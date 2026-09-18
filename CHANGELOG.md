@@ -13,6 +13,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   replacement, shutdown and multihoming failover qualification (Refs #788).
 
 ### Added
+- `opc-proto-ngap`: construct and admit Error Indication's optional 5G-S-TMSI
+  with its distinct ignore criticality. Preserve explicit signalling context,
+  required UE IDs and error basis; qualify the binding with independent Release
+  18 messages, bounded mutations and redacted field reconstruction (Refs #787).
 - `opc-proto-ngap`: construct and admit optional Allowed NSSAI in Initial UE
   and Downlink NAS messages and optional Old AMF in Downlink NAS. Both messages
   also admit Partially Allowed NSSAI with combined count/disjointness checks;

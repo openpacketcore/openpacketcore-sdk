@@ -33,7 +33,7 @@
     "synthetic": true,
     "independent_capture": false,
     "referenced_public_vector": "crates/opc-proto-ngap/tests/fixtures/n3iwf-reset.json",
-    "notes": "Independently encoded ASN.1 recipe; no SDK encoder, capture, or real peer. Source SHA-256 21617ad6dd826e05a0e8356ef96f44199cf4c7bc1be65e6b915e9135e10b59e2. The reference gate recompiles all six modules and checks the complete wire, nested transfers, mandatory fields and enumerated N3IWF conditions. Reused case missing-NGReset-88; corpus SHA-256 3b6676df2cf965031ea50e44c6fe151d3e1ac9a4ff0d036d4a22712dce15abf8."
+    "notes": "Independently encoded ASN.1 recipe; no SDK encoder, capture, or real peer. Source SHA-256 21617ad6dd826e05a0e8356ef96f44199cf4c7bc1be65e6b915e9135e10b59e2. The reference gate recompiles all six modules and checks the complete wire, nested transfers, mandatory fields and enumerated N3IWF conditions. Reused case missing-NGReset-88; corpus SHA-256 998de9dd5cbb34726ac764d6684867be50c159fd563c648461e2314766f6d5a6."
   },
   "sanitized_fields": [
     {

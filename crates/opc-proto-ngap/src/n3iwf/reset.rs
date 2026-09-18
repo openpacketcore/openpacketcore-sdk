@@ -4,6 +4,7 @@
 //! presence does not establish it. Admission neither authorizes resource
 //! release nor proves completion or chooses a local procedure trigger.
 
+use super::nas_fields::FiveGStmsi;
 use super::release::Cause;
 use super::reset_fields::{Connections, CriticalityDiagnostics, ResetType};
 use super::*;
@@ -57,6 +58,9 @@ pub struct ErrorIndication {
     pub cause: Option<Cause>,
     /// Optional root diagnostics; diagnostic item criticality cannot be ignore.
     pub diagnostics: Option<CriticalityDiagnostics>,
+    /// Optional reported 5G-S-TMSI (IE 26/ignore), without identity authority.
+    /// It does not replace the required AMF/RAN IDs for UE signalling.
+    pub fiveg_s_tmsi: Option<FiveGStmsi>,
 }
 redacted!(ErrorIndication);
 
@@ -126,6 +130,9 @@ impl ResetMessage {
                 }
                 if let Some(diagnostics) = &value.diagnostics {
                     fields.push((19, Criticality::ignore, diagnostics.encode(output)));
+                }
+                if let Some(identity) = value.fiveg_s_tmsi {
+                    fields.push((26, Criticality::ignore, identity.encode(output)));
                 }
                 MessageType::ErrorIndication
             }
@@ -214,7 +221,11 @@ fn depth(message: &ResetMessage) -> usize {
             diagnostic_depth(&v.diagnostics).max(if v.connections.is_some() { 7 } else { 5 })
         }
         ResetMessage::Error(v) => {
-            diagnostic_depth(&v.diagnostics).max(if v.cause.is_some() { 6 } else { 5 })
+            diagnostic_depth(&v.diagnostics).max(if v.cause.is_some() || v.fiveg_s_tmsi.is_some() {
+                6
+            } else {
+                5
+            })
         }
     }
 }
@@ -255,7 +266,7 @@ fn admit<'a>(
     let (profile, supported): (_, &[u16]) = match kind {
         MessageType::NgReset => (policy::NG_RESET, &[15, 88]),
         MessageType::NgResetAcknowledge => (policy::NG_RESET_ACKNOWLEDGE, &[111, 19]),
-        _ => (policy::ERROR_INDICATION, &[10, 85, 15, 19]),
+        _ => (policy::ERROR_INDICATION, &[10, 85, 15, 19, 26]),
     };
     let leaf = DecodeContext {
         max_depth: ctx.max_depth.saturating_sub(4),
@@ -263,6 +274,7 @@ fn admit<'a>(
     };
     let (mut amf, mut ran, mut cause, mut reset, mut connections, mut diagnostics) =
         (None, None, None, None, None, None);
+    let mut fiveg_s_tmsi = None;
     let mut ignored_ie_count = 0;
     let mut notify_ie_ids = Vec::new();
     for (index, (id, criticality, value)) in fields.enumerate() {
@@ -287,6 +299,7 @@ fn admit<'a>(
             88 => reset = Some(ResetType::decode(value, leaf)?),
             111 => connections = Some(Connections::decode(value, leaf)?),
             19 => diagnostics = Some(CriticalityDiagnostics::decode(value, leaf)?),
+            26 => fiveg_s_tmsi = Some(FiveGStmsi::decode(value, leaf)?),
             _ => return Err(invalid("reset or error field dispatch")),
         }
     }
@@ -304,6 +317,7 @@ fn admit<'a>(
             ran,
             cause,
             diagnostics,
+            fiveg_s_tmsi,
         }),
     };
     validate(&message, signalling)?;

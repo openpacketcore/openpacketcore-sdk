@@ -212,7 +212,8 @@ preflight exact sizes; decoders reject nonzero padding, extensions, truncation
 and trailing bytes. Leaf depths are one for AMF Set ID/Masked IMEISV and two
 for 5G-S-TMSI/reroute information. These fields do not grant subscriber identity,
 AMF-selection, routing or slice authorization. 5G-S-TMSI is reject-criticality
-in Initial UE; this does not enable its separate Error Indication binding.
+in Initial UE and ignore-criticality in the separately qualified Error Indication
+binding below.
 
 Extended Old AMF uses `ExtendedAmfName`, the TS 38.413 9.3.3.51 SEQUENCE with
 independent optional VisibleString and UTF8String names, each 1–150 characters.
@@ -747,7 +748,7 @@ argument; peer identifier presence does not establish an association.
 | --- | --- | --- | --- |
 | NG Reset (initiating 20/reject) | Cause, Reset Type; non-UE signalling | None | 6 for All; 8 for Part |
 | Reset Acknowledge (successful 20/reject) | Non-UE signalling | Connection list, diagnostics | 5 empty; 7 with connections; up to 8 with diagnostics |
-| Error Indication (initiating 9/ignore) | Cause or diagnostics; both AMF/RAN IDs for UE-associated signalling | AMF/RAN IDs, Cause, diagnostics subject to those rules | 6 without diagnostic items; 8 with items |
+| Error Indication (initiating 9/ignore) | Cause or diagnostics; both AMF/RAN IDs for UE-associated signalling | AMF/RAN IDs, Cause, diagnostics subject to those rules; 5G-S-TMSI 26/ignore | 6 without diagnostic items; 8 with items |
 | Connection list | 1–65536 ordered items; either, both or neither ID may be present | AMF/RAN IDs per item | 3 |
 | Reset Type | Explicit All or Part choice | None | 2 for All; 4 for Part |
 | Criticality Diagnostics | Root fields all optional; IE list has 1–256 items when present | Procedure code/outcome/criticality, IE list | 2 without items; 4 with items |
@@ -764,8 +765,10 @@ Diagnostic IE criticality is reject or notify: ignore is explicitly inapplicable
 under 9.3.1.3 even though ASN.1 can encode it. Procedure code and triggering
 outcome belong only in Error Indication diagnostics and reject in Reset
 Acknowledge. Empty root diagnostics are legal; repeated diagnostic IDs retain
-order. Error Indication's known FiveG-S-TMSI IE is explicitly unsupported in
-this subset. All message fields are singleton. Generic unknown/duplicate and
+order. Error Indication's optional 5G-S-TMSI reuses the bounded seven-octet root
+identity codec with its own ignore criticality. It grants no identity authority
+and does not replace an error basis or either UE identifier. All message fields
+are singleton. Generic unknown/duplicate and
 criticality policies remain authoritative; use the same context for generic
 and semantic admission. Unknown-ignore counts and unknown-notify IDs disclose
 no opaque values. Public field and message Debug output is redacted.
@@ -774,9 +777,15 @@ The [independent field corpus](tests/fixtures/n3iwf-reset-fields.json) has 1,093
 cases (1,079 admitted, 14 semantic negatives). It covers ID width boundaries,
 every list count through 256, larger counts and all element-fragment boundaries
 through 65,536, empty/repeated items, diagnostic presence combinations and enum
-roots. The [complete-message corpus](tests/fixtures/n3iwf-reset.json) has 189
-cases (165 admitted, 24 negative), including all root Causes, required and
+roots. The [complete-message corpus](tests/fixtures/n3iwf-reset.json) has 393
+cases (333 admitted, 60 negative), including all root Causes, required and
 conditional fields, signalling context, metadata, policies and canonical output.
+The identity increment preserves 188 original cases exactly, admits the original
+previously unsupported identity wire, and adds 204 independently generated
+message cases. These cover identity component boundaries, every combination of
+error basis/UE IDs under both signalling contexts, criticalities, duplicate
+selection, unknown IEs and malformed flags/padding/lengths. Complete constructors
+use the reference's semantic identity components, not SDK-decoded leaf bytes.
 Regenerate with `scripts/generate-ngap-reset-field-fixtures.py` and
 `scripts/generate-ngap-reset-fixtures.py`, each taking `--spec PATH --output PATH`,
 using the pinned Release 18 PDF and reference environment.
@@ -801,8 +810,13 @@ nonzero padding and exact/one-short depth, count and byte limits. Fuzz/replay
 compares all successfully admitted values. The 1,282 new seeds comprise 1,274
 complete vectors and eight bounded prefixes for vectors above the fuzz target's
 131,072-byte input limit; the complete large vectors remain ordinary tests.
+Nine additional identity seeds replay semantic reconstruction, and 26,060 adverse
+byte mutations run under two bounded DecodeContexts. The standalone fuzz harness
+is compile-checked; these checks are not a new libFuzzer campaign. Six catalog
+references update only the source corpus digest; their packet bytes are unchanged.
 
 The new public message variants require downstream exhaustive-match updates.
+Error Indication struct literals must supply `fiveg_s_tmsi` (`None` when absent).
 Admission does not choose Error Indication triggers, prove transport/UE
 ownership, correlate requests or perform reset actions. Remaining #787
 procedures, optional fields and live interoperability evidence are pending.
