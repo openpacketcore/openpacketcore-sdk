@@ -7,6 +7,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+- `opc-sctp`: add an affine N2 association owner with explicit candidate
+  promotion, generation-fenced I/O and path readback, bounded reconnect,
+  typed reset/stream-count/partial-abort notifications, and mandatory native
+  replacement, shutdown and multihoming failover qualification (Refs #788).
+
 ### Added
 - `opc-sctp`: add an explicitly unprotected N2 profile and live adapter with
   strict PPID 60, the default NGAP service port, bounded ordered records,

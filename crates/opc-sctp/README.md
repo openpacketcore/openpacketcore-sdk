@@ -84,9 +84,35 @@ handle survives. Invalid local send payloads fail before transmission.
 remain responsible for faithful metadata and record boundaries. Its outbound
 wrapper has redacted diagnostics; explicitly converting it to the generic
 SCTP message transfers payload-handling responsibility to the backend caller.
-None of these types decodes NGAP, proves protection, selects AMFs, assigns
-UE/non-UE streams, fences competing association generations or reconnects.
+None of these types decodes NGAP, proves protection, selects AMFs or assigns
+UE/non-UE streams. Use `N2AssociationOwner` when association generations and
+bounded reconnect are required.
 See [CONFORMANCE.md](CONFORMANCE.md) for the exact scope and evidence.
+
+### N2 association generations
+
+`N2AssociationOwner::connect_candidate(config, bounds)` connects within an
+explicit `N2ReconnectPolicy`. `candidate(association)` consumes an already
+connected/accepted adapter. Neither candidate can send or receive. Explicit
+`promote(candidate)` grants an affine `N2Generation`; competing candidates
+based on the same owner state have exactly one winner. Losing candidates close.
+Retain the returned generation for its transport lifetime: dropping a current
+token retires it, while dropping a stale token cannot close its successor.
+
+Pass that exact token to `send`, `recv`, `readback`, `set_primary_peer_path` or
+`retire`. Replacement cancels pending I/O and stale tokens fail before transport
+admission. Bytes submitted before replacement may already have reached the
+peer. Terminal notifications retire the generation before returning a tagged
+`N2Received`; they never authorize a new generation. Reconnection and promotion
+remain explicit caller decisions. `close` permanently closes this owner.
+
+The owner requires Linux lifecycle event subscriptions. Stream resets retain
+exact direction, outcome and up to 64 explicit IDs; oversized or malformed
+notifications fail closed. The owner observes reconfiguration but does not
+enable or originate RFC 6525 requests. It does not infer NGAP stream bindings,
+AMF preference or peer authentication. Address lists and path snapshots are
+exact readback metadata; Debug and errors remain redacted. See
+[N2-LIFECYCLE.md](N2-LIFECYCLE.md) for support limits and evidence.
 
 ### Diameter connect progress across an application timeout
 
@@ -174,10 +200,10 @@ ordering and (for ordered DATA) SSN across chunks. TSN progress and unordered
 SSN differences remain valid. Existing DATA truncation flags still propagate;
 a caller must reject them before treating metadata as authoritative.
 
-These receive guarantees are a prerequisite slice of the typed N2 profile in
+These receive guarantees are composed by the typed N2 owner in
 [#788](https://github.com/openpacketcore/openpacketcore-sdk/issues/788).
 The [receive conformance scope](CONFORMANCE.md) records the standards baseline,
-synthetic schedules, native checks and remaining N2 work.
+synthetic schedules, native checks and N2 support limits.
 
 ### Multihoming path events and health
 

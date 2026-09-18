@@ -18,7 +18,11 @@
 
 #![forbid(unsafe_code)]
 
+mod lifecycle;
 pub mod n2;
+pub use lifecycle::{
+    SctpAssociationState, SctpReconfigurationStatus, SctpResetStreams, MAX_RESET_STREAM_IDS,
+};
 
 #[cfg(target_os = "linux")]
 use std::collections::BTreeMap;
@@ -668,8 +672,45 @@ impl ReceiveAccumulator {
             Some(
                 SctpEvent::PeerAddrChange { .. }
                 | SctpEvent::SenderDry { .. }
-                | SctpEvent::Authentication { .. },
+                | SctpEvent::Authentication { .. }
+                | SctpEvent::StreamChange { .. },
             ) => {}
+            Some(SctpEvent::StreamReset {
+                assoc_id,
+                incoming,
+                status,
+                streams,
+                ..
+            }) => {
+                if incoming
+                    && status == SctpReconfigurationStatus::Completed
+                    && first.info.is_none_or(|info| {
+                        info.assoc_id == assoc_id && streams.includes(info.stream_id)
+                    })
+                {
+                    *self = Self::new(self.max_message_bytes);
+                }
+            }
+            Some(SctpEvent::AssociationReset {
+                assoc_id, status, ..
+            }) => {
+                if status == SctpReconfigurationStatus::Completed
+                    && first.info.is_none_or(|info| info.assoc_id == assoc_id)
+                {
+                    *self = Self::new(self.max_message_bytes);
+                }
+            }
+            Some(SctpEvent::PartialDeliveryAborted {
+                assoc_id,
+                stream_id,
+                ..
+            }) => {
+                if first.info.is_none_or(|info| {
+                    info.assoc_id == assoc_id && u32::from(info.stream_id) == stream_id
+                }) {
+                    *self = Self::new(self.max_message_bytes);
+                }
+            }
             // An unparsed event may abort partial delivery or reset a stream.
             // Do not concatenate a later record across an unknown transition.
             Some(SctpEvent::Unknown { .. }) | None => return Err(invalid_record_error()),
@@ -2080,6 +2121,50 @@ pub enum SctpEvent {
         /// Association identifier.
         assoc_id: i32,
     },
+    /// A bounded RFC 6525 stream reset notification.
+    StreamReset {
+        /// Association identifier; not generation authority.
+        assoc_id: i32,
+        /// The list applies to incoming streams.
+        incoming: bool,
+        /// The list applies to outgoing streams.
+        outgoing: bool,
+        /// Whether the reset completed, was denied, or failed.
+        status: SctpReconfigurationStatus,
+        /// Exact stream identifiers; empty identifies all streams.
+        streams: SctpResetStreams,
+    },
+    /// An RFC 6525 association sequence-number reset notification.
+    AssociationReset {
+        /// Association identifier; not generation authority.
+        assoc_id: i32,
+        /// Whether the reset completed, was denied, or failed.
+        status: SctpReconfigurationStatus,
+        /// Next local transmission sequence number.
+        local_tsn: u32,
+        /// Next remote transmission sequence number.
+        remote_tsn: u32,
+    },
+    /// An RFC 6525 stream-count change notification.
+    StreamChange {
+        /// Association identifier; not generation authority.
+        assoc_id: i32,
+        /// Whether the change completed, was denied, or failed.
+        status: SctpReconfigurationStatus,
+        /// Number of inbound streams reported by the kernel.
+        inbound_streams: u16,
+        /// Number of outbound streams reported by the kernel.
+        outbound_streams: u16,
+    },
+    /// Linux reports that a partially delivered incoming record was aborted.
+    PartialDeliveryAborted {
+        /// Association identifier; not generation authority.
+        assoc_id: i32,
+        /// Stream identifier in the Linux UAPI's 32-bit representation.
+        stream_id: u32,
+        /// Message sequence value reported by the kernel.
+        sequence: u32,
+    },
     /// Notification type not decoded by this crate yet.
     Unknown {
         /// Kernel SCTP notification type.
@@ -2090,6 +2175,10 @@ pub enum SctpEvent {
 impl fmt::Debug for SctpEvent {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            Self::StreamReset { .. } => f.write_str("StreamReset { .. }"),
+            Self::AssociationReset { .. } => f.write_str("AssociationReset { .. }"),
+            Self::StreamChange { .. } => f.write_str("StreamChange { .. }"),
+            Self::PartialDeliveryAborted { .. } => f.write_str("PartialDeliveryAborted { .. }"),
             Self::AssociationChange {
                 state,
                 error,
@@ -2781,6 +2870,10 @@ impl SctpSenderDrainTracker {
             SctpEvent::AssociationChange { .. }
             | SctpEvent::PeerAddrChange { .. }
             | SctpEvent::Authentication { .. }
+            | SctpEvent::StreamReset { .. }
+            | SctpEvent::AssociationReset { .. }
+            | SctpEvent::StreamChange { .. }
+            | SctpEvent::PartialDeliveryAborted { .. }
             | SctpEvent::Unknown { .. } => {}
         }
     }
@@ -3027,6 +3120,12 @@ impl SctpEndpoint {
 }
 
 impl SctpAssociation {
+    // The N2 owner subscribes before publication. This does not enable peer
+    // reconfiguration requests or change the generic event subscription.
+    pub(crate) fn enable_lifecycle_notifications(&self) -> Result<(), SctpError> {
+        self.imp.enable_lifecycle_notifications()
+    }
+
     /// Connect one SCTP association.
     pub async fn connect(config: SctpConnectConfig) -> Result<Self, SctpError> {
         let (_progress, connect) = Self::connect_with_progress(config);
@@ -3601,8 +3700,21 @@ fn map_recv(received: opc_libsctp_sys::Received, buffer: BytesMut) -> InboundMes
 fn parse_sctp_event(payload: &[u8]) -> Option<SctpEvent> {
     let available_len = payload.len();
     let notification_type = read_u16_ne(payload, 0)?;
+    if lifecycle::is_lifecycle_event(notification_type) {
+        return lifecycle::parse(payload);
+    }
     let declared_len = read_u32_ne(payload, 4)? as usize;
     if declared_len < 8 || declared_len > payload.len() {
+        return None;
+    }
+    if notification_type == opc_libsctp_sys::SCTP_ASSOC_CHANGE_NOTIFICATION
+        && (declared_len < 20 || declared_len != available_len || read_u16_ne(payload, 2)? != 0)
+    {
+        return None;
+    }
+    if notification_type == opc_libsctp_sys::SCTP_SHUTDOWN_EVENT_NOTIFICATION
+        && (declared_len != 12 || available_len != 12 || read_u16_ne(payload, 2)? != 0)
+    {
         return None;
     }
     if notification_type == opc_libsctp_sys::SCTP_PEER_ADDR_CHANGE_NOTIFICATION
@@ -3783,6 +3895,9 @@ fn sender_dry_io_err(operation: &'static str, source: io::Error) -> SctpError {
         io_err(operation, source)
     }
 }
+
+#[cfg(test)]
+mod lifecycle_tests;
 
 #[cfg(target_os = "linux")]
 mod platform {
@@ -4079,6 +4194,23 @@ mod platform {
 
         pub fn max_message_bytes(&self) -> usize {
             self.socket.max_message_bytes
+        }
+
+        pub fn enable_lifecycle_notifications(&self) -> Result<(), SctpError> {
+            if !self.socket.is_open() {
+                return Err(SctpError::Closed);
+            }
+            for kind in [0x8006, 0x800a, 0x800b, 0x800c] {
+                opc_libsctp_sys::set_event(self.socket.fd.get_ref().as_fd(), 0, kind, true)
+                    .map_err(|source| {
+                        path_control_io_err(
+                            "enable_lifecycle_notifications",
+                            "lifecycle_notifications",
+                            source,
+                        )
+                    })?;
+            }
+            Ok(())
         }
 
         pub fn is_pristine_rfc6083_auth_state(&self) -> bool {
@@ -4897,6 +5029,10 @@ mod platform {
         pub fn max_message_bytes(&self) -> usize {
             let _ = self;
             0
+        }
+
+        pub fn enable_lifecycle_notifications(&self) -> Result<(), SctpError> {
+            Err(SctpError::UnsupportedPlatform)
         }
 
         pub fn is_pristine_rfc6083_auth_state(&self) -> bool {

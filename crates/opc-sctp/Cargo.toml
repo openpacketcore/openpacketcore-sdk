@@ -23,7 +23,7 @@ zeroize = { workspace = true }
 
 [dev-dependencies]
 allocation-counter = { workspace = true }
-tokio = { workspace = true, features = ["macros", "rt", "time"] }
+tokio = { workspace = true, features = ["macros", "rt", "time", "test-util"] }
 
 [lints]
 workspace = true
