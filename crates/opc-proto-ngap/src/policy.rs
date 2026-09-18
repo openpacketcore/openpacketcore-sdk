@@ -507,6 +507,23 @@ pub(super) const PDU_SESSION_RESOURCE_SETUP_REQUEST_TRANSFER: IeProfile = IeProf
     IeRule::singleton(394, CRITICALITY_IGNORE), // TLContainer
 ]);
 
+pub(super) const PDU_SESSION_RESOURCE_MODIFY_REQUEST_TRANSFER: IeProfile = IeProfile::new(&[
+    IeRule::singleton(130, CRITICALITY_REJECT), // PDUSessionAggregateMaximumBitRate
+    IeRule::singleton(140, CRITICALITY_REJECT), // UL-NGU-UP-TNLModifyList
+    IeRule::singleton(129, CRITICALITY_REJECT), // NetworkInstance
+    IeRule::singleton(135, CRITICALITY_REJECT), // QosFlowAddOrModifyRequestList
+    IeRule::singleton(137, CRITICALITY_REJECT), // QosFlowListWithCause
+    IeRule::singleton(126, CRITICALITY_REJECT), // AdditionalUL-NGU-UP-TNLInformation
+    IeRule::singleton(166, CRITICALITY_IGNORE), // CommonNetworkInstance
+    IeRule::singleton(186, CRITICALITY_IGNORE), // AdditionalRedundantUL-NGU-UP-TNLInformation
+    IeRule::singleton(190, CRITICALITY_IGNORE), // RedundantCommonNetworkInstance
+    IeRule::singleton(195, CRITICALITY_IGNORE), // RedundantUL-NGU-UP-TNLInformation
+    IeRule::singleton(138, CRITICALITY_IGNORE), // SecurityIndication (differs from Setup)
+    IeRule::singleton(319, CRITICALITY_IGNORE), // MBSSessionSetuporModifyRequestList
+    IeRule::singleton(317, CRITICALITY_IGNORE), // MBSSessionToReleaseList
+    IeRule::singleton(435, CRITICALITY_IGNORE), // UserPlaneFailureIndication
+]);
+
 #[cfg(test)]
 mod tests {
     #![allow(clippy::unwrap_used)]
@@ -571,6 +588,8 @@ mod tests {
     #[test]
     fn every_production_profile_has_unique_singleton_ids() {
         let profiles = [
+            PDU_SESSION_RESOURCE_SETUP_REQUEST_TRANSFER,
+            PDU_SESSION_RESOURCE_MODIFY_REQUEST_TRANSFER,
             PDU_SESSION_RESOURCE_SETUP_REQUEST,
             PDU_SESSION_RESOURCE_SETUP_RESPONSE,
             PDU_SESSION_RESOURCE_RELEASE_COMMAND,

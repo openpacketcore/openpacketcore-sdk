@@ -127,11 +127,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `Ikev2SaInitCryptoErrorCode` to `Ikev2ChildSaKeyMaterialDiagnostic`.
 
 ### Added
+- `opc-proto-ngap`: bounded Modify Request Transfer with optional AMBR, tunnel
+  modifications, add/modify QFIs and release causes, backed by 380 independent
+  complete transfers. Preserve empty roots and absent parameters, apply shared
+  IE policies and reject cross-list QFI conflicts; enclosing Modify messages
+  and resource effects remain separate (Refs #787).
 - `opc-proto-ngap`: standalone PDU Resource Modify flow and tunnel-pair fields,
   backed by 687 independent Release 18 cases. Preserve absent QoS parameters,
   typed endpoint directions and ordered tunnel pairs; validate root counts,
-  identifiers and exact framing before allocation. Complete Modify transfers
-  and procedure admission remain pending (Refs #787).
+  identifiers and exact framing before allocation. Further Modify transfers
+  and complete procedure admission remain pending (Refs #787).
 - `opc-proto-ngap`: canonical PDU Session Resource Notify with typed root
   flow notifications, released QFIs and whole-session release reports, backed
   by 1,014 independent cases. Enforces nonempty reports and disjoint identifiers;
