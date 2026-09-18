@@ -22,6 +22,30 @@ state, retransmission policy, cookie policy, Child SA lifecycle, XFRM/IPsec
 programming, bearer admission or allocation policy, carrier acceptance
 evidence, or a production ePDG control-plane stack.
 
+## NWu payload profiles
+
+`nwu` adds the TS 24.502 V18.8.0 configuration and opened Child-SA payload
+profiles tracked by #786. It supports empty per-family CFG_REQUEST attributes,
+correlated CFG_REPLY/NAS endpoints, complete QoS associations and additional
+QoS parameters, one applicable UP address, network-initiated creation with
+all-packet selectors, full replacement modification, and explicit NWu deletion.
+`PendingModification` distinguishes acceptance, rejection, and ambiguous timeout;
+`PendingChildDelete` requires the ordinary/crossed received-SPI echo.
+`PendingIkeDelete` uses Protocol ID 1 with no SPIs and an empty response.
+
+`AeadPolicy` tries the caller's ordered `AeadSuite` list before peer proposal
+order and emits no integrity transform or fallback. Existing
+`Ikev2SaInitNegotiationPolicy` supplies ordered whole-IKE-suite selection.
+No default downstream suite list is included. Construction and receive helpers
+return intent only; protection, key custody, replay admission, roster authority,
+retransmission scheduling and backend operations belong to their own boundaries.
+
+MOBIKE_SUPPORTED is conditional on the original IPv4 request and UE support.
+Authenticated MOBIKE address updates, return-routability, source/replay checks
+and NAT-T migration are still pending in #786. This payload change does not
+close that issue or establish external interoperability. See
+[CONFORMANCE.md](CONFORMANCE.md#nwu-payload-profile) for exact scope and evidence.
+
 ## API Shape
 
 - `Message<'a>` and `OwnedMessage` provide borrowed and owned IKEv2 messages.

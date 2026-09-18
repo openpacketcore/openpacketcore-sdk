@@ -235,3 +235,69 @@ exchange, correlates both protocol responses, commits the GTP response for
 exact replay, and then performs the corresponding Delete Bearer and IKEv2
 Child-SA deletion flow. Admission, identifier allocation, key installation,
 and dataplane programming remain explicit application responsibilities.
+## NWu payload profile
+
+The `nwu` module implements opened payload boundaries from
+[TS 24.502 V18.8.0](https://www.etsi.org/deliver/etsi_ts/124500_124599/124502/18.08.00_60/ts_124502v180800p.pdf)
+sections 7.3.2.2, 7.4–7.7 and 9.3.1, with generic framing, CP, TS, Notify and
+Delete from [RFC 7296](https://www.rfc-editor.org/rfc/rfc7296.html).
+These are synthetic constructed/receive claims; no peer capture, live network,
+authentication, key custody or XFRM installation is claimed.
+
+- Constructed and received: IPv4/IPv6/dual CFG_REQUEST and correlated
+  CFG_REPLY with NAS addresses and NAS_TCP_PORT; 5G_QOS_INFO including zero or
+  several QFIs, default indication, optional DSCP and additional parameters;
+  UP addresses and sender-inbound UP_SA_INFO; network-initiated CREATE_CHILD_SA
+  with complete SA/Nonce/optional KE/all-packet TS payloads; complete replacement
+  modification; both-initiator Child and IKE deletion.
+- Additional QoS uses exact wire units. Characteristics use six octets for
+  non-GBR, eight for GBR, and ten for delay-critical GBR (including its averaging
+  window and maximum burst). Known fields have exact lengths and range checks;
+  rate unit codes above 25 are retained with the standard's 256 Pbps meaning.
+  Non-GBR characteristics with GBR-only rate/loss parameters are unsupported.
+  Unknown parameter identifiers and Notification Control are framed, counted,
+  then discarded as required by this release. Parameters remain optional; this
+  codec does not reserve or admit QoS resources.
+- Protocol ID is ignored for zero-SPI notifies. UP_SA_INFO requires ESP and a
+  four-octet nonzero SPI; optional future extension bytes are ignored. Spare
+  QFI/flag bits and CP reserved fields are ignored on receive and cleared by
+  canonical encoding. N3GPP_BACKOFF_TIMER is explicitly unsupported here.
+- Local admission policy rejects repeated known CP attributes/notifies/QFIs/QoS
+  parameters and repeated SPIs. `Limits` defaults to 65,535 opened bytes and
+  128 payloads/CP attributes/SPIs as applicable. Every ignored entry counts.
+  CP and Delete counts are checked before generic vector allocation. The QoS
+  one-octet Length and Delete generic 16-bit length bounds are checked before
+  construction. CP attributes outside this profile remain caller-owned.
+- `CreateRequest` validates original IKE responder role for network creation,
+  one applicable UP address and complete selector ranges. Accepted responses
+  are matched to both IKE SPIs, message ID, role, proposal/transforms, KE and
+  all-packet selectors. `AeadPolicy` uses explicit caller suite order, with no
+  default list, fallback, separate integrity, crypto calls or backend effects.
+  Whole-IKE selection continues to use `Ikev2SaInitNegotiationPolicy`.
+- Modification outcomes distinguish a matching empty acceptance, a matching
+  error rejection, and an ambiguous caller-declared timeout. The entire QoS
+  association replaces the old association. A roster must enforce the one
+  default SA per PDU session invariant; a payload cannot establish that fact.
+- TS 24.502 Child Delete echoes the complete received SPI sequence for ordinary
+  and crossed requests. `validate_complete` compares it with a caller-supplied
+  authoritative roster. The generic RFC 7296 and TS 24.302 paired-direction
+  deletion profiles retain their existing behavior. An unanswered initiated
+  NWu Child Delete reports whole-IKE/all-children discard intent, not just the
+  original SPI subset. IKE Delete is Protocol ID 1 without SPIs and uses an
+  empty acknowledgement; its timeout has the same whole-IKE scope.
+- Conditional MOBIKE_SUPPORTED advertisement and receiver-ignored capability
+  extension data are covered. Authenticated
+  UPDATE_SA_ADDRESSES, address advertisement processing, return-routability,
+  replay/source rejection, and NAT-T migration are **not implemented by this
+  change** and keep #786 open. The published additional-address vector is
+  consumed through generic Notify framing only. The opened lifecycle helpers
+  accept SK headers; SKF reassembly and peer authentication are separate.
+
+`tests/nwu.rs` consumes all 15 published `nwu-ike` fixture files, using their
+unchanged provenance/digest manifests under `opc-n3iwf-fixtures`. Full CP and
+CREATE request literals, complete additional-QoS parameters, IPv6/dual-family
+cases, duplicate/length/count mutations, response-correlation failures and
+redaction checks are independently assembled synthetic test vectors. The `nwu`
+fuzz target checks bounded decode and canonical re-encoding, using exact binary
+copies of the published payload seeds. Round trips do not establish external
+interoperability. Review and authenticated mobility evidence remain outstanding.

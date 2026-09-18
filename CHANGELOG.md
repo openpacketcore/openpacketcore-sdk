@@ -121,6 +121,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `Ikev2SaInitCryptoErrorCode` to `Ikev2ChildSaKeyMaterialDiagnostic`.
 
 ### Added
+- `opc-proto-ikev2::nwu`: bounded TS 24.502 configuration and QoS payloads,
+  opened Child-SA creation/modification, explicit NWu Child/IKE deletion and
+  caller-ordered AEAD selection. Conditional MOBIKE capability advertisement
+  is supported; authenticated mobility remains pending (Refs #786).
 - **Bounded acknowledged configuration history — `opc-persist`:** the existing
   consensus authority commits exact-head retention decisions with record and
   encoded-byte limits, authenticated cursor boundaries, and protected rollback
