@@ -384,10 +384,13 @@ pub fn decode(buf: &[u8], ctx: DecodeContext) -> Result<Pdu, DecodeError> {
 /// procedure code carries different message types per outcome (procedure 21
 /// is NGSetupRequest when initiating but NGSetupResponse/NGSetupFailure on
 /// the successful/unsuccessful outcomes).
-#[derive(Clone, Copy, PartialEq, Eq)]
-enum Outcome {
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Outcome {
+    /// Initiating message.
     Initiating,
+    /// Successful outcome.
     Successful,
+    /// Unsuccessful outcome.
     Unsuccessful,
 }
 

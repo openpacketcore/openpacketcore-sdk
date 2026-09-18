@@ -28,12 +28,18 @@ internal semantics in the SDK.
 | Typed IE mapping | NGReset; NGResetAcknowledge; ErrorIndication | ✅ | Independent complete messages, fragmented connection lists and root diagnostics |
 | Typed IE mapping | PDUSessionResourceNotify | ✅ | Independent flow/session reports, root Causes and optional N3IWF location |
 | Typed IE mapping | PDUSessionResourceModify Request/Response | ✅ | Three independent session lists and complete procedure messages, including partial results |
+| N3IWF envelope routing | 40 applicable outcomes; metadata for 81 Release 18 procedures | ✅ | [Explicit receive/error/trigger matrix](N3IWF-PROCEDURES.md), 2,321 independent routing envelopes; no field admission inferred |
 | Typed decode | Paging | 🧪 | Initiating-message dispatch with hand-authored empty-IE APER fixture |
 
 Dispatch is outcome-aware: procedure code 21 decodes as NGSetupRequest only
 on an initiating message, NGSetupResponse on a successful outcome, and
 NGSetupFailure on an unsuccessful outcome. The same outcome-aware rule is
 applied to the first-CNF N2 subset above.
+
+The [N3IWF procedure contract](N3IWF-PROCEDURES.md) classifies all applicable
+outcomes before generic decoding and keeps 17 pending codec triggers disabled.
+Its independent envelope/diagnostic evidence does not expand the 23 qualified
+message subsets or the published fixture corpus.
 
 ## Protocol-IE policy and cardinality
 

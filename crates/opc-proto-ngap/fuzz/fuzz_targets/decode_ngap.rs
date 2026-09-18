@@ -1,5 +1,8 @@
 #![no_main]
 
+#[path = "../../tests/support/applicability.rs"]
+mod applicability;
+
 #[path = "../../tests/support/resource_release.rs"]
 mod resource_release;
 #[path = "../../tests/support/resource_setup.rs"]
@@ -62,6 +65,7 @@ fuzz_target!(|data: &[u8]| {
         max_message_len: 200_000,
         ..EncodeContext::default()
     };
+    applicability::exercise(data, decode, output);
     modify_fields::exercise(data, decode, output);
     modify_request::exercise(data, decode, output);
     modify_results::exercise(data, decode, output);

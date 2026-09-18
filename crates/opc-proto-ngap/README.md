@@ -34,6 +34,18 @@ decode policies.
 - `encode` and `Encode` default to canonical root-container output. Explicit
   `raw_preserving` mode replays the original receive bytes.
 
+## N3IWF procedure routing
+
+Use `n3iwf::applicability::inspect` before generic decoding on an N3IWF
+interface. It distinguishes 23 qualified field subsets, 17 applicable outcomes
+requiring a handler, and procedures absent from N3IWF applicability. It checks
+complete envelope framing, assigned Release 18 metadata and direction without
+allocating a body. The result does not admit fields; keep the same context for
+generic decoding and typed admission. `ApplicableMessage::local_trigger` gates
+wire capability and leaves all pending codecs disabled. `Outcome` is public
+metadata. See [the receive/error and trigger matrix](N3IWF-PROCEDURES.md) for
+required caller behavior and value-free unsupported-procedure diagnostics.
+
 ## Typed IE policy boundary
 
 Each currently typed procedure/outcome has pinned ASN.1 metadata for its known
