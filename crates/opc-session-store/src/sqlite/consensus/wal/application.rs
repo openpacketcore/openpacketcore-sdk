@@ -140,9 +140,12 @@ pub(super) fn project_operation(
     operation: &Operation,
 ) -> io::Result<Option<LogId<SessionConsensusNodeId>>> {
     if let Some(native) = &mut state.native {
-        return native
-            .log
-            .project(operation, &native.business, state.authority.frozen_applied);
+        return native.log.project_reserved(
+            operation,
+            &native.business,
+            state.authority.frozen_applied,
+            state.async_authority,
+        );
     }
     if let Err(error) = validate_applied_prefix(state, binding) {
         fence(state);

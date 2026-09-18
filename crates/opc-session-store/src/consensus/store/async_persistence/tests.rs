@@ -26,6 +26,7 @@ use crate::topology::{
 use crate::{SessionAsyncRecoveryState, SnapshotIntegrityPolicy};
 
 mod admission;
+mod authority_reservation;
 mod bootstrap;
 mod closed;
 mod initialization;

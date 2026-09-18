@@ -537,6 +537,9 @@ impl Opening {
         // All snapshot/origin, generation, vote/log and exact authority
         // validation has completed. Consume before starting the writer, so a
         // second cold incarnation can never reuse this permission.
+        if binding.async_recovery_format {
+            native.check_async_reservation(async_authority::read(&directory, binding)?)?;
+        }
         let recovered_closed = if binding.async_closed_format {
             async_closed::consume(
                 &directory,
@@ -2039,6 +2042,13 @@ impl Wal {
                 drop(state);
                 drop(prepared);
                 continue;
+            }
+            if let Some(reservation) = state.async_authority {
+                if let Err(error) = prepared.check_async_reservation(reservation) {
+                    application::fence(&mut state);
+                    self.shared.ready.notify_all();
+                    return Err(error);
+                }
             }
             let publishing = Instant::now();
             let result = prepared.publish(

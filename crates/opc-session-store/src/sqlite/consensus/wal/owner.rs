@@ -22,6 +22,7 @@ const ASYNC_ROOT_MAGIC: &[u8; 8] = b"OPCNA001";
 // V1 readers must fail before participating: they do not consume a closed
 // incarnation proof and could otherwise leave it beside new volatile work.
 const ASYNC_CLOSED_ROOT_MAGIC: &[u8; 8] = b"OPCNA002";
+const ASYNC_RECOVERY_ROOT_MAGIC: &[u8; 8] = b"OPCNA003";
 const SELECTION_ATTRIBUTE: &str = "user.opc.native-root-v1";
 
 #[cfg(test)]
@@ -381,6 +382,9 @@ impl NativeOwner {
         let mut bytes = [0; ROOT_BYTES as usize];
         bytes[..8].copy_from_slice(match wal.binding.persistence {
             SessionPersistenceMode::Durable => ROOT_MAGIC,
+            SessionPersistenceMode::Async if wal.binding.async_recovery_format => {
+                ASYNC_RECOVERY_ROOT_MAGIC
+            }
             SessionPersistenceMode::Async if wal.binding.async_closed_format => {
                 ASYNC_CLOSED_ROOT_MAGIC
             }
@@ -464,6 +468,7 @@ impl NativeOwner {
             magic if magic == ROOT_MAGIC => SessionPersistenceMode::Durable,
             magic if magic == ASYNC_ROOT_MAGIC => SessionPersistenceMode::Async,
             magic if magic == ASYNC_CLOSED_ROOT_MAGIC => SessionPersistenceMode::Async,
+            magic if magic == ASYNC_RECOVERY_ROOT_MAGIC => SessionPersistenceMode::Async,
             _ => return Err(invalid_data("native root persistence format differs")),
         };
         let directory_identity = identity(&directory.metadata()?);
@@ -487,7 +492,9 @@ impl NativeOwner {
             basis,
             native: true,
             persistence,
-            async_closed_format: &bytes[..8] == ASYNC_CLOSED_ROOT_MAGIC,
+            async_closed_format: &bytes[..8] == ASYNC_CLOSED_ROOT_MAGIC
+                || &bytes[..8] == ASYNC_RECOVERY_ROOT_MAGIC,
+            async_recovery_format: &bytes[..8] == ASYNC_RECOVERY_ROOT_MAGIC,
         };
         if binding.digest()? != bytes[104..136] {
             return Err(invalid_data("native root authority binding differs"));

@@ -773,6 +773,13 @@ pub(super) struct Publication {
 }
 
 impl Publication {
+    pub(super) fn check_async_reservation(
+        &self,
+        reservation: crate::sqlite::consensus::wal::async_authority::Reservation,
+    ) -> io::Result<()> {
+        self.frontiers.check_async_reservation(reservation)
+    }
+
     pub(super) fn is_current(&self, state: &NativeState) -> io::Result<bool> {
         let proof = state.require_business_proof()?;
         if state

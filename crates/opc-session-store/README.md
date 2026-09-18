@@ -449,7 +449,15 @@ successful initialization or traffic authority. An all-cold quorum without
 completed shutdown proofs stays closed; local disk progress, cached responses,
 and recreating storage do not supply a supported recovery authority.
 
-New Async roots use format `OPCNA002`. After the RPC handler is removed,
+New Async roots use format `OPCNA003`. Before the first volatile operation,
+the owner syncs a separate, exact-root-bound authority reservation. It bounds
+vote terms, log indices and issued business frontiers independently of the
+session generation writer. Ordinary operations compare resident values with
+this reservation; they never rewrite it or wait for it. Missing or invalid
+reservation evidence rejects reopening, and exhaustion fails closed.
+This reservation is preparation for unclean recovery, not an admission proof.
+
+After the RPC handler is removed,
 `shutdown()` joins the active consensus engine and every storage owner, drains
 the final generation, then publishes a one-use proof while retaining the root
 lock. Reopen validates the exact root, generation, full vote/log/application
@@ -459,8 +467,9 @@ all-voter restart without adding a disk wait to ordinary acknowledgements.
 The proof permits consensus participation; it grants no lease or traffic
 authority. Initialization and each operation still require fresh quorum checks.
 
-Legacy `OPCNA001` roots remain readable under their original quarantine
-contract and are not implicitly migrated. Older SDK versions reject the new
+Legacy `OPCNA001` roots retain their original quarantine contract; `OPCNA002`
+roots retain their completed-shutdown proof contract. Neither is implicitly
+migrated to an authority reservation. Older SDK versions reject the new
 format, so they cannot leave a stale close proof beside new volatile work.
 This change does not recover already-fenced legacy installations.
 

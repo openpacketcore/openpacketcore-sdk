@@ -404,6 +404,26 @@ pub(crate) struct NativeStorage {
 }
 
 impl NativeStorage {
+    pub(crate) fn check_async_reservation(
+        &self,
+        reservation: crate::sqlite::consensus::wal::async_authority::Reservation,
+    ) -> io::Result<()> {
+        self.business
+            .frontiers
+            .check_async_reservation(reservation)?;
+        if let Some(vote) = self.log.vote {
+            reservation.check(vote.leader_id.term)?;
+        }
+        for id in [self.log.last(), self.log.committed, self.log.purged]
+            .into_iter()
+            .flatten()
+        {
+            reservation.check(id.leader_id.term)?;
+            reservation.check(id.index)?;
+        }
+        Ok(())
+    }
+
     pub(crate) fn empty(
         identity: SessionConsensusIdentity,
         members: BTreeSet<SessionConsensusNodeId>,
@@ -451,6 +471,37 @@ impl NativeStorage {
             let copies = reads.copy_current(&self.business)?;
             self.business.apply_with_receipts(entries, &copies)?;
             next = end;
+        }
+        Ok(())
+    }
+}
+
+impl NativeFrontiers {
+    fn check_async_reservation(
+        &self,
+        reservation: crate::sqlite::consensus::wal::async_authority::Reservation,
+    ) -> io::Result<()> {
+        for counter in [
+            self.sequence,
+            self.watch_sequence,
+            self.next_fence,
+            self.next_credential,
+            self.restore_revision,
+        ] {
+            reservation.check(counter)?;
+        }
+        if let Some(history) = &self.history {
+            reservation.check(history.generation())?;
+            for epoch in [
+                history.active_epoch(),
+                history.retired_through(),
+                history.reclaim_epoch(),
+            ]
+            .into_iter()
+            .flatten()
+            {
+                reservation.check(epoch.get())?;
+            }
         }
         Ok(())
     }

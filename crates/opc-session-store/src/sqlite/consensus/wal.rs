@@ -28,6 +28,7 @@ use sha2::{Digest, Sha256};
 
 pub(crate) mod adapter;
 pub(crate) mod application;
+pub(crate) mod async_authority;
 mod async_closed;
 mod async_persistence;
 mod checkpoint;
@@ -126,6 +127,7 @@ pub(super) struct Binding {
     pub(super) native: bool,
     pub(super) persistence: SessionPersistenceMode,
     pub(super) async_closed_format: bool,
+    pub(super) async_recovery_format: bool,
 }
 
 impl Binding {
@@ -135,13 +137,17 @@ impl Binding {
             if !self.native {
                 return Err(invalid_data("asynchronous storage requires a native root"));
             }
-            hash.update(if self.async_closed_format {
+            hash.update(if self.async_recovery_format && self.async_closed_format {
+                &b"opc-session-native-async-v3"[..]
+            } else if self.async_recovery_format {
+                return Err(invalid_data("asynchronous recovery root format differs"));
+            } else if self.async_closed_format {
                 &b"opc-session-native-async-v2"[..]
             } else {
                 &b"opc-session-native-async-v1"[..]
             });
         } else if self.native {
-            if self.async_closed_format {
+            if self.async_closed_format || self.async_recovery_format {
                 return Err(invalid_data(
                     "durable root cannot carry asynchronous close proof",
                 ));
@@ -331,6 +337,9 @@ pub(crate) enum Point {
     BeforeAsyncClosedConsume,
     AfterAsyncClosedUnlink,
     AfterAsyncClosedConsumeSync,
+    BeforeAsyncAuthorityWrite,
+    AfterAsyncAuthorityFileSync,
+    AfterAsyncAuthorityDirectorySync,
     BeforeBasisCreate,
     AfterBasisCreate,
     BeforeBasisSync,
@@ -548,6 +557,7 @@ struct State {
     #[cfg(feature = "test-control")]
     volatile_experiment: Option<volatile_experiment::Observation>,
     asynchronous: Option<async_persistence::Observation>,
+    async_authority: Option<async_authority::Reservation>,
     queue: VecDeque<Request>,
     outstanding: usize,
     outstanding_bytes: usize,
@@ -648,6 +658,7 @@ impl State {
             } else {
                 None
             },
+            async_authority: None,
             queue: VecDeque::new(),
             outstanding: 0,
             outstanding_bytes: 0,
@@ -760,7 +771,11 @@ impl Wal {
             native,
             persistence,
             async_closed_format: persistence == SessionPersistenceMode::Async,
+            async_recovery_format: persistence == SessionPersistenceMode::Async,
         };
+        if binding.async_recovery_format {
+            async_authority::create(directory, binding, &control)?;
+        }
         let digest = binding.digest()?;
         let segment = create_segment(directory, 0, digest, [0; 32])?;
         File::open(directory)?.sync_all()?;
@@ -887,6 +902,15 @@ impl Wal {
             return Err(invalid_data(
                 "native live creation requires its selected generation owner",
             ));
+        }
+        if binding.async_recovery_format {
+            let reservation = async_authority::read(&disk.directory, binding)?;
+            state
+                .native
+                .as_ref()
+                .ok_or_else(|| invalid_data("asynchronous authority native owner missing"))?
+                .check_async_reservation(reservation)?;
+            state.async_authority = Some(reservation);
         }
         // Bootstrap replaces its prospective state with the admitted Catalog.
         // Bind local cursor authority to that final state before the writer
@@ -2500,6 +2524,7 @@ fn audit_recovery_projected(
                 + 8
                 + 2 * usize::from(allow_snapshot_proof)
                 + 2 * usize::from(binding.async_closed_format)
+                + 2 * usize::from(binding.async_recovery_format)
             || !entry.file_type()?.is_file()
         {
             return Err(invalid_data("private WAL directory exceeds format bounds"));
@@ -2546,6 +2571,11 @@ fn audit_recovery_projected(
         {
             // The closed-incarnation protocol validates and consumes these
             // after complete generation/snapshot admission, before any writer.
+        } else if binding.async_recovery_format
+            && async_authority::is_authority_file(name, entry.metadata()?.len())?
+        {
+            // The separate authority promise is never generation garbage.
+            // It is validated before a writer or engine may use its range.
         } else if !basis_namespace.visit(
             name,
             entry.path(),

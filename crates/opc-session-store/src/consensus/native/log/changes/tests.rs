@@ -68,6 +68,40 @@ fn values(log: &NativeLog) -> Vec<u8> {
     serde_json::to_vec(&(log.vote, log.committed, log.purged, rows)).unwrap()
 }
 
+#[test]
+fn async_authority_reservation_rejects_vote_and_append_before_publication() {
+    use crate::sqlite::consensus::wal::async_authority::Reservation;
+    let reservation = Reservation::initial();
+    let outside = reservation.ceiling() + 1;
+    for operation in [
+        Operation::Vote(Vote::new(outside, SessionConsensusNodeId::new(7).unwrap())),
+        append(&[blank(outside, 3)]),
+    ] {
+        let mut storage = fixture();
+        storage.begin_changes().unwrap();
+        let before = values(&storage.log);
+        assert!(storage
+            .log
+            .project_reserved(&operation, &storage.business, None, Some(reservation))
+            .is_err());
+        assert_eq!(values(&storage.log), before);
+        storage.check_async_reservation(reservation).unwrap();
+        storage.validate_image().unwrap();
+        // A subsequent in-range operation still uses the unchanged owner.
+        storage
+            .log
+            .project_reserved(
+                &append(&[blank(2, 3)]),
+                &storage.business,
+                None,
+                Some(reservation),
+            )
+            .unwrap();
+        storage.validate_image().unwrap();
+        assert_eq!(storage.log.last(), Some(id(2, 3)));
+    }
+}
+
 fn cold(storage: &NativeStorage) -> NativeStorage {
     let mut image = Vec::new();
     storage.write_image(&mut image, [0xAD; 32], 19).unwrap();

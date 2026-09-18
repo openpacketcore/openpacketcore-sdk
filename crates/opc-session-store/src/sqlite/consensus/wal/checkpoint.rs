@@ -681,7 +681,7 @@ pub(super) fn finish(
             "native basis requires suffix-preserving selection",
         ));
     }
-    reclaim_covered(disk, &anchor, control)?;
+    reclaim_covered(disk, &anchor, control, false)?;
     state.base_sequence = anchor.position.sequence;
     state.history_bytes = 0;
     state.checkpoint_epoch = anchor.epoch;
@@ -693,7 +693,12 @@ pub(super) fn finish(
     Ok(())
 }
 
-pub(super) fn reclaim_covered(disk: &Disk, anchor: &Anchor, control: &IoControl) -> io::Result<()> {
+pub(super) fn reclaim_covered(
+    disk: &Disk,
+    anchor: &Anchor,
+    control: &IoControl,
+    async_recovery_format: bool,
+) -> io::Result<()> {
     // Do not report completion if cleanup fails. A subsequent owner verifies
     // and stabilizes the selected basis before retrying these exact removals.
     let mut retired = Vec::new();
@@ -715,6 +720,11 @@ pub(super) fn reclaim_covered(disk: &Disk, anchor: &Anchor, control: &IoControl)
             if number <= anchor.cut {
                 retired.push(entry.path());
             }
+        } else if async_recovery_format
+            && anchor.async_cut.is_some()
+            && super::async_authority::is_authority_file(name, entry.metadata()?.len())?
+        {
+            // Authority reservations outlive session generation reclamation.
         } else if !namespace.visit(
             name,
             entry.path(),

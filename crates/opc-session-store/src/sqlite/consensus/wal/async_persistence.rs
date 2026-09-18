@@ -110,6 +110,9 @@ pub(super) fn admit(
     {
         return Err(invalid_data("asynchronous generation exhausted"));
     }
+    if let Some(reservation) = state.async_authority {
+        reservation.check(sequence)?;
+    }
     application::project_operation(state, wal.binding, operation)?;
     state.sequence = sequence;
     dirty(state);

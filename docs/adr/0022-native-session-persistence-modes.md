@@ -280,6 +280,16 @@ acknowledgements retain their resident replication/application boundary.
 
 ### Majority-loss authority gap (SDK #908)
 
+The new `OPCNA003` root reserves a finite authority range independently of
+session generation selection. Creation syncs the exact-root-bound reservation
+before admitting any volatile operation. Admission checks its resident bound;
+ordinary acknowledgements perform no reservation I/O. Native application and
+snapshot admission check the same bounds. Reopening requires the retained
+reservation, and checkpoint reclamation cannot delete it. The initial range
+ends at `2^40 - 1`; exhaustion fails closed. Legacy root formats do not acquire
+this pre-loss evidence retroactively. Reservation alone grants no votes or
+traffic and does not yet provide the recovery protocol described below.
+
 Without completed-shutdown evidence, this restriction prevents an existing
 three-voter installation from recovering when two voters restart and one
 process survives. It is an availability limitation, not a successful recovery

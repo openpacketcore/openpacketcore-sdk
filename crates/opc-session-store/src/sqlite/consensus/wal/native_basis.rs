@@ -705,7 +705,12 @@ fn select(
     checkpoint::select(&disk.directory, &prepared.anchor, control)?;
     let select_io = select_io_started.elapsed();
     let reclaim_io_started = Instant::now();
-    checkpoint::reclaim_covered(disk, &prepared.anchor, control)?;
+    checkpoint::reclaim_covered(
+        disk,
+        &prepared.anchor,
+        control,
+        binding.async_recovery_format,
+    )?;
     let reclaim_io = reclaim_io_started.elapsed();
     let mut state = lock_state(shared)?;
     let held = Instant::now();
