@@ -13,6 +13,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   replacement, shutdown and multihoming failover qualification (Refs #788).
 
 ### Added
+- `opc-proto-ngap`: construct and admit Error Indication's optional 5G-S-TMSI
+  with its distinct ignore criticality. Preserve explicit signalling context,
+  required UE IDs and error basis; qualify the binding with independent Release
+  18 messages, bounded mutations and redacted field reconstruction (Refs #787).
 - `opc-n3iwf-fixtures`: execute 25 independently authored protocol-key custody
   schedules through the existing SDK API, including generation/reuse/drop and
   cancellation boundaries. Bind successful use to both synthetic AUTH answers

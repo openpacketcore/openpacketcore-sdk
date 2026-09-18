@@ -1,4 +1,5 @@
 use bytes::Bytes;
+use opc_proto_ngap::n3iwf::nas_fields::{AmfSetId, FiveGStmsi};
 use opc_proto_ngap::n3iwf::release::Cause;
 use opc_proto_ngap::n3iwf::reset::{
     ErrorIndication, ResetAcknowledge, ResetMessage, ResetRequest, Signalling,
@@ -87,6 +88,17 @@ fn value(row: &Value) -> ResetMessage {
             ran: get(85).map(|v| RanUeId::decode(v, context()).unwrap()),
             cause: get(15).map(|v| Cause::decode(v, context()).unwrap()),
             diagnostics,
+            fiveg_s_tmsi: get(26).map(|_| {
+                let model = &row["fiveg_s_tmsi"];
+                FiveGStmsi::new(
+                    AmfSetId::new(model["amf_set"].as_u64().unwrap() as u16).unwrap(),
+                    model["amf_pointer"].as_u64().unwrap() as u8,
+                    bytes(model["tmsi_hex"].as_str().unwrap())
+                        .try_into()
+                        .unwrap(),
+                )
+                .unwrap()
+            }),
         }),
     }
 }
@@ -110,7 +122,11 @@ fn depth(value: &ResetMessage) -> usize {
             diagnostic(&v.diagnostics).max(if v.connections.is_some() { 7 } else { 5 })
         }
         ResetMessage::Error(v) => {
-            diagnostic(&v.diagnostics).max(if v.cause.is_some() { 6 } else { 5 })
+            diagnostic(&v.diagnostics).max(if v.cause.is_some() || v.fiveg_s_tmsi.is_some() {
+                6
+            } else {
+                5
+            })
         }
     }
 }
@@ -220,8 +236,8 @@ fn complete_messages_match_independent_values_presence_and_signalling_rules() {
         }
         count += 1;
     }
-    assert_eq!(count, 165);
-    assert_eq!(reference["cases"].as_array().unwrap().len(), 189);
+    assert_eq!(count, 333);
+    assert_eq!(reference["cases"].as_array().unwrap().len(), 393);
 }
 
 #[test]
