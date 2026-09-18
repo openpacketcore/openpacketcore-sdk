@@ -130,6 +130,8 @@ pub mod resource_setup;
 pub mod session_lists;
 pub mod setup;
 pub mod setup_fields;
+/// NAS Non-Delivery Indication and UE Context Release Request field admission.
+pub mod ue_requests;
 
 /// The locally assigned, 32-bit RAN UE NGAP identifier.
 #[derive(Clone, Copy, PartialEq, Eq, Hash)]

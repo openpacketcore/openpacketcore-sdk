@@ -330,7 +330,7 @@ pub(super) fn validate_ids(
     }
     Ok(())
 }
-fn unique_id(seen: &mut [u64; 4], id: SessionId) -> Result<(), DecodeError> {
+pub(super) fn unique_id(seen: &mut [u64; 4], id: SessionId) -> Result<(), DecodeError> {
     let slot = &mut seen[usize::from(id.value() / 64)];
     let bit = 1_u64 << (id.value() % 64);
     if *slot & bit != 0 {

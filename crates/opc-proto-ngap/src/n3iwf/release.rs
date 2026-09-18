@@ -92,6 +92,19 @@ impl Cause {
         if first >> 5 >= 5 || first & 0x10 != 0 {
             return Err(unsupported());
         }
+        // Generated decoding skips unused final bits without requiring zero.
+        // Preflight the qualified root shape before handing it the value.
+        let bits: usize = 4 + match first >> 5 {
+            0 => 6,
+            1 => 1,
+            2 => 2,
+            _ => 3,
+        };
+        let length = bits.div_ceil(8);
+        let padding_mask = (1_u8 << (length * 8 - bits)) - 1;
+        if input.len() != length || input[length - 1] & padding_mask != 0 {
+            return Err(invalid("cause framing"));
+        }
         Self::from_generated(decode_leaf(input)?)
     }
     pub(super) fn from_generated(value: asn::Cause) -> Result<Self, DecodeError> {

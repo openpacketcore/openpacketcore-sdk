@@ -49,7 +49,7 @@ macro_rules! message_types {
         ///
         /// This selects the procedure code, outcome and procedure criticality
         /// together. It does not establish N3IWF semantic admission. Paging has
-        /// structural coverage only; the other fifteen outcomes have independent
+        /// structural coverage only; the other documented outcomes have independent
         /// Release 18 complete-message evidence.
         #[derive(Clone, Copy, Debug, PartialEq, Eq)]
         pub enum MessageType {
@@ -103,6 +103,8 @@ message_types! {
     InitialUeMessage, Initiating, PROCEDURE_CODE_INITIAL_UE, ignore, INITIAL_UE_MESSAGE;
     DownlinkNasTransport, Initiating, PROCEDURE_CODE_DOWNLINK_NAS_TRANSPORT, ignore, DOWNLINK_NAS_TRANSPORT;
     UplinkNasTransport, Initiating, PROCEDURE_CODE_UPLINK_NAS_TRANSPORT, ignore, UPLINK_NAS_TRANSPORT, 0;
+    NasNonDeliveryIndication, Initiating, PROCEDURE_CODE_NAS_NON_DELIVERY_INDICATION, ignore, NAS_NON_DELIVERY_INDICATION;
+    UeContextReleaseRequest, Initiating, PROCEDURE_CODE_UE_CONTEXT_RELEASE_REQUEST, ignore, UE_CONTEXT_RELEASE_REQUEST, 0;
     InitialContextSetupRequest, Initiating, PROCEDURE_CODE_INITIAL_CONTEXT_SETUP, reject, INITIAL_CONTEXT_SETUP_REQUEST;
     InitialContextSetupResponse, Successful, PROCEDURE_CODE_INITIAL_CONTEXT_SETUP, reject, INITIAL_CONTEXT_SETUP_RESPONSE;
     InitialContextSetupFailure, Unsuccessful, PROCEDURE_CODE_INITIAL_CONTEXT_SETUP, reject, INITIAL_CONTEXT_SETUP_FAILURE;
