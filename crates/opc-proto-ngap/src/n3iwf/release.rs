@@ -61,8 +61,11 @@ impl Cause {
     }
     /// Encode this root value through the generated schema.
     pub fn encode(self, ctx: EncodeContext) -> Result<EncodedValue, EncodeError> {
+        encode_leaf(&self.generated()?, ctx)
+    }
+    pub(super) fn generated(self) -> Result<asn::Cause, EncodeError> {
         let code = isize::from(self.code);
-        let value = match self.class {
+        match self.class {
             CauseClass::RadioNetwork => {
                 asn::CauseRadioNetwork::from_discriminant(code).map(asn::Cause::radioNetwork)
             }
@@ -79,8 +82,7 @@ impl Cause {
             EncodeError::new(EncodeErrorCode::Structural {
                 reason: "cause schema mismatch",
             })
-        })?;
-        encode_leaf(&value, ctx)
+        })
     }
     /// Decode a complete root value. Reject extensions before materializing
     /// the generated choice-extension open type.
@@ -90,7 +92,10 @@ impl Cause {
         if first >> 5 >= 5 || first & 0x10 != 0 {
             return Err(unsupported());
         }
-        let (class, code) = match decode_leaf::<asn::Cause>(input)? {
+        Self::from_generated(decode_leaf(input)?)
+    }
+    pub(super) fn from_generated(value: asn::Cause) -> Result<Self, DecodeError> {
+        let (class, code) = match value {
             asn::Cause::radioNetwork(value) => (CauseClass::RadioNetwork, value as u8),
             asn::Cause::transport(value) => (CauseClass::Transport, value as u8),
             asn::Cause::nas(value) => (CauseClass::Nas, value as u8),

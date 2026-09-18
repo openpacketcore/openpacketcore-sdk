@@ -122,6 +122,7 @@ pub mod nas;
 pub mod release;
 pub mod resource_fields;
 pub mod resource_request;
+pub mod resource_results;
 pub mod setup;
 pub mod setup_fields;
 

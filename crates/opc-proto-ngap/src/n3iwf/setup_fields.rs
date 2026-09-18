@@ -540,7 +540,7 @@ impl<'a> Reader<'a> {
     }
 }
 
-// Writes only the independently qualified identity/slice and 5QI 9 list roots.
+// Writes only independently qualified identity/slice and resource roots.
 // Buffer allocation follows exact sizing; checked writes fail if those layouts
 // ever diverge. It does not encode extension additions or arbitrary ASN.1.
 pub(super) struct Writer {

@@ -17,6 +17,7 @@ use opc_proto_ngap::n3iwf::resource_fields::{
     DownlinkTransport, QosFlowSetupList, SessionAggregateBitRate, SessionType, UplinkTransport,
 };
 use opc_proto_ngap::n3iwf::resource_request::SetupRequestTransfer;
+use opc_proto_ngap::n3iwf::resource_results::{SetupFailureTransfer, SetupResponseTransfer};
 use opc_proto_ngap::n3iwf::setup::{
     AmfName, GlobalN3iwfId, PagingDrx, PlmnSupportList, ServedGuamiList, SetupMessage,
     SupportedTaList,
@@ -70,6 +71,15 @@ fn exercise(data: &[u8]) {
         assert!(received.transfer == admitted.transfer);
         assert_eq!(received.ignored_ie_count, 0);
         assert!(received.notify_ie_ids.is_empty());
+    }
+    let result_ctx = DecodeContext { max_ies: 64, ..ctx };
+    if let Ok(value) = SetupResponseTransfer::decode(data, result_ctx) {
+        let wire = value.encode(EncodeContext::default()).unwrap();
+        assert!(SetupResponseTransfer::decode(wire.as_bytes(), result_ctx).unwrap() == value);
+    }
+    if let Ok(value) = SetupFailureTransfer::decode(data, result_ctx) {
+        let wire = value.encode(EncodeContext::default()).unwrap();
+        assert!(SetupFailureTransfer::decode(wire.as_bytes(), result_ctx).unwrap() == value);
     }
     if let Ok(field) = Guami::decode(data, ctx) {
         let wire = field.encode(EncodeContext::default()).unwrap();
