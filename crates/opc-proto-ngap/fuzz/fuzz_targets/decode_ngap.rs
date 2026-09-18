@@ -1,5 +1,7 @@
 #![no_main]
 
+#[path = "../../tests/support/setup_optionals.rs"]
+mod setup_optionals;
 #[path = "../../tests/support/release_sessions.rs"]
 mod release_sessions;
 
@@ -223,6 +225,7 @@ fuzz_target!(|data: &[u8]| {
         );
         assert_eq!(value.encode(output).unwrap().as_bytes().len(), 9);
     }
+    setup_optionals::exercise(data, decode, output);
     if let Ok(field) = GlobalN3iwfId::decode(data, decode) {
         let wire = field.encode(output).unwrap();
         assert!(GlobalN3iwfId::decode(wire.as_bytes(), decode).unwrap() == field);

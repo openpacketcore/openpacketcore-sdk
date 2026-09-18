@@ -179,6 +179,9 @@ fn wait(value: &str) -> TimeToWait {
 }
 fn base_request() -> NgSetupRequest {
     NgSetupRequest {
+        node_name: None,
+        retention: None,
+        extended_node_name: None,
         global: GlobalN3iwfId::new("001-01".parse().unwrap(), 1),
         tracking_areas: SupportedTaList::new(vec![SupportedTa::new(
             [0, 0, 1],
@@ -190,6 +193,8 @@ fn base_request() -> NgSetupRequest {
 }
 fn base_response() -> NgSetupResponse {
     NgSetupResponse {
+        retention: None,
+        extended_name: None,
         diagnostics: None,
         name: AmfName::new("synthetic-amf.example").unwrap(),
         served: ServedGuamiList::new(vec![Guami::new("001-01".parse().unwrap(), 1, 1, 1).unwrap()])
@@ -463,9 +468,9 @@ fn from_fields(kind: MessageType, fields: &[(u16, Criticality, Vec<u8>)]) -> Pdu
 }
 
 #[test]
-fn receiver_ignore_rules_preserve_mandatory_presence_and_other_fields_fail_explicitly() {
+fn receiver_ignore_rules_preserve_mandatory_presence_and_malformed_fields_fail_explicitly() {
     let reference = oracle();
-    for (label, kind, ignored, unsupported) in [
+    for (label, kind, ignored, malformed) in [
         (
             "base-NGSetupRequest",
             MessageType::NgSetupRequest,
@@ -506,7 +511,7 @@ fn receiver_ignore_rules_preserve_mandatory_presence_and_other_fields_fail_expli
                 original.ignored_ie_count + usize::from(*id != 21)
             );
         }
-        for id in unsupported {
+        for id in malformed {
             let mut fields = base.clone();
             fields.push((*id, Criticality::ignore, vec![0xff]));
             assert!(SetupMessage::from_pdu(&from_fields(kind, &fields), context()).is_err());

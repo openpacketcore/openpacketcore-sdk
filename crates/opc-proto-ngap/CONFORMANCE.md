@@ -343,17 +343,38 @@ filtered generic PDU without changing its raw image or activating an association
 
 | Outcome | Required fields | Optional fields admitted | Receiver-ignored IEs |
 |---|---|---|---|
-| Request | Global RAN Node ID 27 restricted to N3IWF; Supported TA List 102; presence of Default Paging DRX 21 | None | 21, 204 |
-| Response | AMF Name 1; Served GUAMI List 96; Relative AMF Capacity 86; PLMN Support List 80 | Response diagnostics 19 | 200, 404 |
+| Request | Global RAN Node ID 27 restricted to N3IWF; Supported TA List 102; presence of Default Paging DRX 21 | RAN Node Name 82, UE Retention Information 147, Extended RAN Node Name 273 (all ignore) | 21, 204 |
+| Response | AMF Name 1; Served GUAMI List 96; Relative AMF Capacity 86; PLMN Support List 80 | Response diagnostics 19, UE Retention Information 147, Extended AMF Name 274 (all ignore) | 200, 404 |
 | Failure | Cause 15 | Root Time To Wait 107, response diagnostics 19 | None |
 
 Default Paging DRX remains mandatory on the wire, but its received contents
 are ignored. `NgSetupRequest::construct` takes an explicit `PagingDrx`;
 `SetupMessage::from_pdu` returns only the interpreted request fields and the
 ignored count. Unknown-notify IDs are caller-owned diagnostics. Other
-recognized optional IEs fail explicitly, including names/retention
-outside the table. Served GUAMI backup names and all nested extensions are
-unsupported; their values are never silently discarded into a successful view.
+recognized optional IEs outside the table fail explicitly. Served GUAMI entries
+preserve optional root backup AMF names. All nested extensions, including GUAMI
+Type and Extended Backup AMF Name, remain unsupported; their values are never
+silently discarded into a successful view.
+
+RAN node names and backup AMF names use the root PrintableString alphabet and
+1..=150-character bound. Extended RAN and AMF names preserve independent optional
+VisibleString and UTF8String components, including both absent or both present.
+The qualified AMF layout supplies shared validation: depth two, at most 754
+octets, 1..=150 characters per present component, and at most 600 UTF-8 octets.
+The separate RAN wrapper is compared with its independently compiled schema.
+UE Retention Information preserves absence versus the root `UesRetained` report;
+its one-octet encoding requires zero padding and rejects extension enum values.
+Retention and names do not restore a context, select an AMF or authorize an
+association. Generic duplicate selection precedes typed admission, and mutable
+containers are revalidated before their selected fields are interpreted.
+
+`ServedGuamiList::new` and `values` keep their identity-only API.
+`with_backups` and `entries` preserve the name associated with every identity;
+all constructors enforce 1..=256 identities. This adds no list depth. Each name
+is bounded before copying and contributes its exact encoded size to preflight.
+`NgSetupRequest` struct literals gain optional `node_name`, `retention` and
+`extended_node_name` fields. Response literals gain `retention` and
+`extended_name`; absence remains `None`.
 
 `setup_fields` uses shared `PlmnId` and `Snssai` values. Root counts are
 TA/GUAMI 1..=256, PLMN 1..=12 and slices 1..=1024. Before each receive list
@@ -387,6 +408,21 @@ pinned Pycrate/pypdf reference environment. All 150 vectors seed fuzz/replay;
 ordinary tests exercise every truncation and sampled byte mutations across
 large list vectors. No AMF selection, slice authorization, timer/retry,
 configuration application or live peer interoperability is established.
+
+The additional [optional-field oracle](tests/fixtures/n3iwf-setup-optionals.json)
+contains 162 complete messages: 118 admitted cases, including 112 independent
+construction comparisons, and 44 explicit policy/malformed/unsupported cases.
+It covers every name presence combination, UTF-8 byte and character boundaries,
+all root backup-list count/name limits including the fragmented maximum,
+duplicate First/Last/Reject policies, unknown criticalities, reordered IEs and
+malformed name/retention/list framing. The original 150 setup vectors remain
+unchanged. Reproduce with `scripts/generate-ngap-setup-optionals.py --spec PATH
+--output PATH`; the generator uses the same pinned specification and Python
+environment. The structured Pycrate APER path handles complete-message
+fragmentation; its ordinary path also agrees for messages below 16 KiB.
+Twelve additional fuzz seeds use shared bounded semantic reconstruction.
+Ordinary tests replay sampled truncations and byte mutations under two resource
+contexts; no new libFuzzer campaign or external interoperability is claimed.
 
 ## Initial context individual fields
 

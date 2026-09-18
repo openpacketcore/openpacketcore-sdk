@@ -188,29 +188,68 @@ impl SupportedTa {
     }
 }
 
-/// Served GUAMIs, without backup names or extension additions.
+/// Served GUAMIs with independent optional backup AMF names; no extensions.
 #[derive(Clone, PartialEq, Eq)]
-pub struct ServedGuamiList(Vec<Guami>);
+pub struct ServedGuamiList {
+    identities: Vec<Guami>,
+    // Kept index-aligned by the two constructors and the bounded decoder.
+    backups: Vec<Option<AmfName>>,
+}
 redacted!(ServedGuamiList);
 impl ServedGuamiList {
     /// Require the ASN.1 root count (1..=256).
     pub fn new(values: Vec<Guami>) -> Result<Self, DecodeError> {
         root_count(values.len(), 256)?;
-        Ok(Self(values))
+        let backups = vec![None; values.len()];
+        Ok(Self {
+            identities: values,
+            backups,
+        })
+    }
+    /// Require 1..=256 entries and preserve each optional backup name.
+    /// Names advertise peer information; they do not select or activate an AMF.
+    pub fn with_backups(values: Vec<(Guami, Option<AmfName>)>) -> Result<Self, DecodeError> {
+        root_count(values.len(), 256)?;
+        let (identities, backups) = values.into_iter().unzip();
+        Ok(Self {
+            identities,
+            backups,
+        })
     }
     /// Explicit access to the advertised identities.
     pub fn values(&self) -> &[Guami] {
-        &self.0
+        &self.identities
+    }
+    /// Explicit access to identities and their associated optional names.
+    pub fn entries(&self) -> impl ExactSizeIterator<Item = (&Guami, Option<&AmfName>)> {
+        self.identities
+            .iter()
+            .zip(self.backups.iter().map(Option::as_ref))
     }
     /// Preflight exact output size before allocating the field output.
     pub fn encode(&self, ctx: EncodeContext) -> Result<EncodedValue, EncodeError> {
-        let length = 1 + 7 * self.0.len();
+        let length = 1
+            + 7 * self.identities.len()
+            + self
+                .backups
+                .iter()
+                .flatten()
+                .map(|name| 2 + name.as_str().len())
+                .sum::<usize>();
         capacity(length, ctx)?;
         let value = asn::ServedGUAMIList(
-            self.0
-                .iter()
-                .map(|v| asn::ServedGUAMIItem::new(v.generated(), None, None))
-                .collect(),
+            self.entries()
+                .map(|(v, name)| {
+                    let name = name
+                        .map(|name| {
+                            rasn::types::PrintableString::try_from(name.as_str().as_bytes())
+                                .map(asn::AMFName)
+                                .map_err(|_| encode_invalid())
+                        })
+                        .transpose()?;
+                    Ok(asn::ServedGUAMIItem::new(v.generated(), name, None))
+                })
+                .collect::<Result<_, EncodeError>>()?,
         );
         encode_collection(&value, length, ctx)
     }
@@ -222,11 +261,19 @@ impl ServedGuamiList {
         let count = reader.count(8, 256, 53)?;
         let mut values = Vec::with_capacity(count);
         for _ in 0..count {
-            reader.flags(3)?; // item extension, backup name, IE extensions
-            values.push(reader.guami()?);
+            reader.flags(1)?;
+            let backup = reader.bits(1)? != 0;
+            reader.flags(1)?;
+            let identity = reader.guami()?;
+            let name = if backup {
+                Some(reader.amf_name()?)
+            } else {
+                None
+            };
+            values.push((identity, name));
         }
         reader.finish()?;
-        Ok(Self(values))
+        Self::with_backups(values)
     }
 }
 
@@ -361,6 +408,84 @@ impl AmfName {
     }
 }
 
+/// RAN node name with the same root PrintableString layout as AMFName.
+#[derive(Clone, PartialEq, Eq)]
+pub struct RanNodeName(AmfName);
+redacted!(RanNodeName);
+impl RanNodeName {
+    /// Require one through 150 characters from the PrintableString alphabet.
+    pub fn new(value: &str) -> Result<Self, DecodeError> {
+        AmfName::new(value).map(Self)
+    }
+    /// Explicit access to the advertised name.
+    pub fn as_str(&self) -> &str {
+        self.0.as_str()
+    }
+    /// Encode the independently qualified identical root layout.
+    pub fn encode(&self, ctx: EncodeContext) -> Result<EncodedValue, EncodeError> {
+        self.0.encode(ctx)
+    }
+    /// Decode the root at depth one; reject unsupported extension lengths.
+    pub fn decode(input: &[u8], ctx: DecodeContext) -> Result<Self, DecodeError> {
+        AmfName::decode(input, ctx).map(Self)
+    }
+}
+
+/// Extended RAN node name preserving both independent optional name strings.
+/// Its root layout and bounds match Extended-AMFName, with distinct IE binding.
+#[derive(Clone, PartialEq, Eq)]
+pub struct ExtendedRanNodeName(super::nas_fields::ExtendedAmfName);
+redacted!(ExtendedRanNodeName);
+impl ExtendedRanNodeName {
+    /// Check the independent VisibleString/UTF8String root bounds before copying.
+    pub fn new(visible: Option<&str>, utf8: Option<&str>) -> Result<Self, DecodeError> {
+        super::nas_fields::ExtendedAmfName::new(visible, utf8).map(Self)
+    }
+    /// Explicit access to the optional VisibleString name.
+    pub fn visible(&self) -> Option<&str> {
+        self.0.visible()
+    }
+    /// Explicit access to the optional UTF8String name.
+    pub fn utf8(&self) -> Option<&str> {
+        self.0.utf8()
+    }
+    /// Encode at most 754 octets after exact-size capacity preflight.
+    pub fn encode(&self, ctx: EncodeContext) -> Result<EncodedValue, EncodeError> {
+        self.0.encode(ctx)
+    }
+    /// Decode at depth two, rejecting extensions, invalid strings and padding.
+    pub fn decode(input: &[u8], ctx: DecodeContext) -> Result<Self, DecodeError> {
+        super::nas_fields::ExtendedAmfName::decode(input, ctx).map(Self)
+    }
+}
+
+/// Root peer report that UE contexts were retained. It grants no local authority.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum UeRetentionInformation {
+    /// The sender reports retained UE contexts.
+    UesRetained,
+}
+redacted!(UeRetentionInformation);
+impl UeRetentionInformation {
+    /// Encode the one root enumeration value with zero padding.
+    pub fn encode(self, ctx: EncodeContext) -> Result<EncodedValue, EncodeError> {
+        capacity(1, ctx)?;
+        Ok(EncodedValue(Zeroizing::new(vec![0])))
+    }
+    /// Require exactly one zero octet at depth one. Extension enum values
+    /// remain unsupported, and padding/trailing octets are never accepted.
+    pub fn decode(input: &[u8], ctx: DecodeContext) -> Result<Self, DecodeError> {
+        bound(input, ctx, 1)?;
+        if input.first().is_some_and(|v| v & 0x80 != 0) {
+            return Err(unsupported());
+        }
+        if input != [0] {
+            return Err(invalid("ue retention root encoding"));
+        }
+        Ok(Self::UesRetained)
+    }
+}
+
 fn root_count(count: usize, maximum: usize) -> Result<(), DecodeError> {
     if count == 0 || count > maximum {
         Err(invalid("setup root count"))
@@ -456,6 +581,22 @@ impl<'a> Reader<'a> {
             return Err(invalid("setup field padding"));
         }
         Ok(())
+    }
+    fn amf_name(&mut self) -> Result<AmfName, DecodeError> {
+        self.flags(1)?; // PrintableString extension length.
+        let length = usize::from(self.bits(8)?) + 1;
+        root_count(length, 150)?;
+        self.align()?;
+        let start = self.bit / 8;
+        let bytes = self
+            .input
+            .get(start..start + length)
+            .ok_or_else(|| invalid("truncated backup amf name"))?;
+        let name = AmfName::new(
+            std::str::from_utf8(bytes).map_err(|_| invalid("backup amf name alphabet"))?,
+        )?;
+        self.bit += length * 8;
+        Ok(name)
     }
     /// Borrow the determinant and all fragments after complete size preflight.
     pub(super) fn framed_octets(&mut self, maximum: usize) -> Result<&'a [u8], DecodeError> {
