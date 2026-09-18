@@ -34,6 +34,9 @@ mod notify;
 #[path = "../../tests/support/reset.rs"]
 mod reset;
 
+#[path = "../../tests/support/nas.rs"]
+mod nas;
+
 use bytes::Bytes;
 use libfuzzer_sys::fuzz_target;
 use opc_proto_ngap::n3iwf::context_fields::{AllowedNssai, Guami, SecurityAlgorithmMasks};
@@ -263,12 +266,7 @@ fuzz_target!(|data: &[u8]| {
             assert!(readmitted.notify_ie_ids.is_empty());
         }
         if let Ok(admitted) = NasMessage::from_pdu(&pdu, decode) {
-            let constructed = admitted.message.construct(decode).unwrap();
-            let wire = encode(&constructed, output).unwrap();
-            let received = Pdu::decode_owned(Bytes::from(wire), decode).unwrap();
-            let readmitted = NasMessage::from_pdu(&received, decode).unwrap();
-            assert_eq!(readmitted.ignored_ie_count, 0);
-            assert!(readmitted.notify_ie_ids.is_empty());
+            nas::reconstruct(&admitted.message, decode, output);
         }
         if let Ok(wire) = encode(&pdu, output) {
             assert_eq!(pdu.wire_len(output).unwrap(), wire.len());

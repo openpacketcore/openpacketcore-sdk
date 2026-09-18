@@ -13,6 +13,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   replacement, shutdown and multihoming failover qualification (Refs #788).
 
 ### Added
+- `opc-proto-ngap`: construct and admit optional Allowed NSSAI in Initial UE
+  and Downlink NAS messages and optional Old AMF in Downlink NAS. Both messages
+  also admit Partially Allowed NSSAI with combined count/disjointness checks;
+  Initial UE admits the fixed 44-bit Selected NID with strict padding, AMF Set
+  ID, 5G-S-TMSI and opaque AMF reroute containers. Downlink admits Masked IMEISV
+  and Extended Old AMF with independent optional VisibleString/UTF8String names.
+  Reuse bounded, redacted field types and qualify complete messages with independent
+  Release 18 reference bytes, duplicate policies and adverse field/boundary tests
+  (Refs #787).
+- `opc-n3iwf-fixtures`: bind 22 unchanged independent N3 packet vectors into
+  the catalog, covering both downlink RQI values, all absent/present PPI values
+  and QFI boundaries in both directions. Check source provenance separately
+  from regeneration and execute the shared PSC codec (Refs #784).
 - `opc-sctp`: add an explicitly unprotected N2 profile and live adapter with
   strict PPID 60, the default NGAP service port, bounded ordered records,
   separate notification delivery and redacted diagnostics. Reuse existing

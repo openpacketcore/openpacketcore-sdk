@@ -125,6 +125,8 @@ pub mod modify_request;
 /// Bounded Modify response and unsuccessful transfer root fields.
 pub mod modify_results;
 pub mod nas;
+/// Bounded identity and AMF reroute root values for NAS message admission.
+pub mod nas_fields;
 pub mod release;
 
 /// Bounded UE Context Release Complete session reports.

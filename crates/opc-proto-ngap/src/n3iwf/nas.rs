@@ -8,6 +8,11 @@
 //! cannot silently enable a partial procedure. The source PDU retains all bytes
 //! required by its existing raw-preservation contract.
 
+use super::context_fields::{validate_slice_lists, AllowedNssai, PartiallyAllowedNssai};
+use super::nas_fields::{
+    AmfRerouteInformation, AmfSetId, ExtendedAmfName, FiveGStmsi, MaskedImeisv,
+};
+use super::setup_fields::AmfName;
 use super::*;
 use crate::{policy, Message, MessageType, Pdu, PduKind, ProtocolIe};
 use opc_protocol::Encode;
@@ -15,6 +20,45 @@ use opc_protocol::Encode;
 /// The NGAP establishment-cause enumeration. Selection for non-3GPP access
 /// follows TS 24.502; this codec does not select a cause on the caller's behalf.
 pub use asn::RRCEstablishmentCause as EstablishmentCause;
+
+/// The fixed 44-bit Selected NID root value. Together with Selected PLMN it
+/// identifies an SNPN (TS 29.413 5.2); neither value grants access authority.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub struct SelectedNid(u64);
+redacted!(SelectedNid);
+impl SelectedNid {
+    /// Admit exactly the unsigned 44-bit range; no high bits are discarded.
+    pub fn new(value: u64) -> Result<Self, DecodeError> {
+        if value >= (1u64 << 44) {
+            return Err(invalid("selected nid range"));
+        }
+        Ok(Self(value))
+    }
+    /// Explicit access to the value, with ASN.1 bit zero as bit 43.
+    pub const fn value(self) -> u64 {
+        self.0
+    }
+    /// Encode six octets with zero low-nibble padding after the 44 bits.
+    pub fn encode(self, ctx: EncodeContext) -> Result<EncodedValue, EncodeError> {
+        capacity(6, ctx)?;
+        Ok(EncodedValue(Zeroizing::new(
+            (self.0 << 4).to_be_bytes()[2..].to_vec(),
+        )))
+    }
+    /// Decode exactly six octets at depth one, rejecting nonzero padding.
+    pub fn decode(input: &[u8], ctx: DecodeContext) -> Result<Self, DecodeError> {
+        bound(input, ctx, 1)?;
+        if input.len() != 6 || input[5] & 0x0f != 0 {
+            return Err(invalid("selected nid extent or padding"));
+        }
+        Ok(Self(
+            input
+                .iter()
+                .fold(0u64, |value, byte| (value << 8) | u64::from(*byte))
+                >> 4,
+        ))
+    }
+}
 
 /// UE aggregate maximum bit rates, in bits per second, with distinct UL/DL values.
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -86,6 +130,22 @@ pub enum NasMessage<'a> {
         selected_plmn: Option<PlmnId>,
         /// Whether UE context establishment is requested.
         context_requested: bool,
+        /// Optional advertised slices. Admission grants no slice authorization.
+        allowed_nssai: Option<AllowedNssai>,
+        /// Optional partial slice list, disjoint from Allowed NSSAI; their
+        /// combined count cannot exceed eight (TS 38.413 8.6.1.3).
+        partially_allowed_nssai: Option<PartiallyAllowedNssai>,
+        /// Optional SNPN identifier component. A missing Selected PLMN stays
+        /// absent; admission does not invent or select a network identity.
+        selected_nid: Option<SelectedNid>,
+        /// Optional reroute indication's AMF Set ID, separate from the set in
+        /// 5G-S-TMSI. These identifiers are not required to be equal.
+        amf_set_id: Option<AmfSetId>,
+        /// Optional 5G-S-TMSI. The caller determines when its presence is
+        /// expected; this codec has no subscriber or NAS procedure state.
+        fiveg_s_tmsi: Option<FiveGStmsi>,
+        /// Optional opaque information from the source AMF. No reroute occurs.
+        reroute: Option<AmfRerouteInformation>,
     },
     /// Downlink NAS Transport (initiating procedure 4).
     Downlink {
@@ -97,6 +157,18 @@ pub enum NasMessage<'a> {
         nas: NasPdu<'a>,
         /// Applicable optional rate limit; never treated as a receiver-ignored IE.
         aggregate_bit_rate: Option<UeAggregateBitRate>,
+        /// Optional advertised slices. Admission grants no slice authorization.
+        allowed_nssai: Option<AllowedNssai>,
+        /// Previous AMF name, without selecting or authorizing an AMF.
+        old_amf: Option<AmfName>,
+        /// Optional fixed-width masked equipment identity.
+        masked_imeisv: Option<MaskedImeisv>,
+        /// Optional extended previous-AMF names, independently preserved
+        /// alongside Old AMF without choosing a routing or display preference.
+        extended_old_amf: Option<ExtendedAmfName>,
+        /// Optional partial slice list with the combined count/disjointness
+        /// rules of TS 38.413 8.6.2.3.
+        partially_allowed_nssai: Option<PartiallyAllowedNssai>,
     },
     /// Uplink NAS Transport (initiating procedure 46).
     Uplink {
@@ -151,6 +223,12 @@ impl NasMessage<'_> {
                 cause,
                 selected_plmn,
                 context_requested,
+                allowed_nssai,
+                partially_allowed_nssai,
+                selected_nid,
+                amf_set_id,
+                fiveg_s_tmsi,
+                reroute,
             } => {
                 fields.push((
                     85,
@@ -188,6 +266,48 @@ impl NasMessage<'_> {
                             .map_err(encode_error)?,
                     ));
                 }
+                if let Some(slices) = allowed_nssai {
+                    fields.push((
+                        0,
+                        Criticality::reject,
+                        slices.encode(output).map_err(encode_error)?,
+                    ));
+                }
+                if let Some(slices) = partially_allowed_nssai {
+                    fields.push((
+                        414,
+                        Criticality::ignore,
+                        slices.encode(output).map_err(encode_error)?,
+                    ));
+                }
+                if let Some(nid) = selected_nid {
+                    fields.push((
+                        371,
+                        Criticality::ignore,
+                        nid.encode(output).map_err(encode_error)?,
+                    ));
+                }
+                if let Some(value) = amf_set_id {
+                    fields.push((
+                        3,
+                        Criticality::ignore,
+                        value.encode(output).map_err(encode_error)?,
+                    ));
+                }
+                if let Some(value) = fiveg_s_tmsi {
+                    fields.push((
+                        26,
+                        Criticality::reject,
+                        value.encode(output).map_err(encode_error)?,
+                    ));
+                }
+                if let Some(value) = reroute {
+                    fields.push((
+                        171,
+                        Criticality::ignore,
+                        value.encode(output).map_err(encode_error)?,
+                    ));
+                }
                 MessageType::InitialUeMessage
             }
             Self::Downlink {
@@ -195,6 +315,11 @@ impl NasMessage<'_> {
                 ran,
                 nas,
                 aggregate_bit_rate,
+                allowed_nssai,
+                old_amf,
+                masked_imeisv,
+                extended_old_amf,
+                partially_allowed_nssai,
             } => {
                 fields.push((
                     10,
@@ -216,6 +341,41 @@ impl NasMessage<'_> {
                         110,
                         Criticality::ignore,
                         rate.encode(output).map_err(encode_error)?,
+                    ));
+                }
+                if let Some(slices) = allowed_nssai {
+                    fields.push((
+                        0,
+                        Criticality::reject,
+                        slices.encode(output).map_err(encode_error)?,
+                    ));
+                }
+                if let Some(name) = old_amf {
+                    fields.push((
+                        48,
+                        Criticality::reject,
+                        name.encode(output).map_err(encode_error)?,
+                    ));
+                }
+                if let Some(slices) = partially_allowed_nssai {
+                    fields.push((
+                        414,
+                        Criticality::ignore,
+                        slices.encode(output).map_err(encode_error)?,
+                    ));
+                }
+                if let Some(value) = masked_imeisv {
+                    fields.push((
+                        34,
+                        Criticality::ignore,
+                        value.encode(output).map_err(encode_error)?,
+                    ));
+                }
+                if let Some(value) = extended_old_amf {
+                    fields.push((
+                        443,
+                        Criticality::ignore,
+                        value.encode(output).map_err(encode_error)?,
                     ));
                 }
                 MessageType::DownlinkNasTransport
@@ -319,12 +479,12 @@ fn admit<'a>(
     let (profile, supported, ignored): (policy::IeProfile, &[u16], &[u16]) = match kind {
         MessageType::InitialUeMessage => (
             policy::INITIAL_UE_MESSAGE,
-            &[85, 38, 121, 90, 174, 112],
+            &[85, 38, 121, 90, 174, 112, 0, 414, 371, 3, 26, 171],
             &[201, 224, 225, 227, 259, 333, 402, 427],
         ),
         MessageType::DownlinkNasTransport => (
             policy::DOWNLINK_NAS_TRANSPORT,
-            &[10, 85, 38, 110],
+            &[10, 85, 38, 110, 0, 48, 414, 34, 443],
             &[
                 83, 36, 31, 177, 205, 206, 209, 222, 117, 228, 226, 264, 334, 400,
             ],
@@ -340,6 +500,15 @@ fn admit<'a>(
     let mut selected_plmn = None;
     let mut context_requested = false;
     let mut aggregate_bit_rate = None;
+    let mut allowed_nssai = None;
+    let mut old_amf = None;
+    let mut partially_allowed_nssai = None;
+    let mut selected_nid = None;
+    let mut amf_set_id = None;
+    let mut fiveg_s_tmsi = None;
+    let mut reroute = None;
+    let mut masked_imeisv = None;
+    let mut extended_old_amf = None;
     let mut ignored_ie_count = 0;
     let mut notify_ie_ids = Vec::new();
     let leaf_ctx = DecodeContext {
@@ -366,6 +535,15 @@ fn admit<'a>(
             continue;
         }
         match id {
+            0 => allowed_nssai = Some(AllowedNssai::decode(value, leaf_ctx)?),
+            48 => old_amf = Some(AmfName::decode(value, leaf_ctx)?),
+            414 => partially_allowed_nssai = Some(PartiallyAllowedNssai::decode(value, leaf_ctx)?),
+            371 => selected_nid = Some(SelectedNid::decode(value, leaf_ctx)?),
+            3 => amf_set_id = Some(AmfSetId::decode(value, leaf_ctx)?),
+            26 => fiveg_s_tmsi = Some(FiveGStmsi::decode(value, leaf_ctx)?),
+            171 => reroute = Some(AmfRerouteInformation::decode(value, leaf_ctx)?),
+            34 => masked_imeisv = Some(MaskedImeisv::decode(value, leaf_ctx)?),
+            443 => extended_old_amf = Some(ExtendedAmfName::decode(value, leaf_ctx)?),
             10 => amf = Some(AmfUeId::decode(value, leaf_ctx)?),
             85 => ran = Some(RanUeId::decode(value, leaf_ctx)?),
             38 => nas = Some(NasPdu::decode(value, leaf_ctx)?),
@@ -389,6 +567,7 @@ fn admit<'a>(
     }
     let ran = ran.ok_or_else(|| invalid("missing ran ue id"))?;
     let nas = nas.ok_or_else(|| invalid("missing nas pdu"))?;
+    validate_slice_lists(allowed_nssai.as_ref(), partially_allowed_nssai.as_ref())?;
     let message = match kind {
         MessageType::InitialUeMessage => NasMessage::InitialUe {
             ran,
@@ -397,12 +576,23 @@ fn admit<'a>(
             cause: cause.ok_or_else(|| invalid("missing establishment cause"))?,
             selected_plmn,
             context_requested,
+            allowed_nssai,
+            partially_allowed_nssai,
+            selected_nid,
+            amf_set_id,
+            fiveg_s_tmsi,
+            reroute,
         },
         MessageType::DownlinkNasTransport => NasMessage::Downlink {
             amf: amf.ok_or_else(|| invalid("missing amf ue id"))?,
             ran,
             nas,
             aggregate_bit_rate,
+            allowed_nssai,
+            old_amf,
+            masked_imeisv,
+            extended_old_amf,
+            partially_allowed_nssai,
         },
         MessageType::UplinkNasTransport => NasMessage::Uplink {
             amf: amf.ok_or_else(|| invalid("missing amf ue id"))?,

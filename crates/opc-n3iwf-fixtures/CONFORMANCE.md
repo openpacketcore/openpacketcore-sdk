@@ -71,8 +71,20 @@ outcome must match the runtime applicability rules for every qualified codec.
 The current SDK checks framing and opaque IE bytes against those independent
 results, and rejects incorrect procedure criticality before typed decoding.
 The complete existing Echo Request/Response and downlink PSC literals are
-compared to the published GTP-U bytes. Codec execution adds semantic checks;
-round trips alone do not prove external interoperability.
+compared to the published GTP-U bytes. Twenty-two additional PSC packets reuse
+unchanged cases from the independent `opc-gtpu-dataplane/tests/n3_reference.tsv`
+corpus (SHA-256 `31da0a1658218432817bc181be4233fadd4fd1f36c36f3d29f087bc131b8424a`).
+At QFI 9 they cover both downlink RQI values and all absent/present PPI values;
+QFI 0/63 also cover uplink and downlink. The source is generated without SDK
+codec or catalog imports under TS 38.415 V18.2.0 5.5.2/5.5.3 and the framing
+clauses of TS 29.281 V18.4.0. Each manifest records its source path, digest,
+case and expected fields. A separate verifier rejects substituted bytes even
+when their local digest is refreshed, or changed source, direction, field,
+critical provenance or normative-source claims. Existing fixture wires remain
+unchanged. Codec execution checks all 33 GTP-U catalog cases and preserves the
+new packets' opaque payload. This qualifies synthetic PSC wire fields only;
+forwarding installation, classifier binding and backend capability remain #790.
+Round trips alone do not prove external interoperability.
 
 ## Unsupported evidence
 
