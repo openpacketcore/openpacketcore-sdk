@@ -166,6 +166,18 @@ pub(super) fn write_loop(
                 continue;
             }
             if state.status != Status::Running && progress.caught_up() {
+                if state.consensus_closed {
+                    if let Err(error) = async_closed::publish(&state, disk, binding, control) {
+                        application::record_failure(
+                            &mut state,
+                            SessionStorageFailure::from_io(
+                                SessionStorageFailureStage::Persistence,
+                                &error,
+                            ),
+                        );
+                        return Err(error);
+                    }
+                }
                 state.status = Status::Closed;
                 shared.ready.notify_all();
                 return Ok(());

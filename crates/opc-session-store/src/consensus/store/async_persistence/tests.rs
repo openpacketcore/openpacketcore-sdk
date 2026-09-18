@@ -27,6 +27,7 @@ use crate::{SessionAsyncRecoveryState, SnapshotIntegrityPolicy};
 
 mod admission;
 mod bootstrap;
+mod closed;
 mod initialization;
 mod majority_authority;
 mod races;
@@ -258,6 +259,27 @@ impl Fleet {
         hook: Option<GenerationHook>,
         root_hook: Option<crate::sqlite::consensus::wal::owner::RootHookForTest>,
     ) -> Result<(), ConsensusSessionStoreOpenError> {
+        self.open_with_all_hooks(index, mode, hook, root_hook, None)
+            .await
+    }
+
+    async fn open_with_io_hook(
+        &mut self,
+        index: usize,
+        hook: crate::sqlite::consensus::wal::owner::IoHookForTest,
+    ) -> Result<(), ConsensusSessionStoreOpenError> {
+        self.open_with_all_hooks(index, SessionPersistenceMode::Async, None, None, Some(hook))
+            .await
+    }
+
+    async fn open_with_all_hooks(
+        &mut self,
+        index: usize,
+        mode: SessionPersistenceMode,
+        hook: Option<GenerationHook>,
+        root_hook: Option<crate::sqlite::consensus::wal::owner::RootHookForTest>,
+        io_hook: Option<crate::sqlite::consensus::wal::owner::IoHookForTest>,
+    ) -> Result<(), ConsensusSessionStoreOpenError> {
         assert!(self.stores[index].is_none());
         let backend =
             SqliteSessionBackend::open(self.directory.path().join(format!("node-{index}.sqlite")))
@@ -275,6 +297,13 @@ impl Fleet {
                 .as_ref()
                 .unwrap()
                 .set_root_hook_for_test(hook);
+        }
+        if let Some(hook) = io_hook {
+            backend
+                .native_owner
+                .as_ref()
+                .unwrap()
+                .set_io_hook_for_test(hook);
         }
         let peers = self
             .peers
@@ -391,6 +420,17 @@ impl Fleet {
     }
 
     async fn close_result(&mut self, index: usize) -> Result<(), StoreError> {
+        *self.peers[index].handler.write().await = None;
+        if let Some(store) = self.stores[index].take() {
+            // These pre-existing fixtures deliberately exercise uncertified
+            // cold incarnations. Join every real owner, but omit only the new
+            // close certificate. This is not a power-loss simulation.
+            return store.shutdown_with_closed_proof(false).await;
+        }
+        Ok(())
+    }
+
+    async fn close_clean(&mut self, index: usize) -> Result<(), StoreError> {
         *self.peers[index].handler.write().await = None;
         if let Some(store) = self.stores[index].take() {
             return store.shutdown().await;

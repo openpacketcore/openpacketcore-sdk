@@ -632,6 +632,30 @@ async fn async_persistence_compacted_snapshot_cancellation_fences_replacement_an
             .await
             .traffic_authority()
             .is_granted());
+        // The repaired incarnation can now certify its own completed shutdown.
+        // Its retained snapshot origin must still pass full validation before
+        // that proof can be consumed on the following reopen.
+        fleet.close_clean(story.follower).await.unwrap();
+        fleet
+            .open(story.follower, SessionPersistenceMode::Async)
+            .await
+            .unwrap();
+        assert_eq!(
+            fleet.store(story.follower).persistence_health().recovery,
+            Some(SessionAsyncRecoveryState::Active)
+        );
+        assert!(!fleet.store(story.follower).status().admitted);
+        fleet
+            .store(story.follower)
+            .initialize_cluster()
+            .await
+            .unwrap();
+        assert_recorded(
+            fleet.store(story.follower),
+            &story.second,
+            &story.second_outcome,
+        )
+        .await;
     })
     .catch_unwind()
     .await;

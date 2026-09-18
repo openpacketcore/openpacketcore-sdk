@@ -534,6 +534,22 @@ impl Opening {
                 (native, selected, 0)
             }
         };
+        // All snapshot/origin, generation, vote/log and exact authority
+        // validation has completed. Consume before starting the writer, so a
+        // second cold incarnation can never reuse this permission.
+        let recovered_closed = if binding.async_closed_format {
+            async_closed::consume(
+                &directory,
+                binding,
+                disk.anchor
+                    .as_ref()
+                    .ok_or_else(|| invalid_data("closed incarnation selector missing"))?,
+                &native,
+                &control,
+            )?
+        } else {
+            false
+        };
         let mut state = State::recovered(
             binding,
             conn,
@@ -549,6 +565,8 @@ impl Opening {
             .and_then(checkpoint::Anchor::native_applied);
         let mut wal = Wal::start_state(binding, limits, state, disk, control, Some(selected))?;
         wal.directory_pin = Some(directory_pin);
+        wal.recovered_closed
+            .store(recovered_closed, std::sync::atomic::Ordering::Release);
         Ok(wal)
     }
 }

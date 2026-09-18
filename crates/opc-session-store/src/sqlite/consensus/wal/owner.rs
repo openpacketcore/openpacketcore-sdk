@@ -19,10 +19,16 @@ use crate::sqlite::consensus::{self, SqliteConsensusCore};
 pub(super) const ROOT_BYTES: u64 = 168;
 const ROOT_MAGIC: &[u8; 8] = b"OPCNR001";
 const ASYNC_ROOT_MAGIC: &[u8; 8] = b"OPCNA001";
+// V1 readers must fail before participating: they do not consume a closed
+// incarnation proof and could otherwise leave it beside new volatile work.
+const ASYNC_CLOSED_ROOT_MAGIC: &[u8; 8] = b"OPCNA002";
 const SELECTION_ATTRIBUTE: &str = "user.opc.native-root-v1";
 
 #[cfg(test)]
 type GenerationHookForTest = Arc<dyn Fn() -> io::Result<()> + Send + Sync>;
+
+#[cfg(test)]
+pub(crate) type IoHookForTest = Arc<dyn Fn(super::Point) -> io::Result<()> + Send + Sync>;
 
 #[cfg(test)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -97,6 +103,8 @@ pub(crate) struct NativeOwner {
     generation_hook: Mutex<Option<GenerationHookForTest>>,
     #[cfg(test)]
     root_hook: Mutex<Option<RootHookForTest>>,
+    #[cfg(test)]
+    io_hook: Mutex<Option<IoHookForTest>>,
 }
 
 impl NativeOwner {
@@ -139,6 +147,8 @@ impl NativeOwner {
             generation_hook: Mutex::new(None),
             #[cfg(test)]
             root_hook: Mutex::new(None),
+            #[cfg(test)]
+            io_hook: Mutex::new(None),
         })
     }
 
@@ -157,12 +167,26 @@ impl NativeOwner {
     }
 
     #[cfg(test)]
+    pub(crate) fn set_io_hook_for_test(&self, hook: IoHookForTest) {
+        assert!(self.current.lock().unwrap().upgrade().is_none());
+        *self.io_hook.lock().unwrap() = Some(hook);
+    }
+
+    #[cfg(test)]
     fn root_point_for_test(&self, point: RootPointForTest) -> io::Result<()> {
         let hook = self.root_hook.lock().unwrap().clone();
         hook.map_or(Ok(()), |hook| hook(point))
     }
 
     fn io_control(&self) -> IoControl {
+        #[cfg(test)]
+        if let Some(hook) = self.io_hook.lock().unwrap().clone() {
+            assert!(self.generation_hook.lock().unwrap().is_none());
+            return IoControl {
+                hook,
+                ..IoControl::default()
+            };
+        }
         #[cfg(test)]
         if let Some(hook) = self.generation_hook.lock().unwrap().clone() {
             return IoControl {
@@ -357,6 +381,9 @@ impl NativeOwner {
         let mut bytes = [0; ROOT_BYTES as usize];
         bytes[..8].copy_from_slice(match wal.binding.persistence {
             SessionPersistenceMode::Durable => ROOT_MAGIC,
+            SessionPersistenceMode::Async if wal.binding.async_closed_format => {
+                ASYNC_CLOSED_ROOT_MAGIC
+            }
             SessionPersistenceMode::Async => ASYNC_ROOT_MAGIC,
         });
         for (chunk, value) in bytes[8..40].as_chunks_mut::<8>().0.iter_mut().zip([
@@ -436,6 +463,7 @@ impl NativeOwner {
         let persistence = match &bytes[..8] {
             magic if magic == ROOT_MAGIC => SessionPersistenceMode::Durable,
             magic if magic == ASYNC_ROOT_MAGIC => SessionPersistenceMode::Async,
+            magic if magic == ASYNC_CLOSED_ROOT_MAGIC => SessionPersistenceMode::Async,
             _ => return Err(invalid_data("native root persistence format differs")),
         };
         let directory_identity = identity(&directory.metadata()?);
@@ -459,6 +487,7 @@ impl NativeOwner {
             basis,
             native: true,
             persistence,
+            async_closed_format: &bytes[..8] == ASYNC_CLOSED_ROOT_MAGIC,
         };
         if binding.digest()? != bytes[104..136] {
             return Err(invalid_data("native root authority binding differs"));

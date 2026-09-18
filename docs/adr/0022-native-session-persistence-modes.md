@@ -171,7 +171,8 @@ quorum or authorize restarting an all-cold fleet.
 ## Cold-incarnation admission
 
 Raft's ordinary restart argument assumes voting/log persistence. Async cannot
-reuse that argument after losing resident state. Every existing Async root is
+reuse that argument after losing resident state. An existing Async root without
+the completed-shutdown proof below is
 quarantined before the engine starts, including a retained committed self-vote
 that causes the engine to restore an internal leader role. The SDK gate covers
 incoming engine RPCs, outgoing requests/results, manual/bootstrap elections,
@@ -232,18 +233,57 @@ replacement configuration or claim instantaneous knowledge of a remote
 election during a partition.
 
 Pristine first formation uses a durably established root/mode identity before
-participation. Reopen is cold even when no background generation completed.
-An all-cold set remains `RecoveryRequired`; local completed generations,
+participation. Uncertified reopen is cold even when no background generation completed.
+An uncertified all-cold set remains `RecoveryRequired`; local completed generations,
 snapshots, equal indices, or waiting longer do not manufacture a surviving
 quorum. Destroying/recreating backing is not a supported recovery workflow.
 Async can lose acknowledged results if the live volatile quorum is lost.
 
+### Completed consensus shutdown
+
+New Async roots use `OPCNA002` and a distinct root-binding hash domain. Old
+readers reject this format before participating: a reader that did not consume
+the one-use proof could otherwise retain it while acknowledging new volatile
+work. Legacy `OPCNA001` roots retain their original admission rules; there is
+no implicit format migration or retrospective certification.
+
+The clone-wide shutdown coordinator first joins maintenance lanes, Raft and
+every actual storage/snapshot owner. Only an incarnation that was Active and
+whose engine stopped normally can request certification. Openraft shutdown's
+successful join alone does not prove a normal exit; its final running state
+must also be `Fatal::Stopped`. A quarantined incarnation cannot certify a
+predecessor's already-missing state. Ordinary WAL shutdown or Drop cannot
+request certification.
+
+While retaining LOCK, the Async writer drains its final generation and verifies
+the complete resident/completed cut and absence of any outstanding native
+operation or recorded failure. It writes and fsyncs `ASYNC-CLOSED.preparing`,
+renames it to `ASYNC-CLOSED`, then fsyncs the directory. The proof binds the
+exact root digest, complete selected anchor (including generation, sequence,
+full LogIds and snapshot origin), full vote, committed/purged frontier and
+membership. No generation is lowered or selected using only an index.
+
+Under the same exclusive root ownership, reopening first validates the entire
+selected native state and any retained snapshot origin. It verifies the proof
+and its file identity, unlinks it and fsyncs the directory before starting a
+writer or Raft. Interrupted preparation grants no authority. Missing proof
+uses normal cold admission; corrupt, foreign or stale selected proof rejects
+opening. A failure after unlink cannot accidentally reuse the consumed proof.
+
+This evidence permits ordinary Raft participation after orderly majority or
+all-voter restart. It does not select a leader or grant application authority:
+the original full vote/log checks, initialization, membership and fresh quorum
+barriers remain required. Shutdown cancellation preserves the shared drain and
+root lock through definitive completion. Public handles must still be released
+before reopen because they own the snapshot namespace. Ordinary Async session
+acknowledgements retain their resident replication/application boundary.
+
 ### Majority-loss authority gap (SDK #908)
 
-This restriction also prevents an existing three-voter installation from
-recovering when two voters restart and one process survives. It is an
-availability limitation, not a successful recovery outcome. Fully persisted
-returning roots do not, under the current protocol, remove the restriction.
+Without completed-shutdown evidence, this restriction prevents an existing
+three-voter installation from recovering when two voters restart and one
+process survives. It is an availability limitation, not a successful recovery
+outcome. Fully persisted returning roots alone do not remove the restriction.
 
 Acknowledged loss includes authority state: a majority can issue higher lease
 fences and credentials, and revoke earlier credentials, while its generation
@@ -274,8 +314,8 @@ Neither a storage reset nor an unchecked epoch increment is a recovery API.
 
 The executable reproduction and counterexample are recorded in
 [`docs/async-majority-recovery-908.md`](../async-majority-recovery-908.md).
-They establish the missing authority and leave the availability assertions
-failing; they do not introduce a recovery mechanism or qualify product HA.
+The orderly restart matrix now passes; separate positive volatile-tail recovery
+assertions still fail. Neither result qualifies product recovery or HA.
 
 ## Mode isolation and traffic authority
 

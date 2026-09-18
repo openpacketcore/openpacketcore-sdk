@@ -1,9 +1,9 @@
 # Async majority-restart recovery: SDK #908
 
-The current SDK has no sound automatic recovery mechanism for an existing
-Async root after losing the live majority. This investigation preserves a
-failing availability regression and identifies authority missing from the
-storage contract. It is not a fix or a successful recovery qualification.
+The SDK now supports majority and all-voter restart after completed shutdown
+of new-format Async roots. Normal session acknowledgements still do not wait
+for disk. Unclean loss of acknowledged volatile state and recovery of already
+fenced legacy roots remain unresolved; #908 is not complete.
 
 ## Executed baseline
 
@@ -48,8 +48,44 @@ requirements; they are neither ignored nor inverted into quarantine passes.
 | Durable, two of three retained roots return | Pass, including successor operation |
 | Durable, all three retained roots return | Pass, including successor operation |
 
-The five-test run exits 101; log SHA-256:
+That baseline five-test run exits 101; log SHA-256:
 `9b0a54f69126d7c993a35f1d85abee638fd09fa98321bd9e3c6bce57e2973e97`.
+
+## Completed-shutdown recovery
+
+New-format Async roots can publish a one-use proof after the active consensus
+engine, storage owners and final disk generation have all completed shutdown.
+Reopen validates its exact authority and durably consumes it before starting
+consensus. It grants no traffic authority; the ordinary fresh quorum and
+application checks remain required. The format rejects older SDK readers that
+cannot consume the proof. Legacy roots keep their existing quarantine contract.
+
+With this implementation, the same five-case mTLS matrix passes, including
+the successor operation and stale-lease rejection. The focused command above
+exited 0; log SHA-256:
+`cdc6192d125a87d8ccdebad9fb4e08e5e52df7073a175cb265f367ed710b5170`.
+This test drains and joins real owners. It proves orderly restart, not power
+loss, lost-tail recovery or migration of an already-fenced installation.
+
+Disabling only the closed-proof admission path makes the same majority and
+all-cold cases fail again, while sequential Async and both Durable controls
+still pass. This fix-removal run exited 101; log SHA-256:
+`ec29cd4388b646bfcb7fd99ee8236229aec5b34d085a3b3b09f218d1d9d0c8dd`.
+The production source was restored byte-for-byte after this control.
+
+Adversarial controls exercise proof publication and consumption failures,
+one-use consumption, corrupt/foreign/stale proof rejection, file replacement,
+shutdown cancellation and the retired writer's inability to mutate its
+successor. Quarantined shutdown cannot manufacture a proof. The original cold
+repair tests deliberately omit close certification while still joining their
+actual owners, preserving their uncertified-incarnation scenarios.
+
+Two additional positive tests require recovery after the acknowledged volatile
+tail described below. Both were executed before production edits and failed at
+usable-authority recovery; log SHA-256:
+`3ba242d01464c56efb7562f53500d907605b735a7d7b26c32d5238a6fb25a0c4`.
+They remain enabled and failing. They prevent the completed-shutdown component
+from being mistaken for full #908 acceptance.
 
 ## Missing authority, beyond the cold-barrier dependency
 
@@ -87,9 +123,10 @@ vote, append and commit operations. Generation selection happens later.
 `consensus/native/ordinary.rs` advances `next_fence` and `next_credential` in
 that same resident state when issuing leases. The retained root identifies the
 storage lineage and mode; it does not reserve an upper bound for future
-volatile allocations or identify a durably closed consensus incarnation.
+volatile allocations. Legacy roots do not identify a durably closed consensus
+incarnation either.
 
-The cold protocol therefore cannot distinguish a fully persisted safe cut from
+Without completed-shutdown evidence, the cold protocol cannot distinguish a fully persisted safe cut from
 an otherwise identical retained cut followed by lost acknowledged effects.
 Increasing a retained scalar once does not solve this: arbitrarily many
 allocations may have occurred before the loss, up to the existing counter
@@ -144,8 +181,8 @@ SDK API would need authenticated evidence for these responsibilities, not an
 unchecked operator flag. This draft implements neither that capability nor a
 migration protocol for existing roots.
 
-No production admission/storage behavior changes in this draft. Full SDK
-qualification remains incomplete while its recovery acceptance tests fail.
+The production change covers completed shutdown only. Full SDK qualification
+remains incomplete while the volatile-tail recovery acceptance tests fail.
 After a recovery contract is implemented and SDK gates pass, the product must
 repin the reviewed SDK and repeat Durable/Async retained-majority recovery
 with its original worker and Recovery authority, followed by the common

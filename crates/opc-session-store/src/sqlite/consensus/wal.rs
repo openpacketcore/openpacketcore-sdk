@@ -28,6 +28,7 @@ use sha2::{Digest, Sha256};
 
 pub(crate) mod adapter;
 pub(crate) mod application;
+mod async_closed;
 mod async_persistence;
 mod checkpoint;
 pub(crate) mod integration;
@@ -124,6 +125,7 @@ pub(super) struct Binding {
     pub(super) basis: [u8; 32],
     pub(super) native: bool,
     pub(super) persistence: SessionPersistenceMode,
+    pub(super) async_closed_format: bool,
 }
 
 impl Binding {
@@ -133,8 +135,17 @@ impl Binding {
             if !self.native {
                 return Err(invalid_data("asynchronous storage requires a native root"));
             }
-            hash.update(b"opc-session-native-async-v1");
+            hash.update(if self.async_closed_format {
+                &b"opc-session-native-async-v2"[..]
+            } else {
+                &b"opc-session-native-async-v1"[..]
+            });
         } else if self.native {
+            if self.async_closed_format {
+                return Err(invalid_data(
+                    "durable root cannot carry asynchronous close proof",
+                ));
+            }
             hash.update(b"opc-session-native-wal-v1");
         } else {
             hash.update(b"opc-session-wal-private-v3");
@@ -313,6 +324,13 @@ pub(crate) enum Point {
     BeforeNativeGenerationAppend,
     AfterNativeGenerationAppend,
     AfterNativeRelocationStep,
+    BeforeAsyncClosedWrite,
+    AfterAsyncClosedFileSync,
+    AfterAsyncClosedRename,
+    AfterAsyncClosedDirectorySync,
+    BeforeAsyncClosedConsume,
+    AfterAsyncClosedUnlink,
+    AfterAsyncClosedConsumeSync,
     BeforeBasisCreate,
     AfterBasisCreate,
     BeforeBasisSync,
@@ -516,6 +534,8 @@ struct State {
     // admission, business application and reads branch before touching it.
     conn: Connection,
     authority: Authority,
+    // Only the joined consensus shutdown path may request this certificate.
+    consensus_closed: bool,
     native: Option<crate::consensus::native::NativeStorage>,
     native_snapshot_pending: Option<super::CurrentSnapshot>,
     native_checkpoint_target: Option<native_basis::Target>,
@@ -569,6 +589,7 @@ pub(crate) struct Wal {
     configured_roster_root: Option<Arc<RosterAttestationTrustRootV1>>,
     // Retain the namespace through writer/basis drain and every detached read.
     directory_pin: Option<Arc<File>>,
+    recovered_closed: std::sync::atomic::AtomicBool,
 }
 
 impl State {
@@ -610,6 +631,7 @@ impl State {
         Ok(Self {
             conn,
             authority,
+            consensus_closed: false,
             native,
             native_snapshot_pending: None,
             native_checkpoint_target: None,
@@ -737,6 +759,7 @@ impl Wal {
             basis: hash_file(&basis_path, MAX_BASIS)?,
             native,
             persistence,
+            async_closed_format: persistence == SessionPersistenceMode::Async,
         };
         let digest = binding.digest()?;
         let segment = create_segment(directory, 0, digest, [0; 32])?;
@@ -905,6 +928,7 @@ impl Wal {
             #[cfg(test)]
             configured_roster_root,
             directory_pin: None,
+            recovered_closed: std::sync::atomic::AtomicBool::new(false),
         })
     }
 
@@ -1237,8 +1261,25 @@ impl Wal {
     }
 
     pub(crate) fn shutdown(&self) -> io::Result<()> {
+        self.shutdown_inner(false)
+    }
+
+    /// All consensus/storage producers have definitively joined. The Async
+    /// writer can certify its final complete selected generation while it
+    /// still owns the root lock. Ordinary Drop never supplies this evidence.
+    pub(crate) fn shutdown_after_consensus(&self) -> io::Result<()> {
+        self.shutdown_inner(self.binding.async_closed_format)
+    }
+
+    pub(crate) fn take_closed_async_restart(&self) -> bool {
+        self.recovered_closed
+            .swap(false, std::sync::atomic::Ordering::AcqRel)
+    }
+
+    fn shutdown_inner(&self, consensus_closed: bool) -> io::Result<()> {
         if let Ok(mut state) = self.shared.state.lock() {
             if state.status == Status::Running {
+                state.consensus_closed = consensus_closed;
                 state.status = Status::Closing;
             }
             self.shared.ready.notify_all();
@@ -2458,6 +2499,7 @@ fn audit_recovery_projected(
             > 2 * (limits.segments + limits.history_count)
                 + 8
                 + 2 * usize::from(allow_snapshot_proof)
+                + 2 * usize::from(binding.async_closed_format)
             || !entry.file_type()?.is_file()
         {
             return Err(invalid_data("private WAL directory exceeds format bounds"));
@@ -2499,6 +2541,11 @@ fn audit_recovery_projected(
         } else if allow_snapshot_proof && snapshot::is_proof_file(name, entry.metadata()?.len())? {
             // The exact two-image protocol owns these files. They must not
             // enter an ordinary checkpoint/tail cleanup plan.
+        } else if binding.async_closed_format
+            && async_closed::is_proof_file(name, entry.metadata()?.len())?
+        {
+            // The closed-incarnation protocol validates and consumes these
+            // after complete generation/snapshot admission, before any writer.
         } else if !basis_namespace.visit(
             name,
             entry.path(),

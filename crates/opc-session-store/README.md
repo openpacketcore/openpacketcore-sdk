@@ -424,7 +424,7 @@ Both constructors are Linux-only and require file-backed storage.
 |:--|:--|:--|
 | Successful mutation | Durable log acknowledgement, real quorum replication, and committed application. | Validated resident storage, real quorum replication, and committed application. |
 | Disk progress | Required before the durable storage acknowledgement. | One coalescing writer persists and selects complete local generations after resident acknowledgement. |
-| Ordinary restart | Reopens the validated durable state under the existing admission checks. | Every existing root starts quarantined and requires catch-up from a surviving live quorum. |
+| Ordinary restart | Reopens the validated durable state under the existing admission checks. | A new-format root with completed SDK shutdown evidence can resume ordinary consensus. Otherwise it requires catch-up from a surviving live quorum. |
 | Readiness API | Existing durable probes or `probe_fixed_quorum_readiness`. | `probe_fixed_quorum_readiness`; durable probes return `PersistenceNotDurable`. |
 
 An Async success can precede disk persistence. Loss of the live volatile quorum
@@ -436,7 +436,7 @@ reject mixed modes. Changing snapshot integrity does not select persistence.
 No automatic conversion or cross-mode recovery is provided.
 
 Install `rpc_handler()` before calling `initialize_cluster()` on every startup.
-For an existing Async root, this call obtains a genuinely new committed entry
+For an uncertified existing Async root, this call obtains a genuinely new committed entry
 from the other live voters, admits repair only from its certified leader, and
 waits for exact local application before allowing votes. An incomplete cold
 recovery attempt or missing live majority returns `RecoveryRequired`; a later
@@ -445,18 +445,33 @@ becomes active, the remaining ordinary initialization and membership admission
 checks still share that call's original operation deadline. Their timeout can
 return `ClusterFormationRejected`, which also covers genuine scope rejection
 and is not a general retry signal. Active recovery health does not establish
-successful initialization or traffic authority. An all-cold quorum stays
-closed; local disk progress, cached responses, and recreating storage do not
-supply a supported recovery authority.
+successful initialization or traffic authority. An all-cold quorum without
+completed shutdown proofs stays closed; local disk progress, cached responses,
+and recreating storage do not supply a supported recovery authority.
 
-This includes a two-of-three restart with one process surviving: retained
-storage alone cannot currently restore service. A fenced installation is an
+New Async roots use format `OPCNA002`. After the RPC handler is removed,
+`shutdown()` joins the active consensus engine and every storage owner, drains
+the final generation, then publishes a one-use proof while retaining the root
+lock. Reopen validates the exact root, generation, full vote/log/application
+cut, membership and any required snapshot, then durably consumes the proof
+before starting consensus. This supports orderly sequential, majority and
+all-voter restart without adding a disk wait to ordinary acknowledgements.
+The proof permits consensus participation; it grants no lease or traffic
+authority. Initialization and each operation still require fresh quorum checks.
+
+Legacy `OPCNA001` roots remain readable under their original quarantine
+contract and are not implicitly migrated. Older SDK versions reject the new
+format, so they cannot leave a stale close proof beside new volatile work.
+This change does not recover already-fenced legacy installations.
+
+Unclean two-of-three restart with one process surviving remains unsupported
+without a live majority: retained storage alone is insufficient. A fenced installation is an
 availability failure. The lost Async tail can include issued fences and
 revocation of older leases, even when the survivor stayed alive. Selecting the
 highest local generation or waiting for a lease timeout cannot establish a
 safe successor. [SDK #908 recovery evidence](../../docs/async-majority-recovery-908.md)
-records the executable regression and the missing durable or external
-authority; no majority-loss recovery API is supplied by the current contract.
+records the executed orderly-restart correction and the separate missing
+authority for acknowledged volatile-tail recovery.
 
 If a restarted voter lost a previously acknowledged volatile tail, its
 certified live leader restores that prefix through ordinary snapshot
@@ -493,8 +508,12 @@ the resident cut captured by that call, within the configured operation
 deadline. Later concurrent mutations need not be included. A timeout or caller
 cancellation leaves the writer responsible for its accepted work; typed drain
 errors distinguish deadline, failure, unavailable owner, and wrong mode.
-`shutdown()` joins owned work and reports failed drain. Neither operation
-establishes quorum persistence or permits an all-cold restart. See
+`shutdown()` joins owned work and reports failed drain. Unlike a local drain,
+completed shutdown of an active new-format incarnation can certify a restart
+as described above. Caller cancellation or a deadline leaves the shared
+shutdown owner responsible; an incomplete drain cannot publish that proof.
+Release all public store handles before reopening because they retain snapshot
+namespace ownership. Neither operation alone grants quorum authority. See
 [ADR 0022](../../docs/adr/0022-native-session-persistence-modes.md) for the
 storage and cold-admission contract.
 

@@ -607,11 +607,12 @@ async fn async_persistence_shutdown_deadline_survives_a_held_writer() {
         let cold = fleet.store(0);
         assert_eq!(
             cold.persistence_health().recovery,
-            Some(SessionAsyncRecoveryState::AwaitingLiveQuorum)
+            Some(SessionAsyncRecoveryState::Active)
         );
         assert!(!cold.status().admitted);
-        // A clean drain still reopens cold. Passive readiness cannot grant
-        // authority; use the existing public live-quorum admission sequence.
+        // The joined active consensus owner published a one-use close proof,
+        // unlike an isolated drain. Ordinary initialization must still obtain
+        // current quorum authority before this reopened store admits traffic.
         let setup_deadline =
             tokio::time::Instant::now() + DEFAULT_SESSION_CONSENSUS_OPERATION_TIMEOUT;
         loop {

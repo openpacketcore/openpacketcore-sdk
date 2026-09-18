@@ -1,11 +1,14 @@
 //! Mode-bound transport and the cold asynchronous voter admission fence.
 //!
-//! A reopened volatile voter cannot participate in Raft until an already-live
+//! An uncertified reopened volatile voter cannot participate in Raft until an already-live
 //! quorum has committed a new nonce-bound entry without it. Only that leader's
 //! term may then repair it. A successful matching AppendEntries through the
 //! new entry, local application, and the ordinary exact authority checks must
 //! all complete before votes or elections resume. No persisted generation,
 //! cached match index, or heartbeat alone supplies that proof.
+//! A new-format root may instead consume one-use evidence that its previous
+//! consensus incarnation stopped and persisted every accepted effect. This
+//! permits ordinary Raft restart, subject to the same current quorum checks.
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;

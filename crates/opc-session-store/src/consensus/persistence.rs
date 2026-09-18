@@ -136,10 +136,12 @@ pub struct SessionPersistenceHealth {
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
 #[non_exhaustive]
 pub enum SessionAsyncRecoveryState {
-    /// A fresh member or a caught-up member may participate in consensus.
+    /// A fresh member, a caught-up member, or a member with a validated
+    /// one-use proof of completed consensus shutdown may participate.
     /// Application traffic still needs the ordinary exact quorum checks.
     Active,
-    /// An existing root awaits a new commit by a surviving live quorum.
+    /// An existing root without a completed shutdown proof awaits a new
+    /// commit by a surviving live quorum.
     /// Votes, elections and replication acknowledgements are withheld.
     AwaitingLiveQuorum,
     /// A live quorum supplied a fresh cut; only its leader may repair this
