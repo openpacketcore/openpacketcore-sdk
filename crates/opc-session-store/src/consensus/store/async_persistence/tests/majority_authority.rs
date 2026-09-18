@@ -136,7 +136,10 @@ async fn exercise_lost_authority(fleet: &mut Fleet, faults: &[Arc<AtomicBool>], 
     let issued = issued.unwrap();
     assert!(issued.fence() > record.fence);
     assert!(
-        fleet.store(leader).delete_fenced(&old).await.is_err(),
+        matches!(
+            fleet.store(leader).delete_fenced(&old).await,
+            Err(StoreError::StaleFence)
+        ),
         "the acknowledged majority already revoked this predecessor credential"
     );
     races::until(
@@ -249,8 +252,9 @@ async fn exercise_lost_authority(fleet: &mut Fleet, faults: &[Arc<AtomicBool>], 
         );
     }
     assert!(
-        issued.expires_at() > opc_types::Timestamp::now_utc(),
-        "the unpersisted external credential is still unexpired"
+        old.expires_at() > opc_types::Timestamp::now_utc()
+            && issued.expires_at() > opc_types::Timestamp::now_utc(),
+        "retained and unpersisted credentials are both still unexpired"
     );
     // The current SDK correctly withholds authority. This is a safety
     // control proving missing recovery input, never an availability pass.
