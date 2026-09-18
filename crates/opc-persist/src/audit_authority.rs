@@ -18,6 +18,7 @@ use crate::management_audit::{
 
 pub use crate::consensus::PreparedAuditedMutation;
 pub(crate) mod ledger;
+pub(crate) mod receipt;
 pub use ledger::{
     AuditAdmission, AuditLedgerLimits, AuditOperationHandle, AuditOperationReceipt,
     AuditOperationState,

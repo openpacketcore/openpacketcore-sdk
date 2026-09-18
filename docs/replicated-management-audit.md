@@ -73,6 +73,14 @@ Standalone intents and observations use the same handle protocol. An observed
    result. `None` never authorizes a newly minted retry; an expired absent
    handle returns `Expired`.
 
+The applying state machine includes an authenticated receipt in its existing
+durable response cache. A successful response carrying a settled outcome is
+verified against the exact operation and caller and returned without requiring
+a second quorum read. Losing read quorum after that response cannot erase a
+known commit or rejection. This receipt proves the outcome at that apply point;
+authorized lookup returns the current terminal-record status. An intent-only
+response is refreshed because its undecided state may have since resolved.
+
 Once the ledger is enabled, legacy append, confirmation and rollback-point
 mutation commands are refused by the state machine. This prevents callers from
 bypassing the required intent. Internal recovery-marker clearing and explicit

@@ -182,6 +182,41 @@ pub(crate) fn map_failure(failure: ConfigMutationFailure) -> AuditAuthorityError
     }
 }
 
+/// Read and authenticate the exact resulting operation inside the existing
+/// apply transaction, including a durable rejection or a racing prior commit.
+pub(crate) fn applied_receipt_sync(
+    conn: &Connection,
+    key: &AuditKey,
+    identity: ConfigConsensusIdentity,
+    intent: &super::ConfigMutationIntent,
+) -> io::Result<Option<crate::audit_authority::receipt::AuthenticatedAuditReceipt>> {
+    use crate::audit_authority::receipt::AuthenticatedAuditReceipt;
+    let handle = match intent {
+        super::ConfigMutationIntent::AuditedMutation(prepared) => &prepared.handle,
+        super::ConfigMutationIntent::ManagementAudit(
+            AuditCommand::Intent(handle)
+            | AuditCommand::Reject(handle)
+            | AuditCommand::Terminal(handle),
+        ) => handle,
+        _ => return Ok(None),
+    };
+    // A rejected malformed/substituted handle has no receipt, not an I/O fault.
+    if handle
+        .verify(key, identity, handle.body.binding.caller)
+        .is_err()
+    {
+        return Ok(None);
+    }
+    let Some(ledger) = read_sync(conn, key, identity)? else {
+        return Ok(None);
+    };
+    ledger
+        .lookup(key, handle, handle.body.binding.caller)
+        .map_err(|_| invalid())?
+        .map(|receipt| AuthenticatedAuditReceipt::seal(key, &receipt).map_err(|_| invalid()))
+        .transpose()
+}
+
 /// Configuration retention cannot erase a still-unresolved audit reference.
 pub(crate) fn protects_config_prefix(
     conn: &Connection,

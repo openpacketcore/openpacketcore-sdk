@@ -2884,6 +2884,7 @@ pub(crate) fn apply_entries_cancellable_sync(
                 digest: None,
                 logical_time: None,
                 raft_log_index: entry.log_id.index,
+                audit_receipt: None,
             },
             EntryPayload::Membership(membership) => {
                 let stored = StoredMembership::new(Some(entry.log_id), membership);
@@ -2894,6 +2895,7 @@ pub(crate) fn apply_entries_cancellable_sync(
                     digest: None,
                     logical_time: None,
                     raft_log_index: entry.log_id.index,
+                    audit_receipt: None,
                 }
             }
             EntryPayload::Normal(command) => {
@@ -2913,6 +2915,7 @@ pub(crate) fn apply_entries_cancellable_sync(
                             digest: (machine.0 != 0).then_some(machine.1),
                             logical_time: machine.2,
                             raft_log_index: entry.log_id.index,
+                            audit_receipt: None,
                         }
                     } else {
                         stored_response
@@ -3012,12 +3015,19 @@ pub(crate) fn apply_entries_cancellable_sync(
                     }
                     tx.execute_batch("RELEASE config_history_command")
                         .map_err(db_error)?;
+                    let audit_receipt = super::audit::applied_receipt_sync(
+                        &tx,
+                        audit_key,
+                        identity,
+                        &command.intent,
+                    )?;
                     let response = ConfigConsensusResponse {
                         result,
                         sequence,
                         digest: Some(digest),
                         logical_time: Some(logical_time),
                         raft_log_index: entry.log_id.index,
+                        audit_receipt,
                     };
                     tx.execute(
                         "INSERT INTO config_raft_request_outcomes (request_id, configuration_epoch, applied_sequence, payload_digest, response_json) VALUES (?1, ?2, ?3, ?4, ?5)",

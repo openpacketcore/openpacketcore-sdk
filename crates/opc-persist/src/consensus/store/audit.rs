@@ -284,22 +284,42 @@ impl ConsensusConfigStore {
         }
         match self.submit_request(request, command).await {
             Err(_) => AuditAdmission::Unknown(handle.clone()),
-            Ok(response) => match self.lookup_audit_operation(handle, caller).await {
-                Ok(Some(receipt)) => AuditAdmission::Applied(receipt),
-                Ok(None) => match response.result {
-                    Err(failure) => {
-                        AuditAdmission::Rejected(super::super::audit::map_failure(failure))
+            Ok(response) => {
+                if let Some(proof) = &response.audit_receipt {
+                    let receipt = match proof.read_back(
+                        self.inner.backend.audit_key(),
+                        self.inner.identity,
+                        handle,
+                        caller,
+                    ) {
+                        Ok(receipt) => receipt,
+                        Err(_) => return AuditAdmission::Unknown(handle.clone()),
+                    };
+                    // Settled outcomes cannot change. The applying quorum has
+                    // already authenticated this result; a later read outage
+                    // must not turn it back into an unknown configuration result.
+                    // Intent may have since expired/resolved, so refresh it below.
+                    if receipt.state() != crate::audit_authority::AuditOperationState::Intent {
+                        return AuditAdmission::Applied(receipt);
                     }
-                    Ok(()) => AuditAdmission::Unknown(handle.clone()),
-                },
-                // Lookup returns Expired only after a quorum read proved no
-                // receipt exists. Preserve that definite refusal when apply
-                // also rejected this command; an outage is still Unknown.
-                Err(AuditAuthorityError::Expired) if response.result.is_err() => {
-                    AuditAdmission::Rejected(AuditAuthorityError::Expired)
                 }
-                Err(_) => AuditAdmission::Unknown(handle.clone()),
-            },
+                match self.lookup_audit_operation(handle, caller).await {
+                    Ok(Some(receipt)) => AuditAdmission::Applied(receipt),
+                    Ok(None) => match response.result {
+                        Err(failure) => {
+                            AuditAdmission::Rejected(super::super::audit::map_failure(failure))
+                        }
+                        Ok(()) => AuditAdmission::Unknown(handle.clone()),
+                    },
+                    // Lookup returns Expired only after a quorum read proved no
+                    // receipt exists. Preserve that definite refusal when apply
+                    // also rejected this command; an outage is still Unknown.
+                    Err(AuditAuthorityError::Expired) if response.result.is_err() => {
+                        AuditAdmission::Rejected(AuditAuthorityError::Expired)
+                    }
+                    Err(_) => AuditAdmission::Unknown(handle.clone()),
+                }
+            }
         }
     }
 

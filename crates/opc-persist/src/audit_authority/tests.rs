@@ -59,6 +59,86 @@ fn handle(nonce: u8) -> AuditOperationHandle {
 }
 
 #[test]
+fn applied_receipt_authenticates_outcome_sequence_and_exact_operation() {
+    use super::receipt::AuthenticatedAuditReceipt;
+
+    let operation = handle(31);
+    let caller = operation.body.binding.caller;
+    let receipt = AuditOperationReceipt {
+        handle: operation.clone(),
+        state: AuditOperationState::Committed { version: 8 },
+        terminal_recorded: false,
+        sequence: 2,
+    };
+    let proof = AuthenticatedAuditReceipt::seal(&key(), &receipt).unwrap();
+    let encoded = serde_json::to_vec(&proof).unwrap();
+    let decoded: AuthenticatedAuditReceipt = serde_json::from_slice(&encoded).unwrap();
+    assert_eq!(
+        decoded
+            .read_back(&key(), identity(), &operation, caller)
+            .unwrap(),
+        receipt
+    );
+    assert!(decoded
+        .read_back(&key(), identity(), &handle(32), caller)
+        .is_err());
+    assert!(decoded
+        .read_back(
+            &AuditKey::new([9; 32]).unwrap(),
+            identity(),
+            &operation,
+            caller
+        )
+        .is_err());
+    let wrong_caller =
+        AuditCaller::project(&AuditPrivacyKey::new([5; 32]).unwrap(), "other", "caller").unwrap();
+    assert!(decoded
+        .read_back(&key(), identity(), &operation, wrong_caller)
+        .is_err());
+    let other_fleet = ConfigConsensusIdentity::new(
+        ConfigConsensusClusterId::new("other-audit-fixture").unwrap(),
+        identity().configuration_id(),
+        identity().configuration_epoch(),
+    );
+    assert!(decoded
+        .read_back(&key(), other_fleet, &operation, caller)
+        .is_err());
+    for field in [
+        "state",
+        "terminal_recorded",
+        "sequence",
+        "operation",
+        "identity",
+        "mac",
+    ] {
+        let mut value = serde_json::to_value(&proof).unwrap();
+        match field {
+            "state" => value["body"][field] = serde_json::json!("rejected"),
+            "terminal_recorded" => value["body"][field] = serde_json::json!(true),
+            "sequence" => value["body"][field] = serde_json::json!(3),
+            "operation" => {
+                value["body"][field][0] =
+                    serde_json::json!(255 - value["body"][field][0].as_u64().unwrap())
+            }
+            "identity" => value["body"][field] = serde_json::to_value(other_fleet).unwrap(),
+            "mac" => value[field][0] = serde_json::json!(255 - value[field][0].as_u64().unwrap()),
+            _ => unreachable!(),
+        }
+        let tampered: AuthenticatedAuditReceipt = serde_json::from_value(value).unwrap();
+        assert!(
+            tampered
+                .read_back(&key(), identity(), &operation, caller)
+                .is_err(),
+            "{field}"
+        );
+    }
+    assert_eq!(
+        format!("{proof:?}"),
+        "AuthenticatedAuditReceipt(<redacted>)"
+    );
+}
+
+#[test]
 fn projection_separates_purposes_tuples_and_callers_before_serialization() {
     let privacy = AuditPrivacyKey::new([5; 32]).unwrap();
     assert_ne!(

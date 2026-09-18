@@ -537,6 +537,9 @@ pub(crate) struct ConfigConsensusResponse {
     pub(crate) logical_time: Option<Timestamp>,
     /// Openraft log index that applied the original request.
     pub(crate) raft_log_index: u64,
+    /// Authenticated audit state from the same transaction, if this command
+    /// concerned a retained operation. Not a second read or client assertion.
+    pub(crate) audit_receipt: Option<crate::audit_authority::receipt::AuthenticatedAuditReceipt>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

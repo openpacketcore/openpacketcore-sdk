@@ -37,6 +37,89 @@ fn applied(result: AuditAdmission) -> AuditOperationReceipt {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn known_audited_commit_does_not_depend_on_a_second_read_quorum() {
+    let cluster = ThreeNodeCluster::start().await;
+    let leader = cluster.leader();
+    let follower = (leader + 1) % 3;
+    let store = cluster.stores[follower].clone();
+    store
+        .initialize_audit_authority(&privacy(), AuditLedgerLimits::new(6, 2).unwrap())
+        .await
+        .unwrap();
+    let tx = TxId::new();
+    let prepared = store
+        .prepare_audited_commit(
+            &privacy(),
+            &source_event(91, ManagementAuditOutcomeCode::Intent),
+            attested(commit(tx, None, 1, 7), audit(tx)),
+            Duration::from_secs(60),
+        )
+        .unwrap();
+    let intent = applied(
+        store
+            .admit_audit_operation(prepared.handle(), caller())
+            .await,
+    );
+    let wire = cluster.paths[&(follower, leader)].clone();
+    wire.pause_forward_response.store(true, Ordering::Release);
+    let submitted = prepared.clone();
+    let actor = store.clone();
+    let task = tokio::spawn(async move {
+        actor
+            .submit_audited_mutation(&submitted, &intent, caller())
+            .await
+    });
+    tokio::time::timeout(
+        Duration::from_secs(10),
+        wire.forward_response_ready.notified(),
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        cluster.stores[leader]
+            .load_latest()
+            .await
+            .unwrap()
+            .unwrap()
+            .record
+            .tx_id,
+        tx,
+        "the exact committed config is independently visible before its response"
+    );
+    for target in 0..3 {
+        if target != follower {
+            cluster.paths[&(follower, target)].stall_family(ConsensusRpcFamily::ReadBarrier, true);
+        }
+    }
+    wire.pause_forward_response.store(false, Ordering::Release);
+    wire.release_forward_response.notify_one();
+    let outcome = tokio::time::timeout(Duration::from_secs(10), task)
+        .await
+        .unwrap()
+        .unwrap();
+    for target in 0..3 {
+        if target != follower {
+            cluster.paths[&(follower, target)].stall_family(ConsensusRpcFamily::ReadBarrier, false);
+        }
+    }
+    let receipt = applied(outcome);
+    assert_eq!(
+        receipt.state(),
+        AuditOperationState::Committed { version: 1 }
+    );
+    assert!(!receipt.terminal_recorded());
+    assert_eq!(
+        store
+            .lookup_audit_operation(prepared.handle(), caller())
+            .await
+            .unwrap()
+            .unwrap(),
+        receipt
+    );
+    cluster.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn replicated_audit_lost_intent_and_commit_acks_survive_leader_change() {
     let cluster = ThreeNodeCluster::start().await;
     let leader = cluster.leader();

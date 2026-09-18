@@ -162,7 +162,9 @@ pub enum AuditOperationState {
     },
 }
 
-/// Authoritative operation readback returned only after a quorum barrier.
+/// Authenticated operation result from a quorum-applied response or quorum read.
+/// A response proves its point-in-time outcome; use authorized lookup for the
+/// current terminal-record status. A later outage cannot erase a known commit.
 #[derive(Clone, PartialEq, Eq)]
 pub struct AuditOperationReceipt {
     pub(crate) handle: AuditOperationHandle,
