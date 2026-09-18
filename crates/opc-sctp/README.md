@@ -123,15 +123,34 @@ the socket scratch. After a successful receive, the SDK zeroizes exactly the
 kernel-reported scratch prefix before the next chunk or return, so small
 successful messages do not incur a full 64 KiB clear. If the receive syscall
 fails, there is no reliable byte count; the SDK conservatively zeroizes the
-entire offered scratch slice (up to 64 KiB) before returning the error. Partial
-accumulated records are also cleared if an error or cancellation drops them.
-The scratch allocation is released and fully cleared when the socket is
-dropped.
+entire offered scratch slice (up to 64 KiB) before returning the error. The
+scratch allocation is released and fully cleared when the socket is dropped.
 
-Receive futures remain non-cancellation-safe after consuming the first chunk of
-a multi-chunk SCTP record: canceling at that point can leave the kernel's
-remaining partial delivery for the next caller. This ordering contract is
-unchanged by scratch reuse.
+Partial DATA belongs to the socket. Cancelling a receive, including while
+another receiver is queued, preserves every consumed prefix and the original
+cumulative byte bound for the next caller. The socket receive owner also
+preserves the prefix on recoverable readiness errors, as exposed by one-to-many
+endpoint receive. The one-to-one association API retains its existing policy
+of closing on any returned receive error, which clears that prefix. Terminal
+receive errors, explicit close, and socket drop
+clear partial data; close can clear it while receive I/O is pending. There is no
+background reader or automatic timeout: an idle partial record remains bounded
+and owned until receive resumes, the socket closes, or the socket is dropped.
+
+Complete path, sender-dry, and authentication notifications remain visible
+without consuming the DATA byte budget or discarding its prefix. Association
+change and shutdown notifications invalidate a partial record for the affected
+association. Unknown, malformed, or truncated notifications during partial
+DATA fail closed because their effect on the record boundary is ambiguous.
+Fully present ancillary metadata must agree on association, stream, PPID,
+ordering and (for ordered DATA) SSN across chunks. TSN progress and unordered
+SSN differences remain valid. Existing DATA truncation flags still propagate;
+a caller must reject them before treating metadata as authoritative.
+
+These receive guarantees are a prerequisite slice of the typed N2 profile in
+[#788](https://github.com/openpacketcore/openpacketcore-sdk/issues/788).
+The [receive conformance scope](CONFORMANCE.md) records the standards baseline,
+synthetic schedules, native checks and remaining N2 work.
 
 ### Multihoming path events and health
 
@@ -159,9 +178,9 @@ and preserves the last known designation rather than applying a possibly stale
 address.
 Health therefore reflects notifications consumed by the application; it is not
 a separate background socket reader. Concurrent active association receives
-are serialized so path events are applied in kernel receive order. Receive
-futures remain non-cancellation-safe after they begin consuming a multi-chunk
-record. IPv6 flow information is ignored for path identity because
+are serialized so path events are applied in kernel receive order. Cancelled
+receives retain partial DATA as described above. IPv6 flow information is
+ignored for path identity because
 system-produced socket addresses may represent it in raw host form; IP address,
 port, and scope ID identify the path.
 

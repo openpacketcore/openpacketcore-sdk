@@ -1,7 +1,7 @@
 //! Complete NGAP messages need independent evidence for every admitted outcome.
 
 use opc_n3iwf_fixtures::FixtureCatalog;
-use opc_proto_ngap::{Message, PduKind};
+use opc_proto_ngap::{Criticality, Message, MessageType, Pdu, PduKind, ProtocolIe};
 use opc_protocol::{
     DecodeContext, DuplicateIePolicy, EncodeContext, UnknownIePolicy, ValidationLevel,
 };
@@ -30,6 +30,18 @@ fn message_fields(message: &Message) -> (&'static str, Vec<Field>) {
         Message::InitialUeMessage(value) => view!("InitialUEMessage", value),
         Message::DownlinkNasTransport(value) => view!("DownlinkNASTransport", value),
         Message::UplinkNasTransport(value) => view!("UplinkNASTransport", value, 0),
+        Message::PduSessionResourceModifyRequest(value) => {
+            view!("PDUSessionResourceModifyRequest", value)
+        }
+        Message::PduSessionResourceModifyResponse(value) => {
+            view!("PDUSessionResourceModifyResponse", value)
+        }
+        Message::PduSessionResourceNotify(value) => view!("PDUSessionResourceNotify", value),
+        Message::NgReset(value) => view!("NGReset", value),
+        Message::NgResetAcknowledge(value) => view!("NGResetAcknowledge", value),
+        Message::ErrorIndication(value) => view!("ErrorIndication", value),
+        Message::NasNonDeliveryIndication(value) => view!("NASNonDeliveryIndication", value),
+        Message::UeContextReleaseRequest(value) => view!("UEContextReleaseRequest", value, 0),
         Message::InitialContextSetupRequest(value) => view!("InitialContextSetupRequest", value),
         Message::InitialContextSetupResponse(value) => view!("InitialContextSetupResponse", value),
         Message::InitialContextSetupFailure(value) => view!("InitialContextSetupFailure", value),
@@ -199,14 +211,89 @@ fn complete_reference_messages_exercise_every_sdk_typed_field() {
         )
         .expect("raw preserving encode");
         assert!(emitted == wire, "raw preserving wire changed for {name}");
-        // This corpus does not turn opaque SDK fields into constructed encoding.
-        assert!(opc_proto_ngap::encode(&pdu, EncodeContext::default()).is_err());
+        // Canonical container output is distinct from semantic IE admission.
+        // These received root containers have no sequence extension additions.
+        assert!(opc_proto_ngap::encode(&pdu, EncodeContext::default()).expect("canonical") == wire);
     }
     assert_eq!(
         count,
         cases.len(),
         "every independent case exercises the SDK"
     );
+}
+
+#[test]
+fn constructed_containers_match_every_independent_admitted_outcome() {
+    let reference: Value =
+        serde_json::from_str(include_str!("../oracles/ngap-rel18-messages.json")).expect("oracle");
+    let mut outcomes = std::collections::BTreeSet::new();
+    let mut compared = 0;
+    for case in reference["cases"].as_array().expect("cases") {
+        if case["case_class"] != "positive" && case["case_class"] != "ordering" {
+            continue;
+        }
+        let name = case["message"].as_str().expect("message");
+        let kind = match name {
+            "NGSetupRequest" => MessageType::NgSetupRequest,
+            "NGSetupResponse" => MessageType::NgSetupResponse,
+            "NGSetupFailure" => MessageType::NgSetupFailure,
+            "InitialUEMessage" => MessageType::InitialUeMessage,
+            "DownlinkNASTransport" => MessageType::DownlinkNasTransport,
+            "UplinkNASTransport" => MessageType::UplinkNasTransport,
+            "NGReset" => MessageType::NgReset,
+            "PDUSessionResourceNotify" => MessageType::PduSessionResourceNotify,
+            "NGResetAcknowledge" => MessageType::NgResetAcknowledge,
+            "ErrorIndication" => MessageType::ErrorIndication,
+            "NASNonDeliveryIndication" => MessageType::NasNonDeliveryIndication,
+            "UEContextReleaseRequest" => MessageType::UeContextReleaseRequest,
+            "InitialContextSetupRequest" => MessageType::InitialContextSetupRequest,
+            "InitialContextSetupResponse" => MessageType::InitialContextSetupResponse,
+            "InitialContextSetupFailure" => MessageType::InitialContextSetupFailure,
+            "PDUSessionResourceSetupRequest" => MessageType::PduSessionResourceSetupRequest,
+            "PDUSessionResourceSetupResponse" => MessageType::PduSessionResourceSetupResponse,
+            "PDUSessionResourceReleaseCommand" => MessageType::PduSessionResourceReleaseCommand,
+            "PDUSessionResourceReleaseResponse" => MessageType::PduSessionResourceReleaseResponse,
+            "UEContextReleaseCommand" => MessageType::UeContextReleaseCommand,
+            "UEContextReleaseComplete" => MessageType::UeContextReleaseComplete,
+            _ => panic!("unmapped independent outcome"),
+        };
+        // Each leaf was independently encoded, before the SDK constructor
+        // existed. Do not decode the expected PDU to obtain constructor input.
+        let fields: Vec<_> = case["encoded_ies"]
+            .as_array()
+            .expect("fields")
+            .iter()
+            .map(|field| {
+                let crit = match criticality(&field["criticality"]) {
+                    0 => Criticality::reject,
+                    1 => Criticality::ignore,
+                    2 => Criticality::notify,
+                    _ => unreachable!(),
+                };
+                (
+                    field["id"].as_u64().expect("id") as u16,
+                    crit,
+                    octets(field["value_hex"].as_str().expect("value")),
+                )
+            })
+            .collect();
+        let ies: Vec<_> = fields
+            .iter()
+            .map(|(id, crit, value)| ProtocolIe::new(*id, *crit, value))
+            .collect();
+        let pdu = Pdu::from_protocol_ies(kind, &ies, DecodeContext::default()).expect("construct");
+        assert!(pdu.raw.is_empty());
+        let expected = octets(case["wire_hex"].as_str().expect("wire"));
+        assert!(
+            opc_proto_ngap::encode(&pdu, EncodeContext::default()).expect("encode") == expected,
+            "constructed wire differs for {}",
+            case["name"].as_str().expect("case name")
+        );
+        outcomes.insert(name);
+        compared += 1;
+    }
+    assert_eq!(outcomes.len(), 15);
+    assert_eq!(compared, 21);
 }
 
 #[test]

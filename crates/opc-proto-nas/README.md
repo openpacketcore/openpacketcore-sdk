@@ -7,7 +7,8 @@ Experimental NAS-5GS codec for OpenPacketCore.
 `opc-proto-nas` implements a v2 subset of 3GPP TS 24.501 NAS-5GS. It covers
 plain 5GMM framing, 5GSM framing, security-protected envelope framing, selected
 5GMM message bodies, mobile identity helpers, BCD unpacking, and caller-owned
-NAS security hooks.
+NAS security hooks. The separate `tcp` module implements bounded TS 24.502
+NAS-over-TCP envelopes while leaving the enclosed NAS bytes opaque.
 
 It does not implement NAS procedure state machines, key derivation or key
 lifecycle, SUCI de-concealment, concrete non-null NAS algorithms, EPS NAS
@@ -15,6 +16,11 @@ interworking, or AMF/SMF product policy.
 
 ## API Shape
 
+- `tcp::NasTcpDecoder` incrementally frames one bounded NAS/TCP payload at a
+  time; `feed` retains unread input in the caller's slice and `finish` detects
+  terminal truncation. `tcp::decode_envelope` borrows one frame and its tail;
+  `tcp::encode_envelope` writes an exact envelope into caller storage.
+  See [TCP.md](TCP.md) for limits, finalization and independent evidence.
 - `NasMessage` is the top-level decoded PDU: `PlainMm`, `SecurityProtected`,
   or `Sm`.
 - `PlainMm::decode_body` dispatches registered 5GMM bodies into
