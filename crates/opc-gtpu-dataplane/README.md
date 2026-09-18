@@ -10,6 +10,28 @@ eBPF, mock, and unsupported backends, and keeps raw syscalls in
 The crate does not implement GTP-C, PFCP, namespace management, route steering,
 XFRM policy, deployment defaults, or traffic-readiness policy.
 
+## Experimental N3 packet and intent boundary
+
+The `n3` module keeps received uplink UPF TNL information separate from
+locally supplied downlink N3IWF TNL information. `N3ForwardingIntent` records
+those directions and a caller-selected QFI/complete-mark association; it is
+not an authorized install request or readback receipt. `N3ForwardingRole` is
+separate from the Linux GTP netdevice role.
+
+`N3UplinkEncapsulation` appends a canonical G-PDU with one uplink PSC using
+the existing `opc-proto-gtpu` encoders. `N3PacketView` borrows a complete
+G-PDU and exposes validated direction/QFI/RQI/PPI metadata and an opaque
+nonempty inner payload. It rejects trailing datagrams, duplicate/missing PSC,
+unsupported required extensions, zero TEID, and direction mismatches. Parsing
+does not authenticate a packet or establish session/selector ownership.
+
+All shipped adapters return `GtpuCapability::Missing` from
+`n3_forwarding_capability(N3ForwardingRole::N3iwf)`. The packet helpers do not
+qualify Linux/eBPF/mock forwarding, marking, exact generation readback,
+stale-writer fencing, or removal/End Marker ordering. Those operations require
+the existing control-datagram and selector-authority work. See the exact
+support boundary and synthetic evidence in [N3 conformance](CONFORMANCE.md).
+
 ## API Shape
 
 - `GtpuDataplaneBackend`: async port for device and PDP lifecycle, typed PDP

@@ -6,6 +6,7 @@ on:
       - ".github/workflows/fuzz.yml"
       - "crates/opc-proto-*/**"
       - "crates/opc-protocol/**"
+      - "crates/opc-gtpu-dataplane/**"
   schedule:
     - cron: "17 3 * * 0"
   workflow_dispatch:
@@ -30,6 +31,7 @@ jobs:
         crate:
           - opc-protocol
           - opc-proto-gtpu
+          - opc-gtpu-dataplane
           - opc-proto-gre
           - opc-proto-pfcp
           - opc-proto-nas
@@ -83,6 +85,7 @@ jobs:
         crate:
           - opc-protocol
           - opc-proto-gtpu
+          - opc-gtpu-dataplane
           - opc-proto-gre
           - opc-proto-pfcp
           - opc-proto-nas

@@ -139,6 +139,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `Ikev2SaInitCryptoErrorCode` to `Ikev2ChildSaKeyMaterialDiagnostic`.
 
 ### Added
+- `opc-gtpu-dataplane`: add experimental directional N3 tunnel/marking intent,
+  bounded complete G-PDU/PSC reception and constructed uplink PSC insertion
+  through the existing GTP-U codecs. All shipped adapters explicitly report
+  N3 forwarding as missing pending control/selector-authority integration
+  (Refs #790, #795).
 - `opc-proto-gre`: experimental bounded NWu keyed GRE with explicit packet
   direction, checked QFI and downlink RQI, canonical transmission, and a
   backend-neutral association model that exposes all exact or default fallback
