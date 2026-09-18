@@ -5,6 +5,7 @@ use super::*;
 use crate::consensus::native::NativeStorage;
 use crate::sqlite::consensus::wal::{IoControl, Limits, Operation, Wal};
 
+mod async_recovery;
 mod basis;
 mod lifecycle;
 mod ordinary;

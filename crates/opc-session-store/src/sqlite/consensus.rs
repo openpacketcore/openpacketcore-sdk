@@ -4,6 +4,7 @@
 //! adapter in `consensus::storage` owns async locking and maps these coarse,
 //! redaction-safe failures into Openraft storage errors.
 
+pub(crate) mod async_recovery;
 pub(crate) mod consumer_receipts;
 #[cfg(target_os = "linux")]
 pub(crate) mod native_snapshot;
@@ -23544,7 +23545,8 @@ impl MembershipLogProjection {
             | SessionMutationIntent::RosterTerminal(_)
             | SessionMutationIntent::RosterAdmissionV2(_)
             | SessionMutationIntent::RosterTerminalV2(_)
-            | SessionMutationIntent::Authorized { .. } => Ok(()),
+            | SessionMutationIntent::Authorized { .. }
+            | SessionMutationIntent::AsyncRecoveryBoundary { .. } => Ok(()),
         }
     }
 }
@@ -30871,9 +30873,12 @@ fn execute_application_intent_sync(
         | SessionMutationIntent::FinalizeOperatorRecoveryV2(_)
         | SessionMutationIntent::RosterAdmissionV2(_)
         | SessionMutationIntent::RosterTerminalV2(_)
-        | SessionMutationIntent::Authorized { .. } => Err(StoreError::BackendUnavailable(
-            "session consensus internal intent reached application executor".into(),
-        )),
+        | SessionMutationIntent::Authorized { .. }
+        | SessionMutationIntent::AsyncRecoveryBoundary { .. } => {
+            Err(StoreError::BackendUnavailable(
+                "session consensus internal intent reached application executor".into(),
+            ))
+        }
     }
 }
 

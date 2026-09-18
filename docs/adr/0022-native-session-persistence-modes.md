@@ -241,7 +241,9 @@ Async can lose acknowledged results if the live volatile quorum is lost.
 
 ### Completed consensus shutdown
 
-New Async roots use `OPCNA002` and a distinct root-binding hash domain. Old
+Completed-shutdown evidence was introduced with `OPCNA002`; new Async roots
+use `OPCNA003`, with an additional durable authority reservation and a distinct
+root-binding hash domain. Old
 readers reject this format before participating: a reader that did not consume
 the one-use proof could otherwise retain it while acknowledging new volatile
 work. Legacy `OPCNA001` roots retain their original admission rules; there is
@@ -277,6 +279,29 @@ barriers remain required. Shutdown cancellation preserves the shared drain and
 root lock through definitive completion. Public handles must still be released
 before reopen because they own the snapshot namespace. Ordinary Async session
 acknowledgements retain their resident replication/application boundary.
+
+### Reserved authority and replicated retirement
+
+An `OPCNA003` owner syncs its root-bound `ASYNC-AUTHORITY` reservation before
+starting volatile consensus. Its finite range bounds terms, indices and
+authority allocators independently of completed session generations. Ordinary
+operations compare resident counters against the reservation without writing
+it. Exhaustion, a missing reservation or inconsistent input fails closed.
+
+The native state machine recognizes an internal recovery-boundary command.
+Ordinary application submission rejects this command. It retires the entire
+predecessor range, invalidates retained leases, advances absent-key fence and
+history floors, and compacts the externally visible watch stream. Physical
+notification inventory and history conservation remain independently checked.
+The boundary survives native generation and portable snapshot admission;
+snapshot downgrade or removal is rejected. Activated protected rosters are
+not covered by this retirement vocabulary.
+
+These predicates are foundations, not recovery authority. Until an
+authenticated, durably prepared recovery protocol supplies the missing proof,
+unclean majority and all-cold recovery remain quarantined. In particular, a
+legacy root has no pre-loss allocation ceiling; adding one after a loss cannot
+retroactively bound already-issued fences.
 
 ### Majority-loss authority gap (SDK #908)
 

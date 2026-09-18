@@ -439,6 +439,7 @@ impl NativeStorage {
         sql::validate_protected_roster_recovery_state_sync(&tx, state.identity)
             .map_err(|_| invalid("native snapshot exported roster recovery validation failed"))?;
         check()?;
+        sql::async_recovery::write(&tx, frontiers.async_recovery.as_ref())?;
         tx.commit().map_err(|error| db!(error))?;
         conn.pragma_update(None, "query_only", true)
             .map_err(|error| db!(error))?;

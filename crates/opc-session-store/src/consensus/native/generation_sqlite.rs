@@ -321,6 +321,7 @@ impl<'a> SqlitePreparedBase<'a> {
                             profile,
                         }
                     }),
+                    async_recovery: metadata.async_recovery,
                     current_snapshot: sql::read_current_snapshot_sync(&tx, identity)?,
                 })),
                 counts: [0; 4],

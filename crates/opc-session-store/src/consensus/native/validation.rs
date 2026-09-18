@@ -215,6 +215,7 @@ pub(super) fn validate_frontiers(
         return Err(invalid("native V1 capability certificate differs"));
     }
     roster::validate_activation(identity, members, frontiers)?;
+    frontiers.validate_async_boundary()?;
     if notifications as u64 != frontiers.watch_sequence {
         return Err(invalid("native image watch count differs"));
     }

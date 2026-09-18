@@ -56,7 +56,8 @@ fn log_bytes(row: &log::NativeLogEntry) -> io::Result<usize> {
         };
         match intent {
             SessionMutationIntent::AdvanceLogicalTime => {}
-            SessionMutationIntent::MaintainFencedTransitionV2History { .. } => {
+            SessionMutationIntent::MaintainFencedTransitionV2History { .. }
+            | SessionMutationIntent::AsyncRecoveryBoundary { .. } => {
                 count = 1;
             }
             SessionMutationIntent::ActivateFencedTransitionCapability { .. } => {
@@ -200,7 +201,10 @@ pub(super) fn log_owned(entry: &Entry<SessionRaftTypeConfig>) -> io::Result<usiz
     fn intent(value: &SessionMutationIntent, allow_authorized: bool) -> io::Result<usize> {
         match value {
             SessionMutationIntent::AdvanceLogicalTime => Ok(0),
-            SessionMutationIntent::MaintainFencedTransitionV2History { .. } if allow_authorized => {
+            SessionMutationIntent::MaintainFencedTransitionV2History { .. }
+            | SessionMutationIntent::AsyncRecoveryBoundary { .. }
+                if allow_authorized =>
+            {
                 Ok(0)
             }
             SessionMutationIntent::BindConsumerRequest { .. } => Ok(0),

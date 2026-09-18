@@ -11027,7 +11027,8 @@ fn committed_error_matches_intent(intent: &SessionMutationIntent, error: &StoreE
         | SessionMutationIntent::RosterTerminal(_)
         | SessionMutationIntent::RosterAdmissionV2(_)
         | SessionMutationIntent::RosterTerminalV2(_)
-        | SessionMutationIntent::Authorized { .. } => false,
+        | SessionMutationIntent::Authorized { .. }
+        | SessionMutationIntent::AsyncRecoveryBoundary { .. } => false,
         SessionMutationIntent::MaintainFencedTransitionV2History { .. } => {
             matches!(
                 error,
@@ -11162,6 +11163,11 @@ fn validate_consensus_intent_with_recovery(
     intent: &SessionMutationIntent,
     allow_operator_recovery: bool,
 ) -> Result<(), StoreError> {
+    if matches!(intent, SessionMutationIntent::AsyncRecoveryBoundary { .. }) {
+        return Err(StoreError::CapabilityNotSupported(
+            "async_recovery_requires_unanimous_protocol".into(),
+        ));
+    }
     if matches!(
         intent,
         SessionMutationIntent::FinalizeOperatorRecovery { .. }

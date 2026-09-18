@@ -612,9 +612,9 @@ impl BusinessChanges {
         // A create-then-reclaim entry has no endpoint row or checksum. Count
         // the actual detached inventory, independently of both certificates,
         // so coalescing cannot erase a binding and its physical reclamation.
-        lifecycle::conservation(
-            self.base.frontiers.history,
-            self.target.frontiers.history,
+        async_recovery::history_conservation(
+            &self.base.frontiers,
+            &self.target.frontiers,
             added,
             removed,
             transient,
@@ -866,11 +866,14 @@ impl Publication {
         let mut deleted = Vec::with_capacity(receipt_removals.len());
         let mut transient = 0usize;
         let mut receipt_order = predecessor.receipt_order.clone();
-        predecessor.receipt_order.validate_retirement(
-            predecessor.frontiers.history,
-            frontiers.history,
-            frontiers.logical_time,
-        )?;
+        predecessor
+            .receipt_order
+            .validate_retirement_with_recovery(
+                predecessor.frontiers.history,
+                frontiers.history,
+                frontiers.logical_time,
+                frontiers.async_fence_floor(),
+            )?;
         for (id, row) in &receipts {
             if receipt_removals.contains(id) {
                 return Err(invalid("native receipt is both retained and removed"));
@@ -930,9 +933,9 @@ impl Publication {
                 transient += 1;
             }
         }
-        lifecycle::conservation(
-            predecessor.frontiers.history,
-            frontiers.history,
+        async_recovery::history_conservation(
+            &predecessor.frontiers,
+            &frontiers,
             introduced.len(),
             deleted.len(),
             transient,
@@ -1001,7 +1004,15 @@ impl Publication {
         )?;
         let delivery = NativeApplied {
             responses,
-            notifications: notifications.clone(),
+            notifications: notifications
+                .iter()
+                .filter(|entry| entry.sequence > frontiers.async_watch_before())
+                .cloned()
+                .map(|mut entry| {
+                    entry.sequence = frontiers.outward_watch(entry.sequence)?;
+                    Ok(entry)
+                })
+                .collect::<io::Result<Vec<_>>>()?,
         };
         let notifications = notifications
             .into_iter()
@@ -1207,6 +1218,23 @@ pub(super) fn validate_frontier_transition(
         }
     }
     v1::validate_activation_transition(before, after)?;
+    if let Some(prior) = &before.async_recovery {
+        let next = after
+            .async_recovery
+            .as_ref()
+            .ok_or_else(|| invalid("native asynchronous boundary cleared"))?;
+        if next != prior && (next.era <= prior.era || next.applied.index <= prior.applied.index) {
+            return Err(invalid(
+                "native asynchronous boundary regressed or conflicted",
+            ));
+        }
+    }
+    if after.async_recovery != before.async_recovery
+        && after.async_watch_before() < before.watch_sequence
+    {
+        return Err(invalid("native asynchronous watch retirement regressed"));
+    }
+    after.validate_async_boundary()?;
     if (before.roster_v1_namespace && !after.roster_v1_namespace)
         || before
             .roster_v2_activation
@@ -1215,7 +1243,7 @@ pub(super) fn validate_frontier_transition(
     {
         return Err(invalid("native roster activation regressed or changed"));
     }
-    lifecycle::transition(before.history, after.history)?;
+    async_recovery::history_transition(before, after)?;
     Ok(())
 }
 

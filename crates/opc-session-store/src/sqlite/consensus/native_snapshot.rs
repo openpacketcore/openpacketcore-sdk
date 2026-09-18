@@ -17,6 +17,7 @@ pub(crate) struct Metadata {
     pub(crate) roster_v1: bool,
     pub(crate) roster_v2: Option<(SessionConsensusIdentity, [u8; 32], [u8; 32])>,
     pub(crate) history: Option<FencedTransitionV2HistoryState>,
+    pub(crate) async_recovery: Option<crate::consensus::native::async_recovery::Boundary>,
     pub(crate) witness: Option<GlobalChargeWitness>,
 }
 
@@ -52,6 +53,7 @@ pub(crate) fn reserve_input(
     // namespaces are classified by the original exact-layout validator below.
     for table in [
         "consensus_identity",
+        "consensus_async_recovery",
         "consensus_membership_scope",
         "consensus_membership_history",
         "consensus_membership_terminal_history",
@@ -224,6 +226,7 @@ fn validate_reserved(
         .map_err(|_| invalid_data("native snapshot roster layout invalid"))?
         == ProtectedRosterRecoveryLayout::Activated;
     Ok(Metadata {
+        async_recovery: async_recovery::read(conn)?,
         machine: read_machine_sync(conn, identity)?,
         v1,
         history: if v2.is_some() {

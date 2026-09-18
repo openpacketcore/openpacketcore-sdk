@@ -116,7 +116,12 @@ impl Transaction<'_, '_> {
     }
 
     fn set_key(&mut self, key: SessionKey, row: NativeKeyState) {
-        self.expiry.replace(&key, Some(&self.key(&key)), Some(&row));
+        let before = self
+            .keys
+            .get(&key)
+            .cloned()
+            .unwrap_or_else(|| self.base.physical_key(&key));
+        self.expiry.replace(&key, Some(&before), Some(&row));
         self.keys.insert(key, row);
     }
 

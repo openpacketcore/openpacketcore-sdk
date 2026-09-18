@@ -285,16 +285,28 @@ impl ReceiptOrder {
         Ok(())
     }
 
+    #[cfg(test)]
     pub(super) fn validate_retirement(
         &self,
         before: Option<FencedTransitionV2HistoryState>,
         after: Option<FencedTransitionV2HistoryState>,
         now: Option<Timestamp>,
     ) -> io::Result<()> {
+        self.validate_retirement_with_recovery(before, after, now, 0)
+    }
+
+    pub(super) fn validate_retirement_with_recovery(
+        &self,
+        before: Option<FencedTransitionV2HistoryState>,
+        after: Option<FencedTransitionV2HistoryState>,
+        now: Option<Timestamp>,
+        recovered_floor: u64,
+    ) -> io::Result<()> {
         let previous = lifecycle::floor(before);
         let next = lifecycle::floor(after);
         for epoch in &self.epochs {
-            if epoch.epoch.get() > previous
+            if epoch.epoch.get() > recovered_floor
+                && epoch.epoch.get() > previous
                 && epoch.epoch.get() <= next
                 && epoch
                     .rows

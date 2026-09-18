@@ -41,6 +41,14 @@ impl Reservation {
         self.era * RANGE - 1
     }
 
+    pub(crate) fn era(self) -> u64 {
+        self.era
+    }
+
+    pub(crate) fn retired_through(self) -> u64 {
+        (self.era - 1).saturating_mul(RANGE).saturating_sub(1)
+    }
+
     pub(crate) fn check(self, value: u64) -> io::Result<()> {
         if value > self.ceiling() {
             return Err(invalid_data("asynchronous authority range exceeded"));
