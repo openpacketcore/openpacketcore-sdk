@@ -254,6 +254,18 @@ async fn replicated_audit_saturation_reserves_results_and_rejects_rebinding() {
         AuditAdmission::Rejected(AuditAuthorityError::BindingMismatch)
     ));
     assert!(store.load_latest().await.unwrap().is_none());
+    let unaudited_tx = TxId::new();
+    assert!(
+        store
+            .append_attested_commit(attested(
+                commit(unaudited_tx, None, 1, 19),
+                audit(unaudited_tx)
+            ))
+            .await
+            .is_err(),
+        "an active audit authority must reject the ordinary unaudited write API"
+    );
+    assert!(store.load_latest().await.unwrap().is_none());
     assert_eq!(
         applied(
             store
