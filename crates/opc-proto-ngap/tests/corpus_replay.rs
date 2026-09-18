@@ -10,6 +10,7 @@
 //! input, this test fails and names the offending input.
 
 use bytes::Bytes;
+use opc_proto_ngap::n3iwf::context_fields::{AllowedNssai, Guami, SecurityAlgorithmMasks};
 use opc_proto_ngap::n3iwf::nas::{NasMessage, UeAggregateBitRate};
 use opc_proto_ngap::n3iwf::release::{Cause, ReleaseMessage, UeIdentifiers};
 use opc_proto_ngap::n3iwf::setup::{
@@ -39,6 +40,31 @@ fn exercise(data: &[u8]) {
     let _ = UeAggregateBitRate::decode(data, ctx);
     let _ = Cause::decode(data, ctx);
     let _ = UeIdentifiers::decode(data, ctx);
+    if let Ok(field) = Guami::decode(data, ctx) {
+        let wire = field.encode(EncodeContext::default()).unwrap();
+        assert!(Guami::decode(wire.as_bytes(), ctx).unwrap() == field);
+    }
+    if let Ok(field) = AllowedNssai::decode(data, ctx) {
+        let wire = field.encode(EncodeContext::default()).unwrap();
+        assert!(AllowedNssai::decode(wire.as_bytes(), ctx).unwrap() == field);
+    }
+    if let Some(bytes) = data.get(..8) {
+        let masks = bytes.as_chunks::<2>().0;
+        let value = SecurityAlgorithmMasks::new(
+            u16::from_be_bytes(masks[0]),
+            u16::from_be_bytes(masks[1]),
+            u16::from_be_bytes(masks[2]),
+            u16::from_be_bytes(masks[3]),
+        );
+        assert_eq!(
+            value
+                .encode(EncodeContext::default())
+                .unwrap()
+                .as_bytes()
+                .len(),
+            9
+        );
+    }
     if let Ok(field) = GlobalN3iwfId::decode(data, ctx) {
         let wire = field.encode(EncodeContext::default()).unwrap();
         assert!(GlobalN3iwfId::decode(wire.as_bytes(), ctx).unwrap() == field);

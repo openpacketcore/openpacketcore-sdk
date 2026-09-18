@@ -1,0 +1,1423 @@
+{
+  "source_sha256": "21617ad6dd826e05a0e8356ef96f44199cf4c7bc1be65e6b915e9135e10b59e2",
+  "reference_tools": {
+    "pycrate": "0.8.1",
+    "pypdf": "6.1.0"
+  },
+  "fields": [
+    {
+      "type": "GUAMI",
+      "model": {
+        "plmn": "001-01",
+        "region": 0,
+        "set": 0,
+        "pointer": 0
+      },
+      "wire_hex": "0000f110000000",
+      "wire_sha256": "1cc6733df60aca7b0ada02b5b90531c6ba49f29fad7120cf9371e2ec375a043c"
+    },
+    {
+      "type": "GUAMI",
+      "model": {
+        "plmn": "001-01",
+        "region": 255,
+        "set": 1023,
+        "pointer": 63
+      },
+      "wire_hex": "0000f110ffffff",
+      "wire_sha256": "0378eed2e5eafa027c0da5a11fb027a851433b4a38f0b04b5bf43e2d1371099c"
+    },
+    {
+      "type": "GUAMI",
+      "model": {
+        "plmn": "001-01",
+        "region": 128,
+        "set": 512,
+        "pointer": 32
+      },
+      "wire_hex": "0000f110808020",
+      "wire_sha256": "b194317c3b519e74202d91cdc52390d2f33ed5431ca3d514a180fa367e21d6e8"
+    },
+    {
+      "type": "GUAMI",
+      "model": {
+        "plmn": "001-01",
+        "region": 1,
+        "set": 1,
+        "pointer": 1
+      },
+      "wire_hex": "0000f110010041",
+      "wire_sha256": "7699d4758c30c936dd2c819c21826a6f05c2d7e1207f0820dc6669ced3b9fe59"
+    },
+    {
+      "type": "GUAMI",
+      "model": {
+        "plmn": "310-260",
+        "region": 0,
+        "set": 0,
+        "pointer": 0
+      },
+      "wire_hex": "00130062000000",
+      "wire_sha256": "c8e9382d38d2a1f8157811eeebd3ff1a35018ee5bcf6fb6a970b62600801eb1c"
+    },
+    {
+      "type": "GUAMI",
+      "model": {
+        "plmn": "310-260",
+        "region": 255,
+        "set": 1023,
+        "pointer": 63
+      },
+      "wire_hex": "00130062ffffff",
+      "wire_sha256": "0a2b28722456e905efa3565f997c229ed72e1532d01f2105ac310f5d5ba226c4"
+    },
+    {
+      "type": "GUAMI",
+      "model": {
+        "plmn": "310-260",
+        "region": 128,
+        "set": 512,
+        "pointer": 32
+      },
+      "wire_hex": "00130062808020",
+      "wire_sha256": "0fd935567f477dda8bb450d3a108bb45b29d85fb517381e3b0801f49a0aaae31"
+    },
+    {
+      "type": "GUAMI",
+      "model": {
+        "plmn": "310-260",
+        "region": 1,
+        "set": 1,
+        "pointer": 1
+      },
+      "wire_hex": "00130062010041",
+      "wire_sha256": "e7eb110319f06b1f7c568d3fab137f88f1a1ed2dd97fb43857a10c16be23e55d"
+    },
+    {
+      "type": "AllowedNSSAI",
+      "model": [
+        {
+          "sst": 0,
+          "sd": null
+        }
+      ],
+      "wire_hex": "0000",
+      "wire_sha256": "96a296d224f285c67bee93c30f8a309157f0daa35dc5b87e410b78630a09cfc7"
+    },
+    {
+      "type": "AllowedNSSAI",
+      "model": [
+        {
+          "sst": 0,
+          "sd": null
+        }
+      ],
+      "wire_hex": "0000",
+      "wire_sha256": "96a296d224f285c67bee93c30f8a309157f0daa35dc5b87e410b78630a09cfc7"
+    },
+    {
+      "type": "AllowedNSSAI",
+      "model": [
+        {
+          "sst": 0,
+          "sd": "000000"
+        }
+      ],
+      "wire_hex": "0200000000",
+      "wire_sha256": "395c2f5598a1643a205154c6f4c46ce36895b28e6c35660a95e5c6fd5ef9aeab"
+    },
+    {
+      "type": "AllowedNSSAI",
+      "model": [
+        {
+          "sst": 0,
+          "sd": null
+        },
+        {
+          "sst": 37,
+          "sd": null
+        }
+      ],
+      "wire_hex": "20000128",
+      "wire_sha256": "e19b1fc77a60f84b69064bf65c005cf358801698f313fa8067e7ad731332f2e2"
+    },
+    {
+      "type": "AllowedNSSAI",
+      "model": [
+        {
+          "sst": 0,
+          "sd": null
+        },
+        {
+          "sst": 37,
+          "sd": "234567"
+        }
+      ],
+      "wire_hex": "20001128234567",
+      "wire_sha256": "1a7680defb2ec7894b2d4dd4fb84732221849265ef32596d7da377349f7e5893"
+    },
+    {
+      "type": "AllowedNSSAI",
+      "model": [
+        {
+          "sst": 0,
+          "sd": "000000"
+        },
+        {
+          "sst": 37,
+          "sd": "234567"
+        }
+      ],
+      "wire_hex": "22000000001128234567",
+      "wire_sha256": "e270000e7bb3b919b0bbd3e158c1835a12d2f28ec2f0d778d1593d468afb96e5"
+    },
+    {
+      "type": "AllowedNSSAI",
+      "model": [
+        {
+          "sst": 0,
+          "sd": null
+        },
+        {
+          "sst": 37,
+          "sd": null
+        },
+        {
+          "sst": 74,
+          "sd": null
+        }
+      ],
+      "wire_hex": "400001281280",
+      "wire_sha256": "3696af42b9ac30488d6b98b7d76f722a98db0385b59b2dd766d0c14492fa1fe2"
+    },
+    {
+      "type": "AllowedNSSAI",
+      "model": [
+        {
+          "sst": 0,
+          "sd": null
+        },
+        {
+          "sst": 37,
+          "sd": "234567"
+        },
+        {
+          "sst": 74,
+          "sd": null
+        }
+      ],
+      "wire_hex": "400011282345670250",
+      "wire_sha256": "8024c12a2c5c834415bde2cd8693302c888bdfb09c788d51c0e95b29461bf88e"
+    },
+    {
+      "type": "AllowedNSSAI",
+      "model": [
+        {
+          "sst": 0,
+          "sd": "000000"
+        },
+        {
+          "sst": 37,
+          "sd": "234567"
+        },
+        {
+          "sst": 74,
+          "sd": "468ace"
+        }
+      ],
+      "wire_hex": "420000000011282345671250468ace",
+      "wire_sha256": "e72e2e8b955c57572f5468449ea21437320ae64c663893c9b13e4b53b8916ccd"
+    },
+    {
+      "type": "AllowedNSSAI",
+      "model": [
+        {
+          "sst": 0,
+          "sd": null
+        },
+        {
+          "sst": 37,
+          "sd": null
+        },
+        {
+          "sst": 74,
+          "sd": null
+        },
+        {
+          "sst": 111,
+          "sd": null
+        }
+      ],
+      "wire_hex": "600001281280de",
+      "wire_sha256": "aabd1b6b8a21aa784399398342e3d9e3f2eccda744b5d9027b283de1791ddbf2"
+    },
+    {
+      "type": "AllowedNSSAI",
+      "model": [
+        {
+          "sst": 0,
+          "sd": null
+        },
+        {
+          "sst": 37,
+          "sd": "234567"
+        },
+        {
+          "sst": 74,
+          "sd": null
+        },
+        {
+          "sst": 111,
+          "sd": "69d035"
+        }
+      ],
+      "wire_hex": "6000112823456702509bc069d035",
+      "wire_sha256": "0c88f57a17400bf2ccdc320c8ec319a36ac18a3c2b9721a4dee4de26070bf661"
+    },
+    {
+      "type": "AllowedNSSAI",
+      "model": [
+        {
+          "sst": 0,
+          "sd": "000000"
+        },
+        {
+          "sst": 37,
+          "sd": "234567"
+        },
+        {
+          "sst": 74,
+          "sd": "468ace"
+        },
+        {
+          "sst": 111,
+          "sd": "69d035"
+        }
+      ],
+      "wire_hex": "620000000011282345671250468ace137869d035",
+      "wire_sha256": "5062780899092a5677c60288801af1359aa6e5b68c7e2ceca1a1afbbfebdcccb"
+    },
+    {
+      "type": "AllowedNSSAI",
+      "model": [
+        {
+          "sst": 0,
+          "sd": null
+        },
+        {
+          "sst": 37,
+          "sd": null
+        },
+        {
+          "sst": 74,
+          "sd": null
+        },
+        {
+          "sst": 111,
+          "sd": null
+        },
+        {
+          "sst": 148,
+          "sd": null
+        }
+      ],
+      "wire_hex": "800001281280de0940",
+      "wire_sha256": "0d91873ffd2656f41e784bfd2ecec971546c39520d1696e8ce4cd05d40e74484"
+    },
+    {
+      "type": "AllowedNSSAI",
+      "model": [
+        {
+          "sst": 0,
+          "sd": null
+        },
+        {
+          "sst": 37,
+          "sd": "234567"
+        },
+        {
+          "sst": 74,
+          "sd": null
+        },
+        {
+          "sst": 111,
+          "sd": "69d035"
+        },
+        {
+          "sst": 148,
+          "sd": null
+        }
+      ],
+      "wire_hex": "8000112823456702509bc069d03504a0",
+      "wire_sha256": "3365bd9ef3f3f6f0b093d820754cca5511a6560402c579d149039cef9fb78c10"
+    },
+    {
+      "type": "AllowedNSSAI",
+      "model": [
+        {
+          "sst": 0,
+          "sd": "000000"
+        },
+        {
+          "sst": 37,
+          "sd": "234567"
+        },
+        {
+          "sst": 74,
+          "sd": "468ace"
+        },
+        {
+          "sst": 111,
+          "sd": "69d035"
+        },
+        {
+          "sst": 148,
+          "sd": "8d159c"
+        }
+      ],
+      "wire_hex": "820000000011282345671250468ace137869d03514a08d159c",
+      "wire_sha256": "92e79cfab089aedaa699823449cda97a90104d81c174a5b23866a866ee66c94b"
+    },
+    {
+      "type": "AllowedNSSAI",
+      "model": [
+        {
+          "sst": 0,
+          "sd": null
+        },
+        {
+          "sst": 37,
+          "sd": null
+        },
+        {
+          "sst": 74,
+          "sd": null
+        },
+        {
+          "sst": 111,
+          "sd": null
+        },
+        {
+          "sst": 148,
+          "sd": null
+        },
+        {
+          "sst": 185,
+          "sd": null
+        }
+      ],
+      "wire_hex": "a00001281280de09405c80",
+      "wire_sha256": "2a494490cd341fffcbc62753d3d4e08ba5f1675aebe1465049a6073304417f7e"
+    },
+    {
+      "type": "AllowedNSSAI",
+      "model": [
+        {
+          "sst": 0,
+          "sd": null
+        },
+        {
+          "sst": 37,
+          "sd": "234567"
+        },
+        {
+          "sst": 74,
+          "sd": null
+        },
+        {
+          "sst": 111,
+          "sd": "69d035"
+        },
+        {
+          "sst": 148,
+          "sd": null
+        },
+        {
+          "sst": 185,
+          "sd": "b05b03"
+        }
+      ],
+      "wire_hex": "a000112823456702509bc069d03504a0ae40b05b03",
+      "wire_sha256": "91a0db1473563304efc3652b7f167071bada859c1a74107e5c20f1285bfeec31"
+    },
+    {
+      "type": "AllowedNSSAI",
+      "model": [
+        {
+          "sst": 0,
+          "sd": "000000"
+        },
+        {
+          "sst": 37,
+          "sd": "234567"
+        },
+        {
+          "sst": 74,
+          "sd": "468ace"
+        },
+        {
+          "sst": 111,
+          "sd": "69d035"
+        },
+        {
+          "sst": 148,
+          "sd": "8d159c"
+        },
+        {
+          "sst": 185,
+          "sd": "b05b03"
+        }
+      ],
+      "wire_hex": "a20000000011282345671250468ace137869d03514a08d159c15c8b05b03",
+      "wire_sha256": "7faa1e6272f0c7640d83dc201b10ecda12b0c80c30c7d0936b2fe618a0aa08ed"
+    },
+    {
+      "type": "AllowedNSSAI",
+      "model": [
+        {
+          "sst": 0,
+          "sd": null
+        },
+        {
+          "sst": 37,
+          "sd": null
+        },
+        {
+          "sst": 74,
+          "sd": null
+        },
+        {
+          "sst": 111,
+          "sd": null
+        },
+        {
+          "sst": 148,
+          "sd": null
+        },
+        {
+          "sst": 185,
+          "sd": null
+        },
+        {
+          "sst": 222,
+          "sd": null
+        }
+      ],
+      "wire_hex": "c00001281280de09405c8378",
+      "wire_sha256": "4324b6b15772d6163f2bc53955f2240bf8e602c99ba3b00bf15a96248a52be9b"
+    },
+    {
+      "type": "AllowedNSSAI",
+      "model": [
+        {
+          "sst": 0,
+          "sd": null
+        },
+        {
+          "sst": 37,
+          "sd": "234567"
+        },
+        {
+          "sst": 74,
+          "sd": null
+        },
+        {
+          "sst": 111,
+          "sd": "69d035"
+        },
+        {
+          "sst": 148,
+          "sd": null
+        },
+        {
+          "sst": 185,
+          "sd": "b05b03"
+        },
+        {
+          "sst": 222,
+          "sd": null
+        }
+      ],
+      "wire_hex": "c000112823456702509bc069d03504a0ae40b05b0306f0",
+      "wire_sha256": "a33119d96d4324a493a12c3da763ee2250d5200d81cebc54ed9442741406416f"
+    },
+    {
+      "type": "AllowedNSSAI",
+      "model": [
+        {
+          "sst": 0,
+          "sd": "000000"
+        },
+        {
+          "sst": 37,
+          "sd": "234567"
+        },
+        {
+          "sst": 74,
+          "sd": "468ace"
+        },
+        {
+          "sst": 111,
+          "sd": "69d035"
+        },
+        {
+          "sst": 148,
+          "sd": "8d159c"
+        },
+        {
+          "sst": 185,
+          "sd": "b05b03"
+        },
+        {
+          "sst": 222,
+          "sd": "d3a06a"
+        }
+      ],
+      "wire_hex": "c20000000011282345671250468ace137869d03514a08d159c15c8b05b0316f0d3a06a",
+      "wire_sha256": "3e83850f1bc29d2d2c3ee0876a33091ca32382d0f3dd1a3676d1abbf752c4d59"
+    },
+    {
+      "type": "AllowedNSSAI",
+      "model": [
+        {
+          "sst": 0,
+          "sd": null
+        },
+        {
+          "sst": 37,
+          "sd": null
+        },
+        {
+          "sst": 74,
+          "sd": null
+        },
+        {
+          "sst": 111,
+          "sd": null
+        },
+        {
+          "sst": 148,
+          "sd": null
+        },
+        {
+          "sst": 185,
+          "sd": null
+        },
+        {
+          "sst": 222,
+          "sd": null
+        },
+        {
+          "sst": 3,
+          "sd": null
+        }
+      ],
+      "wire_hex": "e00001281280de09405c83780060",
+      "wire_sha256": "c4da3d923dc677de3648bc36596e2177e76699c212f4b55f3fa7ffb35798813f"
+    },
+    {
+      "type": "AllowedNSSAI",
+      "model": [
+        {
+          "sst": 0,
+          "sd": null
+        },
+        {
+          "sst": 37,
+          "sd": "234567"
+        },
+        {
+          "sst": 74,
+          "sd": null
+        },
+        {
+          "sst": 111,
+          "sd": "69d035"
+        },
+        {
+          "sst": 148,
+          "sd": null
+        },
+        {
+          "sst": 185,
+          "sd": "b05b03"
+        },
+        {
+          "sst": 222,
+          "sd": null
+        },
+        {
+          "sst": 3,
+          "sd": "f6e5d1"
+        }
+      ],
+      "wire_hex": "e000112823456702509bc069d03504a0ae40b05b0306f080c0f6e5d1",
+      "wire_sha256": "7c773016b373624f15463667cceb5bca3fb2e4f22af9200a4ce88fddce094771"
+    },
+    {
+      "type": "AllowedNSSAI",
+      "model": [
+        {
+          "sst": 0,
+          "sd": "000000"
+        },
+        {
+          "sst": 37,
+          "sd": "234567"
+        },
+        {
+          "sst": 74,
+          "sd": "468ace"
+        },
+        {
+          "sst": 111,
+          "sd": "69d035"
+        },
+        {
+          "sst": 148,
+          "sd": "8d159c"
+        },
+        {
+          "sst": 185,
+          "sd": "b05b03"
+        },
+        {
+          "sst": 222,
+          "sd": "d3a06a"
+        },
+        {
+          "sst": 3,
+          "sd": "f6e5d1"
+        }
+      ],
+      "wire_hex": "e20000000011282345671250468ace137869d03514a08d159c15c8b05b0316f0d3a06a1018f6e5d1",
+      "wire_sha256": "046e92ed4b412f90c009ec15c2074b7aa41de52feaa397444a8ec41ce3a522f7"
+    },
+    {
+      "type": "UESecurityCapabilities",
+      "model": [
+        0,
+        0,
+        0,
+        0
+      ],
+      "wire_hex": "000000000000000000",
+      "wire_sha256": "3e7077fd2f66d689e0cee6a7cf5b37bf2dca7c979af356d0a31cbc5c85605c7d"
+    },
+    {
+      "type": "UESecurityCapabilities",
+      "model": [
+        65535,
+        65535,
+        65535,
+        65535
+      ],
+      "wire_hex": "1fffeffff7fffbfffc",
+      "wire_sha256": "2460d8de740dcfb130c8576dad3d36b2b7545feaf69733051eb6b10c5c88f8d6"
+    },
+    {
+      "type": "UESecurityCapabilities",
+      "model": [
+        1,
+        0,
+        0,
+        0
+      ],
+      "wire_hex": "000020000000000000",
+      "wire_sha256": "d5f53203c7e2cb1c042f08afd7c7106043cfc622f92b7cc02af6acd4e606e3bd"
+    },
+    {
+      "type": "UESecurityCapabilities",
+      "model": [
+        2,
+        0,
+        0,
+        0
+      ],
+      "wire_hex": "000040000000000000",
+      "wire_sha256": "6cb4d2dd6a4abb1a05f351272330cf4c1b53f30c6d12280dd06375ea923a4952"
+    },
+    {
+      "type": "UESecurityCapabilities",
+      "model": [
+        4,
+        0,
+        0,
+        0
+      ],
+      "wire_hex": "000080000000000000",
+      "wire_sha256": "eaa6d00a16c4a8b92e6dd502820686f091bf17f9ac2da73797c5144c50e2d6e1"
+    },
+    {
+      "type": "UESecurityCapabilities",
+      "model": [
+        8,
+        0,
+        0,
+        0
+      ],
+      "wire_hex": "000100000000000000",
+      "wire_sha256": "51b09ceccfbec44595dd4241e6e2a693d279b72c899c8f60ec63524fe58b1d4f"
+    },
+    {
+      "type": "UESecurityCapabilities",
+      "model": [
+        16,
+        0,
+        0,
+        0
+      ],
+      "wire_hex": "000200000000000000",
+      "wire_sha256": "3b7aee3e7f3e7913273d9e7860e0388497282ed34eac943c8f923d073d774cb3"
+    },
+    {
+      "type": "UESecurityCapabilities",
+      "model": [
+        32,
+        0,
+        0,
+        0
+      ],
+      "wire_hex": "000400000000000000",
+      "wire_sha256": "47b5bab475da2f3f91ed6fd44b895fe8e74024319ed2b9bc0fb0c46b3a605a75"
+    },
+    {
+      "type": "UESecurityCapabilities",
+      "model": [
+        64,
+        0,
+        0,
+        0
+      ],
+      "wire_hex": "000800000000000000",
+      "wire_sha256": "7b9980a17c6da19813a22a3607d03a73cae33ce64c292f85ca99471a415530e4"
+    },
+    {
+      "type": "UESecurityCapabilities",
+      "model": [
+        128,
+        0,
+        0,
+        0
+      ],
+      "wire_hex": "001000000000000000",
+      "wire_sha256": "1665c368ee1ef6df213d5495a0bd19262ce19c05b13bdf3d343516a0aad4f62f"
+    },
+    {
+      "type": "UESecurityCapabilities",
+      "model": [
+        256,
+        0,
+        0,
+        0
+      ],
+      "wire_hex": "002000000000000000",
+      "wire_sha256": "c61baea067dbd97b45fa86e75e545fc3271208722e8e901941c15cafef22bcc6"
+    },
+    {
+      "type": "UESecurityCapabilities",
+      "model": [
+        512,
+        0,
+        0,
+        0
+      ],
+      "wire_hex": "004000000000000000",
+      "wire_sha256": "cf7ca0dfd6a68469d1897444e7703880301ca76da0ace2f7ac3abf1eb4d9be68"
+    },
+    {
+      "type": "UESecurityCapabilities",
+      "model": [
+        1024,
+        0,
+        0,
+        0
+      ],
+      "wire_hex": "008000000000000000",
+      "wire_sha256": "4ef9d29efa3094fea40445d712d54ca73fa553a8602e3dc845d230dced741cf8"
+    },
+    {
+      "type": "UESecurityCapabilities",
+      "model": [
+        2048,
+        0,
+        0,
+        0
+      ],
+      "wire_hex": "010000000000000000",
+      "wire_sha256": "a536aa3cede6ea3c1f3e0357c3c60e0f216a8c89b853df13b29daa8f85065dfb"
+    },
+    {
+      "type": "UESecurityCapabilities",
+      "model": [
+        4096,
+        0,
+        0,
+        0
+      ],
+      "wire_hex": "020000000000000000",
+      "wire_sha256": "4322fd2bc0a137d1375b37b3b2e2b4715b3d3dd7ca9682438d4fea0f8437fad3"
+    },
+    {
+      "type": "UESecurityCapabilities",
+      "model": [
+        8192,
+        0,
+        0,
+        0
+      ],
+      "wire_hex": "040000000000000000",
+      "wire_sha256": "93e60f669b99ad3e3ee6284b139e57adfb419960f390858e46ea565bbf82d001"
+    },
+    {
+      "type": "UESecurityCapabilities",
+      "model": [
+        16384,
+        0,
+        0,
+        0
+      ],
+      "wire_hex": "080000000000000000",
+      "wire_sha256": "92c0a3cd8b571ac5634aa066fcc63d7b62155c36126a29231d97692ff2944875"
+    },
+    {
+      "type": "UESecurityCapabilities",
+      "model": [
+        32768,
+        0,
+        0,
+        0
+      ],
+      "wire_hex": "100000000000000000",
+      "wire_sha256": "ba80c236eb51b48f327f8cce2664b5556634c6ac05b50a7b163d9bfd7417c459"
+    },
+    {
+      "type": "UESecurityCapabilities",
+      "model": [
+        0,
+        1,
+        0,
+        0
+      ],
+      "wire_hex": "000000001000000000",
+      "wire_sha256": "6b8c2a4d795e67c47e54a3391275d13205ed66ca67c863270da1875f7fa09f72"
+    },
+    {
+      "type": "UESecurityCapabilities",
+      "model": [
+        0,
+        2,
+        0,
+        0
+      ],
+      "wire_hex": "000000002000000000",
+      "wire_sha256": "18a99611a67eb51b2d761ae4b5f657bd48b58241f86550bd8c5be063a9d4d1b3"
+    },
+    {
+      "type": "UESecurityCapabilities",
+      "model": [
+        0,
+        4,
+        0,
+        0
+      ],
+      "wire_hex": "000000004000000000",
+      "wire_sha256": "be0f4c815b2fdaa3b57c5ac5f4ad3c8b19e0888cf13ae9b2791dbd7350926f7e"
+    },
+    {
+      "type": "UESecurityCapabilities",
+      "model": [
+        0,
+        8,
+        0,
+        0
+      ],
+      "wire_hex": "000000008000000000",
+      "wire_sha256": "010cfa4e7549a3b95392dc4e4079cff2a26aa2b682f3a672ab9de20f06bb0fb4"
+    },
+    {
+      "type": "UESecurityCapabilities",
+      "model": [
+        0,
+        16,
+        0,
+        0
+      ],
+      "wire_hex": "000000010000000000",
+      "wire_sha256": "c58614458c2397d967e807716d65e70c4d6470e3e56e3fb99862671bad2fdee6"
+    },
+    {
+      "type": "UESecurityCapabilities",
+      "model": [
+        0,
+        32,
+        0,
+        0
+      ],
+      "wire_hex": "000000020000000000",
+      "wire_sha256": "8d2dceef1a812dd7558515318442e5fcaa119ea7b470cc3d4ca92b880b4996cf"
+    },
+    {
+      "type": "UESecurityCapabilities",
+      "model": [
+        0,
+        64,
+        0,
+        0
+      ],
+      "wire_hex": "000000040000000000",
+      "wire_sha256": "5ceac9f2d246f5485cc5d0db7cef01a9dd10bc5e1826ca37ad43cddded957053"
+    },
+    {
+      "type": "UESecurityCapabilities",
+      "model": [
+        0,
+        128,
+        0,
+        0
+      ],
+      "wire_hex": "000000080000000000",
+      "wire_sha256": "6ccd810d6ece1df3fccad4ccf7cd367cc0d4932a00d8553506781822f16bd9ec"
+    },
+    {
+      "type": "UESecurityCapabilities",
+      "model": [
+        0,
+        256,
+        0,
+        0
+      ],
+      "wire_hex": "000000100000000000",
+      "wire_sha256": "f68dce5b804aed503a512e004b8a83f75cdb5548c3ade6c7127945385c46125b"
+    },
+    {
+      "type": "UESecurityCapabilities",
+      "model": [
+        0,
+        512,
+        0,
+        0
+      ],
+      "wire_hex": "000000200000000000",
+      "wire_sha256": "8430e45e479556b330f7947fb31fa8a612c685004e11131a68183f7223b99625"
+    },
+    {
+      "type": "UESecurityCapabilities",
+      "model": [
+        0,
+        1024,
+        0,
+        0
+      ],
+      "wire_hex": "000000400000000000",
+      "wire_sha256": "d06d37ae811fdb673e889191ce2831c63a035c8ee5a53efb36f1fd63ca575227"
+    },
+    {
+      "type": "UESecurityCapabilities",
+      "model": [
+        0,
+        2048,
+        0,
+        0
+      ],
+      "wire_hex": "000000800000000000",
+      "wire_sha256": "5a6b32a7d8dc38f6b5941ee792d4a3c65aa8ae6c45452e27bd1eafb1950e91af"
+    },
+    {
+      "type": "UESecurityCapabilities",
+      "model": [
+        0,
+        4096,
+        0,
+        0
+      ],
+      "wire_hex": "000001000000000000",
+      "wire_sha256": "f4a0d55fa069ac77aa9399222a1bb04d34137853bfe3d6cf0d80c1aec627ed86"
+    },
+    {
+      "type": "UESecurityCapabilities",
+      "model": [
+        0,
+        8192,
+        0,
+        0
+      ],
+      "wire_hex": "000002000000000000",
+      "wire_sha256": "ec76aaa43ea8afc0e5132cb3fab389d31c33d2ec9ace63bdbdf8375497039017"
+    },
+    {
+      "type": "UESecurityCapabilities",
+      "model": [
+        0,
+        16384,
+        0,
+        0
+      ],
+      "wire_hex": "000004000000000000",
+      "wire_sha256": "39cfe958b5df73d983277d7da99a4e4572512cc3bd6e598ecaf3ea6583ef175c"
+    },
+    {
+      "type": "UESecurityCapabilities",
+      "model": [
+        0,
+        32768,
+        0,
+        0
+      ],
+      "wire_hex": "000008000000000000",
+      "wire_sha256": "1a8bd8e5b7d5b21663cb26755875dc925acc4d349b0068638bcea94cd8dccc2a"
+    },
+    {
+      "type": "UESecurityCapabilities",
+      "model": [
+        0,
+        0,
+        1,
+        0
+      ],
+      "wire_hex": "000000000000080000",
+      "wire_sha256": "25d09b9b991056d48ec4ed51e180bf3f87a8b4622d39cd8534ad3b7d70a2afa2"
+    },
+    {
+      "type": "UESecurityCapabilities",
+      "model": [
+        0,
+        0,
+        2,
+        0
+      ],
+      "wire_hex": "000000000000100000",
+      "wire_sha256": "f6db62e15a7ee90fa363b899d5de655bf83154ad5a413f3b0d4dd9f88622bd9a"
+    },
+    {
+      "type": "UESecurityCapabilities",
+      "model": [
+        0,
+        0,
+        4,
+        0
+      ],
+      "wire_hex": "000000000000200000",
+      "wire_sha256": "a1f85138e4dbe605bf464be418b5e8b176a22528228ca3c4f00d2be5722c2ded"
+    },
+    {
+      "type": "UESecurityCapabilities",
+      "model": [
+        0,
+        0,
+        8,
+        0
+      ],
+      "wire_hex": "000000000000400000",
+      "wire_sha256": "d37b700c6cddc0d57ac56964edcd865836e059cb1a51827d189b36acdda16fb3"
+    },
+    {
+      "type": "UESecurityCapabilities",
+      "model": [
+        0,
+        0,
+        16,
+        0
+      ],
+      "wire_hex": "000000000000800000",
+      "wire_sha256": "7010446ea1c100591edd8a7d38c5f0fca7ecddb668f1522458da6a6054d5d926"
+    },
+    {
+      "type": "UESecurityCapabilities",
+      "model": [
+        0,
+        0,
+        32,
+        0
+      ],
+      "wire_hex": "000000000001000000",
+      "wire_sha256": "4a75850b2b76c13cc4de03cb5d70a2106d2e50452057008db41e95c7279d26bf"
+    },
+    {
+      "type": "UESecurityCapabilities",
+      "model": [
+        0,
+        0,
+        64,
+        0
+      ],
+      "wire_hex": "000000000002000000",
+      "wire_sha256": "544a3ffcca8646c0b2ef83bb970c53e021cb99b8e1c78f00f0dd9969d468cefa"
+    },
+    {
+      "type": "UESecurityCapabilities",
+      "model": [
+        0,
+        0,
+        128,
+        0
+      ],
+      "wire_hex": "000000000004000000",
+      "wire_sha256": "c3e0cbf851f83111e9602bb200ef55fc816137e8e3936a7a3bc4111bc8a08382"
+    },
+    {
+      "type": "UESecurityCapabilities",
+      "model": [
+        0,
+        0,
+        256,
+        0
+      ],
+      "wire_hex": "000000000008000000",
+      "wire_sha256": "1557cb7738ffd53f9517e9e548f82ee63ad6cf17160e723fbfec1445b120e41d"
+    },
+    {
+      "type": "UESecurityCapabilities",
+      "model": [
+        0,
+        0,
+        512,
+        0
+      ],
+      "wire_hex": "000000000010000000",
+      "wire_sha256": "ed8f678a8bc52aa83f56f8c7be776a8e93777c65f0dd5f8e8b10816b34c8cb44"
+    },
+    {
+      "type": "UESecurityCapabilities",
+      "model": [
+        0,
+        0,
+        1024,
+        0
+      ],
+      "wire_hex": "000000000020000000",
+      "wire_sha256": "acba1cdd4ca27a80afa6cf602602fb6734910088a30afbc0ffdf40c30647b7b2"
+    },
+    {
+      "type": "UESecurityCapabilities",
+      "model": [
+        0,
+        0,
+        2048,
+        0
+      ],
+      "wire_hex": "000000000040000000",
+      "wire_sha256": "6f1990d6aa2a393cb7e49746b328668f3991ac6354e858096a658e6cb48cf829"
+    },
+    {
+      "type": "UESecurityCapabilities",
+      "model": [
+        0,
+        0,
+        4096,
+        0
+      ],
+      "wire_hex": "000000000080000000",
+      "wire_sha256": "b7d61055e2fae23bef7684cb45a98e9eb592d4e1cbb1f7ed2a4bbc59bba57f3a"
+    },
+    {
+      "type": "UESecurityCapabilities",
+      "model": [
+        0,
+        0,
+        8192,
+        0
+      ],
+      "wire_hex": "000000000100000000",
+      "wire_sha256": "cdb032de4c6cb506da0606e0934e69ad1ae64773ffaa76f9d6e28192067c43cf"
+    },
+    {
+      "type": "UESecurityCapabilities",
+      "model": [
+        0,
+        0,
+        16384,
+        0
+      ],
+      "wire_hex": "000000000200000000",
+      "wire_sha256": "3a40f051d7860323de7dc25da2f7c03f7727837c16e9c7a208c217e6c11ba57d"
+    },
+    {
+      "type": "UESecurityCapabilities",
+      "model": [
+        0,
+        0,
+        32768,
+        0
+      ],
+      "wire_hex": "000000000400000000",
+      "wire_sha256": "d04df4541745df552bf656601bd0ba5a803ff47be8c8d06e4f7e833f5fd72727"
+    },
+    {
+      "type": "UESecurityCapabilities",
+      "model": [
+        0,
+        0,
+        0,
+        1
+      ],
+      "wire_hex": "000000000000000004",
+      "wire_sha256": "9899307f9d747746122575edeeb3963c7c83c029241f82a3d17b99972878db0e"
+    },
+    {
+      "type": "UESecurityCapabilities",
+      "model": [
+        0,
+        0,
+        0,
+        2
+      ],
+      "wire_hex": "000000000000000008",
+      "wire_sha256": "4b7735f6f1a0cef18db371351b21e5fb694b89d3bd90731797ce797746c97dfc"
+    },
+    {
+      "type": "UESecurityCapabilities",
+      "model": [
+        0,
+        0,
+        0,
+        4
+      ],
+      "wire_hex": "000000000000000010",
+      "wire_sha256": "9923b8fe4f8db6cf57b48c14ae1631fb3622a5b22a932cb304903e37d917896c"
+    },
+    {
+      "type": "UESecurityCapabilities",
+      "model": [
+        0,
+        0,
+        0,
+        8
+      ],
+      "wire_hex": "000000000000000020",
+      "wire_sha256": "5b104582d1d013a08b3a3a11244cab4d2f3bd1dd467b2679a771568b5ca74837"
+    },
+    {
+      "type": "UESecurityCapabilities",
+      "model": [
+        0,
+        0,
+        0,
+        16
+      ],
+      "wire_hex": "000000000000000040",
+      "wire_sha256": "5edfe25b7b7ac7f16027787bc463050f33f1a84397a5ffbd1cbc8dd507cafdd6"
+    },
+    {
+      "type": "UESecurityCapabilities",
+      "model": [
+        0,
+        0,
+        0,
+        32
+      ],
+      "wire_hex": "000000000000000080",
+      "wire_sha256": "48401ecdba5b6638dd0370022e34312192974b83b7afec0f05bce84adaf971d6"
+    },
+    {
+      "type": "UESecurityCapabilities",
+      "model": [
+        0,
+        0,
+        0,
+        64
+      ],
+      "wire_hex": "000000000000000100",
+      "wire_sha256": "e64cf59bfbcf3c5743ccd9eda3a811a7966689717a8499e5b1ef0cb1f33bf4b6"
+    },
+    {
+      "type": "UESecurityCapabilities",
+      "model": [
+        0,
+        0,
+        0,
+        128
+      ],
+      "wire_hex": "000000000000000200",
+      "wire_sha256": "3c1b31a54751736eb5294d193d0d92594dbfcf5e48a8b7e7ef520ce60d796d0b"
+    },
+    {
+      "type": "UESecurityCapabilities",
+      "model": [
+        0,
+        0,
+        0,
+        256
+      ],
+      "wire_hex": "000000000000000400",
+      "wire_sha256": "3d712e7f1cd5c444a90a4cec2a9edf924335dfcb48d5f502d5c4b3127109faea"
+    },
+    {
+      "type": "UESecurityCapabilities",
+      "model": [
+        0,
+        0,
+        0,
+        512
+      ],
+      "wire_hex": "000000000000000800",
+      "wire_sha256": "2a99cf77549b04ea87cef6a30addf6e4e5074bf90ade03dfc93c1fad96c94673"
+    },
+    {
+      "type": "UESecurityCapabilities",
+      "model": [
+        0,
+        0,
+        0,
+        1024
+      ],
+      "wire_hex": "000000000000001000",
+      "wire_sha256": "6ba7045cdeb865a2896174a4ee0b60fe4a8384e28dc6ce237596d3aef3df648a"
+    },
+    {
+      "type": "UESecurityCapabilities",
+      "model": [
+        0,
+        0,
+        0,
+        2048
+      ],
+      "wire_hex": "000000000000002000",
+      "wire_sha256": "d67db5d3d515d073d4ef22c516948ab92a9088437d7077b745fe6d5d9c8bb4cc"
+    },
+    {
+      "type": "UESecurityCapabilities",
+      "model": [
+        0,
+        0,
+        0,
+        4096
+      ],
+      "wire_hex": "000000000000004000",
+      "wire_sha256": "99295e6476d8191572848083f86c5efdcb0e601bc951a4dd77e99511a570e9ad"
+    },
+    {
+      "type": "UESecurityCapabilities",
+      "model": [
+        0,
+        0,
+        0,
+        8192
+      ],
+      "wire_hex": "000000000000008000",
+      "wire_sha256": "b7e16632b656ff8dfe82039d030275d178e4e012a2205b596925814aa7df0874"
+    },
+    {
+      "type": "UESecurityCapabilities",
+      "model": [
+        0,
+        0,
+        0,
+        16384
+      ],
+      "wire_hex": "000000000000010000",
+      "wire_sha256": "9d2acc50176c40439f056a30952ca9166bd6c1144bd43e66fc7a12c1029112b7"
+    },
+    {
+      "type": "UESecurityCapabilities",
+      "model": [
+        0,
+        0,
+        0,
+        32768
+      ],
+      "wire_hex": "000000000000020000",
+      "wire_sha256": "4f58053393656f15066db4c4969c44f8cc4fea35c1f1e8238ed583539ce360de"
+    }
+  ]
+}

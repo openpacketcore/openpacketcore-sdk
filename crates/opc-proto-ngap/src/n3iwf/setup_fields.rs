@@ -95,6 +95,19 @@ impl Guami {
     pub const fn pointer(&self) -> u8 {
         self.pointer
     }
+    /// Encode the standalone root GUAMI IE, without extensions.
+    pub fn encode(&self, ctx: EncodeContext) -> Result<EncodedValue, EncodeError> {
+        capacity(7, ctx)?;
+        encode_leaf(&self.generated(), ctx)
+    }
+    /// Decode a standalone root GUAMI; requires depth two.
+    pub fn decode(input: &[u8], ctx: DecodeContext) -> Result<Self, DecodeError> {
+        bound(input, ctx, 2)?;
+        let mut reader = Reader::new(input, ctx);
+        let value = reader.guami()?;
+        reader.finish()?;
+        Ok(value)
+    }
     fn generated(&self) -> asn::GUAMI {
         asn::GUAMI::new(
             asn::PLMNIdentity(plmn_bytes(&self.plmn).into()),
@@ -209,17 +222,8 @@ impl ServedGuamiList {
         let count = reader.count(8, 256, 53)?;
         let mut values = Vec::with_capacity(count);
         for _ in 0..count {
-            reader.flags(5)?; // item extension/backup/IE-extension, GUAMI flags
-            let plmn = reader.plmn()?;
-            let region = reader.bits(8)? as u8;
-            let set = reader.bits(10)?;
-            let pointer = reader.bits(6)? as u8;
-            values.push(Guami {
-                plmn,
-                region,
-                set,
-                pointer,
-            });
+            reader.flags(3)?; // item extension, backup name, IE extensions
+            values.push(reader.guami()?);
         }
         reader.finish()?;
         Ok(Self(values))
@@ -384,12 +388,12 @@ fn encode_collection<T: rasn::Encode>(
 
 // Exact root layout sizing is allocation-free. Constructors bound every list,
 // so even the largest schema-valid shape fits usize on supported 32-bit hosts.
-struct Size(usize);
+pub(super) struct Size(pub(super) usize);
 impl Size {
     fn align(&mut self) {
         self.0 = self.0.div_ceil(8) * 8;
     }
-    fn bytes(&self) -> usize {
+    pub(super) fn bytes(&self) -> usize {
         self.0.div_ceil(8)
     }
     fn plmn(&mut self, value: &PlmnSlices) {
@@ -399,11 +403,15 @@ impl Size {
         self.align();
         self.0 += 16;
         for slice in &value.slices {
-            self.0 += 2 + 3 + 8;
-            if slice.sd().is_some() {
-                self.align();
-                self.0 += 24;
-            }
+            self.0 += 2;
+            self.snssai(slice);
+        }
+    }
+    pub(super) fn snssai(&mut self, slice: &Snssai) {
+        self.0 += 3 + 8;
+        if slice.sd().is_some() {
+            self.align();
+            self.0 += 24;
         }
     }
 }
@@ -411,20 +419,20 @@ impl Size {
 // This is a reader for the above root shapes, not a general ASN.1 codec. The
 // fixed >2-octet fields must align after flags (rasn 0.28 misses this on read).
 // Padding must be zero; unknown extensions are rejected before their payloads.
-struct Reader<'a> {
+pub(super) struct Reader<'a> {
     input: &'a [u8],
     bit: usize,
     items_left: usize,
 }
 impl<'a> Reader<'a> {
-    fn new(input: &'a [u8], ctx: DecodeContext) -> Self {
+    pub(super) fn new(input: &'a [u8], ctx: DecodeContext) -> Self {
         Self {
             input,
             bit: 0,
             items_left: ctx.max_ies,
         }
     }
-    fn bits(&mut self, width: usize) -> Result<u16, DecodeError> {
+    pub(super) fn bits(&mut self, width: usize) -> Result<u16, DecodeError> {
         let mut value = 0;
         for _ in 0..width {
             let byte = self
@@ -436,7 +444,7 @@ impl<'a> Reader<'a> {
         }
         Ok(value)
     }
-    fn flags(&mut self, width: usize) -> Result<(), DecodeError> {
+    pub(super) fn flags(&mut self, width: usize) -> Result<(), DecodeError> {
         if self.bits(width)? != 0 {
             return Err(unsupported());
         }
@@ -460,7 +468,7 @@ impl<'a> Reader<'a> {
     fn plmn(&mut self) -> Result<PlmnId, DecodeError> {
         decode_plmn(&self.octets()?)
     }
-    fn count(
+    pub(super) fn count(
         &mut self,
         width: usize,
         maximum: usize,
@@ -491,24 +499,39 @@ impl<'a> Reader<'a> {
             let mut slices = Vec::with_capacity(slice_count);
             for _ in 0..slice_count {
                 self.flags(2)?;
-                let flags = self.bits(3)?;
-                if flags & 5 != 0 {
-                    return Err(unsupported());
-                }
-                let sst = self.bits(8)? as u8;
-                slices.push(if flags & 2 == 0 {
-                    Snssai::without_sd(sst)
-                } else {
-                    let [a, b, c] = self.octets()?;
-                    Snssai::with_sd(sst, format!("{a:02x}{b:02x}{c:02x}"))
-                        .map_err(|_| invalid("slice differentiator"))?
-                });
+                slices.push(self.snssai()?);
             }
             values.push(PlmnSlices { plmn, slices });
         }
         Ok(values)
     }
-    fn finish(mut self) -> Result<(), DecodeError> {
+    fn guami(&mut self) -> Result<Guami, DecodeError> {
+        self.flags(2)?;
+        let plmn = self.plmn()?;
+        let region = self.bits(8)? as u8;
+        let set = self.bits(10)?;
+        let pointer = self.bits(6)? as u8;
+        Ok(Guami {
+            plmn,
+            region,
+            set,
+            pointer,
+        })
+    }
+    pub(super) fn snssai(&mut self) -> Result<Snssai, DecodeError> {
+        let flags = self.bits(3)?;
+        if flags & 5 != 0 {
+            return Err(unsupported());
+        }
+        let sst = self.bits(8)? as u8;
+        if flags & 2 == 0 {
+            return Ok(Snssai::without_sd(sst));
+        }
+        let [a, b, c] = self.octets()?;
+        Snssai::with_sd(sst, format!("{a:02x}{b:02x}{c:02x}"))
+            .map_err(|_| invalid("slice differentiator"))
+    }
+    pub(super) fn finish(mut self) -> Result<(), DecodeError> {
         self.align()?;
         if self.bit / 8 != self.input.len() {
             return Err(invalid("trailing setup field bytes"));
@@ -517,21 +540,21 @@ impl<'a> Reader<'a> {
     }
 }
 
-// Writes only the two independently qualified PLMN/slice list root layouts.
+// Writes only the independently qualified PLMN/slice and Allowed NSSAI roots.
 // Buffer allocation follows exact sizing; checked writes fail if those layouts
 // ever diverge. It does not encode extension additions or arbitrary ASN.1.
-struct Writer {
+pub(super) struct Writer {
     bytes: Zeroizing<Vec<u8>>,
     bit: usize,
 }
 impl Writer {
-    fn new(length: usize) -> Self {
+    pub(super) fn new(length: usize) -> Self {
         Self {
             bytes: Zeroizing::new(vec![0; length]),
             bit: 0,
         }
     }
-    fn bits(&mut self, value: u16, width: usize) -> Result<(), EncodeError> {
+    pub(super) fn bits(&mut self, value: u16, width: usize) -> Result<(), EncodeError> {
         for shift in (0..width).rev() {
             let target = self
                 .bytes
@@ -561,16 +584,20 @@ impl Writer {
             self.bits((value.slices.len() - 1) as u16, 16)?;
             for slice in &value.slices {
                 self.bits(0, 2)?;
-                self.bits(if slice.sd().is_some() { 2 } else { 0 }, 3)?;
-                self.bits(u16::from(slice.sst()), 8)?;
-                if let Some(sd) = slice.sd() {
-                    self.octets(sd_octets(sd))?;
-                }
+                self.snssai(slice)?;
             }
         }
         Ok(())
     }
-    fn finish(self) -> Result<EncodedValue, EncodeError> {
+    pub(super) fn snssai(&mut self, slice: &Snssai) -> Result<(), EncodeError> {
+        self.bits(if slice.sd().is_some() { 2 } else { 0 }, 3)?;
+        self.bits(u16::from(slice.sst()), 8)?;
+        if let Some(sd) = slice.sd() {
+            self.octets(sd_octets(sd))?;
+        }
+        Ok(())
+    }
+    pub(super) fn finish(self) -> Result<EncodedValue, EncodeError> {
         if self.bit.div_ceil(8) != self.bytes.len() {
             return Err(encode_invalid());
         }

@@ -117,6 +117,7 @@ macro_rules! redacted {
     };
 }
 
+pub mod context_fields;
 pub mod nas;
 pub mod release;
 pub mod setup;
