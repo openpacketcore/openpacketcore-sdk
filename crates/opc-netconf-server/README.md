@@ -181,9 +181,14 @@ submission, returns a value-free `operation-failed`, and releases the running
 write reservation. The commit request retains its original deadline while
 waiting for the asynchronous audit result.
 
-This pre-submit gate does not complete the terminal-outcome contract in
-issue #796: running edits still return `operation-failed` when terminal audit
-recording fails after a known commit. Recoverable terminal obligations and
+Running edits now preserve a known successful commit when terminal recording
+fails. The optional `<cancel-commit>` and `<copy-config>` to running paths also
+require an acknowledged intent before submission and preserve known commit
+results. Terminal recording preserves the original configuration rejection
+instead of replacing it with an audit error. These paths use the same bounded,
+value-free terminal-failure signal as candidate commit.
+
+This does not complete issue #796: recoverable terminal obligations and
 the remaining mutation paths require separate implementation and evidence.
 
 ## Relationships

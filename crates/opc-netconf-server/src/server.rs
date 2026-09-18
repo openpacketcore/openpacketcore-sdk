@@ -4465,12 +4465,7 @@ where
                         Err(_) => true,
                     };
                 if terminal_audit_failed {
-                    record_terminal_audit_failure();
-                    tracing::error!(
-                        target: "opc_netconf_server",
-                        audit_phase = "terminal",
-                        "NETCONF commit applied but terminal audit record failed"
-                    );
+                    report_terminal_audit_failure();
                 }
                 self.committed_revision_success_reply(&context, NetconfOperation::Commit, &result)
             }
@@ -4478,6 +4473,33 @@ where
                 self.commit_bus_failure_reply(&context, audit_paths, error.code)
                     .await
             }
+        }
+    }
+
+    async fn required_intent_failure_reply(
+        &self,
+        context: &RpcExecContext<'_>,
+        operation: NetconfOperation,
+        event: &AuditEvent,
+    ) -> Option<RpcHandlingResult> {
+        if !commit_audit_failed(&self.audit, event).await {
+            return None;
+        }
+        record_rpc_error(
+            operation,
+            NetconfErrorTag::OperationFailed,
+            context.started.elapsed(),
+        );
+        Some(RpcHandlingResult::keep_open(rpc_error_reply_with_attrs(
+            Some(context.message_id),
+            context.reply_attrs,
+            RpcError::operation_failed(),
+        )))
+    }
+
+    async fn record_mutation_terminal(&self, event: &AuditEvent) {
+        if commit_audit_failed(&self.audit, event).await {
+            report_terminal_audit_failure();
         }
     }
 
@@ -4654,6 +4676,21 @@ where
         )
         .with_base_version(snapshot.version);
 
+        let intent_event = AuditEvent::new(
+            context.request_id,
+            context.principal,
+            self.transport,
+            AuditOperation::Update,
+            AuditOutcome::Intent,
+        )
+        .with_paths([schema_node_path(NETCONF_CANCEL_COMMIT_PATH)]);
+        if let Some(reply) = self
+            .required_intent_failure_reply(&context, NetconfOperation::CancelCommit, &intent_event)
+            .await
+        {
+            return reply;
+        }
+
         match bus.submit(commit_request).await {
             Ok(result) => {
                 self.confirmed_commit
@@ -4664,32 +4701,17 @@ where
                     &result.changed_paths,
                     NETCONF_CANCEL_COMMIT_PATH,
                 );
-                if self
-                    .audit
-                    .record_async(
-                        &AuditEvent::new(
-                            context.request_id,
-                            context.principal,
-                            self.transport,
-                            AuditOperation::Update,
-                            AuditOutcome::Success,
-                        )
-                        .with_paths(paths),
+                self.record_mutation_terminal(
+                    &AuditEvent::new(
+                        context.request_id,
+                        context.principal,
+                        self.transport,
+                        AuditOperation::Update,
+                        AuditOutcome::Success,
                     )
-                    .await
-                    .is_err()
-                {
-                    record_rpc_error(
-                        NetconfOperation::CancelCommit,
-                        NetconfErrorTag::OperationFailed,
-                        context.started.elapsed(),
-                    );
-                    return RpcHandlingResult::keep_open(rpc_error_reply_with_attrs(
-                        Some(context.message_id),
-                        context.reply_attrs,
-                        RpcError::operation_failed(),
-                    ));
-                }
+                    .with_paths(paths),
+                )
+                .await;
                 record_rpc_success(NetconfOperation::CancelCommit, context.started.elapsed());
                 RpcHandlingResult::keep_open(rpc_ok_empty_reply_with_attrs(
                     context.message_id,
@@ -5164,13 +5186,43 @@ where
         )
         .with_base_version(snapshot.version);
 
+        let intent_event = AuditEvent::new(
+            context.request_id,
+            context.principal,
+            self.transport,
+            AuditOperation::Replace,
+            AuditOutcome::Intent,
+        )
+        .with_paths(self.schema_paths_for_changed_paths(&changed_paths, NETCONF_COPY_CONFIG_PATH));
+        if let Some(reply) = self
+            .required_intent_failure_reply(context, NetconfOperation::CopyConfig, &intent_event)
+            .await
+        {
+            return reply;
+        }
+
         match bus.submit(request).await {
             Ok(result) => {
                 let paths = self.schema_paths_for_changed_paths(
                     &result.changed_paths,
                     NETCONF_COPY_CONFIG_PATH,
                 );
-                self.copy_config_success_reply(context, paths).await
+                self.record_mutation_terminal(
+                    &AuditEvent::new(
+                        context.request_id,
+                        context.principal,
+                        self.transport,
+                        AuditOperation::Replace,
+                        AuditOutcome::Success,
+                    )
+                    .with_paths(paths),
+                )
+                .await;
+                self.committed_revision_success_reply(
+                    context,
+                    NetconfOperation::CopyConfig,
+                    &result,
+                )
             }
             Err(error) => {
                 self.copy_config_failure_reply_for_rpc(
@@ -5384,32 +5436,17 @@ where
         outcome: AuditOutcome,
         rpc_error: RpcError,
     ) -> RpcHandlingResult {
-        if self
-            .audit
-            .record_async(
-                &AuditEvent::new(
-                    context.request_id,
-                    context.principal,
-                    self.transport,
-                    AuditOperation::Replace,
-                    outcome,
-                )
-                .with_paths([schema_node_path(NETCONF_COPY_CONFIG_PATH)]),
+        self.record_mutation_terminal(
+            &AuditEvent::new(
+                context.request_id,
+                context.principal,
+                self.transport,
+                AuditOperation::Replace,
+                outcome,
             )
-            .await
-            .is_err()
-        {
-            record_rpc_error(
-                NetconfOperation::CopyConfig,
-                NetconfErrorTag::OperationFailed,
-                context.started.elapsed(),
-            );
-            return RpcHandlingResult::keep_open(rpc_error_reply_with_attrs(
-                Some(context.message_id),
-                context.reply_attrs,
-                RpcError::operation_failed(),
-            ));
-        }
+            .with_paths([schema_node_path(NETCONF_COPY_CONFIG_PATH)]),
+        )
+        .await;
         record_rpc_error(
             NetconfOperation::CopyConfig,
             rpc_error.classification.tag,
@@ -5560,32 +5597,17 @@ where
         outcome: AuditOutcome,
         rpc_error: RpcError,
     ) -> RpcHandlingResult {
-        if self
-            .audit
-            .record_async(
-                &AuditEvent::new(
-                    context.request_id,
-                    context.principal,
-                    self.transport,
-                    AuditOperation::Exec,
-                    outcome,
-                )
-                .with_paths([schema_node_path(path)]),
+        self.record_mutation_terminal(
+            &AuditEvent::new(
+                context.request_id,
+                context.principal,
+                self.transport,
+                AuditOperation::Exec,
+                outcome,
             )
-            .await
-            .is_err()
-        {
-            record_rpc_error(
-                operation,
-                NetconfErrorTag::OperationFailed,
-                context.started.elapsed(),
-            );
-            return RpcHandlingResult::keep_open(rpc_error_reply_with_attrs(
-                Some(context.message_id),
-                context.reply_attrs,
-                RpcError::operation_failed(),
-            ));
-        }
+            .with_paths([schema_node_path(path)]),
+        )
+        .await;
         record_rpc_error(
             operation,
             rpc_error.classification.tag,
@@ -5876,32 +5898,17 @@ where
         match bus.submit(commit_request).await {
             Ok(result) => {
                 let paths = self.schema_paths_for_changed_paths(&result.changed_paths, kind.path());
-                if self
-                    .audit
-                    .record_async(
-                        &AuditEvent::new(
-                            context.request_id,
-                            context.principal,
-                            self.transport,
-                            AuditOperation::Update,
-                            AuditOutcome::Success,
-                        )
-                        .with_paths(paths),
+                self.record_mutation_terminal(
+                    &AuditEvent::new(
+                        context.request_id,
+                        context.principal,
+                        self.transport,
+                        AuditOperation::Update,
+                        AuditOutcome::Success,
                     )
-                    .await
-                    .is_err()
-                {
-                    record_rpc_error(
-                        kind.metric(),
-                        NetconfErrorTag::OperationFailed,
-                        context.started.elapsed(),
-                    );
-                    return RpcHandlingResult::keep_open(rpc_error_reply_with_attrs(
-                        Some(context.message_id),
-                        context.reply_attrs,
-                        RpcError::operation_failed(),
-                    ));
-                }
+                    .with_paths(paths),
+                )
+                .await;
                 self.committed_revision_success_reply(&context, kind.metric(), &result)
             }
             Err(error) => {
@@ -5952,32 +5959,17 @@ where
         outcome: AuditOutcome,
         rpc_error: RpcError,
     ) -> RpcHandlingResult {
-        if self
-            .audit
-            .record_async(
-                &AuditEvent::new(
-                    context.request_id,
-                    context.principal,
-                    self.transport,
-                    AuditOperation::Update,
-                    outcome,
-                )
-                .with_paths([schema_node_path(kind.path())]),
+        self.record_mutation_terminal(
+            &AuditEvent::new(
+                context.request_id,
+                context.principal,
+                self.transport,
+                AuditOperation::Update,
+                outcome,
             )
-            .await
-            .is_err()
-        {
-            record_rpc_error(
-                kind.metric(),
-                NetconfErrorTag::OperationFailed,
-                context.started.elapsed(),
-            );
-            return RpcHandlingResult::keep_open(rpc_error_reply_with_attrs(
-                Some(context.message_id),
-                context.reply_attrs,
-                RpcError::operation_failed(),
-            ));
-        }
+            .with_paths([schema_node_path(kind.path())]),
+        )
+        .await;
 
         record_rpc_error(
             kind.metric(),
@@ -7221,6 +7213,15 @@ where
             | None => event,
         }
     }
+}
+
+fn report_terminal_audit_failure() {
+    record_terminal_audit_failure();
+    tracing::error!(
+        target: "opc_netconf_server",
+        audit_phase = "terminal",
+        "NETCONF terminal audit write failed; operation result retained"
+    );
 }
 
 async fn commit_audit_failed<A: AuditSink>(audit: &A, event: &AuditEvent) -> bool {
@@ -9054,6 +9055,25 @@ mod tests {
             }
 
             Ok(())
+        }
+    }
+
+    #[derive(Clone)]
+    struct NativeAsyncCommitAudit(ScriptedCommitAudit);
+
+    impl AuditSink for NativeAsyncCommitAudit {
+        fn record(&self, _: &AuditEvent) -> Result<(), AuditError> {
+            panic!("native async audit must not use sync record")
+        }
+
+        fn record_async<'a>(
+            &'a self,
+            event: &'a AuditEvent,
+        ) -> Pin<Box<dyn Future<Output = Result<(), AuditError>> + Send + 'a>> {
+            Box::pin(async move {
+                tokio::task::yield_now().await;
+                self.0.record(event)
+            })
         }
     }
 
@@ -13673,7 +13693,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn edit_config_success_audit_failure_is_payload_free_after_durable_commit() {
+    async fn audit_failure_preserves_known_running_edit_commit() {
         let store = Arc::new(MockManagedDatastore::new());
         let bus = Arc::new(
             ConfigBus::new_dev_only(
@@ -13723,9 +13743,6 @@ mod tests {
             .await;
 
         assert!(result.reply_xml.contains(r#"message-id="417""#));
-        assert!(result
-            .reply_xml
-            .contains("<error-tag>operation-failed</error-tag>"));
         assert!(!result.reply_xml.contains("amf-2"));
         assert!(!result.reply_xml.contains("do-not-leak"));
         assert!(!result.reply_xml.contains("secret-admin"));
@@ -13756,6 +13773,183 @@ mod tests {
             fingerprint.changed_paths,
             vec![YangPath::new("/sys:system/sys:hostname").expect("hostname path")]
         );
+        assert!(
+            result.reply_xml.contains("<ok/>"),
+            "known commit remains successful"
+        );
+        assert!(!result.reply_xml.contains("<rpc-error>"));
+    }
+
+    async fn assert_optional_running_mutation_requires_intent(cancel: bool) {
+        for failure in [
+            CommitAuditFailure::IntentError,
+            CommitAuditFailure::IntentPanic,
+            CommitAuditFailure::TerminalError,
+            CommitAuditFailure::TerminalPanic,
+        ] {
+            let audit = ScriptedCommitAudit::new(failure);
+            *audit.failure.lock().expect("failure") = None;
+            let (server, bus, audit) = generated_edit_server_with_audit(audit).await;
+            let sessions = SessionRegistry::new();
+            let _registration = sessions.register(1).expect("session");
+            let edited = server.handle_rpc_for_session_async(
+                RequestId::new(), &principal(), &edit_config_rpc_to("candidate",
+                    r#"<sys:system xmlns:sys="urn:opc:demo"><sys:hostname>pending-host</sys:hostname></sys:system>"#,
+                    "merge"), &MgmtLimits::default(), 1, &sessions,
+            ).await;
+            assert!(edited.reply_xml.contains("<ok/>"));
+            if cancel {
+                let begun = server
+                    .handle_rpc_for_session_async(
+                        RequestId::new(),
+                        &principal(),
+                        &confirmed_commit_rpc(30),
+                        &MgmtLimits::default(),
+                        1,
+                        &sessions,
+                    )
+                    .await;
+                assert!(begun.reply_xml.contains("<ok/>"));
+            }
+            let before = bus.current_snapshot();
+            *audit.failure.lock().expect("failure") = Some(failure);
+            audit.attempts.lock().expect("attempts").clear();
+            let rpc = if cancel {
+                cancel_commit_rpc()
+            } else {
+                copy_config_rpc("running", "candidate")
+            };
+            let reply = server
+                .handle_rpc_for_session_async(
+                    RequestId::new(),
+                    &principal(),
+                    &rpc,
+                    &MgmtLimits::default(),
+                    1,
+                    &sessions,
+                )
+                .await;
+            if failure.is_terminal() {
+                assert!(bus.current_snapshot().version > before.version);
+                assert_eq!(
+                    bus.current_snapshot().config.hostname,
+                    if cancel { "amf-1" } else { "pending-host" }
+                );
+                assert!(reply.reply_xml.contains("<ok/>"));
+                assert_eq!(sessions.running_write_owner_for_test(), None);
+                let attempts = audit.attempts.lock().expect("attempts");
+                assert_eq!(attempts.len(), 2);
+                assert_eq!(attempts[0].outcome, AuditOutcome::Intent);
+                assert_eq!(attempts[1].outcome, AuditOutcome::Success);
+                continue;
+            }
+            assert_eq!(
+                bus.current_snapshot().version,
+                before.version,
+                "failed intent must prevent configuration mutation"
+            );
+            assert_eq!(
+                bus.current_snapshot().config.hostname,
+                before.config.hostname
+            );
+            assert!(reply
+                .reply_xml
+                .contains("<error-tag>operation-failed</error-tag>"));
+            assert_eq!(sessions.running_write_owner_for_test(), None);
+            {
+                let attempts = audit.attempts.lock().expect("attempts");
+                assert_eq!(attempts.len(), 1);
+                assert_eq!(attempts[0].outcome, AuditOutcome::Intent);
+            }
+            let retry = server
+                .handle_rpc_for_session_async(
+                    RequestId::new(),
+                    &principal(),
+                    &rpc,
+                    &MgmtLimits::default(),
+                    1,
+                    &sessions,
+                )
+                .await;
+            assert!(
+                retry.reply_xml.contains("<ok/>"),
+                "pending state survives rejection"
+            );
+            assert_eq!(
+                bus.current_snapshot().config.hostname,
+                if cancel { "amf-1" } else { "pending-host" }
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn failed_audit_intent_prevents_cancel_commit() {
+        assert_optional_running_mutation_requires_intent(true).await;
+    }
+
+    #[tokio::test]
+    async fn failed_audit_intent_prevents_copy_to_running() {
+        assert_optional_running_mutation_requires_intent(false).await;
+    }
+
+    async fn assert_running_edits_preserve_terminal_result<A: AuditSink + Clone + 'static>(
+        audit: A,
+    ) {
+        let (server, bus, _) = generated_edit_server_with_audit(audit).await;
+        let sessions = SessionRegistry::new();
+        let _registration = sessions.register(1).expect("session");
+        let before = bus.current_snapshot().version;
+        let failures_before = METRICS
+            .netconf_terminal_audit_failures_total
+            .load(Ordering::Relaxed);
+        let result = server.handle_rpc_for_session_async(
+            RequestId::new(), &principal(), &edit_data_rpc("running",
+                r#"<sys:system xmlns:sys="urn:opc:demo"><sys:hostname>committed-host</sys:hostname></sys:system>"#,
+                "merge"), &MgmtLimits::default(), 1, &sessions,
+        ).await;
+        assert_eq!(bus.current_snapshot().config.hostname, "committed-host");
+        assert!(bus.current_snapshot().version > before);
+        assert!(result.reply_xml.contains("<ok/>"));
+        assert!(!result.reply_xml.contains("<rpc-error>"));
+        assert_eq!(sessions.running_write_owner_for_test(), None);
+        assert!(
+            METRICS
+                .netconf_terminal_audit_failures_total
+                .load(Ordering::Relaxed)
+                > failures_before
+        );
+    }
+
+    #[tokio::test]
+    async fn audit_failure_preserves_async_edit_data_commit_and_contains_panics() {
+        for failure in [
+            CommitAuditFailure::TerminalError,
+            CommitAuditFailure::TerminalPanic,
+        ] {
+            assert_running_edits_preserve_terminal_result(ScriptedCommitAudit::new(failure)).await;
+            assert_running_edits_preserve_terminal_result(NativeAsyncCommitAudit(
+                ScriptedCommitAudit::new(failure),
+            ))
+            .await;
+        }
+    }
+
+    #[tokio::test]
+    async fn audit_failure_preserves_running_edit_authorization_denial() {
+        let (server, bus, _) = generated_edit_server_with_audit(FailingAudit).await;
+        let sessions = SessionRegistry::new();
+        let _registration = sessions.register(1).expect("session");
+        let before = bus.current_snapshot().version;
+        let reply = server.handle_rpc_for_session_async(
+            RequestId::new(), &principal(), &edit_config_rpc_to("running",
+                r#"<sys:system xmlns:sys="urn:opc:demo"><sys:secret>denied-value</sys:secret></sys:system>"#,
+                "merge"), &MgmtLimits::default(), 1, &sessions,
+        ).await;
+        assert_eq!(bus.current_snapshot().version, before);
+        assert!(reply
+            .reply_xml
+            .contains("<error-tag>access-denied</error-tag>"));
+        assert!(!reply.reply_xml.contains("denied-value"));
     }
 
     #[tokio::test]

@@ -456,6 +456,16 @@ where
     }
     .with_base_version(snapshot.version);
 
+    audit_set_result(
+        server,
+        request_id,
+        principal,
+        AuditOperation::Update,
+        AuditOutcome::Intent,
+        Vec::new(),
+    )
+    .await?;
+
     let start = Instant::now();
     let result = match bus.submit(commit).await {
         Ok(result) => result,
@@ -544,7 +554,8 @@ where
     C: OpcConfig,
     B: GnmiConfigBinding<C>,
 {
-    record_audit(
+    let required_intent = outcome == AuditOutcome::Intent;
+    let recorded = record_audit(
         server.audit(),
         request_id,
         principal,
@@ -552,7 +563,23 @@ where
         outcome,
         paths,
     )
-    .await
+    .await;
+    if required_intent {
+        // A failed or unacknowledged intent never permits submission.
+        return recorded;
+    }
+    if recorded.is_err() {
+        crate::metrics::record_terminal_audit_failure();
+        tracing::error!(
+            target: "opc_gnmi_server",
+            audit_phase = "terminal",
+            "gNMI Set terminal audit write failed; operation result retained"
+        );
+    }
+    // A terminal recording failure cannot turn a known commit into a failed
+    // mutation or replace the operation's original rejection. Durable terminal
+    // recovery requires the operation-receipt authority tracked by #797.
+    Ok(())
 }
 
 fn normalize_set_request(
