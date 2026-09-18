@@ -347,6 +347,11 @@ occurs when a message passes admission.
 slices, AMF name/capacity and retry delay have independent field and complete
 message evidence. Request construction takes an explicit `PagingDrx`; receive
 checks that mandatory IE's presence and ignores its payload per TS 29.413.
+Optional root RAN/extended names, UE-retention reports, extended AMF names and
+served-GUAMI backup names are preserved and compared with independent complete
+messages. Use `ServedGuamiList::with_backups` and `entries` to retain backup names;
+the existing `new` and `values` API still exposes identities alone. Request and
+Response struct literals gain explicit optional name/retention fields.
 
 The [setup matrix](CONFORMANCE.md#n3iwf-ng-setup-admission) describes nested
 item/depth bounds, unsupported optional fields and the two list layouts that

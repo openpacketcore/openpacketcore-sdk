@@ -5,10 +5,11 @@
 //! receive checks its mandatory presence without interpreting its payload.
 //! No association activation, AMF selection, slice authorization, timer or
 //! retry is performed here. Other applicable optional IEs fail explicitly.
+pub use super::nas_fields::ExtendedAmfName;
 use super::release::Cause;
 pub use super::setup_fields::{
-    AmfName, GlobalN3iwfId, Guami, PlmnSlices, PlmnSupportList, ServedGuamiList, SupportedTa,
-    SupportedTaList,
+    AmfName, ExtendedRanNodeName, GlobalN3iwfId, Guami, PlmnSlices, PlmnSupportList, RanNodeName,
+    ServedGuamiList, SupportedTa, SupportedTaList, UeRetentionInformation,
 };
 use super::*;
 use crate::{policy, Message, MessageType, Pdu, PduKind, ProtocolIe};
@@ -26,6 +27,12 @@ pub struct NgSetupRequest {
     pub global: GlobalN3iwfId,
     /// Supported tracking areas, PLMNs and slices.
     pub tracking_areas: SupportedTaList,
+    /// Optional advertised PrintableString node name.
+    pub node_name: Option<RanNodeName>,
+    /// Optional peer report; no local UE context is retained or restored here.
+    pub retention: Option<UeRetentionInformation>,
+    /// Optional independent VisibleString and UTF8String node names.
+    pub extended_node_name: Option<ExtendedRanNodeName>,
 }
 redacted!(NgSetupRequest);
 /// Admitted response root fields.
@@ -33,7 +40,7 @@ redacted!(NgSetupRequest);
 pub struct NgSetupResponse {
     /// Advertised AMF name.
     pub name: AmfName,
-    /// Served AMF identities, without backup names/extensions.
+    /// Served AMF identities and optional backup names, without extensions.
     pub served: ServedGuamiList,
     /// Relative capacity in the ASN.1 range 0..=255; no selection is inferred.
     pub relative_capacity: u8,
@@ -41,6 +48,10 @@ pub struct NgSetupResponse {
     pub plmns: PlmnSupportList,
     /// Optional same-procedure diagnostics; absence and an empty root differ.
     pub diagnostics: Option<super::reset_fields::CriticalityDiagnostics>,
+    /// Optional peer report; no local UE context is retained or restored here.
+    pub retention: Option<UeRetentionInformation>,
+    /// Optional independent VisibleString and UTF8String AMF names.
+    pub extended_name: Option<ExtendedAmfName>,
 }
 redacted!(NgSetupResponse);
 /// Admitted failure fields, with optional root retry delay.
@@ -89,29 +100,57 @@ impl NgSetupRequest {
                 .iter()
                 .map(|ta| plmn_items(ta.plmns()))
                 .sum::<usize>();
-        check_items(count.max(3), ctx)?;
-        let output = output_context(ctx);
-        construct(
-            MessageType::NgSetupRequest,
-            vec![
-                (
-                    27,
-                    Criticality::reject,
-                    self.global.encode(output).map_err(encode_error)?,
-                ),
-                (
-                    102,
-                    Criticality::reject,
-                    self.tracking_areas.encode(output).map_err(encode_error)?,
-                ),
-                (
-                    21,
-                    Criticality::ignore,
-                    encode_leaf(&paging, output).map_err(encode_error)?,
-                ),
-            ],
+        check_items(
+            count.max(
+                3 + usize::from(self.node_name.is_some())
+                    + usize::from(self.retention.is_some())
+                    + usize::from(self.extended_node_name.is_some()),
+            ),
             ctx,
-        )
+        )?;
+        let output = output_context(ctx);
+        let mut fields = vec![
+            (
+                27,
+                Criticality::reject,
+                self.global.encode(output).map_err(encode_error)?,
+            ),
+            (
+                102,
+                Criticality::reject,
+                self.tracking_areas.encode(output).map_err(encode_error)?,
+            ),
+            (
+                21,
+                Criticality::ignore,
+                encode_leaf(&paging, output).map_err(encode_error)?,
+            ),
+        ];
+        if let Some(name) = &self.node_name {
+            fields.insert(
+                1,
+                (
+                    82,
+                    Criticality::ignore,
+                    name.encode(output).map_err(encode_error)?,
+                ),
+            );
+        }
+        if let Some(retention) = self.retention {
+            fields.push((
+                147,
+                Criticality::ignore,
+                retention.encode(output).map_err(encode_error)?,
+            ));
+        }
+        if let Some(name) = &self.extended_node_name {
+            fields.push((
+                273,
+                Criticality::ignore,
+                name.encode(output).map_err(encode_error)?,
+            ));
+        }
+        construct(MessageType::NgSetupRequest, fields, ctx)
     }
 }
 impl NgSetupResponse {
@@ -124,7 +163,11 @@ impl NgSetupResponse {
                 .values()
                 .len()
                 .max(plmn_items(self.plmns.values()))
-                .max(4 + usize::from(diagnostics.is_some())),
+                .max(
+                    4 + usize::from(diagnostics.is_some())
+                        + usize::from(self.retention.is_some())
+                        + usize::from(self.extended_name.is_some()),
+                ),
             ctx,
         )?;
         let output = output_context(ctx);
@@ -153,6 +196,20 @@ impl NgSetupResponse {
         ];
         if let Some(value) = diagnostics {
             fields.push((19, Criticality::ignore, value));
+        }
+        if let Some(retention) = self.retention {
+            fields.push((
+                147,
+                Criticality::ignore,
+                retention.encode(output).map_err(encode_error)?,
+            ));
+        }
+        if let Some(name) = &self.extended_name {
+            fields.push((
+                274,
+                Criticality::ignore,
+                name.encode(output).map_err(encode_error)?,
+            ));
         }
         construct(MessageType::NgSetupResponse, fields, ctx)
     }
@@ -268,10 +325,16 @@ fn admit<'a>(
     ctx: DecodeContext,
 ) -> Result<AdmittedSetup, DecodeError> {
     let (profile, supported, ignored): (policy::IeProfile, &[u16], &[u16]) = match kind {
-        MessageType::NgSetupRequest => (policy::NG_SETUP_REQUEST, &[27, 102], &[21, 204]),
-        MessageType::NgSetupResponse => {
-            (policy::NG_SETUP_RESPONSE, &[1, 96, 86, 80, 19], &[200, 404])
-        }
+        MessageType::NgSetupRequest => (
+            policy::NG_SETUP_REQUEST,
+            &[27, 82, 102, 147, 273],
+            &[21, 204],
+        ),
+        MessageType::NgSetupResponse => (
+            policy::NG_SETUP_RESPONSE,
+            &[1, 96, 86, 80, 19, 147, 274],
+            &[200, 404],
+        ),
         MessageType::NgSetupFailure => (policy::NG_SETUP_FAILURE, &[15, 107, 19], &[]),
         _ => return Err(invalid("setup message outcome")),
     };
@@ -283,6 +346,8 @@ fn admit<'a>(
     let (mut name, mut served, mut relative_capacity, mut plmns) = (None, None, None, None);
     let (mut cause, mut time_to_wait) = (None, None);
     let mut diagnostics = None;
+    let (mut node_name, mut retention, mut extended_node_name, mut extended_name) =
+        (None, None, None, None);
     let mut ignored_ie_count = 0;
     let mut notify_ie_ids = Vec::new();
     for (index, (id, crit, value)) in fields.enumerate() {
@@ -305,6 +370,10 @@ fn admit<'a>(
         }
         match id {
             27 => global = Some(GlobalN3iwfId::decode(value, leaf)?),
+            82 => node_name = Some(RanNodeName::decode(value, leaf)?),
+            147 => retention = Some(UeRetentionInformation::decode(value, leaf)?),
+            273 => extended_node_name = Some(ExtendedRanNodeName::decode(value, leaf)?),
+            274 => extended_name = Some(ExtendedAmfName::decode(value, leaf)?),
             102 => tracking_areas = Some(SupportedTaList::decode(value, leaf)?),
             1 => name = Some(AmfName::decode(value, leaf)?),
             96 => served = Some(ServedGuamiList::decode(value, leaf)?),
@@ -338,6 +407,9 @@ fn admit<'a>(
                 global: global.ok_or_else(|| invalid("missing global n3iwf id"))?,
                 tracking_areas: tracking_areas
                     .ok_or_else(|| invalid("missing supported tracking areas"))?,
+                node_name,
+                retention,
+                extended_node_name,
             })
         }
         MessageType::NgSetupResponse => SetupMessage::Response(NgSetupResponse {
@@ -347,6 +419,8 @@ fn admit<'a>(
                 .ok_or_else(|| invalid("missing relative amf capacity"))?,
             plmns: plmns.ok_or_else(|| invalid("missing plmn support"))?,
             diagnostics,
+            retention,
+            extended_name,
         }),
         MessageType::NgSetupFailure => SetupMessage::Failure(NgSetupFailure {
             cause: cause.ok_or_else(|| invalid("missing setup failure cause"))?,

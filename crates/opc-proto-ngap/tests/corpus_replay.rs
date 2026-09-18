@@ -13,6 +13,8 @@
 mod resource_release;
 #[path = "support/resource_setup.rs"]
 mod resource_setup;
+#[path = "support/setup_optionals.rs"]
+mod setup_optionals;
 
 #[path = "support/ue_requests.rs"]
 mod ue_requests;
@@ -219,6 +221,14 @@ fn exercise(data: &[u8]) {
             9
         );
     }
+    setup_optionals::exercise(
+        data,
+        ctx,
+        EncodeContext {
+            max_message_len: ctx.max_message_len,
+            ..EncodeContext::default()
+        },
+    );
     if let Ok(field) = GlobalN3iwfId::decode(data, ctx) {
         let wire = field.encode(EncodeContext::default()).unwrap();
         assert!(GlobalN3iwfId::decode(wire.as_bytes(), ctx).unwrap() == field);
