@@ -1,8 +1,8 @@
 {
   "repository": "https://github.com/openpacketcore/openpacketcore-sdk",
   "base": "2a110ecfa5445c927b6be14b0937e0c09dc5841e",
-  "head": "10f1aa35137864b65654b89297374175206652ba",
+  "head": "b7ce301ec6e7878ae34bb16a80ff1807ae3e6e29",
   "tree_path": "crates/opc-n3iwf-fixtures/fixtures",
-  "tree": "a4387f57dc0cbe8dcb73ea102d2bc7642c68907c",
+  "tree": "55413939df7ef12ca40b507e5ef9d7e6b9291098",
   "interoperability_note": "Round trips alone do not prove external interoperability. These contracts publish constructed, receive, and unsupported outcomes with fixture provenance and digests only."
 }

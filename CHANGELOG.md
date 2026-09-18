@@ -30,6 +30,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   persisted envelopes, privacy digests, and protobuf wire bytes.
 
 ### Fixed
+- `opc-n3iwf-fixtures`: correct N2 metadata port octets from `96 1c` (38428)
+  to the declared IANA NGAP service port `96 0c` (38412), refreshing four wire
+  digests. Independently verify numeric PPID/port claims in both metadata
+  orders and repeated tuples, plus DATA user length, so valid framing and
+  a refreshed digest cannot conceal a contradictory claim. Clarify the DATA
+  and caller-port-bound provenance without changing runtime scope (Refs #784, #788).
 - `opc-sctp`: preserve socket-owned partial DATA and its cumulative byte bound
   across cancelled receives and interleaved non-lifecycle notifications. Clear
   partial state on terminal errors and close, invalidate it on matching

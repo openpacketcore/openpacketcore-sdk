@@ -29,6 +29,15 @@ hardening decisions is recorded in [`docs/adr/`](adr/).
 
 ---
 
+## N2 fixture port correction — 2026-09-17
+
+The `n2-sctp` metadata vectors now encode port 38412 (`96 0c`), correcting
+38428 (`96 1c`) in four earlier wire files. Independent numeric claim checks
+and Python/Rust regressions cover the default port, both field orders, repeated
+tuples and DATA length. This is fixture evidence at its declared scope; the
+corrected publication requires review and merge before new N2 consumer
+qualification. See [conformance scope](../crates/opc-n3iwf-fixtures/CONFORMANCE.md).
+
 ## SCTP receive reliability and N2 profile — 2026-09-17
 
 | Scope | Status | Evidence and remaining boundary |

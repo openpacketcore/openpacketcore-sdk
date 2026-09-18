@@ -416,6 +416,36 @@ def verify_field_claims(manifest, data):
             number(name, int(bool(data[0] & mask)))
     elif subset == "nas-tcp" and len(data) >= 2:
         number("length", uint(data[:2]))
+    elif subset == "n2-sctp":
+        require(
+            sum("=" in item for item in manifest["semantic_assertions"]) == len(claims),
+            "field-claim",
+        )
+        if manifest["encoding"] == "protocol-wire":
+            require({"ppid", "user_data_len", "chunk"} <= claims.keys(), "field-claim")
+            number("ppid", uint(data[12:16]))
+            number("user_data_len", uint(data[2:4]) - 16)
+            label("chunk", "DATA")
+            label("ngap_message_validation", "unsupported")
+        else:
+            require({"ppid", "port"} <= claims.keys(), "field-claim")
+            port_first = manifest["context"]["layout"] == "port-ppid"
+            tuples = []
+            for offset in range(0, len(data), 6):
+                item = data[offset : offset + 6]
+                port = uint(item[:2] if port_first else item[4:])
+                ppid = uint(item[2:] if port_first else item[:4])
+                number("port", port)
+                number("ppid", ppid)
+                tuples.append((port, ppid))
+            number("tuple_count", len(tuples))
+            label(
+                "duplicate_tuple",
+                "true" if len(set(tuples)) != len(tuples) else "false",
+            )
+            label(
+                "metadata_order", "port-then-ppid" if port_first else "ppid-then-port"
+            )
     elif subset == "nwu-ike":
         kind, notifies = manifest["context"]["initial_payload_type"], []
         while kind:
@@ -468,7 +498,9 @@ def main():
     except (Invalid, OSError, ValueError, KeyError, TypeError, IndexError):
         print("n3iwf_fixture_semantic_mismatch", file=sys.stderr)
         return 1
-    print(f"n3iwf_fixture_oracles_valid: {count} envelopes, scenarios and known answers")
+    print(
+        f"n3iwf_fixture_oracles_valid: {count} envelopes, scenarios and known answers"
+    )
     return 0
 
 
