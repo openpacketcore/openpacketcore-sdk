@@ -6,7 +6,7 @@ use std::io::{self, Read};
 use std::net::IpAddr;
 use std::num::NonZeroU16;
 use std::sync::atomic::{AtomicU32, AtomicU8, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 use std::time::Duration;
 
 use async_trait::async_trait;
@@ -39,9 +39,11 @@ use crate::model::{
     RouteSteeringBackendKind, RouteSteeringCapabilities, RouteSteeringProbe, RuleConflict,
     RuleConvergenceOutcome, RuleMismatch, RuleReadback, RuleRequest,
 };
+use crate::scheduling::{OperationScheduler, OperationScope};
 use crate::validation::{
-    canonical_route_priority_for_address, canonical_route_request, validate_owned_rule_request,
-    validate_route_request, validate_rule_request,
+    canonical_route_priority_for_address, canonical_route_request,
+    source_only_rules_are_provably_disjoint, validate_owned_rule_request, validate_route_request,
+    validate_rule_request,
 };
 
 const NETLINK_HEADER_LEN: usize = 16;
@@ -234,7 +236,9 @@ impl From<LinuxOwnedRouteRuleCollectionLimits> for LinuxNetlinkDumpLimits {
 
 /// Production Linux route/rule steering backend.
 ///
-/// Clones share one operation lock. Separate instances or external writers in
+/// Clones share bounded scheduling of conflicting route/rule keys. A dispatched
+/// worker retains its exclusion through verification and rollback even if its
+/// async observer is cancelled. Separate instances or external writers in
 /// the same network namespace must be coordinated as one authority for
 /// [`LINUX_ROUTE_STEERING_PROTOCOL`].
 #[derive(Clone)]
@@ -245,7 +249,7 @@ pub struct LinuxRouteSteeringBackend {
 struct LinuxRouteSteeringBackendInner {
     transport: Arc<dyn LinuxRouteTransport>,
     next_sequence: AtomicU32,
-    operation_lock: Mutex<()>,
+    operations: Arc<OperationScheduler>,
     config: LinuxRouteSteeringBackendConfig,
     readback_limits: LinuxRouteReadbackLimits,
     owned_collection_limits: LinuxOwnedRouteRuleCollectionLimits,
@@ -308,7 +312,7 @@ impl LinuxRouteSteeringBackend {
             inner: Arc::new(LinuxRouteSteeringBackendInner {
                 transport: Arc::new(NetlinkRouteTransport),
                 next_sequence: AtomicU32::new(1),
-                operation_lock: Mutex::new(()),
+                operations: Arc::new(OperationScheduler::default()),
                 config,
                 readback_limits,
                 owned_collection_limits,
@@ -340,7 +344,7 @@ impl LinuxRouteSteeringBackend {
             inner: Arc::new(LinuxRouteSteeringBackendInner {
                 transport: Arc::new(transport),
                 next_sequence: AtomicU32::new(1),
-                operation_lock: Mutex::new(()),
+                operations: Arc::new(OperationScheduler::default()),
                 config: LinuxRouteSteeringBackendConfig {
                     receive_attempts: 1,
                     receive_buffer_len: 4096,
@@ -492,13 +496,26 @@ impl LinuxRouteSteeringBackend {
         T: Send + 'static,
         F: FnOnce(&Self) -> Result<T, RouteSteeringError> + Send + 'static,
     {
+        self.run_scoped(operation, OperationScope::Global, action)
+            .await
+    }
+
+    async fn run_scoped<T, F>(
+        &self,
+        operation: &'static str,
+        scope: OperationScope,
+        action: F,
+    ) -> Result<T, RouteSteeringError>
+    where
+        T: Send + 'static,
+        F: FnOnce(&Self) -> Result<T, RouteSteeringError> + Send + 'static,
+    {
+        let permit = self.inner.operations.acquire(scope).await?;
         let backend = self.clone();
         tokio::task::spawn_blocking(move || {
-            let _operation_guard = backend
-                .inner
-                .operation_lock
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            // The worker retains exclusion through all effects and inverses,
+            // even after its async observer is dropped or cancelled.
+            let _permit = permit;
             action(&backend)
         })
         .await
@@ -509,9 +526,11 @@ impl LinuxRouteSteeringBackend {
         &self,
         request: RouteRequest,
     ) -> Result<RouteReadback, RouteSteeringError> {
-        self.run_locked("read_route", move |backend| {
-            backend.read_route_sync(&request)
-        })
+        self.run_scoped(
+            "read_route",
+            OperationScope::Route(request.clone()),
+            move |backend| backend.read_route_sync(&request),
+        )
         .await
     }
 
@@ -519,17 +538,23 @@ impl LinuxRouteSteeringBackend {
         &self,
         request: RuleRequest,
     ) -> Result<RuleReadback, RouteSteeringError> {
-        self.run_locked("read_rule", move |backend| backend.read_rule_sync(&request))
-            .await
+        self.run_scoped(
+            "read_rule",
+            OperationScope::Rule(request.clone()),
+            move |backend| backend.read_rule_sync(&request),
+        )
+        .await
     }
 
     async fn run_remove_converged_route(
         &self,
         request: RouteRequest,
     ) -> Result<(), RouteSteeringError> {
-        self.run_locked("remove_converged_route", move |backend| {
-            backend.remove_converged_route_sync(&request)
-        })
+        self.run_scoped(
+            "remove_converged_route",
+            OperationScope::Route(request.clone()),
+            move |backend| backend.remove_converged_route_sync(&request),
+        )
         .await
     }
 
@@ -537,9 +562,11 @@ impl LinuxRouteSteeringBackend {
         &self,
         request: RuleRequest,
     ) -> Result<(), RouteSteeringError> {
-        self.run_locked("remove_converged_rule", move |backend| {
-            backend.remove_converged_rule_sync(&request)
-        })
+        self.run_scoped(
+            "remove_converged_rule",
+            OperationScope::Rule(request.clone()),
+            move |backend| backend.remove_converged_rule_sync(&request),
+        )
         .await
     }
 
@@ -547,9 +574,11 @@ impl LinuxRouteSteeringBackend {
         &self,
         request: RouteRequest,
     ) -> Result<RouteConvergenceOutcome, RouteSteeringError> {
-        self.run_locked("converge_route", move |backend| {
-            backend.converge_route_sync(&request)
-        })
+        self.run_scoped(
+            "converge_route",
+            OperationScope::Route(request.clone()),
+            move |backend| backend.converge_route_sync(&request),
+        )
         .await
     }
 
@@ -557,9 +586,11 @@ impl LinuxRouteSteeringBackend {
         &self,
         request: RuleRequest,
     ) -> Result<RuleConvergenceOutcome, RouteSteeringError> {
-        self.run_locked("converge_rule", move |backend| {
-            backend.converge_rule_sync(&request)
-        })
+        self.run_scoped(
+            "converge_rule",
+            OperationScope::Rule(request.clone()),
+            move |backend| backend.converge_rule_sync(&request),
+        )
         .await
     }
 
@@ -568,9 +599,11 @@ impl LinuxRouteSteeringBackend {
         route: RouteRequest,
         rule: RuleRequest,
     ) -> Result<RouteRuleConvergenceOutcome, RouteSteeringError> {
-        self.run_locked("converge_route_and_rule", move |backend| {
-            backend.converge_pair_sync(&route, &rule)
-        })
+        self.run_scoped(
+            "converge_route_and_rule",
+            OperationScope::Pair(route.clone(), rule.clone()),
+            move |backend| backend.converge_pair_sync(&route, &rule),
+        )
         .await
     }
 
@@ -578,11 +611,15 @@ impl LinuxRouteSteeringBackend {
         &self,
         scope: OwnedRouteRuleScope,
     ) -> Result<OwnedRouteRuleSnapshot, RouteSteeringError> {
-        self.run_locked("snapshot_owned_route_rules", move |backend| {
-            backend
-                .snapshot_owned_collection_sync(scope)
-                .map(|state| state.snapshot)
-        })
+        self.run_scoped(
+            "snapshot_owned_route_rules",
+            OperationScope::Collection(scope),
+            move |backend| {
+                backend
+                    .snapshot_owned_collection_sync(scope)
+                    .map(|state| state.snapshot)
+            },
+        )
         .await
     }
 
@@ -590,9 +627,11 @@ impl LinuxRouteSteeringBackend {
         &self,
         desired: OwnedRouteRuleSet,
     ) -> Result<OwnedRouteRuleReconcileOutcome, RouteSteeringError> {
-        self.run_locked("reconcile_owned_route_rules", move |backend| {
-            backend.reconcile_owned_collection_sync(desired)
-        })
+        self.run_scoped(
+            "reconcile_owned_route_rules",
+            OperationScope::Collection(desired.scope()),
+            move |backend| backend.reconcile_owned_collection_sync(desired),
+        )
         .await
     }
 
@@ -2706,81 +2745,6 @@ fn classify_rule_readback_with_protocol_evidence(
     }
 }
 
-/// Whether two source selectors are provably disjoint IP prefix sets.
-///
-/// This returns `true` only for two non-wildcard prefixes of the same family
-/// whose network bits differ within their shared prefix length. It ignores
-/// host bits, and returns `false` for absent, wildcard, cross-family, or
-/// out-of-range selectors so callers fail closed unless disjointness is
-/// certain.
-fn source_prefixes_are_provably_disjoint(
-    first: Option<IpPrefix>,
-    second: Option<IpPrefix>,
-) -> bool {
-    match (first, second) {
-        (
-            Some(IpPrefix {
-                address: IpAddr::V4(first),
-                prefix_len: first_len,
-            }),
-            Some(IpPrefix {
-                address: IpAddr::V4(second),
-                prefix_len: second_len,
-            }),
-        ) => prefix_octets_are_provably_disjoint(
-            &first.octets(),
-            first_len,
-            &second.octets(),
-            second_len,
-            32,
-        ),
-        (
-            Some(IpPrefix {
-                address: IpAddr::V6(first),
-                prefix_len: first_len,
-            }),
-            Some(IpPrefix {
-                address: IpAddr::V6(second),
-                prefix_len: second_len,
-            }),
-        ) => prefix_octets_are_provably_disjoint(
-            &first.octets(),
-            first_len,
-            &second.octets(),
-            second_len,
-            128,
-        ),
-        _ => false,
-    }
-}
-
-fn prefix_octets_are_provably_disjoint(
-    first: &[u8],
-    first_len: u8,
-    second: &[u8],
-    second_len: u8,
-    max_prefix_len: u8,
-) -> bool {
-    if first_len == 0
-        || second_len == 0
-        || first_len > max_prefix_len
-        || second_len > max_prefix_len
-    {
-        return false;
-    }
-    let shared_prefix_len = first_len.min(second_len);
-    let whole_bytes = usize::from(shared_prefix_len / 8);
-    if first[..whole_bytes] != second[..whole_bytes] {
-        return true;
-    }
-    let remaining_bits = shared_prefix_len % 8;
-    if remaining_bits == 0 {
-        return false;
-    }
-    let mask = u8::MAX << (8 - remaining_bits);
-    first[whole_bytes] & mask != second[whole_bytes] & mask
-}
-
 /// A sibling can be excluded only when it is an otherwise exact owned rule
 /// whose source selector cannot match any packet selected by `request`.
 ///
@@ -2797,13 +2761,7 @@ fn is_provably_disjoint_owned_source_only_sibling(
     candidate.fixed_kernel_semantics_exact
         && !candidate.has_unrepresented_attributes
         && candidate.protocol == Some(LINUX_ROUTE_STEERING_PROTOCOL)
-        && request.destination.is_none()
-        && request.fwmark.is_none()
-        && resident.destination.is_none()
-        && resident.fwmark.is_none()
-        && resident.table == request.table
-        && resident.priority == request.priority
-        && source_prefixes_are_provably_disjoint(request.source, resident.source)
+        && source_only_rules_are_provably_disjoint(request, resident)
 }
 
 fn nonzero_candidate_count(candidate_count: u16) -> Result<NonZeroU16, RouteSteeringError> {
@@ -6567,6 +6525,226 @@ mod tests {
                 RTM_GETROUTE,
             ]
         );
+    }
+
+    #[tokio::test]
+    async fn independent_owned_scope_progresses_while_another_transport_is_paused() {
+        let (started_tx, started_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel();
+        let transport = CancellationTransport {
+            requests: Arc::new(Mutex::new(Vec::new())),
+            rule_started: started_tx,
+            release_rule: Arc::new(Mutex::new(release_rx)),
+            route_present: Arc::new(AtomicBool::new(false)),
+            rule_present: Arc::new(AtomicBool::new(false)),
+            complete_rule_install: true,
+            resident_route: collection_route(10),
+            resident_rule: collection_rule(10),
+        };
+        let backend = LinuxRouteSteeringBackend::with_transport(transport);
+        let desired = OwnedRouteRuleSet::new(
+            collection_scope(),
+            vec![collection_route(10)],
+            vec![collection_rule(10)],
+        )
+        .unwrap();
+        let worker = tokio::spawn({
+            let backend = backend.clone();
+            async move { backend.reconcile_owned_route_rules(desired).await }
+        });
+        tokio::task::spawn_blocking(move || started_rx.recv_timeout(Duration::from_secs(2)))
+            .await
+            .unwrap()
+            .unwrap();
+
+        // Neither the route table nor the rule priority overlaps the paused
+        // scope. Observe progress before releasing its transport operation.
+        let independent =
+            OwnedRouteRuleScope::new(RouteSteeringIpFamily::Ipv4, 2000, 43, Some(10), 901).unwrap();
+        let result = tokio::time::timeout(
+            Duration::from_secs(2),
+            backend.snapshot_owned_route_rules(independent),
+        )
+        .await;
+        release_tx.send(()).unwrap();
+        worker.await.unwrap().unwrap();
+        let snapshot = result
+            .expect("an unrelated ownership scope must make progress")
+            .unwrap();
+        assert!(snapshot.routes().is_empty());
+        assert!(snapshot.rules().is_empty());
+    }
+
+    #[derive(Debug, Clone)]
+    struct ConcurrentPairTransport {
+        state: Arc<Mutex<ConcurrentPairState>>,
+        pause_rule: RuleRequest,
+        entered: Arc<tokio::sync::Notify>,
+        release: Arc<Mutex<mpsc::Receiver<()>>>,
+    }
+
+    #[derive(Debug, Default)]
+    struct ConcurrentPairState {
+        routes: BTreeSet<RouteRequest>,
+        rules: BTreeSet<RuleRequest>,
+        removed_routes: Vec<RouteRequest>,
+        removed_rules: Vec<RuleRequest>,
+    }
+
+    impl LinuxRouteTransport for ConcurrentPairTransport {
+        fn transact(
+            &self,
+            _operation: &'static str,
+            request: &[u8],
+            _expected_sequence: u32,
+            _config: LinuxRouteSteeringBackendConfig,
+        ) -> Result<Option<Vec<u8>>, RouteSteeringError> {
+            match read_u16_ne(request, 4)? {
+                RTM_NEWROUTE | RTM_DELROUTE => {
+                    let route = parse_route_candidate(netlink_body(request))?
+                        .and_then(|candidate| candidate.resident)
+                        .ok_or_else(malformed_readback)?;
+                    let mut state = self.state.lock().unwrap();
+                    if read_u16_ne(request, 4)? == RTM_NEWROUTE {
+                        if !state.routes.insert(route) {
+                            return Err(RouteSteeringError::AlreadyExists);
+                        }
+                    } else {
+                        if !state.routes.remove(&route) {
+                            return Err(RouteSteeringError::NotFound);
+                        }
+                        state.removed_routes.push(route);
+                    }
+                }
+                RTM_NEWRULE | RTM_DELRULE => {
+                    let rule = parse_rule_candidate(netlink_body(request))?
+                        .and_then(|candidate| candidate.resident)
+                        .ok_or_else(malformed_readback)?;
+                    if read_u16_ne(request, 4)? == RTM_NEWRULE && rule == self.pause_rule {
+                        self.entered.notify_one();
+                        self.release.lock().unwrap().recv().unwrap();
+                        return Err(RouteSteeringError::io(
+                            "install_rule",
+                            io::Error::new(io::ErrorKind::PermissionDenied, "synthetic rejection"),
+                        ));
+                    }
+                    let mut state = self.state.lock().unwrap();
+                    if read_u16_ne(request, 4)? == RTM_NEWRULE {
+                        if !state.rules.insert(rule) {
+                            return Err(RouteSteeringError::AlreadyExists);
+                        }
+                    } else {
+                        if !state.rules.remove(&rule) {
+                            return Err(RouteSteeringError::NotFound);
+                        }
+                        state.removed_rules.push(rule);
+                    }
+                }
+                _ => return Err(malformed_readback()),
+            }
+            Ok(None)
+        }
+
+        fn dump(
+            &self,
+            _operation: &'static str,
+            _request: &[u8],
+            _expected_sequence: u32,
+            expected_message_type: u16,
+            _config: LinuxRouteSteeringBackendConfig,
+            _limits: LinuxNetlinkDumpLimits,
+        ) -> Result<Vec<Vec<u8>>, RouteSteeringError> {
+            let state = self.state.lock().unwrap();
+            match expected_message_type {
+                RTM_NEWROUTE => state.routes.iter().map(encode_route_request).collect(),
+                RTM_NEWRULE => state.rules.iter().map(encode_rule_request).collect(),
+                _ => Err(malformed_readback()),
+            }
+        }
+
+        fn probe(&self, _config: LinuxRouteSteeringBackendConfig) -> RouteSteeringProbe {
+            RouteSteeringProbe::default()
+        }
+    }
+
+    async fn assert_independent_pair_and_cancelled_inverse(cancel: bool) {
+        let (release, receiver) = mpsc::channel();
+        let transport = ConcurrentPairTransport {
+            state: Arc::new(Mutex::new(ConcurrentPairState::default())),
+            pause_rule: collection_rule(10),
+            entered: Arc::new(tokio::sync::Notify::new()),
+            release: Arc::new(Mutex::new(receiver)),
+        };
+        let backend = LinuxRouteSteeringBackend::with_transport(transport.clone());
+        let mut first = tokio::spawn({
+            let backend = backend.clone();
+            async move {
+                backend
+                    .converge_route_and_rule(collection_route(10), collection_rule(10))
+                    .await
+            }
+        });
+        tokio::time::timeout(Duration::from_secs(2), transport.entered.notified())
+            .await
+            .unwrap();
+        if cancel {
+            first.abort();
+            assert!((&mut first).await.unwrap_err().is_cancelled());
+        }
+
+        // Polling proves the same-key follower has requested exclusion while
+        // the dispatched worker still owns its unfinished rollback.
+        let following_route = collection_route(10);
+        let follower = backend.read_route(&following_route);
+        tokio::pin!(follower);
+        use std::future::Future;
+        assert!(
+            std::future::poll_fn(|cx| std::task::Poll::Ready(
+                follower.as_mut().poll(cx).is_pending()
+            ))
+            .await
+        );
+
+        let independent = tokio::time::timeout(
+            Duration::from_secs(2),
+            backend.converge_route_and_rule(collection_route(11), collection_rule(11)),
+        )
+        .await;
+        // Always release the blocking worker, including on a regression.
+        release.send(()).unwrap();
+        let independent = independent
+            .expect("a paused different selector cannot block this pair")
+            .unwrap();
+        assert_eq!(independent.route, RouteConvergenceOutcome::Installed);
+        assert_eq!(independent.rule, RuleConvergenceOutcome::Installed);
+        assert_eq!(follower.await.unwrap(), RouteReadback::Absent);
+        if !cancel {
+            let failed = (&mut first).await.unwrap();
+            assert!(failed.is_err());
+        }
+        assert_eq!(
+            backend.read_route(&collection_route(11)).await.unwrap(),
+            RouteReadback::ExactPresent
+        );
+        assert_eq!(
+            backend.read_rule(&collection_rule(11)).await.unwrap(),
+            RuleReadback::ExactPresent
+        );
+        let state = transport.state.lock().unwrap();
+        assert_eq!(state.routes, BTreeSet::from([collection_route(11)]));
+        assert_eq!(state.rules, BTreeSet::from([collection_rule(11)]));
+        assert_eq!(state.removed_routes, vec![collection_route(10)]);
+        assert!(state.removed_rules.is_empty());
+    }
+
+    #[tokio::test]
+    async fn independent_pair_progresses_through_sibling_rejection_and_exact_rollback() {
+        assert_independent_pair_and_cancelled_inverse(false).await;
+    }
+
+    #[tokio::test]
+    async fn cancelled_pair_retains_only_conflicting_exclusion_through_exact_rollback() {
+        assert_independent_pair_and_cancelled_inverse(true).await;
     }
 
     #[tokio::test]

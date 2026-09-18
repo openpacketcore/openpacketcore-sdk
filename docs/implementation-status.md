@@ -38,6 +38,18 @@ tuples and DATA length. This is fixture evidence at its declared scope; the
 corrected publication requires review and merge before new N2 consumer
 qualification. See [conformance scope](../crates/opc-n3iwf-fixtures/CONFORMANCE.md).
 
+## SCTP receive reliability and N2 profile — 2026-09-17
+
+| Scope | Status | Evidence and remaining boundary |
+| --- | --- | --- |
+| Socket-owned partial receive across cancellation and notifications | implemented | `opc-sctp` deterministic receive schedules cover prefix retention, cumulative limits, queued receivers, close, lifecycle invalidation and metadata conflicts. Native SCTP tests exercise complete multi-chunk delivery and concurrent receivers. |
+| Typed N2 profile ([#788](https://github.com/openpacketcore/openpacketcore-sdk/issues/788)) | partial | Existing SCTP associations, ordered multihoming sets, readback, PPID constants and receive ownership are reusable foundations. Typed generation fencing, strict N2 admission, stream lifecycle and bounded restart remain pending. |
+
+[Conformance scope](../crates/opc-sctp/CONFORMANCE.md) separates synthetic syscall
+schedules from wire fixtures and live-peer qualification. No SCTP metadata or
+configured address establishes cryptographic protection. Current candidate
+checks and independent review must be assessed separately from this scope table.
+
 ## Historical foundation validation snapshot — T-9be95f92 (2026-05-30; updated 2026-06-07)
 
 This snapshot records the foundation hardening validation after the concrete

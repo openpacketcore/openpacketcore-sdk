@@ -29,3 +29,8 @@ test = false
 name = "dedicated_bearer"
 path = "fuzz_targets/dedicated_bearer.rs"
 test = false
+
+[[bin]]
+name = "nwu"
+path = "fuzz_targets/nwu.rs"
+test = false
