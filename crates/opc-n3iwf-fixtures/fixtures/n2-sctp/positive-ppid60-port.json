@@ -35,7 +35,7 @@
   ],
   "wire": {
     "path": "wire/positive-ppid60-port.hex",
-    "digest_sha256": "055d3a888065cd6c75a9b6ebb0bf8e0c6f1300e8e703d3029756fb1531c2c686"
+    "digest_sha256": "5262583a7be26feef143c72a913ee5ce748b80e3a280dda93b70a25ebdfb7572"
   },
   "semantic_assertions": [
     "ppid=60",

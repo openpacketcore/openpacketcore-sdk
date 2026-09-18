@@ -35,9 +35,11 @@
   ],
   "wire": {
     "path": "wire/ordering-port-before-ppid.hex",
-    "digest_sha256": "0a42d6c2b4b84b66980e22ac435a9c5d2a0e7e3e27d8a7d5fa66225f3c0f1a89"
+    "digest_sha256": "d079255d614ddeac09fe68d27588434cfa48c072730faf4ea0afe3a6e37d59aa"
   },
   "semantic_assertions": [
+    "ppid=60",
+    "port=38412",
     "metadata_order=port-then-ppid"
   ],
   "expected_outcome": "receive",

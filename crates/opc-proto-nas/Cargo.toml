@@ -19,6 +19,7 @@ opc-key = { path = "../opc-key", version = "0.2.0" }
 bytes = { workspace = true }
 
 [dev-dependencies]
+allocation-counter = { workspace = true }
 quickcheck = "1"
 opc-types = { path = "../opc-types", version = "0.2.0" }
 

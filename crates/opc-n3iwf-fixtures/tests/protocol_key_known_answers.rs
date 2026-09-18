@@ -18,6 +18,82 @@ use serde_json::Value;
 const SCOPE: &str = "ike-auth-known-answer";
 const PROFILE: &str = "prf-hmac-sha256-aes-gcm16-256-ecp256";
 
+#[test]
+fn imported_consume_once_msk_matches_every_independent_auth_case() {
+    use opc_proto_ikev2::protocol_key::{
+        Ikev2ProtocolKeyAssociation, Ikev2ProtocolKeyError, Ikev2ProtocolKeyPurpose,
+    };
+    use std::num::NonZeroU64;
+    use zeroize::Zeroizing;
+
+    let reference = reference();
+    let cases = reference["cases"].as_array().expect("reviewed cases");
+    let initiator = Inputs::new(
+        &cases
+            .iter()
+            .find(|case| case["name"] == "auth-initiator-known-answer")
+            .expect("initiator case")["inputs"],
+    );
+    let responder = Inputs::new(
+        &cases
+            .iter()
+            .find(|case| case["name"] == "auth-responder-known-answer")
+            .expect("responder case")["inputs"],
+    );
+    let mut count = 0;
+    for case in cases {
+        let current = Inputs::new(&case["inputs"]);
+        let association = Ikev2ProtocolKeyAssociation::new(NonZeroU64::new(1).unwrap());
+        let operation = association
+            .begin_ike_auth(
+                NonZeroU64::new(1).unwrap(),
+                NonZeroU64::new(1).unwrap(),
+                profile(),
+            )
+            .unwrap();
+        let key = operation.import(
+            Ikev2ProtocolKeyPurpose::N3iwfMsk,
+            Zeroizing::new(current.auth_key.clone()),
+        );
+        if case["reference_error"] == "authentication-key-empty" {
+            assert_eq!(key.unwrap_err(), Ikev2ProtocolKeyError::InvalidKeyLength);
+            count += 1;
+            continue;
+        }
+        let key = key.expect("synthetic imported key");
+        let (left, right) = match current.peer {
+            Ikev2IkeAuthPeer::Initiator => (current.signed(), responder.signed()),
+            Ikev2IkeAuthPeer::Responder => (initiator.signed(), current.signed()),
+        };
+        let auth = key
+            .consume_ike_auth(&operation, &current.material, left, right, 4096)
+            .expect("bounded AUTH derivation");
+        let wire = octets(&case["wire_hex"]);
+        let result = Ikev2AuthenticationPayload::decode_body(&wire)
+            .map_err(|_| Ikev2ProtocolKeyError::AuthenticationFailed)
+            .and_then(|payload| auth.verify(current.peer, &payload));
+        assert_eq!(
+            result.is_ok(),
+            case["reference_error"].is_null(),
+            "synthetic case {}",
+            case["name"]
+        );
+        if result.is_ok() {
+            assert!(
+                auth.authentication_data(current.peer) == &wire[4..],
+                "independent AUTH bytes"
+            );
+        }
+        assert_eq!(
+            key.consume_ike_auth(&operation, &current.material, left, right, 4096)
+                .unwrap_err(),
+            Ikev2ProtocolKeyError::Retired
+        );
+        count += 1;
+    }
+    assert_eq!(count, 30);
+}
+
 fn reference() -> Value {
     serde_json::from_str(include_str!("../oracles/ike-auth-sha256.json")).expect("reference")
 }

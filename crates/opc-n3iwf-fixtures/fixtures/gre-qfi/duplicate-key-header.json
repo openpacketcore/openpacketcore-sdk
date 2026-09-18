@@ -22,7 +22,7 @@
     "synthetic": true,
     "independent_capture": false,
     "referenced_public_vector": null,
-    "notes": "Two concatenated GRE headers"
+    "notes": "One GRE header followed by eight opaque payload octets shaped like a second header; no nested GRE parsing"
   },
   "sanitized_fields": [
     {

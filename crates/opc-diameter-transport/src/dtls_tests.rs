@@ -2,6 +2,8 @@
 //! SCTP message seam. These tests prove the RFC 6733 direct-protection
 //! sequencing and RFC 6083 PPID-47 carriage without requiring kernel SCTP.
 
+mod generic;
+
 use std::num::NonZeroUsize;
 use std::time::Duration;
 
