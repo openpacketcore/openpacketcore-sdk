@@ -6097,6 +6097,1226 @@
           "value_hex": "000001002033000004008b000a01f0c633640111223344008600010000820008080f4240200f42400088000d04090000091c00900000091c00"
         }
       ]
+    },
+    {
+      "name": "complete-nas-non-delivery-indication",
+      "message": "NASNonDeliveryIndication",
+      "case_class": "positive",
+      "reference_error": null,
+      "sdk_structural_outcome": "receive",
+      "max_ies": 256,
+      "pdu": {
+        "type": "initiatingMessage",
+        "value": {
+          "procedureCode": 19,
+          "criticality": "ignore",
+          "value": {
+            "type": "NASNonDeliveryIndication",
+            "value": {
+              "protocolIEs": [
+                {
+                  "id": 10,
+                  "criticality": "reject",
+                  "value": {
+                    "type": "AMF-UE-NGAP-ID",
+                    "value": 554642532233
+                  }
+                },
+                {
+                  "id": 85,
+                  "criticality": "reject",
+                  "value": {
+                    "type": "RAN-UE-NGAP-ID",
+                    "value": 2271560481
+                  }
+                },
+                {
+                  "id": 38,
+                  "criticality": "ignore",
+                  "value": {
+                    "type": "NAS-PDU",
+                    "value": {
+                      "hex": "7e0042"
+                    }
+                  }
+                },
+                {
+                  "id": 15,
+                  "criticality": "ignore",
+                  "value": {
+                    "type": "Cause",
+                    "value": {
+                      "type": "radioNetwork",
+                      "value": "unspecified"
+                    }
+                  }
+                }
+              ]
+            }
+          }
+        }
+      },
+      "wire_hex": "00134024000004000a000680812345678900550005c08765432100264004037e0042000f40020000",
+      "wire_sha256": "c9439d3fb46cf1282b3be5642381a6e0f85cd185d53f437e297830b636cb20bd",
+      "encoded_ies": [
+        {
+          "id": 10,
+          "criticality": "reject",
+          "value_hex": "808123456789"
+        },
+        {
+          "id": 85,
+          "criticality": "reject",
+          "value_hex": "c087654321"
+        },
+        {
+          "id": 38,
+          "criticality": "ignore",
+          "value_hex": "037e0042"
+        },
+        {
+          "id": 15,
+          "criticality": "ignore",
+          "value_hex": "0000"
+        }
+      ],
+      "source_vector": {
+        "path": "crates/opc-proto-ngap/tests/fixtures/n3iwf-ue-requests.json",
+        "sha256": "657f478921289bddfeb7013d3e37488956d420f9c327b7a9775a889cf2787ac0",
+        "collection": "messages",
+        "case": "base-NASNonDeliveryIndication"
+      }
+    },
+    {
+      "name": "missing-mandatory-nas-non-delivery-indication",
+      "message": "NASNonDeliveryIndication",
+      "case_class": "malformed",
+      "reference_error": "missing-mandatory-ie",
+      "sdk_structural_outcome": "receive",
+      "max_ies": 256,
+      "pdu": {
+        "type": "initiatingMessage",
+        "value": {
+          "procedureCode": 19,
+          "criticality": "ignore",
+          "value": {
+            "type": "NASNonDeliveryIndication",
+            "value": {
+              "protocolIEs": [
+                {
+                  "id": 10,
+                  "criticality": "reject",
+                  "value": {
+                    "type": "AMF-UE-NGAP-ID",
+                    "value": 554642532233
+                  }
+                },
+                {
+                  "id": 85,
+                  "criticality": "reject",
+                  "value": {
+                    "type": "RAN-UE-NGAP-ID",
+                    "value": 2271560481
+                  }
+                },
+                {
+                  "id": 15,
+                  "criticality": "ignore",
+                  "value": {
+                    "type": "Cause",
+                    "value": {
+                      "type": "radioNetwork",
+                      "value": "unspecified"
+                    }
+                  }
+                }
+              ]
+            }
+          }
+        }
+      },
+      "wire_hex": "0013401c000003000a000680812345678900550005c087654321000f40020000",
+      "wire_sha256": "78e7a7c948a7dc98e0aabdb9eb324080b8c9188963d1936c63df7f3688050de4",
+      "encoded_ies": [
+        {
+          "id": 10,
+          "criticality": "reject",
+          "value_hex": "808123456789"
+        },
+        {
+          "id": 85,
+          "criticality": "reject",
+          "value_hex": "c087654321"
+        },
+        {
+          "id": 15,
+          "criticality": "ignore",
+          "value_hex": "0000"
+        }
+      ],
+      "source_vector": {
+        "path": "crates/opc-proto-ngap/tests/fixtures/n3iwf-ue-requests.json",
+        "sha256": "657f478921289bddfeb7013d3e37488956d420f9c327b7a9775a889cf2787ac0",
+        "collection": "messages",
+        "case": "missing-NASNonDeliveryIndication-38"
+      }
+    },
+    {
+      "name": "complete-ue-context-release-request",
+      "message": "UEContextReleaseRequest",
+      "case_class": "positive",
+      "reference_error": null,
+      "sdk_structural_outcome": "receive",
+      "max_ies": 256,
+      "pdu": {
+        "type": "initiatingMessage",
+        "value": {
+          "procedureCode": 42,
+          "criticality": "ignore",
+          "value": {
+            "type": "UEContextReleaseRequest",
+            "value": {
+              "protocolIEs": [
+                {
+                  "id": 10,
+                  "criticality": "reject",
+                  "value": {
+                    "type": "AMF-UE-NGAP-ID",
+                    "value": 554642532233
+                  }
+                },
+                {
+                  "id": 85,
+                  "criticality": "reject",
+                  "value": {
+                    "type": "RAN-UE-NGAP-ID",
+                    "value": 2271560481
+                  }
+                },
+                {
+                  "id": 15,
+                  "criticality": "ignore",
+                  "value": {
+                    "type": "Cause",
+                    "value": {
+                      "type": "radioNetwork",
+                      "value": "unspecified"
+                    }
+                  }
+                }
+              ]
+            }
+          }
+        }
+      },
+      "wire_hex": "002a401c000003000a000680812345678900550005c087654321000f40020000",
+      "wire_sha256": "c51b8dc2546a075d2eaf5df878c34c320525bb7c5312bc9904a19a3b436e289f",
+      "encoded_ies": [
+        {
+          "id": 10,
+          "criticality": "reject",
+          "value_hex": "808123456789"
+        },
+        {
+          "id": 85,
+          "criticality": "reject",
+          "value_hex": "c087654321"
+        },
+        {
+          "id": 15,
+          "criticality": "ignore",
+          "value_hex": "0000"
+        }
+      ],
+      "source_vector": {
+        "path": "crates/opc-proto-ngap/tests/fixtures/n3iwf-ue-requests.json",
+        "sha256": "657f478921289bddfeb7013d3e37488956d420f9c327b7a9775a889cf2787ac0",
+        "collection": "messages",
+        "case": "base-UEContextReleaseRequest"
+      }
+    },
+    {
+      "name": "missing-mandatory-ue-context-release-request",
+      "message": "UEContextReleaseRequest",
+      "case_class": "malformed",
+      "reference_error": "missing-mandatory-ie",
+      "sdk_structural_outcome": "receive",
+      "max_ies": 256,
+      "pdu": {
+        "type": "initiatingMessage",
+        "value": {
+          "procedureCode": 42,
+          "criticality": "ignore",
+          "value": {
+            "type": "UEContextReleaseRequest",
+            "value": {
+              "protocolIEs": [
+                {
+                  "id": 10,
+                  "criticality": "reject",
+                  "value": {
+                    "type": "AMF-UE-NGAP-ID",
+                    "value": 554642532233
+                  }
+                },
+                {
+                  "id": 85,
+                  "criticality": "reject",
+                  "value": {
+                    "type": "RAN-UE-NGAP-ID",
+                    "value": 2271560481
+                  }
+                }
+              ]
+            }
+          }
+        }
+      },
+      "wire_hex": "002a4016000002000a000680812345678900550005c087654321",
+      "wire_sha256": "54e8f0fb73383328cc4962836668dfa98b821b9cd9dfae97d1bcd89e90fb5334",
+      "encoded_ies": [
+        {
+          "id": 10,
+          "criticality": "reject",
+          "value_hex": "808123456789"
+        },
+        {
+          "id": 85,
+          "criticality": "reject",
+          "value_hex": "c087654321"
+        }
+      ],
+      "source_vector": {
+        "path": "crates/opc-proto-ngap/tests/fixtures/n3iwf-ue-requests.json",
+        "sha256": "657f478921289bddfeb7013d3e37488956d420f9c327b7a9775a889cf2787ac0",
+        "collection": "messages",
+        "case": "missing-UEContextReleaseRequest-15"
+      }
+    },
+    {
+      "name": "complete-ng-reset",
+      "message": "NGReset",
+      "case_class": "positive",
+      "reference_error": null,
+      "sdk_structural_outcome": "receive",
+      "max_ies": 256,
+      "pdu": {
+        "type": "initiatingMessage",
+        "value": {
+          "procedureCode": 20,
+          "criticality": "reject",
+          "value": {
+            "type": "NGReset",
+            "value": {
+              "protocolIEs": [
+                {
+                  "id": 15,
+                  "criticality": "ignore",
+                  "value": {
+                    "type": "Cause",
+                    "value": {
+                      "type": "radioNetwork",
+                      "value": "unspecified"
+                    }
+                  }
+                },
+                {
+                  "id": 88,
+                  "criticality": "reject",
+                  "value": {
+                    "type": "ResetType",
+                    "value": {
+                      "type": "nG-Interface",
+                      "value": "reset-all"
+                    }
+                  }
+                }
+              ]
+            }
+          }
+        }
+      },
+      "wire_hex": "0014000e000002000f400200000058000100",
+      "wire_sha256": "65236a81de3a7904fb2184874b2042a78d3514eb9e5a874eab50057d6412e915",
+      "encoded_ies": [
+        {
+          "id": 15,
+          "criticality": "ignore",
+          "value_hex": "0000"
+        },
+        {
+          "id": 88,
+          "criticality": "reject",
+          "value_hex": "00"
+        }
+      ],
+      "source_vector": {
+        "path": "crates/opc-proto-ngap/tests/fixtures/n3iwf-reset.json",
+        "sha256": "3b6676df2cf965031ea50e44c6fe151d3e1ac9a4ff0d036d4a22712dce15abf8",
+        "collection": "cases",
+        "case": "base-NGReset"
+      }
+    },
+    {
+      "name": "missing-mandatory-ng-reset",
+      "message": "NGReset",
+      "case_class": "malformed",
+      "reference_error": "missing-mandatory-ie",
+      "sdk_structural_outcome": "receive",
+      "max_ies": 256,
+      "pdu": {
+        "type": "initiatingMessage",
+        "value": {
+          "procedureCode": 20,
+          "criticality": "reject",
+          "value": {
+            "type": "NGReset",
+            "value": {
+              "protocolIEs": [
+                {
+                  "id": 15,
+                  "criticality": "ignore",
+                  "value": {
+                    "type": "Cause",
+                    "value": {
+                      "type": "radioNetwork",
+                      "value": "unspecified"
+                    }
+                  }
+                }
+              ]
+            }
+          }
+        }
+      },
+      "wire_hex": "00140009000001000f40020000",
+      "wire_sha256": "cf1189476f1cb359af534ca2cb49efeb5b214051ae622a015758797753c6a197",
+      "encoded_ies": [
+        {
+          "id": 15,
+          "criticality": "ignore",
+          "value_hex": "0000"
+        }
+      ],
+      "source_vector": {
+        "path": "crates/opc-proto-ngap/tests/fixtures/n3iwf-reset.json",
+        "sha256": "3b6676df2cf965031ea50e44c6fe151d3e1ac9a4ff0d036d4a22712dce15abf8",
+        "collection": "cases",
+        "case": "missing-NGReset-88"
+      }
+    },
+    {
+      "name": "complete-ng-reset-acknowledge",
+      "message": "NGResetAcknowledge",
+      "case_class": "positive",
+      "reference_error": null,
+      "sdk_structural_outcome": "receive",
+      "max_ies": 256,
+      "pdu": {
+        "type": "successfulOutcome",
+        "value": {
+          "procedureCode": 20,
+          "criticality": "reject",
+          "value": {
+            "type": "NGResetAcknowledge",
+            "value": {
+              "protocolIEs": []
+            }
+          }
+        }
+      },
+      "wire_hex": "20140003000000",
+      "wire_sha256": "d7e07f8cbe18062a8c925a5010ed291a19243271838ec6e45641e357cf7ddf79",
+      "encoded_ies": [],
+      "source_vector": {
+        "path": "crates/opc-proto-ngap/tests/fixtures/n3iwf-reset.json",
+        "sha256": "3b6676df2cf965031ea50e44c6fe151d3e1ac9a4ff0d036d4a22712dce15abf8",
+        "collection": "cases",
+        "case": "base-NGResetAcknowledge"
+      }
+    },
+    {
+      "name": "complete-duplicate-ng-reset-acknowledge",
+      "message": "NGResetAcknowledge",
+      "case_class": "duplicate",
+      "reference_error": "duplicate-ie",
+      "sdk_structural_outcome": "reject",
+      "max_ies": 256,
+      "pdu": {
+        "type": "successfulOutcome",
+        "value": {
+          "procedureCode": 20,
+          "criticality": "reject",
+          "value": {
+            "type": "NGResetAcknowledge",
+            "value": {
+              "protocolIEs": [
+                {
+                  "id": 19,
+                  "criticality": "ignore",
+                  "value": {
+                    "type": "CriticalityDiagnostics",
+                    "value": {
+                      "procedureCriticality": "reject"
+                    }
+                  }
+                },
+                {
+                  "id": 19,
+                  "criticality": "ignore",
+                  "value": {
+                    "type": "CriticalityDiagnostics",
+                    "value": {
+                      "procedureCriticality": "notify"
+                    }
+                  }
+                }
+              ]
+            }
+          }
+        }
+      },
+      "wire_hex": "2014000d00000200134001100013400112",
+      "wire_sha256": "67812237bd3207b47580b7e2ed221c8d5c58e60fa445a90d9b40f7d8dd011c8b",
+      "encoded_ies": [
+        {
+          "id": 19,
+          "criticality": "ignore",
+          "value_hex": "10"
+        },
+        {
+          "id": 19,
+          "criticality": "ignore",
+          "value_hex": "12"
+        }
+      ],
+      "source_vector": {
+        "path": "crates/opc-proto-ngap/tests/fixtures/n3iwf-reset.json",
+        "sha256": "3b6676df2cf965031ea50e44c6fe151d3e1ac9a4ff0d036d4a22712dce15abf8",
+        "collection": "cases",
+        "case": "duplicate-NGResetAcknowledge"
+      }
+    },
+    {
+      "name": "complete-error-indication",
+      "message": "ErrorIndication",
+      "case_class": "positive",
+      "reference_error": null,
+      "sdk_structural_outcome": "receive",
+      "max_ies": 256,
+      "pdu": {
+        "type": "initiatingMessage",
+        "value": {
+          "procedureCode": 9,
+          "criticality": "ignore",
+          "value": {
+            "type": "ErrorIndication",
+            "value": {
+              "protocolIEs": [
+                {
+                  "id": 15,
+                  "criticality": "ignore",
+                  "value": {
+                    "type": "Cause",
+                    "value": {
+                      "type": "radioNetwork",
+                      "value": "unspecified"
+                    }
+                  }
+                }
+              ]
+            }
+          }
+        }
+      },
+      "wire_hex": "00094009000001000f40020000",
+      "wire_sha256": "7bc6081e1b3b3d6ad8b83f64aaf6505f19301553070ab8e90a00ad7149856e00",
+      "encoded_ies": [
+        {
+          "id": 15,
+          "criticality": "ignore",
+          "value_hex": "0000"
+        }
+      ],
+      "source_vector": {
+        "path": "crates/opc-proto-ngap/tests/fixtures/n3iwf-reset.json",
+        "sha256": "3b6676df2cf965031ea50e44c6fe151d3e1ac9a4ff0d036d4a22712dce15abf8",
+        "collection": "cases",
+        "case": "base-ErrorIndication"
+      }
+    },
+    {
+      "name": "complete-duplicate-error-indication",
+      "message": "ErrorIndication",
+      "case_class": "duplicate",
+      "reference_error": "duplicate-ie",
+      "sdk_structural_outcome": "reject",
+      "max_ies": 256,
+      "pdu": {
+        "type": "initiatingMessage",
+        "value": {
+          "procedureCode": 9,
+          "criticality": "ignore",
+          "value": {
+            "type": "ErrorIndication",
+            "value": {
+              "protocolIEs": [
+                {
+                  "id": 15,
+                  "criticality": "ignore",
+                  "value": {
+                    "type": "Cause",
+                    "value": {
+                      "type": "transport",
+                      "value": "unspecified"
+                    }
+                  }
+                },
+                {
+                  "id": 15,
+                  "criticality": "ignore",
+                  "value": {
+                    "type": "Cause",
+                    "value": {
+                      "type": "radioNetwork",
+                      "value": "unspecified"
+                    }
+                  }
+                }
+              ]
+            }
+          }
+        }
+      },
+      "wire_hex": "0009400e000002000f400128000f40020000",
+      "wire_sha256": "607e16ee647fb0c95b25fab49d8c04826d382ef19c7f6d34a389c3fbf1b2c034",
+      "encoded_ies": [
+        {
+          "id": 15,
+          "criticality": "ignore",
+          "value_hex": "28"
+        },
+        {
+          "id": 15,
+          "criticality": "ignore",
+          "value_hex": "0000"
+        }
+      ],
+      "source_vector": {
+        "path": "crates/opc-proto-ngap/tests/fixtures/n3iwf-reset.json",
+        "sha256": "3b6676df2cf965031ea50e44c6fe151d3e1ac9a4ff0d036d4a22712dce15abf8",
+        "collection": "cases",
+        "case": "duplicate-ErrorIndication"
+      }
+    },
+    {
+      "name": "complete-pdu-session-resource-notify",
+      "message": "PDUSessionResourceNotify",
+      "case_class": "positive",
+      "reference_error": null,
+      "sdk_structural_outcome": "receive",
+      "max_ies": 256,
+      "pdu": {
+        "type": "initiatingMessage",
+        "value": {
+          "procedureCode": 30,
+          "criticality": "ignore",
+          "value": {
+            "type": "PDUSessionResourceNotify",
+            "value": {
+              "protocolIEs": [
+                {
+                  "id": 10,
+                  "criticality": "reject",
+                  "value": {
+                    "type": "AMF-UE-NGAP-ID",
+                    "value": 4328719365
+                  }
+                },
+                {
+                  "id": 85,
+                  "criticality": "reject",
+                  "value": {
+                    "type": "RAN-UE-NGAP-ID",
+                    "value": 16909060
+                  }
+                },
+                {
+                  "id": 66,
+                  "criticality": "reject",
+                  "value": {
+                    "type": "PDUSessionResourceNotifyList",
+                    "value": [
+                      {
+                        "pDUSessionID": 0,
+                        "pDUSessionResourceNotifyTransfer": {
+                          "type": "PDUSessionResourceNotifyTransfer",
+                          "value": {
+                            "qosFlowNotifyList": [
+                              {
+                                "qosFlowIdentifier": 7,
+                                "notificationCause": "fulfilled"
+                              }
+                            ]
+                          }
+                        }
+                      }
+                    ]
+                  }
+                }
+              ]
+            }
+          }
+        }
+      },
+      "wire_hex": "001e4021000003000a000680010203040500550005c00102030400420007000000034000e0",
+      "wire_sha256": "5e54c150b4db76bc4ca9f6501f7a94835860b4c7e4d82dfc2b5b0b8c65bad400",
+      "encoded_ies": [
+        {
+          "id": 10,
+          "criticality": "reject",
+          "value_hex": "800102030405"
+        },
+        {
+          "id": 85,
+          "criticality": "reject",
+          "value_hex": "c001020304"
+        },
+        {
+          "id": 66,
+          "criticality": "reject",
+          "value_hex": "000000034000e0"
+        }
+      ],
+      "source_vector": {
+        "path": "crates/opc-proto-ngap/tests/fixtures/n3iwf-notify.json",
+        "sha256": "a5b88413ae2cecd25eb40b0434b25630b9f3d931b36acffc94c1de7caba265e0",
+        "collection": "cases",
+        "case": "notified-1"
+      }
+    },
+    {
+      "name": "missing-mandatory-pdu-session-resource-notify",
+      "message": "PDUSessionResourceNotify",
+      "case_class": "malformed",
+      "reference_error": "missing-mandatory-ie",
+      "sdk_structural_outcome": "receive",
+      "max_ies": 256,
+      "pdu": {
+        "type": "initiatingMessage",
+        "value": {
+          "procedureCode": 30,
+          "criticality": "ignore",
+          "value": {
+            "type": "PDUSessionResourceNotify",
+            "value": {
+              "protocolIEs": [
+                {
+                  "id": 85,
+                  "criticality": "reject",
+                  "value": {
+                    "type": "RAN-UE-NGAP-ID",
+                    "value": 16909060
+                  }
+                },
+                {
+                  "id": 66,
+                  "criticality": "reject",
+                  "value": {
+                    "type": "PDUSessionResourceNotifyList",
+                    "value": [
+                      {
+                        "pDUSessionID": 0,
+                        "pDUSessionResourceNotifyTransfer": {
+                          "type": "PDUSessionResourceNotifyTransfer",
+                          "value": {
+                            "qosFlowNotifyList": [
+                              {
+                                "qosFlowIdentifier": 7,
+                                "notificationCause": "fulfilled"
+                              }
+                            ]
+                          }
+                        }
+                      }
+                    ]
+                  }
+                }
+              ]
+            }
+          }
+        }
+      },
+      "wire_hex": "001e401700000200550005c00102030400420007000000034000e0",
+      "wire_sha256": "b5f9715314c431f7184216819e5be4ffd00619e67b4bf37ae16f0e5b590836bb",
+      "encoded_ies": [
+        {
+          "id": 85,
+          "criticality": "reject",
+          "value_hex": "c001020304"
+        },
+        {
+          "id": 66,
+          "criticality": "reject",
+          "value_hex": "000000034000e0"
+        }
+      ],
+      "source_vector": {
+        "path": "crates/opc-proto-ngap/tests/fixtures/n3iwf-notify.json",
+        "sha256": "a5b88413ae2cecd25eb40b0434b25630b9f3d931b36acffc94c1de7caba265e0",
+        "collection": "cases",
+        "case": "missing-10"
+      }
+    },
+    {
+      "name": "complete-pdu-session-resource-modify-request",
+      "message": "PDUSessionResourceModifyRequest",
+      "case_class": "positive",
+      "reference_error": null,
+      "sdk_structural_outcome": "receive",
+      "max_ies": 256,
+      "pdu": {
+        "type": "initiatingMessage",
+        "value": {
+          "procedureCode": 26,
+          "criticality": "reject",
+          "value": {
+            "type": "PDUSessionResourceModifyRequest",
+            "value": {
+              "protocolIEs": [
+                {
+                  "id": 10,
+                  "criticality": "reject",
+                  "value": {
+                    "type": "AMF-UE-NGAP-ID",
+                    "value": 4328719365
+                  }
+                },
+                {
+                  "id": 85,
+                  "criticality": "reject",
+                  "value": {
+                    "type": "RAN-UE-NGAP-ID",
+                    "value": 16909060
+                  }
+                },
+                {
+                  "id": 64,
+                  "criticality": "reject",
+                  "value": {
+                    "type": "PDUSessionResourceModifyListModReq",
+                    "value": [
+                      {
+                        "pDUSessionID": 0,
+                        "pDUSessionResourceModifyRequestTransfer": {
+                          "type": "PDUSessionResourceModifyRequestTransfer",
+                          "value": {
+                            "protocolIEs": [
+                              {
+                                "id": 130,
+                                "criticality": "reject",
+                                "value": {
+                                  "type": "PDUSessionAggregateMaximumBitRate",
+                                  "value": {
+                                    "pDUSessionAggregateMaximumBitRateDL": 1000000,
+                                    "pDUSessionAggregateMaximumBitRateUL": 2000000
+                                  }
+                                }
+                              },
+                              {
+                                "id": 140,
+                                "criticality": "reject",
+                                "value": {
+                                  "type": "UL-NGU-UP-TNLModifyList",
+                                  "value": [
+                                    {
+                                      "uL-NGU-UP-TNLInformation": {
+                                        "type": "gTPTunnel",
+                                        "value": {
+                                          "transportLayerAddress": {
+                                            "bits": "20010db8000000000000000000000001",
+                                            "length": 128
+                                          },
+                                          "gTP-TEID": {
+                                            "hex": "00000001"
+                                          }
+                                        }
+                                      },
+                                      "dL-NGU-UP-TNLInformation": {
+                                        "type": "gTPTunnel",
+                                        "value": {
+                                          "transportLayerAddress": {
+                                            "bits": "20010db8000100000000000000000001",
+                                            "length": 128
+                                          },
+                                          "gTP-TEID": {
+                                            "hex": "00000002"
+                                          }
+                                        }
+                                      }
+                                    }
+                                  ]
+                                }
+                              },
+                              {
+                                "id": 135,
+                                "criticality": "reject",
+                                "value": {
+                                  "type": "QosFlowAddOrModifyRequestList",
+                                  "value": [
+                                    {
+                                      "qosFlowIdentifier": 0,
+                                      "qosFlowLevelQosParameters": {
+                                        "qosCharacteristics": {
+                                          "type": "nonDynamic5QI",
+                                          "value": {
+                                            "fiveQI": 9
+                                          }
+                                        },
+                                        "allocationAndRetentionPriority": {
+                                          "priorityLevelARP": 1,
+                                          "pre-emptionCapability": "shall-not-trigger-pre-emption",
+                                          "pre-emptionVulnerability": "not-pre-emptable"
+                                        }
+                                      }
+                                    }
+                                  ]
+                                }
+                              },
+                              {
+                                "id": 137,
+                                "criticality": "reject",
+                                "value": {
+                                  "type": "QosFlowListWithCause",
+                                  "value": [
+                                    {
+                                      "qosFlowIdentifier": 63,
+                                      "cause": {
+                                        "type": "radioNetwork",
+                                        "value": "unspecified"
+                                      }
+                                    }
+                                  ]
+                                }
+                              }
+                            ]
+                          }
+                        }
+                      }
+                    ]
+                  }
+                }
+              ]
+            }
+          }
+        }
+      },
+      "wire_hex": "001a0070000003000a000680010203040500550005c001020304004000560000005200000400820008080f4240201e8480008c002c007f20010db80000000000000000000000010000000107f020010db800010000000000000000000100000002008700070100000009000000890004007e0000",
+      "wire_sha256": "953a4f6b2e2176e95de526c3f2a56a43c43f646ec533e72fa50f767248fde2af",
+      "encoded_ies": [
+        {
+          "id": 10,
+          "criticality": "reject",
+          "value_hex": "800102030405"
+        },
+        {
+          "id": 85,
+          "criticality": "reject",
+          "value_hex": "c001020304"
+        },
+        {
+          "id": 64,
+          "criticality": "reject",
+          "value_hex": "0000005200000400820008080f4240201e8480008c002c007f20010db80000000000000000000000010000000107f020010db800010000000000000000000100000002008700070100000009000000890004007e0000"
+        }
+      ],
+      "source_vector": {
+        "path": "crates/opc-proto-ngap/tests/fixtures/n3iwf-modify.json",
+        "sha256": "c3f52cd72f1b724f8540a766ba9e8b3c87eb8221bcbd512dc1aadbbcf6b62661",
+        "collection": "cases",
+        "case": "PDUSessionResourceModifyRequest-sessions-1"
+      }
+    },
+    {
+      "name": "missing-mandatory-pdu-session-resource-modify-request",
+      "message": "PDUSessionResourceModifyRequest",
+      "case_class": "malformed",
+      "reference_error": "missing-mandatory-ie",
+      "sdk_structural_outcome": "receive",
+      "max_ies": 256,
+      "pdu": {
+        "type": "initiatingMessage",
+        "value": {
+          "procedureCode": 26,
+          "criticality": "reject",
+          "value": {
+            "type": "PDUSessionResourceModifyRequest",
+            "value": {
+              "protocolIEs": [
+                {
+                  "id": 10,
+                  "criticality": "reject",
+                  "value": {
+                    "type": "AMF-UE-NGAP-ID",
+                    "value": 4328719365
+                  }
+                },
+                {
+                  "id": 85,
+                  "criticality": "reject",
+                  "value": {
+                    "type": "RAN-UE-NGAP-ID",
+                    "value": 16909060
+                  }
+                }
+              ]
+            }
+          }
+        }
+      },
+      "wire_hex": "001a0016000002000a000680010203040500550005c001020304",
+      "wire_sha256": "a22aef2e3fde0259d3c46b68f62d9d0203ce66fd7f51f95ceb78383f0f11879d",
+      "encoded_ies": [
+        {
+          "id": 10,
+          "criticality": "reject",
+          "value_hex": "800102030405"
+        },
+        {
+          "id": 85,
+          "criticality": "reject",
+          "value_hex": "c001020304"
+        }
+      ],
+      "source_vector": {
+        "path": "crates/opc-proto-ngap/tests/fixtures/n3iwf-modify.json",
+        "sha256": "c3f52cd72f1b724f8540a766ba9e8b3c87eb8221bcbd512dc1aadbbcf6b62661",
+        "collection": "cases",
+        "case": "PDUSessionResourceModifyRequest-missing-64"
+      }
+    },
+    {
+      "name": "complete-pdu-session-resource-modify-response",
+      "message": "PDUSessionResourceModifyResponse",
+      "case_class": "positive",
+      "reference_error": null,
+      "sdk_structural_outcome": "receive",
+      "max_ies": 256,
+      "pdu": {
+        "type": "successfulOutcome",
+        "value": {
+          "procedureCode": 26,
+          "criticality": "reject",
+          "value": {
+            "type": "PDUSessionResourceModifyResponse",
+            "value": {
+              "protocolIEs": [
+                {
+                  "id": 10,
+                  "criticality": "ignore",
+                  "value": {
+                    "type": "AMF-UE-NGAP-ID",
+                    "value": 4328719365
+                  }
+                },
+                {
+                  "id": 85,
+                  "criticality": "ignore",
+                  "value": {
+                    "type": "RAN-UE-NGAP-ID",
+                    "value": 16909060
+                  }
+                },
+                {
+                  "id": 65,
+                  "criticality": "ignore",
+                  "value": {
+                    "type": "PDUSessionResourceModifyListModRes",
+                    "value": [
+                      {
+                        "pDUSessionID": 0,
+                        "pDUSessionResourceModifyResponseTransfer": {
+                          "type": "PDUSessionResourceModifyResponseTransfer",
+                          "value": {
+                            "dL-NGU-UP-TNLInformation": {
+                              "type": "gTPTunnel",
+                              "value": {
+                                "transportLayerAddress": {
+                                  "bits": "c633640b",
+                                  "length": 32
+                                },
+                                "gTP-TEID": {
+                                  "hex": "11223344"
+                                }
+                              }
+                            },
+                            "uL-NGU-UP-TNLInformation": {
+                              "type": "gTPTunnel",
+                              "value": {
+                                "transportLayerAddress": {
+                                  "bits": "20010db800000000000000000000abcd",
+                                  "length": 128
+                                },
+                                "gTP-TEID": {
+                                  "hex": "55667788"
+                                }
+                              }
+                            },
+                            "qosFlowAddOrModifyResponseList": [
+                              {
+                                "qosFlowIdentifier": 0
+                              }
+                            ],
+                            "qosFlowFailedToAddOrModifyList": [
+                              {
+                                "qosFlowIdentifier": 63,
+                                "cause": {
+                                  "type": "radioNetwork",
+                                  "value": "unspecified"
+                                }
+                              }
+                            ]
+                          }
+                        }
+                      }
+                    ]
+                  }
+                }
+              ]
+            }
+          }
+        }
+      },
+      "wire_hex": "201a0044000003000a400680010203040500554005c0010203040041402a000000267403e0c633640b1122334407f020010db800000000000000000000abcd55667788000000fc00",
+      "wire_sha256": "4687670bfcdd2815c74484041311335be8af052f4b2fbd0639a1f08a6c34ec1f",
+      "encoded_ies": [
+        {
+          "id": 10,
+          "criticality": "ignore",
+          "value_hex": "800102030405"
+        },
+        {
+          "id": 85,
+          "criticality": "ignore",
+          "value_hex": "c001020304"
+        },
+        {
+          "id": 65,
+          "criticality": "ignore",
+          "value_hex": "000000267403e0c633640b1122334407f020010db800000000000000000000abcd55667788000000fc00"
+        }
+      ],
+      "source_vector": {
+        "path": "crates/opc-proto-ngap/tests/fixtures/n3iwf-modify.json",
+        "sha256": "c3f52cd72f1b724f8540a766ba9e8b3c87eb8221bcbd512dc1aadbbcf6b62661",
+        "collection": "cases",
+        "case": "PDUSessionResourceModifyResponse-sessions-1"
+      }
+    },
+    {
+      "name": "missing-mandatory-pdu-session-resource-modify-response",
+      "message": "PDUSessionResourceModifyResponse",
+      "case_class": "malformed",
+      "reference_error": "missing-mandatory-ie",
+      "sdk_structural_outcome": "receive",
+      "max_ies": 256,
+      "pdu": {
+        "type": "successfulOutcome",
+        "value": {
+          "procedureCode": 26,
+          "criticality": "reject",
+          "value": {
+            "type": "PDUSessionResourceModifyResponse",
+            "value": {
+              "protocolIEs": [
+                {
+                  "id": 10,
+                  "criticality": "ignore",
+                  "value": {
+                    "type": "AMF-UE-NGAP-ID",
+                    "value": 4328719365
+                  }
+                },
+                {
+                  "id": 65,
+                  "criticality": "ignore",
+                  "value": {
+                    "type": "PDUSessionResourceModifyListModRes",
+                    "value": [
+                      {
+                        "pDUSessionID": 0,
+                        "pDUSessionResourceModifyResponseTransfer": {
+                          "type": "PDUSessionResourceModifyResponseTransfer",
+                          "value": {
+                            "dL-NGU-UP-TNLInformation": {
+                              "type": "gTPTunnel",
+                              "value": {
+                                "transportLayerAddress": {
+                                  "bits": "c633640b",
+                                  "length": 32
+                                },
+                                "gTP-TEID": {
+                                  "hex": "11223344"
+                                }
+                              }
+                            },
+                            "uL-NGU-UP-TNLInformation": {
+                              "type": "gTPTunnel",
+                              "value": {
+                                "transportLayerAddress": {
+                                  "bits": "20010db800000000000000000000abcd",
+                                  "length": 128
+                                },
+                                "gTP-TEID": {
+                                  "hex": "55667788"
+                                }
+                              }
+                            },
+                            "qosFlowAddOrModifyResponseList": [
+                              {
+                                "qosFlowIdentifier": 0
+                              }
+                            ],
+                            "qosFlowFailedToAddOrModifyList": [
+                              {
+                                "qosFlowIdentifier": 63,
+                                "cause": {
+                                  "type": "radioNetwork",
+                                  "value": "unspecified"
+                                }
+                              }
+                            ]
+                          }
+                        }
+                      }
+                    ]
+                  }
+                }
+              ]
+            }
+          }
+        }
+      },
+      "wire_hex": "201a003b000002000a40068001020304050041402a000000267403e0c633640b1122334407f020010db800000000000000000000abcd55667788000000fc00",
+      "wire_sha256": "f84ae4607a7ad8407b6c0f36aa05e1136390d8defd66e7bc8ef783a33caf6f09",
+      "encoded_ies": [
+        {
+          "id": 10,
+          "criticality": "ignore",
+          "value_hex": "800102030405"
+        },
+        {
+          "id": 65,
+          "criticality": "ignore",
+          "value_hex": "000000267403e0c633640b1122334407f020010db800000000000000000000abcd55667788000000fc00"
+        }
+      ],
+      "source_vector": {
+        "path": "crates/opc-proto-ngap/tests/fixtures/n3iwf-modify.json",
+        "sha256": "c3f52cd72f1b724f8540a766ba9e8b3c87eb8221bcbd512dc1aadbbcf6b62661",
+        "collection": "cases",
+        "case": "PDUSessionResourceModifyResponse-missing-85"
+      }
     }
   ]
 }

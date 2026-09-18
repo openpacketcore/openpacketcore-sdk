@@ -69,7 +69,7 @@ operator PLMNs, the RAN name becomes synthetic, and outer procedure criticality
 is corrected to reject. This is not independent Release-18 N3IWF message
 conformance evidence.
 
-`oracles/ngap-rel18-messages.json` adds complete messages for all 15 admitted
+`oracles/ngap-rel18-messages.json` adds complete messages for all 23 qualified
 outcomes, independently encoded with Pycrate 0.8.1. The reference gate extracts
 and compiles all six ASN.1 modules from the exact PDF. Counted layout repairs
 restore wrapped comments and split identifiers; six SHA-256 hashes verify the
@@ -77,12 +77,22 @@ resulting complete schema. No SDK source or encoder supplies reference bytes.
 The checked-in recipes use explicit `hex`, `bits`/`length`, and `type`/`value`
 notation for ASN.1 octets, bit strings, choices and open types.
 
-The 52 cases include complete N3IWF node/location information, IPv4 and IPv6,
+Sixteen cases reuse unchanged positive/negative bytes from the existing
+`n3iwf-ue-requests.json`, `n3iwf-reset.json`, `n3iwf-notify.json` and
+`n3iwf-modify.json` codec corpora. Each `source_vector` pins the corpus SHA-256,
+collection and case name. The independent gate checks byte, field and result
+identity before evaluating the explicit ASN.1 recipe. Runtime applicability
+rules and the published catalog must cover the same qualified outcomes, with
+matching procedure, outcome and direction. Reset, Reset Acknowledge and Error
+Indication have bidirectional matrices. The 17 handler-required outcomes stay
+outside this catalog's qualified inventory.
+
+The 68 cases include complete N3IWF node/location information, IPv4 and IPv6,
 nested session setup/release transfers, partial resource results, absent
 mandatory/conditional fields, duplicates, unknown criticality, reordered IEs,
 malformed nested transfers and caller bounds. Independent mutation tests
 remove every mandatory IE, duplicate every present IE, change each criticality
-and truncate every prefix of the 15 base messages. Re-encoded mutations bypass
+and truncate every prefix of the 23 base messages. Re-encoded mutations bypass
 the digest check and must still fail semantic validation. The report records
 source/tool hashes and actual case counts; hosted CI archives it.
 
@@ -100,13 +110,15 @@ value bytes with the independent encoder's results. It also verifies all
 procedure/outcome variants and raw-preserving output. Each manifest records
 `sdk_structural_outcome` separately: absence of a mandatory field or a malformed
 nested transfer can still pass the SDK's structural decoder. This is an
-explicit runtime gap tracked by #787. The corpus exposed and fixed the SDK's
-acceptance of incorrect procedure criticality.
+explicit structural boundary; typed admission is qualified separately in
+`opc-proto-ngap` (#787). The corpus exposed and fixed the SDK's acceptance of
+incorrect procedure criticality. Constructed containers for all 23 outcomes
+match independently encoded bytes without first decoding an expected PDU.
 
 NAS remains opaque; the mandatory SecurityKey field uses an all-zero synthetic
 placeholder. Neither establishes a NAS procedure, key derivation, authentication
-or a complete AMF exchange. Canonical SDK encoding and full clause 5.3 content
-handling remain unsupported. Paging is inapplicable under clause 5.4.
+or a complete AMF exchange. Full clause 5.3 content handling remains outside
+this catalog's evidence. Paging is inapplicable under clause 5.4.
 Issue 784 continues tracking evidence beyond these boundaries.
 
 ### Running the independent NGAP gate
