@@ -2,7 +2,8 @@
 //!
 //! Values encode without the enclosing ProtocolIE open-type determinant and
 //! can be borrowed by [`crate::ProtocolIe`]. This boundary validates individual
-//! fields, not procedure presence, association authority or application policy.
+//! fields. The optional [`nas`] module admits required fields for three NAS
+//! message outcomes; association authority and application policy stay outside.
 //! Independently qualified generated ASN.1 encoders handle bounded leaf
 //! structures. Explicit receive layout avoids the runtime's TAI alignment
 //! defect; the without-port CHOICE wrapper also needs aligned framing. NAS
@@ -113,6 +114,8 @@ macro_rules! redacted {
         }
     };
 }
+
+pub mod nas;
 
 /// The locally assigned, 32-bit RAN UE NGAP identifier.
 #[derive(Clone, Copy, PartialEq, Eq, Hash)]

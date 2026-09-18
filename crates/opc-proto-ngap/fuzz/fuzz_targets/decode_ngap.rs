@@ -2,6 +2,7 @@
 
 use bytes::Bytes;
 use libfuzzer_sys::fuzz_target;
+use opc_proto_ngap::n3iwf::nas::{NasMessage, UeAggregateBitRate};
 use opc_proto_ngap::n3iwf::{AmfUeId, N3iwfLocation, NasPdu, RanUeId, SecurityKey, TrackingArea};
 use opc_proto_ngap::{encode, Criticality, MessageType, Pdu, ProtocolIe};
 use opc_protocol::{
@@ -48,7 +49,19 @@ fuzz_target!(|data: &[u8]| {
     }
     let nas = NasPdu::new(data).encode(output).unwrap();
     assert!(NasPdu::decode(nas.as_bytes(), decode).unwrap().as_bytes() == data);
+    if let Ok(field) = UeAggregateBitRate::decode(data, decode) {
+        let wire = field.encode(output).unwrap();
+        assert!(UeAggregateBitRate::decode(wire.as_bytes(), decode).unwrap() == field);
+    }
     if let Ok(pdu) = Pdu::decode_owned(Bytes::copy_from_slice(data), decode) {
+        if let Ok(admitted) = NasMessage::from_pdu(&pdu, decode) {
+            let constructed = admitted.message.construct(decode).unwrap();
+            let wire = encode(&constructed, output).unwrap();
+            let received = Pdu::decode_owned(Bytes::from(wire), decode).unwrap();
+            let readmitted = NasMessage::from_pdu(&received, decode).unwrap();
+            assert_eq!(readmitted.ignored_ie_count, 0);
+            assert!(readmitted.notify_ie_ids.is_empty());
+        }
         if let Ok(wire) = encode(&pdu, output) {
             assert_eq!(pdu.wire_len(output).unwrap(), wire.len());
             let received = Pdu::decode_owned(Bytes::from(wire), decode).unwrap();
