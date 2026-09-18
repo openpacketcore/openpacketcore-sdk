@@ -24,7 +24,7 @@
     "synthetic": true,
     "independent_capture": false,
     "referenced_public_vector": null,
-    "notes": "DATA chunk header with PPID 60 and empty user data"
+    "notes": "DATA chunk header with PPID 60, one opaque user-data octet and three alignment octets"
   },
   "sanitized_fields": [
     {

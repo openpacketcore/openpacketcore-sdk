@@ -2,8 +2,8 @@
 
 use libfuzzer_sys::fuzz_target;
 use opc_proto_nas::{
-    decode_mm_message_body, decode_sm_message_body, MobileIdentity, NasMessage,
-    RegistrationAccept, RegistrationRequest, SecurityModeCommand, SecurityModeComplete,
+    decode_mm_message_body, decode_sm_message_body, MobileIdentity, NasMessage, RegistrationAccept,
+    RegistrationRequest, SecurityModeCommand, SecurityModeComplete,
 };
 use opc_protocol::{BorrowDecode, DecodeContext, OwnedDecode, ValidationLevel};
 

@@ -22,7 +22,7 @@
     "synthetic": true,
     "independent_capture": false,
     "referenced_public_vector": null,
-    "notes": "Octet 5 value 0x4f sets reserved bits plus a value that is not a 6-bit QFI-only encoding"
+    "notes": "One-octet construction argument 0x40 means QFI 64; it is rejected before wire encoding and is not a GRE packet"
   },
   "sanitized_fields": [
     {

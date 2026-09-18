@@ -3,6 +3,8 @@
 `opc-n3iwf-fixtures` publishes ten independently consumable synthetic fixture
 inventories. See its [README](../crates/opc-n3iwf-fixtures/README.md) and
 [conformance boundary](../crates/opc-n3iwf-fixtures/CONFORMANCE.md).
+The [SDK work order](n3iwf-work-order.md) maps these prerequisites to the
+implementation queue and existing public work.
 
 ## Layout and interpretation
 

@@ -8,6 +8,9 @@
 | 4 | `09` | QFI 9 |
 | 5..6 | `00 00` | Spare |
 | 7 | `80` or `00` | RQI downlink-only |
-| 8 | `00` | Next-header / payload terminator used by these frames |
+| 8 | `00` | One opaque synthetic user payload octet |
 
-Received nonzero Protocol Type is ignored.
+Received nonzero Protocol Type is ignored. The payload is opaque; no next-header
+or terminator is defined here. The duplicate-key-header case contains one GRE
+header followed by eight opaque payload octets. The bounded-QFI case is the
+construction argument 64, not a packet with malformed spare bits.
