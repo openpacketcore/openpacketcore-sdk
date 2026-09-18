@@ -1,6 +1,6 @@
-# SCTP receive reliability scope
+# SCTP receive ownership and unprotected N2 framing
 
-This document covers the partial receive ownership slice of
+This document covers partial receive ownership and strict unprotected framing in
 [#788](https://github.com/openpacketcore/openpacketcore-sdk/issues/788).
 It does not qualify the complete N2 profile or external interoperability.
 
@@ -39,10 +39,56 @@ until receive, close or drop.
 No new outbound wire encoding or socket option is introduced. Existing SCTP
 association/endpoint APIs, host-order `NGAP_PPID` with network-order ancillary
 conversion, multihoming configuration and readback remain the foundation.
-Strict PPID 60 admission, explicit PPID 66 rejection, default N2 service port,
-typed path/stream lifecycle, exact generation fencing and bounded restart still
-belong to the subsequent N2 profile slice. Ordinary SCTP and address/PPID
+The `n2` module now composes strict PPID 60 admission, PPID 66 DATA rejection
+and the default N2 service port over those primitives. Typed stream lifecycle,
+exact generation fencing and bounded restart remain subsequent work.
+Ordinary SCTP and address/PPID
 metadata establish no cryptographic protection evidence.
+
+## Strict N2 framing scope
+
+`UnprotectedN2Profile` is a backend-neutral record checker;
+`UnprotectedN2Association` consumes the existing SCTP transport and applies the
+checker before exposing received DATA. Its transport cannot be bypassed through
+a raw I/O handle. Both constructed and received bytes remain opaque to this
+module. The existing NGAP codec owns APER and procedure validation.
+
+TS 38.412 V18.1.0 clause 7 specifies big-endian PPID and refers to IANA.
+[IANA's PPID registry](https://www.iana.org/assignments/sctp-parameters/sctp-parameters.xhtml#sctp-parameters-25)
+assigns 60 to NGAP and 66 to NGAP over DTLS/SCTP;
+[the service registry](https://www.iana.org/assignments/service-names-port-numbers/service-names-port-numbers.xhtml?search=ng-control)
+assigns port 38412. The helper supplies this default without replacing an
+explicit caller-selected additional-TNLA port. The profile introduces no RFC
+9260 transport behavior.
+
+| Boundary | Supported behavior | Limit |
+| --- | --- | --- |
+| Constructed DATA | One nonempty bounded PDU, ordered delivery, PPID 60, caller-selected stream | No stream allocation or UE binding |
+| Received DATA | Strict PPID 60, intact payload and ancillary metadata, original stream and association ID | IDs are backend metadata, not generation authority |
+| PPID 66, 0 and other DATA PPIDs | Reject and abort the live adapter | No compatibility mode or DTLS fallback |
+| Notifications | Return a distinct parsed event, including explicit unknown event types | No new association/path/stream state machine or protection evidence |
+| Cancellation | Reuse the socket-owned partial record and receive cap | No extra accumulator or automatic receive deadline |
+| Bounds and close | Retain transport cap; reject empty/oversized DATA; abort on inbound failure or owner drop | Already completed deliveries cannot be retracted |
+| Readback | Delegate local/peer addresses and existing path-health snapshots | No two-association convergence, path authentication or new primary-path policy |
+
+Nonempty DATA, ordered-only admission, rejecting incomplete/inconsistent
+metadata, the caller's size cap and terminal inbound-failure policy are explicit
+SDK profile choices. Notification metadata is checked before event routing;
+notification PPIDs are not interpreted as DATA PPIDs. The adapter serializes
+concurrent receive callers through admission and terminal-close handling, so
+another caller cannot pass that boundary between a rejected record and abort.
+An invalid local outbound
+payload fails before sending without terminating an otherwise live association.
+`Debug` and `N2Error` carry only bounded type/classification text. No raw
+transport error, peer, payload, identifier or configured bound is formatted by
+the new N2 types. Converting an outbound wrapper to a generic SCTP record
+explicitly transfers diagnostic and mutation responsibility to the backend.
+
+The native adapter and checker do not grant current-generation capability.
+Complete #788 acceptance still requires competing-association races, exact
+generation readback, typed stream lifecycle, bounded restart and the composed
+multihoming/failover scenarios. AMF selection and NGAP procedure state remain
+outside transport.
 
 ## Evidence provenance
 
@@ -65,9 +111,28 @@ The reviewed, merged `n2-sctp` fixture subset from
 unchanged. Its wire/metadata inventory does not by itself prove cancellation
 correctness. A later independent byte check found that four metadata vectors
 encode port 38428 while claiming 38412. [PR #896](https://github.com/openpacketcore/openpacketcore-sdk/pull/896)
-corrects those vectors and their semantic checks; its review and merge remain
-prerequisites for new N2 framing qualification. The receive schedules and native
-socket checks here do not depend on those metadata vectors.
+corrected those vectors and their semantic checks and is merged. The N2 tests
+now consume the corrected fixtures and independently compare the literal IANA
+bytes before exercising host/network-order conversions. The referenced wire
+digests are:
+
+| Fixture | SHA-256 |
+| --- | --- |
+| `positive-ppid60-port` | `5262583a7be26feef143c72a913ee5ce748b80e3a280dda93b70a25ebdfb7572` |
+| `unknown-ppid66` | `d930104925fd1c2c1f7418e81c27cb87f77a040e5894f836cb0c18bb342e558d` |
+
+[`n2/tests.rs`](src/n2/tests.rs) covers all 32 single-bit PPID mutations,
+explicit protected/legacy/swapped-endian values, both truncation flags,
+notification/DATA separation, exact stream/association preservation, bounds and
+redaction. The required SCTP CI lane explicitly executes the otherwise ignored
+`n2::tests::native::unprotected_n2_profile` test. It checks live PPID/stream
+metadata, terminal wrong-PPID rejection with two receive callers,
+exact-cap/cap+1 behavior, idle receive
+cancellation followed by a 100,000-byte record, and owner drop while an abort
+handle survives. The pre-existing deterministic receive schedules remain the
+evidence for cancellation after a partial prefix has actually been consumed.
+These are synthetic metadata vectors and Linux loopback checks, not live
+N3IWF/AMF peer captures.
 
 Candidate evidence must retain exact base/head/tree, failing
 baseline and removed-guard results, native checks, required repository gates

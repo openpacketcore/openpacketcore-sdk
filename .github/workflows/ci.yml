@@ -502,6 +502,16 @@ jobs:
           set -euo pipefail
           cargo test --locked -p opc-sctp --test cold_multihoming_netns --no-run
 
+      - name: Require native unprotected N2 framing proof
+        run: |
+          set -euo pipefail
+          n2_proof_log="${RUNNER_TEMP}/sctp-n2-framing.log"
+          cargo test --locked -p opc-sctp --lib -- \
+            --ignored --exact n2::tests::native::unprotected_n2_profile \
+            --nocapture --test-threads=1 2>&1 | tee "${n2_proof_log}"
+          grep -Fq 'native N2 framing assertions completed' "${n2_proof_log}"
+          grep -Fq 'test result: ok. 1 passed; 0 failed;' "${n2_proof_log}"
+
       - name: Require cold primary-down secondary-up SCTP connectx proof
         run: |
           set -euo pipefail

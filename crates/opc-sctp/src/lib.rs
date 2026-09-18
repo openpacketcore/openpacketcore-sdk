@@ -18,6 +18,8 @@
 
 #![forbid(unsafe_code)]
 
+pub mod n2;
+
 #[cfg(target_os = "linux")]
 use std::collections::BTreeMap;
 use std::fmt;
