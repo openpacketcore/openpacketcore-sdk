@@ -16,7 +16,7 @@ internal semantics in the SDK.
 | Layer | Item | Status | Evidence |
 |---|---|---|---|
 | NGAP-PDU framing | All three outcomes | ✅ | Complete messages independently encoded from the Release 18.10 schema |
-| Constructed root containers | 17 admitted outcomes | ✅ | 21 published-corpus construction cases plus 291 independent UE request cases below |
+| Constructed root containers | 20 admitted outcomes | ✅ | 21 published-corpus construction cases, 291 UE request cases and 189 Reset/Error cases below |
 | Constructed length determinants | All three outcomes; short, two-octet and fragmented open types | ✅ | 54 independent Pycrate cases, including inner/outer 128, 16384 and 65536 boundaries |
 | Typed IE mapping | NGSetup Request/Response/Failure | ✅ | Every IE compared with independent reference bytes |
 | Typed IE mapping | InitialUEMessage; Downlink/UplinkNASTransport | ✅ | Complete N3IWF messages, including IPv4/IPv6 location |
@@ -25,6 +25,7 @@ internal semantics in the SDK.
 | Typed IE mapping | PDUSessionResourceRelease Command/Response | ✅ | Nested release transfers |
 | Typed IE mapping | UEContextRelease Command/Complete | ✅ | UE identifier pair and N3IWF location |
 | Typed IE mapping | NASNonDeliveryIndication; UEContextReleaseRequest | ✅ | Independent complete requests, root Causes and session IDs |
+| Typed IE mapping | NGReset; NGResetAcknowledge; ErrorIndication | ✅ | Independent complete messages, fragmented connection lists and root diagnostics |
 | Typed decode | Paging | 🧪 | Initiating-message dispatch with hand-authored empty-IE APER fixture |
 
 Dispatch is outcome-aware: procedure code 21 decodes as NGSetupRequest only
@@ -624,6 +625,76 @@ depth, counts, metadata mutation, truncation and bounded hostile mutations.
 These APIs do not establish UE ownership, prove delivery status, choose local
 procedure triggers, or perform resource release. Remaining #787 procedures and
 live interoperability evidence are still pending.
+
+## Reset and Error Indication
+
+`n3iwf::reset` constructs and admits the three outcomes in TS 38.413 V18.10.0
+8.7.4–8.7.5 and 9.2.6.11–9.2.6.13. Signalling context is an explicit caller
+argument; peer identifier presence does not establish an association.
+
+| Boundary | Required fields and conditions | Optional fields | Required depth |
+| --- | --- | --- | --- |
+| NG Reset (initiating 20/reject) | Cause, Reset Type; non-UE signalling | None | 6 for All; 8 for Part |
+| Reset Acknowledge (successful 20/reject) | Non-UE signalling | Connection list, diagnostics | 5 empty; 7 with connections; up to 8 with diagnostics |
+| Error Indication (initiating 9/ignore) | Cause or diagnostics; both AMF/RAN IDs for UE-associated signalling | AMF/RAN IDs, Cause, diagnostics subject to those rules | 6 without diagnostic items; 8 with items |
+| Connection list | 1–65536 ordered items; either, both or neither ID may be present | AMF/RAN IDs per item | 3 |
+| Reset Type | Explicit All or Part choice | None | 2 for All; 4 for Part |
+| Criticality Diagnostics | Root fields all optional; IE list has 1–256 items when present | Procedure code/outcome/criticality, IE list | 2 without items; 4 with items |
+
+TS 38.413 8.7.4.4 requires receivers to ignore connection items with neither
+identifier and permits acknowledging or omitting them. Admission preserves
+these items, repeated IDs and received order, reports their count, and exposes
+a `nonempty()` receiver view. An all-empty partial list remains Part; it never
+becomes All. Correlating IDs, preserving requested acknowledgement order,
+waiting for release completion and executing resource effects are caller duties.
+There is no Reset unsuccessful outcome.
+
+Diagnostic IE criticality is reject or notify: ignore is explicitly inapplicable
+under 9.3.1.3 even though ASN.1 can encode it. Procedure code and triggering
+outcome belong only in Error Indication diagnostics and reject in Reset
+Acknowledge. Empty root diagnostics are legal; repeated diagnostic IDs retain
+order. Error Indication's known FiveG-S-TMSI IE is explicitly unsupported in
+this subset. All message fields are singleton. Generic unknown/duplicate and
+criticality policies remain authoritative; use the same context for generic
+and semantic admission. Unknown-ignore counts and unknown-notify IDs disclose
+no opaque values. Public field and message Debug output is redacted.
+
+The [independent field corpus](tests/fixtures/n3iwf-reset-fields.json) has 1,093
+cases (1,079 admitted, 14 semantic negatives). It covers ID width boundaries,
+every list count through 256, larger counts and all element-fragment boundaries
+through 65,536, empty/repeated items, diagnostic presence combinations and enum
+roots. The [complete-message corpus](tests/fixtures/n3iwf-reset.json) has 189
+cases (165 admitted, 24 negative), including all root Causes, required and
+conditional fields, signalling context, metadata, policies and canonical output.
+Regenerate with `scripts/generate-ngap-reset-field-fixtures.py` and
+`scripts/generate-ngap-reset-fixtures.py`, each taking `--spec PATH --output PATH`,
+using the pinned Release 18 PDF and reference environment.
+
+Generated probes fail all 366 connection-list encode/decode cases and all 366
+partial Reset cases; generated All encoding/decoding passes. Diagnostics has
+304/360 encode failures and 256/360 decode failures. These fields therefore use
+bounded explicit root layouts that preserve parent bit offsets, with generated
+All retained. Complete physical preflight checks flags, count fragments,
+cumulative `max_ies`, minimal integer widths, zero padding, exact framing and
+remaining depth before vector allocation. Encoding measures exact capacity
+before allocating a zeroized output buffer. The connection-list upper bound
+65,536 requires unconstrained element-count determinants and fragmentation,
+rather than a fixed-width constrained count. Schema and dependencies are unchanged.
+
+Pycrate 0.8.1's plain fragmented SEQUENCE OF encoder calls the missing
+`ASN1CodecPER.encode_pas`. The generators use its unmodified structured
+`to_aper_ws`/`from_aper_ws` path and compare the plain encoder wherever it works;
+`plain_encoder` records those cases. No reference-package patch is used.
+Tests cover all complete maximum-size vectors, malformed/truncated framing,
+nonzero padding and exact/one-short depth, count and byte limits. Fuzz/replay
+compares all successfully admitted values. The 1,282 new seeds comprise 1,274
+complete vectors and eight bounded prefixes for vectors above the fuzz target's
+131,072-byte input limit; the complete large vectors remain ordinary tests.
+
+The new public message variants require downstream exhaustive-match updates.
+Admission does not choose Error Indication triggers, prove transport/UE
+ownership, correlate requests or perform reset actions. Remaining #787
+procedures, optional fields and live interoperability evidence are pending.
 
 ## Fixtures
 

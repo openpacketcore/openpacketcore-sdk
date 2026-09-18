@@ -8,6 +8,9 @@ mod resource_setup;
 #[path = "../../tests/support/ue_requests.rs"]
 mod ue_requests;
 
+#[path = "../../tests/support/reset.rs"]
+mod reset;
+
 use bytes::Bytes;
 use libfuzzer_sys::fuzz_target;
 use opc_proto_ngap::n3iwf::context_fields::{AllowedNssai, Guami, SecurityAlgorithmMasks};
@@ -45,6 +48,7 @@ fuzz_target!(|data: &[u8]| {
         max_message_len: 200_000,
         ..EncodeContext::default()
     };
+    reset::exercise(data, decode, output);
     ue_requests::exercise(data, decode, output);
     resource_setup::exercise(data, decode, output);
     resource_release::exercise(data, decode, output);

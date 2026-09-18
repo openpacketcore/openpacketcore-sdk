@@ -127,6 +127,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `Ikev2SaInitCryptoErrorCode` to `Ikev2ChildSaKeyMaterialDiagnostic`.
 
 ### Added
+- `opc-proto-ngap`: canonical NG Reset, Reset Acknowledge and Error Indication
+  with explicit signalling context, bounded fragmented connection lists and
+  root Criticality Diagnostics. Preserve legal empty/repeated connection items
+  and enforce conditional Error fields and diagnostic applicability, backed by
+  1,282 independent cases. Adds three public message variants; downstream
+  exhaustive matches need updating. Correlation and resource effects remain
+  caller-owned (Refs #787).
 - `opc-proto-ngap`: canonical NAS Non-Delivery Indication and UE Context
   Release Request with required root Cause and optional unique session IDs,
   backed by 548 independent field/message cases. Root Cause now rejects

@@ -134,6 +134,14 @@ NAS stays opaque and borrows contiguous input. Context correlation, deciding whe
 to send a request and resource release remain caller-owned. Root Cause decoding
 now rejects nonzero final padding that the generated decoder previously ignored.
 
+`reset` admits and constructs NG Reset, Reset Acknowledge and Error Indication.
+Callers explicitly supply non-UE or UE-associated signalling context. Partial
+Reset lists preserve order, repeated identifiers and legal empty items;
+`nonempty()` omits items that receivers must ignore. Root diagnostics enforce
+their procedure-specific applicability. Error Indication requires Cause or
+diagnostics, and both UE identifiers for UE-associated signalling. The caller
+chooses procedure triggers, correlates acknowledgements and performs cleanup.
+
 `n3iwf::context_fields` supplies standalone `Guami` and `AllowedNssai` codecs
 and `SecurityAlgorithmMasks` construction. Allowed slices reuse `opc_types::Snssai`;
 the codec validates their wire shape without authorizing any slice. TS 29.413
@@ -153,9 +161,10 @@ Canonical encoding uses explicit aligned-PER container framing instead of
 `rasn` 0.28's misaligned generated inner-container encoder. This includes
 one/two-octet lengths and 16K–64K open-type fragments. It matches the independent
 Release 18 bytes for the 15 published-corpus outcomes, both additional UE request
-procedures, and 54 independent fragmentation boundary cases. The caller supplies already-encoded IE values; typed N3IWF
+procedures, Reset/Reset Acknowledge/Error Indication, and 54 independent
+fragmentation boundary cases. The caller supplies already-encoded IE values; typed N3IWF
 resource transfers and presence rules beyond the documented NAS, release, NG Setup
-and context/session setup, release and UE request subsets remain pending under #787. No
+and context/session setup, release, UE request and Reset/Error subsets remain pending under #787. No
 live AMF exchange or full N3IWF send capability is claimed. Paging remains structurally covered only.
 
 `from_protocol_ies` applies the existing `DecodeContext` policies and checks

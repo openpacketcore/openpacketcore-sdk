@@ -368,3 +368,29 @@ Causes and 297 individual padding mutations qualify the check. This tightens
 malformed input handling across existing procedures. No new handwritten ASN.1
 codec is justified. Context ownership, delivery state, procedure triggers and
 resource release remain caller-owned.
+
+## Reset and Error Indication amendment (2026-09)
+
+Independent Release 18 probes demonstrate failure for all 366 generated
+connection-list encode/decode cases, all 366 partial Reset cases, and 304/360
+Diagnostics encode and 256/360 decode cases. Retain generated Reset All, whose
+independent case passes. Use explicit bounded root layouts only for the failed
+shapes, preserving parent bit offsets and unconstrained element-count
+fragmentation at the connection-list upper bound of 65,536. Validate complete
+physical framing, counts, flags, integer minimality and padding before vector
+allocation; measure exact output size before allocating the zeroized buffer.
+Schema and dependencies remain unchanged.
+
+The oracle's unmodified structured encoder/decoder supplies 1,093 field cases
+and 189 messages. Its plain SEQUENCE OF fragment encoder calls a missing
+`encode_pas`; record that limitation and compare both encoders where the plain
+path works. Do not modify the reference package or use SDK output as an oracle.
+
+Expose optional connection IDs without inventing uniqueness. Preserve legal
+empty items and order, expose a filtered receiver view, and never promote an
+all-empty partial list into Reset All. Require caller-supplied signalling
+context, Error Indication's Cause/diagnostics basis and conditional UE IDs.
+Restrict diagnostic IE criticality to reject/notify and reject Error-only
+diagnostic header fields in Reset Acknowledge. These checks qualify fields;
+the caller still owns correlation, trigger selection, acknowledgement timing
+and resource effects.

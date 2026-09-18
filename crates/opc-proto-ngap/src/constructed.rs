@@ -103,6 +103,9 @@ message_types! {
     InitialUeMessage, Initiating, PROCEDURE_CODE_INITIAL_UE, ignore, INITIAL_UE_MESSAGE;
     DownlinkNasTransport, Initiating, PROCEDURE_CODE_DOWNLINK_NAS_TRANSPORT, ignore, DOWNLINK_NAS_TRANSPORT;
     UplinkNasTransport, Initiating, PROCEDURE_CODE_UPLINK_NAS_TRANSPORT, ignore, UPLINK_NAS_TRANSPORT, 0;
+    NgReset, Initiating, PROCEDURE_CODE_NG_RESET, reject, NG_RESET;
+    NgResetAcknowledge, Successful, PROCEDURE_CODE_NG_RESET, reject, NG_RESET_ACKNOWLEDGE;
+    ErrorIndication, Initiating, PROCEDURE_CODE_ERROR_INDICATION, ignore, ERROR_INDICATION;
     NasNonDeliveryIndication, Initiating, PROCEDURE_CODE_NAS_NON_DELIVERY_INDICATION, ignore, NAS_NON_DELIVERY_INDICATION;
     UeContextReleaseRequest, Initiating, PROCEDURE_CODE_UE_CONTEXT_RELEASE_REQUEST, ignore, UE_CONTEXT_RELEASE_REQUEST, 0;
     InitialContextSetupRequest, Initiating, PROCEDURE_CODE_INITIAL_CONTEXT_SETUP, reject, INITIAL_CONTEXT_SETUP_REQUEST;

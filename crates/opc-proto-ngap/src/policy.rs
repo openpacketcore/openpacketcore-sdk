@@ -230,6 +230,23 @@ pub(super) const PDU_SESSION_RESOURCE_RELEASE_COMMAND: IeProfile = IeProfile::ne
     IeRule::singleton(79, CRITICALITY_REJECT), // id-PDUSessionResourceToReleaseListRelCmd
 ]);
 
+// TS 38.413 V18.10.0 9.2.6.11–13; all entries are singleton.
+pub(super) const NG_RESET: IeProfile = IeProfile::new(&[
+    IeRule::singleton(15, CRITICALITY_IGNORE), // Cause
+    IeRule::singleton(88, CRITICALITY_REJECT), // ResetType
+]);
+pub(super) const NG_RESET_ACKNOWLEDGE: IeProfile = IeProfile::new(&[
+    IeRule::singleton(111, CRITICALITY_IGNORE), // UE-associatedLogicalNG-connectionList
+    IeRule::singleton(19, CRITICALITY_IGNORE),  // CriticalityDiagnostics
+]);
+pub(super) const ERROR_INDICATION: IeProfile = IeProfile::new(&[
+    IeRule::singleton(10, CRITICALITY_IGNORE), // AMF-UE-NGAP-ID
+    IeRule::singleton(85, CRITICALITY_IGNORE), // RAN-UE-NGAP-ID
+    IeRule::singleton(15, CRITICALITY_IGNORE), // Cause
+    IeRule::singleton(19, CRITICALITY_IGNORE), // CriticalityDiagnostics
+    IeRule::singleton(26, CRITICALITY_IGNORE), // FiveG-S-TMSI
+]);
+
 // TS 38.413 V18.10.0 9.2.5.4 and 9.2.2.4; all entries are singleton.
 pub(super) const NAS_NON_DELIVERY_INDICATION: IeProfile = IeProfile::new(&[
     IeRule::singleton(10, CRITICALITY_REJECT), // id-AMF-UE-NGAP-ID
@@ -558,6 +575,9 @@ mod tests {
             INITIAL_UE_MESSAGE,
             DOWNLINK_NAS_TRANSPORT,
             UPLINK_NAS_TRANSPORT,
+            NG_RESET,
+            NG_RESET_ACKNOWLEDGE,
+            ERROR_INDICATION,
             NAS_NON_DELIVERY_INDICATION,
             UE_CONTEXT_RELEASE_REQUEST,
             NG_SETUP_REQUEST,
