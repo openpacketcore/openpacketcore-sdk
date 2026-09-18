@@ -110,6 +110,7 @@ async fn replicated_audit_lost_intent_and_commit_acks_survive_leader_change() {
         }
     }
     cluster.isolate(leader);
+    #[cfg(feature = "dangerous-test-hooks")]
     cluster.stores[follower]
         .trigger_election_for_test()
         .await
