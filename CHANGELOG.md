@@ -8,6 +8,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- `opc-n3iwf-fixtures`: bind 22 unchanged independent N3 packet vectors into
+  the catalog, covering both downlink RQI values, all absent/present PPI values
+  and QFI boundaries in both directions. Check source provenance separately
+  from regeneration and execute the shared PSC codec (Refs #784).
 - `opc-sctp`: add an explicitly unprotected N2 profile and live adapter with
   strict PPID 60, the default NGAP service port, bounded ordered records,
   separate notification delivery and redacted diagnostics. Reuse existing

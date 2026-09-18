@@ -31,10 +31,24 @@ fn every_gtpu_wire_obeys_its_codec_contract() {
                 .expect("extensions");
             assert_eq!(extensions.len(), 1);
             let psc = PduSessionContainer::decode(&extensions[0]).expect("PSC");
-            assert_eq!(psc.qfi, 9);
-            assert_eq!(psc.pdu_type, u8::from(name == "positive-ul-psc"));
-            assert!(!psc.rqi);
-            assert_eq!(psc.ppi, None);
+            if let Some(expected) = manifest.context.get("psc") {
+                assert_eq!(u64::from(psc.qfi), expected["qfi"].as_u64().expect("QFI"));
+                assert_eq!(
+                    u64::from(psc.pdu_type),
+                    expected["pdu_type"].as_u64().expect("PSC type")
+                );
+                assert_eq!(psc.rqi, expected["rqi"].as_bool().expect("RQI"));
+                assert_eq!(psc.ppi.map(u64::from), expected["ppi"].as_u64());
+                assert!(
+                    message.payload == [0xaa, 0xbb, 0xcc],
+                    "synthetic payload changed"
+                );
+            } else {
+                assert_eq!(psc.qfi, 9);
+                assert_eq!(psc.pdu_type, u8::from(name == "positive-ul-psc"));
+                assert!(!psc.rqi);
+                assert_eq!(psc.ppi, None);
+            }
         } else {
             let result = GtpuControlMessage::decode_datagram(wire, context);
             if manifest.expected_outcome == "reject" {

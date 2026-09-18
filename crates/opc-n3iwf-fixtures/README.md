@@ -19,7 +19,7 @@ independently with `FixtureCatalog::load_subset_from(root, subset)`.
 | `ngap` | Independent complete Release 18.10 messages for all 23 qualified outcomes, IE matrices, nested transfers and SDK structural decode |
 | `n2-sctp` | PPID 60/port 38412 metadata and a DATA chunk with opaque user data |
 | `gre-qfi` | GRE header, QFI/RQI fields, opaque trailing payload, QFI constructor bound |
-| `n3-gtpu` | Existing SDK GTP-U codecs: Echo, Recovery, PSC, End Marker |
+| `n3-gtpu` | Existing SDK codecs: Echo/Recovery/End Marker, direction-specific PSC, and 22 independently authored packets covering both RQI values, all PPI values and QFI boundaries |
 | `protocol-key` | Independent synthetic IKE AUTH known answers; separate consume/cancel/drop reference scenarios |
 | `nas-tcp` | Two-octet length, caller bounds, partial reads/EOF, opaque inner NAS |
 | `xfrm-roster` | Synthetic SPI roster records and explicit provenance/relocation preconditions |

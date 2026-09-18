@@ -161,6 +161,33 @@ fn n3_covers_direction_specific_psc_and_recovery() {
             .any(|value| value == "received_recovery_ignored=true");
     }
     assert!(dl && ul && recovery);
+    let observed: BTreeSet<_> = catalog
+        .manifests()
+        .filter(|(manifest, _)| manifest.subset == "n3-gtpu")
+        .filter_map(|(manifest, _)| {
+            let field = manifest.context.get("psc")?;
+            Some((
+                field["pdu_type"].as_u64().expect("PSC type"),
+                field["qfi"].as_u64().expect("QFI"),
+                field["rqi"].as_bool().expect("RQI"),
+                field["ppi"].as_u64(),
+            ))
+        })
+        .collect();
+    let mut expected = BTreeSet::new();
+    for rqi in [false, true] {
+        for ppi in std::iter::once(None).chain((0..8).map(Some)) {
+            expected.insert((0, 9, rqi, ppi));
+        }
+    }
+    for qfi in [0, 63] {
+        expected.insert((0, qfi, true, Some(7)));
+        expected.insert((1, qfi, false, None));
+    }
+    assert!(
+        observed == expected,
+        "missing independently bound RQI/PPI fixture coverage"
+    );
 }
 
 #[test]

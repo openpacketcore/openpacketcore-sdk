@@ -221,3 +221,16 @@ squashing/rebasing requires restamping before the final gate.
 Round trips alone do not prove external interoperability. The independent
 known answers prove only the declared cryptographic calculations. These gates
 do not prove live dataplane, authenticated transport or kernel state.
+
+## N3 PSC field catalog increment — 2026-09-18
+
+The N3 subset reuses 22 unchanged packet cases from
+`crates/opc-gtpu-dataplane/tests/n3_reference.tsv`. QFI 9 covers both RQI values
+and all absent/present PPI values; QFI 0/63 also cover both directions. The
+manifest context pins the independent source path, SHA-256 and case, and
+records the expected PSC fields. `scripts/n3iwf_gtpu_reference.py` checks that
+binding independently from the fixture writer and is required by the catalog
+gate. Python regressions reject changed wire with a refreshed local digest,
+source substitutions and false field/direction/provenance claims. Existing
+GTP-U codecs execute the records. No forwarding, installation or backend
+capability is implied; `runtime_claim=false` remains mandatory.

@@ -1,0 +1,63 @@
+{
+  "encoding": "protocol-wire",
+  "validation_scope": "gtpu-message",
+  "context": {
+    "max_message_len": 65535,
+    "unknown_ie_policy": "reject",
+    "psc": {
+      "pdu_type": 0,
+      "qfi": 9,
+      "rqi": true,
+      "ppi": 4
+    },
+    "source_vector": {
+      "path": "crates/opc-gtpu-dataplane/tests/n3_reference.tsv",
+      "sha256": "31da0a1658218432817bc181be4233fadd4fd1f36c36f3d29f087bc131b8424a",
+      "case": "dl-9-1-4"
+    }
+  },
+  "sdk_fixture_id": "opc.n3iwf.n3-gtpu.v1.reference-dl-9-1-4",
+  "subset": "n3-gtpu",
+  "case_class": "positive",
+  "source": {
+    "document": "3GPP TS 38.415",
+    "release": "V18.2.0",
+    "clauses": [
+      "5.5.2",
+      "5.5.3.1-7",
+      "TS 29.281 V18.4.0 5.1/5.2.1/5.2.2.7"
+    ]
+  },
+  "direction": "n3-downlink",
+  "role": "upf-to-n3iwf",
+  "prerequisite": "Existing shared PSC codec; packet reception does not install or authorize forwarding",
+  "provenance": {
+    "class": "referenced-public-vector",
+    "synthetic": true,
+    "independent_capture": false,
+    "referenced_public_vector": "crates/opc-gtpu-dataplane/tests/n3_reference.tsv#dl-9-1-4",
+    "notes": "Exact independently authored synthetic N3 packet; source digest and case are checked separately from catalog regeneration. No packet capture or live forwarding claim."
+  },
+  "sanitized_fields": [
+    {
+      "name": "identifiers",
+      "treatment": "documentation-range-or-reserved-test",
+      "value_class": "synthetic"
+    }
+  ],
+  "wire": {
+    "path": "wire/reference-dl-9-1-4.hex",
+    "digest_sha256": "ef9c3271e5a505d0d017819106f08b12db4a04e496da8235ba9586648eefd82e"
+  },
+  "semantic_assertions": [
+    "direction=downlink",
+    "pdu_type=0",
+    "qfi=9",
+    "rqi=1",
+    "ppi=4",
+    "payload=opaque-synthetic",
+    "forwarding_claim=false"
+  ],
+  "expected_outcome": "receive",
+  "runtime_claim": false
+}
