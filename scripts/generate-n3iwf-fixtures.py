@@ -472,7 +472,7 @@ NGAP_IE_MATRICES: list[dict] = [
         "direction": "amf-to-n3iwf",
         "ts29413_clause": "5.2",
         "admitted_disposition": "receive",
-        "clauses_38413": ["9.2.2.4"],
+        "clauses_38413": ["9.2.2.5"],
         "wire_fixture_id": "opc.n3iwf.ngap.v1.receive-empty-ue-context-release-command",
         "emit_empty_wrapper": True,
     },
@@ -485,7 +485,7 @@ NGAP_IE_MATRICES: list[dict] = [
         "direction": "n3iwf-to-amf",
         "ts29413_clause": "5.2",
         "admitted_disposition": "receive",
-        "clauses_38413": ["9.2.2.5"],
+        "clauses_38413": ["9.2.2.6"],
         "wire_fixture_id": "opc.n3iwf.ngap.v1.receive-empty-ue-context-release-complete",
         "emit_empty_wrapper": True,
     },
@@ -1725,11 +1725,11 @@ AMF selection or subscriber policy is claimed.
 
 
 def n2_sctp(subset_dir: Path) -> list[dict]:
-    positive = "00 00 00 3c 96 1c"
+    positive = "00 00 00 3c 96 0c"
     data = "00 03 00 11 00 00 00 01 00 00 00 00 00 00 00 3c 00 00 00 00"
-    unknown = "00 00 00 42 96 1c"
-    duplicate = "00 00 00 3c 96 1c 00 00 00 3c 96 1c"
-    ordered = "96 1c 00 00 00 3c"
+    unknown = "00 00 00 42 96 0c"
+    duplicate = "00 00 00 3c 96 0c 00 00 00 3c 96 0c"
+    ordered = "96 0c 00 00 00 3c"
     malformed = "00 00 00 3c"
     truncated = "00 00 00"
     overflow = "00 00 00 3c ff ff"
@@ -1774,7 +1774,7 @@ def n2_sctp(subset_dir: Path) -> list[dict]:
             role="n3iwf",
             prerequisite="Ordinary SCTP DATA chunk; NGAP bytes are out of band",
             provenance_class="spec-authored",
-            notes="DATA chunk header with PPID 60 and empty user data",
+            notes="DATA chunk header with PPID 60, one opaque user-data octet and three alignment octets",
             referenced=None,
             sanitized=SYN_ID,
             wire_name="positive-data-chunk",
@@ -1804,7 +1804,7 @@ def n2_sctp(subset_dir: Path) -> list[dict]:
             sanitized=SYN_ID,
             wire_name="unknown-ppid66",
             wire_hex=unknown,
-            assertions=["ppid=66", "non_dtls_profile=unsupported"],
+            assertions=["ppid=66", "port=38412", "non_dtls_profile=unsupported"],
             outcome="unsupported",
         ),
         manifest(
@@ -1823,7 +1823,12 @@ def n2_sctp(subset_dir: Path) -> list[dict]:
             sanitized=SYN_ID,
             wire_name="duplicate-association-tuple",
             wire_hex=duplicate,
-            assertions=["duplicate_tuple=true"],
+            assertions=[
+                "ppid=60",
+                "port=38412",
+                "tuple_count=2",
+                "duplicate_tuple=true",
+            ],
             outcome="caller-policy",
         ),
         manifest(
@@ -1842,7 +1847,7 @@ def n2_sctp(subset_dir: Path) -> list[dict]:
             sanitized=SYN_ID,
             wire_name="ordering-port-before-ppid",
             wire_hex=ordered,
-            assertions=["metadata_order=port-then-ppid"],
+            assertions=["ppid=60", "port=38412", "metadata_order=port-then-ppid"],
             outcome="receive",
         ),
         manifest(
@@ -1894,7 +1899,7 @@ def n2_sctp(subset_dir: Path) -> list[dict]:
             role="n3iwf",
             prerequisite="Caller port-width bound",
             provenance_class="synthetic-negative",
-            notes="Port field encoded as 0xffff after PPID; still a 16-bit value, used as overflow sentinel for a 15-bit caller bound",
+            notes="Port 65535 is a valid dynamic port but exceeds this fixture caller maximum of 65534",
             referenced=None,
             sanitized=SYN_ID,
             wire_name="bounded-port-overflow",
@@ -1910,6 +1915,13 @@ def n2_sctp(subset_dir: Path) -> list[dict]:
         "N2 SCTP fixture subset",
         """Non-DTLS N2 profile: PPID 60 and port 38412. Ordinary SCTP metadata is
 not cryptographic protection. PPID 66 is reserved for `n2-dtls`.
+
+Correction (2026-09-17): metadata tuples now encode the claimed default port
+as `96 0c` (38412). Their previous `96 1c` encoded 38428. Independent numeric
+port and PPID checks cover both metadata orders and every duplicated tuple;
+DATA checks also compare the claimed user-data length. This correction changes
+four wire files and their digests without promoting any runtime claim. The
+65535 negative remains a caller-selected bound test, not an invalid port claim.
 """,
     )
     write_completion(

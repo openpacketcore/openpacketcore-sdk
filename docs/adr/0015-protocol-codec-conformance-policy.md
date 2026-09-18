@@ -86,3 +86,13 @@ GRE forwarding would require a separate declared contract and qualification.
 - `opc-proto-gtpu`, `opc-proto-pfcp`, and `opc-proto-nas` conform today and
   serve as the templates; future codecs (NGAP per ADR 0013) inherit the
   same bar.
+
+## N2 numeric fixture claims — 2026-09-17
+
+A well-formed, digest-consistent N2 metadata vector encoded 38428 while its
+manifest claimed the registered service port 38412. Correct the bytes and
+require independent numeric claim checks, including every metadata tuple and
+DATA length. A passing disposition or writer reproduction is insufficient when
+an asserted field was never compared with the bytes. The amended fixture
+publication records the correction without granting runtime or interoperability
+claims; consumer qualification requires its review and merge (Refs #784, #788).

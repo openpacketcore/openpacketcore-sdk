@@ -305,7 +305,7 @@ fn ngap_matrices_use_pinned_release18_rows_supported_by_policy_rs() {
             .iter()
             .find(|(message, _)| *message == matrix.message)
             .map(|(_, name)| *name)
-            .expect("declared NGAP message profile");
+            .expect("matrix outcome is admitted");
         let marker = format!("const {const_name}: IeProfile");
         let start = policy.find(&marker).expect(const_name);
         let rest = &policy[start..];

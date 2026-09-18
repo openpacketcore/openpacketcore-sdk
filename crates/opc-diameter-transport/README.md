@@ -3,6 +3,25 @@
 `opc-diameter-transport` provides the mutually authenticated TLS/TCP and
 DTLS/SCTP transport boundary for the Diameter codec and peer state machine.
 
+It also exposes `rfc6083::{Transport, Connector, Acceptor, Connection}` for
+opaque direct DTLS/SCTP application records independently of Diameter.
+`ExpectedPeer` pins an exact SPIFFE ID; `Policy::ordered_stream_zero` selects
+protected PPID 47 or 66 and a finite plaintext limit. The carrier consumes a
+pristine SCTP-AUTH DATA association, and only a successful mutual handshake
+can return a protected connection. This API requires no `PeerSession`,
+Diameter identity or CER/CEA. The existing Diameter API retains its procedure
+admission and PPID 47 behavior.
+
+This initial generic profile supports reliable ordered stream zero only.
+Nonzero or unordered receive metadata and plaintext PPID 60 are terminal
+errors. The connection has sequential `send`/`receive`, a consuming reciprocal
+`close`, and borrowed negotiated `readback`; cancellation after an operation
+starts closes the carrier. Readback and successful delivery reconcile both
+credential retirement and observed carrier termination. It does not provide
+the complete NGAP stream or 3GPP certificate/revocation profile, in-place
+renegotiation, or new restart/multihoming guarantees. See the exact support and
+verification boundaries in [the generic RFC 6083 contract](../../docs/rfc6083-generic-transport.md).
+
 ## Implemented boundary
 
 - Direct TLS/TCP completes mutually authenticated TLS 1.3 before any Diameter

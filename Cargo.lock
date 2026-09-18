@@ -3409,8 +3409,12 @@ version = "0.2.0"
 dependencies = [
  "bytes",
  "opc-protocol",
+ "opc-types",
  "rasn",
+ "serde_json",
+ "sha2 0.11.0",
  "thiserror 2.0.20",
+ "zeroize",
 ]
 
 [[package]]

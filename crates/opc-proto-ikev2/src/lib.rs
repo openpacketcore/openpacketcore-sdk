@@ -34,6 +34,10 @@
 //! Child SA installation, XFRM
 //! programming, or any product-specific 3GPP ePDG policy.
 //!
+//! The separate [`nwu`] module adds bounded TS 24.502 configuration, QoS,
+//! opened creation/modification/deletion and caller-ordered AEAD selection.
+//! Authenticated MOBIKE address updates remain outside that payload profile.
+//!
 //! Network decoders follow RFC 7296 receiver rules through
 //! [`Ikev2ValidationProfile::NetworkReceive`]: sender-zero reserved fields and
 //! higher minor versions are ignored without weakening structural, critical
@@ -85,6 +89,7 @@ pub mod message;
 pub mod nat_detection;
 pub mod nat_traversal;
 pub mod notify;
+pub mod nwu;
 pub mod payload;
 pub mod pcscf_restoration;
 pub mod pre_admission;

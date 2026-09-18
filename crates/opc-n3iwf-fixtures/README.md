@@ -49,6 +49,11 @@ checkout; this API does not sandbox a concurrently hostile filesystem.
 The repository gate adds read-only regeneration, independent envelope/scenario
 oracles, existing SDK codec tests, and verification of Git publication history.
 The Python reference oracles never import the fixture writer.
+For N2 metadata, the oracle checks each claimed numeric port/PPID in both
+field orders and every repeated tuple. Independent Python and Rust checks
+anchor the default service port to IANA's decimal 38412 (`96 0c`). DATA claims
+are compared with the actual PPID and user-data length. A corrected digest
+alone cannot make an inconsistent numeric claim pass.
 The complete NGAP gate compiles all six ASN.1 modules from the hash-pinned
 ETSI publication with Pycrate, a separate implementation from the SDK's
 `rasn` codec. It compares every SDK-decoded IE's identifier, criticality and

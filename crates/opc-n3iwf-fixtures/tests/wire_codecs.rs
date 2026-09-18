@@ -104,3 +104,31 @@ fn ngap_dispatch_is_structural_and_rejects_malformed_containers() {
         }
     }
 }
+
+#[test]
+fn n2_sctp_metadata_uses_iana_service_port_in_each_order() {
+    let catalog = FixtureCatalog::load().expect("catalog");
+    let mut tuples = 0;
+    for (manifest, wire) in catalog.manifests().filter(|(manifest, _)| {
+        manifest.subset == "n2-sctp"
+            && manifest.encoding == "metadata-record"
+            && manifest.expected_outcome != "reject"
+    }) {
+        let port_first = manifest.context["layout"] == "port-ppid";
+        let (chunks, tail) = wire.as_chunks::<6>();
+        assert!(tail.is_empty(), "complete N2 metadata tuples");
+        for tuple in chunks {
+            let bytes = if port_first { &tuple[..2] } else { &tuple[4..] };
+            let port = u16::from_be_bytes([bytes[0], bytes[1]]);
+            assert!(
+                port == 38412,
+                "N2 golden tuple must use the IANA service port"
+            );
+            tuples += 1;
+        }
+    }
+    assert_eq!(
+        tuples, 5,
+        "four metadata cases include one duplicated tuple"
+    );
+}
