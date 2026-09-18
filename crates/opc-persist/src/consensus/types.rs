@@ -33,19 +33,20 @@ pub(crate) const ATOMIC_CONFIG_CONSENSUS_COMMAND_VERSION: u16 = 2;
 ///
 /// Revision 2 added atomic commit-confirmed resolution and recovery-fence
 /// clearing. Revision 3 adds an inline named rollback point to an appended
-/// encrypted record. Revision 4 adds authenticated history retention. Older
+/// encrypted record. Revision 4 adds authenticated history retention. Revision 5
+/// adds the replicated management ledger and audited configuration effects. Older
 /// commands remain readable under their original
 /// semantics so existing durable logs can be replayed after upgrade.
-pub const CONFIG_CONSENSUS_COMMAND_VERSION: u16 = 4;
+pub const CONFIG_CONSENSUS_COMMAND_VERSION: u16 = 5;
 /// Current SQLite authority schema revision.
-pub const CONFIG_CONSENSUS_STORAGE_VERSION: u16 = 2;
+pub const CONFIG_CONSENSUS_STORAGE_VERSION: u16 = 3;
 /// Current config snapshot envelope revision.
-pub const CONFIG_CONSENSUS_SNAPSHOT_VERSION: u16 = 2;
+pub const CONFIG_CONSENSUS_SNAPSHOT_VERSION: u16 = 3;
 /// Current config-specific RPC payload revision.
 ///
-/// Revision 4 carries the revision-4 command admission contract. Peers require
+/// Revision 5 carries the revision-5 command admission contract. Peers require
 /// an exact match and do not negotiate a downgrade.
-pub const CONFIG_CONSENSUS_WIRE_VERSION: u16 = 4;
+pub const CONFIG_CONSENSUS_WIRE_VERSION: u16 = 5;
 
 /// Maximum configured voter count admitted by the config consensus adapter.
 pub const CONFIG_CONSENSUS_MAX_MEMBERS: usize = 9;
@@ -341,6 +342,10 @@ pub(crate) enum ConfigMutationIntent {
     ClearRecoveryRequired { tx_id: TxId },
     /// Explicit acknowledged-prefix retention under exact-head authority.
     RetainHistory(super::ConfigHistoryRetention),
+    /// Purpose-separated management ledger, with no configuration version change.
+    ManagementAudit(super::audit::AuditCommand),
+    /// Exact configuration effect and recoverable audit outcome, applied atomically.
+    AuditedMutation(super::PreparedAuditedMutation),
 }
 
 impl ConfigMutationIntent {
@@ -352,7 +357,8 @@ impl ConfigMutationIntent {
             Self::ResolveConfirmedAndAppend { .. } | Self::ClearRecoveryRequired { .. } => {
                 ATOMIC_CONFIG_CONSENSUS_COMMAND_VERSION
             }
-            Self::RetainHistory(_) => CONFIG_CONSENSUS_COMMAND_VERSION,
+            Self::RetainHistory(_) => 4,
+            Self::ManagementAudit(_) | Self::AuditedMutation(_) => 5,
         }
     }
 
@@ -364,7 +370,9 @@ impl ConfigMutationIntent {
             Self::MarkConfirmed { .. }
             | Self::CreateRollbackPoint { .. }
             | Self::ClearRecoveryRequired { .. }
-            | Self::RetainHistory(_) => Ok(None),
+            | Self::RetainHistory(_)
+            | Self::ManagementAudit(_)
+            | Self::AuditedMutation(_) => Ok(None),
         }
     }
 }
@@ -443,6 +451,7 @@ impl ConfigConsensusCommand {
                     && !has_inline_rollback_label
             }
             3 => self.intent.minimum_command_version() <= 3,
+            4 => self.intent.minimum_command_version() <= 4,
             CONFIG_CONSENSUS_COMMAND_VERSION => true,
             _ => false,
         };
@@ -458,6 +467,14 @@ impl ConfigConsensusCommand {
                 validate_confirmed_resolution(&commit.record, *resolution)?;
             }
             ConfigMutationIntent::RetainHistory(retention) => retention.validate()?,
+            ConfigMutationIntent::ManagementAudit(_) => {}
+            ConfigMutationIntent::AuditedMutation(prepared) => {
+                let nested = Self {
+                    intent: prepared.effect.intent(),
+                    ..self.clone()
+                };
+                nested.validate(identity)?;
+            }
             ConfigMutationIntent::ClearRecoveryRequired { .. } => {}
             ConfigMutationIntent::MarkConfirmed { .. } => {}
             ConfigMutationIntent::CreateRollbackPoint { label, .. } => {
@@ -520,6 +537,9 @@ pub(crate) struct ConfigConsensusResponse {
     pub(crate) logical_time: Option<Timestamp>,
     /// Openraft log index that applied the original request.
     pub(crate) raft_log_index: u64,
+    /// Authenticated audit state from the same transaction, if this command
+    /// concerned a retained operation. Not a second read or client assertion.
+    pub(crate) audit_receipt: Option<crate::audit_authority::receipt::AuthenticatedAuditReceipt>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -810,7 +830,7 @@ mod tests {
 
     #[test]
     fn config_wire_revision_is_independent_and_exact() {
-        assert_eq!(4, CONFIG_CONSENSUS_WIRE_VERSION);
+        assert_eq!(5, CONFIG_CONSENSUS_WIRE_VERSION);
         let current = encode_config_wire(&7_u64).expect("current wire");
         assert_eq!(
             7,
@@ -867,11 +887,18 @@ mod tests {
             intent: ConfigMutationIntent::RetainHistory(retention.clone()),
         };
         assert!(command.validate(identity).is_ok());
-        for schema_version in 1..CONFIG_CONSENSUS_COMMAND_VERSION {
+        for schema_version in 1..4 {
             command.schema_version = schema_version;
             assert!(command.validate(identity).is_err());
         }
+        command.schema_version = 4;
+        assert!(command.validate(identity).is_ok());
+        let original_digest = command.payload_digest().expect("revision-four digest");
         command.schema_version = CONFIG_CONSENSUS_COMMAND_VERSION;
+        assert_eq!(
+            original_digest,
+            command.payload_digest().expect("current digest")
+        );
         let original = serde_json::to_value(retention).expect("received decision");
         for limits in [
             serde_json::json!({"max_records": 1, "max_bytes": 1_048_576}),
@@ -893,8 +920,37 @@ mod tests {
     }
 
     #[test]
+    fn management_audit_requires_revision_five_without_reinterpreting_old_commands() {
+        let identity = ConfigConsensusIdentity::new(
+            ConfigConsensusClusterId::new("management-audit-revision-test").unwrap(),
+            ConfigConsensusConfigurationId::from_bytes([0xC5; 32]),
+            ConfigConsensusConfigurationEpoch::new(1).unwrap(),
+        );
+        let mut command = ConfigConsensusCommand {
+            schema_version: 5,
+            identity,
+            request_id: ConfigConsensusRequestId::from_bytes([0xC6; 16]),
+            logical_time: Timestamp::now_utc(),
+            intent: ConfigMutationIntent::ManagementAudit(
+                super::super::audit::AuditCommand::Initialize {
+                    projection: crate::audit_authority::AuditToken::from_keyed_projection(
+                        [0xC7; 32],
+                    )
+                    .unwrap(),
+                    limits: crate::audit_authority::AuditLedgerLimits::new(3, 1).unwrap(),
+                },
+            ),
+        };
+        assert!(command.validate(identity).is_ok());
+        for revision in 1..5 {
+            command.schema_version = revision;
+            assert!(command.validate(identity).is_err());
+        }
+    }
+
+    #[test]
     fn older_persisted_commands_decode_but_cannot_claim_newer_intents() {
-        assert_eq!(4, CONFIG_CONSENSUS_COMMAND_VERSION);
+        assert_eq!(5, CONFIG_CONSENSUS_COMMAND_VERSION);
         let identity = ConfigConsensusIdentity::new(
             ConfigConsensusClusterId::new("config-command-v1-replay-test").expect("cluster"),
             ConfigConsensusConfigurationId::from_bytes([0xB1; 32]),

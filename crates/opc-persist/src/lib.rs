@@ -98,6 +98,8 @@
 // The crate is fully safe Rust. Filesystem checks use safe shell-out commands
 // (stat, df, python3) rather than libc FFI.
 
+/// Replicated management-audit privacy and operation contracts.
+pub mod audit_authority;
 mod backend;
 pub mod break_glass;
 mod consensus;
