@@ -13,6 +13,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   replacement, shutdown and multihoming failover qualification (Refs #788).
 
 ### Added
+- `opc-n3iwf-fixtures`: execute 25 independently authored protocol-key custody
+  schedules through the existing SDK API, including generation/reuse/drop and
+  cancellation boundaries. Bind successful use to both synthetic AUTH answers
+  and distinguish private pre-release zeroization evidence (Refs #784).
 - `opc-proto-ngap`: construct and admit optional Allowed NSSAI in Initial UE
   and Downlink NAS messages and optional Old AMF in Downlink NAS. Both messages
   also admit Partially Allowed NSSAI with combined count/disjointness checks;

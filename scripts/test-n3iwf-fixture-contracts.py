@@ -16,6 +16,7 @@ from unittest import mock
 import n3iwf_fixture_oracles as oracle
 import n3iwf_key_reference as key_reference
 import n3iwf_gtpu_reference as gtpu_reference
+import n3iwf_key_lifecycle_reference as key_lifecycle
 
 ROOT = Path(__file__).resolve().parents[1]
 FIXTURES = ROOT / "crates/opc-n3iwf-fixtures/fixtures"
@@ -26,6 +27,48 @@ def wire(subset, name):
 
 
 class WireRegressions(unittest.TestCase):
+    def test_custody_catalog_cannot_rewrite_the_authored_schedule(self):
+        original = json.loads((FIXTURES / "protocol-key/custody-consume-once.json").read_text())
+        data = wire("protocol-key", "custody-consume-once")
+        key_lifecycle.validate(original, data)
+        for mutation, reason in (
+            ("path", "custody-reference-path"), ("digest", "custody-reference-digest"),
+            ("case", "custody-reference-case"), ("wire", "custody-reference-wire"),
+            ("key_recipe", "custody-reference-context"), ("sdk_custody_validation", "custody-reference-context"),
+            ("sdk_bool_type", "custody-reference-context"), ("live_peer_validation", "custody-reference-context"),
+            ("public_memory_erasure_observation", "custody-reference-context"),
+            ("scope", "custody-reference-scope"), ("authority", "custody-reference-authority"),
+            ("claims", "custody-reference-claims"), ("direction", "custody-reference-direction"),
+            ("provenance", "custody-reference-provenance"), ("outcome", "custody-reference-outcome"),
+            ("runtime_claim", "custody-reference-outcome"),
+        ):
+            with self.subTest(mutation=mutation):
+                changed = json.loads(json.dumps(original))
+                payload = data
+                source = changed["context"]["source_vector"]
+                if mutation == "path": source["path"] = "../outside.json"
+                elif mutation == "digest": source["sha256"] = "0" * 64
+                elif mutation == "case": source["case"] = "release"
+                elif mutation == "wire":
+                    schedule = json.loads(data)
+                    schedule["steps"][-1]["expect"] = "ok"
+                    payload = key_lifecycle.wire(schedule)
+                    changed["wire"]["digest_sha256"] = hashlib.sha256(payload).hexdigest()
+                elif mutation == "key_recipe": changed["context"][mutation] = "caller-key"
+                elif mutation == "sdk_custody_validation": changed["context"][mutation] = False
+                elif mutation == "sdk_bool_type": changed["context"]["sdk_custody_validation"] = 1
+                elif mutation in ("live_peer_validation", "public_memory_erasure_observation"):
+                    changed["context"][mutation] = True
+                elif mutation == "scope": changed["validation_scope"] = "handle-lifecycle-contract"
+                elif mutation == "authority": changed["source"]["clauses"][-1] = "RFC wire generation policy"
+                elif mutation == "claims": changed["semantic_assertions"][-1] = "public_memory_erasure_observation=true"
+                elif mutation == "direction": changed["direction"] = "ue-to-n3iwf"
+                elif mutation == "provenance": changed["provenance"]["independent_capture"] = True
+                elif mutation == "outcome": changed["expected_outcome"] = "receive"
+                else: changed["runtime_claim"] = True
+                with self.assertRaisesRegex(key_lifecycle.Invalid, "^" + reason + "$"):
+                    key_lifecycle.validate(changed, payload)
+
     def test_psc_catalog_cannot_replace_independent_source_evidence(self):
         original = json.loads((FIXTURES / "n3-gtpu/reference-dl-9-1-7.json").read_text())
         data = wire("n3-gtpu", "reference-dl-9-1-7")

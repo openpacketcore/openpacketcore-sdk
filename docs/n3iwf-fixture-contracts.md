@@ -234,3 +234,21 @@ gate. Python regressions reject changed wire with a refreshed local digest,
 source substitutions and false field/direction/provenance claims. Existing
 GTP-U codecs execute the records. No forwarding, installation or backend
 capability is implied; `runtime_claim=false` remains mandatory.
+
+## Protocol-key lifecycle catalog increment — 2026-09-18
+
+The `protocol-key-lifecycle` scope separates executable SDK schedules from the
+legacy labels. Twenty-five records cover generation/operation binding, consume
+once, invalid handoffs/inputs, drop, cancellation and concurrent use. The wire
+files contain bounded JSON action records, not keys or IKE packets. The test
+executor imports only the zero synthetic placeholder and compares every
+successful result with both independently authored AUTH answers. Numeric local
+generations and operation identifiers are SDK policy, not wire requirements.
+
+The independent schedule recipe pins the SDK contract, its private audit source
+and the original AUTH corpus by SHA-256. A separate gate checks all source,
+wire, context and provenance claims, including changed expected results with
+refreshed wire digests. The existing private pre-release zeroization audit is
+executed separately from public-handle schedules. Neither proves hardware
+custody or live-peer authentication. Remaining transport and roster fixture
+qualification still keeps #784 open.

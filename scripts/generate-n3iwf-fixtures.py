@@ -2673,6 +2673,44 @@ def protocol_key_known_answers(subset_dir: Path) -> list[dict]:
     return fixtures
 
 
+
+def protocol_key_lifecycle(subset_dir: Path) -> list[dict]:
+    source = "crates/opc-n3iwf-fixtures/oracles/key-lifecycle.json"
+    digest = "f6328da8ee70fd01cf642ebd334cb59a0900ffbb0ce59378b22d922867f79e14"
+    path = ROOT / source
+    if path.is_symlink() or hashlib.sha256(path.read_bytes()).hexdigest() != digest:
+        raise ValueError("n3iwf_custody_reference_digest")
+    reference = json.loads(path.read_bytes())
+    fixtures = []
+    for case in reference["cases"]:
+        if re.fullmatch(r"[a-z0-9-]{1,60}", case["name"]) is None:
+            raise ValueError("n3iwf_custody_reference_name")
+        name = "custody-" + case["name"]
+        wire = (json.dumps(case, sort_keys=True, separators=(",", ":")) + "\n").encode().hex(" ")
+        item = manifest(
+            subset="protocol-key", name=name, case_class="positive",
+            document="RFC 7296", release="Published RFC (2014)",
+            clauses=["2.15", "2.16", "TS 33.501 V18.12.0 7.2.1", "SDK volatile protocol_key custody contract"],
+            direction="local", role="n3iwf",
+            prerequisite="Admitted SDK software IKE module; independent synthetic AUTH inputs; caller owns handoff authentication",
+            provenance_class="referenced-public-vector",
+            notes="Independently authored SDK custody schedule using only a zero test placeholder. No real key or peer. Public refusal is not memory-erasure evidence; the existing private pre-release audit is qualified separately.",
+            referenced=source + "#" + case["name"],
+            sanitized=[{"name": "key-inputs", "treatment": "32-zero-octet-public-test-placeholder", "value_class": "synthetic-not-peer-key"},
+                       {"name": "identifiers", "treatment": "fixed-test-generations-and-local-slots", "value_class": "synthetic"}],
+            wire_name=name, wire_hex=wire,
+            assertions=["scenario=" + case["name"], "key_recipe=32-zero-octets", "sdk_custody_validation=true",
+                        "live_peer_validation=false", "public_memory_erasure_observation=false"], outcome="constructed")
+        item["encoding"] = "scenario-record"
+        item["validation_scope"] = "protocol-key-lifecycle"
+        item["context"] = dict(source_vector={"path": source, "sha256": digest, "case": case["name"]},
+            key_recipe="32-zero-octets", sdk_custody_validation=True,
+            live_peer_validation=False, public_memory_erasure_observation=False)
+        dump_manifest(subset_dir, item, wire)
+        fixtures.append(item)
+    return fixtures
+
+
 def protocol_key(subset_dir: Path) -> list[dict]:
     # Label bytes only. Never a key.
     positive = " ".join(
@@ -2902,6 +2940,7 @@ def protocol_key(subset_dir: Path) -> list[dict]:
     for item, wire in zip(fixtures, wires, strict=True):
         dump_manifest(subset_dir, item, wire)
     fixtures.extend(protocol_key_known_answers(subset_dir))
+    fixtures.extend(protocol_key_lifecycle(subset_dir))
     write_readme(
         subset_dir,
         "Protocol-key fixture subset",
@@ -2914,7 +2953,13 @@ exchanges, peer authentication, or K_AMF hierarchy derivation evidence.
 
 Legacy scenario labels still model wrong-generation, reuse, drop and
 cancellation obligations for issue 791. They do not exercise a custody API
-or prove actual memory zeroization. No real peer key or nonce is published.
+or prove actual memory zeroization. Twenty-five separate scenario records replay
+wrong-generation, reuse, foreign/stale authority, invalid handoff/input, drop,
+cancellation and concurrent consumption through the public SDK API. Every
+successful consumption must match both independent AUTH answers. The existing
+private zeroization audit separately checks clearing before buffer release;
+opaque public errors are not used to infer that result. Monotonic local labels
+are SDK policy, not wire-standard obligations. No real key or nonce is published.
 """,
     )
     write_completion(
@@ -2925,16 +2970,17 @@ or prove actual memory zeroization. No real peer key or nonce is published.
             constructed=[
                 "generation-1 consume-once label",
                 "independent synthetic initiator/responder AUTH bodies",
+                "25 executable SDK volatile custody schedules",
             ],
             receive=[
-                "drop zeroize reference state",
+                "legacy drop-label reference state (not SDK memory observation)",
                 "synthetic AUTH known-answer verification",
             ],
             unsupported=[
                 "byte export",
                 "hierarchy derivation",
                 "authentication decision",
-                "actual consume-once custody and zeroization",
+                "public-memory observation, hardware custody and live-peer authentication",
             ],
         ),
     )

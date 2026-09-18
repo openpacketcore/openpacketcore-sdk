@@ -1,0 +1,1264 @@
+{
+  "schema_version": 1,
+  "scope": "protocol-key-lifecycle",
+  "policy": "SDK volatile custody; not a wire-standard obligation",
+  "sources": {
+    "crates/opc-proto-ikev2/src/protocol_key.rs": "782b456e3a17fe51be226d9c0920f89e53cb341e9ddc58ac0b36dd35bef5ec7a",
+    "crates/opc-proto-ikev2/src/protocol_key/tests.rs": "b12635232fc117e33bd2c49ac82cd1eda2df986682dd8a33f32d9661fe5dc24f",
+    "crates/opc-n3iwf-fixtures/oracles/ike-auth-sha256.json": "e1db7a997007bd2341226d770db34d0c76e89cf56418e92497c63f0e0422667f"
+  },
+  "key_recipe": "32 zero octets; independent synthetic NGAP placeholder only",
+  "auth_cases": [
+    "auth-initiator-known-answer",
+    "auth-responder-known-answer"
+  ],
+  "memory_erasure_evidence": "Existing private pre-release zeroization audit, separately executed; no public-memory observation",
+  "cases": [
+    {
+      "name": "consume-once",
+      "initial_generation": 1,
+      "steps": [
+        {
+          "action": "begin",
+          "expect": "ok",
+          "owner": 0,
+          "slot": 0,
+          "generation": 1,
+          "operation": 1
+        },
+        {
+          "action": "import",
+          "expect": "ok",
+          "slot": 0,
+          "key": 0,
+          "length": 32,
+          "purpose": "n3iwf"
+        },
+        {
+          "action": "consume",
+          "expect": "ok",
+          "key": 0,
+          "slot": 0
+        },
+        {
+          "action": "consume",
+          "expect": "protocol_key_retired",
+          "key": 0,
+          "slot": 0
+        }
+      ]
+    },
+    {
+      "name": "wrong-generation-begin",
+      "initial_generation": 1,
+      "steps": [
+        {
+          "action": "begin",
+          "expect": "protocol_key_generation_mismatch",
+          "owner": 0,
+          "slot": 0,
+          "generation": 2,
+          "operation": 1
+        },
+        {
+          "action": "begin",
+          "expect": "ok",
+          "owner": 0,
+          "slot": 0,
+          "generation": 1,
+          "operation": 1
+        },
+        {
+          "action": "import",
+          "expect": "ok",
+          "slot": 0,
+          "key": 0,
+          "length": 32,
+          "purpose": "n3iwf"
+        },
+        {
+          "action": "consume",
+          "expect": "ok",
+          "key": 0,
+          "slot": 0
+        }
+      ]
+    },
+    {
+      "name": "wrong-expected-generation",
+      "initial_generation": 1,
+      "steps": [
+        {
+          "action": "begin",
+          "expect": "ok",
+          "owner": 0,
+          "slot": 0,
+          "generation": 1,
+          "operation": 1
+        },
+        {
+          "action": "import",
+          "expect": "ok",
+          "slot": 0,
+          "key": 0,
+          "length": 32,
+          "purpose": "n3iwf"
+        },
+        {
+          "action": "replace",
+          "expect": "protocol_key_generation_mismatch",
+          "owner": 0,
+          "current": 2,
+          "replacement": 3
+        },
+        {
+          "action": "consume",
+          "expect": "ok",
+          "key": 0,
+          "slot": 0
+        }
+      ]
+    },
+    {
+      "name": "non-increasing-generation",
+      "initial_generation": 1,
+      "steps": [
+        {
+          "action": "begin",
+          "expect": "ok",
+          "owner": 0,
+          "slot": 0,
+          "generation": 1,
+          "operation": 1
+        },
+        {
+          "action": "import",
+          "expect": "ok",
+          "slot": 0,
+          "key": 0,
+          "length": 32,
+          "purpose": "n3iwf"
+        },
+        {
+          "action": "replace",
+          "expect": "protocol_key_generation_mismatch",
+          "owner": 0,
+          "current": 1,
+          "replacement": 1
+        },
+        {
+          "action": "consume",
+          "expect": "ok",
+          "key": 0,
+          "slot": 0
+        }
+      ]
+    },
+    {
+      "name": "replacement",
+      "initial_generation": 1,
+      "steps": [
+        {
+          "action": "begin",
+          "expect": "ok",
+          "owner": 0,
+          "slot": 0,
+          "generation": 1,
+          "operation": 1
+        },
+        {
+          "action": "import",
+          "expect": "ok",
+          "slot": 0,
+          "key": 0,
+          "length": 32,
+          "purpose": "n3iwf"
+        },
+        {
+          "action": "replace",
+          "expect": "ok",
+          "owner": 0,
+          "current": 1,
+          "replacement": 2
+        },
+        {
+          "action": "consume",
+          "expect": "protocol_key_generation_mismatch",
+          "key": 0,
+          "slot": 0
+        },
+        {
+          "action": "import",
+          "expect": "protocol_key_generation_mismatch",
+          "slot": 0,
+          "key": 1,
+          "length": 32,
+          "purpose": "n3iwf"
+        },
+        {
+          "action": "begin",
+          "expect": "ok",
+          "owner": 0,
+          "slot": 1,
+          "generation": 2,
+          "operation": 1
+        },
+        {
+          "action": "import",
+          "expect": "ok",
+          "slot": 1,
+          "key": 1,
+          "length": 32,
+          "purpose": "n3iwf"
+        },
+        {
+          "action": "consume",
+          "expect": "protocol_key_operation_mismatch",
+          "key": 0,
+          "slot": 1
+        },
+        {
+          "action": "drop-operation",
+          "expect": "ok",
+          "slot": 0
+        },
+        {
+          "action": "drop-key",
+          "expect": "ok",
+          "key": 0
+        },
+        {
+          "action": "consume",
+          "expect": "ok",
+          "key": 1,
+          "slot": 1
+        }
+      ]
+    },
+    {
+      "name": "foreign-association",
+      "initial_generation": 1,
+      "steps": [
+        {
+          "action": "begin",
+          "expect": "ok",
+          "owner": 0,
+          "slot": 0,
+          "generation": 1,
+          "operation": 1
+        },
+        {
+          "action": "import",
+          "expect": "ok",
+          "slot": 0,
+          "key": 0,
+          "length": 32,
+          "purpose": "n3iwf"
+        },
+        {
+          "action": "new-owner",
+          "expect": "ok",
+          "owner": 1,
+          "generation": 1
+        },
+        {
+          "action": "begin",
+          "expect": "ok",
+          "owner": 1,
+          "slot": 1,
+          "generation": 1,
+          "operation": 1
+        },
+        {
+          "action": "import",
+          "expect": "ok",
+          "slot": 1,
+          "key": 1,
+          "length": 32,
+          "purpose": "n3iwf"
+        },
+        {
+          "action": "consume",
+          "expect": "protocol_key_operation_mismatch",
+          "key": 0,
+          "slot": 1
+        },
+        {
+          "action": "consume",
+          "expect": "protocol_key_operation_mismatch",
+          "key": 1,
+          "slot": 0
+        },
+        {
+          "action": "consume",
+          "expect": "ok",
+          "key": 0,
+          "slot": 0
+        },
+        {
+          "action": "consume",
+          "expect": "ok",
+          "key": 1,
+          "slot": 1
+        }
+      ]
+    },
+    {
+      "name": "duplicate-import",
+      "initial_generation": 1,
+      "steps": [
+        {
+          "action": "begin",
+          "expect": "ok",
+          "owner": 0,
+          "slot": 0,
+          "generation": 1,
+          "operation": 1
+        },
+        {
+          "action": "import",
+          "expect": "ok",
+          "slot": 0,
+          "key": 0,
+          "length": 32,
+          "purpose": "n3iwf"
+        },
+        {
+          "action": "import",
+          "expect": "protocol_key_retired",
+          "slot": 0,
+          "key": 1,
+          "length": 32,
+          "purpose": "n3iwf"
+        },
+        {
+          "action": "consume",
+          "expect": "ok",
+          "key": 0,
+          "slot": 0
+        }
+      ]
+    },
+    {
+      "name": "pending-operation",
+      "initial_generation": 1,
+      "steps": [
+        {
+          "action": "begin",
+          "expect": "ok",
+          "owner": 0,
+          "slot": 0,
+          "generation": 1,
+          "operation": 1
+        },
+        {
+          "action": "import",
+          "expect": "ok",
+          "slot": 0,
+          "key": 0,
+          "length": 32,
+          "purpose": "n3iwf"
+        },
+        {
+          "action": "begin",
+          "expect": "protocol_key_operation_pending",
+          "owner": 0,
+          "slot": 1,
+          "generation": 1,
+          "operation": 2
+        },
+        {
+          "action": "consume",
+          "expect": "ok",
+          "key": 0,
+          "slot": 0
+        }
+      ]
+    },
+    {
+      "name": "invalid-width-0",
+      "initial_generation": 1,
+      "steps": [
+        {
+          "action": "begin",
+          "expect": "ok",
+          "owner": 0,
+          "slot": 0,
+          "generation": 1,
+          "operation": 1
+        },
+        {
+          "action": "import",
+          "expect": "protocol_key_invalid_length",
+          "slot": 0,
+          "key": 0,
+          "length": 0,
+          "purpose": "n3iwf"
+        },
+        {
+          "action": "import",
+          "expect": "protocol_key_retired",
+          "slot": 0,
+          "key": 0,
+          "length": 32,
+          "purpose": "n3iwf"
+        },
+        {
+          "action": "cancel",
+          "expect": "ok",
+          "slot": 0
+        },
+        {
+          "action": "begin",
+          "expect": "ok",
+          "owner": 0,
+          "slot": 1,
+          "generation": 1,
+          "operation": 2
+        },
+        {
+          "action": "import",
+          "expect": "ok",
+          "slot": 1,
+          "key": 1,
+          "length": 32,
+          "purpose": "n3iwf"
+        },
+        {
+          "action": "consume",
+          "expect": "ok",
+          "key": 1,
+          "slot": 1
+        }
+      ]
+    },
+    {
+      "name": "invalid-width-1",
+      "initial_generation": 1,
+      "steps": [
+        {
+          "action": "begin",
+          "expect": "ok",
+          "owner": 0,
+          "slot": 0,
+          "generation": 1,
+          "operation": 1
+        },
+        {
+          "action": "import",
+          "expect": "protocol_key_invalid_length",
+          "slot": 0,
+          "key": 0,
+          "length": 1,
+          "purpose": "n3iwf"
+        },
+        {
+          "action": "import",
+          "expect": "protocol_key_retired",
+          "slot": 0,
+          "key": 0,
+          "length": 32,
+          "purpose": "n3iwf"
+        },
+        {
+          "action": "cancel",
+          "expect": "ok",
+          "slot": 0
+        },
+        {
+          "action": "begin",
+          "expect": "ok",
+          "owner": 0,
+          "slot": 1,
+          "generation": 1,
+          "operation": 2
+        },
+        {
+          "action": "import",
+          "expect": "ok",
+          "slot": 1,
+          "key": 1,
+          "length": 32,
+          "purpose": "n3iwf"
+        },
+        {
+          "action": "consume",
+          "expect": "ok",
+          "key": 1,
+          "slot": 1
+        }
+      ]
+    },
+    {
+      "name": "invalid-width-31",
+      "initial_generation": 1,
+      "steps": [
+        {
+          "action": "begin",
+          "expect": "ok",
+          "owner": 0,
+          "slot": 0,
+          "generation": 1,
+          "operation": 1
+        },
+        {
+          "action": "import",
+          "expect": "protocol_key_invalid_length",
+          "slot": 0,
+          "key": 0,
+          "length": 31,
+          "purpose": "n3iwf"
+        },
+        {
+          "action": "import",
+          "expect": "protocol_key_retired",
+          "slot": 0,
+          "key": 0,
+          "length": 32,
+          "purpose": "n3iwf"
+        },
+        {
+          "action": "cancel",
+          "expect": "ok",
+          "slot": 0
+        },
+        {
+          "action": "begin",
+          "expect": "ok",
+          "owner": 0,
+          "slot": 1,
+          "generation": 1,
+          "operation": 2
+        },
+        {
+          "action": "import",
+          "expect": "ok",
+          "slot": 1,
+          "key": 1,
+          "length": 32,
+          "purpose": "n3iwf"
+        },
+        {
+          "action": "consume",
+          "expect": "ok",
+          "key": 1,
+          "slot": 1
+        }
+      ]
+    },
+    {
+      "name": "invalid-width-33",
+      "initial_generation": 1,
+      "steps": [
+        {
+          "action": "begin",
+          "expect": "ok",
+          "owner": 0,
+          "slot": 0,
+          "generation": 1,
+          "operation": 1
+        },
+        {
+          "action": "import",
+          "expect": "protocol_key_invalid_length",
+          "slot": 0,
+          "key": 0,
+          "length": 33,
+          "purpose": "n3iwf"
+        },
+        {
+          "action": "import",
+          "expect": "protocol_key_retired",
+          "slot": 0,
+          "key": 0,
+          "length": 32,
+          "purpose": "n3iwf"
+        },
+        {
+          "action": "cancel",
+          "expect": "ok",
+          "slot": 0
+        },
+        {
+          "action": "begin",
+          "expect": "ok",
+          "owner": 0,
+          "slot": 1,
+          "generation": 1,
+          "operation": 2
+        },
+        {
+          "action": "import",
+          "expect": "ok",
+          "slot": 1,
+          "key": 1,
+          "length": 32,
+          "purpose": "n3iwf"
+        },
+        {
+          "action": "consume",
+          "expect": "ok",
+          "key": 1,
+          "slot": 1
+        }
+      ]
+    },
+    {
+      "name": "invalid-width-4096",
+      "initial_generation": 1,
+      "steps": [
+        {
+          "action": "begin",
+          "expect": "ok",
+          "owner": 0,
+          "slot": 0,
+          "generation": 1,
+          "operation": 1
+        },
+        {
+          "action": "import",
+          "expect": "protocol_key_invalid_length",
+          "slot": 0,
+          "key": 0,
+          "length": 4096,
+          "purpose": "n3iwf"
+        },
+        {
+          "action": "import",
+          "expect": "protocol_key_retired",
+          "slot": 0,
+          "key": 0,
+          "length": 32,
+          "purpose": "n3iwf"
+        },
+        {
+          "action": "cancel",
+          "expect": "ok",
+          "slot": 0
+        },
+        {
+          "action": "begin",
+          "expect": "ok",
+          "owner": 0,
+          "slot": 1,
+          "generation": 1,
+          "operation": 2
+        },
+        {
+          "action": "import",
+          "expect": "ok",
+          "slot": 1,
+          "key": 1,
+          "length": 32,
+          "purpose": "n3iwf"
+        },
+        {
+          "action": "consume",
+          "expect": "ok",
+          "key": 1,
+          "slot": 1
+        }
+      ]
+    },
+    {
+      "name": "wrong-purpose",
+      "initial_generation": 1,
+      "steps": [
+        {
+          "action": "begin",
+          "expect": "ok",
+          "owner": 0,
+          "slot": 0,
+          "generation": 1,
+          "operation": 1
+        },
+        {
+          "action": "import",
+          "expect": "protocol_key_unsupported_purpose",
+          "slot": 0,
+          "key": 0,
+          "length": 32,
+          "purpose": "unsupported"
+        },
+        {
+          "action": "import",
+          "expect": "protocol_key_retired",
+          "slot": 0,
+          "key": 0,
+          "length": 32,
+          "purpose": "n3iwf"
+        }
+      ]
+    },
+    {
+      "name": "input-limit",
+      "initial_generation": 1,
+      "steps": [
+        {
+          "action": "begin",
+          "expect": "ok",
+          "owner": 0,
+          "slot": 0,
+          "generation": 1,
+          "operation": 1
+        },
+        {
+          "action": "import",
+          "expect": "ok",
+          "slot": 0,
+          "key": 0,
+          "length": 32,
+          "purpose": "n3iwf"
+        },
+        {
+          "action": "consume",
+          "expect": "protocol_key_input_limit",
+          "key": 0,
+          "slot": 0,
+          "max_input_bytes": 0
+        },
+        {
+          "action": "consume",
+          "expect": "protocol_key_retired",
+          "key": 0,
+          "slot": 0
+        }
+      ]
+    },
+    {
+      "name": "wrong-transcript-direction",
+      "initial_generation": 1,
+      "steps": [
+        {
+          "action": "begin",
+          "expect": "ok",
+          "owner": 0,
+          "slot": 0,
+          "generation": 1,
+          "operation": 1
+        },
+        {
+          "action": "import",
+          "expect": "ok",
+          "slot": 0,
+          "key": 0,
+          "length": 32,
+          "purpose": "n3iwf"
+        },
+        {
+          "action": "consume",
+          "expect": "protocol_key_invalid_auth_inputs",
+          "key": 0,
+          "slot": 0,
+          "wrong_direction": true
+        },
+        {
+          "action": "consume",
+          "expect": "protocol_key_retired",
+          "key": 0,
+          "slot": 0
+        }
+      ]
+    },
+    {
+      "name": "drop-key",
+      "initial_generation": 1,
+      "steps": [
+        {
+          "action": "begin",
+          "expect": "ok",
+          "owner": 0,
+          "slot": 0,
+          "generation": 1,
+          "operation": 1
+        },
+        {
+          "action": "import",
+          "expect": "ok",
+          "slot": 0,
+          "key": 0,
+          "length": 32,
+          "purpose": "n3iwf"
+        },
+        {
+          "action": "drop-key",
+          "expect": "ok",
+          "key": 0
+        },
+        {
+          "action": "import",
+          "expect": "protocol_key_retired",
+          "slot": 0,
+          "key": 1,
+          "length": 32,
+          "purpose": "n3iwf"
+        },
+        {
+          "action": "begin",
+          "expect": "ok",
+          "owner": 0,
+          "slot": 1,
+          "generation": 1,
+          "operation": 2
+        },
+        {
+          "action": "import",
+          "expect": "ok",
+          "slot": 1,
+          "key": 1,
+          "length": 32,
+          "purpose": "n3iwf"
+        },
+        {
+          "action": "consume",
+          "expect": "ok",
+          "key": 1,
+          "slot": 1
+        }
+      ]
+    },
+    {
+      "name": "drop-operation",
+      "initial_generation": 1,
+      "steps": [
+        {
+          "action": "begin",
+          "expect": "ok",
+          "owner": 0,
+          "slot": 0,
+          "generation": 1,
+          "operation": 1
+        },
+        {
+          "action": "import",
+          "expect": "ok",
+          "slot": 0,
+          "key": 0,
+          "length": 32,
+          "purpose": "n3iwf"
+        },
+        {
+          "action": "drop-operation",
+          "expect": "ok",
+          "slot": 0
+        },
+        {
+          "action": "begin",
+          "expect": "ok",
+          "owner": 0,
+          "slot": 1,
+          "generation": 1,
+          "operation": 2
+        },
+        {
+          "action": "import",
+          "expect": "ok",
+          "slot": 1,
+          "key": 1,
+          "length": 32,
+          "purpose": "n3iwf"
+        },
+        {
+          "action": "consume",
+          "expect": "protocol_key_operation_mismatch",
+          "key": 0,
+          "slot": 1
+        },
+        {
+          "action": "drop-key",
+          "expect": "ok",
+          "key": 0
+        },
+        {
+          "action": "consume",
+          "expect": "ok",
+          "key": 1,
+          "slot": 1
+        }
+      ]
+    },
+    {
+      "name": "drop-association",
+      "initial_generation": 1,
+      "steps": [
+        {
+          "action": "begin",
+          "expect": "ok",
+          "owner": 0,
+          "slot": 0,
+          "generation": 1,
+          "operation": 1
+        },
+        {
+          "action": "import",
+          "expect": "ok",
+          "slot": 0,
+          "key": 0,
+          "length": 32,
+          "purpose": "n3iwf"
+        },
+        {
+          "action": "drop-owner",
+          "expect": "ok",
+          "owner": 0
+        },
+        {
+          "action": "consume",
+          "expect": "protocol_key_released",
+          "key": 0,
+          "slot": 0
+        },
+        {
+          "action": "import",
+          "expect": "protocol_key_released",
+          "slot": 0,
+          "key": 1,
+          "length": 32,
+          "purpose": "n3iwf"
+        }
+      ]
+    },
+    {
+      "name": "release",
+      "initial_generation": 1,
+      "steps": [
+        {
+          "action": "begin",
+          "expect": "ok",
+          "owner": 0,
+          "slot": 0,
+          "generation": 1,
+          "operation": 1
+        },
+        {
+          "action": "import",
+          "expect": "ok",
+          "slot": 0,
+          "key": 0,
+          "length": 32,
+          "purpose": "n3iwf"
+        },
+        {
+          "action": "release",
+          "expect": "ok",
+          "owner": 0
+        },
+        {
+          "action": "release",
+          "expect": "ok",
+          "owner": 0
+        },
+        {
+          "action": "consume",
+          "expect": "protocol_key_released",
+          "key": 0,
+          "slot": 0
+        },
+        {
+          "action": "import",
+          "expect": "protocol_key_released",
+          "slot": 0,
+          "key": 1,
+          "length": 32,
+          "purpose": "n3iwf"
+        },
+        {
+          "action": "begin",
+          "expect": "protocol_key_released",
+          "owner": 0,
+          "slot": 1,
+          "generation": 1,
+          "operation": 2
+        },
+        {
+          "action": "replace",
+          "expect": "protocol_key_released",
+          "owner": 0,
+          "current": 1,
+          "replacement": 2
+        }
+      ]
+    },
+    {
+      "name": "cancel-successor",
+      "initial_generation": 1,
+      "steps": [
+        {
+          "action": "begin",
+          "expect": "ok",
+          "owner": 0,
+          "slot": 0,
+          "generation": 1,
+          "operation": 1
+        },
+        {
+          "action": "import",
+          "expect": "ok",
+          "slot": 0,
+          "key": 0,
+          "length": 32,
+          "purpose": "n3iwf"
+        },
+        {
+          "action": "cancel",
+          "expect": "ok",
+          "slot": 0
+        },
+        {
+          "action": "consume",
+          "expect": "protocol_key_retired",
+          "key": 0,
+          "slot": 0
+        },
+        {
+          "action": "begin",
+          "expect": "ok",
+          "owner": 0,
+          "slot": 1,
+          "generation": 1,
+          "operation": 2
+        },
+        {
+          "action": "import",
+          "expect": "ok",
+          "slot": 1,
+          "key": 1,
+          "length": 32,
+          "purpose": "n3iwf"
+        },
+        {
+          "action": "cancel",
+          "expect": "ok",
+          "slot": 0
+        },
+        {
+          "action": "drop-operation",
+          "expect": "ok",
+          "slot": 0
+        },
+        {
+          "action": "drop-key",
+          "expect": "ok",
+          "key": 0
+        },
+        {
+          "action": "consume",
+          "expect": "ok",
+          "key": 1,
+          "slot": 1
+        }
+      ]
+    },
+    {
+      "name": "cancel-future",
+      "initial_generation": 1,
+      "steps": [
+        {
+          "action": "begin",
+          "expect": "ok",
+          "owner": 0,
+          "slot": 0,
+          "generation": 1,
+          "operation": 1
+        },
+        {
+          "action": "import",
+          "expect": "ok",
+          "slot": 0,
+          "key": 0,
+          "length": 32,
+          "purpose": "n3iwf"
+        },
+        {
+          "action": "cancel-future",
+          "expect": "ok",
+          "slot": 0
+        },
+        {
+          "action": "begin",
+          "expect": "ok",
+          "owner": 0,
+          "slot": 1,
+          "generation": 1,
+          "operation": 2
+        },
+        {
+          "action": "import",
+          "expect": "ok",
+          "slot": 1,
+          "key": 1,
+          "length": 32,
+          "purpose": "n3iwf"
+        },
+        {
+          "action": "consume",
+          "expect": "protocol_key_operation_mismatch",
+          "key": 0,
+          "slot": 1
+        },
+        {
+          "action": "drop-key",
+          "expect": "ok",
+          "key": 0
+        },
+        {
+          "action": "consume",
+          "expect": "ok",
+          "key": 1,
+          "slot": 1
+        }
+      ]
+    },
+    {
+      "name": "operation-reuse",
+      "initial_generation": 1,
+      "steps": [
+        {
+          "action": "begin",
+          "expect": "ok",
+          "owner": 0,
+          "slot": 0,
+          "generation": 1,
+          "operation": 1
+        },
+        {
+          "action": "cancel",
+          "expect": "ok",
+          "slot": 0
+        },
+        {
+          "action": "begin",
+          "expect": "protocol_key_operation_reused",
+          "owner": 0,
+          "slot": 1,
+          "generation": 1,
+          "operation": 1
+        },
+        {
+          "action": "begin",
+          "expect": "ok",
+          "owner": 0,
+          "slot": 1,
+          "generation": 1,
+          "operation": 2
+        },
+        {
+          "action": "import",
+          "expect": "ok",
+          "slot": 1,
+          "key": 1,
+          "length": 32,
+          "purpose": "n3iwf"
+        },
+        {
+          "action": "consume",
+          "expect": "ok",
+          "key": 1,
+          "slot": 1
+        }
+      ]
+    },
+    {
+      "name": "generation-exhaustion",
+      "initial_generation": 1,
+      "steps": [
+        {
+          "action": "begin",
+          "expect": "ok",
+          "owner": 0,
+          "slot": 0,
+          "generation": 1,
+          "operation": 1
+        },
+        {
+          "action": "import",
+          "expect": "ok",
+          "slot": 0,
+          "key": 0,
+          "length": 32,
+          "purpose": "n3iwf"
+        },
+        {
+          "action": "replace",
+          "expect": "ok",
+          "owner": 0,
+          "current": 1,
+          "replacement": 18446744073709551615
+        },
+        {
+          "action": "consume",
+          "expect": "protocol_key_generation_mismatch",
+          "key": 0,
+          "slot": 0
+        },
+        {
+          "action": "begin",
+          "expect": "ok",
+          "owner": 0,
+          "slot": 1,
+          "generation": 18446744073709551615,
+          "operation": 1
+        },
+        {
+          "action": "import",
+          "expect": "ok",
+          "slot": 1,
+          "key": 1,
+          "length": 32,
+          "purpose": "n3iwf"
+        },
+        {
+          "action": "replace",
+          "expect": "protocol_key_generation_mismatch",
+          "owner": 0,
+          "current": 18446744073709551615,
+          "replacement": 1
+        },
+        {
+          "action": "consume",
+          "expect": "ok",
+          "key": 1,
+          "slot": 1
+        }
+      ]
+    },
+    {
+      "name": "concurrent-consume-once",
+      "initial_generation": 1,
+      "steps": [
+        {
+          "action": "begin",
+          "expect": "ok",
+          "owner": 0,
+          "slot": 0,
+          "generation": 1,
+          "operation": 1
+        },
+        {
+          "action": "import",
+          "expect": "ok",
+          "slot": 0,
+          "key": 0,
+          "length": 32,
+          "purpose": "n3iwf"
+        },
+        {
+          "action": "concurrent-consume",
+          "expect": "ok",
+          "key": 0,
+          "slot": 0,
+          "outcomes": [
+            "ok",
+            "protocol_key_retired"
+          ]
+        },
+        {
+          "action": "consume",
+          "expect": "protocol_key_retired",
+          "key": 0,
+          "slot": 0
+        }
+      ]
+    }
+  ]
+}

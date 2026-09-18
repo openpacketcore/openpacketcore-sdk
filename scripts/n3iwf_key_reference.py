@@ -20,6 +20,8 @@ import sys
 import tempfile
 from pathlib import Path
 
+import n3iwf_key_lifecycle_reference as key_lifecycle
+
 ROOT = Path(__file__).resolve().parents[1]
 FIXTURES = ROOT / "crates/opc-n3iwf-fixtures/fixtures"
 REFERENCE = ROOT / "crates/opc-n3iwf-fixtures/oracles/ike-auth-sha256.json"
@@ -442,11 +444,18 @@ def main():
             if path.name != "COMPLETION.json":
                 item = read_json(path)
                 require(
-                    item["validation_scope"] in (SCOPE, "handle-lifecycle-contract"),
+                    item["validation_scope"] in (SCOPE, "handle-lifecycle-contract", key_lifecycle.SCOPE),
                     "unknown-key-scope",
                 )
                 if item["validation_scope"] == SCOPE:
                     published_names.add(item["sdk_fixture_id"].split(".v1.")[1])
+                elif item["validation_scope"] == key_lifecycle.SCOPE:
+                    require(item["wire"]["path"] == "wire/" + path.stem + ".hex", "custody-path")
+                    data = bytes.fromhex(read_bounded(FIXTURES / "protocol-key" / item["wire"]["path"], 16 * 1024).decode("ascii"))
+                    try:
+                        key_lifecycle.validate(item, data)
+                    except key_lifecycle.Invalid as error:
+                        raise Invalid(str(error)) from None
         require(names == published_names, "corpus-inventory")
         require(
             isinstance(corpus["expected_octets"], dict)

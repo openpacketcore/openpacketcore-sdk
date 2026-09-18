@@ -1,0 +1,63 @@
+{
+  "encoding": "scenario-record",
+  "validation_scope": "protocol-key-lifecycle",
+  "context": {
+    "source_vector": {
+      "path": "crates/opc-n3iwf-fixtures/oracles/key-lifecycle.json",
+      "sha256": "f6328da8ee70fd01cf642ebd334cb59a0900ffbb0ce59378b22d922867f79e14",
+      "case": "operation-reuse"
+    },
+    "key_recipe": "32-zero-octets",
+    "sdk_custody_validation": true,
+    "live_peer_validation": false,
+    "public_memory_erasure_observation": false
+  },
+  "sdk_fixture_id": "opc.n3iwf.protocol-key.v1.custody-operation-reuse",
+  "subset": "protocol-key",
+  "case_class": "positive",
+  "source": {
+    "document": "RFC 7296",
+    "release": "Published RFC (2014)",
+    "clauses": [
+      "2.15",
+      "2.16",
+      "TS 33.501 V18.12.0 7.2.1",
+      "SDK volatile protocol_key custody contract"
+    ]
+  },
+  "direction": "local",
+  "role": "n3iwf",
+  "prerequisite": "Admitted SDK software IKE module; independent synthetic AUTH inputs; caller owns handoff authentication",
+  "provenance": {
+    "class": "referenced-public-vector",
+    "synthetic": true,
+    "independent_capture": false,
+    "referenced_public_vector": "crates/opc-n3iwf-fixtures/oracles/key-lifecycle.json#operation-reuse",
+    "notes": "Independently authored SDK custody schedule using only a zero test placeholder. No real key or peer. Public refusal is not memory-erasure evidence; the existing private pre-release audit is qualified separately."
+  },
+  "sanitized_fields": [
+    {
+      "name": "key-inputs",
+      "treatment": "32-zero-octet-public-test-placeholder",
+      "value_class": "synthetic-not-peer-key"
+    },
+    {
+      "name": "identifiers",
+      "treatment": "fixed-test-generations-and-local-slots",
+      "value_class": "synthetic"
+    }
+  ],
+  "wire": {
+    "path": "wire/custody-operation-reuse.hex",
+    "digest_sha256": "343c6f727a27c3afeb9fee383bb96b8509504b0d0b5d2c80f4828d5bc0899a33"
+  },
+  "semantic_assertions": [
+    "scenario=operation-reuse",
+    "key_recipe=32-zero-octets",
+    "sdk_custody_validation=true",
+    "live_peer_validation=false",
+    "public_memory_erasure_observation=false"
+  ],
+  "expected_outcome": "constructed",
+  "runtime_claim": false
+}

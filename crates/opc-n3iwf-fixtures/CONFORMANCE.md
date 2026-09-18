@@ -139,3 +139,35 @@ against these vectors.
 Authority: [IANA NG Control Plane service registration](https://www.iana.org/assignments/service-names-port-numbers/service-names-port-numbers.xhtml?search=ng-control),
 [TS 38.412 V18.1.0 clause 7](https://www.etsi.org/deliver/etsi_ts/138400_138499/138412/18.01.00_60/ts_138412v180100p.pdf),
 and [RFC 6335 section 6](https://www.rfc-editor.org/rfc/rfc6335.html#section-6).
+
+## Executable protocol-key custody schedules
+
+Twenty-five independently authored `protocol-key-lifecycle` records replay the
+existing volatile `opc-proto-ikev2::protocol_key` API. They use only a 32-zero-octet
+synthetic placeholder and the existing independent RFC 7296 initiator/responder
+AUTH answers. Every successful consumption must match both answers. A successful
+scenario means all expected results match, including the refusals inside it;
+it does not mean every requested key operation succeeded.
+
+The records cover generation mismatch and non-increasing replacement, foreign
+associations, operation reuse/pending slots, duplicate import, invalid width and
+purpose, input-limit and transcript-direction failure, handle/operation/owner
+drop, explicit release, cancellation of an actually polled pending future,
+stale-guard retirement, finite generation exhaustion and two concurrent
+consumption attempts. Numeric labels remain caller-owned SDK replay policy,
+separate from the cited wire and cryptographic standards.
+
+`scripts/n3iwf_key_lifecycle_reference.py` authors fixed expected results without
+importing an SDK runtime or the catalog writer. Its source pins bind the unchanged
+public SDK custody contract, private audit source and independent AUTH corpus.
+The catalog gate compares the schedule bytes and exact source/claim binding;
+refreshed local digests cannot disguise a changed expected result. Legacy
+`handle-lifecycle-contract` labels remain separate and unchanged.
+
+Public opaque-handle refusal proves retirement at the API boundary. Memory
+clearing is separately qualified by the existing private test audit that observes
+the owned buffer after zeroization and before release, including invalid imports
+and cancellation. No pointer to freed memory is inspected or published. These
+results qualify synthetic SDK software custody only; live-peer authentication,
+subscriber authorization, sealed/hardware custody and key hierarchy derivation
+remain outside this fixture scope. All manifests retain `runtime_claim=false`.

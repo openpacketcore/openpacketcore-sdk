@@ -220,7 +220,7 @@ fn protocol_key_subset_has_independent_auth_answers_for_both_peers() {
     for (manifest, _) in catalog.manifests() {
         assert!(matches!(
             manifest.validation_scope.as_str(),
-            SCOPE | "handle-lifecycle-contract"
+            SCOPE | "handle-lifecycle-contract" | "protocol-key-lifecycle"
         ));
     }
 }
@@ -470,3 +470,6 @@ fn refreshed_digests_cannot_hide_mic_or_key_mutations() {
         }
     }
 }
+
+#[path = "support/key_lifecycle.rs"]
+mod lifecycle;
