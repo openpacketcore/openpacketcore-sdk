@@ -292,7 +292,7 @@ impl ModifyFailureTransfer {
         Ok(value)
     }
 }
-fn response_diagnostics(value: &CriticalityDiagnostics) -> Result<(), DecodeError> {
+pub(super) fn response_diagnostics(value: &CriticalityDiagnostics) -> Result<(), DecodeError> {
     if value.procedure_code.is_some() || value.triggering_outcome.is_some() {
         return Err(invalid("response diagnostic header applicability"));
     }

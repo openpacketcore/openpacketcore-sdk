@@ -16,7 +16,7 @@ internal semantics in the SDK.
 | Layer | Item | Status | Evidence |
 |---|---|---|---|
 | NGAP-PDU framing | All three outcomes | ✅ | Complete messages independently encoded from the Release 18.10 schema |
-| Constructed root containers | 21 admitted outcomes | ✅ | 21 published-corpus construction cases, 291 UE request cases, 189 Reset/Error cases and 43 Notify cases below |
+| Constructed root containers | 23 admitted outcomes | ✅ | 21 published-corpus construction cases, 291 UE request cases, 189 Reset/Error cases, 43 Notify cases and 63 Modify cases below |
 | Constructed length determinants | All three outcomes; short, two-octet and fragmented open types | ✅ | 54 independent Pycrate cases, including inner/outer 128, 16384 and 65536 boundaries |
 | Typed IE mapping | NGSetup Request/Response/Failure | ✅ | Every IE compared with independent reference bytes |
 | Typed IE mapping | InitialUEMessage; Downlink/UplinkNASTransport | ✅ | Complete N3IWF messages, including IPv4/IPv6 location |
@@ -27,6 +27,7 @@ internal semantics in the SDK.
 | Typed IE mapping | NASNonDeliveryIndication; UEContextReleaseRequest | ✅ | Independent complete requests, root Causes and session IDs |
 | Typed IE mapping | NGReset; NGResetAcknowledge; ErrorIndication | ✅ | Independent complete messages, fragmented connection lists and root diagnostics |
 | Typed IE mapping | PDUSessionResourceNotify | ✅ | Independent flow/session reports, root Causes and optional N3IWF location |
+| Typed IE mapping | PDUSessionResourceModify Request/Response | ✅ | Three independent session lists and complete procedure messages, including partial results |
 | Typed decode | Paging | 🧪 | Initiating-message dispatch with hand-authored empty-IE APER fixture |
 
 Dispatch is outcome-aware: procedure code 21 decodes as NGSetupRequest only
@@ -927,6 +928,76 @@ all truncations and bounded mutations. All 1,436 complete vectors seed shared
 replay and fuzz assertions. Enclosing session lists/messages, request correlation,
 conditional NAS forwarding, response selection, rollback and resource effects
 remain separate; this adds no admitted PDU outcome and does not complete #787.
+
+## Complete PDU Session Resource Modify
+
+`n3iwf::modify_lists` and `n3iwf::modify` compose the transfer roots above into
+TS 38.413 V18.10.0 8.2.3 / 9.2.1.5–6 messages. Procedure 26 has reject
+criticality, an initiating Request and a successful Response. Session failures
+are entries in Response; no unsuccessful procedure outcome is defined.
+
+| Outcome | Mandatory singleton IEs | Optional singleton IEs | Receive behavior |
+| --- | --- | --- | --- |
+| Request | AMF UE ID 10, RAN UE ID 85, nonempty Modify List 64 (all reject) | RAN Paging Priority 83 (ignore) | Ignore 83 contents as required by TS 29.413 5.3; omit it from typed construction |
+| Response | AMF UE ID 10, RAN UE ID 85 (both ignore) | Modified List 65, Failed List 54, N3IWF location 121, Criticality Diagnostics 19 (all ignore) | At least one result list; disjoint session IDs; diagnostics omit procedure code/triggering outcome under 9.3.1.3 |
+
+All three lists contain 1–256 unique session IDs. Request items preserve optional
+opaque NAS (absent and empty are distinct) and optional S-NSSAI extension 148
+with reject criticality. Exactly one such extension is supported; duplicate
+S-NSSAI, Expected UE Activity Behaviour 281 and other item extensions explicitly
+reject in this initial subset, including under unknown-IE Drop. No slice default
+or authorization is inferred. Failed results retain their qualified response
+diagnostics; repeated diagnostic IE identifiers remain representable.
+
+Request lists require depth 7–13 (three layers plus the contained transfer).
+Successful lists require depth 4 for empty transfers, 7 with tunnels/accepted
+QFIs and 8 with failed QFIs. Failed lists require depth 6, or 8 with diagnostic
+items. Complete messages add four enclosing layers; optional top-level fields
+retain their own qualified depth requirements. Outer lists, the top container,
+and each contained transfer independently use `max_ies`. Counts are caller
+limits, not extra standards cardinality. Complete physical framing of every
+list item and fragment is checked before list materialization or NAS/transfer
+coalescing. Ordinary NAS borrows the input; fragmented NAS is bounded by actual
+physical bytes. Exact output size precedes list allocation; allocation-budget
+targets remain advisory.
+
+Both boundaries use the same `DecodeContext`. Duplicate First/Last/Reject and
+unknown Preserve/Drop/Reject policies remain authoritative at the outer and
+contained request levels; previously dropped fields cannot be recovered.
+Retained unknown reject IEs fail typed admission. Unknown-ignore counts and
+notify IDs propagate as value-free diagnostics, including per-session evidence.
+Construction emits canonical known fields in schema order. All formatting
+remains redacted. Exhaustive users of public `Message`/`MessageType` must handle
+the two new Modify variants; previously unknown procedure-26 Request/Response
+bodies now receive typed structural dispatch and its IE policy checks.
+
+The independent [list oracle](tests/fixtures/n3iwf-modify-lists.json) has 1,062
+cases (1,051 admitted, 11 negative), including every list count and SST, NAS
+fragment boundaries through 65,537 bytes, optional slices, nested unknown IEs,
+duplicates and unsupported extensions. Its inputs name and hash the qualified
+transfer corpora. The [message oracle](tests/fixtures/n3iwf-modify.json) has 63
+complete messages (35 admitted, 28 negative), with partial/all-failed results,
+location, diagnostics, receiver-ignore, missing fields and criticality policies.
+Both unmodified reference encoders agree and structured decoding verifies values
+and admission classifications. Regenerate with
+`scripts/generate-ngap-modify-list-fixtures.py --spec PATH --fixtures DIR --output PATH`
+and `scripts/generate-ngap-modify-fixtures.py --spec PATH --output PATH`.
+
+Generated probes cover all 1,051 admitted list cases. Request encoders pass
+525/533 and decoders 521/533; failures involve fragmented NAS or contained
+transfers. Both directions pass all 260 response and 258 failure lists. Retain
+those generated result paths after physical preflight; use the already qualified
+fragment writer and borrowed reader for requests. The pinned generated schema
+and dependencies remain unchanged. All complete vectors seed bounded shared
+replay/fuzz checks, with exact limits and malformed flags, padding and lengths.
+
+The caller checks exact request/result coverage, established session and QFI
+ownership, conditional NAS forwarding and optional-field applicability to its
+session state; it selects and constructs the abnormal-condition responses of
+8.2.3.4. Returning a typed decode error does not send those responses. Actual
+resource modifications, rollback and procedure triggers remain outside the codec.
+Additional applicable fields and the broader applicability/receive/error/trigger
+matrix remain open under #787. This evidence does not claim live interoperability.
 
 ## Fixtures
 

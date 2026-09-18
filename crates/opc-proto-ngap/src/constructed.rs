@@ -103,6 +103,8 @@ message_types! {
     InitialUeMessage, Initiating, PROCEDURE_CODE_INITIAL_UE, ignore, INITIAL_UE_MESSAGE;
     DownlinkNasTransport, Initiating, PROCEDURE_CODE_DOWNLINK_NAS_TRANSPORT, ignore, DOWNLINK_NAS_TRANSPORT;
     UplinkNasTransport, Initiating, PROCEDURE_CODE_UPLINK_NAS_TRANSPORT, ignore, UPLINK_NAS_TRANSPORT, 0;
+    PduSessionResourceModifyRequest, Initiating, PROCEDURE_CODE_PDU_SESSION_RESOURCE_MODIFY, reject, PDU_SESSION_RESOURCE_MODIFY_REQUEST;
+    PduSessionResourceModifyResponse, Successful, PROCEDURE_CODE_PDU_SESSION_RESOURCE_MODIFY, reject, PDU_SESSION_RESOURCE_MODIFY_RESPONSE;
     PduSessionResourceNotify, Initiating, PROCEDURE_CODE_PDU_SESSION_RESOURCE_NOTIFY, ignore, PDU_SESSION_RESOURCE_NOTIFY;
     NgReset, Initiating, PROCEDURE_CODE_NG_RESET, reject, NG_RESET;
     NgResetAcknowledge, Successful, PROCEDURE_CODE_NG_RESET, reject, NG_RESET_ACKNOWLEDGE;

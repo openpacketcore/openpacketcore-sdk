@@ -482,3 +482,25 @@ are unique/disjoint; diagnostic repetitions stay intact. Same-procedure response
 diagnostics reject procedure code/triggering outcome, and diagnostic item ignore
 criticality remains inapplicable. Request correlation, conditional NAS forwarding,
 resource effects and rollback belong to the caller; no NGAP PDU outcome is added.
+
+
+## Complete Modify amendment (2026-09)
+
+Probe every admitted list in the independent 1,062-case oracle. Generated
+request encoding passes 525/533 and decoding 521/533; failed cases contain
+fragmented NAS or transfer payloads. Both directions pass all 260 response and
+258 failure lists. Keep generated result paths after full physical preflight;
+use qualified fragment framing and borrowing for request lists. NAS fragment
+remainders use nonperiodic synthetic content, exposing the generated prefix
+repetition defect. A shared no-allocation fragment scanner preflights the full
+list before materialization or coalescing, without changing existing IE policy.
+
+Three lists compose into procedure-26 Request and Response, independently
+qualified by 63 complete messages. Preserve optional NAS/S-NSSAI, partial and
+all-failed results, applicable diagnostics and per-session unknown-IE evidence.
+RAN Paging Priority remains receiver-ignored. The public dispatch enums gain two
+variants; no unsuccessful Modify outcome is admitted. No generated schema or
+runtime change is needed. Correlation, ownership, NAS eligibility, prescribed
+abnormal-condition responses, trigger selection and resource effects remain
+caller-owned. #787's other optional fields and complete procedure matrix remain
+open; this is independent synthetic evidence, not live interoperability.

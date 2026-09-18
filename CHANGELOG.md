@@ -127,6 +127,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `Ikev2SaInitCryptoErrorCode` to `Ikev2ChildSaKeyMaterialDiagnostic`.
 
 ### Added
+- `opc-proto-ngap`: qualify complete PDU Session Resource Modify Request/Response
+  with bounded session lists, optional NAS/S-NSSAI and partial failure diagnostics.
+  Add two public message variants (exhaustive matches require updates), independent
+  Release 18 byte evidence and shared adversarial replay; caller-owned effects
+  and the remaining #787 procedure matrix stay explicit.
+
 - `opc-proto-ngap`: bounded Modify response and unsuccessful transfers with
   optional directional endpoints, unique/disjoint QFI results and qualified
   response diagnostics. Preserve empty roots and absent/empty diagnostics;

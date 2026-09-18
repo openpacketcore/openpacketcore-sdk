@@ -57,7 +57,8 @@ pub mod messages {
         DownlinkNASTransport, ErrorIndication, InitialContextSetupFailure,
         InitialContextSetupRequest, InitialContextSetupResponse, InitialUEMessage,
         NASNonDeliveryIndication, NGReset, NGResetAcknowledge, NGSetupFailure, NGSetupRequest,
-        NGSetupResponse, PDUSessionResourceNotify, PDUSessionResourceReleaseCommand,
+        NGSetupResponse, PDUSessionResourceModifyRequest, PDUSessionResourceModifyResponse,
+        PDUSessionResourceNotify, PDUSessionResourceReleaseCommand,
         PDUSessionResourceReleaseResponse, PDUSessionResourceSetupRequest,
         PDUSessionResourceSetupResponse, Paging, UEContextReleaseCommand, UEContextReleaseComplete,
         UEContextReleaseRequest, UplinkNASTransport,
@@ -130,6 +131,10 @@ pub enum Message {
     DownlinkNasTransport(messages::DownlinkNASTransport),
     /// Uplink NAS Transport (initiating message, procedure code 46).
     UplinkNasTransport(messages::UplinkNASTransport),
+    /// PDU Session Resource Modify Request (initiating, procedure code 26).
+    PduSessionResourceModifyRequest(messages::PDUSessionResourceModifyRequest),
+    /// PDU Session Resource Modify Response (successful, procedure code 26).
+    PduSessionResourceModifyResponse(messages::PDUSessionResourceModifyResponse),
     /// PDU Session Resource Notify (initiating message, procedure code 30).
     PduSessionResourceNotify(messages::PDUSessionResourceNotify),
     /// NG Reset (initiating message, procedure code 20).
@@ -258,6 +263,12 @@ impl fmt::Debug for Message {
             Self::UeContextReleaseComplete(message) => {
                 typed!("UeContextReleaseComplete", message)
             }
+            Self::PduSessionResourceModifyRequest(message) => {
+                typed!("PduSessionResourceModifyRequest", message)
+            }
+            Self::PduSessionResourceModifyResponse(message) => {
+                typed!("PduSessionResourceModifyResponse", message)
+            }
             Self::PduSessionResourceNotify(message) => typed!("PduSessionResourceNotify", message),
             Self::NgReset(message) => typed!("NgReset", message),
             Self::NgResetAcknowledge(message) => typed!("NgResetAcknowledge", message),
@@ -282,6 +293,7 @@ const PROCEDURE_CODE_PDU_SESSION_RESOURCE_RELEASE: u8 = 28;
 const PROCEDURE_CODE_PDU_SESSION_RESOURCE_SETUP: u8 = 29;
 const PROCEDURE_CODE_UE_CONTEXT_RELEASE: u8 = 41;
 const PROCEDURE_CODE_UPLINK_NAS_TRANSPORT: u8 = 46;
+const PROCEDURE_CODE_PDU_SESSION_RESOURCE_MODIFY: u8 = 26;
 const PROCEDURE_CODE_PDU_SESSION_RESOURCE_NOTIFY: u8 = 30;
 const PROCEDURE_CODE_NG_RESET: u8 = 20;
 const PROCEDURE_CODE_ERROR_INDICATION: u8 = 9;
@@ -493,6 +505,22 @@ fn decode_message(
             Criticality::ignore,
             policy::UPLINK_NAS_TRANSPORT,
             |ie| ie.id.0
+        ),
+        (Outcome::Initiating, PROCEDURE_CODE_PDU_SESSION_RESOURCE_MODIFY) => decode_as!(
+            messages::PDUSessionResourceModifyRequest,
+            PduSessionResourceModifyRequest,
+            "pdu session resource modify request",
+            Criticality::reject,
+            policy::PDU_SESSION_RESOURCE_MODIFY_REQUEST,
+            |ie| ie.id
+        ),
+        (Outcome::Successful, PROCEDURE_CODE_PDU_SESSION_RESOURCE_MODIFY) => decode_as!(
+            messages::PDUSessionResourceModifyResponse,
+            PduSessionResourceModifyResponse,
+            "pdu session resource modify response",
+            Criticality::reject,
+            policy::PDU_SESSION_RESOURCE_MODIFY_RESPONSE,
+            |ie| ie.id
         ),
         (Outcome::Initiating, PROCEDURE_CODE_PDU_SESSION_RESOURCE_NOTIFY) => decode_as!(
             messages::PDUSessionResourceNotify,
@@ -1565,6 +1593,10 @@ mod tests {
 
     #[test]
     fn generated_procedure_constants_match_dispatch_table() {
+        assert_eq!(
+            generated::ngap_constants::ID_PDUSESSION_RESOURCE_MODIFY.0,
+            PROCEDURE_CODE_PDU_SESSION_RESOURCE_MODIFY
+        );
         assert_eq!(
             generated::ngap_constants::ID_NGSETUP.0,
             PROCEDURE_CODE_NG_SETUP

@@ -163,7 +163,13 @@ correlation, conditional NAS forwarding and resource effects remain caller-owned
 reports, plus unsuccessful transfers with root Causes and response diagnostics.
 Empty response roots and absent versus empty diagnostics stay distinct. The
 caller checks conditional presence, request correspondence and resource effects.
-Complete Modify messages and procedure admission remain pending.
+`modify_lists` adds bounded session requests/results with optional NAS/S-NSSAI,
+unique IDs and contained diagnostics. `modify` constructs and admits complete
+Modify Request/Response messages with partial or all-failed results, optional
+N3IWF location and response diagnostics. RAN Paging Priority is receiver-ignored.
+Callers retain session correlation, prescribed error responses and trigger policy.
+The two new public `Message`/`MessageType` variants require exhaustive match
+updates; procedure-26 Request/Response now receives typed structural dispatch.
 
 `n3iwf::context_fields` supplies standalone `Guami` and `AllowedNssai` codecs
 and `SecurityAlgorithmMasks` construction. Allowed slices reuse `opc_types::Snssai`;
@@ -184,10 +190,10 @@ Canonical encoding uses explicit aligned-PER container framing instead of
 `rasn` 0.28's misaligned generated inner-container encoder. This includes
 one/two-octet lengths and 16K–64K open-type fragments. It matches the independent
 Release 18 bytes for the 15 published-corpus outcomes, both additional UE request
-procedures, Reset/Reset Acknowledge/Error Indication, PDU Resource Notify, and 54 independent
+procedures, Reset/Reset Acknowledge/Error Indication, PDU Resource Notify, both Modify outcomes, and 54 independent
 fragmentation boundary cases. The caller supplies already-encoded IE values; typed N3IWF
 resource transfers and presence rules beyond the documented NAS, release, NG Setup
-and context/session setup, release, UE request, Reset/Error and Notify subsets
+and context/session setup, release, UE request, Reset/Error, Notify and Modify subsets
 remain pending under #787. The shared contained-field reader also rejects
 nonminimal length determinants for short values. No
 live AMF exchange or full N3IWF send capability is claimed. Paging remains structurally covered only.
