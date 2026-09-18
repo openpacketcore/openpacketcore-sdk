@@ -925,6 +925,62 @@ mod tests {
     #[derive(Clone)]
     struct FailingAudit;
 
+    #[derive(Default)]
+    struct FailingTerminalAudit {
+        events: Mutex<Vec<AuditEvent>>,
+        async_only: bool,
+        panic_on_terminal: bool,
+    }
+
+    #[derive(Default)]
+    struct SwitchableIntentAudit {
+        fail_intent: AtomicBool,
+    }
+
+    impl AuditSink for SwitchableIntentAudit {
+        fn record(&self, event: &AuditEvent) -> Result<(), AuditError> {
+            if event.outcome == AuditOutcome::Intent && self.fail_intent.load(Ordering::SeqCst) {
+                Err(AuditError::unavailable("synthetic intent failure"))
+            } else {
+                Ok(())
+            }
+        }
+    }
+
+    impl FailingTerminalAudit {
+        fn record_event(&self, event: &AuditEvent) -> Result<(), AuditError> {
+            self.events.lock().expect("audit mutex").push(event.clone());
+            if event.outcome == AuditOutcome::Intent {
+                Ok(())
+            } else if self.panic_on_terminal {
+                panic!("synthetic terminal sink panic")
+            } else {
+                Err(AuditError::unavailable("synthetic terminal append failure"))
+            }
+        }
+    }
+
+    impl AuditSink for FailingTerminalAudit {
+        fn record(&self, event: &AuditEvent) -> Result<(), AuditError> {
+            assert!(!self.async_only, "native async override must be used");
+            self.record_event(event)
+        }
+
+        fn record_async<'a>(
+            &'a self,
+            event: &'a AuditEvent,
+        ) -> Pin<Box<dyn Future<Output = Result<(), AuditError>> + Send + 'a>> {
+            Box::pin(async move {
+                if self.async_only {
+                    tokio::task::yield_now().await;
+                    self.record_event(event)
+                } else {
+                    self.record(event)
+                }
+            })
+        }
+    }
+
     impl AuditSink for FailingAudit {
         fn record(&self, _event: &AuditEvent) -> Result<(), AuditError> {
             Err(AuditError::unavailable(
@@ -4853,6 +4909,235 @@ mod tests {
                 .hostname,
             "amf-1"
         );
+    }
+
+    #[tokio::test]
+    async fn audit_failure_preserves_known_set_commit() {
+        for (async_only, panic_on_terminal) in
+            [(false, false), (false, true), (true, false), (true, true)]
+        {
+            let audit = Arc::new(FailingTerminalAudit {
+                async_only,
+                panic_on_terminal,
+                ..Default::default()
+            });
+            let service = authenticated_service_with_policy_and_audit(
+                allow_all_read_write_policy(),
+                audit.clone(),
+            )
+            .await;
+            let bus = service.server().binding().config_bus();
+            let before = bus.current_snapshot().version;
+            let failures_before = METRICS
+                .gnmi_terminal_audit_failures_total
+                .load(Ordering::Relaxed);
+            let response = service
+                .set(authenticated_set_request(hostname_set(
+                    "committed-host",
+                    Vec::new(),
+                )))
+                .await;
+
+            // Check the independent configuration authority before the wire result.
+            let after = bus.current_snapshot();
+            assert_eq!(after.config.hostname, "committed-host");
+            assert!(after.version > before);
+            let response = response
+                .expect("known commit remains successful")
+                .into_inner();
+            assert_eq!(response.response.len(), 1);
+            let events = audit.events.lock().expect("audit mutex");
+            assert_eq!(events.len(), 2);
+            assert_eq!(events[0].outcome, AuditOutcome::Intent);
+            assert_eq!(events[1].outcome, AuditOutcome::Success);
+            assert_eq!(events[0].request_id, events[1].request_id);
+            assert!(
+                METRICS
+                    .gnmi_terminal_audit_failures_total
+                    .load(Ordering::Relaxed)
+                    > failures_before
+            );
+            let exported = opc_redaction::metrics::export_prometheus_text();
+            assert!(exported.contains("opc_gnmi_terminal_audit_failures_total "));
+            assert!(!exported.contains("opc_gnmi_terminal_audit_failures_total{"));
+        }
+    }
+
+    #[tokio::test]
+    async fn audit_failure_preserves_set_authorization_denial() {
+        let service = authenticated_service_with_write_authorizer_and_audit(
+            Arc::new(DenyWriteAuthorizer),
+            Arc::new(FailingTerminalAudit::default()),
+        )
+        .await;
+        let bus = service.server().binding().config_bus();
+        let before = bus.current_snapshot().version;
+        let status = service
+            .set(authenticated_set_request(gnmi::SetRequest {
+                replace: vec![json_update(hostname_path(), br#""rejected-host""#.to_vec())],
+                ..gnmi::SetRequest::default()
+            }))
+            .await
+            .expect_err("authorization denial");
+        assert_eq!(bus.current_snapshot().version, before);
+        assert_eq!(bus.current_snapshot().config.hostname, "amf-1");
+        assert_eq!(status.code(), Code::PermissionDenied);
+        assert_eq!(status.message(), "gNMI access denied");
+    }
+
+    #[tokio::test]
+    async fn audit_failure_preserves_set_validation_rejection() {
+        let service = authenticated_service_with_policy_and_audit(
+            allow_all_read_write_policy(),
+            Arc::new(FailingAudit),
+        )
+        .await;
+        let bus = service.server().binding().config_bus();
+        let before = bus.current_snapshot().version;
+        let status = service
+            .set(authenticated_set_request(gnmi::SetRequest::default()))
+            .await
+            .expect_err("empty Set is invalid");
+        assert_eq!(bus.current_snapshot().version, before);
+        assert_eq!(status.code(), Code::InvalidArgument);
+        assert_eq!(status.message(), "invalid gNMI request");
+    }
+
+    #[tokio::test]
+    async fn failed_audit_intent_prevents_confirm_and_cancel() {
+        for control in [
+            CommitConfirmedExtension::confirm(),
+            CommitConfirmedExtension::cancel(),
+        ] {
+            let bus = Arc::new(
+                ConfigBus::new_dev_only(initial_config(), MockManagedDatastore::new())
+                    .await
+                    .expect("bus"),
+            );
+            let audit = Arc::new(SwitchableIntentAudit::default());
+            let service =
+                authenticated_service_with_policy_bus_events_audit_extensions_arbitration(
+                    Arc::new(FixedPolicy(allow_all_read_write_policy())),
+                    Arc::clone(&bus),
+                    None,
+                    MgmtLimits::default(),
+                    audit.clone(),
+                    Arc::new(TestOperationalState),
+                    TestProtocolOptions::new(
+                        ExtensionRegistry::with_commit_confirmed().expect("extensions"),
+                        GnmiArbitrationConfig::optional(),
+                    ),
+                )
+                .await;
+            commit_hostname(&service, "rollback-parent").await;
+            service
+                .set(authenticated_set_request(hostname_set(
+                    "pending-host",
+                    fenced_commit_confirmed_extensions(
+                        CommitConfirmedExtension::begin(std::time::Duration::from_secs(30))
+                            .expect("begin"),
+                    ),
+                )))
+                .await
+                .expect("begin");
+            let before = bus.current_snapshot().version;
+            audit.fail_intent.store(true, Ordering::SeqCst);
+            let response = service
+                .set(authenticated_set_request(gnmi::SetRequest {
+                    extension: fenced_commit_confirmed_extensions(control),
+                    ..gnmi::SetRequest::default()
+                }))
+                .await;
+            assert_eq!(bus.current_snapshot().version, before);
+            assert_eq!(bus.current_snapshot().config.hostname, "pending-host");
+            assert!(
+                response.is_err(),
+                "failed intent forbids the control mutation"
+            );
+
+            // A rejected confirm must leave the pending operation cancellable.
+            audit.fail_intent.store(false, Ordering::SeqCst);
+            service
+                .set(authenticated_set_request(gnmi::SetRequest {
+                    extension: fenced_commit_confirmed_extensions(
+                        CommitConfirmedExtension::cancel(),
+                    ),
+                    ..gnmi::SetRequest::default()
+                }))
+                .await
+                .expect("pending operation survives the rejected control");
+            assert_eq!(bus.current_snapshot().config.hostname, "rollback-parent");
+        }
+    }
+
+    #[tokio::test]
+    async fn audit_failure_preserves_confirm_and_cancel_result() {
+        for cancel in [false, true] {
+            let bus = Arc::new(
+                ConfigBus::new_dev_only(initial_config(), MockManagedDatastore::new())
+                    .await
+                    .expect("bus"),
+            );
+            let service =
+                authenticated_service_with_policy_bus_events_audit_extensions_arbitration(
+                    Arc::new(FixedPolicy(allow_all_read_write_policy())),
+                    Arc::clone(&bus),
+                    None,
+                    MgmtLimits::default(),
+                    Arc::new(FailingTerminalAudit::default()),
+                    Arc::new(TestOperationalState),
+                    TestProtocolOptions::new(
+                        ExtensionRegistry::with_commit_confirmed().expect("extensions"),
+                        GnmiArbitrationConfig::optional(),
+                    ),
+                )
+                .await;
+            commit_hostname(&service, "rollback-parent").await;
+            service
+                .set(authenticated_set_request(hostname_set(
+                    "pending-host",
+                    fenced_commit_confirmed_extensions(
+                        CommitConfirmedExtension::begin(std::time::Duration::from_secs(30))
+                            .expect("begin"),
+                    ),
+                )))
+                .await
+                .expect("begin remains successful despite failed terminal recording");
+            service
+                .set(authenticated_set_request(gnmi::SetRequest {
+                    extension: fenced_commit_confirmed_extensions(if cancel {
+                        CommitConfirmedExtension::cancel()
+                    } else {
+                        CommitConfirmedExtension::confirm()
+                    }),
+                    ..gnmi::SetRequest::default()
+                }))
+                .await
+                .expect("known control result remains successful");
+            assert_eq!(
+                bus.current_snapshot().config.hostname,
+                if cancel {
+                    "rollback-parent"
+                } else {
+                    "pending-host"
+                }
+            );
+            if !cancel {
+                let reply = service
+                    .set(authenticated_set_request(gnmi::SetRequest {
+                        extension: fenced_commit_confirmed_extensions(
+                            CommitConfirmedExtension::cancel(),
+                        ),
+                        ..gnmi::SetRequest::default()
+                    }))
+                    .await;
+                assert!(
+                    reply.is_err(),
+                    "confirmed operation can no longer be cancelled"
+                );
+                assert_eq!(bus.current_snapshot().config.hostname, "pending-host");
+            }
+        }
     }
 
     #[tokio::test]

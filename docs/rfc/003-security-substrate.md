@@ -640,6 +640,17 @@ recovery mode.
 
 ### 11.2 External Audit Sink
 
+Required mutation intent acknowledgement precedes configuration submission.
+An intent failure or unknown acknowledgement does not authorize a mutation.
+After an authoritative configuration commit, terminal audit failure MUST NOT
+turn the known commit into an ordinary failed-write reply. A terminal audit
+failure also MUST NOT replace the original authorization or validation
+rejection. Servers report this degradation with bounded, value-free diagnostics.
+The server fixes tracked by #796 enforce this ordering and reply behavior;
+recoverable terminal obligations, cancellation recovery, and fleet operation
+receipts still require the replicated authority tracked by #797. A failure
+counter is not a durable recovery record.
+
 Carrier profiles SHOULD stream audit events to an external append-only system.
 Local SQLite audit is necessary for recovery and debugging but is not sufficient
 against host-level compromise.
