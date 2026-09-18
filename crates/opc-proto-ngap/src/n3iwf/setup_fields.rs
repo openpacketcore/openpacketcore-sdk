@@ -457,6 +457,26 @@ impl<'a> Reader<'a> {
         }
         Ok(())
     }
+    pub(super) fn open_octets(&mut self, maximum: usize) -> Result<Cow<'a, [u8]>, DecodeError> {
+        self.align()?;
+        let start = self.bit / 8;
+        let tail = self
+            .input
+            .get(start..)
+            .ok_or_else(|| invalid("truncated octets"))?;
+        // A qualified small root cannot contain a 16K fragment. Reject before
+        // the shared scanner would coalesce it; larger fields remain bounded
+        // by the already checked enclosing input and physical fragment sizes.
+        if maximum < 16384 && tail.first().is_some_and(|v| *v >= 192) {
+            return Err(invalid("contained field length"));
+        }
+        let (rest, value) = aper::open_type(tail)?;
+        if value.len() > maximum {
+            return Err(invalid("contained field length"));
+        }
+        self.bit = (self.input.len() - rest.len()) * 8;
+        Ok(value)
+    }
     fn octets(&mut self) -> Result<[u8; 3], DecodeError> {
         self.align()?;
         Ok([

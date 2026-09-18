@@ -359,9 +359,9 @@ root reader/writer covers only the qualified 5QI 9 shape. The transfer reuses
 the existing canonical container framing. All 274 vectors seed fuzz/replay;
 ordinary tests exercise every truncation and bounded byte mutations.
 
-Remaining work includes outer session lists, additional applicable fields/QoS
-profiles and whole-message presence rules. The qualified resource-result
-transfer subset is described below. No local procedure trigger is enabled here.
+Remaining work includes additional applicable fields/QoS profiles and
+whole-message presence rules. The qualified resource-result transfers and
+outer session lists are described below. No local procedure trigger is enabled here.
 
 ## N3IWF resource setup-result transfers
 
@@ -404,6 +404,64 @@ including unaligned root Cause fields. All vectors seed fuzz/replay; ordinary
 tests exercise every truncation and three mutations of every reference byte,
 plus size/count/depth, extension, padding and redaction checks. This establishes
 neither additional profile coverage nor live peer interoperability.
+
+## N3IWF session setup lists
+
+`n3iwf::session_lists` admits seven independently qualified Release 18 list
+roots. The public types group only layouts proven to have identical bytes:
+
+| Type | Qualified ASN.1 roots | Receive depth |
+| --- | --- | --- |
+| `SessionSetupRequests` | `PDUSessionResourceSetupListCxtReq`, `PDUSessionResourceSetupListSUReq` | 13 |
+| `SuccessfulSessions` | `PDUSessionResourceSetupListCxtRes`, `PDUSessionResourceSetupListSURes` | 9 |
+| `FailedSessions` | `PDUSessionResourceFailedToSetupListCxtFail`, `PDUSessionResourceFailedToSetupListCxtRes`, `PDUSessionResourceFailedToSetupListSURes` | 6 |
+
+Each list requires 1–256 distinct root session IDs (0–255), preserving input
+order. Request items include S-NSSAI, optional NAS (absent and present-empty
+remain distinct), and an admitted non-GBR request transfer. Results use the
+qualified response/unsuccessful transfers. `SessionResults` rejects a session
+appearing in both result lists. Empty paired results are representable because
+context setup may request no resources; enclosing PDU Setup admission must
+require a nonempty result. Request/result correlation remains caller-owned.
+
+Counts must fit physical input and `max_ies` before list allocation. The outer
+count and each contained transfer have field-local count limits; the enclosing
+byte bound applies to their combined wire input. Nested decoders retain caller
+unknown/duplicate policies and the remaining depth. Strict unknown-critical
+rejection still precedes Drop; per-session ignored counts and unknown-notify
+identifiers are returned without their values. Malformed later entries reject
+the entire list. Optional extensions, nonzero padding and trailing bytes fail.
+Ordinary NAS borrows input; fragmented NAS is coalesced only after physical
+framing checks. Encoders preflight total size before writing NAS; encoded output
+clears on drop, and Debug/errors redact session values.
+
+Generated construction/receive is retained for the five result-list roots,
+with bounded receive preflight. The request reader reuses qualified root and
+open-type helpers because generated receive misreads aligned SD and fragmented
+fields. Fuzzing also exposed generated NAS construction repeating the wrong
+prefix in a fragmented remainder. Nonrepeating independent NAS vectors confirm
+that fault at each 16K fragment boundary; the request writer composes the existing
+S-NSSAI and open-type helpers after exact size preflight. Across 93 positive
+cases, generated construction fails 16 probes and receive fails 36, all in
+request lists. This exception adds no general ASN.1 codec.
+
+The [list oracle](tests/fixtures/n3iwf-session-lists.json) has 102 cases (93
+admitted, nine negative), including all seven roots, counts 1/2/15/16/255/256,
+session-ID boundaries, SD values, absent/empty/fragmented NAS through 65,537
+bytes, nested policy cases, partial IPv6 flow results and duplicate sessions.
+NAS bytes use distinct SHA-256-derived synthetic blocks so fragment substitution
+cannot be masked by a repeating byte ramp.
+Regenerate with `scripts/generate-ngap-session-list-fixtures.py --spec PATH
+--output PATH` in the pinned reference environment. The unmodified Pycrate
+0.8.1 plain decoder mishandles alignment after a nonempty fragmented remainder;
+the generator uses `from_aper_ws`, requires both reference encoders to agree,
+and verifies exact values and reencoding. Both modes use the independently
+compiled Release 18 schema, never the SDK codec.
+
+All cases and the original fuzz reproducer seed fuzz/replay. Tests check independent semantic values and bytes,
+size/count/depth limits, borrowing, redaction, policy propagation, disjoint
+partial results, truncations and bounded byte mutations. This does not admit
+the enclosing Initial Context/PDU Setup procedures or enable resource effects.
 
 ## Fixtures
 

@@ -123,6 +123,7 @@ pub mod release;
 pub mod resource_fields;
 pub mod resource_request;
 pub mod resource_results;
+pub mod session_lists;
 pub mod setup;
 pub mod setup_fields;
 

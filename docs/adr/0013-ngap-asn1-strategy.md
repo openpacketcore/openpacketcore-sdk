@@ -287,4 +287,30 @@ unsupported optionals, extensions, padding and trailing bytes. The independent
 547-case oracle covers all root Causes at all four first-failure offsets, every
 accepted-list size and partial-result split. Reuse shared Cause values and
 distinct downlink transport, without adding general ASN.1 behavior or any
-resource/procedure side effect. Outer session-list admission remains pending.
+resource/procedure side effect. Outer session-list admission is qualified below.
+
+## Session setup-list amendment (2026-09)
+
+Retain generated construction and receive for the five successful/failed list
+roots after physical count, flag, length, duplicate and padding preflight.
+Thirty-six of 93 generated receive probes fail, all in the two request-list
+roots with aligned SD or fragmented fields. The bounded reader exception covers
+those request layouts using qualified S-NSSAI and open-type helpers.
+
+Fuzzing found a generated request encoder defect masked by the original repeating
+NAS ramp: a one-byte mutation in the fragmented remainder was lost on reencoding.
+Strengthened independent vectors use distinct SHA-256-derived synthetic blocks
+and cover both sides of every 16K boundary through 65,537 bytes. They expose
+16 generated encode failures, including two retained unknown-transfer fragments.
+The request writer may compose existing S-NSSAI and fragment helpers after exact
+size preflight. Preserve ordinary NAS borrowing, nested caller policies, unique
+session IDs and disjoint partial results. The 102-case reference corpus and the
+original fuzz reproducer guard this bounded exception; no general ASN.1 codec
+is introduced.
+
+The reference generator uses unmodified Pycrate structured decoding because its
+plain fragment decoder advances the final remainder's alignment offset in
+octets instead of bits. Both independent encoder modes must agree, and the
+structured decoder must reproduce the source values and bytes. Keep this
+reference-tool limitation visible; successful round trips alone do not prove
+live interoperability. Enclosing procedure admission remains separate work.

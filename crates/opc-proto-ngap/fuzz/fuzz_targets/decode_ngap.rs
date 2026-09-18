@@ -10,6 +10,9 @@ use opc_proto_ngap::n3iwf::resource_fields::{
 };
 use opc_proto_ngap::n3iwf::resource_request::SetupRequestTransfer;
 use opc_proto_ngap::n3iwf::resource_results::{SetupFailureTransfer, SetupResponseTransfer};
+use opc_proto_ngap::n3iwf::session_lists::{
+    FailedSessions, SessionResults, SessionSetupRequests, SuccessfulSessions,
+};
 use opc_proto_ngap::n3iwf::setup::{
     AmfName, GlobalN3iwfId, PagingDrx, PlmnSupportList, ServedGuamiList, SetupMessage,
     SupportedTaList,
@@ -111,6 +114,48 @@ fuzz_target!(|data: &[u8]| {
         let wire = value.encode(output).unwrap();
         assert!(SetupFailureTransfer::decode(wire.as_bytes(), result_ctx).unwrap() == value);
     }
+    let list_ctx = DecodeContext {
+        max_ies: 256,
+        ..decode
+    };
+    let list_output = EncodeContext {
+        max_message_len: 200_000,
+        ..EncodeContext::default()
+    };
+    if let Ok(value) = SessionSetupRequests::decode(data, list_ctx) {
+        let wire = value.requests.encode(list_output).unwrap();
+        let admitted = SessionSetupRequests::decode(wire.as_bytes(), list_ctx).unwrap();
+        assert!(admitted.diagnostics.is_empty());
+        assert_eq!(
+            admitted.requests.values().len(),
+            value.requests.values().len()
+        );
+        for (got, expected) in admitted
+            .requests
+            .values()
+            .iter()
+            .zip(value.requests.values())
+        {
+            assert_eq!(got.id.value(), expected.id.value());
+            assert!(got.slice == expected.slice);
+            assert!(got.transfer == expected.transfer);
+            assert!(
+                got.nas.as_ref().map(|v| v.as_bytes())
+                    == expected.nas.as_ref().map(|v| v.as_bytes())
+            );
+        }
+    }
+    let successful = SuccessfulSessions::decode(data, list_ctx).ok();
+    let failed = FailedSessions::decode(data, list_ctx).ok();
+    if let Some(value) = &successful {
+        let wire = value.encode(list_output).unwrap();
+        assert!(SuccessfulSessions::decode(wire.as_bytes(), list_ctx).unwrap() == *value);
+    }
+    if let Some(value) = &failed {
+        let wire = value.encode(list_output).unwrap();
+        assert!(FailedSessions::decode(wire.as_bytes(), list_ctx).unwrap() == *value);
+    }
+    let _ = SessionResults::new(successful, failed);
     if let Ok(field) = Guami::decode(data, decode) {
         let wire = field.encode(output).unwrap();
         assert!(Guami::decode(wire.as_bytes(), decode).unwrap() == field);
