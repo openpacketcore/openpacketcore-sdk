@@ -38,6 +38,10 @@ use opc_tls::{
 };
 use opc_types::{NetworkFunctionKind, TenantId};
 
+#[cfg(target_os = "linux")]
+#[path = "consensus_transport/majority_recovery.rs"]
+mod majority_recovery;
+
 const SERVER_REPLICA: u16 = 2;
 const CLUSTER_TRANSITION_TIMEOUT: Duration = Duration::from_millis(
     DURABLE_CONSENSUS_TIMING_PROFILE
