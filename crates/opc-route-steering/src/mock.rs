@@ -25,8 +25,8 @@ use crate::model::{
     RuleConflict, RuleConvergenceOutcome, RuleMismatch, RuleReadback, RuleRequest,
 };
 use crate::validation::{
-    canonical_route_request, validate_owned_rule_request, validate_route_request,
-    validate_rule_request,
+    canonical_route_request, source_only_rules_are_provably_disjoint, validate_owned_rule_request,
+    validate_route_request, validate_rule_request,
 };
 
 /// One recorded call against the mock backend.
@@ -608,11 +608,21 @@ impl MockRouteSteeringBackend {
         let Some(candidates) = state.rules.get(&RuleKernelKey::from_request(request)) else {
             return Ok(RuleReadback::Absent);
         };
+        let candidates = candidates
+            .iter()
+            .filter(|candidate| {
+                !(candidate.owned
+                    && source_only_rules_are_provably_disjoint(request, &candidate.request))
+            })
+            .collect::<Vec<_>>();
+        if candidates.is_empty() {
+            return Ok(RuleReadback::Absent);
+        }
         let candidate_count = candidate_count(candidates.len())?;
         let mut aggregate = RuleMismatch::default();
         let mut resident = None;
         let mut exact_count = 0_u16;
-        for candidate in candidates {
+        for candidate in &candidates {
             let mismatch = RuleMismatch {
                 source: candidate.request.source != request.source,
                 destination: candidate.request.destination != request.destination,
@@ -2188,6 +2198,60 @@ mod tests {
                 rollback: RouteSteeringFailureClass::Io,
             }
         ));
+    }
+
+    #[tokio::test]
+    async fn exact_owned_source_siblings_match_linux_readback_and_cleanup() {
+        let backend = MockRouteSteeringBackend::new();
+        let first = sibling_rule(10);
+        let second = sibling_rule(11);
+        backend.seed_rule(first.clone()).unwrap();
+        backend.seed_rule(second.clone()).unwrap();
+        assert_eq!(
+            backend.read_rule(&first).await.unwrap(),
+            RuleReadback::ExactPresent
+        );
+        backend.remove_converged_rule(first.clone()).await.unwrap();
+        assert_eq!(
+            backend.read_rule(&first).await.unwrap(),
+            RuleReadback::Absent
+        );
+        assert_eq!(
+            backend.read_rule(&second).await.unwrap(),
+            RuleReadback::ExactPresent
+        );
+        assert_eq!(backend.operations(), vec![MockOperation::RemoveRule(first)]);
+    }
+
+    #[tokio::test]
+    async fn exact_source_sibling_readback_keeps_foreign_and_overlapping_candidates() {
+        for variant in 0..4 {
+            let backend = MockRouteSteeringBackend::new();
+            let target = sibling_rule(10);
+            let mut sibling = sibling_rule(11);
+            backend.seed_rule(target.clone()).unwrap();
+            match variant {
+                0 => backend.seed_foreign_rule(sibling).unwrap(),
+                1 => {
+                    sibling.source.as_mut().unwrap().prefix_len = 24;
+                    backend.seed_rule(sibling).unwrap();
+                }
+                2 => {
+                    sibling.table += 1;
+                    backend.seed_rule(sibling).unwrap();
+                }
+                _ => {
+                    sibling.destination = sibling.source;
+                    backend.seed_rule(sibling).unwrap();
+                }
+            }
+            assert!(matches!(
+                backend.read_rule(&target).await.unwrap(),
+                RuleReadback::Conflict(_)
+            ));
+            assert!(backend.remove_converged_rule(target).await.is_err());
+            assert!(backend.operations().is_empty());
+        }
     }
 
     #[tokio::test]

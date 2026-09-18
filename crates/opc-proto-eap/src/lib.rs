@@ -1,4 +1,8 @@
-//! Typed, redaction-safe EAP-AKA and EAP-AKA-prime packet projection.
+//! Typed EAP-AKA projections and bounded EAP-5G bootstrap envelopes.
+//!
+//! [`eap5g`] constructs and parses TS 24.502 bootstrap messages with typed AN
+//! parameters, explicit caller bounds and opaque NAS. Its public value wrappers
+//! redact diagnostics. It implements no subscriber authentication decisions.
 //!
 //! [`EapAkaPacket::parse`] accepts one complete EAP Request or Response with
 //! Type 23 or Type 50. It validates the exact EAP length, AKA method header,
@@ -35,6 +39,8 @@
 mod error;
 mod model;
 mod parser;
+
+pub mod eap5g;
 
 pub use error::{EapAkaCombinationError, EapAkaError};
 pub use model::{

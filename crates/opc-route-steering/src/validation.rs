@@ -164,3 +164,92 @@ fn validate_table(table: u32, field: &'static str) -> Result<(), RouteSteeringEr
     }
     Ok(())
 }
+
+/// The exact source-only sibling relation shared by readback and scheduling.
+pub(crate) fn source_only_rules_are_provably_disjoint(
+    first: &RuleRequest,
+    second: &RuleRequest,
+) -> bool {
+    first.destination.is_none()
+        && first.fwmark.is_none()
+        && second.destination.is_none()
+        && second.fwmark.is_none()
+        && first.table == second.table
+        && first.priority == second.priority
+        && source_prefixes_are_provably_disjoint(first.source, second.source)
+}
+
+/// Whether two source selectors are provably disjoint IP prefix sets.
+///
+/// This returns `true` only for two non-wildcard prefixes of the same family
+/// whose network bits differ within their shared prefix length. It ignores
+/// host bits, and returns `false` for absent, wildcard, cross-family, or
+/// out-of-range selectors so callers fail closed unless disjointness is
+/// certain.
+fn source_prefixes_are_provably_disjoint(
+    first: Option<IpPrefix>,
+    second: Option<IpPrefix>,
+) -> bool {
+    match (first, second) {
+        (
+            Some(IpPrefix {
+                address: IpAddr::V4(first),
+                prefix_len: first_len,
+            }),
+            Some(IpPrefix {
+                address: IpAddr::V4(second),
+                prefix_len: second_len,
+            }),
+        ) => prefix_octets_are_provably_disjoint(
+            &first.octets(),
+            first_len,
+            &second.octets(),
+            second_len,
+            32,
+        ),
+        (
+            Some(IpPrefix {
+                address: IpAddr::V6(first),
+                prefix_len: first_len,
+            }),
+            Some(IpPrefix {
+                address: IpAddr::V6(second),
+                prefix_len: second_len,
+            }),
+        ) => prefix_octets_are_provably_disjoint(
+            &first.octets(),
+            first_len,
+            &second.octets(),
+            second_len,
+            128,
+        ),
+        _ => false,
+    }
+}
+
+fn prefix_octets_are_provably_disjoint(
+    first: &[u8],
+    first_len: u8,
+    second: &[u8],
+    second_len: u8,
+    max_prefix_len: u8,
+) -> bool {
+    if first_len == 0
+        || second_len == 0
+        || first_len > max_prefix_len
+        || second_len > max_prefix_len
+    {
+        return false;
+    }
+    let shared_prefix_len = first_len.min(second_len);
+    let whole_bytes = usize::from(shared_prefix_len / 8);
+    if first[..whole_bytes] != second[..whole_bytes] {
+        return true;
+    }
+    let remaining_bits = shared_prefix_len % 8;
+    if remaining_bits == 0 {
+        return false;
+    }
+    let mask = u8::MAX << (8 - remaining_bits);
+    first[whole_bytes] & mask != second[whole_bytes] & mask
+}
