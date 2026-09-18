@@ -216,15 +216,23 @@ impl Server {
         }
     }
 
+    #[cfg(test)]
     pub fn poll_output<'a>(&mut self, buf: &'a mut [u8]) -> Output<'a> {
+        self.poll_output_with_record(buf).0
+    }
+
+    pub fn poll_output_with_record<'a>(
+        &mut self,
+        buf: &'a mut [u8],
+    ) -> (Output<'a>, Option<crate::Rfc6083ApplicationRecord>) {
         if let Some(event) = self.local_events.front() {
             let output = event.to_output(buf, &self.client_certificates);
             if !matches!(&output, Output::BufferTooSmall { .. }) {
                 self.local_events.pop_front();
             }
-            return output;
+            return (output, None);
         }
-        self.engine.poll_output(buf, self.last_now)
+        self.engine.poll_output_with_record(buf, self.last_now)
     }
 
     pub fn handle_timeout(&mut self, now: Instant) -> Result<(), Error> {

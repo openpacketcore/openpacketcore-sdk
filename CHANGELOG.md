@@ -143,6 +143,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `Ikev2SaInitCryptoErrorCode` to `Ikev2ChildSaKeyMaterialDiagnostic`.
 
 ### Added
+- Vendored DTLS: pair RFC 6083 application plaintext with its exact decrypted
+  record number for later SCTP stream correlation, preserving the existing
+  Diameter polling API. Complete NGAP stream support remains pending (Refs #794).
 - `opc-ipsec-xfrm::child_sa`: bounded, immutable caller-selected class/default
   intentions with exact directional ESP identities and explicit rekey overlap.
   Refuse ambiguous Linux SA lookup domains and stale incarnation metadata;
