@@ -1222,6 +1222,7 @@ pub struct SdkMetrics {
     pub gnmi_nacm_denials_total: Mutex<HashMap<String, u64>>,
     pub gnmi_extensions_total: Mutex<HashMap<(String, String), u64>>,
     pub gnmi_arbitration_denials_total: Mutex<HashMap<String, u64>>,
+    pub gnmi_terminal_audit_failures_total: AtomicU64,
 
     // === NETCONF Server (opc-netconf-server) ===
     pub netconf_sessions_active: Mutex<HashMap<String, i64>>,
@@ -1397,6 +1398,7 @@ impl SdkMetrics {
             netconf_notifications_total: Mutex::new(HashMap::new()),
             netconf_nacm_denials_total: Mutex::new(HashMap::new()),
             netconf_terminal_audit_failures_total: AtomicU64::new(0),
+            gnmi_terminal_audit_failures_total: AtomicU64::new(0),
         }
     }
 
@@ -1681,6 +1683,8 @@ impl SdkMetrics {
             }
         }
         self.netconf_terminal_audit_failures_total
+            .store(0, Ordering::Relaxed);
+        self.gnmi_terminal_audit_failures_total
             .store(0, Ordering::Relaxed);
     }
 }
@@ -3212,8 +3216,17 @@ pub fn export_prometheus_text() -> String {
         &mut out,
         "opc_netconf_terminal_audit_failures_total",
         "counter",
-        "Total terminal audit writes that failed after a NETCONF commit was applied",
+        "Total terminal audit writes that failed while preserving a known NETCONF result",
         terminal_audit_failures as f64,
+    );
+    write_metric(
+        &mut out,
+        "opc_gnmi_terminal_audit_failures_total",
+        "counter",
+        "Total terminal audit writes that failed while preserving a known gNMI Set result",
+        METRICS
+            .gnmi_terminal_audit_failures_total
+            .load(Ordering::Relaxed) as f64,
     );
 
     out

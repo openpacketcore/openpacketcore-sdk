@@ -15,6 +15,7 @@ from unittest import mock
 
 import n3iwf_fixture_oracles as oracle
 import n3iwf_key_reference as key_reference
+import n3iwf_gtpu_reference as gtpu_reference
 
 ROOT = Path(__file__).resolve().parents[1]
 FIXTURES = ROOT / "crates/opc-n3iwf-fixtures/fixtures"
@@ -25,6 +26,48 @@ def wire(subset, name):
 
 
 class WireRegressions(unittest.TestCase):
+    def test_psc_catalog_cannot_replace_independent_source_evidence(self):
+        original = json.loads((FIXTURES / "n3-gtpu/reference-dl-9-1-7.json").read_text())
+        data = wire("n3-gtpu", "reference-dl-9-1-7")
+        rows = gtpu_reference.reference_rows()
+        gtpu_reference.validate(original, data, rows)
+        for mutation, reason in (
+            ("path", "psc-reference-path"), ("digest", "psc-reference-digest"),
+            ("case", "psc-reference-case"), ("wire", "psc-reference-wire"),
+            ("rqi", "psc-reference-fields"), ("ppi", "psc-reference-fields"),
+            ("qfi", "psc-reference-fields"), ("pdu_type", "psc-reference-fields"),
+            ("rqi_type", "psc-reference-fields"), ("ppi_type", "psc-reference-fields"),
+            ("direction", "psc-reference-direction"),
+            ("claims", "psc-reference-claims"), ("authority", "psc-reference-authority"),
+            ("provenance", "psc-reference-provenance"), ("outcome", "psc-reference-outcome"),
+            ("runtime_claim", "psc-runtime-claim"),
+        ):
+            with self.subTest(mutation=mutation):
+                changed = json.loads(json.dumps(original))
+                payload = data
+                source = changed["context"]["source_vector"]
+                if mutation == "path": source["path"] = "../outside.tsv"
+                elif mutation == "digest": source["sha256"] = "0" * 64
+                elif mutation == "case": source["case"] = "dl-63-1-7"
+                elif mutation == "wire":
+                    payload = data[:14] + bytes([data[14] ^ 0x40]) + data[15:]
+                    changed["wire"]["digest_sha256"] = hashlib.sha256(payload).hexdigest()
+                elif mutation in ("qfi", "ppi"):
+                    changed["context"]["psc"][mutation] = 0
+                elif mutation == "rqi": changed["context"]["psc"]["rqi"] = False
+                elif mutation == "pdu_type": changed["context"]["psc"]["pdu_type"] = 1
+                elif mutation == "rqi_type": changed["context"]["psc"]["rqi"] = 1
+                elif mutation == "ppi_type": changed["context"]["psc"]["ppi"] = True
+                elif mutation == "direction": changed["direction"] = "n3-uplink"
+                elif mutation == "claims": changed["semantic_assertions"][3] = "rqi=0"
+                elif mutation == "authority": changed["source"]["release"] = "V17.0.0"
+                elif mutation == "provenance": changed["provenance"]["independent_capture"] = True
+                elif mutation == "runtime_claim": changed["runtime_claim"] = True
+                else: changed["expected_outcome"] = "constructed"
+                with self.assertRaisesRegex(gtpu_reference.Invalid, "^" + reason + "$"):
+                    gtpu_reference.validate(changed, payload, rows)
+
+
     def test_ngap_reuse_remains_bound_to_its_independent_source(self):
         spec = importlib.util.spec_from_file_location(
             "ngap_reference_gate", ROOT / "scripts/check-n3iwf-ngap-reference.py"

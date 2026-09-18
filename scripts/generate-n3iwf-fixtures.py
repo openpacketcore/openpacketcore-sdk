@@ -2275,6 +2275,45 @@ construction argument 64, not a packet with malformed spare bits.
     return fixtures
 
 
+def n3_psc_references() -> list[tuple[dict, str]]:
+    """Reuse exact independently authored packet vectors; never SDK encoding."""
+    source = "crates/opc-gtpu-dataplane/tests/n3_reference.tsv"
+    digest = "31da0a1658218432817bc181be4233fadd4fd1f36c36f3d29f087bc131b8424a"
+    path = ROOT / source
+    if path.is_symlink() or hashlib.sha256(path.read_bytes()).hexdigest() != digest:
+        raise ValueError("n3iwf_psc_reference_digest")
+    rows = {r[0]: r for line in path.read_text().splitlines()
+            if not line.startswith("#") for r in [line.split("\t")]}
+    selected = [f"dl-9-{rqi}-{ppi}" for rqi in (0, 1) for ppi in (None, *range(8))]
+    selected += [name for qfi in (0, 63) for name in (f"dl-{qfi}-1-7", f"ul-{qfi}")]
+    result = []
+    for case in selected:
+        row = rows[case]
+        if len(row) != 8 or row[2] != "accept":
+            raise ValueError("n3iwf_psc_reference_shape")
+        direction = "uplink" if row[1] == "ul" else "downlink"
+        model = {"pdu_type": int(row[1] == "ul"), "qfi": int(row[3]),
+                 "rqi": row[4] == "1", "ppi": None if row[5] == "-" else int(row[5])}
+        name = "reference-" + case.lower()
+        assertions = [f"direction={direction}", f"pdu_type={model['pdu_type']}",
+                      f"qfi={model['qfi']}", f"rqi={int(model['rqi'])}",
+                      "ppi=" + ("absent" if model['ppi'] is None else str(model['ppi'])),
+                      "payload=opaque-synthetic", "forwarding_claim=false"]
+        item = manifest(
+            subset="n3-gtpu", name=name, case_class="positive",
+            document="3GPP TS 38.415", release="V18.2.0",
+            clauses=["5.5.2", "5.5.3.1-7", "TS 29.281 V18.4.0 5.1/5.2.1/5.2.2.7"],
+            direction="n3-" + direction, role="n3iwf-to-upf" if row[1] == "ul" else "upf-to-n3iwf",
+            prerequisite="Existing shared PSC codec; packet reception does not install or authorize forwarding",
+            provenance_class="referenced-public-vector",
+            notes="Exact independently authored synthetic N3 packet; source digest and case are checked separately from catalog regeneration. No packet capture or live forwarding claim.",
+            referenced=source + "#" + case, sanitized=SYN_ID,
+            wire_name=name, wire_hex=bytes.fromhex(row[7]).hex(" "), assertions=assertions, outcome="receive")
+        item["context"].update(psc=model, source_vector={"path": source, "sha256": digest, "case": case})
+        result.append((item, bytes.fromhex(row[7]).hex(" ")))
+    return result
+
+
 def n3_gtpu(subset_dir: Path) -> list[dict]:
     echo_nz = "32 02 00 06 00 00 00 00 12 34 00 00 0e a5"
     ul_psc = "36 ff 00 08 00 00 00 01 00 05 00 85 01 10 09 00"
@@ -2508,13 +2547,21 @@ def n3_gtpu(subset_dir: Path) -> list[dict]:
             outcome="reject",
         ),
     ]
+    for item, wire in n3_psc_references():
+        fixtures.append(item)
+        wires.append(wire)
     for item, wire in zip(fixtures, wires, strict=True):
         dump_manifest(subset_dir, item, wire)
     write_readme(
         subset_dir,
         "N3 GTP-U fixture subset",
         """Reuses issue 341 typed Echo/Recovery/PSC vectors by digest. Downlink and
-uplink PDU Session Containers are direction-specific. Received Recovery is
+uplink PDU Session Containers are direction-specific. Twenty-two additional
+packets are copied unchanged from the independently authored, digest-pinned
+N3 reference corpus: QFI 9 covers both RQI values and all absent/present PPI
+values, with QFI 0/63 in both directions. A separate gate binds each manifest,
+field claim and wire back to its source case. The existing codec executes every
+packet; no forwarding installation or backend capability is claimed. Received Recovery is
 ignored and canonicalized to zero. Issue 644 checksum-offload behavior is
 dataplane runtime and is not duplicated here.
 """,
@@ -2526,7 +2573,8 @@ dataplane runtime and is not duplicated here.
             fixtures,
             constructed=["Echo Request", "Echo Response Recovery 0", "uplink PSC"],
             receive=[
-                "downlink PSC",
+                "downlink PSC with both RQI values and all absent/present PPIs",
+                "uplink/downlink QFI 0 and 63 reference packets",
                 "ignored nonzero Recovery",
                 "End Marker PSC order",
             ],
