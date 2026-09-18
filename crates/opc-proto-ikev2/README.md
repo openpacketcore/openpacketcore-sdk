@@ -22,6 +22,35 @@ state, retransmission policy, cookie policy, Child SA lifecycle, XFRM/IPsec
 programming, bearer admission or allocation policy, carrier acceptance
 evidence, or a production ePDG control-plane stack.
 
+## NWu payload profiles
+
+`nwu` adds the TS 24.502 V18.8.0 configuration and opened Child-SA payload
+profiles tracked by #786. It supports empty per-family CFG_REQUEST attributes,
+correlated CFG_REPLY/NAS endpoints, complete QoS associations and additional
+QoS parameters, one applicable UP address, network-initiated creation with
+all-packet selectors, full replacement modification, and explicit NWu deletion.
+`PendingModification` distinguishes acceptance, rejection, and ambiguous timeout;
+`PendingChildDelete` requires the ordinary/crossed received-SPI echo.
+`PendingIkeDelete` uses Protocol ID 1 with no SPIs and an empty response.
+
+`AeadPolicy` tries the caller's ordered `AeadSuite` list before peer proposal
+order and emits no integrity transform or fallback. Existing
+`Ikev2SaInitNegotiationPolicy` supplies ordered whole-IKE-suite selection.
+No default downstream suite list is included. Opened payload helpers
+return intent only; protection, key custody, replay admission, roster authority,
+retransmission scheduling and backend operations belong to their own boundaries.
+
+MOBIKE_SUPPORTED is conditional on the original IPv4 request and UE support.
+`nwu::mobike::Responder` authenticates exact UDP/500 or UDP/4500 datagrams using
+the concrete IKE provider, binds the established SA and shared message-ID
+windows, and checks explicit caller address policy. An update produces IKE
+path intent; Child-SA migration additionally requires an unpredictable COOKIE2
+probe answered on that exact path. Older probes cannot apply superseded
+updates. NAT detection reuses the admitted SHA-1 boundary; source addresses,
+cookies and crypto inputs remain absent from diagnostics.
+This does not close #786 or establish external interoperability. See
+[CONFORMANCE.md](CONFORMANCE.md#nwu-payload-profile) for exact scope and evidence.
+
 ## API Shape
 
 - `protocol_key` imports zeroizing K_N3IWF into an opaque association and

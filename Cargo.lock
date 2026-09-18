@@ -2862,6 +2862,7 @@ name = "opc-gtpu-dataplane"
 version = "0.2.0"
 dependencies = [
  "aes-gcm-siv",
+ "allocation-counter",
  "async-trait",
  "aya",
  "aya-obj",
@@ -3170,6 +3171,7 @@ name = "opc-n3iwf-fixtures"
 version = "0.2.0"
 dependencies = [
  "opc-crypto-provider",
+ "opc-proto-gre",
  "opc-proto-gtpu",
  "opc-proto-ikev2",
  "opc-proto-ngap",
@@ -3332,6 +3334,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "opc-proto-gre"
+version = "0.2.0"
+dependencies = [
+ "allocation-counter",
+ "bytes",
+ "opc-protocol",
+ "thiserror 2.0.20",
+]
+
+[[package]]
 name = "opc-proto-gtpu"
 version = "0.2.0"
 dependencies = [
@@ -3399,8 +3411,12 @@ version = "0.2.0"
 dependencies = [
  "bytes",
  "opc-protocol",
+ "opc-types",
  "rasn",
+ "serde_json",
+ "sha2 0.11.0",
  "thiserror 2.0.20",
+ "zeroize",
 ]
 
 [[package]]

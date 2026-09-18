@@ -19,6 +19,7 @@ thiserror = { workspace = true }
 # Exercise the published bytes through the existing codecs; no runtime coupling.
 opc-protocol = { path = "../opc-protocol", version = "0.2.0" }
 opc-proto-gtpu = { path = "../opc-proto-gtpu", version = "0.2.0" }
+opc-proto-gre = { path = "../opc-proto-gre", version = "0.2.0" }
 opc-proto-ngap = { path = "../opc-proto-ngap", version = "0.2.0" }
 opc-proto-ikev2 = { path = "../opc-proto-ikev2", version = "0.2.0" }
 opc-crypto-provider = { path = "../opc-crypto-provider", version = "0.2.0" }

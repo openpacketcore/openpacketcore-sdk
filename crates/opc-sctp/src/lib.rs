@@ -12,7 +12,9 @@
 //! One-to-many callers share its async ownership gate; one-to-one associations
 //! retain their wider receive/event ordering gate. Returned payloads own only
 //! the received prefix, and that prefix is zeroized in the reusable scratch
-//! before the receive operation completes.
+//! before the receive operation completes. Partial DATA stays socket-owned
+//! across receive cancellation and non-lifecycle notifications, with the same
+//! cumulative byte bound. Close clears it without waiting for receive polling.
 
 #![forbid(unsafe_code)]
 
@@ -453,7 +455,48 @@ impl ReceiveFailure {
 
 #[cfg(target_os = "linux")]
 struct ReceiveOwner {
+    // Only the scratch/receiver gate spans an await. Close can always reach the
+    // socket-owned partial record, including when a caller is cancelled.
     scratch: tokio::sync::Mutex<ReceiveScratch>,
+    state: Mutex<ReceiveState>,
+}
+
+#[cfg(target_os = "linux")]
+struct ReceiveState {
+    accumulator: Option<ReceiveAccumulator>,
+    closed: bool,
+}
+
+#[cfg(target_os = "linux")]
+impl ReceiveState {
+    fn accumulator(
+        &mut self,
+        max_message_bytes: usize,
+    ) -> Result<&mut ReceiveAccumulator, ReceiveFailure> {
+        if self.closed {
+            return Err(ReceiveFailure::close_socket(SctpError::Closed));
+        }
+        if self.accumulator.as_ref().is_some_and(|value| {
+            value.first_received.is_some() && value.max_message_bytes != max_message_bytes
+        }) {
+            return Err(ReceiveFailure::close_socket(invalid_record_error()));
+        }
+        if self
+            .accumulator
+            .as_ref()
+            .is_none_or(|value| value.first_received.is_none())
+        {
+            self.accumulator = Some(ReceiveAccumulator::new(max_message_bytes));
+        }
+        self.accumulator
+            .as_mut()
+            .ok_or_else(|| ReceiveFailure::close_socket(invalid_record_error()))
+    }
+
+    fn close(&mut self) {
+        self.closed = true;
+        self.accumulator = None;
+    }
 }
 
 #[cfg(target_os = "linux")]
@@ -461,7 +504,28 @@ impl ReceiveOwner {
     fn new() -> Self {
         Self {
             scratch: tokio::sync::Mutex::new(ReceiveScratch::new()),
+            state: Mutex::new(ReceiveState {
+                accumulator: None,
+                closed: false,
+            }),
         }
+    }
+
+    fn lock_state(&self) -> std::sync::MutexGuard<'_, ReceiveState> {
+        match self.state.lock() {
+            Ok(state) => state,
+            Err(poisoned) => {
+                let mut state = poisoned.into_inner();
+                state.close();
+                state
+            }
+        }
+    }
+
+    fn close(&self) {
+        // This lock is never held across an await. There is no cancellation
+        // guard/try_lock gap in which an abandoned partial record can survive.
+        self.lock_state().close();
     }
 
     async fn recv<S>(
@@ -472,27 +536,41 @@ impl ReceiveOwner {
     where
         S: ReceiveChunkSource,
     {
-        // Holding this gate across the complete record serializes concurrent
-        // one-to-many endpoint receivers. Associations retain a wider outer
-        // gate for receive, event, and path-state ordering.
         let mut scratch = self.scratch.lock().await;
-        let mut accumulator = ReceiveAccumulator::new(max_message_bytes);
+        let result = self
+            .recv_locked(&mut scratch, source, max_message_bytes)
+            .await;
+        if result.as_ref().is_err_and(|failure| failure.close_socket) {
+            self.close();
+        }
+        result
+    }
+
+    async fn recv_locked<S>(
+        &self,
+        scratch: &mut ReceiveScratch,
+        source: &S,
+        max_message_bytes: usize,
+    ) -> Result<InboundMessage, ReceiveFailure>
+    where
+        S: ReceiveChunkSource,
+    {
         loop {
-            let remaining = accumulator.remaining_payload_bytes().ok_or_else(|| {
-                ReceiveFailure::close_socket(SctpError::MessageTooLarge { max_message_bytes })
-            })?;
-            // Notifications share the receive queue with DATA but are not
-            // governed by the caller's payload cap. Always provide enough
-            // room for every fixed notification decoded by this crate, then
-            // enforce `remaining` independently for DATA below.
-            let chunk_len = sctp_recv_chunk_capacity(remaining);
+            let chunk_len = {
+                let mut state = self.lock_state();
+                let accumulator = state.accumulator(max_message_bytes)?;
+                let remaining = accumulator.remaining_payload_bytes().ok_or_else(|| {
+                    ReceiveFailure::close_socket(SctpError::MessageTooLarge { max_message_bytes })
+                })?;
+                // Notifications share the queue but do not consume the DATA cap.
+                sctp_recv_chunk_capacity(remaining)
+            };
             let buffer = scratch
                 .chunk_mut(chunk_len)
                 .ok_or_else(|| ReceiveFailure::close_socket(invalid_receive_scratch_error()))?;
             let received = match source.recv_chunk(buffer).await {
                 Ok(received) => received,
                 Err(error) => {
-                    // A failed syscall has no reliable returned byte count.
                     buffer.zeroize();
                     return Err(error);
                 }
@@ -500,9 +578,26 @@ impl ReceiveOwner {
             let received_prefix = scratch
                 .written_prefix(received.bytes, chunk_len)
                 .ok_or_else(|| ReceiveFailure::close_socket(invalid_receive_scratch_error()))?;
-            let assembled = accumulator.push(received, received_prefix.as_slice());
+            let assembled = {
+                let mut state = self.lock_state();
+                // Close may have completed while the syscall was pending.
+                let accumulator = state.accumulator(max_message_bytes)?;
+                let assembled = accumulator
+                    .push(received, received_prefix.as_slice())
+                    .map_err(ReceiveFailure::close_socket)?;
+                if let Some(message) = &assembled {
+                    if message.notification {
+                        accumulator
+                            .observe_notification(message)
+                            .map_err(ReceiveFailure::close_socket)?;
+                    } else {
+                        state.accumulator = None;
+                    }
+                }
+                assembled
+            };
             drop(received_prefix);
-            if let Some(message) = assembled.map_err(ReceiveFailure::close_socket)? {
+            if let Some(message) = assembled {
                 return Ok(message);
             }
         }
@@ -554,6 +649,32 @@ impl ReceiveAccumulator {
             .filter(|remaining| *remaining > 0)
     }
 
+    fn observe_notification(&mut self, message: &InboundMessage) -> Result<(), SctpError> {
+        let Some(first) = self.first_received else {
+            return Ok(());
+        };
+        match message.event {
+            Some(
+                SctpEvent::AssociationChange { assoc_id, .. } | SctpEvent::Shutdown { assoc_id },
+            ) => {
+                if first.info.is_none_or(|info| info.assoc_id == assoc_id) {
+                    // A lifecycle transition invalidates this partial record.
+                    // The event remains visible; a new record starts afresh.
+                    *self = Self::new(self.max_message_bytes);
+                }
+            }
+            Some(
+                SctpEvent::PeerAddrChange { .. }
+                | SctpEvent::SenderDry { .. }
+                | SctpEvent::Authentication { .. },
+            ) => {}
+            // An unparsed event may abort partial delivery or reset a stream.
+            // Do not concatenate a later record across an unknown transition.
+            Some(SctpEvent::Unknown { .. }) | None => return Err(invalid_record_error()),
+        }
+        Ok(())
+    }
+
     fn push(
         &mut self,
         received: opc_libsctp_sys::Received,
@@ -572,6 +693,15 @@ impl ReceiveAccumulator {
             return Err(SctpError::Closed);
         }
         if received.flags.notification {
+            if self.first_received.is_some()
+                && (!received.flags.end_of_record
+                    || received.flags.payload_truncated
+                    || received.flags.control_truncated
+                    || read_u32_ne(received_prefix, 4).map(|len| len as usize)
+                        != Some(received.bytes))
+            {
+                return Err(invalid_record_error());
+            }
             let mut notification = BytesMut::with_capacity(received.bytes);
             notification.extend_from_slice(received_prefix);
             return Ok(Some(map_recv(received, notification)));
@@ -584,6 +714,16 @@ impl ReceiveAccumulator {
             });
         }
 
+        // An incomplete ancillary record already marks the complete message
+        // untrustworthy. With complete metadata, never splice different records.
+        if let Some(first) = self.first_received {
+            if !self.control_truncated
+                && !received.flags.control_truncated
+                && !same_record_metadata(first.info, received.info)
+            {
+                return Err(invalid_record_error());
+            }
+        }
         let first = self.first_received.get_or_insert(received);
         self.payload_truncated |= received.flags.payload_truncated;
         self.control_truncated |= received.flags.control_truncated;
@@ -603,6 +743,37 @@ impl ReceiveAccumulator {
             });
         }
         Ok(None)
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn invalid_record_error() -> SctpError {
+    io_err(
+        "recv_record",
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            "inconsistent SCTP record metadata or bounds",
+        ),
+    )
+}
+
+#[cfg(target_os = "linux")]
+fn same_record_metadata(
+    first: Option<opc_libsctp_sys::RecvInfo>,
+    next: Option<opc_libsctp_sys::RecvInfo>,
+) -> bool {
+    match (first, next) {
+        (Some(first), Some(next)) => {
+            let unordered = first.flags & opc_libsctp_sys::SCTP_UNORDERED_FLAG;
+            first.stream_id == next.stream_id
+                && first.assoc_id == next.assoc_id
+                && first.ppid_network_order == next.ppid_network_order
+                && unordered == next.flags & opc_libsctp_sys::SCTP_UNORDERED_FLAG
+                // RFC 4960 6.6: an unordered message's SSN is not significant.
+                && (unordered != 0 || first.ssn == next.ssn)
+        }
+        (None, None) => true,
+        _ => false,
     }
 }
 
@@ -2830,8 +3001,9 @@ impl SctpEndpoint {
     /// Concurrent active calls share one socket-owned receive gate and are
     /// serialized in kernel receive order. Returned payloads own exactly the
     /// received bytes; the reusable scratch prefix is cleared before this
-    /// method returns. A receive future is not cancellation-safe after it
-    /// starts consuming a multi-chunk SCTP record.
+    /// method returns. Cancelling a receive preserves its partial record and
+    /// cumulative byte bound for the next caller. See the crate README for
+    /// lifecycle notifications that invalidate a partial record.
     pub async fn recv(&self) -> Result<InboundMessage, SctpError> {
         self.imp.recv().await
     }
@@ -2945,8 +3117,10 @@ impl SctpAssociation {
     /// reconciled best-effort with the kernel's current primary; if that
     /// health-only query fails, the event is returned while the last known
     /// designation is preserved. Returned payloads own exactly the received
-    /// bytes and do not borrow the socket scratch. A receive future is not
-    /// cancellation-safe after it starts consuming a multi-chunk SCTP record.
+    /// bytes and do not borrow the socket scratch. Cancelling a receive keeps
+    /// its partial record and cumulative byte bound for the next caller.
+    /// Association lifecycle notifications invalidate their partial record;
+    /// ambiguous notifications during partial delivery fail closed.
     pub async fn recv(&self) -> Result<InboundMessage, SctpError> {
         self.imp.recv().await
     }
@@ -4479,6 +4653,7 @@ mod platform {
 
         fn mark_closed(&self) {
             self.closed.store(true, Ordering::Relaxed);
+            self.recv_owner.close();
         }
     }
 
@@ -4817,6 +4992,9 @@ mod platform {
         }
     }
 }
+
+#[cfg(all(test, target_os = "linux"))]
+mod receive_resume_tests;
 
 #[cfg(test)]
 mod tests {

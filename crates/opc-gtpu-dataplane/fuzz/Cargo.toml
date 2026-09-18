@@ -1,0 +1,21 @@
+[package]
+name = "opc-gtpu-dataplane-fuzz"
+version = "0.0.0"
+edition = "2021"
+publish = false
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+opc-gtpu-dataplane = { path = ".." }
+opc-protocol = { path = "../../opc-protocol" }
+bytes = "1.8"
+
+[workspace]
+
+[[bin]]
+name = "n3_packet"
+path = "fuzz_targets/n3_packet.rs"
+test = false

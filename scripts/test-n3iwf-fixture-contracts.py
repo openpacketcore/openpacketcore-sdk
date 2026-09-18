@@ -25,6 +25,58 @@ def wire(subset, name):
 
 
 class WireRegressions(unittest.TestCase):
+    def test_gre_rejects_unsupported_legacy_flags(self):
+        manifest = json.loads((FIXTURES / "gre-qfi/positive-uplink.json").read_text())
+        original = wire("gre-qfi", "positive-uplink")
+        # RFC 2784 bit numbering starts at the most significant bit. K (2)
+        # is allowed by RFC 2890; routing (1), strict source (4), recursion
+        # (5), checksum (0), sequence (3), and version bits are not NWu.
+        for bit in [0, 1, 3, 4, 5, 13, 14, 15]:
+            data = bytearray(original)
+            data[bit // 8] |= 1 << (7 - bit % 8)
+            with self.subTest(bit=bit):
+                self.assertEqual(oracle.observe(manifest, data), ("reject", "flags"))
+
+    def test_gre_rqi_requires_downlink_direction(self):
+        manifest = json.loads((FIXTURES / "gre-qfi/positive-uplink.json").read_text())
+        data = wire("gre-qfi", "positive-downlink-rqi")
+        self.assertEqual(oracle.observe(manifest, data), ("reject", "uplink-rqi"))
+        manifest["direction"] = "n3iwf-to-ue"
+        self.assertEqual(oracle.observe(manifest, data), ("accept", None))
+
+    def test_gre_receives_reserved0_ignore_bits(self):
+        manifest = json.loads((FIXTURES / "gre-qfi/positive-uplink.json").read_text())
+        original = wire("gre-qfi", "positive-uplink")
+        for bit in range(6, 13):
+            data = bytearray(original)
+            data[bit // 8] |= 1 << (7 - bit % 8)
+            with self.subTest(bit=bit):
+                self.assertEqual(oracle.observe(manifest, data), ("accept", None))
+
+    def test_n2_default_service_port_is_38412_in_both_metadata_orders(self):
+        # IANA ng-control/sctp: 38412 decimal is 0x960c, independently of writer.
+        for name, port_offset, ppid_offset, expected_ppid in (
+            ("positive-ppid60-port", 4, 0, 60),
+            ("unknown-ppid66", 4, 0, 66),
+            ("ordering-port-before-ppid", 0, 2, 60),
+            ("duplicate-association-tuple", 4, 0, 60),
+        ):
+            data = wire("n2-sctp", name)
+            for offset in range(0, len(data), 6):
+                with self.subTest(case=name, tuple_index=offset // 6):
+                    self.assertEqual(
+                        int.from_bytes(
+                            data[offset + port_offset : offset + port_offset + 2], "big"
+                        ),
+                        38412,
+                    )
+                    self.assertEqual(
+                        int.from_bytes(
+                            data[offset + ppid_offset : offset + ppid_offset + 4], "big"
+                        ),
+                        expected_ppid,
+                    )
+
     def test_key_reference_rejects_non_octet_known_answers(self):
         reference = key_reference.read_json(key_reference.REFERENCE)
         for value in (False, 0.0, "0", -1, 256):
@@ -219,6 +271,78 @@ class WireRegressions(unittest.TestCase):
 
 
 class SemanticMutations(unittest.TestCase):
+    def test_n2_named_fields_cannot_diverge_from_wire_or_disappear(self):
+        for name, fields in (
+            ("positive-ppid60-port", ("ppid", "port")),
+            ("unknown-ppid66", ("ppid", "port")),
+            ("ordering-port-before-ppid", ("ppid", "port")),
+            ("duplicate-association-tuple", ("ppid", "port")),
+            ("positive-data-chunk", ("ppid", "user_data_len", "chunk")),
+        ):
+            path = FIXTURES / "n2-sctp" / (name + ".json")
+            original = json.loads(path.read_text())
+            data = wire("n2-sctp", name)
+            for field in fields:
+                for remove in (False, True):
+                    with self.subTest(case=name, field=field, remove=remove):
+                        changed = json.loads(json.dumps(original))
+                        changed["semantic_assertions"] = [
+                            claim
+                            for claim in changed["semantic_assertions"]
+                            if not claim.startswith(field + "=")
+                        ]
+                        if not remove:
+                            changed["semantic_assertions"].append(field + "=999")
+                        with self.assertRaisesRegex(oracle.Invalid, "^field-claim$"):
+                            oracle.validate(changed, data)
+
+    def test_n2_every_tuple_claim_is_checked_even_when_disposition_stays_duplicate(
+        self,
+    ):
+        manifest = json.loads(
+            (FIXTURES / "n2-sctp/duplicate-association-tuple.json").read_text()
+        )
+        manifest["semantic_assertions"] = [
+            "ppid=60",
+            "port=38412",
+            "tuple_count=3",
+            "duplicate_tuple=true",
+        ]
+        good = (60).to_bytes(4, "big") + (38412).to_bytes(2, "big")
+        altered = (60).to_bytes(4, "big") + (38413).to_bytes(2, "big")
+        data = good + altered + good
+        manifest["wire"]["digest_sha256"] = hashlib.sha256(data).hexdigest()
+        self.assertEqual(oracle.observe(manifest, data), ("caller-policy", None))
+        with self.assertRaisesRegex(oracle.Invalid, "^field-claim$"):
+            oracle.validate(manifest, data)
+
+    def test_n2_contradictory_repeated_claim_cannot_hide_behind_the_last_value(self):
+        original = json.loads(
+            (FIXTURES / "n2-sctp/positive-ppid60-port.json").read_text()
+        )
+        data = wire("n2-sctp", "positive-ppid60-port")
+        for field in ("port", "ppid"):
+            changed = json.loads(json.dumps(original))
+            changed["semantic_assertions"].insert(0, field + "=999")
+            with self.subTest(field=field), self.assertRaisesRegex(
+                oracle.Invalid, "^field-claim$"
+            ):
+                oracle.validate(changed, data)
+
+    def test_n2_port_mutation_with_refreshed_digest_fails_semantic_gate(self):
+        original = json.loads(
+            (FIXTURES / "n2-sctp/positive-ppid60-port.json").read_text()
+        )
+        for port in (38411, 38413, 38428):
+            changed = json.loads(json.dumps(original))
+            data = bytearray(wire("n2-sctp", "positive-ppid60-port"))
+            data[4:6] = port.to_bytes(2, "big")
+            changed["wire"]["digest_sha256"] = hashlib.sha256(data).hexdigest()
+            with self.subTest(candidate=port), self.assertRaisesRegex(
+                oracle.Invalid, "^field-claim$"
+            ):
+                oracle.validate(changed, data)
+
     def fixture(self, subset, name):
         return json.loads((FIXTURES / subset / (name + ".json")).read_text()), wire(
             subset, name

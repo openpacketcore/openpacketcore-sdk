@@ -36,3 +36,8 @@ test = false
 name = "protocol_key"
 path = "fuzz_targets/protocol_key.rs"
 test = false
+
+[[bin]]
+name = "nwu"
+path = "fuzz_targets/nwu.rs"
+test = false

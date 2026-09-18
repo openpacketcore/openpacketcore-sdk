@@ -102,3 +102,23 @@ The repository gate checks regeneration without mutation, independent wire
 and scenario oracles, existing SDK codec execution, and actual Git publication
 content/ancestry. Regression tests cover fix removal and adversarial mutations,
 including changed bytes with refreshed digests and changed caller context.
+
+## N2 port correction — 2026-09-17
+
+Four metadata vectors previously encoded `96 1c` (38428) while claiming the
+IANA `ng-control` SCTP service port 38412. They now encode `96 0c`; their
+manifest digests change with the bytes. The independent semantic oracle checks
+required PPID/port claims in both metadata orders and all repeated tuples, as
+well as DATA PPID/type/user length. Python and Rust regressions anchor the
+service port to decimal 38412 independently of the generator.
+
+The DATA vector still carries one opaque synthetic user octet; its provenance
+now says so. The 65535 negative exceeds a caller-selected maximum of 65534;
+65535 remains a valid dynamic port. Fixture classes, dispositions, runtime
+claims and transport implementation scope are unchanged. The corrected
+publication must be reviewed and merged before qualifying a new N2 consumer
+against these vectors.
+
+Authority: [IANA NG Control Plane service registration](https://www.iana.org/assignments/service-names-port-numbers/service-names-port-numbers.xhtml?search=ng-control),
+[TS 38.412 V18.1.0 clause 7](https://www.etsi.org/deliver/etsi_ts/138400_138499/138412/18.01.00_60/ts_138412v180100p.pdf),
+and [RFC 6335 section 6](https://www.rfc-editor.org/rfc/rfc6335.html#section-6).
