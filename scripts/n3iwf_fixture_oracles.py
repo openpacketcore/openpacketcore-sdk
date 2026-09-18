@@ -127,14 +127,18 @@ def ike(data, context):
     return "caller-policy" if duplicate else "accept"
 
 
-def gre(data, context, encoding):
+def gre(data, context, encoding, direction):
     if encoding == "construction-argument":
         require(len(data) == 1, "argument-size")
-        require(data[0] <= context["max_qfi"], "qfi-bound")
+        require(data[0] <= min(63, context["max_qfi"]), "qfi-bound")
         return "accept"
     require(len(data) >= 8, "truncated")
-    # TS 24.502 9.3.3.1: spare receive bits and Protocol Type are ignored.
-    require(uint(data[:2]) & 0xB007 == 0x2000, "flags")
+    # RFC 2784 2.3 / RFC 2890: only reserved bits 6..12 are ignored.
+    # NWu requires K, excludes C/S and legacy routing/recursion, and uses Ver 0.
+    require(uint(data[:2]) & 0xFC07 == 0x2000, "flags")
+    require(direction in {"ue-to-n3iwf", "n3iwf-to-ue"}, "direction")
+    require(direction != "ue-to-n3iwf" or not data[7] & 0x80, "uplink-rqi")
+    # TS 24.502 table 9.3.3-2 explicitly ignores received Protocol Type.
     return "ignore" if uint(data[2:4]) else "accept"
 
 
@@ -343,7 +347,7 @@ def observe(manifest, data):
         return key_reference.observe(data, context)
     try:
         if subset == "gre-qfi":
-            outcome = gre(data, context, manifest["encoding"])
+            outcome = gre(data, context, manifest["encoding"], manifest["direction"])
         elif subset == "n2-sctp":
             outcome = sctp(data, context, manifest["encoding"])
         elif subset == "n2-dtls":

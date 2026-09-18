@@ -54,6 +54,30 @@ tests do not prove:
 
 ## Consequences
 
+### Fixed NWu GRE profile clarification (SDK #789)
+
+The TS 24.502 NWu profile requires transmitted Protocol Type zero while
+explicitly requiring receivers to ignore nonzero values. Its direction also
+comes from the caller's transport context, not from a wire field. For this
+profile, items 2, 3, and 6 above therefore have the following narrow scope:
+
+- Golden tests assert byte-exact **canonical transmit** against independently
+  authored expected bytes, including accepted inputs that require
+  normalization. Raw-preserving NWu transmission is unsupported and must fail
+  before writing. Callers may retain the original input for inspection, but
+  forwarding arbitrary received headers is outside this fixed-profile codec.
+- Decode entry points must require direction explicitly. They reuse
+  `DecodeContext`, `DecodeError`, `Encode`, and `ToOwnedPdu`; the directionless
+  `BorrowDecode` and `OwnedDecode` traits must not silently choose a direction.
+- CONFORMANCE.md must identify every ignored received field, canonical byte
+  change, unsupported outcome, and caller-owned limit or mapping choice.
+
+This clarification does not relax independent wire evidence, adversarial
+tests, fuzz registration, bounded parsing, or value-free diagnostics. General
+GRE forwarding would require a separate declared contract and qualification.
+
+### General consequences
+
 - Writing a codec costs more up front: authoring fixtures from the spec is
   slower than round-tripping the encoder. That cost is the point — it is
   the only test construction that catches self-consistent wire errors.

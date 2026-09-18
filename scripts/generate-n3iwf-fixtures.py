@@ -2032,7 +2032,7 @@ def gre_qfi(subset_dir: Path) -> list[dict]:
             role="ue",
             prerequisite="One GRE header per packet",
             provenance_class="synthetic-negative",
-            notes="Two concatenated GRE headers",
+            notes="One GRE header followed by eight opaque payload octets shaped like a second header; no nested GRE parsing",
             referenced=None,
             sanitized=SYN_ID,
             wire_name="duplicate-key-header",
@@ -2108,7 +2108,7 @@ def gre_qfi(subset_dir: Path) -> list[dict]:
             role="n3iwf",
             prerequisite="QFI 0-63 bound",
             provenance_class="synthetic-negative",
-            notes="Octet 5 value 0x4f sets reserved bits plus a value that is not a 6-bit QFI-only encoding",
+            notes="One-octet construction argument 0x40 means QFI 64; it is rejected before wire encoding and is not a GRE packet",
             referenced=None,
             sanitized=SYN_ID,
             wire_name="bounded-qfi-overflow",
@@ -2130,9 +2130,12 @@ def gre_qfi(subset_dir: Path) -> list[dict]:
 | 4 | `09` | QFI 9 |
 | 5..6 | `00 00` | Spare |
 | 7 | `80` or `00` | RQI downlink-only |
-| 8 | `00` | Next-header / payload terminator used by these frames |
+| 8 | `00` | One opaque synthetic user payload octet |
 
-Received nonzero Protocol Type is ignored.
+Received nonzero Protocol Type is ignored. The payload is opaque; no next-header
+or terminator is defined here. The duplicate-key-header case contains one GRE
+header followed by eight opaque payload octets. The bounded-QFI case is the
+construction argument 64, not a packet with malformed spare bits.
 """,
     )
     write_completion(

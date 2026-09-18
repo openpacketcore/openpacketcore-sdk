@@ -3170,6 +3170,7 @@ name = "opc-n3iwf-fixtures"
 version = "0.2.0"
 dependencies = [
  "opc-crypto-provider",
+ "opc-proto-gre",
  "opc-proto-gtpu",
  "opc-proto-ikev2",
  "opc-proto-ngap",
@@ -3327,6 +3328,16 @@ dependencies = [
 name = "opc-proto-eap"
 version = "0.2.0"
 dependencies = [
+ "thiserror 2.0.20",
+]
+
+[[package]]
+name = "opc-proto-gre"
+version = "0.2.0"
+dependencies = [
+ "allocation-counter",
+ "bytes",
+ "opc-protocol",
  "thiserror 2.0.20",
 ]
 

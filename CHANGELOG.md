@@ -139,6 +139,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `Ikev2SaInitCryptoErrorCode` to `Ikev2ChildSaKeyMaterialDiagnostic`.
 
 ### Added
+- `opc-proto-gre`: experimental bounded NWu keyed GRE with explicit packet
+  direction, checked QFI and downlink RQI, canonical transmission, and a
+  backend-neutral association model that exposes all exact or default fallback
+  candidates. Includes independent synthetic wire vectors and bounded fuzzing;
+  SA selection, QoS policy, XFRM installation, and live interoperability remain
+  outside this crate. Cargo publication is held (Refs #789, #795).
 - `opc-proto-ngap`: optional UE Context Release Complete session reports with
   unique IDs and optional empty release-response transfers, backed by 1,287
   independent fields and 1,308 complete messages. Preflight nested framing,
