@@ -16,7 +16,7 @@ independently with `FixtureCatalog::load_subset_from(root, subset)`.
 | --- | --- |
 | `eap5g` | EAP Expanded envelope, AN TLVs, opaque inner NAS |
 | `nwu-ike` | Notify/Delete payload chains; create/modify labels identify intended use |
-| `ngap` | Independent complete Release 18.10 messages, IE matrices, nested transfers and SDK structural decode |
+| `ngap` | Independent complete Release 18.10 messages for all 23 qualified outcomes, IE matrices, nested transfers and SDK structural decode |
 | `n2-sctp` | PPID 60/port 38412 metadata and a DATA chunk with opaque user data |
 | `gre-qfi` | GRE header, QFI/RQI fields, opaque trailing payload, QFI constructor bound |
 | `n3-gtpu` | Existing SDK GTP-U codecs: Echo, Recovery, PSC, End Marker |

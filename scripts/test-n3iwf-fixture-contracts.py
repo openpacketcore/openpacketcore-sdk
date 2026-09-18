@@ -25,6 +25,49 @@ def wire(subset, name):
 
 
 class WireRegressions(unittest.TestCase):
+    def test_ngap_reuse_remains_bound_to_its_independent_source(self):
+        spec = importlib.util.spec_from_file_location(
+            "ngap_reference_gate", ROOT / "scripts/check-n3iwf-ngap-reference.py"
+        )
+        gate = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(gate)
+        reference = json.loads(
+            (
+                ROOT / "crates/opc-n3iwf-fixtures/oracles/ngap-rel18-messages.json"
+            ).read_text()
+        )
+        cases = [case for case in reference["cases"] if "source_vector" in case]
+        self.assertEqual(gate.check_reused_vectors(cases), 16)
+        for mutation, reason in (
+            ("path", "reused-vector-path"),
+            ("digest", "reused-vector-source-digest"),
+            ("case", "reused-vector-case"),
+            ("wire", "reused-vector-result"),
+            ("result", "reused-vector-result"),
+            ("field", "reused-vector-fields"),
+        ):
+            with self.subTest(mutation=mutation):
+                changed = json.loads(json.dumps(cases[0]))
+                source = changed["source_vector"]
+                if mutation == "path":
+                    source["path"] = "../outside.json"
+                elif mutation == "digest":
+                    source["sha256"] = "0" * 64
+                elif mutation == "case":
+                    source["case"] = "nonexistent"
+                elif mutation == "wire":
+                    # Refreshing the copied digest cannot invent source provenance.
+                    wire = bytearray.fromhex(changed["wire_hex"])
+                    wire[-1] ^= 1
+                    changed["wire_hex"] = wire.hex()
+                    changed["wire_sha256"] = hashlib.sha256(wire).hexdigest()
+                elif mutation == "result":
+                    changed["reference_error"] = "missing-mandatory-ie"
+                else:
+                    changed["encoded_ies"][0]["criticality"] = "ignore"
+                with self.assertRaisesRegex(gate.Invalid, "^" + reason + "$"):
+                    gate.check_reused_vectors([changed])
+
     def test_gre_rejects_unsupported_legacy_flags(self):
         manifest = json.loads((FIXTURES / "gre-qfi/positive-uplink.json").read_text())
         original = wire("gre-qfi", "positive-uplink")

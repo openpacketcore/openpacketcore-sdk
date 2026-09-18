@@ -63,7 +63,11 @@ the bundled Pycrate NGAP schema and the SDK generator are not used. The gate
 checks mandatory presence, criticality, singleton cardinality, nested ASN.1
 transfers, N3IWF node/location choice, conditional resource results, UE AMBR
 when initial context setup includes session resources, and Session AMBR for
-the reviewed non-GBR 5QI 9 profile. It exercises all 15 admitted outcomes.
+the reviewed non-GBR 5QI 9 profile. It exercises all 23 qualified outcomes. The eight added outcomes reuse 16
+positive/negative vectors from four existing independent codec corpora. Each
+reference pins its source file, case and digest; an updated local wire digest
+cannot replace that evidence. The catalog inventory, direction, procedure and
+outcome must match the runtime applicability rules for every qualified codec.
 The current SDK checks framing and opaque IE bytes against those independent
 results, and rejects incorrect procedure criticality before typed decoding.
 The complete existing Echo Request/Response and downlink PSC literals are
@@ -72,11 +76,12 @@ round trips alone do not prove external interoperability.
 
 ## Unsupported evidence
 
-- SDK NGAP mandatory/conditional presence, typed inner IE validation and
-  canonical typed encode (#787). Reference validation does not implement
-  those runtime functions. Full clause 5.3 content handling, procedures outside
-  the admitted 15 outcomes, other QoS profiles and live AMF interoperability
-  remain unproven.
+- SDK NGAP typed field admission is qualified separately by the codec
+  corpora in [opc-proto-ngap](../opc-proto-ngap/CONFORMANCE.md) (#787). This
+  catalog exercises opaque fields and canonical container construction; it
+  does not qualify every optional field or authorize a network procedure.
+  Full clause 5.3 content handling, the 17 outcomes requiring an external
+  handler, other QoS profiles and live AMF interoperability remain unproven.
 - Complete protected IKE exchanges, subscriber or certificate authentication,
   K_AMF hierarchy derivation, consume-once protocol-key custody (#791), key
   export, and actual memory zeroization. Synthetic IKE key-schedule answers
