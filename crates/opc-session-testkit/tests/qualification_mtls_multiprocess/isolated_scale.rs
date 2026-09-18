@@ -71,20 +71,10 @@ impl Fleet {
             node.send(&QualificationNodeCommand::Initialize);
         }
         for node in &mut self.nodes {
-            let reply = node.receive_until(deadline);
-            match scale.persistence {
-                QualificationIsolatedPersistence::Durable => {
-                    assert!(matches!(reply, QualificationNodeReply::Initialized));
-                }
-                QualificationIsolatedPersistence::Async => {
-                    assert!(matches!(
-                        reply,
-                        QualificationNodeReply::Error {
-                            code: QualificationNodeErrorCode::InitializationUnavailable,
-                        }
-                    ));
-                }
-            }
+            assert!(matches!(
+                node.receive_until(deadline),
+                QualificationNodeReply::Initialized
+            ));
         }
         self.verify_snapshot_namespace();
     }
@@ -105,7 +95,7 @@ impl Fleet {
             .iter_mut()
             .map(|node| match node.receive_until(deadline) {
                 QualificationNodeReply::IsolatedScaleReadiness { status } => status,
-                reply => panic!("explicit scale readiness failed: {reply:?}"),
+                _ => panic!("explicit scale readiness reply has the wrong type"),
             })
             .collect()
     }
@@ -123,7 +113,7 @@ impl Fleet {
             let reports = self.isolated_scale_reports_by(deadline);
             for report in &reports {
                 assert_eq!(report.persistence, scale.persistence);
-                assert_eq!(report.configured_voter_ids, expected_ids);
+                assert!(report.configured_voter_ids == expected_ids);
                 assert!(!report.storage_failed);
             }
             let term = reports
@@ -222,7 +212,7 @@ fn run_isolated_scale_boundary(persistence: QualificationIsolatedPersistence) {
         );
         let outcome = match result {
             SessionConsumerV2Response::FencedTransitionV2(Ok(outcome)) => outcome,
-            response => panic!("scale mutation must have an exact typed outcome: {response:?}"),
+            _ => panic!("scale mutation must have an exact successful outcome"),
         };
         assert!(outcome.matches_v2_request(&request));
         assert!(
@@ -241,7 +231,7 @@ fn run_isolated_scale_boundary(persistence: QualificationIsolatedPersistence) {
     let state =
         match fleet.nodes[leader].invoke(&QualificationNodeCommand::IsolatedScaleHistoryState) {
             QualificationNodeReply::IsolatedScaleHistory { state } => state,
-            reply => panic!("exact scale history state: {reply:?}"),
+            _ => panic!("exact scale history reply has the wrong type"),
         };
     assert_eq!(state.bound_entries(), 1);
     assert!(
@@ -263,64 +253,68 @@ fn run_isolated_scale_boundary(persistence: QualificationIsolatedPersistence) {
     assert!(cold_process_ids
         .iter()
         .all(|pid| !process_ids.contains(pid)));
-    match persistence {
-        QualificationIsolatedPersistence::Durable => {
-            let leader = fleet.wait_isolated_scale_ready(scale);
-            let (endpoint, cold_scope) = fleet.start_stateless_consumer(leader, identities.clone());
-            assert_eq!(cold_scope, scope);
-            let (source, client) = qualification_persistent_v2_client(
-                Arc::new(Mutex::new(vec![endpoint; 3])),
-                leader,
-                fleet.stateless_consumer_voter_authorities()[leader].clone(),
-                fleet.pki.consumer_identity_state(&identities[0]),
-                PersistentSessionConsumerConfig::default(),
-                Some(Duration::from_millis(800)),
-            );
-            runtime.block_on(async {
-                client.prewarm_v2().await.expect("cold durable consumer lanes");
-                let status = client.execute_v2(&SessionConsumerV2Request::new(scope,
-                    SessionConsumerV2Operation::FencedTransitionV2Status { request: Box::new(request.clone()) },
-                )).await.expect("cold durable exact receipt");
-                assert!(matches!(status, SessionConsumerV2Response::FencedTransitionV2Status(Ok(
-                    SessionConsumerV2FencedTransitionStatus::Recorded(result)
-                )) if result.as_ref() == &Ok(outcome.clone())));
-                let started = Instant::now();
-                let replay = client.execute_v2(&SessionConsumerV2Request::new(scope,
-                    SessionConsumerV2Operation::FencedTransitionV2 { request: Box::new(request.clone()) },
-                )).await.expect("cold durable exact replay");
-                assert!(started.elapsed() < Duration::from_millis(800));
-                assert!(matches!(replay, SessionConsumerV2Response::FencedTransitionV2(Ok(result)) if result == outcome));
-                client.shutdown().await;
-            });
-            drop(source);
-        }
-        QualificationIsolatedPersistence::Async => {
-            // Persisted Async roots retain their recovery quarantine even
-            // after joined shutdown. Three cold roots cannot attest a live quorum.
-            let negative_guard = Instant::now() + Duration::from_secs(1);
-            let deadline = Instant::now() + Duration::from_secs(10);
-            loop {
-                let cold = fleet.isolated_scale_reports_by(deadline);
-                assert!(cold.iter().all(|report| !report.ready
-                    && report.awaiting_live_quorum
-                    && !report.storage_failed));
-                if Instant::now() >= negative_guard {
-                    break;
-                }
-                thread::sleep(Duration::from_millis(10));
-            }
-        }
-    }
+    // Every prior OS process completed public shutdown on its retained root.
+    // Async must consume that proof and regain usable authority as Durable does.
+    // This does not model unclean process loss or lost acknowledged history.
+    let leader = fleet.wait_isolated_scale_ready(scale);
+    let (endpoint, cold_scope) = fleet.start_stateless_consumer(leader, identities.clone());
+    assert_eq!(cold_scope, scope);
+    let (source, client) = qualification_persistent_v2_client(
+        Arc::new(Mutex::new(vec![endpoint; 3])),
+        leader,
+        fleet.stateless_consumer_voter_authorities()[leader].clone(),
+        fleet.pki.consumer_identity_state(&identities[0]),
+        PersistentSessionConsumerConfig::default(),
+        Some(Duration::from_millis(800)),
+    );
+    runtime.block_on(async {
+        client.prewarm_v2().await.expect("reopened consumer lanes");
+        let status = client.execute_v2(&SessionConsumerV2Request::new(scope,
+            SessionConsumerV2Operation::FencedTransitionV2Status { request: Box::new(request.clone()) },
+        )).await.expect("reopened exact receipt");
+        assert!(matches!(status, SessionConsumerV2Response::FencedTransitionV2Status(Ok(
+            SessionConsumerV2FencedTransitionStatus::Recorded(result)
+        )) if result.as_ref() == &Ok(outcome.clone())));
+        let started = Instant::now();
+        let replay = client.execute_v2(&SessionConsumerV2Request::new(scope,
+            SessionConsumerV2Operation::FencedTransitionV2 { request: Box::new(request.clone()) },
+        )).await.expect("reopened exact replay");
+        assert!(started.elapsed() < Duration::from_millis(800));
+        assert!(matches!(replay, SessionConsumerV2Response::FencedTransitionV2(Ok(result)) if result == outcome));
+        let next = qualification_fenced_transition_v2_request(3, 1).await;
+        let started = Instant::now();
+        let response = client.execute_v2(&SessionConsumerV2Request::new(scope,
+            SessionConsumerV2Operation::FencedTransitionV2 { request: Box::new(next.clone()) },
+        )).await.expect("new operation after retained-root recovery");
+        assert!(started.elapsed() < Duration::from_millis(800));
+        let result = match response {
+            SessionConsumerV2Response::FencedTransitionV2(Ok(result)) => result,
+            _ => panic!("new operation must have an exact successful outcome"),
+        };
+        assert!(result.matches_v2_request(&next));
+        let status = client.execute_v2(&SessionConsumerV2Request::new(scope,
+            SessionConsumerV2Operation::FencedTransitionV2Status { request: Box::new(next) },
+        )).await.expect("new operation has a committed receipt");
+        assert!(matches!(status, SessionConsumerV2Response::FencedTransitionV2Status(Ok(
+            SessionConsumerV2FencedTransitionStatus::Recorded(recorded)
+        )) if recorded.as_ref() == &Ok(result)));
+        client.shutdown().await;
+    });
+    drop(source);
     let cold_reports = fleet.isolated_scale_reports();
+    assert!(cold_reports
+        .iter()
+        .all(|report| report.ready && !report.storage_failed));
     fleet.shutdown_isolated_scale_joined();
     eprintln!(
         "sdk_isolated_scale_boundary={}",
         serde_json::json!({
             "configuration": scale, "driver_pid": std::process::id(), "voter_pids": process_ids,
-            "workspace": fleet.workspace.path(), "reports": reports, "joined_shutdown": true,
-            "cold_voter_pids": cold_process_ids, "cold_reports": cold_reports,
+            "workspace": fleet.workspace.path(), "live_ready_voters": reports.len(), "joined_shutdown": true,
+            "cold_voter_pids": cold_process_ids, "cold_ready_voters": cold_reports.len(),
             "cold_durable_receipt_and_replay": persistence == QualificationIsolatedPersistence::Durable,
-            "cold_async_quarantined": persistence == QualificationIsolatedPersistence::Async,
+            "cold_receipt_and_replay": true, "post_reopen_operation": true,
+            "cold_async_quarantined": false,
             "full_cardinality": false, "performance_acceptance": false,
         })
     );

@@ -4,9 +4,24 @@ use std::panic::AssertUnwindSafe;
 
 use futures_util::{future::join_all, FutureExt};
 use opc_session_net::SessionConsensusServerHandle;
-use opc_session_store::{SessionPersistenceMode, SnapshotIntegrityPolicy};
+use opc_session_store::{
+    Clock, SessionPersistenceMode, SnapshotIntegrityPolicy, StoreError,
+    DEFAULT_SESSION_CONSENSUS_OPERATION_TIMEOUT,
+};
+use opc_types::Timestamp;
 
 use super::*;
+
+// Lease expiry is a scenario input, not an extra one-second disk-performance
+// requirement on initial setup. Raft timers and operation deadlines stay real.
+#[derive(Debug)]
+struct LeaseClock(StdMutex<Timestamp>);
+
+impl Clock for LeaseClock {
+    fn now_utc(&self) -> Timestamp {
+        *self.0.lock().unwrap()
+    }
+}
 
 struct Fleet {
     directory: tempfile::TempDir,
@@ -17,6 +32,7 @@ struct Fleet {
     stores: Vec<Option<ConsensusSessionStore>>,
     servers: Vec<Option<SessionConsensusServerHandle>>,
     mode: SessionPersistenceMode,
+    clock: Arc<LeaseClock>,
 }
 
 impl Fleet {
@@ -46,6 +62,7 @@ impl Fleet {
             stores: vec![None; 3],
             servers: (0..3).map(|_| None).collect(),
             mode,
+            clock: Arc::new(LeaseClock(StdMutex::new(Timestamp::now_utc()))),
         }
     }
 
@@ -78,12 +95,14 @@ impl Fleet {
                 (node, Arc::new(peer) as Arc<dyn SessionConsensusPeer>)
             })
             .collect();
-        let store = ConsensusSessionStore::open_fixed_quorum_with_persistence(
+        let store = ConsensusSessionStore::open_fixed_quorum_with_clock_and_persistence(
             self.topologies[index].clone(),
             SqliteSessionBackend::open(self.directory.path().join(format!("voter-{index}.sqlite")))
                 .expect("retained database"),
             self.directory.path().join(format!("snapshots-{index}")),
             peers,
+            self.clock.clone(),
+            DEFAULT_SESSION_CONSENSUS_OPERATION_TIMEOUT,
             SnapshotIntegrityPolicy::PortableVerified,
             self.mode,
         )
@@ -146,6 +165,16 @@ impl Fleet {
             tokio::time::sleep(Duration::from_millis(25)).await;
         }
     }
+
+    async fn absence(&self, authority: OldAuthority) {
+        tokio::time::sleep(Duration::from_millis(1200)).await;
+        if matches!(authority, OldAuthority::Expired) {
+            let mut time = self.clock.0.lock().unwrap();
+            *time = Timestamp::from_offset_datetime(
+                *time.as_offset_datetime() + time::Duration::milliseconds(1200),
+            );
+        }
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -155,7 +184,17 @@ enum Restart {
     AllCold,
 }
 
-async fn retained_roots_return(mode: SessionPersistenceMode, restart: Restart) {
+#[derive(Clone, Copy)]
+enum OldAuthority {
+    Expired,
+    Revoked,
+}
+
+async fn retained_roots_return(
+    mode: SessionPersistenceMode,
+    restart: Restart,
+    authority: OldAuthority,
+) {
     let mut fleet = Fleet::new(mode);
     let result = AssertUnwindSafe(async {
         for index in 0..3 {
@@ -203,6 +242,12 @@ async fn retained_roots_return(mode: SessionPersistenceMode, restart: Restart) {
                 .unwrap(),
             CompareAndSetResult::Success
         );
+        if matches!(authority, OldAuthority::Revoked) {
+            original
+                .release(old.clone())
+                .await
+                .expect("revoke the still-unexpired predecessor");
+        }
         if mode == SessionPersistenceMode::Async {
             for store in fleet.stores.iter().flatten() {
                 store
@@ -229,7 +274,7 @@ async fn retained_roots_return(mode: SessionPersistenceMode, restart: Restart) {
                         "each sequential return must recover authority"
                     );
                 }
-                tokio::time::sleep(Duration::from_millis(1200)).await;
+                fleet.absence(authority).await;
             }
             Restart::Majority | Restart::AllCold => {
                 let returning = (0..3)
@@ -238,7 +283,7 @@ async fn retained_roots_return(mode: SessionPersistenceMode, restart: Restart) {
                 for index in &returning {
                     fleet.close(*index).await;
                 }
-                tokio::time::sleep(Duration::from_millis(1200)).await;
+                fleet.absence(authority).await;
                 if let Some(original) = &original {
                     assert!(
                         !original
@@ -296,9 +341,20 @@ async fn retained_roots_return(mode: SessionPersistenceMode, restart: Restart) {
                 .unwrap(),
             CompareAndSetResult::Success
         );
-        assert!(
-            recovered.delete_fenced(&old).await.is_err(),
-            "old authority must not mutate its successor"
+        let expected = match authority {
+            OldAuthority::Expired => {
+                assert!(old.expires_at() <= fleet.clock.now_utc());
+                StoreError::LeaseExpired
+            }
+            OldAuthority::Revoked => {
+                assert!(old.expires_at() > fleet.clock.now_utc());
+                StoreError::StaleFence
+            }
+        };
+        assert_eq!(
+            recovered.delete_fenced(&old).await,
+            Err(expected),
+            "old authority must be rejected explicitly while the successor is usable"
         );
         assert!(
             recovered
@@ -321,7 +377,11 @@ async fn retained_roots_return(mode: SessionPersistenceMode, restart: Restart) {
 fn async_two_of_three_retained_roots_recover_over_mtls() {
     run_openraft_fleet_test(
         4,
-        retained_roots_return(SessionPersistenceMode::Async, Restart::Majority),
+        retained_roots_return(
+            SessionPersistenceMode::Async,
+            Restart::Majority,
+            OldAuthority::Expired,
+        ),
     );
 }
 
@@ -329,7 +389,11 @@ fn async_two_of_three_retained_roots_recover_over_mtls() {
 fn durable_two_of_three_retained_roots_recover_over_mtls() {
     run_openraft_fleet_test(
         4,
-        retained_roots_return(SessionPersistenceMode::Durable, Restart::Majority),
+        retained_roots_return(
+            SessionPersistenceMode::Durable,
+            Restart::Majority,
+            OldAuthority::Expired,
+        ),
     );
 }
 
@@ -337,7 +401,11 @@ fn durable_two_of_three_retained_roots_recover_over_mtls() {
 fn async_sequential_retained_roots_recover_over_mtls() {
     run_openraft_fleet_test(
         4,
-        retained_roots_return(SessionPersistenceMode::Async, Restart::Sequential),
+        retained_roots_return(
+            SessionPersistenceMode::Async,
+            Restart::Sequential,
+            OldAuthority::Expired,
+        ),
     );
 }
 
@@ -345,7 +413,11 @@ fn async_sequential_retained_roots_recover_over_mtls() {
 fn async_all_cold_retained_roots_recover_over_mtls() {
     run_openraft_fleet_test(
         4,
-        retained_roots_return(SessionPersistenceMode::Async, Restart::AllCold),
+        retained_roots_return(
+            SessionPersistenceMode::Async,
+            Restart::AllCold,
+            OldAuthority::Expired,
+        ),
     );
 }
 
@@ -353,6 +425,34 @@ fn async_all_cold_retained_roots_recover_over_mtls() {
 fn durable_all_cold_retained_roots_recover_over_mtls() {
     run_openraft_fleet_test(
         4,
-        retained_roots_return(SessionPersistenceMode::Durable, Restart::AllCold),
+        retained_roots_return(
+            SessionPersistenceMode::Durable,
+            Restart::AllCold,
+            OldAuthority::Expired,
+        ),
+    );
+}
+
+#[test]
+fn async_majority_restart_preserves_unexpired_credential_revocation_over_mtls() {
+    run_openraft_fleet_test(
+        4,
+        retained_roots_return(
+            SessionPersistenceMode::Async,
+            Restart::Majority,
+            OldAuthority::Revoked,
+        ),
+    );
+}
+
+#[test]
+fn async_all_cold_restart_preserves_unexpired_credential_revocation_over_mtls() {
+    run_openraft_fleet_test(
+        4,
+        retained_roots_return(
+            SessionPersistenceMode::Async,
+            Restart::AllCold,
+            OldAuthority::Revoked,
+        ),
     );
 }

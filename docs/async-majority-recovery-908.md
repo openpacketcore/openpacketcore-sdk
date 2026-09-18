@@ -67,6 +67,22 @@ exited 0; log SHA-256:
 This test drains and joins real owners. It proves orderly restart, not power
 loss, lost-tail recovery or migration of an already-fenced installation.
 
+The subsequent transport fixture also checks majority and all-cold recovery
+after explicitly revoking a still-unexpired credential. Its lease clock is a
+scenario input: it advances only for the expiry cases. Raft, TLS, operation
+deadlines and the real absence interval retain their original clocks and
+bounds. This avoids making initial disk setup an accidental one-second lease
+performance test, as exposed by the i686 CI run. Stale writes must return
+exactly `LeaseExpired` or `StaleFence`, followed by unchanged successor readback.
+
+The separate-process `isolated_scale` boundary controls use three actual voter
+processes for each mode, join successful shutdown, and reopen the same storage
+in three new processes. Both Async and Durable recover the exact prior receipt
+and replay, then commit a new request and read its receipt within the original
+800 ms client deadline. The focused two-test run passed; log SHA-256:
+`ce7dbae64c6db67e93f41076d2e46dc20924b3e7094a77cd3520f8bcf241c3db`.
+This is SDK process-boundary evidence, not product or unclean-loss qualification.
+
 Disabling only the closed-proof admission path makes the same majority and
 all-cold cases fail again, while sequential Async and both Durable controls
 still pass. This fix-removal run exited 101; log SHA-256:

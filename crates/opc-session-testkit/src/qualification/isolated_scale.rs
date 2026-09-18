@@ -106,7 +106,8 @@ pub struct QualificationIsolatedScaleReadiness {
     pub background_failed: bool,
     /// Whether the asynchronous persistence backlog is saturated.
     pub saturated: bool,
-    /// Whether an Async root has completed the live-quorum recovery fence.
+    /// Whether Async may participate after fresh creation, completed live-quorum
+    /// repair, or validated one-use evidence of completed consensus shutdown.
     pub async_active: bool,
     /// Completed automatic consensus snapshot publications.
     pub completed_snapshot_count: u64,
