@@ -3,7 +3,8 @@
 //! The backend-neutral profile checks complete SCTP records before exposing
 //! opaque NGAP bytes. The live adapter uses the same checks and the existing
 //! socket-owned partial receive accumulator. NGAP procedures, stream allocation,
-//! association generations and reconnect policy remain caller-owned.
+//! and association preference remain caller-owned. [`N2AssociationOwner`]
+//! fences a caller-selected current generation and bounds reconnect attempts.
 //!
 //! TS 38.412 V18.1.0 clause 7 retains RFC 4960 and big-endian PPIDs. IANA assigns
 //! NGAP PPID 60 and service port 38412. Additional associations may use an
@@ -19,6 +20,11 @@ use thiserror::Error;
 use crate::{
     DeliveryOrder, InboundMessage, OutboundMessage, SctpAssociation, SctpAssociationAbortHandle,
     SctpConnectConfig, SctpError, SctpEvent, SctpPathHealth, NGAP_PPID,
+};
+
+mod owner;
+pub use owner::{
+    N2AssociationOwner, N2Candidate, N2Generation, N2Readback, N2Received, N2ReconnectPolicy,
 };
 
 /// IANA's `ng-control` SCTP service port; an additional TNLA may use another port.
@@ -374,6 +380,27 @@ impl Drop for UnprotectedN2Association {
 #[non_exhaustive]
 #[derive(Debug, Error, Clone, Copy, PartialEq, Eq)]
 pub enum N2Error {
+    /// The owner was explicitly closed or its state became unavailable.
+    #[error("n2_owner_closed")]
+    OwnerClosed,
+    /// A capability belongs to another owner.
+    #[error("n2_foreign_owner")]
+    ForeignOwner,
+    /// Another transition superseded this candidate's observed owner state.
+    #[error("n2_candidate_superseded")]
+    CandidateSuperseded,
+    /// The supplied generation has retired or lost current authority.
+    #[error("n2_generation_retired")]
+    GenerationRetired,
+    /// No further distinct generation can be published without wraparound.
+    #[error("n2_generation_exhausted")]
+    GenerationExhausted,
+    /// The caller's total reconnect deadline elapsed.
+    #[error("n2_reconnect_timeout")]
+    ReconnectTimeout,
+    /// All caller-selected connection attempts failed or timed out.
+    #[error("n2_reconnect_exhausted")]
+    ReconnectExhausted,
     /// The caller selected a zero DATA cap.
     #[error("n2_invalid_limit")]
     InvalidLimit,

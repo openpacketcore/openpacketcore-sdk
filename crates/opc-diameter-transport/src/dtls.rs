@@ -978,6 +978,10 @@ impl KernelSctpMessageIo {
                     match received.event {
                         Some(opc_sctp::SctpEvent::Shutdown { .. })
                         | Some(opc_sctp::SctpEvent::Unknown { .. })
+                        | Some(opc_sctp::SctpEvent::StreamReset { .. })
+                        | Some(opc_sctp::SctpEvent::AssociationReset { .. })
+                        | Some(opc_sctp::SctpEvent::StreamChange { .. })
+                        | Some(opc_sctp::SctpEvent::PartialDeliveryAborted { .. })
                         | None => {
                             let _ = inbound_tx.try_send(Err(DiameterTlsError::Transport));
                             break;

@@ -500,6 +500,9 @@ jobs:
       - name: Build cold SCTP multihoming regression fixture
         run: |
           set -euo pipefail
+          cc -std=c11 -Wall -Wextra -Werror \
+            crates/opc-sctp/tests/n2_lifecycle_uapi.c -o "${RUNNER_TEMP}/n2-lifecycle-uapi"
+          "${RUNNER_TEMP}/n2-lifecycle-uapi"
           cargo test --locked -p opc-sctp --test cold_multihoming_netns --no-run
 
       - name: Require native unprotected N2 framing proof
@@ -511,6 +514,36 @@ jobs:
             --nocapture --test-threads=1 2>&1 | tee "${n2_proof_log}"
           grep -Fq 'native N2 framing assertions completed' "${n2_proof_log}"
           grep -Fq 'test result: ok. 1 passed; 0 failed;' "${n2_proof_log}"
+
+      - name: Require native N2 generation lifecycle proof
+        run: |
+          set -euo pipefail
+          n2_owner_log="${RUNNER_TEMP}/sctp-n2-owner.log"
+          cargo test --locked -p opc-sctp --lib -- \
+            --ignored --exact n2::owner::native_tests::native_generation_replacement_reconnect_and_shutdown \
+            --nocapture --test-threads=1 2>&1 | tee "${n2_owner_log}"
+          grep -Fq 'native N2 generation lifecycle assertions completed' "${n2_owner_log}"
+          grep -Fq 'test result: ok. 1 passed; 0 failed;' "${n2_owner_log}"
+
+      - name: Require composed N2 primary-path failover proof
+        run: |
+          set -euo pipefail
+          export CARGO_HOME="${CARGO_HOME:-${HOME}/.cargo}"
+          export RUSTUP_HOME="${RUSTUP_HOME:-${HOME}/.rustup}"
+          n2_path_log="${RUNNER_TEMP}/sctp-n2-paths.log"
+          sudo env \
+            "PATH=${PATH}" \
+            "CARGO_HOME=${CARGO_HOME}" \
+            "RUSTUP_HOME=${RUSTUP_HOME}" \
+            "CARGO_TARGET_DIR=${CARGO_TARGET_DIR}" \
+            "OPC_SCTP_RUN_PRIVILEGED=1" \
+            unshare -n -- bash -euxo pipefail -c '
+              cargo test --locked -p opc-sctp --test cold_multihoming_netns -- \
+                --ignored --exact n2_generation_survives_primary_path_loss_with_exact_readback \
+                --nocapture --test-threads=1
+            ' 2>&1 | tee "${n2_path_log}"
+          grep -Fq 'native N2 multihoming generation and path assertions completed' "${n2_path_log}"
+          grep -Fq 'test result: ok. 1 passed; 0 failed;' "${n2_path_log}"
 
       - name: Require cold primary-down secondary-up SCTP connectx proof
         run: |

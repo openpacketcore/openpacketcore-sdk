@@ -288,6 +288,128 @@ fn lifecycle(association: bool, assoc_id: i32) -> Chunk {
     chunk
 }
 
+fn reconfiguration(kind: u16, flags: u16, fields: &[u8]) -> Chunk {
+    let mut bytes = Vec::new();
+    bytes.extend_from_slice(&kind.to_ne_bytes());
+    bytes.extend_from_slice(&flags.to_ne_bytes());
+    bytes.extend_from_slice(&(8 + fields.len() as u32).to_ne_bytes());
+    bytes.extend_from_slice(fields);
+    let mut chunk = data(&bytes, true);
+    chunk.received.info = None;
+    chunk.received.flags.notification = true;
+    chunk
+}
+
+#[tokio::test]
+async fn reset_schedules_preserve_only_unaffected_partial_records_after_cancellation() {
+    for split in 1..9 {
+        for flags in [1, 2, 3, 5, 6, 7, 9, 10, 11] {
+            for same_association in [false, true] {
+                for streams in [vec![], vec![3u16], vec![4u16], vec![4, 3, 4]] {
+                    let owner = ReceiveOwner::new();
+                    let (sender, source) = source();
+                    let old = b"123456789";
+                    send(&sender, data(&old[..split], false));
+                    let mut cancelled = Box::pin(owner.recv(&source, 32));
+                    pending(cancelled.as_mut());
+                    drop(cancelled);
+                    let mut fields = (if same_association { 11i32 } else { 12 })
+                        .to_ne_bytes()
+                        .to_vec();
+                    for stream in &streams {
+                        fields.extend_from_slice(&stream.to_ne_bytes());
+                    }
+                    send(&sender, reconfiguration(0x800a, flags, &fields));
+                    let notification = owner.recv(&source, 32).await.unwrap();
+                    assert!(matches!(
+                        notification.event,
+                        Some(SctpEvent::StreamReset { .. })
+                    ));
+                    let clears = same_association
+                        && (flags == 1 || flags == 3)
+                        && (streams.is_empty() || streams.contains(&3));
+                    let mut next = data(b"next", true);
+                    if clears {
+                        next.received.info.as_mut().unwrap().ssn = 0;
+                    }
+                    send(&sender, next);
+                    let expected = if clears {
+                        b"next".to_vec()
+                    } else {
+                        [&old[..split], b"next"].concat()
+                    };
+                    complete(owner.recv(&source, 32).await.unwrap(), &expected);
+                }
+            }
+        }
+    }
+}
+
+#[tokio::test]
+async fn association_reset_partial_abort_and_stream_growth_have_distinct_prefix_effects() {
+    for split in 1..9 {
+        for same in [false, true] {
+            let association = (if same { 11i32 } else { 12 }).to_ne_bytes();
+            let assoc_fields = [
+                association.as_slice(),
+                &7u32.to_ne_bytes(),
+                &9u32.to_ne_bytes(),
+            ]
+            .concat();
+            let changed_fields = [
+                association.as_slice(),
+                &8u16.to_ne_bytes(),
+                &8u16.to_ne_bytes(),
+            ]
+            .concat();
+            let partial_fields = [
+                &0u32.to_ne_bytes(),
+                association.as_slice(),
+                &3u32.to_ne_bytes(),
+                &7u32.to_ne_bytes(),
+            ]
+            .concat();
+            let other_partial_fields = [
+                &0u32.to_ne_bytes(),
+                association.as_slice(),
+                &4u32.to_ne_bytes(),
+                &7u32.to_ne_bytes(),
+            ]
+            .concat();
+            for (kind, flags, fields, clears) in [
+                (0x800b, 0, &assoc_fields, same),
+                (0x800b, 4, &assoc_fields, false),
+                (0x800b, 8, &assoc_fields, false),
+                (0x800c, 0, &changed_fields, false),
+                (0x8006, 0, &partial_fields, same),
+                (0x8006, 0, &other_partial_fields, false),
+            ] {
+                let owner = ReceiveOwner::new();
+                let (sender, source) = source();
+                let old = b"123456789";
+                send(&sender, data(&old[..split], false));
+                let mut cancelled = Box::pin(owner.recv(&source, 32));
+                pending(cancelled.as_mut());
+                drop(cancelled);
+                send(&sender, reconfiguration(kind, flags, fields));
+                let notification = owner.recv(&source, 32).await.unwrap();
+                assert!(notification.notification && notification.event.is_some());
+                let mut next = data(b"next", true);
+                if clears {
+                    next.received.info.as_mut().unwrap().ssn = 0;
+                }
+                send(&sender, next);
+                let expected = if clears {
+                    b"next".to_vec()
+                } else {
+                    [&old[..split], b"next"].concat()
+                };
+                complete(owner.recv(&source, 32).await.unwrap(), &expected);
+            }
+        }
+    }
+}
+
 #[tokio::test]
 async fn lifecycle_invalidates_only_its_associations_partial_record() {
     for association in [false, true] {
