@@ -215,7 +215,7 @@ impl SetupFailureTransfer {
     }
 }
 
-fn unique(seen: &mut u64, qfi: QosFlowId) -> Result<(), DecodeError> {
+pub(super) fn unique(seen: &mut u64, qfi: QosFlowId) -> Result<(), DecodeError> {
     let bit = 1_u64 << qfi.value();
     if *seen & bit != 0 {
         return Err(invalid("duplicate or conflicting resource result"));

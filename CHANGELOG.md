@@ -127,6 +127,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `Ikev2SaInitCryptoErrorCode` to `Ikev2ChildSaKeyMaterialDiagnostic`.
 
 ### Added
+- `opc-proto-ngap`: canonical PDU Session Resource Notify with typed root
+  flow notifications, released QFIs and whole-session release reports, backed
+  by 1,014 independent cases. Enforces nonempty reports and disjoint identifiers;
+  GBR classification, correlation and cleanup remain caller-owned. Shared
+  contained-field preflight rejects nonminimal short-value lengths. Adds a
+  public message variant; downstream exhaustive matches need updating (Refs #787).
 - `opc-proto-ngap`: canonical NG Reset, Reset Acknowledge and Error Indication
   with explicit signalling context, bounded fragmented connection lists and
   root Criticality Diagnostics. Preserve legal empty/repeated connection items

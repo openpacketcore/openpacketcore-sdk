@@ -230,6 +230,15 @@ pub(super) const PDU_SESSION_RESOURCE_RELEASE_COMMAND: IeProfile = IeProfile::ne
     IeRule::singleton(79, CRITICALITY_REJECT), // id-PDUSessionResourceToReleaseListRelCmd
 ]);
 
+// TS 38.413 V18.10.0 9.2.1.7; all fields are singleton.
+pub(super) const PDU_SESSION_RESOURCE_NOTIFY: IeProfile = IeProfile::new(&[
+    IeRule::singleton(10, CRITICALITY_REJECT),  // AMF UE ID
+    IeRule::singleton(85, CRITICALITY_REJECT),  // RAN UE ID
+    IeRule::singleton(66, CRITICALITY_REJECT),  // Notified sessions
+    IeRule::singleton(67, CRITICALITY_IGNORE),  // Released sessions
+    IeRule::singleton(121, CRITICALITY_IGNORE), // Location
+]);
+
 // TS 38.413 V18.10.0 9.2.6.11–13; all entries are singleton.
 pub(super) const NG_RESET: IeProfile = IeProfile::new(&[
     IeRule::singleton(15, CRITICALITY_IGNORE), // Cause
@@ -575,6 +584,7 @@ mod tests {
             INITIAL_UE_MESSAGE,
             DOWNLINK_NAS_TRANSPORT,
             UPLINK_NAS_TRANSPORT,
+            PDU_SESSION_RESOURCE_NOTIFY,
             NG_RESET,
             NG_RESET_ACKNOWLEDGE,
             ERROR_INDICATION,

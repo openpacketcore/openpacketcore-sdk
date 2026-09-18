@@ -16,7 +16,7 @@ internal semantics in the SDK.
 | Layer | Item | Status | Evidence |
 |---|---|---|---|
 | NGAP-PDU framing | All three outcomes | ✅ | Complete messages independently encoded from the Release 18.10 schema |
-| Constructed root containers | 20 admitted outcomes | ✅ | 21 published-corpus construction cases, 291 UE request cases and 189 Reset/Error cases below |
+| Constructed root containers | 21 admitted outcomes | ✅ | 21 published-corpus construction cases, 291 UE request cases, 189 Reset/Error cases and 43 Notify cases below |
 | Constructed length determinants | All three outcomes; short, two-octet and fragmented open types | ✅ | 54 independent Pycrate cases, including inner/outer 128, 16384 and 65536 boundaries |
 | Typed IE mapping | NGSetup Request/Response/Failure | ✅ | Every IE compared with independent reference bytes |
 | Typed IE mapping | InitialUEMessage; Downlink/UplinkNASTransport | ✅ | Complete N3IWF messages, including IPv4/IPv6 location |
@@ -26,6 +26,7 @@ internal semantics in the SDK.
 | Typed IE mapping | UEContextRelease Command/Complete | ✅ | UE identifier pair and N3IWF location |
 | Typed IE mapping | NASNonDeliveryIndication; UEContextReleaseRequest | ✅ | Independent complete requests, root Causes and session IDs |
 | Typed IE mapping | NGReset; NGResetAcknowledge; ErrorIndication | ✅ | Independent complete messages, fragmented connection lists and root diagnostics |
+| Typed IE mapping | PDUSessionResourceNotify | ✅ | Independent flow/session reports, root Causes and optional N3IWF location |
 | Typed decode | Paging | 🧪 | Initiating-message dispatch with hand-authored empty-IE APER fixture |
 
 Dispatch is outcome-aware: procedure code 21 decodes as NGSetupRequest only
@@ -695,6 +696,68 @@ The new public message variants require downstream exhaustive-match updates.
 Admission does not choose Error Indication triggers, prove transport/UE
 ownership, correlate requests or perform reset actions. Remaining #787
 procedures, optional fields and live interoperability evidence are pending.
+
+## PDU Session Resource Notify
+
+`n3iwf::notify::ResourceNotify` constructs and admits initiating procedure
+30/ignore under TS 38.413 V18.10.0 8.2.4 and 9.2.1.7. TS 29.413 5.1–5.2
+lists the procedure as applicable to N3IWF; 5.3 supplies no Notify-specific
+receiver-ignore exception. The admitted root transfers follow 9.3.4.5 and
+9.3.4.13.
+
+| Boundary | Required fields and conditions | Optional fields | Required depth |
+| --- | --- | --- | --- |
+| Complete Notify | AMF/RAN IDs; at least one session-report list | Notified list 66/reject, released list 67/ignore, N3IWF location 121/ignore | 10 for released sessions; 11 for notifications; 12 with released flows |
+| Notify transfer | At least one flow-report list; each present list has 1–64 entries | Root fulfilled/not-fulfilled notifications, released QFI/Cause reports | 4 for notifications; 5 with released flows |
+| Notify released transfer | Root Cause | None | 3 |
+| Notified session list | 1–256 unique session IDs and typed Notify transfers | None | 7 for notifications; 8 with released flows |
+| Released session list | 1–256 unique session IDs and typed released transfers | None | 6 |
+
+Session IDs are unique and disjoint across the two complete-message lists.
+QFIs are unique and disjoint across both lists within each Notify transfer.
+All top-level IEs are singleton; both required IDs use reject criticality.
+Generic duplicate selection, unknown-IE and criticality policies remain
+authoritative; use the same context for generic and semantic admission.
+Unknown-ignore counts and unknown-notify identifiers expose no opaque values.
+Debug output for typed fields and messages is redacted.
+
+The [field corpus](tests/fixtures/n3iwf-notify-fields.json) has 971 independent
+cases (964 admitted, seven negative), including every flow/session list count,
+both root notification states for every QFI, all 64 root Causes, mixed flow
+reports and maximum-width contained transfers. The
+[message corpus](tests/fixtures/n3iwf-notify.json) has 43 cases (27 admitted,
+16 negative), including fragmented complete PDUs, ID widths, IPv4/IPv6 location,
+missing/conflicting reports, distinct duplicate values and unknown criticalities.
+Regenerate with `scripts/generate-ngap-notify-field-fixtures.py` and
+`scripts/generate-ngap-notify-fixtures.py`, each taking `--spec PATH --output PATH`,
+using the pinned Release 18 PDF and reference environment. Both unmodified
+reference encoders agree; its structured decoder verifies the input values.
+
+Generated probes match all 388 Notify-transfer encodings, but decode only the
+empty ASN.1 root: 387 nonempty decodes fail. Only that nested receiver uses an
+explicit root layout. Generated released-transfer encoding/decoding passes all
+64 cases; generated notified/released session lists pass all 262/257 cases in
+both directions. Preserve those qualified generated paths. Physical preflight
+checks flags, exact framing, padding, cumulative counts and remaining depth
+before vector allocation; encoders check exact capacity before constructing
+generated values. `max_ies` bounds the total flow count within a transfer and
+each outer list. Schema and dependencies are unchanged.
+
+The shared contained-field reader now rejects a two-octet length determinant
+for a value below 128 bytes. The initial regression accepted that malformed
+form; this tightens contained-field framing for existing callers as well.
+Tests cover exact and one-short byte/count/depth limits, malformed flags and
+padding, truncation and trailing bytes. Fuzz/replay compares admitted fields
+and canonical messages using all 1,014 complete independent seeds.
+
+The new public message variant requires downstream exhaustive-match updates.
+The caller checks session/QFI ownership and the established GBR classification
+of notification reports, selects triggers and performs resource effects.
+Construction does not override TS 29.413's receiver-ignore rules for Notification
+Control in Setup/Modify or establish eligibility to generate a notification.
+Alternative QoS, feedback, RAT usage and other extensions remain explicitly
+unsupported. Remaining #787 work includes Modify, applicable optional fields,
+the broader procedure applicability/receive/error matrix and live interoperability.
 
 ## Fixtures
 
