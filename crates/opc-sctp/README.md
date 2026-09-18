@@ -27,6 +27,9 @@ Diameter transports are outside the current crate boundary.
 - Messaging: `OutboundMessage`, `InboundMessage`, `SctpEvent`,
   `SctpPeerAddrState`, `SctpAuthenticationIndication`, `SctpEndpoint`,
   `SctpAssociation`, and its exclusive send/receive halves.
+- N2 framing: `n2::UnprotectedN2Profile`, `n2::UnprotectedN2Association`,
+  `n2::N2Inbound`, `n2::N2Error`, and `n2::NGAP_DEFAULT_PORT` provide strict
+  PPID-60 framing with bounded, redacted diagnostics.
 - SCTP-AUTH lifecycle: `SctpAuthKeyId`, zeroizing `SctpAuthKey`, typed AUTH
   events, active-key selection, confirmed old-key retirement, and bounded
   `SctpSenderDrainOutcome` waits.
@@ -48,18 +51,42 @@ Diameter transports are outside the current crate boundary.
 
 ```rust,no_run
 use bytes::Bytes;
-use opc_sctp::{
-    OutboundMessage, SctpAssociation, SctpConnectConfig, SctpError, NGAP_PPID,
-};
+use opc_sctp::n2::{N2Error, UnprotectedN2Association};
 
-async fn send_ngap(remote: std::net::SocketAddr, payload: Bytes) -> Result<(), SctpError> {
-    let assoc = SctpAssociation::connect(SctpConnectConfig::new(remote)).await?;
-    assoc
-        .send(OutboundMessage::ordered(payload, 0, NGAP_PPID))
-        .await?;
+async fn send_ngap(
+    association: &UnprotectedN2Association,
+    stream_id: u16,
+    payload: Bytes,
+) -> Result<(), N2Error> {
+    association.send(payload, stream_id).await?;
     Ok(())
 }
 ```
+
+### Strict unprotected N2 framing
+
+Connect with `UnprotectedN2Association::connect(SctpConnectConfig)` or consume
+an accepted association with `from_association`. The adapter preserves the
+existing SCTP receive bound, ordered address configuration, cancellation
+ownership and exact address readback. `n2::default_destination(ip)` selects
+service port 38412; an explicit configured port is retained for additional
+TNL associations. Retain the association for the caller's transport lifetime.
+
+The adapter emits ordered PPID 60 DATA on the selected stream. Receive admits
+only complete ordered PPID 60 records, rejects truncated ancillary metadata,
+and returns transport notifications separately as `N2Inbound::Notification`.
+PPID 66 DATA is rejected without a compatibility mode. Payload bounds apply
+to DATA, not the independent notification envelope. Any inbound framing or
+transport error aborts the association. Drop also closes it when an abort
+handle survives. Invalid local send payloads fail before transmission.
+
+`UnprotectedN2Profile` exposes the same record checks for other backends, which
+remain responsible for faithful metadata and record boundaries. Its outbound
+wrapper has redacted diagnostics; explicitly converting it to the generic
+SCTP message transfers payload-handling responsibility to the backend caller.
+None of these types decodes NGAP, proves protection, selects AMFs, assigns
+UE/non-UE streams, fences competing association generations or reconnects.
+See [CONFORMANCE.md](CONFORMANCE.md) for the exact scope and evidence.
 
 ### Diameter connect progress across an application timeout
 
@@ -480,6 +507,7 @@ this crate.
 
 ```sh
 cargo test -p opc-sctp
+cargo test --locked -p opc-sctp --lib -- --ignored --exact n2::tests::native::unprotected_n2_profile --nocapture --test-threads=1
 cargo test -p opc-libsctp-sys linux::tests::loopback_path_tuning_and_primary_selection -- --ignored --exact
 cargo test -p opc-sctp tests::loopback_static_multihoming_binds_and_connects_full_sets -- --ignored --exact
 cargo test -p opc-sctp tests::loopback_diameter_recv_surfaces_transport_notification -- --ignored --exact
