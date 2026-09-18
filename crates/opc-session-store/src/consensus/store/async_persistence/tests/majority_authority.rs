@@ -3,22 +3,32 @@
 
 use super::*;
 
-async fn lost_majority_authority(all_cold: bool) {
+async fn lost_majority_authority(all_cold: bool, require_recovery: bool) {
     let _timing = crate::acquire_consensus_timing_test_permit().await;
     let mut fleet = Fleet::new(3);
     let faults = (0..3)
         .map(|_| Arc::new(AtomicBool::new(false)))
         .collect::<Vec<_>>();
-    let result = AssertUnwindSafe(exercise_lost_authority(&mut fleet, &faults, all_cold))
-        .catch_unwind()
-        .await;
+    let result = AssertUnwindSafe(exercise_lost_authority(
+        &mut fleet,
+        &faults,
+        all_cold,
+        require_recovery,
+    ))
+    .catch_unwind()
+    .await;
     for index in 0..3 {
         let _ = fleet.close_result(index).await;
     }
     result.unwrap_or_else(|panic| std::panic::resume_unwind(panic));
 }
 
-async fn exercise_lost_authority(fleet: &mut Fleet, faults: &[Arc<AtomicBool>], all_cold: bool) {
+async fn exercise_lost_authority(
+    fleet: &mut Fleet,
+    faults: &[Arc<AtomicBool>],
+    all_cold: bool,
+    require_recovery: bool,
+) {
     for (index, fault) in faults.iter().enumerate() {
         let fault = Arc::clone(fault);
         fleet
@@ -256,6 +266,61 @@ async fn exercise_lost_authority(fleet: &mut Fleet, faults: &[Arc<AtomicBool>], 
             && issued.expires_at() > opc_types::Timestamp::now_utc(),
         "retained and unpersisted credentials are both still unexpired"
     );
+    if require_recovery {
+        tokio::time::timeout(Duration::from_secs(30), async {
+            loop {
+                let _ = join_all(
+                    fleet
+                        .stores
+                        .iter()
+                        .flatten()
+                        .map(ConsensusSessionStore::initialize_cluster),
+                )
+                .await;
+                let reports = join_all(
+                    fleet
+                        .stores
+                        .iter()
+                        .flatten()
+                        .map(ConsensusSessionStore::probe_fixed_quorum_readiness),
+                )
+                .await;
+                if reports
+                    .iter()
+                    .all(|report| report.traffic_authority().is_granted())
+                {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .expect("retained Async quorum must recover after losing its acknowledged volatile tail");
+        let store = fleet.store(fleet.leader());
+        let successor = store
+            .acquire(&key, owner, Duration::from_secs(60))
+            .await
+            .expect("recovered quorum must issue usable successor authority");
+        assert!(
+            successor.fence() > issued.fence(),
+            "successor must supersede the missing issued fence"
+        );
+        for predecessor in [&old, &issued] {
+            assert!(
+                matches!(
+                    store.delete_fenced(predecessor).await,
+                    Err(StoreError::StaleFence)
+                ),
+                "neither retained nor lost predecessor authority may mutate the successor"
+            );
+        }
+        store
+            .delete_fenced(&successor)
+            .await
+            .expect("the next operation must succeed under successor authority");
+        assert!(store.get(&key).await.unwrap().is_none());
+        return;
+    }
     // The current SDK correctly withholds authority. This is a safety
     // control proving missing recovery input, never an availability pass.
     for index in majority {
@@ -269,10 +334,20 @@ async fn exercise_lost_authority(fleet: &mut Fleet, faults: &[Arc<AtomicBool>], 
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn async_lagging_survivor_and_retained_majority_lose_issued_fence_evidence() {
-    lost_majority_authority(false).await;
+    lost_majority_authority(false, false).await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn async_all_cold_retained_roots_lose_issued_fence_evidence() {
-    lost_majority_authority(true).await;
+    lost_majority_authority(true, false).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn async_majority_volatile_tail_recovers_successor_authority() {
+    lost_majority_authority(false, true).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn async_all_cold_volatile_tail_recovers_successor_authority() {
+    lost_majority_authority(true, true).await;
 }
