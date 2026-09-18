@@ -7,6 +7,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+- `opc-proto-eap`: add bounded EAP-5G bootstrap envelopes with typed AN
+  parameters, opaque NAS forwarding, explicit duplicate and presence policy,
+  canonical construction and redacted diagnostics (Refs #785).
+
 ### Changed
 - Raise the minimum supported Rust version to **1.89** for `russh` 0.63.3,
   and keep the workspace, standalone SMF consumer, and CI compiler gate aligned.
@@ -25,6 +30,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   association lifecycle events, and reject conflicting complete metadata or
   ambiguous notifications. This receive reliability slice precedes the typed
   N2 profile and does not establish protected transport (Refs #788).
+- `opc-route-steering`: schedule independent exact route/rule operations and
+  non-overlapping owned collections concurrently with bounded workers. Retain
+  conflicting-key exclusion through dispatched verification and rollback after
+  cancellation, and align mock exact source-sibling readback with Linux (#894).
 - Make the persistent-file identity qualification recognize actual reuse of
   any inode it previously deleted, retaining the 4,096-attempt bound and the
   generation-change assertion when another filesystem user takes the first inode.
@@ -118,6 +127,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `Ikev2SaInitCryptoErrorCode` to `Ikev2ChildSaKeyMaterialDiagnostic`.
 
 ### Added
+- `opc-proto-ikev2::nwu::mobike`: authenticated network-side mobility updates,
+  source/replay checks, typed NAT/address notifications and COOKIE2 proof before
+  Child-SA migration intent. Crypto and entropy use the admitted IKE module;
+  XFRM application remains separate (Refs #786).
+- `opc-proto-ikev2::nwu`: bounded TS 24.502 configuration and QoS payloads,
+  opened Child-SA creation/modification, explicit NWu Child/IKE deletion and
+  caller-ordered AEAD selection and conditional MOBIKE capability advertisement
+  (Refs #786).
 - **Bounded acknowledged configuration history — `opc-persist`:** the existing
   consensus authority commits exact-head retention decisions with record and
   encoded-byte limits, authenticated cursor boundaries, and protected rollback
