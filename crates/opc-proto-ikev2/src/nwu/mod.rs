@@ -8,6 +8,7 @@
 mod configuration;
 mod create;
 mod lifecycle;
+pub mod mobike;
 mod notify;
 mod policy;
 mod qos;

@@ -235,6 +235,7 @@ exchange, correlates both protocol responses, commits the GTP response for
 exact replay, and then performs the corresponding Delete Bearer and IKEv2
 Child-SA deletion flow. Admission, identifier allocation, key installation,
 and dataplane programming remain explicit application responsibilities.
+
 ## NWu payload profile
 
 The `nwu` module implements opened payload boundaries from
@@ -286,12 +287,9 @@ authentication, key custody or XFRM installation is claimed.
   original SPI subset. IKE Delete is Protocol ID 1 without SPIs and uses an
   empty acknowledgement; its timeout has the same whole-IKE scope.
 - Conditional MOBIKE_SUPPORTED advertisement and receiver-ignored capability
-  extension data are covered. Authenticated
-  UPDATE_SA_ADDRESSES, address advertisement processing, return-routability,
-  replay/source rejection, and NAT-T migration are **not implemented by this
-  change** and keep #786 open. The published additional-address vector is
-  consumed through generic Notify framing only. The opened lifecycle helpers
-  accept SK headers; SKF reassembly and peer authentication are separate.
+  extension data are covered. The separate authenticated mobility boundary
+  below handles updates. Opened lifecycle helpers accept SK headers; SKF
+  reassembly and peer authentication are separate.
 
 `tests/nwu.rs` consumes all 15 published `nwu-ike` fixture files, using their
 unchanged provenance/digest manifests under `opc-n3iwf-fixtures`. Full CP and
@@ -300,4 +298,52 @@ cases, duplicate/length/count mutations, response-correlation failures and
 redaction checks are independently assembled synthetic test vectors. The `nwu`
 fuzz target checks bounded decode and canonical re-encoding, using exact binary
 copies of the published payload seeds. Round trips do not establish external
-interoperability. Review and authenticated mobility evidence remain outstanding.
+interoperability. Independent review remains outstanding.
+
+## Authenticated NWu mobility
+
+`nwu::mobike` implements the network-side RFC 4555 sections 3.3–3.9 and 4
+notification/update boundary, composed with RFC 7296 NAT-D and existing
+module-routed protected-payload crypto. Construction requires an established
+SA's nonzero SPI pair, conditional NWu MOBIKE capability and concrete incoming
+provider. This verifies possession of that SA's keys; IKE_AUTH peer trust and
+subscriber authentication remain caller responsibilities.
+
+- Exact bounded UDP/500 or UDP/4500 datagrams are authenticated before policy
+  or state changes. NAT-T support requires the non-ESP marker on UDP/4500 even
+  without ESP encapsulation. ESP packets and keepalives cannot enter this path.
+- Typed address advertisements, UPDATE_SA_ADDRESSES, COOKIE2, NO_NATS_ALLOWED
+  and NAT-D include shape/count/duplicate checks. Complete address lists include
+  the observed source. Caller address policy and NAT-prohibition mismatches
+  produce distinct Notify 40/41 replies without changing admitted state.
+- The shared established-SA receive window and an internal high-water mark
+  reject replays. The serial window profile delegates exact sealed-response
+  caching to the caller; larger negotiated concurrent receive windows are not
+  implemented here. Unknown noncritical payloads/status notifies are ignored
+  after framing and count toward resource bounds.
+- UPDATE produces immediate IKE-path intent. Child-SA intent requires a fresh
+  32-octet COOKIE2 from admitted entropy, the shared outbound request window,
+  an authenticated matching response and the exact original address/port pair.
+  An authenticated missing/mismatched cookie reports whole-IKE deletion and
+  closes the receiver. Malformed, unauthenticated or wrong-source responses
+  retain the pending probe. A superseded probe frees its request slot without
+  authorizing migration. Probes must never be retargeted outside this API.
+- NAT-D is computed through the admitted SHA-1 operation using observed
+  endpoints; multiple source hashes are OR alternatives. Encapsulation changes
+  only after an UPDATE and its proof; DPD/address advertisements alone cannot
+  change it. Without NAT-T support, changing address information requires
+  NO_NATS_ALLOWED matching both addresses and ports. Outbound probe bounds are
+  checked before entropy or message-ID allocation. Errors/Debug redact values.
+
+`tests/nwu_mobike.rs` uses independent literal Notify/packet headers, direct
+AES-GCM construction and independent SHA-1 endpoint hashes, plus the published
+additional-address fixture. It covers every-octet packet tampering, source and
+cookie substitution, stale/crossed update proofs, both IP families, all four
+NAT outcomes, conditional capability, resource bounds and diagnostics. The
+existing `nwu` fuzz target now includes mobility bodies and request chains.
+
+Unsupported: SKF reassembly, the UE's update-response state machine, discovery
+and selection of alternate paths, multiple outstanding local probes, durable
+restore and backend mutation. Caller scheduling, response caching, initial
+IKE_AUTH address checks and the source socket metadata remain explicit inputs.
+This is synthetic mechanism evidence, not a live interoperability claim.
