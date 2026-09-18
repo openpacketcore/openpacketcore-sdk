@@ -13,6 +13,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   canonical construction and redacted diagnostics (Refs #785).
 
 ### Changed
+- `opc-diameter-transport`: expose an opaque generic RFC 6083 connector,
+  acceptor and protected connection using the existing mutual DTLS/SCTP
+  machinery without Diameter procedure state. Admit protected PPIDs 47 and 66
+  on ordered stream zero, bound opaque application records, and reconcile
+  credential and observed carrier retirement before readback or delivery.
+  Complete NGAP stream and 3GPP PKI profiles remain unsupported (Refs #794).
 - Raise the minimum supported Rust version to **1.89** for `russh` 0.63.3,
   and keep the workspace, standalone SMF consumer, and CI compiler gate aligned.
 - Upgrade `quick-xml` to 0.42, `base64` to 0.23, and the gNMI Prost/Tonic stack
