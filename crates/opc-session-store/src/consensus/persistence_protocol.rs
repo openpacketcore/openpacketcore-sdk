@@ -462,6 +462,8 @@ impl EngineAdmission {
     }
 
     pub(super) fn permits_vote(&self, rpc: &VoteRequest<SessionConsensusNodeId>) -> bool {
+        #[cfg(not(target_os = "linux"))]
+        let _ = rpc;
         match &*self.guard {
             Admission::Active => true,
             #[cfg(target_os = "linux")]
