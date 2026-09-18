@@ -148,6 +148,14 @@ Diagnostic lists preserve repeated IDs and need total message depth at least 8
 (6 without items), alongside existing field depth requirements. Affected public
 struct literals and the Release Complete variant now require the new field.
 
+UE Context Release Complete also accepts optional `sessions`. The nonempty
+`release_sessions::ContextReleasedSessions` list preserves up to 256 unique
+session IDs and distinguishes an absent transfer from a present empty release
+response transfer. Lists require field depth 3, or 6 with transfers; complete
+messages require at least 7 or 10 respectively. Other fields retain their depth
+requirements. Complete variant literals and exhaustive patterns must include or
+allow `sessions`. The caller correlates these reports with its resource state.
+
 `ue_requests` admits and constructs NAS Non-Delivery Indication and UE Context
 Release Request, including mandatory root Cause and optional unique session IDs.
 NAS stays opaque and borrows contiguous input. Context correlation, deciding when

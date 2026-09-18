@@ -558,3 +558,26 @@ and exhaustive Release Complete destructuring require adjustment. Caller-owned
 procedure selection, correlation and state effects remain outside the codec.
 The 23-outcome local qualification count and published fixture revision stay
 unchanged; this field expansion does not close #787.
+
+## UE Release Complete session report amendment (2026-09)
+
+Expose optional IE 60 as a bounded list of unique session reports. Each report
+preserves absence versus a present empty Release Response Transfer through the
+single qualified item extension 145/ignore. Reject all other item extensions
+and transfer usage additions explicitly. Peer reports carry no cleanup or
+ownership authority; the caller correlates them with local resource state.
+
+Probe the unmodified generated list encoder and decoder against all 1,280
+admitted independent field values: both paths pass. Use those generated paths
+behind a complete allocation preflight, rather than changing generated schema
+or runtime code. Check nested open-type and OCTET STRING framing, padding,
+unique identifiers and extension metadata before list materialization. Enforce
+field depths 3/6 and full message depths 7/10 for absent/present transfers.
+
+The independent Release 18 oracle adds 1,287 fields and 1,308 complete messages;
+both reference encoders agree and structured decoding checks their values.
+Cover all list counts and identifiers, optional-field combinations, duplicate
+policies and exact resource bounds. Preserve prior corpus bytes and published
+fixture identity. Add optional `sessions` to the public Complete variant,
+requiring downstream literals and exhaustive patterns to adapt. No new outcome
+or live interoperability claim follows from this field qualification.
