@@ -17,6 +17,8 @@ use crate::management_audit::{
 };
 
 pub use crate::consensus::PreparedAuditedMutation;
+/// Authenticated retained epochs, portable exports and external checkpoints.
+pub mod continuity;
 pub(crate) mod ledger;
 pub(crate) mod receipt;
 pub use ledger::{
@@ -65,6 +67,9 @@ pub enum AuditAuthorityError {
     /// Safe pruning cannot free enough reserved capacity for this operation.
     #[error("audit authority capacity exhausted")]
     Full,
+    /// The local history or external checkpoint moved behind an authenticated bound.
+    #[error("audit authority rollback detected")]
+    RollbackDetected,
 }
 
 /// A projected identifier. It is not a metric label or diagnostic identity.

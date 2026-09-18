@@ -122,15 +122,19 @@ and snapshot lineage. The removed custom Raft implementation, majority config
 wrapper, TCP peer/server, and standalone consensus-node binary are not
 alternative authority paths.
 
-Config command and config-specific RPC revision 5 add the replicated management
-ledger and authenticated operation recovery. Revisions 1 through 4 retain their
+Config command and config-specific RPC revision 6 add authenticated management
+key transitions, frozen exports and required external checkpoints. Revision 5
+introduced the replicated management ledger and authenticated operation recovery.
+Revisions 1 through 5 retain their
 original command semantics, including revision 4's acknowledged application
-history retention. Configuration storage and snapshot representation 3 carry
-both authenticated authorities. Representation-1 and representation-2 files are
+history retention. Configuration storage and snapshot representation 4 carry
+the authenticated authorities and management continuity state. Earlier representations are
 refused; a coordinated binary restart alone is not a state conversion. See
 [the management-audit contract](../../docs/replicated-management-audit.md) for
 admission, atomic results, privacy, bounded recovery and the remaining
-integration/key/export/checkpoint boundaries, and
+protocol integration boundary,
+[ADR 0025](../../docs/adr/0025-management-audit-continuity.md) for signing,
+export, checkpoint and pruning contracts, and
 [ADR 0023](../../docs/adr/0023-bounded-configuration-history.md) for the existing
 configuration-history bounds and protected references.
 

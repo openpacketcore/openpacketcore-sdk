@@ -22,15 +22,25 @@ impl ConsensusConfigStore {
         limits: AuditLedgerLimits,
     ) -> Result<(), AuditAuthorityError> {
         let projection = privacy.project(AuditPrivacyPurpose::KeyIdentity, &[])?;
+        let command = if let Some(policy) = &self.inner.audit_continuity {
+            AuditCommand::InitializeWithContinuity {
+                projection,
+                limits,
+                initial_epoch: policy.initial_epoch,
+            }
+        } else {
+            AuditCommand::Initialize { projection, limits }
+        };
         let request = derive_durable_request_id(self.inner.identity, b"audit-initialize", &[]);
-        self.submit_request(
-            request,
-            ConfigMutationIntent::ManagementAudit(AuditCommand::Initialize { projection, limits }),
-        )
-        .await
-        .map_err(|_| AuditAuthorityError::Unavailable)?
-        .result
-        .map_err(super::super::audit::map_failure)
+        self.submit_request(request, ConfigMutationIntent::ManagementAudit(command))
+            .await
+            .map_err(|_| AuditAuthorityError::Unavailable)?
+            .result
+            .map_err(super::super::audit::map_failure)?;
+        if self.inner.audit_continuity.is_some() {
+            self.provision_audit_checkpoint().await?;
+        }
+        Ok(())
     }
 
     /// Project a standalone intent before any queue or storage. This handle can
@@ -282,6 +292,28 @@ impl ConsensusConfigStore {
         {
             return AuditAdmission::Rejected(AuditAuthorityError::InvalidInput);
         }
+        let ledger = match self.read_audit_ledger().await {
+            Ok(ledger) => ledger,
+            Err(error) => return AuditAdmission::Rejected(error),
+        };
+        // A pruned, expired handle cannot reuse an older successful request
+        // cache entry as admission. Existing retained receipts remain readable
+        // after expiry; only a proven absent operation requires a live handle.
+        match ledger.lookup(self.inner.backend.audit_key(), handle, caller) {
+            Err(error) => return AuditAdmission::Rejected(error),
+            Ok(None) => {
+                let now = self
+                    .inner
+                    .clock
+                    .now_utc()
+                    .as_offset_datetime()
+                    .unix_timestamp();
+                if let Err(error) = handle.require_live(now) {
+                    return AuditAdmission::Rejected(error);
+                }
+            }
+            Ok(Some(_)) => {}
+        }
         match self.submit_request(request, command).await {
             Err(_) => AuditAdmission::Unknown(handle.clone()),
             Ok(response) => {
@@ -424,7 +456,15 @@ impl ConsensusConfigStore {
         Ok(progress)
     }
 
-    async fn read_audit_ledger(&self) -> Result<LedgerState, AuditAuthorityError> {
+    pub(super) async fn read_audit_ledger(&self) -> Result<LedgerState, AuditAuthorityError> {
+        let ledger = self.read_audit_ledger_without_checkpoint().await?;
+        self.verify_audit_checkpoint(&ledger).await?;
+        Ok(ledger)
+    }
+
+    pub(super) async fn read_audit_ledger_without_checkpoint(
+        &self,
+    ) -> Result<LedgerState, AuditAuthorityError> {
         self.linearizable_barrier()
             .await
             .map_err(|_| AuditAuthorityError::Unavailable)?;
@@ -435,7 +475,12 @@ impl ConsensusConfigStore {
             self.inner.operation_timeout,
             move |conn, cancellation| {
                 cancellation.check_io()?;
-                super::super::audit::read_sync(conn, backend.audit_key(), identity)
+                super::super::audit::read_with_keys_sync(
+                    conn,
+                    backend.audit_key(),
+                    backend.management_audit_keys().as_deref(),
+                    identity,
+                )
             },
         )
         .await

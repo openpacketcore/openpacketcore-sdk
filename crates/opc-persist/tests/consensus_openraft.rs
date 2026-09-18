@@ -181,6 +181,7 @@ enum FixtureStorage {
 
 struct ThreeNodeCluster {
     _directory: tempfile::TempDir,
+    identity: ConfigConsensusIdentity,
     stores: Vec<ConsensusConfigStore>,
     paths: BTreeMap<(usize, usize), Arc<LoopbackPeer>>,
 }
@@ -207,6 +208,16 @@ impl ThreeNodeCluster {
     async fn build_with_storage(
         audit_key_material: [[u8; 32]; 3],
         lifecycle: FixtureStorage,
+    ) -> Self {
+        Self::build_with_audit_continuity(audit_key_material, lifecycle, None).await
+    }
+
+    async fn build_with_audit_continuity(
+        audit_key_material: [[u8; 32]; 3],
+        lifecycle: FixtureStorage,
+        policy: Option<
+            &dyn Fn() -> opc_persist::audit_authority::continuity::AuditContinuityPolicy,
+        >,
     ) -> Self {
         let directory = tempfile::tempdir().expect("cluster directory");
         let nodes = [1_u64, 2, 3].map(|value| ConfigConsensusNodeId::new(value).expect("node ID"));
@@ -272,23 +283,35 @@ impl ThreeNodeCluster {
                     (nodes[target], peer)
                 })
                 .collect();
-            stores.push(
+            let snapshots = directory.path().join(format!("snapshots-{index}"));
+            let store = if let Some(policy) = policy {
+                ConsensusConfigStore::open_with_audit_continuity(
+                    topology,
+                    backend,
+                    snapshots,
+                    peers,
+                    policy(),
+                )
+                .await
+            } else {
                 ConsensusConfigStore::open_with_operation_timeout(
                     topology,
                     backend,
-                    directory.path().join(format!("snapshots-{index}")),
+                    snapshots,
                     peers,
                     Duration::from_secs(3),
                 )
                 .await
-                .expect("store"),
-            );
+            }
+            .expect("store");
+            stores.push(store);
         }
         for ((_, target), path) in &paths {
             path.install(stores[*target].rpc_handler()).await;
         }
         Self {
             _directory: directory,
+            identity,
             stores,
             paths,
         }

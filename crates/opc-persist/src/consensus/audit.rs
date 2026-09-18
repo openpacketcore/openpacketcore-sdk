@@ -5,6 +5,9 @@ use serde::{Deserialize, Serialize};
 use std::io;
 
 use super::ConfigMutationFailure;
+use crate::audit_authority::continuity::{
+    chain::ContinuityState, AuditCheckpoint, AuditKeyRing, AuditKeyTransition,
+};
 use crate::audit_authority::ledger::{
     authenticate, verify, LedgerState, MAX_STATE_BYTES, STATE_DOMAIN,
 };
@@ -23,6 +26,17 @@ pub(crate) enum AuditCommand {
     Intent(AuditOperationHandle),
     Reject(AuditOperationHandle),
     Terminal(AuditOperationHandle),
+    InitializeWithContinuity {
+        projection: AuditToken,
+        limits: AuditLedgerLimits,
+        initial_epoch: u64,
+    },
+    Transition(AuditKeyTransition),
+    Checkpoint(AuditCheckpoint),
+    Prune {
+        through: u64,
+        checkpoint: AuditCheckpoint,
+    },
 }
 
 impl std::fmt::Debug for AuditCommand {
@@ -64,6 +78,19 @@ pub(crate) fn read_sync(
         return Err(invalid());
     }
     Ok(stored.ledger)
+}
+
+pub(crate) fn read_with_keys_sync(
+    conn: &Connection,
+    key: &AuditKey,
+    keys: Option<&AuditKeyRing>,
+    identity: ConfigConsensusIdentity,
+) -> io::Result<Option<LedgerState>> {
+    let ledger = read_sync(conn, key, identity)?;
+    if let Some(ledger) = &ledger {
+        ledger.validate_continuity(keys).map_err(|_| invalid())?;
+    }
+    Ok(ledger)
 }
 
 fn read_verified_sync(conn: &Connection, key: &AuditKey) -> io::Result<StoredLedger> {
@@ -129,9 +156,13 @@ pub(crate) fn apply_sync(
     identity: ConfigConsensusIdentity,
     command: &AuditCommand,
     now: i64,
+    keys: Option<&AuditKeyRing>,
 ) -> io::Result<Result<(), ConfigMutationFailure>> {
-    let mut ledger = read_sync(conn, key, identity)?;
+    let mut ledger = read_with_keys_sync(conn, key, keys, identity)?;
     let result = match command {
+        AuditCommand::Initialize { .. } if keys.is_some() => {
+            Err(AuditAuthorityError::BindingMismatch)
+        }
         AuditCommand::Initialize { projection, limits } => match &ledger {
             Some(current) if current.projection == *projection && current.limits == *limits => {
                 Ok(())
@@ -144,6 +175,34 @@ pub(crate) fn apply_sync(
                     .map(|()| ledger = Some(candidate))
             }
         },
+        AuditCommand::InitializeWithContinuity {
+            projection,
+            limits,
+            initial_epoch,
+        } => match (keys, &ledger) {
+            (Some(keys), None) => keys
+                .key(*initial_epoch)
+                .and_then(|_| keys.separate_from(key))
+                .and_then(|()| {
+                    let mut candidate = LedgerState::new(identity, *projection, *limits);
+                    candidate.continuity = Some(ContinuityState::new(*initial_epoch));
+                    candidate.validate(key, identity)?;
+                    candidate.validate_continuity(Some(keys))?;
+                    ledger = Some(candidate);
+                    Ok(())
+                }),
+            (Some(_), Some(current))
+                if current.projection == *projection
+                    && current.limits == *limits
+                    && current
+                        .continuity
+                        .as_ref()
+                        .is_some_and(|chain| chain.initial_epoch == *initial_epoch) =>
+            {
+                Ok(())
+            }
+            _ => Err(AuditAuthorityError::BindingMismatch),
+        },
         command => match ledger.as_mut() {
             None => Err(AuditAuthorityError::Unavailable),
             Some(ledger) => match command {
@@ -152,7 +211,36 @@ pub(crate) fn apply_sync(
                     ledger.resolve(key, handle, AuditOperationState::Rejected)
                 }
                 AuditCommand::Terminal(handle) => ledger.acknowledge_terminal(key, handle),
-                AuditCommand::Initialize { .. } => Err(AuditAuthorityError::InvalidInput),
+                AuditCommand::Transition(transition) => keys
+                    .ok_or(AuditAuthorityError::KeyUnavailable)
+                    .and_then(|keys| ledger.transition_key(key, keys, transition)),
+                AuditCommand::Checkpoint(checkpoint) => keys
+                    .ok_or(AuditAuthorityError::KeyUnavailable)
+                    .and_then(|keys| {
+                        checkpoint.verify(keys, identity)?;
+                        ledger.matches_checkpoint(checkpoint)?;
+                        let chain = ledger
+                            .continuity
+                            .as_mut()
+                            .ok_or(AuditAuthorityError::Unavailable)?;
+                        if chain.checkpoint.as_ref().is_some_and(|old| {
+                            old.sequence() > checkpoint.sequence()
+                                || (old.sequence() == checkpoint.sequence() && old != checkpoint)
+                        }) {
+                            return Err(AuditAuthorityError::RollbackDetected);
+                        }
+                        chain.checkpoint = Some(checkpoint.clone());
+                        Ok(())
+                    }),
+                AuditCommand::Prune {
+                    through,
+                    checkpoint,
+                } => keys
+                    .ok_or(AuditAuthorityError::KeyUnavailable)
+                    .and_then(|keys| ledger.prune(keys, *through, checkpoint, now)),
+                AuditCommand::Initialize { .. } | AuditCommand::InitializeWithContinuity { .. } => {
+                    Err(AuditAuthorityError::InvalidInput)
+                }
             },
         },
     };
@@ -164,6 +252,11 @@ pub(crate) fn apply_sync(
             }
             _ => ConfigMutationFailure::InvalidInput,
         }));
+    }
+    if let Some(ledger) = &mut ledger {
+        ledger.seal_continuity(keys).map_err(|_| invalid())?;
+        ledger.validate(key, identity).map_err(|_| invalid())?;
+        ledger.validate_continuity(keys).map_err(|_| invalid())?;
     }
     write_sync(conn, key, identity, ledger, false)?;
     Ok(Ok(()))
