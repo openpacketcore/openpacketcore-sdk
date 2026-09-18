@@ -201,7 +201,7 @@ fn frozen_export_rejects_malicious_pages_and_incomplete_ranges() {
     assert!(repeated.accept(&first).is_err());
     assert!(repeated.accept(&last).is_err(), "failure is sticky");
     assert!(verifier(&session).accept(&last).is_err());
-    for mutation in 0..6 {
+    for mutation in 0..7 {
         let mut page = serde_json::to_value(&first).unwrap();
         match mutation {
             0 => {
@@ -219,8 +219,13 @@ fn frozen_export_rejects_malicious_pages_and_incomplete_ranges() {
             4 => {
                 page["rows"][0]["proof"]["signature"][0] = serde_json::json!(88);
             }
-            _ => {
+            5 => {
                 page["next"] = serde_json::Value::Null;
+            }
+            _ => {
+                // Changing a signed row field must fail even when all sequence,
+                // predecessor, cursor and signature bytes are left untouched.
+                page["rows"][0]["entry"]["key_epoch"] = serde_json::json!(55);
             }
         }
         let altered = AuditExportPage::decode(&serde_json::to_vec(&page).unwrap()).unwrap();
