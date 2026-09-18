@@ -139,6 +139,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `Ikev2SaInitCryptoErrorCode` to `Ikev2ChildSaKeyMaterialDiagnostic`.
 
 ### Added
+- `opc-proto-nas`: bounded, opaque NAS-over-TCP envelopes with exact
+  caller-storage encoding, borrowed first-frame receive, incremental framing
+  across arbitrary reads, caller-owned coalesced tails and explicit terminal
+  truncation. Validate length before allocation and preserve protected NAS
+  without content decoding (Refs #792).
 - **Consume-once N3IWF protocol-key custody — `opc-proto-ikev2`:** zeroizing
   K_N3IWF import binds an opaque association, generation, pending operation
   and negotiated profile. One attempt computes both directional AUTH MICs

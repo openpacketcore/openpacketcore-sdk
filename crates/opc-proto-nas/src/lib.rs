@@ -14,6 +14,8 @@
 //!
 //! NAS PDUs carry no internal length framing — the transport (NGAP, N1)
 //! delimits them — so decoding consumes the entire input slice.
+//! The separate [`tcp`] module frames opaque PDUs with the TS 24.502 two-octet
+//! envelope, including bounded incremental TCP reads and explicit finalization.
 //!
 //! @spec 3GPP TS24501 R18
 //! @req REQ-3GPP-TS24501-R18-001
@@ -23,6 +25,7 @@ pub mod bcd;
 pub mod identity;
 pub mod messages;
 pub mod security;
+pub mod tcp;
 
 use bytes::{BufMut, Bytes, BytesMut};
 use opc_protocol::{

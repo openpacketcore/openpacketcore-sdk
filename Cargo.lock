@@ -3174,6 +3174,7 @@ dependencies = [
  "opc-proto-gre",
  "opc-proto-gtpu",
  "opc-proto-ikev2",
+ "opc-proto-nas",
  "opc-proto-ngap",
  "opc-protocol",
  "serde",
@@ -3398,6 +3399,7 @@ dependencies = [
 name = "opc-proto-nas"
 version = "0.2.0"
 dependencies = [
+ "allocation-counter",
  "bytes",
  "opc-key",
  "opc-protocol",
