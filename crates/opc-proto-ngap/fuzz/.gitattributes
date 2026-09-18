@@ -1,0 +1,2 @@
+# APER seeds are exact wire bytes, including values that resemble whitespace.
+corpus/** binary

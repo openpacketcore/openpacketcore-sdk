@@ -177,6 +177,48 @@ receiver-ignored malformed fields, unsupported known fields and mutable
 wrapper rejection. Reproduce using `scripts/generate-ngap-nas-fixtures.py`
 with the pinned reference tools and PDF.
 
+## N3IWF UE release field admission
+
+`n3iwf::release` implements the root Cause field, UE identifier choice and
+the following optional typed boundary. Sources: TS 38.413 V18.10.0 8.3.3,
+9.2.2.5–9.2.2.6 and 9.3.1.2; TS 29.413 V18.5.0 5.2–5.3. The existing release corpus
+metadata is corrected to those message clauses; its wire bytes are unchanged.
+
+| Outcome | Required typed IEs | Optional typed IEs | N3IWF disposition |
+|---|---|---|---|
+| UE Context Release Command (initiating 41) | UE NGAP IDs 114, Cause 15 | None | AMF/RAN pair or AMF-only when RAN ID is unavailable |
+| UE Context Release Complete (successful 41) | AMF UE ID 10, RAN UE ID 85 | N3IWF ULI 121 | Ignore paging IEs 32/207; resource list 60 and diagnostics 19 explicitly await codecs |
+
+Both outcomes support canonical construction and receive admission. The generic
+decoder applies unknown/duplicate policies first; typed admission revalidates
+the mutable wrapper and mandatory fields without changing the original PDU.
+Unknown-ignore entries are counted and unknown-notify identifiers are returned
+for caller-owned diagnostics. Unknown reject-criticality and unimplemented
+recognized fields fail explicitly.
+
+`UeIdentifiers` separates local and peer IDs in a pair and retains the valid
+AMF-only choice. Fixed choice/SEQUENCE flags reject extensions before generated
+collection decoding. `Cause` admits all 64 standard root values in five classes;
+extension values and the choice-extension branch are outside this subset.
+Both fields use qualified generated encoders/decoders. Numeric cause getters
+and UE identifier fields are explicit access; Debug and errors redact values.
+
+The [release oracle](tests/fixtures/n3iwf-release.json) independently compiles
+94 field cases and 109 complete messages, including 97 constructions, all four
+missing-mandatory cases, duplicates and each unknown criticality. It covers
+every root Cause and AMF/RAN variable-length integer boundary. Tests compare
+decoded values and complete constructor bytes, then mutate/truncate every
+independent input. Reproduce with `scripts/generate-ngap-release-fixtures.py`
+and the pinned reference environment/PDF. Published wire inventory is unchanged.
+
+Message byte/count limits are checked; fields start after four enclosing
+layers. Identifier choices need depth three, causes two and location four.
+The allocation budget is advisory. The caller resolves association/UE ownership,
+releases signaling and user-plane resources, orders completion, and handles
+applicable optional resource/diagnostic fields before selecting this subset.
+No resource effect or acknowledgement is performed here. UE Release Request
+and other procedure outcomes remain pending under #787.
+
 ## Fixtures
 
 - [Independent N3IWF corpus](../opc-n3iwf-fixtures/oracles/ngap-rel18-messages.json):
