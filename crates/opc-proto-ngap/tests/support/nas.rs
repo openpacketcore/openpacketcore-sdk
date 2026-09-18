@@ -23,6 +23,9 @@ pub fn reconstruct(message: &NasMessage<'_>, ctx: DecodeContext, output: EncodeC
                 allowed_nssai: a_allowed,
                 partially_allowed_nssai: a_partial,
                 selected_nid: a_nid,
+                amf_set_id: a_set,
+                fiveg_s_tmsi: a_tmsi,
+                reroute: a_reroute,
             },
             NasMessage::InitialUe {
                 ran: b_ran,
@@ -34,6 +37,9 @@ pub fn reconstruct(message: &NasMessage<'_>, ctx: DecodeContext, output: EncodeC
                 allowed_nssai: b_allowed,
                 partially_allowed_nssai: b_partial,
                 selected_nid: b_nid,
+                amf_set_id: b_set,
+                fiveg_s_tmsi: b_tmsi,
+                reroute: b_reroute,
             },
         ) => {
             a_ran == b_ran
@@ -45,6 +51,9 @@ pub fn reconstruct(message: &NasMessage<'_>, ctx: DecodeContext, output: EncodeC
                 && a_allowed == b_allowed
                 && a_partial == b_partial
                 && a_nid == b_nid
+                && a_set == b_set
+                && a_tmsi == b_tmsi
+                && a_reroute == b_reroute
         }
         (
             NasMessage::Downlink {
@@ -54,6 +63,8 @@ pub fn reconstruct(message: &NasMessage<'_>, ctx: DecodeContext, output: EncodeC
                 aggregate_bit_rate: a_rate,
                 allowed_nssai: a_allowed,
                 old_amf: a_old,
+                masked_imeisv: a_masked,
+                extended_old_amf: a_extended,
                 partially_allowed_nssai: a_partial,
             },
             NasMessage::Downlink {
@@ -63,6 +74,8 @@ pub fn reconstruct(message: &NasMessage<'_>, ctx: DecodeContext, output: EncodeC
                 aggregate_bit_rate: b_rate,
                 allowed_nssai: b_allowed,
                 old_amf: b_old,
+                masked_imeisv: b_masked,
+                extended_old_amf: b_extended,
                 partially_allowed_nssai: b_partial,
             },
         ) => {
@@ -72,6 +85,8 @@ pub fn reconstruct(message: &NasMessage<'_>, ctx: DecodeContext, output: EncodeC
                 && a_rate == b_rate
                 && a_allowed == b_allowed
                 && a_old == b_old
+                && a_masked == b_masked
+                && a_extended == b_extended
                 && a_partial == b_partial
         }
         (

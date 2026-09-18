@@ -9,6 +9,9 @@
 //! required by its existing raw-preservation contract.
 
 use super::context_fields::{validate_slice_lists, AllowedNssai, PartiallyAllowedNssai};
+use super::nas_fields::{
+    AmfRerouteInformation, AmfSetId, ExtendedAmfName, FiveGStmsi, MaskedImeisv,
+};
 use super::setup_fields::AmfName;
 use super::*;
 use crate::{policy, Message, MessageType, Pdu, PduKind, ProtocolIe};
@@ -135,6 +138,14 @@ pub enum NasMessage<'a> {
         /// Optional SNPN identifier component. A missing Selected PLMN stays
         /// absent; admission does not invent or select a network identity.
         selected_nid: Option<SelectedNid>,
+        /// Optional reroute indication's AMF Set ID, separate from the set in
+        /// 5G-S-TMSI. These identifiers are not required to be equal.
+        amf_set_id: Option<AmfSetId>,
+        /// Optional 5G-S-TMSI. The caller determines when its presence is
+        /// expected; this codec has no subscriber or NAS procedure state.
+        fiveg_s_tmsi: Option<FiveGStmsi>,
+        /// Optional opaque information from the source AMF. No reroute occurs.
+        reroute: Option<AmfRerouteInformation>,
     },
     /// Downlink NAS Transport (initiating procedure 4).
     Downlink {
@@ -150,6 +161,11 @@ pub enum NasMessage<'a> {
         allowed_nssai: Option<AllowedNssai>,
         /// Previous AMF name, without selecting or authorizing an AMF.
         old_amf: Option<AmfName>,
+        /// Optional fixed-width masked equipment identity.
+        masked_imeisv: Option<MaskedImeisv>,
+        /// Optional extended previous-AMF names, independently preserved
+        /// alongside Old AMF without choosing a routing or display preference.
+        extended_old_amf: Option<ExtendedAmfName>,
         /// Optional partial slice list with the combined count/disjointness
         /// rules of TS 38.413 8.6.2.3.
         partially_allowed_nssai: Option<PartiallyAllowedNssai>,
@@ -210,6 +226,9 @@ impl NasMessage<'_> {
                 allowed_nssai,
                 partially_allowed_nssai,
                 selected_nid,
+                amf_set_id,
+                fiveg_s_tmsi,
+                reroute,
             } => {
                 fields.push((
                     85,
@@ -268,6 +287,27 @@ impl NasMessage<'_> {
                         nid.encode(output).map_err(encode_error)?,
                     ));
                 }
+                if let Some(value) = amf_set_id {
+                    fields.push((
+                        3,
+                        Criticality::ignore,
+                        value.encode(output).map_err(encode_error)?,
+                    ));
+                }
+                if let Some(value) = fiveg_s_tmsi {
+                    fields.push((
+                        26,
+                        Criticality::reject,
+                        value.encode(output).map_err(encode_error)?,
+                    ));
+                }
+                if let Some(value) = reroute {
+                    fields.push((
+                        171,
+                        Criticality::ignore,
+                        value.encode(output).map_err(encode_error)?,
+                    ));
+                }
                 MessageType::InitialUeMessage
             }
             Self::Downlink {
@@ -277,6 +317,8 @@ impl NasMessage<'_> {
                 aggregate_bit_rate,
                 allowed_nssai,
                 old_amf,
+                masked_imeisv,
+                extended_old_amf,
                 partially_allowed_nssai,
             } => {
                 fields.push((
@@ -320,6 +362,20 @@ impl NasMessage<'_> {
                         414,
                         Criticality::ignore,
                         slices.encode(output).map_err(encode_error)?,
+                    ));
+                }
+                if let Some(value) = masked_imeisv {
+                    fields.push((
+                        34,
+                        Criticality::ignore,
+                        value.encode(output).map_err(encode_error)?,
+                    ));
+                }
+                if let Some(value) = extended_old_amf {
+                    fields.push((
+                        443,
+                        Criticality::ignore,
+                        value.encode(output).map_err(encode_error)?,
                     ));
                 }
                 MessageType::DownlinkNasTransport
@@ -423,12 +479,12 @@ fn admit<'a>(
     let (profile, supported, ignored): (policy::IeProfile, &[u16], &[u16]) = match kind {
         MessageType::InitialUeMessage => (
             policy::INITIAL_UE_MESSAGE,
-            &[85, 38, 121, 90, 174, 112, 0, 414, 371],
+            &[85, 38, 121, 90, 174, 112, 0, 414, 371, 3, 26, 171],
             &[201, 224, 225, 227, 259, 333, 402, 427],
         ),
         MessageType::DownlinkNasTransport => (
             policy::DOWNLINK_NAS_TRANSPORT,
-            &[10, 85, 38, 110, 0, 48, 414],
+            &[10, 85, 38, 110, 0, 48, 414, 34, 443],
             &[
                 83, 36, 31, 177, 205, 206, 209, 222, 117, 228, 226, 264, 334, 400,
             ],
@@ -448,6 +504,11 @@ fn admit<'a>(
     let mut old_amf = None;
     let mut partially_allowed_nssai = None;
     let mut selected_nid = None;
+    let mut amf_set_id = None;
+    let mut fiveg_s_tmsi = None;
+    let mut reroute = None;
+    let mut masked_imeisv = None;
+    let mut extended_old_amf = None;
     let mut ignored_ie_count = 0;
     let mut notify_ie_ids = Vec::new();
     let leaf_ctx = DecodeContext {
@@ -478,6 +539,11 @@ fn admit<'a>(
             48 => old_amf = Some(AmfName::decode(value, leaf_ctx)?),
             414 => partially_allowed_nssai = Some(PartiallyAllowedNssai::decode(value, leaf_ctx)?),
             371 => selected_nid = Some(SelectedNid::decode(value, leaf_ctx)?),
+            3 => amf_set_id = Some(AmfSetId::decode(value, leaf_ctx)?),
+            26 => fiveg_s_tmsi = Some(FiveGStmsi::decode(value, leaf_ctx)?),
+            171 => reroute = Some(AmfRerouteInformation::decode(value, leaf_ctx)?),
+            34 => masked_imeisv = Some(MaskedImeisv::decode(value, leaf_ctx)?),
+            443 => extended_old_amf = Some(ExtendedAmfName::decode(value, leaf_ctx)?),
             10 => amf = Some(AmfUeId::decode(value, leaf_ctx)?),
             85 => ran = Some(RanUeId::decode(value, leaf_ctx)?),
             38 => nas = Some(NasPdu::decode(value, leaf_ctx)?),
@@ -513,6 +579,9 @@ fn admit<'a>(
             allowed_nssai,
             partially_allowed_nssai,
             selected_nid,
+            amf_set_id,
+            fiveg_s_tmsi,
+            reroute,
         },
         MessageType::DownlinkNasTransport => NasMessage::Downlink {
             amf: amf.ok_or_else(|| invalid("missing amf ue id"))?,
@@ -521,6 +590,8 @@ fn admit<'a>(
             aggregate_bit_rate,
             allowed_nssai,
             old_amf,
+            masked_imeisv,
+            extended_old_amf,
             partially_allowed_nssai,
         },
         MessageType::UplinkNasTransport => NasMessage::Uplink {

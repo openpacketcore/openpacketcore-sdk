@@ -312,6 +312,14 @@ Both messages admit `PartiallyAllowedNssai`, enforcing a combined maximum of
 eight slices and disjointness with Allowed NSSAI. Initial UE also admits the
 fixed 44-bit `SelectedNid`, with exact length and zero padding. Network and
 slice authorization remain caller-owned.
+
+`nas_fields` supplies bounded AMF Set ID, 5G-S-TMSI and opaque AMF reroute
+containers for Initial UE, plus Masked IMEISV and Extended Old AMF for Downlink
+NAS. Extended names preserve independent optional VisibleString/UTF8String
+values, including both present or an empty root; each present name has 1–150
+characters. The two AMF Set IDs remain separate, and all identity/name
+diagnostics are redacted.
+
 Caller-owned association, NAS security, access conditions, Error Indication
 and procedure side effects remain separate.
 

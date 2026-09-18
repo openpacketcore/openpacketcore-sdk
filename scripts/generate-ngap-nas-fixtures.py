@@ -12,6 +12,8 @@ import json
 from pathlib import Path
 import tempfile
 
+from n3iwf_nas_identity_reference import extend_identity_reroute
+
 from n3iwf_ngap_reference import (
     Invalid,
     SPEC_SHA256,
@@ -406,6 +408,7 @@ def main():
                    optional_fields=True, duplicate_id=field["id"], **expectations)
             assert cases[-1]["reference_error"] == "duplicate-ie"
         slice_identity_cases(reference, recipes, record)
+        extend_identity_reroute(reference, recipes, record)
         assert all(row["reference_error"] is None for row in cases if row.get("construct"))
     args.output.write_text(
         json.dumps(
