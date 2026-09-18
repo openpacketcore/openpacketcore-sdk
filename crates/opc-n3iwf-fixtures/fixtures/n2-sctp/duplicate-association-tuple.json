@@ -35,9 +35,12 @@
   ],
   "wire": {
     "path": "wire/duplicate-association-tuple.hex",
-    "digest_sha256": "5c9ffba17e76e1b7ff2d748ef4a5727ebd8945614e3f3cb00dd95492845c23e7"
+    "digest_sha256": "6cf15233b589074b954860380f26de8fb938fc3baca65b94f08a57784350b3e6"
   },
   "semantic_assertions": [
+    "ppid=60",
+    "port=38412",
+    "tuple_count=2",
     "duplicate_tuple=true"
   ],
   "expected_outcome": "caller-policy",

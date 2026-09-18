@@ -17,3 +17,8 @@ opc-proto-eap = { path = ".." }
 name = "project_packet"
 path = "fuzz_targets/project_packet.rs"
 test = false
+
+[[bin]]
+name = "eap5g_packet"
+path = "fuzz_targets/eap5g_packet.rs"
+test = false

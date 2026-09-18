@@ -127,14 +127,18 @@ def ike(data, context):
     return "caller-policy" if duplicate else "accept"
 
 
-def gre(data, context, encoding):
+def gre(data, context, encoding, direction):
     if encoding == "construction-argument":
         require(len(data) == 1, "argument-size")
-        require(data[0] <= context["max_qfi"], "qfi-bound")
+        require(data[0] <= min(63, context["max_qfi"]), "qfi-bound")
         return "accept"
     require(len(data) >= 8, "truncated")
-    # TS 24.502 9.3.3.1: spare receive bits and Protocol Type are ignored.
-    require(uint(data[:2]) & 0xB007 == 0x2000, "flags")
+    # RFC 2784 2.3 / RFC 2890: only reserved bits 6..12 are ignored.
+    # NWu requires K, excludes C/S and legacy routing/recursion, and uses Ver 0.
+    require(uint(data[:2]) & 0xFC07 == 0x2000, "flags")
+    require(direction in {"ue-to-n3iwf", "n3iwf-to-ue"}, "direction")
+    require(direction != "ue-to-n3iwf" or not data[7] & 0x80, "uplink-rqi")
+    # TS 24.502 table 9.3.3-2 explicitly ignores received Protocol Type.
     return "ignore" if uint(data[2:4]) else "accept"
 
 
@@ -343,7 +347,7 @@ def observe(manifest, data):
         return key_reference.observe(data, context)
     try:
         if subset == "gre-qfi":
-            outcome = gre(data, context, manifest["encoding"])
+            outcome = gre(data, context, manifest["encoding"], manifest["direction"])
         elif subset == "n2-sctp":
             outcome = sctp(data, context, manifest["encoding"])
         elif subset == "n2-dtls":
@@ -416,6 +420,36 @@ def verify_field_claims(manifest, data):
             number(name, int(bool(data[0] & mask)))
     elif subset == "nas-tcp" and len(data) >= 2:
         number("length", uint(data[:2]))
+    elif subset == "n2-sctp":
+        require(
+            sum("=" in item for item in manifest["semantic_assertions"]) == len(claims),
+            "field-claim",
+        )
+        if manifest["encoding"] == "protocol-wire":
+            require({"ppid", "user_data_len", "chunk"} <= claims.keys(), "field-claim")
+            number("ppid", uint(data[12:16]))
+            number("user_data_len", uint(data[2:4]) - 16)
+            label("chunk", "DATA")
+            label("ngap_message_validation", "unsupported")
+        else:
+            require({"ppid", "port"} <= claims.keys(), "field-claim")
+            port_first = manifest["context"]["layout"] == "port-ppid"
+            tuples = []
+            for offset in range(0, len(data), 6):
+                item = data[offset : offset + 6]
+                port = uint(item[:2] if port_first else item[4:])
+                ppid = uint(item[2:] if port_first else item[:4])
+                number("port", port)
+                number("ppid", ppid)
+                tuples.append((port, ppid))
+            number("tuple_count", len(tuples))
+            label(
+                "duplicate_tuple",
+                "true" if len(set(tuples)) != len(tuples) else "false",
+            )
+            label(
+                "metadata_order", "port-then-ppid" if port_first else "ppid-then-port"
+            )
     elif subset == "nwu-ike":
         kind, notifies = manifest["context"]["initial_payload_type"], []
         while kind:
@@ -468,7 +502,9 @@ def main():
     except (Invalid, OSError, ValueError, KeyError, TypeError, IndexError):
         print("n3iwf_fixture_semantic_mismatch", file=sys.stderr)
         return 1
-    print(f"n3iwf_fixture_oracles_valid: {count} envelopes, scenarios and known answers")
+    print(
+        f"n3iwf_fixture_oracles_valid: {count} envelopes, scenarios and known answers"
+    )
     return 0
 
 

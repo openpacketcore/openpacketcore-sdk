@@ -32,6 +32,7 @@ jobs:
           - opc-protocol
           - opc-proto-gtpu
           - opc-gtpu-dataplane
+          - opc-proto-gre
           - opc-proto-pfcp
           - opc-proto-nas
           - opc-proto-ngap
@@ -85,6 +86,7 @@ jobs:
           - opc-protocol
           - opc-proto-gtpu
           - opc-gtpu-dataplane
+          - opc-proto-gre
           - opc-proto-pfcp
           - opc-proto-nas
           - opc-proto-ngap
