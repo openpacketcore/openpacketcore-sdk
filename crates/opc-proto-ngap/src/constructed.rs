@@ -49,7 +49,7 @@ macro_rules! message_types {
         ///
         /// This selects the procedure code, outcome and procedure criticality
         /// together. It does not establish N3IWF semantic admission. Paging has
-        /// structural coverage only; the other fifteen outcomes have independent
+        /// structural coverage only; the other documented outcomes have independent
         /// Release 18 complete-message evidence.
         #[derive(Clone, Copy, Debug, PartialEq, Eq)]
         pub enum MessageType {
@@ -103,6 +103,14 @@ message_types! {
     InitialUeMessage, Initiating, PROCEDURE_CODE_INITIAL_UE, ignore, INITIAL_UE_MESSAGE;
     DownlinkNasTransport, Initiating, PROCEDURE_CODE_DOWNLINK_NAS_TRANSPORT, ignore, DOWNLINK_NAS_TRANSPORT;
     UplinkNasTransport, Initiating, PROCEDURE_CODE_UPLINK_NAS_TRANSPORT, ignore, UPLINK_NAS_TRANSPORT, 0;
+    PduSessionResourceModifyRequest, Initiating, PROCEDURE_CODE_PDU_SESSION_RESOURCE_MODIFY, reject, PDU_SESSION_RESOURCE_MODIFY_REQUEST;
+    PduSessionResourceModifyResponse, Successful, PROCEDURE_CODE_PDU_SESSION_RESOURCE_MODIFY, reject, PDU_SESSION_RESOURCE_MODIFY_RESPONSE;
+    PduSessionResourceNotify, Initiating, PROCEDURE_CODE_PDU_SESSION_RESOURCE_NOTIFY, ignore, PDU_SESSION_RESOURCE_NOTIFY;
+    NgReset, Initiating, PROCEDURE_CODE_NG_RESET, reject, NG_RESET;
+    NgResetAcknowledge, Successful, PROCEDURE_CODE_NG_RESET, reject, NG_RESET_ACKNOWLEDGE;
+    ErrorIndication, Initiating, PROCEDURE_CODE_ERROR_INDICATION, ignore, ERROR_INDICATION;
+    NasNonDeliveryIndication, Initiating, PROCEDURE_CODE_NAS_NON_DELIVERY_INDICATION, ignore, NAS_NON_DELIVERY_INDICATION;
+    UeContextReleaseRequest, Initiating, PROCEDURE_CODE_UE_CONTEXT_RELEASE_REQUEST, ignore, UE_CONTEXT_RELEASE_REQUEST, 0;
     InitialContextSetupRequest, Initiating, PROCEDURE_CODE_INITIAL_CONTEXT_SETUP, reject, INITIAL_CONTEXT_SETUP_REQUEST;
     InitialContextSetupResponse, Successful, PROCEDURE_CODE_INITIAL_CONTEXT_SETUP, reject, INITIAL_CONTEXT_SETUP_RESPONSE;
     InitialContextSetupFailure, Unsuccessful, PROCEDURE_CODE_INITIAL_CONTEXT_SETUP, reject, INITIAL_CONTEXT_SETUP_FAILURE;
@@ -195,7 +203,7 @@ fn add(a: usize, b: usize) -> Result<usize, EncodeError> {
 
 // X.691 11.9: emit the largest 16K multiple up to 64K per fragment, then a
 // final short/two-octet determinant (including zero after exact multiples).
-fn open_type_len(len: usize) -> Result<usize, EncodeError> {
+pub(super) fn open_type_len(len: usize) -> Result<usize, EncodeError> {
     let remainder = len % 65536;
     let fragments = add(len / 65536, usize::from(remainder >= 16384))?;
     let final_len = remainder % 16384;
@@ -288,18 +296,18 @@ pub(super) fn encode(pdu: &Pdu, ctx: EncodeContext) -> Result<Vec<u8>, EncodeErr
     Ok(result)
 }
 
-fn write_prefix(out: &mut Vec<u8>, count: usize) {
+pub(super) fn write_prefix(out: &mut Vec<u8>, count: usize) {
     out.push(0); // No SEQUENCE extension additions; zero alignment bits.
     out.extend_from_slice(&(count as u16).to_be_bytes()); // preflighted
 }
 
-fn write_ie(out: &mut Vec<u8>, id: u16, criticality: u8, value: &[u8]) {
+pub(super) fn write_ie(out: &mut Vec<u8>, id: u16, criticality: u8, value: &[u8]) {
     out.extend_from_slice(&id.to_be_bytes());
     out.push(criticality << 6);
     write_open_type(out, value);
 }
 
-fn write_open_type(out: &mut Vec<u8>, mut value: &[u8]) {
+pub(super) fn write_open_type(out: &mut Vec<u8>, mut value: &[u8]) {
     while value.len() >= 16384 {
         let units = (value.len() / 16384).min(4);
         let size = units * 16384;

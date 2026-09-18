@@ -30,6 +30,18 @@ fn message_fields(message: &Message) -> (&'static str, Vec<Field>) {
         Message::InitialUeMessage(value) => view!("InitialUEMessage", value),
         Message::DownlinkNasTransport(value) => view!("DownlinkNASTransport", value),
         Message::UplinkNasTransport(value) => view!("UplinkNASTransport", value, 0),
+        Message::PduSessionResourceModifyRequest(value) => {
+            view!("PDUSessionResourceModifyRequest", value)
+        }
+        Message::PduSessionResourceModifyResponse(value) => {
+            view!("PDUSessionResourceModifyResponse", value)
+        }
+        Message::PduSessionResourceNotify(value) => view!("PDUSessionResourceNotify", value),
+        Message::NgReset(value) => view!("NGReset", value),
+        Message::NgResetAcknowledge(value) => view!("NGResetAcknowledge", value),
+        Message::ErrorIndication(value) => view!("ErrorIndication", value),
+        Message::NasNonDeliveryIndication(value) => view!("NASNonDeliveryIndication", value),
+        Message::UeContextReleaseRequest(value) => view!("UEContextReleaseRequest", value, 0),
         Message::InitialContextSetupRequest(value) => view!("InitialContextSetupRequest", value),
         Message::InitialContextSetupResponse(value) => view!("InitialContextSetupResponse", value),
         Message::InitialContextSetupFailure(value) => view!("InitialContextSetupFailure", value),
@@ -228,6 +240,12 @@ fn constructed_containers_match_every_independent_admitted_outcome() {
             "InitialUEMessage" => MessageType::InitialUeMessage,
             "DownlinkNASTransport" => MessageType::DownlinkNasTransport,
             "UplinkNASTransport" => MessageType::UplinkNasTransport,
+            "NGReset" => MessageType::NgReset,
+            "PDUSessionResourceNotify" => MessageType::PduSessionResourceNotify,
+            "NGResetAcknowledge" => MessageType::NgResetAcknowledge,
+            "ErrorIndication" => MessageType::ErrorIndication,
+            "NASNonDeliveryIndication" => MessageType::NasNonDeliveryIndication,
+            "UEContextReleaseRequest" => MessageType::UeContextReleaseRequest,
             "InitialContextSetupRequest" => MessageType::InitialContextSetupRequest,
             "InitialContextSetupResponse" => MessageType::InitialContextSetupResponse,
             "InitialContextSetupFailure" => MessageType::InitialContextSetupFailure,

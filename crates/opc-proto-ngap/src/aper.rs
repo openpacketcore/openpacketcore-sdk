@@ -75,6 +75,32 @@ pub(super) struct FramedIe<'a> {
     pub(super) value: Cow<'a, [u8]>,
 }
 
+/// Check an entire IE without materializing its open type. New typed transfer
+/// admission uses this to preflight every physical IE before allocating its
+/// container, and to skip opaque unknown values after policy selection.
+pub(super) fn scan_ie(input: &[u8]) -> Result<(&[u8], [u8; 3]), DecodeError> {
+    let prefix = input.get(..3).ok_or_else(error)?;
+    let (remaining, _) = scan_open_type(&input[3..])?;
+    Ok((remaining, [prefix[0], prefix[1], prefix[2]]))
+}
+
+/// Complete canonical fragment framing and payload size, without allocation.
+pub(super) fn scan_open_type(input: &[u8]) -> Result<(&[u8], usize), DecodeError> {
+    let mut remaining = input;
+    let mut length = 0usize;
+    loop {
+        if matches!(remaining, [0x80, second, ..] if *second < 128) {
+            return Err(error());
+        }
+        let (next, part, more) = fragment(remaining)?;
+        length = length.checked_add(part.len()).ok_or_else(error)?;
+        remaining = next;
+        if !more {
+            return Ok((remaining, length));
+        }
+    }
+}
+
 pub(super) fn ie(input: &[u8]) -> Result<FramedIe<'_>, DecodeError> {
     let prefix = input.get(..3).ok_or_else(error)?;
     let (remaining, value) = open_type(&input[3..])?;

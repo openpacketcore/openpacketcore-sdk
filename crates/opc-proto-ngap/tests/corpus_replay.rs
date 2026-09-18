@@ -9,7 +9,40 @@
 //! protection — if a future change makes the decode path panic on a known
 //! input, this test fails and names the offending input.
 
+#[path = "support/resource_release.rs"]
+mod resource_release;
+#[path = "support/resource_setup.rs"]
+mod resource_setup;
+
+#[path = "support/ue_requests.rs"]
+mod ue_requests;
+
+#[path = "support/modify_fields.rs"]
+mod modify_fields;
+
+#[path = "support/notify.rs"]
+mod notify;
+
+#[path = "support/reset.rs"]
+mod reset;
+
 use bytes::Bytes;
+use opc_proto_ngap::n3iwf::context_fields::{AllowedNssai, Guami, SecurityAlgorithmMasks};
+use opc_proto_ngap::n3iwf::nas::{NasMessage, UeAggregateBitRate};
+use opc_proto_ngap::n3iwf::release::{Cause, ReleaseMessage, UeIdentifiers};
+use opc_proto_ngap::n3iwf::resource_fields::{
+    DownlinkTransport, QosFlowSetupList, SessionAggregateBitRate, SessionType, UplinkTransport,
+};
+use opc_proto_ngap::n3iwf::resource_request::SetupRequestTransfer;
+use opc_proto_ngap::n3iwf::resource_results::{SetupFailureTransfer, SetupResponseTransfer};
+use opc_proto_ngap::n3iwf::session_lists::{
+    FailedSessions, SessionResults, SessionSetupRequests, SuccessfulSessions,
+};
+use opc_proto_ngap::n3iwf::setup::{
+    AmfName, GlobalN3iwfId, PagingDrx, PlmnSupportList, ServedGuamiList, SetupMessage,
+    SupportedTaList,
+};
+use opc_proto_ngap::n3iwf::{AmfUeId, N3iwfLocation, NasPdu, RanUeId, SecurityKey, TrackingArea};
 use opc_proto_ngap::{encode, Criticality, MessageType, Pdu, ProtocolIe};
 use opc_protocol::{DecodeContext, Encode, EncodeContext, OwnedDecode, ValidationLevel};
 
@@ -22,7 +55,215 @@ fn exercise(data: &[u8]) {
         validation_level: ValidationLevel::Strict,
         ..DecodeContext::default()
     };
+    modify_fields::exercise(
+        data,
+        ctx,
+        EncodeContext {
+            max_message_len: ctx.max_message_len,
+            ..EncodeContext::default()
+        },
+    );
+    notify::exercise(
+        data,
+        ctx,
+        EncodeContext {
+            max_message_len: ctx.max_message_len,
+            ..EncodeContext::default()
+        },
+    );
+    reset::exercise(
+        data,
+        ctx,
+        EncodeContext {
+            max_message_len: ctx.max_message_len,
+            ..EncodeContext::default()
+        },
+    );
+    ue_requests::exercise(
+        data,
+        ctx,
+        EncodeContext {
+            max_message_len: ctx.max_message_len,
+            ..EncodeContext::default()
+        },
+    );
+    resource_setup::exercise(
+        data,
+        ctx,
+        EncodeContext {
+            max_message_len: ctx.max_message_len,
+            ..EncodeContext::default()
+        },
+    );
+    resource_release::exercise(
+        data,
+        ctx,
+        EncodeContext {
+            max_message_len: ctx.max_message_len,
+            ..EncodeContext::default()
+        },
+    );
+    // Exercise all admitted field receivers on corpus/truncation inputs too.
+    let _ = AmfUeId::decode(data, ctx);
+    let _ = RanUeId::decode(data, ctx);
+    let _ = NasPdu::decode(data, ctx);
+    let _ = SecurityKey::decode(data, ctx);
+    let _ = TrackingArea::decode(data, ctx);
+    let _ = N3iwfLocation::decode(data, ctx);
+    let _ = UeAggregateBitRate::decode(data, ctx);
+    let _ = Cause::decode(data, ctx);
+    let _ = UeIdentifiers::decode(data, ctx);
+    if let Ok(field) = UplinkTransport::decode(data, ctx) {
+        let wire = field.encode(EncodeContext::default()).unwrap();
+        assert!(UplinkTransport::decode(wire.as_bytes(), ctx).unwrap() == field);
+    }
+    if let Ok(field) = DownlinkTransport::decode(data, ctx) {
+        let wire = field.encode(EncodeContext::default()).unwrap();
+        assert!(DownlinkTransport::decode(wire.as_bytes(), ctx).unwrap() == field);
+    }
+    if let Ok(field) = SessionAggregateBitRate::decode(data, ctx) {
+        let wire = field.encode(EncodeContext::default()).unwrap();
+        assert!(SessionAggregateBitRate::decode(wire.as_bytes(), ctx).unwrap() == field);
+    }
+    if let Ok(field) = SessionType::decode(data, ctx) {
+        let wire = field.encode(EncodeContext::default()).unwrap();
+        assert!(SessionType::decode(wire.as_bytes(), ctx).unwrap() == field);
+    }
+    if let Ok(field) = QosFlowSetupList::decode(data, ctx) {
+        let wire = field.encode(EncodeContext::default()).unwrap();
+        assert!(QosFlowSetupList::decode(wire.as_bytes(), ctx).unwrap() == field);
+    }
+    if let Ok(admitted) = SetupRequestTransfer::decode(data, ctx) {
+        let wire = admitted.transfer.encode(EncodeContext::default()).unwrap();
+        let received = SetupRequestTransfer::decode(wire.as_bytes(), ctx).unwrap();
+        assert!(received.transfer == admitted.transfer);
+        assert_eq!(received.ignored_ie_count, 0);
+        assert!(received.notify_ie_ids.is_empty());
+    }
+    let result_ctx = DecodeContext { max_ies: 64, ..ctx };
+    if let Ok(value) = SetupResponseTransfer::decode(data, result_ctx) {
+        let wire = value.encode(EncodeContext::default()).unwrap();
+        assert!(SetupResponseTransfer::decode(wire.as_bytes(), result_ctx).unwrap() == value);
+    }
+    if let Ok(value) = SetupFailureTransfer::decode(data, result_ctx) {
+        let wire = value.encode(EncodeContext::default()).unwrap();
+        assert!(SetupFailureTransfer::decode(wire.as_bytes(), result_ctx).unwrap() == value);
+    }
+    let list_ctx = DecodeContext {
+        max_ies: 256,
+        ..ctx
+    };
+    let list_output = EncodeContext {
+        max_message_len: 200_000,
+        ..EncodeContext::default()
+    };
+    if let Ok(value) = SessionSetupRequests::decode(data, list_ctx) {
+        let wire = value.requests.encode(list_output).unwrap();
+        let admitted = SessionSetupRequests::decode(wire.as_bytes(), list_ctx).unwrap();
+        assert!(admitted.diagnostics.is_empty());
+        assert_eq!(
+            admitted.requests.values().len(),
+            value.requests.values().len()
+        );
+        for (got, expected) in admitted
+            .requests
+            .values()
+            .iter()
+            .zip(value.requests.values())
+        {
+            assert_eq!(got.id.value(), expected.id.value());
+            assert!(got.slice == expected.slice);
+            assert!(got.transfer == expected.transfer);
+            assert!(
+                got.nas.as_ref().map(|v| v.as_bytes())
+                    == expected.nas.as_ref().map(|v| v.as_bytes())
+            );
+        }
+    }
+    let successful = SuccessfulSessions::decode(data, list_ctx).ok();
+    let failed = FailedSessions::decode(data, list_ctx).ok();
+    if let Some(value) = &successful {
+        let wire = value.encode(list_output).unwrap();
+        assert!(SuccessfulSessions::decode(wire.as_bytes(), list_ctx).unwrap() == *value);
+    }
+    if let Some(value) = &failed {
+        let wire = value.encode(list_output).unwrap();
+        assert!(FailedSessions::decode(wire.as_bytes(), list_ctx).unwrap() == *value);
+    }
+    let _ = SessionResults::new(successful, failed);
+    if let Ok(field) = Guami::decode(data, ctx) {
+        let wire = field.encode(EncodeContext::default()).unwrap();
+        assert!(Guami::decode(wire.as_bytes(), ctx).unwrap() == field);
+    }
+    if let Ok(field) = AllowedNssai::decode(data, ctx) {
+        let wire = field.encode(EncodeContext::default()).unwrap();
+        assert!(AllowedNssai::decode(wire.as_bytes(), ctx).unwrap() == field);
+    }
+    if let Some(bytes) = data.get(..8) {
+        let masks = bytes.as_chunks::<2>().0;
+        let value = SecurityAlgorithmMasks::new(
+            u16::from_be_bytes(masks[0]),
+            u16::from_be_bytes(masks[1]),
+            u16::from_be_bytes(masks[2]),
+            u16::from_be_bytes(masks[3]),
+        );
+        assert_eq!(
+            value
+                .encode(EncodeContext::default())
+                .unwrap()
+                .as_bytes()
+                .len(),
+            9
+        );
+    }
+    if let Ok(field) = GlobalN3iwfId::decode(data, ctx) {
+        let wire = field.encode(EncodeContext::default()).unwrap();
+        assert!(GlobalN3iwfId::decode(wire.as_bytes(), ctx).unwrap() == field);
+    }
+    if let Ok(field) = ServedGuamiList::decode(data, ctx) {
+        let wire = field.encode(EncodeContext::default()).unwrap();
+        assert!(ServedGuamiList::decode(wire.as_bytes(), ctx).unwrap() == field);
+    }
+    if let Ok(field) = PlmnSupportList::decode(data, ctx) {
+        let wire = field.encode(EncodeContext::default()).unwrap();
+        assert!(PlmnSupportList::decode(wire.as_bytes(), ctx).unwrap() == field);
+    }
+    if let Ok(field) = SupportedTaList::decode(data, ctx) {
+        let wire = field.encode(EncodeContext::default()).unwrap();
+        assert!(SupportedTaList::decode(wire.as_bytes(), ctx).unwrap() == field);
+    }
+    if let Ok(field) = AmfName::decode(data, ctx) {
+        let wire = field.encode(EncodeContext::default()).unwrap();
+        assert!(AmfName::decode(wire.as_bytes(), ctx).unwrap() == field);
+    }
     if let Ok(pdu) = Pdu::decode_owned(Bytes::copy_from_slice(data), ctx) {
+        if let Ok(admitted) = SetupMessage::from_pdu(&pdu, ctx) {
+            let constructed = match &admitted.message {
+                SetupMessage::Request(value) => value.construct(PagingDrx::v128, ctx),
+                SetupMessage::Response(value) => value.construct(ctx),
+                SetupMessage::Failure(value) => value.construct(ctx),
+            }
+            .unwrap();
+            let wire = encode(&constructed, EncodeContext::default()).unwrap();
+            let received = Pdu::decode_owned(Bytes::from(wire), ctx).unwrap();
+            let readmitted = SetupMessage::from_pdu(&received, ctx).unwrap();
+            assert!(readmitted.message == admitted.message);
+            assert!(readmitted.notify_ie_ids.is_empty());
+        }
+        if let Ok(admitted) = ReleaseMessage::from_pdu(&pdu, ctx) {
+            let constructed = admitted.message.construct(ctx).unwrap();
+            let wire = encode(&constructed, EncodeContext::default()).unwrap();
+            let received = Pdu::decode_owned(Bytes::from(wire), ctx).unwrap();
+            assert!(ReleaseMessage::from_pdu(&received, ctx).is_ok());
+        }
+        if let Ok(admitted) = NasMessage::from_pdu(&pdu, ctx) {
+            let constructed = admitted.message.construct(ctx).unwrap();
+            let wire = encode(&constructed, EncodeContext::default()).unwrap();
+            let received = Pdu::decode_owned(Bytes::from(wire), ctx).unwrap();
+            let readmitted = NasMessage::from_pdu(&received, ctx).unwrap();
+            assert_eq!(readmitted.ignored_ie_count, 0);
+            assert!(readmitted.notify_ie_ids.is_empty());
+        }
         if let Ok(wire) = encode(&pdu, EncodeContext::default()) {
             assert_eq!(pdu.wire_len(EncodeContext::default()).unwrap(), wire.len());
             assert!(Pdu::decode_owned(Bytes::from(wire), ctx).unwrap().kind == pdu.kind);

@@ -133,6 +133,108 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `Ikev2SaInitCryptoErrorCode` to `Ikev2ChildSaKeyMaterialDiagnostic`.
 
 ### Added
+- `opc-proto-ngap`: optional UE Context Release Complete session reports with
+  unique IDs and optional empty release-response transfers, backed by 1,287
+  independent fields and 1,308 complete messages. Preflight nested framing,
+  count and depth before allocation. Complete variant literals and exhaustive
+  patterns must include or allow the new `sessions` field.
+- `opc-proto-ngap`: optional Criticality Diagnostics in seven existing response
+  types, backed by 4,349 independent complete-message vectors. Preserve absent
+  versus empty diagnostics, enforce response header applicability and bound
+  diagnostic lists before allocation. Affected struct literals and Release
+  Complete patterns must include or allow the new `diagnostics` field.
+- Add explicit N3IWF receive routing for all 40 applicable NGAP outcomes,
+  assigned metadata checks for all Release 18 procedures, disabled trigger gates
+  for pending codecs and value-free unsupported-procedure diagnostic headers.
+  Document each pending procedure's receive/error behavior and caller effects.
+  Envelope classification remains separate from typed field admission.
+- `opc-proto-ngap`: qualify complete PDU Session Resource Modify Request/Response
+  with bounded session lists, optional NAS/S-NSSAI and partial failure diagnostics.
+  Add two public message variants (exhaustive matches require updates), independent
+  Release 18 byte evidence and shared adversarial replay; caller-owned effects
+  and the remaining #787 procedure matrix stay explicit.
+
+- `opc-proto-ngap`: bounded Modify response and unsuccessful transfers with
+  optional directional endpoints, unique/disjoint QFI results and qualified
+  response diagnostics. Preserve empty roots and absent/empty diagnostics;
+  1,436 independent vectors qualify parent-offset framing. Request correlation,
+  conditional NAS forwarding and resource effects remain caller-owned (Refs #787).
+- `opc-proto-ngap`: bounded Modify Request Transfer with optional AMBR, tunnel
+  modifications, add/modify QFIs and release causes, backed by 380 independent
+  complete transfers. Preserve empty roots and absent parameters, apply shared
+  IE policies and reject cross-list QFI conflicts; enclosing Modify messages
+  and resource effects remain separate (Refs #787).
+- `opc-proto-ngap`: standalone PDU Resource Modify flow and tunnel-pair fields,
+  backed by 687 independent Release 18 cases. Preserve absent QoS parameters,
+  typed endpoint directions and ordered tunnel pairs; validate root counts,
+  identifiers and exact framing before allocation. Further Modify transfers
+  and complete procedure admission remain pending (Refs #787).
+- `opc-proto-ngap`: canonical PDU Session Resource Notify with typed root
+  flow notifications, released QFIs and whole-session release reports, backed
+  by 1,014 independent cases. Enforces nonempty reports and disjoint identifiers;
+  GBR classification, correlation and cleanup remain caller-owned. Shared
+  contained-field preflight rejects nonminimal short-value lengths. Adds a
+  public message variant; downstream exhaustive matches need updating (Refs #787).
+- `opc-proto-ngap`: canonical NG Reset, Reset Acknowledge and Error Indication
+  with explicit signalling context, bounded fragmented connection lists and
+  root Criticality Diagnostics. Preserve legal empty/repeated connection items
+  and enforce conditional Error fields and diagnostic applicability, backed by
+  1,282 independent cases. Adds three public message variants; downstream
+  exhaustive matches need updating. Correlation and resource effects remain
+  caller-owned (Refs #787).
+- `opc-proto-ngap`: canonical NAS Non-Delivery Indication and UE Context
+  Release Request with required root Cause and optional unique session IDs,
+  backed by 548 independent field/message cases. Root Cause now rejects
+  nonzero final padding across all admitted procedures. Adds public message
+  variants; downstream exhaustive matches need updating (Refs #787).
+- `opc-proto-ngap`: canonical PDU Session Resource Release Command/Response
+  construction and admission, with unique session lists, per-session root
+  Causes and bounded generated transfer codecs. Independent Release 18 evidence
+  covers every list length, optional NAS/location and receiver-ignore behavior;
+  correlation and resource cleanup remain caller-owned (Refs #787).
+- `opc-proto-ngap`: canonical construction and typed admission for all five
+  Initial Context/PDU Session Resource Setup outcomes, with required and
+  conditional presence, nested caller policies and disjoint partial results.
+  Independent Release 18 messages cover receiver-ignored capabilities, borrowed
+  keys and fragmented NAS; resource effects remain caller-owned (Refs #787).
+- `opc-proto-ngap`: bounded context/PDU Setup session request/result lists
+  with optional borrowed NAS, S-NSSAI, unique session IDs and disjoint partial
+  results. Independent Release 18 vectors cover seven root layouts and nested
+  fragmentation; nested admission preserves caller IE policies (Refs #787).
+- `opc-proto-ngap`: construct/admit bounded setup response and unsuccessful
+  transfers, with distinct downlink endpoints and unique, disjoint accepted/
+  failed QFI results. Independent Release 18 vectors qualify the response
+  layout and all root Causes; malformed final padding is rejected before
+  generated unsuccessful-transfer decoding (Refs #787).
+- `opc-proto-ngap`: admit and construct a bounded PDU-session setup-request
+  transfer with distinct UL/DL tunnel fields, session AMBR, root session types
+  and unique non-GBR 5QI 9 flows. Preserve nested unknown/duplicate IE policies;
+  require conditional AMBR and reject unimplemented known fields. Independent
+  Release 18 vectors qualify the nested QoS framing fix (Refs #787).
+- `opc-proto-ngap`: bounded standalone GUAMI and Allowed NSSAI field codecs,
+  plus construction-only UE security algorithm masks. Independent Release 18
+  vectors cover every root list length, optional slice differentiators and
+  every mask bit. Context-message composition is qualified separately above.
+- `opc-proto-ngap`: construct and admit all three NG Setup outcomes with bounded
+  N3IWF identity, TA/PLMN/slice/GUAMI lists, AMF name/capacity and root retry
+  delay. Preserve mandatory presence plus receiver-ignore behavior for DRX.
+  Independent Release 18 vectors qualify fixes for nested APER alignment;
+  association activation and selection remain caller-owned (Refs #787).
+- Experimental NGAP N3IWF UE release field admission and construction, including
+  AMF/RAN and AMF-only identifier choices, all root Cause values and optional
+  location. Independent Release 18 messages qualify this bounded subset; resource
+  cleanup, association authorization and remaining procedure fields stay outside.
+- `opc-proto-ngap`: construct and admit bounded Initial UE and uplink/downlink
+  NAS messages, enforce every required field, validate N3IWF-applicable UE
+  AMBR, and report unknown-notify diagnostic IDs. Explicitly gate unsupported
+  known fields and retain generic decode selection/raw preservation. Compare
+  with 44 independent complete-message cases (Refs #787).
+- `opc-proto-ngap`: typed, redacted N3IWF UE IDs, opaque NAS, borrowed Security
+  Key, TAI and IPv4/IPv6 location values with canonical field encoding and
+  bounded decoding. Correct TAI receive and without-port CHOICE alignment
+  against 51 independent Release 18 field vectors and two complete UL NAS
+  messages. Encoded buffers clear on drop; procedure presence, additional
+  nested extensions and key-provider admission remain separate (Refs #787).
 - `opc-proto-ngap`: construct and canonically encode the supported root PDU/IE
   containers from opaque encoded IE values; preserve existing receive policies
   and raw replay. Correct open-type fragmentation boundaries, check complete

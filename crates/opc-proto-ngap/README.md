@@ -10,9 +10,11 @@ schema is V19.2.0 and admits later extensions. The current scope is the v1
 subset documented in [CONFORMANCE.md](CONFORMANCE.md).
 
 It is not a full NGAP implementation and does not provide SCTP transport, AMF
-or gNB procedure state, NAS handling, or semantic validation of NGAP IE
-contents. The typed boundary does validate top-level identifiers, criticality,
-cardinality, and configured decode policies.
+or gNB procedure state, or NAS message processing. Its optional `n3iwf`
+module validates the documented individual fields, NAS and UE requests,
+NG Setup, context/session setup and release subsets. The container boundary
+validates top-level identifiers, criticality, cardinality, and configured
+decode policies.
 
 ## API Shape
 
@@ -31,6 +33,18 @@ cardinality, and configured decode policies.
   received packet. `MessageType` fixes the procedure/outcome/criticality tuple.
 - `encode` and `Encode` default to canonical root-container output. Explicit
   `raw_preserving` mode replays the original receive bytes.
+
+## N3IWF procedure routing
+
+Use `n3iwf::applicability::inspect` before generic decoding on an N3IWF
+interface. It distinguishes 23 qualified field subsets, 17 applicable outcomes
+requiring a handler, and procedures absent from N3IWF applicability. It checks
+complete envelope framing, assigned Release 18 metadata and direction without
+allocating a body. The result does not admit fields; keep the same context for
+generic decoding and typed admission. `ApplicableMessage::local_trigger` gates
+wire capability and leaves all pending codecs disabled. `Outcome` is public
+metadata. See [the receive/error and trigger matrix](N3IWF-PROCEDURES.md) for
+required caller behavior and value-free unsupported-procedure diagnostics.
 
 ## Typed IE policy boundary
 
@@ -104,20 +118,113 @@ pdu.encode(
 
 ## Status And Limits
 
+`n3iwf::resource_request::SetupRequestTransfer` constructs and admits the
+nested request transfer for a bounded non-GBR 5QI 9 subset. It requires an UL
+tunnel, session AMBR, session type and unique QoS flows. `resource_fields`
+keeps uplink and downlink endpoint types separate. Other QoS profiles and
+recognized optional transfer fields fail explicitly. `resource_results` adds
+a single-downlink setup response with unique accepted/failed QFI results and
+a root-Cause unsuccessful transfer. `session_lists` adds bounded request,
+successful and failed session lists for context and PDU Setup procedures,
+with unique session IDs, optional NAS, slice values and disjoint partial
+results. `resource_setup` composes these fields into Initial Context Setup
+Request/Response/Failure and PDU Session Resource Setup Request/Response.
+Admission checks required and conditional presence, contained transfers and
+partial results; these values do not configure a session or tunnel. Requests
+with resource lists require an explicit `DecodeContext::max_depth` of at least
+17. See the message matrix in [CONFORMANCE.md](CONFORMANCE.md).
+
+`resource_release` admits and constructs PDU Session Resource Release Command
+and Response. It includes unique session lists, per-session root Causes,
+empty response transfers, optional opaque NAS and optional N3IWF location.
+The caller correlates requests and performs cleanup; decoding a peer report
+does not prove that resources have been removed.
+
+NG Setup Response/Failure, Initial Context Setup Response/Failure, PDU Session
+Resource Setup/Release Response and UE Context Release Complete accept optional
+`diagnostics`. Absence differs from a present empty root. Responses reject
+procedure code and triggering outcome, which belong only in Error Indication.
+Diagnostic lists preserve repeated IDs and need total message depth at least 8
+(6 without items), alongside existing field depth requirements. Affected public
+struct literals and the Release Complete variant now require the new field.
+
+UE Context Release Complete also accepts optional `sessions`. The nonempty
+`release_sessions::ContextReleasedSessions` list preserves up to 256 unique
+session IDs and distinguishes an absent transfer from a present empty release
+response transfer. Lists require field depth 3, or 6 with transfers; complete
+messages require at least 7 or 10 respectively. Other fields retain their depth
+requirements. Complete variant literals and exhaustive patterns must include or
+allow `sessions`. The caller correlates these reports with its resource state.
+
+`ue_requests` admits and constructs NAS Non-Delivery Indication and UE Context
+Release Request, including mandatory root Cause and optional unique session IDs.
+NAS stays opaque and borrows contiguous input. Context correlation, deciding when
+to send a request and resource release remain caller-owned. Root Cause decoding
+now rejects nonzero final padding that the generated decoder previously ignored.
+
+`reset` admits and constructs NG Reset, Reset Acknowledge and Error Indication.
+Callers explicitly supply non-UE or UE-associated signalling context. Partial
+Reset lists preserve order, repeated identifiers and legal empty items;
+`nonempty()` omits items that receivers must ignore. Root diagnostics enforce
+their procedure-specific applicability. Error Indication requires Cause or
+diagnostics, and both UE identifiers for UE-associated signalling. The caller
+chooses procedure triggers, correlates acknowledgements and performs cleanup.
+
+`notify` admits and constructs PDU Session Resource Notify with typed flow
+notifications, released flows and whole-session release reports. Present lists
+are nonempty, with unique and disjoint session/QFI domains. The caller verifies
+association, session ownership and whether a notified QFI is an established GBR
+flow; admission neither infers that state nor performs cleanup. The qualified
+root subset requires depth 10–12 depending on the contained reports. Alternative
+QoS, feedback and usage-report extensions remain unsupported.
+
+`modify_fields` supplies standalone add/modify QFI lists with absent or explicit
+non-GBR 5QI 9 parameters, successful QFI reports, QFI/Cause lists and ordered
+uplink/downlink tunnel modification pairs. Parameter absence is preserved;
+these fields do not infer existing state or supply defaults. `modify_request`
+composes optional session AMBR, tunnel modifications, add/modify flows and
+release causes into a bounded Modify Request Transfer. It preserves empty
+roots and absent AMBR, rejects cross-list QFI overlap, and applies the shared
+IE selection policies after complete physical preflight. Request/response
+correlation, conditional NAS forwarding and resource effects remain caller-owned.
+`modify_results` supplies optional directional tunnel and unique/disjoint QFI
+reports, plus unsuccessful transfers with root Causes and response diagnostics.
+Empty response roots and absent versus empty diagnostics stay distinct. The
+caller checks conditional presence, request correspondence and resource effects.
+`modify_lists` adds bounded session requests/results with optional NAS/S-NSSAI,
+unique IDs and contained diagnostics. `modify` constructs and admits complete
+Modify Request/Response messages with partial or all-failed results, optional
+N3IWF location and response diagnostics. RAN Paging Priority is receiver-ignored.
+Callers retain session correlation, prescribed error responses and trigger policy.
+The two new public `Message`/`MessageType` variants require exhaustive match
+updates; procedure-26 Request/Response now receives typed structural dispatch.
+
+`n3iwf::context_fields` supplies standalone `Guami` and `AllowedNssai` codecs
+and `SecurityAlgorithmMasks` construction. Allowed slices reuse `opc_types::Snssai`;
+the codec validates their wire shape without authorizing any slice. TS 29.413
+requires N3IWF receivers to ignore UE Security Capabilities contents, so the
+mask helper adds no receive decoder. Context-message admission checks mandatory
+capability presence while ignoring its contents; construction requires explicit
+masks. Keys remain borrowed, redacted values with no installation or use.
+
 The crate is experimental and `publish = false`. The independent N3IWF corpus
 proves framing and each decoded IE's identifier, criticality and opaque bytes
 for 15 admitted message outcomes. Its reference gate validates nested ASN.1
-values and enumerated N3IWF conditions; the SDK does not yet perform those
-semantic checks. See the [evidence guide](../../docs/n3iwf-fixture-contracts.md).
+values and enumerated N3IWF conditions; SDK semantic admission covers only
+the explicitly documented field and message subsets below. See the
+[evidence guide](../../docs/n3iwf-fixture-contracts.md).
 
 Canonical encoding uses explicit aligned-PER container framing instead of
 `rasn` 0.28's misaligned generated inner-container encoder. This includes
 one/two-octet lengths and 16K–64K open-type fragments. It matches the independent
-Release 18 bytes for all 15 admitted outcomes and 54 independent fragmentation
-boundary cases. The caller supplies already-encoded IE values; typed N3IWF
-keys, locations, resource transfers and mandatory/conditional presence are
-still pending under #787. No live AMF exchange or full N3IWF send capability is
-claimed. Paging remains structurally covered only.
+Release 18 bytes for the 15 published-corpus outcomes, both additional UE request
+procedures, Reset/Reset Acknowledge/Error Indication, PDU Resource Notify, both Modify outcomes, and 54 independent
+fragmentation boundary cases. The caller supplies already-encoded IE values; typed N3IWF
+resource transfers and presence rules beyond the documented NAS, release, NG Setup
+and context/session setup, release, UE request, Reset/Error, Notify and Modify subsets
+remain pending under #787. The shared contained-field reader also rejects
+nonminimal length determinants for short values. No
+live AMF exchange or full N3IWF send capability is claimed. Paging remains structurally covered only.
 
 `from_protocol_ies` applies the existing `DecodeContext` policies and checks
 depth, IE count and complete wire length before payload allocation. It returns
@@ -156,6 +263,75 @@ cargo check -p opc-proto-ngap --all-targets --all-features
 cargo test -p opc-proto-ngap --all-features
 (cd crates/opc-proto-ngap && cargo +nightly fuzz list)
 ```
+
+## N3IWF field codecs
+
+`n3iwf::{RanUeId, AmfUeId}` distinguish the local 32-bit and peer 40-bit
+identifiers. `NasPdu` borrows opaque NAS or coalesces fully checked fragments;
+it does not process NAS security or infer an association. `TrackingArea`
+reuses `opc_types::PlmnId` and carries a three-octet TAC. `N3iwfLocation`
+explicitly selects IPv4/IPv6, with/without a port, and optional TAI.
+
+Each field encodes an `EncodedValue` without its enclosing protocol-IE length.
+Borrow `as_bytes()` into `ProtocolIe::new` and use `Pdu::from_protocol_ies`.
+The latter remains a structural constructor: these field codecs do not check
+message-wide mandatory/conditional presence or authorize procedure triggers.
+51 independent Release 18 field vectors and two complete uplink NAS messages
+exercise the field-to-container composition.
+
+`SecurityKey` borrows exactly 32 octets. It is redacted, has no Clone/equality/
+hash/serialization implementation, and has no key-provider effects.
+`EncodedValue` clears its buffer on drop. The caller must protect the source
+key and all generic-PDU/wire copies: clearing one buffer does not clear copies.
+All field wrappers redact their contents in Debug; byte/identity getters are
+explicit disclosure boundaries.
+
+Field receive limits apply to the encoded field: `max_message_len`, depth one
+for simple fields or four for location, and `max_ies` for location extensions.
+The allocation budget is advisory. Location supports only the N3IWF choices
+and known with-port TAI extension. Other nested extensions/choices return an
+explicit error under every context policy, without changing generic PDU
+preservation or duplicate selection. TAI extension additions are unsupported.
+
+## Initial UE and NAS transport
+
+`n3iwf::nas::NasMessage` constructs and validates the admitted Initial UE,
+Downlink NAS and Uplink NAS fields. Call `from_pdu` on a generic decoded PDU to
+check mandatory fields and get typed values, an ignored-IE count, and any
+unknown-notify diagnostic identifiers. `construct` writes those typed fields
+into a canonical PDU. Both directions validate the same bounded field subset.
+
+The [NAS conformance matrix](CONFORMANCE.md#n3iwf-nas-message-admission) names
+supported optional fields, receiver-ignored IEs and explicit unsupported gates.
+Downlink UE AMBR is applicable to N3IWF and is validated. Other recognized
+fields without a codec fail admission; they do not become a partial success.
+Caller-owned association, NAS security, access conditions, Error Indication
+and procedure side effects remain separate.
+
+## UE context release
+
+`n3iwf::release::ReleaseMessage` constructs and admits Release Command and
+Complete. `UeIdentifiers` supports both the AMF/RAN pair and the AMF-only form
+when the RAN identifier is unavailable. `Cause` admits the five standard root
+classes and their 64 root codes. Complete can carry an optional N3IWF location.
+
+The [release matrix](CONFORMANCE.md#n3iwf-ue-release-field-admission) records
+required, ignored and unsupported fields. Association lookup, resource cleanup
+and acknowledgement ordering remain caller-owned. No protocol/backend effect
+occurs when a message passes admission.
+
+## NG Setup
+
+`n3iwf::setup` provides Request, Response and Failure construction and
+`SetupMessage::from_pdu` admission. Root identities, tracking areas, PLMNs,
+slices, AMF name/capacity and retry delay have independent field and complete
+message evidence. Request construction takes an explicit `PagingDrx`; receive
+checks that mandatory IE's presence and ignores its payload per TS 29.413.
+
+The [setup matrix](CONFORMANCE.md#n3iwf-ng-setup-admission) describes nested
+item/depth bounds, unsupported optional fields and the two list layouts that
+need explicit framing around proven runtime alignment defects. Admission does
+not select an AMF, authorize a slice or activate an association.
 
 ## License
 
