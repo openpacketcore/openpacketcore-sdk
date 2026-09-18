@@ -490,6 +490,110 @@ NGAP_IE_MATRICES: list[dict] = [
         "emit_empty_wrapper": True,
     },
     {
+        "slug": "nas-non-delivery-indication",
+        "message": "NASNonDeliveryIndication",
+        "procedure_code": 19,
+        "outcome": "initiating",
+        "outer_criticality": "ignore",
+        "direction": "n3iwf-to-amf",
+        "ts29413_clause": "5.2",
+        "admitted_disposition": "receive",
+        "clauses_38413": ["8.6.4"],
+        "wire_fixture_id": "opc.n3iwf.ngap.v1.complete-nas-non-delivery-indication",
+        "emit_empty_wrapper": False,
+    },
+    {
+        "slug": "ue-context-release-request",
+        "message": "UEContextReleaseRequest",
+        "procedure_code": 42,
+        "outcome": "initiating",
+        "outer_criticality": "ignore",
+        "direction": "n3iwf-to-amf",
+        "ts29413_clause": "5.2",
+        "admitted_disposition": "receive",
+        "clauses_38413": ["8.3.2"],
+        "wire_fixture_id": "opc.n3iwf.ngap.v1.complete-ue-context-release-request",
+        "emit_empty_wrapper": False,
+    },
+    {
+        "slug": "ng-reset",
+        "message": "NGReset",
+        "procedure_code": 20,
+        "outcome": "initiating",
+        "outer_criticality": "reject",
+        "direction": "bidirectional",
+        "ts29413_clause": "5.2",
+        "admitted_disposition": "receive",
+        "clauses_38413": ["8.7.4"],
+        "wire_fixture_id": "opc.n3iwf.ngap.v1.complete-ng-reset",
+        "emit_empty_wrapper": False,
+    },
+    {
+        "slug": "ng-reset-acknowledge",
+        "message": "NGResetAcknowledge",
+        "procedure_code": 20,
+        "outcome": "successful",
+        "outer_criticality": "reject",
+        "direction": "bidirectional",
+        "ts29413_clause": "5.2",
+        "admitted_disposition": "receive",
+        "clauses_38413": ["8.7.4"],
+        "wire_fixture_id": "opc.n3iwf.ngap.v1.complete-ng-reset-acknowledge",
+        "emit_empty_wrapper": False,
+    },
+    {
+        "slug": "error-indication",
+        "message": "ErrorIndication",
+        "procedure_code": 9,
+        "outcome": "initiating",
+        "outer_criticality": "ignore",
+        "direction": "bidirectional",
+        "ts29413_clause": "5.2",
+        "admitted_disposition": "receive",
+        "clauses_38413": ["8.7.5"],
+        "wire_fixture_id": "opc.n3iwf.ngap.v1.complete-error-indication",
+        "emit_empty_wrapper": False,
+    },
+    {
+        "slug": "pdu-session-resource-notify",
+        "message": "PDUSessionResourceNotify",
+        "procedure_code": 30,
+        "outcome": "initiating",
+        "outer_criticality": "ignore",
+        "direction": "n3iwf-to-amf",
+        "ts29413_clause": "5.2",
+        "admitted_disposition": "receive",
+        "clauses_38413": ["8.2.4"],
+        "wire_fixture_id": "opc.n3iwf.ngap.v1.complete-pdu-session-resource-notify",
+        "emit_empty_wrapper": False,
+    },
+    {
+        "slug": "pdu-session-resource-modify-request",
+        "message": "PDUSessionResourceModifyRequest",
+        "procedure_code": 26,
+        "outcome": "initiating",
+        "outer_criticality": "reject",
+        "direction": "amf-to-n3iwf",
+        "ts29413_clause": "5.2",
+        "admitted_disposition": "receive",
+        "clauses_38413": ["8.2.3"],
+        "wire_fixture_id": "opc.n3iwf.ngap.v1.complete-pdu-session-resource-modify-request",
+        "emit_empty_wrapper": False,
+    },
+    {
+        "slug": "pdu-session-resource-modify-response",
+        "message": "PDUSessionResourceModifyResponse",
+        "procedure_code": 26,
+        "outcome": "successful",
+        "outer_criticality": "reject",
+        "direction": "n3iwf-to-amf",
+        "ts29413_clause": "5.2",
+        "admitted_disposition": "receive",
+        "clauses_38413": ["8.2.3"],
+        "wire_fixture_id": "opc.n3iwf.ngap.v1.complete-pdu-session-resource-modify-response",
+        "emit_empty_wrapper": False,
+    },
+    {
         "slug": "paging",
         "message": "Paging",
         "procedure_code": 24,
@@ -1290,7 +1394,7 @@ def ngap_matrix_record(spec: dict) -> dict:
             "TS 29.413 5.3 RAN-specific ignore is not encoded; "
             "rows are TS 38.413 identifier/criticality/cardinality"
         ),
-        "admission_scope": "issue-493-first-cnf-typed-subset",
+        "admission_scope": "issue-787-qualified-first-cnf-typed-subset",
         "wire_fixture_id": (
             f"opc.n3iwf.ngap.v1.complete-{spec['slug']}"
             if spec["admitted_disposition"] == "receive"
@@ -1336,6 +1440,7 @@ def ngap_complete_messages(subset_dir: Path) -> list[dict]:
         spec = next(
             item for item in NGAP_IE_MATRICES if item["message"] == case["message"]
         )
+        reused = case.get("source_vector")
         wire_hex = bytes.fromhex(case["wire_hex"]).hex(" ")
         record = manifest(
             subset="ngap",
@@ -1345,14 +1450,18 @@ def ngap_complete_messages(subset_dir: Path) -> list[dict]:
             release="V18.10.0",
             clauses=spec["clauses_38413"] + ["9.4.4", "9.4.5", "TS 29.413 5.3"],
             direction=spec["direction"],
-            role="n3iwf" if spec["direction"].startswith("n3iwf") else "amf",
+            role=(
+                "n3iwf-or-amf"
+                if spec["direction"] == "bidirectional"
+                else "n3iwf" if spec["direction"].startswith("n3iwf") else "amf"
+            ),
             prerequisite=(
                 "Independent Pycrate 0.8.1 compiled from the hash-pinned ETSI Release 18.10 "
                 "publication. Existing SDK tests exercise structural decode separately. "
                 "Session outcomes use synthetic requested resources; inner NAS is opaque."
             ),
             provenance_class=(
-                "spec-authored"
+                ("referenced-public-vector" if reused else "spec-authored")
                 if case["reference_error"] is None
                 else "synthetic-negative"
             ),
@@ -1361,8 +1470,13 @@ def ngap_complete_messages(subset_dir: Path) -> list[dict]:
                 f"Source SHA-256 {reference['source_sha256']}. "
                 "The reference gate recompiles all six modules and checks the complete "
                 "wire, nested transfers, mandatory fields and enumerated N3IWF conditions."
+                + (
+                    f" Reused case {reused['case']}; corpus SHA-256 {reused['sha256']}."
+                    if reused
+                    else ""
+                )
             ),
-            referenced=reference_path,
+            referenced=reused["path"] if reused else reference_path,
             sanitized=SYN_ID
             + [
                 {
@@ -1372,7 +1486,7 @@ def ngap_complete_messages(subset_dir: Path) -> list[dict]:
                 },
                 {
                     "name": "NAS-PDU",
-                    "treatment": "opaque-synthetic-four-octet-container",
+                    "treatment": "opaque-synthetic-container",
                     "value_class": "non-subscriber",
                 },
                 {
@@ -1394,7 +1508,11 @@ def ngap_complete_messages(subset_dir: Path) -> list[dict]:
                 f"reference_result={case['reference_error'] or 'accept'}",
                 f"sdk_structural_result={case['sdk_structural_outcome']}",
                 "inner_nas=opaque",
-                "constructed_sdk_encode=unsupported",
+                (
+                    "constructed_container_encode=reference-byte-match"
+                    if case["case_class"] in ("positive", "ordering")
+                    else "constructed_container_encode=not-claimed"
+                ),
                 "runtime_claim=false",
             ],
             outcome="reject" if case["reference_error"] else "receive",
@@ -1618,7 +1736,6 @@ def ngap(subset_dir: Path) -> list[dict]:
         "empty initiating NG Setup wrapper",
     ]
     unsupported_labels = [
-        "canonical typed encode",
         "constructed N3IWF send",
         "semantic IE-value validation",
         "AMF selection",
@@ -1685,12 +1802,18 @@ def ngap(subset_dir: Path) -> list[dict]:
     write_readme(
         subset_dir,
         "NGAP N3IWF fixture subset",
-        """Complete messages for all 15 admitted outcomes are independently
+        """Complete messages for all 23 qualified outcomes are independently
 encoded and decoded with Pycrate 0.8.1 compiled directly from the hash-pinned
 TS 38.413 V18.10.0 publication. They contain N3IWF identifiers, location and
 nested PDU-session transfers. Negative cases separate reference admission
 from the current SDK's structural decoder. The legacy empty wrappers remain
 at `aper-structural-dispatch`; the new scope is `ngap-release18-message`.
+
+The 68 complete-message cases include 16 unchanged vectors from the existing
+UE-request, Reset, Notify and Modify corpora in `opc-proto-ngap/tests/fixtures`.
+Their source files and individual cases are pinned by digest. The gate checks
+those references before independently recompiling and checking the recipes.
+Reset, Reset Acknowledge and Error Indication apply in either direction.
 
 The reference gate validates ASN.1 constraints, mandatory fields, criticality,
 cardinality, nested transfers and enumerated TS 29.413 N3IWF conditions.
@@ -1700,9 +1823,10 @@ placeholder; these vectors do not prove key derivation or authentication.
 `matrices/` publishes identifier/criticality/cardinality for every admitted
 first-CNF sent/received outcome plus Paging (5.4 discard). Each admitted matrix
 links to a complete independently validated positive vector. TS 29.413 5.2
-messages outside the issue 493 typed subset stay unpublished. Clause 5.3
-RAN-specific ignore is not encoded in the rows. Canonical SDK encoding and
-SDK semantic admission remain unsupported (#787). No real AMF exchange,
+messages requiring an external handler stay unpublished. Clause 5.3
+RAN-specific ignore is not encoded in the rows. SDK tests compare every opaque
+IE and canonical container with independent bytes; typed field admission is
+qualified separately in `opc-proto-ngap` (#787). No real AMF exchange,
 AMF selection or subscriber policy is claimed.
 """,
     )
@@ -1717,7 +1841,7 @@ AMF selection or subscriber policy is claimed.
             extra={
                 "admitted_outcomes": admitted,
                 "matrices": matrix_paths,
-                "admission_scope": "issue-493-first-cnf-typed-subset-admitted-by-ts29413-5.2",
+                "admission_scope": "issue-787-qualified-first-cnf-typed-subset-admitted-by-ts29413-5.2",
             },
         ),
     )

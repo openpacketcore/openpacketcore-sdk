@@ -104,6 +104,57 @@ fn every_admitted_ngap_outcome_has_an_independent_complete_message() {
 }
 
 #[test]
+fn published_outcomes_match_the_qualified_n3iwf_codecs() {
+    use opc_proto_ngap::n3iwf::applicability::{Direction, APPLICABLE_MESSAGES};
+    use opc_proto_ngap::Outcome;
+
+    let catalog = FixtureCatalog::load_subset_from(&FixtureCatalog::fixture_root(), "ngap")
+        .expect("reviewed catalog");
+    let published: std::collections::BTreeSet<_> = catalog.completions()["ngap"]
+        .admitted_outcomes
+        .iter()
+        .map(String::as_str)
+        .collect();
+    let qualified: std::collections::BTreeSet<_> = APPLICABLE_MESSAGES
+        .iter()
+        .map(|message| message.rule())
+        .filter(|rule| rule.codec.is_some())
+        .map(|rule| rule.name)
+        .collect();
+    assert_eq!(
+        published, qualified,
+        "qualified NGAP codecs need published evidence"
+    );
+    for rule in APPLICABLE_MESSAGES.iter().map(|message| message.rule()) {
+        if rule.codec.is_none() {
+            continue;
+        }
+        let matrix = catalog
+            .ngap_matrices()
+            .iter()
+            .find(|matrix| matrix.message == rule.name)
+            .expect("qualified matrix");
+        assert_eq!(matrix.procedure_code, rule.procedure_code);
+        assert_eq!(
+            matrix.outcome,
+            match rule.outcome {
+                Outcome::Initiating => "initiating",
+                Outcome::Successful => "successful",
+                Outcome::Unsuccessful => "unsuccessful",
+            }
+        );
+        assert_eq!(
+            matrix.direction,
+            match rule.direction {
+                Direction::ToAmf => "n3iwf-to-amf",
+                Direction::ToN3iwf => "amf-to-n3iwf",
+                Direction::Either => "bidirectional",
+            }
+        );
+    }
+}
+
+#[test]
 fn complete_reference_messages_exercise_every_sdk_typed_field() {
     let reference: Value =
         serde_json::from_str(include_str!("../oracles/ngap-rel18-messages.json")).expect("oracle");
@@ -242,6 +293,8 @@ fn constructed_containers_match_every_independent_admitted_outcome() {
             "UplinkNASTransport" => MessageType::UplinkNasTransport,
             "NGReset" => MessageType::NgReset,
             "PDUSessionResourceNotify" => MessageType::PduSessionResourceNotify,
+            "PDUSessionResourceModifyRequest" => MessageType::PduSessionResourceModifyRequest,
+            "PDUSessionResourceModifyResponse" => MessageType::PduSessionResourceModifyResponse,
             "NGResetAcknowledge" => MessageType::NgResetAcknowledge,
             "ErrorIndication" => MessageType::ErrorIndication,
             "NASNonDeliveryIndication" => MessageType::NasNonDeliveryIndication,
@@ -292,8 +345,8 @@ fn constructed_containers_match_every_independent_admitted_outcome() {
         outcomes.insert(name);
         compared += 1;
     }
-    assert_eq!(outcomes.len(), 15);
-    assert_eq!(compared, 21);
+    assert_eq!(outcomes.len(), 23);
+    assert_eq!(compared, 29);
 }
 
 #[test]
@@ -318,5 +371,5 @@ fn every_complete_outcome_rejects_each_wrong_procedure_criticality() {
             );
         }
     }
-    assert_eq!(seen.len(), 15);
+    assert_eq!(seen.len(), 23);
 }

@@ -89,7 +89,23 @@
     "opc.n3iwf.ngap.v1.complete-ignore-inapplicable-location-ie",
     "opc.n3iwf.ngap.v1.complete-missing-session-ambr",
     "opc.n3iwf.ngap.v1.complete-missing-nested-tunnel",
-    "opc.n3iwf.ngap.v1.complete-duplicate-qfi"
+    "opc.n3iwf.ngap.v1.complete-duplicate-qfi",
+    "opc.n3iwf.ngap.v1.complete-nas-non-delivery-indication",
+    "opc.n3iwf.ngap.v1.missing-mandatory-nas-non-delivery-indication",
+    "opc.n3iwf.ngap.v1.complete-ue-context-release-request",
+    "opc.n3iwf.ngap.v1.missing-mandatory-ue-context-release-request",
+    "opc.n3iwf.ngap.v1.complete-ng-reset",
+    "opc.n3iwf.ngap.v1.missing-mandatory-ng-reset",
+    "opc.n3iwf.ngap.v1.complete-ng-reset-acknowledge",
+    "opc.n3iwf.ngap.v1.complete-duplicate-ng-reset-acknowledge",
+    "opc.n3iwf.ngap.v1.complete-error-indication",
+    "opc.n3iwf.ngap.v1.complete-duplicate-error-indication",
+    "opc.n3iwf.ngap.v1.complete-pdu-session-resource-notify",
+    "opc.n3iwf.ngap.v1.missing-mandatory-pdu-session-resource-notify",
+    "opc.n3iwf.ngap.v1.complete-pdu-session-resource-modify-request",
+    "opc.n3iwf.ngap.v1.missing-mandatory-pdu-session-resource-modify-request",
+    "opc.n3iwf.ngap.v1.complete-pdu-session-resource-modify-response",
+    "opc.n3iwf.ngap.v1.missing-mandatory-pdu-session-resource-modify-response"
   ],
   "constructed": [],
   "receive": [
@@ -128,10 +144,17 @@
     "UplinkNASTransport independently validated complete message",
     "PDUSessionResourceSetupResponse independently validated complete message",
     "InitialContextSetupRequest independently validated complete message",
-    "NGSetupRequest independently validated complete message"
+    "NGSetupRequest independently validated complete message",
+    "NASNonDeliveryIndication independently validated complete message",
+    "UEContextReleaseRequest independently validated complete message",
+    "NGReset independently validated complete message",
+    "NGResetAcknowledge independently validated complete message",
+    "ErrorIndication independently validated complete message",
+    "PDUSessionResourceNotify independently validated complete message",
+    "PDUSessionResourceModifyRequest independently validated complete message",
+    "PDUSessionResourceModifyResponse independently validated complete message"
   ],
   "unsupported": [
-    "canonical typed encode",
     "constructed N3IWF send",
     "semantic IE-value validation",
     "AMF selection",
@@ -152,7 +175,15 @@
     "PDUSessionResourceReleaseCommand",
     "PDUSessionResourceReleaseResponse",
     "UEContextReleaseCommand",
-    "UEContextReleaseComplete"
+    "UEContextReleaseComplete",
+    "NASNonDeliveryIndication",
+    "UEContextReleaseRequest",
+    "NGReset",
+    "NGResetAcknowledge",
+    "ErrorIndication",
+    "PDUSessionResourceNotify",
+    "PDUSessionResourceModifyRequest",
+    "PDUSessionResourceModifyResponse"
   ],
   "matrices": [
     "matrices/ng-setup-request.json",
@@ -170,7 +201,15 @@
     "matrices/pdu-session-resource-release-response.json",
     "matrices/ue-context-release-command.json",
     "matrices/ue-context-release-complete.json",
+    "matrices/nas-non-delivery-indication.json",
+    "matrices/ue-context-release-request.json",
+    "matrices/ng-reset.json",
+    "matrices/ng-reset-acknowledge.json",
+    "matrices/error-indication.json",
+    "matrices/pdu-session-resource-notify.json",
+    "matrices/pdu-session-resource-modify-request.json",
+    "matrices/pdu-session-resource-modify-response.json",
     "matrices/paging.json"
   ],
-  "admission_scope": "issue-493-first-cnf-typed-subset-admitted-by-ts29413-5.2"
+  "admission_scope": "issue-787-qualified-first-cnf-typed-subset-admitted-by-ts29413-5.2"
 }

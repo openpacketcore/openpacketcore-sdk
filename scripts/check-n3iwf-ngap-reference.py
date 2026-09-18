@@ -52,6 +52,67 @@ def read_json(path: Path):
     return json.loads(read_bounded(path, 256 * 1024), object_pairs_hook=unique_pairs)
 
 
+def check_reused_vectors(cases: list[dict]) -> int:
+    """Bind copied recipes to existing independent corpora, before ASN.1 checks."""
+    allowed = {
+        "crates/opc-proto-ngap/tests/fixtures/" + name
+        for name in (
+            "n3iwf-ue-requests.json",
+            "n3iwf-reset.json",
+            "n3iwf-notify.json",
+            "n3iwf-modify.json",
+        )
+    }
+    sources = {}
+    count = 0
+    for case in cases:
+        if "source_vector" not in case:
+            continue
+        source = case["source_vector"]
+        path = source["path"]
+        require(path in allowed, "reused-vector-path")
+        if path not in sources:
+            raw = read_bounded(ROOT / path, 8 * 1024 * 1024)
+            sources[path] = (
+                hashlib.sha256(raw).hexdigest(),
+                json.loads(raw, object_pairs_hook=unique_pairs),
+            )
+        digest, corpus = sources[path]
+        require(digest == source["sha256"], "reused-vector-source-digest")
+        require(
+            corpus["source_sha256"] == SPEC_SHA256
+            and corpus["reference_tools"] == VERSIONS,
+            "reused-vector-reference",
+        )
+        require(
+            source["collection"] in ("cases", "messages"), "reused-vector-collection"
+        )
+        matches = [
+            row for row in corpus[source["collection"]] if row["name"] == source["case"]
+        ]
+        require(len(matches) == 1, "reused-vector-case")
+        original = matches[0]
+        require(
+            original["wire_hex"] == case["wire_hex"]
+            and original["wire_sha256"] == case["wire_sha256"]
+            and original["reference_error"] == case["reference_error"]
+            and original["admitted"] == (case["reference_error"] is None),
+            "reused-vector-result",
+        )
+        require(
+            case["encoded_ies"]
+            == [
+                dict(
+                    id=ie["id"], criticality=ie["criticality"], value_hex=ie["wire_hex"]
+                )
+                for ie in original["fields"]
+            ],
+            "reused-vector-fields",
+        )
+        count += 1
+    return count
+
+
 def read_spec(path: Path | None) -> bytes:
     if path is not None:
         return read_bounded(path, MAX_SPEC_BYTES)
@@ -130,6 +191,14 @@ def check_case(reference, case: dict) -> None:
     require(published == wire, "published-wire")
     manifest = read_json(FIXTURES / (name + ".json"))
     require(manifest["validation_scope"] == "ngap-release18-message", "published-scope")
+    if "source_vector" in case:
+        source = case["source_vector"]
+        require(
+            manifest["provenance"]["referenced_public_vector"] == source["path"]
+            and source["case"] in manifest["provenance"]["notes"]
+            and source["sha256"] in manifest["provenance"]["notes"],
+            "published-reused-provenance",
+        )
     require(manifest["context"]["message"] == case["message"], "published-message")
     require(
         manifest["context"]["independent_asn1_validation"] is True,
@@ -207,7 +276,7 @@ def mutation_checks(reference, cases: list[dict]) -> dict[str, int]:
         for size in range(len(wire)):
             expect_rejection(reference, wire[:size])
             counts["truncated_prefix"] += 1
-    require(len(seen) == 15 and all(counts.values()), "mutation-coverage")
+    require(len(seen) == 23 and all(counts.values()), "mutation-coverage")
     try:
         extract_modules(b"synthetic-wrong-publication")
     except Invalid as error:
@@ -250,9 +319,11 @@ def main() -> int:
             if case["reference_error"] is None and case["case_class"] == "positive"
         }
         require(
-            positive == set(completion["admitted_outcomes"]) and len(positive) == 15,
+            positive == set(completion["admitted_outcomes"]) and len(positive) == 23,
             "corpus-admitted-outcomes",
         )
+        reused = check_reused_vectors(cases)
+        require(reused == 16, "reused-vector-coverage")
         published = {
             manifest["sdk_fixture_id"].split(".v1.")[1]
             for path in FIXTURES.glob("*.json")
@@ -275,6 +346,7 @@ def main() -> int:
             "reference_tools": VERSIONS,
             "complete_outcomes": len(positive),
             "cases": len(cases),
+            "reused_vectors": reused,
             "mutations": mutations,
             "runtime_claim": False,
             "result": "pass",
