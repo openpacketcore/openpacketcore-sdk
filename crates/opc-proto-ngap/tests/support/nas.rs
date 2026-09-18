@@ -21,6 +21,8 @@ pub fn reconstruct(message: &NasMessage<'_>, ctx: DecodeContext, output: EncodeC
                 selected_plmn: a_plmn,
                 context_requested: a_context,
                 allowed_nssai: a_allowed,
+                partially_allowed_nssai: a_partial,
+                selected_nid: a_nid,
             },
             NasMessage::InitialUe {
                 ran: b_ran,
@@ -30,6 +32,8 @@ pub fn reconstruct(message: &NasMessage<'_>, ctx: DecodeContext, output: EncodeC
                 selected_plmn: b_plmn,
                 context_requested: b_context,
                 allowed_nssai: b_allowed,
+                partially_allowed_nssai: b_partial,
+                selected_nid: b_nid,
             },
         ) => {
             a_ran == b_ran
@@ -39,6 +43,8 @@ pub fn reconstruct(message: &NasMessage<'_>, ctx: DecodeContext, output: EncodeC
                 && a_plmn == b_plmn
                 && a_context == b_context
                 && a_allowed == b_allowed
+                && a_partial == b_partial
+                && a_nid == b_nid
         }
         (
             NasMessage::Downlink {
@@ -48,6 +54,7 @@ pub fn reconstruct(message: &NasMessage<'_>, ctx: DecodeContext, output: EncodeC
                 aggregate_bit_rate: a_rate,
                 allowed_nssai: a_allowed,
                 old_amf: a_old,
+                partially_allowed_nssai: a_partial,
             },
             NasMessage::Downlink {
                 amf: b_amf,
@@ -56,6 +63,7 @@ pub fn reconstruct(message: &NasMessage<'_>, ctx: DecodeContext, output: EncodeC
                 aggregate_bit_rate: b_rate,
                 allowed_nssai: b_allowed,
                 old_amf: b_old,
+                partially_allowed_nssai: b_partial,
             },
         ) => {
             a_amf == b_amf
@@ -64,6 +72,7 @@ pub fn reconstruct(message: &NasMessage<'_>, ctx: DecodeContext, output: EncodeC
                 && a_rate == b_rate
                 && a_allowed == b_allowed
                 && a_old == b_old
+                && a_partial == b_partial
         }
         (
             NasMessage::Uplink {

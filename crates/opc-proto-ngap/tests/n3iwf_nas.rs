@@ -5,8 +5,8 @@
 mod shared;
 
 use bytes::Bytes;
-use opc_proto_ngap::n3iwf::context_fields::AllowedNssai;
-use opc_proto_ngap::n3iwf::nas::{EstablishmentCause, NasMessage, UeAggregateBitRate};
+use opc_proto_ngap::n3iwf::context_fields::{AllowedNssai, PartiallyAllowedNssai};
+use opc_proto_ngap::n3iwf::nas::{EstablishmentCause, NasMessage, SelectedNid, UeAggregateBitRate};
 use opc_proto_ngap::n3iwf::setup_fields::AmfName;
 use opc_proto_ngap::n3iwf::{AmfUeId, N3iwfLocation, NasPdu, RanUeId, TrackingArea};
 use opc_proto_ngap::{decode, encode, Criticality, Message, MessageType, Pdu, PduKind, ProtocolIe};
@@ -33,6 +33,271 @@ fn octets(text: &str) -> Vec<u8> {
 }
 fn oracle() -> Value {
     serde_json::from_str(include_str!("fixtures/n3iwf-nas.json")).unwrap()
+}
+
+#[test]
+fn independently_encoded_partial_slices_and_selected_nid_are_admitted() {
+    let oracle = oracle();
+    let mut accepted = 0;
+    let mut rejected = 0;
+    for row in oracle["cases"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|row| row["slice_identity_fields"] == true && row["reference_error"].is_null())
+    {
+        let wire = octets(row["wire_hex"].as_str().unwrap());
+        let pdu = decode(&wire, context()).unwrap();
+        let admitted = NasMessage::from_pdu(&pdu, context());
+        if row["semantic_error"].is_null() {
+            assert!(
+                admitted.is_ok(),
+                "independent slice or identity field not admitted"
+            );
+            let admitted = admitted.unwrap();
+            match &admitted.message {
+                NasMessage::InitialUe {
+                    allowed_nssai,
+                    partially_allowed_nssai,
+                    selected_nid,
+                    ..
+                } => {
+                    assert!(*allowed_nssai == allowed(&row["allowed_nssai"]));
+                    assert!(*partially_allowed_nssai == partial(&row["partially_allowed_nssai"]));
+                    assert!(*selected_nid == nid(&row["selected_nid"]));
+                }
+                NasMessage::Downlink {
+                    allowed_nssai,
+                    partially_allowed_nssai,
+                    ..
+                } => {
+                    assert!(*allowed_nssai == allowed(&row["allowed_nssai"]));
+                    assert!(*partially_allowed_nssai == partial(&row["partially_allowed_nssai"]));
+                }
+                _ => panic!("slice/identity reference outcome"),
+            }
+            shared::reconstruct(&admitted.message, context(), EncodeContext::default());
+            accepted += 1;
+        } else {
+            assert!(admitted.is_err(), "invalid slice-list combination admitted");
+            assert!(
+                construct(row).construct(context()).is_err(),
+                "invalid constructed slice-list combination admitted"
+            );
+            rejected += 1;
+        }
+        assert!(pdu.raw.as_ref() == wire);
+    }
+    assert_eq!(accepted, 167);
+    assert_eq!(rejected, 76);
+}
+
+#[test]
+fn slice_identity_duplicates_and_criticality_preserve_policy_then_validate_semantics() {
+    let oracle = oracle();
+    let mut duplicates = 0;
+    let mut criticalities = 0;
+    for row in oracle["cases"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|row| row["slice_identity_fields"] == true)
+    {
+        let wire = octets(row["wire_hex"].as_str().unwrap());
+        if row.get("invalid_slice_identity_id").is_some() {
+            assert!(row["reference_error"] == "ie-criticality");
+            assert!(decode(&wire, context()).is_err());
+            criticalities += 1;
+        }
+        if row.get("slice_identity_duplicate_id").is_none() {
+            continue;
+        }
+        duplicates += 1;
+        assert!(row["reference_error"] == "duplicate-ie");
+        assert!(decode(&wire, context()).is_err());
+        for duplicate_ie_policy in [DuplicateIePolicy::First, DuplicateIePolicy::Last] {
+            let ctx = DecodeContext {
+                duplicate_ie_policy,
+                ..context()
+            };
+            let prefix = if duplicate_ie_policy == DuplicateIePolicy::First {
+                "first"
+            } else {
+                "last"
+            };
+            let pdu = decode(&wire, ctx).unwrap();
+            let admitted = NasMessage::from_pdu(&pdu, ctx);
+            if row[format!("{prefix}_admitted")] == false {
+                assert!(
+                    admitted.is_err(),
+                    "duplicate selection bypassed slice-list semantics"
+                );
+            } else {
+                let admitted = admitted.unwrap();
+                match &admitted.message {
+                    NasMessage::InitialUe {
+                        partially_allowed_nssai,
+                        selected_nid,
+                        ..
+                    } => {
+                        assert!(
+                            *partially_allowed_nssai
+                                == partial(&row[format!("{prefix}_partially_allowed_nssai")])
+                        );
+                        assert!(*selected_nid == nid(&row[format!("{prefix}_selected_nid")]));
+                    }
+                    NasMessage::Downlink {
+                        partially_allowed_nssai,
+                        ..
+                    } => {
+                        assert!(
+                            *partially_allowed_nssai
+                                == partial(&row[format!("{prefix}_partially_allowed_nssai")])
+                        );
+                    }
+                    _ => panic!("slice/identity reference outcome"),
+                }
+                shared::reconstruct(&admitted.message, ctx, EncodeContext::default());
+            }
+            assert!(pdu.raw.as_ref() == wire);
+        }
+    }
+    assert_eq!(duplicates, 7);
+    assert_eq!(criticalities, 6);
+}
+
+#[test]
+fn partial_slice_and_selected_nid_roots_reject_malformed_extent_padding_and_limits() {
+    assert!(PartiallyAllowedNssai::new(vec![]).is_err());
+    assert!(PartiallyAllowedNssai::new(vec![Snssai::without_sd(1); 9]).is_err());
+    assert!(SelectedNid::new(1 << 44).is_err());
+    assert!(SelectedNid::new(u64::MAX).is_err());
+    let oracle = oracle();
+    let mut checked = 0;
+    for row in oracle["cases"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|row| row["slice_identity_fields"] == true && row["construct"] == true)
+    {
+        let wire = octets(row["wire_hex"].as_str().unwrap());
+        let pdu = decode(&wire, context()).unwrap();
+        let base = construct(&serde_json::json!({"message":row["message"]}))
+            .construct(context())
+            .unwrap();
+        for id in [414, 371] {
+            let Some(value) = field_value(&pdu, id) else {
+                continue;
+            };
+            for end in 0..value.len() {
+                let changed = with_extra(&base, id, Criticality::ignore, &value[..end]);
+                assert!(
+                    NasMessage::from_pdu(&changed, context()).is_err(),
+                    "truncated slice/identity field admitted"
+                );
+            }
+            let mut tail = value.to_vec();
+            tail.push(0);
+            assert!(NasMessage::from_pdu(
+                &with_extra(&base, id, Criticality::ignore, &tail),
+                context()
+            )
+            .is_err());
+            let depth = if id == 414 { 4 } else { 1 };
+            let count = if id == 414 {
+                row["partially_allowed_nssai"].as_array().unwrap().len()
+            } else {
+                0
+            };
+            let exact = DecodeContext {
+                max_message_len: value.len(),
+                max_depth: depth,
+                max_ies: count,
+                ..context()
+            };
+            let admitted = |ctx| {
+                if id == 414 {
+                    PartiallyAllowedNssai::decode(value, ctx).is_ok()
+                } else {
+                    SelectedNid::decode(value, ctx).is_ok()
+                }
+            };
+            assert!(admitted(exact));
+            assert!(!admitted(DecodeContext {
+                max_message_len: value.len() - 1,
+                ..exact
+            }));
+            assert!(!admitted(DecodeContext {
+                max_depth: depth - 1,
+                ..exact
+            }));
+            if id == 414 {
+                assert!(!admitted(DecodeContext {
+                    max_ies: count - 1,
+                    ..exact
+                }));
+                let leaf = partial(&row["partially_allowed_nssai"]).unwrap();
+                assert!(leaf
+                    .encode(EncodeContext {
+                        max_message_len: value.len() - 1,
+                        ..EncodeContext::default()
+                    })
+                    .is_err());
+                // List count is three bits; the first item then has extension
+                // and optional-extension-container flags. Both fail closed.
+                for flag in [0x10, 0x08] {
+                    let mut changed = value.to_vec();
+                    changed[0] |= flag;
+                    for unknown_ie_policy in [
+                        UnknownIePolicy::Preserve,
+                        UnknownIePolicy::Drop,
+                        UnknownIePolicy::Reject,
+                    ] {
+                        assert!(NasMessage::from_pdu(
+                            &with_extra(&base, id, Criticality::ignore, &changed),
+                            DecodeContext {
+                                unknown_ie_policy,
+                                ..context()
+                            }
+                        )
+                        .is_err());
+                    }
+                }
+                assert_eq!(format!("{leaf:?}"), "PartiallyAllowedNssai([REDACTED])");
+            } else {
+                let leaf = nid(&row["selected_nid"]).unwrap();
+                assert!(leaf
+                    .encode(EncodeContext {
+                        max_message_len: 5,
+                        ..EncodeContext::default()
+                    })
+                    .is_err());
+                for padding in 1..16 {
+                    let mut changed = value.to_vec();
+                    changed[5] |= padding;
+                    assert!(
+                        NasMessage::from_pdu(
+                            &with_extra(&base, id, Criticality::ignore, &changed),
+                            context()
+                        )
+                        .is_err(),
+                        "nonzero NID padding admitted"
+                    );
+                }
+                assert_eq!(format!("{leaf:?}"), "SelectedNid([REDACTED])");
+            }
+            checked += 1;
+        }
+        for end in 0..wire.len() {
+            assert!(decode(&wire[..end], context()).is_err());
+        }
+        let mut tail = wire.clone();
+        tail.push(0);
+        let (rest, prefix) = Pdu::decode(&tail, context()).unwrap();
+        assert!(rest == [0] && prefix.raw.as_ref() == wire);
+        assert!(Pdu::decode_owned(Bytes::from(tail), context()).is_err());
+    }
+    assert_eq!(checked, 160);
 }
 fn location() -> N3iwfLocation {
     N3iwfLocation::new(
@@ -77,6 +342,16 @@ fn allowed(value: &Value) -> Option<AllowedNssai> {
     })
 }
 
+fn partial(value: &Value) -> Option<PartiallyAllowedNssai> {
+    allowed(value).map(|value| PartiallyAllowedNssai::new(value.values().to_vec()).unwrap())
+}
+
+fn nid(value: &Value) -> Option<SelectedNid> {
+    value
+        .as_str()
+        .map(|v| SelectedNid::new(u64::from_str_radix(v, 16).unwrap()).unwrap())
+}
+
 fn construct(row: &Value) -> NasMessage<'static> {
     let amf = AmfUeId::new(0x0102030405).unwrap();
     let ran = RanUeId::new(0x10203040);
@@ -93,6 +368,8 @@ fn construct(row: &Value) -> NasMessage<'static> {
                 .then(|| PlmnId::new("001", "01").unwrap()),
             context_requested: row["context_requested"].as_bool().unwrap_or(false),
             allowed_nssai: allowed(&row["allowed_nssai"]),
+            partially_allowed_nssai: partial(&row["partially_allowed_nssai"]),
+            selected_nid: nid(&row["selected_nid"]),
         },
         "DownlinkNASTransport" => NasMessage::Downlink {
             amf,
@@ -105,6 +382,7 @@ fn construct(row: &Value) -> NasMessage<'static> {
             old_amf: row["old_amf"]
                 .as_str()
                 .map(|name| AmfName::new(name).unwrap()),
+            partially_allowed_nssai: partial(&row["partially_allowed_nssai"]),
         },
         "UplinkNASTransport" => NasMessage::Uplink {
             amf,
@@ -184,6 +462,8 @@ fn complete_constructed_and_received_messages_match_independent_reference() {
                 selected_plmn,
                 context_requested,
                 allowed_nssai,
+                partially_allowed_nssai,
+                selected_nid,
             } => {
                 assert!(ran.value() == 0x10203040);
                 assert!(nas.as_bytes() == [0x7e, 0, 0x64, 0x14]);
@@ -199,6 +479,8 @@ fn complete_constructed_and_received_messages_match_independent_reference() {
                     row["context_requested"].as_bool().unwrap_or(false)
                 );
                 assert!(*allowed_nssai == allowed(&row["allowed_nssai"]));
+                assert!(*partially_allowed_nssai == partial(&row["partially_allowed_nssai"]));
+                assert!(*selected_nid == nid(&row["selected_nid"]));
             }
             NasMessage::Downlink {
                 amf,
@@ -207,6 +489,7 @@ fn complete_constructed_and_received_messages_match_independent_reference() {
                 aggregate_bit_rate,
                 allowed_nssai,
                 old_amf,
+                partially_allowed_nssai,
             } => {
                 assert!(amf.value() == 0x0102030405);
                 assert!(ran.value() == 0x10203040);
@@ -220,6 +503,7 @@ fn complete_constructed_and_received_messages_match_independent_reference() {
                 );
                 assert!(*allowed_nssai == allowed(&row["allowed_nssai"]));
                 assert!(old_amf.as_ref().map(AmfName::as_str) == row["old_amf"].as_str());
+                assert!(*partially_allowed_nssai == partial(&row["partially_allowed_nssai"]));
             }
             NasMessage::Uplink {
                 amf,
@@ -235,7 +519,7 @@ fn complete_constructed_and_received_messages_match_independent_reference() {
         }
         assert!(received.raw.as_ref() == expected);
     }
-    assert_eq!(count, 76);
+    assert_eq!(count, 235);
 }
 
 #[test]
@@ -390,7 +674,7 @@ fn n3iwf_ignored_fields_are_not_parsed_and_applicable_fields_do_not_disappear() 
                         (402, Criticality::reject),
                         (427, Criticality::ignore),
                     ],
-                    371,
+                    3,
                 ),
                 "DownlinkNASTransport" => (
                     &[
@@ -409,7 +693,7 @@ fn n3iwf_ignored_fields_are_not_parsed_and_applicable_fields_do_not_disappear() 
                         (334, Criticality::ignore),
                         (400, Criticality::ignore),
                     ],
-                    414,
+                    34,
                 ),
                 "UplinkNASTransport" => (&[], 239),
                 _ => panic!("message"),
@@ -422,7 +706,7 @@ fn n3iwf_ignored_fields_are_not_parsed_and_applicable_fields_do_not_disappear() 
         let pdu = with_extra(
             &base,
             unsupported,
-            if [371, 414].contains(&unsupported) {
+            if [3, 34].contains(&unsupported) {
                 Criticality::ignore
             } else {
                 Criticality::reject
@@ -644,29 +928,41 @@ fn optional_nested_fields_reject_truncation_trailing_bytes_and_extensions() {
 #[test]
 fn optional_field_bounds_and_mutable_metadata_are_revalidated() {
     let oracle = oracle();
-    for row in oracle["cases"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .filter(|row| row["optional_fields"] == true && row["construct"] == true)
-    {
+    for row in oracle["cases"].as_array().unwrap().iter().filter(|row| {
+        (row["optional_fields"] == true || row["slice_identity_fields"] == true)
+            && row["construct"] == true
+    }) {
         let wire = octets(row["wire_hex"].as_str().unwrap());
         let message = construct(row);
         let pdu = decode(&wire, context()).unwrap();
-        let depth = if row["allowed_nssai"].is_array() || row["message"] == "InitialUEMessage" {
+        let depth = if row["allowed_nssai"].is_array()
+            || row["partially_allowed_nssai"].is_array()
+            || row["message"] == "InitialUEMessage"
+        {
             8
         } else {
             5
         };
         let base_count = if row["message"] == "InitialUEMessage" {
-            5
+            if row["selected_plmn"] == false {
+                4
+            } else {
+                5
+            }
         } else {
             3
         };
         let count = (base_count
             + usize::from(row["allowed_nssai"].is_array())
-            + usize::from(row["old_amf"].is_string()))
-        .max(row["allowed_nssai"].as_array().map_or(0, Vec::len));
+            + usize::from(row["old_amf"].is_string())
+            + usize::from(row["partially_allowed_nssai"].is_array())
+            + usize::from(row["selected_nid"].is_string()))
+        .max(row["allowed_nssai"].as_array().map_or(0, Vec::len))
+        .max(
+            row["partially_allowed_nssai"]
+                .as_array()
+                .map_or(0, Vec::len),
+        );
         let exact = DecodeContext {
             max_message_len: wire.len(),
             max_depth: depth,
@@ -698,7 +994,7 @@ fn optional_field_bounds_and_mutable_metadata_are_revalidated() {
                 "optional receive bound ignored"
             );
         }
-        for id in [0, 48] {
+        for id in [0, 48, 414, 371] {
             if field_value(&pdu, id).is_none() {
                 continue;
             }
@@ -711,7 +1007,9 @@ fn optional_field_bounds_and_mutable_metadata_are_revalidated() {
                             .iter_mut()
                             .find(|ie| ie.id == id)
                             .unwrap()
-                            .criticality = rasn::aper::decode(&[0x40]).unwrap()
+                            .criticality =
+                            rasn::aper::decode(&[if id == 0 || id == 48 { 0x40 } else { 0 }])
+                                .unwrap()
                     }
                     Message::DownlinkNasTransport(m) => {
                         m.protocol_ies
@@ -719,7 +1017,9 @@ fn optional_field_bounds_and_mutable_metadata_are_revalidated() {
                             .iter_mut()
                             .find(|ie| ie.id == id)
                             .unwrap()
-                            .criticality = rasn::aper::decode(&[0x40]).unwrap()
+                            .criticality =
+                            rasn::aper::decode(&[if id == 0 || id == 48 { 0x40 } else { 0 }])
+                                .unwrap()
                     }
                     _ => panic!("optional field outcome"),
                 }
@@ -758,7 +1058,7 @@ fn bounded_optional_message_mutations_replay_the_fuzz_boundary() {
         .as_array()
         .unwrap()
         .iter()
-        .filter(|row| row["optional_fields"] == true)
+        .filter(|row| row["optional_fields"] == true || row["slice_identity_fields"] == true)
     {
         let wire = octets(row["wire_hex"].as_str().unwrap());
         for index in 0..wire.len() {
@@ -784,7 +1084,7 @@ fn bounded_optional_message_mutations_replay_the_fuzz_boundary() {
             }
         }
     }
-    assert!(mutations > 10_000);
+    assert_eq!(mutations, 74_118);
 }
 
 fn crit_of(value: u8) -> Criticality {

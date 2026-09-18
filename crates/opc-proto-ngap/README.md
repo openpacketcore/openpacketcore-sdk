@@ -308,6 +308,10 @@ fields without a codec fail admission; they do not become a partial success.
 Initial UE and Downlink NAS also accept optional root Allowed NSSAI; Downlink
 NAS accepts optional root Old AMF. They reuse the redacted `AllowedNssai` and
 `AmfName` leaf types, preserving generic duplicate selection and raw bytes.
+Both messages admit `PartiallyAllowedNssai`, enforcing a combined maximum of
+eight slices and disjointness with Allowed NSSAI. Initial UE also admits the
+fixed 44-bit `SelectedNid`, with exact length and zero padding. Network and
+slice authorization remain caller-owned.
 Caller-owned association, NAS security, access conditions, Error Indication
 and procedure side effects remain separate.
 

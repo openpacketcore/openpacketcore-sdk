@@ -59,6 +59,52 @@ impl AllowedNssai {
     }
 }
 
+/// Root Partially Allowed NSSAI with one through eight slice identifiers.
+/// This is distinct from Allowed NSSAI and confers no slice authorization.
+#[derive(Clone, PartialEq, Eq)]
+pub struct PartiallyAllowedNssai(AllowedNssai);
+redacted!(PartiallyAllowedNssai);
+impl PartiallyAllowedNssai {
+    /// Require the root list count. The enclosing message checks the combined
+    /// count and disjointness with its separate Allowed NSSAI list.
+    pub fn new(values: Vec<Snssai>) -> Result<Self, DecodeError> {
+        AllowedNssai::new(values).map(Self)
+    }
+    /// Explicit access to the advertised values, preserving their order.
+    pub fn values(&self) -> &[Snssai] {
+        self.0.values()
+    }
+    /// Encode the root list. Its item layout matches Allowed NSSAI in the
+    /// pinned Release 18 ASN.1; independent complete-message vectors qualify
+    /// reuse of that layout, including optional SD alignment.
+    pub fn encode(&self, ctx: EncodeContext) -> Result<EncodedValue, EncodeError> {
+        self.0.encode(ctx)
+    }
+    /// Decode the bounded root list with depth four and `max_ies` limits.
+    /// Extensions, trailing bytes and invalid padding fail explicitly.
+    pub fn decode(input: &[u8], ctx: DecodeContext) -> Result<Self, DecodeError> {
+        AllowedNssai::decode(input, ctx).map(Self)
+    }
+}
+
+pub(super) fn validate_slice_lists(
+    allowed: Option<&AllowedNssai>,
+    partial: Option<&PartiallyAllowedNssai>,
+) -> Result<(), DecodeError> {
+    if let Some(partial) = partial {
+        let allowed = allowed.map(AllowedNssai::values).unwrap_or_default();
+        if allowed.len() + partial.values().len() > 8 {
+            return Err(invalid(
+                "combined allowed and partially allowed nssai count",
+            ));
+        }
+        if partial.values().iter().any(|slice| allowed.contains(slice)) {
+            return Err(invalid("overlapping allowed and partially allowed nssai"));
+        }
+    }
+    Ok(())
+}
+
 /// Four explicit 16-bit root algorithm masks for UE Security Capabilities
 /// construction. Bit 15 is the first ASN.1 bit. No algorithm is selected here.
 ///

@@ -14,7 +14,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 - `opc-proto-ngap`: construct and admit optional Allowed NSSAI in Initial UE
-  and Downlink NAS messages and optional Old AMF in Downlink NAS. Reuse bounded,
+  and Downlink NAS messages and optional Old AMF in Downlink NAS. Both messages
+  also admit Partially Allowed NSSAI with combined count/disjointness checks;
+  Initial UE admits the fixed 44-bit Selected NID with strict padding. Reuse bounded,
   redacted field types and qualify complete messages with independent Release 18
   reference bytes, duplicate policies and adverse field/boundary tests (Refs #787).
 - `opc-sctp`: add an explicitly unprotected N2 profile and live adapter with
