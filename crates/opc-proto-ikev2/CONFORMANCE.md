@@ -164,8 +164,14 @@ all derived keys and exact AUTH bodies, with altered key/transcript/identity/
 nonce/direction inputs and 1,549 mutations. Inputs are public synthetic test
 values; the K_N3IWF input is the zero SecurityKey placeholder from a complete
 independent NGAP fixture. See [the evidence boundary](../opc-n3iwf-fixtures/CONFORMANCE.md).
-This does not establish peer interoperability, a protected IKE_AUTH exchange,
-or a consume-once protocol-key custody implementation.
+The fixture subset alone does not establish peer interoperability, a protected
+IKE_AUTH exchange, or consume-once protocol-key custody. The separate
+`protocol_key` implementation now exercises these thirty AUTH cases through
+its real import/consume/verify API. Lifecycle, concurrent consumption,
+zeroization, provider withdrawal and compile-time non-exportability have
+dedicated tests. This is synthetic software-custody evidence; sealing, restore,
+HSM custody and live peer interoperability remain unsupported. See
+[the exact contract, provenance and limits](PROTOCOL_KEY.md).
 
 `tests/sa_init_negotiation.rs` contains a literal, synthetic, redaction-safe
 SA_INIT message with the observed protocol shape. Its addresses, SPIs, nonce,

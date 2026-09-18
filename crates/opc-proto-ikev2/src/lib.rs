@@ -67,6 +67,13 @@
 //! into [`Ikev2SaInitNegotiationPolicy`]. The SDK has no default proposal list
 //! and never automatically enables or prefers these legacy transforms.
 //!
+//! [`protocol_key`] adds volatile, consume-once K_N3IWF custody bound to an
+//! opaque association and pending IKE_AUTH operation. It computes both peers'
+//! AUTH MICs through the admitted module and retires custody on consumption,
+//! cancellation, release, generation replacement or drop. Its handle has no
+//! key-byte export; sealing, restore and subscriber decisions remain outside
+//! this contract. See `PROTOCOL_KEY.md` for evidence and limitations.
+//!
 //! @spec IETF RFC7296
 //! @req REQ-IETF-RFC7296-IKEV2-SCAFFOLD-001
 //! @conformance experimental-mechanism boundary — see CONFORMANCE.md
@@ -94,6 +101,7 @@ pub mod payload;
 pub mod pcscf_restoration;
 pub mod pre_admission;
 pub mod protected_payload_crypto;
+pub mod protocol_key;
 pub mod sa_init;
 pub mod sa_init_crypto;
 pub mod sa_init_negotiation;

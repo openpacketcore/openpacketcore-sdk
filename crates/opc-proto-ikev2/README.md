@@ -53,6 +53,10 @@ This does not close #786 or establish external interoperability. See
 
 ## API Shape
 
+- `protocol_key` imports zeroizing K_N3IWF into an opaque association and
+  pending operation, then consumes it once for both directional IKE_AUTH MICs
+  through the admitted IKE module. Lifecycle retirement clears custody and
+  the handle exposes no key bytes. See [the contract and evidence](PROTOCOL_KEY.md).
 - `Message<'a>` and `OwnedMessage` provide borrowed and owned IKEv2 messages.
 - `header` exposes `Header`, `HeaderFlags`, `decode_header`, and
   `encode_header`.

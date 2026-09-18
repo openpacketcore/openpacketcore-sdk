@@ -12,6 +12,8 @@ bytes = "1.8"
 libfuzzer-sys = "0.4"
 opc-protocol = { path = "../../opc-protocol" }
 opc-proto-ikev2 = { path = ".." }
+opc-crypto-provider = { path = "../../opc-crypto-provider" }
+zeroize = "1"
 
 [workspace]
 
@@ -28,6 +30,11 @@ test = false
 [[bin]]
 name = "dedicated_bearer"
 path = "fuzz_targets/dedicated_bearer.rs"
+test = false
+
+[[bin]]
+name = "protocol_key"
+path = "fuzz_targets/protocol_key.rs"
 test = false
 
 [[bin]]

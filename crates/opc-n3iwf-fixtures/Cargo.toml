@@ -23,6 +23,7 @@ opc-proto-gre = { path = "../opc-proto-gre", version = "0.2.0" }
 opc-proto-ngap = { path = "../opc-proto-ngap", version = "0.2.0" }
 opc-proto-ikev2 = { path = "../opc-proto-ikev2", version = "0.2.0" }
 opc-crypto-provider = { path = "../opc-crypto-provider", version = "0.2.0" }
+zeroize = { workspace = true }
 
 [lints]
 workspace = true
