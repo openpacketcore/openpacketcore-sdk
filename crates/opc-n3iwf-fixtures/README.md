@@ -73,3 +73,9 @@ cargo test --locked -p opc-n3iwf-fixtures
 See [CONFORMANCE.md](CONFORMANCE.md) for limitations and
 [fixture maintenance](../../docs/n3iwf-fixture-contracts.md) for regeneration
 and publication. Product integration and issue 795 remain outside this crate.
+
+The protocol-key subset also contains 25 executable custody schedules. They
+exercise the existing public SDK API against independently authored expected
+results and the original synthetic AUTH answers. The separate private audit
+qualifies pre-release memory clearing; ordinary handle errors are not used as
+memory evidence. See [CONFORMANCE.md](CONFORMANCE.md) for the exact scope.

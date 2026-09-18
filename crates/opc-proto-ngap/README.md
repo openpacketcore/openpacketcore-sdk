@@ -293,6 +293,11 @@ and known with-port TAI extension. Other nested extensions/choices return an
 explicit error under every context policy, without changing generic PDU
 preservation or duplicate selection. TAI extension additions are unsupported.
 
+Error Indication separately supports optional `fiveg_s_tmsi` with IE 26/ignore,
+using the same bounded identity type as Initial UE. Its reported identity does
+not replace the caller's signalling context, required UE identifiers or error
+basis. See the [Reset/Error matrix](CONFORMANCE.md#reset-and-error-indication).
+
 ## Initial UE and NAS transport
 
 `n3iwf::nas::NasMessage` constructs and validates the admitted Initial UE,

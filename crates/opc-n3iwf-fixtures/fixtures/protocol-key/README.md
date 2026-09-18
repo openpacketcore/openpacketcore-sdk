@@ -9,4 +9,10 @@ exchanges, peer authentication, or K_AMF hierarchy derivation evidence.
 
 Legacy scenario labels still model wrong-generation, reuse, drop and
 cancellation obligations for issue 791. They do not exercise a custody API
-or prove actual memory zeroization. No real peer key or nonce is published.
+or prove actual memory zeroization. Twenty-five separate scenario records replay
+wrong-generation, reuse, foreign/stale authority, invalid handoff/input, drop,
+cancellation and concurrent consumption through the public SDK API. Every
+successful consumption must match both independent AUTH answers. The existing
+private zeroization audit separately checks clearing before buffer release;
+opaque public errors are not used to infer that result. Monotonic local labels
+are SDK policy, not wire-standard obligations. No real key or nonce is published.

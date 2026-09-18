@@ -8,6 +8,7 @@ import json
 from pathlib import Path
 import tempfile
 from n3iwf_ngap_reference import Invalid, SPEC_SHA256, VERSIONS, compile_reference
+from n3iwf_error_identity_reference import identity_cases
 
 KINDS = ("NGReset", "NGResetAcknowledge", "ErrorIndication")
 
@@ -115,8 +116,6 @@ def main():
                     for v in diag.get("iEsCriticalityDiagnostics", [])
                 ):
                     raise Invalid("non-applicable-diagnostic-criticality")
-            if 26 in ies:
-                raise Invalid("outside-sdk-admitted-field-subset")
 
         def record(
             name, value, admitted=True, mode="valid", signalling="non-ue", **extra
@@ -155,6 +154,14 @@ def main():
                 "aMF-UE-NGAP-ID" not in item and "rAN-UE-NGAP-ID" not in item
                 for item in connection_items
             )
+            identity = next((v["value"][1] for v in entries(value)
+                             if v["id"] == 26 and not v["value"][0].startswith("_unk_")), None)
+            if identity is not None:
+                extra["fiveg_s_tmsi"] = dict(
+                    amf_set=identity["aMFSetID"][0],
+                    amf_pointer=identity["aMFPointer"][0],
+                    tmsi_hex=identity["fiveG-TMSI"].hex(),
+                )
             cases.append(
                 dict(
                     name=name,
@@ -348,7 +355,8 @@ def main():
                 **{"fiveG-TMSI": b"\x01\x02\x03\x04"}
             ),
         )
-        record("unsupported-fiveg-stmsi", value, False, "unsupported")
+        record("fiveg-stmsi", value)
+        identity_cases(record, make, entries, field, causes[0])
         profiles = {
             kind: [
                 dict(id=v["id"], criticality=v["criticality"], presence=v["presence"])

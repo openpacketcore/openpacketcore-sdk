@@ -54,20 +54,46 @@
     "opc.n3iwf.protocol-key.v1.auth-responder-short-mic",
     "opc.n3iwf.protocol-key.v1.auth-responder-short-header",
     "opc.n3iwf.protocol-key.v1.auth-responder-unsupported-method",
-    "opc.n3iwf.protocol-key.v1.auth-responder-auth-reserved"
+    "opc.n3iwf.protocol-key.v1.auth-responder-auth-reserved",
+    "opc.n3iwf.protocol-key.v1.custody-consume-once",
+    "opc.n3iwf.protocol-key.v1.custody-wrong-generation-begin",
+    "opc.n3iwf.protocol-key.v1.custody-wrong-expected-generation",
+    "opc.n3iwf.protocol-key.v1.custody-non-increasing-generation",
+    "opc.n3iwf.protocol-key.v1.custody-replacement",
+    "opc.n3iwf.protocol-key.v1.custody-foreign-association",
+    "opc.n3iwf.protocol-key.v1.custody-duplicate-import",
+    "opc.n3iwf.protocol-key.v1.custody-pending-operation",
+    "opc.n3iwf.protocol-key.v1.custody-invalid-width-0",
+    "opc.n3iwf.protocol-key.v1.custody-invalid-width-1",
+    "opc.n3iwf.protocol-key.v1.custody-invalid-width-31",
+    "opc.n3iwf.protocol-key.v1.custody-invalid-width-33",
+    "opc.n3iwf.protocol-key.v1.custody-invalid-width-4096",
+    "opc.n3iwf.protocol-key.v1.custody-wrong-purpose",
+    "opc.n3iwf.protocol-key.v1.custody-input-limit",
+    "opc.n3iwf.protocol-key.v1.custody-wrong-transcript-direction",
+    "opc.n3iwf.protocol-key.v1.custody-drop-key",
+    "opc.n3iwf.protocol-key.v1.custody-drop-operation",
+    "opc.n3iwf.protocol-key.v1.custody-drop-association",
+    "opc.n3iwf.protocol-key.v1.custody-release",
+    "opc.n3iwf.protocol-key.v1.custody-cancel-successor",
+    "opc.n3iwf.protocol-key.v1.custody-cancel-future",
+    "opc.n3iwf.protocol-key.v1.custody-operation-reuse",
+    "opc.n3iwf.protocol-key.v1.custody-generation-exhaustion",
+    "opc.n3iwf.protocol-key.v1.custody-concurrent-consume-once"
   ],
   "constructed": [
     "generation-1 consume-once label",
-    "independent synthetic initiator/responder AUTH bodies"
+    "independent synthetic initiator/responder AUTH bodies",
+    "25 executable SDK volatile custody schedules"
   ],
   "receive": [
-    "drop zeroize reference state",
+    "legacy drop-label reference state (not SDK memory observation)",
     "synthetic AUTH known-answer verification"
   ],
   "unsupported": [
     "byte export",
     "hierarchy derivation",
     "authentication decision",
-    "actual consume-once custody and zeroization"
+    "public-memory observation, hardware custody and live-peer authentication"
   ]
 }

@@ -425,6 +425,13 @@ fn protocol_key_publication_contains_only_labels_and_public_test_inputs() {
             // negative mutation to public scalar/nonce/identity recipes.
             continue;
         }
+        if manifest.validation_scope == "protocol-key-lifecycle" {
+            assert_eq!(manifest.context["key_recipe"], "32-zero-octets");
+            assert_eq!(manifest.context["sdk_custody_validation"], true);
+            assert_eq!(manifest.context["live_peer_validation"], false);
+            assert_eq!(manifest.context["public_memory_erasure_observation"], false);
+            continue;
+        }
         assert_eq!(manifest.validation_scope, "handle-lifecycle-contract");
         labels += 1;
         assert!(manifest
@@ -653,4 +660,17 @@ fn debug_and_errors_are_redacted() {
         "contract_error=n3iwf_fixture_forbidden_content"
     );
     assert_eq!(wire_digest(b"abc").len(), 64);
+}
+
+#[test]
+fn protocol_key_has_executable_custody_scenarios() {
+    let catalog = FixtureCatalog::load().expect("catalog must load");
+    let cases = catalog
+        .manifests()
+        .filter(|(m, _)| m.validation_scope == "protocol-key-lifecycle")
+        .count();
+    assert!(
+        cases == 25,
+        "missing executable protocol-key lifecycle fixtures"
+    );
 }

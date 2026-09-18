@@ -1,5 +1,6 @@
 //! Shared bounded Reset/Error field and message fuzz/replay assertions.
 use bytes::Bytes;
+use opc_proto_ngap::n3iwf::nas_fields::{AmfSetId, FiveGStmsi};
 use opc_proto_ngap::n3iwf::reset::{ResetMessage, Signalling};
 use opc_proto_ngap::n3iwf::reset_fields::{Connections, CriticalityDiagnostics, ResetType};
 use opc_proto_ngap::{encode, Pdu};
@@ -31,7 +32,19 @@ pub fn exercise(data: &[u8], ctx: DecodeContext, output: EncodeContext) {
         let Ok(admitted) = ResetMessage::from_pdu(&pdu, signalling, ctx) else {
             continue;
         };
-        let constructed = admitted.message.construct(signalling, ctx).unwrap();
+        let mut rebuilt = admitted.message.clone();
+        if let ResetMessage::Error(error) = &mut rebuilt {
+            error.fiveg_s_tmsi = error.fiveg_s_tmsi.map(|identity| {
+                FiveGStmsi::new(
+                    AmfSetId::new(identity.amf_set_id().value()).unwrap(),
+                    identity.amf_pointer(),
+                    *identity.tmsi(),
+                )
+                .unwrap()
+            });
+        }
+        assert!(rebuilt == admitted.message);
+        let constructed = rebuilt.construct(signalling, ctx).unwrap();
         let wire = encode(&constructed, output).unwrap();
         let pdu = Pdu::decode_owned(Bytes::from(wire), ctx).unwrap();
         let readmitted = ResetMessage::from_pdu(&pdu, signalling, ctx).unwrap();
