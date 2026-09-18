@@ -313,4 +313,24 @@ plain fragment decoder advances the final remainder's alignment offset in
 octets instead of bits. Both independent encoder modes must agree, and the
 structured decoder must reproduce the source values and bytes. Keep this
 reference-tool limitation visible; successful round trips alone do not prove
-live interoperability. Enclosing procedure admission remains separate work.
+live interoperability. Enclosing procedure admission is qualified separately below.
+
+## Context and session setup message amendment (2026-09)
+
+Compose the qualified fields and nested lists into all three Initial Context
+Setup outcomes and both PDU Session Resource Setup outcomes. Keep container
+policies authoritative and pass them through nested admission with remaining
+depth. Require conditional UE AMBR when context resources are requested;
+require a nonempty overall PDU setup result while permitting context-only
+success. Partial result lists remain disjoint.
+
+TS 29.413 requires capability contents to be receiver-ignored but retains the
+mandatory IE. Construction therefore takes explicit capability masks instead
+of replaying unvalidated input. Keep the complete receiver-ignore allowlist
+explicit, including its non-trusted-access exceptions: UE AMBR applies and
+Trace Activation must fail until supported. Other applicable unimplemented
+IEs also fail explicitly. The 122 independent complete-message vectors qualify
+this composition; no additional generated-code workaround is needed. Bounded
+fuzz/replay compares every admitted field, including synthetic NAS/key bytes
+without rendering them. Admission establishes neither request correlation nor
+resource effects, and does not enable local procedure triggers.

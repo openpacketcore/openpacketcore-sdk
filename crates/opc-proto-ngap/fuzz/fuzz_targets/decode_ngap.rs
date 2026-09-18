@@ -1,5 +1,8 @@
 #![no_main]
 
+#[path = "../../tests/support/resource_setup.rs"]
+mod resource_setup;
+
 use bytes::Bytes;
 use libfuzzer_sys::fuzz_target;
 use opc_proto_ngap::n3iwf::context_fields::{AllowedNssai, Guami, SecurityAlgorithmMasks};
@@ -37,6 +40,7 @@ fuzz_target!(|data: &[u8]| {
         max_message_len: 200_000,
         ..EncodeContext::default()
     };
+    resource_setup::exercise(data, decode, output);
     if let Ok(field) = AmfUeId::decode(data, decode) {
         let wire = field.encode(output).unwrap();
         assert!(AmfUeId::decode(wire.as_bytes(), decode).unwrap() == field);
