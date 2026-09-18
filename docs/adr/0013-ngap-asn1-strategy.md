@@ -167,6 +167,24 @@ fuzz coverage, and an explicit conformance boundary. The broader generated
 schema strategy and experimental maturity are unchanged. Evidence is linked
 from `crates/opc-proto-ngap/CONFORMANCE.md`; Refs #787.
 
+## Bounded N3IWF field amendment (2026-09)
+
+Independent Release 18 field vectors additionally reveal a generated TAI
+receive alignment defect (three-octet PLMN after SEQUENCE flags) and a
+without-port location CHOICE extension-container encode alignment defect.
+The field layer may explicitly read the fixed admitted TAI/location layouts
+and frame the known choice extension 439. It rejects unimplemented SEQUENCE
+additions and nested extensions before collection decoding; it does not become
+a general handwritten ASN.1 decoder. Independently qualified generated
+encoders still encode the inner structures and the bounded UE identifiers.
+NAS OCTET STRING reuses the container length/fragment scanner. Security Key
+is a borrowed fixed 256-bit view; its encoded buffer is cleared on drop.
+
+The original generic PDU policy remains unchanged. New individual field APIs
+have explicit narrower extension admission and field-local limits. The field
+oracle, complete uplink-message comparison, mutation tests and fuzz target
+qualify this exception; broader procedure admission remains open under #787.
+
 ## Evidence
 
 - Gap register updated: `GAP-PROTO-003` now records the partially closed codec

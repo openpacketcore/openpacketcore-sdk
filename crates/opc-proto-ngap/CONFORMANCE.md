@@ -85,10 +85,51 @@ render `Pdu::raw`, opaque IE values, or NAS payload bytes.
   mutable wrapper/message tuple, known criticality and singleton uniqueness;
   unknown reject-criticality IEs and unknown message bodies fail. Capacity
   errors leave the destination unchanged; `wire_len` allocates no heap memory.
-- Typed IE semantic construction, required/conditional presence, and nested
-  resource/key/location validation remain outside this change. A malformed
+- General typed IE construction, required/conditional presence, and nested
+  resource validation remain outside container construction. The optional
+  individual-field subset below validates its own values. A malformed
   opaque leaf can be structurally constructed; the API does not claim semantic
   send admission. Raw-preserving encode rejects PDUs without received bytes.
+
+## Typed N3IWF field subset
+
+TS 29.413 V18.5.0 5.3 and TS 38.413 V18.10.0 9.3 govern these field values.
+The individual ASN.1 constraints are independently compiled from the pinned
+Release 18 publication; field limits and the closed extension subset are SDK
+admission choices, not additional standards requirements.
+
+| Field | Construct / receive | Boundary |
+|---|---|---|
+| RAN UE NGAP ID / AMF UE NGAP ID | Both | Distinct local/peer types; 32/40 bits |
+| NAS-PDU | Both | Opaque OCTET STRING, including empty and fragmented values |
+| Security Key | Both | Borrowed exactly 256 bits; K_N3IWF meaning, no key-provider effects |
+| TAI | Both | Shared validated PLMN plus three-octet TAC; no extensions |
+| N3IWF ULI with port | Both | IPv4/IPv6, optional TAI extension 213 |
+| N3IWF ULI without port | Both | Choice extension 439, IPv4/IPv6, optional TAI |
+
+The [field oracle](tests/fixtures/n3iwf-fields.json) has 51 independently
+encoded cases: integer boundaries, NAS lengths through 131072, a nonzero key,
+two-/three-digit MNCs, and all 16 address/port/TAI/PLMN combinations. Reproduce
+with `scripts/generate-ngap-n3iwf-field-fixtures.py --spec PATH --output PATH`
+in the pinned reference environment. Published corpus bytes are unchanged.
+Two complete UL NAS messages also construct entirely from typed field values
+and match the published IPv4/IPv6 oracle. Additional tests cover byte mutations,
+truncation, trailing data, forged extension counts, capacity and redaction.
+
+The generated TAI decoder mishandles alignment of its three-octet PLMN after
+SEQUENCE flags. Its without-port location CHOICE encoder also misaligns the
+extension container ID. Bounded explicit receive layout and a fixed aligned
+CHOICE wrapper avoid those defects; qualified generated encoders handle the
+inner structures. NAS shares the independently tested open-type length codec.
+
+All wrappers redact identity, NAS, key and peer values. Security Key decoding
+borrows the input without copying; encoded buffers use `zeroize::Zeroizing`.
+Caller-owned input, generic PDU and final wire copies remain caller custody.
+No association authorization, derivation, import, cryptographic decision or
+backend effect occurs. Location addressing/port assignment, required TAI and
+message-level presence remain caller responsibilities. Nested extensions other
+than the enumerated TAI fail explicitly regardless of context policy; the
+existing outer decoder's unknown/duplicate behavior is unchanged.
 
 ## Fixtures
 
@@ -144,8 +185,8 @@ additional layers guard it:
 
 ## Codec Boundary (v1 subset)
 
-- Typed semantic encoding of IE values, as distinct from the implemented
-  root-container construction from opaque encoded values.
+- Typed semantic encoding of IE values beyond the explicitly admitted
+  N3IWF field subset, including resource transfers and UE identifier pairs.
 - External field-level fixtures for Paging and procedures outside the admitted
   N3IWF corpus.
 - Typed decode of procedures outside the first-CNF N2 subset above; preserved

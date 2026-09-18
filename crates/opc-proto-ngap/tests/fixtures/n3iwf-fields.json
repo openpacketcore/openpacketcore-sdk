@@ -1,0 +1,591 @@
+{
+  "source_sha256": "21617ad6dd826e05a0e8356ef96f44199cf4c7bc1be65e6b915e9135e10b59e2",
+  "reference_tools": {
+    "pycrate": "0.8.1",
+    "pypdf": "6.1.0"
+  },
+  "scope": "Synthetic individual IE values; no complete procedure admission",
+  "cases": [
+    {
+      "name": "RAN_UE_NGAP_ID-0",
+      "type": "RAN_UE_NGAP_ID",
+      "recipe": {
+        "integer": 0
+      },
+      "wire_len": 2,
+      "wire_sha256": "96a296d224f285c67bee93c30f8a309157f0daa35dc5b87e410b78630a09cfc7",
+      "wire_hex": "0000"
+    },
+    {
+      "name": "RAN_UE_NGAP_ID-1",
+      "type": "RAN_UE_NGAP_ID",
+      "recipe": {
+        "integer": 1
+      },
+      "wire_len": 2,
+      "wire_sha256": "b413f47d13ee2fe6c845b2ee141af81de858df4ec549a58b7970bb96645bc8d2",
+      "wire_hex": "0001"
+    },
+    {
+      "name": "RAN_UE_NGAP_ID-2",
+      "type": "RAN_UE_NGAP_ID",
+      "recipe": {
+        "integer": 255
+      },
+      "wire_len": 2,
+      "wire_sha256": "06eb7d6a69ee19e5fbdf749018d3d2abfa04bcbd1365db312eb86dc7169389b8",
+      "wire_hex": "00ff"
+    },
+    {
+      "name": "RAN_UE_NGAP_ID-3",
+      "type": "RAN_UE_NGAP_ID",
+      "recipe": {
+        "integer": 256
+      },
+      "wire_len": 3,
+      "wire_sha256": "99f9e38a0c702feac1f8834578bfab5fbc8ebd9ee8ba4edf6b0786e3621012dc",
+      "wire_hex": "400100"
+    },
+    {
+      "name": "RAN_UE_NGAP_ID-4",
+      "type": "RAN_UE_NGAP_ID",
+      "recipe": {
+        "integer": 65535
+      },
+      "wire_len": 3,
+      "wire_sha256": "c61b27e94d121568581a98d6c3b1c4eb9b8cd5ff2809557ced6a0a93eaff177a",
+      "wire_hex": "40ffff"
+    },
+    {
+      "name": "RAN_UE_NGAP_ID-5",
+      "type": "RAN_UE_NGAP_ID",
+      "recipe": {
+        "integer": 65536
+      },
+      "wire_len": 4,
+      "wire_sha256": "d6fdf1608d1f8ebee507044ae1898e3fdbda97b1b0debe89e16d390494319968",
+      "wire_hex": "80010000"
+    },
+    {
+      "name": "RAN_UE_NGAP_ID-6",
+      "type": "RAN_UE_NGAP_ID",
+      "recipe": {
+        "integer": 16777215
+      },
+      "wire_len": 4,
+      "wire_sha256": "e4b22d3cdd9b572a5ec20ed7a86c50300435359c94fc3a08e1378b7a624c450a",
+      "wire_hex": "80ffffff"
+    },
+    {
+      "name": "RAN_UE_NGAP_ID-7",
+      "type": "RAN_UE_NGAP_ID",
+      "recipe": {
+        "integer": 16777216
+      },
+      "wire_len": 5,
+      "wire_sha256": "9eddc2f7aa900f3a519e07eebbcb29c81deda1ff380b1d7e9941d281c9f233f6",
+      "wire_hex": "c001000000"
+    },
+    {
+      "name": "RAN_UE_NGAP_ID-8",
+      "type": "RAN_UE_NGAP_ID",
+      "recipe": {
+        "integer": 4294967295
+      },
+      "wire_len": 5,
+      "wire_sha256": "1319194aa3af2be0e7bda6b355b13f29d7ed6ff60aa16da88642a435e4827bcd",
+      "wire_hex": "c0ffffffff"
+    },
+    {
+      "name": "AMF_UE_NGAP_ID-0",
+      "type": "AMF_UE_NGAP_ID",
+      "recipe": {
+        "integer": 0
+      },
+      "wire_len": 2,
+      "wire_sha256": "96a296d224f285c67bee93c30f8a309157f0daa35dc5b87e410b78630a09cfc7",
+      "wire_hex": "0000"
+    },
+    {
+      "name": "AMF_UE_NGAP_ID-1",
+      "type": "AMF_UE_NGAP_ID",
+      "recipe": {
+        "integer": 1
+      },
+      "wire_len": 2,
+      "wire_sha256": "b413f47d13ee2fe6c845b2ee141af81de858df4ec549a58b7970bb96645bc8d2",
+      "wire_hex": "0001"
+    },
+    {
+      "name": "AMF_UE_NGAP_ID-2",
+      "type": "AMF_UE_NGAP_ID",
+      "recipe": {
+        "integer": 255
+      },
+      "wire_len": 2,
+      "wire_sha256": "06eb7d6a69ee19e5fbdf749018d3d2abfa04bcbd1365db312eb86dc7169389b8",
+      "wire_hex": "00ff"
+    },
+    {
+      "name": "AMF_UE_NGAP_ID-3",
+      "type": "AMF_UE_NGAP_ID",
+      "recipe": {
+        "integer": 256
+      },
+      "wire_len": 3,
+      "wire_sha256": "d18c1171f238914f2dd7bd57b4c085274820df124179efd43ea75d404658f279",
+      "wire_hex": "200100"
+    },
+    {
+      "name": "AMF_UE_NGAP_ID-4",
+      "type": "AMF_UE_NGAP_ID",
+      "recipe": {
+        "integer": 65535
+      },
+      "wire_len": 3,
+      "wire_sha256": "6a55380d89a2df32d46338558f7792c9bf1c9602ea64962c4de939f6428fe4ba",
+      "wire_hex": "20ffff"
+    },
+    {
+      "name": "AMF_UE_NGAP_ID-5",
+      "type": "AMF_UE_NGAP_ID",
+      "recipe": {
+        "integer": 65536
+      },
+      "wire_len": 4,
+      "wire_sha256": "874d4a57ec4bfe979629f5f5537f9926f71f6102abb4634ee48770d1ceb3384e",
+      "wire_hex": "40010000"
+    },
+    {
+      "name": "AMF_UE_NGAP_ID-6",
+      "type": "AMF_UE_NGAP_ID",
+      "recipe": {
+        "integer": 16777215
+      },
+      "wire_len": 4,
+      "wire_sha256": "17b1a2cead463c15f4808899cbd125f8e18a6dbfbb603dfff29667d6a1f48cc3",
+      "wire_hex": "40ffffff"
+    },
+    {
+      "name": "AMF_UE_NGAP_ID-7",
+      "type": "AMF_UE_NGAP_ID",
+      "recipe": {
+        "integer": 16777216
+      },
+      "wire_len": 5,
+      "wire_sha256": "c31dfd440528f94356efe92aa26408eb80e88e3935735c57d410d3ccffafdd5e",
+      "wire_hex": "6001000000"
+    },
+    {
+      "name": "AMF_UE_NGAP_ID-8",
+      "type": "AMF_UE_NGAP_ID",
+      "recipe": {
+        "integer": 4294967295
+      },
+      "wire_len": 5,
+      "wire_sha256": "c4badb9dc9e9f9411ccada24e38b3fcba0ef89829b414a895c2a4f23ea33d57a",
+      "wire_hex": "60ffffffff"
+    },
+    {
+      "name": "AMF_UE_NGAP_ID-9",
+      "type": "AMF_UE_NGAP_ID",
+      "recipe": {
+        "integer": 4294967296
+      },
+      "wire_len": 6,
+      "wire_sha256": "ce678846aa496aab2a5bba604e8a31114e0e458ed63520fccca1d8dd84762e59",
+      "wire_hex": "800100000000"
+    },
+    {
+      "name": "AMF_UE_NGAP_ID-10",
+      "type": "AMF_UE_NGAP_ID",
+      "recipe": {
+        "integer": 1099511627775
+      },
+      "wire_len": 6,
+      "wire_sha256": "a8c704c7fe1212cb78bc43136b9c71bf94a80254726993ffdd37491eb207a0a6",
+      "wire_hex": "80ffffffffff"
+    },
+    {
+      "name": "nas-0",
+      "type": "NAS_PDU",
+      "recipe": {
+        "length": 0,
+        "octet": "(i * 17 + 3) % 256"
+      },
+      "wire_len": 1,
+      "wire_sha256": "6e340b9cffb37a989ca544e6bb780a2c78901d3fb33738768511a30617afa01d",
+      "wire_hex": "00"
+    },
+    {
+      "name": "nas-1",
+      "type": "NAS_PDU",
+      "recipe": {
+        "length": 1,
+        "octet": "(i * 17 + 3) % 256"
+      },
+      "wire_len": 2,
+      "wire_sha256": "c79b932e1e1da3c0e098e5ad2c422937eb904a76cf61d83975a74a68fbb04b99",
+      "wire_hex": "0103"
+    },
+    {
+      "name": "nas-127",
+      "type": "NAS_PDU",
+      "recipe": {
+        "length": 127,
+        "octet": "(i * 17 + 3) % 256"
+      },
+      "wire_len": 128,
+      "wire_sha256": "694b00ef335dda89afa5617ecb0488982b6fbf5add57446a4ab858c65561dbd6",
+      "wire_hex": "7f031425364758697a8b9cadbecfe0f102132435465768798a9bacbdcedff00112233445566778899aabbccddeef00112233445566778899aabbccddeeff102132435465768798a9bacbdcedfe0f2031425364758697a8b9cadbecfd0e1f30415263748596a7b8c9daebfc0d1e2f405162738495a6b7c8d9eafb0c1d2e3f5061"
+    },
+    {
+      "name": "nas-128",
+      "type": "NAS_PDU",
+      "recipe": {
+        "length": 128,
+        "octet": "(i * 17 + 3) % 256"
+      },
+      "wire_len": 130,
+      "wire_sha256": "ec4047af32de1af4799d6fe6aafd01aeed2eadf078e50ba61b01d8bdf59d03f0"
+    },
+    {
+      "name": "nas-16383",
+      "type": "NAS_PDU",
+      "recipe": {
+        "length": 16383,
+        "octet": "(i * 17 + 3) % 256"
+      },
+      "wire_len": 16385,
+      "wire_sha256": "3eae740969fd8363a84b3582b0b494df6d133da432624f6eecc6b902333f206f"
+    },
+    {
+      "name": "nas-16384",
+      "type": "NAS_PDU",
+      "recipe": {
+        "length": 16384,
+        "octet": "(i * 17 + 3) % 256"
+      },
+      "wire_len": 16386,
+      "wire_sha256": "e028b13c628770ceb4dec88edb38db05eb986864f410fe0a331a42528d2bb75b"
+    },
+    {
+      "name": "nas-16385",
+      "type": "NAS_PDU",
+      "recipe": {
+        "length": 16385,
+        "octet": "(i * 17 + 3) % 256"
+      },
+      "wire_len": 16387,
+      "wire_sha256": "bb764197f1c16deebe8624a2c08fd18c373a536a930830acdb3ea01681e74be8"
+    },
+    {
+      "name": "nas-32768",
+      "type": "NAS_PDU",
+      "recipe": {
+        "length": 32768,
+        "octet": "(i * 17 + 3) % 256"
+      },
+      "wire_len": 32770,
+      "wire_sha256": "0e9a234b86c4d7bb83213b0aec2f79f6589f37d052d0f048739a2af33eaf190f"
+    },
+    {
+      "name": "nas-65535",
+      "type": "NAS_PDU",
+      "recipe": {
+        "length": 65535,
+        "octet": "(i * 17 + 3) % 256"
+      },
+      "wire_len": 65538,
+      "wire_sha256": "1d75b5a8f0323303a9f6d5b3bd017a14697bad7291af25d43bd683fdba4e9a28"
+    },
+    {
+      "name": "nas-65536",
+      "type": "NAS_PDU",
+      "recipe": {
+        "length": 65536,
+        "octet": "(i * 17 + 3) % 256"
+      },
+      "wire_len": 65538,
+      "wire_sha256": "c1c1b10f3b6287d163463264197bb29a5ec475b972548d548ee7c7367dd5cfb4"
+    },
+    {
+      "name": "nas-65537",
+      "type": "NAS_PDU",
+      "recipe": {
+        "length": 65537,
+        "octet": "(i * 17 + 3) % 256"
+      },
+      "wire_len": 65539,
+      "wire_sha256": "042c2e54bb59e8bf766663743459197ca7945d2866a4aa48f4a5a4c08b69e290"
+    },
+    {
+      "name": "nas-131072",
+      "type": "NAS_PDU",
+      "recipe": {
+        "length": 131072,
+        "octet": "(i * 17 + 3) % 256"
+      },
+      "wire_len": 131075,
+      "wire_sha256": "357007f9c1ee09d2f96f4fbe94db4227afaf64eccdedf2761192cae7b9d3dc6a"
+    },
+    {
+      "name": "security-key-nonzero",
+      "type": "SecurityKey",
+      "recipe": {
+        "octet": "i"
+      },
+      "wire_len": 32,
+      "wire_sha256": "630dcd2966c4336691125448bbb25b4ff412a49c732db2c8abc1b8581bd710dd",
+      "wire_hex": "000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f"
+    },
+    {
+      "name": "tai-01",
+      "type": "TAI",
+      "recipe": {
+        "mcc": "001",
+        "mnc": "01",
+        "tac": "000001"
+      },
+      "wire_len": 7,
+      "wire_sha256": "a3659752a9e325e9cec16f6d390cef411f57ed064318e22dfbe623e89a47eaea",
+      "wire_hex": "0000f110000001"
+    },
+    {
+      "name": "location-01-4-None-False",
+      "type": "UserLocationInformation",
+      "recipe": {
+        "address": "192.0.2.1",
+        "port": null,
+        "tai": false,
+        "mcc": "001",
+        "mnc": "01"
+      },
+      "wire_len": 11,
+      "wire_sha256": "bae006b50764e52e0a973da48c145d9c768b1eb8ad0f5dfcadd2cbb3ee0dec34",
+      "wire_hex": "c001b7400601f0c0000201"
+    },
+    {
+      "name": "location-01-4-None-True",
+      "type": "UserLocationInformation",
+      "recipe": {
+        "address": "192.0.2.1",
+        "port": null,
+        "tai": true,
+        "mcc": "001",
+        "mnc": "01"
+      },
+      "wire_len": 18,
+      "wire_sha256": "51c0fce17e626dcb62e356af616fb1cca935c505571ac7c6192bb8d497a3fda1",
+      "wire_hex": "c001b7400d41f0c00002010000f110000001"
+    },
+    {
+      "name": "location-01-4-4500-False",
+      "type": "UserLocationInformation",
+      "recipe": {
+        "address": "192.0.2.1",
+        "port": 4500,
+        "tai": false,
+        "mcc": "001",
+        "mnc": "01"
+      },
+      "wire_len": 8,
+      "wire_sha256": "9ef606316d606316180660b77c2d3b86f11571a9a23875c7eb67332ca4774a31",
+      "wire_hex": "80f8c00002011194"
+    },
+    {
+      "name": "location-01-4-4500-True",
+      "type": "UserLocationInformation",
+      "recipe": {
+        "address": "192.0.2.1",
+        "port": 4500,
+        "tai": true,
+        "mcc": "001",
+        "mnc": "01"
+      },
+      "wire_len": 21,
+      "wire_sha256": "e75489633b4ae5ca04996afb2cdda54b189e6641faf0869e1dad71332a84c87e",
+      "wire_hex": "90f8c00002011194000000d540070000f110000001"
+    },
+    {
+      "name": "location-01-6-None-False",
+      "type": "UserLocationInformation",
+      "recipe": {
+        "address": "2001:db8::1",
+        "port": null,
+        "tai": false,
+        "mcc": "001",
+        "mnc": "01"
+      },
+      "wire_len": 23,
+      "wire_sha256": "37e4d62c0aa78a7cfd802c04e95b998d9ce00a1b7943938a770955babc4460a1",
+      "wire_hex": "c001b7401207f020010db8000000000000000000000001"
+    },
+    {
+      "name": "location-01-6-None-True",
+      "type": "UserLocationInformation",
+      "recipe": {
+        "address": "2001:db8::1",
+        "port": null,
+        "tai": true,
+        "mcc": "001",
+        "mnc": "01"
+      },
+      "wire_len": 30,
+      "wire_sha256": "98ab6759e9ca8495cac337a64aad1a4ef913de989c7c02734be0d74ec2ac8db6",
+      "wire_hex": "c001b7401947f020010db80000000000000000000000010000f110000001"
+    },
+    {
+      "name": "location-01-6-4500-False",
+      "type": "UserLocationInformation",
+      "recipe": {
+        "address": "2001:db8::1",
+        "port": 4500,
+        "tai": false,
+        "mcc": "001",
+        "mnc": "01"
+      },
+      "wire_len": 20,
+      "wire_sha256": "56646622a36da48270c2fbcc9def61d53b51bfb874065f6490cd49a6936ecbf4",
+      "wire_hex": "83f820010db80000000000000000000000011194"
+    },
+    {
+      "name": "location-01-6-4500-True",
+      "type": "UserLocationInformation",
+      "recipe": {
+        "address": "2001:db8::1",
+        "port": 4500,
+        "tai": true,
+        "mcc": "001",
+        "mnc": "01"
+      },
+      "wire_len": 33,
+      "wire_sha256": "bb2ee049640597241206c6a14cac1dc3b2dfa1ad936dcd88f5440af9542ebfa7",
+      "wire_hex": "93f820010db80000000000000000000000011194000000d540070000f110000001"
+    },
+    {
+      "name": "tai-001",
+      "type": "TAI",
+      "recipe": {
+        "mcc": "001",
+        "mnc": "001",
+        "tac": "000001"
+      },
+      "wire_len": 7,
+      "wire_sha256": "e549fc8bc2cbf7f4fdc7d1981cc21b5cc9ef0e734f07d42d3c2b9bbb26a070af",
+      "wire_hex": "00001100000001"
+    },
+    {
+      "name": "location-001-4-None-False",
+      "type": "UserLocationInformation",
+      "recipe": {
+        "address": "192.0.2.1",
+        "port": null,
+        "tai": false,
+        "mcc": "001",
+        "mnc": "001"
+      },
+      "wire_len": 11,
+      "wire_sha256": "bae006b50764e52e0a973da48c145d9c768b1eb8ad0f5dfcadd2cbb3ee0dec34",
+      "wire_hex": "c001b7400601f0c0000201"
+    },
+    {
+      "name": "location-001-4-None-True",
+      "type": "UserLocationInformation",
+      "recipe": {
+        "address": "192.0.2.1",
+        "port": null,
+        "tai": true,
+        "mcc": "001",
+        "mnc": "001"
+      },
+      "wire_len": 18,
+      "wire_sha256": "514583437c8f8be4d39f1bfc59093a82049548d3cbd4a61d35a9f1f59401209b",
+      "wire_hex": "c001b7400d41f0c000020100001100000001"
+    },
+    {
+      "name": "location-001-4-4500-False",
+      "type": "UserLocationInformation",
+      "recipe": {
+        "address": "192.0.2.1",
+        "port": 4500,
+        "tai": false,
+        "mcc": "001",
+        "mnc": "001"
+      },
+      "wire_len": 8,
+      "wire_sha256": "9ef606316d606316180660b77c2d3b86f11571a9a23875c7eb67332ca4774a31",
+      "wire_hex": "80f8c00002011194"
+    },
+    {
+      "name": "location-001-4-4500-True",
+      "type": "UserLocationInformation",
+      "recipe": {
+        "address": "192.0.2.1",
+        "port": 4500,
+        "tai": true,
+        "mcc": "001",
+        "mnc": "001"
+      },
+      "wire_len": 21,
+      "wire_sha256": "887a23f78bd05fec2447ddc80f4332c1ebb36caafe61b678ab10c8a310ebb890",
+      "wire_hex": "90f8c00002011194000000d5400700001100000001"
+    },
+    {
+      "name": "location-001-6-None-False",
+      "type": "UserLocationInformation",
+      "recipe": {
+        "address": "2001:db8::1",
+        "port": null,
+        "tai": false,
+        "mcc": "001",
+        "mnc": "001"
+      },
+      "wire_len": 23,
+      "wire_sha256": "37e4d62c0aa78a7cfd802c04e95b998d9ce00a1b7943938a770955babc4460a1",
+      "wire_hex": "c001b7401207f020010db8000000000000000000000001"
+    },
+    {
+      "name": "location-001-6-None-True",
+      "type": "UserLocationInformation",
+      "recipe": {
+        "address": "2001:db8::1",
+        "port": null,
+        "tai": true,
+        "mcc": "001",
+        "mnc": "001"
+      },
+      "wire_len": 30,
+      "wire_sha256": "7045348a2e02856968e93c7ed57ae2ec601909e4df95d19efe5c42be826a6637",
+      "wire_hex": "c001b7401947f020010db800000000000000000000000100001100000001"
+    },
+    {
+      "name": "location-001-6-4500-False",
+      "type": "UserLocationInformation",
+      "recipe": {
+        "address": "2001:db8::1",
+        "port": 4500,
+        "tai": false,
+        "mcc": "001",
+        "mnc": "001"
+      },
+      "wire_len": 20,
+      "wire_sha256": "56646622a36da48270c2fbcc9def61d53b51bfb874065f6490cd49a6936ecbf4",
+      "wire_hex": "83f820010db80000000000000000000000011194"
+    },
+    {
+      "name": "location-001-6-4500-True",
+      "type": "UserLocationInformation",
+      "recipe": {
+        "address": "2001:db8::1",
+        "port": 4500,
+        "tai": true,
+        "mcc": "001",
+        "mnc": "001"
+      },
+      "wire_len": 33,
+      "wire_sha256": "76017376cb946d3b737a6c182b55928f2edfe680172a878b398f017c16262ed6",
+      "wire_hex": "93f820010db80000000000000000000000011194000000d5400700001100000001"
+    }
+  ]
+}

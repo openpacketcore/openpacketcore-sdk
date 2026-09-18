@@ -127,6 +127,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `Ikev2SaInitCryptoErrorCode` to `Ikev2ChildSaKeyMaterialDiagnostic`.
 
 ### Added
+- `opc-proto-ngap`: typed, redacted N3IWF UE IDs, opaque NAS, borrowed Security
+  Key, TAI and IPv4/IPv6 location values with canonical field encoding and
+  bounded decoding. Correct TAI receive and without-port CHOICE alignment
+  against 51 independent Release 18 field vectors and two complete UL NAS
+  messages. Encoded buffers clear on drop; procedure presence, additional
+  nested extensions and key-provider admission remain separate (Refs #787).
 - `opc-proto-ngap`: construct and canonically encode the supported root PDU/IE
   containers from opaque encoded IE values; preserve existing receive policies
   and raw replay. Correct open-type fragmentation boundaries, check complete

@@ -2,6 +2,7 @@
 
 use bytes::Bytes;
 use libfuzzer_sys::fuzz_target;
+use opc_proto_ngap::n3iwf::{AmfUeId, N3iwfLocation, NasPdu, RanUeId, SecurityKey, TrackingArea};
 use opc_proto_ngap::{encode, Criticality, MessageType, Pdu, ProtocolIe};
 use opc_protocol::{
     DecodeContext, DuplicateIePolicy, Encode, EncodeContext, OwnedDecode, ValidationLevel,
@@ -21,6 +22,32 @@ fuzz_target!(|data: &[u8]| {
         max_message_len: 200_000,
         ..EncodeContext::default()
     };
+    if let Ok(field) = AmfUeId::decode(data, decode) {
+        let wire = field.encode(output).unwrap();
+        assert!(AmfUeId::decode(wire.as_bytes(), decode).unwrap() == field);
+    }
+    if let Ok(field) = RanUeId::decode(data, decode) {
+        let wire = field.encode(output).unwrap();
+        assert!(RanUeId::decode(wire.as_bytes(), decode).unwrap() == field);
+    }
+    if let Ok(field) = TrackingArea::decode(data, decode) {
+        let wire = field.encode(output).unwrap();
+        assert!(TrackingArea::decode(wire.as_bytes(), decode).unwrap() == field);
+    }
+    if let Ok(field) = N3iwfLocation::decode(data, decode) {
+        let wire = field.encode(output).unwrap();
+        assert!(N3iwfLocation::decode(wire.as_bytes(), decode).unwrap() == field);
+    }
+    if let Ok(field) = SecurityKey::decode(data, decode) {
+        let wire = field.encode(output).unwrap();
+        assert!(wire.as_bytes() == data);
+    }
+    if let Ok(field) = NasPdu::decode(data, decode) {
+        let wire = field.encode(output).unwrap();
+        assert!(NasPdu::decode(wire.as_bytes(), decode).unwrap().as_bytes() == field.as_bytes());
+    }
+    let nas = NasPdu::new(data).encode(output).unwrap();
+    assert!(NasPdu::decode(nas.as_bytes(), decode).unwrap().as_bytes() == data);
     if let Ok(pdu) = Pdu::decode_owned(Bytes::copy_from_slice(data), decode) {
         if let Ok(wire) = encode(&pdu, output) {
             assert_eq!(pdu.wire_len(output).unwrap(), wire.len());

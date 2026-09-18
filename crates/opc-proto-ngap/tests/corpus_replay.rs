@@ -10,6 +10,7 @@
 //! input, this test fails and names the offending input.
 
 use bytes::Bytes;
+use opc_proto_ngap::n3iwf::{AmfUeId, N3iwfLocation, NasPdu, RanUeId, SecurityKey, TrackingArea};
 use opc_proto_ngap::{encode, Criticality, MessageType, Pdu, ProtocolIe};
 use opc_protocol::{DecodeContext, Encode, EncodeContext, OwnedDecode, ValidationLevel};
 
@@ -22,6 +23,13 @@ fn exercise(data: &[u8]) {
         validation_level: ValidationLevel::Strict,
         ..DecodeContext::default()
     };
+    // Exercise all admitted field receivers on corpus/truncation inputs too.
+    let _ = AmfUeId::decode(data, ctx);
+    let _ = RanUeId::decode(data, ctx);
+    let _ = NasPdu::decode(data, ctx);
+    let _ = SecurityKey::decode(data, ctx);
+    let _ = TrackingArea::decode(data, ctx);
+    let _ = N3iwfLocation::decode(data, ctx);
     if let Ok(pdu) = Pdu::decode_owned(Bytes::copy_from_slice(data), ctx) {
         if let Ok(wire) = encode(&pdu, EncodeContext::default()) {
             assert_eq!(pdu.wire_len(EncodeContext::default()).unwrap(), wire.len());

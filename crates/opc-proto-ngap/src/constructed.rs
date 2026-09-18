@@ -195,7 +195,7 @@ fn add(a: usize, b: usize) -> Result<usize, EncodeError> {
 
 // X.691 11.9: emit the largest 16K multiple up to 64K per fragment, then a
 // final short/two-octet determinant (including zero after exact multiples).
-fn open_type_len(len: usize) -> Result<usize, EncodeError> {
+pub(super) fn open_type_len(len: usize) -> Result<usize, EncodeError> {
     let remainder = len % 65536;
     let fragments = add(len / 65536, usize::from(remainder >= 16384))?;
     let final_len = remainder % 16384;
@@ -299,7 +299,7 @@ fn write_ie(out: &mut Vec<u8>, id: u16, criticality: u8, value: &[u8]) {
     write_open_type(out, value);
 }
 
-fn write_open_type(out: &mut Vec<u8>, mut value: &[u8]) {
+pub(super) fn write_open_type(out: &mut Vec<u8>, mut value: &[u8]) {
     while value.len() >= 16384 {
         let units = (value.len() / 16384).min(4);
         let size = units * 16384;
