@@ -16,6 +16,8 @@ internal semantics in the SDK.
 | Layer | Item | Status | Evidence |
 |---|---|---|---|
 | NGAP-PDU framing | All three outcomes | ✅ | Complete messages independently encoded from the Release 18.10 schema |
+| Constructed root containers | All 15 admitted outcomes | ✅ | 21 independent complete-message/order/extension cases built from oracle IE values without receive bytes |
+| Constructed length determinants | All three outcomes; short, two-octet and fragmented open types | ✅ | 54 independent Pycrate cases, including inner/outer 128, 16384 and 65536 boundaries |
 | Typed IE mapping | NGSetup Request/Response/Failure | ✅ | Every IE compared with independent reference bytes |
 | Typed IE mapping | InitialUEMessage; Downlink/UplinkNASTransport | ✅ | Complete N3IWF messages, including IPv4/IPv6 location |
 | Typed IE mapping | InitialContextSetup Request/Response/Failure | ✅ | Complete context and nested resource fields |
@@ -56,7 +58,8 @@ singleton/repeatable cardinality.
 These policies filter the typed generated container, not the preserved wire
 image. `Pdu::raw` remains the immutable received bytes. Raw-preserving encode
 therefore reproduces unknown or duplicate entries removed by `Drop`, `First`,
-or `Last`; it is not a sanitized typed-view encoder.
+or `Last`. Canonical encoding serializes the resulting typed container. Neither
+mode performs nested semantic admission.
 
 Public `Debug` output for the wrapper and message enums is redacted to
 procedure/outcome metadata, lengths, variant names, and IE counts. It does not
@@ -66,13 +69,26 @@ render `Pdu::raw`, opaque IE values, or NAS payload bytes.
 
 - **Raw-preserving**: byte-exact `decode → encode` is proven for every
   fixture above; the original PDU bytes are preserved and re-emitted.
-- **Canonical typed encode**: unsupported in the v1 subset and rejected with an
-  error.
-  `rasn` 0.28's APER encoder does not reproduce the octet alignment of the
-  external fixtures for the inner message types (and its output for those
-  types does not survive its own decoder), so this codec profile preserves raw
-  bytes instead of constructing new NGAP messages from typed values.
-  Raw-preserving encode also rejects PDUs without decoded raw bytes.
+- **Canonical container encode**: explicitly writes the supported typed root
+  PDU/IE containers using TS 38.413 9.4 and X.691 aligned BASIC-PER. This avoids
+  the generated `rasn` 0.28 inner-container encoder alignment defect. The
+  mode name describes SDK reconstruction, not ASN.1 CANONICAL-PER. IE order
+  and opaque IE value bytes are preserved; alignment bits are zero, length
+  determinants are minimal, large open types use the largest permitted 16K
+  multiple up to 64K followed by a terminating determinant (including zero),
+  and no message SEQUENCE extension additions are written. Use raw mode when
+  received extensions or ignored bytes must survive exactly.
+- Construction accepts `MessageType` plus borrowed `ProtocolIe` values and
+  applies the existing receive policies, including caller-selected unknown
+  and duplicate handling. It bounds count/depth/complete wire size before
+  payload allocation. Returned `raw` is empty. Canonical send revalidates the
+  mutable wrapper/message tuple, known criticality and singleton uniqueness;
+  unknown reject-criticality IEs and unknown message bodies fail. Capacity
+  errors leave the destination unchanged; `wire_len` allocates no heap memory.
+- Typed IE semantic construction, required/conditional presence, and nested
+  resource/key/location validation remain outside this change. A malformed
+  opaque leaf can be structurally constructed; the API does not claim semantic
+  send admission. Raw-preserving encode rejects PDUs without received bytes.
 
 ## Fixtures
 
@@ -81,8 +97,18 @@ render `Pdu::raw`, opaque IE values, or NAS payload bytes.
   compiled directly from the exact ETSI Release 18.10 publication. The
   [SDK field comparison](../opc-n3iwf-fixtures/tests/ngap_messages.rs) verifies
   every decoded IE and raw-preserving output. The separate reference gate
-  validates mandatory fields and nested ASN.1 values; it does not give the
-  SDK semantic admission or canonical typed encoding.
+  validates mandatory fields and nested ASN.1 values. Construction tests use
+  independently encoded leaf bytes as inputs and compare complete output
+  with the published PDU. This proves container construction, not SDK semantic
+  admission of those leaf values.
+- [Constructed framing oracle](tests/fixtures/constructed-framing.json):
+  SHA-256 and length of 54 independently encoded root containers with a
+  deterministic synthetic unknown ignore-criticality IE. These are structural
+  containers, not complete procedures. Reproduce with the pinned reference
+  Python environment and local hash-checked ETSI V18.10.0 PDF:
+  `python scripts/generate-ngap-constructed-fixtures.py --spec PATH --output PATH`.
+  Tests cover exact/one-short bounds, fragmented inner and outer open types,
+  all outcomes, zero-length values and terminating zero determinants.
 - Legacy `NGSetupRequest`: 78-byte structural derivative of the libngap
   literal. Its erroneous outer criticality is corrected from ignore to reject;
   the original literal remains as provenance. It is not a complete N3IWF peer
@@ -94,24 +120,32 @@ render `Pdu::raw`, opaque IE values, or NAS payload bytes.
 
 ## Robustness & Fuzzing
 
-The decode path carries no `unsafe` and uses checked length arithmetic. For
-typed procedures it parses the exact aligned-PER container prefix before
-`rasn`: the fixed-width 16-bit `ProtocolIE-Container` count must satisfy
+The decode path carries no `unsafe` and uses checked length arithmetic. Root
+PDU/IE open types are preflighted through their final length determinant before
+fragment coalescing; the claimed fragment must physically fit. For typed
+procedures the fixed-width 16-bit `ProtocolIE-Container` count must satisfy
 `DecodeContext::max_ies` and the minimum physical bytes required by that many
-entries before `SequenceOf` materialization. Three additional layers guard it:
+entries before materialization. Generated types decode fixed IE headers;
+fragments cannot consume a following IE or PDU. Trailing bytes inside a root
+container are rejected. SEQUENCE extension additions retain the earlier
+generated decoder path; fragmented additions are not qualified. Three
+additional layers guard it:
 
 - **Per-PR regression guard** — `tests/corpus_replay.rs` replays every committed
   corpus entry, byte-truncations of each, and hostile constant inputs through
   `Pdu::decode_owned` under `catch_unwind`. Runs in ordinary `cargo test`; no
   nightly toolchain or libFuzzer required.
 - **Scheduled fuzzing** — `fuzz/fuzz_targets/decode_ngap.rs` with a seeded
-  corpus, registered in `.github/workflows/fuzz.yml` and run weekly.
+  corpus, registered in `.github/workflows/fuzz.yml` and run weekly. The target
+  also constructs bounded borrowed IE lists, exercises duplicate policies,
+  and checks canonical lengths and structural replay.
 - **Verification** — a deep `cargo-fuzz` pass over the decoder completed ~26M
   executions with no crash, leak, or OOM.
 
 ## Codec Boundary (v1 subset)
 
-- Canonical (typed) encoding of any message.
+- Typed semantic encoding of IE values, as distinct from the implemented
+  root-container construction from opaque encoded values.
 - External field-level fixtures for Paging and procedures outside the admitted
   N3IWF corpus.
 - Typed decode of procedures outside the first-CNF N2 subset above; preserved

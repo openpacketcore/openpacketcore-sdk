@@ -127,6 +127,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `Ikev2SaInitCryptoErrorCode` to `Ikev2ChildSaKeyMaterialDiagnostic`.
 
 ### Added
+- `opc-proto-ngap`: construct and canonically encode the supported root PDU/IE
+  containers from opaque encoded IE values; preserve existing receive policies
+  and raw replay. Correct open-type fragmentation boundaries, check complete
+  output bounds before writing, and compare all 15 admitted outcomes with the
+  independent Release 18 corpus. Typed N3IWF semantic IE admission and further
+  applicable procedures remain pending (Refs #787).
 - `opc-proto-ikev2::nwu::mobike`: authenticated network-side mobility updates,
   source/replay checks, typed NAT/address notifications and COOKIE2 proof before
   Child-SA migration intent. Crypto and entropy use the admitted IKE module;
