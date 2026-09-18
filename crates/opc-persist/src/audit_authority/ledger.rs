@@ -22,8 +22,8 @@ const OPERATION_EVENT_RESERVATION: usize = 3;
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct AuditLedgerLimits {
-    max_events: usize,
-    max_operations: usize,
+    pub(crate) max_events: usize,
+    pub(crate) max_operations: usize,
 }
 
 impl AuditLedgerLimits {
@@ -223,6 +223,7 @@ pub(crate) struct LedgerOperation {
 #[serde(rename_all = "kebab-case")]
 pub(crate) enum EntryPayload {
     Event(Box<ProjectedAuditEvent>),
+    KeyTransition(Box<super::continuity::AuditKeyTransition>),
     Intent(Box<AuditOperationHandle>),
     Outcome {
         operation: [u8; 32],
@@ -236,11 +237,11 @@ pub(crate) enum EntryPayload {
 #[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct LedgerEntry {
-    sequence: u64,
-    previous: [u8; 32],
-    payload: EntryPayload,
-    key_epoch: u64,
-    mac: [u8; 32],
+    pub(crate) sequence: u64,
+    pub(crate) previous: [u8; 32],
+    pub(crate) payload: EntryPayload,
+    pub(crate) key_epoch: u64,
+    pub(crate) mac: [u8; 32],
 }
 
 /// Exactly one bounded state, changed inside the existing Raft apply transaction.
@@ -257,6 +258,7 @@ pub(crate) struct LedgerState {
     pub(crate) predecessor: [u8; 32],
     pub(crate) entries: Vec<LedgerEntry>,
     pub(crate) operations: Vec<LedgerOperation>,
+    pub(crate) continuity: Option<super::continuity::chain::ContinuityState>,
 }
 
 impl LedgerState {
@@ -276,10 +278,11 @@ impl LedgerState {
             predecessor: [0; 32],
             entries: Vec::new(),
             operations: Vec::new(),
+            continuity: None,
         }
     }
 
-    fn used_capacity(&self) -> Result<usize, AuditAuthorityError> {
+    pub(crate) fn used_capacity(&self) -> Result<usize, AuditAuthorityError> {
         self.operations
             .iter()
             .try_fold(self.entries.len(), |used, op| {
@@ -288,7 +291,7 @@ impl LedgerState {
             })
     }
 
-    fn append(
+    pub(crate) fn append(
         &mut self,
         key: &AuditKey,
         payload: EntryPayload,
@@ -567,6 +570,11 @@ impl LedgerState {
                     op.terminal_recorded = true;
                     op.last_sequence = sequence;
                     op.reserved = 0;
+                }
+                EntryPayload::KeyTransition(_) => {
+                    if self.continuity.is_none() {
+                        return Err(AuditAuthorityError::BindingMismatch);
+                    }
                 }
                 EntryPayload::Event(event) => {
                     if event.projection != self.projection {

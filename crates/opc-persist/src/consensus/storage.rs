@@ -881,6 +881,7 @@ impl RaftStateMachine<ConfigRaftTypeConfig> for SqliteConfigStateMachine {
         let identity = self.core.identity;
         let members = self.core.expected_members.clone();
         let audit_key = self.core.audit_key.clone();
+        let audit_keys = self.core.management_audit_keys.clone();
         let entries = collect_bounded_entries(entries)
             .map_err(|error| storage_error(ErrorSubject::StateMachine, ErrorVerb::Write, error))?;
         let responses = self
@@ -893,6 +894,7 @@ impl RaftStateMachine<ConfigRaftTypeConfig> for SqliteConfigStateMachine {
                     entries,
                     cancellation,
                     &audit_key,
+                    audit_keys.as_deref(),
                 )
             })
             .await

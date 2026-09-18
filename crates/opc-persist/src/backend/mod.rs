@@ -194,6 +194,8 @@ pub struct SqliteBackend {
     pub(crate) consensus_apply_gate: Arc<tokio::sync::Semaphore>,
     /// Audit HMAC key used to seal and verify local audit-trail rows.
     audit_key: Arc<AuditKey>,
+    management_audit_keys:
+        Arc<std::sync::OnceLock<Arc<crate::audit_authority::continuity::AuditKeyRing>>>,
     /// Last SQLite data-version observed after authenticating management-audit
     /// state. SQLite advances this value only for commits by other connections.
     management_audit_data_version: Arc<AtomicU64>,
@@ -282,6 +284,22 @@ impl SqliteBackend {
 
     pub(crate) fn audit_key(&self) -> &AuditKey {
         &self.audit_key
+    }
+
+    pub(crate) fn management_audit_keys(
+        &self,
+    ) -> Option<Arc<crate::audit_authority::continuity::AuditKeyRing>> {
+        self.management_audit_keys.get().cloned()
+    }
+
+    pub(crate) fn attach_management_audit_keys(
+        &self,
+        keys: Arc<crate::audit_authority::continuity::AuditKeyRing>,
+    ) -> Result<(), crate::audit_authority::AuditAuthorityError> {
+        keys.separate_from(self.audit_key())?;
+        self.management_audit_keys
+            .set(keys)
+            .map_err(|_| crate::audit_authority::AuditAuthorityError::BindingMismatch)
     }
 
     pub(crate) fn management_audit_data_version(&self) -> u64 {
@@ -377,6 +395,7 @@ impl SqliteBackend {
             #[cfg(test)]
             consensus_apply_gate: Arc::new(tokio::sync::Semaphore::new(1)),
             audit_key: Arc::new(audit_key),
+            management_audit_keys: Arc::new(std::sync::OnceLock::new()),
             management_audit_data_version: Arc::new(AtomicU64::new(0)),
             config_consensus_history_required: Arc::new(AtomicBool::new(consensus_required)),
             cached_caps: std::sync::OnceLock::new(),
@@ -416,6 +435,7 @@ impl SqliteBackend {
             #[cfg(test)]
             consensus_apply_gate: Arc::new(tokio::sync::Semaphore::new(1)),
             audit_key: Arc::new(audit_key),
+            management_audit_keys: Arc::new(std::sync::OnceLock::new()),
             management_audit_data_version: Arc::new(AtomicU64::new(0)),
             config_consensus_history_required: Arc::new(AtomicBool::new(true)),
             cached_caps: std::sync::OnceLock::new(),

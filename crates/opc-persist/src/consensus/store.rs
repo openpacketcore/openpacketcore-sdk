@@ -1,6 +1,7 @@
 //! ConfigStore implementation coordinated exclusively by Openraft.
 
 mod audit;
+mod audit_continuity;
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
@@ -72,6 +73,9 @@ pub enum ConfigConsensusOpenError {
     /// Durable SQLite or snapshot storage could not be opened.
     #[error("config consensus durable storage is unavailable")]
     StorageUnavailable,
+    /// Required audit keys or external rollback protection could not be proven.
+    #[error("config consensus audit continuity is unavailable")]
+    AuditContinuityUnavailable,
     /// Fixed Openraft runtime profile or deadline was invalid.
     #[error("config consensus runtime configuration is invalid")]
     InvalidRuntimeConfiguration,
@@ -290,6 +294,7 @@ struct ConsensusConfigStoreInner {
     clock: Arc<dyn ConfigConsensusClock>,
     operation_timeout: Duration,
     admitted: AtomicBool,
+    audit_continuity: Option<Arc<crate::audit_authority::continuity::AuditContinuityPolicy>>,
     linearizability: EnsureLinearizableSupervisor<ConfigRaftTypeConfig>,
     proposal_admission: Arc<tokio::sync::Semaphore>,
     metric_leader: std::sync::Mutex<Option<ConsensusNodeId>>,
@@ -384,6 +389,7 @@ impl ConsensusConfigStore {
             clock,
             operation_timeout,
             None,
+            None,
         )
         .await
     }
@@ -405,6 +411,7 @@ impl ConsensusConfigStore {
             Arc::new(SystemConfigConsensusClock),
             DEFAULT_CONFIG_CONSENSUS_OPERATION_TIMEOUT,
             Some(approval),
+            None,
         )
         .await
     }
@@ -418,6 +425,7 @@ impl ConsensusConfigStore {
         clock: Arc<dyn ConfigConsensusClock>,
         operation_timeout: Duration,
         recovery: Option<ApprovedLegacyConfigRecovery>,
+        audit_continuity: Option<Arc<crate::audit_authority::continuity::AuditContinuityPolicy>>,
     ) -> Result<Self, ConfigConsensusOpenError> {
         if operation_timeout.is_zero() || operation_timeout > Duration::from_secs(60) {
             return Err(ConfigConsensusOpenError::InvalidRuntimeConfiguration);
@@ -440,6 +448,11 @@ impl ConsensusConfigStore {
         if peers.keys().copied().collect::<BTreeSet<_>>() != expected_peers {
             return Err(ConfigConsensusOpenError::PeerSetMismatch);
         }
+        if let Some(policy) = &audit_continuity {
+            backend
+                .attach_management_audit_keys(policy.keys.clone())
+                .map_err(|_| ConfigConsensusOpenError::AuditContinuityUnavailable)?;
+        }
         let network = ConfigRaftNetworkFactory::try_new(identity, local_node_id, peers.clone())?;
         let (log_store, state_machine, durable_progress) = if let Some(recovery) = recovery {
             storage::open_with_recovery(
@@ -453,6 +466,14 @@ impl ConsensusConfigStore {
         } else {
             storage::open(&backend, snapshot_dir, identity, members.clone()).await?
         };
+        audit_continuity::verify_startup(
+            &backend,
+            audit_continuity.as_deref(),
+            identity,
+            operation_timeout,
+        )
+        .await
+        .map_err(|_| ConfigConsensusOpenError::AuditContinuityUnavailable)?;
         let raft = ConfigRaft::new(
             local_node_id,
             Arc::new(config_raft_config()?),
@@ -476,6 +497,7 @@ impl ConsensusConfigStore {
                 clock,
                 operation_timeout,
                 admitted: AtomicBool::new(false),
+                audit_continuity,
                 linearizability,
                 proposal_admission: Arc::new(tokio::sync::Semaphore::new(
                     DURABLE_OPENRAFT_PROPOSAL_ADMISSION_SLOTS,
@@ -753,7 +775,13 @@ impl ConsensusConfigStore {
 
     /// Prove quorum through the same read-index path used by authoritative reads.
     pub async fn probe_durable_readiness(&self) -> Result<(), PersistError> {
-        self.linearizable_barrier().await.map(|_| ())
+        self.linearizable_barrier().await?;
+        if self.inner.audit_continuity.is_some() {
+            self.read_audit_ledger()
+                .await
+                .map_err(|_| PersistError::unavailable())?;
+        }
+        Ok(())
     }
 
     /// Ask Openraft to build and compact a state-machine snapshot.

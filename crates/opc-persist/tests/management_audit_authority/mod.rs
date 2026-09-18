@@ -1,4 +1,6 @@
-//! SDK #797: one real configuration quorum; independent receipt and config readback.
+mod continuity;
+
+// SDK #797: one real configuration quorum; independent receipt and config readback.
 use super::*;
 use opc_persist::audit_authority::*;
 use opc_persist::{

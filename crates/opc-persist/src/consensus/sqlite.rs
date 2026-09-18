@@ -297,6 +297,7 @@ pub(crate) struct ConfigConsensusCore {
     pub(crate) snapshot_dir: Arc<PathBuf>,
     pub(crate) snapshot_gate: Arc<tokio::sync::Mutex<()>>,
     pub(crate) audit_key: Arc<AuditKey>,
+    pub(crate) management_audit_keys: Option<Arc<crate::audit_authority::continuity::AuditKeyRing>>,
     pub(crate) _snapshot_dir_guard: Arc<std::fs::File>,
     pub(crate) snapshot_binding_path: Arc<PathBuf>,
     pub(crate) durable_progress: Arc<super::storage::ConfigDurableProgress>,
@@ -463,6 +464,7 @@ impl ConfigConsensusCore {
             snapshot_dir: Arc::new(snapshot_dir),
             snapshot_gate: Arc::new(tokio::sync::Mutex::new(())),
             audit_key: Arc::new(backend.audit_key().clone()),
+            management_audit_keys: backend.management_audit_keys(),
             _snapshot_dir_guard: snapshot_dir_guard,
             snapshot_binding_path: Arc::new(snapshot_binding_path),
             durable_progress,
@@ -2726,11 +2728,13 @@ fn execute_intent_sync(
 /// The effect savepoint rolls back configuration failure only. Its audited
 /// rejection survives in the enclosing Raft transaction. An I/O failure still
 /// rolls back everything and never creates a caller-asserted commit receipt.
+#[allow(clippy::too_many_arguments)]
 fn apply_audited_mutation_sync(
     conn: &Connection,
     key: &AuditKey,
     identity: ConsensusIdentity,
     prepared: &super::PreparedAuditedMutation,
+    audit_keys: Option<&crate::audit_authority::continuity::AuditKeyRing>,
     logical_time: Timestamp,
     request_id: opc_consensus::ConsensusRequestId,
     cancellation: &SqliteWorkCancellation,
@@ -2740,7 +2744,8 @@ fn apply_audited_mutation_sync(
     if prepared.verify_effect(key).is_err() {
         return Ok(Err(ConfigMutationFailure::InvalidInput));
     }
-    let Some(mut ledger) = super::audit::read_sync(conn, key, identity)? else {
+    let Some(mut ledger) = super::audit::read_with_keys_sync(conn, key, audit_keys, identity)?
+    else {
         return Ok(Err(ConfigMutationFailure::InvalidInput));
     };
     let receipt = match ledger.lookup(key, &prepared.handle, prepared.handle.body.binding.caller) {
@@ -2804,6 +2809,10 @@ fn apply_audited_mutation_sync(
     ledger
         .resolve(key, &prepared.handle, state)
         .map_err(|_| invalid())?;
+    ledger.seal_continuity(audit_keys).map_err(|_| invalid())?;
+    ledger
+        .validate_continuity(audit_keys)
+        .map_err(|_| invalid())?;
     super::audit::write_sync(conn, key, identity, Some(ledger), false)?;
     Ok(result)
 }
@@ -2823,9 +2832,11 @@ pub(crate) fn apply_entries_sync(
         entries,
         &SqliteWorkCancellation::new(),
         audit_key,
+        None,
     )
 }
 
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn apply_entries_cancellable_sync(
     conn: &Connection,
     identity: ConsensusIdentity,
@@ -2833,6 +2844,7 @@ pub(crate) fn apply_entries_cancellable_sync(
     entries: Vec<Entry<ConfigRaftTypeConfig>>,
     cancellation: &SqliteWorkCancellation,
     audit_key: &AuditKey,
+    audit_keys: Option<&crate::audit_authority::continuity::AuditKeyRing>,
 ) -> io::Result<Vec<ConfigConsensusResponse>> {
     if entries.len() > CONFIG_CONSENSUS_LOG_APPEND_MAX_ENTRIES {
         return Err(invalid_data(
@@ -2953,6 +2965,7 @@ pub(crate) fn apply_entries_cancellable_sync(
                                 audit_key,
                                 identity,
                                 prepared,
+                                audit_keys,
                                 logical_time,
                                 command.request_id,
                                 cancellation,
@@ -2964,6 +2977,7 @@ pub(crate) fn apply_entries_cancellable_sync(
                             identity,
                             audit,
                             logical_time.as_offset_datetime().unix_timestamp(),
+                            audit_keys,
                         )?,
                         ConfigMutationIntent::RetainHistory(retention) => {
                             validate_sealed_state_sync(&tx, audit_key, cancellation)?;
@@ -2978,7 +2992,8 @@ pub(crate) fn apply_entries_cancellable_sync(
                                     | ConfigMutationIntent::CreateRollbackPoint { .. }
                             );
                             if requires_audit
-                                && super::audit::read_sync(&tx, audit_key, identity)?.is_some()
+                                && (audit_keys.is_some()
+                                    || super::audit::read_sync(&tx, audit_key, identity)?.is_some())
                             {
                                 Err(ConfigMutationFailure::InvalidInput)
                             } else {

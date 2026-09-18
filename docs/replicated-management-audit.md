@@ -4,6 +4,12 @@ Tracking: #796, #797, #798. This document describes the configuration-authority
 slice of #797. Protocol-server composition and #798's multi-epoch,
 export/checkpoint and safe-pruning contracts remain separate acceptance work.
 
+The optional required-continuity composition is now specified by
+[ADR 0025](adr/0025-management-audit-continuity.md). It extends this original
+single-key slice and supersedes its representation versions with command/RPC 6
+and storage/snapshot 4. The limitations below describe the authority without
+that separately composed signing/checkpoint profile.
+
 ## Authority and storage
 
 `opc-persist::ConsensusConfigStore` owns one management ledger in the existing

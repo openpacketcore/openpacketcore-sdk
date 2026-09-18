@@ -34,19 +34,21 @@ pub(crate) const ATOMIC_CONFIG_CONSENSUS_COMMAND_VERSION: u16 = 2;
 /// Revision 2 added atomic commit-confirmed resolution and recovery-fence
 /// clearing. Revision 3 adds an inline named rollback point to an appended
 /// encrypted record. Revision 4 adds authenticated history retention. Revision 5
-/// adds the replicated management ledger and audited configuration effects. Older
+/// adds the replicated management ledger and audited configuration effects.
+/// Revision 6 adds authenticated signing transitions, export acknowledgements
+/// and checkpoint-protected retention. Older
 /// commands remain readable under their original
 /// semantics so existing durable logs can be replayed after upgrade.
-pub const CONFIG_CONSENSUS_COMMAND_VERSION: u16 = 5;
+pub const CONFIG_CONSENSUS_COMMAND_VERSION: u16 = 6;
 /// Current SQLite authority schema revision.
-pub const CONFIG_CONSENSUS_STORAGE_VERSION: u16 = 3;
+pub const CONFIG_CONSENSUS_STORAGE_VERSION: u16 = 4;
 /// Current config snapshot envelope revision.
-pub const CONFIG_CONSENSUS_SNAPSHOT_VERSION: u16 = 3;
+pub const CONFIG_CONSENSUS_SNAPSHOT_VERSION: u16 = 4;
 /// Current config-specific RPC payload revision.
 ///
-/// Revision 5 carries the revision-5 command admission contract. Peers require
+/// Revision 6 carries the revision-6 command admission contract. Peers require
 /// an exact match and do not negotiate a downgrade.
-pub const CONFIG_CONSENSUS_WIRE_VERSION: u16 = 5;
+pub const CONFIG_CONSENSUS_WIRE_VERSION: u16 = 6;
 
 /// Maximum configured voter count admitted by the config consensus adapter.
 pub const CONFIG_CONSENSUS_MAX_MEMBERS: usize = 9;
@@ -358,7 +360,14 @@ impl ConfigMutationIntent {
                 ATOMIC_CONFIG_CONSENSUS_COMMAND_VERSION
             }
             Self::RetainHistory(_) => 4,
-            Self::ManagementAudit(_) | Self::AuditedMutation(_) => 5,
+            Self::AuditedMutation(_) => 5,
+            Self::ManagementAudit(command) => match command {
+                super::audit::AuditCommand::Initialize { .. }
+                | super::audit::AuditCommand::Intent(_)
+                | super::audit::AuditCommand::Reject(_)
+                | super::audit::AuditCommand::Terminal(_) => 5,
+                _ => 6,
+            },
         }
     }
 
@@ -452,6 +461,7 @@ impl ConfigConsensusCommand {
             }
             3 => self.intent.minimum_command_version() <= 3,
             4 => self.intent.minimum_command_version() <= 4,
+            5 => self.intent.minimum_command_version() <= 5,
             CONFIG_CONSENSUS_COMMAND_VERSION => true,
             _ => false,
         };
@@ -830,7 +840,7 @@ mod tests {
 
     #[test]
     fn config_wire_revision_is_independent_and_exact() {
-        assert_eq!(5, CONFIG_CONSENSUS_WIRE_VERSION);
+        assert_eq!(6, CONFIG_CONSENSUS_WIRE_VERSION);
         let current = encode_config_wire(&7_u64).expect("current wire");
         assert_eq!(
             7,
@@ -946,11 +956,25 @@ mod tests {
             command.schema_version = revision;
             assert!(command.validate(identity).is_err());
         }
+        command.intent = ConfigMutationIntent::ManagementAudit(
+            super::super::audit::AuditCommand::InitializeWithContinuity {
+                projection: crate::audit_authority::AuditToken::from_keyed_projection([0xC7; 32])
+                    .unwrap(),
+                limits: crate::audit_authority::AuditLedgerLimits::new(3, 1).unwrap(),
+                initial_epoch: 1,
+            },
+        );
+        for revision in 1..6 {
+            command.schema_version = revision;
+            assert!(command.validate(identity).is_err());
+        }
+        command.schema_version = 6;
+        assert!(command.validate(identity).is_ok());
     }
 
     #[test]
     fn older_persisted_commands_decode_but_cannot_claim_newer_intents() {
-        assert_eq!(5, CONFIG_CONSENSUS_COMMAND_VERSION);
+        assert_eq!(6, CONFIG_CONSENSUS_COMMAND_VERSION);
         let identity = ConfigConsensusIdentity::new(
             ConfigConsensusClusterId::new("config-command-v1-replay-test").expect("cluster"),
             ConfigConsensusConfigurationId::from_bytes([0xB1; 32]),
