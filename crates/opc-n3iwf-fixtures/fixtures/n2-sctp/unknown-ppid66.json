@@ -35,10 +35,11 @@
   ],
   "wire": {
     "path": "wire/unknown-ppid66.hex",
-    "digest_sha256": "d4e7a428fe407e83d7ad8ba3d1511162b50acf58b62c25796b90add8140c420f"
+    "digest_sha256": "d930104925fd1c2c1f7418e81c27cb87f77a040e5894f836cb0c18bb342e558d"
   },
   "semantic_assertions": [
     "ppid=66",
+    "port=38412",
     "non_dtls_profile=unsupported"
   ],
   "expected_outcome": "unsupported",

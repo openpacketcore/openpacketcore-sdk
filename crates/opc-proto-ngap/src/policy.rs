@@ -31,12 +31,35 @@ pub(super) struct IeProfile {
 }
 
 impl IeProfile {
+    pub(super) fn recognizes(self, id: u16) -> bool {
+        self.rule(id).is_some()
+    }
+
     const fn new(rules: &'static [IeRule]) -> Self {
         Self { rules }
     }
 
     fn rule(self, id: u16) -> Option<IeRule> {
         self.rules.iter().copied().find(|rule| rule.id == id)
+    }
+
+    pub(super) fn validate_send_ie(
+        self,
+        id: u16,
+        criticality: u8,
+    ) -> Result<(), opc_protocol::EncodeError> {
+        let reason = match self.rule(id) {
+            Some(rule) if rule.criticality != criticality => {
+                "ngap protocol ie criticality mismatch"
+            }
+            None if criticality == CRITICALITY_REJECT => {
+                "cannot construct an unknown critical ngap protocol ie"
+            }
+            _ => return Ok(()),
+        };
+        Err(opc_protocol::EncodeError::new(
+            opc_protocol::EncodeErrorCode::Structural { reason },
+        ))
     }
 }
 
@@ -205,6 +228,61 @@ pub(super) const PDU_SESSION_RESOURCE_RELEASE_COMMAND: IeProfile = IeProfile::ne
     IeRule::singleton(83, CRITICALITY_IGNORE), // id-RANPagingPriority
     IeRule::singleton(38, CRITICALITY_IGNORE), // id-NAS-PDU
     IeRule::singleton(79, CRITICALITY_REJECT), // id-PDUSessionResourceToReleaseListRelCmd
+]);
+
+// TS 38.413 V18.10.0 9.2.1.7; all fields are singleton.
+pub(super) const PDU_SESSION_RESOURCE_MODIFY_REQUEST: IeProfile = IeProfile::new(&[
+    IeRule::singleton(10, CRITICALITY_REJECT),
+    IeRule::singleton(85, CRITICALITY_REJECT),
+    IeRule::singleton(83, CRITICALITY_IGNORE),
+    IeRule::singleton(64, CRITICALITY_REJECT),
+]);
+pub(super) const PDU_SESSION_RESOURCE_MODIFY_RESPONSE: IeProfile = IeProfile::new(&[
+    IeRule::singleton(10, CRITICALITY_IGNORE),
+    IeRule::singleton(85, CRITICALITY_IGNORE),
+    IeRule::singleton(65, CRITICALITY_IGNORE),
+    IeRule::singleton(54, CRITICALITY_IGNORE),
+    IeRule::singleton(121, CRITICALITY_IGNORE),
+    IeRule::singleton(19, CRITICALITY_IGNORE),
+]);
+
+pub(super) const PDU_SESSION_RESOURCE_NOTIFY: IeProfile = IeProfile::new(&[
+    IeRule::singleton(10, CRITICALITY_REJECT),  // AMF UE ID
+    IeRule::singleton(85, CRITICALITY_REJECT),  // RAN UE ID
+    IeRule::singleton(66, CRITICALITY_REJECT),  // Notified sessions
+    IeRule::singleton(67, CRITICALITY_IGNORE),  // Released sessions
+    IeRule::singleton(121, CRITICALITY_IGNORE), // Location
+]);
+
+// TS 38.413 V18.10.0 9.2.6.11–13; all entries are singleton.
+pub(super) const NG_RESET: IeProfile = IeProfile::new(&[
+    IeRule::singleton(15, CRITICALITY_IGNORE), // Cause
+    IeRule::singleton(88, CRITICALITY_REJECT), // ResetType
+]);
+pub(super) const NG_RESET_ACKNOWLEDGE: IeProfile = IeProfile::new(&[
+    IeRule::singleton(111, CRITICALITY_IGNORE), // UE-associatedLogicalNG-connectionList
+    IeRule::singleton(19, CRITICALITY_IGNORE),  // CriticalityDiagnostics
+]);
+pub(super) const ERROR_INDICATION: IeProfile = IeProfile::new(&[
+    IeRule::singleton(10, CRITICALITY_IGNORE), // AMF-UE-NGAP-ID
+    IeRule::singleton(85, CRITICALITY_IGNORE), // RAN-UE-NGAP-ID
+    IeRule::singleton(15, CRITICALITY_IGNORE), // Cause
+    IeRule::singleton(19, CRITICALITY_IGNORE), // CriticalityDiagnostics
+    IeRule::singleton(26, CRITICALITY_IGNORE), // FiveG-S-TMSI
+]);
+
+// TS 38.413 V18.10.0 9.2.5.4 and 9.2.2.4; all entries are singleton.
+pub(super) const NAS_NON_DELIVERY_INDICATION: IeProfile = IeProfile::new(&[
+    IeRule::singleton(10, CRITICALITY_REJECT), // id-AMF-UE-NGAP-ID
+    IeRule::singleton(85, CRITICALITY_REJECT), // id-RAN-UE-NGAP-ID
+    IeRule::singleton(38, CRITICALITY_IGNORE), // id-NAS-PDU
+    IeRule::singleton(15, CRITICALITY_IGNORE), // id-Cause
+]);
+pub(super) const UE_CONTEXT_RELEASE_REQUEST: IeProfile = IeProfile::new(&[
+    IeRule::singleton(10, CRITICALITY_REJECT), // id-AMF-UE-NGAP-ID
+    IeRule::singleton(85, CRITICALITY_REJECT), // id-RAN-UE-NGAP-ID
+    IeRule::singleton(133, CRITICALITY_REJECT), // id-PDUSessionResourceListCxtRelReq
+    IeRule::singleton(15, CRITICALITY_IGNORE), // id-Cause
 ]);
 
 pub(super) const PDU_SESSION_RESOURCE_RELEASE_RESPONSE: IeProfile = IeProfile::new(&[
@@ -422,6 +500,45 @@ pub(super) const NG_SETUP_FAILURE: IeProfile = IeProfile::new(&[
     IeRule::singleton(19, CRITICALITY_IGNORE),  // id-CriticalityDiagnostics
 ]);
 
+// Nested transfer metadata is the independently compiled TS 38.413 V18.10.0
+// NGAP-IEs object set, recorded with its oracle. Optional known fields outside
+// the admitted resource subset remain recognized, so they fail explicitly.
+pub(super) const PDU_SESSION_RESOURCE_SETUP_REQUEST_TRANSFER: IeProfile = IeProfile::new(&[
+    IeRule::singleton(130, CRITICALITY_REJECT), // PDUSessionAggregateMaximumBitRate
+    IeRule::singleton(139, CRITICALITY_REJECT), // UPTransportLayerInformation
+    IeRule::singleton(126, CRITICALITY_REJECT), // UPTransportLayerInformationList
+    IeRule::singleton(127, CRITICALITY_REJECT), // DataForwardingNotPossible
+    IeRule::singleton(134, CRITICALITY_REJECT), // PDUSessionType
+    IeRule::singleton(138, CRITICALITY_REJECT), // SecurityIndication
+    IeRule::singleton(129, CRITICALITY_REJECT), // NetworkInstance
+    IeRule::singleton(136, CRITICALITY_REJECT), // QosFlowSetupRequestList
+    IeRule::singleton(166, CRITICALITY_IGNORE), // CommonNetworkInstance
+    IeRule::singleton(22, CRITICALITY_IGNORE),  // DirectForwardingPathAvailability
+    IeRule::singleton(195, CRITICALITY_IGNORE), // UPTransportLayerInformation
+    IeRule::singleton(186, CRITICALITY_IGNORE), // UPTransportLayerInformationList
+    IeRule::singleton(190, CRITICALITY_IGNORE), // CommonNetworkInstance
+    IeRule::singleton(197, CRITICALITY_IGNORE), // RedundantPDUSessionInformation
+    IeRule::singleton(318, CRITICALITY_IGNORE), // MBSSessionSetupRequestList
+    IeRule::singleton(394, CRITICALITY_IGNORE), // TLContainer
+]);
+
+pub(super) const PDU_SESSION_RESOURCE_MODIFY_REQUEST_TRANSFER: IeProfile = IeProfile::new(&[
+    IeRule::singleton(130, CRITICALITY_REJECT), // PDUSessionAggregateMaximumBitRate
+    IeRule::singleton(140, CRITICALITY_REJECT), // UL-NGU-UP-TNLModifyList
+    IeRule::singleton(129, CRITICALITY_REJECT), // NetworkInstance
+    IeRule::singleton(135, CRITICALITY_REJECT), // QosFlowAddOrModifyRequestList
+    IeRule::singleton(137, CRITICALITY_REJECT), // QosFlowListWithCause
+    IeRule::singleton(126, CRITICALITY_REJECT), // AdditionalUL-NGU-UP-TNLInformation
+    IeRule::singleton(166, CRITICALITY_IGNORE), // CommonNetworkInstance
+    IeRule::singleton(186, CRITICALITY_IGNORE), // AdditionalRedundantUL-NGU-UP-TNLInformation
+    IeRule::singleton(190, CRITICALITY_IGNORE), // RedundantCommonNetworkInstance
+    IeRule::singleton(195, CRITICALITY_IGNORE), // RedundantUL-NGU-UP-TNLInformation
+    IeRule::singleton(138, CRITICALITY_IGNORE), // SecurityIndication (differs from Setup)
+    IeRule::singleton(319, CRITICALITY_IGNORE), // MBSSessionSetuporModifyRequestList
+    IeRule::singleton(317, CRITICALITY_IGNORE), // MBSSessionToReleaseList
+    IeRule::singleton(435, CRITICALITY_IGNORE), // UserPlaneFailureIndication
+]);
+
 #[cfg(test)]
 mod tests {
     #![allow(clippy::unwrap_used)]
@@ -486,6 +603,8 @@ mod tests {
     #[test]
     fn every_production_profile_has_unique_singleton_ids() {
         let profiles = [
+            PDU_SESSION_RESOURCE_SETUP_REQUEST_TRANSFER,
+            PDU_SESSION_RESOURCE_MODIFY_REQUEST_TRANSFER,
             PDU_SESSION_RESOURCE_SETUP_REQUEST,
             PDU_SESSION_RESOURCE_SETUP_RESPONSE,
             PDU_SESSION_RESOURCE_RELEASE_COMMAND,
@@ -499,6 +618,14 @@ mod tests {
             INITIAL_UE_MESSAGE,
             DOWNLINK_NAS_TRANSPORT,
             UPLINK_NAS_TRANSPORT,
+            PDU_SESSION_RESOURCE_NOTIFY,
+            PDU_SESSION_RESOURCE_MODIFY_REQUEST,
+            PDU_SESSION_RESOURCE_MODIFY_RESPONSE,
+            NG_RESET,
+            NG_RESET_ACKNOWLEDGE,
+            ERROR_INDICATION,
+            NAS_NON_DELIVERY_INDICATION,
+            UE_CONTEXT_RELEASE_REQUEST,
             NG_SETUP_REQUEST,
             NG_SETUP_RESPONSE,
             NG_SETUP_FAILURE,

@@ -1,0 +1,383 @@
+{
+  "source_sha256": "21617ad6dd826e05a0e8356ef96f44199cf4c7bc1be65e6b915e9135e10b59e2",
+  "reference_tools": {
+    "pycrate": "0.8.1",
+    "pypdf": "6.1.0"
+  },
+  "cases": [
+    {
+      "name": "base-InitialUEMessage",
+      "message": "InitialUEMessage",
+      "reference_error": null,
+      "wire_hex": "000f403a00000500550005c01020304000260005047e0064140079001590f8c00002011194000000d540070000f110000001005a40011800ae400300f110",
+      "wire_sha256": "3fed009b2145692ce09cef73c13b64db87a7ecd28af942d875043c7a322dd1f3",
+      "construct": true
+    },
+    {
+      "name": "missing-InitialUEMessage-85",
+      "message": "InitialUEMessage",
+      "reference_error": "missing-mandatory-ie",
+      "wire_hex": "000f403100000400260005047e0064140079001590f8c00002011194000000d540070000f110000001005a40011800ae400300f110",
+      "wire_sha256": "9ad5cd06e6a26f3606cb7cce1961a122111d39c3714a07df45db2aff905c9cbb",
+      "missing_id": 85
+    },
+    {
+      "name": "missing-InitialUEMessage-38",
+      "message": "InitialUEMessage",
+      "reference_error": "missing-mandatory-ie",
+      "wire_hex": "000f403100000400550005c0102030400079001590f8c00002011194000000d540070000f110000001005a40011800ae400300f110",
+      "wire_sha256": "3aa3dd311b47b54aa2c269b1bc081f0ff37c872cf3f737a9d731389e1b8ba298",
+      "missing_id": 38
+    },
+    {
+      "name": "missing-InitialUEMessage-121",
+      "message": "InitialUEMessage",
+      "reference_error": "missing-mandatory-ie",
+      "wire_hex": "000f402100000400550005c01020304000260005047e006414005a40011800ae400300f110",
+      "wire_sha256": "ae54e4e4977f56741e43cef407df74c58b8d8596d161d30206ab8b994e568af5",
+      "missing_id": 121
+    },
+    {
+      "name": "missing-InitialUEMessage-90",
+      "message": "InitialUEMessage",
+      "reference_error": "missing-mandatory-ie",
+      "wire_hex": "000f403500000400550005c01020304000260005047e0064140079001590f8c00002011194000000d540070000f11000000100ae400300f110",
+      "wire_sha256": "4dfceabf19631673f0d23a25ef5f2c60c586e11b84642f42247e0932f470231d",
+      "missing_id": 90
+    },
+    {
+      "name": "duplicate-InitialUEMessage",
+      "message": "InitialUEMessage",
+      "reference_error": "duplicate-ie",
+      "wire_hex": "000f404000000600550002002200550005c01020304000260005047e0064140079001590f8c00002011194000000d540070000f110000001005a40011800ae400300f110",
+      "wire_sha256": "fc6ff0df77bdcc1e6960193a13191c5949d97b8b41334aa6acbc6f488782bcb7",
+      "duplicate_id": 85
+    },
+    {
+      "name": "unknown-InitialUEMessage-ignore",
+      "message": "InitialUEMessage",
+      "reference_error": null,
+      "wire_hex": "000f404000000600550005c01020304000260005047e0064140079001590f8c00002011194000000d540070000f110000001005a40011800ae400300f110fffa4002abcd",
+      "wire_sha256": "5be62a954d0b51271bc76fffd806917055e59351f7e15db0322c188e01b4f1a1",
+      "unknown_criticality": "ignore"
+    },
+    {
+      "name": "unknown-InitialUEMessage-notify",
+      "message": "InitialUEMessage",
+      "reference_error": null,
+      "wire_hex": "000f404000000600550005c01020304000260005047e0064140079001590f8c00002011194000000d540070000f110000001005a40011800ae400300f110fffa8002abcd",
+      "wire_sha256": "cdac6670bfa6fc493f261f94b6d695ebe89a7d9bc692cd4231d8a5848f6b4516",
+      "unknown_criticality": "notify"
+    },
+    {
+      "name": "unknown-InitialUEMessage-reject",
+      "message": "InitialUEMessage",
+      "reference_error": "unknown-critical-ie",
+      "wire_hex": "000f404000000600550005c01020304000260005047e0064140079001590f8c00002011194000000d540070000f110000001005a40011800ae400300f110fffa0002abcd",
+      "wire_sha256": "6b64ac3de8eb57bfc29cc56c6862da06dccc794bb758a93ce566a8bf28c7c7f0",
+      "unknown_criticality": "reject"
+    },
+    {
+      "name": "base-DownlinkNASTransport",
+      "message": "DownlinkNASTransport",
+      "reference_error": null,
+      "wire_hex": "0004401f000003000a000680010203040500550005c01020304000260005047e006414",
+      "wire_sha256": "c05043624e52ad98fa1e14574f1d354d8aeec33d725131a4d03ae78c5e962ad1",
+      "construct": true
+    },
+    {
+      "name": "missing-DownlinkNASTransport-10",
+      "message": "DownlinkNASTransport",
+      "reference_error": "missing-mandatory-ie",
+      "wire_hex": "0004401500000200550005c01020304000260005047e006414",
+      "wire_sha256": "c7b7f0415ca16a2d72af366f22a406a369a6b18ed61c585f21013c1b69cdf08d",
+      "missing_id": 10
+    },
+    {
+      "name": "missing-DownlinkNASTransport-85",
+      "message": "DownlinkNASTransport",
+      "reference_error": "missing-mandatory-ie",
+      "wire_hex": "00044016000002000a000680010203040500260005047e006414",
+      "wire_sha256": "eaf9545506463fcd4587c877a1f48e59fdb140d9b949893c7db5aaf0b054c89e",
+      "missing_id": 85
+    },
+    {
+      "name": "missing-DownlinkNASTransport-38",
+      "message": "DownlinkNASTransport",
+      "reference_error": "missing-mandatory-ie",
+      "wire_hex": "00044016000002000a000680010203040500550005c010203040",
+      "wire_sha256": "58320494c8e18a783463fd5f33b08331f5bc79f979300641746d1a40273aefc5",
+      "missing_id": 38
+    },
+    {
+      "name": "duplicate-DownlinkNASTransport",
+      "message": "DownlinkNASTransport",
+      "reference_error": "duplicate-ie",
+      "wire_hex": "00044025000004000a00020022000a000680010203040500550005c01020304000260005047e006414",
+      "wire_sha256": "2d41bc6401ee07ac155b79f4e7988a0c4537a810e9809f5f1b34950fa8363057",
+      "duplicate_id": 10
+    },
+    {
+      "name": "unknown-DownlinkNASTransport-ignore",
+      "message": "DownlinkNASTransport",
+      "reference_error": null,
+      "wire_hex": "00044025000004000a000680010203040500550005c01020304000260005047e006414fffa4002abcd",
+      "wire_sha256": "a59575dcc3bda58cce9a4fdc52e076e9f83c7c7c0c1ee4ff4a996a4e753100a9",
+      "unknown_criticality": "ignore"
+    },
+    {
+      "name": "unknown-DownlinkNASTransport-notify",
+      "message": "DownlinkNASTransport",
+      "reference_error": null,
+      "wire_hex": "00044025000004000a000680010203040500550005c01020304000260005047e006414fffa8002abcd",
+      "wire_sha256": "e983a6f12b6028eba95aa1dbf0aba4d49565479511ed4c4982b3dc70ff9c4181",
+      "unknown_criticality": "notify"
+    },
+    {
+      "name": "unknown-DownlinkNASTransport-reject",
+      "message": "DownlinkNASTransport",
+      "reference_error": "unknown-critical-ie",
+      "wire_hex": "00044025000004000a000680010203040500550005c01020304000260005047e006414fffa0002abcd",
+      "wire_sha256": "a786026e2a2bf9a39b79558a255ef9369b7c37a08dbb0ad02b9027358e1f58b1",
+      "unknown_criticality": "reject"
+    },
+    {
+      "name": "base-UplinkNASTransport",
+      "message": "UplinkNASTransport",
+      "reference_error": null,
+      "wire_hex": "002e4038000004000a000680010203040500550005c01020304000260005047e0064140079401590f8c00002011194000000d540070000f110000001",
+      "wire_sha256": "0a904b9d350921061e0d8412562b7cdb38a9b8d083d491a290c248bc7a2a1cad",
+      "construct": true
+    },
+    {
+      "name": "missing-UplinkNASTransport-10",
+      "message": "UplinkNASTransport",
+      "reference_error": "missing-mandatory-ie",
+      "wire_hex": "002e402e00000300550005c01020304000260005047e0064140079401590f8c00002011194000000d540070000f110000001",
+      "wire_sha256": "dfcc04e65fc53397ecfd77415470fc273566bccd390767dc8b1a4645add01f1d",
+      "missing_id": 10
+    },
+    {
+      "name": "missing-UplinkNASTransport-85",
+      "message": "UplinkNASTransport",
+      "reference_error": "missing-mandatory-ie",
+      "wire_hex": "002e402f000003000a000680010203040500260005047e0064140079401590f8c00002011194000000d540070000f110000001",
+      "wire_sha256": "a820b08ddfcb83bd6825be4ea8c67353afa5c4f0af93ea9570ed9125a4c4f7a0",
+      "missing_id": 85
+    },
+    {
+      "name": "missing-UplinkNASTransport-38",
+      "message": "UplinkNASTransport",
+      "reference_error": "missing-mandatory-ie",
+      "wire_hex": "002e402f000003000a000680010203040500550005c0102030400079401590f8c00002011194000000d540070000f110000001",
+      "wire_sha256": "b351676f4e08f95f4c7002b7720847feffb3d2c5b246bafe3f1b4a221d72064a",
+      "missing_id": 38
+    },
+    {
+      "name": "missing-UplinkNASTransport-121",
+      "message": "UplinkNASTransport",
+      "reference_error": "missing-mandatory-ie",
+      "wire_hex": "002e401f000003000a000680010203040500550005c01020304000260005047e006414",
+      "wire_sha256": "d978917dc40e3ff96d95ea27f16ff3cb2db22570c412e7959640d0534b77dc06",
+      "missing_id": 121
+    },
+    {
+      "name": "duplicate-UplinkNASTransport",
+      "message": "UplinkNASTransport",
+      "reference_error": "duplicate-ie",
+      "wire_hex": "002e403e000005000a00020022000a000680010203040500550005c01020304000260005047e0064140079401590f8c00002011194000000d540070000f110000001",
+      "wire_sha256": "97d2ae3dcd0509026e31b7f9124adb0dcf52a211c73fabae2c2429a847bbda1a",
+      "duplicate_id": 10
+    },
+    {
+      "name": "unknown-UplinkNASTransport-ignore",
+      "message": "UplinkNASTransport",
+      "reference_error": null,
+      "wire_hex": "002e403e000005000a000680010203040500550005c01020304000260005047e0064140079401590f8c00002011194000000d540070000f110000001fffa4002abcd",
+      "wire_sha256": "61ec0e96563fdb7bde707d3f9a98aab75298545ab2b4223979f84a68962eb61c",
+      "unknown_criticality": "ignore"
+    },
+    {
+      "name": "unknown-UplinkNASTransport-notify",
+      "message": "UplinkNASTransport",
+      "reference_error": null,
+      "wire_hex": "002e403e000005000a000680010203040500550005c01020304000260005047e0064140079401590f8c00002011194000000d540070000f110000001fffa8002abcd",
+      "wire_sha256": "9dc1bbf99a6dc900c7ab3907b553e9855372857a3361adbb43983f0fab1ed99a",
+      "unknown_criticality": "notify"
+    },
+    {
+      "name": "unknown-UplinkNASTransport-reject",
+      "message": "UplinkNASTransport",
+      "reference_error": "unknown-critical-ie",
+      "wire_hex": "002e403e000005000a000680010203040500550005c01020304000260005047e0064140079401590f8c00002011194000000d540070000f110000001fffa0002abcd",
+      "wire_sha256": "5deccbf7b3ad5546633488dc3875fe11009439751e4d01dc7f0e0c04cff969d7",
+      "unknown_criticality": "reject"
+    },
+    {
+      "name": "cause-0",
+      "message": "InitialUEMessage",
+      "reference_error": null,
+      "wire_hex": "000f403a00000500550005c01020304000260005047e0064140079001590f8c00002011194000000d540070000f110000001005a40010000ae400300f110",
+      "wire_sha256": "980b1bade9068f4ab2cf77583a1a57f604ca7dd13f6fc6a1db063c7ffa283961",
+      "construct": true,
+      "cause": "emergency"
+    },
+    {
+      "name": "cause-1",
+      "message": "InitialUEMessage",
+      "reference_error": null,
+      "wire_hex": "000f403a00000500550005c01020304000260005047e0064140079001590f8c00002011194000000d540070000f110000001005a40010800ae400300f110",
+      "wire_sha256": "64e69e294063f855108d6973d45889692cf4f73014a24a6449b23d0a980f298d",
+      "construct": true,
+      "cause": "highPriorityAccess"
+    },
+    {
+      "name": "cause-2",
+      "message": "InitialUEMessage",
+      "reference_error": null,
+      "wire_hex": "000f403a00000500550005c01020304000260005047e0064140079001590f8c00002011194000000d540070000f110000001005a40011000ae400300f110",
+      "wire_sha256": "2ac647d88024c12aee4014d43a322857b3b7e0cf5a5ef93f73a8c9f18fee88af",
+      "construct": true,
+      "cause": "mt-Access"
+    },
+    {
+      "name": "cause-3",
+      "message": "InitialUEMessage",
+      "reference_error": null,
+      "wire_hex": "000f403a00000500550005c01020304000260005047e0064140079001590f8c00002011194000000d540070000f110000001005a40011800ae400300f110",
+      "wire_sha256": "3fed009b2145692ce09cef73c13b64db87a7ecd28af942d875043c7a322dd1f3",
+      "construct": true,
+      "cause": "mo-Signalling"
+    },
+    {
+      "name": "cause-4",
+      "message": "InitialUEMessage",
+      "reference_error": null,
+      "wire_hex": "000f403a00000500550005c01020304000260005047e0064140079001590f8c00002011194000000d540070000f110000001005a40012000ae400300f110",
+      "wire_sha256": "a44caff139092cbe08c4c98a97059085b518d18927276aaef59eb5c28c526145",
+      "construct": true,
+      "cause": "mo-Data"
+    },
+    {
+      "name": "cause-5",
+      "message": "InitialUEMessage",
+      "reference_error": null,
+      "wire_hex": "000f403a00000500550005c01020304000260005047e0064140079001590f8c00002011194000000d540070000f110000001005a40012800ae400300f110",
+      "wire_sha256": "76a4bdff77073dfaf2cb39cd39427074c128461965235095e52a12b669233216",
+      "construct": true,
+      "cause": "mo-VoiceCall"
+    },
+    {
+      "name": "cause-6",
+      "message": "InitialUEMessage",
+      "reference_error": null,
+      "wire_hex": "000f403a00000500550005c01020304000260005047e0064140079001590f8c00002011194000000d540070000f110000001005a40013000ae400300f110",
+      "wire_sha256": "91700621e56aca3ce1d3f6dd7d2ed8b700e338ff50671d43e5bd51beb04f1cf6",
+      "construct": true,
+      "cause": "mo-VideoCall"
+    },
+    {
+      "name": "cause-7",
+      "message": "InitialUEMessage",
+      "reference_error": null,
+      "wire_hex": "000f403a00000500550005c01020304000260005047e0064140079001590f8c00002011194000000d540070000f110000001005a40013800ae400300f110",
+      "wire_sha256": "d11e36c7b9d4fb6264d04ec2e08198bda83b39a65ae7397aaec58a564aee3292",
+      "construct": true,
+      "cause": "mo-SMS"
+    },
+    {
+      "name": "cause-8",
+      "message": "InitialUEMessage",
+      "reference_error": null,
+      "wire_hex": "000f403a00000500550005c01020304000260005047e0064140079001590f8c00002011194000000d540070000f110000001005a40014000ae400300f110",
+      "wire_sha256": "6ec59e9cc8eb06b9295c1278b0af06b3c3f72e47ec8e9e9ab143f4d34d0dc55f",
+      "construct": true,
+      "cause": "mps-PriorityAccess"
+    },
+    {
+      "name": "cause-9",
+      "message": "InitialUEMessage",
+      "reference_error": null,
+      "wire_hex": "000f403a00000500550005c01020304000260005047e0064140079001590f8c00002011194000000d540070000f110000001005a40014800ae400300f110",
+      "wire_sha256": "b4c5ad62dff4bea491d0ed44ea91bed3471ceb97a4221f0e061a0a29a54049f2",
+      "construct": true,
+      "cause": "mcs-PriorityAccess"
+    },
+    {
+      "name": "cause-10",
+      "message": "InitialUEMessage",
+      "reference_error": null,
+      "wire_hex": "000f403a00000500550005c01020304000260005047e0064140079001590f8c00002011194000000d540070000f110000001005a40018000ae400300f110",
+      "wire_sha256": "b8fcc4045539ef18d73fa792ba4ba5fd1d7ff8e7289d847b63999ae3a0f9a288",
+      "construct": true,
+      "cause": "notAvailable"
+    },
+    {
+      "name": "cause-11",
+      "message": "InitialUEMessage",
+      "reference_error": null,
+      "wire_hex": "000f403a00000500550005c01020304000260005047e0064140079001590f8c00002011194000000d540070000f110000001005a40018100ae400300f110",
+      "wire_sha256": "61180753e8747fe3003b36cf3f713c0b6b5fc15dece2095474d09d57580ce204",
+      "construct": true,
+      "cause": "mo-ExceptionData"
+    },
+    {
+      "name": "context-requested",
+      "message": "InitialUEMessage",
+      "reference_error": null,
+      "wire_hex": "000f403f00000600550005c01020304000260005047e0064140079001590f8c00002011194000000d540070000f110000001005a40011800ae400300f1100070400100",
+      "wire_sha256": "ca2c46e803f80d457856b3cac090bed94f5e42b78c40b41c1f260196beb801ef",
+      "construct": true,
+      "context_requested": true
+    },
+    {
+      "name": "selected-plmn-absent",
+      "message": "InitialUEMessage",
+      "reference_error": null,
+      "wire_hex": "000f403300000400550005c01020304000260005047e0064140079001590f8c00002011194000000d540070000f110000001005a400118",
+      "wire_sha256": "795aa6a6096b8982f00c05a11d30bd08ca4b1d07bc99c282b5febb0319b30425",
+      "construct": true,
+      "selected_plmn": false
+    },
+    {
+      "name": "ambr-0",
+      "message": "DownlinkNASTransport",
+      "reference_error": null,
+      "wire_hex": "00044027000004000a000680010203040500550005c01020304000260005047e006414006e400400000000",
+      "wire_sha256": "d06d9beb9c4259e5b05080a441953994e10993e0659b770554cced5c853164d4",
+      "construct": true,
+      "downlink": 0,
+      "uplink": 0
+    },
+    {
+      "name": "ambr-1",
+      "message": "DownlinkNASTransport",
+      "reference_error": null,
+      "wire_hex": "00044027000004000a000680010203040500550005c01020304000260005047e006414006e400400010002",
+      "wire_sha256": "fa2246f92c237b9da0ba58d3b95f92365ee5d8d22031a8a7d3e993a025edae46",
+      "construct": true,
+      "downlink": 1,
+      "uplink": 2
+    },
+    {
+      "name": "ambr-2",
+      "message": "DownlinkNASTransport",
+      "reference_error": null,
+      "wire_hex": "0004402d000004000a000680010203040500550005c01020304000260005047e006414006e400a0c3b9aca00301dcd6500",
+      "wire_sha256": "204fb3234f83ceafc45b96d50e840ee696278e72277647c2c3e17530d495f28a",
+      "construct": true,
+      "downlink": 1000000000,
+      "uplink": 500000000
+    },
+    {
+      "name": "ambr-3",
+      "message": "DownlinkNASTransport",
+      "reference_error": null,
+      "wire_hex": "00044031000004000a000680010203040500550005c01020304000260005047e006414006e400e1403a3529440005003a352944000",
+      "wire_sha256": "8929299d4b5b904806cf426384728a92275b84dbe7be758a0683e7aca795fca7",
+      "construct": true,
+      "downlink": 4000000000000,
+      "uplink": 4000000000000
+    }
+  ]
+}

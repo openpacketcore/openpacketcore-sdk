@@ -184,6 +184,8 @@ struct CountingModule {
     malformed_output: Arc<AtomicU8>,
     counts: Arc<OperationCounts>,
     provider_diagnostic: &'static str,
+    protocol_msk_uses: AtomicUsize,
+    panic_protocol_msk: AtomicBool,
 }
 
 impl CountingModule {
@@ -213,6 +215,8 @@ impl CountingModule {
             malformed_output: Arc::new(AtomicU8::new(MalformedOutput::None as u8)),
             counts: Arc::new(OperationCounts::default()),
             provider_diagnostic: HOSTILE_PROVIDER_DIAGNOSTIC,
+            protocol_msk_uses: AtomicUsize::new(0),
+            panic_protocol_msk: AtomicBool::new(false),
         }
     }
 
@@ -347,6 +351,13 @@ impl IkePrfOperations for CountingModule {
         data: &[u8],
     ) -> Result<Zeroizing<Vec<u8>>, CryptoOperationError> {
         self.counts.prf.fetch_add(1, Ordering::SeqCst);
+        if key == [0x5a; 32] {
+            self.protocol_msk_uses.fetch_add(1, Ordering::SeqCst);
+            assert!(
+                !self.panic_protocol_msk.swap(false, Ordering::SeqCst),
+                "synthetic protocol-key provider panic"
+            );
+        }
         let mut result = self.operations.prf(algorithm, key, data);
         if self.malformed_output(MalformedOutput::Prf) {
             if let Ok(output) = &mut result {
@@ -711,6 +722,206 @@ fn policy(requirements: &Ikev2CryptoRequirements) -> ProviderPolicy {
         .require(CryptoCapability::SealedKeyStorage)
 }
 
+fn protocol_key_uses_only_admitted_prf(
+    module: &CountingModule,
+    profile: Ikev2SaInitCryptoProfile,
+    material: &opc_proto_ikev2::Ikev2SaInitKeyMaterial,
+) {
+    use opc_proto_ikev2::protocol_key::{
+        Ikev2ProtocolKeyAssociation, Ikev2ProtocolKeyError, Ikev2ProtocolKeyHandle,
+        Ikev2ProtocolKeyOperation, Ikev2ProtocolKeyPurpose,
+    };
+    use std::num::NonZeroU64;
+    let id = |v| NonZeroU64::new(v).expect("nonzero synthetic identifier");
+    let signed = |peer| Ikev2IkeAuthSignedOctets {
+        peer,
+        ike_sa_init_message: &[0x11; 28],
+        peer_nonce: &[0x22; 32],
+        identity_payload_body: &[1, 0, 0, 0, 192, 0, 2, 1],
+    };
+    let consume = |key: &Ikev2ProtocolKeyHandle, op: &Ikev2ProtocolKeyOperation| {
+        key.consume_ike_auth(
+            op,
+            material,
+            signed(Ikev2IkeAuthPeer::Initiator),
+            signed(Ikev2IkeAuthPeer::Responder),
+            136,
+        )
+    };
+    let fresh = || {
+        let owner = Ikev2ProtocolKeyAssociation::new(id(1));
+        let operation = owner.begin_ike_auth(id(1), id(1), profile).unwrap();
+        let before = module.counts.snapshot();
+        let key = operation
+            .import(
+                Ikev2ProtocolKeyPurpose::N3iwfMsk,
+                Zeroizing::new(vec![0x5a; 32]),
+            )
+            .unwrap();
+        assert_eq!(
+            module.counts.snapshot(),
+            before,
+            "import is not crypto execution"
+        );
+        (owner, operation, key)
+    };
+    let (_owner, operation, key) = fresh();
+    let (_other, foreign, _other_key) = fresh();
+    let before = module.counts.snapshot();
+    let msk_before = module.protocol_msk_uses.load(Ordering::SeqCst);
+    assert_eq!(
+        consume(&key, &foreign).unwrap_err(),
+        Ikev2ProtocolKeyError::OperationMismatch
+    );
+    assert_eq!(module.counts.snapshot(), before);
+    let start = std::sync::Barrier::new(8);
+    let results = std::thread::scope(|scope| {
+        let workers = (0..8)
+            .map(|_| {
+                scope.spawn(|| {
+                    start.wait();
+                    consume(&key, &operation)
+                })
+            })
+            .collect::<Vec<_>>();
+        workers
+            .into_iter()
+            .map(|worker| worker.join().unwrap())
+            .collect::<Vec<_>>()
+    });
+    assert_eq!(results.iter().filter(|r| r.is_ok()).count(), 1);
+    assert_eq!(
+        results
+            .iter()
+            .filter(|r| matches!(r, Err(Ikev2ProtocolKeyError::Retired)))
+            .count(),
+        7
+    );
+    assert_eq!(module.counts.prf.load(Ordering::SeqCst), before[2] + 6);
+    assert_eq!(
+        module.protocol_msk_uses.load(Ordering::SeqCst),
+        msk_before + 2
+    );
+
+    for cause in 0..3 {
+        let (owner, operation, key) = fresh();
+        match cause {
+            0 => operation.cancel(),
+            1 => owner.release(),
+            2 => owner.replace_generation(id(1), id(2)).unwrap(),
+            _ => unreachable!(),
+        }
+        let before = module.counts.snapshot();
+        assert!(consume(&key, &operation).is_err());
+        assert_eq!(
+            module.counts.snapshot(),
+            before,
+            "retired authority dispatched crypto"
+        );
+    }
+    let all = module.capabilities();
+    let (_owner, op, key) = fresh();
+    let mut invalid_responder = signed(Ikev2IkeAuthPeer::Responder);
+    invalid_responder.identity_payload_body = &[0, 0, 0, 0, 1];
+    let before = module.counts.snapshot();
+    assert_eq!(
+        key.consume_ike_auth(
+            &op,
+            material,
+            signed(Ikev2IkeAuthPeer::Initiator),
+            invalid_responder,
+            136
+        )
+        .unwrap_err(),
+        Ikev2ProtocolKeyError::InvalidAuthInputs
+    );
+    assert_eq!(
+        module.counts.snapshot(),
+        before,
+        "invalid second direction used the first direction's key"
+    );
+    for failure in 0..7 {
+        let (_owner, operation, key) = fresh();
+        let before = module.counts.prf.load(Ordering::SeqCst);
+        let msk_before = module.protocol_msk_uses.load(Ordering::SeqCst);
+        match failure {
+            0 => module.set_serviceable(all.without(CryptoCapability::IkePrf)),
+            1 => module.set_serviceable(all.without(CryptoCapability::Zeroization)),
+            2 => module.set_advertised(all.without(CryptoCapability::IkePrf)),
+            3 => module.drift_validation.store(true, Ordering::SeqCst),
+            4 => module.reject_prf_support.store(true, Ordering::SeqCst),
+            5 => module.set_malformed_output(MalformedOutput::Prf),
+            6 => module.withdraw_signature_after_next_prf(),
+            _ => unreachable!(),
+        }
+        assert_eq!(
+            consume(&key, &operation).unwrap_err(),
+            Ikev2ProtocolKeyError::CryptoUnavailable
+        );
+        assert_eq!(
+            module.counts.prf.load(Ordering::SeqCst),
+            before + usize::from(failure >= 5)
+        );
+        assert_eq!(module.protocol_msk_uses.load(Ordering::SeqCst), msk_before);
+        module.set_serviceable(all);
+        module.set_advertised(all);
+        module.drift_validation.store(false, Ordering::SeqCst);
+        module.reject_prf_support.store(false, Ordering::SeqCst);
+        module.set_malformed_output(MalformedOutput::None);
+        let before = module.counts.snapshot();
+        assert_eq!(
+            consume(&key, &operation).unwrap_err(),
+            Ikev2ProtocolKeyError::Retired
+        );
+        assert_eq!(
+            module.counts.snapshot(),
+            before,
+            "failed consume retried crypto"
+        );
+    }
+    for failure in 0..3 {
+        let owner = Ikev2ProtocolKeyAssociation::new(id(1));
+        let operation = owner.begin_ike_auth(id(1), id(1), profile).unwrap();
+        let before = module.counts.snapshot();
+        let purpose = if failure == 0 {
+            Ikev2ProtocolKeyPurpose::Unsupported
+        } else {
+            Ikev2ProtocolKeyPurpose::N3iwfMsk
+        };
+        if failure == 2 {
+            module.set_serviceable(all.without(CryptoCapability::IkePrf));
+        }
+        let error = operation
+            .import(
+                purpose,
+                Zeroizing::new(vec![0x5a; if failure == 1 { 31 } else { 32 }]),
+            )
+            .unwrap_err();
+        assert_eq!(
+            error,
+            [
+                Ikev2ProtocolKeyError::UnsupportedPurpose,
+                Ikev2ProtocolKeyError::InvalidKeyLength,
+                Ikev2ProtocolKeyError::CryptoUnavailable
+            ][failure]
+        );
+        assert_eq!(module.counts.snapshot(), before);
+        module.set_serviceable(all);
+    }
+    let (_owner, operation, key) = fresh();
+    module.panic_protocol_msk.store(true, Ordering::SeqCst);
+    assert!(
+        std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| consume(&key, &operation)))
+            .is_err()
+    );
+    let before = module.counts.snapshot();
+    assert_eq!(
+        consume(&key, &operation).unwrap_err(),
+        Ikev2ProtocolKeyError::Unavailable
+    );
+    assert_eq!(module.counts.snapshot(), before);
+}
+
 #[test]
 fn child_sa_pfs_requirements_include_dh_and_entropy_capabilities() {
     let child_profile = opc_proto_ikev2::Ikev2ChildSaCryptoProfile::new_aead(
@@ -989,6 +1200,7 @@ fn one_admitted_module_handles_every_operation_and_withdrawal_never_falls_back()
         None,
     )
     .expect("PRF and PRF+ routed");
+    protocol_key_uses_only_admitted_prf(&module, profile, &material);
     let cleartext = [0_u8, 0, 0, 4];
     let body_len = ikev2_aes_cbc_protected_body_len(profile, cleartext.len())
         .expect("CBC protected body length");
