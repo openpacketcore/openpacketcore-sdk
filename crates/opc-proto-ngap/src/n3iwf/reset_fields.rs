@@ -292,7 +292,7 @@ fn read_integer(reader: &mut Reader<'_>, width: usize, maximum: usize) -> Result
     Ok(value)
 }
 
-fn read_diagnostic_header(
+pub(super) fn read_diagnostic_header(
     reader: &mut Reader<'_>,
 ) -> Result<(CriticalityDiagnostics, bool), DecodeError> {
     reader.flags(1)?;
@@ -338,7 +338,7 @@ fn read_diagnostic_header(
     ))
 }
 
-fn read_diagnostic_item(reader: &mut Reader<'_>) -> Result<DiagnosticItem, DecodeError> {
+pub(super) fn read_diagnostic_item(reader: &mut Reader<'_>) -> Result<DiagnosticItem, DecodeError> {
     reader.flags(2)?;
     let criticality = match reader.bits(2)? {
         0 => DiagnosticCriticality::Reject,
@@ -362,7 +362,7 @@ fn read_diagnostic_item(reader: &mut Reader<'_>) -> Result<DiagnosticItem, Decod
 
 // One layout pass measures without allocation; a second writes into an exact
 // zeroized buffer. Both passes execute the same bounded root field traversal.
-trait Sink {
+pub(super) trait Sink {
     fn bits(&mut self, value: u16, width: usize) -> Result<(), EncodeError>;
     fn align(&mut self);
 }
@@ -388,7 +388,7 @@ impl Sink for Measure {
         self.0 = self.0.div_ceil(8) * 8;
     }
 }
-fn encode_root(
+pub(super) fn encode_root(
     ctx: EncodeContext,
     write: impl Fn(&mut dyn Sink) -> Result<(), EncodeError>,
 ) -> Result<EncodedValue, EncodeError> {
@@ -445,7 +445,7 @@ fn write_integer(out: &mut dyn Sink, value: u64, width: usize) -> Result<(), Enc
     }
     Ok(())
 }
-fn write_diagnostics(
+pub(super) fn write_diagnostics(
     out: &mut dyn Sink,
     value: &CriticalityDiagnostics,
 ) -> Result<(), EncodeError> {

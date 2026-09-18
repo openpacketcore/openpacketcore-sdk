@@ -159,7 +159,11 @@ release causes into a bounded Modify Request Transfer. It preserves empty
 roots and absent AMBR, rejects cross-list QFI overlap, and applies the shared
 IE selection policies after complete physical preflight. Request/response
 correlation, conditional NAS forwarding and resource effects remain caller-owned.
-Modify response/failure transfers and complete procedure admission remain pending.
+`modify_results` supplies optional directional tunnel and unique/disjoint QFI
+reports, plus unsuccessful transfers with root Causes and response diagnostics.
+Empty response roots and absent versus empty diagnostics stay distinct. The
+caller checks conditional presence, request correspondence and resource effects.
+Complete Modify messages and procedure admission remain pending.
 
 `n3iwf::context_fields` supplies standalone `Guami` and `AllowedNssai` codecs
 and `SecurityAlgorithmMasks` construction. Allowed slices reuse `opc_types::Snssai`;

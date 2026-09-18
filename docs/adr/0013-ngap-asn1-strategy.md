@@ -461,3 +461,24 @@ response. Session correlation, conditional presence, NAS forwarding and resource
 effects belong to the caller. No enclosing PDU outcome, schema or dependency
 changes are introduced. Response/failure transfers and procedure admission
 still need independent qualification.
+
+
+## Modify result transfer amendment (2026-09)
+
+The independent 1,436-case oracle covers response and unsuccessful transfer
+roots, including optional response diagnostics. Probe 1,433 modeled roots:
+empty response passes both directions; QFI-only responses encode 773/773 and
+decode 0/773; tunnel responses encode 4/76 and decode 55/76. Cause-only failures
+pass all 64 in both directions; diagnostic failures encode 149/519 and decode
+284/519. Keep the generated no-tunnel response encoder, empty response decoder
+and Cause-only failure codec. Use bounded explicit layouts for the failed shapes,
+sharing internal transport, Cause and diagnostic helpers at their parent offsets.
+
+Whole-transfer preflight precedes list materialization; exact sizing precedes
+output allocation. Both unmodified reference encoders agree and structured
+values/classifications are checked. No schema or dependency changes are needed.
+Preserve empty responses and absent versus empty diagnostics. Reported QFI lists
+are unique/disjoint; diagnostic repetitions stay intact. Same-procedure response
+diagnostics reject procedure code/triggering outcome, and diagnostic item ignore
+criticality remains inapplicable. Request correlation, conditional NAS forwarding,
+resource effects and rollback belong to the caller; no NGAP PDU outcome is added.

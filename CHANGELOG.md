@@ -127,6 +127,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `Ikev2SaInitCryptoErrorCode` to `Ikev2ChildSaKeyMaterialDiagnostic`.
 
 ### Added
+- `opc-proto-ngap`: bounded Modify response and unsuccessful transfers with
+  optional directional endpoints, unique/disjoint QFI results and qualified
+  response diagnostics. Preserve empty roots and absent/empty diagnostics;
+  1,436 independent vectors qualify parent-offset framing. Request correlation,
+  conditional NAS forwarding and resource effects remain caller-owned (Refs #787).
 - `opc-proto-ngap`: bounded Modify Request Transfer with optional AMBR, tunnel
   modifications, add/modify QFIs and release causes, backed by 380 independent
   complete transfers. Preserve empty roots and absent parameters, apply shared

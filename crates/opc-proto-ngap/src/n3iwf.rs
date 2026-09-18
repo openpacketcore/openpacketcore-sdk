@@ -120,6 +120,8 @@ macro_rules! redacted {
 pub mod context_fields;
 /// Bounded optional Modify Request Transfer root fields.
 pub mod modify_request;
+/// Bounded Modify response and unsuccessful transfer root fields.
+pub mod modify_results;
 pub mod nas;
 pub mod release;
 /// NG Reset, Reset Acknowledge and Error Indication admission.
