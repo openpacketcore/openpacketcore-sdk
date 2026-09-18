@@ -1,0 +1,197 @@
+//! Management audit changes applied by the existing configuration state machine.
+
+use rusqlite::{params, Connection, OptionalExtension};
+use serde::{Deserialize, Serialize};
+use std::io;
+
+use super::ConfigMutationFailure;
+use crate::audit_authority::ledger::{
+    authenticate, verify, LedgerState, MAX_STATE_BYTES, STATE_DOMAIN,
+};
+use crate::audit_authority::{
+    AuditAuthorityError, AuditLedgerLimits, AuditOperationHandle, AuditOperationState, AuditToken,
+};
+use crate::{AuditKey, ConfigConsensusIdentity};
+
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub(crate) enum AuditCommand {
+    Initialize {
+        projection: AuditToken,
+        limits: AuditLedgerLimits,
+    },
+    Intent(AuditOperationHandle),
+    Reject(AuditOperationHandle),
+    Terminal(AuditOperationHandle),
+}
+
+impl std::fmt::Debug for AuditCommand {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("AuditCommand(<redacted>)")
+    }
+}
+
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct StoredLedger {
+    identity: ConfigConsensusIdentity,
+    ledger: Option<LedgerState>,
+}
+
+fn invalid() -> io::Error {
+    io::Error::new(
+        io::ErrorKind::InvalidData,
+        "invalid replicated management audit state",
+    )
+}
+
+/// A signed inactive row distinguishes initial provisioning from lost authority.
+pub(crate) fn initialize_sync(
+    conn: &Connection,
+    key: &AuditKey,
+    identity: ConfigConsensusIdentity,
+) -> io::Result<()> {
+    write_sync(conn, key, identity, None, true)
+}
+
+pub(crate) fn read_sync(
+    conn: &Connection,
+    key: &AuditKey,
+    identity: ConfigConsensusIdentity,
+) -> io::Result<Option<LedgerState>> {
+    let stored = read_verified_sync(conn, key)?;
+    if stored.identity != identity {
+        return Err(invalid());
+    }
+    Ok(stored.ledger)
+}
+
+fn read_verified_sync(conn: &Connection, key: &AuditKey) -> io::Result<StoredLedger> {
+    let (encoded, mac): (Vec<u8>,Vec<u8>) = conn.query_row(
+        "SELECT state_json, state_hmac FROM config_raft_management_audit WHERE singleton = 1 AND length(state_json) BETWEEN 1 AND 16777216 AND length(state_hmac) = 32",
+        [], |row| Ok((row.get(0)?,row.get(1)?)),
+    ).optional().map_err(|_| invalid())?.ok_or_else(invalid)?;
+    let mac: [u8; 32] = mac.try_into().map_err(|_| invalid())?;
+    let stored: StoredLedger = serde_json::from_slice(&encoded).map_err(|_| invalid())?;
+    verify(key, STATE_DOMAIN, &stored, &mac).map_err(|_| invalid())?;
+    if let Some(ledger) = &stored.ledger {
+        ledger
+            .validate(key, stored.identity)
+            .map_err(|_| invalid())?;
+    }
+    let identity = stored.identity;
+    let matches: bool = conn.query_row(
+        "SELECT EXISTS(SELECT 1 FROM config_raft_identity WHERE singleton=1 AND cluster_id=?1 AND configuration_id=?2 AND configuration_epoch=?3)",
+        params![identity.cluster_id().as_bytes().as_slice(),identity.configuration_id().as_bytes().as_slice(),identity.configuration_epoch().get() as i64],
+        |row| row.get(0),
+    ).map_err(|_| invalid())?;
+    if !matches {
+        return Err(invalid());
+    }
+    Ok(stored)
+}
+
+pub(crate) fn validate_sync(conn: &Connection, key: &AuditKey) -> io::Result<()> {
+    read_verified_sync(conn, key).map(|_| ())
+}
+
+pub(crate) fn write_sync(
+    conn: &Connection,
+    key: &AuditKey,
+    identity: ConfigConsensusIdentity,
+    ledger: Option<LedgerState>,
+    initialize: bool,
+) -> io::Result<()> {
+    let stored = StoredLedger { identity, ledger };
+    let encoded = serde_json::to_vec(&stored).map_err(|_| invalid())?;
+    if encoded.len() > MAX_STATE_BYTES {
+        return Err(invalid());
+    }
+    let mac = authenticate(key, STATE_DOMAIN, &stored).map_err(|_| invalid())?;
+    let statement = if initialize {
+        "INSERT INTO config_raft_management_audit(singleton,state_json,state_hmac) VALUES(1,?1,?2)"
+    } else {
+        "UPDATE config_raft_management_audit SET state_json=?1,state_hmac=?2 WHERE singleton=1"
+    };
+    if conn
+        .execute(statement, params![encoded, mac.as_slice()])
+        .map_err(|_| invalid())?
+        != 1
+    {
+        return Err(invalid());
+    }
+    Ok(())
+}
+
+pub(crate) fn apply_sync(
+    conn: &Connection,
+    key: &AuditKey,
+    identity: ConfigConsensusIdentity,
+    command: &AuditCommand,
+    now: i64,
+) -> io::Result<Result<(), ConfigMutationFailure>> {
+    let mut ledger = read_sync(conn, key, identity)?;
+    let result = match command {
+        AuditCommand::Initialize { projection, limits } => match &ledger {
+            Some(current) if current.projection == *projection && current.limits == *limits => {
+                Ok(())
+            }
+            Some(_) => Err(AuditAuthorityError::BindingMismatch),
+            None => {
+                let candidate = LedgerState::new(identity, *projection, *limits);
+                candidate
+                    .validate(key, identity)
+                    .map(|()| ledger = Some(candidate))
+            }
+        },
+        command => match ledger.as_mut() {
+            None => Err(AuditAuthorityError::Unavailable),
+            Some(ledger) => match command {
+                AuditCommand::Intent(handle) => ledger.admit(key, handle, now),
+                AuditCommand::Reject(handle) => {
+                    ledger.resolve(key, handle, AuditOperationState::Rejected)
+                }
+                AuditCommand::Terminal(handle) => ledger.acknowledge_terminal(key, handle),
+                AuditCommand::Initialize { .. } => Err(AuditAuthorityError::InvalidInput),
+            },
+        },
+    };
+    if let Err(error) = result {
+        return Ok(Err(match error {
+            AuditAuthorityError::Full => ConfigMutationFailure::HistoryFull,
+            AuditAuthorityError::BindingMismatch | AuditAuthorityError::Expired => {
+                ConfigMutationFailure::Conflict
+            }
+            _ => ConfigMutationFailure::InvalidInput,
+        }));
+    }
+    write_sync(conn, key, identity, ledger, false)?;
+    Ok(Ok(()))
+}
+
+/// Closed public mapping, with no backend or operation identity.
+pub(crate) fn map_failure(failure: ConfigMutationFailure) -> AuditAuthorityError {
+    match failure {
+        ConfigMutationFailure::HistoryFull => AuditAuthorityError::Full,
+        ConfigMutationFailure::Conflict
+        | ConfigMutationFailure::RequestIdCollision
+        | ConfigMutationFailure::HistoryProtected => AuditAuthorityError::BindingMismatch,
+        ConfigMutationFailure::NotFound | ConfigMutationFailure::InvalidInput => {
+            AuditAuthorityError::InvalidInput
+        }
+    }
+}
+
+/// Configuration retention cannot erase a still-unresolved audit reference.
+pub(crate) fn protects_config_prefix(
+    conn: &Connection,
+    key: &AuditKey,
+    retain_from: u64,
+) -> io::Result<bool> {
+    let stored = read_verified_sync(conn, key)?;
+    Ok(stored.ledger.is_some_and(|ledger| ledger.operations.iter().any(|op| {
+        if op.terminal_recorded { return false; }
+        let base = op.handle.body.binding.base_version;
+        (base > 0 && base < retain_from) || matches!(op.state, AuditOperationState::Committed { version } if version < retain_from)
+    })))
+}

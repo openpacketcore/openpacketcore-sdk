@@ -122,14 +122,17 @@ and snapshot lineage. The removed custom Raft implementation, majority config
 wrapper, TCP peer/server, and standalone consensus-node binary are not
 alternative authority paths.
 
-Config command and config-specific RPC revision 4 add explicit acknowledged
-application-history retention. Revisions 1 through 3 retain their original
-command semantics. Configuration storage and snapshot representation 2 carry
-the authenticated history boundary. Representation-1 files are refused; a
-coordinated binary restart alone is not a state conversion. See
-[ADR 0023](../../docs/adr/0023-bounded-configuration-history.md) for the exact
-bounds, acknowledgement obligation, protected references, replay and recovery
-contract, and representation cutover limitation.
+Config command and config-specific RPC revision 5 add the replicated management
+ledger and authenticated operation recovery. Revisions 1 through 4 retain their
+original command semantics, including revision 4's acknowledged application
+history retention. Configuration storage and snapshot representation 3 carry
+both authenticated authorities. Representation-1 and representation-2 files are
+refused; a coordinated binary restart alone is not a state conversion. See
+[the management-audit contract](../../docs/replicated-management-audit.md) for
+admission, atomic results, privacy, bounded recovery and the remaining
+integration/key/export/checkpoint boundaries, and
+[ADR 0023](../../docs/adr/0023-bounded-configuration-history.md) for the existing
+configuration-history bounds and protected references.
 
 Creating the `config_raft_identity` table claims the database for Openraft in
 the same immediate SQLite transaction that checks or imports legacy state.

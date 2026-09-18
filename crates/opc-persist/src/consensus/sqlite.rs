@@ -63,6 +63,11 @@ CREATE TABLE config_raft_identity (
     audit_key_fingerprint BLOB NOT NULL CHECK (length(audit_key_fingerprint) = 32),
     schema_manifest_digest BLOB NOT NULL CHECK (length(schema_manifest_digest) = 32)
 );
+CREATE TABLE config_raft_management_audit (
+    singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
+    state_json BLOB NOT NULL CHECK (length(state_json) BETWEEN 1 AND 16777216),
+    state_hmac BLOB NOT NULL CHECK (length(state_hmac) = 32)
+);
 CREATE TABLE config_raft_history_retention (
     singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
     state_json BLOB NOT NULL CHECK (length(state_json) BETWEEN 1 AND 4096),
@@ -262,6 +267,7 @@ const AUTHORITY_TABLES: &[&str] = &[
 
 const RAFT_TABLES: &[&str] = &[
     "config_raft_identity",
+    "config_raft_management_audit",
     "config_raft_history_retention",
     "config_raft_vote",
     "config_raft_committed",
@@ -758,6 +764,8 @@ fn initialize_schema_transaction(
             ],
         )
         .map_err(|_| ConfigConsensusStorageError::BackendUnavailable)?;
+        super::audit::initialize_sync(&tx, audit_key, identity)
+            .map_err(|_| ConfigConsensusStorageError::CorruptState)?;
         super::history::initialize_sync(&tx, identity, audit_key, cancellation)
             .map_err(|_| ConfigConsensusStorageError::CorruptState)?;
         if let Some(recovery) = recovery {
@@ -2673,6 +2681,9 @@ fn execute_intent_sync(
     cancellation: &SqliteWorkCancellation,
 ) -> io::Result<Result<(), ConfigMutationFailure>> {
     match intent {
+        ConfigMutationIntent::ManagementAudit(_) | ConfigMutationIntent::AuditedMutation(_) => Err(
+            invalid_data("audit command requires its authority dispatcher"),
+        ),
         ConfigMutationIntent::RetainHistory(_) => {
             Err(invalid_data("retention requires authenticated writer"))
         }
@@ -2710,6 +2721,91 @@ fn execute_intent_sync(
             create_rollback_point_sync(conn, *tx_id, label, logical_time, request_id)
         }
     }
+}
+
+/// The effect savepoint rolls back configuration failure only. Its audited
+/// rejection survives in the enclosing Raft transaction. An I/O failure still
+/// rolls back everything and never creates a caller-asserted commit receipt.
+fn apply_audited_mutation_sync(
+    conn: &Connection,
+    key: &AuditKey,
+    identity: ConsensusIdentity,
+    prepared: &super::PreparedAuditedMutation,
+    logical_time: Timestamp,
+    request_id: opc_consensus::ConsensusRequestId,
+    cancellation: &SqliteWorkCancellation,
+) -> io::Result<Result<(), ConfigMutationFailure>> {
+    use crate::audit_authority::AuditOperationState;
+    let invalid = || invalid_data("invalid audited configuration mutation");
+    if prepared.verify_effect(key).is_err() {
+        return Ok(Err(ConfigMutationFailure::InvalidInput));
+    }
+    let Some(mut ledger) = super::audit::read_sync(conn, key, identity)? else {
+        return Ok(Err(ConfigMutationFailure::InvalidInput));
+    };
+    let receipt = match ledger.lookup(key, &prepared.handle, prepared.handle.body.binding.caller) {
+        Ok(Some(receipt)) => receipt,
+        _ => return Ok(Err(ConfigMutationFailure::InvalidInput)),
+    };
+    match receipt.state() {
+        AuditOperationState::Committed { .. } => return Ok(Ok(())),
+        AuditOperationState::Rejected | AuditOperationState::Observed { .. } => {
+            return Ok(Err(ConfigMutationFailure::Conflict))
+        }
+        AuditOperationState::Intent => {}
+    }
+    validate_sealed_state_sync(conn, key, cancellation)?;
+    let current_version: u64 = conn
+        .query_row(
+            "SELECT COALESCE(MAX(version),0) FROM config_history",
+            [],
+            |row| row.get(0),
+        )
+        .map_err(db_error)?;
+    let now = logical_time.as_offset_datetime().unix_timestamp();
+    let live = prepared.handle.require_live(now).is_ok()
+        && current_version == prepared.handle.body.binding.base_version;
+    conn.execute_batch("SAVEPOINT audited_config_effect")
+        .map_err(db_error)?;
+    let updates = prepared.effect.updates_existing_records();
+    let mut result = if live {
+        execute_intent_sync(
+            conn,
+            &prepared.effect.intent(),
+            super::types::CONFIG_CONSENSUS_COMMAND_VERSION,
+            logical_time,
+            request_id,
+            cancellation,
+        )?
+    } else {
+        Err(ConfigMutationFailure::Conflict)
+    };
+    if result.is_ok() {
+        result = super::history::refresh_sync(conn, key, updates, cancellation)?;
+    }
+    if result.is_err() {
+        conn.execute_batch("ROLLBACK TO audited_config_effect")
+            .map_err(db_error)?;
+    }
+    conn.execute_batch("RELEASE audited_config_effect")
+        .map_err(db_error)?;
+    let state = if result.is_ok() {
+        let version: u64 = conn
+            .query_row(
+                "SELECT COALESCE(MAX(version),0) FROM config_history",
+                [],
+                |row| row.get(0),
+            )
+            .map_err(db_error)?;
+        AuditOperationState::Committed { version }
+    } else {
+        AuditOperationState::Rejected
+    };
+    ledger
+        .resolve(key, &prepared.handle, state)
+        .map_err(|_| invalid())?;
+    super::audit::write_sync(conn, key, identity, Some(ledger), false)?;
+    Ok(result)
 }
 
 #[cfg(test)]
@@ -2836,7 +2932,9 @@ pub(crate) fn apply_entries_cancellable_sync(
                         .map_err(db_error)?;
                     let updates_existing_records = match &command.intent {
                         ConfigMutationIntent::AppendCommit(_)
-                        | ConfigMutationIntent::RetainHistory(_) => false,
+                        | ConfigMutationIntent::RetainHistory(_)
+                        | ConfigMutationIntent::ManagementAudit(_)
+                        | ConfigMutationIntent::AuditedMutation(_) => false,
                         ConfigMutationIntent::ResolveConfirmedAndAppend { .. }
                         | ConfigMutationIntent::ClearRecoveryRequired { .. }
                         | ConfigMutationIntent::MarkConfirmed { .. }
@@ -2846,20 +2944,59 @@ pub(crate) fn apply_entries_cancellable_sync(
                         super::history::validate_record_chain_sync(&tx, audit_key, cancellation)?;
                     }
                     let mut result = match &command.intent {
+                        ConfigMutationIntent::AuditedMutation(prepared) => {
+                            apply_audited_mutation_sync(
+                                &tx,
+                                audit_key,
+                                identity,
+                                prepared,
+                                logical_time,
+                                command.request_id,
+                                cancellation,
+                            )?
+                        }
+                        ConfigMutationIntent::ManagementAudit(audit) => super::audit::apply_sync(
+                            &tx,
+                            audit_key,
+                            identity,
+                            audit,
+                            logical_time.as_offset_datetime().unix_timestamp(),
+                        )?,
                         ConfigMutationIntent::RetainHistory(retention) => {
                             validate_sealed_state_sync(&tx, audit_key, cancellation)?;
                             super::history::retain_sync(&tx, audit_key, retention, cancellation)?
                         }
-                        _ => execute_intent_sync(
-                            &tx,
-                            &command.intent,
-                            command.schema_version,
-                            logical_time,
-                            command.request_id,
-                            cancellation,
-                        )?,
+                        _ => {
+                            let requires_audit = matches!(
+                                command.intent,
+                                ConfigMutationIntent::AppendCommit(_)
+                                    | ConfigMutationIntent::ResolveConfirmedAndAppend { .. }
+                                    | ConfigMutationIntent::MarkConfirmed { .. }
+                                    | ConfigMutationIntent::CreateRollbackPoint { .. }
+                            );
+                            if requires_audit
+                                && super::audit::read_sync(&tx, audit_key, identity)?.is_some()
+                            {
+                                Err(ConfigMutationFailure::InvalidInput)
+                            } else {
+                                execute_intent_sync(
+                                    &tx,
+                                    &command.intent,
+                                    command.schema_version,
+                                    logical_time,
+                                    command.request_id,
+                                    cancellation,
+                                )?
+                            }
+                        }
                     };
-                    if result.is_ok() {
+                    if result.is_ok()
+                        && !matches!(
+                            command.intent,
+                            ConfigMutationIntent::ManagementAudit(_)
+                                | ConfigMutationIntent::AuditedMutation(_)
+                        )
+                    {
                         result = super::history::refresh_sync(
                             &tx,
                             audit_key,
@@ -2867,7 +3004,9 @@ pub(crate) fn apply_entries_cancellable_sync(
                             cancellation,
                         )?;
                     }
-                    if result.is_err() {
+                    if result.is_err()
+                        && !matches!(command.intent, ConfigMutationIntent::AuditedMutation(_))
+                    {
                         tx.execute_batch("ROLLBACK TO config_history_command")
                             .map_err(db_error)?;
                     }
@@ -2940,6 +3079,7 @@ fn validate_sealed_state_sync(
     if super::history::has_consensus_metadata_sync(conn)? {
         validate_live_history_schema_sync(conn, cancellation)?;
     }
+    super::audit::validate_sync(conn, audit_key)?;
     super::history::validate_sync(conn, audit_key)?;
     super::history::validate_record_chain_sync(conn, audit_key, cancellation)?;
     validate_history_chain_cancellable_sync(conn, cancellation)?;
@@ -3470,6 +3610,7 @@ pub(crate) fn install_snapshot_database_cancellable_sync(
         "audit_trail",
         "config_history",
         "config_raft_request_outcomes",
+        "config_raft_management_audit",
         "config_raft_history_retention",
         "config_raft_machine",
         "config_raft_membership",
@@ -3492,6 +3633,10 @@ pub(crate) fn install_snapshot_database_cancellable_sync(
         (
             "config_lifecycle_audit",
             "id, tx_id, action, principal, occurred_at, details",
+        ),
+        (
+            "config_raft_management_audit",
+            "singleton, state_json, state_hmac",
         ),
         (
             "config_raft_history_retention",

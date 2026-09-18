@@ -33,19 +33,20 @@ pub(crate) const ATOMIC_CONFIG_CONSENSUS_COMMAND_VERSION: u16 = 2;
 ///
 /// Revision 2 added atomic commit-confirmed resolution and recovery-fence
 /// clearing. Revision 3 adds an inline named rollback point to an appended
-/// encrypted record. Revision 4 adds authenticated history retention. Older
+/// encrypted record. Revision 4 adds authenticated history retention. Revision 5
+/// adds the replicated management ledger and audited configuration effects. Older
 /// commands remain readable under their original
 /// semantics so existing durable logs can be replayed after upgrade.
-pub const CONFIG_CONSENSUS_COMMAND_VERSION: u16 = 4;
+pub const CONFIG_CONSENSUS_COMMAND_VERSION: u16 = 5;
 /// Current SQLite authority schema revision.
-pub const CONFIG_CONSENSUS_STORAGE_VERSION: u16 = 2;
+pub const CONFIG_CONSENSUS_STORAGE_VERSION: u16 = 3;
 /// Current config snapshot envelope revision.
-pub const CONFIG_CONSENSUS_SNAPSHOT_VERSION: u16 = 2;
+pub const CONFIG_CONSENSUS_SNAPSHOT_VERSION: u16 = 3;
 /// Current config-specific RPC payload revision.
 ///
-/// Revision 4 carries the revision-4 command admission contract. Peers require
+/// Revision 5 carries the revision-5 command admission contract. Peers require
 /// an exact match and do not negotiate a downgrade.
-pub const CONFIG_CONSENSUS_WIRE_VERSION: u16 = 4;
+pub const CONFIG_CONSENSUS_WIRE_VERSION: u16 = 5;
 
 /// Maximum configured voter count admitted by the config consensus adapter.
 pub const CONFIG_CONSENSUS_MAX_MEMBERS: usize = 9;
@@ -341,6 +342,10 @@ pub(crate) enum ConfigMutationIntent {
     ClearRecoveryRequired { tx_id: TxId },
     /// Explicit acknowledged-prefix retention under exact-head authority.
     RetainHistory(super::ConfigHistoryRetention),
+    /// Purpose-separated management ledger, with no configuration version change.
+    ManagementAudit(super::audit::AuditCommand),
+    /// Exact configuration effect and recoverable audit outcome, applied atomically.
+    AuditedMutation(super::PreparedAuditedMutation),
 }
 
 impl ConfigMutationIntent {
@@ -352,7 +357,8 @@ impl ConfigMutationIntent {
             Self::ResolveConfirmedAndAppend { .. } | Self::ClearRecoveryRequired { .. } => {
                 ATOMIC_CONFIG_CONSENSUS_COMMAND_VERSION
             }
-            Self::RetainHistory(_) => CONFIG_CONSENSUS_COMMAND_VERSION,
+            Self::RetainHistory(_) => 4,
+            Self::ManagementAudit(_) | Self::AuditedMutation(_) => 5,
         }
     }
 
@@ -364,7 +370,9 @@ impl ConfigMutationIntent {
             Self::MarkConfirmed { .. }
             | Self::CreateRollbackPoint { .. }
             | Self::ClearRecoveryRequired { .. }
-            | Self::RetainHistory(_) => Ok(None),
+            | Self::RetainHistory(_)
+            | Self::ManagementAudit(_)
+            | Self::AuditedMutation(_) => Ok(None),
         }
     }
 }
@@ -443,6 +451,7 @@ impl ConfigConsensusCommand {
                     && !has_inline_rollback_label
             }
             3 => self.intent.minimum_command_version() <= 3,
+            4 => self.intent.minimum_command_version() <= 4,
             CONFIG_CONSENSUS_COMMAND_VERSION => true,
             _ => false,
         };
@@ -458,6 +467,14 @@ impl ConfigConsensusCommand {
                 validate_confirmed_resolution(&commit.record, *resolution)?;
             }
             ConfigMutationIntent::RetainHistory(retention) => retention.validate()?,
+            ConfigMutationIntent::ManagementAudit(_) => {}
+            ConfigMutationIntent::AuditedMutation(prepared) => {
+                let nested = Self {
+                    intent: prepared.effect.intent(),
+                    ..self.clone()
+                };
+                nested.validate(identity)?;
+            }
             ConfigMutationIntent::ClearRecoveryRequired { .. } => {}
             ConfigMutationIntent::MarkConfirmed { .. } => {}
             ConfigMutationIntent::CreateRollbackPoint { label, .. } => {

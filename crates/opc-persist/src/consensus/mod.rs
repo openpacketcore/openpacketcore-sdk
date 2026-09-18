@@ -5,6 +5,9 @@
 //! metadata; it never owns an HKMS/KMS provider, key handle, or plaintext
 //! configuration value.
 
+mod audit;
+mod audit_mutation;
+pub use audit_mutation::PreparedAuditedMutation;
 pub(crate) mod history;
 mod raft_adapter;
 mod snapshot_file;
