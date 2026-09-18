@@ -1325,6 +1325,246 @@
         "cardinality": "singleton",
         "presence": "optional"
       }
+    ],
+    "NASNonDeliveryIndication": [
+      {
+        "id": 10,
+        "name": "id-AMF-UE-NGAP-ID",
+        "criticality": "reject",
+        "cardinality": "singleton",
+        "presence": "mandatory"
+      },
+      {
+        "id": 85,
+        "name": "id-RAN-UE-NGAP-ID",
+        "criticality": "reject",
+        "cardinality": "singleton",
+        "presence": "mandatory"
+      },
+      {
+        "id": 38,
+        "name": "id-NAS-PDU",
+        "criticality": "ignore",
+        "cardinality": "singleton",
+        "presence": "mandatory"
+      },
+      {
+        "id": 15,
+        "name": "id-Cause",
+        "criticality": "ignore",
+        "cardinality": "singleton",
+        "presence": "mandatory"
+      }
+    ],
+    "UEContextReleaseRequest": [
+      {
+        "id": 10,
+        "name": "id-AMF-UE-NGAP-ID",
+        "criticality": "reject",
+        "cardinality": "singleton",
+        "presence": "mandatory"
+      },
+      {
+        "id": 85,
+        "name": "id-RAN-UE-NGAP-ID",
+        "criticality": "reject",
+        "cardinality": "singleton",
+        "presence": "mandatory"
+      },
+      {
+        "id": 133,
+        "name": "id-PDUSessionResourceListCxtRelReq",
+        "criticality": "reject",
+        "cardinality": "singleton",
+        "presence": "optional"
+      },
+      {
+        "id": 15,
+        "name": "id-Cause",
+        "criticality": "ignore",
+        "cardinality": "singleton",
+        "presence": "mandatory"
+      }
+    ],
+    "NGReset": [
+      {
+        "id": 15,
+        "name": "id-Cause",
+        "criticality": "ignore",
+        "cardinality": "singleton",
+        "presence": "mandatory"
+      },
+      {
+        "id": 88,
+        "name": "id-ResetType",
+        "criticality": "reject",
+        "cardinality": "singleton",
+        "presence": "mandatory"
+      }
+    ],
+    "NGResetAcknowledge": [
+      {
+        "id": 111,
+        "name": "id-UE-associatedLogicalNG-connectionList",
+        "criticality": "ignore",
+        "cardinality": "singleton",
+        "presence": "optional"
+      },
+      {
+        "id": 19,
+        "name": "id-CriticalityDiagnostics",
+        "criticality": "ignore",
+        "cardinality": "singleton",
+        "presence": "optional"
+      }
+    ],
+    "ErrorIndication": [
+      {
+        "id": 10,
+        "name": "id-AMF-UE-NGAP-ID",
+        "criticality": "ignore",
+        "cardinality": "singleton",
+        "presence": "optional"
+      },
+      {
+        "id": 85,
+        "name": "id-RAN-UE-NGAP-ID",
+        "criticality": "ignore",
+        "cardinality": "singleton",
+        "presence": "optional"
+      },
+      {
+        "id": 15,
+        "name": "id-Cause",
+        "criticality": "ignore",
+        "cardinality": "singleton",
+        "presence": "optional"
+      },
+      {
+        "id": 19,
+        "name": "id-CriticalityDiagnostics",
+        "criticality": "ignore",
+        "cardinality": "singleton",
+        "presence": "optional"
+      },
+      {
+        "id": 26,
+        "name": "id-FiveG-S-TMSI",
+        "criticality": "ignore",
+        "cardinality": "singleton",
+        "presence": "optional"
+      }
+    ],
+    "PDUSessionResourceNotify": [
+      {
+        "id": 10,
+        "name": "id-AMF-UE-NGAP-ID",
+        "criticality": "reject",
+        "cardinality": "singleton",
+        "presence": "mandatory"
+      },
+      {
+        "id": 85,
+        "name": "id-RAN-UE-NGAP-ID",
+        "criticality": "reject",
+        "cardinality": "singleton",
+        "presence": "mandatory"
+      },
+      {
+        "id": 66,
+        "name": "id-PDUSessionResourceNotifyList",
+        "criticality": "reject",
+        "cardinality": "singleton",
+        "presence": "optional"
+      },
+      {
+        "id": 67,
+        "name": "id-PDUSessionResourceReleasedListNot",
+        "criticality": "ignore",
+        "cardinality": "singleton",
+        "presence": "optional"
+      },
+      {
+        "id": 121,
+        "name": "id-UserLocationInformation",
+        "criticality": "ignore",
+        "cardinality": "singleton",
+        "presence": "optional"
+      }
+    ],
+    "PDUSessionResourceModifyRequest": [
+      {
+        "id": 10,
+        "name": "id-AMF-UE-NGAP-ID",
+        "criticality": "reject",
+        "cardinality": "singleton",
+        "presence": "mandatory"
+      },
+      {
+        "id": 85,
+        "name": "id-RAN-UE-NGAP-ID",
+        "criticality": "reject",
+        "cardinality": "singleton",
+        "presence": "mandatory"
+      },
+      {
+        "id": 83,
+        "name": "id-RANPagingPriority",
+        "criticality": "ignore",
+        "cardinality": "singleton",
+        "presence": "optional"
+      },
+      {
+        "id": 64,
+        "name": "id-PDUSessionResourceModifyListModReq",
+        "criticality": "reject",
+        "cardinality": "singleton",
+        "presence": "mandatory"
+      }
+    ],
+    "PDUSessionResourceModifyResponse": [
+      {
+        "id": 10,
+        "name": "id-AMF-UE-NGAP-ID",
+        "criticality": "ignore",
+        "cardinality": "singleton",
+        "presence": "mandatory"
+      },
+      {
+        "id": 85,
+        "name": "id-RAN-UE-NGAP-ID",
+        "criticality": "ignore",
+        "cardinality": "singleton",
+        "presence": "mandatory"
+      },
+      {
+        "id": 65,
+        "name": "id-PDUSessionResourceModifyListModRes",
+        "criticality": "ignore",
+        "cardinality": "singleton",
+        "presence": "optional"
+      },
+      {
+        "id": 54,
+        "name": "id-PDUSessionResourceFailedToModifyListModRes",
+        "criticality": "ignore",
+        "cardinality": "singleton",
+        "presence": "optional"
+      },
+      {
+        "id": 121,
+        "name": "id-UserLocationInformation",
+        "criticality": "ignore",
+        "cardinality": "singleton",
+        "presence": "optional"
+      },
+      {
+        "id": 19,
+        "name": "id-CriticalityDiagnostics",
+        "criticality": "ignore",
+        "cardinality": "singleton",
+        "presence": "optional"
+      }
     ]
   },
   "dispatch": {
@@ -1423,6 +1663,54 @@
       "outcome": "initiating",
       "direction": "amf-to-n3iwf",
       "criticality_octet": 64
+    },
+    "NASNonDeliveryIndication": {
+      "procedure_code": 19,
+      "outcome": "initiating",
+      "criticality_octet": 64,
+      "direction": "n3iwf-to-amf"
+    },
+    "UEContextReleaseRequest": {
+      "procedure_code": 42,
+      "outcome": "initiating",
+      "criticality_octet": 64,
+      "direction": "n3iwf-to-amf"
+    },
+    "NGReset": {
+      "procedure_code": 20,
+      "outcome": "initiating",
+      "criticality_octet": 0,
+      "direction": "bidirectional"
+    },
+    "NGResetAcknowledge": {
+      "procedure_code": 20,
+      "outcome": "successful",
+      "criticality_octet": 0,
+      "direction": "bidirectional"
+    },
+    "ErrorIndication": {
+      "procedure_code": 9,
+      "outcome": "initiating",
+      "criticality_octet": 64,
+      "direction": "bidirectional"
+    },
+    "PDUSessionResourceNotify": {
+      "procedure_code": 30,
+      "outcome": "initiating",
+      "criticality_octet": 64,
+      "direction": "n3iwf-to-amf"
+    },
+    "PDUSessionResourceModifyRequest": {
+      "procedure_code": 26,
+      "outcome": "initiating",
+      "criticality_octet": 0,
+      "direction": "amf-to-n3iwf"
+    },
+    "PDUSessionResourceModifyResponse": {
+      "procedure_code": 26,
+      "outcome": "successful",
+      "criticality_octet": 0,
+      "direction": "n3iwf-to-amf"
     }
   }
 }

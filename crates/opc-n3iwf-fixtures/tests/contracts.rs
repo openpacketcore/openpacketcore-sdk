@@ -268,6 +268,20 @@ fn ngap_matrices_use_pinned_release18_rows_supported_by_policy_rs() {
         ("InitialUEMessage", "INITIAL_UE_MESSAGE"),
         ("DownlinkNASTransport", "DOWNLINK_NAS_TRANSPORT"),
         ("UplinkNASTransport", "UPLINK_NAS_TRANSPORT"),
+        ("NASNonDeliveryIndication", "NAS_NON_DELIVERY_INDICATION"),
+        ("UEContextReleaseRequest", "UE_CONTEXT_RELEASE_REQUEST"),
+        ("NGReset", "NG_RESET"),
+        ("NGResetAcknowledge", "NG_RESET_ACKNOWLEDGE"),
+        ("ErrorIndication", "ERROR_INDICATION"),
+        ("PDUSessionResourceNotify", "PDU_SESSION_RESOURCE_NOTIFY"),
+        (
+            "PDUSessionResourceModifyRequest",
+            "PDU_SESSION_RESOURCE_MODIFY_REQUEST",
+        ),
+        (
+            "PDUSessionResourceModifyResponse",
+            "PDU_SESSION_RESOURCE_MODIFY_RESPONSE",
+        ),
         (
             "InitialContextSetupRequest",
             "INITIAL_CONTEXT_SETUP_REQUEST",

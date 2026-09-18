@@ -48,7 +48,7 @@
     },
     {
       "name": "NAS-PDU",
-      "treatment": "opaque-synthetic-four-octet-container",
+      "treatment": "opaque-synthetic-container",
       "value_class": "non-subscriber"
     },
     {
@@ -72,7 +72,7 @@
     "reference_result=ie-bound",
     "sdk_structural_result=reject",
     "inner_nas=opaque",
-    "constructed_sdk_encode=unsupported",
+    "constructed_container_encode=not-claimed",
     "runtime_claim=false"
   ],
   "expected_outcome": "reject",
