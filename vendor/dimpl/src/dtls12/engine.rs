@@ -15,7 +15,9 @@ use crate::dtls12::message::{ContentType, DTLSRecord, Dtls12CipherSuite, Handsha
 use crate::error::bounded_error_len;
 use crate::timer::ExponentialBackoff;
 use crate::window::ReplayWindow;
-use crate::{Config, Error, InternalError, KeyingMaterial, Output, SeededRng};
+use crate::{
+    Config, Error, InternalError, KeyingMaterial, Output, Rfc6083ApplicationRecord, SeededRng,
+};
 
 const MAX_DEFRAGMENT_PACKETS: usize = 50;
 const MAX_SEQUENCE_NUMBER: u64 = (1_u64 << 48) - 1;
@@ -500,11 +502,31 @@ impl Engine {
         Ok(())
     }
 
+    #[cfg(test)]
     pub fn poll_output<'a>(&mut self, buf: &'a mut [u8], now: Instant) -> Output<'a> {
+        self.poll_output_with_record(buf, now).0
+    }
+
+    pub fn poll_output_with_record<'a>(
+        &mut self,
+        buf: &'a mut [u8],
+        now: Instant,
+    ) -> (Output<'a>, Option<Rfc6083ApplicationRecord>) {
+        let mut record = None;
+        let output = self.poll_output_inner(buf, now, &mut record);
+        (output, record)
+    }
+
+    fn poll_output_inner<'a>(
+        &mut self,
+        buf: &'a mut [u8],
+        now: Instant,
+        record: &mut Option<Rfc6083ApplicationRecord>,
+    ) -> Output<'a> {
         // Drain incoming queue of processed records.
         self.purge_handled_queue_rx();
 
-        let buf = match self.poll_app_data(buf) {
+        let buf = match self.poll_app_data(buf, record) {
             PollOutput::Data(p) => return Output::ApplicationData(p),
             PollOutput::BufferTooSmall { needed } => return Output::BufferTooSmall { needed },
             PollOutput::None(b) => b,
@@ -550,7 +572,11 @@ impl Engine {
         Output::Timeout(next_timeout)
     }
 
-    fn poll_app_data<'a>(&mut self, buf: &'a mut [u8]) -> PollOutput<'a> {
+    fn poll_app_data<'a>(
+        &mut self,
+        buf: &'a mut [u8],
+        record: &mut Option<Rfc6083ApplicationRecord>,
+    ) -> PollOutput<'a> {
         if !self.release_app_data {
             return PollOutput::None(buf);
         }
@@ -575,6 +601,13 @@ impl Engine {
         }
 
         buf[..len].copy_from_slice(fragment);
+        let sequence = next.record().sequence;
+        if self.config.rfc6083_sctp() && self.peer_encryption_enabled && sequence.epoch != 0 {
+            *record = Some(Rfc6083ApplicationRecord {
+                epoch: sequence.epoch,
+                sequence_number: sequence.sequence_number,
+            });
+        }
         next.set_handled();
 
         PollOutput::Data(&buf[..len])
@@ -1808,6 +1841,174 @@ mod tests {
             packets.push(packet.to_vec());
         }
         packets
+    }
+
+    fn record_reference() -> Vec<(u16, u64, Vec<u8>, Vec<u8>)> {
+        fn hex(value: &str) -> Vec<u8> {
+            assert_eq!(value.len() % 2, 0);
+            (0..value.len())
+                .step_by(2)
+                .map(|start| u8::from_str_radix(&value[start..start + 2], 16).expect("fixture hex"))
+                .collect()
+        }
+        include_str!("../../tests/dtls12/rfc6083_record_reference.tsv")
+            .lines()
+            .filter(|line| !line.starts_with('#'))
+            .map(|line| {
+                let fields: Vec<_> = line.split('\t').collect();
+                assert_eq!(fields.len(), 4);
+                (
+                    fields[0].parse().expect("fixture epoch"),
+                    fields[1].parse().expect("fixture sequence"),
+                    hex(fields[2]),
+                    hex(fields[3]),
+                )
+            })
+            .collect()
+    }
+
+    fn record_receiver(rfc6083: bool) -> Engine {
+        let mut receiver = encrypted_engine(config(rfc6083), false);
+        receiver.enable_peer_encryption().expect("receive epoch");
+        receiver
+    }
+
+    #[test]
+    fn rfc6083_record_identity_matches_independent_reordered_ciphertext() {
+        let records = record_reference();
+        assert_eq!(records.len(), 6);
+        let mut receiver = record_receiver(true);
+        // Deliberately retain multiple records before releasing plaintext.
+        // A receive-order FIFO assigns the first plaintext the wrong number.
+        for (_, _, _, wire) in records.iter().rev() {
+            receiver.parse_packet(wire).expect("independent ciphertext");
+        }
+        let mut buffer = [0_u8; 2048];
+        let (before_release, identity) =
+            receiver.poll_output_with_record(&mut buffer, Instant::now());
+        assert!(matches!(before_release, Output::Timeout(_)));
+        assert_eq!(identity, None, "nothing before handshake release");
+        receiver.release_application_data();
+        for (index, (epoch, sequence, plaintext, _)) in records.iter().enumerate() {
+            let (output, identity) = receiver.poll_output_with_record(&mut buffer, Instant::now());
+            assert!(matches!(output, Output::ApplicationData(data) if data == plaintext));
+            let identity = identity.expect("exact decrypted record");
+            assert_eq!(identity.epoch(), *epoch);
+            assert_eq!(identity.sequence_number(), *sequence);
+            assert_ne!(
+                identity.sequence_number(),
+                records[records.len() - 1 - index].1,
+                "a FIFO stream sidecar would misbind this plaintext"
+            );
+            assert_eq!(
+                format!("{identity:?}"),
+                "Rfc6083ApplicationRecord([redacted])"
+            );
+            assert_eq!(
+                format!("{identity:#?}"),
+                "Rfc6083ApplicationRecord([redacted])"
+            );
+        }
+        let (finished, identity) = receiver.poll_output_with_record(&mut buffer, Instant::now());
+        assert!(matches!(finished, Output::Timeout(_)));
+        assert_eq!(identity, None, "no stale number after draining");
+    }
+
+    #[test]
+    fn rfc6083_record_identity_short_buffer_retry_and_legacy_poll_do_not_shift_records() {
+        let records = record_reference();
+        let mut receiver = record_receiver(true);
+        receiver.release_application_data();
+        for (_, _, _, wire) in &records[2..] {
+            receiver.parse_packet(wire).expect("independent record");
+        }
+        let mut short = [0_u8; 1];
+        for _ in 0..3 {
+            let (output, identity) = receiver.poll_output_with_record(&mut short, Instant::now());
+            assert!(matches!(output, Output::BufferTooSmall { needed: 17 }));
+            assert_eq!(identity, None, "retry must not consume or publish identity");
+        }
+        let mut buffer = [0_u8; 2048];
+        assert!(matches!(receiver.poll_output(&mut buffer, Instant::now()),
+            Output::ApplicationData(data) if data == records[2].2));
+        for (_, sequence, plaintext, _) in &records[3..] {
+            let (output, identity) = receiver.poll_output_with_record(&mut buffer, Instant::now());
+            assert!(matches!(output, Output::ApplicationData(data) if data == plaintext));
+            assert_eq!(
+                identity.expect("paired record").sequence_number(),
+                *sequence
+            );
+        }
+    }
+
+    #[test]
+    fn rfc6083_record_identity_is_absent_for_ordinary_dtls12() {
+        let mut receiver = record_receiver(false);
+        receiver.release_application_data();
+        let records = record_reference();
+        receiver
+            .parse_packet(&records[4].3)
+            .expect("ordinary DTLS record");
+        let mut buffer = [0_u8; 2048];
+        let (output, identity) = receiver.poll_output_with_record(&mut buffer, Instant::now());
+        assert!(matches!(output, Output::ApplicationData(data) if data == records[4].2));
+        assert_eq!(
+            identity, None,
+            "ordinary DTLS does not claim RFC 6083 metadata"
+        );
+    }
+
+    #[test]
+    fn rfc6083_record_identity_never_tracks_a_discarded_or_unauthenticated_record() {
+        let records = record_reference();
+        // Mutate every byte of an independent record, including epoch, sequence,
+        // version, explicit nonce, ciphertext, and authentication tag. Malformed
+        // shapes may return a parse error; neither outcome may expose plaintext.
+        for offset in 0..records[2].3.len() {
+            let mut receiver = record_receiver(true);
+            receiver.release_application_data();
+            let mut damaged = records[2].3.clone();
+            damaged[offset] ^= 0x80;
+            let _ = receiver.parse_packet(&damaged);
+            let mut buffer = [0_u8; 2048];
+            let (output, identity) = receiver.poll_output_with_record(&mut buffer, Instant::now());
+            assert!(
+                !matches!(output, Output::ApplicationData(_)),
+                "damaged byte {offset}"
+            );
+            assert_eq!(identity, None, "unauthenticated byte {offset}");
+            receiver
+                .parse_packet(&records[4].3)
+                .expect("later independent record");
+            let (output, identity) = receiver.poll_output_with_record(&mut buffer, Instant::now());
+            assert!(matches!(output, Output::ApplicationData(data) if data == records[4].2));
+            assert_eq!(
+                identity.expect("later record identity").sequence_number(),
+                records[4].1
+            );
+        }
+    }
+
+    #[test]
+    fn rfc6083_record_identity_empty_plaintext_and_pending_duplicate_are_exact() {
+        let records = record_reference();
+        let mut receiver = record_receiver(true);
+        receiver.release_application_data();
+        receiver
+            .parse_packet(&records[0].3)
+            .expect("empty authenticated record");
+        receiver
+            .parse_packet(&records[0].3)
+            .expect("pending duplicate");
+        let (output, identity) = receiver.poll_output_with_record(&mut [], Instant::now());
+        assert!(matches!(output, Output::ApplicationData([])));
+        assert_eq!(
+            identity.expect("empty record identity").sequence_number(),
+            0
+        );
+        let (output, identity) = receiver.poll_output_with_record(&mut [], Instant::now());
+        assert!(matches!(output, Output::Timeout(_)));
+        assert_eq!(identity, None);
     }
 
     #[test]

@@ -336,6 +336,42 @@ impl Drop for DtlsCertificate {
     }
 }
 
+/// Record number paired with one decrypted RFC 6083 application-data output.
+///
+/// The number is scoped to one direction of one DTLS connection. It contains
+/// no SCTP stream, peer identity, or proof of certificate policy. Obtain it
+/// only from [`Dtls::poll_output_with_record`]; correlation across connections
+/// or directions is invalid. Diagnostic formatting redacts both fields.
+///
+/// Callers cannot construct an engine-issued record identity from raw metadata:
+///
+/// ```compile_fail
+/// let record = dimpl::Rfc6083ApplicationRecord { epoch: 1, sequence_number: 7 };
+/// ```
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct Rfc6083ApplicationRecord {
+    epoch: u16,
+    sequence_number: u64,
+}
+
+impl Rfc6083ApplicationRecord {
+    /// Authenticated DTLS 1.2 record epoch.
+    pub const fn epoch(self) -> u16 {
+        self.epoch
+    }
+
+    /// Authenticated 48-bit record sequence number, represented without loss.
+    pub const fn sequence_number(self) -> u64 {
+        self.sequence_number
+    }
+}
+
+impl fmt::Debug for Rfc6083ApplicationRecord {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("Rfc6083ApplicationRecord([redacted])")
+    }
+}
+
 /// Sans-IO DTLS endpoint (client or server).
 ///
 /// New instances start in the **server role**. Call
@@ -880,16 +916,37 @@ impl Dtls {
 
     /// Poll for pending output from the DTLS engine.
     pub fn poll_output<'a>(&mut self, buf: &'a mut [u8]) -> Output<'a> {
+        self.poll_output_with_record(buf).0
+    }
+
+    /// Poll output together with the exact record identity of RFC 6083 plaintext.
+    ///
+    /// The optional identity accompanies only [`Output::ApplicationData`] from
+    /// DTLS 1.2 configured with [`ConfigBuilder::rfc6083_sctp`]. It identifies
+    /// that decrypted record, including when buffered records are released in
+    /// a different order from their arrival. All other outputs, ordinary DTLS
+    /// 1.2, and DTLS 1.3 return `None`. A short output buffer consumes neither
+    /// the plaintext nor its identity; retry with the requested capacity.
+    ///
+    /// This is record correlation data, not peer-authentication or SCTP stream
+    /// authority. The embedding must verify peer certificates, complete the
+    /// RFC 6083 key barriers, and bind authenticated SCTP receive metadata to
+    /// this record on the same association. It must not match streams by FIFO
+    /// arrival order: the engine can reorder or discard received records.
+    pub fn poll_output_with_record<'a>(
+        &mut self,
+        buf: &'a mut [u8],
+    ) -> (Output<'a>, Option<Rfc6083ApplicationRecord>) {
         match self.inner.as_mut() {
-            Some(Inner::Client12(client)) => client.poll_output(buf),
-            Some(Inner::Server12(server)) => server.poll_output(buf),
-            Some(Inner::Client13(client)) => client.poll_output(buf),
-            Some(Inner::Server13(server)) => server.poll_output(buf),
-            Some(Inner::ClientPending(cp)) => cp.poll_output(buf),
+            Some(Inner::Client12(client)) => client.poll_output_with_record(buf),
+            Some(Inner::Server12(server)) => server.poll_output_with_record(buf),
+            Some(Inner::Client13(client)) => (client.poll_output(buf), None),
+            Some(Inner::Server13(server)) => (server.poll_output(buf), None),
+            Some(Inner::ClientPending(cp)) => (cp.poll_output(buf), None),
             // `inner` is only absent while a transition method owns the state.
             // If an invariant violation ever exposes that state to a caller,
             // fail closed without manufacturing a packet or panicking.
-            None => Output::Timeout(Instant::now()),
+            None => (Output::Timeout(Instant::now()), None),
         }
     }
 

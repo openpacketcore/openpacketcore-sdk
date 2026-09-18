@@ -35,7 +35,19 @@ fn drain_rfc6083(endpoint: &mut Dtls) -> Rfc6083Trace {
     let mut trace = Rfc6083Trace::default();
     let mut buffer = vec![0_u8; 65_536];
     loop {
-        match endpoint.poll_output(&mut buffer) {
+        let (output, identity) = endpoint.poll_output_with_record(&mut buffer);
+        if matches!(output, Output::ApplicationData(_)) {
+            assert!(
+                identity.is_some(),
+                "RFC 6083 plaintext has a record identity"
+            );
+        } else {
+            assert_eq!(
+                identity, None,
+                "control output never carries a stale record"
+            );
+        }
+        match output {
             Output::Packet(packet) => {
                 assert_single_dtls_record(packet);
                 trace.packets.push(packet.to_vec());
@@ -239,5 +251,274 @@ fn rfc6083_sender_dry_close_order_is_symmetric_and_reciprocal_discards_writes() 
             initiator.poll_output(&mut output),
             Output::CloseNotify
         ));
+    }
+}
+
+// These PSK pairs exercise the record API under both retained provider builds.
+// They do not assert certificate policy or NGAP protected readiness.
+struct RecordTestPsk;
+
+impl dimpl::PskResolver for RecordTestPsk {
+    fn resolve(&self, identity: &[u8]) -> Option<Vec<u8>> {
+        (identity == b"synthetic-record-test").then(|| vec![0x6b; 32])
+    }
+}
+
+fn record_pair(rfc6083: bool) -> (Dtls, Dtls) {
+    fn builder(rfc6083: bool) -> dimpl::ConfigBuilder {
+        let builder = Config::builder()
+            .dtls13_cipher_suites(&[])
+            .dtls12_cipher_suites(&[dimpl::crypto::Dtls12CipherSuite::PSK_AES128_CCM_8]);
+        if rfc6083 {
+            builder.rfc6083_sctp()
+        } else {
+            builder
+        }
+    }
+    let client_config = builder(rfc6083)
+        .with_psk_client(b"synthetic-record-test".to_vec(), Arc::new(RecordTestPsk))
+        .build()
+        .expect("record test client config");
+    let server_config = builder(rfc6083)
+        .with_psk_server(None, Arc::new(RecordTestPsk))
+        .build()
+        .expect("record test server config");
+    let mut now = Instant::now();
+    let mut client = Dtls::new_12_psk(Arc::new(client_config), now);
+    let mut server = Dtls::new_12_psk(Arc::new(server_config), now);
+    client.set_active(true);
+    let mut connected = [false; 2];
+    let mut buffer = [0_u8; 18445];
+    for _ in 0..80 {
+        for (side, connected_side) in connected.iter_mut().enumerate() {
+            let (source, destination) = if side == 0 {
+                (&mut client, &mut server)
+            } else {
+                (&mut server, &mut client)
+            };
+            source.handle_timeout(now).expect("advance handshake");
+            loop {
+                let (output, record) = source.poll_output_with_record(&mut buffer);
+                assert_eq!(
+                    record, None,
+                    "handshake output cannot supply application metadata"
+                );
+                match output {
+                    Output::Packet(packet) => {
+                        destination.handle_packet(packet).expect("handshake packet")
+                    }
+                    Output::Connected => *connected_side = true,
+                    Output::Timeout(_) => break,
+                    Output::Rfc6083KeyingMaterial(_)
+                    | Output::Rfc6083PrepareChangeCipherSpec
+                    | Output::Rfc6083PrepareEpoch => {}
+                    Output::KeyingMaterial(_, _) if !rfc6083 => {}
+                    other => panic!("unexpected synthetic handshake event: {other:?}"),
+                }
+            }
+        }
+        if connected == [true, true] {
+            return (client, server);
+        }
+        now += Duration::from_millis(10);
+    }
+    panic!("synthetic record test handshake did not complete");
+}
+
+fn wire_number(packet: &[u8]) -> (u16, u64) {
+    assert_single_dtls_record(packet);
+    let epoch = u16::from_be_bytes([packet[3], packet[4]]);
+    let sequence = packet[5..11]
+        .iter()
+        .fold(0_u64, |number, byte| (number << 8) | u64::from(*byte));
+    (epoch, sequence)
+}
+
+#[test]
+fn rfc6083_public_record_identity_correlates_both_roles_and_out_of_order_streams() {
+    let (mut client, mut server) = record_pair(true);
+    for side in 0..2 {
+        let (sender, receiver) = if side == 0 {
+            (&mut client, &mut server)
+        } else {
+            (&mut server, &mut client)
+        };
+        let mut expected = Vec::new();
+        for index in 0_u8..4 {
+            let plaintext = [index; 32];
+            sender
+                .send_application_data(&plaintext)
+                .expect("send protected record");
+            let packets = drain_rfc6083(sender).packets;
+            assert_eq!(packets.len(), 1);
+            expected.push((wire_number(&packets[0]), plaintext, packets[0].clone()));
+        }
+        for index in [3, 1, 2, 0] {
+            receiver
+                .handle_packet(&expected[index].2)
+                .expect("reordered record");
+        }
+        let mut buffer = [0_u8; 64];
+        for (number, plaintext, _) in expected {
+            let (output, record) = receiver.poll_output_with_record(&mut buffer);
+            assert!(matches!(output, Output::ApplicationData(data) if data == plaintext));
+            let record = record.expect("paired application record");
+            assert_eq!((record.epoch(), record.sequence_number()), number);
+        }
+        let (output, record) = receiver.poll_output_with_record(&mut buffer);
+        assert!(matches!(output, Output::Timeout(_)));
+        assert_eq!(record, None);
+    }
+}
+
+#[test]
+fn rfc6083_public_record_identity_survives_retry_and_alternating_legacy_polls() {
+    let (mut client, mut server) = record_pair(true);
+    let mut expected = Vec::new();
+    for index in 1_u8..=3 {
+        client
+            .send_application_data(&[index; 32])
+            .expect("queue protected record");
+        let packets = drain_rfc6083(&mut client).packets;
+        assert_eq!(packets.len(), 1);
+        expected.push(wire_number(&packets[0]));
+        deliver(&packets, &mut server);
+    }
+    for _ in 0..2 {
+        let mut short = [0; 31];
+        let (output, record) = server.poll_output_with_record(&mut short);
+        assert!(matches!(output, Output::BufferTooSmall { needed: 32 }));
+        assert_eq!(record, None);
+    }
+    let mut buffer = [0_u8; 32];
+    assert!(
+        matches!(server.poll_output(&mut buffer), Output::ApplicationData(data) if data == [1; 32])
+    );
+    let (output, record) = server.poll_output_with_record(&mut buffer);
+    assert!(matches!(output, Output::ApplicationData(data) if data == [2; 32]));
+    let record = record.expect("second record after legacy polling");
+    assert_eq!((record.epoch(), record.sequence_number()), expected[1]);
+    assert!(
+        matches!(server.poll_output(&mut buffer), Output::ApplicationData(data) if data == [3; 32])
+    );
+    let (_, record) = server.poll_output_with_record(&mut buffer);
+    assert_eq!(record, None);
+}
+
+#[test]
+fn rfc6083_public_record_identity_is_absent_for_ordinary_dtls() {
+    let (mut client, mut server) = record_pair(false);
+    client
+        .send_application_data(b"ordinary transport")
+        .expect("ordinary application data");
+    let mut buffer = [0_u8; 18445];
+    loop {
+        let (output, record) = client.poll_output_with_record(&mut buffer);
+        assert_eq!(record, None);
+        match output {
+            Output::Packet(packet) => server.handle_packet(packet).expect("ordinary packet"),
+            Output::Timeout(_) => break,
+            other => panic!("unexpected ordinary send: {other:?}"),
+        }
+    }
+    let (output, record) = server.poll_output_with_record(&mut buffer);
+    assert!(matches!(output, Output::ApplicationData(data) if data == b"ordinary transport"));
+    assert_eq!(record, None);
+}
+
+#[test]
+fn rfc6083_public_record_identity_is_absent_for_pending_dtls13() {
+    let config = Arc::new(Config::builder().build().expect("ordinary DTLS config"));
+    let certificate = dimpl::DtlsCertificate {
+        certificate: Vec::new(),
+        intermediates: Vec::new(),
+        private_key: Vec::new(),
+    };
+    let mut endpoint = Dtls::new_13(config, certificate, Instant::now());
+    let mut buffer = [0_u8; 32];
+    let (output, record) = endpoint.poll_output_with_record(&mut buffer);
+    assert!(matches!(output, Output::Timeout(_)));
+    assert_eq!(record, None);
+}
+
+#[test]
+#[cfg(feature = "rcgen")]
+fn rfc6083_public_record_identity_is_absent_for_dtls13_application_data() {
+    use dimpl::certificate::generate_self_signed_certificate;
+    let config = Arc::new(
+        Config::builder()
+            .dtls12_cipher_suites(&[])
+            .build()
+            .expect("DTLS 1.3 config"),
+    );
+    let mut now = Instant::now();
+    let mut client = Dtls::new_13(
+        Arc::clone(&config),
+        generate_self_signed_certificate().expect("client certificate"),
+        now,
+    );
+    let mut server = Dtls::new_13(
+        config,
+        generate_self_signed_certificate().expect("server certificate"),
+        now,
+    );
+    client.set_active(true);
+    let mut connected = [false; 2];
+    let mut buffer = [0_u8; 18445];
+    for _ in 0..80 {
+        for (side, connected_side) in connected.iter_mut().enumerate() {
+            let (source, destination) = if side == 0 {
+                (&mut client, &mut server)
+            } else {
+                (&mut server, &mut client)
+            };
+            source
+                .handle_timeout(now)
+                .expect("advance DTLS 1.3 handshake");
+            loop {
+                let (output, record) = source.poll_output_with_record(&mut buffer);
+                assert_eq!(record, None, "DTLS 1.3 does not expose RFC 6083 metadata");
+                match output {
+                    Output::Packet(packet) => {
+                        destination.handle_packet(packet).expect("DTLS 1.3 packet")
+                    }
+                    Output::Connected => *connected_side = true,
+                    Output::Timeout(_) => break,
+                    Output::PeerCert(_)
+                    | Output::PeerCertChain(_)
+                    | Output::KeyingMaterial(_, _) => {}
+                    other => panic!("unexpected DTLS 1.3 output: {other:?}"),
+                }
+            }
+        }
+        if connected == [true, true] {
+            break;
+        }
+        now += Duration::from_millis(10);
+    }
+    assert_eq!(connected, [true, true]);
+    for side in 0..2 {
+        let (source, destination) = if side == 0 {
+            (&mut client, &mut server)
+        } else {
+            (&mut server, &mut client)
+        };
+        source
+            .send_application_data(b"DTLS 1.3 payload")
+            .expect("DTLS 1.3 application data");
+        loop {
+            let (output, record) = source.poll_output_with_record(&mut buffer);
+            assert_eq!(record, None);
+            match output {
+                Output::Packet(packet) => destination
+                    .handle_packet(packet)
+                    .expect("DTLS 1.3 application packet"),
+                Output::Timeout(_) => break,
+                other => panic!("unexpected DTLS 1.3 send output: {other:?}"),
+            }
+        }
+        let (output, record) = destination.poll_output_with_record(&mut buffer);
+        assert!(matches!(output, Output::ApplicationData(data) if data == b"DTLS 1.3 payload"));
+        assert_eq!(record, None);
     }
 }

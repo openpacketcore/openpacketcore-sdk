@@ -116,6 +116,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `Ikev2SaInitCryptoErrorCode` to `Ikev2ChildSaKeyMaterialDiagnostic`.
 
 ### Added
+- Vendored DTLS: pair RFC 6083 application plaintext with its exact decrypted
+  record number for later SCTP stream correlation, preserving the existing
+  Diameter polling API. Generic NGAP transport remains pending (Refs #794).
 - **Bounded acknowledged configuration history — `opc-persist`:** the existing
   consensus authority commits exact-head retention decisions with record and
   encoded-byte limits, authenticated cursor boundaries, and protected rollback

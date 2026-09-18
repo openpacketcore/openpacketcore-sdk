@@ -69,6 +69,14 @@ changes:
 - Diagnostic formatting redacts PSK identities and hints, RNG seeds, session
   identifiers, cookies, certificates, application data, and exported keying
   material.
+- `Dtls::poll_output_with_record` pairs RFC 6083 application plaintext with
+  its exact decrypted DTLS epoch and 48-bit sequence. The record number is
+  taken from the same queue entry as the plaintext, after the output-capacity
+  check. Control events and other DTLS profiles return no identity. The
+  existing `poll_output` API discards the optional metadata and preserves its
+  output shape and behavior. This enables later SCTP stream correlation;
+  neither the record number nor the engine alone attests peer certificate
+  policy or authenticated SCTP delivery (Refs SDK #794).
 - The vendored manifest is marked `publish = false`, adds `zeroize`, and keeps
   the upstream integration-test targets and development dependencies.
 
@@ -102,6 +110,15 @@ The expected changed paths are `tests/auto/main.rs`, `tests/dtls12/common.rs`,
 `tests/dtls12/main.rs`, `tests/dtls12/ossl.rs`, `tests/dtls12/psk.rs`,
 `tests/dtls12/retransmit.rs`, `tests/dtls12/rfc6083.rs`, and
 `tests/dtls13/main.rs`, plus `tests/ossl/io_buf.rs`.
+
+The additional `tests/dtls12/rfc6083_record_reference.py` and `.tsv` contain
+six synthetic record-layer vectors reproduced with Python `cryptography`
+AES-GCM, independent of the Rust providers. They initialize the same fixed
+test key schedule as the engine unit tests; they are not certificate or
+SCTP-AUTH handshake evidence. Regenerate with the Python script, or pass
+`--check` to detect drift. See the SDK's
+[`RFC 6083 record-correlation scope`](../../docs/rfc6083-record-correlation.md)
+for the remaining generic-transport work.
 
 Packaging and repository-development metadata that does not participate in the
 vendored build is deliberately omitted: `.cargo/`, `.github/`, `.vscode/`,
