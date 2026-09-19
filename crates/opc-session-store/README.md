@@ -439,6 +439,10 @@ Install `rpc_handler()` before calling `initialize_cluster()` on every startup.
 A cold voter first uses a compatible surviving live majority when available.
 That path obtains a genuinely new committed entry, admits repair only from
 its certified leader, and requires matching replication and local application.
+An initialization timeout preserves an accepted catch-up certificate and its
+progress. Retries keep the original per-call deadline. A newer authenticated
+leader requires a fresh committed certificate; its packets cannot authorize
+recovery under the old certificate. Replacement drains accepted old effects.
 When that majority is unavailable, new-format roots can recover automatically
 once **every configured retained voter** returns, including the surviving
 process. Three and five fixed voters are supported; membership, storage roots,

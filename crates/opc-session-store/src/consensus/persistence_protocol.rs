@@ -184,6 +184,7 @@ enum Admission {
         cut: Box<ColdQuorumCut>,
         confirmed: AtomicBool,
         repair_needed: AtomicBool,
+        refresh_needed: AtomicBool,
     },
     #[cfg(target_os = "linux")]
     Preparing {
@@ -385,8 +386,29 @@ impl PersistenceProtocol {
             cut: Box::new(cut),
             confirmed: AtomicBool::new(false),
             repair_needed: AtomicBool::new(false),
+            refresh_needed: AtomicBool::new(false),
         };
         Ok(())
+    }
+
+    // A caller's deadline does not invalidate an accepted quorum cut. Keep
+    // its exact nonce and matching-prefix progress until there is a reason
+    // to obtain a successor cut; continually replacing it can outrun catch-up.
+    pub(super) async fn resume_cut_before(
+        &self,
+        deadline: Instant,
+    ) -> Result<Option<ColdQuorumCut>, SessionConsensusPeerError> {
+        let state = tokio::time::timeout_at(deadline, self.admission.read())
+            .await
+            .map_err(|_| SessionConsensusPeerError::Timeout)?;
+        Ok(match &*state {
+            Admission::CatchingUp {
+                cut,
+                refresh_needed,
+                ..
+            } if !refresh_needed.load(Ordering::Acquire) => Some(**cut),
+            _ => None,
+        })
     }
 
     pub(super) async fn take_repair_before(
@@ -416,10 +438,16 @@ impl PersistenceProtocol {
         let mut state = tokio::time::timeout_at(deadline, self.admission.write())
             .await
             .map_err(|_| SessionConsensusPeerError::Timeout)?;
-        let Admission::CatchingUp { cut, confirmed, .. } = &*state else {
+        let Admission::CatchingUp {
+            cut,
+            confirmed,
+            refresh_needed,
+            ..
+        } = &*state
+        else {
             return Ok(matches!(*state, Admission::Active));
         };
-        if !confirmed.load(Ordering::Acquire) {
+        if !confirmed.load(Ordering::Acquire) || refresh_needed.load(Ordering::Acquire) {
             return Ok(false);
         }
         // The exact attempt remains exclusively held through scope/local
@@ -463,6 +491,26 @@ pub(super) struct EngineAdmission {
 }
 
 impl EngineAdmission {
+    // The authenticated engine adapter has already bound the sender to this
+    // vote. A newer committed leader is a scheduling hint only: reject its RPC
+    // under the old cut and request a new, independently committed certificate.
+    // Never admit the hinted vote or activate from the previous certificate.
+    fn observe_cold_leader(&self, vote: Vote<SessionConsensusNodeId>) {
+        if let Admission::CatchingUp {
+            cut,
+            refresh_needed,
+            ..
+        } = &*self.guard
+        {
+            if vote.is_committed()
+                && vote > cut.vote
+                && !refresh_needed.swap(true, Ordering::AcqRel)
+            {
+                self.progress.notify_one();
+            }
+        }
+    }
+
     // A live leader can remember matches acknowledged by this voter's old
     // volatile incarnation. Returning a regressed Conflict to Openraft would
     // violate its durable-follower contract. Keep it unavailable while the
@@ -490,6 +538,7 @@ impl EngineAdmission {
     }
 
     pub(super) fn permits_append(&self, rpc: &AppendEntriesRequest<SessionRaftTypeConfig>) -> bool {
+        self.observe_cold_leader(rpc.vote);
         match &*self.guard {
             Admission::Active => true,
             Admission::Quarantined { .. } => false,
@@ -512,6 +561,7 @@ impl EngineAdmission {
         &self,
         rpc: &InstallSnapshotRequest<SessionRaftTypeConfig>,
     ) -> bool {
+        self.observe_cold_leader(rpc.vote);
         match &*self.guard {
             Admission::Active => true,
             Admission::Quarantined { .. } => false,
