@@ -34,6 +34,14 @@ support boundary and synthetic evidence in [N3 conformance](CONFORMANCE.md).
 
 ## API Shape
 
+The [`control_port` module](docs/control-port.md) adds bounded control
+datagrams and response plans on the existing Linux IPv4 reassembly socket.
+One consumer shares its UDP/2152 queue with user-packet reassembly. Plans
+preserve message-specific response tuples and require the exact receiving
+socket; admission and aggregate rate policy remain with the caller. This
+does not yet expose Linux kernel-GTP sockets or qualify backend parity,
+End Marker ordering or N3 forwarding.
+
 - `GtpuDataplaneBackend`: async port for device and PDP lifecycle, typed PDP
   readback, classified installation, authority-safe exact removal, and probes.
   New trait ports retain default unsupported bodies for third-party backend

@@ -13,6 +13,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   replacement, shutdown and multihoming failover qualification (Refs #788).
 
 ### Added
+
+- `opc-gtpu-dataplane` exposes a bounded control-datagram/response port on the
+  existing Linux IPv4 reassembly socket. Echo, Error Indication and extension
+  notifications preserve their transport rules, with explicit byte/ratio
+  budgets, exact socket identity and live binding checks. The shared receive
+  queue avoids a second UDP/2152 listener. Refs #341, #790; backend exposure
+  and installed forwarding remain separate work.
 - `opc-proto-gtpu`: correct the Supported Extension Headers Notification
   list count to the single-octet wire layout in TS 29.281 figure 8.5-1;
   reject the former two-octet encoding and retain bounded IE parsing,
