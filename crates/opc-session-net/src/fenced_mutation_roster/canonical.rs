@@ -2434,6 +2434,16 @@ fn validate_status_bytes(bytes: &[u8]) -> Result<(), Error> {
 /// Terminal member commitments deliberately exclude the execution fence so
 /// that reconstruction remains byte-identical.
 ///
+/// This floor protects successors of the same immutable admission. It is not
+/// a configuration-wide retirement primitive: a higher fence for a different
+/// admission has a different [`MemberCall::fence_binding_commitment`]. Local
+/// lease expiry also does not reconstruct a lost admission or undo effects
+/// already recorded by the provider. Consequently this trait alone cannot
+/// authorize protected Async majority/all-cold recovery when acknowledged
+/// admission state may have been lost. That path remains unavailable pending
+/// an authority capable of retiring and reconciling the entire affected
+/// provider scope; retaining only the trust root is insufficient.
+///
 /// The conclusive operation/outcome matrix is fixed:
 ///
 /// | Operation | Permitted signed conclusive outcome |
