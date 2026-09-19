@@ -50,6 +50,12 @@ exchange. Fully blocked paths must retire both roles before a fresh
 association is admitted. See the exact fault model, reproduction and limits
 in [native path qualification](../../docs/rfc6083-native-path-qualification.md).
 
+A separate required native case kills and replaces a real peer process in
+both DTLS roles. It refuses queued delivery and stale readback after death,
+rejects a wrong replacement identity, and requires a fresh mutual handshake
+before new delivery. See [process restart qualification](../../docs/rfc6083-process-restart-qualification.md)
+for the exact crash cut, credential handling and remaining limits.
+
 ## Implemented boundary
 
 - Direct TLS/TCP completes mutually authenticated TLS 1.3 before any Diameter

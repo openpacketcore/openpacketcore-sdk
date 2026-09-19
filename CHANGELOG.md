@@ -13,6 +13,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   replacement, shutdown and multihoming failover qualification (Refs #788).
 
 ### Added
+- `opc-diameter-transport`: require native peer-process crash/restart
+  qualification in both DTLS roles, with queued-delivery retirement, wrong
+  replacement identity rejection and fresh mutual authentication (Refs #794,
+  #784).
 - `opc-diameter-transport`: require seven native RFC 6083 cases in Linux SCTP
   CI, including authenticated multistream delivery through actual active
   destination loss, exact retained protection, bounded all-path retirement,
