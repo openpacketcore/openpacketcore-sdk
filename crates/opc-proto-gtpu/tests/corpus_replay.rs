@@ -181,9 +181,8 @@ fn named_control_corpus_entries_are_valid_and_canonicalize() {
         0x36, 0x1a, 0, 20, 0, 0, 0, 0, 0, 0, 0, 0x40, 1, 0x08, 0x68, 0, 16, 0x11, 0x22, 0x33, 0x44,
         133, 0, 4, 192, 0, 2, 10,
     ];
-    const SUPPORTED_EXTENSIONS: &[u8] = &[
-        0x32, 0x1f, 0, 9, 0, 0, 0, 0, 0, 0, 0, 0, 141, 0, 2, 0x40, 0x85,
-    ];
+    const SUPPORTED_EXTENSIONS: &[u8] =
+        &[0x32, 0x1f, 0, 8, 0, 0, 0, 0, 0, 0, 0, 0, 141, 2, 0x40, 0x85];
     const END_MARKER: &[u8] = &[
         0x34, 0xfe, 0, 8, 0x11, 0x22, 0x33, 0x44, 0, 0, 0, 0x85, 1, 0, 9, 0,
     ];

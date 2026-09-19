@@ -34,8 +34,127 @@ const ERROR_INDICATION_IPV6: &[u8] = &[
     0x20, 0x01, 0x0d, 0xb8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0x10,
 ];
 const SUPPORTED_EXTENSION_HEADERS: &[u8] = &[
-    0x32, 0x1f, 0x00, 0x09, 0, 0, 0, 0, 0, 0, 0, 0, 0x8d, 0, 2, 0x40, 0x85,
+    0x32, 0x1f, 0x00, 0x08, 0, 0, 0, 0, 0, 0, 0, 0, 0x8d, 2, 0x40, 0x85,
 ];
+
+#[test]
+fn extension_list_single_octet_length_matches_ts29281_figure_8_5_1_on_send() {
+    let list = opc_proto_gtpu::GtpuExtensionHeaderTypeList::new([
+        opc_proto_gtpu::GtpuExtensionHeaderType::new(0x40),
+        opc_proto_gtpu::GtpuExtensionHeaderType::new(0x85),
+    ])
+    .unwrap();
+    let message = GtpuControlMessage::SupportedExtensionHeadersNotification(
+        opc_proto_gtpu::GtpuSupportedExtensionHeadersNotification::new(list),
+    );
+    // Figure 8.5-1: type in octet 1, count in octet 2, then n entries.
+    let independent_wire = [0x32, 0x1f, 0, 8, 0, 0, 0, 0, 0, 0, 0, 0, 141, 2, 0x40, 0x85];
+    assert_eq!(encode(&message).as_ref(), independent_wire);
+}
+
+#[test]
+fn extension_list_single_octet_length_matches_ts29281_figure_8_5_1_on_receive() {
+    let independent_wire = [0x32, 0x1f, 0, 8, 0, 0, 0, 0, 0, 0, 0, 0, 141, 2, 0x40, 0x85];
+    let decoded = GtpuControlMessage::decode_datagram(&independent_wire, DecodeContext::default())
+        .expect("TS 29.281 single-octet list length must decode");
+    let GtpuControlMessage::SupportedExtensionHeadersNotification(notification) = decoded else {
+        panic!("wrong control procedure");
+    };
+    let values: Vec<_> = notification
+        .supported_types()
+        .as_slice()
+        .iter()
+        .map(|t| t.value())
+        .collect();
+    assert_eq!(values, [0x40, 0x85]);
+}
+
+#[test]
+fn extension_list_independent_complete_count_domain_and_mutations() {
+    let mut admitted = 0;
+    let mut refused = 0;
+    for row in include_str!("fixtures/extension_list.tsv")
+        .lines()
+        .filter(|row| !row.starts_with('#'))
+    {
+        let fields: Vec<_> = row.split('\t').collect();
+        assert_eq!(fields.len(), 3);
+        let (pairs, remainder) = fields[2].as_bytes().as_chunks::<2>();
+        assert!(remainder.is_empty(), "{} has incomplete hex", fields[0]);
+        let wire: Vec<_> = pairs
+            .iter()
+            .map(|pair| u8::from_str_radix(std::str::from_utf8(pair).unwrap(), 16).unwrap())
+            .collect();
+        let result = GtpuControlMessage::decode_datagram(&wire, DecodeContext::default());
+        if fields[1] == "1" {
+            let message = result.unwrap_or_else(|error| panic!("{}: {error}", fields[0]));
+            assert_eq!(encode(&message).as_ref(), wire, "{}", fields[0]);
+            // All positive corpus frames have exactly the authored n values,
+            // including zero and the maximum 255 distinct nonzero types.
+            let GtpuControlMessage::SupportedExtensionHeadersNotification(value) = message else {
+                panic!("wrong message");
+            };
+            let values: Vec<_> = value
+                .supported_types()
+                .as_slice()
+                .iter()
+                .map(|t| t.value())
+                .collect();
+            assert_eq!(values, &wire[14..14 + usize::from(wire[13])]);
+            admitted += 1;
+        } else {
+            assert!(result.is_err(), "{} must refuse", fields[0]);
+            refused += 1;
+        }
+    }
+    assert_eq!((admitted, refused), (512, 2043));
+}
+
+#[test]
+fn extension_list_count_boundaries_retain_exact_message_and_ie_caps() {
+    for count in [0, 1, 254, 255] {
+        let list = GtpuExtensionHeaderTypeList::new((1..=count).map(GtpuExtensionHeaderType::new))
+            .unwrap();
+        let message = GtpuControlMessage::SupportedExtensionHeadersNotification(
+            GtpuSupportedExtensionHeadersNotification::new(list),
+        );
+        let wire = encode(&message);
+        assert_eq!(wire.len(), 14 + usize::from(count));
+        let exact = EncodeContext {
+            max_message_len: wire.len(),
+            ..EncodeContext::default()
+        };
+        assert_eq!(message.to_bytes(exact).unwrap(), wire);
+        let short = EncodeContext {
+            max_message_len: wire.len() - 1,
+            ..exact
+        };
+        assert_eq!(
+            message.to_bytes(short).unwrap_err().code(),
+            &GtpuControlCodecErrorCode::CapacityExceeded
+        );
+        let exact = DecodeContext {
+            max_message_len: wire.len(),
+            max_ies: 1,
+            ..DecodeContext::default()
+        };
+        assert!(GtpuControlMessage::decode_datagram(&wire, exact).is_ok());
+        for limited in [
+            DecodeContext {
+                max_message_len: wire.len() - 1,
+                ..exact
+            },
+            DecodeContext {
+                max_ies: 0,
+                ..exact
+            },
+        ] {
+            assert!(GtpuControlMessage::decode_datagram(&wire, limited).is_err());
+            let (_, generic) = GtpuMessage::decode(&wire, DecodeContext::default()).unwrap();
+            assert!(GtpuControlMessage::from_message(&generic, limited).is_err());
+        }
+    }
+}
 const END_MARKER: &[u8] = &[0x30, 0xfe, 0, 0, 0x11, 0x22, 0x33, 0x44];
 const END_MARKER_WITH_PDU_SESSION_CONTAINER: &[u8] = &[
     0x34, 0xfe, 0, 8, 0x11, 0x22, 0x33, 0x44, 0, 0, 0, 0x85, 1, 0, 9, 0,
@@ -1137,7 +1256,7 @@ fn extension_type_list_accepts_empty_and_rejects_zero_or_duplicate_values() {
         assert!(result.is_err());
     }
 
-    let wire = [0x32, 0x1f, 0, 7, 0, 0, 0, 0, 0, 0, 0, 0, 141, 0, 0];
+    let wire = [0x32, 0x1f, 0, 6, 0, 0, 0, 0, 0, 0, 0, 0, 141, 0];
     let message = decode(&wire);
     let notification = match &message {
         GtpuControlMessage::SupportedExtensionHeadersNotification(value) => value,
@@ -1210,7 +1329,7 @@ fn duplicate_timestamp_and_supported_type_list_fail_at_datagram_offsets() {
     assert_eq!(error.offset(), 19);
 
     let duplicate_type_list = [
-        0x32, 0x1f, 0, 12, 0, 0, 0, 0, 0, 0, 0, 0, 141, 0, 1, 0x40, 141, 0, 1, 0x85,
+        0x32, 0x1f, 0, 10, 0, 0, 0, 0, 0, 0, 0, 0, 141, 1, 0x40, 141, 1, 0x85,
     ];
     let error = GtpuControlMessage::decode(&duplicate_type_list, DecodeContext::default())
         .expect_err("duplicate Extension Header Type List must fail");
@@ -1218,7 +1337,7 @@ fn duplicate_timestamp_and_supported_type_list_fail_at_datagram_offsets() {
         error.code(),
         &GtpuControlCodecErrorCode::DuplicateIe { ie_type: 141 }
     );
-    assert_eq!(error.offset(), 16);
+    assert_eq!(error.offset(), 15);
 }
 
 #[test]
@@ -1241,7 +1360,7 @@ fn error_and_supported_notification_require_sequence_and_zero_header_teid() {
     assert_eq!(error.code(), &GtpuControlCodecErrorCode::InvalidHeaderTeid);
     assert_eq!(error.offset(), 4);
 
-    let supported_without_optional_header = [0x30, 0x1f, 0, 4, 0, 0, 0, 0, 141, 0, 1, 0x40];
+    let supported_without_optional_header = [0x30, 0x1f, 0, 3, 0, 0, 0, 0, 141, 1, 0x40];
     let error =
         GtpuControlMessage::decode(&supported_without_optional_header, DecodeContext::default())
             .expect_err("Supported Extension Headers Notification requires S=1");
