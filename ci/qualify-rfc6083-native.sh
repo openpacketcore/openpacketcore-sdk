@@ -39,6 +39,7 @@ rfc6083_cases=(
   dtls_tests::generic::restart::generic_kernel_process_restart_requires_fresh_mutual_authentication
   dtls_tests::generic::rekey::generic_kernel_rekey_preserves_multistream_records_and_rotates_keys
   dtls_tests::generic::sni::generic_kernel_sni_preserves_name_through_rekey_and_delivery
+  dtls_tests::generic::certificates::generic_kernel_certificate_profile_preserves_path_through_rekey
 )
 "$rfc6083_binary" --list --ignored --format terse > "$rfc6083_logs/inventory.log"
 for rfc6083_case in "${rfc6083_cases[@]}"; do
@@ -78,4 +79,6 @@ grep -Fq 'native protected SCTP SNI assertions completed: 3 ciphers, 6 transitio
   "$rfc6083_logs/generic_kernel_sni_preserves_name_through_rekey_and_delivery.log"
 grep -Fq 'native SNI wire verified: 3 named ClientHellos, 3 acknowledged ServerHellos, key IDs 0..3, 0 capture drops' \
   "$rfc6083_logs/generic_kernel_sni_preserves_name_through_rekey_and_delivery.log"
-echo 'native RFC 6083 qualification completed: 10 executed, 0 ignored'
+grep -Fq 'native protected SCTP certificate profile assertions completed: 3 ciphers, 6 transitions per peer' \
+  "$rfc6083_logs/generic_kernel_certificate_profile_preserves_path_through_rekey.log"
+echo 'native RFC 6083 qualification completed: 11 executed, 0 ignored'

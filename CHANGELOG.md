@@ -29,6 +29,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- `opc-diameter-transport`: add opt-in NDS/AF ECDSA certificate constraints
+  for generic RFC 6083 endpoints with required CRLs. Validate local and
+  selected peer paths, TLS CA constraints, key strength, names, criticality
+  and anchor expiry; retain the profile through rekey. Independent signed
+  fixtures and native SCTP tests qualify this bounded subset. Refs #794,
+  #784, #795.
+
 - `opc-diameter-transport`: add bounded RFC 6066 SNI for generic DTLS/SCTP
   endpoints, with exact server DNS SAN checks in addition to mutual SPIFFE
   authentication and the same name retained across coordinated rekey.

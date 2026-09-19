@@ -1,5 +1,6 @@
 //! Exercise the public generic boundary without constructing a Diameter session.
 
+pub(crate) mod certificates;
 mod independent;
 #[cfg(target_os = "linux")]
 mod paths;

@@ -682,6 +682,7 @@ jobs:
           "${RUNNER_TEMP}/dtls-reference/bin/python" vendor/dimpl/tests/dtls12/rfc5746_binding_reference.py --check
           "${RUNNER_TEMP}/dtls-reference/bin/python" vendor/dimpl/tests/dtls12/rfc5746_hello_reference.py --check
           "${RUNNER_TEMP}/dtls-reference/bin/python" vendor/dimpl/tests/dtls12/rfc6066_reference.py --check
+          "${RUNNER_TEMP}/dtls-reference/bin/python" crates/opc-diameter-transport/tests/fixtures/rfc6083/nds_certificates.py
 
       - name: Lint every all-feature DTLS target
         run: cargo clippy --manifest-path vendor/dimpl/Cargo.toml --all-features --all-targets -- -D warnings
