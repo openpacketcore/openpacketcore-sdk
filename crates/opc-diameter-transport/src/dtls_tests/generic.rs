@@ -2,6 +2,7 @@
 
 mod independent;
 mod revocation;
+mod streams;
 
 use super::*;
 use crate::rfc6083::{
@@ -18,7 +19,7 @@ fn peer(value: &str) -> ExpectedPeer {
     ExpectedPeer::spiffe(SpiffeId::new(value).expect("synthetic SPIFFE identity"))
 }
 
-async fn generic_pair(
+pub(crate) async fn generic_pair(
     material: &TestMaterial,
     client_policy: Policy,
     server_policy: Policy,

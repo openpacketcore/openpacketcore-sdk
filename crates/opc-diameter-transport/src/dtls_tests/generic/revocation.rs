@@ -132,8 +132,16 @@ impl Materials {
     }
 
     async fn pair(&self, source: CrlSource) -> (Connection, Connection, SctpWireLog) {
+        self.pair_with_policy(source, generic_policy(PayloadProtocol::Ngap))
+            .await
+    }
+
+    async fn pair_with_policy(
+        &self,
+        source: CrlSource,
+        policy: Policy,
+    ) -> (Connection, Connection, SctpWireLog) {
         let (local, remote, log) = in_memory_sctp_link(64);
-        let policy = generic_policy(PayloadProtocol::Ngap);
         let deadline = Instant::now() + Duration::from_secs(5);
         let local = Transport::in_memory(local, PayloadProtocol::Ngap);
         let remote = Transport::in_memory(remote, PayloadProtocol::Ngap);
@@ -155,6 +163,43 @@ impl Materials {
             )
         };
         (local.unwrap(), remote.unwrap(), log)
+    }
+}
+
+#[tokio::test]
+async fn required_crls_retire_queued_nonzero_streams_in_both_roles() {
+    for role in ["client", "server"] {
+        for replace in [false, true] {
+            let material = Materials::new(role);
+            let mut publication = CrlPublisher::new(&material.local);
+            publication.publish(fixture_crls(role, "valid")).unwrap();
+            let policy = Policy::ordered_streams(PayloadProtocol::Ngap, 4096, 16, 8).unwrap();
+            let (mut local, mut remote, log) = material
+                .pair_with_policy(publication.source(), policy)
+                .await;
+            let deadline = Instant::now() + Duration::from_secs(5);
+            remote
+                .send_on_stream(2, b"synthetic", deadline)
+                .await
+                .unwrap();
+            let received = local.receive(deadline).await.unwrap();
+            assert_eq!(received.stream_id(), 2);
+            assert_eq!(received.as_bytes(), b"synthetic");
+            remote.send_on_stream(3, b"queued", deadline).await.unwrap();
+            if replace {
+                publication.publish(fixture_crls(role, "newer")).unwrap();
+            } else {
+                publication.withdraw();
+            }
+            assert_eq!(local.readback().err(), Some(Error::Retired));
+            let sent = log.records().len();
+            assert_eq!(local.receive(deadline).await.err(), Some(Error::Retired));
+            assert_eq!(
+                local.send_on_stream(1, b"refused", deadline).await.err(),
+                Some(Error::Retired)
+            );
+            assert_eq!(log.records().len(), sent);
+        }
     }
 }
 

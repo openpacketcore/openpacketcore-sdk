@@ -260,15 +260,13 @@ pub(crate) trait SctpTransportClose: Send + Sync {
 /// Message-oriented SCTP seam between the DTLS association and a transport.
 ///
 /// The send side deliberately accepts only complete DTLS records: the
-/// implementation emits each record as its own ordered SCTP user message on
-/// stream 0 with PPID 47 (RFC 6083 sections 4.1 and 4.4). This keeps
-/// "PPID 47 only through an actual DTLS/SCTP association" and the
-/// one-record-per-message rule structural properties rather than caller
-/// discipline. The RFC 6083 engine profile disables its datagram replay
-/// window and relies on SCTP's reliable, ordered transport; this seam requires
-/// ordered stream-0 delivery for every record. The receive side surfaces every
-/// user message with its PPID so the association can fail closed on any
-/// cleartext input.
+/// implementation emits each record as its own ordered SCTP user message with
+/// the immutable protected PPID (RFC 6083 sections 4.1 and 4.4). Control records
+/// use stream zero; the generic policy can admit a bounded application stream
+/// range. The RFC 6083 engine disables its datagram replay window and relies
+/// on SCTP's reliable per-stream ordering and DATA authentication. Receive
+/// metadata retains the exact stream and PPID; decrypted record identities,
+/// rather than receive order, determine each application's stream.
 mod sctp_io_sealed {
     pub trait Sealed {}
 }
@@ -309,6 +307,22 @@ pub(crate) trait SctpMessageIo: sctp_io_sealed::Sealed + Send {
 
     /// Emit one complete DTLS record on ordered stream zero with the sealed PPID.
     fn send_dtls_record<'a>(&'a mut self, record: &'a [u8]) -> FrameTransportFuture<'a, ()>;
+
+    /// Emit one record on a selected reliable ordered application stream.
+    /// Control records always require stream zero. The default seam retains
+    /// the original stream-zero-only behavior.
+    fn send_dtls_record_on_stream<'a>(
+        &'a mut self,
+        record: &'a [u8],
+        stream_id: u16,
+    ) -> FrameTransportFuture<'a, ()> {
+        Box::pin(async move {
+            if stream_id != 0 {
+                return Err(DiameterTlsError::Transport);
+            }
+            self.send_dtls_record(record).await
+        })
+    }
 
     /// Receive the next SCTP user message, or `None` once the transport is
     /// cleanly closed and drained.
@@ -418,6 +432,8 @@ pub struct SctpWireRecord {
     pub a_to_b: bool,
     /// Payload protocol identifier of the emitted SCTP user message.
     pub ppid: u32,
+    /// Stream selected on the synthetic authenticated carrier.
+    pub stream_id: u16,
     /// Emitted payload length in bytes.
     pub payload_bytes: usize,
     /// SCTP-AUTH key identifier active when the message was submitted.
@@ -648,6 +664,7 @@ async fn emit_logged(
         log.push(SctpWireRecord {
             a_to_b: a_side,
             ppid: message.ppid(),
+            stream_id: message.stream_id(),
             payload_bytes: message.payload().len(),
             auth_key_id,
             record_header: (matches!(message.ppid(), DIAMETER_DTLS_SCTP_PPID | 66)
@@ -750,9 +767,17 @@ impl SctpMessageIo for InMemorySctpEndpoint {
     }
 
     fn send_dtls_record<'a>(&'a mut self, record: &'a [u8]) -> FrameTransportFuture<'a, ()> {
+        self.send_dtls_record_on_stream(record, 0)
+    }
+
+    fn send_dtls_record_on_stream<'a>(
+        &'a mut self,
+        record: &'a [u8],
+        stream_id: u16,
+    ) -> FrameTransportFuture<'a, ()> {
         Box::pin(async move {
             self.phase.ensure_dtls()?;
-            validate_outbound_dtls_record(record)?;
+            validate_outbound_dtls_stream(record, stream_id)?;
             self.wait_for_dtls_send().await?;
             let direction = if self.a_side {
                 &self.shared.next_a_to_b_metadata
@@ -764,7 +789,10 @@ impl SctpMessageIo for InMemorySctpEndpoint {
                 .expect("private metadata fault lock")
                 .take()
                 .unwrap_or_else(|| {
-                    SctpUserMessage::ordered_record(Bytes::new(), self.protected_ppid)
+                    let mut message =
+                        SctpUserMessage::ordered_record(Bytes::new(), self.protected_ppid);
+                    message.stream_id = stream_id;
+                    message
                 });
             message.payload = Bytes::copy_from_slice(record);
             self.emit(message).await
@@ -1168,14 +1196,22 @@ impl SctpMessageIo for KernelSctpMessageIo {
     }
 
     fn send_dtls_record<'a>(&'a mut self, record: &'a [u8]) -> FrameTransportFuture<'a, ()> {
+        self.send_dtls_record_on_stream(record, 0)
+    }
+
+    fn send_dtls_record_on_stream<'a>(
+        &'a mut self,
+        record: &'a [u8],
+        stream_id: u16,
+    ) -> FrameTransportFuture<'a, ()> {
         Box::pin(async move {
             self.phase.ensure_dtls()?;
-            validate_outbound_dtls_record(record)?;
+            validate_outbound_dtls_stream(record, stream_id)?;
             let sent = self
                 .send
                 .send(OutboundMessage::ordered(
                     Bytes::copy_from_slice(record),
-                    DIAMETER_DTLS_SCTP_STREAM,
+                    stream_id,
                     PayloadProtocolIdentifier::new(self.protected_ppid),
                 ))
                 .await
@@ -1857,9 +1893,15 @@ fn validate_peer_certificate_chain(
 struct PumpState {
     connected: bool,
     peer_certificate_expires_at: Option<Timestamp>,
-    inbound: VecDeque<Bytes>,
+    inbound: VecDeque<ReceivedApplication>,
+    streams: rfc6083::streams::RecordStreams,
     peer_closed: bool,
     outbound: Vec<Bytes>,
+}
+
+struct ReceivedApplication {
+    payload: Bytes,
+    stream_id: u16,
 }
 
 enum EnginePoll {
@@ -1892,7 +1934,8 @@ fn poll_engine(
     buffer: &mut Vec<u8>,
 ) -> Result<EnginePoll, DiameterTlsError> {
     loop {
-        match engine.poll_output(buffer) {
+        let (output, record) = engine.poll_output_with_record(buffer);
+        match output {
             dimpl::Output::Packet(packet) => state.outbound.push(Bytes::copy_from_slice(packet)),
             dimpl::Output::BufferTooSmall { needed } => {
                 grow_engine_poll_buffer(buffer, needed)?;
@@ -1919,7 +1962,11 @@ fn poll_engine(
                 if !state.connected {
                     return Err(DiameterTlsError::CleartextInput);
                 }
-                state.inbound.push_back(Bytes::copy_from_slice(plaintext));
+                let stream_id = state.streams.take(record, state.inbound.len())?;
+                state.inbound.push_back(ReceivedApplication {
+                    payload: Bytes::copy_from_slice(plaintext),
+                    stream_id,
+                });
             }
             dimpl::Output::Rfc6083KeyingMaterial(material) => {
                 return Ok(EnginePoll::InstallEpochKey(material));
@@ -2021,10 +2068,18 @@ fn validate_received_record_for(
     message: &SctpUserMessage,
     protected_ppid: u32,
 ) -> Result<&[u8], DiameterTlsError> {
+    validate_received_record_on_streams(message, protected_ppid, 1)
+}
+
+fn validate_received_record_on_streams(
+    message: &SctpUserMessage,
+    protected_ppid: u32,
+    stream_count: u16,
+) -> Result<&[u8], DiameterTlsError> {
     if message.ppid() != protected_ppid {
         return Err(DiameterTlsError::CleartextInput);
     }
-    if message.stream_id() != DIAMETER_DTLS_SCTP_STREAM
+    if message.stream_id() >= stream_count
         || message.order() != SctpDeliveryOrder::Ordered
         || message.truncated()
         || message.control_truncated()
@@ -2034,10 +2089,43 @@ fn validate_received_record_for(
         return Err(DiameterTlsError::Transport);
     }
     let bounds = parse_dtls_record_bounds(message.payload()).ok_or(DiameterTlsError::Transport)?;
-    if bounds.record_bytes != message.payload().len() {
+    if bounds.record_bytes != message.payload().len()
+        || (message.stream_id() != 0 && (bounds.content_type != Some(23) || bounds.epoch == 0))
+        // This opt-in profile uses DTLS 1.2 record identities. Initial
+        // handshakes may use the DTLS 1.0 compatibility version, but protected
+        // records must carry the negotiated DTLS 1.2 version on the wire.
+        || (stream_count > 1
+            && (bounds.unified
+                || (bounds.epoch != 0
+                    && message.payload().get(1..3) != Some(&[0xfe, 0xfd][..]))))
+    {
         return Err(DiameterTlsError::Transport);
     }
     Ok(message.payload())
+}
+
+fn handle_received_record(
+    engine: &mut dimpl::Dtls,
+    state: &mut PumpState,
+    message: &SctpUserMessage,
+    protected_ppid: u32,
+    packet_error: DiameterTlsError,
+) -> Result<(), DiameterTlsError> {
+    let record =
+        validate_received_record_on_streams(message, protected_ppid, state.streams.count())?;
+    state.streams.remember(message)?;
+    engine.handle_packet(record).map_err(|_| packet_error)
+}
+
+fn validate_outbound_dtls_stream(record: &[u8], stream_id: u16) -> Result<(), DiameterTlsError> {
+    validate_outbound_dtls_record(record)?;
+    if stream_id != 0 {
+        let bounds = parse_dtls_record_bounds(record).ok_or(DiameterTlsError::Transport)?;
+        if bounds.content_type != Some(23) || bounds.epoch == 0 {
+            return Err(DiameterTlsError::Transport);
+        }
+    }
+    Ok(())
 }
 
 fn validate_outbound_dtls_record(record: &[u8]) -> Result<(), DiameterTlsError> {
@@ -2078,7 +2166,13 @@ async fn flush_outbound(
     let datagrams = std::mem::take(&mut state.outbound);
     for datagram in datagrams {
         for record in split_dtls_records(&datagram)? {
-            io.send_dtls_record(record).await?;
+            let bounds = parse_dtls_record_bounds(record).ok_or(DiameterTlsError::Transport)?;
+            let stream_id = if bounds.content_type == Some(23) {
+                state.streams.outbound
+            } else {
+                0
+            };
+            io.send_dtls_record_on_stream(record, stream_id).await?;
         }
     }
     Ok(())
@@ -2145,13 +2239,26 @@ async fn run_transport_handshake(
     validation: &HandshakeValidation,
     deadline: Instant,
 ) -> Result<CompletedHandshake, DiameterTlsError> {
+    run_transport_handshake_with_streams(engine, io, validation, deadline, Default::default()).await
+}
+
+async fn run_transport_handshake_with_streams(
+    engine: &mut dimpl::Dtls,
+    io: &mut Box<dyn SctpMessageIo>,
+    validation: &HandshakeValidation,
+    deadline: Instant,
+    streams: rfc6083::streams::RecordStreams,
+) -> Result<CompletedHandshake, DiameterTlsError> {
     // dimpl starts the client flight and seeds server state from
     // handle_timeout; the explicit initial kick keeps the handshake
     // deterministic instead of depending on the engine's first timer.
     engine
         .handle_timeout(std::time::Instant::now())
         .map_err(|_| DiameterTlsError::TlsHandshake)?;
-    let mut state = PumpState::default();
+    let mut state = PumpState {
+        streams,
+        ..Default::default()
+    };
     let mut buffer = vec![0_u8; ENGINE_POLL_BUFFER];
     let mut auth_key_installed = false;
     let mut change_cipher_spec_prepared = false;
@@ -2227,10 +2334,13 @@ async fn run_transport_handshake(
                 .map_err(|_| DiameterTlsError::TlsHandshake)?,
             PumpEvent::Message(None) => return Err(DiameterTlsError::Transport),
             PumpEvent::Message(Some(message)) => {
-                let record = validate_received_record_for(&message, io.protected_ppid())?;
-                engine
-                    .handle_packet(record)
-                    .map_err(|_| DiameterTlsError::TlsHandshake)?;
+                handle_received_record(
+                    engine,
+                    &mut state,
+                    &message,
+                    io.protected_ppid(),
+                    DiameterTlsError::TlsHandshake,
+                )?;
             }
         }
     }
@@ -2271,10 +2381,13 @@ async fn pump_until_inbound(
                 .map_err(|_| DiameterTlsError::Transport)?,
             PumpEvent::Message(None) => return Err(DiameterTlsError::Transport),
             PumpEvent::Message(Some(message)) => {
-                let record = validate_received_record_for(&message, io.protected_ppid())?;
-                engine
-                    .handle_packet(record)
-                    .map_err(|_| DiameterTlsError::Transport)?;
+                handle_received_record(
+                    engine,
+                    state,
+                    &message,
+                    io.protected_ppid(),
+                    DiameterTlsError::Transport,
+                )?;
             }
         }
     }
@@ -3399,7 +3512,8 @@ async fn run_dtls_runtime_actor(
                     let wire = state
                         .inbound
                         .pop_front()
-                        .ok_or(DiameterTlsError::Transport)?;
+                        .ok_or(DiameterTlsError::Transport)?
+                        .payload;
                     let result = validate_wire_frame(&wire, request.limits).map(|()| wire);
                     let failed = result.is_err();
                     let _ = request.result.send(result);
@@ -4141,10 +4255,13 @@ async fn close_transport_via(
                 return Err(DiameterTlsError::Transport);
             }
             PumpEvent::Message(Some(message)) => {
-                let record = validate_received_record_for(&message, io.protected_ppid())?;
-                engine
-                    .handle_packet(record)
-                    .map_err(|_| DiameterTlsError::Transport)?;
+                handle_received_record(
+                    engine,
+                    pump_state,
+                    &message,
+                    io.protected_ppid(),
+                    DiameterTlsError::Transport,
+                )?;
             }
         }
     }
@@ -4171,9 +4288,25 @@ async fn write_application_via(
     wire: &[u8],
     deadline: Instant,
 ) -> Result<(), DiameterTlsError> {
+    write_application_on_stream_via(engine, io, pump_state, poll_buffer, wire, 0, deadline).await
+}
+
+async fn write_application_on_stream_via(
+    engine: &mut dimpl::Dtls,
+    io: &mut Box<dyn SctpMessageIo>,
+    pump_state: &mut PumpState,
+    poll_buffer: &mut Vec<u8>,
+    wire: &[u8],
+    stream_id: u16,
+    deadline: Instant,
+) -> Result<(), DiameterTlsError> {
     if Instant::now() >= deadline {
         return Err(DiameterTlsError::DeadlineExceeded);
     }
+    if stream_id >= pump_state.streams.count() || !pump_state.outbound.is_empty() {
+        return Err(DiameterTlsError::Transport);
+    }
+    pump_state.streams.outbound = stream_id;
     engine
         .send_application_data(wire)
         .map_err(|_| DiameterTlsError::Transport)?;
@@ -4218,7 +4351,7 @@ async fn read_wire_frame_via(
         .inbound
         .pop_front()
         .ok_or(DiameterTlsError::Transport)?;
-    decode_wire_frame(wire, frame_limits)
+    decode_wire_frame(wire.payload, frame_limits)
 }
 
 impl fmt::Debug for DiameterDtlsSctpConnection {
@@ -4557,6 +4690,7 @@ mod tests {
             vec![SctpWireRecord {
                 a_to_b: true,
                 ppid: DIAMETER_DTLS_SCTP_PPID,
+                stream_id: 0,
                 payload_bytes: DTLS_RECORD_HEADER_BYTES + 10,
                 auth_key_id: 0,
                 record_header: Some(

@@ -2,7 +2,7 @@
 //! SCTP message seam. These tests prove the RFC 6733 direct-protection
 //! sequencing and RFC 6083 PPID-47 carriage without requiring kernel SCTP.
 
-mod generic;
+pub(crate) mod generic;
 
 use std::num::NonZeroUsize;
 use std::time::Duration;
@@ -47,7 +47,7 @@ const APP_ID: ApplicationId = ApplicationId::new(16_777_264);
 
 type TestCa = rcgen::CertifiedIssuer<'static, rcgen::KeyPair>;
 
-struct TestMaterial {
+pub(crate) struct TestMaterial {
     _ca: TestCa,
     client_source: watch::Sender<Option<IdentityState>>,
     _server_source: watch::Sender<Option<IdentityState>>,
@@ -184,7 +184,7 @@ fn material_controller(
     )
 }
 
-fn dtls_material() -> TestMaterial {
+pub(crate) fn dtls_material() -> TestMaterial {
     let ca = test_ca();
     let (client_source, client_rx) = watch::channel(Some(identity_state(CLIENT_ID, &ca)));
     let (server_source, server_rx) = watch::channel(Some(identity_state(SERVER_ID, &ca)));
