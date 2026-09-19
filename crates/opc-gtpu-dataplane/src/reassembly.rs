@@ -414,6 +414,7 @@ impl fmt::Debug for DownlinkOuterProvenance {
 #[cfg(target_os = "linux")]
 pub struct GtpuReassemblySocket {
     socket: std::net::UdpSocket,
+    control_identity: std::sync::Arc<()>,
     interface_name: std::ffi::OsString,
     ingress_ifindex: u32,
     local_address: Ipv4Addr,
@@ -546,6 +547,7 @@ impl GtpuReassemblySocket {
         )?;
         Ok(Self {
             socket,
+            control_identity: std::sync::Arc::new(()),
             interface_name,
             ingress_ifindex,
             local_address,
@@ -641,7 +643,96 @@ impl GtpuReassemblySocket {
     /// truncated envelopes, absent packet info, conflicting provenance, or
     /// the underlying receive operation.
     pub fn receive(&self, buffer: &mut [u8]) -> std::io::Result<(usize, DownlinkOuterProvenance)> {
-        use nix::sys::socket::{recvmsg, ControlMessageOwned, MsgFlags, SockaddrIn};
+        self.receive_with_flags(buffer, nix::sys::socket::MsgFlags::empty())
+    }
+
+    /// Nonblocking receive from the same queue used for reassembled G-PDUs.
+    ///
+    /// A single caller must demultiplex this queue: do not concurrently call
+    /// `receive` and this method, or bind a competing reuse-port socket. The
+    /// returned G-PDU bytes/provenance can be passed to the existing reassembly
+    /// consumer. Malformed and unsupported-required-extension events must not
+    /// be decapsulated. This socket observation does not prove tc attachment,
+    /// an installed tunnel or peer admission.
+    ///
+    /// # Errors
+    /// Refuses a cap outside 8..=65,507 bytes, truncated payload/control data,
+    /// or lost exact binding. `Ok(None)` means the queue was empty.
+    pub fn try_receive_datagram(
+        &self,
+        maximum_bytes: usize,
+    ) -> Result<
+        Option<crate::control_port::GtpuControlDatagram>,
+        crate::control_port::GtpuControlPortError,
+    > {
+        use crate::control_port::{
+            GtpuControlDatagram, GtpuControlPortError, GTPU_CONTROL_MAX_DATAGRAM,
+        };
+        if !(8..=GTPU_CONTROL_MAX_DATAGRAM).contains(&maximum_bytes) {
+            return Err(GtpuControlPortError::InvalidLimits);
+        }
+        let mut bytes = vec![0; maximum_bytes];
+        match self.receive_with_flags(&mut bytes, nix::sys::socket::MsgFlags::MSG_DONTWAIT) {
+            Ok((length, provenance)) => {
+                bytes.truncate(length);
+                Ok(Some(GtpuControlDatagram::received(
+                    bytes.into(),
+                    provenance,
+                    std::sync::Arc::clone(&self.control_identity),
+                )))
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => Ok(None),
+            Err(error) => Err(error.into()),
+        }
+    }
+
+    /// Send one budgeted response through its exact receiving socket.
+    ///
+    /// The local IP/port and device binding are rechecked, and the response
+    /// keeps the message-specific destination chosen by its receive event.
+    /// Consumes the plan on every outcome. A success reports UDP payload bytes
+    /// accepted by the local kernel, not peer delivery or session authority.
+    ///
+    /// # Errors
+    /// Refuses another socket's plan, lost binding, a nonblocking send failure
+    /// or an unexpected partial write. No automatic retry or queue is created.
+    pub fn send_control_response(
+        &self,
+        plan: crate::control_port::GtpuControlSendPlan,
+    ) -> Result<usize, crate::control_port::GtpuControlPortError> {
+        use crate::control_port::GtpuControlPortError;
+        use nix::sys::socket::{sendto, MsgFlags, SockaddrIn};
+        use std::os::fd::AsRawFd;
+
+        if !std::sync::Arc::ptr_eq(&plan.socket_identity, &self.control_identity) {
+            return Err(GtpuControlPortError::SocketMismatch);
+        }
+        if plan.source != std::net::SocketAddrV4::new(self.local_address, GTPU_PORT) {
+            return Err(GtpuControlPortError::InvalidTuple);
+        }
+        self.verify_live_binding()?;
+        let written = sendto(
+            self.socket.as_raw_fd(),
+            &plan.bytes,
+            &SockaddrIn::from(plan.peer),
+            MsgFlags::MSG_DONTWAIT | MsgFlags::MSG_NOSIGNAL,
+        )
+        .map_err(std::io::Error::from)?;
+        if written != plan.bytes.len() {
+            return Err(GtpuControlPortError::Io {
+                kind: std::io::ErrorKind::WriteZero,
+            });
+        }
+        self.verify_live_binding()?;
+        Ok(written)
+    }
+
+    fn receive_with_flags(
+        &self,
+        buffer: &mut [u8],
+        flags: nix::sys::socket::MsgFlags,
+    ) -> std::io::Result<(usize, DownlinkOuterProvenance)> {
+        use nix::sys::socket::{recvmsg, ControlMessageOwned, SockaddrIn};
         use std::os::fd::AsRawFd;
 
         self.verify_live_binding()?;
@@ -651,7 +742,7 @@ impl GtpuReassemblySocket {
             self.socket.as_raw_fd(),
             &mut iov,
             Some(&mut cmsg_space),
-            MsgFlags::empty(),
+            flags,
         )?;
         validate_reassembly_envelope_flags(message.flags)?;
         // Close the blocking-receive race: an interface rename, deletion, or
@@ -699,6 +790,26 @@ impl GtpuReassemblySocket {
                 std::io::Error::new(std::io::ErrorKind::InvalidData, "non-canonical provenance")
             })?;
         Ok((message.bytes, provenance))
+    }
+}
+
+#[cfg(target_os = "linux")]
+impl crate::control_port::GtpuControlPort for GtpuReassemblySocket {
+    fn try_receive_datagram(
+        &self,
+        maximum_bytes: usize,
+    ) -> Result<
+        Option<crate::control_port::GtpuControlDatagram>,
+        crate::control_port::GtpuControlPortError,
+    > {
+        Self::try_receive_datagram(self, maximum_bytes)
+    }
+
+    fn send_control_response(
+        &self,
+        plan: crate::control_port::GtpuControlSendPlan,
+    ) -> Result<usize, crate::control_port::GtpuControlPortError> {
+        Self::send_control_response(self, plan)
     }
 }
 

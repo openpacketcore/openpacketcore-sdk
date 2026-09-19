@@ -92,6 +92,9 @@ jobs:
       - name: Check GTP-U extension-list reference vectors
         run: python3 crates/opc-proto-gtpu/tests/fixtures/extension_list.py --check
 
+      - name: Check shared GTP-U control receive/response vectors
+        run: python3 crates/opc-gtpu-dataplane/tests/fixtures/control_port.py --check
+
       - name: Validate complete NGAP messages with independent Release 18 ASN.1
         run: |
           python3 -m venv "${RUNNER_TEMP}/ngap-reference"
