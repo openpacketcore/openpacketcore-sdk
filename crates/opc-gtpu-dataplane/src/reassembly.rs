@@ -995,7 +995,7 @@ pub struct GtpuReassemblyCounters {
     /// Reassembled messages dropped as malformed, including corrupt PDR
     /// state (dual-map TEID, reserved zero mark).
     pub malformed: u64,
-    /// G-PDUs dropped for an unknown TEID.
+    /// Unknown-TEID G-PDUs; no inner forwarding, with possible eBPF control handoff.
     pub unknown_teid: u64,
     /// G-PDUs dropped by the outer-endpoint binding or the marked-bearer
     /// owner journal.

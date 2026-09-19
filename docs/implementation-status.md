@@ -627,11 +627,15 @@ bits, and places it first while retaining unrelated optional unknown headers in
 relative order; generic raw-preserving encoding remains byte-exact. Tunnel
 Status remains outside this codec slice.
 
-This is only the codec slice of #341. Backend-neutral control datagram
-receive/send ports, local/remote tuple metadata, Linux/eBPF integration,
-admission and amplification limits, live unknown-TEID response behavior, End
-Marker ordering, and cross-backend tests remain open. This section therefore
-does not close #341 or make a production dataplane claim.
+The codec is one part of #341. The shared IPv4 control port now retains exact
+local/peer tuples and byte/amplification budgets. eBPF attachments expose their
+owned socket, with native Echo, required-extension and unknown-TEID handoff
+tests; the latter proves exact Error Indication bytes and service-port rules.
+Kernel-GTP and mock ports return explicit unsupported results. IPv6 typed
+responses, per-tunnel End Marker ordering and equivalent kernel behavior remain
+open, as does installed N3 forwarding in #790. Packet reception grants no peer
+admission, tunnel-absence receipt, forwarding or restart authority. See the
+[control-port contract](../crates/opc-gtpu-dataplane/docs/control-port.md).
 
 ---
 

@@ -1489,6 +1489,39 @@ fn local_outer_endpoint_is_ipv4(ctx: &TcContext, address: &[u8; 4]) -> bool {
     gtpu_session_config_wire_owns_local_ipv4(unsafe { &*config_ptr }, packet_ifindex(ctx), address)
 }
 
+#[inline(always)]
+fn local_outer_endpoint_is_ipv6(ctx: &TcContext, address: &[u8; 16]) -> bool {
+    let Some(config_ptr) = GTPU_CONFIG6.get_ptr(GTPU_SESSION_CONFIG_KEY) else {
+        return false;
+    };
+    // SAFETY: single-slot array value written only by the loader; borrowed
+    // read-only for this canonicality check.
+    gtpu_session_config_wire_owns_local_ipv6(unsafe { &*config_ptr }, packet_ifindex(ctx), address)
+}
+
+/// Preserve an unselected G-PDU for the local control consumer. The caller
+/// has validated its full envelope and excluded retained invalid ownership.
+/// This is an observed lookup miss, not an absence receipt or permission to
+/// respond: the consumer must establish current absence and peer/rate policy.
+#[inline(never)]
+fn unknown_teid_control(ctx: &TcContext, family: GtpuSessionIpFamily) -> i32 {
+    count(COUNTER_DL_UNKNOWN_TEID);
+    let local = match family {
+        GtpuSessionIpFamily::Ipv4 => ctx
+            .load::<[u8; 4]>(ETH_HDR_LEN + 16)
+            .is_ok_and(|address| local_outer_endpoint_is_ipv4(ctx, &address)),
+        GtpuSessionIpFamily::Ipv6 => ctx
+            .load::<[u8; 16]>(ETH_HDR_LEN + 24)
+            .is_ok_and(|address| local_outer_endpoint_is_ipv6(ctx, &address)),
+    };
+    if !local {
+        return binding_drop(DownlinkBindingMismatch::LocalAddress);
+    }
+    // TC_ACT_OK keeps the original outer packet. Never decapsulate the inner
+    // payload or send an automatic Error Indication from the packet path.
+    TC_ACT_OK
+}
+
 /// Return whether this frame is one of this datapath's own re-emitted outer
 /// GTP-U frames traversing the egress hook a second time.
 ///
@@ -1569,16 +1602,7 @@ fn uplink_frame_is_redirect_reentry(ctx: &TcContext, mark: u32, eth_proto: u16) 
             let Ok(source) = ctx.load::<[u8; 16]>(ETH_HDR_LEN + 8) else {
                 return false;
             };
-            let Some(config_ptr) = GTPU_CONFIG6.get_ptr(GTPU_SESSION_CONFIG_KEY) else {
-                return false;
-            };
-            // SAFETY: single-slot array value written only by the loader;
-            // borrowed read-only for this canonicality check.
-            gtpu_session_config_wire_owns_local_ipv6(
-                unsafe { &*config_ptr },
-                packet_ifindex(ctx),
-                &source,
-            )
+            local_outer_endpoint_is_ipv6(ctx, &source)
         }
         _ => false,
     }
@@ -2861,9 +2885,9 @@ fn handle_downlink_ipv6(ctx: &mut TcContext) -> i32 {
         None if status == GROUPED_LOOKUP_ERROR => binding_drop(DownlinkBindingMismatch::Invalid),
         None => {
             // The frozen v5 schema has no outer-IPv6 selector. A valid G-PDU
-            // with no grouped owner is therefore unknown, never pass-through.
-            count(COUNTER_DL_UNKNOWN_TEID);
-            TC_ACT_SHOT
+            // with no grouped selector can reach only the configured local
+            // control endpoint; retained invalid grouped state was refused.
+            unknown_teid_control(ctx, GtpuSessionIpFamily::Ipv6)
         }
     }
 }
@@ -4038,8 +4062,12 @@ fn authorize_and_decap_legacy_downlink(
     let marked_pdr = GTPU_DLM_PDR.get_ptr(&teid);
     let (pdr, output_mark, owner_selector) = match (legacy_pdr, marked_pdr) {
         (None, None) => {
-            count(COUNTER_DL_UNKNOWN_TEID);
-            return TC_ACT_SHOT as i32;
+            if GTPU_DL_BIND.get_ptr(&teid).is_some() {
+                // A partially removed graph is not an unowned tunnel. Keep
+                // its retained binding fail-closed until reconciliation.
+                return binding_drop(DownlinkBindingMismatch::Invalid);
+            }
+            return unknown_teid_control(ctx, GtpuSessionIpFamily::Ipv4);
         }
         (Some(_), Some(_)) => {
             // A TEID must exist in exactly one schema. Treat externally

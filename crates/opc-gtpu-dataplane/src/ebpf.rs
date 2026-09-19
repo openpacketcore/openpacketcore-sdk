@@ -16332,7 +16332,7 @@ mod aya_runtime {
         GTPU_TRAFFIC_OBSERVATION_FLOW_SCRATCH_MAP_NAME,
     ];
 
-    const CURRENT_DOWNLINK_PROGRAM_MAP_NAMES: [&str; 22] = [
+    const CURRENT_DOWNLINK_PROGRAM_MAP_NAMES: [&str; 23] = [
         MAP_DOWNLINK_PDR,
         MAP_DOWNLINK_MARK_PDR,
         MAP_DOWNLINK_ENDPOINT_BINDING,
@@ -16345,6 +16345,7 @@ mod aya_runtime {
         MAP_MARKED_BEARER_OWNER,
         MAP_COUNTERS,
         MAP_DOWNLINK_BINDING_COUNTERS,
+        MAP_CONFIG,
         MAP_SESSION_GROUPS,
         MAP_SESSION_DOWNLINK_INDEX,
         MAP_CONFIG_IPV6,
@@ -51457,9 +51458,20 @@ mod aya_runtime {
             assert_ne!(swapped_map_ids, expected_successor_map_ids);
             assert_eq!(current_graph_inventory(), admitted_graph_inventory);
             let swapped_create = backend.create_device(create.clone()).await;
+            // Both classifiers now reference CONFIG and SEQUENCE_LOCK. Their
+            // unordered program map-ID sets therefore survive this swap, but
+            // the untyped layout check must reject the wrong kernel names
+            // before loading or binding any typed map.
             assert!(
-                matches!(swapped_create, Err(GtpuError::AlreadyExists)),
-                "map-ID-swapped successor must retain the live program-to-pin conflict without mutation: {swapped_create:?}"
+                matches!(
+                    swapped_create,
+                    Err(GtpuError::Io {
+                        operation: "ebpf_pin_map_abi",
+                        kind: io::ErrorKind::InvalidData,
+                        raw_os_error: None,
+                    })
+                ),
+                "map-ID-swapped successor must retain the exact pin-layout refusal without mutation: {swapped_create:?}"
             );
             assert_eq!(
                 AyaGtpuRuntime::pinned_map_ids(

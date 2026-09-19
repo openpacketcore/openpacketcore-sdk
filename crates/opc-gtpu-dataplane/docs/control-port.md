@@ -70,10 +70,28 @@ error; no reuse-port distribution is enabled.
 
 The port grants no tunnel installation, selector provenance, peer admission,
 or forwarding authority. Kernel/eBPF/mock parity, IPv6 typed responses,
-outgoing Echo requests, per-tunnel End Marker ordering, unknown-TEID control
-handoff and installed N3 forwarding remain tracked by #341 and #790.
+outgoing Echo requests, per-tunnel End Marker ordering and installed N3
+forwarding remain tracked by #341 and #790.
 Existing forwarding capabilities and checksum-offload control pass-through
 are unchanged.
+
+After validating the outer envelope and complete extension chain, the eBPF
+classifier sends a G-PDU with a nonzero, unselected TEID to this queue only
+when its outer destination is a configured local endpoint. It preserves the
+GTP-U bytes and never forwards the inner packet. The unknown-TEID counter
+still counts the lookup miss. A retained grouped selector with invalid
+authority, or a legacy endpoint binding without its PDR, remains a drop;
+neither becomes an unknown-tunnel event. This lookup-miss path refuses zero
+TEID and malformed packets. Grouped IPv6 attachments deliver the raw G-PDU to
+the local UDP stack, but the typed IPv6 port remains unsupported.
+
+An observed lookup miss is not an absence receipt. Installed state can
+change before a consumer processes the datagram, and the queue also serves
+reassembled packets. The caller must establish current tunnel absence and
+apply its peer/rate policy before consuming the event into an Error
+Indication plan. There is no automatic GTP-U response or packet-driven state
+mutation. This implements the receive boundary needed by TS 29.281 clause
+7.3.1 while retaining the SDK's existing bounded IP-payload parser profile.
 
 Validation uses independently authored packet literals, all 65,536 source
 ports at four sequence boundaries, all 255 nonterminal extension types,
@@ -112,3 +130,20 @@ as a compile-time API detector. Four separate production guard removals
 and an independent Echo sequence mutation each compile and fail during the
 native scenario. Restored native cases pass. The PR retains exact public
 base/head/tree and complete repository/hosted qualification.
+
+The unknown-TEID native case uses the real committed tc object on both legacy
+and grouped attachments. It checks exact independent Error Indication bytes,
+the triggering dynamic UDP source-port extension and response service port,
+both sequence-block forms, unchanged IPv6 delivery, no inner delivery,
+wrong-local-endpoint refusal, zero TEID, malformed length/checksum, and retained
+inconsistent ownership. Restoring the known context resumes ordinary
+decapsulation without a control event. Both privileged CI lanes require its
+completion marker and include it in their exact ignored-test inventory.
+The original committed object fails the receive deadline. Seven separate
+production guard removals (both handoffs, both local-endpoint checks, retained
+legacy binding and each retained grouped-state check) and an independent
+triggering-TEID mutation compile and fail at the packet assertions. Restored
+sources and the rebuilt object are byte-identical and pass. The local endpoint
+check adds the existing IPv4 configuration map to the downlink program's exact
+map-identity set; map layouts, pin inventory and frozen historical objects do
+not change.

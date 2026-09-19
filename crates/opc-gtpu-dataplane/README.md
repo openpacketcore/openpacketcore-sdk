@@ -2470,3 +2470,7 @@ an IPv4 endpoint. Handles share one queue and lose access on removal,
 replacement, backend loss or observed hook loss. Linux kernel/mock adapters
 return an exact unsupported result. See the [control-port contract](docs/control-port.md)
 for socket lifetime, response budgets and the remaining backend limitations.
+Validated nonzero unknown-TEID G-PDUs can reach only the configured local
+control endpoint without decapsulation. Retained inconsistent ownership stays
+dropped. The consumer must establish current absence and its response policy;
+receiving a packet does not authorize a tunnel change or automatic reply.
