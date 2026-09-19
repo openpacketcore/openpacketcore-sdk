@@ -45,7 +45,6 @@ use opc_proto_ngap::n3iwf::resource_fields::{
     DownlinkTransport, QosFlowSetupList, SessionAggregateBitRate, SessionType, UplinkTransport,
 };
 use opc_proto_ngap::n3iwf::resource_request::SetupRequestTransfer;
-use opc_proto_ngap::n3iwf::resource_results::SetupResponseTransfer;
 #[path = "support/setup_failure_diagnostics.rs"]
 mod setup_failure_diagnostics;
 use opc_proto_ngap::n3iwf::session_lists::{
@@ -58,6 +57,7 @@ use opc_proto_ngap::n3iwf::setup::{
 use opc_proto_ngap::n3iwf::{AmfUeId, N3iwfLocation, NasPdu, RanUeId, SecurityKey, TrackingArea};
 use opc_proto_ngap::{encode, Criticality, MessageType, Pdu, ProtocolIe};
 use opc_protocol::{DecodeContext, Encode, EncodeContext, OwnedDecode, ValidationLevel};
+use resource_setup::resource_security::setup_tunnels;
 
 /// The decode entry point the fuzz target exercises. Must never panic,
 /// regardless of input. Decode returning `Err` is expected and fine.
@@ -178,10 +178,17 @@ fn exercise(data: &[u8]) {
         assert!(received.notify_ie_ids.is_empty());
     }
     let result_ctx = DecodeContext { max_ies: 64, ..ctx };
-    if let Ok(value) = SetupResponseTransfer::decode(data, result_ctx) {
-        let wire = value.encode(EncodeContext::default()).unwrap();
-        assert!(SetupResponseTransfer::decode(wire.as_bytes(), result_ctx).unwrap() == value);
-    }
+    setup_tunnels::exercise(
+        data,
+        DecodeContext {
+            max_ies: 320,
+            ..result_ctx
+        },
+        EncodeContext {
+            max_message_len: ctx.max_message_len,
+            ..EncodeContext::default()
+        },
+    );
     setup_failure_diagnostics::exercise(
         data,
         DecodeContext {

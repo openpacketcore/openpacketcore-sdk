@@ -57,7 +57,7 @@ use opc_proto_ngap::n3iwf::resource_fields::{
     DownlinkTransport, QosFlowSetupList, SessionAggregateBitRate, SessionType, UplinkTransport,
 };
 use opc_proto_ngap::n3iwf::resource_request::SetupRequestTransfer;
-use opc_proto_ngap::n3iwf::resource_results::SetupResponseTransfer;
+use resource_setup::resource_security::setup_tunnels;
 #[path = "../../tests/support/setup_failure_diagnostics.rs"]
 mod setup_failure_diagnostics;
 use opc_proto_ngap::n3iwf::session_lists::{
@@ -171,10 +171,7 @@ fuzz_target!(|data: &[u8]| {
         max_ies: 64,
         ..decode
     };
-    if let Ok(value) = SetupResponseTransfer::decode(data, result_ctx) {
-        let wire = resource_setup::resource_security::response(&value).encode(output).unwrap();
-        assert!(SetupResponseTransfer::decode(wire.as_bytes(), result_ctx).unwrap() == value);
-    }
+    setup_tunnels::exercise(data, DecodeContext { max_ies: 320, ..result_ctx }, EncodeContext { max_message_len: decode.max_message_len, ..EncodeContext::default() });
     setup_failure_diagnostics::exercise(data, DecodeContext { max_ies: 256, ..result_ctx }, output);
     let list_ctx = DecodeContext {
         max_ies: 256,
