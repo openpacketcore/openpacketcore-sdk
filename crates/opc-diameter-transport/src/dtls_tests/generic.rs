@@ -1,6 +1,7 @@
 //! Exercise the public generic boundary without constructing a Diameter session.
 
 mod independent;
+mod revocation;
 
 use super::*;
 use crate::rfc6083::{

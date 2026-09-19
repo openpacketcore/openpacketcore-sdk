@@ -11,8 +11,11 @@
 //! drains, retirement and close machinery. It requires no Diameter identity,
 //! peer session, CER/CEA or NGAP procedure state. The certificate profile is
 //! SPIFFE with exact identity, trust-domain anchors, chain time/signatures and
-//! role EKU checks; it does not implement the complete 3GPP PKI or CRL/OCSP
-//! profile. Material withdrawal or replacement retires the association.
+//! role EKU checks. [`Connector::new_with_required_crls`] and
+//! [`Acceptor::new_with_required_crls`] additionally require an epoch-bound
+//! complete direct CRL publication; the original constructors do not check
+//! revocation. The complete 3GPP PKI and OCSP profiles remain unsupported.
+//! Material or required-CRL withdrawal/replacement retires the association.
 //! In-place renegotiation is unsupported; establish a fresh association.
 //!
 //! ```no_run
@@ -39,6 +42,12 @@
 
 use super::*;
 use opc_types::SpiffeId;
+
+pub(in crate::dtls) mod revocation;
+pub use revocation::{
+    CrlError, CrlEvidence, CrlGeneration, CrlPublisher, CrlSource, MAX_CRLS, MAX_CRL_BYTES,
+    MAX_CRL_SET_BYTES,
+};
 
 pub use super::{DtlsSctpCipher as Cipher, DtlsSctpVersion as Version};
 
@@ -278,6 +287,7 @@ struct Endpoint {
     expected_peer: ExpectedPeer,
     policy: Policy,
     engine_config: Arc<dimpl::Config>,
+    crls: Option<CrlSource>,
 }
 
 impl Endpoint {
@@ -292,6 +302,7 @@ impl Endpoint {
             expected_peer,
             policy,
             engine_config,
+            crls: None,
         })
     }
 
@@ -316,6 +327,17 @@ impl Endpoint {
                 certificate,
                 trust_bundles,
             } = prepare_material(&self.controller).await?;
+            let mut crls = self
+                .crls
+                .as_ref()
+                .map(|source| source.bind(handshake.epoch()))
+                .transpose()?;
+            let handshake_deadline = crls.as_ref().map_or(deadline, |v| {
+                deadline.min(wall_expiry_deadline(
+                    v.evidence().expires_at(),
+                    Instant::now(),
+                ))
+            });
             let mut engine = new_policy_engine(Arc::clone(&self.engine_config), certificate)?;
             engine.set_active(role == Role::Connector);
             let validation = HandshakeValidation {
@@ -325,9 +347,19 @@ impl Endpoint {
                     Role::Connector => PeerUsage::Server,
                     Role::Acceptor => PeerUsage::Client,
                 },
+                revocation: crls.as_ref().map(|v| Arc::clone(&v.snapshot)),
             };
-            let completed =
-                run_transport_handshake(&mut engine, &mut io, &validation, deadline).await?;
+            let handshake_result =
+                run_transport_handshake(&mut engine, &mut io, &validation, handshake_deadline);
+            let completed = if let Some(binding) = crls.as_mut() {
+                tokio::select! {
+                    biased;
+                    () = binding.retired() => return Err(Error::Retired),
+                    result = handshake_result => result?,
+                }
+            } else {
+                handshake_result.await?
+            };
             if completed.state.peer_closed {
                 return Err(Error::PeerClosed);
             }
@@ -354,6 +386,12 @@ impl Endpoint {
                 admission.certificate_chain_expires_at(),
                 completed.peer_expires_at,
             );
+            let hard_deadline = crls.as_ref().map_or(hard_deadline, |v| {
+                hard_deadline.min(wall_expiry_deadline(
+                    v.evidence().expires_at(),
+                    Instant::now(),
+                ))
+            });
             let close = io.close_handle();
             let retired = Arc::new(AtomicBool::new(false));
             let retirement_task = spawn_retirement_task(
@@ -363,6 +401,9 @@ impl Endpoint {
                 Arc::clone(&retired),
                 Arc::clone(&close),
             );
+            let crl_retirement_task = crls
+                .as_ref()
+                .map(|v| v.spawn_retirement(Arc::clone(&retired), Arc::clone(&close)));
             let connection = Connection {
                 engine,
                 io,
@@ -376,12 +417,15 @@ impl Endpoint {
                     local_certificate_expires_at: admission.certificate_chain_expires_at(),
                     peer_certificate_expires_at: completed.peer_expires_at,
                     expected_peer: self.expected_peer.clone(),
+                    crls: crls.as_ref().map(|v| v.evidence()),
                 },
                 maximum_plaintext_bytes: self.policy.maximum_plaintext_bytes,
                 material_status,
                 hard_deadline,
                 retired,
                 _retirement_task: retirement_task,
+                crls,
+                _crl_retirement_task: crl_retirement_task,
                 pump: completed.state,
                 buffer: completed.buffer,
                 closed: Arc::new(AtomicBool::new(false)),
@@ -409,6 +453,18 @@ impl Connector {
         policy: Policy,
     ) -> Result<Self, Error> {
         Endpoint::new(material, expected_peer, policy).map(Self)
+    }
+
+    /// Require complete direct CRL coverage using the source's own material
+    /// controller. No handshake falls back if this exact source/epoch is unavailable.
+    pub fn new_with_required_crls(
+        source: CrlSource,
+        expected_peer: ExpectedPeer,
+        policy: Policy,
+    ) -> Result<Self, Error> {
+        let mut endpoint = Endpoint::new(source.controller(), expected_peer, policy)?;
+        endpoint.crls = Some(source);
+        Ok(Self(endpoint))
     }
 
     /// Consume the carrier and complete protection under one absolute deadline.
@@ -441,6 +497,18 @@ impl Acceptor {
         Endpoint::new(material, expected_peer, policy).map(Self)
     }
 
+    /// Require complete direct CRL coverage using the source's own material
+    /// controller. No handshake falls back if this exact source/epoch is unavailable.
+    pub fn new_with_required_crls(
+        source: CrlSource,
+        expected_peer: ExpectedPeer,
+        policy: Policy,
+    ) -> Result<Self, Error> {
+        let mut endpoint = Endpoint::new(source.controller(), expected_peer, policy)?;
+        endpoint.crls = Some(source);
+        Ok(Self(endpoint))
+    }
+
     /// Consume the carrier and complete protection under one absolute deadline.
     pub async fn accept(
         &self,
@@ -471,6 +539,7 @@ pub struct Evidence {
     local_certificate_expires_at: Timestamp,
     peer_certificate_expires_at: Timestamp,
     expected_peer: ExpectedPeer,
+    crls: Option<CrlEvidence>,
 }
 
 impl Evidence {
@@ -505,6 +574,10 @@ impl Evidence {
     /// Exact caller-selected identity that matched the verified peer certificate.
     pub const fn expected_peer(&self) -> &ExpectedPeer {
         &self.expected_peer
+    }
+    /// Verified direct-CRL publication, or `None` for the explicit legacy profile.
+    pub const fn crls(&self) -> Option<CrlEvidence> {
+        self.crls
     }
 }
 
@@ -557,6 +630,8 @@ pub struct Connection {
     hard_deadline: Instant,
     retired: Arc<AtomicBool>,
     _retirement_task: RetirementTask,
+    crls: Option<revocation::Binding>,
+    _crl_retirement_task: Option<RetirementTask>,
     pump: PumpState,
     buffer: Vec<u8>,
     closed: Arc<AtomicBool>,
@@ -668,12 +743,14 @@ impl Connection {
     }
 
     fn ensure_authentication_current(&self) -> Result<(), Error> {
-        if retirement_required(
-            &self.material_status,
-            self.evidence.material_epoch,
-            self.hard_deadline,
-            &self.retired,
-        ) {
+        if self.crls.as_ref().is_some_and(|v| !v.retained())
+            || retirement_required(
+                &self.material_status,
+                self.evidence.material_epoch,
+                self.hard_deadline,
+                &self.retired,
+            )
+        {
             self.retired.store(true, Ordering::Release);
             self.close.close();
             return Err(Error::Retired);
