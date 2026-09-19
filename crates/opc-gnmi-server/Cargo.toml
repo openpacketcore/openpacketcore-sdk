@@ -45,6 +45,10 @@ protoc-bin-vendored = "3.2.0"
 tonic-prost-build = { version = "0.14.6", default-features = false, features = ["transport"] }
 
 [dev-dependencies]
+opc-config-bus-consensus = { path = "../opc-config-bus-consensus", version = "0.2.0" }
+opc-consensus = { path = "../opc-consensus", version = "0.2.0" }
+opc-persist = { path = "../opc-persist", version = "0.2.0" }
+tempfile = "3"
 async-trait = { workspace = true }
 bytes = { workspace = true }
 http-body-util = "0.1"

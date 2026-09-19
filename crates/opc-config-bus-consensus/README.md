@@ -60,6 +60,16 @@ writer never forwards a mutation. See the
 for protocol-sink scope, caller privacy, response-loss recovery and the separate
 external-checkpoint composition.
 
+For gNMI, obtain `bus.required_config_audit()?` from that same encrypted bus,
+pass its `observation_sink()` to the server constructor, and install the
+capability with `server.with_required_config_audit(audit)?`. The server rejects
+a capability from another bus worker. Set transfers its original protocol
+intent and request together; the encrypted append admits one effect-bound
+intent before mutation. The observation sink refuses standalone Intents, so
+it cannot silently authorize a legacy Set path. Plain and unaudited encryption
+wrappers expose no capability, and the distinct required-append method has no
+ordinary-append fallback. NETCONF keeps its existing contract.
+
 `RaftManagedDatastore::config_authority()` returns a
 `ConsensusConfigAuthority` over that exact `ConsensusConfigStore`. The adapter
 uses its local-only Openraft read-index/apply barrier, never a second leader

@@ -19,6 +19,7 @@ async-trait = { workspace = true }
 futures-util = "0.3"
 opc-alarm = { path = "../opc-alarm", version = "0.2.0" }
 opc-config-model = { path = "../opc-config-model", version = "0.2.0" }
+opc-mgmt-audit = { path = "../opc-mgmt-audit", version = "0.2.0" }
 opc-crypto = { path = "../opc-crypto", version = "0.2.0" }
 opc-key = { path = "../opc-key", version = "0.2.0" }
 opc-types = { path = "../opc-types", version = "0.2.0" }

@@ -1,6 +1,6 @@
 # Replicated management audit and operation recovery
 
-Tracking: #796, #797, #798. This document describes the replicated audit
+Tracking: #796, #797, #798, #927. This document describes the replicated audit
 authority and its required-audit ConfigBus composition. Multi-epoch signing,
 export/checkpoint and safe-pruning behavior is specified separately below.
 
@@ -128,7 +128,30 @@ identifier alone is not permission to reapply a mutation. The supervisor must
 run bounded `reconcile_audit_obligations` at startup and during maintenance;
 it can recover committed terminal obligations without a client-held handle.
 
-Protocol `AuditSink` observations still provide authorization/validation
+For gNMI, install `GnmiServer::with_required_config_audit` using the capability
+returned by that exact bus's `required_config_audit()` method. Pass the
+capability's `observation_sink()` to the server constructor. Possession of the
+capability supplies neither an authorization grant nor an acknowledged intent.
+The protocol intent and immutable config request transfer together into the
+existing worker. Authorization and validation precede a distinct required-audit
+append, whose default refuses the effect. Encryption forwards this exact port.
+The audited Raft adapter checks request identity, caller, operation and transport
+against the commit context, preserves the protocol timestamp/schema paths, and
+binds them to the full sealed effect before admitting its sole Intent. No
+standalone protocol intent, synthetic receipt or replacement RequestId is used.
+
+The capability is tied to a worker channel; a different bus, even over the same
+store, cannot borrow it. Legacy and unaudited encryption wrappers expose no
+capability. Reads and protocol/worker refusals before append use a bounded
+observation sink on the same store. It projects private fields before handing
+immutable work to cancellation-independent processing and rejects Intent.
+After append begins the worker does not create a generic terminal observation:
+the exact retained ledger operation is the sole configuration-outcome authority.
+A canceled RPC cannot cancel admitted worker work. Terminal checkpoint debt
+preserves a known committed reply, fences later writes, and is recovered by the
+existing supervisor without a new handle, expiry or mutation.
+
+On the legacy sink path, protocol `AuditSink` observations provide authorization/validation
 denials and protocol-level audit policy. gNMI/NETCONF required Intent errors,
 panics or cancellation forbid their guarded mutation, and terminal failures
 preserve the original committed result or original rejection while exposing
@@ -196,6 +219,14 @@ audit capacity, invalid projection, missing Northbound context, follower-write
 refusal and atomic confirmed-commit confirmation/cancellation. Protocol tests
 separately exercise sync/async sink failures, panics and cancellation around
 local and running mutation paths.
+
+The required handoff tests additionally run the authenticated `GnmiService`
+against an encrypted three-voter authority and independent synthetic checkpoint.
+They verify one intent/result/terminal sequence, original request identity,
+missing/foreign/unaudited refusal, authorization and validation observations,
+cancellation after retained intent and exact terminal checkpoint recovery.
+The unsupported standalone-intent/config-effect collision remains a strict
+negative test; it was not converted into mutation authority.
 
 These tests do not prove deployed storage/network behavior, a product release,
 key rotation, rollback resistance against whole-database restore, or complete

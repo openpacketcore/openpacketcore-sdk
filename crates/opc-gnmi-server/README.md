@@ -53,7 +53,7 @@ retract the append. An error, timeout, or dropped RPC after admission can leave
 the durable outcome unknown; the server never treats that as proof that no
 record was written.
 
-Set requires an acknowledged intent before submitting an ordinary commit,
+The legacy sink path requires an acknowledged intent before submitting an ordinary commit,
 commit-confirmed begin, confirm, or cancel. Failed or unknown intent recording
 prevents submission. Once the config bus returns success, a failed terminal
 audit write does not turn that commit into a failed Set. Terminal recording
@@ -65,6 +65,32 @@ That counter is an audit-degradation signal, not a durable operation receipt.
 Restart-safe terminal obligations and cross-leader reconciliation remain the
 separate issue #797 dependency of #796. The legacy `AuditSink` contract alone
 cannot establish those guarantees after RPC cancellation or process loss.
+
+For the replicated required-audit datastore, use the SDK-owned handoff from
+the exact encrypted ConfigBus (issue #927):
+
+```rust,ignore
+let audit = bus.required_config_audit()?;
+let server = GnmiServer::new(binding, limits, profile, extensions,
+    audit.observation_sink())?
+    .with_required_config_audit(audit)?;
+```
+
+The capability is bound to that bus worker and is not an intent receipt or an
+authorization grant. Set transfers the protocol intent with the original
+request into the worker. After authorization and validation, the required
+datastore admits a single intent bound to the complete encrypted config effect
+before applying it. It retains the exact authoritative result and terminal
+obligation across cancellation and checkpoint failure. A standalone protocol
+intent must never be admitted first: that different operation correctly
+collides with the effect's request binding. No new request ID is substituted.
+
+Read and pre-append rejection observations use the same consensus authority's
+bounded, privacy-projecting observation sink. That sink rejects Intents.
+Unaudited stores refuse the capability and required append; a capability from
+another worker is rejected when constructing the server and on submission.
+Keep the existing config-authority/projection gate and audit recovery
+supervisor. This opt-in does not change NETCONF candidate or startup contracts.
 
 ## HA config authority opt-in
 

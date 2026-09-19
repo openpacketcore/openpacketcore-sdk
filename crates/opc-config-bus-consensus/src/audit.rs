@@ -19,8 +19,8 @@ use opc_persist::{
 /// single admitted operation; it does not extend ConfigBus request deadlines.
 #[derive(Clone)]
 pub struct ConfigAuditPolicy {
-    privacy: Arc<dyn AuditPrivacyProjection>,
-    lifetime: Duration,
+    pub(super) privacy: Arc<dyn AuditPrivacyProjection>,
+    pub(super) lifetime: Duration,
 }
 
 impl ConfigAuditPolicy {
@@ -40,6 +40,7 @@ impl ConfigAuditPolicy {
         &self,
         store: &ConsensusConfigStore,
         commit: CommitWrite<SealedConfig<C>>,
+        protocol: Option<opc_mgmt_audit::AuditEvent>,
     ) -> Result<(), StoreError> {
         let context = commit.audit_context().ok_or_else(|| {
             StoreError::internal("required configuration audit context unavailable")
@@ -77,19 +78,44 @@ impl ConfigAuditPolicy {
         // This is the complete configuration commit boundary. Exact private
         // paths/mode/candidate remain in the authenticated encrypted payload;
         // do not parse instance paths or retain plaintext replay metadata here.
-        let event = ManagementAuditEventRecord::try_new(
-            *context.request_id().as_uuid().as_bytes(),
-            occurred_at,
-            record.principal.tenant.as_str(),
-            principal,
-            transport,
-            operation,
-            ManagementAuditOutcomeCode::Intent,
-            None::<&str>,
-            std::iter::empty::<&str>(),
-            Some(record.tx_id.to_string()),
-        )
-        .map_err(|_| StoreError::internal("invalid configuration audit context"))?;
+        let event = if let Some(mut event) = protocol {
+            let expected_operation = match context.operation() {
+                ConfigOperation::Replace => opc_mgmt_audit::AuditOperation::Replace,
+                ConfigOperation::Patch => opc_mgmt_audit::AuditOperation::Update,
+                ConfigOperation::Delete => opc_mgmt_audit::AuditOperation::Delete,
+                ConfigOperation::Rollback => opc_mgmt_audit::AuditOperation::Rollback,
+            };
+            if event.request_id != context.request_id()
+                || event.transport != context.transport()
+                || event.operation != expected_operation
+                || event.principal != principal
+                || event.tenant != record.principal.tenant.as_str()
+                || event.outcome != opc_mgmt_audit::AuditOutcome::Intent
+                || event.tx_id.is_some()
+            {
+                return Err(StoreError::unavailable(
+                    "configuration audit request binding mismatch",
+                ));
+            }
+            event = event
+                .with_tx_id(record.tx_id.to_string())
+                .map_err(|_| StoreError::internal("invalid configuration audit transaction"))?;
+            super::audit_observations::convert_event(&event)?
+        } else {
+            ManagementAuditEventRecord::try_new(
+                *context.request_id().as_uuid().as_bytes(),
+                occurred_at,
+                record.principal.tenant.as_str(),
+                principal,
+                transport,
+                operation,
+                ManagementAuditOutcomeCode::Intent,
+                None::<&str>,
+                std::iter::empty::<&str>(),
+                Some(record.tx_id.to_string()),
+            )
+            .map_err(|_| StoreError::internal("invalid configuration audit context"))?
+        };
         let commit = super::attested_bus_commit(commit)?;
         let prepared = store
             .prepare_audited_commit(self.privacy.as_ref(), &event, commit, self.lifetime)

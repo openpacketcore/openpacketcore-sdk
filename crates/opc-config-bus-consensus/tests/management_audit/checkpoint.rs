@@ -8,7 +8,7 @@ use std::sync::atomic::{AtomicU64, AtomicUsize};
 
 // Synthetic separately owned monotonic authority, never a production provider.
 #[derive(Default)]
-struct CheckpointFixture {
+pub(super) struct CheckpointFixture {
     value: std::sync::Mutex<Option<AuditCheckpoint>>,
     unavailable: AtomicBool,
     advance_unavailable: AtomicBool,
@@ -230,7 +230,7 @@ async fn committed_terminal_checkpoint_debt_fences_new_writes_until_exact_recove
 }
 
 impl CheckpointFixture {
-    fn sequence(&self) -> u64 {
+    pub(super) fn sequence(&self) -> u64 {
         self.value
             .lock()
             .expect("checkpoint lock")
@@ -281,7 +281,7 @@ async fn acknowledge_current_prefix(
         .await
 }
 
-fn next_checkpointed_request() -> CommitRequest<TestConfig> {
+pub(super) fn next_checkpointed_request() -> CommitRequest<TestConfig> {
     CommitRequest::commit(
         RequestId::new(),
         principal(),
