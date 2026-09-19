@@ -171,7 +171,7 @@ fuzz_target!(|data: &[u8]| {
         max_ies: 64,
         ..decode
     };
-    setup_tunnels::exercise(data, DecodeContext { max_ies: 320, ..result_ctx }, EncodeContext { max_message_len: ctx.max_message_len, ..EncodeContext::default() });
+    setup_tunnels::exercise(data, DecodeContext { max_ies: 320, ..result_ctx }, EncodeContext { max_message_len: decode.max_message_len, ..EncodeContext::default() });
     setup_failure_diagnostics::exercise(data, DecodeContext { max_ies: 256, ..result_ctx }, output);
     let list_ctx = DecodeContext {
         max_ies: 256,
