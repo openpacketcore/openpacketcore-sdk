@@ -25,16 +25,24 @@ state and verifies the selected primary peer path before the protected
 handshake. Both DTLS roles take turns on the SCTP connecting endpoint; DTLS
 roles do not have to match the SCTP active/passive socket roles.
 
+Before the handshake, a separate probe requires a nonzero total drop count
+while the PPID 66 DATA count stays zero. This prevents heartbeats and other
+non-DATA chunks from qualifying application-path loss. The two counters use
+the kernel's [SCTP chunk expression](https://netfilter.org/projects/nftables/manpage.html)
+and an all-SCTP drop rule for the selected destination. Both rules are scoped
+to the current association's ports, excluding traffic from prior associations.
+
 After mutual DTLS authentication, both directions exchange exact opaque
 records on streams 0, 1, 2 and 15. A private nftables rule then drops all SCTP
 traffic destined for one peer address of the connecting endpoint. SCTP can
 change its active destination during the handshake, so the fixture tries
-each of its two peer addresses at most once. An attempt with a zero drop
-counter cannot qualify path failure. The qualifying attempt leaves the other
-peer address and all return destinations available. Delivery must still
-succeed in both directions, and the kernel rule's packet counter must show
-actual drops. Readback must preserve the exact role, PPID,
-DTLS version, cipher, material epoch, both certificate expiry bounds, expected
+each of its two peer addresses at most once. An attempt with zero dropped
+PPID 66 DATA packets cannot qualify path failure. The qualifying attempt leaves
+the other peer address and all return destinations available. Delivery must still
+succeed in both directions, and the kernel DATA counter must show actual
+protected-data drops. A heartbeat-only counter is insufficient. Readback must
+preserve the exact role, PPID, DTLS version, cipher, material epoch, both
+certificate expiry bounds, expected
 peer, stream count and correlation capacity. This scenario uses the explicit
 profile without required CRLs; the separate native CRL case qualifies that
 profile's retirement behavior.
@@ -42,7 +50,7 @@ profile's retirement behavior.
 A second rule blocks all four destinations. Both endpoints attempt protected
 sends; neither may return received plaintext. The one-second absolute receive
 deadline must retire both connections, and both readbacks must refuse access.
-The drop counter must again show traffic reaching the fault. Removing the
+The PPID 66 DATA counter must again show traffic reaching the fault. Removing the
 rule cannot revive the old connections. A fresh association must complete a
 new mutual handshake, exchange protected records, expose valid readback, and
 perform reciprocal close. RAII removes only the test-owned nftables table;

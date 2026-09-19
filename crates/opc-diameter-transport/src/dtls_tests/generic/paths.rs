@@ -16,17 +16,18 @@ fn require_private_namespace() {
 
 struct PathBlock {
     destination: &'static str,
+    ports: [u16; 2],
 }
 
 impl PathBlock {
-    fn destination(destination: &'static str) -> Self {
+    fn destination(destination: &'static str, ports: [u16; 2]) -> Self {
         require_private_namespace();
         let result = Command::new("nft")
             .args(["add", "table", "inet", "opc_n3_dtls_paths"])
             .output()
             .expect("nft table");
         assert!(result.status.success(), "private test table must be new");
-        let block = Self { destination };
+        let block = Self { destination, ports };
         block.replace(false);
         block
     }
@@ -37,10 +38,12 @@ impl PathBlock {
         } else {
             self.destination
         };
+        let [first, second] = self.ports;
         let script = format!(
             "flush table inet opc_n3_dtls_paths\n\
              add chain inet opc_n3_dtls_paths output {{ type filter hook output priority 0; policy accept; }}\n\
-             add rule inet opc_n3_dtls_paths output meta l4proto sctp ip daddr {{ {addresses} }} counter drop\n"
+             add rule inet opc_n3_dtls_paths output meta l4proto sctp ip daddr {{ {addresses} }} sctp dport {{ {first}, {second} }} sctp chunk data ppid 66 counter\n\
+             add rule inet opc_n3_dtls_paths output meta l4proto sctp ip daddr {{ {addresses} }} sctp dport {{ {first}, {second} }} counter drop\n"
         );
         let mut child = Command::new("nft")
             .args(["-f", "-"])
@@ -58,7 +61,7 @@ impl PathBlock {
         assert!(child.wait().expect("nft completion").success());
     }
 
-    fn dropped(&self) -> u64 {
+    fn dropped(&self) -> (u64, u64) {
         let result = Command::new("nft")
             .args(["list", "table", "inet", "opc_n3_dtls_paths"])
             .output()
@@ -66,11 +69,13 @@ impl PathBlock {
         assert!(result.status.success());
         let text = String::from_utf8(result.stdout).expect("counter text");
         let words: Vec<_> = text.split_whitespace().collect();
-        let position = words
-            .iter()
-            .position(|word| *word == "packets")
-            .expect("drop counter");
-        words[position + 1].parse().expect("bounded counter")
+        let counts: Vec<u64> = words
+            .windows(2)
+            .filter(|pair| pair[0] == "packets")
+            .map(|pair| pair[1].parse().expect("bounded counter"))
+            .collect();
+        assert_eq!(counts.len(), 2, "exact data and total counter inventory");
+        (counts[0], counts[1])
     }
 }
 
@@ -82,7 +87,10 @@ impl Drop for PathBlock {
     }
 }
 
-async fn multihomed_pair(material: &TestMaterial, reverse_roles: bool) -> (Connection, Connection) {
+async fn multihomed_pair(
+    material: &TestMaterial,
+    reverse_roles: bool,
+) -> (Connection, Connection, [u16; 2]) {
     let deadline = Instant::now() + Duration::from_secs(10);
     let auth = SctpAuthenticationConfig::data();
     let rto = RtoConfig {
@@ -128,6 +136,7 @@ async fn multihomed_pair(material: &TestMaterial, reverse_roles: bool) -> (Conne
         .await
         .unwrap()
         .unwrap();
+    let ports = [port, client.local_addresses().unwrap()[0].port()];
     for (association, wanted) in [(&client, "127.0.0.3"), (&server, "127.0.0.1")] {
         assert_eq!(association.local_addresses().unwrap().len(), 2);
         assert_eq!(association.peer_addresses().unwrap().len(), 2);
@@ -150,6 +159,22 @@ async fn multihomed_pair(material: &TestMaterial, reverse_roles: bool) -> (Conne
         );
         assert!(association.is_pristine_rfc6083_auth_state());
     }
+    // No user DATA exists yet. Prove independently that non-DATA traffic to
+    // an alternate destination cannot satisfy the protected-data counter.
+    let control_only = PathBlock::destination("127.0.0.4", ports);
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while control_only.dropped().1 == 0 {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("bounded non-DATA path probe");
+    assert_eq!(
+        control_only.dropped().0,
+        0,
+        "non-DATA traffic cannot qualify protected path loss"
+    );
+    drop(control_only);
     let policy =
         Policy::ordered_streams(PayloadProtocol::Ngap, MAX_DTLS_SCTP_MESSAGE_BYTES, 16, 64)
             .unwrap();
@@ -177,6 +202,7 @@ async fn multihomed_pair(material: &TestMaterial, reverse_roles: bool) -> (Conne
     (
         client.expect("multihomed protected client"),
         server.expect("multihomed protected server"),
+        ports,
     )
 }
 
@@ -255,7 +281,7 @@ async fn generic_kernel_multihoming_preserves_protection_and_bounds_total_path_l
     require_private_namespace();
     let material = dtls_material();
     for reverse_roles in [false, true] {
-        let (mut client, mut server) = multihomed_pair(&material, reverse_roles).await;
+        let (mut client, mut server, ports) = multihomed_pair(&material, reverse_roles).await;
         exchange(&mut client, &mut server).await;
         let client_before = assert_protection(&client, Role::Connector, &material);
         let server_before = assert_protection(&server, Role::Acceptor, &material);
@@ -265,14 +291,14 @@ async fn generic_kernel_multihoming_preserves_protection_and_bounds_total_path_l
         // cannot qualify it merely because application delivery succeeded.
         let mut selected = None;
         for destination in ["127.0.0.3", "127.0.0.4"] {
-            let candidate = PathBlock::destination(destination);
+            let candidate = PathBlock::destination(destination, ports);
             exchange(&mut client, &mut server).await;
-            if candidate.dropped() > 0 {
+            if candidate.dropped().0 > 0 {
                 selected = Some(candidate);
                 break;
             }
         }
-        let block = selected.expect("must actually block an active peer path");
+        let block = selected.expect("must actually block protected DATA on an active peer path");
         assert!(assert_protection(&client, Role::Connector, &material) == client_before);
         assert!(assert_protection(&server, Role::Acceptor, &material) == server_before);
         eprintln!("protected active-path loss completed: reverse_roles={reverse_roles}");
@@ -291,7 +317,10 @@ async fn generic_kernel_multihoming_preserves_protection_and_bounds_total_path_l
             client.readback().is_err() && server.readback().is_err(),
             "deadline must retire both roles"
         );
-        assert!(block.dropped() > 0, "total path loss must reach the kernel");
+        assert!(
+            block.dropped().0 > 0,
+            "total path loss must drop protected DATA"
+        );
         drop(block);
         assert!(client.readback().is_err() && server.readback().is_err());
         let deadline = Instant::now() + Duration::from_secs(1);
@@ -305,7 +334,7 @@ async fn generic_kernel_multihoming_preserves_protection_and_bounds_total_path_l
         );
         drop(client);
         drop(server);
-        let (mut client, mut server) = multihomed_pair(&material, reverse_roles).await;
+        let (mut client, mut server, _) = multihomed_pair(&material, reverse_roles).await;
         exchange(&mut client, &mut server).await;
         assert_protection(&client, Role::Connector, &material);
         assert_protection(&server, Role::Acceptor, &material);
