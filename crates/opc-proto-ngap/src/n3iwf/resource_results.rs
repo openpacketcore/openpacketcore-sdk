@@ -3,6 +3,7 @@
 //! QoS state. The caller must correlate each QFI with the original request.
 
 use super::release::{Cause, CauseClass};
+use super::reset_fields::CriticalityDiagnostics;
 use super::resource_fields::{DownlinkTransport, QosFlowId};
 use super::security_fields::SecurityResult;
 use super::setup_fields::{Reader, Writer};
@@ -192,53 +193,33 @@ impl SetupResponseTransfer {
     }
 }
 
-/// An entirely failed session's setup transfer, carrying a root Cause.
-/// Criticality diagnostics and extensions remain unsupported.
-#[derive(Clone, Copy, PartialEq, Eq)]
+/// An entirely failed session's root Cause and optional response diagnostics.
+/// Procedure code and triggering outcome are inapplicable in same-procedure
+/// responses. Repeated diagnostic IE identifiers remain in wire order.
+/// Extensions remain unsupported; retry and resource effects are external.
+#[derive(Clone, PartialEq, Eq)]
 pub struct SetupFailureTransfer {
     /// Peer-reported cause; selecting a response or retry is caller-owned.
     pub cause: Cause,
+    /// Optional qualified root diagnostics, including an empty root object.
+    pub diagnostics: Option<CriticalityDiagnostics>,
 }
 redacted!(SetupFailureTransfer);
 impl SetupFailureTransfer {
-    /// Encode the independently qualified generated root transfer.
-    pub fn encode(self, ctx: EncodeContext) -> Result<EncodedValue, EncodeError> {
-        capacity((7 + cause_width(self.cause.class())).div_ceil(8), ctx)?;
-        encode_leaf(
-            &asn::PDUSessionResourceSetupUnsuccessfulTransfer::new(
-                self.cause.generated()?,
-                None,
-                None,
-            ),
-            ctx,
-        )
+    /// Preflight exact output capacity before allocation. The Setup and Modify
+    /// failure roots share an independently qualified bit layout, including
+    /// diagnostics at the actual parent offset after each root Cause.
+    pub fn encode(&self, ctx: EncodeContext) -> Result<EncodedValue, EncodeError> {
+        super::modify_results::encode_failure(self.cause, self.diagnostics.as_ref(), ctx)
     }
-    /// Decode with depth three. Reject extension/optional payloads before
-    /// generated materialization; require exact framing and zero padding.
+    /// Require depth three, or five with diagnostic items. Complete physical
+    /// preflight precedes item allocation; `max_ies` bounds that list. Enforce
+    /// response applicability, exact framing and zero alignment/final padding.
     pub fn decode(input: &[u8], ctx: DecodeContext) -> Result<Self, DecodeError> {
-        bound(input, ctx, 3)?;
-        let first = *input
-            .first()
-            .ok_or_else(|| invalid("missing failure transfer"))?;
-        if first & 0xe0 != 0 || (first >> 2) & 7 >= 5 || first & 2 != 0 {
-            return Err(unsupported());
-        }
-        // Generated decoding consumes final padding without requiring zero.
-        // Preflight the complete fixed root shape before invoking it.
-        let bits: usize = 7 + match (first >> 2) & 7 {
-            0 => 6,
-            1 => 1,
-            2 => 2,
-            _ => 3,
-        };
-        let length = bits.div_ceil(8);
-        let padding_mask = (1_u8 << (length * 8 - bits)) - 1;
-        if input.len() != length || input[length - 1] & padding_mask != 0 {
-            return Err(invalid("failure transfer framing"));
-        }
-        let value: asn::PDUSessionResourceSetupUnsuccessfulTransfer = decode_leaf(input)?;
+        let value = super::modify_results::ModifyFailureTransfer::decode(input, ctx)?;
         Ok(Self {
-            cause: Cause::from_generated(value.cause)?,
+            cause: value.cause,
+            diagnostics: value.diagnostics,
         })
     }
 }

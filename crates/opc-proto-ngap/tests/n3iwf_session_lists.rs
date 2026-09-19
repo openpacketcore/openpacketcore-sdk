@@ -175,6 +175,7 @@ fn failures(reference: &Value, row: &Value) -> Result<FailedSessions, opc_protoc
                 id,
                 transfer: SetupFailureTransfer {
                     cause: cause(model(reference, row)),
+                    diagnostics: None,
                 },
             })
             .collect(),
@@ -398,11 +399,11 @@ fn partial_session_results_are_disjoint_and_redacted() {
     let reference = oracle();
     let yes = successes(&reference, find_row(&reference, "count-1-", "response")).unwrap();
     let no = failures(&reference, find_row(&reference, "count-1-", "failure")).unwrap();
-    assert!(FailedSessions::new(vec![no.values()[0]; 257]).is_err());
+    assert!(FailedSessions::new(vec![no.values()[0].clone(); 257]).is_err());
     assert!(SessionResults::new(Some(yes.clone()), Some(no.clone())).is_err());
     let different = FailedSessions::new(vec![FailedSession {
         id: SessionId::new(255),
-        transfer: no.values()[0].transfer,
+        transfer: no.values()[0].transfer.clone(),
     }])
     .unwrap();
     let results = SessionResults::new(Some(yes), Some(different)).unwrap();

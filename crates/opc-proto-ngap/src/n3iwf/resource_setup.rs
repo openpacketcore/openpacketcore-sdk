@@ -283,7 +283,10 @@ impl InitialContextResponse {
 impl InitialContextFailure {
     /// Construct failure, with optional individual failed-session results.
     pub fn construct(&self, ctx: DecodeContext) -> Result<Pdu, DecodeError> {
-        crate::enforce_depth(if self.failed.is_some() { 10 } else { 6 }, ctx)?;
+        crate::enforce_depth(
+            self.failed.as_ref().map_or(6, |v| 4 + v.required_depth()),
+            ctx,
+        )?;
         let diagnostics = super::reset_fields::encode_response_diagnostics(&self.diagnostics, ctx)?;
         let output = output_context(ctx);
         let mut fields = id_fields(self.amf, self.ran, Criticality::ignore, output)?;
@@ -424,8 +427,8 @@ fn result_depth(results: &SessionResults, ctx: DecodeContext) -> Result<(), Deco
     crate::enforce_depth(
         if results.successful().is_some() {
             13
-        } else if results.failed().is_some() {
-            10
+        } else if let Some(failed) = results.failed() {
+            4 + failed.required_depth()
         } else {
             5
         },

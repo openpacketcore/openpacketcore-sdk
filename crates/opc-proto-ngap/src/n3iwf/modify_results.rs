@@ -250,28 +250,7 @@ impl ModifyFailureTransfer {
     /// independently qualified generated encoder; diagnostics use the qualified
     /// explicit layout at their actual parent bit offset.
     pub fn encode(&self, ctx: EncodeContext) -> Result<EncodedValue, EncodeError> {
-        if let Some(value) = &self.diagnostics {
-            response_diagnostics(value).map_err(|_| {
-                EncodeError::new(EncodeErrorCode::Structural {
-                    reason: "response diagnostic header applicability",
-                })
-            })?;
-            encode_root(ctx, |out| {
-                out.bits(2, 3)?;
-                write_cause(out, self.cause)?;
-                write_diagnostics(out, value)
-            })
-        } else {
-            capacity((7 + cause_width(self.cause.class())).div_ceil(8), ctx)?;
-            encode_leaf(
-                &asn::PDUSessionResourceModifyUnsuccessfulTransfer::new(
-                    self.cause.generated()?,
-                    None,
-                    None,
-                ),
-                ctx,
-            )
-        }
+        encode_failure(self.cause, self.diagnostics.as_ref(), ctx)
     }
     /// Require depth three, or five with diagnostic items. Complete physical
     /// preflight precedes item allocation; `max_ies` bounds that list. Root
@@ -290,6 +269,33 @@ impl ModifyFailureTransfer {
             }
         }
         Ok(value)
+    }
+}
+
+// Setup and Modify unsuccessful transfers have independently qualified,
+// identical root Cause/optional-diagnostics layouts. Keep preflight shared.
+pub(super) fn encode_failure(
+    cause: Cause,
+    diagnostics: Option<&CriticalityDiagnostics>,
+    ctx: EncodeContext,
+) -> Result<EncodedValue, EncodeError> {
+    if let Some(value) = diagnostics {
+        response_diagnostics(value).map_err(|_| {
+            EncodeError::new(EncodeErrorCode::Structural {
+                reason: "response diagnostic header applicability",
+            })
+        })?;
+        encode_root(ctx, |out| {
+            out.bits(2, 3)?;
+            write_cause(out, cause)?;
+            write_diagnostics(out, value)
+        })
+    } else {
+        capacity((7 + cause_width(cause.class())).div_ceil(8), ctx)?;
+        encode_leaf(
+            &asn::PDUSessionResourceModifyUnsuccessfulTransfer::new(cause.generated()?, None, None),
+            ctx,
+        )
     }
 }
 pub(super) use super::reset_fields::response_diagnostics;

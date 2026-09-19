@@ -610,7 +610,7 @@ interoperability claims are introduced.
 | Transfer | Admitted contents | Explicitly unsupported |
 | --- | --- | --- |
 | Setup response | One downlink IPv4/IPv6 GTP tunnel; 1–64 accepted QFIs; optional failed QFIs with root Cause; optional root Security Result | Additional tunnels, per-flow mapping indications, all extensions |
-| Setup unsuccessful | Root Cause in any of the five classes | Criticality diagnostics and extensions |
+| Setup unsuccessful | Root Cause in any of the five classes; optional root response diagnostics | Extensions |
 
 Accepted/failed QFIs must be unique across both lists. The entirely failed case
 uses the unsuccessful transfer; the response always has at least one accepted
@@ -623,9 +623,10 @@ Response receive requires depth six. `max_ies` limits the combined result count;
 physical count feasibility is checked before each vector allocation. Fixed
 IPv4/IPv6 buffers avoid address allocation. Known optional/extension flags,
 nonzero padding and trailing bytes fail explicitly. Response construction
-checks its exact bounded length before allocating; the unsuccessful root is
-at most two bytes and has a capacity/framing check around generated encoding
-and decoding. Errors and Debug redact values; encoded buffers clear on drop.
+checks its exact bounded length before allocating. Cause-only unsuccessful
+roots remain at most two bytes; optional diagnostics extend the maximum to
+773 bytes with shared exact size/framing preflight. Errors and Debug redact
+values; encoded buffers clear on drop.
 
 The [result oracle](tests/fixtures/n3iwf-resource-results.json) contains 547
 independent vectors, originally labeled 539 admitted and eight negative/unsupported cases. It
@@ -635,8 +636,8 @@ boundaries, duplicate/conflicting results and recognized unsupported fields.
 Regenerate using `scripts/generate-ngap-resource-result-fixtures.py` with the
 same `--spec`/`--output` arguments and pinned Release 18 environment.
 Its original bytes and labels are preserved. The historical
-`unsupported-security-result` vector now admits and is compared with an
-explicit constructor in the harness, giving 540 admitted and seven rejected
+`unsupported-security-result` and `unsupported-diagnostics` vectors now admit
+and are compared with explicit constructors in the harness, giving 541 admitted and six rejected
 vectors under the expanded boundary.
 
 Generated failure-transfer encode/decode matches all 128 positive probes;
@@ -693,6 +694,57 @@ These deterministic checks are separate from hosted PR fuzz smoke and do not
 claim a new local libFuzzer campaign. Subsequent root QoS qualification is
 recorded above; extensions and applicable fields remain tracked in #787.
 
+## Setup failure diagnostics
+
+`SetupFailureTransfer` now carries optional `CriticalityDiagnostics` under
+TS 38.413 9.3.4.16 and 9.3.1.3. Absent and present-empty diagnostics remain
+distinct. Root procedure criticality and 1–256 ordered diagnostic IE reports
+are preserved; repeated IE identifiers are allowed. Same-procedure responses
+refuse Procedure Code and Triggering Message. Diagnostic item criticality is
+reject or notify; ignore, extension values, nonzero padding and trailing data
+remain refused. No offending IE value is stored, and diagnostics do not select
+a response, retry or resource operation.
+
+The Setup and Modify unsuccessful-transfer roots have independently identical
+layouts. They share the existing qualified failure scanner and exact-size
+writer, including parent bit offsets after all five Cause classes. Receive
+preflights the complete root before allocating the diagnostic list. Depth is
+three without items and five with them; `max_ies` bounds the item count and
+`max_message_len` bounds the whole transfer. The maximum root is 773 bytes.
+Failed session lists retain three enclosing levels, and complete messages
+retain four more. Constructors preflight the added diagnostic depth and keep
+the existing shared DecodeContext and mutable-container policies.
+
+The [independent corpus](tests/fixtures/n3iwf-setup-failure-diagnostics.json)
+has 584 transfers (576 admitted, eight refused) and 102 complete messages
+(78 admitted, 24 refused), covering Initial Context Response/Failure and PDU
+Session Resource Setup Response. `scripts/generate-ngap-setup-failure-diagnostics.py`
+loads the independently authored Modify diagnostic models, verifies them with
+the pinned Release 18 reference, encodes the separate Setup ASN.1 type with
+both unmodified Pycrate encoders, and checks exact decoded values. Its own
+semantic classifier rechecks response restrictions. It also encodes all three
+outer message bindings independently, including their assigned IE criticalities.
+It does not consume SDK-generated output.
+
+Transfer coverage includes every root Cause, all diagnostic list lengths,
+optional criticality, repeated/boundary identifiers and response-inapplicable
+headers. Complete-message cases cover each Cause width, absent/empty/full
+diagnostics, count boundaries and adverse headers/extensions. Corpus SHA-256:
+`6c27bb547ede9a08f41e6c5dddb82744d6d5ca1c75f164d603bdd9ca1ab2ed3c`.
+Regenerate with `--spec PATH --output PATH` in the same pinned reference
+environment. Existing transfer/list/message fixtures remain byte-identical;
+the former `unsupported-diagnostics` empty root now has an explicit admitted
+constructor expectation. Tests compare values and canonical bytes, exact and
+one-short limits at both boundaries, redaction, truncations and bounded adverse
+mutations. 120 new representative seeds exercise shared public reconstruction
+in replay and fuzzing.
+
+API migration: add `diagnostics: None` to prior `SetupFailureTransfer` literals.
+`SetupFailureTransfer` and `FailedSession` retain `Clone` and equality but no
+longer implement `Copy`; callers copying from borrowed lists must clone
+explicitly. Setup response extra tunnels/mapping indications and all transfer
+extensions remain outside this increment. Tracking remains #787 and #784.
+
 ## N3IWF session setup lists
 
 `n3iwf::session_lists` admits seven independently qualified Release 18 list
@@ -702,7 +754,7 @@ roots. The public types group only layouts proven to have identical bytes:
 | --- | --- | --- |
 | `SessionSetupRequests` | `PDUSessionResourceSetupListCxtReq`, `PDUSessionResourceSetupListSUReq` | 13; 14 with dynamic QoS |
 | `SuccessfulSessions` | `PDUSessionResourceSetupListCxtRes`, `PDUSessionResourceSetupListSURes` | 9 |
-| `FailedSessions` | `PDUSessionResourceFailedToSetupListCxtFail`, `PDUSessionResourceFailedToSetupListCxtRes`, `PDUSessionResourceFailedToSetupListSURes` | 6 |
+| `FailedSessions` | `PDUSessionResourceFailedToSetupListCxtFail`, `PDUSessionResourceFailedToSetupListCxtRes`, `PDUSessionResourceFailedToSetupListSURes` | 6; 8 with diagnostic items |
 
 Each list requires 1–256 distinct root session IDs (0–255), preserving input
 order. Request items include S-NSSAI, optional NAS (absent and present-empty
@@ -786,8 +838,9 @@ Other recognized applicable fields outside this subset fail explicitly. Ignored 
 apart from mandatory capabilities. No ignored bytes are exposed as semantic data.
 
 Requests with a resource list need total depth 17; a context-only request needs
-8. Responses need 13 with successful results, 10 with only failures, or 5 for an
-empty context response. Context failure needs 10 with failed sessions and 6
+8. Responses need 13 with successful results, 10 with only cause/empty-diagnostic
+failures, 12 with diagnostic-item failures, or 5 for an empty context response.
+Context failure needs 10/12 with the corresponding failed sessions and 6
 without them. These explicit limits exceed the default depth for resource
 requests. Each list and contained transfer uses the caller's field-local
 `max_ies`; complete input/output is bounded by `max_message_len`. Physical
