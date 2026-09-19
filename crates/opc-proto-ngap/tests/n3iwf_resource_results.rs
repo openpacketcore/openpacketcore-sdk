@@ -73,6 +73,19 @@ fn independent_results_match_values_and_constructor_bytes() {
         let admit = row["admitted"].as_bool().unwrap();
         if row["type"] == "PDUSessionResourceSetupResponseTransfer" {
             let received = SetupResponseTransfer::decode(&wire, DecodeContext::default());
+            // Preserve the original corpus bytes and its historical label;
+            // this formerly unsupported root is now independently qualified.
+            if row["name"] == "unsupported-security-result" {
+                let model = response(&row_named(&reference, "accepted-count-1")["model"])
+                    .unwrap()
+                    .with_security_result(Some(
+                        opc_proto_ngap::n3iwf::security_fields::SecurityResult::new(true, false),
+                    ));
+                assert!(received.unwrap() == model);
+                assert!(model.encode(EncodeContext::default()).unwrap().as_bytes() == wire);
+                admitted += 1;
+                continue;
+            }
             if !admit {
                 assert!(received.is_err(), "{}", row["name"]);
                 if !row["model"].is_null() {
@@ -118,7 +131,7 @@ fn independent_results_match_values_and_constructor_bytes() {
         admitted += 1;
     }
     assert_eq!(reference["cases"].as_array().unwrap().len(), 547);
-    assert_eq!(admitted, 539);
+    assert_eq!(admitted, 540);
 }
 #[test]
 fn result_limits_are_checked_on_receive_and_construction() {

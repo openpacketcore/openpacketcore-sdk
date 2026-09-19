@@ -147,7 +147,7 @@ fuzz_target!(|data: &[u8]| {
         assert!(QosFlowSetupList::decode(wire.as_bytes(), decode).unwrap() == field);
     }
     if let Ok(admitted) = SetupRequestTransfer::decode(data, decode) {
-        let wire = admitted.transfer.encode(output).unwrap();
+        let wire = resource_setup::resource_security::request(&admitted.transfer).encode(output).unwrap();
         let received = SetupRequestTransfer::decode(wire.as_bytes(), decode).unwrap();
         assert!(received.transfer == admitted.transfer);
         assert_eq!(received.ignored_ie_count, 0);
@@ -158,7 +158,7 @@ fuzz_target!(|data: &[u8]| {
         ..decode
     };
     if let Ok(value) = SetupResponseTransfer::decode(data, result_ctx) {
-        let wire = value.encode(output).unwrap();
+        let wire = resource_setup::resource_security::response(&value).encode(output).unwrap();
         assert!(SetupResponseTransfer::decode(wire.as_bytes(), result_ctx).unwrap() == value);
     }
     if let Ok(value) = SetupFailureTransfer::decode(data, result_ctx) {
