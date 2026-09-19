@@ -34,6 +34,12 @@ these reports; `primary().flows()` and `additional()` inspect all associations.
 The existing `new`, `downlink` and `accepted` methods retain their single
 primary tunnel meaning. See the [Setup tunnel contract](CONFORMANCE.md#setup-response-tunnels-and-flow-mappings).
 
+Setup and Modify requests also preserve optional additional uplink endpoints
+through `UplinkTransportList`. Add `additional_uplink: None` to existing request
+literals. Modify responses expose up to three `DownlinkQosTunnel` associations
+in `additional`; use `Vec::new()` for existing response literals. See the
+[additional tunnel contract](CONFORMANCE.md#additional-request-tunnels-and-modify-associations).
+
 ## API Shape
 
 - `Pdu` stores the policy-filtered decoded PDU kind plus the immutable raw bytes

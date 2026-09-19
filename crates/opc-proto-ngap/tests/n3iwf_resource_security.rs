@@ -77,6 +77,7 @@ fn result(model: &Value) -> SecurityResult {
 }
 fn request(model: &Value) -> Result<SetupRequestTransfer, opc_protocol::DecodeError> {
     Ok(SetupRequestTransfer {
+        additional_uplink: None,
         uplink: UplinkTransport::new("198.51.100.17".parse().unwrap(), 0x11223344),
         aggregate_bit_rate: Some(SessionAggregateBitRate::new(1_000_000, 2_000_000)?),
         session_type: SessionType::Ipv4,

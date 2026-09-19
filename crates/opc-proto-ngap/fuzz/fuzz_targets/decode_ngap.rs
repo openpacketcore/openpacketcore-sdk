@@ -1,5 +1,8 @@
 #![no_main]
 
+#[path = "../../tests/support/remaining_tunnels.rs"]
+mod remaining_tunnels;
+
 #[path = "../../tests/support/qos_admission.rs"]
 mod qos_admission;
 
@@ -88,6 +91,7 @@ fuzz_target!(|data: &[u8]| {
         ..EncodeContext::default()
     };
     qos_admission::exercise(data, decode, output);
+    remaining_tunnels::exercise(data, DecodeContext { max_depth: 32, max_ies: 320, ..decode }, output);
     qos_profiles::exercise(data, decode, output);
     release_sessions::exercise(data, decode, output);
     network_instance::exercise(data, decode, output);

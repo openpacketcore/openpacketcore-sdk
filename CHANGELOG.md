@@ -13,6 +13,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   replacement, shutdown and multihoming failover qualification (Refs #788).
 
 ### Added
+- `opc-proto-ngap`: construct and admit up to three additional uplink
+  endpoints in Setup/Modify requests and additional downlink flow associations
+  in Modify responses. Share bounded tunnel codecs with independent Release
+  18 transfer and complete-message evidence. Request literals gain optional
+  `additional_uplink`; Modify response literals gain `additional` (Refs #787).
 - `opc-proto-ngap`: preserve and construct Setup response flow mappings and
   up to three additional downlink tunnels, including complete context/session
   responses. Validate each tunnel's flow list and the accepted/failed union

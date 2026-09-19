@@ -226,7 +226,10 @@ impl SetupResponseTransfer {
     }
 }
 
-fn write_tunnel(out: &mut dyn Sink, value: &DownlinkQosTunnel) -> Result<(), EncodeError> {
+pub(in crate::n3iwf) fn write_tunnel(
+    out: &mut dyn Sink,
+    value: &DownlinkQosTunnel,
+) -> Result<(), EncodeError> {
     out.bits(0, 2)?;
     out.bits(0, 4)?;
     let address_bits = if value.downlink.address().is_ipv4() {
@@ -252,7 +255,7 @@ fn write_tunnel(out: &mut dyn Sink, value: &DownlinkQosTunnel) -> Result<(), Enc
     Ok(())
 }
 
-fn read_tunnel(
+pub(in crate::n3iwf) fn read_tunnel(
     reader: &mut Reader<'_>,
     accepted_mask: &mut u64,
     materialize: bool,

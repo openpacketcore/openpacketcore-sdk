@@ -1362,7 +1362,8 @@ reports. QFIs are unique and disjoint; present lists contain 1–64 entries.
 An empty or failed-flow-only root can accompany a successful AMBR, tunnel or
 release change. The codec therefore preserves these shapes without asserting
 request correspondence or that an operation succeeded. Additional per-tunnel
-lists, non-root address choices and extensions remain unsupported.
+associations are qualified below. Non-root address choices and extensions
+remain unsupported.
 
 `ModifyFailureTransfer` carries a mandatory root Cause and optional root
 Criticality Diagnostics. Absent and empty diagnostics remain distinct. Diagnostic
@@ -1378,19 +1379,23 @@ unsuccessful procedure-26 PDU.
 | Empty response | 1 | No list |
 | Response with tunnels and/or accepted QFIs | 4 | Accepted list 1–64 |
 | Response with failed QFIs | 5 | Each list 1–64; combined count uses caller budget |
+| Response with additional downlink associations | 8 | 1–3 bearers, each with 1–64 flows; all occurrences and result lists share the caller budget |
 | Failure Cause and optional diagnostics without items | 3 | No list |
 | Failure with diagnostic items | 5 | 1–256, repeats retained |
 
 Complete flags, counts, enums, unique QFIs, padding and exact framing preflight
 precedes vector allocation. Exact output sizing precedes generated materialization
 or bounded output allocation. Nested layouts retain their actual parent bit
-offsets. The combined accepted/failed QFI count uses `max_ies`; allocation-budget targets remain
+offsets. Accepted/failed QFIs, additional bearer items and their flow occurrences
+cumulatively use `max_ies`; allocation-budget targets remain
 advisory. Public formatting is redacted. Internal transport, Cause and diagnostic
 helpers are reused without changing their public field contracts.
 
 The [independent oracle](tests/fixtures/n3iwf-modify-results.json) supplies 1,436
-complete transfers: 852 responses and 584 unsuccessful transfers, with 1,423
-admissions and 13 negative cases. Both unmodified reference encoders agree;
+complete transfers: 852 responses and 584 unsuccessful transfers, originally
+with 1,423 admissions and 13 negative cases. The historical additional-tunnel
+vector is now explicitly requalified at depth eight: 1,424 admit and 12 refuse,
+with no fixture byte or label changes. Both unmodified reference encoders agree;
 structured decoding verifies explicit models and admission classifications.
 Coverage includes all 16 response presence combinations, directional IPv4/IPv6
 endpoint bounds, all QFI counts and disjoint splits, every root Cause at eight
@@ -1416,6 +1421,57 @@ replay and fuzz assertions. Enclosing session lists/messages, request correlatio
 conditional NAS forwarding, response selection, rollback and resource effects
 remain separate; this adds no admitted PDU outcome and does not complete #787.
 
+### Additional request tunnels and Modify associations
+
+`resource_fields::UplinkTransportList` preserves one to three additional
+IPv4/IPv6 core endpoints in peer order, including repeated endpoints and every
+root TEID value. Setup and Modify transfers expose `additional_uplink` and emit
+IE 126 with reject criticality in schema order. Shared duplicate/unknown IE
+selection still precedes semantic admission. Existing public request literals
+need `additional_uplink: None`; Modify's default remains empty.
+
+`ModifyResponseTransfer::additional` preserves zero to three additional
+`DownlinkQosTunnel` values, including each associated QFI and optional UL/DL
+mapping. Existing literals need `additional: Vec::new()`. Associated QFIs are
+unique within a bearer and may repeat across bearers. Successful and failed
+modification lists remain unique and disjoint. Associations are separate from
+those result lists: this codec does not infer successful modification from an
+association, request correspondence, endpoint availability or resource effects.
+The caller applies TS 38.413 8.2.3, including fallback to the prior configuration
+for failed modifications and the conditions on additional transport bearers.
+
+The additional UL leaf requires depth five; enclosing Setup transfers retain
+their ten/eleven-level QoS requirement, and Modify requests require at least
+nine with this field. Additional DL associations require depth eight, eleven
+in the Modify session list and fifteen in the complete response. A single
+reader cumulatively charges every response list entry and flow occurrence
+against `max_ies`. Request containers and each nested list retain their separate
+caller count bounds. Two-pass scanners check complete physical framing before
+vector allocation. Exact output measurement precedes buffer allocation.
+Extensions, unsupported address lengths, nonzero padding and trailing bytes
+refuse explicitly. Root admission never installs a bearer or selects a peer.
+
+The [independent corpus](tests/fixtures/n3iwf-remaining-tunnels.json) contains
+631 transfers (625 admitted, six duplicate/conflict negatives) and 35 complete
+Setup/Modify messages (29 admitted, six negatives). Both unmodified Pycrate
+encoders and decoders agree on the pinned TS 38.413 V18.10.0 schema. Cases cover
+all 64 QFIs and mapping alternatives, every association-list size, tunnel-list
+arity, mixed IPv4/IPv6 and TEID boundaries, optional fields at differing parent
+offsets, every root Cause, and the 516-byte maximum tested response. Reference
+outer metadata and mandatory fields come from the schema. No SDK codec supplies
+oracle bytes. Regenerate with `scripts/generate-ngap-remaining-tunnels.py --spec
+PATH --output PATH` in the pinned reference environment. Corpus SHA-256:
+`f9254fdf6c66365b88fcc4d8c3ec9ced2c5f9289591a1251679a2f300ef2d055`.
+
+Three positive reference cases failed against the previous implementation before
+adding support. Tests compare explicit typed values and exact reference bytes,
+complete-message construction/admission, exact and one-short limits, constructor
+bounds, truncations and mutations. Shared fuzz/replay code rebuilds additional
+endpoints and mappings through public constructors; 79 new corpus seeds exercise
+those boundaries. Root item extensions,
+redundant/forwarding extension fields and combined IPv4-plus-IPv6 addresses
+remain explicit gaps; this evidence is not live-peer interoperability.
+
 ## Complete PDU Session Resource Modify
 
 `n3iwf::modify_lists` and `n3iwf::modify` compose the transfer roots above into
@@ -1438,7 +1494,7 @@ diagnostics; repeated diagnostic IE identifiers remain representable.
 
 Request lists require depth 7–13 (three layers plus the contained transfer).
 Successful lists require depth 4 for empty transfers, 7 with tunnels/accepted
-QFIs and 8 with failed QFIs. Failed lists require depth 6, or 8 with diagnostic
+QFIs, 8 with failed QFIs and 11 with additional tunnel associations. Failed lists require depth 6, or 8 with diagnostic
 items. Complete messages add four enclosing layers; optional top-level fields
 retain their own qualified depth requirements. Outer lists, the top container,
 and each contained transfer independently use `max_ies`. Counts are caller

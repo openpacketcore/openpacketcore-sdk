@@ -3,6 +3,7 @@
 //!
 //! Flow lists preserve both root QoS descriptors, GBR parameters and attributes.
 //! Extension additions remain explicitly unsupported.
+use super::modify_fields::{read_transport, write_transport};
 use super::nas::UeAggregateBitRate;
 use super::qos_fields::{QosFlow, QosParameters};
 use super::reset_fields::encode_root;
@@ -107,6 +108,62 @@ directional_transport!(
     UplinkTransport,
     "Uplink GTP tunnel advertised toward the core; distinct from a downlink endpoint."
 );
+
+/// One to three additional core-side endpoints, in peer-supplied order.
+/// Repeated endpoints are preserved; matching, availability and allocation are
+/// caller-owned. Root IPv4/IPv6 items carry no extension fields.
+#[derive(Clone, PartialEq, Eq)]
+pub struct UplinkTransportList(Vec<UplinkTransport>);
+redacted!(UplinkTransportList);
+impl UplinkTransportList {
+    /// Validate the ASN.1 list bound without selecting an endpoint.
+    pub fn new(values: Vec<UplinkTransport>) -> Result<Self, DecodeError> {
+        if !(1..=3).contains(&values.len()) {
+            return Err(invalid("additional uplink tunnel count"));
+        }
+        Ok(Self(values))
+    }
+    /// Explicit access to the ordered endpoint descriptions.
+    pub fn values(&self) -> &[UplinkTransport] {
+        &self.0
+    }
+    /// Measure the complete root layout before allocating the output buffer.
+    pub fn encode(&self, ctx: EncodeContext) -> Result<EncodedValue, EncodeError> {
+        encode_root(ctx, |out| {
+            out.bits((self.0.len() - 1) as u16, 2)?;
+            for value in &self.0 {
+                out.bits(0, 2)?;
+                write_transport(out, value.address(), value.teid())?;
+            }
+            Ok(())
+        })
+    }
+    /// Require depth five and bound the list with `max_ies`. Validate all
+    /// flags, addresses, alignment and exact framing before allocating items.
+    pub fn decode(input: &[u8], ctx: DecodeContext) -> Result<Self, DecodeError> {
+        let count = scan_uplink_list(input, ctx, |_| {})?;
+        let mut values = Vec::with_capacity(count);
+        scan_uplink_list(input, ctx, |value| values.push(value))?;
+        Ok(Self(values))
+    }
+}
+
+fn scan_uplink_list(
+    input: &[u8],
+    ctx: DecodeContext,
+    mut emit: impl FnMut(UplinkTransport),
+) -> Result<usize, DecodeError> {
+    bound(input, ctx, 5)?;
+    let mut reader = Reader::new(input, ctx);
+    let count = reader.count(2, 3, 78)?;
+    for _ in 0..count {
+        reader.flags(2)?;
+        let (address, teid) = read_transport(&mut reader)?;
+        emit(UplinkTransport::new(address, teid));
+    }
+    reader.finish()?;
+    Ok(count)
+}
 directional_transport!(
     DownlinkTransport,
     "Downlink GTP tunnel advertised toward the N3IWF; distinct from an uplink endpoint."

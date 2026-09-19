@@ -20,6 +20,7 @@ pub struct FailedQosFlow {
 redacted!(FailedQosFlow);
 
 mod tunnels;
+pub(super) use tunnels::{read_tunnel, write_tunnel};
 pub use tunnels::{AssociatedQosFlow, DownlinkQosTunnel, QosFlowMapping, SetupResponseTransfer};
 
 /// An entirely failed session's root Cause and optional response diagnostics.

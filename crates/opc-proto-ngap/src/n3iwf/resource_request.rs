@@ -1,6 +1,7 @@
 //! N3IWF PDU Session Resource Setup Request Transfer admission.
 //!
-//! This root subset admits one uplink tunnel and unique QoS flows. Session
+//! This root subset admits a primary uplink tunnel, up to three additional
+//! uplink endpoints and unique QoS flows. Session
 //! AMBR is required by the default boundary. The explicitly classified boundary
 //! admits its absence only when the caller classifies every requested flow as
 //! GBR. Root QoS syntax does not establish that resource classification. Optional
@@ -13,7 +14,7 @@
 use super::network_fields::{CommonNetworkInstance, TransportNetworkInstance};
 use super::qos_fields::QosResourceTypes;
 use super::resource_fields::{
-    QosFlowSetupList, SessionAggregateBitRate, SessionType, UplinkTransport,
+    QosFlowSetupList, SessionAggregateBitRate, SessionType, UplinkTransport, UplinkTransportList,
 };
 use super::security_fields::{NetworkInstance, SecurityIndication};
 use super::*;
@@ -25,6 +26,8 @@ use crate::policy;
 pub struct SetupRequestTransfer {
     /// Core-side endpoint for uplink traffic, distinct from a downlink endpoint.
     pub uplink: UplinkTransport,
+    /// Optional additional core-side endpoints; availability is caller-owned.
+    pub additional_uplink: Option<UplinkTransportList>,
     /// Session aggregate limits. Absence requires exact caller classification
     /// through the classified encode/decode APIs and an all-GBR flow list.
     pub aggregate_bit_rate: Option<SessionAggregateBitRate>,
@@ -93,11 +96,14 @@ impl SetupRequestTransfer {
                 reason: "session ambr or resource classification",
             })
         })?;
-        let mut fields = Vec::with_capacity(7);
+        let mut fields = Vec::with_capacity(8);
         if let Some(rate) = self.aggregate_bit_rate {
             fields.push((130, 0, rate.encode(ctx)?));
         }
         fields.push((139, 0, self.uplink.encode(ctx)?));
+        if let Some(additional) = &self.additional_uplink {
+            fields.push((126, 0, additional.encode(ctx)?));
+        }
         fields.push((134, 0, self.session_type.encode(ctx)?));
         if let Some(security) = self.security {
             fields.push((138, 0, security.encode(ctx)?));
@@ -192,6 +198,7 @@ impl SetupRequestTransfer {
             ..ctx
         };
         let mut uplink = None;
+        let mut additional_uplink = None;
         let mut aggregate_bit_rate = None;
         let mut session_type = None;
         let mut flows = None;
@@ -215,12 +222,13 @@ impl SetupRequestTransfer {
                 }
                 continue;
             }
-            if !matches!(entry.id, 139 | 130 | 134 | 136 | 138 | 129 | 166) {
+            if !matches!(entry.id, 139 | 126 | 130 | 134 | 136 | 138 | 129 | 166) {
                 return Err(unsupported());
             }
             let framed = aper::ie(entry.wire)?;
             match entry.id {
                 139 => uplink = Some(UplinkTransport::decode(&framed.value, leaf)?),
+                126 => additional_uplink = Some(UplinkTransportList::decode(&framed.value, leaf)?),
                 130 => {
                     aggregate_bit_rate = Some(SessionAggregateBitRate::decode(&framed.value, leaf)?)
                 }
@@ -238,6 +246,7 @@ impl SetupRequestTransfer {
         let admitted = AdmittedRequestTransfer {
             transfer: Self {
                 uplink: uplink.ok_or_else(|| invalid("missing uplink transport"))?,
+                additional_uplink,
                 aggregate_bit_rate,
                 session_type: session_type.ok_or_else(|| invalid("missing pdu session type"))?,
                 flows: flows.ok_or_else(|| invalid("missing qos flow setup list"))?,

@@ -120,6 +120,7 @@ fn context() -> DecodeContext {
 }
 fn transfer(model: &Value) -> SetupRequestTransfer {
     SetupRequestTransfer {
+        additional_uplink: None,
         security: None,
         network_instance: None,
         common_network_instance: None,
