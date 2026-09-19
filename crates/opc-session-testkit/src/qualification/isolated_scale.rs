@@ -46,6 +46,8 @@ pub enum QualificationIsolatedScaleWorkload {
     /// Abrupt retained-root recovery under ordinary fixed-quorum authority.
     /// This opt-in fixture has no protected-roster trust root from creation.
     RetainedRecoveryControl,
+    /// Abrupt retained-root recovery with the protected trust root and V2 profile.
+    ProtectedRecoveryControl,
 }
 
 /// Opt-in configuration; omission preserves every legacy Durable node.
@@ -68,6 +70,9 @@ impl QualificationIsolatedScaleConfig {
             QualificationIsolatedScaleWorkload::BoundaryControl => "boundary-control",
             QualificationIsolatedScaleWorkload::RetainedRecoveryControl => {
                 "retained-recovery-control;roster=none"
+            }
+            QualificationIsolatedScaleWorkload::ProtectedRecoveryControl => {
+                "retained-recovery-control;roster=v2"
             }
         };
         let descriptor = format!(

@@ -21,10 +21,11 @@ fn recover_unclean(fleet: &mut Fleet, scale: QualificationIsolatedScaleConfig) -
         }
         if initialized {
             let reports = fleet.isolated_scale_reports_by(deadline);
-            if reports
-                .iter()
-                .all(|report| report.ready && report.async_active)
-            {
+            if reports.iter().all(|report| {
+                report.ready
+                    && (scale.persistence == QualificationIsolatedPersistence::Durable
+                        || report.async_active)
+            }) {
                 return fleet.wait_isolated_scale_ready(scale);
             }
         }
@@ -36,10 +37,14 @@ fn recover_unclean(fleet: &mut Fleet, scale: QualificationIsolatedScaleConfig) -
     }
 }
 
-fn unclean_return(all_cold: bool) {
+fn unclean_return(
+    all_cold: bool,
+    persistence: QualificationIsolatedPersistence,
+    workload: QualificationIsolatedScaleWorkload,
+) {
     let scale = QualificationIsolatedScaleConfig {
-        persistence: QualificationIsolatedPersistence::Async,
-        workload: QualificationIsolatedScaleWorkload::RetainedRecoveryControl,
+        persistence,
+        workload,
     };
     let mut fleet = Fleet::start_with_settings(3, scale.schedule_sha256(), None, Some(scale));
     let survivor = fleet.wait_isolated_scale_ready(scale);
@@ -68,11 +73,21 @@ fn unclean_return(all_cold: bool) {
             current_generation: Some(1)
         }
     ));
+    if persistence == QualificationIsolatedPersistence::Durable {
+        // Durable restart preserves acknowledged authority. Revoke the old
+        // lease explicitly, retaining its handle for the delayed-write probe.
+        assert!(matches!(
+            fleet.nodes[survivor].invoke(&QualificationNodeCommand::Release {
+                lease_handle: "recovery-old".to_owned(),
+            }),
+            QualificationNodeReply::Released
+        ));
+    }
     // Establish that the healthy membership reached background persistence.
     // This deliberately does not assert that the last acknowledged operation
     // is durable: its presence is checked, and reconciled, after recovery.
     let deadline = Instant::now() + CLUSTER_TRANSITION_TIMEOUT;
-    loop {
+    while persistence == QualificationIsolatedPersistence::Async {
         let reports = fleet.isolated_scale_reports_by(deadline);
         if reports.iter().zip(&before).all(|(after, prior)| {
             after.completed_generation > prior.completed_generation && !after.background_failed
@@ -95,7 +110,9 @@ fn unclean_return(all_cold: bool) {
             !native.join("ASYNC-CLOSED").exists(),
             "abrupt loss cannot mint completed-shutdown evidence"
         );
-        assert!(native.join("ASYNC-AUTHORITY").is_file());
+        if persistence == QualificationIsolatedPersistence::Async {
+            assert!(native.join("ASYNC-AUTHORITY").is_file());
+        }
     }
     if !all_cold {
         assert!(
@@ -150,6 +167,9 @@ fn unclean_return(all_cold: bool) {
         } => None,
         _ => panic!("recovered record must be the retained version or permitted Async loss"),
     };
+    if persistence == QualificationIsolatedPersistence::Durable {
+        assert_eq!(retained, Some(1));
+    }
     let next_fence = match fleet.nodes[leader].invoke(&QualificationNodeCommand::Acquire {
         lease_handle: "recovery-new".to_owned(),
         stable_id: "recovery-key".to_owned(),
@@ -204,10 +224,54 @@ fn unclean_return(all_cold: bool) {
 
 #[test]
 fn isolated_async_two_voters_killed_recover_without_restarting_survivor() {
-    unclean_return(false);
+    unclean_return(
+        false,
+        QualificationIsolatedPersistence::Async,
+        QualificationIsolatedScaleWorkload::RetainedRecoveryControl,
+    );
 }
 
 #[test]
 fn isolated_async_all_voters_killed_recover_with_new_usable_authority() {
-    unclean_return(true);
+    unclean_return(
+        true,
+        QualificationIsolatedPersistence::Async,
+        QualificationIsolatedScaleWorkload::RetainedRecoveryControl,
+    );
+}
+
+#[test]
+fn protected_async_majority_return_recovers_successor_authority() {
+    unclean_return(
+        false,
+        QualificationIsolatedPersistence::Async,
+        QualificationIsolatedScaleWorkload::ProtectedRecoveryControl,
+    );
+}
+
+#[test]
+fn protected_async_all_cold_return_recovers_successor_authority() {
+    unclean_return(
+        true,
+        QualificationIsolatedPersistence::Async,
+        QualificationIsolatedScaleWorkload::ProtectedRecoveryControl,
+    );
+}
+
+#[test]
+fn protected_durable_majority_return_recovers_successor_authority() {
+    unclean_return(
+        false,
+        QualificationIsolatedPersistence::Durable,
+        QualificationIsolatedScaleWorkload::ProtectedRecoveryControl,
+    );
+}
+
+#[test]
+fn protected_durable_all_cold_return_recovers_successor_authority() {
+    unclean_return(
+        true,
+        QualificationIsolatedPersistence::Durable,
+        QualificationIsolatedScaleWorkload::ProtectedRecoveryControl,
+    );
 }

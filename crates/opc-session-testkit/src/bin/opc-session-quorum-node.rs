@@ -1473,7 +1473,7 @@ impl QualificationNode {
             QualificationNodeCommand::Configure => QualificationNodeReply::Error {
                 code: QualificationNodeErrorCode::InvalidRequest,
             },
-            QualificationNodeCommand::Initialize => match self.store.initialize_cluster().await {
+            QualificationNodeCommand::Initialize => match self.initialize().await {
                 Ok(()) => QualificationNodeReply::Initialized,
                 Err(_) => QualificationNodeReply::Error {
                     code: QualificationNodeErrorCode::InitializationUnavailable,
@@ -1873,6 +1873,26 @@ impl QualificationNode {
                 }
             }
         }
+    }
+
+    async fn initialize(&self) -> Result<(), ()> {
+        self.store.initialize_cluster().await.map_err(|_| ())?;
+        if self.isolated_scale.is_some_and(|scale| {
+            scale.workload == opc_session_testkit::qualification::QualificationIsolatedScaleWorkload::ProtectedRecoveryControl
+        }) {
+            // This fixture retains the production trust root from construction
+            // and activates the same V2 profile before returning initialized.
+            // Reopen must reconcile that exact profile; it cannot remove it.
+            self.store
+                .activate_fenced_transition_capability()
+                .await
+                .map_err(|_| ())?;
+            self.store
+                .activate_protected_roster_profile_v2()
+                .await
+                .map_err(|_| ())?;
+        }
+        Ok(())
     }
 
     async fn start_stateless_consumer(
