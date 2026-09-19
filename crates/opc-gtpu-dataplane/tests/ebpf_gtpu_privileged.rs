@@ -4532,6 +4532,14 @@ fn expect_no_reassembled_datagram(socket: &GtpuReassemblySocket) {
     }
 }
 
+fn expect_no_control_datagram(port: &dyn opc_gtpu_dataplane::control_port::GtpuControlPort) {
+    let deadline = Instant::now() + Duration::from_millis(100);
+    while Instant::now() < deadline {
+        assert!(port.try_receive_datagram(2048).unwrap().is_none());
+        std::thread::sleep(Duration::from_millis(1));
+    }
+}
+
 const IPFRAG_TIME_PATH: &str = "/proc/sys/net/ipv4/ipfrag_time";
 const IPFRAG_HIGH_THRESH_PATH: &str = "/proc/sys/net/ipv4/ipfrag_high_thresh";
 const IPFRAG_LOW_THRESH_PATH: &str = "/proc/sys/net/ipv4/ipfrag_low_thresh";
@@ -9708,6 +9716,38 @@ async fn ebpf_gtpu_grouped_dual_stack_live_contract() -> Result<(), Box<dyn std:
     let pgw_v4 = in_netns(&net.pgw_ns, || {
         UdpSocket::bind((PGW_IP, GTPU_PORT)).expect("bind initial PGW IPv4 GTP-U socket")
     });
+    // A grouped attachment exposes the same IPv4 queue without granting
+    // any grouped selector authority or changing its forwarding generation.
+    let grouped_control = backend.open_gtpu_control_port(&device).await?;
+    let echo = [0x32, 1, 0, 4, 0, 0, 0, 0, 0x31, 0x42, 0, 0];
+    pgw_v4.send_to(&echo, (EPDG_S2BU_IP, GTPU_PORT))?;
+    let deadline = Instant::now() + Duration::from_secs(2);
+    let event = loop {
+        if let Some(event) = grouped_control.try_receive_datagram(2048)? {
+            break event;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "grouped control receive deadline"
+        );
+        std::thread::sleep(Duration::from_millis(1));
+    };
+    assert_eq!(event.bytes(), echo);
+    assert_eq!(event.provenance().ingress_ifindex(), device.ifindex);
+    let plan = event
+        .echo_response(opc_gtpu_dataplane::control_port::GtpuControlResponseBudget::new(14, 2)?)?;
+    grouped_control.send_control_response(plan)?;
+    pgw_v4.set_read_timeout(Some(Duration::from_secs(2)))?;
+    let mut echo_response = [0_u8; 64];
+    let (length, source) = pgw_v4.recv_from(&mut echo_response)?;
+    assert_eq!(source, SocketAddr::from((EPDG_S2BU_IP, GTPU_PORT)));
+    assert_eq!(
+        &echo_response[..length],
+        &[0x32, 2, 0, 6, 0, 0, 0, 0, 0x31, 0x42, 0, 0, 14, 0]
+    );
+    eprintln!(
+        "OPC_GTPU_BACKEND_GROUPED_CONTROL_PROVEN: exact IPv4 tuple and Echo on grouped attachment"
+    );
     let pgw_v6 = in_netns(&net.pgw_ns, || {
         UdpSocket::bind((PGW_IPV6, GTPU_PORT)).expect("bind initial PGW IPv6 GTP-U socket")
     });
@@ -12330,7 +12370,7 @@ async fn ebpf_gtpu_required_extensions_reach_shared_control_without_decap(
         .await?;
     run("ping", &["-c", "1", "-W", "1", "192.0.2.10"]);
     run("ping", &["-6", "-c", "1", "-W", "1", "2001:db8:2::10"]);
-    let control = GtpuReassemblySocket::bind(EPDG_S2BU_IP, "s2bu")?;
+    let control = backend.open_gtpu_control_port(&device).await?;
     let control_v6 = UdpSocket::bind((EPDG_S2BU_IPV6, GTPU_PORT))?;
     control_v6.set_read_timeout(Some(Duration::from_secs(2)))?;
     let peer = in_netns(&net.pgw_ns, || {
@@ -12488,7 +12528,7 @@ async fn ebpf_gtpu_required_extensions_reach_shared_control_without_decap(
         }
         gpdu.fill(0);
     }
-    expect_no_reassembled_datagram(&control);
+    expect_no_control_datagram(control.as_ref());
     expect_no_datagram(&control_v6);
     expect_no_datagram(&ue);
     let after_malformed = backend.datapath_snapshot(&device).await?;
@@ -12508,5 +12548,200 @@ async fn ebpf_gtpu_required_extensions_reach_shared_control_without_decap(
     drop(backend);
     drop(net);
     eprintln!("OPC_GTPU_REQUIRED_EXTENSION_CONTROL_PROVEN: 127 required types, both outer families, 127 optional types, 4 malformed chains");
+    Ok(())
+}
+
+#[tokio::test]
+#[allow(clippy::await_holding_lock)]
+#[ignore = "requires root (CAP_BPF/CAP_NET_ADMIN), a fresh netns, and bpffs"]
+async fn ebpf_gtpu_backend_control_port_fences_attachment_lifetime(
+) -> Result<(), Box<dyn std::error::Error>> {
+    use opc_gtpu_dataplane::control_port::{
+        GtpuControlDatagramKind, GtpuControlPort, GtpuControlPortError, GtpuControlResponseBudget,
+    };
+    assert_eq!(env::var("OPC_GTPU_RUN_PRIVILEGED").as_deref(), Ok("1"));
+    assert_ne!(
+        fs::read_link("/proc/self/ns/net")?,
+        fs::read_link("/proc/1/ns/net")?
+    );
+    let _serial = PRIVILEGED_TEST_LOCK
+        .lock()
+        .unwrap_or_else(|p| p.into_inner());
+    let net = TestNet::provision();
+    let config = EbpfGtpuDataplaneBackendConfig {
+        bpffs_pin_root: net.pin_root.clone(),
+        ..EbpfGtpuDataplaneBackendConfig::default()
+    };
+    let backend = EbpfGtpuDataplaneBackend::with_config(config.clone());
+    let mut request = CreateGtpDeviceRequest::new("s2bu");
+    request.bind_address = IpAddr::V4(EPDG_S2BU_IP);
+    let device = backend.create_device(request.clone()).await?;
+    run("ping", &["-c", "1", "-W", "1", "192.0.2.10"]);
+    // An external legacy queue is never replaced or joined using reuseport.
+    let external = GtpuReassemblySocket::bind(EPDG_S2BU_IP, "s2bu")?;
+    assert!(backend.open_gtpu_control_port(&device).await.is_err());
+    drop(external);
+    let first = backend.open_gtpu_control_port(&device).await?;
+    let second = backend.open_gtpu_control_port(&device).await?;
+    assert!(GtpuReassemblySocket::bind(EPDG_S2BU_IP, "s2bu").is_err());
+    let peer = in_netns(&net.pgw_ns, || UdpSocket::bind((PGW_IP, 0)).unwrap());
+    peer.set_read_timeout(Some(Duration::from_secs(2)))?;
+    let peer_address = peer.local_addr()?;
+    let receive = |port: &dyn GtpuControlPort| {
+        let deadline = Instant::now() + Duration::from_secs(2);
+        loop {
+            if let Some(event) = port.try_receive_datagram(2048).unwrap() {
+                break event;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "backend control receive deadline"
+            );
+            std::thread::sleep(Duration::from_millis(1));
+        }
+    };
+    // Independent canonical Echo wire: dynamic peer port, nonzero sequence.
+    let echo = [0x32, 1, 0, 4, 0, 0, 0, 0, 0x91, 0x73, 0, 0];
+    let response = [0x32, 2, 0, 6, 0, 0, 0, 0, 0x91, 0x73, 0, 0, 14, 0];
+    let budget = GtpuControlResponseBudget::new(14, 2)?;
+    peer.send_to(&echo, (EPDG_S2BU_IP, GTPU_PORT))?;
+    let event = receive(second.as_ref());
+    assert_eq!(event.kind(), GtpuControlDatagramKind::Control);
+    assert_eq!(SocketAddr::from(event.peer()), peer_address);
+    assert_eq!(
+        event.local(),
+        std::net::SocketAddrV4::new(EPDG_S2BU_IP, GTPU_PORT)
+    );
+    assert_eq!(event.provenance().ingress_ifindex(), device.ifindex);
+    assert_eq!(event.bytes(), echo);
+    assert_eq!(
+        first.send_control_response(event.echo_response(budget)?)?,
+        response.len()
+    );
+    let mut bytes = [0_u8; 2048];
+    let (length, source) = peer.recv_from(&mut bytes)?;
+    assert_eq!(source, SocketAddr::from((EPDG_S2BU_IP, GTPU_PORT)));
+    assert_eq!(&bytes[..length], response);
+    expect_no_control_datagram(first.as_ref());
+    expect_no_control_datagram(second.as_ref());
+    assert_eq!(format!("{first:?}"), "EbpfGtpuControlPort(<redacted>)");
+
+    peer.send_to(&echo, (EPDG_S2BU_IP, GTPU_PORT))?;
+    let old_plan = receive(first.as_ref()).echo_response(budget)?;
+    peer.send_to(&echo, (EPDG_S2BU_IP, GTPU_PORT))?;
+    let foreign_plan = receive(first.as_ref()).echo_response(budget)?;
+    // Prove the datagram is in this socket's kernel queue before removal;
+    // send completion alone would not exclude delayed network delivery.
+    peer.send_to(&echo, (EPDG_S2BU_IP, GTPU_PORT))?;
+    let local_hex = format!(
+        "{:08X}:{GTPU_PORT:04X}",
+        u32::from_ne_bytes(EPDG_S2BU_IP.octets())
+    );
+    let deadline = Instant::now() + Duration::from_secs(2);
+    loop {
+        let table = fs::read_to_string("/proc/net/udp")?;
+        let queued = table.lines().skip(1).any(|line| {
+            let fields: Vec<_> = line.split_whitespace().collect();
+            fields.get(1) == Some(&local_hex.as_str())
+                && fields
+                    .get(4)
+                    .and_then(|queues| queues.split_once(':'))
+                    .and_then(|(_, rx)| u64::from_str_radix(rx, 16).ok())
+                    .is_some_and(|rx| rx > 0)
+        });
+        if queued {
+            break;
+        }
+        assert!(Instant::now() < deadline, "old socket never queued receive");
+        std::thread::sleep(Duration::from_millis(1));
+    }
+    backend.remove_device(&device).await?;
+    assert_eq!(
+        first.try_receive_datagram(2048).unwrap_err(),
+        GtpuControlPortError::Unavailable
+    );
+    let mut ipv6_request = CreateGtpDeviceRequest::new("s2bu");
+    ipv6_request.uplink_mtu_policy = Some(grouped_mtu_policy());
+    let ipv6_request = CreateGtpDeviceEndpointSetRequest::new(
+        ipv6_request,
+        grouped_device_id(),
+        GtpuLocalEndpointSet::new(IpAddr::V6(EPDG_S2BU_IPV6), None)?,
+    )?;
+    let ipv6_only = backend.create_device_with_endpoints(ipv6_request).await?;
+    assert!(matches!(
+        backend.open_gtpu_control_port(&ipv6_only).await,
+        Err(GtpuError::UnsupportedFeature {
+            feature: "gtpu_control_port_ipv6"
+        })
+    ));
+    backend.remove_device(&ipv6_only).await?;
+    let replacement = backend.create_device(request).await?;
+    assert_eq!(replacement.ifindex, device.ifindex);
+    let fresh = backend.open_gtpu_control_port(&replacement).await?;
+    assert_eq!(
+        first.send_control_response(old_plan).unwrap_err(),
+        GtpuControlPortError::Unavailable
+    );
+    assert_eq!(
+        second.try_receive_datagram(2048).unwrap_err(),
+        GtpuControlPortError::Unavailable
+    );
+    assert_eq!(
+        fresh.send_control_response(foreign_plan).unwrap_err(),
+        GtpuControlPortError::SocketMismatch
+    );
+    expect_no_control_datagram(fresh.as_ref());
+    expect_no_datagram(&peer);
+    peer.send_to(&echo, (EPDG_S2BU_IP, GTPU_PORT))?;
+    let event = receive(fresh.as_ref());
+    fresh.send_control_response(event.echo_response(budget)?)?;
+    let (length, source) = peer.recv_from(&mut bytes)?;
+    assert_eq!(source, SocketAddr::from((EPDG_S2BU_IP, GTPU_PORT)));
+    assert_eq!(&bytes[..length], response);
+
+    // Dropping the final backend closes its queue despite retained ports.
+    peer.send_to(&echo, (EPDG_S2BU_IP, GTPU_PORT))?;
+    let backend_loss_plan = receive(fresh.as_ref()).echo_response(budget)?;
+    drop(backend);
+    assert_eq!(
+        fresh.try_receive_datagram(2048).unwrap_err(),
+        GtpuControlPortError::Unavailable
+    );
+    assert_eq!(
+        fresh.send_control_response(backend_loss_plan).unwrap_err(),
+        GtpuControlPortError::Unavailable
+    );
+    let released = GtpuReassemblySocket::bind(EPDG_S2BU_IP, "s2bu")?;
+    drop(released);
+    let backend = EbpfGtpuDataplaneBackend::with_config(config);
+    let replacement = backend.resolve_device("s2bu").await?;
+    let fresh = backend.open_gtpu_control_port(&replacement).await?;
+
+    // Missing live hooks retire the socket. Returning the same interface
+    // alone cannot authorize a queued response or keep a private FD alive.
+    peer.send_to(&echo, (EPDG_S2BU_IP, GTPU_PORT))?;
+    let lost_hook_plan = receive(fresh.as_ref()).echo_response(budget)?;
+    run("tc", &["qdisc", "del", "dev", "s2bu", "clsact"]);
+    assert_eq!(
+        fresh.send_control_response(lost_hook_plan).unwrap_err(),
+        GtpuControlPortError::Unavailable
+    );
+    assert!(matches!(
+        backend.open_gtpu_control_port(&replacement).await,
+        Err(GtpuError::StateIndeterminate {
+            operation: "ebpf_control_port_attachment"
+        })
+    ));
+    let released = GtpuReassemblySocket::bind(EPDG_S2BU_IP, "s2bu")?;
+    drop(released);
+    drop(backend);
+    assert_eq!(
+        fresh.try_receive_datagram(2048).unwrap_err(),
+        GtpuControlPortError::Unavailable
+    );
+    expect_no_datagram(&peer);
+    drop(peer);
+    drop(net);
+    eprintln!("OPC_GTPU_BACKEND_CONTROL_LIFETIME_PROVEN: shared queue, dynamic Echo, removal/reinstall, exact hooks, backend loss");
     Ok(())
 }

@@ -100,6 +100,24 @@ pub enum GtpuSessionSelectorRetiringRecovery {
 /// and deterministic.
 #[async_trait]
 pub trait GtpuDataplaneBackend: Send + Sync + std::fmt::Debug {
+    /// Open the shared control receive queue for one managed attachment.
+    ///
+    /// Repeated calls share the same socket and require one caller-selected
+    /// receive consumer. No raw descriptor or forwarding authority is issued.
+    /// A supported backend invalidates outstanding ports on attachment removal,
+    /// replacement or backend loss, including already prepared response plans.
+    /// The current eBPF implementation supports concrete IPv4 endpoints only.
+    /// Linux kernel, mock and unsupported adapters return the exact unsupported
+    /// feature below; they do not bind a competing socket or simulate parity.
+    async fn open_gtpu_control_port(
+        &self,
+        _device: &GtpDevice,
+    ) -> Result<std::sync::Arc<dyn crate::control_port::GtpuControlPort>, GtpuError> {
+        Err(GtpuError::UnsupportedFeature {
+            feature: "gtpu_control_port",
+        })
+    }
+
     /// Report whether this backend can issue a trusted production GTP-U
     /// traffic-continuity proof.
     ///

@@ -62,6 +62,12 @@ pub trait GtpuControlPort: fmt::Debug + Send + Sync {
 /// Stable failures without peer, packet, tunnel or deployment values.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
 pub enum GtpuControlPortError {
+    /// The managed attachment/backend no longer admits this port instance.
+    #[error("GTP-U control port is unavailable")]
+    Unavailable,
+    /// Attachment mutation currently holds the port's serialization boundary.
+    #[error("GTP-U control port is busy")]
+    Busy,
     /// Caller-selected receive or response limits are invalid.
     #[error("invalid GTP-U control port limits")]
     InvalidLimits,
