@@ -124,6 +124,14 @@ tunnel, session AMBR, session type and unique QoS flows. `resource_fields`
 keeps uplink and downlink endpoint types separate. Optional `security` and
 `network_instance` fields use bounded `security_fields` roots. Integrity
 Required/Preferred requires an explicit UL rate; decoding installs no protection.
+Setup and Modify also accept `common_network_instance` through the opaque
+`network_fields::CommonNetworkInstance` type; Modify accepts numeric
+`network_instance`. Their `transport_network_instance()` accessor prefers Common
+when present. Both supplied values remain validated and available. The caller
+resolves this request against local network configuration; decoding selects no
+network. Common octets have field depth one and caller byte limits, including
+complete fragmented-length preflight. Existing Setup/Modify struct literals must
+include or default the new optional fields.
 Data Forwarding Not Possible is receiver-ignored outside handover and omitted
 from semantic reconstruction. Other QoS profiles and unqualified optional
 transfer fields fail explicitly. `resource_results` adds

@@ -466,12 +466,13 @@ Resource Setup admission is a separate `resource_setup` boundary below.
 | UL NG-U UP transport information | 139 | reject | Mandatory single IPv4/IPv6 GTP tunnel |
 | PDU session type | 134 | reject | Mandatory; all five root payload kinds |
 | Security Indication | 138 | reject | Optional three-root integrity/confidentiality requirements; conditional UL rate |
-| Network Instance | 129 | reject | Optional root 1–256; Common Network Instance remains unsupported |
+| Network Instance | 129 | reject | Optional root 1–256; Common takes precedence when supplied |
+| Common Network Instance | 166 | ignore | Optional opaque network identifier, with bounded fragmented OCTET STRING framing |
 | Data Forwarding Not Possible | 127 | reject | Receiver-ignored outside Handover Request (9.3.4.1); never emitted by this setup constructor |
 | QoS flow setup request list | 136 | reject | Mandatory 1–64 unique root QFIs; 5QI 9 and root ARP priority/flags |
 
 Recognized optional transfer IEs outside this table fail explicitly,
-including extra/redundant tunnels and Common Network Instance.
+including extra/redundant tunnels and Redundant Common Network Instance.
 The shared IE policy implementation handles unknown criticality and
 Drop/Preserve/Reject and duplicate First/Last/Reject before field admission.
 Retained unknown-ignore entries are counted; notify IDs are returned without
@@ -1071,6 +1072,8 @@ NAS forwarding, abnormal-condition responses and resource effects (#787).
 of TS 38.413 V18.10.0 8.2.3 / 9.3.4.3. Session AMBR (130), uplink tunnel
 modifications (140), flow additions/modifications (135) and flow releases (137)
 are independently optional and reject-criticality. An empty root is preserved.
+Numeric Network Instance (129/reject) and Common Network Instance (166/ignore)
+are also optional; their separate qualification is recorded below.
 Unlike Setup's non-GBR admission, Modify does not require a new AMBR: an existing
 session can retain its prior limits. Absent QoS parameters remain absent.
 The type neither asserts an existing session nor applies previous values.
@@ -1078,6 +1081,7 @@ The type neither asserts an existing session nor applies previous values.
 | Present root field | Required depth | Nested count bound |
 | --- | --- | --- |
 | None | 4 | Zero IEs is valid |
+| Numeric or Common Network Instance | 5 | No list |
 | Session AMBR | 6 | No list |
 | Identifier-only add/modify requests | 7 | 1–64 |
 | Release QFI/Cause pairs | 8 | 1–64 |
@@ -1112,6 +1116,50 @@ Tests compare independent field values and canonical bytes, first/last selection
 metadata, empty/absent values, exact/one-short limits, overlap, malformed framing,
 all truncations and bounded mutations. All 380 full vectors seed shared replay
 and fuzz assertions.
+
+### Network-instance fields in Setup and Modify
+
+`network_fields::CommonNetworkInstance` owns opaque octets with value-free
+formatting. TS 38.413 9.3.1.120 references TS 29.244 8.2.4: identifiers may use
+domain/APN encoding but are not universally restricted to it. The codec preserves
+the unconstrained OCTET STRING, including empty and fragmented values, without
+resolving an identifier or enforcing deployment-specific naming. It needs depth
+one and checks caller byte bounds, complete minimal length determinants and
+trailing data before allocating. Construction takes a caller-owned vector and
+checks the full fragmented wire length before allocating output.
+
+Setup and Modify expose `network_instance` and `common_network_instance` plus
+`transport_network_instance()`. The accessor returns Common first, as required
+by TS 38.413 8.2.1.2/8.2.3.2. Both supplied values are preserved and validated
+after shared duplicate selection; Common presence does not make a malformed
+numeric value admissible. Numeric extension integers remain unsupported. The
+accessor describes the request and provides no local routing authority. New
+optional fields require updates to existing public struct literals.
+
+Both transfer constructors emit schema order and field-specific criticality;
+receivers preflight all physical IE framing before allocating entries or
+coalescing selected values. The Common field is ignore-criticality, but a known
+malformed selected Common value is rejected by this typed admission boundary.
+Unknown Drop and First/Last/Reject retain the existing shared policy semantics.
+No QoS profile, extra/redundant tunnel or unqualified extension is added.
+
+The [independent network-instance corpus](tests/fixtures/n3iwf-network-instance.json)
+contains 271 Common leaf vectors, 365 transfer cases and 15 complete Initial
+Context Setup, Session Setup and Session Modify requests. Pycrate 0.8.1 is
+compiled from the unchanged hash-pinned TS 38.413 V18.10.0 ASN.1; both encoder
+paths and structured decoding agree. It covers all one-octet identifier values,
+empty/127/128/16K/32K/48K/64K fragmentation boundaries, every numeric root in
+Modify, Common precedence, malformed numeric values even when Common is present,
+criticality, distinct and invalid selected duplicates, unknown IEs and ordering.
+Regenerate with `scripts/generate-ngap-network-instance.py --spec PATH --output
+PATH`. Numeric-value semantics remain TS 38.413 9.3.1.113.
+
+The original Modify corpus is byte-identical. Its two `unsupported-known-129`
+vectors and one `unsupported-known-166` vector now pass explicit construction
+and admission assertions; their old scope labels remain visible. Tests compare
+fresh typed construction with independent bytes, exact and one-short limits,
+complete-message encoding and redacted formatting. Shared fuzz/replay assertions
+reconstruct selected values and test canonical re-admission under bounded inputs.
 
 This is a transfer boundary, not an additional admitted NGAP PDU. The caller
 checks session/bearer ownership and conditional presence, correlates requests,

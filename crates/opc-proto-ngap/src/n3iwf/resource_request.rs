@@ -2,10 +2,13 @@
 //!
 //! This initial root subset admits one uplink tunnel and unique standardized
 //! non-GBR 5QI 9 flows. Session AMBR is required for these flows (TS 38.413
-//! 8.2.1.4). Optional root Security Indication and Network Instance are admitted.
+//! 8.2.1.4). Optional root Security Indication, Network Instance and Common
+//! Network Instance are admitted. Common takes precedence without hiding either
+//! supplied value or relaxing its validation.
 //! Data Forwarding Not Possible is receiver-ignored outside Handover Request
 //! (9.3.4.1). Other recognized optional fields and QoS profiles fail explicitly.
 //! No session, QoS, tunnel or datapath state is created here.
+use super::network_fields::{CommonNetworkInstance, TransportNetworkInstance};
 use super::resource_fields::{
     QosFlowSetupList, SessionAggregateBitRate, SessionType, UplinkTransport,
 };
@@ -29,6 +32,8 @@ pub struct SetupRequestTransfer {
     pub security: Option<SecurityIndication>,
     /// Optional root network instance; no local network is selected.
     pub network_instance: Option<NetworkInstance>,
+    /// Optional opaque common identifier; takes precedence over the numeric one.
+    pub common_network_instance: Option<CommonNetworkInstance>,
 }
 redacted!(SetupRequestTransfer);
 
@@ -44,6 +49,14 @@ pub struct AdmittedRequestTransfer {
 }
 
 impl SetupRequestTransfer {
+    /// Return the request preference from TS 38.413 8.2.1.2. Both supplied
+    /// fields remain available; this performs no local network selection.
+    pub fn transport_network_instance(&self) -> Option<TransportNetworkInstance<'_>> {
+        TransportNetworkInstance::preferred(
+            self.network_instance,
+            self.common_network_instance.as_ref(),
+        )
+    }
     /// Encode required and supplied optional root IEs in schema order.
     /// Receiver-ignored Data Forwarding Not Possible is not emitted.
     /// Individual fields are bounded before
@@ -52,28 +65,33 @@ impl SetupRequestTransfer {
     /// constructor. The caller may retain the original input separately.
     pub fn encode(&self, ctx: EncodeContext) -> Result<EncodedValue, EncodeError> {
         let mut fields = vec![
-            (130, self.aggregate_bit_rate.encode(ctx)?),
-            (139, self.uplink.encode(ctx)?),
-            (134, self.session_type.encode(ctx)?),
+            (130, 0, self.aggregate_bit_rate.encode(ctx)?),
+            (139, 0, self.uplink.encode(ctx)?),
+            (134, 0, self.session_type.encode(ctx)?),
         ];
         if let Some(security) = self.security {
-            fields.push((138, security.encode(ctx)?));
+            fields.push((138, 0, security.encode(ctx)?));
         }
         if let Some(network) = self.network_instance {
-            fields.push((129, network.encode(ctx)?));
+            fields.push((129, 0, network.encode(ctx)?));
         }
-        fields.push((136, self.flows.encode(ctx)?));
-        let mut length = 3;
-        for (_, value) in &fields {
-            // Every constructor is bounded; the largest complete root is
-            // below 512 bytes even on a 32-bit target.
-            length += 3 + constructed::open_type_len(value.as_bytes().len())?;
+        fields.push((136, 0, self.flows.encode(ctx)?));
+        if let Some(common) = &self.common_network_instance {
+            fields.push((166, 1, common.encode(ctx)?));
+        }
+        let mut length = 3usize;
+        for (_, _, value) in &fields {
+            let framed_length = constructed::open_type_len(value.as_bytes().len())?;
+            length = length
+                .checked_add(3)
+                .and_then(|v| v.checked_add(framed_length))
+                .ok_or_else(|| EncodeError::new(EncodeErrorCode::LengthOverflow))?;
         }
         capacity(length, ctx)?;
         let mut bytes = Zeroizing::new(Vec::with_capacity(length));
         constructed::write_prefix(&mut bytes, fields.len());
-        for (id, value) in &fields {
-            constructed::write_ie(&mut bytes, *id, 0, value.as_bytes());
+        for (id, criticality, value) in &fields {
+            constructed::write_ie(&mut bytes, *id, *criticality, value.as_bytes());
         }
         Ok(EncodedValue(bytes))
     }
@@ -95,23 +113,9 @@ impl SetupRequestTransfer {
             return Err(unsupported());
         }
         let count = policy::preflight_ie_count(input, ctx, "resource transfer container")?;
+        scan(input, count, |_| {})?;
         let mut entries = Vec::with_capacity(count);
-        let mut remaining = &input[3..];
-        for _ in 0..count {
-            let framed = aper::ie(remaining)?;
-            if framed.header[2] & 63 != 0 || framed.header[2] >> 6 > 2 {
-                return Err(invalid("resource transfer criticality framing"));
-            }
-            entries.push(Entry {
-                id: u16::from_be_bytes([framed.header[0], framed.header[1]]),
-                criticality: framed.header[2] >> 6,
-                value: framed.value,
-            });
-            remaining = framed.remainder;
-        }
-        if !remaining.is_empty() {
-            return Err(invalid("trailing resource transfer bytes"));
-        }
+        scan(input, count, |entry| entries.push(entry))?;
         let profile = policy::PDU_SESSION_RESOURCE_SETUP_REQUEST_TRANSFER;
         policy::apply_ie_policy(
             &mut entries,
@@ -131,28 +135,42 @@ impl SetupRequestTransfer {
         let mut flows = None;
         let mut security = None;
         let mut network_instance = None;
+        let mut common_network_instance = None;
         let mut ignored_ie_count = 0;
         let mut notify_ie_ids = Vec::new();
         for entry in &entries {
-            match entry.id {
-                139 => uplink = Some(UplinkTransport::decode(&entry.value, leaf)?),
-                130 => {
-                    aggregate_bit_rate = Some(SessionAggregateBitRate::decode(&entry.value, leaf)?)
-                }
-                134 => session_type = Some(SessionType::decode(&entry.value, leaf)?),
-                136 => flows = Some(QosFlowSetupList::decode(&entry.value, leaf)?),
-                138 => security = Some(SecurityIndication::decode(&entry.value, leaf)?),
-                129 => network_instance = Some(NetworkInstance::decode(&entry.value, leaf)?),
-                // This N3IWF boundary handles Initial Context/PDU Session
-                // setup, not Handover Request. Ignore the value after shared
-                // container criticality and duplicate selection (9.3.4.1).
-                127 => ignored_ie_count += 1,
-                id if profile.recognizes(id) => return Err(unsupported()),
-                _ => match entry.criticality {
+            // Unknown or receiver-ignored values are never materialized. Their
+            // complete physical framing was already checked before allocation.
+            if entry.id == 127 {
+                ignored_ie_count += 1;
+                continue;
+            }
+            if !profile.recognizes(entry.id) {
+                match entry.criticality {
                     0 => return Err(DecodeError::new(DecodeErrorCode::UnknownCriticalIe, 0)),
                     1 => ignored_ie_count += 1,
                     _ => notify_ie_ids.push(entry.id),
-                },
+                }
+                continue;
+            }
+            if !matches!(entry.id, 139 | 130 | 134 | 136 | 138 | 129 | 166) {
+                return Err(unsupported());
+            }
+            let framed = aper::ie(entry.wire)?;
+            match entry.id {
+                139 => uplink = Some(UplinkTransport::decode(&framed.value, leaf)?),
+                130 => {
+                    aggregate_bit_rate = Some(SessionAggregateBitRate::decode(&framed.value, leaf)?)
+                }
+                134 => session_type = Some(SessionType::decode(&framed.value, leaf)?),
+                136 => flows = Some(QosFlowSetupList::decode(&framed.value, leaf)?),
+                138 => security = Some(SecurityIndication::decode(&framed.value, leaf)?),
+                129 => network_instance = Some(NetworkInstance::decode(&framed.value, leaf)?),
+                166 => {
+                    common_network_instance =
+                        Some(CommonNetworkInstance::decode(&framed.value, leaf)?)
+                }
+                _ => return Err(unsupported()),
             }
         }
         Ok(AdmittedRequestTransfer {
@@ -164,6 +182,7 @@ impl SetupRequestTransfer {
                 flows: flows.ok_or_else(|| invalid("missing qos flow setup list"))?,
                 security,
                 network_instance,
+                common_network_instance,
             },
             ignored_ie_count,
             notify_ie_ids,
@@ -174,5 +193,29 @@ impl SetupRequestTransfer {
 struct Entry<'a> {
     id: u16,
     criticality: u8,
-    value: Cow<'a, [u8]>,
+    wire: &'a [u8],
+}
+
+fn scan<'a>(
+    input: &'a [u8],
+    count: usize,
+    mut emit: impl FnMut(Entry<'a>),
+) -> Result<(), DecodeError> {
+    let mut remaining = &input[3..]; // count prefix was preflighted
+    for _ in 0..count {
+        let (next, header) = aper::scan_ie(remaining)?;
+        if header[2] & 63 != 0 || header[2] >> 6 > 2 {
+            return Err(invalid("resource transfer criticality framing"));
+        }
+        emit(Entry {
+            id: u16::from_be_bytes([header[0], header[1]]),
+            criticality: header[2] >> 6,
+            wire: &remaining[..remaining.len() - next.len()],
+        });
+        remaining = next;
+    }
+    if !remaining.is_empty() {
+        return Err(invalid("trailing resource transfer bytes"));
+    }
+    Ok(())
 }

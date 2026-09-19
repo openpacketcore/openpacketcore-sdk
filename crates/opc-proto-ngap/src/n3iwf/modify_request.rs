@@ -1,5 +1,5 @@
 //! Root PDU Session Resource Modify Request Transfer admission (TS 38.413
-//! 8.2.3 / 9.3.4.3). The four supported fields are optional, including AMBR:
+//! 8.2.3 / 9.3.4.3). The supported fields are optional, including AMBR:
 //! an existing session can retain its previous aggregate limits. Empty roots
 //! and absent flow parameters are preserved without supplying defaults.
 //!
@@ -10,7 +10,9 @@
 //! explicitly unsupported; this module does not admit an enclosing NGAP PDU.
 
 use super::modify_fields::{QosFlowCauses, QosFlowModifications, UplinkModifications};
+use super::network_fields::{CommonNetworkInstance, TransportNetworkInstance};
 use super::resource_fields::SessionAggregateBitRate;
+use super::security_fields::NetworkInstance;
 use super::*;
 use crate::policy;
 
@@ -25,6 +27,10 @@ pub struct ModifyRequestTransfer {
     pub add_or_modify: Option<QosFlowModifications>,
     /// Unique QFIs and root causes, disjoint from `add_or_modify`.
     pub release: Option<QosFlowCauses>,
+    /// Optional numeric root network identifier; no local network is selected.
+    pub network_instance: Option<NetworkInstance>,
+    /// Optional opaque common identifier; takes precedence over the numeric one.
+    pub common_network_instance: Option<CommonNetworkInstance>,
 }
 redacted!(ModifyRequestTransfer);
 
@@ -40,6 +46,14 @@ pub struct AdmittedModifyRequestTransfer {
 }
 
 impl ModifyRequestTransfer {
+    /// Return the request preference from TS 38.413 8.2.3.2. Both supplied
+    /// fields remain available; this performs no local network selection.
+    pub fn transport_network_instance(&self) -> Option<TransportNetworkInstance<'_>> {
+        TransportNetworkInstance::preferred(
+            self.network_instance,
+            self.common_network_instance.as_ref(),
+        )
+    }
     fn validate(&self) -> Result<(), DecodeError> {
         if let (Some(add), Some(release)) = (&self.add_or_modify, &self.release) {
             let identifiers = add
@@ -69,17 +83,25 @@ impl ModifyRequestTransfer {
         let fields = [
             (
                 130,
+                0,
                 self.aggregate_bit_rate.map(|v| v.encode(ctx)).transpose()?,
             ),
             (
                 140,
+                0,
                 self.uplink_modifications
                     .as_ref()
                     .map(|v| v.encode(ctx))
                     .transpose()?,
             ),
             (
+                129,
+                0,
+                self.network_instance.map(|v| v.encode(ctx)).transpose()?,
+            ),
+            (
                 135,
+                0,
                 self.add_or_modify
                     .as_ref()
                     .map(|v| v.encode(ctx))
@@ -87,23 +109,36 @@ impl ModifyRequestTransfer {
             ),
             (
                 137,
+                0,
                 self.release.as_ref().map(|v| v.encode(ctx)).transpose()?,
             ),
+            (
+                166,
+                1,
+                self.common_network_instance
+                    .as_ref()
+                    .map(|v| v.encode(ctx))
+                    .transpose()?,
+            ),
         ];
-        let mut length = 3;
+        let mut length = 3usize;
         let mut count = 0;
-        for (_, value) in &fields {
+        for (_, _, value) in &fields {
             if let Some(value) = value {
-                length += 3 + constructed::open_type_len(value.as_bytes().len())?;
+                let framed_length = constructed::open_type_len(value.as_bytes().len())?;
+                length = length
+                    .checked_add(3)
+                    .and_then(|v| v.checked_add(framed_length))
+                    .ok_or_else(|| EncodeError::new(EncodeErrorCode::LengthOverflow))?;
                 count += 1;
             }
         }
         capacity(length, ctx)?;
         let mut bytes = Zeroizing::new(Vec::with_capacity(length));
         constructed::write_prefix(&mut bytes, count);
-        for (id, value) in &fields {
+        for (id, criticality, value) in &fields {
             if let Some(value) = value {
-                constructed::write_ie(&mut bytes, *id, 0, value.as_bytes());
+                constructed::write_ie(&mut bytes, *id, *criticality, value.as_bytes());
             }
         }
         Ok(EncodedValue(bytes))
@@ -113,7 +148,8 @@ impl ModifyRequestTransfer {
     /// materialization, then apply the shared duplicate/unknown IE policies.
     /// Retained unknown reject-criticality IEs prevent semantic admission.
     ///
-    /// Depth is four for an empty root, six with AMBR, seven with identifier-only
+    /// Depth is four for an empty root, five with network identifiers, six with
+    /// AMBR, seven with identifier-only
     /// requests, eight with release causes, nine with tunnel modifications or
     /// ten with flow parameters. The container and each nested list separately
     /// use `max_ies`; `allocation_budget` remains advisory. These are SDK caller
@@ -155,7 +191,7 @@ impl ModifyRequestTransfer {
                 }
                 continue;
             }
-            if !matches!(entry.id, 130 | 140 | 135 | 137) {
+            if !matches!(entry.id, 130 | 140 | 129 | 135 | 137 | 166) {
                 return Err(unsupported());
             }
             let framed = aper::ie(entry.wire)?;
@@ -173,6 +209,13 @@ impl ModifyRequestTransfer {
                         Some(QosFlowModifications::decode(&framed.value, leaf)?)
                 }
                 137 => transfer.release = Some(QosFlowCauses::decode(&framed.value, leaf)?),
+                129 => {
+                    transfer.network_instance = Some(NetworkInstance::decode(&framed.value, leaf)?)
+                }
+                166 => {
+                    transfer.common_network_instance =
+                        Some(CommonNetworkInstance::decode(&framed.value, leaf)?)
+                }
                 _ => return Err(unsupported()),
             }
         }

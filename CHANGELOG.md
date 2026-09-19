@@ -13,6 +13,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   replacement, shutdown and multihoming failover qualification (Refs #788).
 
 ### Added
+- `opc-proto-ngap`: construct and admit Common Network Instance in Setup/Modify
+  transfers and numeric Network Instance in Modify. Preserve opaque identifiers,
+  expose the specified Common-first request preference, and preflight fragmented
+  values with independent leaf, transfer and complete-message evidence (Refs #787).
 - `opc-n3iwf-fixtures`: bind ten DTLS lifecycle families to eight independent
   certificate cases and 78 SDK stream-zero schedules. Replay them against the
   existing generic protected PPID 66 transport; also qualify the certificate

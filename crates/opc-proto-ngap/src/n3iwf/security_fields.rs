@@ -217,7 +217,7 @@ impl SecurityResult {
 }
 
 /// The root network-instance value, without selecting a transport resource.
-/// Common Network Instance precedence requires separate field qualification.
+/// Setup/Modify request accessors prefer a supplied Common Network Instance.
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub struct NetworkInstance(u16);
 redacted!(NetworkInstance);

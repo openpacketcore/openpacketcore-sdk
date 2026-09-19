@@ -1,4 +1,5 @@
 //! Shared semantic reconstruction for resource-security fuzz and replay.
+use opc_proto_ngap::n3iwf::network_fields::CommonNetworkInstance;
 use opc_proto_ngap::n3iwf::release::Cause;
 use opc_proto_ngap::n3iwf::resource_fields::{DownlinkTransport, QosFlowId};
 use opc_proto_ngap::n3iwf::resource_request::SetupRequestTransfer;
@@ -33,6 +34,10 @@ pub fn request(value: &SetupRequestTransfer) -> SetupRequestTransfer {
     reconstructed.network_instance = value
         .network_instance
         .map(|v| NetworkInstance::new(v.value()).unwrap());
+    reconstructed.common_network_instance = value
+        .common_network_instance
+        .as_ref()
+        .map(|v| CommonNetworkInstance::new(v.as_bytes().to_vec()));
     assert!(reconstructed == *value);
     reconstructed
 }

@@ -9,6 +9,8 @@
 //! protection — if a future change makes the decode path panic on a known
 //! input, this test fails and names the offending input.
 
+#[path = "support/network_instance.rs"]
+mod network_instance;
 #[path = "support/resource_release.rs"]
 mod resource_release;
 #[path = "support/resource_setup.rs"]
@@ -60,6 +62,14 @@ fn exercise(data: &[u8]) {
         validation_level: ValidationLevel::Strict,
         ..DecodeContext::default()
     };
+    network_instance::exercise(
+        data,
+        ctx,
+        EncodeContext {
+            max_message_len: ctx.max_message_len,
+            ..EncodeContext::default()
+        },
+    );
     modify_fields::exercise(
         data,
         ctx,

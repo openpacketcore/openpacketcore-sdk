@@ -122,6 +122,7 @@ fn transfer(model: &Value) -> SetupRequestTransfer {
     SetupRequestTransfer {
         security: None,
         network_instance: None,
+        common_network_instance: None,
         uplink: UplinkTransport::new(
             model["uplink"]["address"]
                 .as_str()

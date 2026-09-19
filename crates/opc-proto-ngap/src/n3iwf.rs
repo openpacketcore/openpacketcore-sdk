@@ -127,6 +127,7 @@ pub mod modify_results;
 pub mod nas;
 /// Bounded identity and AMF reroute root values for NAS message admission.
 pub mod nas_fields;
+pub mod network_fields;
 pub mod release;
 
 /// Bounded UE Context Release Complete session reports.

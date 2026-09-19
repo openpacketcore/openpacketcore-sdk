@@ -59,6 +59,7 @@ fn request_transfer(m: &Value) -> SetupRequestTransfer {
     SetupRequestTransfer {
         security: None,
         network_instance: None,
+        common_network_instance: None,
         uplink: UplinkTransport::new(
             m["uplink"]["address"].as_str().unwrap().parse().unwrap(),
             m["uplink"]["teid"].as_u64().unwrap() as u32,
