@@ -21,6 +21,13 @@ pub(super) use admission::{LogMemory, RosterPreparation};
 const REQUEST_METADATA: usize = 128 * 512;
 const CONTEXT_METADATA: usize = 64 * 1024;
 
+// Each retirement owner contributes eight field slots and nine containers
+// across its inventory entry and signature. One original block covers the
+// fixed identity/challenge/signature fields. The raw preflight uses the same
+// bound; complete decoding still enforces the exact 32-owner maximum.
+pub(super) const ASYNC_RECOVERY_METADATA_REQUESTS: usize =
+    (128 + crate::consensus::protected_recovery::MAX_PROTECTED_RECOVERY_OWNERS * 9).div_ceil(128);
+
 // These two boundary fixtures each deliberately consume most of the one
 // process budget. Serialize only their construction/verification in the test
 // harness; production keeps the original shared reservation and denial rules.
@@ -56,9 +63,11 @@ fn log_bytes(row: &log::NativeLogEntry) -> io::Result<usize> {
         };
         match intent {
             SessionMutationIntent::AdvanceLogicalTime => {}
-            SessionMutationIntent::MaintainFencedTransitionV2History { .. }
-            | SessionMutationIntent::AsyncRecoveryBoundary { .. } => {
+            SessionMutationIntent::MaintainFencedTransitionV2History { .. } => {
                 count = 1;
+            }
+            SessionMutationIntent::AsyncRecoveryBoundary { .. } => {
+                count = ASYNC_RECOVERY_METADATA_REQUESTS;
             }
             SessionMutationIntent::ActivateFencedTransitionCapability { .. } => {
                 count = 1;
@@ -201,11 +210,15 @@ pub(super) fn log_owned(entry: &Entry<SessionRaftTypeConfig>) -> io::Result<usiz
     fn intent(value: &SessionMutationIntent, allow_authorized: bool) -> io::Result<usize> {
         match value {
             SessionMutationIntent::AdvanceLogicalTime => Ok(0),
-            SessionMutationIntent::MaintainFencedTransitionV2History { .. }
-            | SessionMutationIntent::AsyncRecoveryBoundary { .. }
-                if allow_authorized =>
-            {
+            SessionMutationIntent::MaintainFencedTransitionV2History { .. } if allow_authorized => {
                 Ok(0)
+            }
+            SessionMutationIntent::AsyncRecoveryBoundary { protected, .. } if allow_authorized => {
+                Ok(if protected.is_some() {
+                    CONTEXT_METADATA
+                } else {
+                    0
+                })
             }
             SessionMutationIntent::BindConsumerRequest { .. } => Ok(0),
             SessionMutationIntent::ActivateFencedTransitionCapability { .. } => Ok(0),

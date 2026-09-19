@@ -49,6 +49,9 @@ rustls-pki-types = { workspace = true }
 [target.'cfg(unix)'.dependencies]
 rustix = { version = "1", features = ["event", "fs", "net", "process"] }
 
+[target.'cfg(target_os = "linux")'.dependencies]
+rusqlite = { workspace = true, features = ["bundled"] }
+
 [[test]]
 name = "qualification_multiprocess"
 path = "tests/qualification_multiprocess.rs"

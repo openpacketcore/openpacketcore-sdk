@@ -13,6 +13,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   replacement, shutdown and multihoming failover qualification (Refs #788).
 
 ### Added
+- `opc-session-store`: add `ProtectedAsyncRecovery` for retained-root majority
+  and all-cold recovery with a complete, root-signed inventory of external
+  effect owners. Every owner durably retires the old authority range before
+  real quorum commitment and completed generations admit a successor. Normal
+  Async acknowledgements remain independent of disk; acknowledged state can
+  still be lost. This recovery path requires all original retained voters and
+  inventoried owners, plus downstream provider composition (Refs #908, #929).
 - `opc-proto-ngap`: consolidate N3IWF subset acceptance evidence, public
   revisions and bounded fuzz qualification; reconcile stale procedure-status
   text while preserving all unsupported fields and disabled triggers (Refs #787).
@@ -135,6 +142,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   persisted envelopes, privacy digests, and protobuf wire bytes.
 
 ### Fixed
+- `opc-session-store`: preserve a cold voter's certified catch-up progress
+  across caller deadlines and recertify a newer committed leader. Reuse exact
+  in-memory signature calculations during protected recovery validation while
+  independently verifying every cold or wire decode. Preserve operation
+  deadlines, full authority checks and Durable/Ephemeral behavior (Refs #908).
 - Publish XFRM recovery-test readiness only after the complete record is
   written and synced. Preserve exclusive publication and strict malformed
   record refusal across the single-object, roster and SA relocation harnesses
@@ -425,9 +437,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   Additive openers accept persistence independently of snapshot integrity,
   including the existing explicit clock and complete-operation deadline shape.
   Mode-aware readiness, typed passive health, and an explicit local drain
-  report the selected contract. Every existing Async root rejoins through a
-  fresh surviving-quorum commit and exact local catch-up; an all-cold set stays
-  `RecoveryRequired`. Mode mismatches fail closed on disk and consensus/control
+  report the selected contract. Retained Async roots rejoin through a fresh
+  surviving-quorum commit and exact catch-up, or the explicit majority-recovery
+  capability. Mode mismatches fail closed on disk and consensus/control
   traffic. Losing the volatile quorum can lose acknowledged results; local
   persistence does not authorize recovery. No automatic mode migration is
   provided. See ADR 0022 for semantics and qualification boundaries.

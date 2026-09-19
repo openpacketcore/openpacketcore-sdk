@@ -2167,6 +2167,8 @@ pub enum SessionMutationIntent {
         era: u64,
         /// Commitment to every exact prepared member and retained log cut.
         plan: [u8; 32],
+        /// Verified complete external retirement for a protected root.
+        protected: Option<Box<super::protected_recovery::ProtectedRecoveryProof>>,
     },
 }
 

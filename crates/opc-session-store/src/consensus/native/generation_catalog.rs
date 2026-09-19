@@ -483,6 +483,7 @@ pub(super) fn validate_context_header_with_origin(
         &context.business.frontiers,
         context.business.counts,
         origin,
+        root,
     )?;
     if let Some(origin) = origin {
         origin.require_scope(binding, identity, members, root)?;

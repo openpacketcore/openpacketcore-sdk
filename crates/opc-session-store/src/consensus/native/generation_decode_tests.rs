@@ -730,6 +730,11 @@ fn native_generation_cold_log_preflight_rejects_recursive_authority_and_unbounde
         body.insert(format!("unknown{index}"), serde_json::json!({}));
     }
     assert!(json::log_scratch(&serde_json::to_vec(&row).unwrap()).is_err());
+    let fields = (0..513)
+        .map(|index| (format!("unknown{index}"), serde_json::json!({})))
+        .collect::<serde_json::Map<_, _>>();
+    row["payload"]["Normal"]["intent"] = serde_json::json!({"AsyncRecoveryBoundary": fields});
+    assert!(json::log_scratch(&serde_json::to_vec(&row).unwrap()).is_err());
     let bytes = serde_json::to_vec(&command(2, &original, time(2), false)).unwrap();
     assert!(verify_log(
         &bytes,

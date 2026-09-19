@@ -3771,6 +3771,7 @@ dependencies = [
  "opc-types",
  "p256 0.14.0",
  "rcgen",
+ "rusqlite",
  "rustix",
  "rustls-pki-types",
  "serde",

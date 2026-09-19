@@ -118,6 +118,49 @@ fn validate_selection(selection: &Selection) -> PeerResult<()> {
 }
 
 impl ConsensusSessionStore {
+    /// Install the complete provider retirement authority for this protected
+    /// Async configuration. Configure every voter with the same root-signed
+    /// inventory before recovery. This is one-time configuration, not permission
+    /// to bypass quarantine; readiness still requires real committed application
+    /// and completed generations on every retained voter.
+    ///
+    /// Provider owners must implement the scope-wide retirement contract in
+    /// [`crate::consensus::protected_recovery::ProtectedAsyncRecoveryOwner`].
+    /// Replacing the configured authority in an open store is rejected.
+    pub fn configure_protected_async_recovery(
+        &self,
+        authority: Arc<crate::consensus::protected_recovery::ProtectedAsyncRecovery>,
+    ) -> Result<(), crate::consensus::protected_recovery::ProtectedRecoveryError> {
+        use crate::consensus::protected_recovery::ProtectedRecoveryError::AuthorityRejected;
+        if self.persistence_mode() != SessionPersistenceMode::Async {
+            return Err(AuthorityRejected);
+        }
+        let root = self
+            .inner
+            .roster_attestation_trust_root
+            .as_ref()
+            .ok_or(AuthorityRejected)?;
+        authority.inventory().matches(
+            self.inner.storage_identity,
+            &self.inner.bootstrap_members,
+            root,
+        )?;
+        let inventory = authority.inventory().commitment()?;
+        self.inner
+            .private_wal
+            .as_ref()
+            .ok_or(AuthorityRejected)?
+            .native_public_scalar_read(|state| {
+                state.validate_protected_recovery_inventory(inventory)
+            })
+            .map_err(|_| AuthorityRejected)?;
+        self.inner
+            .persistence_protocol
+            .protected_recovery
+            .set(authority)
+            .map_err(|_| AuthorityRejected)
+    }
+
     async fn recovery_scope_before(&self, deadline: tokio::time::Instant) -> PeerResult<()> {
         if self.persistence_mode() != SessionPersistenceMode::Async
             || !self.engine_is_running_in_local_scope()
@@ -150,9 +193,23 @@ impl ConsensusSessionStore {
         let supported = wal
             .native_public_scalar_read(|state| Ok(state.async_recovery_supported()))
             .map_err(unavailable)?;
+        let protected_inventory = self
+            .inner
+            .persistence_protocol
+            .protected_recovery
+            .get()
+            .map(|authority| authority.inventory().commitment())
+            .transpose()
+            .map_err(rejected)?;
+        if let Some(inventory) = protected_inventory {
+            wal.native_public_scalar_read(|state| {
+                state.validate_protected_recovery_inventory(inventory)
+            })
+            .map_err(rejected)?;
+        }
         let capability = if authority.is_none() {
             Capability::Legacy
-        } else if supported {
+        } else if supported || protected_inventory.is_some() {
             Capability::Reserved
         } else {
             Capability::ProtectedAuthority
@@ -171,10 +228,11 @@ impl ConsensusSessionStore {
                 .is_reforming(deadline)
                 .await?,
             capability,
+            protected_inventory,
         })
     }
 
-    fn recovery_call(
+    pub(super) fn recovery_call(
         &self,
         target: SessionConsensusNodeId,
         action: Action,
@@ -216,7 +274,10 @@ impl ConsensusSessionStore {
                     deadline,
                 )
                 .await
-                .map_err(unavailable)
+                .map_err(|failure| match failure {
+                    ConsensusPeerCallFailure::AuthenticatedRejection(error) => error,
+                    _ => SessionConsensusPeerError::Unavailable,
+                })
             }
         })
     }
@@ -394,6 +455,10 @@ impl ConsensusSessionStore {
                 .commit_recovery(selection, deadline)
                 .await
                 .map(Reply::Committed),
+            Action::CommitStatus(selection) => self
+                .protected_commit_status(&selection, deadline)
+                .await
+                .map(Reply::CommitStatus),
             Action::Ready {
                 selection,
                 boundary,
@@ -435,6 +500,7 @@ impl ConsensusSessionStore {
         };
         if status.boot != original.boot
             || status.root != original.root
+            || status.protected_inventory != original.protected_inventory
             || status.capability != Capability::Reserved
             || !((status.era == before.era() && status.promise == before.plan())
                 || (local.as_ref().is_some_and(|prior| prior.round == round)
@@ -659,6 +725,26 @@ impl ConsensusSessionStore {
                 intent: SessionMutationIntent::AsyncRecoveryBoundary {
                     era: selection.round.era,
                     plan: selection.round.digest()?,
+                    protected: match self.inner.persistence_protocol.protected_recovery.get() {
+                        Some(authority) => {
+                            protocol.recovery_restriction(
+                                crate::SessionAsyncRecoveryState::AwaitingProtectedRetirement,
+                            );
+                            let proof = authority.retire_before(&selection, deadline).await.map_err(|error| {
+                                use crate::consensus::protected_recovery::ProtectedRecoveryError;
+                                if error == ProtectedRecoveryError::AuthorityRejected {
+                                    protocol.recovery_restriction(crate::SessionAsyncRecoveryState::ProtectedAuthorityRejected);
+                                }
+                                match error {
+                                    ProtectedRecoveryError::Deadline => SessionConsensusPeerError::Timeout,
+                                    ProtectedRecoveryError::OwnerPending => SessionConsensusPeerError::Unavailable,
+                                    ProtectedRecoveryError::AuthorityRejected => SessionConsensusPeerError::Rejected,
+                                }
+                            })?;
+                            Some(Box::new(proof))
+                        }
+                        None => None,
+                    },
                 },
             };
             let response = self
@@ -701,6 +787,47 @@ impl ConsensusSessionStore {
                 .map_err(|_| SessionConsensusPeerError::Timeout)?
                 .map_err(unavailable)?;
         }
+    }
+
+    async fn protected_commit_status(
+        &self,
+        selection: &Selection,
+        deadline: tokio::time::Instant,
+    ) -> PeerResult<bool> {
+        validate_selection(selection)?;
+        if selection.leader != self.inner.local_node_id
+            || self
+                .inner
+                .persistence_protocol
+                .protected_recovery
+                .get()
+                .is_none()
+        {
+            return Ok(false);
+        }
+        let protocol = &self.inner.persistence_protocol;
+        let owner = tokio::time::timeout_at(deadline, protocol.recovery_local.lock())
+            .await
+            .map_err(|_| SessionConsensusPeerError::Timeout)?;
+        let Some(local) = owner
+            .as_ref()
+            .filter(|local| local.selection.as_ref() == Some(selection))
+        else {
+            return Ok(false);
+        };
+        let guard = protocol.engine_before(deadline).await?;
+        if !guard.recovery_matches(selection.round.digest()?, selection.round.era)
+            || self.inner.raft.metrics().borrow().vote != committed_vote(selection)?
+        {
+            return Ok(false);
+        }
+        // A current real committed election permits another observation of
+        // its owned retirement/proposal. It does not prove either completed.
+        // A failed accepted proposal must instead be retired by a newer round.
+        Ok(local
+            .proposal
+            .as_ref()
+            .is_none_or(|completion| !matches!(*completion.borrow(), Some(Err(())))))
     }
 
     async fn ready_recovery(
@@ -747,6 +874,11 @@ impl ConsensusSessionStore {
                 && metrics.current_leader == Some(selection.leader)
                 && metrics.last_applied == retained.applied
                 && *metrics.membership_config.log_id() == retained.membership
+                && wal
+                    .native_public_scalar_read(|state| {
+                        Ok(state.protected_recovery_matches(selection))
+                    })
+                    .map_err(rejected)?
             {
                 let status = selection
                     .round
@@ -876,9 +1008,6 @@ impl ConsensusSessionStore {
             return Err(SessionConsensusPeerError::Rejected);
         }
         if current.as_ref().is_some_and(|prior| {
-            if prior.restart {
-                return true;
-            }
             let Ok(plan) = prior.round.digest() else {
                 return true;
             };
@@ -891,6 +1020,35 @@ impl ConsensusSessionStore {
             })
         }) {
             *current = None;
+        }
+        if let Some(prior) = current.as_mut().filter(|prior| prior.restart) {
+            let can_resume = if let Some(selection) = prior.selection.as_ref().filter(|selection| {
+                prior.resume_owned_commit
+                    && selection
+                        .round
+                        .participants
+                        .values()
+                        .all(|status| status.protected_inventory.is_some())
+            }) {
+                match self
+                    .recovery_call(
+                        selection.leader,
+                        Action::CommitStatus(selection.clone()),
+                        deadline,
+                    )
+                    .await?
+                {
+                    Reply::CommitStatus(value) => value,
+                    _ => return Err(SessionConsensusPeerError::Protocol),
+                }
+            } else {
+                false
+            };
+            if can_resume {
+                prior.restart = false;
+            } else {
+                *current = None;
+            }
         }
         if current.is_none() {
             if statuses.values().filter(|s| s.active).count() > statuses.len() / 2
@@ -931,6 +1089,7 @@ impl ConsensusSessionStore {
                 boundary: None,
                 ready: BTreeMap::new(),
                 restart: false,
+                resume_owned_commit: false,
             });
         }
         let current = current
@@ -998,10 +1157,16 @@ impl ConsensusSessionStore {
                     // A triggered election makes one real vote attempt. It
                     // cannot safely reuse its term after a lost response, and
                     // an accepted proposal may still finish. The next drive
-                    // must prepare a strictly newer range on every owner;
-                    // preparation drains and supersedes those old effects.
+                    // must either verify that the exact protected election
+                    // still owns resumable work, or prepare a strictly newer
+                    // range. That preparation drains and supersedes old effects.
                     current.restart = true;
-                    return Err(other.err().unwrap_or(SessionConsensusPeerError::Protocol));
+                    let error = other.err().unwrap_or(SessionConsensusPeerError::Protocol);
+                    current.resume_owned_commit = matches!(
+                        error,
+                        SessionConsensusPeerError::Timeout | SessionConsensusPeerError::Unavailable
+                    );
+                    return Err(error);
                 }
             };
             current.boundary = Some(boundary);

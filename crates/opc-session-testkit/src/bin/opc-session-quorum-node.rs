@@ -1339,19 +1339,38 @@ impl QualificationNode {
         };
         let backend = SqliteSessionBackend::open(&config.database_path)
             .map_err(|_| node_open_failure(QualificationNodeOpenStage::Sqlite))?;
+        #[cfg(all(target_os = "linux", feature = "test-control"))]
+        if config.isolated_scale.is_some_and(|scale| {
+            scale.workload == opc_session_testkit::qualification::QualificationIsolatedScaleWorkload::ProtectedRecoveryControl
+                && scale.persistence.store_mode() == opc_session_store::SessionPersistenceMode::Async
+        }) {
+            let fault = config.workspace_directory.join("fail-async-generations");
+            backend.set_native_generation_fault_for_test(move || {
+                if fault.try_exists()? {
+                    Err(std::io::Error::from(std::io::ErrorKind::StorageFull))
+                } else {
+                    Ok(())
+                }
+            }).map_err(|_| NodeFailure)?;
+        }
         let store = Arc::new(if let Some(scale) = config.isolated_scale {
             let logical_time = time::OffsetDateTime::from_unix_timestamp(
                 QUALIFICATION_ISOLATED_SCALE_UNIX_SECONDS,
             )
             .map_err(|_| node_open_failure(QualificationNodeOpenStage::Consensus))?;
+            let clock: Arc<dyn opc_session_store::Clock> = if scale.workload
+                == opc_session_testkit::qualification::QualificationIsolatedScaleWorkload::ProtectedRecoveryControl
+            {
+                Arc::new(SystemClock)
+            } else {
+                Arc::new(IsolatedScaleClock(Timestamp::from_offset_datetime(logical_time)))
+            };
             ConsensusSessionStore::open_fixed_quorum_with_snapshot_directory(
                 topology,
                 backend,
                 snapshot_directory,
                 peers,
-                Arc::new(IsolatedScaleClock(Timestamp::from_offset_datetime(
-                    logical_time,
-                ))),
+                clock,
                 Duration::from_millis(config.operation_timeout_millis),
                 config
                     .snapshot_integrity
@@ -1383,6 +1402,19 @@ impl QualificationNode {
             })?
         });
         let empty_vote_dispatches = Arc::new(AtomicU64::new(0));
+        #[cfg(target_os = "linux")]
+        if config.isolated_scale.is_some_and(|scale| {
+            scale.workload == opc_session_testkit::qualification::QualificationIsolatedScaleWorkload::ProtectedRecoveryControl
+                && scale.persistence.store_mode() == opc_session_store::SessionPersistenceMode::Async
+        }) {
+            let voters = configured_voter_ids.iter().copied()
+                .map(SessionConsensusNodeId::new).collect::<Result<std::collections::BTreeSet<_>, _>>()
+                .map_err(|_| NodeFailure)?;
+            let authority = opc_session_testkit::qualification::protected_recovery::authority(
+                &config.workspace_directory, fixed_consensus_identity, &voters, roster_attestation_root.clone(),
+            ).map_err(|_| NodeFailure)?;
+            store.configure_protected_async_recovery(authority).map_err(|_| NodeFailure)?;
+        }
         let counting_handler: Arc<dyn SessionConsensusRpcHandler> =
             Arc::new(QualificationProbeDispatchCountingHandler {
                 inner: store.rpc_handler(),
@@ -1473,7 +1505,7 @@ impl QualificationNode {
             QualificationNodeCommand::Configure => QualificationNodeReply::Error {
                 code: QualificationNodeErrorCode::InvalidRequest,
             },
-            QualificationNodeCommand::Initialize => match self.store.initialize_cluster().await {
+            QualificationNodeCommand::Initialize => match self.initialize().await {
                 Ok(()) => QualificationNodeReply::Initialized,
                 Err(_) => QualificationNodeReply::Error {
                     code: QualificationNodeErrorCode::InitializationUnavailable,
@@ -1873,6 +1905,26 @@ impl QualificationNode {
                 }
             }
         }
+    }
+
+    async fn initialize(&self) -> Result<(), ()> {
+        self.store.initialize_cluster().await.map_err(|_| ())?;
+        if self.isolated_scale.is_some_and(|scale| {
+            scale.workload == opc_session_testkit::qualification::QualificationIsolatedScaleWorkload::ProtectedRecoveryControl
+        }) {
+            // This fixture retains the production trust root from construction
+            // and activates the same V2 profile before returning initialized.
+            // Reopen must reconcile that exact profile; it cannot remove it.
+            self.store
+                .activate_fenced_transition_capability()
+                .await
+                .map_err(|_| ())?;
+            self.store
+                .activate_protected_roster_profile_v2()
+                .await
+                .map_err(|_| ())?;
+        }
+        Ok(())
     }
 
     async fn start_stateless_consumer(
@@ -3101,6 +3153,9 @@ impl QualificationNode {
                 completed_generation: health
                     .asynchronous
                     .map(|progress| progress.completed_generation),
+                completed_applied_index: health
+                    .asynchronous
+                    .and_then(|progress| progress.completed_applied_index),
                 persistence_lag_millis: health.asynchronous.map(|progress| progress.lag_millis),
             },
         }

@@ -83,6 +83,7 @@ fn recover(storage: &mut NativeStorage, index: u64) -> u64 {
         term,
         index,
         SessionMutationIntent::AsyncRecoveryBoundary {
+            protected: None,
             era: 2,
             plan: [0xB1; 32],
         },
@@ -255,6 +256,7 @@ fn native_async_boundary_requires_successor_term_and_preserves_named_header() {
         1,
         2,
         SessionMutationIntent::AsyncRecoveryBoundary {
+            protected: None,
             era: 2,
             plan: [0xB1; 32],
         },
@@ -281,6 +283,7 @@ fn native_async_boundary_requires_successor_term_and_preserves_named_header() {
         term,
         3,
         SessionMutationIntent::AsyncRecoveryBoundary {
+            protected: None,
             era: 2,
             plan: [0xB1; 32],
         },
