@@ -137,6 +137,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `opc-proto-eap`: add bounded EAP-5G bootstrap envelopes with typed AN
   parameters, opaque NAS forwarding, explicit duplicate and presence policy,
   canonical construction and redacted diagnostics (Refs #785).
+- `opc-session-store`: add `ProtectedAsyncRecovery` for retained-root majority
+  and all-cold recovery with a complete, root-signed inventory of external
+  effect owners. Every owner durably retires the old authority range before
+  real quorum commitment and completed generations admit a successor. Normal
+  Async acknowledgements remain independent of disk; acknowledged state can
+  still be lost. This recovery path requires all original retained voters and
+  inventoried owners, plus downstream provider composition (Refs #908, #929).
+
 
 ### Changed
 - `opc-diameter-transport`: expose an opaque generic RFC 6083 connector,
@@ -267,6 +275,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   bounded `Display` output are unchanged. Compatibility note: downstream
   matches must change the `KeyDerivation` payload from
   `Ikev2SaInitCryptoErrorCode` to `Ikev2ChildSaKeyMaterialDiagnostic`.
+- `opc-session-store`: preserve a cold voter's certified catch-up progress
+  across caller deadlines and recertify a newer committed leader. Reuse exact
+  in-memory signature calculations during protected recovery validation while
+  independently verifying every cold or wire decode. Preserve operation
+  deadlines, full authority checks and Durable/Ephemeral behavior (Refs #908).
+
 
 ### Added
 - Vendored DTLS: pair RFC 6083 application plaintext with its exact decrypted
