@@ -1,9 +1,9 @@
 //! Shared semantic reconstruction for resource-security fuzz and replay.
 use opc_proto_ngap::n3iwf::network_fields::CommonNetworkInstance;
-use opc_proto_ngap::n3iwf::release::Cause;
-use opc_proto_ngap::n3iwf::resource_fields::{DownlinkTransport, QosFlowId};
 use opc_proto_ngap::n3iwf::resource_request::SetupRequestTransfer;
-use opc_proto_ngap::n3iwf::resource_results::{FailedQosFlow, SetupResponseTransfer};
+use opc_proto_ngap::n3iwf::resource_results::SetupResponseTransfer;
+#[path = "setup_tunnels.rs"]
+pub mod setup_tunnels;
 use opc_proto_ngap::n3iwf::resource_setup::ResourceSetupMessage;
 use opc_proto_ngap::n3iwf::security_fields::{
     MaximumIntegrityRate, NetworkInstance, ProtectionRequirement, SecurityIndication,
@@ -42,24 +42,7 @@ pub fn request(value: &SetupRequestTransfer) -> SetupRequestTransfer {
     reconstructed
 }
 pub fn response(value: &SetupResponseTransfer) -> SetupResponseTransfer {
-    let reconstructed = SetupResponseTransfer::new(
-        DownlinkTransport::new(value.downlink().address(), value.downlink().teid()),
-        value
-            .accepted()
-            .iter()
-            .map(|qfi| QosFlowId::new(qfi.value()).unwrap())
-            .collect(),
-        value
-            .failed()
-            .iter()
-            .map(|failed| FailedQosFlow {
-                qfi: QosFlowId::new(failed.qfi.value()).unwrap(),
-                cause: Cause::new(failed.cause.class(), failed.cause.code()).unwrap(),
-            })
-            .collect(),
-    )
-    .unwrap()
-    .with_security_result(value.security_result().map(result));
+    let reconstructed = setup_tunnels::rebuild(value);
     assert!(reconstructed == *value);
     reconstructed
 }
@@ -114,8 +97,5 @@ pub fn exercise(data: &[u8], ctx: DecodeContext, output: EncodeContext) {
         assert_eq!(received.ignored_ie_count, 0);
         assert!(received.notify_ie_ids.is_empty());
     }
-    if let Ok(value) = SetupResponseTransfer::decode(data, ctx) {
-        let wire = response(&value).encode(output).unwrap();
-        assert!(SetupResponseTransfer::decode(wire.as_bytes(), ctx).unwrap() == value);
-    }
+    setup_tunnels::exercise(data, ctx, output);
 }

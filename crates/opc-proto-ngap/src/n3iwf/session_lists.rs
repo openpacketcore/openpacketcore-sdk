@@ -362,8 +362,8 @@ macro_rules! result_list {
         }
     };
 }
-result_list!(SuccessfulSessions, SuccessfulSession, PDUSessionResourceSetupListCxtRes, PDUSessionResourceSetupItemCxtRes, p_dusession_resource_setup_response_transfer, SetupResponseTransfer, 9, 176,
-    "Nonempty successful-session list (depth nine). Context and PDU Setup response roots have independently identical layouts.");
+result_list!(SuccessfulSessions, SuccessfulSession, PDUSessionResourceSetupListCxtRes, PDUSessionResourceSetupItemCxtRes, p_dusession_resource_setup_response_transfer, SetupResponseTransfer, 9, 512,
+    "Nonempty successful-session list (depth nine, or eleven with additional tunnels). Context and PDU Setup response roots have independently identical layouts.");
 result_list!(FailedSessions, FailedSession, PDUSessionResourceFailedToSetupListCxtFail, PDUSessionResourceFailedToSetupItemCxtFail, p_dusession_resource_setup_unsuccessful_transfer, SetupFailureTransfer, 6, 773,
     "Nonempty failed-session list (depth six, or eight with diagnostic items). Context failure, context response and PDU Setup response roots have independently identical layouts. The maximum root failure transfer is 773 bytes with 256 diagnostics.");
 
@@ -379,6 +379,17 @@ impl FailedSessions {
         } else {
             6
         }
+    }
+}
+
+impl SuccessfulSessions {
+    pub(super) fn required_depth(&self) -> usize {
+        3 + self
+            .0
+            .iter()
+            .map(|value| value.transfer.required_depth())
+            .max()
+            .unwrap_or(6)
     }
 }
 

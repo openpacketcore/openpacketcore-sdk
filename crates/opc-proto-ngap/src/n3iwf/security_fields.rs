@@ -1,7 +1,7 @@
 //! Bounded user-plane security indications and peer-reported results.
 //! These values do not select, install or prove cryptographic protection.
 //! Downlink-rate IE extensions and future ASN.1 roots remain unsupported.
-use super::setup_fields::{Reader, Writer};
+use super::setup_fields::Reader;
 use super::*;
 
 /// A peer's root user-plane protection requirement.
@@ -201,7 +201,10 @@ impl SecurityResult {
     }
     // A contained SEQUENCE starts at the parent's current bit offset; leaf
     // octet padding must not be inserted before a following failed-flow list.
-    pub(super) fn write(self, writer: &mut Writer) -> Result<(), EncodeError> {
+    pub(super) fn write(
+        self,
+        writer: &mut dyn super::reset_fields::Sink,
+    ) -> Result<(), EncodeError> {
         writer.bits(0, 2)?;
         writer.bits(u16::from(!self.integrity_performed), 2)?;
         writer.bits(u16::from(!self.confidentiality_performed), 2)

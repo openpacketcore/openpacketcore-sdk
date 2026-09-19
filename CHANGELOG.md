@@ -13,6 +13,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   replacement, shutdown and multihoming failover qualification (Refs #788).
 
 ### Added
+- `opc-proto-ngap`: preserve and construct Setup response flow mappings and
+  up to three additional downlink tunnels, including complete context/session
+  responses. Validate each tunnel's flow list and the accepted/failed union
+  before allocation, with independent Release 18 wire evidence. Existing
+  single-tunnel accessors retain their primary-tunnel meaning (Refs #787).
 - `opc-proto-ngap`: admit and construct optional Criticality Diagnostics in
   Setup unsuccessful transfers and all three enclosing response/failure
   outcomes. Reuse the qualified Modify root layout with independent Setup

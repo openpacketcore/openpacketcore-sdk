@@ -609,19 +609,21 @@ interoperability claims are introduced.
 
 | Transfer | Admitted contents | Explicitly unsupported |
 | --- | --- | --- |
-| Setup response | One downlink IPv4/IPv6 GTP tunnel; 1–64 accepted QFIs; optional failed QFIs with root Cause; optional root Security Result | Additional tunnels, per-flow mapping indications, all extensions |
+| Setup response | One mandatory and up to three additional downlink IPv4/IPv6 GTP tunnels; 1–64 associated QFIs per tunnel with optional root mapping indications; optional failed QFIs with root Cause; optional root Security Result | Extensions |
 | Setup unsuccessful | Root Cause in any of the five classes; optional root response diagnostics | Extensions |
 
-Accepted/failed QFIs must be unique across both lists. The entirely failed case
+QFIs must be unique within each tunnel and the failed list; failures must not
+overlap any accepted association. A QFI may occur on several tunnels. The entirely failed case
 uses the unsuccessful transfer; the response always has at least one accepted
 flow. These are reports only. Request correlation, cause selection, supported
 security policy, endpoint ownership and resource changes remain caller-owned.
 An absent result/security field does not establish a successful security or
 QoS operation. No enclosing context/session procedure is admitted here.
 
-Response receive requires depth six. `max_ies` limits the combined result count;
-physical count feasibility is checked before each vector allocation. Fixed
-IPv4/IPv6 buffers avoid address allocation. Known optional/extension flags,
+Response receive requires depth six, or eight with additional tunnels. `max_ies`
+limits flow occurrences, failures and additional tunnel items cumulatively;
+the entire physical layout is checked before list allocation. Fixed
+IPv4/IPv6 buffers avoid address allocation. Unsupported extension flags,
 nonzero padding and trailing bytes fail explicitly. Response construction
 checks its exact bounded length before allocating. Cause-only unsuccessful
 roots remain at most two bytes; optional diagnostics extend the maximum to
@@ -636,8 +638,9 @@ boundaries, duplicate/conflicting results and recognized unsupported fields.
 Regenerate using `scripts/generate-ngap-resource-result-fixtures.py` with the
 same `--spec`/`--output` arguments and pinned Release 18 environment.
 Its original bytes and labels are preserved. The historical
-`unsupported-security-result` and `unsupported-diagnostics` vectors now admit
-and are compared with explicit constructors in the harness, giving 541 admitted and six rejected
+`unsupported-security-result`, `unsupported-diagnostics`, both mapping vectors
+and `unsupported-additional-tunnel` now admit and are compared with explicit
+constructors in the harness, giving 544 admitted and three rejected
 vectors under the expanded boundary.
 
 Generated failure-transfer encode/decode matches all 128 positive probes;
@@ -742,8 +745,55 @@ in replay and fuzzing.
 API migration: add `diagnostics: None` to prior `SetupFailureTransfer` literals.
 `SetupFailureTransfer` and `FailedSession` retain `Clone` and equality but no
 longer implement `Copy`; callers copying from borrowed lists must clone
-explicitly. Setup response extra tunnels/mapping indications and all transfer
-extensions remain outside this increment. Tracking remains #787 and #784.
+explicitly. All transfer extensions remain outside this increment. Setup
+response root tunnels/mappings are qualified separately below. Tracking remains
+#787 and #784.
+
+## Setup response tunnels and flow mappings
+
+`SetupResponseTransfer::with_tunnels` admits the mandatory
+`DLQosFlowPerTNLInformation` and the optional list of one to three additional
+downlink reports in TS 38.413 9.3.4.2. Each `DownlinkQosTunnel` preserves its
+IPv4/IPv6 address, TEID, ordered 1–64 flow associations and each optional root
+`ul`/`dl` mapping indication. Absence is preserved. Per TS 38.413 8.2.1,
+additional transport bearers may serve some or all of the same flows: QFIs are
+unique within each report, while repeated associations across reports are
+retained. Failed QFIs are unique and disjoint from the accepted union. Endpoint
+uniqueness, preferred bearer, request correspondence and installed resources
+are not inferred. These value types describe peer reports only.
+
+The legacy constructor has no additional tunnels or mappings. `downlink()` and
+`accepted()` still describe the primary report only; new consumers inspect
+`primary().flows()` and `additional()`. Construction measures the complete
+root encoding before allocating. Receive preflights the entire message before
+allocating lists, including every count, extension flag, flow conflict, padding
+bit and trailing byte. Its cumulative `max_ies` includes all associated flow
+occurrences, additional list items and failures. Required depth is six, or
+eight with additional tunnels; successful session lists require nine/eleven
+and complete context/session responses thirteen/fifteen. A conservative
+512-byte contained-transfer bound covers the admitted root; the maximum
+independent vector is 478 bytes with four IPv6 tunnels, all 64 mapped QFIs per
+tunnel and a security report (259 counted items).
+
+The [independent corpus](tests/fixtures/n3iwf-setup-tunnels.json) contains 925
+transfers (916 admitted, nine duplicate/conflict refusals) and 32 complete
+context/session responses (14 admitted, 18 refusals). Both Pycrate 0.8.1 APER
+encoders and decoders agree using the pinned TS 38.413 V18.10.0 source. The
+expected admission classifier uses independently authored semantic models;
+complete-message criticality, presence and field order come from the reference
+schema. SHA-256:
+`46c640c5f2043f9a19518d1be0de9ae18649b77f81c3addad47567b54356fc36`.
+Regenerate with `scripts/generate-ngap-setup-tunnels.py --spec PATH --output PATH`
+in the pinned reference environment. Existing fixtures remain unchanged and
+their three previously unsupported tunnel/mapping examples are explicitly
+requalified. Coverage includes every QFI, list count, root Cause, both address
+families, mixed/absent mappings, repeated cross-tunnel associations, partial
+failure/security combinations and maximum-size roots. Public construction and
+semantic reconstruction must reproduce reference bytes; exact and one-short
+resource limits, redaction, truncation and adverse byte mutations are checked.
+Seventy new seeds exercise the same reconstruction in replay and fuzzing.
+Extensions and 160-bit combined addresses remain explicitly unsupported;
+this does not qualify Modify response tunnels, forwarding or live peers.
 
 ## N3IWF session setup lists
 
@@ -753,7 +803,7 @@ roots. The public types group only layouts proven to have identical bytes:
 | Type | Qualified ASN.1 roots | Receive depth |
 | --- | --- | --- |
 | `SessionSetupRequests` | `PDUSessionResourceSetupListCxtReq`, `PDUSessionResourceSetupListSUReq` | 13; 14 with dynamic QoS |
-| `SuccessfulSessions` | `PDUSessionResourceSetupListCxtRes`, `PDUSessionResourceSetupListSURes` | 9 |
+| `SuccessfulSessions` | `PDUSessionResourceSetupListCxtRes`, `PDUSessionResourceSetupListSURes` | 9; 11 with additional tunnels |
 | `FailedSessions` | `PDUSessionResourceFailedToSetupListCxtFail`, `PDUSessionResourceFailedToSetupListCxtRes`, `PDUSessionResourceFailedToSetupListSURes` | 6; 8 with diagnostic items |
 
 Each list requires 1–256 distinct root session IDs (0–255), preserving input

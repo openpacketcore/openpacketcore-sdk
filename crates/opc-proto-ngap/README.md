@@ -28,6 +28,12 @@ Add `diagnostics: None` to existing `SetupFailureTransfer` literals; that
 type and `FailedSession` now require explicit cloning where they previously
 used `Copy`. See the [Setup failure diagnostic contract](CONFORMANCE.md#setup-failure-diagnostics).
 
+Setup responses preserve up to three additional downlink tunnels and each
+flow's optional uplink/downlink mapping indication. `with_tunnels` constructs
+these reports; `primary().flows()` and `additional()` inspect all associations.
+The existing `new`, `downlink` and `accepted` methods retain their single
+primary tunnel meaning. See the [Setup tunnel contract](CONFORMANCE.md#setup-response-tunnels-and-flow-mappings).
+
 ## API Shape
 
 - `Pdu` stores the policy-filtered decoded PDU kind plus the immutable raw bytes

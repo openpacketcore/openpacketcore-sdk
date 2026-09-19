@@ -425,8 +425,8 @@ fn result_fields(
 }
 fn result_depth(results: &SessionResults, ctx: DecodeContext) -> Result<(), DecodeError> {
     crate::enforce_depth(
-        if results.successful().is_some() {
-            13
+        if let Some(successful) = results.successful() {
+            4 + successful.required_depth()
         } else if let Some(failed) = results.failed() {
             4 + failed.required_depth()
         } else {
