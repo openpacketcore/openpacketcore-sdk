@@ -138,6 +138,14 @@ pub enum AuthMode {
 }
 
 impl CryptoContext {
+    /// Move the signing authority into a fresh handshake while retaining only
+    /// the preceding cryptographic state for its outstanding record epoch.
+    pub fn restart_handshake(&mut self) -> Self {
+        let auth = std::mem::replace(&mut self.auth, AuthMode::Psk);
+        let next = Self::new(auth, Arc::clone(&self.config));
+        std::mem::replace(self, next)
+    }
+
     /// Create a new crypto context with the given authentication mode.
     pub fn new(auth: AuthMode, config: Arc<crate::Config>) -> Self {
         CryptoContext {

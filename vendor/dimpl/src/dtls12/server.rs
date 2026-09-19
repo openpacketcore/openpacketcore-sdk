@@ -205,6 +205,33 @@ impl Server {
             && !self.engine.has_pending_close_output()
     }
 
+    pub(crate) fn begin_rfc6083_rekey(&mut self) -> Result<(), Error> {
+        if self.state != State::AwaitApplicationData
+            || !self.local_events.is_empty()
+            || !self.queued_data.is_empty()
+        {
+            return Err(Error::RenegotiationAttempt);
+        }
+        self.engine.begin_rfc6083_rekey()?;
+        self.random = None;
+        self.session_id = None;
+        self.extension_data.clear();
+        self.negotiated_srtp_profile = None;
+        self.defragment_buffer.clear();
+        self.captured_session_hash = None;
+        self.client_supported_groups = None;
+        self.client_signature_algorithms = None;
+        self.client_random = None;
+        self.client_certificates.clear();
+        self.psk_valid = None;
+        self.state = State::AwaitClientHello;
+        Ok(())
+    }
+
+    pub(crate) fn rfc6083_epoch(&self) -> u16 {
+        self.engine.rfc6083_epoch()
+    }
+
     pub fn handle_packet(&mut self, packet: &[u8]) -> Result<(), Error> {
         match self
             .engine
@@ -370,6 +397,12 @@ impl State {
             return Err(InternalError::handshake_body_type_mismatch());
         };
 
+        server.engine.verify_renegotiation_info(
+            &ch.extensions,
+            &server.defragment_buffer,
+            ch.renegotiation_scsv,
+        )?;
+
         // Enforce DTLS1.2
         if ch.client_version != ProtocolVersion::DTLS1_2 {
             return Err(
@@ -397,7 +430,11 @@ impl State {
         // Stateless cookie: require 32-byte cookie matching HMAC(secret, client_random)
         let client_random = ch.random;
         let hmac_provider = server.engine.config().crypto_provider().hmac_provider;
-        let need_cookie = server.engine.config().use_server_cookie();
+        // The rekey ClientHello is already protected by the existing epoch.
+        // A stateless cookie reset would discard authenticated application
+        // records which must survive this in-place transition.
+        let need_cookie =
+            server.engine.config().use_server_cookie() && !server.engine.is_rfc6083_rekey();
         let cookie_valid = !need_cookie
             || verify_cookie(
                 hmac_provider,
@@ -1096,6 +1133,8 @@ impl State {
             .into());
         }
 
+        server.engine.save_finished(true, expected);
+
         trace!("Client Finished verified successfully");
 
         Ok(Self::SendChangeCipherSpec)
@@ -1144,6 +1183,7 @@ impl State {
             .engine
             .create_handshake(MessageType::Finished, |body, engine| {
                 let verify_data = engine.generate_verify_data(false /* server */)?;
+                engine.save_finished(false, verify_data);
                 trace!("Finished.verify_data length: {}", verify_data.len());
                 // Directly write the verify data without creating Finished struct
                 body.extend_from_slice(&verify_data);
@@ -1305,7 +1345,7 @@ fn handshake_create_server_hello(
         SrtpProfile::AES128_CM_SHA1_80 => SrtpProfileId::SRTP_AES128_CM_SHA1_80,
     });
 
-    let sh = ServerHello::new(
+    let mut sh = ServerHello::new(
         server_version,
         random,
         session_id,
@@ -1315,6 +1355,20 @@ fn handshake_create_server_hello(
     )
     .with_extensions(extension_data, srtp_pid);
 
+    if engine.config().rfc6083_rekey() {
+        let start = extension_data.len();
+        extension_data.extend_from_slice(&engine.renegotiation_info());
+        let extension = sh
+            .extensions
+            .as_mut()
+            .and_then(|extensions| {
+                extensions
+                    .iter_mut()
+                    .find(|e| e.extension_type == ExtensionType::RenegotiationInfo)
+            })
+            .ok_or(Error::RenegotiationAttempt)?;
+        extension.extension_data_range = start..extension_data.len();
+    }
     sh.serialize(extension_data, body);
     Ok(())
 }
@@ -1514,6 +1568,44 @@ mod tests {
 
     use crate::PskResolver;
     use crate::dtls12::message::DTLSRecord;
+
+    #[test]
+    fn rekey_server_checks_independently_encrypted_client_hello_binding() {
+        let fixtures = crate::dtls12::engine::tests::rekey_hello_fixtures("server");
+        assert_eq!(fixtures.len(), 7);
+        for (name, valid, wire) in fixtures {
+            let engine = crate::dtls12::engine::tests::rekey_fixture_receiver(false);
+            let mut server = Server::new_with_engine(engine, Instant::now());
+            server
+                .engine
+                .parse_packet(&wire)
+                .expect("independent old-epoch ciphertext");
+            let error = State::AwaitClientHello
+                .await_client_hello(&mut server)
+                .expect_err("record-context fixture");
+            if name == "duplicate" {
+                assert!(
+                    matches!(
+                        error,
+                        InternalError::Transient(crate::error::TransientError::Parse(
+                            nom::error::ErrorKind::LengthValue
+                        ))
+                    ),
+                    "duplicate extension parser refusal"
+                );
+                continue;
+            }
+            let InternalError::Fatal(error) = error else {
+                panic!("fixture {name}: expected terminal rejection, got {error:?}")
+            };
+            let expected = if valid {
+                crate::SecurityError::NoMutuallyAcceptableCipherSuite
+            } else {
+                crate::SecurityError::RenegotiationBindingMismatch
+            };
+            assert_eq!(error, Error::SecurityError(expected), "fixture {name}");
+        }
+    }
 
     struct FixedPsk;
 

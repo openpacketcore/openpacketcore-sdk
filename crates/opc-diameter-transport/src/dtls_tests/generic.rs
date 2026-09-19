@@ -3,6 +3,7 @@
 mod independent;
 #[cfg(target_os = "linux")]
 mod paths;
+mod rekey;
 #[cfg(target_os = "linux")]
 mod restart;
 mod revocation;
