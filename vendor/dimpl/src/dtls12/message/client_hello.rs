@@ -20,6 +20,7 @@ pub struct ClientHello {
     pub session_id: SessionId,
     pub cookie: Cookie,
     pub cipher_suites: CipherSuiteVec,
+    pub renegotiation_scsv: bool,
     pub compression_methods: CompressionMethodVec,
     pub extensions: ExtensionVec,
 }
@@ -39,6 +40,7 @@ impl ClientHello {
             session_id,
             cookie,
             cipher_suites,
+            renegotiation_scsv: false,
             compression_methods,
             extensions: ArrayVec::new(),
         }
@@ -131,6 +133,7 @@ impl ClientHello {
         let (input, cookie) = Cookie::parse(input)?;
         let (input, cipher_suites_len) = be_u16(input)?;
         let (input, input_cipher) = take(cipher_suites_len)(input)?;
+        let renegotiation_scsv = input_cipher.chunks_exact(2).any(|c| c == [0, 0xff]);
         let (rest, cipher_suites) =
             many1(Dtls12CipherSuite::parse, Dtls12CipherSuite::is_supported)(input_cipher)?;
         if !rest.is_empty() {
@@ -159,6 +162,7 @@ impl ClientHello {
                 session_id,
                 cookie,
                 cipher_suites,
+                renegotiation_scsv,
                 compression_methods,
                 extensions,
             },
@@ -228,9 +232,15 @@ impl ClientHello {
         output.extend_from_slice(&self.session_id);
         output.push(self.cookie.len() as u8);
         output.extend_from_slice(&self.cookie);
-        output.extend_from_slice(&(self.cipher_suites.len() as u16 * 2).to_be_bytes());
+        output.extend_from_slice(
+            &((self.cipher_suites.len() as u16 + u16::from(self.renegotiation_scsv)) * 2)
+                .to_be_bytes(),
+        );
         for suite in &self.cipher_suites {
             output.extend_from_slice(&suite.as_u16().to_be_bytes());
+        }
+        if self.renegotiation_scsv {
+            output.extend_from_slice(&[0, 0xff]);
         }
         output.push(self.compression_methods.len() as u8);
         for method in &self.compression_methods {

@@ -17,6 +17,14 @@ pub struct Incoming {
 }
 
 impl Incoming {
+    pub(crate) fn from_record(record: Record) -> Self {
+        let mut records = ArrayVec::new();
+        records.push(record);
+        Self {
+            records: Box::new(Records { records }),
+        }
+    }
+
     pub fn records(&self) -> &Records {
         &self.records
     }
@@ -154,13 +162,22 @@ impl Record {
             }
         };
         let parsed = Box::new(parsed);
-        let record = Record { buffer, parsed };
+        let mut record = Record { buffer, parsed };
 
         // It is not enough to only look at the epoch, since to be able to decrypt the entire
         // preceeding set of flights sets up the cryptographic context. In a situation with
         // packet loss, we can end up seeing epoch 1 records before we can decrypt them.
-        let is_epoch_0 = record.record().sequence.epoch == 0;
-        if is_epoch_0 || !decrypt.is_peer_encryption_enabled() {
+        let epoch = record.record().sequence.epoch;
+        if !decrypt.accepts_epoch(epoch) {
+            return Ok(None);
+        }
+        if epoch == 0 {
+            return Ok(Some(record));
+        }
+        if !decrypt.can_decrypt_epoch(epoch) {
+            // Ciphertext must never be interpreted as a handshake before its
+            // epoch is activated, even when its random prefix happens to parse.
+            record.parsed.handshakes.clear();
             return Ok(Some(record));
         }
 
@@ -304,6 +321,12 @@ impl ParsedRecord {
 pub trait RecordHandler {
     fn classify_record(&mut self, record: Record) -> Result<Option<Record>, Error>;
     fn is_peer_encryption_enabled(&self) -> bool;
+    fn can_decrypt_epoch(&self, _epoch: u16) -> bool {
+        self.is_peer_encryption_enabled()
+    }
+    fn accepts_epoch(&self, _epoch: u16) -> bool {
+        true
+    }
     fn replay_check(&self, seq: Sequence) -> bool;
     fn replay_update(&mut self, seq: Sequence);
     fn decryption_aad_and_nonce(

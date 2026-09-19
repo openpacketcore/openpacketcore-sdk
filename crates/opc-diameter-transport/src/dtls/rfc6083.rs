@@ -16,7 +16,8 @@
 //! complete direct CRL publication; the original constructors do not check
 //! revocation. The complete 3GPP PKI and OCSP profiles remain unsupported.
 //! Material or required-CRL withdrawal/replacement retires the association.
-//! In-place renegotiation is unsupported; establish a fresh association.
+//! [`Policy::with_rekey`] enables coordinated, connection-bound in-place rekey
+//! within the original credential, identity, cipher and absolute lifetime.
 //!
 //! ```no_run
 //! use opc_diameter_transport::rfc6083::{
@@ -105,6 +106,7 @@ pub struct Policy {
     maximum_plaintext_bytes: usize,
     application_stream_count: u16,
     pending_record_capacity: usize,
+    allow_rekey: bool,
     shared: DtlsSctpPolicy,
 }
 
@@ -126,6 +128,7 @@ impl Policy {
             maximum_plaintext_bytes,
             application_stream_count: 1,
             pending_record_capacity: 0,
+            allow_rekey: false,
             shared: DtlsSctpPolicy::default(),
         })
     }
@@ -170,6 +173,18 @@ impl Policy {
     /// Record correlation/queued-plaintext limit; zero denotes the legacy profile.
     pub const fn pending_record_capacity(self) -> usize {
         self.pending_record_capacity
+    }
+
+    /// Enable explicitly coordinated in-place DTLS 1.2 renegotiation.
+    ///
+    /// Both endpoints must select this policy before the initial handshake
+    /// and call [`Connection::rekey`] for each transition. RFC 5746 binds each
+    /// handshake to the preceding Finished messages. This retains the same
+    /// credential/trust epoch, identity, cipher and absolute lifetime; it does
+    /// not admit replacement credentials or extend authentication validity.
+    pub const fn with_rekey(mut self) -> Self {
+        self.allow_rekey = true;
+        self
     }
 
     /// Restrict the existing ECDHE-ECDSA AEAD cipher allowlist.
@@ -343,7 +358,16 @@ impl Endpoint {
         expected_peer: ExpectedPeer,
         policy: Policy,
     ) -> Result<Self, Error> {
-        let engine_config = policy.shared.engine_config()?;
+        let mut engine_config = policy.shared.engine_config()?;
+        if policy.allow_rekey {
+            engine_config = Arc::new(
+                engine_config
+                    .as_ref()
+                    .clone()
+                    .with_rfc6083_rekey()
+                    .map_err(|_| Error::PolicyRejected)?,
+            );
+        }
         Ok(Self {
             controller,
             expected_peer,
@@ -468,6 +492,8 @@ impl Endpoint {
                     protocol: self.policy.protocol,
                     application_stream_count: self.policy.application_stream_count,
                     pending_record_capacity: self.policy.pending_record_capacity,
+                    allow_rekey: self.policy.allow_rekey,
+                    record_epoch: 1,
                     version: completed.version,
                     cipher: completed.cipher,
                     material_epoch: admission.epoch(),
@@ -477,6 +503,7 @@ impl Endpoint {
                     crls: crls.as_ref().map(|v| v.evidence()),
                 },
                 maximum_plaintext_bytes: self.policy.maximum_plaintext_bytes,
+                validation,
                 material_status,
                 hard_deadline,
                 retired,
@@ -592,6 +619,8 @@ pub struct Evidence {
     protocol: PayloadProtocol,
     application_stream_count: u16,
     pending_record_capacity: usize,
+    allow_rekey: bool,
+    record_epoch: u16,
     version: Version,
     cipher: Cipher,
     material_epoch: TlsMaterialEpoch,
@@ -617,6 +646,18 @@ impl Evidence {
     /// Configured bounded correlation/queue capacity, or zero for stream zero.
     pub const fn pending_record_capacity(&self) -> usize {
         self.pending_record_capacity
+    }
+    /// Whether the caller enabled coordinated in-place renegotiation.
+    pub const fn allows_rekey(&self) -> bool {
+        self.allow_rekey
+    }
+    /// DTLS record epoch of the last fully authenticated handshake.
+    ///
+    /// This is published only after the peer Finished and SCTP-AUTH transition
+    /// complete. It is distinct from the credential publication epoch and is
+    /// not a kernel SCTP-AUTH key-ID readback.
+    pub const fn record_epoch(&self) -> u16 {
+        self.record_epoch
     }
     /// Authenticated negotiated protocol version.
     pub const fn version(&self) -> Version {
@@ -701,6 +742,7 @@ pub struct Connection {
     close: Arc<dyn SctpTransportClose>,
     evidence: Evidence,
     maximum_plaintext_bytes: usize,
+    validation: HandshakeValidation,
     material_status: TlsMaterialStatusReceiver,
     hard_deadline: Instant,
     retired: Arc<AtomicBool>,
@@ -721,6 +763,89 @@ impl Connection {
     pub fn readback(&self) -> Result<&Evidence, Error> {
         self.ensure_active()?;
         Ok(&self.evidence)
+    }
+
+    /// Complete a fresh, connection-bound handshake on this SCTP association.
+    ///
+    /// Both endpoints explicitly call this operation; the connector sends the
+    /// ClientHello and the acceptor waits for it. The application coordinates
+    /// that decision as required by RFC 6083 section 4.6. Application writes
+    /// are suspended until the new peer Finished is verified. Already admitted
+    /// application records retain their stream and order. Every exporter-key,
+    /// sender-drain, activation and previous-key retirement barrier runs again.
+    ///
+    /// The original policy must enable [`Policy::with_rekey`]. The original
+    /// credential/trust epoch and expected peer are revalidated, and the
+    /// absolute lifetime can only shorten. Failure or cancellation after
+    /// polling closes the association, including an unsupported request.
+    pub async fn rekey(&mut self, deadline: Instant) -> Result<(), Error> {
+        self.ensure_active()?;
+        let mut operation = OperationGuard::new(self);
+        let deadline = deadline.min(self.hard_deadline);
+        check_deadline(deadline)?;
+        if !self.evidence.allow_rekey || !self.pump.outbound.is_empty() {
+            return Err(Error::PolicyRejected);
+        }
+        let next_epoch = self
+            .evidence
+            .record_epoch
+            .checked_add(1)
+            .ok_or(Error::PolicyRejected)?;
+        self.engine
+            .begin_rfc6083_rekey()
+            .map_err(|_| Error::Handshake)?;
+        self.pump.connected = false;
+        self.pump.peer_certificate_expires_at = None;
+        let result = tokio::time::timeout_at(
+            deadline,
+            run_transport_handshake_with_state(
+                &mut self.engine,
+                &mut self.io,
+                &self.validation,
+                deadline,
+                std::mem::take(&mut self.pump),
+                std::mem::take(&mut self.buffer),
+            ),
+        )
+        .await;
+        self.ensure_authentication_current()?;
+        let completed = result.map_err(|_| Error::DeadlineExceeded)??;
+        self.ensure_active()?;
+        check_deadline(deadline)?;
+        if completed.state.peer_closed
+            || completed.version != self.evidence.version
+            || completed.cipher != self.evidence.cipher
+            || self.engine.rfc6083_epoch() != Some(next_epoch)
+        {
+            return Err(Error::Handshake);
+        }
+        if completed
+            .state
+            .inbound
+            .iter()
+            .any(|v| v.payload.len() > self.maximum_plaintext_bytes)
+        {
+            return Err(Error::MessageLimit);
+        }
+        self.hard_deadline = self.hard_deadline.min(wall_expiry_deadline(
+            completed.peer_expires_at,
+            Instant::now(),
+        ));
+        self._retirement_task
+            .replace_watcher(spawn_retirement_watcher(
+                self.material_status.clone(),
+                self.evidence.material_epoch,
+                self.hard_deadline,
+                Arc::clone(&self.retired),
+                Arc::clone(&self.close),
+            ));
+        self.evidence.record_epoch = next_epoch;
+        self.evidence.peer_certificate_expires_at = completed.peer_expires_at;
+        self.pump = completed.state;
+        self.buffer = completed.buffer;
+        self.ensure_active()?;
+        operation.disarm();
+        Ok(())
     }
 
     /// Emit one opaque application record reliably on ordered stream zero.

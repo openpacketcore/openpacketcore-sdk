@@ -640,6 +640,27 @@ impl Dtls {
         }
     }
 
+    /// Arm one full RFC 5746 rekey on an explicitly enabled RFC 6083 endpoint.
+    /// Both peers must be armed by their upper layer. The client initiates the
+    /// handshake and the server waits. The existing I/O barriers remain mandatory.
+    pub fn begin_rfc6083_rekey(&mut self) -> Result<(), Error> {
+        match self.inner.as_mut() {
+            Some(Inner::Client12(client)) => client.begin_rfc6083_rekey(),
+            Some(Inner::Server12(server)) => server.begin_rfc6083_rekey(),
+            _ => Err(Error::RenegotiationAttempt),
+        }
+    }
+
+    /// Current target record epoch for the DTLS 1.2 SCTP handshake.
+    /// This value alone is not proof of completed peer authentication.
+    pub fn rfc6083_epoch(&self) -> Option<u16> {
+        match self.inner.as_ref()? {
+            Inner::Client12(client) => Some(client.rfc6083_epoch()),
+            Inner::Server12(server) => Some(server.rfc6083_epoch()),
+            _ => None,
+        }
+    }
+
     /// Return true while DTLS shutdown is in progress.
     ///
     /// This becomes true after local shutdown starts, or while a received

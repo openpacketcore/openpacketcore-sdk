@@ -1,5 +1,9 @@
 # Generic RFC 6083 transport: initial stream-zero profile
 
+This document records the initial profile. Optional later capabilities are
+documented in [the current crate contract](../crates/opc-diameter-transport/README.md),
+including [coordinated rekey](rfc6083-rekey-transport.md).
+
 This partial implementation of #794 exposes the existing authenticated
 DTLS/SCTP boundary without `PeerSession`, Diameter identities, CER/CEA, or
 NGAP procedure state. It composes the transport completed under #348 and the

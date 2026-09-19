@@ -223,6 +223,32 @@ impl Client {
             && !self.engine.has_pending_close_output()
     }
 
+    pub(crate) fn begin_rfc6083_rekey(&mut self) -> Result<(), Error> {
+        if self.state != State::AwaitApplicationData
+            || !self.local_events.is_empty()
+            || !self.queued_data.is_empty()
+        {
+            return Err(Error::RenegotiationAttempt);
+        }
+        self.engine.begin_rfc6083_rekey()?;
+        self.random = None;
+        self.session_id = None;
+        self.extension_data.clear();
+        self.negotiated_srtp_profile = None;
+        self.defragment_buffer.clear();
+        self.captured_session_hash = None;
+        self.cookie = None;
+        self.server_random = None;
+        self.server_certificates.clear();
+        self.certificate_verify = false;
+        self.state = State::SendClientHello;
+        Ok(())
+    }
+
+    pub(crate) fn rfc6083_epoch(&self) -> u16 {
+        self.engine.rfc6083_epoch()
+    }
+
     pub fn handle_packet(&mut self, packet: &[u8]) -> Result<(), Error> {
         match self
             .engine
@@ -506,6 +532,12 @@ impl State {
             "Received ServerHello with cipher suite: {:?}",
             server_hello.cipher_suite
         );
+
+        client.engine.verify_renegotiation_info(
+            server_hello.extensions.as_deref().unwrap_or_default(),
+            &client.defragment_buffer,
+            false,
+        )?;
 
         // Enforce DTLS version
         if server_hello.server_version != ProtocolVersion::DTLS1_2 {
@@ -1161,6 +1193,7 @@ impl State {
             .create_handshake(MessageType::Finished, |body, engine| {
                 // Calculate verify data for Finished message using PRF
                 let verify_data = engine.generate_verify_data(true)?;
+                engine.save_finished(true, verify_data);
 
                 debug!("Generated verify data for Finished message (12 bytes)");
 
@@ -1258,6 +1291,8 @@ impl State {
             ))
             .into());
         }
+
+        client.engine.save_finished(false, expected);
 
         trace!("Server Finished verified successfully");
 
@@ -1385,7 +1420,7 @@ fn handshake_create_client_hello(
     compression_methods.push(CompressionMethod::Null);
 
     // Create ClientHello with all required extensions
-    let client_hello = ClientHello::new(
+    let mut client_hello = ClientHello::new(
         client_version,
         random,
         session_id,
@@ -1395,6 +1430,17 @@ fn handshake_create_client_hello(
     )
     .with_extensions(extension_data, engine.config());
 
+    if engine.config().rfc6083_rekey() {
+        let start = extension_data.len();
+        extension_data.extend_from_slice(&engine.renegotiation_info());
+        client_hello
+            .extensions
+            .try_push(crate::dtls12::message::Extension {
+                extension_type: ExtensionType::RenegotiationInfo,
+                extension_data_range: start..extension_data.len(),
+            })
+            .map_err(|_| Error::RenegotiationAttempt)?;
+    }
     client_hello.serialize(extension_data, body);
     Ok(())
 }
@@ -1554,6 +1600,47 @@ mod tests {
     use super::*;
     use crate::PskResolver;
     use crate::dtls12::message::{ServerHello, SrtpProfileId};
+
+    #[test]
+    fn rekey_client_checks_independently_encrypted_server_hello_binding() {
+        let fixtures = crate::dtls12::engine::tests::rekey_hello_fixtures("client");
+        assert_eq!(fixtures.len(), 6);
+        for (name, valid, wire) in fixtures {
+            let engine = crate::dtls12::engine::tests::rekey_fixture_receiver(true);
+            let mut client = Client::new_with_engine(engine, Instant::now());
+            client.state = State::AwaitServerHello;
+            client
+                .engine
+                .parse_packet(&wire)
+                .expect("independent old-epoch ciphertext");
+            let error = State::AwaitServerHello
+                .await_server_hello(&mut client)
+                .expect_err("record-context fixture");
+            if name == "duplicate" {
+                assert!(
+                    matches!(
+                        error,
+                        InternalError::Transient(crate::error::TransientError::Parse(
+                            nom::error::ErrorKind::LengthValue
+                        ))
+                    ),
+                    "duplicate extension parser refusal"
+                );
+                continue;
+            }
+            let InternalError::Fatal(error) = error else {
+                panic!("fixture {name}: expected terminal rejection, got {error:?}")
+            };
+            let expected = if valid {
+                crate::SecurityError::ServerSelectedIncompatibleCipherSuite(
+                    Dtls12CipherSuite::ECDHE_ECDSA_AES128_GCM_SHA256,
+                )
+            } else {
+                crate::SecurityError::RenegotiationBindingMismatch
+            };
+            assert_eq!(error, Error::SecurityError(expected), "fixture {name}");
+        }
+    }
 
     struct FixedPsk;
 

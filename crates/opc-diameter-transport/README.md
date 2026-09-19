@@ -12,14 +12,13 @@ can return a protected connection. This API requires no `PeerSession`,
 Diameter identity or CER/CEA. The existing Diameter API retains its procedure
 admission and PPID 47 behavior.
 
-This initial generic profile supports reliable ordered stream zero only.
+By default, the generic profile uses reliable ordered stream zero only.
 Nonzero or unordered receive metadata and plaintext PPID 60 are terminal
 errors. The connection has sequential `send`/`receive`, a consuming reciprocal
 `close`, and borrowed negotiated `readback`; cancellation after an operation
 starts closes the carrier. Readback and successful delivery reconcile both
 credential retirement and observed carrier termination. It does not provide
-the complete NGAP stream or 3GPP certificate/revocation profile, in-place
-renegotiation, or new restart/multihoming guarantees. See the exact support and
+the complete NGAP stream or 3GPP certificate/revocation profile. See the exact support and
 verification boundaries in [the generic RFC 6083 contract](../../docs/rfc6083-generic-transport.md).
 
 The generic endpoints also offer `new_with_required_crls`. A local
@@ -42,6 +41,14 @@ The profile bounds pending correlations and queued plaintexts and rejects
 protected records with any wire version other than DTLS 1.2. See the exact
 resource, ordering and qualification contract in
 [ordered application streams](../../docs/rfc6083-stream-transport.md).
+
+`Policy::with_rekey` enables explicitly coordinated `Connection::rekey` on
+the existing SCTP association. RFC 5746 binds the fresh handshake to the
+previous Finished values; all SCTP-AUTH barriers run again. Queued records
+retain their streams, and the original credential/CRL authority and absolute
+lifetime remain binding. Native qualification includes an independent capture
+of actual SCTP-AUTH key transitions. See the exact profile and limits in
+[coordinated rekey](../../docs/rfc6083-rekey-transport.md).
 
 The required Linux SCTP job executes the generic, CRL, Diameter, stream and
 path-failure tests in a private SCTP-AUTH namespace. Actual kernel drop
