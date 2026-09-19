@@ -288,6 +288,12 @@ fn pruning_requires_export_checkpoint_and_expired_whole_operations_before_key_re
     state.continuity.as_mut().unwrap().checkpoint = Some(unresolved.clone());
     assert_eq!(
         state.prune(&keys(), 1, &unresolved, 201),
+        Err(AuditAuthorityError::BindingMismatch),
+        "a continuity checkpoint alone is not export acknowledgement"
+    );
+    state.continuity.as_mut().unwrap().export_checkpoint = Some(unresolved.clone());
+    assert_eq!(
+        state.prune(&keys(), 1, &unresolved, 201),
         Err(AuditAuthorityError::Full)
     );
     state
@@ -297,6 +303,7 @@ fn pruning_requires_export_checkpoint_and_expired_whole_operations_before_key_re
     state.seal_continuity(Some(&keys())).unwrap();
     let complete = checkpoint(&state);
     state.continuity.as_mut().unwrap().checkpoint = Some(complete.clone());
+    state.continuity.as_mut().unwrap().export_checkpoint = Some(complete.clone());
     assert_eq!(
         state.prune(&keys(), 3, &complete, 199),
         Err(AuditAuthorityError::Full)
@@ -322,6 +329,12 @@ fn pruning_requires_export_checkpoint_and_expired_whole_operations_before_key_re
         "unacknowledged export cannot prune"
     );
     state.continuity.as_mut().unwrap().checkpoint = Some(rotated.clone());
+    assert_eq!(
+        state.prune(&keys(), 4, &rotated, 201),
+        Err(AuditAuthorityError::BindingMismatch),
+        "a later continuity checkpoint cannot extend export retention authority"
+    );
+    state.continuity.as_mut().unwrap().export_checkpoint = Some(rotated.clone());
     state.prune(&keys(), 4, &rotated, 201).unwrap();
     state.validate(&root(), identity()).unwrap();
     let new_only = AuditKeyRing::new(vec![AuditSigningKey::new(2, [10; 32]).unwrap()]).unwrap();

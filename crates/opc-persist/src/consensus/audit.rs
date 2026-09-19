@@ -37,6 +37,7 @@ pub(crate) enum AuditCommand {
         through: u64,
         checkpoint: AuditCheckpoint,
     },
+    AcknowledgeExport(AuditCheckpoint),
 }
 
 impl std::fmt::Debug for AuditCommand {
@@ -232,6 +233,32 @@ pub(crate) fn apply_sync(
                         chain.checkpoint = Some(checkpoint.clone());
                         Ok(())
                     }),
+                AuditCommand::AcknowledgeExport(checkpoint) => {
+                    keys.ok_or(AuditAuthorityError::KeyUnavailable)
+                        .and_then(|keys| {
+                            checkpoint.verify(keys, identity)?;
+                            ledger.matches_checkpoint(checkpoint)?;
+                            let chain = ledger
+                                .continuity
+                                .as_mut()
+                                .ok_or(AuditAuthorityError::Unavailable)?;
+                            if checkpoint.body.acknowledged_export == [0; 32]
+                                || chain.checkpoint.as_ref().is_none_or(|current| {
+                                    current.sequence() < checkpoint.sequence()
+                                })
+                            {
+                                return Err(AuditAuthorityError::BindingMismatch);
+                            }
+                            if chain
+                                .export_checkpoint
+                                .as_ref()
+                                .is_none_or(|current| current.sequence() < checkpoint.sequence())
+                            {
+                                chain.export_checkpoint = Some(checkpoint.clone());
+                            }
+                            Ok(())
+                        })
+                }
                 AuditCommand::Prune {
                     through,
                     checkpoint,

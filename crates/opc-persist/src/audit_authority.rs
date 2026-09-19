@@ -70,6 +70,10 @@ pub enum AuditAuthorityError {
     /// The local history or external checkpoint moved behind an authenticated bound.
     #[error("audit authority rollback detected")]
     RollbackDetected,
+    /// A checkpointed mutation has no retained authoritative outcome after
+    /// reopen. Expiry is not proof that its possibly lost effect did not commit.
+    #[error("audit authority recovery required")]
+    RecoveryRequired,
 }
 
 /// A projected identifier. It is not a metric label or diagnostic identity.

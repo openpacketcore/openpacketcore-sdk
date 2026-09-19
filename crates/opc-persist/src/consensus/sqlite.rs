@@ -2759,6 +2759,25 @@ fn apply_audited_mutation_sync(
         }
         AuditOperationState::Intent => {}
     }
+    if let Some(chain) = &ledger.continuity {
+        let checkpointed = ledger.operations.iter().any(|operation| {
+            operation.handle == prepared.handle
+                && chain
+                    .checkpoint
+                    .as_ref()
+                    .is_some_and(|checkpoint| checkpoint.sequence() >= operation.first_sequence)
+        });
+        if !checkpointed
+            || ledger
+                .operations
+                .iter()
+                .any(|op| ledger.mutation_outcome_needs_checkpoint(op))
+        {
+            // No configuration effect and no invented rejection: the exact
+            // admitted intent remains recoverable under its original owner.
+            return Ok(Err(ConfigMutationFailure::InvalidInput));
+        }
+    }
     validate_sealed_state_sync(conn, key, cancellation)?;
     let current_version: u64 = conn
         .query_row(

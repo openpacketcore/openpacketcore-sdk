@@ -340,6 +340,14 @@ impl LedgerState {
             };
         }
         handle.require_live(now)?;
+        if handle.body.mutation.is_some()
+            && self
+                .operations
+                .iter()
+                .any(|operation| self.mutation_outcome_needs_checkpoint(operation))
+        {
+            return Err(AuditAuthorityError::RecoveryRequired);
+        }
         if handle.body.event.projection != self.projection {
             return Err(AuditAuthorityError::BindingMismatch);
         }

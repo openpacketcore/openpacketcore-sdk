@@ -268,6 +268,40 @@ impl ConsensusConfigStore {
         .await
     }
 
+    /// Complete the exact known outcome's terminal record and independent
+    /// checkpoint when this store requires audit continuity. Without that
+    /// profile, terminal completion retains its existing supervisor lifecycle.
+    ///
+    /// An error preserves the supplied authoritative outcome and retained debt;
+    /// it cannot turn a known commit into rejection or authorize another effect.
+    /// New mutations remain refused until the debt is checkpointed. Recovery
+    /// retries this same operation without changing its original expiry.
+    pub async fn complete_required_audit_outcome(
+        &self,
+        receipt: &AuditOperationReceipt,
+        caller: AuditCaller,
+    ) -> Result<(), AuditAuthorityError> {
+        receipt
+            .handle
+            .verify(self.inner.backend.audit_key(), self.inner.identity, caller)?;
+        if self.inner.audit_continuity.is_none() {
+            return Ok(());
+        }
+        let terminal = match self.finish_audit_operation(&receipt.handle, caller).await {
+            AuditAdmission::Applied(terminal)
+                if terminal.state() == receipt.state() && terminal.terminal_recorded() =>
+            {
+                terminal
+            }
+            AuditAdmission::Rejected(error) => return Err(error),
+            _ => return Err(AuditAuthorityError::Unavailable),
+        };
+        if terminal.state() == crate::audit_authority::AuditOperationState::Intent {
+            return Err(AuditAuthorityError::BindingMismatch);
+        }
+        self.checkpoint_audit_tail().await
+    }
+
     /// Admit an intent only through this node's current local leader. No
     /// management mutation is forwarded after deposition. Reads may still use
     /// the ordinary authenticated quorum barrier.
@@ -369,6 +403,29 @@ impl ConsensusConfigStore {
                 }
             }
             Ok(Some(_)) => {}
+        }
+        if matches!(command, ConfigMutationIntent::AuditedMutation(_))
+            && self.inner.audit_continuity.is_some()
+        {
+            let receipt = match ledger.lookup(self.inner.backend.audit_key(), handle, caller) {
+                Ok(Some(receipt)) => receipt,
+                _ => return AuditAdmission::Rejected(AuditAuthorityError::BindingMismatch),
+            };
+            // Exact replay preserves an already authoritative outcome, including
+            // while its terminal checkpoint is still outstanding.
+            if receipt.state() != crate::audit_authority::AuditOperationState::Intent {
+                return AuditAdmission::Applied(receipt);
+            }
+            if ledger
+                .operations
+                .iter()
+                .any(|op| ledger.mutation_outcome_needs_checkpoint(op))
+            {
+                return AuditAdmission::Rejected(AuditAuthorityError::RecoveryRequired);
+            }
+            if let Err(error) = self.checkpoint_audit_tail().await {
+                return AuditAdmission::Rejected(error);
+            }
         }
         let response = if local_only {
             self.submit_request_on_local_leader(request, command).await
@@ -484,8 +541,9 @@ impl ConsensusConfigStore {
         let mut progress = AuditRecoveryProgress::default();
         let mut operations: Vec<_> = ledger
             .operations
-            .into_iter()
-            .filter(|op| !op.terminal_recorded)
+            .iter()
+            .filter(|op| !op.terminal_recorded || ledger.mutation_outcome_needs_checkpoint(op))
+            .cloned()
             .collect();
         // A still-live intent at the front of the ledger must not starve
         // later terminal obligations when the caller uses a small work limit.
@@ -509,7 +567,15 @@ impl ConsensusConfigStore {
             }
             match self.finish_audit_operation(&op.handle, caller).await {
                 AuditAdmission::Applied(ref receipt) if receipt.terminal_recorded() => {
-                    progress.completed += 1
+                    if self
+                        .complete_required_audit_outcome(receipt, caller)
+                        .await
+                        .is_ok()
+                    {
+                        progress.completed += 1;
+                    } else {
+                        progress.unknown += 1;
+                    }
                 }
                 _ => progress.unknown += 1,
             }

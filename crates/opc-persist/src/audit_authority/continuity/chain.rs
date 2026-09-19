@@ -29,12 +29,13 @@ pub(crate) struct ContinuityState {
     pub(crate) terminal: [u8; 32],
     pub(crate) rows: Vec<SignedAuditRow>,
     pub(crate) checkpoint: Option<super::AuditCheckpoint>,
+    pub(crate) export_checkpoint: Option<super::AuditCheckpoint>,
 }
 
 impl ContinuityState {
     pub(crate) fn new(epoch: u64) -> Self {
         Self {
-            version: 1,
+            version: 2,
             initial_epoch: epoch,
             floor_epoch: epoch,
             floor_anchor: [0; 32],
@@ -42,6 +43,7 @@ impl ContinuityState {
             terminal: [0; 32],
             rows: Vec::new(),
             checkpoint: None,
+            export_checkpoint: None,
         }
     }
 }
@@ -89,7 +91,7 @@ impl LedgerState {
             return Ok(());
         };
         let keys = keys.ok_or(AuditAuthorityError::KeyUnavailable)?;
-        if chain.version != 1 || chain.rows.len() != self.entries.len() {
+        if chain.version != 2 || chain.rows.len() != self.entries.len() {
             return Err(AuditAuthorityError::BindingMismatch);
         }
         let mut epoch = chain.floor_epoch;
@@ -106,7 +108,34 @@ impl LedgerState {
             checkpoint.verify(keys, self.identity)?;
             self.matches_checkpoint(checkpoint)?;
         }
+        if let Some(export) = &chain.export_checkpoint {
+            export.verify(keys, self.identity)?;
+            self.matches_checkpoint(export)?;
+            if export.body.acknowledged_export == [0; 32]
+                || chain
+                    .checkpoint
+                    .as_ref()
+                    .is_none_or(|checkpoint| checkpoint.sequence() < export.sequence())
+            {
+                return Err(AuditAuthorityError::BindingMismatch);
+            }
+        }
         Ok(())
+    }
+
+    pub(crate) fn mutation_outcome_needs_checkpoint(
+        &self,
+        operation: &crate::audit_authority::ledger::LedgerOperation,
+    ) -> bool {
+        self.continuity.as_ref().is_some_and(|chain| {
+            operation.handle.body.mutation.is_some()
+                && operation.state != crate::audit_authority::AuditOperationState::Intent
+                && (!operation.terminal_recorded
+                    || chain
+                        .checkpoint
+                        .as_ref()
+                        .is_none_or(|checkpoint| checkpoint.sequence() < operation.last_sequence))
+        })
     }
 
     /// Existing rows must be verified before mutation; this appends only missing
@@ -190,7 +219,10 @@ impl LedgerState {
             .continuity
             .as_mut()
             .ok_or(AuditAuthorityError::Unavailable)?;
-        if chain.checkpoint.as_ref() != Some(checkpoint) || through > checkpoint.body.sequence {
+        if chain.export_checkpoint.as_ref() != Some(checkpoint)
+            || checkpoint.body.acknowledged_export == [0; 32]
+            || through > checkpoint.body.sequence
+        {
             return Err(AuditAuthorityError::BindingMismatch);
         }
         if through < self.floor {
