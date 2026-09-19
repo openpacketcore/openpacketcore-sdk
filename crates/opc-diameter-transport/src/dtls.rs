@@ -1725,6 +1725,7 @@ struct HandshakeValidation {
     expected_peer: opc_types::SpiffeId,
     trust_bundles: TrustBundleSet,
     usage: PeerUsage,
+    revocation: Option<Arc<rfc6083::revocation::Snapshot>>,
 }
 
 fn certificate_expiry(der: &[u8]) -> Result<Timestamp, DiameterTlsError> {
@@ -1818,17 +1819,37 @@ fn validate_peer_certificate_chain(
         PeerUsage::Client => webpki::KeyUsage::client_auth(),
     };
     let provider = tokio_rustls::rustls::crypto::ring::default_provider();
-    end_entity
+    if validation.revocation.as_ref().is_some_and(|v| !v.current()) {
+        return Err(DiameterTlsError::Authentication);
+    }
+    let crls = validation.revocation.as_ref().map(|v| v.lists());
+    let revocation = crls
+        .as_ref()
+        .map(|lists| {
+            webpki::RevocationOptionsBuilder::new(lists)
+                .map(|v| {
+                    v.with_depth(webpki::RevocationCheckDepth::Chain)
+                        .with_status_policy(webpki::UnknownStatusPolicy::Deny)
+                        .with_expiration_policy(webpki::ExpirationPolicy::Enforce)
+                        .build()
+                })
+                .map_err(|_| DiameterTlsError::Authentication)
+        })
+        .transpose()?;
+    let path = end_entity
         .verify_for_usage(
             provider.signature_verification_algorithms.all,
             &anchors,
             &intermediates,
             rustls_pki_types::UnixTime::since_unix_epoch(since_epoch),
             usage,
-            None,
+            revocation,
             None,
         )
         .map_err(|_| DiameterTlsError::Authentication)?;
+    if let Some(revocation) = &validation.revocation {
+        revocation.verify_identifiers(&path, &bundle.certificates)?;
+    }
     Ok(expiry)
 }
 
@@ -2648,6 +2669,7 @@ impl DiameterDtlsSctpConnector {
             expected_peer: self.expected_peer.spiffe_id().clone(),
             trust_bundles,
             usage: PeerUsage::Server,
+            revocation: None,
         };
         let established = match tokio::time::timeout_at(
             deadline,
@@ -2841,6 +2863,7 @@ impl DiameterDtlsSctpAcceptor {
             expected_peer: self.expected_peer.spiffe_id().clone(),
             trust_bundles,
             usage: PeerUsage::Client,
+            revocation: None,
         };
         let established = match tokio::time::timeout_at(
             deadline,

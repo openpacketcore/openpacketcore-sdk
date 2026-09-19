@@ -22,6 +22,16 @@ the complete NGAP stream or 3GPP certificate/revocation profile, in-place
 renegotiation, or new restart/multihoming guarantees. See the exact support and
 verification boundaries in [the generic RFC 6083 contract](../../docs/rfc6083-generic-transport.md).
 
+The generic endpoints also offer `new_with_required_crls`. A local
+`CrlPublisher` binds complete direct CRLs to its material controller's exact
+epoch; both roles require current coverage for the peer's full certificate
+path. Missing, invalid, stale or revoked status cannot fall back to the
+original profile. Replacement, withdrawal, publisher loss and expiry retire
+existing connections, including queued delivery and borrowed readback. This
+adds no CRL fetching, OCSP or full 3GPP PKI claim. See the supported inputs,
+rollback boundary and independent evidence in
+[the required-CRL contract](../../docs/rfc6083-crl-transport.md).
+
 ## Implemented boundary
 
 - Direct TLS/TCP completes mutually authenticated TLS 1.3 before any Diameter
