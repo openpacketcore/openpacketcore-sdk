@@ -168,8 +168,8 @@ The commit boundary contains unwinding from an `AuditSink` so a sink panic
 cannot reverse these reply semantics. A sink panic remains a trait-contract
 violation: Rust invokes the process panic hook before unwinding can be caught,
 so sink implementations must never place sensitive content in panic payloads.
-This contract describes candidate `<commit>`; it does not claim identical
-ordering for every NETCONF operation.
+The same containment applies to the configuration mutation paths listed below;
+read-only and registry operations retain their separately documented contracts.
 
 ## Running edit audit intent
 
@@ -188,8 +188,22 @@ results. Terminal recording preserves the original configuration rejection
 instead of replacing it with an audit error. These paths use the same bounded,
 value-free terminal-failure signal as candidate commit.
 
-This does not complete issue #796: recoverable terminal obligations and
-the remaining mutation paths require separate implementation and evidence.
+Candidate and startup `<edit-config>`/`<edit-data>`, copies to candidate/startup,
+`<discard-changes>`, and deletion of startup also require acknowledged Intent
+before modifying their local datastore. They preserve the applied result or
+original rejection if terminal recording fails. Cancellation while Intent is
+unacknowledged leaves the datastore unchanged and releases the write reservation.
+
+Non-persistent confirmed-commit rollback on session exit follows the same
+pre-submit rule. Failed Intent keeps the pending confirmation available for
+retry without extending its original deadline. A known rollback result retires
+only the matching pending confirmation; a later confirmation cannot be cleared
+by an earlier completion.
+
+These handler guarantees do not by themselves provide durable terminal recovery.
+A local sink or process-local candidate is not a replicated operation authority;
+recoverable configuration outcomes require the SDK consensus audit composition
+tracked by #796 and #797.
 
 ## Relationships
 

@@ -623,6 +623,7 @@ where
         &self,
         commit: CommitWrite<C>,
     ) -> Result<CommitWriteReceipt, StoreError> {
+        let audit_context = commit.audit_context().cloned();
         let (record, resolution) = commit.into_parts();
         let record = self.encrypt_record(record).await?;
         let receipt = CommitWriteReceipt::new(record.plaintext_digest);
@@ -630,7 +631,9 @@ where
             Some(resolution) => CommitWrite::resolving(record, resolution)?,
             None => CommitWrite::new(record),
         };
-        self.inner.append_commit_write(write).await?;
+        self.inner
+            .append_commit_write(write.with_audit_context(audit_context))
+            .await?;
         Ok(receipt)
     }
 

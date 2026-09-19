@@ -2622,6 +2622,7 @@ dependencies = [
  "opc-consensus",
  "opc-identity",
  "opc-key",
+ "opc-mgmt-audit",
  "opc-persist",
  "opc-tls",
  "opc-types",

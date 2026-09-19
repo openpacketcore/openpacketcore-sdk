@@ -268,12 +268,68 @@ impl ConsensusConfigStore {
         .await
     }
 
+    /// Admit an intent only through this node's current local leader. No
+    /// management mutation is forwarded after deposition. Reads may still use
+    /// the ordinary authenticated quorum barrier.
+    pub async fn admit_audit_operation_local(
+        &self,
+        handle: &AuditOperationHandle,
+        caller: AuditCaller,
+    ) -> AuditAdmission {
+        self.audit_operation_command_with_route(
+            handle,
+            caller,
+            b"audit-intent",
+            ConfigMutationIntent::ManagementAudit(AuditCommand::Intent(handle.clone())),
+            true,
+        )
+        .await
+    }
+
+    /// Apply the exact admitted configuration effect only on this node's
+    /// current leader. A possibly admitted effect returns Unknown and retains
+    /// the same durable operation; it must not be blindly resubmitted elsewhere.
+    pub async fn submit_audited_mutation_local(
+        &self,
+        prepared: &PreparedAuditedMutation,
+        admitted: &AuditOperationReceipt,
+        caller: AuditCaller,
+    ) -> AuditAdmission {
+        if admitted.handle != prepared.handle
+            || prepared
+                .verify_effect(self.inner.backend.audit_key())
+                .is_err()
+        {
+            return AuditAdmission::Rejected(AuditAuthorityError::BindingMismatch);
+        }
+        self.audit_operation_command_with_route(
+            &prepared.handle,
+            caller,
+            b"audit-config",
+            ConfigMutationIntent::AuditedMutation(prepared.clone()),
+            true,
+        )
+        .await
+    }
+
     async fn audit_operation_command(
         &self,
         handle: &AuditOperationHandle,
         caller: AuditCaller,
         purpose: &[u8],
         command: ConfigMutationIntent,
+    ) -> AuditAdmission {
+        self.audit_operation_command_with_route(handle, caller, purpose, command, false)
+            .await
+    }
+
+    async fn audit_operation_command_with_route(
+        &self,
+        handle: &AuditOperationHandle,
+        caller: AuditCaller,
+        purpose: &[u8],
+        command: ConfigMutationIntent,
+        local_only: bool,
     ) -> AuditAdmission {
         if let Err(error) =
             handle.verify(self.inner.backend.audit_key(), self.inner.identity, caller)
@@ -314,7 +370,12 @@ impl ConsensusConfigStore {
             }
             Ok(Some(_)) => {}
         }
-        match self.submit_request(request, command).await {
+        let response = if local_only {
+            self.submit_request_on_local_leader(request, command).await
+        } else {
+            self.submit_request(request, command).await
+        };
+        match response {
             Err(_) => AuditAdmission::Unknown(handle.clone()),
             Ok(response) => {
                 if let Some(proof) = &response.audit_receipt {

@@ -2048,15 +2048,14 @@ where
                 Some(pending)
                     if pending.owner_session_id == session_id && pending.persist.is_none() =>
                 {
-                    state.clear();
                     Some(pending)
                 }
                 _ => None,
             }
         };
-        if pending.is_none() {
+        let Some(pending) = pending else {
             return;
-        }
+        };
 
         let request_id = RequestId::new();
         let bus = self.binding.config_bus();
@@ -2071,49 +2070,69 @@ where
         )
         .with_base_version(snapshot.version);
 
+        let intent = AuditEvent::new(
+            request_id,
+            principal,
+            self.transport,
+            AuditOperation::Update,
+            AuditOutcome::Intent,
+        )
+        .with_paths([schema_node_path(NETCONF_CANCEL_COMMIT_PATH)]);
+        if commit_audit_failed(&self.audit, &intent).await {
+            tracing::error!(
+                target: "opc_netconf_server",
+                audit_phase = "intent",
+                "NETCONF session-exit rollback withheld because required audit intent is unproven"
+            );
+            return;
+        }
+
         match bus.submit(request).await {
             Ok(result) => {
+                {
+                    let mut state = self
+                        .confirmed_commit
+                        .lock()
+                        .unwrap_or_else(|err| err.into_inner());
+                    // Do not retire a different confirmation that arrived while
+                    // this rollback was awaiting admission or its result.
+                    if state.pending.as_ref().is_some_and(|current| {
+                        current.owner_session_id == pending.owner_session_id
+                            && current.deadline == pending.deadline
+                            && current.persist == pending.persist
+                    }) {
+                        state.clear();
+                    }
+                }
                 let paths = self.schema_paths_for_changed_paths(
                     &result.changed_paths,
                     NETCONF_CANCEL_COMMIT_PATH,
                 );
-                if self
-                    .audit
-                    .record_async(
-                        &AuditEvent::new(
-                            request_id,
-                            principal,
-                            self.transport,
-                            AuditOperation::Update,
-                            AuditOutcome::Success,
-                        )
-                        .with_paths(paths),
+                self.record_mutation_terminal(
+                    &AuditEvent::new(
+                        request_id,
+                        principal,
+                        self.transport,
+                        AuditOperation::Update,
+                        AuditOutcome::Success,
                     )
-                    .await
-                    .is_err()
-                {
-                    tracing::warn!(
-                        session_id,
-                        "NETCONF confirmed-commit session-exit rollback succeeded but audit failed"
-                    );
-                }
+                    .with_paths(paths),
+                )
+                .await;
             }
             Err(error) => {
-                let _ = self
-                    .audit
-                    .record_async(
-                        &AuditEvent::new(
-                            request_id,
-                            principal,
-                            self.transport,
-                            AuditOperation::Update,
-                            audit_failed(error.code.as_str()),
-                        )
-                        .with_paths([schema_node_path(NETCONF_CANCEL_COMMIT_PATH)]),
+                self.record_mutation_terminal(
+                    &AuditEvent::new(
+                        request_id,
+                        principal,
+                        self.transport,
+                        AuditOperation::Update,
+                        audit_failed(error.code.as_str()),
                     )
-                    .await;
+                    .with_paths([schema_node_path(NETCONF_CANCEL_COMMIT_PATH)]),
+                )
+                .await;
                 tracing::warn!(
-                    session_id,
                     commit_error_code = %error.code,
                     "NETCONF confirmed-commit session-exit rollback failed"
                 );
@@ -4088,32 +4107,17 @@ where
         owner_session_id: u64,
         operation: NetconfOperation,
     ) -> RpcHandlingResult {
-        if self
-            .audit
-            .record_async(
-                &AuditEvent::new(
-                    context.request_id,
-                    context.principal,
-                    self.transport,
-                    AuditOperation::Exec,
-                    audit_failed("lock-denied"),
-                )
-                .with_paths([schema_node_path(path)]),
+        self.record_mutation_terminal(
+            &AuditEvent::new(
+                context.request_id,
+                context.principal,
+                self.transport,
+                AuditOperation::Exec,
+                audit_failed("lock-denied"),
             )
-            .await
-            .is_err()
-        {
-            record_rpc_error(
-                operation,
-                NetconfErrorTag::OperationFailed,
-                context.started.elapsed(),
-            );
-            return RpcHandlingResult::keep_open(rpc_error_reply_with_attrs(
-                Some(context.message_id),
-                context.reply_attrs,
-                RpcError::operation_failed(),
-            ));
-        }
+            .with_paths([schema_node_path(path)]),
+        )
+        .await;
         self.lock_denied_reply_after_audit(context, owner_session_id, operation)
     }
 
@@ -4814,6 +4818,23 @@ where
             }
         };
 
+        if let Some(reply) = self
+            .required_intent_failure_reply(
+                &context,
+                NetconfOperation::DiscardChanges,
+                &AuditEvent::new(
+                    context.request_id,
+                    context.principal,
+                    self.transport,
+                    AuditOperation::Exec,
+                    AuditOutcome::Intent,
+                )
+                .with_paths([schema_node_path(NETCONF_DISCARD_CHANGES_PATH)]),
+            )
+            .await
+        {
+            return reply;
+        }
         self.candidate
             .lock()
             .unwrap_or_else(|err| err.into_inner())
@@ -4983,6 +5004,23 @@ where
             }
         }
 
+        if let Some(reply) = self
+            .required_intent_failure_reply(
+                &context,
+                NetconfOperation::DeleteConfig,
+                &AuditEvent::new(
+                    context.request_id,
+                    context.principal,
+                    self.transport,
+                    AuditOperation::Delete,
+                    AuditOutcome::Intent,
+                )
+                .with_paths([schema_node_path(NETCONF_DELETE_CONFIG_PATH)]),
+            )
+            .await
+        {
+            return reply;
+        }
         match startup.delete_startup_config() {
             Ok(()) => self.delete_config_success_reply(&context).await,
             Err(error) => {
@@ -5263,6 +5301,23 @@ where
                     .await;
             }
         };
+        if let Some(reply) = self
+            .required_intent_failure_reply(
+                context,
+                NetconfOperation::CopyConfig,
+                &AuditEvent::new(
+                    context.request_id,
+                    context.principal,
+                    self.transport,
+                    AuditOperation::Replace,
+                    AuditOutcome::Intent,
+                )
+                .with_paths([schema_node_path(NETCONF_COPY_CONFIG_PATH)]),
+            )
+            .await
+        {
+            return reply;
+        }
         let running = self.binding.config_bus().current_snapshot();
         self.candidate
             .lock()
@@ -5367,6 +5422,23 @@ where
                     .await;
             }
         }
+        if let Some(reply) = self
+            .required_intent_failure_reply(
+                context,
+                NetconfOperation::CopyConfig,
+                &AuditEvent::new(
+                    context.request_id,
+                    context.principal,
+                    self.transport,
+                    AuditOperation::Replace,
+                    AuditOutcome::Intent,
+                )
+                .with_paths([schema_node_path(NETCONF_COPY_CONFIG_PATH)]),
+            )
+            .await
+        {
+            return reply;
+        }
         match startup.store_startup_config(&source) {
             Ok(()) => {
                 self.copy_config_success_reply(
@@ -5384,32 +5456,17 @@ where
         context: &RpcExecContext<'_>,
         paths: Vec<SchemaNodePath>,
     ) -> RpcHandlingResult {
-        if self
-            .audit
-            .record_async(
-                &AuditEvent::new(
-                    context.request_id,
-                    context.principal,
-                    self.transport,
-                    AuditOperation::Replace,
-                    AuditOutcome::Success,
-                )
-                .with_paths(paths),
+        self.record_mutation_terminal(
+            &AuditEvent::new(
+                context.request_id,
+                context.principal,
+                self.transport,
+                AuditOperation::Replace,
+                AuditOutcome::Success,
             )
-            .await
-            .is_err()
-        {
-            record_rpc_error(
-                NetconfOperation::CopyConfig,
-                NetconfErrorTag::OperationFailed,
-                context.started.elapsed(),
-            );
-            return RpcHandlingResult::keep_open(rpc_error_reply_with_attrs(
-                Some(context.message_id),
-                context.reply_attrs,
-                RpcError::operation_failed(),
-            ));
-        }
+            .with_paths(paths),
+        )
+        .await;
         record_rpc_success(NetconfOperation::CopyConfig, context.started.elapsed());
         RpcHandlingResult::keep_open(rpc_ok_empty_reply_with_attrs(
             context.message_id,
@@ -5460,32 +5517,17 @@ where
     }
 
     async fn delete_config_success_reply(&self, context: &RpcExecContext<'_>) -> RpcHandlingResult {
-        if self
-            .audit
-            .record_async(
-                &AuditEvent::new(
-                    context.request_id,
-                    context.principal,
-                    self.transport,
-                    AuditOperation::Delete,
-                    AuditOutcome::Success,
-                )
-                .with_paths([schema_node_path(NETCONF_DELETE_CONFIG_PATH)]),
+        self.record_mutation_terminal(
+            &AuditEvent::new(
+                context.request_id,
+                context.principal,
+                self.transport,
+                AuditOperation::Delete,
+                AuditOutcome::Success,
             )
-            .await
-            .is_err()
-        {
-            record_rpc_error(
-                NetconfOperation::DeleteConfig,
-                NetconfErrorTag::OperationFailed,
-                context.started.elapsed(),
-            );
-            return RpcHandlingResult::keep_open(rpc_error_reply_with_attrs(
-                Some(context.message_id),
-                context.reply_attrs,
-                RpcError::operation_failed(),
-            ));
-        }
+            .with_paths([schema_node_path(NETCONF_DELETE_CONFIG_PATH)]),
+        )
+        .await;
         record_rpc_success(NetconfOperation::DeleteConfig, context.started.elapsed());
         RpcHandlingResult::keep_open(rpc_ok_empty_reply_with_attrs(
             context.message_id,
@@ -5512,32 +5554,17 @@ where
         outcome: AuditOutcome,
         rpc_error: RpcError,
     ) -> RpcHandlingResult {
-        if self
-            .audit
-            .record_async(
-                &AuditEvent::new(
-                    context.request_id,
-                    context.principal,
-                    self.transport,
-                    AuditOperation::Delete,
-                    outcome,
-                )
-                .with_paths([schema_node_path(NETCONF_DELETE_CONFIG_PATH)]),
+        self.record_mutation_terminal(
+            &AuditEvent::new(
+                context.request_id,
+                context.principal,
+                self.transport,
+                AuditOperation::Delete,
+                outcome,
             )
-            .await
-            .is_err()
-        {
-            record_rpc_error(
-                NetconfOperation::DeleteConfig,
-                NetconfErrorTag::OperationFailed,
-                context.started.elapsed(),
-            );
-            return RpcHandlingResult::keep_open(rpc_error_reply_with_attrs(
-                Some(context.message_id),
-                context.reply_attrs,
-                RpcError::operation_failed(),
-            ));
-        }
+            .with_paths([schema_node_path(NETCONF_DELETE_CONFIG_PATH)]),
+        )
+        .await;
         record_rpc_error(
             NetconfOperation::DeleteConfig,
             rpc_error.classification.tag,
@@ -5556,32 +5583,17 @@ where
         operation: NetconfOperation,
         path: &'static str,
     ) -> RpcHandlingResult {
-        if self
-            .audit
-            .record_async(
-                &AuditEvent::new(
-                    context.request_id,
-                    context.principal,
-                    self.transport,
-                    AuditOperation::Exec,
-                    AuditOutcome::Success,
-                )
-                .with_paths([schema_node_path(path)]),
+        self.record_mutation_terminal(
+            &AuditEvent::new(
+                context.request_id,
+                context.principal,
+                self.transport,
+                AuditOperation::Exec,
+                AuditOutcome::Success,
             )
-            .await
-            .is_err()
-        {
-            record_rpc_error(
-                operation,
-                NetconfErrorTag::OperationFailed,
-                context.started.elapsed(),
-            );
-            return RpcHandlingResult::keep_open(rpc_error_reply_with_attrs(
-                Some(context.message_id),
-                context.reply_attrs,
-                RpcError::operation_failed(),
-            ));
-        }
+            .with_paths([schema_node_path(path)]),
+        )
+        .await;
         record_rpc_success(operation, context.started.elapsed());
         RpcHandlingResult::keep_open(rpc_ok_empty_reply_with_attrs(
             context.message_id,
@@ -5989,32 +6001,17 @@ where
         kind: EditRpcKind,
         owner_session_id: u64,
     ) -> RpcHandlingResult {
-        if self
-            .audit
-            .record_async(
-                &AuditEvent::new(
-                    context.request_id,
-                    context.principal,
-                    self.transport,
-                    AuditOperation::Update,
-                    audit_failed("lock-denied"),
-                )
-                .with_paths([schema_node_path(kind.path())]),
+        self.record_mutation_terminal(
+            &AuditEvent::new(
+                context.request_id,
+                context.principal,
+                self.transport,
+                AuditOperation::Update,
+                audit_failed("lock-denied"),
             )
-            .await
-            .is_err()
-        {
-            record_rpc_error(
-                kind.metric(),
-                NetconfErrorTag::OperationFailed,
-                context.started.elapsed(),
-            );
-            return RpcHandlingResult::keep_open(rpc_error_reply_with_attrs(
-                Some(context.message_id),
-                context.reply_attrs,
-                RpcError::operation_failed(),
-            ));
-        }
+            .with_paths([schema_node_path(kind.path())]),
+        )
+        .await;
 
         record_rpc_error(
             kind.metric(),
@@ -6092,37 +6089,39 @@ where
         };
 
         let paths = self.schema_paths_for_changed_paths(&candidate.changed_paths, kind.path());
-        self.candidate
-            .lock()
-            .unwrap_or_else(|err| err.into_inner())
-            .replace(candidate.candidate, base.base_version);
-
-        if self
-            .audit
-            .record_async(
+        if let Some(reply) = self
+            .required_intent_failure_reply(
+                context,
+                kind.metric(),
                 &AuditEvent::new(
                     context.request_id,
                     context.principal,
                     self.transport,
                     AuditOperation::Update,
-                    AuditOutcome::Success,
+                    AuditOutcome::Intent,
                 )
-                .with_paths(paths),
+                .with_paths(paths.clone()),
             )
             .await
-            .is_err()
         {
-            record_rpc_error(
-                kind.metric(),
-                NetconfErrorTag::OperationFailed,
-                context.started.elapsed(),
-            );
-            return RpcHandlingResult::keep_open(rpc_error_reply_with_attrs(
-                Some(context.message_id),
-                context.reply_attrs,
-                RpcError::operation_failed(),
-            ));
+            return reply;
         }
+        self.candidate
+            .lock()
+            .unwrap_or_else(|err| err.into_inner())
+            .replace(candidate.candidate, base.base_version);
+
+        self.record_mutation_terminal(
+            &AuditEvent::new(
+                context.request_id,
+                context.principal,
+                self.transport,
+                AuditOperation::Update,
+                AuditOutcome::Success,
+            )
+            .with_paths(paths),
+        )
+        .await;
         record_rpc_success(kind.metric(), context.started.elapsed());
         RpcHandlingResult::keep_open(rpc_ok_empty_reply_with_attrs(
             context.message_id,
@@ -6267,6 +6266,24 @@ where
                     .await;
             }
         }
+        let paths = self.schema_paths_for_changed_paths(&changed_paths, kind.path());
+        if let Some(reply) = self
+            .required_intent_failure_reply(
+                context,
+                kind.metric(),
+                &AuditEvent::new(
+                    context.request_id,
+                    context.principal,
+                    self.transport,
+                    AuditOperation::Update,
+                    AuditOutcome::Intent,
+                )
+                .with_paths(paths.clone()),
+            )
+            .await
+        {
+            return reply;
+        }
         match startup.store_startup_config(&candidate.candidate) {
             Ok(()) => {}
             Err(StartupDatastoreError::Unsupported) => {
@@ -6291,33 +6308,17 @@ where
             }
         }
 
-        let paths = self.schema_paths_for_changed_paths(&changed_paths, kind.path());
-        if self
-            .audit
-            .record_async(
-                &AuditEvent::new(
-                    context.request_id,
-                    context.principal,
-                    self.transport,
-                    AuditOperation::Update,
-                    AuditOutcome::Success,
-                )
-                .with_paths(paths),
+        self.record_mutation_terminal(
+            &AuditEvent::new(
+                context.request_id,
+                context.principal,
+                self.transport,
+                AuditOperation::Update,
+                AuditOutcome::Success,
             )
-            .await
-            .is_err()
-        {
-            record_rpc_error(
-                kind.metric(),
-                NetconfErrorTag::OperationFailed,
-                context.started.elapsed(),
-            );
-            return RpcHandlingResult::keep_open(rpc_error_reply_with_attrs(
-                Some(context.message_id),
-                context.reply_attrs,
-                RpcError::operation_failed(),
-            ));
-        }
+            .with_paths(paths),
+        )
+        .await;
         record_rpc_success(kind.metric(), context.started.elapsed());
         RpcHandlingResult::keep_open(rpc_ok_empty_reply_with_attrs(
             context.message_id,
@@ -7470,6 +7471,8 @@ fn edit_config_rpc_error(error: EditConfigError) -> RpcError {
 #[cfg(test)]
 mod tests {
     #![allow(clippy::unwrap_used, clippy::expect_used)]
+
+    mod mutation_audit;
 
     use std::collections::{HashSet, VecDeque};
     use std::net::SocketAddr;
@@ -16059,6 +16062,18 @@ mod tests {
         Arc<MemoryStartupDatastore>,
         CapturingAudit,
     ) {
+        generated_edit_server_with_startup_audit(policy, CapturingAudit::default()).await
+    }
+
+    async fn generated_edit_server_with_startup_audit<A: AuditSink + Clone>(
+        policy: NacmPolicy,
+        audit: A,
+    ) -> (
+        ReadOnlyNetconfServer<DemoConfig, GeneratedEditBinding, FixedPolicy, A>,
+        Arc<ConfigBus<DemoConfig>>,
+        Arc<MemoryStartupDatastore>,
+        A,
+    ) {
         let store = Arc::new(MockManagedDatastore::new());
         store
             .seed(StoredConfig::new(
@@ -16094,7 +16109,6 @@ mod tests {
             bus: Arc::clone(&bus),
             startup: Some(Arc::clone(&startup)),
         };
-        let audit = CapturingAudit::default();
         let server = ReadOnlyNetconfServer::new(
             binding,
             FixedPolicy(policy),
@@ -17602,6 +17616,7 @@ mod tests {
             CommitAuditFailure::IntentPanic,
         ] {
             let audit = ScriptedCommitAudit::new(failure);
+            *audit.failure.lock().expect("audit failure") = None;
             let (server, bus, audit) = generated_edit_server_with_audit(audit).await;
             let registry = SessionRegistry::new();
             let _registration = registry.register(1).expect("register session 1");
@@ -17622,6 +17637,7 @@ mod tests {
                 )
                 .await;
             assert!(staged.reply_xml.contains("<ok/>"), "{}", staged.reply_xml);
+            *audit.failure.lock().expect("audit failure") = Some(failure);
             assert_eq!(bus.current_snapshot().config.hostname, "amf-1");
 
             let commit_request_id = RequestId::new();
@@ -17731,22 +17747,13 @@ mod tests {
         let (server, bus, _) = generated_edit_server_with_audit(CommitConstructionPanicAudit).await;
         let registry = SessionRegistry::new();
         let _registration = registry.register(1).expect("register session 1");
-        let edit = edit_config_rpc_to(
-            "candidate",
-            r#"<sys:system xmlns:sys="urn:opc:demo"><sys:hostname>amf-2</sys:hostname></sys:system>"#,
-            "merge",
-        );
-        let staged = server
-            .handle_rpc_for_session_async(
-                RequestId::new(),
-                &principal(),
-                &edit,
-                &MgmtLimits::default(),
-                1,
-                &registry,
-            )
-            .await;
-        assert!(staged.reply_xml.contains("<ok/>"), "{}", staged.reply_xml);
+        let mut candidate = bus.current_snapshot().config.as_ref().clone();
+        candidate.hostname = "amf-2".into();
+        server
+            .candidate
+            .lock()
+            .expect("candidate fixture")
+            .replace(candidate, ConfigVersion::new(1));
 
         let rejected = server
             .handle_rpc_for_session_async(
@@ -17786,6 +17793,7 @@ mod tests {
             CommitAuditFailure::TerminalPanic,
         ] {
             let audit = ScriptedCommitAudit::new(failure);
+            *audit.failure.lock().expect("audit failure") = None;
             let (server, bus, audit) = generated_edit_server_with_audit(audit).await;
             let registry = SessionRegistry::new();
             let _registration = registry.register(1).expect("register session 1");
@@ -17806,6 +17814,7 @@ mod tests {
                 )
                 .await;
             assert!(staged.reply_xml.contains("<ok/>"), "{}", staged.reply_xml);
+            *audit.failure.lock().expect("audit failure") = Some(failure);
 
             let terminal_failures_before = METRICS
                 .netconf_terminal_audit_failures_total

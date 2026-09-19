@@ -48,8 +48,8 @@ pub use datastore::{
 };
 pub use subscribers::{ConfigReceiver, SubscriberDisconnectReason, SubscriberLagPolicy};
 pub use types::{
-    AtomicConfigSnapshot, AuthorityMode, CommitWrite, CommitWriteReceipt, ConfigChange,
-    ConfigEvent, ConfigEventRetainedSizeError, ConfigSnapshot, ConfirmedCommitResolution,
-    DriftState, PublishedSnapshot, SealedConfig, StoreError, StoreErrorCode, StoredConfig,
-    StoredRequestFingerprint, StoredRequestMode,
+    AtomicConfigSnapshot, AuthorityMode, CommitAuditContext, CommitWrite, CommitWriteReceipt,
+    ConfigChange, ConfigEvent, ConfigEventRetainedSizeError, ConfigSnapshot,
+    ConfirmedCommitResolution, DriftState, PublishedSnapshot, SealedConfig, StoreError,
+    StoreErrorCode, StoredConfig, StoredRequestFingerprint, StoredRequestMode,
 };

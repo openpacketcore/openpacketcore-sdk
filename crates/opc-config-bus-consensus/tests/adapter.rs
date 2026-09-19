@@ -196,6 +196,12 @@ struct ProjectionCluster {
 
 impl ProjectionCluster {
     async fn start() -> Self {
+        Self::start_with_continuity(None).await
+    }
+
+    async fn start_with_continuity(
+        checkpoints: Option<Arc<dyn opc_persist::audit_authority::continuity::AuditCheckpointPort>>,
+    ) -> Self {
         let directory = tempfile::tempdir().expect("projection cluster directory");
         let nodes = [1_u64, 2, 3]
             .map(|value| ConfigConsensusNodeId::new(value).expect("projection cluster node ID"));
@@ -234,18 +240,37 @@ impl ProjectionCluster {
             )
             .await
             .expect("projection cluster backend");
-            stores.push(Arc::new(
-                ConsensusConfigStore::open_with_operation_timeout(
-                    ConfigConsensusTopology::try_new(identity, node, members.clone())
-                        .expect("projection cluster topology"),
+            let topology = ConfigConsensusTopology::try_new(identity, node, members.clone())
+                .expect("projection cluster topology");
+            let snapshots = directory.path().join(format!("snapshots-{index}"));
+            let store = if let Some(checkpoints) = &checkpoints {
+                use opc_persist::audit_authority::continuity::{
+                    AuditContinuityPolicy, AuditKeyRing, AuditSigningKey,
+                };
+                let keys = AuditKeyRing::new(vec![
+                    AuditSigningKey::new(1, [0x91; 32]).expect("separate signing key")
+                ])
+                .expect("key ring");
+                ConsensusConfigStore::open_with_audit_continuity(
+                    topology,
                     backend,
-                    directory.path().join(format!("snapshots-{index}")),
+                    snapshots,
+                    peers,
+                    AuditContinuityPolicy::new(keys, Arc::clone(checkpoints), 1, 1)
+                        .expect("continuity policy"),
+                )
+                .await
+            } else {
+                ConsensusConfigStore::open_with_operation_timeout(
+                    topology,
+                    backend,
+                    snapshots,
                     peers,
                     DURABLE_CONSENSUS_OPERATION_TIMEOUT,
                 )
                 .await
-                .expect("projection cluster store"),
-            ));
+            };
+            stores.push(Arc::new(store.expect("projection cluster store")));
         }
         for ((_, target), path) in &paths {
             path.install(stores[*target].rpc_handler()).await;
@@ -264,7 +289,23 @@ impl ProjectionCluster {
         one.expect("initialize projection node one");
         two.expect("initialize projection node two");
         three.expect("initialize projection node three");
-        cluster.wait_ready().await;
+        if checkpoints.is_some() {
+            // Required audit readiness deliberately stays closed until the
+            // separate ledger/checkpoint provisioning below the fixture.
+            tokio::time::timeout(Duration::from_secs(10), async {
+                while !cluster
+                    .stores
+                    .iter()
+                    .any(|store| store.status().leader_id.is_some())
+                {
+                    tokio::time::sleep(Duration::from_millis(25)).await;
+                }
+            })
+            .await
+            .expect("projection cluster leader before audit provisioning");
+        } else {
+            cluster.wait_ready().await;
+        }
         cluster
     }
 
@@ -788,3 +829,5 @@ async fn promoted_follower_reconciles_the_live_bus_before_writing() {
 
     cluster.shutdown().await;
 }
+
+mod management_audit;
