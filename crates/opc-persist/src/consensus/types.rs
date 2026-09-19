@@ -36,19 +36,20 @@ pub(crate) const ATOMIC_CONFIG_CONSENSUS_COMMAND_VERSION: u16 = 2;
 /// encrypted record. Revision 4 adds authenticated history retention. Revision 5
 /// adds the replicated management ledger and audited configuration effects.
 /// Revision 6 adds authenticated signing transitions, export acknowledgements
-/// and checkpoint-protected retention. Older
+/// and checkpoint-protected retention. Revision 7 separates verified-export
+/// retention authority from required mutation checkpoint advancement. Older
 /// commands remain readable under their original
 /// semantics so existing durable logs can be replayed after upgrade.
-pub const CONFIG_CONSENSUS_COMMAND_VERSION: u16 = 6;
+pub const CONFIG_CONSENSUS_COMMAND_VERSION: u16 = 7;
 /// Current SQLite authority schema revision.
-pub const CONFIG_CONSENSUS_STORAGE_VERSION: u16 = 4;
+pub const CONFIG_CONSENSUS_STORAGE_VERSION: u16 = 5;
 /// Current config snapshot envelope revision.
-pub const CONFIG_CONSENSUS_SNAPSHOT_VERSION: u16 = 4;
+pub const CONFIG_CONSENSUS_SNAPSHOT_VERSION: u16 = 5;
 /// Current config-specific RPC payload revision.
 ///
-/// Revision 6 carries the revision-6 command admission contract. Peers require
+/// Revision 7 carries the revision-7 command admission contract. Peers require
 /// an exact match and do not negotiate a downgrade.
-pub const CONFIG_CONSENSUS_WIRE_VERSION: u16 = 6;
+pub const CONFIG_CONSENSUS_WIRE_VERSION: u16 = 7;
 
 /// Maximum configured voter count admitted by the config consensus adapter.
 pub const CONFIG_CONSENSUS_MAX_MEMBERS: usize = 9;
@@ -366,6 +367,7 @@ impl ConfigMutationIntent {
                 | super::audit::AuditCommand::Intent(_)
                 | super::audit::AuditCommand::Reject(_)
                 | super::audit::AuditCommand::Terminal(_) => 5,
+                super::audit::AuditCommand::AcknowledgeExport(_) => 7,
                 _ => 6,
             },
         }
@@ -462,6 +464,7 @@ impl ConfigConsensusCommand {
             3 => self.intent.minimum_command_version() <= 3,
             4 => self.intent.minimum_command_version() <= 4,
             5 => self.intent.minimum_command_version() <= 5,
+            6 => self.intent.minimum_command_version() <= 6,
             CONFIG_CONSENSUS_COMMAND_VERSION => true,
             _ => false,
         };
@@ -840,7 +843,7 @@ mod tests {
 
     #[test]
     fn config_wire_revision_is_independent_and_exact() {
-        assert_eq!(6, CONFIG_CONSENSUS_WIRE_VERSION);
+        assert_eq!(7, CONFIG_CONSENSUS_WIRE_VERSION);
         let current = encode_config_wire(&7_u64).expect("current wire");
         assert_eq!(
             7,
@@ -970,11 +973,38 @@ mod tests {
         }
         command.schema_version = 6;
         assert!(command.validate(identity).is_ok());
+        let keys = crate::audit_authority::continuity::AuditKeyRing::new(vec![
+            crate::audit_authority::continuity::AuditSigningKey::new(1, [0x93; 32]).unwrap(),
+        ])
+        .unwrap();
+        let checkpoint = crate::audit_authority::continuity::AuditCheckpoint::issue(
+            &keys,
+            crate::audit_authority::continuity::checkpoint::CheckpointBody {
+                version: 1,
+                identity,
+                sequence: 0,
+                root_anchor: [0; 32],
+                anchor: [0; 32],
+                epoch_at_sequence: 1,
+                signing_epoch: 1,
+                acknowledged_export: [0x94; 32],
+            },
+        )
+        .unwrap();
+        command.intent = ConfigMutationIntent::ManagementAudit(
+            super::super::audit::AuditCommand::AcknowledgeExport(checkpoint),
+        );
+        for revision in 1..7 {
+            command.schema_version = revision;
+            assert!(command.validate(identity).is_err());
+        }
+        command.schema_version = 7;
+        assert!(command.validate(identity).is_ok());
     }
 
     #[test]
     fn older_persisted_commands_decode_but_cannot_claim_newer_intents() {
-        assert_eq!(6, CONFIG_CONSENSUS_COMMAND_VERSION);
+        assert_eq!(7, CONFIG_CONSENSUS_COMMAND_VERSION);
         let identity = ConfigConsensusIdentity::new(
             ConfigConsensusClusterId::new("config-command-v1-replay-test").expect("cluster"),
             ConfigConsensusConfigurationId::from_bytes([0xB1; 32]),

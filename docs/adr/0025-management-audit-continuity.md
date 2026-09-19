@@ -111,18 +111,35 @@ have existed in a lost suffix, so expiration cannot classify that intent as
 rejected. This is explicit recovery-required state; preserve the database and
 external checkpoint and recover the authoritative outcome. A retained committed
 or rejected outcome can still reopen and finish its terminal obligation. This
-guard does not supply automatic per-mutation checkpoint advancement or protect
-an intent that was never independently checkpointed; those ordering guarantees
-remain separate from export-prefix acknowledgement.
+guard is paired with required mutation ordering: after exact intent admission,
+submission first advances and independently reads back that intent's prefix,
+then records the checkpoint through consensus. The state machine also refuses
+an effect whose intent lacks that recorded proof. Thus no admitted configuration
+effect can depend on an uncheckpointed reservation. Uncheckpointed standalone
+observations do not acquire that mutation guarantee.
 
-After complete export verification, acknowledgement verifies the same prefix,
-CAS-advances the external checkpoint, reads it back and commits that exact value
-locally. A newer independently verified checkpoint may subsume an older export.
-Competing equal-sequence exports reconcile to the already established mark;
-they cannot replace it. Lost external or consensus acknowledgements retain an
+The continuity-enabled ConfigBus adapter completes the known outcome's terminal
+record and checkpoint before an ordinary healthy reply. If completion fails
+after a known commit, it preserves the committed result and emits only the fixed
+`configuration_audit_terminal_checkpoint_pending` code. The retained operation
+blocks new mutation admission and effects, including through another voter.
+The bounded recovery pass includes terminal rows awaiting their checkpoint;
+it settles the same operation without reapplying configuration. Configuration
+quorum readiness remains distinct from this mutation-admission gate and does
+not claim the absence of audit completion debt. Without the explicit continuity
+profile, the existing asynchronous terminal-obligation contract is unchanged.
+
+Mutation checkpointing does not authorize retention. A separate authenticated
+export checkpoint is committed only after complete export verification.
+Acknowledgement verifies that exported prefix, CAS-advances the external
+checkpoint when necessary, independently reads it back, and records the export
+receipt through consensus. A newer independently verified checkpoint may subsume an older export.
+An export of a prefix already covered by automatic mutation checkpointing still
+needs its separate export receipt. Competing equal-sequence exports reconcile
+to the already established external mark; they cannot replace it. Lost external or consensus acknowledgements retain an
 uncertain result until readback/retry succeeds.
 
-Explicit prefix pruning requires that acknowledged checkpoint, no unresolved
+Explicit prefix pruning requires that separately acknowledged export checkpoint, no unresolved
 operation, no operation crossing the cut, and expiry of every included handle.
 The same consensus transaction removes complete operations, advances the
 authenticated floor/epoch and preserves the remaining ordered rows. A pruned
@@ -132,10 +149,12 @@ no automatic discard, unbounded spill, or second persistence owner.
 
 ## Representation and compatibility
 
-Configuration command/RPC revision 6 adds these continuity commands. Revisions
-1 through 5 keep their original semantics and ordinal encodings; the earlier
-audit commands still require revision 5. Configuration storage/snapshot
-representation 4 authenticates the additional continuity state. Earlier storage
+Configuration command/RPC revision 7 adds the distinct export-acknowledgement
+command. Revision 6's continuity commands and revisions 1 through 5 keep their
+original ordinal encodings and admission versions; the earlier audit commands
+still require revision 5. Configuration storage/snapshot representation 5
+authenticates separate mutation and export checkpoint state (continuity
+representation 2). Earlier storage
 representations are refused, without a decoder fallback, silent reset or
 automatic migration. Preserve retained state and use an explicitly reviewed
 cutover before deployment. These revisions do not change session WAL or the

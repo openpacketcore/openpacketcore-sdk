@@ -108,6 +108,92 @@ fn verify_export(
     verify.finish().unwrap()
 }
 
+#[tokio::test]
+async fn automatic_mutation_checkpoint_never_grants_export_retention_authority() {
+    let dir = tempfile::tempdir().unwrap();
+    let external = Arc::new(ExternalCheckpointFixture::default());
+    let store = open(
+        &dir.path().join("authority.sqlite"),
+        &dir.path().join("snapshots"),
+        external.clone(),
+        &[1, 2],
+        true,
+    )
+    .await
+    .unwrap();
+    store.initialize_cluster().await.unwrap();
+    store
+        .initialize_audit_authority(&privacy(), AuditLedgerLimits::new(6, 2).unwrap())
+        .await
+        .unwrap();
+    let tx = TxId::new();
+    let prepared = store
+        .prepare_audited_commit(
+            &privacy(),
+            &source_event(94, ManagementAuditOutcomeCode::Intent),
+            attested(commit(tx, None, 1, 7), audit(tx)),
+            Duration::from_secs(3),
+        )
+        .unwrap();
+    let intent = applied(
+        store
+            .admit_audit_operation(prepared.handle(), caller())
+            .await,
+    );
+    let committed = applied(
+        store
+            .submit_audited_mutation(&prepared, &intent, caller())
+            .await,
+    );
+    store
+        .complete_required_audit_outcome(&committed, caller())
+        .await
+        .unwrap();
+    assert_eq!(
+        external.value.lock().unwrap().as_ref().unwrap().sequence(),
+        3
+    );
+    tokio::time::sleep(Duration::from_millis(3100)).await;
+    assert!(
+        store.retain_audit_history_through(3).await.is_err(),
+        "a mutation checkpoint is not proof of complete export"
+    );
+    assert_eq!(store.load_latest().await.unwrap().unwrap().record.tx_id, tx);
+    let export = store
+        .freeze_audit_export(caller(), 0, Duration::from_secs(60))
+        .await
+        .unwrap();
+    let verified = verify_export(&export, topology().identity(), &[1, 2]);
+    store
+        .acknowledge_audit_export(&verified, caller())
+        .await
+        .unwrap();
+    assert_eq!(
+        external.value.lock().unwrap().as_ref().unwrap().sequence(),
+        3,
+        "equal-tail export acknowledgement cannot overwrite the external checkpoint"
+    );
+    store.retain_audit_history_through(3).await.unwrap();
+    assert!(
+        matches!(
+            store
+                .freeze_audit_export(caller(), 0, Duration::from_secs(60))
+                .await,
+            Err(AuditAuthorityError::Full)
+        ),
+        "frozen export still owns its one-slot capacity"
+    );
+    drop(export);
+    assert!(matches!(
+        store
+            .freeze_audit_export(caller(), 0, Duration::from_secs(60))
+            .await,
+        Err(AuditAuthorityError::Pruned)
+    ));
+    assert_eq!(store.load_latest().await.unwrap().unwrap().record.tx_id, tx);
+    store.shutdown().await.unwrap();
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn rotation_and_export_remain_one_history_across_ack_loss_and_leader_change() {
     let external = Arc::new(ExternalCheckpointFixture::default());

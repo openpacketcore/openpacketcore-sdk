@@ -121,15 +121,37 @@ impl ConfigAuditPolicy {
         {
             AuditAdmission::Applied(receipt) => match receipt.state() {
                 AuditOperationState::Committed { version: committed } if committed == version => {
-                    // Outcome and reserved terminal obligation are already in
-                    // the same durable transaction as the encrypted config.
-                    // Recovery finishes that obligation; no second write/read
-                    // can turn this known result into an ordinary failure.
+                    // Required continuity normally completes before reply. A
+                    // failed terminal/checkpoint write cannot turn this known
+                    // commit into rejection: its exact debt fences subsequent
+                    // mutations and remains discoverable by the supervisor.
+                    if store
+                        .complete_required_audit_outcome(&receipt, caller)
+                        .await
+                        .is_err()
+                    {
+                        tracing::warn!(
+                            reason = "configuration_audit_terminal_checkpoint_pending",
+                            "committed configuration retains required audit completion"
+                        );
+                    }
                     Ok(())
                 }
-                AuditOperationState::Rejected => Err(StoreError::unavailable(
-                    "audited configuration mutation refused",
-                )),
+                AuditOperationState::Rejected => {
+                    if store
+                        .complete_required_audit_outcome(&receipt, caller)
+                        .await
+                        .is_err()
+                    {
+                        tracing::warn!(
+                            reason = "configuration_audit_terminal_checkpoint_pending",
+                            "rejected configuration retains required audit completion"
+                        );
+                    }
+                    Err(StoreError::unavailable(
+                        "audited configuration mutation refused",
+                    ))
+                }
                 _ => Err(StoreError::outcome_unknown(
                     "audited configuration result unresolved",
                 )),

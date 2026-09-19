@@ -4,7 +4,7 @@ use opc_persist::audit_authority::continuity::{
     AuditKeyRing, AuditSigningKey,
 };
 use opc_persist::audit_authority::{AuditAuthorityError, AuditCaller};
-use std::sync::atomic::AtomicUsize;
+use std::sync::atomic::{AtomicU64, AtomicUsize};
 
 // Synthetic separately owned monotonic authority, never a production provider.
 #[derive(Default)]
@@ -13,6 +13,8 @@ struct CheckpointFixture {
     unavailable: AtomicBool,
     advance_unavailable: AtomicBool,
     advance_attempts: AtomicUsize,
+    refuse_from_sequence: AtomicU64,
+    lose_next_ack: AtomicBool,
 }
 
 #[async_trait::async_trait]
@@ -36,6 +38,8 @@ impl AuditCheckpointPort for CheckpointFixture {
         self.advance_attempts.fetch_add(1, Ordering::AcqRel);
         if self.unavailable.load(Ordering::Acquire)
             || self.advance_unavailable.load(Ordering::Acquire)
+            || (self.refuse_from_sequence.load(Ordering::Acquire) != 0
+                && next.sequence() >= self.refuse_from_sequence.load(Ordering::Acquire))
         {
             return Err(AuditAuthorityError::Unavailable);
         }
@@ -48,7 +52,11 @@ impl AuditCheckpointPort for CheckpointFixture {
             return Ok(AuditCheckpointAdvance::Conflict);
         }
         *current = Some(next);
-        Ok(AuditCheckpointAdvance::Applied)
+        Ok(if self.lose_next_ack.swap(false, Ordering::AcqRel) {
+            AuditCheckpointAdvance::Unknown
+        } else {
+            AuditCheckpointAdvance::Applied
+        })
     }
 }
 
@@ -113,6 +121,7 @@ async fn config_bus_required_continuity_refuses_checkpoint_outage_before_config_
     assert_eq!(stored.config.name, "revision-1");
 
     checkpoints.unavailable.store(false, Ordering::Release);
+    checkpoints.lose_next_ack.store(true, Ordering::Release);
     let result = bus.submit(request()).await.expect("checkpoint restored");
     assert_eq!(result.new_version, Some(ConfigVersion::new(2)));
     assert_eq!(
@@ -128,8 +137,95 @@ async fn config_bus_required_continuity_refuses_checkpoint_outage_before_config_
         .reconcile_audit_obligations(3)
         .await
         .expect("recovery");
-    assert_eq!(progress.completed, 2);
+    assert_eq!(progress.completed, 0);
+    assert_eq!(checkpoints.sequence(), 6);
     assert_eq!((progress.pending, progress.unknown), (0, 0));
+    cluster.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn committed_terminal_checkpoint_debt_fences_new_writes_until_exact_recovery() {
+    let checkpoints = Arc::new(CheckpointFixture::default());
+    let cluster = ProjectionCluster::start_with_continuity(Some(checkpoints.clone())).await;
+    let authority = Arc::clone(&cluster.stores[cluster.leader()]);
+    let privacy = Arc::new(AuditPrivacyKey::new([0x81; 32]).expect("privacy key"));
+    authority
+        .initialize_audit_authority(privacy.as_ref(), AuditLedgerLimits::new(12, 4).unwrap())
+        .await
+        .unwrap();
+    cluster.wait_ready().await;
+    let source = audited_source(Arc::clone(&authority), privacy);
+    source
+        .append_commit(projection_record(TxId::new(), None, 1, "revision-1"))
+        .await
+        .unwrap();
+    let bus = ConfigBus::restore_or_new_dev_only(
+        TestConfig {
+            name: "initial".into(),
+        },
+        Arc::clone(&source),
+    )
+    .await
+    .unwrap();
+    assert_eq!(checkpoints.sequence(), 3);
+
+    // Intent 4 can be independently reserved, but terminal 6 cannot. The
+    // authoritative commit must remain truthful, with no new mutation admitted.
+    checkpoints.refuse_from_sequence.store(6, Ordering::Release);
+    let committed = bus.submit(next_checkpointed_request()).await.unwrap();
+    assert_eq!(committed.new_version, Some(ConfigVersion::new(2)));
+    assert_eq!(checkpoints.sequence(), 4);
+    let next = || {
+        CommitRequest::commit(
+            RequestId::new(),
+            principal(),
+            TransportType::Gnmi,
+            RequestSource::Northbound,
+            ConfigOperation::Replace,
+            TestConfig {
+                name: "revision-3".into(),
+            },
+            Vec::new(),
+            Instant::now() + Duration::from_secs(5),
+        )
+        .with_base_version(ConfigVersion::new(2))
+    };
+    let before = checkpoints.advance_attempts.load(Ordering::Acquire);
+    assert!(bus.submit(next()).await.is_err());
+    assert_eq!(checkpoints.advance_attempts.load(Ordering::Acquire), before);
+    assert_eq!(bus.version(), ConfigVersion::new(2));
+    assert_eq!(
+        source.load_committed_latest().await.unwrap().unwrap().tx_id,
+        committed.tx_id
+    );
+    let pending = authority.reconcile_audit_obligations(4).await.unwrap();
+    assert_eq!(
+        (pending.completed, pending.pending, pending.unknown),
+        (0, 0, 1)
+    );
+
+    checkpoints.refuse_from_sequence.store(0, Ordering::Release);
+    let recovered = authority.reconcile_audit_obligations(4).await.unwrap();
+    assert_eq!(
+        (recovered.completed, recovered.pending, recovered.unknown),
+        (1, 0, 0)
+    );
+    assert_eq!(checkpoints.sequence(), 6);
+    assert_eq!(
+        authority
+            .reconcile_audit_obligations(4)
+            .await
+            .unwrap()
+            .inspected,
+        0
+    );
+    assert_eq!(
+        source.load_committed_latest().await.unwrap().unwrap().tx_id,
+        committed.tx_id
+    );
+    let successor = bus.submit(next()).await.unwrap();
+    assert_eq!(successor.new_version, Some(ConfigVersion::new(3)));
+    assert_eq!(checkpoints.sequence(), 9);
     cluster.shutdown().await;
 }
 
@@ -224,9 +320,9 @@ async fn required_checkpoint_advance_failure_forbids_config_effect() {
         authority
             .reconcile_audit_obligations(3)
             .await
-            .expect("bootstrap terminal")
+            .expect("bootstrap terminal already checkpointed")
             .completed,
-        1
+        0
     );
     acknowledge_current_prefix(&authority, &privacy)
         .await
@@ -260,6 +356,10 @@ async fn required_checkpoint_advance_failure_forbids_config_effect() {
     cluster.shutdown().await;
 
     assert!(
+        attempted > 0,
+        "must attempt independent reservation before effect"
+    );
+    assert!(
         result.is_err() && bus_revision == 1 && durable_revision == 1,
         "checkpoint advance refusal must prevent configuration effect: success={}, bus_revision={bus_revision}, durable_revision={durable_revision}, external_sequence={sequence}, advance_attempts={attempted}",
         result.is_ok()
@@ -289,9 +389,9 @@ async fn required_checkpoint_terminal_precedes_healthy_commit_acknowledgement() 
         authority
             .reconcile_audit_obligations(3)
             .await
-            .expect("bootstrap terminal")
+            .expect("bootstrap terminal already checkpointed")
             .completed,
-        1
+        0
     );
     acknowledge_current_prefix(&authority, &privacy)
         .await

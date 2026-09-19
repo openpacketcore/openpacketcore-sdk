@@ -122,6 +122,52 @@ pub(super) async fn verify_startup(
 }
 
 impl ConsensusConfigStore {
+    // Advancing mutation continuity never acknowledges an export. Retention
+    // uses the separately committed export receipt below, even at an equal tail.
+    pub(super) async fn checkpoint_audit_tail(&self) -> Result<(), AuditAuthorityError> {
+        let policy = self
+            .inner
+            .audit_continuity
+            .as_ref()
+            .ok_or(AuditAuthorityError::Unavailable)?;
+        let ledger = self.read_audit_ledger().await?;
+        let chain = ledger
+            .continuity
+            .as_ref()
+            .ok_or(AuditAuthorityError::Unavailable)?;
+        if chain
+            .checkpoint
+            .as_ref()
+            .is_some_and(|checkpoint| checkpoint.sequence() == ledger.sequence)
+        {
+            return Ok(());
+        }
+        let next = AuditCheckpoint::issue(
+            &policy.keys,
+            CheckpointBody {
+                version: 1,
+                identity: self.inner.identity,
+                sequence: ledger.sequence,
+                root_anchor: ledger.terminal,
+                anchor: chain.terminal,
+                epoch_at_sequence: chain.active_epoch,
+                signing_epoch: chain.active_epoch,
+                acknowledged_export: [0; 32],
+            },
+        )?;
+        let current = load_external(policy, self.inner.identity, self.inner.operation_timeout)
+            .await?
+            .ok_or(AuditAuthorityError::Unavailable)?;
+        verify_external(&ledger, &policy.keys, Some(&current))?;
+        let checkpoint = if current.sequence() >= next.sequence() {
+            current
+        } else {
+            self.advance_external(&ledger, Some(current), next).await?
+        };
+        self.audit_maintenance(AuditCommand::Checkpoint(checkpoint))
+            .await
+    }
+
     /// Open with required, separate management signing and external monotonic
     /// checkpoint providers. Existing continuity state cannot be opened through
     /// the ordinary constructor or reset by a different initial epoch. A stale
@@ -372,9 +418,12 @@ impl ConsensusConfigStore {
         let checkpoint = if current.sequence() >= next.sequence() {
             current
         } else {
-            self.advance_external(&ledger, Some(current), next).await?
+            self.advance_external(&ledger, Some(current), next.clone())
+                .await?
         };
         self.audit_maintenance(AuditCommand::Checkpoint(checkpoint))
+            .await?;
+        self.audit_maintenance(AuditCommand::AcknowledgeExport(next))
             .await
     }
 
@@ -389,7 +438,7 @@ impl ConsensusConfigStore {
         let checkpoint = ledger
             .continuity
             .as_ref()
-            .and_then(|chain| chain.checkpoint.clone())
+            .and_then(|chain| chain.export_checkpoint.clone())
             .ok_or(AuditAuthorityError::Unavailable)?;
         if through > checkpoint.sequence() {
             return Err(AuditAuthorityError::BindingMismatch);

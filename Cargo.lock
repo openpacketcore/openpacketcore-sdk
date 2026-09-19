@@ -2636,6 +2636,7 @@ dependencies = [
  "time",
  "tokio",
  "tokio-rustls",
+ "tracing",
  "uuid",
  "zeroize",
 ]
