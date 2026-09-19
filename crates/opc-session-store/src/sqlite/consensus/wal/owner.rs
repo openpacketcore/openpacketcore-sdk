@@ -206,16 +206,27 @@ impl NativeOwner {
             };
         }
         #[cfg(any(test, feature = "test-control"))]
-        if let Some(hook) = self.generation_hook.lock().unwrap().clone() {
-            return IoControl {
-                hook: Arc::new(move |point| {
-                    if point == super::Point::BeforeNativeGenerationAppend {
-                        hook()?;
-                    }
-                    Ok(())
-                }),
-                ..IoControl::default()
+        {
+            let hook = match self.generation_hook.lock() {
+                Ok(slot) => slot.clone(),
+                Err(_) => {
+                    return IoControl {
+                        hook: Arc::new(|_| Err(invalid_data("native test fault lock poisoned"))),
+                        ..IoControl::default()
+                    };
+                }
             };
+            if let Some(hook) = hook {
+                return IoControl {
+                    hook: Arc::new(move |point| {
+                        if point == super::Point::BeforeNativeGenerationAppend {
+                            hook()?;
+                        }
+                        Ok(())
+                    }),
+                    ..IoControl::default()
+                };
+            }
         }
         IoControl::default()
     }
