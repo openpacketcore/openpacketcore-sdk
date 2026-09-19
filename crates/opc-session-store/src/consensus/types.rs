@@ -2157,6 +2157,17 @@ pub enum SessionMutationIntent {
     /// does not alter the terminal variant's durable field sequence.
     #[doc(hidden)]
     FinalizeOperatorRecoveryV2(Box<FinalizeOperatorRecoveryV2Intent>),
+    /// Internal boundary selected by the unanimous Async recovery protocol.
+    /// Ordinary and administrative mutation APIs reject this intent. Its
+    /// application requires the local durable reservation and exact recovery
+    /// plan; the command alone is never recovery authority.
+    #[doc(hidden)]
+    AsyncRecoveryBoundary {
+        /// Successor authority reservation, durably promised by every voter.
+        era: u64,
+        /// Commitment to every exact prepared member and retained log cut.
+        plan: [u8; 32],
+    },
 }
 
 /// Exact, self-contained precondition and effect request for the appended

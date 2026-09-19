@@ -99,6 +99,8 @@ pub(crate) fn original_install(
         basis: [0xE9; 32],
         native: true,
         persistence: crate::SessionPersistenceMode::Async,
+        async_closed_format: false,
+        async_recovery_format: false,
     };
     let origin = {
         let conn = connection.blocking_lock();

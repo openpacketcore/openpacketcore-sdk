@@ -33,6 +33,12 @@ impl ConsumerReceiptStore for ConsumerReceipts<'_> {
             return Ok(None);
         };
         validation::validate_generic(&id, receipt, &self.state.frontiers)?;
+        if receipt
+            .response()
+            .is_some_and(|response| self.state.frontiers.async_retires_response(response))
+        {
+            return Ok(None);
+        }
         match &**receipt {
             NativeGenericReceipt::Ordinary(row) => Ok(Some((
                 row.payload_digest,
@@ -121,7 +127,13 @@ impl NativeState {
         limit: usize,
         check: &dyn Fn() -> io::Result<()>,
     ) -> Result<Vec<ReplicationEntry>, StoreError> {
-        let range = crate::backend::ReplicationLogRange::try_new(start, limit)?;
+        let original = crate::backend::ReplicationLogRange::try_new(start, limit)?;
+        let floor = self.frontiers.async_fence_floor();
+        original.ensure_not_compacted(floor)?;
+        let first = (original.first_sequence() - floor)
+            .checked_add(self.frontiers.async_watch_before())
+            .ok_or_else(unavailable)?;
+        let range = crate::backend::ReplicationLogRange::try_new(first, limit)?;
         if range.is_empty() || range.first_sequence() > self.frontiers.watch_sequence {
             return Ok(Vec::new());
         }
@@ -190,7 +202,9 @@ impl NativeState {
             output_bytes = output_bytes
                 .checked_sub(bytes)
                 .ok_or_else(|| invalid("native journal output exceeds preflight"))?;
-            result.push(owned::notification(entry)?);
+            let mut outward = owned::notification(entry)?;
+            outward.sequence = self.frontiers.outward_watch(outward.sequence)?;
+            result.push(outward);
             sequence = sequence
                 .checked_add(1)
                 .ok_or_else(|| invalid("native journal sequence overflow"))?;
@@ -250,7 +264,10 @@ impl NativeState {
     }
 
     pub(crate) fn watch_sequence(&self) -> u64 {
-        self.frontiers.watch_sequence
+        // Admission independently checks this addition against the reserved
+        // range and the complete physical notification inventory.
+        self.frontiers.async_fence_floor() + self.frontiers.watch_sequence
+            - self.frontiers.async_watch_before()
     }
 }
 

@@ -26,8 +26,12 @@ use crate::topology::{
 use crate::{SessionAsyncRecoveryState, SnapshotIntegrityPolicy};
 
 mod admission;
+mod authority_reservation;
 mod bootstrap;
+mod closed;
 mod initialization;
+mod majority_authority;
+mod majority_protocol;
 mod races;
 mod snapshots;
 mod writer;
@@ -43,6 +47,7 @@ struct Peer {
     successful_appends: AtomicU64,
     last_cut: Mutex<Option<ColdQuorumCut>>,
     blocked_senders: Mutex<BTreeSet<SessionConsensusNodeId>>,
+    blocked_votes: AtomicBool,
     blocked_append_above: Mutex<Option<(SessionConsensusNodeId, u64)>>,
     held_reply: Mutex<Option<Arc<races::ReplyHold>>>,
     cut_mutation: Mutex<Option<admission::CutMutation>>,
@@ -67,6 +72,11 @@ impl SessionConsensusPeer for Peer {
         &self,
         request: SessionConsensusWireRequest,
     ) -> Result<SessionConsensusWireResponse, SessionConsensusPeerError> {
+        if request.family == SessionConsensusRpcFamily::Vote
+            && self.blocked_votes.load(Ordering::Acquire)
+        {
+            return Err(SessionConsensusPeerError::Unavailable);
+        }
         if self
             .blocked_senders
             .lock()
@@ -102,16 +112,18 @@ impl SessionConsensusPeer for Peer {
         }
         let hold = self.held_reply.lock().unwrap().clone();
         let held_request = hold.as_ref().map(|_| request.clone());
-        let handler = self
-            .handler
-            .read()
-            .await
+        // Retiring this transport must join accepted handler calls, as the
+        // real server's abort_and_wait does. Keep this read lease until the
+        // handler returns; a detached cached reply owns no store handle.
+        let installed = self.handler.read().await;
+        let handler = installed
             .clone()
             .ok_or(SessionConsensusPeerError::Unavailable)?;
         let mut response = handler.handle(request.sender, request).await;
         // A cached network response must not retain the predecessor store
         // while the test closes and reopens that ordinary public owner.
         drop(handler);
+        drop(installed);
         if let (Some(hold), Some(request)) = (hold, held_request) {
             hold.after_response(request, &response).await;
         }
@@ -159,6 +171,10 @@ struct Fleet {
 
 impl Fleet {
     fn new(voters: usize) -> Self {
+        Self::with_roster_root(voters, None)
+    }
+
+    fn with_roster_root(voters: usize, root: Option<crate::RosterAttestationTrustRootV1>) -> Self {
         let directory = tempfile::tempdir().unwrap();
         let members = (0..voters)
             .map(|index| {
@@ -172,7 +188,7 @@ impl Fleet {
             })
             .collect::<Vec<_>>();
         let placement = PlacementResiliencePolicy::AllowReducedResilience;
-        let identity = crate::derive_fixed_durable_quorum_consensus_identity(
+        let identity = crate::topology::derive_fixed_durable_quorum_consensus_identity_with_roster_attestation_root(
             ConsensusClusterId::new("async-public-fixed").unwrap(),
             ConsensusConfigurationEpoch::new(1).unwrap(),
             &members
@@ -180,17 +196,21 @@ impl Fleet {
                 .map(QuorumReplicaDescriptor::configuration_fingerprint)
                 .collect::<Vec<_>>(),
             placement,
+            root.as_ref(),
         );
         let topologies = members
             .iter()
             .map(|member| {
+                let mut config = QuorumTopologyConfig::new_consensus(
+                    member.replica_id().clone(),
+                    members.clone(),
+                    identity,
+                );
+                if let Some(root) = &root {
+                    config = config.with_roster_attestation_trust_root(root.clone());
+                }
                 ValidatedQuorumTopology::try_from_fixed_durable_quorum_with_placement_policy(
-                    QuorumTopologyConfig::new_consensus(
-                        member.replica_id().clone(),
-                        members.clone(),
-                        identity,
-                    ),
-                    placement,
+                    config, placement,
                 )
                 .unwrap()
             })
@@ -206,6 +226,7 @@ impl Fleet {
                     successful_appends: AtomicU64::new(0),
                     last_cut: Mutex::new(None),
                     blocked_senders: Mutex::new(BTreeSet::new()),
+                    blocked_votes: AtomicBool::new(false),
                     blocked_append_above: Mutex::new(None),
                     held_reply: Mutex::new(None),
                     cut_mutation: Mutex::new(None),
@@ -257,6 +278,27 @@ impl Fleet {
         hook: Option<GenerationHook>,
         root_hook: Option<crate::sqlite::consensus::wal::owner::RootHookForTest>,
     ) -> Result<(), ConsensusSessionStoreOpenError> {
+        self.open_with_all_hooks(index, mode, hook, root_hook, None)
+            .await
+    }
+
+    async fn open_with_io_hook(
+        &mut self,
+        index: usize,
+        hook: crate::sqlite::consensus::wal::owner::IoHookForTest,
+    ) -> Result<(), ConsensusSessionStoreOpenError> {
+        self.open_with_all_hooks(index, SessionPersistenceMode::Async, None, None, Some(hook))
+            .await
+    }
+
+    async fn open_with_all_hooks(
+        &mut self,
+        index: usize,
+        mode: SessionPersistenceMode,
+        hook: Option<GenerationHook>,
+        root_hook: Option<crate::sqlite::consensus::wal::owner::RootHookForTest>,
+        io_hook: Option<crate::sqlite::consensus::wal::owner::IoHookForTest>,
+    ) -> Result<(), ConsensusSessionStoreOpenError> {
         assert!(self.stores[index].is_none());
         let backend =
             SqliteSessionBackend::open(self.directory.path().join(format!("node-{index}.sqlite")))
@@ -274,6 +316,13 @@ impl Fleet {
                 .as_ref()
                 .unwrap()
                 .set_root_hook_for_test(hook);
+        }
+        if let Some(hook) = io_hook {
+            backend
+                .native_owner
+                .as_ref()
+                .unwrap()
+                .set_io_hook_for_test(hook);
         }
         let peers = self
             .peers
@@ -390,6 +439,17 @@ impl Fleet {
     }
 
     async fn close_result(&mut self, index: usize) -> Result<(), StoreError> {
+        *self.peers[index].handler.write().await = None;
+        if let Some(store) = self.stores[index].take() {
+            // These pre-existing fixtures deliberately exercise uncertified
+            // cold incarnations. Join every real owner, but omit only the new
+            // close certificate. This is not a power-loss simulation.
+            return store.shutdown_with_closed_proof(false).await;
+        }
+        Ok(())
+    }
+
+    async fn close_clean(&mut self, index: usize) -> Result<(), StoreError> {
         *self.peers[index].handler.write().await = None;
         if let Some(store) = self.stores[index].take() {
             return store.shutdown().await;
@@ -744,20 +804,9 @@ async fn async_persistence_all_cold_roots_withhold_votes_and_restored_leader_tra
         );
         assert!(restored.inner.raft.metrics().borrow().vote.is_committed());
         restored.inner.raft.trigger().elect().await.unwrap();
-        let results = join_all(
-            fleet
-                .stores
-                .iter()
-                .flatten()
-                .map(ConsensusSessionStore::initialize_cluster),
-        )
-        .await;
-        assert!(
-            results
-                .iter()
-                .all(|result| *result == Err(ConsensusSessionStoreOpenError::RecoveryRequired)),
-            "all-cold results: {results:?}"
-        );
+        // A restored vote or an ordinary manual campaign grants nothing.
+        // Recovery must first prepare new authority with every retained owner.
+        tokio::time::sleep(Duration::from_millis(30)).await;
         assert_eq!(
             fleet.engine_calls_from(former_leader),
             before,
@@ -777,6 +826,18 @@ async fn async_persistence_all_cold_roots_withhold_votes_and_restored_leader_tra
                 FixedQuorumTrafficAuthority::RecoveryRequired
             );
         }
+        majority_protocol::recover(&fleet).await;
+        let store = fleet.store(fleet.leader());
+        let request = create_request(store, 126, &provider()).await;
+        let lease = store
+            .acquire(
+                request.lease().key(),
+                OwnerId::new("all-cold-successor").unwrap(),
+                Duration::from_secs(60),
+            )
+            .await
+            .unwrap();
+        store.release(lease).await.unwrap();
     })
     .catch_unwind()
     .await;
@@ -903,6 +964,13 @@ async fn async_persistence_wire_bounds_full_lineage_and_attempt_replacement() {
         persistence_protocol::unwrap_payload(SessionPersistenceMode::Durable, &tagged).is_err()
     );
     assert!(decode_bounded::<VoteRequest<SessionConsensusNodeId>>(&tagged).is_err());
+    let mut old_wire = b"\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xffOPC-ASYNC-1\0".to_vec();
+    old_wire.extend_from_slice(&encoded);
+    assert!(
+        persistence_protocol::unwrap_payload(SessionPersistenceMode::Async, &old_wire).is_err()
+    );
+    assert!(decode_bounded::<VoteRequest<SessionConsensusNodeId>>(&old_wire).is_err());
+
     let overhead = tagged.len() - encoded.len();
     let largest = vec![0; family.max_request_payload_bytes() - overhead];
     assert!(persistence_protocol::payload_fits(
@@ -963,7 +1031,7 @@ async fn async_persistence_wire_bounds_full_lineage_and_attempt_replacement() {
         .is_none());
     protocol.accept_cut_before(cut, deadline).await.unwrap();
     let guard = protocol.engine_before(deadline).await.unwrap();
-    assert!(!guard.permits_vote());
+    assert!(!guard.permits_vote(&VoteRequest::new(cut.vote, Some(cut.barrier))));
     assert!(guard.request_cold_repair());
     for wrong in [
         LogId::new(CommittedLeaderId::new(9, leader), 7),

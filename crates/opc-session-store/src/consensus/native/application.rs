@@ -96,6 +96,13 @@ impl ApplicationCapture {
 }
 
 impl ApplicationPublication {
+    pub(crate) fn check_async_reservation(
+        &self,
+        reservation: crate::sqlite::consensus::wal::async_authority::Reservation,
+    ) -> io::Result<()> {
+        self.0.check_async_reservation(reservation)
+    }
+
     pub(crate) fn is_current(&self, state: &NativeState) -> io::Result<bool> {
         self.0.is_current(state)
     }

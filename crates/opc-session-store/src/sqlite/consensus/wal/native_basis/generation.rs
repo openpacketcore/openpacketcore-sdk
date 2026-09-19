@@ -186,7 +186,7 @@ pub(in crate::sqlite::consensus::wal) fn bootstrap(
     selected.repair(&final_path, &|| Ok(()))?;
     native.begin_changes()?;
     checkpoint::select(&disk.directory, &anchor, control)?;
-    checkpoint::reclaim_covered(disk, &anchor, control)?;
+    checkpoint::reclaim_covered(disk, &anchor, control, binding.async_recovery_format)?;
     disk.cuts
         .retain(|sequence, _| *sequence >= position.sequence);
     disk.anchor = Some(anchor);

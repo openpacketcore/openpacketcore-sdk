@@ -135,6 +135,10 @@ impl NativeLog {
         }
         if let EntryPayload::Normal(command) = &entry.payload {
             sql::validate_command_for_log(command, identity)?;
+            if let SessionMutationIntent::AsyncRecoveryBoundary { era, plan } = command.intent {
+                return super::async_recovery::Boundary::from_entry(era, plan, entry.log_id)
+                    .validate();
+            }
             if sql::contains_protected_roster_command(&command.intent) {
                 sql::protected_roster_command_for_scope(
                     &command.intent,
@@ -191,7 +195,21 @@ impl NativeLog {
         state: &NativeState,
         frozen_applied: Option<LogId<SessionConsensusNodeId>>,
     ) -> io::Result<Option<LogId<SessionConsensusNodeId>>> {
-        changes::Publication::prepare(self, operation, state, frozen_applied)?.publish(self, state)
+        self.project_reserved(operation, state, frozen_applied, None)
+    }
+
+    pub(crate) fn project_reserved(
+        &mut self,
+        operation: &Operation,
+        state: &NativeState,
+        frozen_applied: Option<LogId<SessionConsensusNodeId>>,
+        reservation: Option<crate::sqlite::consensus::wal::async_authority::Reservation>,
+    ) -> io::Result<Option<LogId<SessionConsensusNodeId>>> {
+        let publication = changes::Publication::prepare(self, operation, state, frozen_applied)?;
+        if let Some(reservation) = reservation {
+            publication.check_async_reservation(reservation)?;
+        }
+        publication.publish(self, state)
     }
 
     pub(crate) fn require_committed_entries(

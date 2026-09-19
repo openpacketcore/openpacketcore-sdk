@@ -161,14 +161,16 @@ impl Ordinals {
         Ok(())
     }
 
-    pub(super) fn validate_retirement(
+    pub(super) fn validate_retirement_with_recovery(
         &self,
         before: Option<FencedTransitionV2HistoryState>,
         after: Option<FencedTransitionV2HistoryState>,
         now: Option<Timestamp>,
+        recovered_floor: u64,
     ) -> io::Result<()> {
         for epoch in &self.epochs {
-            if epoch.epoch > lifecycle::floor(before)
+            if epoch.epoch > recovered_floor
+                && epoch.epoch > lifecycle::floor(before)
                 && epoch.epoch <= lifecycle::floor(after)
                 && epoch.times[epoch.last].is_none_or(|until| now.is_none_or(|now| until > now))
             {

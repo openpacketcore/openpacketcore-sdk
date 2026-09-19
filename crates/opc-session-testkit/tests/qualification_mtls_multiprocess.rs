@@ -3680,6 +3680,20 @@ fn stateless_consumer_voter_topology_for_configuration(
     configuration_generation: &str,
     configuration_epoch: u64,
 ) -> ValidatedQuorumTopology {
+    fixed_voter_topology_for_configuration_with_root(
+        members,
+        configuration_generation,
+        configuration_epoch,
+        Some(qualification_roster_attestation_trust_root()),
+    )
+}
+
+fn fixed_voter_topology_for_configuration_with_root(
+    members: &[QualificationMember],
+    configuration_generation: &str,
+    configuration_epoch: u64,
+    roster_attestation_root: Option<opc_session_store::RosterAttestationTrustRootV1>,
+) -> ValidatedQuorumTopology {
     let descriptors = members
         .iter()
         .map(|member| {
@@ -3697,7 +3711,6 @@ fn stateless_consumer_voter_topology_for_configuration(
             )
         })
         .collect::<Vec<_>>();
-    let roster_attestation_root = qualification_roster_attestation_trust_root();
     let manifest = SessionReplicationManifest::try_new_with_epoch_and_roster_attestation_root(
         SessionClusterId::new(format!("qualification-mtls-{}-cluster", members.len()))
             .expect("qualification consumer cluster ID"),
@@ -3706,7 +3719,7 @@ fn stateless_consumer_voter_topology_for_configuration(
         SessionConfigurationEpoch::new(configuration_epoch)
             .expect("qualification consumer configuration epoch"),
         descriptors.clone(),
-        Some(roster_attestation_root.clone()),
+        roster_attestation_root.clone(),
     )
     .expect("qualification consumer replication manifest");
     let local_replica = descriptors
@@ -3714,15 +3727,16 @@ fn stateless_consumer_voter_topology_for_configuration(
         .expect("qualification consumer local replica")
         .replica_id()
         .clone();
-    ValidatedQuorumTopology::try_from_fixed_durable_quorum(
-        QuorumTopologyConfig::new_consensus_with_roster_attestation_trust_root(
-            local_replica,
-            descriptors,
-            manifest.fixed_durable_quorum_consensus_identity(),
-            roster_attestation_root,
-        ),
-    )
-    .expect("qualification consumer validated fixed topology")
+    let mut config = QuorumTopologyConfig::new_consensus(
+        local_replica,
+        descriptors,
+        manifest.fixed_durable_quorum_consensus_identity(),
+    );
+    if let Some(root) = roster_attestation_root {
+        config = config.with_roster_attestation_trust_root(root);
+    }
+    ValidatedQuorumTopology::try_from_fixed_durable_quorum(config)
+        .expect("qualification consumer validated fixed topology")
 }
 
 #[test]

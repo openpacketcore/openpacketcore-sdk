@@ -30,7 +30,21 @@ impl NativeDelta<'_> {
                 return Ok(self.response(index, Err(StoreError::CasIdempotencyConflict)));
             };
             return Ok(if receipt.payload_digest == payload_digest {
-                receipt.response.as_ref().clone()
+                if self.frontiers.async_retires_response(&receipt.response)
+                    && !matches!(intent, SessionMutationIntent::AdvanceLogicalTime)
+                {
+                    // Keep the immutable binding as evidence; its old result
+                    // cannot issue authority after the committed retirement.
+                    let error =
+                        if matches!(intent, SessionMutationIntent::BindConsumerRequest { .. }) {
+                            StoreError::CasIdempotencyConflict
+                        } else {
+                            StoreError::TopologyAuthorityRevoked
+                        };
+                    self.response(index, Err(error))
+                } else {
+                    receipt.response.as_ref().clone()
+                }
             } else {
                 self.response(index, Err(StoreError::CasIdempotencyConflict))
             });
@@ -116,7 +130,12 @@ impl Transaction<'_, '_> {
     }
 
     fn set_key(&mut self, key: SessionKey, row: NativeKeyState) {
-        self.expiry.replace(&key, Some(&self.key(&key)), Some(&row));
+        let before = self
+            .keys
+            .get(&key)
+            .cloned()
+            .unwrap_or_else(|| self.base.physical_key(&key));
+        self.expiry.replace(&key, Some(&before), Some(&row));
         self.keys.insert(key, row);
     }
 

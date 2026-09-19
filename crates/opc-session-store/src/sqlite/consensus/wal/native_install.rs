@@ -398,6 +398,10 @@ fn advance_inner(
     }
     (control.hook)(Point::AfterNativeBasisAdmission)?;
     let mut native = catalog.into_storage(&check)?;
+    let reservation = lock_state(shared)?.async_authority;
+    if let Some(reservation) = reservation {
+        native.check_async_reservation(reservation, &check)?;
+    }
     let mut selected = native_basis::Selected::admitted(append, &native)?;
     selected.repair(&final_path, &check)?;
     native.begin_changes()?;
@@ -432,7 +436,7 @@ fn advance_inner(
     };
     drop(retired);
     drop(old_selected);
-    checkpoint::reclaim_covered(disk, &anchor, control)?;
+    checkpoint::reclaim_covered(disk, &anchor, control, binding.async_recovery_format)?;
     installation.source.verify()?;
     let retired_handoff = {
         let mut state = lock_state(shared)?;

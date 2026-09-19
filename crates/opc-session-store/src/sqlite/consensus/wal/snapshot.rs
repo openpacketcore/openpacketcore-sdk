@@ -301,6 +301,14 @@ impl InstallSource {
         .map_err(db_error)?;
         let incoming_tx = incoming.unchecked_transaction().map_err(db_error)?;
         let incoming_memory = consensus::native_snapshot::reserve_input(&incoming_tx, check)?;
+        let old_recovery = consensus::async_recovery::read(conn)?;
+        let new_recovery = consensus::async_recovery::read(&incoming_tx)?;
+        if new_recovery.is_some() && !binding.async_recovery_format {
+            return Err(invalid_data(
+                "native asynchronous snapshot requires a reserved authority root",
+            ));
+        }
+        consensus::async_recovery::transition(old_recovery.as_ref(), new_recovery.as_ref())?;
         conn.pragma_update(None, "query_only", false)
             .map_err(db_error)?;
         self.apply_original(
@@ -312,7 +320,11 @@ impl InstallSource {
                 self.prepare_native_install_tail(tx, binding, &authority.members)?;
                 check()
             },
-            |_| check(),
+            |tx| {
+                check()?;
+                consensus::async_recovery::write(tx, new_recovery.as_ref())?;
+                check()
+            },
         )?;
         drop(incoming_tx);
         drop(incoming);

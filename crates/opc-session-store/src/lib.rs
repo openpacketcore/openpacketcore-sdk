@@ -12,9 +12,15 @@
 //! [`ConsensusSessionStore::open_fixed_quorum_with_persistence`] or its explicit
 //! clock/deadline variant. Existing constructors retain durable acknowledgement.
 //! Async mutations still require real quorum replication and committed apply;
-//! disk persistence may lag success. Every existing Async root must rejoin a
-//! surviving live quorum through [`ConsensusSessionStore::initialize_cluster`].
-//! An all-cold quorum cannot recover authority from local generations alone.
+//! disk persistence may lag success. New Async roots support restart after
+//! completed [`ConsensusSessionStore::shutdown`], including majority and
+//! all-voter restarts. A one-use, durable proof covers the final vote, log and
+//! application state; normal initialization and quorum admission still apply.
+//! Unclean restarts and legacy roots require a surviving live quorum through
+//! [`ConsensusSessionStore::initialize_cluster`]. Losing that live majority
+//! still prevents recovery: the lost tail can contain issued fencing
+//! credentials and lease revocations that local generations cannot supersede.
+//! Remaining fenced preserves safety but does not constitute service recovery.
 //! Use [`ConsensusSessionStore::probe_fixed_quorum_readiness`] to gate traffic;
 //! [`SessionPersistenceHealth`] and an explicit local persistence drain are
 //! observations of local storage, not quorum-durability proofs.

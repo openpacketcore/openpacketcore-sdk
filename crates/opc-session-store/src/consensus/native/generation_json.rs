@@ -243,6 +243,7 @@ impl InnerIntent {
 enum Intent {
     AdvanceLogicalTime,
     MaintainFencedTransitionV2History(Request),
+    AsyncRecoveryBoundary(Request),
     CompareAndSet(Request),
     DeleteFenced(Request),
     RefreshTtl(Request),
@@ -264,7 +265,9 @@ impl Intent {
     fn shape(self) -> Shape {
         match self {
             Self::AdvanceLogicalTime => Shape::default(),
-            Self::MaintainFencedTransitionV2History(value) => value.0,
+            Self::MaintainFencedTransitionV2History(value) | Self::AsyncRecoveryBoundary(value) => {
+                value.0
+            }
             Self::CompareAndSet(value)
             | Self::DeleteFenced(value)
             | Self::RefreshTtl(value)

@@ -4,6 +4,8 @@
 mod tests;
 
 mod cold_repair;
+#[cfg(target_os = "linux")]
+mod majority;
 
 use futures_util::stream::FuturesUnordered;
 use opc_consensus::engine::CommittedLeaderId;
@@ -83,6 +85,17 @@ impl ConsensusSessionStore {
             .map_err(|_| ConsensusSessionStoreOpenError::RecoveryRequired)?;
         if protocol.is_active() || self.activate_caught_up_async_before(deadline).await? {
             return Ok(());
+        }
+        #[cfg(target_os = "linux")]
+        {
+            match self.try_majority_recovery_before(deadline).await {
+                Ok(true) => return Ok(()),
+                Ok(false) => {}
+                Err(_) => return Err(ConsensusSessionStoreOpenError::RecoveryRequired),
+            }
+            if protocol.is_reforming(deadline).await.unwrap_or(true) {
+                return Err(ConsensusSessionStoreOpenError::RecoveryRequired);
+            }
         }
         // No old permitted RPC may be in flight when this nonce is created.
         // Repeated initialize calls may replace an unavailable leader's cut;

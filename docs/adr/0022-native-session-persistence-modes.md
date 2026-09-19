@@ -171,7 +171,8 @@ quorum or authorize restarting an all-cold fleet.
 ## Cold-incarnation admission
 
 Raft's ordinary restart argument assumes voting/log persistence. Async cannot
-reuse that argument after losing resident state. Every existing Async root is
+reuse that argument after losing resident state. An existing Async root without
+the completed-shutdown proof below is
 quarantined before the engine starts, including a retained committed self-vote
 that causes the engine to restore an internal leader role. The SDK gate covers
 incoming engine RPCs, outgoing requests/results, manual/bootstrap elections,
@@ -179,7 +180,9 @@ proposals, forwarding, and readiness. A retained vote is never erased or
 lowered to make repair easier.
 
 After the caller installs `rpc_handler()`, `initialize_cluster()` performs
-the following recovery protocol within the configured operation deadline:
+the following live-quorum recovery protocol within the configured operation deadline.
+The unanimous retained-owner path below applies when a compatible live majority
+is unavailable:
 
 1. Drain operations admitted under an earlier attempt. Create a nonce tied to
    the current process incarnation and a monotonically distinct attempt.
@@ -232,11 +235,176 @@ replacement configuration or claim instantaneous knowledge of a remote
 election during a partition.
 
 Pristine first formation uses a durably established root/mode identity before
-participation. Reopen is cold even when no background generation completed.
-An all-cold set remains `RecoveryRequired`; local completed generations,
-snapshots, equal indices, or waiting longer do not manufacture a surviving
-quorum. Destroying/recreating backing is not a supported recovery workflow.
+participation. Uncertified reopen is cold even when no background generation completed.
+An uncertified all-cold set requires the unanimous protocol below; local
+completed generations, snapshots, equal indices, or waiting longer do not
+manufacture authority. Destroying/recreating backing is not a supported recovery workflow.
 Async can lose acknowledged results if the live volatile quorum is lost.
+
+### Completed consensus shutdown
+
+Completed-shutdown evidence was introduced with `OPCNA002`; new Async roots
+use `OPCNA003`, with an additional durable authority reservation and a distinct
+root-binding hash domain. Old
+readers reject this format before participating: a reader that did not consume
+the one-use proof could otherwise retain it while acknowledging new volatile
+work. Legacy `OPCNA001` roots retain their original admission rules; there is
+no implicit format migration or retrospective certification.
+
+The clone-wide shutdown coordinator first joins maintenance lanes, Raft and
+every actual storage/snapshot owner. Only an incarnation that was Active and
+whose engine stopped normally can request certification. Openraft shutdown's
+successful join alone does not prove a normal exit; its final running state
+must also be `Fatal::Stopped`. A quarantined incarnation cannot certify a
+predecessor's already-missing state. Ordinary WAL shutdown or Drop cannot
+request certification.
+
+While retaining LOCK, the Async writer drains its final generation and verifies
+the complete resident/completed cut and absence of any outstanding native
+operation or recorded failure. It writes and fsyncs `ASYNC-CLOSED.preparing`,
+renames it to `ASYNC-CLOSED`, then fsyncs the directory. The proof binds the
+exact root digest, complete selected anchor (including generation, sequence,
+full LogIds and snapshot origin), full vote, committed/purged frontier and
+membership. No generation is lowered or selected using only an index.
+
+Under the same exclusive root ownership, reopening first validates the entire
+selected native state and any retained snapshot origin. It verifies the proof
+and its file identity, unlinks it and fsyncs the directory before starting a
+writer or Raft. Interrupted preparation grants no authority. Missing proof
+uses normal cold admission; corrupt, foreign or stale selected proof rejects
+opening. A failure after unlink cannot accidentally reuse the consumed proof.
+
+This evidence permits ordinary Raft participation after orderly majority or
+all-voter restart. It does not select a leader or grant application authority:
+the original full vote/log checks, initialization, membership and fresh quorum
+barriers remain required. Shutdown cancellation preserves the shared drain and
+root lock through definitive completion. Public handles must still be released
+before reopen because they own the snapshot namespace. Ordinary Async session
+acknowledgements retain their resident replication/application boundary.
+
+### Reserved authority and replicated retirement
+
+An `OPCNA003` owner syncs its root-bound `ASYNC-AUTHORITY` reservation before
+starting volatile consensus. Its finite range bounds terms, indices and
+authority allocators independently of completed session generations. Ordinary
+operations compare resident counters against the reservation without writing
+it. Exhaustion, a missing reservation or inconsistent input fails closed.
+
+The native state machine recognizes an internal recovery-boundary command.
+Ordinary application submission rejects this command. It retires the entire
+predecessor range, invalidates retained leases, advances absent-key fence and
+history floors, and compacts the externally visible watch stream. Physical
+notification inventory and history conservation remain independently checked.
+The boundary survives native generation and portable snapshot admission;
+snapshot downgrade or removal is rejected. Configured protected-roster trust
+roots and retained protected authority are outside this retirement vocabulary.
+
+### Unanimous retained-owner recovery (SDK #908)
+
+Normal Async acknowledgements remain independent of disk. An `OPCNA003` root
+reserves a finite range **before** any volatile issuance. The initial ceiling
+is `2^40 - 1`; each recovery era advances by `2^40`. Eras and all reserved
+frontiers are bounded below the signed-counter limit. Exhaustion rejects work;
+there is no wraparound or automatic reset. The reservation is independent of
+session generations and survives reclamation. Reservation alone grants no
+votes, leases or traffic authority.
+
+This pre-loss bound is necessary because a live but isolated survivor can miss
+an entire acknowledged majority tail, including higher fences and revocation
+of earlier credentials. Every retained copy may contain the revoked credential
+and allocator values below externally issued values. Local expiry, maximum
+retained generation, equal indices or promoting the survivor cannot recover
+that missing bound. Reserving only during recovery would be too late.
+
+The recovery protocol uses the existing authenticated member transport and
+exact immutable three/five-voter configuration. All configured retained owners
+must participate; a majority of disks is insufficient. The canonical smallest
+member coordinates bounded attempts, but its identity grants no new authority.
+Every transition validates the configuration/epoch, fixed voter digest, root
+binding, process incarnation, reservation era and exact round digest.
+
+1. **Prepare.** Each participant closes ordinary admission, drains previously
+   admitted effects and durably promises a strictly higher range. Publication
+   holds the root owner through file sync, atomic selection and directory sync.
+   A real self-vote advances its term above the retired range, retaining full
+   log freshness and the engine's existing leader-lease checks. Preparation
+   waits for the actual vote/log/application cut to be selected on disk.
+2. **Select.** All prepared cuts must carry the exact same applied membership.
+   Select the greatest full last `LogId`, breaking ties by smallest node, and
+   require coverage of every retained committed/applied cut. Retained entries
+   compare complete identities; a validated purged committed prefix must cover
+   the cut without lowering its term/index. Conflicting evidence is rejected,
+   never silently reconciled as acknowledged data loss.
+3. **Reform.** Permit only the selected candidate's actual next-term election
+   and its replication. The engine must grant real votes and commit an internal
+   recovery-boundary proposal. No synthetic successful response, new member,
+   erased vote, lowered generation or forged commit substitutes for this step.
+   Snapshot catch-up retains existing validation and ownership; actual matching
+   append plus committed local application is still required.
+4. **Persist and activate.** Every member reports its applied boundary, full
+   vote, membership and completed generation/sequence from its current owner.
+   Only the exact all-member completion set permits participation. Activation
+   is idempotent if the same boot still contains that committed boundary after
+   a later real election; it grants no application authority by itself.
+   The ordinary fresh quorum and Recovery/application gates remain required.
+
+The boundary retires all earlier reserved lease/credential authority, including
+unpersisted acknowledgements. New allocations exceed the prior ceiling;
+retained and absent-key leases cannot revive. It also retires V1 outcome
+visibility, V2 history and external watch cursors while preserving immutable
+old request bindings and independently checked history/notification accounting.
+Old delayed credentials cannot mutate the successor. Retained session records
+survive if selected; acknowledged records/results absent from every retained
+cut can be lost. External consumers must enforce the SDK's fence and history
+contracts; this protocol does not certify or revoke arbitrary external effects.
+
+A proposal captures its admission incarnation before asynchronous authority
+reads and holds a shared fence through enqueue. The activated raw V2 path
+acquires that fence before its final uncached acceptance snapshot. Preparation
+holds the exclusive side. Incoming and outgoing accepted engine operations
+retain their admission owner through definitive completion. Disk sync runs
+under a joined owner without holding the passive-health state mutex. Shutdown
+cannot release a root with an accepted promise still writing. Cancellation
+ends the caller's wait, not these responsibilities. A replaced boot rejects old
+rounds and completion replies; retry after an interrupted election prepares a
+new durable range instead of replaying a guessed vote.
+
+Every RPC, lock wait, election wait, persistence drain and activation consumes
+the existing complete-operation deadline. A timed-out call can leave safe,
+owned progress; retrying initialization continues it. Fixed passive states
+separate `PreparingRecovery`, `ReformingQuorum`, `AwaitingRecoveryParticipants`
+and unsupported/repair-required authority. `Active` never replaces traffic
+readiness or a subsequent operation's own checks.
+
+### Compatibility and unsupported authority
+
+`OPCNA001`/`OPCNA002` roots lack a pre-loss allocation ceiling. Their live-quorum
+and completed-shutdown paths remain available as applicable, but this protocol
+cannot retroactively bound a lost tail. An already-fenced legacy installation
+needs independent authority that can durably retire its lost scope and finish
+or revoke accepted effects at every affected consumer, then authorize one
+exact successor state. Neither data-loss acceptance nor the existing product
+Recovery object supplies those facts. The existing operator-recovery API itself
+requires a live quorum. No migration/reset recipe is provided as a substitute.
+
+All participants must retain applied exact fixed membership. If loss predates
+its first persisted generation, this protocol does not synthesize membership
+or rerun genesis; health reports `RetainedMembershipRequired`. Missing/corrupt
+roots, conflicting committed histories and exhausted ranges also require
+separate repair. A configured protected-roster trust root or retained protected
+authority reports `ProtectedAuthorityRequired`: its external retirement
+vocabulary is outside this protocol, including lost volatile activation.
+These are availability limits, never successful fence-only recovery outcomes.
+
+The Async wire discriminator advances to `OPC-ASYNC-2` so older peers cannot
+admit state without understanding retirement/snapshot semantics. Mixed-version
+Async membership is rejected. Upgrade members and consumers together; Durable
+encoding and acknowledgement semantics remain unchanged.
+
+[`docs/async-majority-recovery-908.md`](../async-majority-recovery-908.md)
+records the meaningful pre-change RED, lost-tail RED/GREEN, adversarial checks
+and remaining qualification. SDK results do not establish product recovery,
+packet continuity, audio or production HA.
 
 ## Mode isolation and traffic authority
 

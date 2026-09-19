@@ -801,10 +801,11 @@ impl Rows {
             )?;
             validate_log_transition(&delta.before, &delta.after)?;
             roster_index::transition(&delta.before, &delta.after)?;
-            ordinals.validate_retirement(
+            ordinals.validate_retirement_with_recovery(
                 delta.before.business.frontiers.history,
                 delta.after.business.frontiers.history,
                 delta.after.business.frontiers.logical_time,
+                delta.after.business.frontiers.async_fence_floor(),
             )?;
             rows.read_rows(
                 &mut reader,
@@ -1040,9 +1041,9 @@ impl Rows {
             return Err(invalid("native generation repeats a changed receipt ID"));
         }
         if !base {
-            lifecycle::conservation(
-                self.context.business.frontiers.history,
-                frontiers.history,
+            async_recovery::history_conservation(
+                &self.context.business.frontiers,
+                frontiers,
                 added,
                 removed,
                 transient,

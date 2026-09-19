@@ -68,6 +68,85 @@ fn values(log: &NativeLog) -> Vec<u8> {
     serde_json::to_vec(&(log.vote, log.committed, log.purged, rows)).unwrap()
 }
 
+#[test]
+fn async_authority_reservation_rejects_vote_and_append_before_publication() {
+    use crate::sqlite::consensus::wal::async_authority::Reservation;
+    let reservation = Reservation::initial();
+    let outside = reservation.ceiling() + 1;
+    for operation in [
+        Operation::Vote(Vote::new(outside, SessionConsensusNodeId::new(7).unwrap())),
+        append(&[blank(outside, 3)]),
+    ] {
+        let mut storage = fixture();
+        storage.begin_changes().unwrap();
+        let before = values(&storage.log);
+        assert!(storage
+            .log
+            .project_reserved(&operation, &storage.business, None, Some(reservation))
+            .is_err());
+        assert_eq!(values(&storage.log), before);
+        storage
+            .check_async_reservation(reservation, &|| Ok(()))
+            .unwrap();
+        storage.validate_image().unwrap();
+        // A subsequent in-range operation still uses the unchanged owner.
+        storage
+            .log
+            .project_reserved(
+                &append(&[blank(2, 3)]),
+                &storage.business,
+                None,
+                Some(reservation),
+            )
+            .unwrap();
+        storage.validate_image().unwrap();
+        assert_eq!(storage.log.last(), Some(id(2, 3)));
+    }
+}
+
+#[test]
+fn async_authority_reservation_rejects_foreign_uncommitted_boundary() {
+    use crate::sqlite::consensus::wal::async_authority::Reservation;
+    let reservation = Reservation::recovery(2, [0xA1; 32]).unwrap();
+    let mut storage = fixture();
+    let boundary = |plan| Entry {
+        log_id: id(reservation.retired_through() + 2, 3),
+        payload: EntryPayload::Normal(SessionConsensusCommand {
+            schema_version: crate::consensus::SESSION_CONSENSUS_SCHEMA_VERSION,
+            identity: identity(),
+            request_id: crate::consensus::SessionConsensusRequestId::new(),
+            logical_time: Timestamp::now_utc(),
+            intent: SessionMutationIntent::AsyncRecoveryBoundary { era: 2, plan },
+        }),
+    };
+    let before = values(&storage.log);
+    assert!(storage
+        .log
+        .project_reserved(
+            &append(&[boundary([0xA2; 32])]),
+            &storage.business,
+            None,
+            Some(reservation)
+        )
+        .is_err());
+    assert_eq!(values(&storage.log), before);
+    storage
+        .log
+        .project_reserved(
+            &append(&[boundary([0xA1; 32])]),
+            &storage.business,
+            None,
+            Some(reservation),
+        )
+        .unwrap();
+    storage
+        .check_async_reservation(reservation, &|| Ok(()))
+        .unwrap();
+    assert!(cold(&storage)
+        .check_async_reservation(Reservation::recovery(2, [0xA2; 32]).unwrap(), &|| Ok(()))
+        .is_err());
+}
+
 fn cold(storage: &NativeStorage) -> NativeStorage {
     let mut image = Vec::new();
     storage.write_image(&mut image, [0xAD; 32], 19).unwrap();

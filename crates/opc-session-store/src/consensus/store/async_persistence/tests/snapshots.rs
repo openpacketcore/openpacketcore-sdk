@@ -23,7 +23,9 @@ struct Story {
     cut: ColdQuorumCut,
 }
 
-async fn snapshot(store: &ConsensusSessionStore) -> InstallSnapshotRequest<SessionRaftTypeConfig> {
+pub(super) async fn snapshot(
+    store: &ConsensusSessionStore,
+) -> InstallSnapshotRequest<SessionRaftTypeConfig> {
     let applied = store.inner.raft.metrics().borrow().last_applied.unwrap();
     store.inner.raft.trigger().snapshot().await.unwrap();
     store
@@ -51,7 +53,7 @@ async fn snapshot(store: &ConsensusSessionStore) -> InstallSnapshotRequest<Sessi
     }
 }
 
-async fn send_snapshot(
+pub(super) async fn send_snapshot(
     cold: &ConsensusSessionStore,
     sender: SessionConsensusNodeId,
     request: &InstallSnapshotRequest<SessionRaftTypeConfig>,
@@ -70,18 +72,12 @@ async fn send_snapshot(
         )
         .await;
     if response.result.is_err() {
-        eprintln!(
-            "async snapshot response: index={:?} result={:?} health={:?} engine={:?}",
-            request.meta.last_log_id,
-            response.result.as_ref().err(),
-            cold.persistence_health(),
-            cold.inner.raft.metrics().borrow().running_state
-        );
+        eprintln!("async_snapshot stage=response success=false");
     }
     response
 }
 
-fn decode_snapshot(
+pub(super) fn decode_snapshot(
     response: SessionConsensusWireResponse,
     stage: &str,
 ) -> Result<
@@ -520,6 +516,22 @@ async fn async_persistence_compacted_snapshot_cancellation_fences_replacement_an
         );
         installing.abort();
         assert!(installing.await.unwrap_err().is_cancelled());
+        // The first replacement must expire under the unchanged operation
+        // deadline while accepted installation still owns the pre-publication
+        // hold. Expiry must neither retire that work nor allocate an attempt.
+        assert!(matches!(
+            cold.inner
+                .persistence_protocol
+                .quarantine_before(tokio::time::Instant::now() + OPERATION_BOUND)
+                .await,
+            Err(SessionConsensusPeerError::Timeout)
+        ));
+        assert_eq!(fleet.selector(story.follower), selected_base);
+        assert!(!cold.inner.persistence_protocol.is_active());
+        before.release();
+        tokio::time::timeout(Duration::from_secs(3), after.wait_started())
+            .await
+            .expect("cancelled caller leaves actual installation owned through publication");
         let new_request = {
             let replacement = cold
                 .inner
@@ -528,10 +540,6 @@ async fn async_persistence_compacted_snapshot_cancellation_fences_replacement_an
             tokio::pin!(replacement);
             assert!(futures_util::poll!(replacement.as_mut()).is_pending());
 
-            before.release();
-            tokio::time::timeout(Duration::from_secs(3), after.wait_started())
-                .await
-                .expect("cancelled caller leaves actual installation owned through publication");
             assert_eq!(
                 cold.inner
                     .private_wal
@@ -632,6 +640,30 @@ async fn async_persistence_compacted_snapshot_cancellation_fences_replacement_an
             .await
             .traffic_authority()
             .is_granted());
+        // The repaired incarnation can now certify its own completed shutdown.
+        // Its retained snapshot origin must still pass full validation before
+        // that proof can be consumed on the following reopen.
+        fleet.close_clean(story.follower).await.unwrap();
+        fleet
+            .open(story.follower, SessionPersistenceMode::Async)
+            .await
+            .unwrap();
+        assert_eq!(
+            fleet.store(story.follower).persistence_health().recovery,
+            Some(SessionAsyncRecoveryState::Active)
+        );
+        assert!(!fleet.store(story.follower).status().admitted);
+        fleet
+            .store(story.follower)
+            .initialize_cluster()
+            .await
+            .unwrap();
+        assert_recorded(
+            fleet.store(story.follower),
+            &story.second,
+            &story.second_outcome,
+        )
+        .await;
     })
     .catch_unwind()
     .await;

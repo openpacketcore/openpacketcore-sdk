@@ -121,6 +121,12 @@ fn intent(
             expected_retired_through: *expected_retired_through,
             expected_bound_entries: *expected_bound_entries,
         },
+        SessionMutationIntent::AsyncRecoveryBoundary { era, plan } if allow_authorized => {
+            SessionMutationIntent::AsyncRecoveryBoundary {
+                era: *era,
+                plan: *plan,
+            }
+        }
         SessionMutationIntent::BindConsumerRequest { request_commitment } => {
             SessionMutationIntent::BindConsumerRequest {
                 request_commitment: *request_commitment,

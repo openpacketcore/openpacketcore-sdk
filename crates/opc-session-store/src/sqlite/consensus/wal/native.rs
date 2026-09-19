@@ -43,7 +43,7 @@ fn ensure_native_application_owner(state: &State) -> io::Result<()> {
     Ok(())
 }
 
-fn ensure_native_public_owner(state: &State) -> io::Result<()> {
+pub(super) fn ensure_native_public_owner(state: &State) -> io::Result<()> {
     ensure_readable(state)?;
     if state.status != Status::Running {
         return Err(invalid_data("native public read owner is not running"));
@@ -54,7 +54,7 @@ fn ensure_native_public_owner(state: &State) -> io::Result<()> {
 // Installation drains accepted applications and detached reads before its
 // capture or old-generation reclamation. New operations wait while existing
 // work finishes against its pinned predecessor. Permits retire outside State.
-struct OperationPermit(Arc<Shared>);
+pub(super) struct OperationPermit(Arc<Shared>);
 impl Drop for OperationPermit {
     fn drop(&mut self) {
         let mut state = match self.0.state.lock() {
@@ -534,6 +534,26 @@ impl Opening {
                 (native, selected, 0)
             }
         };
+        // All snapshot/origin, generation, vote/log and exact authority
+        // validation has completed. Consume before starting the writer, so a
+        // second cold incarnation can never reuse this permission.
+        if binding.async_recovery_format {
+            native
+                .check_async_reservation(async_authority::read(&directory, binding)?, &|| Ok(()))?;
+        }
+        let recovered_closed = if binding.async_closed_format {
+            async_closed::consume(
+                &directory,
+                binding,
+                disk.anchor
+                    .as_ref()
+                    .ok_or_else(|| invalid_data("closed incarnation selector missing"))?,
+                &native,
+                &control,
+            )?
+        } else {
+            false
+        };
         let mut state = State::recovered(
             binding,
             conn,
@@ -549,6 +569,8 @@ impl Opening {
             .and_then(checkpoint::Anchor::native_applied);
         let mut wal = Wal::start_state(binding, limits, state, disk, control, Some(selected))?;
         wal.directory_pin = Some(directory_pin);
+        wal.recovered_closed
+            .store(recovered_closed, std::sync::atomic::Ordering::Release);
         Ok(wal)
     }
 }
@@ -1053,7 +1075,7 @@ impl Wal {
         }
     }
 
-    fn native_operation(&self) -> io::Result<OperationPermit> {
+    pub(super) fn native_operation(&self) -> io::Result<OperationPermit> {
         let mut state = self.wait_for_snapshot(lock_state(&self.shared)?)?;
         if state.snapshot.is_some() || state.native_install_pending {
             return Err(invalid_data("native operation installation is closing"));
@@ -2021,6 +2043,13 @@ impl Wal {
                 drop(state);
                 drop(prepared);
                 continue;
+            }
+            if let Some(reservation) = state.async_authority {
+                if let Err(error) = prepared.check_async_reservation(reservation) {
+                    application::fence(&mut state);
+                    self.shared.ready.notify_all();
+                    return Err(error);
+                }
             }
             let publishing = Instant::now();
             let result = prepared.publish(

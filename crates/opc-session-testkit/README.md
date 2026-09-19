@@ -1020,12 +1020,24 @@ independent-checker, and tamper tests with:
   three separate voter processes and an external mTLS client for each explicit
   Async/Durable mode. They check a public exact receipt, joined shutdown of
   every live voter, and reconstruction from the same storage in three fresh
-  processes. Durable reconstruction must return the recorded receipt and an
-  identical replay; an all-cold Async quorum must remain quarantined under the
-  original negative guard. These small boundary controls do not establish
-  full-cardinality memory or throughput qualification. Legacy configurations
-  omit `isolated_scale` and retain their existing behavior.
+  processes. Both modes must return the recorded receipt, an identical replay,
+  and a successful new operation under the original deadlines. Async uses the
+  one-use evidence of completed shutdown on new-format roots; this does not
+  qualify unclean loss or already-fenced legacy roots. These small controls do
+  not establish full-cardinality memory or throughput qualification. Legacy
+  configurations omit `isolated_scale` and retain their existing behavior.
 - Source checked: `Cargo.toml`, `src/lib.rs`, and dependent session tests.
+- `isolated_scale::majority_recovery` uses the explicit
+  `retained_recovery_control` workload: ordinary fixed-quorum authority without
+  a protected-roster trust root, configured that way from initial creation.
+  It abruptly kills two voters or all three, reopens the exact retained roots
+  and addresses, and requires initialization, traffic readiness, a higher-fence
+  lease and a successful subsequent mutation. The two-voter case preserves the
+  original survivor process and rejects its still-unexpired old lease. Recovery
+  uses the production mTLS adapters and the original operation and transition
+  deadlines. The existing protected-roster workloads retain their original
+  configuration. These controls qualify new-format SDK recovery, not legacy
+  storage migration, protected-roster retirement or deployed product recovery.
 - Run production-mTLS qualification with:
   `cargo test -p opc-session-testkit --test qualification_mtls_multiprocess --no-default-features -- --test-threads=1`.
 - Run the non-ignored three- and five-process fault/expiry cases exactly with:

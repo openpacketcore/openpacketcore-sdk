@@ -32,7 +32,8 @@ use super::{
     SessionConsensusCommand, SessionConsensusIdentity, SessionConsensusNodeId,
     SessionConsensusPeer, SessionConsensusPeerError, SessionConsensusRpcFamily,
     SessionConsensusRpcHandler, SessionConsensusWireRequest, SessionConsensusWireResponse,
-    SessionMutationIntent, SessionRaft, SessionRaftTypeConfig, SESSION_CONSENSUS_SCHEMA_VERSION,
+    SessionMutationIntent, SessionPersistenceMode, SessionRaft, SessionRaftTypeConfig,
+    SESSION_CONSENSUS_SCHEMA_VERSION,
 };
 use crate::membership::{SessionTopologyTransitionDigest, SessionTopologyTransitionId};
 use crate::readiness::PlacementResiliencePolicy;
@@ -966,11 +967,23 @@ impl SessionRaftNetwork {
         Resp: DeserializeOwned,
         E: std::error::Error + DeserializeOwned,
     {
-        if !self.persistence.is_active() {
-            return Err(EngineRpcError::Unreachable(Unreachable::new(
-                &SessionConsensusPeerError::Rejected,
-            )));
-        }
+        let async_deadline = (self.persistence.mode() == SessionPersistenceMode::Async)
+            .then(|| tokio::time::Instant::now() + option.soft_ttl());
+        let _admission = if let Some(deadline) = async_deadline {
+            let admission = self
+                .persistence
+                .engine_before(deadline)
+                .await
+                .map_err(|error| EngineRpcError::Unreachable(Unreachable::new(&error)))?;
+            if !admission.permits_outgoing(family, &payload) {
+                return Err(EngineRpcError::Unreachable(Unreachable::new(
+                    &SessionConsensusPeerError::Rejected,
+                )));
+            }
+            Some(admission)
+        } else {
+            None
+        };
         // Keep the route-generation permit for the complete peer call. A
         // uniform apply waits for all predecessor-scoped calls already in
         // flight before publishing successor routes.
@@ -1002,7 +1015,15 @@ impl SessionRaftNetwork {
         .map_err(|error| EngineRpcError::Unreachable(Unreachable::new(&error)))?;
 
         let hard_ttl = option.hard_ttl();
-        let response = match peer.call_with_timeout(wire, option.soft_ttl()).await {
+        let remaining = match async_deadline {
+            Some(deadline) => deadline
+                .checked_duration_since(tokio::time::Instant::now())
+                .ok_or_else(|| {
+                    map_peer_error(SessionConsensusPeerError::Timeout, action, self, hard_ttl)
+                })?,
+            None => option.soft_ttl(),
+        };
+        let response = match peer.call_with_timeout(wire, remaining).await {
             Err(error) => return Err(map_peer_error(error, action, self, hard_ttl)),
             Ok(response) => response,
         };
@@ -1253,9 +1274,7 @@ impl SessionRaftRpcHandler {
             Ok(payload) => payload,
             Err(error) => return rejected_response(error),
         };
-        let response = if self.persistence.mode() == super::SessionPersistenceMode::Async
-            && !self.persistence.is_active()
-        {
+        let response = if self.persistence.mode() == super::SessionPersistenceMode::Async {
             let permit = match tokio::time::timeout_at(
                 deadline,
                 Arc::clone(&self.persistence.cold_rpc_admission).acquire_owned(),
@@ -1394,9 +1413,6 @@ impl SessionRaftRpcHandler {
                 encode_engine_result(&result)
             }
             SessionConsensusRpcFamily::Vote => {
-                if !persistence.permits_vote() {
-                    return rejected_response(SessionConsensusPeerError::Rejected);
-                }
                 let rpc = match decode_and_bind_sender::<VoteRequest<SessionConsensusNodeId>>(
                     &request.payload,
                     request.sender,
@@ -1404,6 +1420,9 @@ impl SessionRaftRpcHandler {
                     Ok(rpc) => rpc,
                     Err(error) => return rejected_response(error),
                 };
+                if !persistence.permits_vote(&rpc) {
+                    return rejected_response(SessionConsensusPeerError::Rejected);
+                }
                 encode_engine_result(&self.raft.vote(rpc).await)
             }
             SessionConsensusRpcFamily::InstallSnapshot => {

@@ -7,6 +7,7 @@
 //! same mutex as every physical read; an unwind poisons/fences that owner.
 
 mod application;
+pub(crate) mod async_recovery;
 mod business;
 mod changes;
 mod expiry;
@@ -233,9 +234,57 @@ struct NativeActivation {
 // copies the complete values before changing them, so old captures keep their
 // exact membership and snapshot metadata. Equality retains the full value
 // comparison for distinct allocations; serialized bytes are unchanged.
-#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, PartialEq, Eq, Serialize)]
 #[serde(transparent)]
 struct NativeFrontiers(Arc<NativeFrontierValues>);
+
+impl<'de> Deserialize<'de> for NativeFrontiers {
+    fn deserialize<D: serde::Deserializer<'de>>(decoder: D) -> Result<Self, D::Error> {
+        if decoder.is_human_readable() {
+            return NativeFrontierValues::deserialize(decoder).map(|value| Self(Arc::new(value)));
+        }
+        // Generation and image headers use named JSON fields. Preserve the
+        // original positional frontier vocabulary for old binary consumers;
+        // the recovery extension is not silently inserted into that layout.
+        #[derive(Deserialize)]
+        struct Binary {
+            applied: Option<LogId<SessionConsensusNodeId>>,
+            membership: StoredMembership<SessionConsensusNodeId, EmptyNode>,
+            sequence: u64,
+            digest: SessionConsensusEntryDigest,
+            logical_time: Option<Timestamp>,
+            watch_sequence: u64,
+            next_fence: u64,
+            next_credential: u64,
+            restore_revision: u64,
+            history: Option<FencedTransitionV2HistoryState>,
+            activation: Option<NativeActivation>,
+            v1_activation: Option<NativeV1Activation>,
+            roster_v1_namespace: bool,
+            roster_v2_activation: Option<NativeActivation>,
+            current_snapshot: Option<crate::sqlite::consensus::CurrentSnapshot>,
+        }
+        let value = Binary::deserialize(decoder)?;
+        Ok(Self(Arc::new(NativeFrontierValues {
+            applied: value.applied,
+            membership: value.membership,
+            sequence: value.sequence,
+            digest: value.digest,
+            logical_time: value.logical_time,
+            watch_sequence: value.watch_sequence,
+            next_fence: value.next_fence,
+            next_credential: value.next_credential,
+            restore_revision: value.restore_revision,
+            history: value.history,
+            activation: value.activation,
+            v1_activation: value.v1_activation,
+            roster_v1_namespace: value.roster_v1_namespace,
+            roster_v2_activation: value.roster_v2_activation,
+            current_snapshot: value.current_snapshot,
+            async_recovery: None,
+        })))
+    }
+}
 
 impl std::ops::Deref for NativeFrontiers {
     type Target = NativeFrontierValues;
@@ -271,6 +320,8 @@ struct NativeFrontierValues {
     roster_v1_namespace: bool,
     #[serde(default)]
     roster_v2_activation: Option<NativeActivation>,
+    #[serde(default)]
+    async_recovery: Option<async_recovery::Boundary>,
     current_snapshot: Option<crate::sqlite::consensus::CurrentSnapshot>,
 }
 
@@ -284,11 +335,18 @@ impl Serialize for NativeFrontierValues {
         let include_roster_v1 = !serializer.is_human_readable() || self.roster_v1_namespace;
         let include_roster_v2 =
             !serializer.is_human_readable() || self.roster_v2_activation.is_some();
+        if !serializer.is_human_readable() && self.async_recovery.is_some() {
+            return Err(serde::ser::Error::custom(
+                "asynchronous frontier requires a named header",
+            ));
+        }
+        let include_async_recovery = self.async_recovery.is_some();
         let mut value = serializer.serialize_struct(
             "NativeFrontiers",
             12 + usize::from(include_v1)
                 + usize::from(include_roster_v1)
-                + usize::from(include_roster_v2),
+                + usize::from(include_roster_v2)
+                + usize::from(include_async_recovery),
         )?;
         value.serialize_field("applied", &self.applied)?;
         value.serialize_field("membership", &self.membership)?;
@@ -309,6 +367,9 @@ impl Serialize for NativeFrontierValues {
         }
         if include_roster_v2 {
             value.serialize_field("roster_v2_activation", &self.roster_v2_activation)?;
+        }
+        if include_async_recovery {
+            value.serialize_field("async_recovery", &self.async_recovery)?;
         }
         value.serialize_field("current_snapshot", &self.current_snapshot)?;
         value.end()
@@ -404,6 +465,39 @@ pub(crate) struct NativeStorage {
 }
 
 impl NativeStorage {
+    /// Outside the shared State lock: selected log bodies retain bounded,
+    /// independently validated disk ranges and need not be resident at reopen.
+    pub(crate) fn check_async_reservation(
+        &self,
+        reservation: crate::sqlite::consensus::wal::async_authority::Reservation,
+        check: &impl Fn() -> io::Result<()>,
+    ) -> io::Result<()> {
+        check()?;
+        self.business
+            .frontiers
+            .check_async_reservation(reservation)?;
+        if let Some(vote) = self.log.vote {
+            reservation.check(vote.leader_id.term)?;
+        }
+        for id in [self.log.last(), self.log.committed, self.log.purged]
+            .into_iter()
+            .flatten()
+        {
+            reservation.check(id.leader_id.term)?;
+            reservation.check(id.index)?;
+        }
+        for entry in self.log.entries.values() {
+            let input = entry.read_owned(
+                entry.id().index,
+                self.business.identity,
+                &self.business.members,
+                check,
+            )?;
+            async_recovery::check_log_reservation(input.entry(), reservation)?;
+        }
+        check()
+    }
+
     pub(crate) fn empty(
         identity: SessionConsensusIdentity,
         members: BTreeSet<SessionConsensusNodeId>,
@@ -451,6 +545,44 @@ impl NativeStorage {
             let copies = reads.copy_current(&self.business)?;
             self.business.apply_with_receipts(entries, &copies)?;
             next = end;
+        }
+        Ok(())
+    }
+}
+
+impl NativeFrontiers {
+    fn check_async_reservation(
+        &self,
+        reservation: crate::sqlite::consensus::wal::async_authority::Reservation,
+    ) -> io::Result<()> {
+        if self.async_recovery.as_ref().is_some_and(|boundary| {
+            boundary.era > reservation.era()
+                || (boundary.era == reservation.era() && boundary.plan != reservation.plan())
+        }) {
+            return Err(invalid("native asynchronous boundary reservation differs"));
+        }
+        self.validate_async_boundary()?;
+        for counter in [
+            self.sequence,
+            self.watch_sequence,
+            self.next_fence,
+            self.next_credential,
+            self.restore_revision,
+        ] {
+            reservation.check(counter)?;
+        }
+        if let Some(history) = &self.history {
+            reservation.check(history.generation())?;
+            for epoch in [
+                history.active_epoch(),
+                history.retired_through(),
+                history.reclaim_epoch(),
+            ]
+            .into_iter()
+            .flatten()
+            {
+                reservation.check(epoch.get())?;
+            }
         }
         Ok(())
     }
@@ -529,6 +661,7 @@ impl NativeState {
                 v1_activation: None,
                 roster_v1_namespace: false,
                 roster_v2_activation: None,
+                async_recovery: None,
                 current_snapshot: None,
             })),
             keys: RowMap::new(),
@@ -621,14 +754,14 @@ impl NativeState {
             FencedTransitionV2HistoryState::new(
                 Some(
                     crate::FencedTransitionV2HistoryEpoch::new(
-                        FENCED_TRANSITION_V2_INITIAL_HISTORY_EPOCH,
+                        self.frontiers.async_history_epoch(),
                     )
                     .map_err(|_| invalid("native initial epoch invalid"))?,
                 ),
-                None,
+                self.frontiers.async_history_retired()?,
                 None,
                 0,
-                0,
+                self.frontiers.async_history_generation(),
                 0,
                 0,
             )
@@ -835,6 +968,28 @@ impl NativeState {
         self.keys.get(key).map_or(0, |state| state.fence)
     }
 
+    /// Raw allocator frontiers, independent of traffic or lease admission.
+    #[cfg(test)]
+    pub(crate) fn authority_frontiers_for_test(&self) -> (u64, u64) {
+        (self.frontiers.next_fence, self.frontiers.next_credential)
+    }
+
+    /// Read a retained credential without applying the mutation validator.
+    #[cfg(test)]
+    pub(crate) fn retained_lease_for_test(&self, key: &SessionKey) -> Option<LeaseGuard> {
+        let lease = self.keys.get(key)?.lease.as_ref()?;
+        lease.active.then(|| {
+            Some(LeaseGuard::new(
+                key.clone(),
+                lease.owner.clone(),
+                lease.fence,
+                lease.acquired_at?,
+                lease.guard_expires_at,
+                lease.credential_id,
+            ))
+        })?
+    }
+
     /// Number of receipts whose response bytes reside in an admitted prefix.
     /// A positive count proves a cold witness actually exercised that path.
     #[cfg(test)]
@@ -923,7 +1078,12 @@ impl NativeState {
         let record = self.get_at(key, logical_time)?;
         crate::FencedTransitionObservation::new(
             record,
-            crate::FenceToken::new(self.keys.get(key).map_or(0, |state| state.fence)),
+            crate::FenceToken::new(
+                self.keys
+                    .get(key)
+                    .map_or(0, |state| state.fence)
+                    .max(self.frontiers.async_fence_floor()),
+            ),
         )
     }
 
@@ -962,7 +1122,9 @@ impl NativeState {
         }
         let Some(history) = self.frontiers.history else {
             return Ok(
-                if request.request_id().epoch().get() != FENCED_TRANSITION_V2_INITIAL_HISTORY_EPOCH
+                if request.request_id().epoch().get() <= self.frontiers.async_fence_floor() {
+                    FencedTransitionV2Status::Retired
+                } else if request.request_id().epoch().get() != self.frontiers.async_history_epoch()
                 {
                     FencedTransitionV2Status::EpochNotActive
                 } else if retention_exhausted(self.frontiers.logical_time) {
@@ -1094,6 +1256,12 @@ impl NativeState {
 
 impl NativeDelta<'_> {
     fn key(&self, key: &SessionKey) -> NativeKeyState {
+        let mut state = self.physical_key(key);
+        state.apply_async_floor(self.frontiers.async_fence_floor());
+        state
+    }
+
+    fn physical_key(&self, key: &SessionKey) -> NativeKeyState {
         self.keys
             .get(key)
             .or_else(|| self.base.keys.get(key).map(|row| &**row))
@@ -1103,7 +1271,7 @@ impl NativeDelta<'_> {
 
     fn set_key(&mut self, key: SessionKey, value: NativeKeyState) {
         self.expiry
-            .replace(&key, Some(&self.key(&key)), Some(&value));
+            .replace(&key, Some(&self.physical_key(&key)), Some(&value));
         self.keys.insert(key, value);
     }
 
@@ -1160,6 +1328,14 @@ impl NativeDelta<'_> {
                 self.frontiers.membership =
                     StoredMembership::new(Some(entry.log_id), membership.clone());
                 empty_response(entry.log_id.index)
+            }
+            EntryPayload::Normal(command)
+                if matches!(
+                    command.intent,
+                    SessionMutationIntent::AsyncRecoveryBoundary { .. }
+                ) =>
+            {
+                self.apply_async_boundary(command, entry.log_id)?
             }
             EntryPayload::Normal(command) => self.command(command, entry.log_id.index, check)?,
         };
@@ -1363,7 +1539,7 @@ impl NativeDelta<'_> {
             return Ok(self.clock_response(now, index, StoreError::TopologyAuthorityRevoked));
         }
         if self.frontiers.history.is_none()
-            && request.request_id().epoch().get() != FENCED_TRANSITION_V2_INITIAL_HISTORY_EPOCH
+            && request.request_id().epoch().get() != self.frontiers.async_history_epoch()
         {
             return Ok(self.clock_response(
                 now,
@@ -1383,10 +1559,10 @@ impl NativeDelta<'_> {
                 self.frontiers.history = Some(
                     FencedTransitionV2HistoryState::new(
                         Some(request.request_id().epoch()),
-                        None,
+                        self.frontiers.async_history_retired()?,
                         None,
                         0,
-                        0,
+                        self.frontiers.async_history_generation(),
                         0,
                         0,
                     )

@@ -263,6 +263,10 @@ async fn async_persistence_public_reopen_before_first_generation_requires_live_q
         );
         for (index, cold) in fleet.stores.iter().flatten().enumerate() {
             assert_eq!(
+                cold.persistence_health().recovery,
+                Some(SessionAsyncRecoveryState::RetainedMembershipRequired)
+            );
+            assert_eq!(
                 fleet.engine_calls_from(fleet.peers[index].node),
                 before[index]
             );

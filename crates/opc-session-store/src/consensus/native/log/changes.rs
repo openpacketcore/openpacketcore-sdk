@@ -429,6 +429,35 @@ pub(super) struct Publication {
 }
 
 impl Publication {
+    pub(super) fn check_async_reservation(
+        &self,
+        reservation: crate::sqlite::consensus::wal::async_authority::Reservation,
+    ) -> io::Result<()> {
+        let frontiers = &self.proof.frontiers;
+        if let Some(vote) = frontiers.vote {
+            reservation.check(vote.leader_id.term)?;
+        }
+        for id in [frontiers.committed, frontiers.purged]
+            .into_iter()
+            .flatten()
+            .chain(
+                self.rows
+                    .values()
+                    .filter_map(|row| row.after.as_ref().map(|row| row.id())),
+            )
+        {
+            reservation.check(id.leader_id.term)?;
+            reservation.check(id.index)?;
+        }
+        for row in self.rows.values().filter_map(|row| row.after.as_ref()) {
+            super::super::async_recovery::check_log_reservation(
+                &row.resident()?.entry,
+                reservation,
+            )?;
+        }
+        Ok(())
+    }
+
     pub(super) fn prepare(
         log: &NativeLog,
         operation: &Operation,

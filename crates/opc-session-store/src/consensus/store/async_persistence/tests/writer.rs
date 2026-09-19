@@ -400,9 +400,7 @@ async fn public_background_error_recovery(hold: RecoveryHold) {
             ).await
         };
         for (role, store) in [("leader", fleet.store(leader)), ("cold", fleet.store(follower))] {
-            let metrics = store.inner.raft.metrics();
-            let metrics = metrics.borrow();
-            eprintln!("async_failed_writer_rejoin role={role} elapsed_us={} result={initialized:?} health={:?} vote={:?} log={:?} applied={:?} snapshot={:?}", started_repair.elapsed().as_micros(), store.persistence_health(), metrics.vote, metrics.last_log_index, metrics.last_applied, metrics.snapshot);
+            eprintln!("async_failed_writer_rejoin role={role} elapsed_us={} initialized={} engine_running={} deadline_elapsed={}", started_repair.elapsed().as_micros(), initialized.result.is_ok(), store.persistence_health().engine_running, initialized.expired_stage().is_some());
         }
         // RecoveryRequired describes one incomplete bounded cold attempt.
         // After activation, the remaining initialized probe can expire at
@@ -442,7 +440,7 @@ async fn public_background_error_recovery(hold: RecoveryHold) {
                 ),
             ).await.expect("cold recovery completes within the existing setup guard");
             attempts += 1;
-            eprintln!("async_failed_writer_rejoin attempt={attempts} elapsed_us={} result={initialized:?} health={:?}", started_repair.elapsed().as_micros(), cold.persistence_health());
+            eprintln!("async_failed_writer_rejoin attempt={attempts} elapsed_us={} initialized={} engine_running={} deadline_elapsed={}", started_repair.elapsed().as_micros(), initialized.result.is_ok(), cold.persistence_health().engine_running, initialized.expired_stage().is_some());
         }
         initialized.result.expect("bounded recovery retries must survive a proven post-activation admission deadline");
         assert_eq!(probe_deadlines_seen, if hold == RecoveryHold::InitializedProbe { 2 } else { 0 });
@@ -607,11 +605,12 @@ async fn async_persistence_shutdown_deadline_survives_a_held_writer() {
         let cold = fleet.store(0);
         assert_eq!(
             cold.persistence_health().recovery,
-            Some(SessionAsyncRecoveryState::AwaitingLiveQuorum)
+            Some(SessionAsyncRecoveryState::Active)
         );
         assert!(!cold.status().admitted);
-        // A clean drain still reopens cold. Passive readiness cannot grant
-        // authority; use the existing public live-quorum admission sequence.
+        // The joined active consensus owner published a one-use close proof,
+        // unlike an isolated drain. Ordinary initialization must still obtain
+        // current quorum authority before this reopened store admits traffic.
         let setup_deadline =
             tokio::time::Instant::now() + DEFAULT_SESSION_CONSENSUS_OPERATION_TIMEOUT;
         loop {
