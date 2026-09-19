@@ -51458,9 +51458,20 @@ mod aya_runtime {
             assert_ne!(swapped_map_ids, expected_successor_map_ids);
             assert_eq!(current_graph_inventory(), admitted_graph_inventory);
             let swapped_create = backend.create_device(create.clone()).await;
+            // Both classifiers now reference CONFIG and SEQUENCE_LOCK. Their
+            // unordered program map-ID sets therefore survive this swap, but
+            // the untyped layout check must reject the wrong kernel names
+            // before loading or binding any typed map.
             assert!(
-                matches!(swapped_create, Err(GtpuError::AlreadyExists)),
-                "map-ID-swapped successor must retain the live program-to-pin conflict without mutation: {swapped_create:?}"
+                matches!(
+                    swapped_create,
+                    Err(GtpuError::Io {
+                        operation: "ebpf_pin_map_abi",
+                        kind: io::ErrorKind::InvalidData,
+                        raw_os_error: None,
+                    })
+                ),
+                "map-ID-swapped successor must retain the exact pin-layout refusal without mutation: {swapped_create:?}"
             );
             assert_eq!(
                 AyaGtpuRuntime::pinned_map_ids(
