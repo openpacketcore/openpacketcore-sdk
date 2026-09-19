@@ -71,7 +71,10 @@ This document defines the conformance of the `opc-proto-gtpu` crate against the 
   Recovery Time Stamp, and repeatable Private Extensions.
 - **Supported Extension Headers Notification**: mandatory, duplicate-free
   Extension Header Type List (including the specification-permitted empty
-  list) and receiver-ignored sequence semantics.
+  list), a one-octet count as specified by figure 8.5-1, and receiver-ignored
+  sequence semantics. The previous two-octet list encoding was incorrect;
+  it is not a compatibility profile. Other TLVs retain their two-octet
+  lengths. See [the correction evidence](docs/extension-list-wire.md).
 - **End Marker** (§7.3.2.3): S flag zero, tunnel TEID preserved (including the
   specified backward-compatibility zero case), repeatable Private Extensions, and a
   structurally validated PDU Session Container where permitted for 5GS

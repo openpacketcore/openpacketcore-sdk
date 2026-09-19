@@ -146,6 +146,11 @@ typed canonical output always clears it.
 
 ## Control-codec boundaries
 
+Supported Extension Headers Notification IE 141 uses a **one-octet list
+count**, unlike the other control TLVs. The corrected wire contract,
+independent corpus and compatibility limits are recorded in
+[extension-list-wire.md](docs/extension-list-wire.md).
+
 - Received Recovery counter values and the sequence fields of Error Indication
   and Supported Extension Headers Notification are intentionally ignored as
   TS 29.281 directs; canonical encoding emits zero for those fields.

@@ -13,6 +13,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   replacement, shutdown and multihoming failover qualification (Refs #788).
 
 ### Added
+- `opc-proto-gtpu`: correct the Supported Extension Headers Notification
+  list count to the single-octet wire layout in TS 29.281 figure 8.5-1;
+  reject the former two-octet encoding and retain bounded IE parsing,
+  independent full-count-domain fixtures and corrected fuzz seeds (Refs #341,
+  #790).
 - `opc-proto-ngap`: consolidate N3IWF subset acceptance evidence, public
   revisions and bounded fuzz qualification; reconcile stale procedure-status
   text while preserving all unsupported fields and disabled triggers (Refs #787).

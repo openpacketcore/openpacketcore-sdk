@@ -438,6 +438,9 @@ impl fmt::Debug for GtpuPeerAddress {
 }
 
 /// Duplicate-free supported extension-header type list.
+///
+/// TS 29.281 figure 8.5-1 uses a **one-octet** length/count for IE 141,
+/// unlike the two-octet lengths of the other typed control TLVs.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct GtpuExtensionHeaderTypeList(Vec<GtpuExtensionHeaderType>);
 
@@ -1671,6 +1674,27 @@ fn parse_ies(
                 parsed.known_ie_offsets.push((ie_type, datagram_offset));
                 offset += 5;
             }
+            IE_EXTENSION_HEADER_TYPE_LIST => {
+                // TS 29.281 figure 8.5-1: type, one-octet count, then n
+                // extension types. Do not apply the generic TLV u16 length.
+                require_bytes(payload, offset, 2, datagram_offset)?;
+                let value_len = usize::from(payload[offset + 1]);
+                require_bytes(payload, offset, 2 + value_len, datagram_offset)?;
+                if parsed.extension_header_type_list.is_some() {
+                    return Err(duplicate(ie_type, datagram_offset));
+                }
+                let end = offset + 2 + value_len;
+                let types = payload[offset + 2..end]
+                    .iter()
+                    .copied()
+                    .map(GtpuExtensionHeaderType::new);
+                parsed.extension_header_type_list = Some(
+                    GtpuExtensionHeaderTypeList::new(types)
+                        .map_err(|_| invalid_value(ie_type, datagram_offset))?,
+                );
+                parsed.known_ie_offsets.push((ie_type, datagram_offset));
+                offset = end;
+            }
             0..=127 => {
                 return Err(GtpuControlCodecError::new(
                     GtpuControlCodecErrorCode::UnknownTvIe { ie_type },
@@ -1710,17 +1734,6 @@ fn parse_ies(
                             _ => return Err(invalid_length(ie_type, datagram_offset)),
                         };
                         parsed.peer_address = Some(GtpuPeerAddress::new(address));
-                        parsed.known_ie_offsets.push((ie_type, datagram_offset));
-                    }
-                    IE_EXTENSION_HEADER_TYPE_LIST => {
-                        if parsed.extension_header_type_list.is_some() {
-                            return Err(duplicate(ie_type, datagram_offset));
-                        }
-                        let types = value.iter().copied().map(GtpuExtensionHeaderType::new);
-                        parsed.extension_header_type_list =
-                            Some(GtpuExtensionHeaderTypeList::new(types).map_err(|_| {
-                                invalid_value(IE_EXTENSION_HEADER_TYPE_LIST, datagram_offset)
-                            })?);
                         parsed.known_ie_offsets.push((ie_type, datagram_offset));
                     }
                     IE_GTPU_TUNNEL_STATUS => {
@@ -1868,7 +1881,7 @@ impl ControlIeRef<'_> {
                 IpAddr::V4(_) => 7,
                 IpAddr::V6(_) => 19,
             }),
-            Self::ExtensionTypes(value) => tlv_wire_len(value.0.len()),
+            Self::ExtensionTypes(value) => value.0.len().checked_add(2).ok_or_else(length_overflow),
             Self::RecoveryTimeStamp(value) => tlv_wire_len(
                 value
                     .additional_data
@@ -1911,7 +1924,11 @@ impl ControlIeRef<'_> {
                 }
             }
             Self::ExtensionTypes(value) => {
-                put_tlv_header(destination, IE_EXTENSION_HEADER_TYPE_LIST, value.0.len())?;
+                let count = u8::try_from(value.0.len()).map_err(|_| {
+                    GtpuControlCodecError::new(GtpuControlCodecErrorCode::InvalidModel, 0)
+                })?;
+                destination.put_u8(IE_EXTENSION_HEADER_TYPE_LIST);
+                destination.put_u8(count);
                 for header_type in &value.0 {
                     destination.put_u8(header_type.value());
                 }
