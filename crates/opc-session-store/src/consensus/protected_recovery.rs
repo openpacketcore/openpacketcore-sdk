@@ -14,7 +14,11 @@ use futures_util::FutureExt;
 use p256::ecdsa::{signature::hazmat::PrehashVerifier, Signature, VerifyingKey};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
-use std::{collections::BTreeSet, fmt, sync::Arc};
+use std::{
+    collections::BTreeSet,
+    fmt,
+    sync::{Arc, OnceLock},
+};
 #[cfg(target_os = "linux")]
 use tokio::sync::{watch, Mutex};
 
@@ -62,21 +66,76 @@ impl Key {
     }
 }
 
-#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
+#[derive(Clone, Serialize, Deserialize)]
+#[serde(from = "SignedWire", into = "SignedWire")]
 struct Signed {
     r: [u8; 32],
     s: [u8; 32],
+    verified: OnceLock<VerifiedSignature>,
 }
+
+// Repeated live frontier validation must not repeat every owner's elliptic
+// curve computation. This positive result binds *all* verifier inputs, not
+// just an owner or challenge. It grants no scope, membership or Raft authority.
+// One fixed-size entry per signature stays bounded and may follow a clone.
+#[derive(Clone, Copy, PartialEq, Eq)]
+struct VerifiedSignature {
+    key: [u8; 33],
+    digest: [u8; 32],
+    r: [u8; 32],
+    s: [u8; 32],
+}
+
+// Keep the existing wire shape exact. Every cold or wire decode starts without
+// a verification result; neither serialization nor equality includes it.
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct SignedWire {
+    r: [u8; 32],
+    s: [u8; 32],
+}
+impl From<SignedWire> for Signed {
+    fn from(value: SignedWire) -> Self {
+        Self {
+            r: value.r,
+            s: value.s,
+            verified: OnceLock::new(),
+        }
+    }
+}
+impl From<Signed> for SignedWire {
+    fn from(value: Signed) -> Self {
+        Self {
+            r: value.r,
+            s: value.s,
+        }
+    }
+}
+impl PartialEq for Signed {
+    fn eq(&self, other: &Self) -> bool {
+        self.r == other.r && self.s == other.s
+    }
+}
+impl Eq for Signed {}
+
 impl Signed {
     fn new(bytes: [u8; 64]) -> Self {
         let mut r = [0; 32];
         let mut s = [0; 32];
         r.copy_from_slice(&bytes[..32]);
         s.copy_from_slice(&bytes[32..]);
-        Self { r, s }
+        SignedWire { r, s }.into()
     }
     fn verify(&self, key: [u8; 33], digest: [u8; 32]) -> Result<()> {
+        let input = VerifiedSignature {
+            key,
+            digest,
+            r: self.r,
+            s: self.s,
+        };
+        if self.verified.get() == Some(&input) {
+            return Ok(());
+        }
         let signature = Signature::from_scalars(self.r, self.s).map_err(|_| REJECTED)?;
         if signature.normalize_s() != signature {
             return Err(REJECTED);
@@ -84,7 +143,11 @@ impl Signed {
         VerifyingKey::from_sec1_bytes(&key)
             .map_err(|_| REJECTED)?
             .verify_prehash(&digest, &signature)
-            .map_err(|_| REJECTED)
+            .map_err(|_| REJECTED)?;
+        // Concurrent first checks may duplicate computation but never publish
+        // a failed result or replace another exact positive result.
+        let _ = self.verified.set(input);
+        Ok(())
     }
 }
 

@@ -440,6 +440,14 @@ selection. All signatures are required in the committed boundary. Independent
 log, application, snapshot and cold-generation validation enforce that proof;
 every Ready report additionally checks the exact selection before activation.
 
+Repeated live validation may reuse a successful signature calculation only for
+identical public-key, digest and signature-scalar bytes within that signature's
+in-memory object. This fixed-size result grants no scope or consensus authority;
+all inventory, challenge, frontier and current-authority predicates still run.
+It is excluded from equality and serialization. Every wire or cold decode starts
+without it and must independently verify the signature. This keeps an unchanged
+32-owner certificate from repeatedly consuming ordinary operation deadlines.
+
 Each owner must durably enforce the inclusive retired floor across its whole
 configuration scope, including different and unknown bindings. Retirement
 serializes with physical effects: all accepted old work must finish, be

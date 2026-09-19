@@ -165,7 +165,10 @@ async fn async_persistence_resumed_catch_up_recertifies_a_new_committed_leader()
         .await
         .expect("new authenticated leader requests recertification");
         assert!(!cold.inner.persistence_protocol.is_active());
-        assert_eq!(cold.inner.raft.metrics().borrow().vote, retained_vote);
+        assert!(
+            cold.inner.raft.metrics().borrow().vote == retained_vote,
+            "new leader hint cannot change the cold vote"
+        );
         *fleet.peers[returning].blocked_append_above.lock().unwrap() = None;
         super::majority_protocol::recover(&fleet).await;
         let successor_cut = fleet.peers[successor].last_cut.lock().unwrap().unwrap();

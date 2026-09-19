@@ -250,6 +250,27 @@ The reservation fixtures now reopen their retained roots to obtain cold
 admission rather than forcibly replacing an Active admission. No deadline,
 cryptographic check or completed-application requirement changes.
 
+A later two-CPU native replay failed the maximum-owner fixture after recovery
+and lease acquisition: `delete_fenced` returned an unknown outcome within the
+unchanged 800 ms bound (exit 101, SHA-256
+`d28890591c6d5914084d2e5dffed7cb3b7d2f8ff5c2f6cb5c0248f0a174831e8`).
+This is distinct from the cold-rejoin progress defect. Diagnostic counters and
+stack samples identified repeated verification of the same 32-owner signatures
+during ordinary frontier validation. A traced control run passed but spent
+718 ms acquiring the lease and 742 ms deleting it. The fixture first observes
+a fence and constructs a request; it does not create a session record there.
+
+An in-memory signature now retains one positive result bound to its exact
+public key, digest and both scalar byte arrays. All surrounding validation
+still runs. The result cannot be supplied on the wire or recovered from disk;
+deserialization starts empty. Changed keys, digests, signatures and authority
+remain rejected. With this correction the same traced operations took 45 ms
+and 34 ms; all fifteen selected recovery/crypto controls passed (exit 0,
+SHA-256 `7c96f0c833c87f78cc1cb849cbb874f6de07c82f49b050f763142e04a8aa5617`).
+These are diagnostic observations, not a latency qualification. Temporary
+counters were removed; exact-revision native and full gates remain separately
+reported in the PR. No production deadline or verification predicate changed.
+
 This is a new explicit SDK capability, not an automatic claim about an
 existing product provider. ePDG must provision the complete inventory, wire
 actual member/publication owners to enforce retirement at their effect

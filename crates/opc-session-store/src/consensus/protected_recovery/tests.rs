@@ -30,6 +30,45 @@ fn sign(n: u8, digest: [u8; 32]) -> [u8; 64] {
     signature.normalize_s().to_bytes().into()
 }
 
+#[test]
+fn signature_reuse_binds_every_input_and_cannot_cross_a_cold_decode() {
+    let key = public(0x62);
+    let digest = [0x63; 32];
+    let signed = Signed::new(sign(0x62, digest));
+    let encoded = serde_json::to_vec(&signed).unwrap();
+    assert!(signed.verified.get().is_none());
+    assert!(signed.verify(key, digest).is_ok());
+    assert!(signed.verified.get().is_some());
+    let warmed = signed.clone();
+    assert!(warmed.verify(key, digest).is_ok());
+    assert!(serde_json::to_vec(&warmed).unwrap() == encoded);
+
+    assert!(warmed.verify(public(0x64), digest).is_err());
+    assert!(warmed.verify(key, [0x65; 32]).is_err());
+    let mut changed = warmed.clone();
+    changed.r[0] ^= 1;
+    assert!(changed.verify(key, digest).is_err());
+    changed = warmed.clone();
+    changed.s[0] ^= 1;
+    assert!(changed.verify(key, digest).is_err());
+    assert!(warmed.verify(key, digest).is_ok());
+
+    let cold: Signed = serde_json::from_slice(&encoded).unwrap();
+    assert!(cold == warmed);
+    assert!(cold.verified.get().is_none());
+    assert!(cold.verify(key, [0x65; 32]).is_err());
+    assert!(
+        cold.verified.get().is_none(),
+        "failure cannot populate a result"
+    );
+    assert!(cold.verify(key, digest).is_ok());
+    assert!(cold.verified.get().is_some());
+
+    let mut injected = serde_json::to_value(&signed).unwrap();
+    injected["verified"] = serde_json::Value::Bool(true);
+    assert!(serde_json::from_value::<Signed>(injected).is_err());
+}
+
 pub(crate) fn fixture() -> (ProtectedRecoveryInventory, Selection) {
     let identity = SessionConsensusIdentity::new(
         SessionConsensusClusterId::new("protected-recovery-fixture").unwrap(),
