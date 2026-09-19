@@ -58,7 +58,7 @@ extension also fails. Each source is restored byte for byte. A separate
 native wire-name mutation must fail the capture checker even after the real
 Rust test passes; this separates live endpoint success from wire evidence.
 
-The native runner explicitly executes ten SCTP-AUTH cases, including three
+The SNI increment qualified ten SCTP-AUTH cases, including three
 named associations and two rekeys per peer. Its independent bounded loopback
 capture requires the exact initial ClientHello name and empty ServerHello
 acknowledgement in all three associations, key IDs 0 through 3 matching DTLS
@@ -88,7 +88,7 @@ specifies separate IKE/IPsec obligations. SNI does not complete those profiles.
 | --- | --- | --- |
 | [TS 33.210 V18.2.0 clause 6.2.3](https://www.etsi.org/deliver/etsi_ts/133200_133299/133210/18.02.00_60/ts_133210v180200p.pdf): cipher/signature profile | ECDHE-ECDSA AEAD suites; P-256/P-384 and SHA-256/SHA-384 | Mandatory DHE-RSA AES-128-GCM and RSA signature profile; associated parameter validation and independent interoperability |
 | Same TLS profile: extensions | Signature algorithms, supported groups, extended master secret, coordinated RFC 5746 rekey and explicit RFC 6066 SNI | Complete combined-profile qualification; recommended OCSP/resumption are outside this transport |
-| [TS 33.310 V18.8.0 clause 6.1.3a](https://www.etsi.org/deliver/etsi_ts/133300_133399/133310/18.08.00_60/ts_133310v180800p.pdf): TLS entity certificate profile | Exact SPIFFE identity and optional DNS SAN, chain/time/role checks and opt-in complete direct CRLs | Operator TLS certificate-profile admission and its independent positive/negative corpus; remote CRL retrieval and OCSP remain unsupported |
+| [TS 33.310 V18.8.0 clause 6.1.3a](https://www.etsi.org/deliver/etsi_ts/133300_133399/133310/18.08.00_60/ts_133310v180800p.pdf): TLS entity certificate profile | Exact SPIFFE identity and optional DNS SAN, chain/time/role checks and opt-in complete direct CRLs | The later [bounded ECDSA certificate profile](rfc6083-certificate-profile.md) adds operator certificate constraints and independent signed fixtures; RSA, remote CRL retrieval and OCSP remain unsupported |
 
 The older hash-pinned fixture contract retains its original scope. This
 increment adds no dependencies, DTLS 1.3, resumption or application identity

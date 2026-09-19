@@ -1802,6 +1802,7 @@ struct HandshakeValidation {
     usage: PeerUsage,
     revocation: Option<Arc<rfc6083::revocation::Snapshot>>,
     server_name: Option<rfc6083::ServerName>,
+    certificate_profile: Option<rfc6083::CertificateProfile>,
 }
 
 fn certificate_expiry(der: &[u8]) -> Result<Timestamp, DiameterTlsError> {
@@ -1925,6 +1926,12 @@ fn validate_peer_certificate_chain(
         .map_err(|_| DiameterTlsError::Authentication)?;
     if let Some(revocation) = &validation.revocation {
         revocation.verify_identifiers(&path, &bundle.certificates)?;
+    }
+    if let Some(profile) = validation.certificate_profile {
+        if validation.revocation.is_none() {
+            return Err(DiameterTlsError::Authentication);
+        }
+        expiry = expiry.min(profile.verify(&path, &bundle.certificates, validation.usage)?);
     }
     if let Some(name) = &validation.server_name {
         name.verify_certificate(leaf)?;
@@ -2868,6 +2875,7 @@ impl DiameterDtlsSctpConnector {
             usage: PeerUsage::Server,
             revocation: None,
             server_name: None,
+            certificate_profile: None,
         };
         let established = match tokio::time::timeout_at(
             deadline,
@@ -3063,6 +3071,7 @@ impl DiameterDtlsSctpAcceptor {
             usage: PeerUsage::Client,
             revocation: None,
             server_name: None,
+            certificate_profile: None,
         };
         let established = match tokio::time::timeout_at(
             deadline,

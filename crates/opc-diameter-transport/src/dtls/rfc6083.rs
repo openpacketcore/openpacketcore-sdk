@@ -46,9 +46,11 @@
 use super::*;
 use opc_types::SpiffeId;
 
+mod certificates;
 pub(in crate::dtls) mod revocation;
 mod server_name;
 pub(in crate::dtls) mod streams;
+pub use certificates::CertificateProfile;
 pub use revocation::{
     CrlError, CrlEvidence, CrlGeneration, CrlPublisher, CrlSource, MAX_CRLS, MAX_CRL_BYTES,
     MAX_CRL_SET_BYTES,
@@ -355,6 +357,7 @@ struct Endpoint {
     engine_config: Arc<dimpl::Config>,
     crls: Option<CrlSource>,
     server_name: Option<ServerName>,
+    certificate_profile: Option<CertificateProfile>,
 }
 
 impl Endpoint {
@@ -380,6 +383,7 @@ impl Endpoint {
             engine_config,
             crls: None,
             server_name: None,
+            certificate_profile: None,
         })
     }
 
@@ -392,6 +396,14 @@ impl Endpoint {
                 .map_err(|_| Error::PolicyRejected)?,
         );
         self.server_name = Some(name);
+        Ok(self)
+    }
+
+    fn with_certificate_profile(mut self, profile: CertificateProfile) -> Result<Self, Error> {
+        if self.crls.is_none() {
+            return Err(Error::PolicyRejected);
+        }
+        self.certificate_profile = Some(profile);
         Ok(self)
     }
 
@@ -427,6 +439,40 @@ impl Endpoint {
                 .as_ref()
                 .map(|source| source.bind(handshake.epoch()))
                 .transpose()?;
+            // Profiled local credentials are checked before sending any Hello.
+            // The controller still owns admission and the private key; the
+            // certificate's own SPIFFE domain scopes its local verification.
+            let local_profile_expiry = if let Some(profile) = self.certificate_profile {
+                let expected_peer =
+                    opc_identity::extract_spiffe_id_from_cert_der(&certificate.certificate)
+                        .map_err(|_| Error::MaterialNotAdmitted)?;
+                let local_validation = HandshakeValidation {
+                    expected_peer,
+                    trust_bundles: trust_bundles.clone(),
+                    usage: match role {
+                        Role::Connector => PeerUsage::Client,
+                        Role::Acceptor => PeerUsage::Server,
+                    },
+                    revocation: crls.as_ref().map(|v| Arc::clone(&v.snapshot)),
+                    server_name: if role == Role::Acceptor {
+                        self.server_name.clone()
+                    } else {
+                        None
+                    },
+                    certificate_profile: Some(profile),
+                };
+                let chain: Vec<_> = handshake
+                    .certificate_chain()
+                    .iter()
+                    .map(|der| der.as_ref().to_vec())
+                    .collect();
+                Some(
+                    validate_peer_certificate_chain(&chain, &local_validation)
+                        .map_err(|_| Error::MaterialNotAdmitted)?,
+                )
+            } else {
+                None
+            };
             let handshake_deadline = crls.as_ref().map_or(deadline, |v| {
                 deadline.min(wall_expiry_deadline(
                     v.evidence().expires_at(),
@@ -443,6 +489,7 @@ impl Endpoint {
                     Role::Acceptor => PeerUsage::Client,
                 },
                 revocation: crls.as_ref().map(|v| Arc::clone(&v.snapshot)),
+                certificate_profile: self.certificate_profile,
                 server_name: if role == Role::Connector {
                     self.server_name.clone()
                 } else {
@@ -488,10 +535,14 @@ impl Endpoint {
                 return Err(Error::Retired);
             }
             check_deadline(deadline)?;
+            let local_certificate_expires_at = local_profile_expiry
+                .map_or(admission.certificate_chain_expires_at(), |expiry| {
+                    expiry.min(admission.certificate_chain_expires_at())
+                });
             let hard_deadline = association_hard_deadline(
                 Instant::now(),
                 self.policy.maximum_connection_age(),
-                admission.certificate_chain_expires_at(),
+                local_certificate_expires_at,
                 completed.peer_expires_at,
             );
             let hard_deadline = crls.as_ref().map_or(hard_deadline, |v| {
@@ -526,11 +577,12 @@ impl Endpoint {
                     version: completed.version,
                     cipher: completed.cipher,
                     material_epoch: admission.epoch(),
-                    local_certificate_expires_at: admission.certificate_chain_expires_at(),
+                    local_certificate_expires_at,
                     peer_certificate_expires_at: completed.peer_expires_at,
                     expected_peer: self.expected_peer.clone(),
                     crls: crls.as_ref().map(|v| v.evidence()),
                     server_name: self.server_name.clone(),
+                    certificate_profile: self.certificate_profile,
                 },
                 maximum_plaintext_bytes: self.policy.maximum_plaintext_bytes,
                 validation,
@@ -560,6 +612,13 @@ impl Endpoint {
 pub struct Connector(Endpoint);
 
 impl Connector {
+    /// Add the documented certificate constraints to both local and peer paths.
+    /// Requires `new_with_required_crls`; both local and peer trust-domain bundles
+    /// and their complete direct CRLs must be present. No fallback is allowed.
+    pub fn with_certificate_profile(self, profile: CertificateProfile) -> Result<Self, Error> {
+        self.0.with_certificate_profile(profile).map(Self)
+    }
+
     /// Require SNI acknowledgement and an exact server DNS SAN, in addition to
     /// the existing mutual SPIFFE/trust checks. No wildcard or fallback is used.
     /// The immutable name is required again during coordinated rekey.
@@ -609,6 +668,13 @@ impl fmt::Debug for Connector {
 pub struct Acceptor(Endpoint);
 
 impl Acceptor {
+    /// Add the documented certificate constraints to both local and peer paths.
+    /// Requires `new_with_required_crls`; both local and peer trust-domain bundles
+    /// and their complete direct CRLs must be present. No fallback is allowed.
+    pub fn with_certificate_profile(self, profile: CertificateProfile) -> Result<Self, Error> {
+        self.0.with_certificate_profile(profile).map(Self)
+    }
+
     /// Require this exact SNI name before acknowledging it. The admitted local
     /// certificate must contain its DNS SAN. This selects one configured
     /// credential controller; incoming names never select or broaden trust.
@@ -673,9 +739,16 @@ pub struct Evidence {
     expected_peer: ExpectedPeer,
     crls: Option<CrlEvidence>,
     server_name: Option<ServerName>,
+    certificate_profile: Option<CertificateProfile>,
 }
 
 impl Evidence {
+    /// Additional certificate profile verified on both authenticated paths.
+    /// This records the bounded subset, not full 3GPP or external interoperability.
+    pub const fn certificate_profile(&self) -> Option<CertificateProfile> {
+        self.certificate_profile
+    }
+
     /// Explicitly borrow the name acknowledged and certificate-checked in the
     /// completed handshake. This is not DNS resolution or application authority.
     pub fn server_name(&self) -> Option<&ServerName> {

@@ -57,6 +57,15 @@ during rekey. Missing or mismatching names fail closed; there is no CN or
 wildcard fallback. The independent Hello fixtures and native wire evidence
 are documented in [named endpoints](../../docs/rfc6083-server-name.md).
 
+Endpoints constructed with required CRLs can also add
+`CertificateProfile::NdsAfEcdsa` using `with_certificate_profile`. The bounded
+operator-certificate subset checks local credentials and the authenticated
+peer path, including the original selected anchor's CA constraints and
+expiry. It retains those checks through rekey without broadening SPIFFE or
+trust authority. See the precise ECDSA subset, independent signed corpus and
+remaining RSA/retrieval limitations in
+[certificate constraints](../../docs/rfc6083-certificate-profile.md).
+
 The required Linux SCTP job executes the generic, CRL, Diameter, stream and
 path-failure tests in a private SCTP-AUTH namespace. Actual kernel drop
 counters distinguish a protected active-path failure from an unfaulted
