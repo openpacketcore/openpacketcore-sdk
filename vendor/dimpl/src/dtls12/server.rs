@@ -402,6 +402,9 @@ impl State {
             &server.defragment_buffer,
             ch.renegotiation_scsv,
         )?;
+        server
+            .engine
+            .verify_server_name(&ch.extensions, &server.defragment_buffer, true)?;
 
         // Enforce DTLS1.2
         if ch.client_version != ProtocolVersion::DTLS1_2 {
@@ -1369,6 +1372,11 @@ fn handshake_create_server_hello(
             .ok_or(Error::RenegotiationAttempt)?;
         extension.extension_data_range = start..extension_data.len();
     }
+    engine.add_server_name(
+        sh.extensions.as_mut().ok_or(Error::IncompleteServerHello)?,
+        extension_data,
+        false,
+    )?;
     sh.serialize(extension_data, body);
     Ok(())
 }
@@ -1568,6 +1576,43 @@ mod tests {
 
     use crate::PskResolver;
     use crate::dtls12::message::DTLSRecord;
+
+    #[test]
+    fn sni_server_checks_independently_encrypted_client_hello_name() {
+        use crate::dtls12::engine::server_name::tests::{fixtures, receiver};
+        let cases = fixtures("server");
+        assert_eq!(cases.len(), 99);
+        for case in cases {
+            let engine = receiver(false, case.configured);
+            let mut server = Server::new_with_engine(engine, Instant::now());
+            server
+                .engine
+                .parse_packet(&case.record)
+                .expect("independent protected Hello");
+            let error = State::AwaitClientHello
+                .await_client_hello(&mut server)
+                .expect_err("synthetic record context");
+            if case.label == "duplicate" {
+                assert!(matches!(
+                    error,
+                    InternalError::Transient(crate::error::TransientError::Parse(
+                        nom::error::ErrorKind::LengthValue
+                    ))
+                ));
+                continue;
+            }
+            let expected = if case.accept {
+                crate::SecurityError::NoMutuallyAcceptableCipherSuite
+            } else {
+                crate::SecurityError::ServerNameMismatch
+            };
+            assert!(
+                matches!(error, InternalError::Fatal(e) if e == Error::SecurityError(expected)),
+                "{}",
+                case.label
+            );
+        }
+    }
 
     #[test]
     fn rekey_server_checks_independently_encrypted_client_hello_binding() {

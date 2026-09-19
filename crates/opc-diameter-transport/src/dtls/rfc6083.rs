@@ -18,6 +18,8 @@
 //! Material or required-CRL withdrawal/replacement retires the association.
 //! [`Policy::with_rekey`] enables coordinated, connection-bound in-place rekey
 //! within the original credential, identity, cipher and absolute lifetime.
+//! Optional [`ServerName`] adds SNI acknowledgement and exact server DNS SAN
+//! checks to the existing mutual identity contract, including during rekey.
 //!
 //! ```no_run
 //! use opc_diameter_transport::rfc6083::{
@@ -45,11 +47,13 @@ use super::*;
 use opc_types::SpiffeId;
 
 pub(in crate::dtls) mod revocation;
+mod server_name;
 pub(in crate::dtls) mod streams;
 pub use revocation::{
     CrlError, CrlEvidence, CrlGeneration, CrlPublisher, CrlSource, MAX_CRLS, MAX_CRL_BYTES,
     MAX_CRL_SET_BYTES,
 };
+pub use server_name::ServerName;
 
 pub use super::{DtlsSctpCipher as Cipher, DtlsSctpVersion as Version};
 
@@ -350,6 +354,7 @@ struct Endpoint {
     policy: Policy,
     engine_config: Arc<dimpl::Config>,
     crls: Option<CrlSource>,
+    server_name: Option<ServerName>,
 }
 
 impl Endpoint {
@@ -374,7 +379,20 @@ impl Endpoint {
             policy,
             engine_config,
             crls: None,
+            server_name: None,
         })
+    }
+
+    fn with_server_name(mut self, name: ServerName) -> Result<Self, Error> {
+        self.engine_config = Arc::new(
+            self.engine_config
+                .as_ref()
+                .clone()
+                .with_server_name(name.0.clone())
+                .map_err(|_| Error::PolicyRejected)?,
+        );
+        self.server_name = Some(name);
+        Ok(self)
     }
 
     async fn establish(
@@ -398,6 +416,12 @@ impl Endpoint {
                 certificate,
                 trust_bundles,
             } = prepare_material(&self.controller).await?;
+            if role == Role::Acceptor {
+                if let Some(name) = &self.server_name {
+                    name.verify_certificate(&certificate.certificate)
+                        .map_err(|_| Error::MaterialNotAdmitted)?;
+                }
+            }
             let mut crls = self
                 .crls
                 .as_ref()
@@ -419,6 +443,11 @@ impl Endpoint {
                     Role::Acceptor => PeerUsage::Client,
                 },
                 revocation: crls.as_ref().map(|v| Arc::clone(&v.snapshot)),
+                server_name: if role == Role::Connector {
+                    self.server_name.clone()
+                } else {
+                    None
+                },
             };
             let handshake_result = run_transport_handshake_with_streams(
                 &mut engine,
@@ -501,6 +530,7 @@ impl Endpoint {
                     peer_certificate_expires_at: completed.peer_expires_at,
                     expected_peer: self.expected_peer.clone(),
                     crls: crls.as_ref().map(|v| v.evidence()),
+                    server_name: self.server_name.clone(),
                 },
                 maximum_plaintext_bytes: self.policy.maximum_plaintext_bytes,
                 validation,
@@ -530,6 +560,13 @@ impl Endpoint {
 pub struct Connector(Endpoint);
 
 impl Connector {
+    /// Require SNI acknowledgement and an exact server DNS SAN, in addition to
+    /// the existing mutual SPIFFE/trust checks. No wildcard or fallback is used.
+    /// The immutable name is required again during coordinated rekey.
+    pub fn with_server_name(self, name: ServerName) -> Result<Self, Error> {
+        self.0.with_server_name(name).map(Self)
+    }
+
     /// Validate immutable engine policy before accepting any peer traffic.
     pub fn new(
         material: TlsMaterialController,
@@ -572,6 +609,13 @@ impl fmt::Debug for Connector {
 pub struct Acceptor(Endpoint);
 
 impl Acceptor {
+    /// Require this exact SNI name before acknowledging it. The admitted local
+    /// certificate must contain its DNS SAN. This selects one configured
+    /// credential controller; incoming names never select or broaden trust.
+    pub fn with_server_name(self, name: ServerName) -> Result<Self, Error> {
+        self.0.with_server_name(name).map(Self)
+    }
+
     /// Validate immutable engine policy before accepting any peer traffic.
     pub fn new(
         material: TlsMaterialController,
@@ -628,9 +672,16 @@ pub struct Evidence {
     peer_certificate_expires_at: Timestamp,
     expected_peer: ExpectedPeer,
     crls: Option<CrlEvidence>,
+    server_name: Option<ServerName>,
 }
 
 impl Evidence {
+    /// Explicitly borrow the name acknowledged and certificate-checked in the
+    /// completed handshake. This is not DNS resolution or application authority.
+    pub fn server_name(&self) -> Option<&ServerName> {
+        self.server_name.as_ref()
+    }
+
     /// Local handshake role.
     pub const fn role(&self) -> Role {
         self.role

@@ -77,7 +77,7 @@ operation cancellation and native SCTP key activation. A separate mutation
 of an independent accepted binding also fails at runtime. Sources are restored
 byte for byte before final qualification.
 
-`ci/qualify-rfc6083-native.sh` explicitly resolves and executes nine native
+`ci/qualify-rfc6083-native.sh` explicitly resolves and executes ten native
 cases; ordinary ignored tests do not qualify the native carrier. The rekey
 case uses three real SCTP associations, all three ciphers and three rekeys
 per peer, preserving unread records on streams 0, 1 and 15 and exchanging new
@@ -88,6 +88,9 @@ six directions, actual SCTP-AUTH key IDs 0 through 4 matching DTLS epochs,
 old-key ChangeCipherSpec, a handshake record first under each new key, and
 zero capture drops. Successful native receive additionally exercises kernel
 authentication; the capture does not itself verify HMACs or key deletion.
+
+The additional [named endpoint case](rfc6083-server-name.md) keeps the exact
+SNI name and server DNS SAN constraint through rekey and protected delivery.
 
 This increment supplies coordinated rekey within the existing ECDHE-ECDSA
 and SPIFFE certificate profile. Full 3GPP PKI/profile coverage, remote CRL

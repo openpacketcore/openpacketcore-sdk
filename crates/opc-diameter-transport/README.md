@@ -50,6 +50,13 @@ lifetime remain binding. Native qualification includes an independent capture
 of actual SCTP-AUTH key transitions. See the exact profile and limits in
 [coordinated rekey](../../docs/rfc6083-rekey-transport.md).
 
+Generic `Connector::with_server_name` and `Acceptor::with_server_name` opt into
+one bounded RFC 6066 DNS name. SNI acknowledgement and exact server DNS SAN
+verification supplement the existing mutual SPIFFE/trust checks, including
+during rekey. Missing or mismatching names fail closed; there is no CN or
+wildcard fallback. The independent Hello fixtures and native wire evidence
+are documented in [named endpoints](../../docs/rfc6083-server-name.md).
+
 The required Linux SCTP job executes the generic, CRL, Diameter, stream and
 path-failure tests in a private SCTP-AUTH namespace. Actual kernel drop
 counters distinguish a protected active-path failure from an unfaulted
@@ -116,7 +123,8 @@ for the exact crash cut, credential handling and remaining limits.
   and `Origin-Realm` configuration. Typed CER/CEA parsing and construction use
   the same nonempty-ASCII DiameterIdentity contract, with ASCII
   case-insensitive authorization comparison.
-- Client `ServerName` is only ClientHello routing/SNI input. It is not
+- The Diameter TLS/TCP client's rustls `ServerName` is only ClientHello
+  routing/SNI input. It is not
   authorization evidence and no DNS SAN is required; the SPIFFE verifier and
   exact `ExpectedPeerIdentity` authorize the peer.
 - Diameter framing reads the exact 20-octet header before bounded allocation,

@@ -23,6 +23,7 @@ const MAX_DEFRAGMENT_PACKETS: usize = 50;
 const MAX_SEQUENCE_NUMBER: u64 = (1_u64 << 48) - 1;
 
 mod rekey;
+pub(super) mod server_name;
 
 struct Rfc6083OutputBarrier {
     preceding_datagrams: usize,

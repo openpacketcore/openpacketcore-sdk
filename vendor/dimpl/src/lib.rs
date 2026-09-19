@@ -285,6 +285,8 @@ pub use error::{
 
 mod config;
 pub use config::{Config, ConfigBuilder, Psk, PskResolver};
+mod server_name;
+pub use server_name::ServerName;
 
 #[cfg(feature = "rcgen")]
 pub mod certificate;

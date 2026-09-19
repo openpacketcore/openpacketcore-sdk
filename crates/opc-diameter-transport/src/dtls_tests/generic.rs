@@ -7,6 +7,7 @@ mod rekey;
 #[cfg(target_os = "linux")]
 mod restart;
 mod revocation;
+pub(crate) mod sni;
 mod streams;
 
 use super::*;
