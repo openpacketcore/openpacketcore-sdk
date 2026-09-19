@@ -23,6 +23,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- `opc-gtpu-dataplane`: expose the eBPF attachment's shared IPv4 control
+  socket through the backend trait, with exact hook checks, weak lifetime
+  ownership and removal/reinstall fencing. Linux kernel/mock backends return
+  explicit unsupported results; live tc tests cover Echo and required
+  extensions through this public port. Refs #341, #790, #795.
+
 - `opc-gtpu-dataplane` exposes a bounded control-datagram/response port on the
   existing Linux IPv4 reassembly socket. Echo, Error Indication and extension
   notifications preserve their transport rules, with explicit byte/ratio

@@ -30,6 +30,8 @@
 
 use std::cell::RefCell;
 
+#[cfg(target_os = "linux")]
+mod control_port;
 pub(crate) mod grouped_simulation;
 mod workload_scope;
 use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
@@ -2406,6 +2408,10 @@ pub(crate) struct EbpfTrafficObservationDrain {
 
 #[derive(Clone)]
 struct ManagedDevice {
+    /// Private socket slot identity changes on every registration. Ports hold
+    /// only weak references, so removal closes the queue even with old handles.
+    #[cfg(target_os = "linux")]
+    control_socket: Arc<Mutex<control_port::ControlSocketState>>,
     name: String,
     /// Legacy v5 IPv4 authority. Grouped attachments deliberately leave this
     /// absent even when their endpoint set contains IPv4, so no grouped graph
@@ -8556,6 +8562,8 @@ impl EbpfGtpuDataplaneBackend {
         devices.insert(
             ifindex,
             ManagedDevice {
+                #[cfg(target_os = "linux")]
+                control_socket: Arc::default(),
                 name: request.name.clone(),
                 local_ip: Some(local_ip),
                 grouped: None,
@@ -8757,6 +8765,8 @@ impl EbpfGtpuDataplaneBackend {
         devices.insert(
             ifindex,
             ManagedDevice {
+                #[cfg(target_os = "linux")]
+                control_socket: Arc::default(),
                 name: request.name.clone(),
                 local_ip: None,
                 grouped: Some(ManagedGroupedDevice {
@@ -8835,6 +8845,8 @@ impl EbpfGtpuDataplaneBackend {
         devices.insert(
             ifindex,
             ManagedDevice {
+                #[cfg(target_os = "linux")]
+                control_socket: Arc::default(),
                 name: name.clone(),
                 local_ip: Some(Ipv4Addr::from(local_ip)),
                 grouped: None,
@@ -10162,6 +10174,8 @@ impl EbpfGtpuDataplaneBackend {
                 devices.insert(
                     ifindex,
                     ManagedDevice {
+                        #[cfg(target_os = "linux")]
+                        control_socket: Arc::default(),
                         name: device.name.clone(),
                         local_ip: Some(Ipv4Addr::from(local_ip)),
                         grouped: None,
@@ -14443,6 +14457,18 @@ impl GtpuDataplaneBackend for EbpfGtpuDataplaneBackend {
     ) -> Result<TftUplinkClassifierRemovalOutcome, GtpuError> {
         self.run_blocking("ebpf_tft_remove", move |backend| {
             backend.remove_tft_classifier_sync(expected)
+        })
+        .await
+    }
+
+    #[cfg(target_os = "linux")]
+    async fn open_gtpu_control_port(
+        &self,
+        device: &GtpDevice,
+    ) -> Result<Arc<dyn crate::control_port::GtpuControlPort>, GtpuError> {
+        let device = device.clone();
+        self.run_blocking("ebpf_control_port", move |backend| {
+            backend.open_control_port_sync(device)
         })
         .await
     }
@@ -64649,6 +64675,8 @@ mod tests {
         backend.inner.devices.lock().unwrap().insert(
             ifindex,
             ManagedDevice {
+                #[cfg(target_os = "linux")]
+                control_socket: Arc::default(),
                 name: name.into(),
                 local_ip: None,
                 grouped: None,
@@ -65032,6 +65060,8 @@ mod tests {
                 .encode(),
         };
         let managed = ManagedDevice {
+            #[cfg(target_os = "linux")]
+            control_socket: Arc::default(),
             name: "sentinel-sensitive-interface".to_string(),
             local_ip: None,
             grouped: Some(grouped),
@@ -71201,6 +71231,8 @@ mod tests {
             backend.devices().expect("managed device lock").insert(
                 managed_ifindex,
                 ManagedDevice {
+                    #[cfg(target_os = "linux")]
+                    control_socket: Arc::default(),
                     name: managed_name.to_string(),
                     local_ip: None,
                     grouped: None,
@@ -74081,6 +74113,8 @@ mod tests {
         backend.inner.devices.lock().unwrap().insert(
             REPLACEMENT_IFINDEX,
             ManagedDevice {
+                #[cfg(target_os = "linux")]
+                control_socket: Arc::default(),
                 name: "s2bu-new".to_string(),
                 local_ip: Some(Ipv4Addr::new(192, 0, 2, 99)),
                 grouped: None,

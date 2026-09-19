@@ -2464,3 +2464,9 @@ sudo modprobe wireguard
 sudo unshare -n -- bash -lc 'ip link set lo up && OPC_GTPU_RUN_PRIVILEGED=1 cargo test -p opc-gtpu-dataplane --test linux_gtpu_privileged -- --ignored --nocapture --test-threads=1'
 sudo unshare -n -- bash -lc 'ip link set lo up && OPC_GTPU_RUN_PRIVILEGED=1 cargo test -p opc-gtpu-dataplane --test ebpf_gtpu_privileged -- --ignored --nocapture'
 ```
+
+The backend trait exposes `open_gtpu_control_port` for eBPF attachments with
+an IPv4 endpoint. Handles share one queue and lose access on removal,
+replacement, backend loss or observed hook loss. Linux kernel/mock adapters
+return an exact unsupported result. See the [control-port contract](docs/control-port.md)
+for socket lifetime, response budgets and the remaining backend limitations.
