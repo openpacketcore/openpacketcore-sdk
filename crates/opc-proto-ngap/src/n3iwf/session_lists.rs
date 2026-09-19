@@ -2,6 +2,7 @@
 //! Context/session procedures select the enclosing IE and correlate these
 //! identifiers with the original request. No session or resource is created.
 
+use super::qos_fields::QosResourceTypes;
 use super::resource_request::SetupRequestTransfer;
 use super::resource_results::{SetupFailureTransfer, SetupResponseTransfer};
 use super::setup_fields::{Reader, Writer};
@@ -24,6 +25,38 @@ impl SessionId {
     }
 }
 
+/// Caller-established resource types for each session's exact requested QFI set.
+/// This local input grants no resource, subscriber or procedure authority.
+#[derive(Clone, PartialEq, Eq)]
+pub struct SessionResourceTypes(Vec<(SessionId, QosResourceTypes)>);
+redacted!(SessionResourceTypes);
+impl SessionResourceTypes {
+    /// Require 1–256 distinct session identifiers. The classified boundary
+    /// checks that this roster exactly matches the admitted request list.
+    pub fn new(values: Vec<(SessionId, QosResourceTypes)>) -> Result<Self, DecodeError> {
+        validate_ids(values.iter().map(|(id, _)| *id), values.len())?;
+        Ok(Self(values))
+    }
+    /// Explicit local classification for a session, if supplied.
+    pub fn get(&self, session: SessionId) -> Option<&QosResourceTypes> {
+        self.0
+            .iter()
+            .find(|(id, _)| *id == session)
+            .map(|(_, types)| types)
+    }
+    fn validate(&self, sessions: &SessionSetupRequests<'_>) -> Result<(), DecodeError> {
+        if self.0.len() != sessions.0.len() {
+            return Err(invalid("session resource classification coverage"));
+        }
+        for session in &sessions.0 {
+            self.get(session.id)
+                .ok_or_else(|| invalid("missing session resource classification"))?
+                .requires_session_ambr(session.transfer.flows.values())?;
+        }
+        Ok(())
+    }
+}
+
 /// One setup request, retaining optional opaque NAS and its requested slice.
 pub struct SessionSetupRequest<'a> {
     /// Session being requested, without a local ownership claim.
@@ -32,7 +65,8 @@ pub struct SessionSetupRequest<'a> {
     pub slice: Snssai,
     /// Optional opaque per-session NAS. Empty and absent remain distinct.
     pub nas: Option<NasPdu<'a>>,
-    /// Qualified non-GBR request transfer.
+    /// Qualified root request transfer; missing Session AMBR requires the
+    /// classified list API and an all-GBR flow list.
     pub transfer: SetupRequestTransfer,
 }
 redacted!(SessionSetupRequest<'_>);
@@ -77,11 +111,38 @@ impl<'a> SessionSetupRequests<'a> {
     /// Unknown transfer fields are omitted; preserve the original input
     /// separately when lossless retransmission is required.
     pub fn encode(&self, ctx: EncodeContext) -> Result<EncodedValue, EncodeError> {
+        self.encode_with_resource_types(None, ctx)
+    }
+
+    /// Encode using exact caller-established session/QFI classification.
+    pub fn encode_classified(
+        &self,
+        resource_types: &SessionResourceTypes,
+        ctx: EncodeContext,
+    ) -> Result<EncodedValue, EncodeError> {
+        self.encode_with_resource_types(Some(resource_types), ctx)
+    }
+
+    fn encode_with_resource_types(
+        &self,
+        resource_types: Option<&SessionResourceTypes>,
+        ctx: EncodeContext,
+    ) -> Result<EncodedValue, EncodeError> {
+        if let Some(types) = resource_types {
+            types.validate(self).map_err(|_| {
+                EncodeError::new(EncodeErrorCode::Structural {
+                    reason: "session resource classification coverage",
+                })
+            })?;
+        }
         let mut length = 1;
         capacity(length, ctx)?;
         let mut transfers = Vec::with_capacity(self.0.len());
         for value in &self.0 {
-            let transfer = value.transfer.encode(ctx)?;
+            let transfer = match resource_types.and_then(|types| types.get(value.id)) {
+                Some(types) => value.transfer.encode_classified(types, ctx)?,
+                None => value.transfer.encode(ctx)?,
+            };
             add_size(
                 &mut length,
                 2 + if value.slice.sd().is_some() { 5 } else { 2 },
@@ -132,6 +193,25 @@ impl<'a> SessionSetupRequests<'a> {
         input: &'a [u8],
         ctx: DecodeContext,
     ) -> Result<AdmittedSessionRequests<'a>, DecodeError> {
+        Self::decode_with_resource_types(input, None, ctx)
+    }
+
+    /// Admit requests with exact caller-established resource classifications.
+    /// Session AMBR can be absent only in an all-GBR session. Shared policies,
+    /// physical bounds, session uniqueness and NAS custody remain unchanged.
+    pub fn decode_classified(
+        input: &'a [u8],
+        resource_types: &SessionResourceTypes,
+        ctx: DecodeContext,
+    ) -> Result<AdmittedSessionRequests<'a>, DecodeError> {
+        Self::decode_with_resource_types(input, Some(resource_types), ctx)
+    }
+
+    fn decode_with_resource_types(
+        input: &'a [u8],
+        resource_types: Option<&SessionResourceTypes>,
+        ctx: DecodeContext,
+    ) -> Result<AdmittedSessionRequests<'a>, DecodeError> {
         bound(input, ctx, 13)?;
         let mut reader = Reader::new(input, ctx);
         let count = reader.count(8, 256, 40)?;
@@ -157,7 +237,16 @@ impl<'a> SessionSetupRequests<'a> {
             };
             let slice = reader.snssai()?;
             let wire = reader.open_octets(ctx.max_message_len)?;
-            let admitted = SetupRequestTransfer::decode(&wire, nested)?;
+            let admitted = match resource_types {
+                Some(types) => SetupRequestTransfer::decode_classified(
+                    &wire,
+                    types
+                        .get(id)
+                        .ok_or_else(|| invalid("missing session resource classification"))?,
+                    nested,
+                )?,
+                None => SetupRequestTransfer::decode(&wire, nested)?,
+            };
             if admitted.ignored_ie_count != 0 || !admitted.notify_ie_ids.is_empty() {
                 diagnostics.push(SessionTransferDiagnostics {
                     session: id,
@@ -173,8 +262,12 @@ impl<'a> SessionSetupRequests<'a> {
             });
         }
         reader.finish()?;
+        let requests = Self(values);
+        if let Some(types) = resource_types {
+            types.validate(&requests)?;
+        }
         Ok(AdmittedSessionRequests {
-            requests: Self(values),
+            requests,
             diagnostics,
         })
     }

@@ -64,11 +64,13 @@ fn request_transfer(m: &Value) -> SetupRequestTransfer {
             m["uplink"]["address"].as_str().unwrap().parse().unwrap(),
             m["uplink"]["teid"].as_u64().unwrap() as u32,
         ),
-        aggregate_bit_rate: SessionAggregateBitRate::new(
-            m["ambr"]["downlink"].as_u64().unwrap(),
-            m["ambr"]["uplink"].as_u64().unwrap(),
-        )
-        .unwrap(),
+        aggregate_bit_rate: Some(
+            SessionAggregateBitRate::new(
+                m["ambr"]["downlink"].as_u64().unwrap(),
+                m["ambr"]["uplink"].as_u64().unwrap(),
+            )
+            .unwrap(),
+        ),
         session_type: match m["session_type"].as_str().unwrap() {
             "ipv4" => SessionType::Ipv4,
             "ipv6" => SessionType::Ipv6,

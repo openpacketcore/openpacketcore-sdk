@@ -1,14 +1,17 @@
 //! N3IWF PDU Session Resource Setup Request Transfer admission.
 //!
-//! This initial root subset admits one uplink tunnel and unique standardized
-//! non-GBR 5QI 9 flows. Session AMBR is required for these flows (TS 38.413
-//! 8.2.1.4). Optional root Security Indication, Network Instance and Common
+//! This root subset admits one uplink tunnel and unique QoS flows. Session
+//! AMBR is required by the default boundary. The explicitly classified boundary
+//! admits its absence only when the caller classifies every requested flow as
+//! GBR. Root QoS syntax does not establish that resource classification. Optional
+//! root Security Indication, Network Instance and Common
 //! Network Instance are admitted. Common takes precedence without hiding either
 //! supplied value or relaxing its validation.
 //! Data Forwarding Not Possible is receiver-ignored outside Handover Request
-//! (9.3.4.1). Other recognized optional fields and QoS profiles fail explicitly.
+//! (9.3.4.1). Other recognized optional transfer fields fail explicitly.
 //! No session, QoS, tunnel or datapath state is created here.
 use super::network_fields::{CommonNetworkInstance, TransportNetworkInstance};
+use super::qos_fields::QosResourceTypes;
 use super::resource_fields::{
     QosFlowSetupList, SessionAggregateBitRate, SessionType, UplinkTransport,
 };
@@ -22,11 +25,12 @@ use crate::policy;
 pub struct SetupRequestTransfer {
     /// Core-side endpoint for uplink traffic, distinct from a downlink endpoint.
     pub uplink: UplinkTransport,
-    /// Session aggregate limits, mandatory for this non-GBR flow subset.
-    pub aggregate_bit_rate: SessionAggregateBitRate,
+    /// Session aggregate limits. Absence requires exact caller classification
+    /// through the classified encode/decode APIs and an all-GBR flow list.
+    pub aggregate_bit_rate: Option<SessionAggregateBitRate>,
     /// Requested session payload kind.
     pub session_type: SessionType,
-    /// Unique bounded 5QI 9 flows.
+    /// Unique bounded root QoS requests; flow conditions are caller-qualified.
     pub flows: QosFlowSetupList,
     /// Optional peer security requirements; no protection is installed.
     pub security: Option<SecurityIndication>,
@@ -64,11 +68,37 @@ impl SetupRequestTransfer {
     /// Diagnostics and unknown retained values are not emitted by this typed
     /// constructor. The caller may retain the original input separately.
     pub fn encode(&self, ctx: EncodeContext) -> Result<EncodedValue, EncodeError> {
-        let mut fields = vec![
-            (130, 0, self.aggregate_bit_rate.encode(ctx)?),
-            (139, 0, self.uplink.encode(ctx)?),
-            (134, 0, self.session_type.encode(ctx)?),
-        ];
+        self.encode_with_resource_types(None, ctx)
+    }
+
+    /// Encode with caller-established classification for exactly this flow set.
+    /// Session AMBR may be absent only if every flow is classified GBR.
+    /// Per-flow abnormal conditions remain separately reportable through
+    /// `QosParameters::applicable`; this codec performs no resource allocation.
+    pub fn encode_classified(
+        &self,
+        resource_types: &QosResourceTypes,
+        ctx: EncodeContext,
+    ) -> Result<EncodedValue, EncodeError> {
+        self.encode_with_resource_types(Some(resource_types), ctx)
+    }
+
+    fn encode_with_resource_types(
+        &self,
+        resource_types: Option<&QosResourceTypes>,
+        ctx: EncodeContext,
+    ) -> Result<EncodedValue, EncodeError> {
+        self.validate_ambr(resource_types).map_err(|_| {
+            EncodeError::new(EncodeErrorCode::Structural {
+                reason: "session ambr or resource classification",
+            })
+        })?;
+        let mut fields = Vec::with_capacity(7);
+        if let Some(rate) = self.aggregate_bit_rate {
+            fields.push((130, 0, rate.encode(ctx)?));
+        }
+        fields.push((139, 0, self.uplink.encode(ctx)?));
+        fields.push((134, 0, self.session_type.encode(ctx)?));
         if let Some(security) = self.security {
             fields.push((138, 0, security.encode(ctx)?));
         }
@@ -106,6 +136,38 @@ impl SetupRequestTransfer {
     /// prevents admission even under structural Preserve policy.
     pub fn decode(
         input: &[u8],
+        ctx: DecodeContext,
+    ) -> Result<AdmittedRequestTransfer, DecodeError> {
+        Self::decode_with_resource_types(input, None, ctx)
+    }
+
+    /// Admit an all-GBR request without AMBR using exact caller-supplied QFI
+    /// classification. Missing, duplicate or unrelated classifications fail.
+    /// Shared IE policy still runs before semantic admission. Flow-specific
+    /// failures are checked separately with `QosParameters::applicable` so the
+    /// caller can report partial success/failure without losing the other flows.
+    pub fn decode_classified(
+        input: &[u8],
+        resource_types: &QosResourceTypes,
+        ctx: DecodeContext,
+    ) -> Result<AdmittedRequestTransfer, DecodeError> {
+        Self::decode_with_resource_types(input, Some(resource_types), ctx)
+    }
+
+    fn validate_ambr(&self, resource_types: Option<&QosResourceTypes>) -> Result<(), DecodeError> {
+        let required = match resource_types {
+            Some(types) => types.requires_session_ambr(self.flows.values())?,
+            None => true,
+        };
+        if required && self.aggregate_bit_rate.is_none() {
+            return Err(invalid("missing non-gbr session ambr"));
+        }
+        Ok(())
+    }
+
+    fn decode_with_resource_types(
+        input: &[u8],
+        resource_types: Option<&QosResourceTypes>,
         ctx: DecodeContext,
     ) -> Result<AdmittedRequestTransfer, DecodeError> {
         bound(input, ctx, 10)?;
@@ -173,11 +235,10 @@ impl SetupRequestTransfer {
                 _ => return Err(unsupported()),
             }
         }
-        Ok(AdmittedRequestTransfer {
+        let admitted = AdmittedRequestTransfer {
             transfer: Self {
                 uplink: uplink.ok_or_else(|| invalid("missing uplink transport"))?,
-                aggregate_bit_rate: aggregate_bit_rate
-                    .ok_or_else(|| invalid("missing non-gbr session ambr"))?,
+                aggregate_bit_rate,
                 session_type: session_type.ok_or_else(|| invalid("missing pdu session type"))?,
                 flows: flows.ok_or_else(|| invalid("missing qos flow setup list"))?,
                 security,
@@ -186,7 +247,9 @@ impl SetupRequestTransfer {
             },
             ignored_ie_count,
             notify_ie_ids,
-        })
+        };
+        admitted.transfer.validate_ambr(resource_types)?;
+        Ok(admitted)
     }
 }
 

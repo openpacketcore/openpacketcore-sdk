@@ -97,6 +97,10 @@ fn budgets(value: &ModifyRequestTransfer, container_count: usize) -> (usize, usi
 #[test]
 fn independent_transfers_preserve_optional_values_and_canonical_bytes() {
     use opc_proto_ngap::n3iwf::network_fields::CommonNetworkInstance;
+    use opc_proto_ngap::n3iwf::qos_fields::{
+        AllocationRetentionPriority, NonDynamicQos, QosCharacteristics, QosFlow, QosParameters,
+    };
+    use opc_proto_ngap::n3iwf::resource_fields::QosFlowId;
     use opc_proto_ngap::n3iwf::security_fields::NetworkInstance;
     let corpus = oracle();
     let rows = corpus["cases"].as_array().unwrap();
@@ -108,8 +112,8 @@ fn independent_transfers_preserve_optional_values_and_canonical_bytes() {
         let wire = bytes(row["wire_hex"].as_str().unwrap());
         let decoded = ModifyRequestTransfer::decode(&wire, context());
         // Keep the original corpus byte-identical and its original scope
-        // labels visible. These three valid wires gain separately qualified
-        // support in n3iwf-network-instance.json.
+        // labels visible. These valid wires gain separately qualified support
+        // in n3iwf-network-instance.json and n3iwf-qos-profiles.json.
         let qualified = match name {
             "unsupported-known-129-372" => Some(ModifyRequestTransfer {
                 network_instance: Some(NetworkInstance::new(1).unwrap()),
@@ -121,6 +125,35 @@ fn independent_transfers_preserve_optional_values_and_canonical_bytes() {
             }),
             "unsupported-known-166-374" => Some(ModifyRequestTransfer {
                 common_network_instance: Some(CommonNetworkInstance::new(vec![1, 2])),
+                ..Default::default()
+            }),
+            "unsupported-five-qi" => Some(ModifyRequestTransfer {
+                add_or_modify: Some(
+                    QosFlowModifications::new(vec![QosFlowModification::Profile(QosFlow::new(
+                        QosFlowId::new(7).unwrap(),
+                        QosParameters::new(
+                            QosCharacteristics::NonDynamic(NonDynamicQos {
+                                five_qi: 8,
+                                priority: None,
+                                averaging_window: None,
+                                maximum_data_burst: None,
+                            }),
+                            AllocationRetentionPriority::new(2, true, false).unwrap(),
+                        )
+                        .unwrap(),
+                    ))])
+                    .unwrap(),
+                ),
+                ..Default::default()
+            }),
+            "unsupported-e-rab" => Some(ModifyRequestTransfer {
+                add_or_modify: Some(
+                    QosFlowModifications::new(vec![QosFlowModification::IdentifierWithErab {
+                        qfi: QosFlowId::new(7).unwrap(),
+                        erab: 3,
+                    }])
+                    .unwrap(),
+                ),
                 ..Default::default()
             }),
             _ => None,
@@ -237,7 +270,7 @@ fn independent_transfers_preserve_optional_values_and_canonical_bytes() {
         assert_eq!(format!("{value:?}"), "ModifyRequestTransfer([REDACTED])");
     }
     assert_eq!(admitted, 363);
-    assert_eq!(newly_qualified, 3);
+    assert_eq!(newly_qualified, 5);
 }
 
 fn append(input: &[u8], id: u16, criticality: u8, value: &[u8]) -> Vec<u8> {

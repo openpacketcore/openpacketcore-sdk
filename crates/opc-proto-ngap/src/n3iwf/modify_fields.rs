@@ -2,23 +2,32 @@
 //! These fields describe requests or reports; ownership, request correlation,
 //! conditional presence and resource effects belong to the enclosing procedure.
 
+use super::qos_fields::{QosFlow, QosParameters};
 use super::release::Cause;
-use super::reset_fields::Sink;
+use super::reset_fields::{encode_root, Sink};
 use super::resource_fields::{DownlinkTransport, NonGbrFlow, QosFlowId, UplinkTransport};
 use super::resource_results::{cause_width, read_cause, unique};
 use super::session_lists::encode_list;
 use super::setup_fields::{Reader, Writer};
 use super::*;
 
-/// A QFI with absent parameters or explicit standardized non-GBR 5QI 9
-/// parameters. Absence is preserved; it neither supplies defaults nor proves
-/// that the flow exists. Other profiles and optional fields are unsupported.
+/// A QFI with absent parameters or explicit root QoS parameters. Absence
+/// supplies no defaults and does not prove that the flow exists.
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum QosFlowModification {
     /// Only the identifier was supplied.
     Identifier(QosFlowId),
     /// Explicit 5QI 9 and root allocation/retention priority.
     NonGbr(NonGbrFlow),
+    /// Explicit root QoS parameters, with an optional E-RAB identifier.
+    Profile(QosFlow),
+    /// Identifier-only request with a root E-RAB identifier (0..=15).
+    IdentifierWithErab {
+        /// Requested QFI.
+        qfi: QosFlowId,
+        /// Root E-RAB identifier, validated when admitted to a list.
+        erab: u8,
+    },
 }
 redacted!(QosFlowModification);
 impl QosFlowModification {
@@ -27,6 +36,22 @@ impl QosFlowModification {
         match self {
             Self::Identifier(value) => value,
             Self::NonGbr(value) => value.qfi(),
+            Self::Profile(value) => value.qfi(),
+            Self::IdentifierWithErab { qfi, .. } => qfi,
+        }
+    }
+    fn profile(self) -> Option<QosFlow> {
+        match self {
+            Self::NonGbr(value) => Some(value.into()),
+            Self::Profile(value) => Some(value),
+            _ => None,
+        }
+    }
+    fn erab(self) -> Option<u8> {
+        match self {
+            Self::Profile(value) => value.erab(),
+            Self::IdentifierWithErab { erab, .. } => Some(erab),
+            _ => None,
         }
     }
 }
@@ -37,8 +62,18 @@ pub struct QosFlowModifications(Vec<QosFlowModification>);
 redacted!(QosFlowModifications);
 impl QosFlowModifications {
     /// Validate the root count and unique identifiers without reordering.
-    pub fn new(values: Vec<QosFlowModification>) -> Result<Self, DecodeError> {
+    pub fn new(mut values: Vec<QosFlowModification>) -> Result<Self, DecodeError> {
         validate_qfis(values.iter().map(|v| v.qfi()), values.len())?;
+        for value in &mut values {
+            if value.erab().is_some_and(|v| v > 15) {
+                return Err(invalid("e-rab identifier range"));
+            }
+            if let QosFlowModification::Profile(profile) = *value {
+                if let Some(legacy) = profile.legacy() {
+                    *value = QosFlowModification::NonGbr(legacy);
+                }
+            }
+        }
         Ok(Self(values))
     }
     /// Explicit requests in wire order.
@@ -49,18 +84,13 @@ impl QosFlowModifications {
     /// retained for identifier-only lists; nested parameter encoding fails
     /// independent vectors and uses a bounded explicit layout instead.
     pub fn encode(&self, ctx: EncodeContext) -> Result<EncodedValue, EncodeError> {
-        let mut bits: usize = 6;
-        let mut parameters = false;
-        for value in &self.0 {
-            bits += 11;
-            if matches!(value, QosFlowModification::NonGbr(_)) {
-                parameters = true;
-                bits = (bits + 13).div_ceil(8) * 8 + 18;
-            }
-        }
-        let length = bits.div_ceil(8);
-        capacity(length, ctx)?;
-        if !parameters {
+        if self
+            .0
+            .iter()
+            .all(|v| matches!(v, QosFlowModification::Identifier(_)))
+        {
+            let length = (6 + self.0.len() * 11).div_ceil(8);
+            capacity(length, ctx)?;
             let values = self
                 .0
                 .iter()
@@ -75,25 +105,26 @@ impl QosFlowModifications {
                 .collect();
             return encode_list(&asn::QosFlowAddOrModifyRequestList(values), length);
         }
-        let mut writer = Writer::new(length);
-        writer.bits((self.0.len() - 1) as u16, 6)?;
-        for value in &self.0 {
-            let present = matches!(value, QosFlowModification::NonGbr(_));
-            writer.bits(if present { 4 } else { 0 }, 4)?;
-            writer.bits(u16::from(value.qfi().value()), 7)?;
-            if let QosFlowModification::NonGbr(value) = value {
-                writer.bits(0, 13)?; // root parameters, non-dynamic descriptor and 5QI
-                writer.align();
-                writer.bits(9, 8)?;
-                writer.bits(0, 2)?; // ARP extensions
-                writer.bits(u16::from(value.priority() - 1), 4)?;
-                writer.bits(u16::from(value.may_preempt()), 2)?;
-                writer.bits(u16::from(value.preemptable()), 2)?;
+        encode_root(ctx, |out| {
+            out.bits((self.0.len() - 1) as u16, 6)?;
+            for value in &self.0 {
+                out.bits(
+                    u16::from(value.profile().is_some()) * 4
+                        + u16::from(value.erab().is_some()) * 2,
+                    4,
+                )?;
+                out.bits(u16::from(value.qfi().value()), 7)?;
+                if let Some(profile) = value.profile() {
+                    profile.parameters().write(out)?;
+                }
+                if let Some(erab) = value.erab() {
+                    out.bits(u16::from(erab), 5)?;
+                }
             }
-        }
-        writer.finish()
+            Ok(())
+        })
     }
-    /// Require depth three for identifiers or six with parameters. Complete
+    /// Require depth three for identifiers, six for non-dynamic or seven for dynamic parameters. Complete
     /// count, flags, padding and uniqueness preflight precedes vector allocation.
     pub fn decode(input: &[u8], ctx: DecodeContext) -> Result<Self, DecodeError> {
         let count = scan_requests(input, ctx, |_| {})?;
@@ -114,34 +145,35 @@ fn scan_requests(
     let mut seen = 0;
     for _ in 0..count {
         let flags = reader.bits(4)?;
-        if flags & !4 != 0 {
+        if flags & !6 != 0 {
             return Err(unsupported());
         }
         reader.flags(1)?;
         let qfi = QosFlowId::new(reader.bits(6)? as u8)?;
         unique(&mut seen, qfi)?;
-        if flags & 4 == 0 {
-            emit(QosFlowModification::Identifier(qfi));
+        let parameters = if flags & 4 != 0 {
+            Some(QosParameters::read(&mut reader, ctx, 6)?)
         } else {
-            crate::enforce_depth(6, ctx)?;
-            reader.flags(13)?;
-            reader.align()?;
-            if reader.bits(8)? != 9 {
-                return Err(unsupported());
+            None
+        };
+        let erab = if flags & 2 != 0 {
+            reader.flags(1)?;
+            Some(reader.bits(4)? as u8)
+        } else {
+            None
+        };
+        emit(match parameters {
+            Some(parameters) => {
+                let flow = QosFlow::new(qfi, parameters).with_erab(erab)?;
+                flow.legacy()
+                    .map(QosFlowModification::NonGbr)
+                    .unwrap_or(QosFlowModification::Profile(flow))
             }
-            reader.flags(2)?;
-            let priority = reader.bits(4)? as u8 + 1;
-            reader.flags(1)?;
-            let may_preempt = reader.bits(1)? != 0;
-            reader.flags(1)?;
-            let preemptable = reader.bits(1)? != 0;
-            emit(QosFlowModification::NonGbr(NonGbrFlow::new(
-                qfi,
-                priority,
-                may_preempt,
-                preemptable,
-            )?));
-        }
+            None => match erab {
+                Some(erab) => QosFlowModification::IdentifierWithErab { qfi, erab },
+                None => QosFlowModification::Identifier(qfi),
+            },
+        });
     }
     reader.finish()?;
     Ok(count)

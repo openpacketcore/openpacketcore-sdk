@@ -1,10 +1,12 @@
 //! Qualified resource-request root fields. These describe peer requests;
 //! they do not assign tunnels, admit traffic or authorize QoS resources.
 //!
-//! The initial flow subset is standardized non-GBR 5QI 9 with root ARP.
-//! Other QoS descriptors and optional flow parameters fail explicitly.
+//! Flow lists preserve both root QoS descriptors, GBR parameters and attributes.
+//! Extension additions remain explicitly unsupported.
 use super::nas::UeAggregateBitRate;
-use super::setup_fields::{Reader, Writer};
+use super::qos_fields::{QosFlow, QosParameters};
+use super::reset_fields::encode_root;
+use super::setup_fields::Reader;
 use super::*;
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -245,85 +247,88 @@ impl NonGbrFlow {
     }
 }
 
-/// One through 64 unique non-GBR 5QI 9 requests. Other QoS profiles need a
-/// separate qualified admission boundary; they cannot silently enter this one.
+/// One through 64 unique root QoS requests, preserved in wire order.
 #[derive(Clone, PartialEq, Eq)]
-pub struct QosFlowSetupList(Vec<NonGbrFlow>);
+pub struct QosFlowSetupList(Vec<QosFlow>);
 redacted!(QosFlowSetupList);
 impl QosFlowSetupList {
     /// Enforce root cardinality and reject duplicate QFIs without reordering.
+    /// This compatibility constructor selects the original non-GBR 5QI 9 profile.
     pub fn new(values: Vec<NonGbrFlow>) -> Result<Self, DecodeError> {
+        if values.is_empty() || values.len() > 64 {
+            return Err(invalid("qos flow list count"));
+        }
+        Self::with_profiles(values.into_iter().map(QosFlow::from).collect())
+    }
+    /// Admit the root QoS profiles. No flow resources are created or authorized.
+    pub fn with_profiles(values: Vec<QosFlow>) -> Result<Self, DecodeError> {
         if values.is_empty() || values.len() > 64 {
             return Err(invalid("qos flow list count"));
         }
         let mut seen = 0u64;
         for value in &values {
-            unique_qfi(&mut seen, value.qfi)?;
+            unique_qfi(&mut seen, value.qfi())?;
         }
         Ok(Self(values))
     }
     /// Explicit access to the admitted requests in wire order.
-    pub fn values(&self) -> &[NonGbrFlow] {
+    pub fn values(&self) -> &[QosFlow] {
         &self.0
     }
     /// Encode the independently qualified root layout. Generated nested-list
     /// construction loses its bit offset even for a single 5QI 9 flow.
     pub fn encode(&self, ctx: EncodeContext) -> Result<EncodedValue, EncodeError> {
-        // First item ends at bit 50; every following item consumes 48 bits.
-        // Root constructors bound this arithmetic to at most 385 bytes.
-        let length = self.0.len() * 6 + 1;
-        capacity(length, ctx)?;
-        let mut writer = Writer::new(length);
-        writer.bits((self.0.len() - 1) as u16, 6)?;
-        for value in &self.0 {
-            writer.bits(0, 3)?; // item extensions/E-RAB/IE extensions
-            writer.bits(u16::from(value.qfi.0), 7)?; // QFI extension bit + value
-            writer.bits(0, 5)?; // QoS parameters extension and four optional flags
-            writer.bits(0, 2)?; // nonDynamic5QI choice
-            writer.bits(0, 5)?; // descriptor extension and four optional flags
-            writer.bits(0, 1)?; // FiveQI root extension bit
-            writer.align();
-            writer.bits(9, 8)?;
-            writer.bits(0, 2)?; // ARP extension/IE extensions
-            writer.bits(u16::from(value.priority - 1), 4)?;
-            writer.bits(u16::from(value.may_preempt), 2)?; // enum extension + value
-            writer.bits(u16::from(value.preemptable), 2)?;
-        }
-        writer.finish()
-    }
-    /// Decode root 5QI 9 flows with depth six. Enforce `max_ies` and physical
-    /// count preflight before allocation, then reject duplicate QFIs and every
-    /// unsupported choice, optional field or extension.
-    pub fn decode(input: &[u8], ctx: DecodeContext) -> Result<Self, DecodeError> {
-        bound(input, ctx, 6)?;
-        let mut reader = Reader::new(input, ctx);
-        let count = reader.count(6, 64, 41)?;
-        let mut values = Vec::with_capacity(count);
-        let mut seen = 0u64;
-        for _ in 0..count {
-            reader.flags(3)?;
-            reader.flags(1)?;
-            let qfi = QosFlowId(reader.bits(6)? as u8);
-            unique_qfi(&mut seen, qfi)?;
-            reader.flags(5)?;
-            reader.flags(2)?;
-            reader.flags(5)?;
-            reader.flags(1)?;
-            reader.align()?;
-            if reader.bits(8)? != 9 {
-                return Err(unsupported());
+        encode_root(ctx, |out| {
+            out.bits((self.0.len() - 1) as u16, 6)?;
+            for value in &self.0 {
+                out.bits(u16::from(value.erab().is_some()) * 2, 3)?;
+                out.bits(u16::from(value.qfi().value()), 7)?;
+                value.parameters().write(out)?;
+                if let Some(erab) = value.erab() {
+                    out.bits(u16::from(erab), 5)?;
+                }
             }
-            reader.flags(2)?;
-            let priority = reader.bits(4)? as u8 + 1;
-            reader.flags(1)?;
-            let may_preempt = reader.bits(1)? != 0;
-            reader.flags(1)?;
-            let preemptable = reader.bits(1)? != 0;
-            values.push(NonGbrFlow::new(qfi, priority, may_preempt, preemptable)?);
-        }
-        reader.finish()?;
+            Ok(())
+        })
+    }
+    /// Decode root profiles with depth six (seven for a dynamic descriptor).
+    /// Complete physical/count/depth/range/uniqueness preflight precedes allocation.
+    pub fn decode(input: &[u8], ctx: DecodeContext) -> Result<Self, DecodeError> {
+        let count = scan_qos_flows(input, ctx, |_| {})?;
+        let mut values = Vec::with_capacity(count);
+        scan_qos_flows(input, ctx, |value| values.push(value))?;
         Ok(Self(values))
     }
+}
+
+fn scan_qos_flows(
+    input: &[u8],
+    ctx: DecodeContext,
+    mut emit: impl FnMut(QosFlow),
+) -> Result<usize, DecodeError> {
+    bound(input, ctx, 6)?;
+    let mut reader = Reader::new(input, ctx);
+    let count = reader.count(6, 64, 41)?;
+    let mut seen = 0u64;
+    for _ in 0..count {
+        let flags = reader.bits(3)?;
+        if flags & !2 != 0 {
+            return Err(unsupported());
+        }
+        reader.flags(1)?;
+        let qfi = QosFlowId(reader.bits(6)? as u8);
+        unique_qfi(&mut seen, qfi)?;
+        let parameters = QosParameters::read(&mut reader, ctx, 6)?;
+        let erab = if flags & 2 != 0 {
+            reader.flags(1)?;
+            Some(reader.bits(4)? as u8)
+        } else {
+            None
+        };
+        emit(QosFlow::new(qfi, parameters).with_erab(erab)?);
+    }
+    reader.finish()?;
+    Ok(count)
 }
 
 fn unique_qfi(seen: &mut u64, qfi: QosFlowId) -> Result<(), DecodeError> {

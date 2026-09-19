@@ -1,5 +1,11 @@
 #![no_main]
 
+#[path = "../../tests/support/qos_admission.rs"]
+mod qos_admission;
+
+#[path = "../../tests/support/qos_profiles.rs"]
+mod qos_profiles;
+
 #[path = "../../tests/support/network_instance.rs"]
 mod network_instance;
 
@@ -79,6 +85,8 @@ fuzz_target!(|data: &[u8]| {
         max_message_len: 200_000,
         ..EncodeContext::default()
     };
+    qos_admission::exercise(data, decode, output);
+    qos_profiles::exercise(data, decode, output);
     release_sessions::exercise(data, decode, output);
     network_instance::exercise(data, decode, output);
     response_diagnostics::exercise(data, decode, output);

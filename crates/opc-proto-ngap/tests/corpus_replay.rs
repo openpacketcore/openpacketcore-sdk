@@ -11,6 +11,10 @@
 
 #[path = "support/network_instance.rs"]
 mod network_instance;
+#[path = "support/qos_admission.rs"]
+mod qos_admission;
+#[path = "support/qos_profiles.rs"]
+mod qos_profiles;
 #[path = "support/resource_release.rs"]
 mod resource_release;
 #[path = "support/resource_setup.rs"]
@@ -62,6 +66,22 @@ fn exercise(data: &[u8]) {
         validation_level: ValidationLevel::Strict,
         ..DecodeContext::default()
     };
+    qos_admission::exercise(
+        data,
+        ctx,
+        EncodeContext {
+            max_message_len: ctx.max_message_len,
+            ..EncodeContext::default()
+        },
+    );
+    qos_profiles::exercise(
+        data,
+        ctx,
+        EncodeContext {
+            max_message_len: ctx.max_message_len,
+            ..EncodeContext::default()
+        },
+    );
     network_instance::exercise(
         data,
         ctx,

@@ -456,20 +456,20 @@ and replay; tests also cover every truncation and byte mutation.
 ## N3IWF resource setup-request transfer
 
 TS 38.413 V18.10.0 9.3.4.1 defines this nested transfer. The opt-in
-`n3iwf::resource_request` boundary admits the independently qualified
-standardized non-GBR 5QI 9 subset. Enclosing Initial Context Setup and PDU Session
+`n3iwf::resource_request` boundary admits the independently qualified root QoS
+profiles described below. Enclosing Initial Context Setup and PDU Session
 Resource Setup admission is a separate `resource_setup` boundary below.
 
 | Field | IE | Criticality | Construction / receive |
 | --- | --- | --- | --- |
-| Session aggregate maximum bit rate | 130 | reject | Required for this non-GBR subset by 8.2.1.4; distinct UL/DL root rates |
+| Session aggregate maximum bit rate | 130 | reject | Distinct UL/DL root rates; required by the default API, or when any flow is caller-classified non-GBR (8.2.1.4) |
 | UL NG-U UP transport information | 139 | reject | Mandatory single IPv4/IPv6 GTP tunnel |
 | PDU session type | 134 | reject | Mandatory; all five root payload kinds |
 | Security Indication | 138 | reject | Optional three-root integrity/confidentiality requirements; conditional UL rate |
 | Network Instance | 129 | reject | Optional root 1–256; Common takes precedence when supplied |
 | Common Network Instance | 166 | ignore | Optional opaque network identifier, with bounded fragmented OCTET STRING framing |
 | Data Forwarding Not Possible | 127 | reject | Receiver-ignored outside Handover Request (9.3.4.1); never emitted by this setup constructor |
-| QoS flow setup request list | 136 | reject | Mandatory 1–64 unique root QFIs; 5QI 9 and root ARP priority/flags |
+| QoS flow setup request list | 136 | reject | Mandatory 1–64 unique root QFIs; root dynamic/non-dynamic descriptors, ARP, GBR information, attributes and optional E-RAB |
 
 Recognized optional transfer IEs outside this table fail explicitly,
 including extra/redundant tunnels and Redundant Common Network Instance.
@@ -491,15 +491,16 @@ dual-address bit strings and extensions are unsupported. The codec permits
 all wire address/TEID values; endpoint validation and installation are external.
 Session AMBR reuses the byte-identical two-BitRate root layout with a distinct
 public type, qualified by independent session vectors. Root QFI values are
-0–63; allocation policy is external. Other QoS descriptors, optional flow
-parameters, E-RAB fields and nested extensions fail explicitly.
+0–63; allocation policy is external. Root QoS fields and E-RAB identifiers are
+qualified below; nested extensions remain explicitly unsupported.
 
-Transfer receive requires depth ten, with four levels subtracted before leaf
-decoding. Flow lists require depth six and enforce `max_ies` and physical
+Transfer receive requires depth ten, or eleven with dynamic QoS, with four
+levels subtracted before leaf decoding. Flow lists require depth six, or seven
+with dynamic QoS, and enforce `max_ies` and physical
 count feasibility before allocation. Byte limits apply to the entire input
 and each leaf. Container/list counts use separate field-local limits;
-`allocation_budget` remains advisory. Known constructed roots are below
-512 bytes; all fields are bounded and complete framing is checked before the
+`allocation_budget` remains advisory. All fields are bounded and exact
+constructed framing is measured before the
 final allocation. Fragmented unknown values use the existing physical-length
 preflight before coalescing. Debug/errors redact values; encoded buffers clear
 on drop. No NAS/key processing, resource allocation, endpoint assignment,
@@ -514,13 +515,92 @@ every flow-list length. Regenerate with
 `scripts/generate-ngap-resource-request-fixtures.py --spec PATH --output PATH`
 in the pinned Release 18 reference environment. Generated tunnel codecs match
 the independent values and bytes. Generated QoS list codecs differ; a bounded
-root reader/writer covers only the qualified 5QI 9 shape. The transfer reuses
+root reader/writer covers the qualified root profiles. The transfer reuses
 the existing canonical container framing. All 274 vectors seed fuzz/replay;
 ordinary tests exercise every truncation and bounded byte mutations.
 
-Remaining work includes additional applicable fields/QoS profiles and
-whole-message presence rules. The qualified resource-result transfers and
+Remaining work includes additional applicable transfer and extension fields.
+The qualified resource-result transfers and
 outer session lists are described below. No local procedure trigger is enabled here.
+
+## Root QoS profiles and conditional Session AMBR
+
+`n3iwf::qos_fields` constructs and decodes the two root QoS characteristic
+choices from TS 38.413 V18.10.0 9.3.1.18–19. Non-dynamic descriptors preserve
+the root 5QI (0–255), optional priority (1–127), averaging window and maximum
+data burst (0–4095). Dynamic descriptors also preserve delay (0–1023), packet
+error scalar/exponent (0–9), optional 5QI and the distinct absent/false/true
+Delay Critical values. Root ARP retains priority 1–15 and both pre-emption flags.
+GBR information retains four rates (0–4,000,000,000,000), Notification Control
+presence and optional UL/DL loss rates (0–1000). Reflective and Additional QoS
+attributes and optional E-RAB identifiers (0–15) retain their presence.
+Extension integers, choice extensions, SEQUENCE/IE extensions, nonzero padding,
+nonminimal rates, trailing data and duplicate QFIs fail explicitly.
+
+`QosParameters::applicable` checks per-flow conditions using a caller-established
+`QosResourceType`; GBR-information presence alone never establishes that type.
+Missing GBR information for a GBR flow, missing conditional dynamic fields,
+and missing burst volume for a delay-critical flow produce value-free failures.
+The caller can report each failed flow while processing the other flows. The
+applicable view hides GBR information for non-GBR flows, hides Reflective and
+Additional QoS attributes for GBR flows, and clears Notification Control's
+requested effect for N3IWF (TS 29.413 5.3). `requested()` retains the original
+fields for explicit access and canonical construction. Classification, rate
+consistency, request correlation, Cause selection and resource effects remain
+caller responsibilities.
+
+`SetupRequestTransfer::aggregate_bit_rate` is now optional. The existing
+`decode`/`encode` APIs still require AMBR. The explicit `decode_classified` and
+`encode_classified` APIs accept its absence only for an all-GBR flow set.
+`QosResourceTypes` requires exact QFI coverage and `SessionResourceTypes` exact
+session/QFI coverage; missing, duplicate or unrelated entries fail. These are
+caller-supplied inputs, not peer assertions or authorization capabilities.
+Classification is never guessed from the presence of GBR information.
+`SessionSetupRequests` and both complete Setup request constructors/admission
+paths expose corresponding classified APIs. Enclosing Initial Context UE-AMBR
+and security/key requirements remain unchanged. Shared DecodeContext selection,
+unknown-critical handling, mutable-container validation and NAS custody still
+apply before classified admission.
+
+API migration: wrap supplied Session AMBR literals in `Some(...)`.
+`QosFlowSetupList::new(Vec<NonGbrFlow>)` remains available;
+`with_profiles(Vec<QosFlow>)` accepts the broader roots, and `values()` now
+returns `&[QosFlow]`. Existing QFI/ARP getters remain. Exhaustive matches on
+`QosFlowModification` must handle `Profile` and `IdentifierWithErab` in addition
+to the original variants. Exact original 5QI 9 values normalize to `NonGbr`.
+
+The [profile corpus](tests/fixtures/n3iwf-qos-profiles.json) contains 5,060 cases
+(5,058 admitted and two duplicate-QFI negatives). Both unmodified Pycrate
+encoders agree, structural reference decoding checks exact values, and SDK
+constructors compare to those independent bytes. It covers all 256 root 5QIs,
+optional combinations, rate-width boundaries, all 100 packet-error pairs,
+conditional failures, list lengths 1–64 and differing parent bit offsets.
+The [conditional corpus](tests/fixtures/n3iwf-qos-admission.json) adds 224
+transfers and 224 complete requests: each set has 160 classified admissions
+and 64 missing-AMBR failures. Two-session messages preserve classification
+separation and both Initial Context and PDU Session outcomes. The independently
+authored classification rules are separate from the ASN.1 wire oracle.
+
+Regenerate with `scripts/generate-ngap-qos-profiles.py` followed by
+`scripts/generate-ngap-qos-admission.py`, each with `--spec PATH --output PATH`
+in the pinned Release 18 reference environment. Profile SHA-256:
+`581c9b2a814a24334183f2b2d307eae0a59489829a70bc0f81eafdaa2120000a`;
+conditional SHA-256:
+`8fc7d4ad79bf15b677266fd9da4d85c7e94921f3092484b6d23cdc36d90874cc`.
+Fifty-nine representative new corpus seeds exercise shared semantic replay.
+Independent value/byte checks, exact/one-short limits, constructor bounds,
+redaction, truncations and deterministic mutations supplement round trips.
+The old request/Modify fixture bytes are unchanged; their newly supported
+5QI 8/E-RAB cases now have explicit constructor expectations.
+
+Standalone parameters need depth four (non-dynamic) or five (dynamic); flow
+lists need six/seven, Setup transfers ten/eleven, session lists thirteen/fourteen,
+and complete Setup requests seventeen/eighteen. Preflight checks complete list
+framing, physical count feasibility, uniqueness and depth before vector
+allocation. Exact output size is checked before allocation. The classified
+inputs use fixed QFI masks and at most 256 session entries. No new dependencies,
+schema changes, procedure triggers, resource effects or live-peer
+interoperability claims are introduced.
 
 ## N3IWF resource setup-result transfers
 
@@ -610,8 +690,8 @@ checks all 131,328 fixed-width leaf patterns against independently admitted
 sets. Shared fuzz/replay logic checks all new cases and 244,616 deterministic
 mutations across two bounded contexts; 21 representative seeds are committed.
 These deterministic checks are separate from hosted PR fuzz smoke and do not
-claim a new local libFuzzer campaign. Additional QoS profiles, extensions and
-applicable fields remain tracked in #787.
+claim a new local libFuzzer campaign. Subsequent root QoS qualification is
+recorded above; extensions and applicable fields remain tracked in #787.
 
 ## N3IWF session setup lists
 
@@ -620,13 +700,13 @@ roots. The public types group only layouts proven to have identical bytes:
 
 | Type | Qualified ASN.1 roots | Receive depth |
 | --- | --- | --- |
-| `SessionSetupRequests` | `PDUSessionResourceSetupListCxtReq`, `PDUSessionResourceSetupListSUReq` | 13 |
+| `SessionSetupRequests` | `PDUSessionResourceSetupListCxtReq`, `PDUSessionResourceSetupListSUReq` | 13; 14 with dynamic QoS |
 | `SuccessfulSessions` | `PDUSessionResourceSetupListCxtRes`, `PDUSessionResourceSetupListSURes` | 9 |
 | `FailedSessions` | `PDUSessionResourceFailedToSetupListCxtFail`, `PDUSessionResourceFailedToSetupListCxtRes`, `PDUSessionResourceFailedToSetupListSURes` | 6 |
 
 Each list requires 1–256 distinct root session IDs (0–255), preserving input
 order. Request items include S-NSSAI, optional NAS (absent and present-empty
-remain distinct), and an admitted non-GBR request transfer. Results use the
+remain distinct), and an admitted root request transfer. Results use the
 qualified response/unsuccessful transfers. `SessionResults` rejects a session
 appearing in both result lists. Empty paired results are representable because
 context setup may request no resources; enclosing PDU Setup admission must
@@ -731,7 +811,7 @@ nested framing, key lengths, metadata, bounds and policy changes.
 Security Key borrows exactly 32 bytes without installation or cryptographic
 use. NAS remains opaque; Debug and failures redact values. UE ownership,
 request/result correlation, slice authorization, tunnel/resource changes and
-local procedure triggers remain caller-owned. Other QoS profiles, optional
+local procedure triggers remain caller-owned. Additional optional/extension
 fields and procedures under #787 are still pending; no live interoperability
 is established.
 
@@ -1025,15 +1105,15 @@ The standalone field boundary adds no PDU outcome.
 
 | Field | Qualified root | Required depth |
 | --- | --- | --- |
-| `QosFlowModifications` | 1–64 unique QFIs; absent parameters or explicit standardized non-GBR 5QI 9 with root ARP | 3 for identifiers only; 6 with parameters |
+| `QosFlowModifications` | 1–64 unique QFIs; absent parameters or explicit root QoS profiles; optional E-RAB | 3 for identifiers only; 6 non-dynamic / 7 dynamic |
 | `ModifiedQosFlows` | 1–64 unique reported QFIs | 3 |
 | `QosFlowCauses` | 1–64 unique QFI/root-Cause pairs | 4 |
 | `UplinkModifications` | 1–4 ordered UL/DL GTP-tunnel pairs; IPv4 or IPv6 per endpoint | 5 |
 
 Request parameter absence is represented separately from supplied parameters;
 it does not establish that a flow exists or provide default QoS. Root ARP has
-priority 1–15 and explicit pre-emption flags. E-RAB identifiers, other QoS
-profiles and optional/extension fields are unsupported in this initial subset.
+priority 1–15 and explicit pre-emption flags. Root QoS profiles and E-RAB
+identifiers are qualified above; extension additions remain unsupported.
 QFI values 0–63 and all wire endpoint/TEID values are representable; reservation,
 ownership and endpoint policy are caller duties. Directional endpoint types stay
 distinct. Tunnel pairs preserve repetition and order without inventing a
@@ -1041,7 +1121,8 @@ uniqueness requirement. Each list uses `max_ies` and exact byte/depth limits.
 Public formatting is redacted.
 
 The [independent oracle](tests/fixtures/n3iwf-modify-fields.json) contains 687
-cases (682 admitted, three duplicate negatives and two unsupported profiles).
+cases (originally 682 admitted, three duplicate negatives and two unsupported
+profiles; both profile cases are now independently qualified and admitted).
 It covers every list count, every QFI with and without parameters, all root
 Causes, all ARP priorities/pre-emption combinations, mixed parameter presence,
 both IP families, endpoint/TEID boundaries and repeated tunnel pairs. Both
@@ -1074,7 +1155,7 @@ modifications (140), flow additions/modifications (135) and flow releases (137)
 are independently optional and reject-criticality. An empty root is preserved.
 Numeric Network Instance (129/reject) and Common Network Instance (166/ignore)
 are also optional; their separate qualification is recorded below.
-Unlike Setup's non-GBR admission, Modify does not require a new AMBR: an existing
+Modify does not require a new AMBR: an existing
 session can retain its prior limits. Absent QoS parameters remain absent.
 The type neither asserts an existing session nor applies previous values.
 
@@ -1086,7 +1167,7 @@ The type neither asserts an existing session nor applies previous values.
 | Identifier-only add/modify requests | 7 | 1–64 |
 | Release QFI/Cause pairs | 8 | 1–64 |
 | UL/DL tunnel modification pairs | 9 | 1–4 |
-| Add/modify requests with parameters | 10 | 1–64 |
+| Add/modify requests with parameters | 10 non-dynamic / 11 dynamic | 1–64 |
 
 All QFIs are unique and disjoint across add/modify and release lists. The
 container and each nested list separately use `max_ies`; byte/depth limits
