@@ -192,15 +192,17 @@ full-gate results belong in the PR's validation evidence; unfinished checks
 must not be reported as passes.
 
 The strengthened process suite passed five cases (exit 0), log SHA-256
-`67603b9cf4ba66ccd73340b1acf81cd7036b04af56763ff7443ce6499c389e9a`:
+`ee1f233867456be9427ae1fbbdcfb4ce662f0443ce6e11811faa3d59f8b19e01`:
 the same two Durable controls, protected Async majority/all-cold return with
 retained Q1 and successful reconciled Q2, and a separate all-cold case with an
 acknowledged Q1 missing from every returned generation. The last case injects
 ENOSPC only before real native generation publication; it verifies completed
 frontiers stayed before Q1, kills all voter processes, removes only the I/O
 fault and reopens unchanged roots. The durable provider effect survives;
-missing Q1 remains unknown, old prepared handles cannot write, and successor
-lease/CAS/provider operations succeed.
+missing Q1 returns exactly `RecoveryRequired`, old prepared handles cannot
+write, and successor lease/CAS/provider operations succeed. `RecoveryRequired`
+preserves the ambiguity of the missing admission; it cannot manufacture a
+negative outcome for the provider's completed effect.
 
 A slow-owner regression separately failed before progress resumption (exit
 101, SHA-256 `bb8d127638926e8ebbf0254a956c710ee8859f60027cae5a5c9b0f0cbeda074c`)
@@ -208,7 +210,9 @@ and passed afterward (exit 0, SHA-256
 `0e392f1c2e9c2258f8830d03b8326135bbca44c847279c96e31d65103b39be61`).
 Its retirement takes 1,600 ms against unchanged 800 ms RPC deadlines; repeated
 ordinary initialization joins exactly one owner call, then performs a valid
-successor operation. Full repository qualification remains pending.
+successor operation. Full repository qualification is reported separately in
+[PR #929](https://github.com/openpacketcore/openpacketcore-sdk/pull/929);
+focused tests alone do not qualify the full gates or separate CI profiles.
 
 This is a new explicit SDK capability, not an automatic claim about an
 existing product provider. ePDG must provision the complete inventory, wire
