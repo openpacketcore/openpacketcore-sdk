@@ -48,12 +48,32 @@ deployment-specific admission remain caller policy. Debug/errors contain
 only static classes and lengths; packet and deployment values are exposed
 only by explicit processing getters.
 
-This increment supplies a shared socket implementation, not a new backend
-attachment contract. Linux kernel-GTP private sockets are not exposed by
-this change. Live tc classification, kernel/eBPF/mock parity, IPv6, outgoing
-Echo requests, per-tunnel End Marker ordering, and installed N3 forwarding
-remain tracked by #341 and #790. Existing forwarding capabilities and the
-checksum-offload pass-through behavior are unchanged.
+`GtpuDataplaneBackend::open_gtpu_control_port` exposes the queue for an
+existing eBPF attachment with a concrete IPv4 endpoint. Repeated opens share
+one backend-owned socket. This includes a grouped attachment with IPv4;
+an IPv6-only attachment returns `UnsupportedFeature { feature:
+"gtpu_control_port_ipv6" }`. Linux kernel-GTP, mock and unsupported backends
+return `UnsupportedFeature { feature: "gtpu_control_port" }`. They do not
+open another listener or expose their private file descriptors.
+
+The backend checks its exact current tc hooks/maps and serializes each socket
+operation with attachment mutation through that backend instance. External
+attachment changes are refused when observed by the live hook/binding checks. A busy writer returns `Busy` without
+waiting for the mutation. Removal closes the queue and invalidates all old
+ports, including when a replacement has the same name, ifindex and address.
+Ports hold weak references; keeping them alive cannot keep the backend or
+its socket alive. Observed attachment loss retires the queue. Restoring hooks
+alone cannot reopen that retired instance; callers must recreate/adopt the
+attachment under the existing backend lifecycle. Socket bind failure leaves
+no published socket and can be retried. An external listener produces a bind
+error; no reuse-port distribution is enabled.
+
+The port grants no tunnel installation, selector provenance, peer admission,
+or forwarding authority. Kernel/eBPF/mock parity, IPv6 typed responses,
+outgoing Echo requests, per-tunnel End Marker ordering, unknown-TEID control
+handoff and installed N3 forwarding remain tracked by #341 and #790.
+Existing forwarding capabilities and checksum-offload control pass-through
+are unchanged.
 
 Validation uses independently authored packet literals, all 65,536 source
 ports at four sequence boundaries, all 255 nonterminal extension types,
@@ -69,3 +89,26 @@ plans, and interface-rename refusal. It does not attach a tc program or GTP
 netdevice and therefore cannot qualify their behavior. The native runner
 requires exactly one executed test, its completion marker and zero ignored
 tests. The PR records guard-removal results and public base/head/tree.
+
+Separate native eBPF tests now obtain this same port through the public
+backend trait. They attach the committed classifier and check all 127 unknown
+required extension identifiers, original tuple/bytes, bounded notification
+responses, all 127 optional identifiers and malformed suffix rejection.
+The IPv6 parser handoff still uses an ordinary UDP receiver and does not
+qualify IPv6 typed responses. A second native case checks dynamic-port Echo
+bytes, shared-queue behavior, external-listener exclusion, kernel-observed
+queued receive retirement, same-tuple reinstall, old-plan rejection, backend
+loss and live hook loss. Its completion marker and exact native inventory
+are required by both full privileged CI lanes. Only synthetic packets and
+namespace-local addresses are used.
+
+The backend implementation adds two unit cases for writer contention and
+poisoned serialization, plus an exact unsupported-result contract test for
+Linux kernel, mock and unsupported adapters. Independent Echo wire literals
+exercise both legacy and grouped IPv4 attachments; IPv6-only attachments
+refuse explicitly. The original parent lacks the backend method, retained
+as a compile-time API detector. Four separate production guard removals
+(backend exposure, live-hook check, weak backend ownership and socket release)
+and an independent Echo sequence mutation each compile and fail during the
+native scenario. Restored native cases pass. The PR retains exact public
+base/head/tree and complete repository/hosted qualification.
