@@ -351,7 +351,7 @@ pub const COUNTER_UL_ENCAP: u32 = 0;
 pub const COUNTER_UL_FAR_MISS: u32 = 1;
 /// Counter index: downlink G-PDUs decapsulated.
 pub const COUNTER_DL_DECAP: u32 = 2;
-/// Counter index: downlink G-PDUs dropped for an unknown TEID.
+/// Counter index: unknown-TEID G-PDUs; inner payloads never forward, controls may be handed off.
 pub const COUNTER_DL_UNKNOWN_TEID: u32 = 3;
 /// Counter index: downlink GTP-U packets dropped as malformed.
 pub const COUNTER_DL_MALFORMED: u32 = 4;

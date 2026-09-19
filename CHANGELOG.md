@@ -9,6 +9,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- GTP-U eBPF sends validated nonzero unknown-TEID G-PDUs to the configured
+  local control endpoint without decapsulation. Retained inconsistent
+  ownership, foreign local endpoints, zero TEID and malformed envelopes
+  remain drops. Native legacy/grouped tests check exact IPv4 Error Indication
+  bytes and ports, plus raw grouped IPv6 handoff. Refs #341, #790, #795.
+
 - GTP-U tc and host reassembly parsers now hand unknown required extension
   headers to the shared control queue after full chain validation, before
   tunnel lookup or decapsulation. Live IPv4/IPv6 packet evidence covers every
