@@ -1116,4 +1116,43 @@ async fn async_persistence_wire_bounds_full_lineage_and_attempt_replacement() {
             .unwrap(),
         "old confirmation cannot activate the replacement attempt"
     );
+    let current_cut = ColdQuorumCut {
+        request: second,
+        ..cut
+    };
+    let guard = protocol.engine_before(deadline).await.unwrap();
+    assert!(!guard.permits_append(&AppendEntriesRequest {
+        vote: Vote::new(9, leader),
+        prev_log_id: Some(cut.barrier),
+        entries: vec![],
+        leader_commit: Some(cut.barrier),
+    }));
+    assert!(protocol.resume_cut_before(deadline).await.unwrap() == Some(current_cut));
+    guard.confirm_append(Some(cut.barrier));
+    assert!(
+        !guard.permits_snapshot(&opc_consensus::engine::raft::InstallSnapshotRequest {
+            vote: Vote::new_committed(9, leader),
+            meta: opc_consensus::engine::SnapshotMeta {
+                last_log_id: Some(LogId::new(CommittedLeaderId::new(9, leader), 101)),
+                last_membership: Default::default(),
+                snapshot_id: "newer-leader-control".into(),
+            },
+            offset: 0,
+            data: vec![],
+            done: true,
+        })
+    );
+    drop(guard);
+    assert!(protocol
+        .resume_cut_before(deadline)
+        .await
+        .unwrap()
+        .is_none());
+    assert!(
+        !protocol
+            .activate_before(deadline, |_| async { true })
+            .await
+            .unwrap(),
+        "a newer leader hint requires fresh certification even after old matching confirmation"
+    );
 }

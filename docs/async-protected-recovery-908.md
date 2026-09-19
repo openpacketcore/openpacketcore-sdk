@@ -7,6 +7,27 @@ The missing capability affected fresh roots too; deployment migration is
 outside this work's scope. Normal Async acknowledgements remain independent
 of disk. The new synchronization belongs to recovery.
 
+Sequential cold rejoin must also preserve bounded progress after recovery.
+Hosted native-profile validation exposed retries repeatedly obtaining a valid
+committed barrier, exhausting their deadline during catch-up, then replacing
+the cut with another later barrier. The same maximum-owner case failed on
+unchanged source with the local test process limited to two CPUs. A separate
+deterministic control blocks actual replication across two original deadlines
+and proves that retry must retain its already certified attempt.
+
+Retries now preserve that exact cut and matching-prefix progress. A newer
+authenticated committed leader's append or snapshot request remains rejected
+and requests fresh certification; it cannot activate the old attempt. A real
+leader-change control, delayed lower-vote and uncommitted-vote controls, and
+the existing membership/nonce/root validation controls preserve that boundary.
+No deadline, voting rule or committed-application requirement changes.
+The deterministic RED log SHA-256 is
+`9b303149bfea690710a591e0e175c340411800b32ac851fbe9ddc16eace12cd2`.
+Six native-profile controls passed with two CPUs and four test threads,
+including maximum-owner rejoin and a subsequent operation; log SHA-256
+`f0a2b4a3a8501012a71eb6664eb2b25c3e1c57b2f35684b1e1264b1dc8837e3b`.
+These focused controls do not replace full integration validation.
+
 ## Executed baseline
 
 Baseline source: `4356ef8595f0e010ea49ce01b5c225c4b9f06036`.

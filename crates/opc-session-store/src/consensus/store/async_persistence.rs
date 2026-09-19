@@ -97,8 +97,78 @@ impl ConsensusSessionStore {
                 return Err(ConsensusSessionStoreOpenError::RecoveryRequired);
             }
         }
+        let resumable = protocol
+            .resume_cut_before(deadline)
+            .await
+            .map_err(|_| ConsensusSessionStoreOpenError::RecoveryRequired)?;
+        let cut = match resumable.filter(|cut| {
+            let metrics = self.inner.raft.metrics();
+            let current = metrics.borrow();
+            // These local observations can require fresh certification, but
+            // cannot grant authority. Activation retains its complete checks.
+            current.vote <= cut.vote && *current.membership_config.log_id() == cut.membership
+        }) {
+            Some(cut) => cut,
+            None => self.certify_async_cold_cut_before(deadline).await?,
+        };
+        // The live leader may already know that this incarnation lost an
+        // acknowledged volatile tail. Start ordinary snapshot repair now,
+        // without spending this operation's deadline on its replication
+        // worker's unreachable-peer backoff. This hint grants no authority.
+        if cut.remembered_match.is_some_and(|remembered| {
+            self.inner.raft.metrics().borrow().last_log_index < Some(remembered.index)
+        }) {
+            protocol
+                .engine_before(deadline)
+                .await
+                .map_err(|_| ConsensusSessionStoreOpenError::RecoveryRequired)?
+                .request_cold_repair();
+        }
+        let mut metrics = self.inner.raft.metrics();
+        loop {
+            metrics.borrow_and_update();
+            if self.activate_caught_up_async_before(deadline).await? {
+                return Ok(());
+            }
+            if let Some(cut) = protocol
+                .take_repair_before(deadline)
+                .await
+                .map_err(|_| ConsensusSessionStoreOpenError::RecoveryRequired)?
+            {
+                let leader = cut
+                    .vote
+                    .leader_id
+                    .voted_for()
+                    .ok_or(ConsensusSessionStoreOpenError::RecoveryRequired)?;
+                self.call_peer::<_, ()>(
+                    leader,
+                    SessionConsensusRpcFamily::ReadBarrier,
+                    &persistence_protocol::ColdRepairRequest::new(cut),
+                    deadline,
+                )
+                .await
+                .map_err(|_| ConsensusSessionStoreOpenError::RecoveryRequired)?;
+                continue;
+            }
+            let changed = async {
+                tokio::select! {
+                    changed = metrics.changed() => changed.map_err(|_| ConsensusSessionStoreOpenError::EngineUnavailable),
+                    () = protocol.progress.notified() => Ok(()),
+                }
+            };
+            tokio::time::timeout_at(deadline, changed)
+                .await
+                .map_err(|_| ConsensusSessionStoreOpenError::RecoveryRequired)??;
+        }
+    }
+
+    async fn certify_async_cold_cut_before(
+        &self,
+        deadline: tokio::time::Instant,
+    ) -> Result<ColdQuorumCut, ConsensusSessionStoreOpenError> {
+        let protocol = &self.inner.persistence_protocol;
         // No old permitted RPC may be in flight when this nonce is created.
-        // Repeated initialize calls may replace an unavailable leader's cut;
+        // Replacement of an incompatible leader's cut drains admitted RPCs;
         // any already running strict snapshot install first drains here.
         let request = protocol
             .quarantine_before(deadline)
@@ -154,55 +224,7 @@ impl ConsensusSessionStore {
             .accept_cut_before(cut, deadline)
             .await
             .map_err(|_| ConsensusSessionStoreOpenError::RecoveryRequired)?;
-        // The live leader may already know that this incarnation lost an
-        // acknowledged volatile tail. Start ordinary snapshot repair now,
-        // without spending this operation's deadline on its replication
-        // worker's unreachable-peer backoff. This hint grants no authority.
-        if cut.remembered_match.is_some_and(|remembered| {
-            self.inner.raft.metrics().borrow().last_log_index < Some(remembered.index)
-        }) {
-            protocol
-                .engine_before(deadline)
-                .await
-                .map_err(|_| ConsensusSessionStoreOpenError::RecoveryRequired)?
-                .request_cold_repair();
-        }
-        let mut metrics = self.inner.raft.metrics();
-        loop {
-            metrics.borrow_and_update();
-            if self.activate_caught_up_async_before(deadline).await? {
-                return Ok(());
-            }
-            if let Some(cut) = protocol
-                .take_repair_before(deadline)
-                .await
-                .map_err(|_| ConsensusSessionStoreOpenError::RecoveryRequired)?
-            {
-                let leader = cut
-                    .vote
-                    .leader_id
-                    .voted_for()
-                    .ok_or(ConsensusSessionStoreOpenError::RecoveryRequired)?;
-                self.call_peer::<_, ()>(
-                    leader,
-                    SessionConsensusRpcFamily::ReadBarrier,
-                    &persistence_protocol::ColdRepairRequest::new(cut),
-                    deadline,
-                )
-                .await
-                .map_err(|_| ConsensusSessionStoreOpenError::RecoveryRequired)?;
-                continue;
-            }
-            let changed = async {
-                tokio::select! {
-                    changed = metrics.changed() => changed.map_err(|_| ConsensusSessionStoreOpenError::EngineUnavailable),
-                    () = protocol.progress.notified() => Ok(()),
-                }
-            };
-            tokio::time::timeout_at(deadline, changed)
-                .await
-                .map_err(|_| ConsensusSessionStoreOpenError::RecoveryRequired)??;
-        }
+        Ok(cut)
     }
 
     async fn activate_caught_up_async_before(

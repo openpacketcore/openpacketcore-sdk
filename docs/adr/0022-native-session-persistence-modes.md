@@ -206,6 +206,18 @@ is unavailable:
    fence through definitive completion. Cancellation or replacement cannot
    let an old callback activate the new attempt or cut over its snapshot.
 
+A caller deadline does not discard an accepted cut. Repeated initialization
+retains its exact nonce, leader, membership and matching-prefix progress;
+otherwise repeated new barriers can advance faster than the returning voter
+can apply them. Local incompatible vote/membership observations or an
+authenticated newer committed leader's replication request require fresh
+certification. Such a request is rejected under the old cut and grants no
+authority. Delayed lower votes and uncommitted campaigns do not discard
+progress. Replacing the cut still drains old admitted operations under the
+exclusive fence, and activation retains every full-vote, membership,
+confirmation and committed-application check. Each caller keeps its original
+deadline.
+
 Snapshot repair retains the selected PortableVerified or FsVerity policy,
 exact authority, metadata identity, and completed installation. A pre-barrier
 snapshot can supply only a base. A snapshot covering the barrier still needs
