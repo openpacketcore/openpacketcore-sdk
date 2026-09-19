@@ -86,6 +86,7 @@ fn request(model: &Value) -> Result<SetupRequestTransfer, opc_protocol::DecodeEr
             .as_u64()
             .map(|v| NetworkInstance::new(v as u16))
             .transpose()?,
+        common_network_instance: None,
     })
 }
 fn response(model: &Value) -> SetupResponseTransfer {

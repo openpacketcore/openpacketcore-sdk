@@ -96,14 +96,41 @@ fn budgets(value: &ModifyRequestTransfer, container_count: usize) -> (usize, usi
 
 #[test]
 fn independent_transfers_preserve_optional_values_and_canonical_bytes() {
+    use opc_proto_ngap::n3iwf::network_fields::CommonNetworkInstance;
+    use opc_proto_ngap::n3iwf::security_fields::NetworkInstance;
     let corpus = oracle();
     let rows = corpus["cases"].as_array().unwrap();
     assert_eq!(rows.len(), 380);
     let mut admitted = 0;
+    let mut newly_qualified = 0;
     for row in rows {
         let name = row["name"].as_str().unwrap();
         let wire = bytes(row["wire_hex"].as_str().unwrap());
         let decoded = ModifyRequestTransfer::decode(&wire, context());
+        // Keep the original corpus byte-identical and its original scope
+        // labels visible. These three valid wires gain separately qualified
+        // support in n3iwf-network-instance.json.
+        let qualified = match name {
+            "unsupported-known-129-372" => Some(ModifyRequestTransfer {
+                network_instance: Some(NetworkInstance::new(1).unwrap()),
+                ..Default::default()
+            }),
+            "unsupported-known-129-373" => Some(ModifyRequestTransfer {
+                network_instance: Some(NetworkInstance::new(256).unwrap()),
+                ..Default::default()
+            }),
+            "unsupported-known-166-374" => Some(ModifyRequestTransfer {
+                common_network_instance: Some(CommonNetworkInstance::new(vec![1, 2])),
+                ..Default::default()
+            }),
+            _ => None,
+        };
+        if let Some(expected) = qualified {
+            newly_qualified += 1;
+            assert!(decoded.unwrap().transfer == expected);
+            assert!(expected.encode(output()).unwrap().as_bytes() == wire);
+            continue;
+        }
         if row["admitted"] == false {
             assert!(decoded.is_err(), "{name} negative admitted");
             if name == "overlap" {
@@ -210,6 +237,7 @@ fn independent_transfers_preserve_optional_values_and_canonical_bytes() {
         assert_eq!(format!("{value:?}"), "ModifyRequestTransfer([REDACTED])");
     }
     assert_eq!(admitted, 363);
+    assert_eq!(newly_qualified, 3);
 }
 
 fn append(input: &[u8], id: u16, criticality: u8, value: &[u8]) -> Vec<u8> {
@@ -344,8 +372,12 @@ fn known_metadata_is_not_dropped_and_optional_ambr_stays_absent() {
         assert_eq!(row["presence"], "optional");
         let id = row["id"].as_u64().unwrap() as u16;
         let criticality = if row["criticality"] == "reject" { 0 } else { 1 };
-        let supported = [130, 140, 135, 137].contains(&id);
-        let value = if supported {
+        let supported = [130, 140, 129, 135, 137, 166].contains(&id);
+        let value = if id == 129 {
+            vec![0, 0] // Independently qualified root Network Instance 1.
+        } else if id == 166 {
+            vec![0] // Independently qualified empty Common OCTET STRING.
+        } else if supported {
             bytes(
                 all["fields"]
                     .as_array()

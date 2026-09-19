@@ -1,5 +1,8 @@
 #![no_main]
 
+#[path = "../../tests/support/network_instance.rs"]
+mod network_instance;
+
 #[path = "../../tests/support/setup_optionals.rs"]
 mod setup_optionals;
 #[path = "../../tests/support/release_sessions.rs"]
@@ -77,6 +80,7 @@ fuzz_target!(|data: &[u8]| {
         ..EncodeContext::default()
     };
     release_sessions::exercise(data, decode, output);
+    network_instance::exercise(data, decode, output);
     response_diagnostics::exercise(data, decode, output);
     applicability::exercise(data, decode, output);
     modify_fields::exercise(data, decode, output);
