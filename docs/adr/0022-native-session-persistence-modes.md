@@ -337,7 +337,9 @@ binding, process incarnation, reservation era and exact round digest.
    never silently reconciled as acknowledged data loss.
 3. **Reform.** Permit only the selected candidate's actual next-term election
    and its replication. The engine must grant real votes and commit an internal
-   recovery-boundary proposal. No synthetic successful response, new member,
+   recovery-boundary proposal. For protected configurations this proposal must
+   carry complete external-owner retirement evidence as specified below.
+   No synthetic successful response, new member,
    erased vote, lowered generation or forged commit substitutes for this step.
    Snapshot catch-up retains existing validation and ownership; actual matching
    append plus committed local application is still required.
@@ -391,13 +393,13 @@ All participants must retain applied exact fixed membership. If loss predates
 its first persisted generation, this protocol does not synthesize membership
 or rerun genesis; health reports `RetainedMembershipRequired`. Missing/corrupt
 roots, conflicting committed histories and exhausted ranges also require
-separate repair. A configured protected-roster trust root or retained protected
-authority reports `ProtectedAuthorityRequired`: its external retirement
-vocabulary is outside this protocol, including lost volatile activation.
+separate repair. A protected configuration without an installed complete
+provider inventory reports `ProtectedAuthorityRequired`, including when its
+volatile activation was lost.
 These are availability limits, never successful fence-only recovery outcomes.
 
-The protected restriction also applies to newly provisioned `OPCNA003` roots;
-it is independent of older deployment migration. The provider contract fences
+This requirement also applies to newly provisioned `OPCNA003` roots;
+it is independent of older deployment migration. The member provider contract fences
 one immutable admission/member binding. Issuing a larger consensus fence for
 a different admission does not advance that old provider row. A local permit
 can still authorize its provider effect while consensus subsequently rejects
@@ -405,13 +407,56 @@ its terminalization. Expiring the permit prevents new calls but neither undoes
 an earlier durable effect nor reconstructs lost admitted bytes. Disk waits
 during recovery alone cannot supply this missing authority.
 
-The real retained-root/mTLS RED and independent disk-backed provider controls
-are recorded in [the protected recovery follow-up](../async-protected-recovery-908.md).
-They establish the need for recovery-only scope retirement and exact effect
-reconciliation, not a requirement to make ordinary Async acknowledgements
-wait for disk. No such protected recovery capability is implemented yet.
+### Protected external authority retirement
 
-The Async wire discriminator advances to `OPC-ASYNC-2` so older peers cannot
+`ProtectedAsyncRecovery` supplies the recovery-only capability. Before use,
+the protected trust-root authority signs one complete immutable inventory of
+external owners for the exact configuration identity and fixed voter set.
+Completeness comes from provisioned effect ownership, never from the selected
+generation: a lost admission can leave an effect in a provider absent from that
+generation. Every replica/pool capable of member or publication effects must
+belong to a listed owner. Inventory replacement in an open store is rejected;
+persisted recovery evidence pins the inventory in later incarnations.
+
+After all voters have durably promised the new reserved range and elected the
+selected candidate, the SDK requests retirement from every owner. The challenge
+binds the root, inventory, Async domain, configuration epoch, next era, exact
+round and selected history, including every retained root/boot, full vote and
+LogId, completed generation and application digest. Owner-specific P-256
+signatures cannot be relabelled, combined across rounds or reused for a new
+selection. All signatures are required in the committed boundary. Independent
+log, application, snapshot and cold-generation validation enforce that proof;
+every Ready report additionally checks the exact selection before activation.
+
+Each owner must durably enforce the inclusive retired floor across its whole
+configuration scope, including different and unknown bindings. Retirement
+serializes with physical effects: all accepted old work must finish, be
+conclusively reconciled, or be permanently unable to touch successor resources
+before the owner signs. Completed outcomes remain immutable. Orphan cleanup
+must complete or remain permanently fenced from successor resources; lost Q1
+and `NotFound` cannot manufacture `NotApplied`. Retained protected admissions,
+reservations and terminal evidence are preserved for exact higher-fence
+reconciliation. This contract covers member and publication effects alike.
+
+An owned SDK supervisor joins every accepted owner call, including after caller
+cancellation, timeout or another owner's failure. Exact retries share completion;
+a replacement challenge waits for accepted responsibility. Providers separately
+retain crash-durable responsibility across their own restarts. Original deadlines
+still bound each caller's wait. Passive typed states distinguish pending owners
+(`AwaitingProtectedRetirement`) from invalid authority
+(`ProtectedAuthorityRejected`). A provider may not sign if it cannot enforce
+the required scope floor. No boolean opt-in substitutes for this capability.
+
+Only recovery waits for these new disk synchronizations. Normal Async
+acknowledgements and Durable/Ephemeral semantics are unchanged. Async still
+permits acknowledged session/admission data loss; recovery does not reconstruct
+missing exact outcomes or promise continued calls. The provider inventory and
+owner adapters must be composed and qualified by downstream applications.
+
+The retained-root/mTLS RED, recovery tests and independent provider controls
+are recorded in [the protected recovery follow-up](../async-protected-recovery-908.md).
+
+The Async wire discriminator advances to `OPC-ASYNC-3` so older peers cannot
 admit state without understanding retirement/snapshot semantics. Mixed-version
 Async membership is rejected. Upgrade members and consumers together; Durable
 encoding and acknowledgement semantics remain unchanged.

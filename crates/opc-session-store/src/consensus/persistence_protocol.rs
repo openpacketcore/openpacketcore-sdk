@@ -31,7 +31,7 @@ use super::{
 // Eleven continuation bytes cannot encode a Postcard u64 or enum tag. Older
 // durable engine/forward handlers therefore reject this prefix too. The
 // entire prefix consumes the existing family payload budget.
-const ASYNC_WIRE: &[u8] = b"\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xffOPC-ASYNC-2\0";
+const ASYNC_WIRE: &[u8] = b"\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xffOPC-ASYNC-3\0";
 
 mod recovery;
 #[cfg(target_os = "linux")]
@@ -218,6 +218,9 @@ pub(crate) struct PersistenceProtocol {
     pub(super) recovery_coordinator: Arc<Mutex<Option<Coordinator>>>,
     #[cfg(target_os = "linux")]
     pub(super) recovery_local: Arc<Mutex<Option<LocalRecovery>>>,
+    #[cfg(target_os = "linux")]
+    pub(super) protected_recovery:
+        Arc<std::sync::OnceLock<Arc<super::protected_recovery::ProtectedAsyncRecovery>>>,
     recovery_limit: Arc<std::sync::atomic::AtomicU8>,
     pub progress: Arc<Notify>,
     /// Bound cancellation-safe cold RPC supervisors. The original engine
@@ -251,6 +254,8 @@ impl PersistenceProtocol {
             recovery_coordinator: Arc::new(Mutex::new(None)),
             #[cfg(target_os = "linux")]
             recovery_local: Arc::new(Mutex::new(None)),
+            #[cfg(target_os = "linux")]
+            protected_recovery: Arc::new(std::sync::OnceLock::new()),
             recovery_limit: Arc::new(std::sync::atomic::AtomicU8::new(0)),
             progress: Arc::new(Notify::new()),
             cold_rpc_admission: Arc::new(Semaphore::new(16)),
@@ -293,6 +298,8 @@ impl PersistenceProtocol {
             4 => return Some(SessionAsyncRecoveryState::RetainedMembershipRequired),
             5 => return Some(SessionAsyncRecoveryState::RetainedHistoryConflict),
             6 => return Some(SessionAsyncRecoveryState::AuthorityRangeExhausted),
+            7 => return Some(SessionAsyncRecoveryState::AwaitingProtectedRetirement),
+            8 => return Some(SessionAsyncRecoveryState::ProtectedAuthorityRejected),
             _ => {}
         }
         Some(match self.admission.try_read().as_deref() {

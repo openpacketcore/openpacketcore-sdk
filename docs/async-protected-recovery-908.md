@@ -1,9 +1,11 @@
 # Protected-roster Async recovery: SDK #908 follow-up
 
-PR #910 does not cover the protected-roster configuration used by ePDG. This
-gap also affects roots created by the current SDK. It is independent of older
-storage formats or deployment migration; adding a legacy upgrade workflow is
-outside this follow-up's scope.
+This follow-up implements protected Async majority/all-cold recovery through
+explicit external-owner retirement. PR #910 supplied the retained-owner
+consensus recovery mechanism but could not retire protected provider effects.
+The missing capability affected fresh roots too; deployment migration is
+outside this work's scope. Normal Async acknowledgements remain independent
+of disk. The new synchronization belongs to recovery.
 
 ## Executed baseline
 
@@ -42,7 +44,7 @@ not yet exercise a retained protected admission or prepared transition.
 
 ## Established authority boundary
 
-The current `ProtectedAuthorityRequired` guard remains in place. Removing it
+The `ProtectedAuthorityRequired` guard remains for unconfigured owners. Removing it
 alone would not define how a lost protected admission, its external effects,
 or an old provider permit is reconciled with the successor. Ordinary Async
 acknowledgements must remain independent of disk; Durable and Ephemeral
@@ -56,9 +58,8 @@ An external effect's absence from the selected Async generation is not proof
 that it never occurred. See the
 [protected-roster contract](session-store-protected-atomic-roster.md).
 
-No production correction, full-gate pass or new CRC result is claimed by this
-baseline. The existing CRC failure evidence remains unchanged. Further SDK
-work and downstream product qualification are required before #908 is closed.
+The baseline is historical RED evidence. The existing CRC failure evidence
+remains unchanged; SDK recovery tests cannot establish product recovery.
 
 ### Independent provider controls
 
@@ -90,58 +91,136 @@ tests passed (exit 0, no ignored tests), log SHA-256
 `cd5bdaddb8a69c7592904600a74f55b71446d461729b2af63c54570be8fecc53`.
 Both used the CI core profile and a private XFS `TMPDIR` verified by `findmnt`.
 
-## Required contract extension and ownership
+## Implemented recovery capability and ownership
 
-The missing authority is permission to retire **every** old protected effect
-in the exact configuration, including bindings absent from all returned
-generations. The current provider API only prepares, executes, statuses,
-adopts and reconciles an already known exact member. It has no complete
-provider inventory, scope-retirement operation, or proof that unknown old
-work is fenced. A trust root authenticates signatures; by itself it proves
-none of those facts.
+`consensus::protected_recovery` supplies four composition steps:
 
-A safe recovery capability must provide all of the following:
+1. The protected trust-root authority provisions one complete immutable
+   `ProtectedRecoveryInventory` for the exact configuration identity, epoch
+   and fixed voter set. It lists 1–32 external owner identities and P-256 keys
+   in canonical order. The root signer establishes completeness from actual
+   ownership, including every member and publication provider, replica and
+   pool. It must never infer completeness from returned session state or sign
+   a different inventory for the same configuration as a recovery shortcut.
+2. Every voter installs that same inventory and its owner adapters once using
+   `ProtectedAsyncRecovery::new` and
+   `ConsensusSessionStore::configure_protected_async_recovery`. The store
+   checks Async mode, exact configuration/root/membership and any retained
+   prior proof. Replacing configured authority in an open store is rejected.
+3. The existing unanimous protocol obtains durable promises and a real
+   election. Its selected leader issues an SDK-only challenge binding the
+   complete inventory, exact round and selected history: all retained
+   roots/incarnations, full votes/LogIds, completed generations and application
+   digests. Each owner durably retires the entire inclusive old reserved fence
+   range, then signs its owner-specific challenge digest. An old reply cannot
+   authorize another round or selection, even when the scalar floor matches.
+4. The SDK requires every listed owner's verified receipt in its internal
+   committed recovery boundary. Native application and cold/snapshot readers
+   validate the proof against the actual root/configuration. Every retained
+   voter must apply and persist the boundary and check its exact selection
+   before activation. Normal current quorum/traffic checks still follow.
 
-1. Bind the configuration epoch, retained roots, fixed membership, persistence
-   mode, old reserved range, proposed successor range and exact recovery round.
-   Bind any authorization to the selected state/generation as well; a stale
-   receipt cannot authorize another candidate, replacement owner or round.
-2. Durably retire the old range at every affected member and publication
-   provider, including absent journal bindings. Checks at effect boundaries
-   must enforce that retirement across processes and different admissions.
-   Already accepted work must finish under retained ownership, be conclusively
-   reconciled, or be irrevocably fenced before successor effects are enabled.
-   Caller cancellation or a dropped reply must not drop that responsibility.
-3. Preserve exact retained admissions, reservations, prepared bodies and
-   terminal evidence. Reconcile effects missing from the selected Async
-   generation under explicit retirement authority; neither `NotFound` nor an
-   expired timer permits inventing a replacement admission or claiming
-   `NotApplied`.
-4. Carry verified completion into the existing real election, committed
-   application, complete persisted-generation and readiness checks. Missing
-   participants or provider authority remain fixed typed pending/repair states
-   within the original deadlines; partial or interrupted retirement must be
-   resumable under the same exact binding.
+### Provider effect boundary
 
-This extends the SDK recovery/provider boundary and requires composition by
-the actual provider owners. It does not require ordinary Async session
-acknowledgements to wait for disk, or a redesign of Durable or Ephemeral.
-Disk synchronization for the new retirement authority belongs in recovery.
-The generic SDK cannot assert that arbitrary external effects have been
-retired using the current opaque provider methods. A boolean opt-in, a signed
-assertion without that provider contract, or removing the trust root would
-only conceal the missing authority.
+The owner must enforce a crash-durable global floor across **all** bindings in
+its configuration. A per-admission fence cannot substitute for this floor.
+Every prepare, execute, adopt, reconcile, compensate and publication effect
+must respect it, across processes, replicas and independent connection pools.
+An unknown binding also rejects an old fence. A delayed retirement request
+cannot lower the floor or affect resources owned by a newer range.
 
-This follow-up establishes that technical blocker; it does not implement the
-new capability. The required positive tests remain RED, and draft PR #929 must
-not be presented or merged as a recovery fix. Retained prepared transitions,
-lost volatile protected admissions, unavailable providers, interrupted
-retirement, partial catch-up, cancellation and owner replacement still need
-positive/negative composed coverage once the capability exists. Full SDK
-gates and the separate CI profiles remain required for that implementation.
+Before signing, the owner must join accepted lower-range work, conclusively
+reconcile it, or make it permanently unable to affect successor resources.
+A dropped request/reply, cancellation or process replacement must not discard
+that responsibility. Completed outcomes and their evidence remain immutable.
+Completed effects may remain for exact higher-fence adoption; orphan cleanup
+must complete or be permanently fenced from successor resources before the
+receipt. Neither lost Q1 nor `NotFound` proves `NotApplied`. The root inventory
+signer and the provider signing keys are privileged authorities, not arbitrary
+consumer opt-ins.
 
-Downstream ePDG must then wire the provider retirement authority, repin the
-validated SDK and repeat retained-root Durable/Async majority and all-cold
-recovery with the original worker, followed by the common service suite. No
-live CRC, storage reset, packet-continuity, audio or production-HA result is
-claimed here. Older deployment migration is outside this work's scope.
+Retained protected admissions, reservations, prepared bodies and terminal
+receipts remain intact. A higher-fence successor uses the ordinary protected
+API to recover the exact admission and reconcile its providers before Q2.
+The boundary does not clear a reservation, invent a terminal or reconstruct a
+lost admission from a subscriber key. A provider must return pending if its
+physical effects cannot satisfy this contract; a signature without enforcement
+is a broken provider implementation, not a valid recovery implementation.
+
+### Deadlines and responsibility
+
+The coordinator retains accepted calls under an owned supervisor. It joins
+**all** owners even when one fails or the original caller stops waiting.
+Duplicate calls share exact completion; a newer challenge waits for earlier
+accepted responsibility. Provider adapters additionally retain responsibility
+across provider-process loss. Caller deadlines remain unchanged and consume
+lock, election, provider, commit and persistence waits together.
+
+After a deadline or lost commit reply, an authenticated progress query checks
+the exact selected leader, current full committed vote, local recovery binding
+and accepted proposal status. An intact protected election resumes its owned
+work on the next initialization call. This progress reply cannot activate a
+voter or replace a commit/application certificate. A failed election/proposal,
+replaced incarnation or rejected authority starts a fresh unanimous round.
+
+| Passive typed state | Meaning |
+| --- | --- |
+| `ProtectedAuthorityRequired` | The protected configuration has no complete recovery capability installed. |
+| `AwaitingProtectedRetirement` | A selected round is waiting for durable completion from its external owners. |
+| `ProtectedAuthorityRejected` | Inventory, signature or exact authority binding was rejected. |
+| `ReformingQuorum` | Real election, catch-up, committed boundary or persisted completion remains in progress. |
+| `Active` | Consensus participation is admitted; current traffic authority still requires its own probe. |
+
+Diagnostics expose fixed states only. No subscriber values, addresses,
+credentials, arbitrary protocol/debug state or packet payloads are required.
+
+## Validation and remaining integration
+
+The initial implementation passed the four real process recovery cases
+(two protected Async and two Durable controls), exit 0, log SHA-256
+`cc1bc06c178ff157dc967251e52d9f21789e5ce5ce99ddbc68a1b1a6865c70fa`.
+The external FULL-sync journal retained a prepared effect, a completed effect,
+and the global floor; old known and unknown bindings could not mutate the
+successor. This first GREEN preceded the stronger composed Q1 tests and is
+not a full-gate qualification.
+
+Further focused coverage includes retained protected Q1 and prepared member
+work, differing generations and acknowledged volatile lease tails, all-cold
+recovery, delayed/duplicate proofs, missing owners, sequential catch-up,
+cancellation and replacement. Exact commands, source hashes, exit codes and
+full-gate results belong in the PR's validation evidence; unfinished checks
+must not be reported as passes.
+
+The strengthened process suite passed five cases (exit 0), log SHA-256
+`67603b9cf4ba66ccd73340b1acf81cd7036b04af56763ff7443ce6499c389e9a`:
+the same two Durable controls, protected Async majority/all-cold return with
+retained Q1 and successful reconciled Q2, and a separate all-cold case with an
+acknowledged Q1 missing from every returned generation. The last case injects
+ENOSPC only before real native generation publication; it verifies completed
+frontiers stayed before Q1, kills all voter processes, removes only the I/O
+fault and reopens unchanged roots. The durable provider effect survives;
+missing Q1 remains unknown, old prepared handles cannot write, and successor
+lease/CAS/provider operations succeed.
+
+A slow-owner regression separately failed before progress resumption (exit
+101, SHA-256 `bb8d127638926e8ebbf0254a956c710ee8859f60027cae5a5c9b0f0cbeda074c`)
+and passed afterward (exit 0, SHA-256
+`0e392f1c2e9c2258f8830d03b8326135bbca44c847279c96e31d65103b39be61`).
+Its retirement takes 1,600 ms against unchanged 800 ms RPC deadlines; repeated
+ordinary initialization joins exactly one owner call, then performs a valid
+successor operation. Full repository qualification remains pending.
+
+This is a new explicit SDK capability, not an automatic claim about an
+existing product provider. ePDG must provision the complete inventory, wire
+actual member/publication owners to enforce retirement at their effect
+boundaries, repin the reviewed SDK and qualify that composition. The separate
+CRC exercise must retain the original worker, membership, roots and Recovery
+authority, test Durable/Async majority recovery and a separate all-cold case,
+then run the common service suite. No live CRC, storage reset, call continuity,
+audio or production-HA result is claimed here.
+
+Async can still lose acknowledged records, admissions and results absent from
+all selected generations. Recovery requires all original retained owners on
+this unanimous path; permanently missing/corrupt roots, missing persisted
+membership and conflicting committed histories require separate repair
+authority. These availability limits must remain explicit.

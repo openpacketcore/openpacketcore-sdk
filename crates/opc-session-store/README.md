@@ -480,7 +480,8 @@ Each call keeps its original operation deadline. `RecoveryRequired` can mean
 an incomplete bounded attempt: retry initialization while consulting passive
 `persistence_health().recovery`. Fixed reasons distinguish preparation,
 quorum reformation, unavailable participants, legacy authority, missing retained
-membership, incompatible committed history and exhausted authority. Accepted
+membership, incompatible committed history, exhausted authority, pending
+protected retirement and rejected protected authority. Accepted
 disk/engine work retains its owner after cancellation; an interrupted round
 prepares a strictly newer range where necessary. No timeout is raised to make
 recovery succeed. `Active` permits consensus participation, not traffic by
@@ -505,23 +506,32 @@ This change does not recover already-fenced legacy installations.
 Automatic unanimous recovery requires retained reservations and an applied
 exact fixed membership on every participant. It cannot replace a missing or
 corrupt root, reconstruct formation when every selected generation predates
-membership, select between conflicting committed histories, or retire protected
-roster authority. A configured protected-roster trust root disables this path,
-even if its volatile activation was lost. Those conditions require a separately
-specified repair/retirement authority; waiting or resetting storage supplies
-none. A permanently fenced installation is an availability failure.
+membership, or select between conflicting committed histories. Those conditions
+require separate repair authority; waiting or resetting storage supplies none.
+A permanently fenced installation is an availability failure.
 
-The protected-roster restriction affects fresh roots too. Provider journals
-fence an exact admitted operation; a higher fence for a different admission
-does not retire a lost operation's provider authority. Recovery needs authority
-to retire and reconcile that whole scope, including effects whose admissions
-are missing from retained Async state. Waiting for disk or lease expiry cannot
-recreate those facts. This does not require changing ordinary Async
-acknowledgements into Durable acknowledgements. See the
-[protected recovery RED and authority controls](../../docs/async-protected-recovery-908.md)
-for the current gap and exact required contract extension.
+Protected Async recovery uses
+`consensus::protected_recovery::ProtectedAsyncRecovery`. Provision the same
+root-signed, complete `ProtectedRecoveryInventory` on every voter and install
+it once with `configure_protected_async_recovery`. Each listed
+`ProtectedAsyncRecoveryOwner` must durably retire the entire old fence range,
+including unknown admissions and publications, across all of its processes and
+effect boundaries. It must join or irrevocably fence accepted work and retain
+responsibility for orphan effects before signing the SDK's exact challenge.
+Every owner's verified receipt is committed with the recovery boundary and
+checked again on all returned roots. Retained admissions and evidence remain
+intact; higher-fence callers reconcile them through the ordinary protected API.
 
-Async transport now uses `OPC-ASYNC-2`; older Async peers reject the protocol,
+This capability adds recovery-time synchronization. Normal Async session
+acknowledgements still do not wait for disk. A provider's existing per-member
+journal alone cannot implement whole-scope retirement. Missing configured
+authority reports `ProtectedAuthorityRequired`; unfinished providers report
+`AwaitingProtectedRetirement`; invalid proofs report
+`ProtectedAuthorityRejected`. The same initialization deadline and retry apply.
+See the [protected recovery contract and evidence](../../docs/async-protected-recovery-908.md)
+for the required provider ownership guarantees and acknowledged-data-loss limits.
+
+Async transport now uses `OPC-ASYNC-3`; older Async peers reject the protocol,
 and current peers reject older Async frames. Durable wire encoding is unchanged.
 Upgrade the whole Async membership and consumers together; rolling mixed-version
 recovery is unsupported. An already-fenced legacy installation cannot gain its

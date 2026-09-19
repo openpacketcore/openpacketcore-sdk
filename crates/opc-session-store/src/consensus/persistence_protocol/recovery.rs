@@ -14,6 +14,7 @@ pub(in crate::consensus) struct Coordinator {
     pub boundary: Option<LogId<SessionConsensusNodeId>>,
     pub ready: BTreeMap<SessionConsensusNodeId, Ready>,
     pub restart: bool,
+    pub resume_owned_commit: bool,
 }
 
 #[cfg(target_os = "linux")]
@@ -36,6 +37,8 @@ impl PersistenceProtocol {
             SessionAsyncRecoveryState::RetainedMembershipRequired => 4,
             SessionAsyncRecoveryState::RetainedHistoryConflict => 5,
             SessionAsyncRecoveryState::AuthorityRangeExhausted => 6,
+            SessionAsyncRecoveryState::AwaitingProtectedRetirement => 7,
+            SessionAsyncRecoveryState::ProtectedAuthorityRejected => 8,
             _ => return,
         };
         if value == 3 {

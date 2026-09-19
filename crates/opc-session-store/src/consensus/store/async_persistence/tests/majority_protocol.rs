@@ -8,7 +8,7 @@ fn coordinator(fleet: &Fleet) -> SessionConsensusNodeId {
     fleet.peers.iter().map(|peer| peer.node).min().unwrap()
 }
 
-fn index(fleet: &Fleet, node: SessionConsensusNodeId) -> usize {
+pub(super) fn index(fleet: &Fleet, node: SessionConsensusNodeId) -> usize {
     fleet
         .peers
         .iter()
@@ -16,7 +16,7 @@ fn index(fleet: &Fleet, node: SessionConsensusNodeId) -> usize {
         .unwrap()
 }
 
-async fn control(
+pub(super) async fn control(
     fleet: &Fleet,
     target: usize,
     action: Action,
@@ -61,7 +61,7 @@ async fn round(fleet: &Fleet) -> Round {
     }
 }
 
-async fn prepare(fleet: &Fleet) -> Selection {
+pub(super) async fn prepare(fleet: &Fleet) -> Selection {
     let round = round(fleet).await;
     let prepared = tokio::time::timeout(Duration::from_secs(30), async {
         loop {
@@ -159,7 +159,7 @@ async fn committed(fleet: &Fleet, selection: &Selection) -> LogId<SessionConsens
 }
 
 pub(super) async fn recover(fleet: &Fleet) {
-    tokio::time::timeout(Duration::from_secs(30), async {
+    let result = tokio::time::timeout(Duration::from_secs(30), async {
         loop {
             let _ = join_all(
                 fleet
@@ -185,8 +185,17 @@ pub(super) async fn recover(fleet: &Fleet) {
             }
         }
     })
-    .await
-    .expect("complete recovery and usable application authority");
+    .await;
+    if result.is_err() {
+        for store in fleet.stores.iter().flatten() {
+            eprintln!(
+                "recovery_fixture_progress stage={:?} active={}",
+                store.persistence_health().recovery,
+                store.inner.persistence_protocol.is_active()
+            );
+        }
+    }
+    result.expect("complete recovery and usable application authority");
 }
 
 struct DiskHold {
@@ -210,9 +219,22 @@ impl Drop for DiskRelease {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn async_recovery_cancelled_promise_owns_disk_until_shutdown_and_replacement() {
+    exercise_cancelled_promise_owns_disk_until_shutdown_and_replacement(false).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn protected_async_recovery_cancelled_promise_owns_disk_until_shutdown_and_replacement() {
+    exercise_cancelled_promise_owns_disk_until_shutdown_and_replacement(true).await;
+}
+
+async fn exercise_cancelled_promise_owns_disk_until_shutdown_and_replacement(protected: bool) {
     use crate::sqlite::consensus::wal::Point;
     let _timing = crate::acquire_consensus_timing_test_permit().await;
-    let mut fleet = Fleet::new(3);
+    let mut fleet = if protected {
+        Fleet::with_protected_recovery(3)
+    } else {
+        Fleet::new(3)
+    };
     let result = AssertUnwindSafe(async {
         fleet.start().await;
         cold(&mut fleet).await;
@@ -316,8 +338,21 @@ async fn async_recovery_cancelled_promise_owns_disk_until_shutdown_and_replaceme
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn async_recovery_five_voters_repeat_boundary_and_sequential_rejoin() {
+    exercise_five_voters_repeat_boundary_and_sequential_rejoin(false).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn protected_async_recovery_five_voters_repeat_boundary_and_sequential_rejoin() {
+    exercise_five_voters_repeat_boundary_and_sequential_rejoin(true).await;
+}
+
+async fn exercise_five_voters_repeat_boundary_and_sequential_rejoin(protected: bool) {
     let _timing = crate::acquire_consensus_timing_test_permit().await;
-    let mut fleet = Fleet::new(5);
+    let mut fleet = if protected {
+        Fleet::with_protected_recovery(5)
+    } else {
+        Fleet::new(5)
+    };
     let result = AssertUnwindSafe(async {
         fleet.start().await;
         let mut prior_era = 1;
@@ -380,7 +415,7 @@ async fn async_recovery_five_voters_repeat_boundary_and_sequential_rejoin() {
     result.unwrap_or_else(|panic| std::panic::resume_unwind(panic));
 }
 
-async fn cold(fleet: &mut Fleet) {
+pub(super) async fn cold(fleet: &mut Fleet) {
     fleet.close_all().await;
     for target in 0..fleet.stores.len() {
         fleet
@@ -392,8 +427,21 @@ async fn cold(fleet: &mut Fleet) {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn async_recovery_activation_retry_survives_a_new_real_leader() {
+    exercise_activation_retry_survives_a_new_real_leader(false).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn protected_async_recovery_activation_retry_survives_a_new_real_leader() {
+    exercise_activation_retry_survives_a_new_real_leader(true).await;
+}
+
+async fn exercise_activation_retry_survives_a_new_real_leader(protected: bool) {
     let _timing = crate::acquire_consensus_timing_test_permit().await;
-    let mut fleet = Fleet::new(3);
+    let mut fleet = if protected {
+        Fleet::with_protected_recovery(3)
+    } else {
+        Fleet::new(3)
+    };
     let result = AssertUnwindSafe(async {
         fleet.start().await;
         cold(&mut fleet).await;
@@ -497,8 +545,21 @@ async fn async_recovery_activation_retry_survives_a_new_real_leader() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn async_recovery_retries_an_election_interrupted_after_preparation() {
+    exercise_retries_an_election_interrupted_after_preparation(false).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn protected_async_recovery_retries_an_election_interrupted_after_preparation() {
+    exercise_retries_an_election_interrupted_after_preparation(true).await;
+}
+
+async fn exercise_retries_an_election_interrupted_after_preparation(protected: bool) {
     let _timing = crate::acquire_consensus_timing_test_permit().await;
-    let mut fleet = Fleet::new(3);
+    let mut fleet = if protected {
+        Fleet::with_protected_recovery(3)
+    } else {
+        Fleet::new(3)
+    };
     let result = AssertUnwindSafe(async {
         fleet.start().await;
         cold(&mut fleet).await;
@@ -552,8 +613,21 @@ async fn async_recovery_retries_an_election_interrupted_after_preparation() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn async_recovery_old_ready_and_delayed_activation_cannot_admit_a_replacement() {
+    exercise_old_ready_and_delayed_activation_cannot_admit_a_replacement(false).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn protected_async_recovery_old_ready_and_delayed_activation_cannot_admit_a_replacement() {
+    exercise_old_ready_and_delayed_activation_cannot_admit_a_replacement(true).await;
+}
+
+async fn exercise_old_ready_and_delayed_activation_cannot_admit_a_replacement(protected: bool) {
     let _timing = crate::acquire_consensus_timing_test_permit().await;
-    let mut fleet = Fleet::new(3);
+    let mut fleet = if protected {
+        Fleet::with_protected_recovery(3)
+    } else {
+        Fleet::new(3)
+    };
     let result = AssertUnwindSafe(async {
         fleet.start().await;
         cold(&mut fleet).await;
@@ -640,12 +714,47 @@ async fn async_recovery_old_ready_and_delayed_activation_cannot_admit_a_replacem
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn async_recovery_certificates_require_exact_roster_root_boot_vote_and_commit() {
+    exercise_certificates_require_exact_roster_root_boot_vote_and_commit(false).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn protected_async_recovery_certificates_require_exact_roster_root_boot_vote_and_commit() {
+    exercise_certificates_require_exact_roster_root_boot_vote_and_commit(true).await;
+}
+
+async fn exercise_certificates_require_exact_roster_root_boot_vote_and_commit(protected: bool) {
     let _timing = crate::acquire_consensus_timing_test_permit().await;
-    let mut fleet = Fleet::new(3);
+    let mut fleet = if protected {
+        Fleet::with_protected_recovery(3)
+    } else {
+        Fleet::new(3)
+    };
     let result = AssertUnwindSafe(async {
         fleet.start().await;
         cold(&mut fleet).await;
         let selection = prepare(&fleet).await;
+        if protected {
+            let caller = coordinator(&fleet);
+            let remote = fleet
+                .peers
+                .iter()
+                .find(|peer| peer.node != caller && peer.node != selection.leader)
+                .unwrap();
+            let rejection = fleet
+                .store(index(&fleet, caller))
+                .recovery_call(
+                    remote.node,
+                    Action::Commit(selection.clone()),
+                    tokio::time::Instant::now() + OPERATION_BOUND,
+                )
+                .await
+                .err();
+            assert_eq!(
+                rejection,
+                Some(SessionConsensusPeerError::Rejected),
+                "an authenticated rejection must not become retryable owner progress"
+            );
+        }
         let own = fleet.peers[0].node;
         let mut invalid = Vec::new();
         let mut changed = selection.clone();
@@ -750,8 +859,21 @@ async fn async_recovery_certificates_require_exact_roster_root_boot_vote_and_com
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn async_recovery_snapshot_requires_complete_install_and_actual_matching_append() {
+    exercise_snapshot_requires_complete_install_and_actual_matching_append(false).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn protected_async_recovery_snapshot_requires_complete_install_and_actual_matching_append() {
+    exercise_snapshot_requires_complete_install_and_actual_matching_append(true).await;
+}
+
+async fn exercise_snapshot_requires_complete_install_and_actual_matching_append(protected: bool) {
     let _timing = crate::acquire_consensus_timing_test_permit().await;
-    let mut fleet = Fleet::new(3);
+    let mut fleet = if protected {
+        Fleet::with_protected_recovery(3)
+    } else {
+        Fleet::new(3)
+    };
     let result = AssertUnwindSafe(async {
         fleet.start().await;
         cold(&mut fleet).await;

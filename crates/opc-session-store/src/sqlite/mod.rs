@@ -1009,6 +1009,22 @@ fn fixed_quorum_application_traffic_authority_is_exact_sync(
 }
 
 impl SqliteSessionBackend {
+    /// Install a test-only I/O fault before opening the native owner. The
+    /// callback runs before ordinary generation publication; it cannot replace
+    /// storage, change admission or manufacture completed persistence.
+    #[cfg(all(target_os = "linux", any(test, feature = "test-control")))]
+    #[doc(hidden)]
+    pub fn set_native_generation_fault_for_test(
+        &self,
+        fault: impl Fn() -> std::io::Result<()> + Send + Sync + 'static,
+    ) -> Result<(), StoreError> {
+        self.native_owner
+            .as_ref()
+            .ok_or(StoreError::TopologyAuthorityRevoked)?
+            .set_generation_hook_for_test(Arc::new(fault))
+            .map_err(|_| StoreError::TopologyAuthorityRevoked)
+    }
+
     /// Open (or create) a SQLite database at the given path.
     pub fn open(path: impl AsRef<Path>) -> Result<Self, StoreError> {
         let path = path.as_ref();
