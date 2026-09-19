@@ -13,6 +13,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   replacement, shutdown and multihoming failover qualification (Refs #788).
 
 ### Added
+- `opc-diameter-transport`: add opt-in reliable ordered application streams to
+  generic RFC 6083 transport. Preserve stream metadata through exact decrypted
+  record identities, bound pending correlations and plaintext queues, retain
+  control stream zero, and enforce DTLS 1.2 protected-record wire versions.
+  Qualify both endpoint roles on the real Linux SCTP-AUTH carrier (Refs #794,
+  #784).
 - `opc-diameter-transport`: add optional required direct-CRL constructors for
   generic RFC 6083 endpoints. Bind full-path revocation verification and
   retained connection evidence to the exact credential/trust epoch and CRL

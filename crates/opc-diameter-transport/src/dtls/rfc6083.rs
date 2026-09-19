@@ -1,10 +1,10 @@
 //! Direct RFC 6083 transport without Diameter procedure state.
 //!
-//! This initial profile carries every record reliably on ordered SCTP stream
-//! zero. It supports the registered protected PPIDs 47 and 66; PPID 60 is never
-//! admitted. Nonzero streams and full NGAP transport conformance remain
-//! unsupported. A selected PPID is only configuration: [`Connection`] is
-//! issued after mutual DTLS authentication and the SCTP-AUTH key barriers.
+//! Explicit policies carry application records on reliable ordered SCTP
+//! stream zero or a bounded stream range. DTLS control always uses stream zero.
+//! The protected PPIDs are 47 and 66; PPID 60 is never admitted. Full NGAP stream
+//! assignment remains caller-owned. A selected PPID is only configuration:
+//! [`Connection`] is issued after mutual DTLS authentication and SCTP-AUTH barriers.
 //!
 //! The implementation shares the existing Diameter transport's DTLS engine,
 //! exact SPIFFE certificate verification, coherent credential epochs, sender
@@ -44,6 +44,7 @@ use super::*;
 use opc_types::SpiffeId;
 
 pub(in crate::dtls) mod revocation;
+pub(in crate::dtls) mod streams;
 pub use revocation::{
     CrlError, CrlEvidence, CrlGeneration, CrlPublisher, CrlSource, MAX_CRLS, MAX_CRL_BYTES,
     MAX_CRL_SET_BYTES,
@@ -92,7 +93,7 @@ impl fmt::Debug for ExpectedPeer {
     }
 }
 
-/// Caller-selected limits for the DTLS 1.2 ordered-stream-zero profile.
+/// Caller-selected stream and resource limits for reliable ordered DTLS 1.2.
 ///
 /// The plaintext limit is 1 through [`MAX_DTLS_SCTP_MESSAGE_BYTES`], inclusive;
 /// an authenticated empty application record is nevertheless valid. The
@@ -102,6 +103,8 @@ impl fmt::Debug for ExpectedPeer {
 pub struct Policy {
     protocol: PayloadProtocol,
     maximum_plaintext_bytes: usize,
+    application_stream_count: u16,
+    pending_record_capacity: usize,
     shared: DtlsSctpPolicy,
 }
 
@@ -109,8 +112,8 @@ impl Policy {
     /// Select reliable ordered stream zero and a finite plaintext budget.
     ///
     /// This deliberately does not advertise the stream pairs required for
-    /// complete NGAP operation. Nonzero or unordered receive metadata fails
-    /// the association; there is no API for sending such messages.
+    /// complete NGAP operation. Nonzero sends and nonzero or unordered receive
+    /// metadata fail the association under this policy.
     pub fn ordered_stream_zero(
         protocol: PayloadProtocol,
         maximum_plaintext_bytes: usize,
@@ -121,8 +124,52 @@ impl Policy {
         Ok(Self {
             protocol,
             maximum_plaintext_bytes,
+            application_stream_count: 1,
+            pending_record_capacity: 0,
             shared: DtlsSctpPolicy::default(),
         })
+    }
+
+    /// Admit reliable ordered application records on streams `0..stream_count`.
+    ///
+    /// Control records remain on ordered stream zero. `stream_count` must be
+    /// at least two and is a local policy limit, not negotiated stream-count
+    /// evidence. SCTP independently enforces its negotiated send range. The
+    /// caller owns UE/non-UE stream assignment and must configure its SCTP
+    /// association accordingly; this constructor does not assign NGAP streams.
+    /// Protected records require the DTLS 1.2 wire version; DTLS 1.0 initial
+    /// handshake compatibility does not extend to protected records.
+    ///
+    /// `pending_record_capacity` bounds both retained record/stream mappings
+    /// and queued plaintexts, from one through
+    /// [`MAX_DTLS_SCTP_RECEIVE_QUEUE_MESSAGES`]. A record discarded by the
+    /// engine can retain one mapping until close; exhaustion fails closed.
+    /// This is an SDK resource bound, not a DTLS replay window.
+    pub fn ordered_streams(
+        protocol: PayloadProtocol,
+        maximum_plaintext_bytes: usize,
+        stream_count: u16,
+        pending_record_capacity: usize,
+    ) -> Result<Self, Error> {
+        if stream_count < 2
+            || !(1..=MAX_DTLS_SCTP_RECEIVE_QUEUE_MESSAGES).contains(&pending_record_capacity)
+        {
+            return Err(Error::PolicyRejected);
+        }
+        let mut policy = Self::ordered_stream_zero(protocol, maximum_plaintext_bytes)?;
+        policy.application_stream_count = stream_count;
+        policy.pending_record_capacity = pending_record_capacity;
+        Ok(policy)
+    }
+
+    /// Exclusive upper bound of the locally admitted application stream range.
+    pub const fn application_stream_count(self) -> u16 {
+        self.application_stream_count
+    }
+
+    /// Record correlation/queued-plaintext limit; zero denotes the legacy profile.
+    pub const fn pending_record_capacity(self) -> usize {
+        self.pending_record_capacity
     }
 
     /// Restrict the existing ECDHE-ECDSA AEAD cipher allowlist.
@@ -349,8 +396,16 @@ impl Endpoint {
                 },
                 revocation: crls.as_ref().map(|v| Arc::clone(&v.snapshot)),
             };
-            let handshake_result =
-                run_transport_handshake(&mut engine, &mut io, &validation, handshake_deadline);
+            let handshake_result = run_transport_handshake_with_streams(
+                &mut engine,
+                &mut io,
+                &validation,
+                handshake_deadline,
+                streams::RecordStreams::new(
+                    self.policy.application_stream_count,
+                    self.policy.pending_record_capacity,
+                ),
+            );
             let completed = if let Some(binding) = crls.as_mut() {
                 tokio::select! {
                     biased;
@@ -370,7 +425,7 @@ impl Endpoint {
                 .state
                 .inbound
                 .iter()
-                .any(|message| message.len() > self.policy.maximum_plaintext_bytes)
+                .any(|message| message.payload.len() > self.policy.maximum_plaintext_bytes)
             {
                 return Err(Error::MessageLimit);
             }
@@ -411,6 +466,8 @@ impl Endpoint {
                 evidence: Evidence {
                     role,
                     protocol: self.policy.protocol,
+                    application_stream_count: self.policy.application_stream_count,
+                    pending_record_capacity: self.policy.pending_record_capacity,
                     version: completed.version,
                     cipher: completed.cipher,
                     material_epoch: admission.epoch(),
@@ -533,6 +590,8 @@ impl fmt::Debug for Acceptor {
 pub struct Evidence {
     role: Role,
     protocol: PayloadProtocol,
+    application_stream_count: u16,
+    pending_record_capacity: usize,
     version: Version,
     cipher: Cipher,
     material_epoch: TlsMaterialEpoch,
@@ -550,6 +609,14 @@ impl Evidence {
     /// Immutable protected PPID profile.
     pub const fn payload_protocol(&self) -> PayloadProtocol {
         self.protocol
+    }
+    /// Locally configured application stream range, not SCTP negotiation evidence.
+    pub const fn application_stream_count(&self) -> u16 {
+        self.application_stream_count
+    }
+    /// Configured bounded correlation/queue capacity, or zero for stream zero.
+    pub const fn pending_record_capacity(&self) -> usize {
+        self.pending_record_capacity
     }
     /// Authenticated negotiated protocol version.
     pub const fn version(&self) -> Version {
@@ -588,16 +655,24 @@ impl fmt::Debug for Evidence {
 }
 
 /// One authenticated application record, with value-free diagnostic formatting.
-pub struct ApplicationMessage(Bytes);
+pub struct ApplicationMessage {
+    payload: Bytes,
+    stream_id: u16,
+}
 
 impl ApplicationMessage {
     /// Explicitly borrow the application payload.
     pub fn as_bytes(&self) -> &[u8] {
-        &self.0
+        &self.payload
+    }
+    /// SCTP-authenticated stream of this exact decrypted application record.
+    /// This is scoped to the delivering connection, not a UE ownership proof.
+    pub const fn stream_id(&self) -> u16 {
+        self.stream_id
     }
     /// Consume the wrapper and take the application payload.
     pub fn into_bytes(self) -> Bytes {
-        self.0
+        self.payload
     }
 }
 
@@ -650,6 +725,20 @@ impl Connection {
 
     /// Emit one opaque application record reliably on ordered stream zero.
     pub async fn send(&mut self, plaintext: &[u8], deadline: Instant) -> Result<(), Error> {
+        self.send_on_stream(0, plaintext, deadline).await
+    }
+
+    /// Emit one application record on a locally admitted reliable ordered stream.
+    ///
+    /// Only application records use this stream; DTLS control remains on zero.
+    /// SCTP validates the negotiated send range. As with `send`, an error or
+    /// cancellation after polling closes the connection.
+    pub async fn send_on_stream(
+        &mut self,
+        stream_id: u16,
+        plaintext: &[u8],
+        deadline: Instant,
+    ) -> Result<(), Error> {
         self.ensure_active()?;
         let mut operation = OperationGuard::new(self);
         let deadline = deadline.min(self.hard_deadline);
@@ -657,12 +746,13 @@ impl Connection {
         if plaintext.len() > self.maximum_plaintext_bytes {
             return Err(Error::MessageLimit);
         }
-        let result = write_application_via(
+        let result = write_application_on_stream_via(
             &mut self.engine,
             &mut self.io,
             &mut self.pump,
             &mut self.buffer,
             plaintext,
+            stream_id,
             deadline,
         )
         .await;
@@ -674,7 +764,7 @@ impl Connection {
         Ok(())
     }
 
-    /// Receive one authenticated opaque application record on ordered stream zero.
+    /// Receive one authenticated opaque record with its exact ordered stream.
     pub async fn receive(&mut self, deadline: Instant) -> Result<ApplicationMessage, Error> {
         self.ensure_active()?;
         let mut operation = OperationGuard::new(self);
@@ -695,12 +785,15 @@ impl Connection {
         result.map_err(|_| Error::DeadlineExceeded)??;
         self.ensure_active()?;
         check_deadline(deadline)?;
-        let plaintext = self.pump.inbound.pop_front().ok_or(Error::Transport)?;
-        if plaintext.len() > self.maximum_plaintext_bytes {
+        let message = self.pump.inbound.pop_front().ok_or(Error::Transport)?;
+        if message.payload.len() > self.maximum_plaintext_bytes {
             return Err(Error::MessageLimit);
         }
         operation.disarm();
-        Ok(ApplicationMessage(plaintext))
+        Ok(ApplicationMessage {
+            payload: message.payload,
+            stream_id: message.stream_id,
+        })
     }
 
     /// Consume the connection and perform sender-drained reciprocal close.

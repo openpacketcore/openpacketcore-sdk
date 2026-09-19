@@ -32,6 +32,17 @@ adds no CRL fetching, OCSP or full 3GPP PKI claim. See the supported inputs,
 rollback boundary and independent evidence in
 [the required-CRL contract](../../docs/rfc6083-crl-transport.md).
 
+`Policy::ordered_streams` opts into a bounded reliable ordered application
+stream range. `send_on_stream` chooses the stream, and received
+`ApplicationMessage::stream_id` retains its authenticated carrier metadata
+through exact decrypted-record correlation, including engine buffering.
+Control records remain on stream zero. The configured range is a local limit;
+callers still own SCTP stream negotiation and NGAP UE/non-UE assignment.
+The profile bounds pending correlations and queued plaintexts and rejects
+protected records with any wire version other than DTLS 1.2. See the exact
+resource, ordering and qualification contract in
+[ordered application streams](../../docs/rfc6083-stream-transport.md).
+
 ## Implemented boundary
 
 - Direct TLS/TCP completes mutually authenticated TLS 1.3 before any Diameter
