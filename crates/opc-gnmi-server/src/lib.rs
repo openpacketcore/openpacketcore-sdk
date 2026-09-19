@@ -125,6 +125,7 @@ where
     arbitration: GnmiArbitrationState,
     config_authority: Option<Arc<dyn ConfigAuthorityPort>>,
     audit: Arc<dyn AuditSink>,
+    required_config_audit: Option<opc_config_bus::RequiredConfigAudit<C>>,
     _config: PhantomData<C>,
 }
 
@@ -264,6 +265,7 @@ where
             config_authority: None,
             audit,
             _config: PhantomData,
+            required_config_audit: None,
         })
     }
 
@@ -353,6 +355,25 @@ where
     /// Audit sink used for management-plane operation records.
     pub fn audit(&self) -> &dyn AuditSink {
         self.audit.as_ref()
+    }
+
+    /// Use the exact config bus's required mutation-audit authority for Set,
+    /// and its consensus observation port for reads and pre-submission denials.
+    /// No standalone Intent is acknowledged: the bus hands the protocol intent
+    /// to the encrypted effect boundary, which must persist it before mutation.
+    /// A capability issued for any other bus worker is rejected.
+    pub fn with_required_config_audit(
+        mut self,
+        audit: opc_config_bus::RequiredConfigAudit<C>,
+    ) -> Result<Self, GnmiError> {
+        if !audit.belongs_to(self.binding.config_bus().as_ref()) {
+            return Err(GnmiError::failed_precondition(
+                "configuration audit authority mismatch",
+            ));
+        }
+        self.audit = audit.observation_sink();
+        self.required_config_audit = Some(audit);
+        Ok(self)
     }
 
     /// Renders protocol-neutral gNMI Capabilities data from the schema registry.

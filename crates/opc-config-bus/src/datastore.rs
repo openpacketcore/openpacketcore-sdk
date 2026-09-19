@@ -75,6 +75,30 @@ struct ConfigPlaintextV2<C> {
 /// after a crash, and a definite failed append must leave no partial record.
 #[async_trait]
 pub trait ManagedDatastore<C: OpcConfig>: Send + Sync {
+    /// Observation port belonging to this datastore's required mutation audit
+    /// authority. It must reject standalone Intents and preserve admitted work
+    /// across cancellation. Legacy stores expose no required audit capability.
+    /// This alone never permits mutation; implementors must also implement
+    /// [`Self::append_required_audit_commit`] without an unaudited fallback.
+    fn required_audit_observations(&self) -> Option<Arc<dyn opc_mgmt_audit::AuditSink>> {
+        None
+    }
+
+    /// Admit one intent bound to this exact write before atomically applying it.
+    /// Preserve the protocol request/caller/transport/operation, complete effect,
+    /// fixed expiry and authoritative terminal recovery. Unknown persistence
+    /// must return `OutcomeUnknown`; terminal failure cannot reverse a known
+    /// commit. The default refuses without invoking ordinary append.
+    async fn append_required_audit_commit(
+        &self,
+        _commit: CommitWrite<C>,
+        _intent: opc_mgmt_audit::AuditEvent,
+    ) -> Result<CommitWriteReceipt, StoreError> {
+        Err(StoreError::unavailable(
+            "required configuration audit is unsupported",
+        ))
+    }
+
     /// Reports whether new successful commit receipts always contain the exact
     /// persisted plaintext-envelope digest.
     ///
@@ -255,6 +279,18 @@ where
     C: OpcConfig,
     T: ManagedDatastore<C> + ?Sized,
 {
+    fn required_audit_observations(&self) -> Option<Arc<dyn opc_mgmt_audit::AuditSink>> {
+        (**self).required_audit_observations()
+    }
+
+    async fn append_required_audit_commit(
+        &self,
+        commit: CommitWrite<C>,
+        intent: opc_mgmt_audit::AuditEvent,
+    ) -> Result<CommitWriteReceipt, StoreError> {
+        (**self).append_required_audit_commit(commit, intent).await
+    }
+
     fn commit_receipts_include_plaintext_digest(&self) -> bool {
         (**self).commit_receipts_include_plaintext_digest()
     }
@@ -399,6 +435,20 @@ where
     P: KeyProvider + ?Sized,
     S: ManagedDatastore<SealedConfig<C>> + ?Sized,
 {
+    async fn encrypt_write(
+        &self,
+        commit: CommitWrite<C>,
+    ) -> Result<CommitWrite<SealedConfig<C>>, StoreError> {
+        let audit_context = commit.audit_context().cloned();
+        let (record, resolution) = commit.into_parts();
+        let record = self.encrypt_record(record).await?;
+        let write = match resolution {
+            Some(resolution) => CommitWrite::resolving(record, resolution)?,
+            None => CommitWrite::new(record),
+        };
+        Ok(write.with_audit_context(audit_context))
+    }
+
     async fn encrypt_record(
         &self,
         mut record: StoredConfig<C>,
@@ -519,6 +569,19 @@ where
     P: KeyProvider + ?Sized,
     S: ManagedDatastore<SealedConfig<C>> + ?Sized,
 {
+    fn required_audit_observations(&self) -> Option<Arc<dyn opc_mgmt_audit::AuditSink>> {
+        self.inner.required_audit_observations()
+    }
+
+    async fn append_required_audit_commit(
+        &self,
+        commit: CommitWrite<C>,
+        intent: opc_mgmt_audit::AuditEvent,
+    ) -> Result<CommitWriteReceipt, StoreError> {
+        let write = self.encrypt_write(commit).await?;
+        self.inner.append_required_audit_commit(write, intent).await
+    }
+
     fn commit_receipts_include_plaintext_digest(&self) -> bool {
         true
     }
@@ -623,17 +686,9 @@ where
         &self,
         commit: CommitWrite<C>,
     ) -> Result<CommitWriteReceipt, StoreError> {
-        let audit_context = commit.audit_context().cloned();
-        let (record, resolution) = commit.into_parts();
-        let record = self.encrypt_record(record).await?;
-        let receipt = CommitWriteReceipt::new(record.plaintext_digest);
-        let write = match resolution {
-            Some(resolution) => CommitWrite::resolving(record, resolution)?,
-            None => CommitWrite::new(record),
-        };
-        self.inner
-            .append_commit_write(write.with_audit_context(audit_context))
-            .await?;
+        let write = self.encrypt_write(commit).await?;
+        let receipt = CommitWriteReceipt::new(write.record().plaintext_digest);
+        self.inner.append_commit_write(write).await?;
         Ok(receipt)
     }
 

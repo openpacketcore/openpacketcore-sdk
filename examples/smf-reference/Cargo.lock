@@ -1460,6 +1460,7 @@ dependencies = [
  "opc-config-model",
  "opc-crypto",
  "opc-key",
+ "opc-mgmt-audit",
  "opc-redaction",
  "opc-types",
  "serde",

@@ -23,6 +23,7 @@ pub mod commit;
 pub mod committed;
 pub mod datastore;
 pub mod metrics;
+mod required_audit;
 pub mod restore;
 pub mod rollback;
 pub mod subscribers;
@@ -46,6 +47,7 @@ pub use datastore::{
     CommittedRevisionSource, EncryptingManagedDatastore, InMemoryManagedDatastore,
     ManagedDatastore, MockManagedDatastore,
 };
+pub use required_audit::RequiredConfigAudit;
 pub use subscribers::{ConfigReceiver, SubscriberDisconnectReason, SubscriberLagPolicy};
 pub use types::{
     AtomicConfigSnapshot, AuthorityMode, CommitAuditContext, CommitWrite, CommitWriteReceipt,

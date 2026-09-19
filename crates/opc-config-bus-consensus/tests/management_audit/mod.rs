@@ -3,6 +3,7 @@ use super::*;
 use opc_persist::audit_authority::{AuditLedgerLimits, AuditPrivacyKey};
 
 mod checkpoint;
+mod gnmi;
 mod handoff;
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

@@ -16,6 +16,7 @@
 //! a consensus peer, accept a mutation, or forward reads to the leader.
 
 mod audit;
+mod audit_observations;
 pub mod remote_watch;
 pub use audit::ConfigAuditPolicy;
 
@@ -913,6 +914,27 @@ impl<C> ManagedDatastore<SealedConfig<C>> for RaftManagedDatastore<C>
 where
     C: OpcConfig + Serialize + DeserializeOwned + Send + Sync + 'static,
 {
+    fn required_audit_observations(&self) -> Option<Arc<dyn opc_mgmt_audit::AuditSink>> {
+        self.audit
+            .as_ref()
+            .map(|policy| policy.observation_sink(Arc::clone(self.consensus_store())))
+    }
+
+    async fn append_required_audit_commit(
+        &self,
+        commit: BusCommitWrite<SealedConfig<C>>,
+        intent: opc_mgmt_audit::AuditEvent,
+    ) -> Result<opc_config_bus::CommitWriteReceipt, StoreError> {
+        let policy = self.audit.as_ref().ok_or_else(|| {
+            StoreError::unavailable("required configuration audit is unsupported")
+        })?;
+        let receipt = opc_config_bus::CommitWriteReceipt::new(commit.record().plaintext_digest);
+        policy
+            .append(self.consensus_store(), commit, Some(intent))
+            .await?;
+        Ok(receipt)
+    }
+
     async fn load_latest(&self) -> Result<Option<BusStoredConfig<SealedConfig<C>>>, StoreError> {
         self.adapter.load_latest().await
     }
@@ -974,7 +996,7 @@ where
         commit: BusCommitWrite<SealedConfig<C>>,
     ) -> Result<(), StoreError> {
         match &self.audit {
-            Some(audit) => audit.append(self.consensus_store(), commit).await,
+            Some(audit) => audit.append(self.consensus_store(), commit, None).await,
             None => self.adapter.append_commit_write(commit).await,
         }
     }

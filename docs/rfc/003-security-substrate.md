@@ -640,7 +640,7 @@ recovery mode.
 
 ### 11.2 External Audit Sink
 
-Required mutation intent acknowledgement precedes configuration submission.
+Required mutation intent acknowledgement precedes the configuration effect.
 An intent failure or unknown acknowledgement does not authorize a mutation.
 After an authoritative configuration commit, terminal audit failure MUST NOT
 turn the known commit into an ordinary failed-write reply. A terminal audit
@@ -656,6 +656,14 @@ maintenance. Local candidate/startup stores and standalone protocol
 observations keep their separate persistence contracts. A failure counter or
 local `AuditSink` is not a durable fleet recovery record. See the
 [composition contract](../replicated-management-audit.md).
+
+The explicit gNMI handoff in #927 passes the protocol intent and original
+request to that exact config-bus worker. It does not acknowledge a standalone
+protocol Intent: the required append admits one intent only after the complete
+encrypted effect is known. Legacy `AuditSink` server composition retains its
+pre-submission acknowledgement rule. Neither path may substitute a generic
+observation, a fresh request ID or a different bus's capability for required
+mutation authority.
 
 Carrier profiles SHOULD stream audit events to an external append-only system.
 Local SQLite audit is necessary for recovery and debugging but is not sufficient

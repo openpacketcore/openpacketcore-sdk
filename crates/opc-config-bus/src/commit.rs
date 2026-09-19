@@ -73,6 +73,7 @@ const SHADOW_MUTATION_REJECTED_MESSAGE: &str =
 
 pub(crate) struct Submission<C: OpcConfig> {
     pub(crate) request: CommitRequest<C>,
+    pub(crate) required_audit: Option<crate::required_audit::RequiredAuditSubmission>,
     pub(crate) reply: oneshot::Sender<Result<CommitResult, CommitError>>,
 }
 
@@ -314,15 +315,28 @@ impl<C: OpcConfig> ConfigBus<C> {
     /// durable append, and snapshot publication have all succeeded; failures
     /// before the durable append leave the running config untouched.
     pub async fn submit(&self, request: CommitRequest<C>) -> Result<CommitResult, CommitError> {
+        self.submit_with_audit(request, None).await
+    }
+
+    pub(crate) async fn submit_with_audit(
+        &self,
+        request: CommitRequest<C>,
+        required_audit: Option<crate::required_audit::RequiredAuditSubmission>,
+    ) -> Result<CommitResult, CommitError> {
         if self.authority_mode == AuthorityMode::Shadow {
-            return Err(CommitError::new(
+            let error = CommitError::new(
                 CommitErrorCode::AdmissionRejected,
                 SHADOW_MUTATION_REJECTED_MESSAGE,
-            ));
+            );
+            if let Some(audit) = &required_audit {
+                audit.record_refusal(&error).await;
+            }
+            return Err(error);
         }
         let (reply_tx, reply_rx) = oneshot::channel();
         let sent = self.tx.try_send(WorkerRequest::Submit(Box::new(Submission {
             request,
+            required_audit,
             reply: reply_tx,
         })));
 
@@ -332,7 +346,7 @@ impl<C: OpcConfig> ConfigBus<C> {
                 true
             }
             Err(err) => {
-                let commit_err = match err {
+                let commit_err = match &err {
                     TrySendError::Full(_) => CommitError::new(
                         CommitErrorCode::AdmissionRejected,
                         "config commit queue is full",
@@ -341,6 +355,11 @@ impl<C: OpcConfig> ConfigBus<C> {
                         CommitError::state_machine_fault("config commit worker is unavailable")
                     }
                 };
+                if let WorkerRequest::Submit(submission) = err.into_inner() {
+                    if let Some(audit) = submission.required_audit {
+                        audit.record_refusal(&commit_err).await;
+                    }
+                }
                 raise_commit_error(&self.alarm_manager, &commit_err);
                 return Err(commit_err);
             }
@@ -599,7 +618,7 @@ async fn worker_loop<C: OpcConfig>(
                     break;
                 };
 
-                let submission = match request {
+                let mut submission = match request {
                     WorkerRequest::Submit(submission) => *submission,
                     WorkerRequest::Reconcile {
                         source,
@@ -664,6 +683,7 @@ async fn worker_loop<C: OpcConfig>(
                     impact_classifier.clone(),
                     authority.as_ref(),
                     has_pending,
+                    &mut submission.required_audit,
                 ))
                 .catch_unwind()
                 .await
@@ -687,6 +707,9 @@ async fn worker_loop<C: OpcConfig>(
                     }
                 }
                 let result = processed.map(|processed| processed.result);
+                if let (Err(error), Some(audit)) = (&result, &submission.required_audit) {
+                    audit.record_refusal(error).await;
+                }
 
                 if result.is_ok() {
                     if let Some(reason) = recovery.reason() {
@@ -875,6 +898,7 @@ async fn process_commit<C: OpcConfig>(
     impact_classifier: Arc<dyn ConfigImpactClassifier<C>>,
     authority: &Mutex<Option<Arc<dyn crate::ConfigAuthorityPort>>>,
     has_pending: bool,
+    required_audit: &mut Option<crate::required_audit::RequiredAuditSubmission>,
 ) -> Result<ProcessedCommit, CommitError> {
     if let Some(reason) = recovery.reason() {
         let can_attempt_durable_replay = request.idempotency_key.is_some()
@@ -1163,10 +1187,18 @@ async fn process_commit<C: OpcConfig>(
             };
 
             let persist_start = std::time::Instant::now();
-            let receipt = match AssertUnwindSafe(store.append_commit_write_with_receipt(write))
-                .catch_unwind()
-                .await
-            {
+            let append = async {
+                match required_audit.as_mut() {
+                    Some(audit) => {
+                        audit.effect_started = true;
+                        store
+                            .append_required_audit_commit(write, audit.intent.clone())
+                            .await
+                    }
+                    None => store.append_commit_write_with_receipt(write).await,
+                }
+            };
+            let receipt = match AssertUnwindSafe(append).catch_unwind().await {
                 Err(panic_payload) => {
                     drop(panic_payload);
                     tracing::error!(

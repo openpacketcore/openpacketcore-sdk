@@ -160,9 +160,25 @@ automatic migration. Preserve retained state and use an explicitly reviewed
 cutover before deployment. These revisions do not change session WAL or the
 Durable/Async session persistence modes.
 
-The protocol-server/ConfigBus composition under #796 remains a separate slice.
-Enabling this ledger on an adapter that still uses unaudited configuration writes
-will refuse those writes. The API alone is not an end-to-end management claim.
+Issue #927 adds an explicit gNMI/ConfigBus handoff to this existing authority.
+`ConfigBus::required_config_audit` issues a worker-bound submitter only for an
+audited datastore. gNMI transfers the original protocol intent and request
+together instead of first acknowledging a separate standalone intent. After
+authorization and validation, a distinct required-append port carries that
+intent through encryption. The audited adapter verifies request, caller,
+transport and operation, then prepares one handle bound to the complete sealed
+effect, parent/base, mode and confirmed resolution before admission. The
+existing receipt, fixed expiry and recovery protocol remain unchanged.
+
+Legacy stores default to refusing the required-append port; encryption forwards
+that exact port and never falls back to ordinary append. A capability from a
+different worker cannot enable a protocol write. Read and pre-append refusal
+observations use the same authority through a bounded, cancellation-independent
+sink that rejects Intent. Once append starts, only the retained effect-bound
+operation may establish the configuration result; generic protocol observations
+cannot replace its terminal obligation. This adds no consensus or storage
+representation and leaves NETCONF's existing contract unchanged. Enabling the
+ledger on unaudited configuration writes still refuses them.
 
 ## Evidence
 

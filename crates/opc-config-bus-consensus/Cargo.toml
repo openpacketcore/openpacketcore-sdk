@@ -33,6 +33,12 @@ tracing = { workspace = true }
 uuid = { workspace = true }
 
 [dev-dependencies]
+opc-gnmi-server = { path = "../opc-gnmi-server", version = "0.2.0" }
+opc-mgmt-authz = { path = "../opc-mgmt-authz", version = "0.2.0" }
+opc-mgmt-limits = { path = "../opc-mgmt-limits", version = "0.2.0" }
+opc-mgmt-opstate = { path = "../opc-mgmt-opstate", version = "0.2.0" }
+opc-mgmt-schema = { path = "../opc-mgmt-schema", version = "0.2.0" }
+opc-nacm = { path = "../opc-nacm", version = "0.2.0" }
 opc-consensus = { path = "../opc-consensus", version = "0.2.0" }
 opc-identity = { path = "../opc-identity", version = "0.2.0" }
 opc-key = { path = "../opc-key", version = "0.2.0" }
@@ -41,6 +47,7 @@ rusqlite = { workspace = true }
 tempfile = "3"
 time = { workspace = true }
 tokio = { workspace = true, features = ["io-util", "macros", "net", "rt-multi-thread", "sync", "test-util", "time"] }
+tonic = { version = "0.14.6", default-features = false, features = ["codegen"] }
 
 [lints]
 workspace = true

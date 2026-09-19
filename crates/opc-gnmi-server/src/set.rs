@@ -301,22 +301,22 @@ where
     )
     .with_base_version(snapshot.version);
 
-    audit_set_result(
-        server,
-        request_id,
-        principal,
-        audit_operation,
-        AuditOutcome::Intent,
-        audit_paths.clone(),
-    )
-    .await?;
-
+    if server.required_config_audit.is_none() {
+        audit_set_result(
+            server,
+            request_id,
+            principal,
+            audit_operation,
+            AuditOutcome::Intent,
+            audit_paths.clone(),
+        )
+        .await?;
+    }
     let start = Instant::now();
-    let result = match bus.submit(commit).await {
+    let result = match submit_set_commit(server, commit, audit_paths.clone()).await {
         Ok(result) => result,
         Err(err) => {
-            let err = commit_error_to_gnmi(err);
-            audit_set_result(
+            audit_submitted_set_result(
                 server,
                 request_id,
                 principal,
@@ -332,7 +332,7 @@ where
     let extensions = match committed_revision_extensions(server, &result) {
         Ok(extensions) => extensions,
         Err(err) => {
-            audit_set_result(
+            audit_submitted_set_result(
                 server,
                 request_id,
                 principal,
@@ -344,7 +344,7 @@ where
             return Err(err);
         }
     };
-    audit_set_result(
+    audit_submitted_set_result(
         server,
         request_id,
         principal,
@@ -456,22 +456,22 @@ where
     }
     .with_base_version(snapshot.version);
 
-    audit_set_result(
-        server,
-        request_id,
-        principal,
-        AuditOperation::Update,
-        AuditOutcome::Intent,
-        Vec::new(),
-    )
-    .await?;
-
+    if server.required_config_audit.is_none() {
+        audit_set_result(
+            server,
+            request_id,
+            principal,
+            AuditOperation::Update,
+            AuditOutcome::Intent,
+            Vec::new(),
+        )
+        .await?;
+    }
     let start = Instant::now();
-    let result = match bus.submit(commit).await {
+    let result = match submit_set_commit(server, commit, Vec::new()).await {
         Ok(result) => result,
         Err(err) => {
-            let err = commit_error_to_gnmi(err);
-            audit_set_result(
+            audit_submitted_set_result(
                 server,
                 request_id,
                 principal,
@@ -487,7 +487,7 @@ where
     let extensions = match committed_revision_extensions(server, &result) {
         Ok(extensions) => extensions,
         Err(err) => {
-            audit_set_result(
+            audit_submitted_set_result(
                 server,
                 request_id,
                 principal,
@@ -499,7 +499,7 @@ where
             return Err(err);
         }
     };
-    audit_set_result(
+    audit_submitted_set_result(
         server,
         request_id,
         principal,
@@ -540,6 +540,64 @@ fn set_operation_count(request: &gnmi::SetRequest) -> usize {
         + request.replace.len()
         + request.update.len()
         + request.union_replace.len()
+}
+
+async fn submit_set_commit<C, B>(
+    server: &GnmiServer<C, B>,
+    commit: CommitRequest<C>,
+    paths: Vec<opc_mgmt_audit::SchemaNodePath>,
+) -> Result<CommitResult, GnmiError>
+where
+    C: OpcConfig,
+    B: GnmiConfigBinding<C>,
+{
+    let bus = server.binding().config_bus();
+    if let Some(audit) = &server.required_config_audit {
+        if !audit.belongs_to(bus.as_ref()) {
+            return Err(GnmiError::failed_precondition(
+                "configuration audit authority mismatch",
+            ));
+        }
+        // A confirmed cancellation is a rollback effect. Keep the legacy
+        // observation vocabulary separate from this exact operation binding.
+        let operation = match commit.operation {
+            ConfigOperation::Rollback => AuditOperation::Rollback,
+            operation => set_audit_operation(operation),
+        };
+        let intent = opc_mgmt_audit::AuditEvent::new(
+            commit.request_id,
+            &commit.principal,
+            commit.transport,
+            operation,
+            AuditOutcome::Intent,
+        )
+        .with_paths(paths);
+        return audit
+            .submit(commit, intent)
+            .await
+            .map_err(commit_error_to_gnmi);
+    }
+    bus.submit(commit).await.map_err(commit_error_to_gnmi)
+}
+
+async fn audit_submitted_set_result<C, B>(
+    server: &GnmiServer<C, B>,
+    request_id: RequestId,
+    principal: &TrustedPrincipal,
+    operation: AuditOperation,
+    outcome: AuditOutcome,
+    paths: Vec<opc_mgmt_audit::SchemaNodePath>,
+) -> Result<(), GnmiError>
+where
+    C: OpcConfig,
+    B: GnmiConfigBinding<C>,
+{
+    if server.required_config_audit.is_some() {
+        // The worker records pre-append refusals. Once append starts, only
+        // the exact retained ledger operation may settle the config outcome.
+        return Ok(());
+    }
+    audit_set_result(server, request_id, principal, operation, outcome, paths).await
 }
 
 async fn audit_set_result<C, B>(
