@@ -131,11 +131,13 @@ fn transfer(model: &Value) -> SetupRequestTransfer {
                 .unwrap(),
             model["uplink"]["teid"].as_u64().unwrap() as u32,
         ),
-        aggregate_bit_rate: SessionAggregateBitRate::new(
-            model["ambr"]["downlink"].as_u64().unwrap(),
-            model["ambr"]["uplink"].as_u64().unwrap(),
-        )
-        .unwrap(),
+        aggregate_bit_rate: Some(
+            SessionAggregateBitRate::new(
+                model["ambr"]["downlink"].as_u64().unwrap(),
+                model["ambr"]["uplink"].as_u64().unwrap(),
+            )
+            .unwrap(),
+        ),
         session_type: session_type(&model["session_type"]),
         flows: flows(&model["flows"]),
     }
@@ -148,6 +150,46 @@ fn independent_transfers_cover_required_conditional_and_policy_cases() {
         let wire = bytes(row["wire_hex"].as_str().unwrap());
         let mode = row["mode"].as_str().unwrap();
         let result = SetupRequestTransfer::decode(&wire, context());
+        if mode == "unsupported-qos" {
+            use opc_proto_ngap::n3iwf::qos_fields::{
+                AllocationRetentionPriority, NonDynamicQos, QosCharacteristics, QosFlow,
+                QosParameters,
+            };
+            // Retain the original independent packet and qualify its newly
+            // supported 5QI 8 value against an explicit semantic constructor.
+            let base = reference["transfers"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|v| v["mode"] == "construct")
+                .unwrap();
+            let mut expected = transfer(&base["model"]);
+            expected.uplink = UplinkTransport::new("198.51.100.1".parse().unwrap(), 0x11223344);
+            expected.flows = QosFlowSetupList::with_profiles(vec![QosFlow::new(
+                QosFlowId::new(0).unwrap(),
+                QosParameters::new(
+                    QosCharacteristics::NonDynamic(NonDynamicQos {
+                        five_qi: 8,
+                        priority: None,
+                        averaging_window: None,
+                        maximum_data_burst: None,
+                    }),
+                    AllocationRetentionPriority::new(1, false, false).unwrap(),
+                )
+                .unwrap(),
+            )])
+            .unwrap();
+            assert!(result.unwrap().transfer == expected);
+            assert_eq!(
+                expected
+                    .encode(EncodeContext::default())
+                    .unwrap()
+                    .as_bytes(),
+                wire
+            );
+            admitted += 1;
+            continue;
+        }
         if mode == "construct"
             || mode.starts_with("unknown-ignore")
             || mode.starts_with("unknown-notify")
@@ -210,7 +252,7 @@ fn independent_transfers_cover_required_conditional_and_policy_cases() {
         }
     }
     assert_eq!(reference["transfers"].as_array().unwrap().len(), 49);
-    assert_eq!(admitted, 34);
+    assert_eq!(admitted, 35);
 }
 fn append_ie(input: &[u8], id: u16, criticality: u8, value: &[u8]) -> Vec<u8> {
     assert!(value.len() < 128);
@@ -432,9 +474,9 @@ fn resource_limits_extensions_and_redaction_are_explicit() {
                 .is_ok());
                 assert!(QosFlowSetupList::decode(&trailing, context()).is_err());
                 // Count occupies six bits; item flags straddle the first two bytes.
-                for bit in [
-                    6usize, 7, 8, 9, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28,
-                ] {
+                // Only extension/choice bits remain unsupported. Root optional
+                // fields have independent positive, bounds and mutation coverage.
+                for bit in [6usize, 8, 9, 16, 20, 21, 23, 27, 28] {
                     let mut changed = wire.clone();
                     changed[bit / 8] |= 1 << (7 - bit % 8);
                     assert!(

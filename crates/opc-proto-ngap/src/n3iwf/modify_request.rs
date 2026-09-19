@@ -23,7 +23,7 @@ pub struct ModifyRequestTransfer {
     pub aggregate_bit_rate: Option<SessionAggregateBitRate>,
     /// Requested uplink endpoint and existing downlink bearer endpoint pairs.
     pub uplink_modifications: Option<UplinkModifications>,
-    /// Unique QFIs with absent parameters or explicit non-GBR 5QI 9 parameters.
+    /// Unique QFIs with absent parameters or explicit root QoS profiles.
     pub add_or_modify: Option<QosFlowModifications>,
     /// Unique QFIs and root causes, disjoint from `add_or_modify`.
     pub release: Option<QosFlowCauses>,

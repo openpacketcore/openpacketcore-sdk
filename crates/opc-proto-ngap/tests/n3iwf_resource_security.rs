@@ -78,7 +78,7 @@ fn result(model: &Value) -> SecurityResult {
 fn request(model: &Value) -> Result<SetupRequestTransfer, opc_protocol::DecodeError> {
     Ok(SetupRequestTransfer {
         uplink: UplinkTransport::new("198.51.100.17".parse().unwrap(), 0x11223344),
-        aggregate_bit_rate: SessionAggregateBitRate::new(1_000_000, 2_000_000)?,
+        aggregate_bit_rate: Some(SessionAggregateBitRate::new(1_000_000, 2_000_000)?),
         session_type: SessionType::Ipv4,
         flows: QosFlowSetupList::new(vec![NonGbrFlow::new(QosFlowId::new(9)?, 8, false, false)?])?,
         security: model.get("security").map(indication).transpose()?,

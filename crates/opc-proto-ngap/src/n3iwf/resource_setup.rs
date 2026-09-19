@@ -12,8 +12,8 @@ use super::nas::UeAggregateBitRate;
 use super::nas_fields::{ExtendedAmfName, MaskedImeisv};
 use super::release::Cause;
 use super::session_lists::{
-    FailedSessions, SessionResults, SessionSetupRequests, SessionTransferDiagnostics,
-    SuccessfulSessions,
+    FailedSessions, SessionResourceTypes, SessionResults, SessionSetupRequests,
+    SessionTransferDiagnostics, SuccessfulSessions,
 };
 use super::setup_fields::AmfName;
 pub use super::trace_fields::{TraceActivation, TraceDepth};
@@ -35,7 +35,7 @@ pub struct InitialContextRequest<'a> {
     pub key: SecurityKey<'a>,
     /// Required whenever a session request list is present.
     pub aggregate_bit_rate: Option<UeAggregateBitRate>,
-    /// Optional session requests with the admitted non-GBR transfer profile.
+    /// Optional session requests with the admitted root transfer profile.
     pub sessions: Option<SessionSetupRequests<'a>>,
     /// Optional opaque NAS, separate from per-session NAS.
     pub nas: Option<NasPdu<'a>>,
@@ -147,6 +147,30 @@ impl InitialContextRequest<'_> {
         capabilities: SecurityAlgorithmMasks,
         ctx: DecodeContext,
     ) -> Result<Pdu, DecodeError> {
+        self.construct_with_resource_types(capabilities, None, ctx)
+    }
+
+    /// Construct with exact caller-established resource types for the requested
+    /// sessions. This permits Session AMBR absence for all-GBR sessions; the
+    /// enclosing UE-AMBR and mandatory security rules are unchanged.
+    pub fn construct_classified(
+        &self,
+        capabilities: SecurityAlgorithmMasks,
+        resource_types: &SessionResourceTypes,
+        ctx: DecodeContext,
+    ) -> Result<Pdu, DecodeError> {
+        self.construct_with_resource_types(capabilities, Some(resource_types), ctx)
+    }
+
+    fn construct_with_resource_types(
+        &self,
+        capabilities: SecurityAlgorithmMasks,
+        resource_types: Option<&SessionResourceTypes>,
+        ctx: DecodeContext,
+    ) -> Result<Pdu, DecodeError> {
+        if resource_types.is_some() && self.sessions.is_none() {
+            return Err(invalid("resource classification without sessions"));
+        }
         validate_slice_lists(Some(&self.allowed), self.partially_allowed_nssai.as_ref())?;
         if self.sessions.is_some() && self.aggregate_bit_rate.is_none() {
             return Err(invalid("missing conditional ue aggregate bitrate"));
@@ -177,7 +201,7 @@ impl InitialContextRequest<'_> {
             fields.push((
                 71,
                 Criticality::reject,
-                sessions.encode(output).map_err(encode_error)?,
+                encode_requests(sessions, resource_types, output)?,
             ));
         }
         fields.extend([
@@ -232,7 +256,12 @@ impl InitialContextRequest<'_> {
                 name.encode(output).map_err(encode_error)?,
             ));
         }
-        construct(MessageType::InitialContextSetupRequest, fields, ctx)
+        construct_with_resource_types(
+            MessageType::InitialContextSetupRequest,
+            fields,
+            resource_types,
+            ctx,
+        )
     }
 }
 
@@ -281,6 +310,24 @@ impl SessionResourceRequest<'_> {
     /// Construct the mandatory session list; requires message depth seventeen.
     /// UE aggregate bitrate is optional here, unlike a context request with resources.
     pub fn construct(&self, ctx: DecodeContext) -> Result<Pdu, DecodeError> {
+        self.construct_with_resource_types(None, ctx)
+    }
+
+    /// Construct with exact local session/QFI classification, permitting absent
+    /// Session AMBR only for all-GBR sessions. No resource effects occur.
+    pub fn construct_classified(
+        &self,
+        resource_types: &SessionResourceTypes,
+        ctx: DecodeContext,
+    ) -> Result<Pdu, DecodeError> {
+        self.construct_with_resource_types(Some(resource_types), ctx)
+    }
+
+    fn construct_with_resource_types(
+        &self,
+        resource_types: Option<&SessionResourceTypes>,
+        ctx: DecodeContext,
+    ) -> Result<Pdu, DecodeError> {
         crate::enforce_depth(17, ctx)?;
         let output = output_context(ctx);
         let mut fields = id_fields(self.amf, self.ran, Criticality::reject, output)?;
@@ -294,7 +341,7 @@ impl SessionResourceRequest<'_> {
         fields.push((
             74,
             Criticality::reject,
-            self.sessions.encode(output).map_err(encode_error)?,
+            encode_requests(&self.sessions, resource_types, output)?,
         ));
         if let Some(rate) = &self.aggregate_bit_rate {
             fields.push((
@@ -303,7 +350,12 @@ impl SessionResourceRequest<'_> {
                 rate.encode(output).map_err(encode_error)?,
             ));
         }
-        construct(MessageType::PduSessionResourceSetupRequest, fields, ctx)
+        construct_with_resource_types(
+            MessageType::PduSessionResourceSetupRequest,
+            fields,
+            resource_types,
+            ctx,
+        )
     }
 }
 
@@ -390,12 +442,31 @@ fn encode_error(_: EncodeError) -> DecodeError {
     invalid("resource setup encoding or capacity")
 }
 fn construct(kind: MessageType, fields: Fields, ctx: DecodeContext) -> Result<Pdu, DecodeError> {
+    construct_with_resource_types(kind, fields, None, ctx)
+}
+fn encode_requests(
+    sessions: &SessionSetupRequests<'_>,
+    resource_types: Option<&SessionResourceTypes>,
+    ctx: EncodeContext,
+) -> Result<EncodedValue, DecodeError> {
+    match resource_types {
+        Some(types) => sessions.encode_classified(types, ctx),
+        None => sessions.encode(ctx),
+    }
+    .map_err(encode_error)
+}
+fn construct_with_resource_types(
+    kind: MessageType,
+    fields: Fields,
+    resource_types: Option<&SessionResourceTypes>,
+    ctx: DecodeContext,
+) -> Result<Pdu, DecodeError> {
     let ies: Vec<_> = fields
         .iter()
         .map(|(id, crit, value)| ProtocolIe::new(*id, *crit, value.as_bytes()))
         .collect();
     let pdu = Pdu::from_protocol_ies(kind, &ies, ctx)?;
-    ResourceSetupMessage::from_pdu(&pdu, ctx)?;
+    ResourceSetupMessage::from_pdu_with_resource_types(&pdu, resource_types, ctx)?;
     Ok(pdu)
 }
 
@@ -405,6 +476,26 @@ impl<'a> ResourceSetupMessage<'a> {
     /// decoding and admission; already filtered unknowns/duplicates stay filtered.
     pub fn from_pdu(
         pdu: &'a Pdu,
+        ctx: DecodeContext,
+    ) -> Result<AdmittedResourceSetup<'a>, DecodeError> {
+        Self::from_pdu_with_resource_types(pdu, None, ctx)
+    }
+
+    /// Admit a Setup request with exact caller-established session/QFI resource
+    /// types. Missing Session AMBR requires an all-GBR classification. Other
+    /// presence, key custody, ignored fields and DecodeContext policies apply
+    /// unchanged. A classification supplied for a non-request is rejected.
+    pub fn from_pdu_classified(
+        pdu: &'a Pdu,
+        resource_types: &SessionResourceTypes,
+        ctx: DecodeContext,
+    ) -> Result<AdmittedResourceSetup<'a>, DecodeError> {
+        Self::from_pdu_with_resource_types(pdu, Some(resource_types), ctx)
+    }
+
+    fn from_pdu_with_resource_types(
+        pdu: &'a Pdu,
+        resource_types: Option<&SessionResourceTypes>,
         ctx: DecodeContext,
     ) -> Result<AdmittedResourceSetup<'a>, DecodeError> {
         crate::enforce_depth(5, ctx)?;
@@ -419,6 +510,7 @@ impl<'a> ResourceSetupMessage<'a> {
                         .0
                         .iter()
                         .map(|ie| (ie.id, ie.criticality as u8, ie.value.as_bytes())),
+                    resource_types,
                     ctx,
                 )
             };
@@ -460,8 +552,17 @@ const CONTEXT_IGNORED: &[u16] = &[
 fn admit<'a>(
     kind: MessageType,
     fields: impl Iterator<Item = (u16, u8, &'a [u8])>,
+    resource_types: Option<&SessionResourceTypes>,
     ctx: DecodeContext,
 ) -> Result<AdmittedResourceSetup<'a>, DecodeError> {
+    if resource_types.is_some()
+        && !matches!(
+            kind,
+            MessageType::InitialContextSetupRequest | MessageType::PduSessionResourceSetupRequest
+        )
+    {
+        return Err(invalid("resource classification for non-request"));
+    }
     let (profile, supported, ignored): (policy::IeProfile, &[u16], &[u16]) = match kind {
         MessageType::InitialContextSetupRequest => (
             policy::INITIAL_CONTEXT_SETUP_REQUEST,
@@ -543,7 +644,10 @@ fn admit<'a>(
             94 => key = Some(SecurityKey::decode(value, leaf)?),
             38 => nas = Some(NasPdu::decode(value, leaf)?),
             71 | 74 => {
-                let admitted = SessionSetupRequests::decode(value, leaf)?;
+                let admitted = match resource_types {
+                    Some(types) => SessionSetupRequests::decode_classified(value, types, leaf)?,
+                    None => SessionSetupRequests::decode(value, leaf)?,
+                };
                 requests = Some(admitted.requests);
                 transfer_diagnostics = admitted.diagnostics;
             }
@@ -558,6 +662,9 @@ fn admit<'a>(
             }
             _ => return Err(invalid("resource setup field dispatch")),
         }
+    }
+    if resource_types.is_some() && requests.is_none() {
+        return Err(invalid("resource classification without sessions"));
     }
     let amf = amf.ok_or_else(|| invalid("missing amf ue id"))?;
     let ran = ran.ok_or_else(|| invalid("missing ran ue id"))?;

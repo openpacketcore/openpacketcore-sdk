@@ -86,7 +86,7 @@ fn numeric(model: &Value) -> Option<NetworkInstance> {
 fn setup(model: &Value) -> SetupRequestTransfer {
     SetupRequestTransfer {
         uplink: UplinkTransport::new("198.51.100.17".parse().unwrap(), 0x11223344),
-        aggregate_bit_rate: SessionAggregateBitRate::new(1_000_000, 2_000_000).unwrap(),
+        aggregate_bit_rate: Some(SessionAggregateBitRate::new(1_000_000, 2_000_000).unwrap()),
         session_type: SessionType::Ipv4,
         flows: QosFlowSetupList::new(vec![NonGbrFlow::new(
             QosFlowId::new(9).unwrap(),

@@ -129,6 +129,35 @@ fn independent_root_values_encoding_and_exact_limits() {
         let kind = row["type"].as_str().unwrap();
         let model = &row["model"];
         let wire = bytes(row["wire_hex"].as_str().unwrap());
+        if matches!(name, "unsupported-five-qi" | "unsupported-e-rab") {
+            use opc_proto_ngap::n3iwf::qos_fields::{
+                AllocationRetentionPriority, NonDynamicQos, QosCharacteristics, QosFlow,
+                QosParameters,
+            };
+            let qfi = QosFlowId::new(7).unwrap();
+            let value = if name == "unsupported-five-qi" {
+                QosFlowModification::Profile(QosFlow::new(
+                    qfi,
+                    QosParameters::new(
+                        QosCharacteristics::NonDynamic(NonDynamicQos {
+                            five_qi: 8,
+                            priority: None,
+                            averaging_window: None,
+                            maximum_data_burst: None,
+                        }),
+                        AllocationRetentionPriority::new(2, true, false).unwrap(),
+                    )
+                    .unwrap(),
+                ))
+            } else {
+                QosFlowModification::IdentifierWithErab { qfi, erab: 3 }
+            };
+            let expected = QosFlowModifications::new(vec![value]).unwrap();
+            assert!(QosFlowModifications::decode(&wire, context()).unwrap() == expected);
+            assert_eq!(expected.encode(output()).unwrap().as_bytes(), wire);
+            admitted += 1;
+            continue;
+        }
         if row["admitted"] == false {
             assert!(rejects(kind, &wire), "{name} receive");
             if row["mode"] == "duplicate" {
@@ -216,7 +245,7 @@ fn independent_root_values_encoding_and_exact_limits() {
         }
         admitted += 1;
     }
-    assert_eq!(admitted, 682);
+    assert_eq!(admitted, 684);
 }
 
 #[test]
@@ -277,7 +306,9 @@ fn explicit_padding_and_extension_mutations_are_rejected() {
     for (name, offsets) in [
         (
             "request-identifiers-1",
-            vec![(0, 2), (1, 128), (1, 64), (1, 32)],
+            // E-RAB presence (byte 1, bit 7) is now admitted and has all
+            // sixteen independently encoded identifier-only values elsewhere.
+            vec![(0, 2), (1, 64), (1, 32)],
         ),
         ("request-parameters-1", vec![(2, 64), (3, 4), (3, 1)]),
         ("response-count-1", vec![(0, 2), (0, 1), (1, 128)]),

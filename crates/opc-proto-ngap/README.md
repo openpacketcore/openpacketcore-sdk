@@ -16,6 +16,12 @@ NG Setup, context/session setup and release subsets. The container boundary
 validates top-level identifiers, criticality, cardinality, and configured
 decode policies.
 
+Root QoS profiles preserve dynamic/non-dynamic descriptors, GBR information,
+ARP, optional attributes and E-RAB identifiers. Setup's default API requires
+Session AMBR; explicit classified APIs allow its absence only with exact
+caller-supplied all-GBR classification. Per-flow abnormal conditions are
+reportable separately. See the [QoS contract and API migration](CONFORMANCE.md#root-qos-profiles-and-conditional-session-ambr).
+
 ## API Shape
 
 - `Pdu` stores the policy-filtered decoded PDU kind plus the immutable raw bytes
