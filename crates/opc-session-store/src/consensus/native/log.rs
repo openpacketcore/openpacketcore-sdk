@@ -135,9 +135,16 @@ impl NativeLog {
         }
         if let EntryPayload::Normal(command) = &entry.payload {
             sql::validate_command_for_log(command, identity)?;
-            if let SessionMutationIntent::AsyncRecoveryBoundary { era, plan } = command.intent {
-                return super::async_recovery::Boundary::from_entry(era, plan, entry.log_id)
-                    .validate();
+            if let SessionMutationIntent::AsyncRecoveryBoundary {
+                era,
+                plan,
+                protected,
+            } = &command.intent
+            {
+                let mut boundary =
+                    super::async_recovery::Boundary::from_entry(*era, *plan, entry.log_id);
+                boundary.protected = protected.clone();
+                return boundary.validate();
             }
             if sql::contains_protected_roster_command(&command.intent) {
                 sql::protected_roster_command_for_scope(

@@ -32,6 +32,7 @@ mod closed;
 mod initialization;
 mod majority_authority;
 mod majority_protocol;
+mod protected;
 mod races;
 mod snapshots;
 mod writer;
@@ -167,6 +168,8 @@ struct Fleet {
     topologies: Vec<ValidatedQuorumTopology>,
     peers: Vec<Arc<Peer>>,
     stores: Vec<Option<ConsensusSessionStore>>,
+    protected_owner: Option<Arc<protected::Owner>>,
+    protected_owner_count: u8,
 }
 
 impl Fleet {
@@ -238,6 +241,8 @@ impl Fleet {
             topologies,
             peers,
             stores: vec![None; voters],
+            protected_owner: None,
+            protected_owner_count: 1,
         }
     }
 
@@ -308,7 +313,8 @@ impl Fleet {
                 .native_owner
                 .as_ref()
                 .unwrap()
-                .set_generation_hook_for_test(hook);
+                .set_generation_hook_for_test(hook)
+                .unwrap();
         }
         if let Some(hook) = root_hook {
             backend
@@ -347,6 +353,11 @@ impl Fleet {
         .await?;
         assert_eq!(store.persistence_mode(), mode);
         assert_eq!(store.inner.operation_timeout, OPERATION_BOUND);
+        if self.protected_owner.is_some() {
+            store
+                .configure_protected_async_recovery(self.protected_authority(&store))
+                .unwrap();
+        }
         *self.peers[index].handler.write().await = Some(store.rpc_handler());
         self.stores[index] = Some(store);
         Ok(())

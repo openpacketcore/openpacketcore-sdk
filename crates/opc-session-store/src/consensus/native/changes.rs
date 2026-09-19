@@ -555,6 +555,7 @@ impl BusinessChanges {
                 &self.target.frontiers,
                 self.target.counts(),
                 self.target.snapshot_origin(),
+                self.target.roster_root.as_deref(),
             )
         })?;
         for (key, change) in &self.keys {
@@ -1027,6 +1028,7 @@ impl Publication {
             &frontiers,
             tables.map(|table| table.count),
             base.snapshot_origin.as_deref(),
+            base.roster_root.as_deref(),
         )?;
         let revision = predecessor
             .revision
@@ -1470,6 +1472,7 @@ impl NativeState {
             &frontiers,
             before.counts(),
             self.snapshot_origin.as_deref(),
+            self.roster_root.as_deref(),
         )?;
         let selected = BusinessProof::new(
             self,
@@ -1523,6 +1526,7 @@ impl NativeState {
                 &frontiers,
                 current.counts(),
                 self.snapshot_origin.as_deref(),
+                self.roster_root.as_deref(),
             )?;
             BusinessProof::new(
                 self,

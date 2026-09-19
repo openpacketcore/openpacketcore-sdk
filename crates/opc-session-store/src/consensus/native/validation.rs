@@ -167,6 +167,7 @@ pub(super) fn validate_frontiers(
     frontiers: &NativeFrontiers,
     counts: [usize; 4],
     origin: Option<&NativeSnapshotAuthority>,
+    root: Option<&crate::fenced_mutation_roster::RosterAttestationTrustRootV1>,
 ) -> io::Result<()> {
     let [keys, receipts, generic, notifications] = counts;
     if !matches!(members.len(), 3 | 5)
@@ -216,6 +217,9 @@ pub(super) fn validate_frontiers(
     }
     roster::validate_activation(identity, members, frontiers)?;
     frontiers.validate_async_boundary()?;
+    if let Some(boundary) = &frontiers.async_recovery {
+        boundary.validate_protected_scope(identity, members, root)?;
+    }
     if notifications as u64 != frontiers.watch_sequence {
         return Err(invalid("native image watch count differs"));
     }
@@ -315,6 +319,7 @@ impl NativeState {
                 self.notifications.len(),
             ],
             self.snapshot_origin.as_deref(),
+            self.roster_root.as_deref(),
         )?;
         for (key, row) in &self.keys {
             validate_key(key, row, frontiers)?;

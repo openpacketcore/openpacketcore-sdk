@@ -4,6 +4,8 @@
 mod majority_recovery;
 #[path = "isolated_scale/original.rs"]
 mod original;
+#[path = "isolated_scale/protected_roster.rs"]
+mod protected_roster;
 
 use super::*;
 use opc_session_testkit::qualification::{

@@ -47,6 +47,7 @@ fn native_async_boundary_portable_snapshot_roundtrip_preserves_retired_authority
             request_id: SessionConsensusRequestId::from_bytes([0xD5; 16]),
             logical_time: timestamp(2),
             intent: SessionMutationIntent::AsyncRecoveryBoundary {
+                protected: None,
                 era: 2,
                 plan: [0xD6; 32],
             },

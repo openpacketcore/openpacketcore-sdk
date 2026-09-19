@@ -11,7 +11,7 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet};
 
-pub(crate) const WIRE: &[u8; 23] = b"\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xffOPC-MAJOR-1\0";
+pub(crate) const WIRE: &[u8; 23] = b"\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xffOPC-MAJOR-2\0";
 
 #[derive(Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) enum Capability {
@@ -31,6 +31,7 @@ pub(crate) struct Status {
     pub active: bool,
     pub recovering: bool,
     pub capability: Capability,
+    pub protected_inventory: Option<[u8; 32]>,
 }
 
 #[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -69,6 +70,12 @@ impl Round {
                     || status.root == [0; 32]
                     || status.era == 0
                     || self.era <= status.era
+                    || status.protected_inventory
+                        != self
+                            .participants
+                            .values()
+                            .next()
+                            .and_then(|s| s.protected_inventory)
             })
         {
             return Err(SessionConsensusPeerError::ScopeMismatch);
@@ -92,6 +99,7 @@ pub(crate) struct Retained {
     pub sequence: u64,
     pub completed_sequence: u64,
     pub busy: bool,
+    pub application_digest: super::SessionConsensusEntryDigest,
 }
 
 #[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -139,6 +147,8 @@ pub(crate) enum Action {
         selection: Selection,
         ready: BTreeMap<Node, Ready>,
     },
+    // Progress only: never a committed/application/activation certificate.
+    CommitStatus(Selection),
 }
 
 #[derive(Clone, Serialize, Deserialize)]
@@ -164,4 +174,5 @@ pub(crate) enum Reply {
     Committed(LogId<Node>),
     Ready(Ready),
     Active,
+    CommitStatus(bool),
 }

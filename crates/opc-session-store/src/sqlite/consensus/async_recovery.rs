@@ -5,8 +5,8 @@ use super::*;
 use crate::consensus::native::async_recovery::Boundary;
 
 const TABLE: &str = "consensus_async_recovery";
-const SCHEMA: &str = "CREATE TABLE consensus_async_recovery (singleton INTEGER PRIMARY KEY CHECK(singleton = 1), boundary BLOB NOT NULL CHECK(length(boundary) BETWEEN 1 AND 2048))";
-const MAX_BYTES: usize = 2048;
+const SCHEMA: &str = "CREATE TABLE consensus_async_recovery (singleton INTEGER PRIMARY KEY CHECK(singleton = 1), boundary BLOB NOT NULL CHECK(length(boundary) BETWEEN 1 AND 65536))";
+const MAX_BYTES: usize = 65536;
 
 pub(crate) fn read(conn: &Connection) -> io::Result<Option<Boundary>> {
     let mut schema = conn

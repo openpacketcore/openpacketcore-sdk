@@ -42,6 +42,15 @@ fn unclean_return(
     persistence: QualificationIsolatedPersistence,
     workload: QualificationIsolatedScaleWorkload,
 ) {
+    unclean_return_with_tail(all_cold, persistence, workload, false);
+}
+
+fn unclean_return_with_tail(
+    all_cold: bool,
+    persistence: QualificationIsolatedPersistence,
+    workload: QualificationIsolatedScaleWorkload,
+    volatile_q1: bool,
+) {
     let scale = QualificationIsolatedScaleConfig {
         persistence,
         workload,
@@ -50,6 +59,19 @@ fn unclean_return(
     let survivor = fleet.wait_isolated_scale_ready(scale);
     let original_process = fleet.nodes[survivor].process_id();
     let before = fleet.isolated_scale_reports();
+    let provider = (workload == QualificationIsolatedScaleWorkload::ProtectedRecoveryControl
+        && persistence == QualificationIsolatedPersistence::Async)
+        .then(|| {
+            let identity =
+                stateless_consumer_voter_topology_for_configuration(&fleet.members, "v1", 1)
+                    .consensus_identity()
+                    .expect("same protected scope");
+            opc_session_testkit::qualification::protected_recovery::Journal::open(
+                fleet.workspace.path(),
+                identity,
+            )
+            .expect("retained external owner")
+        });
     let old_issued_at = Instant::now();
     let old_fence = match fleet.nodes[survivor].invoke(&QualificationNodeCommand::Acquire {
         lease_handle: "recovery-old".to_owned(),
@@ -60,6 +82,14 @@ fn unclean_return(
         QualificationNodeReply::LeaseAcquired { fence } => fence,
         _ => panic!("initial authority acquisition failed"),
     };
+    if let Some(provider) = &provider {
+        provider
+            .effect(1, old_fence, false)
+            .expect("retained prepared external intent");
+        provider
+            .effect(2, old_fence, true)
+            .expect("external effect whose Q1 may be absent");
+    }
     assert!(matches!(
         fleet.nodes[survivor].invoke(&QualificationNodeCommand::CompareAndSet {
             lease_handle: "recovery-old".to_owned(),
@@ -83,6 +113,43 @@ fn unclean_return(
             QualificationNodeReply::Released
         ));
     }
+    if volatile_q1 {
+        assert!(all_cold && provider.is_some());
+        // Complete the earlier generation before faulting the real writer.
+        let deadline = Instant::now() + CLUSTER_TRANSITION_TIMEOUT;
+        let applied = fleet
+            .isolated_scale_reports()
+            .iter()
+            .filter_map(|r| r.applied_index)
+            .max();
+        loop {
+            if fleet
+                .isolated_scale_reports_by(deadline)
+                .iter()
+                .all(|r| r.completed_applied_index >= applied)
+            {
+                break;
+            }
+            assert!(Instant::now() < deadline);
+        }
+        fs::write(
+            fleet.workspace.path().join("fail-async-generations"),
+            b"synthetic ENOSPC before native generation publication",
+        )
+        .unwrap();
+    }
+    let mut prepared_roster = provider.as_ref().map(|provider| {
+        super::protected_roster::Prepared::start(&mut fleet, survivor, provider.clone())
+    });
+    if volatile_q1 {
+        prepared_roster.as_mut().unwrap().execute_one();
+    }
+    let admission_applied = fleet
+        .isolated_scale_reports()
+        .iter()
+        .map(|report| report.applied_index)
+        .max()
+        .flatten();
     // Establish that the healthy membership reached background persistence.
     // This deliberately does not assert that the last acknowledged operation
     // is durable: its presence is checked, and reconciled, after recovery.
@@ -90,8 +157,24 @@ fn unclean_return(
     if persistence == QualificationIsolatedPersistence::Async {
         loop {
             let reports = fleet.isolated_scale_reports_by(deadline);
+            if volatile_q1 {
+                if reports.iter().all(|report| report.background_failed) {
+                    assert!(
+                        reports
+                            .iter()
+                            .all(|report| report.completed_applied_index < admission_applied),
+                        "no selected generation contains acknowledged Q1"
+                    );
+                    break;
+                }
+                assert!(Instant::now() < deadline);
+                continue;
+            }
             if reports.iter().zip(&before).all(|(after, prior)| {
-                after.completed_generation > prior.completed_generation && !after.background_failed
+                after.completed_generation > prior.completed_generation
+                    && !after.background_failed
+                    && (prepared_roster.is_none()
+                        || after.completed_applied_index >= admission_applied)
             }) {
                 break;
             }
@@ -115,6 +198,11 @@ fn unclean_return(
         if persistence == QualificationIsolatedPersistence::Async {
             assert!(native.join("ASYNC-AUTHORITY").is_file());
         }
+    }
+    if volatile_q1 {
+        // Remove only the injected I/O failure after every writer was killed;
+        // retain all voter roots, provider journals and authority evidence.
+        fs::remove_file(fleet.workspace.path().join("fail-async-generations")).unwrap();
     }
     if !all_cold {
         assert!(
@@ -182,6 +270,27 @@ fn unclean_return(
         _ => panic!("subsequent usable authority acquisition failed"),
     };
     assert!(next_fence > old_fence);
+    if let Some(provider) = &provider {
+        let (floor, writes, retired) = provider.progress().expect("reopen durable completion");
+        assert!(floor >= old_fence && next_fence > floor);
+        assert_eq!((writes, retired), if volatile_q1 { (2, 6) } else { (1, 7) });
+        provider
+            .effect(3, next_fence, true)
+            .expect("successor external effect");
+        assert!(
+            provider.effect(1, old_fence, true).is_err(),
+            "delayed prepared execute must be fenced"
+        );
+        assert!(
+            provider.effect(4, old_fence, true).is_err(),
+            "unknown old binding must also be fenced"
+        );
+        assert_eq!(
+            provider.progress().expect("read successor effect").1,
+            if volatile_q1 { 3 } else { 2 }
+        );
+    }
+
     assert!(matches!(
         fleet.nodes[leader].invoke(&QualificationNodeCommand::CompareAndSet {
             lease_handle: "recovery-new".to_owned(),
@@ -220,6 +329,9 @@ fn unclean_return(
             matches!(node.invoke(&QualificationNodeCommand::Get { stable_id: "recovery-key".to_owned() }),
             QualificationNodeReply::Record { present: true, generation: Some(2), fence: Some(fence), .. } if fence == next_fence)
         );
+    }
+    if let Some(prepared) = prepared_roster {
+        prepared.recover(&mut fleet, returning[0], volatile_q1);
     }
     fleet.shutdown_isolated_scale_joined();
 }
@@ -275,5 +387,16 @@ fn protected_durable_all_cold_return_recovers_successor_authority() {
         true,
         QualificationIsolatedPersistence::Durable,
         QualificationIsolatedScaleWorkload::ProtectedRecoveryControl,
+    );
+}
+
+#[cfg(feature = "test-control")]
+#[test]
+fn protected_async_all_cold_loses_acknowledged_q1_but_retires_durable_effects() {
+    unclean_return_with_tail(
+        true,
+        QualificationIsolatedPersistence::Async,
+        QualificationIsolatedScaleWorkload::ProtectedRecoveryControl,
+        true,
     );
 }
