@@ -3,6 +3,8 @@
 mod independent;
 #[cfg(target_os = "linux")]
 mod paths;
+#[cfg(target_os = "linux")]
+mod restart;
 mod revocation;
 mod streams;
 

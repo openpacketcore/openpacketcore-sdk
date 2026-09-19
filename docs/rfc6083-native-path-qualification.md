@@ -1,6 +1,6 @@
 # Native protected SCTP path qualification
 
-The required Linux SCTP CI job runs seven real kernel RFC 6083 cases through
+The required Linux SCTP CI job runs eight real kernel RFC 6083 cases through
 `ci/qualify-rfc6083-native.sh`. The script requires a private network namespace
 before changing its SCTP-AUTH setting, builds nothing as root, and requires
 every named test to resolve exactly once and report one pass with zero ignored

@@ -36,6 +36,7 @@ rfc6083_cases=(
   dtls_tests::kernel_loopback_completes_real_rfc6083_handshake_and_reciprocal_close
   dtls_tests::generic::streams::generic_kernel_multistream_preserves_payload_streams_and_close
   dtls_tests::generic::paths::generic_kernel_multihoming_preserves_protection_and_bounds_total_path_loss
+  dtls_tests::generic::restart::generic_kernel_process_restart_requires_fresh_mutual_authentication
 )
 "$rfc6083_binary" --list --ignored --format terse > "$rfc6083_logs/inventory.log"
 for rfc6083_case in "${rfc6083_cases[@]}"; do
@@ -45,5 +46,7 @@ for rfc6083_case in "${rfc6083_cases[@]}"; do
     --test-threads=1 --nocapture 2>&1 | tee "$rfc6083_log"
   grep -Fq 'test result: ok. 1 passed; 0 failed; 0 ignored;' "$rfc6083_log"
 done
-grep -Fq 'native protected SCTP path assertions completed' "$rfc6083_log"
-echo 'native RFC 6083 qualification completed: 7 executed, 0 ignored'
+grep -Fq 'native protected SCTP path assertions completed' \
+  "$rfc6083_logs/generic_kernel_multihoming_preserves_protection_and_bounds_total_path_loss.log"
+grep -Fq 'native protected SCTP process restart assertions completed' "$rfc6083_log"
+echo 'native RFC 6083 qualification completed: 8 executed, 0 ignored'
