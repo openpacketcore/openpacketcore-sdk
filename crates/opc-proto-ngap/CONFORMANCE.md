@@ -41,6 +41,11 @@ outcomes before generic decoding and keeps 17 pending codec triggers disabled.
 Its independent envelope/diagnostic evidence does not expand the 23 qualified
 message subsets or the published fixture corpus.
 
+The [subset acceptance record](N3IWF-ACCEPTANCE.md) maps the original #787
+criteria to these implemented boundaries, independent sources, runtime tests
+and qualification records. It preserves the explicit unsupported ranges and
+disabled procedure triggers below.
+
 ## Protocol-IE policy and cardinality
 
 The wrapper carries procedure/outcome-specific metadata transcribed from the
@@ -295,7 +300,8 @@ The allocation budget is advisory. The caller resolves association/UE ownership,
 releases signaling and user-plane resources, orders completion, and handles
 applicable optional fields before selecting this subset. No resource effect or
 acknowledgement is performed here. UE Release Request has its separate admitted
-boundary below; other pending procedure codecs remain tracked under #787.
+boundary below. The other 17 applicable outcomes retain the disabled-handler
+boundary in [N3IWF-PROCEDURES.md](N3IWF-PROCEDURES.md).
 
 ### UE Release Complete session reports
 
@@ -332,8 +338,8 @@ malformed nested framing, wrapper mutation and shared bounded fuzz replay.
 `ReleaseMessage::Complete` gains an explicit optional `sessions` field; update
 struct literals and exhaustive destructuring. These are peer reports under
 38.413 8.3.3.2 and 9.2.2.6. Correlation, resource ownership and actual cleanup
-remain caller-owned. This field expansion adds no qualified outcome and does
-not close #787.
+remain caller-owned. This field expansion adds no qualified outcome; the
+aggregate subset evidence is recorded in [N3IWF-ACCEPTANCE.md](N3IWF-ACCEPTANCE.md).
 
 ## N3IWF NG Setup admission
 
@@ -695,7 +701,8 @@ sets. Shared fuzz/replay logic checks all new cases and 244,616 deterministic
 mutations across two bounded contexts; 21 representative seeds are committed.
 These deterministic checks are separate from hosted PR fuzz smoke and do not
 claim a new local libFuzzer campaign. Subsequent root QoS qualification is
-recorded above; extensions and applicable fields remain tracked in #787.
+recorded above. Unsupported extensions retain the explicit restrictions in
+each field section; see [subset acceptance](N3IWF-ACCEPTANCE.md).
 
 ## Setup failure diagnostics
 
@@ -746,8 +753,9 @@ API migration: add `diagnostics: None` to prior `SetupFailureTransfer` literals.
 `SetupFailureTransfer` and `FailedSession` retain `Clone` and equality but no
 longer implement `Copy`; callers copying from borrowed lists must clone
 explicitly. All transfer extensions remain outside this increment. Setup
-response root tunnels/mappings are qualified separately below. Tracking remains
-#787 and #784.
+response root tunnels/mappings are qualified separately below. The aggregate
+codec record is [N3IWF-ACCEPTANCE.md](N3IWF-ACCEPTANCE.md); broader fixture
+acceptance remains in #784.
 
 ## Setup response tunnels and flow mappings
 
@@ -914,9 +922,9 @@ nested framing, key lengths, metadata, bounds and policy changes.
 Security Key borrows exactly 32 bytes without installation or cryptographic
 use. NAS remains opaque; Debug and failures redact values. UE ownership,
 request/result correlation, slice authorization, tunnel/resource changes and
-local procedure triggers remain caller-owned. Additional optional/extension
-fields and procedures under #787 are still pending; no live interoperability
-is established.
+local procedure triggers remain caller-owned. Optional/extension fields outside
+these documented subsets remain unsupported. The other applicable procedures
+retain explicit handler dispositions; no live interoperability is established.
 
 
 Initial Context Request also admits and constructs Old AMF (48/reject), Trace
@@ -1049,8 +1057,9 @@ is involved. Tests also cover every session-item flag/padding bit, capacity,
 depth, counts, metadata mutation, truncation and bounded hostile mutations.
 
 These APIs do not establish UE ownership, prove delivery status, choose local
-procedure triggers, or perform resource release. Remaining #787 procedures and
-live interoperability evidence are still pending.
+procedure triggers, or perform resource release. Other applicable procedures
+retain the disabled-handler boundary in [N3IWF-PROCEDURES.md](N3IWF-PROCEDURES.md).
+Live interoperability is not established.
 
 ## Reset and Error Indication
 
@@ -1132,8 +1141,9 @@ references update only the source corpus digest; their packet bytes are unchange
 The new public message variants require downstream exhaustive-match updates.
 Error Indication struct literals must supply `fiveg_s_tmsi` (`None` when absent).
 Admission does not choose Error Indication triggers, prove transport/UE
-ownership, correlate requests or perform reset actions. Remaining #787
-procedures, optional fields and live interoperability evidence are pending.
+ownership, correlate requests or perform reset actions. Other procedures and
+unsupported optional fields retain their documented restrictions. Live
+interoperability is not established.
 
 ## PDU Session Resource Notify
 
@@ -1246,9 +1256,9 @@ precedes output allocation; schema and dependencies are unchanged.
 Tests compare all admitted values and exact independent bytes, exact/one-short
 limits, unsupported fields, truncations, trailing bytes and flag/padding
 mutations. Shared fuzz/replay assertions include all 687 complete independent
-seeds. Complete Modify request/response support must also enforce TS 29.413's
-receiver-ignore rules and retain caller-owned request correlation, conditional
-NAS forwarding, abnormal-condition responses and resource effects (#787).
+seeds. Complete Modify request/response support, documented below, enforces
+TS 29.413's receiver-ignore rules. Request correlation, conditional NAS
+forwarding, abnormal-condition responses and resource effects remain caller-owned.
 
 ## PDU Session Resource Modify Request Transfer
 
@@ -1419,7 +1429,8 @@ exact/one-short byte/depth/count bounds, unsupported flags, parent-offset paddin
 all truncations and bounded mutations. All 1,436 complete vectors seed shared
 replay and fuzz assertions. Enclosing session lists/messages, request correlation,
 conditional NAS forwarding, response selection, rollback and resource effects
-remain separate; this adds no admitted PDU outcome and does not complete #787.
+remain separate and are described in the enclosing-message section below.
+This field increment adds no admitted PDU outcome.
 
 ### Additional request tunnels and Modify associations
 
@@ -1539,8 +1550,10 @@ ownership, conditional NAS forwarding and optional-field applicability to its
 session state; it selects and constructs the abnormal-condition responses of
 8.2.3.4. Returning a typed decode error does not send those responses. Actual
 resource modifications, rollback and procedure triggers remain outside the codec.
-Additional applicable fields and the broader applicability/receive/error/trigger
-matrix remain open under #787. This evidence does not claim live interoperability.
+Other optional fields remain outside the enumerated subset. The complete
+applicability/receive/error/trigger matrix is in
+[N3IWF-PROCEDURES.md](N3IWF-PROCEDURES.md). This evidence does not claim live
+interoperability.
 
 ## Optional diagnostics in existing responses
 

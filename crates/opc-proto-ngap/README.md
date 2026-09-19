@@ -40,6 +40,11 @@ literals. Modify responses expose up to three `DownlinkQosTunnel` associations
 in `additional`; use `Vec::new()` for existing response literals. See the
 [additional tunnel contract](CONFORMANCE.md#additional-request-tunnels-and-modify-associations).
 
+The [N3IWF subset acceptance record](N3IWF-ACCEPTANCE.md) maps the original
+codec task to implemented evidence, exact public field revisions and real fuzz
+campaigns. The 23 admitted subsets and 17 disabled handler outcomes retain
+their distinct contracts and documented unsupported fields.
+
 ## API Shape
 
 - `Pdu` stores the policy-filtered decoded PDU kind plus the immutable raw bytes
