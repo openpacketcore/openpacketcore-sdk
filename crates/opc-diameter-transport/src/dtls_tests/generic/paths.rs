@@ -14,17 +14,19 @@ fn require_private_namespace() {
     );
 }
 
-struct PathBlock;
+struct PathBlock {
+    destination: &'static str,
+}
 
 impl PathBlock {
-    fn primary() -> Self {
+    fn destination(destination: &'static str) -> Self {
         require_private_namespace();
         let result = Command::new("nft")
             .args(["add", "table", "inet", "opc_n3_dtls_paths"])
             .output()
             .expect("nft table");
         assert!(result.status.success(), "private test table must be new");
-        let block = Self;
+        let block = Self { destination };
         block.replace(false);
         block
     }
@@ -33,7 +35,7 @@ impl PathBlock {
         let addresses = if all {
             "127.0.0.1, 127.0.0.2, 127.0.0.3, 127.0.0.4"
         } else {
-            "127.0.0.3"
+            self.destination
         };
         let script = format!(
             "flush table inet opc_n3_dtls_paths\n\
@@ -257,15 +259,23 @@ async fn generic_kernel_multihoming_preserves_protection_and_bounds_total_path_l
         exchange(&mut client, &mut server).await;
         let client_before = assert_protection(&client, Role::Connector, &material);
         let server_before = assert_protection(&server, Role::Acceptor, &material);
-        let block = PathBlock::primary();
-        exchange(&mut client, &mut server).await;
-        assert!(
-            block.dropped() > 0,
-            "must actually block primary-path traffic"
-        );
+        // SCTP may change its active destination during the handshake. Try
+        // each of the two known peer destinations once, requiring actual
+        // drops before accepting the path-failure phase. An unused address
+        // cannot qualify it merely because application delivery succeeded.
+        let mut selected = None;
+        for destination in ["127.0.0.3", "127.0.0.4"] {
+            let candidate = PathBlock::destination(destination);
+            exchange(&mut client, &mut server).await;
+            if candidate.dropped() > 0 {
+                selected = Some(candidate);
+                break;
+            }
+        }
+        let block = selected.expect("must actually block an active peer path");
         assert!(assert_protection(&client, Role::Connector, &material) == client_before);
         assert!(assert_protection(&server, Role::Acceptor, &material) == server_before);
-        eprintln!("protected primary-path loss completed: reverse_roles={reverse_roles}");
+        eprintln!("protected active-path loss completed: reverse_roles={reverse_roles}");
         block.replace(true);
         let deadline = Instant::now() + Duration::from_secs(1);
         let _ = tokio::join!(

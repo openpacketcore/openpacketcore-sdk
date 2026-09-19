@@ -27,10 +27,13 @@ roles do not have to match the SCTP active/passive socket roles.
 
 After mutual DTLS authentication, both directions exchange exact opaque
 records on streams 0, 1, 2 and 15. A private nftables rule then drops all SCTP
-traffic destined for the connecting endpoint's selected primary peer address.
-It leaves the alternate peer address and the return destinations available.
-Delivery must still succeed in both directions, and the kernel rule's packet
-counter must show actual drops. Readback must preserve the exact role, PPID,
+traffic destined for one peer address of the connecting endpoint. SCTP can
+change its active destination during the handshake, so the fixture tries
+each of its two peer addresses at most once. An attempt with a zero drop
+counter cannot qualify path failure. The qualifying attempt leaves the other
+peer address and all return destinations available. Delivery must still
+succeed in both directions, and the kernel rule's packet counter must show
+actual drops. Readback must preserve the exact role, PPID,
 DTLS version, cipher, material epoch, both certificate expiry bounds, expected
 peer, stream count and correlation capacity. This scenario uses the explicit
 profile without required CRLs; the separate native CRL case qualifies that

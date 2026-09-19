@@ -14,7 +14,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 - `opc-diameter-transport`: require seven native RFC 6083 cases in Linux SCTP
-  CI, including authenticated multistream delivery through actual primary
+  CI, including authenticated multistream delivery through actual active
   destination loss, exact retained protection, bounded all-path retirement,
   and fresh association replacement in both DTLS roles (Refs #794, #784).
 - `opc-diameter-transport`: add opt-in reliable ordered application streams to

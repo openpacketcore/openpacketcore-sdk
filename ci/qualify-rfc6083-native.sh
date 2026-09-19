@@ -20,6 +20,9 @@ fi
 
 rfc6083_binary="$1"
 rfc6083_logs="$2"
+# These files contain only synthetic test diagnostics and must be readable by
+# the unprivileged artifact uploader after this root process exits.
+umask 022
 mkdir -p "$rfc6083_logs"
 ip link set dev lo up
 sysctl -w net.sctp.auth_enable=1

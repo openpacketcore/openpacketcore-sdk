@@ -45,7 +45,7 @@ resource, ordering and qualification contract in
 
 The required Linux SCTP job executes the generic, CRL, Diameter, stream and
 path-failure tests in a private SCTP-AUTH namespace. Actual kernel drop
-counters distinguish a protected primary-path failover from an unfaulted
+counters distinguish a protected active-path failure from an unfaulted
 exchange. Fully blocked paths must retire both roles before a fresh
 association is admitted. See the exact fault model, reproduction and limits
 in [native path qualification](../../docs/rfc6083-native-path-qualification.md).
