@@ -72,9 +72,6 @@ impl OpcConfig for TestConfig {
     }
 
     fn validate_syntax(&self) -> Result<(), ValidationError> {
-        if self.name == "invalid-test-candidate" {
-            return Err(ValidationError::syntax("synthetic candidate rejected"));
-        }
         Ok(())
     }
 

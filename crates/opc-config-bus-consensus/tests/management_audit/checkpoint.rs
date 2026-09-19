@@ -10,14 +10,11 @@ use std::sync::atomic::{AtomicU64, AtomicUsize};
 #[derive(Default)]
 pub(super) struct CheckpointFixture {
     value: std::sync::Mutex<Option<AuditCheckpoint>>,
-    pub(super) unavailable: AtomicBool,
-    pub(super) advance_unavailable: AtomicBool,
+    unavailable: AtomicBool,
+    advance_unavailable: AtomicBool,
     advance_attempts: AtomicUsize,
-    pub(super) refuse_from_sequence: AtomicU64,
+    refuse_from_sequence: AtomicU64,
     lose_next_ack: AtomicBool,
-    pub(super) pause_at_sequence: AtomicU64,
-    pub(super) entered: tokio::sync::Notify,
-    pub(super) resume: tokio::sync::Notify,
 }
 
 #[async_trait::async_trait]
@@ -45,12 +42,6 @@ impl AuditCheckpointPort for CheckpointFixture {
                 && next.sequence() >= self.refuse_from_sequence.load(Ordering::Acquire))
         {
             return Err(AuditAuthorityError::Unavailable);
-        }
-        if self.pause_at_sequence.load(Ordering::Acquire) != 0
-            && self.pause_at_sequence.load(Ordering::Acquire) == next.sequence()
-        {
-            self.entered.notify_one();
-            self.resume.notified().await;
         }
         let mut current = self.value.lock().expect("checkpoint lock");
         if *current != expected

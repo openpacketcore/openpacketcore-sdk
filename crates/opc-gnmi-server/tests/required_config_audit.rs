@@ -1,6 +1,10 @@
 //! Real authenticated protocol composition, with no successful test AuditSink.
-use super::*;
+#[path = "required_config_audit/support.rs"]
+mod support;
 use opc_config_bus::{AuthorizationContext, AuthorizationError, ConfigAuthorizer};
+use opc_config_bus::{ConfigBus, ConfigSnapshot, EncryptingManagedDatastore, ManagedDatastore};
+use opc_config_bus_consensus::RaftManagedDatastore;
+use opc_config_model::{ConfigOperation, RequestId, YangPath};
 use opc_gnmi_server::proto::gnmi::{self, g_nmi_server::GNmi};
 use opc_gnmi_server::proto::gnmi_ext;
 use opc_gnmi_server::{
@@ -8,6 +12,7 @@ use opc_gnmi_server::{
     GnmiArbitrationConfig, GnmiConfigBinding, GnmiError, GnmiPatchApplicator, GnmiServer,
     GnmiService, GnmiVersion, NormalizedSet, GNMI_VERSION, OPC_COMMIT_CONFIRMED_EXTENSION_ID,
 };
+use opc_key::MemoryKeyProvider;
 use opc_mgmt_authz::{AuthzError, PolicySource};
 use opc_mgmt_limits::MgmtLimits;
 use opc_mgmt_opstate::{
@@ -15,6 +20,13 @@ use opc_mgmt_opstate::{
 };
 use opc_mgmt_schema::{DataClass, ModelData, NodeKind, NodeMeta, OriginEntry, SchemaRegistry};
 use opc_nacm::{ModuleRegistry, NacmAction, NacmPolicy, NacmRule, PolicyVersion, YangPathPattern};
+use opc_persist::audit_authority::{AuditLedgerLimits, AuditPrivacyKey};
+use opc_persist::ConsensusConfigStore;
+use opc_types::{ConfigVersion, TxId};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
+use std::time::Duration;
+use support::*;
 
 struct Registry;
 impl SchemaRegistry for Registry {
@@ -154,12 +166,12 @@ struct Harness {
     store: Arc<ConsensusConfigStore>,
     source: Arc<Source>,
     bus: Arc<ConfigBus<TestConfig>>,
-    checkpoints: Arc<checkpoint::CheckpointFixture>,
+    checkpoints: Arc<CheckpointFixture>,
     writer: Arc<Writer>,
 }
 impl Harness {
     async fn start() -> Self {
-        let checkpoints = Arc::new(checkpoint::CheckpointFixture::default());
+        let checkpoints = Arc::new(CheckpointFixture::default());
         let cluster = ProjectionCluster::start_with_continuity(Some(checkpoints.clone())).await;
         let store = cluster.stores[cluster.leader()].clone();
         let privacy = Arc::new(AuditPrivacyKey::new([0x81; 32]).unwrap());
