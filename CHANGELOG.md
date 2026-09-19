@@ -7,6 +7,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- GTP-U tc and host reassembly parsers now hand unknown required extension
+  headers to the shared control queue after full chain validation, before
+  tunnel lookup or decapsulation. Live IPv4/IPv6 packet evidence covers every
+  required identifier, optional skip behavior and malformed suffix rejection.
+  N3 forwarding capabilities remain unchanged. Refs #341, #790, #795.
+
+
 - `opc-sctp`: add an affine N2 association owner with explicit candidate
   promotion, generation-fenced I/O and path readback, bounded reconnect,
   typed reset/stream-count/partial-abort notifications, and mandatory native

@@ -1197,6 +1197,15 @@ external-writer canary `uplink_mtu_policy_corrupt`, both from the
 closed; the netlink driver leaves outer MTU/fragmentation to the kernel
 routing layer.
 
+### Unknown required extensions
+
+The current tc IPv4/IPv6 parsers and post-reassembly parser hand complete
+unknown-required-extension chains to the control plane before tunnel lookup
+or decapsulation. Optional extensions retain their endpoint skip behavior;
+malformed chains still drop. The existing shared IPv4 control socket supplies
+bounded notification plans. See the [exact contract and native evidence](docs/required-extensions.md).
+This does not enable N3 forwarding or change selector authority.
+
 ### Downlink outer-fragment handling
 
 `GtpuProbe::downlink_outer_fragment_handling` states each backend's outer-IPv4

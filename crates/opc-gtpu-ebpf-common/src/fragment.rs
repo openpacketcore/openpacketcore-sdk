@@ -14,7 +14,10 @@
 //! fragment cache, so reassembly memory and time stay bounded by the kernel's
 //! configured limits and are reported through the backend capability surface.
 
-use crate::{classify_gtpu, GtpuClass, GTPU_MANDATORY_HDR_LEN, GTPU_MAX_EXT_HEADERS, GTPU_OPT_LEN};
+use crate::{
+    classify_gtpu, gtpu_endpoint_requires_extension_control, GtpuClass, GTPU_MANDATORY_HDR_LEN,
+    GTPU_MAX_EXT_HEADERS, GTPU_OPT_LEN,
+};
 
 /// Explicit downlink outer-fragment handling contract of a GTP-U backend.
 ///
@@ -122,7 +125,8 @@ impl core::fmt::Debug for GtpuTpdu<'_> {
 /// block, and bounded extension-header walk of the tc downlink fast path.
 ///
 /// Returns `Ok(None)` for messages the fast path passes through untouched —
-/// non-GTPv1 and non-G-PDU GTP-U (echo, error indication) — so the consumer
+/// non-GTPv1, non-G-PDU GTP-U, and complete unknown-required-extension chains
+/// — so the consumer
 /// hands them to the control plane rather than dropping them. Malformed
 /// declarations fail closed with a bounded typed reason.
 ///
@@ -154,6 +158,7 @@ pub fn parse_gtpu_tpdu(message: &[u8]) -> Result<Option<GtpuTpdu<'_>>, GtpuTpduE
         } => (teid, has_opt, has_ext),
     };
 
+    let mut requires_control = false;
     let mut payload_offset = GTPU_MANDATORY_HDR_LEN;
     if has_opt {
         let optional_end = payload_offset
@@ -184,11 +189,15 @@ pub fn parse_gtpu_tpdu(message: &[u8]) -> Result<Option<GtpuTpdu<'_>>, GtpuTpduE
                 if ext_end > gtp_end {
                     return Err(GtpuTpduError::MalformedExtensionChain);
                 }
+                requires_control |= gtpu_endpoint_requires_extension_control(next_ext);
                 payload_offset = ext_end;
                 next_ext = message[ext_end - 1];
                 walked += 1;
             }
         }
+    }
+    if requires_control {
+        return Ok(None);
     }
     if payload_offset >= gtp_end || gtp_end - payload_offset < 20 {
         return Err(GtpuTpduError::TruncatedPayload);
@@ -207,6 +216,36 @@ mod tests {
     use std::vec::Vec;
 
     use super::*;
+
+    #[test]
+    fn required_unknown_extensions_never_become_a_tpdu() {
+        // Independently authored TS 29.281 5.2.1 type-bit matrix. The existing
+        // profile understands PSC framing (0x85); it does not gain N3/QFI
+        // forwarding authority from this test.
+        for kind in 1_u8..=255 {
+            let mut body = vec![0, 0, 0, kind, 1, 0x12, 0x34, 0];
+            body.extend_from_slice(&[0x45; 20]);
+            let wire = gpdu([0x10, 0, 0, 1], 0x34, &body);
+            let parsed = parse_gtpu_tpdu(&wire).unwrap();
+            if kind >= 128 && kind != 0x85 {
+                assert!(parsed.is_none(), "required extension reached T-PDU output");
+            } else {
+                assert_eq!(parsed.unwrap().payload, &[0x45; 20]);
+            }
+        }
+        // A required first header cannot hide a malformed later header.
+        for length in [0, 255] {
+            let wire = gpdu(
+                [0x10, 0, 0, 1],
+                0x34,
+                &[0, 0, 0, 0x80, 1, 0, 0, 0x20, length, 0, 0, 0],
+            );
+            assert_eq!(
+                parse_gtpu_tpdu(&wire),
+                Err(GtpuTpduError::MalformedExtensionChain)
+            );
+        }
+    }
 
     fn gpdu(teid: [u8; 4], flags: u8, body: &[u8]) -> Vec<u8> {
         let mut message = vec![flags, 0xFF, 0, 0, teid[0], teid[1], teid[2], teid[3]];
