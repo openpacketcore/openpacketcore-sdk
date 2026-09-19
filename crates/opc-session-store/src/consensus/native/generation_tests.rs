@@ -1,6 +1,7 @@
 use super::super::changes::tests::{apply, clock, command, fixture, request, time};
 use super::*;
 use crate::sqlite::consensus::wal::Operation;
+use crate::test_process::CommandExt as _;
 use std::fs::OpenOptions;
 
 const BLOCK: usize = 64 * 1024;
@@ -413,7 +414,7 @@ fn native_history_captured_transient_omission_rejects_before_generation_selectio
         let output = std::process::Command::new(std::env::current_exe().unwrap())
             .args(["--exact", TEST, "--test-threads=1", "--nocapture"])
             .env(CHILD, "1")
-            .output()
+            .test_output()
             .unwrap();
         let stdout = String::from_utf8(output.stdout).unwrap();
         let stderr = String::from_utf8(output.stderr).unwrap();

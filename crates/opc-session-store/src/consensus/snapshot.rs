@@ -1847,6 +1847,10 @@ impl PinnedSqliteFile {
     /// of reopening the pathname after closing that writer.
     #[cfg(target_os = "linux")]
     pub(crate) fn seal_fixed(&mut self) -> io::Result<()> {
+        #[cfg(test)]
+        let _child_launch = crate::test_process::SNAPSHOT_PROCESS_FD_GATE
+            .read()
+            .expect("test snapshot-seal gate remains available");
         let digest = opc_fs_verity_sys::enable_fixed_profile(self.file.as_fd())
             .map_err(fs_verity_enable_error)?;
         let metadata = self.file.metadata()?;
@@ -4364,6 +4368,8 @@ impl AsyncSeek for SessionSnapshotFile {
 
 #[cfg(test)]
 mod tests {
+    #[cfg(target_os = "linux")]
+    use crate::test_process::CommandExt as _;
     use std::io;
     #[cfg(target_os = "linux")]
     use std::io::{Read as _, Write as _};
@@ -5275,7 +5281,7 @@ mod tests {
             .arg("-m")
             .arg("600")
             .arg(&path)
-            .status()?
+            .test_status()?
             .success());
 
         let started = Instant::now();

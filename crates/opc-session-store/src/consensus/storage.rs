@@ -8167,6 +8167,7 @@ fn reject_indeterminate_snapshot_publication(core: &SqliteConsensusCore) -> io::
 
 #[cfg(test)]
 mod tests {
+    use crate::test_process::CommandExt as _;
     use std::str::FromStr;
     use std::sync::Arc;
     use std::time::Duration;
@@ -8868,7 +8869,7 @@ mod tests {
                     .env(CHILD_MODE, "blocked")
                     .env(CHILD_DATABASE, &database)
                     .env(CHILD_SNAPSHOTS, &migrated_snapshots)
-                    .output()
+                    .test_output()
                     .expect("run independent queued-cleanup child");
             assert!(
                 blocked.status.success(),
@@ -8930,7 +8931,7 @@ mod tests {
                     .env(CHILD_MODE, "admitted")
                     .env(CHILD_DATABASE, &database)
                     .env(CHILD_SNAPSHOTS, &migrated_snapshots)
-                    .output()
+                    .test_output()
                     .expect("run post-ack child");
             assert!(
                 admitted.status.success(),
@@ -9033,7 +9034,7 @@ mod tests {
                 .arg("-m")
                 .arg("600")
                 .arg(original)
-                .status()
+                .test_status()
                 .expect("run mkfifo")
                 .success());
         }));
@@ -9072,7 +9073,7 @@ mod tests {
                 .arg("-m")
                 .arg("600")
                 .arg(tombstone)
-                .status()
+                .test_status()
                 .expect("run mkfifo")
                 .success());
         }));
@@ -10887,6 +10888,94 @@ mod tests {
                 .tempdir()
                 .expect("create local snapshot fixture directory"),
         }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn fixed_snapshot_seal_waits_for_test_child_descriptor_retirement() {
+        use std::io::Write as _;
+
+        let directory = fs_verity_snapshot_tempdir("child-descriptor-seal-");
+        let path = directory.path().join("snapshot");
+        let writer = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&path)
+            .unwrap();
+        (&writer).write_all(b"synthetic fixed snapshot").unwrap();
+        writer.sync_all().unwrap();
+        let mut pinned =
+            PinnedSqliteFile::from_file(std::fs::File::open(&path).unwrap(), path).unwrap();
+        let error = pinned.seal_fixed().unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+        assert_eq!(
+            error.to_string(),
+            "fixed snapshot sealing is unavailable (enable errno=Some(26))",
+            "coordination cannot authorize a real retained writer"
+        );
+        // Model a child paused before exec with the parent's writable open
+        // description still retained. CLOEXEC does not close it until exec.
+        let launch = crate::test_process::SNAPSHOT_PROCESS_FD_GATE
+            .write()
+            .unwrap();
+        let (started, starting) = std::sync::mpsc::channel();
+        let (finished, finishing) = std::sync::mpsc::channel();
+        let worker = std::thread::spawn(move || {
+            let mut pinned = pinned;
+            started.send(()).unwrap();
+            finished.send(pinned.seal_fixed()).unwrap();
+        });
+        starting.recv_timeout(Duration::from_secs(5)).unwrap();
+        let premature = finishing.recv_timeout(Duration::from_millis(100)).ok();
+        drop(writer);
+        drop(launch);
+        let result =
+            premature.unwrap_or_else(|| finishing.recv_timeout(Duration::from_secs(5)).unwrap());
+        worker.join().unwrap();
+        result.expect("seal after the test child retires its inherited writer");
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn fixed_snapshot_seal_can_complete_while_a_test_child_is_still_running() {
+        use std::io::{BufRead as _, Write as _};
+        use std::process::{Child, Command, Stdio};
+
+        struct ChildGuard(Child);
+        impl Drop for ChildGuard {
+            fn drop(&mut self) {
+                let _ = self.0.kill();
+                let _ = self.0.wait();
+            }
+        }
+
+        let mut child = ChildGuard(
+            Command::new("/bin/sh")
+                .args(["-c", "printf 'ready\\n'; read -r release"])
+                .stdin(Stdio::piped())
+                .stdout(Stdio::piped())
+                .test_spawn()
+                .unwrap(),
+        );
+        let mut ready = String::new();
+        std::io::BufReader::new(child.0.stdout.take().unwrap())
+            .read_line(&mut ready)
+            .unwrap();
+        assert_eq!(ready, "ready\n");
+        let directory = fs_verity_snapshot_tempdir("live-child-seal-");
+        let path = directory.path().join("snapshot");
+        std::fs::write(&path, b"synthetic fixed snapshot").unwrap();
+        let pinned = PinnedSqliteFile::reopen_and_seal_fixed(&path).unwrap();
+        pinned.verify_immutable_generation().unwrap();
+        assert!(child.0.try_wait().unwrap().is_none());
+        child
+            .0
+            .stdin
+            .take()
+            .unwrap()
+            .write_all(b"release\n")
+            .unwrap();
+        assert!(child.0.wait().unwrap().success());
     }
 
     #[cfg(target_os = "linux")]
@@ -13271,7 +13360,7 @@ mod tests {
         let output = std::process::Command::new(std::env::current_exe().expect("test executable"))
             .args([&test, "--exact", "--nocapture", "--test-threads=1"])
             .env(CHILD_CASE, test_name)
-            .output()
+            .test_output()
             .expect("run isolated handoff resource case");
         assert!(
             output.status.success(),
@@ -19935,7 +20024,7 @@ mod tests {
                 .env(CHILD_MODE, mode)
                 .env(CHILD_DATABASE, &database)
                 .env(CHILD_SNAPSHOTS, &child_directory)
-                .output()
+                .test_output()
                 .expect("run independent database-lock child")
         };
 
@@ -20047,7 +20136,7 @@ mod tests {
                 .args(["--exact", TEST_NAME, "--nocapture"])
                 .env(UMASK_CHILD, "1")
                 .env(UMASK_ROOT, directory.path())
-                .status()
+                .test_status()
                 .expect("run restrictive-umask child");
         assert!(status.success(), "restrictive-umask child passes");
     }
@@ -20074,7 +20163,7 @@ mod tests {
         let fifo_path = directory.path().join("snapshot-fifo");
         let status = std::process::Command::new("mkfifo")
             .arg(&fifo_path)
-            .status()
+            .test_status()
             .expect("run mkfifo");
         assert!(status.success(), "mkfifo fixture succeeds");
         let started = std::time::Instant::now();
@@ -20553,7 +20642,7 @@ mod tests {
                 .env(CHILD_MODE, mode)
                 .env(CHILD_DATABASE, &database)
                 .env(CHILD_SNAPSHOTS, &snapshots)
-                .output()
+                .test_output()
                 .expect("run separate-process lease child")
         };
 

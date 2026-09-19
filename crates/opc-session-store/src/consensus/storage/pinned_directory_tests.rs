@@ -1,6 +1,7 @@
 //! Complete lease-path tests for explicit configured-name/descriptor custody.
 
 use super::*;
+use crate::test_process::CommandExt as _;
 use std::fs::File;
 use std::os::fd::AsRawFd as _;
 use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _};
@@ -74,7 +75,7 @@ impl Actor {
             .stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(Stdio::inherit())
-            .spawn()
+            .test_spawn()
             .expect("spawn synthetic lease actor");
         // Install the child guard before any fallible handshake wait.
         let mut child = ChildGuard(Some(child));
