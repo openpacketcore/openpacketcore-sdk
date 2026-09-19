@@ -13,6 +13,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   replacement, shutdown and multihoming failover qualification (Refs #788).
 
 ### Added
+- `opc-proto-ngap`: construct and admit root non-dynamic/dynamic QoS profiles,
+  GBR parameters and optional E-RAB identifiers. Add exact caller-supplied
+  session/QFI classification for conditional Session AMBR and per-flow failure
+  reporting, with independent Release 18 bytes and bounded replay. Session
+  AMBR literals now use `Option`, setup-list values expose `QosFlow`, and Modify
+  matches gain two variants; the crate conformance record documents migration
+  and the remaining unsupported extensions (Refs #787).
 - `opc-proto-ngap`: construct and admit Common Network Instance in Setup/Modify
   transfers and numeric Network Instance in Modify. Preserve opaque identifiers,
   expose the specified Common-first request preference, and preflight fragmented
