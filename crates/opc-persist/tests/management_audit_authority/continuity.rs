@@ -548,6 +548,95 @@ async fn coherent_database_rollback_and_missing_keys_are_refused_before_engine_s
 }
 
 #[tokio::test]
+async fn checkpointed_intent_with_retained_commit_reopens_and_settles() {
+    let dir = tempfile::tempdir().unwrap();
+    let external = Arc::new(ExternalCheckpointFixture::default());
+    let database = dir.path().join("authority.sqlite");
+    let snapshots = dir.path().join("snapshots");
+    let store = open(&database, &snapshots, external.clone(), &[1, 2], true)
+        .await
+        .unwrap();
+    store.initialize_cluster().await.unwrap();
+    store
+        .initialize_audit_authority(&privacy(), AuditLedgerLimits::new(6, 2).unwrap())
+        .await
+        .unwrap();
+    let tx = TxId::new();
+    let prepared = store
+        .prepare_audited_commit(
+            &privacy(),
+            &source_event(93, ManagementAuditOutcomeCode::Intent),
+            attested(commit(tx, None, 1, 7), audit(tx)),
+            Duration::from_secs(60),
+        )
+        .unwrap();
+    let intent = applied(
+        store
+            .admit_audit_operation(prepared.handle(), caller())
+            .await,
+    );
+    let export = store
+        .freeze_audit_export(caller(), 0, Duration::from_secs(60))
+        .await
+        .unwrap();
+    let verified = verify_export(&export, topology().identity(), &[1, 2]);
+    store
+        .acknowledge_audit_export(&verified, caller())
+        .await
+        .unwrap();
+    drop(export);
+    let committed = applied(
+        store
+            .submit_audited_mutation(&prepared, &intent, caller())
+            .await,
+    );
+    assert_eq!(
+        committed.state(),
+        AuditOperationState::Committed { version: 1 }
+    );
+    assert!(!committed.terminal_recorded());
+    assert_eq!(
+        external.value.lock().unwrap().as_ref().unwrap().sequence(),
+        1
+    );
+    store.shutdown().await.unwrap();
+    drop(store);
+
+    // The same prefix checkpoint accompanies a retained committed outcome here.
+    // Reopen must recover that exact outcome, not refuse every pending terminal.
+    let reopened = open(&database, &snapshots, external, &[1, 2], false)
+        .await
+        .unwrap();
+    reopened.initialize_cluster().await.unwrap();
+    reopened.probe_durable_readiness().await.unwrap();
+    assert_eq!(
+        reopened.load_latest().await.unwrap().unwrap().record.tx_id,
+        tx
+    );
+    let progress = reopened.reconcile_audit_obligations(2).await.unwrap();
+    assert_eq!(
+        (progress.completed, progress.pending, progress.unknown),
+        (1, 0, 0)
+    );
+    let settled = reopened
+        .lookup_audit_operation(prepared.handle(), caller())
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(settled.state(), committed.state());
+    assert!(settled.terminal_recorded());
+    assert_eq!(
+        reopened
+            .reconcile_audit_obligations(2)
+            .await
+            .unwrap()
+            .inspected,
+        0
+    );
+    reopened.shutdown().await.unwrap();
+}
+
+#[tokio::test]
 async fn checkpointed_intent_cannot_become_rejected_after_committed_suffix_rollback() {
     let dir = tempfile::tempdir().unwrap();
     let external = Arc::new(ExternalCheckpointFixture::default());

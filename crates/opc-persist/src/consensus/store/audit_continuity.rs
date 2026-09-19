@@ -99,7 +99,23 @@ pub(super) async fn verify_startup(
                 // traffic/mutation readiness exists until that CAS is read back.
                 ledger.validate_continuity(Some(&policy.keys))
             } else {
-                verify_external(&ledger, &policy.keys, external.as_ref())
+                verify_external(&ledger, &policy.keys, external.as_ref())?;
+                let checkpoint = external.as_ref().ok_or(AuditAuthorityError::Unavailable)?;
+                // An authenticated prefix may end at an admitted mutation's
+                // intent even though a later configuration result was lost by
+                // restoring this database. A newly opened owner cannot prove
+                // that the previous process never submitted that effect. Do
+                // not start the engine and let expiry invent a rejection.
+                // Retained authoritative outcomes remain resumable below the
+                // latest checkpoint and do not need a terminal record yet.
+                if ledger.operations.iter().any(|operation| {
+                    operation.handle.body.mutation.is_some()
+                        && operation.state == crate::audit_authority::AuditOperationState::Intent
+                        && operation.first_sequence <= checkpoint.sequence()
+                }) {
+                    return Err(AuditAuthorityError::RecoveryRequired);
+                }
+                Ok(())
             }
         }
     }
@@ -110,6 +126,9 @@ impl ConsensusConfigStore {
     /// checkpoint providers. Existing continuity state cannot be opened through
     /// the ordinary constructor or reset by a different initial epoch. A stale
     /// local restore behind the external mark is refused before the engine starts.
+    /// A checkpointed mutation intent without a retained outcome is also refused:
+    /// the new owner cannot distinguish an unsubmitted effect from a lost commit
+    /// suffix. Recover authoritative state explicitly; expiry cannot repair it.
     pub async fn open_with_audit_continuity(
         topology: ConfigConsensusTopology,
         backend: SqliteBackend,

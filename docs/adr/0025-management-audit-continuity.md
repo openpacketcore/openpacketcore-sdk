@@ -105,6 +105,16 @@ claimed resistant to coordinated whole-database rollback. A faulty or hostile
 external authority that rolls back together with the database violates the
 required independent trust boundary.
 
+A reopened authority also refuses a checkpointed configuration-mutation intent
+whose authoritative outcome is absent from the retained ledger. A commit may
+have existed in a lost suffix, so expiration cannot classify that intent as
+rejected. This is explicit recovery-required state; preserve the database and
+external checkpoint and recover the authoritative outcome. A retained committed
+or rejected outcome can still reopen and finish its terminal obligation. This
+guard does not supply automatic per-mutation checkpoint advancement or protect
+an intent that was never independently checkpointed; those ordering guarantees
+remain separate from export-prefix acknowledgement.
+
 After complete export verification, acknowledgement verifies the same prefix,
 CAS-advances the external checkpoint, reads it back and commits that exact value
 locally. A newer independently verified checkpoint may subsume an older export.
