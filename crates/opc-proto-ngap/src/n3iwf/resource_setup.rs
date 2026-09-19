@@ -5,13 +5,18 @@
 //! TS 29.413 ignores security-capability contents on receive; construction
 //! still requires an explicit mandatory capability value from the caller.
 
-use super::context_fields::{AllowedNssai, Guami, SecurityAlgorithmMasks};
+use super::context_fields::{
+    validate_slice_lists, AllowedNssai, Guami, PartiallyAllowedNssai, SecurityAlgorithmMasks,
+};
 use super::nas::UeAggregateBitRate;
+use super::nas_fields::{ExtendedAmfName, MaskedImeisv};
 use super::release::Cause;
 use super::session_lists::{
     FailedSessions, SessionResults, SessionSetupRequests, SessionTransferDiagnostics,
     SuccessfulSessions,
 };
+use super::setup_fields::AmfName;
+pub use super::trace_fields::{TraceActivation, TraceDepth};
 use super::*;
 use crate::{policy, Message, MessageType, Pdu, PduKind, ProtocolIe};
 use opc_protocol::Encode;
@@ -34,6 +39,16 @@ pub struct InitialContextRequest<'a> {
     pub sessions: Option<SessionSetupRequests<'a>>,
     /// Optional opaque NAS, separate from per-session NAS.
     pub nas: Option<NasPdu<'a>>,
+    /// Optional root name of the old AMF; no AMF is selected.
+    pub old_amf: Option<AmfName>,
+    /// Optional trace parameters; no trace session is started or authorized.
+    pub trace: Option<TraceActivation>,
+    /// Optional fixed masked identity, without subscriber interpretation.
+    pub masked_imeisv: Option<MaskedImeisv>,
+    /// Optional partial slices, disjoint from Allowed NSSAI with combined count <= 8.
+    pub partially_allowed_nssai: Option<PartiallyAllowedNssai>,
+    /// Independent optional VisibleString and UTF8String old-AMF names.
+    pub extended_old_amf: Option<ExtendedAmfName>,
 }
 redacted!(InitialContextRequest<'_>);
 
@@ -132,12 +147,20 @@ impl InitialContextRequest<'_> {
         capabilities: SecurityAlgorithmMasks,
         ctx: DecodeContext,
     ) -> Result<Pdu, DecodeError> {
+        validate_slice_lists(Some(&self.allowed), self.partially_allowed_nssai.as_ref())?;
         if self.sessions.is_some() && self.aggregate_bit_rate.is_none() {
             return Err(invalid("missing conditional ue aggregate bitrate"));
         }
         crate::enforce_depth(if self.sessions.is_some() { 17 } else { 8 }, ctx)?;
         let output = output_context(ctx);
         let mut fields = id_fields(self.amf, self.ran, Criticality::reject, output)?;
+        if let Some(name) = &self.old_amf {
+            fields.push((
+                48,
+                Criticality::reject,
+                name.encode(output).map_err(encode_error)?,
+            ));
+        }
         if let Some(rate) = &self.aggregate_bit_rate {
             fields.push((
                 110,
@@ -174,11 +197,39 @@ impl InitialContextRequest<'_> {
                 self.key.encode(output).map_err(encode_error)?,
             ),
         ]);
+        if let Some(trace) = self.trace {
+            fields.push((
+                108,
+                Criticality::ignore,
+                trace.encode(output).map_err(encode_error)?,
+            ));
+        }
+        if let Some(identity) = self.masked_imeisv {
+            fields.push((
+                34,
+                Criticality::ignore,
+                identity.encode(output).map_err(encode_error)?,
+            ));
+        }
         if let Some(nas) = &self.nas {
             fields.push((
                 38,
                 Criticality::ignore,
                 nas.encode(output).map_err(encode_error)?,
+            ));
+        }
+        if let Some(partial) = &self.partially_allowed_nssai {
+            fields.push((
+                414,
+                Criticality::ignore,
+                partial.encode(output).map_err(encode_error)?,
+            ));
+        }
+        if let Some(name) = &self.extended_old_amf {
+            fields.push((
+                443,
+                Criticality::ignore,
+                name.encode(output).map_err(encode_error)?,
             ));
         }
         construct(MessageType::InitialContextSetupRequest, fields, ctx)
@@ -414,7 +465,7 @@ fn admit<'a>(
     let (profile, supported, ignored): (policy::IeProfile, &[u16], &[u16]) = match kind {
         MessageType::InitialContextSetupRequest => (
             policy::INITIAL_CONTEXT_SETUP_REQUEST,
-            &[10, 85, 110, 28, 71, 0, 94, 38],
+            &[10, 85, 48, 110, 28, 71, 0, 94, 108, 34, 38, 414, 443],
             CONTEXT_IGNORED,
         ),
         MessageType::InitialContextSetupResponse => (
@@ -448,6 +499,13 @@ fn admit<'a>(
     let (mut aggregate_bit_rate, mut requests, mut nas) = (None, None, None);
     let (mut successful, mut failed, mut cause, mut location) = (None, None, None, None);
     let mut diagnostics = None;
+    let (
+        mut old_amf,
+        mut trace,
+        mut masked_imeisv,
+        mut partially_allowed_nssai,
+        mut extended_old_amf,
+    ) = (None, None, None, None, None);
     let mut ignored_ie_count = 0;
     let mut notify_ie_ids = Vec::new();
     let mut transfer_diagnostics = Vec::new();
@@ -474,6 +532,11 @@ fn admit<'a>(
         match id {
             10 => amf = Some(AmfUeId::decode(value, leaf)?),
             85 => ran = Some(RanUeId::decode(value, leaf)?),
+            48 => old_amf = Some(AmfName::decode(value, leaf)?),
+            108 => trace = Some(TraceActivation::decode(value, leaf)?),
+            34 => masked_imeisv = Some(MaskedImeisv::decode(value, leaf)?),
+            414 => partially_allowed_nssai = Some(PartiallyAllowedNssai::decode(value, leaf)?),
+            443 => extended_old_amf = Some(ExtendedAmfName::decode(value, leaf)?),
             110 => aggregate_bit_rate = Some(UeAggregateBitRate::decode(value, leaf)?),
             28 => guami = Some(Guami::decode(value, leaf)?),
             0 => allowed = Some(AllowedNssai::decode(value, leaf)?),
@@ -506,15 +569,22 @@ fn admit<'a>(
             if requests.is_some() && aggregate_bit_rate.is_none() {
                 return Err(invalid("missing conditional ue aggregate bitrate"));
             }
+            let allowed = allowed.ok_or_else(|| invalid("missing allowed nssai"))?;
+            validate_slice_lists(Some(&allowed), partially_allowed_nssai.as_ref())?;
             ResourceSetupMessage::InitialRequest(InitialContextRequest {
                 amf,
                 ran,
                 guami: guami.ok_or_else(|| invalid("missing guami"))?,
-                allowed: allowed.ok_or_else(|| invalid("missing allowed nssai"))?,
+                allowed,
                 key: key.ok_or_else(|| invalid("missing security key"))?,
                 aggregate_bit_rate,
                 sessions: requests,
                 nas,
+                old_amf,
+                trace,
+                masked_imeisv,
+                partially_allowed_nssai,
+                extended_old_amf,
             })
         }
         MessageType::InitialContextSetupResponse => {

@@ -624,7 +624,7 @@ from typed fields. The matrix covers TS 38.413 V18.10.0 9.2.2.1–9.2.2.3 and
 
 | Outcome | Required fields | Admitted optional/conditional fields | Encode / receive |
 | --- | --- | --- | --- |
-| Initial Context Setup Request | AMF/RAN UE IDs, GUAMI, Allowed NSSAI, UE Security Capabilities presence, Security Key | Session setup requests, opaque NAS; UE AMBR required when session requests exist | Canonical / typed |
+| Initial Context Setup Request | AMF/RAN UE IDs, GUAMI, Allowed NSSAI, UE Security Capabilities presence, Security Key | Session setup requests, opaque NAS, Old AMF, Trace Activation, Masked IMEISV, Partially Allowed NSSAI, Extended Old AMF; UE AMBR required when session requests exist | Canonical / typed |
 | Initial Context Setup Response | AMF/RAN UE IDs | Disjoint successful and failed session lists; both may be absent; response diagnostics | Canonical / typed |
 | Initial Context Setup Failure | AMF/RAN UE IDs, root Cause | Failed session list, response diagnostics | Canonical / typed |
 | PDU Session Resource Setup Request | AMF/RAN UE IDs, session setup request list | Opaque NAS, UE AMBR | Canonical / typed |
@@ -644,8 +644,8 @@ TS 29.413 receiver-ignore list are skipped even if their opaque values are
 malformed. The capability IE must still exist; construction requires four
 caller-provided masks. RAN Paging Priority and UE Slice Maximum Bit Rate List
 are receiver-ignored on PDU setup requests. Trace Activation and UE AMBR are
-applicable to N3IWF under the non-trusted-access exceptions: bitrate is decoded,
-while Trace Activation fails explicitly until its contract is implemented.
+applicable to N3IWF under the non-trusted-access exceptions: both are decoded
+as bounded values; neither creates resources nor starts tracing.
 Other recognized applicable fields outside this subset fail explicitly. Ignored fields are omitted by construction,
 apart from mandatory capabilities. No ignored bytes are exposed as semantic data.
 
@@ -678,6 +678,45 @@ request/result correlation, slice authorization, tunnel/resource changes and
 local procedure triggers remain caller-owned. Other QoS profiles, optional
 fields and procedures under #787 are still pending; no live interoperability
 is established.
+
+
+Initial Context Request also admits and constructs Old AMF (48/reject), Trace
+Activation (108/ignore), Masked IMEISV (34/ignore), Partially Allowed NSSAI
+(414/ignore), and Extended Old AMF (443/ignore). Old AMF has different criticality
+here than in Downlink NAS. These fields reuse the qualified name, identity and
+slice roots. Allowed NSSAI remains mandatory; partial slices must be disjoint,
+including optional SD, and the combined count must not exceed eight under
+TS 38.413 8.3.1.4. Validation follows duplicate selection, including a selected
+last duplicate that creates overlap or overflow. Mandatory capability presence
+and conditional AMBR remain unchanged. Public InitialContextRequest struct
+literals gain five optional fields.
+
+`trace_fields::TraceActivation` preserves the eight opaque trace-ID octets,
+all eight interface bits, one of six root depth values and a 1..=160-bit
+Transport Layer Address. Per 9.3.2.4, transport-layer interpretation belongs to
+the caller; the codec preserves the complete root bit string with zero unused
+low bits. Reserved interface bits are retained without selecting an interface.
+The decoder uses fixed storage, requires depth two and rejects sequence, IE,
+address-length and enumeration extensions, invalid root indices, nonzero
+padding and trailing data. Generated root construction agrees with independent
+bytes for all 160 address lengths after exact 13..=32-octet size preflight.
+Optional MDT Configuration and Trace Collection Entity URI remain unsupported;
+no trace activation, collector connection or reporting authority is granted.
+
+The separate [context optional-field corpus](tests/fixtures/n3iwf-context-optionals.json)
+contains 453 independent complete messages: 378 admitted cases, 375 canonical
+constructor comparisons and 75 negative cases. It covers every trace address
+root length and depth, interface-bit boundaries, names, masked identity bits,
+all allowed/partial count pairs, overlap, SD distinctions, duplicate
+First/Last/Reject, mutable criticality, unknown policy and malformed trace
+framing. The existing 122 resource-setup vectors are unchanged; their legacy
+`unsupported` labels for empty Old AMF/Trace values remain negative malformed
+leaf cases. Reproduce using `scripts/generate-ngap-context-optionals.py --spec
+PATH --output PATH` with the same pinned PDF/Pycrate environment. Five new
+ordinary tests exercise independent values, exact constructor bytes, limits,
+redaction and complete-message/leaf mutations under two bounded contexts.
+Eighteen added seeds share semantic reconstruction in fuzz/replay. No new local
+fuzz campaign or external interoperability is claimed.
 
 ## PDU Session Resource Release
 

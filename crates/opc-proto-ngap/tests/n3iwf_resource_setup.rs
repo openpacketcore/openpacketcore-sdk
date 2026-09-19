@@ -109,6 +109,11 @@ fn construct_row(row: &Value, ctx: DecodeContext) -> Result<Pdu, DecodeError> {
         field(&values, 110).map(|v| UeAggregateBitRate::decode(v, context()).unwrap());
     match kind(row) {
         MessageType::InitialContextSetupRequest => InitialContextRequest {
+            old_amf: None,
+            trace: None,
+            masked_imeisv: None,
+            partially_allowed_nssai: None,
+            extended_old_amf: None,
             amf,
             ran,
             guami: Guami::decode(field(&values, 28).unwrap(), context()).unwrap(),

@@ -13,6 +13,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   replacement, shutdown and multihoming failover qualification (Refs #788).
 
 ### Added
+- `opc-proto-ngap`: admit and construct Initial Context Setup optional old/extended
+  AMF names, masked identity, partial slices and bounded root trace parameters.
+  Preserve message-specific criticality and combined slice constraints with
+  independent complete-message and semantic reconstruction evidence (Refs #787).
 - `opc-proto-ngap`: admit and construct NG Setup root node/extended names,
   UE-retention reports and served-GUAMI backup AMF names. Preserve optional
   name components and existing duplicate policy with bounded, redacted types
