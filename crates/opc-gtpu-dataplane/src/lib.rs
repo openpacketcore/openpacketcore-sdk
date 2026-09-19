@@ -56,6 +56,7 @@
 #![forbid(unsafe_code)]
 
 pub mod backend;
+pub mod control_port;
 pub mod ebpf;
 pub mod error;
 pub mod icmp;

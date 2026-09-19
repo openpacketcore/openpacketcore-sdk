@@ -152,6 +152,34 @@ jobs:
           grep -Fq 'OPC_GTPU_HISTORICAL_25_DETACHED_RECOVERY_PROVEN' "${datapath_log}"
           grep -Fq 'OPC_GTPU_HISTORICAL_25_ATTACHED_REFUSAL_PROVEN' "${datapath_log}"
 
+      - name: Require native shared GTP-U control queue proof
+        run: |
+          set -euo pipefail
+          export CARGO_TARGET_DIR="${RUNNER_TEMP}/gtpu-target"
+          cargo test --locked -p opc-gtpu-dataplane --lib --no-run --message-format=json \
+            > "${RUNNER_TEMP}/gtpu-control-build.jsonl"
+          gtpu_control_binary="$(python3 - "${RUNNER_TEMP}/gtpu-control-build.jsonl" <<'PY'
+          import json, sys
+          records = [json.loads(line) for line in open(sys.argv[1])]
+          binaries = [r['executable'] for r in records
+                      if r.get('reason') == 'compiler-artifact'
+                      and r.get('executable')
+                      and r['target']['name'] == 'opc_gtpu_dataplane']
+          assert len(binaries) == 1, 'expected exactly one GTP-U test binary'
+          print(binaries[0])
+          PY
+          )"
+          sudo unshare -n -- bash ci/qualify-gtpu-control-native.sh \
+            "$gtpu_control_binary" "${RUNNER_TEMP}/gtpu-control-native"
+
+      - name: Upload shared GTP-U control queue qualification logs
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: gtpu-control-native
+          path: ${{ runner.temp }}/gtpu-control-native
+          if-no-files-found: warn
+
   linux-6-8-classifier-load:
     name: Linux 6.8 committed classifier load
     runs-on: ubuntu-24.04
