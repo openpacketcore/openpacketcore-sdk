@@ -538,6 +538,11 @@ impl State {
             &client.defragment_buffer,
             false,
         )?;
+        client.engine.verify_server_name(
+            server_hello.extensions.as_deref().unwrap_or_default(),
+            &client.defragment_buffer,
+            false,
+        )?;
 
         // Enforce DTLS version
         if server_hello.server_version != ProtocolVersion::DTLS1_2 {
@@ -1441,6 +1446,7 @@ fn handshake_create_client_hello(
             })
             .map_err(|_| Error::RenegotiationAttempt)?;
     }
+    engine.add_server_name(&mut client_hello.extensions, extension_data, true)?;
     client_hello.serialize(extension_data, body);
     Ok(())
 }
@@ -1600,6 +1606,46 @@ mod tests {
     use super::*;
     use crate::PskResolver;
     use crate::dtls12::message::{ServerHello, SrtpProfileId};
+
+    #[test]
+    fn sni_client_checks_independently_encrypted_server_hello_acknowledgement() {
+        use crate::dtls12::engine::server_name::tests::{fixtures, receiver};
+        let cases = fixtures("client");
+        assert_eq!(cases.len(), 10);
+        for case in cases {
+            let engine = receiver(true, case.configured);
+            let mut client = Client::new_with_engine(engine, Instant::now());
+            client.state = State::AwaitServerHello;
+            client
+                .engine
+                .parse_packet(&case.record)
+                .expect("independent protected Hello");
+            let error = State::AwaitServerHello
+                .await_server_hello(&mut client)
+                .expect_err("synthetic record context");
+            if case.label == "duplicate" {
+                assert!(matches!(
+                    error,
+                    InternalError::Transient(crate::error::TransientError::Parse(
+                        nom::error::ErrorKind::LengthValue
+                    ))
+                ));
+                continue;
+            }
+            let expected = if case.accept {
+                crate::SecurityError::ServerSelectedIncompatibleCipherSuite(
+                    Dtls12CipherSuite::ECDHE_ECDSA_AES128_GCM_SHA256,
+                )
+            } else {
+                crate::SecurityError::ServerNameMismatch
+            };
+            assert!(
+                matches!(error, InternalError::Fatal(e) if e == Error::SecurityError(expected)),
+                "{}",
+                case.label
+            );
+        }
+    }
 
     #[test]
     fn rekey_client_checks_independently_encrypted_server_hello_binding() {
