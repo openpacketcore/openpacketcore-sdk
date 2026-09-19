@@ -13,6 +13,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   replacement, shutdown and multihoming failover qualification (Refs #788).
 
 ### Added
+- `opc-proto-ngap`: consolidate N3IWF subset acceptance evidence, public
+  revisions and bounded fuzz qualification; reconcile stale procedure-status
+  text while preserving all unsupported fields and disabled triggers (Refs #787).
 - `opc-diameter-transport`: require native peer-process crash/restart
   qualification in both DTLS roles, with queued-delivery retirement, wrong
   replacement identity rejection and fresh mutual authentication (Refs #794,

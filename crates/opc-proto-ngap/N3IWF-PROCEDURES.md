@@ -127,8 +127,10 @@ Source digests:
 - Routing oracle: `efba0bcfd1afd6f67953bfa8e2f80917656864aad618c32514ccf2c7c3630bcb`.
 
 Pycrate 0.8.1 and pypdf 6.1.0 are pinned by the reference helper. No generated
-SDK schema, dependency or published fixture revision changes. Remaining #787
-scope includes applicable optional field subsets and qualifications needed to
-enable the pending codecs. Procedure state, deployment readiness and live AMF
-interoperability remain outside the codec evidence. This matrix alone does not
-close #787.
+SDK schema, dependency or published fixture revision changes. The original
+#787 conditional-procedure criterion requires these explicit dispositions and
+trigger gates; it does not qualify the 17 pending field codecs. They remain
+unsupported with local triggers disabled. The 23 implemented outcomes and
+aggregate criterion evidence are recorded in
+[N3IWF-ACCEPTANCE.md](N3IWF-ACCEPTANCE.md). Procedure state, deployment readiness
+and live AMF interoperability remain outside the codec evidence.
