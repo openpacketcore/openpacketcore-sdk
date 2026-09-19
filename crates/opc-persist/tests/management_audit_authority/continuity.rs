@@ -546,3 +546,128 @@ async fn coherent_database_rollback_and_missing_keys_are_refused_before_engine_s
         "coherent old database cannot erase the external high-water mark"
     );
 }
+
+#[tokio::test]
+async fn checkpointed_intent_cannot_become_rejected_after_committed_suffix_rollback() {
+    let dir = tempfile::tempdir().unwrap();
+    let external = Arc::new(ExternalCheckpointFixture::default());
+    let database = dir.path().join("authority.sqlite");
+    let snapshots = dir.path().join("snapshots");
+    let store = open(&database, &snapshots, external.clone(), &[1, 2], true)
+        .await
+        .unwrap();
+    store.initialize_cluster().await.unwrap();
+    store
+        .initialize_audit_authority(&privacy(), AuditLedgerLimits::new(6, 2).unwrap())
+        .await
+        .unwrap();
+    let tx = TxId::new();
+    let prepared = store
+        .prepare_audited_commit(
+            &privacy(),
+            &source_event(92, ManagementAuditOutcomeCode::Intent),
+            attested(commit(tx, None, 1, 7), audit(tx)),
+            Duration::from_secs(3),
+        )
+        .unwrap();
+    let intent = applied(
+        store
+            .admit_audit_operation(prepared.handle(), caller())
+            .await,
+    );
+    assert_eq!(intent.state(), AuditOperationState::Intent);
+
+    // Exercise the strongest existing public composition: export, verify and
+    // externally checkpoint this exact Intent before submitting its mutation.
+    let export = store
+        .freeze_audit_export(caller(), 0, Duration::from_secs(60))
+        .await
+        .unwrap();
+    let verified = verify_export(&export, topology().identity(), &[1, 2]);
+    store
+        .acknowledge_audit_export(&verified, caller())
+        .await
+        .unwrap();
+    drop(export);
+    assert_eq!(
+        external.value.lock().unwrap().as_ref().unwrap().sequence(),
+        1
+    );
+    let saved = dir.path().join("checkpointed-intent.sqlite");
+    {
+        let source = rusqlite::Connection::open(&database).unwrap();
+        let mut destination = rusqlite::Connection::open(&saved).unwrap();
+        rusqlite::backup::Backup::new(&source, &mut destination)
+            .unwrap()
+            .run_to_completion(64, Duration::from_millis(1), None)
+            .unwrap();
+    }
+    let committed = applied(
+        store
+            .submit_audited_mutation(&prepared, &intent, caller())
+            .await,
+    );
+    assert_eq!(
+        committed.state(),
+        AuditOperationState::Committed { version: 1 }
+    );
+    assert_eq!(store.load_latest().await.unwrap().unwrap().record.tx_id, tx);
+    assert!(!committed.terminal_recorded());
+    assert_eq!(
+        external.value.lock().unwrap().as_ref().unwrap().sequence(),
+        1
+    );
+    store.shutdown().await.unwrap();
+    drop(store);
+    assert!(
+        !database.with_extension("sqlite-wal").exists(),
+        "all database owners are closed before this synthetic restore"
+    );
+    std::fs::copy(saved, &database).unwrap();
+
+    // The external authority is unchanged and still reserves the earlier
+    // Intent. Restoring its exact prefix is not proof of no configuration effect.
+    let restored = match open(&database, &snapshots, external.clone(), &[1, 2], false).await {
+        Ok(store) => store,
+        Err(ConfigConsensusOpenError::AuditContinuityUnavailable) => return,
+        Err(error) => panic!("unexpected retained-open error: {error:?}"),
+    };
+    restored.initialize_cluster().await.unwrap();
+    if restored.probe_durable_readiness().await.is_err() {
+        restored.shutdown().await.unwrap();
+        return;
+    }
+    assert!(restored.load_latest().await.unwrap().is_none());
+    let recovered = restored
+        .lookup_audit_operation(prepared.handle(), caller())
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(recovered.state(), AuditOperationState::Intent);
+    tokio::time::sleep(Duration::from_millis(3100)).await;
+    let progress = restored.reconcile_audit_obligations(2).await.unwrap();
+    let recovered = restored
+        .lookup_audit_operation(prepared.handle(), caller())
+        .await
+        .unwrap()
+        .unwrap();
+    let export = restored
+        .freeze_audit_export(caller(), 0, Duration::from_secs(60))
+        .await
+        .unwrap();
+    let verified = verify_export(&export, topology().identity(), &[1, 2]);
+    restored
+        .acknowledge_audit_export(&verified, caller())
+        .await
+        .unwrap();
+    let checkpoint_sequence = external.value.lock().unwrap().as_ref().unwrap().sequence();
+    restored.shutdown().await.unwrap();
+
+    assert_ne!(
+        recovered.state(),
+        AuditOperationState::Rejected,
+        "a checkpointed reservation cannot erase a known committed suffix: original_version=1, restored_version=0, terminal_recorded={}, completed={}, external_sequence={checkpoint_sequence}",
+        recovered.terminal_recorded(),
+        progress.completed
+    );
+}
