@@ -990,7 +990,7 @@ pub enum GtpuReassemblyDrop {
 pub struct GtpuReassemblyCounters {
     /// Reassembled G-PDUs decapsulated and handed to the embedding ePDG.
     pub decapsulated: u64,
-    /// Messages passed through for the control plane (non-G-PDU GTP-U).
+    /// Messages passed through for controls or unknown required extensions.
     pub control_plane: u64,
     /// Reassembled messages dropped as malformed, including corrupt PDR
     /// state (dual-map TEID, reserved zero mark).
@@ -1018,7 +1018,8 @@ pub enum GtpuReassemblyOutcome {
         /// default bearer (mark zero), matching the fast path.
         bearer_mark: Option<GtpBearerMark>,
     },
-    /// Not a G-PDU: hand the message to the GTP-U control plane.
+    /// Control message or unknown required extension: hand the complete
+    /// datagram to the shared GTP-U control consumer, without decapsulation.
     ControlPlane,
     /// Fail-closed drop with a bounded typed reason.
     Dropped(GtpuReassemblyDrop),

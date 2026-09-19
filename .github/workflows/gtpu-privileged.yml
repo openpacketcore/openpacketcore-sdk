@@ -139,6 +139,7 @@ jobs:
           grep -Fq 'OPC_GTPU_OFF_SLOT_GENERATION_GUARD_PROVEN' "${datapath_log}"
           grep -Fq 'OPC_GTPU_WRONG_CURRENT_GRAPH_GUARD_PROVEN' "${datapath_log}"
           grep -Fq 'OPC_GTPU_TFT_IPV4_LIVE_PROVEN' "${datapath_log}"
+          grep -Fq 'OPC_GTPU_REQUIRED_EXTENSION_CONTROL_PROVEN:' "${datapath_log}"
           grep -Fq 'OPC_GTPU_TRAFFIC_CONTINUITY_PROOF_PROVEN' "${datapath_log}"
           grep -Fq 'OPC_GTPU_TRAFFIC_CONTINUITY_IPV6_PROOF_PROVEN' "${datapath_log}"
 
@@ -773,6 +774,7 @@ jobs:
           grep -Fq 'OPC_GTPU_OFF_SLOT_GENERATION_GUARD_PROVEN' "${datapath_log}"
           grep -Fq 'OPC_GTPU_WRONG_CURRENT_GRAPH_GUARD_PROVEN' "${datapath_log}"
           grep -Fq 'OPC_GTPU_TFT_IPV4_LIVE_PROVEN' "${datapath_log}"
+          grep -Fq 'OPC_GTPU_REQUIRED_EXTENSION_CONTROL_PROVEN:' "${datapath_log}"
           grep -Fq 'OPC_GTPU_TRAFFIC_CONTINUITY_PROOF_PROVEN' "${datapath_log}"
           grep -Fq 'OPC_GTPU_TRAFFIC_CONTINUITY_IPV6_PROOF_PROVEN' "${datapath_log}"
 
