@@ -4127,10 +4127,13 @@ impl Fleet {
             node.send(&QualificationNodeCommand::Initialize);
         }
         for node in &mut nodes {
-            assert!(matches!(
-                node.receive(),
-                QualificationNodeReply::Initialized
-            ));
+            match node.receive() {
+                QualificationNodeReply::Initialized => {}
+                QualificationNodeReply::Error { code } => {
+                    panic!("qualification initial fleet initialization rejected: {code:?}");
+                }
+                _ => panic!("qualification initial fleet initialization reply mismatch"),
+            }
         }
 
         let mut fleet = Self {
