@@ -1077,3 +1077,102 @@ async fn async_recovery_protected_trust_root_needs_authority_even_without_retain
     fleet.close_all().await;
     result.unwrap_or_else(|panic| std::panic::resume_unwind(panic));
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn protected_async_stale_cold_attempt_cannot_replace_committed_recovery() {
+    exercise_stale_cold_attempt_cannot_replace_recovery(false).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn protected_async_stale_cold_attempt_cannot_replace_active_recovery() {
+    exercise_stale_cold_attempt_cannot_replace_recovery(true).await;
+}
+
+async fn exercise_stale_cold_attempt_cannot_replace_recovery(activate: bool) {
+    let _timing = crate::acquire_consensus_timing_test_permit().await;
+    let mut fleet = Fleet::with_protected_recovery(3);
+    let result = AssertUnwindSafe(async {
+        fleet.start().await;
+        cold(&mut fleet).await;
+        let selection = prepare(&fleet).await;
+        let ready = committed_ready(&fleet, &selection).await;
+        if activate {
+            for target in 0..3 {
+                assert!(matches!(
+                    control(
+                        &fleet,
+                        target,
+                        Action::Activate {
+                            selection: selection.clone(),
+                            ready: ready.clone(),
+                        },
+                    )
+                    .await,
+                    Ok(Reply::Active)
+                ));
+            }
+        }
+        let target = index(&fleet, selection.leader);
+        let store = fleet.store(target);
+        let protocol = &store.inner.persistence_protocol;
+        let stamp = protocol.operation_stamp();
+        // An initialization call may have observed a cold admission before
+        // awaiting peer status. By the time it reaches this exclusive effect
+        // boundary, a separately owned recovery RPC may have committed and/or
+        // activated this exact incarnation. Its stale decision cannot undo
+        // that recovery. The boundary and replies above are all real.
+        assert!(matches!(
+            protocol
+                .quarantine_before(store.operation_deadline_from(tokio::time::Instant::now()))
+                .await,
+            Err(SessionConsensusPeerError::Rejected)
+        ));
+        assert_eq!(protocol.operation_stamp(), stamp);
+        assert_eq!(protocol.is_active(), activate);
+        assert_eq!(
+            protocol
+                .is_reforming(store.operation_deadline_from(tokio::time::Instant::now()))
+                .await
+                .unwrap(),
+            !activate
+        );
+        if !activate {
+            for target in 0..3 {
+                assert!(matches!(
+                    control(
+                        &fleet,
+                        target,
+                        Action::Activate {
+                            selection: selection.clone(),
+                            ready: ready.clone(),
+                        },
+                    )
+                    .await,
+                    Ok(Reply::Active)
+                ));
+            }
+        }
+        recover(&fleet).await;
+        let store = fleet.store(fleet.leader());
+        let request = create_request(store, 139, &provider()).await;
+        let successor = store
+            .acquire(
+                request.lease().key(),
+                OwnerId::new("late-cold-attempt-successor").unwrap(),
+                Duration::from_secs(60),
+            )
+            .await
+            .unwrap();
+        store.delete_fenced(&successor).await.unwrap();
+    })
+    .catch_unwind()
+    .await;
+    let mut closed = Vec::new();
+    for index in 0..fleet.stores.len() {
+        closed.push(fleet.close_result(index).await);
+    }
+    if result.is_ok() {
+        assert!(closed.iter().all(Result::is_ok), "ordinary cleanup");
+    }
+    result.unwrap_or_else(|panic| std::panic::resume_unwind(panic));
+}

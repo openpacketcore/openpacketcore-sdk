@@ -214,6 +214,21 @@ successor operation. Full repository qualification is reported separately in
 [PR #929](https://github.com/openpacketcore/openpacketcore-sdk/pull/929);
 focused tests alone do not qualify the full gates or separate CI profiles.
 
+The separate egress CI profile exposed another admission race: an ordinary
+cold initialization could await peer progress while an independently owned
+recovery RPC activated the same incarnation, then overwrite that admission
+with quarantine. The cold transition now checks its admissible source states
+under the exclusive admission lock; it cannot replace Preparing, Reforming or
+Active state. Two deterministic controls use real committed recovery and fail
+before this check (exit 101, SHA-256
+`c71acde1cac5b5d50cdb3ebea7c74b30ff8ae21fb60de6e0963c4e4b87974efd`).
+They pass with the check, together with the maximum-owner recovery/reopen and
+six authority-reservation controls (nine passed, exit 0, SHA-256
+`4326dd2d9addd88fa2e958dd820b711010f70be7ab9acff7dfae9c7b33f879a2`).
+The reservation fixtures now reopen their retained roots to obtain cold
+admission rather than forcibly replacing an Active admission. No deadline,
+cryptographic check or completed-application requirement changes.
+
 This is a new explicit SDK capability, not an automatic claim about an
 existing product provider. ePDG must provision the complete inventory, wire
 actual member/publication owners to enforce retirement at their effect

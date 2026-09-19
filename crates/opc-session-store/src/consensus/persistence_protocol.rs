@@ -343,6 +343,16 @@ impl PersistenceProtocol {
         let mut state = tokio::time::timeout_at(deadline, self.admission.write())
             .await
             .map_err(|_| SessionConsensusPeerError::Timeout)?;
+        // Peer/status awaits may let an independently owned recovery RPC
+        // prepare or activate this incarnation after initialization observed
+        // it cold. Recheck under the same exclusive fence as replacement;
+        // a stale cold attempt cannot undo the newer admission transition.
+        if !matches!(
+            *state,
+            Admission::Quarantined { .. } | Admission::CatchingUp { .. }
+        ) {
+            return Err(SessionConsensusPeerError::Rejected);
+        }
         self.active.store(false, Ordering::Release);
         *state = Admission::Quarantined { request: None };
         let attempt = self
