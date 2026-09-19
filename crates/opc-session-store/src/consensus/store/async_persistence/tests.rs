@@ -32,6 +32,7 @@ mod closed;
 mod initialization;
 mod majority_authority;
 mod majority_protocol;
+mod protected;
 mod races;
 mod snapshots;
 mod writer;
@@ -167,6 +168,8 @@ struct Fleet {
     topologies: Vec<ValidatedQuorumTopology>,
     peers: Vec<Arc<Peer>>,
     stores: Vec<Option<ConsensusSessionStore>>,
+    protected_owner: Option<Arc<protected::Owner>>,
+    protected_owner_count: u8,
 }
 
 impl Fleet {
@@ -238,6 +241,8 @@ impl Fleet {
             topologies,
             peers,
             stores: vec![None; voters],
+            protected_owner: None,
+            protected_owner_count: 1,
         }
     }
 
@@ -308,7 +313,8 @@ impl Fleet {
                 .native_owner
                 .as_ref()
                 .unwrap()
-                .set_generation_hook_for_test(hook);
+                .set_generation_hook_for_test(hook)
+                .unwrap();
         }
         if let Some(hook) = root_hook {
             backend
@@ -347,6 +353,11 @@ impl Fleet {
         .await?;
         assert_eq!(store.persistence_mode(), mode);
         assert_eq!(store.inner.operation_timeout, OPERATION_BOUND);
+        if self.protected_owner.is_some() {
+            store
+                .configure_protected_async_recovery(self.protected_authority(&store))
+                .unwrap();
+        }
         *self.peers[index].handler.write().await = Some(store.rpc_handler());
         self.stores[index] = Some(store);
         Ok(())
@@ -1104,5 +1115,44 @@ async fn async_persistence_wire_bounds_full_lineage_and_attempt_replacement() {
             .await
             .unwrap(),
         "old confirmation cannot activate the replacement attempt"
+    );
+    let current_cut = ColdQuorumCut {
+        request: second,
+        ..cut
+    };
+    let guard = protocol.engine_before(deadline).await.unwrap();
+    assert!(!guard.permits_append(&AppendEntriesRequest {
+        vote: Vote::new(9, leader),
+        prev_log_id: Some(cut.barrier),
+        entries: vec![],
+        leader_commit: Some(cut.barrier),
+    }));
+    assert!(protocol.resume_cut_before(deadline).await.unwrap() == Some(current_cut));
+    guard.confirm_append(Some(cut.barrier));
+    assert!(
+        !guard.permits_snapshot(&opc_consensus::engine::raft::InstallSnapshotRequest {
+            vote: Vote::new_committed(9, leader),
+            meta: opc_consensus::engine::SnapshotMeta {
+                last_log_id: Some(LogId::new(CommittedLeaderId::new(9, leader), 101)),
+                last_membership: Default::default(),
+                snapshot_id: "newer-leader-control".into(),
+            },
+            offset: 0,
+            data: vec![],
+            done: true,
+        })
+    );
+    drop(guard);
+    assert!(protocol
+        .resume_cut_before(deadline)
+        .await
+        .unwrap()
+        .is_none());
+    assert!(
+        !protocol
+            .activate_before(deadline, |_| async { true })
+            .await
+            .unwrap(),
+        "a newer leader hint requires fresh certification even after old matching confirmation"
     );
 }

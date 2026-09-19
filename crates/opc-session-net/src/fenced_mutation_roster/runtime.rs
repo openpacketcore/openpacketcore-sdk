@@ -6115,6 +6115,8 @@ mod local_authority_registry_tests {
 
 #[cfg(test)]
 mod production_runtime_cut_matrix_tests {
+    mod async_provider_authority_tests;
+
     use super::*;
     use crate::fenced_mutation_roster::canonical::{
         AdmissionProposal, EstablishedMutation, MemberCall, MemberOperationId, Profile,

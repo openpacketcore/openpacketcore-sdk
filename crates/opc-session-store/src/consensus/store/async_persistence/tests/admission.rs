@@ -3,6 +3,188 @@
 use super::races::{until, wait_for_lease_expiry};
 use super::*;
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn async_persistence_retry_retains_certified_catch_up_across_deadlines() {
+    let _timing = crate::acquire_consensus_timing_test_permit().await;
+    let mut fleet = Fleet::new(3);
+    let result = AssertUnwindSafe(async {
+        fleet.start().await;
+        for store in fleet.stores.iter().flatten() {
+            store.drain_async_persistence().await.unwrap();
+        }
+        let leader = fleet.leader();
+        let returning = (leader + 1) % 3;
+        fleet.close(returning).await;
+        *fleet.peers[returning].blocked_append_above.lock().unwrap() =
+            Some((fleet.peers[leader].node, 0));
+        fleet
+            .open(returning, SessionPersistenceMode::Async)
+            .await
+            .unwrap();
+        let cold = fleet.store(returning);
+        assert!(matches!(
+            cold.initialize_cluster().await,
+            Err(ConsensusSessionStoreOpenError::RecoveryRequired)
+        ));
+        assert_eq!(
+            cold.persistence_health().recovery,
+            Some(SessionAsyncRecoveryState::CatchingUp)
+        );
+        let certified = fleet.peers[leader].last_cut.lock().unwrap().unwrap();
+
+        // Accepted catch-up can outlive one caller without acquiring new
+        // authority. Keep the actual engine transport blocked across a second
+        // original deadline, then allow the same certified prefix to arrive.
+        assert!(matches!(
+            cold.initialize_cluster().await,
+            Err(ConsensusSessionStoreOpenError::RecoveryRequired)
+        ));
+        let after_retry = fleet.peers[leader].last_cut.lock().unwrap().unwrap();
+        assert!(
+            after_retry == certified,
+            "retry must retain the certified catch-up attempt"
+        );
+        assert!(!cold.inner.persistence_protocol.is_active());
+        *fleet.peers[returning].blocked_append_above.lock().unwrap() = None;
+        super::majority_protocol::recover(&fleet).await;
+        assert!(fleet.peers[leader].last_cut.lock().unwrap().as_ref() == Some(&certified));
+        let request = create_request(fleet.store(returning), 136, &provider()).await;
+        let outcome = create(fleet.store(returning), &request).await;
+        for store in fleet.stores.iter().flatten() {
+            assert_recorded(store, &request, &outcome).await;
+        }
+    })
+    .catch_unwind()
+    .await;
+    fleet.close_all().await;
+    result.unwrap_or_else(|panic| std::panic::resume_unwind(panic));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn async_persistence_resumed_catch_up_recertifies_a_new_committed_leader() {
+    let _timing = crate::acquire_consensus_timing_test_permit().await;
+    let mut fleet = Fleet::new(3);
+    let result = AssertUnwindSafe(async {
+        fleet.start().await;
+        for store in fleet.stores.iter().flatten() {
+            store.drain_async_persistence().await.unwrap();
+        }
+        let leader = fleet.leader();
+        let returning = (leader + 1) % 3;
+        let successor = (leader + 2) % 3;
+        fleet.close(returning).await;
+        *fleet.peers[returning].blocked_append_above.lock().unwrap() =
+            Some((fleet.peers[leader].node, 0));
+        fleet
+            .open(returning, SessionPersistenceMode::Async)
+            .await
+            .unwrap();
+        let cold = fleet.store(returning);
+        assert!(matches!(
+            cold.initialize_cluster().await,
+            Err(ConsensusSessionStoreOpenError::RecoveryRequired)
+        ));
+        let certified = fleet.peers[leader].last_cut.lock().unwrap().unwrap();
+        let deadline = tokio::time::Instant::now() + OPERATION_BOUND;
+        assert!(
+            cold.inner
+                .persistence_protocol
+                .resume_cut_before(deadline)
+                .await
+                .unwrap()
+                == Some(certified)
+        );
+        let retained_vote = cold.inner.raft.metrics().borrow().vote;
+
+        // A delayed lower-vote packet is rejected without discarding progress.
+        // This negative control supplies no successful vote or append evidence.
+        let delayed = AppendEntriesRequest::<SessionRaftTypeConfig> {
+            vote: Vote::new_committed(certified.vote.leader_id.term - 1, fleet.peers[leader].node),
+            prev_log_id: None,
+            entries: Vec::new(),
+            leader_commit: None,
+        };
+        let response = fleet.peers[returning]
+            .call(wire(
+                cold,
+                fleet.peers[leader].node,
+                SessionPersistenceMode::Async,
+                SessionConsensusRpcFamily::AppendEntries,
+                &delayed,
+            ))
+            .await
+            .unwrap();
+        assert!(response.result.is_err());
+        assert!(
+            cold.inner
+                .persistence_protocol
+                .resume_cut_before(deadline)
+                .await
+                .unwrap()
+                == Some(certified)
+        );
+        for active in [leader, successor] {
+            fleet.store(active).inner.raft.runtime_config().elect(false);
+        }
+        fleet
+            .store(leader)
+            .inner
+            .raft
+            .runtime_config()
+            .heartbeat(false);
+        let next = fleet.store(successor);
+        wait_for_lease_expiry(next).await;
+        next.inner.raft.trigger().elect().await.unwrap();
+        until(
+            || {
+                let vote = next.inner.raft.metrics().borrow().vote;
+                vote.is_committed()
+                    && vote > certified.vote
+                    && vote.leader_id.voted_for() == Some(fleet.peers[successor].node)
+                    && fleet.store(leader).inner.raft.metrics().borrow().vote == vote
+            },
+            "the two live voters elect a real successor",
+        )
+        .await;
+        tokio::time::timeout(Duration::from_secs(10), async {
+            loop {
+                let deadline = tokio::time::Instant::now() + OPERATION_BOUND;
+                if cold
+                    .inner
+                    .persistence_protocol
+                    .resume_cut_before(deadline)
+                    .await
+                    .unwrap()
+                    .is_none()
+                {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("new authenticated leader requests recertification");
+        assert!(!cold.inner.persistence_protocol.is_active());
+        assert!(
+            cold.inner.raft.metrics().borrow().vote == retained_vote,
+            "new leader hint cannot change the cold vote"
+        );
+        *fleet.peers[returning].blocked_append_above.lock().unwrap() = None;
+        super::majority_protocol::recover(&fleet).await;
+        let successor_cut = fleet.peers[successor].last_cut.lock().unwrap().unwrap();
+        assert!(successor_cut.request != certified.request && successor_cut.vote > certified.vote);
+        let request = create_request(cold, 137, &provider()).await;
+        let outcome = create(cold, &request).await;
+        for store in fleet.stores.iter().flatten() {
+            assert_recorded(store, &request, &outcome).await;
+        }
+    })
+    .catch_unwind()
+    .await;
+    fleet.close_all().await;
+    result.unwrap_or_else(|panic| std::panic::resume_unwind(panic));
+}
+
 #[derive(Clone, Copy, Debug)]
 pub(super) enum CutMutation {
     Nonce,

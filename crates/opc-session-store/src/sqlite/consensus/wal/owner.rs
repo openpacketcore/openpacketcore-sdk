@@ -25,7 +25,7 @@ const ASYNC_CLOSED_ROOT_MAGIC: &[u8; 8] = b"OPCNA002";
 const ASYNC_RECOVERY_ROOT_MAGIC: &[u8; 8] = b"OPCNA003";
 const SELECTION_ATTRIBUTE: &str = "user.opc.native-root-v1";
 
-#[cfg(test)]
+#[cfg(any(test, feature = "test-control"))]
 type GenerationHookForTest = Arc<dyn Fn() -> io::Result<()> + Send + Sync>;
 
 #[cfg(test)]
@@ -100,7 +100,7 @@ pub(crate) struct NativeOwner {
     native_name: OsString,
     selected: AtomicBool,
     current: Mutex<Weak<Wal>>,
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-control"))]
     generation_hook: Mutex<Option<GenerationHookForTest>>,
     #[cfg(test)]
     root_hook: Mutex<Option<RootHookForTest>>,
@@ -144,7 +144,7 @@ impl NativeOwner {
             native_name,
             selected: AtomicBool::new(selected),
             current: Mutex::new(Weak::new()),
-            #[cfg(test)]
+            #[cfg(any(test, feature = "test-control"))]
             generation_hook: Mutex::new(None),
             #[cfg(test)]
             root_hook: Mutex::new(None),
@@ -155,10 +155,27 @@ impl NativeOwner {
 
     /// Inject only an I/O boundary before ordinary owner construction. This
     /// never selects a persistence mode or substitutes a test storage owner.
-    #[cfg(test)]
-    pub(crate) fn set_generation_hook_for_test(&self, hook: GenerationHookForTest) {
-        assert!(self.current.lock().unwrap().upgrade().is_none());
-        *self.generation_hook.lock().unwrap() = Some(hook);
+    #[cfg(any(test, feature = "test-control"))]
+    pub(crate) fn set_generation_hook_for_test(
+        &self,
+        hook: GenerationHookForTest,
+    ) -> io::Result<()> {
+        if self
+            .current
+            .lock()
+            .map_err(|_| invalid_data("native test owner lock poisoned"))?
+            .upgrade()
+            .is_some()
+        {
+            return Err(invalid_data(
+                "native test fault must precede owner construction",
+            ));
+        }
+        *self
+            .generation_hook
+            .lock()
+            .map_err(|_| invalid_data("native test fault lock poisoned"))? = Some(hook);
+        Ok(())
     }
 
     #[cfg(test)]
@@ -188,17 +205,28 @@ impl NativeOwner {
                 ..IoControl::default()
             };
         }
-        #[cfg(test)]
-        if let Some(hook) = self.generation_hook.lock().unwrap().clone() {
-            return IoControl {
-                hook: Arc::new(move |point| {
-                    if point == super::Point::BeforeNativeGenerationAppend {
-                        hook()?;
-                    }
-                    Ok(())
-                }),
-                ..IoControl::default()
+        #[cfg(any(test, feature = "test-control"))]
+        {
+            let hook = match self.generation_hook.lock() {
+                Ok(slot) => slot.clone(),
+                Err(_) => {
+                    return IoControl {
+                        hook: Arc::new(|_| Err(invalid_data("native test fault lock poisoned"))),
+                        ..IoControl::default()
+                    };
+                }
             };
+            if let Some(hook) = hook {
+                return IoControl {
+                    hook: Arc::new(move |point| {
+                        if point == super::Point::BeforeNativeGenerationAppend {
+                            hook()?;
+                        }
+                        Ok(())
+                    }),
+                    ..IoControl::default()
+                };
+            }
         }
         IoControl::default()
     }

@@ -269,6 +269,7 @@ impl Wal {
             return Err(invalid_data("asynchronous retained persistence failed"));
         }
         Ok(crate::consensus::recovery_types::Retained {
+            application_digest: native.business.application_digest(),
             vote: native.log.vote,
             last: native.log.last(),
             committed: native.log.committed,

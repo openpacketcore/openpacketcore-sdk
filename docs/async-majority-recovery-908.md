@@ -1,5 +1,9 @@
 # Async majority-restart recovery: SDK #908
 
+The [protected-roster follow-up](async-protected-recovery-908.md) reproduces the
+remaining current-configuration failure after PR #910. It affects newly
+created protected roots; deployment migration is outside that follow-up.
+
 The implementation adds automatic majority/all-cold recovery for new-format
 Async roots once every configured retained owner returns. Normal session
 acknowledgements still do not wait for disk. Recovery durably prepares a new

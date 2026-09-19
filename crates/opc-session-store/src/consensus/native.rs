@@ -683,6 +683,10 @@ impl NativeState {
         self.frontiers.applied
     }
 
+    pub(crate) fn application_digest(&self) -> SessionConsensusEntryDigest {
+        self.frontiers.digest
+    }
+
     pub(crate) fn members(&self) -> &BTreeSet<SessionConsensusNodeId> {
         &self.members
     }

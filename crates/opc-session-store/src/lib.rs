@@ -128,6 +128,9 @@ pub mod ttl;
 #[cfg(test)]
 mod protected_fenced_transition_tests;
 
+#[cfg(test)]
+mod test_process;
+
 pub use backend::{
     next_replication_sequence, record_expiry_preflights, validate_record_expiry_preflights_at,
     validate_record_expiry_preflights_profile, validate_replication_log_page,

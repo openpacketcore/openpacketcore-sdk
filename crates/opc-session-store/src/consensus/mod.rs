@@ -9,6 +9,7 @@ pub(crate) mod native;
 pub mod network;
 mod persistence;
 mod persistence_protocol;
+pub mod protected_recovery;
 pub(crate) mod raft_adapter;
 #[cfg(target_os = "linux")]
 pub(crate) mod recovery_types;

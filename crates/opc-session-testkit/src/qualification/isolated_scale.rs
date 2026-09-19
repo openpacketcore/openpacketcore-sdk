@@ -46,6 +46,8 @@ pub enum QualificationIsolatedScaleWorkload {
     /// Abrupt retained-root recovery under ordinary fixed-quorum authority.
     /// This opt-in fixture has no protected-roster trust root from creation.
     RetainedRecoveryControl,
+    /// Abrupt retained-root recovery with the protected trust root and V2 profile.
+    ProtectedRecoveryControl,
 }
 
 /// Opt-in configuration; omission preserves every legacy Durable node.
@@ -69,9 +71,18 @@ impl QualificationIsolatedScaleConfig {
             QualificationIsolatedScaleWorkload::RetainedRecoveryControl => {
                 "retained-recovery-control;roster=none"
             }
+            QualificationIsolatedScaleWorkload::ProtectedRecoveryControl => {
+                "retained-recovery-control;roster=v2"
+            }
+        };
+        let clock = if self.workload == QualificationIsolatedScaleWorkload::ProtectedRecoveryControl
+        {
+            "system".to_owned()
+        } else {
+            QUALIFICATION_ISOLATED_SCALE_UNIX_SECONDS.to_string()
         };
         let descriptor = format!(
-            "opc-session-isolated-scale/v1;voters=3;mode={};clock={QUALIFICATION_ISOLATED_SCALE_UNIX_SECONDS};{workload}",
+            "opc-session-isolated-scale/v1;voters=3;mode={};clock={clock};{workload}",
             self.persistence.label(),
         );
         format!(
@@ -125,6 +136,8 @@ pub struct QualificationIsolatedScaleReadiness {
     pub captured_generation: Option<u64>,
     /// Most recently selected Async generation, if any.
     pub completed_generation: Option<u64>,
+    /// Applied log frontier in the completed on-disk generation.
+    pub completed_applied_index: Option<u64>,
     /// Passive elapsed Async persistence lag, if applicable.
     pub persistence_lag_millis: Option<u64>,
 }

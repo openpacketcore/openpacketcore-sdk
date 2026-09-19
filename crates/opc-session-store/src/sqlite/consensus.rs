@@ -40148,6 +40148,8 @@ pub(crate) mod historical_snapshot_fixture;
 #[cfg(test)]
 mod tests {
     #[cfg(target_os = "linux")]
+    use crate::test_process::CommandExt as _;
+    #[cfg(target_os = "linux")]
     mod native;
     #[cfg(target_os = "linux")]
     mod sequential_wal;
@@ -45245,7 +45247,7 @@ mod tests {
             let status = std::process::Command::new("/proc/self/exe")
                 .args(["--exact", TEST_NAME, "--nocapture"])
                 .env(CHILD, "1")
-                .status()
+                .test_status()
                 .expect("run isolated compaction sync regression");
             assert!(status.success(), "isolated compaction regression succeeds");
             return;
@@ -45679,7 +45681,7 @@ mod tests {
             let status = std::process::Command::new("/proc/self/exe")
                 .args(["--exact", TEST_NAME])
                 .env(CHILD, "1")
-                .status()
+                .test_status()
                 .expect("run isolated temporary-path failure regression");
             assert!(status.success(), "isolated regression succeeds");
             return;

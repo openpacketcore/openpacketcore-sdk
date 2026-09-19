@@ -163,6 +163,12 @@ pub enum SessionAsyncRecoveryState {
     /// Configured or retained protected authority requires an explicit
     /// retirement contract, including when its activation was volatile.
     ProtectedAuthorityRequired,
+    /// The complete configured provider inventory is retiring old external
+    /// effects. Accepted work remains owned after the caller's deadline.
+    AwaitingProtectedRetirement,
+    /// A provider completion or configured recovery authority failed its
+    /// exact binding/signature checks. It cannot authorize this boundary.
+    ProtectedAuthorityRejected,
     /// No compatible live majority is available; all retained configured
     /// owners must return before a successor range can be prepared.
     AwaitingRecoveryParticipants,

@@ -3,9 +3,13 @@
 
 use super::*;
 
-async fn lost_majority_authority(all_cold: bool, require_recovery: bool) {
+async fn lost_majority_authority(all_cold: bool, require_recovery: bool, protected: bool) {
     let _timing = crate::acquire_consensus_timing_test_permit().await;
-    let mut fleet = Fleet::new(3);
+    let mut fleet = if protected {
+        Fleet::with_protected_recovery(3)
+    } else {
+        Fleet::new(3)
+    };
     let faults = (0..3)
         .map(|_| Arc::new(AtomicBool::new(false)))
         .collect::<Vec<_>>();
@@ -48,6 +52,18 @@ async fn exercise_lost_authority(
     }
     fleet.form().await;
     let leader = fleet.leader();
+    if fleet.protected_owner.is_some() {
+        fleet
+            .store(leader)
+            .activate_fenced_transition_capability()
+            .await
+            .unwrap();
+        fleet
+            .store(leader)
+            .activate_protected_roster_profile_v2()
+            .await
+            .unwrap();
+    }
     let survivor = (leader + 1) % 3;
     let majority = [leader, (leader + 2) % 3];
     let provider = provider();
@@ -354,20 +370,30 @@ async fn exercise_lost_authority(
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn async_lagging_survivor_and_retained_majority_lose_issued_fence_evidence() {
-    lost_majority_authority(false, false).await;
+    lost_majority_authority(false, false, false).await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn async_all_cold_retained_roots_lose_issued_fence_evidence() {
-    lost_majority_authority(true, false).await;
+    lost_majority_authority(true, false, false).await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn async_majority_volatile_tail_recovers_successor_authority() {
-    lost_majority_authority(false, true).await;
+    lost_majority_authority(false, true, false).await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn async_all_cold_volatile_tail_recovers_successor_authority() {
-    lost_majority_authority(true, true).await;
+    lost_majority_authority(true, true, false).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn protected_async_majority_volatile_tail_and_differing_generations_recover() {
+    lost_majority_authority(false, true, true).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn protected_async_all_cold_volatile_tail_and_differing_generations_recover() {
+    lost_majority_authority(true, true, true).await;
 }

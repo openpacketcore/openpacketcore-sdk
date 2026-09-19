@@ -4076,6 +4076,16 @@ impl Fleet {
             projected_roots.push(projected_root);
             database_paths.push(database_path);
         }
+        #[cfg(target_os = "linux")]
+        if isolated_scale.is_some_and(|scale| {
+            scale.workload == opc_session_testkit::qualification::QualificationIsolatedScaleWorkload::ProtectedRecoveryControl
+                && scale.persistence == opc_session_testkit::qualification::QualificationIsolatedPersistence::Async
+        }) {
+            let identity = stateless_consumer_voter_topology_for_configuration(&members, "v1", 1)
+                .consensus_identity().expect("fixed protected identity");
+            opc_session_testkit::qualification::protected_recovery::Journal::provision(root, identity)
+                .expect("provision external owner before any voter starts");
+        }
         let candidate_evidence_inputs = CandidateEvidenceInputs {
             source_revision,
             source_tree_status,
@@ -4117,10 +4127,13 @@ impl Fleet {
             node.send(&QualificationNodeCommand::Initialize);
         }
         for node in &mut nodes {
-            assert!(matches!(
-                node.receive(),
-                QualificationNodeReply::Initialized
-            ));
+            match node.receive() {
+                QualificationNodeReply::Initialized => {}
+                QualificationNodeReply::Error { code } => {
+                    panic!("qualification initial fleet initialization rejected: {code:?}");
+                }
+                _ => panic!("qualification initial fleet initialization reply mismatch"),
+            }
         }
 
         let mut fleet = Self {
@@ -14919,6 +14932,19 @@ impl QualificationProtectedRosterRun {
         voter_index: usize,
         scope: SessionConsumerScope,
     ) -> Self {
+        let client = qualification_fenced_mutation_roster_client(protected.clone(), scope);
+        Self::prepare_with_client(member_count, general, protected, voter_index, scope, client)
+            .await
+    }
+
+    async fn prepare_with_client(
+        member_count: usize,
+        general: &QualificationConsumerClient,
+        protected: PersistentSessionConsumerClient,
+        voter_index: usize,
+        scope: SessionConsumerScope,
+        client: FencedMutationRosterClient,
+    ) -> Self {
         let key = SessionKey {
             tenant: TenantId::new("session-ha-qualification").expect("bounded roster tenant"),
             nf_kind: NetworkFunctionKind::smf(),
@@ -14970,7 +14996,6 @@ impl QualificationProtectedRosterRun {
             ))
         ));
 
-        let client = qualification_fenced_mutation_roster_client(protected.clone(), scope);
         let members = (0_u8..6)
             .map(|ordinal| {
                 FencedMutationRosterMember::new(

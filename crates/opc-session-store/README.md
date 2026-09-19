@@ -439,6 +439,10 @@ Install `rpc_handler()` before calling `initialize_cluster()` on every startup.
 A cold voter first uses a compatible surviving live majority when available.
 That path obtains a genuinely new committed entry, admits repair only from
 its certified leader, and requires matching replication and local application.
+An initialization timeout preserves an accepted catch-up certificate and its
+progress. Retries keep the original per-call deadline. A newer authenticated
+leader requires a fresh committed certificate; its packets cannot authorize
+recovery under the old certificate. Replacement drains accepted old effects.
 When that majority is unavailable, new-format roots can recover automatically
 once **every configured retained voter** returns, including the surviving
 process. Three and five fixed voters are supported; membership, storage roots,
@@ -480,7 +484,8 @@ Each call keeps its original operation deadline. `RecoveryRequired` can mean
 an incomplete bounded attempt: retry initialization while consulting passive
 `persistence_health().recovery`. Fixed reasons distinguish preparation,
 quorum reformation, unavailable participants, legacy authority, missing retained
-membership, incompatible committed history and exhausted authority. Accepted
+membership, incompatible committed history, exhausted authority, pending
+protected retirement and rejected protected authority. Accepted
 disk/engine work retains its owner after cancellation; an interrupted round
 prepares a strictly newer range where necessary. No timeout is raised to make
 recovery succeed. `Active` permits consensus participation, not traffic by
@@ -505,13 +510,32 @@ This change does not recover already-fenced legacy installations.
 Automatic unanimous recovery requires retained reservations and an applied
 exact fixed membership on every participant. It cannot replace a missing or
 corrupt root, reconstruct formation when every selected generation predates
-membership, select between conflicting committed histories, or retire protected
-roster authority. A configured protected-roster trust root disables this path,
-even if its volatile activation was lost. Those conditions require a separately
-specified repair/retirement authority; waiting or resetting storage supplies
-none. A permanently fenced installation is an availability failure.
+membership, or select between conflicting committed histories. Those conditions
+require separate repair authority; waiting or resetting storage supplies none.
+A permanently fenced installation is an availability failure.
 
-Async transport now uses `OPC-ASYNC-2`; older Async peers reject the protocol,
+Protected Async recovery uses
+`consensus::protected_recovery::ProtectedAsyncRecovery`. Provision the same
+root-signed, complete `ProtectedRecoveryInventory` on every voter and install
+it once with `configure_protected_async_recovery`. Each listed
+`ProtectedAsyncRecoveryOwner` must durably retire the entire old fence range,
+including unknown admissions and publications, across all of its processes and
+effect boundaries. It must join or irrevocably fence accepted work and retain
+responsibility for orphan effects before signing the SDK's exact challenge.
+Every owner's verified receipt is committed with the recovery boundary and
+checked again on all returned roots. Retained admissions and evidence remain
+intact; higher-fence callers reconcile them through the ordinary protected API.
+
+This capability adds recovery-time synchronization. Normal Async session
+acknowledgements still do not wait for disk. A provider's existing per-member
+journal alone cannot implement whole-scope retirement. Missing configured
+authority reports `ProtectedAuthorityRequired`; unfinished providers report
+`AwaitingProtectedRetirement`; invalid proofs report
+`ProtectedAuthorityRejected`. The same initialization deadline and retry apply.
+See the [protected recovery contract and evidence](../../docs/async-protected-recovery-908.md)
+for the required provider ownership guarantees and acknowledged-data-loss limits.
+
+Async transport now uses `OPC-ASYNC-3`; older Async peers reject the protocol,
 and current peers reject older Async frames. Durable wire encoding is unchanged.
 Upgrade the whole Async membership and consumers together; rolling mixed-version
 recovery is unsupported. An already-fenced legacy installation cannot gain its

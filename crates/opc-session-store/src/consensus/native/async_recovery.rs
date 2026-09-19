@@ -10,8 +10,10 @@ pub(super) fn check_log_reservation(
     reservation: Reservation,
 ) -> io::Result<()> {
     if let EntryPayload::Normal(command) = &entry.payload {
-        if let SessionMutationIntent::AsyncRecoveryBoundary { era, plan } = command.intent {
-            if era > reservation.era() || (era == reservation.era() && plan != reservation.plan()) {
+        if let SessionMutationIntent::AsyncRecoveryBoundary { era, plan, .. } = &command.intent {
+            if *era > reservation.era()
+                || (*era == reservation.era() && *plan != reservation.plan())
+            {
                 return Err(invalid("native asynchronous log reservation differs"));
             }
         }
@@ -27,6 +29,8 @@ pub(crate) struct Boundary {
     pub(crate) applied: LogId<SessionConsensusNodeId>,
     watch_before: u64,
     history: HistoryRetirement,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) protected: Option<Box<crate::consensus::protected_recovery::ProtectedRecoveryProof>>,
 }
 
 // Cumulative discontinuities keep the ordinary lifecycle conservation law
@@ -53,9 +57,15 @@ impl Boundary {
             applied,
             watch_before: 0,
             history: HistoryRetirement::default(),
+            protected: None,
         }
     }
     pub(crate) fn validate(&self) -> io::Result<()> {
+        if let Some(proof) = &self.protected {
+            proof
+                .verify()
+                .map_err(|_| invalid("native protected recovery proof invalid"))?;
+        }
         let reservation = Reservation::from_era(self.era)?;
         if self.era < 2
             || self.plan == [0; 32]
@@ -75,6 +85,23 @@ impl Boundary {
         }
         reservation.check(self.applied.index)?;
         reservation.check(self.applied.leader_id.term)
+    }
+
+    pub(crate) fn validate_protected_scope(
+        &self,
+        identity: SessionConsensusIdentity,
+        members: &BTreeSet<SessionConsensusNodeId>,
+        root: Option<&crate::fenced_mutation_roster::RosterAttestationTrustRootV1>,
+    ) -> io::Result<()> {
+        match (root, &self.protected) {
+            (None, None) => Ok(()),
+            (Some(root), Some(proof)) => proof
+                .matches(identity, members, root, self.era, self.plan)
+                .map_err(|_| invalid("native protected recovery scope differs")),
+            _ => Err(invalid(
+                "native protected recovery authority absent or unexpected",
+            )),
+        }
     }
 
     fn floor(&self) -> u64 {
@@ -168,6 +195,54 @@ impl NativeKeyState {
 }
 
 impl NativeState {
+    pub(crate) fn protected_recovery_matches(
+        &self,
+        selection: &crate::consensus::recovery_types::Selection,
+    ) -> bool {
+        match (
+            &self.roster_root,
+            self.frontiers
+                .async_recovery
+                .as_ref()
+                .and_then(|boundary| boundary.protected.as_ref()),
+        ) {
+            (None, None) => selection
+                .round
+                .participants
+                .values()
+                .all(|status| status.protected_inventory.is_none()),
+            (Some(_), Some(proof)) => {
+                proof.matches_selection(selection)
+                    && selection.round.participants.values().all(|status| {
+                        status
+                            .protected_inventory
+                            .is_some_and(|inventory| proof.inventory() == Ok(inventory))
+                    })
+            }
+            _ => false,
+        }
+    }
+
+    pub(crate) fn validate_protected_recovery_inventory(
+        &self,
+        inventory: [u8; 32],
+    ) -> io::Result<()> {
+        if self.roster_root.is_none()
+            || self
+                .frontiers
+                .async_recovery
+                .as_ref()
+                .is_some_and(|boundary| {
+                    boundary
+                        .protected
+                        .as_ref()
+                        .is_none_or(|proof| proof.inventory() != Ok(inventory))
+                })
+        {
+            return Err(invalid("native protected recovery inventory differs"));
+        }
+        Ok(())
+    }
     pub(crate) fn async_recovery_supported(&self) -> bool {
         self.roster_root.is_none()
             && !self.frontiers.roster_v1_namespace
@@ -197,29 +272,47 @@ impl NativeDelta<'_> {
         applied: LogId<SessionConsensusNodeId>,
     ) -> io::Result<SessionConsensusResponse> {
         crate::sqlite::consensus::validate_command_for_log(command, self.base.identity)?;
-        let SessionMutationIntent::AsyncRecoveryBoundary { era, plan } = command.intent else {
+        let SessionMutationIntent::AsyncRecoveryBoundary {
+            era,
+            plan,
+            protected,
+        } = &command.intent
+        else {
             return Err(invalid("native asynchronous recovery command differs"));
         };
-        let mut boundary = Boundary::from_entry(era, plan, applied);
+        let mut boundary = Boundary::from_entry(*era, *plan, applied);
+        boundary.protected = protected.clone();
         boundary.validate()?;
+        boundary.validate_protected_scope(
+            self.base.identity,
+            &self.base.members,
+            self.base.roster_root.as_deref(),
+        )?;
         if self
             .frontiers
             .async_recovery
             .as_ref()
-            .is_some_and(|prior| prior.era >= era)
+            .is_some_and(|prior| prior.era >= *era)
         {
             return Err(invalid("native asynchronous recovery era did not advance"));
         }
         // A recovery capability must account for every activated authority
         // vocabulary before it prepares a round. Do not partially retire an
         // unsupported protected history or roster.
-        if self.base.roster_root.is_some()
-            || self.frontiers.roster_v1_namespace
-            || self.frontiers.roster_v2_activation.is_some()
-            || !self.roster.rows.is_empty()
-            || !self.roster.partitions.is_empty()
+        if self.base.roster_root.is_none()
+            && (self.frontiers.roster_v1_namespace
+                || self.frontiers.roster_v2_activation.is_some()
+                || !self.roster.rows.is_empty()
+                || !self.roster.partitions.is_empty())
         {
             return Err(invalid("native asynchronous recovery capability differs"));
+        }
+        if let Some(proof) = &boundary.protected {
+            self.base.validate_protected_recovery_inventory(
+                proof
+                    .inventory()
+                    .map_err(|_| invalid("native protected recovery inventory invalid"))?,
+            )?;
         }
         let floor = boundary.floor();
         if self.frontiers.next_fence > floor

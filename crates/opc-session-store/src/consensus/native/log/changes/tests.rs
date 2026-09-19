@@ -116,7 +116,11 @@ fn async_authority_reservation_rejects_foreign_uncommitted_boundary() {
             identity: identity(),
             request_id: crate::consensus::SessionConsensusRequestId::new(),
             logical_time: Timestamp::now_utc(),
-            intent: SessionMutationIntent::AsyncRecoveryBoundary { era: 2, plan },
+            intent: SessionMutationIntent::AsyncRecoveryBoundary {
+                protected: None,
+                era: 2,
+                plan,
+            },
         }),
     };
     let before = values(&storage.log);

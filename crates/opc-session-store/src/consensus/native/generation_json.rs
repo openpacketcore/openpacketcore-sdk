@@ -15,24 +15,24 @@ struct Shape {
     payload: usize,
 }
 
-#[derive(Default)]
 struct Body {
     fields: usize,
     containers: usize,
     payload: usize,
+    limit: usize,
 }
 
 impl Body {
     fn field<E: de::Error>(&mut self) -> Result<(), E> {
         self.fields += 1;
-        if self.fields > REQUEST_FIELDS {
+        if self.fields > self.limit {
             return Err(E::custom("native V2 body metadata exceeds closed shape"));
         }
         Ok(())
     }
     fn container<E: de::Error>(&mut self) -> Result<(), E> {
         self.containers += 1;
-        if self.containers > REQUEST_FIELDS {
+        if self.containers > self.limit {
             return Err(E::custom("native V2 body containers exceed closed shape"));
         }
         Ok(())
@@ -118,7 +118,7 @@ impl<'de> Visitor<'de> for Scan<'_> {
             if matches!(value, Atom::Other) {
                 all_bytes = false;
                 other += 1;
-                if other > REQUEST_FIELDS {
+                if other > self.0.limit {
                     return Err(de::Error::custom(
                         "native V2 complex array exceeds closed shape",
                     ));
@@ -140,13 +140,18 @@ impl<'de> Visitor<'de> for Scan<'_> {
     }
 }
 
-struct Request(Shape);
-impl<'de> Deserialize<'de> for Request {
+struct Request<const BLOCKS: usize = 1>(Shape);
+impl<'de, const BLOCKS: usize> Deserialize<'de> for Request<BLOCKS> {
     fn deserialize<D: de::Deserializer<'de>>(decoder: D) -> Result<Self, D::Error> {
-        let mut body = Body::default();
+        let mut body = Body {
+            fields: 0,
+            containers: 0,
+            payload: 0,
+            limit: REQUEST_FIELDS * BLOCKS,
+        };
         Scan(&mut body).deserialize(decoder)?;
         Ok(Self(Shape {
-            requests: 1,
+            requests: BLOCKS,
             payload: body.payload,
         }))
     }
@@ -243,7 +248,10 @@ impl InnerIntent {
 enum Intent {
     AdvanceLogicalTime,
     MaintainFencedTransitionV2History(Request),
-    AsyncRecoveryBoundary(Request),
+    // Only this internal command includes a complete bounded owner inventory
+    // and one signature per owner. Charge its independently bounded shape;
+    // ordinary request and batch limits retain their original single block.
+    AsyncRecoveryBoundary(Request<{ scratch::ASYNC_RECOVERY_METADATA_REQUESTS }>),
     CompareAndSet(Request),
     DeleteFenced(Request),
     RefreshTtl(Request),
@@ -265,9 +273,8 @@ impl Intent {
     fn shape(self) -> Shape {
         match self {
             Self::AdvanceLogicalTime => Shape::default(),
-            Self::MaintainFencedTransitionV2History(value) | Self::AsyncRecoveryBoundary(value) => {
-                value.0
-            }
+            Self::MaintainFencedTransitionV2History(value) => value.0,
+            Self::AsyncRecoveryBoundary(value) => value.0,
             Self::CompareAndSet(value)
             | Self::DeleteFenced(value)
             | Self::RefreshTtl(value)

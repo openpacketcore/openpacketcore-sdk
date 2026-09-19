@@ -43,6 +43,9 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
 mod isolated_scale;
+#[cfg(target_os = "linux")]
+#[doc(hidden)]
+pub mod protected_recovery;
 pub use isolated_scale::{
     QualificationIsolatedPersistence, QualificationIsolatedScaleConfig,
     QualificationIsolatedScaleReadiness, QualificationIsolatedScaleWorkload,

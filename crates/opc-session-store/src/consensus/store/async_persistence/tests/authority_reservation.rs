@@ -5,17 +5,6 @@ use crate::sqlite::consensus::wal::async_authority::Reservation;
 use crate::sqlite::consensus::wal::Point;
 use std::path::PathBuf;
 
-async fn freeze(store: &ConsensusSessionStore) {
-    store.inner.raft.runtime_config().elect(false);
-    store.inner.raft.runtime_config().heartbeat(false);
-    store
-        .inner
-        .persistence_protocol
-        .quarantine_before(store.operation_deadline_from(tokio::time::Instant::now()))
-        .await
-        .unwrap();
-}
-
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn async_authority_promise_is_durable_idempotent_and_monotonic() {
     let _timing = crate::acquire_consensus_timing_test_permit().await;
@@ -23,7 +12,11 @@ async fn async_authority_promise_is_durable_idempotent_and_monotonic() {
     let result = AssertUnwindSafe(async {
         fleet.start().await;
         let index = (fleet.leader() + 1) % 3;
-        freeze(fleet.store(index)).await;
+        fleet.close(index).await;
+        fleet
+            .open(index, SessionPersistenceMode::Async)
+            .await
+            .unwrap();
         let wal = fleet.store(index).inner.private_wal.as_ref().unwrap();
         let (root, before) = wal.async_authority().unwrap().unwrap();
         assert!(before == Reservation::initial());
@@ -79,18 +72,13 @@ async fn async_authority_interrupted_promise_never_grants_old_owner_new_range() 
         let armed = Arc::new(AtomicBool::new(false));
         let result = AssertUnwindSafe(async {
             let fault = Arc::clone(&armed);
-            fleet
-                .open_with_io_hook(
-                    0,
-                    Arc::new(move |at| {
-                        if at == point && fault.load(Ordering::Acquire) {
-                            return Err(std::io::Error::from_raw_os_error(libc::EIO));
-                        }
-                        Ok(())
-                    }),
-                )
-                .await
-                .unwrap();
+            let hook: crate::sqlite::consensus::wal::owner::IoHookForTest = Arc::new(move |at| {
+                if at == point && fault.load(Ordering::Acquire) {
+                    return Err(std::io::Error::from_raw_os_error(libc::EIO));
+                }
+                Ok(())
+            });
+            fleet.open_with_io_hook(0, Arc::clone(&hook)).await.unwrap();
             for index in 1..3 {
                 fleet
                     .open(index, SessionPersistenceMode::Async)
@@ -98,7 +86,8 @@ async fn async_authority_interrupted_promise_never_grants_old_owner_new_range() 
                     .unwrap();
             }
             fleet.form().await;
-            freeze(fleet.store(0)).await;
+            fleet.close(0).await;
+            fleet.open_with_io_hook(0, hook).await.unwrap();
             fleet.store(0).drain_async_persistence().await.unwrap();
             let before = Reservation::initial();
             let after = Reservation::recovery(2, [0xD3; 32]).unwrap();
