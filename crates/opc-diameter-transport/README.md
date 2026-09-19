@@ -43,6 +43,13 @@ protected records with any wire version other than DTLS 1.2. See the exact
 resource, ordering and qualification contract in
 [ordered application streams](../../docs/rfc6083-stream-transport.md).
 
+The required Linux SCTP job executes the generic, CRL, Diameter, stream and
+path-failure tests in a private SCTP-AUTH namespace. Actual kernel drop
+counters distinguish a protected active-path failure from an unfaulted
+exchange. Fully blocked paths must retire both roles before a fresh
+association is admitted. See the exact fault model, reproduction and limits
+in [native path qualification](../../docs/rfc6083-native-path-qualification.md).
+
 ## Implemented boundary
 
 - Direct TLS/TCP completes mutually authenticated TLS 1.3 before any Diameter

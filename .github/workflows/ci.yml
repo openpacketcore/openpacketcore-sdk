@@ -464,7 +464,7 @@ jobs:
   rust-sctp-privileged:
     name: Rust SCTP cold multihoming
     runs-on: ubuntu-latest
-    timeout-minutes: 15
+    timeout-minutes: 20
     env:
       CARGO_INCREMENTAL: "0"
       CARGO_PROFILE_DEV_DEBUG: "0"
@@ -486,7 +486,7 @@ jobs:
         run: |
           set -euo pipefail
           sudo apt-get update
-          sudo apt-get install -y iproute2 kmod
+          sudo apt-get install -y iproute2 kmod nftables
           if ! sudo modprobe sctp; then
             sudo apt-get install -y "linux-modules-extra-$(uname -r)"
             sudo modprobe sctp
@@ -565,6 +565,33 @@ jobs:
             ' 2>&1 | tee "${proof_log}"
           grep -Fq 'cold SCTP multihoming connector=connected' "${proof_log}"
           grep -Fq 'test result: ok. 1 passed; 0 failed;' "${proof_log}"
+
+      - name: Require protected SCTP authentication, streams and path failure proof
+        run: |
+          set -euo pipefail
+          cargo test --locked -p opc-diameter-transport --all-features --lib \
+            --no-run --message-format=json > "${RUNNER_TEMP}/rfc6083-build.jsonl"
+          rfc6083_binary="$(python3 - "${RUNNER_TEMP}/rfc6083-build.jsonl" <<'PY'
+          import json, sys
+          records = [json.loads(line) for line in open(sys.argv[1])]
+          binaries = [r['executable'] for r in records
+                      if r.get('reason') == 'compiler-artifact'
+                      and r.get('executable')
+                      and r['target']['name'] == 'opc_diameter_transport']
+          assert len(binaries) == 1, 'expected exactly one transport test binary'
+          print(binaries[0])
+          PY
+          )"
+          sudo unshare -n -- bash ci/qualify-rfc6083-native.sh \
+            "$rfc6083_binary" "${RUNNER_TEMP}/rfc6083-native"
+
+      - name: Upload protected SCTP qualification logs
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: rfc6083-native
+          path: ${{ runner.temp }}/rfc6083-native
+          if-no-files-found: warn
 
       - name: Require private namespace cleanup
         if: always()

@@ -13,6 +13,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   replacement, shutdown and multihoming failover qualification (Refs #788).
 
 ### Added
+- `opc-diameter-transport`: require seven native RFC 6083 cases in Linux SCTP
+  CI, including authenticated multistream delivery through actual active
+  destination loss, exact retained protection, bounded all-path retirement,
+  and fresh association replacement in both DTLS roles (Refs #794, #784).
 - `opc-diameter-transport`: add opt-in reliable ordered application streams to
   generic RFC 6083 transport. Preserve stream metadata through exact decrypted
   record identities, bound pending correlations and plaintext queues, retain
