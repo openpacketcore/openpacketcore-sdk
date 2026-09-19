@@ -282,10 +282,12 @@ impl Prepared {
                 .recovery(successor, Generation::new(1))
                 .unwrap();
             if lost_q1 {
-                assert!(
-                    matches!(current.recover(&input).await,
-                        Err(opc_session_net::FencedMutationRosterClientError::AdmissionRecordMissing)),
-                    "missing Q1 cannot be invented from provider retirement"
+                // The authoritative lookup deliberately keeps missing Q1
+                // ambiguous: its absence is not proof that no effect applied.
+                assert_eq!(
+                    current.recover(&input).await.err(),
+                    Some(opc_session_net::FencedMutationRosterClientError::RecoveryRequired),
+                    "lost Q1 requires recovery without inventing its admission or outcome"
                 );
                 for member in &mut self.ready[1..] {
                     assert!(matches!(
