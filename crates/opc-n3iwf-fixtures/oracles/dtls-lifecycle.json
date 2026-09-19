@@ -1,0 +1,635 @@
+{
+  "schema_version": 1,
+  "scope": "rfc6083-stream-zero-lifecycle",
+  "protected_ppid": 66,
+  "ordered_stream": 0,
+  "policy": "Existing SDK bounded stream-zero profile; size/age/duplicate policy is not a standards mandate",
+  "contract": {
+    "path": "docs/rfc6083-generic-transport.md",
+    "before": "## Evidence and reproduction",
+    "sha256": "308f661f2f868b693f476200b95e0cfe06b59531cbc3b8a6c2838a5acc6d6f5f"
+  },
+  "certificate_reference": {
+    "path": "crates/opc-diameter-transport/tests/fixtures/rfc6083/certificates.tsv",
+    "sha256": "f8dff321905c79f06c752b477bc56fc7f2d7a5e67acda40cc2a774bd708f416b"
+  },
+  "initial_auth_epoch": {
+    "initial_key_id": 0,
+    "exporter_key_id": 1,
+    "exporter_bytes": 64,
+    "change_cipher_spec_key_id": 0,
+    "finished_key_id": 1,
+    "finished_dtls_epoch": 1
+  },
+  "limitations": [
+    "in-memory SCTP with real mutual DTLS",
+    "separate Linux qualification",
+    "no multistream or in-place rekey",
+    "no CRL/OCSP or full 3GPP PKI",
+    "no restart/multihoming guarantee"
+  ],
+  "cases": [
+    {
+      "name": "certificate-acceptor-valid",
+      "family": "certificate",
+      "side": "acceptor",
+      "argument": "valid",
+      "expected": "admit"
+    },
+    {
+      "name": "certificate-acceptor-wrong-identity",
+      "family": "certificate",
+      "side": "acceptor",
+      "argument": "wrong-identity",
+      "expected": "identity"
+    },
+    {
+      "name": "certificate-acceptor-missing-identity",
+      "family": "certificate",
+      "side": "acceptor",
+      "argument": "missing-identity",
+      "expected": "authentication"
+    },
+    {
+      "name": "certificate-acceptor-expired",
+      "family": "certificate",
+      "side": "acceptor",
+      "argument": "expired",
+      "expected": "authentication"
+    },
+    {
+      "name": "certificate-acceptor-not-yet-valid",
+      "family": "certificate",
+      "side": "acceptor",
+      "argument": "not-yet-valid",
+      "expected": "authentication"
+    },
+    {
+      "name": "certificate-acceptor-wrong-role",
+      "family": "certificate",
+      "side": "acceptor",
+      "argument": "wrong-role",
+      "expected": "authentication"
+    },
+    {
+      "name": "certificate-acceptor-untrusted",
+      "family": "certificate",
+      "side": "acceptor",
+      "argument": "untrusted",
+      "expected": "authentication"
+    },
+    {
+      "name": "certificate-acceptor-corrupt-signature",
+      "family": "certificate",
+      "side": "acceptor",
+      "argument": "corrupt-signature",
+      "expected": "authentication"
+    },
+    {
+      "name": "records-connector-0",
+      "family": "records",
+      "side": "connector",
+      "argument": "0",
+      "expected": "delivered"
+    },
+    {
+      "name": "records-connector-1",
+      "family": "records",
+      "side": "connector",
+      "argument": "1",
+      "expected": "delivered"
+    },
+    {
+      "name": "records-connector-19",
+      "family": "records",
+      "side": "connector",
+      "argument": "19",
+      "expected": "delivered"
+    },
+    {
+      "name": "records-connector-16347",
+      "family": "records",
+      "side": "connector",
+      "argument": "16347",
+      "expected": "delivered"
+    },
+    {
+      "name": "limits-connector-send",
+      "family": "limits",
+      "side": "connector",
+      "argument": "send",
+      "expected": "rfc6083_message_limit"
+    },
+    {
+      "name": "deadline-connector-send",
+      "family": "deadline",
+      "side": "connector",
+      "argument": "send",
+      "expected": "rfc6083_deadline_exceeded"
+    },
+    {
+      "name": "cancellation-connector-unpolled-send",
+      "family": "cancellation",
+      "side": "connector",
+      "argument": "unpolled-send",
+      "expected": "active"
+    },
+    {
+      "name": "cancellation-connector-polled-send",
+      "family": "cancellation",
+      "side": "connector",
+      "argument": "polled-send",
+      "expected": "rfc6083_connection_closed"
+    },
+    {
+      "name": "limits-connector-receive",
+      "family": "limits",
+      "side": "connector",
+      "argument": "receive",
+      "expected": "rfc6083_message_limit"
+    },
+    {
+      "name": "deadline-connector-receive",
+      "family": "deadline",
+      "side": "connector",
+      "argument": "receive",
+      "expected": "rfc6083_deadline_exceeded"
+    },
+    {
+      "name": "cancellation-connector-unpolled-receive",
+      "family": "cancellation",
+      "side": "connector",
+      "argument": "unpolled-receive",
+      "expected": "active"
+    },
+    {
+      "name": "cancellation-connector-polled-receive",
+      "family": "cancellation",
+      "side": "connector",
+      "argument": "polled-receive",
+      "expected": "rfc6083_connection_closed"
+    },
+    {
+      "name": "cancellation-connector-polled-close",
+      "family": "cancellation",
+      "side": "connector",
+      "argument": "polled-close",
+      "expected": "rfc6083_connection_closed"
+    },
+    {
+      "name": "retirement-connector-replacement",
+      "family": "retirement",
+      "side": "connector",
+      "argument": "replacement",
+      "expected": "rfc6083_retired"
+    },
+    {
+      "name": "retirement-connector-trust",
+      "family": "retirement",
+      "side": "connector",
+      "argument": "trust",
+      "expected": "rfc6083_retired"
+    },
+    {
+      "name": "retirement-connector-withdrawal",
+      "family": "retirement",
+      "side": "connector",
+      "argument": "withdrawal",
+      "expected": "rfc6083_retired"
+    },
+    {
+      "name": "carrier-connector-abort",
+      "family": "carrier",
+      "side": "connector",
+      "argument": "abort",
+      "expected": "rfc6083_connection_closed"
+    },
+    {
+      "name": "carrier-connector-queued-abort",
+      "family": "carrier",
+      "side": "connector",
+      "argument": "queued-abort",
+      "expected": "rfc6083_connection_closed"
+    },
+    {
+      "name": "close-connector-reciprocal",
+      "family": "close",
+      "side": "connector",
+      "argument": "reciprocal",
+      "expected": "rfc6083_peer_closed"
+    },
+    {
+      "name": "close-connector-silent",
+      "family": "close",
+      "side": "connector",
+      "argument": "silent",
+      "expected": "rfc6083_deadline_exceeded"
+    },
+    {
+      "name": "close-connector-pending",
+      "family": "close",
+      "side": "connector",
+      "argument": "pending",
+      "expected": "rfc6083_transport_failed"
+    },
+    {
+      "name": "metadata-connector-before:stream-one",
+      "family": "metadata",
+      "side": "connector",
+      "argument": "before:stream-one",
+      "expected": "rfc6083_transport_failed"
+    },
+    {
+      "name": "metadata-connector-before:stream-max",
+      "family": "metadata",
+      "side": "connector",
+      "argument": "before:stream-max",
+      "expected": "rfc6083_transport_failed"
+    },
+    {
+      "name": "metadata-connector-before:unordered",
+      "family": "metadata",
+      "side": "connector",
+      "argument": "before:unordered",
+      "expected": "rfc6083_transport_failed"
+    },
+    {
+      "name": "metadata-connector-before:payload-truncated",
+      "family": "metadata",
+      "side": "connector",
+      "argument": "before:payload-truncated",
+      "expected": "rfc6083_transport_failed"
+    },
+    {
+      "name": "metadata-connector-before:control-truncated",
+      "family": "metadata",
+      "side": "connector",
+      "argument": "before:control-truncated",
+      "expected": "rfc6083_transport_failed"
+    },
+    {
+      "name": "metadata-connector-before:notification",
+      "family": "metadata",
+      "side": "connector",
+      "argument": "before:notification",
+      "expected": "rfc6083_transport_failed"
+    },
+    {
+      "name": "cleartext-connector-before:0",
+      "family": "cleartext",
+      "side": "connector",
+      "argument": "before:0",
+      "expected": "rfc6083_cleartext_rejected"
+    },
+    {
+      "name": "cleartext-connector-before:47",
+      "family": "cleartext",
+      "side": "connector",
+      "argument": "before:47",
+      "expected": "rfc6083_cleartext_rejected"
+    },
+    {
+      "name": "cleartext-connector-before:60",
+      "family": "cleartext",
+      "side": "connector",
+      "argument": "before:60",
+      "expected": "rfc6083_cleartext_rejected"
+    },
+    {
+      "name": "metadata-connector-after:stream-one",
+      "family": "metadata",
+      "side": "connector",
+      "argument": "after:stream-one",
+      "expected": "rfc6083_transport_failed"
+    },
+    {
+      "name": "metadata-connector-after:stream-max",
+      "family": "metadata",
+      "side": "connector",
+      "argument": "after:stream-max",
+      "expected": "rfc6083_transport_failed"
+    },
+    {
+      "name": "metadata-connector-after:unordered",
+      "family": "metadata",
+      "side": "connector",
+      "argument": "after:unordered",
+      "expected": "rfc6083_transport_failed"
+    },
+    {
+      "name": "metadata-connector-after:payload-truncated",
+      "family": "metadata",
+      "side": "connector",
+      "argument": "after:payload-truncated",
+      "expected": "rfc6083_transport_failed"
+    },
+    {
+      "name": "metadata-connector-after:control-truncated",
+      "family": "metadata",
+      "side": "connector",
+      "argument": "after:control-truncated",
+      "expected": "rfc6083_transport_failed"
+    },
+    {
+      "name": "metadata-connector-after:notification",
+      "family": "metadata",
+      "side": "connector",
+      "argument": "after:notification",
+      "expected": "rfc6083_transport_failed"
+    },
+    {
+      "name": "cleartext-connector-after:0",
+      "family": "cleartext",
+      "side": "connector",
+      "argument": "after:0",
+      "expected": "rfc6083_cleartext_rejected"
+    },
+    {
+      "name": "cleartext-connector-after:47",
+      "family": "cleartext",
+      "side": "connector",
+      "argument": "after:47",
+      "expected": "rfc6083_cleartext_rejected"
+    },
+    {
+      "name": "cleartext-connector-after:60",
+      "family": "cleartext",
+      "side": "connector",
+      "argument": "after:60",
+      "expected": "rfc6083_cleartext_rejected"
+    },
+    {
+      "name": "records-acceptor-0",
+      "family": "records",
+      "side": "acceptor",
+      "argument": "0",
+      "expected": "delivered"
+    },
+    {
+      "name": "records-acceptor-1",
+      "family": "records",
+      "side": "acceptor",
+      "argument": "1",
+      "expected": "delivered"
+    },
+    {
+      "name": "records-acceptor-19",
+      "family": "records",
+      "side": "acceptor",
+      "argument": "19",
+      "expected": "delivered"
+    },
+    {
+      "name": "records-acceptor-16347",
+      "family": "records",
+      "side": "acceptor",
+      "argument": "16347",
+      "expected": "delivered"
+    },
+    {
+      "name": "limits-acceptor-send",
+      "family": "limits",
+      "side": "acceptor",
+      "argument": "send",
+      "expected": "rfc6083_message_limit"
+    },
+    {
+      "name": "deadline-acceptor-send",
+      "family": "deadline",
+      "side": "acceptor",
+      "argument": "send",
+      "expected": "rfc6083_deadline_exceeded"
+    },
+    {
+      "name": "cancellation-acceptor-unpolled-send",
+      "family": "cancellation",
+      "side": "acceptor",
+      "argument": "unpolled-send",
+      "expected": "active"
+    },
+    {
+      "name": "cancellation-acceptor-polled-send",
+      "family": "cancellation",
+      "side": "acceptor",
+      "argument": "polled-send",
+      "expected": "rfc6083_connection_closed"
+    },
+    {
+      "name": "limits-acceptor-receive",
+      "family": "limits",
+      "side": "acceptor",
+      "argument": "receive",
+      "expected": "rfc6083_message_limit"
+    },
+    {
+      "name": "deadline-acceptor-receive",
+      "family": "deadline",
+      "side": "acceptor",
+      "argument": "receive",
+      "expected": "rfc6083_deadline_exceeded"
+    },
+    {
+      "name": "cancellation-acceptor-unpolled-receive",
+      "family": "cancellation",
+      "side": "acceptor",
+      "argument": "unpolled-receive",
+      "expected": "active"
+    },
+    {
+      "name": "cancellation-acceptor-polled-receive",
+      "family": "cancellation",
+      "side": "acceptor",
+      "argument": "polled-receive",
+      "expected": "rfc6083_connection_closed"
+    },
+    {
+      "name": "cancellation-acceptor-polled-close",
+      "family": "cancellation",
+      "side": "acceptor",
+      "argument": "polled-close",
+      "expected": "rfc6083_connection_closed"
+    },
+    {
+      "name": "retirement-acceptor-replacement",
+      "family": "retirement",
+      "side": "acceptor",
+      "argument": "replacement",
+      "expected": "rfc6083_retired"
+    },
+    {
+      "name": "retirement-acceptor-trust",
+      "family": "retirement",
+      "side": "acceptor",
+      "argument": "trust",
+      "expected": "rfc6083_retired"
+    },
+    {
+      "name": "retirement-acceptor-withdrawal",
+      "family": "retirement",
+      "side": "acceptor",
+      "argument": "withdrawal",
+      "expected": "rfc6083_retired"
+    },
+    {
+      "name": "carrier-acceptor-abort",
+      "family": "carrier",
+      "side": "acceptor",
+      "argument": "abort",
+      "expected": "rfc6083_connection_closed"
+    },
+    {
+      "name": "carrier-acceptor-queued-abort",
+      "family": "carrier",
+      "side": "acceptor",
+      "argument": "queued-abort",
+      "expected": "rfc6083_connection_closed"
+    },
+    {
+      "name": "close-acceptor-reciprocal",
+      "family": "close",
+      "side": "acceptor",
+      "argument": "reciprocal",
+      "expected": "rfc6083_peer_closed"
+    },
+    {
+      "name": "close-acceptor-silent",
+      "family": "close",
+      "side": "acceptor",
+      "argument": "silent",
+      "expected": "rfc6083_deadline_exceeded"
+    },
+    {
+      "name": "close-acceptor-pending",
+      "family": "close",
+      "side": "acceptor",
+      "argument": "pending",
+      "expected": "rfc6083_transport_failed"
+    },
+    {
+      "name": "metadata-acceptor-before:stream-one",
+      "family": "metadata",
+      "side": "acceptor",
+      "argument": "before:stream-one",
+      "expected": "rfc6083_transport_failed"
+    },
+    {
+      "name": "metadata-acceptor-before:stream-max",
+      "family": "metadata",
+      "side": "acceptor",
+      "argument": "before:stream-max",
+      "expected": "rfc6083_transport_failed"
+    },
+    {
+      "name": "metadata-acceptor-before:unordered",
+      "family": "metadata",
+      "side": "acceptor",
+      "argument": "before:unordered",
+      "expected": "rfc6083_transport_failed"
+    },
+    {
+      "name": "metadata-acceptor-before:payload-truncated",
+      "family": "metadata",
+      "side": "acceptor",
+      "argument": "before:payload-truncated",
+      "expected": "rfc6083_transport_failed"
+    },
+    {
+      "name": "metadata-acceptor-before:control-truncated",
+      "family": "metadata",
+      "side": "acceptor",
+      "argument": "before:control-truncated",
+      "expected": "rfc6083_transport_failed"
+    },
+    {
+      "name": "metadata-acceptor-before:notification",
+      "family": "metadata",
+      "side": "acceptor",
+      "argument": "before:notification",
+      "expected": "rfc6083_transport_failed"
+    },
+    {
+      "name": "cleartext-acceptor-before:0",
+      "family": "cleartext",
+      "side": "acceptor",
+      "argument": "before:0",
+      "expected": "rfc6083_cleartext_rejected"
+    },
+    {
+      "name": "cleartext-acceptor-before:47",
+      "family": "cleartext",
+      "side": "acceptor",
+      "argument": "before:47",
+      "expected": "rfc6083_cleartext_rejected"
+    },
+    {
+      "name": "cleartext-acceptor-before:60",
+      "family": "cleartext",
+      "side": "acceptor",
+      "argument": "before:60",
+      "expected": "rfc6083_cleartext_rejected"
+    },
+    {
+      "name": "metadata-acceptor-after:stream-one",
+      "family": "metadata",
+      "side": "acceptor",
+      "argument": "after:stream-one",
+      "expected": "rfc6083_transport_failed"
+    },
+    {
+      "name": "metadata-acceptor-after:stream-max",
+      "family": "metadata",
+      "side": "acceptor",
+      "argument": "after:stream-max",
+      "expected": "rfc6083_transport_failed"
+    },
+    {
+      "name": "metadata-acceptor-after:unordered",
+      "family": "metadata",
+      "side": "acceptor",
+      "argument": "after:unordered",
+      "expected": "rfc6083_transport_failed"
+    },
+    {
+      "name": "metadata-acceptor-after:payload-truncated",
+      "family": "metadata",
+      "side": "acceptor",
+      "argument": "after:payload-truncated",
+      "expected": "rfc6083_transport_failed"
+    },
+    {
+      "name": "metadata-acceptor-after:control-truncated",
+      "family": "metadata",
+      "side": "acceptor",
+      "argument": "after:control-truncated",
+      "expected": "rfc6083_transport_failed"
+    },
+    {
+      "name": "metadata-acceptor-after:notification",
+      "family": "metadata",
+      "side": "acceptor",
+      "argument": "after:notification",
+      "expected": "rfc6083_transport_failed"
+    },
+    {
+      "name": "cleartext-acceptor-after:0",
+      "family": "cleartext",
+      "side": "acceptor",
+      "argument": "after:0",
+      "expected": "rfc6083_cleartext_rejected"
+    },
+    {
+      "name": "cleartext-acceptor-after:47",
+      "family": "cleartext",
+      "side": "acceptor",
+      "argument": "after:47",
+      "expected": "rfc6083_cleartext_rejected"
+    },
+    {
+      "name": "cleartext-acceptor-after:60",
+      "family": "cleartext",
+      "side": "acceptor",
+      "argument": "after:60",
+      "expected": "rfc6083_cleartext_rejected"
+    }
+  ]
+}

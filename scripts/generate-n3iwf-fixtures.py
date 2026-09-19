@@ -3519,6 +3519,51 @@ per-packet provenance and complete-roster relocation remain outside this scope.
     return fixtures
 
 
+def n2_dtls_lifecycle(subset_dir: Path) -> list[dict]:
+    source = "crates/opc-n3iwf-fixtures/oracles/dtls-lifecycle.json"
+    digest = "2375cc860d06a3f9ed2b18310e890135ce6889fb2a7ee88836694be41f4a6fbc"
+    path = ROOT / source
+    if path.is_symlink() or hashlib.sha256(path.read_bytes()).hexdigest() != digest:
+        raise ValueError("n3iwf_dtls_reference_digest")
+    reference = json.loads(path.read_bytes())
+    fixtures = []
+    families = sorted({case["family"] for case in reference["cases"]})
+    if len(families) != 10 or len(reference["cases"]) != 86:
+        raise ValueError("n3iwf_dtls_reference_inventory")
+    for family in families:
+        if re.fullmatch(r"[a-z-]{1,32}", family) is None:
+            raise ValueError("n3iwf_dtls_reference_name")
+        cases = [row for row in reference["cases"] if row["family"] == family]
+        count = len(cases)
+        name = "lifecycle-" + family
+        data = (json.dumps(dict(family=family, cases=cases), sort_keys=True, separators=(",", ":")) + "\n").encode()
+        item = manifest(
+            subset="n2-dtls", name=name, case_class="ordering",
+            document="IETF RFC 6083", release="RFC 6083",
+            clauses=["4.1", "4.3", "4.4", "4.5", "4.7", "4.8", "4.9", "SDK stream-zero lifecycle contract"],
+            direction="local-transport", role="dtls-sctp-endpoint",
+            prerequisite="Existing bounded stream-zero profile, expected SPIFFE peer, active credential epoch and SCTP-AUTH carrier",
+            provenance_class="referenced-public-vector",
+            notes="Independent SDK lifecycle obligations and existing independent certificate negatives. Real mutual DTLS over the private in-memory SCTP harness; separate Linux qualification. No in-place rekey, multistream, revocation or external interoperability claim.",
+            referenced=source + "#" + family,
+            sanitized=[{"name": "operations", "treatment": "synthetic-labels-and-lengths", "value_class": "synthetic"},
+                       {"name": "certificates", "treatment": "reference-labels-no-credential-bytes", "value_class": "synthetic"}],
+            wire_name=name, wire_hex=data.hex(" "),
+            assertions=["family=" + family, "schedules=" + str(count), "sdk_transport_validation=true",
+                        "carrier=in-memory-sctp", "protected_ppid=66", "ordered_stream=0",
+                        "kernel_validation=false", "in_place_rekey=false", "revocation=false", "external_interoperability=false"],
+            outcome="constructed")
+        item["encoding"] = "scenario-record"
+        item["validation_scope"] = "rfc6083-stream-zero-lifecycle"
+        item["context"] = dict(source_vector={"path": source, "sha256": digest, "case": family},
+            schedules=count, sdk_transport_validation=True, carrier="in-memory-sctp", protected_ppid=66,
+            ordered_stream=0, kernel_validation=False, in_place_rekey=False, revocation=False,
+            external_interoperability=False)
+        dump_manifest(subset_dir, item, data.hex(" "))
+        fixtures.append(item)
+    return fixtures
+
+
 def n2_dtls(subset_dir: Path) -> list[dict]:
     positive = "00 00 00 42"
     hello = "16 fe fd 00 00 00 00 00 00 00 00 00 0c 0e 00 00 00 00 00 00 00 00 00 00 00"
@@ -3855,15 +3900,26 @@ def n2_dtls(subset_dir: Path) -> list[dict]:
     ]
     for item, wire in zip(fixtures, wires, strict=True):
         dump_manifest(subset_dir, item, wire)
+    fixtures.extend(n2_dtls_lifecycle(subset_dir))
     write_readme(
         subset_dir,
         "N2 DTLS fixture subset",
-        """PPID 66 metadata, isolated ServerHelloDone framing, and lifecycle labels.
+        """Legacy PPID 66 metadata, isolated ServerHelloDone framing, and lifecycle labels.
 SCTP-AUTH length, verified identity, reliable delivery, and key rotation are
 explicit caller preconditions. DATA B/E flags describe message boundaries;
 they do not prove reliability. Restart/path failure and error labels model
 scenarios without executing a transport or handshake. Ordinary PPID 60 associations cannot satisfy this subset. No
 certificates or exporter secrets are published.
+
+Ten separate rfc6083-stream-zero-lifecycle records bind eight existing independent
+client-certificate vectors and 78 authored SDK lifecycle schedules. The generic
+transport replays them using real mutual DTLS over the private in-memory SCTP
+harness at protected PPID 66, ordered stream zero. They cover record bounds,
+cancellation, deadlines, credential/trust replacement, withdrawal, terminal
+carrier observations, reciprocal close, invalid metadata and foreign PPIDs.
+Certificate vectors also run at protected Diameter PPID 47. Separate Linux
+tests qualify the kernel adapter; these records do not claim kernel execution,
+in-place rekey, multistream, revocation, restart or external interoperability.
 """,
     )
     write_completion(
@@ -3877,12 +3933,16 @@ certificates or exporter secrets are published.
                 "expected-peer identity label",
                 "SCTP-AUTH length label",
                 "SCTP DATA B/E PPID 66",
+                "86 independent stream-zero lifecycle and certificate schedules",
             ],
             receive=["rekey", "rotation generation 3", "path failure"],
             unsupported=[
                 "PPID 60 as protection",
                 "NGAP procedure state",
                 "certificate dumps",
+                "in-place rekey and multistream",
+                "CRL/OCSP and full 3GPP PKI",
+                "restart/multihoming and external interoperability",
             ],
         ),
     )

@@ -13,6 +13,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   replacement, shutdown and multihoming failover qualification (Refs #788).
 
 ### Added
+- `opc-n3iwf-fixtures`: bind ten DTLS lifecycle families to eight independent
+  certificate cases and 78 SDK stream-zero schedules. Replay them against the
+  existing generic protected PPID 66 transport; also qualify the certificate
+  corpus at protected PPID 47. Keep kernel, multistream, rekey and revocation
+  evidence boundaries explicit (Refs #784, #794).
 - `opc-n3iwf-fixtures`: bind nine durable XFRM roster lifecycle families to
   636 independent schedules over all supported member counts and SA/policy
   shapes. Replay ordered acquisition, compensation, recovery and authenticated

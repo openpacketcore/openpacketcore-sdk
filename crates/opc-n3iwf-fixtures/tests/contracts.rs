@@ -285,6 +285,57 @@ fn durable_roster_lifecycle_families_load_with_explicit_execution_scope() {
 }
 
 #[test]
+fn dtls_lifecycle_families_load_with_explicit_execution_scope() {
+    let catalog = FixtureCatalog::load().expect("catalog must load");
+    let expected: BTreeSet<_> = [
+        "certificate",
+        "records",
+        "limits",
+        "cancellation",
+        "deadline",
+        "retirement",
+        "carrier",
+        "close",
+        "metadata",
+        "cleartext",
+    ]
+    .into_iter()
+    .collect();
+    let mut observed = BTreeSet::new();
+    let mut schedules = 0;
+    for (manifest, data) in catalog.manifests() {
+        if manifest.validation_scope != "rfc6083-stream-zero-lifecycle" {
+            continue;
+        }
+        assert_eq!(manifest.subset, "n2-dtls");
+        assert_eq!(manifest.context["carrier"], "in-memory-sctp");
+        assert_eq!(manifest.context["sdk_transport_validation"], true);
+        assert_eq!(manifest.context["protected_ppid"], 66);
+        assert_eq!(manifest.context["ordered_stream"], 0);
+        for claim in [
+            "kernel_validation",
+            "in_place_rekey",
+            "revocation",
+            "external_interoperability",
+        ] {
+            assert_eq!(manifest.context[claim], false);
+        }
+        assert!(!manifest.runtime_claim);
+        let family = manifest.context["source_vector"]["case"]
+            .as_str()
+            .expect("family");
+        assert!(observed.insert(family), "duplicate DTLS family");
+        let wire: serde_json::Value = serde_json::from_slice(data).expect("bounded scenario JSON");
+        assert_eq!(wire["family"], family);
+        let count = wire["cases"].as_array().expect("schedule list").len() as u64;
+        assert_eq!(manifest.context["schedules"], count);
+        schedules += count;
+    }
+    assert_eq!(observed, expected);
+    assert_eq!(schedules, 86);
+}
+
+#[test]
 fn ngap_publishes_matrices_for_every_admitted_outcome() {
     let catalog = FixtureCatalog::load().expect("catalog must load");
     let completion = catalog.completions().get("ngap").expect("ngap completion");

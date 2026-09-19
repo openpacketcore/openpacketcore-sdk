@@ -1,0 +1,77 @@
+{
+  "encoding": "scenario-record",
+  "validation_scope": "rfc6083-stream-zero-lifecycle",
+  "context": {
+    "source_vector": {
+      "path": "crates/opc-n3iwf-fixtures/oracles/dtls-lifecycle.json",
+      "sha256": "2375cc860d06a3f9ed2b18310e890135ce6889fb2a7ee88836694be41f4a6fbc",
+      "case": "cleartext"
+    },
+    "schedules": 12,
+    "sdk_transport_validation": true,
+    "carrier": "in-memory-sctp",
+    "protected_ppid": 66,
+    "ordered_stream": 0,
+    "kernel_validation": false,
+    "in_place_rekey": false,
+    "revocation": false,
+    "external_interoperability": false
+  },
+  "sdk_fixture_id": "opc.n3iwf.n2-dtls.v1.lifecycle-cleartext",
+  "subset": "n2-dtls",
+  "case_class": "ordering",
+  "source": {
+    "document": "IETF RFC 6083",
+    "release": "RFC 6083",
+    "clauses": [
+      "4.1",
+      "4.3",
+      "4.4",
+      "4.5",
+      "4.7",
+      "4.8",
+      "4.9",
+      "SDK stream-zero lifecycle contract"
+    ]
+  },
+  "direction": "local-transport",
+  "role": "dtls-sctp-endpoint",
+  "prerequisite": "Existing bounded stream-zero profile, expected SPIFFE peer, active credential epoch and SCTP-AUTH carrier",
+  "provenance": {
+    "class": "referenced-public-vector",
+    "synthetic": true,
+    "independent_capture": false,
+    "referenced_public_vector": "crates/opc-n3iwf-fixtures/oracles/dtls-lifecycle.json#cleartext",
+    "notes": "Independent SDK lifecycle obligations and existing independent certificate negatives. Real mutual DTLS over the private in-memory SCTP harness; separate Linux qualification. No in-place rekey, multistream, revocation or external interoperability claim."
+  },
+  "sanitized_fields": [
+    {
+      "name": "operations",
+      "treatment": "synthetic-labels-and-lengths",
+      "value_class": "synthetic"
+    },
+    {
+      "name": "certificates",
+      "treatment": "reference-labels-no-credential-bytes",
+      "value_class": "synthetic"
+    }
+  ],
+  "wire": {
+    "path": "wire/lifecycle-cleartext.hex",
+    "digest_sha256": "95f26959729fa87b45f1a61f2c823a8099cf27fc7688cf9a2b90b6818cd8747b"
+  },
+  "semantic_assertions": [
+    "family=cleartext",
+    "schedules=12",
+    "sdk_transport_validation=true",
+    "carrier=in-memory-sctp",
+    "protected_ppid=66",
+    "ordered_stream=0",
+    "kernel_validation=false",
+    "in_place_rekey=false",
+    "revocation=false",
+    "external_interoperability=false"
+  ],
+  "expected_outcome": "constructed",
+  "runtime_claim": false
+}

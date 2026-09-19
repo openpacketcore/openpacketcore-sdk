@@ -15,6 +15,7 @@ from pathlib import Path
 import n3iwf_key_reference as key_reference
 import n3iwf_key_lifecycle_reference as key_lifecycle
 import n3iwf_roster_lifecycle_reference as roster_lifecycle
+import n3iwf_dtls_lifecycle_reference as dtls_lifecycle
 
 ROOT = Path(__file__).resolve().parents[1]
 FIXTURES = ROOT / "crates/opc-n3iwf-fixtures/fixtures"
@@ -370,6 +371,12 @@ def observe(manifest, data):
 
 
 def validate(manifest, data):
+    if manifest["subset"] == "n2-dtls" and manifest["validation_scope"] == dtls_lifecycle.SCOPE:
+        try:
+            dtls_lifecycle.validate(manifest, data)
+        except dtls_lifecycle.Invalid as error:
+            raise Invalid(str(error)) from None
+        return
     if manifest["subset"] == "xfrm-roster" and manifest["validation_scope"] == roster_lifecycle.SCOPE:
         try:
             roster_lifecycle.validate(manifest, data)
