@@ -3,6 +3,7 @@ use super::*;
 use opc_persist::audit_authority::{AuditLedgerLimits, AuditPrivacyKey};
 
 mod checkpoint;
+mod handoff;
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn config_bus_commit_has_a_recoverable_consensus_audit_outcome() {

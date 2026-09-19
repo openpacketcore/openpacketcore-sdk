@@ -8,7 +8,7 @@ use std::sync::atomic::{AtomicU64, AtomicUsize};
 
 // Synthetic separately owned monotonic authority, never a production provider.
 #[derive(Default)]
-struct CheckpointFixture {
+pub(super) struct CheckpointFixture {
     value: std::sync::Mutex<Option<AuditCheckpoint>>,
     unavailable: AtomicBool,
     advance_unavailable: AtomicBool,
