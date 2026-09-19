@@ -396,6 +396,21 @@ authority reports `ProtectedAuthorityRequired`: its external retirement
 vocabulary is outside this protocol, including lost volatile activation.
 These are availability limits, never successful fence-only recovery outcomes.
 
+The protected restriction also applies to newly provisioned `OPCNA003` roots;
+it is independent of older deployment migration. The provider contract fences
+one immutable admission/member binding. Issuing a larger consensus fence for
+a different admission does not advance that old provider row. A local permit
+can still authorize its provider effect while consensus subsequently rejects
+its terminalization. Expiring the permit prevents new calls but neither undoes
+an earlier durable effect nor reconstructs lost admitted bytes. Disk waits
+during recovery alone cannot supply this missing authority.
+
+The real retained-root/mTLS RED and independent disk-backed provider controls
+are recorded in [the protected recovery follow-up](../async-protected-recovery-908.md).
+They establish the need for recovery-only scope retirement and exact effect
+reconciliation, not a requirement to make ordinary Async acknowledgements
+wait for disk. No such protected recovery capability is implemented yet.
+
 The Async wire discriminator advances to `OPC-ASYNC-2` so older peers cannot
 admit state without understanding retirement/snapshot semantics. Mixed-version
 Async membership is rejected. Upgrade members and consumers together; Durable

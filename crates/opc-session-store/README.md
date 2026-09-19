@@ -511,6 +511,16 @@ even if its volatile activation was lost. Those conditions require a separately
 specified repair/retirement authority; waiting or resetting storage supplies
 none. A permanently fenced installation is an availability failure.
 
+The protected-roster restriction affects fresh roots too. Provider journals
+fence an exact admitted operation; a higher fence for a different admission
+does not retire a lost operation's provider authority. Recovery needs authority
+to retire and reconcile that whole scope, including effects whose admissions
+are missing from retained Async state. Waiting for disk or lease expiry cannot
+recreate those facts. This does not require changing ordinary Async
+acknowledgements into Durable acknowledgements. See the
+[protected recovery RED and authority controls](../../docs/async-protected-recovery-908.md)
+for the current gap and exact required contract extension.
+
 Async transport now uses `OPC-ASYNC-2`; older Async peers reject the protocol,
 and current peers reject older Async frames. Durable wire encoding is unchanged.
 Upgrade the whole Async membership and consumers together; rolling mixed-version

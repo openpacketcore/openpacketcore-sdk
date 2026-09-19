@@ -87,14 +87,16 @@ fn unclean_return(
     // This deliberately does not assert that the last acknowledged operation
     // is durable: its presence is checked, and reconciled, after recovery.
     let deadline = Instant::now() + CLUSTER_TRANSITION_TIMEOUT;
-    while persistence == QualificationIsolatedPersistence::Async {
-        let reports = fleet.isolated_scale_reports_by(deadline);
-        if reports.iter().zip(&before).all(|(after, prior)| {
-            after.completed_generation > prior.completed_generation && !after.background_failed
-        }) {
-            break;
+    if persistence == QualificationIsolatedPersistence::Async {
+        loop {
+            let reports = fleet.isolated_scale_reports_by(deadline);
+            if reports.iter().zip(&before).all(|(after, prior)| {
+                after.completed_generation > prior.completed_generation && !after.background_failed
+            }) {
+                break;
+            }
+            assert!(Instant::now() < deadline);
         }
-        assert!(Instant::now() < deadline);
     }
     let returning = (0..3)
         .filter(|index| all_cold || *index != survivor)
