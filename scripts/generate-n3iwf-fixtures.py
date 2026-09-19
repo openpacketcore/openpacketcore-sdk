@@ -3218,6 +3218,49 @@ a trailing partial or complete frame is valid buffered input.
     return fixtures
 
 
+def xfrm_roster_lifecycle(subset_dir: Path) -> list[dict]:
+    source = "crates/opc-n3iwf-fixtures/oracles/roster-lifecycle.json"
+    digest = "4aa403e1afd7f4449f35a2d3cbafb90b75eab84917f34ec74c0242e0b95f09f2"
+    path = ROOT / source
+    if path.is_symlink() or hashlib.sha256(path.read_bytes()).hexdigest() != digest:
+        raise ValueError("n3iwf_roster_reference_digest")
+    reference = json.loads(path.read_bytes())
+    fixtures = []
+    families = sorted({case["trigger"] for case in reference["cases"]})
+    if len(families) != 9 or len(reference["cases"]) != 636:
+        raise ValueError("n3iwf_roster_reference_inventory")
+    for family in families:
+        if re.fullmatch(r"[a-z-]{1,32}", family) is None:
+            raise ValueError("n3iwf_roster_reference_name")
+        cases = [row for row in reference["cases"] if row["trigger"] == family]
+        count = len(cases)
+        name = "lifecycle-" + family
+        data = (json.dumps(dict(family=family, cases=cases), sort_keys=True, separators=(",", ":")) + "\n").encode()
+        item = manifest(
+            subset="xfrm-roster", name=name, case_class="ordering",
+            document="IETF RFC 7296", release="RFC 7296",
+            clauses=["1.3", "2.8", "SDK durable grouped object roster recovery contract"],
+            direction="local-backend", role="xfrm-backend",
+            prerequisite="Exclude noncooperating writers; authenticated local store; synthetic backend; caller decides finalization",
+            provenance_class="referenced-public-vector",
+            notes="Independent ordinal schedules for the existing SDK object-roster contract. Private scripted backend and real authenticated store; separate public Linux crash-cut qualification. No packet, key, installed Child-SA or complete-roster relocation authority.",
+            referenced=source + "#" + family,
+            sanitized=[{"name": "members", "treatment": "synthetic-ordinals-and-object-kinds", "value_class": "synthetic"},
+                       {"name": "store", "treatment": "bounded-phase-labels-no-handles", "value_class": "synthetic"}],
+            wire_name=name, wire_hex=data.hex(" "),
+            assertions=["family=" + family, "schedules=" + str(count), "sdk_store_validation=true", "backend=scripted",
+                        "kernel_validation=false", "packet_provenance=false", "complete_roster_relocation=false"],
+            outcome="constructed")
+        item["encoding"] = "scenario-record"
+        item["validation_scope"] = "durable-object-roster-lifecycle"
+        item["context"] = dict(source_vector={"path": source, "sha256": digest, "case": family},
+            schedules=count, sdk_store_validation=True, backend="scripted", kernel_validation=False,
+            packet_provenance=False, complete_roster_relocation=False)
+        dump_manifest(subset_dir, item, data.hex(" "))
+        fixtures.append(item)
+    return fixtures
+
+
 def xfrm_roster(subset_dir: Path) -> list[dict]:
     positive = "01 00 00 01 0a 0b 0c 0d 0a 0b 0c 0e"
     overlap = "01 00 00 01 0a 0b 0c 0d 0a 0b 0c 0e 01 00 00 02 0a 0b 0c 0f 0a 0b 0c 10"
@@ -3441,6 +3484,7 @@ def xfrm_roster(subset_dir: Path) -> list[dict]:
     ]
     for item, wire in zip(fixtures, wires, strict=True):
         dump_manifest(subset_dir, item, wire)
+    fixtures.extend(xfrm_roster_lifecycle(subset_dir))
     write_readme(
         subset_dir,
         "XFRM roster fixture subset",
@@ -3448,7 +3492,18 @@ def xfrm_roster(subset_dir: Path) -> list[dict]:
 SPI provenance, rekey, and authorized relocation. These model transitions;
 they do not prove kernel installation or authentication.
 IKE notify/create/modify/delete/mobility bytes live in `nwu-ike`. Records
-contain only version, generation, and synthetic SPI labels.
+contain only version, generation, and synthetic SPI labels. The ten legacy
+records remain unchanged; their labels are not live lifecycle evidence.
+
+Nine additional manifests bind 636 independently authored schedules to the
+existing durable object-roster fault harness and authenticated store. All
+arities 1..8 and SA-only, policy-only and mixed groups cover apply/finalize,
+adoption, owned-residue and prepared recovery, sweep failure, foreign conflicts,
+install failure, and issuing cuts before/after each member effect. The record
+contains only object kinds, ordinals, phase labels and expected observations.
+The scripted-backend comparison is distinct from separately qualified public
+Linux process-crash tests. IKE exchanges, installed Child-SA selection,
+per-packet provenance and complete-roster relocation remain outside this scope.
 """,
     )
     write_completion(
@@ -3456,9 +3511,9 @@ contain only version, generation, and synthetic SPI labels.
         completion(
             "xfrm-roster",
             fixtures,
-            constructed=["single pair", "overlap", "rekey"],
-            receive=["relocation", "old-then-new order"],
-            unsupported=["PDU/QFI policy", "IKE notify parsing", "key material"],
+            constructed=["legacy single-pair/overlap/rekey scenario records", "636 independent durable object-roster schedules"],
+            receive=["legacy relocation/order labels", "scripted apply/rollback and authenticated-store recovery verdicts"],
+            unsupported=["PDU/QFI policy", "IKE notify parsing", "key material", "installed Child-SA selection and packet provenance", "complete-roster relocation"],
         ),
     )
     return fixtures

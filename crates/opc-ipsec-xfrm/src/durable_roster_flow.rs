@@ -2263,6 +2263,8 @@ where
 
 #[cfg(test)]
 mod tests {
+    mod independent;
+
     use std::{
         fs::{self, DirBuilder},
         io,

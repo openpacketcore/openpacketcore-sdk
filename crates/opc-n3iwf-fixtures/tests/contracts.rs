@@ -238,6 +238,53 @@ fn ike_and_xfrm_are_separated() {
 }
 
 #[test]
+fn durable_roster_lifecycle_families_load_with_explicit_execution_scope() {
+    let catalog = FixtureCatalog::load().expect("catalog must load");
+    let expected: BTreeSet<_> = [
+        "finalize",
+        "adopt",
+        "recover-applied",
+        "recover-prepared",
+        "sweep-failure",
+        "foreign-conflict",
+        "install-failure",
+        "issuing-before",
+        "issuing-after",
+    ]
+    .into_iter()
+    .collect();
+    let mut observed = BTreeSet::new();
+    let mut schedules = 0;
+    for (manifest, data) in catalog.manifests() {
+        if manifest.validation_scope != "durable-object-roster-lifecycle" {
+            continue;
+        }
+        assert_eq!(manifest.subset, "xfrm-roster");
+        assert_eq!(manifest.context["backend"], "scripted");
+        assert_eq!(manifest.context["sdk_store_validation"], true);
+        for claim in [
+            "kernel_validation",
+            "packet_provenance",
+            "complete_roster_relocation",
+        ] {
+            assert_eq!(manifest.context[claim], false);
+        }
+        assert!(!manifest.runtime_claim);
+        let family = manifest.context["source_vector"]["case"]
+            .as_str()
+            .expect("family");
+        assert!(observed.insert(family), "duplicate roster family");
+        let wire: serde_json::Value = serde_json::from_slice(data).expect("bounded scenario JSON");
+        assert_eq!(wire["family"], family);
+        let count = wire["cases"].as_array().expect("schedule list").len() as u64;
+        assert_eq!(manifest.context["schedules"], count);
+        schedules += count;
+    }
+    assert_eq!(observed, expected);
+    assert_eq!(schedules, 636);
+}
+
+#[test]
 fn ngap_publishes_matrices_for_every_admitted_outcome() {
     let catalog = FixtureCatalog::load().expect("catalog must load");
     let completion = catalog.completions().get("ngap").expect("ngap completion");

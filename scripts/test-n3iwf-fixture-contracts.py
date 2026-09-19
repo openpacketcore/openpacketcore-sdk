@@ -17,6 +17,7 @@ import n3iwf_fixture_oracles as oracle
 import n3iwf_key_reference as key_reference
 import n3iwf_gtpu_reference as gtpu_reference
 import n3iwf_key_lifecycle_reference as key_lifecycle
+import n3iwf_roster_lifecycle_reference as roster_lifecycle
 
 ROOT = Path(__file__).resolve().parents[1]
 FIXTURES = ROOT / "crates/opc-n3iwf-fixtures/fixtures"
@@ -27,6 +28,53 @@ def wire(subset, name):
 
 
 class WireRegressions(unittest.TestCase):
+    def test_roster_catalog_cannot_rewrite_schedules_or_promote_authority(self):
+        original = json.loads((FIXTURES / "xfrm-roster/lifecycle-install-failure.json").read_text())
+        data = wire("xfrm-roster", "lifecycle-install-failure")
+        roster_lifecycle.validate(original, data)
+        for mutation, reason in (
+            ("path", "roster-reference-path"), ("digest", "roster-reference-digest"),
+            ("family", "roster-reference-family"), ("wire-order", "roster-reference-wire"),
+            ("wire-effect", "roster-reference-wire"), ("wire-truncated", "roster-reference-wire"),
+            ("count", "roster-reference-context"), ("backend", "roster-reference-context"),
+            ("kernel_validation", "roster-reference-context"), ("packet_provenance", "roster-reference-context"),
+            ("complete_roster_relocation", "roster-reference-context"), ("bool-type", "roster-reference-context"),
+            ("scope", "roster-reference-scope"), ("authority", "roster-reference-authority"),
+            ("claims", "roster-reference-claims"), ("direction", "roster-reference-direction"),
+            ("provenance", "roster-reference-provenance"), ("outcome", "roster-reference-outcome"),
+            ("runtime_claim", "roster-reference-outcome"),
+        ):
+            with self.subTest(mutation=mutation):
+                changed = json.loads(json.dumps(original))
+                payload = data
+                source = changed["context"]["source_vector"]
+                if mutation == "path": source["path"] = "../outside.json"
+                elif mutation == "digest": source["sha256"] = "0" * 64
+                elif mutation == "family": source["case"] = "finalize"
+                elif mutation in ("wire-order", "wire-effect"):
+                    schedule = json.loads(data)
+                    if mutation == "wire-order": schedule["cases"].reverse()
+                    else: schedule["cases"][0]["final_present"][0] = 1
+                    payload = (json.dumps(schedule, sort_keys=True, separators=(",", ":")) + "\n").encode()
+                    changed["wire"]["digest_sha256"] = hashlib.sha256(payload).hexdigest()
+                elif mutation == "wire-truncated":
+                    payload = payload[:-1]
+                    changed["wire"]["digest_sha256"] = hashlib.sha256(payload).hexdigest()
+                elif mutation == "count": changed["context"]["schedules"] -= 1
+                elif mutation == "backend": changed["context"]["backend"] = "linux"
+                elif mutation in ("kernel_validation", "packet_provenance", "complete_roster_relocation"):
+                    changed["context"][mutation] = True
+                elif mutation == "bool-type": changed["context"]["sdk_store_validation"] = 1
+                elif mutation == "scope": changed["validation_scope"] = "lifecycle-label"
+                elif mutation == "authority": changed["source"]["clauses"][-1] = "RFC wire maximum eight members"
+                elif mutation == "claims": changed["semantic_assertions"][-1] = "complete_roster_relocation=true"
+                elif mutation == "direction": changed["direction"] = "ue-to-n3iwf"
+                elif mutation == "provenance": changed["provenance"]["independent_capture"] = True
+                elif mutation == "outcome": changed["expected_outcome"] = "receive"
+                else: changed["runtime_claim"] = True
+                with self.assertRaisesRegex(roster_lifecycle.Invalid, "^" + reason + "$"):
+                    roster_lifecycle.validate(changed, payload)
+
     def test_custody_catalog_cannot_rewrite_the_authored_schedule(self):
         original = json.loads((FIXTURES / "protocol-key/custody-consume-once.json").read_text())
         data = wire("protocol-key", "custody-consume-once")

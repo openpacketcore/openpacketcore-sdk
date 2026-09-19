@@ -1,0 +1,66 @@
+{
+  "encoding": "scenario-record",
+  "validation_scope": "durable-object-roster-lifecycle",
+  "context": {
+    "source_vector": {
+      "path": "crates/opc-n3iwf-fixtures/oracles/roster-lifecycle.json",
+      "sha256": "4aa403e1afd7f4449f35a2d3cbafb90b75eab84917f34ec74c0242e0b95f09f2",
+      "case": "finalize"
+    },
+    "schedules": 24,
+    "sdk_store_validation": true,
+    "backend": "scripted",
+    "kernel_validation": false,
+    "packet_provenance": false,
+    "complete_roster_relocation": false
+  },
+  "sdk_fixture_id": "opc.n3iwf.xfrm-roster.v1.lifecycle-finalize",
+  "subset": "xfrm-roster",
+  "case_class": "ordering",
+  "source": {
+    "document": "IETF RFC 7296",
+    "release": "RFC 7296",
+    "clauses": [
+      "1.3",
+      "2.8",
+      "SDK durable grouped object roster recovery contract"
+    ]
+  },
+  "direction": "local-backend",
+  "role": "xfrm-backend",
+  "prerequisite": "Exclude noncooperating writers; authenticated local store; synthetic backend; caller decides finalization",
+  "provenance": {
+    "class": "referenced-public-vector",
+    "synthetic": true,
+    "independent_capture": false,
+    "referenced_public_vector": "crates/opc-n3iwf-fixtures/oracles/roster-lifecycle.json#finalize",
+    "notes": "Independent ordinal schedules for the existing SDK object-roster contract. Private scripted backend and real authenticated store; separate public Linux crash-cut qualification. No packet, key, installed Child-SA or complete-roster relocation authority."
+  },
+  "sanitized_fields": [
+    {
+      "name": "members",
+      "treatment": "synthetic-ordinals-and-object-kinds",
+      "value_class": "synthetic"
+    },
+    {
+      "name": "store",
+      "treatment": "bounded-phase-labels-no-handles",
+      "value_class": "synthetic"
+    }
+  ],
+  "wire": {
+    "path": "wire/lifecycle-finalize.hex",
+    "digest_sha256": "f05d124cd7f5c6888354fe78beb5deb751ee651b33c05cf4d3d76268d772e65e"
+  },
+  "semantic_assertions": [
+    "family=finalize",
+    "schedules=24",
+    "sdk_store_validation=true",
+    "backend=scripted",
+    "kernel_validation=false",
+    "packet_provenance=false",
+    "complete_roster_relocation=false"
+  ],
+  "expected_outcome": "constructed",
+  "runtime_claim": false
+}

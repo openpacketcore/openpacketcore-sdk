@@ -95,9 +95,9 @@ Round trips alone do not prove external interoperability.
   Full clause 5.3 content handling, the 17 outcomes requiring an external
   handler, other QoS profiles and live AMF interoperability remain unproven.
 - Complete protected IKE exchanges, subscriber or certificate authentication,
-  K_AMF hierarchy derivation, consume-once protocol-key custody (#791), key
-  export, and actual memory zeroization. Synthetic IKE key-schedule answers
-  are distinct from these unimplemented or unproven boundaries.
+  K_AMF hierarchy derivation, hardware-backed custody, key export, and external
+  memory-zeroization observation. The executable volatile custody and private
+  audit evidence below qualifies its explicitly bounded SDK contract.
 - Established DTLS sessions, verified peer certificates, actual exporter
   output, SCTP reliability, restart recovery, and authenticated relocation.
 - Kernel XFRM installation, live dataplane, AMF selection, deployment,
@@ -106,6 +106,35 @@ Round trips alone do not prove external interoperability.
 The [README](README.md) maps each subset to its exact evidence boundary.
 The [maintenance guide](../../docs/n3iwf-fixture-contracts.md) describes
 publication history and the independently executable gates.
+
+## Executable durable object-roster schedules
+
+Nine `durable-object-roster-lifecycle` records bind 636 independent schedules
+to the existing grouped XFRM recovery contract: each supported arity 1–8 with
+SA-only, policy-only and alternating member kinds. The eight-member bound is
+SDK policy. The reference pins the unchanged public contract section and imports
+neither runtime code nor the catalog writer. Its JSON and TSV encodings are
+regenerated and checked independently; the catalog binds their exact source
+digest, family, schedule count and execution scope.
+
+The private replay uses the existing scripted backend with a real authenticated
+durable store. It compares declared acquisition order, reverse compensation,
+per-member physical presence and authenticated dispositions, store reopening,
+recovery verdicts and repeated terminal recovery. Schedules include complete
+apply/finalize/adopt, prepared and applied restart, readback failure, foreign
+conflict and installation failure at every ordinal, and issuing cuts before and
+after every effect. Public inspection rejects every single-byte handle mutation,
+wrong group/generation, reordered or substituted members, and superseded handles.
+
+The catalog gate rejects changed schedules even with refreshed local digests,
+changed execution or provenance claims, and incomplete inventory. Legacy roster
+labels remain separately qualified as scenario labels. These records contain
+only synthetic ordinal obligations, not packets or key material. They establish
+neither installed packet classification nor authenticated packet provenance,
+overlapping Child-SA ownership or complete roster relocation. Those runtime
+boundaries remain in #793. Separately executed Linux crash-cut tests are recorded
+in PR evidence; the 636 scripted schedules themselves have
+`kernel_validation=false` and all catalog records retain `runtime_claim=false`.
 
 ## Validation
 
