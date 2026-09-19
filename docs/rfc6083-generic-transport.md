@@ -1,9 +1,5 @@
 # Generic RFC 6083 transport: initial stream-zero profile
 
-This document records the initial profile. Optional later capabilities are
-documented in [the current crate contract](../crates/opc-diameter-transport/README.md),
-including [coordinated rekey](rfc6083-rekey-transport.md).
-
 This partial implementation of #794 exposes the existing authenticated
 DTLS/SCTP boundary without `PeerSession`, Diameter identities, CER/CEA, or
 NGAP procedure state. It composes the transport completed under #348 and the
@@ -87,6 +83,11 @@ this stream-zero implementation. Multistream support must correlate the
 actual decrypted record with authenticated SCTP metadata, not FIFO position.
 
 ## Evidence and reproduction
+
+The contract above records the initial profile and is pinned by its lifecycle
+fixtures. Optional later capabilities are documented in
+[the current crate contract](../crates/opc-diameter-transport/README.md), including
+[coordinated rekey](rfc6083-rekey-transport.md).
 
 The fixture catalog now adds ten independently checked lifecycle families at
 `rfc6083-stream-zero-lifecycle`: eight existing client-certificate cases plus
