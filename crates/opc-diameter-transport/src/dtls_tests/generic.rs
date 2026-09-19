@@ -1,6 +1,8 @@
 //! Exercise the public generic boundary without constructing a Diameter session.
 
 mod independent;
+#[cfg(target_os = "linux")]
+mod paths;
 mod revocation;
 mod streams;
 
