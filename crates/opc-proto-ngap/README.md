@@ -22,6 +22,12 @@ Session AMBR; explicit classified APIs allow its absence only with exact
 caller-supplied all-GBR classification. Per-flow abnormal conditions are
 reportable separately. See the [QoS contract and API migration](CONFORMANCE.md#root-qos-profiles-and-conditional-session-ambr).
 
+Setup unsuccessful transfers now retain optional root Criticality Diagnostics,
+including an explicitly empty object and ordered, repeatable IE reports.
+Add `diagnostics: None` to existing `SetupFailureTransfer` literals; that
+type and `FailedSession` now require explicit cloning where they previously
+used `Copy`. See the [Setup failure diagnostic contract](CONFORMANCE.md#setup-failure-diagnostics).
+
 ## API Shape
 
 - `Pdu` stores the policy-filtered decoded PDU kind plus the immutable raw bytes

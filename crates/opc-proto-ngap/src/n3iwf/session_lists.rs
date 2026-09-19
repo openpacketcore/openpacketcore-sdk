@@ -283,7 +283,7 @@ pub struct SuccessfulSession {
 }
 redacted!(SuccessfulSession);
 /// One entirely failed session's setup result.
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct FailedSession {
     /// Session whose setup failed.
     pub id: SessionId,
@@ -364,8 +364,23 @@ macro_rules! result_list {
 }
 result_list!(SuccessfulSessions, SuccessfulSession, PDUSessionResourceSetupListCxtRes, PDUSessionResourceSetupItemCxtRes, p_dusession_resource_setup_response_transfer, SetupResponseTransfer, 9, 176,
     "Nonempty successful-session list (depth nine). Context and PDU Setup response roots have independently identical layouts.");
-result_list!(FailedSessions, FailedSession, PDUSessionResourceFailedToSetupListCxtFail, PDUSessionResourceFailedToSetupItemCxtFail, p_dusession_resource_setup_unsuccessful_transfer, SetupFailureTransfer, 6, 2,
-    "Nonempty failed-session list (depth six). Context failure, context response and PDU Setup response roots have independently identical layouts.");
+result_list!(FailedSessions, FailedSession, PDUSessionResourceFailedToSetupListCxtFail, PDUSessionResourceFailedToSetupItemCxtFail, p_dusession_resource_setup_unsuccessful_transfer, SetupFailureTransfer, 6, 773,
+    "Nonempty failed-session list (depth six, or eight with diagnostic items). Context failure, context response and PDU Setup response roots have independently identical layouts. The maximum root failure transfer is 773 bytes with 256 diagnostics.");
+
+impl FailedSessions {
+    pub(super) fn required_depth(&self) -> usize {
+        if self.0.iter().any(|v| {
+            v.transfer
+                .diagnostics
+                .as_ref()
+                .is_some_and(|d| d.ies.is_some())
+        }) {
+            8
+        } else {
+            6
+        }
+    }
+}
 
 /// Paired optional session result lists with no session in both outcomes.
 /// Empty results are representable for context responses without requested

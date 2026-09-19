@@ -110,12 +110,35 @@ fn independent_results_match_values_and_constructor_bytes() {
             assert!(received.failed() == expected.failed());
         } else {
             let received = SetupFailureTransfer::decode(&wire, DecodeContext::default());
+            if row["name"] == "unsupported-diagnostics" {
+                let expected = SetupFailureTransfer {
+                    cause: Cause::new(CauseClass::RadioNetwork, 0).unwrap(),
+                    diagnostics: Some(
+                        opc_proto_ngap::n3iwf::reset_fields::CriticalityDiagnostics {
+                            procedure_code: None,
+                            triggering_outcome: None,
+                            procedure_criticality: None,
+                            ies: None,
+                        },
+                    ),
+                };
+                assert!(received.unwrap() == expected);
+                assert_eq!(
+                    expected
+                        .encode(EncodeContext::default())
+                        .unwrap()
+                        .as_bytes(),
+                    wire
+                );
+                continue;
+            }
             if !admit {
                 assert!(received.is_err(), "{}", row["name"]);
                 continue;
             }
             let expected = SetupFailureTransfer {
                 cause: cause(&row["model"]),
+                diagnostics: None,
             };
             assert!(received.unwrap() == expected, "{}", row["name"]);
             assert!(
@@ -189,6 +212,7 @@ fn result_limits_are_checked_on_receive_and_construction() {
     assert!(SetupResponseTransfer::new(endpoint, vec![qfi, qfi], vec![]).is_err());
     let failure = SetupFailureTransfer {
         cause: Cause::new(CauseClass::RadioNetwork, 44).unwrap(),
+        diagnostics: None,
     };
     let wire = failure.encode(EncodeContext::default()).unwrap();
     for ctx in [
@@ -292,7 +316,8 @@ fn nested_flags_padding_and_invalid_causes_fail_explicitly() {
         format!(
             "{:?}",
             SetupFailureTransfer {
-                cause: accepted.failed()[0].cause
+                cause: accepted.failed()[0].cause,
+                diagnostics: None,
             }
         ),
     ] {

@@ -13,6 +13,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   replacement, shutdown and multihoming failover qualification (Refs #788).
 
 ### Added
+- `opc-proto-ngap`: admit and construct optional Criticality Diagnostics in
+  Setup unsuccessful transfers and all three enclosing response/failure
+  outcomes. Reuse the qualified Modify root layout with independent Setup
+  bytes, bounded diagnostic lists and response-specific header restrictions.
+  `SetupFailureTransfer` gains `diagnostics`; it and `FailedSession` are now
+  `Clone` rather than `Copy` (Refs #787).
 - `opc-proto-ngap`: construct and admit root non-dynamic/dynamic QoS profiles,
   GBR parameters and optional E-RAB identifiers. Add exact caller-supplied
   session/QFI classification for conditional Session AMBR and per-flow failure

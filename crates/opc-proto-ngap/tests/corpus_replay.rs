@@ -45,7 +45,9 @@ use opc_proto_ngap::n3iwf::resource_fields::{
     DownlinkTransport, QosFlowSetupList, SessionAggregateBitRate, SessionType, UplinkTransport,
 };
 use opc_proto_ngap::n3iwf::resource_request::SetupRequestTransfer;
-use opc_proto_ngap::n3iwf::resource_results::{SetupFailureTransfer, SetupResponseTransfer};
+use opc_proto_ngap::n3iwf::resource_results::SetupResponseTransfer;
+#[path = "support/setup_failure_diagnostics.rs"]
+mod setup_failure_diagnostics;
 use opc_proto_ngap::n3iwf::session_lists::{
     FailedSessions, SessionResults, SessionSetupRequests, SuccessfulSessions,
 };
@@ -180,10 +182,14 @@ fn exercise(data: &[u8]) {
         let wire = value.encode(EncodeContext::default()).unwrap();
         assert!(SetupResponseTransfer::decode(wire.as_bytes(), result_ctx).unwrap() == value);
     }
-    if let Ok(value) = SetupFailureTransfer::decode(data, result_ctx) {
-        let wire = value.encode(EncodeContext::default()).unwrap();
-        assert!(SetupFailureTransfer::decode(wire.as_bytes(), result_ctx).unwrap() == value);
-    }
+    setup_failure_diagnostics::exercise(
+        data,
+        DecodeContext {
+            max_ies: 256,
+            ..result_ctx
+        },
+        EncodeContext::default(),
+    );
     let list_ctx = DecodeContext {
         max_ies: 256,
         ..ctx
