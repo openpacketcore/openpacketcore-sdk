@@ -68,6 +68,7 @@ fn session_types(row: &Value) -> SessionResourceTypes {
 }
 fn transfer(row: &Value) -> SetupRequestTransfer {
     SetupRequestTransfer {
+        additional_uplink: None,
         uplink: UplinkTransport::new("198.51.100.17".parse().unwrap(), 0x11223344),
         aggregate_bit_rate: row["ambr"]
             .as_bool()

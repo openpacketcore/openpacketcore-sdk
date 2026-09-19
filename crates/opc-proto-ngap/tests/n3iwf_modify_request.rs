@@ -405,8 +405,13 @@ fn known_metadata_is_not_dropped_and_optional_ambr_stays_absent() {
         assert_eq!(row["presence"], "optional");
         let id = row["id"].as_u64().unwrap() as u16;
         let criticality = if row["criticality"] == "reject" { 0 } else { 1 };
-        let supported = [130, 140, 129, 135, 137, 166].contains(&id);
-        let value = if id == 129 {
+        let supported = [130, 140, 129, 135, 137, 126, 166].contains(&id);
+        let value = if id == 126 {
+            let tunnels: Value =
+                serde_json::from_str(include_str!("fixtures/n3iwf-remaining-tunnels.json"))
+                    .unwrap();
+            bytes(tunnels["cases"][0]["leaf_hex"].as_str().unwrap())
+        } else if id == 129 {
             vec![0, 0] // Independently qualified root Network Instance 1.
         } else if id == 166 {
             vec![0] // Independently qualified empty Common OCTET STRING.

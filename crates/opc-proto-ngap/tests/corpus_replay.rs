@@ -57,6 +57,8 @@ use opc_proto_ngap::n3iwf::setup::{
 use opc_proto_ngap::n3iwf::{AmfUeId, N3iwfLocation, NasPdu, RanUeId, SecurityKey, TrackingArea};
 use opc_proto_ngap::{encode, Criticality, MessageType, Pdu, ProtocolIe};
 use opc_protocol::{DecodeContext, Encode, EncodeContext, OwnedDecode, ValidationLevel};
+#[path = "support/remaining_tunnels.rs"]
+mod remaining_tunnels;
 use resource_setup::resource_security::setup_tunnels;
 
 /// The decode entry point the fuzz target exercises. Must never panic,
@@ -177,6 +179,18 @@ fn exercise(data: &[u8]) {
         assert_eq!(received.ignored_ie_count, 0);
         assert!(received.notify_ie_ids.is_empty());
     }
+    remaining_tunnels::exercise(
+        data,
+        DecodeContext {
+            max_depth: 32,
+            max_ies: 320,
+            ..ctx
+        },
+        EncodeContext {
+            max_message_len: ctx.max_message_len,
+            ..EncodeContext::default()
+        },
+    );
     let result_ctx = DecodeContext { max_ies: 64, ..ctx };
     setup_tunnels::exercise(
         data,

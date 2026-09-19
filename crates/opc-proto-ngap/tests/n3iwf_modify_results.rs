@@ -59,6 +59,7 @@ fn response(v: &Value) -> Result<ModifyResponseTransfer, DecodeError> {
         )
     };
     Ok(ModifyResponseTransfer {
+        additional: Vec::new(),
         downlink: if v["downlink"].is_null() {
             None
         } else {
@@ -142,6 +143,19 @@ fn independent_values_encodings_and_exact_limits() {
     for row in corpus["cases"].as_array().unwrap() {
         let name = row["name"].as_str().unwrap();
         let wire = bytes(row["wire_hex"].as_str().unwrap());
+        if name == "unsupported-additional-tunnel" {
+            // Preserve the historical fixture and explicitly requalify this
+            // newly supported root field at its required depth.
+            let ctx = DecodeContext {
+                max_depth: 8,
+                ..context()
+            };
+            let value = ModifyResponseTransfer::decode(&wire, ctx).unwrap();
+            assert_eq!(value.additional.len(), 1);
+            assert_eq!(value.encode(output()).unwrap().as_bytes(), wire);
+            admitted += 1;
+            continue;
+        }
         let is_failure = row["type"] == "PDUSessionResourceModifyUnsuccessfulTransfer";
         if row["admitted"] == false {
             if is_failure {
@@ -282,7 +296,7 @@ fn independent_values_encodings_and_exact_limits() {
             check!(ModifyResponseTransfer, value, depth, count);
         }
     }
-    assert_eq!(admitted, 1423);
+    assert_eq!(admitted, 1424);
 }
 
 #[test]

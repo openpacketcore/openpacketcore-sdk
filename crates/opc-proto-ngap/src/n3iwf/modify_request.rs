@@ -6,12 +6,12 @@
 //! The caller correlates sessions, bearers and QFIs, checks conditional
 //! presence, constructs prescribed abnormal-condition responses and performs
 //! resource changes. A typed rejection is not a protocol failure response.
-//! Other recognized optional fields, QoS profiles and extensions remain
+//! Other recognized optional fields and extensions remain
 //! explicitly unsupported; this module does not admit an enclosing NGAP PDU.
 
 use super::modify_fields::{QosFlowCauses, QosFlowModifications, UplinkModifications};
 use super::network_fields::{CommonNetworkInstance, TransportNetworkInstance};
-use super::resource_fields::SessionAggregateBitRate;
+use super::resource_fields::{SessionAggregateBitRate, UplinkTransportList};
 use super::security_fields::NetworkInstance;
 use super::*;
 use crate::policy;
@@ -23,6 +23,8 @@ pub struct ModifyRequestTransfer {
     pub aggregate_bit_rate: Option<SessionAggregateBitRate>,
     /// Requested uplink endpoint and existing downlink bearer endpoint pairs.
     pub uplink_modifications: Option<UplinkModifications>,
+    /// Additional core-side endpoints; no bearer is allocated or selected.
+    pub additional_uplink: Option<UplinkTransportList>,
     /// Unique QFIs with absent parameters or explicit root QoS profiles.
     pub add_or_modify: Option<QosFlowModifications>,
     /// Unique QFIs and root causes, disjoint from `add_or_modify`.
@@ -113,6 +115,14 @@ impl ModifyRequestTransfer {
                 self.release.as_ref().map(|v| v.encode(ctx)).transpose()?,
             ),
             (
+                126,
+                0,
+                self.additional_uplink
+                    .as_ref()
+                    .map(|v| v.encode(ctx))
+                    .transpose()?,
+            ),
+            (
                 166,
                 1,
                 self.common_network_instance
@@ -151,6 +161,7 @@ impl ModifyRequestTransfer {
     /// Depth is four for an empty root, five with network identifiers, six with
     /// AMBR, seven with identifier-only
     /// requests, eight with release causes, nine with tunnel modifications or
+    /// additional uplink endpoints, or
     /// ten with flow parameters. The container and each nested list separately
     /// use `max_ies`; `allocation_budget` remains advisory. These are SDK caller
     /// limits, not resource policy or a cumulative allocation budget.
@@ -191,11 +202,15 @@ impl ModifyRequestTransfer {
                 }
                 continue;
             }
-            if !matches!(entry.id, 130 | 140 | 129 | 135 | 137 | 166) {
+            if !matches!(entry.id, 130 | 140 | 129 | 135 | 137 | 126 | 166) {
                 return Err(unsupported());
             }
             let framed = aper::ie(entry.wire)?;
             match entry.id {
+                126 => {
+                    transfer.additional_uplink =
+                        Some(UplinkTransportList::decode(&framed.value, leaf)?)
+                }
                 130 => {
                     transfer.aggregate_bit_rate =
                         Some(SessionAggregateBitRate::decode(&framed.value, leaf)?)

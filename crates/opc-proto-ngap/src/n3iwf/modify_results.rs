@@ -13,7 +13,9 @@ use super::reset_fields::{
     CriticalityDiagnostics, DiagnosticItem, DiagnosticItems, Sink,
 };
 use super::resource_fields::{DownlinkTransport, QosFlowId, UplinkTransport};
-use super::resource_results::{cause_width, read_cause, unique, write_cause};
+use super::resource_results::{
+    cause_width, read_cause, read_tunnel, unique, write_cause, write_tunnel, DownlinkQosTunnel,
+};
 use super::session_lists::encode_list;
 use super::setup_fields::Reader;
 use super::*;
@@ -29,6 +31,10 @@ pub struct ModifyResponseTransfer {
     pub uplink: Option<UplinkTransport>,
     /// Unique QFIs reported successfully added or modified.
     pub accepted: Option<ModifiedQosFlows>,
+    /// Up to three additional downlink bearers with per-bearer flow mappings.
+    /// Associations do not replace the successful/failed modification reports;
+    /// their consistency with the request and prior configuration is external.
+    pub additional: Vec<DownlinkQosTunnel>,
     /// Unique failed QFIs with root Causes, disjoint from accepted QFIs.
     pub failed: Option<QosFlowCauses>,
 }
@@ -36,6 +42,9 @@ redacted!(ModifyResponseTransfer);
 
 impl ModifyResponseTransfer {
     fn validate(&self) -> Result<(), DecodeError> {
+        if self.additional.len() > 3 {
+            return Err(invalid("additional modify tunnel count"));
+        }
         let mut seen = 0;
         if let Some(values) = &self.accepted {
             for &qfi in values.values() {
@@ -51,15 +60,15 @@ impl ModifyResponseTransfer {
     }
     /// Encode qualified root fields after exact sizing and cross-list checks.
     /// Retain the qualified generated encoder without tunnels; tunnel-bearing
-    /// layouts require explicit parent-offset framing. Extra tunnels and
-    /// extension fields are outside this initial typed subset.
+    /// layouts require explicit parent-offset framing. Extension fields remain
+    /// unsupported. Associations may repeat QFIs across different bearers.
     pub fn encode(&self, ctx: EncodeContext) -> Result<EncodedValue, EncodeError> {
         self.validate().map_err(|_| {
             EncodeError::new(EncodeErrorCode::Structural {
-                reason: "conflicting modify result qfi",
+                reason: "modify result fields",
             })
         })?;
-        if self.downlink.is_none() && self.uplink.is_none() {
+        if self.downlink.is_none() && self.uplink.is_none() && self.additional.is_empty() {
             let mut bits = 7;
             if let Some(values) = &self.accepted {
                 bits += 6 + 9 * values.values().len();
@@ -115,30 +124,16 @@ impl ModifyResponseTransfer {
         encode_root(ctx, |out| write_response(out, self))
     }
     /// Require depth one for an empty root, four for tunnels/accepted QFIs and
-    /// five with failures. The combined accepted/failed count uses `max_ies`. Flags,
-    /// count, uniqueness, alignment and exact framing preflight precedes either
-    /// vector allocation; the generic allocation budget remains advisory.
+    /// five with failures, or eight with additional associations. `max_ies`
+    /// cumulatively bounds accepted/failed flows, additional bearer items and
+    /// every associated-flow occurrence. Complete framing and uniqueness
+    /// preflight precedes vector allocation; `allocation_budget` is advisory.
     pub fn decode(input: &[u8], ctx: DecodeContext) -> Result<Self, DecodeError> {
-        let (mut value, accepted_count, failed_count) = scan_response(input, ctx, |_| {}, |_| {})?;
-        if accepted_count == 0
-            && failed_count == 0
-            && value.downlink.is_none()
-            && value.uplink.is_none()
-        {
+        scan_response(input, ctx, false)?;
+        if input == [0] {
             let _: asn::PDUSessionResourceModifyResponseTransfer = decode_leaf(input)?;
         }
-        let mut accepted = Vec::with_capacity(accepted_count);
-        let mut failed = Vec::with_capacity(failed_count);
-        if accepted_count != 0 || failed_count != 0 {
-            scan_response(input, ctx, |v| accepted.push(v), |v| failed.push(v))?;
-        }
-        if accepted_count != 0 {
-            value.accepted = Some(ModifiedQosFlows::new(accepted)?);
-        }
-        if failed_count != 0 {
-            value.failed = Some(QosFlowCauses::new(failed)?);
-        }
-        Ok(value)
+        scan_response(input, ctx, true)
     }
 }
 
@@ -146,6 +141,7 @@ fn write_response(out: &mut dyn Sink, value: &ModifyResponseTransfer) -> Result<
     let flags = (u16::from(value.downlink.is_some()) << 5)
         | (u16::from(value.uplink.is_some()) << 4)
         | (u16::from(value.accepted.is_some()) << 3)
+        | (u16::from(!value.additional.is_empty()) << 2)
         | (u16::from(value.failed.is_some()) << 1);
     out.bits(flags, 7)?;
     if let Some(v) = value.downlink {
@@ -161,6 +157,13 @@ fn write_response(out: &mut dyn Sink, value: &ModifyResponseTransfer) -> Result<
             out.bits(u16::from(qfi.value()), 6)?;
         }
     }
+    if !value.additional.is_empty() {
+        out.bits((value.additional.len() - 1) as u16, 2)?;
+        for tunnel in &value.additional {
+            out.bits(0, 2)?;
+            write_tunnel(out, tunnel)?;
+        }
+    }
     if let Some(values) = &value.failed {
         out.bits((values.values().len() - 1) as u16, 6)?;
         for v in values.values() {
@@ -174,17 +177,18 @@ fn write_response(out: &mut dyn Sink, value: &ModifyResponseTransfer) -> Result<
 fn scan_response(
     input: &[u8],
     ctx: DecodeContext,
-    mut accepted: impl FnMut(QosFlowId),
-    mut failed: impl FnMut(QosFlowCause),
-) -> Result<(ModifyResponseTransfer, usize, usize), DecodeError> {
+    materialize: bool,
+) -> Result<ModifyResponseTransfer, DecodeError> {
     bound(input, ctx, 1)?;
     let mut reader = Reader::new(input, ctx);
     let flags = reader.bits(7)?;
-    if flags & !0b111010 != 0 {
+    if flags & !0b111110 != 0 {
         return Err(unsupported());
     }
     crate::enforce_depth(
-        if flags & 2 != 0 {
+        if flags & 4 != 0 {
+            8
+        } else if flags & 2 != 0 {
             5
         } else if flags != 0 {
             4
@@ -203,35 +207,55 @@ fn scan_response(
         value.uplink = Some(UplinkTransport::new(address, teid));
     }
     let mut seen = 0;
-    let accepted_count = if flags & 8 != 0 {
+    if flags & 8 != 0 {
         let count = reader.count(6, 64, 9)?;
+        let mut accepted = Vec::with_capacity(if materialize { count } else { 0 });
         for _ in 0..count {
             reader.flags(3)?;
             let qfi = QosFlowId::new(reader.bits(6)? as u8)?;
             unique(&mut seen, qfi)?;
-            accepted(qfi);
+            if materialize {
+                accepted.push(qfi);
+            }
         }
-        count
-    } else {
-        0
-    };
-    let failed_count = if flags & 2 != 0 {
+        if materialize {
+            value.accepted = Some(ModifiedQosFlows::new(accepted)?);
+        }
+    }
+    if flags & 4 != 0 {
+        let count = reader.count(2, 3, 96)?;
+        if materialize {
+            value.additional.reserve_exact(count);
+        }
+        // An association is not a successful modification result. Do not
+        // infer request correspondence or alter the accepted/failed mask.
+        let mut associations = 0;
+        for _ in 0..count {
+            reader.flags(2)?;
+            let tunnel = read_tunnel(&mut reader, &mut associations, materialize)?;
+            if materialize {
+                value.additional.push(tunnel);
+            }
+        }
+    }
+    if flags & 2 != 0 {
         let count = reader.count(6, 64, 14)?;
+        let mut failed = Vec::with_capacity(if materialize { count } else { 0 });
         for _ in 0..count {
             reader.flags(3)?;
             let qfi = QosFlowId::new(reader.bits(6)? as u8)?;
             unique(&mut seen, qfi)?;
-            failed(QosFlowCause {
-                qfi,
-                cause: read_cause(&mut reader)?,
-            });
+            let cause = read_cause(&mut reader)?;
+            if materialize {
+                failed.push(QosFlowCause { qfi, cause });
+            }
         }
-        count
-    } else {
-        0
-    };
+        if materialize {
+            value.failed = Some(QosFlowCauses::new(failed)?);
+        }
+    }
     reader.finish()?;
-    Ok((value, accepted_count, failed_count))
+    Ok(value)
 }
 
 /// A failed session's root Cause and optional response diagnostics. Procedure

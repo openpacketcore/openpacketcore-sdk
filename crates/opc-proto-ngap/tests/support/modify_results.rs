@@ -3,8 +3,8 @@ use opc_proto_ngap::n3iwf::modify_results::{ModifyFailureTransfer, ModifyRespons
 use opc_protocol::{DecodeContext, EncodeContext};
 pub fn exercise(data: &[u8], ctx: DecodeContext, output: EncodeContext) {
     let ctx = DecodeContext {
-        max_ies: 256,
-        max_depth: 5,
+        max_ies: 320,
+        max_depth: 8,
         ..ctx
     };
     macro_rules! transfer {

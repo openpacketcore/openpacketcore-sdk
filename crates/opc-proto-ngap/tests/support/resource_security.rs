@@ -1,5 +1,6 @@
 //! Shared semantic reconstruction for resource-security fuzz and replay.
 use opc_proto_ngap::n3iwf::network_fields::CommonNetworkInstance;
+use opc_proto_ngap::n3iwf::resource_fields::{UplinkTransport, UplinkTransportList};
 use opc_proto_ngap::n3iwf::resource_request::SetupRequestTransfer;
 use opc_proto_ngap::n3iwf::resource_results::SetupResponseTransfer;
 #[path = "setup_tunnels.rs"]
@@ -30,6 +31,15 @@ pub fn result(value: SecurityResult) -> SecurityResult {
 }
 pub fn request(value: &SetupRequestTransfer) -> SetupRequestTransfer {
     let mut reconstructed = value.clone();
+    reconstructed.additional_uplink = value.additional_uplink.as_ref().map(|list| {
+        UplinkTransportList::new(
+            list.values()
+                .iter()
+                .map(|v| UplinkTransport::new(v.address(), v.teid()))
+                .collect(),
+        )
+        .unwrap()
+    });
     reconstructed.security = value.security.map(indication);
     reconstructed.network_instance = value
         .network_instance

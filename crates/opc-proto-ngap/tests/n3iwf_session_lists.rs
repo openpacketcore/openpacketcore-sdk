@@ -57,6 +57,7 @@ fn cause(m: &Value) -> Cause {
 }
 fn request_transfer(m: &Value) -> SetupRequestTransfer {
     SetupRequestTransfer {
+        additional_uplink: None,
         security: None,
         network_instance: None,
         common_network_instance: None,
