@@ -46,7 +46,6 @@ use aya_ebpf::{
     maps::{Array, HashMap, PerCpuArray, RingBuf},
     programs::TcContext,
 };
-use opc_gtpu_ebpf_common::classify_ipv6_extension_step;
 use opc_gtpu_ebpf_common::trusted_traffic_observation_abi::{
     GtpuTrafficObservationRegistration, GtpuTrafficObservationRegistrationWireView,
 };
@@ -80,9 +79,8 @@ use opc_gtpu_ebpf_common::{
     GTPU_SESSION_CONFIG_VALUE_LEN, GTPU_SESSION_DOWNLINK_KEY_LEN, GTPU_SESSION_GROUP_ID_LEN,
     GTPU_SESSION_GROUP_REF_LEN, GTPU_SESSION_GROUP_VALUE_LEN, GTPU_SESSION_SCHEMA_MARKER_LEN,
     GTPU_SESSION_SELECTOR_STAMP_VALUE_LEN, GTPU_SESSION_TRANSACTION_VALUE_LEN,
-    GTPU_SESSION_UPLINK_KEY_LEN,
-    GTPU_TRAFFIC_OBSERVATION_EVENT_LEN, GTPU_TRAFFIC_OBSERVATION_GATE_INDEX,
-    GTPU_TRAFFIC_OBSERVATION_GATE_MAX_ENTRIES,
+    GTPU_SESSION_UPLINK_KEY_LEN, GTPU_TRAFFIC_OBSERVATION_EVENT_LEN,
+    GTPU_TRAFFIC_OBSERVATION_GATE_INDEX, GTPU_TRAFFIC_OBSERVATION_GATE_MAX_ENTRIES,
     GTPU_TRAFFIC_OBSERVATION_ICMP_ECHO_CHALLENGE_PAYLOAD_LEN,
     GTPU_TRAFFIC_OBSERVATION_ICMP_ECHO_CHALLENGE_PROFILE, GTPU_TRAFFIC_OBSERVATION_ICMP_ECHO_MAGIC,
     GTPU_TRAFFIC_OBSERVATION_ICMP_ECHO_VERSION, GTPU_TRAFFIC_OBSERVATION_REDIRECT_NONCE_LEN,
@@ -96,6 +94,9 @@ use opc_gtpu_ebpf_common::{
     UPLINK_DSCP_SCHEMA_MARKER_KEY, UPLINK_DSCP_VALUE_LEN, UPLINK_FAR_VALUE_LEN,
     UPLINK_MARK_KEY_LEN, UPLINK_PMTU_COUNTER_SLOTS, UPLINK_PMTU_VALUE_LEN,
     UPLINK_SOURCE_PORT_VALUE_LEN,
+};
+use opc_gtpu_ebpf_common::{
+    classify_ipv6_extension_step, gtpu_endpoint_requires_extension_control,
 };
 #[cfg(test)]
 use opc_gtpu_ebpf_common::{internet_checksum, udp_ipv6_checksum};
@@ -2728,6 +2729,7 @@ fn parse_downlink_ipv6(ctx: &mut TcContext, parsed: &mut ParsedIpv6Downlink) -> 
     let Some(mut payload_offset) = gtp_offset.checked_add(GTPU_MANDATORY_HDR_LEN) else {
         return IPV6_PARSE_DROP;
     };
+    let mut requires_control = false;
     if has_opt {
         let Some(optional_end) = payload_offset.checked_add(GTPU_OPT_LEN) else {
             return IPV6_PARSE_DROP;
@@ -2764,11 +2766,17 @@ fn parse_downlink_ipv6(ctx: &mut TcContext, parsed: &mut ParsedIpv6Downlink) -> 
                 let Ok(following) = ctx.load::<u8>(extension_end - 1) else {
                     return IPV6_PARSE_DROP;
                 };
+                requires_control |= gtpu_endpoint_requires_extension_control(next_extension);
                 payload_offset = extension_end;
                 next_extension = following;
                 walked += 1;
             }
         }
+    }
+    // Validate the entire chain before handing the original packet to the
+    // shared control queue, without any PDR lookup or decapsulation.
+    if requires_control {
+        return IPV6_PARSE_PASS;
     }
     if payload_offset >= gtp_end
         || payload_offset
@@ -3948,6 +3956,7 @@ fn parse_downlink(ctx: &mut TcContext) -> u64 {
     let Some(mut payload_offset) = gtp_offset.checked_add(GTPU_MANDATORY_HDR_LEN) else {
         return u64::from(malformed_downlink() as u32);
     };
+    let mut requires_control = false;
     if has_opt {
         let Some(optional_end) = payload_offset.checked_add(GTPU_OPT_LEN) else {
             return u64::from(malformed_downlink() as u32);
@@ -3984,11 +3993,17 @@ fn parse_downlink(ctx: &mut TcContext) -> u64 {
                 let Ok(next) = ctx.load::<u8>(ext_end - 1) else {
                     return u64::from(malformed_downlink() as u32);
                 };
+                requires_control |= gtpu_endpoint_requires_extension_control(next_ext);
                 payload_offset = ext_end;
                 next_ext = next;
                 walked += 1;
             }
         }
+    }
+    // Validate the entire chain before handing the original packet to the
+    // shared control queue, without any PDR lookup or decapsulation.
+    if requires_control {
+        return u64::from(TC_ACT_OK as u32);
     }
     if payload_offset >= gtp_end {
         return u64::from(malformed_downlink() as u32);

@@ -2040,6 +2040,19 @@ pub enum GtpuClass {
     },
 }
 
+/// Whether this endpoint profile must hand an extension to the control plane.
+///
+/// TS 29.281 clause 5.2.1 makes unknown types with bit 8 set mandatory for an
+/// endpoint. This is not the SGW intermediate profile and has no 0xc0 exception.
+/// The existing recognized PSC identifier (0x85) retains its framing path;
+/// this helper does not establish PSC/QFI forwarding or installed authority.
+/// Call only while walking a complete, bounded extension chain. The caller
+/// must finish validating that chain before returning a host-pass verdict.
+#[must_use]
+pub const fn gtpu_endpoint_requires_extension_control(extension_type: u8) -> bool {
+    extension_type & 0x80 != 0 && extension_type != 0x85
+}
+
 /// Classify the mandatory GTPv1-U header of a received UDP/2152 payload.
 #[must_use]
 pub fn classify_gtpu(header: &[u8; GTPU_MANDATORY_HDR_LEN]) -> GtpuClass {

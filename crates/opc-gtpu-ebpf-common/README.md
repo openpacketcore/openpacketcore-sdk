@@ -26,6 +26,9 @@ GTP-U encapsulation/classification helpers.
   program's mandatory IPv6 UDP-checksum path.
 - `classify_gtpu` classifies a mandatory GTP-U header as `NotGtpV1`,
   `NotGpdu`, or `Gpdu { teid, length, has_opt, has_ext }`.
+- `gtpu_endpoint_requires_extension_control` shares the endpoint unknown-required
+  extension rule between both tc parsers and the host reassembly parser. The
+  complete chain must validate before a control-plane handoff.
 - `ipv4_header_checksum` computes an option-free IPv4 header checksum.
 - `Ipv4EnvelopeBounds`, `UdpEnvelopeBounds`, and `GtpuEnvelopeBounds` validate
   the exact nested downlink boundary with checked arithmetic while retaining

@@ -12300,3 +12300,213 @@ async fn ebpf_gtpu_snapshot_publishes_every_counter_map_identity(
     drop(net);
     Ok(())
 }
+
+#[tokio::test]
+#[allow(clippy::await_holding_lock)]
+#[ignore = "requires root (CAP_BPF/CAP_NET_ADMIN), a fresh netns, and bpffs"]
+async fn ebpf_gtpu_required_extensions_reach_shared_control_without_decap(
+) -> Result<(), Box<dyn std::error::Error>> {
+    use opc_gtpu_dataplane::control_port::{GtpuControlDatagramKind, GtpuControlResponseBudget};
+    use opc_proto_gtpu::GtpuExtensionHeaderTypeList;
+
+    assert_eq!(env::var("OPC_GTPU_RUN_PRIVILEGED").as_deref(), Ok("1"));
+    assert_ne!(
+        fs::read_link("/proc/self/ns/net")?,
+        fs::read_link("/proc/1/ns/net")?
+    );
+    let _serial = PRIVILEGED_TEST_LOCK
+        .lock()
+        .unwrap_or_else(|p| p.into_inner());
+    let net = TestNet::provision();
+    let backend = EbpfGtpuDataplaneBackend::with_config(EbpfGtpuDataplaneBackendConfig {
+        bpffs_pin_root: net.pin_root.clone(),
+        ..EbpfGtpuDataplaneBackendConfig::default()
+    });
+    let mut request = CreateGtpDeviceRequest::new("s2bu");
+    request.bind_address = IpAddr::V4(EPDG_S2BU_IP);
+    let device = backend.create_device(request).await?;
+    backend
+        .install_pdp_context(session_context(device.ifindex))
+        .await?;
+    run("ping", &["-c", "1", "-W", "1", "192.0.2.10"]);
+    run("ping", &["-6", "-c", "1", "-W", "1", "2001:db8:2::10"]);
+    let control = GtpuReassemblySocket::bind(EPDG_S2BU_IP, "s2bu")?;
+    let control_v6 = UdpSocket::bind((EPDG_S2BU_IPV6, GTPU_PORT))?;
+    control_v6.set_read_timeout(Some(Duration::from_secs(2)))?;
+    let peer = in_netns(&net.pgw_ns, || {
+        UdpSocket::bind((PGW_IP, GTPU_PORT)).unwrap()
+    });
+    peer.set_read_timeout(Some(Duration::from_secs(2)))?;
+    let ue = in_netns(&net.ue_ns, || UdpSocket::bind((UE_PAA, 5000)).unwrap());
+    let destination_mac = main_link_address("s2bu");
+    let source_mac = net.pgw_link_address("s2bup");
+    let inner = build_inner_udp(
+        REMOTE_HOST,
+        UE_PAA,
+        53,
+        5000,
+        b"required-extension-no-decap",
+    );
+    let before = backend.datapath_snapshot(&device).await?;
+    let receive_control = || {
+        let deadline = Instant::now() + Duration::from_secs(2);
+        loop {
+            if let Some(event) = control.try_receive_datagram(2048).unwrap() {
+                break event;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "required extension missed control queue"
+            );
+            std::thread::sleep(Duration::from_millis(1));
+        }
+    };
+    let mut received = [0_u8; 2048];
+    let mut required_count = 0;
+    // All endpoint-required unknown identifiers, including the SGW-only 0xc0
+    // exception, are required for this endpoint profile. PSC is known framing.
+    for kind in 128_u8..=255 {
+        if kind == 0x85 {
+            continue;
+        }
+        let mut gpdu = build_extension_gpdu(LOCAL_TEID, &inner);
+        gpdu[11] = kind;
+        let frame = build_outer_gtpu_frame(destination_mac, source_mac, &[], &gpdu, true, 0);
+        send_raw_gtpu_frame(
+            &net.pgw_ns,
+            "s2bup",
+            &frame,
+            RawChecksumMetadata::Unverified,
+        );
+        let event = receive_control();
+        assert_eq!(
+            event.kind(),
+            GtpuControlDatagramKind::UnsupportedRequiredExtension
+        );
+        assert_eq!(event.bytes(), gpdu);
+        assert_eq!(event.peer(), std::net::SocketAddrV4::new(PGW_IP, GTPU_PORT));
+        assert_eq!(
+            event.local(),
+            std::net::SocketAddrV4::new(EPDG_S2BU_IP, GTPU_PORT)
+        );
+        assert_eq!(event.provenance().ingress_ifindex(), device.ifindex);
+        let plan = event.extension_notification(
+            GtpuExtensionHeaderTypeList::new([])?,
+            GtpuControlResponseBudget::new(14, 1)?,
+        )?;
+        assert_eq!(control.send_control_response(plan)?, 14);
+        let (length, source) = peer.recv_from(&mut received)?;
+        assert_eq!(source, SocketAddr::from((EPDG_S2BU_IP, GTPU_PORT)));
+        assert_eq!(
+            &received[..length],
+            &[0x32, 31, 0, 6, 0, 0, 0, 0, 0, 0, 0, 0, 141, 0]
+        );
+
+        // The same committed IPv6 parser must hand the unchanged packet to
+        // the host before any grouped owner lookup. IPv6 typed socket support
+        // remains separate: this checks the actual raw UDP receive boundary.
+        let frame6 = build_outer_ipv6_gtpu_frame(
+            destination_mac,
+            source_mac,
+            PGW_IPV6,
+            EPDG_S2BU_IPV6,
+            &gpdu,
+            OuterIpv6Extension::None,
+        );
+        send_raw_gtpu_frame(
+            &net.pgw_ns,
+            "s2bup",
+            &frame6,
+            RawChecksumMetadata::Unverified,
+        );
+        let (length, source) = control_v6.recv_from(&mut received)?;
+        assert_eq!(source, SocketAddr::from((PGW_IPV6, GTPU_PORT)));
+        assert_eq!(&received[..length], gpdu);
+        required_count += 1;
+    }
+    assert_eq!(required_count, 127);
+    expect_no_datagram(&ue);
+    let after_required = backend.datapath_snapshot(&device).await?;
+    assert_eq!(
+        after_required.counters.downlink_decapsulated,
+        before.counters.downlink_decapsulated
+    );
+    assert_eq!(
+        after_required.counters.downlink_unknown_teid,
+        before.counters.downlink_unknown_teid
+    );
+    assert_eq!(
+        after_required.counters.downlink_malformed,
+        before.counters.downlink_malformed
+    );
+
+    // Unknown optional types are skipped at this endpoint, with their next
+    // pointer followed. The exact inner UDP packet still reaches the UE.
+    for kind in 1_u8..=127 {
+        let mut gpdu = build_extension_gpdu(LOCAL_TEID, &inner);
+        gpdu[11] = kind;
+        let frame = build_outer_gtpu_frame(destination_mac, source_mac, &[], &gpdu, true, 0);
+        send_raw_gtpu_frame(
+            &net.pgw_ns,
+            "s2bup",
+            &frame,
+            RawChecksumMetadata::Unverified,
+        );
+        receive_raw_downlink(&ue, b"required-extension-no-decap");
+        assert!(control.try_receive_datagram(2048)?.is_none());
+    }
+    let after_optional = backend.datapath_snapshot(&device).await?;
+    assert_eq!(
+        after_optional.counters.downlink_decapsulated,
+        before.counters.downlink_decapsulated + 127
+    );
+    // Validate the whole chain before handing it to the host. A required
+    // first header must not bypass a malformed second header in either family.
+    for length in [0, 255] {
+        let mut gpdu = vec![
+            0x34, 0xff, 0, 12, 0x10, 0, 0, 1, 0, 0, 0, 0x80, 1, 0, 0, 0x20, length, 0, 0, 0,
+        ];
+        for ipv6 in [false, true] {
+            let frame = if ipv6 {
+                build_outer_ipv6_gtpu_frame(
+                    destination_mac,
+                    source_mac,
+                    PGW_IPV6,
+                    EPDG_S2BU_IPV6,
+                    &gpdu,
+                    OuterIpv6Extension::None,
+                )
+            } else {
+                build_outer_gtpu_frame(destination_mac, source_mac, &[], &gpdu, true, 0)
+            };
+            send_raw_gtpu_frame(
+                &net.pgw_ns,
+                "s2bup",
+                &frame,
+                RawChecksumMetadata::Unverified,
+            );
+        }
+        gpdu.fill(0);
+    }
+    expect_no_reassembled_datagram(&control);
+    expect_no_datagram(&control_v6);
+    expect_no_datagram(&ue);
+    let after_malformed = backend.datapath_snapshot(&device).await?;
+    assert_eq!(
+        after_malformed.counters.downlink_malformed,
+        before.counters.downlink_malformed + 4
+    );
+    assert_eq!(
+        after_malformed.counters.downlink_decapsulated,
+        after_optional.counters.downlink_decapsulated
+    );
+    drop(control);
+    drop(control_v6);
+    drop(peer);
+    drop(ue);
+    backend.remove_device(&device).await?;
+    drop(backend);
+    drop(net);
+    eprintln!("OPC_GTPU_REQUIRED_EXTENSION_CONTROL_PROVEN: 127 required types, both outer families, 127 optional types, 4 malformed chains");
+    Ok(())
+}
