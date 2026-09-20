@@ -92,6 +92,20 @@ impl InstalledChildSaRoster {
     pub fn generation(&self) -> u64 {
         self.state.generation
     }
+
+    #[cfg(target_os = "linux")]
+    pub(crate) fn declared_pair(
+        &self,
+        child: crate::child_sa::ChildSaId,
+        incarnation: crate::child_sa::ChildSaIncarnation,
+    ) -> Option<ChildSaPair> {
+        self.state
+            .plan
+            .pairs()
+            .iter()
+            .find(|pair| pair.child() == child && pair.incarnation() == incarnation)
+            .cloned()
+    }
 }
 
 /// Exact selected child after a fresh readback of the complete published roster.

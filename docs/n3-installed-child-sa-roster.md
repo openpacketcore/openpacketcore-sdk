@@ -1,4 +1,4 @@
-# Installed Child-SA selection roster
+# Installed Child-SA selection and inbound provenance
 
 `XfrmBackend` exposes optional `begin_child_sa_roster_update`,
 `publish_child_sa_roster` and `select_installed_child_sa` operations. The
@@ -6,10 +6,10 @@ namespace-bound Linux actor implements them. Raw Linux, mock and unsupported
 backends return `UnsupportedFeature { feature: "installed_child_sa_roster" }`.
 The existing freely constructed `ChildSaSelectionPlan` remains intent data.
 
-This is an installed-selection increment of #793. It does not complete that
-issue's sealed inbound packet-provenance or authenticated whole-roster
-relocation requirements. It introduces no IKE parsing, PDU/QFI policy, key
-custody, SA installation or endpoint-migration authority.
+This is a bounded installed-selection and inbound-provenance profile for #793.
+Authenticated whole-roster relocation remains separate work. This profile
+introduces no IKE parsing, PDU/QFI policy, key custody, SA installation or
+endpoint-migration authority.
 
 ## Admitted profile
 
@@ -73,6 +73,36 @@ actor even if the caller drops its reply receiver. A lost publication reply
 requires a new ticket and complete readback. Process loss likewise requires
 fresh publication; this in-memory receipt adds no durable recovery format.
 
+## Authenticated inbound observations
+
+On supported Linux kernels, `LinuxEspPeerObservationMonitor` can register the
+inbound SA of an exact published child and incarnation with
+`register_installed_child_sa`. It derives the SA identity from the opaque
+publication, reads the complete installed roster before registration and again
+before arming the source, and retains the private monitor scope and registration
+epoch. The registration remains unarmed across the second roster read; dropping
+that operation aborts its prepared registration. Both the selected incarnation
+and a receive-only rekey predecessor can be registered.
+
+`poll_installed_child_sa` returns `AuthenticatedChildSaPeerObservation` only
+after the existing kernel source's post-integrity, final-replay-accepted
+observation, another successful whole-roster read and a final source-authority
+check. The result binds the exact pair, publication generation and registration
+epoch. These private fields cannot be constructed from public observation data.
+A handle from another monitor, a stale publication, teardown or lost tracing
+authority issues no result. A raw registration cannot be promoted or rebound to
+a new publication: teardown and a fresh registration are required, so queued
+events cannot acquire a later publication's identity.
+
+This source reports bounded peer-source changes for authenticated ESP-in-UDP;
+it does not report every packet or prove inner application delivery. No source
+change returns `Ok(None)`, and explicit source/overflow loss remains visible.
+Native ESP, kernels without the required tracing hooks, unauthenticated ESP,
+unsupported replay/offload profiles and unavailable capabilities retain the
+existing precise refusal behavior. The sealed type adds no wider source
+capability. All registration, polling and subsequent use require the same
+caller-owned writer serialization as installed selection.
+
 ## Authority limits
 
 The returned `InstalledChildSaSelection` is a point-in-time installed-state
@@ -87,7 +117,7 @@ Neither publication nor selection grants counter restoration, same-SPI/key
 reuse, key export, default eligibility, inbound packet authentication or
 relocation authority. The existing custody, counter-resume and migration
 contracts still govern those operations. In particular, the public mutable
-`EspPeerObservation` must not be promoted into an authenticated roster receipt.
+`EspPeerObservation` cannot be promoted into the sealed roster observation.
 Source-address observation alone remains insufficient to authorize MOBIKE.
 
 ## Evidence
@@ -118,11 +148,28 @@ outbound class/default choices and six inbound authenticated deliveries. A
 successor packet uses the new SPI while predecessor SAs remain installed.
 Removal/reinstallation and a deliberately foreign policy conflict refuse the
 old publication. This test uses synthetic authentication-only ESP-in-UDP
-traffic; it is not external interoperability, sealed inbound SDK provenance,
-native-ESP relocation or full N3IWF qualification. The CI native lane requires
-one passing test, zero ignored cases and its completion marker, without debug
-profile overrides.
+traffic. A second native test independently constructs IPv4/UDP/null-cipher
+ESP with HMAC-SHA-256, observes each of the three exact inbound pairs, and
+checks real inner delivery separately from sealed source observations. Invalid
+integrity and replayed packets issue no observation. It exercises monitor-scope
+substitution, old-publication refusal with an already queued authenticated
+event, and distinct predecessor/successor receipts after fresh registration.
+The CI native lane requires both passing tests, zero ignored cases and both
+completion markers, without debug profile overrides. Each test owns a separate
+network namespace and XFRM database. These tests do not qualify external
+interoperability, native-ESP relocation or full N3IWF behavior.
 
 No new dependencies, secret-bearing publication fields, metrics or production
 log values are added. Errors carry existing static XFRM error labels; request,
-ticket, publication and selection `Debug` output is fully redacted.
+ticket, publication, selection and sealed observation `Debug` output is fully
+redacted. Copying and editing the public observation facts cannot alter the
+sealed receipt or create a new one.
+
+The sealed-observation consumer fails to compile on the installed-selection
+parent because its public API is absent. Four compiled native guard-removal
+controls fail: the final publication reread, the private monitor scope, both
+registration publication checks, and exact child/incarnation lookup. The scope
+control uses two monitors on the same actor and publication with identical raw
+SA keys and registration epochs, so those other bindings cannot hide a missing
+scope check. The stale-publication control queues an authenticated event before
+the actor mutation and requires the exact generation refusal afterward.
