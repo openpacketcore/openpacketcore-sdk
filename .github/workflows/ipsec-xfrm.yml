@@ -104,6 +104,7 @@ jobs:
             --test xfrm_object_recovery_privileged \
             --test xfrm_object_roster_recovery_privileged \
             --test xfrm_peer_observation_privileged \
+            --test xfrm_child_sa_roster_privileged \
             --test xfrm_relocation_privileged \
             --test xfrm_sa_relocation_recovery_privileged \
             --no-run
@@ -309,6 +310,29 @@ jobs:
               ip link set lo up
               cargo test --locked -p opc-ipsec-xfrm --features ikev2 --test xfrm_auth_only_privileged -- --ignored --nocapture
             '
+
+      - name: Run installed Child-SA selection and rekey packet proof
+        run: |
+          set -euo pipefail
+          export CARGO_HOME="${CARGO_HOME:-${HOME}/.cargo}"
+          export RUSTUP_HOME="${RUSTUP_HOME:-${HOME}/.rustup}"
+          export CARGO_TARGET_DIR="${RUNNER_TEMP}/xfrm-target"
+          sudo env \
+            "PATH=${PATH}" \
+            "CARGO_HOME=${CARGO_HOME}" \
+            "RUSTUP_HOME=${RUSTUP_HOME}" \
+            "CARGO_TARGET_DIR=${CARGO_TARGET_DIR}" \
+            "OPC_XFRM_RUN_CHILD_SA_ROSTER_PRIVILEGED=1" \
+            unshare -n -- bash -euxo pipefail -c '
+              umask 022
+              ip link set lo up
+              cargo test --locked -p opc-ipsec-xfrm --features ikev2 \
+                --test xfrm_child_sa_roster_privileged -- \
+                --ignored --exact installed_child_sa_roster_selects_exact_marked_spis_and_fences_replacement \
+                --nocapture --test-threads=1
+            ' 2>&1 | tee "${RUNNER_TEMP}/xfrm-child-sa-roster.log"
+          grep -Fq 'N3_CHILD_SA_INSTALLED_PACKET_PROOF_OK' "${RUNNER_TEMP}/xfrm-child-sa-roster.log"
+          grep -Eq '^test result: ok. 1 passed; 0 failed; 0 ignored;' "${RUNNER_TEMP}/xfrm-child-sa-roster.log"
 
       - name: Run authenticated ESP peer-observation proof
         run: |

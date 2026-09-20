@@ -17,6 +17,50 @@ use crate::XfrmError;
 /// unsupported adapters keep operations cheap and deterministic.
 #[async_trait]
 pub trait XfrmBackend: Send + Sync + std::fmt::Debug {
+    /// Acquire an affine ticket for installed Child-SA roster publication.
+    ///
+    /// Only a namespace-bound actor with whole-roster readback and writer
+    /// fencing implements this optional profile. Raw Linux, mock and custom
+    /// backends fail closed by default. Install/adopt resources before this call.
+    async fn begin_child_sa_roster_update(&self) -> Result<crate::ChildSaRosterUpdate, XfrmError> {
+        Err(XfrmError::UnsupportedFeature {
+            feature: "installed_child_sa_roster",
+        })
+    }
+
+    /// Consume a current ticket, read back every declared SA/policy and publish
+    /// one key-free generation. A failed readback retires the predecessor.
+    ///
+    /// The actor continues an admitted call after caller cancellation. Lost
+    /// replies require a fresh ticket and full readback; they do not authorize
+    /// use of an older generation. This call makes no kernel mutations and
+    /// grants no packet-provenance or endpoint-migration authority.
+    async fn publish_child_sa_roster(
+        &self,
+        _update: crate::ChildSaRosterUpdate,
+        _request: crate::ChildSaInstalledRosterRequest,
+    ) -> Result<crate::InstalledChildSaRoster, XfrmError> {
+        Err(XfrmError::UnsupportedFeature {
+            feature: "installed_child_sa_roster",
+        })
+    }
+
+    /// Select an exact outbound pair after fresh whole-roster readback.
+    ///
+    /// Caller classification chooses a class or the explicit default. This is
+    /// a point-in-time observation under namespace writer exclusion, not a
+    /// lock across later packet sends. Any admitted actor mutation invalidates
+    /// the publication, even if that mutation later fails or is indeterminate.
+    async fn select_installed_child_sa(
+        &self,
+        _roster: &crate::InstalledChildSaRoster,
+        _selection: crate::child_sa::ChildSaOutboundSelection,
+    ) -> Result<crate::InstalledChildSaSelection, XfrmError> {
+        Err(XfrmError::UnsupportedFeature {
+            feature: "installed_child_sa_roster",
+        })
+    }
+
     /// Allocate an SPI for an inbound SA.
     async fn allocate_spi(&self, request: AllocateSpiRequest) -> Result<SpiAllocation, XfrmError>;
 
