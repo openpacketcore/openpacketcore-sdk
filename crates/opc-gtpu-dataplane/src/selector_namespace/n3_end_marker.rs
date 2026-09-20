@@ -62,6 +62,7 @@ impl GtpuN3EndMarkerRequest {
         verifies_terminal_retired_stamp(&self.retired.admission, stamp)
     }
 
+    #[cfg(any(target_os = "linux", test))]
     pub(crate) fn is_current(&self) -> bool {
         self.window.is_current()
     }
