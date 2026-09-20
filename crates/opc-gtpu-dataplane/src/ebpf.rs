@@ -53816,6 +53816,7 @@ mod tests {
     mod grouped_bearer_transition;
     #[cfg(target_os = "linux")]
     mod n3_end_marker;
+    mod retained_namespace_boundary;
     // This fixture constructs real durable consensus, whose public platform
     // contract is Linux-only. The portable fake-runtime tests remain below.
     #[cfg(target_os = "linux")]
