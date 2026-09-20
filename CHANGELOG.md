@@ -29,6 +29,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- N3IWF DTLS fixture profiles bind 634 independent vector projections and
+  authored rekey, retirement, path-loss and process-restart obligations to
+  exact public source digests. Historical wires and their narrower scopes
+  remain intact; catalog loading makes no transport-execution claim. Refs #784, #795.
+
 - `opc-gtpu-dataplane`: submit N3 End Markers from exact protected retired
   claims after classifier quiescence, using the existing IPv4 UDP/2152
   control socket and original tunnel tuples. Refuse shared peer tunnels,

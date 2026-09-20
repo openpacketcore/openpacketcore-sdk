@@ -108,6 +108,12 @@ def main() -> int:
         run(sys.executable, "scripts/n3iwf_key_lifecycle_reference.py", "--check")
         run(sys.executable, "scripts/n3iwf_roster_lifecycle_reference.py", "--check")
         run(sys.executable, "scripts/n3iwf_dtls_lifecycle_reference.py", "--check")
+        run(sys.executable, "scripts/n3iwf_dtls_profile_reference.py", "--check")
+        # Cryptographic source regeneration belongs to the existing audited-DTLS
+        # job with its pinned Python environment. This gate verifies their exact
+        # source bytes and value-free projections without adding dependencies.
+        run(sys.executable, "crates/opc-diameter-transport/tests/fixtures/rfc6083/streams.py", "--check")
+        run(sys.executable, "vendor/dimpl/tests/dtls12/rfc5746_binding_reference.py", "--check")
         run(sys.executable, "crates/opc-gtpu-dataplane/tests/n3_reference.py", "--check")
         run(sys.executable, "scripts/n3iwf_gtpu_reference.py")
         run(

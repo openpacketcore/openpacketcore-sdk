@@ -336,6 +336,71 @@ fn dtls_lifecycle_families_load_with_explicit_execution_scope() {
 }
 
 #[test]
+fn dtls_profile_references_preserve_separate_execution_and_complete_inventory() {
+    let catalog = FixtureCatalog::load().expect("catalog must load");
+    let expected = std::collections::BTreeMap::from([
+        ("certificate-profile", 146),
+        ("coordinated-rekey", 25),
+        ("crl-profile", 52),
+        ("native-path-loss", 8),
+        ("native-process-restart", 6),
+        ("publication-retirement", 16),
+        ("rekey-binding", 100),
+        ("rekey-hello", 13),
+        ("server-name", 109),
+        ("stream-framing", 159),
+    ]);
+    let mut observed = std::collections::BTreeMap::new();
+    for (manifest, data) in catalog.manifests() {
+        if manifest.validation_scope != "rfc6083-profile-evidence-reference" {
+            continue;
+        }
+        assert_eq!(manifest.subset, "n2-dtls");
+        assert_eq!(manifest.encoding, "scenario-record");
+        assert_eq!(manifest.expected_outcome, "constructed");
+        assert!(!manifest.runtime_claim);
+        assert_eq!(manifest.context["execution_claim"], false);
+        assert_eq!(manifest.context["external_interoperability"], false);
+        assert_eq!(
+            manifest.context["requires_separate_runtime_qualification"],
+            true
+        );
+        let family = manifest.context["source_vector"]["case"]
+            .as_str()
+            .expect("family");
+        let record: serde_json::Value = serde_json::from_slice(data).expect("reference JSON");
+        assert_eq!(record["family"], family);
+        let cases = record["cases"].as_array().expect("cases");
+        assert_eq!(manifest.context["cases"], cases.len());
+        assert!(observed.insert(family, cases.len()).is_none());
+        if family == "stream-framing" {
+            assert_eq!(record["reference"]["corpus_cases"], 18_560);
+            assert_eq!(
+                cases
+                    .iter()
+                    .filter(|case| case["expected"] == "framing-admitted")
+                    .count(),
+                92
+            );
+        }
+        if family == "native-process-restart" {
+            assert_eq!(
+                cases
+                    .iter()
+                    .filter(|case| case["case"] == "wrong-replacement")
+                    .count(),
+                2
+            );
+            assert_eq!(
+                cases.iter().filter(|case| case["case"] == "crash").count(),
+                2
+            );
+        }
+    }
+    assert_eq!(observed, expected);
+}
+
+#[test]
 fn ngap_publishes_matrices_for_every_admitted_outcome() {
     let catalog = FixtureCatalog::load().expect("catalog must load");
     let completion = catalog.completions().get("ngap").expect("ngap completion");

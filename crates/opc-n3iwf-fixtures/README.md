@@ -23,7 +23,7 @@ independently with `FixtureCatalog::load_subset_from(root, subset)`.
 | `protocol-key` | Independent synthetic IKE AUTH known answers; separate consume/cancel/drop reference scenarios |
 | `nas-tcp` | Two-octet length, caller bounds, partial reads/EOF, opaque inner NAS |
 | `xfrm-roster` | Synthetic SPI roster records and explicit provenance/relocation preconditions |
-| `n2-dtls` | PPID 66, isolated DTLS record/DATA framing, lifecycle preconditions |
+| `n2-dtls` | PPID 66 framing, original stream-zero lifecycle contracts, and 634 digest-bound profile vector projections and runtime-test obligations |
 
 Key and transport scenario labels remain separate from cryptographic evidence.
 The `ike-auth-known-answer` cases exercise the existing SDK's key schedule,
@@ -49,6 +49,10 @@ checkout; this API does not sandbox a concurrently hostile filesystem.
 The repository gate adds read-only regeneration, independent envelope/scenario
 oracles, existing SDK codec tests, and verification of Git publication history.
 The Python reference oracles never import the fixture writer.
+The additive [DTLS profile records](../../docs/n3iwf-dtls-fixture-profiles.md)
+bind certificate/CRL, stream, rekey, SNI, path and process-restart evidence.
+Their references preserve the distinction between catalog validation and
+separate transport execution; the original records retain their scope.
 For N2 metadata, the oracle checks each claimed numeric port/PPID in both
 field orders and every repeated tuple. Independent Python and Rust checks
 anchor the default service port to IANA's decimal 38412 (`96 0c`). DATA claims

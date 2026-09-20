@@ -19,6 +19,7 @@ import n3iwf_gtpu_reference as gtpu_reference
 import n3iwf_key_lifecycle_reference as key_lifecycle
 import n3iwf_roster_lifecycle_reference as roster_lifecycle
 import n3iwf_dtls_lifecycle_reference as dtls_lifecycle
+import n3iwf_dtls_profile_reference as dtls_profiles
 
 ROOT = Path(__file__).resolve().parents[1]
 FIXTURES = ROOT / "crates/opc-n3iwf-fixtures/fixtures"
@@ -29,6 +30,68 @@ def wire(subset, name):
 
 
 class WireRegressions(unittest.TestCase):
+    def test_dtls_profiles_cannot_replace_source_rows_or_claim_execution(self):
+        original = json.loads((FIXTURES / "n2-dtls/profile-rekey-hello.json").read_text())
+        data = wire("n2-dtls", "profile-rekey-hello")
+        dtls_profiles.validate(original, data)
+        for mutation, reason in (
+            ("path", "dtls-profile-path"), ("digest", "dtls-profile-digest"),
+            ("family", "dtls-profile-family"), ("wire-row", "dtls-profile-wire"),
+            ("wire-outcome", "dtls-profile-wire"), ("wire-truncated", "dtls-profile-wire"),
+            ("wire-source", "dtls-profile-wire"), ("wire-secret", "dtls-profile-wire"),
+            ("count", "dtls-profile-context"), ("execution_claim", "dtls-profile-context"),
+            ("requires_separate_runtime_qualification", "dtls-profile-context"),
+            ("external_interoperability", "dtls-profile-context"), ("bool-type", "dtls-profile-context"),
+            ("scope", "dtls-profile-scope"), ("claims", "dtls-profile-claims"),
+            ("authority", "dtls-profile-authority"), ("direction", "dtls-profile-direction"),
+            ("provenance", "dtls-profile-provenance"), ("outcome", "dtls-profile-outcome"),
+            ("runtime_claim", "dtls-profile-outcome"),
+        ):
+            with self.subTest(mutation=mutation):
+                changed = json.loads(json.dumps(original))
+                payload = data
+                source = changed["context"]["source_vector"]
+                if mutation == "path": source["path"] = "../outside.json"
+                elif mutation == "digest": source["sha256"] = "0" * 64
+                elif mutation == "family": source["case"] = "server-name"
+                elif mutation.startswith("wire-"):
+                    value = json.loads(data)
+                    if mutation == "wire-row": value["cases"][0]["row"] = 2
+                    elif mutation == "wire-outcome": value["cases"][0]["expected"] = "reject"
+                    elif mutation == "wire-source": value["reference"]["sha256"] = "0" * 64
+                    elif mutation == "wire-secret": value["cases"][0]["record_hex"] = "00"
+                    payload = (json.dumps(value, sort_keys=True, separators=(",", ":")) + "\n").encode()
+                    if mutation == "wire-truncated": payload = payload[:-1]
+                    changed["wire"]["digest_sha256"] = hashlib.sha256(payload).hexdigest()
+                elif mutation == "count": changed["context"]["cases"] -= 1
+                elif mutation in ("execution_claim", "external_interoperability"): changed["context"][mutation] = True
+                elif mutation == "requires_separate_runtime_qualification": changed["context"][mutation] = False
+                elif mutation == "bool-type": changed["context"]["execution_claim"] = 0
+                elif mutation == "scope": changed["validation_scope"] = "dtls-record"
+                elif mutation == "claims": changed["semantic_assertions"][-1] = "external_interoperability=true"
+                elif mutation == "authority": changed["source"]["clauses"][-1] = "RFC mandatory stream count 16"
+                elif mutation == "direction": changed["direction"] = "ue-to-n3iwf"
+                elif mutation == "provenance": changed["provenance"]["independent_capture"] = True
+                elif mutation == "outcome": changed["expected_outcome"] = "receive"
+                else: changed["runtime_claim"] = True
+                with self.assertRaisesRegex(dtls_profiles.Invalid, "^" + reason + "$"):
+                    dtls_profiles.validate(changed, payload)
+
+    def test_dtls_profile_sources_and_redaction_are_pinned(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            source, digest, _, _ = dtls_profiles.VECTORS["rekey-hello"]
+            target = root / source
+            target.parent.mkdir(parents=True)
+            target.write_bytes((ROOT / source).read_bytes() + b"\n")
+            with mock.patch.object(dtls_profiles, "ROOT", root):
+                with self.assertRaisesRegex(dtls_profiles.Invalid, "^dtls-profile-source-digest$"):
+                    dtls_profiles.projected_vectors("rekey-hello")
+        for family in dtls_profiles.FAMILIES:
+            payload = dtls_profiles.wire(family)
+            for forbidden in (b"pkcs8", b"leaf_der", b"crl_der", b"record_hex", b"spiffe:", b"amf."):
+                self.assertNotIn(forbidden, payload)
+
     def test_dtls_catalog_cannot_rewrite_obligations_or_promote_scope(self):
         original = json.loads((FIXTURES / "n2-dtls/lifecycle-cancellation.json").read_text())
         data = wire("n2-dtls", "lifecycle-cancellation")
