@@ -3,7 +3,6 @@ name: GTP-U privileged
 on:
   pull_request:
   push:
-    if: ${{ false }}
     branches:
       - main
   workflow_dispatch:
