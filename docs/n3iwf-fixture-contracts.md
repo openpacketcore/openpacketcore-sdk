@@ -5,6 +5,11 @@ inventories. See its [README](../crates/opc-n3iwf-fixtures/README.md) and
 [conformance boundary](../crates/opc-n3iwf-fixtures/CONFORMANCE.md).
 The [SDK work order](n3iwf-work-order.md) maps these prerequisites to the
 implementation queue and existing public work.
+The [completion map](n3iwf-completion.md) links the resulting inventories to
+their separately qualified runtime contracts. Additive
+[Child-SA](n3iwf-child-sa-fixture-profiles.md) and
+[DTLS](n3iwf-dtls-fixture-profiles.md) records are digest-bound evidence
+references, not execution receipts.
 
 ## Layout and interpretation
 
@@ -119,7 +124,7 @@ NAS remains opaque; the mandatory SecurityKey field uses an all-zero synthetic
 placeholder. Neither establishes a NAS procedure, key derivation, authentication
 or a complete AMF exchange. Full clause 5.3 content handling remains outside
 this catalog's evidence. Paging is inapplicable under clause 5.4.
-Issue 784 continues tracking evidence beyond these boundaries.
+The aggregate inventory retains these NGAP-specific boundaries.
 
 ### Running the independent NGAP gate
 
@@ -171,7 +176,8 @@ and passes the placeholder to its existing AUTH calculation. This proves the
 octet-level connection for this vector. It does not implement typed key
 import, consume-once custody, operation/generation binding, or K_AMF derivation.
 Legacy wrong-generation, reuse, cancellation and drop cases remain reference
-state models pending #791's implementation and zeroization evidence.
+state models. The additive executable custody schedules and private audit
+qualify #791 separately, as recorded in the crate's conformance document.
 
 Thirty published cases cover positive AUTH, altered MIC/key/transcript/SPI/
 nonce/identity/direction/DH input, empty key, short data and unsupported method.
@@ -188,7 +194,8 @@ cargo test --locked -p opc-n3iwf-fixtures --test protocol_key_known_answers
 The reference needs Python's standard library and OpenSSL 3; it uses no network
 or live peer. Hosted CI archives its report. AUTH bodies and SA_INIT inputs do
 not prove certificate validation, EAP success, a protected IKE_AUTH exchange,
-SCTP/DTLS interoperability or kernel installation. These remain in #784.
+SCTP/DTLS interoperability or kernel installation. Broader runtime profiles
+have separate qualification linked from the completion map.
 
 ## Maintenance and publication
 
@@ -196,9 +203,16 @@ Both `--check` and `--self-test` generate into temporary directories. They
 reject changed, missing, extra, or symlinked files without repairing the input.
 Only explicit `--write` changes fixtures.
 
+The Child-SA and DTLS references are generated independently before the catalog
+writer publishes them. Changing a pinned source requires reviewing its evidence,
+regenerating the reference intentionally, and updating the writer's exact digest.
+Read-only checks reject drift; they never refresh a digest implicitly.
+
 ```bash
 python3 scripts/generate-n3iwf-fixtures.py --write
 python3 scripts/test-n3iwf-fixture-contracts.py
+python3 scripts/n3iwf_child_sa_profile_reference.py --check
+python3 scripts/n3iwf_dtls_profile_reference.py --check
 python3 scripts/n3iwf_fixture_oracles.py
 cargo test --locked -p opc-n3iwf-fixtures
 ```

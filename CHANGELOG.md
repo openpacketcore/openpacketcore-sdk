@@ -29,6 +29,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- `opc-n3iwf-fixtures`: complete the Child-SA evidence inventory with fifteen
+  digest-bound records covering 3,364 model cases and 89 runtime-test
+  obligations. Preserve historical vectors and publish an aggregate SDK
+  completion map without promoting catalog records to runtime authority.
+  Refs #784, #793, #795.
+
 - `opc-ipsec-xfrm` and `opc-proto-ikev2`: bind authenticated MOBIKE permits
   to installed Child-SA rosters and relocate every directional/rekey member
   under one durable writer gate. Exact policy blocks, complete readback and

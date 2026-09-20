@@ -21,6 +21,7 @@ import n3iwf_roster_lifecycle_reference as roster_lifecycle
 import n3iwf_dtls_lifecycle_reference as dtls_lifecycle
 import n3iwf_dtls_profile_reference as dtls_profiles
 import n3iwf_child_sa_relocation_reference as child_sa_relocation
+import n3iwf_child_sa_profile_reference as child_sa_profiles
 
 ROOT = Path(__file__).resolve().parents[1]
 FIXTURES = ROOT / "crates/opc-n3iwf-fixtures/fixtures"
@@ -31,6 +32,70 @@ def wire(subset, name):
 
 
 class WireRegressions(unittest.TestCase):
+    def test_child_sa_profiles_refuse_changed_evidence_and_authority_promotion(self):
+        original = json.loads((FIXTURES / "xfrm-roster/child-sa-relocation-complete.json").read_text())
+        data = wire("xfrm-roster", "child-sa-relocation-complete")
+        child_sa_profiles.validate(original, data)
+        mutations = (
+            ("path", "child-sa-path"), ("digest", "child-sa-digest"), ("family", "child-sa-family"),
+            ("wire-result", "child-sa-wire"), ("wire-order", "child-sa-wire"), ("wire-secret", "child-sa-wire"),
+            ("wire-source", "child-sa-wire"), ("wire-truncated", "child-sa-wire"),
+            ("wire-index", "child-sa-wire"), ("wire-duplicate", "child-sa-wire"),
+            ("count", "child-sa-context"), ("head", "child-sa-context"), ("tree", "child-sa-context"), ("base", "child-sa-context"),
+            ("execution_claim", "child-sa-context"), ("grants_authority", "child-sa-context"),
+            ("requires_separate_runtime_qualification", "child-sa-context"), ("external_interoperability", "child-sa-context"),
+            ("bool-type", "child-sa-context"), ("scope", "child-sa-scope"), ("authority", "child-sa-authority"),
+            ("claims", "child-sa-claims"), ("direction", "child-sa-direction"), ("provenance", "child-sa-provenance"),
+            ("outcome", "child-sa-outcome"), ("runtime_claim", "child-sa-outcome"),
+        )
+        for mutation, reason in mutations:
+            with self.subTest(mutation=mutation):
+                changed = json.loads(json.dumps(original))
+                payload = data
+                if mutation == "path": changed["context"]["source_vector"]["path"] = "../outside.json"
+                elif mutation == "digest": changed["context"]["source_vector"]["sha256"] = "0" * 64
+                elif mutation == "family": changed["context"]["source_vector"]["case"] = "native-relocation"
+                elif mutation.startswith("wire-"):
+                    value = json.loads(data)
+                    if mutation == "wire-result": value["cases"][0][-1] = "repair"
+                    elif mutation == "wire-order": value["cases"].reverse()
+                    elif mutation == "wire-secret": value["packet_hex"] = "00"
+                    elif mutation == "wire-source": value["references"][0]["sha256"] = "0" * 64
+                    elif mutation == "wire-index": value["cases"][0][0] += 1
+                    elif mutation == "wire-duplicate": value["cases"][1] = value["cases"][0]
+                    payload = (json.dumps(value, sort_keys=True, separators=(",", ":")) + "\n").encode()
+                    if mutation == "wire-truncated": payload = payload[:-1]
+                    changed["wire"]["digest_sha256"] = hashlib.sha256(payload).hexdigest()
+                elif mutation == "count": changed["context"]["cases"] -= 1
+                elif mutation in ("head", "tree", "base"): changed["context"]["public_sdk"][mutation] = "0" * 40
+                elif mutation in ("execution_claim", "grants_authority", "external_interoperability"): changed["context"][mutation] = True
+                elif mutation == "requires_separate_runtime_qualification": changed["context"][mutation] = False
+                elif mutation == "bool-type": changed["context"]["execution_claim"] = 0
+                elif mutation == "scope": changed["validation_scope"] = "roster-transition-contract"
+                elif mutation == "authority": changed["source"]["clauses"][-1] = "RFC requires exactly eight pairs"
+                elif mutation == "claims": changed["semantic_assertions"][-1] = "external_interoperability=true"
+                elif mutation == "direction": changed["direction"] = "ue-to-n3iwf"
+                elif mutation == "provenance": changed["provenance"]["independent_capture"] = True
+                elif mutation == "outcome": changed["expected_outcome"] = "receive"
+                else: changed["runtime_claim"] = True
+                with self.assertRaisesRegex(child_sa_profiles.Invalid, "^" + reason + "$"):
+                    child_sa_profiles.validate(changed, payload)
+
+    def test_child_sa_profile_sources_are_pinned_and_projections_are_value_free(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            path = child_sa_profiles.NATIVE
+            target = root / path
+            target.parent.mkdir(parents=True)
+            target.write_bytes((ROOT / path).read_bytes() + b"\n")
+            with mock.patch.object(child_sa_profiles, "ROOT", root):
+                with self.assertRaisesRegex(child_sa_profiles.Invalid, "^child-sa-source-digest$"):
+                    child_sa_profiles.read_pinned(path)
+        for family in child_sa_profiles.FAMILIES:
+            payload = child_sa_profiles.wire(family)
+            for forbidden in (b"packet_hex", b"key_hex", b"192.0.2.", b"198.51.100.", b"spiffe:", b"pkcs8", b"imsi"):
+                self.assertNotIn(forbidden, payload)
+
     def test_child_sa_relocation_reference_rejects_changed_obligations_and_contract(self):
         paths = (child_sa_relocation.SOURCE, child_sa_relocation.TABLE, child_sa_relocation.CONTRACT)
         with tempfile.TemporaryDirectory() as directory:

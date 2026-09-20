@@ -1,5 +1,11 @@
 # N3IWF SDK work order
 
+The original planning snapshot below is retained as history. The resulting
+[completion map](n3iwf-completion.md) links all ten fixture inventories and
+their qualified SDK contracts, including the later installed forwarding,
+Child-SA and protected-transport profiles. Use the tracker and that map when
+assessing remaining work; the dated queue below is not current issue status.
+
 This queue follows [tracker #795](https://github.com/openpacketcore/openpacketcore-sdk/issues/795).
 Checked against SDK `main` at `1416b647aabcc57bf983ed2443897f8c7743d590`
 on 2026-09-16. Issue state alone is not implementation evidence.
@@ -15,8 +21,8 @@ added independent IKE AUTH known answers and the synthetic NGAP-key handoff.
 
 The completion records permit consumers to depend on each declared inventory.
 They do not prove live transport, key custody, kernel behavior or all of #784.
-Keep [#784](https://github.com/openpacketcore/openpacketcore-sdk/issues/784)
-open for the remaining evidence described in
+At this planning snapshot, [#784](https://github.com/openpacketcore/openpacketcore-sdk/issues/784)
+remained open for evidence described in
 [the fixture conformance document](../crates/opc-n3iwf-fixtures/CONFORMANCE.md).
 
 ## Implementation queue

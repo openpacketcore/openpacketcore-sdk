@@ -19,7 +19,7 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
 FIXTURE_ROOT = ROOT / "crates" / "opc-n3iwf-fixtures" / "fixtures"
-PUBLIC_BASE = "ccd8ee2f9c803a9e015710b44ce20d981e45b8aa"
+PUBLIC_BASE = "1c7012e6667a29f27d1100f3492dff5cc2c05d34"
 ISSUE = 784
 
 # Existing public SDK vectors reused by digest (issues 341/493).
@@ -3261,6 +3261,49 @@ def xfrm_roster_lifecycle(subset_dir: Path) -> list[dict]:
     return fixtures
 
 
+def xfrm_child_sa_profiles(subset_dir: Path) -> list[dict]:
+    source = "crates/opc-n3iwf-fixtures/oracles/child-sa-profiles.json"
+    digest = "b092689801a0f85e2d32580ee5ab66b9a103291aa5db36baaf55d815504b3f55"
+    path = ROOT / source
+    if path.is_symlink() or hashlib.sha256(path.read_bytes()).hexdigest() != digest:
+        raise ValueError("n3iwf_child_sa_profile_digest")
+    reference = json.loads(path.read_bytes())
+    families = reference["families"]
+    if len(families) != 15 or sum(len(value["cases"]) for value in families.values()) != 3453:
+        raise ValueError("n3iwf_child_sa_profile_inventory")
+    fixtures = []
+    for family, value in sorted(families.items()):
+        if re.fullmatch(r"[a-z-]{1,32}", family) is None:
+            raise ValueError("n3iwf_child_sa_profile_name")
+        name = "child-sa-" + family
+        data = (json.dumps(dict(family=family, **value), sort_keys=True, separators=(",", ":")) + "\n").encode()
+        count = len(value["cases"])
+        item = manifest(
+            subset="xfrm-roster", name=name, case_class="ordering",
+            document="IETF RFC 4301, RFC 4303, RFC 4555 and bounded SDK profile", release="Published RFCs",
+            clauses=["RFC 4301 4.4", "RFC 4303 3.3 and 3.4", "RFC 4555 3.3, 3.5, 4 and 5",
+                     "SDK installed Child-SA and ordered relocation contracts"],
+            direction="local-backend", role="xfrm-backend",
+            prerequisite="Caller-owned established IKE association, namespace writer/send exclusion and separately qualified bounded backend; loading this record admits no effect",
+            provenance_class="referenced-public-vector", referenced=source + "#" + family,
+            notes="Independent contract-model projections and authored obligations for separately qualified public SDK tests. No packet capture, kernel execution, subscriber trust or live authority is produced by this record.",
+            sanitized=[{"name": "cases", "treatment": "synthetic-ordinals-phases-and-outcomes", "value_class": "synthetic"},
+                       {"name": "test-material", "treatment": "source-digests-only-no-key-packet-or-endpoint-values", "value_class": "synthetic"}],
+            wire_name=name, wire_hex=data.hex(" "),
+            assertions=["family=" + family, "cases=" + str(count), "execution_claim=false",
+                        "requires_separate_runtime_qualification=true", "grants_authority=false", "external_interoperability=false"],
+            outcome="constructed")
+        item["encoding"] = "scenario-record"
+        item["validation_scope"] = "installed-child-sa-evidence-reference"
+        item["context"] = dict(source_vector=dict(path=source, sha256=digest, case=family),
+            cases=count, evidence_kind=value["kind"], public_sdk=reference["public_sdk"],
+            execution_claim=False, requires_separate_runtime_qualification=True,
+            grants_authority=False, external_interoperability=False)
+        dump_manifest(subset_dir, item, data.hex(" "))
+        fixtures.append(item)
+    return fixtures
+
+
 def xfrm_roster(subset_dir: Path) -> list[dict]:
     positive = "01 00 00 01 0a 0b 0c 0d 0a 0b 0c 0e"
     overlap = "01 00 00 01 0a 0b 0c 0d 0a 0b 0c 0e 01 00 00 02 0a 0b 0c 0f 0a 0b 0c 10"
@@ -3485,6 +3528,7 @@ def xfrm_roster(subset_dir: Path) -> list[dict]:
     for item, wire in zip(fixtures, wires, strict=True):
         dump_manifest(subset_dir, item, wire)
     fixtures.extend(xfrm_roster_lifecycle(subset_dir))
+    fixtures.extend(xfrm_child_sa_profiles(subset_dir))
     write_readme(
         subset_dir,
         "XFRM roster fixture subset",
@@ -3503,7 +3547,16 @@ install failure, and issuing cuts before/after each member effect. The record
 contains only object kinds, ordinals, phase labels and expected observations.
 The scripted-backend comparison is distinct from separately qualified public
 Linux process-crash tests. IKE exchanges, installed Child-SA selection,
-per-packet provenance and complete-roster relocation remain outside this scope.
+per-packet provenance and complete-roster relocation remain outside that older
+durable-object-roster-lifecycle scope.
+
+Fifteen additive Child-SA evidence-reference records bind 3,364 independent
+whole-roster obligations and 89 authored runtime-test obligations to public SDK
+source digests. They cover installed selection, sealed ESP-in-UDP source events,
+publication fencing, live MOBIKE authority, native/NAT-T packet continuity and
+32 process-loss cuts. Every record has execution_claim=false and grants_authority=false.
+The catalog neither runs those tests nor broadens their qualified profiles.
+See docs/n3iwf-child-sa-fixture-profiles.md for the separate evidence boundaries.
 """,
     )
     write_completion(
@@ -3511,9 +3564,9 @@ per-packet provenance and complete-roster relocation remain outside this scope.
         completion(
             "xfrm-roster",
             fixtures,
-            constructed=["legacy single-pair/overlap/rekey scenario records", "636 independent durable object-roster schedules"],
-            receive=["legacy relocation/order labels", "scripted apply/rollback and authenticated-store recovery verdicts"],
-            unsupported=["PDU/QFI policy", "IKE notify parsing", "key material", "installed Child-SA selection and packet provenance", "complete-roster relocation"],
+            constructed=["legacy single-pair/overlap/rekey scenario records", "636 independent durable object-roster schedules", "3364 complete-roster obligations and 89 separate runtime-test references"],
+            receive=["legacy relocation/order labels", "scripted apply/rollback and authenticated-store recovery verdicts", "digest-bound installed selection, source provenance and whole-roster relocation obligations"],
+            unsupported=["PDU/QFI policy", "IKE notify parsing", "key material", "live XFRM or IKE operation from catalog loading", "every-packet provenance or external interoperability"],
         ),
     )
     return fixtures
