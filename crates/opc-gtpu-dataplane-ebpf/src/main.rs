@@ -413,15 +413,6 @@ fn count(index: u32) {
     }
 }
 
-// Diagnostic branch only: stage bits contain no packet or authority values.
-#[inline(always)]
-fn n3_diagnostic_stage(stage: u32) {
-    if let Some(counter) = GTPU_COUNTERS.get_ptr_mut(COUNTER_DL_DST_MISMATCH) {
-        // SAFETY: per-CPU diagnostic slot for this private comparison only.
-        unsafe { *counter |= 1_u64 << (stage + 16) };
-    }
-}
-
 #[inline(always)]
 fn count_binding_drop(index: u32) {
     if let Some(counter) = GTPU_DL_DROP.get_ptr_mut(index) {
@@ -1107,23 +1098,14 @@ fn publish_grouped_observation_event(
 /// changed group generation or registration suppresses stale observations.
 #[inline(never)]
 fn emit_grouped_uplink_observation_on_reentry(ctx: &TcContext, eth_proto: u16) {
-    if eth_proto == ETH_P_IPV6 {
-        n3_diagnostic_stage(0);
-    }
     let Some(nonce) = take_grouped_uplink_observation_stamp(ctx) else {
         return;
     };
-    if eth_proto == ETH_P_IPV6 {
-        n3_diagnostic_stage(1);
-    }
     let Some(group_key_ptr) = GTPU_OBS_REDIR.get_ptr(nonce) else {
         return;
     };
     // SAFETY: this retained map value is read only for this classifier invocation.
     let group_key = unsafe { *group_key_ptr };
-    if eth_proto == ETH_P_IPV6 {
-        n3_diagnostic_stage(2);
-    }
     let Some(authority_ptr) = GTPU_SESSIONS.get_ptr(group_key) else {
         return;
     };
@@ -1138,9 +1120,6 @@ fn emit_grouped_uplink_observation_on_reentry(ctx: &TcContext, eth_proto: u16) {
     {
         return;
     }
-    if eth_proto == ETH_P_IPV6 {
-        n3_diagnostic_stage(3);
-    }
     let Some(raw_registration) = GTPU_OBS_REG.get_ptr(group_key) else {
         return;
     };
@@ -1154,14 +1133,8 @@ fn emit_grouped_uplink_observation_on_reentry(ctx: &TcContext, eth_proto: u16) {
     else {
         return;
     };
-    if eth_proto == ETH_P_IPV6 {
-        n3_diagnostic_stage(4);
-    }
     if registration_nonce != nonce {
         return;
-    }
-    if eth_proto == ETH_P_IPV6 {
-        n3_diagnostic_stage(5);
     }
     let inner_offset = match eth_proto {
         ETH_P_IPV4 => ETH_HDR_LEN + GTPU_ENCAP_LEN,
@@ -1172,9 +1145,6 @@ fn emit_grouped_uplink_observation_on_reentry(ctx: &TcContext, eth_proto: u16) {
     else {
         return;
     };
-    if eth_proto == ETH_P_IPV6 {
-        n3_diagnostic_stage(6);
-    }
     emit_grouped_observation(
         ctx,
         Some(authority),
