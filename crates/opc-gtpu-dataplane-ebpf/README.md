@@ -87,6 +87,11 @@ aggregate and contain no rejected endpoint or session fields.
   on el9 fails the gate rather than shrinking it. Kernels outside the gated
   lines are unqualified rather than unsupported, and `opc-gtpu-dataplane`'s
   `probe_committed_classifier_load` establishes the answer on the node.
+- Grouped entry validation keeps each address check in a separate BPF call.
+  Combining the N3 endpoint checks with the remaining entry checks causes LLVM
+  register spills that exceed the cumulative stack limit on Linux 6.8 and
+  RHEL 9. The wire checks and accepted address sets are unchanged by this split;
+  both kernel jobs must load the committed object and execute forwarding tests.
 - Outer IPv6 is `MaterializedOnly`: GSO and pending
   `CHECKSUM_PARTIAL` state are rejected before encapsulation. Outer IPv6
   fragment reassembly is not claimed; only atomic Fragment headers are handled

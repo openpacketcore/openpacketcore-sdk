@@ -1212,6 +1212,24 @@ pub trait GtpuDataplaneBackend: Send + Sync + std::fmt::Debug {
         GtpuCapability::Missing
     }
 
+    /// Inspect support for one installed N3IWF QFI per inner-family entry.
+    ///
+    /// This bounded profile inserts uplink PSC and requires one matching
+    /// downlink PSC before applying the entry's complete mark. It uses the
+    /// existing grouped selector admission and exact readback. It does not
+    /// qualify multiple QFIs sharing a PAA, reflective QoS policy, fragmented
+    /// outer reassembly, or removal/End Marker ordering. The complete-role
+    /// query above therefore remains `Missing`.
+    ///
+    /// A positive report requires an exact currently qualified attachment;
+    /// it grants no mutation or peer-authentication authority.
+    async fn n3_fixed_flow_capability(
+        &self,
+        _attachment: GtpuSessionAttachmentSelector,
+    ) -> Result<GtpuCapability, GtpuError> {
+        Ok(GtpuCapability::Missing)
+    }
+
     /// Report support for the authority-bearing durable restart-recovery
     /// request independently of generationless exact removal.
     fn pdp_restart_recovery_capability(&self) -> GtpuCapability {

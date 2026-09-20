@@ -1,7 +1,8 @@
-# Experimental N3 packet/intent support
+# Experimental N3 packet, intent and fixed-flow support
 
-This document covers the additive `n3` module only. Existing GTP dataplane
-qualification remains documented in [README.md](README.md). This slice is
+This document covers the additive `n3` module and the bounded eBPF fixed-flow
+profile. Existing GTP dataplane qualification remains documented in
+[README.md](README.md). This slice is
 held (`publish = false`) and does not complete [#790](https://github.com/openpacketcore/openpacketcore-sdk/issues/790).
 
 ## Support boundary
@@ -12,7 +13,8 @@ held (`publish = false`) and does not complete [#790](https://github.com/openpac
 | Constructed send | Canonical uplink G-PDU, nonzero TEID, one first PSC, QFI 0–63, opaque nonempty inner payload | Software buffer construction only; no downlink constructor, packet transmission, UDP/IP header, checksum or offload claim |
 | Receive | Complete G-PDU; one PSC; uplink QFI or downlink QFI/RQI/optional PPI; caller-supplied expected direction | Shared PSC conditional-field subset; no monitoring timestamps, delay results, sequence-field extensions or MBS support |
 | Receive framing | Exact datagram length, bounded extension walk, duplicate PSC refusal, endpoint comprehension bits | Optional unknowns can appear before/after the PSC and remain in the borrowed original datagram; no raw re-encoder |
-| Linux, eBPF, mock, unsupported adapter | Exact coarse N3 capability result is `GtpuCapability::Missing` for each shipped adapter | No N3 install, runtime classifier/marking, generation readback, stale-writer fencing or removal/End Marker ordering is qualified |
+| eBPF fixed-flow attachment | One QFI per inner family; UL PSC insertion and DL QFI/direction checks; atomic generation/readback and opaque selector authority | Four inner/outer IP combinations; existing checksum/offload limits; no multi-QFI, reflective QoS, in-place QFI change or ordered End Marker retirement |
+| Linux, eBPF, mock, unsupported adapter | Coarse N3 capability remains `GtpuCapability::Missing` for every adapter; only qualified eBPF attachments expose the narrower fixed-flow capability | No full N3 role or backend parity claim |
 
 The two TNL types are not convertible. `N3ForwardingIntent` is desired data,
 not a receipt or mutation authority. Mark `None` explicitly requests zero;
@@ -68,9 +70,10 @@ their positive PSC examples have no inner payload and assert generic
 not an installed forwarding result. This slice adds separate synthetic
 packets with an opaque inner payload and changes no published fixture wire.
 
-The merged shared codecs already provide PSC construction/parsing and typed
-controls. [#341](https://github.com/openpacketcore/openpacketcore-sdk/issues/341)
-still owns the backend-neutral control-datagram port; this module adds none.
+The merged shared codecs provide PSC construction/parsing and typed controls.
+The eBPF backend also exposes its shared IPv4 control-datagram port from
+[#942](https://github.com/openpacketcore/openpacketcore-sdk/pull/942). The fixed-flow
+profile reuses that control handoff; it adds no independent control queue.
 Exact selector operations already use opaque requests/receipts. Remaining
 per-selector provenance/coordinator work belongs to
 [#663](https://github.com/openpacketcore/openpacketcore-sdk/issues/663), and
@@ -79,9 +82,14 @@ external adapter operation-stamp contracts to
 No caller-created generation receipt substitutes for those authorities.
 The checksum-offload control pass-through fixed in
 [#644](https://github.com/openpacketcore/openpacketcore-sdk/issues/644) is
-unchanged. Echo port rules, zero transmitted Recovery, ignored received
-Recovery authority, and End Marker lifecycle ordering still require those
-existing control/runtime interfaces; they are not claims of this slice.
+unchanged. Echo port rules, zero transmitted Recovery and ignored received
+Recovery authority remain the existing control port's responsibility.
+End Marker lifecycle ordering is not part of the fixed-flow profile.
+
+The [fixed-flow contract](../../docs/n3-fixed-flow-forwarding.md) separately
+describes installed authority, byte layouts, classifier limits and live
+qualification. The synthetic packet-helper fixtures below remain unchanged;
+their admission alone is not forwarding evidence.
 
 ## Evidence and reproducibility
 

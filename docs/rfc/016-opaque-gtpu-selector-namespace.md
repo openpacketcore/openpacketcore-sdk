@@ -404,6 +404,15 @@ entries in IPv4-then-IPv6 order; for each entry:
   egress DSCP tag (0=none, 1=present + u8)
 ```
 
+An N3 fixed-flow group uses desired-codec version `2`, with the same fields
+above followed by one byte per entry: QFI `0..63` for N3, or `0xff` for an
+ordinary entry. That byte follows the entry's egress DSCP. Version `2` requires
+at least one N3 entry; an entirely ordinary group retains the exact version `1`
+encoding. Decoding both versions requires exact canonical re-encoding. The QFI
+is forwarding semantics bound by the desired fingerprint, not a new selector
+atom. An unchanged-selector recovery or single-bearer reattach cannot change
+the N3 profile or QFI. See [the fixed-flow profile](../n3-fixed-flow-forwarding.md).
+
 No padding is present. The complete-set codec is version `1`, then a u16 big-
 endian atom count, then sorted unique atoms. Each atom is `tag || u16 length ||
 bytes`: tag `T` contains the existing 8-byte

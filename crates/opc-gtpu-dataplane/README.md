@@ -25,12 +25,20 @@ nonempty inner payload. It rejects trailing datagrams, duplicate/missing PSC,
 unsupported required extensions, zero TEID, and direction mismatches. Parsing
 does not authenticate a packet or establish session/selector ownership.
 
-All shipped adapters return `GtpuCapability::Missing` from
-`n3_forwarding_capability(N3ForwardingRole::N3iwf)`. The packet helpers do not
-qualify Linux/eBPF/mock forwarding, marking, exact generation readback,
-stale-writer fencing, or removal/End Marker ordering. Those operations require
-the existing control-datagram and selector-authority work. See the exact
-support boundary and synthetic evidence in [N3 conformance](CONFORMANCE.md).
+`GtpuSessionEntry::from_n3` projects an intent into the existing grouped
+selector-authority path. The eBPF attachment can expose
+`n3_fixed_flow_capability`: one fixed QFI per inner-family entry, uplink PSC
+insertion, matching downlink PSC, complete bearer marks, and exact atomic
+generation readback. Installation and retirement require the protected opaque
+selector namespace. See [fixed-flow forwarding](../../docs/n3-fixed-flow-forwarding.md)
+for the wire layout, native evidence and limits.
+
+All shipped adapters still return `GtpuCapability::Missing` from the broader
+`n3_forwarding_capability(N3ForwardingRole::N3iwf)`. Multiple QFIs for the same
+PAA, reflective QoS, in-place QFI replacement and ordered End Marker retirement
+remain outside the fixed-flow profile. Linux kernel-GTP, mock and unsupported
+adapters return `Missing` for the new attachment-scoped capability. The software
+packet helpers alone confer no install authority; see [N3 conformance](CONFORMANCE.md).
 
 ## API Shape
 

@@ -2,10 +2,11 @@
 //!
 //! These are software packet helpers, not installed forwarding state. They
 //! confer no peer authentication, selector authority, generation receipt,
-//! readiness, or protection-policy decision. All shipped backends report
-//! [`crate::GtpuCapability::Missing`] for N3 forwarding. Runtime integration
-//! must use the existing opaque selector-authority ports and the separately
-//! tracked backend-neutral control-datagram work.
+//! readiness, or protection-policy decision. [`crate::GtpuSessionEntry::from_n3`]
+//! projects an intent into the existing opaque grouped selector-authority
+//! path. The eBPF attachment has a separate bounded fixed-flow capability;
+//! all shipped backends still report [`crate::GtpuCapability::Missing`] for
+//! the broader N3 forwarding role, including multi-QFI and End Marker ordering.
 //!
 //! Received uplink TNL information names the UPF destination. Locally supplied
 //! downlink TNL information names the N3IWF receive endpoint. Neither is a

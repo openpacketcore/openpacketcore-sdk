@@ -15,6 +15,7 @@
 
 mod envelope;
 mod fragment;
+mod n3;
 mod pmtu;
 mod session;
 mod tft_classifier;
@@ -50,6 +51,7 @@ pub use fragment::{
     parse_gtpu_tpdu, GtpuDownlinkFragmentContract, GtpuReassemblyBounds, GtpuTpdu, GtpuTpduError,
     LINUX_DEFAULT_REASSEMBLY_BOUNDS, MAX_REASSEMBLED_GTPU_LEN,
 };
+pub use n3::{n3_downlink_psc_matches, n3_uplink_extension, N3_UPLINK_EXTENSION_LEN};
 pub use pmtu::{
     apply_uplink_mtu_policy, decide_uplink_encap, decide_uplink_pmtu, encap_overhead,
     stamp_ipv4_dont_fragment, GtpuOuterFragmentPolicy, GtpuPmtuProtocol, GtpuPmtuSignal,

@@ -2507,7 +2507,7 @@ fn grouped_device_config(
 fn grouped_entry_to_ebpf(entry: &GtpuSessionEntry) -> Option<EbpfSessionEntry> {
     let context = entry.context();
     validate_gtp_version(context.gtp_version).ok()?;
-    EbpfSessionEntry::new(
+    let encoded = EbpfSessionEntry::new(
         entry.inner_paa(),
         endpoint_address(context.peer_address),
         endpoint_address(entry.local_outer_address()),
@@ -2519,7 +2519,11 @@ fn grouped_entry_to_ebpf(entry: &GtpuSessionEntry) -> Option<EbpfSessionEntry> {
         context.egress_dscp.map(crate::DscpCodepoint::get),
         context.downlink_source_port_policy,
         context.uplink_source_port_policy,
-    )
+    )?;
+    match entry.n3_qfi() {
+        Some(qfi) => encoded.with_n3_qfi(qfi.get()),
+        None => Some(encoded),
+    }
 }
 
 fn grouped_record_from_model(
@@ -2572,7 +2576,11 @@ fn grouped_model_from_record(
                 .transpose()
                 .ok()?,
         };
-        entries.push(GtpuSessionEntry::new(context, ip_address(entry.local_outer_address())).ok()?);
+        let model = GtpuSessionEntry::new(context, ip_address(entry.local_outer_address())).ok()?;
+        entries.push(match entry.n3_qfi() {
+            Some(qfi) => model.restore_n3_qfi(qfi)?,
+            None => model,
+        });
     }
     GtpuSessionGroup::new(record.group_id(), record.device_id(), entries).ok()
 }
@@ -14918,6 +14926,16 @@ impl GtpuDataplaneBackend for EbpfGtpuDataplaneBackend {
                 GtpuCapability::Unknown
             },
         }
+    }
+
+    async fn n3_fixed_flow_capability(
+        &self,
+        attachment: GtpuSessionAttachmentSelector,
+    ) -> Result<GtpuCapability, GtpuError> {
+        Ok(self
+            .gtpu_ip_family_capabilities(attachment)
+            .await?
+            .grouped_atomic_reconciliation)
     }
 
     async fn gtpu_ip_family_capabilities(
