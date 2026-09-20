@@ -238,6 +238,80 @@ fn ike_and_xfrm_are_separated() {
 }
 
 #[test]
+fn installed_child_sa_evidence_inventory_is_complete_and_grants_no_authority() {
+    let catalog = FixtureCatalog::load().expect("catalog must load");
+    let expected: BTreeSet<_> = [
+        "installed-selection",
+        "inbound-provenance",
+        "publication-fencing",
+        "mobike-authority",
+        "native-relocation",
+        "process-recovery",
+        "relocation-complete",
+        "relocation-mutation-before",
+        "relocation-mutation-after",
+        "relocation-read-before",
+        "relocation-read-after",
+        "relocation-foreign-member",
+        "relocation-missing-member",
+        "relocation-mixed-members",
+        "relocation-revoked",
+    ]
+    .into_iter()
+    .collect();
+    let mut observed = BTreeSet::new();
+    let mut projected = 0;
+    let mut authored = 0;
+    for (manifest, data) in catalog.manifests() {
+        if manifest.validation_scope != "installed-child-sa-evidence-reference" {
+            continue;
+        }
+        assert_eq!(manifest.subset, "xfrm-roster");
+        assert!(!manifest.runtime_claim);
+        for claim in [
+            "execution_claim",
+            "grants_authority",
+            "external_interoperability",
+        ] {
+            assert_eq!(manifest.context[claim], false);
+        }
+        assert_eq!(
+            manifest.context["requires_separate_runtime_qualification"],
+            true
+        );
+        assert_eq!(
+            manifest.context["public_sdk"]["head"],
+            "1c7012e6667a29f27d1100f3492dff5cc2c05d34"
+        );
+        assert_eq!(
+            manifest.context["public_sdk"]["tree"],
+            "1de2e42f567031052e26322d0f581b87993180b2"
+        );
+        let family = manifest.context["source_vector"]["case"]
+            .as_str()
+            .expect("family");
+        assert!(
+            observed.insert(family),
+            "duplicate Child-SA evidence family"
+        );
+        let record: serde_json::Value =
+            serde_json::from_slice(data).expect("bounded reference record");
+        assert_eq!(record["family"], family);
+        let count = record["cases"].as_array().expect("obligations").len() as u64;
+        assert_eq!(manifest.context["cases"], count);
+        if family.starts_with("relocation-") {
+            assert_eq!(record["kind"], "independent-obligation-projection");
+            projected += count;
+        } else {
+            assert_eq!(record["kind"], "authored-runtime-test-obligations");
+            authored += count;
+        }
+    }
+    assert_eq!(observed, expected);
+    assert_eq!((projected, authored), (3364, 89));
+}
+
+#[test]
 fn durable_roster_lifecycle_families_load_with_explicit_execution_scope() {
     let catalog = FixtureCatalog::load().expect("catalog must load");
     let expected: BTreeSet<_> = [

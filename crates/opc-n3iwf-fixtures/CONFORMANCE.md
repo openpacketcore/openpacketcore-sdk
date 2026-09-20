@@ -11,7 +11,8 @@ existing NGAP and GTP-U codecs and IKE crypto against the published bytes.
 
 `complete` in a subset record means its declared fixture inventory is complete
 at its `validation_scope`. It does not mean a N3IWF primitive is implemented
-or that all acceptance evidence for issue 784 has been supplied.
+or qualify its runtime. The [SDK completion map](../../docs/n3iwf-completion.md)
+links the aggregate fixture inventory and separate implementation evidence.
 
 The additive `rfc6083-profile-evidence-reference` scope publishes 634 vector
 projections and authored runtime-test obligations in ten families. Full source
@@ -20,6 +21,14 @@ corpora. Test-source references bind coordinated rekey, publication retirement,
 native path loss and peer-process restart. Catalog checks never assert runtime
 execution or promote the older stream-zero profile. See the
 [complete inventory and limits](../../docs/n3iwf-dtls-fixture-profiles.md).
+
+The additive `installed-child-sa-evidence-reference` scope publishes 3,453
+model projections and authored runtime-test obligations in fifteen families.
+Full source digests bind installed selection, sealed source observations,
+writer fencing, live MOBIKE authority and complete-roster recovery. Exact source
+row references preserve all model cases within the catalog's file-size bound.
+Every record explicitly grants no authority and requires separate runtime
+qualification. See the [Child-SA inventory](../../docs/n3iwf-child-sa-fixture-profiles.md).
 
 ## Specification baseline
 
@@ -91,7 +100,8 @@ when their local digest is refreshed, or changed source, direction, field,
 critical provenance or normative-source claims. Existing fixture wires remain
 unchanged. Codec execution checks all 33 GTP-U catalog cases and preserves the
 new packets' opaque payload. This qualifies synthetic PSC wire fields only;
-forwarding installation, classifier binding and backend capability remain #790.
+forwarding installation, classifier binding and backend capability are qualified
+separately by the [fixed-flow contract](../../docs/n3-fixed-flow-forwarding.md).
 Round trips alone do not prove external interoperability.
 
 ## Unsupported evidence
@@ -106,12 +116,13 @@ Round trips alone do not prove external interoperability.
   K_AMF hierarchy derivation, hardware-backed custody, key export, and external
   memory-zeroization observation. The executable volatile custody and private
   audit evidence below qualifies its explicitly bounded SDK contract.
-- In-place DTLS rekey, multistream, CRL/OCSP and the full 3GPP PKI profile,
-  restart recovery and authenticated relocation. The stream-zero replay
-  below qualifies its bounded existing SDK profile; catalog bytes alone
-  authenticate no peer and expose no exporter secret.
+- Full 3GPP PKI, OCSP, remote CRL retrieval and external transport
+  interoperability. Bounded rekey, ordered streams, CRL retirement, path loss
+  and peer-process restart have [separate runtime qualification](../../docs/n3iwf-dtls-fixture-profiles.md).
+  Catalog bytes alone authenticate no peer and expose no exporter secret.
 - Kernel XFRM installation, live dataplane, AMF selection, deployment,
-  readiness, and product claims. Issue 795 remains tracking-only.
+  readiness, and product claims from catalog loading. Installed selection and
+  authenticated relocation have [separate runtime qualification](../../docs/n3iwf-child-sa-fixture-profiles.md).
 
 The [README](README.md) maps each subset to its exact evidence boundary.
 The [maintenance guide](../../docs/n3iwf-fixture-contracts.md) describes
@@ -151,7 +162,8 @@ are unchanged. Four existing ignored Linux tests are separately executable in
 an isolated SCTP-AUTH network namespace; ordinary in-memory replay does not
 qualify the kernel. Neither source establishes in-place rekey, multistream,
 revocation, restart/multihoming recovery or external peer interoperability.
-Those runtime requirements remain in #794.
+The subsequent #794 profiles are linked above; this original replay retains
+its stream-zero scope.
 
 ## Executable durable object-roster schedules
 
@@ -178,7 +190,8 @@ labels remain separately qualified as scenario labels. These records contain
 only synthetic ordinal obligations, not packets or key material. They establish
 neither installed packet classification nor authenticated packet provenance,
 overlapping Child-SA ownership or complete roster relocation. Those runtime
-boundaries remain in #793. Separately executed Linux crash-cut tests are recorded
+boundaries are qualified separately by the Child-SA profiles linked above.
+Separately executed Linux crash-cut tests are recorded
 in PR evidence; the 636 scripted schedules themselves have
 `kernel_validation=false` and all catalog records retain `runtime_claim=false`.
 

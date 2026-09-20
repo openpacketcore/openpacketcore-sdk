@@ -33,21 +33,38 @@
     "opc.n3iwf.xfrm-roster.v1.lifecycle-issuing-before",
     "opc.n3iwf.xfrm-roster.v1.lifecycle-recover-applied",
     "opc.n3iwf.xfrm-roster.v1.lifecycle-recover-prepared",
-    "opc.n3iwf.xfrm-roster.v1.lifecycle-sweep-failure"
+    "opc.n3iwf.xfrm-roster.v1.lifecycle-sweep-failure",
+    "opc.n3iwf.xfrm-roster.v1.child-sa-inbound-provenance",
+    "opc.n3iwf.xfrm-roster.v1.child-sa-installed-selection",
+    "opc.n3iwf.xfrm-roster.v1.child-sa-mobike-authority",
+    "opc.n3iwf.xfrm-roster.v1.child-sa-native-relocation",
+    "opc.n3iwf.xfrm-roster.v1.child-sa-process-recovery",
+    "opc.n3iwf.xfrm-roster.v1.child-sa-publication-fencing",
+    "opc.n3iwf.xfrm-roster.v1.child-sa-relocation-complete",
+    "opc.n3iwf.xfrm-roster.v1.child-sa-relocation-foreign-member",
+    "opc.n3iwf.xfrm-roster.v1.child-sa-relocation-missing-member",
+    "opc.n3iwf.xfrm-roster.v1.child-sa-relocation-mixed-members",
+    "opc.n3iwf.xfrm-roster.v1.child-sa-relocation-mutation-after",
+    "opc.n3iwf.xfrm-roster.v1.child-sa-relocation-mutation-before",
+    "opc.n3iwf.xfrm-roster.v1.child-sa-relocation-read-after",
+    "opc.n3iwf.xfrm-roster.v1.child-sa-relocation-read-before",
+    "opc.n3iwf.xfrm-roster.v1.child-sa-relocation-revoked"
   ],
   "constructed": [
     "legacy single-pair/overlap/rekey scenario records",
-    "636 independent durable object-roster schedules"
+    "636 independent durable object-roster schedules",
+    "3364 complete-roster obligations and 89 separate runtime-test references"
   ],
   "receive": [
     "legacy relocation/order labels",
-    "scripted apply/rollback and authenticated-store recovery verdicts"
+    "scripted apply/rollback and authenticated-store recovery verdicts",
+    "digest-bound installed selection, source provenance and whole-roster relocation obligations"
   ],
   "unsupported": [
     "PDU/QFI policy",
     "IKE notify parsing",
     "key material",
-    "installed Child-SA selection and packet provenance",
-    "complete-roster relocation"
+    "live XFRM or IKE operation from catalog loading",
+    "every-packet provenance or external interoperability"
   ]
 }

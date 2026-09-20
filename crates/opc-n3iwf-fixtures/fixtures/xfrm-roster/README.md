@@ -15,4 +15,13 @@ install failure, and issuing cuts before/after each member effect. The record
 contains only object kinds, ordinals, phase labels and expected observations.
 The scripted-backend comparison is distinct from separately qualified public
 Linux process-crash tests. IKE exchanges, installed Child-SA selection,
-per-packet provenance and complete-roster relocation remain outside this scope.
+per-packet provenance and complete-roster relocation remain outside that older
+durable-object-roster-lifecycle scope.
+
+Fifteen additive Child-SA evidence-reference records bind 3,364 independent
+whole-roster obligations and 89 authored runtime-test obligations to public SDK
+source digests. They cover installed selection, sealed ESP-in-UDP source events,
+publication fencing, live MOBIKE authority, native/NAT-T packet continuity and
+32 process-loss cuts. Every record has execution_claim=false and grants_authority=false.
+The catalog neither runs those tests nor broadens their qualified profiles.
+See docs/n3iwf-child-sa-fixture-profiles.md for the separate evidence boundaries.
