@@ -136,6 +136,10 @@ def main():
             port = sock.getsockname()[1]
         kvm = subprocess.run(["sudo", "-n", "test", "-r", "/dev/kvm"]).returncode == 0
         pidfile = vm / "pid"
+        # QEMU runs as root and otherwise creates a root-owned mode-0600 log.
+        # Create it as the invoking runner so evidence upload can read it.
+        serial = output / "guest-serial.log"
+        serial.write_bytes(b"")
         run(["sudo", "-n", "qemu-system-x86_64", "-machine", "accel=kvm" if kvm else "accel=tcg",
              "-cpu", "host" if kvm else "max", "-smp", "2", "-m", "3072",
              "-kernel", kernel_image, "-append", "root=/dev/vda1 rw console=ttyS0",
@@ -143,7 +147,7 @@ def main():
              "-drive", f"file={seed},format=raw,media=cdrom,readonly=on",
              "-netdev", f"user,id=net0,restrict=on,hostfwd=tcp:127.0.0.1:{port}-:22",
              "-device", "virtio-net-pci,netdev=net0", "-display", "none", "-serial",
-             f"file:{output}/guest-serial.log", "-daemonize", "-pidfile", pidfile])
+             f"file:{serial}", "-daemonize", "-pidfile", pidfile])
         pid = int(subprocess.check_output(["sudo", "-n", "cat", str(pidfile)], text=True))
         common = ["-i", str(key), "-o", "BatchMode=yes", "-o", "IdentitiesOnly=yes",
                   "-o", "StrictHostKeyChecking=no", "-o", "UserKnownHostsFile=/dev/null"]
