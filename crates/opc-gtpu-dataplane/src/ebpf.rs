@@ -33,6 +33,8 @@ use std::cell::RefCell;
 #[cfg(target_os = "linux")]
 mod control_port;
 pub(crate) mod grouped_simulation;
+#[cfg(target_os = "linux")]
+mod n3_end_marker;
 mod workload_scope;
 use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::fmt;
@@ -13703,6 +13705,31 @@ impl EbpfGtpuDataplaneBackend {
 
 #[async_trait]
 impl GtpuDataplaneBackend for EbpfGtpuDataplaneBackend {
+    async fn submit_n3_end_markers(
+        &self,
+        request: crate::GtpuN3EndMarkerRequest,
+    ) -> Result<crate::GtpuN3EndMarkerReceipt, GtpuError> {
+        #[cfg(target_os = "linux")]
+        {
+            let request = self
+                .run_blocking("ebpf_n3_end_marker", move |backend| {
+                    backend.submit_n3_end_markers_sync(request)
+                })
+                .await?;
+            if !request.is_current() {
+                return Err(state_indeterminate("ebpf_n3_end_marker_window"));
+            }
+            Ok(request.confirm_submitted())
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            let _ = request;
+            Err(GtpuError::UnsupportedFeature {
+                feature: "n3_end_marker_submission",
+            })
+        }
+    }
+
     async fn authorize_selector_reuse(
         &self,
         request: crate::GtpuSessionSelectorReuseRequest,
@@ -38665,10 +38692,20 @@ mod aya_runtime {
         let Some(build) = fields.next().and_then(|field| field.strip_prefix('#')) else {
             return false;
         };
-        if build.is_empty()
-            || !build.bytes().all(|byte| byte.is_ascii_digit())
-            || fields.next() != Some("SMP")
-        {
+        let decimal =
+            |value: &str| !value.is_empty() && value.bytes().all(|byte| byte.is_ascii_digit());
+        // Ubuntu decorates the build counter, including a dotted backport
+        // release on some kernels. That label does not change the SMP or
+        // preemption fields. Keep other vendor/build grammars unsupported.
+        let supported_build = if let Some(ubuntu) = build.strip_suffix("-Ubuntu") {
+            let (number, backport) = ubuntu
+                .split_once('~')
+                .map_or((ubuntu, None), |(number, release)| (number, Some(release)));
+            decimal(number) && backport.is_none_or(|release| release.split('.').all(decimal))
+        } else {
+            decimal(build)
+        };
+        if !supported_build || fields.next() != Some("SMP") {
             return false;
         }
         let remaining = fields.collect::<Vec<_>>();
@@ -38684,6 +38721,8 @@ mod aya_runtime {
             "#1 SMP PREEMPT_DYNAMIC Wed Sep 9 00:00:00 UTC 2026",
             "#2 SMP PREEMPT Wed Sep 9 00:00:00 UTC 2026",
             "#3 SMP Wed Sep 9 00:00:00 UTC 2026",
+            "#134-Ubuntu SMP PREEMPT_DYNAMIC Fri Jun 26 18:43:11 UTC 2026",
+            "#17~24.04.1-Ubuntu SMP PREEMPT_DYNAMIC Fri Jun 26 18:43:11 UTC 2026",
         ] {
             assert!(grouped_reader_grace_kernel_profile(version.as_bytes()));
         }
@@ -38691,6 +38730,17 @@ mod aya_runtime {
             "#1 SMP PREEMPT_RT Wed Sep 9 00:00:00 UTC 2026",
             "#1 SMP PREEMPT_RT_FULL Wed Sep 9 00:00:00 UTC 2026",
             "#1 SMP PREEMPT_UNKNOWN Wed Sep 9 00:00:00 UTC 2026",
+            "#134-Ubuntu SMP PREEMPT_RT Fri Jun 26 18:43:11 UTC 2026",
+            "#134-Ubuntu SMP PREEMPT_UNKNOWN Fri Jun 26 18:43:11 UTC 2026",
+            "#134-Unknown SMP PREEMPT_DYNAMIC Fri Jun 26 18:43:11 UTC 2026",
+            "#134-Ubuntu-RT SMP Fri Jun 26 18:43:11 UTC 2026",
+            "#-Ubuntu SMP PREEMPT_DYNAMIC Fri Jun 26 18:43:11 UTC 2026",
+            "#134-Ubuntu SMP",
+            "#17~24.04.1-Ubuntu SMP PREEMPT_RT Fri Jun 26 18:43:11 UTC 2026",
+            "#17~-Ubuntu SMP PREEMPT_DYNAMIC Fri Jun 26 18:43:11 UTC 2026",
+            "#17~24..04-Ubuntu SMP PREEMPT_DYNAMIC Fri Jun 26 18:43:11 UTC 2026",
+            "#17~24.04~1-Ubuntu SMP PREEMPT_DYNAMIC Fri Jun 26 18:43:11 UTC 2026",
+            "#17~24.04.1 SMP PREEMPT_DYNAMIC Fri Jun 26 18:43:11 UTC 2026",
             "#1 PREEMPT Wed Sep 9 00:00:00 UTC 2026",
             "#1 SMP",
             "# SMP Wed Sep 9 00:00:00 UTC 2026",
@@ -53764,6 +53814,8 @@ mod load_capability_tests {
 #[cfg(test)]
 mod tests {
     mod grouped_bearer_transition;
+    #[cfg(target_os = "linux")]
+    mod n3_end_marker;
     // This fixture constructs real durable consensus, whose public platform
     // contract is Linux-only. The portable fake-runtime tests remain below.
     #[cfg(target_os = "linux")]

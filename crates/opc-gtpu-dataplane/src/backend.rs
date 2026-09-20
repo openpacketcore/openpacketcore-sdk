@@ -932,6 +932,25 @@ pub trait GtpuDataplaneBackend: Send + Sync + std::fmt::Debug {
         })
     }
 
+    /// Submit one End Marker for each distinct outgoing N3 tunnel in the
+    /// SDK-issued request, after exact retirement and classifier quiescence.
+    ///
+    /// Implementations must hold the exclusive namespace effect lease, verify
+    /// the terminal stamp and complete absence before and after a trusted grace
+    /// period, and use each original tunnel's IPs, UDP ports and peer TEID. A
+    /// receipt means local submission only; failures after a send are
+    /// indeterminate. No caller-supplied retired flag or raw tuple is authority.
+    /// `UnsupportedFeature` is permitted only before any submission and must
+    /// reject the entire requested profile, including mixed tunnel graphs.
+    async fn submit_n3_end_markers(
+        &self,
+        _request: crate::GtpuN3EndMarkerRequest,
+    ) -> Result<crate::GtpuN3EndMarkerReceipt, GtpuError> {
+        Err(GtpuError::UnsupportedFeature {
+            feature: "n3_end_marker_submission",
+        })
+    }
+
     /// Qualify one complete retired selector source for RFC 017 reuse.
     ///
     /// This is deliberately distinct from [`Self::authorize_selector_reuse`]:

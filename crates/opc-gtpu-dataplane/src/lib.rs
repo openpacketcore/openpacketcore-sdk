@@ -180,7 +180,8 @@ pub use reassembly::{
 };
 pub use selector_namespace::GtpuSelectorNamespaceBootstrap;
 pub use selector_namespace::{
-    GtpuSessionSelectorActiveClaim, GtpuSessionSelectorAdmission,
+    GtpuN3EndMarkerCompletion, GtpuN3EndMarkerError, GtpuN3EndMarkerReceipt,
+    GtpuN3EndMarkerRequest, GtpuSessionSelectorActiveClaim, GtpuSessionSelectorAdmission,
     GtpuSessionSelectorAuthorityGeneration, GtpuSessionSelectorBackendBinding,
     GtpuSessionSelectorBackendReceipt, GtpuSessionSelectorBindingLease,
     GtpuSessionSelectorCoordinatorError, GtpuSessionSelectorDecommissionInspectRequest,

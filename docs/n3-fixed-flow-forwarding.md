@@ -70,9 +70,11 @@ This uses the bounded PSC subset in [TS 38.415 V18.2.0, sections 5.5.2–5.5.3](
 and the framing and extension-comprehension rules in
 [TS 29.281 V18.4.0, sections 5.1–5.2](https://www.etsi.org/deliver/etsi_ts/129200_129299/129281/18.04.00_60/ts_129281v180400p.pdf).
 It adds no reflective-QoS policy, multi-QFI classifier, QFI-to-Child-SA allocation,
-outer reassembly, new checksum-offload admission, in-place QFI replacement, or
-End Marker retirement ordering. Those remaining contracts keep the broad N3
-capability unavailable. Existing legacy GTP-U entries preserve their wire bytes.
+outer reassembly, new checksum-offload admission, or in-place QFI replacement.
+[End Marker retirement](n3-end-marker-retirement.md) is a separate bounded
+IPv4/source-port-2152 operation; it does not qualify full-profile End Marker
+support or peer delivery. The broad N3 capability remains unavailable.
+Existing legacy GTP-U entries preserve their wire bytes.
 
 ## Qualification
 

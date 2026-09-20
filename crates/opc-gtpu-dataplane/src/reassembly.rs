@@ -701,8 +701,6 @@ impl GtpuReassemblySocket {
         plan: crate::control_port::GtpuControlSendPlan,
     ) -> Result<usize, crate::control_port::GtpuControlPortError> {
         use crate::control_port::GtpuControlPortError;
-        use nix::sys::socket::{sendto, MsgFlags, SockaddrIn};
-        use std::os::fd::AsRawFd;
 
         if !std::sync::Arc::ptr_eq(&plan.socket_identity, &self.control_identity) {
             return Err(GtpuControlPortError::SocketMismatch);
@@ -710,15 +708,52 @@ impl GtpuReassemblySocket {
         if plan.source != std::net::SocketAddrV4::new(self.local_address, GTPU_PORT) {
             return Err(GtpuControlPortError::InvalidTuple);
         }
+        self.send_control_bytes(plan.peer, &plan.bytes)
+    }
+
+    /// Internal send path used only under the backend's retired-source request,
+    /// attachment mutation lock and protected namespace effect lease. Public
+    /// control responses continue to require their receive-bound affine plan.
+    pub(crate) fn send_retired_n3_end_marker(
+        &self,
+        local: Ipv4Addr,
+        peer: Ipv4Addr,
+        teid: crate::Teid,
+    ) -> Result<usize, crate::control_port::GtpuControlPortError> {
+        use crate::control_port::GtpuControlPortError;
+        use opc_proto_gtpu::{GtpuControlMessage, GtpuEndMarker, GtpuTunnelEndpointId};
+        if local != self.local_address
+            || peer.is_unspecified()
+            || peer.is_multicast()
+            || peer.is_broadcast()
+        {
+            return Err(GtpuControlPortError::InvalidTuple);
+        }
+        let bytes = GtpuControlMessage::EndMarker(GtpuEndMarker::new(GtpuTunnelEndpointId::new(
+            teid.get(),
+        )))
+        .to_bytes(opc_protocol::EncodeContext::default())
+        .map_err(|_| GtpuControlPortError::Encoding)?;
+        self.send_control_bytes(std::net::SocketAddrV4::new(peer, GTPU_PORT), &bytes)
+    }
+
+    fn send_control_bytes(
+        &self,
+        peer: std::net::SocketAddrV4,
+        bytes: &[u8],
+    ) -> Result<usize, crate::control_port::GtpuControlPortError> {
+        use crate::control_port::GtpuControlPortError;
+        use nix::sys::socket::{sendto, MsgFlags, SockaddrIn};
+        use std::os::fd::AsRawFd;
         self.verify_live_binding()?;
         let written = sendto(
             self.socket.as_raw_fd(),
-            &plan.bytes,
-            &SockaddrIn::from(plan.peer),
+            bytes,
+            &SockaddrIn::from(peer),
             MsgFlags::MSG_DONTWAIT | MsgFlags::MSG_NOSIGNAL,
         )
         .map_err(std::io::Error::from)?;
-        if written != plan.bytes.len() {
+        if written != bytes.len() {
             return Err(GtpuControlPortError::Io {
                 kind: std::io::ErrorKind::WriteZero,
             });

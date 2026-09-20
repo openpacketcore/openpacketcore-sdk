@@ -42,6 +42,8 @@
 
 #![cfg(target_os = "linux")]
 
+#[path = "ebpf_gtpu_privileged/n3_end_marker.rs"]
+mod n3_end_marker;
 #[path = "ebpf_gtpu_privileged/n3_fixed_flow.rs"]
 mod n3_fixed_flow;
 
@@ -13069,4 +13071,10 @@ async fn ebpf_gtpu_unknown_teid_reaches_shared_control_without_decap(
 #[ignore = "requires root, a fresh netns, and bpffs"]
 async fn ebpf_gtpu_n3_fixed_flow_live_contract() -> Result<(), Box<dyn std::error::Error>> {
     n3_fixed_flow::qualify().await
+}
+
+#[tokio::test]
+#[ignore = "requires root (CAP_BPF/CAP_NET_ADMIN), a fresh netns, and bpffs"]
+async fn ebpf_gtpu_n3_end_marker_retirement_ordering() -> Result<(), Box<dyn std::error::Error>> {
+    n3_end_marker::qualify().await
 }
