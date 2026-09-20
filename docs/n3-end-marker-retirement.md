@@ -47,6 +47,12 @@ Completion establishes retirement, classifier quiescence and acceptance of
 all marker datagrams by the local UDP stack. The existing qualified
 `MEMBARRIER_CMD_GLOBAL` path waits for RCU readers on the supported Linux
 profile; see [Linux 6.8 implementation](https://github.com/torvalds/linux/blob/v6.8/kernel/sched/membarrier.c).
+The kernel-profile check admits numeric build counters and Ubuntu's numeric
+counter/backport labels. SMP and the recognized non-RT preemption fields are
+still required, as is a successful query and invocation of the global barrier.
+Real-time, unknown vendor/preemption and malformed or truncated profiles remain
+unsupported before submission. The pinned Ubuntu 6.8 guest's `#134-Ubuntu`
+label is covered by a regression and an actual successful barrier probe.
 It provides no qdisc/NIC drain or remote ordering/delivery receipt. Caller-owned
 peer coordination and deployment qualification remain necessary. There is
 no End Marker acknowledgement, automatic retry, retransmission timer, or

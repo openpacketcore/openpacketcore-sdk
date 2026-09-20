@@ -42,6 +42,8 @@ jobs:
       - name: Check privileged GTP kernel support
         run: |
           set -euo pipefail
+          uname -r
+          uname -v
           if ! sudo modprobe gtp; then
             sudo apt-get install -y "linux-modules-extra-$(uname -r)" || true
             sudo modprobe gtp
@@ -346,6 +348,7 @@ jobs:
           ssh "${ssh_options[@]}" opc@127.0.0.1 '
             set -euo pipefail
             test "$(uname -r)" = "6.8.0-134-generic"
+            uname -v
             test "$(</proc/sys/kernel/osrelease)" = "6.8.0-134-generic"
             test "$(dpkg-query -W linux-image-6.8.0-134-generic | cut -f2)" = "6.8.0-134.134"
             case "$(systemd-detect-virt)" in

@@ -38692,10 +38692,20 @@ mod aya_runtime {
         let Some(build) = fields.next().and_then(|field| field.strip_prefix('#')) else {
             return false;
         };
-        if build.is_empty()
-            || !build.bytes().all(|byte| byte.is_ascii_digit())
-            || fields.next() != Some("SMP")
-        {
+        let decimal =
+            |value: &str| !value.is_empty() && value.bytes().all(|byte| byte.is_ascii_digit());
+        // Ubuntu decorates the build counter, including a dotted backport
+        // release on some kernels. That label does not change the SMP or
+        // preemption fields. Keep other vendor/build grammars unsupported.
+        let supported_build = if let Some(ubuntu) = build.strip_suffix("-Ubuntu") {
+            let (number, backport) = ubuntu
+                .split_once('~')
+                .map_or((ubuntu, None), |(number, release)| (number, Some(release)));
+            decimal(number) && backport.is_none_or(|release| release.split('.').all(decimal))
+        } else {
+            decimal(build)
+        };
+        if !supported_build || fields.next() != Some("SMP") {
             return false;
         }
         let remaining = fields.collect::<Vec<_>>();
@@ -38711,6 +38721,8 @@ mod aya_runtime {
             "#1 SMP PREEMPT_DYNAMIC Wed Sep 9 00:00:00 UTC 2026",
             "#2 SMP PREEMPT Wed Sep 9 00:00:00 UTC 2026",
             "#3 SMP Wed Sep 9 00:00:00 UTC 2026",
+            "#134-Ubuntu SMP PREEMPT_DYNAMIC Fri Jun 26 18:43:11 UTC 2026",
+            "#17~24.04.1-Ubuntu SMP PREEMPT_DYNAMIC Fri Jun 26 18:43:11 UTC 2026",
         ] {
             assert!(grouped_reader_grace_kernel_profile(version.as_bytes()));
         }
@@ -38718,6 +38730,17 @@ mod aya_runtime {
             "#1 SMP PREEMPT_RT Wed Sep 9 00:00:00 UTC 2026",
             "#1 SMP PREEMPT_RT_FULL Wed Sep 9 00:00:00 UTC 2026",
             "#1 SMP PREEMPT_UNKNOWN Wed Sep 9 00:00:00 UTC 2026",
+            "#134-Ubuntu SMP PREEMPT_RT Fri Jun 26 18:43:11 UTC 2026",
+            "#134-Ubuntu SMP PREEMPT_UNKNOWN Fri Jun 26 18:43:11 UTC 2026",
+            "#134-Unknown SMP PREEMPT_DYNAMIC Fri Jun 26 18:43:11 UTC 2026",
+            "#134-Ubuntu-RT SMP Fri Jun 26 18:43:11 UTC 2026",
+            "#-Ubuntu SMP PREEMPT_DYNAMIC Fri Jun 26 18:43:11 UTC 2026",
+            "#134-Ubuntu SMP",
+            "#17~24.04.1-Ubuntu SMP PREEMPT_RT Fri Jun 26 18:43:11 UTC 2026",
+            "#17~-Ubuntu SMP PREEMPT_DYNAMIC Fri Jun 26 18:43:11 UTC 2026",
+            "#17~24..04-Ubuntu SMP PREEMPT_DYNAMIC Fri Jun 26 18:43:11 UTC 2026",
+            "#17~24.04~1-Ubuntu SMP PREEMPT_DYNAMIC Fri Jun 26 18:43:11 UTC 2026",
+            "#17~24.04.1 SMP PREEMPT_DYNAMIC Fri Jun 26 18:43:11 UTC 2026",
             "#1 PREEMPT Wed Sep 9 00:00:00 UTC 2026",
             "#1 SMP",
             "# SMP Wed Sep 9 00:00:00 UTC 2026",
