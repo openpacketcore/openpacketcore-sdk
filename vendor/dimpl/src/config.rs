@@ -83,6 +83,8 @@ pub struct Config {
     use_server_cookie: bool,
     replay_detection: bool,
     rfc6083_sctp: bool,
+    rfc6083_rekey: bool,
+    server_name: Option<crate::ServerName>,
     flight_start_rto: Duration,
     flight_retries: usize,
     handshake_timeout: Duration,
@@ -194,6 +196,51 @@ impl Config {
     #[inline(always)]
     pub fn rfc6083_sctp(&self) -> bool {
         self.rfc6083_sctp
+    }
+
+    /// Opt into caller-armed, mutually authenticated RFC 5746 renegotiation.
+    ///
+    /// Only the reliable DTLS 1.2 SCTP certificate profile supports this
+    /// operation. Each handshake still requires the transport's RFC 6083
+    /// sender-drain, exporter, key activation and peer-Finished barriers.
+    pub fn with_rfc6083_rekey(mut self) -> Result<Self, Error> {
+        if !self.rfc6083_sctp
+            || !self.require_client_certificate
+            || !self.require_server_certificate_request
+            || self.psk.is_some()
+        {
+            return Err(Error::ConfigError(ConfigError::Rfc6083RekeyProfile));
+        }
+        self.rfc6083_rekey = true;
+        Ok(self)
+    }
+
+    /// Whether each side may explicitly arm secure renegotiation.
+    pub fn rfc6083_rekey(&self) -> bool {
+        self.rfc6083_rekey
+    }
+
+    /// Require one immutable RFC 6066 name on every SCTP handshake.
+    ///
+    /// A client sends this name and requires the empty server acknowledgement.
+    /// A server requires the same client name before acknowledging it. This is
+    /// an explicit single-name policy, not a certificate-selection callback.
+    /// Only the mutually authenticated DTLS 1.2 SCTP profile is supported.
+    pub fn with_server_name(mut self, name: crate::ServerName) -> Result<Self, Error> {
+        if !self.rfc6083_sctp
+            || !self.require_client_certificate
+            || !self.require_server_certificate_request
+            || self.psk.is_some()
+        {
+            return Err(Error::ConfigError(ConfigError::ServerNameProfile));
+        }
+        self.server_name = Some(name);
+        Ok(self)
+    }
+
+    /// Explicitly borrow the configured server name, if required.
+    pub fn server_name(&self) -> Option<&crate::ServerName> {
+        self.server_name.as_ref()
     }
 
     /// Time of first retry.
@@ -760,6 +807,8 @@ impl ConfigBuilder {
             use_server_cookie: self.use_server_cookie,
             replay_detection,
             rfc6083_sctp: self.rfc6083_sctp,
+            rfc6083_rekey: false,
+            server_name: None,
             flight_start_rto: self.flight_start_rto,
             flight_retries,
             handshake_timeout: self.handshake_timeout,
@@ -808,6 +857,8 @@ impl fmt::Debug for Config {
             .field("use_server_cookie", &self.use_server_cookie)
             .field("replay_detection", &self.replay_detection)
             .field("rfc6083_sctp", &self.rfc6083_sctp)
+            .field("rfc6083_rekey", &self.rfc6083_rekey)
+            .field("server_name", &self.server_name)
             .field("flight_start_rto", &self.flight_start_rto)
             .field("flight_retries", &self.flight_retries)
             .field("handshake_timeout", &self.handshake_timeout)

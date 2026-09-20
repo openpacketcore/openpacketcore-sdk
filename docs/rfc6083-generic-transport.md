@@ -84,6 +84,14 @@ actual decrypted record with authenticated SCTP metadata, not FIFO position.
 
 ## Evidence and reproduction
 
+The contract above records the initial profile and is pinned by its lifecycle
+fixtures. Optional later capabilities are documented in
+[the current crate contract](../crates/opc-diameter-transport/README.md), including
+[coordinated rekey](rfc6083-rekey-transport.md) and
+[explicit server names](rfc6083-server-name.md).
+The later [certificate constraints](rfc6083-certificate-profile.md) add a bounded
+ECDSA operator-certificate subset with required local and peer CRLs.
+
 The fixture catalog now adds ten independently checked lifecycle families at
 `rfc6083-stream-zero-lifecycle`: eight existing client-certificate cases plus
 78 authored schedules for both endpoint roles. The lifecycle model pins the

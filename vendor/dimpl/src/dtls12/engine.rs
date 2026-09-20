@@ -22,6 +22,9 @@ use crate::{
 const MAX_DEFRAGMENT_PACKETS: usize = 50;
 const MAX_SEQUENCE_NUMBER: u64 = (1_u64 << 48) - 1;
 
+mod rekey;
+pub(super) mod server_name;
+
 struct Rfc6083OutputBarrier {
     preceding_datagrams: usize,
     material: Zeroizing<Vec<u8>>,
@@ -79,6 +82,10 @@ pub struct Engine {
 
     /// Cryptographic context for handling encryption/decryption
     pub(crate) crypto_context: CryptoContext,
+    previous_crypto_context: Option<CryptoContext>,
+    previous_protected_send_count: u64,
+    peer_epoch: u16,
+    rekey: rekey::RekeyState,
 
     /// Whether the remote peer has enabled encryption
     peer_encryption_enabled: bool,
@@ -239,6 +246,10 @@ impl Engine {
             min_protected_fragment_len: 0,
             protected_send_count: 0,
             crypto_context,
+            previous_crypto_context: None,
+            previous_protected_send_count: 0,
+            peer_epoch: 0,
+            rekey: rekey::RekeyState::default(),
             peer_encryption_enabled: false,
             is_client: false,
             peer_handshake_seq_no: 0,
@@ -382,7 +393,7 @@ impl Engine {
             return Ok(());
         }
 
-        // Reject new handshakes after initial handshake is complete (renegotiation not supported).
+        // A new handshake requires an explicit local rekey transition first.
         if self.release_app_data && handshake.header.message_seq >= self.peer_handshake_seq_no {
             return Err(Error::RenegotiationAttempt);
         }
@@ -852,7 +863,10 @@ impl Engine {
             .queue_rx
             .iter()
             .flat_map(|i| i.records().iter())
-            .find(|r| !r.is_handled())?;
+            .find(|r| {
+                !r.is_handled()
+                    && (self.previous_crypto_context.is_none() || r.record().content_type == ctype)
+            })?;
 
         if record.record().content_type != ctype {
             return None;
@@ -888,7 +902,13 @@ impl Engine {
     where
         F: FnOnce(&mut Buf),
     {
-        self.create_record_inner(content_type, epoch, save_fragment, false, f)
+        self.create_record_inner(
+            content_type,
+            self.record_epoch(epoch),
+            save_fragment,
+            false,
+            f,
+        )
     }
 
     /// Create a DTLS record in a new datagram even when the current datagram
@@ -908,7 +928,13 @@ impl Engine {
     where
         F: FnOnce(&mut Buf),
     {
-        self.create_record_inner(content_type, epoch, save_fragment, true, f)
+        self.create_record_inner(
+            content_type,
+            self.record_epoch(epoch),
+            save_fragment,
+            true,
+            f,
+        )
     }
 
     fn create_record_inner<F>(
@@ -923,10 +949,10 @@ impl Engine {
         F: FnOnce(&mut Buf),
     {
         if epoch >= 1 {
-            self.ensure_protected_send_budget(1)?;
+            self.ensure_epoch_send_budget(epoch, 1)?;
         }
 
-        let sequence = if epoch == 0 {
+        let sequence = if epoch == self.sequence_epoch_0.epoch {
             self.sequence_epoch_0
         } else {
             self.sequence_epoch_n
@@ -1017,9 +1043,9 @@ impl Engine {
 
             // Get the fixed part of the IV
             let iv = if self.is_client {
-                self.crypto_context.get_client_write_iv()
+                self.write_context(epoch).get_client_write_iv()
             } else {
-                self.crypto_context.get_server_write_iv()
+                self.write_context(epoch).get_server_write_iv()
             };
 
             let Some(iv) = iv else {
@@ -1053,7 +1079,7 @@ impl Engine {
             let aad = Aad::new_dtls12(content_type, sequence, length);
 
             // Encrypt the fragment in-place
-            self.encrypt_data(&mut fragment, aad, nonce)?;
+            self.encrypt_data(epoch, &mut fragment, aad, nonce)?;
             let ctext_len = fragment.len();
 
             // For suites with a per-record nonce (e.g. AES-GCM), prefix it on the wire.
@@ -1079,7 +1105,7 @@ impl Engine {
         };
 
         // Increment the sequence number for the next transmission
-        if epoch == 0 {
+        if epoch == self.sequence_epoch_0.epoch {
             self.sequence_epoch_0.sequence_number += 1;
         } else {
             self.sequence_epoch_n.sequence_number += 1;
@@ -1101,7 +1127,11 @@ impl Engine {
         }
 
         if epoch >= 1 {
-            self.protected_send_count += 1;
+            if epoch == self.sequence_epoch_0.epoch {
+                self.previous_protected_send_count += 1;
+            } else {
+                self.protected_send_count += 1;
+            }
         }
 
         // Return the fragment buffer to the pool
@@ -1115,8 +1145,8 @@ impl Engine {
     where
         F: FnOnce(&mut Buf, &mut Self) -> Result<(), Error>,
     {
-        let epoch = msg_type.epoch();
-        let sequence = if epoch == 0 {
+        let epoch = self.record_epoch(msg_type.epoch());
+        let sequence = if epoch == self.sequence_epoch_0.epoch {
             self.sequence_epoch_0
         } else {
             self.sequence_epoch_n
@@ -1139,7 +1169,7 @@ impl Engine {
         let (required_records, new_datagrams) =
             self.required_handshake_records(body_buffer.len(), epoch)?;
         if epoch >= 1 {
-            self.ensure_protected_send_budget(required_records)?;
+            self.ensure_epoch_send_budget(epoch, required_records)?;
         }
         let final_sequence = sequence
             .sequence_number
@@ -1289,13 +1319,21 @@ impl Engine {
     }
 
     fn ensure_protected_send_budget(&self, additional: usize) -> Result<(), Error> {
+        self.ensure_epoch_send_budget(self.sequence_epoch_n.epoch, additional)
+    }
+
+    fn ensure_epoch_send_budget(&self, epoch: u16, additional: usize) -> Result<(), Error> {
         let additional = u64::try_from(additional).map_err(|_| {
             Error::CryptoError(crate::CryptoError::AeadEncryptionLimitReached {
                 limit: self.config.aead_encryption_limit(),
             })
         })?;
-        let within_budget = self
-            .protected_send_count
+        let used = if epoch == self.sequence_epoch_0.epoch {
+            self.previous_protected_send_count
+        } else {
+            self.protected_send_count
+        };
+        let within_budget = used
             .checked_add(additional)
             .is_some_and(|count| count <= self.config.aead_encryption_limit());
         if !within_budget {
@@ -1358,6 +1396,7 @@ impl Engine {
     /// Release application data from the incoming queue
     pub fn release_application_data(&mut self) {
         self.release_app_data = true;
+        self.previous_crypto_context = None;
     }
 
     /// Whether a close_notify alert has been received from the peer.
@@ -1413,13 +1452,19 @@ impl Engine {
     }
 
     /// Encrypt data appropriate for the role (client or server)
-    fn encrypt_data(&mut self, plaintext: &mut Buf, aad: Aad, nonce: Nonce) -> Result<(), Error> {
+    fn encrypt_data(
+        &mut self,
+        epoch: u16,
+        plaintext: &mut Buf,
+        aad: Aad,
+        nonce: Nonce,
+    ) -> Result<(), Error> {
         if self.is_client {
-            self.crypto_context
+            self.write_context_mut(epoch)
                 .encrypt_client_to_server(plaintext, aad, nonce)
                 .map_err(Error::CryptoError)
         } else {
-            self.crypto_context
+            self.write_context_mut(epoch)
                 .encrypt_server_to_client(plaintext, aad, nonce)
                 .map_err(Error::CryptoError)
         }
@@ -1433,11 +1478,11 @@ impl Engine {
         nonce: Nonce,
     ) -> Result<(), Error> {
         if self.is_client {
-            self.crypto_context
+            self.read_context_mut()
                 .decrypt_server_to_client(ciphertext, aad, nonce)
                 .map_err(Error::CryptoError)
         } else {
-            self.crypto_context
+            self.read_context_mut()
                 .decrypt_client_to_server(ciphertext, aad, nonce)
                 .map_err(Error::CryptoError)
         }
@@ -1493,6 +1538,9 @@ impl Engine {
     }
 
     pub fn set_cipher_suite(&mut self, cipher_suite: Dtls12CipherSuite) -> Result<(), Error> {
+        if self.previous_crypto_context.is_some() && self.cipher_suite != Some(cipher_suite) {
+            return Err(Error::RenegotiationAttempt);
+        }
         // Cache AEAD record parameters from the provider suite. The formula
         // (explicit_nonce + tag) lives on the suite trait; Engine just stores
         // the resolved values for hot-path access.
@@ -1515,25 +1563,22 @@ impl Engine {
         debug!("Peer encryption enabled");
         self.peer_encryption_enabled = true;
 
-        let maybe_index_epoch1 = self
-            .queue_rx
-            .iter()
-            .position(|i| i.records().iter().any(|r| r.record().sequence.epoch == 1));
-
-        let Some(index_epoch1) = maybe_index_epoch1 else {
-            return Ok(());
-        };
-
-        // Now decrypt all entries remaining.
-        let all = self.queue_rx.split_off(index_epoch1);
-
+        self.peer_epoch = self.sequence_epoch_n.epoch;
+        self.replay = ReplayWindow::new();
+        // Earlier application records have already been authenticated. Keep
+        // their plaintext; only the new epoch's buffered ciphertext is reparsed.
+        let all = self.queue_rx.split_off(0);
         for incoming in all {
-            let unhandled = incoming.into_records().filter(|r| !r.is_handled());
-
-            for record in unhandled {
-                let buf = record.into_buffer();
-                self.parse_packet(&buf)?;
-                self.buffers_free.push(buf);
+            for record in incoming.into_records().filter(|r| !r.is_handled()) {
+                if record.record().sequence.epoch == self.peer_epoch {
+                    let buf = record.into_buffer();
+                    self.parse_packet(&buf)?;
+                    self.buffers_free.push(buf);
+                } else if record.record().content_type == ContentType::ApplicationData {
+                    self.queue_rx.push_back(Incoming::from_record(record));
+                } else {
+                    self.buffers_free.push(record.into_buffer());
+                }
             }
         }
 
@@ -1542,13 +1587,13 @@ impl Engine {
 
     fn peer_iv(&self) -> Result<Iv, Error> {
         if self.is_client {
-            self.crypto_context
+            self.read_context()
                 .get_server_write_iv()
                 .ok_or(Error::CryptoError(
                     crate::CryptoError::WriteIvNotAvailable { is_client: false },
                 ))
         } else {
-            self.crypto_context
+            self.read_context()
                 .get_client_write_iv()
                 .ok_or(Error::CryptoError(
                     crate::CryptoError::WriteIvNotAvailable { is_client: true },
@@ -1621,6 +1666,19 @@ impl Engine {
 impl RecordHandler for Engine {
     fn classify_record(&mut self, record: Record) -> Result<Option<Record>, Error> {
         let epoch = record.record().sequence.epoch;
+        if epoch > self.peer_epoch {
+            return Ok(Some(record));
+        }
+        if epoch > 0 && epoch < self.peer_epoch {
+            self.push_buffer(record.into_buffer());
+            return Ok(None);
+        }
+        if self.config.rfc6083_rekey()
+            && record.record().content_type == ContentType::ChangeCipherSpec
+            && record.record().fragment(record.buffer()) != [1]
+        {
+            return Err(Error::RenegotiationAttempt);
+        }
 
         if record.record().content_type == ContentType::ChangeCipherSpec
             && epoch == 0
@@ -1716,6 +1774,14 @@ impl RecordHandler for Engine {
         self.peer_encryption_enabled
     }
 
+    fn can_decrypt_epoch(&self, epoch: u16) -> bool {
+        self.peer_encryption_enabled && epoch == self.peer_epoch
+    }
+
+    fn accepts_epoch(&self, epoch: u16) -> bool {
+        epoch <= self.sequence_epoch_n.epoch && (epoch == 0 || epoch >= self.peer_epoch)
+    }
+
     fn replay_check(&self, seq: Sequence) -> bool {
         if !self.config.replay_detection() {
             return true;
@@ -1773,8 +1839,60 @@ impl RecordHandler for Engine {
 }
 
 #[cfg(test)]
-mod tests {
+pub(super) mod tests {
     use super::*;
+
+    pub(in crate::dtls12) fn rekey_fixture_receiver(client: bool) -> Engine {
+        let config = Arc::new(
+            Config::builder()
+                .rfc6083_sctp()
+                .require_server_certificate_request(true)
+                .dtls13_cipher_suites(&[])
+                .build()
+                .expect("mutual profile")
+                .with_rfc6083_rekey()
+                .expect("opt in"),
+        );
+        let mut engine = encrypted_engine(config, client);
+        engine.enable_peer_encryption().expect("old epoch");
+        engine
+            .verify_renegotiation_info(
+                &[crate::dtls12::message::Extension {
+                    extension_type: crate::dtls12::message::ExtensionType::RenegotiationInfo,
+                    extension_data_range: 0..1,
+                }],
+                &[0],
+                false,
+            )
+            .expect("initial extension");
+        engine.save_finished(true, std::array::from_fn(|i| i as u8));
+        engine.save_finished(false, std::array::from_fn(|i| 240 + i as u8));
+        engine.release_application_data();
+        engine.begin_rfc6083_rekey().expect("locally arm");
+        engine
+    }
+
+    pub(in crate::dtls12) fn rekey_hello_fixtures(
+        role: &str,
+    ) -> Vec<(&'static str, bool, Vec<u8>)> {
+        include_str!("../../tests/dtls12/rfc5746_hello_reference.tsv")
+            .lines()
+            .filter(|v| !v.starts_with('#'))
+            .filter_map(|row| {
+                let f: Vec<_> = row.split('\t').collect();
+                (f[0] == role).then(|| {
+                    (
+                        f[1],
+                        f[2] == "1",
+                        (0..f[3].len())
+                            .step_by(2)
+                            .map(|i| u8::from_str_radix(&f[3][i..i + 2], 16).expect("fixture hex"))
+                            .collect(),
+                    )
+                })
+            })
+            .collect()
+    }
 
     fn config(rfc6083: bool) -> Arc<Config> {
         let builder = Config::builder().dtls13_cipher_suites(&[]);
@@ -1799,7 +1917,7 @@ mod tests {
         )
     }
 
-    fn encrypted_engine(config: Arc<Config>, is_client: bool) -> Engine {
+    pub(super) fn encrypted_engine(config: Arc<Config>, is_client: bool) -> Engine {
         let mut engine = Engine::new(config, AuthMode::Psk);
         engine.set_client(is_client);
         engine
@@ -1834,7 +1952,7 @@ mod tests {
         engine
     }
 
-    fn drain_packets(engine: &mut Engine) -> Vec<Vec<u8>> {
+    pub(super) fn drain_packets(engine: &mut Engine) -> Vec<Vec<u8>> {
         let mut packets = Vec::new();
         let mut buffer = vec![0_u8; crate::config::RFC6083_DTLS_MTU];
         while let Output::Packet(packet) = engine.poll_output(&mut buffer, Instant::now()) {

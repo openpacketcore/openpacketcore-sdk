@@ -12,14 +12,13 @@ can return a protected connection. This API requires no `PeerSession`,
 Diameter identity or CER/CEA. The existing Diameter API retains its procedure
 admission and PPID 47 behavior.
 
-This initial generic profile supports reliable ordered stream zero only.
+By default, the generic profile uses reliable ordered stream zero only.
 Nonzero or unordered receive metadata and plaintext PPID 60 are terminal
 errors. The connection has sequential `send`/`receive`, a consuming reciprocal
 `close`, and borrowed negotiated `readback`; cancellation after an operation
 starts closes the carrier. Readback and successful delivery reconcile both
 credential retirement and observed carrier termination. It does not provide
-the complete NGAP stream or 3GPP certificate/revocation profile, in-place
-renegotiation, or new restart/multihoming guarantees. See the exact support and
+the complete NGAP stream or 3GPP certificate/revocation profile. See the exact support and
 verification boundaries in [the generic RFC 6083 contract](../../docs/rfc6083-generic-transport.md).
 
 The generic endpoints also offer `new_with_required_crls`. A local
@@ -42,6 +41,30 @@ The profile bounds pending correlations and queued plaintexts and rejects
 protected records with any wire version other than DTLS 1.2. See the exact
 resource, ordering and qualification contract in
 [ordered application streams](../../docs/rfc6083-stream-transport.md).
+
+`Policy::with_rekey` enables explicitly coordinated `Connection::rekey` on
+the existing SCTP association. RFC 5746 binds the fresh handshake to the
+previous Finished values; all SCTP-AUTH barriers run again. Queued records
+retain their streams, and the original credential/CRL authority and absolute
+lifetime remain binding. Native qualification includes an independent capture
+of actual SCTP-AUTH key transitions. See the exact profile and limits in
+[coordinated rekey](../../docs/rfc6083-rekey-transport.md).
+
+Generic `Connector::with_server_name` and `Acceptor::with_server_name` opt into
+one bounded RFC 6066 DNS name. SNI acknowledgement and exact server DNS SAN
+verification supplement the existing mutual SPIFFE/trust checks, including
+during rekey. Missing or mismatching names fail closed; there is no CN or
+wildcard fallback. The independent Hello fixtures and native wire evidence
+are documented in [named endpoints](../../docs/rfc6083-server-name.md).
+
+Endpoints constructed with required CRLs can also add
+`CertificateProfile::NdsAfEcdsa` using `with_certificate_profile`. The bounded
+operator-certificate subset checks local credentials and the authenticated
+peer path, including the original selected anchor's CA constraints and
+expiry. It retains those checks through rekey without broadening SPIFFE or
+trust authority. See the precise ECDSA subset, independent signed corpus and
+remaining RSA/retrieval limitations in
+[certificate constraints](../../docs/rfc6083-certificate-profile.md).
 
 The required Linux SCTP job executes the generic, CRL, Diameter, stream and
 path-failure tests in a private SCTP-AUTH namespace. Actual kernel drop
@@ -109,7 +132,8 @@ for the exact crash cut, credential handling and remaining limits.
   and `Origin-Realm` configuration. Typed CER/CEA parsing and construction use
   the same nonempty-ASCII DiameterIdentity contract, with ASCII
   case-insensitive authorization comparison.
-- Client `ServerName` is only ClientHello routing/SNI input. It is not
+- The Diameter TLS/TCP client's rustls `ServerName` is only ClientHello
+  routing/SNI input. It is not
   authorization evidence and no DNS SAN is required; the SPIFFE verifier and
   exact `ExpectedPeerIdentity` authorize the peer.
 - Diameter framing reads the exact 20-octet header before bounded allocation,

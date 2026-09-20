@@ -27,6 +27,24 @@ tar -xOf dimpl-0.7.2.crate dimpl-0.7.2/.cargo_vcs_info.json
 OpenPacketCore carries a security-scoped patch with the following intentional
 changes:
 
+- The explicit mutual-certificate SCTP profile supports a bounded RFC 6066
+  server name. It emits and validates a single host_name/empty acknowledgement,
+  keeps the configured name through rekey, and rejects missing, malformed,
+  duplicate, unsolicited or mismatched negotiation. The embedding SDK adds
+  independent certificate DNS SAN checks; the engine's SNI alone is not peer
+  authentication. Names and errors are redacted. Independent extension and
+  protected-Hello fixtures exercise both production receive call sites.
+  See [named SDK endpoints](../../docs/rfc6083-server-name.md).
+
+- Explicitly armed RFC 6083 rekey uses RFC 5746 previous-Finished bindings,
+  retains old record keys/sequence/AEAD budgets through ChangeCipherSpec,
+  derives fresh handshake keys and exporters, and buffers new-epoch records
+  until peer Finished. The opt-in profile requires mutual certificates.
+  Independent extension and protected-Hello fixtures exercise both Hello
+  validation call sites; real handshake tests cover successive transitions,
+  queued old plaintext, old-epoch rejection and cross-stream reordering.
+  See [the SDK rekey contract](../../docs/rfc6083-rekey-transport.md).
+
 - DTLS 1.2 RFC 6083 mode disables record replay detection and DTLS flight
   retransmission, fixes the DTLS record budget at 16,384 bytes, and rejects
   configurations that retain any DTLS 1.3 cipher suite. Every output SCTP

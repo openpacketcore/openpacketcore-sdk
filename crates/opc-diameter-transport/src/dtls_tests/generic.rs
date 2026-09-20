@@ -1,11 +1,14 @@
 //! Exercise the public generic boundary without constructing a Diameter session.
 
+pub(crate) mod certificates;
 mod independent;
 #[cfg(target_os = "linux")]
 mod paths;
+mod rekey;
 #[cfg(target_os = "linux")]
 mod restart;
 mod revocation;
+pub(crate) mod sni;
 mod streams;
 
 use super::*;

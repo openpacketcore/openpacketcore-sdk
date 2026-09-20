@@ -350,6 +350,37 @@ async fn withdrawn_source_interrupts_pending_receive_and_handshake() {
 }
 
 #[tokio::test]
+async fn withdrawn_crls_interrupt_an_in_place_rekey_in_both_roles() {
+    for role in ["client", "server"] {
+        let material = Materials::new(role);
+        let mut publication = CrlPublisher::new(&material.local);
+        publication
+            .publish(fixture_crls(role, "valid"))
+            .expect("valid CRLs");
+        let policy = generic_policy(PayloadProtocol::Ngap).with_rekey();
+        let (mut local, remote, log) = material
+            .pair_with_policy(publication.source(), policy)
+            .await;
+        log.set_dtls_send_blocked(true, true);
+        let mut rekey = Box::pin(local.rekey(Instant::now() + Duration::from_secs(5)));
+        std::future::poll_fn(|cx| {
+            assert!(rekey.as_mut().poll(cx).is_pending());
+            Poll::Ready(())
+        })
+        .await;
+        publication.withdraw();
+        assert_eq!(
+            tokio::time::timeout(Duration::from_secs(1), rekey)
+                .await
+                .expect("prompt CRL retirement"),
+            Err(Error::Retired)
+        );
+        assert_eq!(local.readback().err(), Some(Error::Retired));
+        assert_eq!(remote.readback().err(), Some(Error::ConnectionClosed));
+    }
+}
+
+#[tokio::test]
 async fn unavailable_and_obsolete_sources_never_fall_back_to_legacy_handshakes() {
     for mode in ["empty", "closed", "epoch"] {
         let material = Materials::new("server");

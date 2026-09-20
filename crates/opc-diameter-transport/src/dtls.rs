@@ -553,6 +553,7 @@ impl SctpTransportClose for InMemoryClose {
 /// multihoming or path semantics.
 #[cfg(test)]
 pub struct InMemorySctpEndpoint {
+    buffered_receive: VecDeque<SctpUserMessage>,
     protected_ppid: u32,
     tx: mpsc::Sender<SctpUserMessage>,
     rx: mpsc::Receiver<SctpUserMessage>,
@@ -803,6 +804,9 @@ impl SctpMessageIo for InMemorySctpEndpoint {
         Box::pin(async move {
             self.phase.ensure_dtls()?;
             loop {
+                if let Some(message) = self.buffered_receive.pop_front() {
+                    return Ok(Some(message));
+                }
                 if self.shared.closed.load(Ordering::Acquire) && self.rx.is_empty() {
                     return Ok(None);
                 }
@@ -812,7 +816,20 @@ impl SctpMessageIo for InMemorySctpEndpoint {
                             return Ok(None);
                         }
                     }
-                    message = self.rx.recv() => return Ok(message),
+                    message = self.rx.recv() => {
+                        let Some(message) = message else { return Ok(None) };
+                        if requires_receive_drain(message.payload()) {
+                            while let Ok(buffered) = self.rx.try_recv() {
+                                if self.buffered_receive.len() >= self.rx.max_capacity() {
+                                    return Err(DiameterTlsError::Transport);
+                                }
+                                self.buffered_receive.push_back(buffered);
+                            }
+                            self.buffered_receive.push_back(message);
+                        } else {
+                            return Ok(Some(message));
+                        }
+                    },
                 }
             }
         })
@@ -917,6 +934,7 @@ pub fn in_memory_sctp_link(
     };
     (
         InMemorySctpEndpoint {
+            buffered_receive: VecDeque::new(),
             tx: a_tx,
             rx: a_rx,
             a_side: true,
@@ -928,6 +946,7 @@ pub fn in_memory_sctp_link(
             protected_ppid: DIAMETER_DTLS_SCTP_PPID,
         },
         InMemorySctpEndpoint {
+            buffered_receive: VecDeque::new(),
             tx: b_tx,
             rx: b_rx,
             a_side: false,
@@ -1021,59 +1040,44 @@ impl KernelSctpMessageIo {
         let terminal = Arc::new(AtomicBool::new(false));
         let task_terminal = Arc::clone(&terminal);
         let receive_task = runtime.spawn(async move {
-            loop {
-                let received = match receive.recv().await {
-                    Ok(received) => received,
-                    Err(_) => {
-                        let _ = inbound_tx.try_send(Err(DiameterTlsError::Transport));
-                        break;
-                    }
-                };
-                if received.notification {
-                    match received.event {
-                        Some(opc_sctp::SctpEvent::Shutdown { .. })
-                        | Some(opc_sctp::SctpEvent::Unknown { .. })
-                        | Some(opc_sctp::SctpEvent::StreamReset { .. })
-                        | Some(opc_sctp::SctpEvent::AssociationReset { .. })
-                        | Some(opc_sctp::SctpEvent::StreamChange { .. })
-                        | Some(opc_sctp::SctpEvent::PartialDeliveryAborted { .. })
-                        | None => {
-                            let _ = inbound_tx.try_send(Err(DiameterTlsError::Transport));
-                            break;
+            let result: Result<(), DiameterTlsError> = async {
+                loop {
+                    let received = receive
+                        .recv()
+                        .await
+                        .map_err(|_| DiameterTlsError::Transport)?;
+                    let mut messages = VecDeque::new();
+                    if !received.notification && requires_receive_drain(&received.payload) {
+                        // RFC 6083 section 4.7: observing a CCS on stream zero
+                        // does not prove the other streams have been read. Drain
+                        // the real socket to EAGAIN before publishing this CCS.
+                        // New-epoch ciphertext can overtake Finished and remains
+                        // buffered in DTLS until that epoch is authenticated.
+                        while let Some(buffered) = receive
+                            .recv_buffered()
+                            .await
+                            .map_err(|_| DiameterTlsError::Transport)?
+                        {
+                            if messages.len() >= receive_queue_capacity {
+                                return Err(DiameterTlsError::Transport);
+                            }
+                            messages.push_back(buffered);
                         }
-                        Some(opc_sctp::SctpEvent::AssociationChange {
-                            state: 0, error: 0, ..
-                        })
-                        | Some(
-                            opc_sctp::SctpEvent::PeerAddrChange { .. }
-                            | opc_sctp::SctpEvent::SenderDry { .. }
-                            | opc_sctp::SctpEvent::Authentication { .. },
-                        ) => continue,
-                        Some(opc_sctp::SctpEvent::AssociationChange { .. }) => {
-                            let _ = inbound_tx.try_send(Err(DiameterTlsError::Transport));
-                            break;
+                    }
+                    messages.push_back(received);
+                    for received in messages {
+                        if let Some(message) = kernel_dtls_message(received)? {
+                            // Never block notification processing behind DATA.
+                            inbound_tx
+                                .try_send(Ok(message))
+                                .map_err(|_| DiameterTlsError::Transport)?;
                         }
                     }
                 }
-                let order = match received.order {
-                    DeliveryOrder::Ordered => SctpDeliveryOrder::Ordered,
-                    DeliveryOrder::Unordered => SctpDeliveryOrder::Unordered,
-                };
-                let message = SctpUserMessage::new(
-                    received.payload,
-                    received.ppid.get(),
-                    received.stream_id,
-                    order,
-                    received.truncated,
-                    received.control_truncated,
-                    false,
-                );
-                // Never await a full DATA queue: doing so would stop the only
-                // kernel receiver from dispatching sender-dry and SCTP-AUTH
-                // notifications. Capacity exhaustion is terminal and bounded.
-                if inbound_tx.try_send(Ok(message)).is_err() {
-                    break;
-                }
+            }
+            .await;
+            if let Err(error) = result {
+                let _ = inbound_tx.try_send(Err(error));
             }
             task_terminal.store(true, Ordering::Release);
             task_abort.abort();
@@ -1099,6 +1103,41 @@ impl KernelSctpMessageIo {
         }
         Ok(deadline.saturating_duration_since(now))
     }
+}
+
+fn requires_receive_drain(payload: &[u8]) -> bool {
+    matches!(payload.first().copied(), Some(20 | 21))
+}
+
+fn kernel_dtls_message(
+    received: opc_sctp::InboundMessage,
+) -> Result<Option<SctpUserMessage>, DiameterTlsError> {
+    if received.notification {
+        return match received.event {
+            Some(opc_sctp::SctpEvent::AssociationChange {
+                state: 0, error: 0, ..
+            })
+            | Some(
+                opc_sctp::SctpEvent::PeerAddrChange { .. }
+                | opc_sctp::SctpEvent::SenderDry { .. }
+                | opc_sctp::SctpEvent::Authentication { .. },
+            ) => Ok(None),
+            _ => Err(DiameterTlsError::Transport),
+        };
+    }
+    let order = match received.order {
+        DeliveryOrder::Ordered => SctpDeliveryOrder::Ordered,
+        DeliveryOrder::Unordered => SctpDeliveryOrder::Unordered,
+    };
+    Ok(Some(SctpUserMessage::new(
+        received.payload,
+        received.ppid.get(),
+        received.stream_id,
+        order,
+        received.truncated,
+        received.control_truncated,
+        false,
+    )))
 }
 
 fn validate_kernel_receive_queue_capacity(capacity: usize) -> Result<(), DiameterTlsError> {
@@ -1762,6 +1801,8 @@ struct HandshakeValidation {
     trust_bundles: TrustBundleSet,
     usage: PeerUsage,
     revocation: Option<Arc<rfc6083::revocation::Snapshot>>,
+    server_name: Option<rfc6083::ServerName>,
+    certificate_profile: Option<rfc6083::CertificateProfile>,
 }
 
 fn certificate_expiry(der: &[u8]) -> Result<Timestamp, DiameterTlsError> {
@@ -1885,6 +1926,15 @@ fn validate_peer_certificate_chain(
         .map_err(|_| DiameterTlsError::Authentication)?;
     if let Some(revocation) = &validation.revocation {
         revocation.verify_identifiers(&path, &bundle.certificates)?;
+    }
+    if let Some(profile) = validation.certificate_profile {
+        if validation.revocation.is_none() {
+            return Err(DiameterTlsError::Authentication);
+        }
+        expiry = expiry.min(profile.verify(&path, &bundle.certificates, validation.usage)?);
+    }
+    if let Some(name) = &validation.server_name {
+        name.verify_certificate(leaf)?;
     }
     Ok(expiry)
 }
@@ -2249,17 +2299,34 @@ async fn run_transport_handshake_with_streams(
     deadline: Instant,
     streams: rfc6083::streams::RecordStreams,
 ) -> Result<CompletedHandshake, DiameterTlsError> {
+    run_transport_handshake_with_state(
+        engine,
+        io,
+        validation,
+        deadline,
+        PumpState {
+            streams,
+            ..Default::default()
+        },
+        vec![0_u8; ENGINE_POLL_BUFFER],
+    )
+    .await
+}
+
+async fn run_transport_handshake_with_state(
+    engine: &mut dimpl::Dtls,
+    io: &mut Box<dyn SctpMessageIo>,
+    validation: &HandshakeValidation,
+    deadline: Instant,
+    mut state: PumpState,
+    mut buffer: Vec<u8>,
+) -> Result<CompletedHandshake, DiameterTlsError> {
     // dimpl starts the client flight and seeds server state from
     // handle_timeout; the explicit initial kick keeps the handshake
     // deterministic instead of depending on the engine's first timer.
     engine
         .handle_timeout(std::time::Instant::now())
         .map_err(|_| DiameterTlsError::TlsHandshake)?;
-    let mut state = PumpState {
-        streams,
-        ..Default::default()
-    };
-    let mut buffer = vec![0_u8; ENGINE_POLL_BUFFER];
     let mut auth_key_installed = false;
     let mut change_cipher_spec_prepared = false;
     let mut auth_key_prepared = false;
@@ -2529,6 +2596,15 @@ struct RetirementTask {
     close: Arc<dyn SctpTransportClose>,
 }
 
+impl RetirementTask {
+    fn replace_watcher(&mut self, task: tokio::task::JoinHandle<()>) {
+        // Keep the same synchronous drop/close authority while replacing only
+        // the timer. Dropping a whole RetirementTask would close the carrier.
+        self.task.abort();
+        self.task = task;
+    }
+}
+
 struct SctpTransportLifetimeGuard {
     close: Arc<dyn SctpTransportClose>,
     armed: bool,
@@ -2563,14 +2639,33 @@ impl Drop for RetirementTask {
 }
 
 fn spawn_retirement_task(
-    mut material_status: TlsMaterialStatusReceiver,
+    material_status: TlsMaterialStatusReceiver,
     admitted_epoch: TlsMaterialEpoch,
     hard_deadline: Instant,
     retired: Arc<AtomicBool>,
     close: Arc<dyn SctpTransportClose>,
 ) -> RetirementTask {
+    RetirementTask {
+        task: spawn_retirement_watcher(
+            material_status,
+            admitted_epoch,
+            hard_deadline,
+            retired,
+            Arc::clone(&close),
+        ),
+        close,
+    }
+}
+
+fn spawn_retirement_watcher(
+    mut material_status: TlsMaterialStatusReceiver,
+    admitted_epoch: TlsMaterialEpoch,
+    hard_deadline: Instant,
+    retired: Arc<AtomicBool>,
+    close: Arc<dyn SctpTransportClose>,
+) -> tokio::task::JoinHandle<()> {
     let task_close = Arc::clone(&close);
-    let task = tokio::spawn(async move {
+    tokio::spawn(async move {
         let hard_deadline_sleep = tokio::time::sleep_until(hard_deadline);
         tokio::pin!(hard_deadline_sleep);
         loop {
@@ -2586,11 +2681,7 @@ fn spawn_retirement_task(
         }
         retired.store(true, Ordering::Release);
         task_close.close();
-    });
-    RetirementTask {
-        task,
-        close: Arc::clone(&close),
-    }
+    })
 }
 
 fn material_epoch_retained(epoch: TlsMaterialEpoch, status: opc_tls::TlsMaterialStatus) -> bool {
@@ -2783,6 +2874,8 @@ impl DiameterDtlsSctpConnector {
             trust_bundles,
             usage: PeerUsage::Server,
             revocation: None,
+            server_name: None,
+            certificate_profile: None,
         };
         let established = match tokio::time::timeout_at(
             deadline,
@@ -2977,6 +3070,8 @@ impl DiameterDtlsSctpAcceptor {
             trust_bundles,
             usage: PeerUsage::Client,
             revocation: None,
+            server_name: None,
+            certificate_profile: None,
         };
         let established = match tokio::time::timeout_at(
             deadline,

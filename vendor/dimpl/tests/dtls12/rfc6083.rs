@@ -5,6 +5,9 @@ use std::time::{Duration, Instant};
 
 use dimpl::{Config, Dtls, KeyingMaterial, Output};
 
+#[path = "rfc6083_rekey.rs"]
+mod rekey;
+
 #[derive(Default)]
 struct Rfc6083Trace {
     packets: Vec<Vec<u8>>,

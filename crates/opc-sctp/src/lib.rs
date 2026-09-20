@@ -3475,6 +3475,18 @@ impl SctpAssociationReceiveHalf {
         self.imp.recv().await
     }
 
+    /// Read a currently buffered message or notification.
+    ///
+    /// `None` means a nonblocking kernel receive reached `WouldBlock` with no
+    /// partially assembled user message. An already-started partial message
+    /// is completed before returning, so callers must apply their operation
+    /// deadline. Cancelling preserves that partial record just as [`Self::recv`]
+    /// does. This supports RFC 6083 receive drains before an epoch transition;
+    /// it does not assert that no later network message can arrive.
+    pub async fn recv_buffered(&mut self) -> Result<Option<InboundMessage>, SctpError> {
+        self.imp.recv_buffered().await
+    }
+
     /// Return association health.
     pub fn health(&self) -> SctpHealth {
         self.imp.health()
@@ -4249,6 +4261,28 @@ mod platform {
                     return Err(error);
                 }
             };
+            self.observe_received(&message);
+            Ok(message)
+        }
+
+        pub async fn recv_buffered(&self) -> Result<Option<InboundMessage>, SctpError> {
+            let _recv_guard = self.recv_gate.lock().await;
+            self.ensure_open()?;
+            match self.socket.recv_buffered().await {
+                Ok(message) => {
+                    if let Some(message) = &message {
+                        self.observe_received(message);
+                    }
+                    Ok(message)
+                }
+                Err(error) => {
+                    self.terminal_close();
+                    Err(error)
+                }
+            }
+        }
+
+        fn observe_received(&self, message: &InboundMessage) {
             if !message.notification {
                 self.user_data_observed.store(true, Ordering::Release);
             }
@@ -4265,7 +4299,6 @@ mod platform {
                     || opc_libsctp_sys::peer_primary_address(self.socket.fd.get_ref().as_fd()).ok(),
                 );
             }
-            Ok(message)
         }
 
         pub async fn install_auth_key(&self, key: SctpAuthKey) -> Result<(), SctpError> {
@@ -4781,6 +4814,42 @@ mod platform {
             Ok(message)
         }
 
+        async fn recv_buffered(&self) -> Result<Option<InboundMessage>, SctpError> {
+            match self
+                .recv_owner
+                .recv(&BufferedChunks(self), self.max_message_bytes)
+                .await
+            {
+                Ok(message) => {
+                    self.metrics.record_rx(message.payload.len());
+                    Ok(Some(message))
+                }
+                Err(ReceiveFailure {
+                    error: SctpError::Io { source, .. },
+                    close_socket: false,
+                }) if source.kind() == io::ErrorKind::WouldBlock => {
+                    let partial = self
+                        .recv_owner
+                        .lock_state()
+                        .accumulator
+                        .as_ref()
+                        .is_some_and(|v| v.first_received.is_some());
+                    if partial {
+                        self.recv().await.map(Some)
+                    } else {
+                        Ok(None)
+                    }
+                }
+                Err(failure) => {
+                    if failure.close_socket {
+                        self.mark_closed();
+                        self.metrics.record_io_error();
+                    }
+                    Err(failure.error)
+                }
+            }
+        }
+
         fn is_open(&self) -> bool {
             !self.closed.load(Ordering::Relaxed)
         }
@@ -4819,6 +4888,36 @@ mod platform {
                     }
                 }
             }
+        }
+    }
+
+    struct BufferedChunks<'a>(&'a SctpSocket);
+
+    impl ReceiveChunkSource for BufferedChunks<'_> {
+        fn recv_chunk<'a>(
+            &'a self,
+            buffer: &'a mut [u8],
+        ) -> impl std::future::Future<Output = Result<opc_libsctp_sys::Received, ReceiveFailure>>
+               + Send
+               + 'a {
+            std::future::ready(loop {
+                match opc_libsctp_sys::recv_msg(self.0.fd.get_ref().as_fd(), buffer) {
+                    Ok(received) => break Ok(received),
+                    Err(source) if source.kind() == io::ErrorKind::Interrupted => continue,
+                    Err(source) if source.kind() == io::ErrorKind::WouldBlock => {
+                        break Err(ReceiveFailure::preserve_socket(io_err(
+                            "recv_buffered",
+                            source,
+                        )));
+                    }
+                    Err(source) => {
+                        break Err(ReceiveFailure::close_socket(io_err(
+                            "recv_buffered",
+                            source,
+                        )))
+                    }
+                }
+            })
         }
     }
 
@@ -5019,6 +5118,10 @@ mod platform {
     impl Association {
         pub fn abort(&self) {
             let _ = self;
+        }
+
+        pub async fn recv_buffered(&self) -> Result<Option<InboundMessage>, SctpError> {
+            Err(SctpError::UnsupportedPlatform)
         }
 
         pub fn authenticates_data_chunks(&self) -> bool {

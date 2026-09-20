@@ -16,7 +16,10 @@
 //! complete direct CRL publication; the original constructors do not check
 //! revocation. The complete 3GPP PKI and OCSP profiles remain unsupported.
 //! Material or required-CRL withdrawal/replacement retires the association.
-//! In-place renegotiation is unsupported; establish a fresh association.
+//! [`Policy::with_rekey`] enables coordinated, connection-bound in-place rekey
+//! within the original credential, identity, cipher and absolute lifetime.
+//! Optional [`ServerName`] adds SNI acknowledgement and exact server DNS SAN
+//! checks to the existing mutual identity contract, including during rekey.
 //!
 //! ```no_run
 //! use opc_diameter_transport::rfc6083::{
@@ -43,12 +46,16 @@
 use super::*;
 use opc_types::SpiffeId;
 
+mod certificates;
 pub(in crate::dtls) mod revocation;
+mod server_name;
 pub(in crate::dtls) mod streams;
+pub use certificates::CertificateProfile;
 pub use revocation::{
     CrlError, CrlEvidence, CrlGeneration, CrlPublisher, CrlSource, MAX_CRLS, MAX_CRL_BYTES,
     MAX_CRL_SET_BYTES,
 };
+pub use server_name::ServerName;
 
 pub use super::{DtlsSctpCipher as Cipher, DtlsSctpVersion as Version};
 
@@ -105,6 +112,7 @@ pub struct Policy {
     maximum_plaintext_bytes: usize,
     application_stream_count: u16,
     pending_record_capacity: usize,
+    allow_rekey: bool,
     shared: DtlsSctpPolicy,
 }
 
@@ -126,6 +134,7 @@ impl Policy {
             maximum_plaintext_bytes,
             application_stream_count: 1,
             pending_record_capacity: 0,
+            allow_rekey: false,
             shared: DtlsSctpPolicy::default(),
         })
     }
@@ -170,6 +179,18 @@ impl Policy {
     /// Record correlation/queued-plaintext limit; zero denotes the legacy profile.
     pub const fn pending_record_capacity(self) -> usize {
         self.pending_record_capacity
+    }
+
+    /// Enable explicitly coordinated in-place DTLS 1.2 renegotiation.
+    ///
+    /// Both endpoints must select this policy before the initial handshake
+    /// and call [`Connection::rekey`] for each transition. RFC 5746 binds each
+    /// handshake to the preceding Finished messages. This retains the same
+    /// credential/trust epoch, identity, cipher and absolute lifetime; it does
+    /// not admit replacement credentials or extend authentication validity.
+    pub const fn with_rekey(mut self) -> Self {
+        self.allow_rekey = true;
+        self
     }
 
     /// Restrict the existing ECDHE-ECDSA AEAD cipher allowlist.
@@ -335,6 +356,8 @@ struct Endpoint {
     policy: Policy,
     engine_config: Arc<dimpl::Config>,
     crls: Option<CrlSource>,
+    server_name: Option<ServerName>,
+    certificate_profile: Option<CertificateProfile>,
 }
 
 impl Endpoint {
@@ -343,14 +366,45 @@ impl Endpoint {
         expected_peer: ExpectedPeer,
         policy: Policy,
     ) -> Result<Self, Error> {
-        let engine_config = policy.shared.engine_config()?;
+        let mut engine_config = policy.shared.engine_config()?;
+        if policy.allow_rekey {
+            engine_config = Arc::new(
+                engine_config
+                    .as_ref()
+                    .clone()
+                    .with_rfc6083_rekey()
+                    .map_err(|_| Error::PolicyRejected)?,
+            );
+        }
         Ok(Self {
             controller,
             expected_peer,
             policy,
             engine_config,
             crls: None,
+            server_name: None,
+            certificate_profile: None,
         })
+    }
+
+    fn with_server_name(mut self, name: ServerName) -> Result<Self, Error> {
+        self.engine_config = Arc::new(
+            self.engine_config
+                .as_ref()
+                .clone()
+                .with_server_name(name.0.clone())
+                .map_err(|_| Error::PolicyRejected)?,
+        );
+        self.server_name = Some(name);
+        Ok(self)
+    }
+
+    fn with_certificate_profile(mut self, profile: CertificateProfile) -> Result<Self, Error> {
+        if self.crls.is_none() {
+            return Err(Error::PolicyRejected);
+        }
+        self.certificate_profile = Some(profile);
+        Ok(self)
     }
 
     async fn establish(
@@ -374,11 +428,51 @@ impl Endpoint {
                 certificate,
                 trust_bundles,
             } = prepare_material(&self.controller).await?;
+            if role == Role::Acceptor {
+                if let Some(name) = &self.server_name {
+                    name.verify_certificate(&certificate.certificate)
+                        .map_err(|_| Error::MaterialNotAdmitted)?;
+                }
+            }
             let mut crls = self
                 .crls
                 .as_ref()
                 .map(|source| source.bind(handshake.epoch()))
                 .transpose()?;
+            // Profiled local credentials are checked before sending any Hello.
+            // The controller still owns admission and the private key; the
+            // certificate's own SPIFFE domain scopes its local verification.
+            let local_profile_expiry = if let Some(profile) = self.certificate_profile {
+                let expected_peer =
+                    opc_identity::extract_spiffe_id_from_cert_der(&certificate.certificate)
+                        .map_err(|_| Error::MaterialNotAdmitted)?;
+                let local_validation = HandshakeValidation {
+                    expected_peer,
+                    trust_bundles: trust_bundles.clone(),
+                    usage: match role {
+                        Role::Connector => PeerUsage::Client,
+                        Role::Acceptor => PeerUsage::Server,
+                    },
+                    revocation: crls.as_ref().map(|v| Arc::clone(&v.snapshot)),
+                    server_name: if role == Role::Acceptor {
+                        self.server_name.clone()
+                    } else {
+                        None
+                    },
+                    certificate_profile: Some(profile),
+                };
+                let chain: Vec<_> = handshake
+                    .certificate_chain()
+                    .iter()
+                    .map(|der| der.as_ref().to_vec())
+                    .collect();
+                Some(
+                    validate_peer_certificate_chain(&chain, &local_validation)
+                        .map_err(|_| Error::MaterialNotAdmitted)?,
+                )
+            } else {
+                None
+            };
             let handshake_deadline = crls.as_ref().map_or(deadline, |v| {
                 deadline.min(wall_expiry_deadline(
                     v.evidence().expires_at(),
@@ -395,6 +489,12 @@ impl Endpoint {
                     Role::Acceptor => PeerUsage::Client,
                 },
                 revocation: crls.as_ref().map(|v| Arc::clone(&v.snapshot)),
+                certificate_profile: self.certificate_profile,
+                server_name: if role == Role::Connector {
+                    self.server_name.clone()
+                } else {
+                    None
+                },
             };
             let handshake_result = run_transport_handshake_with_streams(
                 &mut engine,
@@ -435,10 +535,14 @@ impl Endpoint {
                 return Err(Error::Retired);
             }
             check_deadline(deadline)?;
+            let local_certificate_expires_at = local_profile_expiry
+                .map_or(admission.certificate_chain_expires_at(), |expiry| {
+                    expiry.min(admission.certificate_chain_expires_at())
+                });
             let hard_deadline = association_hard_deadline(
                 Instant::now(),
                 self.policy.maximum_connection_age(),
-                admission.certificate_chain_expires_at(),
+                local_certificate_expires_at,
                 completed.peer_expires_at,
             );
             let hard_deadline = crls.as_ref().map_or(hard_deadline, |v| {
@@ -468,15 +572,20 @@ impl Endpoint {
                     protocol: self.policy.protocol,
                     application_stream_count: self.policy.application_stream_count,
                     pending_record_capacity: self.policy.pending_record_capacity,
+                    allow_rekey: self.policy.allow_rekey,
+                    record_epoch: 1,
                     version: completed.version,
                     cipher: completed.cipher,
                     material_epoch: admission.epoch(),
-                    local_certificate_expires_at: admission.certificate_chain_expires_at(),
+                    local_certificate_expires_at,
                     peer_certificate_expires_at: completed.peer_expires_at,
                     expected_peer: self.expected_peer.clone(),
                     crls: crls.as_ref().map(|v| v.evidence()),
+                    server_name: self.server_name.clone(),
+                    certificate_profile: self.certificate_profile,
                 },
                 maximum_plaintext_bytes: self.policy.maximum_plaintext_bytes,
+                validation,
                 material_status,
                 hard_deadline,
                 retired,
@@ -503,6 +612,20 @@ impl Endpoint {
 pub struct Connector(Endpoint);
 
 impl Connector {
+    /// Add the documented certificate constraints to both local and peer paths.
+    /// Requires `new_with_required_crls`; both local and peer trust-domain bundles
+    /// and their complete direct CRLs must be present. No fallback is allowed.
+    pub fn with_certificate_profile(self, profile: CertificateProfile) -> Result<Self, Error> {
+        self.0.with_certificate_profile(profile).map(Self)
+    }
+
+    /// Require SNI acknowledgement and an exact server DNS SAN, in addition to
+    /// the existing mutual SPIFFE/trust checks. No wildcard or fallback is used.
+    /// The immutable name is required again during coordinated rekey.
+    pub fn with_server_name(self, name: ServerName) -> Result<Self, Error> {
+        self.0.with_server_name(name).map(Self)
+    }
+
     /// Validate immutable engine policy before accepting any peer traffic.
     pub fn new(
         material: TlsMaterialController,
@@ -545,6 +668,20 @@ impl fmt::Debug for Connector {
 pub struct Acceptor(Endpoint);
 
 impl Acceptor {
+    /// Add the documented certificate constraints to both local and peer paths.
+    /// Requires `new_with_required_crls`; both local and peer trust-domain bundles
+    /// and their complete direct CRLs must be present. No fallback is allowed.
+    pub fn with_certificate_profile(self, profile: CertificateProfile) -> Result<Self, Error> {
+        self.0.with_certificate_profile(profile).map(Self)
+    }
+
+    /// Require this exact SNI name before acknowledging it. The admitted local
+    /// certificate must contain its DNS SAN. This selects one configured
+    /// credential controller; incoming names never select or broaden trust.
+    pub fn with_server_name(self, name: ServerName) -> Result<Self, Error> {
+        self.0.with_server_name(name).map(Self)
+    }
+
     /// Validate immutable engine policy before accepting any peer traffic.
     pub fn new(
         material: TlsMaterialController,
@@ -592,6 +729,8 @@ pub struct Evidence {
     protocol: PayloadProtocol,
     application_stream_count: u16,
     pending_record_capacity: usize,
+    allow_rekey: bool,
+    record_epoch: u16,
     version: Version,
     cipher: Cipher,
     material_epoch: TlsMaterialEpoch,
@@ -599,9 +738,23 @@ pub struct Evidence {
     peer_certificate_expires_at: Timestamp,
     expected_peer: ExpectedPeer,
     crls: Option<CrlEvidence>,
+    server_name: Option<ServerName>,
+    certificate_profile: Option<CertificateProfile>,
 }
 
 impl Evidence {
+    /// Additional certificate profile verified on both authenticated paths.
+    /// This records the bounded subset, not full 3GPP or external interoperability.
+    pub const fn certificate_profile(&self) -> Option<CertificateProfile> {
+        self.certificate_profile
+    }
+
+    /// Explicitly borrow the name acknowledged and certificate-checked in the
+    /// completed handshake. This is not DNS resolution or application authority.
+    pub fn server_name(&self) -> Option<&ServerName> {
+        self.server_name.as_ref()
+    }
+
     /// Local handshake role.
     pub const fn role(&self) -> Role {
         self.role
@@ -617,6 +770,18 @@ impl Evidence {
     /// Configured bounded correlation/queue capacity, or zero for stream zero.
     pub const fn pending_record_capacity(&self) -> usize {
         self.pending_record_capacity
+    }
+    /// Whether the caller enabled coordinated in-place renegotiation.
+    pub const fn allows_rekey(&self) -> bool {
+        self.allow_rekey
+    }
+    /// DTLS record epoch of the last fully authenticated handshake.
+    ///
+    /// This is published only after the peer Finished and SCTP-AUTH transition
+    /// complete. It is distinct from the credential publication epoch and is
+    /// not a kernel SCTP-AUTH key-ID readback.
+    pub const fn record_epoch(&self) -> u16 {
+        self.record_epoch
     }
     /// Authenticated negotiated protocol version.
     pub const fn version(&self) -> Version {
@@ -701,6 +866,7 @@ pub struct Connection {
     close: Arc<dyn SctpTransportClose>,
     evidence: Evidence,
     maximum_plaintext_bytes: usize,
+    validation: HandshakeValidation,
     material_status: TlsMaterialStatusReceiver,
     hard_deadline: Instant,
     retired: Arc<AtomicBool>,
@@ -721,6 +887,89 @@ impl Connection {
     pub fn readback(&self) -> Result<&Evidence, Error> {
         self.ensure_active()?;
         Ok(&self.evidence)
+    }
+
+    /// Complete a fresh, connection-bound handshake on this SCTP association.
+    ///
+    /// Both endpoints explicitly call this operation; the connector sends the
+    /// ClientHello and the acceptor waits for it. The application coordinates
+    /// that decision as required by RFC 6083 section 4.6. Application writes
+    /// are suspended until the new peer Finished is verified. Already admitted
+    /// application records retain their stream and order. Every exporter-key,
+    /// sender-drain, activation and previous-key retirement barrier runs again.
+    ///
+    /// The original policy must enable [`Policy::with_rekey`]. The original
+    /// credential/trust epoch and expected peer are revalidated, and the
+    /// absolute lifetime can only shorten. Failure or cancellation after
+    /// polling closes the association, including an unsupported request.
+    pub async fn rekey(&mut self, deadline: Instant) -> Result<(), Error> {
+        self.ensure_active()?;
+        let mut operation = OperationGuard::new(self);
+        let deadline = deadline.min(self.hard_deadline);
+        check_deadline(deadline)?;
+        if !self.evidence.allow_rekey || !self.pump.outbound.is_empty() {
+            return Err(Error::PolicyRejected);
+        }
+        let next_epoch = self
+            .evidence
+            .record_epoch
+            .checked_add(1)
+            .ok_or(Error::PolicyRejected)?;
+        self.engine
+            .begin_rfc6083_rekey()
+            .map_err(|_| Error::Handshake)?;
+        self.pump.connected = false;
+        self.pump.peer_certificate_expires_at = None;
+        let result = tokio::time::timeout_at(
+            deadline,
+            run_transport_handshake_with_state(
+                &mut self.engine,
+                &mut self.io,
+                &self.validation,
+                deadline,
+                std::mem::take(&mut self.pump),
+                std::mem::take(&mut self.buffer),
+            ),
+        )
+        .await;
+        self.ensure_authentication_current()?;
+        let completed = result.map_err(|_| Error::DeadlineExceeded)??;
+        self.ensure_active()?;
+        check_deadline(deadline)?;
+        if completed.state.peer_closed
+            || completed.version != self.evidence.version
+            || completed.cipher != self.evidence.cipher
+            || self.engine.rfc6083_epoch() != Some(next_epoch)
+        {
+            return Err(Error::Handshake);
+        }
+        if completed
+            .state
+            .inbound
+            .iter()
+            .any(|v| v.payload.len() > self.maximum_plaintext_bytes)
+        {
+            return Err(Error::MessageLimit);
+        }
+        self.hard_deadline = self.hard_deadline.min(wall_expiry_deadline(
+            completed.peer_expires_at,
+            Instant::now(),
+        ));
+        self._retirement_task
+            .replace_watcher(spawn_retirement_watcher(
+                self.material_status.clone(),
+                self.evidence.material_epoch,
+                self.hard_deadline,
+                Arc::clone(&self.retired),
+                Arc::clone(&self.close),
+            ));
+        self.evidence.record_epoch = next_epoch;
+        self.evidence.peer_certificate_expires_at = completed.peer_expires_at;
+        self.pump = completed.state;
+        self.buffer = completed.buffer;
+        self.ensure_active()?;
+        operation.disarm();
+        Ok(())
     }
 
     /// Emit one opaque application record reliably on ordered stream zero.

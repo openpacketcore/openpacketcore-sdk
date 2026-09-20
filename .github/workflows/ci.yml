@@ -674,6 +674,16 @@ jobs:
       - name: Check audited DTLS fork formatting
         run: cargo fmt --manifest-path vendor/dimpl/Cargo.toml --all --check
 
+      - name: Check independent RFC 5746 and RFC 6066 fixtures
+        run: |
+          python3 -m venv "${RUNNER_TEMP}/dtls-reference"
+          "${RUNNER_TEMP}/dtls-reference/bin/pip" install --quiet \
+            -r crates/opc-diameter-transport/tests/fixtures/rfc6083/requirements.txt
+          "${RUNNER_TEMP}/dtls-reference/bin/python" vendor/dimpl/tests/dtls12/rfc5746_binding_reference.py --check
+          "${RUNNER_TEMP}/dtls-reference/bin/python" vendor/dimpl/tests/dtls12/rfc5746_hello_reference.py --check
+          "${RUNNER_TEMP}/dtls-reference/bin/python" vendor/dimpl/tests/dtls12/rfc6066_reference.py --check
+          "${RUNNER_TEMP}/dtls-reference/bin/python" crates/opc-diameter-transport/tests/fixtures/rfc6083/nds_certificates.py
+
       - name: Lint every all-feature DTLS target
         run: cargo clippy --manifest-path vendor/dimpl/Cargo.toml --all-features --all-targets -- -D warnings
 
