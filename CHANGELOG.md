@@ -32,7 +32,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `opc-gtpu-dataplane`: add an eBPF N3 fixed-flow profile through the protected
   grouped selector namespace. Bind one QFI per inner-family entry to atomic
   authority, insert uplink PSC, enforce downlink QFI/direction, and account
-  for PSC bytes in IPv4/IPv6 checksums and PMTU. The broader N3 capability
+  for PSC bytes in IPv4/IPv6 checksums, PMTU and observation bounds. The broader N3 capability
   remains missing pending multi-QFI and End Marker lifecycle work. Refs #790,
   #795.
 

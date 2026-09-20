@@ -96,6 +96,16 @@ restart adoption and retirement in both directions. A successful native run emit
 CI requires that marker with zero ignored tests on the native and EL9 lanes,
 and includes this contract in the Linux 6.8 verifier qualification.
 
+The shared IPv6 observation walker admits inner offsets through 78 bytes,
+including the optional block and PSC after an outer IPv6 envelope. Its declared
+packet-end limit includes the same overhead. Direct callback tests cover literal
+ordinary/PSC offsets, the maximum IPv6 payload, and one-byte-outside refusals.
+The existing bidirectional IPv6 continuity gate also runs on EL9: retaining the
+old 70-byte bound caused that kernel to prune the callback's success path and
+suppress ordinary IPv6 return observations. The failing production object and
+passing correction were compared on the same pinned EL9 kernel; diagnostic
+instrumentation is excluded from the production change.
+
 The PR records exact revisions, parent/fix-removal detector results, native logs
 and required gate outcomes. Value-bearing public objects retain redacted Debug
 output; no per-session, QFI, mark or endpoint log/cardinality surface is added.

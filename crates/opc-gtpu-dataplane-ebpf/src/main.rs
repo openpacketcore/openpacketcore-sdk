@@ -2365,9 +2365,13 @@ const IPV6_EXTENSION_FLAGS_MASK: u32 = IPV6_EXTENSION_FLAG_FRAGMENT
     | IPV6_EXTENSION_FLAG_FINAL_DESTINATION;
 // Observation begins after a proven outer GTP-U envelope, while the existing
 // downlink parser starts at Ethernet. Bound both positions so bpf_loop state
-// remains verifier-friendly without assuming a fixed inner IPv6 offset.
-const IPV6_PACKET_MAX_END: u32 =
-    (ETH_HDR_LEN + GTPU_IPV6_ENCAP_LEN + IPV6_HDR_LEN + u16::MAX as usize) as u32;
+// remains verifier-friendly without assuming a fixed inner IPv6 offset. The
+// largest envelope includes the optional block and uplink N3 PSC. Retaining
+// the pre-PSC 70-byte bound also lets EL9 prune the callback's success path
+// after admitting the new 78-byte observation offset in its caller.
+const IPV6_PACKET_MAX_START: u32 =
+    (ETH_HDR_LEN + GTPU_IPV6_ENCAP_LEN + N3_UPLINK_EXTENSION_LEN) as u32;
+const IPV6_PACKET_MAX_END: u32 = IPV6_PACKET_MAX_START + IPV6_HDR_LEN as u32 + u16::MAX as u32;
 const IPV6_OPTIONS_MAX_BYTES: u32 = (u8::MAX as u32 + 1) * 8 - 2;
 const IPV6_TERMINAL_UDP: u32 = 0;
 const IPV6_TERMINAL_OBSERVATION: u32 = 1;
@@ -2412,9 +2416,7 @@ unsafe extern "C" fn walk_ipv6_extension_step(_index: u64, context: *mut c_void)
     // `bpf_loop` revisits this callback with caller-stack scalars. Reassert
     // every protocol bound so imprecise merged states cannot turn a bounded
     // packet cursor or state field into an unbounded branch.
-    if context.ip_start < ETH_HDR_LEN as u32
-        || context.ip_start > (ETH_HDR_LEN + GTPU_IPV6_ENCAP_LEN) as u32
-    {
+    if context.ip_start < ETH_HDR_LEN as u32 || context.ip_start > IPV6_PACKET_MAX_START {
         context.state = IPV6_EXTENSION_STATE_FAILED;
         return 1;
     }
@@ -4370,6 +4372,68 @@ fn authorize_and_decap_legacy_downlink(
 mod tests {
     use super::*;
 
+    fn terminal_ipv6_observation_context(
+        ip_start: u32,
+        payload_len: u32,
+    ) -> Ipv6ExtensionLoopContext {
+        Ipv6ExtensionLoopContext {
+            // These tests terminate at the already-read ICMPv6 selector or a
+            // scalar bound. Neither path reads skb bytes or calls a helper.
+            skb: core::ptr::null_mut(),
+            ip_start,
+            ip_end: ip_start + 40 + payload_len,
+            cursor: ip_start + 40,
+            option_remaining: 0,
+            walked: 0,
+            options_walked: 0,
+            next_header: 58,
+            flags: 0,
+            state: IPV6_EXTENSION_STATE_WALK,
+            terminal: IPV6_TERMINAL_OBSERVATION,
+            reject_fragments: 1,
+        }
+    }
+
+    #[test]
+    fn ipv6_observation_walker_admits_ordinary_and_psc_payload_offsets() {
+        // Literal Ethernet + IPv4/IPv6 + UDP + mandatory/PSC GTP-U extents.
+        // Include the unencapsulated downlink position and the maximum legal
+        // IPv6 payload so both cursor and declared-end bounds are exercised.
+        for ip_start in [14, 50, 58, 70, 78] {
+            for payload_len in [40, 65_535] {
+                let mut context = terminal_ipv6_observation_context(ip_start, payload_len);
+                // SAFETY: the complete live context is uniquely borrowed. Its
+                // terminal selector takes the callback's helper-free path.
+                let stopped = unsafe {
+                    walk_ipv6_extension_step(
+                        0,
+                        (&mut context as *mut Ipv6ExtensionLoopContext).cast(),
+                    )
+                };
+                assert_eq!(stopped, 1);
+                assert_eq!(
+                    context.state, IPV6_EXTENSION_STATE_DONE,
+                    "offset {ip_start}"
+                );
+                assert_eq!(context.cursor, ip_start + 40);
+            }
+        }
+    }
+
+    #[test]
+    fn ipv6_observation_walker_rejects_out_of_profile_scalar_bounds() {
+        for (ip_start, payload_len) in [(13, 40), (79, 40), (78, 65_536)] {
+            let mut context = terminal_ipv6_observation_context(ip_start, payload_len);
+            // SAFETY: this complete live context is uniquely borrowed; the
+            // invalid scalar bound returns before any skb/helper access.
+            let stopped = unsafe {
+                walk_ipv6_extension_step(0, (&mut context as *mut Ipv6ExtensionLoopContext).cast())
+            };
+            assert_eq!(stopped, 1);
+            assert_eq!(context.state, IPV6_EXTENSION_STATE_FAILED);
+        }
+    }
+
     // The pre-#655 generic tuple-correlation host model is deliberately kept
     // out of the test graph. It describes a producer contract that must never
     // again be able to mint traffic-proof events.
@@ -5776,12 +5840,12 @@ mod tests {
         let source = include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/src/main.rs"));
         for (classifier, terminator, first_packet_read) in [
             (
-                "pub fn opc_gtpu_uplink(mut ctx: TcContext)",
+                "pub fn opc_gtpu_uplink(mut ctx: TcContext) -> i32",
                 "#[classifier]\npub fn opc_gtpu_downlink",
                 "let mark = packet_mark(&ctx);",
             ),
             (
-                "pub fn opc_gtpu_downlink(mut ctx: TcContext)",
+                "pub fn opc_gtpu_downlink(mut ctx: TcContext) -> i32",
                 "/// Uplink: inner IPv4 packet",
                 "let Ok(ether_type) = ctx.load::<u16>(12)",
             ),
