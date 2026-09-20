@@ -3753,10 +3753,18 @@ mod tests {
             .encode(&key(9))
             .unwrap();
         let mut bad_code = valid;
-        bad_code[12] = 3;
+        bad_code[12] = 4;
         assert_eq!(
             DurableRelocationRecord::decode(&bad_code, &key(9)),
             Err(XfrmSaRelocationDurableError::Malformed)
+        );
+        // The new group witness is recognized, but cannot replace another
+        // witness without authenticating the entire record again.
+        let mut unauthenticated_group = valid;
+        unauthenticated_group[12] = 3;
+        assert_eq!(
+            DurableRelocationRecord::decode(&unauthenticated_group, &key(9)),
+            Err(XfrmSaRelocationDurableError::AuthenticationFailed)
         );
         // Prepared must not carry a proof.
         let mut prepared_with_proof = record(XfrmSaRelocationDurablePhase::Prepared);
@@ -3775,10 +3783,11 @@ mod tests {
     }
 
     #[test]
-    fn proof_round_trips_both_witnesses() {
+    fn proof_round_trips_all_witnesses() {
         for proof in [
             XfrmSaRelocationPreEffectProof::TargetAbsent,
             XfrmSaRelocationPreEffectProof::SameIdentityWitnessed,
+            XfrmSaRelocationPreEffectProof::RosterWitnessed,
         ] {
             let mut expected = record(XfrmSaRelocationDurablePhase::Issuing);
             expected.pre_effect_proof = Some(proof);
