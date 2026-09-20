@@ -996,19 +996,31 @@ impl LinuxXfrmBackend {
         expectation: &OutboundSaPolicyExpectation,
         supplied_sa: Option<&SaParameters>,
     ) -> Result<SaState, OutboundSaBindingError> {
-        let expected_policy = expected_policy(expectation);
-        let observed_policy = match self
-            .query_policy_for_outbound_binding(expected_policy)
+        self.read_child_sa_binding(expectation, supplied_sa, true)
             .await
-        {
-            Ok(policy) => policy,
-            Err(XfrmError::NotFound) => {
-                return readback_mismatch("xfrm_outbound_sa_binding_current_policy_missing")
+    }
+
+    pub(crate) async fn read_child_sa_binding(
+        &self,
+        expectation: &OutboundSaPolicyExpectation,
+        supplied_sa: Option<&SaParameters>,
+        require_policy: bool,
+    ) -> Result<SaState, OutboundSaBindingError> {
+        let expected_policy = expected_policy(expectation);
+        if require_policy {
+            let observed_policy = match self
+                .query_policy_for_outbound_binding(expected_policy)
+                .await
+            {
+                Ok(policy) => policy,
+                Err(XfrmError::NotFound) => {
+                    return readback_mismatch("xfrm_outbound_sa_binding_current_policy_missing")
+                }
+                Err(source) => return Err(OutboundSaBindingError::Readback { source }),
+            };
+            if observed_policy.parameters != *expected_policy {
+                return readback_mismatch("xfrm_outbound_sa_binding_current_policy_mismatch");
             }
-            Err(source) => return Err(OutboundSaBindingError::Readback { source }),
-        };
-        if observed_policy.parameters != *expected_policy {
-            return readback_mismatch("xfrm_outbound_sa_binding_current_policy_mismatch");
         }
 
         let expected_sa = expected_sa(expectation);
@@ -2968,7 +2980,16 @@ fn parse_outbound_sa_binding_snapshot(
         "query_outbound_sa_binding",
     )?;
     validate_outbound_sa_fixed_header(payload, expected, expectation.replay_esn())?;
-    validate_outbound_sa_dynamic_attributes(payload)?;
+    let direction = match expected_policy(expectation).direction {
+        XfrmDirection::In => XFRM_SA_DIR_IN,
+        XfrmDirection::Out => XFRM_SA_DIR_OUT,
+        _ => {
+            return Err(XfrmError::UnsupportedFeature {
+                feature: "installed_child_sa_direction",
+            })
+        }
+    };
+    validate_sa_binding_dynamic_attributes(payload, direction)?;
     validate_outbound_sa_replay_attributes(payload, expectation.replay_esn())?;
     match supplied_sa {
         Some(supplied_sa) => validate_outbound_sa_crypto(payload, supplied_sa)?,
@@ -3018,7 +3039,10 @@ fn validate_outbound_sa_fixed_header(
     Ok(())
 }
 
-fn validate_outbound_sa_dynamic_attributes(payload: &[u8]) -> Result<(), XfrmError> {
+fn validate_sa_binding_dynamic_attributes(
+    payload: &[u8],
+    expected_direction: u8,
+) -> Result<(), XfrmError> {
     if let Some(last_used) = unique_route_attribute(
         payload,
         XFRM_USER_SA_INFO_LEN,
@@ -3051,10 +3075,10 @@ fn validate_outbound_sa_dynamic_attributes(payload: &[u8]) -> Result<(), XfrmErr
         XFRMA_SA_DIR,
         "query_outbound_sa_binding",
     )? {
-        if direction != [XFRM_SA_DIR_OUT] {
+        if direction != [expected_direction] {
             return Err(XfrmError::io(
                 "query_outbound_sa_binding",
-                invalid_data("SA direction is not outbound"),
+                invalid_data("SA direction does not match policy"),
             ));
         }
     }
@@ -5928,6 +5952,8 @@ mod tests {
         .unwrap();
         assert!(parse_policy_state(&duplicate).is_err());
     }
+
+    mod installed_child_sa_tests;
 
     #[tokio::test]
     async fn outbound_binding_backend_reads_policy_then_sa_and_rejects_key_substitution() {

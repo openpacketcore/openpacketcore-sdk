@@ -221,6 +221,7 @@ mod durable_roster_flow;
 pub mod error;
 #[cfg(feature = "ikev2")]
 pub mod ikev2;
+pub mod installed_child_sa;
 pub mod linux;
 pub mod mock;
 pub mod model;
@@ -291,6 +292,10 @@ pub use ikev2::{
     Ikev2ChildSaKeyMaterialError, Ikev2ChildSaNonceRole, Ikev2ChildSaXfrmError,
     Ikev2ChildSaXfrmKeys, Ikev2ChildSaXfrmOptions, Ikev2ChildSaXfrmOptionsError,
     Ikev2ChildSaXfrmRequest, Ikev2ChildSaXfrmRequests, IKEV2_SECURITY_PROTOCOL_ID_ESP, IPPROTO_ESP,
+};
+pub use installed_child_sa::{
+    ChildSaInstalledPairRequest, ChildSaInstalledRosterRequest, ChildSaRosterUpdate,
+    InstalledChildSaRoster, InstalledChildSaSelection,
 };
 pub use linux::{LinuxXfrmBackend, LinuxXfrmBackendConfig};
 pub use mock::{MockOperation, MockSaRelocation, MockXfrmBackend};

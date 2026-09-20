@@ -3,8 +3,11 @@
 Caller-selected traffic classes can use the immutable
 [`child_sa` selection contract](CHILD_SA_SELECTION.md) to name exact outbound
 SPIs, retain inbound identities during rekey overlap, and select one explicit
-default. These are validated intentions; live packet provenance, grouped
-publication and whole-roster relocation remain separate work.
+default. These are validated intentions. The optional
+[installed-roster contract](../../docs/n3-installed-child-sa-roster.md) binds
+those intentions to whole-roster readback and an actor-fenced publication,
+with distinct exact marks and concrete outbound SPIs. Sealed inbound packet
+provenance and authenticated whole-roster relocation remain separate work.
 
 ## Purpose
 

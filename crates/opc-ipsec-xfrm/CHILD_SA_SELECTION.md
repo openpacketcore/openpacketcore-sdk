@@ -13,6 +13,11 @@ authority. Pairing, selectors, keys, policies and namespace identity remain
 outside the plan. Existing `InstalledOutboundSaBinding`, durable installation
 and single-SA relocation contracts are unchanged.
 
+A namespace-bound actor can separately publish these intentions through the
+[installed-roster contract](../../docs/n3-installed-child-sa-roster.md) after
+whole-roster readback. That opaque publication does not turn freely supplied
+inbound metadata into authenticated packet provenance.
+
 ## Selection
 
 1. Assign a `ChildSaId` to each logical child in a caller-owned scope. Assign a

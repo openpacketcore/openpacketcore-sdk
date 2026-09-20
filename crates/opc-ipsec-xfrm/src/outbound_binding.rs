@@ -316,14 +316,21 @@ impl fmt::Debug for OutboundSaPolicyFingerprint {
 pub(crate) fn validate_outbound_request(
     request: &XfrmCompositeInstallRequest,
 ) -> Result<OutboundSaPolicyExpectation, OutboundSaBindingError> {
-    // Agree with the gate in `XfrmStagedInstall::run`, which is the only path
-    // that turns this validated pair into an installed binding. Accepting a
-    // mark here that `run` then refuses would make this validator answer a
-    // different question than the one its name implies: whether the pair is an
-    // acceptable exact outbound identity.
-    let sa = &request.sa.parameters;
-    let policy = &request.policy.parameters;
+    validate_sa_policy_request(
+        &request.sa.parameters,
+        &request.policy.parameters,
+        XfrmDirection::Out,
+    )
+}
 
+/// Shared key-free SA/policy expectation construction. Existing outbound
+/// authorities always pass `Out`; the installed-roster reader also admits `In`.
+/// Neither path accepts a forwarding policy or changes the outbound contract.
+pub(crate) fn validate_sa_policy_request(
+    sa: &SaParameters,
+    policy: &PolicyParameters,
+    direction: XfrmDirection,
+) -> Result<OutboundSaPolicyExpectation, OutboundSaBindingError> {
     // Agree with the gate in `XfrmStagedInstall::run`, the only path that turns
     // a validated pair into an installed binding. Accepting a mark here that
     // `run` then refuses would make this validator answer a different question
@@ -343,7 +350,8 @@ pub(crate) fn validate_outbound_request(
             "xfrm_outbound_sa_binding_not_esp",
         ));
     }
-    if policy.direction != XfrmDirection::Out {
+    if policy.direction != direction || !matches!(direction, XfrmDirection::In | XfrmDirection::Out)
+    {
         return Err(OutboundSaBindingError::invalid(
             "xfrm_outbound_sa_binding_policy_not_outbound",
         ));

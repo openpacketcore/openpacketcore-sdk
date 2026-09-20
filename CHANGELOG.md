@@ -29,6 +29,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- `opc-ipsec-xfrm`: add optional actor-fenced installed Child-SA roster
+  publication and exact marked outbound selection. Whole-roster key/readback
+  proof, stale-writer invalidation, bounded generation and native rekey packet
+  checks preserve the existing migration and custody boundaries. Raw Linux,
+  mock and unsupported adapters report the precise missing profile. Refs #793,
+  #795.
+
 - N3IWF DTLS fixture profiles bind 634 independent vector projections and
   authored rekey, retirement, path-loss and process-restart obligations to
   exact public source digests. Historical wires and their narrower scopes

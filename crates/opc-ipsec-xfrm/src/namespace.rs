@@ -22,10 +22,12 @@ use nix::sys::socket::{getsockopt, socket, AddressFamily, SockFlag, SockType};
 use nix::{getsockopt_impl, sockopt_impl};
 use tokio::sync::{mpsc, oneshot};
 
+use crate::child_sa::ChildSaOutboundSelection;
 use crate::counter_resume::{
     map_backend_error, CounterRecoveryActorRequest, CounterResumeActorRequest,
     EspCounterReceiptRegistry,
 };
+use crate::installed_child_sa::ChildSaRosterRegistry;
 use crate::model::validate_exact_remove_policy_request;
 #[cfg(target_os = "linux")]
 use crate::observation::linux::LinuxEspPeerObservationKernelSource;
@@ -102,6 +104,10 @@ use crate::{
     RekeySaRequest, RelocateSaRequest, RemovePolicyRequest, RemoveSaRequest, SaParameters,
     SaRelocationIdentity, SaState, SpiAllocation, XfrmBackend, XfrmCapability,
     XfrmCompositeInstallRequest, XfrmError, XfrmProbe,
+};
+use crate::{
+    ChildSaInstalledRosterRequest, ChildSaRosterUpdate, InstalledChildSaRoster,
+    InstalledChildSaSelection,
 };
 
 /// Maximum number of admitted Linux XFRM operations waiting for the dedicated
@@ -1532,6 +1538,7 @@ fn run_actor(
 struct NamespaceActorState {
     actor_binding: NamespaceActorBinding,
     counter_receipts: EspCounterReceiptRegistry,
+    child_sa_roster: ChildSaRosterRegistry,
     #[cfg(unix)]
     object_recovery_store: Option<XfrmObjectInstallRecoveryStore>,
     #[cfg(unix)]
@@ -1564,6 +1571,7 @@ impl NamespaceActorState {
         Self {
             actor_binding,
             counter_receipts: EspCounterReceiptRegistry::default(),
+            child_sa_roster: ChildSaRosterRegistry::default(),
             #[cfg(unix)]
             object_recovery_store: None,
             #[cfg(unix)]
@@ -1579,8 +1587,21 @@ impl NamespaceActorState {
         }
     }
 
-    fn invalidate_counter_receipts(&mut self) {
+    fn invalidate_live_authorities(&mut self) {
         self.counter_receipts.invalidate_all();
+        self.child_sa_roster.invalidate();
+    }
+
+    fn require_child_sa_publication_ready(&mut self) -> Result<(), XfrmError> {
+        #[cfg(unix)]
+        if self.require_install_gate_open_for_roster().is_err()
+            || self.require_relocation_gate_open_for_roster().is_err()
+            || self.require_roster_gate_open_for_roster().is_err()
+        {
+            self.child_sa_roster.invalidate();
+            return Err(XfrmError::Unavailable);
+        }
+        Ok(())
     }
 
     #[cfg(unix)]
@@ -1648,7 +1669,7 @@ impl NamespaceActorState {
         self.object_install_admissions.remove(&authority.key());
         self.relocation_admissions.clear();
         self.roster_admissions.clear();
-        self.invalidate_counter_receipts();
+        self.invalidate_live_authorities();
         Ok(())
     }
 
@@ -1681,7 +1702,7 @@ impl NamespaceActorState {
             self.relocation_admissions.clear();
             self.roster_admissions.clear();
         }
-        self.invalidate_counter_receipts();
+        self.invalidate_live_authorities();
         Ok(())
     }
 
@@ -1765,7 +1786,7 @@ impl NamespaceActorState {
         self.object_install_admissions.clear();
         self.relocation_admissions.clear();
         self.roster_admissions.clear();
-        self.invalidate_counter_receipts();
+        self.invalidate_live_authorities();
         Ok(())
     }
 
@@ -1797,7 +1818,7 @@ impl NamespaceActorState {
             self.object_install_admissions.clear();
             self.roster_admissions.clear();
         }
-        self.invalidate_counter_receipts();
+        self.invalidate_live_authorities();
         Ok(())
     }
 
@@ -1909,7 +1930,7 @@ impl NamespaceActorState {
         self.roster_admissions.remove(&authority.key());
         self.object_install_admissions.clear();
         self.relocation_admissions.clear();
-        self.invalidate_counter_receipts();
+        self.invalidate_live_authorities();
         Ok(())
     }
 
@@ -1942,7 +1963,7 @@ impl NamespaceActorState {
             self.object_install_admissions.clear();
             self.relocation_admissions.clear();
         }
-        self.invalidate_counter_receipts();
+        self.invalidate_live_authorities();
         Ok(())
     }
 
@@ -2117,7 +2138,7 @@ impl NamespaceActorState {
             self.relocation_admissions.clear();
             self.roster_admissions.clear();
         }
-        self.invalidate_counter_receipts();
+        self.invalidate_live_authorities();
         Ok(())
     }
 }
@@ -3454,6 +3475,17 @@ enum DetectorRosterCut {
 }
 
 enum NamespaceCommand {
+    BeginChildSaRosterUpdate(oneshot::Sender<Result<ChildSaRosterUpdate, XfrmError>>),
+    PublishChildSaRoster(
+        ChildSaRosterUpdate,
+        Box<ChildSaInstalledRosterRequest>,
+        oneshot::Sender<Result<InstalledChildSaRoster, XfrmError>>,
+    ),
+    SelectInstalledChildSa(
+        InstalledChildSaRoster,
+        ChildSaOutboundSelection,
+        oneshot::Sender<Result<InstalledChildSaSelection, XfrmError>>,
+    ),
     #[cfg(unix)]
     PrepareDurableObjectInstall(
         Box<DurableObjectOperation>,
@@ -3764,7 +3796,7 @@ fn admit_object_roster_adoption(
         // The two unresolved phases adoption always refuses. Nothing durable
         // is read past this point and nothing is published, so no sibling
         // family is fenced.
-        state.invalidate_counter_receipts();
+        state.invalidate_live_authorities();
         return Ok(());
     }
     state.admit_durable_object_roster_recovery(phase)
@@ -3856,6 +3888,36 @@ impl NamespaceCommand {
         }
 
         match self {
+            Self::BeginChildSaRosterUpdate(reply) => {
+                let result = state
+                    .require_child_sa_publication_ready()
+                    .and_then(|()| state.child_sa_roster.begin(&state.actor_binding));
+                let _ = reply.send(result);
+            }
+            Self::PublishChildSaRoster(update, request, reply) => {
+                let result = match state.require_child_sa_publication_ready() {
+                    Ok(()) => {
+                        state
+                            .child_sa_roster
+                            .publish(&state.actor_binding, backend, update, *request)
+                            .await
+                    }
+                    Err(error) => Err(error),
+                };
+                let _ = reply.send(result);
+            }
+            Self::SelectInstalledChildSa(roster, selection, reply) => {
+                let result = match state.require_child_sa_publication_ready() {
+                    Ok(()) => {
+                        state
+                            .child_sa_roster
+                            .select(&state.actor_binding, backend, &roster, selection)
+                            .await
+                    }
+                    Err(error) => Err(error),
+                };
+                let _ = reply.send(result);
+            }
             #[cfg(unix)]
             Self::PrepareDurableObjectInstall(operation, reply) => {
                 let result = match state.require_object_recovery_store(&operation.store) {
@@ -4777,6 +4839,15 @@ impl NamespaceCommand {
 
     fn send_error(self, error: XfrmError) {
         match self {
+            Self::BeginChildSaRosterUpdate(reply) => {
+                let _ = reply.send(Err(error));
+            }
+            Self::PublishChildSaRoster(_, _, reply) => {
+                let _ = reply.send(Err(error));
+            }
+            Self::SelectInstalledChildSa(_, _, reply) => {
+                let _ = reply.send(Err(error));
+            }
             #[cfg(unix)]
             Self::PrepareDurableObjectInstall(_, reply) => {
                 let _ = reply.send(Err(XfrmObjectInstallDurableError::WrongBinding));
@@ -4911,6 +4982,37 @@ struct OutboundBindingValidation {
 
 #[async_trait]
 impl XfrmBackend for NamespaceBoundLinuxXfrmBackend {
+    async fn begin_child_sa_roster_update(&self) -> Result<ChildSaRosterUpdate, XfrmError> {
+        self.dispatch(
+            LostReply::ReadOnly,
+            NamespaceCommand::BeginChildSaRosterUpdate,
+        )
+        .await
+    }
+
+    async fn publish_child_sa_roster(
+        &self,
+        update: ChildSaRosterUpdate,
+        request: ChildSaInstalledRosterRequest,
+    ) -> Result<InstalledChildSaRoster, XfrmError> {
+        self.dispatch(
+            LostReply::Mutation("installed_child_sa_roster_publication"),
+            |reply| NamespaceCommand::PublishChildSaRoster(update, Box::new(request), reply),
+        )
+        .await
+    }
+
+    async fn select_installed_child_sa(
+        &self,
+        roster: &InstalledChildSaRoster,
+        selection: ChildSaOutboundSelection,
+    ) -> Result<InstalledChildSaSelection, XfrmError> {
+        self.dispatch(LostReply::ReadOnly, |reply| {
+            NamespaceCommand::SelectInstalledChildSa(roster.clone(), selection, reply)
+        })
+        .await
+    }
+
     async fn allocate_spi(&self, request: AllocateSpiRequest) -> Result<SpiAllocation, XfrmError> {
         self.dispatch(LostReply::Mutation("allocspi"), |reply| {
             NamespaceCommand::AllocateSpi(request, reply)
