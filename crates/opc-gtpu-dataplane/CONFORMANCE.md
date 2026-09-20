@@ -14,6 +14,7 @@ held (`publish = false`) and does not complete [#790](https://github.com/openpac
 | Receive | Complete G-PDU; one PSC; uplink QFI or downlink QFI/RQI/optional PPI; caller-supplied expected direction | Shared PSC conditional-field subset; no monitoring timestamps, delay results, sequence-field extensions or MBS support |
 | Receive framing | Exact datagram length, bounded extension walk, duplicate PSC refusal, endpoint comprehension bits | Optional unknowns can appear before/after the PSC and remain in the borrowed original datagram; no raw re-encoder |
 | eBPF fixed-flow attachment | One QFI per inner family; UL PSC insertion and DL QFI/direction checks; atomic generation/readback and opaque selector authority | Four inner/outer IP combinations; existing checksum/offload limits; no multi-QFI, reflective QoS, in-place QFI change or ordered End Marker retirement |
+| Retirement-bound End Marker submission | Exact protected retirement, classifier grace, original IPv4 addresses/TEIDs and UDP/2152 socket; one marker per distinct outgoing tunnel | Separate operation; no outer IPv6, selected source port, 5GS/EPS forwarding PSC, NIC drain, peer acknowledgement or delivery guarantee; other backends return typed `Unsupported` |
 | Linux, eBPF, mock, unsupported adapter | Coarse N3 capability remains `GtpuCapability::Missing` for every adapter; only qualified eBPF attachments expose the narrower fixed-flow capability | No full N3 role or backend parity claim |
 
 The two TNL types are not convertible. `N3ForwardingIntent` is desired data,
@@ -84,7 +85,9 @@ The checksum-offload control pass-through fixed in
 [#644](https://github.com/openpacketcore/openpacketcore-sdk/issues/644) is
 unchanged. Echo port rules, zero transmitted Recovery and ignored received
 Recovery authority remain the existing control port's responsibility.
-End Marker lifecycle ordering is not part of the fixed-flow profile.
+The separate [End Marker operation](../../docs/n3-end-marker-retirement.md)
+qualifies local retirement/grace/submission order for its bounded IPv4 profile.
+It neither changes the fixed-flow admission rules nor grants selector reuse.
 
 The [fixed-flow contract](../../docs/n3-fixed-flow-forwarding.md) separately
 describes installed authority, byte layouts, classifier limits and live

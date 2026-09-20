@@ -33,10 +33,17 @@ generation readback. Installation and retirement require the protected opaque
 selector namespace. See [fixed-flow forwarding](../../docs/n3-fixed-flow-forwarding.md)
 for the wire layout, native evidence and limits.
 
+`send_n3_end_markers` consumes an exact retired claim and submits markers on
+the original IPv4 tunnels after classifier quiescence. It reuses the managed
+UDP/2152 control socket. Its completion reports local submission; it grants
+no selector reuse or peer-delivery authority. See
+[End Marker retirement](../../docs/n3-end-marker-retirement.md) for unsupported
+profiles, cancellation, retry and ordering limits.
+
 All shipped adapters still return `GtpuCapability::Missing` from the broader
 `n3_forwarding_capability(N3ForwardingRole::N3iwf)`. Multiple QFIs for the same
-PAA, reflective QoS, in-place QFI replacement and ordered End Marker retirement
-remain outside the fixed-flow profile. Linux kernel-GTP, mock and unsupported
+PAA, reflective QoS, in-place QFI replacement and full-profile End Marker
+support remain unavailable. Linux kernel-GTP, mock and unsupported
 adapters return `Missing` for the new attachment-scoped capability. The software
 packet helpers alone confer no install authority; see [N3 conformance](CONFORMANCE.md).
 

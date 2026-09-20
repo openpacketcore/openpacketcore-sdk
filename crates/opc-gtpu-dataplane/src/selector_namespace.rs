@@ -7,7 +7,11 @@
 //! module and all public diagnostics are summaries.
 
 mod bearer;
+mod n3_end_marker;
 pub use bearer::GTPU_SHARED_PAA_MAX_LIVE_BEARERS;
+pub use n3_end_marker::{
+    GtpuN3EndMarkerCompletion, GtpuN3EndMarkerError, GtpuN3EndMarkerReceipt, GtpuN3EndMarkerRequest,
+};
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
@@ -10794,6 +10798,7 @@ fn hmac_bytes(key: &[u8; 32], chunks: &[&[u8]]) -> [u8; 32] {
 #[cfg(test)]
 mod tests {
     mod bearer_ledger;
+    mod n3_end_marker;
     mod n3_fixed_flow;
     mod worker_lease;
 
@@ -11167,6 +11172,7 @@ mod tests {
 
     #[derive(Debug, Default)]
     struct FaultingSelectorBackend {
+        end_markers: n3_end_marker::EndMarkerTestState,
         effect_fault: std::sync::atomic::AtomicBool,
         effect_ack_lost: std::sync::atomic::AtomicBool,
         removal_ack_lost: std::sync::atomic::AtomicBool,
@@ -11341,6 +11347,13 @@ mod tests {
 
     #[async_trait::async_trait]
     impl GtpuDataplaneBackend for FaultingSelectorBackend {
+        async fn submit_n3_end_markers(
+            &self,
+            request: GtpuN3EndMarkerRequest,
+        ) -> Result<GtpuN3EndMarkerReceipt, crate::GtpuError> {
+            self.end_markers.submit(request).await
+        }
+
         async fn create_device(
             &self,
             _request: crate::CreateGtpDeviceRequest,

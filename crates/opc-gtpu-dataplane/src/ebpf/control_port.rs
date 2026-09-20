@@ -14,6 +14,11 @@ pub(super) struct ControlSocketState {
 }
 
 impl ControlSocketState {
+    #[cfg(test)]
+    pub(super) fn is_unopened(&self) -> bool {
+        self.socket.is_none()
+    }
+
     fn retire(&mut self) {
         self.retired = true;
         self.socket = None;
@@ -99,6 +104,63 @@ impl GtpuControlPort for BackendControlPort {
 }
 
 impl EbpfGtpuDataplaneBackend {
+    /// Caller holds the attachment mutation guard and the exact namespace
+    /// effect lease through all pre/post checks and this nonblocking send.
+    pub(super) fn send_retired_n3_end_marker_under_guard(
+        &self,
+        device: &GtpDevice,
+        local: Ipv4Addr,
+        peer: Ipv4Addr,
+        teid: crate::Teid,
+        current: impl Fn() -> bool,
+    ) -> Result<(), GtpuError> {
+        let unavailable = || state_indeterminate("ebpf_n3_end_marker_socket");
+        let devices = self.devices()?;
+        let managed = devices.get(&device.ifindex).ok_or_else(unavailable)?;
+        if managed.name != device.name
+            || managed.cleanup_only
+            || managed.successor_pending
+            || managed
+                .grouped
+                .and_then(|grouped| grouped.local_endpoints.ipv4())
+                != Some(local)
+        {
+            return Err(unavailable());
+        }
+        let slot = Arc::clone(&managed.control_socket);
+        drop(devices);
+        if self.inner.runtime.ifindex_by_name(&device.name)? != device.ifindex
+            || !self
+                .inner
+                .runtime
+                .pdp_readback_datapath_usable(device.ifindex)
+        {
+            slot.lock().map_err(|_| unavailable())?.retire();
+            return Err(unavailable());
+        }
+        let mut state = slot.lock().map_err(|_| unavailable())?;
+        if state.retired {
+            return Err(unavailable());
+        }
+        if state.socket.is_none() {
+            state.socket = Some(
+                crate::GtpuReassemblySocket::bind(local, &device.name)
+                    .map_err(|_| unavailable())?,
+            );
+        }
+        let socket = state.socket.as_ref().ok_or_else(unavailable)?;
+        if !current() {
+            return Err(unavailable());
+        }
+        socket
+            .send_retired_n3_end_marker(local, peer, teid)
+            .map_err(|_| unavailable())?;
+        if !current() {
+            return Err(unavailable());
+        }
+        Ok(())
+    }
+
     pub(super) fn open_control_port_sync(
         &self,
         device: GtpDevice,

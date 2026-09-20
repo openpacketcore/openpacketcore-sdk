@@ -33,6 +33,8 @@ use std::cell::RefCell;
 #[cfg(target_os = "linux")]
 mod control_port;
 pub(crate) mod grouped_simulation;
+#[cfg(target_os = "linux")]
+mod n3_end_marker;
 mod workload_scope;
 use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::fmt;
@@ -13703,6 +13705,31 @@ impl EbpfGtpuDataplaneBackend {
 
 #[async_trait]
 impl GtpuDataplaneBackend for EbpfGtpuDataplaneBackend {
+    async fn submit_n3_end_markers(
+        &self,
+        request: crate::GtpuN3EndMarkerRequest,
+    ) -> Result<crate::GtpuN3EndMarkerReceipt, GtpuError> {
+        #[cfg(target_os = "linux")]
+        {
+            let request = self
+                .run_blocking("ebpf_n3_end_marker", move |backend| {
+                    backend.submit_n3_end_markers_sync(request)
+                })
+                .await?;
+            if !request.is_current() {
+                return Err(state_indeterminate("ebpf_n3_end_marker_window"));
+            }
+            Ok(request.confirm_submitted())
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            let _ = request;
+            Err(GtpuError::UnsupportedFeature {
+                feature: "n3_end_marker_submission",
+            })
+        }
+    }
+
     async fn authorize_selector_reuse(
         &self,
         request: crate::GtpuSessionSelectorReuseRequest,
@@ -53764,6 +53791,8 @@ mod load_capability_tests {
 #[cfg(test)]
 mod tests {
     mod grouped_bearer_transition;
+    #[cfg(target_os = "linux")]
+    mod n3_end_marker;
     // This fixture constructs real durable consensus, whose public platform
     // contract is Linux-only. The portable fake-runtime tests remain below.
     #[cfg(target_os = "linux")]

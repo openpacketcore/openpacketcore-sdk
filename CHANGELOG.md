@@ -29,6 +29,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- `opc-gtpu-dataplane`: submit N3 End Markers from exact protected retired
+  claims after classifier quiescence, using the existing IPv4 UDP/2152
+  control socket and original tunnel tuples. Refuse shared peer tunnels,
+  stale maps and unsupported profiles; preserve owned workers through caller
+  cancellation. Completion reports local submission only. Refs #790, #795.
+
 - `opc-gtpu-dataplane`: add an eBPF N3 fixed-flow profile through the protected
   grouped selector namespace. Bind one QFI per inner-family entry to atomic
   authority, insert uplink PSC, enforce downlink QFI/direction, and account

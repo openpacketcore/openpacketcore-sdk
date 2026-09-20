@@ -5,7 +5,7 @@ use opc_gtpu_dataplane::n3::{
 };
 
 // Independent literal construction: no SDK PSC/GTP-U encoder is used here.
-fn gpdu(teid: u32, qfi: u8, uplink: bool, inner: &[u8]) -> Vec<u8> {
+pub(super) fn gpdu(teid: u32, qfi: u8, uplink: bool, inner: &[u8]) -> Vec<u8> {
     let mut packet = vec![0x34, 0xff];
     packet.extend_from_slice(&u16::try_from(inner.len() + 8).unwrap().to_be_bytes());
     packet.extend_from_slice(&teid.to_be_bytes());
@@ -14,7 +14,7 @@ fn gpdu(teid: u32, qfi: u8, uplink: bool, inner: &[u8]) -> Vec<u8> {
     packet
 }
 
-fn entry(base: &GtpuSessionEntry, qfi: u8) -> GtpuSessionEntry {
+pub(super) fn entry(base: &GtpuSessionEntry, qfi: u8) -> GtpuSessionEntry {
     let context = base.context();
     GtpuSessionEntry::from_n3(
         N3ForwardingIntent::new(
@@ -39,7 +39,7 @@ fn group_bytes(net: &TestNet) -> [u8; GTPU_SESSION_GROUP_VALUE_LEN] {
     groups.get(&grouped_group_id().to_bytes(), 0).unwrap()
 }
 
-fn uplink_inner(net: &TestNet, ipv6: bool, payload: &[u8]) -> Vec<u8> {
+pub(super) fn uplink_inner(net: &TestNet, ipv6: bool, payload: &[u8]) -> Vec<u8> {
     if ipv6 {
         let packet = build_inner_udp_v6(UE_PAA_IPV6, REMOTE_HOST_IPV6, 5601, 53, payload);
         send_raw_ipv6_packet(&net.ue_ns, &packet);
