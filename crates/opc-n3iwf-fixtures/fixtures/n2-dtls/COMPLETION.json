@@ -39,7 +39,17 @@
     "opc.n3iwf.n2-dtls.v1.lifecycle-limits",
     "opc.n3iwf.n2-dtls.v1.lifecycle-metadata",
     "opc.n3iwf.n2-dtls.v1.lifecycle-records",
-    "opc.n3iwf.n2-dtls.v1.lifecycle-retirement"
+    "opc.n3iwf.n2-dtls.v1.lifecycle-retirement",
+    "opc.n3iwf.n2-dtls.v1.profile-certificate-profile",
+    "opc.n3iwf.n2-dtls.v1.profile-coordinated-rekey",
+    "opc.n3iwf.n2-dtls.v1.profile-crl-profile",
+    "opc.n3iwf.n2-dtls.v1.profile-native-path-loss",
+    "opc.n3iwf.n2-dtls.v1.profile-native-process-restart",
+    "opc.n3iwf.n2-dtls.v1.profile-publication-retirement",
+    "opc.n3iwf.n2-dtls.v1.profile-rekey-binding",
+    "opc.n3iwf.n2-dtls.v1.profile-rekey-hello",
+    "opc.n3iwf.n2-dtls.v1.profile-server-name",
+    "opc.n3iwf.n2-dtls.v1.profile-stream-framing"
   ],
   "constructed": [
     "PPID 66",
@@ -47,19 +57,21 @@
     "expected-peer identity label",
     "SCTP-AUTH length label",
     "SCTP DATA B/E PPID 66",
-    "86 independent stream-zero lifecycle and certificate schedules"
+    "86 independent stream-zero lifecycle and certificate schedules",
+    "634 bounded profile vector projections and authored lifecycle obligations"
   ],
   "receive": [
-    "rekey",
-    "rotation generation 3",
-    "path failure"
+    "legacy rekey label",
+    "legacy rotation generation 3 label",
+    "legacy path failure label"
   ],
   "unsupported": [
     "PPID 60 as protection",
     "NGAP procedure state",
     "certificate dumps",
-    "in-place rekey and multistream",
-    "CRL/OCSP and full 3GPP PKI",
-    "restart/multihoming and external interoperability"
+    "runtime execution inferred from catalog loading",
+    "in-place rekey, multistream, CRLs and native faults in the legacy stream-zero records",
+    "remote CRL retrieval, OCSP and full 3GPP PKI",
+    "in-place SCTP restart, host reboot, resumption and external interoperability"
   ]
 }

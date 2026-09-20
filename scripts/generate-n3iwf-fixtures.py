@@ -19,7 +19,7 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
 FIXTURE_ROOT = ROOT / "crates" / "opc-n3iwf-fixtures" / "fixtures"
-PUBLIC_BASE = "2a110ecfa5445c927b6be14b0937e0c09dc5841e"
+PUBLIC_BASE = "ccd8ee2f9c803a9e015710b44ce20d981e45b8aa"
 ISSUE = 784
 
 # Existing public SDK vectors reused by digest (issues 341/493).
@@ -3564,6 +3564,47 @@ def n2_dtls_lifecycle(subset_dir: Path) -> list[dict]:
     return fixtures
 
 
+def n2_dtls_profiles(subset_dir: Path) -> list[dict]:
+    source = "crates/opc-n3iwf-fixtures/oracles/dtls-profiles.json"
+    digest = "6d5dc50a0cf8e6a797ee878f1398475ec818ddf70dfea2ba6af2fcf82ae7fe3f"
+    path = ROOT / source
+    if path.is_symlink() or hashlib.sha256(path.read_bytes()).hexdigest() != digest:
+        raise ValueError("n3iwf_dtls_profile_digest")
+    reference = json.loads(path.read_bytes())
+    families = reference["families"]
+    if len(families) != 10 or sum(len(value["cases"]) for value in families.values()) != 634:
+        raise ValueError("n3iwf_dtls_profile_inventory")
+    fixtures = []
+    for family, value in sorted(families.items()):
+        if re.fullmatch(r"[a-z-]{1,32}", family) is None:
+            raise ValueError("n3iwf_dtls_profile_name")
+        name = "profile-" + family
+        data = (json.dumps(dict(family=family, **value), sort_keys=True, separators=(",", ":")) + "\n").encode()
+        count = len(value["cases"])
+        item = manifest(
+            subset="n2-dtls", name=name, case_class="ordering",
+            document="IETF RFC 6083 and bounded SDK profile", release="RFC 6083",
+            clauses=["4.1", "4.4", "4.5", "4.6", "4.7", "4.8", "4.9", "SDK evidence-reference contract"],
+            direction="local-transport", role="dtls-sctp-endpoint",
+            prerequisite="The explicitly selected SDK profile and separate runtime qualification; catalog loading does not execute a transport",
+            provenance_class="referenced-public-vector", referenced=source + "#" + family,
+            notes="Digest-bound projections of independent public vectors or authored obligations for separately qualified tests. No capture, handshake, kernel or external interoperability claim from this record.",
+            sanitized=[{"name": "cases", "treatment": "synthetic-roles-indices-and-outcomes", "value_class": "synthetic"},
+                       {"name": "transport-material", "treatment": "digests-only-no-key-certificate-record-or-endpoint-values", "value_class": "synthetic"}],
+            wire_name=name, wire_hex=data.hex(" "),
+            assertions=["family=" + family, "cases=" + str(count), "execution_claim=false",
+                        "requires_separate_runtime_qualification=true", "external_interoperability=false"],
+            outcome="constructed")
+        item["encoding"] = "scenario-record"
+        item["validation_scope"] = "rfc6083-profile-evidence-reference"
+        item["context"] = dict(source_vector=dict(path=source, sha256=digest, case=family),
+            cases=count, evidence_kind=value["kind"], execution_claim=False,
+            requires_separate_runtime_qualification=True, protected_ppid=66, external_interoperability=False)
+        dump_manifest(subset_dir, item, data.hex(" "))
+        fixtures.append(item)
+    return fixtures
+
+
 def n2_dtls(subset_dir: Path) -> list[dict]:
     positive = "00 00 00 42"
     hello = "16 fe fd 00 00 00 00 00 00 00 00 00 0c 0e 00 00 00 00 00 00 00 00 00 00 00"
@@ -3901,6 +3942,7 @@ def n2_dtls(subset_dir: Path) -> list[dict]:
     for item, wire in zip(fixtures, wires, strict=True):
         dump_manifest(subset_dir, item, wire)
     fixtures.extend(n2_dtls_lifecycle(subset_dir))
+    fixtures.extend(n2_dtls_profiles(subset_dir))
     write_readme(
         subset_dir,
         "N2 DTLS fixture subset",
@@ -3920,6 +3962,16 @@ carrier observations, reciprocal close, invalid metadata and foreign PPIDs.
 Certificate vectors also run at protected Diameter PPID 47. Separate Linux
 tests qualify the kernel adapter; these records do not claim kernel execution,
 in-place rekey, multistream, revocation, restart or external interoperability.
+
+Ten additive rfc6083-profile-evidence-reference records publish 634 value-free
+vector projections and authored lifecycle obligations. They bind independent
+certificate/CRL, stream-framing, secure-renegotiation and SNI corpora, plus the
+coordinated rekey, publication retirement, native path-loss and peer-process
+restart test sources. Full corpus digests and row indices distinguish a selected
+projection from complete source coverage. No credentials, record octets or names
+are copied into these records. Loading the catalog checks these references;
+runtime execution remains a separate qualification. See
+[the profile inventory](../../../../docs/n3iwf-dtls-fixture-profiles.md).
 """,
     )
     write_completion(
@@ -3934,15 +3986,17 @@ in-place rekey, multistream, revocation, restart or external interoperability.
                 "SCTP-AUTH length label",
                 "SCTP DATA B/E PPID 66",
                 "86 independent stream-zero lifecycle and certificate schedules",
+                "634 bounded profile vector projections and authored lifecycle obligations",
             ],
-            receive=["rekey", "rotation generation 3", "path failure"],
+            receive=["legacy rekey label", "legacy rotation generation 3 label", "legacy path failure label"],
             unsupported=[
                 "PPID 60 as protection",
                 "NGAP procedure state",
                 "certificate dumps",
-                "in-place rekey and multistream",
-                "CRL/OCSP and full 3GPP PKI",
-                "restart/multihoming and external interoperability",
+                "runtime execution inferred from catalog loading",
+                "in-place rekey, multistream, CRLs and native faults in the legacy stream-zero records",
+                "remote CRL retrieval, OCSP and full 3GPP PKI",
+                "in-place SCTP restart, host reboot, resumption and external interoperability",
             ],
         ),
     )

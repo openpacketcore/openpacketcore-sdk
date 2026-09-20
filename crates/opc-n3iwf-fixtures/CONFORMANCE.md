@@ -13,6 +13,14 @@ existing NGAP and GTP-U codecs and IKE crypto against the published bytes.
 at its `validation_scope`. It does not mean a N3IWF primitive is implemented
 or that all acceptance evidence for issue 784 has been supplied.
 
+The additive `rfc6083-profile-evidence-reference` scope publishes 634 vector
+projections and authored runtime-test obligations in ten families. Full source
+digests and row indices bind independent certificate/CRL, stream, rekey and SNI
+corpora. Test-source references bind coordinated rekey, publication retirement,
+native path loss and peer-process restart. Catalog checks never assert runtime
+execution or promote the older stream-zero profile. See the
+[complete inventory and limits](../../docs/n3iwf-dtls-fixture-profiles.md).
+
 ## Specification baseline
 
 | Document | Release | Evidence |
