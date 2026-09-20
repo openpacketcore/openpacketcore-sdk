@@ -10408,6 +10408,7 @@ pub(crate) fn single_bearer_reattach_is_exact(
         && old_entry.local_outer_address() == new_entry.local_outer_address()
         && old_entry.outer_family() == new_entry.outer_family()
         && old_entry.context().bearer_mark == new_entry.context().bearer_mark
+        && old_entry.n3_qfi() == new_entry.n3_qfi()
         && old_claim.atoms != new_claim.atoms
         && non_teid(&old_claim.atoms) == non_teid(&new_claim.atoms)
         && old_claim.atoms.difference(&new_claim.atoms).count() == 1
@@ -10558,7 +10559,8 @@ fn atom_codec(tag: u8, bytes: &[u8]) -> Vec<u8> {
 /// semantically different graph with the same selector keys.
 fn canonical_desired_bytes(group: &GtpuSessionGroup) -> Vec<u8> {
     let mut output = Vec::new();
-    output.push(1);
+    let n3 = group.entries().iter().any(|entry| entry.n3_qfi().is_some());
+    output.push(if n3 { 2 } else { 1 });
     output.extend_from_slice(&group.device_id().to_bytes());
     output.extend_from_slice(&group.id().to_bytes());
     let count = u8::try_from(group.entries().len()).unwrap_or(u8::MAX);
@@ -10595,6 +10597,9 @@ fn canonical_desired_bytes(group: &GtpuSessionGroup) -> Vec<u8> {
                 output.push(dscp.get());
             }
             None => output.push(0),
+        }
+        if n3 {
+            output.push(entry.n3_qfi().map_or(0xff, crate::n3::N3Qfi::get));
         }
     }
     output
@@ -10646,7 +10651,8 @@ fn decode_canonical_desired(bytes: &[u8]) -> Option<GtpuSessionGroup> {
     }
 
     let mut cursor = 0_usize;
-    (take(bytes, &mut cursor, 1)? == [1]).then_some(())?;
+    let version = *take(bytes, &mut cursor, 1)?.first()?;
+    matches!(version, 1 | 2).then_some(())?;
     let device = crate::GtpuSessionDeviceId::new(take_array(take(bytes, &mut cursor, 16)?)?)?;
     let group_id = crate::GtpuSessionGroupId::new(take_array(take(bytes, &mut cursor, 16)?)?)?;
     let count = usize::from(*take(bytes, &mut cursor, 1)?.first()?);
@@ -10705,24 +10711,30 @@ fn decode_canonical_desired(bytes: &[u8]) -> Option<GtpuSessionGroup> {
             1 => Some(crate::DscpCodepoint::new(*take(bytes, &mut cursor, 1)?.first()?).ok()?),
             _ => return None,
         };
-        entries.push(
-            crate::GtpuSessionEntry::new(
-                crate::GtpPdpContext {
-                    local_teid,
-                    peer_teid,
-                    ms_address,
-                    peer_address,
-                    link_ifindex,
-                    downlink_source_port_policy,
-                    gtp_version,
-                    bearer_mark,
-                    uplink_source_port_policy,
-                    egress_dscp,
-                },
-                local_outer_address,
-            )
-            .ok()?,
-        );
+        let entry = crate::GtpuSessionEntry::new(
+            crate::GtpPdpContext {
+                local_teid,
+                peer_teid,
+                ms_address,
+                peer_address,
+                link_ifindex,
+                downlink_source_port_policy,
+                gtp_version,
+                bearer_mark,
+                uplink_source_port_policy,
+                egress_dscp,
+            },
+            local_outer_address,
+        )
+        .ok()?;
+        entries.push(if version == 2 {
+            match *take(bytes, &mut cursor, 1)?.first()? {
+                0xff => entry,
+                qfi => entry.restore_n3_qfi(qfi)?,
+            }
+        } else {
+            entry
+        });
     }
     (cursor == bytes.len()).then_some(())?;
     let group = GtpuSessionGroup::new(group_id, device, entries).ok()?;
@@ -10782,6 +10794,7 @@ fn hmac_bytes(key: &[u8; 32], chunks: &[&[u8]]) -> [u8; 32] {
 #[cfg(test)]
 mod tests {
     mod bearer_ledger;
+    mod n3_fixed_flow;
     mod worker_lease;
 
     use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};

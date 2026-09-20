@@ -41,6 +41,7 @@ pub const GTPU_SESSION_IPV6_SLOT: u8 = 1;
 const GROUP_HEADER_LEN: usize = 48;
 const TRANSACTION_HEADER_LEN: usize = 48;
 const ENTRY_FORMAT_VERSION: u8 = 1;
+const N3_ENTRY_FORMAT_VERSION: u8 = 2;
 const GROUP_FORMAT_VERSION: u8 = 1;
 const TRANSACTION_FORMAT_VERSION: u8 = 1;
 const CONFIG_FORMAT_VERSION: u8 = 1;
@@ -626,6 +627,7 @@ pub struct GtpuSessionEntry {
     egress_dscp_wire: u8,
     downlink_source_port_policy: GtpuSourcePortPolicy,
     uplink_source_port_policy: GtpuUplinkSourcePortPolicy,
+    n3_qfi: Option<u8>,
 }
 
 impl core::fmt::Debug for GtpuSessionEntry {
@@ -680,7 +682,37 @@ impl GtpuSessionEntry {
             egress_dscp_wire: egress_dscp.unwrap_or(0xff),
             downlink_source_port_policy,
             uplink_source_port_policy,
+            n3_qfi: None,
         })
+    }
+
+    /// Select the fixed-flow N3IWF profile, with one six-bit QFI in both directions.
+    ///
+    /// The profile is part of this atomic entry, never a separate selector or
+    /// authority source. Outer endpoints must be unicast, as in the directional
+    /// N3 intent. Version-one entries retain their exact encoding.
+    #[must_use]
+    pub const fn with_n3_qfi(mut self, qfi: u8) -> Option<Self> {
+        if qfi > 63
+            || !n3_outer_is_unicast(
+                self.peer_outer_address.family_wire(),
+                &self.peer_outer_address.encode_bytes(),
+            )
+            || !n3_outer_is_unicast(
+                self.local_outer_address.family_wire(),
+                &self.local_outer_address.encode_bytes(),
+            )
+        {
+            return None;
+        }
+        self.n3_qfi = Some(qfi);
+        Some(self)
+    }
+
+    /// Fixed-flow N3 QFI, including zero; `None` denotes ordinary GTP-U.
+    #[must_use]
+    pub const fn n3_qfi(self) -> Option<u8> {
+        self.n3_qfi
     }
 
     /// Canonical inner IPv4 `/32` or IPv6 `/64` PAA.
@@ -757,7 +789,13 @@ impl GtpuSessionEntry {
     #[must_use]
     pub fn encode(self) -> [u8; GTPU_SESSION_ENTRY_LEN] {
         let mut out = [0_u8; GTPU_SESSION_ENTRY_LEN];
-        out[0] = ENTRY_FORMAT_VERSION;
+        out[0] = match self.n3_qfi {
+            Some(qfi) => {
+                out[72] = qfi;
+                N3_ENTRY_FORMAT_VERSION
+            }
+            None => ENTRY_FORMAT_VERSION,
+        };
         out[1] = self.inner_family() as u8;
         out[2] = self.outer_family() as u8;
         out[3] = 0;
@@ -781,10 +819,7 @@ impl GtpuSessionEntry {
     /// Decode one canonical fixed-width entry.
     #[must_use]
     pub fn decode(value: &[u8; GTPU_SESSION_ENTRY_LEN]) -> Option<Self> {
-        if value[0] != ENTRY_FORMAT_VERSION
-            || value[3] != 0
-            || value[72..].iter().any(|byte| *byte != 0)
-        {
+        if !entry_profile_is_canonical(value) || value[3] != 0 {
             return None;
         }
         let inner = GtpuSessionPaa::decode(value[1], copy_16(value, 4)?)?;
@@ -804,7 +839,7 @@ impl GtpuSessionEntry {
             0xff => None,
             _ => return None,
         };
-        Self::new(
+        let entry = Self::new(
             inner,
             peer,
             local,
@@ -814,7 +849,43 @@ impl GtpuSessionEntry {
             dscp,
             downlink_policy,
             uplink_policy,
-        )
+        )?;
+        if value[0] == N3_ENTRY_FORMAT_VERSION {
+            entry.with_n3_qfi(value[72])
+        } else {
+            Some(entry)
+        }
+    }
+}
+
+#[inline(always)]
+fn entry_profile_is_canonical(value: &[u8; GTPU_SESSION_ENTRY_LEN]) -> bool {
+    match value[0] {
+        ENTRY_FORMAT_VERSION if value[72] == 0 => {}
+        N3_ENTRY_FORMAT_VERSION if value[72] <= 63 => {}
+        _ => return false,
+    }
+    value[73] == 0
+        && value[74] == 0
+        && value[75] == 0
+        && value[76] == 0
+        && value[77] == 0
+        && value[78] == 0
+        && value[79] == 0
+}
+
+// The ordinary entry already excludes unspecified addresses. N3 additionally
+// excludes multicast and the IPv4 limited broadcast address, matching its
+// public directional TNL model. Keep this usable by both decode paths.
+#[inline(always)]
+const fn n3_outer_is_unicast(family: u8, value: &[u8; 16]) -> bool {
+    match family {
+        4 => {
+            !(value[0] >= 224 && value[0] <= 239)
+                && !(value[0] == 255 && value[1] == 255 && value[2] == 255 && value[3] == 255)
+        }
+        6 => value[0] != 0xff,
+        _ => false,
     }
 }
 
@@ -892,18 +963,18 @@ fn entry_wire_is_canonical(
         Ok(value) => value,
         Err(_) => return false,
     };
-    if value[0] != ENTRY_FORMAT_VERSION
+    if !entry_profile_is_canonical(value)
         || value[1] != expected_family as u8
         || value[3] != 0
         || !wire_paa_is_canonical(value[1], inner_paa)
         || !wire_address_is_canonical(value[2], peer_outer)
         || !wire_address_is_canonical(value[2], local_outer)
+        || (value[0] == N3_ENTRY_FORMAT_VERSION
+            && (!n3_outer_is_unicast(value[2], peer_outer)
+                || !n3_outer_is_unicast(value[2], local_outer)))
         || u32::from_ne_bytes([value[52], value[53], value[54], value[55]]) == 0
         || u32::from_ne_bytes([value[56], value[57], value[58], value[59]]) == 0
         || !matches!(value[64], 0..=63 | 0xff)
-        || u64::from_ne_bytes([
-            value[72], value[73], value[74], value[75], value[76], value[77], value[78], value[79],
-        ]) != 0
     {
         return false;
     }
@@ -1004,6 +1075,16 @@ impl core::fmt::Debug for GtpuSessionEntryWireView<'_> {
 }
 
 impl<'a> GtpuSessionEntryWireView<'a> {
+    /// Fixed-flow N3 QFI from the already validated atomic entry.
+    #[must_use]
+    pub const fn n3_qfi(self) -> Option<u8> {
+        if self.wire[0] == N3_ENTRY_FORMAT_VERSION {
+            Some(self.wire[72])
+        } else {
+            None
+        }
+    }
+
     /// Return the already-validated fixed-width entry bytes.
     #[must_use]
     pub const fn as_wire(self) -> &'a [u8; GTPU_SESSION_ENTRY_LEN] {
@@ -3183,51 +3264,101 @@ mod tests {
     }
 
     #[test]
-    fn zero_copy_wire_view_matches_typed_authorizers_for_all_single_byte_mutations() {
-        let entries = [v4_entry(), v6_entry()];
-        let authority = active(9, Some(entries[0]), Some(entries[1])).encode();
+    fn zero_copy_n3_authority_retains_every_qfi_in_both_families() {
         let config = device_config().encode();
-        for entry in entries {
-            let reference = GtpuSessionGroupRef::single(group_id(), candidate(9, entry)).encode();
-            assert_wire_view_typed_parity(&authority, &reference, &config, entry);
-
-            let mut mutated_authority = authority;
-            for offset in 0..mutated_authority.len() {
-                let original = mutated_authority[offset];
-                for replacement in u8::MIN..=u8::MAX {
-                    if replacement == original {
-                        continue;
-                    }
-                    mutated_authority[offset] = replacement;
-                    assert_wire_view_typed_parity(&mutated_authority, &reference, &config, entry);
-                }
-                mutated_authority[offset] = original;
+        for qfi in 0..64 {
+            let entries = [
+                v4_entry().with_n3_qfi(qfi).unwrap(),
+                v6_entry().with_n3_qfi(qfi).unwrap(),
+            ];
+            let authority = active(9, Some(entries[0]), Some(entries[1])).encode();
+            for entry in entries {
+                let reference =
+                    GtpuSessionGroupRef::single(group_id(), candidate(9, entry)).encode();
+                let view = select_gtpu_session_entry_wire(
+                    &authority,
+                    &reference,
+                    &config,
+                    42,
+                    entry.inner_family().slot(),
+                )
+                .unwrap();
+                assert_eq!(view.n3_qfi(), Some(qfi));
+                assert_eq!(view.as_wire(), &entry.encode());
+                assert_wire_view_typed_parity(&authority, &reference, &config, entry);
             }
+        }
+    }
 
-            let mut mutated_reference = reference;
-            for offset in 0..mutated_reference.len() {
-                let original = mutated_reference[offset];
-                for replacement in u8::MIN..=u8::MAX {
-                    if replacement == original {
-                        continue;
-                    }
-                    mutated_reference[offset] = replacement;
-                    assert_wire_view_typed_parity(&authority, &mutated_reference, &config, entry);
-                }
-                mutated_reference[offset] = original;
-            }
+    #[test]
+    fn zero_copy_wire_view_matches_typed_authorizers_for_all_single_byte_mutations() {
+        for entries in [
+            [v4_entry(), v6_entry()],
+            [
+                v4_entry().with_n3_qfi(0).unwrap(),
+                v6_entry().with_n3_qfi(63).unwrap(),
+            ],
+        ] {
+            let authority = active(9, Some(entries[0]), Some(entries[1])).encode();
+            let config = device_config().encode();
+            for entry in entries {
+                let reference =
+                    GtpuSessionGroupRef::single(group_id(), candidate(9, entry)).encode();
+                assert_wire_view_typed_parity(&authority, &reference, &config, entry);
 
-            let mut mutated_config = config;
-            for offset in 0..mutated_config.len() {
-                let original = mutated_config[offset];
-                for replacement in u8::MIN..=u8::MAX {
-                    if replacement == original {
-                        continue;
+                let mut mutated_authority = authority;
+                for offset in 0..mutated_authority.len() {
+                    let original = mutated_authority[offset];
+                    for replacement in u8::MIN..=u8::MAX {
+                        if replacement == original {
+                            continue;
+                        }
+                        mutated_authority[offset] = replacement;
+                        assert_wire_view_typed_parity(
+                            &mutated_authority,
+                            &reference,
+                            &config,
+                            entry,
+                        );
                     }
-                    mutated_config[offset] = replacement;
-                    assert_wire_view_typed_parity(&authority, &reference, &mutated_config, entry);
+                    mutated_authority[offset] = original;
                 }
-                mutated_config[offset] = original;
+
+                let mut mutated_reference = reference;
+                for offset in 0..mutated_reference.len() {
+                    let original = mutated_reference[offset];
+                    for replacement in u8::MIN..=u8::MAX {
+                        if replacement == original {
+                            continue;
+                        }
+                        mutated_reference[offset] = replacement;
+                        assert_wire_view_typed_parity(
+                            &authority,
+                            &mutated_reference,
+                            &config,
+                            entry,
+                        );
+                    }
+                    mutated_reference[offset] = original;
+                }
+
+                let mut mutated_config = config;
+                for offset in 0..mutated_config.len() {
+                    let original = mutated_config[offset];
+                    for replacement in u8::MIN..=u8::MAX {
+                        if replacement == original {
+                            continue;
+                        }
+                        mutated_config[offset] = replacement;
+                        assert_wire_view_typed_parity(
+                            &authority,
+                            &reference,
+                            &mutated_config,
+                            entry,
+                        );
+                    }
+                    mutated_config[offset] = original;
+                }
             }
         }
     }
@@ -3555,7 +3686,7 @@ mod tests {
     #[test]
     fn every_new_wire_type_rejects_noncanonical_control_bytes() {
         let entry = independent_v4_entry_bytes();
-        for (offset, replacement) in [(0, 2), (1, 5), (3, 1), (72, 1)] {
+        for (offset, replacement) in [(0, 3), (1, 5), (3, 1), (72, 1)] {
             let mut malformed = entry;
             malformed[offset] = replacement;
             assert_eq!(GtpuSessionEntry::decode(&malformed), None);

@@ -4757,6 +4757,7 @@ pub struct GtpuSessionEntry {
     context: GtpPdpContext,
     inner_paa: GtpuSessionPaa,
     local_outer_address: IpAddr,
+    n3_qfi: Option<crate::n3::N3Qfi>,
 }
 
 impl GtpuSessionEntry {
@@ -4795,7 +4796,90 @@ impl GtpuSessionEntry {
             context,
             inner_paa,
             local_outer_address,
+            n3_qfi: None,
         })
+    }
+
+    /// Construct a fixed-flow N3IWF entry from the distinct directional TNLs.
+    ///
+    /// The selected QFI is inserted on uplink and required on downlink. The
+    /// complete mark selects uplink traffic and is applied after downlink
+    /// classification. Installation still requires the existing opaque
+    /// selector admission and qualified grouped backend. This is one flow per
+    /// inner family; it does not provide a multi-QFI fallback policy.
+    ///
+    /// # Errors
+    /// Returns the same address, PAA, and attachment errors as [`Self::new`].
+    pub fn from_n3(
+        intent: crate::n3::N3ForwardingIntent,
+        inner_address: IpAddr,
+        link_ifindex: u32,
+        downlink_source_port_policy: GtpuSourcePortPolicy,
+        uplink_source_port_policy: GtpuUplinkSourcePortPolicy,
+        egress_dscp: Option<DscpCodepoint>,
+    ) -> Result<Self, GtpuSessionModelError> {
+        match intent.role() {
+            crate::n3::N3ForwardingRole::N3iwf => {}
+        }
+        let mut entry = Self::new(
+            GtpPdpContext {
+                local_teid: intent.local_downlink().teid(),
+                peer_teid: intent.received_uplink().teid(),
+                ms_address: inner_address,
+                peer_address: intent.received_uplink().destination(),
+                link_ifindex,
+                downlink_source_port_policy,
+                gtp_version: GtpVersion::V1,
+                bearer_mark: intent.flow().mark(),
+                egress_dscp,
+                uplink_source_port_policy,
+            },
+            intent.local_downlink().local_address(),
+        )?;
+        entry.n3_qfi = Some(intent.flow().qfi());
+        Ok(entry)
+    }
+
+    /// Exact fixed-flow N3 QFI; `None` means ordinary GTP-U without PSC enforcement.
+    #[must_use]
+    pub const fn n3_qfi(&self) -> Option<crate::n3::N3Qfi> {
+        self.n3_qfi
+    }
+
+    /// Reconstruct the distinct uplink/downlink TNL and flow intent on readback.
+    #[must_use]
+    pub fn n3_intent(&self) -> Option<crate::n3::N3ForwardingIntent> {
+        use crate::n3::{
+            LocalN3DownlinkTnl, N3FlowMarking, N3ForwardingIntent, N3ForwardingRole,
+            ReceivedN3UplinkTnl,
+        };
+        Some(N3ForwardingIntent::new(
+            N3ForwardingRole::N3iwf,
+            ReceivedN3UplinkTnl::new(self.context.peer_address, self.context.peer_teid).ok()?,
+            LocalN3DownlinkTnl::new(self.local_outer_address, self.context.local_teid).ok()?,
+            N3FlowMarking::new(self.n3_qfi?, self.context.bearer_mark),
+        ))
+    }
+
+    pub(crate) fn restore_n3_qfi(self, qfi: u8) -> Option<Self> {
+        use crate::n3::{
+            LocalN3DownlinkTnl, N3FlowMarking, N3ForwardingIntent, N3ForwardingRole, N3Qfi,
+            ReceivedN3UplinkTnl,
+        };
+        Self::from_n3(
+            N3ForwardingIntent::new(
+                N3ForwardingRole::N3iwf,
+                ReceivedN3UplinkTnl::new(self.context.peer_address, self.context.peer_teid).ok()?,
+                LocalN3DownlinkTnl::new(self.local_outer_address, self.context.local_teid).ok()?,
+                N3FlowMarking::new(N3Qfi::new(qfi).ok()?, self.context.bearer_mark),
+            ),
+            self.context.ms_address,
+            self.context.link_ifindex,
+            self.context.downlink_source_port_policy,
+            self.context.uplink_source_port_policy,
+            self.context.egress_dscp,
+        )
+        .ok()
     }
 
     /// Complete existing PDP-context policy.

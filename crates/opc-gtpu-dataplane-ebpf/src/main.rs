@@ -55,18 +55,19 @@ use opc_gtpu_ebpf_common::{
     downlink_parse_ipv4_total_length, downlink_parse_payload_offset, downlink_parse_teid,
     gtpu_session_config_wire_owns_local_ipv4, gtpu_session_config_wire_owns_local_ipv6,
     internet_checksum_sum_is_valid, marked_owner_wire_authorizes_downlink,
-    marked_owner_wire_authorizes_uplink, pack_downlink_parse_result,
-    pdp_commit_wire_authorized_source_port, pdp_commit_wire_authorizes_downlink,
-    pdp_commit_wire_authorizes_graph, select_gtpu_session_entry_wire,
-    tft_classifier_filter_matches, tft_classifier_schema_is_current,
-    uplink_non_encapsulation_drops, validate_ipv4_downlink_binding_wire, DownlinkBindingMismatch,
-    DownlinkPdr, GtpuClass, GtpuEnvelopeBounds, GtpuOuterFragmentPolicy, GtpuPmtuProtocol,
-    GtpuSessionAuthorityWireView, GtpuSessionEntryWireView, GtpuSessionGroupPhase,
-    GtpuSessionIpFamily, GtpuTrafficObservationDirection, GtpuUplinkMtuPolicy, Ipv4EnvelopeBounds,
-    Ipv6ExtensionStep, MarkedDownlinkPdr, TftClassifierFilter, TftClassifierFilterKey,
-    TftClassifierIpv4Packet, TftClassifierKey, TftClassifierMeta, UdpChecksumDisposition,
-    UdpChecksumEvidence, UdpEnvelopeBounds, UplinkFar, UplinkFarKey, UplinkMtuMapState,
-    UplinkPmtuDecision, COUNTER_DL_BINDING_FAMILY_MISMATCH, COUNTER_DL_BINDING_INGRESS_MISMATCH,
+    marked_owner_wire_authorizes_uplink, n3_downlink_psc_matches, n3_uplink_extension,
+    pack_downlink_parse_result, pdp_commit_wire_authorized_source_port,
+    pdp_commit_wire_authorizes_downlink, pdp_commit_wire_authorizes_graph,
+    select_gtpu_session_entry_wire, tft_classifier_filter_matches,
+    tft_classifier_schema_is_current, uplink_non_encapsulation_drops,
+    validate_ipv4_downlink_binding_wire, DownlinkBindingMismatch, DownlinkPdr, GtpuClass,
+    GtpuEnvelopeBounds, GtpuOuterFragmentPolicy, GtpuPmtuProtocol, GtpuSessionAuthorityWireView,
+    GtpuSessionEntryWireView, GtpuSessionGroupPhase, GtpuSessionIpFamily,
+    GtpuTrafficObservationDirection, GtpuUplinkMtuPolicy, Ipv4EnvelopeBounds, Ipv6ExtensionStep,
+    MarkedDownlinkPdr, TftClassifierFilter, TftClassifierFilterKey, TftClassifierIpv4Packet,
+    TftClassifierKey, TftClassifierMeta, UdpChecksumDisposition, UdpChecksumEvidence,
+    UdpEnvelopeBounds, UplinkFar, UplinkFarKey, UplinkMtuMapState, UplinkPmtuDecision,
+    COUNTER_DL_BINDING_FAMILY_MISMATCH, COUNTER_DL_BINDING_INGRESS_MISMATCH,
     COUNTER_DL_BINDING_INVALID, COUNTER_DL_BINDING_LOCAL_MISMATCH,
     COUNTER_DL_BINDING_PEER_MISMATCH, COUNTER_DL_BINDING_SOURCE_PORT_MISMATCH, COUNTER_DL_DECAP,
     COUNTER_DL_DST_MISMATCH, COUNTER_DL_MALFORMED, COUNTER_DL_UNKNOWN_TEID, COUNTER_SLOTS,
@@ -74,13 +75,14 @@ use opc_gtpu_ebpf_common::{
     COUNTER_TFT_CLASSIFIER_NO_MATCH, COUNTER_UL_ENCAP, COUNTER_UL_FAR_MISS, COUNTER_UL_MTU_REJECT,
     COUNTER_UL_PMTU_CORRUPT, COUNTER_UL_REDIRECT_RESOLVED, DOWNLINK_BINDING_COUNTER_SLOTS,
     DOWNLINK_ENDPOINT_BINDING_VALUE_LEN, DOWNLINK_PDR_VALUE_LEN, ETH_HDR_LEN, ETH_P_IPV4,
-    ETH_P_IPV6, GTPU_ENCAP_LEN, GTPU_FLAGS_V1_GPDU, GTPU_IPV6_ENCAP_LEN, GTPU_MANDATORY_HDR_LEN,
-    GTPU_MAX_EXT_HEADERS, GTPU_MSG_TYPE_GPDU, GTPU_OPT_LEN, GTPU_SESSION_CONFIG_KEY,
-    GTPU_SESSION_CONFIG_VALUE_LEN, GTPU_SESSION_DOWNLINK_KEY_LEN, GTPU_SESSION_GROUP_ID_LEN,
-    GTPU_SESSION_GROUP_REF_LEN, GTPU_SESSION_GROUP_VALUE_LEN, GTPU_SESSION_SCHEMA_MARKER_LEN,
-    GTPU_SESSION_SELECTOR_STAMP_VALUE_LEN, GTPU_SESSION_TRANSACTION_VALUE_LEN,
-    GTPU_SESSION_UPLINK_KEY_LEN, GTPU_TRAFFIC_OBSERVATION_EVENT_LEN,
-    GTPU_TRAFFIC_OBSERVATION_GATE_INDEX, GTPU_TRAFFIC_OBSERVATION_GATE_MAX_ENTRIES,
+    ETH_P_IPV6, GTPU_ENCAP_LEN, GTPU_FLAGS_V1_GPDU, GTPU_FLAG_E, GTPU_IPV6_ENCAP_LEN,
+    GTPU_MANDATORY_HDR_LEN, GTPU_MAX_EXT_HEADERS, GTPU_MSG_TYPE_GPDU, GTPU_OPT_LEN,
+    GTPU_SESSION_CONFIG_KEY, GTPU_SESSION_CONFIG_VALUE_LEN, GTPU_SESSION_DOWNLINK_KEY_LEN,
+    GTPU_SESSION_GROUP_ID_LEN, GTPU_SESSION_GROUP_REF_LEN, GTPU_SESSION_GROUP_VALUE_LEN,
+    GTPU_SESSION_SCHEMA_MARKER_LEN, GTPU_SESSION_SELECTOR_STAMP_VALUE_LEN,
+    GTPU_SESSION_TRANSACTION_VALUE_LEN, GTPU_SESSION_UPLINK_KEY_LEN,
+    GTPU_TRAFFIC_OBSERVATION_EVENT_LEN, GTPU_TRAFFIC_OBSERVATION_GATE_INDEX,
+    GTPU_TRAFFIC_OBSERVATION_GATE_MAX_ENTRIES,
     GTPU_TRAFFIC_OBSERVATION_ICMP_ECHO_CHALLENGE_PAYLOAD_LEN,
     GTPU_TRAFFIC_OBSERVATION_ICMP_ECHO_CHALLENGE_PROFILE, GTPU_TRAFFIC_OBSERVATION_ICMP_ECHO_MAGIC,
     GTPU_TRAFFIC_OBSERVATION_ICMP_ECHO_VERSION, GTPU_TRAFFIC_OBSERVATION_REDIRECT_NONCE_LEN,
@@ -88,12 +90,12 @@ use opc_gtpu_ebpf_common::{
     GTPU_TRAFFIC_OBSERVATION_RING_BYTES, GTPU_UDP_PORT, IPV4_MIN_HDR_LEN, IPV6_HDR_LEN,
     IPV6_MAX_EXT_HEADERS, IPV6_MAX_OPTIONS_PER_HEADER, IPV6_NH_DESTINATION_OPTIONS,
     IPV6_NH_FRAGMENT, IPV6_NH_HOP_BY_HOP, IPV6_NH_NONE, IPV6_NH_ROUTING, IPV6_NH_UDP,
-    MARKED_BEARER_OWNER_VALUE_LEN, MARKED_DOWNLINK_PDR_VALUE_LEN, TFT_CLASSIFIER_COUNTER_SLOTS,
-    TFT_CLASSIFIER_FILTER_MAP_MAX_ENTRIES, TFT_CLASSIFIER_MAX_FILTERS,
-    TFT_CLASSIFIER_META_MAP_MAX_ENTRIES, TFT_CLASSIFIER_SCHEMA_VALUE_LEN, UDP_HDR_LEN,
-    UPLINK_DSCP_SCHEMA_MARKER_KEY, UPLINK_DSCP_VALUE_LEN, UPLINK_FAR_VALUE_LEN,
-    UPLINK_MARK_KEY_LEN, UPLINK_PMTU_COUNTER_SLOTS, UPLINK_PMTU_VALUE_LEN,
-    UPLINK_SOURCE_PORT_VALUE_LEN,
+    MARKED_BEARER_OWNER_VALUE_LEN, MARKED_DOWNLINK_PDR_VALUE_LEN, N3_UPLINK_EXTENSION_LEN,
+    TFT_CLASSIFIER_COUNTER_SLOTS, TFT_CLASSIFIER_FILTER_MAP_MAX_ENTRIES,
+    TFT_CLASSIFIER_MAX_FILTERS, TFT_CLASSIFIER_META_MAP_MAX_ENTRIES,
+    TFT_CLASSIFIER_SCHEMA_VALUE_LEN, UDP_HDR_LEN, UPLINK_DSCP_SCHEMA_MARKER_KEY,
+    UPLINK_DSCP_VALUE_LEN, UPLINK_FAR_VALUE_LEN, UPLINK_MARK_KEY_LEN, UPLINK_PMTU_COUNTER_SLOTS,
+    UPLINK_PMTU_VALUE_LEN, UPLINK_SOURCE_PORT_VALUE_LEN,
 };
 use opc_gtpu_ebpf_common::{
     classify_ipv6_extension_step, gtpu_endpoint_requires_extension_control,
@@ -1139,11 +1141,15 @@ fn emit_grouped_uplink_observation_on_reentry(ctx: &TcContext, eth_proto: u16) {
         ETH_P_IPV6 => ETH_HDR_LEN + GTPU_IPV6_ENCAP_LEN,
         _ => return,
     };
+    let Some(extra) = uplink_gpdu_extension_length(ctx, inner_offset - GTPU_MANDATORY_HDR_LEN)
+    else {
+        return;
+    };
     emit_grouped_observation(
         ctx,
         Some(authority),
         publication_id,
-        inner_offset,
+        inner_offset + extra,
         GtpuTrafficObservationDirection::AccessToCore,
     );
 }
@@ -1457,10 +1463,25 @@ fn outer_envelope_is_uplink_gpdu(ctx: &TcContext, l4_offset: usize) -> bool {
     if u16::from_be(destination_port) != GTPU_UDP_PORT {
         return false;
     }
-    let Ok(header) = ctx.load::<[u8; 2]>(l4_offset + UDP_HDR_LEN) else {
-        return false;
-    };
-    header == [GTPU_FLAGS_V1_GPDU, GTPU_MSG_TYPE_GPDU]
+    uplink_gpdu_extension_length(ctx, l4_offset + UDP_HDR_LEN).is_some()
+}
+
+#[inline(always)]
+fn uplink_gpdu_extension_length(ctx: &TcContext, gtp_offset: usize) -> Option<usize> {
+    let header = ctx.load::<[u8; 2]>(gtp_offset).ok()?;
+    if header == [GTPU_FLAGS_V1_GPDU, GTPU_MSG_TYPE_GPDU] {
+        return Some(0);
+    }
+    if header != [GTPU_FLAGS_V1_GPDU | GTPU_FLAG_E, GTPU_MSG_TYPE_GPDU] {
+        return None;
+    }
+    let extension = ctx
+        .load::<[u8; N3_UPLINK_EXTENSION_LEN]>(gtp_offset + GTPU_MANDATORY_HDR_LEN)
+        .ok()?;
+    if n3_uplink_extension(extension[6])? != extension {
+        return None;
+    }
+    Some(N3_UPLINK_EXTENSION_LEN)
 }
 
 /// Return whether `address` is one of this attachment's local S2b-U IPv4
@@ -1769,9 +1790,72 @@ fn grouped_downlink_authority<'a>(
     {
         return None;
     }
+    if let Some(qfi) = entry.n3_qfi() {
+        if !grouped_n3_downlink_matches(ctx, l4_offset, payload_offset, qfi) {
+            return None;
+        }
+    }
     *observation_authority = Some(authority);
     *status = GROUPED_LOOKUP_AUTHORIZED;
     Some(entry)
+}
+
+/// Apply the installed flow's PSC constraint only after selecting one exact
+/// atomic group. The envelope parser already bounded this entire chain; repeat
+/// its four-extension bound so optional headers cannot hide a second PSC.
+#[inline(never)]
+fn grouped_n3_downlink_matches(
+    ctx: &TcContext,
+    l4_offset: usize,
+    payload_offset: usize,
+    qfi: u8,
+) -> bool {
+    let gtp_offset = l4_offset + UDP_HDR_LEN;
+    let Ok(flags) = ctx.load::<u8>(gtp_offset) else {
+        return false;
+    };
+    if flags & GTPU_FLAG_E == 0 {
+        return false;
+    }
+    let mut cursor = gtp_offset + GTPU_MANDATORY_HDR_LEN + GTPU_OPT_LEN;
+    if cursor > payload_offset {
+        return false;
+    }
+    let Ok(mut next) = ctx.load::<u8>(cursor - 1) else {
+        return false;
+    };
+    let mut found = false;
+    let mut walked = 0;
+    while next != 0 {
+        if walked == GTPU_MAX_EXT_HEADERS || cursor >= payload_offset {
+            return false;
+        }
+        let Ok(units) = ctx.load::<u8>(cursor) else {
+            return false;
+        };
+        let end = cursor + usize::from(units) * 4;
+        if units == 0 || end > payload_offset {
+            return false;
+        }
+        if next == 0x85 {
+            let Ok(prefix) = ctx.load::<[u8; 3]>(cursor) else {
+                return false;
+            };
+            if found || !n3_downlink_psc_matches(prefix, qfi) {
+                return false;
+            }
+            found = true;
+        } else if gtpu_endpoint_requires_extension_control(next) {
+            return false;
+        }
+        let Ok(following) = ctx.load::<u8>(end - 1) else {
+            return false;
+        };
+        next = following;
+        cursor = end;
+        walked += 1;
+    }
+    found && cursor == payload_offset
 }
 
 #[inline(always)]
@@ -1939,7 +2023,13 @@ fn prepare_grouped_ipv6_encapsulation(
 ) -> Option<u32> {
     let peer = entry.peer_outer_wire();
     let local = entry.local_outer_wire();
-    let udp_length = inner_len.checked_add(16)?;
+    let extra = if entry.n3_qfi().is_some() {
+        N3_UPLINK_EXTENSION_LEN as u16
+    } else {
+        0
+    };
+    let gtp_length = inner_len.checked_add(extra)?;
+    let udp_length = gtp_length.checked_add(16)?;
     let source_port = entry.uplink_source_port();
     if source_port == 0 {
         return None;
@@ -1955,9 +2045,9 @@ fn prepare_grouped_ipv6_encapsulation(
     encap[40..42].copy_from_slice(&source_port.to_be_bytes());
     encap[42..44].copy_from_slice(&GTPU_UDP_PORT.to_be_bytes());
     encap[44..46].copy_from_slice(&udp_length.to_be_bytes());
-    encap[48] = GTPU_FLAGS_V1_GPDU;
+    encap[48] = GTPU_FLAGS_V1_GPDU | if extra != 0 { GTPU_FLAG_E } else { 0 };
     encap[49] = GTPU_MSG_TYPE_GPDU;
-    encap[50..52].copy_from_slice(&inner_len.to_be_bytes());
+    encap[50..52].copy_from_slice(&gtp_length.to_be_bytes());
     encap[52..56].copy_from_slice(&entry.peer_teid());
 
     let mut pseudo_header = [0_u8; 40];
@@ -1993,6 +2083,20 @@ fn prepare_grouped_ipv6_encapsulation(
     if fixed_sum < 0 {
         return None;
     }
+    if let Some(qfi) = entry.n3_qfi() {
+        let mut extension = n3_uplink_extension(qfi)?;
+        // SAFETY: the initialized eight-byte PSC block is a multiple of four.
+        let sum = unsafe {
+            bpf_csum_diff(
+                core::ptr::null_mut(),
+                0,
+                extension.as_mut_ptr().cast::<u32>(),
+                N3_UPLINK_EXTENSION_LEN as u32,
+                fixed_sum as u32,
+            )
+        };
+        return if sum < 0 { None } else { Some(sum as u32) };
+    }
     Some(fixed_sum as u32)
 }
 
@@ -2004,9 +2108,17 @@ fn encapsulate_grouped_ipv6(
     inner_len: u16,
     authority: Option<&[u8; GTPU_SESSION_GROUP_VALUE_LEN]>,
 ) -> i32 {
+    let extra = if entry.n3_qfi().is_some() {
+        N3_UPLINK_EXTENSION_LEN as u16
+    } else {
+        0
+    };
+    let Some(accounted_len) = inner_len.checked_add(extra) else {
+        return TC_ACT_SHOT;
+    };
     if entry.outer_family() != GtpuSessionIpFamily::Ipv6
         || !checksum_bytes_are_materialized(ctx)
-        || !ipv6_uplink_pmtu_allows(inner_len, entry.inner_family())
+        || !ipv6_uplink_pmtu_allows(accounted_len, entry.inner_family())
     {
         return TC_ACT_SHOT;
     }
@@ -2021,7 +2133,7 @@ fn encapsulate_grouped_ipv6(
     if ctx
         .skb
         .adjust_room(
-            encap.len() as i32,
+            encap.len() as i32 + i32::from(extra),
             BPF_ADJ_ROOM_MAC,
             u64::from(BPF_F_ADJ_ROOM_ENCAP_L3_IPV6 | BPF_F_ADJ_ROOM_ENCAP_L4_UDP),
         )
@@ -2029,6 +2141,17 @@ fn encapsulate_grouped_ipv6(
         || ctx.store(ETH_HDR_LEN, &encap, 0).is_err()
     {
         return TC_ACT_SHOT;
+    }
+    if let Some(qfi) = entry.n3_qfi() {
+        let Some(extension) = n3_uplink_extension(qfi) else {
+            return TC_ACT_SHOT;
+        };
+        if ctx
+            .store(ETH_HDR_LEN + GTPU_IPV6_ENCAP_LEN, &extension, 0)
+            .is_err()
+        {
+            return TC_ACT_SHOT;
+        }
     }
     complete_grouped_uplink(ctx, mark, ETH_P_IPV6, authority)
 }
@@ -2044,6 +2167,14 @@ fn encapsulate_grouped_ipv4(
     if entry.outer_family() != GtpuSessionIpFamily::Ipv4 {
         return TC_ACT_SHOT;
     }
+    let extra = if entry.n3_qfi().is_some() {
+        N3_UPLINK_EXTENSION_LEN as u16
+    } else {
+        0
+    };
+    let Some(accounted_len) = inner_len.checked_add(extra) else {
+        return TC_ACT_SHOT;
+    };
     let peer = entry.peer_outer_wire();
     let local = entry.local_outer_wire();
     let far = UplinkFar {
@@ -2053,12 +2184,15 @@ fn encapsulate_grouped_ipv4(
     };
     let Some(mut encap) = build_uplink_encap_with_dscp_and_source_port(
         &far,
-        inner_len,
+        accounted_len,
         entry.egress_dscp(),
         entry.uplink_source_port(),
     ) else {
         return TC_ACT_SHOT;
     };
+    if extra != 0 {
+        encap[28] |= GTPU_FLAG_E;
+    }
     if let Some(policy_ptr) = GTPU_PMTU_CFG.get_ptr(0) {
         // SAFETY: one aligned four-byte map value is read atomically.
         let bytes = unsafe { (policy_ptr as *const u32).read_unaligned() }.to_ne_bytes();
@@ -2081,7 +2215,7 @@ fn encapsulate_grouped_ipv4(
     if ctx
         .skb
         .adjust_room(
-            encap.len() as i32,
+            encap.len() as i32 + i32::from(extra),
             BPF_ADJ_ROOM_MAC,
             u64::from(BPF_F_ADJ_ROOM_ENCAP_L3_IPV4 | BPF_F_ADJ_ROOM_ENCAP_L4_UDP),
         )
@@ -2089,6 +2223,17 @@ fn encapsulate_grouped_ipv4(
         || ctx.store(ETH_HDR_LEN, &encap, 0).is_err()
     {
         return TC_ACT_SHOT;
+    }
+    if let Some(qfi) = entry.n3_qfi() {
+        let Some(extension) = n3_uplink_extension(qfi) else {
+            return TC_ACT_SHOT;
+        };
+        if ctx
+            .store(ETH_HDR_LEN + GTPU_ENCAP_LEN, &extension, 0)
+            .is_err()
+        {
+            return TC_ACT_SHOT;
+        }
     }
     complete_grouped_uplink(ctx, mark, ETH_P_IPV4, authority)
 }

@@ -29,6 +29,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- `opc-gtpu-dataplane`: add an eBPF N3 fixed-flow profile through the protected
+  grouped selector namespace. Bind one QFI per inner-family entry to atomic
+  authority, insert uplink PSC, enforce downlink QFI/direction, and account
+  for PSC bytes in IPv4/IPv6 checksums and PMTU. The broader N3 capability
+  remains missing pending multi-QFI and End Marker lifecycle work. Refs #790,
+  #795.
+
 - `opc-diameter-transport`: add opt-in NDS/AF ECDSA certificate constraints
   for generic RFC 6083 endpoints with required CRLs. Validate local and
   selected peer paths, TLS CA constraints, key strength, names, criticality
