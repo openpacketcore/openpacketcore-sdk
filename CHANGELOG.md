@@ -29,6 +29,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- `opc-ipsec-xfrm`: seal authenticated ESP-in-UDP source observations to the
+  exact installed Child-SA pair, publication and monitor registration. Fresh
+  whole-roster checks reject stale publications and queued-event relabelling;
+  native packet tests cover three overlapping children, replay rejection and
+  rekey overlap. Observations preserve the existing source and loss limits
+  without granting relocation authority. Refs #793, #795.
+
 - `opc-ipsec-xfrm`: add optional actor-fenced installed Child-SA roster
   publication and exact marked outbound selection. Whole-roster key/readback
   proof, stale-writer invalidation, bounded generation and native rekey packet

@@ -1,6 +1,7 @@
 //! Real installed selection, independently captured ESP SPIs and writer fences.
 #![cfg(target_os = "linux")]
 
+use hmac::{Hmac, KeyInit, Mac};
 use nix::sys::socket::{
     recvfrom, setsockopt, socket, sockopt, AddressFamily, LinkAddr, SockFlag, SockProtocol,
     SockType,
@@ -73,6 +74,10 @@ impl Network {
             fs::read_link("/proc/1/ns/net").unwrap(),
             "native proof requires a fresh network namespace"
         );
+        // libtest may run several cases in this process. Each current-thread
+        // Tokio test owns another private namespace, including loopback and
+        // the XFRM database, so one case cannot leave state in the next.
+        nix::sched::unshare(nix::sched::CloneFlags::CLONE_NEWNET).unwrap();
         let peer = format!("opc-childsa-{}", std::process::id());
         command(&["netns", "add", &peer]);
         command(&[
@@ -335,6 +340,254 @@ async fn install_local(backend: &NamespaceBoundLinuxXfrmBackend) -> Result<(), X
             })
             .await?;
     }
+    Ok(())
+}
+
+// Independently construct authentication-only ESP transport bytes. The kernel
+// receiver, not a round trip through the SDK encoder, verifies these packets.
+fn authenticated_packet(id: u64, incarnation: u64, sequence: u32, payload: &[u8]) -> Vec<u8> {
+    let inner_length = 20 + 8 + payload.len();
+    let mut inner = vec![0_u8; inner_length];
+    inner[0] = 0x45;
+    inner[2..4].copy_from_slice(&(inner_length as u16).to_be_bytes());
+    inner[8] = 64;
+    inner[9] = 17;
+    inner[12..16].copy_from_slice(&INNER_PEER);
+    inner[16..20].copy_from_slice(&INNER_LOCAL);
+    let mut sum: u32 = inner[..20]
+        .as_chunks::<2>()
+        .0
+        .iter()
+        .map(|pair| u32::from(u16::from_be_bytes(*pair)))
+        .sum();
+    while sum > u32::from(u16::MAX) {
+        sum = (sum & u32::from(u16::MAX)) + (sum >> 16);
+    }
+    inner[10..12].copy_from_slice(&(!(sum as u16)).to_be_bytes());
+    inner[20..22].copy_from_slice(&34567_u16.to_be_bytes());
+    inner[22..24].copy_from_slice(&PORT.to_be_bytes());
+    inner[24..26].copy_from_slice(&((8 + payload.len()) as u16).to_be_bytes());
+    // IPv4 UDP permits the literal zero checksum used by this synthetic peer.
+    inner[28..].copy_from_slice(payload);
+    let mut esp = spi(id, incarnation, true).to_be_bytes().to_vec();
+    esp.extend_from_slice(&sequence.to_be_bytes());
+    esp.extend_from_slice(&inner);
+    let padding = (4 - (inner.len() + 2) % 4) % 4;
+    esp.extend(1..=padding as u8);
+    esp.extend_from_slice(&[padding as u8, 4]);
+    let key = vec![0x50 + id as u8 + incarnation as u8 + 1; 32];
+    let mut authentication = Hmac::<sha2::Sha256>::new_from_slice(&key).unwrap();
+    authentication.update(&esp);
+    esp.extend_from_slice(&authentication.finalize().into_bytes()[..16]);
+    esp
+}
+
+fn send_authenticated(network: &Network, source_port: u16, packet: &[u8]) {
+    let sender = peer(&network.peer, move || {
+        UdpSocket::bind((Ipv4Addr::from(OUTER_PEER), source_port)).unwrap()
+    });
+    sender
+        .send_to(packet, (Ipv4Addr::from(OUTER_LOCAL), 4500))
+        .unwrap();
+}
+
+async fn sealed_observation(
+    monitor: &mut LinuxEspPeerObservationMonitor,
+    handle: &InstalledChildSaObservationHandle,
+) -> Result<AuthenticatedChildSaPeerObservation, XfrmError> {
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            if let Some(observation) = monitor.poll_installed_child_sa(handle).await? {
+                return Ok(observation);
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .map_err(|_| XfrmError::Unavailable)?
+}
+
+#[tokio::test]
+#[ignore = "requires CAP_NET_ADMIN, CAP_NET_RAW, BPF tracing and a fresh netns"]
+async fn installed_child_sa_provenance_seals_exact_inbound_pair_and_publication(
+) -> Result<(), Box<dyn std::error::Error>> {
+    if std::env::var("OPC_XFRM_RUN_CHILD_SA_ROSTER_PRIVILEGED").as_deref() != Ok("1") {
+        eprintln!("skipping: set OPC_XFRM_RUN_CHILD_SA_ROSTER_PRIVILEGED=1 in a fresh netns");
+        return Ok(());
+    }
+    let network = Network::new();
+    let _encapsulation = encapsulation(OUTER_LOCAL);
+    let receiver = receiver(INNER_LOCAL);
+    let capture = capture();
+    let backend = LinuxXfrmBackend::new().bind_current_network_namespace()?;
+    install_local(&backend).await?;
+    let publication = backend
+        .publish_child_sa_roster(
+            backend.begin_child_sa_roster_update().await?,
+            request(false),
+        )
+        .await?;
+    let config = LinuxEspPeerObservationConfig::new(4)?;
+    let mut monitor = backend.create_esp_peer_observation_monitor(config).await?;
+    let mut handles = Vec::new();
+    for id in 1..=3 {
+        handles.push(
+            monitor
+                .register_installed_child_sa(
+                    &publication,
+                    child(id),
+                    ChildSaIncarnation::new(1).unwrap(),
+                )
+                .await?,
+        );
+    }
+    assert!(monitor
+        .register_installed_child_sa(&publication, child(99), ChildSaIncarnation::new(1).unwrap(),)
+        .await
+        .is_err());
+    // Identical first registration keys/epochs on the same actor must not let
+    // a handle cross the monitors' private source scopes.
+    let mut other_monitor = backend.create_esp_peer_observation_monitor(config).await?;
+    let other_handle = other_monitor
+        .register_installed_child_sa(&publication, child(1), ChildSaIncarnation::new(1).unwrap())
+        .await?;
+    assert_eq!(other_handle.registration(), handles[0].registration());
+    assert!(matches!(
+        other_monitor.poll_installed_child_sa(&handles[0]).await,
+        Err(XfrmError::StateMismatch {
+            operation: "installed_child_sa_observation_scope"
+        })
+    ));
+    other_monitor.close().await?;
+    let foreign = LinuxXfrmBackend::new().bind_current_network_namespace()?;
+    let mut foreign_monitor = foreign.create_esp_peer_observation_monitor(config).await?;
+    assert!(foreign_monitor
+        .register_installed_child_sa(&publication, child(1), ChildSaIncarnation::new(1).unwrap(),)
+        .await
+        .is_err());
+    assert!(foreign_monitor
+        .poll_installed_child_sa(&handles[0])
+        .await
+        .is_err());
+    foreign_monitor.close().await?;
+
+    for (index, handle) in handles.iter().enumerate() {
+        let id = index as u64 + 1;
+        for sequence in 1..=2 {
+            let payload = format!("n3-sealed-in-{id}-{sequence}");
+            let packet = authenticated_packet(id, 1, sequence, payload.as_bytes());
+            let source_port = 4500 + sequence as u16;
+            send_authenticated(&network, source_port, &packet);
+            assert_eq!(
+                captured_spi(&capture, payload.as_bytes(), OUTER_LOCAL),
+                spi(id, 1, true)
+            );
+            received(&receiver, payload.as_bytes(), INNER_PEER);
+            let receipt = sealed_observation(&mut monitor, handle).await?;
+            assert_eq!(receipt.pair().child(), child(id));
+            assert_eq!(receipt.pair().incarnation().get(), 1);
+            assert_eq!(receipt.roster_generation(), publication.generation());
+            assert_eq!(receipt.observation().key.id.spi, spi(id, 1, true));
+            assert_eq!(receipt.observation().epoch, handle.registration().epoch());
+            assert_eq!(receipt.observation().outer_source_port, source_port);
+            assert_eq!(receipt.observation().loss, EspPeerObservationLoss::None);
+            assert_eq!(
+                format!("{receipt:?}"),
+                "AuthenticatedChildSaPeerObservation(<redacted>)"
+            );
+            // Raw public observations remain editable data. Editing a copy
+            // cannot alter the sealed pair or the retained trusted facts.
+            let mut edited = *receipt.observation();
+            edited.key.id.spi ^= 1;
+            assert_ne!(edited.key, receipt.observation().key);
+        }
+    }
+    let mut invalid = authenticated_packet(2, 1, 3, b"n3-invalid-icv");
+    *invalid.last_mut().unwrap() ^= 1;
+    send_authenticated(&network, 4503, &invalid);
+    send_authenticated(
+        &network,
+        4503,
+        &authenticated_packet(2, 1, 2, b"n3-replayed"),
+    );
+    receiver.set_read_timeout(Some(Duration::from_millis(100)))?;
+    assert!(receiver.recv_from(&mut [0_u8; 256]).is_err());
+    assert!(monitor
+        .poll_installed_child_sa(&handles[1])
+        .await?
+        .is_none());
+
+    // Queue an authenticated event under the old publication, then rekey.
+    // Neither the old handle nor a new publication may relabel that event.
+    send_authenticated(
+        &network,
+        4510,
+        &authenticated_packet(1, 1, 3, b"n3-old-publication"),
+    );
+    received(&receiver, b"n3-old-publication", INNER_PEER);
+    backend
+        .install_sa(InstallSaRequest {
+            parameters: sa(2, 2, true),
+        })
+        .await?;
+    backend
+        .install_sa(InstallSaRequest {
+            parameters: sa(2, 2, false),
+        })
+        .await?;
+    backend
+        .rekey_policy(RekeyPolicyRequest {
+            parameters: policy(&sa(2, 2, false), XfrmDirection::Out),
+        })
+        .await?;
+    assert!(matches!(
+        monitor.poll_installed_child_sa(&handles[0]).await,
+        Err(XfrmError::StateMismatch {
+            operation: "installed_child_sa_roster_generation"
+        })
+    ));
+    let successor = backend
+        .publish_child_sa_roster(backend.begin_child_sa_roster_update().await?, request(true))
+        .await?;
+    assert!(monitor
+        .register_installed_child_sa(&successor, child(1), ChildSaIncarnation::new(1).unwrap(),)
+        .await
+        .is_err());
+    monitor.close().await?;
+    let mut monitor = backend.create_esp_peer_observation_monitor(config).await?;
+    for incarnation in 1..=2 {
+        let handle = monitor
+            .register_installed_child_sa(
+                &successor,
+                child(2),
+                ChildSaIncarnation::new(incarnation).unwrap(),
+            )
+            .await?;
+        assert!(monitor.poll_installed_child_sa(&handle).await?.is_none());
+        let payload = format!("n3-overlap-in-{incarnation}");
+        let sequence = if incarnation == 1 { 3 } else { 1 };
+        send_authenticated(
+            &network,
+            4510 + incarnation as u16,
+            &authenticated_packet(2, incarnation, sequence, payload.as_bytes()),
+        );
+        received(&receiver, payload.as_bytes(), INNER_PEER);
+        let receipt = sealed_observation(&mut monitor, &handle).await?;
+        assert_eq!(receipt.pair().incarnation().get(), incarnation);
+        assert_eq!(receipt.roster_generation(), successor.generation());
+        assert_eq!(
+            receipt.pair().outbound_use(),
+            if incarnation == 1 {
+                ChildSaOutboundUse::ReceiveOnly
+            } else {
+                ChildSaOutboundUse::Selected
+            }
+        );
+        monitor.teardown(handle.registration()).await?;
+        assert!(monitor.poll_installed_child_sa(&handle).await.is_err());
+    }
+    monitor.close().await?;
+    eprintln!("N3_CHILD_SA_INBOUND_PROOF_OK");
     Ok(())
 }
 

@@ -311,7 +311,7 @@ jobs:
               cargo test --locked -p opc-ipsec-xfrm --features ikev2 --test xfrm_auth_only_privileged -- --ignored --nocapture
             '
 
-      - name: Run installed Child-SA selection and rekey packet proof
+      - name: Run installed Child-SA selection and authenticated provenance proof
         run: |
           set -euo pipefail
           export CARGO_HOME="${CARGO_HOME:-${HOME}/.cargo}"
@@ -328,11 +328,12 @@ jobs:
               ip link set lo up
               cargo test --locked -p opc-ipsec-xfrm --features ikev2 \
                 --test xfrm_child_sa_roster_privileged -- \
-                --ignored --exact installed_child_sa_roster_selects_exact_marked_spis_and_fences_replacement \
+                --ignored \
                 --nocapture --test-threads=1
             ' 2>&1 | tee "${RUNNER_TEMP}/xfrm-child-sa-roster.log"
           grep -Fq 'N3_CHILD_SA_INSTALLED_PACKET_PROOF_OK' "${RUNNER_TEMP}/xfrm-child-sa-roster.log"
-          grep -Eq '^test result: ok. 1 passed; 0 failed; 0 ignored;' "${RUNNER_TEMP}/xfrm-child-sa-roster.log"
+          grep -Fq 'N3_CHILD_SA_INBOUND_PROOF_OK' "${RUNNER_TEMP}/xfrm-child-sa-roster.log"
+          grep -Eq '^test result: ok. 2 passed; 0 failed; 0 ignored;' "${RUNNER_TEMP}/xfrm-child-sa-roster.log"
 
       - name: Run authenticated ESP peer-observation proof
         run: |

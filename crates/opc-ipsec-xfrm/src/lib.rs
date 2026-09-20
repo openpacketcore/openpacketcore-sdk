@@ -318,15 +318,16 @@ pub use namespace::{
     XfrmObjectRosterAdmissionAuthority, XfrmObjectRosterEffectQuiesced, XfrmObjectRosterRunError,
     XfrmSaRelocationAdmissionAuthority, XfrmSaRelocationRunError,
 };
+#[cfg(target_os = "linux")]
+pub use observation::{
+    AuthenticatedChildSaPeerObservation, InstalledChildSaObservationHandle,
+    LinuxEspPeerObservationConfig, LinuxEspPeerObservationHandle, LinuxEspPeerObservationMonitor,
+};
 pub use observation::{
     EspPeerAddressFamily, EspPeerIngestTally, EspPeerObservation, EspPeerObservationEpoch,
     EspPeerObservationKey, EspPeerObservationLoss, EspPeerObservationRejection,
     EspPeerObservationSourceTerminal, EspPeerObservationTeardown,
     DEFAULT_ESP_PEER_OBSERVATION_CAPACITY,
-};
-#[cfg(target_os = "linux")]
-pub use observation::{
-    LinuxEspPeerObservationConfig, LinuxEspPeerObservationHandle, LinuxEspPeerObservationMonitor,
 };
 pub use opc_types::DscpCodepoint;
 pub use outbound_binding::{

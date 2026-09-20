@@ -112,6 +112,7 @@ use crate::model::{IpAddress, XfrmDirection, XfrmId, XfrmLookupMark};
 pub(crate) mod linux;
 #[cfg(target_os = "linux")]
 pub use linux::{
+    AuthenticatedChildSaPeerObservation, InstalledChildSaObservationHandle,
     LinuxEspPeerObservationConfig, LinuxEspPeerObservationHandle, LinuxEspPeerObservationMonitor,
 };
 
