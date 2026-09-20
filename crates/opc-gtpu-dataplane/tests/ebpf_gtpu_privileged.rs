@@ -9567,6 +9567,16 @@ async fn ebpf_gtpu_trusted_traffic_proof_requires_bidirectional_continuity(
         *second_ipv6_challenge.payload(),
         "each IPv6 request must use its private return domain"
     );
+    let diagnostic_counters = pinned_per_cpu_u64_values(
+        &grouped_pin_directory(&net.pin_root, grouped_device_id()),
+        MAP_COUNTERS,
+        COUNTER_SLOTS,
+    );
+    let diagnostic_stages = diagnostic_counters[COUNTER_DL_DST_MISMATCH as usize]
+        .iter()
+        .fold(0_u64, |all, value| all | value)
+        >> 16;
+    println!("OPC_N3_DIAGNOSTIC_STAGES: {diagnostic_stages:#x}");
     let ipv6_proof = match backend.poll_gtpu_traffic_proof(&mut ipv6_session).await? {
         GtpuTrafficProofPoll::Proven(proof) => proof,
         other => {

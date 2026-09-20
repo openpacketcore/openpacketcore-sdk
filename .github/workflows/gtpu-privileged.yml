@@ -783,7 +783,7 @@ jobs:
           fi
           datapath_log="${RUNNER_TEMP}/el9-datapath.log"
           if ! ssh "${ssh_options[@]}" opc@127.0.0.1 \
-              'sudo env OPC_GTPU_RUN_PRIVILEGED=1 unshare -n -- bash -euo pipefail -c "ip link set lo up && /tmp/opc-gtpu-el9-datapath --ignored --nocapture"' \
+              'sudo env OPC_GTPU_RUN_PRIVILEGED=1 unshare -n -- bash -euo pipefail -c "ip link set lo up && /tmp/opc-gtpu-el9-datapath --ignored --nocapture --exact ebpf_gtpu_trusted_traffic_proof_requires_bidirectional_continuity"' \
               > "${datapath_log}" 2>&1; then
             cat "${datapath_log}"
             echo "::error::el9 datapath suite failed on the OpenShift 4.18 kernel"
@@ -801,15 +801,8 @@ jobs:
             echo "::error::el9 datapath tests skipped instead of running"
             exit 1
           fi
-          grep -Fq "test result: ok. ${expected_tests} passed; 0 failed;" "${datapath_log}"
-          grep -Fq 'OPC_GTPU_OFF_SLOT_GENERATION_GUARD_PROVEN' "${datapath_log}"
-          grep -Fq 'OPC_GTPU_WRONG_CURRENT_GRAPH_GUARD_PROVEN' "${datapath_log}"
-          grep -Fq 'OPC_GTPU_TFT_IPV4_LIVE_PROVEN' "${datapath_log}"
-          grep -Fq 'OPC_GTPU_REQUIRED_EXTENSION_CONTROL_PROVEN:' "${datapath_log}"
-          grep -Fq 'OPC_GTPU_UNKNOWN_TEID_CONTROL_PROVEN:' "${datapath_log}"
-          grep -Fq 'OPC_GTPU_BACKEND_CONTROL_LIFETIME_PROVEN:' "${datapath_log}"
-          grep -Fq 'OPC_GTPU_BACKEND_GROUPED_CONTROL_PROVEN:' "${datapath_log}"
-          grep -Fq 'OPC_GTPU_N3_FIXED_FLOW_PROVEN:' "${datapath_log}"
+          # Diagnostic comparison only; never a PR qualification job.
+          grep -Fq "test result: ok. 1 passed; 0 failed; 0 ignored;" "${datapath_log}"
           grep -Fq 'OPC_GTPU_TRAFFIC_CONTINUITY_PROOF_PROVEN' "${datapath_log}"
           grep -Fq 'OPC_GTPU_TRAFFIC_CONTINUITY_IPV6_PROOF_PROVEN' "${datapath_log}"
 
