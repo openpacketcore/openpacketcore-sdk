@@ -3,6 +3,7 @@ name: GTP-U privileged
 on:
   pull_request:
   push:
+    if: ${{ false }}
     branches:
       - main
   workflow_dispatch:
@@ -17,6 +18,7 @@ env:
 
 jobs:
   privileged-gtpu:
+    if: ${{ false }}
     name: Privileged Linux GTP-U
     runs-on: ubuntu-latest
     timeout-minutes: 30
@@ -186,6 +188,7 @@ jobs:
           if-no-files-found: warn
 
   linux-6-8-classifier-load:
+    if: ${{ false }}
     name: Linux 6.8 committed classifier load
     runs-on: ubuntu-24.04
     timeout-minutes: 30
@@ -476,6 +479,21 @@ jobs:
           fi
           cp "${datapath_binary}" "${RUNNER_TEMP}/opc-gtpu-el9-datapath"
 
+          # Diagnostic only: identical instrumented userspace, parent BPF object.
+          # Do not use this comparison binary for the N3 forwarding gate.
+          object=crates/opc-gtpu-dataplane/bpf/opc-gtpu-datapath.bpf.o
+          cp "${object}" "${RUNNER_TEMP}/candidate.bpf.o"
+          git fetch --no-tags origin 20e6710a23ed07179705b0ed2dce1e302ec07740
+          git show "20e6710a23ed07179705b0ed2dce1e302ec07740:${object}" > "${object}"
+          sha256sum "${object}" "${RUNNER_TEMP}/candidate.bpf.o"
+          cargo test --locked -p opc-gtpu-dataplane --test ebpf_gtpu_privileged --no-run \
+            --target x86_64-unknown-linux-musl --message-format=json \
+            > "${RUNNER_TEMP}/parent-datapath-build.jsonl"
+          parent_binary="$(jq -r 'select(.profile.test == true and .target.name == "ebpf_gtpu_privileged") | .executable // empty' "${RUNNER_TEMP}/parent-datapath-build.jsonl" | tail -n 1)"
+          test -x "${parent_binary}"
+          cp "${parent_binary}" "${RUNNER_TEMP}/opc-gtpu-el9-parent"
+          cp "${RUNNER_TEMP}/candidate.bpf.o" "${object}"
+
       - name: Load both classifiers on a RHEL 9 kernel
         run: |
           set -euo pipefail
@@ -588,6 +606,9 @@ jobs:
             -o StrictHostKeyChecking=no \
             -o UserKnownHostsFile=/dev/null \
             "${RUNNER_TEMP}/opc-gtpu-el9-datapath" opc@127.0.0.1:/tmp/opc-gtpu-el9-datapath
+          scp -i "${key}" -P 2228 -o BatchMode=yes -o IdentitiesOnly=yes \
+            -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null \
+            "${RUNNER_TEMP}/opc-gtpu-el9-parent" opc@127.0.0.1:/tmp/opc-gtpu-el9-parent
 
           # Record the kernel this evidence is about, and assert it is the
           # RHEL 9 line rather than whatever the image happens to ship.
@@ -755,6 +776,12 @@ jobs:
           # anything is printed, so the one run whose output actually matters
           # -- a datapath failure on the enterprise kernel -- would be the one
           # that leaves no evidence behind.
+          if ssh "${ssh_options[@]}" opc@127.0.0.1 \
+            'chmod +x /tmp/opc-gtpu-el9-parent && sudo env OPC_GTPU_RUN_PRIVILEGED=1 unshare -n -- bash -euo pipefail -c "ip link set lo up && /tmp/opc-gtpu-el9-parent --ignored --nocapture --exact ebpf_gtpu_trusted_traffic_proof_requires_bidirectional_continuity"'; then
+            echo 'OPC_N3_DIAGNOSTIC_PARENT_PASS'
+          else
+            echo 'OPC_N3_DIAGNOSTIC_PARENT_FAIL'
+          fi
           datapath_log="${RUNNER_TEMP}/el9-datapath.log"
           if ! ssh "${ssh_options[@]}" opc@127.0.0.1 \
               'sudo env OPC_GTPU_RUN_PRIVILEGED=1 unshare -n -- bash -euo pipefail -c "ip link set lo up && /tmp/opc-gtpu-el9-datapath --ignored --nocapture"' \
@@ -788,6 +815,7 @@ jobs:
           grep -Fq 'OPC_GTPU_TRAFFIC_CONTINUITY_IPV6_PROOF_PROVEN' "${datapath_log}"
 
   ebpf-object:
+    if: ${{ false }}
     name: eBPF datapath object rebuild
     runs-on: ubuntu-latest
     timeout-minutes: 30

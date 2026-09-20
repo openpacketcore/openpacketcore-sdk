@@ -9464,8 +9464,8 @@ async fn ebpf_gtpu_trusted_traffic_proof_requires_bidirectional_continuity(
     );
     let proof = match backend.poll_gtpu_traffic_proof(&mut session).await? {
         GtpuTrafficProofPoll::Proven(proof) => proof,
-        GtpuTrafficProofPoll::Pending | GtpuTrafficProofPoll::Invalidated(_) | _ => {
-            panic!("bidirectional continuity proof did not complete")
+        other => {
+            panic!("bidirectional continuity proof did not complete: {other:?}")
         }
     };
     println!("OPC_GTPU_TRAFFIC_IPV4_PROOF_ISSUED");
@@ -9569,8 +9569,8 @@ async fn ebpf_gtpu_trusted_traffic_proof_requires_bidirectional_continuity(
     );
     let ipv6_proof = match backend.poll_gtpu_traffic_proof(&mut ipv6_session).await? {
         GtpuTrafficProofPoll::Proven(proof) => proof,
-        GtpuTrafficProofPoll::Pending | GtpuTrafficProofPoll::Invalidated(_) | _ => {
-            panic!("protected IPv6 continuity proof did not complete")
+        other => {
+            panic!("protected IPv6 continuity proof did not complete: {other:?}")
         }
     };
     let ipv6_summary = ipv6_proof.summary();

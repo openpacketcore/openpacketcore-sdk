@@ -13323,6 +13323,23 @@ impl EbpfGtpuDataplaneBackend {
             return Ok(EbpfTrafficProofPollState::Invalidated(invalidation));
         }
         let mut events = attempt.events.iter().copied().collect::<Vec<_>>();
+        if std::env::var("OPC_GTPU_RUN_PRIVILEGED").as_deref() == Ok("1") {
+            let origin = events
+                .iter()
+                .map(|event| event.boot_time_ns())
+                .min()
+                .unwrap_or(0);
+            let summary = events
+                .iter()
+                .map(|event| {
+                    (
+                        event.direction(),
+                        event.boot_time_ns().saturating_sub(origin),
+                    )
+                })
+                .collect::<Vec<_>>();
+            eprintln!("OPC_N3_DIAGNOSTIC_EVENT_WINDOWS: {summary:?}");
+        }
         events.sort_unstable_by_key(|event| (event.boot_time_ns(), event.producer_sequence()));
         let mut producer_sequences = events
             .iter()
@@ -13427,7 +13444,17 @@ impl EbpfGtpuDataplaneBackend {
         let mut source = EbpfTrafficRecordSource { records };
         let mut evaluator =
             TrafficContinuityEvaluator::new(session.traffic_binding(), session.policy());
-        let result = match evaluator.evaluate(&mut source, now) {
+        let assessment = evaluator.evaluate(&mut source, now);
+        if std::env::var("OPC_GTPU_RUN_PRIVILEGED").as_deref() == Ok("1") {
+            eprintln!(
+                "OPC_N3_DIAGNOSTIC_ASSESSMENT: incomplete={incomplete_sample}, result={:?}",
+                assessment
+                    .as_ref()
+                    .map(|_| "complete")
+                    .map_err(|error| error.to_string())
+            );
+        }
+        let result = match assessment {
             Ok(_) if incomplete_sample => {
                 Self::invalidate_traffic_attempt(
                     attempt,
