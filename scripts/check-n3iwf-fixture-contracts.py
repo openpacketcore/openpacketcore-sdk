@@ -107,6 +107,7 @@ def main() -> int:
         run(sys.executable, "scripts/n3iwf_key_reference.py")
         run(sys.executable, "scripts/n3iwf_key_lifecycle_reference.py", "--check")
         run(sys.executable, "scripts/n3iwf_roster_lifecycle_reference.py", "--check")
+        run(sys.executable, "scripts/n3iwf_child_sa_relocation_reference.py", "--check")
         run(sys.executable, "scripts/n3iwf_dtls_lifecycle_reference.py", "--check")
         run(sys.executable, "scripts/n3iwf_dtls_profile_reference.py", "--check")
         # Cryptographic source regeneration belongs to the existing audited-DTLS

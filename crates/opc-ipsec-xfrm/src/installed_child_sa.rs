@@ -27,6 +27,7 @@ const MAX_CLASSES: usize = 256;
 /// policy. Only the selected outbound incarnation has an outbound policy, and
 /// that policy must pin its concrete SPI. The SDK does not retain key material
 /// in the resulting publication.
+#[derive(Clone)]
 pub struct ChildSaInstalledPairRequest {
     /// Exact pair declaration, including its caller-assigned incarnation.
     pub pair: ChildSaPair,
@@ -52,6 +53,7 @@ pub struct ChildSaInstalledPairRequest {
 /// Construction grants no installed or packet authority. Resources must first
 /// be installed and any durable recovery/adoption completed through the existing
 /// lifecycle APIs, before acquiring a [`ChildSaRosterUpdate`].
+#[derive(Clone)]
 pub struct ChildSaInstalledRosterRequest {
     /// Validated class/default selection intentions.
     pub plan: ChildSaSelectionPlan,
@@ -151,6 +153,7 @@ redacted_debug!(
     InstalledChildSaSelection
 );
 
+#[derive(PartialEq, Eq)]
 struct RetainedPair {
     inbound: OutboundSaPolicyExpectation,
     outbound: OutboundSaPolicyExpectation,
@@ -187,6 +190,22 @@ fn identity_matches(identity: ChildSaTrafficIdentity, sa: &SaParameters) -> bool
 }
 
 impl ChildSaInstalledRosterRequest {
+    #[cfg(all(unix, feature = "ikev2"))]
+    pub(crate) fn validate_relocation_intent(&self) -> Result<(), XfrmError> {
+        self.validate().map(|_| ())
+    }
+
+    #[cfg(all(unix, feature = "ikev2"))]
+    pub(crate) fn matches_publication(
+        &self,
+        roster: &InstalledChildSaRoster,
+    ) -> Result<(), XfrmError> {
+        if self.plan != roster.state.plan || self.validate()? != roster.state.pairs {
+            return Err(stale());
+        }
+        Ok(())
+    }
+
     fn validate(&self) -> Result<Vec<RetainedPair>, XfrmError> {
         if self.pairs.len() > MAX_PAIRS || self.plan.classes().len() > MAX_CLASSES {
             return Err(invalid("capacity exceeded"));

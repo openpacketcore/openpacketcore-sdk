@@ -29,6 +29,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- `opc-ipsec-xfrm` and `opc-proto-ikev2`: bind authenticated MOBIKE permits
+  to installed Child-SA rosters and relocate every directional/rekey member
+  under one durable writer gate. Exact policy blocks, complete readback and
+  process-loss recovery preserve selector and counter continuity; unsupported
+  kernels retain precise refusal. Pinned migration-enabled VM qualification
+  covers native ESP, NAT-T, authority and caller cancellation. Refs #793, #795.
+
 - `opc-ipsec-xfrm`: seal authenticated ESP-in-UDP source observations to the
   exact installed Child-SA pair, publication and monitor registration. Fresh
   whole-roster checks reject stale publications and queued-event relabelling;

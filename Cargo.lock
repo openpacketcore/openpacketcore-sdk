@@ -2966,6 +2966,7 @@ version = "0.2.0"
 name = "opc-ipsec-xfrm"
 version = "0.2.0"
 dependencies = [
+ "aes-gcm 0.11.1",
  "async-trait",
  "aya",
  "hmac 0.13.0",

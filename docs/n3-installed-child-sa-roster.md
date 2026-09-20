@@ -7,7 +7,8 @@ backends return `UnsupportedFeature { feature: "installed_child_sa_roster" }`.
 The existing freely constructed `ChildSaSelectionPlan` remains intent data.
 
 This is a bounded installed-selection and inbound-provenance profile for #793.
-Authenticated whole-roster relocation remains separate work. This profile
+Authenticated whole-roster relocation is a separate
+[namespace-actor contract](n3-child-sa-mobike.md). This profile
 introduces no IKE parsing, PDU/QFI policy, key custody, SA installation or
 endpoint-migration authority.
 

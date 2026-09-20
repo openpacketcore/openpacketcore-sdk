@@ -17,6 +17,14 @@ use crate::XfrmError;
 /// unsupported adapters keep operations cheap and deterministic.
 #[async_trait]
 pub trait XfrmBackend: Send + Sync + std::fmt::Debug {
+    /// Report support for the optional authenticated complete-roster profile.
+    /// Raw, mock and custom adapters default to Missing. Available still
+    /// requires a valid bounded intent and a bound durable namespace actor.
+    #[cfg(all(unix, feature = "ikev2"))]
+    async fn child_sa_relocation_capability(&self) -> Result<XfrmCapability, XfrmError> {
+        Ok(XfrmCapability::Missing)
+    }
+
     /// Acquire an affine ticket for installed Child-SA roster publication.
     ///
     /// Only a namespace-bound actor with whole-roster readback and writer

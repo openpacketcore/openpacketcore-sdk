@@ -5953,6 +5953,8 @@ mod tests {
         assert!(parse_policy_state(&duplicate).is_err());
     }
 
+    #[cfg(all(unix, feature = "ikev2"))]
+    mod child_sa_relocation_tests;
     mod installed_child_sa_tests;
 
     #[tokio::test]

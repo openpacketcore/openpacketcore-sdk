@@ -1,5 +1,13 @@
 //! Namespace-bound Linux XFRM actor.
 
+#[cfg(all(unix, feature = "ikev2"))]
+mod child_sa_mobike;
+#[cfg(all(unix, feature = "ikev2"))]
+pub use child_sa_mobike::{
+    ChildSaMobikeAssociation, ChildSaRelocationAuthority, ChildSaRelocationReceipt,
+    ChildSaRelocationRecovery,
+};
+
 use std::fmt;
 use std::sync::Arc;
 use std::time::Instant;
@@ -3475,6 +3483,8 @@ enum DetectorRosterCut {
 }
 
 enum NamespaceCommand {
+    #[cfg(all(unix, feature = "ikev2"))]
+    ChildSaMobike(child_sa_mobike::Command),
     BeginChildSaRosterUpdate(oneshot::Sender<Result<ChildSaRosterUpdate, XfrmError>>),
     PublishChildSaRoster(
         ChildSaRosterUpdate,
@@ -3894,6 +3904,8 @@ impl NamespaceCommand {
                     .and_then(|()| state.child_sa_roster.begin(&state.actor_binding));
                 let _ = reply.send(result);
             }
+            #[cfg(all(unix, feature = "ikev2"))]
+            Self::ChildSaMobike(command) => command.execute(backend, state).await,
             Self::PublishChildSaRoster(update, request, reply) => {
                 let result = match state.require_child_sa_publication_ready() {
                     Ok(()) => {
@@ -4839,6 +4851,8 @@ impl NamespaceCommand {
 
     fn send_error(self, error: XfrmError) {
         match self {
+            #[cfg(all(unix, feature = "ikev2"))]
+            Self::ChildSaMobike(command) => command.send_error(error),
             Self::BeginChildSaRosterUpdate(reply) => {
                 let _ = reply.send(Err(error));
             }
@@ -4982,6 +4996,11 @@ struct OutboundBindingValidation {
 
 #[async_trait]
 impl XfrmBackend for NamespaceBoundLinuxXfrmBackend {
+    #[cfg(all(unix, feature = "ikev2"))]
+    async fn child_sa_relocation_capability(&self) -> Result<XfrmCapability, XfrmError> {
+        self.sa_relocation_capability().await
+    }
+
     async fn begin_child_sa_roster_update(&self) -> Result<ChildSaRosterUpdate, XfrmError> {
         self.dispatch(
             LostReply::ReadOnly,

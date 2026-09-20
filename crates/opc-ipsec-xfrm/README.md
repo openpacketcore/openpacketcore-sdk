@@ -1423,3 +1423,12 @@ sudo unshare -n -- bash -lc 'ip link set lo up && OPC_XFRM_RUN_PRIVILEGED=1 carg
 sudo unshare -n -- bash -lc 'ip link set lo up && OPC_XFRM_RUN_RELOCATION_PRIVILEGED=1 cargo test -p opc-ipsec-xfrm --test xfrm_relocation_privileged -- --ignored --nocapture'
 sudo unshare -n -- bash -lc 'ip link set lo up && OPC_XFRM_RUN_AUTH_ONLY_PRIVILEGED=1 cargo test -p opc-ipsec-xfrm --features ikev2 --test xfrm_auth_only_privileged -- --ignored --nocapture'
 ```
+
+## Authenticated complete Child-SA relocation
+
+The namespace actor can consume a live NWu MOBIKE permit for one associated
+installed roster, move all directional and rekey members under one durable
+record, and publish only after complete readback. Interrupted moves stay gated
+for exact-target reconciliation. This bounded profile requires the upstream
+MIGRATE_STATE capability and has no delete/reinstall fallback. See the
+[public contract and supported-kernel evidence](../../docs/n3-child-sa-mobike.md).

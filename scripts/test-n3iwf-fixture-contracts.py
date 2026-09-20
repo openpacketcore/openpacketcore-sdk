@@ -20,6 +20,7 @@ import n3iwf_key_lifecycle_reference as key_lifecycle
 import n3iwf_roster_lifecycle_reference as roster_lifecycle
 import n3iwf_dtls_lifecycle_reference as dtls_lifecycle
 import n3iwf_dtls_profile_reference as dtls_profiles
+import n3iwf_child_sa_relocation_reference as child_sa_relocation
 
 ROOT = Path(__file__).resolve().parents[1]
 FIXTURES = ROOT / "crates/opc-n3iwf-fixtures/fixtures"
@@ -30,6 +31,50 @@ def wire(subset, name):
 
 
 class WireRegressions(unittest.TestCase):
+    def test_child_sa_relocation_reference_rejects_changed_obligations_and_contract(self):
+        paths = (child_sa_relocation.SOURCE, child_sa_relocation.TABLE, child_sa_relocation.CONTRACT)
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            for name in paths:
+                target = root / name
+                target.parent.mkdir(parents=True, exist_ok=True)
+                target.write_bytes((ROOT / name).read_bytes())
+
+            def check():
+                with mock.patch.object(child_sa_relocation, "ROOT", root), \
+                        mock.patch.object(sys, "argv", ["reference", "--check"]), \
+                        mock.patch("sys.stdout", new=io.StringIO()) as output:
+                    result = child_sa_relocation.main()
+                    self.assertIn(output.getvalue().strip(), (
+                        "n3iwf_child_sa_relocation_reference_valid: 3364 independent schedules",
+                        "n3iwf_child_sa_relocation_reference_mismatch"))
+                    return result
+
+            self.assertEqual(check(), 0)
+            for mutation in ("case", "order", "missing", "promotion", "table", "contract", "symlink"):
+                with self.subTest(mutation=mutation):
+                    name = paths[1] if mutation == "table" else paths[2] if mutation == "contract" else paths[0]
+                    target = root / name
+                    original = target.read_bytes()
+                    if mutation == "table":
+                        target.write_bytes(original.replace(b"complete\t0\t0", b"complete\t1\t0", 1))
+                    elif mutation == "contract":
+                        target.write_bytes(original.replace(b"every selected outgoing", b"one selected outgoing", 1))
+                    elif mutation == "symlink":
+                        target.unlink()
+                        target.symlink_to(ROOT / name)
+                    else:
+                        value = json.loads(original)
+                        if mutation == "case": value["cases"][0][-1] = "repair"
+                        elif mutation == "order": value["cases"].reverse()
+                        elif mutation == "missing": value["cases"].pop()
+                        else: value["runtime_claim"] = True
+                        target.write_text(json.dumps(value, separators=(",", ":")) + "\n")
+                    self.assertNotEqual(check(), 0)
+                    if target.is_symlink(): target.unlink()
+                    target.write_bytes(original)
+            self.assertEqual(check(), 0)
+
     def test_dtls_profiles_cannot_replace_source_rows_or_claim_execution(self):
         original = json.loads((FIXTURES / "n2-dtls/profile-rekey-hello.json").read_text())
         data = wire("n2-dtls", "profile-rekey-hello")
