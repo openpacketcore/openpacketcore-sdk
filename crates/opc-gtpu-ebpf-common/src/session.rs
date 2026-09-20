@@ -918,7 +918,10 @@ fn bytes_16_are_zero(value: &[u8; 16]) -> bool {
     native_word_8(value, 0) | native_word_8(value, 8) == 0
 }
 
-#[inline(always)]
+// Validate one address per call: keeping the independent address-byte loads
+// in separate frames avoids register spills that exceed the Linux 5.14/6.8
+// combined stack limit in the grouped downlink authority chain.
+#[inline(never)]
 fn wire_address_is_canonical(family: u8, value: &[u8; 16]) -> bool {
     match GtpuSessionIpFamily::from_wire(family) {
         Some(GtpuSessionIpFamily::Ipv4) => {
@@ -931,7 +934,7 @@ fn wire_address_is_canonical(family: u8, value: &[u8; 16]) -> bool {
     }
 }
 
-#[inline(always)]
+#[inline(never)]
 fn wire_paa_is_canonical(family: u8, value: &[u8; 16]) -> bool {
     match GtpuSessionIpFamily::from_wire(family) {
         Some(GtpuSessionIpFamily::Ipv4) => {
