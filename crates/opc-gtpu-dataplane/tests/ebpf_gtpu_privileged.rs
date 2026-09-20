@@ -42,6 +42,9 @@
 
 #![cfg(target_os = "linux")]
 
+#[path = "ebpf_gtpu_privileged/n3_fixed_flow.rs"]
+mod n3_fixed_flow;
+
 use std::cell::RefCell;
 use std::env;
 use std::fs;
@@ -13060,4 +13063,10 @@ async fn ebpf_gtpu_unknown_teid_reaches_shared_control_without_decap(
     }
     eprintln!("OPC_GTPU_UNKNOWN_TEID_CONTROL_PROVEN: legacy/grouped IPv4 Error Indication, grouped IPv6 handoff, exact local endpoints, retained-state refusal");
     Ok(())
+}
+
+#[tokio::test]
+#[ignore = "requires root, a fresh netns, and bpffs"]
+async fn ebpf_gtpu_n3_fixed_flow_live_contract() -> Result<(), Box<dyn std::error::Error>> {
+    n3_fixed_flow::qualify().await
 }
