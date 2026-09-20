@@ -538,6 +538,7 @@ where
     let consistent = match proof {
         XfrmSaRelocationPreEffectProof::TargetAbsent => !same_identity,
         XfrmSaRelocationPreEffectProof::SameIdentityWitnessed => same_identity,
+        XfrmSaRelocationPreEffectProof::RosterWitnessed => false,
     };
     if !consistent {
         return Ok(XfrmSaRelocationRestartOutcome::RepairRequired);

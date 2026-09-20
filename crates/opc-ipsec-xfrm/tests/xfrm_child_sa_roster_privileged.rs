@@ -1,6 +1,13 @@
 //! Real installed selection, independently captured ESP SPIs and writer fences.
 #![cfg(target_os = "linux")]
 
+#[cfg(feature = "ikev2")]
+#[path = "support/mobike.rs"]
+mod mobike;
+#[cfg(feature = "ikev2")]
+#[path = "support/mobike_roster.rs"]
+mod mobike_roster;
+
 use hmac::{Hmac, KeyInit, Mac};
 use nix::sys::socket::{
     recvfrom, setsockopt, socket, sockopt, AddressFamily, LinkAddr, SockFlag, SockProtocol,

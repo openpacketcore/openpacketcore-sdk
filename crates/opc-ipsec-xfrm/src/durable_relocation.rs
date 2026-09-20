@@ -137,6 +137,11 @@ impl XfrmSaRelocationRecoveryProofKey {
     fn bytes(&self) -> &[u8; AUTH_TAG_BYTES] {
         &self.0
     }
+
+    #[cfg(feature = "ikev2")]
+    fn canonical_mac_key(&self) -> crate::durable_object::CanonicalMacKey<'_> {
+        crate::durable_object::CanonicalMacKey::new(&self.0)
+    }
 }
 
 impl Clone for XfrmSaRelocationRecoveryProofKey {
@@ -355,6 +360,10 @@ pub(crate) enum XfrmSaRelocationPreEffectProof {
     /// encapsulation and/or source-only change), and that exact identity was
     /// present when the effect was admitted.
     SameIdentityWitnessed = 2,
+    /// The complete ordered Child-SA relocation program was read back at its
+    /// original prefix, including keys, policies and every absent target.
+    /// Only the domain-separated whole-roster recovery flow accepts this proof.
+    RosterWitnessed = 3,
 }
 
 impl XfrmSaRelocationPreEffectProof {
@@ -363,6 +372,7 @@ impl XfrmSaRelocationPreEffectProof {
         match self {
             Self::TargetAbsent => "target_absent",
             Self::SameIdentityWitnessed => "same_identity_witnessed",
+            Self::RosterWitnessed => "roster_witnessed",
         }
     }
 
@@ -370,6 +380,7 @@ impl XfrmSaRelocationPreEffectProof {
         match self {
             Self::TargetAbsent => 1,
             Self::SameIdentityWitnessed => 2,
+            Self::RosterWitnessed => 3,
         }
     }
 
@@ -377,6 +388,7 @@ impl XfrmSaRelocationPreEffectProof {
         match code {
             1 => Ok(Self::TargetAbsent),
             2 => Ok(Self::SameIdentityWitnessed),
+            3 => Ok(Self::RosterWitnessed),
             _ => Err(XfrmSaRelocationDurableError::Malformed),
         }
     }
@@ -1069,6 +1081,16 @@ impl XfrmSaRelocationRecoveryStore {
             deletion_identity,
             relocation_request,
         })
+    }
+
+    #[cfg(feature = "ikev2")]
+    pub(crate) fn fingerprints_for_child_roster(
+        &self,
+        intent: &crate::ChildSaRelocationIntent,
+        updated: &crate::ChildSaInstalledRosterRequest,
+    ) -> Result<DurableRelocationFingerprints, XfrmSaRelocationDurableError> {
+        let lease = self.lease()?;
+        intent.fingerprints(lease.store.proof_key.canonical_mac_key(), updated)
     }
 
     /// Inspect the authenticated current phase for a retained handle.

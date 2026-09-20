@@ -7,9 +7,11 @@
 //! Peer authentication and negotiated capability originate in the caller's
 //! established IKE_AUTH state. Key custody and backend application are separate.
 
+mod authority;
 mod responder;
 mod wire;
 
+pub use authority::{MigrationAssociation, MigrationPermit};
 pub use responder::{
     Migration, NatState, Outbound, ProbeOutcome, ReceivedRequest, RequestStatus, Responder,
 };
@@ -39,7 +41,7 @@ pub enum Error {
     State,
     /// The admitted crypto module could not generate entropy or a NAT hash.
     Crypto,
-    /// This session was closed by an authenticated COOKIE2 mismatch.
+    /// This session was closed, dropped or exhausted its migration generation.
     Closed,
 }
 impl From<super::Error> for Error {

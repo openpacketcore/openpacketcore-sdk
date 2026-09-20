@@ -1,7 +1,8 @@
 use super::super::{
     configuration::chain, encode_payloads, Address, ConfigurationReply, DeleteOutcome, Limits,
 };
-use super::{Error, Notify, Path, Request};
+use super::authority::MigrationScope;
+use super::{Error, MigrationAssociation, MigrationPermit, Notify, Path, Request};
 use crate::{
     classify_ike_nat_traversal_datagram_with_context, crypto_module::with_entropy_operation,
     evaluate_ikev2_nat_detection, ikev2_aes_cbc_protected_body_len,
@@ -13,7 +14,7 @@ use crate::{
 };
 use bytes::Bytes;
 use opc_protocol::DecodeContext;
-use std::fmt;
+use std::{fmt, sync::Arc};
 use subtle::ConstantTimeEq;
 
 /// Established NAT traversal capability and current ESP encapsulation state.
@@ -151,10 +152,11 @@ impl ReceivedRequest {
 /// Once-produced Child-SA address/encapsulation intent after authenticated
 /// COOKIE2 proof for the latest accepted update. Applying it belongs to XFRM;
 /// the caller must apply or discard it before processing the next SA event.
-#[derive(Debug)]
 pub struct Migration {
     path: Path,
     esp_udp: bool,
+    scope: Arc<MigrationScope>,
+    generation: u64,
 }
 impl Migration {
     /// Verified observed path, in UE-to-network packet direction.
@@ -164,6 +166,25 @@ impl Migration {
     /// Desired ESP UDP encapsulation after this address change.
     pub const fn esp_udp_encapsulation(&self) -> bool {
         self.esp_udp
+    }
+
+    /// Consume this verified update for its exact, previously bound IKE scope.
+    ///
+    /// A later accepted event or closed responder refuses stale intent. A
+    /// backend retains and revalidates the returned permit through publication.
+    pub fn authorize(self, association: &MigrationAssociation) -> Result<MigrationPermit, Error> {
+        MigrationPermit::issue(
+            self.scope,
+            self.generation,
+            self.path,
+            self.esp_udp,
+            association,
+        )
+    }
+}
+impl fmt::Debug for Migration {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("Migration(<redacted>)")
     }
 }
 /// Terminal result of a correlated authenticated COOKIE2 response.
@@ -203,6 +224,12 @@ pub struct Responder<'a> {
     probe: Option<Probe>,
     highest_peer_id: Option<u32>,
     closed: bool,
+    migration_scope: Arc<MigrationScope>,
+}
+impl Drop for Responder<'_> {
+    fn drop(&mut self) {
+        self.migration_scope.close();
+    }
 }
 impl fmt::Debug for Responder<'_> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -240,6 +267,7 @@ impl<'a> Responder<'a> {
             probe: None,
             highest_peer_id: None,
             closed: false,
+            migration_scope: MigrationScope::new(),
         })
     }
     /// Current Child-SA encapsulation mode; it changes only after COOKIE2 proof.
@@ -250,10 +278,29 @@ impl<'a> Responder<'a> {
     pub const fn has_pending_update(&self) -> bool {
         self.candidate.is_some()
     }
+
+    /// Bind the caller-owned Child-SA roster to this exact live IKE responder.
+    #[must_use]
+    pub fn migration_association(&self) -> MigrationAssociation {
+        MigrationAssociation {
+            scope: self.migration_scope.clone(),
+        }
+    }
+
+    /// Retire pending migration permits before processing another IKE-SA event.
+    ///
+    /// Accepted MOBIKE requests do this automatically. The owner must call it
+    /// for external IKE events, including Child-SA lifecycle changes and IKE
+    /// rekey/deletion, while serializing those events with backend publication.
+    /// Exhaustion permanently closes the scope rather than wrapping.
+    pub fn invalidate_migration_authority(&mut self) -> Result<(), Error> {
+        self.migration_scope.advance().map(|_| ())
+    }
     fn open(&self, datagram: &[u8], path: Path, response: bool) -> Result<Opened, Error> {
         if self.closed {
             return Err(Error::Closed);
         }
+        self.migration_scope.current()?;
         self.limits.check(datagram.len(), 0)?;
         if path.destination().port() != if self.nat.supported { 4500 } else { 500 } {
             return Err(Error::Transport);
@@ -407,6 +454,7 @@ impl<'a> Responder<'a> {
         });
         // Commit only after authentication, complete decode, policy and every
         // potentially failing operation. Probe completion is a separate step.
+        self.migration_scope.advance()?;
         *window = next_window;
         self.highest_peer_id = Some(id);
         if request.update {
@@ -431,6 +479,7 @@ impl<'a> Responder<'a> {
         if self.closed {
             return Err(Error::Closed);
         }
+        self.migration_scope.current()?;
         if self.probe.is_some() {
             return Err(Error::State);
         }
@@ -498,6 +547,7 @@ impl<'a> Responder<'a> {
         let probe = self.probe.take().ok_or(Error::State)?;
         if !matches {
             self.closed = true;
+            self.migration_scope.close();
             self.candidate = None;
             return Ok(ProbeOutcome::DiscardIkeAndAllChildren);
         }
@@ -512,6 +562,8 @@ impl<'a> Responder<'a> {
         Ok(ProbeOutcome::Verified(Migration {
             path: probe.candidate.path,
             esp_udp: probe.candidate.esp_udp,
+            scope: self.migration_scope.clone(),
+            generation: self.migration_scope.current()?,
         }))
     }
 

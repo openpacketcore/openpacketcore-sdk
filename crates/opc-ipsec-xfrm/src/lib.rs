@@ -203,6 +203,10 @@
 
 pub mod backend;
 pub mod child_sa;
+#[cfg(all(unix, feature = "ikev2"))]
+mod child_sa_relocation;
+#[cfg(all(unix, feature = "ikev2"))]
+mod child_sa_relocation_flow;
 pub mod composite;
 mod counter_resume;
 mod dscp;
@@ -233,6 +237,8 @@ pub mod staged_object;
 pub mod unsupported;
 
 pub use backend::XfrmBackend;
+#[cfg(all(unix, feature = "ikev2"))]
+pub use child_sa_relocation::{ChildSaRelocationError, ChildSaRelocationIntent};
 pub use composite::{
     install_bidirectional_sa_policy_with_rollback, install_sa_policy_with_rollback,
     rekey_sa_policy, remove_policy_sa, XfrmBidirectionalInstallError,
@@ -310,6 +316,11 @@ pub use model::{
     XfrmMark, XfrmMode, XfrmProbe, XfrmRequestId, XfrmSelector, XfrmTemplate, UDP_ENCAP_ESPINUDP,
     XFRM_AEAD_RFC4106_GCM_AES, XFRM_AUTH_HMAC_SHA1, XFRM_AUTH_HMAC_SHA256, XFRM_AUTH_HMAC_SHA384,
     XFRM_AUTH_HMAC_SHA512, XFRM_ENCR_CBC_AES, XFRM_ENCR_NULL,
+};
+#[cfg(all(unix, feature = "ikev2"))]
+pub use namespace::{
+    ChildSaMobikeAssociation, ChildSaRelocationAuthority, ChildSaRelocationReceipt,
+    ChildSaRelocationRecovery,
 };
 pub use namespace::{NamespaceBoundLinuxXfrmBackend, LINUX_XFRM_NAMESPACE_ACTOR_CAPACITY};
 #[cfg(unix)]

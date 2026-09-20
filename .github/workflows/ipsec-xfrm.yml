@@ -11,6 +11,10 @@ on:
       - "crates/opc-types/**"
       - ".github/workflows/ipsec-xfrm.yml"
       - "scripts/build-ipsec-xfrm-ebpf.sh"
+      - "ci/qualify-n3-mobike-kernel.py"
+      - "scripts/n3iwf_child_sa_relocation_reference.py"
+      - "crates/opc-n3iwf-fixtures/oracles/child-sa-relocation.json"
+      - "docs/n3-child-sa-mobike.md"
       - "Cargo.toml"
       - "Cargo.lock"
   push:
@@ -25,6 +29,10 @@ on:
       - "crates/opc-types/**"
       - ".github/workflows/ipsec-xfrm.yml"
       - "scripts/build-ipsec-xfrm-ebpf.sh"
+      - "ci/qualify-n3-mobike-kernel.py"
+      - "scripts/n3iwf_child_sa_relocation_reference.py"
+      - "crates/opc-n3iwf-fixtures/oracles/child-sa-relocation.json"
+      - "docs/n3-child-sa-mobike.md"
       - "Cargo.toml"
       - "Cargo.lock"
   workflow_dispatch:
@@ -38,6 +46,60 @@ env:
   RUST_BACKTRACE: "1"
 
 jobs:
+  mobike-kernel:
+    name: Supported Linux whole-roster MOBIKE
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    env:
+      CARGO_INCREMENTAL: "0"
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache Rust build output
+        uses: Swatinem/rust-cache@v2
+
+      - name: Install isolated kernel build and VM tooling
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y build-essential flex bison libelf-dev libssl-dev bc pkg-config \
+            cloud-image-utils qemu-system-x86 qemu-utils openssh-client patchelf
+
+      - name: Build native relocation consumer
+        run: |
+          set -euo pipefail
+          unset CARGO_PROFILE_DEV_DEBUG CARGO_PROFILE_TEST_DEBUG
+          cargo test --locked -p opc-ipsec-xfrm --features ikev2 \
+            --test xfrm_child_sa_roster_privileged --no-run --message-format=json \
+            > "${RUNNER_TEMP}/mobike-build.jsonl"
+          python3 - <<'PY'
+          import json, os
+          from pathlib import Path
+          events = [json.loads(line) for line in (Path(os.environ['RUNNER_TEMP']) / 'mobike-build.jsonl').read_text().splitlines()]
+          binaries = [event['executable'] for event in events if event.get('executable')]
+          assert len(binaries) == 1
+          with open(os.environ['GITHUB_ENV'], 'a') as out:
+              out.write('N3_MOBIKE_BINARY=' + binaries[0] + '\n')
+          PY
+
+      - name: Qualify pinned migration-enabled kernel
+        run: |
+          python3 ci/qualify-n3-mobike-kernel.py \
+            --binary "${N3_MOBIKE_BINARY}" \
+            --cache "${RUNNER_TEMP}/n3-mobike-kernel" \
+            --output "${RUNNER_TEMP}/n3-mobike-evidence" --jobs 2
+
+      - name: Retain supported-kernel evidence
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: n3-mobike-kernel-evidence
+          path: ${{ runner.temp }}/n3-mobike-evidence
+          if-no-files-found: error
+
   conformance:
     name: Kernel-independent conformance
     runs-on: ubuntu-latest
@@ -61,6 +123,9 @@ jobs:
 
       - name: Run clippy
         run: cargo clippy --locked -p opc-ipsec-xfrm -p opc-ipsec-xfrm-ebpf-common -p opc-types --all-targets --all-features -- -D warnings
+
+      - name: Check independent complete-roster reference
+        run: python3 scripts/n3iwf_child_sa_relocation_reference.py --check
 
       - name: Run conformance tests
         run: cargo test --locked -p opc-ipsec-xfrm -p opc-ipsec-xfrm-ebpf-common -p opc-types --all-features --quiet -- --test-threads=4
@@ -333,7 +398,11 @@ jobs:
             ' 2>&1 | tee "${RUNNER_TEMP}/xfrm-child-sa-roster.log"
           grep -Fq 'N3_CHILD_SA_INSTALLED_PACKET_PROOF_OK' "${RUNNER_TEMP}/xfrm-child-sa-roster.log"
           grep -Fq 'N3_CHILD_SA_INBOUND_PROOF_OK' "${RUNNER_TEMP}/xfrm-child-sa-roster.log"
-          grep -Eq '^test result: ok. 2 passed; 0 failed; 0 ignored;' "${RUNNER_TEMP}/xfrm-child-sa-roster.log"
+          grep -Eq 'N3_CHILD_SA_MOBIKE_(PROOF_OK|UNSUPPORTED)' "${RUNNER_TEMP}/xfrm-child-sa-roster.log"
+          grep -Eq 'N3_CHILD_SA_MOBIKE_PROCESS_(PROOF_OK|UNSUPPORTED)' "${RUNNER_TEMP}/xfrm-child-sa-roster.log"
+          grep -Fq 'N3_CHILD_SA_MOBIKE_AUTH_PROOF_OK' "${RUNNER_TEMP}/xfrm-child-sa-roster.log"
+          grep -Eq 'N3_CHILD_SA_MOBIKE_CANCEL_(PROOF_OK|UNSUPPORTED)' "${RUNNER_TEMP}/xfrm-child-sa-roster.log"
+          grep -Eq '^test result: ok. 5 passed; 0 failed; 0 ignored;' "${RUNNER_TEMP}/xfrm-child-sa-roster.log"
 
       - name: Run authenticated ESP peer-observation proof
         run: |

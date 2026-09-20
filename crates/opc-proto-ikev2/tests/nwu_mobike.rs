@@ -804,3 +804,153 @@ fn complete_datagram_bounds_precede_probe_entropy_and_window_allocation() {
         }
     }
 }
+
+fn verified_migration(
+    keys: &Ikev2SaInitKeyMaterial,
+    responder: &mut Responder<'_>,
+    receive: &mut Ikev2ResponderMessageIdWindow,
+    send: &mut Ikev2InitiatorMessageIdWindow,
+    id: u32,
+    observed: Path,
+) -> opc_proto_ikev2::nwu::mobike::Migration {
+    responder
+        .receive_request(
+            &packet(keys, id, false, true, &[UPDATE]),
+            observed,
+            receive,
+            |_| true,
+        )
+        .unwrap();
+    let probe = responder.begin_return_routability(send).unwrap();
+    let ProbeOutcome::Verified(migration) = responder
+        .receive_probe_response(&probe_response(keys, &probe, true), observed, send)
+        .unwrap()
+    else {
+        panic!("authenticated proof required")
+    };
+    migration
+}
+
+#[test]
+fn migration_permit_requires_exact_live_association_and_accepted_event_freshness() {
+    let keys = keys();
+    let observed = v4path(true);
+    let mut responder = receiver(&keys, true, true);
+    let foreign = receiver(&keys, true, true);
+    let association = responder.migration_association();
+    let mut receive = window();
+    let mut send = Ikev2InitiatorMessageIdWindow::with_next_message_id(20);
+    let migration = verified_migration(&keys, &mut responder, &mut receive, &mut send, 3, observed);
+    let permit = migration.authorize(&association).unwrap();
+    assert_eq!(permit.path(), observed);
+    assert!(permit.esp_udp_encapsulation());
+    assert_eq!(permit.validate(&association), Ok(()));
+    assert_eq!(
+        permit.validate(&foreign.migration_association()),
+        Err(Error::Correlation)
+    );
+    assert_eq!(format!("{permit:?}"), "MigrationPermit(<redacted>)");
+    assert_eq!(
+        format!("{association:?}"),
+        "MigrationAssociation(<redacted>)"
+    );
+
+    let mut corrupted = packet(&keys, 4, false, true, &[UPDATE]);
+    *corrupted.last_mut().unwrap() ^= 1;
+    assert!(matches!(
+        responder.receive_request(&corrupted, observed, &mut receive, |_| true),
+        Err(Error::Authentication)
+    ));
+    assert_eq!(permit.validate(&association), Ok(()));
+    assert!(matches!(
+        responder.receive_request(
+            &packet(&keys, 3, false, true, &[UPDATE]),
+            observed,
+            &mut receive,
+            |_| true
+        ),
+        Err(Error::Replay)
+    ));
+    assert_eq!(permit.validate(&association), Ok(()));
+    let rejected = responder
+        .receive_request(
+            &packet(&keys, 4, false, true, &[UPDATE]),
+            observed,
+            &mut receive,
+            |_| false,
+        )
+        .unwrap();
+    assert_eq!(rejected.status(), RequestStatus::UnacceptableAddresses);
+    assert_eq!(permit.validate(&association), Ok(()));
+
+    // Even a successfully admitted liveness request is a later SA event.
+    responder
+        .receive_request(
+            &packet(&keys, 4, false, true, &[]),
+            observed,
+            &mut receive,
+            |_| true,
+        )
+        .unwrap();
+    assert_eq!(permit.validate(&association), Err(Error::Replay));
+}
+
+#[test]
+fn stale_migration_cannot_be_authorized_and_external_events_or_drop_revoke_permits() {
+    let keys = keys();
+    let observed = v4path(true);
+    let mut responder = receiver(&keys, true, true);
+    let association = responder.migration_association();
+    let mut receive = window();
+    let mut send = Ikev2InitiatorMessageIdWindow::with_next_message_id(20);
+    let migration = verified_migration(&keys, &mut responder, &mut receive, &mut send, 3, observed);
+    responder.invalidate_migration_authority().unwrap();
+    assert!(matches!(
+        migration.authorize(&association),
+        Err(Error::Replay)
+    ));
+    let migration = verified_migration(&keys, &mut responder, &mut receive, &mut send, 4, observed);
+    let permit = migration.authorize(&association).unwrap();
+    responder.invalidate_migration_authority().unwrap();
+    assert_eq!(permit.validate(&association), Err(Error::Replay));
+    let migration = verified_migration(&keys, &mut responder, &mut receive, &mut send, 5, observed);
+    let permit = migration.authorize(&association).unwrap();
+    drop(responder);
+    assert_eq!(permit.validate(&association), Err(Error::Closed));
+    assert_eq!(permit.validate(&association.clone()), Err(Error::Closed));
+}
+
+#[test]
+fn cross_association_authorization_and_cookie_failure_cannot_create_live_permits() {
+    let keys = keys();
+    let observed = v4path(true);
+    let mut responder = receiver(&keys, true, true);
+    let foreign = receiver(&keys, true, true);
+    let association = responder.migration_association();
+    let mut receive = window();
+    let mut send = Ikev2InitiatorMessageIdWindow::with_next_message_id(20);
+    let migration = verified_migration(&keys, &mut responder, &mut receive, &mut send, 3, observed);
+    assert!(matches!(
+        migration.authorize(&foreign.migration_association()),
+        Err(Error::Correlation)
+    ));
+    let migration = verified_migration(&keys, &mut responder, &mut receive, &mut send, 4, observed);
+    let permit = migration.authorize(&association).unwrap();
+    responder
+        .receive_request(
+            &packet(&keys, 5, false, true, &[UPDATE]),
+            observed,
+            &mut receive,
+            |_| true,
+        )
+        .unwrap();
+    let probe = responder.begin_return_routability(&mut send).unwrap();
+    let reply = packet(&keys, probe.message_id(), true, true, &[]);
+    assert!(matches!(
+        responder
+            .receive_probe_response(&reply, observed, &mut send)
+            .unwrap(),
+        ProbeOutcome::DiscardIkeAndAllChildren
+    ));
+    assert_eq!(permit.validate(&association), Err(Error::Closed));
+}
