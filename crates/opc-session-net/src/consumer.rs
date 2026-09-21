@@ -1086,10 +1086,15 @@ impl fmt::Debug for PersistentSessionConsumerExecuteError {
             Self::ReadUnavailable { .. } => "read_unavailable",
             Self::OutcomeUnknown { .. } => "outcome_unknown",
         };
-        formatter
-            .debug_struct("PersistentSessionConsumerExecuteError")
-            .field("kind", &kind)
-            .finish_non_exhaustive()
+        let mut debug = formatter.debug_struct("PersistentSessionConsumerExecuteError");
+        debug.field("kind", &kind);
+        match self {
+            Self::NotTransmitted { cause } | Self::ReadUnavailable { cause } => {
+                debug.field("cause", cause);
+            }
+            Self::OutcomeUnknown { .. } => {}
+        }
+        debug.finish_non_exhaustive()
     }
 }
 
@@ -27691,6 +27696,51 @@ mod tests {
         recovery.succeeded();
         drop(lifetime);
         persistent.shutdown().await;
+    }
+
+    #[test]
+    fn persistent_execute_debug_retains_transport_cause_without_request_identity() {
+        let causes = [
+            SessionConsumerClientError::Authentication,
+            SessionConsumerClientError::AuthorityRevoked,
+            SessionConsumerClientError::Scope,
+            SessionConsumerClientError::Protocol,
+            SessionConsumerClientError::Unsupported,
+            SessionConsumerClientError::Unavailable,
+            SessionConsumerClientError::Deadline,
+            SessionConsumerClientError::Overloaded,
+            SessionConsumerClientError::ShuttingDown,
+        ];
+        for cause in causes {
+            for error in [
+                PersistentSessionConsumerExecuteError::NotTransmitted { cause },
+                PersistentSessionConsumerExecuteError::ReadUnavailable { cause },
+            ] {
+                let diagnostic = format!("{error:?}");
+                assert!(
+                    diagnostic.contains(&format!("cause: {cause:?}")),
+                    "bounded transport classification was lost: {diagnostic}"
+                );
+                assert!(!diagnostic.contains("request_id"));
+            }
+        }
+        let unknown = |bytes| {
+            format!(
+                "{:?}",
+                PersistentSessionConsumerExecuteError::OutcomeUnknown {
+                    request_id: SessionConsumerRequestId::from_bytes(bytes),
+                }
+            )
+        };
+        assert_eq!(
+            unknown([0x19; 16]),
+            unknown([0xE4; 16]),
+            "ambiguous effect identifiers must remain redacted"
+        );
+        assert_eq!(
+            unknown([0x19; 16]),
+            "PersistentSessionConsumerExecuteError { kind: \"outcome_unknown\", .. }"
+        );
     }
 
     #[test]
