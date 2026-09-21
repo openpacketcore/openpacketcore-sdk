@@ -1531,6 +1531,42 @@ impl QualificationNode {
             }
             QualificationNodeCommand::ConsensusDiagnostics => {
                 let health = self.store.persistence_health();
+                let status = self.store.status();
+                #[cfg(all(target_os = "linux", feature = "test-control"))]
+                if let Ok(Some(costs)) =
+                    opc_session_store::test_support::consensus_local_wal_costs_for_test(&self.store)
+                {
+                    // This body-free snapshot has bounded counters and retains
+                    // the writer scope, stage maxima and slowest request too.
+                    eprintln!("qualification_local_wal_costs {costs}");
+                    // The recent-flush array above can exceed the harness's
+                    // stderr tail. Keep a closed, fixed-size summary after it;
+                    // no request body, identity, path or raw error is included.
+                    eprintln!(
+                        "qualification_local_wal_costs_summary {}",
+                        serde_json::json!({
+                            "native_memory": costs["native_memory"],
+                            "native_live_sql_fallbacks": costs["native_live_sql_fallbacks"],
+                            "groups": costs["groups"],
+                            "requests": costs["requests"],
+                            "sync_calls": costs["sync_calls"],
+                            "queue_wait_maximum_us": costs["queue_wait_maximum_us"],
+                            "write_maximum_us": costs["write_maximum_us"],
+                            "intent_maximum_us": costs["intent_maximum_us"],
+                            "data_sync_maximum_us": costs["data_sync_maximum_us"],
+                            "publication_maximum_us": costs["publication_maximum_us"],
+                            "slowest_request": costs["slowest_request"],
+                            "checkpoint": costs["checkpoint"],
+                            "application": costs["application"],
+                        })
+                    );
+                }
+                eprintln!(
+                    "qualification_consensus_progress term={} leader_known={} local_leader={} last_log_index={:?} applied_index={:?} admitted={} completed_snapshot_count={}",
+                    status.term, status.leader_id.is_some(),
+                    status.leader_id == Some(status.node_id), status.last_log_index,
+                    status.applied_index, status.admitted, status.completed_snapshot_count,
+                );
                 eprintln!(
                     "qualification_persistence_health mode={:?} engine_running={} storage_state={:?} storage_failure={:?}",
                     health.mode, health.engine_running, health.storage_state, health.storage_failure,
@@ -1542,14 +1578,6 @@ impl QualificationNode {
                         &self.store
                     ),
                 );
-                #[cfg(all(target_os = "linux", feature = "test-control"))]
-                if let Ok(Some(costs)) =
-                    opc_session_store::test_support::consensus_local_wal_costs_for_test(&self.store)
-                {
-                    // This body-free snapshot has bounded counters and retains
-                    // the writer scope, stage maxima and slowest request too.
-                    eprintln!("qualification_local_wal_costs {costs}");
-                }
                 QualificationNodeReply::ConsensusDiagnostics {
                     metrics: self.store.diagnostic_snapshot(),
                 }
