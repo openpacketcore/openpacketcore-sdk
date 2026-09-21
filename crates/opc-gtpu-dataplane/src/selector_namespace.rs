@@ -8,10 +8,13 @@
 
 mod bearer;
 mod n3_end_marker;
+mod pristine;
 pub use bearer::GTPU_SHARED_PAA_MAX_LIVE_BEARERS;
 pub use n3_end_marker::{
     GtpuN3EndMarkerCompletion, GtpuN3EndMarkerError, GtpuN3EndMarkerReceipt, GtpuN3EndMarkerRequest,
 };
+pub use pristine::GtpuSessionSelectorPristineReadbackRequest;
+use pristine::PristineRelocation;
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
@@ -652,6 +655,7 @@ enum SelectorBackendRequestKind {
     DecommissionReadback = 8,
     InstallingNoEffect = 9,
     RetiringNoEffect = 10,
+    PristineReadback = 11,
 }
 
 #[derive(Clone, Copy)]
@@ -1774,6 +1778,7 @@ pub struct GtpuSessionSelectorBackendReceipt {
 enum SelectorBackendReceiptKind {
     BindingConfirmed,
     Provisioned,
+    PristineReadback,
     InstallingNoEffect,
     RetiringNoEffect,
     DecommissionFenceAbsent,
@@ -6063,32 +6068,16 @@ where
                     }
                 }
                 NamespaceLifecycle::Initializing => {
-                    if state.stable_device != Some(self.stable_device.to_bytes())
-                        || state.pin_commitment != self.pin_commitment
-                        || state.storage_scope_commitment != self.storage_scope_commitment
-                        || state.capacity != self.maximum_operation_atoms as u32
-                    {
+                    // Only the explicit relocation operation may resume its
+                    // precommitted successor. Ordinary provisioning must not
+                    // acquire that additional authority implicitly.
+                    if !state.pristine_relocations.is_empty() {
                         return Err(GtpuSessionSelectorNamespaceError::ConfigurationMismatch);
                     }
-                    let binding = state.binding_with_scope(self.storage_scope_commitment)?;
-                    let window = self.mint_backend_mutation_window(lease).await?;
-                    let request = GtpuSessionSelectorProvisionRequest { binding, window };
-                    let expected_receipt = request.receipt_coordinate();
-                    let receipt = settle_selector_backend_step(
-                        backend.provision_selector_namespace_authorized(request),
-                    )
-                    .await
-                    .ok_or(GtpuSessionSelectorNamespaceError::Indeterminate)?
-                    .map_err(|_| GtpuSessionSelectorNamespaceError::Indeterminate)?;
-                    if !receipt.confirms_provisioning(expected_receipt) {
-                        return Err(GtpuSessionSelectorNamespaceError::Indeterminate);
-                    }
-                    state.lifecycle = NamespaceLifecycle::Bound;
                     if self
-                        .replace_with_lease(record.as_ref(), state, lease)
+                        .complete_initializing_binding(backend, record.as_ref(), state, lease)
                         .await?
                     {
-                        self.ensure_backend_namespace(backend, lease).await?;
                         return Ok(());
                     }
                 }
@@ -6104,6 +6093,55 @@ where
             }
         }
         Err(GtpuSessionSelectorNamespaceError::Indeterminate)
+    }
+
+    async fn complete_initializing_binding<D>(
+        &self,
+        backend: &D,
+        record: Option<&StoredSessionRecord>,
+        mut state: NamespaceState,
+        lease: &mut SelectorWorkerLease,
+    ) -> Result<bool, GtpuSessionSelectorNamespaceError>
+    where
+        D: GtpuDataplaneBackend + ?Sized,
+    {
+        if state.lifecycle != NamespaceLifecycle::Initializing
+            || state.stable_device != Some(self.stable_device.to_bytes())
+            || state.pin_commitment != self.pin_commitment
+            || state.storage_scope_commitment != self.storage_scope_commitment
+            || state.capacity != self.maximum_operation_atoms as u32
+        {
+            return Err(GtpuSessionSelectorNamespaceError::ConfigurationMismatch);
+        }
+        let binding = state.binding_with_scope(self.storage_scope_commitment)?;
+        // Only a precommitted never-admitted relocation can prove an exact
+        // already-published empty binding without stopping its replacement.
+        // Ordinary provisioning keeps its original stopped-recovery contract.
+        let already_published = !state.pristine_relocations.is_empty()
+            && self
+                .read_pristine_binding(backend, &state, lease)
+                .await
+                .is_ok();
+        if !already_published {
+            let window = self.mint_backend_mutation_window(lease).await?;
+            let request = GtpuSessionSelectorProvisionRequest { binding, window };
+            let expected_receipt = request.receipt_coordinate();
+            let receipt = settle_selector_backend_step(
+                backend.provision_selector_namespace_authorized(request),
+            )
+            .await
+            .ok_or(GtpuSessionSelectorNamespaceError::Indeterminate)?
+            .map_err(|_| GtpuSessionSelectorNamespaceError::Indeterminate)?;
+            if !receipt.confirms_provisioning(expected_receipt) {
+                return Err(GtpuSessionSelectorNamespaceError::Indeterminate);
+            }
+        }
+        state.lifecycle = NamespaceLifecycle::Bound;
+        if !self.replace_with_lease(record, state, lease).await? {
+            return Ok(false);
+        }
+        self.ensure_backend_namespace(backend, lease).await?;
+        Ok(true)
     }
 
     async fn decommission_owned<D>(
@@ -7359,6 +7397,9 @@ struct NamespaceState {
     /// not merely absent from the current group or tombstone rows.
     published_atoms: BTreeSet<[u8; 32]>,
     tombstones: BTreeSet<[u8; 32]>,
+    /// Permanent exact lineage for explicitly relocated never-admitted
+    /// namespaces. This is never discarded when the first group is admitted.
+    pristine_relocations: Vec<PristineRelocation>,
 }
 
 #[derive(Clone)]
@@ -7564,6 +7605,7 @@ impl NamespaceState {
             || !self.canonical_desired.is_empty()
             || !self.published_atoms.is_empty()
             || !self.tombstones.is_empty()
+            || !self.pristine_relocations.is_empty()
         {
             return Err(GtpuSessionSelectorNamespaceError::Indeterminate);
         }
@@ -8489,7 +8531,11 @@ impl NamespaceState {
         // OPCSN16 adds a permanent, disjoint no-admission index. Existing
         // OPCSN15 ledgers keep their exact encoding until the first seal CAS;
         // older readers then reject the new schema before issuing authority.
-        output.extend_from_slice(if !self.bearer_parents.is_empty() {
+        // OPCSN19 retains explicit never-admitted relocation lineage. Older
+        // readers refuse the promoted record before issuing group authority.
+        output.extend_from_slice(if !self.pristine_relocations.is_empty() {
+            b"OPCSN19"
+        } else if !self.bearer_parents.is_empty() {
             b"OPCSN18"
         } else if !self.reattach_sources.is_empty() {
             b"OPCSN17"
@@ -8726,6 +8772,7 @@ impl NamespaceState {
         if !self.unadmitted_groups.is_empty()
             || !self.reattach_sources.is_empty()
             || !self.bearer_parents.is_empty()
+            || !self.pristine_relocations.is_empty()
         {
             output.extend_from_slice(&(self.unadmitted_groups.len() as u32).to_be_bytes());
             for (group, sealed) in &self.unadmitted_groups {
@@ -8735,18 +8782,24 @@ impl NamespaceState {
                 output.extend_from_slice(&sealed.desired);
             }
         }
-        if !self.reattach_sources.is_empty() || !self.bearer_parents.is_empty() {
+        if !self.reattach_sources.is_empty()
+            || !self.bearer_parents.is_empty()
+            || !self.pristine_relocations.is_empty()
+        {
             output.extend_from_slice(&(self.reattach_sources.len() as u32).to_be_bytes());
             for source in &self.reattach_sources {
                 output.extend_from_slice(source);
             }
         }
-        if !self.bearer_parents.is_empty() {
+        if !self.bearer_parents.is_empty() || !self.pristine_relocations.is_empty() {
             output.extend_from_slice(&(self.bearer_parents.len() as u32).to_be_bytes());
             for (child, parent) in &self.bearer_parents {
                 output.extend_from_slice(child);
                 output.extend_from_slice(parent);
             }
+        }
+        if !self.pristine_relocations.is_empty() {
+            self.encode_pristine_relocations(&mut output);
         }
         output
     }
@@ -8760,7 +8813,8 @@ impl NamespaceState {
         (version == b"OPCSN15"
             || version == b"OPCSN16"
             || version == b"OPCSN17"
-            || version == b"OPCSN18")
+            || version == b"OPCSN18"
+            || version == b"OPCSN19")
             .then_some(())?;
         let lifecycle = match *take(bytes, &mut cursor, 1)?.first()? {
             0 => NamespaceLifecycle::Unprovisioned,
@@ -8936,7 +8990,10 @@ impl NamespaceState {
                         match *take(bytes, &mut cursor, 1)?.first()? {
                             0 => None,
                             kind @ (1 | 2)
-                                if kind == 1 || version == b"OPCSN17" || version == b"OPCSN18" =>
+                                if kind == 1
+                                    || version == b"OPCSN17"
+                                    || version == b"OPCSN18"
+                                    || version == b"OPCSN19" =>
                             {
                                 let len = usize::from(u16::from_be_bytes(take_array(take(
                                     bytes,
@@ -9129,7 +9186,11 @@ impl NamespaceState {
             tombstones.insert(tombstone);
         }
         let mut unadmitted_groups = BTreeMap::new();
-        if version == b"OPCSN16" || version == b"OPCSN17" || version == b"OPCSN18" {
+        if version == b"OPCSN16"
+            || version == b"OPCSN17"
+            || version == b"OPCSN18"
+            || version == b"OPCSN19"
+        {
             let count = u32::from_be_bytes(take_array(take(bytes, &mut cursor, 4)?)?) as usize;
             if (count == 0 && version == b"OPCSN16")
                 || count > MAX_PERMANENT_GROUPS
@@ -9162,7 +9223,7 @@ impl NamespaceState {
             }
         }
         let mut reattach_sources = BTreeSet::new();
-        if version == b"OPCSN17" || version == b"OPCSN18" {
+        if version == b"OPCSN17" || version == b"OPCSN18" || version == b"OPCSN19" {
             let count = u32::from_be_bytes(take_array(take(bytes, &mut cursor, 4)?)?) as usize;
             if (count == 0 && version == b"OPCSN17") || count > MAX_PERMANENT_GROUPS {
                 return None;
@@ -9178,9 +9239,9 @@ impl NamespaceState {
             }
         }
         let mut bearer_parents = BTreeMap::new();
-        if version == b"OPCSN18" {
+        if version == b"OPCSN18" || version == b"OPCSN19" {
             let count = u32::from_be_bytes(take_array(take(bytes, &mut cursor, 4)?)?) as usize;
-            if count == 0 || count > MAX_PERMANENT_GROUPS {
+            if (count == 0 && version == b"OPCSN18") || count > MAX_PERMANENT_GROUPS {
                 return None;
             }
             let mut previous = None;
@@ -9194,6 +9255,11 @@ impl NamespaceState {
                 bearer_parents.insert(child, parent);
             }
         }
+        let pristine_relocations = if version == b"OPCSN19" {
+            Self::decode_pristine_relocations(bytes, &mut cursor)?
+        } else {
+            Vec::new()
+        };
         let state = Self {
             lifecycle,
             stable_device,
@@ -9214,6 +9280,7 @@ impl NamespaceState {
             canonical_desired,
             published_atoms,
             tombstones,
+            pristine_relocations,
         };
         (cursor == bytes.len() && state.is_complete()).then_some(state)
     }
@@ -9376,6 +9443,7 @@ impl NamespaceState {
             keyed_digest(&self.selector_digest_key, GROUP_DOMAIN, &codec)
         });
         lifecycle_complete
+            && self.pristine_lineage_is_exact()
             && self
                 .decommission_fence
                 .is_none_or(|fence| self.decommission_fence_is_exact(fence))
@@ -14566,6 +14634,60 @@ mod tests {
         assert!(stale.release_worker_lease(stale_lease).await.is_err());
     }
 
+    #[tokio::test(start_paused = true)]
+    async fn pristine_namespace_relocation_fences_owner_paused_before_admission_cas() {
+        let desired = group(1, 1, 0x1000_0001, None);
+        let clock = Arc::new(opc_session_store::TokioVirtualClock::new());
+        let store = SessionStore::new(SqliteSessionBackend::in_memory().unwrap().with_clock(clock));
+        let stale = raw_production_authority(
+            store,
+            production_namespace_key(desired.device_id()),
+            "pristine-stale-worker",
+            32,
+        )
+        .await;
+        let original_backend = Arc::new(FaultingSelectorBackend::default());
+        stale.provision(original_backend.as_ref()).await.unwrap();
+        let mut stale_lease = stale.acquire_worker_lease().await.unwrap();
+        let (old_record, old_state) = stale.read_state().await.unwrap();
+
+        // Pause the original worker before its admission CAS; advance the
+        // store's clock beyond the unchanged production lease bound. No sleep,
+        // shortened lease or forged currentness receipt is used.
+        tokio::time::advance(SELECTOR_NAMESPACE_MAX_LEASE_TTL + Duration::from_secs(1)).await;
+        let mut successor = stale.clone();
+        successor.owner = OwnerId::new("pristine-successor-worker").unwrap();
+        successor.pin_commitment = [0x7a; 32];
+        successor.instance = Arc::new(());
+        let replacement_backend = Arc::new(FaultingSelectorBackend::default());
+        let mut successor_lease = successor.acquire_worker_lease().await.unwrap();
+        successor
+            .relocate_pristine_with_lease(replacement_backend.as_ref(), &mut successor_lease)
+            .await
+            .unwrap();
+        successor
+            .release_worker_lease(successor_lease)
+            .await
+            .unwrap();
+        let settled = successor.read_state().await.unwrap().1.encode();
+
+        // A resumed worker cannot overwrite the successor even if it still
+        // carries its old complete snapshot, and cannot obtain an admission
+        // through the normal production claim path on its original backend.
+        assert!(!stale
+            .replace_with_lease(old_record.as_ref(), old_state, &mut stale_lease)
+            .await
+            .unwrap());
+        assert!(stale
+            .claim_fresh_with_lease(original_backend.as_ref(), &desired, &mut stale_lease)
+            .await
+            .is_err());
+        assert_eq!(original_backend.effect_calls(), 0);
+        assert_eq!(replacement_backend.effect_calls(), 0);
+        assert_eq!(successor.read_state().await.unwrap().1.encode(), settled);
+        assert!(stale.release_worker_lease(stale_lease).await.is_err());
+    }
+
     #[tokio::test]
     async fn expired_started_retirement_owner_cannot_make_recovery_replay_its_removal() {
         let desired = group(1, 1, 0x1000_0001, None);
@@ -14909,6 +15031,7 @@ mod tests {
             canonical_desired: BTreeMap::new(),
             published_atoms: BTreeSet::new(),
             tombstones: BTreeSet::new(),
+            pristine_relocations: Vec::new(),
         };
         state
             .selectors
@@ -15100,6 +15223,7 @@ mod tests {
             canonical_desired: BTreeMap::new(),
             published_atoms: BTreeSet::new(),
             tombstones: BTreeSet::new(),
+            pristine_relocations: Vec::new(),
         };
         let template = group(1, 1, 0x1000_0001, None);
         let mut entries = template.entries().to_vec();

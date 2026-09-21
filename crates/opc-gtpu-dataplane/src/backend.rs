@@ -1053,6 +1053,21 @@ pub trait GtpuDataplaneBackend: Send + Sync + std::fmt::Debug {
         })
     }
 
+    /// Prove the exact precommitted binding and complete empty authority
+    /// inventory for a never-admitted relocation. This read-only operation
+    /// takes the backend's current host lock and validates the full graph,
+    /// absence of terminal fences, marker identity, every authority map and
+    /// request currentness before and after readback. A binding-only lookup
+    /// or an empty operation-stamp map alone is insufficient.
+    async fn read_pristine_selector_namespace(
+        &self,
+        _request: crate::GtpuSessionSelectorPristineReadbackRequest,
+    ) -> Result<crate::GtpuSessionSelectorBackendReceipt, GtpuError> {
+        Err(GtpuError::UnsupportedFeature {
+            feature: "gtpu_selector_pristine_readback",
+        })
+    }
+
     /// Inspect the durable terminal-fence capsule before or after a selector
     /// namespace decommission precommit.
     ///

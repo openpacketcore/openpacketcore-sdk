@@ -29,6 +29,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- `opc-gtpu-dataplane`: add experimental explicit relocation for a protected
+  selector namespace with permanent proof of no prior group admission. Retain
+  its ledger and secret, fence stale writers, and resume only the exact
+  precommitted replacement after interruption. All prior session history is
+  refused; ordinary open/provision and general restart support are unchanged.
+  See RFC 018.
+
 - `opc-n3iwf-fixtures`: complete the Child-SA evidence inventory with fifteen
   digest-bound records covering 3,364 model cases and 89 runtime-test
   obligations. Preserve historical vectors and publish an aggregate SDK

@@ -49,6 +49,15 @@ packet helpers alone confer no install authority; see [N3 conformance](CONFORMAN
 
 ## API Shape
 
+The experimental protected selector coordinator exposes an explicit
+`relocate_never_admitted_protected` operation for a namespace whose complete
+permanent ledger proves no group has ever been admitted or sealed. It retains
+the same ledger and secret, commits an exact replacement before its backend
+effect, and resumes only that replacement after interruption. Ordinary open
+and provision operations remain strict. Any prior session history excludes
+this operation; it is not general restart or packet-continuity recovery. See
+[RFC 018](../../docs/rfc/018-never-admitted-selector-relocation.md).
+
 The [`control_port` module](docs/control-port.md) adds bounded control
 datagrams and response plans on the existing Linux IPv4 reassembly socket.
 One consumer shares its UDP/2152 queue with user-packet reassembly. Plans
