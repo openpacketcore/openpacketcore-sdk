@@ -95,7 +95,10 @@ async fn exact_status(
     client: &PersistentSessionConsumerClient,
     scope: SessionConsumerScope,
     request: &FencedTransitionV2Request,
+    ordinal: usize,
+    changed_body: bool,
 ) -> SessionConsumerV2FencedTransitionStatus {
+    let started = Instant::now();
     match client
         .execute_v2(&SessionConsumerV2Request::new(
             scope,
@@ -104,7 +107,13 @@ async fn exact_status(
             },
         ))
         .await
-        .expect("public exact receipt transport")
+        .unwrap_or_else(|error| match error {
+            PersistentSessionConsumerV2ExecuteError::ReadUnavailable { cause }
+            | PersistentSessionConsumerV2ExecuteError::NotTransmitted { cause } => {
+                panic!("public exact receipt transport: ordinal={ordinal}; changed_body={changed_body}; elapsed_ms={}; cause={cause:?}; kind={error:?}", started.elapsed().as_millis())
+            }
+            error => panic!("public exact receipt transport: ordinal={ordinal}; changed_body={changed_body}; elapsed_ms={}; kind={error:?}", started.elapsed().as_millis()),
+        })
     {
         SessionConsumerV2Response::FencedTransitionV2Status(Ok(status)) => status,
         response => panic!("exact receipt rejected: {response:?}"),
@@ -537,12 +546,12 @@ fn run_original(persistence: QualificationIsolatedPersistence) {
                     rotations += 1;
                     assert!(rotations <= 7);
                     active_entries = 0;
-                    for (request, outcome) in &representatives {
-                        assert!(matches!(exact_status(&client, scope, request).await,
+                    for (ordinal, (request, outcome)) in representatives.iter().enumerate() {
+                        assert!(matches!(exact_status(&client, scope, request, ordinal, false).await,
                             SessionConsumerV2FencedTransitionStatus::Recorded(result) if result.as_ref() == &Ok(outcome.clone())));
                         let replay = execute_batch(&client, scope, std::slice::from_ref(request), &effects, Instant::now() + BATCH_BOUND).await;
                         assert_eq!(&replay, &vec![outcome.clone()]);
-                        assert!(matches!(exact_status(&client, scope, &request_with_changed_body(request)).await,
+                        assert!(matches!(exact_status(&client, scope, &request_with_changed_body(request), ordinal, true).await,
                             SessionConsumerV2FencedTransitionStatus::RequestConflict));
                     }
                 }
@@ -813,10 +822,90 @@ fn capture_original_failure_diagnostics(fleet: &mut Fleet) {
 
 // Exercise the full workload's actual encryption and public batch protocol
 // without claiming its cardinality, duration or memory acceptance.
-fn original_wire_control(
-    persistence: QualificationIsolatedPersistence,
-    check_mixed_batch_failure: bool,
-) {
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum WireControl {
+    Clean,
+    MixedRejection,
+    DelayedBatchReply,
+}
+
+#[derive(Default, Debug, serde::Serialize)]
+struct FailedWireReceiptObservation {
+    attempted: usize,
+    recorded: usize,
+    recorded_rejection: usize,
+    not_found: usize,
+    request_conflict: usize,
+    unavailable: usize,
+    unexpected: usize,
+    unobserved: usize,
+}
+
+/// Diagnostic reads happen only after the original qualification has failed.
+/// They never replay a mutation, replace a request, or change its failed result.
+async fn observe_failed_wire_receipts(
+    client: &PersistentSessionConsumerClient,
+    scope: SessionConsumerScope,
+    requests: &[FencedTransitionV2Request],
+) -> FailedWireReceiptObservation {
+    let mut observation = FailedWireReceiptObservation {
+        attempted: requests.len(),
+        unobserved: requests.len(),
+        ..FailedWireReceiptObservation::default()
+    };
+    // This is a bounded post-failure diagnostic window, not another attempt
+    // at the 800 ms qualification. Only immutable exact-status calls are made.
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    for request in requests {
+        let response = tokio::time::timeout_at(
+            deadline,
+            client.execute_v2(&SessionConsumerV2Request::new(
+                scope,
+                SessionConsumerV2Operation::FencedTransitionV2Status {
+                    request: Box::new(request.clone()),
+                },
+            )),
+        )
+        .await;
+        let Ok(response) = response else {
+            break;
+        };
+        observation.unobserved -= 1;
+        match response {
+            Ok(SessionConsumerV2Response::FencedTransitionV2Status(Ok(status))) => match status {
+                SessionConsumerV2FencedTransitionStatus::Recorded(result) => {
+                    match result.as_ref() {
+                        Ok(outcome) if outcome.matches_v2_request(request) => {
+                            observation.recorded += 1;
+                        }
+                        Ok(_) => observation.unexpected += 1,
+                        Err(_) => observation.recorded_rejection += 1,
+                    }
+                }
+                SessionConsumerV2FencedTransitionStatus::NotFound => {
+                    observation.not_found += 1;
+                }
+                SessionConsumerV2FencedTransitionStatus::RequestConflict => {
+                    observation.request_conflict += 1;
+                }
+                _ => observation.unexpected += 1,
+            },
+            Err(
+                PersistentSessionConsumerV2ExecuteError::ReadUnavailable { .. }
+                | PersistentSessionConsumerV2ExecuteError::NotTransmitted { .. },
+            ) => {
+                observation.unavailable += 1;
+            }
+            Ok(response) if qualification_v2_batch_status_is_retryable_unavailable(&response) => {
+                observation.unavailable += 1;
+            }
+            _ => observation.unexpected += 1,
+        }
+    }
+    observation
+}
+
+fn original_wire_control(persistence: QualificationIsolatedPersistence, control: WireControl) {
     let scale = QualificationIsolatedScaleConfig {
         persistence,
         workload: QualificationIsolatedScaleWorkload::Original,
@@ -843,6 +932,9 @@ fn original_wire_control(
         evidence_root: fleet.workspace.path().to_path_buf(),
         ..Effects::default()
     };
+    // Retain the original request bodies through failure-only observation.
+    // Neither diagnostics nor the negative control may mint replacement IDs.
+    let mut attempted_requests = Vec::new();
     let result = runtime.block_on(AssertUnwindSafe(async {
         client.prewarm().await.expect("public observation lane");
         client.prewarm_v2().await.expect("public batch lane");
@@ -851,15 +943,26 @@ fn original_wire_control(
         let mut requests = Vec::new();
         for index in 0..8 {
             let key = key(index);
+            let started = Instant::now();
             let response = client.execute(&SessionConsumerRequest::new(scope,
                 SessionConsumerRequestId::from_bytes((index as u128).to_be_bytes()),
                 SessionConsumerOperation::ObserveFencedTransition { key: key.clone() },
-            )).await.expect("independent public current fence");
+            )).await.unwrap_or_else(|error| match error {
+                PersistentSessionConsumerExecuteError::ReadUnavailable { cause }
+                | PersistentSessionConsumerExecuteError::NotTransmitted { cause } => {
+                    panic!("independent public current fence: ordinal={index}; elapsed_ms={}; cause={cause:?}; kind={error:?}", started.elapsed().as_millis())
+                }
+                error => panic!("independent public current fence: ordinal={index}; elapsed_ms={}; kind={error:?}", started.elapsed().as_millis()),
+            });
             let SessionConsumerResponse::ObserveFencedTransition(Ok(observed)) = response else {
                 panic!("original scope must receive an authoritative fence");
             };
             requests.push(create_request(index, epoch, key, observed.current_fence(), &provider).await);
         }
+        if control == WireControl::DelayedBatchReply {
+            fleet.arm_stateless_consumer_delayed_response(leader);
+        }
+        attempted_requests.extend(requests.iter().cloned());
         let created = execute_batch(&client, scope, &requests, &effects, Instant::now() + BATCH_BOUND).await;
         let mut updates = Vec::new();
         for (index, previous) in created.iter().enumerate() {
@@ -867,11 +970,12 @@ fn original_wire_control(
             assert_exact_qualified_update_request(previous, &request);
             updates.push(request);
         }
+        attempted_requests.extend(updates.iter().cloned());
         let updated = execute_batch(&client, scope, &updates, &effects, Instant::now() + BATCH_BOUND).await;
-        for (request, outcome) in requests.iter().zip(&created).chain(updates.iter().zip(&updated)) {
-            assert!(matches!(exact_status(&client, scope, request).await,
+        for (ordinal, (request, outcome)) in requests.iter().zip(&created).chain(updates.iter().zip(&updated)).enumerate() {
+            assert!(matches!(exact_status(&client, scope, request, ordinal, false).await,
                 SessionConsumerV2FencedTransitionStatus::Recorded(result) if result.as_ref() == &Ok(outcome.clone())));
-            assert!(matches!(exact_status(&client, scope, &request_with_changed_body(request)).await,
+            assert!(matches!(exact_status(&client, scope, &request_with_changed_body(request), ordinal, true).await,
                 SessionConsumerV2FencedTransitionStatus::RequestConflict));
         }
         assert_eq!(execute_batch(&client, scope, &requests, &effects, Instant::now() + BATCH_BOUND).await, created);
@@ -884,7 +988,7 @@ fn original_wire_control(
         )).await.expect("real rejected public request");
         assert!(matches!(rejection, SessionConsumerResponse::Rejected(SessionConsumerRejection::Unauthorized)));
         effects.assert_clean();
-        if check_mixed_batch_failure {
+        if control == WireControl::MixedRejection {
             let mut mixed = requests.clone();
             mixed[0] = request_with_changed_body(&mixed[0]);
             let evidence_root = fleet.workspace.path().join("mixed-item-failure");
@@ -929,26 +1033,109 @@ fn original_wire_control(
             }));
         }
     }).catch_unwind());
+    let mut receipt_observation = FailedWireReceiptObservation::default();
+    let mut diagnostic_voters = 0;
     if result.is_err() {
-        capture_original_failure_diagnostics(&mut fleet);
+        eprintln!(
+            "sdk_original_failure effects={} client={:?} v2={:?}",
+            effects.json(),
+            runtime.block_on(client.diagnostics()),
+            client.v2_diagnostics()
+        );
+        // Observe only after the original result is fixed. This command reads
+        // passive consensus/storage counters; it must not run another quorum
+        // readiness probe or replace the original failed assertion.
+        let diagnostics =
+            std::panic::catch_unwind(AssertUnwindSafe(|| fleet.all_consensus_diagnostics()));
+        match diagnostics {
+            Ok(diagnostics) => eprintln!("sdk_original_consensus_diagnostics={diagnostics:?}"),
+            Err(_) => eprintln!("sdk_original_consensus_diagnostics=unavailable"),
+        }
+        for (ordinal, stderr) in fleet.stderr_diagnostics().iter().enumerate() {
+            let mut progress = false;
+            let mut health = false;
+            let mut storage = false;
+            for line in stderr.lines().filter(|line| {
+                line.starts_with("qualification_persistence_health ")
+                    || line.starts_with("qualification_consensus_progress ")
+                    || line.starts_with("qualification_local_durable_progress ")
+                    || line.starts_with("qualification_local_wal_costs_summary ")
+            }) {
+                progress |= line.starts_with("qualification_consensus_progress ");
+                health |= line.starts_with("qualification_persistence_health ");
+                storage |= line.starts_with("qualification_local_wal_costs_summary ");
+                eprintln!("sdk_original_voter ordinal={ordinal} {line}");
+            }
+            diagnostic_voters += usize::from(progress && health && storage);
+        }
+        receipt_observation = runtime.block_on(observe_failed_wire_receipts(
+            &client,
+            scope,
+            &attempted_requests,
+        ));
+        eprintln!(
+            "sdk_original_failed_receipts={}",
+            serde_json::json!({
+                "original_result": "failed",
+                "performance_acceptance": false,
+                "observation": receipt_observation,
+            })
+        );
     }
     runtime.block_on(client.shutdown());
     drop(source);
     fleet.shutdown_isolated_scale_joined();
+    if control == WireControl::DelayedBatchReply {
+        let failure =
+            result.expect_err("delayed committed reply must keep original qualification RED");
+        let reason = failure
+            .downcast_ref::<String>()
+            .map(String::as_str)
+            .or_else(|| failure.downcast_ref::<&str>().copied());
+        assert_eq!(reason, Some("original exact-status convergence deadline"));
+        assert_eq!(effects.dispatched_batches.load(Ordering::Relaxed), 1);
+        assert_eq!(effects.not_transmitted_retries.load(Ordering::Relaxed), 0);
+        assert_eq!(effects.ambiguous_batches.load(Ordering::Relaxed), 1);
+        assert_eq!(effects.status_reads.load(Ordering::Relaxed), 0);
+        assert_eq!(effects.failure_records.load(Ordering::Relaxed), 1);
+        assert_eq!(receipt_observation.attempted, 8);
+        assert_eq!(receipt_observation.recorded, 8);
+        assert_eq!(receipt_observation.unobserved, 0);
+        assert_eq!(
+            diagnostic_voters, VOTERS,
+            "every voter must retain bounded progress and storage diagnostics"
+        );
+        return;
+    }
     result.unwrap_or_else(|panic| std::panic::resume_unwind(panic));
 }
 
 #[test]
 fn original_encrypted_async_batches_preserve_receipts_and_scope() {
-    original_wire_control(QualificationIsolatedPersistence::Async, false);
+    original_wire_control(QualificationIsolatedPersistence::Async, WireControl::Clean);
 }
 
 #[test]
 fn original_encrypted_durable_batches_preserve_receipts_and_scope() {
-    original_wire_control(QualificationIsolatedPersistence::Durable, false);
+    original_wire_control(
+        QualificationIsolatedPersistence::Durable,
+        WireControl::Clean,
+    );
 }
 
 #[test]
 fn original_mixed_batch_failure_retains_typed_rejection_and_exact_successes() {
-    original_wire_control(QualificationIsolatedPersistence::Durable, true);
+    original_wire_control(
+        QualificationIsolatedPersistence::Durable,
+        WireControl::MixedRejection,
+    );
+}
+
+#[test]
+#[cfg(feature = "test-control")]
+fn original_delayed_durable_reply_remains_failed_after_exact_receipt_observation() {
+    original_wire_control(
+        QualificationIsolatedPersistence::Durable,
+        WireControl::DelayedBatchReply,
+    );
 }

@@ -1099,6 +1099,25 @@ from the small cold-reconstruction controls and the retained cold-image probe.
 All voters join their shutdown paths after the driver classifies submitted
 effects; failure evidence retains exact requests and classified results.
 
+The small original wire controls retain their failed result before collecting
+failure-only diagnostics. A transport failure reports its closed error cause,
+synthetic ordinal and elapsed time. The driver then records client counters,
+passive voter progress/health and bounded native-WAL timing summaries before
+making any diagnostic receipt reads. These summaries follow the verbose WAL
+history so they remain in the harness's bounded stderr tail.
+
+After failure, a separate five-second diagnostic window reads only the exact
+original attempted requests. Its output contains outcome counts, never request
+bodies or identifiers, and explicitly reports `performance_acceptance:false`.
+It does not retry a mutation, extend the original 800 ms bound, or turn a failed
+qualification into a pass. With `test-control`, the delayed-response negative
+control withholds a real committed batch reply, requires the original deadline
+failure, and recovers all eight original receipts without replay. Removing the
+bounded voter summaries or changing the diagnostic request bodies must fail
+that control. This diagnoses the controlled fault only: the historical hosted
+failures tracked in [SDK #923](https://github.com/openpacketcore/openpacketcore-sdk/issues/923)
+remain unexplained until their cause is reproduced or independently established.
+
 ## License
 
 Licensed under the [Apache License, Version 2.0](../../LICENSE).
