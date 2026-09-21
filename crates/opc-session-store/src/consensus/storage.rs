@@ -12670,7 +12670,8 @@ mod tests {
             assert_eq!(
                 observed.load(Ordering::SeqCst),
                 1,
-                "{case}: intended boundary executed once"
+                "{case}: intended boundary executed once; snapshot_error={:?}",
+                result.as_ref().err()
             );
             let intact = matches!(
                 case,
