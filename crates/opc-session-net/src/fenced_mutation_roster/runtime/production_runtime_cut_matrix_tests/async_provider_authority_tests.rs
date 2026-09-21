@@ -317,12 +317,100 @@ async fn higher_fence_for_another_binding_does_not_retire_old_provider_authority
     );
 }
 
+// This helper must issue the lease against the provider/executor clock. The
+// provider may have completed synchronous disk setup while virtual time stayed
+// paused. Its time base must not be replaced with a later wall-clock reading.
+fn journal_registration(clock: &dyn Clock) -> RegistrationRequest {
+    let request = request_with_members(1);
+    let authority = request.authority();
+    let acquired_at = clock
+        .now_utc()
+        .add_seconds(-1)
+        .expect("fixture acquisition time");
+    RegistrationRequest::new_with_lease_metadata(
+        request.admission().clone(),
+        authority.owner().clone(),
+        authority.fence(),
+        authority.credential_id(),
+        authority.generation(),
+        acquired_at,
+        acquired_at.add_seconds(60).expect("fixture lease expiry"),
+    )
+    .expect("registration on the provider clock")
+}
+
+#[derive(Debug)]
+struct RetainedProviderClock(Timestamp);
+
+impl Clock for RetainedProviderClock {
+    fn now_utc(&self) -> Timestamp {
+        self.0
+    }
+}
+
+#[tokio::test]
+async fn journal_registration_uses_the_provider_clock_after_wall_time_advances() {
+    // Model disk setup advancing wall time without moving the frozen provider
+    // clock. An explicit offset makes the old mismatch deterministic; no sleep
+    // or lease deadline is changed.
+    let clock: Arc<dyn Clock> = Arc::new(RetainedProviderClock(
+        Timestamp::now_utc()
+            .add_seconds(-120)
+            .expect("synthetic earlier anchor"),
+    ));
+    let directory = tempfile::tempdir().expect("disk-backed provider directory");
+    let provider = JournalProvider::new(&directory.path().join("journal.db"), Arc::clone(&clock));
+    let request = journal_registration(clock.as_ref());
+    assert_eq!(
+        request.authority().acquired_at(),
+        clock.now_utc().add_seconds(-1).unwrap()
+    );
+    assert_eq!(
+        request.authority().expires_at(),
+        clock.now_utc().add_seconds(59).unwrap()
+    );
+    let executor = journal_executor(provider, Arc::new(CutBackend::default()));
+    let _admitted = executor
+        .register(request)
+        .await
+        .expect("fixture lease must be current on the provider clock");
+}
+
+#[tokio::test]
+async fn journal_registration_preserves_future_and_expired_lease_rejection() {
+    let clock: Arc<dyn Clock> = Arc::new(RetainedProviderClock(Timestamp::now_utc()));
+    let directory = tempfile::tempdir().expect("disk-backed provider directory");
+    let provider = JournalProvider::new(&directory.path().join("journal.db"), Arc::clone(&clock));
+    let request = journal_registration(clock.as_ref());
+    let authority = request.authority();
+    for offset in [1, -61] {
+        let acquired_at = clock.now_utc().add_seconds(offset).unwrap();
+        let invalid = RegistrationRequest::new_with_lease_metadata(
+            request.admission().clone(),
+            authority.owner().clone(),
+            authority.fence(),
+            authority.credential_id(),
+            authority.generation(),
+            acquired_at,
+            acquired_at.add_seconds(60).unwrap(),
+        )
+        .unwrap();
+        let executor = journal_executor(Arc::clone(&provider), Arc::new(CutBackend::default()));
+        assert!(matches!(
+            executor.register(invalid).await,
+            Err(ExecutorError::AdmissionOutcomeUnknown)
+        ));
+        assert_eq!(provider.resource(), (0, 0));
+        assert_eq!(provider.applied_bindings(), 0);
+    }
+}
+
 #[tokio::test(start_paused = true)]
 async fn lease_expiry_does_not_reconstruct_a_lost_admission_or_undo_its_effect() {
     let directory = tempfile::tempdir().expect("disk-backed provider directory");
     let clock: Arc<dyn Clock> = Arc::new(TokioVirtualClock::new());
     let provider = JournalProvider::new(&directory.path().join("journal.db"), Arc::clone(&clock));
-    let request = request_with_members(1);
+    let request = journal_registration(clock.as_ref());
     let old = journal_executor(Arc::clone(&provider), Arc::new(CutBackend::default()));
     let admitted = old
         .register(request.clone())

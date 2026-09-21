@@ -18,6 +18,7 @@ import json
 import re
 import subprocess
 import sys
+import tempfile
 from collections import deque
 from dataclasses import dataclass
 from pathlib import Path
@@ -305,7 +306,7 @@ def rust_sources(root: Path) -> list[Path]:
     return sorted(
         path
         for path in root.rglob("*.rs")
-        if not any(part in skip for part in path.parts)
+        if not any(part in skip for part in path.relative_to(root).parts)
     )
 
 
@@ -549,6 +550,39 @@ def assert_grpc_policy_fragments(
 
 
 def run_self_test() -> None:
+    # Exclusions belong to each audited crate, not to an ancestor directory
+    # chosen by its consumer. An ignored ancestor must not hide unsafe code.
+    with tempfile.TemporaryDirectory(prefix="management-source-audit-") as temporary:
+        for ancestor in ("workspace", "target", ".git"):
+            crate = Path(temporary) / ancestor / "checkout" / "crates" / "opc-core"
+            source = crate / "src" / "lib.rs"
+            source.parent.mkdir(parents=True)
+            source.write_text(
+                "fn prohibited() { unsafe { call(); } }\n", encoding="utf-8"
+            )
+            for ignored in ("target", ".git"):
+                generated = crate / ignored / "generated.rs"
+                generated.parent.mkdir()
+                generated.write_text("unsafe { generated(); }\n", encoding="utf-8")
+            if rust_sources(crate) != [source]:
+                raise SystemExit(
+                    "source audit self-test failed: checkout ancestor hid Rust source"
+                )
+            metadata = {
+                "workspace_members": ["opc-core"],
+                "packages": [{
+                    "id": "opc-core", "name": "opc-core",
+                    "manifest_path": str(crate / "Cargo.toml"),
+                }],
+            }
+            violations = check_unsafe_boundary(metadata)
+            if len(violations) != 1 or not violations[0].location.startswith(
+                str(source) + ":"
+            ):
+                raise SystemExit(
+                    "source audit self-test failed: prohibited unsafe code was not rejected"
+                )
+
     assert_grpc_policy_fragments(
         "opc-gnmi-server direct gRPC deps allowed",
         grpc_policy_fixture(

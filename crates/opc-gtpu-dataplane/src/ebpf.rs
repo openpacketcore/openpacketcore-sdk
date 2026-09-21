@@ -2047,6 +2047,20 @@ pub(crate) trait EbpfGtpuRuntime: Send + Sync + fmt::Debug {
         currentness: &mut SelectorNamespaceCurrentnessGate<'_>,
     ) -> Result<(), GtpuError>;
 
+    /// Inspect an exact precommitted pristine binding without mutating it.
+    /// Complete graph identity and every empty authority map must be checked
+    /// under the current bounded host lock; binding-only readback is not proof.
+    fn read_pristine_selector_namespace_effect(
+        &self,
+        _ifindex: u32,
+        _binding: crate::selector_namespace::GtpuSessionSelectorBackendBinding,
+        _currentness: &mut SelectorNamespaceCurrentnessGate<'_>,
+    ) -> Result<(), GtpuError> {
+        Err(GtpuError::UnsupportedFeature {
+            feature: "ebpf_selector_pristine_readback",
+        })
+    }
+
     /// Inspect the one durable terminal-fence capsule under a bounded host
     /// lock. The runtime must release that lock before returning so the
     /// selector authority can safely perform its protected-store CAS/readback.
@@ -13888,6 +13902,40 @@ impl GtpuDataplaneBackend for EbpfGtpuDataplaneBackend {
             return Err(state_indeterminate(
                 "ebpf_selector_provision_window_expired",
             ));
+        }
+        Ok(request.confirm())
+    }
+
+    async fn read_pristine_selector_namespace(
+        &self,
+        request: crate::GtpuSessionSelectorPristineReadbackRequest,
+    ) -> Result<crate::GtpuSessionSelectorBackendReceipt, GtpuError> {
+        let request = self
+            .run_blocking("ebpf_selector_pristine_readback", move |backend| {
+                let context = backend
+                    .grouped_attachment_context(request.binding().stable_device())
+                    .map_err(|_| state_indeterminate("ebpf_selector_pristine_attachment"))?;
+                let mut currentness = || {
+                    request
+                        .is_current()
+                        .then_some(())
+                        .ok_or_else(|| state_indeterminate("ebpf_selector_pristine_window"))
+                };
+                currentness()?;
+                backend
+                    .inner
+                    .runtime
+                    .read_pristine_selector_namespace_effect(
+                        context.device.ifindex,
+                        request.binding(),
+                        &mut currentness,
+                    )?;
+                currentness()?;
+                Ok(request)
+            })
+            .await?;
+        if !request.is_current() {
+            return Err(state_indeterminate("ebpf_selector_pristine_window"));
         }
         Ok(request.confirm())
     }
@@ -26516,6 +26564,37 @@ mod aya_runtime {
                         }
                         _ => Err(state_indeterminate("ebpf_selector_binding_conflict")),
                     }
+                },
+            )
+        }
+
+        fn read_pristine_selector_namespace_effect(
+            &self,
+            ifindex: u32,
+            binding: crate::selector_namespace::GtpuSessionSelectorBackendBinding,
+            currentness: &mut SelectorNamespaceCurrentnessGate<'_>,
+        ) -> Result<(), GtpuError> {
+            self.with_current_selector_namespace_control_lock_current(
+                ifindex,
+                "ebpf_selector_pristine_readback",
+                currentness,
+                |device, control, currentness| {
+                    currentness()?;
+                    Self::selector_namespace_binding_is_exact(device, binding, control)?;
+                    let (_, terminal) = Self::marker_inventory(control)?;
+                    let graph_current = if device.cleanup_only {
+                        device.links.is_none()
+                            && Self::loaded_datapath_cleanup_safe(ifindex, device)
+                    } else {
+                        device.links.is_some() && Self::loaded_datapath_is_current(ifindex, device)
+                    };
+                    if !terminal.is_empty()
+                        || !graph_current
+                        || !Self::selector_namespace_maps_are_empty(ifindex, device)?
+                    {
+                        return Err(state_indeterminate("ebpf_selector_pristine_inventory"));
+                    }
+                    currentness()
                 },
             )
         }
@@ -46382,6 +46461,15 @@ mod aya_runtime {
             self.provision_selector_namespace_effect(ifindex, binding, currentness)
         }
 
+        fn read_pristine_selector_namespace_effect(
+            &self,
+            ifindex: u32,
+            binding: crate::selector_namespace::GtpuSessionSelectorBackendBinding,
+            currentness: &mut SelectorNamespaceCurrentnessGate<'_>,
+        ) -> Result<(), GtpuError> {
+            self.read_pristine_selector_namespace_effect(ifindex, binding, currentness)
+        }
+
         fn inspect_selector_namespace_decommission_fence(
             &self,
             ifindex: u32,
@@ -53816,6 +53904,7 @@ mod tests {
     mod grouped_bearer_transition;
     #[cfg(target_os = "linux")]
     mod n3_end_marker;
+    mod retained_namespace_boundary;
     // This fixture constructs real durable consensus, whose public platform
     // contract is Linux-only. The portable fake-runtime tests remain below.
     #[cfg(target_os = "linux")]
@@ -60961,12 +61050,51 @@ mod tests {
                 }
             })();
             match result {
-                Ok(()) => Box::new(guard).finish_with_currentness(currentness),
+                Ok(()) => {
+                    Self::fail_after_if_requested(
+                        &mut self.state(),
+                        "selector_namespace_provision",
+                    )?;
+                    Box::new(guard).finish_with_currentness(currentness)
+                }
                 Err(error) => {
                     drop(guard);
                     Err(error)
                 }
             }
+        }
+
+        fn read_pristine_selector_namespace_effect(
+            &self,
+            ifindex: u32,
+            binding: crate::selector_namespace::GtpuSessionSelectorBackendBinding,
+            currentness: &mut SelectorNamespaceCurrentnessGate<'_>,
+        ) -> Result<(), GtpuError> {
+            let guard = self.acquire_selector_namespace_effect(ifindex, binding)?;
+            currentness()?;
+            {
+                let state = self.state();
+                let graph_current = if state.cleanup_only.contains(&ifindex) {
+                    !state.uplink_filter_ready.contains(&ifindex)
+                        && !state.downlink_filter_ready.contains(&ifindex)
+                } else {
+                    state.uplink_filter_ready.contains(&ifindex)
+                        && state.downlink_filter_ready.contains(&ifindex)
+                };
+                if !state.attached.contains_key(&ifindex)
+                    || !state.grouped_map_ready.contains(&ifindex)
+                    || state
+                        .selector_namespace_terminal_fences
+                        .contains_key(&ifindex)
+                    || !graph_current
+                    || !Self::selector_namespace_maps_are_empty(&state, ifindex)
+                {
+                    return Err(state_indeterminate("fake_selector_pristine_inventory"));
+                }
+            }
+            currentness()?;
+            guard.finish()?;
+            currentness()
         }
 
         fn inspect_selector_namespace_decommission_fence(

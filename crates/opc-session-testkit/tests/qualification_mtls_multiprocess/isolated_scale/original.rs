@@ -713,30 +713,7 @@ fn run_original(persistence: QualificationIsolatedPersistence) {
         })
     }));
     if result.is_err() {
-        // Capture live progress after the failed workload has relinquished its
-        // calls, before shutdown changes the observed engine/storage state.
-        let reports = std::panic::catch_unwind(AssertUnwindSafe(|| fleet.isolated_scale_reports()));
-        if let Ok(reports) = reports {
-            eprintln!(
-                "sdk_isolated_scale_failure_reports={}",
-                serde_json::json!(reports)
-            );
-        }
-        // The timed workload and its dispatched calls have already ended.
-        // Ask the existing diagnostic command for bounded WAL stage counters
-        // before shutdown; diagnostic failure must not replace the workload RED.
-        let diagnostics =
-            std::panic::catch_unwind(AssertUnwindSafe(|| fleet.all_consensus_diagnostics()));
-        if let Ok(diagnostics) = diagnostics {
-            eprintln!(
-                "sdk_isolated_scale_failure_consensus={}",
-                serde_json::json!(diagnostics)
-            );
-        }
-        eprintln!(
-            "sdk_isolated_scale_failure_node_stderr={}",
-            serde_json::json!(fleet.stderr_diagnostics())
-        );
+        capture_original_failure_diagnostics(&mut fleet);
     }
     runtime.block_on(client.shutdown());
     drop(identity_source);
@@ -814,6 +791,33 @@ fn isolated_async_original_workload() {
 #[ignore = "original 1,010,000-operation separate-process Durable diagnostic; requires release and designated fs-verity"]
 fn isolated_durable_original_workload() {
     run_original(QualificationIsolatedPersistence::Durable);
+}
+
+fn capture_original_failure_diagnostics(fleet: &mut Fleet) {
+    // Capture live progress after the failed workload has relinquished its
+    // calls, before shutdown changes the observed engine/storage state.
+    let reports = std::panic::catch_unwind(AssertUnwindSafe(|| fleet.isolated_scale_reports()));
+    if let Ok(reports) = reports {
+        eprintln!(
+            "sdk_isolated_scale_failure_reports={}",
+            serde_json::json!(reports)
+        );
+    }
+    // The timed workload and its dispatched calls have already ended.
+    // Ask the existing diagnostic command for bounded WAL stage counters
+    // before shutdown; diagnostic failure must not replace the workload RED.
+    let diagnostics =
+        std::panic::catch_unwind(AssertUnwindSafe(|| fleet.all_consensus_diagnostics()));
+    if let Ok(diagnostics) = diagnostics {
+        eprintln!(
+            "sdk_isolated_scale_failure_consensus={}",
+            serde_json::json!(diagnostics)
+        );
+    }
+    eprintln!(
+        "sdk_isolated_scale_failure_node_stderr={}",
+        serde_json::json!(fleet.stderr_diagnostics())
+    );
 }
 
 // Exercise the full workload's actual encryption and public batch protocol

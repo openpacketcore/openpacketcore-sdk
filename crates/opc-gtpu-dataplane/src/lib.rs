@@ -188,12 +188,12 @@ pub use selector_namespace::{
     GtpuSessionSelectorDecommissionReadbackRequest, GtpuSessionSelectorDecommissionRequest,
     GtpuSessionSelectorEffectRequest, GtpuSessionSelectorInstallingNoEffectRequest,
     GtpuSessionSelectorNamespaceAuthority, GtpuSessionSelectorNamespaceError,
-    GtpuSessionSelectorOperation, GtpuSessionSelectorProvisionRequest,
-    GtpuSessionSelectorReadbackRequest, GtpuSessionSelectorRemovalRequest,
-    GtpuSessionSelectorRetiredClaim, GtpuSessionSelectorRetiringNoEffectRequest,
-    GtpuSessionSelectorReuseAuthorization, GtpuSessionSelectorReuseReceipt,
-    GtpuSessionSelectorReuseRequest, GtpuSessionSelectorUnadmittedClaim,
-    GTPU_SHARED_PAA_MAX_LIVE_BEARERS,
+    GtpuSessionSelectorOperation, GtpuSessionSelectorPristineReadbackRequest,
+    GtpuSessionSelectorProvisionRequest, GtpuSessionSelectorReadbackRequest,
+    GtpuSessionSelectorRemovalRequest, GtpuSessionSelectorRetiredClaim,
+    GtpuSessionSelectorRetiringNoEffectRequest, GtpuSessionSelectorReuseAuthorization,
+    GtpuSessionSelectorReuseReceipt, GtpuSessionSelectorReuseRequest,
+    GtpuSessionSelectorUnadmittedClaim, GTPU_SHARED_PAA_MAX_LIVE_BEARERS,
 };
 #[cfg(test)]
 pub(crate) use selector_namespace::{
