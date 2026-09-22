@@ -1,6 +1,7 @@
 # Draft: NETCONF required audit for exact configuration effects (#958)
 
-**Status**: Contract proposal; maintainer and independent review pending.
+**Status**: Contract proposal revised after adversarial author review. No
+independent review or complete implementation is claimed.
 
 **Date**: 2026-09-22
 
@@ -30,6 +31,21 @@ Proposed `ReadOnlyNetconfServer::with_required_config_audit` accepts the existin
 submission checks it again, because a binding can return a different bus later.
 An independently opened bus over the same datastore is not the same worker.
 The attachment grants no principal, NACM or configuration authority.
+
+The first implementation slice is an explicit writable-running profile. The
+attachment rejects a binding that enables candidate, confirmed commit or
+startup. It does not silently remove an advertised capability. The server
+rechecks this composition when dispatching each asynchronous RPC, because a
+binding can change its capability answers after construction. Configuration
+submission also checks the exact bus selected for that request. Registry-free
+synchronous helpers cannot drive the asynchronous replicated audit port and
+continue to fail closed with it.
+
+This slice covers running `edit-config`, running NMDA `edit-data`, supported
+`copy-config` to running, and the base session/registry operations below. It is
+partial delivery: candidate, startup and confirmed lifecycle obligations remain
+required for #958. The smaller profile cannot close the issue or stand in for
+their acceptance evidence.
 
 The authenticated session supplies the principal and tenant. The SDK creates
 one request identity per received RPC; the XML `message-id` is reply correlation,
@@ -83,6 +99,11 @@ this inventory. Existing legacy profiles retain their documented behavior.
 
 ## Decisions requiring review
 
+The first slice uses the existing required configuration authority and rejects
+unsupported local-effect compositions explicitly. The following full-profile
+contracts remain required before those compositions can be enabled; they are
+not delegated to an accepting application audit callback.
+
 ### Candidate preparation
 
 Candidate staging is currently volatile, but its mutation already requires
@@ -111,6 +132,11 @@ storage backend, consumer callback or local audit journal is outside scope.
 In either design, a cancelled or slow commit must not discard a subsequently
 staged generation. The final running commit has its own exact encrypted effect
 and authenticated committing principal; it cannot reuse a staging receipt.
+Candidate retirement must belong to the admitted operation's completion owner,
+not solely to the lifetime of the RPC future. Its compare-and-retire condition
+must include the staged generation and exact committed request. Dropping the
+caller after admission must not leave a success response as the only route to
+retirement or permit a second commit of an ambiguous generation.
 
 ### Startup datastore
 
@@ -137,6 +163,37 @@ may be submitted merely to discover whether a previous request committed.
 The final contract must distinguish automatic rollback attribution from the
 original initiating principal. Both must remain connected by the exact pending
 effect, without exposing request or transaction identities in diagnostics.
+Confirmation ownership must be installed by the same completion owner even if
+the initiating RPC is cancelled. The NETCONF deadline must use the persisted
+pending deadline; starting a fresh timeout after receipt would extend the
+tentative effect's lifetime. A control request must resolve its exact pending
+transaction, not whichever pending transaction exists when a delayed worker
+finally processes it. Restoration must never invent a session or persistent
+token, and automatic rollback must retain its original deadline and parent.
+
+### Atomic registry operations and asynchronous observations
+
+Lock/unlock and kill-session use an existing bounded, non-cancellable blocking
+job to keep registry checks, audit admission and mutation atomic. Their current
+hooks call synchronous `AuditSink::record`. The replicated observation sink
+deliberately refuses that entry point; simply installing its async-capable
+object does not make these hooks usable.
+
+For the required profile, the existing blocking job must await the selected
+authority's real `record_async` result before allowing its registry mutation.
+The job keeps the existing atomic permit and registry guard for that lifetime.
+An unavailable runtime, rejected audit, or panic permits no registry effect;
+dropping the RPC cannot drop an admitted job's ownership. Ordinary async RPCs
+must never block an executor thread this way. Legacy synchronous sinks keep
+their existing hook behavior. No sink acknowledges a standalone configuration
+Intent or fabricates successful admission.
+
+Registry observations are not encrypted configuration commits. A successful
+lock must leave the running version unchanged. Reads, denials, missing-session
+results and pressure rejection use the appropriate observation outcome. Any
+session termination that can trigger a confirmed rollback additionally needs
+the full-profile exact rollback contract; an observed termination is not its
+rollback receipt.
 
 ## Detector and qualification plan
 
@@ -152,6 +209,10 @@ Required follow-up evidence includes:
 
 - Every inventory row under each advertised capability combination, including
   unsupported startup composition and wrong-session/token negatives.
+- Constructor refusal for each unsupported composition, capability changes
+  after attachment, and read/lock/unlock/kill controls through the real
+  asynchronous observation authority. Audit refusal and cancellation must
+  preserve the registry's existing atomicity and admission bounds.
 - Exact-worker mismatch at construction and submission, missing capability,
   unaudited datastore, revoked authorization and non-current authority.
 - Rejected/unknown intent admission with authoritative unchanged readback;
