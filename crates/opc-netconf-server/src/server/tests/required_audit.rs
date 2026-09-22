@@ -274,8 +274,7 @@ async fn replicated_observations_alone_cannot_enable_advertised_netconf_mutation
             reply
                 .reply_xml
                 .contains("<error-tag>operation-failed</error-tag>"),
-            "mutation case {index}: {}",
-            reply.reply_xml
+            "mutation case {index}: required admission was bypassed"
         );
         assert_eq!(h.checkpoints.sequence(), 3, "mutation case {index}");
         assert_eq!(
@@ -312,7 +311,10 @@ async fn exact_bus_control_admits_one_encrypted_effect_without_a_standalone_inte
         .is_err());
     audit.submit(request, intent).await.unwrap();
     let stored = h.source.load_committed_latest().await.unwrap().unwrap();
-    assert_eq!(stored.request_id, Some(request_id));
+    assert!(
+        stored.request_id == Some(request_id),
+        "stored request binding mismatch"
+    );
     assert_eq!(stored.version, ConfigVersion::new(2));
     assert_eq!(stored.config.hostname, "fixture-control");
     assert_eq!(h.checkpoints.sequence(), 6);
@@ -359,7 +361,10 @@ async fn exact_bus_control_preserves_known_commit_and_recovers_only_its_terminal
     let (request, intent) = exact_replace(request_id, 1);
     audit.submit(request, intent).await.unwrap();
     let committed = h.source.load_committed_latest().await.unwrap().unwrap();
-    assert_eq!(committed.request_id, Some(request_id));
+    assert!(
+        committed.request_id == Some(request_id),
+        "committed request binding mismatch"
+    );
     assert_eq!(committed.version, ConfigVersion::new(2));
     assert_eq!(h.checkpoints.sequence(), 4);
 
@@ -376,9 +381,15 @@ async fn exact_bus_control_preserves_known_commit_and_recovers_only_its_terminal
     );
     assert_eq!(h.checkpoints.sequence(), 6);
     let exact = h.bus.resolve_request_id(request_id).await.unwrap().unwrap();
-    assert_eq!(exact.tx_id, committed.tx_id);
+    assert!(
+        exact.tx_id == committed.tx_id,
+        "resolved transaction binding mismatch"
+    );
     let latest = h.source.load_committed_latest().await.unwrap().unwrap();
-    assert_eq!(latest.tx_id, committed.tx_id);
+    assert!(
+        latest.tx_id == committed.tx_id,
+        "latest transaction binding mismatch"
+    );
     assert_eq!(latest.version, ConfigVersion::new(2));
     drop(audit);
     h.shutdown().await;
@@ -413,9 +424,15 @@ async fn authenticated_netconf_running_edit_reaches_the_exact_required_audit_eff
 
     // This is the desired behavior detector, not an assertion that the
     // current standalone-Intent refusal constitutes a successful handoff.
-    assert!(reply.reply_xml.contains("<ok/>"), "{}", reply.reply_xml);
-    assert_eq!(stored.request_id, Some(request_id));
-    assert_eq!(stored.principal, principal());
+    assert!(
+        reply.reply_xml.contains("<ok/>"),
+        "required NETCONF edit did not return success"
+    );
+    assert!(
+        stored.request_id == Some(request_id),
+        "NETCONF request binding mismatch"
+    );
+    assert!(stored.principal == principal(), "NETCONF caller mismatch");
     assert_eq!(stored.version, ConfigVersion::new(2));
     assert_eq!(stored.config.hostname, "fixture-edited");
     assert_eq!(
