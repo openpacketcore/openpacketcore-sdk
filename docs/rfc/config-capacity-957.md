@@ -48,7 +48,7 @@ to the repository root at the revision above.
 | --- | --- | --- |
 | Logical configuration JSON | Optional caller-configured `ConfigBus` limit; asks the model for its size. No common consensus capability limit. | `crates/opc-config-bus/src/commit.rs`, `enforce_candidate_payload_limit` |
 | Encrypted plaintext | Version-2 JSON wrapper contains config, source, replay key, apply plan, request fingerprint and request ID. Serialization allocates before consensus admission; no separate replay-byte ceiling. | `crates/opc-config-bus/src/datastore.rs`, `ConfigPlaintextV2Ref`, `EncryptingDatastore::encrypt_record` |
-| Crypto envelope | 16-byte header; key ID at most 512 bytes; nonce 12 or 24 bytes; tag 16 bytes. AAD length uses a `u32`; custody modules separately cap bound AAD at 65,536 bytes. Envelope parsing alone is not a logical-size policy. | `crates/opc-crypto/src/lib.rs`, `CryptoEnvelopeV1`; `crates/opc-key/src/{scope,custody}.rs` |
+| Crypto envelope | 16-byte header; key ID at most 512 bytes; AES-GCM-SIV nonce 12 bytes and tag 16 bytes; RemoteSeal has no envelope nonce. AAD length uses a `u32`; custody modules separately cap bound AAD at 65,536 bytes. Envelope parsing alone is not a logical-size policy. | `crates/opc-crypto/src/lib.rs`, `CryptoEnvelopeV1`; `crates/opc-key/src/{scope,custody}.rs` |
 | Fresh-write attestation | The opaque claim binds envelope bytes and plaintext digest, but carries no logical/replay length or capacity profile. Public direct attested writes need not pass through the plaintext adapter. | `crates/opc-crypto/src/lib.rs`, `AuthenticatedEnvelopeClaim`; `crates/opc-persist/src/types.rs`, `AttestedConfigCommit`; `crates/opc-persist/src/consensus/store.rs` |
 | Principal and replay lookup | Stored principal at most 16,384 bytes, including adapter JSON wrapper; replay lookup is a 64-character digest. Rollback label at most 128 bytes. Plaintext replay data remains encrypted. | `crates/opc-persist/src/consensus/types.rs`; `crates/opc-config-bus-consensus/src/lib.rs`, `PersistedBusMetadata` |
 | Configuration audit | At most 16,384 records; each path at most 8,192 bytes before and after predicate tokenization. Values become fixed redacted strings. Individual maxima do not imply their Cartesian product fits a command. | `crates/opc-persist/src/consensus/types.rs`, `PreparedConfigCommit` |
@@ -81,12 +81,12 @@ length, inspect plaintext inside consensus, or allocate the rejected encoding.
 | Complete AEAD plaintext | 1,638,400 | Logical plus replay/framing; both constituent limits also apply |
 | Bound AAD | 65,536 | Complete bound AAD, including key binding |
 | Key ID | 512 | Existing key-ID maximum |
-| Nonce | 24 | Worst supported algorithm; actual algorithm length must match |
-| Crypto framing and expansion | 66,104 | 16 header + 512 key ID + 24 nonce + 65,536 AAD + 16 tag |
-| Complete encrypted envelope | 1,704,504 | Complete plaintext plus worst crypto expansion |
+| Nonce | 12 | AES-GCM-SIV used by the bounded local-key encryption API; actual algorithm length must match |
+| Crypto framing and expansion | 66,092 | 16 header + 512 key ID + 12 nonce + 65,536 AAD + 16 tag |
+| Complete encrypted envelope | 1,704,492 | Complete plaintext plus worst crypto expansion for that API |
 | Non-envelope command metadata | 196,608 | Complete command encoding minus envelope byte content; includes the envelope length prefix, record, principal wrapper, finalized audit, operation handle/binding, resolutions, identity, request ID and maximum logical timestamp |
-| Sum of component ceilings | 1,901,112 | Envelope plus non-envelope metadata maxima; arithmetic upper bound, not evidence that every maximum is jointly reachable |
-| Complete configuration command | 1,966,080 | Dedicated hard ceiling; leaves 64,968 bytes beyond the combination above |
+| Sum of component ceilings | 1,901,100 | Envelope plus non-envelope metadata maxima; arithmetic upper bound, not evidence that every maximum is jointly reachable |
+| Complete configuration command | 1,966,080 | Dedicated hard ceiling; leaves 64,980 bytes beyond the combination above |
 | Complete private RPC | 2,097,152 | Unchanged; 131,072 bytes beyond the command ceiling for engine/forwarding framing |
 | Complete durable JSON entry | 16,777,216 | Unchanged; exact serialized-entry preflight is also mandatory |
 
@@ -125,12 +125,16 @@ contract. Missing or mismatched evidence rejects new larger-profile writes.
 Existing claims remain valid for the legacy write profile and historical read
 compatibility; they do not implicitly authorize larger-profile admission.
 
-The public construction and transfer API for this evidence is still a blocking
-design decision. The existing `AuthenticatedEnvelopeClaim` and
-`AttestedConfigCommit` do not supply it. Extending these exact boundaries needs
-an explicit ownership handoff and API review before source edits. This RFC
-does not prescribe consumer cryptography or assert that a new cryptographic
-primitive is necessary.
+The proposed construction API is `encrypt_bounded_config_envelope`, with
+`ConfigCapacityProfile::BoundedV1` and opaque `ConfigCapacityEvidence` transferred
+through the one-shot `AuthenticatedEnvelopeClaim` and `AttestedConfigCommit`.
+It validates the actual borrowed JSON bytes, including adjacent raw-value
+whitespace, and separates the config value from the version-two replay wrapper.
+No caller length or second serialization establishes the proof. The existing
+local-key AES-GCM-SIV path supplies the envelope bound above. Remote sealing
+needs a separate reviewed evidence-transfer path before it can claim this
+profile; its legacy behavior is unchanged. These APIs remain subject to review
+and qualification. No new cryptographic primitive is proposed.
 
 ## Admission and compatibility
 
