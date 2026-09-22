@@ -33,6 +33,10 @@ tracing = { workspace = true }
 uuid = { workspace = true }
 
 [dev-dependencies]
+opc-crypto = { path = "../opc-crypto", version = "0.2.0" }
+opc-session-net = { path = "../opc-session-net", version = "0.2.0" }
+opc-session-store = { path = "../opc-session-store", version = "0.2.0" }
+sha2 = { workspace = true }
 opc-consensus = { path = "../opc-consensus", version = "0.2.0" }
 opc-identity = { path = "../opc-identity", version = "0.2.0" }
 opc-key = { path = "../opc-key", version = "0.2.0" }
