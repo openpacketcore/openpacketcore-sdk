@@ -24,6 +24,9 @@ struct Checkpoints {
     refuse_from: AtomicU64,
     unknown_from: AtomicU64,
     readback_unavailable: AtomicBool,
+    pause_at: AtomicU64,
+    entered: tokio::sync::Notify,
+    resume: tokio::sync::Notify,
 }
 
 #[async_trait::async_trait]
@@ -47,6 +50,16 @@ impl AuditCheckpointPort for Checkpoints {
         let refuse_from = self.refuse_from.load(Ordering::Acquire);
         if refuse_from != 0 && next.sequence() >= refuse_from {
             return Err(AuditAuthorityError::Unavailable);
+        }
+        if self
+            .pause_at
+            .compare_exchange(next.sequence(), 0, Ordering::AcqRel, Ordering::Acquire)
+            .is_ok()
+        {
+            // The ledger intent exists; checkpoint admission has not returned.
+            // An explicit barrier controls cancellation without timing sleeps.
+            self.entered.notify_one();
+            self.resume.notified().await;
         }
         let mut current = self.value.lock().unwrap();
         if *current != expected
@@ -319,6 +332,125 @@ async fn exact_bus_control_admits_one_encrypted_effect_without_a_standalone_inte
     assert_eq!(stored.config.hostname, "fixture-control");
     assert_eq!(h.checkpoints.sequence(), 6);
     drop(audit);
+    h.shutdown().await;
+}
+
+#[tokio::test]
+async fn required_capability_distinguishes_clones_from_another_worker_over_the_same_store() {
+    let h = Harness::start().await;
+    let audit = h.bus.required_config_audit().unwrap();
+    let clone = h.bus.as_ref().clone();
+    let other = ConfigBus::restore_or_new_dev_only(
+        h.bus.current_snapshot().config.as_ref().clone(),
+        h.source.clone(),
+    )
+    .await
+    .unwrap();
+    assert!(audit.belongs_to(&clone));
+    assert!(!audit.belongs_to(&other));
+    assert_eq!(h.checkpoints.sequence(), 3);
+    drop(other);
+    drop(clone);
+    drop(audit);
+    h.shutdown().await;
+}
+
+#[tokio::test]
+async fn required_capability_refuses_each_mismatched_protocol_intent_before_admission() {
+    let h = Harness::start().await;
+    let audit = h.bus.required_config_audit().unwrap();
+    for case in 0..7 {
+        let (mut request, mut intent) = exact_replace(RequestId::new(), 1);
+        match case {
+            0 => intent.request_id = RequestId::new(),
+            1 => intent.principal = "synthetic-other".into(),
+            2 => intent.tenant = "synthetic-other".into(),
+            3 => intent.transport = TransportType::Gnmi,
+            4 => intent.operation = AuditOperation::Update,
+            5 => intent.outcome = AuditOutcome::Success,
+            6 => request.mode = CommitMode::ValidateOnly,
+            _ => unreachable!(),
+        }
+        let result = audit.submit(request, intent).await;
+        assert!(
+            matches!(result, Err(error) if error.code == CommitErrorCode::AdmissionRejected),
+            "mismatched intent case {case} was not rejected at the binding boundary"
+        );
+        assert_eq!(h.checkpoints.sequence(), 3);
+        let stored = h.source.load_committed_latest().await.unwrap().unwrap();
+        assert_eq!(stored.version, ConfigVersion::new(1));
+        assert_eq!(stored.config.hostname, "fixture-initial");
+    }
+    drop(audit);
+    h.shutdown().await;
+}
+
+#[tokio::test]
+async fn required_capability_replays_only_the_exact_request_without_a_second_effect() {
+    let h = Harness::start().await;
+    let audit = h.bus.required_config_audit().unwrap();
+    let (request, intent) = exact_replace(RequestId::new(), 1);
+    let first = audit.submit(request.clone(), intent.clone()).await.unwrap();
+    let replay = audit.submit(request.clone(), intent.clone()).await.unwrap();
+    assert!(
+        first.tx_id == replay.tx_id,
+        "request replay changed transaction"
+    );
+    assert_eq!(first.committed_revision, replay.committed_revision);
+    assert_eq!(h.checkpoints.sequence(), 6);
+
+    let mut conflict = request;
+    conflict.candidate.as_mut().unwrap().hostname = "fixture-conflict".into();
+    assert!(audit.submit(conflict, intent).await.is_err());
+    let stored = h.source.load_committed_latest().await.unwrap().unwrap();
+    assert!(
+        stored.tx_id == first.tx_id,
+        "conflicting replay changed transaction"
+    );
+    assert_eq!(stored.version, ConfigVersion::new(2));
+    assert_eq!(stored.config.hostname, "fixture-control");
+    drop(audit);
+    h.shutdown().await;
+}
+
+#[tokio::test]
+async fn cancelled_required_submitter_leaves_the_admitted_operation_with_its_worker() {
+    let h = Harness::start().await;
+    h.checkpoints.pause_at.store(4, Ordering::Release);
+    let audit = h.bus.required_config_audit().unwrap();
+    let request_id = RequestId::new();
+    let (request, intent) = exact_replace(request_id, 1);
+    let task = tokio::spawn(async move { audit.submit(request, intent).await });
+    tokio::time::timeout(Duration::from_secs(5), h.checkpoints.entered.notified())
+        .await
+        .unwrap();
+    task.abort();
+    assert!(task.await.unwrap_err().is_cancelled());
+    let before = h.source.load_committed_latest().await.unwrap().unwrap();
+    assert_eq!(before.version, ConfigVersion::new(1));
+    assert_eq!(h.checkpoints.sequence(), 3);
+
+    h.checkpoints.resume.notify_one();
+    // A validation request on the same sequenced worker is an event-driven
+    // completion barrier. It adds no configuration effect or audit terminal.
+    let (mut barrier, _) = exact_replace(RequestId::new(), 2);
+    barrier.mode = CommitMode::ValidateOnly;
+    tokio::time::timeout(Duration::from_secs(5), h.bus.submit(barrier))
+        .await
+        .unwrap()
+        .unwrap();
+    let recovered = h.bus.resolve_request_id(request_id).await.unwrap().unwrap();
+    let stored = h.source.load_committed_latest().await.unwrap().unwrap();
+    assert!(
+        stored.request_id == Some(request_id),
+        "cancelled request binding mismatch"
+    );
+    assert!(
+        stored.tx_id == recovered.tx_id,
+        "cancelled result binding mismatch"
+    );
+    assert_eq!(stored.version, ConfigVersion::new(2));
+    assert_eq!(h.checkpoints.sequence(), 6);
     h.shutdown().await;
 }
 
