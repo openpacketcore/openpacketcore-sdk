@@ -43,6 +43,7 @@ tokio-rustls = { workspace = true }
 tracing = { workspace = true }
 
 [dev-dependencies]
+opc-consensus = { path = "../opc-consensus", version = "0.2.0" }
 opc-config-bus-consensus = { path = "../opc-config-bus-consensus", version = "0.2.0" }
 async-trait = { workspace = true }
 futures-executor = "0.3"

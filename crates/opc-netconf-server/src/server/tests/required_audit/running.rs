@@ -93,8 +93,12 @@ fn unattached(binding: RunningBinding) -> RequiredServer {
 }
 
 pub(super) fn required_server(h: &Harness) -> RequiredServer {
-    unattached(RunningBinding::new(h.bus.clone()))
-        .with_required_config_audit(h.bus.required_config_audit().unwrap())
+    required_server_for_bus(h.bus.clone())
+}
+
+pub(super) fn required_server_for_bus(bus: Arc<ConfigBus<DemoConfig>>) -> RequiredServer {
+    unattached(RunningBinding::new(bus.clone()))
+        .with_required_config_audit(bus.required_config_audit().unwrap())
         .unwrap()
 }
 

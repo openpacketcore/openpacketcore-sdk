@@ -3223,6 +3223,7 @@ dependencies = [
  "opc-config-bus",
  "opc-config-bus-consensus",
  "opc-config-model",
+ "opc-consensus",
  "opc-identity",
  "opc-key",
  "opc-mgmt-audit",
