@@ -41,11 +41,16 @@ submission also checks the exact bus selected for that request. Registry-free
 synchronous helpers cannot drive the asynchronous replicated audit port and
 continue to fail closed with it.
 
-This slice covers running `edit-config`, running NMDA `edit-data`, supported
-`copy-config` to running, and the base session/registry operations below. It is
-partial delivery: candidate, startup and confirmed lifecycle obligations remain
-required for #958. The smaller profile cannot close the issue or stand in for
-their acceptance evidence.
+This slice covers running `edit-config`, running NMDA `edit-data`, and the base
+session/registry operations below. The copy-to-running effect helper uses the
+same required submitter, but this profile has no supported distinct source:
+candidate and startup are refused, and inline XML copy sources are unsupported.
+Same-datastore copy is invalid under RFC 6241 section 7.3. Helper qualification
+cannot establish positive wire-protocol copy coverage.
+
+This is partial delivery: copy, candidate, startup and confirmed lifecycle
+obligations remain required for #958. The smaller profile cannot close the issue
+or stand in for their acceptance evidence.
 
 The authenticated session supplies the principal and tenant. The SDK creates
 one request identity per received RPC; the XML `message-id` is reply correlation,
