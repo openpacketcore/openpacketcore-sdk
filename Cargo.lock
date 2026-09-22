@@ -3221,6 +3221,7 @@ dependencies = [
  "futures-executor",
  "futures-util",
  "opc-config-bus",
+ "opc-config-bus-consensus",
  "opc-config-model",
  "opc-identity",
  "opc-key",

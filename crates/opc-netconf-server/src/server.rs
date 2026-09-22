@@ -7473,6 +7473,7 @@ mod tests {
     #![allow(clippy::unwrap_used, clippy::expect_used)]
 
     mod mutation_audit;
+    mod required_audit;
 
     use std::collections::{HashSet, VecDeque};
     use std::net::SocketAddr;
