@@ -51,6 +51,24 @@ pub const CONFIG_CONSENSUS_SNAPSHOT_VERSION: u16 = 5;
 /// an exact match and do not negotiate a downgrade.
 pub const CONFIG_CONSENSUS_WIRE_VERSION: u16 = 7;
 
+/// The opt-in profile has distinct on-disk and snapshot revisions. Existing
+/// constants and legacy encodings remain unchanged; there is no migration.
+pub(crate) const fn config_storage_revision(profile: opc_crypto::ConfigCapacityProfile) -> u16 {
+    match profile {
+        opc_crypto::ConfigCapacityProfile::Legacy => CONFIG_CONSENSUS_STORAGE_VERSION,
+        opc_crypto::ConfigCapacityProfile::BoundedV1 => 6,
+        _ => 0,
+    }
+}
+
+pub(crate) const fn config_snapshot_revision(profile: opc_crypto::ConfigCapacityProfile) -> u16 {
+    match profile {
+        opc_crypto::ConfigCapacityProfile::Legacy => CONFIG_CONSENSUS_SNAPSHOT_VERSION,
+        opc_crypto::ConfigCapacityProfile::BoundedV1 => 6,
+        _ => 0,
+    }
+}
+
 /// Maximum configured voter count admitted by the config consensus adapter.
 pub const CONFIG_CONSENSUS_MAX_MEMBERS: usize = 9;
 

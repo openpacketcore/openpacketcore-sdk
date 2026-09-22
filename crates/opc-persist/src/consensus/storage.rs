@@ -10,6 +10,9 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 
+use hmac::{Hmac, KeyInit, Mac};
+use opc_crypto::ConfigCapacityProfile;
+
 use opc_consensus::engine::storage::{LogFlushed, RaftLogStorage, RaftStateMachine};
 use opc_consensus::engine::{
     Entry, ErrorSubject, ErrorVerb, LogId, LogState, RaftLogReader, RaftSnapshotBuilder, Snapshot,
@@ -23,6 +26,7 @@ use tokio::io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt};
 use super::snapshot_file::ConfigSnapshotFile;
 use super::{sqlite, ApprovedLegacyConfigRecovery, ConfigConsensusResponse, ConfigRaftTypeConfig};
 use crate::backend::SqliteBackend;
+use crate::types::AuditKey;
 
 const SNAPSHOT_FOOTER_MAGIC: &[u8; 8] = b"OPCCFG01";
 const SNAPSHOT_FOOTER_BYTES: u64 = 8 + 2 + 8 + 32;
@@ -499,11 +503,13 @@ async fn validate_and_clean_snapshot_directory(
         if !file_type.is_file() {
             return Err(ConfigConsensusStorageError::CorruptState);
         }
-        let (_, checksum, length) =
-            tokio::time::timeout(SNAPSHOT_OPERATION_TIMEOUT, verify_snapshot_envelope(&path))
-                .await
-                .map_err(|_| ConfigConsensusStorageError::BackendUnavailable)?
-                .map_err(|_| ConfigConsensusStorageError::CorruptState)?;
+        let (_, checksum, length) = tokio::time::timeout(
+            SNAPSHOT_OPERATION_TIMEOUT,
+            verify_snapshot_envelope(&path, core.capacity_profile, core.identity, &core.audit_key),
+        )
+        .await
+        .map_err(|_| ConfigConsensusStorageError::BackendUnavailable)?
+        .map_err(|_| ConfigConsensusStorageError::CorruptState)?;
         if checksum != *expected_checksum || length != *expected_length {
             return Err(ConfigConsensusStorageError::CorruptState);
         }
@@ -976,23 +982,30 @@ impl RaftStateMachine<ConfigRaftTypeConfig> for SqliteConfigStateMachine {
             snapshot.disarm_cleanup();
             drop(snapshot);
             let _incoming_cleanup = StagingArtifact::file(incoming.clone());
-            let (payload_length, checksum, total_length) =
-                tokio::time::timeout_at(deadline, verify_snapshot_envelope(&incoming))
-                    .await
-                    .map_err(|_| {
-                        storage_error(
-                            ErrorSubject::Snapshot(Some(meta.signature())),
-                            ErrorVerb::Read,
-                            sqlite::invalid_data("config consensus snapshot install timed out"),
-                        )
-                    })?
-                    .map_err(|error| {
-                        storage_error(
-                            ErrorSubject::Snapshot(Some(meta.signature())),
-                            ErrorVerb::Read,
-                            error,
-                        )
-                    })?;
+            let (payload_length, checksum, total_length) = tokio::time::timeout_at(
+                deadline,
+                verify_snapshot_envelope(
+                    &incoming,
+                    self.core.capacity_profile,
+                    self.core.identity,
+                    &self.core.audit_key,
+                ),
+            )
+            .await
+            .map_err(|_| {
+                storage_error(
+                    ErrorSubject::Snapshot(Some(meta.signature())),
+                    ErrorVerb::Read,
+                    sqlite::invalid_data("config consensus snapshot install timed out"),
+                )
+            })?
+            .map_err(|error| {
+                storage_error(
+                    ErrorSubject::Snapshot(Some(meta.signature())),
+                    ErrorVerb::Read,
+                    error,
+                )
+            })?;
             let raw = self
                 .core
                 .snapshot_dir
@@ -1044,6 +1057,7 @@ impl RaftStateMachine<ConfigRaftTypeConfig> for SqliteConfigStateMachine {
             let identity = self.core.identity;
             let members = self.core.expected_members.clone();
             let audit_key = self.core.audit_key.clone();
+            let capacity_profile = self.core.capacity_profile;
             let raw_for_install = raw.clone();
             let meta_for_install = meta.clone();
             let file_name_for_install = file_name.clone();
@@ -1056,6 +1070,7 @@ impl RaftStateMachine<ConfigRaftTypeConfig> for SqliteConfigStateMachine {
                         identity,
                         &members,
                         &audit_key,
+                        capacity_profile,
                         &raw_for_install,
                         &meta_for_install,
                         &file_name_for_install,
@@ -1108,23 +1123,30 @@ impl RaftStateMachine<ConfigRaftTypeConfig> for SqliteConfigStateMachine {
             return Ok(None);
         };
         let path = self.core.snapshot_dir.join(file_name);
-        let (_, checksum, length) =
-            tokio::time::timeout(SNAPSHOT_OPERATION_TIMEOUT, verify_snapshot_envelope(&path))
-                .await
-                .map_err(|_| {
-                    storage_error(
-                        ErrorSubject::Snapshot(Some(meta.signature())),
-                        ErrorVerb::Read,
-                        sqlite::invalid_data("config consensus snapshot verification timed out"),
-                    )
-                })?
-                .map_err(|error| {
-                    storage_error(
-                        ErrorSubject::Snapshot(Some(meta.signature())),
-                        ErrorVerb::Read,
-                        error,
-                    )
-                })?;
+        let (_, checksum, length) = tokio::time::timeout(
+            SNAPSHOT_OPERATION_TIMEOUT,
+            verify_snapshot_envelope(
+                &path,
+                self.core.capacity_profile,
+                self.core.identity,
+                &self.core.audit_key,
+            ),
+        )
+        .await
+        .map_err(|_| {
+            storage_error(
+                ErrorSubject::Snapshot(Some(meta.signature())),
+                ErrorVerb::Read,
+                sqlite::invalid_data("config consensus snapshot verification timed out"),
+            )
+        })?
+        .map_err(|error| {
+            storage_error(
+                ErrorSubject::Snapshot(Some(meta.signature())),
+                ErrorVerb::Read,
+                error,
+            )
+        })?;
         if checksum != expected_checksum || length != expected_length {
             return Err(storage_error(
                 ErrorSubject::Snapshot(Some(meta.signature())),
@@ -1179,6 +1201,7 @@ impl RaftSnapshotBuilder<ConfigRaftTypeConfig> for SqliteConfigSnapshotBuilder {
         let identity = self.core.identity;
         let members = self.core.expected_members.clone();
         let audit_key = self.core.audit_key.clone();
+        let capacity_profile = self.core.capacity_profile;
         let raw_for_build = raw.clone();
         let (last_log_id, last_membership) = self
             .core
@@ -1188,6 +1211,7 @@ impl RaftSnapshotBuilder<ConfigRaftTypeConfig> for SqliteConfigSnapshotBuilder {
                     identity,
                     &members,
                     &audit_key,
+                    capacity_profile,
                     &raw_for_build,
                     cancellation,
                 )
@@ -1201,19 +1225,25 @@ impl RaftSnapshotBuilder<ConfigRaftTypeConfig> for SqliteConfigSnapshotBuilder {
             .core
             .snapshot_dir
             .join(format!("snapshot-{snapshot_id}.part"));
-        let (checksum, length, mut final_cleanup) =
-            tokio::time::timeout_at(deadline, envelope_snapshot_database(&raw, &staging))
-                .await
-                .map_err(|_| {
-                    storage_error(
-                        ErrorSubject::Snapshot(None),
-                        ErrorVerb::Write,
-                        sqlite::invalid_data("config consensus snapshot build timed out"),
-                    )
-                })?
-                .map_err(|error| {
-                    storage_error(ErrorSubject::Snapshot(None), ErrorVerb::Write, error)
-                })?;
+        let (checksum, length, mut final_cleanup) = tokio::time::timeout_at(
+            deadline,
+            envelope_snapshot_database(
+                &raw,
+                &staging,
+                self.core.capacity_profile,
+                self.core.identity,
+                &self.core.audit_key,
+            ),
+        )
+        .await
+        .map_err(|_| {
+            storage_error(
+                ErrorSubject::Snapshot(None),
+                ErrorVerb::Write,
+                sqlite::invalid_data("config consensus snapshot build timed out"),
+            )
+        })?
+        .map_err(|error| storage_error(ErrorSubject::Snapshot(None), ErrorVerb::Write, error))?;
         std::fs::rename(&staging, &final_path).map_err(|error| {
             storage_error(ErrorSubject::Snapshot(None), ErrorVerb::Write, error)
         })?;
@@ -1294,9 +1324,86 @@ impl RaftSnapshotBuilder<ConfigRaftTypeConfig> for SqliteConfigSnapshotBuilder {
     }
 }
 
+/// Legacy snapshots retain their exact checksum. The bounded profile uses the
+/// same 32-byte field for a domain-separated MAC, so changing an unkeyed footer
+/// or SQLite profile row cannot relabel an existing snapshot as a new profile.
+enum SnapshotIntegrity {
+    Legacy(Sha256),
+    Bounded(Hmac<Sha256>),
+}
+
+impl SnapshotIntegrity {
+    fn new(
+        profile: ConfigCapacityProfile,
+        identity: ConsensusIdentity,
+        audit_key: &AuditKey,
+    ) -> io::Result<Self> {
+        match profile {
+            ConfigCapacityProfile::Legacy => Ok(Self::Legacy(Sha256::new())),
+            ConfigCapacityProfile::BoundedV1 => {
+                let mut mac = <Hmac<Sha256> as KeyInit>::new_from_slice(audit_key.as_bytes())
+                    .map_err(|_| sqlite::invalid_data("config snapshot key is unavailable"))?;
+                mac.update(b"openpacketcore/config-snapshot-capacity/v1\0");
+                mac.update(&profile.revision().to_be_bytes());
+                mac.update(identity.cluster_id().as_bytes());
+                mac.update(identity.configuration_id().as_bytes());
+                mac.update(&identity.configuration_epoch().get().to_be_bytes());
+                mac.update(&audit_key.epoch().to_be_bytes());
+                Ok(Self::Bounded(mac))
+            }
+            _ => Err(sqlite::invalid_data(
+                "config snapshot profile is unsupported",
+            )),
+        }
+    }
+
+    fn update(&mut self, bytes: &[u8]) {
+        match self {
+            Self::Legacy(digest) => digest.update(bytes),
+            Self::Bounded(mac) => mac.update(bytes),
+        }
+    }
+
+    fn bind_footer(&mut self, length: u64) {
+        if let Self::Bounded(mac) = self {
+            mac.update(SNAPSHOT_FOOTER_MAGIC);
+            mac.update(
+                &super::types::config_snapshot_revision(ConfigCapacityProfile::BoundedV1)
+                    .to_be_bytes(),
+            );
+            mac.update(&length.to_be_bytes());
+        }
+    }
+
+    fn finish(mut self, length: u64) -> [u8; 32] {
+        self.bind_footer(length);
+        match self {
+            Self::Legacy(digest) => digest.finalize().into(),
+            Self::Bounded(mac) => mac.finalize().into_bytes().into(),
+        }
+    }
+
+    fn verify(mut self, length: u64, expected: &[u8; 32]) -> io::Result<()> {
+        self.bind_footer(length);
+        let valid = match self {
+            Self::Legacy(digest) => <[u8; 32]>::from(digest.finalize()) == *expected,
+            Self::Bounded(mac) => mac.verify_slice(expected).is_ok(),
+        };
+        if !valid {
+            return Err(sqlite::invalid_data(
+                "config consensus snapshot integrity mismatch",
+            ));
+        }
+        Ok(())
+    }
+}
+
 async fn envelope_snapshot_database(
     raw: &Path,
     output: &Path,
+    profile: ConfigCapacityProfile,
+    identity: ConsensusIdentity,
+    audit_key: &AuditKey,
 ) -> io::Result<([u8; 32], u64, StagingArtifact)> {
     let metadata = tokio::fs::metadata(raw).await?;
     if metadata.len() == 0 || metadata.len() > SNAPSHOT_MAX_BYTES {
@@ -1312,7 +1419,7 @@ async fn envelope_snapshot_database(
         .await?;
     set_private_file_permissions(output)?;
     let cleanup = StagingArtifact::file(output.to_path_buf());
-    let mut hasher = Sha256::new();
+    let mut hasher = SnapshotIntegrity::new(profile, identity, audit_key)?;
     let mut copied = 0_u64;
     let mut buffer = vec![0_u8; 1024 * 1024];
     loop {
@@ -1339,10 +1446,10 @@ async fn envelope_snapshot_database(
             "config consensus snapshot copy length mismatch",
         ));
     }
-    let checksum: [u8; 32] = hasher.finalize().into();
+    let checksum = hasher.finish(copied);
     destination.write_all(SNAPSHOT_FOOTER_MAGIC).await?;
     destination
-        .write_all(&super::types::CONFIG_CONSENSUS_SNAPSHOT_VERSION.to_be_bytes())
+        .write_all(&super::types::config_snapshot_revision(profile).to_be_bytes())
         .await?;
     destination.write_all(&copied.to_be_bytes()).await?;
     destination.write_all(&checksum).await?;
@@ -1353,7 +1460,12 @@ async fn envelope_snapshot_database(
     Ok((checksum, total, cleanup))
 }
 
-async fn verify_snapshot_envelope(path: &Path) -> io::Result<(u64, [u8; 32], u64)> {
+async fn verify_snapshot_envelope(
+    path: &Path,
+    profile: ConfigCapacityProfile,
+    identity: ConsensusIdentity,
+    audit_key: &AuditKey,
+) -> io::Result<(u64, [u8; 32], u64)> {
     let source = open_read_nofollow(path)?;
     let metadata = source.metadata()?;
     let total = metadata.len();
@@ -1374,7 +1486,7 @@ async fn verify_snapshot_envelope(path: &Path) -> io::Result<(u64, [u8; 32], u64
     }
     let mut revision = [0_u8; 2];
     file.read_exact(&mut revision).await?;
-    if u16::from_be_bytes(revision) != super::types::CONFIG_CONSENSUS_SNAPSHOT_VERSION {
+    if u16::from_be_bytes(revision) != super::types::config_snapshot_revision(profile) {
         return Err(sqlite::invalid_data(
             "config consensus snapshot revision is unsupported",
         ));
@@ -1390,7 +1502,7 @@ async fn verify_snapshot_envelope(path: &Path) -> io::Result<(u64, [u8; 32], u64
     file.read_exact(&mut expected).await?;
     file.seek(io::SeekFrom::Start(0)).await?;
     let mut remaining = payload_length;
-    let mut hasher = Sha256::new();
+    let mut hasher = SnapshotIntegrity::new(profile, identity, audit_key)?;
     let mut buffer = vec![0_u8; 1024 * 1024];
     while remaining > 0 {
         let requested = usize::try_from(remaining.min(buffer.len() as u64))
@@ -1406,13 +1518,8 @@ async fn verify_snapshot_envelope(path: &Path) -> io::Result<(u64, [u8; 32], u64
             .map_err(|_| sqlite::invalid_data("config consensus snapshot read overflow"))?;
         hasher.update(&buffer[..read]);
     }
-    let actual: [u8; 32] = hasher.finalize().into();
-    if actual != expected {
-        return Err(sqlite::invalid_data(
-            "config consensus snapshot checksum mismatch",
-        ));
-    }
-    Ok((payload_length, actual, total))
+    hasher.verify(payload_length, &expected)?;
+    Ok((payload_length, expected, total))
 }
 
 async fn extract_snapshot_database(
@@ -1490,6 +1597,9 @@ async fn remove_old_snapshot(
         }
     }
 }
+
+#[cfg(all(test, target_os = "linux"))]
+mod config_capacity_snapshot_tests;
 
 #[cfg(test)]
 mod tests {
@@ -2818,9 +2928,14 @@ mod tests {
             .expect("write future revision");
         file.sync_all().expect("sync future revision");
 
-        let error = verify_snapshot_envelope(&path)
-            .await
-            .expect_err("future snapshot revision must fail closed");
+        let error = verify_snapshot_envelope(
+            &path,
+            ConfigCapacityProfile::Legacy,
+            identity(),
+            backend.audit_key(),
+        )
+        .await
+        .expect_err("future snapshot revision must fail closed");
         assert_eq!(io::ErrorKind::InvalidData, error.kind());
     }
 

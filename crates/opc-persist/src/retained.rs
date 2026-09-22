@@ -514,6 +514,7 @@ fn open_authority_sync(
             &conn,
             options.binding.topology(),
             &audit_key,
+            options.binding.capacity_profile(),
             work.deadline,
         )
         .map_err(|_| RetainedConfigError::Rejected)?;
@@ -806,6 +807,7 @@ fn validate_connection(
         conn,
         options.binding.topology(),
         key,
+        options.binding.capacity_profile(),
         work.deadline,
     )
     .map_err(|_| RetainedConfigError::Rejected)?;

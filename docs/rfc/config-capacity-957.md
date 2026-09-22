@@ -194,6 +194,21 @@ snapshot does not establish compatibility. These are additional exact-symbol
 handoff and implementation prerequisites. Provision the new profile explicitly;
 an existing store is not silently promoted. Any migration needs its own reviewed
 procedure and compatibility evidence.
+
+The proposed profile uses config RPC revision 8 and SQLite/snapshot revision 6;
+legacy callers keep RPC revision 7 and SQLite/snapshot revision 5. The snapshot
+body's identity row must match the selected storage revision before replacing
+receiver authority. Its 50-byte footer keeps the existing layout; for revision
+6 the 32-byte integrity field is HMAC-SHA-256 using the existing configuration
+audit key under a distinct snapshot-capacity domain. It binds the profile,
+cluster/configuration/epoch, key epoch, complete body and footer prefix. Legacy
+revision 5 keeps its exact SHA-256 checksum. A revised footer alone cannot
+authorize a legacy body in the larger profile. Private bounded staging may be
+needed to validate a complete incoming body; rejected staging is removed and
+cannot replace the receiver's authority or local admission binding. Snapshot
+size, copy-buffer and operation-deadline limits remain unchanged. These format
+checks require runtime qualification in addition to authenticated transport.
+
 Shared transport and session profiles remain byte-identical.
 
 ## Resource and recovery contract

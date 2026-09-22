@@ -18,13 +18,14 @@ use opc_consensus::{
     AppendEntriesBatchAccumulator, AppendEntriesBatchDecision, ConsensusEntryDigest,
     ConsensusIdentity, ConsensusNodeId,
 };
+use opc_crypto::ConfigCapacityProfile;
 use opc_types::Timestamp;
 use rusqlite::{params, Connection, OptionalExtension, Transaction, TransactionBehavior};
 use serde::Serialize;
 use sha2::{Digest, Sha256};
 
 use super::storage::ConfigConsensusStorageError;
-use super::types::{CONFIG_CONSENSUS_STORAGE_VERSION, LEGACY_CONFIG_CONSENSUS_COMMAND_VERSION};
+use super::types::{config_storage_revision, LEGACY_CONFIG_CONSENSUS_COMMAND_VERSION};
 use super::{
     ApprovedLegacyConfigRecovery, ConfigConsensusResponse, ConfigMutationFailure,
     ConfigMutationIntent, ConfigRaftTypeConfig,
@@ -293,6 +294,7 @@ const LEGACY_RAFT_TABLES: &[&str] = &[
 pub(crate) struct ConfigConsensusCore {
     pub(crate) conn: Arc<tokio::sync::Mutex<crate::backend::BackendConnection>>,
     pub(crate) identity: ConsensusIdentity,
+    pub(crate) capacity_profile: ConfigCapacityProfile,
     pub(crate) expected_members: Arc<BTreeSet<ConsensusNodeId>>,
     pub(crate) snapshot_dir: Arc<PathBuf>,
     pub(crate) snapshot_gate: Arc<tokio::sync::Mutex<()>>,
@@ -391,6 +393,12 @@ impl ConfigConsensusCore {
         let worker_audit_key = backend.audit_key().clone();
         let worker_backend = backend.clone();
         let retained = backend.retained_binding.is_some();
+        let capacity_profile = backend
+            .retained_binding
+            .as_ref()
+            .map_or(ConfigCapacityProfile::Legacy, |binding| {
+                binding.capacity_profile()
+            });
         let cancellation = Arc::new(SqliteWorkCancellation::with_deadline(std_deadline));
         let mut cancel_on_drop = SqliteWorkCancelOnDrop::new(cancellation.clone());
         let worker_cancellation = cancellation.clone();
@@ -409,16 +417,18 @@ impl ConfigConsensusCore {
                         identity,
                         &worker_members,
                         &worker_audit_key,
+                        capacity_profile,
                         false,
                         &worker_cancellation,
                     )
                 }
             } else {
-                initialize_schema(
+                initialize_schema_for_profile(
                     &worker_conn,
                     identity,
                     &worker_members,
                     &worker_audit_key,
+                    capacity_profile,
                     recovery.as_ref(),
                     &worker_cancellation,
                     before_commit,
@@ -460,6 +470,7 @@ impl ConfigConsensusCore {
         Ok(Self {
             conn,
             identity,
+            capacity_profile,
             expected_members: Arc::new(expected_members),
             snapshot_dir: Arc::new(snapshot_dir),
             snapshot_gate: Arc::new(tokio::sync::Mutex::new(())),
@@ -656,13 +667,15 @@ pub(crate) fn provision_retained_schema(
     conn: &Connection,
     topology: &super::ConfigConsensusTopology,
     audit_key: &AuditKey,
+    capacity_profile: ConfigCapacityProfile,
     deadline: std::time::Instant,
 ) -> Result<(), ConfigConsensusStorageError> {
-    initialize_schema(
+    initialize_schema_for_profile(
         conn,
         topology.identity(),
         topology.members(),
         audit_key,
+        capacity_profile,
         None,
         &Arc::new(SqliteWorkCancellation::with_deadline(deadline)),
         None,
@@ -674,6 +687,7 @@ pub(crate) fn validate_retained_schema(
     conn: &Connection,
     topology: &super::ConfigConsensusTopology,
     audit_key: &AuditKey,
+    capacity_profile: ConfigCapacityProfile,
     deadline: std::time::Instant,
 ) -> Result<(), ConfigConsensusStorageError> {
     validate_existing_schema(
@@ -681,16 +695,41 @@ pub(crate) fn validate_retained_schema(
         topology.identity(),
         topology.members(),
         audit_key,
+        capacity_profile,
         false,
         &SqliteWorkCancellation::with_deadline(deadline),
     )
 }
 
+#[cfg(test)]
 fn initialize_schema(
     conn: &Connection,
     identity: ConsensusIdentity,
     expected_members: &BTreeSet<ConsensusNodeId>,
     audit_key: &AuditKey,
+    recovery: Option<&StagedLegacyRecovery>,
+    cancellation: &Arc<SqliteWorkCancellation>,
+    before_commit: Option<InitializationCommitHook>,
+) -> Result<(), ConfigConsensusStorageError> {
+    initialize_schema_for_profile(
+        conn,
+        identity,
+        expected_members,
+        audit_key,
+        ConfigCapacityProfile::Legacy,
+        recovery,
+        cancellation,
+        before_commit,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn initialize_schema_for_profile(
+    conn: &Connection,
+    identity: ConsensusIdentity,
+    expected_members: &BTreeSet<ConsensusNodeId>,
+    audit_key: &AuditKey,
+    capacity_profile: ConfigCapacityProfile,
     recovery: Option<&StagedLegacyRecovery>,
     cancellation: &Arc<SqliteWorkCancellation>,
     before_commit: Option<InitializationCommitHook>,
@@ -709,6 +748,7 @@ fn initialize_schema(
         identity,
         expected_members,
         audit_key,
+        capacity_profile,
         recovery,
         cancellation,
         before_commit,
@@ -722,11 +762,13 @@ fn initialize_schema(
     result
 }
 
+#[allow(clippy::too_many_arguments)]
 fn initialize_schema_transaction(
     conn: &Connection,
     identity: ConsensusIdentity,
     expected_members: &BTreeSet<ConsensusNodeId>,
     audit_key: &AuditKey,
+    capacity_profile: ConfigCapacityProfile,
     recovery: Option<&StagedLegacyRecovery>,
     cancellation: &SqliteWorkCancellation,
     before_commit: Option<InitializationCommitHook>,
@@ -756,7 +798,7 @@ fn initialize_schema_transaction(
         tx.execute(
             "INSERT INTO config_raft_identity (singleton, schema_version, cluster_id, configuration_id, configuration_epoch, audit_key_epoch, audit_key_fingerprint, schema_manifest_digest) VALUES (1, ?1, ?2, ?3, ?4, ?5, ?6, ?7)",
             params![
-                i64::from(CONFIG_CONSENSUS_STORAGE_VERSION),
+                i64::from(config_storage_revision(capacity_profile)),
                 identity.cluster_id().as_bytes().as_slice(),
                 identity.configuration_id().as_bytes().as_slice(),
                 epoch,
@@ -798,6 +840,7 @@ fn initialize_schema_transaction(
             identity,
             expected_members,
             audit_key,
+            capacity_profile,
             false,
             cancellation,
         )?;
@@ -808,6 +851,7 @@ fn initialize_schema_transaction(
             identity,
             expected_members,
             audit_key,
+            capacity_profile,
             false,
             cancellation,
         )?;
@@ -1105,6 +1149,7 @@ fn validate_existing_schema(
     identity: ConsensusIdentity,
     expected_members: &BTreeSet<ConsensusNodeId>,
     audit_key: &AuditKey,
+    capacity_profile: ConfigCapacityProfile,
     allow_detached_snapshot: bool,
     cancellation: &SqliteWorkCancellation,
 ) -> Result<(), ConfigConsensusStorageError> {
@@ -1127,7 +1172,7 @@ fn validate_existing_schema(
         .optional()
         .map_err(|_| ConfigConsensusStorageError::BackendUnavailable)?
         .ok_or(ConfigConsensusStorageError::CorruptState)?;
-    if row.0 != i64::from(CONFIG_CONSENSUS_STORAGE_VERSION) {
+    if row.0 != i64::from(config_storage_revision(capacity_profile)) {
         return Err(ConfigConsensusStorageError::SchemaVersionMismatch);
     }
     if row.1.as_slice() != identity.cluster_id().as_bytes()
@@ -3414,6 +3459,7 @@ pub(crate) fn build_snapshot_database_sync(
         identity,
         expected_members,
         audit_key,
+        ConfigCapacityProfile::Legacy,
         path,
         &Arc::new(SqliteWorkCancellation::new()),
     )
@@ -3424,6 +3470,7 @@ pub(crate) fn build_snapshot_database_cancellable_sync(
     identity: ConsensusIdentity,
     expected_members: &BTreeSet<ConsensusNodeId>,
     audit_key: &AuditKey,
+    capacity_profile: ConfigCapacityProfile,
     path: &Path,
     cancellation: &Arc<SqliteWorkCancellation>,
 ) -> io::Result<AppliedMembership> {
@@ -3472,6 +3519,7 @@ pub(crate) fn build_snapshot_database_cancellable_sync(
         identity,
         expected_members,
         audit_key,
+        capacity_profile,
         true,
         cancellation,
     )
@@ -3521,6 +3569,7 @@ fn validate_snapshot_database_sync(
     identity: ConsensusIdentity,
     expected_members: &BTreeSet<ConsensusNodeId>,
     audit_key: &AuditKey,
+    capacity_profile: ConfigCapacityProfile,
     meta: &SnapshotMeta<ConsensusNodeId, EmptyNode>,
     cancellation: &Arc<SqliteWorkCancellation>,
 ) -> io::Result<Connection> {
@@ -3552,6 +3601,7 @@ fn validate_snapshot_database_sync(
         identity,
         expected_members,
         audit_key,
+        capacity_profile,
         true,
         cancellation,
     )
@@ -3593,6 +3643,7 @@ pub(crate) fn install_snapshot_database_sync(
         identity,
         expected_members,
         audit_key,
+        ConfigCapacityProfile::Legacy,
         snapshot_db_path,
         meta,
         final_file_name,
@@ -3608,6 +3659,7 @@ pub(crate) fn install_snapshot_database_cancellable_sync(
     identity: ConsensusIdentity,
     expected_members: &BTreeSet<ConsensusNodeId>,
     audit_key: &AuditKey,
+    capacity_profile: ConfigCapacityProfile,
     snapshot_db_path: &Path,
     meta: &SnapshotMeta<ConsensusNodeId, EmptyNode>,
     final_file_name: &str,
@@ -3620,6 +3672,7 @@ pub(crate) fn install_snapshot_database_cancellable_sync(
         identity,
         expected_members,
         audit_key,
+        capacity_profile,
         meta,
         cancellation,
     )?;
