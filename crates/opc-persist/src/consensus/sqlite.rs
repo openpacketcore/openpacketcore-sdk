@@ -2335,6 +2335,26 @@ pub(crate) fn read_machine_sync(
     ))
 }
 
+pub(super) async fn read_commit_outcome_until(
+    backend: &SqliteBackend,
+    identity: ConsensusIdentity,
+    request_id: opc_consensus::ConsensusRequestId,
+    deadline: tokio::time::Instant,
+) -> io::Result<Option<([u8; 32], ConfigConsensusResponse)>> {
+    run_sqlite_worker_until(
+        backend.config_consensus_worker_gate(),
+        backend.conn(),
+        deadline,
+        move |conn, cancellation| {
+            cancellation.check_io()?;
+            let outcome = read_outcome_sync(conn, identity, request_id)?;
+            cancellation.check_io()?;
+            Ok(outcome)
+        },
+    )
+    .await
+}
+
 fn read_outcome_sync(
     conn: &Connection,
     identity: ConsensusIdentity,

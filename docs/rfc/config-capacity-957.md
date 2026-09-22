@@ -240,9 +240,28 @@ oversize body/footer and concurrent operations without relaxing timeouts.
 Retained reopen uses the same original identities, paths and durability mode;
 creating new storage is not reopen evidence.
 
-Ordinary exact-operation recovery needs a public caller-scoped, read-only
-lookup contract; the current internal result cache and mutation retry API do
-not supply it. Qualify recovery within its existing 4,096-applied-sequence
+Ordinary exact-operation recovery uses the proposed public
+`PreparedConfigCommitOperation`, `ConfigCommitRecoveryHandle` and
+`ConfigCommitRecoveryOutcome` types. `prepare_recoverable_commit` consumes an
+attested ordinary append or confirmed-resolution successor once, finalizes its
+audit metadata and binds the caller-chosen original request ID before sending.
+`append_prepared_commit` preserves forwarding and
+`append_prepared_commit_local` requires the local leader. Both consume the
+prepared operation; its handle is available beforehand. The existing mutation
+retry API retains its behavior.
+
+The version-one handle is exactly **200 bytes**, with no public field setters or
+serde constructor. It binds authority, immutable capacity profile, key epoch,
+original request ID, prepared-payload digest and a purpose-separated keyed caller
+binding. An existing-key HMAC authenticates the complete fixed encoding under a
+distinct recovery domain. Parsing validates only the exact framing;
+`lookup_commit_operation` authenticates scope and a separately trusted caller
+before its quorum barrier and read-only outcome lookup. Debug output is redacted.
+One deadline covers authentication, quorum, local catch-up and the SQLite read.
+
+Lookup returns `Committed`, a retained same-payload `Rejected(PersistError)`, or
+`Unresolved`. It never proposes a write or reveals a different payload's result
+when the request ID collides. Qualify recovery within the existing 4,096-applied-sequence
 window, including reopen and snapshot transfer. A missing or expired result
 outside a proven coverage window remains unresolved: it is not evidence of
 noncommit and does not authorize another operation identity. Any additional
@@ -308,11 +327,14 @@ The exact shared boundary needing coordination is
 policy port on `ManagedDatastore`, plus the sealed consensus adapter's policy
 override. Additional exact boundaries identified by adversarial review are
 the claim/commit size-evidence transfer and retained-profile validation before
-WAL recovery. Their API designs and handoffs remain open. The ordinary
-read-only recovery API and its coverage semantics also require review.
+WAL recovery. These exact source boundaries and the three ordinary recovery
+root exports have a recorded ownership handoff. Their API designs and coverage
+semantics still require review and qualification.
 Required-audit sequencing and authority custody remain with their owners.
-Public exports and the final RFC number require a recorded handoff. No
-transport-budget, manifest or dependency expansion is proposed by this draft.
+The final RFC number requires maintainer allocation. Borrowed validation of the
+exact encryption plaintext adds only the existing workspace `serde` and
+`serde_json` dependencies to `opc-crypto`, enabling `raw_value`; it introduces
+no package version upgrade or transport-budget expansion.
 
 Prepare the original-behavior detector and bounded implementation design while
 these decisions are reviewed. Before delivering a wider admission fence,

@@ -2,6 +2,11 @@
 
 mod audit;
 mod audit_continuity;
+mod recovery;
+
+pub use recovery::{
+    ConfigCommitRecoveryHandle, ConfigCommitRecoveryOutcome, PreparedConfigCommitOperation,
+};
 
 #[cfg(test)]
 mod config_capacity_attestation_tests;
@@ -1550,7 +1555,17 @@ impl ConsensusConfigStore {
     }
 
     async fn linearizable_barrier(&self) -> Result<Option<LogId<ConsensusNodeId>>, PersistError> {
-        let result = self.linearizable_barrier_inner().await;
+        let deadline = tokio::time::Instant::now()
+            .checked_add(self.inner.operation_timeout)
+            .ok_or_else(consensus_unavailable)?;
+        self.linearizable_barrier_until(deadline).await
+    }
+
+    async fn linearizable_barrier_until(
+        &self,
+        deadline: tokio::time::Instant,
+    ) -> Result<Option<LogId<ConsensusNodeId>>, PersistError> {
+        let result = self.linearizable_barrier_inner(deadline).await;
         let metric = if result.is_ok() {
             &opc_redaction::metrics::METRICS.persist_quorum_read_success
         } else {
@@ -1563,11 +1578,9 @@ impl ConsensusConfigStore {
 
     async fn linearizable_barrier_inner(
         &self,
+        deadline: tokio::time::Instant,
     ) -> Result<Option<LogId<ConsensusNodeId>>, PersistError> {
         self.require_admission()?;
-        let deadline = tokio::time::Instant::now()
-            .checked_add(self.inner.operation_timeout)
-            .ok_or_else(consensus_unavailable)?;
         let mut preferred = None;
         loop {
             let leader = match preferred.take() {
