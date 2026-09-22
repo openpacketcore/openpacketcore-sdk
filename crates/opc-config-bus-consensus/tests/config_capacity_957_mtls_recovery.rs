@@ -15,7 +15,8 @@ use std::time::Duration;
 use async_trait::async_trait;
 use opc_consensus::{
     ConsensusIdentity, ConsensusNodeId, ConsensusPeer, ConsensusPeerError, ConsensusRpcFamily,
-    ConsensusWireRequest, ConsensusWireResponse, DURABLE_CONSENSUS_OPERATION_TIMEOUT,
+    ConsensusRpcHandler, ConsensusWireRequest, ConsensusWireResponse,
+    DURABLE_CONSENSUS_OPERATION_TIMEOUT,
 };
 use opc_identity::{build_identity_state, parse_certs_pem, parse_key_pem, TrustBundle};
 use opc_key::{ConfigAad, EnvelopeAad, KeyHandle, KeyId, KeyPurpose, Zeroizing};
@@ -213,6 +214,67 @@ impl ConsensusPeer for ObservedPeer {
     }
 }
 
+// The transport intentionally lets already-accepted handlers complete after
+// connection cancellation. Observe release of every handler Arc before reopening
+// retained storage. Delegation preserves the authenticated sender and request.
+#[derive(Debug)]
+struct HandlerLifetime {
+    // Fields drop in declaration order: release the actual service/store before
+    // sending the test-only lifetime observation.
+    inner: Arc<dyn ConsensusRpcHandler>,
+    _released: HandlerReleased,
+}
+
+#[derive(Debug)]
+struct HandlerReleased(Option<tokio::sync::oneshot::Sender<()>>);
+
+impl Drop for HandlerReleased {
+    fn drop(&mut self) {
+        if let Some(released) = self.0.take() {
+            let _ = released.send(());
+        }
+    }
+}
+
+#[async_trait]
+impl ConsensusRpcHandler for HandlerLifetime {
+    async fn handle(
+        &self,
+        authenticated_sender: ConsensusNodeId,
+        request: ConsensusWireRequest,
+    ) -> ConsensusWireResponse {
+        self.inner.handle(authenticated_sender, request).await
+    }
+}
+
+fn observed_handler(
+    store: &ConsensusConfigStore,
+) -> (
+    Arc<dyn ConsensusRpcHandler>,
+    tokio::sync::oneshot::Receiver<()>,
+) {
+    let (released, receiver) = tokio::sync::oneshot::channel();
+    (
+        Arc::new(HandlerLifetime {
+            inner: store.rpc_handler(),
+            _released: HandlerReleased(Some(released)),
+        }),
+        receiver,
+    )
+}
+
+async fn all_handlers_released(receivers: Vec<tokio::sync::oneshot::Receiver<()>>) {
+    tokio::time::timeout(DURABLE_CONSENSUS_OPERATION_TIMEOUT, async {
+        for receiver in receivers {
+            receiver
+                .await
+                .expect("all accepted handler owners released");
+        }
+    })
+    .await
+    .expect("handler ownership ends inside existing operation bound");
+}
+
 fn resolver(address: Arc<RwLock<Option<SocketAddr>>>) -> RemoteAddrResolver {
     Arc::new(move || {
         let address = address.clone();
@@ -325,11 +387,16 @@ fn effect_counts(database: &Path) -> [i64; 4] {
     })
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn config_capacity_957_exact_recovery_after_mtls_response_loss_and_leader_loss() {
-    let directory = disk_fixture();
-    let pki = Pki::new();
-    let manifest = manifest();
+// Each phase constructs fresh stores and transport clients over the exact
+// original member identities, native storage paths, budgets and key epoch.
+async fn open_members(
+    directory: &Path,
+    manifest: &Arc<SessionReplicationManifest>,
+    pki: &Pki,
+    addresses: &[Arc<RwLock<Option<SocketAddr>>>; 3],
+    faults: &[Arc<Fault>; 3],
+    reopen: bool,
+) -> Vec<ConsensusConfigStore> {
     let node_ids = [0, 1, 2].map(|replica| {
         manifest
             .bind_local(replica_id(replica))
@@ -338,8 +405,6 @@ async fn config_capacity_957_exact_recovery_after_mtls_response_loss_and_leader_
     });
     let members = node_ids.into_iter().collect::<BTreeSet<_>>();
     let identity = manifest.consensus_identity();
-    let addresses = [0, 1, 2].map(|_| Arc::new(RwLock::new(None)));
-    let faults = [0, 1, 2].map(|_| Arc::new(Fault::default()));
     let databases = [0, 1, 2].map(|index| directory.join(format!("config-{index}.sqlite")));
     let mut stores = Vec::new();
     for source in 0..3 {
@@ -384,11 +449,12 @@ async fn config_capacity_957_exact_recovery_after_mtls_response_loss_and_leader_
             DURABLE_CONSENSUS_OPERATION_TIMEOUT,
         )
         .expect("native Durable options");
-        let backend = SqliteBackend::provision_config_authority(
-            options,
-            AuditKey::new([0xD9; 32]).expect("synthetic shared audit key"),
-        )
-        .await
+        let key = AuditKey::new([0xD9; 32]).expect("synthetic shared audit key");
+        let backend = if reopen {
+            SqliteBackend::reopen_config_authority(options, key).await
+        } else {
+            SqliteBackend::provision_config_authority(options, key).await
+        }
         .expect("native retained authority");
         stores.push(
             ConsensusConfigStore::open(
@@ -401,10 +467,31 @@ async fn config_capacity_957_exact_recovery_after_mtls_response_loss_and_leader_
             .expect("native consensus member"),
         );
     }
+    stores
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn config_capacity_957_exact_recovery_after_mtls_response_loss_and_leader_loss() {
+    let directory = disk_fixture();
+    let pki = Pki::new();
+    let manifest = manifest();
+    let node_ids = [0, 1, 2].map(|replica| {
+        manifest
+            .bind_local(replica_id(replica))
+            .expect("local binding")
+            .local_consensus_node_id()
+    });
+    let addresses = [0, 1, 2].map(|_| Arc::new(RwLock::new(None)));
+    let faults = [0, 1, 2].map(|_| Arc::new(Fault::default()));
+    let databases = [0, 1, 2].map(|index| directory.join(format!("config-{index}.sqlite")));
+    let stores = open_members(&directory, &manifest, &pki, &addresses, &faults, false).await;
     let mut servers = Vec::new();
+    let mut released_handlers = Vec::new();
     for source in 0..3 {
+        let (handler, released) = observed_handler(&stores[source]);
+        released_handlers.push(released);
         let (server, address) = SessionConsensusServer::new(
-            stores[source].rpc_handler(),
+            handler,
             pki.server(source),
             manifest
                 .bind_local(replica_id(source))
@@ -618,4 +705,138 @@ async fn config_capacity_957_exact_recovery_after_mtls_response_loss_and_leader_
             .await
             .expect("stop surviving member");
     }
+
+    let retained_handle = handle.as_bytes().to_vec();
+    drop(handle);
+    drop(servers);
+    all_handlers_released(released_handlers).await;
+    drop(stores);
+    for address in &addresses {
+        *address.write().expect("retire old listener address") = None;
+    }
+    let retained_effects = databases
+        .iter()
+        .map(|database| {
+            let counts = effect_counts(database);
+            [counts[0], counts[1], counts[3]]
+        })
+        .collect::<Vec<_>>();
+
+    // Reopen every original store and recreate every mTLS client/listener.
+    // No authority is provisioned, source commit is reconstructed, or mutation
+    // resubmitted. This is an orderly full restart, not a process-crash claim.
+    let stores = open_members(&directory, &manifest, &pki, &addresses, &faults, true).await;
+    let mut servers = Vec::new();
+    let mut released_handlers = Vec::new();
+    for source in 0..3 {
+        let (handler, released) = observed_handler(&stores[source]);
+        released_handlers.push(released);
+        let (server, address) = SessionConsensusServer::new(
+            handler,
+            pki.server(source),
+            manifest
+                .bind_local(replica_id(source))
+                .expect("original server binding"),
+        )
+        .listen("127.0.0.1:0".parse().expect("loopback socket"))
+        .await
+        .expect("new mTLS listener on original retained authority");
+        *addresses[source].write().expect("new address publication") = Some(address);
+        servers.push(server);
+    }
+    tokio::time::timeout(DURABLE_CONSENSUS_OPERATION_TIMEOUT, async {
+        let (one, two, three) = tokio::join!(
+            stores[0].initialize_cluster(),
+            stores[1].initialize_cluster(),
+            stores[2].initialize_cluster(),
+        );
+        one.expect("first retained voter readmission");
+        two.expect("second retained voter readmission");
+        three.expect("third retained voter readmission");
+        let (one, two, three) = tokio::join!(
+            stores[0].probe_durable_readiness(),
+            stores[1].probe_durable_readiness(),
+            stores[2].probe_durable_readiness(),
+        );
+        one.expect("first retained voter ready");
+        two.expect("second retained voter ready");
+        three.expect("third retained voter ready");
+    })
+    .await
+    .expect("retained readmission inside original operation budget");
+    let retained_leader = stores[0]
+        .status()
+        .leader_id
+        .expect("retained quorum leader");
+    assert!(stores.iter().all(|store| {
+        let status = store.status();
+        status.admitted && status.leader_id == Some(retained_leader)
+    }));
+    assert!(
+        databases
+            .iter()
+            .map(|database| {
+                let counts = effect_counts(database);
+                [counts[0], counts[1], counts[3]]
+            })
+            .collect::<Vec<_>>()
+            == retained_effects,
+        "configuration, audit and outcome effects survive original-store reopen"
+    );
+    // Elections may append engine entries during readmission. Capture the
+    // complete four-table baseline after that phase, before read-only recovery.
+    let before = databases
+        .iter()
+        .map(|database| effect_counts(database))
+        .collect::<Vec<_>>();
+    let handle = ConfigCommitRecoveryHandle::from_bytes(&retained_handle)
+        .expect("decode only the originally retained recovery handle");
+    for store in &stores {
+        assert!(
+            matches!(
+                store
+                    .lookup_commit_operation(&handle, CALLER)
+                    .await
+                    .expect("same original operation after retained restart"),
+                ConfigCommitRecoveryOutcome::Committed
+            ),
+            "CONFIG_CAPACITY_RECOVERY_REOPEN_RED: original committed evidence survives full retained restart"
+        );
+        let readback = store
+            .load_latest()
+            .await
+            .expect("retained quorum read")
+            .expect("retained successor");
+        assert!(
+            readback.record == expected,
+            "complete encrypted successor survives full retained restart"
+        );
+    }
+    assert!(
+        databases
+            .iter()
+            .map(|database| effect_counts(database))
+            .collect::<Vec<_>>()
+            == before,
+        "recovery after readmission leaves all four effect tables unchanged"
+    );
+    assert_eq!(
+        faults
+            .iter()
+            .map(|fault| fault.actual_forwards.load(Ordering::SeqCst))
+            .sum::<usize>(),
+        forwards_before,
+        "retained restart and exact recovery never forward another mutation"
+    );
+    assert_eq!(faults[follower].lost_responses.load(Ordering::SeqCst), 1);
+    for server in servers {
+        server.abort_and_wait().await;
+    }
+    for store in &stores {
+        store.shutdown().await.expect("stop reopened member");
+    }
+    all_handlers_released(released_handlers).await;
+    println!(
+        "CONFIG_CAPACITY_RECOVERY_REOPEN all_members=true original_handle=true resubmitted=false"
+    );
 }
