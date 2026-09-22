@@ -273,7 +273,7 @@ fn commit(version: u64, parent: Option<TxId>) -> AttestedConfigCommit {
         .expect("synthetic AAD"),
     );
     let key = KeyHandle::new(
-        KeyId::new("synthetic-config-recovery".into()).expect("key ID"),
+        KeyId::new("synthetic-config-recovery").expect("key ID"),
         KeyPurpose::Config,
         TenantId::from_static("test"),
         Zeroizing::new([0xD2; 32]),

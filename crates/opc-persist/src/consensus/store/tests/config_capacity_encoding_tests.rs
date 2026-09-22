@@ -161,7 +161,7 @@ fn audit_event() -> crate::ManagementAuditEventRecord {
         crate::ManagementAuditTransportCode::Gnmi,
         crate::ManagementAuditOperationCode::Update,
         crate::ManagementAuditOutcomeCode::Intent,
-        None,
+        None::<&str>,
         ["/fixture:config"],
         Some("synthetic-command-boundary"),
     )

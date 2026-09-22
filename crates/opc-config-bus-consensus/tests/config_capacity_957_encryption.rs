@@ -199,7 +199,7 @@ fn record(logical_bytes: usize, serializations: Arc<AtomicUsize>) -> StoredConfi
 async fn exercise(profile: ConfigCapacityProfile, logical_bytes: usize, accepted: bool) {
     let provider = Arc::new(Provider {
         key: KeyHandle::new(
-            KeyId::new("synthetic-key".into()).expect("key ID"),
+            KeyId::new("synthetic-key").expect("key ID"),
             KeyPurpose::Config,
             TenantId::from_static("test"),
             Zeroizing::new([0xC2; 32]),

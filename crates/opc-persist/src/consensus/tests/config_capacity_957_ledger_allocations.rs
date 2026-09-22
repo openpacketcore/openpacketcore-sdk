@@ -26,9 +26,9 @@ fn event(number: u64) -> crate::ManagementAuditEventRecord {
         crate::ManagementAuditTransportCode::Gnmi,
         crate::ManagementAuditOperationCode::Update,
         crate::ManagementAuditOutcomeCode::Intent,
-        Some(opc_types::TxId::new()),
+        None::<&str>,
         ["/fixture:configuration"],
-        Some("synthetic retained allocation control"),
+        Some("synthetic-retained-allocation-control"),
     )
     .expect("bounded synthetic event")
 }

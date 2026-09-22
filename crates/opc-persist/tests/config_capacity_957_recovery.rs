@@ -34,7 +34,7 @@ fn commit() -> AttestedConfigCommit {
         ConfigAad::new(tx_id, None, committed_at, CALLER, schema_digest, "running").expect("AAD"),
     );
     let key = KeyHandle::new(
-        KeyId::new("synthetic-recovery-key".into()).expect("key ID"),
+        KeyId::new("synthetic-recovery-key").expect("key ID"),
         KeyPurpose::Config,
         TenantId::from_static("test"),
         Zeroizing::new([0xA2; 32]),

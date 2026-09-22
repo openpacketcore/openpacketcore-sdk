@@ -171,7 +171,7 @@ fn event(marker: u8) -> ManagementAuditEventRecord {
         ManagementAuditTransportCode::Gnmi,
         ManagementAuditOperationCode::Update,
         ManagementAuditOutcomeCode::Intent,
-        None,
+        None::<&str>,
         ["/fixture:config"],
         Some("synthetic-capacity-transaction"),
     )

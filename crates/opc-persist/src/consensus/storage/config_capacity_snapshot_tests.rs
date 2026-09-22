@@ -274,7 +274,7 @@ async fn transfer(
     source: &Path,
     target: &mut SqliteConfigStateMachine,
     meta: &SnapshotMeta<ConsensusNodeId, opc_consensus::engine::EmptyNode>,
-) -> Result<(), StorageError<ConsensusNodeId>> {
+) -> Result<(), Box<StorageError<ConsensusNodeId>>> {
     let mut incoming = target
         .begin_receiving_snapshot()
         .await
@@ -283,7 +283,10 @@ async fn transfer(
     tokio::io::copy(&mut file, incoming.as_mut())
         .await
         .expect("finite file transfer");
-    target.install_snapshot(meta, incoming).await
+    target
+        .install_snapshot(meta, incoming)
+        .await
+        .map_err(Box::new)
 }
 
 #[tokio::test]
