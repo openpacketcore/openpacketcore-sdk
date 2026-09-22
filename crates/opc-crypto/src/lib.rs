@@ -146,9 +146,6 @@ impl ConfigCapacityEvidence {
             .len()
             .checked_sub(logical_bytes)
             .ok_or(ConfigCapacityError::InvalidPlaintext)?;
-        if logical_bytes > CONFIG_CAPACITY_V1_LOGICAL_BYTES {
-            return Err(ConfigCapacityError::LogicalBytes);
-        }
         if replay_bytes > CONFIG_CAPACITY_V1_REPLAY_BYTES {
             return Err(ConfigCapacityError::ReplayBytes);
         }
