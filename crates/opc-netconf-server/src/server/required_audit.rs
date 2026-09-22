@@ -81,7 +81,6 @@ where
         !self.binding.candidate_datastore_capability()
             && !self.binding.confirmed_commit_capability()
             && !self.binding.startup_datastore_capability()
-            && self.binding.startup_datastore().is_none()
     }
 
     pub(super) async fn submit_config_effect(
