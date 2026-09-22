@@ -372,6 +372,19 @@ async fn assert_original_terminal(
         handle["body"]["event"]["transaction"] == serde_json::to_value(transaction).unwrap(),
         "recovery changed the projected effect"
     );
+    // The original RPC changes this one schema leaf. Ordinary bus submission
+    // derives a generic intent with no paths; exact request/effect correlation
+    // alone would miss loss of the protocol intent during leadership recovery.
+    let paths = privacy
+        .project(
+            AuditPrivacyPurpose::SchemaPaths,
+            &[b"/sys:system/sys:hostname"],
+        )
+        .unwrap();
+    assert!(
+        handle["body"]["event"]["paths"] == serde_json::to_value(paths).unwrap(),
+        "recovery lost protocol schema-path attribution"
+    );
     for terminal in ["outcome", "terminal"] {
         assert_eq!(
             rows.iter()
