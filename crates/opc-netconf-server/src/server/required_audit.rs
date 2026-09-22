@@ -109,7 +109,14 @@ where
             ConfigOperation::Delete => AuditOperation::Delete,
             ConfigOperation::Rollback => AuditOperation::Rollback,
         };
-        audit.submit(request, intent).await
+        // Qualification only: restore the separated protocol Intent path.
+        if commit_audit_failed(&self.audit, &intent).await {
+            return Err(CommitError::new(
+                CommitErrorCode::AdmissionRejected,
+                "required configuration audit intent unavailable",
+            ));
+        }
+        bus.submit(request).await
     }
 
     /// Once the required submitter owns the request, only its exact retained
