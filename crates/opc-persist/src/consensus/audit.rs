@@ -189,10 +189,12 @@ fn read_verified_sync(conn: &Connection, key: &AuditKey) -> io::Result<StoredLed
     ).optional().map_err(|_| invalid())?.ok_or_else(invalid)?;
     let mac: [u8; 32] = mac.try_into().map_err(|_| invalid())?;
     let stored: StoredLedger = serde_json::from_slice(&encoded).map_err(|_| invalid())?;
-    let length = canonical_state_len(&stored)?;
-    stream_state(&stored, key, length, None)?
-        .verify_slice(&mac)
-        .map_err(|_| invalid())?;
+    // Experimental negative control: authenticate raw instead of canonical JSON.
+    let mut raw_mac = Hmac::<Sha256>::new_from_slice(key.as_bytes()).map_err(|_| invalid())?;
+    raw_mac.update(STATE_DOMAIN);
+    raw_mac.update(&(encoded.len() as u64).to_be_bytes());
+    raw_mac.update(&encoded);
+    raw_mac.verify_slice(&mac).map_err(|_| invalid())?;
     if let Some(ledger) = &stored.ledger {
         ledger
             .validate(key, stored.identity)
