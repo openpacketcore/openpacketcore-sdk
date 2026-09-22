@@ -16,6 +16,8 @@ use opc_persist::{
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::atomic::{AtomicBool, AtomicU64};
 
+mod running;
+
 // Separately owned synthetic monotonic checkpoint authority. This is not a
 // production provider and carries no configuration signing material.
 #[derive(Default)]
@@ -51,10 +53,11 @@ impl AuditCheckpointPort for Checkpoints {
         if refuse_from != 0 && next.sequence() >= refuse_from {
             return Err(AuditAuthorityError::Unavailable);
         }
-        if self
-            .pause_at
-            .compare_exchange(next.sequence(), 0, Ordering::AcqRel, Ordering::Acquire)
-            .is_ok()
+        if next.sequence() != 0
+            && self
+                .pause_at
+                .compare_exchange(next.sequence(), 0, Ordering::AcqRel, Ordering::Acquire)
+                .is_ok()
         {
             // The ledger intent exists; checkpoint admission has not returned.
             // An explicit barrier controls cancellation without timing sleeps.
@@ -530,7 +533,7 @@ async fn exact_bus_control_preserves_known_commit_and_recovers_only_its_terminal
 #[tokio::test]
 async fn authenticated_netconf_running_edit_reaches_the_exact_required_audit_effect() {
     let h = Harness::start().await;
-    let server = h.server();
+    let server = running::required_server(&h);
     let sessions = SessionRegistry::new();
     let registration = sessions.register(1).unwrap();
     let request_id = RequestId::new();

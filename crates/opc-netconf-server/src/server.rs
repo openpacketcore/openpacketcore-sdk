@@ -1,5 +1,8 @@
 //! NETCONF server core.
 
+mod required_audit;
+use required_audit::ServerAudit;
+
 use std::future::Future;
 use std::marker::PhantomData;
 use std::num::NonZeroU32;
@@ -119,6 +122,13 @@ pub enum ServerInitError {
     /// opt-in committed-revision responses.
     #[error("config datastore does not support committed revision receipts")]
     CommittedRevisionUnsupported,
+    /// Required audit was issued for a different config-bus worker.
+    #[error("configuration audit authority mismatch")]
+    RequiredAuditWorkerMismatch,
+    /// A local candidate/startup/confirmed effect owner cannot supply the
+    /// required encrypted-effect and retained-recovery contract.
+    #[error("required audit does not support this datastore composition")]
+    RequiredAuditProfileUnsupported,
 }
 
 /// Result of handling one NETCONF RPC.
@@ -454,7 +464,8 @@ where
 {
     binding: B,
     authz: ReadAuthorizer<'static, P>,
-    audit: Arc<A>,
+    audit: Arc<ServerAudit<A>>,
+    required_config_audit: Option<opc_config_bus::RequiredConfigAudit<C>>,
     transport: TransportType,
     candidate: Arc<Mutex<CandidateDatastore<C>>>,
     confirmed_commit: Arc<Mutex<ConfirmedCommitState>>,
@@ -484,7 +495,8 @@ where
         Ok(Self {
             binding,
             authz,
-            audit: Arc::new(audit),
+            audit: Arc::new(ServerAudit::Legacy(audit)),
+            required_config_audit: None,
             transport,
             candidate: Arc::new(Mutex::new(CandidateDatastore::default())),
             confirmed_commit: Arc::new(Mutex::new(ConfirmedCommitState::default())),
@@ -510,10 +522,11 @@ where
                 let hook_sessions = sessions.clone();
                 let hook_audit = Arc::clone(&audit);
                 run_atomic_registry_hook(&sessions, audit.as_ref(), &fallback_event, move || {
-                    let result = hook_sessions
-                        .terminate_after(target_session_id, || hook_audit.record(&success_event))?;
+                    let result = hook_sessions.terminate_after(target_session_id, || {
+                        hook_audit.record_atomic(&success_event)
+                    })?;
                     if result == KillSessionResult::NotFound {
-                        hook_audit.record(&not_found_event)?;
+                        hook_audit.record_atomic(&not_found_event)?;
                     }
                     Ok(result)
                 })
@@ -545,14 +558,14 @@ where
                         XmlDatastore::Running => {
                             let result = hook_sessions
                                 .lock_running_after(current_session_id, || {
-                                    hook_audit.record(&success_event)
+                                    hook_audit.record_atomic(&success_event)
                                 })?;
                             match result {
                                 LockRunningResult::Denied { .. } => {
-                                    hook_audit.record(&denied_event)?;
+                                    hook_audit.record_atomic(&denied_event)?;
                                 }
                                 LockRunningResult::SessionNotRegistered => {
-                                    hook_audit.record(&hook_fallback)?;
+                                    hook_audit.record_atomic(&hook_fallback)?;
                                 }
                                 LockRunningResult::Acquired => {}
                             }
@@ -561,14 +574,14 @@ where
                         XmlDatastore::Candidate => {
                             let result = hook_sessions
                                 .lock_candidate_after(current_session_id, || {
-                                    hook_audit.record(&success_event)
+                                    hook_audit.record_atomic(&success_event)
                                 })?;
                             match result {
                                 LockCandidateResult::Denied { .. } => {
-                                    hook_audit.record(&denied_event)?;
+                                    hook_audit.record_atomic(&denied_event)?;
                                 }
                                 LockCandidateResult::SessionNotRegistered => {
-                                    hook_audit.record(&hook_fallback)?;
+                                    hook_audit.record_atomic(&hook_fallback)?;
                                 }
                                 LockCandidateResult::Acquired => {}
                             }
@@ -577,14 +590,14 @@ where
                         XmlDatastore::Startup => {
                             let result = hook_sessions
                                 .lock_startup_after(current_session_id, || {
-                                    hook_audit.record(&success_event)
+                                    hook_audit.record_atomic(&success_event)
                                 })?;
                             match result {
                                 LockStartupResult::Denied { .. } => {
-                                    hook_audit.record(&denied_event)?;
+                                    hook_audit.record_atomic(&denied_event)?;
                                 }
                                 LockStartupResult::SessionNotRegistered => {
-                                    hook_audit.record(&hook_fallback)?;
+                                    hook_audit.record_atomic(&hook_fallback)?;
                                 }
                                 LockStartupResult::Acquired => {}
                             }
@@ -620,15 +633,15 @@ where
                         XmlDatastore::Running => {
                             let result = hook_sessions
                                 .unlock_running_after(current_session_id, || {
-                                    hook_audit.record(&success_event)
+                                    hook_audit.record_atomic(&success_event)
                                 })?;
                             match result {
                                 UnlockRunningResult::NotOwner { .. } => {
-                                    hook_audit.record(&denied_event)?;
+                                    hook_audit.record_atomic(&denied_event)?;
                                 }
                                 UnlockRunningResult::NotLocked
                                 | UnlockRunningResult::SessionNotRegistered => {
-                                    hook_audit.record(&hook_fallback)?;
+                                    hook_audit.record_atomic(&hook_fallback)?;
                                 }
                                 UnlockRunningResult::Unlocked => {}
                             }
@@ -637,15 +650,15 @@ where
                         XmlDatastore::Candidate => {
                             let result = hook_sessions
                                 .unlock_candidate_after(current_session_id, || {
-                                    hook_audit.record(&success_event)
+                                    hook_audit.record_atomic(&success_event)
                                 })?;
                             match result {
                                 UnlockCandidateResult::NotOwner { .. } => {
-                                    hook_audit.record(&denied_event)?;
+                                    hook_audit.record_atomic(&denied_event)?;
                                 }
                                 UnlockCandidateResult::NotLocked
                                 | UnlockCandidateResult::SessionNotRegistered => {
-                                    hook_audit.record(&hook_fallback)?;
+                                    hook_audit.record_atomic(&hook_fallback)?;
                                 }
                                 UnlockCandidateResult::Unlocked => {}
                             }
@@ -654,15 +667,15 @@ where
                         XmlDatastore::Startup => {
                             let result = hook_sessions
                                 .unlock_startup_after(current_session_id, || {
-                                    hook_audit.record(&success_event)
+                                    hook_audit.record_atomic(&success_event)
                                 })?;
                             match result {
                                 UnlockStartupResult::NotOwner { .. } => {
-                                    hook_audit.record(&denied_event)?;
+                                    hook_audit.record_atomic(&denied_event)?;
                                 }
                                 UnlockStartupResult::NotLocked
                                 | UnlockStartupResult::SessionNotRegistered => {
-                                    hook_audit.record(&hook_fallback)?;
+                                    hook_audit.record_atomic(&hook_fallback)?;
                                 }
                                 UnlockStartupResult::Unlocked => {}
                             }
@@ -1065,21 +1078,23 @@ where
                 &parsed.reply_attrs,
                 started,
             ),
-            RpcOperation::Get(request) => RpcHandlingResult::keep_open(handle_get::<C, B, P, A>(
-                &self.binding,
-                GetContext {
-                    authz: &self.authz,
-                    audit: &self.audit,
-                    transport: self.transport,
-                    request_id,
-                    principal,
-                    message_id: &parsed.message_id,
-                    reply_attrs: &parsed.reply_attrs,
-                    started,
-                    limits,
-                },
-                request,
-            )),
+            RpcOperation::Get(request) => {
+                RpcHandlingResult::keep_open(handle_get::<C, B, P, ServerAudit<A>>(
+                    &self.binding,
+                    GetContext {
+                        authz: &self.authz,
+                        audit: &self.audit,
+                        transport: self.transport,
+                        request_id,
+                        principal,
+                        message_id: &parsed.message_id,
+                        reply_attrs: &parsed.reply_attrs,
+                        started,
+                        limits,
+                    },
+                    request,
+                ))
+            }
             RpcOperation::GetConfig(request) => {
                 let candidate_config = self.candidate_config_for_get_config(request);
                 let startup_config = match self.startup_config_for_get_config(request) {
@@ -1095,7 +1110,7 @@ where
                         );
                     }
                 };
-                RpcHandlingResult::keep_open(handle_get_config::<C, B, P, A>(
+                RpcHandlingResult::keep_open(handle_get_config::<C, B, P, ServerAudit<A>>(
                     &self.binding,
                     GetConfigContext {
                         authz: &self.authz,
@@ -1130,7 +1145,7 @@ where
                         );
                     }
                 };
-                RpcHandlingResult::keep_open(handle_get_data::<C, B, P, A>(
+                RpcHandlingResult::keep_open(handle_get_data::<C, B, P, ServerAudit<A>>(
                     &self.binding,
                     GetDataContext {
                         authz: &self.authz,
@@ -1327,6 +1342,29 @@ where
             }
         };
 
+        if self.required_config_audit.is_some() && !self.required_audit_profile_supported() {
+            // A mutable application binding must not enable a local effect
+            // owner after required-audit construction checked the composition.
+            let event = AuditEvent::new(
+                request_id,
+                principal,
+                self.transport,
+                AuditOperation::Exec,
+                audit_failed("operation-failed"),
+            );
+            let _ = self.audit.record_async(&event).await;
+            let metric = config_authority_gate(&parsed.operation)
+                .map(|gate| gate.metric)
+                .unwrap_or(NetconfOperation::Unknown);
+            record_rpc_error(metric, NetconfErrorTag::OperationFailed, started.elapsed());
+            return RpcHandlingResult::keep_open(rpc_error_reply_with_attrs(
+                Some(&parsed.message_id),
+                &parsed.reply_attrs,
+                RpcError::operation_failed(),
+            ))
+            .into();
+        }
+
         if let Some(gate) = config_authority_gate(&parsed.operation) {
             if let Err(outcome) = self.ensure_config_authority(gate.operation).await {
                 return self
@@ -1376,7 +1414,7 @@ where
                 .await
             }
             RpcOperation::Get(request) => RpcHandlingResult::keep_open(
-                handle_get_async::<C, B, P, A>(
+                handle_get_async::<C, B, P, ServerAudit<A>>(
                     &self.binding,
                     GetContext {
                         authz: &self.authz,
@@ -1412,7 +1450,7 @@ where
                     }
                 };
                 RpcHandlingResult::keep_open(
-                    handle_get_config_async::<C, B, P, A>(
+                    handle_get_config_async::<C, B, P, ServerAudit<A>>(
                         &self.binding,
                         GetConfigContext {
                             authz: &self.authz,
@@ -1453,7 +1491,7 @@ where
                     }
                 };
                 RpcHandlingResult::keep_open(
-                    handle_get_data_async::<C, B, P, A>(
+                    handle_get_data_async::<C, B, P, ServerAudit<A>>(
                         &self.binding,
                         GetDataContext {
                             authz: &self.authz,
@@ -5232,30 +5270,38 @@ where
             AuditOutcome::Intent,
         )
         .with_paths(self.schema_paths_for_changed_paths(&changed_paths, NETCONF_COPY_CONFIG_PATH));
-        if let Some(reply) = self
-            .required_intent_failure_reply(context, NetconfOperation::CopyConfig, &intent_event)
-            .await
-        {
+        let intent_failure = if self.required_config_audit.is_none() {
+            self.required_intent_failure_reply(context, NetconfOperation::CopyConfig, &intent_event)
+                .await
+        } else {
+            None
+        };
+        if let Some(reply) = intent_failure {
             return reply;
         }
 
-        match bus.submit(request).await {
+        match self
+            .submit_config_effect(bus.as_ref(), request, intent_event)
+            .await
+        {
             Ok(result) => {
                 let paths = self.schema_paths_for_changed_paths(
                     &result.changed_paths,
                     NETCONF_COPY_CONFIG_PATH,
                 );
-                self.record_mutation_terminal(
-                    &AuditEvent::new(
-                        context.request_id,
-                        context.principal,
-                        self.transport,
-                        AuditOperation::Replace,
-                        AuditOutcome::Success,
+                if self.required_config_audit.is_none() {
+                    self.record_mutation_terminal(
+                        &AuditEvent::new(
+                            context.request_id,
+                            context.principal,
+                            self.transport,
+                            AuditOperation::Replace,
+                            AuditOutcome::Success,
+                        )
+                        .with_paths(paths),
                     )
-                    .with_paths(paths),
-                )
-                .await;
+                    .await;
+                }
                 self.committed_revision_success_reply(
                     context,
                     NetconfOperation::CopyConfig,
@@ -5263,6 +5309,14 @@ where
                 )
             }
             Err(error) => {
+                if self.required_config_audit.is_some() {
+                    return self.required_effect_error_reply(
+                        context,
+                        NetconfOperation::CopyConfig,
+                        error.code,
+                    );
+                }
+
                 self.copy_config_failure_reply_for_rpc(
                     context,
                     audit_failed(error.code.as_str()),
@@ -5894,7 +5948,9 @@ where
         )
         .with_base_version(snapshot.version);
 
-        if commit_audit_failed(&self.audit, &intent_event).await {
+        if self.required_config_audit.is_none()
+            && commit_audit_failed(&self.audit, &intent_event).await
+        {
             record_rpc_error(
                 kind.metric(),
                 NetconfErrorTag::OperationFailed,
@@ -5907,23 +5963,32 @@ where
             ));
         }
 
-        match bus.submit(commit_request).await {
+        match self
+            .submit_config_effect(bus.as_ref(), commit_request, intent_event)
+            .await
+        {
             Ok(result) => {
                 let paths = self.schema_paths_for_changed_paths(&result.changed_paths, kind.path());
-                self.record_mutation_terminal(
-                    &AuditEvent::new(
-                        context.request_id,
-                        context.principal,
-                        self.transport,
-                        AuditOperation::Update,
-                        AuditOutcome::Success,
+                if self.required_config_audit.is_none() {
+                    self.record_mutation_terminal(
+                        &AuditEvent::new(
+                            context.request_id,
+                            context.principal,
+                            self.transport,
+                            AuditOperation::Update,
+                            AuditOutcome::Success,
+                        )
+                        .with_paths(paths),
                     )
-                    .with_paths(paths),
-                )
-                .await;
+                    .await;
+                }
                 self.committed_revision_success_reply(&context, kind.metric(), &result)
             }
             Err(error) => {
+                if self.required_config_audit.is_some() {
+                    return self.required_effect_error_reply(&context, kind.metric(), error.code);
+                }
+
                 self.edit_config_failure_reply(
                     &context,
                     kind,

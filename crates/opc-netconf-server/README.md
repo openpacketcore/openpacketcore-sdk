@@ -56,6 +56,32 @@ durable sinks therefore await acknowledgement without parking a Tokio executor
 thread. The public registry-free synchronous helpers retain their synchronous
 behavior and accept borrowed sink adapters.
 
+### Required configuration audit
+
+`ReadOnlyNetconfServer::with_required_config_audit` installs the capability from
+the exact binding's `ConfigBus::required_config_audit`. For this profile,
+running `edit-config`, NMDA `edit-data`, and supported `copy-config` submit their
+original authenticated request together with its required intent. The encrypted
+datastore admits and checkpoints that intent before its effect. The protocol
+does not send a separate Intent to an observation sink or report a second
+terminal outcome after submission. Known commits remain successful when audit
+completion debt fences later writes; recovery resolves the original operation.
+
+This is a partial writable-running profile. Attachment returns
+`RequiredAuditProfileUnsupported` for candidate, confirmed-commit or startup
+bindings, and `RequiredAuditWorkerMismatch` for another bus worker, including
+one opened over the same store. It never hides capabilities. Changed capability
+answers after attachment also fail closed. Full candidate/startup/confirmation
+support remains tracked by #958 and the
+[contract proposal](../../docs/rfc/netconf-required-audit-958.md).
+
+The supplied legacy sink is replaced by that authority's observation port.
+Reads and denials use asynchronous observations; registry-free synchronous
+dispatch cannot drive the replicated port and fails closed. Atomic registry
+jobs await real asynchronous observation admission on their existing blocking
+worker while retaining the atomic gate and registry guard. They do not create
+configuration commits or acknowledge standalone configuration Intents.
+
 `<kill-session>`, `<lock>`, and `<unlock>` must make one audit-plus-registry
 decision that survives caller cancellation. Their async paths reserve a
 single, fail-fast gate owned by the shared `SessionRegistry`, then run the
