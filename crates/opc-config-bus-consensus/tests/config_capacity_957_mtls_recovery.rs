@@ -780,7 +780,6 @@ async fn config_capacity_957_exact_recovery_after_mtls_response_loss_and_leader_
     }
 
     let retained_handle = handle.as_bytes().to_vec();
-    drop(handle);
     drop(servers);
     all_handlers_released(released_handlers).await;
     drop(stores);
