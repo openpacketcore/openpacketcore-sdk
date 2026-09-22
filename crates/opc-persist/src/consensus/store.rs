@@ -1301,7 +1301,7 @@ impl ConsensusConfigStore {
                 {
                     Ok(reply) => reply,
                     Err(_) => {
-                        ambiguity_seen = true;
+                        // Adversarial experiment only: forget an uncertain transmission.
                         if let Err(error) = self.wait_for_route_refresh(leader, deadline).await {
                             drop(error);
                             return Err(PersistError::outcome_unknown());
