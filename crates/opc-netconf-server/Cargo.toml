@@ -56,7 +56,7 @@ rand = { workspace = true }
 rcgen = { workspace = true }
 tempfile = "3"
 time = { workspace = true }
-tokio = { workspace = true, features = ["io-util", "macros", "net", "rt", "sync", "time"] }
+tokio = { workspace = true, features = ["io-util", "macros", "net", "process", "rt", "sync", "time"] }
 
 [lints]
 workspace = true

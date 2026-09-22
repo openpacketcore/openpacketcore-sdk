@@ -2,6 +2,8 @@
 //! This covers orderly owner replacement, not process-crash or quorum failover.
 
 use super::*;
+
+mod crash;
 use opc_config_bus::{AuthorizationContext, AuthorizationError, ConfigAuthorizer};
 use opc_persist::{
     ConfigConsensusOpenError, RetainedConfigBinding, RetainedConfigDurability,
@@ -24,7 +26,7 @@ fn topology() -> ConfigConsensusTopology {
 
 async fn open_authority(
     directory: &std::path::Path,
-    checkpoints: Arc<Checkpoints>,
+    checkpoints: Arc<dyn AuditCheckpointPort>,
     provision: bool,
 ) -> Result<ConsensusConfigStore, ConfigConsensusOpenError> {
     let options = RetainedConfigOptions::new(
