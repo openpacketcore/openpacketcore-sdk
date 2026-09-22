@@ -119,24 +119,7 @@ impl ConfigCapacityEvidence {
         {
             let parsed: ConfigCapacityPlaintextV2<'_> = serde_json::from_slice(encoded)
                 .map_err(|_| ConfigCapacityError::InvalidPlaintext)?;
-            let value = parsed.config.get().as_bytes();
-            let mut start = (value.as_ptr() as usize)
-                .checked_sub(encoded.as_ptr() as usize)
-                .ok_or(ConfigCapacityError::InvalidPlaintext)?;
-            let mut end = start
-                .checked_add(value.len())
-                .filter(|end| *end <= encoded.len())
-                .ok_or(ConfigCapacityError::InvalidPlaintext)?;
-            // RawValue excludes adjacent JSON whitespace. A custom serializer
-            // can emit that whitespace as part of the config value: charge it
-            // to logical bytes so it cannot consume replay headroom instead.
-            while start > 0 && encoded[start - 1].is_ascii_whitespace() {
-                start -= 1;
-            }
-            while end < encoded.len() && encoded[end].is_ascii_whitespace() {
-                end += 1;
-            }
-            end - start
+            parsed.config.get().len()
         } else {
             let _: &serde_json::value::RawValue = serde_json::from_slice(plaintext)
                 .map_err(|_| ConfigCapacityError::InvalidPlaintext)?;
