@@ -145,3 +145,159 @@ fn config_capacity_957_streamed_digests_match_original_canonical_json() {
         );
     }
 }
+
+fn audit_event() -> crate::ManagementAuditEventRecord {
+    crate::ManagementAuditEventRecord::try_new(
+        [0x86; 16],
+        crate::ManagementAuditInstant::try_new(
+            100,
+            0,
+            1,
+            crate::ManagementAuditTimeSourceCode::NodeClock,
+        )
+        .expect("synthetic event time"),
+        "test",
+        "spiffe://qualification.invalid/tenant/test/ns/test/sa/config/nf/test/instance/0",
+        crate::ManagementAuditTransportCode::Gnmi,
+        crate::ManagementAuditOperationCode::Update,
+        crate::ManagementAuditOutcomeCode::Intent,
+        None,
+        ["/fixture:config"],
+        Some("synthetic-command-boundary"),
+    )
+    .expect("synthetic boundary event")
+}
+
+// Encoding oracle only: build a valid complete audited command without calling
+// the preparation guard being tested. This must remain independent of that guard.
+fn audited_boundary_command(
+    store: &ConsensusConfigStore,
+    bytes: usize,
+) -> crate::consensus::ConfigConsensusCommand {
+    use crate::audit_authority::ledger::HandleBody;
+    use crate::audit_authority::{
+        AuditOperationBinding, AuditOperationHandle, AuditPrivacyKey, ProjectedAuditEvent,
+    };
+    use crate::consensus::audit_mutation::AuditedConfigEffect;
+
+    let key = store.inner.backend.audit_key();
+    let privacy = AuditPrivacyKey::new([0x87; 32]).expect("synthetic privacy key");
+    let (record, audit, resolution) = sized_attested_commit(bytes).into_parts();
+    let effect = AuditedConfigEffect::Append {
+        commit: Box::new(PreparedConfigCommit::prepare(record, audit, key).expect("valid record")),
+        resolution,
+    };
+    let digest = effect.digest(key).expect("authenticated exact effect");
+    let event = ProjectedAuditEvent::project(&privacy, &audit_event()).expect("project event");
+    let binding = AuditOperationBinding::project(&privacy, &event, 0, &digest)
+        .expect("project exact binding");
+    let issued_at = store
+        .inner
+        .clock
+        .now_utc()
+        .as_offset_datetime()
+        .unix_timestamp();
+    let handle = AuditOperationHandle::issue(
+        HandleBody {
+            version: 1,
+            identity: store.inner.identity,
+            binding,
+            event,
+            issued_at,
+            expires_at: issued_at.checked_add(60).expect("fixture lifetime"),
+            nonce: [0x88; 16],
+            key_epoch: key.epoch(),
+            mutation: Some(digest),
+        },
+        key,
+    )
+    .expect("valid authenticated handle");
+    let request_id = derive_durable_request_id(store.inner.identity, b"audit-config", &handle.mac);
+    crate::consensus::ConfigConsensusCommand {
+        schema_version: crate::consensus::CONFIG_CONSENSUS_COMMAND_VERSION,
+        identity: store.inner.identity,
+        request_id,
+        logical_time: maximum_encoded_config_timestamp().expect("maximum leader timestamp"),
+        intent: ConfigMutationIntent::AuditedMutation(crate::consensus::PreparedAuditedMutation {
+            handle,
+            effect,
+        }),
+    }
+}
+
+#[tokio::test]
+async fn config_capacity_957_audit_metadata_counts_at_exact_command_boundary() {
+    // The unit fixture isolates exact postcard sizing and preparation. The
+    // separate native-Durable integration detector establishes durable effects.
+    let (store, _snapshots) = singleton_store().await;
+    let baseline_plaintext = 1_000_000;
+    let baseline = audited_boundary_command(&store, baseline_plaintext);
+    baseline
+        .validate(store.inner.identity)
+        .expect("valid size oracle");
+    let baseline_len = encode_bounded(&baseline)
+        .expect("real postcard oracle")
+        .len();
+    let at_limit_plaintext = baseline_plaintext
+        + DURABLE_OPENRAFT_APPEND_ENTRIES_TARGET_BYTES
+            .checked_sub(baseline_len)
+            .expect("baseline command below unchanged limit");
+    let privacy =
+        crate::audit_authority::AuditPrivacyKey::new([0x87; 32]).expect("synthetic privacy key");
+    for extra in [0, 1] {
+        let oracle = audited_boundary_command(&store, at_limit_plaintext + extra);
+        oracle
+            .validate(store.inner.identity)
+            .expect("valid exact command oracle");
+        assert_eq!(
+            encode_bounded(&oracle)
+                .expect("real complete-command encoding")
+                .len(),
+            DURABLE_OPENRAFT_APPEND_ENTRIES_TARGET_BYTES + extra,
+            "fixture reaches the exact complete audited-command boundary",
+        );
+        let ConfigMutationIntent::AuditedMutation(ref audited) = oracle.intent else {
+            panic!("audited fixture");
+        };
+        let mut inner = oracle.clone();
+        inner.intent = audited.effect.intent();
+        assert!(
+            encode_bounded(&inner)
+                .expect("real inner-command encoding")
+                .len()
+                < DURABLE_OPENRAFT_APPEND_ENTRIES_TARGET_BYTES,
+            "inner effect alone must fit in both adversarial cases",
+        );
+        let result = store.prepare_audited_commit(
+            &privacy,
+            &audit_event(),
+            sized_attested_commit(at_limit_plaintext + extra),
+            Duration::from_secs(60),
+        );
+        if extra == 0 {
+            let prepared = result.expect("complete command at limit is accepted");
+            let accepted = crate::consensus::ConfigConsensusCommand {
+                request_id: derive_durable_request_id(
+                    store.inner.identity,
+                    b"audit-config",
+                    &prepared.handle.mac,
+                ),
+                intent: ConfigMutationIntent::AuditedMutation(prepared),
+                ..oracle
+            };
+            assert_eq!(
+                encode_bounded(&accepted)
+                    .expect("actual prepared command encoding")
+                    .len(),
+                DURABLE_OPENRAFT_APPEND_ENTRIES_TARGET_BYTES,
+                "preparation preserves the exact at-limit command",
+            );
+        } else {
+            assert!(
+                matches!(result, Err(crate::audit_authority::AuditAuthorityError::InvalidInput)),
+                "CONFIG_CAPACITY_AUDIT_METADATA_RED: complete audited command one byte over must reject during preparation",
+            );
+        }
+    }
+    store.shutdown().await.expect("shutdown encoding fixture");
+}

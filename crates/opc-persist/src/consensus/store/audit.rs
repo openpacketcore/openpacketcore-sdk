@@ -154,10 +154,22 @@ impl ConsensusConfigStore {
         let digest = effect.digest(self.inner.backend.audit_key())?;
         let event = ProjectedAuditEvent::project(privacy, event)?;
         let binding = AuditOperationBinding::project(privacy, &event, base, &digest)?;
-        Ok(PreparedAuditedMutation {
+        let prepared = PreparedAuditedMutation {
             handle: self.issue_audit_handle(event, binding, Some(digest), lifetime)?,
             effect,
-        })
+        };
+        // The eventual config command must fit before this handle can admit
+        // a durable Intent. Preflighting only the much smaller Intent command
+        // leaves an unusable audit reservation behind on a later size failure.
+        let request =
+            derive_durable_request_id(self.inner.identity, b"audit-config", &prepared.handle.mac);
+        let command = ConfigMutationIntent::AuditedMutation(prepared);
+        super::preflight_config_command_replication_budget(self.inner.identity, request, &command)
+            .map_err(|_| AuditAuthorityError::InvalidInput)?;
+        let ConfigMutationIntent::AuditedMutation(prepared) = command else {
+            return Err(AuditAuthorityError::InvalidInput);
+        };
+        Ok(prepared)
     }
 
     fn issue_audit_handle(
