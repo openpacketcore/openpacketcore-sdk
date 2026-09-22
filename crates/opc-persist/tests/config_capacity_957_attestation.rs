@@ -212,6 +212,15 @@ async fn config_capacity_957_logical_and_replay_limits_are_independent() {
 #[tokio::test]
 async fn config_capacity_957_raw_whitespace_cannot_borrow_replay_headroom() {
     for leading in [false, true] {
+        // Only one extra byte: ignoring adjacent whitespace would incorrectly
+        // admit this logical L+1 as L with a still-valid 129-byte replay span.
+        let mut one_over = logical_json(CONFIG_CAPACITY_V1_LOGICAL_BYTES);
+        if leading {
+            one_over.insert(0, b' ');
+        } else {
+            one_over.push(b' ');
+        }
+        rejects_before_provider(&framed(&one_over, 128), ConfigCapacityError::LogicalBytes).await;
         let mut logical = vec![b' '; CONFIG_CAPACITY_V1_LOGICAL_BYTES + 1];
         let offset = if leading { logical.len() - 2 } else { 0 };
         logical[offset..offset + 2].copy_from_slice(b"{}");

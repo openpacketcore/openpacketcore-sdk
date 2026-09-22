@@ -7,6 +7,8 @@ mod audit_continuity;
 mod config_capacity_attestation_tests;
 #[cfg(test)]
 mod config_capacity_review_tests;
+#[cfg(test)]
+mod config_capacity_rpc_tests;
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
@@ -33,7 +35,12 @@ use thiserror::Error;
 
 use super::raft_adapter::{ConfigRaftAdapterError, ConfigRaftNetworkFactory, ConfigRaftRpcHandler};
 use super::storage::{self, ConfigConsensusStorageError};
-use super::types::{decode_config_wire, encode_config_wire, ValidatedRollbackLabel};
+use super::types::{
+    config_wire_revision, decode_config_wire_for_profile, encode_config_wire_for_profile,
+    ValidatedRollbackLabel,
+};
+#[cfg(test)]
+use super::types::{decode_config_wire, encode_config_wire};
 use super::{
     ApprovedLegacyConfigRecovery, ConfigConsensusClock, ConfigConsensusResponse,
     ConfigConsensusTopology, ConfigMutationIntent, ConfigRaft, ConfigRaftTypeConfig,
@@ -459,7 +466,16 @@ impl ConsensusConfigStore {
                 .attach_management_audit_keys(policy.keys.clone())
                 .map_err(|_| ConfigConsensusOpenError::AuditContinuityUnavailable)?;
         }
-        let network = ConfigRaftNetworkFactory::try_new(identity, local_node_id, peers.clone())?;
+        let capacity_profile = backend.retained_binding.as_ref().map_or(
+            opc_crypto::ConfigCapacityProfile::Legacy,
+            crate::RetainedConfigBinding::capacity_profile,
+        );
+        let network = ConfigRaftNetworkFactory::try_new(
+            identity,
+            local_node_id,
+            peers.clone(),
+            capacity_profile,
+        )?;
         let (log_store, state_machine, durable_progress) = if let Some(recovery) = recovery {
             storage::open_with_recovery(
                 &backend,
@@ -489,7 +505,8 @@ impl ConsensusConfigStore {
         )
         .await
         .map_err(|_| ConfigConsensusOpenError::EngineUnavailable)?;
-        let raft_handler = ConfigRaftRpcHandler::new(raft.clone(), identity, local_node_id);
+        let raft_handler =
+            ConfigRaftRpcHandler::new(raft.clone(), identity, local_node_id, capacity_profile);
         let linearizability = EnsureLinearizableSupervisor::new(raft.clone());
         Ok(Self {
             inner: Arc::new(ConsensusConfigStoreInner {
@@ -1103,7 +1120,7 @@ impl ConsensusConfigStore {
 
     fn peer_compatibility(&self) -> ConfigPeerCompatibility {
         ConfigPeerCompatibility {
-            wire_version: super::CONFIG_CONSENSUS_WIRE_VERSION,
+            wire_version: config_wire_revision(self.capacity_profile()),
             command_version: super::CONFIG_CONSENSUS_COMMAND_VERSION,
             audit_key_epoch: self.inner.backend.audit_key().epoch(),
             audit_key_fingerprint: self.inner.backend.audit_key().fingerprint(),
@@ -1148,10 +1165,7 @@ impl ConsensusConfigStore {
     }
 
     fn require_commit_capacity(&self, commit: &AttestedConfigCommit) -> Result<(), PersistError> {
-        let profile = self.inner.backend.retained_binding.as_ref().map_or(
-            opc_crypto::ConfigCapacityProfile::Legacy,
-            crate::RetainedConfigBinding::capacity_profile,
-        );
+        let profile = self.capacity_profile();
         if profile != opc_crypto::ConfigCapacityProfile::Legacy
             && !commit
                 .capacity_evidence()
@@ -1162,6 +1176,13 @@ impl ConsensusConfigStore {
             ));
         }
         Ok(())
+    }
+
+    fn capacity_profile(&self) -> opc_crypto::ConfigCapacityProfile {
+        self.inner.backend.retained_binding.as_ref().map_or(
+            opc_crypto::ConfigCapacityProfile::Legacy,
+            crate::RetainedConfigBinding::capacity_profile,
+        )
     }
 
     async fn submit_request(
@@ -1480,7 +1501,8 @@ impl ConsensusConfigStore {
             .get(&target)
             .filter(|peer| peer.node_id() == target)
             .ok_or_else(consensus_unavailable)?;
-        let payload = encode_config_wire(request).map_err(|_| consensus_unavailable())?;
+        let payload = encode_config_wire_for_profile(self.capacity_profile(), request)
+            .map_err(|_| consensus_unavailable())?;
         let wire = ConsensusWireRequest::try_new(
             self.inner.identity,
             self.inner.local_node_id,
@@ -1493,8 +1515,11 @@ impl ConsensusConfigStore {
             .map_err(|_| consensus_unavailable())?
             .map_err(|_| consensus_unavailable())?;
         response.validate().map_err(|_| consensus_unavailable())?;
-        decode_config_wire(&response.result.map_err(|_| consensus_unavailable())?)
-            .map_err(|_| consensus_unavailable())
+        decode_config_wire_for_profile(
+            self.capacity_profile(),
+            &response.result.map_err(|_| consensus_unavailable())?,
+        )
+        .map_err(|_| consensus_unavailable())
     }
 
     async fn local_read_barrier(&self, deadline: tokio::time::Instant) -> ReadBarrierReply {
@@ -1798,7 +1823,10 @@ impl ConsensusRpcHandler for ConfigConsensusService {
                         result: Err(ConsensusPeerError::ScopeMismatch),
                     };
                 }
-                let forwarded: ForwardMutationRequest = match decode_config_wire(&request.payload) {
+                let forwarded: ForwardMutationRequest = match decode_config_wire_for_profile(
+                    self.store.capacity_profile(),
+                    &request.payload,
+                ) {
                     Ok(forwarded) => forwarded,
                     Err(_) => return protocol_rejection(),
                 };
@@ -1813,10 +1841,16 @@ impl ConsensusRpcHandler for ConfigConsensusService {
                 else {
                     return protocol_rejection();
                 };
-                encode_service_reply(&self.store.apply_on_local_leader(forwarded, deadline).await)
+                encode_service_reply_for_profile(
+                    self.store.capacity_profile(),
+                    &self.store.apply_on_local_leader(forwarded, deadline).await,
+                )
             }
             ConsensusRpcFamily::ReadBarrier => {
-                let read: ReadBarrierRequest = match decode_config_wire(&request.payload) {
+                let read: ReadBarrierRequest = match decode_config_wire_for_profile(
+                    self.store.capacity_profile(),
+                    &request.payload,
+                ) {
                     Ok(read) => read,
                     Err(_) => return protocol_rejection(),
                 };
@@ -1826,7 +1860,10 @@ impl ConsensusRpcHandler for ConfigConsensusService {
                     };
                 }
                 if read.compatibility_probe {
-                    return encode_service_reply(&ReadBarrierReply::Compatible);
+                    return encode_service_reply_for_profile(
+                        self.store.capacity_profile(),
+                        &ReadBarrierReply::Compatible,
+                    );
                 }
                 if !self.store.is_live_voter(authenticated_sender) {
                     return ConsensusWireResponse {
@@ -1839,15 +1876,26 @@ impl ConsensusRpcHandler for ConfigConsensusService {
                 else {
                     return protocol_rejection();
                 };
-                encode_service_reply(&self.store.local_read_barrier(deadline).await)
+                encode_service_reply_for_profile(
+                    self.store.capacity_profile(),
+                    &self.store.local_read_barrier(deadline).await,
+                )
             }
             _ => protocol_rejection(),
         }
     }
 }
 
+#[cfg(test)]
 fn encode_service_reply<T: Serialize>(reply: &T) -> ConsensusWireResponse {
-    match encode_config_wire(reply) {
+    encode_service_reply_for_profile(opc_crypto::ConfigCapacityProfile::Legacy, reply)
+}
+
+fn encode_service_reply_for_profile<T: Serialize>(
+    profile: opc_crypto::ConfigCapacityProfile,
+    reply: &T,
+) -> ConsensusWireResponse {
+    match encode_config_wire_for_profile(profile, reply) {
         Ok(payload) => ConsensusWireResponse {
             result: Ok(payload),
         },

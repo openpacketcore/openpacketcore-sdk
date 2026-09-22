@@ -537,6 +537,9 @@ impl ConfigMutationFailure {
     }
 }
 
+#[cfg(test)]
+mod config_capacity_wire_tests;
+
 /// Persisted result returned after durable quorum commit and local apply.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) struct ConfigConsensusResponse {
@@ -555,13 +558,30 @@ pub(crate) struct ConfigConsensusResponse {
     pub(crate) audit_receipt: Option<crate::audit_authority::receipt::AuthenticatedAuditReceipt>,
 }
 
+#[cfg(test)]
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) struct ConfigWirePayload<T> {
     revision: u16,
     value: T,
 }
 
+pub(crate) const fn config_wire_revision(profile: opc_crypto::ConfigCapacityProfile) -> u16 {
+    match profile {
+        opc_crypto::ConfigCapacityProfile::Legacy => CONFIG_CONSENSUS_WIRE_VERSION,
+        opc_crypto::ConfigCapacityProfile::BoundedV1 => 8,
+        _ => 0, // An unknown profile cannot silently acquire legacy admission.
+    }
+}
+
+#[cfg(test)]
 pub(crate) fn encode_config_wire<T: Serialize + ?Sized>(
+    value: &T,
+) -> Result<Vec<u8>, opc_consensus::ConsensusCodecError> {
+    encode_config_wire_for_profile(opc_crypto::ConfigCapacityProfile::Legacy, value)
+}
+
+pub(crate) fn encode_config_wire_for_profile<T: Serialize + ?Sized>(
+    profile: opc_crypto::ConfigCapacityProfile,
     value: &T,
 ) -> Result<Vec<u8>, opc_consensus::ConsensusCodecError> {
     #[derive(Serialize)]
@@ -570,19 +590,77 @@ pub(crate) fn encode_config_wire<T: Serialize + ?Sized>(
         value: &'a T,
     }
     opc_consensus::encode_bounded(&BorrowedConfigWirePayload {
-        revision: CONFIG_CONSENSUS_WIRE_VERSION,
+        revision: config_wire_revision(profile),
         value,
     })
 }
 
+// Validate the profile discriminator before asking the payload to deserialize.
+// This keeps a mismatched peer from allocating its command or snapshot chunk
+// before the immutable configuration profile has been checked.
+struct CheckedConfigWire<T, const REVISION: u16>(T);
+
+impl<'de, T: serde::Deserialize<'de>, const REVISION: u16> serde::Deserialize<'de>
+    for CheckedConfigWire<T, REVISION>
+{
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        struct Visitor<T, const REVISION: u16>(std::marker::PhantomData<T>);
+        impl<'de, T: serde::Deserialize<'de>, const REVISION: u16> serde::de::Visitor<'de>
+            for Visitor<T, REVISION>
+        {
+            type Value = CheckedConfigWire<T, REVISION>;
+
+            fn expecting(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                f.write_str("an exact configuration wire profile")
+            }
+
+            fn visit_seq<A: serde::de::SeqAccess<'de>>(
+                self,
+                mut fields: A,
+            ) -> Result<Self::Value, A::Error> {
+                let revision: u16 = fields.next_element()?.ok_or_else(|| {
+                    serde::de::Error::custom("missing configuration wire profile")
+                })?;
+                if revision != REVISION {
+                    return Err(serde::de::Error::custom(
+                        "configuration wire profile mismatch",
+                    ));
+                }
+                let value = fields.next_element()?.ok_or_else(|| {
+                    serde::de::Error::custom("missing configuration wire payload")
+                })?;
+                Ok(CheckedConfigWire(value))
+            }
+        }
+        deserializer.deserialize_struct(
+            "ConfigWirePayload",
+            &["revision", "value"],
+            Visitor::<T, REVISION>(std::marker::PhantomData),
+        )
+    }
+}
+
+#[cfg(test)]
 pub(crate) fn decode_config_wire<T: serde::de::DeserializeOwned>(
     bytes: &[u8],
 ) -> Result<T, opc_consensus::ConsensusCodecError> {
-    let payload: ConfigWirePayload<T> = opc_consensus::decode_bounded(bytes)?;
-    if payload.revision != CONFIG_CONSENSUS_WIRE_VERSION {
-        return Err(opc_consensus::ConsensusCodecError::Decode);
+    decode_config_wire_for_profile(opc_crypto::ConfigCapacityProfile::Legacy, bytes)
+}
+
+pub(crate) fn decode_config_wire_for_profile<T: serde::de::DeserializeOwned>(
+    profile: opc_crypto::ConfigCapacityProfile,
+    bytes: &[u8],
+) -> Result<T, opc_consensus::ConsensusCodecError> {
+    match profile {
+        opc_crypto::ConfigCapacityProfile::Legacy => opc_consensus::decode_bounded::<
+            CheckedConfigWire<T, CONFIG_CONSENSUS_WIRE_VERSION>,
+        >(bytes)
+        .map(|payload| payload.0),
+        opc_crypto::ConfigCapacityProfile::BoundedV1 => {
+            opc_consensus::decode_bounded::<CheckedConfigWire<T, 8>>(bytes).map(|payload| payload.0)
+        }
+        _ => Err(opc_consensus::ConsensusCodecError::Decode),
     }
-    Ok(payload.value)
 }
 
 impl ConfigConsensusResponse {
