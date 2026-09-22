@@ -258,3 +258,145 @@ async fn mtls_edits_with_duplicate_xml_ids_keep_distinct_requests_and_opaque_exa
     drop(server);
     h.shutdown().await;
 }
+
+#[tokio::test]
+async fn reply_write_timeout_preserves_the_exact_commit_and_its_terminal_fence() {
+    let h = Harness::start().await;
+    let server = Arc::new(running::required_server(&h));
+    let sessions = SessionRegistry::new();
+    let session_server = server.clone();
+    let session_registry = sessions.clone();
+    let (mut client, mut server_io) = tokio::io::duplex(1);
+    // Exercise the actual session write timeout with its unchanged default.
+    // The one-byte stream cannot accept an RPC reply while its peer stops
+    // reading. No synthetic RPC deadline or sleep advances the operation.
+    let config = SessionConfig::default();
+    h.checkpoints.refuse_from.store(6, Ordering::Release);
+    let session = tokio::spawn(async move {
+        crate::session::run_read_only_session_with_registry(
+            session_server.as_ref(),
+            &principal(),
+            &mut server_io,
+            config,
+            1,
+            &session_registry,
+        )
+        .await
+    });
+    tokio::time::timeout(Duration::from_secs(5), read_base10_frame(&mut client))
+        .await
+        .unwrap();
+    let hello = format!(
+        r#"<hello xmlns="{NETCONF_BASE_NS}"><capabilities><capability>{NETCONF_BASE_1_0}</capability></capabilities></hello>"#
+    );
+    client
+        .write_all(&base10::encode_message(hello.as_bytes(), &config.limits).unwrap())
+        .await
+        .unwrap();
+    let edit = edit_config_rpc_to(
+        "running",
+        r#"<sys:system xmlns:sys="urn:opc:demo"><sys:hostname>fixture-timeout</sys:hostname></sys:system>"#,
+        "merge",
+    );
+    client
+        .write_all(&base10::encode_message(edit.as_bytes(), &config.limits).unwrap())
+        .await
+        .unwrap();
+    let result = tokio::time::timeout(config.frame_timeout + Duration::from_secs(5), session)
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(
+        matches!(result, Err(crate::session::SessionError::Io(ref error))
+            if error.kind() == std::io::ErrorKind::TimedOut),
+        "blocked reply did not reach the session write timeout"
+    );
+    assert!(!sessions.contains_session_for_test(1));
+
+    let first = h.source.load_committed_latest().await.unwrap().unwrap();
+    assert_eq!(first.version, ConfigVersion::new(2));
+    assert_eq!(first.config.hostname, "fixture-timeout");
+    assert!(first.principal == principal(), "timed-out caller changed");
+    let original_request = first.request_id.unwrap();
+    let resolved = h
+        .bus
+        .resolve_request_id(original_request)
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(
+        resolved.tx_id == first.tx_id,
+        "reply timeout lost the original committed result"
+    );
+    assert_eq!(resolved.new_version, Some(ConfigVersion::new(2)));
+    assert_eq!(h.checkpoints.sequence(), 4);
+
+    let later_session = sessions.register(2).unwrap();
+    let later = edit.replace("fixture-timeout", "fixture-after-timeout");
+    let refused = server
+        .handle_rpc_for_session_async(
+            RequestId::new(),
+            &principal(),
+            &later,
+            &config.limits,
+            2,
+            &sessions,
+        )
+        .await;
+    assert!(refused.reply_xml.contains("operation-failed"));
+    let pending = h.authority.reconcile_audit_obligations(30).await.unwrap();
+    assert_eq!(
+        (pending.completed, pending.pending, pending.unknown),
+        (0, 0, 1)
+    );
+    let latest = h.source.load_committed_latest().await.unwrap().unwrap();
+    assert!(
+        latest.tx_id == first.tx_id,
+        "terminal fence allowed another effect"
+    );
+
+    h.checkpoints.refuse_from.store(0, Ordering::Release);
+    let recovered = h.authority.reconcile_audit_obligations(30).await.unwrap();
+    assert_eq!(
+        (recovered.completed, recovered.pending, recovered.unknown),
+        (1, 0, 0)
+    );
+    assert_eq!(h.checkpoints.sequence(), 6);
+    let exact = h
+        .bus
+        .resolve_request_id(original_request)
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(
+        exact.tx_id == first.tx_id,
+        "recovery changed the original effect"
+    );
+    // Recovery resolved only the original request. A new write is permitted
+    // after that obligation is complete and has its own audit operation.
+    let permitted = server
+        .handle_rpc_for_session_async(
+            RequestId::new(),
+            &principal(),
+            &later,
+            &config.limits,
+            2,
+            &sessions,
+        )
+        .await;
+    assert!(
+        permitted.reply_xml.contains("<ok/>"),
+        "recovered fence stayed closed"
+    );
+    let latest = h.source.load_committed_latest().await.unwrap().unwrap();
+    assert_eq!(latest.version, ConfigVersion::new(3));
+    assert!(
+        latest.request_id != Some(original_request) && latest.tx_id != first.tx_id,
+        "new write reused the recovered operation"
+    );
+    assert_eq!(h.checkpoints.sequence(), 9);
+    drop(later_session);
+    drop(client);
+    drop(server);
+    h.shutdown().await;
+}
