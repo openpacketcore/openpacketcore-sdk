@@ -301,3 +301,133 @@ async fn config_capacity_957_audit_metadata_counts_at_exact_command_boundary() {
     }
     store.shutdown().await.expect("shutdown encoding fixture");
 }
+
+fn check_audited_validation(command: &crate::consensus::ConfigConsensusCommand, valid: bool) {
+    let ConfigMutationIntent::AuditedMutation(prepared) = &command.intent else {
+        panic!("audited validation fixture");
+    };
+    // Retain the previous owned-inner-command path as a compatibility oracle.
+    // This fixture measures validation semantics, not process allocations.
+    let original = crate::consensus::ConfigConsensusCommand {
+        intent: prepared.effect.intent(),
+        ..command.clone()
+    };
+    let before = serde_json::to_vec(command).expect("format fixture before validation");
+    let decoded: crate::consensus::ConfigConsensusCommand =
+        serde_json::from_slice(&before).expect("untrusted command field decoding");
+    let result = decoded.validate(command.identity);
+    assert_eq!(result.is_ok(), valid, "audited effect format admission");
+    assert!(
+        match (result, original.validate(command.identity)) {
+            (Ok(()), Ok(())) => true,
+            (Err(actual), Err(expected)) => actual.to_string() == expected.to_string(),
+            _ => false,
+        },
+        "borrowed validation must retain the original inner result and error",
+    );
+    assert!(
+        serde_json::to_vec(&decoded).expect("format fixture after validation") == before,
+        "validation must leave the exact encoded command unchanged",
+    );
+}
+
+#[tokio::test]
+async fn config_capacity_957_borrowed_audit_validation_preserves_effect_checks() {
+    use crate::consensus::audit_mutation::AuditedConfigEffect;
+
+    let (store, _snapshots) = singleton_store().await;
+    let mut fixture = audited_boundary_command(&store, 1_572_864);
+    check_audited_validation(&fixture, true);
+    let ConfigMutationIntent::AuditedMutation(prepared) = &fixture.intent else {
+        panic!("audited fixture");
+    };
+    let AuditedConfigEffect::Append { commit, .. } = &prepared.effect else {
+        panic!("append fixture");
+    };
+    let original = commit.clone();
+    let tx_id = original.record.tx_id;
+
+    // Untrusted decoding must not bypass envelope, finalized-audit, principal,
+    // plaintext-digest or confirmed-parent structure checks.
+    let corruptions: [fn(&mut PreparedConfigCommit); 4] = [
+        |commit| commit.record.encrypted_blob.clear(),
+        |commit| commit.record.plaintext_digest.clear(),
+        |commit| commit.record.principal.clear(),
+        |commit| {
+            commit.audit.push(crate::AuditRecord {
+                tx_id: commit.record.tx_id,
+                sequence: 1,
+                yang_path: "/fixture:config".into(),
+                op_type: crate::types::AuditOpType::Update,
+                previous_value: None,
+                new_value: None,
+                redaction_applied: true,
+                previous_hash: [0; 32],
+                entry_hmac: [0x91; 32],
+            });
+        },
+    ];
+    for corrupt in corruptions {
+        let mut commit = original.clone();
+        corrupt(&mut commit);
+        let ConfigMutationIntent::AuditedMutation(prepared) = &mut fixture.intent else {
+            panic!("audited fixture");
+        };
+        prepared.effect = AuditedConfigEffect::Append {
+            commit,
+            resolution: None,
+        };
+        check_audited_validation(&fixture, false);
+    }
+    let ConfigMutationIntent::AuditedMutation(prepared) = &mut fixture.intent else {
+        panic!("audited fixture");
+    };
+    prepared.effect = AuditedConfigEffect::Append {
+        commit: original,
+        resolution: Some(crate::ConfirmedCommitResolution::Confirm {
+            pending_tx_id: tx_id,
+        }),
+    };
+    check_audited_validation(&fixture, false);
+
+    for (label, valid) in [
+        (None, true),
+        (Some("x".repeat(128)), true),
+        (Some("x".repeat(129)), false),
+        (Some(String::new()), false),
+        (Some("invalid\nlabel".into()), false),
+    ] {
+        let ConfigMutationIntent::AuditedMutation(prepared) = &mut fixture.intent else {
+            panic!("audited fixture");
+        };
+        prepared.effect = AuditedConfigEffect::RollbackPoint {
+            tx_id,
+            label: label.map(ValidatedRollbackLabel),
+        };
+        check_audited_validation(&fixture, valid);
+    }
+    let ConfigMutationIntent::AuditedMutation(prepared) = &mut fixture.intent else {
+        panic!("audited fixture");
+    };
+    prepared.effect = AuditedConfigEffect::Confirm { tx_id };
+    for revision in 1..=8 {
+        fixture.schema_version = revision;
+        assert_eq!(
+            fixture.validate(fixture.identity).is_ok(),
+            (5..=7).contains(&revision),
+            "outer audit revision fence remains authoritative",
+        );
+    }
+    fixture.schema_version = crate::consensus::CONFIG_CONSENSUS_COMMAND_VERSION;
+    check_audited_validation(&fixture, true);
+    let other_identity = opc_consensus::ConsensusIdentity::new(
+        ConfigConsensusClusterId::from_bytes([0x92; 32]),
+        fixture.identity.configuration_id(),
+        fixture.identity.configuration_epoch(),
+    );
+    assert!(
+        fixture.validate(other_identity).is_err(),
+        "scope remains bound"
+    );
+    store.shutdown().await.expect("shutdown validation fixture");
+}

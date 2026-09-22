@@ -336,6 +336,17 @@ fn validate_confirmed_resolution(
     Ok(())
 }
 
+fn validate_rollback_point_label(
+    label: Option<&ValidatedRollbackLabel>,
+) -> Result<(), PersistError> {
+    if label.is_some_and(|label| crate::types::validate_rollback_label(label.as_str()).is_err()) {
+        return Err(PersistError::constraint_violation(
+            "rollback label is not canonically representable",
+        ));
+    }
+    Ok(())
+}
+
 /// High-level deterministic mutation carried by a normal Openraft entry.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub(crate) enum ConfigMutationIntent {
@@ -504,23 +515,28 @@ impl ConfigConsensusCommand {
             ConfigMutationIntent::RetainHistory(retention) => retention.validate()?,
             ConfigMutationIntent::ManagementAudit(_) => {}
             ConfigMutationIntent::AuditedMutation(prepared) => {
-                let nested = Self {
-                    intent: prepared.effect.intent(),
-                    ..self.clone()
-                };
-                nested.validate(identity)?;
+                // The outer revision check requires revision 5 or later, so
+                // every closed audited effect's revision is already supported.
+                // Preserve the inner validation order without materializing a
+                // second owned intent and copying its complete encrypted record.
+                match &prepared.effect {
+                    super::audit_mutation::AuditedConfigEffect::Append { commit, resolution } => {
+                        crate::types::config_rollback_label(&commit.record.principal)?;
+                        commit.validate()?;
+                        if let Some(resolution) = resolution {
+                            validate_confirmed_resolution(&commit.record, *resolution)?;
+                        }
+                    }
+                    super::audit_mutation::AuditedConfigEffect::Confirm { .. } => {}
+                    super::audit_mutation::AuditedConfigEffect::RollbackPoint { label, .. } => {
+                        validate_rollback_point_label(label.as_ref())?;
+                    }
+                }
             }
             ConfigMutationIntent::ClearRecoveryRequired { .. } => {}
             ConfigMutationIntent::MarkConfirmed { .. } => {}
             ConfigMutationIntent::CreateRollbackPoint { label, .. } => {
-                if label
-                    .as_ref()
-                    .is_some_and(|label| ValidatedRollbackLabel::try_new(label.0.clone()).is_err())
-                {
-                    return Err(PersistError::constraint_violation(
-                        "rollback label is not canonically representable",
-                    ));
-                }
+                validate_rollback_point_label(label.as_ref())?;
             }
         }
         Ok(())
