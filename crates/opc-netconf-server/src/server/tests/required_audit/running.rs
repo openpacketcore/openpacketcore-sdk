@@ -6,6 +6,8 @@ use std::sync::atomic::AtomicU8;
 pub(super) struct RunningBinding {
     bus: Arc<Mutex<Arc<ConfigBus<DemoConfig>>>>,
     capabilities: Arc<AtomicU8>,
+    startup: Arc<MemoryStartupDatastore>,
+    startup_visible: Arc<AtomicBool>,
 }
 
 impl RunningBinding {
@@ -13,6 +15,8 @@ impl RunningBinding {
         Self {
             bus: Arc::new(Mutex::new(bus)),
             capabilities: Arc::new(AtomicU8::new(0)),
+            startup: Arc::new(MemoryStartupDatastore::new(None, true)),
+            startup_visible: Arc::new(AtomicBool::new(false)),
         }
     }
 }
@@ -48,6 +52,12 @@ impl NetconfConfigBinding<DemoConfig> for RunningBinding {
 
     fn startup_datastore_capability(&self) -> bool {
         self.capabilities.load(Ordering::Acquire) & 4 != 0
+    }
+
+    fn startup_datastore(&self) -> Option<&dyn StartupDatastore<DemoConfig>> {
+        self.startup_visible
+            .load(Ordering::Acquire)
+            .then_some(self.startup.as_ref())
     }
 
     fn render_running_config(
@@ -123,6 +133,65 @@ async fn attachment_refuses_each_unsupported_composition_without_hiding_it() {
         ));
     }
     assert_eq!(h.checkpoints.sequence(), 3);
+    h.shutdown().await;
+}
+
+#[tokio::test]
+async fn unadvertised_startup_port_is_refused_before_and_after_attachment() {
+    let h = Harness::start().await;
+    let binding = RunningBinding::new(h.bus.clone());
+    let startup = binding.startup.clone();
+    let startup_visible = binding.startup_visible.clone();
+    startup
+        .store_startup_config(&DemoConfig {
+            hostname: "fixture-startup".into(),
+            secret: "synthetic-secret".into(),
+        })
+        .unwrap();
+    // A false capability flag must not hide an actual local effect owner.
+    assert!(!binding.startup_datastore_capability());
+    startup_visible.store(true, Ordering::Release);
+    let result =
+        unattached(binding).with_required_config_audit(h.bus.required_config_audit().unwrap());
+    assert!(matches!(
+        result,
+        Err(ServerInitError::RequiredAuditProfileUnsupported)
+    ));
+    assert_eq!(h.checkpoints.sequence(), 3);
+
+    let binding = RunningBinding::new(h.bus.clone());
+    let startup_visible = binding.startup_visible.clone();
+    let binding = RunningBinding { startup, ..binding };
+    let server = unattached(binding)
+        .with_required_config_audit(h.bus.required_config_audit().unwrap())
+        .unwrap();
+    let sessions = SessionRegistry::new();
+    let registration = sessions.register(1).unwrap();
+    // The same guard must be re-evaluated when the binding exposes a port later.
+    startup_visible.store(true, Ordering::Release);
+    let xml = r#"<sys:system xmlns:sys="urn:opc:demo"><sys:hostname>fixture-edited</sys:hostname></sys:system>"#;
+    for request in [
+        edit(),
+        edit_config_rpc_to("startup", xml, "merge"),
+        copy_config_rpc("startup", "running"),
+        delete_config_rpc("startup"),
+    ] {
+        assert!(rpc(&server, &sessions, &request)
+            .await
+            .reply_xml
+            .contains("<error-tag>operation-failed</error-tag>"));
+        assert!(server.candidate.lock().unwrap().snapshot().is_none());
+        assert_eq!(
+            server.binding.startup.current().unwrap().hostname,
+            "fixture-startup"
+        );
+        let stored = h.source.load_committed_latest().await.unwrap().unwrap();
+        assert_eq!(stored.version, ConfigVersion::new(1));
+        assert_eq!(stored.config.hostname, "fixture-initial");
+    }
+    drop(registration);
+    drop(server);
+    drop(startup_visible);
     h.shutdown().await;
 }
 
