@@ -4,6 +4,8 @@ mod audit;
 mod audit_continuity;
 
 #[cfg(test)]
+mod config_capacity_attestation_tests;
+#[cfg(test)]
 mod config_capacity_review_tests;
 
 use std::collections::{BTreeMap, BTreeSet};
@@ -433,11 +435,12 @@ impl ConsensusConfigStore {
         if operation_timeout.is_zero() || operation_timeout > Duration::from_secs(60) {
             return Err(ConfigConsensusOpenError::InvalidRuntimeConfiguration);
         }
-        if backend
-            .retained_binding
-            .as_ref()
-            .is_some_and(|binding| binding.topology() != &topology)
-        {
+        if backend.retained_binding.as_ref().is_some_and(|binding| {
+            binding.topology() != &topology
+                    // The bounded profile is not available until every RPC,
+                    // snapshot and resource boundary admits it coherently.
+                    || binding.capacity_profile() != opc_crypto::ConfigCapacityProfile::Legacy
+        }) {
             return Err(ConfigConsensusOpenError::InvalidRuntimeConfiguration);
         }
         let identity = topology.identity();
@@ -833,6 +836,7 @@ impl ConsensusConfigStore {
         request_id: opc_consensus::ConsensusRequestId,
         commit: AttestedConfigCommit,
     ) -> Result<(), PersistError> {
+        self.require_commit_capacity(&commit)?;
         let (record, audit, resolution) = commit.into_parts();
         let prepared =
             PreparedConfigCommit::prepare(record, audit, self.inner.backend.audit_key())?;
@@ -854,6 +858,7 @@ impl ConsensusConfigStore {
         request_id: opc_consensus::ConsensusRequestId,
         commit: AttestedConfigCommit,
     ) -> Result<(), PersistError> {
+        self.require_commit_capacity(&commit)?;
         let (record, audit, resolution) = commit.into_parts();
         let prepared =
             PreparedConfigCommit::prepare(record, audit, self.inner.backend.audit_key())?;
@@ -1140,6 +1145,23 @@ impl ConsensusConfigStore {
             .membership()
             .voter_ids()
             .any(|voter| voter == node_id)
+    }
+
+    fn require_commit_capacity(&self, commit: &AttestedConfigCommit) -> Result<(), PersistError> {
+        let profile = self.inner.backend.retained_binding.as_ref().map_or(
+            opc_crypto::ConfigCapacityProfile::Legacy,
+            crate::RetainedConfigBinding::capacity_profile,
+        );
+        if profile != opc_crypto::ConfigCapacityProfile::Legacy
+            && !commit
+                .capacity_evidence()
+                .is_some_and(|evidence| evidence.profile() == profile)
+        {
+            return Err(PersistError::constraint_violation(
+                "configuration capacity evidence is required",
+            ));
+        }
+        Ok(())
     }
 
     async fn submit_request(

@@ -154,13 +154,15 @@ pub struct StoredConfig {
 /// A config commit bound to one successful outer-adapter AEAD encryption.
 ///
 /// The one-shot encryption claim is consumed by [`Self::try_new`] and is not
-/// retained or serialized. Consensus therefore receives only ciphertext and
+/// retained or serialized. Optional SDK-validated capacity evidence is retained
+/// after the exact ciphertext/digest checks. Consensus receives only ciphertext and
 /// deterministic metadata, while unauthenticated raw bytes cannot enter its
 /// proposal API.
 pub struct AttestedConfigCommit {
     record: CommitRecord,
     audit: Vec<AuditRecord>,
     confirmed_resolution: Option<ConfirmedCommitResolution>,
+    capacity_evidence: Option<opc_crypto::ConfigCapacityEvidence>,
 }
 
 impl AttestedConfigCommit {
@@ -178,6 +180,7 @@ impl AttestedConfigCommit {
             record,
             audit,
             confirmed_resolution: None,
+            capacity_evidence: claim.capacity_evidence(),
         })
     }
 
@@ -206,7 +209,12 @@ impl AttestedConfigCommit {
             record,
             audit,
             confirmed_resolution: Some(resolution),
+            capacity_evidence: claim.capacity_evidence(),
         })
+    }
+
+    pub(crate) const fn capacity_evidence(&self) -> Option<opc_crypto::ConfigCapacityEvidence> {
+        self.capacity_evidence
     }
 
     pub(crate) fn into_parts(

@@ -78,6 +78,8 @@ impl ConsensusConfigStore {
         commit: AttestedConfigCommit,
         lifetime: std::time::Duration,
     ) -> Result<PreparedAuditedMutation, AuditAuthorityError> {
+        self.require_commit_capacity(&commit)
+            .map_err(|_| AuditAuthorityError::InvalidInput)?;
         let (record, audit, resolution) = commit.into_parts();
         let base = record
             .version
