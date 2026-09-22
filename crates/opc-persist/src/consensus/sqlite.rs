@@ -3241,7 +3241,7 @@ fn validate_sealed_state_sync(
                 "config consensus sealed record metadata is invalid",
             ));
         }
-        let envelope = opc_crypto::CryptoEnvelopeV1::decode(&encrypted_blob).map_err(|_| {
+        let envelope = opc_crypto::CryptoEnvelopeRef::decode(&encrypted_blob).map_err(|_| {
             invalid_data("config consensus state contains plaintext or malformed envelope")
         })?;
         if envelope.nonce.len() != envelope.algorithm.nonce_len()
@@ -3250,7 +3250,7 @@ fn validate_sealed_state_sync(
         {
             return Err(invalid_data("config consensus state envelope is invalid"));
         }
-        let (aad, key_id) = opc_key::decode_bound_aad(&envelope.aad)
+        let (aad, key_id) = opc_key::decode_bound_aad(envelope.aad)
             .map_err(|_| invalid_data("config consensus state AAD is invalid"))?;
         let opc_key::EnvelopeMetadata::Config(metadata) = aad.metadata() else {
             return Err(invalid_data(

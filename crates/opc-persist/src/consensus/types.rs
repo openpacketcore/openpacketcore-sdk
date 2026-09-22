@@ -7,7 +7,7 @@ use std::sync::Arc;
 
 use hmac::{Hmac, KeyInit, Mac};
 use opc_consensus::{ConsensusEntryDigest, ConsensusIdentity};
-use opc_crypto::CryptoEnvelopeV1;
+use opc_crypto::CryptoEnvelopeRef;
 use opc_types::{Timestamp, TxId};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -712,7 +712,7 @@ pub(crate) fn validate_encrypted_record(record: &CommitRecord) -> Result<(), Per
     if record.plaintext_digest.len() != 32 || record.encrypted_blob.is_empty() {
         return Err(PersistError::corrupt_blob());
     }
-    let envelope = CryptoEnvelopeV1::decode(&record.encrypted_blob)
+    let envelope = CryptoEnvelopeRef::decode(&record.encrypted_blob)
         .map_err(|_| PersistError::corrupt_blob())?;
     if envelope.nonce.len() != envelope.algorithm.nonce_len()
         || envelope.aad.is_empty()
@@ -721,7 +721,7 @@ pub(crate) fn validate_encrypted_record(record: &CommitRecord) -> Result<(), Per
         return Err(PersistError::corrupt_blob());
     }
     let (aad, bound_key_id) =
-        opc_key::decode_bound_aad(&envelope.aad).map_err(|_| PersistError::corrupt_blob())?;
+        opc_key::decode_bound_aad(envelope.aad).map_err(|_| PersistError::corrupt_blob())?;
     let opc_key::EnvelopeMetadata::Config(metadata) = aad.metadata() else {
         return Err(PersistError::corrupt_blob());
     };
