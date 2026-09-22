@@ -914,6 +914,10 @@ impl<C> ManagedDatastore<SealedConfig<C>> for RaftManagedDatastore<C>
 where
     C: OpcConfig + Serialize + DeserializeOwned + Send + Sync + 'static,
 {
+    fn config_capacity_profile(&self) -> opc_config_bus::datastore::ConfigCapacityProfile {
+        self.consensus_store().capacity_profile()
+    }
+
     fn required_audit_observations(&self) -> Option<Arc<dyn opc_mgmt_audit::AuditSink>> {
         self.audit
             .as_ref()

@@ -1185,7 +1185,9 @@ impl ConsensusConfigStore {
         Ok(())
     }
 
-    fn capacity_profile(&self) -> opc_crypto::ConfigCapacityProfile {
+    /// Immutable configuration byte profile admitted by this retained authority.
+    /// Encrypting adapters use it before serialization and key-provider access.
+    pub fn capacity_profile(&self) -> opc_crypto::ConfigCapacityProfile {
         self.inner.backend.retained_binding.as_ref().map_or(
             opc_crypto::ConfigCapacityProfile::Legacy,
             crate::RetainedConfigBinding::capacity_profile,
