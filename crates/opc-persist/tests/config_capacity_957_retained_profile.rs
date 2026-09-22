@@ -98,16 +98,45 @@ fn config_capacity_957_native_wal_child() {
         rusqlite::OpenFlags::SQLITE_OPEN_READ_WRITE,
     )
     .expect("open previously provisioned synthetic store");
+    let record: Vec<u8> = connection
+        .query_row(
+            "SELECT record FROM consensus_retained_binding WHERE singleton=1",
+            [],
+            |row| row.get(0),
+        )
+        .expect("original valid binding");
     connection
         .execute_batch(
             "PRAGMA journal_mode=WAL;
              PRAGMA synchronous=FULL;
              PRAGMA wal_autocheckpoint=0;
              BEGIN IMMEDIATE;
-             UPDATE consensus_retained_binding SET record=record WHERE singleton=1;
-             COMMIT;",
+             DELETE FROM consensus_retained_binding WHERE singleton=1;",
         )
+        .expect("dirty the binding page inside one native transaction");
+    // SQLite may elide an unchanged-value UPDATE entirely. Remove and restore
+    // the exact authenticated row in one transaction to require a WAL frame
+    // while preserving the provisioned authority and its complete schema.
+    assert_eq!(
+        connection
+            .execute(
+                "INSERT INTO consensus_retained_binding (singleton, record) VALUES (1, ?1)",
+                [&record],
+            )
+            .expect("restore the exact original binding"),
+        1
+    );
+    connection
+        .execute_batch("COMMIT;")
         .expect("durably commit unchanged valid binding through native WAL");
+    let committed: Vec<u8> = connection
+        .query_row(
+            "SELECT record FROM consensus_retained_binding WHERE singleton=1",
+            [],
+            |row| row.get(0),
+        )
+        .expect("committed binding");
+    assert!(committed == record, "native WAL preserves exact binding");
     // Abrupt exit retains the real WAL. No destructor may checkpoint it first.
     std::process::exit(91);
 }
