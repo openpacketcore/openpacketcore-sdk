@@ -158,19 +158,48 @@ fn config_capacity_957_retained_ledger_buffer_inventory() {
         )
         .expect("actual SQL-owned JSON allocation");
     let decoded: StoredLedger = serde_json::from_slice(&encoded).expect("actual decoded state");
-    let canonical = serde_json::to_vec(&decoded).expect("same encoder used by authentication");
+    let canonical = serde_json::to_vec(&decoded).expect("original authentication encoder");
     assert!(canonical == encoded, "canonical bytes stay exact");
     assert!(canonical.len() <= MAX_STATE_BYTES);
+    let original_mac = crate::audit_authority::ledger::authenticate(&key, STATE_DOMAIN, &decoded)
+        .expect("original authenticated transcript");
+    let (streamed, streamed_mac) = encode_state(&decoded, &key).expect("streamed state output");
+    assert!(
+        streamed == encoded,
+        "complete populated encoding stays exact"
+    );
+    assert!(
+        streamed_mac == original_mac,
+        "populated authenticator stays exact"
+    );
+    stream_state(
+        &decoded,
+        &key,
+        canonical_state_len(&decoded).expect("actual canonical length"),
+        None,
+    )
+    .expect("verification without a canonical output buffer")
+    .verify_slice(&original_mac)
+    .expect("original populated authentication remains valid");
     let decoded_bytes = decoded_owned_bytes(&decoded);
-    let known_live_bytes = encoded.capacity() + canonical.capacity() + decoded_bytes;
+    let original_canonical_capacity = canonical.capacity();
+    let streamed_write_capacity = streamed.capacity();
+    // The extra outputs above are compatibility oracles, not live buffers in
+    // the streaming read path. Release them before recording the inventory.
+    drop(canonical);
+    drop(streamed);
+    let read_known_live_bytes = encoded.capacity() + decoded_bytes;
+    let write_known_live_bytes = streamed_write_capacity + decoded_bytes;
     // Keep these value-free measurements visible in the required quiet CI
     // harness even when this test passes; ordinary println output is captured.
     writeln!(
         std::io::stdout().lock(),
-        "CONFIG_CAPACITY_LEDGER_BUFFERS encoded_len={} encoded_capacity={} canonical_capacity={} decoded_owned_bytes={} known_live_bytes={}",
-        encoded.len(), encoded.capacity(), canonical.capacity(), decoded_bytes, known_live_bytes,
+        "CONFIG_CAPACITY_LEDGER_STREAMED_BUFFERS encoded_len={} encoded_capacity={} original_canonical_capacity={} streamed_write_capacity={} decoded_owned_bytes={} read_known_live_bytes={} write_known_live_bytes={}",
+        encoded.len(), encoded.capacity(), original_canonical_capacity, streamed_write_capacity,
+        decoded_bytes, read_known_live_bytes, write_known_live_bytes,
     )
     .expect("emit value-free allocation inventory");
     // No unmeasured 32 MiB assertion: this excludes allocator overhead, SQL,
-    // validation temporaries, commands, transport, replication and continuity.
+    // validation temporaries (including derived operations), commands,
+    // transport, replication and continuity.
 }

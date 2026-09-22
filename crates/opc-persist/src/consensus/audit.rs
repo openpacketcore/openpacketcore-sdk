@@ -1,16 +1,16 @@
 //! Management audit changes applied by the existing configuration state machine.
 
+use hmac::{Hmac, KeyInit, Mac};
 use rusqlite::{params, Connection, OptionalExtension};
 use serde::{Deserialize, Serialize};
+use sha2::Sha256;
 use std::io;
 
 use super::ConfigMutationFailure;
 use crate::audit_authority::continuity::{
     chain::ContinuityState, AuditCheckpoint, AuditKeyRing, AuditKeyTransition,
 };
-use crate::audit_authority::ledger::{
-    authenticate, verify, LedgerState, MAX_STATE_BYTES, STATE_DOMAIN,
-};
+use crate::audit_authority::ledger::{LedgerState, MAX_STATE_BYTES, STATE_DOMAIN};
 use crate::audit_authority::{
     AuditAuthorityError, AuditLedgerLimits, AuditOperationHandle, AuditOperationState, AuditToken,
 };
@@ -60,6 +60,94 @@ fn invalid() -> io::Error {
     )
 }
 
+// StoredLedger is a closed, immutable serde representation. Count its exact
+// canonical JSON before authenticating the length-prefixed bytes. Verification
+// needs no second complete JSON allocation alongside the SQL row and decoded
+// ledger; writes allocate their one output buffer once. The transcript remains
+// exactly the existing audit-authority STATE_DOMAIN, u64 length and JSON.
+struct StateByteCounter(usize);
+
+impl io::Write for StateByteCounter {
+    fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+        self.0 = self
+            .0
+            .checked_add(bytes.len())
+            .filter(|length| *length <= MAX_STATE_BYTES)
+            .ok_or_else(invalid)?;
+        Ok(bytes.len())
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        Ok(())
+    }
+}
+
+fn canonical_state_len(stored: &StoredLedger) -> io::Result<usize> {
+    let mut counter = StateByteCounter(0);
+    serde_json::to_writer(&mut counter, stored).map_err(|_| invalid())?;
+    Ok(counter.0)
+}
+
+struct StateWriter<'a> {
+    mac: Hmac<Sha256>,
+    remaining: usize,
+    encoded: Option<&'a mut Vec<u8>>,
+}
+
+impl io::Write for StateWriter<'_> {
+    fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+        let remaining = self
+            .remaining
+            .checked_sub(bytes.len())
+            .ok_or_else(invalid)?;
+        if let Some(encoded) = self.encoded.as_mut() {
+            if encoded.capacity().saturating_sub(encoded.len()) < bytes.len() {
+                return Err(invalid());
+            }
+            encoded.extend_from_slice(bytes);
+        }
+        self.mac.update(bytes);
+        self.remaining = remaining;
+        Ok(bytes.len())
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        Ok(())
+    }
+}
+
+fn stream_state(
+    stored: &StoredLedger,
+    key: &AuditKey,
+    length: usize,
+    encoded: Option<&mut Vec<u8>>,
+) -> io::Result<Hmac<Sha256>> {
+    if length > MAX_STATE_BYTES {
+        return Err(invalid());
+    }
+    let mut mac = Hmac::<Sha256>::new_from_slice(key.as_bytes()).map_err(|_| invalid())?;
+    mac.update(STATE_DOMAIN);
+    mac.update(&(length as u64).to_be_bytes());
+    let mut writer = StateWriter {
+        mac,
+        remaining: length,
+        encoded,
+    };
+    serde_json::to_writer(&mut writer, stored).map_err(|_| invalid())?;
+    if writer.remaining != 0 {
+        return Err(invalid());
+    }
+    Ok(writer.mac)
+}
+
+fn encode_state(stored: &StoredLedger, key: &AuditKey) -> io::Result<(Vec<u8>, [u8; 32])> {
+    let length = canonical_state_len(stored)?;
+    let mut encoded = Vec::new();
+    encoded.try_reserve_exact(length).map_err(|_| invalid())?;
+    let mac = stream_state(stored, key, length, Some(&mut encoded))?;
+    Ok((encoded, mac.finalize().into_bytes().into()))
+}
+
 /// A signed inactive row distinguishes initial provisioning from lost authority.
 pub(crate) fn initialize_sync(
     conn: &Connection,
@@ -101,7 +189,10 @@ fn read_verified_sync(conn: &Connection, key: &AuditKey) -> io::Result<StoredLed
     ).optional().map_err(|_| invalid())?.ok_or_else(invalid)?;
     let mac: [u8; 32] = mac.try_into().map_err(|_| invalid())?;
     let stored: StoredLedger = serde_json::from_slice(&encoded).map_err(|_| invalid())?;
-    verify(key, STATE_DOMAIN, &stored, &mac).map_err(|_| invalid())?;
+    let length = canonical_state_len(&stored)?;
+    stream_state(&stored, key, length, None)?
+        .verify_slice(&mac)
+        .map_err(|_| invalid())?;
     if let Some(ledger) = &stored.ledger {
         ledger
             .validate(key, stored.identity)
@@ -131,11 +222,7 @@ pub(crate) fn write_sync(
     initialize: bool,
 ) -> io::Result<()> {
     let stored = StoredLedger { identity, ledger };
-    let encoded = serde_json::to_vec(&stored).map_err(|_| invalid())?;
-    if encoded.len() > MAX_STATE_BYTES {
-        return Err(invalid());
-    }
-    let mac = authenticate(key, STATE_DOMAIN, &stored).map_err(|_| invalid())?;
+    let (encoded, mac) = encode_state(&stored, key)?;
     let statement = if initialize {
         "INSERT INTO config_raft_management_audit(singleton,state_json,state_hmac) VALUES(1,?1,?2)"
     } else {
@@ -354,3 +441,7 @@ pub(crate) fn protects_config_prefix(
 #[cfg(test)]
 #[path = "tests/config_capacity_957_ledger_allocations.rs"]
 mod config_capacity_957_ledger_allocations;
+
+#[cfg(test)]
+#[path = "tests/config_capacity_957_ledger_streaming.rs"]
+mod config_capacity_957_ledger_streaming;
