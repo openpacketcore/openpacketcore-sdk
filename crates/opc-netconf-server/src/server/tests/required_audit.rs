@@ -215,10 +215,6 @@ impl Harness {
         }
     }
 
-    fn server(&self) -> Server {
-        self.server_with_startup(None)
-    }
-
     fn server_with_startup(&self, startup: Option<Arc<MemoryStartupDatastore>>) -> Server {
         let audit = self.bus.required_config_audit().unwrap();
         ReadOnlyNetconfServer::new(
@@ -390,10 +386,13 @@ async fn required_capability_refuses_each_mismatched_protocol_intent_before_admi
 }
 
 #[tokio::test]
-async fn required_capability_replays_only_the_exact_request_without_a_second_effect() {
+async fn required_capability_replays_only_the_exact_idempotent_request_without_a_second_effect() {
     let h = Harness::start().await;
     let audit = h.bus.required_config_audit().unwrap();
     let (request, intent) = exact_replace(RequestId::new(), 1);
+    let request = request.with_idempotency_key(
+        opc_config_model::IdempotencyKey::new("synthetic-required-replay").unwrap(),
+    );
     let first = audit.submit(request.clone(), intent.clone()).await.unwrap();
     let replay = audit.submit(request.clone(), intent.clone()).await.unwrap();
     assert!(
@@ -411,6 +410,33 @@ async fn required_capability_replays_only_the_exact_request_without_a_second_eff
         stored.tx_id == first.tx_id,
         "conflicting replay changed transaction"
     );
+    assert_eq!(stored.version, ConfigVersion::new(2));
+    assert_eq!(stored.config.hostname, "fixture-control");
+    drop(audit);
+    h.shutdown().await;
+}
+
+#[tokio::test]
+async fn request_identity_alone_resolves_the_original_result_without_authorizing_replay() {
+    let h = Harness::start().await;
+    let audit = h.bus.required_config_audit().unwrap();
+    let request_id = RequestId::new();
+    let (request, intent) = exact_replace(request_id, 1);
+    let first = audit.submit(request.clone(), intent.clone()).await.unwrap();
+    assert_eq!(h.checkpoints.sequence(), 6);
+
+    // Request correlation is a read-only recovery key. Replaying the original
+    // stale-base request without an idempotency key cannot authorize a write.
+    let error = audit.submit(request, intent).await.unwrap_err();
+    assert_eq!(error.code, CommitErrorCode::AdmissionRejected);
+    let recovered = h.bus.resolve_request_id(request_id).await.unwrap().unwrap();
+    assert!(
+        first.tx_id == recovered.tx_id,
+        "recovery changed transaction"
+    );
+    assert_eq!(first.committed_revision, recovered.committed_revision);
+    let stored = h.source.load_committed_latest().await.unwrap().unwrap();
+    assert!(stored.tx_id == first.tx_id, "duplicate changed transaction");
     assert_eq!(stored.version, ConfigVersion::new(2));
     assert_eq!(stored.config.hostname, "fixture-control");
     drop(audit);

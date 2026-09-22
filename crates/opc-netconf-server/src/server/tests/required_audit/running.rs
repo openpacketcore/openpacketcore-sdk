@@ -199,10 +199,77 @@ async fn capability_changes_after_attachment_permit_no_local_or_running_mutation
 }
 
 #[tokio::test]
-async fn required_edit_data_and_inline_copy_bind_their_real_operations_once() {
+async fn required_edit_data_binds_its_real_operation_once() {
+    let xml = r#"<sys:system xmlns:sys="urn:opc:demo"><sys:hostname>fixture-edited</sys:hostname><sys:secret>synthetic-secret</sys:secret></sys:system>"#;
+    let h = Harness::start().await;
+    let server = required_server(&h);
+    let sessions = SessionRegistry::new();
+    let registration = sessions.register(1).unwrap();
+    assert!(
+        rpc(&server, &sessions, &edit_data_rpc("running", xml, "merge"))
+            .await
+            .reply_xml
+            .contains("<ok/>")
+    );
+    let stored = h.source.load_committed_latest().await.unwrap().unwrap();
+    assert_eq!(stored.version, ConfigVersion::new(2));
+    assert_eq!(stored.config.hostname, "fixture-edited");
+    assert_eq!(h.checkpoints.sequence(), 6);
+    drop(registration);
+    drop(server);
+    h.shutdown().await;
+}
+
+#[tokio::test]
+async fn copy_to_running_effect_helper_binds_one_exact_replacement() {
+    let h = Harness::start().await;
+    let server = required_server(&h);
+    let sessions = SessionRegistry::new();
+    let registration = sessions.register(1).unwrap();
+    let principal = principal();
+    let reply_attrs = RpcReplyAttributes::default();
+    let context = RpcExecContext {
+        request_id: RequestId::new(),
+        principal: &principal,
+        message_id: "synthetic-copy",
+        reply_attrs: &reply_attrs,
+        started: Instant::now(),
+    };
+    // Exercise the real effect helper with a resolved source. This is not
+    // positive wire-protocol copy coverage: the current required profile has
+    // no second supported datastore, and inline sources remain unsupported.
+    let copied = server
+        .copy_config_to_running(
+            DemoConfig {
+                hostname: "fixture-copied".into(),
+                secret: "synthetic-secret".into(),
+            },
+            &context,
+            1,
+            &sessions,
+        )
+        .await;
+    assert!(copied.reply_xml.contains("<ok/>"));
+    let stored = h.source.load_committed_latest().await.unwrap().unwrap();
+    assert!(
+        stored.request_id == Some(context.request_id),
+        "copy changed request binding"
+    );
+    assert!(stored.principal == principal, "copy changed caller binding");
+    assert_eq!(stored.version, ConfigVersion::new(2));
+    assert_eq!(stored.config.hostname, "fixture-copied");
+    assert_eq!(h.checkpoints.sequence(), 6);
+    drop(registration);
+    drop(server);
+    h.shutdown().await;
+}
+
+#[tokio::test]
+async fn unsupported_copy_sources_permit_no_effect_in_the_required_running_profile() {
     let xml = r#"<sys:system xmlns:sys="urn:opc:demo"><sys:hostname>fixture-edited</sys:hostname><sys:secret>synthetic-secret</sys:secret></sys:system>"#;
     for request in [
-        edit_data_rpc("running", xml, "merge"),
+        copy_config_rpc("running", "candidate"),
+        copy_config_rpc("running", "startup"),
         format!(
             r#"<rpc xmlns="urn:ietf:params:xml:ns:netconf:base:1.0" message-id="synthetic"><copy-config><target><running/></target><source><config>{xml}</config></source></copy-config></rpc>"#
         ),
@@ -214,15 +281,36 @@ async fn required_edit_data_and_inline_copy_bind_their_real_operations_once() {
         assert!(rpc(&server, &sessions, &request)
             .await
             .reply_xml
-            .contains("<ok/>"));
+            .contains("rpc-error"));
         let stored = h.source.load_committed_latest().await.unwrap().unwrap();
-        assert_eq!(stored.version, ConfigVersion::new(2));
-        assert_eq!(stored.config.hostname, "fixture-edited");
-        assert_eq!(h.checkpoints.sequence(), 6);
+        assert_eq!(stored.version, ConfigVersion::new(1));
+        assert_eq!(stored.config.hostname, "fixture-initial");
+        let recovery = h.authority.reconcile_audit_obligations(30).await.unwrap();
+        assert_eq!(
+            (recovery.completed, recovery.pending, recovery.unknown),
+            (0, 0, 0)
+        );
         drop(registration);
         drop(server);
         h.shutdown().await;
     }
+}
+
+#[tokio::test]
+async fn same_datastore_copy_is_invalid_and_creates_only_a_failure_observation() {
+    let h = Harness::start().await;
+    let server = required_server(&h);
+    let sessions = SessionRegistry::new();
+    let registration = sessions.register(1).unwrap();
+    let copied = rpc(&server, &sessions, &copy_config_rpc("running", "running")).await;
+    assert!(copied.reply_xml.contains("invalid-value"));
+    let stored = h.source.load_committed_latest().await.unwrap().unwrap();
+    assert_eq!(stored.version, ConfigVersion::new(1));
+    assert_eq!(stored.config.hostname, "fixture-initial");
+    assert_eq!(h.checkpoints.sequence(), 4);
+    drop(registration);
+    drop(server);
+    h.shutdown().await;
 }
 
 #[tokio::test]

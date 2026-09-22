@@ -60,7 +60,7 @@ behavior and accept borrowed sink adapters.
 
 `ReadOnlyNetconfServer::with_required_config_audit` installs the capability from
 the exact binding's `ConfigBus::required_config_audit`. For this profile,
-running `edit-config`, NMDA `edit-data`, and supported `copy-config` submit their
+running `edit-config` and NMDA `edit-data` submit their
 original authenticated request together with its required intent. The encrypted
 datastore admits and checkpoints that intent before its effect. The protocol
 does not send a separate Intent to an observation sink or report a second
@@ -74,6 +74,14 @@ one opened over the same store. It never hides capabilities. Changed capability
 answers after attachment also fail closed. Full candidate/startup/confirmation
 support remains tracked by #958 and the
 [contract proposal](../../docs/rfc/netconf-required-audit-958.md).
+
+The copy-to-running effect helper uses the same required submitter, but this
+profile has no supported distinct source datastore: candidate and startup are
+refused, and the XML parser does not support inline copy sources. Copying a
+datastore to itself returns `invalid-value` as required by
+[RFC 6241 section 7.3](https://www.rfc-editor.org/rfc/rfc6241.html#section-7.3).
+Helper qualification does not establish positive wire-protocol copy coverage;
+that remains part of the full-profile work in #958.
 
 The supplied legacy sink is replaced by that authority's observation port.
 Reads and denials use asynchronous observations; registry-free synchronous
