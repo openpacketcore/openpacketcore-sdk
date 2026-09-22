@@ -73,6 +73,38 @@ pub(super) async fn send_snapshot(
         .await;
     if response.result.is_err() {
         eprintln!("async_snapshot stage=response success=false");
+        // Passive observations after a failed response; no retry or new work.
+        let health = cold.persistence_health();
+        let metrics = cold.inner.raft.metrics().borrow().clone();
+        #[cfg(feature = "test-control")]
+        let build_phase = cold.inner.backend.snapshot_observation().phase_for_test();
+        #[cfg(not(feature = "test-control"))]
+        let build_phase = "test-control-disabled";
+        eprintln!(
+            "async_snapshot engine_running={} storage_failed={} active={} cold_permits={} log={:?} applied={:?} snapshot={:?} purged={:?} build_phase={}",
+            health.engine_running,
+            health.storage_failure.is_some(),
+            cold.inner.persistence_protocol.is_active(),
+            cold.inner.persistence_protocol.cold_rpc_admission.available_permits(),
+            metrics.last_log_index,
+            metrics.last_applied.map(|id| id.index),
+            metrics.snapshot.map(|id| id.index),
+            metrics.purged.map(|id| id.index),
+            build_phase,
+        );
+        if let Some(progress) = health.asynchronous {
+            eprintln!(
+                "async_snapshot resident_generation={} completed_generation={} captured_generation={:?} resident_sequence={} completed_sequence={} lag_ms={} saturated={} background_failed={}",
+                progress.resident_generation,
+                progress.completed_generation,
+                progress.captured_generation,
+                progress.resident_sequence,
+                progress.completed_sequence,
+                progress.lag_millis,
+                progress.saturated,
+                progress.background_failure.is_some(),
+            );
+        }
     }
     response
 }
