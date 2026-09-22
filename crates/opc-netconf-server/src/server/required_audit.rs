@@ -109,7 +109,16 @@ where
             ConfigOperation::Delete => AuditOperation::Delete,
             ConfigOperation::Rollback => AuditOperation::Rollback,
         };
-        audit.submit(request, intent).await
+        let mut terminal = intent.clone();
+        terminal.outcome = AuditOutcome::Success;
+        let result = audit.submit(request, intent).await?;
+        if commit_audit_failed(&self.audit, &terminal).await {
+            return Err(CommitError::new(
+                CommitErrorCode::PersistFailed,
+                "configuration terminal observation unavailable",
+            ));
+        }
+        Ok(result)
     }
 
     /// Once the required submitter owns the request, only its exact retained
