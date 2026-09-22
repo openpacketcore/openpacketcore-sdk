@@ -350,3 +350,7 @@ pub(crate) fn protects_config_prefix(
         (base > 0 && base < retain_from) || matches!(op.state, AuditOperationState::Committed { version } if version < retain_from)
     })))
 }
+
+#[cfg(test)]
+#[path = "tests/config_capacity_957_ledger_allocations.rs"]
+mod config_capacity_957_ledger_allocations;
