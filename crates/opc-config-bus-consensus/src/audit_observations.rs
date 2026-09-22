@@ -43,6 +43,10 @@ impl AuditSink for ConsensusObservations {
         event: &'a AuditEvent,
     ) -> Pin<Box<dyn Future<Output = Result<(), AuditError>> + Send + 'a>> {
         Box::pin(async move {
+            // Adversarial qualification only: bypass standalone Intent admission.
+            if event.outcome == AuditOutcome::Intent {
+                return Ok(());
+            }
             let runtime = tokio::runtime::Handle::try_current().map_err(|_| unavailable())?;
             let permit = Arc::clone(&self.admission)
                 .try_acquire_owned()
