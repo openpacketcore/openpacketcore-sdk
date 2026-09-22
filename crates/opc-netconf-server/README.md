@@ -73,7 +73,7 @@ bindings, and `RequiredAuditWorkerMismatch` for another bus worker, including
 one opened over the same store. It never hides capabilities. Changed capability
 answers after attachment also fail closed. Full candidate/startup/confirmation
 support remains tracked by #958 and the
-[contract proposal](../../docs/rfc/netconf-required-audit-958.md).
+[contract proposal](../../docs/rfc/019-netconf-required-audit.md).
 
 The copy-to-running effect helper uses the same required submitter, but this
 profile has no supported distinct source datastore: candidate and startup are

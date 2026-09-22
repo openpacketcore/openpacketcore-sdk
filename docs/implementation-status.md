@@ -29,6 +29,17 @@ hardening decisions is recorded in [`docs/adr/`](adr/).
 
 ---
 
+## RFC number allocation — 2026-09-22
+
+RFC 019 is allocated to [NETCONF required audit for exact configuration
+effects](rfc/019-netconf-required-audit.md). The next available RFC number is
+**020**. Allocate subsequent numbers sequentially under the governance process.
+Allocation alone does not approve an API or qualify an implementation.
+
+| RFC | Status | Scope and remaining acceptance |
+| --- | --- | --- |
+| [019](rfc/019-netconf-required-audit.md) | partial | The writable-running implementation is proposed in [#963](https://github.com/openpacketcore/openpacketcore-sdk/pull/963). Candidate preparation, distinct wire copy sources, startup and confirmed lifecycle effects, and complete recovery qualification remain open under [#958](https://github.com/openpacketcore/openpacketcore-sdk/issues/958). |
+
 ## N2 fixture port correction — 2026-09-17
 
 The `n2-sctp` metadata vectors now encode port 38412 (`96 0c`), correcting
