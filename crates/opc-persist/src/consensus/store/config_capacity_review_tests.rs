@@ -105,9 +105,8 @@ async fn verify_forward_rejection(lose_applied_response: bool) {
         "disk-backed retained storage is required"
     );
 
-    let members = (1..=3)
-        .map(|id| ConsensusNodeId::new(id).expect("synthetic node"))
-        .collect::<BTreeSet<_>>();
+    let nodes = [1, 2, 3].map(|id| ConsensusNodeId::new(id).expect("synthetic node"));
+    let members = nodes.into_iter().collect::<BTreeSet<_>>();
     let identity = ConfigConsensusIdentity::new(
         ConfigConsensusClusterId::new("synthetic-capacity-routing").expect("cluster"),
         ConfigConsensusConfigurationId::from_bytes([0xD1; 32]),
@@ -166,12 +165,28 @@ async fn verify_forward_rejection(lose_applied_response: bool) {
         *peers[node].handler.write().await = Some(store.rpc_handler());
         stores.insert(*node, store);
     }
-    let first = *members.first().expect("first member");
-    stores[&first]
-        .initialize_cluster()
+    let [first, second, third] = nodes;
+    let formation_deadline = tokio::time::Instant::now()
+        .checked_add(stores[&first].inner.operation_timeout)
+        .expect("original formation budget");
+    let (one, two, three) = tokio::time::timeout_at(formation_deadline, async {
+        tokio::join!(
+            stores[&first].initialize_cluster(),
+            stores[&second].initialize_cluster(),
+            stores[&third].initialize_cluster(),
+        )
+    })
+    .await
+    .expect("all members initialize within the original operation budget");
+    one.expect("initialize first member");
+    two.expect("initialize second member");
+    three.expect("initialize third member");
+    // Membership admission can finish before the first election. Observe the
+    // real metrics event using the same deadline; do not sample or sleep.
+    let leader = stores[&first]
+        .wait_for_known_leader(formation_deadline)
         .await
-        .expect("initialize real Openraft cluster");
-    let leader = stores[&first].status().leader_id.expect("elected leader");
+        .expect("elected leader within the original operation budget");
     let follower = *members
         .iter()
         .find(|node| **node != leader)
