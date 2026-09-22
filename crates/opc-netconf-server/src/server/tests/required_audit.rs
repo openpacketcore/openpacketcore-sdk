@@ -332,7 +332,7 @@ async fn exact_bus_control_fences_unavailable_and_ambiguous_intent_checkpoint() 
         let audit = h.bus.required_config_audit().unwrap();
         let (request, intent) = exact_replace(RequestId::new(), 1);
         assert!(audit.submit(request, intent).await.is_err());
-        assert_eq!(h.bus.version(), ConfigVersion::new(1));
+        assert_eq!(h.bus.current_snapshot().version, ConfigVersion::new(1));
         assert_eq!(h.checkpoints.sequence(), if unknown { 4 } else { 3 });
 
         // Restore read availability only after submission returned. Recovering
