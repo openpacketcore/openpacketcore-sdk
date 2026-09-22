@@ -95,7 +95,7 @@ where
         };
         // Bind to the bus selected for this request, not a second potentially
         // different result from the application binding's config_bus method.
-        if !audit.belongs_to(bus) || !self.required_audit_profile_supported() {
+        if !self.required_audit_profile_supported() {
             intent.outcome = audit_failed("operation-failed");
             let _ = commit_audit_failed(&self.audit, &intent).await;
             return Err(CommitError::new(
