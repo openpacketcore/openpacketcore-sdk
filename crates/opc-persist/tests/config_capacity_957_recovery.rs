@@ -329,3 +329,177 @@ async fn config_capacity_957_invalid_recovery_rejects_before_read_barrier() {
     }
     assert_eq!(counts(&root), before);
 }
+
+#[derive(Debug, PartialEq, Eq)]
+struct RecoveryWindow {
+    application_sequence: i64,
+    retained_count: i64,
+    oldest_sequence: i64,
+    newest_sequence: i64,
+    original_sequence: Option<i64>,
+}
+
+fn recovery_window(root: &Path, original: ConfigConsensusRequestId) -> RecoveryWindow {
+    use rusqlite::OptionalExtension;
+
+    let mut conn = rusqlite::Connection::open_with_flags(
+        root.join("config.sqlite"),
+        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+    )
+    .expect("read-only retained window inspection");
+    let view = conn.transaction().expect("consistent read-only view");
+    let application_sequence = view
+        .query_row(
+            "SELECT application_sequence FROM config_raft_machine WHERE singleton=1",
+            [],
+            |row| row.get(0),
+        )
+        .expect("actual applied application frontier");
+    let (retained_count, oldest_sequence, newest_sequence) = view
+        .query_row(
+            "SELECT COUNT(*), MIN(applied_sequence), MAX(applied_sequence) FROM config_raft_request_outcomes",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )
+        .expect("nonempty retained result window");
+    let original_sequence = view
+        .query_row(
+            "SELECT applied_sequence FROM config_raft_request_outcomes WHERE request_id=?1",
+            [original.as_bytes().as_slice()],
+            |row| row.get(0),
+        )
+        .optional()
+        .expect("exact original outcome presence");
+    RecoveryWindow {
+        application_sequence,
+        retained_count,
+        oldest_sequence,
+        newest_sequence,
+        original_sequence,
+    }
+}
+
+#[tokio::test]
+async fn config_capacity_957_recovery_window_expiry_stays_unresolved_after_reopen() {
+    // This exercises the unchanged 4096-applied-sequence public recovery
+    // window through native Durable Raft writes. It is not an enlarged
+    // history budget, multi-node snapshot or larger-config qualification.
+    const RETAINED_OUTCOMES: i64 = 4096;
+    let root = disk_fixture();
+    let store = open(&root, false).await;
+    let original = ConfigConsensusRequestId::from_bytes([0xB4; 16]);
+    let input = commit();
+    let expected = input.record().clone();
+    let operation = store
+        .prepare_recoverable_commit(original, input, CALLER)
+        .expect("prepare original operation once");
+    let handle = operation.recovery_handle().clone();
+    store
+        .append_prepared_commit_local(operation)
+        .await
+        .expect("original known commit");
+    let initial = recovery_window(&root, original);
+    let committed_sequence = initial.original_sequence.expect("original retained result");
+    assert_eq!(initial.application_sequence, committed_sequence);
+    assert_eq!(initial.retained_count, 1);
+
+    let missing = TxId::new();
+    assert!(
+        missing != expected.tx_id,
+        "separate synthetic missing transaction"
+    );
+    for step in 1_i64..=RETAINED_OUTCOMES {
+        // These are distinct synthetic rejected operations, not retries of
+        // the committed configuration under replacement operation identities.
+        // No direct SQL writes or fabricated sequence/frontier changes occur.
+        let mut bytes = [0xB5; 16];
+        bytes[..8].copy_from_slice(&step.to_be_bytes());
+        let result = store
+            .create_rollback_point_local_idempotent(
+                ConfigConsensusRequestId::from_bytes(bytes),
+                missing,
+                None,
+            )
+            .await
+            .expect_err("applied missing-target rejection");
+        assert!(matches!(result.kind(), PersistErrorKind::RollbackNotFound));
+        if step == RETAINED_OUTCOMES - 1 {
+            let inside = recovery_window(&root, original);
+            assert_eq!(inside.application_sequence, committed_sequence + step);
+            assert_eq!(inside.retained_count, RETAINED_OUTCOMES);
+            assert_eq!(inside.oldest_sequence, committed_sequence);
+            assert_eq!(inside.newest_sequence, committed_sequence + step);
+            assert_eq!(inside.original_sequence, Some(committed_sequence));
+            assert!(matches!(
+                store
+                    .lookup_commit_operation(&handle, CALLER)
+                    .await
+                    .expect("last retained position"),
+                ConfigCommitRecoveryOutcome::Committed
+            ));
+            assert_eq!(recovery_window(&root, original), inside);
+        }
+    }
+    let expired = recovery_window(&root, original);
+    assert_eq!(
+        expired.application_sequence,
+        committed_sequence + RETAINED_OUTCOMES
+    );
+    assert_eq!(expired.retained_count, RETAINED_OUTCOMES);
+    assert_eq!(expired.oldest_sequence, committed_sequence + 1);
+    assert_eq!(
+        expired.newest_sequence,
+        committed_sequence + RETAINED_OUTCOMES
+    );
+    assert_eq!(expired.original_sequence, None);
+    assert!(matches!(
+        store
+            .lookup_commit_operation(&handle, CALLER)
+            .await
+            .expect("first expired position"),
+        ConfigCommitRecoveryOutcome::Unresolved
+    ));
+    assert_eq!(recovery_window(&root, original), expired);
+    assert!(
+        store
+            .load_latest()
+            .await
+            .expect("committed readback")
+            .expect("head")
+            .record
+            == expected,
+        "expired recovery evidence does not undo or reclassify the known commit"
+    );
+    store.shutdown().await.expect("orderly native shutdown");
+    drop(store);
+
+    let reopened = open(&root, true).await;
+    let before = recovery_window(&root, original);
+    assert_eq!(
+        before, expired,
+        "retained frontier and expiry survive reopen"
+    );
+    assert!(matches!(
+        reopened
+            .lookup_commit_operation(&handle, CALLER)
+            .await
+            .expect("same original handle after retained reopen"),
+        ConfigCommitRecoveryOutcome::Unresolved
+    ));
+    assert_eq!(recovery_window(&root, original), before);
+    assert!(
+        reopened
+            .load_latest()
+            .await
+            .expect("retained readback")
+            .expect("head")
+            .record
+            == expected,
+        "complete committed record remains readable after outcome expiry"
+    );
+    reopened
+        .shutdown()
+        .await
+        .expect("shutdown retained fixture");
+    println!("CONFIG_CAPACITY_RECOVERY_WINDOW inside=true expired=true retained_after_reopen=true");
+}
