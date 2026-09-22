@@ -4896,17 +4896,6 @@ where
                 .copy_config_failure_reply(&context, DatastoreFailure::Unsupported)
                 .await;
         }
-        // RFC 6241 section 7.3 requires distinct source and target datastores.
-        // Reject before intent admission or creation of a replacement effect.
-        if request.source == request.target {
-            return self
-                .copy_config_failure_reply_for_rpc(
-                    &context,
-                    audit_failed("invalid-value"),
-                    RpcError::invalid_value(),
-                )
-                .await;
-        }
 
         match self.authorize_exec(context.principal, NETCONF_COPY_CONFIG_PATH) {
             Ok(true) => {}
