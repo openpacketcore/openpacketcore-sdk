@@ -5385,11 +5385,43 @@ async fn persistent_three_voter_consumer_write_does_not_spend_budget_on_a_read_q
     let started = Instant::now();
     let lease = match persistent.execute(&request).await {
         Ok(SessionConsumerResponse::AcquireLease(Ok(lease))) => lease,
-        outcome => panic!(
-            "one healthy write quorum must fit inside the operation budget: {outcome:?}; delayed ReadBarrier={}; delayed empty AppendEntries={}",
-            fleet.read_barrier_calls(),
-            fleet.prewrite_empty_append_entries_calls(),
-        ),
+        outcome => {
+            // Inspect only after the original operation has already failed.
+            // These existing snapshots contain counters and readiness booleans.
+            let transport = persistent.diagnostics().await;
+            let readiness = fleet
+                .stores
+                .iter()
+                .map(|store| {
+                    let status = store.status();
+                    (
+                        status.admitted,
+                        status.leader_id.is_some(),
+                        status.last_log_index == status.applied_index,
+                    )
+                })
+                .collect::<Vec<_>>();
+            let routing = fleet
+                .stores
+                .iter()
+                .map(|store| {
+                    let diagnostic = store.diagnostic_snapshot();
+                    (
+                        diagnostic.route_deadline,
+                        diagnostic.route_metrics_watch_closed,
+                        diagnostic.raw_read_barrier_unavailable,
+                        diagnostic.raw_read_barrier_deadline,
+                    )
+                })
+                .collect::<Vec<_>>();
+            panic!(
+                "one healthy write quorum must fit inside the operation budget: {outcome:?}; delayed ReadBarrier={}; delayed empty AppendEntries={}; transport={transport:?}; readiness(admitted,leader_known,applied_at_log)={readiness:?}; routing_totals(deadline,watch_closed,barrier_unavailable,barrier_deadline)={routing:?}; append_observation(decoded,decode_failures,nonempty_seen)={:?}; write_entries(binding,acquire)={:?}",
+                fleet.read_barrier_calls(),
+                fleet.prewrite_empty_append_entries_calls(),
+                fleet.append_entries_observation(),
+                fleet.consumer_write_entries(),
+            );
+        }
     };
     let mutation_elapsed = started.elapsed();
     fleet.set_prewrite_empty_append_entries_delay(false);
