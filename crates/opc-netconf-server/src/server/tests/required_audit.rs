@@ -16,6 +16,8 @@ use opc_persist::{
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::atomic::{AtomicBool, AtomicU64};
 
+#[cfg(target_os = "linux")]
+mod recovery;
 mod running;
 mod transport;
 
