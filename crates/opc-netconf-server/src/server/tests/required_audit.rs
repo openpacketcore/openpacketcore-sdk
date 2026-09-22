@@ -17,6 +17,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::sync::atomic::{AtomicBool, AtomicU64};
 
 mod running;
+mod transport;
 
 // Separately owned synthetic monotonic checkpoint authority. This is not a
 // production provider and carries no configuration signing material.

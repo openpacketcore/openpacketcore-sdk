@@ -484,3 +484,75 @@ async fn cancelled_netconf_rpc_leaves_its_exact_admitted_effect_with_the_worker(
     drop(registration);
     h.shutdown().await;
 }
+
+#[tokio::test]
+async fn required_capability_does_not_grant_protocol_write_authorization() {
+    let h = Harness::start().await;
+    let server = ReadOnlyNetconfServer::new(
+        RunningBinding::new(h.bus.clone()),
+        FixedPolicy(policy_allow_system_but_deny_edit_config()),
+        RefusingOriginalSink,
+        TransportType::NetconfTls,
+    )
+    .unwrap()
+    .with_required_config_audit(h.bus.required_config_audit().unwrap())
+    .unwrap();
+    let sessions = SessionRegistry::new();
+    let registration = sessions.register(1).unwrap();
+    assert!(rpc(&server, &sessions, &edit())
+        .await
+        .reply_xml
+        .contains("<error-tag>access-denied</error-tag>"));
+    // One denial observation, with no required intent/result/terminal tuple.
+    assert_eq!(h.checkpoints.sequence(), 4);
+    let stored = h.source.load_committed_latest().await.unwrap().unwrap();
+    assert_eq!(stored.version, ConfigVersion::new(1));
+    assert_eq!(stored.config.hostname, "fixture-initial");
+    assert_eq!(
+        h.authority
+            .reconcile_audit_obligations(30)
+            .await
+            .unwrap()
+            .inspected,
+        0
+    );
+    drop(registration);
+    drop(server);
+    h.shutdown().await;
+}
+
+#[tokio::test]
+async fn required_capability_does_not_override_the_current_authority_gate() {
+    for outcome in [
+        ConfigAuthorityOutcome::Unavailable,
+        ConfigAuthorityOutcome::Retry { leader_hint: None },
+    ] {
+        let h = Harness::start().await;
+        let gate = Arc::new(ScriptedConfigAuthority::fixed(outcome));
+        let server = required_server(&h)
+            .with_config_authority(gate.clone())
+            .unwrap();
+        let sessions = SessionRegistry::new();
+        let registration = sessions.register(1).unwrap();
+        assert!(rpc(&server, &sessions, &edit())
+            .await
+            .reply_xml
+            .contains("<error-tag>operation-failed</error-tag>"));
+        assert_eq!(gate.operations(), vec![ConfigAuthorityOperation::Write]);
+        assert_eq!(h.checkpoints.sequence(), 4);
+        let stored = h.source.load_committed_latest().await.unwrap().unwrap();
+        assert_eq!(stored.version, ConfigVersion::new(1));
+        assert_eq!(stored.config.hostname, "fixture-initial");
+        assert_eq!(
+            h.authority
+                .reconcile_audit_obligations(30)
+                .await
+                .unwrap()
+                .inspected,
+            0
+        );
+        drop(registration);
+        drop(server);
+        h.shutdown().await;
+    }
+}
