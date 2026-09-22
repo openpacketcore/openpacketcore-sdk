@@ -3,6 +3,9 @@
 mod audit;
 mod audit_continuity;
 
+#[cfg(test)]
+mod config_capacity_review_tests;
+
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 use std::future::Future;
@@ -2054,7 +2057,7 @@ mod tests {
         }
     }
 
-    fn sized_attested_commit(plaintext_bytes: usize) -> AttestedConfigCommit {
+    pub(super) fn sized_attested_commit(plaintext_bytes: usize) -> AttestedConfigCommit {
         let tx_id = opc_types::TxId::new();
         let committed_at = size_test_timestamp();
         let principal =
