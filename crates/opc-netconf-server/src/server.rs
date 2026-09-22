@@ -7761,15 +7761,27 @@ mod tests {
         secret: String,
     }
 
+    impl std::fmt::Debug for DemoConfig {
+        fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            formatter.write_str("DemoConfig(<redacted>)")
+        }
+    }
+
     impl OpcConfig for DemoConfig {
-        type Delta = ();
+        type Delta = Self;
 
         fn schema_digest(&self) -> SchemaDigest {
             SchemaDigest::from_bytes([1u8; 32])
         }
 
-        fn diff(&self, _previous: &Self) -> Result<Vec<Self::Delta>, ConfigError> {
-            Ok(Vec::new())
+        fn diff(&self, previous: &Self) -> Result<Vec<Self::Delta>, ConfigError> {
+            if self.hostname == previous.hostname && self.secret == previous.secret {
+                Ok(Vec::new())
+            } else {
+                // A replacement snapshot is the structured delta for this
+                // two-field fixture. Replay must detect changed content.
+                Ok(vec![self.clone()])
+            }
         }
 
         fn changed_paths(
@@ -7795,11 +7807,12 @@ mod tests {
             )
         }
 
-        fn subscriber_delta_retained_size_bytes(_delta: &Self::Delta) -> Option<usize> {
-            Some(std::mem::size_of::<Self::Delta>())
+        fn subscriber_delta_retained_size_bytes(delta: &Self::Delta) -> Option<usize> {
+            delta.subscriber_snapshot_retained_size_bytes()
         }
 
-        fn apply_delta(&mut self, _delta: Self::Delta) -> Result<(), ConfigError> {
+        fn apply_delta(&mut self, delta: Self::Delta) -> Result<(), ConfigError> {
+            *self = delta;
             Ok(())
         }
 
