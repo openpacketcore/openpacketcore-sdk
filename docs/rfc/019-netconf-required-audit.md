@@ -1,12 +1,14 @@
-# Draft: NETCONF required audit for exact configuration effects (#958)
+# OPC-SDK-RFC-019: NETCONF Required Audit for Exact Configuration Effects
 
 **Status**: Contract proposal revised after adversarial author review. No
 independent review or complete implementation is claimed.
 
 **Date**: 2026-09-22
 
-**RFC number**: Pending allocation. This proposal does not claim an accepted
-API, complete qualification, or closure of #958.
+**Version**: 1.0.0
+
+The writable-running profile is a partial implementation proposal. Full candidate,
+startup and confirmed-lifecycle contracts, qualification and #958 remain open.
 
 ## Problem and existing authority
 
