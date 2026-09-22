@@ -147,12 +147,22 @@ struct Fault {
     actual_forwards: AtomicUsize,
     lost_responses: AtomicUsize,
     read_barriers: AtomicUsize,
+    rpc_observations: [[RpcObservation; 3]; 3],
+}
+
+#[derive(Debug, Default)]
+struct RpcObservation {
+    started: AtomicUsize,
+    completed: AtomicUsize,
+    transport_errors: AtomicUsize,
+    service_errors: AtomicUsize,
 }
 
 #[derive(Debug)]
 struct ObservedPeer {
     inner: RemoteSessionConsensusPeer,
     fault: Arc<Fault>,
+    target: usize,
 }
 
 impl ObservedPeer {
@@ -171,10 +181,33 @@ impl ObservedPeer {
             }
             self.fault.actual_forwards.fetch_add(1, Ordering::SeqCst);
         }
+        let observation = match request.family {
+            ConsensusRpcFamily::Vote => Some(0),
+            ConsensusRpcFamily::AppendEntries => Some(1),
+            ConsensusRpcFamily::ReadBarrier => Some(2),
+            _ => None,
+        }
+        .map(|family| &self.fault.rpc_observations[self.target][family]);
+        if let Some(observation) = observation {
+            observation.started.fetch_add(1, Ordering::SeqCst);
+        }
         let response = match timeout {
             Some(timeout) => self.inner.call_with_timeout(request, timeout).await,
             None => self.inner.call(request).await,
-        }?;
+        };
+        if let Some(observation) = observation {
+            observation.completed.fetch_add(1, Ordering::SeqCst);
+            match &response {
+                Err(_) => {
+                    observation.transport_errors.fetch_add(1, Ordering::SeqCst);
+                }
+                Ok(response) if response.result.is_err() => {
+                    observation.service_errors.fetch_add(1, Ordering::SeqCst);
+                }
+                Ok(_) => {}
+            }
+        }
+        let response = response?;
         if forwarded && self.fault.armed.swap(false, Ordering::SeqCst) {
             assert!(
                 response.result.is_ok(),
@@ -427,6 +460,7 @@ async fn open_members(
                     Arc::new(ObservedPeer {
                         inner: peer,
                         fault: faults[source].clone(),
+                        target,
                     }) as Arc<dyn ConsensusPeer>,
                 )
             })
@@ -468,6 +502,38 @@ async fn open_members(
         );
     }
     stores
+}
+
+fn report_failover_observation(
+    stores: &[ConsensusConfigStore],
+    faults: &[Arc<Fault>; 3],
+    live: &[usize],
+    old_leader: ConsensusNodeId,
+    original_term: u64,
+) {
+    for (cohort, index) in live.iter().copied().enumerate() {
+        let status = stores[index].status();
+        eprintln!(
+            "CONFIG_CAPACITY_FAILOVER cohort={cohort} admitted={} term_advanced={} leader_known={} leader_changed={} local_leader={} applied_matches_committed={}",
+            status.admitted,
+            status.term > original_term,
+            status.leader_id.is_some(),
+            status.leader_id.is_some_and(|leader| leader != old_leader),
+            status.leader_id == Some(status.node_id),
+            status.applied_index.is_some() && status.applied_index == status.committed_index,
+        );
+        for (target, observations) in faults[index].rpc_observations.iter().enumerate() {
+            for (family, observation) in ["vote", "append", "read"].into_iter().zip(observations) {
+                eprintln!(
+                    "CONFIG_CAPACITY_FAILOVER_RPC cohort={cohort} target={target} family={family} started={} completed={} transport_errors={} service_errors={}",
+                    observation.started.load(Ordering::SeqCst),
+                    observation.completed.load(Ordering::SeqCst),
+                    observation.transport_errors.load(Ordering::SeqCst),
+                    observation.service_errors.load(Ordering::SeqCst),
+                );
+            }
+        }
+    }
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -596,6 +662,7 @@ async fn config_capacity_957_exact_recovery_after_mtls_response_loss_and_leader_
 
     // Stop the old leader and all its authenticated connections. This is a
     // leader-loss control, not a process-crash or power-loss assertion.
+    let original_term = stores[leader].status().term;
     servers[leader]
         .take()
         .expect("old leader listener")
@@ -606,16 +673,22 @@ async fn config_capacity_957_exact_recovery_after_mtls_response_loss_and_leader_
         .await
         .expect("stop original leader");
     let live = (0..3).filter(|index| *index != leader).collect::<Vec<_>>();
-    tokio::time::timeout(DURABLE_CONSENSUS_OPERATION_TIMEOUT, async {
+    let readiness = tokio::time::timeout(DURABLE_CONSENSUS_OPERATION_TIMEOUT, async {
         let (one, two) = tokio::join!(
             stores[live[0]].probe_durable_readiness(),
             stores[live[1]].probe_durable_readiness(),
         );
+        if one.is_err() || two.is_err() {
+            report_failover_observation(&stores, &faults, &live, leader_id, original_term);
+        }
         one.expect("first surviving voter readiness");
         two.expect("second surviving voter readiness");
     })
-    .await
-    .expect("new quorum inside original operation budget");
+    .await;
+    if readiness.is_err() {
+        report_failover_observation(&stores, &faults, &live, leader_id, original_term);
+    }
+    readiness.expect("new quorum inside original operation budget");
     let successor_leader = stores[follower]
         .status()
         .leader_id

@@ -251,7 +251,8 @@ async fn source_snapshot(
     let membership = Entry {
         log_id: LogId::new(
             CommittedLeaderId::new(1, ConsensusNodeId::new(1).expect("node")),
-            1,
+            // A pristine state machine starts with log index zero.
+            0,
         ),
         payload: EntryPayload::Membership(Membership::new(vec![members()], None)),
     };

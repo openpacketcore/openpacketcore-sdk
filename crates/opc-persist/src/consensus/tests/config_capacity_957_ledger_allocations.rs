@@ -2,6 +2,8 @@
 //! This observes real serde container capacities for one reachable legacy ledger
 //! shape. It is neither a process peak nor a whole-operation memory bound.
 
+use std::io::Write;
+
 use super::*;
 use crate::audit_authority::ledger::{EntryPayload, HandleBody, LedgerEntry, LedgerOperation};
 use crate::audit_authority::{
@@ -161,10 +163,14 @@ fn config_capacity_957_retained_ledger_buffer_inventory() {
     assert!(canonical.len() <= MAX_STATE_BYTES);
     let decoded_bytes = decoded_owned_bytes(&decoded);
     let known_live_bytes = encoded.capacity() + canonical.capacity() + decoded_bytes;
-    println!(
+    // Keep these value-free measurements visible in the required quiet CI
+    // harness even when this test passes; ordinary println output is captured.
+    writeln!(
+        std::io::stdout().lock(),
         "CONFIG_CAPACITY_LEDGER_BUFFERS encoded_len={} encoded_capacity={} canonical_capacity={} decoded_owned_bytes={} known_live_bytes={}",
         encoded.len(), encoded.capacity(), canonical.capacity(), decoded_bytes, known_live_bytes,
-    );
+    )
+    .expect("emit value-free allocation inventory");
     // No unmeasured 32 MiB assertion: this excludes allocator overhead, SQL,
     // validation temporaries, commands, transport, replication and continuity.
 }
