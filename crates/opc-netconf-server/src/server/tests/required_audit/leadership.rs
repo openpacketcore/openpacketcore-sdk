@@ -12,6 +12,8 @@ use opc_persist::{
     RetainedConfigOptions,
 };
 
+mod authenticated;
+
 // Same election/operation envelope as the persistence quorum qualification.
 // No sleeps, accelerated elections, or altered engine/operation deadlines.
 const TRANSITION_TIMEOUT: Duration = Duration::from_millis(
@@ -302,6 +304,7 @@ fn edit(hostname: &str) -> String {
 
 async fn assert_original_terminal(
     authority: &ConsensusConfigStore,
+    consensus_identity: ConfigConsensusIdentity,
     request_id: RequestId,
     committed: &StoredConfig<DemoConfig>,
 ) {
@@ -323,7 +326,7 @@ async fn assert_original_terminal(
     let mut verifier = AuditExportVerifier::new(
         Arc::new(AuditKeyRing::new(vec![AuditSigningKey::new(1, [0x91; 32]).unwrap()]).unwrap()),
         export.manifest().clone(),
-        identity(),
+        consensus_identity,
         caller,
         ::time::OffsetDateTime::now_utc().unix_timestamp(),
     )
@@ -508,7 +511,13 @@ async fn required_running_terminal_debt_survives_leadership_change_and_fences_st
         "recovery replaced original effect"
     );
     assert_eq!(exact.new_version, Some(ConfigVersion::new(2)));
-    assert_original_terminal(quorum.stores[new_leader].as_ref(), request_id, &committed).await;
+    assert_original_terminal(
+        quorum.stores[new_leader].as_ref(),
+        identity(),
+        request_id,
+        &committed,
+    )
+    .await;
 
     let later_request = RequestId::new();
     let permitted = new_server
