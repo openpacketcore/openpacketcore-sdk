@@ -1,6 +1,6 @@
 //! Exact ordinary-commit recovery without mutation resubmission.
 
-use hmac::{Hmac, Mac};
+use hmac::{Hmac, KeyInit, Mac};
 
 use super::*;
 use crate::consensus::{ConfigConsensusCommand, ConfigConsensusIdentity, ConfigConsensusRequestId};
