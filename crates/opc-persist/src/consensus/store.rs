@@ -1263,6 +1263,13 @@ impl ConsensusConfigStore {
                     return Ok(*response);
                 }
                 ForwardMutationReply::Rejected(rejection) => {
+                    // This peer rejected only this attempt. A previous peer
+                    // may already have applied the same operation before its
+                    // response was lost, so rejection cannot resolve that
+                    // earlier uncertainty.
+                    if ambiguity_seen {
+                        return Err(PersistError::outcome_unknown());
+                    }
                     return Err(rejection.into_persist_error());
                 }
                 ForwardMutationReply::NotLeader { leader: next } => {
