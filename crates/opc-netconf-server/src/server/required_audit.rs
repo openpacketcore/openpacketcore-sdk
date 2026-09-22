@@ -109,7 +109,7 @@ where
             ConfigOperation::Delete => AuditOperation::Delete,
             ConfigOperation::Rollback => AuditOperation::Rollback,
         };
-        audit.submit(request, intent).await
+        bus.submit(request).await
     }
 
     /// Once the required submitter owns the request, only its exact retained
