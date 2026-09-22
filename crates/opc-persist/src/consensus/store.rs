@@ -19,15 +19,17 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use async_trait::async_trait;
+#[cfg(test)]
+use opc_consensus::encode_bounded;
 use opc_consensus::engine::error::{ClientWriteError, InitializeError, RaftError};
 use opc_consensus::engine::{EmptyNode, LogId, StoredMembership};
 use opc_consensus::{
-    durable_openraft_config, encode_bounded, ConsensusNodeId, ConsensusPeer, ConsensusPeerError,
-    ConsensusRpcFamily, ConsensusRpcHandler, ConsensusWireRequest, ConsensusWireResponse,
-    DurableOpenraftDomain, EnsureLinearizableOutcome, EnsureLinearizableSupervisor,
-    LinearizableReadBarrier, LinearizableReadBarrierError, LinearizableReadLease,
-    DURABLE_CONSENSUS_OPERATION_TIMEOUT, DURABLE_OPENRAFT_APPEND_ENTRIES_TARGET_BYTES,
-    DURABLE_OPENRAFT_PROPOSAL_ADMISSION_SLOTS,
+    durable_openraft_config, AppendEntriesBatchAccumulator, ConsensusNodeId, ConsensusPeer,
+    ConsensusPeerError, ConsensusRpcFamily, ConsensusRpcHandler, ConsensusWireRequest,
+    ConsensusWireResponse, DurableOpenraftDomain, EnsureLinearizableOutcome,
+    EnsureLinearizableSupervisor, LinearizableReadBarrier, LinearizableReadBarrierError,
+    LinearizableReadLease, DURABLE_CONSENSUS_OPERATION_TIMEOUT,
+    DURABLE_OPENRAFT_APPEND_ENTRIES_TARGET_BYTES, DURABLE_OPENRAFT_PROPOSAL_ADMISSION_SLOTS,
 };
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -1701,8 +1703,19 @@ fn config_command_fits_replication_budget(command: &super::ConfigConsensusComman
     // revision and singleton Openraft metadata under the 2 MiB hard RPC
     // ceiling. It also aligns every admitted command with the shared
     // AppendEntries soft target, so no accepted singleton can wedge the log.
-    encode_bounded(command)
-        .is_ok_and(|encoded| encoded.len() <= DURABLE_OPENRAFT_APPEND_ENTRIES_TARGET_BYTES)
+    config_command_encoded_size(command)
+        .is_ok_and(|bytes| bytes <= DURABLE_OPENRAFT_APPEND_ENTRIES_TARGET_BYTES)
+}
+
+fn config_command_encoded_size<T: Serialize>(
+    command: &T,
+) -> Result<usize, opc_consensus::ConsensusCodecError> {
+    // The shared accumulator uses the actual postcard size serializer. Sizing
+    // one borrowed value needs no command buffer. Its oversized-singleton
+    // decision is not admission: callers still enforce the command ceiling.
+    let mut counter = AppendEntriesBatchAccumulator::new();
+    counter.consider(command)?;
+    Ok(counter.serialized_entry_bytes())
 }
 
 fn preflight_config_command_replication_budget(
@@ -1722,8 +1735,8 @@ fn preflight_config_command_replication_budget(
             .ok_or(ForwardMutationRejection::InvalidCommand)?,
         intent,
     };
-    match encode_bounded(&probe) {
-        Ok(encoded) if encoded.len() <= DURABLE_OPENRAFT_APPEND_ENTRIES_TARGET_BYTES => Ok(()),
+    match config_command_encoded_size(&probe) {
+        Ok(bytes) if bytes <= DURABLE_OPENRAFT_APPEND_ENTRIES_TARGET_BYTES => Ok(()),
         Ok(_) | Err(opc_consensus::ConsensusCodecError::TooLarge) => {
             Err(ForwardMutationRejection::CommandTooLarge)
         }
@@ -2036,6 +2049,8 @@ impl ConfigStore for ConsensusConfigStore {
 
 #[cfg(test)]
 mod tests {
+    mod config_capacity_encoding_tests;
+
     use super::super::{
         ConfigConsensusClusterId, ConfigConsensusConfigurationEpoch, ConfigConsensusConfigurationId,
     };

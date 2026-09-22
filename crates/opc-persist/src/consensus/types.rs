@@ -444,11 +444,13 @@ impl ConfigConsensusCommand {
         // resubmit the same durable request ID through a newer binary and
         // receive the stored outcome instead of a false collision.
         let semantic_revision = self.intent.minimum_command_version();
-        let bytes = serde_json::to_vec(&(semantic_revision, self.identity, &self.intent))
-            .map_err(|_| PersistError::inconsistent_state("config consensus encoding failed"))?;
         let mut hasher = Sha256::new();
         hasher.update(OUTCOME_DIGEST_DOMAIN);
-        hasher.update(bytes);
+        serde_json::to_writer(
+            ConfigDigestWriter(&mut hasher),
+            &(semantic_revision, self.identity, &self.intent),
+        )
+        .map_err(|_| PersistError::inconsistent_state("config consensus encoding failed"))?;
         Ok(hasher.finalize().into())
     }
 
@@ -459,11 +461,13 @@ impl ConfigConsensusCommand {
         previous: ConfigConsensusEntryDigest,
         effective_time: Timestamp,
     ) -> Result<ConfigConsensusEntryDigest, PersistError> {
-        let bytes = serde_json::to_vec(&(sequence, previous, effective_time, self))
-            .map_err(|_| PersistError::inconsistent_state("config consensus digest failed"))?;
         let mut hasher = Sha256::new();
         hasher.update(COMMAND_DIGEST_DOMAIN);
-        hasher.update(bytes);
+        serde_json::to_writer(
+            ConfigDigestWriter(&mut hasher),
+            &(sequence, previous, effective_time, self),
+        )
+        .map_err(|_| PersistError::inconsistent_state("config consensus digest failed"))?;
         Ok(ConsensusEntryDigest::from_bytes(hasher.finalize().into()))
     }
 
@@ -519,6 +523,21 @@ impl ConfigConsensusCommand {
                 }
             }
         }
+        Ok(())
+    }
+}
+
+// Feed the identical canonical JSON into the digest without retaining an
+// expanded JSON command allocation alongside the encrypted record.
+struct ConfigDigestWriter<'a>(&'a mut Sha256);
+
+impl std::io::Write for ConfigDigestWriter<'_> {
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        self.0.update(bytes);
+        Ok(bytes.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
         Ok(())
     }
 }
