@@ -7548,6 +7548,7 @@ fn edit_config_rpc_error(error: EditConfigError) -> RpcError {
 mod tests {
     #![allow(clippy::unwrap_used, clippy::expect_used)]
 
+    mod candidate_lifecycle;
     mod mutation_audit;
     mod required_audit;
 
