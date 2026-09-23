@@ -228,6 +228,17 @@ before modifying their local datastore. They preserve the applied result or
 original rejection if terminal recording fails. Cancellation while Intent is
 unacknowledged leaves the datastore unchanged and releases the write reservation.
 
+While the volatile candidate is locked, staged content is tied to that exact
+lock and session incarnation. Explicit unlock or loss of its owner invalidates staged
+content before later reads or writes can use it. Cleanup does not block session
+Drop. A rejected unlock preserves both lock and content. Delayed edits, copies
+and discards from an obsolete write lease fail without changing a replacement
+owner's stage, including numeric session-ID reuse. A successful running commit
+retires only the candidate generation it consumed; a newer stage remains
+available for explicit rebase or discard if its running base is now stale.
+These are process-local lifecycle guarantees, not retained encrypted target
+support or an expansion of the required-audit profile.
+
 Non-persistent confirmed-commit rollback on session exit follows the same
 pre-submit rule. Failed Intent keeps the pending confirmation available for
 retry without extending its original deadline. A known rollback result retires
