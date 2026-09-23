@@ -1547,6 +1547,7 @@ impl ConsensusConfigStore {
         // request ID. Supervision, not the originating RPC/client future,
         // owns admission until that exact accepted proposal resolves.
         let (completion_tx, completion_rx) = tokio::sync::oneshot::channel();
+        drop(ownership);
         tokio::spawn(async move {
             let reply = match response.await {
                 Err(_) => ForwardMutationReply::OutcomeUnknown,
@@ -1561,7 +1562,6 @@ impl ConsensusConfigStore {
                 }
             };
             let _ = completion_tx.send(reply);
-            drop(ownership);
             drop(proposal_permit);
         });
         match tokio::time::timeout_at(deadline, completion_rx).await {
