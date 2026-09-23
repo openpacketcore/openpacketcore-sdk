@@ -426,7 +426,7 @@ async fn config_capacity_957_borrowed_audit_validation_preserves_effect_checks()
                 .validate_for_profile(
                     fixture.identity,
                     store.inner.backend.audit_key(),
-                    ConfigCapacityProfile::Legacy,
+                    opc_crypto::ConfigCapacityProfile::Legacy,
                 )
                 .is_ok(),
             (5..=7).contains(&revision),
@@ -437,7 +437,7 @@ async fn config_capacity_957_borrowed_audit_validation_preserves_effect_checks()
                 .validate_for_profile(
                     fixture.identity,
                     store.inner.backend.audit_key(),
-                    ConfigCapacityProfile::BoundedV1,
+                    opc_crypto::ConfigCapacityProfile::BoundedV1,
                 )
                 .is_ok(),
             (5..=8).contains(&revision),
