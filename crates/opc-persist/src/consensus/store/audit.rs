@@ -391,12 +391,17 @@ impl ConsensusConfigStore {
         handle: &AuditOperationHandle,
         caller: AuditCaller,
     ) -> AuditAdmission {
+        let ownership = match self.reserve_submission() {
+            Ok(ownership) => ownership,
+            Err(_) => return AuditAdmission::Rejected(AuditAuthorityError::Unavailable),
+        };
         self.audit_operation_command_with_route(
             handle,
             caller,
             b"audit-intent",
             ConfigMutationIntent::ManagementAudit(AuditCommand::Intent(handle.clone())),
             true,
+            ownership,
         )
         .await
     }
