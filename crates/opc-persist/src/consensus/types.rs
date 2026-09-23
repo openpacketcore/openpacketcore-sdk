@@ -275,7 +275,6 @@ impl PreparedConfigCommit {
         audit_key: &crate::types::AuditKey,
         profile: opc_crypto::ConfigCapacityProfile,
     ) -> Result<Self, PersistError> {
-        preflight_transferred_input_capacity(&record, &audit, audit.capacity(), profile)?;
         validate_record_representability(&record)?;
         if audit.len() > CONFIG_AUDIT_RECORDS_MAX {
             return Err(PersistError::constraint_violation(
@@ -345,55 +344,6 @@ impl PreparedConfigCommit {
         }
         Ok(())
     }
-}
-
-// A necessary input-only check against the proposed entire-operation allowance.
-// It does not reserve the remaining phase overlap or qualify the full working
-// set. Check the transferred allocations before this helper's derived work;
-// caller allocations before transfer and earlier entrypoints are separate.
-fn preflight_transferred_input_capacity(
-    record: &CommitRecord,
-    audit: &[AuditRecord],
-    audit_capacity: usize,
-    profile: opc_crypto::ConfigCapacityProfile,
-) -> Result<(), PersistError> {
-    match profile {
-        opc_crypto::ConfigCapacityProfile::Legacy => return Ok(()),
-        opc_crypto::ConfigCapacityProfile::BoundedV1 => {}
-        _ => return Err(PersistError::corrupt_blob()),
-    }
-    const INPUT_NECESSARY_MAX_BYTES: usize = 32 * 1024 * 1024;
-    let too_large =
-        || PersistError::constraint_violation("config input allocation exceeds working limit");
-    // This includes the record and Vec/String control blocks. The audit
-    // backing allocation includes initialized and unused element capacity;
-    // only initialized elements own nested String allocations.
-    let mut owned_bytes = std::mem::size_of::<PreparedConfigCommit>();
-    let mut charge = |bytes: usize| -> Result<(), PersistError> {
-        owned_bytes = owned_bytes
-            .checked_add(bytes)
-            .filter(|total| *total <= INPUT_NECESSARY_MAX_BYTES)
-            .ok_or_else(too_large)?;
-        Ok(())
-    };
-    charge(record.encrypted_blob.capacity())?;
-    charge(record.plaintext_digest.capacity())?;
-    charge(record.principal.capacity())?;
-    charge(
-        audit_capacity
-            .checked_mul(std::mem::size_of::<AuditRecord>())
-            .ok_or_else(too_large)?,
-    )?;
-    for entry in audit {
-        charge(entry.yang_path.capacity())?;
-        if let Some(value) = &entry.previous_value {
-            charge(value.capacity())?;
-        }
-        if let Some(value) = &entry.new_value {
-            charge(value.capacity())?;
-        }
-    }
-    Ok(())
 }
 
 // Count the finalized vector before replacing any path. Its necessary bound
