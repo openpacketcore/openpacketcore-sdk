@@ -1656,3 +1656,6 @@ mod tests {
         assert_eq!(legacy, current);
     }
 }
+
+#[cfg(test)]
+mod config_capacity_input_capacity_tests;
