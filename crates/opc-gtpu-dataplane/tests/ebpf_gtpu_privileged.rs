@@ -10069,7 +10069,7 @@ async fn ebpf_gtpu_grouped_dual_stack_live_contract() -> Result<(), Box<dyn std:
     // retirement/republication remains the separately tracked RFC 017 work.
     drop(initial_active);
     drop(backend);
-    let adopted_backend = Arc::new(EbpfGtpuDataplaneBackend::with_config(config));
+    let adopted_backend = Arc::new(EbpfGtpuDataplaneBackend::with_config(config.clone()));
     let adopted = adopted_backend
         .create_device_with_endpoints(grouped_device_request(policy))
         .await?;
@@ -10175,6 +10175,50 @@ async fn ebpf_gtpu_grouped_dual_stack_live_contract() -> Result<(), Box<dyn std:
         RawChecksumMetadata::Unverified,
     );
     expect_no_datagram(&ue_v6);
+
+    // Ordinary removal deletes the pins required by this protected retired
+    // history. The explicit restart operation detaches both owned hooks while
+    // keeping all of those same objects available to the next process.
+    let pins = grouped_pin_directory(&net.pin_root, grouped_device_id());
+    let retained_ids = exact_pinned_map_ids(&pins, &CURRENT_PIN_NAMES);
+    adopted_backend.suspend_grouped_device(&adopted).await?;
+    assert!(tc_filters("ingress").trim().is_empty());
+    assert!(tc_filters("egress").trim().is_empty());
+    assert_eq!(
+        exact_pinned_map_ids(&pins, &CURRENT_PIN_NAMES),
+        retained_ids
+    );
+    assert!(adopted_backend.managed_device_inventory().await?.is_empty());
+    assert!(matches!(
+        adopted_backend.suspend_grouped_device(&adopted).await,
+        Err(GtpuError::NotFound)
+    ));
+    drop(adopted_backend);
+    let restarted = Arc::new(EbpfGtpuDataplaneBackend::with_config(config));
+    let restarted_device = restarted
+        .create_device_with_endpoints(grouped_device_request(policy))
+        .await?;
+    assert_eq!(
+        exact_pinned_map_ids(&pins, &CURRENT_PIN_NAMES),
+        retained_ids
+    );
+    drop(
+        selector_namespace
+            .recover_retired(restarted.clone(), initial.clone())
+            .await?,
+    );
+    assert!(selector_namespace
+        .reconcile_fresh(restarted.clone(), initial)
+        .await
+        .is_err());
+    restarted.suspend_grouped_device(&restarted_device).await?;
+    assert!(tc_filters("ingress").trim().is_empty());
+    assert!(tc_filters("egress").trim().is_empty());
+    assert_eq!(
+        exact_pinned_map_ids(&pins, &CURRENT_PIN_NAMES),
+        retained_ids
+    );
+    println!("OPC_GTPU_GROUPED_RETAINED_RESTART_PROVEN");
     drop(net);
     Ok(())
 }

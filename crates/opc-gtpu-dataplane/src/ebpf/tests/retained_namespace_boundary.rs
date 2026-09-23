@@ -689,3 +689,412 @@ async fn retained_namespace_boundary_missing_marker_does_not_authorize_reprovisi
         fixture.assert_original_owners_remain_exact().await;
     }
 }
+
+fn restart_attachment() -> GtpDevice {
+    GtpDevice {
+        name: "s2bu".to_owned(),
+        ifindex: S2BU_IFINDEX,
+    }
+}
+
+fn detached_publication(runtime: &FakeRuntime) -> FakeGroupedPublicationSnapshot {
+    let mut expected = FakeGroupedPublicationSnapshot::capture(&runtime.state());
+    expected.attached.remove(&S2BU_IFINDEX);
+    expected.uplink_filter_ready.remove(&S2BU_IFINDEX);
+    expected.downlink_filter_ready.remove(&S2BU_IFINDEX);
+    expected.uplink_filter_pin_dir.remove(&S2BU_IFINDEX);
+    expected.downlink_filter_pin_dir.remove(&S2BU_IFINDEX);
+    expected
+}
+
+#[tokio::test]
+async fn grouped_restart_detach_reopens_active_and_retired_history_without_touching_neighbor() {
+    let fixture = Fixture::new(true).await;
+    let retired = fixture.groups[0].clone();
+    let active = fixture
+        .authority
+        .recover_active(fixture.backend.clone(), retired.clone())
+        .await
+        .unwrap();
+    drop(
+        fixture
+            .authority
+            .retire(fixture.backend.clone(), active, retired.clone())
+            .await
+            .unwrap(),
+    );
+    let neighbor = fixture
+        .backend
+        .create_device_with_endpoints(grouped_device_request(
+            "s2bu-new",
+            grouped_device_id(0xe1),
+            fixture.endpoints,
+        ))
+        .await
+        .unwrap();
+    assert_ne!(neighbor.ifindex, S2BU_IFINDEX);
+    let expected = detached_publication(&fixture.runtime);
+    let bindings = fixture.runtime.state().selector_namespace_bindings.clone();
+    let stamps = fixture.runtime.state().selector_operation_stamps.clone();
+    assert!(!stamps.is_empty());
+    fixture
+        .backend
+        .suspend_grouped_device(&restart_attachment())
+        .await
+        .unwrap();
+    assert!(FakeGroupedPublicationSnapshot::capture(&fixture.runtime.state()) == expected);
+    assert!(fixture.runtime.state().selector_namespace_bindings == bindings);
+    assert!(fixture.runtime.state().selector_operation_stamps == stamps);
+    assert!(!fixture
+        .backend
+        .devices()
+        .unwrap()
+        .contains_key(&S2BU_IFINDEX));
+    assert!(fixture
+        .backend
+        .devices()
+        .unwrap()
+        .contains_key(&neighbor.ifindex));
+    assert!(matches!(
+        fixture
+            .backend
+            .suspend_grouped_device(&restart_attachment())
+            .await,
+        Err(GtpuError::NotFound)
+    ));
+    assert!(fixture
+        .authority
+        .recover_active(fixture.backend.clone(), fixture.groups[1].clone())
+        .await
+        .is_err());
+
+    let next = Arc::new(
+        attach_grouped_fake(fixture.runtime.clone(), fixture.device, fixture.endpoints).await,
+    );
+    let reopened = fixture.open(next.clone(), false).await.unwrap();
+    assert!(reopened
+        .reconcile_fresh(next.clone(), retired)
+        .await
+        .is_err());
+    drop(
+        reopened
+            .recover_active(next.clone(), fixture.groups[1].clone())
+            .await
+            .unwrap(),
+    );
+    // Changing only group/tunnel IDs must not reuse a retired selector. An
+    // independent session uses a different address as well as fresh IDs.
+    let reused_selector =
+        grouped_group(0xe2, fixture.device, vec![grouped_v4_entry(0x1203, 0x2203)]);
+    assert!(reopened
+        .reconcile_fresh(next.clone(), reused_selector)
+        .await
+        .is_err());
+    let new_group = grouped_group(
+        0xe3,
+        fixture.device,
+        vec![grouped_entry_for_addresses(
+            IpAddr::V4(Ipv4Addr::new(192, 0, 2, 223)),
+            IpAddr::V4(Ipv4Addr::new(198, 51, 100, 1)),
+            IpAddr::V4(Ipv4Addr::new(192, 0, 2, 1)),
+            0x1204,
+            0x2204,
+            None,
+        )],
+    );
+    let active = reopened
+        .reconcile_fresh(next.clone(), new_group.clone())
+        .await
+        .unwrap();
+    drop(reopened.retire(next, active, new_group).await.unwrap());
+    assert!(fixture
+        .runtime
+        .state()
+        .attached
+        .contains_key(&neighbor.ifindex));
+    assert!(fixture
+        .runtime
+        .state()
+        .uplink_filter_ready
+        .contains(&neighbor.ifindex));
+    assert!(fixture
+        .runtime
+        .state()
+        .downlink_filter_ready
+        .contains(&neighbor.ifindex));
+}
+
+#[tokio::test]
+async fn grouped_restart_detach_refuses_foreign_or_incomplete_graph_without_effects() {
+    for fault in [
+        "pin",
+        "uplink",
+        "downlink",
+        "off_slot",
+        "missing_maps",
+        "missing_hook",
+    ] {
+        let fixture = Fixture::new(true).await;
+        {
+            let mut state = fixture.runtime.state();
+            match fault {
+                "pin" => {
+                    state.pin_identity_invalid.insert(S2BU_IFINDEX);
+                }
+                "uplink" => {
+                    state.uplink_filter_foreign.insert(S2BU_IFINDEX);
+                }
+                "downlink" => {
+                    state.downlink_filter_foreign.insert(S2BU_IFINDEX);
+                }
+                "off_slot" => {
+                    state.off_slot_sdk_hooks.insert(S2BU_IFINDEX);
+                }
+                "missing_maps" => {
+                    state.grouped_map_ready.remove(&S2BU_IFINDEX);
+                }
+                "missing_hook" => {
+                    state.downlink_filter_ready.remove(&S2BU_IFINDEX);
+                }
+                _ => unreachable!(),
+            }
+        }
+        let before = FakeGroupedPublicationSnapshot::capture(&fixture.runtime.state());
+        let bindings = fixture.runtime.state().selector_namespace_bindings.clone();
+        let stamps = fixture.runtime.state().selector_operation_stamps.clone();
+        assert!(
+            fixture
+                .backend
+                .suspend_grouped_device(&restart_attachment())
+                .await
+                .is_err(),
+            "{fault}"
+        );
+        assert!(
+            FakeGroupedPublicationSnapshot::capture(&fixture.runtime.state()) == before,
+            "{fault}"
+        );
+        assert!(
+            fixture.runtime.state().selector_namespace_bindings == bindings,
+            "{fault}"
+        );
+        assert!(
+            fixture.runtime.state().selector_operation_stamps == stamps,
+            "{fault}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn grouped_restart_detach_refuses_ordinary_stale_and_unadmitted_handles() {
+    let (ordinary, runtime) = backend_with_fake();
+    let ordinary_device = ordinary.create_device(create_request()).await.unwrap();
+    let before = FakeGroupedPublicationSnapshot::capture(&runtime.state());
+    assert!(matches!(
+        ordinary.suspend_grouped_device(&ordinary_device).await,
+        Err(GtpuError::UnsupportedFeature {
+            feature: "grouped_restart_detach"
+        })
+    ));
+    assert!(FakeGroupedPublicationSnapshot::capture(&runtime.state()) == before);
+    // The existing ordinary lifecycle still removes its graph.
+    ordinary.remove_device(&ordinary_device).await.unwrap();
+    assert!(runtime.state().attached.is_empty());
+    assert!(runtime.state().pinned_config.is_empty());
+
+    for mode in ["stale", "cleanup_only", "successor_pending"] {
+        let fixture = Fixture::new(false).await;
+        let mut attachment = restart_attachment();
+        match mode {
+            "stale" => {
+                attachment.name = "s2bu-new".to_owned();
+            }
+            "cleanup_only" => {
+                fixture
+                    .backend
+                    .devices()
+                    .unwrap()
+                    .get_mut(&S2BU_IFINDEX)
+                    .unwrap()
+                    .cleanup_only = true;
+            }
+            "successor_pending" => {
+                fixture
+                    .backend
+                    .devices()
+                    .unwrap()
+                    .get_mut(&S2BU_IFINDEX)
+                    .unwrap()
+                    .successor_pending = true;
+            }
+            _ => unreachable!(),
+        }
+        let before = FakeGroupedPublicationSnapshot::capture(&fixture.runtime.state());
+        assert!(
+            fixture
+                .backend
+                .suspend_grouped_device(&attachment)
+                .await
+                .is_err(),
+            "{mode}"
+        );
+        assert!(
+            FakeGroupedPublicationSnapshot::capture(&fixture.runtime.state()) == before,
+            "{mode}"
+        );
+        assert!(!fixture
+            .runtime
+            .state()
+            .operations
+            .contains(&"suspend_grouped"));
+    }
+}
+
+#[tokio::test]
+async fn grouped_restart_detach_cancel_before_dispatch_has_no_effect() {
+    let fixture = Fixture::new(true).await;
+    let before = FakeGroupedPublicationSnapshot::capture(&fixture.runtime.state());
+    let (entered, release, finished) = fixture
+        .backend
+        .pause_next_blocking_worker_start("ebpf_suspend_grouped_device");
+    let backend = fixture.backend.clone();
+    let task =
+        tokio::spawn(async move { backend.suspend_grouped_device(&restart_attachment()).await });
+    rendezvous_test_barrier(entered).await;
+    task.abort();
+    assert!(task.await.unwrap_err().is_cancelled());
+    rendezvous_test_barrier(release).await;
+    rendezvous_test_barrier(finished).await;
+    assert!(FakeGroupedPublicationSnapshot::capture(&fixture.runtime.state()) == before);
+    fixture.assert_original_owners_remain_exact().await;
+}
+
+#[tokio::test]
+async fn grouped_restart_detach_cancel_after_dispatch_finishes_under_owned_guard() {
+    let fixture = Fixture::new(true).await;
+    let expected = detached_publication(&fixture.runtime);
+    let (entered, release) = fixture
+        .runtime
+        .pause_next_historical_recovery_effect("restart_before_detach");
+    let backend = fixture.backend.clone();
+    let task =
+        tokio::spawn(async move { backend.suspend_grouped_device(&restart_attachment()).await });
+    rendezvous_test_barrier(entered).await;
+    assert!(fixture
+        .runtime
+        .selector_namespace_effect_held
+        .load(Ordering::Acquire));
+    assert!(fixture.backend.inner.operation_lock.try_lock().is_err());
+    task.abort();
+    assert!(task.await.unwrap_err().is_cancelled());
+    assert!(fixture
+        .runtime
+        .selector_namespace_effect_held
+        .load(Ordering::Acquire));
+    rendezvous_test_barrier(release).await;
+    // Acquiring the same operation guard waits for the dispatched worker to
+    // settle. No sleep or abandoned observer is used as completion evidence.
+    assert!(matches!(
+        fixture.backend.remove_device(&restart_attachment()).await,
+        Err(GtpuError::NotFound)
+    ));
+    assert!(!fixture
+        .runtime
+        .selector_namespace_effect_held
+        .load(Ordering::Acquire));
+    assert!(FakeGroupedPublicationSnapshot::capture(&fixture.runtime.state()) == expected);
+    let next = Arc::new(
+        attach_grouped_fake(fixture.runtime.clone(), fixture.device, fixture.endpoints).await,
+    );
+    let reopened = fixture.open(next.clone(), false).await.unwrap();
+    for group in &fixture.groups {
+        drop(
+            reopened
+                .recover_active(next.clone(), group.clone())
+                .await
+                .unwrap(),
+        );
+    }
+}
+
+#[tokio::test]
+async fn grouped_restart_detach_partial_failure_retains_exact_history_and_refuses_success() {
+    let fixture = Fixture::new(true).await;
+    let before = FakeGroupedPublicationSnapshot::capture(&fixture.runtime.state());
+    let bindings = fixture.runtime.state().selector_namespace_bindings.clone();
+    let stamps = fixture.runtime.state().selector_operation_stamps.clone();
+    fixture.runtime.fail_in_order(["restart_after_uplink"]);
+    assert!(matches!(
+        fixture
+            .backend
+            .suspend_grouped_device(&restart_attachment())
+            .await,
+        Err(GtpuError::StateIndeterminate { .. })
+    ));
+    let mut expected = before;
+    expected.attached.remove(&S2BU_IFINDEX);
+    expected.uplink_filter_ready.remove(&S2BU_IFINDEX);
+    expected.uplink_filter_pin_dir.remove(&S2BU_IFINDEX);
+    assert!(FakeGroupedPublicationSnapshot::capture(&fixture.runtime.state()) == expected);
+    assert!(fixture.runtime.state().selector_namespace_bindings == bindings);
+    assert!(fixture.runtime.state().selector_operation_stamps == stamps);
+    assert!(fixture
+        .backend
+        .suspend_grouped_device(&restart_attachment())
+        .await
+        .is_err());
+    assert!(FakeGroupedPublicationSnapshot::capture(&fixture.runtime.state()) == expected);
+    assert!(fixture
+        .authority
+        .recover_active(fixture.backend.clone(), fixture.groups[0].clone())
+        .await
+        .is_err());
+}
+
+#[tokio::test]
+async fn grouped_restart_detach_rejects_identity_change_before_final_receipt() {
+    for boundary in ["restart_before_detach", "restart_after_detach"] {
+        let fixture = Fixture::new(true).await;
+        let pins = fixture.runtime.state().pinned_grouped_config.clone();
+        let stamps = fixture.runtime.state().selector_operation_stamps.clone();
+        let (entered, release) = fixture
+            .runtime
+            .pause_next_historical_recovery_effect(boundary);
+        let backend = fixture.backend.clone();
+        let task =
+            tokio::spawn(
+                async move { backend.suspend_grouped_device(&restart_attachment()).await },
+            );
+        rendezvous_test_barrier(entered).await;
+        fixture
+            .runtime
+            .state()
+            .pin_identity_invalid
+            .insert(S2BU_IFINDEX);
+        let before_resume = FakeGroupedPublicationSnapshot::capture(&fixture.runtime.state());
+        rendezvous_test_barrier(release).await;
+        assert!(
+            matches!(
+                task.await.unwrap(),
+                Err(GtpuError::StateIndeterminate { .. })
+            ),
+            "{boundary}"
+        );
+        assert!(
+            FakeGroupedPublicationSnapshot::capture(&fixture.runtime.state()) == before_resume,
+            "{boundary}"
+        );
+        assert!(
+            fixture.runtime.state().pinned_grouped_config == pins,
+            "{boundary}"
+        );
+        assert!(
+            fixture.runtime.state().selector_operation_stamps == stamps,
+            "{boundary}"
+        );
+        assert!(!fixture
+            .runtime
+            .selector_namespace_effect_held
+            .load(Ordering::Acquire));
+    }
+}
