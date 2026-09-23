@@ -188,7 +188,7 @@ fn encrypted_column<'row>(
             value.data_type(),
         ));
     };
-    Ok(std::borrow::Cow::Borrowed(encrypted))
+    Ok(std::borrow::Cow::Owned(encrypted.to_vec()))
 }
 
 fn head_sync(conn: &Connection) -> io::Result<Option<HistoryHead>> {
