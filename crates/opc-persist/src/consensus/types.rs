@@ -370,8 +370,7 @@ fn preflight_transferred_input_capacity(
     // only initialized elements own nested String allocations.
     let mut owned_bytes = std::mem::size_of::<PreparedConfigCommit>();
     let mut charge = |bytes: usize| -> Result<(), PersistError> {
-        owned_bytes = owned_bytes
-            .checked_add(bytes)
+        owned_bytes = Some(owned_bytes.max(bytes))
             .filter(|total| *total <= INPUT_NECESSARY_MAX_BYTES)
             .ok_or_else(too_large)?;
         Ok(())
