@@ -7,6 +7,7 @@ use crate::consensus::{
     ConfigConsensusClusterId, ConfigConsensusConfigurationEpoch, ConfigConsensusConfigurationId,
     ConfigConsensusTopology,
 };
+use crate::types::ConfigStore;
 use crate::{AuditKey, RetainedConfigBinding, RetainedConfigDurability, RetainedConfigOptions};
 use std::collections::BTreeSet;
 use std::future::{poll_fn, Future};
