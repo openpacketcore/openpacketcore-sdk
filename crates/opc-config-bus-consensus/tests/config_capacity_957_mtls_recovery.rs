@@ -16,7 +16,7 @@ use async_trait::async_trait;
 use opc_consensus::{
     ConsensusIdentity, ConsensusNodeId, ConsensusPeer, ConsensusPeerError, ConsensusRpcFamily,
     ConsensusRpcHandler, ConsensusWireRequest, ConsensusWireResponse,
-    DURABLE_CONSENSUS_OPERATION_TIMEOUT,
+    DURABLE_CONSENSUS_OPERATION_TIMEOUT, DURABLE_CONSENSUS_TIMING_PROFILE,
 };
 use opc_identity::{build_identity_state, parse_certs_pem, parse_key_pem, TrustBundle};
 use opc_key::{ConfigAad, EnvelopeAad, KeyHandle, KeyId, KeyPurpose, Zeroizing};
@@ -41,6 +41,13 @@ use sha2::{Digest, Sha256};
 const CALLER: &str =
     "spiffe://qualification.invalid/tenant/test/ns/test/sa/config/nf/test/instance/client";
 const LOGICAL_BYTES: usize = 262_144;
+// Test-stage convergence budget, distinct from each unchanged operation deadline.
+// This uses the existing session qualification transition formula; it is not a
+// guarantee for every possible election path or a ten-second failover claim.
+const CONFIG_CAPACITY_CLUSTER_RECOVERY_TIMEOUT: Duration = Duration::from_millis(
+    DURABLE_CONSENSUS_TIMING_PROFILE.election_timeout_max_millis * 2
+        + DURABLE_CONSENSUS_TIMING_PROFILE.operation_timeout_millis,
+);
 
 struct Pki {
     issuer: rcgen::CertifiedIssuer<'static, rcgen::KeyPair>,
@@ -673,22 +680,45 @@ async fn config_capacity_957_exact_recovery_after_mtls_response_loss_and_leader_
         .await
         .expect("stop original leader");
     let live = (0..3).filter(|index| *index != leader).collect::<Vec<_>>();
-    let readiness = tokio::time::timeout(DURABLE_CONSENSUS_OPERATION_TIMEOUT, async {
-        let (one, two) = tokio::join!(
-            stores[live[0]].probe_durable_readiness(),
-            stores[live[1]].probe_durable_readiness(),
-        );
-        if one.is_err() || two.is_err() {
+    let convergence_deadline =
+        tokio::time::Instant::now() + CONFIG_CAPACITY_CLUSTER_RECOVERY_TIMEOUT;
+    let readiness = tokio::time::timeout_at(convergence_deadline, async {
+        // Each read-only probe retains the fixed production operation deadline.
+        // Only Unavailable may start another round within this one stage bound.
+        for round in 1..=3 {
+            let (one, two) = tokio::join!(
+                stores[live[0]].probe_durable_readiness(),
+                stores[live[1]].probe_durable_readiness(),
+            );
+            eprintln!(
+                "CONFIG_CAPACITY_CONVERGENCE round={round} first_ready={} second_ready={}",
+                one.is_ok(),
+                two.is_ok(),
+            );
+            if one.is_ok() && two.is_ok() {
+                assert!(
+                    tokio::time::Instant::now() <= convergence_deadline,
+                    "new quorum must be observed inside the convergence bound"
+                );
+                return;
+            }
             report_failover_observation(&stores, &faults, &live, leader_id, original_term);
+            for result in [&one, &two] {
+                if let Err(error) = result {
+                    assert!(
+                        matches!(error.kind(), PersistErrorKind::Unavailable),
+                        "unexpected surviving voter readiness error class"
+                    );
+                }
+            }
         }
-        one.expect("first surviving voter readiness");
-        two.expect("second surviving voter readiness");
+        panic!("surviving voters did not become ready in three read-only rounds");
     })
     .await;
     if readiness.is_err() {
         report_failover_observation(&stores, &faults, &live, leader_id, original_term);
     }
-    readiness.expect("new quorum inside original operation budget");
+    readiness.expect("new quorum inside the fixed cluster convergence bound");
     let successor_leader = stores[follower]
         .status()
         .leader_id
