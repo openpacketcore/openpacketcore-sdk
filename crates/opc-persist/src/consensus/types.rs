@@ -263,6 +263,8 @@ impl PreparedConfigCommit {
         }
         let audit_count =
             u32::try_from(audit.len()).map_err(|_| PersistError::audit_chain_broken())?;
+        #[cfg(test)]
+        config_capacity_audit_preparation_tests::observe_start();
         let tenant = extract_tenant(&record.principal);
         let mut previous_hash = [0_u8; 32];
         for (expected_sequence, entry) in audit.iter_mut().enumerate() {
@@ -272,6 +274,8 @@ impl PreparedConfigCommit {
                 return Err(PersistError::audit_chain_broken());
             }
             entry.yang_path = tokenize_audit_path(&entry.yang_path, audit_key)?;
+            #[cfg(test)]
+            config_capacity_audit_preparation_tests::observe_path(entry.yang_path.capacity());
             if entry.previous_value.is_some() {
                 entry.previous_value = Some(REDACTED_AUDIT_VALUE.to_owned());
                 entry.redaction_applied = true;
@@ -599,6 +603,9 @@ mod config_capacity_command_layout_tests;
 
 #[cfg(test)]
 mod config_capacity_tokenization_tests;
+
+#[cfg(test)]
+mod config_capacity_audit_preparation_tests;
 
 /// Persisted result returned after durable quorum commit and local apply.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
