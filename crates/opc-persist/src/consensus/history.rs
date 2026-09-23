@@ -20,6 +20,9 @@ const HISTORY_DOMAIN: &[u8] = b"openpacketcore/config-consensus/history-retentio
 const RECORD_CHAIN_DOMAIN: &[u8] = b"openpacketcore/config-consensus/history-record-chain/v1\0";
 const STATE_MAX_BYTES: usize = 4096;
 
+#[cfg(test)]
+pub(super) mod config_capacity_read_buffers;
+
 /// Explicit bounds for canonical retained configuration records and their data.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -171,16 +174,40 @@ fn record_count(conn: &Connection) -> io::Result<u64> {
     u64::try_from(count).map_err(|_| corrupt())
 }
 
+// Keep ciphertext borrowed until its digest is computed. No view escapes the
+// SQLite row, and all four history-authentication paths use this projection.
+fn encrypted_column<'row>(
+    row: &'row rusqlite::Row<'_>,
+    index: usize,
+) -> rusqlite::Result<std::borrow::Cow<'row, [u8]>> {
+    let value = row.get_ref(index)?;
+    let rusqlite::types::ValueRef::Blob(encrypted) = value else {
+        return Err(rusqlite::Error::InvalidColumnType(
+            index,
+            "encrypted_blob".to_owned(),
+            value.data_type(),
+        ));
+    };
+    Ok(std::borrow::Cow::Borrowed(encrypted))
+}
+
 fn head_sync(conn: &Connection) -> io::Result<Option<HistoryHead>> {
     let row = conn.query_row(
         "SELECT tx_id, version, encrypted_blob FROM config_history ORDER BY version DESC LIMIT 1",
-        [], |row| Ok((row.get::<_, Vec<u8>>(0)?, row.get::<_, i64>(1)?, row.get::<_, Vec<u8>>(2)?)),
+        [], |row| {
+            let tx_id = row.get::<_, Vec<u8>>(0)?;
+            let version = row.get::<_, i64>(1)?;
+            let encrypted = encrypted_column(row, 2)?;
+            #[cfg(test)]
+            config_capacity_read_buffers::observe(0, &encrypted);
+            Ok((tx_id, version, <[u8; 32]>::from(Sha256::digest(encrypted))))
+        },
     ).optional().map_err(database_error)?;
-    row.map(|(tx_id, version, encrypted)| {
+    row.map(|(tx_id, version, encrypted_digest)| {
         Ok(HistoryHead {
             tx_id: TxId::from_uuid(uuid::Uuid::from_slice(&tx_id).map_err(|_| corrupt())?),
             version: ConfigVersion::new(u64::try_from(version).map_err(|_| corrupt())?),
-            encrypted_digest: Sha256::digest(encrypted).into(),
+            encrypted_digest,
         })
     })
     .transpose()
@@ -290,7 +317,9 @@ fn record_chain_sync(
         };
         let tx_id: Vec<u8> = row.get(0).map_err(database_error)?;
         let version: i64 = row.get(1).map_err(database_error)?;
-        let encrypted: Vec<u8> = row.get(2).map_err(database_error)?;
+        let encrypted = encrypted_column(row, 2).map_err(database_error)?;
+        #[cfg(test)]
+        config_capacity_read_buffers::observe(1, &encrypted);
         let count: i64 = row.get(3).map_err(database_error)?;
         let terminal: Vec<u8> = row.get(4).map_err(database_error)?;
         let head = HistoryHead {
@@ -437,14 +466,22 @@ fn validate_state(conn: &Connection, state: &HistoryState) -> io::Result<()> {
         return Err(corrupt());
     }
     if let Some(boundary) = &state.boundary {
-        let (first_tx, first_version, parent, blob): (Vec<u8>, i64, Option<Vec<u8>>, Vec<u8>) = conn.query_row(
+        let (first_tx, first_version, parent, encrypted_digest): (Vec<u8>, i64, Option<Vec<u8>>, [u8; 32]) = conn.query_row(
             "SELECT tx_id, version, parent_tx_id, encrypted_blob FROM config_history ORDER BY version ASC LIMIT 1",
-            [], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            [], |row| {
+                let tx_id = row.get(0)?;
+                let version = row.get(1)?;
+                let parent = row.get(2)?;
+                let encrypted = encrypted_column(row, 3)?;
+                #[cfg(test)]
+                config_capacity_read_buffers::observe(2, &encrypted);
+                Ok((tx_id, version, parent, <[u8; 32]>::from(Sha256::digest(encrypted))))
+            },
         ).map_err(database_error)?;
         if first_tx != boundary.first.tx_id.as_uuid().as_bytes()
             || u64::try_from(first_version).ok() != Some(boundary.first.version.get())
             || parent.is_some()
-            || <[u8; 32]>::from(Sha256::digest(blob)) != boundary.first.encrypted_digest
+            || encrypted_digest != boundary.first.encrypted_digest
         {
             return Err(corrupt());
         }
@@ -683,11 +720,18 @@ pub(crate) fn retain_sync(
         return Ok(Err(ConfigMutationFailure::HistoryProtected));
     }
     let from = i64::try_from(decision.retain_from.get()).map_err(|_| corrupt())?;
-    let (first_tx, parent, encrypted): (Vec<u8>, Option<Vec<u8>>, Vec<u8>) = conn
+    let (first_tx, parent, encrypted_digest): (Vec<u8>, Option<Vec<u8>>, [u8; 32]) = conn
         .query_row(
             "SELECT tx_id, parent_tx_id, encrypted_blob FROM config_history WHERE version = ?1",
             [from],
-            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            |row| {
+                let tx_id = row.get(0)?;
+                let parent = row.get(1)?;
+                let encrypted = encrypted_column(row, 2)?;
+                #[cfg(test)]
+                config_capacity_read_buffers::observe(3, &encrypted);
+                Ok((tx_id, parent, <[u8; 32]>::from(Sha256::digest(encrypted))))
+            },
         )
         .optional()
         .map_err(database_error)?
@@ -758,7 +802,7 @@ pub(crate) fn retain_sync(
             first: HistoryHead {
                 tx_id: TxId::from_uuid(uuid::Uuid::from_slice(&first_tx).map_err(|_| corrupt())?),
                 version: decision.retain_from,
-                encrypted_digest: Sha256::digest(encrypted).into(),
+                encrypted_digest,
             },
             original_parent,
         });

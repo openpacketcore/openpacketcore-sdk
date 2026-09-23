@@ -3197,36 +3197,21 @@ fn validate_sealed_state_sync(
             "SELECT tx_id, parent_tx_id, version, committed_at, principal, schema_digest, plaintext_digest, encrypted_blob, audit_count, audit_terminal_hash FROM config_history ORDER BY version ASC",
         )
         .map_err(db_error)?;
-    let rows = statement
-        .query_map([], |row| {
-            Ok((
-                row.get::<_, Vec<u8>>(0)?,
-                row.get::<_, Option<Vec<u8>>>(1)?,
-                row.get::<_, i64>(2)?,
-                row.get::<_, String>(3)?,
-                row.get::<_, String>(4)?,
-                row.get::<_, Vec<u8>>(5)?,
-                row.get::<_, Vec<u8>>(6)?,
-                row.get::<_, Vec<u8>>(7)?,
-                row.get::<_, i64>(8)?,
-                row.get::<_, Vec<u8>>(9)?,
-            ))
-        })
-        .map_err(db_error)?;
-    for row in rows {
+    let mut rows = statement.query([]).map_err(db_error)?;
+    while let Some(row) = rows.next().map_err(db_error)? {
         cancellation.check_io()?;
-        let (
-            tx_id,
-            parent_tx_id,
-            version,
-            committed_at,
-            principal,
-            schema_digest,
-            plaintext_digest,
-            encrypted_blob,
-            audit_count,
-            terminal_hash,
-        ) = row.map_err(db_error)?;
+        let tx_id: Vec<u8> = row.get(0).map_err(db_error)?;
+        let parent_tx_id: Option<Vec<u8>> = row.get(1).map_err(db_error)?;
+        let version: i64 = row.get(2).map_err(db_error)?;
+        let committed_at: String = row.get(3).map_err(db_error)?;
+        let principal: String = row.get(4).map_err(db_error)?;
+        let schema_digest: Vec<u8> = row.get(5).map_err(db_error)?;
+        let plaintext_digest: Vec<u8> = row.get(6).map_err(db_error)?;
+        let encrypted_blob = sealed_ciphertext_column(row, 7).map_err(db_error)?;
+        let audit_count: i64 = row.get(8).map_err(db_error)?;
+        let terminal_hash: Vec<u8> = row.get(9).map_err(db_error)?;
+        #[cfg(test)]
+        config_capacity_sealed_buffers::observe(&encrypted_blob);
         let parent_tx_id =
             super::history::original_parent_sync(conn, audit_key, &tx_id, version, parent_tx_id)?;
         if tx_id.len() != 16
@@ -3405,6 +3390,22 @@ fn validate_sealed_state_sync(
         }
     }
     Ok(())
+}
+
+// The view stays inside the current SQLite row until every envelope and audit
+// check finishes. It never escapes the cursor or advances to another row.
+fn sealed_ciphertext_column<'row>(
+    row: &'row rusqlite::Row<'_>,
+    index: usize,
+) -> rusqlite::Result<std::borrow::Cow<'row, [u8]>> {
+    match row.get_ref(index)? {
+        rusqlite::types::ValueRef::Blob(encrypted) => Ok(std::borrow::Cow::Borrowed(encrypted)),
+        _ => Err(rusqlite::Error::InvalidColumnType(
+            index,
+            "encrypted_blob".to_owned(),
+            row.get_ref(index)?.data_type(),
+        )),
+    }
 }
 
 fn validate_history_chain_sync(conn: &Connection) -> io::Result<Option<(Vec<u8>, u64)>> {
@@ -5553,3 +5554,11 @@ mod tests {
         );
     }
 }
+
+#[cfg(test)]
+#[path = "sqlite/config_capacity_history_reader_tests.rs"]
+mod config_capacity_history_reader_tests;
+
+#[cfg(test)]
+#[path = "sqlite/config_capacity_sealed_buffers.rs"]
+mod config_capacity_sealed_buffers;
