@@ -8,6 +8,8 @@
 mod audit;
 mod audit_mutation;
 pub use audit_mutation::PreparedAuditedMutation;
+#[cfg(test)]
+mod capacity_record;
 pub(crate) mod history;
 mod preparation;
 mod raft_adapter;
