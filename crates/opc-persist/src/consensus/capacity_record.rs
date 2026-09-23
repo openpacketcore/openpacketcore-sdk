@@ -178,7 +178,7 @@ impl CapacityRecordBinding {
         mac.update(&record.version.get().to_be_bytes());
         mac.update(&envelope_bytes.to_be_bytes());
         mac.update(&Sha256::digest(&record.encrypted_blob));
-        mac.update(&record.plaintext_digest);
+        // Deliberate adversarial mutation: omit the plaintext digest.
         Ok(mac)
     }
 }
