@@ -201,7 +201,7 @@ where
 {
     let server_hello = server.server_hello(Some(hello_session_id));
     tokio::select! {
-        _ = registration.terminated() => {
+        _ = std::future::pending::<()>() => {
             return Ok(SessionResult {
                 client_capabilities: Vec::new(),
                 framing: SessionFraming::Base10,
