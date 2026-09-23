@@ -574,6 +574,18 @@ impl ConfigMutationIntent {
             opc_crypto::ConfigCapacityProfile::BoundedV1 => {}
             _ => return false,
         }
+        let complete_bytes = if let Self::AuditedMutation(prepared) = self {
+            let mut omitted = opc_consensus::AppendEntriesBatchAccumulator::new();
+            if omitted.consider(&prepared.handle).is_err() {
+                return false;
+            }
+            let Some(bytes) = complete_bytes.checked_sub(omitted.serialized_entry_bytes()) else {
+                return false;
+            };
+            bytes
+        } else {
+            complete_bytes
+        };
         let envelope_bytes = match self {
             Self::AppendCommit(commit)
             | Self::ResolveConfirmedAndAppend { commit, .. }
