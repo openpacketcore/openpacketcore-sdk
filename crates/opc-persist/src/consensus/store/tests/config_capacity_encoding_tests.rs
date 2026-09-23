@@ -411,12 +411,37 @@ async fn config_capacity_957_borrowed_audit_validation_preserves_effect_checks()
         panic!("audited fixture");
     };
     prepared.effect = AuditedConfigEffect::Confirm { tx_id };
-    for revision in 1..=8 {
+    // Revision 8 is structurally recognized for the bounded profile. Keep the
+    // legacy authority's original revision fence, and reject unknown revision 9
+    // at both structural and admitted-profile boundaries.
+    for revision in 1..=9 {
         fixture.schema_version = revision;
         assert_eq!(
             fixture.validate(fixture.identity).is_ok(),
+            (5..=8).contains(&revision),
+            "outer audit revision must be structurally supported",
+        );
+        assert_eq!(
+            fixture
+                .validate_for_profile(
+                    fixture.identity,
+                    store.inner.backend.audit_key(),
+                    ConfigCapacityProfile::Legacy,
+                )
+                .is_ok(),
             (5..=7).contains(&revision),
-            "outer audit revision fence remains authoritative",
+            "outer audit revision fence remains authoritative for legacy admission",
+        );
+        assert_eq!(
+            fixture
+                .validate_for_profile(
+                    fixture.identity,
+                    store.inner.backend.audit_key(),
+                    ConfigCapacityProfile::BoundedV1,
+                )
+                .is_ok(),
+            (5..=8).contains(&revision),
+            "bounded admission supports only recognized outer audit revisions",
         );
     }
     fixture.schema_version = crate::consensus::CONFIG_CONSENSUS_COMMAND_VERSION;
