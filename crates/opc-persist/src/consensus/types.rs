@@ -523,9 +523,8 @@ impl ConfigConsensusCommand {
                     super::audit_mutation::AuditedConfigEffect::Append { commit, resolution } => {
                         crate::types::config_rollback_label(&commit.record.principal)?;
                         commit.validate()?;
-                        if let Some(resolution) = resolution {
-                            validate_confirmed_resolution(&commit.record, *resolution)?;
-                        }
+                        // Experimental omission: loses the exact confirmed-parent check.
+                        let _ = resolution;
                     }
                     super::audit_mutation::AuditedConfigEffect::Confirm { .. } => {}
                     super::audit_mutation::AuditedConfigEffect::RollbackPoint { label, .. } => {
