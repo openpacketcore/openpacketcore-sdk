@@ -2243,6 +2243,8 @@ mod tests {
     #[cfg(target_os = "linux")]
     mod config_capacity_native_preparation_tests;
     mod config_capacity_preparation_tests;
+    #[cfg(target_os = "linux")]
+    mod config_capacity_shutdown_tests;
 
     use super::super::{
         ConfigConsensusClusterId, ConfigConsensusConfigurationEpoch, ConfigConsensusConfigurationId,

@@ -127,6 +127,8 @@ pub(crate) struct ConfigDurableProgress {
     committed_present: AtomicBool,
     committed_index: AtomicU64,
     applied_epoch: tokio::sync::watch::Sender<u64>,
+    #[cfg(test)]
+    pub(crate) apply_entered: tokio::sync::watch::Sender<u64>,
 }
 
 impl Default for ConfigDurableProgress {
@@ -136,6 +138,8 @@ impl Default for ConfigDurableProgress {
             committed_present: AtomicBool::new(false),
             committed_index: AtomicU64::new(0),
             applied_epoch,
+            #[cfg(test)]
+            apply_entered: tokio::sync::watch::channel(0).0,
         }
     }
 }
@@ -876,6 +880,11 @@ impl RaftStateMachine<ConfigRaftTypeConfig> for SqliteConfigStateMachine {
         I: IntoIterator<Item = Entry<ConfigRaftTypeConfig>> + Send,
         I::IntoIter: Send,
     {
+        #[cfg(test)]
+        self.core
+            .durable_progress
+            .apply_entered
+            .send_modify(|epoch| *epoch = epoch.saturating_add(1));
         #[cfg(test)]
         let _apply_permit = self.core.apply_gate.acquire().await.map_err(|_| {
             storage_error(
