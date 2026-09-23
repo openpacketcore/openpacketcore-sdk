@@ -5,6 +5,9 @@
 
 #![cfg(target_os = "linux")]
 
+#[path = "config_capacity_957_mtls_recovery/election_trace.rs"]
+mod election_trace;
+
 use std::collections::{BTreeMap, BTreeSet};
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
@@ -538,6 +541,7 @@ fn report_failover_observation(
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn config_capacity_957_exact_recovery_after_mtls_response_loss_and_leader_loss() {
+    let election_trace = election_trace::ElectionTrace::install();
     let directory = disk_fixture();
     let pki = Pki::new();
     let manifest = manifest();
@@ -674,6 +678,7 @@ async fn config_capacity_957_exact_recovery_after_mtls_response_loss_and_leader_
         .expect("stop original leader");
     let live = (0..3).filter(|index| *index != leader).collect::<Vec<_>>();
     let readiness = tokio::time::timeout(DURABLE_CONSENSUS_OPERATION_TIMEOUT, async {
+        let _election_phase = election_trace.begin_phase();
         let (one, two) = tokio::join!(
             stores[live[0]].probe_durable_readiness(),
             stores[live[1]].probe_durable_readiness(),
