@@ -5553,3 +5553,7 @@ mod tests {
         );
     }
 }
+
+#[cfg(test)]
+#[path = "sqlite/config_capacity_history_reader_tests.rs"]
+mod config_capacity_history_reader_tests;
