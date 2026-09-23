@@ -194,6 +194,60 @@ snapshot does not establish compatibility. These are additional exact-symbol
 handoff and implementation prerequisites. Provision the new profile explicitly;
 an existing store is not silently promoted. Any migration needs its own reviewed
 procedure and compatibility evidence.
+
+Each bounded append carries a private, fixed 44-byte record proof: a 12-byte
+header (proof revision, capacity profile, logical bytes and replay bytes) and a
+32-byte HMAC-SHA-256 tag. The SDK issues it while the encryption evidence is
+still paired with the immutable record. Under a separate domain, the tag binds
+the header, authority scope, key epoch and exact immutable record, including
+its original AEAD parent. Verification uses the receiver's independently
+admitted profile and authority. An operation handle or decoded byte count
+cannot substitute for this proof. Verified recovery may attach a fresh local
+reservation; it grants neither a new encryption claim nor audit authorization.
+
+Revision 8 adds final ordinary and audited append variants without renumbering
+the legacy variants. Rejection must precede local proposal, forwarded proposal
+and replication handoff. Durable storage must commit the record and its proof
+atomically, retain their one-to-one binding beyond request-outcome expiry, and
+authenticate them during history reads, retained reopen and snapshot restore.
+Acknowledged retention must preserve the authenticated original parent and
+prune matching proof rows. These are still implementation and qualification
+prerequisites: command support alone does not enable the larger profile, and
+an append must refuse if atomic proof storage is unavailable.
+
+Revision 6 adds a separate record-proof table keyed by the existing 16-byte
+transaction ID, with exactly one 44-byte binding per retained configuration.
+History format 2 authenticates the selected capacity profile and includes the
+exact binding bytes in its record chain. Legacy format 1 omits that profile
+field and keeps its existing serialized bytes and schema manifest. Missing,
+extra, mismatched or invalid proofs must reject even an empty or negative read.
+The canonical history charge includes the additional 60 bytes per record;
+SQLite pages, journals, indexes and working allocations require separate
+physical storage and memory accounting.
+
+Snapshot construction must pin validation, frontier capture and database copy
+to one source read transaction. Import must validate the independently admitted
+destination profile before replacing any authority, copy the proof table in
+the same transaction as history, and authenticate the result before commit.
+Record/proof/confirmed-parent effects must roll back together on history
+capacity rejection. Native database-body fixtures are partial evidence only;
+they cannot qualify the snapshot envelope, real multi-node transfer, full
+resource budget or public larger-profile opening.
+
+The proposed profile uses config RPC revision 8 and SQLite/snapshot revision 6;
+legacy callers keep RPC revision 7 and SQLite/snapshot revision 5. The snapshot
+body's identity row must match the selected storage revision before replacing
+receiver authority. Its 50-byte footer keeps the existing layout; for revision
+6 the 32-byte integrity field is HMAC-SHA-256 using the existing configuration
+audit key under a distinct snapshot-capacity domain. It binds the profile,
+cluster/configuration/epoch, key epoch, complete body and footer prefix. Legacy
+revision 5 keeps its exact SHA-256 checksum. A revised footer alone cannot
+authorize a legacy body in the larger profile. Private bounded staging may be
+needed to validate a complete incoming body; rejected staging is removed and
+cannot replace the receiver's authority or local admission binding. Snapshot
+size, copy-buffer and operation-deadline limits remain unchanged. These format
+checks require runtime qualification in addition to authenticated transport.
+
 Shared transport and session profiles remain byte-identical.
 
 ## Resource and recovery contract
@@ -207,6 +261,34 @@ before exceeding its reservation. Count allocated capacities and overlapping
 lifetimes, including rejected inbound decoding and leader fan-out, rather than
 only payload lengths. If that inventory cannot fit, the RFC must
 be revised before admission changes; an unmeasured multiplier is not evidence.
+
+Use `ConfigPreparationPool` and its non-cloneable
+`ConfigPreparationReservation` for the destination store's eight nonwaiting
+preparation slots. `ConsensusConfigStore::try_reserve_config_preparation` and
+the corresponding `ManagedDatastore` port supply that exact store's reservation
+before SDK-owned plaintext or recovery decoding allocations. A foreign pool,
+missing reservation or reused encryption reservation cannot authorize bounded
+store admission. Legacy implementations return no reservation and preserve
+their existing behavior; an unsupported nonlegacy datastore refuses.
+
+`encrypt_reserved_bounded_config_envelope` consumes the reservation before
+provider access and transfers it through the one-shot encryption claim and
+attestation. Envelope aliases retain shared ownership until their last drop.
+Ordinary prepared operations remain non-cloneable; audited prepared aliases
+share immutable payload and preparation ownership. Separate nonwaiting guards
+bound concurrent SDK encoding and mutation submission by those aliases.
+Timeout or cancellation must retain ownership of accepted work until it
+finishes. The receiver acquires its own reservation before inner forwarded
+command decoding. Slot counts alone are not allocated-byte accounting.
+
+`ConsensusConfigStore::decode_prepared_audited_mutation` reserves before owned
+decoding and authenticates the original handle, effect and required record
+proof before attaching local ownership. It grants no new encryption evidence,
+Intent receipt or caller authority. Generic legacy decoding remains unreserved.
+Reservations have no serialized representation and cannot enter commands,
+retained Raft entries, recovery handles or snapshots. Replication and snapshot
+progress must remain possible with all eight preparation slots occupied;
+their separate buffers and queues still require complete occupancy bounds.
 
 Account separately for caller-owned arbitrary config objects, Openraft retained
 entries/channels, SQLite caches, TLS/outer frames, peer connections, history
@@ -225,9 +307,28 @@ oversize body/footer and concurrent operations without relaxing timeouts.
 Retained reopen uses the same original identities, paths and durability mode;
 creating new storage is not reopen evidence.
 
-Ordinary exact-operation recovery needs a public caller-scoped, read-only
-lookup contract; the current internal result cache and mutation retry API do
-not supply it. Qualify recovery within its existing 4,096-applied-sequence
+Ordinary exact-operation recovery uses the proposed public
+`PreparedConfigCommitOperation`, `ConfigCommitRecoveryHandle` and
+`ConfigCommitRecoveryOutcome` types. `prepare_recoverable_commit` consumes an
+attested ordinary append or confirmed-resolution successor once, finalizes its
+audit metadata and binds the caller-chosen original request ID before sending.
+`append_prepared_commit` preserves forwarding and
+`append_prepared_commit_local` requires the local leader. Both consume the
+prepared operation; its handle is available beforehand. The existing mutation
+retry API retains its behavior.
+
+The version-one handle is exactly **200 bytes**, with no public field setters or
+serde constructor. It binds authority, immutable capacity profile, key epoch,
+original request ID, prepared-payload digest and a purpose-separated keyed caller
+binding. An existing-key HMAC authenticates the complete fixed encoding under a
+distinct recovery domain. Parsing validates only the exact framing;
+`lookup_commit_operation` authenticates scope and a separately trusted caller
+before its quorum barrier and read-only outcome lookup. Debug output is redacted.
+One deadline covers authentication, quorum, local catch-up and the SQLite read.
+
+Lookup returns `Committed`, a retained same-payload `Rejected(PersistError)`, or
+`Unresolved`. It never proposes a write or reveals a different payload's result
+when the request ID collides. Qualify recovery within the existing 4,096-applied-sequence
 window, including reopen and snapshot transfer. A missing or expired result
 outside a proven coverage window remains unresolved: it is not evidence of
 noncommit and does not authorize another operation identity. Any additional
@@ -293,11 +394,15 @@ The exact shared boundary needing coordination is
 policy port on `ManagedDatastore`, plus the sealed consensus adapter's policy
 override. Additional exact boundaries identified by adversarial review are
 the claim/commit size-evidence transfer and retained-profile validation before
-WAL recovery. Their API designs and handoffs remain open. The ordinary
-read-only recovery API and its coverage semantics also require review.
+WAL recovery. These exact source boundaries, the three ordinary recovery
+root exports, destination-store reservation transfer and reserved audited decode
+have recorded ownership handoffs. Their API designs, allocation accounting and
+coverage semantics still require review and qualification.
 Required-audit sequencing and authority custody remain with their owners.
-Public exports and the final RFC number require a recorded handoff. No
-transport-budget, manifest or dependency expansion is proposed by this draft.
+The final RFC number requires maintainer allocation. Borrowed validation of the
+exact encryption plaintext adds only the existing workspace `serde` and
+`serde_json` dependencies to `opc-crypto`, enabling `raw_value`; it introduces
+no package version upgrade or transport-budget expansion.
 
 Prepare the original-behavior detector and bounded implementation design while
 these decisions are reviewed. Before delivering a wider admission fence,
