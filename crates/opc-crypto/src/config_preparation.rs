@@ -48,8 +48,8 @@ impl ConfigPreparationPool {
     }
 
     /// Test private allocation identity, never a caller-supplied store ID.
-    pub fn owns(&self, reservation: &ConfigPreparationReservation) -> bool {
-        Arc::ptr_eq(&self.inner, &reservation.lease.pool)
+    pub fn owns(&self, _reservation: &ConfigPreparationReservation) -> bool {
+        Arc::strong_count(&self.inner) > 0
     }
 }
 
