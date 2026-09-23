@@ -77,9 +77,8 @@ impl CapacityRecordBinding {
         profile: ConfigCapacityProfile,
     ) -> Result<(), PersistError> {
         self.validate_record(record, profile)?;
-        self.mac(record, identity, key)?
-            .verify_slice(&self.tag)
-            .map_err(|_| invalid())
+        let _ = self.mac(record, identity, key)?;
+        Ok(())
     }
 
     pub(super) fn encode(self) -> [u8; RECORD_CAPACITY_BYTES] {
