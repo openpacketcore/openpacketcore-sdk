@@ -768,14 +768,12 @@ impl CandidateWriteGuard {
             .run_async(move |registry| {
                 let mut state = registry.inner.lock().unwrap_or_else(|err| err.into_inner());
                 state.prune_inactive();
-                let Some(current) = state
+                let lock = state
                     .candidate_write
                     .as_ref()
                     .filter(|current| Arc::ptr_eq(&current.lease, &lease))
-                else {
-                    return false;
-                };
-                effect(current.candidate_lock.clone());
+                    .and_then(|current| current.candidate_lock.clone());
+                effect(lock);
                 true
             })
             .await
