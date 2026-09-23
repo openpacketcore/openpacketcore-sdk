@@ -806,12 +806,50 @@ impl ConfigConsensusResponse {
     }
 }
 
+/// Immutable encrypted-record fields shared by commands and borrowed SQL rows.
+/// Mutable retention/rollback projections are authenticated separately. A view
+/// carries no attestation or mutation authority by itself.
+#[derive(Clone, Copy)]
+pub(super) struct ConfigRecordView<'a> {
+    pub(super) tx_id: TxId,
+    pub(super) parent_tx_id: Option<TxId>,
+    pub(super) version: opc_types::ConfigVersion,
+    pub(super) committed_at: Timestamp,
+    pub(super) principal: &'a str,
+    pub(super) schema_digest: opc_types::SchemaDigest,
+    pub(super) plaintext_digest: &'a [u8],
+    pub(super) encrypted_blob: &'a [u8],
+}
+
+impl<'a> From<&'a CommitRecord> for ConfigRecordView<'a> {
+    fn from(record: &'a CommitRecord) -> Self {
+        Self {
+            tx_id: record.tx_id,
+            parent_tx_id: record.parent_tx_id,
+            version: record.version,
+            committed_at: record.committed_at,
+            principal: &record.principal,
+            schema_digest: record.schema_digest,
+            plaintext_digest: &record.plaintext_digest,
+            encrypted_blob: &record.encrypted_blob,
+        }
+    }
+}
+
 /// Validate that the config payload is a structurally valid AEAD envelope.
 pub(crate) fn validate_encrypted_record(record: &CommitRecord) -> Result<(), PersistError> {
+    validate_encrypted_record_view(ConfigRecordView::from(record))
+}
+
+/// Validate while ciphertext remains borrowed from the same immutable command
+/// or SQL row that consumes the result. No borrowed data escapes this call.
+pub(super) fn validate_encrypted_record_view(
+    record: ConfigRecordView<'_>,
+) -> Result<(), PersistError> {
     if record.plaintext_digest.len() != 32 || record.encrypted_blob.is_empty() {
         return Err(PersistError::corrupt_blob());
     }
-    let envelope = CryptoEnvelopeRef::decode(&record.encrypted_blob)
+    let envelope = CryptoEnvelopeRef::decode(record.encrypted_blob)
         .map_err(|_| PersistError::corrupt_blob())?;
     if envelope.nonce.len() != envelope.algorithm.nonce_len()
         || envelope.aad.is_empty()
@@ -827,11 +865,11 @@ pub(crate) fn validate_encrypted_record(record: &CommitRecord) -> Result<(), Per
     if bound_key_id != envelope.key_id
         || aad.purpose() != opc_key::KeyPurpose::Config
         || aad.version() != record.version.get()
-        || aad.tenant().as_str() != extract_tenant(&record.principal)
+        || aad.tenant().as_str() != extract_tenant(record.principal)
         || metadata.tx_id() != &record.tx_id
         || metadata.parent_tx_id() != record.parent_tx_id.as_ref()
         || metadata.committed_at() != &record.committed_at
-        || !crate::types::config_principal_matches_aad(&record.principal, metadata.principal())
+        || !crate::types::config_principal_matches_aad(record.principal, metadata.principal())
         || metadata.schema_digest() != &record.schema_digest
     {
         return Err(PersistError::corrupt_blob());

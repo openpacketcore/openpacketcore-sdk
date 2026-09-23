@@ -15,7 +15,7 @@ use opc_crypto::{
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
-use super::types::{validate_encrypted_record, ConfigConsensusIdentity};
+use super::types::{validate_encrypted_record_view, ConfigConsensusIdentity, ConfigRecordView};
 use crate::{AttestedConfigCommit, AuditKey, CommitRecord, PersistError};
 
 const RECORD_CAPACITY_DOMAIN: &[u8] = b"openpacketcore/config-capacity/record/v1\0";
@@ -56,7 +56,7 @@ impl CapacityRecordBinding {
         binding.header[2..4].copy_from_slice(&profile.revision().to_be_bytes());
         binding.header[4..8].copy_from_slice(&logical.to_be_bytes());
         binding.header[8..12].copy_from_slice(&replay.to_be_bytes());
-        binding.validate_record(commit.record(), profile)?;
+        binding.validate_record(ConfigRecordView::from(commit.record()), profile)?;
         binding.tag = binding
             .mac(commit.record(), identity, key)?
             .finalize()
@@ -76,8 +76,21 @@ impl CapacityRecordBinding {
         key: &AuditKey,
         profile: ConfigCapacityProfile,
     ) -> Result<(), PersistError> {
+        self.verify_borrowed(ConfigRecordView::from(record), identity, key, profile)
+    }
+
+    /// Authenticate a borrowed row without constructing an owned CommitRecord.
+    /// The caller supplies the independently authenticated original AEAD parent
+    /// and keeps the row/transaction pinned until its consuming operation ends.
+    pub(super) fn verify_borrowed(
+        &self,
+        record: ConfigRecordView<'_>,
+        identity: ConfigConsensusIdentity,
+        key: &AuditKey,
+        profile: ConfigCapacityProfile,
+    ) -> Result<(), PersistError> {
         self.validate_record(record, profile)?;
-        self.mac(record, identity, key)?
+        self.mac_borrowed(record, identity, key)?
             .verify_slice(&self.tag)
             .map_err(|_| invalid())
     }
@@ -105,7 +118,7 @@ impl CapacityRecordBinding {
 
     fn validate_record(
         &self,
-        record: &CommitRecord,
+        record: ConfigRecordView<'_>,
         profile: ConfigCapacityProfile,
     ) -> Result<(), PersistError> {
         if profile != ConfigCapacityProfile::BoundedV1
@@ -138,8 +151,8 @@ impl CapacityRecordBinding {
         {
             return Err(invalid());
         }
-        preflight_envelope_lengths(&record.encrypted_blob)?;
-        let envelope = CryptoEnvelopeRef::decode(&record.encrypted_blob).map_err(|_| invalid())?;
+        preflight_envelope_lengths(record.encrypted_blob)?;
+        let envelope = CryptoEnvelopeRef::decode(record.encrypted_blob).map_err(|_| invalid())?;
         if envelope.algorithm != opc_key::AeadAlgorithm::Aes256GcmSiv
             || envelope.nonce.len() != opc_key::AES_256_GCM_SIV_NONCE_LEN
             || envelope.aad.len() > CONFIG_CAPACITY_V1_AAD_BYTES
@@ -154,12 +167,21 @@ impl CapacityRecordBinding {
         // Bounded framing is checked before the existing AAD decoder. This
         // also checks key-ID, tenant, parent, transaction, timestamp, principal,
         // schema and version against the envelope without decrypting it.
-        validate_encrypted_record(record).map_err(|_| invalid())
+        validate_encrypted_record_view(record).map_err(|_| invalid())
     }
 
     fn mac(
         &self,
         record: &CommitRecord,
+        identity: ConfigConsensusIdentity,
+        key: &AuditKey,
+    ) -> Result<Hmac<Sha256>, PersistError> {
+        self.mac_borrowed(ConfigRecordView::from(record), identity, key)
+    }
+
+    fn mac_borrowed(
+        &self,
+        record: ConfigRecordView<'_>,
         identity: ConfigConsensusIdentity,
         key: &AuditKey,
     ) -> Result<Hmac<Sha256>, PersistError> {
@@ -177,8 +199,8 @@ impl CapacityRecordBinding {
         mac.update(record.tx_id.as_uuid().as_bytes());
         mac.update(&record.version.get().to_be_bytes());
         mac.update(&envelope_bytes.to_be_bytes());
-        mac.update(&Sha256::digest(&record.encrypted_blob));
-        mac.update(&record.plaintext_digest);
+        mac.update(&Sha256::digest(record.encrypted_blob));
+        mac.update(record.plaintext_digest);
         Ok(mac)
     }
 }

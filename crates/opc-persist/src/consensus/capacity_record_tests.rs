@@ -342,3 +342,99 @@ fn config_capacity_957_record_proof_checks_lengths_before_allocating_key_or_aad(
         assert!(preflight_envelope_lengths(&header[..len]).is_err());
     }
 }
+
+#[test]
+fn config_capacity_957_record_proof_checks_borrowed_sql_ciphertext() {
+    // This exercises the borrowed proof boundary, not native consensus storage,
+    // retention, snapshot transfer, an allocation peak or a production profile.
+    let commit = fixture(96 * 1024, 64, true);
+    let proof = CapacityRecordBinding::issue(&commit, scope(), &key(), PROFILE).expect("issue");
+    let directory = tempfile::tempdir().expect("synthetic proof directory");
+    let mut connection = rusqlite::Connection::open(directory.path().join("proof.sqlite"))
+        .expect("disk SQL connection");
+    connection
+        .execute_batch("CREATE TABLE proof_input (ciphertext BLOB NOT NULL, digest BLOB NOT NULL)")
+        .expect("synthetic schema");
+    connection
+        .execute(
+            "INSERT INTO proof_input (ciphertext, digest) VALUES (?1, ?2)",
+            rusqlite::params![
+                &commit.record().encrypted_blob,
+                &commit.record().plaintext_digest
+            ],
+        )
+        .expect("synthetic encrypted row");
+    let transaction = connection.transaction().expect("pinned transaction");
+    {
+        let mut statement = transaction
+            .prepare("SELECT ciphertext, digest FROM proof_input")
+            .expect("borrowed query");
+        let mut rows = statement.query([]).expect("borrowed rows");
+        let row = rows.next().expect("read").expect("one row");
+        let encrypted_blob = row
+            .get_ref(0)
+            .expect("ciphertext column")
+            .as_blob()
+            .expect("ciphertext BLOB");
+        let plaintext_digest = row
+            .get_ref(1)
+            .expect("digest column")
+            .as_blob()
+            .expect("digest BLOB");
+        let view = ConfigRecordView {
+            encrypted_blob,
+            plaintext_digest,
+            ..ConfigRecordView::from(commit.record())
+        };
+        proof
+            .verify_borrowed(view, scope(), &key(), PROFILE)
+            .expect("exact ciphertext and digest borrowed from pinned row");
+        // Neither a borrowed record nor a valid proof supplies scope or the
+        // authenticated original parent on behalf of the consuming authority.
+        let detached = ConfigRecordView {
+            parent_tx_id: None,
+            ..view
+        };
+        assert!(proof
+            .verify_borrowed(detached, scope(), &key(), PROFILE)
+            .is_err());
+        assert!(proof
+            .verify_borrowed(view, identity(0xB1, 0xA2, 3), &key(), PROFILE)
+            .is_err());
+        assert!(proof
+            .verify_borrowed(view, scope(), &key(), ConfigCapacityProfile::Legacy)
+            .is_err());
+        assert!(rows.next().expect("row end").is_none());
+    }
+    transaction.rollback().expect("end pinned read");
+    // A same-sized changed digest cannot become acceptable by entering through
+    // the borrowed verifier. The original encrypted envelope remains exact.
+    connection
+        .execute("UPDATE proof_input SET digest = zeroblob(32)", [])
+        .expect("synthetic changed digest");
+    let transaction = connection.transaction().expect("second pinned transaction");
+    {
+        let mut statement = transaction
+            .prepare("SELECT ciphertext, digest FROM proof_input")
+            .expect("changed query");
+        let mut rows = statement.query([]).expect("changed rows");
+        let row = rows.next().expect("read").expect("one changed row");
+        let view = ConfigRecordView {
+            encrypted_blob: row
+                .get_ref(0)
+                .expect("ciphertext column")
+                .as_blob()
+                .expect("ciphertext BLOB"),
+            plaintext_digest: row
+                .get_ref(1)
+                .expect("digest column")
+                .as_blob()
+                .expect("digest BLOB"),
+            ..ConfigRecordView::from(commit.record())
+        };
+        assert!(proof
+            .verify_borrowed(view, scope(), &key(), PROFILE)
+            .is_err());
+    }
+    transaction.rollback().expect("end changed pinned read");
+}
