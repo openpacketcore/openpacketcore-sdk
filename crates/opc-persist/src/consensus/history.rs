@@ -181,7 +181,7 @@ fn head_sync(conn: &Connection) -> io::Result<Option<HistoryHead>> {
     ).optional().map_err(database_error)?;
     row.map(|(tx_id, version, encrypted)| {
         #[cfg(test)]
-        config_capacity_read_buffers::observe(0, encrypted.capacity());
+        config_capacity_read_buffers::observe(0, &encrypted);
         Ok(HistoryHead {
             tx_id: TxId::from_uuid(uuid::Uuid::from_slice(&tx_id).map_err(|_| corrupt())?),
             version: ConfigVersion::new(u64::try_from(version).map_err(|_| corrupt())?),
@@ -297,7 +297,7 @@ fn record_chain_sync(
         let version: i64 = row.get(1).map_err(database_error)?;
         let encrypted: Vec<u8> = row.get(2).map_err(database_error)?;
         #[cfg(test)]
-        config_capacity_read_buffers::observe(1, encrypted.capacity());
+        config_capacity_read_buffers::observe(1, &encrypted);
         let count: i64 = row.get(3).map_err(database_error)?;
         let terminal: Vec<u8> = row.get(4).map_err(database_error)?;
         let head = HistoryHead {
@@ -449,7 +449,7 @@ fn validate_state(conn: &Connection, state: &HistoryState) -> io::Result<()> {
             [], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
         ).map_err(database_error)?;
         #[cfg(test)]
-        config_capacity_read_buffers::observe(2, blob.capacity());
+        config_capacity_read_buffers::observe(2, &blob);
         if first_tx != boundary.first.tx_id.as_uuid().as_bytes()
             || u64::try_from(first_version).ok() != Some(boundary.first.version.get())
             || parent.is_some()
@@ -702,7 +702,7 @@ pub(crate) fn retain_sync(
         .map_err(database_error)?
         .ok_or_else(corrupt)?;
     #[cfg(test)]
-    config_capacity_read_buffers::observe(3, encrypted.capacity());
+    config_capacity_read_buffers::observe(3, &encrypted);
     // The head and its immediate predecessor always survive. A pending marker
     // on an older row was resolved by its successor's atomic confirm/rollback;
     // rollback intentionally does not set that historical row's confirmed_at.

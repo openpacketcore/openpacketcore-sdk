@@ -1,6 +1,7 @@
 //! Test-only observations of the four history-authentication ciphertext copies.
 //! SQLite pages, returned records and other Rust buffers are outside this probe.
 
+use std::borrow::Cow;
 use std::cell::Cell;
 
 #[derive(Clone, Copy, Default)]
@@ -13,7 +14,27 @@ thread_local! {
     static CURRENT: Cell<Option<Sample>> = const { Cell::new(None) };
 }
 
-pub(in crate::consensus) fn observe(site: usize, owned_capacity: usize) {
+pub(in crate::consensus) trait CiphertextBuffer {
+    fn owned_capacity(&self) -> usize;
+}
+
+impl CiphertextBuffer for Vec<u8> {
+    fn owned_capacity(&self) -> usize {
+        self.capacity()
+    }
+}
+
+impl CiphertextBuffer for Cow<'_, [u8]> {
+    fn owned_capacity(&self) -> usize {
+        match self {
+            Cow::Borrowed(_) => 0,
+            Cow::Owned(bytes) => bytes.capacity(),
+        }
+    }
+}
+
+pub(in crate::consensus) fn observe(site: usize, ciphertext: &impl CiphertextBuffer) {
+    let owned_capacity = ciphertext.owned_capacity();
     CURRENT.with(|current| {
         if let Some(mut sample) = current.get() {
             sample.calls[site] += 1;
