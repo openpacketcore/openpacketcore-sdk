@@ -167,6 +167,9 @@ impl ConfigDurableProgress {
     }
 
     pub(crate) async fn wait_for_storage_release(&self) -> Result<(), ConfigConsensusStorageError> {
+        if *self.applied_epoch.borrow() > 0 {
+            return Ok(());
+        }
         let mut released = self
             .storage_released
             .get()
