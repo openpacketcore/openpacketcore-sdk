@@ -132,9 +132,11 @@ async fn config_capacity_957_shutdown_waits_for_native_state_machine_owner() {
     let mut shutdown = Box::pin(store.shutdown());
     // A single explicit poll, without cooperative-budget interference, asks
     // whether shutdown has already returned while apply is provably held.
-    let early =
-        poll_fn(|context| Poll::Ready(tokio::task::unconstrained(shutdown.as_mut()).poll(context)))
-            .await;
+    let early = poll_fn(|context| {
+        let mut probe = tokio::task::unconstrained(shutdown.as_mut());
+        Poll::Ready(std::pin::Pin::new(&mut probe).poll(context))
+    })
+    .await;
     let returned_before_release = early.is_ready();
     drop(held_apply);
     match early {
