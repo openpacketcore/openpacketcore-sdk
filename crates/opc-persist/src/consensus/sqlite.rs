@@ -622,9 +622,10 @@ where
     let conn = tokio::time::timeout_at(deadline, conn.lock_owned())
         .await
         .map_err(|_| timed_out("config consensus SQLite connection timed out"))?;
+    drop(storage_owner);
     let connection = ConfigSqliteWorkerConnection {
         connection: conn,
-        _storage_owner: storage_owner,
+        _storage_owner: None,
     };
     let cancellation = Arc::new(SqliteWorkCancellation::with_deadline(std_deadline));
     let mut cancel_on_drop = SqliteWorkCancelOnDrop::new(cancellation.clone());
