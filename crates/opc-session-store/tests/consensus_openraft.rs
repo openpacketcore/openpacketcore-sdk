@@ -6304,11 +6304,32 @@ async fn compacted_successor_snapshot_catches_up_predecessor_voter_and_survives_
     // First make every voter compact, publish, and purge its predecessor
     // phase. The later isolated voter keeps its selected predecessor P, but
     // has no retained P+1..S log interval from which it can catch up.
-    tokio::time::timeout(SNAPSHOT_COMMAND_BATCH_TIMEOUT, async {
+    let predecessor_batch = tokio::time::timeout(SNAPSHOT_COMMAND_BATCH_TIMEOUT, async {
         commit_snapshot_triggering_commands(&cluster.stores[initial_leader]).await;
     })
-    .await
-    .expect("predecessor snapshot command batch completes within its aggregate bound");
+    .await;
+    if predecessor_batch.is_err() {
+        for (voter, store) in cluster.stores.iter().enumerate() {
+            let status = store.status();
+            let health = store.persistence_health();
+            eprintln!(
+                "predecessor_snapshot_batch voter={voter} term={} leader_known={} local_leader={} last_log_index={:?} applied_index={:?} admitted={} completed_snapshots={} engine_running={} storage_state={:?} storage_failure={:?} counters={:?}",
+                status.term,
+                status.leader_id.is_some(),
+                status.leader_id == Some(status.node_id),
+                status.last_log_index,
+                status.applied_index,
+                status.admitted,
+                status.completed_snapshot_count,
+                health.engine_running,
+                health.storage_state,
+                health.storage_failure,
+                store.diagnostic_snapshot(),
+            );
+        }
+    }
+    predecessor_batch
+        .expect("predecessor snapshot command batch completes within its aggregate bound");
     let predecessor = tokio::time::timeout(SNAPSHOT_RECOVERY_TIMEOUT, async {
         loop {
             let progress = futures_util::future::join_all(

@@ -1935,8 +1935,48 @@ impl QualificationNode {
         }
     }
 
+    // Only called after an original initialization operation has failed.
+    // The fixed numeric frame carries no identity, error string or payload.
+    fn report_initialization_failure(&self, stage: u64, code: u64) {
+        let status = self.store.status();
+        let health = self.store.persistence_health();
+        let counters = self.store.diagnostic_snapshot();
+        let fields: [u64; 16] = [
+            stage,
+            code,
+            status.term,
+            u64::from(status.leader_id.is_some()),
+            u64::from(status.leader_id == Some(status.node_id)),
+            u64::from(status.last_log_index.is_some()),
+            status.last_log_index.unwrap_or_default(),
+            u64::from(status.applied_index.is_some()),
+            status.applied_index.unwrap_or_default(),
+            u64::from(status.admitted),
+            u64::from(health.engine_running),
+            status.completed_snapshot_count,
+            counters.route_deadline,
+            counters.proposal_permit_deadline,
+            counters.sqlite_connection_lock_deadline,
+            counters.sqlite_execution_deadline,
+        ];
+        eprintln!(
+            "qualification_initialization_failure {}",
+            serde_json::json!(fields)
+        );
+    }
+
     async fn initialize(&self) -> Result<(), ()> {
-        self.store.initialize_cluster().await.map_err(|_| ())?;
+        self.store.initialize_cluster().await.map_err(|error| {
+            use opc_session_store::ConsensusSessionStoreOpenError as OpenError;
+            let code = match error {
+                OpenError::ClusterFormationRejected => 1,
+                OpenError::EngineUnavailable => 2,
+                OpenError::StorageUnavailable => 3,
+                OpenError::RecoveryRequired => 4,
+                _ => 0,
+            };
+            self.report_initialization_failure(1, code);
+        })?;
         if self.isolated_scale.is_some_and(|scale| {
             scale.workload == opc_session_testkit::qualification::QualificationIsolatedScaleWorkload::ProtectedRecoveryControl
         }) {
@@ -1946,11 +1986,23 @@ impl QualificationNode {
             self.store
                 .activate_fenced_transition_capability()
                 .await
-                .map_err(|_| ())?;
+                .map_err(|error| {
+                    let code = u64::from(matches!(
+                        map_store_error(&error),
+                        QualificationNodeErrorCode::BackendUnavailable
+                    ));
+                    self.report_initialization_failure(2, code);
+                })?;
             self.store
                 .activate_protected_roster_profile_v2()
                 .await
-                .map_err(|_| ())?;
+                .map_err(|error| {
+                    let code = u64::from(matches!(
+                        map_store_error(&error),
+                        QualificationNodeErrorCode::BackendUnavailable
+                    ));
+                    self.report_initialization_failure(3, code);
+                })?;
         }
         Ok(())
     }

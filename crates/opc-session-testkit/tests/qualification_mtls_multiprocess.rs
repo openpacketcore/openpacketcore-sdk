@@ -3079,6 +3079,21 @@ impl ChildNode {
         )
     }
 
+    fn initialization_failure_diagnostic(&self) -> Option<[u64; 16]> {
+        // Read at most the existing stderr-tail budget, then admit only the
+        // exact numeric frame. Never copy arbitrary child stderr into a log.
+        const LIMIT: u64 = 8 * 1024;
+        let mut file = File::open(&self.stderr_path).ok()?;
+        let start = file.metadata().ok()?.len().saturating_sub(LIMIT);
+        file.seek(SeekFrom::Start(start)).ok()?;
+        let mut bytes = Vec::new();
+        file.take(LIMIT).read_to_end(&mut bytes).ok()?;
+        bytes.split(|byte| *byte == b'\n').rev().find_map(|line| {
+            let encoded = line.strip_prefix(b"qualification_initialization_failure ")?;
+            serde_json::from_slice::<[u64; 16]>(encoded).ok()
+        })
+    }
+
     fn stderr_diagnostic(&self) -> ChildStderrDiagnostic {
         const MAX_STDERR_BYTES: u64 = 8 * 1024;
 
@@ -4130,7 +4145,12 @@ impl Fleet {
             match node.receive() {
                 QualificationNodeReply::Initialized => {}
                 QualificationNodeReply::Error { code } => {
-                    panic!("qualification initial fleet initialization rejected: {code:?}");
+                    panic!(
+                        "qualification initial fleet initialization rejected: {code:?}; node={} initialization={:?} stderr={:?}",
+                        node.node_index,
+                        node.initialization_failure_diagnostic(),
+                        node.stderr_diagnostic(),
+                    );
                 }
                 _ => panic!("qualification initial fleet initialization reply mismatch"),
             }
