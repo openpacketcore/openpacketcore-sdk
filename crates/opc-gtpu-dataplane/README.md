@@ -47,6 +47,31 @@ support remain unavailable. Linux kernel-GTP, mock and unsupported
 adapters return `Missing` for the new attachment-scoped capability. The software
 packet helpers alone confer no install authority; see [N3 conformance](CONFORMANCE.md).
 
+## Grouped device shutdown for retained restart
+
+`EbpfGtpuDataplaneBackend::suspend_grouped_device` detaches both exact owned tc
+hooks while preserving the complete map graph and selector-authority markers.
+Use it after stopping producers when a protected grouped namespace must reopen
+its existing ledger. Success invalidates the backend's old managed attachment;
+recreate the exact stable device/endpoints and open the retained authority before
+resuming group work. Active and retired history remain subject to the existing
+ownership and selector-reuse checks.
+
+Ordinary `remove_device` still detaches and unpins its graph. It is unsuitable
+for a protected namespace that must retain kernel history across restart.
+Suspension refuses ordinary, cleanup-only and unadmitted successor handles,
+foreign hooks, replaced pins and incomplete identities. Cancellation before
+dispatch has no effect; after dispatch the owned worker completes under the
+operation/namespace locks. Partial detach remains an error with pins retained.
+
+This operation does not restore missing maps, relocate used authority to a new
+control root, reset a namespace, or prove packet continuity. The privileged
+dual-stack lane checks exact map-object preservation and retired-history reopen.
+The `selector_retained_restart` example additionally reopens an encrypted,
+file-backed ledger with active and retired groups. Run it only through an
+isolated, operator-authorized Linux mount/network namespace with private bpffs
+and the documented synthetic interface; it is not a live deployment command.
+
 ## API Shape
 
 The experimental protected selector coordinator exposes an explicit

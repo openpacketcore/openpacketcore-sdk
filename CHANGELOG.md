@@ -29,6 +29,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- `opc-gtpu-dataplane`: add explicit grouped restart detachment that removes
+  exact owned tc hooks while retaining all map objects and selector history.
+  Revoke the old managed attachment, refuse conflicting identities, and keep
+  ordinary device removal and missing-map recovery boundaries unchanged.
+  Refs #964.
+
 - `opc-gtpu-dataplane`: add experimental explicit relocation for a protected
   selector namespace with permanent proof of no prior group admission. Retain
   its ledger and secret, fence stale writers, and resume only the exact

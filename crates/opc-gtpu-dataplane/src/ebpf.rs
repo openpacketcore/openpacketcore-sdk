@@ -1485,6 +1485,19 @@ pub(crate) trait EbpfGtpuRuntime: Send + Sync + fmt::Debug {
         tc_priority: u16,
     ) -> Result<(), GtpuError>;
 
+    /// Detach the exact grouped hooks while preserving the complete pin graph.
+    fn suspend_grouped(
+        &self,
+        _interface: &str,
+        _ifindex: u32,
+        _pin_dir: &Path,
+        _tc_priority: u16,
+    ) -> Result<(), GtpuError> {
+        Err(GtpuError::UnsupportedFeature {
+            feature: "grouped_restart_detach",
+        })
+    }
+
     /// Remove an exact, empty legacy-v2 program/map graph while retaining
     /// retry-safe identity evidence across partial cleanup.
     fn teardown_drained_v2(
@@ -3759,6 +3772,32 @@ impl EbpfGtpuDataplaneBackend {
     ) -> Result<crate::selector_namespace::GtpuSelectorNamespaceBootstrap, GtpuError> {
         self.run_blocking("ebpf_selector_namespace_bootstrap", move |backend| {
             backend.selector_namespace_bootstrap_sync(stable_device)
+        })
+        .await
+    }
+
+    /// Detach a managed grouped device for an orderly process restart.
+    ///
+    /// Success proves both exact owned tc hooks are absent. Every map pin and
+    /// selector-authority marker remains intact, including terminal selector
+    /// stamps required by a retained protected ledger. The old attachment is
+    /// no longer managed and cannot authorize further group mutations. Reopen
+    /// with [`GtpuDataplaneBackend::create_device_with_endpoints`] and the exact
+    /// stable device/endpoints, then reopen the retained selector authority.
+    ///
+    /// Unlike [`GtpuDataplaneBackend::remove_device`], this operation never
+    /// unpins the map graph. It is not missing-map restoration, a namespace
+    /// reset, or permission to attach a different owner. Callers must stop
+    /// their producers before shutdown. Ordinary devices are refused.
+    ///
+    /// Dropping the observer before dispatch has no effect; once dispatched,
+    /// the worker completes under its existing operation/namespace locks.
+    /// Conflicting or incomplete identities fail closed. A partial detach
+    /// returns an error, preserves the pins, and never reports clean shutdown.
+    pub async fn suspend_grouped_device(&self, device: &GtpDevice) -> Result<(), GtpuError> {
+        let device = device.clone();
+        self.run_blocking("ebpf_suspend_grouped_device", move |backend| {
+            backend.detach_device_sync(device, true)
         })
         .await
     }
@@ -8882,6 +8921,10 @@ impl EbpfGtpuDataplaneBackend {
     }
 
     fn remove_device_sync(&self, device: GtpDevice) -> Result<(), GtpuError> {
+        self.detach_device_sync(device, false)
+    }
+
+    fn detach_device_sync(&self, device: GtpDevice, retain_grouped: bool) -> Result<(), GtpuError> {
         let _operation = self.operation_guard()?;
         validate_interface_name(&device.name)?;
         let devices = self.devices()?;
@@ -8890,6 +8933,15 @@ impl EbpfGtpuDataplaneBackend {
             .is_some_and(|managed| managed.name == device.name);
         if !is_managed {
             return Err(GtpuError::NotFound);
+        }
+        if retain_grouped
+            && devices
+                .get(&device.ifindex)
+                .is_none_or(|managed| managed.grouped.is_none())
+        {
+            return Err(GtpuError::UnsupportedFeature {
+                feature: "grouped_restart_detach",
+            });
         }
         if devices
             .get(&device.ifindex)
@@ -8943,12 +8995,21 @@ impl EbpfGtpuDataplaneBackend {
                 stores.remove(&group_key);
             }
         }
-        self.inner.runtime.detach(
-            &device.name,
-            device.ifindex,
-            &pin_dir,
-            self.inner.config.tc_priority,
-        )?;
+        if retain_grouped {
+            self.inner.runtime.suspend_grouped(
+                &device.name,
+                device.ifindex,
+                &pin_dir,
+                self.inner.config.tc_priority,
+            )?;
+        } else {
+            self.inner.runtime.detach(
+                &device.name,
+                device.ifindex,
+                &pin_dir,
+                self.inner.config.tc_priority,
+            )?;
+        }
         self.devices()?.remove(&device.ifindex);
         self.traffic_sequence_sources()?.remove(&device.ifindex);
         Ok(())
@@ -38831,6 +38892,135 @@ mod aya_runtime {
         assert!(!grouped_reader_grace_kernel_profile(&[0xff]));
     }
 
+    impl AyaGtpuRuntime {
+        fn detach_managed_device(
+            &self,
+            interface: &str,
+            ifindex: u32,
+            pin_dir: &Path,
+            tc_priority: u16,
+            retain_grouped: bool,
+        ) -> Result<(), GtpuError> {
+            let operation = if retain_grouped {
+                "ebpf_grouped_restart_detach"
+            } else {
+                "ebpf_detach"
+            };
+            let ownership = self.selector_namespace_ownership(ifindex, operation)?;
+            let _graph_lock = Self::acquire_operation_control_lock(&ownership, operation)?;
+            let (held, before) = {
+                let mut devices = self
+                    .devices
+                    .lock()
+                    .map_err(|_| GtpuError::io(operation, super::poisoned_lock()))?;
+                let loaded = devices.get(&ifindex).ok_or(GtpuError::NotFound)?;
+                if retain_grouped
+                    && (loaded.interface != interface
+                        || loaded.pin_dir != pin_dir
+                        || loaded.tc_priority != tc_priority)
+                {
+                    return Err(GtpuError::AlreadyExists);
+                }
+                if !Arc::ptr_eq(&loaded._reconciler_ownership, &ownership) {
+                    return Err(state_indeterminate(operation));
+                }
+                let observed_pins = Self::pinned_map_identity(&loaded.pin_dir)
+                    .map_err(|_| state_indeterminate(operation))?;
+                if observed_pins != loaded.datapath_identity.pins {
+                    // All canonical pin paths were readable, so a different
+                    // complete inventory is a proven replacement rather than
+                    // an uncertain partial graph.
+                    return Err(GtpuError::AlreadyExists);
+                }
+                let observed_datapath = Self::datapath_identity(&loaded.ebpf, &loaded.pin_dir)
+                    .map_err(|_| state_indeterminate(operation))?;
+                if observed_datapath != loaded.datapath_identity {
+                    // The exact pin inventory is still present, so a complete
+                    // readable program-identity change is also a replacement.
+                    return Err(GtpuError::AlreadyExists);
+                }
+                if !Self::loaded_datapath_is_current(ifindex, loaded) {
+                    // Leave in-process ownership and pins intact. Aya-created
+                    // links are ManuallyDrop and numeric link descriptors have
+                    // no detaching destructor, so a foreign/replacement
+                    // occupant observed here is not detached.
+                    return Err(GtpuError::AlreadyExists);
+                }
+                if !Self::detach_graph_is_exclusive(ifindex, loaded) {
+                    return Err(GtpuError::AlreadyExists);
+                }
+                let before = Self::selector_namespace_graph_identity(
+                    ifindex,
+                    loaded,
+                    &ownership,
+                    &_graph_lock,
+                    operation,
+                )?;
+                let held = devices.remove(&ifindex).ok_or(GtpuError::NotFound)?;
+                (held, before)
+            };
+            let LoadedDevice {
+                ebpf,
+                interface: _,
+                marked_owner_by_teid: _,
+                default_teid_by_ue: _,
+                links,
+                pin_dir,
+                tc_priority,
+                datapath_identity,
+                cleanup_only: _,
+                successor_pending: _,
+                pending_traffic_observation_gate: _,
+                active_traffic_observation_gate: _,
+                selector_namespace_fresh_provisioning: _,
+                _reconciler_ownership: _ownership,
+            } = held;
+            match links {
+                // `loaded_datapath_is_current` above proves both live slots
+                // hold our exact programs, which is only possible when links
+                // were attached.
+                Some(links) => {
+                    detach_datapath_if_current(links, &datapath_identity, ifindex, tc_priority)?;
+                }
+                // A link-less device can only reach this point if an
+                // out-of-band actor reattached the still-pinned programs into
+                // our exact slots. Never unpin beneath live hooks: require
+                // both slots authoritatively empty first.
+                None => {
+                    if !Self::cleanup_only_hook_slots_empty(ifindex, tc_priority)? {
+                        return Err(state_indeterminate(operation));
+                    }
+                }
+            }
+            if !Self::detach_graph_is_fenced(ifindex, &datapath_identity, tc_priority) {
+                return Err(state_indeterminate(operation));
+            }
+            if retain_grouped {
+                // A restart preserves the exact map objects, PMTU policy and
+                // marker objects observed before detaching. Missing or replaced
+                // state is not repaired or reported as a completed suspension.
+                let current =
+                    Self::revalidate_current_control_path(&ownership, &_graph_lock, operation)?;
+                if Self::datapath_identity(&ebpf, &pin_dir)
+                    .map_err(|_| state_indeterminate(operation))?
+                    != before.datapath
+                    || Self::marker_inventory_identity_snapshot(&current)
+                        .map_err(|_| state_indeterminate(operation))?
+                        != before.selector_markers
+                    || Self::pmtu_policy_slot_for_graph(&ebpf, operation)? != before.pmtu_policy
+                {
+                    return Err(state_indeterminate(operation));
+                }
+            } else {
+                // Both filters are now confirmed removed. Any pin mismatch or
+                // unlink failure from this point is necessarily partial cleanup.
+                Self::unpin_if_current(&ebpf, &pin_dir, &datapath_identity, &ownership)?;
+            }
+            Self::revalidate_current_control_path(&ownership, &_graph_lock, operation)?;
+            Ok(())
+        }
+    }
+
     impl EbpfGtpuRuntime for AyaGtpuRuntime {
         fn synchronize_grouped_readers(&self) -> Result<(), GtpuError> {
             // Linux's non-expedited GLOBAL command executes synchronize_rcu
@@ -45089,98 +45279,22 @@ mod aya_runtime {
 
         fn detach(
             &self,
-            _interface: &str,
+            interface: &str,
             ifindex: u32,
-            _pin_dir: &Path,
-            _tc_priority: u16,
+            pin_dir: &Path,
+            tc_priority: u16,
         ) -> Result<(), GtpuError> {
-            let ownership = self.selector_namespace_ownership(ifindex, "ebpf_detach")?;
-            let _graph_lock = Self::acquire_operation_control_lock(&ownership, "ebpf_detach")?;
-            let held = {
-                let mut devices = self
-                    .devices
-                    .lock()
-                    .map_err(|_| GtpuError::io("ebpf_detach", super::poisoned_lock()))?;
-                let loaded = devices.get(&ifindex).ok_or(GtpuError::NotFound)?;
-                if !Arc::ptr_eq(&loaded._reconciler_ownership, &ownership) {
-                    return Err(state_indeterminate("ebpf_detach"));
-                }
-                let observed_pins = Self::pinned_map_identity(&loaded.pin_dir)
-                    .map_err(|_| state_indeterminate("ebpf_detach"))?;
-                if observed_pins != loaded.datapath_identity.pins {
-                    // All canonical pin paths were readable, so a different
-                    // complete inventory is a proven replacement rather than
-                    // an uncertain partial graph.
-                    return Err(GtpuError::AlreadyExists);
-                }
-                let observed_datapath = Self::datapath_identity(&loaded.ebpf, &loaded.pin_dir)
-                    .map_err(|_| state_indeterminate("ebpf_detach"))?;
-                if observed_datapath != loaded.datapath_identity {
-                    // The exact pin inventory is still present, so a complete
-                    // readable program-identity change is also a replacement.
-                    return Err(GtpuError::AlreadyExists);
-                }
-                if !Self::loaded_datapath_is_current(ifindex, loaded) {
-                    // Leave in-process ownership and pins intact. Aya-created
-                    // links are ManuallyDrop and numeric link descriptors have
-                    // no detaching destructor, so a foreign/replacement
-                    // occupant observed here is not detached.
-                    return Err(GtpuError::AlreadyExists);
-                }
-                if !Self::detach_graph_is_exclusive(ifindex, loaded) {
-                    return Err(GtpuError::AlreadyExists);
-                }
-                Self::selector_namespace_graph_identity(
-                    ifindex,
-                    loaded,
-                    &ownership,
-                    &_graph_lock,
-                    "ebpf_detach",
-                )?;
-                devices.remove(&ifindex)
-            }
-            .ok_or(GtpuError::NotFound)?;
-            let LoadedDevice {
-                ebpf,
-                interface: _,
-                marked_owner_by_teid: _,
-                default_teid_by_ue: _,
-                links,
-                pin_dir,
-                tc_priority,
-                datapath_identity,
-                cleanup_only: _,
-                successor_pending: _,
-                pending_traffic_observation_gate: _,
-                active_traffic_observation_gate: _,
-                selector_namespace_fresh_provisioning: _,
-                _reconciler_ownership: _ownership,
-            } = held;
-            match links {
-                // `loaded_datapath_is_current` above proves both live slots
-                // hold our exact programs, which is only possible when links
-                // were attached.
-                Some(links) => {
-                    detach_datapath_if_current(links, &datapath_identity, ifindex, tc_priority)?;
-                }
-                // A link-less device can only reach this point if an
-                // out-of-band actor reattached the still-pinned programs into
-                // our exact slots. Never unpin beneath live hooks: require
-                // both slots authoritatively empty first.
-                None => {
-                    if !Self::cleanup_only_hook_slots_empty(ifindex, tc_priority)? {
-                        return Err(state_indeterminate("ebpf_detach"));
-                    }
-                }
-            }
-            if !Self::detach_graph_is_fenced(ifindex, &datapath_identity, tc_priority) {
-                return Err(state_indeterminate("ebpf_detach"));
-            }
-            // Both filters are now confirmed removed. Any pin mismatch or
-            // unlink failure from this point is necessarily partial cleanup.
-            Self::unpin_if_current(&ebpf, &pin_dir, &datapath_identity, &ownership)?;
-            Self::revalidate_current_control_path(&ownership, &_graph_lock, "ebpf_detach")?;
-            Ok(())
+            self.detach_managed_device(interface, ifindex, pin_dir, tc_priority, false)
+        }
+
+        fn suspend_grouped(
+            &self,
+            interface: &str,
+            ifindex: u32,
+            pin_dir: &Path,
+            tc_priority: u16,
+        ) -> Result<(), GtpuError> {
+            self.detach_managed_device(interface, ifindex, pin_dir, tc_priority, true)
         }
 
         fn far_get(
@@ -59804,6 +59918,73 @@ mod tests {
             }
             state.current_graphs.remove(pin_dir);
             Ok(CurrentEbpfGraphRecoveryOutcome::Removed)
+        }
+
+        fn suspend_grouped(
+            &self,
+            interface: &str,
+            ifindex: u32,
+            pin_dir: &Path,
+            tc_priority: u16,
+        ) -> Result<(), GtpuError> {
+            const OPERATION: &str = "fake_grouped_restart_detach";
+            let guard = self.acquire_selector_namespace_effect_guard(ifindex, None)?;
+            let mut before = {
+                let state = self.state();
+                let attachment = state.attached.get(&ifindex).ok_or(GtpuError::NotFound)?;
+                if attachment.interface != interface
+                    || attachment.pin_dir != pin_dir
+                    || attachment.tc_priority != tc_priority
+                    || !state.grouped_map_ready.contains(&ifindex)
+                    || !state.grouped_schema_ready.contains(pin_dir)
+                    || !state.pinned_grouped_config.contains_key(pin_dir)
+                    || !state.uplink_filter_ready.contains(&ifindex)
+                    || !state.downlink_filter_ready.contains(&ifindex)
+                    || state
+                        .uplink_filter_pin_dir
+                        .get(&ifindex)
+                        .map(PathBuf::as_path)
+                        != Some(pin_dir)
+                    || state
+                        .downlink_filter_pin_dir
+                        .get(&ifindex)
+                        .map(PathBuf::as_path)
+                        != Some(pin_dir)
+                    || state.uplink_filter_foreign.contains(&ifindex)
+                    || state.downlink_filter_foreign.contains(&ifindex)
+                    || state.off_slot_sdk_hooks.contains(&ifindex)
+                    || state.pin_identity_invalid.contains(&ifindex)
+                {
+                    return Err(GtpuError::AlreadyExists);
+                }
+                FakeSelectorNamespaceGraphIdentity::capture(&state, ifindex)
+            };
+            self.pause_historical_recovery_effect_if_requested("restart_before_detach");
+            {
+                let mut state = self.state();
+                if FakeSelectorNamespaceGraphIdentity::capture(&state, ifindex) != before {
+                    return Err(state_indeterminate(OPERATION));
+                }
+                Self::fail_if_requested(&mut state, "restart_before_detach")?;
+                state.operations.push("suspend_grouped");
+                state.attached.remove(&ifindex);
+                state.uplink_filter_ready.remove(&ifindex);
+                state.uplink_filter_pin_dir.remove(&ifindex);
+                Self::fail_if_requested(&mut state, "restart_after_uplink")
+                    .map_err(|_| state_indeterminate(OPERATION))?;
+                state.downlink_filter_ready.remove(&ifindex);
+                state.downlink_filter_pin_dir.remove(&ifindex);
+                before.attachment = None;
+                before.uplink_filter = false;
+                before.downlink_filter = false;
+                before.uplink_filter_pin = None;
+                before.downlink_filter_pin = None;
+            }
+            self.pause_historical_recovery_effect_if_requested("restart_after_detach");
+            if FakeSelectorNamespaceGraphIdentity::capture(&self.state(), ifindex) != before {
+                return Err(state_indeterminate(OPERATION));
+            }
+            Box::new(guard).finish()
         }
 
         fn detach(
