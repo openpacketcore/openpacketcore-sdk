@@ -265,6 +265,7 @@ impl PreparedConfigCommit {
             u32::try_from(audit.len()).map_err(|_| PersistError::audit_chain_broken())?;
         #[cfg(test)]
         config_capacity_audit_preparation_tests::observe_start();
+        preflight_finalized_audit_size(&audit, audit_key)?;
         let tenant = extract_tenant(&record.principal);
         let mut previous_hash = [0_u8; 32];
         for (expected_sequence, entry) in audit.iter_mut().enumerate() {
@@ -323,6 +324,74 @@ impl PreparedConfigCommit {
         }
         Ok(())
     }
+}
+
+// A finalized audit vector alone cannot exceed the complete command's existing
+// ceiling. Count its real postcard representation before replacing any path.
+// This is a necessary early check, not complete command or resource admission:
+// record/intent/authority overhead is still checked by the existing preflight.
+// No legacy command that fitted that fence can be rejected by this check.
+fn preflight_finalized_audit_size(
+    audit: &[AuditRecord],
+    audit_key: &crate::types::AuditKey,
+) -> Result<(), PersistError> {
+    const LIMIT: usize = opc_consensus::DURABLE_OPENRAFT_APPEND_ENTRIES_TARGET_BYTES;
+    // Postcard string sizing depends only on byte length. This static ASCII
+    // placeholder avoids allocating each finalized path merely to count it.
+    static PATH_BYTES: [u8; CONFIG_AUDIT_PATH_MAX_BYTES] = [b'x'; CONFIG_AUDIT_PATH_MAX_BYTES];
+    let mut total = audit_component_encoded_size(&audit.len())?;
+    for entry in audit {
+        validate_audit_path_input(&entry.yang_path)?;
+        let mut path_bytes = AuditPathByteCount(0);
+        write_tokenized_audit_path(&entry.yang_path, audit_key, &mut path_bytes)?;
+        let path = std::str::from_utf8(&PATH_BYTES[..path_bytes.0])
+            .map_err(|_| PersistError::audit_chain_broken())?;
+        let probe = FinalizedAuditSizeProbe {
+            tx_id: &entry.tx_id,
+            sequence: entry.sequence,
+            yang_path: path,
+            op_type: &entry.op_type,
+            previous_value: entry.previous_value.as_ref().map(|_| REDACTED_AUDIT_VALUE),
+            new_value: entry.new_value.as_ref().map(|_| REDACTED_AUDIT_VALUE),
+            redaction_applied: entry.redaction_applied
+                || entry.previous_value.is_some()
+                || entry.new_value.is_some(),
+            // Postcard writes every u8 as one byte. Hash contents cannot change
+            // their encoded size; the real chain is produced only after admission.
+            previous_hash: &entry.previous_hash,
+            entry_hmac: &entry.entry_hmac,
+        };
+        total = total
+            .checked_add(audit_component_encoded_size(&probe)?)
+            .filter(|bytes| *bytes <= LIMIT)
+            .ok_or_else(|| {
+                PersistError::constraint_violation("config audit exceeds command byte limit")
+            })?;
+    }
+    Ok(())
+}
+
+// Match AuditRecord's field order and representation. The boundary fixture
+// compares this admission with the actual finalized vector's postcard size.
+#[derive(Serialize)]
+struct FinalizedAuditSizeProbe<'a> {
+    tx_id: &'a TxId,
+    sequence: u32,
+    yang_path: &'a str,
+    op_type: &'a crate::types::AuditOpType,
+    previous_value: Option<&'a str>,
+    new_value: Option<&'a str>,
+    redaction_applied: bool,
+    previous_hash: &'a [u8; 32],
+    entry_hmac: &'a [u8; 32],
+}
+
+fn audit_component_encoded_size(value: &impl Serialize) -> Result<usize, PersistError> {
+    let mut counter = opc_consensus::AppendEntriesBatchAccumulator::new();
+    counter.consider(value).map_err(|_| {
+        PersistError::constraint_violation("config audit cannot be sized for admission")
+    })?;
+    Ok(counter.serialized_entry_bytes())
 }
 
 fn validate_confirmed_resolution(
@@ -788,15 +857,7 @@ pub(crate) fn tokenize_audit_path(
     path: &str,
     audit_key: &crate::types::AuditKey,
 ) -> Result<String, PersistError> {
-    if path.is_empty()
-        || path.len() > CONFIG_AUDIT_PATH_MAX_BYTES
-        || !path.starts_with('/')
-        || path.chars().any(char::is_control)
-    {
-        return Err(PersistError::constraint_violation(
-            "audit YANG path is not canonically representable",
-        ));
-    }
+    validate_audit_path_input(path)?;
     #[cfg(test)]
     config_capacity_tokenization_tests::observe_capacity(0);
     // Count the exact emitted bytes with the same immutable input and emitter.
@@ -816,6 +877,19 @@ pub(crate) fn tokenize_audit_path(
         return Err(tokenized_path_too_large());
     }
     Ok(output)
+}
+
+fn validate_audit_path_input(path: &str) -> Result<(), PersistError> {
+    if path.is_empty()
+        || path.len() > CONFIG_AUDIT_PATH_MAX_BYTES
+        || !path.starts_with('/')
+        || path.chars().any(char::is_control)
+    {
+        return Err(PersistError::constraint_violation(
+            "audit YANG path is not canonically representable",
+        ));
+    }
+    Ok(())
 }
 
 struct AuditPathByteCount(usize);
