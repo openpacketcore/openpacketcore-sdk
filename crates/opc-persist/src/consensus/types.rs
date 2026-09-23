@@ -1135,6 +1135,8 @@ pub(super) fn validate_encrypted_record_view(
     let opc_key::EnvelopeMetadata::Config(metadata) = aad.metadata() else {
         return Err(PersistError::corrupt_blob());
     };
+    #[cfg(test)]
+    config_capacity_aad_working_tests::observe_decoded_principal(metadata.principal().len());
     if bound_key_id != envelope.key_id
         || aad.purpose() != opc_key::KeyPurpose::Config
         || aad.version() != record.version.get()
@@ -1727,3 +1729,6 @@ mod tests {
 
 #[cfg(test)]
 mod config_capacity_input_capacity_tests;
+
+#[cfg(test)]
+mod config_capacity_aad_working_tests;
