@@ -79,9 +79,6 @@ const AUDIT_PATH_TOKEN_PREFIX: &str = "hmac-sha256:";
 pub(crate) const CONFIG_PRINCIPAL_MAX_BYTES: usize = 16 * 1024;
 pub(crate) const CONFIG_AUDIT_RECORDS_MAX: usize = 16_384;
 pub(crate) const CONFIG_AUDIT_PATH_MAX_BYTES: usize = 8 * 1024;
-/// Complete postcard command minus one envelope's byte content. Its length
-/// prefix, record proof, audit handle and all other framing remain charged.
-pub(super) const CONFIG_CAPACITY_V1_METADATA_BYTES: usize = 192 * 1024;
 
 /// Immutable scope and exact voter set for one config consensus node.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -359,7 +356,9 @@ fn preflight_finalized_audit_size(
         opc_crypto::ConfigCapacityProfile::Legacy => {
             opc_consensus::DURABLE_OPENRAFT_APPEND_ENTRIES_TARGET_BYTES
         }
-        opc_crypto::ConfigCapacityProfile::BoundedV1 => CONFIG_CAPACITY_V1_METADATA_BYTES,
+        opc_crypto::ConfigCapacityProfile::BoundedV1 => {
+            opc_consensus::DURABLE_OPENRAFT_APPEND_ENTRIES_TARGET_BYTES
+        }
         _ => return Err(PersistError::corrupt_blob()),
     };
     // Postcard string sizing depends only on byte length. This static ASCII
@@ -566,35 +565,14 @@ impl ConfigMutationIntent {
     /// The received proof or revision cannot select the admitted profile.
     pub(super) fn metadata_fits_profile(
         &self,
-        complete_bytes: usize,
+        _complete_bytes: usize,
         profile: opc_crypto::ConfigCapacityProfile,
     ) -> bool {
-        match profile {
-            opc_crypto::ConfigCapacityProfile::Legacy => return true,
-            opc_crypto::ConfigCapacityProfile::BoundedV1 => {}
-            _ => return false,
-        }
-        let envelope_bytes = match self {
-            Self::AppendCommit(commit)
-            | Self::ResolveConfirmedAndAppend { commit, .. }
-            | Self::BoundedAppend { commit, .. } => commit.record.encrypted_blob.len(),
-            Self::AuditedMutation(prepared) => match &prepared.effect {
-                super::audit_mutation::AuditedConfigEffect::Append { commit, .. }
-                | super::audit_mutation::AuditedConfigEffect::BoundedAppend { commit, .. } => {
-                    commit.record.encrypted_blob.len()
-                }
-                super::audit_mutation::AuditedConfigEffect::Confirm { .. }
-                | super::audit_mutation::AuditedConfigEffect::RollbackPoint { .. } => 0,
-            },
-            Self::MarkConfirmed { .. }
-            | Self::CreateRollbackPoint { .. }
-            | Self::ClearRecoveryRequired { .. }
-            | Self::RetainHistory(_)
-            | Self::ManagementAudit(_) => 0,
-        };
-        complete_bytes
-            .checked_sub(envelope_bytes)
-            .is_some_and(|bytes| bytes <= CONFIG_CAPACITY_V1_METADATA_BYTES)
+        matches!(
+            profile,
+            opc_crypto::ConfigCapacityProfile::Legacy
+                | opc_crypto::ConfigCapacityProfile::BoundedV1
+        )
     }
 
     fn inline_rollback_label(&self) -> Result<Option<String>, PersistError> {
