@@ -147,6 +147,26 @@ CREATE TABLE config_raft_legacy_recovery (
 );
 "#;
 
+// Added only for explicitly provisioned storage revision 6. The legacy DDL
+// and its exact manifest digest remain unchanged.
+const CONFIG_RAFT_CAPACITY_SCHEMA: &str = r#"
+CREATE TABLE config_raft_capacity_records (
+    tx_id BLOB PRIMARY KEY NOT NULL CHECK (typeof(tx_id) = 'blob' AND length(tx_id) = 16),
+    binding BLOB NOT NULL CHECK (typeof(binding) = 'blob' AND length(binding) = 44),
+    FOREIGN KEY (tx_id) REFERENCES config_history(tx_id)
+);
+"#;
+
+fn create_capacity_schema(conn: &Connection, profile: ConfigCapacityProfile) -> io::Result<()> {
+    match profile {
+        ConfigCapacityProfile::Legacy => Ok(()),
+        ConfigCapacityProfile::BoundedV1 => conn
+            .execute_batch(CONFIG_RAFT_CAPACITY_SCHEMA)
+            .map_err(db_error),
+        _ => Err(invalid_data("unsupported config capacity profile")),
+    }
+}
+
 /// Hard ceiling for one serialized config Openraft entry on disk.
 pub(crate) const CONFIG_CONSENSUS_LOG_ENTRY_MAX_BYTES: usize = 16 * 1024 * 1024;
 /// Hard ceiling for entries accepted by one Openraft log append callback.
@@ -734,6 +754,9 @@ fn initialize_schema_for_profile(
     cancellation: &Arc<SqliteWorkCancellation>,
     before_commit: Option<InitializationCommitHook>,
 ) -> Result<(), ConfigConsensusStorageError> {
+    if capacity_profile != ConfigCapacityProfile::Legacy && recovery.is_some() {
+        return Err(ConfigConsensusStorageError::InvalidIdentity);
+    }
     if let Some(recovery) = recovery {
         validate_legacy_recovery_snapshot(recovery, audit_key, cancellation)?;
         let path = recovery
@@ -791,10 +814,13 @@ fn initialize_schema_transaction(
             .map_err(|_| ConfigConsensusStorageError::BackendUnavailable)?;
         tx.execute_batch(CONFIG_RAFT_SCHEMA)
             .map_err(|_| ConfigConsensusStorageError::BackendUnavailable)?;
+        create_capacity_schema(&tx, capacity_profile)
+            .map_err(|_| ConfigConsensusStorageError::InvalidIdentity)?;
         let epoch = checked_positive_i64(identity.configuration_epoch().get())
             .map_err(|_| ConfigConsensusStorageError::InvalidIdentity)?;
-        let schema_manifest_digest = config_schema_manifest_digest(&tx, cancellation)
-            .map_err(|_| ConfigConsensusStorageError::CorruptState)?;
+        let schema_manifest_digest =
+            config_schema_manifest_digest(&tx, capacity_profile, cancellation)
+                .map_err(|_| ConfigConsensusStorageError::CorruptState)?;
         tx.execute(
             "INSERT INTO config_raft_identity (singleton, schema_version, cluster_id, configuration_id, configuration_epoch, audit_key_epoch, audit_key_fingerprint, schema_manifest_digest) VALUES (1, ?1, ?2, ?3, ?4, ?5, ?6, ?7)",
             params![
@@ -810,7 +836,7 @@ fn initialize_schema_transaction(
         .map_err(|_| ConfigConsensusStorageError::BackendUnavailable)?;
         super::audit::initialize_sync(&tx, audit_key, identity)
             .map_err(|_| ConfigConsensusStorageError::CorruptState)?;
-        super::history::initialize_sync(&tx, identity, audit_key, cancellation)
+        super::history::initialize_sync(&tx, identity, audit_key, capacity_profile, cancellation)
             .map_err(|_| ConfigConsensusStorageError::CorruptState)?;
         if let Some(recovery) = recovery {
             tx.execute(
@@ -1161,31 +1187,7 @@ fn validate_existing_schema(
             return Err(ConfigConsensusStorageError::CorruptState);
         }
     }
-    let schema_manifest_digest = config_schema_manifest_digest(conn, cancellation)
-        .map_err(|_| ConfigConsensusStorageError::CorruptState)?;
-    let row = conn
-        .query_row(
-            "SELECT schema_version, cluster_id, configuration_id, configuration_epoch, audit_key_epoch, audit_key_fingerprint, schema_manifest_digest FROM config_raft_identity WHERE singleton = 1",
-            [],
-            |row| Ok((row.get::<_, i64>(0)?, row.get::<_, Vec<u8>>(1)?, row.get::<_, Vec<u8>>(2)?, row.get::<_, i64>(3)?, row.get::<_, i64>(4)?, row.get::<_, Vec<u8>>(5)?, row.get::<_, Vec<u8>>(6)?)),
-        )
-        .optional()
-        .map_err(|_| ConfigConsensusStorageError::BackendUnavailable)?
-        .ok_or(ConfigConsensusStorageError::CorruptState)?;
-    if row.0 != i64::from(config_storage_revision(capacity_profile)) {
-        return Err(ConfigConsensusStorageError::SchemaVersionMismatch);
-    }
-    if row.1.as_slice() != identity.cluster_id().as_bytes()
-        || row.2.as_slice() != identity.configuration_id().as_bytes()
-        || checked_positive_u64(row.3).map_err(|_| ConfigConsensusStorageError::CorruptState)?
-            != identity.configuration_epoch().get()
-        || checked_positive_u64(row.4).map_err(|_| ConfigConsensusStorageError::CorruptState)?
-            != audit_key.epoch()
-        || row.5.as_slice() != audit_key.fingerprint()
-        || row.6.as_slice() != schema_manifest_digest
-    {
-        return Err(ConfigConsensusStorageError::IdentityMismatch);
-    }
+    validate_storage_identity_sync(conn, identity, audit_key, capacity_profile, cancellation)?;
     let machine_rows: i64 = conn
         .query_row("SELECT COUNT(*) FROM config_raft_machine", [], |row| {
             row.get(0)
@@ -1212,12 +1214,50 @@ fn validate_existing_schema(
         conn,
         identity,
         expected_members,
+        audit_key,
+        capacity_profile,
         allow_detached_snapshot,
         cancellation,
     )
     .map_err(|_| ConfigConsensusStorageError::CorruptState)?;
-    validate_sealed_state_sync(conn, audit_key, cancellation)
+    validate_sealed_state_for_profile_sync(conn, audit_key, capacity_profile, cancellation)
         .map_err(|_| ConfigConsensusStorageError::CorruptState)
+}
+
+fn validate_storage_identity_sync(
+    conn: &Connection,
+    identity: ConsensusIdentity,
+    audit_key: &AuditKey,
+    capacity_profile: ConfigCapacityProfile,
+    cancellation: &SqliteWorkCancellation,
+) -> Result<(), ConfigConsensusStorageError> {
+    let schema_manifest_digest =
+        config_schema_manifest_digest(conn, capacity_profile, cancellation)
+            .map_err(|_| ConfigConsensusStorageError::CorruptState)?;
+    let row = conn
+        .query_row(
+            "SELECT schema_version, cluster_id, configuration_id, configuration_epoch, audit_key_epoch, audit_key_fingerprint, schema_manifest_digest FROM config_raft_identity WHERE singleton = 1",
+            [],
+            |row| Ok((row.get::<_, i64>(0)?, row.get::<_, Vec<u8>>(1)?, row.get::<_, Vec<u8>>(2)?, row.get::<_, i64>(3)?, row.get::<_, i64>(4)?, row.get::<_, Vec<u8>>(5)?, row.get::<_, Vec<u8>>(6)?)),
+        )
+        .optional()
+        .map_err(|_| ConfigConsensusStorageError::BackendUnavailable)?
+        .ok_or(ConfigConsensusStorageError::CorruptState)?;
+    if row.0 != i64::from(config_storage_revision(capacity_profile)) {
+        return Err(ConfigConsensusStorageError::SchemaVersionMismatch);
+    }
+    if row.1.as_slice() != identity.cluster_id().as_bytes()
+        || row.2.as_slice() != identity.configuration_id().as_bytes()
+        || checked_positive_u64(row.3).map_err(|_| ConfigConsensusStorageError::CorruptState)?
+            != identity.configuration_epoch().get()
+        || checked_positive_u64(row.4).map_err(|_| ConfigConsensusStorageError::CorruptState)?
+            != audit_key.epoch()
+        || row.5.as_slice() != audit_key.fingerprint()
+        || row.6.as_slice() != schema_manifest_digest
+    {
+        return Err(ConfigConsensusStorageError::IdentityMismatch);
+    }
+    Ok(())
 }
 
 const CONFIG_SCHEMA_OBJECTS: &str = "SELECT type, name, tbl_name, sql FROM main.sqlite_schema \
@@ -1252,6 +1292,7 @@ fn config_schema_manifest(
 
 fn config_schema_manifest_digest(
     conn: &Connection,
+    profile: ConfigCapacityProfile,
     cancellation: &SqliteWorkCancellation,
 ) -> io::Result<[u8; 32]> {
     cancellation.check_io()?;
@@ -1259,6 +1300,7 @@ fn config_schema_manifest_digest(
     expected
         .execute_batch(CONFIG_RAFT_SCHEMA)
         .map_err(db_error)?;
+    create_capacity_schema(&expected, profile)?;
     let expected_manifest = config_schema_manifest(&expected, cancellation)?;
     let live_count: i64 = conn
         .query_row(
@@ -1299,8 +1341,9 @@ fn config_schema_manifest_digest(
 /// Validate the executable schema in the same transaction as history use.
 /// Authenticating rows alone cannot authorize a changed trigger or constraint
 /// to alter unrelated records during an otherwise legitimate lifecycle update.
-pub(super) fn validate_live_history_schema_sync(
+pub(super) fn validate_live_history_schema_for_profile_sync(
     conn: &Connection,
+    profile: ConfigCapacityProfile,
     cancellation: &SqliteWorkCancellation,
 ) -> io::Result<()> {
     cancellation.check_io()?;
@@ -1316,7 +1359,7 @@ pub(super) fn validate_live_history_schema_sync(
     }
     crate::schema::validate_retained_base_schema(conn)
         .map_err(|_| invalid_data("config history base schema does not match"))?;
-    config_schema_manifest_digest(conn, cancellation)?;
+    config_schema_manifest_digest(conn, profile, cancellation)?;
     cancellation.check_io()
 }
 
@@ -1812,6 +1855,8 @@ fn validate_durable_log_state_sync(
     conn: &Connection,
     identity: ConsensusIdentity,
     expected_members: &BTreeSet<ConsensusNodeId>,
+    audit_key: &AuditKey,
+    capacity_profile: ConfigCapacityProfile,
     allow_detached_snapshot: bool,
     cancellation: &SqliteWorkCancellation,
 ) -> io::Result<()> {
@@ -1904,6 +1949,7 @@ fn validate_durable_log_state_sync(
                     append_entries_batch: false,
                 },
             )?;
+            validate_entry_capacities(&entries, identity, audit_key, capacity_profile)?;
             if entries.len()
                 != usize::try_from(expected_count)
                     .map_err(|_| invalid_data("config consensus log count overflow"))?
@@ -2766,10 +2812,33 @@ fn execute_intent_sync(
     cancellation: &SqliteWorkCancellation,
 ) -> io::Result<Result<(), ConfigMutationFailure>> {
     match intent {
-        ConfigMutationIntent::BoundedAppend { .. } => {
-            // Opening this profile remains refused. Never persist a record
-            // without its atomic retained proof while that path is incomplete.
-            Err(invalid_data("bounded config retention is not admitted"))
+        ConfigMutationIntent::BoundedAppend {
+            commit,
+            binding,
+            resolution,
+        } => {
+            // The immutable command has already passed keyed profile admission.
+            // This stays inside the same ordinary/audited effect savepoint.
+            let result = append_prepared_commit_sync(
+                conn,
+                commit,
+                *resolution,
+                schema_version,
+                logical_time,
+                request_id,
+                cancellation,
+            )?;
+            if result.is_ok() {
+                conn.execute(
+                    "INSERT INTO config_raft_capacity_records (tx_id, binding) VALUES (?1, ?2)",
+                    params![
+                        commit.record.tx_id.as_uuid().as_bytes().as_slice(),
+                        binding.encode().as_slice()
+                    ],
+                )
+                .map_err(db_error)?;
+            }
+            Ok(result)
         }
         ConfigMutationIntent::ManagementAudit(_) | ConfigMutationIntent::AuditedMutation(_) => Err(
             invalid_data("audit command requires its authority dispatcher"),
@@ -2822,6 +2891,7 @@ fn apply_audited_mutation_sync(
     key: &AuditKey,
     identity: ConsensusIdentity,
     prepared: &super::audit_mutation::AuditedConfigCommand,
+    capacity_profile: ConfigCapacityProfile,
     audit_keys: Option<&crate::audit_authority::continuity::AuditKeyRing>,
     logical_time: Timestamp,
     request_id: opc_consensus::ConsensusRequestId,
@@ -2866,7 +2936,7 @@ fn apply_audited_mutation_sync(
             return Ok(Err(ConfigMutationFailure::InvalidInput));
         }
     }
-    validate_sealed_state_sync(conn, key, cancellation)?;
+    validate_sealed_state_for_profile_sync(conn, key, capacity_profile, cancellation)?;
     let current_version: u64 = conn
         .query_row(
             "SELECT COALESCE(MAX(version),0) FROM config_history",
@@ -2943,6 +3013,7 @@ pub(crate) fn apply_entries_sync(
         &SqliteWorkCancellation::new(),
         audit_key,
         None,
+        ConfigCapacityProfile::Legacy,
     )
 }
 
@@ -2955,12 +3026,14 @@ pub(crate) fn apply_entries_cancellable_sync(
     cancellation: &SqliteWorkCancellation,
     audit_key: &AuditKey,
     audit_keys: Option<&crate::audit_authority::continuity::AuditKeyRing>,
+    capacity_profile: ConfigCapacityProfile,
 ) -> io::Result<Vec<ConfigConsensusResponse>> {
     if entries.len() > CONFIG_CONSENSUS_LOG_APPEND_MAX_ENTRIES {
         return Err(invalid_data(
             "config consensus apply exceeds entry-count limit",
         ));
     }
+    validate_entry_capacities(&entries, identity, audit_key, capacity_profile)?;
     let mut encoded_bytes = 0_usize;
     for entry in &entries {
         cancellation.check_io()?;
@@ -2981,7 +3054,13 @@ pub(crate) fn apply_entries_cancellable_sync(
             .ok_or_else(|| invalid_data("config consensus apply byte count overflow"))?;
     }
     let tx = conn.unchecked_transaction().map_err(db_error)?;
-    super::history::validate_access_sync(&tx, audit_key, true, cancellation)?;
+    super::history::validate_access_for_profile_sync(
+        &tx,
+        audit_key,
+        true,
+        capacity_profile,
+        cancellation,
+    )?;
     let mut last_applied = read_applied_sync(&tx, identity)?;
     let mut machine = read_machine_sync(&tx, identity)?;
     let mut responses = Vec::with_capacity(entries.len());
@@ -3078,6 +3157,7 @@ pub(crate) fn apply_entries_cancellable_sync(
                                 audit_key,
                                 identity,
                                 prepared,
+                                capacity_profile,
                                 audit_keys,
                                 logical_time,
                                 command.request_id,
@@ -3093,7 +3173,12 @@ pub(crate) fn apply_entries_cancellable_sync(
                             audit_keys,
                         )?,
                         ConfigMutationIntent::RetainHistory(retention) => {
-                            validate_sealed_state_sync(&tx, audit_key, cancellation)?;
+                            validate_sealed_state_for_profile_sync(
+                                &tx,
+                                audit_key,
+                                capacity_profile,
+                                cancellation,
+                            )?;
                             super::history::retain_sync(&tx, audit_key, retention, cancellation)?
                         }
                         _ => {
@@ -3210,17 +3295,35 @@ pub(crate) fn apply_entries_cancellable_sync(
     Ok(responses)
 }
 
+#[cfg(test)]
 fn validate_sealed_state_sync(
     conn: &Connection,
     audit_key: &AuditKey,
     cancellation: &SqliteWorkCancellation,
 ) -> io::Result<()> {
-    if super::history::has_consensus_metadata_sync(conn)? {
-        validate_live_history_schema_sync(conn, cancellation)?;
-    }
+    validate_sealed_state_for_profile_sync(
+        conn,
+        audit_key,
+        ConfigCapacityProfile::Legacy,
+        cancellation,
+    )
+}
+
+fn validate_sealed_state_for_profile_sync(
+    conn: &Connection,
+    audit_key: &AuditKey,
+    capacity_profile: ConfigCapacityProfile,
+    cancellation: &SqliteWorkCancellation,
+) -> io::Result<()> {
+    let consensus_required = super::history::has_consensus_metadata_sync(conn)?;
+    super::history::validate_access_for_profile_sync(
+        conn,
+        audit_key,
+        consensus_required,
+        capacity_profile,
+        cancellation,
+    )?;
     super::audit::validate_sync(conn, audit_key)?;
-    super::history::validate_sync(conn, audit_key)?;
-    super::history::validate_record_chain_sync(conn, audit_key, cancellation)?;
     validate_history_chain_cancellable_sync(conn, cancellation)?;
     let mut statement = conn
         .prepare(
@@ -3526,9 +3629,13 @@ pub(crate) fn build_snapshot_database_cancellable_sync(
     cancellation: &Arc<SqliteWorkCancellation>,
 ) -> io::Result<AppliedMembership> {
     cancellation.check_io()?;
-    validate_sealed_state_sync(conn, audit_key, cancellation)?;
-    let applied = read_applied_sync(conn, identity)?;
-    let membership = read_membership_sync(conn, identity, expected_members)?;
+    // Pin validation, frontier capture and backup to one source read snapshot.
+    // The connection mutex alone does not exclude another SQLite connection.
+    let source =
+        Transaction::new_unchecked(conn, TransactionBehavior::Deferred).map_err(db_error)?;
+    validate_sealed_state_for_profile_sync(&source, audit_key, capacity_profile, cancellation)?;
+    let applied = read_applied_sync(&source, identity)?;
+    let membership = read_membership_sync(&source, identity, expected_members)?;
     validate_fixed_membership(&membership, expected_members)?;
     let mut destination = Connection::open(path).map_err(db_error)?;
     let progress_cancellation = cancellation.clone();
@@ -3536,7 +3643,7 @@ pub(crate) fn build_snapshot_database_cancellable_sync(
         .progress_handler(1_000, Some(move || progress_cancellation.is_cancelled()))
         .map_err(db_error)?;
     {
-        let backup = rusqlite::backup::Backup::new(conn, &mut destination).map_err(db_error)?;
+        let backup = rusqlite::backup::Backup::new(&source, &mut destination).map_err(db_error)?;
         loop {
             cancellation.check_io()?;
             match backup.step(128).map_err(db_error)? {
@@ -3657,7 +3764,7 @@ fn validate_snapshot_database_sync(
         cancellation,
     )
     .map_err(|_| invalid_data("config consensus snapshot identity is invalid"))?;
-    validate_sealed_state_sync(&conn, audit_key, cancellation)?;
+    validate_sealed_state_for_profile_sync(&conn, audit_key, capacity_profile, cancellation)?;
     validate_snapshot_has_no_log_authority(&conn, cancellation)?;
     if read_applied_sync(&conn, identity)? != meta.last_log_id
         || read_membership_sync(&conn, identity, expected_members)? != meta.last_membership
@@ -3750,8 +3857,15 @@ pub(crate) fn install_snapshot_database_cancellable_sync(
     let tx = conn.unchecked_transaction().map_err(db_error)?;
     // Validate the destination before replacing authority. Source authentication
     // cannot prevent a destination trigger or temporary table from changing the
-    // imported state. Repair may replace damaged rows, so check only schema here.
-    validate_live_history_schema_sync(&tx, cancellation)?;
+    // imported state. Repair may replace damaged payload rows, so check the
+    // executable schema and immutable authority here.
+    validate_live_history_schema_for_profile_sync(&tx, capacity_profile, cancellation)?;
+    validate_storage_identity_sync(&tx, identity, audit_key, capacity_profile, cancellation)
+        .map_err(|_| invalid_data("config snapshot destination identity is invalid"))?;
+    if capacity_profile == ConfigCapacityProfile::BoundedV1 {
+        tx.execute("DELETE FROM config_raft_capacity_records", [])
+            .map_err(db_error)?;
+    }
     for table in [
         "config_lifecycle_audit",
         "rollback_labels",
@@ -3809,6 +3923,17 @@ pub(crate) fn install_snapshot_database_cancellable_sync(
     ] {
         cancellation.check_io()?;
         copy_snapshot_table(&source, &tx, table, columns, cancellation)?;
+    }
+    if capacity_profile == ConfigCapacityProfile::BoundedV1 {
+        copy_snapshot_table(
+            &source,
+            &tx,
+            "config_raft_capacity_records",
+            "tx_id, binding",
+            cancellation,
+        )?;
+        // Refuse before commit even if a future copy-list edit omits a proof.
+        validate_sealed_state_for_profile_sync(&tx, audit_key, capacity_profile, cancellation)?;
     }
     tx.execute(
         "INSERT OR REPLACE INTO config_raft_snapshot (singleton, configuration_epoch, meta_json, file_name, checksum, byte_length) VALUES (1, ?1, ?2, ?3, ?4, ?5)",
@@ -5592,3 +5717,7 @@ mod config_capacity_history_reader_tests;
 #[cfg(test)]
 #[path = "sqlite/config_capacity_sealed_buffers.rs"]
 mod config_capacity_sealed_buffers;
+
+#[cfg(test)]
+#[path = "sqlite/config_capacity_retained_proof_tests.rs"]
+mod config_capacity_retained_proof_tests;

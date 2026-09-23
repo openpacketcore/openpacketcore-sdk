@@ -209,15 +209,34 @@ async fn config_capacity_957_incomplete_profile_is_not_enabled_by_binding_alone(
     )
     .await
     .expect("provision bounded-profile binding");
+    assert!(backend
+        .load_latest()
+        .await
+        .expect("explicitly provisioned empty proof-bound history")
+        .is_none());
+    assert!(
+        ConsensusConfigStore::open(
+            topology(),
+            backend.clone(),
+            root.join("snapshots"),
+            BTreeMap::new()
+        )
+        .await
+        .is_err(),
+        "unqualified RPC/snapshot/resource profile must remain unavailable"
+    );
+    // The healthy retained format above is independent of public store
+    // admission. Losing its required proof schema must never select legacy
+    // history semantics, even when the requested history is empty.
+    let connection =
+        rusqlite::Connection::open(root.join("config.sqlite")).expect("native corruption fixture");
+    connection
+        .execute_batch("DROP TABLE config_raft_capacity_records")
+        .expect("remove required proof schema");
+    drop(connection);
     let read_error = backend
         .load_latest()
         .await
-        .expect_err("unqualified bounded history must not fall back to legacy reads");
+        .expect_err("bounded history must not fall back to legacy reads");
     assert!(matches!(read_error.kind(), PersistErrorKind::CorruptBlob));
-    assert!(
-        ConsensusConfigStore::open(topology(), backend, root.join("snapshots"), BTreeMap::new())
-            .await
-            .is_err(),
-        "unqualified RPC/snapshot/resource profile must remain unavailable"
-    );
 }

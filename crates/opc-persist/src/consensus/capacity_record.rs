@@ -21,7 +21,6 @@ use crate::{AttestedConfigCommit, AuditKey, CommitRecord, PersistError};
 const RECORD_CAPACITY_DOMAIN: &[u8] = b"openpacketcore/config-capacity/record/v1\0";
 const RECORD_CAPACITY_REVISION: u16 = 1;
 const HEADER_BYTES: usize = 12;
-#[cfg(test)]
 pub(super) const RECORD_CAPACITY_BYTES: usize = HEADER_BYTES + 32;
 
 /// Private deterministic data, not evidence of validation merely by decoding.
@@ -126,7 +125,6 @@ impl CapacityRecordBinding {
             .map_err(|_| invalid())
     }
 
-    #[cfg(test)]
     pub(super) fn encode(self) -> [u8; RECORD_CAPACITY_BYTES] {
         let mut encoded = [0; RECORD_CAPACITY_BYTES];
         encoded[..HEADER_BYTES].copy_from_slice(&self.header);
@@ -135,7 +133,6 @@ impl CapacityRecordBinding {
     }
 
     /// Fixed-width parsing alone confers no authenticity or mutation authority.
-    #[cfg(test)]
     pub(super) fn decode(encoded: &[u8]) -> Result<Self, PersistError> {
         if encoded.len() != RECORD_CAPACITY_BYTES {
             return Err(invalid());

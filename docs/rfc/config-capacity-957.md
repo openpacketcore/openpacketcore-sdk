@@ -215,6 +215,25 @@ prune matching proof rows. These are still implementation and qualification
 prerequisites: command support alone does not enable the larger profile, and
 an append must refuse if atomic proof storage is unavailable.
 
+Revision 6 adds a separate record-proof table keyed by the existing 16-byte
+transaction ID, with exactly one 44-byte binding per retained configuration.
+History format 2 authenticates the selected capacity profile and includes the
+exact binding bytes in its record chain. Legacy format 1 omits that profile
+field and keeps its existing serialized bytes and schema manifest. Missing,
+extra, mismatched or invalid proofs must reject even an empty or negative read.
+The canonical history charge includes the additional 60 bytes per record;
+SQLite pages, journals, indexes and working allocations require separate
+physical storage and memory accounting.
+
+Snapshot construction must pin validation, frontier capture and database copy
+to one source read transaction. Import must validate the independently admitted
+destination profile before replacing any authority, copy the proof table in
+the same transaction as history, and authenticate the result before commit.
+Record/proof/confirmed-parent effects must roll back together on history
+capacity rejection. Native database-body fixtures are partial evidence only;
+they cannot qualify the snapshot envelope, real multi-node transfer, full
+resource budget or public larger-profile opening.
+
 The proposed profile uses config RPC revision 8 and SQLite/snapshot revision 6;
 legacy callers keep RPC revision 7 and SQLite/snapshot revision 5. The snapshot
 body's identity row must match the selected storage revision before replacing

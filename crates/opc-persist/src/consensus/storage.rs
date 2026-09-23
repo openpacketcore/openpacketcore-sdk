@@ -916,6 +916,7 @@ impl RaftStateMachine<ConfigRaftTypeConfig> for SqliteConfigStateMachine {
                     cancellation,
                     &audit_key,
                     audit_keys.as_deref(),
+                    capacity_profile,
                 )
             })
             .await
