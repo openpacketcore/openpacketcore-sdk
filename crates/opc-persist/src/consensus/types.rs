@@ -275,7 +275,7 @@ impl PreparedConfigCommit {
         audit_key: &crate::types::AuditKey,
         profile: opc_crypto::ConfigCapacityProfile,
     ) -> Result<Self, PersistError> {
-        preflight_transferred_input_capacity(&record, &audit, audit.capacity(), profile)?;
+        preflight_preparation_capacity(&record, &audit, audit.capacity(), profile, audit_key)?;
         validate_record_representability(&record)?;
         if audit.len() > CONFIG_AUDIT_RECORDS_MAX {
             return Err(PersistError::constraint_violation(
@@ -347,24 +347,27 @@ impl PreparedConfigCommit {
     }
 }
 
-// A necessary input-only check against the proposed entire-operation allowance.
-// It does not reserve the remaining phase overlap or qualify the full working
-// set. Check the transferred allocations before this helper's derived work;
-// caller allocations before transfer and earlier entrypoints are separate.
-fn preflight_transferred_input_capacity(
+// A necessary preparation check against the proposed entire-operation allowance.
+// Keep room for all transferred owners and the emitted audit replacement bytes
+// simultaneously; original fields still exist while each replacement is built.
+// This is not a sufficient whole-operation budget: validation temporaries,
+// allocator rounding, caller allocations and later phases remain separate.
+fn preflight_preparation_capacity(
     record: &CommitRecord,
     audit: &[AuditRecord],
     audit_capacity: usize,
     profile: opc_crypto::ConfigCapacityProfile,
+    audit_key: &crate::types::AuditKey,
 ) -> Result<(), PersistError> {
     match profile {
         opc_crypto::ConfigCapacityProfile::Legacy => return Ok(()),
         opc_crypto::ConfigCapacityProfile::BoundedV1 => {}
         _ => return Err(PersistError::corrupt_blob()),
     }
-    const INPUT_NECESSARY_MAX_BYTES: usize = 32 * 1024 * 1024;
-    let too_large =
-        || PersistError::constraint_violation("config input allocation exceeds working limit");
+    const PREPARATION_NECESSARY_MAX_BYTES: usize = 32 * 1024 * 1024;
+    let too_large = || {
+        PersistError::constraint_violation("config preparation allocation exceeds working limit")
+    };
     // This includes the record and Vec/String control blocks. The audit
     // backing allocation includes initialized and unused element capacity;
     // only initialized elements own nested String allocations.
@@ -372,7 +375,7 @@ fn preflight_transferred_input_capacity(
     let mut charge = |bytes: usize| -> Result<(), PersistError> {
         owned_bytes = owned_bytes
             .checked_add(bytes)
-            .filter(|total| *total <= INPUT_NECESSARY_MAX_BYTES)
+            .filter(|total| *total <= PREPARATION_NECESSARY_MAX_BYTES)
             .ok_or_else(too_large)?;
         Ok(())
     };
@@ -391,6 +394,21 @@ fn preflight_transferred_input_capacity(
         }
         if let Some(value) = &entry.new_value {
             charge(value.capacity())?;
+        }
+    }
+    // Count with the existing bounded emitter before validation or output
+    // allocation. Charge every new output while conservatively retaining all
+    // old inputs; do not subtract the raw path before its replacement exists.
+    for entry in audit {
+        validate_audit_path_input(&entry.yang_path)?;
+        let mut finalized_bytes = AuditPathByteCount(0);
+        write_tokenized_audit_path(&entry.yang_path, audit_key, &mut finalized_bytes)?;
+        charge(finalized_bytes.0)?;
+        if entry.previous_value.is_some() {
+            charge(REDACTED_AUDIT_VALUE.len())?;
+        }
+        if entry.new_value.is_some() {
+            charge(REDACTED_AUDIT_VALUE.len())?;
         }
     }
     Ok(())
