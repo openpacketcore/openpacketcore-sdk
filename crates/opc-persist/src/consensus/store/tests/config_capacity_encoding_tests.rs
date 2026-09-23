@@ -47,7 +47,8 @@ fn config_capacity_957_counted_command_sizes_keep_exact_legacy_rejection() {
             preflight_config_command_replication_budget(
                 command.identity,
                 command.request_id,
-                &command.intent
+                &command.intent,
+                opc_crypto::ConfigCapacityProfile::Legacy,
             )
             .is_ok(),
             expected,
@@ -81,7 +82,8 @@ fn config_capacity_957_counted_command_sizes_keep_exact_legacy_rejection() {
             preflight_config_command_replication_budget(
                 command.identity,
                 command.request_id,
-                &command.intent
+                &command.intent,
+                opc_crypto::ConfigCapacityProfile::Legacy,
             ),
             expected
         );

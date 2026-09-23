@@ -175,8 +175,12 @@ impl ConsensusConfigStore {
         }
         let binding = self.issue_capacity_binding(&commit)?;
         let (record, audit, resolution, evidence, reservation) = commit.into_capacity_parts();
-        let prepared =
-            PreparedConfigCommit::prepare(record, audit, self.inner.backend.audit_key())?;
+        let prepared = PreparedConfigCommit::prepare_for_profile(
+            record,
+            audit,
+            self.inner.backend.audit_key(),
+            self.capacity_profile(),
+        )?;
         let intent = ConfigMutationIntent::prepared_append(prepared, resolution, binding);
         let command = ConfigConsensusCommand {
             schema_version: super::config_command_revision(self.capacity_profile()),
@@ -194,6 +198,7 @@ impl ConsensusConfigStore {
             command.identity,
             original_request_id,
             &command.intent,
+            self.capacity_profile(),
         )
         .map_err(ForwardMutationRejection::into_persist_error)?;
         let handle = ConfigCommitRecoveryHandle::issue(

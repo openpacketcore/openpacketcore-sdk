@@ -217,3 +217,49 @@ fn config_capacity_957_audit_expansion_rejects_before_finalized_allocation() {
     assert_eq!(observed.paths, 0);
     assert!(result.is_err());
 }
+
+#[test]
+fn config_capacity_957_bounded_audit_component_at_metadata_ceiling() {
+    // This is only the audit component's necessary early bound. The complete
+    // command cannot fit when its audit alone consumes the metadata allowance.
+    let record = record();
+    let audit = at_encoded_size(record.tx_id, 196_608);
+    OBSERVED.set(Observed::default());
+    let prepared = PreparedConfigCommit::prepare_for_profile(
+        record,
+        audit,
+        &key(),
+        opc_crypto::ConfigCapacityProfile::BoundedV1,
+    )
+    .expect("audit component alone fits the profile's inclusive ceiling");
+    assert_eq!(encoded_size(&prepared.audit), 196_608);
+    let observed = OBSERVED.get();
+    assert!(observed.reached);
+    assert_eq!(observed.paths, prepared.audit.len());
+    assert!(observed.capacity > 0);
+    prepared.validate().expect("same finalized audit encoding");
+}
+
+#[test]
+fn config_capacity_957_bounded_audit_one_over_rejects_before_path_allocation() {
+    let record = record();
+    let audit = at_encoded_size(record.tx_id, 196_609);
+    OBSERVED.set(Observed::default());
+    let rejected = PreparedConfigCommit::prepare_for_profile(
+        record,
+        audit,
+        &key(),
+        opc_crypto::ConfigCapacityProfile::BoundedV1,
+    );
+    let observed = OBSERVED.get();
+    assert!(observed.reached);
+    assert!(
+        rejected.is_err(),
+        "one-over finalized metadata component must reject"
+    );
+    assert_eq!(
+        observed.paths, 0,
+        "rejection precedes finalized path allocation"
+    );
+    assert_eq!(observed.capacity, 0);
+}

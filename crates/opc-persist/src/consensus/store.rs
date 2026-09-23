@@ -874,8 +874,12 @@ impl ConsensusConfigStore {
         let binding = self.issue_capacity_binding(&commit)?;
         let (record, audit, resolution, evidence, reservation) = commit.into_capacity_parts();
         let ownership = self.commit_submission(evidence, reservation)?;
-        let prepared =
-            PreparedConfigCommit::prepare(record, audit, self.inner.backend.audit_key())?;
+        let prepared = PreparedConfigCommit::prepare_for_profile(
+            record,
+            audit,
+            self.inner.backend.audit_key(),
+            self.capacity_profile(),
+        )?;
         let intent = ConfigMutationIntent::prepared_append(prepared, resolution, binding);
         self.submit_owned_request(request_id, intent, ownership)
             .await?
@@ -894,8 +898,12 @@ impl ConsensusConfigStore {
         let binding = self.issue_capacity_binding(&commit)?;
         let (record, audit, resolution, evidence, reservation) = commit.into_capacity_parts();
         let ownership = self.commit_submission(evidence, reservation)?;
-        let prepared =
-            PreparedConfigCommit::prepare(record, audit, self.inner.backend.audit_key())?;
+        let prepared = PreparedConfigCommit::prepare_for_profile(
+            record,
+            audit,
+            self.inner.backend.audit_key(),
+            self.capacity_profile(),
+        )?;
         let intent = ConfigMutationIntent::prepared_append(prepared, resolution, binding);
         self.submit_owned_request_on_local_leader(request_id, intent, ownership)
             .await?
@@ -1328,8 +1336,13 @@ impl ConsensusConfigStore {
                 self.inner.backend.audit_key(),
                 self.capacity_profile(),
             )?;
-            preflight_config_command_replication_budget(self.inner.identity, request_id, &intent)
-                .map_err(ForwardMutationRejection::into_persist_error)?;
+            preflight_config_command_replication_budget(
+                self.inner.identity,
+                request_id,
+                &intent,
+                self.capacity_profile(),
+            )
+            .map_err(ForwardMutationRejection::into_persist_error)?;
             self.require_admission()?;
             let deadline = tokio::time::Instant::now()
                 .checked_add(self.inner.operation_timeout)
@@ -1384,8 +1397,13 @@ impl ConsensusConfigStore {
             self.inner.backend.audit_key(),
             self.capacity_profile(),
         )?;
-        preflight_config_command_replication_budget(self.inner.identity, request_id, &intent)
-            .map_err(ForwardMutationRejection::into_persist_error)?;
+        preflight_config_command_replication_budget(
+            self.inner.identity,
+            request_id,
+            &intent,
+            self.capacity_profile(),
+        )
+        .map_err(ForwardMutationRejection::into_persist_error)?;
         self.require_admission()?;
         let deadline = tokio::time::Instant::now()
             .checked_add(self.inner.operation_timeout)
@@ -1523,6 +1541,7 @@ impl ConsensusConfigStore {
             self.inner.identity,
             request.request_id,
             &request.intent,
+            self.capacity_profile(),
         ) {
             return ForwardMutationReply::Rejected(rejection);
         }
@@ -1937,15 +1956,18 @@ fn preflight_config_command_replication_budget(
     identity: opc_consensus::ConsensusIdentity,
     request_id: opc_consensus::ConsensusRequestId,
     intent: &ConfigMutationIntent,
+    profile: opc_crypto::ConfigCapacityProfile,
 ) -> Result<(), ForwardMutationRejection> {
+    let schema_version = config_command_revision(profile);
+    if schema_version == 0 {
+        return Err(ForwardMutationRejection::InvalidCommand);
+    }
     // The maximum UTC RFC 3339 timestamp has the longest representation that
     // the leader-selected logical time can add to the postcard command. This
     // makes admission independent of the current clock value while retaining
     // the exact command shape and field order.
     let probe = ConfigConsensusCommandSizeProbe {
-        schema_version: intent
-            .minimum_command_version()
-            .max(super::CONFIG_CONSENSUS_COMMAND_VERSION),
+        schema_version,
         identity,
         request_id,
         logical_time: maximum_encoded_config_timestamp()
@@ -1953,7 +1975,12 @@ fn preflight_config_command_replication_budget(
         intent,
     };
     match config_command_encoded_size(&probe) {
-        Ok(bytes) if bytes <= DURABLE_OPENRAFT_APPEND_ENTRIES_TARGET_BYTES => Ok(()),
+        Ok(bytes)
+            if bytes <= DURABLE_OPENRAFT_APPEND_ENTRIES_TARGET_BYTES
+                && intent.metadata_fits_profile(bytes, profile) =>
+        {
+            Ok(())
+        }
         Ok(_) | Err(opc_consensus::ConsensusCodecError::TooLarge) => {
             Err(ForwardMutationRejection::CommandTooLarge)
         }
@@ -2746,6 +2773,7 @@ mod tests {
                 store.inner.identity,
                 oversized_request.request_id,
                 &oversized_request.intent,
+                store.capacity_profile(),
             ),
             Err(ForwardMutationRejection::CommandTooLarge)
         );

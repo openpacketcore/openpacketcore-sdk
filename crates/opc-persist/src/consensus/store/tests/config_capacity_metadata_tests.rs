@@ -249,6 +249,7 @@ fn assert_boundary(audit: bool, resolution: Option<bool>, boundary: Boundary) {
                         identity(),
                         value.request_id,
                         &value.intent,
+                        PROFILE,
                     ),
                     if extra == 0 {
                         Ok(())

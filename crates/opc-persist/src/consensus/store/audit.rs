@@ -96,8 +96,13 @@ impl ConsensusConfigStore {
             .get()
             .checked_sub(1)
             .ok_or(AuditAuthorityError::InvalidInput)?;
-        let commit = PreparedConfigCommit::prepare(record, audit, self.inner.backend.audit_key())
-            .map_err(|_| AuditAuthorityError::InvalidInput)?;
+        let commit = PreparedConfigCommit::prepare_for_profile(
+            record,
+            audit,
+            self.inner.backend.audit_key(),
+            self.capacity_profile(),
+        )
+        .map_err(|_| AuditAuthorityError::InvalidInput)?;
         self.prepare_audited_effect(
             privacy,
             event,
@@ -194,8 +199,13 @@ impl ConsensusConfigStore {
         let request =
             derive_durable_request_id(self.inner.identity, b"audit-config", &prepared.handle().mac);
         let command = ConfigMutationIntent::AuditedMutation(prepared.command().clone());
-        super::preflight_config_command_replication_budget(self.inner.identity, request, &command)
-            .map_err(|_| AuditAuthorityError::InvalidInput)?;
+        super::preflight_config_command_replication_budget(
+            self.inner.identity,
+            request,
+            &command,
+            self.capacity_profile(),
+        )
+        .map_err(|_| AuditAuthorityError::InvalidInput)?;
         Ok(prepared)
     }
 
@@ -245,6 +255,7 @@ impl ConsensusConfigStore {
             self.inner.identity,
             request,
             &ConfigMutationIntent::AuditedMutation(prepared.command().clone()),
+            self.capacity_profile(),
         )
         .map_err(|_| AuditAuthorityError::InvalidInput)?;
         if let Some(reservation) = reservation {
@@ -505,6 +516,7 @@ impl ConsensusConfigStore {
             self.inner.identity,
             request,
             &command,
+            self.capacity_profile(),
         )
         .is_err()
         {

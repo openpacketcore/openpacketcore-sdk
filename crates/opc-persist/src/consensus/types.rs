@@ -79,6 +79,9 @@ const AUDIT_PATH_TOKEN_PREFIX: &str = "hmac-sha256:";
 pub(crate) const CONFIG_PRINCIPAL_MAX_BYTES: usize = 16 * 1024;
 pub(crate) const CONFIG_AUDIT_RECORDS_MAX: usize = 16_384;
 pub(crate) const CONFIG_AUDIT_PATH_MAX_BYTES: usize = 8 * 1024;
+/// Complete postcard command minus one envelope's byte content. Its length
+/// prefix, record proof, audit handle and all other framing remain charged.
+pub(super) const CONFIG_CAPACITY_V1_METADATA_BYTES: usize = 192 * 1024;
 
 /// Immutable scope and exact voter set for one config consensus node.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -250,10 +253,27 @@ impl PreparedConfigCommit {
     /// Every audit value is masked, even when it is not classified as secret,
     /// so no configuration value can enter a Raft log or wire frame. The audit
     /// key is used here and is never retained by the command or state machine.
+    #[cfg(test)]
     pub(crate) fn prepare(
+        record: CommitRecord,
+        audit: Vec<AuditRecord>,
+        audit_key: &crate::types::AuditKey,
+    ) -> Result<Self, PersistError> {
+        Self::prepare_for_profile(
+            record,
+            audit,
+            audit_key,
+            opc_crypto::ConfigCapacityProfile::Legacy,
+        )
+    }
+
+    /// Use the authority's immutable profile for the early necessary bound.
+    /// Full command metadata admission still follows finalized preparation.
+    pub(crate) fn prepare_for_profile(
         record: CommitRecord,
         mut audit: Vec<AuditRecord>,
         audit_key: &crate::types::AuditKey,
+        profile: opc_crypto::ConfigCapacityProfile,
     ) -> Result<Self, PersistError> {
         validate_record_representability(&record)?;
         if audit.len() > CONFIG_AUDIT_RECORDS_MAX {
@@ -265,7 +285,7 @@ impl PreparedConfigCommit {
             u32::try_from(audit.len()).map_err(|_| PersistError::audit_chain_broken())?;
         #[cfg(test)]
         config_capacity_audit_preparation_tests::observe_start();
-        preflight_finalized_audit_size(&audit, audit_key)?;
+        preflight_finalized_audit_size(&audit, audit_key, profile)?;
         let tenant = extract_tenant(&record.principal);
         let mut previous_hash = [0_u8; 32];
         for (expected_sequence, entry) in audit.iter_mut().enumerate() {
@@ -326,16 +346,22 @@ impl PreparedConfigCommit {
     }
 }
 
-// A finalized audit vector alone cannot exceed the complete command's existing
-// ceiling. Count its real postcard representation before replacing any path.
-// This is a necessary early check, not complete command or resource admission:
-// record/intent/authority overhead is still checked by the existing preflight.
-// No legacy command that fitted that fence can be rejected by this check.
+// Count the finalized vector before replacing any path. Its necessary bound
+// is the Legacy command ceiling or the bounded profile's metadata ceiling.
+// Complete command metadata and resource admission remain separate checks.
+// No legacy command that fitted its original fence acquires a smaller bound.
 fn preflight_finalized_audit_size(
     audit: &[AuditRecord],
     audit_key: &crate::types::AuditKey,
+    profile: opc_crypto::ConfigCapacityProfile,
 ) -> Result<(), PersistError> {
-    const LIMIT: usize = opc_consensus::DURABLE_OPENRAFT_APPEND_ENTRIES_TARGET_BYTES;
+    let limit = match profile {
+        opc_crypto::ConfigCapacityProfile::Legacy => {
+            opc_consensus::DURABLE_OPENRAFT_APPEND_ENTRIES_TARGET_BYTES
+        }
+        opc_crypto::ConfigCapacityProfile::BoundedV1 => CONFIG_CAPACITY_V1_METADATA_BYTES,
+        _ => return Err(PersistError::corrupt_blob()),
+    };
     // Postcard string sizing depends only on byte length. This static ASCII
     // placeholder avoids allocating each finalized path merely to count it.
     static PATH_BYTES: [u8; CONFIG_AUDIT_PATH_MAX_BYTES] = [b'x'; CONFIG_AUDIT_PATH_MAX_BYTES];
@@ -363,7 +389,7 @@ fn preflight_finalized_audit_size(
         };
         total = total
             .checked_add(audit_component_encoded_size(&probe)?)
-            .filter(|bytes| *bytes <= LIMIT)
+            .filter(|bytes| *bytes <= limit)
             .ok_or_else(|| {
                 PersistError::constraint_violation("config audit exceeds command byte limit")
             })?;
@@ -533,6 +559,42 @@ impl ConfigMutationIntent {
                 .map(|_| ()),
             _ => Ok(()),
         }
+    }
+
+    /// Charge the actual complete encoding, excluding only the single
+    /// encrypted record's byte content. No-envelope commands charge all bytes.
+    /// The received proof or revision cannot select the admitted profile.
+    pub(super) fn metadata_fits_profile(
+        &self,
+        complete_bytes: usize,
+        profile: opc_crypto::ConfigCapacityProfile,
+    ) -> bool {
+        match profile {
+            opc_crypto::ConfigCapacityProfile::Legacy => return true,
+            opc_crypto::ConfigCapacityProfile::BoundedV1 => {}
+            _ => return false,
+        }
+        let envelope_bytes = match self {
+            Self::AppendCommit(commit)
+            | Self::ResolveConfirmedAndAppend { commit, .. }
+            | Self::BoundedAppend { commit, .. } => commit.record.encrypted_blob.len(),
+            Self::AuditedMutation(prepared) => match &prepared.effect {
+                super::audit_mutation::AuditedConfigEffect::Append { commit, .. }
+                | super::audit_mutation::AuditedConfigEffect::BoundedAppend { commit, .. } => {
+                    commit.record.encrypted_blob.len()
+                }
+                super::audit_mutation::AuditedConfigEffect::Confirm { .. }
+                | super::audit_mutation::AuditedConfigEffect::RollbackPoint { .. } => 0,
+            },
+            Self::MarkConfirmed { .. }
+            | Self::CreateRollbackPoint { .. }
+            | Self::ClearRecoveryRequired { .. }
+            | Self::RetainHistory(_)
+            | Self::ManagementAudit(_) => 0,
+        };
+        complete_bytes
+            .checked_sub(envelope_bytes)
+            .is_some_and(|bytes| bytes <= CONFIG_CAPACITY_V1_METADATA_BYTES)
     }
 
     fn inline_rollback_label(&self) -> Result<Option<String>, PersistError> {
@@ -724,6 +786,26 @@ impl ConfigConsensusCommand {
         key: &crate::AuditKey,
         profile: opc_crypto::ConfigCapacityProfile,
     ) -> Result<(), PersistError> {
+        match profile {
+            opc_crypto::ConfigCapacityProfile::Legacy => {}
+            opc_crypto::ConfigCapacityProfile::BoundedV1 => {
+                // Count the actual borrowed command without materializing its
+                // encoding, before allocating structural validation helpers.
+                let mut counter = opc_consensus::AppendEntriesBatchAccumulator::new();
+                counter
+                    .consider(self)
+                    .map_err(|_| PersistError::corrupt_blob())?;
+                if !self
+                    .intent
+                    .metadata_fits_profile(counter.serialized_entry_bytes(), profile)
+                {
+                    return Err(PersistError::constraint_violation(
+                        "config consensus metadata exceeds byte limit",
+                    ));
+                }
+            }
+            _ => return Err(PersistError::corrupt_blob()),
+        }
         self.validate(identity)?;
         if self.schema_version > config_command_revision(profile) {
             return Err(PersistError::corrupt_blob());
