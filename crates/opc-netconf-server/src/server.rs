@@ -412,7 +412,6 @@ impl From<StartupDatastoreError> for DatastoreFailure {
 impl<C: Clone> CandidateDatastore<C> {
     fn prune_released(&mut self) {
         if self.lock.as_ref().is_some_and(|lock| !lock.is_active()) {
-            self.snapshot = None;
             self.lock = None;
         }
     }
