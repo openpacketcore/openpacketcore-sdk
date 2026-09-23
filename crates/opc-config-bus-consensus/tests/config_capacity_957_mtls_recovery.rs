@@ -680,6 +680,19 @@ async fn config_capacity_957_exact_recovery_after_mtls_response_loss_and_leader_
         .await
         .expect("stop original leader");
     let live = (0..3).filter(|index| *index != leader).collect::<Vec<_>>();
+    // Adversarial control: remove a second voter after the original exact
+    // committed readback. The unchanged convergence check must not succeed
+    // with one of the original three voters remaining.
+    servers[live[0]]
+        .take()
+        .expect("second voter listener")
+        .abort_and_wait()
+        .await;
+    stores[live[0]]
+        .shutdown()
+        .await
+        .expect("stop second voter for quorum-loss control");
+    eprintln!("CONFIG_CAPACITY_QUORUM_LOSS_CONTROL stopped_voters=2 remaining_voters=1");
     let convergence_deadline =
         tokio::time::Instant::now() + CONFIG_CAPACITY_CLUSTER_RECOVERY_TIMEOUT;
     let readiness = tokio::time::timeout_at(convergence_deadline, async {
