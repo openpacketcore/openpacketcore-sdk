@@ -306,6 +306,9 @@ pub(crate) struct ConfigConsensusCore {
     sqlite_worker_gate: Arc<tokio::sync::Semaphore>,
     #[cfg(test)]
     pub(crate) apply_gate: Arc<tokio::sync::Semaphore>,
+    // Last field: release is observable only after this core's connection and
+    // every other engine-storage resource have finished dropping.
+    storage_owner: Arc<super::storage::ConfigStorageOwner>,
 }
 
 impl ConfigConsensusCore {
@@ -467,6 +470,7 @@ impl ConfigConsensusCore {
             binding_path: snapshot_binding_path,
             guard: snapshot_dir_guard,
         } = snapshot_directory;
+        let storage_owner = durable_progress.track_storage_owners()?;
         Ok(Self {
             conn,
             identity,
@@ -482,6 +486,7 @@ impl ConfigConsensusCore {
             sqlite_worker_gate: worker_gate,
             #[cfg(test)]
             apply_gate: Arc::clone(&backend.consensus_apply_gate),
+            storage_owner,
         })
     }
 
@@ -517,6 +522,7 @@ impl ConfigConsensusCore {
         run_sqlite_worker_until(
             self.sqlite_worker_gate.clone(),
             self.conn.clone(),
+            Some(Arc::clone(&self.storage_owner)),
             deadline,
             operation,
         )
@@ -552,6 +558,7 @@ impl ConfigConsensusCore {
         run_sqlite_worker_until(
             self.sqlite_worker_gate.clone(),
             self.conn.clone(),
+            Some(Arc::clone(&self.storage_owner)),
             deadline,
             operation,
         )
@@ -579,15 +586,24 @@ where
     run_sqlite_worker_until(
         backend.config_consensus_worker_gate(),
         backend.conn(),
+        None,
         deadline,
         operation,
     )
     .await
 }
 
+// Retain the engine-storage owner through the final worker connection drop,
+// including a blocking worker whose caller was cancelled. Field order matters.
+struct ConfigSqliteWorkerConnection {
+    connection: tokio::sync::OwnedMutexGuard<crate::backend::BackendConnection>,
+    _storage_owner: Option<Arc<super::storage::ConfigStorageOwner>>,
+}
+
 async fn run_sqlite_worker_until<T, F>(
     worker_gate: Arc<tokio::sync::Semaphore>,
     conn: Arc<tokio::sync::Mutex<crate::backend::BackendConnection>>,
+    storage_owner: Option<Arc<super::storage::ConfigStorageOwner>>,
     deadline: tokio::time::Instant,
     operation: F,
 ) -> io::Result<T>
@@ -606,11 +622,19 @@ where
     let conn = tokio::time::timeout_at(deadline, conn.lock_owned())
         .await
         .map_err(|_| timed_out("config consensus SQLite connection timed out"))?;
+    let connection = ConfigSqliteWorkerConnection {
+        connection: conn,
+        _storage_owner: storage_owner,
+    };
     let cancellation = Arc::new(SqliteWorkCancellation::with_deadline(std_deadline));
     let mut cancel_on_drop = SqliteWorkCancelOnDrop::new(cancellation.clone());
     let worker_cancellation = cancellation.clone();
     let mut worker = tokio::task::spawn_blocking(move || {
+        // Move the complete wrapper so precise closure capture cannot split
+        // its connection from the owner that must outlive it.
+        let connection = connection;
         let _permit = permit;
+        let conn = &connection.connection;
         let commit_cancellation = worker_cancellation.clone();
         conn.commit_hook(Some(move || {
             commit_cancellation.authorize_commit().is_err()
@@ -624,7 +648,7 @@ where
             }),
         )
         .map_err(db_error)?;
-        let result = operation(&conn, &worker_cancellation);
+        let result = operation(conn, &worker_cancellation);
         conn.commit_hook(None::<fn() -> bool>)
             .expect("installed SQLite hook belongs to an owned connection");
         conn.progress_handler(0, None::<fn() -> bool>)
@@ -2344,6 +2368,7 @@ pub(super) async fn read_commit_outcome_until(
     run_sqlite_worker_until(
         backend.config_consensus_worker_gate(),
         backend.conn(),
+        None,
         deadline,
         move |conn, cancellation| {
             cancellation.check_io()?;

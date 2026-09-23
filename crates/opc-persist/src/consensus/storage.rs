@@ -122,11 +122,19 @@ pub(crate) struct SqliteConfigSnapshotBuilder {
     core: sqlite::ConfigConsensusCore,
 }
 
+// The final engine-storage owner closes this channel. Observers retain only
+// receivers, so observing shutdown cannot keep the storage lifetime alive.
+#[derive(Debug)]
+pub(crate) struct ConfigStorageOwner {
+    _released: tokio::sync::watch::Sender<()>,
+}
+
 #[derive(Debug)]
 pub(crate) struct ConfigDurableProgress {
     committed_present: AtomicBool,
     committed_index: AtomicU64,
     applied_epoch: tokio::sync::watch::Sender<u64>,
+    storage_released: std::sync::OnceLock<tokio::sync::watch::Receiver<()>>,
     #[cfg(test)]
     pub(crate) apply_entered: tokio::sync::watch::Sender<u64>,
 }
@@ -138,6 +146,7 @@ impl Default for ConfigDurableProgress {
             committed_present: AtomicBool::new(false),
             committed_index: AtomicU64::new(0),
             applied_epoch,
+            storage_released: std::sync::OnceLock::new(),
             #[cfg(test)]
             apply_entered: tokio::sync::watch::channel(0).0,
         }
@@ -145,6 +154,33 @@ impl Default for ConfigDurableProgress {
 }
 
 impl ConfigDurableProgress {
+    pub(crate) fn track_storage_owners(
+        &self,
+    ) -> Result<Arc<ConfigStorageOwner>, ConfigConsensusStorageError> {
+        let (released, receiver) = tokio::sync::watch::channel(());
+        self.storage_released
+            .set(receiver)
+            .map_err(|_| ConfigConsensusStorageError::BackendUnavailable)?;
+        Ok(Arc::new(ConfigStorageOwner {
+            _released: released,
+        }))
+    }
+
+    pub(crate) async fn wait_for_storage_release(&self) -> Result<(), ConfigConsensusStorageError> {
+        let mut released = self
+            .storage_released
+            .get()
+            .ok_or(ConfigConsensusStorageError::BackendUnavailable)?
+            .clone();
+        // No value is ever sent: closure proves that the last storage owner
+        // has dropped. A value notification cannot stand in for task exit.
+        if released.changed().await.is_err() {
+            Ok(())
+        } else {
+            Err(ConfigConsensusStorageError::BackendUnavailable)
+        }
+    }
+
     fn set_committed(&self, committed: Option<LogId<ConsensusNodeId>>) {
         if let Some(committed) = committed {
             self.committed_index
@@ -1609,6 +1645,9 @@ async fn remove_old_snapshot(
 
 #[cfg(all(test, target_os = "linux"))]
 mod config_capacity_snapshot_tests;
+
+#[cfg(all(test, target_os = "linux"))]
+mod config_capacity_worker_ownership_tests;
 
 #[cfg(test)]
 mod tests {

@@ -855,6 +855,13 @@ impl ConsensusConfigStore {
             .raft
             .shutdown()
             .await
+            .map_err(|_| consensus_unavailable())?;
+        // Openraft joins its core and timer. Its state-machine, log readers
+        // and snapshot workers may still own SQLite after that core returns.
+        self.inner
+            .durable_progress
+            .wait_for_storage_release()
+            .await
             .map_err(|_| consensus_unavailable())
     }
 
