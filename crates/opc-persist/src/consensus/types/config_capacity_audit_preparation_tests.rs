@@ -186,12 +186,19 @@ fn config_capacity_957_audit_expansion_rejects_before_finalized_allocation() {
     let record = record();
     // Raw paths fit well below the command ceiling; each redacted path expands
     // to 8,192 bytes. The aggregate finalized audit cannot fit the command.
+    let predicates = 96;
+    let predicate_bytes = "[key='hmac-sha256:']".len() + 64;
+    let prefix_bytes = CONFIG_AUDIT_PATH_MAX_BYTES - predicates * predicate_bytes;
     let audit: Vec<_> = (0..129)
         .map(|sequence| {
             entry(
                 record.tx_id,
                 sequence,
-                format!("/{}{}", "x".repeat(57), "[key='x']".repeat(98)),
+                format!(
+                    "/{}{}",
+                    "x".repeat(prefix_bytes - 1),
+                    "[key='x']".repeat(predicates)
+                ),
             )
         })
         .collect();
