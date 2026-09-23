@@ -375,13 +375,15 @@ pub(crate) enum ConfigMutationIntent {
     /// Explicit acknowledged-prefix retention under exact-head authority.
     RetainHistory(super::ConfigHistoryRetention),
     /// Purpose-separated management ledger, with no configuration version change.
-    ManagementAudit(super::audit::AuditCommand),
+    /// Indirection keeps unrelated intents small; serde retains the original
+    /// variant index, JSON name and payload bytes.
+    ManagementAudit(Box<super::audit::AuditCommand>),
     /// Exact configuration effect and recoverable audit outcome, applied atomically.
     AuditedMutation(super::audit_mutation::AuditedConfigCommand),
 }
 
 impl ConfigMutationIntent {
-    const fn minimum_command_version(&self) -> u16 {
+    fn minimum_command_version(&self) -> u16 {
         match self {
             Self::AppendCommit(_)
             | Self::MarkConfirmed { .. }
@@ -391,7 +393,7 @@ impl ConfigMutationIntent {
             }
             Self::RetainHistory(_) => 4,
             Self::AuditedMutation(_) => 5,
-            Self::ManagementAudit(command) => match command {
+            Self::ManagementAudit(command) => match command.as_ref() {
                 super::audit::AuditCommand::Initialize { .. }
                 | super::audit::AuditCommand::Intent(_)
                 | super::audit::AuditCommand::Reject(_)
@@ -592,6 +594,9 @@ impl ConfigMutationFailure {
 
 #[cfg(test)]
 mod config_capacity_wire_tests;
+
+#[cfg(test)]
+mod config_capacity_command_layout_tests;
 
 /// Persisted result returned after durable quorum commit and local apply.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -1075,7 +1080,7 @@ mod tests {
             identity,
             request_id: ConfigConsensusRequestId::from_bytes([0xC6; 16]),
             logical_time: Timestamp::now_utc(),
-            intent: ConfigMutationIntent::ManagementAudit(
+            intent: ConfigMutationIntent::ManagementAudit(Box::new(
                 super::super::audit::AuditCommand::Initialize {
                     projection: crate::audit_authority::AuditToken::from_keyed_projection(
                         [0xC7; 32],
@@ -1083,21 +1088,21 @@ mod tests {
                     .unwrap(),
                     limits: crate::audit_authority::AuditLedgerLimits::new(3, 1).unwrap(),
                 },
-            ),
+            )),
         };
         assert!(command.validate(identity).is_ok());
         for revision in 1..5 {
             command.schema_version = revision;
             assert!(command.validate(identity).is_err());
         }
-        command.intent = ConfigMutationIntent::ManagementAudit(
+        command.intent = ConfigMutationIntent::ManagementAudit(Box::new(
             super::super::audit::AuditCommand::InitializeWithContinuity {
                 projection: crate::audit_authority::AuditToken::from_keyed_projection([0xC7; 32])
                     .unwrap(),
                 limits: crate::audit_authority::AuditLedgerLimits::new(3, 1).unwrap(),
                 initial_epoch: 1,
             },
-        );
+        ));
         for revision in 1..6 {
             command.schema_version = revision;
             assert!(command.validate(identity).is_err());
@@ -1122,9 +1127,9 @@ mod tests {
             },
         )
         .unwrap();
-        command.intent = ConfigMutationIntent::ManagementAudit(
+        command.intent = ConfigMutationIntent::ManagementAudit(Box::new(
             super::super::audit::AuditCommand::AcknowledgeExport(checkpoint),
-        );
+        ));
         for revision in 1..7 {
             command.schema_version = revision;
             assert!(command.validate(identity).is_err());

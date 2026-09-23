@@ -34,11 +34,14 @@ impl ConsensusConfigStore {
             AuditCommand::Initialize { projection, limits }
         };
         let request = derive_durable_request_id(self.inner.identity, b"audit-initialize", &[]);
-        self.submit_request(request, ConfigMutationIntent::ManagementAudit(command))
-            .await
-            .map_err(|_| AuditAuthorityError::Unavailable)?
-            .result
-            .map_err(super::super::audit::map_failure)?;
+        self.submit_request(
+            request,
+            ConfigMutationIntent::ManagementAudit(Box::new(command)),
+        )
+        .await
+        .map_err(|_| AuditAuthorityError::Unavailable)?
+        .result
+        .map_err(super::super::audit::map_failure)?;
         if self.inner.audit_continuity.is_some() {
             self.provision_audit_checkpoint().await?;
         }
@@ -276,7 +279,7 @@ impl ConsensusConfigStore {
             handle,
             caller,
             b"audit-intent",
-            ConfigMutationIntent::ManagementAudit(AuditCommand::Intent(handle.clone())),
+            ConfigMutationIntent::ManagementAudit(Box::new(AuditCommand::Intent(handle.clone()))),
         )
         .await
     }
@@ -328,7 +331,7 @@ impl ConsensusConfigStore {
             handle,
             caller,
             b"audit-reject",
-            ConfigMutationIntent::ManagementAudit(AuditCommand::Reject(handle.clone())),
+            ConfigMutationIntent::ManagementAudit(Box::new(AuditCommand::Reject(handle.clone()))),
         )
         .await
     }
@@ -344,7 +347,7 @@ impl ConsensusConfigStore {
             handle,
             caller,
             b"audit-terminal",
-            ConfigMutationIntent::ManagementAudit(AuditCommand::Terminal(handle.clone())),
+            ConfigMutationIntent::ManagementAudit(Box::new(AuditCommand::Terminal(handle.clone()))),
         )
         .await
     }
@@ -399,7 +402,7 @@ impl ConsensusConfigStore {
             handle,
             caller,
             b"audit-intent",
-            ConfigMutationIntent::ManagementAudit(AuditCommand::Intent(handle.clone())),
+            ConfigMutationIntent::ManagementAudit(Box::new(AuditCommand::Intent(handle.clone()))),
             true,
             ownership,
         )

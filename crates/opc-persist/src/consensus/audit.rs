@@ -400,11 +400,12 @@ pub(crate) fn applied_receipt_sync(
     use crate::audit_authority::receipt::AuthenticatedAuditReceipt;
     let handle = match intent {
         super::ConfigMutationIntent::AuditedMutation(prepared) => &prepared.handle,
-        super::ConfigMutationIntent::ManagementAudit(
+        super::ConfigMutationIntent::ManagementAudit(command) => match command.as_ref() {
             AuditCommand::Intent(handle)
             | AuditCommand::Reject(handle)
-            | AuditCommand::Terminal(handle),
-        ) => handle,
+            | AuditCommand::Terminal(handle) => handle,
+            _ => return Ok(None),
+        },
         _ => return Ok(None),
     };
     // A rejected malformed/substituted handle has no receipt, not an I/O fault.
