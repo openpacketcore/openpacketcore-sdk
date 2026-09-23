@@ -155,14 +155,15 @@ pub struct StoredConfig {
 ///
 /// The one-shot encryption claim is consumed by [`Self::try_new`] and is not
 /// retained or serialized. Optional SDK-validated capacity evidence is retained
-/// after the exact ciphertext/digest checks. Consensus receives only ciphertext and
-/// deterministic metadata, while unauthenticated raw bytes cannot enter its
-/// proposal API.
+/// together with its process-local preparation reservation after the exact
+/// ciphertext/digest checks. Consensus commands receive only ciphertext and
+/// deterministic metadata; preparation ownership stays with the submission.
 pub struct AttestedConfigCommit {
     record: CommitRecord,
     audit: Vec<AuditRecord>,
     confirmed_resolution: Option<ConfirmedCommitResolution>,
     capacity_evidence: Option<opc_crypto::ConfigCapacityEvidence>,
+    preparation: Option<opc_crypto::ConfigPreparationReservation>,
 }
 
 impl AttestedConfigCommit {
@@ -176,11 +177,13 @@ impl AttestedConfigCommit {
         {
             return Err(PersistError::corrupt_blob());
         }
+        let (capacity_evidence, preparation) = claim.into_capacity_parts();
         Ok(Self {
             record,
             audit,
             confirmed_resolution: None,
-            capacity_evidence: claim.capacity_evidence(),
+            capacity_evidence,
+            preparation,
         })
     }
 
@@ -205,16 +208,40 @@ impl AttestedConfigCommit {
         {
             return Err(PersistError::corrupt_blob());
         }
+        let (capacity_evidence, preparation) = claim.into_capacity_parts();
         Ok(Self {
             record,
             audit,
             confirmed_resolution: Some(resolution),
-            capacity_evidence: claim.capacity_evidence(),
+            capacity_evidence,
+            preparation,
         })
     }
 
     pub(crate) const fn capacity_evidence(&self) -> Option<opc_crypto::ConfigCapacityEvidence> {
         self.capacity_evidence
+    }
+
+    pub(crate) fn preparation(&self) -> Option<&opc_crypto::ConfigPreparationReservation> {
+        self.preparation.as_ref()
+    }
+
+    pub(crate) fn into_capacity_parts(
+        self,
+    ) -> (
+        CommitRecord,
+        Vec<AuditRecord>,
+        Option<ConfirmedCommitResolution>,
+        Option<opc_crypto::ConfigCapacityEvidence>,
+        Option<opc_crypto::ConfigPreparationReservation>,
+    ) {
+        (
+            self.record,
+            self.audit,
+            self.confirmed_resolution,
+            self.capacity_evidence,
+            self.preparation,
+        )
     }
 
     pub(crate) fn into_parts(

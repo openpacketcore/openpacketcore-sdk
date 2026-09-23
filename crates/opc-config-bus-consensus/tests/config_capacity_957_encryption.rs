@@ -118,14 +118,60 @@ impl KeyProvider for Provider {
 
 struct RecordingSink {
     profile: ConfigCapacityProfile,
+    preparation: opc_crypto::ConfigPreparationPool,
     appends: AtomicUsize,
     record: tokio::sync::Mutex<Option<StoredConfig<SealedConfig<ProbeConfig>>>>,
+}
+
+struct UnsupportedBoundedSink;
+
+#[async_trait]
+impl ManagedDatastore<SealedConfig<ProbeConfig>> for UnsupportedBoundedSink {
+    fn config_capacity_profile(&self) -> ConfigCapacityProfile {
+        ConfigCapacityProfile::BoundedV1
+    }
+
+    async fn load_latest(
+        &self,
+    ) -> Result<Option<StoredConfig<SealedConfig<ProbeConfig>>>, StoreError> {
+        Ok(None)
+    }
+
+    async fn load_rollback(
+        &self,
+        _: RollbackTarget,
+    ) -> Result<StoredConfig<SealedConfig<ProbeConfig>>, StoreError> {
+        Err(StoreError::not_found("synthetic empty sink"))
+    }
+
+    async fn load_by_idempotency_key(
+        &self,
+        _: &IdempotencyKey,
+    ) -> Result<Option<StoredConfig<SealedConfig<ProbeConfig>>>, StoreError> {
+        Ok(None)
+    }
+
+    async fn clear_recovery_required(&self, _: TxId) -> Result<(), StoreError> {
+        Ok(())
+    }
 }
 
 #[async_trait]
 impl ManagedDatastore<SealedConfig<ProbeConfig>> for RecordingSink {
     fn config_capacity_profile(&self) -> ConfigCapacityProfile {
         self.profile
+    }
+
+    fn try_reserve_config_preparation(
+        &self,
+    ) -> Result<Option<opc_crypto::ConfigPreparationReservation>, StoreError> {
+        if self.profile == ConfigCapacityProfile::Legacy {
+            return Ok(None);
+        }
+        self.preparation
+            .try_reserve()
+            .map(Some)
+            .map_err(|_| StoreError::unavailable("configuration preparation admission unavailable"))
     }
 
     async fn load_latest(
@@ -208,6 +254,7 @@ async fn exercise(profile: ConfigCapacityProfile, logical_bytes: usize, accepted
     });
     let sink = Arc::new(RecordingSink {
         profile,
+        preparation: opc_crypto::ConfigPreparationPool::bounded_v1(),
         appends: AtomicUsize::new(0),
         record: tokio::sync::Mutex::new(None),
     });
@@ -275,4 +322,84 @@ async fn config_capacity_957_adapter_stops_the_complete_plaintext_writer() {
 #[tokio::test]
 async fn config_capacity_957_legacy_adapter_keeps_its_encryption_behavior() {
     exercise(ConfigCapacityProfile::Legacy, LOGICAL_BYTES + 1, true).await;
+}
+
+#[tokio::test]
+async fn config_capacity_957_adapter_reserves_before_serialization_and_keeps_sealed_ownership() {
+    let provider = Arc::new(Provider {
+        key: KeyHandle::new(
+            KeyId::new("synthetic-reservation").expect("key ID"),
+            KeyPurpose::Config,
+            TenantId::from_static("test"),
+            Zeroizing::new([0xC3; 32]),
+        ),
+        active_calls: AtomicUsize::new(0),
+    });
+    let sink = Arc::new(RecordingSink {
+        profile: ConfigCapacityProfile::BoundedV1,
+        preparation: opc_crypto::ConfigPreparationPool::bounded_v1(),
+        appends: AtomicUsize::new(0),
+        record: tokio::sync::Mutex::new(None),
+    });
+    let mut occupied: Vec<_> = (0..8)
+        .map(|_| sink.preparation.try_reserve().expect("slot"))
+        .collect();
+    let wrapped =
+        EncryptingManagedDatastore::new(Arc::new(Arc::clone(&sink)), Arc::clone(&provider));
+    let serializations = Arc::new(AtomicUsize::new(0));
+    assert!(wrapped
+        .append_commit(record(32, Arc::clone(&serializations)))
+        .await
+        .is_err());
+    assert_eq!(
+        serializations.load(Ordering::SeqCst),
+        0,
+        "reservation precedes plaintext serialization"
+    );
+    assert_eq!(provider.active_calls.load(Ordering::SeqCst), 0);
+    assert_eq!(sink.appends.load(Ordering::SeqCst), 0);
+    assert!(sink.record.lock().await.is_none());
+    drop(occupied.pop().expect("release one"));
+    wrapped
+        .append_commit(record(32, Arc::clone(&serializations)))
+        .await
+        .expect("one slot available");
+    assert_eq!(serializations.load(Ordering::SeqCst), 1);
+    assert_eq!(provider.active_calls.load(Ordering::SeqCst), 1);
+    assert_eq!(sink.appends.load(Ordering::SeqCst), 1);
+    assert!(
+        sink.preparation.try_reserve().is_err(),
+        "stored sealed buffer retains its reservation"
+    );
+    drop(sink.record.lock().await.take());
+    let _released = sink
+        .preparation
+        .try_reserve()
+        .expect("last sealed owner released capacity");
+    assert!(
+        sink.preparation.try_reserve().is_err(),
+        "exactly one slot was released"
+    );
+}
+
+#[tokio::test]
+async fn config_capacity_957_default_bounded_port_refuses_before_preparation() {
+    let provider = Arc::new(Provider {
+        key: KeyHandle::new(
+            KeyId::new("synthetic-unsupported").expect("key ID"),
+            KeyPurpose::Config,
+            TenantId::from_static("test"),
+            Zeroizing::new([0xC4; 32]),
+        ),
+        active_calls: AtomicUsize::new(0),
+    });
+    let wrapped =
+        EncryptingManagedDatastore::new(Arc::new(UnsupportedBoundedSink), Arc::clone(&provider));
+    let serializations = Arc::new(AtomicUsize::new(0));
+    assert!(wrapped
+        .append_commit(record(32, Arc::clone(&serializations)))
+        .await
+        .is_err());
+    assert_eq!(serializations.load(Ordering::SeqCst), 0);
+    assert_eq!(provider.active_calls.load(Ordering::SeqCst), 0);
 }

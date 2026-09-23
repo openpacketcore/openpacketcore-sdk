@@ -9,6 +9,7 @@ mod audit;
 mod audit_mutation;
 pub use audit_mutation::PreparedAuditedMutation;
 pub(crate) mod history;
+mod preparation;
 mod raft_adapter;
 mod snapshot_file;
 mod sqlite;

@@ -11,8 +11,9 @@ use opc_crypto::ConfigCapacityProfile;
 use opc_persist::{
     AuditKey, ConfigConsensusClusterId, ConfigConsensusConfigurationEpoch,
     ConfigConsensusConfigurationId, ConfigConsensusIdentity, ConfigConsensusNodeId,
-    ConfigConsensusTopology, ConsensusConfigStore, RetainedConfigBinding, RetainedConfigDurability,
-    RetainedConfigError, RetainedConfigOptions, SqliteBackend,
+    ConfigConsensusTopology, ConfigStore, ConsensusConfigStore, PersistErrorKind,
+    RetainedConfigBinding, RetainedConfigDurability, RetainedConfigError, RetainedConfigOptions,
+    SqliteBackend,
 };
 use sha2::{Digest, Sha256};
 
@@ -208,6 +209,11 @@ async fn config_capacity_957_incomplete_profile_is_not_enabled_by_binding_alone(
     )
     .await
     .expect("provision bounded-profile binding");
+    let read_error = backend
+        .load_latest()
+        .await
+        .expect_err("unqualified bounded history must not fall back to legacy reads");
+    assert!(matches!(read_error.kind(), PersistErrorKind::CorruptBlob));
     assert!(
         ConsensusConfigStore::open(topology(), backend, root.join("snapshots"), BTreeMap::new())
             .await

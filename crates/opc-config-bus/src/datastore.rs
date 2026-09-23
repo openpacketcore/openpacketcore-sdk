@@ -12,7 +12,9 @@ use std::sync::Arc;
 use tokio::sync::{watch, Mutex as AsyncMutex};
 
 use opc_config_model::{IdempotencyKey, OpcConfig, RequestId, RequestSource, RollbackTarget};
-use opc_crypto::{decrypt_envelope, encrypt_attested_envelope, encrypt_bounded_config_envelope};
+use opc_crypto::{
+    decrypt_envelope, encrypt_attested_envelope, encrypt_reserved_bounded_config_envelope,
+};
 
 /// Configuration byte policy selected by the sealed datastore authority.
 pub use opc_crypto::ConfigCapacityProfile;
@@ -105,6 +107,20 @@ pub trait ManagedDatastore<C: OpcConfig>: Send + Sync {
     /// larger consensus command or promise a durability/resource profile.
     fn config_capacity_profile(&self) -> ConfigCapacityProfile {
         ConfigCapacityProfile::Legacy
+    }
+
+    /// Reserve preparation capacity in this exact sealed datastore before
+    /// allocating SDK plaintext. Nonlegacy implementations must provide their
+    /// authority's reservation; the compatibility default cannot invent one.
+    fn try_reserve_config_preparation(
+        &self,
+    ) -> Result<Option<opc_crypto::ConfigPreparationReservation>, StoreError> {
+        match self.config_capacity_profile() {
+            ConfigCapacityProfile::Legacy => Ok(None),
+            _ => Err(StoreError::unavailable(
+                "configuration preparation admission unavailable",
+            )),
+        }
     }
 
     /// Observation port belonging to this datastore's required mutation audit
@@ -315,6 +331,12 @@ where
         (**self).config_capacity_profile()
     }
 
+    fn try_reserve_config_preparation(
+        &self,
+    ) -> Result<Option<opc_crypto::ConfigPreparationReservation>, StoreError> {
+        (**self).try_reserve_config_preparation()
+    }
+
     fn required_audit_observations(&self) -> Option<Arc<dyn opc_mgmt_audit::AuditSink>> {
         (**self).required_audit_observations()
     }
@@ -498,6 +520,12 @@ where
             request_id: record.request_id,
         };
         let profile = self.inner.config_capacity_profile();
+        let preparation = self.inner.try_reserve_config_preparation()?;
+        if profile != ConfigCapacityProfile::Legacy && preparation.is_none() {
+            return Err(StoreError::unavailable(
+                "configuration preparation admission unavailable",
+            ));
+        }
         let mut plaintext = Zeroizing::new(Vec::new());
         match profile {
             ConfigCapacityProfile::Legacy => {
@@ -544,14 +572,22 @@ where
                     .map_err(|_| StoreError::crypto(CONFIG_ENVELOPE_ENCRYPT_FAILED_MESSAGE))?
             }
             ConfigCapacityProfile::BoundedV1 => {
-                encrypt_bounded_config_envelope(self.provider.as_ref(), &aad, plaintext.as_slice())
-                    .await
-                    .map_err(|error| match error {
-                        opc_crypto::ConfigCapacityError::EncryptionFailed => {
-                            StoreError::crypto(CONFIG_ENVELOPE_ENCRYPT_FAILED_MESSAGE)
-                        }
-                        _ => StoreError::internal("configuration capacity validation failed"),
-                    })?
+                let preparation = preparation.ok_or_else(|| {
+                    StoreError::unavailable("configuration preparation admission unavailable")
+                })?;
+                encrypt_reserved_bounded_config_envelope(
+                    preparation,
+                    self.provider.as_ref(),
+                    &aad,
+                    plaintext.as_slice(),
+                )
+                .await
+                .map_err(|error| match error {
+                    opc_crypto::ConfigCapacityError::EncryptionFailed => {
+                        StoreError::crypto(CONFIG_ENVELOPE_ENCRYPT_FAILED_MESSAGE)
+                    }
+                    _ => StoreError::internal("configuration capacity validation failed"),
+                })?
             }
             _ => {
                 return Err(StoreError::internal(
@@ -643,6 +679,12 @@ where
 {
     fn config_capacity_profile(&self) -> ConfigCapacityProfile {
         self.inner.config_capacity_profile()
+    }
+
+    fn try_reserve_config_preparation(
+        &self,
+    ) -> Result<Option<opc_crypto::ConfigPreparationReservation>, StoreError> {
+        self.inner.try_reserve_config_preparation()
     }
 
     fn required_audit_observations(&self) -> Option<Arc<dyn opc_mgmt_audit::AuditSink>> {

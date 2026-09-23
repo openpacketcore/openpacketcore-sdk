@@ -377,7 +377,7 @@ pub(crate) enum ConfigMutationIntent {
     /// Purpose-separated management ledger, with no configuration version change.
     ManagementAudit(super::audit::AuditCommand),
     /// Exact configuration effect and recoverable audit outcome, applied atomically.
-    AuditedMutation(super::PreparedAuditedMutation),
+    AuditedMutation(super::audit_mutation::AuditedConfigCommand),
 }
 
 impl ConfigMutationIntent {

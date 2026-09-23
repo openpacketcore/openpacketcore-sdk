@@ -21,6 +21,8 @@ const CALLER_DOMAIN: &[u8] = b"openpacketcore/config-commit-recovery/caller/v1\0
 pub struct PreparedConfigCommitOperation {
     intent: ConfigMutationIntent,
     handle: ConfigCommitRecoveryHandle,
+    evidence: Option<opc_crypto::ConfigCapacityEvidence>,
+    reservation: Option<opc_crypto::ConfigPreparationReservation>,
 }
 
 impl PreparedConfigCommitOperation {
@@ -171,7 +173,7 @@ impl ConsensusConfigStore {
         ) {
             return Err(invalid_handle());
         }
-        let (record, audit, resolution) = commit.into_parts();
+        let (record, audit, resolution, evidence, reservation) = commit.into_capacity_parts();
         let prepared =
             PreparedConfigCommit::prepare(record, audit, self.inner.backend.audit_key())?;
         let intent = match resolution {
@@ -206,6 +208,8 @@ impl ConsensusConfigStore {
         Ok(PreparedConfigCommitOperation {
             intent: command.intent,
             handle,
+            evidence,
+            reservation,
         })
     }
 
@@ -220,7 +224,8 @@ impl ConsensusConfigStore {
             self.inner.identity,
             self.capacity_profile(),
         )?;
-        self.submit_request(operation.handle.request_id(), operation.intent)
+        let ownership = self.commit_submission(operation.evidence, operation.reservation)?;
+        self.submit_owned_request(operation.handle.request_id(), operation.intent, ownership)
             .await?
             .into_result()
     }
@@ -236,9 +241,14 @@ impl ConsensusConfigStore {
             self.inner.identity,
             self.capacity_profile(),
         )?;
-        self.submit_request_on_local_leader(operation.handle.request_id(), operation.intent)
-            .await?
-            .into_result()
+        let ownership = self.commit_submission(operation.evidence, operation.reservation)?;
+        self.submit_owned_request_on_local_leader(
+            operation.handle.request_id(),
+            operation.intent,
+            ownership,
+        )
+        .await?
+        .into_result()
     }
 
     /// Read the original operation's retained result without proposing a write.

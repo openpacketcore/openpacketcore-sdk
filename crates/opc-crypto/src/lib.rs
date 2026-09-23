@@ -8,6 +8,10 @@
 
 #![forbid(unsafe_code)]
 
+mod config_preparation;
+
+pub use config_preparation::{ConfigPreparationPool, ConfigPreparationReservation};
+
 use opc_key::{
     AeadAlgorithm, EnvelopeAad, KeyHandle, KeyId, KeyProvider, Zeroizing, AEAD_TAG_LEN,
     AES_256_GCM_SIV_NONCE_LEN,
@@ -61,6 +65,9 @@ const CONFIG_CAPACITY_V2_MAGIC: &[u8] = b"\x89OPCCFG\x02\r\n\x1a\n";
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Error)]
 #[non_exhaustive]
 pub enum ConfigCapacityError {
+    /// No preparation slot is available, or a sealed reservation was reused.
+    #[error("configuration preparation admission unavailable")]
+    ResourceAdmission,
     /// The input is not a supported, unambiguous configuration serialization.
     #[error("invalid configuration plaintext framing")]
     InvalidPlaintext,
@@ -262,6 +269,24 @@ pub async fn encrypt_bounded_config_envelope<P: KeyProvider + ?Sized>(
     seal_bounded_config(&handle, aad, plaintext, nonce, evidence)
 }
 
+/// Encrypt under one destination-store preparation reservation.
+///
+/// Consumes the reservation before any provider request or encryption buffer
+/// allocation. A reservation extracted from an earlier encryption claim cannot
+/// encrypt again. The caller owns the borrowed plaintext; SDK adapters must
+/// obtain this reservation before allocating their plaintext buffer.
+pub async fn encrypt_reserved_bounded_config_envelope<P: KeyProvider + ?Sized>(
+    reservation: ConfigPreparationReservation,
+    provider: &P,
+    aad: &EnvelopeAad,
+    plaintext: &[u8],
+) -> Result<AuthenticatedEnvelope, ConfigCapacityError> {
+    reservation.begin_encryption()?;
+    let mut envelope = encrypt_bounded_config_envelope(provider, aad, plaintext).await?;
+    envelope.preparation = Some(reservation.lease);
+    Ok(envelope)
+}
+
 /// Deterministic bounded configuration encryption for test vectors.
 /// Callers MUST NOT reuse a nonce with the same key. Prefer
 /// [`encrypt_bounded_config_envelope`] for production encryption.
@@ -284,6 +309,7 @@ pub struct AuthenticatedEnvelope {
     encoded: Arc<[u8]>,
     plaintext_digest: [u8; 32],
     capacity_evidence: Option<ConfigCapacityEvidence>,
+    preparation: Option<Arc<config_preparation::ConfigPreparationLease>>,
     unclaimed: Arc<AtomicBool>,
 }
 
@@ -293,6 +319,7 @@ impl AuthenticatedEnvelope {
             encoded: Arc::from(encoded),
             plaintext_digest: Sha256::digest(plaintext).into(),
             capacity_evidence: None,
+            preparation: None,
             unclaimed: Arc::new(AtomicBool::new(true)),
         }
     }
@@ -311,6 +338,12 @@ impl AuthenticatedEnvelope {
             encoded: self.encoded.clone(),
             plaintext_digest: self.plaintext_digest,
             capacity_evidence: self.capacity_evidence,
+            preparation: self
+                .preparation
+                .as_ref()
+                .map(|lease| ConfigPreparationReservation {
+                    lease: Arc::clone(lease),
+                }),
         })
     }
 }
@@ -331,6 +364,7 @@ pub struct AuthenticatedEnvelopeClaim {
     encoded: Arc<[u8]>,
     plaintext_digest: [u8; 32],
     capacity_evidence: Option<ConfigCapacityEvidence>,
+    preparation: Option<ConfigPreparationReservation>,
 }
 
 impl AuthenticatedEnvelopeClaim {
@@ -338,6 +372,19 @@ impl AuthenticatedEnvelopeClaim {
     /// produced this claim. Legacy encryption never issues this evidence.
     pub const fn capacity_evidence(&self) -> Option<ConfigCapacityEvidence> {
         self.capacity_evidence
+    }
+
+    /// Consume this claim's size evidence and process-local reservation.
+    ///
+    /// Persistence constructors must first check exact ciphertext and digest
+    /// equality. These parts alone do not attest another encrypted record.
+    pub fn into_capacity_parts(
+        self,
+    ) -> (
+        Option<ConfigCapacityEvidence>,
+        Option<ConfigPreparationReservation>,
+    ) {
+        (self.capacity_evidence, self.preparation)
     }
 
     /// Verify that record bytes are exactly the successfully encrypted bytes.

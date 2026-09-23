@@ -40,6 +40,7 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use thiserror::Error;
 
+use super::preparation::{PreparationOwnership, SubmissionOwnership};
 use super::raft_adapter::{ConfigRaftAdapterError, ConfigRaftNetworkFactory, ConfigRaftRpcHandler};
 use super::storage::{self, ConfigConsensusStorageError};
 use super::types::{
@@ -255,6 +256,7 @@ enum ForwardMutationReply {
 enum ForwardMutationRejection {
     CommandTooLarge,
     InvalidCommand,
+    ResourceAdmission,
 }
 
 impl ForwardMutationRejection {
@@ -264,6 +266,7 @@ impl ForwardMutationRejection {
                 "config consensus command exceeds durable replication limit",
             ),
             Self::InvalidCommand => PersistError::corrupt_blob(),
+            Self::ResourceAdmission => PersistError::unavailable(),
         }
     }
 }
@@ -316,6 +319,7 @@ struct ConsensusConfigStoreInner {
     audit_continuity: Option<Arc<crate::audit_authority::continuity::AuditContinuityPolicy>>,
     linearizability: EnsureLinearizableSupervisor<ConfigRaftTypeConfig>,
     proposal_admission: Arc<tokio::sync::Semaphore>,
+    preparation_admission: opc_crypto::ConfigPreparationPool,
     metric_leader: std::sync::Mutex<Option<ConsensusNodeId>>,
     durable_progress: Arc<storage::ConfigDurableProgress>,
 }
@@ -532,6 +536,7 @@ impl ConsensusConfigStore {
                 proposal_admission: Arc::new(tokio::sync::Semaphore::new(
                     DURABLE_OPENRAFT_PROPOSAL_ADMISSION_SLOTS,
                 )),
+                preparation_admission: opc_crypto::ConfigPreparationPool::bounded_v1(),
                 metric_leader: std::sync::Mutex::new(None),
                 durable_progress,
             }),
@@ -861,7 +866,8 @@ impl ConsensusConfigStore {
         commit: AttestedConfigCommit,
     ) -> Result<(), PersistError> {
         self.require_commit_capacity(&commit)?;
-        let (record, audit, resolution) = commit.into_parts();
+        let (record, audit, resolution, evidence, reservation) = commit.into_capacity_parts();
+        let ownership = self.commit_submission(evidence, reservation)?;
         let prepared =
             PreparedConfigCommit::prepare(record, audit, self.inner.backend.audit_key())?;
         let intent = match resolution {
@@ -871,7 +877,9 @@ impl ConsensusConfigStore {
             },
             None => ConfigMutationIntent::AppendCommit(Box::new(prepared)),
         };
-        self.submit_request(request_id, intent).await?.into_result()
+        self.submit_owned_request(request_id, intent, ownership)
+            .await?
+            .into_result()
     }
 
     /// Append an authenticated config commit only when this node remains the
@@ -883,7 +891,8 @@ impl ConsensusConfigStore {
         commit: AttestedConfigCommit,
     ) -> Result<(), PersistError> {
         self.require_commit_capacity(&commit)?;
-        let (record, audit, resolution) = commit.into_parts();
+        let (record, audit, resolution, evidence, reservation) = commit.into_capacity_parts();
+        let ownership = self.commit_submission(evidence, reservation)?;
         let prepared =
             PreparedConfigCommit::prepare(record, audit, self.inner.backend.audit_key())?;
         let intent = match resolution {
@@ -893,7 +902,7 @@ impl ConsensusConfigStore {
             },
             None => ConfigMutationIntent::AppendCommit(Box::new(prepared)),
         };
-        self.submit_request_on_local_leader(request_id, intent)
+        self.submit_owned_request_on_local_leader(request_id, intent, ownership)
             .await?
             .into_result()
     }
@@ -1174,12 +1183,15 @@ impl ConsensusConfigStore {
     fn require_commit_capacity(&self, commit: &AttestedConfigCommit) -> Result<(), PersistError> {
         let profile = self.capacity_profile();
         if profile != opc_crypto::ConfigCapacityProfile::Legacy
-            && !commit
+            && (!commit
                 .capacity_evidence()
                 .is_some_and(|evidence| evidence.profile() == profile)
+                || !commit
+                    .preparation()
+                    .is_some_and(|reservation| self.inner.preparation_admission.owns(reservation)))
         {
             return Err(PersistError::constraint_violation(
-                "configuration capacity evidence is required",
+                "configuration capacity evidence and store reservation are required",
             ));
         }
         Ok(())
@@ -1194,12 +1206,86 @@ impl ConsensusConfigStore {
         )
     }
 
+    /// Reserve one of this store's eight bounded preparation slots without
+    /// waiting. Legacy stores require no reservation and return `None`.
+    /// Call before allocating SDK-owned plaintext or recovery decode buffers.
+    pub fn try_reserve_config_preparation(
+        &self,
+    ) -> Result<Option<opc_crypto::ConfigPreparationReservation>, PersistError> {
+        match self.capacity_profile() {
+            opc_crypto::ConfigCapacityProfile::Legacy => Ok(None),
+            opc_crypto::ConfigCapacityProfile::BoundedV1 => self
+                .inner
+                .preparation_admission
+                .try_reserve()
+                .map(Some)
+                .map_err(|_| consensus_unavailable()),
+            _ => Err(consensus_unavailable()),
+        }
+    }
+
+    fn reserve_submission(&self) -> Result<SubmissionOwnership, PersistError> {
+        self.try_reserve_config_preparation()?
+            .map(|reservation| {
+                PreparationOwnership::new(reservation, None)
+                    .try_submit()
+                    .map(Arc::new)
+                    .map_err(|_| consensus_unavailable())
+            })
+            .transpose()
+    }
+
+    fn commit_submission(
+        &self,
+        evidence: Option<opc_crypto::ConfigCapacityEvidence>,
+        reservation: Option<opc_crypto::ConfigPreparationReservation>,
+    ) -> Result<SubmissionOwnership, PersistError> {
+        match reservation {
+            Some(reservation) => {
+                let owner = PreparationOwnership::new(reservation, evidence);
+                if self.capacity_profile() != opc_crypto::ConfigCapacityProfile::Legacy
+                    && !owner.belongs_to(
+                        &self.inner.preparation_admission,
+                        self.capacity_profile(),
+                        true,
+                    )
+                {
+                    return Err(PersistError::constraint_violation(
+                        "configuration capacity evidence and store reservation are required",
+                    ));
+                }
+                owner
+                    .try_submit()
+                    .map(|guard| Some(Arc::new(guard)))
+                    .map_err(|_| consensus_unavailable())
+            }
+            None if self.capacity_profile() == opc_crypto::ConfigCapacityProfile::Legacy => {
+                Ok(None)
+            }
+            None => Err(PersistError::constraint_violation(
+                "configuration capacity evidence and store reservation are required",
+            )),
+        }
+    }
+
     async fn submit_request(
         &self,
         request_id: opc_consensus::ConsensusRequestId,
         intent: ConfigMutationIntent,
     ) -> Result<ConfigConsensusResponse, PersistError> {
-        let result = self.submit_request_inner(request_id, intent).await;
+        self.submit_owned_request(request_id, intent, self.reserve_submission()?)
+            .await
+    }
+
+    async fn submit_owned_request(
+        &self,
+        request_id: opc_consensus::ConsensusRequestId,
+        intent: ConfigMutationIntent,
+        ownership: SubmissionOwnership,
+    ) -> Result<ConfigConsensusResponse, PersistError> {
+        let result = self
+            .submit_owned_request_inner(request_id, intent, ownership)
+            .await;
         let metric = if result.is_ok() {
             &opc_redaction::metrics::METRICS.persist_quorum_write_success
         } else {
@@ -1215,6 +1301,16 @@ impl ConsensusConfigStore {
         request_id: opc_consensus::ConsensusRequestId,
         intent: ConfigMutationIntent,
     ) -> Result<ConfigConsensusResponse, PersistError> {
+        self.submit_owned_request_on_local_leader(request_id, intent, self.reserve_submission()?)
+            .await
+    }
+
+    async fn submit_owned_request_on_local_leader(
+        &self,
+        request_id: opc_consensus::ConsensusRequestId,
+        intent: ConfigMutationIntent,
+        ownership: SubmissionOwnership,
+    ) -> Result<ConfigConsensusResponse, PersistError> {
         let result = async {
             preflight_config_command_replication_budget(self.inner.identity, request_id, &intent)
                 .map_err(ForwardMutationRejection::into_persist_error)?;
@@ -1228,7 +1324,10 @@ impl ConsensusConfigStore {
                 compatibility: self.peer_compatibility(),
                 budget: ForwardedBudget::from_deadline(deadline)?,
             };
-            match self.apply_on_local_leader(request, deadline).await {
+            match self
+                .apply_owned_on_local_leader(request, deadline, ownership)
+                .await
+            {
                 ForwardMutationReply::Applied(response) => Ok(*response),
                 ForwardMutationReply::Rejected(rejection) => Err(rejection.into_persist_error()),
                 ForwardMutationReply::OutcomeUnknown => Err(PersistError::outcome_unknown()),
@@ -1248,10 +1347,21 @@ impl ConsensusConfigStore {
         result
     }
 
+    #[cfg(test)]
     async fn submit_request_inner(
         &self,
         request_id: opc_consensus::ConsensusRequestId,
         intent: ConfigMutationIntent,
+    ) -> Result<ConfigConsensusResponse, PersistError> {
+        self.submit_owned_request_inner(request_id, intent, self.reserve_submission()?)
+            .await
+    }
+
+    async fn submit_owned_request_inner(
+        &self,
+        request_id: opc_consensus::ConsensusRequestId,
+        intent: ConfigMutationIntent,
+        ownership: SubmissionOwnership,
     ) -> Result<ConfigConsensusResponse, PersistError> {
         preflight_config_command_replication_budget(self.inner.identity, request_id, &intent)
             .map_err(ForwardMutationRejection::into_persist_error)?;
@@ -1288,15 +1398,11 @@ impl ConsensusConfigStore {
                 budget,
             };
             let reply = if leader == self.inner.local_node_id {
-                self.apply_on_local_leader(request.clone(), deadline).await
+                self.apply_owned_on_local_leader(request, deadline, ownership.clone())
+                    .await
             } else {
                 match self
-                    .call_peer::<_, ForwardMutationReply>(
-                        leader,
-                        ConsensusRpcFamily::ForwardMutation,
-                        &request,
-                        deadline,
-                    )
+                    .call_mutation_peer(leader, request, deadline, ownership.clone())
                     .await
                 {
                     Ok(reply) => reply,
@@ -1361,10 +1467,25 @@ impl ConsensusConfigStore {
         }
     }
 
+    #[cfg(test)]
     async fn apply_on_local_leader(
         &self,
         request: ForwardMutationRequest,
         deadline: tokio::time::Instant,
+    ) -> ForwardMutationReply {
+        let ownership = match self.reserve_submission() {
+            Ok(ownership) => ownership,
+            Err(_) => return ForwardMutationReply::Unavailable,
+        };
+        self.apply_owned_on_local_leader(request, deadline, ownership)
+            .await
+    }
+
+    async fn apply_owned_on_local_leader(
+        &self,
+        request: ForwardMutationRequest,
+        deadline: tokio::time::Instant,
+        ownership: SubmissionOwnership,
     ) -> ForwardMutationReply {
         if let Err(rejection) = preflight_config_command_replication_budget(
             self.inner.identity,
@@ -1440,6 +1561,7 @@ impl ConsensusConfigStore {
                 }
             };
             let _ = completion_tx.send(reply);
+            drop(ownership);
             drop(proposal_permit);
         });
         match tokio::time::timeout_at(deadline, completion_rx).await {
@@ -1491,6 +1613,45 @@ impl ConsensusConfigStore {
                 Err(_) => return Err(consensus_unavailable()),
             }
         }
+    }
+
+    async fn call_mutation_peer(
+        &self,
+        target: ConsensusNodeId,
+        request: ForwardMutationRequest,
+        deadline: tokio::time::Instant,
+        ownership: SubmissionOwnership,
+    ) -> Result<ForwardMutationReply, PersistError> {
+        let Some(ownership) = ownership else {
+            return self
+                .call_peer(
+                    target,
+                    ConsensusRpcFamily::ForwardMutation,
+                    &request,
+                    deadline,
+                )
+                .await;
+        };
+        // A cancelled caller cannot release the sender's buffers or alias
+        // guard while its in-flight transport still owns the exact request.
+        // The existing operation deadline bounds this one transport attempt.
+        // The receiver independently owns its decode and accepted proposal.
+        let store = self.clone();
+        tokio::spawn(async move {
+            let result = store
+                .call_peer(
+                    target,
+                    ConsensusRpcFamily::ForwardMutation,
+                    &request,
+                    deadline,
+                )
+                .await;
+            drop(request);
+            drop(ownership);
+            result
+        })
+        .await
+        .map_err(|_| PersistError::outcome_unknown())?
     }
 
     async fn call_peer<Req, Resp>(
@@ -1851,6 +2012,17 @@ impl ConsensusRpcHandler for ConfigConsensusService {
                         result: Err(ConsensusPeerError::ScopeMismatch),
                     };
                 }
+                let ownership = match self.store.reserve_submission() {
+                    Ok(ownership) => ownership,
+                    Err(_) => {
+                        return encode_service_reply_for_profile(
+                            self.store.capacity_profile(),
+                            &ForwardMutationReply::Rejected(
+                                ForwardMutationRejection::ResourceAdmission,
+                            ),
+                        )
+                    }
+                };
                 let forwarded: ForwardMutationRequest = match decode_config_wire_for_profile(
                     self.store.capacity_profile(),
                     &request.payload,
@@ -1871,7 +2043,10 @@ impl ConsensusRpcHandler for ConfigConsensusService {
                 };
                 encode_service_reply_for_profile(
                     self.store.capacity_profile(),
-                    &self.store.apply_on_local_leader(forwarded, deadline).await,
+                    &self
+                        .store
+                        .apply_owned_on_local_leader(forwarded, deadline, ownership)
+                        .await,
                 )
             }
             ConsensusRpcFamily::ReadBarrier => {
@@ -2065,6 +2240,9 @@ impl ConfigStore for ConsensusConfigStore {
 #[cfg(test)]
 mod tests {
     mod config_capacity_encoding_tests;
+    #[cfg(target_os = "linux")]
+    mod config_capacity_native_preparation_tests;
+    mod config_capacity_preparation_tests;
 
     use super::super::{
         ConfigConsensusClusterId, ConfigConsensusConfigurationEpoch, ConfigConsensusConfigurationId,

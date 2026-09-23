@@ -918,6 +918,14 @@ where
         self.consensus_store().capacity_profile()
     }
 
+    fn try_reserve_config_preparation(
+        &self,
+    ) -> Result<Option<opc_crypto::ConfigPreparationReservation>, StoreError> {
+        self.consensus_store()
+            .try_reserve_config_preparation()
+            .map_err(|_| StoreError::unavailable("configuration preparation admission unavailable"))
+    }
+
     fn required_audit_observations(&self) -> Option<Arc<dyn opc_mgmt_audit::AuditSink>> {
         self.audit
             .as_ref()

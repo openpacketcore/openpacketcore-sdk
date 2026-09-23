@@ -554,6 +554,24 @@ pub(crate) fn validate_sync(conn: &Connection, key: &AuditKey) -> io::Result<()>
 /// Authenticate once per read/apply transaction, before even a negative lookup
 /// or metadata-based admission decision. Per-row projection must not repeat the
 /// complete scan; it runs in this same authenticated SQLite snapshot instead.
+pub(crate) fn validate_access_for_profile_sync(
+    conn: &Connection,
+    key: &AuditKey,
+    consensus_required: bool,
+    capacity_profile: opc_crypto::ConfigCapacityProfile,
+    cancellation: &SqliteWorkCancellation,
+) -> io::Result<()> {
+    // Version-one history has no authenticated per-record size proof. A local
+    // authority selecting the bounded profile must never silently validate it
+    // as legacy, including an empty or absent history. Admission stays refused
+    // until the retained proof format and its qualification are implemented.
+    if capacity_profile != opc_crypto::ConfigCapacityProfile::Legacy {
+        return Err(corrupt());
+    }
+    validate_access_sync(conn, key, consensus_required, cancellation)
+}
+
+/// Authenticate legacy consensus history within its existing transaction.
 pub(crate) fn validate_access_sync(
     conn: &Connection,
     key: &AuditKey,

@@ -218,10 +218,11 @@ fn audited_boundary_command(
         identity: store.inner.identity,
         request_id,
         logical_time: maximum_encoded_config_timestamp().expect("maximum leader timestamp"),
-        intent: ConfigMutationIntent::AuditedMutation(crate::consensus::PreparedAuditedMutation {
-            handle,
-            effect,
-        }),
+        intent: ConfigMutationIntent::AuditedMutation(
+            crate::consensus::PreparedAuditedMutation::new(handle, effect, None)
+                .command()
+                .clone(),
+        ),
     }
 }
 
@@ -280,9 +281,9 @@ async fn config_capacity_957_audit_metadata_counts_at_exact_command_boundary() {
                 request_id: derive_durable_request_id(
                     store.inner.identity,
                     b"audit-config",
-                    &prepared.handle.mac,
+                    &prepared.handle().mac,
                 ),
-                intent: ConfigMutationIntent::AuditedMutation(prepared),
+                intent: ConfigMutationIntent::AuditedMutation(prepared.command().clone()),
                 ..oracle
             };
             assert_eq!(

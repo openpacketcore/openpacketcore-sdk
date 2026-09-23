@@ -2798,7 +2798,7 @@ fn apply_audited_mutation_sync(
     conn: &Connection,
     key: &AuditKey,
     identity: ConsensusIdentity,
-    prepared: &super::PreparedAuditedMutation,
+    prepared: &super::audit_mutation::AuditedConfigCommand,
     audit_keys: Option<&crate::audit_authority::continuity::AuditKeyRing>,
     logical_time: Timestamp,
     request_id: opc_consensus::ConsensusRequestId,
