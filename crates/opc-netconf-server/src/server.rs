@@ -463,13 +463,9 @@ impl<C: Clone> CandidateDatastore<C> {
         self.lock = lock;
     }
 
-    fn discard_generation(&mut self, generation: &Arc<()>) {
+    fn discard_generation(&mut self, _generation: &Arc<()>) {
         self.prune_released();
-        if self
-            .snapshot
-            .as_ref()
-            .is_some_and(|snapshot| Arc::ptr_eq(&snapshot.generation, generation))
-        {
+        if self.snapshot.is_some() {
             self.discard();
         }
     }
