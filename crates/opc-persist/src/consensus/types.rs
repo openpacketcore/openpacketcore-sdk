@@ -598,6 +598,9 @@ mod config_capacity_wire_tests;
 #[cfg(test)]
 mod config_capacity_command_layout_tests;
 
+#[cfg(test)]
+mod config_capacity_tokenization_tests;
+
 /// Persisted result returned after durable quorum commit and local apply.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) struct ConfigConsensusResponse {
@@ -854,6 +857,8 @@ pub(crate) fn tokenize_audit_path(
         ));
     }
     output.push_str(remainder);
+    #[cfg(test)]
+    config_capacity_tokenization_tests::observe_capacity(output.capacity());
     if output.len() > CONFIG_AUDIT_PATH_MAX_BYTES {
         return Err(PersistError::constraint_violation(
             "tokenized audit YANG path exceeds durable limit",
