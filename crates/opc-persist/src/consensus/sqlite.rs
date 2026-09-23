@@ -3399,7 +3399,9 @@ fn sealed_ciphertext_column<'row>(
     index: usize,
 ) -> rusqlite::Result<std::borrow::Cow<'row, [u8]>> {
     match row.get_ref(index)? {
-        rusqlite::types::ValueRef::Blob(encrypted) => Ok(std::borrow::Cow::Borrowed(encrypted)),
+        rusqlite::types::ValueRef::Blob(encrypted) => {
+            Ok(std::borrow::Cow::Owned(encrypted.to_vec()))
+        }
         _ => Err(rusqlite::Error::InvalidColumnType(
             index,
             "encrypted_blob".to_owned(),
