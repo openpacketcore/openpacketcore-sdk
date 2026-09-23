@@ -268,3 +268,113 @@ fn config_capacity_957_input_combined_capacities() {
         "CONFIG_CAPACITY_TRANSFERRED_INPUT: combined transferred allocations exceed the entire proposed operation bound",
     );
 }
+
+fn expanding_path_fixture() -> (CommitRecord, Vec<AuditRecord>, CapacityRecordBinding) {
+    let (record, mut audit, binding) = fixture();
+    let mut path = String::from("/fixture:capacity");
+    // Distinct synthetic keys avoid relying on duplicate-predicate handling.
+    for index in 0..64 {
+        use std::fmt::Write as _;
+        write!(&mut path, "[key{index}='x']").expect("synthetic path");
+    }
+    audit[0].yang_path = path;
+    (record, audit, binding)
+}
+
+#[test]
+fn config_capacity_957_input_finalized_result_allocations() {
+    // Qualify the exact content shape before modifying only spare capacity.
+    let (record, audit, binding) = expanding_path_fixture();
+    let compact = PreparedConfigCommit::prepare_for_profile(record, audit, &key(), PROFILE)
+        .expect("compact expanding path is preparable");
+    compact.validate().expect("compact finalized structure");
+    binding
+        .verify(&compact.record, identity(), &key(), PROFILE)
+        .expect("compact scoped encryption proof");
+    assert_eq!(compact.audit.len(), 1);
+    assert!(compact.audit[0].yang_path.len() <= 8192);
+    crate::StoredConfig {
+        record: compact.record,
+        audit: compact.audit,
+    }
+    .verify_audit_chain(&key())
+    .expect("compact expanding path authenticates");
+
+    let (mut record, audit, binding) = expanding_path_fixture();
+    let before = serde_json::to_vec(&(&record, &audit)).expect("compact content oracle");
+    assert!(before.len() < 4096);
+    // This is a fixture admission precondition, not the failure oracle. Count
+    // every transferred allocation to leave 1 KiB below the proposed whole
+    // allowance. The oracle below needs only two actual returned capacities.
+    let mut other_input_bytes = std::mem::size_of::<PreparedConfigCommit>();
+    for capacity in [
+        record.plaintext_digest.capacity(),
+        record.principal.capacity(),
+        audit.capacity() * std::mem::size_of::<AuditRecord>(),
+        audit[0].yang_path.capacity(),
+        audit[0]
+            .previous_value
+            .as_ref()
+            .expect("synthetic before")
+            .capacity(),
+        audit[0]
+            .new_value
+            .as_ref()
+            .expect("synthetic after")
+            .capacity(),
+    ] {
+        other_input_bytes = other_input_bytes
+            .checked_add(capacity)
+            .expect("finite fixture accounting");
+    }
+    let target = OPERATION_BYTES
+        .checked_sub(1024)
+        .and_then(|bytes| bytes.checked_sub(other_input_bytes))
+        .expect("fixture leaves positive envelope capacity");
+    record
+        .encrypted_blob
+        .try_reserve_exact(target - record.encrypted_blob.len())
+        .expect("capacity fixture allocation");
+    let input_capacity = record
+        .encrypted_blob
+        .capacity()
+        .checked_add(other_input_bytes)
+        .expect("finite transferred input");
+    assert_eq!(input_capacity, OPERATION_BYTES - 1024);
+    assert!(
+        serde_json::to_vec(&(&record, &audit)).expect("unchanged content oracle") == before,
+        "capacity reservation changes no encrypted or audit bytes",
+    );
+    drop(before);
+
+    // Directly transfer the original allocations. Rejection is valid; an
+    // accepted result cannot itself exceed the entire operation allowance.
+    let prepared = match PreparedConfigCommit::prepare_for_profile(record, audit, &key(), PROFILE) {
+        Err(_) => return,
+        Ok(prepared) => prepared,
+    };
+    prepared.validate().expect("accepted finalized structure");
+    binding
+        .verify(&prepared.record, identity(), &key(), PROFILE)
+        .expect("accepted exact encryption proof");
+    let stored = crate::StoredConfig {
+        record: prepared.record,
+        audit: prepared.audit,
+    };
+    stored
+        .verify_audit_chain(&key())
+        .expect("accepted finalized chain authenticates");
+    assert_eq!(stored.audit.len(), 1);
+    let envelope_capacity = stored.record.encrypted_blob.capacity();
+    let finalized_path_capacity = stored.audit[0].yang_path.capacity();
+    let retained_lower_bound = envelope_capacity
+        .checked_add(finalized_path_capacity)
+        .expect("two simultaneously retained capacities");
+    eprintln!(
+        "CONFIG_CAPACITY_FINALIZED_INPUT input_capacity={input_capacity} envelope_capacity={envelope_capacity} finalized_path_capacity={finalized_path_capacity} retained_lower_bound={retained_lower_bound} proposed_operation_bound={OPERATION_BYTES}"
+    );
+    assert!(
+        retained_lower_bound <= OPERATION_BYTES,
+        "CONFIG_CAPACITY_FINALIZED_INPUT: two accepted result allocations exceed the entire proposed operation bound",
+    );
+}
