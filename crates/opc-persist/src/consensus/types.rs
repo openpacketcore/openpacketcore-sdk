@@ -1,7 +1,6 @@
 //! Config state-machine commands built on the shared consensus substrate.
 
 use std::collections::BTreeSet;
-use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -791,10 +790,54 @@ pub(crate) fn tokenize_audit_path(
             "audit YANG path is not canonically representable",
         ));
     }
-    let mut output = String::with_capacity(path.len());
+    #[cfg(test)]
+    config_capacity_tokenization_tests::observe_capacity(0);
+    // Count the exact emitted bytes with the same immutable input and emitter.
+    // Reject expansion before allocating its output, then reserve only its exact
+    // successful length. Ordinary String growth can otherwise exceed the field
+    // limit even for an accepted final path.
+    let mut counted = AuditPathByteCount(0);
+    write_tokenized_audit_path(path, audit_key, &mut counted)?;
+    let mut output = String::new();
+    output
+        .try_reserve_exact(counted.0)
+        .map_err(|_| PersistError::unavailable())?;
+    write_tokenized_audit_path(path, audit_key, &mut output)?;
+    #[cfg(test)]
+    config_capacity_tokenization_tests::observe_capacity(output.capacity());
+    if output.len() > CONFIG_AUDIT_PATH_MAX_BYTES {
+        return Err(tokenized_path_too_large());
+    }
+    Ok(output)
+}
+
+struct AuditPathByteCount(usize);
+
+impl std::fmt::Write for AuditPathByteCount {
+    fn write_str(&mut self, value: &str) -> std::fmt::Result {
+        self.0 = self
+            .0
+            .checked_add(value.len())
+            .filter(|bytes| *bytes <= CONFIG_AUDIT_PATH_MAX_BYTES)
+            .ok_or(std::fmt::Error)?;
+        Ok(())
+    }
+}
+
+fn tokenized_path_too_large() -> PersistError {
+    PersistError::constraint_violation("tokenized audit YANG path exceeds durable limit")
+}
+
+fn write_tokenized_audit_path(
+    path: &str,
+    audit_key: &crate::types::AuditKey,
+    output: &mut impl std::fmt::Write,
+) -> Result<(), PersistError> {
     let mut remainder = path;
     while let Some(open) = remainder.find('[') {
-        output.push_str(&remainder[..open + 1]);
+        output
+            .write_str(&remainder[..open + 1])
+            .map_err(|_| tokenized_path_too_large())?;
         remainder = &remainder[open + 1..];
         let close = remainder.find(']').ok_or_else(|| {
             PersistError::constraint_violation("audit YANG predicate is malformed")
@@ -844,11 +887,13 @@ pub(crate) fn tokenize_audit_path(
         mac.update(value.as_bytes());
         let token = mac.finalize().into_bytes();
         write!(output, "{key}='{AUDIT_PATH_TOKEN_PREFIX}")
-            .map_err(|_| PersistError::audit_chain_broken())?;
+            .map_err(|_| tokenized_path_too_large())?;
         for byte in token {
-            write!(output, "{byte:02x}").map_err(|_| PersistError::audit_chain_broken())?;
+            write!(output, "{byte:02x}").map_err(|_| tokenized_path_too_large())?;
         }
-        output.push_str("']");
+        output
+            .write_str("']")
+            .map_err(|_| tokenized_path_too_large())?;
         remainder = &remainder[close + 1..];
     }
     if remainder.contains(']') {
@@ -856,15 +901,10 @@ pub(crate) fn tokenize_audit_path(
             "audit YANG predicate is malformed",
         ));
     }
-    output.push_str(remainder);
-    #[cfg(test)]
-    config_capacity_tokenization_tests::observe_capacity(output.capacity());
-    if output.len() > CONFIG_AUDIT_PATH_MAX_BYTES {
-        return Err(PersistError::constraint_violation(
-            "tokenized audit YANG path exceeds durable limit",
-        ));
-    }
-    Ok(output)
+    output
+        .write_str(remainder)
+        .map_err(|_| tokenized_path_too_large())?;
+    Ok(())
 }
 
 pub(crate) fn audit_path_is_safe(path: &str) -> bool {
