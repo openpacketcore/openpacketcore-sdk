@@ -2281,6 +2281,7 @@ impl ConfigStore for ConsensusConfigStore {
 #[cfg(test)]
 mod tests {
     mod config_capacity_encoding_tests;
+    mod config_capacity_metadata_tests;
     #[cfg(target_os = "linux")]
     mod config_capacity_native_preparation_tests;
     mod config_capacity_preparation_tests;
