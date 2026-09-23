@@ -815,11 +815,7 @@ struct AuditPathByteCount(usize);
 
 impl std::fmt::Write for AuditPathByteCount {
     fn write_str(&mut self, value: &str) -> std::fmt::Result {
-        self.0 = self
-            .0
-            .checked_add(value.len())
-            .filter(|bytes| *bytes <= CONFIG_AUDIT_PATH_MAX_BYTES)
-            .ok_or(std::fmt::Error)?;
+        self.0 = self.0.checked_add(value.len()).ok_or(std::fmt::Error)?;
         Ok(())
     }
 }
