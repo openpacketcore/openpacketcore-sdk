@@ -403,7 +403,7 @@ fn preflight_preparation_capacity(
         validate_audit_path_input(&entry.yang_path)?;
         let mut finalized_bytes = AuditPathByteCount(0);
         write_tokenized_audit_path(&entry.yang_path, audit_key, &mut finalized_bytes)?;
-        charge(finalized_bytes.0)?;
+        charge(entry.yang_path.len())?;
         if entry.previous_value.is_some() {
             charge(REDACTED_AUDIT_VALUE.len())?;
         }
