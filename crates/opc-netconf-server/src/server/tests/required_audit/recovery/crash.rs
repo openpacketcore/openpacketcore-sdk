@@ -10,6 +10,8 @@ use std::process::Stdio;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{UnixListener, UnixStream};
 
+mod provider_restart;
+
 const CHILD_ROOT: &str = "OPC_NETCONF_AUDIT_CRASH_ROOT";
 const CHECKPOINT_SOCKET: &str = "OPC_NETCONF_AUDIT_CHECKPOINT_SOCKET";
 const CHILD_TEST: &str =
@@ -335,6 +337,18 @@ async fn assert_original_terminal(owner: &Owner, original: &CommittedIdentity) {
     assert!(
         handle["body"]["event"]["transaction"] == serde_json::to_value(transaction).unwrap(),
         "crash recovery changed the projected effect"
+    );
+    // The fixture RPC changes this one schema leaf. Check original protocol
+    // attribution separately from the request/transaction and completion rows.
+    let paths = privacy
+        .project(
+            AuditPrivacyPurpose::SchemaPaths,
+            &[b"/sys:system/sys:hostname"],
+        )
+        .unwrap();
+    assert!(
+        handle["body"]["event"]["paths"] == serde_json::to_value(paths).unwrap(),
+        "crash recovery lost protocol schema-path attribution"
     );
     for terminal in ["outcome", "terminal"] {
         assert_eq!(
