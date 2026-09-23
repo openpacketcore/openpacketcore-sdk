@@ -292,3 +292,107 @@ async fn config_capacity_957_history_retention_boundary_borrows_ciphertext() {
     .expect("retained schema and original parent");
     assert_borrowed(observation.finish(), &[0, 1, 2]);
 }
+
+fn assert_sealed_borrowed(sample: super::config_capacity_sealed_buffers::Sample, rows: usize) {
+    assert_eq!(
+        sample.calls, rows,
+        "every expected sealed record was reached"
+    );
+    assert_eq!(
+        sample.peak_owned_ciphertext, 0,
+        "sealed validation must not own a ciphertext copy"
+    );
+}
+
+#[tokio::test]
+async fn config_capacity_957_sealed_validation_borrows_ciphertext() {
+    let fixture = fixture().await;
+    let shared = fixture.backend.conn();
+    let conn = shared.lock().await;
+    let tx = conn.unchecked_transaction().expect("pinned validation");
+    let observation = super::config_capacity_sealed_buffers::Observation::start();
+    validate_sealed_state_sync(&tx, &fixture.key, &SqliteWorkCancellation::new())
+        .expect("sealed native records");
+    assert_sealed_borrowed(observation.finish(), 3);
+    let decision = ConfigHistoryRetention::new(
+        tx_id(3),
+        ConfigVersion::new(3),
+        ConfigVersion::new(1),
+        ConfigVersion::new(2),
+        ConfigHistoryLimits::new(2, 1024 * 1024).expect("unchanged retention limits"),
+    )
+    .expect("acknowledged prefix");
+    super::super::history::retain_sync(
+        &tx,
+        &fixture.key,
+        &decision,
+        &SqliteWorkCancellation::new(),
+    )
+    .expect("retention storage")
+    .expect("admitted retention");
+    let observation = super::config_capacity_sealed_buffers::Observation::start();
+    validate_sealed_state_sync(&tx, &fixture.key, &SqliteWorkCancellation::new())
+        .expect("sealed boundary restores original AEAD parent");
+    assert_sealed_borrowed(observation.finish(), 2);
+    tx.commit().expect("durable retained prefix");
+    drop(conn);
+    drop(shared);
+    drop(fixture.backend);
+    let reopened = SqliteBackend::reopen_config_authority(fixture.options, fixture.key.clone())
+        .await
+        .expect("native retained reopen");
+    let shared = reopened.conn();
+    let conn = shared.lock().await;
+    let tx = conn
+        .unchecked_transaction()
+        .expect("pinned retained reopen");
+    let observation = super::config_capacity_sealed_buffers::Observation::start();
+    validate_retained_schema(
+        &tx,
+        &fixture.topology,
+        &fixture.key,
+        ConfigCapacityProfile::Legacy,
+        std::time::Instant::now() + Duration::from_secs(10),
+    )
+    .expect("retained schema and original parent");
+    assert_sealed_borrowed(observation.finish(), 2);
+    tx.commit().expect("finish reopened read");
+}
+
+#[tokio::test]
+async fn config_capacity_957_sealed_rejection_borrows_ciphertext() {
+    let fixture = fixture().await;
+    let shared = fixture.backend.conn();
+    let conn = shared.lock().await;
+    let tx = conn
+        .unchecked_transaction()
+        .expect("pinned negative fixture");
+    tx.execute(
+        "UPDATE config_history SET encrypted_blob = zeroblob(length(encrypted_blob)) WHERE version = 2",
+        [],
+    )
+    .expect("synthetic malformed middle envelope");
+    // This test owns the synthetic signing key. Deliberately reauthenticate
+    // the changed history so the negative reaches sealed-envelope validation.
+    // It does not claim that ordinary on-disk corruption can reauthenticate.
+    super::super::history::refresh_sync(&tx, &fixture.key, true, &SqliteWorkCancellation::new())
+        .expect("synthetic history authentication")
+        .expect("within original history bounds");
+    super::super::history::validate_access_sync(
+        &tx,
+        &fixture.key,
+        true,
+        &SqliteWorkCancellation::new(),
+    )
+    .expect("negative reaches envelope validation after authenticated history");
+    let observation = super::config_capacity_sealed_buffers::Observation::start();
+    let error = validate_sealed_state_sync(&tx, &fixture.key, &SqliteWorkCancellation::new())
+        .expect_err("malformed envelope must be rejected");
+    let sample = observation.finish();
+    assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
+    assert_sealed_borrowed(sample, 2);
+    // Roll back fixture tampering; no negative-path mutation is committed.
+    tx.rollback().expect("restore original fixture");
+    validate_sealed_state_sync(&conn, &fixture.key, &SqliteWorkCancellation::new())
+        .expect("original retained records remain valid");
+}

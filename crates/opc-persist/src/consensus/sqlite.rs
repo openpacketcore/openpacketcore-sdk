@@ -3227,6 +3227,8 @@ fn validate_sealed_state_sync(
             audit_count,
             terminal_hash,
         ) = row.map_err(db_error)?;
+        #[cfg(test)]
+        config_capacity_sealed_buffers::observe(&encrypted_blob);
         let parent_tx_id =
             super::history::original_parent_sync(conn, audit_key, &tx_id, version, parent_tx_id)?;
         if tx_id.len() != 16
@@ -5557,3 +5559,7 @@ mod tests {
 #[cfg(test)]
 #[path = "sqlite/config_capacity_history_reader_tests.rs"]
 mod config_capacity_history_reader_tests;
+
+#[cfg(test)]
+#[path = "sqlite/config_capacity_sealed_buffers.rs"]
+mod config_capacity_sealed_buffers;
