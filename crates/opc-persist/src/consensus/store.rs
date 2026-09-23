@@ -44,8 +44,8 @@ use super::preparation::{PreparationOwnership, SubmissionOwnership};
 use super::raft_adapter::{ConfigRaftAdapterError, ConfigRaftNetworkFactory, ConfigRaftRpcHandler};
 use super::storage::{self, ConfigConsensusStorageError};
 use super::types::{
-    config_wire_revision, decode_config_wire_for_profile, encode_config_wire_for_profile,
-    ValidatedRollbackLabel,
+    config_command_revision, config_wire_revision, decode_config_wire_for_profile,
+    encode_config_wire_for_profile, ValidatedRollbackLabel,
 };
 #[cfg(test)]
 use super::types::{decode_config_wire, encode_config_wire};
@@ -516,8 +516,13 @@ impl ConsensusConfigStore {
         )
         .await
         .map_err(|_| ConfigConsensusOpenError::EngineUnavailable)?;
-        let raft_handler =
-            ConfigRaftRpcHandler::new(raft.clone(), identity, local_node_id, capacity_profile);
+        let raft_handler = ConfigRaftRpcHandler::new(
+            raft.clone(),
+            identity,
+            local_node_id,
+            capacity_profile,
+            backend.audit_key().clone(),
+        );
         let linearizability = EnsureLinearizableSupervisor::new(raft.clone());
         Ok(Self {
             inner: Arc::new(ConsensusConfigStoreInner {
@@ -866,17 +871,12 @@ impl ConsensusConfigStore {
         commit: AttestedConfigCommit,
     ) -> Result<(), PersistError> {
         self.require_commit_capacity(&commit)?;
+        let binding = self.issue_capacity_binding(&commit)?;
         let (record, audit, resolution, evidence, reservation) = commit.into_capacity_parts();
         let ownership = self.commit_submission(evidence, reservation)?;
         let prepared =
             PreparedConfigCommit::prepare(record, audit, self.inner.backend.audit_key())?;
-        let intent = match resolution {
-            Some(resolution) => ConfigMutationIntent::ResolveConfirmedAndAppend {
-                commit: Box::new(prepared),
-                resolution,
-            },
-            None => ConfigMutationIntent::AppendCommit(Box::new(prepared)),
-        };
+        let intent = ConfigMutationIntent::prepared_append(prepared, resolution, binding);
         self.submit_owned_request(request_id, intent, ownership)
             .await?
             .into_result()
@@ -891,17 +891,12 @@ impl ConsensusConfigStore {
         commit: AttestedConfigCommit,
     ) -> Result<(), PersistError> {
         self.require_commit_capacity(&commit)?;
+        let binding = self.issue_capacity_binding(&commit)?;
         let (record, audit, resolution, evidence, reservation) = commit.into_capacity_parts();
         let ownership = self.commit_submission(evidence, reservation)?;
         let prepared =
             PreparedConfigCommit::prepare(record, audit, self.inner.backend.audit_key())?;
-        let intent = match resolution {
-            Some(resolution) => ConfigMutationIntent::ResolveConfirmedAndAppend {
-                commit: Box::new(prepared),
-                resolution,
-            },
-            None => ConfigMutationIntent::AppendCommit(Box::new(prepared)),
-        };
+        let intent = ConfigMutationIntent::prepared_append(prepared, resolution, binding);
         self.submit_owned_request_on_local_leader(request_id, intent, ownership)
             .await?
             .into_result()
@@ -1137,7 +1132,7 @@ impl ConsensusConfigStore {
     fn peer_compatibility(&self) -> ConfigPeerCompatibility {
         ConfigPeerCompatibility {
             wire_version: config_wire_revision(self.capacity_profile()),
-            command_version: super::CONFIG_CONSENSUS_COMMAND_VERSION,
+            command_version: config_command_revision(self.capacity_profile()),
             audit_key_epoch: self.inner.backend.audit_key().epoch(),
             audit_key_fingerprint: self.inner.backend.audit_key().fingerprint(),
         }
@@ -1195,6 +1190,22 @@ impl ConsensusConfigStore {
             ));
         }
         Ok(())
+    }
+
+    fn issue_capacity_binding(
+        &self,
+        commit: &AttestedConfigCommit,
+    ) -> Result<Option<super::capacity_record::CapacityRecordBinding>, PersistError> {
+        match self.capacity_profile() {
+            opc_crypto::ConfigCapacityProfile::Legacy => Ok(None),
+            profile => super::capacity_record::CapacityRecordBinding::issue(
+                commit,
+                self.inner.identity,
+                self.inner.backend.audit_key(),
+                profile,
+            )
+            .map(Some),
+        }
     }
 
     /// Immutable configuration byte profile admitted by this retained authority.
@@ -1312,6 +1323,11 @@ impl ConsensusConfigStore {
         ownership: SubmissionOwnership,
     ) -> Result<ConfigConsensusResponse, PersistError> {
         let result = async {
+            intent.validate_capacity(
+                self.inner.identity,
+                self.inner.backend.audit_key(),
+                self.capacity_profile(),
+            )?;
             preflight_config_command_replication_budget(self.inner.identity, request_id, &intent)
                 .map_err(ForwardMutationRejection::into_persist_error)?;
             self.require_admission()?;
@@ -1363,6 +1379,11 @@ impl ConsensusConfigStore {
         intent: ConfigMutationIntent,
         ownership: SubmissionOwnership,
     ) -> Result<ConfigConsensusResponse, PersistError> {
+        intent.validate_capacity(
+            self.inner.identity,
+            self.inner.backend.audit_key(),
+            self.capacity_profile(),
+        )?;
         preflight_config_command_replication_budget(self.inner.identity, request_id, &intent)
             .map_err(ForwardMutationRejection::into_persist_error)?;
         self.require_admission()?;
@@ -1487,6 +1508,17 @@ impl ConsensusConfigStore {
         deadline: tokio::time::Instant,
         ownership: SubmissionOwnership,
     ) -> ForwardMutationReply {
+        if request
+            .intent
+            .validate_capacity(
+                self.inner.identity,
+                self.inner.backend.audit_key(),
+                self.capacity_profile(),
+            )
+            .is_err()
+        {
+            return ForwardMutationReply::Rejected(ForwardMutationRejection::InvalidCommand);
+        }
         if let Err(rejection) = preflight_config_command_replication_budget(
             self.inner.identity,
             request.request_id,
@@ -1524,13 +1556,20 @@ impl ConsensusConfigStore {
             _ => return ForwardMutationReply::Unavailable,
         }
         let command = super::ConfigConsensusCommand {
-            schema_version: super::CONFIG_CONSENSUS_COMMAND_VERSION,
+            schema_version: config_command_revision(self.capacity_profile()),
             identity: self.inner.identity,
             request_id: request.request_id,
             logical_time: self.inner.clock.now_utc(),
             intent: request.intent,
         };
-        if command.validate(self.inner.identity).is_err() {
+        if command
+            .validate_for_profile(
+                self.inner.identity,
+                self.inner.backend.audit_key(),
+                self.capacity_profile(),
+            )
+            .is_err()
+        {
             return ForwardMutationReply::Rejected(ForwardMutationRejection::InvalidCommand);
         }
         if !config_command_fits_replication_budget(&command) {
@@ -1904,7 +1943,9 @@ fn preflight_config_command_replication_budget(
     // makes admission independent of the current clock value while retaining
     // the exact command shape and field order.
     let probe = ConfigConsensusCommandSizeProbe {
-        schema_version: super::CONFIG_CONSENSUS_COMMAND_VERSION,
+        schema_version: intent
+            .minimum_command_version()
+            .max(super::CONFIG_CONSENSUS_COMMAND_VERSION),
         identity,
         request_id,
         logical_time: maximum_encoded_config_timestamp()

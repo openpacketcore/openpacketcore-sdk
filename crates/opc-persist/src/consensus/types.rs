@@ -452,10 +452,17 @@ pub(crate) enum ConfigMutationIntent {
     ManagementAudit(Box<super::audit::AuditCommand>),
     /// Exact configuration effect and recoverable audit outcome, applied atomically.
     AuditedMutation(super::audit_mutation::AuditedConfigCommand),
+    /// Append with a size proof issued from the paired encryption evidence.
+    /// This stays last: legacy postcard indices and durable JSON are unchanged.
+    BoundedAppend {
+        commit: Box<PreparedConfigCommit>,
+        binding: super::capacity_record::CapacityRecordBinding,
+        resolution: Option<ConfirmedCommitResolution>,
+    },
 }
 
 impl ConfigMutationIntent {
-    fn minimum_command_version(&self) -> u16 {
+    pub(super) fn minimum_command_version(&self) -> u16 {
         match self {
             Self::AppendCommit(_)
             | Self::MarkConfirmed { .. }
@@ -464,7 +471,8 @@ impl ConfigMutationIntent {
                 ATOMIC_CONFIG_CONSENSUS_COMMAND_VERSION
             }
             Self::RetainHistory(_) => 4,
-            Self::AuditedMutation(_) => 5,
+            Self::BoundedAppend { .. } => 8,
+            Self::AuditedMutation(prepared) => prepared.effect.minimum_command_version(),
             Self::ManagementAudit(command) => match command.as_ref() {
                 super::audit::AuditCommand::Initialize { .. }
                 | super::audit::AuditCommand::Intent(_)
@@ -476,9 +484,62 @@ impl ConfigMutationIntent {
         }
     }
 
+    pub(super) fn prepared_append(
+        commit: PreparedConfigCommit,
+        resolution: Option<ConfirmedCommitResolution>,
+        binding: Option<super::capacity_record::CapacityRecordBinding>,
+    ) -> Self {
+        match (binding, resolution) {
+            (Some(binding), resolution) => Self::BoundedAppend {
+                commit: Box::new(commit),
+                binding,
+                resolution,
+            },
+            (None, Some(resolution)) => Self::ResolveConfirmedAndAppend {
+                commit: Box::new(commit),
+                resolution,
+            },
+            (None, None) => Self::AppendCommit(Box::new(commit)),
+        }
+    }
+
+    /// Enforce the admitted authority's profile without trusting the incoming
+    /// command revision or its record proof to select that profile.
+    pub(super) fn validate_capacity(
+        &self,
+        identity: ConfigConsensusIdentity,
+        key: &crate::AuditKey,
+        profile: opc_crypto::ConfigCapacityProfile,
+    ) -> Result<(), PersistError> {
+        use opc_crypto::ConfigCapacityProfile;
+        if !matches!(
+            profile,
+            ConfigCapacityProfile::Legacy | ConfigCapacityProfile::BoundedV1
+        ) {
+            return Err(PersistError::corrupt_blob());
+        }
+        match self {
+            Self::BoundedAppend {
+                commit, binding, ..
+            } => binding.verify(&commit.record, identity, key, profile),
+            Self::AppendCommit(_) | Self::ResolveConfirmedAndAppend { .. }
+                if profile != ConfigCapacityProfile::Legacy =>
+            {
+                Err(PersistError::corrupt_blob())
+            }
+            Self::AuditedMutation(prepared) => prepared
+                .effect
+                .verify_capacity(identity, key, profile)
+                .map(|_| ()),
+            _ => Ok(()),
+        }
+    }
+
     fn inline_rollback_label(&self) -> Result<Option<String>, PersistError> {
         match self {
-            Self::AppendCommit(commit) | Self::ResolveConfirmedAndAppend { commit, .. } => {
+            Self::AppendCommit(commit)
+            | Self::ResolveConfirmedAndAppend { commit, .. }
+            | Self::BoundedAppend { commit, .. } => {
                 crate::types::config_rollback_label(&commit.record.principal)
             }
             Self::MarkConfirmed { .. }
@@ -558,6 +619,26 @@ impl ConfigConsensusCommand {
 
     /// Validate scope, schema, and encrypted command contents.
     pub(crate) fn validate(&self, identity: ConsensusIdentity) -> Result<(), PersistError> {
+        // Bound the new record's framing before the general record/AAD or
+        // principal projection decoders can allocate from untrusted lengths.
+        match &self.intent {
+            ConfigMutationIntent::BoundedAppend {
+                commit, binding, ..
+            } => {
+                binding.validate(&commit.record)?;
+            }
+            ConfigMutationIntent::AuditedMutation(prepared) => {
+                if let super::audit_mutation::AuditedConfigEffect::BoundedAppend {
+                    commit,
+                    binding,
+                    ..
+                } = &prepared.effect
+                {
+                    binding.validate(&commit.record)?;
+                }
+            }
+            _ => {}
+        }
         let has_inline_rollback_label = self.intent.inline_rollback_label()?.is_some();
         let supported_revision = match self.schema_version {
             LEGACY_CONFIG_CONSENSUS_COMMAND_VERSION => {
@@ -572,7 +653,10 @@ impl ConfigConsensusCommand {
             4 => self.intent.minimum_command_version() <= 4,
             5 => self.intent.minimum_command_version() <= 5,
             6 => self.intent.minimum_command_version() <= 6,
-            CONFIG_CONSENSUS_COMMAND_VERSION => true,
+            CONFIG_CONSENSUS_COMMAND_VERSION => {
+                self.intent.minimum_command_version() <= CONFIG_CONSENSUS_COMMAND_VERSION
+            }
+            8 => self.intent.minimum_command_version() <= 8,
             _ => false,
         };
         if !supported_revision || self.identity != identity {
@@ -586,15 +670,33 @@ impl ConfigConsensusCommand {
                 commit.validate()?;
                 validate_confirmed_resolution(&commit.record, *resolution)?;
             }
+            ConfigMutationIntent::BoundedAppend {
+                commit, resolution, ..
+            } => {
+                commit.validate()?;
+                if let Some(resolution) = resolution {
+                    validate_confirmed_resolution(&commit.record, *resolution)?;
+                }
+            }
             ConfigMutationIntent::RetainHistory(retention) => retention.validate()?,
             ConfigMutationIntent::ManagementAudit(_) => {}
             ConfigMutationIntent::AuditedMutation(prepared) => {
-                // The outer revision check requires revision 5 or later, so
-                // every closed audited effect's revision is already supported.
+                // The outer revision check accounts for the effect's revision.
                 // Preserve the inner validation order without materializing a
                 // second owned intent and copying its complete encrypted record.
                 match &prepared.effect {
                     super::audit_mutation::AuditedConfigEffect::Append { commit, resolution } => {
+                        crate::types::config_rollback_label(&commit.record.principal)?;
+                        commit.validate()?;
+                        if let Some(resolution) = resolution {
+                            validate_confirmed_resolution(&commit.record, *resolution)?;
+                        }
+                    }
+                    super::audit_mutation::AuditedConfigEffect::BoundedAppend {
+                        commit,
+                        resolution,
+                        ..
+                    } => {
                         crate::types::config_rollback_label(&commit.record.principal)?;
                         commit.validate()?;
                         if let Some(resolution) = resolution {
@@ -614,6 +716,27 @@ impl ConfigConsensusCommand {
             }
         }
         Ok(())
+    }
+
+    pub(super) fn validate_for_profile(
+        &self,
+        identity: ConfigConsensusIdentity,
+        key: &crate::AuditKey,
+        profile: opc_crypto::ConfigCapacityProfile,
+    ) -> Result<(), PersistError> {
+        self.validate(identity)?;
+        if self.schema_version > config_command_revision(profile) {
+            return Err(PersistError::corrupt_blob());
+        }
+        self.intent.validate_capacity(identity, key, profile)
+    }
+}
+
+pub(super) fn config_command_revision(profile: opc_crypto::ConfigCapacityProfile) -> u16 {
+    match profile {
+        opc_crypto::ConfigCapacityProfile::Legacy => CONFIG_CONSENSUS_COMMAND_VERSION,
+        opc_crypto::ConfigCapacityProfile::BoundedV1 => 8,
+        _ => 0,
     }
 }
 
@@ -878,17 +1001,24 @@ pub(super) fn validate_encrypted_record_view(
 }
 
 fn validate_record_representability(record: &CommitRecord) -> Result<(), PersistError> {
+    validate_record_metadata_view(ConfigRecordView::from(record))?;
+    validate_encrypted_record(record)
+}
+
+pub(super) fn validate_record_metadata_view(
+    record: ConfigRecordView<'_>,
+) -> Result<(), PersistError> {
     if record.version.get() > i64::MAX as u64
         || record.principal.is_empty()
         || record.principal.len() > CONFIG_PRINCIPAL_MAX_BYTES
         || record.principal.chars().any(char::is_control)
-        || !crate::types::config_principal_metadata_is_valid(&record.principal)
+        || !crate::types::config_principal_metadata_is_valid(record.principal)
     {
         return Err(PersistError::constraint_violation(
             "config record is not representable by durable storage",
         ));
     }
-    validate_encrypted_record(record)
+    Ok(())
 }
 
 pub(crate) fn tokenize_audit_path(
@@ -1174,7 +1304,21 @@ mod tests {
             logical_time: Timestamp::now_utc(),
             intent: ConfigMutationIntent::MarkConfirmed { tx_id: TxId::new() },
         };
-        assert!(future_command.validate(identity).is_err());
+        // Revision 8 is understood structurally for the closed bounded profile,
+        // but the same command remains inadmissible to a legacy authority.
+        assert!(future_command
+            .validate_for_profile(
+                identity,
+                &crate::AuditKey::new([0xA6; 32]).expect("synthetic key"),
+                opc_crypto::ConfigCapacityProfile::Legacy,
+            )
+            .is_err());
+        let unsupported_command = ConfigConsensusCommand {
+            schema_version: config_command_revision(opc_crypto::ConfigCapacityProfile::BoundedV1)
+                + 1,
+            ..future_command
+        };
+        assert!(unsupported_command.validate(identity).is_err());
     }
 
     #[test]

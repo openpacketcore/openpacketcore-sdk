@@ -288,20 +288,23 @@ pub(crate) struct ConfigRaftRpcHandler {
     identity: ConsensusIdentity,
     local_node_id: ConsensusNodeId,
     capacity_profile: opc_crypto::ConfigCapacityProfile,
+    audit_key: crate::AuditKey,
 }
 
 impl ConfigRaftRpcHandler {
-    pub(crate) const fn new(
+    pub(crate) fn new(
         raft: ConfigRaft,
         identity: ConsensusIdentity,
         local_node_id: ConsensusNodeId,
         capacity_profile: opc_crypto::ConfigCapacityProfile,
+        audit_key: crate::AuditKey,
     ) -> Self {
         Self {
             raft,
             identity,
             local_node_id,
             capacity_profile,
+            audit_key,
         }
     }
 }
@@ -336,6 +339,16 @@ impl ConsensusRpcHandler for ConfigRaftRpcHandler {
                     Ok(rpc) => rpc,
                     Err(error) => return rejected_response(error),
                 };
+                if super::sqlite::validate_entry_capacities(
+                    &rpc.entries,
+                    self.identity,
+                    &self.audit_key,
+                    self.capacity_profile,
+                )
+                .is_err()
+                {
+                    return rejected_response(ConsensusPeerError::Rejected);
+                }
                 encode_engine_result(self.capacity_profile, &self.raft.append_entries(rpc).await)
             }
             ConsensusRpcFamily::Vote => {

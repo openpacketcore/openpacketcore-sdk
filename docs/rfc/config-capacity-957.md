@@ -195,6 +195,26 @@ handoff and implementation prerequisites. Provision the new profile explicitly;
 an existing store is not silently promoted. Any migration needs its own reviewed
 procedure and compatibility evidence.
 
+Each bounded append carries a private, fixed 44-byte record proof: a 12-byte
+header (proof revision, capacity profile, logical bytes and replay bytes) and a
+32-byte HMAC-SHA-256 tag. The SDK issues it while the encryption evidence is
+still paired with the immutable record. Under a separate domain, the tag binds
+the header, authority scope, key epoch and exact immutable record, including
+its original AEAD parent. Verification uses the receiver's independently
+admitted profile and authority. An operation handle or decoded byte count
+cannot substitute for this proof. Verified recovery may attach a fresh local
+reservation; it grants neither a new encryption claim nor audit authorization.
+
+Revision 8 adds final ordinary and audited append variants without renumbering
+the legacy variants. Rejection must precede local proposal, forwarded proposal
+and replication handoff. Durable storage must commit the record and its proof
+atomically, retain their one-to-one binding beyond request-outcome expiry, and
+authenticate them during history reads, retained reopen and snapshot restore.
+Acknowledged retention must preserve the authenticated original parent and
+prune matching proof rows. These are still implementation and qualification
+prerequisites: command support alone does not enable the larger profile, and
+an append must refuse if atomic proof storage is unavailable.
+
 The proposed profile uses config RPC revision 8 and SQLite/snapshot revision 6;
 legacy callers keep RPC revision 7 and SQLite/snapshot revision 5. The snapshot
 body's identity row must match the selected storage revision before replacing

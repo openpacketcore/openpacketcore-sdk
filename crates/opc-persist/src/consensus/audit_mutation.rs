@@ -25,11 +25,60 @@ pub(crate) enum AuditedConfigEffect {
         tx_id: opc_types::TxId,
         label: Option<super::types::ValidatedRollbackLabel>,
     },
+    /// A new final variant preserves all legacy effect bytes and indices.
+    BoundedAppend {
+        commit: Box<PreparedConfigCommit>,
+        binding: super::capacity_record::CapacityRecordBinding,
+        resolution: Option<ConfirmedCommitResolution>,
+    },
 }
 
 impl AuditedConfigEffect {
+    pub(super) fn minimum_command_version(&self) -> u16 {
+        if matches!(self, Self::BoundedAppend { .. }) {
+            8
+        } else {
+            5
+        }
+    }
+
+    pub(super) fn verify_capacity(
+        &self,
+        identity: super::ConfigConsensusIdentity,
+        key: &AuditKey,
+        profile: opc_crypto::ConfigCapacityProfile,
+    ) -> Result<Option<super::capacity_record::RecoveredRecordCapacity>, crate::PersistError> {
+        use opc_crypto::ConfigCapacityProfile;
+        if !matches!(
+            profile,
+            ConfigCapacityProfile::Legacy | ConfigCapacityProfile::BoundedV1
+        ) {
+            return Err(crate::PersistError::corrupt_blob());
+        }
+        match self {
+            Self::BoundedAppend {
+                commit, binding, ..
+            } => binding
+                .recover(&commit.record, identity, key, profile)
+                .map(Some),
+            Self::Append { .. } if profile != ConfigCapacityProfile::Legacy => {
+                Err(crate::PersistError::corrupt_blob())
+            }
+            _ => Ok(None),
+        }
+    }
+
     pub(crate) fn intent(&self) -> ConfigMutationIntent {
         match self {
+            Self::BoundedAppend {
+                commit,
+                binding,
+                resolution,
+            } => ConfigMutationIntent::BoundedAppend {
+                commit: commit.clone(),
+                binding: *binding,
+                resolution: *resolution,
+            },
             Self::Append {
                 commit,
                 resolution: Some(resolution),
@@ -67,6 +116,10 @@ impl AuditedConfigEffect {
             Self::Confirm { .. }
                 | Self::RollbackPoint { .. }
                 | Self::Append {
+                    resolution: Some(_),
+                    ..
+                }
+                | Self::BoundedAppend {
                     resolution: Some(_),
                     ..
                 }
@@ -202,7 +255,10 @@ impl PreparedAuditedMutation {
             .preparation
             .as_ref()
             .ok_or(AuditAuthorityError::InvalidInput)?;
-        let needs_evidence = matches!(self.command.effect, AuditedConfigEffect::Append { .. });
+        let needs_evidence = matches!(
+            self.command.effect,
+            AuditedConfigEffect::Append { .. } | AuditedConfigEffect::BoundedAppend { .. }
+        );
         if profile != opc_crypto::ConfigCapacityProfile::Legacy
             && !preparation.belongs_to(pool, profile, needs_evidence)
         {

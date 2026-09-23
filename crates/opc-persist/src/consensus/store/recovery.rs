@@ -173,24 +173,23 @@ impl ConsensusConfigStore {
         ) {
             return Err(invalid_handle());
         }
+        let binding = self.issue_capacity_binding(&commit)?;
         let (record, audit, resolution, evidence, reservation) = commit.into_capacity_parts();
         let prepared =
             PreparedConfigCommit::prepare(record, audit, self.inner.backend.audit_key())?;
-        let intent = match resolution {
-            Some(resolution) => ConfigMutationIntent::ResolveConfirmedAndAppend {
-                commit: Box::new(prepared),
-                resolution,
-            },
-            None => ConfigMutationIntent::AppendCommit(Box::new(prepared)),
-        };
+        let intent = ConfigMutationIntent::prepared_append(prepared, resolution, binding);
         let command = ConfigConsensusCommand {
-            schema_version: super::super::CONFIG_CONSENSUS_COMMAND_VERSION,
+            schema_version: super::config_command_revision(self.capacity_profile()),
             identity: self.inner.identity,
             request_id: original_request_id,
             logical_time: maximum_encoded_config_timestamp().ok_or_else(consensus_unavailable)?,
             intent,
         };
-        command.validate(self.inner.identity)?;
+        command.validate_for_profile(
+            self.inner.identity,
+            self.inner.backend.audit_key(),
+            self.capacity_profile(),
+        )?;
         preflight_config_command_replication_budget(
             command.identity,
             original_request_id,

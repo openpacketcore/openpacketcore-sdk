@@ -1,5 +1,8 @@
 //! Format controls only: no storage, transport or allocation qualification.
 
+#[path = "capacity_record/config_capacity_command_tests.rs"]
+mod command_tests;
+
 use super::*;
 use crate::types::CommitSource;
 use opc_crypto::{

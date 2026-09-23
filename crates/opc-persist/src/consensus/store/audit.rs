@@ -85,6 +85,9 @@ impl ConsensusConfigStore {
     ) -> Result<PreparedAuditedMutation, AuditAuthorityError> {
         self.require_commit_capacity(&commit)
             .map_err(|_| AuditAuthorityError::InvalidInput)?;
+        let binding = self
+            .issue_capacity_binding(&commit)
+            .map_err(|_| AuditAuthorityError::InvalidInput)?;
         let (record, audit, resolution, evidence, reservation) = commit.into_capacity_parts();
         let preparation =
             reservation.map(|reservation| PreparationOwnership::new(reservation, evidence));
@@ -99,9 +102,16 @@ impl ConsensusConfigStore {
             privacy,
             event,
             base,
-            AuditedConfigEffect::Append {
-                commit: Box::new(commit),
-                resolution,
+            match binding {
+                Some(binding) => AuditedConfigEffect::BoundedAppend {
+                    commit: Box::new(commit),
+                    binding,
+                    resolution,
+                },
+                None => AuditedConfigEffect::Append {
+                    commit: Box::new(commit),
+                    resolution,
+                },
             },
             lifetime,
             preparation,
@@ -163,6 +173,13 @@ impl ConsensusConfigStore {
         lifetime: std::time::Duration,
         preparation: Option<Arc<PreparationOwnership>>,
     ) -> Result<PreparedAuditedMutation, AuditAuthorityError> {
+        effect
+            .verify_capacity(
+                self.inner.identity,
+                self.inner.backend.audit_key(),
+                self.capacity_profile(),
+            )
+            .map_err(|_| AuditAuthorityError::InvalidInput)?;
         let digest = effect.digest(self.inner.backend.audit_key())?;
         let event = ProjectedAuditEvent::project(privacy, event)?;
         let binding = AuditOperationBinding::project(privacy, &event, base, &digest)?;
@@ -196,13 +213,16 @@ impl ConsensusConfigStore {
     ///
     /// Reserves before owned decoding, then authenticates the unchanged handle
     /// and effect. This grants neither an Intent receipt nor caller authority.
-    /// Bounded append recovery remains refused until the retained size-proof
-    /// format can authenticate its original logical and replay lengths.
+    /// A bounded append additionally authenticates its exact record size proof
+    /// before attaching local preparation ownership. The larger store profile
+    /// remains unavailable until retained storage qualification is complete.
     pub fn decode_prepared_audited_mutation(
         &self,
         bytes: &[u8],
     ) -> Result<PreparedAuditedMutation, AuditAuthorityError> {
-        let preparation = self.reserve_audited_preparation()?;
+        let reservation = self
+            .try_reserve_config_preparation()
+            .map_err(|_| AuditAuthorityError::Unavailable)?;
         let mut prepared = PreparedAuditedMutation::decode(bytes)?;
         prepared.handle().verify(
             self.inner.backend.audit_key(),
@@ -210,14 +230,15 @@ impl ConsensusConfigStore {
             prepared.handle().body.binding.caller,
         )?;
         prepared.verify_effect(self.inner.backend.audit_key())?;
-        if self.capacity_profile() != opc_crypto::ConfigCapacityProfile::Legacy
-            && matches!(
-                prepared.command().effect,
-                AuditedConfigEffect::Append { .. }
+        let recovered = prepared
+            .command()
+            .effect
+            .verify_capacity(
+                self.inner.identity,
+                self.inner.backend.audit_key(),
+                self.capacity_profile(),
             )
-        {
-            return Err(AuditAuthorityError::InvalidInput);
-        }
+            .map_err(|_| AuditAuthorityError::InvalidInput)?;
         let request =
             derive_durable_request_id(self.inner.identity, b"audit-config", &prepared.handle().mac);
         super::preflight_config_command_replication_budget(
@@ -226,7 +247,11 @@ impl ConsensusConfigStore {
             &ConfigMutationIntent::AuditedMutation(prepared.command().clone()),
         )
         .map_err(|_| AuditAuthorityError::InvalidInput)?;
-        if let Some(preparation) = preparation {
+        if let Some(reservation) = reservation {
+            let preparation = match recovered {
+                Some(evidence) => PreparationOwnership::recovered(reservation, evidence),
+                None => PreparationOwnership::new(reservation, None),
+            };
             prepared.attach_preparation(preparation);
         }
         Ok(prepared)

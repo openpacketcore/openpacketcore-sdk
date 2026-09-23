@@ -3,6 +3,9 @@
 
 #![cfg(target_os = "linux")]
 
+#[path = "config_capacity_command_admission_tests.rs"]
+mod command_admission_tests;
+
 use super::*;
 use crate::{
     AuditKey, ConfigConsensusClusterId, ConfigConsensusConfigurationEpoch,

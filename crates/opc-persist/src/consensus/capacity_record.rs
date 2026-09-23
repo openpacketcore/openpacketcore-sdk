@@ -21,6 +21,7 @@ use crate::{AttestedConfigCommit, AuditKey, CommitRecord, PersistError};
 const RECORD_CAPACITY_DOMAIN: &[u8] = b"openpacketcore/config-capacity/record/v1\0";
 const RECORD_CAPACITY_REVISION: u16 = 1;
 const HEADER_BYTES: usize = 12;
+#[cfg(test)]
 pub(super) const RECORD_CAPACITY_BYTES: usize = HEADER_BYTES + 32;
 
 /// Private deterministic data, not evidence of validation merely by decoding.
@@ -28,9 +29,19 @@ pub(super) const RECORD_CAPACITY_BYTES: usize = HEADER_BYTES + 32;
 /// the same canonical 44-byte representation in the SQL row and postcard field.
 #[derive(Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-pub(super) struct CapacityRecordBinding {
+pub(crate) struct CapacityRecordBinding {
     header: [u8; HEADER_BYTES],
     tag: [u8; 32],
+}
+
+/// Private evidence minted only after checking the exact immutable recovered
+/// record. It is neither a fresh encryption claim nor operation authority.
+pub(super) struct RecoveredRecordCapacity(ConfigCapacityProfile);
+
+impl RecoveredRecordCapacity {
+    pub(super) fn profile(&self) -> ConfigCapacityProfile {
+        self.0
+    }
 }
 
 impl CapacityRecordBinding {
@@ -79,6 +90,26 @@ impl CapacityRecordBinding {
         self.verify_borrowed(ConfigRecordView::from(record), identity, key, profile)
     }
 
+    pub(super) fn recover(
+        &self,
+        record: &CommitRecord,
+        identity: ConfigConsensusIdentity,
+        key: &AuditKey,
+        profile: ConfigCapacityProfile,
+    ) -> Result<RecoveredRecordCapacity, PersistError> {
+        self.verify(record, identity, key, profile)?;
+        Ok(RecoveredRecordCapacity(profile))
+    }
+
+    /// Structural validation is separate from independently scoped keyed
+    /// verification. Decoding a command must never grant recovered ownership.
+    pub(super) fn validate(&self, record: &CommitRecord) -> Result<(), PersistError> {
+        self.validate_record(
+            ConfigRecordView::from(record),
+            ConfigCapacityProfile::BoundedV1,
+        )
+    }
+
     /// Authenticate a borrowed row without constructing an owned CommitRecord.
     /// The caller supplies the independently authenticated original AEAD parent
     /// and keeps the row/transaction pinned until its consuming operation ends.
@@ -95,6 +126,7 @@ impl CapacityRecordBinding {
             .map_err(|_| invalid())
     }
 
+    #[cfg(test)]
     pub(super) fn encode(self) -> [u8; RECORD_CAPACITY_BYTES] {
         let mut encoded = [0; RECORD_CAPACITY_BYTES];
         encoded[..HEADER_BYTES].copy_from_slice(&self.header);
@@ -103,6 +135,7 @@ impl CapacityRecordBinding {
     }
 
     /// Fixed-width parsing alone confers no authenticity or mutation authority.
+    #[cfg(test)]
     pub(super) fn decode(encoded: &[u8]) -> Result<Self, PersistError> {
         if encoded.len() != RECORD_CAPACITY_BYTES {
             return Err(invalid());
@@ -121,6 +154,7 @@ impl CapacityRecordBinding {
         record: ConfigRecordView<'_>,
         profile: ConfigCapacityProfile,
     ) -> Result<(), PersistError> {
+        super::types::validate_record_metadata_view(record).map_err(|_| invalid())?;
         if profile != ConfigCapacityProfile::BoundedV1
             || self.header[..2] != RECORD_CAPACITY_REVISION.to_be_bytes()
             || self.header[2..4] != profile.revision().to_be_bytes()

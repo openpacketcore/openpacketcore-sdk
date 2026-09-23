@@ -12,9 +12,23 @@ use crate::audit_authority::AuditAuthorityError;
 
 pub(crate) struct PreparationOwnership {
     reservation: ConfigPreparationReservation,
-    evidence: Option<ConfigCapacityEvidence>,
+    evidence: Option<PreparationEvidence>,
     encoding: AtomicBool,
     submitting: AtomicBool,
+}
+
+enum PreparationEvidence {
+    Fresh(ConfigCapacityEvidence),
+    Recovered(super::capacity_record::RecoveredRecordCapacity),
+}
+
+impl PreparationEvidence {
+    fn profile(&self) -> ConfigCapacityProfile {
+        match self {
+            Self::Fresh(evidence) => evidence.profile(),
+            Self::Recovered(evidence) => evidence.profile(),
+        }
+    }
 }
 
 impl PreparationOwnership {
@@ -24,7 +38,19 @@ impl PreparationOwnership {
     ) -> Arc<Self> {
         Arc::new(Self {
             reservation,
-            evidence,
+            evidence: evidence.map(PreparationEvidence::Fresh),
+            encoding: AtomicBool::new(false),
+            submitting: AtomicBool::new(false),
+        })
+    }
+
+    pub(super) fn recovered(
+        reservation: ConfigPreparationReservation,
+        evidence: super::capacity_record::RecoveredRecordCapacity,
+    ) -> Arc<Self> {
+        Arc::new(Self {
+            reservation,
+            evidence: Some(PreparationEvidence::Recovered(evidence)),
             encoding: AtomicBool::new(false),
             submitting: AtomicBool::new(false),
         })
@@ -40,6 +66,7 @@ impl PreparationOwnership {
             && (!needs_evidence
                 || self
                     .evidence
+                    .as_ref()
                     .is_some_and(|evidence| evidence.profile() == profile))
     }
 

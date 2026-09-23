@@ -1703,6 +1703,24 @@ fn validate_entry(
     }
 }
 
+/// Verify the immutable decoded entries against the independently admitted
+/// authority before an engine handoff, log write or state-machine effect.
+pub(super) fn validate_entry_capacities(
+    entries: &[Entry<ConfigRaftTypeConfig>],
+    identity: ConsensusIdentity,
+    key: &AuditKey,
+    profile: ConfigCapacityProfile,
+) -> io::Result<()> {
+    for entry in entries {
+        if let EntryPayload::Normal(command) = &entry.payload {
+            command
+                .validate_for_profile(identity, key, profile)
+                .map_err(|_| invalid_data("invalid config capacity command"))?;
+        }
+    }
+    Ok(())
+}
+
 fn read_log_id_at_sync(
     conn: &Connection,
     identity: ConsensusIdentity,
@@ -2748,6 +2766,11 @@ fn execute_intent_sync(
     cancellation: &SqliteWorkCancellation,
 ) -> io::Result<Result<(), ConfigMutationFailure>> {
     match intent {
+        ConfigMutationIntent::BoundedAppend { .. } => {
+            // Opening this profile remains refused. Never persist a record
+            // without its atomic retained proof while that path is incomplete.
+            Err(invalid_data("bounded config retention is not admitted"))
+        }
         ConfigMutationIntent::ManagementAudit(_) | ConfigMutationIntent::AuditedMutation(_) => Err(
             invalid_data("audit command requires its authority dispatcher"),
         ),
@@ -2861,7 +2884,10 @@ fn apply_audited_mutation_sync(
         execute_intent_sync(
             conn,
             &prepared.effect.intent(),
-            super::types::CONFIG_CONSENSUS_COMMAND_VERSION,
+            prepared
+                .effect
+                .minimum_command_version()
+                .max(super::types::CONFIG_CONSENSUS_COMMAND_VERSION),
             logical_time,
             request_id,
             cancellation,
@@ -3030,6 +3056,9 @@ pub(crate) fn apply_entries_cancellable_sync(
                     tx.execute_batch("SAVEPOINT config_history_command")
                         .map_err(db_error)?;
                     let updates_existing_records = match &command.intent {
+                        ConfigMutationIntent::BoundedAppend { resolution, .. } => {
+                            resolution.is_some()
+                        }
                         ConfigMutationIntent::AppendCommit(_)
                         | ConfigMutationIntent::RetainHistory(_)
                         | ConfigMutationIntent::ManagementAudit(_)
@@ -3071,6 +3100,7 @@ pub(crate) fn apply_entries_cancellable_sync(
                             let requires_audit = matches!(
                                 command.intent,
                                 ConfigMutationIntent::AppendCommit(_)
+                                    | ConfigMutationIntent::BoundedAppend { .. }
                                     | ConfigMutationIntent::ResolveConfirmedAndAppend { .. }
                                     | ConfigMutationIntent::MarkConfirmed { .. }
                                     | ConfigMutationIntent::CreateRollbackPoint { .. }

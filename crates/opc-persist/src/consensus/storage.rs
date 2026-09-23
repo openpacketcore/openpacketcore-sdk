@@ -760,9 +760,17 @@ impl RaftLogStorage<ConfigRaftTypeConfig> for SqliteConfigLogStore {
         };
         let identity = self.core.identity;
         let members = self.core.expected_members.clone();
+        let audit_key = self.core.audit_key.clone();
+        let capacity_profile = self.core.capacity_profile;
         match self
             .core
             .run_sqlite_cancellable(move |conn, cancellation| {
+                sqlite::validate_entry_capacities(
+                    &entries,
+                    identity,
+                    &audit_key,
+                    capacity_profile,
+                )?;
                 sqlite::append_logs_cancellable_sync(
                     conn,
                     identity,
@@ -890,9 +898,16 @@ impl RaftStateMachine<ConfigRaftTypeConfig> for SqliteConfigStateMachine {
         let audit_keys = self.core.management_audit_keys.clone();
         let entries = collect_bounded_entries(entries)
             .map_err(|error| storage_error(ErrorSubject::StateMachine, ErrorVerb::Write, error))?;
+        let capacity_profile = self.core.capacity_profile;
         let responses = self
             .core
             .run_sqlite_cancellable(move |conn, cancellation| {
+                sqlite::validate_entry_capacities(
+                    &entries,
+                    identity,
+                    &audit_key,
+                    capacity_profile,
+                )?;
                 sqlite::apply_entries_cancellable_sync(
                     conn,
                     identity,
