@@ -8,7 +8,9 @@
 mod audit;
 mod audit_mutation;
 pub use audit_mutation::PreparedAuditedMutation;
+mod capacity_record;
 pub(crate) mod history;
+mod preparation;
 mod raft_adapter;
 mod snapshot_file;
 mod sqlite;
@@ -22,8 +24,9 @@ pub(crate) use sqlite::{provision_retained_schema, validate_retained_schema};
 pub use history::{ConfigHistoryLimits, ConfigHistoryRetention};
 
 pub use store::{
-    ConfigConsensusOpenError, ConfigConsensusStatus, ConfigLocalAuthorityOutcome,
-    ConsensusConfigStore, DEFAULT_CONFIG_CONSENSUS_OPERATION_TIMEOUT,
+    ConfigCommitRecoveryHandle, ConfigCommitRecoveryOutcome, ConfigConsensusOpenError,
+    ConfigConsensusStatus, ConfigLocalAuthorityOutcome, ConsensusConfigStore,
+    PreparedConfigCommitOperation, DEFAULT_CONFIG_CONSENSUS_OPERATION_TIMEOUT,
 };
 pub use types::{
     ApprovedLegacyConfigRecovery, ConfigConsensusClock, ConfigConsensusClusterId,

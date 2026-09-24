@@ -125,17 +125,17 @@ pub use break_glass::{
     BreakGlassSession, BreakGlassStatus, DefaultBreakGlassApproval, NoopBreakGlassAlarmNotifier,
 };
 pub use consensus::{
-    ApprovedLegacyConfigRecovery, ConfigConsensusClock, ConfigConsensusClusterId,
-    ConfigConsensusConfigurationEpoch, ConfigConsensusConfigurationId, ConfigConsensusEntryDigest,
-    ConfigConsensusIdentity, ConfigConsensusIdentityError, ConfigConsensusNodeId,
-    ConfigConsensusOpenError, ConfigConsensusPeer, ConfigConsensusRequestId,
-    ConfigConsensusRpcHandler, ConfigConsensusStatus, ConfigConsensusTopology,
-    ConfigConsensusTopologyError, ConfigHistoryLimits, ConfigHistoryRetention,
-    ConfigLocalAuthorityOutcome, ConsensusConfigStore, LegacyConfigTailDisposition,
-    SharedConfigConsensusClock, SystemConfigConsensusClock, CONFIG_CONSENSUS_COMMAND_VERSION,
-    CONFIG_CONSENSUS_MAX_MEMBERS, CONFIG_CONSENSUS_SNAPSHOT_VERSION,
-    CONFIG_CONSENSUS_STORAGE_VERSION, CONFIG_CONSENSUS_WIRE_VERSION,
-    DEFAULT_CONFIG_CONSENSUS_OPERATION_TIMEOUT,
+    ApprovedLegacyConfigRecovery, ConfigCommitRecoveryHandle, ConfigCommitRecoveryOutcome,
+    ConfigConsensusClock, ConfigConsensusClusterId, ConfigConsensusConfigurationEpoch,
+    ConfigConsensusConfigurationId, ConfigConsensusEntryDigest, ConfigConsensusIdentity,
+    ConfigConsensusIdentityError, ConfigConsensusNodeId, ConfigConsensusOpenError,
+    ConfigConsensusPeer, ConfigConsensusRequestId, ConfigConsensusRpcHandler,
+    ConfigConsensusStatus, ConfigConsensusTopology, ConfigConsensusTopologyError,
+    ConfigHistoryLimits, ConfigHistoryRetention, ConfigLocalAuthorityOutcome, ConsensusConfigStore,
+    LegacyConfigTailDisposition, PreparedConfigCommitOperation, SharedConfigConsensusClock,
+    SystemConfigConsensusClock, CONFIG_CONSENSUS_COMMAND_VERSION, CONFIG_CONSENSUS_MAX_MEMBERS,
+    CONFIG_CONSENSUS_SNAPSHOT_VERSION, CONFIG_CONSENSUS_STORAGE_VERSION,
+    CONFIG_CONSENSUS_WIRE_VERSION, DEFAULT_CONFIG_CONSENSUS_OPERATION_TIMEOUT,
 };
 pub use error::{PersistError, PersistErrorKind};
 pub use management_audit::{

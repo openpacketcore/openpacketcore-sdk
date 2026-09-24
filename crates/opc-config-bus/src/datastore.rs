@@ -12,7 +12,12 @@ use std::sync::Arc;
 use tokio::sync::{watch, Mutex as AsyncMutex};
 
 use opc_config_model::{IdempotencyKey, OpcConfig, RequestId, RequestSource, RollbackTarget};
-use opc_crypto::{decrypt_envelope, encrypt_attested_envelope};
+use opc_crypto::{
+    decrypt_envelope, encrypt_attested_envelope, encrypt_reserved_bounded_config_envelope,
+};
+
+/// Configuration byte policy selected by the sealed datastore authority.
+pub use opc_crypto::ConfigCapacityProfile;
 use opc_key::{ConfigAad, EnvelopeAad, KeyProvider, Zeroizing};
 use opc_types::{ConfigVersion, TxId};
 
@@ -51,6 +56,28 @@ struct ConfigPlaintextV2Ref<'a, C> {
     request_id: Option<opc_config_model::RequestId>,
 }
 
+// Only used after the bounded profile reserved its full plaintext capacity.
+// ConfigCapacityEvidence independently validates logical and replay spans in
+// these exact bytes before any key-provider request.
+struct ConfigPlaintextWriter<'a>(&'a mut Vec<u8>);
+
+impl std::io::Write for ConfigPlaintextWriter<'_> {
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        if bytes.len() > opc_crypto::CONFIG_CAPACITY_V1_PLAINTEXT_BYTES.saturating_sub(self.0.len())
+        {
+            return Err(std::io::Error::other(
+                "configuration plaintext capacity exceeded",
+            ));
+        }
+        self.0.extend_from_slice(bytes);
+        Ok(bytes.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
 #[derive(serde::Deserialize)]
 struct ConfigPlaintextV2<C> {
     config: C,
@@ -75,6 +102,27 @@ struct ConfigPlaintextV2<C> {
 /// after a crash, and a definite failed append must leave no partial record.
 #[async_trait]
 pub trait ManagedDatastore<C: OpcConfig>: Send + Sync {
+    /// Immutable byte policy used before configuration encryption. Legacy is
+    /// the compatibility default. This selection alone does not enable a
+    /// larger consensus command or promise a durability/resource profile.
+    fn config_capacity_profile(&self) -> ConfigCapacityProfile {
+        ConfigCapacityProfile::Legacy
+    }
+
+    /// Reserve preparation capacity in this exact sealed datastore before
+    /// allocating SDK plaintext. Nonlegacy implementations must provide their
+    /// authority's reservation; the compatibility default cannot invent one.
+    fn try_reserve_config_preparation(
+        &self,
+    ) -> Result<Option<opc_crypto::ConfigPreparationReservation>, StoreError> {
+        match self.config_capacity_profile() {
+            ConfigCapacityProfile::Legacy => Ok(None),
+            _ => Err(StoreError::unavailable(
+                "configuration preparation admission unavailable",
+            )),
+        }
+    }
+
     /// Observation port belonging to this datastore's required mutation audit
     /// authority. It must reject standalone Intents and preserve admitted work
     /// across cancellation. Legacy stores expose no required audit capability.
@@ -279,6 +327,16 @@ where
     C: OpcConfig,
     T: ManagedDatastore<C> + ?Sized,
 {
+    fn config_capacity_profile(&self) -> ConfigCapacityProfile {
+        (**self).config_capacity_profile()
+    }
+
+    fn try_reserve_config_preparation(
+        &self,
+    ) -> Result<Option<opc_crypto::ConfigPreparationReservation>, StoreError> {
+        (**self).try_reserve_config_preparation()
+    }
+
     fn required_audit_observations(&self) -> Option<Arc<dyn opc_mgmt_audit::AuditSink>> {
         (**self).required_audit_observations()
     }
@@ -461,20 +519,44 @@ where
             request_fingerprint: record.request_fingerprint.as_ref(),
             request_id: record.request_id,
         };
-        // Serialize directly into zeroizing storage. Wrapping a `to_vec`
-        // result only after serialization would leave both its error path and
-        // any copied intermediate allocation able to retain config and raw
-        // replay metadata in allocator memory.
-        let mut encoded = Zeroizing::new(Vec::new());
-        serde_json::to_writer(&mut *encoded, &plaintext_v2)
-            .map_err(|_| StoreError::internal(CONFIG_ENVELOPE_SERIALIZATION_FAILED_MESSAGE))?;
-        let mut plaintext = Zeroizing::new(Vec::with_capacity(
-            CONFIG_PLAINTEXT_V2_MAGIC
-                .len()
-                .saturating_add(encoded.len()),
-        ));
-        plaintext.extend_from_slice(CONFIG_PLAINTEXT_V2_MAGIC);
-        plaintext.extend_from_slice(&encoded);
+        let profile = self.inner.config_capacity_profile();
+        let preparation = self.inner.try_reserve_config_preparation()?;
+        if profile != ConfigCapacityProfile::Legacy && preparation.is_none() {
+            return Err(StoreError::unavailable(
+                "configuration preparation admission unavailable",
+            ));
+        }
+        let mut plaintext = Zeroizing::new(Vec::new());
+        match profile {
+            ConfigCapacityProfile::Legacy => {
+                plaintext.extend_from_slice(CONFIG_PLAINTEXT_V2_MAGIC);
+                serde_json::to_writer(&mut *plaintext, &plaintext_v2).map_err(|_| {
+                    StoreError::internal(CONFIG_ENVELOPE_SERIALIZATION_FAILED_MESSAGE)
+                })?;
+            }
+            ConfigCapacityProfile::BoundedV1 => {
+                // Reserve once so growing the serializer cannot leave copied
+                // plaintext in an abandoned allocation. Charge the magic and
+                // every exact emitted byte to the complete plaintext ceiling.
+                plaintext
+                    .try_reserve_exact(opc_crypto::CONFIG_CAPACITY_V1_PLAINTEXT_BYTES)
+                    .map_err(|_| {
+                        StoreError::unavailable("configuration plaintext allocation failed")
+                    })?;
+                plaintext.extend_from_slice(CONFIG_PLAINTEXT_V2_MAGIC);
+                serde_json::to_writer(ConfigPlaintextWriter(&mut plaintext), &plaintext_v2)
+                    .map_err(|_| {
+                        StoreError::internal(
+                            "configuration plaintext serialization exceeds capacity or is invalid",
+                        )
+                    })?;
+            }
+            _ => {
+                return Err(StoreError::internal(
+                    "configuration capacity profile is unsupported",
+                ))
+            }
+        }
         record.plaintext_digest = Some(compute_plaintext_digest(plaintext.as_slice()));
         record.idempotency_key =
             replay_lookup_digest(record.idempotency_key.as_ref(), record.request_id)?;
@@ -483,10 +565,36 @@ where
         record.request_id = None;
         let aad = build_config_envelope_aad(&record, self.store_kind(), None)?;
         let schema_digest = record.schema_digest;
-        let envelope =
-            encrypt_attested_envelope(self.provider.as_ref(), &aad, plaintext.as_slice())
+        let envelope = match profile {
+            ConfigCapacityProfile::Legacy => {
+                encrypt_attested_envelope(self.provider.as_ref(), &aad, plaintext.as_slice())
+                    .await
+                    .map_err(|_| StoreError::crypto(CONFIG_ENVELOPE_ENCRYPT_FAILED_MESSAGE))?
+            }
+            ConfigCapacityProfile::BoundedV1 => {
+                let preparation = preparation.ok_or_else(|| {
+                    StoreError::unavailable("configuration preparation admission unavailable")
+                })?;
+                encrypt_reserved_bounded_config_envelope(
+                    preparation,
+                    self.provider.as_ref(),
+                    &aad,
+                    plaintext.as_slice(),
+                )
                 .await
-                .map_err(|_| StoreError::crypto(CONFIG_ENVELOPE_ENCRYPT_FAILED_MESSAGE))?;
+                .map_err(|error| match error {
+                    opc_crypto::ConfigCapacityError::EncryptionFailed => {
+                        StoreError::crypto(CONFIG_ENVELOPE_ENCRYPT_FAILED_MESSAGE)
+                    }
+                    _ => StoreError::internal("configuration capacity validation failed"),
+                })?
+            }
+            _ => {
+                return Err(StoreError::internal(
+                    "configuration capacity profile is unsupported",
+                ))
+            }
+        };
         record.encrypted_blob = envelope.encoded().to_vec();
         Ok(record.with_config(SealedConfig::newly_encrypted(schema_digest, envelope)))
     }
@@ -569,6 +677,16 @@ where
     P: KeyProvider + ?Sized,
     S: ManagedDatastore<SealedConfig<C>> + ?Sized,
 {
+    fn config_capacity_profile(&self) -> ConfigCapacityProfile {
+        self.inner.config_capacity_profile()
+    }
+
+    fn try_reserve_config_preparation(
+        &self,
+    ) -> Result<Option<opc_crypto::ConfigPreparationReservation>, StoreError> {
+        self.inner.try_reserve_config_preparation()
+    }
+
     fn required_audit_observations(&self) -> Option<Arc<dyn opc_mgmt_audit::AuditSink>> {
         self.inner.required_audit_observations()
     }

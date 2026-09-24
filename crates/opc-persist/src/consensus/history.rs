@@ -1,5 +1,6 @@
 //! Bounded retained configuration history owned by the existing consensus writer.
 
+use opc_crypto::ConfigCapacityProfile;
 use opc_types::{ConfigVersion, TxId};
 use serde::{Deserialize, Serialize};
 
@@ -19,6 +20,9 @@ use crate::AuditKey;
 const HISTORY_DOMAIN: &[u8] = b"openpacketcore/config-consensus/history-retention/v1\0";
 const RECORD_CHAIN_DOMAIN: &[u8] = b"openpacketcore/config-consensus/history-record-chain/v1\0";
 const STATE_MAX_BYTES: usize = 4096;
+
+#[cfg(test)]
+pub(super) mod config_capacity_read_buffers;
 
 /// Explicit bounds for canonical retained configuration records and their data.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -140,6 +144,19 @@ struct HistoryState {
     head: Option<HistoryHead>,
     records: u64,
     record_chain: [u8; 32],
+    // Omission preserves every legacy format-one serialized byte.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    capacity_profile: Option<u16>,
+}
+
+impl HistoryState {
+    fn profile(&self) -> io::Result<ConfigCapacityProfile> {
+        match (self.format_version, self.capacity_profile) {
+            (1, None) => Ok(ConfigCapacityProfile::Legacy),
+            (2, Some(1)) => Ok(ConfigCapacityProfile::BoundedV1),
+            _ => Err(corrupt()),
+        }
+    }
 }
 
 fn corrupt() -> io::Error {
@@ -171,16 +188,40 @@ fn record_count(conn: &Connection) -> io::Result<u64> {
     u64::try_from(count).map_err(|_| corrupt())
 }
 
+// Keep ciphertext borrowed until its digest is computed. No view escapes the
+// SQLite row, and all four history-authentication paths use this projection.
+fn encrypted_column<'row>(
+    row: &'row rusqlite::Row<'_>,
+    index: usize,
+) -> rusqlite::Result<std::borrow::Cow<'row, [u8]>> {
+    let value = row.get_ref(index)?;
+    let rusqlite::types::ValueRef::Blob(encrypted) = value else {
+        return Err(rusqlite::Error::InvalidColumnType(
+            index,
+            "encrypted_blob".to_owned(),
+            value.data_type(),
+        ));
+    };
+    Ok(std::borrow::Cow::Borrowed(encrypted))
+}
+
 fn head_sync(conn: &Connection) -> io::Result<Option<HistoryHead>> {
     let row = conn.query_row(
         "SELECT tx_id, version, encrypted_blob FROM config_history ORDER BY version DESC LIMIT 1",
-        [], |row| Ok((row.get::<_, Vec<u8>>(0)?, row.get::<_, i64>(1)?, row.get::<_, Vec<u8>>(2)?)),
+        [], |row| {
+            let tx_id = row.get::<_, Vec<u8>>(0)?;
+            let version = row.get::<_, i64>(1)?;
+            let encrypted = encrypted_column(row, 2)?;
+            #[cfg(test)]
+            config_capacity_read_buffers::observe(0, &encrypted);
+            Ok((tx_id, version, <[u8; 32]>::from(Sha256::digest(encrypted))))
+        },
     ).optional().map_err(database_error)?;
-    row.map(|(tx_id, version, encrypted)| {
+    row.map(|(tx_id, version, encrypted_digest)| {
         Ok(HistoryHead {
             tx_id: TxId::from_uuid(uuid::Uuid::from_slice(&tx_id).map_err(|_| corrupt())?),
             version: ConfigVersion::new(u64::try_from(version).map_err(|_| corrupt())?),
-            encrypted_digest: Sha256::digest(encrypted).into(),
+            encrypted_digest,
         })
     })
     .transpose()
@@ -204,6 +245,7 @@ fn audit_anchor_digest(count: i64, terminal: &[u8]) -> io::Result<[u8; 32]> {
 fn record_metadata_digest(
     conn: &Connection,
     head: &HistoryHead,
+    profile: ConfigCapacityProfile,
     cancellation: &SqliteWorkCancellation,
 ) -> io::Result<[u8; 32]> {
     use rusqlite::types::ValueRef;
@@ -254,7 +296,29 @@ fn record_metadata_digest(
         digest.update([0]);
         digest.update(count.to_be_bytes());
     }
+    if profile == ConfigCapacityProfile::BoundedV1 {
+        digest.update(b"capacity-record\0");
+        digest.update(record_capacity_bytes(conn, head.tx_id)?);
+    }
     Ok(digest.finalize().into())
+}
+
+fn record_capacity_bytes(
+    conn: &Connection,
+    tx_id: TxId,
+) -> io::Result<[u8; super::capacity_record::RECORD_CAPACITY_BYTES]> {
+    conn.query_row(
+        "SELECT binding FROM config_raft_capacity_records WHERE tx_id = ?1",
+        [tx_id.as_uuid().as_bytes().as_slice()],
+        |row| {
+            let value = row.get_ref(0)?;
+            let bytes = value.as_blob().map_err(|error| {
+                rusqlite::Error::FromSqlConversionFailure(0, value.data_type(), Box::new(error))
+            })?;
+            bytes.try_into().map_err(|_| rusqlite::Error::InvalidQuery)
+        },
+    )
+    .map_err(database_error)
 }
 
 fn extend_record_chain(
@@ -276,6 +340,7 @@ fn extend_record_chain(
 
 fn record_chain_sync(
     conn: &Connection,
+    profile: ConfigCapacityProfile,
     cancellation: &SqliteWorkCancellation,
 ) -> io::Result<[u8; 32]> {
     let mut statement = conn
@@ -290,7 +355,9 @@ fn record_chain_sync(
         };
         let tx_id: Vec<u8> = row.get(0).map_err(database_error)?;
         let version: i64 = row.get(1).map_err(database_error)?;
-        let encrypted: Vec<u8> = row.get(2).map_err(database_error)?;
+        let encrypted = encrypted_column(row, 2).map_err(database_error)?;
+        #[cfg(test)]
+        config_capacity_read_buffers::observe(1, &encrypted);
         let count: i64 = row.get(3).map_err(database_error)?;
         let terminal: Vec<u8> = row.get(4).map_err(database_error)?;
         let head = HistoryHead {
@@ -302,7 +369,7 @@ fn record_chain_sync(
             digest,
             &head,
             audit_anchor_digest(count, &terminal)?,
-            record_metadata_digest(conn, &head, cancellation)?,
+            record_metadata_digest(conn, &head, profile, cancellation)?,
         );
     }
     Ok(digest)
@@ -320,7 +387,7 @@ pub(crate) fn validate_record_chain_sync(
     cancellation: &SqliteWorkCancellation,
 ) -> io::Result<()> {
     if let Some(state) = load_state(conn, key)? {
-        if record_chain_sync(conn, cancellation)? != state.record_chain {
+        if record_chain_sync(conn, state.profile()?, cancellation)? != state.record_chain {
             return Err(corrupt());
         }
     }
@@ -345,14 +412,25 @@ pub(crate) fn initialize_sync(
     conn: &Connection,
     identity: ConsensusIdentity,
     key: &AuditKey,
+    profile: ConfigCapacityProfile,
     cancellation: &SqliteWorkCancellation,
 ) -> io::Result<()> {
-    super::sqlite::validate_live_history_schema_sync(conn, cancellation)?;
+    let (format_version, capacity_profile) = match profile {
+        ConfigCapacityProfile::Legacy => (1, None),
+        ConfigCapacityProfile::BoundedV1 => (2, Some(profile.revision())),
+        _ => return Err(corrupt()),
+    };
+    super::sqlite::validate_live_history_schema_for_profile_sync(conn, profile, cancellation)?;
+    // A new profile is provisioned explicitly; no unbound legacy history is
+    // silently promoted. Approved legacy recovery retains format one.
+    if profile != ConfigCapacityProfile::Legacy && record_count(conn)? != 0 {
+        return Err(corrupt());
+    }
     save_state(
         conn,
         key,
         &HistoryState {
-            format_version: 1,
+            format_version,
             identity,
             key_epoch: key.epoch(),
             limits: None,
@@ -360,7 +438,8 @@ pub(crate) fn initialize_sync(
             boundary: None,
             head: head_sync(conn)?,
             records: record_count(conn)?,
-            record_chain: record_chain_sync(conn, cancellation)?,
+            record_chain: record_chain_sync(conn, profile, cancellation)?,
+            capacity_profile,
         },
     )
 }
@@ -404,8 +483,8 @@ fn load_state(conn: &Connection, key: &AuditKey) -> io::Result<Option<HistorySta
         "SELECT cluster_id, configuration_id, configuration_epoch FROM config_raft_identity WHERE singleton = 1",
         [], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
     ).map_err(database_error)?;
-    if state.format_version != 1
-        || state.key_epoch != key.epoch()
+    state.profile()?;
+    if state.key_epoch != key.epoch()
         || state.identity.cluster_id().as_bytes().as_slice() != cluster
         || state.identity.configuration_id().as_bytes().as_slice() != configuration
         || u64::try_from(epoch).ok() != Some(state.identity.configuration_epoch().get())
@@ -437,14 +516,22 @@ fn validate_state(conn: &Connection, state: &HistoryState) -> io::Result<()> {
         return Err(corrupt());
     }
     if let Some(boundary) = &state.boundary {
-        let (first_tx, first_version, parent, blob): (Vec<u8>, i64, Option<Vec<u8>>, Vec<u8>) = conn.query_row(
+        let (first_tx, first_version, parent, encrypted_digest): (Vec<u8>, i64, Option<Vec<u8>>, [u8; 32]) = conn.query_row(
             "SELECT tx_id, version, parent_tx_id, encrypted_blob FROM config_history ORDER BY version ASC LIMIT 1",
-            [], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            [], |row| {
+                let tx_id = row.get(0)?;
+                let version = row.get(1)?;
+                let parent = row.get(2)?;
+                let encrypted = encrypted_column(row, 3)?;
+                #[cfg(test)]
+                config_capacity_read_buffers::observe(2, &encrypted);
+                Ok((tx_id, version, parent, <[u8; 32]>::from(Sha256::digest(encrypted))))
+            },
         ).map_err(database_error)?;
         if first_tx != boundary.first.tx_id.as_uuid().as_bytes()
             || u64::try_from(first_version).ok() != Some(boundary.first.version.get())
             || parent.is_some()
-            || <[u8; 32]>::from(Sha256::digest(blob)) != boundary.first.encrypted_digest
+            || encrypted_digest != boundary.first.encrypted_digest
         {
             return Err(corrupt());
         }
@@ -503,7 +590,11 @@ pub(crate) fn validate_cursor_sync(
     Ok(())
 }
 
-fn retained_size(conn: &Connection, before: Option<i64>) -> io::Result<(u64, u64)> {
+fn retained_size(
+    conn: &Connection,
+    before: Option<i64>,
+    profile: ConfigCapacityProfile,
+) -> io::Result<(u64, u64)> {
     // Bound encoded canonical data, including conservative fixed metadata per
     // row; SQLite/Raft physical storage has its separate admission/snapshot policy.
     let (records, bytes): (i64, i64) = conn.query_row(
@@ -522,8 +613,19 @@ fn retained_size(conn: &Connection, before: Option<i64>) -> io::Result<(u64, u64
         "SELECT COALESCE(SUM(64 + length(CAST(a.label AS BLOB)) + length(CAST(a.created_at AS BLOB))),0) FROM rollback_labels a JOIN config_history h ON h.tx_id = a.tx_id WHERE (?1 IS NULL OR h.version < ?1)",
         [before], |row| row.get(0),
     ).map_err(database_error)?;
+    // Exact canonical additional row data: 16-byte transaction + 44-byte proof.
+    // Physical SQLite pages and Rust allocation remain separate budgets.
+    let capacity = match profile {
+        ConfigCapacityProfile::Legacy => 0,
+        ConfigCapacityProfile::BoundedV1 => conn.query_row(
+            "SELECT COALESCE(SUM(length(p.tx_id) + length(p.binding)),0) FROM config_raft_capacity_records p JOIN config_history h ON h.tx_id = p.tx_id WHERE (?1 IS NULL OR h.version < ?1)",
+            [before], |row| row.get::<_, i64>(0),
+        ).map_err(database_error)?,
+        _ => return Err(corrupt()),
+    };
     let bytes = bytes
-        .checked_add(audit)
+        .checked_add(capacity)
+        .and_then(|v| v.checked_add(audit))
         .and_then(|v| v.checked_add(lifecycle))
         .and_then(|v| v.checked_add(labels))
         .ok_or_else(corrupt)?;
@@ -536,7 +638,7 @@ fn retained_size(conn: &Connection, before: Option<i64>) -> io::Result<(u64, u64
 fn validate_limited_state(conn: &Connection, state: &HistoryState) -> io::Result<()> {
     validate_state(conn, state)?;
     if let Some(limits) = state.limits {
-        let (records, bytes) = retained_size(conn, None)?;
+        let (records, bytes) = retained_size(conn, None, state.profile()?)?;
         if records > u64::from(limits.max_records) || bytes > limits.max_bytes {
             return Err(corrupt());
         }
@@ -554,25 +656,134 @@ pub(crate) fn validate_sync(conn: &Connection, key: &AuditKey) -> io::Result<()>
 /// Authenticate once per read/apply transaction, before even a negative lookup
 /// or metadata-based admission decision. Per-row projection must not repeat the
 /// complete scan; it runs in this same authenticated SQLite snapshot instead.
+pub(crate) fn validate_access_for_profile_sync(
+    conn: &Connection,
+    key: &AuditKey,
+    consensus_required: bool,
+    capacity_profile: opc_crypto::ConfigCapacityProfile,
+    cancellation: &SqliteWorkCancellation,
+) -> io::Result<()> {
+    if !matches!(
+        capacity_profile,
+        ConfigCapacityProfile::Legacy | ConfigCapacityProfile::BoundedV1
+    ) {
+        return Err(corrupt());
+    }
+    if consensus_required || has_consensus_metadata_sync(conn)? {
+        super::sqlite::validate_live_history_schema_for_profile_sync(
+            conn,
+            capacity_profile,
+            cancellation,
+        )?;
+    }
+    let Some(state) = load_state(conn, key)? else {
+        return if consensus_required || capacity_profile != ConfigCapacityProfile::Legacy {
+            Err(corrupt())
+        } else {
+            Ok(())
+        };
+    };
+    if state.profile()? != capacity_profile {
+        return Err(corrupt());
+    }
+    validate_limited_state(conn, &state)?;
+    if record_chain_sync(conn, capacity_profile, cancellation)? != state.record_chain {
+        return Err(corrupt());
+    }
+    validate_capacity_records(conn, &state, key, cancellation)
+}
+
+/// Authenticate legacy consensus history within its existing transaction.
+#[cfg(test)]
 pub(crate) fn validate_access_sync(
     conn: &Connection,
     key: &AuditKey,
     consensus_required: bool,
     cancellation: &SqliteWorkCancellation,
 ) -> io::Result<()> {
-    if consensus_required || has_consensus_metadata_sync(conn)? {
-        super::sqlite::validate_live_history_schema_sync(conn, cancellation)?;
+    validate_access_for_profile_sync(
+        conn,
+        key,
+        consensus_required,
+        ConfigCapacityProfile::Legacy,
+        cancellation,
+    )
+}
+
+/// No owning ciphertext copy or view escapes this pinned consuming transaction.
+/// The caller has already authenticated the state, its chain and boundary.
+fn validate_capacity_records(
+    conn: &Connection,
+    state: &HistoryState,
+    key: &AuditKey,
+    cancellation: &SqliteWorkCancellation,
+) -> io::Result<()> {
+    use super::capacity_record::CapacityRecordBinding;
+    use super::types::ConfigRecordView;
+    use std::str::FromStr;
+    if state.profile()? == ConfigCapacityProfile::Legacy {
+        return Ok(());
     }
-    let Some(state) = load_state(conn, key)? else {
-        return if consensus_required {
-            Err(corrupt())
-        } else {
-            Ok(())
-        };
-    };
-    validate_limited_state(conn, &state)?;
-    if record_chain_sync(conn, cancellation)? != state.record_chain {
+    let orphans: bool = conn.query_row(
+        "SELECT EXISTS(SELECT 1 FROM config_raft_capacity_records p WHERE NOT EXISTS(SELECT 1 FROM config_history h WHERE h.tx_id = p.tx_id))",
+        [], |row| row.get(0),
+    ).map_err(database_error)?;
+    if orphans {
         return Err(corrupt());
+    }
+    let mut query = conn.prepare(
+        "SELECT h.tx_id, h.parent_tx_id, h.version, h.committed_at, h.principal, h.schema_digest, h.plaintext_digest, h.encrypted_blob, p.binding FROM config_history h LEFT JOIN config_raft_capacity_records p ON p.tx_id = h.tx_id ORDER BY h.version ASC",
+    ).map_err(database_error)?;
+    let mut rows = query.query([]).map_err(database_error)?;
+    while let Some(row) = rows.next().map_err(database_error)? {
+        cancellation.check_io()?;
+        let blob = |index| {
+            row.get_ref(index)
+                .map_err(database_error)?
+                .as_blob()
+                .map_err(|_| corrupt())
+        };
+        let text = |index| {
+            row.get_ref(index)
+                .map_err(database_error)?
+                .as_str()
+                .map_err(|_| corrupt())
+        };
+        let tx_id = TxId::from_uuid(uuid::Uuid::from_slice(blob(0)?).map_err(|_| corrupt())?);
+        let version = ConfigVersion::new(
+            u64::try_from(row.get::<_, i64>(2).map_err(database_error)?).map_err(|_| corrupt())?,
+        );
+        let mut parent_tx_id = match row.get_ref(1).map_err(database_error)? {
+            rusqlite::types::ValueRef::Null => None,
+            value => Some(TxId::from_uuid(
+                uuid::Uuid::from_slice(value.as_blob().map_err(|_| corrupt())?)
+                    .map_err(|_| corrupt())?,
+            )),
+        };
+        if let Some(boundary) = &state.boundary {
+            if version == boundary.first.version {
+                if tx_id != boundary.first.tx_id || parent_tx_id.is_some() {
+                    return Err(corrupt());
+                }
+                parent_tx_id = Some(boundary.original_parent);
+            }
+        }
+        let record = ConfigRecordView {
+            tx_id,
+            parent_tx_id,
+            version,
+            committed_at: opc_types::Timestamp::from_str(text(3)?).map_err(|_| corrupt())?,
+            principal: text(4)?,
+            schema_digest: opc_types::SchemaDigest::from_bytes(
+                blob(5)?.try_into().map_err(|_| corrupt())?,
+            ),
+            plaintext_digest: blob(6)?,
+            encrypted_blob: blob(7)?,
+        };
+        CapacityRecordBinding::decode(blob(8)?)
+            .map_err(|_| corrupt())?
+            .verify_borrowed(record, state.identity, key, state.profile()?)
+            .map_err(|_| corrupt())?;
     }
     Ok(())
 }
@@ -589,7 +800,7 @@ pub(crate) fn refresh_sync(
 ) -> io::Result<Result<(), ConfigMutationFailure>> {
     let mut state = load_state(conn, key)?.ok_or_else(corrupt)?;
     if let Some(limits) = state.limits {
-        let (records, bytes) = retained_size(conn, None)?;
+        let (records, bytes) = retained_size(conn, None, state.profile()?)?;
         if records > u64::from(limits.max_records) || bytes > limits.max_bytes {
             return Ok(Err(ConfigMutationFailure::HistoryFull));
         }
@@ -620,7 +831,7 @@ pub(crate) fn refresh_sync(
                 state.record_chain,
                 next,
                 audit_anchor_digest(count, &terminal)?,
-                record_metadata_digest(conn, next, cancellation)?,
+                record_metadata_digest(conn, next, state.profile()?, cancellation)?,
             );
         }
     } else if records != state.records {
@@ -630,7 +841,7 @@ pub(crate) fn refresh_sync(
         // Only a command whose prior chain was authenticated may rebind an
         // existing record's mutable metadata. Otherwise a legitimate lifecycle
         // update could bless unrelated historical damage.
-        state.record_chain = record_chain_sync(conn, cancellation)?;
+        state.record_chain = record_chain_sync(conn, state.profile()?, cancellation)?;
     }
     state.head = head;
     state.records = records;
@@ -665,11 +876,18 @@ pub(crate) fn retain_sync(
         return Ok(Err(ConfigMutationFailure::HistoryProtected));
     }
     let from = i64::try_from(decision.retain_from.get()).map_err(|_| corrupt())?;
-    let (first_tx, parent, encrypted): (Vec<u8>, Option<Vec<u8>>, Vec<u8>) = conn
+    let (first_tx, parent, encrypted_digest): (Vec<u8>, Option<Vec<u8>>, [u8; 32]) = conn
         .query_row(
             "SELECT tx_id, parent_tx_id, encrypted_blob FROM config_history WHERE version = ?1",
             [from],
-            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            |row| {
+                let tx_id = row.get(0)?;
+                let parent = row.get(1)?;
+                let encrypted = encrypted_column(row, 2)?;
+                #[cfg(test)]
+                config_capacity_read_buffers::observe(3, &encrypted);
+                Ok((tx_id, parent, <[u8; 32]>::from(Sha256::digest(encrypted))))
+            },
         )
         .optional()
         .map_err(database_error)?
@@ -710,8 +928,8 @@ pub(crate) fn retain_sync(
     if named {
         return Ok(Err(ConfigMutationFailure::HistoryProtected));
     }
-    let (all_records, all_bytes) = retained_size(conn, None)?;
-    let (removed_records, removed_bytes) = retained_size(conn, Some(from))?;
+    let (all_records, all_bytes) = retained_size(conn, None, state.profile()?)?;
+    let (removed_records, removed_bytes) = retained_size(conn, Some(from), state.profile()?)?;
     if all_records
         .checked_sub(removed_records)
         .ok_or_else(corrupt)?
@@ -740,7 +958,7 @@ pub(crate) fn retain_sync(
             first: HistoryHead {
                 tx_id: TxId::from_uuid(uuid::Uuid::from_slice(&first_tx).map_err(|_| corrupt())?),
                 version: decision.retain_from,
-                encrypted_digest: Sha256::digest(encrypted).into(),
+                encrypted_digest,
             },
             original_parent,
         });
@@ -751,9 +969,12 @@ pub(crate) fn retain_sync(
         .map_err(database_error)?;
         conn.execute("DELETE FROM audit_trail WHERE tx_id IN (SELECT tx_id FROM config_history WHERE version < ?1)", [from]).map_err(database_error)?;
         conn.execute("DELETE FROM config_lifecycle_audit WHERE tx_id IN (SELECT tx_id FROM config_history WHERE version < ?1)", [from]).map_err(database_error)?;
+        if state.profile()? == ConfigCapacityProfile::BoundedV1 {
+            conn.execute("DELETE FROM config_raft_capacity_records WHERE tx_id IN (SELECT tx_id FROM config_history WHERE version < ?1)", [from]).map_err(database_error)?;
+        }
         conn.execute("DELETE FROM config_history WHERE version < ?1", [from])
             .map_err(database_error)?;
-        state.record_chain = record_chain_sync(conn, cancellation)?;
+        state.record_chain = record_chain_sync(conn, state.profile()?, cancellation)?;
     }
     state.records = record_count(conn)?;
     state.limits = Some(decision.limits);
