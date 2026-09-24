@@ -289,7 +289,7 @@ impl SessionRegistry {
         before_lock: F,
     ) -> Result<LockCandidateResult, E>
     where
-        F: FnOnce() -> Result<(), E>,
+        F: FnOnce(CandidateLockLease) -> Result<(), E>,
     {
         let mut state = self.inner.lock().unwrap_or_else(|err| err.into_inner());
         state.prune_inactive();
@@ -306,11 +306,17 @@ impl SessionRegistry {
                 owner_session_id: owner.session_id,
             });
         }
-        before_lock()?;
-        state.candidate_lock = Some(CandidateLock {
+        let lease = CandidateLockLease {
+            session: Arc::clone(&session),
+            active: Arc::new(AtomicBool::new(true)),
+        };
+        let owner = CandidateLock {
             session_id,
             session,
-        });
+            lease,
+        };
+        before_lock(owner.lease.clone())?;
+        state.candidate_lock = Some(owner);
         Ok(LockCandidateResult::Acquired)
     }
 
@@ -338,6 +344,10 @@ impl SessionRegistry {
             session_id,
             session,
             lease: Arc::clone(&lease),
+            candidate_lock: state
+                .candidate_lock
+                .as_ref()
+                .map(|owner| owner.lease.clone()),
         });
         CandidateWriteResult::Acquired(CandidateWriteGuard {
             registry: self.clone(),
@@ -579,7 +589,12 @@ impl RegistryState {
             self.running_write = None;
         }
         if self.candidate_write.as_ref().is_some_and(|owner| {
-            !owner.session.active.load(Ordering::Acquire) || !owner.lease.load(Ordering::Acquire)
+            !owner.session.active.load(Ordering::Acquire)
+                || !owner.lease.load(Ordering::Acquire)
+                || owner
+                    .candidate_lock
+                    .as_ref()
+                    .is_some_and(|lease| !lease.is_active())
         }) {
             self.candidate_write = None;
         }
@@ -670,10 +685,31 @@ struct RunningWrite {
     lease: Arc<AtomicBool>,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 struct CandidateLock {
     session_id: u64,
     session: Arc<SessionEntry>,
+    lease: CandidateLockLease,
+}
+
+impl Drop for CandidateLock {
+    fn drop(&mut self) {
+        self.lease.active.store(false, Ordering::Release);
+    }
+}
+
+/// Identity and liveness of one candidate lock, including its session generation.
+/// Release never needs to acquire the server's candidate mutex.
+#[derive(Debug, Clone)]
+pub(crate) struct CandidateLockLease {
+    session: Arc<SessionEntry>,
+    active: Arc<AtomicBool>,
+}
+
+impl CandidateLockLease {
+    pub(crate) fn is_active(&self) -> bool {
+        self.active.load(Ordering::Acquire) && self.session.active.load(Ordering::Acquire)
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -681,6 +717,7 @@ struct CandidateWrite {
     session_id: u64,
     session: Arc<SessionEntry>,
     lease: Arc<AtomicBool>,
+    candidate_lock: Option<CandidateLockLease>,
 }
 
 #[derive(Debug, Clone)]
@@ -715,6 +752,34 @@ impl Drop for RunningWriteGuard {
 pub(crate) struct CandidateWriteGuard {
     registry: SessionRegistry,
     lease: Arc<AtomicBool>,
+}
+
+impl CandidateWriteGuard {
+    /// Applies a local candidate effect only while this exact write lease is
+    /// current. The registry and candidate effect share one critical section;
+    /// an old caller cannot overwrite a replacement session or lock generation.
+    /// The existing async registry worker prevents blocking executor threads.
+    pub(crate) async fn apply_if_current<F>(&self, effect: F) -> Result<bool, SessionRegistryError>
+    where
+        F: FnOnce(Option<CandidateLockLease>) + Send + 'static,
+    {
+        let lease = Arc::clone(&self.lease);
+        self.registry
+            .run_async(move |registry| {
+                let mut state = registry.inner.lock().unwrap_or_else(|err| err.into_inner());
+                state.prune_inactive();
+                let Some(current) = state
+                    .candidate_write
+                    .as_ref()
+                    .filter(|current| Arc::ptr_eq(&current.lease, &lease))
+                else {
+                    return false;
+                };
+                effect(current.candidate_lock.clone());
+                true
+            })
+            .await
+    }
 }
 
 /// Drop guard for an in-flight startup datastore write.
@@ -1191,7 +1256,7 @@ mod tests {
             Ok(LockRunningResult::Acquired)
         );
         assert_eq!(
-            registry.lock_candidate_after(11, || Ok::<(), ()>(())),
+            registry.lock_candidate_after(11, |_| Ok::<(), ()>(())),
             Ok(LockCandidateResult::Acquired)
         );
 
@@ -1218,7 +1283,7 @@ mod tests {
             }
         ));
         assert!(matches!(
-            registry.lock_candidate_after(11, || Ok::<(), ()>(())),
+            registry.lock_candidate_after(11, |_| Ok::<(), ()>(())),
             Ok(LockCandidateResult::Denied {
                 owner_session_id: 10
             })
@@ -1237,7 +1302,7 @@ mod tests {
         let registry = SessionRegistry::new();
         let owner = registry.register(10).expect("owner");
         assert_eq!(
-            registry.lock_candidate_after(10, || Ok::<(), ()>(())),
+            registry.lock_candidate_after(10, |_| Ok::<(), ()>(())),
             Ok(LockCandidateResult::Acquired)
         );
         let guard = match registry.begin_candidate_write(10) {

@@ -56,6 +56,40 @@ durable sinks therefore await acknowledgement without parking a Tokio executor
 thread. The public registry-free synchronous helpers retain their synchronous
 behavior and accept borrowed sink adapters.
 
+### Required configuration audit
+
+`ReadOnlyNetconfServer::with_required_config_audit` installs the capability from
+the exact binding's `ConfigBus::required_config_audit`. For this profile,
+running `edit-config` and NMDA `edit-data` submit their
+original authenticated request together with its required intent. The encrypted
+datastore admits and checkpoints that intent before its effect. The protocol
+does not send a separate Intent to an observation sink or report a second
+terminal outcome after submission. Known commits remain successful when audit
+completion debt fences later writes; recovery resolves the original operation.
+
+This is a partial writable-running profile. Attachment returns
+`RequiredAuditProfileUnsupported` for candidate, confirmed-commit or startup
+bindings, and `RequiredAuditWorkerMismatch` for another bus worker, including
+one opened over the same store. It never hides capabilities. Changed capability
+answers after attachment also fail closed. Full candidate/startup/confirmation
+support remains tracked by #958 and the
+[contract proposal](../../docs/rfc/019-netconf-required-audit.md).
+
+The copy-to-running effect helper uses the same required submitter, but this
+profile has no supported distinct source datastore: candidate and startup are
+refused, and the XML parser does not support inline copy sources. Copying a
+datastore to itself returns `invalid-value` as required by
+[RFC 6241 section 7.3](https://www.rfc-editor.org/rfc/rfc6241.html#section-7.3).
+Helper qualification does not establish positive wire-protocol copy coverage;
+that remains part of the full-profile work in #958.
+
+The supplied legacy sink is replaced by that authority's observation port.
+Reads and denials use asynchronous observations; registry-free synchronous
+dispatch cannot drive the replicated port and fails closed. Atomic registry
+jobs await real asynchronous observation admission on their existing blocking
+worker while retaining the atomic gate and registry guard. They do not create
+configuration commits or acknowledge standalone configuration Intents.
+
 `<kill-session>`, `<lock>`, and `<unlock>` must make one audit-plus-registry
 decision that survives caller cancellation. Their async paths reserve a
 single, fail-fast gate owned by the shared `SessionRegistry`, then run the
@@ -193,6 +227,17 @@ Candidate and startup `<edit-config>`/`<edit-data>`, copies to candidate/startup
 before modifying their local datastore. They preserve the applied result or
 original rejection if terminal recording fails. Cancellation while Intent is
 unacknowledged leaves the datastore unchanged and releases the write reservation.
+
+While the volatile candidate is locked, staged content is tied to that exact
+lock and session incarnation. Explicit unlock or loss of its owner invalidates staged
+content before later reads or writes can use it. Cleanup does not block session
+Drop. A rejected unlock preserves both lock and content. Delayed edits, copies
+and discards from an obsolete write lease fail without changing a replacement
+owner's stage, including numeric session-ID reuse. A successful running commit
+retires only the candidate generation it consumed; a newer stage remains
+available for explicit rebase or discard if its running base is now stale.
+These are process-local lifecycle guarantees, not retained encrypted target
+support or an expansion of the required-audit profile.
 
 Non-persistent confirmed-commit rollback on session exit follows the same
 pre-submit rule. Failed Intent keeps the pending confirmation available for
