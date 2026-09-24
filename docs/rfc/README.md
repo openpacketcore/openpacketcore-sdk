@@ -26,6 +26,7 @@ engineers.
 | [016](016-opaque-gtpu-selector-namespace.md) | Opaque Durable GTP-U Selector Namespace | Experimental durable whole-group selector authority, affine admissions, tombstones, eBPF control binding |
 | [017](017-mixed-selector-provenance-and-restore.md) | Mixed Selector Provenance and Loss-Qualified Restore | Experimental mixed per-atom provenance and marker-retaining namespace restore under RFC 016's ledger |
 | [018](018-never-admitted-selector-relocation.md) | Never-Admitted Selector Namespace Relocation | Explicit relocation under positive permanent no-admission proof; excludes all prior session history |
+| [019](019-netconf-required-audit.md) | NETCONF Required Audit for Exact Configuration Effects | Exact-worker writable-running handoff; candidate, startup and confirmed lifecycle obligations remain open |
 
 ## Recommended Reading Order
 
@@ -47,6 +48,8 @@ engineers.
 16. RFC 016: opaque durable GTP-U selector namespace (after RFC 004, RFC 006, RFC 011, ADR 0018, and ADR 0019).
 17. RFC 017: mixed selector provenance and loss-qualified restore (after RFC 016).
 18. RFC 018: never-admitted selector namespace relocation (after RFC 016 and RFC 017's scope boundaries).
+
+19. RFC 019: NETCONF exact-effect required audit (after RFC 001, RFC 003 and ADR 0025).
 
 RFC 006 should be revisited after each implementation slice because it defines
 the evidence required to claim that the slice is complete.
