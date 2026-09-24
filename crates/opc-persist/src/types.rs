@@ -763,6 +763,9 @@ struct ConfigPrincipalMetadata {
     rollback_label: Option<String>,
 }
 
+#[path = "consensus/config_capacity_principal_value.rs"]
+mod config_principal_value;
+
 #[cfg(test)]
 #[path = "consensus/config_capacity_principal_working_tests.rs"]
 mod config_capacity_principal_working_tests;
@@ -814,7 +817,9 @@ impl<'de> Deserialize<'de> for ConfigPrincipalMetadataProbe {
                                 probe.duplicate_reserved_field = true;
                             }
                             probe.saw_principal = true;
-                            let value = map.next_value::<serde_json::Value>()?;
+                            let value = map.next_value_seed(
+                                config_principal_value::PrincipalValueSeed::retained(),
+                            )?;
                             #[cfg(test)]
                             config_capacity_principal_working_tests::observe_reserved_value(&value);
                             match value {
@@ -830,7 +835,9 @@ impl<'de> Deserialize<'de> for ConfigPrincipalMetadataProbe {
                                 probe.duplicate_reserved_field = true;
                             }
                             probe.saw_replay_lookup_digest = true;
-                            let value = map.next_value::<serde_json::Value>()?;
+                            let value = map.next_value_seed(
+                                config_principal_value::PrincipalValueSeed::retained(),
+                            )?;
                             #[cfg(test)]
                             config_capacity_principal_working_tests::observe_reserved_value(&value);
                             match value {
@@ -847,7 +854,9 @@ impl<'de> Deserialize<'de> for ConfigPrincipalMetadataProbe {
                                 probe.duplicate_reserved_field = true;
                             }
                             probe.saw_recovery_required = true;
-                            let value = map.next_value::<serde_json::Value>()?;
+                            let value = map.next_value_seed(
+                                config_principal_value::PrincipalValueSeed::retained(),
+                            )?;
                             #[cfg(test)]
                             config_capacity_principal_working_tests::observe_reserved_value(&value);
                             match value {
@@ -863,7 +872,9 @@ impl<'de> Deserialize<'de> for ConfigPrincipalMetadataProbe {
                                 probe.duplicate_reserved_field = true;
                             }
                             probe.saw_rollback_label = true;
-                            let value = map.next_value::<serde_json::Value>()?;
+                            let value = map.next_value_seed(
+                                config_principal_value::PrincipalValueSeed::retained(),
+                            )?;
                             #[cfg(test)]
                             config_capacity_principal_working_tests::observe_reserved_value(&value);
                             match value {
