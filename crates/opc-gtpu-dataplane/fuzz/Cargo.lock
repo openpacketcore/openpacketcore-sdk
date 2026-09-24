@@ -1444,7 +1444,7 @@ dependencies = [
 [[package]]
 name = "openraft"
 version = "0.9.24"
-source = "git+https://github.com/openpacketcore/openraft?rev=6bedb5f5d3890b08a82ca1ac53c93b7cfaf5560e#6bedb5f5d3890b08a82ca1ac53c93b7cfaf5560e"
+source = "git+https://github.com/openpacketcore/openraft?rev=88c8627c35d96d80cb304d3f50fadc8c1b21a5cb#88c8627c35d96d80cb304d3f50fadc8c1b21a5cb"
 dependencies = [
  "anyerror",
  "byte-unit",
@@ -1466,7 +1466,7 @@ dependencies = [
 [[package]]
 name = "openraft-macros"
 version = "0.9.24"
-source = "git+https://github.com/openpacketcore/openraft?rev=6bedb5f5d3890b08a82ca1ac53c93b7cfaf5560e#6bedb5f5d3890b08a82ca1ac53c93b7cfaf5560e"
+source = "git+https://github.com/openpacketcore/openraft?rev=88c8627c35d96d80cb304d3f50fadc8c1b21a5cb#88c8627c35d96d80cb304d3f50fadc8c1b21a5cb"
 dependencies = [
  "chrono",
  "proc-macro2",
