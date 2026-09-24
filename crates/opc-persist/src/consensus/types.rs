@@ -1,13 +1,12 @@
 //! Config state-machine commands built on the shared consensus substrate.
 
 use std::collections::BTreeSet;
-use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use hmac::{Hmac, KeyInit, Mac};
 use opc_consensus::{ConsensusEntryDigest, ConsensusIdentity};
-use opc_crypto::CryptoEnvelopeV1;
+use opc_crypto::CryptoEnvelopeRef;
 use opc_types::{Timestamp, TxId};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -51,6 +50,24 @@ pub const CONFIG_CONSENSUS_SNAPSHOT_VERSION: u16 = 5;
 /// an exact match and do not negotiate a downgrade.
 pub const CONFIG_CONSENSUS_WIRE_VERSION: u16 = 7;
 
+/// The opt-in profile has distinct on-disk and snapshot revisions. Existing
+/// constants and legacy encodings remain unchanged; there is no migration.
+pub(crate) const fn config_storage_revision(profile: opc_crypto::ConfigCapacityProfile) -> u16 {
+    match profile {
+        opc_crypto::ConfigCapacityProfile::Legacy => CONFIG_CONSENSUS_STORAGE_VERSION,
+        opc_crypto::ConfigCapacityProfile::BoundedV1 => 6,
+        _ => 0,
+    }
+}
+
+pub(crate) const fn config_snapshot_revision(profile: opc_crypto::ConfigCapacityProfile) -> u16 {
+    match profile {
+        opc_crypto::ConfigCapacityProfile::Legacy => CONFIG_CONSENSUS_SNAPSHOT_VERSION,
+        opc_crypto::ConfigCapacityProfile::BoundedV1 => 6,
+        _ => 0,
+    }
+}
+
 /// Maximum configured voter count admitted by the config consensus adapter.
 pub const CONFIG_CONSENSUS_MAX_MEMBERS: usize = 9;
 
@@ -62,6 +79,9 @@ const AUDIT_PATH_TOKEN_PREFIX: &str = "hmac-sha256:";
 pub(crate) const CONFIG_PRINCIPAL_MAX_BYTES: usize = 16 * 1024;
 pub(crate) const CONFIG_AUDIT_RECORDS_MAX: usize = 16_384;
 pub(crate) const CONFIG_AUDIT_PATH_MAX_BYTES: usize = 8 * 1024;
+/// Complete postcard command minus one envelope's byte content. Its length
+/// prefix, record proof, audit handle and all other framing remain charged.
+pub(super) const CONFIG_CAPACITY_V1_METADATA_BYTES: usize = 192 * 1024;
 
 /// Immutable scope and exact voter set for one config consensus node.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -233,11 +253,29 @@ impl PreparedConfigCommit {
     /// Every audit value is masked, even when it is not classified as secret,
     /// so no configuration value can enter a Raft log or wire frame. The audit
     /// key is used here and is never retained by the command or state machine.
+    #[cfg(test)]
     pub(crate) fn prepare(
+        record: CommitRecord,
+        audit: Vec<AuditRecord>,
+        audit_key: &crate::types::AuditKey,
+    ) -> Result<Self, PersistError> {
+        Self::prepare_for_profile(
+            record,
+            audit,
+            audit_key,
+            opc_crypto::ConfigCapacityProfile::Legacy,
+        )
+    }
+
+    /// Use the authority's immutable profile for the early necessary bound.
+    /// Full command metadata admission still follows finalized preparation.
+    pub(crate) fn prepare_for_profile(
         record: CommitRecord,
         mut audit: Vec<AuditRecord>,
         audit_key: &crate::types::AuditKey,
+        profile: opc_crypto::ConfigCapacityProfile,
     ) -> Result<Self, PersistError> {
+        preflight_preparation_capacity(&record, &audit, audit.capacity(), profile, audit_key)?;
         validate_record_representability(&record)?;
         if audit.len() > CONFIG_AUDIT_RECORDS_MAX {
             return Err(PersistError::constraint_violation(
@@ -246,6 +284,9 @@ impl PreparedConfigCommit {
         }
         let audit_count =
             u32::try_from(audit.len()).map_err(|_| PersistError::audit_chain_broken())?;
+        #[cfg(test)]
+        config_capacity_audit_preparation_tests::observe_start();
+        preflight_finalized_audit_size(&audit, audit_key, profile)?;
         let tenant = extract_tenant(&record.principal);
         let mut previous_hash = [0_u8; 32];
         for (expected_sequence, entry) in audit.iter_mut().enumerate() {
@@ -255,6 +296,8 @@ impl PreparedConfigCommit {
                 return Err(PersistError::audit_chain_broken());
             }
             entry.yang_path = tokenize_audit_path(&entry.yang_path, audit_key)?;
+            #[cfg(test)]
+            config_capacity_audit_preparation_tests::observe_path(entry.yang_path.capacity());
             if entry.previous_value.is_some() {
                 entry.previous_value = Some(REDACTED_AUDIT_VALUE.to_owned());
                 entry.redaction_applied = true;
@@ -304,6 +347,156 @@ impl PreparedConfigCommit {
     }
 }
 
+// A necessary preparation check against the proposed entire-operation allowance.
+// Keep room for all transferred owners and the emitted audit replacement bytes
+// simultaneously; original fields still exist while each replacement is built.
+// This is not a sufficient whole-operation budget: validation temporaries,
+// allocator rounding, caller allocations and later phases remain separate.
+fn preflight_preparation_capacity(
+    record: &CommitRecord,
+    audit: &[AuditRecord],
+    audit_capacity: usize,
+    profile: opc_crypto::ConfigCapacityProfile,
+    audit_key: &crate::types::AuditKey,
+) -> Result<(), PersistError> {
+    match profile {
+        opc_crypto::ConfigCapacityProfile::Legacy => return Ok(()),
+        opc_crypto::ConfigCapacityProfile::BoundedV1 => {}
+        _ => return Err(PersistError::corrupt_blob()),
+    }
+    const PREPARATION_NECESSARY_MAX_BYTES: usize = 32 * 1024 * 1024;
+    let too_large = || {
+        PersistError::constraint_violation("config preparation allocation exceeds working limit")
+    };
+    // This includes the record and Vec/String control blocks. The audit
+    // backing allocation includes initialized and unused element capacity;
+    // only initialized elements own nested String allocations.
+    let mut owned_bytes = std::mem::size_of::<PreparedConfigCommit>();
+    let mut charge = |bytes: usize| -> Result<(), PersistError> {
+        owned_bytes = owned_bytes
+            .checked_add(bytes)
+            .filter(|total| *total <= PREPARATION_NECESSARY_MAX_BYTES)
+            .ok_or_else(too_large)?;
+        Ok(())
+    };
+    charge(record.encrypted_blob.capacity())?;
+    charge(record.plaintext_digest.capacity())?;
+    charge(record.principal.capacity())?;
+    charge(
+        audit_capacity
+            .checked_mul(std::mem::size_of::<AuditRecord>())
+            .ok_or_else(too_large)?,
+    )?;
+    for entry in audit {
+        charge(entry.yang_path.capacity())?;
+        if let Some(value) = &entry.previous_value {
+            charge(value.capacity())?;
+        }
+        if let Some(value) = &entry.new_value {
+            charge(value.capacity())?;
+        }
+    }
+    // The header KeyId copy and canonical AAD output coexist with transferred
+    // input owners during validation. Inspect their encoded extents before
+    // invoking any allocating decoder. This necessary byte floor does not
+    // qualify parser scratch, decoded-owner capacities or the whole operation.
+    let (header_key_bytes, aad_bytes) =
+        CryptoEnvelopeRef::encoded_metadata_lengths(&record.encrypted_blob)
+            .map_err(|_| PersistError::corrupt_blob())?;
+    charge(header_key_bytes)?;
+    charge(aad_bytes)?;
+    // Count with the existing bounded emitter before validation or output
+    // allocation. Charge every new output while conservatively retaining all
+    // old inputs; do not subtract the raw path before its replacement exists.
+    for entry in audit {
+        validate_audit_path_input(&entry.yang_path)?;
+        let mut finalized_bytes = AuditPathByteCount(0);
+        write_tokenized_audit_path(&entry.yang_path, audit_key, &mut finalized_bytes)?;
+        charge(finalized_bytes.0)?;
+        if entry.previous_value.is_some() {
+            charge(REDACTED_AUDIT_VALUE.len())?;
+        }
+        if entry.new_value.is_some() {
+            charge(REDACTED_AUDIT_VALUE.len())?;
+        }
+    }
+    Ok(())
+}
+
+// Count the finalized vector before replacing any path. Its necessary bound
+// is the Legacy command ceiling or the bounded profile's metadata ceiling.
+// Complete command metadata and resource admission remain separate checks.
+// No legacy command that fitted its original fence acquires a smaller bound.
+fn preflight_finalized_audit_size(
+    audit: &[AuditRecord],
+    audit_key: &crate::types::AuditKey,
+    profile: opc_crypto::ConfigCapacityProfile,
+) -> Result<(), PersistError> {
+    let limit = match profile {
+        opc_crypto::ConfigCapacityProfile::Legacy => {
+            opc_consensus::DURABLE_OPENRAFT_APPEND_ENTRIES_TARGET_BYTES
+        }
+        opc_crypto::ConfigCapacityProfile::BoundedV1 => CONFIG_CAPACITY_V1_METADATA_BYTES,
+        _ => return Err(PersistError::corrupt_blob()),
+    };
+    // Postcard string sizing depends only on byte length. This static ASCII
+    // placeholder avoids allocating each finalized path merely to count it.
+    static PATH_BYTES: [u8; CONFIG_AUDIT_PATH_MAX_BYTES] = [b'x'; CONFIG_AUDIT_PATH_MAX_BYTES];
+    let mut total = audit_component_encoded_size(&audit.len())?;
+    for entry in audit {
+        validate_audit_path_input(&entry.yang_path)?;
+        let mut path_bytes = AuditPathByteCount(0);
+        write_tokenized_audit_path(&entry.yang_path, audit_key, &mut path_bytes)?;
+        let path = std::str::from_utf8(&PATH_BYTES[..path_bytes.0])
+            .map_err(|_| PersistError::audit_chain_broken())?;
+        let probe = FinalizedAuditSizeProbe {
+            tx_id: &entry.tx_id,
+            sequence: entry.sequence,
+            yang_path: path,
+            op_type: &entry.op_type,
+            previous_value: entry.previous_value.as_ref().map(|_| REDACTED_AUDIT_VALUE),
+            new_value: entry.new_value.as_ref().map(|_| REDACTED_AUDIT_VALUE),
+            redaction_applied: entry.redaction_applied
+                || entry.previous_value.is_some()
+                || entry.new_value.is_some(),
+            // Postcard writes every u8 as one byte. Hash contents cannot change
+            // their encoded size; the real chain is produced only after admission.
+            previous_hash: &entry.previous_hash,
+            entry_hmac: &entry.entry_hmac,
+        };
+        total = total
+            .checked_add(audit_component_encoded_size(&probe)?)
+            .filter(|bytes| *bytes <= limit)
+            .ok_or_else(|| {
+                PersistError::constraint_violation("config audit exceeds command byte limit")
+            })?;
+    }
+    Ok(())
+}
+
+// Match AuditRecord's field order and representation. The boundary fixture
+// compares this admission with the actual finalized vector's postcard size.
+#[derive(Serialize)]
+struct FinalizedAuditSizeProbe<'a> {
+    tx_id: &'a TxId,
+    sequence: u32,
+    yang_path: &'a str,
+    op_type: &'a crate::types::AuditOpType,
+    previous_value: Option<&'a str>,
+    new_value: Option<&'a str>,
+    redaction_applied: bool,
+    previous_hash: &'a [u8; 32],
+    entry_hmac: &'a [u8; 32],
+}
+
+fn audit_component_encoded_size(value: &impl Serialize) -> Result<usize, PersistError> {
+    let mut counter = opc_consensus::AppendEntriesBatchAccumulator::new();
+    counter.consider(value).map_err(|_| {
+        PersistError::constraint_violation("config audit cannot be sized for admission")
+    })?;
+    Ok(counter.serialized_entry_bytes())
+}
+
 fn validate_confirmed_resolution(
     record: &CommitRecord,
     resolution: ConfirmedCommitResolution,
@@ -313,6 +506,17 @@ fn validate_confirmed_resolution(
     {
         return Err(PersistError::constraint_violation(
             "confirmed resolution does not match a non-pending successor",
+        ));
+    }
+    Ok(())
+}
+
+fn validate_rollback_point_label(
+    label: Option<&ValidatedRollbackLabel>,
+) -> Result<(), PersistError> {
+    if label.is_some_and(|label| crate::types::validate_rollback_label(label.as_str()).is_err()) {
+        return Err(PersistError::constraint_violation(
+            "rollback label is not canonically representable",
         ));
     }
     Ok(())
@@ -346,13 +550,22 @@ pub(crate) enum ConfigMutationIntent {
     /// Explicit acknowledged-prefix retention under exact-head authority.
     RetainHistory(super::ConfigHistoryRetention),
     /// Purpose-separated management ledger, with no configuration version change.
-    ManagementAudit(super::audit::AuditCommand),
+    /// Indirection keeps unrelated intents small; serde retains the original
+    /// variant index, JSON name and payload bytes.
+    ManagementAudit(Box<super::audit::AuditCommand>),
     /// Exact configuration effect and recoverable audit outcome, applied atomically.
-    AuditedMutation(super::PreparedAuditedMutation),
+    AuditedMutation(super::audit_mutation::AuditedConfigCommand),
+    /// Append with a size proof issued from the paired encryption evidence.
+    /// This stays last: legacy postcard indices and durable JSON are unchanged.
+    BoundedAppend {
+        commit: Box<PreparedConfigCommit>,
+        binding: super::capacity_record::CapacityRecordBinding,
+        resolution: Option<ConfirmedCommitResolution>,
+    },
 }
 
 impl ConfigMutationIntent {
-    const fn minimum_command_version(&self) -> u16 {
+    pub(super) fn minimum_command_version(&self) -> u16 {
         match self {
             Self::AppendCommit(_)
             | Self::MarkConfirmed { .. }
@@ -361,8 +574,9 @@ impl ConfigMutationIntent {
                 ATOMIC_CONFIG_CONSENSUS_COMMAND_VERSION
             }
             Self::RetainHistory(_) => 4,
-            Self::AuditedMutation(_) => 5,
-            Self::ManagementAudit(command) => match command {
+            Self::BoundedAppend { .. } => 8,
+            Self::AuditedMutation(prepared) => prepared.effect.minimum_command_version(),
+            Self::ManagementAudit(command) => match command.as_ref() {
                 super::audit::AuditCommand::Initialize { .. }
                 | super::audit::AuditCommand::Intent(_)
                 | super::audit::AuditCommand::Reject(_)
@@ -373,9 +587,98 @@ impl ConfigMutationIntent {
         }
     }
 
+    pub(super) fn prepared_append(
+        commit: PreparedConfigCommit,
+        resolution: Option<ConfirmedCommitResolution>,
+        binding: Option<super::capacity_record::CapacityRecordBinding>,
+    ) -> Self {
+        match (binding, resolution) {
+            (Some(binding), resolution) => Self::BoundedAppend {
+                commit: Box::new(commit),
+                binding,
+                resolution,
+            },
+            (None, Some(resolution)) => Self::ResolveConfirmedAndAppend {
+                commit: Box::new(commit),
+                resolution,
+            },
+            (None, None) => Self::AppendCommit(Box::new(commit)),
+        }
+    }
+
+    /// Enforce the admitted authority's profile without trusting the incoming
+    /// command revision or its record proof to select that profile.
+    pub(super) fn validate_capacity(
+        &self,
+        identity: ConfigConsensusIdentity,
+        key: &crate::AuditKey,
+        profile: opc_crypto::ConfigCapacityProfile,
+    ) -> Result<(), PersistError> {
+        use opc_crypto::ConfigCapacityProfile;
+        if !matches!(
+            profile,
+            ConfigCapacityProfile::Legacy | ConfigCapacityProfile::BoundedV1
+        ) {
+            return Err(PersistError::corrupt_blob());
+        }
+        match self {
+            Self::BoundedAppend {
+                commit, binding, ..
+            } => binding.verify(&commit.record, identity, key, profile),
+            Self::AppendCommit(_) | Self::ResolveConfirmedAndAppend { .. }
+                if profile != ConfigCapacityProfile::Legacy =>
+            {
+                Err(PersistError::corrupt_blob())
+            }
+            Self::AuditedMutation(prepared) => prepared
+                .effect
+                .verify_capacity(identity, key, profile)
+                .map(|_| ()),
+            _ => Ok(()),
+        }
+    }
+
+    /// Charge the actual complete encoding, excluding only the single
+    /// encrypted record's byte content. No-envelope commands charge all bytes.
+    /// The received proof or revision cannot select the admitted profile.
+    pub(super) fn metadata_fits_profile(
+        &self,
+        complete_bytes: usize,
+        profile: opc_crypto::ConfigCapacityProfile,
+    ) -> bool {
+        match profile {
+            opc_crypto::ConfigCapacityProfile::Legacy => return true,
+            opc_crypto::ConfigCapacityProfile::BoundedV1 => {}
+            _ => return false,
+        }
+        let envelope_bytes = match self {
+            Self::AppendCommit(commit)
+            | Self::ResolveConfirmedAndAppend { commit, .. }
+            | Self::BoundedAppend { commit, .. } => commit.record.encrypted_blob.len(),
+            Self::AuditedMutation(prepared) => match &prepared.effect {
+                super::audit_mutation::AuditedConfigEffect::Append { commit, .. }
+                | super::audit_mutation::AuditedConfigEffect::BoundedAppend { commit, .. } => {
+                    commit.record.encrypted_blob.len()
+                }
+                super::audit_mutation::AuditedConfigEffect::Confirm { .. }
+                | super::audit_mutation::AuditedConfigEffect::RollbackPoint { .. } => 0,
+            },
+            Self::MarkConfirmed { .. }
+            | Self::CreateRollbackPoint { .. }
+            | Self::ClearRecoveryRequired { .. }
+            | Self::RetainHistory(_)
+            | Self::ManagementAudit(_) => 0,
+        };
+        complete_bytes
+            .checked_sub(envelope_bytes)
+            .is_some_and(|bytes| bytes <= CONFIG_CAPACITY_V1_METADATA_BYTES)
+    }
+
     fn inline_rollback_label(&self) -> Result<Option<String>, PersistError> {
         match self {
-            Self::AppendCommit(commit) | Self::ResolveConfirmedAndAppend { commit, .. } => {
+            Self::AppendCommit(commit)
+            | Self::ResolveConfirmedAndAppend { commit, .. }
+            | Self::BoundedAppend { commit, .. } => {
                 crate::types::config_rollback_label(&commit.record.principal)
             }
             Self::MarkConfirmed { .. }
@@ -426,11 +729,13 @@ impl ConfigConsensusCommand {
         // resubmit the same durable request ID through a newer binary and
         // receive the stored outcome instead of a false collision.
         let semantic_revision = self.intent.minimum_command_version();
-        let bytes = serde_json::to_vec(&(semantic_revision, self.identity, &self.intent))
-            .map_err(|_| PersistError::inconsistent_state("config consensus encoding failed"))?;
         let mut hasher = Sha256::new();
         hasher.update(OUTCOME_DIGEST_DOMAIN);
-        hasher.update(bytes);
+        serde_json::to_writer(
+            ConfigDigestWriter(&mut hasher),
+            &(semantic_revision, self.identity, &self.intent),
+        )
+        .map_err(|_| PersistError::inconsistent_state("config consensus encoding failed"))?;
         Ok(hasher.finalize().into())
     }
 
@@ -441,16 +746,38 @@ impl ConfigConsensusCommand {
         previous: ConfigConsensusEntryDigest,
         effective_time: Timestamp,
     ) -> Result<ConfigConsensusEntryDigest, PersistError> {
-        let bytes = serde_json::to_vec(&(sequence, previous, effective_time, self))
-            .map_err(|_| PersistError::inconsistent_state("config consensus digest failed"))?;
         let mut hasher = Sha256::new();
         hasher.update(COMMAND_DIGEST_DOMAIN);
-        hasher.update(bytes);
+        serde_json::to_writer(
+            ConfigDigestWriter(&mut hasher),
+            &(sequence, previous, effective_time, self),
+        )
+        .map_err(|_| PersistError::inconsistent_state("config consensus digest failed"))?;
         Ok(ConsensusEntryDigest::from_bytes(hasher.finalize().into()))
     }
 
     /// Validate scope, schema, and encrypted command contents.
     pub(crate) fn validate(&self, identity: ConsensusIdentity) -> Result<(), PersistError> {
+        // Bound the new record's framing before the general record/AAD or
+        // principal projection decoders can allocate from untrusted lengths.
+        match &self.intent {
+            ConfigMutationIntent::BoundedAppend {
+                commit, binding, ..
+            } => {
+                binding.validate(&commit.record)?;
+            }
+            ConfigMutationIntent::AuditedMutation(prepared) => {
+                if let super::audit_mutation::AuditedConfigEffect::BoundedAppend {
+                    commit,
+                    binding,
+                    ..
+                } = &prepared.effect
+                {
+                    binding.validate(&commit.record)?;
+                }
+            }
+            _ => {}
+        }
         let has_inline_rollback_label = self.intent.inline_rollback_label()?.is_some();
         let supported_revision = match self.schema_version {
             LEGACY_CONFIG_CONSENSUS_COMMAND_VERSION => {
@@ -465,7 +792,10 @@ impl ConfigConsensusCommand {
             4 => self.intent.minimum_command_version() <= 4,
             5 => self.intent.minimum_command_version() <= 5,
             6 => self.intent.minimum_command_version() <= 6,
-            CONFIG_CONSENSUS_COMMAND_VERSION => true,
+            CONFIG_CONSENSUS_COMMAND_VERSION => {
+                self.intent.minimum_command_version() <= CONFIG_CONSENSUS_COMMAND_VERSION
+            }
+            8 => self.intent.minimum_command_version() <= 8,
             _ => false,
         };
         if !supported_revision || self.identity != identity {
@@ -479,28 +809,107 @@ impl ConfigConsensusCommand {
                 commit.validate()?;
                 validate_confirmed_resolution(&commit.record, *resolution)?;
             }
+            ConfigMutationIntent::BoundedAppend {
+                commit, resolution, ..
+            } => {
+                commit.validate()?;
+                if let Some(resolution) = resolution {
+                    validate_confirmed_resolution(&commit.record, *resolution)?;
+                }
+            }
             ConfigMutationIntent::RetainHistory(retention) => retention.validate()?,
             ConfigMutationIntent::ManagementAudit(_) => {}
             ConfigMutationIntent::AuditedMutation(prepared) => {
-                let nested = Self {
-                    intent: prepared.effect.intent(),
-                    ..self.clone()
-                };
-                nested.validate(identity)?;
+                // The outer revision check accounts for the effect's revision.
+                // Preserve the inner validation order without materializing a
+                // second owned intent and copying its complete encrypted record.
+                match &prepared.effect {
+                    super::audit_mutation::AuditedConfigEffect::Append { commit, resolution } => {
+                        crate::types::config_rollback_label(&commit.record.principal)?;
+                        commit.validate()?;
+                        if let Some(resolution) = resolution {
+                            validate_confirmed_resolution(&commit.record, *resolution)?;
+                        }
+                    }
+                    super::audit_mutation::AuditedConfigEffect::BoundedAppend {
+                        commit,
+                        resolution,
+                        ..
+                    } => {
+                        crate::types::config_rollback_label(&commit.record.principal)?;
+                        commit.validate()?;
+                        if let Some(resolution) = resolution {
+                            validate_confirmed_resolution(&commit.record, *resolution)?;
+                        }
+                    }
+                    super::audit_mutation::AuditedConfigEffect::Confirm { .. } => {}
+                    super::audit_mutation::AuditedConfigEffect::RollbackPoint { label, .. } => {
+                        validate_rollback_point_label(label.as_ref())?;
+                    }
+                }
             }
             ConfigMutationIntent::ClearRecoveryRequired { .. } => {}
             ConfigMutationIntent::MarkConfirmed { .. } => {}
             ConfigMutationIntent::CreateRollbackPoint { label, .. } => {
-                if label
-                    .as_ref()
-                    .is_some_and(|label| ValidatedRollbackLabel::try_new(label.0.clone()).is_err())
+                validate_rollback_point_label(label.as_ref())?;
+            }
+        }
+        Ok(())
+    }
+
+    pub(super) fn validate_for_profile(
+        &self,
+        identity: ConfigConsensusIdentity,
+        key: &crate::AuditKey,
+        profile: opc_crypto::ConfigCapacityProfile,
+    ) -> Result<(), PersistError> {
+        match profile {
+            opc_crypto::ConfigCapacityProfile::Legacy => {}
+            opc_crypto::ConfigCapacityProfile::BoundedV1 => {
+                // Count the actual borrowed command without materializing its
+                // encoding, before allocating structural validation helpers.
+                let mut counter = opc_consensus::AppendEntriesBatchAccumulator::new();
+                counter
+                    .consider(self)
+                    .map_err(|_| PersistError::corrupt_blob())?;
+                if !self
+                    .intent
+                    .metadata_fits_profile(counter.serialized_entry_bytes(), profile)
                 {
                     return Err(PersistError::constraint_violation(
-                        "rollback label is not canonically representable",
+                        "config consensus metadata exceeds byte limit",
                     ));
                 }
             }
+            _ => return Err(PersistError::corrupt_blob()),
         }
+        self.validate(identity)?;
+        if self.schema_version > config_command_revision(profile) {
+            return Err(PersistError::corrupt_blob());
+        }
+        self.intent.validate_capacity(identity, key, profile)
+    }
+}
+
+pub(super) fn config_command_revision(profile: opc_crypto::ConfigCapacityProfile) -> u16 {
+    match profile {
+        opc_crypto::ConfigCapacityProfile::Legacy => CONFIG_CONSENSUS_COMMAND_VERSION,
+        opc_crypto::ConfigCapacityProfile::BoundedV1 => 8,
+        _ => 0,
+    }
+}
+
+// Feed the identical canonical JSON into the digest without retaining an
+// expanded JSON command allocation alongside the encrypted record.
+struct ConfigDigestWriter<'a>(&'a mut Sha256);
+
+impl std::io::Write for ConfigDigestWriter<'_> {
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        self.0.update(bytes);
+        Ok(bytes.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
         Ok(())
     }
 }
@@ -537,6 +946,18 @@ impl ConfigMutationFailure {
     }
 }
 
+#[cfg(test)]
+mod config_capacity_wire_tests;
+
+#[cfg(test)]
+mod config_capacity_command_layout_tests;
+
+#[cfg(test)]
+mod config_capacity_tokenization_tests;
+
+#[cfg(test)]
+mod config_capacity_audit_preparation_tests;
+
 /// Persisted result returned after durable quorum commit and local apply.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) struct ConfigConsensusResponse {
@@ -555,13 +976,30 @@ pub(crate) struct ConfigConsensusResponse {
     pub(crate) audit_receipt: Option<crate::audit_authority::receipt::AuthenticatedAuditReceipt>,
 }
 
+#[cfg(test)]
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) struct ConfigWirePayload<T> {
     revision: u16,
     value: T,
 }
 
+pub(crate) const fn config_wire_revision(profile: opc_crypto::ConfigCapacityProfile) -> u16 {
+    match profile {
+        opc_crypto::ConfigCapacityProfile::Legacy => CONFIG_CONSENSUS_WIRE_VERSION,
+        opc_crypto::ConfigCapacityProfile::BoundedV1 => 8,
+        _ => 0, // An unknown profile cannot silently acquire legacy admission.
+    }
+}
+
+#[cfg(test)]
 pub(crate) fn encode_config_wire<T: Serialize + ?Sized>(
+    value: &T,
+) -> Result<Vec<u8>, opc_consensus::ConsensusCodecError> {
+    encode_config_wire_for_profile(opc_crypto::ConfigCapacityProfile::Legacy, value)
+}
+
+pub(crate) fn encode_config_wire_for_profile<T: Serialize + ?Sized>(
+    profile: opc_crypto::ConfigCapacityProfile,
     value: &T,
 ) -> Result<Vec<u8>, opc_consensus::ConsensusCodecError> {
     #[derive(Serialize)]
@@ -570,19 +1008,77 @@ pub(crate) fn encode_config_wire<T: Serialize + ?Sized>(
         value: &'a T,
     }
     opc_consensus::encode_bounded(&BorrowedConfigWirePayload {
-        revision: CONFIG_CONSENSUS_WIRE_VERSION,
+        revision: config_wire_revision(profile),
         value,
     })
 }
 
+// Validate the profile discriminator before asking the payload to deserialize.
+// This keeps a mismatched peer from allocating its command or snapshot chunk
+// before the immutable configuration profile has been checked.
+struct CheckedConfigWire<T, const REVISION: u16>(T);
+
+impl<'de, T: serde::Deserialize<'de>, const REVISION: u16> serde::Deserialize<'de>
+    for CheckedConfigWire<T, REVISION>
+{
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        struct Visitor<T, const REVISION: u16>(std::marker::PhantomData<T>);
+        impl<'de, T: serde::Deserialize<'de>, const REVISION: u16> serde::de::Visitor<'de>
+            for Visitor<T, REVISION>
+        {
+            type Value = CheckedConfigWire<T, REVISION>;
+
+            fn expecting(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                f.write_str("an exact configuration wire profile")
+            }
+
+            fn visit_seq<A: serde::de::SeqAccess<'de>>(
+                self,
+                mut fields: A,
+            ) -> Result<Self::Value, A::Error> {
+                let revision: u16 = fields.next_element()?.ok_or_else(|| {
+                    serde::de::Error::custom("missing configuration wire profile")
+                })?;
+                if revision != REVISION {
+                    return Err(serde::de::Error::custom(
+                        "configuration wire profile mismatch",
+                    ));
+                }
+                let value = fields.next_element()?.ok_or_else(|| {
+                    serde::de::Error::custom("missing configuration wire payload")
+                })?;
+                Ok(CheckedConfigWire(value))
+            }
+        }
+        deserializer.deserialize_struct(
+            "ConfigWirePayload",
+            &["revision", "value"],
+            Visitor::<T, REVISION>(std::marker::PhantomData),
+        )
+    }
+}
+
+#[cfg(test)]
 pub(crate) fn decode_config_wire<T: serde::de::DeserializeOwned>(
     bytes: &[u8],
 ) -> Result<T, opc_consensus::ConsensusCodecError> {
-    let payload: ConfigWirePayload<T> = opc_consensus::decode_bounded(bytes)?;
-    if payload.revision != CONFIG_CONSENSUS_WIRE_VERSION {
-        return Err(opc_consensus::ConsensusCodecError::Decode);
+    decode_config_wire_for_profile(opc_crypto::ConfigCapacityProfile::Legacy, bytes)
+}
+
+pub(crate) fn decode_config_wire_for_profile<T: serde::de::DeserializeOwned>(
+    profile: opc_crypto::ConfigCapacityProfile,
+    bytes: &[u8],
+) -> Result<T, opc_consensus::ConsensusCodecError> {
+    match profile {
+        opc_crypto::ConfigCapacityProfile::Legacy => opc_consensus::decode_bounded::<
+            CheckedConfigWire<T, CONFIG_CONSENSUS_WIRE_VERSION>,
+        >(bytes)
+        .map(|payload| payload.0),
+        opc_crypto::ConfigCapacityProfile::BoundedV1 => {
+            opc_consensus::decode_bounded::<CheckedConfigWire<T, 8>>(bytes).map(|payload| payload.0)
+        }
+        _ => Err(opc_consensus::ConsensusCodecError::Decode),
     }
-    Ok(payload.value)
 }
 
 impl ConfigConsensusResponse {
@@ -592,12 +1088,50 @@ impl ConfigConsensusResponse {
     }
 }
 
+/// Immutable encrypted-record fields shared by commands and borrowed SQL rows.
+/// Mutable retention/rollback projections are authenticated separately. A view
+/// carries no attestation or mutation authority by itself.
+#[derive(Clone, Copy)]
+pub(super) struct ConfigRecordView<'a> {
+    pub(super) tx_id: TxId,
+    pub(super) parent_tx_id: Option<TxId>,
+    pub(super) version: opc_types::ConfigVersion,
+    pub(super) committed_at: Timestamp,
+    pub(super) principal: &'a str,
+    pub(super) schema_digest: opc_types::SchemaDigest,
+    pub(super) plaintext_digest: &'a [u8],
+    pub(super) encrypted_blob: &'a [u8],
+}
+
+impl<'a> From<&'a CommitRecord> for ConfigRecordView<'a> {
+    fn from(record: &'a CommitRecord) -> Self {
+        Self {
+            tx_id: record.tx_id,
+            parent_tx_id: record.parent_tx_id,
+            version: record.version,
+            committed_at: record.committed_at,
+            principal: &record.principal,
+            schema_digest: record.schema_digest,
+            plaintext_digest: &record.plaintext_digest,
+            encrypted_blob: &record.encrypted_blob,
+        }
+    }
+}
+
 /// Validate that the config payload is a structurally valid AEAD envelope.
 pub(crate) fn validate_encrypted_record(record: &CommitRecord) -> Result<(), PersistError> {
+    validate_encrypted_record_view(ConfigRecordView::from(record))
+}
+
+/// Validate while ciphertext remains borrowed from the same immutable command
+/// or SQL row that consumes the result. No borrowed data escapes this call.
+pub(super) fn validate_encrypted_record_view(
+    record: ConfigRecordView<'_>,
+) -> Result<(), PersistError> {
     if record.plaintext_digest.len() != 32 || record.encrypted_blob.is_empty() {
         return Err(PersistError::corrupt_blob());
     }
-    let envelope = CryptoEnvelopeV1::decode(&record.encrypted_blob)
+    let envelope = CryptoEnvelopeRef::decode(record.encrypted_blob)
         .map_err(|_| PersistError::corrupt_blob())?;
     if envelope.nonce.len() != envelope.algorithm.nonce_len()
         || envelope.aad.is_empty()
@@ -606,18 +1140,20 @@ pub(crate) fn validate_encrypted_record(record: &CommitRecord) -> Result<(), Per
         return Err(PersistError::corrupt_blob());
     }
     let (aad, bound_key_id) =
-        opc_key::decode_bound_aad(&envelope.aad).map_err(|_| PersistError::corrupt_blob())?;
+        opc_key::decode_bound_aad(envelope.aad).map_err(|_| PersistError::corrupt_blob())?;
     let opc_key::EnvelopeMetadata::Config(metadata) = aad.metadata() else {
         return Err(PersistError::corrupt_blob());
     };
+    #[cfg(test)]
+    config_capacity_aad_working_tests::observe_decoded_principal(metadata.principal().len());
     if bound_key_id != envelope.key_id
         || aad.purpose() != opc_key::KeyPurpose::Config
         || aad.version() != record.version.get()
-        || aad.tenant().as_str() != extract_tenant(&record.principal)
+        || aad.tenant().as_str() != extract_tenant(record.principal)
         || metadata.tx_id() != &record.tx_id
         || metadata.parent_tx_id() != record.parent_tx_id.as_ref()
         || metadata.committed_at() != &record.committed_at
-        || !crate::types::config_principal_matches_aad(&record.principal, metadata.principal())
+        || !crate::types::config_principal_matches_aad(record.principal, metadata.principal())
         || metadata.schema_digest() != &record.schema_digest
     {
         return Err(PersistError::corrupt_blob());
@@ -626,23 +1162,53 @@ pub(crate) fn validate_encrypted_record(record: &CommitRecord) -> Result<(), Per
 }
 
 fn validate_record_representability(record: &CommitRecord) -> Result<(), PersistError> {
+    validate_record_metadata_view(ConfigRecordView::from(record))?;
+    validate_encrypted_record(record)
+}
+
+pub(super) fn validate_record_metadata_view(
+    record: ConfigRecordView<'_>,
+) -> Result<(), PersistError> {
     if record.version.get() > i64::MAX as u64
         || record.principal.is_empty()
         || record.principal.len() > CONFIG_PRINCIPAL_MAX_BYTES
         || record.principal.chars().any(char::is_control)
-        || !crate::types::config_principal_metadata_is_valid(&record.principal)
+        || !crate::types::config_principal_metadata_is_valid(record.principal)
     {
         return Err(PersistError::constraint_violation(
             "config record is not representable by durable storage",
         ));
     }
-    validate_encrypted_record(record)
+    Ok(())
 }
 
 pub(crate) fn tokenize_audit_path(
     path: &str,
     audit_key: &crate::types::AuditKey,
 ) -> Result<String, PersistError> {
+    validate_audit_path_input(path)?;
+    #[cfg(test)]
+    config_capacity_tokenization_tests::observe_capacity(0);
+    // Count the exact emitted bytes with the same immutable input and emitter.
+    // Reject expansion before allocating its output, then reserve only its exact
+    // successful length. Ordinary String growth can otherwise exceed the field
+    // limit even for an accepted final path.
+    let mut counted = AuditPathByteCount(0);
+    write_tokenized_audit_path(path, audit_key, &mut counted)?;
+    let mut output = String::new();
+    output
+        .try_reserve_exact(counted.0)
+        .map_err(|_| PersistError::unavailable())?;
+    write_tokenized_audit_path(path, audit_key, &mut output)?;
+    #[cfg(test)]
+    config_capacity_tokenization_tests::observe_capacity(output.capacity());
+    if output.len() > CONFIG_AUDIT_PATH_MAX_BYTES {
+        return Err(tokenized_path_too_large());
+    }
+    Ok(output)
+}
+
+fn validate_audit_path_input(path: &str) -> Result<(), PersistError> {
     if path.is_empty()
         || path.len() > CONFIG_AUDIT_PATH_MAX_BYTES
         || !path.starts_with('/')
@@ -652,10 +1218,36 @@ pub(crate) fn tokenize_audit_path(
             "audit YANG path is not canonically representable",
         ));
     }
-    let mut output = String::with_capacity(path.len());
+    Ok(())
+}
+
+struct AuditPathByteCount(usize);
+
+impl std::fmt::Write for AuditPathByteCount {
+    fn write_str(&mut self, value: &str) -> std::fmt::Result {
+        self.0 = self
+            .0
+            .checked_add(value.len())
+            .filter(|bytes| *bytes <= CONFIG_AUDIT_PATH_MAX_BYTES)
+            .ok_or(std::fmt::Error)?;
+        Ok(())
+    }
+}
+
+fn tokenized_path_too_large() -> PersistError {
+    PersistError::constraint_violation("tokenized audit YANG path exceeds durable limit")
+}
+
+fn write_tokenized_audit_path(
+    path: &str,
+    audit_key: &crate::types::AuditKey,
+    output: &mut impl std::fmt::Write,
+) -> Result<(), PersistError> {
     let mut remainder = path;
     while let Some(open) = remainder.find('[') {
-        output.push_str(&remainder[..open + 1]);
+        output
+            .write_str(&remainder[..open + 1])
+            .map_err(|_| tokenized_path_too_large())?;
         remainder = &remainder[open + 1..];
         let close = remainder.find(']').ok_or_else(|| {
             PersistError::constraint_violation("audit YANG predicate is malformed")
@@ -705,11 +1297,13 @@ pub(crate) fn tokenize_audit_path(
         mac.update(value.as_bytes());
         let token = mac.finalize().into_bytes();
         write!(output, "{key}='{AUDIT_PATH_TOKEN_PREFIX}")
-            .map_err(|_| PersistError::audit_chain_broken())?;
+            .map_err(|_| tokenized_path_too_large())?;
         for byte in token {
-            write!(output, "{byte:02x}").map_err(|_| PersistError::audit_chain_broken())?;
+            write!(output, "{byte:02x}").map_err(|_| tokenized_path_too_large())?;
         }
-        output.push_str("']");
+        output
+            .write_str("']")
+            .map_err(|_| tokenized_path_too_large())?;
         remainder = &remainder[close + 1..];
     }
     if remainder.contains(']') {
@@ -717,13 +1311,10 @@ pub(crate) fn tokenize_audit_path(
             "audit YANG predicate is malformed",
         ));
     }
-    output.push_str(remainder);
-    if output.len() > CONFIG_AUDIT_PATH_MAX_BYTES {
-        return Err(PersistError::constraint_violation(
-            "tokenized audit YANG path exceeds durable limit",
-        ));
-    }
-    Ok(output)
+    output
+        .write_str(remainder)
+        .map_err(|_| tokenized_path_too_large())?;
+    Ok(())
 }
 
 pub(crate) fn audit_path_is_safe(path: &str) -> bool {
@@ -874,7 +1465,21 @@ mod tests {
             logical_time: Timestamp::now_utc(),
             intent: ConfigMutationIntent::MarkConfirmed { tx_id: TxId::new() },
         };
-        assert!(future_command.validate(identity).is_err());
+        // Revision 8 is understood structurally for the closed bounded profile,
+        // but the same command remains inadmissible to a legacy authority.
+        assert!(future_command
+            .validate_for_profile(
+                identity,
+                &crate::AuditKey::new([0xA6; 32]).expect("synthetic key"),
+                opc_crypto::ConfigCapacityProfile::Legacy,
+            )
+            .is_err());
+        let unsupported_command = ConfigConsensusCommand {
+            schema_version: config_command_revision(opc_crypto::ConfigCapacityProfile::BoundedV1)
+                + 1,
+            ..future_command
+        };
+        assert!(unsupported_command.validate(identity).is_err());
     }
 
     #[test]
@@ -944,7 +1549,7 @@ mod tests {
             identity,
             request_id: ConfigConsensusRequestId::from_bytes([0xC6; 16]),
             logical_time: Timestamp::now_utc(),
-            intent: ConfigMutationIntent::ManagementAudit(
+            intent: ConfigMutationIntent::ManagementAudit(Box::new(
                 super::super::audit::AuditCommand::Initialize {
                     projection: crate::audit_authority::AuditToken::from_keyed_projection(
                         [0xC7; 32],
@@ -952,21 +1557,21 @@ mod tests {
                     .unwrap(),
                     limits: crate::audit_authority::AuditLedgerLimits::new(3, 1).unwrap(),
                 },
-            ),
+            )),
         };
         assert!(command.validate(identity).is_ok());
         for revision in 1..5 {
             command.schema_version = revision;
             assert!(command.validate(identity).is_err());
         }
-        command.intent = ConfigMutationIntent::ManagementAudit(
+        command.intent = ConfigMutationIntent::ManagementAudit(Box::new(
             super::super::audit::AuditCommand::InitializeWithContinuity {
                 projection: crate::audit_authority::AuditToken::from_keyed_projection([0xC7; 32])
                     .unwrap(),
                 limits: crate::audit_authority::AuditLedgerLimits::new(3, 1).unwrap(),
                 initial_epoch: 1,
             },
-        );
+        ));
         for revision in 1..6 {
             command.schema_version = revision;
             assert!(command.validate(identity).is_err());
@@ -991,9 +1596,9 @@ mod tests {
             },
         )
         .unwrap();
-        command.intent = ConfigMutationIntent::ManagementAudit(
+        command.intent = ConfigMutationIntent::ManagementAudit(Box::new(
             super::super::audit::AuditCommand::AcknowledgeExport(checkpoint),
-        );
+        ));
         for revision in 1..7 {
             command.schema_version = revision;
             assert!(command.validate(identity).is_err());
@@ -1130,3 +1735,9 @@ mod tests {
         assert_eq!(legacy, current);
     }
 }
+
+#[cfg(test)]
+mod config_capacity_input_capacity_tests;
+
+#[cfg(test)]
+mod config_capacity_aad_working_tests;
