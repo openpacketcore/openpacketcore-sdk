@@ -159,7 +159,11 @@ impl<'de> Visitor<'de> for PrincipalValueSeed {
                 }
             } else {
                 drop(key);
-                values.next_value_seed(PrincipalValueSeed::discarded())?;
+                if self.retain_tenant {
+                    values.next_value::<de::IgnoredAny>()?;
+                } else {
+                    values.next_value_seed(PrincipalValueSeed::discarded())?;
+                }
             }
             let Some(next_key) = values.next_key::<String>()? else {
                 break;
