@@ -72,7 +72,7 @@ not a mutable branch or tag, and locked metadata must resolve only
 `openraft`/`openraft-macros` 0.9.24 from that revision.
 
 SDK-741 advances the current immutable pin to signed commit
-`88c8627c35d96d80cb304d3f50fadc8c1b21a5cb`. This descendant preserves the
+`702ff263d2122820e09d35abd53518b01c85823a`. This descendant preserves the
 election repair and fixes snapshot-to-log handoff and failed-target purge
 retention. It also joins former-leader replication readers before conflict
 truncation can remove their uncommitted suffix. Independent engine and SDK

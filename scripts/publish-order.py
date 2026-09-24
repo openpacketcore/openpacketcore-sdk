@@ -23,7 +23,7 @@ from collections import deque
 from pathlib import Path
 
 
-OPENRAFT_REV = "88c8627c35d96d80cb304d3f50fadc8c1b21a5cb"
+OPENRAFT_REV = "702ff263d2122820e09d35abd53518b01c85823a"
 FROZEN_SESSION_HA_OPENRAFT_REV = "f607e636406b16bd0ad7925dbb631da1b7a4cd96"
 OPENRAFT_GIT_SOURCE = (
     "git+https://github.com/openpacketcore/openraft"

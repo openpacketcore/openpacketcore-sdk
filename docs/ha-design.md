@@ -51,7 +51,7 @@ These are code-path constants, not operator tuning knobs and not proof that
 the experimental profile meets #143 under deployed load.
 
 The workspace temporarily exact-pins `openpacketcore/openraft` revision
-`88c8627c35d96d80cb304d3f50fadc8c1b21a5cb`. Registry 0.9.24 reuses a sampled
+`702ff263d2122820e09d35abd53518b01c85823a`. Registry 0.9.24 reuses a sampled
 election timeout across campaigns; the fork resamples each campaign. It does
 not add an SDK leader lease or any second election/vote path. Until an official
 stable release contains that fix, an exact registry checksum replaces the git
