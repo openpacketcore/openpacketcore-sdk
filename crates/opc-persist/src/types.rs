@@ -1051,6 +1051,8 @@ pub fn extract_tenant(principal: &str) -> String {
     if let Some(tenant) = serde_json::from_str::<serde_json::Value>(principal)
         .ok()
         .and_then(|principal| {
+            #[cfg(test)]
+            config_capacity_principal_working_tests::tenant::observe_value(&principal);
             principal
                 .get("tenant")
                 .and_then(|value| value.as_str())

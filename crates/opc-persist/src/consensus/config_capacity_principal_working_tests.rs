@@ -252,3 +252,6 @@ mod compatibility;
 
 #[path = "config_capacity_principal_scalar_working_tests.rs"]
 mod scalar;
+
+#[path = "config_capacity_tenant_working_tests.rs"]
+pub(super) mod tenant;
