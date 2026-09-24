@@ -1,4 +1,7 @@
 mod continuity;
+mod legacy_outcome_bytes;
+#[cfg(unix)]
+mod retained_opening;
 
 // SDK #797: one real configuration quorum; independent receipt and config readback.
 use super::*;
