@@ -19,6 +19,9 @@ mod storage;
 mod store;
 mod types;
 
+#[cfg(test)]
+pub(crate) mod config_capacity_simultaneous_working_tests;
+
 pub(crate) use sqlite::{provision_retained_schema, validate_retained_schema};
 
 pub use history::{ConfigHistoryLimits, ConfigHistoryRetention};

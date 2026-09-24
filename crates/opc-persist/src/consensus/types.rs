@@ -1151,6 +1151,12 @@ pub(super) fn validate_encrypted_record_view(
     };
     #[cfg(test)]
     config_capacity_aad_working_tests::observe_decoded_principal(metadata.principal().len());
+    #[cfg(test)]
+    let _decoded_owners = super::config_capacity_simultaneous_working_tests::decoded_owners(
+        &aad,
+        &envelope.key_id,
+        &bound_key_id,
+    );
     if bound_key_id != envelope.key_id
         || aad.purpose() != opc_key::KeyPurpose::Config
         || aad.version() != record.version.get()

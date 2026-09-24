@@ -30,6 +30,9 @@ thread_local! {
 // or dropped. The original configuration record is still owned by preparation.
 // Observation uses only stack arithmetic and the existing Value's capacities.
 pub(crate) fn observe_value(value: &serde_json::Value) {
+    crate::consensus::config_capacity_simultaneous_working_tests::observe_tenant(
+        value_heap_lower_bound(value),
+    );
     OBSERVATION.with(|slot| {
         if let Some(mut observation) = slot.get() {
             let bytes = value_heap_lower_bound(value);
