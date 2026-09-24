@@ -396,6 +396,15 @@ fn preflight_preparation_capacity(
             charge(value.capacity())?;
         }
     }
+    // The header KeyId copy and canonical AAD output coexist with transferred
+    // input owners during validation. Inspect their encoded extents before
+    // invoking any allocating decoder. This necessary byte floor does not
+    // qualify parser scratch, decoded-owner capacities or the whole operation.
+    let (header_key_bytes, aad_bytes) =
+        CryptoEnvelopeRef::encoded_metadata_lengths(&record.encrypted_blob)
+            .map_err(|_| PersistError::corrupt_blob())?;
+    charge(header_key_bytes)?;
+    charge(aad_bytes)?;
     // Count with the existing bounded emitter before validation or output
     // allocation. Charge every new output while conservatively retaining all
     // old inputs; do not subtract the raw path before its replacement exists.

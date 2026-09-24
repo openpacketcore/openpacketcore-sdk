@@ -423,9 +423,17 @@ pub struct CryptoEnvelopeRef<'a> {
     pub ciphertext_and_tag: &'a [u8],
 }
 
-impl<'a> CryptoEnvelopeRef<'a> {
-    /// Decode under the same binary profile as [`CryptoEnvelopeV1::decode`].
-    pub fn decode(bytes: &'a [u8]) -> Result<Self, CryptoError> {
+// Borrow only binary extents here: admission must precede key/AAD copies.
+struct EnvelopeFraming<'a> {
+    algorithm: AeadAlgorithm,
+    key_id: &'a str,
+    nonce: &'a [u8],
+    aad: &'a [u8],
+    ciphertext_and_tag: &'a [u8],
+}
+
+impl<'a> EnvelopeFraming<'a> {
+    fn decode(bytes: &'a [u8]) -> Result<Self, CryptoError> {
         if bytes.len() < HEADER_LEN {
             return Err(CryptoError::InvalidEnvelope);
         }
@@ -470,10 +478,37 @@ impl<'a> CryptoEnvelopeRef<'a> {
 
         Ok(Self {
             algorithm,
-            key_id: KeyId::new(key_id.to_owned()).map_err(|_| CryptoError::InvalidEnvelope)?,
+            key_id,
             nonce: &bytes[key_id_end..nonce_end],
             aad: &bytes[nonce_end..aad_end],
             ciphertext_and_tag,
+        })
+    }
+}
+
+impl<'a> CryptoEnvelopeRef<'a> {
+    /// Read header-key and AAD byte lengths without allocating or copying them.
+    ///
+    /// This checks V1 framing, supported algorithm, UTF-8 header key, and the
+    /// minimum tag length. It does not validate key-identifier grammar, nonce
+    /// policy, AAD schema or binding, or keyed authenticity. Callers must retain
+    /// their existing validation after using these lengths for admission.
+    /// The returned pair is `(header_key_bytes, aad_bytes)`.
+    pub fn encoded_metadata_lengths(bytes: &[u8]) -> Result<(usize, usize), CryptoError> {
+        let frame = EnvelopeFraming::decode(bytes)?;
+        Ok((frame.key_id.len(), frame.aad.len()))
+    }
+
+    /// Decode under the same binary profile as [`CryptoEnvelopeV1::decode`].
+    pub fn decode(bytes: &'a [u8]) -> Result<Self, CryptoError> {
+        let frame = EnvelopeFraming::decode(bytes)?;
+        Ok(Self {
+            algorithm: frame.algorithm,
+            key_id: KeyId::new(frame.key_id.to_owned())
+                .map_err(|_| CryptoError::InvalidEnvelope)?,
+            nonce: frame.nonce,
+            aad: frame.aad,
+            ciphertext_and_tag: frame.ciphertext_and_tag,
         })
     }
 
@@ -517,6 +552,10 @@ impl<'a> CryptoEnvelopeRef<'a> {
 #[cfg(test)]
 #[path = "envelope_view_tests.rs"]
 mod envelope_view_tests;
+
+#[cfg(test)]
+#[path = "config_capacity_metadata_lengths_tests.rs"]
+mod config_capacity_metadata_lengths_tests;
 
 /// Decoded RFC 001 envelope structure.
 #[derive(Debug, Clone, PartialEq, Eq)]
