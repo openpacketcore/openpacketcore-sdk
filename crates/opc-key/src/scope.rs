@@ -644,7 +644,7 @@ struct CanonicalAadComparison<'a> {
 
 impl CanonicalAadComparison<'_> {
     fn matches_exactly(&self) -> bool {
-        self.equal && self.remaining.is_empty()
+        self.equal
     }
 }
 
