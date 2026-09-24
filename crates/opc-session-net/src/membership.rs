@@ -798,7 +798,8 @@ impl SessionMembershipAdmission {
             | ConsensusRpcFamily::TopologyAdmissionBarrier => true,
             ConsensusRpcFamily::ForwardMutation
             | ConsensusRpcFamily::ForwardRosterMutation
-            | ConsensusRpcFamily::ReadBarrier => false,
+            | ConsensusRpcFamily::ReadBarrier
+            | ConsensusRpcFamily::LeadershipTransfer => false,
             _ => false,
         };
         // Once joint membership is durably committed, the predecessor
@@ -814,6 +815,7 @@ impl SessionMembershipAdmission {
                 ConsensusRpcFamily::ForwardMutation
                     | ConsensusRpcFamily::ForwardRosterMutation
                     | ConsensusRpcFamily::ReadBarrier
+                    | ConsensusRpcFamily::LeadershipTransfer
             );
         let current_admitted = current_matches && !predecessor_application_authority_revoked;
         if !(current_admitted || pending_matches && pending_engine_catchup) {
@@ -1247,6 +1249,7 @@ mod tests {
             ConsensusRpcFamily::ForwardMutation,
             ConsensusRpcFamily::ForwardRosterMutation,
             ConsensusRpcFamily::ReadBarrier,
+            ConsensusRpcFamily::LeadershipTransfer,
         ] {
             assert_eq!(
                 admission
