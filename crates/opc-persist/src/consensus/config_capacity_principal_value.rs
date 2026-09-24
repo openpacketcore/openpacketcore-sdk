@@ -14,18 +14,21 @@ use std::sync::OnceLock;
 
 pub(super) struct PrincipalValueSeed {
     retain_scalar: bool,
+    retain_tenant: bool,
 }
 
 impl PrincipalValueSeed {
     pub(super) fn retained() -> Self {
         Self {
             retain_scalar: true,
+            retain_tenant: false,
         }
     }
 
     fn discarded() -> Self {
         Self {
             retain_scalar: false,
+            retain_tenant: false,
         }
     }
 }
@@ -143,12 +146,27 @@ impl<'de> Visitor<'de> for PrincipalValueSeed {
                 values,
             }));
         }
-        drop(first_key);
-        values.next_value_seed(PrincipalValueSeed::discarded())?;
-        while values.next_key::<String>()?.is_some() {
-            values.next_value_seed(PrincipalValueSeed::discarded())?;
+        let mut projection = serde_json::Map::new();
+        let mut key = first_key;
+        loop {
+            if self.retain_tenant && key == "tenant" {
+                let value = values.next_value_seed(PrincipalValueSeed::retained())?;
+                if value.is_string() {
+                    projection.insert(key, value);
+                } else {
+                    // Value keeps the last duplicate, including a non-string.
+                    projection.remove("tenant");
+                }
+            } else {
+                drop(key);
+                values.next_value_seed(PrincipalValueSeed::discarded())?;
+            }
+            let Some(next_key) = values.next_key::<String>()? else {
+                break;
+            };
+            key = next_key;
         }
-        Ok(Value::Object(serde_json::Map::new()))
+        Ok(Value::Object(projection))
     }
 }
 
@@ -239,4 +257,20 @@ impl<'de> Visitor<'de> for RawPrincipalValueSeed {
             .map_err(|_| E::custom("invalid config metadata JSON"))?;
         Ok(value)
     }
+}
+
+// Validate the complete JSON using Value's rules, but retain only a top-level
+// string tenant. This temporary projection is consumed only by extract_tenant;
+// it is never a replacement for a stored or externally returned JSON value.
+// RawValue recursively retains the same projection mode; numeric tokens keep
+// the linked serde_json implementation's original first-key semantics.
+pub(super) fn tenant_projection(input: &str) -> serde_json::Result<Value> {
+    let mut deserializer = serde_json::Deserializer::from_str(input);
+    let value = PrincipalValueSeed {
+        retain_scalar: false,
+        retain_tenant: true,
+    }
+    .deserialize(&mut deserializer)?;
+    deserializer.end()?;
+    Ok(value)
 }

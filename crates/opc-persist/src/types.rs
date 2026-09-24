@@ -1048,7 +1048,7 @@ pub(crate) fn validate_rollback_label(label: &str) -> Result<(), PersistError> {
 pub fn extract_tenant(principal: &str) -> String {
     let wrapped = wrapped_config_principal(principal);
     let principal = wrapped.as_deref().unwrap_or(principal);
-    if let Some(tenant) = serde_json::from_str::<serde_json::Value>(principal)
+    if let Some(tenant) = config_principal_value::tenant_projection(principal)
         .ok()
         .and_then(|principal| {
             #[cfg(test)]
