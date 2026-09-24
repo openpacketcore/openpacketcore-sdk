@@ -62,6 +62,19 @@ delayed task scheduling cannot extend it. The default is `Disabled`, which
 retains a fresh coalesced quorum round for every barrier cohort; consumers
 cannot supply a lease duration.
 
+Before releasing an engine vote lease for planned retirement, call
+`disable_lease_reuse()` on every applicable barrier. The veto is permanent for
+that barrier and all its clones: an in-flight proof cannot repopulate the cache
+or return a cached admission after the veto. Fresh engine checks retain their
+normal authority and deadline requirements. Clearing a cache once is not an
+equivalent retirement fence.
+
+The appended `LeadershipTransfer` RPC family carries only an engine-issued
+handoff request. Its payload limit is 1,024 bytes and its deadline uses the
+existing five-second Vote budget. Consumers must authenticate the exact sender,
+vote issuer and membership scope before passing the request to the engine.
+This family does not replace ordinary election, quorum or applied-prefix checks.
+
 New leaders can use `open_leader(projection, deadline)` with a
 `LeaderReadProjection` implementation. The helper executes the barrier,
 drives the consumer-owned projection to Openraft's applied log ID, independently
@@ -75,7 +88,7 @@ signal; these helpers are scheduling and gating, not a parallel authority.
 
 Issue #143 remains open and the HA profile remains experimental. The workspace
 pins `https://github.com/openpacketcore/openraft` at the full verified revision
-`dddfe2ee7c51394c1b5ed601c85225ce9eca680d` (signed commit). It retains the
+`6bedb5f5d3890b08a82ca1ac53c93b7cfaf5560e` (source-build candidate). It retains the
 per-campaign election-timeout fix and preserves a recovering snapshot target's
 required log suffix through successful handoff, while failed targets release
 their ownership before retrying. When a higher vote ends leadership, the core

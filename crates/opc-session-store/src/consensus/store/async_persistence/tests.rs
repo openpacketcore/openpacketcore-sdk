@@ -34,6 +34,7 @@ mod majority_authority;
 mod majority_protocol;
 mod protected;
 mod races;
+mod retirement;
 mod snapshots;
 mod writer;
 
