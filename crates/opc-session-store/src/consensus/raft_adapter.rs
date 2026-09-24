@@ -15,7 +15,7 @@ use opc_consensus::engine::error::{
 use opc_consensus::engine::network::{RPCOption, RaftNetwork, RaftNetworkFactory};
 use opc_consensus::engine::raft::{
     AppendEntriesRequest, AppendEntriesResponse, InstallSnapshotRequest, InstallSnapshotResponse,
-    VoteRequest, VoteResponse,
+    TransferLeaderRequest, VoteRequest, VoteResponse,
 };
 use opc_consensus::engine::{EmptyNode, EntryPayload, Membership, StoredMembership, Vote};
 use opc_consensus::{
@@ -1357,6 +1357,30 @@ impl SessionRaftRpcHandler {
         }
 
         let result = match request.family {
+            SessionConsensusRpcFamily::LeadershipTransfer => {
+                // Staged learner routes and cold persistence may replicate,
+                // but cannot release an active leader's election lease.
+                if !self.persistence.is_active()
+                    || !self
+                        .peer_directory
+                        .current_scope()
+                        .is_ok_and(|(identity, members)| {
+                            identity == request.identity
+                                && members.contains(&self.local_node_id)
+                                && members.contains(&authenticated_sender)
+                        })
+                {
+                    return rejected_response(SessionConsensusPeerError::ScopeMismatch);
+                }
+                let rpc = match decode_and_bind_sender::<
+                    TransferLeaderRequest<SessionConsensusNodeId>,
+                >(&request.payload, authenticated_sender)
+                {
+                    Ok(rpc) => rpc,
+                    Err(error) => return rejected_response(error),
+                };
+                encode_engine_result(&self.raft.handle_leadership_transfer(rpc).await)
+            }
             SessionConsensusRpcFamily::AppendEntries => {
                 let rpc = match decode_and_bind_sender::<AppendEntriesRequest<SessionRaftTypeConfig>>(
                     &request.payload,
@@ -1519,11 +1543,18 @@ fn is_engine_rpc_family(family: SessionConsensusRpcFamily) -> bool {
             | SessionConsensusRpcFamily::AppendEntries
             | SessionConsensusRpcFamily::AppendEntriesRoster
             | SessionConsensusRpcFamily::InstallSnapshot
+            | SessionConsensusRpcFamily::LeadershipTransfer
     )
 }
 
 trait EngineRequestSender {
     fn vote(&self) -> &Vote<SessionConsensusNodeId>;
+}
+
+impl EngineRequestSender for TransferLeaderRequest<SessionConsensusNodeId> {
+    fn vote(&self) -> &Vote<SessionConsensusNodeId> {
+        self.from()
+    }
 }
 
 impl EngineRequestSender for AppendEntriesRequest<SessionRaftTypeConfig> {
@@ -4171,6 +4202,9 @@ mod tests {
     #[test]
     fn consumer_rpc_families_are_not_engine_authority() {
         assert!(is_engine_rpc_family(SessionConsensusRpcFamily::Vote));
+        assert!(is_engine_rpc_family(
+            SessionConsensusRpcFamily::LeadershipTransfer
+        ));
         assert!(is_engine_rpc_family(
             SessionConsensusRpcFamily::AppendEntries
         ));

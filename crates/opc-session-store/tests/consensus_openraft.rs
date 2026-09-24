@@ -4,6 +4,9 @@ mod late_acquire;
 #[path = "consensus_openraft/stepdown.rs"]
 mod stepdown;
 
+#[path = "consensus_openraft/planned_shutdown.rs"]
+mod planned_shutdown;
+
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 use std::path::{Path, PathBuf};
