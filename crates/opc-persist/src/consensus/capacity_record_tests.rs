@@ -3,6 +3,9 @@
 #[path = "capacity_record/config_capacity_command_tests.rs"]
 mod command_tests;
 
+#[path = "capacity_record/config_capacity_post_preparation_working_tests.rs"]
+mod post_preparation_working_tests;
+
 use super::*;
 use crate::types::CommitSource;
 use opc_crypto::{
