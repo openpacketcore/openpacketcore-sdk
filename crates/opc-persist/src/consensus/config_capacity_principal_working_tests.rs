@@ -246,3 +246,6 @@ fn config_capacity_957_preparation_counts_rejected_recovery_array() {
 fn config_capacity_957_preparation_counts_rejected_rollback_array() {
     rejected_value_case("rollback_label", 0x37);
 }
+
+#[path = "config_capacity_principal_compatibility_tests.rs"]
+mod compatibility;
