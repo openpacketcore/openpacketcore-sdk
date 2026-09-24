@@ -609,6 +609,12 @@ pub fn decode_bound_aad(bound_aad: &[u8]) -> Result<(EnvelopeAad, KeyId), KeyErr
     };
     aad.validate()?;
     let canonical = serialize_bound_aad(&aad, &parsed.key_id)?;
+    #[cfg(test)]
+    config_capacity_aad_canonical_tests::observe_live_bytes(
+        &aad,
+        &parsed.key_id,
+        canonical.capacity(),
+    );
     if canonical.as_slice() != bound_aad {
         return Err(KeyError::invalid_metadata("aad", "must be canonical"));
     }
@@ -663,3 +669,7 @@ fn validate_non_blank_config_field(field: &'static str, value: &str) -> Result<(
 
     Ok(())
 }
+
+#[cfg(test)]
+#[path = "config_capacity_aad_canonical_tests.rs"]
+mod config_capacity_aad_canonical_tests;
