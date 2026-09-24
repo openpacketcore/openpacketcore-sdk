@@ -763,6 +763,10 @@ struct ConfigPrincipalMetadata {
     rollback_label: Option<String>,
 }
 
+#[cfg(test)]
+#[path = "consensus/config_capacity_principal_working_tests.rs"]
+mod config_capacity_principal_working_tests;
+
 #[derive(Debug, Default)]
 struct ConfigPrincipalMetadataProbe {
     is_object: bool,
@@ -811,6 +815,8 @@ impl<'de> Deserialize<'de> for ConfigPrincipalMetadataProbe {
                             }
                             probe.saw_principal = true;
                             let value = map.next_value::<serde_json::Value>()?;
+                            #[cfg(test)]
+                            config_capacity_principal_working_tests::observe_reserved_value(&value);
                             match value {
                                 serde_json::Value::String(principal) => {
                                     probe.principal = Some(principal);
@@ -825,6 +831,8 @@ impl<'de> Deserialize<'de> for ConfigPrincipalMetadataProbe {
                             }
                             probe.saw_replay_lookup_digest = true;
                             let value = map.next_value::<serde_json::Value>()?;
+                            #[cfg(test)]
+                            config_capacity_principal_working_tests::observe_reserved_value(&value);
                             match value {
                                 serde_json::Value::Null => probe.replay_lookup_digest = None,
                                 serde_json::Value::String(digest) => {
@@ -840,6 +848,8 @@ impl<'de> Deserialize<'de> for ConfigPrincipalMetadataProbe {
                             }
                             probe.saw_recovery_required = true;
                             let value = map.next_value::<serde_json::Value>()?;
+                            #[cfg(test)]
+                            config_capacity_principal_working_tests::observe_reserved_value(&value);
                             match value {
                                 serde_json::Value::Bool(required) => {
                                     probe.recovery_required = Some(required);
@@ -854,6 +864,8 @@ impl<'de> Deserialize<'de> for ConfigPrincipalMetadataProbe {
                             }
                             probe.saw_rollback_label = true;
                             let value = map.next_value::<serde_json::Value>()?;
+                            #[cfg(test)]
+                            config_capacity_principal_working_tests::observe_reserved_value(&value);
                             match value {
                                 serde_json::Value::Null => probe.rollback_label = None,
                                 serde_json::Value::String(label) => {
