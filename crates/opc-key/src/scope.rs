@@ -608,17 +608,61 @@ pub fn decode_bound_aad(bound_aad: &[u8]) -> Result<(EnvelopeAad, KeyId), KeyErr
         metadata: parsed.metadata,
     };
     aad.validate()?;
-    let canonical = serialize_bound_aad(&aad, &parsed.key_id)?;
+    // Reuse the canonical representation and serializer without retaining a
+    // second complete encoding alongside parsed metadata and caller buffers.
+    aad.validate()?;
+    let mut canonical = CanonicalAadComparison {
+        remaining: bound_aad,
+        equal: true,
+    };
+    serde_json::to_writer(
+        &mut canonical,
+        &BoundEnvelopeAad {
+            tenant: &aad.tenant,
+            purpose: aad.purpose,
+            version: aad.version,
+            key_id: &parsed.key_id,
+            metadata: &aad.metadata,
+        },
+    )
+    .map_err(|_| KeyError::invalid_metadata("aad", "failed to serialize"))?;
     #[cfg(test)]
-    config_capacity_aad_canonical_tests::observe_live_bytes(
-        &aad,
-        &parsed.key_id,
-        canonical.capacity(),
-    );
-    if canonical.as_slice() != bound_aad {
+    config_capacity_aad_canonical_tests::observe_live_bytes(&aad, &parsed.key_id, 0);
+    if !canonical.matches_exactly() {
         return Err(KeyError::invalid_metadata("aad", "must be canonical"));
     }
     Ok((aad, parsed.key_id))
+}
+
+// A sink for the existing serializer. Mismatches remain sticky while it
+// consumes the complete serialization, preserving serialization error behavior.
+// Neither matching nor mismatching output allocates a canonical output buffer.
+struct CanonicalAadComparison<'a> {
+    remaining: &'a [u8],
+    equal: bool,
+}
+
+impl CanonicalAadComparison<'_> {
+    fn matches_exactly(&self) -> bool {
+        self.equal && self.remaining.is_empty()
+    }
+}
+
+impl std::io::Write for CanonicalAadComparison<'_> {
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        if let Some((prefix, remaining)) = self.remaining.split_at_checked(bytes.len()) {
+            self.equal &= prefix == bytes;
+            self.remaining = remaining;
+        } else {
+            self.equal = false;
+            self.remaining = &[];
+        }
+        Ok(bytes.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
 }
 
 pub(crate) fn validate_key_id(value: &str) -> Result<(), KeyError> {
