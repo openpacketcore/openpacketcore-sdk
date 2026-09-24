@@ -116,10 +116,7 @@ impl<'de> Visitor<'de> for PrincipalValueSeed {
     where
         A: SeqAccess<'de>,
     {
-        while values
-            .next_element_seed(PrincipalValueSeed::discarded())?
-            .is_some()
-        {}
+        while values.next_element::<serde::de::IgnoredAny>()?.is_some() {}
         Ok(Value::Array(Vec::new()))
     }
 
