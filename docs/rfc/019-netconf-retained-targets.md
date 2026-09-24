@@ -6,7 +6,7 @@ implementation; it does not declare the full profile available.
 
 **Date:** 2026-09-24
 
-**Version:** 0.1.0
+**Version:** 0.2.0
 
 **Parent:** [RFC 019](019-netconf-required-audit.md). Refs #958.
 
@@ -47,7 +47,8 @@ constructors and redacted `Debug`. They are proposed APIs, not existing symbols.
 | Authorized lookup/recovery | Takes the original handle and independently authenticated caller/recovery capability. Lookup never submits a replacement effect, extends expiry, or treats a missing row as success. |
 
 The typed applied result distinguishes `Candidate { generation }`,
-`Startup { revision }`, `Promoted { running_version, retired_generation }`,
+`Startup { revision }`, `CopiedRunning { running_version }`,
+`Promoted { running_version, retired_generation }`,
 `Tentative { running_version, retired_generation, pending }`,
 `Confirmed { pending }`, `RolledBack { running_version, pending }` and
 `Lifecycle { incarnation }`. Pending and incarnation values are opaque scoped
@@ -98,8 +99,8 @@ Action tags are fixed within this new record: 0 activate, 1 begin device,
 2 acquire lock, 3 release lock, 4 stage candidate, 5 discard candidate,
 6 promote candidate, 7 replace startup, 8 delete startup, 9 tentative promotion,
 10 confirm pending, 11 cancel pending, 12 expire pending, 13 end session and
-14 reboot recovery. Unknown tags and trailing data are rejected. Legacy command
-and effect tags are not renumbered.
+14 reboot recovery and 15 copy to running. Unknown tags and trailing data are
+rejected. Legacy command and effect tags are not renumbered.
 
 Destination expectations contain the exact current target generation, not just
 the desired successor. Source expectations bind source datastore, generation or
@@ -108,13 +109,25 @@ authenticates/decrypts that exact source through the existing provider, then
 constructs the destination envelope. Application rechecks the source expectation
 and cannot silently fetch a newer source. The closed SDK preparation path binds
 the source plaintext to the destination encryption; a caller's matching digest
-claim alone is insufficient.
+claim alone is insufficient. When an absent candidate is read as the current
+running configuration, the source expectation binds both its exact tombstone
+generation and the exact running version/ciphertext used for that fallback.
+Either changing before application invalidates the prepared copy.
 
 Promotion carries the ordinary prepared running commit plus the exact candidate
 expectation. The common running preparation/capacity contract is used unchanged.
 It commits running state and retires the candidate in one existing authority
 transaction. A delayed generation-A promotion cannot commit or clear generation
 B. The applied outcome records both the running version and retired generation.
+
+Copy from candidate or startup to running uses action 15 and a `CopiedRunning`
+result. It carries the same bounded prepared running commit and exact source
+expectation, but does not retire or modify its source. A candidate-to-running
+copy therefore leaves the candidate generation and encrypted content intact.
+All current lock and pending-resolution fences still apply; a copy cannot
+silently resolve another pending operation. This is distinct from candidate
+promotion and cannot be routed through an unbound read followed by ordinary
+running submission.
 
 Target encryption uses existing `KeyProvider`, `EnvelopeAad::config`,
 `ConfigAad` and attested-envelope APIs. The target counter occupies the AAD's
@@ -135,7 +148,7 @@ Legacy running plaintext wrappers and authentication domains remain unchanged.
 
 ## Admission, application and terminal recovery
 
-Every changing target action follows this order:
+Every changing full-profile action follows this order:
 
 1. Enforce authentication, authorization, current configuration authority, device
    ownership, lock and source/destination expectations. Validate/encrypt through
@@ -218,8 +231,11 @@ not multiplied by treating each field as independently entitled to the maximum.
 The sealed authority table manifest, reopen validator, history validator and
 snapshot copy/restore set include these exact tables and row invariants. Their
 authenticated state digest binds authority, format, all row tags, generations,
-ownership, ciphertext and unresolved obligations. The applied target outcome
-binds its resulting digest into the existing authenticated audit history; the
+ownership, ciphertext and unresolved obligations. Digest input uses the canonical
+row bodies in profile, candidate, startup, lifecycle order and excludes the stored
+state digest and MAC fields themselves. The resulting digest is covered by the
+row authenticator; no self-referential digest is required. The applied target
+outcome binds that digest into the existing authenticated audit history; the
 profile anchor preserves this relation across acknowledged pruning. Tampering
 with a target while retaining a valid unrelated running history must fail.
 
@@ -283,10 +299,16 @@ retains cleanup independently of an RPC future. While cleanup admission or its
 checkpoint is unavailable, new ownership/effects remain fenced. Late cleanup for
 one incarnation cannot clear a later stage or another owner's lease.
 
-An empty candidate commit is an observation only after an authoritative
-generation-checked read proves no staged target. It is not inferred from a local
-cache, missing database row or timeout. Validate/test-only and ordinary reads
-remain observations; they cannot acquire configuration-effect authority.
+An empty plain candidate commit is an observation only after one authoritative
+read proves both no staged target and no pending confirmation, with the exact
+generation and pending-state expectation rechecked before observation admission.
+It is not inferred from a local cache, missing database row or timeout. An empty
+commit that confirms pending ownership uses action 10 with its exact pending
+identity and required intent/result/terminal sequence. A confirming commit with
+staged changes uses action 6 with that same explicit pending resolution; the
+running effect, candidate retirement and pending resolution are one transaction.
+Validate/test-only and ordinary reads remain observations; they cannot acquire
+configuration-effect authority.
 
 Tentative promotion retains the pending transaction, rollback parent, original
 deadline and encrypted session/persistent ownership in the same transaction as
@@ -318,6 +340,10 @@ including positive authenticated wire copy between distinct supported targets.
 The existing helper-only copy and explicit profile-refusal tests cannot qualify
 those operations. A full-profile negative reads all relevant authoritative target,
 running, pending and audit state; unchanged running version alone is inadequate.
+Copy-to-running tests additionally prove unchanged source generation/ciphertext,
+including absent-candidate fallback substitution. Empty plain commit without a
+pending operation and empty confirmation of an exact pending operation require
+separate controls; only the former is an observation.
 
 Use synthetic real-authority fixtures for stale generation, discard/recreate ABA,
 source/action/ciphertext substitution, wrong caller/worker/session/token,

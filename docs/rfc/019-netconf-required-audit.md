@@ -6,7 +6,7 @@ review. No independent review or complete implementation is claimed.
 
 **Date**: 2026-09-22
 
-**Version**: 1.2.0
+**Version**: 1.2.1
 
 The writable-running profile was delivered by #963. The selected full profile
 retains encrypted candidate/startup state in the existing configuration authority.
@@ -90,11 +90,11 @@ All enabled branches must be covered before claiming issue acceptance.
 | Advertised operation or trigger | Current effect owner | Required disposition |
 | --- | --- | --- |
 | `edit-config` to running; NMDA `edit-data` to running | ConfigBus | Exact required submit, with replace/patch/delete binding derived from the actual request. |
-| `copy-config` to running | ConfigBus | Same required submit and independently checked source/base. |
+| `copy-config` to running | ConfigBus | Exact source-bound copy effect in the full profile; preserve source generation/content and check destination base. |
 | Candidate `edit-config`, `edit-data`, `copy-config` | Server candidate buffer | Explicit preparation contract below; never claim a running effect or silently send standalone Intent to observations. |
 | `discard-changes` | Server candidate buffer | Explicit preparation contract and candidate lock; no fabricated configuration commit. |
 | Plain candidate `commit` | ConfigBus plus candidate buffer | One exact required configuration intent; retire only the candidate actually committed. |
-| Empty plain `commit` | No configuration effect | Distinct observation; no invented encrypted write or receipt. |
+| Empty plain `commit` with no pending confirmation | No configuration effect | Authoritatively check both states before a distinct observation; a pending confirmation still requires its exact effect. |
 | Confirmed `commit`, including persistent token | ConfigBus plus server confirmation metadata | Exact tentative effect, fixed deadline, retained parent and correlation; preserve access control. |
 | Confirm pending commit | ConfigBus confirmed resolution | Audit the exact pending transaction; no separate unaudited marker update. |
 | `cancel-commit`, including persistent token | ConfigBus confirmed resolution | Required rollback intent for the exact pending transaction; wrong token/session permits no effect. |
@@ -171,10 +171,12 @@ The following names describe proposed semantics, not available SDK APIs:
 | Confirm/cancel/rollback | Exact pending transaction, authority generation and authenticated ownership; apply its one resolution | Typed original pending outcome |
 
 Lock release and session/device lifecycle actions add the incarnation-bound
-preconditions below. An empty candidate commit is an observation only after an
-authoritative generation-checked read proves no pending stage. Missing or
-ambiguous state is not an empty candidate. A prepared copy cannot silently read
-a newer source when its effect is eventually applied.
+preconditions below. An empty plain candidate commit is an observation only after
+an authoritative read and admission recheck prove no staged target and no pending
+confirmation. Confirming an exact pending operation remains a required effect
+even without staged content. Missing or ambiguous state is not an empty candidate.
+A prepared copy cannot silently read a newer source when its effect is eventually
+applied.
 
 For each changing action, the authority must:
 
