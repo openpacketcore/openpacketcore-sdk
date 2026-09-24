@@ -1231,7 +1231,7 @@ mod tests {
         .await
         .expect("target server-hello readiness timeout")
         .expect("target server-hello prefix");
-        assert!(hello_prefix == [b'<'], "target server hello did not begin");
+        assert!(hello_prefix == *b"<", "target server hello did not begin");
         assert!(
             sessions.contains_session_for_test(431),
             "target session missing at server hello"
