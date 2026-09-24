@@ -379,7 +379,7 @@ fn preflight_preparation_capacity(
             .ok_or_else(too_large)?;
         Ok(())
     };
-    charge(record.encrypted_blob.capacity())?;
+    charge(record.encrypted_blob.len())?;
     charge(record.plaintext_digest.capacity())?;
     charge(record.principal.capacity())?;
     charge(
