@@ -1,5 +1,8 @@
 //! NETCONF server core.
 
+mod required_audit;
+use required_audit::ServerAudit;
+
 use std::future::Future;
 use std::marker::PhantomData;
 use std::num::NonZeroU32;
@@ -51,8 +54,9 @@ use crate::operations::get_config::{handle_get_config, handle_get_config_async, 
 use crate::operations::get_data::{handle_get_data, handle_get_data_async, GetDataContext};
 use crate::operations::{record_audit as record_audit_by_mode, AuditMode};
 use crate::session_registry::{
-    CandidateWriteResult, KillSessionResult, LockCandidateResult, RunningWriteResult,
-    SessionRegistry, StartupWriteResult, UnlockCandidateResult,
+    CandidateLockLease, CandidateWriteGuard, CandidateWriteResult, KillSessionResult,
+    LockCandidateResult, RunningWriteResult, SessionRegistry, StartupWriteResult,
+    UnlockCandidateResult,
 };
 use crate::session_registry::{
     LockRunningResult, LockStartupResult, UnlockRunningResult, UnlockStartupResult,
@@ -119,6 +123,13 @@ pub enum ServerInitError {
     /// opt-in committed-revision responses.
     #[error("config datastore does not support committed revision receipts")]
     CommittedRevisionUnsupported,
+    /// Required audit was issued for a different config-bus worker.
+    #[error("configuration audit authority mismatch")]
+    RequiredAuditWorkerMismatch,
+    /// A local candidate/startup/confirmed effect owner cannot supply the
+    /// required encrypted-effect and retained-recovery contract.
+    #[error("required audit does not support this datastore composition")]
+    RequiredAuditProfileUnsupported,
 }
 
 /// Result of handling one NETCONF RPC.
@@ -314,6 +325,7 @@ impl EditRpcKind {
 #[derive(Debug)]
 struct CandidateDatastore<C> {
     snapshot: Option<CandidateSnapshot<C>>,
+    lock: Option<CandidateLockLease>,
 }
 
 #[derive(Debug, Clone)]
@@ -353,6 +365,7 @@ impl ConfirmedCommitState {
 struct CandidateSnapshot<C> {
     config: C,
     base_version: ConfigVersion,
+    generation: Arc<()>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -397,32 +410,77 @@ impl From<StartupDatastoreError> for DatastoreFailure {
 }
 
 impl<C: Clone> CandidateDatastore<C> {
-    fn snapshot(&self) -> Option<CandidateSnapshot<C>> {
+    fn prune_released(&mut self) {
+        if self.lock.as_ref().is_some_and(|lock| !lock.is_active()) {
+            self.snapshot = None;
+            self.lock = None;
+        }
+    }
+
+    fn bind_lock(&mut self, lock: CandidateLockLease) {
+        self.prune_released();
+        self.lock = Some(lock);
+    }
+
+    fn snapshot(&mut self) -> Option<CandidateSnapshot<C>> {
+        self.prune_released();
         self.snapshot.clone()
     }
 
-    fn snapshot_or(&self, running: &C, running_version: ConfigVersion) -> CandidateSnapshot<C> {
-        self.snapshot.clone().unwrap_or_else(|| CandidateSnapshot {
+    fn snapshot_or(&mut self, running: &C, running_version: ConfigVersion) -> CandidateSnapshot<C> {
+        self.snapshot().unwrap_or_else(|| CandidateSnapshot {
             config: running.clone(),
             base_version: running_version,
+            generation: Arc::new(()),
         })
     }
 
     fn replace(&mut self, candidate: C, base_version: ConfigVersion) {
+        self.prune_released();
         self.snapshot = Some(CandidateSnapshot {
             config: candidate,
             base_version,
+            generation: Arc::new(()),
         });
     }
 
     fn discard(&mut self) {
         self.snapshot = None;
     }
+
+    fn apply_local_effect(
+        &mut self,
+        lock: Option<CandidateLockLease>,
+        replacement: Option<(C, ConfigVersion)>,
+    ) {
+        match replacement {
+            Some((config, base_version)) => self.replace(config, base_version),
+            None => self.discard(),
+        }
+        // Registration drop can invalidate a lease without the registry mutex.
+        // Keep the admitted lock bound even if it died during replacement, so
+        // the next read cannot expose changes from a released generation.
+        self.lock = lock;
+    }
+
+    fn discard_generation(&mut self, generation: &Arc<()>) {
+        self.prune_released();
+        if self
+            .snapshot
+            .as_ref()
+            .is_some_and(|snapshot| Arc::ptr_eq(&snapshot.generation, generation))
+        {
+            self.discard();
+        }
+    }
 }
 
 impl<C> Default for CandidateDatastore<C> {
     fn default() -> Self {
-        Self { snapshot: None }
+        Self {
+            snapshot: None,
+            lock: None,
+        }
     }
 }
 
@@ -454,7 +512,8 @@ where
 {
     binding: B,
     authz: ReadAuthorizer<'static, P>,
-    audit: Arc<A>,
+    audit: Arc<ServerAudit<A>>,
+    required_config_audit: Option<opc_config_bus::RequiredConfigAudit<C>>,
     transport: TransportType,
     candidate: Arc<Mutex<CandidateDatastore<C>>>,
     confirmed_commit: Arc<Mutex<ConfirmedCommitState>>,
@@ -484,7 +543,8 @@ where
         Ok(Self {
             binding,
             authz,
-            audit: Arc::new(audit),
+            audit: Arc::new(ServerAudit::Legacy(audit)),
+            required_config_audit: None,
             transport,
             candidate: Arc::new(Mutex::new(CandidateDatastore::default())),
             confirmed_commit: Arc::new(Mutex::new(ConfirmedCommitState::default())),
@@ -510,10 +570,11 @@ where
                 let hook_sessions = sessions.clone();
                 let hook_audit = Arc::clone(&audit);
                 run_atomic_registry_hook(&sessions, audit.as_ref(), &fallback_event, move || {
-                    let result = hook_sessions
-                        .terminate_after(target_session_id, || hook_audit.record(&success_event))?;
+                    let result = hook_sessions.terminate_after(target_session_id, || {
+                        hook_audit.record_atomic(&success_event)
+                    })?;
                     if result == KillSessionResult::NotFound {
-                        hook_audit.record(&not_found_event)?;
+                        hook_audit.record_atomic(&not_found_event)?;
                     }
                     Ok(result)
                 })
@@ -527,6 +588,7 @@ where
         A: 'static,
     {
         let audit = Arc::clone(&self.audit);
+        let candidate = Arc::clone(&self.candidate);
         Box::new(move |request| {
             Box::pin(async move {
                 let LockAtomicRequest {
@@ -545,30 +607,37 @@ where
                         XmlDatastore::Running => {
                             let result = hook_sessions
                                 .lock_running_after(current_session_id, || {
-                                    hook_audit.record(&success_event)
+                                    hook_audit.record_atomic(&success_event)
                                 })?;
                             match result {
                                 LockRunningResult::Denied { .. } => {
-                                    hook_audit.record(&denied_event)?;
+                                    hook_audit.record_atomic(&denied_event)?;
                                 }
                                 LockRunningResult::SessionNotRegistered => {
-                                    hook_audit.record(&hook_fallback)?;
+                                    hook_audit.record_atomic(&hook_fallback)?;
                                 }
                                 LockRunningResult::Acquired => {}
                             }
                             Ok(LockAtomicResult::Running(result))
                         }
                         XmlDatastore::Candidate => {
-                            let result = hook_sessions
-                                .lock_candidate_after(current_session_id, || {
-                                    hook_audit.record(&success_event)
-                                })?;
+                            let result = hook_sessions.lock_candidate_after(
+                                current_session_id,
+                                |lease| {
+                                    hook_audit.record_atomic(&success_event)?;
+                                    candidate
+                                        .lock()
+                                        .unwrap_or_else(|err| err.into_inner())
+                                        .bind_lock(lease);
+                                    Ok(())
+                                },
+                            )?;
                             match result {
                                 LockCandidateResult::Denied { .. } => {
-                                    hook_audit.record(&denied_event)?;
+                                    hook_audit.record_atomic(&denied_event)?;
                                 }
                                 LockCandidateResult::SessionNotRegistered => {
-                                    hook_audit.record(&hook_fallback)?;
+                                    hook_audit.record_atomic(&hook_fallback)?;
                                 }
                                 LockCandidateResult::Acquired => {}
                             }
@@ -577,14 +646,14 @@ where
                         XmlDatastore::Startup => {
                             let result = hook_sessions
                                 .lock_startup_after(current_session_id, || {
-                                    hook_audit.record(&success_event)
+                                    hook_audit.record_atomic(&success_event)
                                 })?;
                             match result {
                                 LockStartupResult::Denied { .. } => {
-                                    hook_audit.record(&denied_event)?;
+                                    hook_audit.record_atomic(&denied_event)?;
                                 }
                                 LockStartupResult::SessionNotRegistered => {
-                                    hook_audit.record(&hook_fallback)?;
+                                    hook_audit.record_atomic(&hook_fallback)?;
                                 }
                                 LockStartupResult::Acquired => {}
                             }
@@ -620,15 +689,15 @@ where
                         XmlDatastore::Running => {
                             let result = hook_sessions
                                 .unlock_running_after(current_session_id, || {
-                                    hook_audit.record(&success_event)
+                                    hook_audit.record_atomic(&success_event)
                                 })?;
                             match result {
                                 UnlockRunningResult::NotOwner { .. } => {
-                                    hook_audit.record(&denied_event)?;
+                                    hook_audit.record_atomic(&denied_event)?;
                                 }
                                 UnlockRunningResult::NotLocked
                                 | UnlockRunningResult::SessionNotRegistered => {
-                                    hook_audit.record(&hook_fallback)?;
+                                    hook_audit.record_atomic(&hook_fallback)?;
                                 }
                                 UnlockRunningResult::Unlocked => {}
                             }
@@ -637,15 +706,15 @@ where
                         XmlDatastore::Candidate => {
                             let result = hook_sessions
                                 .unlock_candidate_after(current_session_id, || {
-                                    hook_audit.record(&success_event)
+                                    hook_audit.record_atomic(&success_event)
                                 })?;
                             match result {
                                 UnlockCandidateResult::NotOwner { .. } => {
-                                    hook_audit.record(&denied_event)?;
+                                    hook_audit.record_atomic(&denied_event)?;
                                 }
                                 UnlockCandidateResult::NotLocked
                                 | UnlockCandidateResult::SessionNotRegistered => {
-                                    hook_audit.record(&hook_fallback)?;
+                                    hook_audit.record_atomic(&hook_fallback)?;
                                 }
                                 UnlockCandidateResult::Unlocked => {}
                             }
@@ -654,15 +723,15 @@ where
                         XmlDatastore::Startup => {
                             let result = hook_sessions
                                 .unlock_startup_after(current_session_id, || {
-                                    hook_audit.record(&success_event)
+                                    hook_audit.record_atomic(&success_event)
                                 })?;
                             match result {
                                 UnlockStartupResult::NotOwner { .. } => {
-                                    hook_audit.record(&denied_event)?;
+                                    hook_audit.record_atomic(&denied_event)?;
                                 }
                                 UnlockStartupResult::NotLocked
                                 | UnlockStartupResult::SessionNotRegistered => {
-                                    hook_audit.record(&hook_fallback)?;
+                                    hook_audit.record_atomic(&hook_fallback)?;
                                 }
                                 UnlockStartupResult::Unlocked => {}
                             }
@@ -1065,21 +1134,23 @@ where
                 &parsed.reply_attrs,
                 started,
             ),
-            RpcOperation::Get(request) => RpcHandlingResult::keep_open(handle_get::<C, B, P, A>(
-                &self.binding,
-                GetContext {
-                    authz: &self.authz,
-                    audit: &self.audit,
-                    transport: self.transport,
-                    request_id,
-                    principal,
-                    message_id: &parsed.message_id,
-                    reply_attrs: &parsed.reply_attrs,
-                    started,
-                    limits,
-                },
-                request,
-            )),
+            RpcOperation::Get(request) => {
+                RpcHandlingResult::keep_open(handle_get::<C, B, P, ServerAudit<A>>(
+                    &self.binding,
+                    GetContext {
+                        authz: &self.authz,
+                        audit: &self.audit,
+                        transport: self.transport,
+                        request_id,
+                        principal,
+                        message_id: &parsed.message_id,
+                        reply_attrs: &parsed.reply_attrs,
+                        started,
+                        limits,
+                    },
+                    request,
+                ))
+            }
             RpcOperation::GetConfig(request) => {
                 let candidate_config = self.candidate_config_for_get_config(request);
                 let startup_config = match self.startup_config_for_get_config(request) {
@@ -1095,7 +1166,7 @@ where
                         );
                     }
                 };
-                RpcHandlingResult::keep_open(handle_get_config::<C, B, P, A>(
+                RpcHandlingResult::keep_open(handle_get_config::<C, B, P, ServerAudit<A>>(
                     &self.binding,
                     GetConfigContext {
                         authz: &self.authz,
@@ -1130,7 +1201,7 @@ where
                         );
                     }
                 };
-                RpcHandlingResult::keep_open(handle_get_data::<C, B, P, A>(
+                RpcHandlingResult::keep_open(handle_get_data::<C, B, P, ServerAudit<A>>(
                     &self.binding,
                     GetDataContext {
                         authz: &self.authz,
@@ -1327,6 +1398,29 @@ where
             }
         };
 
+        if self.required_config_audit.is_some() && !self.required_audit_profile_supported() {
+            // A mutable application binding must not enable a local effect
+            // owner after required-audit construction checked the composition.
+            let event = AuditEvent::new(
+                request_id,
+                principal,
+                self.transport,
+                AuditOperation::Exec,
+                audit_failed("operation-failed"),
+            );
+            let _ = self.audit.record_async(&event).await;
+            let metric = config_authority_gate(&parsed.operation)
+                .map(|gate| gate.metric)
+                .unwrap_or(NetconfOperation::Unknown);
+            record_rpc_error(metric, NetconfErrorTag::OperationFailed, started.elapsed());
+            return RpcHandlingResult::keep_open(rpc_error_reply_with_attrs(
+                Some(&parsed.message_id),
+                &parsed.reply_attrs,
+                RpcError::operation_failed(),
+            ))
+            .into();
+        }
+
         if let Some(gate) = config_authority_gate(&parsed.operation) {
             if let Err(outcome) = self.ensure_config_authority(gate.operation).await {
                 return self
@@ -1376,7 +1470,7 @@ where
                 .await
             }
             RpcOperation::Get(request) => RpcHandlingResult::keep_open(
-                handle_get_async::<C, B, P, A>(
+                handle_get_async::<C, B, P, ServerAudit<A>>(
                     &self.binding,
                     GetContext {
                         authz: &self.authz,
@@ -1412,7 +1506,7 @@ where
                     }
                 };
                 RpcHandlingResult::keep_open(
-                    handle_get_config_async::<C, B, P, A>(
+                    handle_get_config_async::<C, B, P, ServerAudit<A>>(
                         &self.binding,
                         GetConfigContext {
                             authz: &self.authz,
@@ -1453,7 +1547,7 @@ where
                     }
                 };
                 RpcHandlingResult::keep_open(
-                    handle_get_data_async::<C, B, P, A>(
+                    handle_get_data_async::<C, B, P, ServerAudit<A>>(
                         &self.binding,
                         GetDataContext {
                             authz: &self.authz,
@@ -1986,7 +2080,7 @@ where
             return None;
         }
         let running = self.binding.config_bus().current_snapshot();
-        let candidate = self.candidate.lock().unwrap_or_else(|err| err.into_inner());
+        let mut candidate = self.candidate.lock().unwrap_or_else(|err| err.into_inner());
         let candidate = candidate.snapshot_or(running.config.as_ref(), running.version);
         (candidate.base_version == running.version).then_some(candidate.config)
     }
@@ -1998,7 +2092,7 @@ where
             return None;
         }
         let running = self.binding.config_bus().current_snapshot();
-        let candidate = self.candidate.lock().unwrap_or_else(|err| err.into_inner());
+        let mut candidate = self.candidate.lock().unwrap_or_else(|err| err.into_inner());
         let candidate = candidate.snapshot_or(running.config.as_ref(), running.version);
         (candidate.base_version == running.version).then_some(candidate.config)
     }
@@ -3101,8 +3195,16 @@ where
             )
             .with_paths([lock_path.clone()]);
             let lock_result = match audit_mode {
-                AuditMode::Synchronous => sessions
-                    .lock_candidate_after(current_session_id, || self.audit.record(&success_event)),
+                AuditMode::Synchronous => {
+                    sessions.lock_candidate_after(current_session_id, |lease| {
+                        self.audit.record(&success_event)?;
+                        self.candidate
+                            .lock()
+                            .unwrap_or_else(|err| err.into_inner())
+                            .bind_lock(lease);
+                        Ok(())
+                    })
+                }
                 AuditMode::Asynchronous => match atomic_executor.take() {
                     Some(execute) => match execute(LockAtomicRequest {
                         sessions: sessions.clone(),
@@ -4395,6 +4497,9 @@ where
             .map(|candidate| candidate.base_version)
             .unwrap_or(snapshot.version);
         let audit_paths = self.schema_paths_for_changed_paths(&changed_paths, NETCONF_COMMIT_PATH);
+        let candidate_generation = candidate
+            .as_ref()
+            .map(|candidate| Arc::clone(&candidate.generation));
         let candidate_config = candidate.map(|candidate| candidate.config);
         let commit_request = CommitRequest::new(
             context.request_id,
@@ -4432,10 +4537,14 @@ where
 
         match bus.submit(commit_request).await {
             Ok(result) => {
-                self.candidate
-                    .lock()
-                    .unwrap_or_else(|err| err.into_inner())
-                    .discard();
+                // A completed running commit retires only the candidate it
+                // consumed. Session loss may already have admitted a newer one.
+                if let Some(generation) = candidate_generation {
+                    self.candidate
+                        .lock()
+                        .unwrap_or_else(|err| err.into_inner())
+                        .discard_generation(&generation);
+                }
                 if request.confirmed {
                     let persist = request
                         .persist
@@ -4790,7 +4899,7 @@ where
                 .await;
         };
 
-        let _candidate_guard = match sessions
+        let candidate_guard = match sessions
             .begin_candidate_write_async(current_session_id)
             .await
         {
@@ -4835,10 +4944,17 @@ where
         {
             return reply;
         }
-        self.candidate
-            .lock()
-            .unwrap_or_else(|err| err.into_inner())
-            .discard();
+        if !self.apply_candidate_write(&candidate_guard, None).await {
+            return self
+                .exec_failure_reply(
+                    &context,
+                    NetconfOperation::DiscardChanges,
+                    NETCONF_DISCARD_CHANGES_PATH,
+                    audit_failed("operation-failed"),
+                    RpcError::operation_failed(),
+                )
+                .await;
+        }
         self.exec_success_reply(
             &context,
             NetconfOperation::DiscardChanges,
@@ -4856,6 +4972,17 @@ where
         if !self.datastore_available(request.source) || !self.datastore_available(request.target) {
             return self
                 .copy_config_failure_reply(&context, DatastoreFailure::Unsupported)
+                .await;
+        }
+        // RFC 6241 section 7.3 requires distinct source and target datastores.
+        // Reject before intent admission or creation of a replacement effect.
+        if request.source == request.target {
+            return self
+                .copy_config_failure_reply_for_rpc(
+                    &context,
+                    audit_failed("invalid-value"),
+                    RpcError::invalid_value(),
+                )
                 .await;
         }
 
@@ -5232,30 +5359,38 @@ where
             AuditOutcome::Intent,
         )
         .with_paths(self.schema_paths_for_changed_paths(&changed_paths, NETCONF_COPY_CONFIG_PATH));
-        if let Some(reply) = self
-            .required_intent_failure_reply(context, NetconfOperation::CopyConfig, &intent_event)
-            .await
-        {
+        let intent_failure = if self.required_config_audit.is_none() {
+            self.required_intent_failure_reply(context, NetconfOperation::CopyConfig, &intent_event)
+                .await
+        } else {
+            None
+        };
+        if let Some(reply) = intent_failure {
             return reply;
         }
 
-        match bus.submit(request).await {
+        match self
+            .submit_config_effect(bus.as_ref(), request, intent_event)
+            .await
+        {
             Ok(result) => {
                 let paths = self.schema_paths_for_changed_paths(
                     &result.changed_paths,
                     NETCONF_COPY_CONFIG_PATH,
                 );
-                self.record_mutation_terminal(
-                    &AuditEvent::new(
-                        context.request_id,
-                        context.principal,
-                        self.transport,
-                        AuditOperation::Replace,
-                        AuditOutcome::Success,
+                if self.required_config_audit.is_none() {
+                    self.record_mutation_terminal(
+                        &AuditEvent::new(
+                            context.request_id,
+                            context.principal,
+                            self.transport,
+                            AuditOperation::Replace,
+                            AuditOutcome::Success,
+                        )
+                        .with_paths(paths),
                     )
-                    .with_paths(paths),
-                )
-                .await;
+                    .await;
+                }
                 self.committed_revision_success_reply(
                     context,
                     NetconfOperation::CopyConfig,
@@ -5263,6 +5398,14 @@ where
                 )
             }
             Err(error) => {
+                if self.required_config_audit.is_some() {
+                    return self.required_effect_error_reply(
+                        context,
+                        NetconfOperation::CopyConfig,
+                        error.code,
+                    );
+                }
+
                 self.copy_config_failure_reply_for_rpc(
                     context,
                     audit_failed(error.code.as_str()),
@@ -5280,7 +5423,7 @@ where
         current_session_id: u64,
         sessions: &SessionRegistry,
     ) -> RpcHandlingResult {
-        let _candidate_guard = match sessions
+        let candidate_guard = match sessions
             .begin_candidate_write_async(current_session_id)
             .await
         {
@@ -5319,10 +5462,14 @@ where
             return reply;
         }
         let running = self.binding.config_bus().current_snapshot();
-        self.candidate
-            .lock()
-            .unwrap_or_else(|err| err.into_inner())
-            .replace(source, running.version);
+        if !self
+            .apply_candidate_write(&candidate_guard, Some((source, running.version)))
+            .await
+        {
+            return self
+                .copy_config_failure_reply(context, DatastoreFailure::Failed)
+                .await;
+        }
         self.copy_config_success_reply(context, vec![schema_node_path(NETCONF_COPY_CONFIG_PATH)])
             .await
     }
@@ -5894,7 +6041,9 @@ where
         )
         .with_base_version(snapshot.version);
 
-        if commit_audit_failed(&self.audit, &intent_event).await {
+        if self.required_config_audit.is_none()
+            && commit_audit_failed(&self.audit, &intent_event).await
+        {
             record_rpc_error(
                 kind.metric(),
                 NetconfErrorTag::OperationFailed,
@@ -5907,23 +6056,32 @@ where
             ));
         }
 
-        match bus.submit(commit_request).await {
+        match self
+            .submit_config_effect(bus.as_ref(), commit_request, intent_event)
+            .await
+        {
             Ok(result) => {
                 let paths = self.schema_paths_for_changed_paths(&result.changed_paths, kind.path());
-                self.record_mutation_terminal(
-                    &AuditEvent::new(
-                        context.request_id,
-                        context.principal,
-                        self.transport,
-                        AuditOperation::Update,
-                        AuditOutcome::Success,
+                if self.required_config_audit.is_none() {
+                    self.record_mutation_terminal(
+                        &AuditEvent::new(
+                            context.request_id,
+                            context.principal,
+                            self.transport,
+                            AuditOperation::Update,
+                            AuditOutcome::Success,
+                        )
+                        .with_paths(paths),
                     )
-                    .with_paths(paths),
-                )
-                .await;
+                    .await;
+                }
                 self.committed_revision_success_reply(&context, kind.metric(), &result)
             }
             Err(error) => {
+                if self.required_config_audit.is_some() {
+                    return self.required_effect_error_reply(&context, kind.metric(), error.code);
+                }
+
                 self.edit_config_failure_reply(
                     &context,
                     kind,
@@ -6025,6 +6183,25 @@ where
         ))
     }
 
+    async fn apply_candidate_write(
+        &self,
+        guard: &CandidateWriteGuard,
+        replacement: Option<(C, ConfigVersion)>,
+    ) -> bool {
+        let candidate = Arc::clone(&self.candidate);
+        matches!(
+            guard
+                .apply_if_current(move |lock| {
+                    candidate
+                        .lock()
+                        .unwrap_or_else(|err| err.into_inner())
+                        .apply_local_effect(lock, replacement);
+                })
+                .await,
+            Ok(true)
+        )
+    }
+
     async fn handle_candidate_edit_config(
         &self,
         request: &XmlEditConfigRequest,
@@ -6033,7 +6210,7 @@ where
         sessions: &SessionRegistry,
         kind: EditRpcKind,
     ) -> RpcHandlingResult {
-        let _write_guard = match sessions
+        let candidate_guard = match sessions
             .begin_candidate_write_async(current_session_id)
             .await
         {
@@ -6057,7 +6234,7 @@ where
 
         let running = self.binding.config_bus().current_snapshot();
         let base = {
-            let candidate = self.candidate.lock().unwrap_or_else(|err| err.into_inner());
+            let mut candidate = self.candidate.lock().unwrap_or_else(|err| err.into_inner());
             candidate.snapshot_or(running.config.as_ref(), running.version)
         };
         if base.base_version != running.version {
@@ -6106,10 +6283,22 @@ where
         {
             return reply;
         }
-        self.candidate
-            .lock()
-            .unwrap_or_else(|err| err.into_inner())
-            .replace(candidate.candidate, base.base_version);
+        if !self
+            .apply_candidate_write(
+                &candidate_guard,
+                Some((candidate.candidate, base.base_version)),
+            )
+            .await
+        {
+            return self
+                .edit_config_failure_reply(
+                    context,
+                    kind,
+                    audit_failed("operation-failed"),
+                    RpcError::operation_failed(),
+                )
+                .await;
+        }
 
         self.record_mutation_terminal(
             &AuditEvent::new(
@@ -7472,7 +7661,9 @@ fn edit_config_rpc_error(error: EditConfigError) -> RpcError {
 mod tests {
     #![allow(clippy::unwrap_used, clippy::expect_used)]
 
+    mod candidate_lifecycle;
     mod mutation_audit;
+    mod required_audit;
 
     use std::collections::{HashSet, VecDeque};
     use std::net::SocketAddr;
@@ -7684,15 +7875,27 @@ mod tests {
         secret: String,
     }
 
+    impl std::fmt::Debug for DemoConfig {
+        fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            formatter.write_str("DemoConfig(<redacted>)")
+        }
+    }
+
     impl OpcConfig for DemoConfig {
-        type Delta = ();
+        type Delta = Self;
 
         fn schema_digest(&self) -> SchemaDigest {
             SchemaDigest::from_bytes([1u8; 32])
         }
 
-        fn diff(&self, _previous: &Self) -> Result<Vec<Self::Delta>, ConfigError> {
-            Ok(Vec::new())
+        fn diff(&self, previous: &Self) -> Result<Vec<Self::Delta>, ConfigError> {
+            if self.hostname == previous.hostname && self.secret == previous.secret {
+                Ok(Vec::new())
+            } else {
+                // A replacement snapshot is the structured delta for this
+                // two-field fixture. Replay must detect changed content.
+                Ok(vec![self.clone()])
+            }
         }
 
         fn changed_paths(
@@ -7718,11 +7921,12 @@ mod tests {
             )
         }
 
-        fn subscriber_delta_retained_size_bytes(_delta: &Self::Delta) -> Option<usize> {
-            Some(std::mem::size_of::<Self::Delta>())
+        fn subscriber_delta_retained_size_bytes(delta: &Self::Delta) -> Option<usize> {
+            delta.subscriber_snapshot_retained_size_bytes()
         }
 
-        fn apply_delta(&mut self, _delta: Self::Delta) -> Result<(), ConfigError> {
+        fn apply_delta(&mut self, delta: Self::Delta) -> Result<(), ConfigError> {
+            *self = delta;
             Ok(())
         }
 
