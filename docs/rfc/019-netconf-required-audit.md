@@ -1,16 +1,18 @@
 # OPC-SDK-RFC-019: NETCONF Required Audit for Exact Configuration Effects
 
-**Status**: Contract proposal revised after adversarial author review. No
-independent review or complete implementation is claimed.
+**Status**: Writable-running contract and partial implementation merged. The
+retained-target architecture is selected; its detailed extension remains under
+review. No independent review or complete implementation is claimed.
 
 **Date**: 2026-09-22
 
-**Version**: 1.1.0
+**Version**: 1.2.0
 
-The writable-running profile is a partial implementation proposal. The recommended
-full profile retains encrypted candidate/startup state in the existing configuration authority. This choice and
-the lifecycle contract below require maintainer disposition; implementation,
-qualification and #958 remain open.
+The writable-running profile was delivered by #963. The selected full profile
+retains encrypted candidate/startup state in the existing configuration authority.
+The [retained-target extension](019-netconf-retained-targets.md) specifies its API,
+effect and result representations, lifecycle and compatibility boundary.
+Full-profile implementation, qualification and #958 remain open.
 
 ## Problem and existing authority
 
@@ -115,9 +117,9 @@ unsupported local-effect compositions explicitly. The following full-profile
 contracts remain required before those compositions can be enabled; they are
 not delegated to an accepting application audit callback.
 
-### Recommended full-profile authority
+### Selected full-profile authority
 
-The recommended full profile retains encrypted candidate and startup target
+The selected full profile retains encrypted candidate and startup target
 state in the existing replicated configuration authority. Its atomic application
 transaction records both the target effect and the corresponding audit outcome.
 It uses the existing KeyProvider and attested encryption seams, native WAL and
@@ -136,9 +138,9 @@ The alternative is a volatile candidate owner with a retained owner incarnation
 and explicit lost-state outcome. That alternative requires a protocol that binds
 the volatile effect and replicated outcome despite cancellation or process loss.
 The current closed append port provides no such protocol. Merely wrapping an
-in-memory edit in audit calls leaves an ambiguous effect boundary. This RFC
-recommends the retained-target design; approval must settle this tradeoff before
-its public API or retained format is implemented.
+in-memory edit in audit calls leaves an ambiguous effect boundary. The
+retained-target design is selected. The detailed extension still requires review
+and merge before its public API or retained format is implemented.
 
 The following names describe proposed semantics, not available SDK APIs:
 

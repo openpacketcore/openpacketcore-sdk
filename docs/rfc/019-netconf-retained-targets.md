@@ -1,0 +1,342 @@
+# RFC 019 extension: Retained NETCONF targets and lifecycle authority
+
+**Status:** Proposed format and API extension. The retained-target approach is
+selected. This document must complete review and merge before architectural
+implementation; it does not declare the full profile available.
+
+**Date:** 2026-09-24
+
+**Version:** 0.1.0
+
+**Parent:** [RFC 019](019-netconf-required-audit.md). Refs #958.
+
+## Scope and availability
+
+The full required-audit profile places encrypted candidate and startup state in
+the existing configuration consensus authority. Staging, discard, copy, startup
+writes and protocol lifecycle transitions depend on that authority and its
+independent audit checkpoint service. An unavailable authority cannot be replaced
+by a local candidate edit or a successful application audit callback.
+
+The existing writable-running required-audit profile remains available. Legacy
+volatile candidate and synchronous startup implementations retain their behavior
+outside the full profile. Full-profile attachment explicitly refuses an arbitrary
+startup implementation or a datastore without the closed target capability.
+
+There is one logical NETCONF device owner per configuration authority. This is
+distinct from its replicated voters. Starting a replacement device owner is an
+explicit retained lifecycle transition. Starting a voter or a checkpoint provider
+does not make that transition. The embedding application must use the SDK device
+owner lifecycle before serving authenticated NETCONF sessions; possession of a
+database connection or a numeric session identifier grants no such ownership.
+
+## Public capability and result contract
+
+The following additions are SDK-owned types with private fields, validated
+constructors and redacted `Debug`. They are proposed APIs, not existing symbols.
+
+| Type or operation | Contract |
+| --- | --- |
+| `ConfigBus::required_netconf_audit` | Returns `RequiredNetconfAudit<C>` only when the exact worker has both the existing required running port and the reviewed retained-target port. Default/custom datastore implementations refuse. |
+| `ReadOnlyNetconfServer::with_required_netconf_audit` | Attaches that capability and its observation sink. Checks exact worker, target profile and device ownership at attachment and each dispatch. Never hides an advertised capability or grants NACM/principal authority. |
+| `CandidateGeneration`, `StartupRevision` | Distinct authority-scoped, checked `u64` counters. Neither converts to `ConfigVersion`. Zero denotes only the authenticated initial absent state. Deletion/discard retains a tombstone and advances the counter. |
+| `NetconfDeviceOwner`, `NetconfSessionOwner`, `NetconfLockLease` | Authority-minted incarnation-bound capabilities. Session ownership binds authenticated caller and device incarnation; each lock lease also binds its datastore and monotonically increasing lock incarnation. Numeric NETCONF session IDs remain correlation only. |
+| `NetconfTargetRequest<C>` | Original request/caller/transport, fixed expiry, exact target/action, expected generations, immutable validated content and authenticated source selection. No request field asserts that an effect already happened. |
+| `PreparedTargetMutation` | Closed encrypted effect plus authenticated original operation handle, prepared by the SDK adapter/authority. No public field setters or construction from caller-asserted ciphertext digests. Encoding is bounded protected recovery data, never diagnostics. |
+| `NetconfMutationResult` | A disjoint typed applied result, definite rejection, or unresolved original handle. A known result cannot become rejection because a later read/report failed. |
+| Authorized lookup/recovery | Takes the original handle and independently authenticated caller/recovery capability. Lookup never submits a replacement effect, extends expiry, or treats a missing row as success. |
+
+The typed applied result distinguishes `Candidate { generation }`,
+`Startup { revision }`, `Promoted { running_version, retired_generation }`,
+`Tentative { running_version, retired_generation, pending }`,
+`Confirmed { pending }`, `RolledBack { running_version, pending }` and
+`Lifecycle { incarnation }`. Pending and incarnation values are opaque scoped
+tokens. Existing `AuditOperationState::Committed { version }` keeps its running
+meaning and byte representation. New target outcomes use a separate variant;
+no candidate generation or startup revision is encoded as a running version.
+
+Session and lock ownership are not derived from user-supplied audit labels. The
+SDK authenticates a session before issuing its owner capability. A replacement
+worker over the same database cannot reuse the old worker's capability. Ordinary
+running gNMI and NETCONF writes continue through their current required port;
+when the full profile is active, its retained debt/lifecycle fences also apply
+to those writes at the shared authority boundary.
+
+The submission surface has these signatures (the proposed types above are not
+yet available):
+
+```text
+ConfigBus<C>::required_netconf_audit(&self)
+    -> Result<RequiredNetconfAudit<C>, StoreError>
+ReadOnlyNetconfServer::with_required_netconf_audit(self, RequiredNetconfAudit<C>)
+    -> Result<Self, ServerInitError>
+RequiredNetconfAudit<C>::belongs_to(&self, &ConfigBus<C>) -> bool
+RequiredNetconfAudit<C>::submit(&self, NetconfTargetRequest<C>, AuditEvent)
+    -> Future<Output = NetconfMutationResult>
+RequiredNetconfAudit<C>::recover(&self, &NetconfRecoveryHandle, &TrustedPrincipal)
+    -> Future<Output = NetconfMutationResult>
+```
+
+`NetconfMutationResult` has `Applied(NetconfAppliedReceipt)`,
+`Rejected(CommitError)` and `Unknown(NetconfRecoveryHandle)` variants. The receipt
+exposes the typed outcome and terminal-recorded status; the recovery handle is
+opaque and bounded. A rejected result guarantees no effect by that admission;
+an unknown result grants no permission to resubmit different work. Separate
+SDK lifecycle methods create device/session/lock capabilities only after current
+authority and caller authorization; `submit` cannot mint them from request fields.
+
+## Closed effect representation
+
+`TargetEffectV1` is an explicitly tagged, bounded record. Its common fields, in
+encoding order, are: format revision, authority identity, profile incarnation,
+device incarnation, projected caller, original projected request, action,
+destination expectation, source expectation, lock expectation, fixed expiry,
+encrypted effect payload and effect-specific resolution. Optional fields use
+explicit option tags; absent and empty content are different values.
+
+Action tags are fixed within this new record: 0 activate, 1 begin device,
+2 acquire lock, 3 release lock, 4 stage candidate, 5 discard candidate,
+6 promote candidate, 7 replace startup, 8 delete startup, 9 tentative promotion,
+10 confirm pending, 11 cancel pending, 12 expire pending, 13 end session and
+14 reboot recovery. Unknown tags and trailing data are rejected. Legacy command
+and effect tags are not renumbered.
+
+Destination expectations contain the exact current target generation, not just
+the desired successor. Source expectations bind source datastore, generation or
+running version, immutable source ciphertext digest and schema. Copy preparation
+authenticates/decrypts that exact source through the existing provider, then
+constructs the destination envelope. Application rechecks the source expectation
+and cannot silently fetch a newer source. The closed SDK preparation path binds
+the source plaintext to the destination encryption; a caller's matching digest
+claim alone is insufficient.
+
+Promotion carries the ordinary prepared running commit plus the exact candidate
+expectation. The common running preparation/capacity contract is used unchanged.
+It commits running state and retires the candidate in one existing authority
+transaction. A delayed generation-A promotion cannot commit or clear generation
+B. The applied outcome records both the running version and retired generation.
+
+Target encryption uses existing `KeyProvider`, `EnvelopeAad::config`,
+`ConfigAad` and attested-envelope APIs. The target counter occupies the AAD's
+generic numeric version field; it is never represented as `ConfigVersion`.
+The target's store-kind domain is distinct from `running` and includes the
+target/profile binding digest in a fixed canonical hexadecimal spelling.
+Candidate, startup and confirmation-ownership domains are separate. The digest
+is computed from the pre-encryption common binding, including authority, target,
+source, destination, schema, caller and request. It excludes the destination
+envelope bytes and MAC, avoiding a circular dependency. It is authenticated AAD, not a new
+encryption algorithm or a substitute for provider attestation.
+
+Principal/tenant metadata uses the existing projection and encrypted envelope
+rules. Persistent confirmation credentials are encrypted through the same custody
+seam, with their exact pending identity and device ownership in AAD. Raw tokens,
+requests and configuration payloads do not appear in typed errors or diagnostics.
+Legacy running plaintext wrappers and authentication domains remain unchanged.
+
+## Admission, application and terminal recovery
+
+Every changing target action follows this order:
+
+1. Enforce authentication, authorization, current configuration authority, device
+   ownership, lock and source/destination expectations. Validate/encrypt through
+   the existing SDK provider seam and preflight the complete eventual command,
+   including audit metadata and terminal reservation. Reject before admission if
+   any command, retained-state or reservation bound would be exceeded.
+2. Retain the original closed recovery description with its required intent.
+   The operation reserves its outcome and terminal capacity. Independently
+   checkpoint that intent before allowing application. Rejected or indeterminate
+   intent admission permits no effect, including local registry publication.
+3. Apply the authenticated closed effect and typed outcome atomically in the
+   configuration authority's application transaction. Revalidate current versions,
+   ownership, expiry and all fences at that boundary. An admitted stale effect
+   receives a definite retained rejection without partially changing a target.
+4. Complete the original terminal/checkpoint obligation. Its failure cannot erase
+   a known applied result. Retained debt fences subsequent configuration and
+   target changes, including replacement lock/device admission, until exact
+   original-operation reconciliation succeeds.
+
+The ConfigBus worker and retained operation own completion after admission.
+Dropping a protocol future cannot drop candidate retirement, confirmation
+ownership or a lifecycle recovery fence. A protocol error after transfer does
+not produce a second terminal or relabel a possible commit as a failure.
+
+Exact request replay returns the original typed result without advancing any
+generation again. Reuse with another action, source, target, caller or ciphertext
+is rejected. Recovery never mints a new request to discover an old result. An
+expired original handle can recover an already-established result under existing
+authorization rules; it cannot authorize a newly applied effect.
+
+If an expired operation is authoritatively resolved as unapplied/rejected, a
+separately authorized recovery attempt may address the still-fenced lifecycle
+event. It must first settle the original obligation; an unknown original outcome
+never permits this replacement. The new attempt does not extend the original
+confirmed deadline, change the pending parent or convert an earlier failure to
+success. This distinction permits recovery after a long authority outage without
+replaying a possibly applied operation.
+
+## Retained state and compatibility
+
+The target extension proposes config command/wire revision **9** and
+storage/snapshot revision **7**. Revision 8 and storage/snapshot 6 are reserved by
+the separate capacity contract. These numbers do not imply that an unimplemented
+capacity profile is available. Implementation must preserve the exact landed
+capacity variants and bounds, and qualify each supported profile combination.
+The first target profile uses the currently supported capacity contract and
+refuses combinations without a landed, qualified implementation.
+
+To avoid colliding with capacity append variants, the target command is appended
+inside the existing management-audit command family. At the inspected base,
+`AuditCommand::NetconfTarget` follows `AcknowledgeExport` with index 9; outer
+`ConfigMutationIntent::ManagementAudit` retains index 6. Its minimum command
+revision is 9. The old running `AuditedConfigEffect` representation is unchanged.
+If the shared base changes these indices, reconcile the contract before code;
+never reuse an allocated tag or copy a parallel experimental implementation.
+
+The storage extension adds three bounded authenticated tables to the existing
+SQLite authority, not another database or storage engine:
+
+| Table | Exact logical rows and body fields |
+| --- | --- |
+| `config_netconf_profile` | Singleton: format, authority, selected target/capacity profile, activation operation, original bootstrap checkpoint, current device incarnation, last target-transition sequence and state digest. |
+| `config_netconf_targets` | Exactly candidate and startup rows: target tag, generation, present/tombstone tag, schema, encrypted envelope or absent marker, source/base binding and last applying operation. |
+| `config_netconf_lifecycle` | Singleton: device ownership, three datastore lock slots, optional exact pending confirmation, original rollback parent/deadline, encrypted confirmation ownership, and bounded unresolved cleanup/recovery descriptions. |
+
+Bodies use the repository's bounded JSON serialized-struct and authenticated-state
+helpers. Field order follows the table above, field names use `snake_case`, and
+fixed byte arrays retain the existing JSON integer-array encoding. Every body
+has format 1; new outcome payloads have a separate `target-v1` tag. Decoders reject
+unknown fields and invalid tags. The enclosing command uses the existing bounded
+postcard codec; these body/tag definitions do not redefine that codec.
+Target tags are candidate=0 and startup=1. Counters never wrap. Locks
+have fixed running/candidate/startup slots. At most one pending confirmation and
+one cleanup obligation per owned lock are retained; duplicate delivery refers to
+the original obligation rather than growing an unbounded event list. Admission
+accounts for the complete encoded bodies and reserved recovery descriptions
+within the existing authenticated-state and complete-command bounds. Limits are
+not multiplied by treating each field as independently entitled to the maximum.
+
+The sealed authority table manifest, reopen validator, history validator and
+snapshot copy/restore set include these exact tables and row invariants. Their
+authenticated state digest binds authority, format, all row tags, generations,
+ownership, ciphertext and unresolved obligations. The applied target outcome
+binds its resulting digest into the existing authenticated audit history; the
+profile anchor preserves this relation across acknowledged pruning. Tampering
+with a target while retaining a valid unrelated running history must fail.
+
+The snapshot body and envelope identify target and capacity profiles. Snapshot
+construction captures validation, frontier and all tables from one pinned source
+read transaction. Import verifies the independently admitted destination profile,
+identity, authenticated body, lifecycle/audit checkpoint relation and table set
+before replacing authority. An old-format or partial-body snapshot cannot clear
+a newer target fence. All copies retain existing storage limits and deadlines.
+
+Old ledger entries, running outcomes, effect encodings, key transitions and
+independent checkpoints retain their original bytes and authentication. New
+target outcome payloads are explicitly versioned and disjoint. Export manifests
+bind the target format/profile and the frozen predecessor/terminal boundaries;
+unsupported readers fail with typed errors. An ordinary mutation checkpoint
+still grants no verified-export retention authority. This does not provide the
+recipient-only verification capability requested by #959.
+
+## Activation and bootstrap
+
+Full-profile provisioning is explicit. New-format stores start with authenticated
+inactive target state; absence of its row is corruption, not permission to
+initialize. Activation records both zero-generation tombstones, device ownership
+and the exact audit/checkpoint anchor before serving mutations.
+
+Existing stores require a quiescent, separately invoked SDK upgrade. The upgrade
+binds the exact source authority, applied frontier, audit/checkpoint anchor and
+approved destination profile. All participating readers/writers must support
+that profile; fixed membership and exact peer-profile agreement are verified
+before activation. Legacy writers cannot rejoin or recover a new-profile store
+under a legacy binding. Refusal must precede mutation of the original WAL; a
+later server capability check is insufficient.
+
+Quiescence includes no candidate owner, pending staging request, unresolved
+cleanup, old terminal obligation or pending confirmation whose original ownership
+cannot be resolved. Upgrade retains the source history and authenticated recovery
+evidence; it does not reset the database, replace historical MACs or rotate keys.
+An interrupted upgrade is either still the old inactive authority or a retained
+new-profile recovery obligation that blocks writes. It cannot publish a partially
+upgraded authority. Downgrade after activation is unsupported.
+
+Legacy startup content is not trusted merely because a callback returns it. Any
+import is an explicit authorized exact-content target mutation after bootstrap,
+with independent source verification and its own intent/result. No staged legacy
+candidate is silently imported or discarded. If these preconditions cannot be
+proved by the SDK's retained-opening and upgrade APIs, activation stays refused.
+
+## Session, lock and confirmed-commit lifecycle
+
+The SDK issues a fresh session incarnation after authentication under the retained
+device owner. A lock request reserves the registry's existing atomic operation
+permit, admits the exact retained lease, then publishes that lease locally. Caller
+cancellation after admission is completed by the owner. A crash between retained
+admission and local publication is reconciled before serving another session.
+Local registry entries are projections and cannot manufacture durable ownership.
+
+Candidate unlock admits a generation/lock-bound discard and atomically releases
+that retained lease. Explicit unlock returns success only after that result is
+known. Session disappearance invalidates its local authority immediately and
+retains cleanup independently of an RPC future. While cleanup admission or its
+checkpoint is unavailable, new ownership/effects remain fenced. Late cleanup for
+one incarnation cannot clear a later stage or another owner's lease.
+
+An empty candidate commit is an observation only after an authoritative
+generation-checked read proves no staged target. It is not inferred from a local
+cache, missing database row or timeout. Validate/test-only and ordinary reads
+remain observations; they cannot acquire configuration-effect authority.
+
+Tentative promotion retains the pending transaction, rollback parent, original
+deadline and encrypted session/persistent ownership in the same transaction as
+the tentative effect. Confirmation and cancellation compare that exact pending
+identity. Replays and recovery preserve the deadline. A separately authorized
+follow-up confirmed commit has a new request; it is not an extension of a retry.
+
+Session loss rolls back nonpersistent pending ownership. Persistent-token session
+loss retains the original deadline and token binding. Beginning a replacement
+NETCONF device owner is a device-reboot boundary and schedules rollback even for
+persistent ownership before ordinary writes resume. Voter election, store reopen
+for a voter and checkpoint-provider restart do not themselves begin a device.
+The trusted embedding must distinguish those starts; the SDK exposes an explicit
+device-start transition and refuses serving under an unestablished incarnation.
+
+Lifecycle recovery uses an SDK-scoped recovery actor linked to the original
+principal and pending effect. It cannot fabricate credentials or take the most
+recent pending transaction instead. Repeated session/reboot delivery recovers
+the same retained operation and original rollback parent. Known rollback with
+terminal debt remains known rollback; the debt fence survives further restart.
+
+These lifecycle requirements follow [candidate lock release](https://www.rfc-editor.org/rfc/rfc6241.html#section-8.3.5.2)
+and [confirmed commit](https://www.rfc-editor.org/rfc/rfc6241.html#section-8.4.1).
+
+## Qualification and delivery
+
+Every enabled row in the parent RFC's mutation inventory remains mandatory,
+including positive authenticated wire copy between distinct supported targets.
+The existing helper-only copy and explicit profile-refusal tests cannot qualify
+those operations. A full-profile negative reads all relevant authoritative target,
+running, pending and audit state; unchanged running version alone is inadequate.
+
+Use synthetic real-authority fixtures for stale generation, discard/recreate ABA,
+source/action/ciphertext substitution, wrong caller/worker/session/token,
+conflicting request reuse, refused/unknown checkpoint admission and terminal debt.
+Keep deterministic cancellation barriers, fixed original deadlines and stale-owner
+negatives. Extend retained reopen, process loss, independent checkpoint-provider
+restart and authenticated voter-replacement fixtures; distinguish device reboot
+and session loss with their own controls.
+
+Freeze old-format byte fixtures and add new command/state/snapshot/export
+fixtures, including omitted/reordered/substituted state, truncated snapshots,
+unknown format, unsupported profile, partial upgrade and coherent rollback.
+Preserve #925 checkpoint ordering/recovery and the #927 gNMI regression suite.
+Test complete command and recovery reservations at their actual bounds without
+raising limits or bypassing the capacity contract.
+
+Implementation requires runnable desired-behavior RED, exact fix-removal RED,
+a distinct adversarial mutation, restoration of the exact fix, full applicable
+local/hosted checks, exact candidate review and normal current-main integration.
+Author review is identified as author review; it is not independent approval.
+Use Refs #958 until every acceptance row is complete. Native WAL and explicit
+Durable/Async behavior remain unchanged.
