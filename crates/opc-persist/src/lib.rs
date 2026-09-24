@@ -124,6 +124,7 @@ pub use break_glass::{
     BreakGlassAlarmNotifier, BreakGlassApprovalTrait, BreakGlassRequest, BreakGlassService,
     BreakGlassSession, BreakGlassStatus, DefaultBreakGlassApproval, NoopBreakGlassAlarmNotifier,
 };
+pub use consensus::RetainedConfigProfile;
 pub use consensus::{
     ApprovedLegacyConfigRecovery, ConfigConsensusClock, ConfigConsensusClusterId,
     ConfigConsensusConfigurationEpoch, ConfigConsensusConfigurationId, ConfigConsensusEntryDigest,

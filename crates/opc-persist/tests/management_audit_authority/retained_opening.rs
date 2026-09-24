@@ -7,7 +7,7 @@ use opc_persist::{
     AuditKey, ConfigConsensusClusterId, ConfigConsensusConfigurationEpoch,
     ConfigConsensusConfigurationId, ConfigConsensusIdentity, ConfigConsensusNodeId,
     ConfigConsensusTopology, RetainedConfigBinding, RetainedConfigDurability, RetainedConfigError,
-    RetainedConfigOptions, SqliteBackend,
+    RetainedConfigOptions, RetainedConfigProfile, SqliteBackend,
 };
 use sha2::Sha256;
 use std::collections::BTreeSet;
@@ -45,6 +45,15 @@ fn fixtures() -> [LegacyBinding; 3] {
 }
 
 fn options(path: &Path, fixture: &LegacyBinding, backing: u8) -> RetainedConfigOptions {
+    options_for_profile(path, fixture, backing, RetainedConfigProfile::Legacy)
+}
+
+fn options_for_profile(
+    path: &Path,
+    fixture: &LegacyBinding,
+    backing: u8,
+    profile: RetainedConfigProfile,
+) -> RetainedConfigOptions {
     let identity = ConfigConsensusIdentity::new(
         ConfigConsensusClusterId::from_bytes([0x31; 32]),
         ConfigConsensusConfigurationId::from_bytes([0x32; 32]),
@@ -62,7 +71,9 @@ fn options(path: &Path, fixture: &LegacyBinding, backing: u8) -> RetainedConfigO
     .unwrap();
     RetainedConfigOptions::new(
         path,
-        RetainedConfigBinding::new(topology, [backing; 32], [0x42; 32]).unwrap(),
+        RetainedConfigBinding::new(topology, [backing; 32], [0x42; 32])
+            .unwrap()
+            .with_profile(profile),
         RetainedConfigDurability::Ephemeral,
         16 * 1024 * 1024,
         Duration::from_secs(30),
@@ -146,6 +157,100 @@ async fn legacy_wrong_backing_rejection_preserves_storage_and_releases_admission
         SqliteBackend::reopen_config_authority(options(&path, fixture, 0x43), key(fixture)).await;
     assert!(matches!(rejected, Err(RetainedConfigError::Rejected)));
     assert_eq!(snapshot(), before, "rejection changed original storage");
+    drop(
+        SqliteBackend::reopen_config_authority(options(&path, fixture, 0x41), key(fixture))
+            .await
+            .unwrap(),
+    );
+}
+
+#[tokio::test]
+async fn retained_target_profile_provisions_and_reopens_with_exact_selection() {
+    let fixture = &fixtures()[0];
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("targets.sqlite");
+    let options = options_for_profile(
+        &path,
+        fixture,
+        0x41,
+        RetainedConfigProfile::NetconfTargetsV1,
+    );
+    drop(
+        SqliteBackend::provision_config_authority(options.clone(), key(fixture))
+            .await
+            .unwrap(),
+    );
+    // A removed refusal guard alone must not satisfy this detector. Require
+    // the RFC format and complete bounded inactive target row set as well.
+    let conn =
+        rusqlite::Connection::open_with_flags(&path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)
+            .unwrap();
+    let revision: u16 = conn
+        .query_row(
+            "SELECT schema_version FROM config_raft_identity WHERE singleton = 1",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(revision, 7, "target storage revision was not admitted");
+    for (table, expected_rows) in [
+        ("config_netconf_profile", 1),
+        ("config_netconf_targets", 2),
+        ("config_netconf_lifecycle", 1),
+    ] {
+        let count: u64 = conn
+            .query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(count, expected_rows, "target row set is incomplete");
+    }
+    drop(conn);
+    let record_path = dir.path().join("targets.sqlite.opc-retained");
+    let before = std::fs::read(&record_path).unwrap();
+    drop(
+        SqliteBackend::reopen_config_authority(options, key(fixture))
+            .await
+            .unwrap(),
+    );
+    assert_eq!(std::fs::read(&record_path).unwrap(), before);
+}
+
+#[tokio::test]
+async fn retained_target_selection_cannot_adopt_legacy_storage() {
+    let fixture = &fixtures()[0];
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("legacy.sqlite");
+    drop(
+        SqliteBackend::provision_config_authority(options(&path, fixture, 0x41), key(fixture))
+            .await
+            .unwrap(),
+    );
+    let snapshot = || {
+        std::fs::read_dir(dir.path())
+            .unwrap()
+            .map(|entry| {
+                let entry = entry.unwrap();
+                (entry.file_name(), std::fs::read(entry.path()).unwrap())
+            })
+            .collect::<std::collections::BTreeMap<_, _>>()
+    };
+    let before = snapshot();
+    let selected = options_for_profile(
+        &path,
+        fixture,
+        0x41,
+        RetainedConfigProfile::NetconfTargetsV1,
+    );
+    assert!(matches!(
+        SqliteBackend::reopen_config_authority(selected, key(fixture)).await,
+        Err(RetainedConfigError::Rejected)
+    ));
+    assert_eq!(
+        snapshot(),
+        before,
+        "profile refusal changed original storage"
+    );
     drop(
         SqliteBackend::reopen_config_authority(options(&path, fixture, 0x41), key(fixture))
             .await

@@ -25,7 +25,7 @@ use crate::local_sqlite::{
     file_identity, identity_for_path, open_file, open_sqlite, AdmissionFileLock, FileAdmission,
 };
 use crate::local_sqlite::{lock_path, reject_symlink_components};
-use crate::{AuditKey, ConfigConsensusTopology, SqliteBackend};
+use crate::{AuditKey, ConfigConsensusTopology, RetainedConfigProfile, SqliteBackend};
 
 #[cfg(unix)]
 use std::os::unix::fs::OpenOptionsExt;
@@ -33,6 +33,7 @@ use std::os::unix::fs::OpenOptionsExt;
 const RECORD_MAGIC: &[u8; 8] = b"OPCRET01";
 const RECORD_DOMAIN: &[u8] = b"openpacketcore/config-retained-admission/v1\0";
 const BINDING_DOMAIN: &[u8] = b"openpacketcore/config-retained-scope/v1\0";
+const TARGET_BINDING_DOMAIN: &[u8] = b"openpacketcore/config-retained-scope/netconf-targets/v1\0";
 const RECORD_BYTES: usize = 8 + 32 + 32 + 1 + 6 * 8 + 32;
 const MAX_VALIDATION_BYTES: u64 = 64 * 1024 * 1024 * 1024;
 const COPY_BUFFER_BYTES: usize = 64 * 1024;
@@ -57,6 +58,7 @@ pub struct RetainedConfigBinding {
     topology: ConfigConsensusTopology,
     backing_identity: [u8; 32],
     key_scope: [u8; 32],
+    profile: RetainedConfigProfile,
 }
 
 impl RetainedConfigBinding {
@@ -73,7 +75,22 @@ impl RetainedConfigBinding {
             topology,
             backing_identity,
             key_scope,
+            profile: RetainedConfigProfile::Legacy,
         })
+    }
+
+    /// Explicitly select the independently admitted target/capacity profile.
+    ///
+    /// A selection is not proof that the SDK supports opening that profile.
+    /// Provisioning and reopening refuse unsupported profiles before opening
+    /// the original database. The existing constructor selects `Legacy`.
+    pub fn with_profile(mut self, profile: RetainedConfigProfile) -> Self {
+        self.profile = profile;
+        self
+    }
+
+    pub(crate) const fn profile(&self) -> RetainedConfigProfile {
+        self.profile
     }
 
     pub(crate) fn topology(&self) -> &ConfigConsensusTopology {
@@ -96,7 +113,18 @@ impl RetainedConfigBinding {
         digest.update(self.key_scope);
         digest.update(key.epoch().to_be_bytes());
         digest.update(key.fingerprint());
-        digest.finalize().into()
+        let legacy: [u8; 32] = digest.finalize().into();
+        match self.profile {
+            RetainedConfigProfile::Legacy => legacy,
+            RetainedConfigProfile::NetconfTargetsV1 => {
+                let mut digest = Sha256::new();
+                digest.update(TARGET_BINDING_DOMAIN);
+                // Closed target profile 1, independently selected legacy capacity 0.
+                digest.update([1, 0]);
+                digest.update(legacy);
+                digest.finalize().into()
+            }
+        }
     }
 }
 
@@ -356,6 +384,9 @@ fn open_authority_sync(
 ) -> Result<SqliteBackend, RetainedConfigError> {
     let provision = !matches!(intent, OpenIntent::Reopen);
     work.check()?;
+    if provision && options.binding.profile() != RetainedConfigProfile::Legacy {
+        return Err(RetainedConfigError::Unsupported);
+    }
     reject_symlink_components(&options.path)?;
     if provision && std::fs::symlink_metadata(&options.path).is_ok() {
         return Err(RetainedConfigError::AlreadyExists);
@@ -420,6 +451,9 @@ fn open_authority_sync(
             .read_exact(&mut record)
             .map_err(|_| RetainedConfigError::RecoveryRequired)?;
         validate_record(&record, &options.binding, &audit_key)?;
+        if options.binding.profile() != RetainedConfigProfile::Legacy {
+            return Err(RetainedConfigError::Unsupported);
+        }
     }
     let database = if provision {
         work.mutation()?;
