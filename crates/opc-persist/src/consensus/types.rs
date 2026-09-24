@@ -405,6 +405,11 @@ fn preflight_preparation_capacity(
             .map_err(|_| PersistError::corrupt_blob())?;
     charge(header_key_bytes)?;
     charge(aad_bytes)?;
+    // Keep a second principal-sized allowance for decoded scalar contents.
+    // Reserved strings are copied while the original record stays live.
+    // Parser scratch, nested raw values, allocator rounding and tenant
+    // extraction still need separate accounting; this is not a peak bound.
+    charge(record.principal.len())?;
     // Count with the existing bounded emitter before validation or output
     // allocation. Charge every new output while conservatively retaining all
     // old inputs; do not subtract the raw path before its replacement exists.
