@@ -357,9 +357,12 @@ from admission of new writes.
 
 ## Qualification required before capability delivery
 
-Every row requires exact base/head/tree, settings and retained results. Current
-status for all runtime rows is **missing**. A setup failure is not a detector
-failure, and component loopback evidence is not production transport evidence.
+Every row requires exact base/head/tree, settings and retained results.
+Complete larger-profile qualification remains **outstanding**. Original-behavior
+detectors and partial component results are tracked in #960; they do not establish
+the larger-profile guarantee or complete the acceptance matrix below. A setup
+failure is not a detector failure, and component loopback evidence is not
+production transport evidence.
 
 | Row | Required observations |
 | --- | --- |
