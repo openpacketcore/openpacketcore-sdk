@@ -215,3 +215,6 @@ fn config_capacity_957_preparation_counts_unwrapped_tenant_value() {
 fn config_capacity_957_preparation_counts_wrapped_tenant_value() {
     tenant_value_case(true, 0x45);
 }
+
+#[path = "config_capacity_tenant_compatibility_tests.rs"]
+mod compatibility;
