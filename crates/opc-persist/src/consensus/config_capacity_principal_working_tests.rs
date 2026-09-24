@@ -249,3 +249,6 @@ fn config_capacity_957_preparation_counts_rejected_rollback_array() {
 
 #[path = "config_capacity_principal_compatibility_tests.rs"]
 mod compatibility;
+
+#[path = "config_capacity_principal_scalar_working_tests.rs"]
+mod scalar;
