@@ -161,7 +161,10 @@ pub fn validate_consensus_physical_fenced_transition_request(
 
 mod async_persistence;
 mod membership;
+mod planned_shutdown;
 mod quorum_readiness;
+
+use planned_shutdown::ConsensusRetirementCoordinator;
 
 /// Feature-gated signing fixtures for live consensus integration coverage.
 #[cfg(feature = "test-control")]
@@ -1888,6 +1891,7 @@ struct ConsensusSessionStoreInner {
     proposal_admission: Arc<tokio::sync::Semaphore>,
     diagnostics: Arc<ConsensusStoreDiagnosticCounters>,
     shutdown: ConsensusShutdownCoordinator,
+    retirement: ConsensusRetirementCoordinator,
     #[cfg(test)]
     accepted_receiver_test_outcomes: Mutex<VecDeque<AcceptedClientWriteReceiverTestOutcome>>,
 }
@@ -3562,6 +3566,7 @@ impl ConsensusSessionStore {
             )),
             diagnostics,
             shutdown: ConsensusShutdownCoordinator::new(),
+            retirement: ConsensusRetirementCoordinator::new(),
             #[cfg(test)]
             accepted_receiver_test_outcomes: Mutex::new(VecDeque::new()),
         });
@@ -3790,6 +3795,7 @@ impl ConsensusSessionStore {
             )),
             diagnostics,
             shutdown: ConsensusShutdownCoordinator::new(),
+            retirement: ConsensusRetirementCoordinator::new(),
             #[cfg(test)]
             accepted_receiver_test_outcomes: Mutex::new(VecDeque::new()),
         });
@@ -5948,7 +5954,8 @@ impl ConsensusSessionStore {
         // nor veto application authority. The latch is set only after the
         // exact durable applied scope is proven; engine failure and local
         // removal remain live vetoes.
-        let admitted = self.inner.admitted.load(Ordering::Acquire)
+        let admitted = !self.inner.retirement.is_started()
+            && self.inner.admitted.load(Ordering::Acquire)
             && self.inner.persistence_protocol.is_active()
             && engine_running
             && current_members.contains(&self.inner.local_node_id)
@@ -6160,7 +6167,8 @@ impl ConsensusSessionStore {
     }
 
     fn exact_membership_is_admitted(&self) -> bool {
-        self.inner.admitted.load(Ordering::Acquire)
+        !self.inner.retirement.is_started()
+            && self.inner.admitted.load(Ordering::Acquire)
             && self.inner.persistence_protocol.is_active()
             && self.engine_is_running_in_local_scope()
             && (self.inner.topology.mode() != QuorumTopologyMode::FixedDurableQuorum
@@ -11506,6 +11514,7 @@ impl SessionConsensusRpcHandler for SessionConsensusService {
                 | SessionConsensusRpcFamily::AppendEntries
                 | SessionConsensusRpcFamily::AppendEntriesRoster
                 | SessionConsensusRpcFamily::InstallSnapshot
+                | SessionConsensusRpcFamily::LeadershipTransfer
         ) {
             let deadline = self
                 .store

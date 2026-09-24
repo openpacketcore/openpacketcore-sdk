@@ -491,7 +491,29 @@ prepares a strictly newer range where necessary. No timeout is raised to make
 recovery succeed. `Active` permits consensus participation, not traffic by
 itself; ordinary admission can still return `ClusterFormationRejected`.
 
-After the RPC handler is removed,
+For a planned voter restart, first stop external consumers, then call
+`ConsensusSessionStore::prepare_shutdown()` while the authenticated replication
+listener remains available. The store closes local consumer admission and
+atomically asks the engine to retire from campaigning. A retiring leader hands
+off its exact accepted prefix to a current voter; a follower or candidate must
+observe a different current leader. Success requires a fresh engine quorum
+read proof in the unchanged scope. The retiring voter can participate in that
+proof, so operators must retain a surviving quorum and serialize conflicting
+retirements; this is not a certificate against another simultaneous loss.
+
+Preparation has one owned operation and the original operation deadline.
+Cancellation does not resume admission or select another successor. Later calls
+observe the retained result, including failure. Already accepted mutations keep
+their original completion paths. A failed preparation must be reported as a
+failed handoff; later recovery does not turn it into a success. Preparation does
+not change membership or persistence mode and publishes no storage close proof.
+
+Normal startup must still establish each capability that consumers require.
+V1 fenced-transition activation and V2 profile activation are independent;
+planned retirement does not manufacture a missing activation certificate.
+A new store incarnation must separately regain consensus admission.
+
+After preparation completes and the RPC handler is removed,
 `shutdown()` joins the active consensus engine and every storage owner, drains
 the final generation, then publishes a one-use proof while retaining the root
 lock. Reopen validates the exact root, generation, full vote/log/application
