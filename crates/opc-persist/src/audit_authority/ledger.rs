@@ -354,7 +354,7 @@ impl LedgerState {
     pub(crate) fn admit_target(
         &mut self,
         key: &AuditKey,
-        prepared: &crate::consensus::audit_mutation::PreparedTargetMutation,
+        prepared: &super::PreparedTargetMutation,
         now: i64,
     ) -> Result<(), AuditAuthorityError> {
         if self.continuity.is_none() {
@@ -515,7 +515,7 @@ impl LedgerState {
         key: &AuditKey,
         handle: &AuditOperationHandle,
         caller: AuditCaller,
-    ) -> Result<crate::consensus::audit_mutation::PreparedTargetMutation, AuditAuthorityError> {
+    ) -> Result<super::PreparedTargetMutation, AuditAuthorityError> {
         handle.verify(key, self.identity, caller)?;
         let index = self.operation_index(key, handle)?;
         let operation = &self.operations[index];
@@ -789,9 +789,8 @@ fn validate_target_recovery(
     key: &AuditKey,
     handle: &AuditOperationHandle,
     recovery: &str,
-) -> Result<crate::consensus::audit_mutation::PreparedTargetMutation, AuditAuthorityError> {
-    let prepared =
-        crate::consensus::audit_mutation::PreparedTargetMutation::decode(recovery.as_bytes())?;
+) -> Result<super::PreparedTargetMutation, AuditAuthorityError> {
+    let prepared = super::PreparedTargetMutation::decode(recovery.as_bytes())?;
     if prepared.handle() != handle || prepared.encode()?.as_slice() != recovery.as_bytes() {
         return Err(AuditAuthorityError::BindingMismatch);
     }
