@@ -2951,7 +2951,7 @@ async fn target_session_invalidation_reaches_clones_and_cannot_be_reactivated_by
 
 #[tokio::test]
 async fn target_session_preparation_refuses_wrong_caller_transport_operation_and_old_device() {
-    use crate::audit_authority::NetconfLockDatastore;
+    use crate::audit_authority::{AuditCaller, NetconfLockDatastore};
     let fixture = Fixture::new().await;
     let shared = fixture.backend.conn();
     let conn = shared.lock().await;
