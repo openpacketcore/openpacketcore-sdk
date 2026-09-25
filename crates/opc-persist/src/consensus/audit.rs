@@ -391,3 +391,7 @@ pub(crate) fn protects_config_prefix(
 #[cfg(test)]
 #[path = "../../tests/management_audit_authority/target_command.rs"]
 mod target_command_tests;
+
+#[cfg(test)]
+#[path = "../../tests/management_audit_authority/target_state.rs"]
+mod target_state_tests;
