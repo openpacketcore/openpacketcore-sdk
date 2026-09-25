@@ -828,3 +828,40 @@ impl NetconfSessionOwner {
         Self::matching_cleanup(&current.prepared, &prepared.handle.body.event, lifetime)
     }
 }
+
+/// A proposed encrypted copy from candidate or startup into running.
+///
+/// The destination carries a fresh attested running envelope and its own replay
+/// metadata. This input grants no authority: preparation reads the exact source
+/// and authenticates both configurations through the supplied existing provider.
+/// An absent candidate binds its exact tombstone and current running fallback.
+pub struct NetconfRunningCopy<'a> {
+    pub(crate) source: NetconfLockDatastore,
+    pub(crate) commit: crate::AttestedConfigCommit,
+    pub(crate) provider: &'a dyn opc_key::KeyProvider,
+}
+
+impl<'a> NetconfRunningCopy<'a> {
+    /// Select candidate or startup and the exact proposed running envelope.
+    /// Running as a source and confirmed-resolution commits are refused.
+    pub fn new(
+        source: NetconfLockDatastore,
+        commit: crate::AttestedConfigCommit,
+        provider: &'a dyn opc_key::KeyProvider,
+    ) -> Result<Self, AuditAuthorityError> {
+        if source == NetconfLockDatastore::Running {
+            return Err(AuditAuthorityError::InvalidInput);
+        }
+        Ok(Self {
+            source,
+            commit,
+            provider,
+        })
+    }
+}
+
+impl fmt::Debug for NetconfRunningCopy<'_> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("NetconfRunningCopy(<redacted>)")
+    }
+}

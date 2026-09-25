@@ -146,6 +146,23 @@ seam, with their exact pending identity and device ownership in AAD. Raw tokens,
 requests and configuration payloads do not appear in typed errors or diagnostics.
 Legacy running plaintext wrappers and authentication domains remain unchanged.
 
+The running payload's `provider-copy` form binds source and destination
+ciphertext digests, their separate complete plaintext digests, and schema under
+the original effect MAC. Only SDK preparation constructs it after authenticating
+both exact envelopes with the existing provider. It compares the serialized
+configuration bytes, without JSON value normalization or numeric conversion.
+The existing config-only JSON format and the SDK's config-first V2 wrapper are
+recognized; V2 request/replay fields remain inside their respective encrypted
+envelopes and may differ. Duplicate/unknown wrapper fields and unknown formats
+are refused. No configuration digest, plaintext, key, or provider object is
+retained in this binding. A decoded binding is untrusted until the authority
+authenticates the complete original effect. Application still checks the source
+generation/version/ciphertext and its original complete plaintext digest.
+An ordinary running payload continues to require equality of complete plaintext
+digests. Provider verification is an online authority-preparation requirement;
+this supplies no recipient-only or offline cryptographic capability.
+
+
 ## Admission, application and terminal recovery
 
 Every changing full-profile action follows this order:

@@ -3828,6 +3828,17 @@ async fn copy_provider_destination(
     fixture.rebind_at(conn, prepared, 100)
 }
 
+async fn bind_copy_provider(
+    fixture: &Fixture,
+    conn: &Connection,
+    provider: &dyn opc_key::KeyProvider,
+    source: &crate::consensus::audit_mutation::TargetEncryptedBlobV1,
+    mut prepared: PreparedTargetMutation,
+) -> Result<PreparedTargetMutation, AuditAuthorityError> {
+    prepared.effect.bind_provider_copy(provider, source).await?;
+    Ok(fixture.rebind_at(conn, prepared, 100))
+}
+
 #[tokio::test]
 async fn target_provider_copy_accepts_distinct_authenticated_replay_wrappers() {
     use crate::consensus::audit_mutation::TargetPayloadV1;
@@ -3840,10 +3851,15 @@ async fn target_provider_copy_accepts_distinct_authenticated_replay_wrappers() {
         let (provider, source) = copy_provider_stage(&fixture, &conn, slot, config).await;
         let prepared =
             copy_provider_destination(&fixture, &conn, &provider, slot, 181, config).await;
-        let Some(TargetPayloadV1::Running { commit, .. }) = &prepared.effect.encrypted_payload
-        else {
-            panic!("running copy fixture");
-        };
+        let prepared = bind_copy_provider(&fixture, &conn, &provider, &source, prepared)
+            .await
+            .unwrap();
+        let (commit, _) = prepared
+            .effect
+            .encrypted_payload
+            .as_ref()
+            .and_then(TargetPayloadV1::running)
+            .unwrap();
         assert_ne!(commit.record.plaintext_digest, source.plaintext_digest);
         for (ciphertext, expected) in [
             (&source.encrypted_blob, copy_plaintext(180, config)),
@@ -3875,5 +3891,218 @@ async fn target_provider_copy_accepts_distinct_authenticated_replay_wrappers() {
             .unwrap();
         assert_eq!(retained, commit.record.encrypted_blob);
         fixture.settle(&conn, &prepared);
+    }
+}
+
+#[tokio::test]
+async fn target_provider_copy_refuses_content_substitution_and_authentication_failure_before_intent(
+) {
+    use crate::consensus::audit_mutation::TargetPayloadV1;
+    let fixture = Fixture::new().await;
+    let shared = fixture.backend.conn();
+    let conn = shared.lock().await;
+    fixture.active(&conn);
+    let config = br#"{"limit":9007199254740993}"#;
+    let (provider, source) = copy_provider_stage(&fixture, &conn, 0, config).await;
+    let before = target_rows(&conn);
+    let sequence = fixture.ledger(&conn).sequence;
+    // Adjacent large numbers must never become equal through float conversion.
+    let wrong = copy_provider_destination(
+        &fixture,
+        &conn,
+        &provider,
+        0,
+        181,
+        br#"{"limit":9007199254740992}"#,
+    )
+    .await;
+    assert!(
+        matches!(
+            bind_copy_provider(&fixture, &conn, &provider, &source, wrong).await,
+            Err(AuditAuthorityError::BindingMismatch)
+        ),
+        "provider copy accepted substituted configuration"
+    );
+    let exact = copy_provider_destination(&fixture, &conn, &provider, 0, 182, config).await;
+    let mut false_digest = source.clone();
+    false_digest.plaintext_digest[0] ^= 1;
+    assert!(matches!(
+        bind_copy_provider(&fixture, &conn, &provider, &false_digest, exact.clone()).await,
+        Err(AuditAuthorityError::BindingMismatch)
+    ));
+    let mut tampered = source.clone();
+    *tampered.encrypted_blob.last_mut().unwrap() ^= 1;
+    assert!(
+        bind_copy_provider(&fixture, &conn, &provider, &tampered, exact.clone())
+            .await
+            .is_err()
+    );
+    assert!(matches!(
+        bind_copy_provider(
+            &fixture,
+            &conn,
+            &opc_key::MemoryKeyProvider::new(),
+            &source,
+            exact.clone()
+        )
+        .await,
+        Err(AuditAuthorityError::Unavailable)
+    ));
+    let mut tampered_destination = exact.clone();
+    let Some(TargetPayloadV1::Running { commit, .. }) =
+        &mut tampered_destination.effect.encrypted_payload
+    else {
+        panic!("running copy fixture");
+    };
+    *commit.record.encrypted_blob.last_mut().unwrap() ^= 1;
+    assert!(
+        bind_copy_provider(&fixture, &conn, &provider, &source, tampered_destination)
+            .await
+            .is_err()
+    );
+    let mut false_source = exact.clone();
+    let Some(crate::consensus::audit_mutation::TargetSourceV1::Candidate {
+        ciphertext_digest, ..
+    }) = &mut false_source.effect.source
+    else {
+        panic!("candidate source fixture");
+    };
+    ciphertext_digest[0] ^= 1;
+    assert!(matches!(
+        bind_copy_provider(&fixture, &conn, &provider, &source, false_source).await,
+        Err(AuditAuthorityError::BindingMismatch)
+    ));
+    assert_eq!(target_rows(&conn), before);
+    assert_eq!(
+        fixture.ledger(&conn).sequence,
+        sequence,
+        "failed provider preparation admitted an intent"
+    );
+    assert_eq!(
+        conn.query_row("SELECT COUNT(*) FROM config_history", [], |r| r
+            .get::<_, u64>(0))
+            .unwrap(),
+        0
+    );
+    assert!(
+        bind_copy_provider(&fixture, &conn, &provider, &source, exact)
+            .await
+            .is_ok()
+    );
+}
+
+#[tokio::test]
+async fn target_provider_copy_retains_source_and_authenticated_binding_fences() {
+    let fixture = Fixture::new().await;
+    let shared = fixture.backend.conn();
+    let conn = shared.lock().await;
+    fixture.active(&conn);
+    let config = br#"{"enabled":true}"#;
+    let (provider, source) = copy_provider_stage(&fixture, &conn, 0, config).await;
+    let exact = copy_provider_destination(&fixture, &conn, &provider, 0, 181, config).await;
+    let exact = bind_copy_provider(&fixture, &conn, &provider, &source, exact)
+        .await
+        .unwrap();
+    let encoded = exact.encode().unwrap();
+    assert!(
+        !encoded.windows(config.len()).any(|w| w == config),
+        "configuration entered closed recovery data"
+    );
+    let mut changed: Value = serde_json::from_slice(&encoded).unwrap();
+    let binding = &mut changed["effect"]["encrypted_payload"]["provider-copy"]["binding"];
+    binding["source_plaintext_digest"][0] =
+        Value::from(binding["source_plaintext_digest"][0].as_u64().unwrap() ^ 1);
+    let untrusted = PreparedTargetMutation::decode(&serde_json::to_vec(&changed).unwrap()).unwrap();
+    assert!(
+        untrusted.verify_effect(&fixture.key).is_err(),
+        "decoded copy binding bypassed original effect authentication"
+    );
+    // Even an authority-side fault cannot substitute its claimed source digest
+    // for the digest in the authenticated retained row.
+    let corrupt = fixture.rebind_at(&conn, untrusted, 100);
+    let before = target_rows(&conn);
+    assert_eq!(
+        fixture.submit(&conn, &corrupt),
+        AuditOperationState::Rejected,
+        "copy accepted an unrelated source plaintext digest"
+    );
+    assert_eq!(target_rows(&conn), before);
+    fixture.settle(&conn, &corrupt);
+    let old = copy_provider_destination(&fixture, &conn, &provider, 0, 182, config).await;
+    let old = bind_copy_provider(&fixture, &conn, &provider, &source, old)
+        .await
+        .unwrap();
+    let replacement = fixture.encrypted(fixture.request(&conn, 183, 4, 0x61, 1), 0x6b);
+    assert!(matches!(
+        fixture.submit(&conn, &replacement),
+        AuditOperationState::TargetV1(_)
+    ));
+    fixture.settle(&conn, &replacement);
+    let before = target_rows(&conn);
+    assert_eq!(
+        fixture.submit(&conn, &old),
+        AuditOperationState::Rejected,
+        "provider binding bypassed exact source generation/ciphertext"
+    );
+    assert_eq!(target_rows(&conn), before);
+    assert_eq!(
+        conn.query_row("SELECT COUNT(*) FROM config_history", [], |r| r
+            .get::<_, u64>(0))
+            .unwrap(),
+        0
+    );
+    fixture.settle(&conn, &old);
+}
+
+#[tokio::test]
+async fn target_provider_copy_pinned_preparation_binds_current_session_and_locks() {
+    use crate::audit_authority::NetconfLockDatastore as Store;
+    use crate::consensus::audit_mutation::TargetPayloadV1;
+    for store in [Store::Candidate, Store::Startup] {
+        let slot = if store == Store::Candidate { 0 } else { 1 };
+        let fixture = Fixture::new().await;
+        let shared = fixture.backend.conn();
+        let conn = shared.lock().await;
+        fixture.active(&conn);
+        let config = br#"{"enabled":true}"#;
+        let (provider, source) = copy_provider_stage(&fixture, &conn, slot, config).await;
+        let original =
+            copy_provider_destination(&fixture, &conn, &provider, slot, 181, config).await;
+        let Some(TargetPayloadV1::Running { commit, .. }) = original.effect.encrypted_payload
+        else {
+            panic!("running copy fixture");
+        };
+        let tx = conn.unchecked_transaction().unwrap();
+        let view = crate::consensus::audit_targets::read_copy_view_sync(
+            &tx,
+            &fixture.key,
+            &fixture.ledger(&tx),
+            store,
+            &crate::consensus::sqlite::SqliteWorkCancellation::audit_test(),
+        )
+        .unwrap()
+        .unwrap();
+        tx.commit().unwrap();
+        assert!(view.blob == source);
+        let worker = std::sync::Arc::new(());
+        let session = fixture.session_owner(&conn, &worker, 0x61);
+        let mut effect = view
+            .prepare(&session, &fixture.event(181), (*commit).clone(), 160)
+            .unwrap();
+        effect
+            .bind_provider_copy(&provider, &view.blob)
+            .await
+            .unwrap();
+        let prepared = fixture.rebind_at(&conn, fixture.prepare(effect, fixture.event(181)), 100);
+        assert!(matches!(
+            fixture.submit(&conn, &prepared),
+            AuditOperationState::TargetV1(_)
+        ));
+        fixture.settle(&conn, &prepared);
+        session.invalidate();
+        assert!(matches!(
+            view.prepare(&session, &fixture.event(182), *commit, 160),
+            Err(AuditAuthorityError::BindingMismatch)
+        ));
     }
 }

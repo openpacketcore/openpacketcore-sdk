@@ -1154,11 +1154,8 @@ impl TargetState {
             }
             6 | 9 | 15 => {
                 self.check_lock(prepared, 0)?;
-                let Some(TargetPayloadV1::Running {
-                    commit,
-                    confirmation_ownership,
-                }) = &effect.encrypted_payload
-                else {
+                let payload = effect.encrypted_payload.as_ref().ok_or(bad)?;
+                let Some((commit, confirmation_ownership)) = payload.running() else {
                     return Err(bad);
                 };
                 if action == 9 {
@@ -1216,7 +1213,7 @@ impl TargetState {
                     (blob.schema, blob.plaintext_digest)
                 };
                 if commit.record.schema_digest != schema
-                    || commit.record.plaintext_digest != plaintext_digest
+                    || !payload.matches_source_digest(&plaintext_digest)
                 {
                     return Err(bad);
                 }
@@ -1240,7 +1237,7 @@ impl TargetState {
                         else {
                             return Err(bad);
                         };
-                        let ownership = confirmation_ownership.as_ref().ok_or(bad)?;
+                        let ownership = confirmation_ownership.ok_or(bad)?;
                         let deadline = commit.record.confirmed_deadline.ok_or(bad)?;
                         if pending.authority != effect.authority
                             || pending.value == [0; 16]
@@ -1335,17 +1332,14 @@ impl TargetState {
                 {
                     return Err(bad);
                 }
-                let Some(TargetPayloadV1::Running {
-                    commit,
-                    confirmation_ownership: None,
-                }) = &effect.encrypted_payload
-                else {
+                let payload = effect.encrypted_payload.as_ref().ok_or(bad)?;
+                let Some((commit, None)) = payload.running() else {
                     return Err(bad);
                 };
                 if commit.record.parent_tx_id != Some(pending.tx_id)
                     || pending.running_version.checked_add(1) != Some(commit.record.version.get())
                     || commit.record.schema_digest != parent.schema
-                    || commit.record.plaintext_digest != parent.plaintext_digest
+                    || !payload.matches_source_digest(&parent.plaintext_digest)
                     || commit.record.confirmed_deadline.is_some()
                     || commit.record.source != crate::CommitSource::CommitConfirmedRestore
                 {
@@ -1959,5 +1953,147 @@ impl PreparedTargetMutation {
             return Err(AuditAuthorityError::RecoveryRequired);
         }
         Ok(())
+    }
+}
+
+/// Exact source bytes and device/lock observations from one authenticated read.
+pub(crate) struct NetconfCopyView {
+    pub(crate) device: NetconfDeviceView,
+    pub(crate) source: TargetSourceV1,
+    pub(crate) blob: TargetEncryptedBlobV1,
+    source_slot: usize,
+    pending: bool,
+}
+
+pub(crate) fn read_copy_view_sync(
+    conn: &Connection,
+    key: &AuditKey,
+    ledger: &LedgerState,
+    datastore: crate::audit_authority::NetconfLockDatastore,
+    cancellation: &SqliteWorkCancellation,
+) -> io::Result<Result<NetconfCopyView, AuditAuthorityError>> {
+    use crate::audit_authority::NetconfLockDatastore as Datastore;
+    let slot = match datastore {
+        Datastore::Candidate => 0,
+        Datastore::Startup => 1,
+        Datastore::Running => return Ok(Err(AuditAuthorityError::InvalidInput)),
+    };
+    let device = read_device_view_sync(conn, key, ledger, cancellation)?;
+    let state = read_state_sync(conn, key, ledger.identity, cancellation)?;
+    let target = &state.targets[slot];
+    let generation = crate::audit_authority::CandidateGeneration {
+        authority: ledger.identity,
+        value: target.generation,
+    };
+    let (source, blob) = if let Some(blob) = &target.encrypted_envelope {
+        let ciphertext_digest = Sha256::digest(&blob.encrypted_blob).into();
+        let source = if slot == 0 {
+            TargetSourceV1::Candidate {
+                generation,
+                schema: blob.schema,
+                ciphertext_digest,
+            }
+        } else {
+            TargetSourceV1::Startup {
+                revision: crate::audit_authority::StartupRevision {
+                    authority: ledger.identity,
+                    value: target.generation,
+                },
+                schema: blob.schema,
+                ciphertext_digest,
+            }
+        };
+        (source, blob.clone())
+    } else {
+        if slot != 0 || device.running_version == 0 {
+            return Ok(Err(AuditAuthorityError::InvalidInput));
+        }
+        let (schema, plaintext, encrypted): (Vec<u8>, Vec<u8>, Vec<u8>) = conn.query_row(
+            "SELECT schema_digest,plaintext_digest,encrypted_blob FROM config_history WHERE version=?1",
+            [device.running_version], |r| Ok((r.get(0)?,r.get(1)?,r.get(2)?)),
+        ).map_err(|_| invalid())?;
+        let blob = TargetEncryptedBlobV1 {
+            schema: opc_types::SchemaDigest::from_bytes(schema.try_into().map_err(|_| invalid())?),
+            plaintext_digest: plaintext.try_into().map_err(|_| invalid())?,
+            encrypted_blob: encrypted,
+        };
+        (
+            TargetSourceV1::CandidateFallback {
+                generation,
+                running_version: device.running_version,
+                schema: blob.schema,
+                ciphertext_digest: Sha256::digest(&blob.encrypted_blob).into(),
+            },
+            blob,
+        )
+    };
+    cancellation.check_io()?;
+    Ok(Ok(NetconfCopyView {
+        device,
+        source,
+        blob,
+        source_slot: slot + 1,
+        pending: state.lifecycle.pending_confirmation.is_some(),
+    }))
+}
+
+impl NetconfCopyView {
+    pub(crate) fn prepare(
+        &self,
+        session: &crate::audit_authority::NetconfSessionOwner,
+        event: &crate::audit_authority::ProjectedAuditEvent,
+        commit: super::PreparedConfigCommit,
+        expires_at: i64,
+    ) -> Result<super::audit_mutation::TargetEffectV1, AuditAuthorityError> {
+        use crate::ManagementAuditTransportCode as Transport;
+        let bad = AuditAuthorityError::BindingMismatch;
+        self.device.verify_session(session)?;
+        if self.pending
+            || event.caller != session.caller
+            || event.outcome != crate::ManagementAuditOutcomeCode::Intent
+            || event.operation != crate::ManagementAuditOperationCode::Exec
+            || !matches!(
+                event.transport,
+                Transport::NetconfSsh | Transport::NetconfTls
+            )
+            || self.device.running_version.checked_add(1) != Some(commit.record.version.get())
+            || commit.record.confirmed_deadline.is_some()
+        {
+            return Err(bad);
+        }
+        for slot in [0, self.source_slot] {
+            let lock = self.device.locks[slot].ok_or(bad)?;
+            if lock.session.is_some_and(|s| s != session.incarnation())
+                || lock.caller.is_some_and(|c| c != session.caller)
+            {
+                return Err(bad);
+            }
+        }
+        let lock = self.device.locks[0].ok_or(bad)?;
+        Ok(super::audit_mutation::TargetEffectV1 {
+            format: 1,
+            authority: self.device.authority,
+            profile_incarnation: session.device.profile_incarnation,
+            device_incarnation: session.device.device_incarnation,
+            caller: event.caller,
+            request: event.request,
+            action: 15.try_into()?,
+            destination: TargetExpectationV1::Running {
+                version: self.device.running_version,
+            },
+            source: Some(self.source.clone()),
+            lock: Some(super::audit_mutation::TargetLockExpectationV1 {
+                datastore: 0,
+                incarnation: lock.incarnation,
+                session: lock.session,
+                requester: session.incarnation(),
+            }),
+            expires_at,
+            encrypted_payload: Some(TargetPayloadV1::Running {
+                commit: Box::new(commit),
+                confirmation_ownership: None,
+            }),
+            resolution: None,
+        })
     }
 }

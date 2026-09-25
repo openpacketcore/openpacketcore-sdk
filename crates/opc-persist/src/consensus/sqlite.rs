@@ -2806,7 +2806,9 @@ pub(super) fn apply_target_running_sync(
     use super::audit_mutation::{TargetPayloadV1, TargetResolutionV1};
     let action = u8::from(prepared.effect.action);
     let (result, updates_existing) = match &prepared.effect.encrypted_payload {
-        Some(TargetPayloadV1::Running { commit, .. }) => {
+        Some(
+            TargetPayloadV1::Running { commit, .. } | TargetPayloadV1::ProviderCopy { commit, .. },
+        ) => {
             let resolution = match action {
                 6 if matches!(
                     prepared.effect.resolution,

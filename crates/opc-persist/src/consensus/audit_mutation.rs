@@ -2,6 +2,10 @@
 
 use serde::{Deserialize, Serialize};
 
+#[path = "audit_copy.rs"]
+mod target_copy;
+use target_copy::TargetCopyBindingV1;
+
 use super::{ConfigMutationIntent, PreparedConfigCommit};
 use crate::audit_authority::ledger::{authenticate, verify};
 use crate::audit_authority::{AuditAuthorityError, AuditOperationHandle};
@@ -240,6 +244,69 @@ pub(crate) enum TargetPayloadV1 {
         commit: Box<PreparedConfigCommit>,
         confirmation_ownership: Option<TargetEncryptedBlobV1>,
     },
+    ProviderCopy {
+        #[serde(deserialize_with = "target_commit_input::deserialize")]
+        commit: Box<PreparedConfigCommit>,
+        confirmation_ownership: Option<TargetEncryptedBlobV1>,
+        binding: TargetCopyBindingV1,
+    },
+}
+
+impl TargetPayloadV1 {
+    pub(crate) fn running(
+        &self,
+    ) -> Option<(&PreparedConfigCommit, Option<&TargetEncryptedBlobV1>)> {
+        match self {
+            Self::Running {
+                commit,
+                confirmation_ownership,
+            }
+            | Self::ProviderCopy {
+                commit,
+                confirmation_ownership,
+                ..
+            } => Some((commit, confirmation_ownership.as_ref())),
+            Self::Target(_) => None,
+        }
+    }
+
+    pub(crate) fn matches_source_digest(&self, digest: &[u8]) -> bool {
+        match self {
+            Self::Running { commit, .. } => commit.record.plaintext_digest == digest,
+            Self::ProviderCopy { binding, .. } => binding.matches_source_digest(digest),
+            Self::Target(_) => false,
+        }
+    }
+}
+
+impl TargetEffectV1 {
+    pub(crate) async fn bind_provider_copy(
+        &mut self,
+        provider: &dyn opc_key::KeyProvider,
+        source: &TargetEncryptedBlobV1,
+    ) -> Result<(), AuditAuthorityError> {
+        if !matches!(self.action.0, 6 | 9 | 11 | 12 | 14 | 15) {
+            return Err(AuditAuthorityError::BindingMismatch);
+        }
+        let Some(TargetPayloadV1::Running { commit, .. }) = &self.encrypted_payload else {
+            return Err(AuditAuthorityError::BindingMismatch);
+        };
+        let binding = TargetCopyBindingV1::prepare(provider, source, commit).await?;
+        binding.validate(self.source.as_ref(), commit)?;
+        let Some(TargetPayloadV1::Running {
+            commit,
+            confirmation_ownership,
+        }) = self.encrypted_payload.take()
+        else {
+            return Err(AuditAuthorityError::BindingMismatch);
+        };
+        self.encrypted_payload = Some(TargetPayloadV1::ProviderCopy {
+            commit,
+            confirmation_ownership,
+            binding,
+        });
+        Ok(())
+    }
 }
 
 #[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -393,7 +460,15 @@ impl TargetEffectV1 {
                 TargetPayloadV1::Running {
                     commit,
                     confirmation_ownership,
+                }
+                | TargetPayloadV1::ProviderCopy {
+                    commit,
+                    confirmation_ownership,
+                    ..
                 } => {
+                    if let TargetPayloadV1::ProviderCopy { binding, .. } = payload {
+                        binding.validate(self.source.as_ref(), commit)?;
+                    }
                     commit
                         .validate()
                         .map_err(|_| AuditAuthorityError::InvalidInput)?;
@@ -412,7 +487,7 @@ impl TargetEffectV1 {
         let target_payload = matches!(self.encrypted_payload, Some(TargetPayloadV1::Target(_)));
         let running_payload = matches!(
             self.encrypted_payload,
-            Some(TargetPayloadV1::Running { .. })
+            Some(TargetPayloadV1::Running { .. } | TargetPayloadV1::ProviderCopy { .. })
         );
         let no_payload = self.encrypted_payload.is_none();
         let no_resolution = self.resolution.is_none();
@@ -634,9 +709,9 @@ impl PreparedTargetMutation {
                     retired_generation,
                 },
             ) => {
-                matches!((&self.effect.source, &self.effect.encrypted_payload, &self.effect.destination),
+                matches!((&self.effect.source, self.effect.encrypted_payload.as_ref().and_then(TargetPayloadV1::running), &self.effect.destination),
                     (Some(TargetSourceV1::Candidate { generation, .. }),
-                     Some(TargetPayloadV1::Running { commit, confirmation_ownership: None }),
+                     Some((commit, None)),
                      TargetExpectationV1::Running { version })
                     if generation.checked_next()? == retired_generation
                         && *version == self.handle.body.binding.base_version
@@ -646,8 +721,8 @@ impl PreparedTargetMutation {
                         && matches!(self.effect.resolution, None | Some(TargetResolutionV1::ResolvePending { .. })))
             }
             (15, Outcome::CopiedRunning { running_version }) => {
-                matches!((&self.effect.encrypted_payload, &self.effect.destination),
-                    (Some(TargetPayloadV1::Running { commit, confirmation_ownership: None }),
+                matches!((self.effect.encrypted_payload.as_ref().and_then(TargetPayloadV1::running), &self.effect.destination),
+                    (Some((commit, None)),
                      TargetExpectationV1::Running { version })
                     if *version == self.handle.body.binding.base_version
                         && version.checked_add(1) == Some(running_version)
@@ -663,9 +738,9 @@ impl PreparedTargetMutation {
                     pending,
                 },
             ) => {
-                matches!((&self.effect.source, &self.effect.encrypted_payload, &self.effect.destination, &self.effect.resolution),
+                matches!((&self.effect.source, self.effect.encrypted_payload.as_ref().and_then(TargetPayloadV1::running), &self.effect.destination, &self.effect.resolution),
                     (Some(TargetSourceV1::Candidate { generation, .. }),
-                     Some(TargetPayloadV1::Running { commit, confirmation_ownership: Some(_) }),
+                     Some((commit, Some(_))),
                      TargetExpectationV1::Running { version },
                      Some(TargetResolutionV1::InstallPending { pending: token, rollback_parent, rollback_version, original_deadline, .. }))
                     if generation.checked_next()? == retired_generation && *token == pending
@@ -696,8 +771,8 @@ impl PreparedTargetMutation {
                     _ => false,
                 };
                 token_matches
-                    && matches!((&self.effect.destination, &self.effect.encrypted_payload),
-                    (TargetExpectationV1::Running { version }, Some(TargetPayloadV1::Running { commit, confirmation_ownership: None }))
+                    && matches!((&self.effect.destination, self.effect.encrypted_payload.as_ref().and_then(TargetPayloadV1::running)),
+                    (TargetExpectationV1::Running { version }, Some((commit, None)))
                     if *version == self.handle.body.binding.base_version
                         && version.checked_add(1) == Some(running_version)
                         && commit.record.version.get() == running_version && commit.record.confirmed_deadline.is_none())
