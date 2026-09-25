@@ -625,6 +625,17 @@ async fn selector_profile_step<T>(
 #[cfg(target_os = "linux")]
 #[tokio::test]
 async fn durable_overlapping_bearer_phase_profile() {
+    durable_bearer_phase_profile(false).await;
+}
+
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn durable_concurrent_bearer_phase_profile() {
+    durable_bearer_phase_profile(true).await;
+}
+
+#[cfg(target_os = "linux")]
+async fn durable_bearer_phase_profile(concurrent: bool) {
     use opc_session_testkit::authenticated_consumer_fixture::AuthenticatedPreparedFencedTransitionFixture;
     use std::io::Write;
 
@@ -654,11 +665,39 @@ async fn durable_overlapping_bearer_phase_profile() {
         .await
         .unwrap();
     let lab = lab_with_store(SessionStore::new(protected), tenant, 3).await;
+    let concurrent_authority = lab.authority.concurrent_operations();
+    let composition = if concurrent {
+        "concurrent"
+    } else {
+        "serialized"
+    };
+    let recover = |group| {
+        if concurrent {
+            concurrent_authority.recover_active(lab.backend.clone(), group)
+        } else {
+            lab.authority.recover_active(lab.backend.clone(), group)
+        }
+    };
+    let create = |claim, parent, child| {
+        if concurrent {
+            concurrent_authority.reconcile_bearer(lab.backend.clone(), claim, parent, child)
+        } else {
+            lab.authority
+                .reconcile_bearer(lab.backend.clone(), claim, parent, child)
+        }
+    };
+    let retire = |claim, group| {
+        if concurrent {
+            concurrent_authority.retire(lab.backend.clone(), claim, group)
+        } else {
+            lab.authority.retire(lab.backend.clone(), claim, group)
+        }
+    };
+    let (recover, create, retire) = (&recover, &create, &retire);
     let before = selector_profile_snapshot();
     let storage_before = remote.local_storage_timing().unwrap().unwrap();
     let mut create_us = Vec::new();
     let mut delete_us = Vec::new();
-    let lab_ref = &lab;
     for cycle in 0..cycles {
         let parents = [&lab.parent, &lab.sibling];
         let children: [GtpuSessionGroup; 2] = std::array::from_fn(|index| {
@@ -679,28 +718,17 @@ async fn durable_overlapping_bearer_phase_profile() {
         });
         let children_ref = &children;
         let parents_ref = &parents;
-        let create = |index: usize| async move {
+        let create_pair_member = |index: usize| async move {
             let started = Instant::now();
             let parent = parents_ref[index].clone();
-            let claim = selector_profile_step(
-                cycle,
-                index,
-                "parent_recover",
-                lab_ref
-                    .authority
-                    .recover_active(lab_ref.backend.clone(), parent.clone()),
-            )
-            .await?;
+            let claim =
+                selector_profile_step(cycle, index, "parent_recover", recover(parent.clone()))
+                    .await?;
             let child = selector_profile_step(
                 cycle,
                 index,
                 "create",
-                lab_ref.authority.reconcile_bearer(
-                    lab_ref.backend.clone(),
-                    claim,
-                    parent,
-                    children_ref[index].clone(),
-                ),
+                create(claim, parent, children_ref[index].clone()),
             )
             .await?;
             Ok::<_, GtpuSessionSelectorCoordinatorError>((
@@ -708,7 +736,7 @@ async fn durable_overlapping_bearer_phase_profile() {
                 u64::try_from(started.elapsed().as_micros()).unwrap(),
             ))
         };
-        let (first, second) = tokio::join!(create(0), create(1));
+        let (first, second) = tokio::join!(create_pair_member(0), create_pair_member(1));
         // Both owned operations reach a result before a failed observation
         // fails the fixture. A failed run retains its completed step records.
         let first = first.unwrap();
@@ -721,11 +749,7 @@ async fn durable_overlapping_bearer_phase_profile() {
                 cycle,
                 index,
                 "delete",
-                lab_ref.authority.retire(
-                    lab_ref.backend.clone(),
-                    claim,
-                    children_ref[index].clone(),
-                ),
+                retire(claim, children_ref[index].clone()),
             )
             .await?;
             drop(retired);
@@ -742,8 +766,7 @@ async fn durable_overlapping_bearer_phase_profile() {
                     cycle,
                     index,
                     "post_delete_parent_recover",
-                    lab.authority
-                        .recover_active(lab.backend.clone(), parent.clone()),
+                    recover(parent.clone()),
                 )
                 .await
                 .unwrap(),
@@ -751,6 +774,7 @@ async fn durable_overlapping_bearer_phase_profile() {
         }
         let evidence = serde_json::json!({
             "cycle": cycle,
+            "composition": composition,
             "create_us": &create_us[create_us.len() - 2..],
             "delete_us": &delete_us[delete_us.len() - 2..],
             "phases": selector_profile_snapshot(),
@@ -759,7 +783,8 @@ async fn durable_overlapping_bearer_phase_profile() {
         writeln!(std::io::stderr(), "selector_component_cycle={evidence}").unwrap();
     }
     let evidence = serde_json::json!({
-        "schema": "opc-selector-component-profile-v1",
+        "schema": "opc-selector-component-profile-v2",
+        "composition": composition,
         "resident_parents": 2,
         "offered_concurrency": 2,
         "cycles": cycles,
@@ -767,23 +792,17 @@ async fn durable_overlapping_bearer_phase_profile() {
         "delete_us": delete_us,
         "phases_before": before,
         "phases_after": selector_profile_snapshot(),
+        "activity": gtpu_selector_activity_snapshot().into_iter().map(|sample| serde_json::json!({
+            "phase": sample.phase.as_str(), "current": sample.current, "peak": sample.peak,
+        })).collect::<Vec<_>>(),
         "storage_before": storage_before,
         "storage_after": remote.local_storage_timing().unwrap().unwrap(),
         "limits": ["component_boundary", "in_process_raft_transport", "simulated_dataplane"],
     });
     writeln!(std::io::stderr(), "selector_component_profile={evidence}").unwrap();
     for parent in [&lab.parent, &lab.sibling] {
-        let active = lab
-            .authority
-            .recover_active(lab.backend.clone(), parent.clone())
-            .await
-            .unwrap();
-        drop(
-            lab.authority
-                .retire(lab.backend.clone(), active, parent.clone())
-                .await
-                .unwrap(),
-        );
+        let active = recover(parent.clone()).await.unwrap();
+        drop(retire(active, parent.clone()).await.unwrap());
     }
     drop(lab);
     remote.shutdown().await.unwrap();

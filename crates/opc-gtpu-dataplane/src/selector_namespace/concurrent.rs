@@ -1,5 +1,6 @@
 //! Explicit concurrent composition of the existing protected lifecycle.
 
+use super::observability::{observe_guard, ObservedGuard};
 use super::*;
 use std::sync::atomic::{AtomicBool, Ordering};
 use tokio::sync::{Mutex as AsyncMutex, OwnedMutexGuard, OwnedSemaphorePermit};
@@ -59,9 +60,18 @@ where
         }
     }
 
-    pub(super) async fn concurrent_transition(&self) -> Option<tokio::sync::MutexGuard<'_, ()>> {
+    pub(super) async fn concurrent_transition(
+        &self,
+    ) -> Option<ObservedGuard<'static, tokio::sync::MutexGuard<'_, ()>>> {
         match self.concurrent_operation.as_ref() {
-            Some(operation) => Some(operation.shared.transition.lock().await),
+            Some(operation) => Some(
+                observe_guard(
+                    GtpuSelectorPhase::TransitionWait,
+                    GtpuSelectorPhase::TransitionHold,
+                    operation.shared.transition.lock(),
+                )
+                .await,
+            ),
             None => None,
         }
     }
@@ -257,7 +267,8 @@ impl LeasePool {
     async fn reserve_groups(
         &self,
         groups: &[GtpuSessionGroup],
-    ) -> Result<Vec<OwnedMutexGuard<()>>, GtpuSessionSelectorCoordinatorError> {
+    ) -> Result<ObservedGuard<'static, Vec<OwnedMutexGuard<()>>>, GtpuSessionSelectorCoordinatorError>
+    {
         if groups.is_empty() || groups.len() > 2 {
             return Err(GtpuSessionSelectorCoordinatorError::Namespace);
         }
@@ -300,11 +311,18 @@ impl LeasePool {
                 })
                 .collect::<Vec<_>>()
         };
-        let mut guards = Vec::with_capacity(locks.len());
-        for lock in locks {
-            guards.push(lock.lock_owned().await);
-        }
-        Ok(guards)
+        Ok(observe_guard(
+            GtpuSelectorPhase::ConflictWait,
+            GtpuSelectorPhase::ConflictHold,
+            async move {
+                let mut guards = Vec::with_capacity(locks.len());
+                for lock in locks {
+                    guards.push(lock.lock_owned().await);
+                }
+                guards
+            },
+        )
+        .await)
     }
 
     async fn join<B>(
@@ -314,7 +332,12 @@ impl LeasePool {
     where
         B: SessionBackend + SessionLeaseManager,
     {
-        let mut state = self.lifecycle.lock().await;
+        let mut state = observe_guard(
+            GtpuSelectorPhase::CohortWait,
+            GtpuSelectorPhase::CohortHold,
+            self.lifecycle.lock(),
+        )
+        .await;
         if let Some((shared, members)) = state.as_mut() {
             if shared.abandoned.load(Ordering::Acquire) {
                 return Err(GtpuSessionSelectorCoordinatorError::Namespace);
@@ -342,7 +365,7 @@ impl LeasePool {
             abandoned: AtomicBool::new(false),
             _worker: worker,
         });
-        *state = Some((Arc::clone(&shared), 1));
+        **state = Some((Arc::clone(&shared), 1));
         Ok(shared)
     }
 
@@ -354,7 +377,12 @@ impl LeasePool {
     where
         B: SessionBackend + SessionLeaseManager,
     {
-        let mut state = self.lifecycle.lock().await;
+        let mut state = observe_guard(
+            GtpuSelectorPhase::CohortWait,
+            GtpuSelectorPhase::CohortHold,
+            self.lifecycle.lock(),
+        )
+        .await;
         let Some((current, members)) = state.as_mut() else {
             return Err(GtpuSessionSelectorNamespaceError::Indeterminate);
         };
@@ -369,13 +397,12 @@ impl LeasePool {
             return shared.check_current().await;
         }
         let lease = shared
-            .lease
-            .lock()
+            .credential()
             .await
             .take()
             .ok_or(GtpuSessionSelectorNamespaceError::Indeterminate)?;
         let result = authority.release_worker_lease_owned(lease).await;
-        *state = None;
+        **state = None;
         result
     }
 }
@@ -389,6 +416,17 @@ pub(super) struct SharedLease {
 }
 
 impl SharedLease {
+    pub(super) async fn credential(
+        &self,
+    ) -> ObservedGuard<'static, tokio::sync::MutexGuard<'_, Option<SelectorWorkerLease>>> {
+        observe_guard(
+            GtpuSelectorPhase::CredentialWait,
+            GtpuSelectorPhase::CredentialHold,
+            self.lease.lock(),
+        )
+        .await
+    }
+
     pub(super) fn is_abandoned(&self) -> bool {
         self.abandoned.load(Ordering::Acquire)
     }
@@ -397,7 +435,7 @@ impl SharedLease {
         if self.is_abandoned() {
             return Err(GtpuSessionSelectorNamespaceError::Indeterminate);
         }
-        let mut lease = self.lease.lock().await;
+        let mut lease = self.credential().await;
         let lease = lease
             .as_mut()
             .ok_or(GtpuSessionSelectorNamespaceError::Indeterminate)?;

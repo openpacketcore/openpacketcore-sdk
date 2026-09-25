@@ -17,8 +17,9 @@ pub use n3_end_marker::{
     GtpuN3EndMarkerCompletion, GtpuN3EndMarkerError, GtpuN3EndMarkerReceipt, GtpuN3EndMarkerRequest,
 };
 pub use observability::{
-    gtpu_selector_duration_snapshot, GtpuSelectorDurationSnapshot, GtpuSelectorOutcome,
-    GtpuSelectorPhase, GTPU_SELECTOR_DURATION_BUCKETS_US,
+    gtpu_selector_activity_snapshot, gtpu_selector_duration_snapshot, GtpuSelectorActivitySnapshot,
+    GtpuSelectorDurationSnapshot, GtpuSelectorOutcome, GtpuSelectorPhase,
+    GTPU_SELECTOR_DURATION_BUCKETS_US,
 };
 use observability::{observe, observe_sync};
 pub use pristine::GtpuSessionSelectorPristineReadbackRequest;
@@ -6509,7 +6510,7 @@ where
     ) -> Result<SelectorWorkerLease, GtpuSessionSelectorNamespaceError> {
         if let Some(operation) = &self.concurrent_operation {
             operation.shared.check_current().await?;
-            let current = operation.shared.lease.lock().await;
+            let current = operation.shared.credential().await;
             let current = current
                 .as_ref()
                 .ok_or(GtpuSessionSelectorNamespaceError::Indeterminate)?;
@@ -6616,7 +6617,7 @@ where
             if operation.shared.is_abandoned() {
                 return Err(GtpuSessionSelectorNamespaceError::Indeterminate);
             }
-            let mut current = operation.shared.lease.lock().await;
+            let mut current = operation.shared.credential().await;
             let current = current
                 .as_mut()
                 .ok_or(GtpuSessionSelectorNamespaceError::Indeterminate)?;
@@ -6708,7 +6709,7 @@ where
         lease: &mut SelectorWorkerLease,
     ) -> Result<bool, GtpuSessionSelectorNamespaceError> {
         if let Some(operation) = &self.concurrent_operation {
-            let mut shared = operation.shared.lease.lock().await;
+            let mut shared = operation.shared.credential().await;
             let shared = shared
                 .as_mut()
                 .ok_or(GtpuSessionSelectorNamespaceError::Indeterminate)?;
