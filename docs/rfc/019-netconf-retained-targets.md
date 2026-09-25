@@ -136,6 +136,28 @@ running version and lock; unknown transmission recovers only the retained origin
 Copy into running preserves candidate/startup state and cannot install, confirm
 or resolve a confirmed commit. This API does not activate the public target runtime.
 
+### Ordinary candidate promotion preparation
+
+`read_netconf_candidate_promotion` returns an opaque
+`NetconfCandidatePromotionRead` for an actual staged generation whose original
+session, caller and running base match. Its `candidate()` supplies the original
+provider-backed content. The shared authoritative read verifies current locks,
+ledger/device state and independent checkpoint. It refuses absent candidate,
+running fallback, startup, pending confirmation and unresolved audit obligations.
+
+`NetconfCandidatePromotion::new` pairs that read with the proposed attested running
+envelope. `prepare_netconf_candidate_promotion` requires the original session and
+NETCONF Exec Intent, expected tenant and provider-authenticated exact configuration.
+The prepared action 6 retains the original generation and running base; preflight,
+admission and application recheck them. Running commit and retirement of that
+candidate are atomic; replay returns the original typed `Promoted` result without
+advancing either again. Known promotion remains known when terminal persistence
+is owed, and the retained obligation fences subsequent writes.
+
+This ordinary preparation cannot install or resolve confirmed ownership. Empty
+plain commit and confirmation require their distinct contracts below. These ports
+alone do not activate the public full-profile NETCONF runtime.
+
 ### Frozen datastore-copy preparation
 
 `ConsensusConfigStore::read_netconf_target_copy` returns a private-field

@@ -1444,6 +1444,79 @@ impl ConsensusConfigStore {
         Ok(prepared)
     }
 
+    /// Prepare ordinary candidate promotion from an original frozen read.
+    /// The Exec intent binds the original generation, staging owner, running
+    /// base and exact provider-authenticated configuration. Applying it commits
+    /// running and retires that candidate atomically. It cannot resolve pending
+    /// confirmation or promote a running fallback. Retain the original before
+    /// admission; unknown transmission recovers only that operation.
+    pub async fn prepare_netconf_candidate_promotion(
+        &self,
+        session: &crate::audit_authority::NetconfSessionOwner,
+        promotion: crate::audit_authority::NetconfCandidatePromotion<'_>,
+        privacy: &dyn AuditPrivacyProjection,
+        event: &ManagementAuditEventRecord,
+        lifetime: std::time::Duration,
+    ) -> Result<crate::audit_authority::PreparedTargetMutation, AuditAuthorityError> {
+        self.require_netconf_target_profile()?;
+        if !session.device.worker.belongs_to(&self.inner) {
+            return Err(AuditAuthorityError::BindingMismatch);
+        }
+        let frozen = promotion.frozen;
+        frozen.verify_session(session)?;
+        if lifetime.subsec_nanos() != 0 || !(1..=3600).contains(&lifetime.as_secs()) {
+            return Err(AuditAuthorityError::InvalidInput);
+        }
+        let tenant = opc_types::TenantId::new(event.tenant())
+            .map_err(|_| AuditAuthorityError::InvalidInput)?;
+        let event = ProjectedAuditEvent::project(privacy, event)?;
+        let issued_at = self
+            .inner
+            .clock
+            .now_utc()
+            .as_offset_datetime()
+            .unix_timestamp();
+        let expires_at = issued_at
+            .checked_add(lifetime.as_secs() as i64)
+            .ok_or(AuditAuthorityError::InvalidInput)?;
+        let effect = frozen
+            .prepare_promotion(
+                session,
+                promotion,
+                &tenant,
+                &event,
+                expires_at,
+                self.inner.backend.audit_key(),
+            )
+            .await?;
+        let digest = effect.digest(self.inner.backend.audit_key())?;
+        let binding = AuditOperationBinding::project(
+            privacy,
+            &event,
+            frozen.candidate().running_base_version(),
+            &digest,
+        )?;
+        let handle = AuditOperationHandle::issue(
+            HandleBody {
+                version: 1,
+                identity: self.inner.identity,
+                binding,
+                event,
+                issued_at,
+                expires_at,
+                nonce: *uuid::Uuid::new_v4().as_bytes(),
+                key_epoch: self.inner.backend.audit_key().epoch(),
+                mutation: Some(digest),
+            },
+            self.inner.backend.audit_key(),
+        )?;
+        let prepared = crate::audit_authority::PreparedTargetMutation { handle, effect };
+        prepared.verify_effect(self.inner.backend.audit_key())?;
+        self.preflight_netconf_target(&prepared).await?;
+        frozen.verify_session(session)?;
+        Ok(prepared)
+    }
+
     /// Freeze a candidate/startup source and the running destination before
     /// decrypting, validating or encrypting copy content. The quorum-current
     /// transaction binds the source generation/fallback, running version, both
@@ -1455,6 +1528,33 @@ impl ConsensusConfigStore {
         session: &crate::audit_authority::NetconfSessionOwner,
         source: crate::audit_authority::NetconfLockDatastore,
     ) -> Result<crate::audit_authority::NetconfRunningCopyRead, AuditAuthorityError> {
+        self.read_netconf_running_source(session, source)
+            .await?
+            .freeze(session)
+    }
+
+    /// Freeze an actual staged candidate for ordinary promotion, before
+    /// decrypting or preparing its running envelope. The original staging
+    /// session, caller and base must match; fallback, foreign locks, pending
+    /// confirmation and unresolved audit obligations are refused. This uses
+    /// the same quorum-current read and independent checkpoint as running copy.
+    pub async fn read_netconf_candidate_promotion(
+        &self,
+        session: &crate::audit_authority::NetconfSessionOwner,
+    ) -> Result<crate::audit_authority::NetconfCandidatePromotionRead, AuditAuthorityError> {
+        self.read_netconf_running_source(
+            session,
+            crate::audit_authority::NetconfLockDatastore::Candidate,
+        )
+        .await?
+        .freeze_promotion(session)
+    }
+
+    async fn read_netconf_running_source(
+        &self,
+        session: &crate::audit_authority::NetconfSessionOwner,
+        source: crate::audit_authority::NetconfLockDatastore,
+    ) -> Result<super::super::audit_targets::NetconfCopyView, AuditAuthorityError> {
         self.require_netconf_target_profile()?;
         if !session.device.worker.belongs_to(&self.inner) {
             return Err(AuditAuthorityError::BindingMismatch);
@@ -1499,7 +1599,7 @@ impl ConsensusConfigStore {
         .await
         .map_err(|_| AuditAuthorityError::Unavailable)?;
         self.verify_audit_checkpoint(&ledger).await?;
-        view?.freeze(session)
+        view
     }
 }
 

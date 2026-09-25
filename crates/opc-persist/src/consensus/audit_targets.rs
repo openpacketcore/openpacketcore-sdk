@@ -1981,6 +1981,7 @@ pub(crate) struct NetconfCopyView {
     pub(crate) source: TargetSourceV1,
     pub(crate) blob: TargetEncryptedBlobV1,
     source_slot: usize,
+    source_binding: Option<TargetBinding>,
     pending: bool,
 }
 
@@ -2052,6 +2053,7 @@ pub(crate) fn read_copy_view_sync(
         source,
         blob,
         source_slot: slot + 1,
+        source_binding: target.source_binding.clone(),
         pending: state.lifecycle.pending_confirmation.is_some(),
     }))
 }
@@ -2120,9 +2122,94 @@ impl NetconfCopyView {
         commit: super::PreparedConfigCommit,
         expires_at: i64,
     ) -> Result<super::audit_mutation::TargetEffectV1, AuditAuthorityError> {
-        self.clone()
-            .freeze(session)?
-            .prepare_commit(session, event, commit, expires_at)
+        self.clone().freeze(session)?.prepare_commit(
+            session,
+            event,
+            commit,
+            expires_at,
+            RunningPreparationPurpose::Copy,
+        )
+    }
+}
+
+impl NetconfCopyView {
+    pub(crate) fn freeze_promotion(
+        self,
+        session: &crate::audit_authority::NetconfSessionOwner,
+    ) -> Result<crate::audit_authority::NetconfCandidatePromotionRead, AuditAuthorityError> {
+        let bad = AuditAuthorityError::BindingMismatch;
+        let binding = self.source_binding.as_ref().ok_or(bad)?;
+        if !matches!(self.source, TargetSourceV1::Candidate { .. })
+            || binding.session != session.incarnation()
+            || binding.caller != session.caller
+            || binding.base_version != self.device.running_version
+        {
+            return Err(bad);
+        }
+        Ok(crate::audit_authority::NetconfCandidatePromotionRead {
+            copy: self.freeze(session)?,
+        })
+    }
+}
+
+#[derive(Clone, Copy)]
+enum RunningPreparationPurpose {
+    Copy,
+    Promotion,
+}
+
+impl RunningPreparationPurpose {
+    fn operation(self) -> crate::ManagementAuditOperationCode {
+        match self {
+            Self::Copy => crate::ManagementAuditOperationCode::Replace,
+            Self::Promotion => crate::ManagementAuditOperationCode::Exec,
+        }
+    }
+
+    fn action(self) -> u8 {
+        match self {
+            Self::Copy => 15,
+            Self::Promotion => 6,
+        }
+    }
+}
+
+struct RunningPreparation<'a> {
+    frozen: &'a crate::audit_authority::NetconfRunningCopyRead,
+    commit: crate::AttestedConfigCommit,
+    provider: &'a dyn opc_key::KeyProvider,
+    purpose: RunningPreparationPurpose,
+}
+
+impl crate::audit_authority::NetconfCandidatePromotionRead {
+    pub(crate) async fn prepare_promotion(
+        &self,
+        session: &crate::audit_authority::NetconfSessionOwner,
+        promotion: crate::audit_authority::NetconfCandidatePromotion<'_>,
+        tenant: &opc_types::TenantId,
+        event: &crate::audit_authority::ProjectedAuditEvent,
+        expires_at: i64,
+        key: &AuditKey,
+    ) -> Result<super::audit_mutation::TargetEffectV1, AuditAuthorityError> {
+        self.verify_session(session)?;
+        if !std::ptr::eq(self, promotion.frozen) {
+            return Err(AuditAuthorityError::BindingMismatch);
+        }
+        self.copy
+            .prepare_running(
+                session,
+                RunningPreparation {
+                    frozen: &promotion.frozen.copy,
+                    commit: promotion.commit,
+                    provider: promotion.provider,
+                    purpose: RunningPreparationPurpose::Promotion,
+                },
+                tenant,
+                event,
+                expires_at,
+                key,
+            )
+            .await
     }
 }
 
@@ -2133,6 +2220,7 @@ impl crate::audit_authority::NetconfRunningCopyRead {
         event: &crate::audit_authority::ProjectedAuditEvent,
         commit: super::PreparedConfigCommit,
         expires_at: i64,
+        purpose: RunningPreparationPurpose,
     ) -> Result<super::audit_mutation::TargetEffectV1, AuditAuthorityError> {
         use crate::audit_authority::NetconfLockDatastore as Store;
         use crate::ManagementAuditTransportCode as Transport;
@@ -2140,7 +2228,7 @@ impl crate::audit_authority::NetconfRunningCopyRead {
         let bad = AuditAuthorityError::BindingMismatch;
         if event.caller != session.caller
             || event.outcome != crate::ManagementAuditOutcomeCode::Intent
-            || event.operation != crate::ManagementAuditOperationCode::Replace
+            || event.operation != purpose.operation()
             || !matches!(
                 event.transport,
                 Transport::NetconfSsh | Transport::NetconfTls
@@ -2178,7 +2266,7 @@ impl crate::audit_authority::NetconfRunningCopyRead {
             device_incarnation: session.device.device_incarnation,
             caller: event.caller,
             request: event.request,
-            action: 15.try_into()?,
+            action: purpose.action().try_into()?,
             destination: TargetExpectationV1::Running {
                 version: self.source.running_base,
             },
@@ -2207,9 +2295,34 @@ impl crate::audit_authority::NetconfRunningCopyRead {
         expires_at: i64,
         key: &AuditKey,
     ) -> Result<super::audit_mutation::TargetEffectV1, AuditAuthorityError> {
+        self.prepare_running(
+            session,
+            RunningPreparation {
+                frozen: copy.frozen,
+                commit: copy.commit,
+                provider: copy.provider,
+                purpose: RunningPreparationPurpose::Copy,
+            },
+            tenant,
+            event,
+            expires_at,
+            key,
+        )
+        .await
+    }
+
+    async fn prepare_running(
+        &self,
+        session: &crate::audit_authority::NetconfSessionOwner,
+        input: RunningPreparation<'_>,
+        tenant: &opc_types::TenantId,
+        event: &crate::audit_authority::ProjectedAuditEvent,
+        expires_at: i64,
+        key: &AuditKey,
+    ) -> Result<super::audit_mutation::TargetEffectV1, AuditAuthorityError> {
         self.verify_session(session)?;
         let bad = AuditAuthorityError::BindingMismatch;
-        if !std::ptr::eq(self, copy.frozen) {
+        if !std::ptr::eq(self, input.frozen) {
             return Err(bad);
         }
         let content = self.source.content.as_ref().ok_or(bad)?;
@@ -2219,19 +2332,19 @@ impl crate::audit_authority::NetconfRunningCopyRead {
         if aad.tenant() != tenant {
             return Err(bad);
         }
-        let (record, audit, resolution) = copy.commit.into_parts();
+        let (record, audit, resolution) = input.commit.into_parts();
         if resolution.is_some() {
             return Err(bad);
         }
         let commit = super::PreparedConfigCommit::prepare(record, audit, key)
             .map_err(|_| AuditAuthorityError::InvalidInput)?;
-        let mut effect = self.prepare_commit(session, event, commit, expires_at)?;
+        let mut effect = self.prepare_commit(session, event, commit, expires_at, input.purpose)?;
         let source = TargetEncryptedBlobV1 {
             schema: content.schema,
             plaintext_digest: content.plaintext_digest,
             encrypted_blob: content.encrypted.clone(),
         };
-        effect.bind_provider_copy(copy.provider, &source).await?;
+        effect.bind_provider_copy(input.provider, &source).await?;
         self.verify_session(session)?;
         Ok(effect)
     }

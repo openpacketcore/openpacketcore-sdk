@@ -894,6 +894,67 @@ impl fmt::Debug for NetconfRunningCopy<'_> {
     }
 }
 
+/// An actual staged candidate and running destination frozen for ordinary
+/// promotion. The SDK verifies the original staging session, caller and running
+/// base before returning this value. It has no consumer constructor or decoder.
+/// A running fallback is not a staged candidate and cannot produce this read.
+pub struct NetconfCandidatePromotionRead {
+    pub(crate) copy: NetconfRunningCopyRead,
+}
+
+impl NetconfCandidatePromotionRead {
+    /// Original staged content and generation. Decrypt through the existing
+    /// provider and expected tenant, then authorize and validate that content.
+    pub fn candidate(&self) -> &NetconfTargetRead {
+        self.copy.source()
+    }
+
+    pub(crate) fn verify_session(
+        &self,
+        session: &NetconfSessionOwner,
+    ) -> Result<(), AuditAuthorityError> {
+        self.copy.verify_session(session)
+    }
+}
+
+impl fmt::Debug for NetconfCandidatePromotionRead {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("NetconfCandidatePromotionRead(<redacted>)")
+    }
+}
+
+/// An original staged candidate paired with its proposed running envelope.
+/// Preparation authenticates exact configuration equality through the provider;
+/// admission and atomic promotion remain separate required authority steps.
+pub struct NetconfCandidatePromotion<'a> {
+    pub(crate) frozen: &'a NetconfCandidatePromotionRead,
+    pub(crate) commit: crate::AttestedConfigCommit,
+    pub(crate) provider: &'a dyn opc_key::KeyProvider,
+}
+
+impl<'a> NetconfCandidatePromotion<'a> {
+    /// Pair the original read and exact attested running envelope. This input
+    /// cannot confirm a pending operation or install a confirmation deadline.
+    /// The provider is borrowed only for preparation and is never retained.
+    pub fn new(
+        frozen: &'a NetconfCandidatePromotionRead,
+        commit: crate::AttestedConfigCommit,
+        provider: &'a dyn opc_key::KeyProvider,
+    ) -> Self {
+        Self {
+            frozen,
+            commit,
+            provider,
+        }
+    }
+}
+
+impl fmt::Debug for NetconfCandidatePromotion<'_> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("NetconfCandidatePromotion(<redacted>)")
+    }
+}
+
 /// A frozen encrypted candidate/startup read from one authenticated authority
 /// transaction. Its private binding names the original session, worker, target
 /// counter, running base and lock. It cannot be constructed or decoded by a
