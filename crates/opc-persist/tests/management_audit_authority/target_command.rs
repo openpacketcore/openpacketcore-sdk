@@ -52,7 +52,7 @@ fn discard_command() -> Value {
         &key,
     )
     .unwrap();
-    json!({"netconf-target": {
+    json!({"netconf-target": {"apply": {
         "handle": handle,
         "effect": {
             "format": 1,
@@ -69,7 +69,7 @@ fn discard_command() -> Value {
             "encrypted_payload": null,
             "resolution": null
         }
-    }})
+    }}})
 }
 
 #[test]
@@ -96,8 +96,8 @@ fn target_command_rejects_unknown_fields_and_unallocated_action_tags() {
     // These refusals are meaningful only alongside the positive decoder above.
     for path in [
         "/netconf-target",
-        "/netconf-target/effect",
-        "/netconf-target/effect/lock",
+        "/netconf-target/apply/effect",
+        "/netconf-target/apply/effect/lock",
     ] {
         let mut fixture = discard_command();
         fixture
@@ -110,7 +110,7 @@ fn target_command_rejects_unknown_fields_and_unallocated_action_tags() {
     }
     for tag in [16, 17, 255, 256, -1] {
         let mut fixture = discard_command();
-        fixture["netconf-target"]["effect"]["action"] = json!(tag);
+        fixture["netconf-target"]["apply"]["effect"]["action"] = json!(tag);
         assert!(serde_json::from_value::<AuditCommand>(fixture).is_err());
     }
 }
@@ -118,8 +118,12 @@ fn target_command_rejects_unknown_fields_and_unallocated_action_tags() {
 fn signed_discard() -> crate::consensus::audit_mutation::PreparedTargetMutation {
     use crate::audit_authority::ledger::authenticate;
     let command: AuditCommand = serde_json::from_value(discard_command()).unwrap();
-    let AuditCommand::NetconfTarget(mut prepared) = command else {
+    let AuditCommand::NetconfTarget(command) = command else {
         panic!("target fixture decoded as another action");
+    };
+    let crate::consensus::audit_mutation::TargetAuditCommandV1::Apply(mut prepared) = *command
+    else {
+        panic!("target fixture decoded as admission");
     };
     let key = AuditKey::new([0x24; 32]).unwrap();
     let mut body = prepared.handle.body.clone();
@@ -132,7 +136,7 @@ fn signed_discard() -> crate::consensus::audit_mutation::PreparedTargetMutation 
         .unwrap(),
     );
     prepared.handle = AuditOperationHandle::issue(body, &key).unwrap();
-    *prepared
+    prepared
 }
 
 #[test]
@@ -198,7 +202,7 @@ fn target_command_cannot_enter_any_legacy_command_revision() {
             request_id: crate::ConfigConsensusRequestId::from_bytes([0x51; 16]),
             logical_time: "2026-01-01T00:00:00Z".parse().unwrap(),
             intent: ConfigMutationIntent::ManagementAudit(AuditCommand::NetconfTarget(Box::new(
-                prepared.clone(),
+                crate::consensus::audit_mutation::TargetAuditCommandV1::Apply(prepared.clone()),
             ))),
         };
         assert!(
@@ -401,4 +405,294 @@ fn retained_target_admission_preserves_the_exact_closed_description_after_reopen
     let recovered = crate::consensus::audit_mutation::PreparedTargetMutation::decode(&raw).unwrap();
     assert_eq!(recovered.handle(), prepared.handle());
     recovered.verify_effect(&key).unwrap();
+}
+
+fn resign_target(prepared: &mut crate::consensus::audit_mutation::PreparedTargetMutation) {
+    let key = AuditKey::new([0x24; 32]).unwrap();
+    let mut body = prepared.handle.body.clone();
+    body.mutation = Some(
+        crate::audit_authority::ledger::authenticate(
+            &key,
+            b"openpacketcore/management-audit/netconf-target/v1\0",
+            &prepared.effect,
+        )
+        .unwrap(),
+    );
+    prepared.handle = AuditOperationHandle::issue(body, &key).unwrap();
+}
+
+#[test]
+fn retained_target_admission_rejects_conflicts_and_handle_only_recovery() {
+    use crate::audit_authority::{AuditAuthorityError, AuditOperationState};
+    let prepared = signed_discard();
+    let key = AuditKey::new([0x24; 32]).unwrap();
+    let identity = prepared.handle.body.identity;
+    let (_root, conn, keys) = retained_target_fixture();
+    let mut ledger = super::read_with_keys_sync(&conn, &key, Some(&keys), identity)
+        .unwrap()
+        .unwrap();
+    ledger.admit_target(&key, &prepared, 100).unwrap();
+    ledger.seal_continuity(Some(&keys)).unwrap();
+    ledger.validate(&key, identity).unwrap();
+    ledger.validate_continuity(Some(&keys)).unwrap();
+    let unchanged = serde_json::to_vec(&ledger).unwrap();
+    let mut different = prepared.clone();
+    different.effect.lock.as_mut().unwrap().incarnation = 2;
+    resign_target(&mut different);
+    assert_eq!(
+        ledger.admit_target(&key, &different, 100),
+        Err(AuditAuthorityError::BindingMismatch)
+    );
+    assert_eq!(
+        ledger.admit(&key, prepared.handle(), 100),
+        Err(AuditAuthorityError::BindingMismatch)
+    );
+    assert_eq!(serde_json::to_vec(&ledger).unwrap(), unchanged);
+    let mut caller = serde_json::to_value(prepared.handle.body.binding.caller).unwrap();
+    caller["principal"] = json!(vec![0x71u8; 32]);
+    assert!(ledger
+        .recover_target(
+            &key,
+            prepared.handle(),
+            serde_json::from_value(caller).unwrap()
+        )
+        .is_err());
+    assert_eq!(
+        ledger
+            .recover_target(&key, prepared.handle(), prepared.handle.body.binding.caller)
+            .unwrap()
+            .encode()
+            .unwrap(),
+        prepared.encode().unwrap()
+    );
+    ledger
+        .resolve(&key, prepared.handle(), AuditOperationState::Rejected)
+        .unwrap();
+    ledger
+        .acknowledge_terminal(&key, prepared.handle())
+        .unwrap();
+    ledger.seal_continuity(Some(&keys)).unwrap();
+    let settled = serde_json::to_vec(&ledger).unwrap();
+    ledger.admit_target(&key, &prepared, 200).unwrap();
+    assert_eq!(serde_json::to_vec(&ledger).unwrap(), settled);
+    assert_eq!(
+        ledger
+            .lookup(&key, prepared.handle(), prepared.handle.body.binding.caller)
+            .unwrap()
+            .unwrap()
+            .state(),
+        AuditOperationState::Rejected
+    );
+    assert_eq!(
+        ledger
+            .recover_target(&key, prepared.handle(), prepared.handle.body.binding.caller)
+            .unwrap()
+            .encode()
+            .unwrap(),
+        prepared.encode().unwrap()
+    );
+
+    let mut ordinary = super::read_with_keys_sync(&conn, &key, Some(&keys), identity)
+        .unwrap()
+        .unwrap();
+    ordinary.admit(&key, prepared.handle(), 100).unwrap();
+    let before = serde_json::to_vec(&ordinary).unwrap();
+    assert!(ordinary
+        .recover_target(&key, prepared.handle(), prepared.handle.body.binding.caller)
+        .is_err());
+    assert_eq!(
+        ordinary.admit_target(&key, &prepared, 100),
+        Err(AuditAuthorityError::BindingMismatch)
+    );
+    assert_eq!(serde_json::to_vec(&ordinary).unwrap(), before);
+}
+
+#[test]
+fn retained_target_admission_requires_live_original_and_independent_continuity() {
+    use crate::audit_authority::ledger::LedgerState;
+    use crate::audit_authority::{AuditAuthorityError, AuditLedgerLimits};
+    let prepared = signed_discard();
+    let key = AuditKey::new([0x24; 32]).unwrap();
+    let identity = prepared.handle.body.identity;
+    let mut ledger = LedgerState::new(
+        identity,
+        prepared.handle.body.event.projection,
+        AuditLedgerLimits::new(12, 4).unwrap(),
+    );
+    let original = serde_json::to_vec(&ledger).unwrap();
+    assert_eq!(
+        ledger.admit_target(&key, &prepared, 100),
+        Err(AuditAuthorityError::RecoveryRequired)
+    );
+    assert_eq!(serde_json::to_vec(&ledger).unwrap(), original);
+    ledger.continuity = Some(crate::audit_authority::continuity::chain::ContinuityState::new(1));
+    for time in [99, 160, 200] {
+        let original = serde_json::to_vec(&ledger).unwrap();
+        assert_eq!(
+            ledger.admit_target(&key, &prepared, time),
+            Err(AuditAuthorityError::Expired)
+        );
+        assert_eq!(serde_json::to_vec(&ledger).unwrap(), original);
+    }
+}
+
+#[test]
+fn retained_target_admission_rejects_tampered_truncated_and_substituted_descriptions() {
+    use crate::audit_authority::ledger::{authenticate, EntryPayload, LedgerState};
+    let prepared = signed_discard();
+    let key = AuditKey::new([0x24; 32]).unwrap();
+    let identity = prepared.handle.body.identity;
+    let (_root, conn, keys) = retained_target_fixture();
+    let mut ledger = super::read_with_keys_sync(&conn, &key, Some(&keys), identity)
+        .unwrap()
+        .unwrap();
+    ledger.admit_target(&key, &prepared, 100).unwrap();
+    ledger.seal_continuity(Some(&keys)).unwrap();
+    let recovery = String::from_utf8(prepared.encode().unwrap()).unwrap();
+    let mut changed = serde_json::to_value(&prepared).unwrap();
+    changed["effect"]["lock"]["incarnation"] = json!(2);
+    let changed = crate::consensus::audit_mutation::PreparedTargetMutation::decode(
+        &serde_json::to_vec(&changed).unwrap(),
+    )
+    .unwrap();
+    let changed = String::from_utf8(changed.encode().unwrap()).unwrap();
+    let mut foreign = prepared.clone();
+    foreign.handle.body.nonce = [0x76; 16];
+    resign_target(&mut foreign);
+    for replacement in [
+        String::new(),
+        recovery[..recovery.len() - 1].into(),
+        format!(" {recovery}"),
+        changed.clone(),
+        String::from_utf8(foreign.encode().unwrap()).unwrap(),
+        " ".repeat(crate::consensus::sqlite::CONFIG_CONSENSUS_LOG_ENTRY_MAX_BYTES + 1),
+    ] {
+        let mut value = serde_json::to_value(&ledger).unwrap();
+        value["entries"][0]["payload"]["target-intent"]["recovery"] = json!(replacement);
+        let altered: LedgerState = serde_json::from_value(value).unwrap();
+        assert!(
+            altered.validate(&key, identity).is_err(),
+            "altered retained description admitted"
+        );
+        assert!(
+            altered.validate_continuity(Some(&keys)).is_err(),
+            "portable chain ignored the retained description"
+        );
+    }
+    // Recompute the outer row chain to isolate validation of the original
+    // handle/effect binding, rather than relying only on an enclosing MAC.
+    let mut forged = ledger.clone();
+    let EntryPayload::TargetIntent {
+        recovery: retained, ..
+    } = &mut forged.entries[0].payload
+    else {
+        panic!("missing target intent");
+    };
+    *retained = changed;
+    let entry = &mut forged.entries[0];
+    entry.mac = authenticate(
+        &key,
+        b"openpacketcore/management-audit/replicated-entry/v1\0",
+        &(
+            identity,
+            entry.sequence,
+            entry.previous,
+            entry.key_epoch,
+            &entry.payload,
+        ),
+    )
+    .unwrap();
+    forged.terminal = entry.mac;
+    assert!(
+        forged.validate(&key, identity).is_err(),
+        "re-signed outer row hid substituted target content"
+    );
+    ledger.validate(&key, identity).unwrap();
+}
+
+#[test]
+fn retained_target_admission_reserves_aggregate_capacity_for_terminal_recovery() {
+    use crate::audit_authority::ledger::{LedgerState, MAX_STATE_BYTES};
+    use crate::audit_authority::{AuditAuthorityError, AuditLedgerLimits, AuditOperationState};
+    let prepared = signed_discard();
+    let key = AuditKey::new([0x24; 32]).unwrap();
+    let identity = prepared.handle.body.identity;
+    let (_root, _conn, keys) = retained_target_fixture();
+    let mut ledger = LedgerState::new(
+        identity,
+        prepared.handle.body.event.projection,
+        AuditLedgerLimits::new(4096, 1024).unwrap(),
+    );
+    ledger.continuity = Some(crate::audit_authority::continuity::chain::ContinuityState::new(1));
+    let mut admitted = Vec::new();
+    let mut full = false;
+    for index in 1u32..=1024 {
+        let mut next = prepared.clone();
+        let mut request = [0x79u8; 32];
+        request[..4].copy_from_slice(&index.to_le_bytes());
+        let request = serde_json::from_value(json!(request)).unwrap();
+        next.effect.request = request;
+        next.handle.body.binding.request = request;
+        next.handle.body.event.request = request;
+        resign_target(&mut next);
+        let unchanged = serde_json::to_vec(&ledger).unwrap();
+        match ledger.admit_target(&key, &next, 100) {
+            Ok(()) => admitted.push(next),
+            Err(AuditAuthorityError::Full) => {
+                assert_eq!(serde_json::to_vec(&ledger).unwrap(), unchanged);
+                full = true;
+                break;
+            }
+            Err(error) => panic!("unexpected admission error: {error}"),
+        }
+    }
+    assert!(full && !admitted.is_empty() && admitted.len() < 1024);
+    ledger.seal_continuity(Some(&keys)).unwrap();
+    ledger.validate(&key, identity).unwrap();
+    // Every reserved terminal remains appendable without deleting recovery
+    // descriptions, increasing the aggregate bound, or extending expiry.
+    for original in &admitted {
+        ledger
+            .resolve(&key, original.handle(), AuditOperationState::Rejected)
+            .unwrap();
+        ledger
+            .acknowledge_terminal(&key, original.handle())
+            .unwrap();
+    }
+    ledger.seal_continuity(Some(&keys)).unwrap();
+    ledger.validate(&key, identity).unwrap();
+    ledger.validate_continuity(Some(&keys)).unwrap();
+    assert!(serde_json::to_vec(&ledger).unwrap().len() < MAX_STATE_BYTES);
+    for original in &admitted {
+        assert_eq!(
+            ledger
+                .recover_target(&key, original.handle(), original.handle.body.binding.caller)
+                .unwrap()
+                .encode()
+                .unwrap(),
+            original.encode().unwrap()
+        );
+    }
+}
+
+#[test]
+fn retained_target_admission_and_application_have_distinct_closed_phase_tags() {
+    let prepared = signed_discard();
+    for (name, tag) in [("admit", 0), ("apply", 1)] {
+        let value = json!({"netconf-target": {name: prepared}});
+        let command: AuditCommand = serde_json::from_value(value.clone()).unwrap();
+        let bytes = opc_consensus::encode_bounded(&command).unwrap();
+        assert_eq!(&bytes[..2], &[9, tag]);
+        let restored: AuditCommand = opc_consensus::decode_bounded(&bytes).unwrap();
+        assert_eq!(serde_json::to_value(restored).unwrap(), value);
+        let mut unknown = bytes.clone();
+        unknown[1] = 2;
+        assert!(opc_consensus::decode_bounded::<AuditCommand>(&unknown).is_err());
+        for end in 0..bytes.len() {
+            assert!(opc_consensus::decode_bounded::<AuditCommand>(&bytes[..end]).is_err());
+        }
+        let mut trailing = bytes;
+        trailing.push(0);
+        assert!(opc_consensus::decode_bounded::<AuditCommand>(&trailing).is_err());
+    }
 }

@@ -39,7 +39,7 @@ pub(crate) enum AuditCommand {
     },
     AcknowledgeExport(AuditCheckpoint),
     // Append-only nested allocation; outer management-audit remains tag 6.
-    NetconfTarget(Box<super::audit_mutation::PreparedTargetMutation>),
+    NetconfTarget(Box<super::audit_mutation::TargetAuditCommandV1>),
 }
 
 impl std::fmt::Debug for AuditCommand {
@@ -267,9 +267,29 @@ pub(crate) fn apply_sync(
                 } => keys
                     .ok_or(AuditAuthorityError::KeyUnavailable)
                     .and_then(|keys| ledger.prune(keys, *through, checkpoint, now)),
-                AuditCommand::NetconfTarget(prepared) => prepared
-                    .verify_effect(key)
-                    .and(Err(AuditAuthorityError::RecoveryRequired)),
+                AuditCommand::NetconfTarget(command) => {
+                    use super::audit_mutation::TargetAuditCommandV1;
+                    match &**command {
+                        TargetAuditCommandV1::Admit(prepared) => {
+                            ledger.admit_target(key, prepared, now)
+                        }
+                        TargetAuditCommandV1::Apply(prepared) => (|| {
+                            prepared.verify_effect(key)?;
+                            let original = ledger.recover_target(
+                                key,
+                                prepared.handle(),
+                                prepared.handle.body.binding.caller,
+                            )?;
+                            if original.encode()? != prepared.encode()? {
+                                Err(AuditAuthorityError::BindingMismatch)
+                            } else {
+                                // Target effects stay unavailable until the complete
+                                // retained ownership/lifecycle path is connected.
+                                Err(AuditAuthorityError::RecoveryRequired)
+                            }
+                        })(),
+                    }
+                }
                 AuditCommand::Initialize { .. } | AuditCommand::InitializeWithContinuity { .. } => {
                     Err(AuditAuthorityError::InvalidInput)
                 }
@@ -323,6 +343,9 @@ pub(crate) fn applied_receipt_sync(
             | AuditCommand::Reject(handle)
             | AuditCommand::Terminal(handle),
         ) => handle,
+        super::ConfigMutationIntent::ManagementAudit(AuditCommand::NetconfTarget(command)) => {
+            command.prepared().handle()
+        }
         _ => return Ok(None),
     };
     // A rejected malformed/substituted handle has no receipt, not an I/O fault.

@@ -125,6 +125,23 @@ impl std::fmt::Debug for PreparedAuditedMutation {
     }
 }
 
+// Admission and application use distinct, append-only phase tags inside the
+// allocated target-command family. The signed effect itself is unchanged.
+#[derive(Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub(crate) enum TargetAuditCommandV1 {
+    Admit(PreparedTargetMutation),
+    Apply(PreparedTargetMutation),
+}
+
+impl TargetAuditCommandV1 {
+    pub(crate) fn prepared(&self) -> &PreparedTargetMutation {
+        match self {
+            Self::Admit(prepared) | Self::Apply(prepared) => prepared,
+        }
+    }
+}
+
 const TARGET_MUTATION_DOMAIN: &[u8] = b"openpacketcore/management-audit/netconf-target/v1\0";
 
 // Fixed RFC 019 action codes. They are numbers in both JSON and postcard; this

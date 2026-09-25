@@ -247,6 +247,12 @@ pub(crate) enum EntryPayload {
     Terminal {
         operation: [u8; 32],
     },
+    // Append-only allocation. Both the ordinary root chain and the independent
+    // continuity chain authenticate the exact closed recovery description.
+    TargetIntent {
+        handle: Box<AuditOperationHandle>,
+        recovery: String,
+    },
 }
 
 #[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -342,13 +348,68 @@ impl LedgerState {
         handle: &AuditOperationHandle,
         now: i64,
     ) -> Result<(), AuditAuthorityError> {
+        self.admit_with_recovery(key, handle, now, None)
+    }
+
+    pub(crate) fn admit_target(
+        &mut self,
+        key: &AuditKey,
+        prepared: &crate::consensus::audit_mutation::PreparedTargetMutation,
+        now: i64,
+    ) -> Result<(), AuditAuthorityError> {
+        if self.continuity.is_none() {
+            return Err(AuditAuthorityError::RecoveryRequired);
+        }
+        prepared.verify_effect(key)?;
+        let recovery =
+            String::from_utf8(prepared.encode()?).map_err(|_| AuditAuthorityError::InvalidInput)?;
+        self.admit_with_recovery(key, prepared.handle(), now, Some(recovery))
+    }
+
+    fn admit_with_recovery(
+        &mut self,
+        key: &AuditKey,
+        handle: &AuditOperationHandle,
+        now: i64,
+        recovery: Option<String>,
+    ) -> Result<(), AuditAuthorityError> {
+        // Failed admission leaves the in-memory candidate unchanged as well as
+        // the outer transaction. Existing legacy-only admission keeps its path.
+        if recovery.is_some() || self.has_target_intents() {
+            let mut candidate = self.clone();
+            candidate.admit_inner(key, handle, now, recovery)?;
+            candidate.check_target_capacity()?;
+            *self = candidate;
+            Ok(())
+        } else {
+            self.admit_inner(key, handle, now, recovery)
+        }
+    }
+
+    fn admit_inner(
+        &mut self,
+        key: &AuditKey,
+        handle: &AuditOperationHandle,
+        now: i64,
+        recovery: Option<String>,
+    ) -> Result<(), AuditAuthorityError> {
         handle.verify(key, self.identity, handle.body.binding.caller)?;
         if let Some(existing) = self
             .operations
             .iter()
             .find(|op| op.handle.body.binding.request == handle.body.binding.request)
         {
-            return if existing.handle == *handle {
+            let previous = self.entries.iter().find_map(|entry| {
+                if entry.sequence != existing.first_sequence {
+                    return None;
+                }
+                match &entry.payload {
+                    EntryPayload::Intent(_) => Some(None),
+                    EntryPayload::TargetIntent { recovery, .. } => Some(Some(recovery)),
+                    _ => None,
+                }
+            });
+            return if existing.handle == *handle && previous == Some(recovery.as_ref()) {
                 Ok(())
             } else {
                 Err(AuditAuthorityError::BindingMismatch)
@@ -380,7 +441,15 @@ impl LedgerState {
         {
             return Err(AuditAuthorityError::Full);
         }
-        let sequence = self.append(key, EntryPayload::Intent(Box::new(handle.clone())))?;
+        let handle_payload = Box::new(handle.clone());
+        let payload = match recovery {
+            Some(recovery) => EntryPayload::TargetIntent {
+                handle: handle_payload,
+                recovery,
+            },
+            None => EntryPayload::Intent(handle_payload),
+        };
+        let sequence = self.append(key, payload)?;
         self.operations.push(LedgerOperation {
             handle: handle.clone(),
             state: if is_intent {
@@ -396,6 +465,72 @@ impl LedgerState {
             reserved: reservation - 1,
         });
         Ok(())
+    }
+
+    fn has_target_intents(&self) -> bool {
+        self.entries
+            .iter()
+            .any(|entry| matches!(entry.payload, EntryPayload::TargetIntent { .. }))
+    }
+
+    // The existing 16 MiB aggregate is unchanged. Reserve a conservative 32 KiB
+    // for each remaining fixed-shape outcome/terminal event, including its
+    // operation-index update and both chain authenticators. No future outcome
+    // contains configuration/envelope bytes or variable-length caller strings.
+    // Additional fixed slack covers the stored wrapper and two checkpoints;
+    // unsealed rows retain space for their independent chain authenticator.
+    pub(crate) fn check_target_capacity(&self) -> Result<(), AuditAuthorityError> {
+        if !self.has_target_intents() {
+            return Ok(());
+        }
+        let reserved = self.operations.iter().try_fold(0usize, |used, op| {
+            used.checked_add(op.reserved)
+                .ok_or(AuditAuthorityError::Full)
+        })?;
+        let unsealed = self
+            .continuity
+            .as_ref()
+            .map_or(self.entries.len(), |chain| {
+                self.entries.len().saturating_sub(chain.rows.len())
+            });
+        let encoded = serde_json::to_vec(self).map_err(|_| AuditAuthorityError::InvalidInput)?;
+        let required = reserved
+            .checked_mul(32 * 1024)
+            .and_then(|n| {
+                unsealed
+                    .checked_mul(1024)
+                    .and_then(|rows| n.checked_add(rows))
+            })
+            .and_then(|n| n.checked_add(16 * 1024))
+            .and_then(|n| n.checked_add(encoded.len()))
+            .ok_or(AuditAuthorityError::Full)?;
+        if required > MAX_STATE_BYTES {
+            return Err(AuditAuthorityError::Full);
+        }
+        Ok(())
+    }
+
+    pub(crate) fn recover_target(
+        &self,
+        key: &AuditKey,
+        handle: &AuditOperationHandle,
+        caller: AuditCaller,
+    ) -> Result<crate::consensus::audit_mutation::PreparedTargetMutation, AuditAuthorityError> {
+        handle.verify(key, self.identity, caller)?;
+        let index = self.operation_index(key, handle)?;
+        let operation = &self.operations[index];
+        let entry = self
+            .entries
+            .iter()
+            .find(|entry| entry.sequence == operation.first_sequence)
+            .ok_or(AuditAuthorityError::BindingMismatch)?;
+        match &entry.payload {
+            EntryPayload::TargetIntent {
+                handle: retained,
+                recovery,
+            } if **retained == *handle => validate_target_recovery(key, handle, recovery),
+            _ => Err(AuditAuthorityError::BindingMismatch),
+        }
     }
 
     #[cfg(test)]
@@ -540,7 +675,13 @@ impl LedgerState {
                 &entry.mac,
             )?;
             match &entry.payload {
-                EntryPayload::Intent(handle) => {
+                EntryPayload::Intent(handle) | EntryPayload::TargetIntent { handle, .. } => {
+                    if let EntryPayload::TargetIntent { recovery, .. } = &entry.payload {
+                        if self.continuity.is_none() {
+                            return Err(AuditAuthorityError::BindingMismatch);
+                        }
+                        validate_target_recovery(key, handle, recovery)?;
+                    }
                     handle.verify(key, identity, handle.body.binding.caller)?;
                     if handle.body.event.projection != self.projection
                         || derived
@@ -617,6 +758,7 @@ impl LedgerState {
         if sequence != self.sequence || previous != self.terminal {
             return Err(AuditAuthorityError::BindingMismatch);
         }
+        self.check_target_capacity()?;
         for (index, op) in self.operations.iter().enumerate() {
             op.handle
                 .verify(key, identity, op.handle.body.binding.caller)?;
@@ -641,6 +783,20 @@ impl LedgerState {
         }
         Ok(())
     }
+}
+
+fn validate_target_recovery(
+    key: &AuditKey,
+    handle: &AuditOperationHandle,
+    recovery: &str,
+) -> Result<crate::consensus::audit_mutation::PreparedTargetMutation, AuditAuthorityError> {
+    let prepared =
+        crate::consensus::audit_mutation::PreparedTargetMutation::decode(recovery.as_bytes())?;
+    if prepared.handle() != handle || prepared.encode()?.as_slice() != recovery.as_bytes() {
+        return Err(AuditAuthorityError::BindingMismatch);
+    }
+    prepared.verify_effect(key)?;
+    Ok(prepared)
 }
 
 pub(crate) fn authenticate<T: Serialize>(
