@@ -57,7 +57,7 @@ where
         )
     }
 
-    async fn reconcile_bearer_owned<D>(
+    pub(super) async fn reconcile_bearer_owned<D>(
         &self,
         backend: &D,
         parent_claim: GtpuSessionSelectorActiveClaim,

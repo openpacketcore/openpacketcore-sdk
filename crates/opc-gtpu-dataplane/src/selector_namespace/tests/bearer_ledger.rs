@@ -246,6 +246,7 @@ async fn active_recovery_requires_fresh_durable_read_after_backend_readback() {
     let backend = Arc::new(HeldAcknowledgement {
         inner: lab.backend.clone(),
         hold_next: AtomicBool::new(false),
+        hold_before_effect: false,
         read_calls: AtomicUsize::new(0),
         entered: tokio::sync::Notify::new(),
         release: tokio::sync::Notify::new(),
@@ -360,6 +361,7 @@ async fn retained_transition_snapshot_cannot_replace_a_later_active_generation()
 struct HeldAcknowledgement {
     inner: Arc<GroupedGtpuDataplaneSimulation>,
     hold_next: std::sync::atomic::AtomicBool,
+    hold_before_effect: bool,
     read_calls: std::sync::atomic::AtomicUsize,
     entered: tokio::sync::Notify,
     release: tokio::sync::Notify,
@@ -420,15 +422,18 @@ impl GtpuDataplaneBackend for HeldAcknowledgement {
         &self,
         request: GtpuSessionSelectorEffectRequest,
     ) -> Result<GtpuSessionSelectorBackendReceipt, crate::GtpuError> {
+        let hold = self
+            .hold_next
+            .swap(false, std::sync::atomic::Ordering::SeqCst);
+        if hold && self.hold_before_effect {
+            self.entered.notify_one();
+            self.release.notified().await;
+        }
         let result = self
             .inner
             .reconcile_pdp_context_group_authorized(request)
             .await;
-        if result.is_ok()
-            && self
-                .hold_next
-                .swap(false, std::sync::atomic::Ordering::SeqCst)
-        {
+        if hold && !self.hold_before_effect && result.is_ok() {
             self.entered.notify_one();
             self.release.notified().await;
         }
@@ -438,10 +443,26 @@ impl GtpuDataplaneBackend for HeldAcknowledgement {
 
 #[tokio::test]
 async fn unrelated_child_finishes_before_delayed_effect_acknowledgement() {
+    concurrent_child_progress(false, false).await;
+}
+
+#[tokio::test]
+async fn unrelated_child_finishes_while_exact_install_owner_has_not_published_a_stamp() {
+    concurrent_child_progress(true, false).await;
+}
+
+#[tokio::test]
+async fn dropping_one_observer_retains_its_effect_while_an_unrelated_child_finishes() {
+    concurrent_child_progress(true, true).await;
+}
+
+async fn concurrent_child_progress(hold_before_effect: bool, cancel_observer: bool) {
     let lab = lab(3).await;
+    let concurrent = lab.authority.concurrent_operations();
     let backend = Arc::new(HeldAcknowledgement {
         inner: lab.backend.clone(),
         hold_next: std::sync::atomic::AtomicBool::new(true),
+        hold_before_effect,
         read_calls: std::sync::atomic::AtomicUsize::new(0),
         entered: tokio::sync::Notify::new(),
         release: tokio::sync::Notify::new(),
@@ -470,7 +491,7 @@ async fn unrelated_child_finishes_before_delayed_effect_acknowledgement() {
         .unwrap()],
     )
     .unwrap();
-    let mut first = lab.authority.reconcile_bearer(
+    let mut first = concurrent.reconcile_bearer(
         backend.clone(),
         parent,
         lab.parent.clone(),
@@ -480,7 +501,13 @@ async fn unrelated_child_finishes_before_delayed_effect_acknowledgement() {
         () = backend.entered.notified() => {},
         result = &mut first => panic!("first effect escaped its acknowledgement gate: {result:?}"),
     }
-    let mut second = lab.authority.reconcile_bearer(
+    let first = if cancel_observer {
+        drop(first);
+        None
+    } else {
+        Some(first)
+    };
+    let mut second = concurrent.reconcile_bearer(
         backend.clone(),
         sibling,
         lab.sibling.clone(),
@@ -491,7 +518,9 @@ async fn unrelated_child_finishes_before_delayed_effect_acknowledgement() {
     let progress = tokio::time::timeout(Duration::from_secs(1), &mut second).await;
     let independent = progress.is_ok();
     backend.release.notify_one();
-    drop(first.await.unwrap());
+    if let Some(first) = first {
+        drop(first.await.unwrap());
+    }
     drop(match progress {
         Ok(result) => result.unwrap(),
         Err(_) => second.await.unwrap(),
