@@ -6960,8 +6960,11 @@ async fn target_promotion_sdk_read_requires_original_stage_owner_and_current_bas
                     ));
                     fixture.settle(&conn, &running);
                 } else if matches!(change, "source-lock" | "running-lock") {
-                    let lock =
-                        fixture.request(&conn, 227, 2, 0x62, u8::from(change == "source-lock"));
+                    let lock = if change == "source-lock" {
+                        fixture.foreign_candidate_lock_after_owner_discard(&conn)
+                    } else {
+                        fixture.request(&conn, 227, 2, 0x62, 0)
+                    };
                     assert!(matches!(
                         fixture.submit(&conn, &lock),
                         AuditOperationState::TargetV1(_)
@@ -7048,8 +7051,10 @@ async fn target_promotion_sdk_preserves_original_generation_and_running_expectat
                 .unwrap()
         } else if change == "discard" {
             fixture.request(&conn, 229, 5, 0x61, 1)
+        } else if change == "source-lock" {
+            fixture.foreign_candidate_lock_after_owner_discard(&conn)
         } else {
-            fixture.request(&conn, 229, 2, 0x62, u8::from(change == "source-lock"))
+            fixture.request(&conn, 229, 2, 0x62, 0)
         };
         assert!(matches!(
             fixture.submit(&conn, &changed),
@@ -7175,5 +7180,33 @@ async fn target_promotion_sdk_refuses_substituted_session_read_tenant_and_config
         assert!(result.is_err(), "promotion accepted substituted session, read, tenant, context, provider or configuration: {change}");
         assert_eq!(conn.total_changes(), changes);
         assert_eq!(target_rows(&conn), before);
+    }
+}
+
+impl Fixture {
+    // A different session cannot acquire an existing owner's staged candidate.
+    // Exercise that refusal first, then create a reachable foreign-lock state
+    // after the original owner discards its candidate. Original frozen reads
+    // must still reject the changed generation and ownership.
+    fn foreign_candidate_lock_after_owner_discard(
+        &self,
+        conn: &Connection,
+    ) -> PreparedTargetMutation {
+        let attempted = self.request(conn, 231, 2, 0x62, 1);
+        let before = target_rows(conn);
+        assert_eq!(self.submit(conn, &attempted), AuditOperationState::Rejected);
+        assert_eq!(target_rows(conn), before);
+        self.settle(conn, &attempted);
+        assert_eq!(target_rows(conn), before);
+        let discard = self.request(conn, 232, 5, 0x61, 1);
+        assert!(matches!(
+            self.submit(conn, &discard),
+            AuditOperationState::TargetV1(_)
+        ));
+        self.settle(conn, &discard);
+        let candidate = row(conn, "config_netconf_targets", "target", 0);
+        assert_eq!(candidate["present"], false);
+        assert!(candidate["source_binding"].is_null());
+        self.request(conn, 233, 2, 0x62, 1)
     }
 }
