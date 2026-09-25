@@ -4885,14 +4885,20 @@ where
             self.ensure_backend_namespace(backend, &mut lease)
                 .await
                 .map_err(|_| GtpuSessionSelectorCoordinatorError::Namespace)?;
-            let admission = self
-                .active_admission(&desired)
+            let (_, state) = self
+                .read_state()
                 .await
+                .map_err(|_| GtpuSessionSelectorCoordinatorError::Namespace)?;
+            // The rollback descriptor and consumed readback descriptor have
+            // identical authority. Derive both synchronously from this one
+            // authenticated snapshot; the post-backend read remains fresh.
+            let admission = self
+                .admission_for_final_phase_from_state(&desired, 0, &state)
                 .map_err(|_| GtpuSessionSelectorCoordinatorError::Namespace)?;
             let readback_admission = self
-                .active_admission(&desired)
-                .await
+                .admission_for_final_phase_from_state(&desired, 0, &state)
                 .map_err(|_| GtpuSessionSelectorCoordinatorError::Namespace)?;
+            drop(state);
             if self
                 .require_exact_active(backend, desired.clone(), readback_admission, &mut lease)
                 .await

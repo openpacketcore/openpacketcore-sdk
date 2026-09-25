@@ -15,6 +15,7 @@ pub(super) struct RenewalBackend {
     renewals: AtomicUsize,
     pub(super) reads: AtomicUsize,
     pub(super) writes: AtomicUsize,
+    pub(super) reject_read: AtomicUsize,
     hold_ack: AtomicBool,
     applied: tokio::sync::Notify,
     acknowledge: tokio::sync::Notify,
@@ -28,6 +29,7 @@ impl RenewalBackend {
             renewals: AtomicUsize::new(0),
             reads: AtomicUsize::new(0),
             writes: AtomicUsize::new(0),
+            reject_read: AtomicUsize::new(usize::MAX),
             hold_ack: AtomicBool::new(false),
             applied: tokio::sync::Notify::new(),
             acknowledge: tokio::sync::Notify::new(),
@@ -46,7 +48,10 @@ impl SessionBackend for RenewalBackend {
     }
 
     async fn get(&self, key: &SessionKey) -> Result<Option<StoredSessionRecord>, StoreError> {
-        self.reads.fetch_add(1, Ordering::SeqCst);
+        let count = self.reads.fetch_add(1, Ordering::SeqCst) + 1;
+        if count == self.reject_read.load(Ordering::SeqCst) {
+            return Err(StoreError::BackendUnavailable("fixed read fault".into()));
+        }
         self.inner.get(key).await
     }
 

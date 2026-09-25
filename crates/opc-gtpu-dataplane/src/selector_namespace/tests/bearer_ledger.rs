@@ -164,6 +164,120 @@ async fn bearer_admission_does_not_repeat_the_same_preflight_snapshot_read() {
 }
 
 #[tokio::test]
+async fn active_recovery_does_not_repeat_the_pre_readback_snapshot() {
+    use std::sync::atomic::Ordering;
+
+    let tenant = TenantId::from_static("recovery-read-budget");
+    let keys = Arc::new(opc_key::MemoryKeyProvider::new());
+    keys.insert_active_key(
+        opc_key::KeyId::new("recovery-read-budget-key").unwrap(),
+        opc_key::KeyPurpose::Session,
+        tenant.clone(),
+        opc_key::Zeroizing::new([0x71; 32]),
+    )
+    .unwrap();
+    let raw = Arc::new(super::worker_lease::RenewalBackend::new());
+    let store = SessionStore::new(EncryptingSessionBackend::new(
+        raw.clone(),
+        keys,
+        "recovery-read-budget",
+    ));
+    let lab = lab_with_store(store, tenant, 3).await;
+    let reads_before = raw.reads.load(Ordering::SeqCst);
+    let writes_before = raw.writes.load(Ordering::SeqCst);
+    let parent = lab
+        .authority
+        .recover_active(lab.backend.clone(), lab.parent.clone())
+        .await
+        .unwrap();
+    let reads = raw.reads.load(Ordering::SeqCst) - reads_before;
+    let writes = raw.writes.load(Ordering::SeqCst) - writes_before;
+    // The recovered authority must remain usable for the exact protected
+    // parent/child lifecycle; a dropped read cannot substitute a fake claim.
+    let child = lab
+        .authority
+        .reconcile_bearer(
+            lab.backend.clone(),
+            parent,
+            lab.parent.clone(),
+            lab.child.clone(),
+        )
+        .await
+        .unwrap();
+    drop(
+        lab.authority
+            .retire(lab.backend.clone(), child, lab.child)
+            .await
+            .unwrap(),
+    );
+    drop(
+        lab.authority
+            .recover_active(lab.backend, lab.parent)
+            .await
+            .unwrap(),
+    );
+    assert_eq!(writes, 0);
+    assert_eq!(
+        reads, 3,
+        "active recovery repeated its pre-readback snapshot"
+    );
+}
+
+#[tokio::test]
+async fn active_recovery_requires_fresh_durable_read_after_backend_readback() {
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+
+    let tenant = TenantId::from_static("recovery-read-failure");
+    let keys = Arc::new(opc_key::MemoryKeyProvider::new());
+    keys.insert_active_key(
+        opc_key::KeyId::new("recovery-read-failure-key").unwrap(),
+        opc_key::KeyPurpose::Session,
+        tenant.clone(),
+        opc_key::Zeroizing::new([0x72; 32]),
+    )
+    .unwrap();
+    let raw = Arc::new(super::worker_lease::RenewalBackend::new());
+    let store = SessionStore::new(EncryptingSessionBackend::new(
+        raw.clone(),
+        keys,
+        "recovery-read-failure",
+    ));
+    let lab = lab_with_store(store, tenant, 3).await;
+    let backend = Arc::new(HeldAcknowledgement {
+        inner: lab.backend.clone(),
+        hold_next: AtomicBool::new(false),
+        read_calls: AtomicUsize::new(0),
+        entered: tokio::sync::Notify::new(),
+        release: tokio::sync::Notify::new(),
+    });
+    let writes_before = raw.writes.load(Ordering::SeqCst);
+    raw.reject_read
+        .store(raw.reads.load(Ordering::SeqCst) + 3, Ordering::SeqCst);
+    assert!(matches!(
+        lab.authority
+            .recover_active(backend.clone(), lab.parent.clone())
+            .await,
+        Err(GtpuSessionSelectorCoordinatorError::Namespace)
+    ));
+    assert_eq!(
+        backend.read_calls.load(Ordering::SeqCst),
+        1,
+        "the failed durable read must follow exact backend readback"
+    );
+    assert_eq!(raw.writes.load(Ordering::SeqCst), writes_before);
+    // Read-only uncertainty must neither fabricate success nor poison a
+    // settled parent or prevent its independent sibling's exact recovery.
+    for parent in [lab.parent, lab.sibling] {
+        drop(
+            lab.authority
+                .recover_active(lab.backend.clone(), parent)
+                .await
+                .unwrap(),
+        );
+    }
+}
+
+#[tokio::test]
 async fn retained_transition_snapshot_cannot_replace_a_later_active_generation() {
     let lab = lab(3).await;
     let parent = lab
@@ -246,6 +360,7 @@ async fn retained_transition_snapshot_cannot_replace_a_later_active_generation()
 struct HeldAcknowledgement {
     inner: Arc<GroupedGtpuDataplaneSimulation>,
     hold_next: std::sync::atomic::AtomicBool,
+    read_calls: std::sync::atomic::AtomicUsize,
     entered: tokio::sync::Notify,
     release: tokio::sync::Notify,
 }
@@ -296,6 +411,8 @@ impl GtpuDataplaneBackend for HeldAcknowledgement {
         &self,
         request: GtpuSessionSelectorReadbackRequest,
     ) -> Result<GtpuSessionSelectorBackendReceipt, crate::GtpuError> {
+        self.read_calls
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         self.inner.read_pdp_context_group_with_lease(request).await
     }
 
@@ -325,6 +442,7 @@ async fn unrelated_child_finishes_before_delayed_effect_acknowledgement() {
     let backend = Arc::new(HeldAcknowledgement {
         inner: lab.backend.clone(),
         hold_next: std::sync::atomic::AtomicBool::new(true),
+        read_calls: std::sync::atomic::AtomicUsize::new(0),
         entered: tokio::sync::Notify::new(),
         release: tokio::sync::Notify::new(),
     });
