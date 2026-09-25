@@ -5249,9 +5249,12 @@ async fn target_replacement_refuses_session_context_provider_and_content_substit
             1 => wrong.transport = ManagementAuditTransportCode::Internal,
             2 => wrong.outcome = ManagementAuditOutcomeCode::Success,
             _ => {
-                wrong.caller =
-                    AuditCaller::project(&fixture.privacy, "fixture-tenant", "fixture-other")
-                        .unwrap()
+                wrong.caller = crate::audit_authority::AuditCaller::project(
+                    &fixture.privacy,
+                    "fixture-tenant",
+                    "fixture-other",
+                )
+                .unwrap()
             }
         }
         assert!(
@@ -5398,9 +5401,10 @@ async fn target_replacement_preserves_original_lock_even_when_target_is_unchange
 async fn target_replacement_binds_absent_candidate_fallback_and_pending_owner() {
     use crate::audit_authority::{NetconfLockDatastore as Store, NetconfTargetReplacement};
     for persistent in [false, true] {
-        let (fixture, tentative) = pending_fixture(persistent).await;
+        let fixture = Fixture::new().await;
         let shared = fixture.backend.conn();
         let conn = shared.lock().await;
+        let tentative = fixture.pending_fixture(&conn, persistent);
         assert!(matches!(
             fixture.submit(&conn, &tentative),
             AuditOperationState::TargetV1(_)
