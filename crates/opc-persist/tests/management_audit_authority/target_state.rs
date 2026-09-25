@@ -744,3 +744,88 @@ async fn target_state_pruned_anchor_rejects_authenticated_older_rows_and_snapsho
     restore_rows(&conn, &current);
     validate().unwrap();
 }
+
+#[tokio::test]
+async fn target_state_result_must_match_the_retained_action_profile_and_successor() {
+    let fixture = Fixture::new().await;
+    let shared = fixture.backend.conn();
+    let conn = shared.lock().await;
+    fixture.active(&conn);
+    let discard = fixture.request(&conn, 2, 5, 0x61, 1);
+    fixture
+        .apply(
+            &conn,
+            AuditCommand::NetconfTarget(Box::new(TargetAuditCommandV1::Admit(discard.clone()))),
+            100,
+        )
+        .unwrap();
+    fixture.checkpoint(&conn);
+    let admitted = fixture.ledger(&conn);
+    let AuditOperationState::TargetV1(correct) = fixture.submit(&conn, &discard) else {
+        panic!("discard refused");
+    };
+    use crate::audit_authority::{CandidateGeneration, NetconfTargetResult, StartupRevision};
+    let wrong = [
+        NetconfTargetResult::new(
+            fixture.identity,
+            [0x7e; 16],
+            correct.state_digest(),
+            correct.outcome(),
+        )
+        .unwrap(),
+        NetconfTargetResult::new(
+            fixture.identity,
+            correct.profile_incarnation(),
+            correct.state_digest(),
+            NetconfAppliedOutcome::Startup {
+                revision: StartupRevision {
+                    authority: fixture.identity,
+                    value: 1,
+                },
+            },
+        )
+        .unwrap(),
+        NetconfTargetResult::new(
+            fixture.identity,
+            correct.profile_incarnation(),
+            correct.state_digest(),
+            NetconfAppliedOutcome::Candidate {
+                generation: CandidateGeneration {
+                    authority: fixture.identity,
+                    value: 2,
+                },
+            },
+        )
+        .unwrap(),
+    ];
+    for result in wrong {
+        let mut trial = admitted.clone();
+        let unchanged = serde_json::to_vec(&trial).unwrap();
+        assert!(
+            trial
+                .resolve(
+                    &fixture.key,
+                    discard.handle(),
+                    AuditOperationState::TargetV1(result)
+                )
+                .is_err(),
+            "mismatched retained target result accepted"
+        );
+        assert_eq!(
+            serde_json::to_vec(&trial).unwrap(),
+            unchanged,
+            "refused result changed the ledger"
+        );
+    }
+    let mut positive = admitted;
+    positive
+        .resolve(
+            &fixture.key,
+            discard.handle(),
+            AuditOperationState::TargetV1(correct),
+        )
+        .unwrap();
+    positive.seal_continuity(Some(&fixture.keys)).unwrap();
+    positive.validate(&fixture.key, fixture.identity).unwrap();
+    positive.validate_continuity(Some(&fixture.keys)).unwrap();
+}
