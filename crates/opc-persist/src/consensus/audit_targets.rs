@@ -1186,6 +1186,7 @@ impl TargetState {
                 let source_slot = match &effect.source {
                     Some(TargetSourceV1::Candidate { .. }) => 0,
                     Some(TargetSourceV1::Startup { .. }) if action == 15 => 1,
+                    Some(TargetSourceV1::CandidateFallback { .. }) if action == 15 => 0,
                     _ => return Err(AuditAuthorityError::RecoveryRequired),
                 };
                 let expected = effect.lock.as_ref().ok_or(bad)?;
@@ -1196,9 +1197,26 @@ impl TargetState {
                     return Err(bad);
                 }
                 let source = &self.targets[source_slot];
-                let blob = source.encrypted_envelope.as_ref().ok_or(bad)?;
-                if commit.record.schema_digest != blob.schema
-                    || commit.record.plaintext_digest != blob.plaintext_digest
+                let (schema, plaintext_digest) = if matches!(
+                    effect.source,
+                    Some(TargetSourceV1::CandidateFallback { .. })
+                ) {
+                    // check_source authenticated the exact absent generation and
+                    // running version/ciphertext. Compare the prepared destination
+                    // with that same source; never materialize or retire candidate.
+                    let (schema, plaintext): (Vec<u8>, Vec<u8>) = conn.query_row(
+                        "SELECT schema_digest,plaintext_digest FROM config_history ORDER BY version DESC LIMIT 1", [],
+                        |row| Ok((row.get(0)?, row.get(1)?))).map_err(|_| bad)?;
+                    (
+                        opc_types::SchemaDigest::from_bytes(schema.try_into().map_err(|_| bad)?),
+                        <[u8; 32]>::try_from(plaintext).map_err(|_| bad)?,
+                    )
+                } else {
+                    let blob = source.encrypted_envelope.as_ref().ok_or(bad)?;
+                    (blob.schema, blob.plaintext_digest)
+                };
+                if commit.record.schema_digest != schema
+                    || commit.record.plaintext_digest != plaintext_digest
                 {
                     return Err(bad);
                 }
