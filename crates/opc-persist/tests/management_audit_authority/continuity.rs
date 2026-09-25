@@ -906,3 +906,186 @@ async fn target_recovery_refuses_legacy_profile_without_reinterpreting_running_r
     assert_eq!(store.load_latest().await.unwrap().unwrap().record.tx_id, tx);
     store.shutdown().await.unwrap();
 }
+
+fn target_runtime_options(path: &std::path::Path) -> RetainedConfigOptions {
+    RetainedConfigOptions::new(
+        path,
+        RetainedConfigBinding::new(topology(), [0x31; 32], [0x61; 32])
+            .unwrap()
+            .with_profile(opc_persist::RetainedConfigProfile::NetconfTargetsV1),
+        RetainedConfigDurability::Ephemeral,
+        64 * 1024 * 1024,
+        Duration::from_secs(30),
+    )
+    .unwrap()
+}
+
+#[tokio::test]
+async fn target_runtime_refuses_opening_without_independent_continuity() {
+    let directory = tempfile::tempdir().unwrap();
+    let backend = SqliteBackend::provision_config_authority(
+        target_runtime_options(&directory.path().join("authority.sqlite")),
+        audit_key(),
+    )
+    .await
+    .unwrap();
+    let opened = ConsensusConfigStore::open(
+        topology(),
+        backend,
+        directory.path().join("snapshots"),
+        BTreeMap::new(),
+    )
+    .await;
+    match opened {
+        Ok(store) => {
+            store.shutdown().await.unwrap();
+            panic!("target runtime opened without independent continuity");
+        }
+        Err(error) => assert!(
+            matches!(error, ConfigConsensusOpenError::AuditContinuityUnavailable),
+            "target runtime must refuse missing continuity before engine opening: {error:?}"
+        ),
+    }
+}
+
+#[tokio::test]
+async fn target_runtime_prepares_and_retains_one_native_device_operation() {
+    let directory = tempfile::tempdir().unwrap();
+    let legacy_external = Arc::new(ExternalCheckpointFixture::default());
+    let legacy = open(
+        &directory.path().join("legacy.sqlite"),
+        &directory.path().join("legacy-snapshots"),
+        legacy_external.clone(),
+        &[1, 2],
+        true,
+    )
+    .await
+    .unwrap();
+    legacy.initialize_cluster().await.unwrap();
+    legacy
+        .initialize_audit_authority(&privacy(), AuditLedgerLimits::new(12, 4).unwrap())
+        .await
+        .unwrap();
+    assert!(legacy_external.value.lock().unwrap().is_some());
+    legacy.shutdown().await.unwrap();
+    drop(legacy);
+
+    let database = directory.path().join("targets.sqlite");
+    let snapshots = directory.path().join("target-snapshots");
+    let external = Arc::new(ExternalCheckpointFixture::default());
+    let backend =
+        SqliteBackend::provision_config_authority(target_runtime_options(&database), audit_key())
+            .await
+            .unwrap();
+    let store = ConsensusConfigStore::open_with_audit_continuity(
+        topology(),
+        backend,
+        &snapshots,
+        BTreeMap::new(),
+        policy(external.clone(), &[1, 2]),
+    )
+    .await
+    .expect("selected target runtime must open with independent continuity");
+    store.initialize_cluster().await.unwrap();
+    store
+        .initialize_audit_authority(&privacy(), AuditLedgerLimits::new(12, 4).unwrap())
+        .await
+        .unwrap();
+    let event = ManagementAuditEventRecord::try_new(
+        [0xd1; 16],
+        ManagementAuditInstant::try_new(100, 0, 1, ManagementAuditTimeSourceCode::NodeClock)
+            .unwrap(),
+        "audit-tenant-canary",
+        "audit-principal-canary",
+        ManagementAuditTransportCode::Internal,
+        ManagementAuditOperationCode::Exec,
+        ManagementAuditOutcomeCode::Intent,
+        None::<&str>,
+        ["/fixture:config"],
+        None::<&str>,
+    )
+    .unwrap();
+    let prepared = store
+        .prepare_netconf_device(&privacy(), &event, Duration::from_secs(60))
+        .await;
+    if prepared.is_err() {
+        store.shutdown().await.unwrap();
+    }
+    let prepared =
+        prepared.expect("selected target runtime rejected valid original device preparation");
+    let intent = applied(
+        store
+            .admit_netconf_target_local(prepared.mutation(), caller())
+            .await,
+    );
+    assert_eq!(intent.state(), AuditOperationState::Intent);
+    let known = applied(
+        store
+            .submit_netconf_target_local(prepared.mutation(), &intent, caller())
+            .await,
+    );
+    assert!(matches!(
+        known.state(),
+        AuditOperationState::TargetV1(result)
+            if matches!(result.outcome(), NetconfAppliedOutcome::Lifecycle { .. })
+    ));
+    store
+        .complete_required_audit_outcome(&known, caller())
+        .await
+        .unwrap();
+    let owner = store
+        .claim_netconf_device_owner(&prepared, &known, caller())
+        .await
+        .unwrap();
+    store.verify_netconf_device_owner(&owner).await.unwrap();
+    let original = store
+        .recover_netconf_target(prepared.mutation().handle(), caller())
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(&original, prepared.mutation());
+    let original_receipt = store
+        .lookup_audit_operation(original.handle(), caller())
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(original_receipt.state(), known.state());
+    assert!(original_receipt.terminal_recorded());
+    assert!(store.load_latest().await.unwrap().is_none());
+    let checkpoint = external.value.lock().unwrap().clone();
+    store.shutdown().await.unwrap();
+    drop(store);
+
+    let backend =
+        SqliteBackend::reopen_config_authority(target_runtime_options(&database), audit_key())
+            .await
+            .unwrap();
+    let reopened = ConsensusConfigStore::open_with_audit_continuity(
+        topology(),
+        backend,
+        &snapshots,
+        BTreeMap::new(),
+        policy(external.clone(), &[1, 2]),
+    )
+    .await
+    .unwrap();
+    reopened.initialize_cluster().await.unwrap();
+    assert!(reopened.verify_netconf_device_owner(&owner).await.is_err());
+    let recovered = reopened
+        .recover_netconf_target(prepared.mutation().handle(), caller())
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(&recovered, prepared.mutation());
+    assert_eq!(
+        reopened
+            .lookup_audit_operation(recovered.handle(), caller())
+            .await
+            .unwrap()
+            .unwrap(),
+        original_receipt
+    );
+    assert_eq!(external.value.lock().unwrap().clone(), checkpoint);
+    assert!(reopened.load_latest().await.unwrap().is_none());
+    reopened.shutdown().await.unwrap();
+}
