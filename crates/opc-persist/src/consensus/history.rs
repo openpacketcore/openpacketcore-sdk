@@ -9,7 +9,7 @@ use std::io;
 
 use hmac::{Hmac, KeyInit, Mac};
 use opc_consensus::ConsensusIdentity;
-use rusqlite::{params, Connection, OptionalExtension};
+use rusqlite::{Connection, OptionalExtension, params};
 use sha2::{Digest, Sha256};
 
 use super::sqlite::SqliteWorkCancellation;
@@ -214,15 +214,25 @@ fn record_metadata_digest(
     // publication and replay, plus its labels and lifecycle audit. They never
     // expose that content outside the existing persistence authority.
     for (domain, sql) in [
-        (b"record\0".as_slice(), "SELECT parent_tx_id, committed_at, principal, source, schema_digest, plaintext_digest, rollback_point, rollback_label, confirmed_deadline, confirmed_at FROM config_history WHERE tx_id = ?1"),
-        (b"labels\0".as_slice(), "SELECT label, created_at FROM rollback_labels WHERE tx_id = ?1 ORDER BY label ASC"),
-        (b"lifecycle\0".as_slice(), "SELECT id, action, principal, occurred_at, details FROM config_lifecycle_audit WHERE tx_id = ?1 ORDER BY id ASC"),
+        (
+            b"record\0".as_slice(),
+            "SELECT parent_tx_id, committed_at, principal, source, schema_digest, plaintext_digest, rollback_point, rollback_label, confirmed_deadline, confirmed_at FROM config_history WHERE tx_id = ?1",
+        ),
+        (
+            b"labels\0".as_slice(),
+            "SELECT label, created_at FROM rollback_labels WHERE tx_id = ?1 ORDER BY label ASC",
+        ),
+        (
+            b"lifecycle\0".as_slice(),
+            "SELECT id, action, principal, occurred_at, details FROM config_lifecycle_audit WHERE tx_id = ?1 ORDER BY id ASC",
+        ),
     ] {
         cancellation.check_io()?;
         digest.update(domain);
         let mut statement = conn.prepare(sql).map_err(database_error)?;
         let width = statement.column_count();
-        let mut rows = statement.query([head.tx_id.as_uuid().as_bytes().as_slice()])
+        let mut rows = statement
+            .query([head.tx_id.as_uuid().as_bytes().as_slice()])
             .map_err(database_error)?;
         let mut count = 0_u64;
         while let Some(row) = rows.next().map_err(database_error)? {
@@ -239,12 +249,20 @@ fn record_metadata_digest(
                     }
                     ValueRef::Text(value) => {
                         digest.update([2]);
-                        digest.update(u64::try_from(value.len()).map_err(|_| corrupt())?.to_be_bytes());
+                        digest.update(
+                            u64::try_from(value.len())
+                                .map_err(|_| corrupt())?
+                                .to_be_bytes(),
+                        );
                         digest.update(value);
                     }
                     ValueRef::Blob(value) => {
                         digest.update([3]);
-                        digest.update(u64::try_from(value.len()).map_err(|_| corrupt())?.to_be_bytes());
+                        digest.update(
+                            u64::try_from(value.len())
+                                .map_err(|_| corrupt())?
+                                .to_be_bytes(),
+                        );
                         digest.update(value);
                     }
                     ValueRef::Real(_) => return Err(corrupt()),
@@ -560,8 +578,29 @@ pub(crate) fn validate_access_sync(
     consensus_required: bool,
     cancellation: &SqliteWorkCancellation,
 ) -> io::Result<()> {
-    if consensus_required || has_consensus_metadata_sync(conn)? {
-        super::sqlite::validate_live_history_schema_sync(conn, cancellation)?;
+    validate_access_for_profile_sync(
+        conn,
+        key,
+        consensus_required,
+        crate::RetainedConfigProfile::Legacy,
+        cancellation,
+    )
+}
+
+/// The selection comes from the admitted backend, never from stored row tags.
+/// The existing read/apply transaction pins both history and target validation.
+pub(crate) fn validate_access_for_profile_sync(
+    conn: &Connection,
+    key: &AuditKey,
+    consensus_required: bool,
+    profile: crate::RetainedConfigProfile,
+    cancellation: &SqliteWorkCancellation,
+) -> io::Result<()> {
+    if consensus_required
+        || profile != crate::RetainedConfigProfile::Legacy
+        || has_consensus_metadata_sync(conn)?
+    {
+        super::sqlite::validate_live_history_schema_for_profile(conn, cancellation, profile)?;
     }
     let Some(state) = load_state(conn, key)? else {
         return if consensus_required {
@@ -570,6 +609,9 @@ pub(crate) fn validate_access_sync(
             Ok(())
         };
     };
+    if profile == crate::RetainedConfigProfile::NetconfTargetsV1 {
+        super::audit_targets::validate_inactive_sync(conn, key, state.identity, cancellation)?;
+    }
     validate_limited_state(conn, &state)?;
     if record_chain_sync(conn, cancellation)? != state.record_chain {
         return Err(corrupt());
