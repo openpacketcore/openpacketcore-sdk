@@ -1,5 +1,6 @@
 mod continuity;
 mod legacy_outcome_bytes;
+mod target_outcome_bytes;
 #[cfg(unix)]
 mod retained_opening;
 
