@@ -672,5 +672,10 @@ cannot extend the worker's lifetime. It is not a distributed lease: required
 audit admission and retained pending/source guards still fence effects across
 workers. After recovery, serving requires an explicit admitted device start.
 
+Within that device entry, a different pending confirmation replaces the cached
+original only when its authenticated tentative running revision strictly increases.
+An older or equal revision is refused, and repeated reads of the same exact pending
+view retain the same original attempt. Old read clones keep their known results.
+
 Component cache/reopen fixtures do not establish process-crash, public runtime,
 provider or leadership availability. Those remain full-profile qualification gates.

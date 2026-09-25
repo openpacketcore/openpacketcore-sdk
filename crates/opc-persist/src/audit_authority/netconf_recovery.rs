@@ -294,6 +294,11 @@ impl NetconfRecoveryOwner {
                 }
                 return Ok(original.clone());
             }
+            // A different pending operation requires a newer tentative revision.
+            // A delayed read must not discard its retained original attempt.
+            if view.running_version <= original.running_version() {
+                return Err(AuditAuthorityError::RollbackDetected);
+            }
         }
         let read = NetconfRollbackRead(Arc::new(NetconfRollbackState {
             view,
