@@ -1023,7 +1023,7 @@ impl TargetState {
             {
                 return Err(bad);
             }
-            if matches!(action, 3 | 4 | 5)
+            if matches!(action, 3..=5)
                 && (effect.caller != pending.caller
                     || effect
                         .lock
