@@ -9232,7 +9232,7 @@ async fn target_rollback_sdk_provider_cancellation_and_later_device_change_admit
         let admin = fixture.device_event(243);
         let effect = fixture
             .device_view(&conn)
-            .prepare(&admin, deadline + 60, [0x58; 16], [0x59; 16])
+            .prepare(&admin, 160, [0x58; 16], [0x59; 16])
             .unwrap();
         let device = fixture.rebind_at(&conn, fixture.prepare(effect, admin), deadline);
         assert!(matches!(
@@ -9320,7 +9320,7 @@ async fn target_rollback_sdk_preserves_candidate_and_retained_result_after_new_d
     let event = fixture.device_event(243);
     let effect = fixture
         .device_view(&conn)
-        .prepare(&event, deadline + 60, [0x58; 16], [0x59; 16])
+        .prepare(&event, 160, [0x58; 16], [0x59; 16])
         .unwrap();
     let device = fixture.rebind_at(&conn, fixture.prepare(effect, event), deadline);
     assert!(matches!(

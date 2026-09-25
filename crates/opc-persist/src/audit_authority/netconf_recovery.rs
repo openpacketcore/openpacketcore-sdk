@@ -317,7 +317,7 @@ impl NetconfRecoveryOwner {
 /// No user credential or caller-selected internal cause is accepted here.
 pub struct NetconfRollback<'a> {
     pub(crate) frozen: &'a NetconfRollbackRead,
-    pub(crate) commit: crate::AttestedCommit,
+    pub(crate) commit: crate::AttestedConfigCommit,
     pub(crate) provider: &'a dyn opc_key::KeyProvider,
 }
 
@@ -325,7 +325,7 @@ impl<'a> NetconfRollback<'a> {
     /// Bind the original read and existing provider before required admission.
     pub fn new(
         frozen: &'a NetconfRollbackRead,
-        commit: crate::AttestedCommit,
+        commit: crate::AttestedConfigCommit,
         provider: &'a dyn opc_key::KeyProvider,
     ) -> Self {
         Self {
