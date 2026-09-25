@@ -596,3 +596,5 @@ async fn target_profile_rejects_an_internal_named_index_with_valid_sqlite_integr
         "rejection changed retained files"
     );
 }
+
+mod profile_reads;
