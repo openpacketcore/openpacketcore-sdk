@@ -1923,3 +1923,41 @@ impl PreparedTargetMutation {
                 Some(TargetResolutionV1::EndSession { session: incarnation }) if incarnation == session.incarnation())
     }
 }
+
+impl PreparedTargetMutation {
+    // The caller supplies an authenticated quorum-current ledger after checking
+    // its independent checkpoint. This checks the exact original operation,
+    // never a timeout, an absent receipt, or another operation's terminal state.
+    pub(crate) fn verify_settled_cleanup_rejection(
+        &self,
+        session: &crate::audit_authority::NetconfSessionOwner,
+        ledger: &LedgerState,
+        key: &AuditKey,
+        now: i64,
+    ) -> Result<(), AuditAuthorityError> {
+        session.cleanup_context(&self.handle.body.event)?;
+        self.verify_effect(key)?;
+        if !self.is_session_cleanup_for(session)
+            || ledger.recover_target(key, self.handle(), session.caller)? != *self
+        {
+            return Err(AuditAuthorityError::BindingMismatch);
+        }
+        let original = ledger
+            .operations
+            .iter()
+            .find(|operation| operation.handle == self.handle)
+            .ok_or(AuditAuthorityError::BindingMismatch)?;
+        if now < self.handle.body.expires_at
+            || original.state != AuditOperationState::Rejected
+            || !original.terminal_recorded
+            || ledger
+                .continuity
+                .as_ref()
+                .and_then(|chain| chain.checkpoint.as_ref())
+                .is_none_or(|checkpoint| checkpoint.sequence() < original.last_sequence)
+        {
+            return Err(AuditAuthorityError::RecoveryRequired);
+        }
+        Ok(())
+    }
+}

@@ -1283,3 +1283,89 @@ impl ConsensusConfigStore {
         Ok(original)
     }
 }
+
+impl ConsensusConfigStore {
+    /// Prepare a separately authorized cleanup attempt after the exact original
+    /// expired and was definitively rejected with its terminal checkpoint settled.
+    /// A timeout, absent/pruned operation, outstanding intent, or known applied
+    /// cleanup cannot authorize replacement. The original result stays unchanged.
+    ///
+    /// `previous` must be the attempt retained by this exact inactive session.
+    /// Supply a new Internal Exec Intent for the same authenticated caller and
+    /// projection. Concurrent identical retries select one successor before any
+    /// admission; different requests or stale predecessors are refused. Keep its
+    /// original handle through ordinary target admission, submission and recovery.
+    ///
+    /// Preparation never clears the worker's cleanup fence, reactivates a session,
+    /// or changes a confirmed deadline/rollback parent. End-session cleanup and
+    /// confirmed rollback remain separate retained obligations. Store/checkpoint
+    /// unavailability preserves the original attempt and permits no effect.
+    pub async fn prepare_netconf_session_cleanup_successor(
+        &self,
+        session: &crate::audit_authority::NetconfSessionOwner,
+        previous: &crate::audit_authority::PreparedTargetMutation,
+        privacy: &dyn AuditPrivacyProjection,
+        event: &ManagementAuditEventRecord,
+        lifetime: std::time::Duration,
+    ) -> Result<crate::audit_authority::PreparedTargetMutation, AuditAuthorityError> {
+        self.require_netconf_target_profile()?;
+        if !session.device.worker.belongs_to(&self.inner) {
+            return Err(AuditAuthorityError::BindingMismatch);
+        }
+        if lifetime.subsec_nanos() != 0 || !(1..=3600).contains(&lifetime.as_secs()) {
+            return Err(AuditAuthorityError::InvalidInput);
+        }
+        self.verify_netconf_target(previous, session.caller)?;
+        let event = ProjectedAuditEvent::project(privacy, event)?;
+        if let Some(original) = session.successor_cleanup(previous, &event, lifetime)? {
+            self.verify_netconf_target(&original, session.caller)?;
+            self.preflight_netconf_target(&original).await?;
+            return Ok(original);
+        }
+        let issued_at = self
+            .inner
+            .clock
+            .now_utc()
+            .as_offset_datetime()
+            .unix_timestamp();
+        let expires_at = issued_at
+            .checked_add(lifetime.as_secs() as i64)
+            .ok_or(AuditAuthorityError::InvalidInput)?;
+        let ledger = self.read_audit_ledger().await?;
+        previous.verify_settled_cleanup_rejection(
+            session,
+            &ledger,
+            self.inner.backend.audit_key(),
+            issued_at,
+        )?;
+        let view = self.read_netconf_device_view().await?;
+        let effect = view.prepare_session_cleanup(session, &event, expires_at)?;
+        let digest = effect.digest(self.inner.backend.audit_key())?;
+        let binding =
+            AuditOperationBinding::project(privacy, &event, view.running_version, &digest)?;
+        let handle = AuditOperationHandle::issue(
+            HandleBody {
+                version: 1,
+                identity: self.inner.identity,
+                binding,
+                event,
+                issued_at,
+                expires_at,
+                nonce: *uuid::Uuid::new_v4().as_bytes(),
+                key_epoch: self.inner.backend.audit_key().epoch(),
+                mutation: Some(digest),
+            },
+            self.inner.backend.audit_key(),
+        )?;
+        let prepared = crate::audit_authority::PreparedTargetMutation { handle, effect };
+        let original = session.retain_cleanup_successor(
+            previous,
+            prepared,
+            &ledger,
+            self.inner.backend.audit_key(),
+            issued_at,
+        )?;
+        self.preflight_netconf_target(&original).await?;
+        Ok(original)
+    }
+}

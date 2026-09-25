@@ -3266,3 +3266,468 @@ async fn target_session_cleanup_discards_only_owned_candidate_and_preserves_fore
         known.state()
     );
 }
+
+impl Fixture {
+    fn cleanup_at(
+        &self,
+        conn: &Connection,
+        session: &crate::audit_authority::NetconfSessionOwner,
+        request: u8,
+        now: i64,
+    ) -> PreparedTargetMutation {
+        let event = self.device_event(request);
+        let effect = self
+            .device_view(conn)
+            .prepare_session_cleanup(session, &event, now + 60)
+            .unwrap();
+        self.rebind_at(conn, self.prepare(effect, event), now)
+    }
+
+    fn expire_cleanup(&self, conn: &Connection, original: &PreparedTargetMutation) {
+        self.apply(
+            conn,
+            AuditCommand::NetconfTarget(Box::new(TargetAuditCommandV1::Admit(original.clone()))),
+            original.handle.body.issued_at,
+        )
+        .unwrap();
+        self.checkpoint(conn);
+        assert!(self
+            .apply(
+                conn,
+                AuditCommand::NetconfTarget(Box::new(TargetAuditCommandV1::Apply(
+                    original.clone()
+                ))),
+                original.handle.body.expires_at,
+            )
+            .is_err());
+        assert_eq!(
+            self.ledger(conn)
+                .lookup(&self.key, original.handle(), original.effect.caller)
+                .unwrap()
+                .unwrap()
+                .state(),
+            AuditOperationState::Rejected
+        );
+    }
+}
+
+#[tokio::test]
+async fn target_cleanup_successor_requires_expiry_rejection_terminal_and_checkpoint() {
+    let fixture = Fixture::new().await;
+    let shared = fixture.backend.conn();
+    let conn = shared.lock().await;
+    fixture.active(&conn);
+    let worker = std::sync::Arc::new(());
+    let session = fixture.session_owner(&conn, &worker, 0x61);
+    session.invalidate();
+    let original = session
+        .retain_cleanup(fixture.cleanup_at(&conn, &session, 201, 100))
+        .unwrap();
+    let original_bytes = original.encode().unwrap();
+    let successor = fixture.cleanup_at(&conn, &session, 202, 160);
+    let before = target_rows(&conn);
+    assert!(
+        session
+            .retain_cleanup_successor(
+                &original,
+                successor.clone(),
+                &fixture.ledger(&conn),
+                &fixture.key,
+                160
+            )
+            .is_err(),
+        "missing original is not rejection"
+    );
+    fixture
+        .apply(
+            &conn,
+            AuditCommand::NetconfTarget(Box::new(TargetAuditCommandV1::Admit(original.clone()))),
+            100,
+        )
+        .unwrap();
+    fixture.checkpoint(&conn);
+    assert!(
+        matches!(
+            session.retain_cleanup_successor(
+                &original,
+                successor.clone(),
+                &fixture.ledger(&conn),
+                &fixture.key,
+                160
+            ),
+            Err(AuditAuthorityError::RecoveryRequired)
+        ),
+        "expired intent is still unresolved"
+    );
+    assert!(fixture
+        .apply(
+            &conn,
+            AuditCommand::NetconfTarget(Box::new(TargetAuditCommandV1::Apply(original.clone()))),
+            160
+        )
+        .is_err());
+    assert_eq!(
+        fixture
+            .ledger(&conn)
+            .lookup(&fixture.key, original.handle(), session.caller)
+            .unwrap()
+            .unwrap()
+            .state(),
+        AuditOperationState::Rejected
+    );
+    assert!(
+        matches!(
+            session.retain_cleanup_successor(
+                &original,
+                successor.clone(),
+                &fixture.ledger(&conn),
+                &fixture.key,
+                160
+            ),
+            Err(AuditAuthorityError::RecoveryRequired)
+        ),
+        "rejection without terminal is unsettled"
+    );
+    fixture
+        .apply(&conn, AuditCommand::Terminal(original.handle.clone()), 160)
+        .unwrap();
+    assert!(
+        matches!(
+            session.retain_cleanup_successor(
+                &original,
+                successor.clone(),
+                &fixture.ledger(&conn),
+                &fixture.key,
+                160
+            ),
+            Err(AuditAuthorityError::RecoveryRequired)
+        ),
+        "terminal without independent checkpoint is unsettled"
+    );
+    fixture.checkpoint(&conn);
+    assert!(
+        matches!(
+            session.retain_cleanup_successor(
+                &original,
+                successor.clone(),
+                &fixture.ledger(&conn),
+                &fixture.key,
+                159
+            ),
+            Err(AuditAuthorityError::RecoveryRequired)
+        ),
+        "original expiry must have elapsed"
+    );
+    let changes = conn.total_changes();
+    assert_eq!(
+        session
+            .retain_cleanup_successor(
+                &original,
+                successor.clone(),
+                &fixture.ledger(&conn),
+                &fixture.key,
+                160
+            )
+            .unwrap(),
+        successor
+    );
+    assert_eq!(
+        conn.total_changes(),
+        changes,
+        "preparation must not admit or apply cleanup"
+    );
+    assert_eq!(target_rows(&conn), before);
+    assert_eq!(original.encode().unwrap(), original_bytes);
+    assert_eq!(
+        session.require_active(),
+        Err(AuditAuthorityError::BindingMismatch)
+    );
+    assert!(fixture
+        .ledger(&conn)
+        .lookup(&fixture.key, successor.handle(), session.caller)
+        .unwrap()
+        .is_none());
+    let reopened = Connection::open(fixture.directory.path().join("authority.sqlite")).unwrap();
+    assert_eq!(
+        fixture
+            .ledger(&reopened)
+            .recover_target(&fixture.key, original.handle(), session.caller)
+            .unwrap(),
+        original
+    );
+    assert_eq!(
+        fixture
+            .ledger(&reopened)
+            .lookup(&fixture.key, original.handle(), session.caller)
+            .unwrap()
+            .unwrap()
+            .state(),
+        AuditOperationState::Rejected
+    );
+}
+
+#[tokio::test]
+async fn target_cleanup_successor_selects_one_concurrent_attempt_and_rejects_stale_predecessors() {
+    let fixture = Fixture::new().await;
+    let shared = fixture.backend.conn();
+    let conn = shared.lock().await;
+    fixture.active(&conn);
+    let worker = std::sync::Arc::new(());
+    let session = fixture.session_owner(&conn, &worker, 0x61);
+    session.invalidate();
+    let original = session
+        .retain_cleanup(fixture.cleanup_at(&conn, &session, 203, 100))
+        .unwrap();
+    fixture.expire_cleanup(&conn, &original);
+    fixture.settle(&conn, &original);
+    let first = fixture.cleanup_at(&conn, &session, 204, 160);
+    let later = fixture.cleanup_at(&conn, &session, 204, 161);
+    assert_ne!(first, later);
+    let ledger = fixture.ledger(&conn);
+    let key = fixture.key.clone();
+    let before = target_rows(&conn);
+    let barrier = std::sync::Barrier::new(2);
+    let outcomes = std::thread::scope(|scope| {
+        let one = scope.spawn(|| {
+            barrier.wait();
+            session
+                .retain_cleanup_successor(&original, first.clone(), &ledger, &key, 161)
+                .unwrap()
+        });
+        let two = scope.spawn(|| {
+            barrier.wait();
+            session
+                .clone()
+                .retain_cleanup_successor(&original, later.clone(), &ledger, &key, 161)
+                .unwrap()
+        });
+        (one.join().unwrap(), two.join().unwrap())
+    });
+    let selected = outcomes.0;
+    assert_eq!(selected, outcomes.1);
+    assert!(selected == first || selected == later);
+    assert_eq!(
+        session
+            .successor_cleanup(
+                &original,
+                &fixture.device_event(204),
+                Duration::from_secs(60)
+            )
+            .unwrap(),
+        Some(selected.clone())
+    );
+    assert!(matches!(
+        session.successor_cleanup(
+            &original,
+            &fixture.device_event(205),
+            Duration::from_secs(60)
+        ),
+        Err(AuditAuthorityError::BindingMismatch)
+    ));
+    assert!(matches!(
+        session.successor_cleanup(
+            &original,
+            &fixture.device_event(204),
+            Duration::from_secs(61)
+        ),
+        Err(AuditAuthorityError::BindingMismatch)
+    ));
+    assert!(matches!(
+        session.successor_cleanup(
+            &original,
+            &fixture.device_event(203),
+            Duration::from_secs(60)
+        ),
+        Err(AuditAuthorityError::BindingMismatch)
+    ));
+    let competing = fixture.cleanup_at(&conn, &session, 205, 162);
+    assert!(matches!(
+        session.retain_cleanup_successor(&original, competing, &ledger, &key, 162),
+        Err(AuditAuthorityError::BindingMismatch)
+    ));
+    assert_eq!(target_rows(&conn), before);
+    fixture.expire_cleanup(&conn, &selected);
+    fixture.settle(&conn, &selected);
+    let next = fixture.cleanup_at(&conn, &session, 206, 222);
+    assert_eq!(
+        session
+            .retain_cleanup_successor(
+                &selected,
+                next.clone(),
+                &fixture.ledger(&conn),
+                &fixture.key,
+                222
+            )
+            .unwrap(),
+        next
+    );
+    assert!(
+        matches!(
+            session.successor_cleanup(
+                &original,
+                &fixture.device_event(206),
+                Duration::from_secs(60)
+            ),
+            Err(AuditAuthorityError::BindingMismatch)
+        ),
+        "an old predecessor cannot select the current attempt"
+    );
+    assert!(matches!(
+        session.retain_cleanup_successor(
+            &original,
+            next.clone(),
+            &fixture.ledger(&conn),
+            &fixture.key,
+            222
+        ),
+        Err(AuditAuthorityError::BindingMismatch)
+    ));
+    assert_eq!(
+        session
+            .clone()
+            .original_cleanup(&fixture.device_event(206), Duration::from_secs(60))
+            .unwrap(),
+        Some(next)
+    );
+    for old in [&original, &selected] {
+        assert_eq!(
+            fixture
+                .ledger(&conn)
+                .recover_target(&fixture.key, old.handle(), session.caller)
+                .unwrap(),
+            *old
+        );
+        assert_eq!(
+            fixture
+                .ledger(&conn)
+                .lookup(&fixture.key, old.handle(), session.caller)
+                .unwrap()
+                .unwrap()
+                .state(),
+            AuditOperationState::Rejected
+        );
+    }
+    assert_eq!(target_rows(&conn), before);
+}
+
+#[tokio::test]
+async fn target_cleanup_successor_refuses_applied_cleanup_and_other_session_scope() {
+    let fixture = Fixture::new().await;
+    let shared = fixture.backend.conn();
+    let conn = shared.lock().await;
+    fixture.active(&conn);
+    let worker = std::sync::Arc::new(());
+    let session = fixture.session_owner(&conn, &worker, 0x61);
+    session.invalidate();
+    let original = session
+        .retain_cleanup(fixture.cleanup_at(&conn, &session, 207, 100))
+        .unwrap();
+    assert!(matches!(
+        fixture.submit(&conn, &original),
+        AuditOperationState::TargetV1(_)
+    ));
+    fixture.settle(&conn, &original);
+    let successor = fixture.cleanup_at(&conn, &session, 208, 160);
+    assert!(matches!(
+        session.retain_cleanup_successor(
+            &original,
+            successor,
+            &fixture.ledger(&conn),
+            &fixture.key,
+            160
+        ),
+        Err(AuditAuthorityError::RecoveryRequired)
+    ));
+    let other = fixture.session_owner(&conn, &worker, 0x62);
+    other.invalidate();
+    assert!(matches!(
+        other.successor_cleanup(
+            &original,
+            &fixture.device_event(208),
+            Duration::from_secs(60)
+        ),
+        Err(AuditAuthorityError::BindingMismatch)
+    ));
+    assert_eq!(
+        session
+            .original_cleanup(&fixture.device_event(207), Duration::from_secs(60))
+            .unwrap(),
+        Some(original)
+    );
+}
+
+#[tokio::test]
+async fn target_cleanup_successor_refuses_pruned_original_without_changing_pending_rollback() {
+    let fixture = Fixture::new().await;
+    let shared = fixture.backend.conn();
+    let conn = shared.lock().await;
+    let tentative = fixture.pending_fixture(&conn, true);
+    assert!(matches!(
+        fixture.submit(&conn, &tentative),
+        AuditOperationState::TargetV1(_)
+    ));
+    fixture.settle(&conn, &tentative);
+    let worker = std::sync::Arc::new(());
+    let session = fixture.session_owner(&conn, &worker, 0x61);
+    session.invalidate();
+    let original = session
+        .retain_cleanup(fixture.cleanup_at(&conn, &session, 209, 100))
+        .unwrap();
+    fixture.expire_cleanup(&conn, &original);
+    fixture.settle(&conn, &original);
+    let before = target_rows(&conn);
+    let successor = fixture.cleanup_at(&conn, &session, 210, 200);
+    let ledger = fixture.ledger(&conn);
+    assert_eq!(
+        original.verify_settled_cleanup_rejection(&session, &ledger, &fixture.key, 200),
+        Ok(())
+    );
+    // The fixture is the authority. This is a real acknowledged-prefix prune,
+    // not a recipient verification guarantee or a fabricated missing receipt.
+    let mut body = ledger
+        .continuity
+        .as_ref()
+        .unwrap()
+        .checkpoint
+        .as_ref()
+        .unwrap()
+        .body
+        .clone();
+    body.acknowledged_export = [0x78; 32];
+    let export = AuditCheckpoint::issue(&fixture.keys, body).unwrap();
+    fixture
+        .apply(&conn, AuditCommand::AcknowledgeExport(export.clone()), 200)
+        .unwrap();
+    fixture
+        .apply(
+            &conn,
+            AuditCommand::Prune {
+                through: ledger.sequence,
+                checkpoint: export,
+            },
+            200,
+        )
+        .unwrap();
+    let pruned = fixture.ledger(&conn);
+    assert!(pruned
+        .lookup(&fixture.key, original.handle(), session.caller)
+        .unwrap()
+        .is_none());
+    assert!(
+        session
+            .retain_cleanup_successor(&original, successor, &pruned, &fixture.key, 200)
+            .is_err(),
+        "pruned rejection cannot authorize a new cleanup"
+    );
+    assert_eq!(
+        session
+            .original_cleanup(&fixture.device_event(209), Duration::from_secs(60))
+            .unwrap(),
+        Some(original)
+    );
+    assert_eq!(
+        target_rows(&conn),
+        before,
+        "pending parent and deadline must remain unchanged"
+    );
+}

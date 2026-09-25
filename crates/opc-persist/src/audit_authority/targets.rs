@@ -556,7 +556,7 @@ impl NetconfLockDatastore {
 struct NetconfSessionState {
     incarnation: [u8; 16],
     active: std::sync::atomic::AtomicBool,
-    cleanup: std::sync::OnceLock<super::PreparedTargetMutation>,
+    cleanup: std::sync::Mutex<Option<NetconfCleanupAttempt>>,
 }
 
 /// Authenticated session incarnation under one SDK-issued device owner.
@@ -584,7 +584,7 @@ impl NetconfSessionOwner {
             state: std::sync::Arc::new(NetconfSessionState {
                 incarnation,
                 active: std::sync::atomic::AtomicBool::new(true),
-                cleanup: std::sync::OnceLock::new(),
+                cleanup: std::sync::Mutex::new(None),
             }),
         })
     }
@@ -660,6 +660,11 @@ impl fmt::Debug for NetconfLockLease {
     }
 }
 
+struct NetconfCleanupAttempt {
+    prepared: super::PreparedTargetMutation,
+    predecessor: Option<AuditOperationHandle>,
+}
+
 impl NetconfSessionOwner {
     pub(crate) fn cleanup_context(
         &self,
@@ -676,15 +681,11 @@ impl NetconfSessionOwner {
         Ok(())
     }
 
-    pub(crate) fn original_cleanup(
-        &self,
+    fn matching_cleanup(
+        original: &super::PreparedTargetMutation,
         event: &super::ProjectedAuditEvent,
         lifetime: std::time::Duration,
-    ) -> Result<Option<super::PreparedTargetMutation>, AuditAuthorityError> {
-        self.cleanup_context(event)?;
-        let Some(original) = self.state.cleanup.get() else {
-            return Ok(None);
-        };
+    ) -> Result<super::PreparedTargetMutation, AuditAuthorityError> {
         if original.handle.body.event != *event
             || lifetime.subsec_nanos() != 0
             || original
@@ -696,13 +697,13 @@ impl NetconfSessionOwner {
         {
             return Err(AuditAuthorityError::BindingMismatch);
         }
-        Ok(Some(original.clone()))
+        Ok(original.clone())
     }
 
-    pub(crate) fn retain_cleanup(
+    fn cleanup_preparation_lifetime(
         &self,
-        prepared: super::PreparedTargetMutation,
-    ) -> Result<super::PreparedTargetMutation, AuditAuthorityError> {
+        prepared: &super::PreparedTargetMutation,
+    ) -> Result<std::time::Duration, AuditAuthorityError> {
         self.cleanup_context(&prepared.handle.body.event)?;
         let seconds = prepared
             .handle
@@ -714,11 +715,116 @@ impl NetconfSessionOwner {
         if !prepared.is_session_cleanup_for(self) {
             return Err(AuditAuthorityError::BindingMismatch);
         }
+        Ok(std::time::Duration::from_secs(seconds as u64))
+    }
+
+    pub(crate) fn original_cleanup(
+        &self,
+        event: &super::ProjectedAuditEvent,
+        lifetime: std::time::Duration,
+    ) -> Result<Option<super::PreparedTargetMutation>, AuditAuthorityError> {
+        self.cleanup_context(event)?;
+        let slot = self
+            .state
+            .cleanup
+            .lock()
+            .map_err(|_| AuditAuthorityError::Unavailable)?;
+        slot.as_ref()
+            .map(|current| Self::matching_cleanup(&current.prepared, event, lifetime))
+            .transpose()
+    }
+
+    pub(crate) fn retain_cleanup(
+        &self,
+        prepared: super::PreparedTargetMutation,
+    ) -> Result<super::PreparedTargetMutation, AuditAuthorityError> {
+        let lifetime = self.cleanup_preparation_lifetime(&prepared)?;
         let event = prepared.handle.body.event.clone();
-        // All clones select one original operation before the caller can admit
-        // it. A concurrent preparation never replaces that operation or expiry.
-        self.state.cleanup.get_or_init(|| prepared);
-        self.original_cleanup(&event, std::time::Duration::from_secs(seconds as u64))?
-            .ok_or(AuditAuthorityError::BindingMismatch)
+        let mut slot = self
+            .state
+            .cleanup
+            .lock()
+            .map_err(|_| AuditAuthorityError::Unavailable)?;
+        // No await or authority mutation occurs under this bounded local lock.
+        let original = slot.get_or_insert(NetconfCleanupAttempt {
+            prepared,
+            predecessor: None,
+        });
+        Self::matching_cleanup(&original.prepared, &event, lifetime)
+    }
+
+    fn cleanup_successor_context(
+        &self,
+        previous: &super::PreparedTargetMutation,
+        event: &super::ProjectedAuditEvent,
+    ) -> Result<(), AuditAuthorityError> {
+        self.cleanup_context(event)?;
+        self.cleanup_preparation_lifetime(previous)?;
+        if event.request == previous.handle.body.event.request
+            || event.projection != previous.handle.body.event.projection
+        {
+            return Err(AuditAuthorityError::BindingMismatch);
+        }
+        Ok(())
+    }
+
+    pub(crate) fn successor_cleanup(
+        &self,
+        previous: &super::PreparedTargetMutation,
+        event: &super::ProjectedAuditEvent,
+        lifetime: std::time::Duration,
+    ) -> Result<Option<super::PreparedTargetMutation>, AuditAuthorityError> {
+        self.cleanup_successor_context(previous, event)?;
+        let slot = self
+            .state
+            .cleanup
+            .lock()
+            .map_err(|_| AuditAuthorityError::Unavailable)?;
+        let current = slot.as_ref().ok_or(AuditAuthorityError::BindingMismatch)?;
+        if current.prepared == *previous {
+            return Ok(None);
+        }
+        if current.predecessor.as_ref() != Some(previous.handle()) {
+            return Err(AuditAuthorityError::BindingMismatch);
+        }
+        Self::matching_cleanup(&current.prepared, event, lifetime).map(Some)
+    }
+
+    pub(crate) fn retain_cleanup_successor(
+        &self,
+        previous: &super::PreparedTargetMutation,
+        prepared: super::PreparedTargetMutation,
+        ledger: &super::ledger::LedgerState,
+        key: &crate::AuditKey,
+        now: i64,
+    ) -> Result<super::PreparedTargetMutation, AuditAuthorityError> {
+        self.cleanup_successor_context(previous, &prepared.handle.body.event)?;
+        let lifetime = self.cleanup_preparation_lifetime(&prepared)?;
+        if prepared.handle.body.issued_at < previous.handle.body.expires_at {
+            return Err(AuditAuthorityError::BindingMismatch);
+        }
+        prepared.verify_effect(key)?;
+        previous.verify_settled_cleanup_rejection(self, ledger, key, now)?;
+        let mut slot = self
+            .state
+            .cleanup
+            .lock()
+            .map_err(|_| AuditAuthorityError::Unavailable)?;
+        let current = slot.as_ref().ok_or(AuditAuthorityError::BindingMismatch)?;
+        if current.prepared == *previous {
+            // Retain at most one prepared attempt and its immediate predecessor,
+            // never an unbounded local history. Old handles remain in the ledger.
+            *slot = Some(NetconfCleanupAttempt {
+                prepared: prepared.clone(),
+                predecessor: Some(previous.handle().clone()),
+            });
+            return Ok(prepared);
+        }
+        if current.predecessor.as_ref() != Some(previous.handle()) {
+            return Err(AuditAuthorityError::BindingMismatch);
+        }
+        // A concurrent identical preparation gets the first selected original.
+        // Another event, predecessor or lifetime cannot replace that winner.
+        Self::matching_cleanup(&current.prepared, &prepared.handle.body.event, lifetime)
     }
 }
