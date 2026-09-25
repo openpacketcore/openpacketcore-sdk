@@ -575,22 +575,19 @@ impl LedgerState {
     ) -> Result<(), AuditAuthorityError> {
         let index = self.operation_index(key, handle)?;
         state.validate_target_for(handle)?;
+        let retained = self.entries.iter().find_map(|entry| match &entry.payload {
+            EntryPayload::TargetIntent(retained) if retained.handle == *handle => Some(retained),
+            _ => None,
+        });
+        let target = retained.is_some();
+        if let Some(retained) = retained {
+            validate_target_outcome(key, retained, state)?;
+        }
         let current = &self.operations[index];
         if current.state == state {
             return Ok(());
         }
         if current.state != AuditOperationState::Intent || state == AuditOperationState::Intent {
-            return Err(AuditAuthorityError::BindingMismatch);
-        }
-        let target = self.entries.iter().any(|entry| {
-            matches!(&entry.payload, EntryPayload::TargetIntent(retained) if retained.handle == *handle)
-        });
-        if target
-            && !matches!(
-                state,
-                AuditOperationState::Rejected | AuditOperationState::TargetV1(_)
-            )
-        {
             return Err(AuditAuthorityError::BindingMismatch);
         }
         let sequence = self.append(
@@ -763,13 +760,22 @@ impl LedgerState {
                         return Err(AuditAuthorityError::BindingMismatch);
                     }
                     state.validate_target_for(&op.handle)?;
-                    if self.entries.iter().any(|entry| {
-                        matches!(&entry.payload, EntryPayload::TargetIntent(retained) if retained.handle == op.handle)
-                    }) {
-                        match state {
-                            AuditOperationState::TargetV1(result) => target_anchor = Some(TargetStateAnchor { sequence, result: *result }),
-                            AuditOperationState::Rejected => {},
-                            _ => return Err(AuditAuthorityError::BindingMismatch),
+                    if let Some(retained) =
+                        self.entries.iter().find_map(|entry| match &entry.payload {
+                            EntryPayload::TargetIntent(retained)
+                                if retained.handle == op.handle =>
+                            {
+                                Some(retained)
+                            }
+                            _ => None,
+                        })
+                    {
+                        validate_target_outcome(key, retained, *state)?;
+                        if let AuditOperationState::TargetV1(result) = state {
+                            target_anchor = Some(TargetStateAnchor {
+                                sequence,
+                                result: *result,
+                            });
                         }
                     }
                     op.state = *state;
@@ -907,6 +913,19 @@ mod strict_target_handle {
         outcome: ManagementAuditOutcomeCode,
         utc_seconds: i64,
         nanosecond: u32,
+    }
+}
+
+fn validate_target_outcome(
+    key: &AuditKey,
+    retained: &RetainedTargetIntent,
+    state: AuditOperationState,
+) -> Result<(), AuditAuthorityError> {
+    let prepared = validate_target_recovery(key, &retained.handle, &retained.recovery)?;
+    match state {
+        AuditOperationState::Rejected => Ok(()),
+        AuditOperationState::TargetV1(result) => prepared.validate_result(result),
+        _ => Err(AuditAuthorityError::BindingMismatch),
     }
 }
 

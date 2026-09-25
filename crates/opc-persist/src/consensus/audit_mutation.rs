@@ -597,6 +597,46 @@ impl PreparedTargetMutation {
         Ok(value)
     }
 
+    pub(crate) fn validate_result(
+        &self,
+        result: crate::audit_authority::NetconfTargetResult,
+    ) -> Result<(), AuditAuthorityError> {
+        use crate::audit_authority::NetconfAppliedOutcome as Outcome;
+        let bad = AuditAuthorityError::BindingMismatch;
+        result.validate_for(&self.handle)?;
+        if result.profile_incarnation() != self.effect.profile_incarnation {
+            return Err(bad);
+        }
+        let matches = match (u8::from(self.effect.action), result.outcome()) {
+            (0 | 1, Outcome::Lifecycle { incarnation }) => {
+                incarnation.value == self.effect.device_incarnation
+            }
+            (2 | 3, Outcome::Lifecycle { incarnation }) => {
+                incarnation.value == self.handle.body.nonce
+            }
+            (4 | 5, Outcome::Candidate { generation }) => {
+                matches!(self.effect.destination, TargetExpectationV1::Candidate { generation: expected }
+                    if expected.checked_next()? == generation)
+            }
+            (7 | 8, Outcome::Startup { revision }) => {
+                matches!(self.effect.destination, TargetExpectationV1::Startup { revision: expected }
+                    if expected.checked_next()? == revision)
+            }
+            (13, Outcome::Lifecycle { incarnation }) => {
+                matches!(self.effect.resolution, Some(TargetResolutionV1::EndSession { session })
+                    if session == incarnation.value)
+            }
+            // Pending and running target effects remain unavailable until their
+            // complete atomic transition and exact result binding are implemented.
+            _ => false,
+        };
+        if matches {
+            Ok(())
+        } else {
+            Err(bad)
+        }
+    }
+
     pub(crate) fn verify_effect(&self, key: &AuditKey) -> Result<(), AuditAuthorityError> {
         self.effect.validate(&self.handle)?;
         self.handle

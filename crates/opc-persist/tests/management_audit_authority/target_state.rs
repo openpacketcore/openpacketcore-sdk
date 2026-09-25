@@ -829,3 +829,93 @@ async fn target_state_result_must_match_the_retained_action_profile_and_successo
     positive.validate(&fixture.key, fixture.identity).unwrap();
     positive.validate_continuity(Some(&fixture.keys)).unwrap();
 }
+
+#[tokio::test]
+async fn target_state_reconstruction_rejects_authentic_but_substituted_result() {
+    use crate::audit_authority::ledger::{verify, EntryPayload, TargetStateAnchor, ENTRY_DOMAIN};
+    use crate::audit_authority::{NetconfTargetResult, StartupRevision};
+    let fixture = Fixture::new().await;
+    let shared = fixture.backend.conn();
+    let conn = shared.lock().await;
+    fixture.active(&conn);
+    let discard = fixture.request(&conn, 2, 5, 0x61, 1);
+    let AuditOperationState::TargetV1(correct) = fixture.submit(&conn, &discard) else {
+        panic!("discard refused");
+    };
+    let valid = fixture.ledger(&conn);
+    valid.validate(&fixture.key, fixture.identity).unwrap();
+    let wrong = NetconfTargetResult::new(
+        fixture.identity,
+        correct.profile_incarnation(),
+        correct.state_digest(),
+        NetconfAppliedOutcome::Startup {
+            revision: StartupRevision {
+                authority: fixture.identity,
+                value: 1,
+            },
+        },
+    )
+    .unwrap();
+    let mut substituted = valid.clone();
+    let op = substituted
+        .operations
+        .iter_mut()
+        .find(|op| op.handle == discard.handle)
+        .unwrap();
+    op.state = AuditOperationState::TargetV1(wrong);
+    substituted.target_anchor = Some(TargetStateAnchor {
+        sequence: op.last_sequence,
+        result: wrong,
+    });
+    for entry in &mut substituted.entries {
+        if let EntryPayload::Outcome { operation, state } = &mut entry.payload {
+            if *operation == discard.handle.mac {
+                *state = AuditOperationState::TargetV1(wrong);
+            }
+        }
+    }
+    // Model an authority-side outcome substitution, not a bad-MAC shortcut.
+    // Root ledger validation must bind the genuine stored result to its intent.
+    let mut previous = substituted.predecessor;
+    for entry in &mut substituted.entries {
+        entry.previous = previous;
+        entry.mac = authenticate(
+            &fixture.key,
+            ENTRY_DOMAIN,
+            &(
+                fixture.identity,
+                entry.sequence,
+                previous,
+                entry.key_epoch,
+                &entry.payload,
+            ),
+        )
+        .unwrap();
+        verify(
+            &fixture.key,
+            ENTRY_DOMAIN,
+            &(
+                fixture.identity,
+                entry.sequence,
+                previous,
+                entry.key_epoch,
+                &entry.payload,
+            ),
+            &entry.mac,
+        )
+        .unwrap();
+        previous = entry.mac;
+    }
+    substituted.terminal = previous;
+    assert!(
+        substituted
+            .validate(&fixture.key, fixture.identity)
+            .is_err(),
+        "authenticated substituted target result survived reconstruction"
+    );
+    // The actual stored operation and target rows were not touched.
+    assert_eq!(
+        serde_json::to_vec(&fixture.ledger(&conn)).unwrap(),
+        serde_json::to_vec(&valid).unwrap()
+    );
+}
