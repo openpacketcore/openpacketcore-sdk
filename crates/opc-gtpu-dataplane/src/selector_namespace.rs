@@ -14,11 +14,11 @@ pub use bearer::GTPU_SHARED_PAA_MAX_LIVE_BEARERS;
 pub use n3_end_marker::{
     GtpuN3EndMarkerCompletion, GtpuN3EndMarkerError, GtpuN3EndMarkerReceipt, GtpuN3EndMarkerRequest,
 };
-use observability::observe;
 pub use observability::{
     gtpu_selector_duration_snapshot, GtpuSelectorDurationSnapshot, GtpuSelectorOutcome,
     GtpuSelectorPhase, GTPU_SELECTOR_DURATION_BUCKETS_US,
 };
+use observability::{observe, observe_sync};
 pub use pristine::GtpuSessionSelectorPristineReadbackRequest;
 use pristine::PristineRelocation;
 
@@ -5945,8 +5945,10 @@ where
                     && record.state_type.as_str() == "gtpu-selector-namespace-v1"
                     && record.expires_at.is_none() =>
             {
-                NamespaceState::decode(record.payload.as_bytes())
-                    .ok_or(GtpuSessionSelectorNamespaceError::Indeterminate)?
+                observe_sync(GtpuSelectorPhase::LedgerDecode, || {
+                    NamespaceState::decode(record.payload.as_bytes())
+                        .ok_or(GtpuSessionSelectorNamespaceError::Indeterminate)
+                })?
             }
             Some(_) => return Err(GtpuSessionSelectorNamespaceError::Indeterminate),
         };
@@ -5997,7 +5999,9 @@ where
     {
         let (_, state) = self.read_state().await?;
         let binding = self.bound_binding(&state)?;
-        let inventory = state.operation_stamp_inventory(binding)?;
+        let inventory = observe_sync(GtpuSelectorPhase::InventoryDerive, || {
+            state.operation_stamp_inventory(binding)
+        })?;
         let window = self.mint_backend_mutation_window(lease).await?;
         let request = GtpuSessionSelectorBindingLease {
             binding,
@@ -6036,8 +6040,10 @@ where
                     && record.state_type.as_str() == "gtpu-selector-namespace-v1"
                     && record.expires_at.is_none() =>
             {
-                NamespaceState::decode(record.payload.as_bytes())
-                    .ok_or(GtpuSessionSelectorNamespaceError::Indeterminate)?
+                observe_sync(GtpuSelectorPhase::LedgerDecode, || {
+                    NamespaceState::decode(record.payload.as_bytes())
+                        .ok_or(GtpuSessionSelectorNamespaceError::Indeterminate)
+                })?
             }
             Some(_) => return Err(GtpuSessionSelectorNamespaceError::Indeterminate),
         };
@@ -6538,13 +6544,16 @@ where
         state: NamespaceState,
         lease: &mut SelectorWorkerLease,
     ) -> Result<bool, GtpuSessionSelectorNamespaceError> {
-        if !state.is_complete() {
-            return Err(GtpuSessionSelectorNamespaceError::Indeterminate);
-        }
-        let bytes = state.encode();
-        if bytes.len() > MAX_RECORD_BYTES {
-            return Err(GtpuSessionSelectorNamespaceError::CapacityExhausted);
-        }
+        let bytes = observe_sync(GtpuSelectorPhase::LedgerEncode, || {
+            if !state.is_complete() {
+                return Err(GtpuSessionSelectorNamespaceError::Indeterminate);
+            }
+            let bytes = state.encode();
+            if bytes.len() > MAX_RECORD_BYTES {
+                return Err(GtpuSessionSelectorNamespaceError::CapacityExhausted);
+            }
+            Ok(bytes)
+        })?;
         let generation = match current {
             Some(record) => record
                 .generation

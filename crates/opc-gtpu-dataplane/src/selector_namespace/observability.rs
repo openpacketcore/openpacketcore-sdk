@@ -31,10 +31,16 @@ pub enum GtpuSelectorPhase {
     BackendRead,
     /// Apply an authorized grouped removal.
     BackendRemove,
+    /// Decode and validate one complete authenticated ledger snapshot.
+    LedgerDecode,
+    /// Validate and encode one complete proposed ledger replacement.
+    LedgerEncode,
+    /// Derive the complete operation-stamp inventory from protected state.
+    InventoryDerive,
 }
 
 impl GtpuSelectorPhase {
-    const ALL: [Self; 11] = [
+    const ALL: [Self; 14] = [
         Self::WorkerWait,
         Self::WorkerHold,
         Self::LeaseAcquire,
@@ -46,6 +52,9 @@ impl GtpuSelectorPhase {
         Self::BackendInstall,
         Self::BackendRead,
         Self::BackendRemove,
+        Self::LedgerDecode,
+        Self::LedgerEncode,
+        Self::InventoryDerive,
     ];
 
     /// Stable label containing no request or authority information.
@@ -62,6 +71,9 @@ impl GtpuSelectorPhase {
             Self::BackendInstall => "backend_install",
             Self::BackendRead => "backend_read",
             Self::BackendRemove => "backend_remove",
+            Self::LedgerDecode => "ledger_decode",
+            Self::LedgerEncode => "ledger_encode",
+            Self::InventoryDerive => "inventory_derive",
         }
     }
 }
@@ -182,6 +194,24 @@ pub(super) async fn observe<T, E>(
         started: Instant::now(),
     };
     let result = future.await;
+    observation.outcome = if result.is_ok() {
+        GtpuSelectorOutcome::Completed
+    } else {
+        GtpuSelectorOutcome::Error
+    };
+    result
+}
+
+pub(super) fn observe_sync<T, E>(
+    phase: GtpuSelectorPhase,
+    operation: impl FnOnce() -> Result<T, E>,
+) -> Result<T, E> {
+    let mut observation = Observation {
+        phase,
+        outcome: GtpuSelectorOutcome::Cancelled,
+        started: Instant::now(),
+    };
+    let result = operation();
     observation.outcome = if result.is_ok() {
         GtpuSelectorOutcome::Completed
     } else {
