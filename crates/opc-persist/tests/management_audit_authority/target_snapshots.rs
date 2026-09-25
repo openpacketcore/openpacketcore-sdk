@@ -252,9 +252,9 @@ async fn target_snapshot_rejects_omitted_altered_and_substituted_state_without_i
         let (path, meta) = source.snapshot(profile).await;
         Connection::open(&path).unwrap().execute_batch(attack).unwrap();
         let shared = destination.backend.conn();
-        let before = logical_rows(&shared.lock().await);
+        let before = logical_rows(&**shared.lock().await);
         assert!(destination.install(&path, &meta, profile).await.is_err(), "altered snapshot admitted");
-        assert!(logical_rows(&shared.lock().await) == before, "rejected import changed authority");
+        assert!(logical_rows(&**shared.lock().await) == before, "rejected import changed authority");
     }
 }
 
@@ -286,10 +286,10 @@ async fn snapshot_selection_never_infers_profile_from_source_or_destination() {
         let destination = Fixture::new(destination_profile, 0x31).await;
         let (path, meta) = source.snapshot(source_profile).await;
         let shared = destination.backend.conn();
-        let before = logical_rows(&shared.lock().await);
+        let before = logical_rows(&**shared.lock().await);
         assert!(destination.install(&path, &meta, selected).await.is_err());
         assert!(
-            logical_rows(&shared.lock().await) == before,
+            logical_rows(&**shared.lock().await) == before,
             "profile rejection changed authority"
         );
     }
@@ -298,9 +298,9 @@ async fn snapshot_selection_never_infers_profile_from_source_or_destination() {
     let destination = Fixture::new(profile, 0x31).await;
     let (path, meta) = foreign.snapshot(profile).await;
     let shared = destination.backend.conn();
-    let before = logical_rows(&shared.lock().await);
+    let before = logical_rows(&**shared.lock().await);
     assert!(destination.install(&path, &meta, profile).await.is_err());
-    assert!(logical_rows(&shared.lock().await) == before);
+    assert!(logical_rows(&**shared.lock().await) == before);
 }
 
 #[tokio::test]
