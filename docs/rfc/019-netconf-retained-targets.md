@@ -489,3 +489,53 @@ local/hosted checks, exact candidate review and normal current-main integration.
 Author review is identified as author review; it is not independent approval.
 Use Refs #958 until every acceptance row is complete. Native WAL and explicit
 Durable/Async behavior remain unchanged.
+
+### Provider-bound tentative and empty-confirmation preparation
+
+`NetconfTentativePromotion` pairs an original candidate-promotion read with the
+exact attested running envelope, fixed deadline and optional borrowed persistent
+credential. `prepare_netconf_tentative_promotion` requires a nonempty original
+running parent, authenticates the same staged configuration through the provider
+and creates an opaque pending identity. The action9 effect includes that original
+parent/deadline and encrypted ownership before its intent can be admitted. The
+same existing preflight, command bounds, checkpoints and atomic reducer apply.
+
+`read_netconf_pending_confirmation` returns an opaque `NetconfPendingRead` from
+the authenticated, quorum-current transaction and independent checkpoint. It
+binds the original caller/tenant, device, pending identity, candidate state and
+running lock. Session-only ownership requires its original session incarnation.
+Persistent ownership may be used by another session of the same projected caller
+and tenant, with the exact credential; it does not delegate across principals.
+
+`NetconfEmptyConfirmation` supplies that original read, provider and optional
+credential to `prepare_netconf_empty_confirmation`. The SDK authenticates the
+retained ownership for its exact tenant, schema, version and confirmation AAD,
+checks its complete plaintext digest and verifies the credential. Its action10
+binds the original lifecycle digest and pending identity. A staged candidate is
+refused, and concurrent candidate changes invalidate preflight and application.
+The running revision does not advance. Known confirmation remains known through
+terminal debt and exact replay.
+
+Ownership plaintext begins with the eight bytes `4f 50 43 4e 43 4f 01 00`, a
+mode byte (0 session-only or 1 persistent), 16 fresh random UUIDv4 bytes, a four-byte
+big-endian credential length and exact UTF-8 credential bytes. Session-only
+requires zero length; persistent requires nonempty bytes. The existing 256 KiB
+private-operation input bound applies before allocation; the body is at most
+29 + 262144 bytes. Unknown versions/modes, inconsistent lengths and trailing bytes
+are refused. The encrypted random bytes prevent the existing plaintext digest
+from becoming a deterministic credential fingerprint or a direct verifier for
+guessed credentials.
+
+Encoding and decryption use zeroizing storage. The caller owns the borrowed input
+credential's lifetime. AEAD and randomness use existing provider/SDK primitives;
+credential digest equality uses the existing RustCrypto `CtOutput<Sha256>`
+constant-time comparison. No credential, provider or signing material enters the
+recovery descriptor, error or Debug output. The existing confirmation AAD digest
+binds the pending identity, original effect, caller, device, owner session, parent
+and deadline before encryption. Provider failure or cancellation during
+preparation admits no intent or effect. Unknown transmission recovers only the
+retained original prepared operation.
+
+Staged confirmation, cancellation and internal timeout/session/reboot rollback
+require their distinct preparation contracts. These ports do not activate the
+public full-profile runtime or provide recipient-only/offline audit verification.

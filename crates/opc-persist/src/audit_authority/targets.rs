@@ -1168,3 +1168,85 @@ impl fmt::Debug for NetconfTargetCopy<'_> {
         f.write_str("NetconfTargetCopy(<redacted>)")
     }
 }
+
+/// Exact tentative promotion input paired with the original staged read.
+/// The envelope carries a fixed confirmed deadline and original running parent.
+/// A persistent credential is borrowed only during provider-backed preparation.
+/// This input grants no admission and never confers signing authority.
+pub struct NetconfTentativePromotion<'a> {
+    pub(crate) frozen: &'a NetconfCandidatePromotionRead,
+    pub(crate) commit: crate::AttestedConfigCommit,
+    pub(crate) provider: &'a dyn opc_key::KeyProvider,
+    pub(crate) persist: Option<&'a str>,
+}
+
+impl<'a> NetconfTentativePromotion<'a> {
+    /// Pair the original candidate with its exact tentative running envelope.
+    /// `None` retains session-only ownership; a nonempty credential selects
+    /// persistent ownership under the same original projected caller and tenant.
+    pub fn new(
+        frozen: &'a NetconfCandidatePromotionRead,
+        commit: crate::AttestedConfigCommit,
+        provider: &'a dyn opc_key::KeyProvider,
+        persist: Option<&'a str>,
+    ) -> Self {
+        Self {
+            frozen,
+            commit,
+            provider,
+            persist,
+        }
+    }
+}
+
+impl fmt::Debug for NetconfTentativePromotion<'_> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("NetconfTentativePromotion(<redacted>)")
+    }
+}
+
+/// One original pending confirmation read with authenticated authority state.
+/// It has no consumer constructor or decoder and exposes no credential bytes.
+/// The exact worker, session, pending identity and candidate state remain bound
+/// through provider preparation; stale admission must reject those expectations.
+pub struct NetconfPendingRead {
+    pub(crate) session: NetconfSessionOwner,
+    pub(crate) view: crate::consensus::audit_targets::NetconfPendingView,
+}
+
+impl fmt::Debug for NetconfPendingRead {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("NetconfPendingRead(<redacted>)")
+    }
+}
+
+/// Credential input for confirming an original pending operation without
+/// another running commit. Staged changes require separate promotion with
+/// resolution. No credential or provider is retained by the prepared command.
+pub struct NetconfEmptyConfirmation<'a> {
+    pub(crate) frozen: &'a NetconfPendingRead,
+    pub(crate) provider: &'a dyn opc_key::KeyProvider,
+    pub(crate) persist_id: Option<&'a str>,
+}
+
+impl<'a> NetconfEmptyConfirmation<'a> {
+    /// Pair the original pending read with its provider and, only for
+    /// persistent ownership, the exact original confirmation credential.
+    pub fn new(
+        frozen: &'a NetconfPendingRead,
+        provider: &'a dyn opc_key::KeyProvider,
+        persist_id: Option<&'a str>,
+    ) -> Self {
+        Self {
+            frozen,
+            provider,
+            persist_id,
+        }
+    }
+}
+
+impl fmt::Debug for NetconfEmptyConfirmation<'_> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("NetconfEmptyConfirmation(<redacted>)")
+    }
+}

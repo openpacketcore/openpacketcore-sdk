@@ -2156,13 +2156,14 @@ impl NetconfCopyView {
 enum RunningPreparationPurpose {
     Copy,
     Promotion,
+    Tentative,
 }
 
 impl RunningPreparationPurpose {
     fn operation(self) -> crate::ManagementAuditOperationCode {
         match self {
             Self::Copy => crate::ManagementAuditOperationCode::Replace,
-            Self::Promotion => crate::ManagementAuditOperationCode::Exec,
+            Self::Promotion | Self::Tentative => crate::ManagementAuditOperationCode::Exec,
         }
     }
 
@@ -2170,6 +2171,7 @@ impl RunningPreparationPurpose {
         match self {
             Self::Copy => 15,
             Self::Promotion => 6,
+            Self::Tentative => 9,
         }
     }
 }
@@ -2234,7 +2236,10 @@ impl crate::audit_authority::NetconfRunningCopyRead {
                 Transport::NetconfSsh | Transport::NetconfTls
             )
             || self.source.running_base.checked_add(1) != Some(commit.record.version.get())
-            || commit.record.confirmed_deadline.is_some()
+            || match purpose {
+                RunningPreparationPurpose::Tentative => commit.record.confirmed_deadline.is_none(),
+                _ => commit.record.confirmed_deadline.is_some(),
+            }
         {
             return Err(bad);
         }
@@ -2875,5 +2880,272 @@ impl crate::audit_authority::NetconfTargetCopyRead {
             .await?;
         frozen.verify_session(session)?;
         Ok(effect)
+    }
+}
+
+impl crate::audit_authority::NetconfCandidatePromotionRead {
+    pub(crate) async fn prepare_tentative(
+        &self,
+        session: &crate::audit_authority::NetconfSessionOwner,
+        input: crate::audit_authority::NetconfTentativePromotion<'_>,
+        tenant: &opc_types::TenantId,
+        event: &crate::audit_authority::ProjectedAuditEvent,
+        window: std::ops::Range<i64>,
+        key: &AuditKey,
+    ) -> Result<super::audit_mutation::TargetEffectV1, AuditAuthorityError> {
+        self.verify_session(session)?;
+        let bad = AuditAuthorityError::BindingMismatch;
+        if !std::ptr::eq(self, input.frozen) || self.copy.source.running_base == 0 {
+            return Err(bad);
+        }
+        // The only credential allocation is bounded and zeroizing. It is never
+        // copied to the command, log or local diagnostic identity.
+        let ownership_plaintext = crate::audit_authority::confirmation::encode(input.persist)?;
+        let mut effect = self
+            .copy
+            .prepare_running(
+                session,
+                RunningPreparation {
+                    frozen: &input.frozen.copy,
+                    commit: input.commit,
+                    provider: input.provider,
+                    purpose: RunningPreparationPurpose::Tentative,
+                },
+                tenant,
+                event,
+                window.end,
+                key,
+            )
+            .await?;
+        let (commit, _) = effect
+            .encrypted_payload
+            .as_ref()
+            .and_then(TargetPayloadV1::running)
+            .ok_or(bad)?;
+        let record = &commit.record;
+        let deadline = record.confirmed_deadline.ok_or(bad)?;
+        let original_deadline = deadline.as_offset_datetime().unix_timestamp();
+        if window.start >= window.end
+            || original_deadline <= window.start
+            || deadline <= record.committed_at
+        {
+            return Err(bad);
+        }
+        let rollback_parent = record.parent_tx_id.ok_or(bad)?;
+        let schema = record.schema_digest;
+        let version = record.version.get();
+        let tx_id = record.tx_id;
+        let committed_at = record.committed_at;
+        effect.resolution = Some(TargetResolutionV1::InstallPending {
+            pending: crate::audit_authority::NetconfPendingConfirmation {
+                authority: session.device.authority,
+                value: *uuid::Uuid::new_v4().as_bytes(),
+            },
+            rollback_parent,
+            rollback_version: self.copy.source.running_base,
+            original_deadline,
+            owner_session: session.incarnation(),
+            persistent: input.persist.is_some(),
+        });
+        let aad = opc_key::EnvelopeAad::config(
+            tenant.clone(),
+            version,
+            opc_key::ConfigAad::new(
+                tx_id,
+                Some(rollback_parent),
+                committed_at,
+                "netconf-required-audit",
+                schema,
+                effect.encryption_store_kind(schema, 2)?,
+            )
+            .map_err(|_| AuditAuthorityError::InvalidInput)?,
+        );
+        let encrypted =
+            opc_crypto::encrypt_attested_envelope(input.provider, &aad, &ownership_plaintext)
+                .await
+                .map_err(|_| AuditAuthorityError::Unavailable)?;
+        let blob = TargetEncryptedBlobV1 {
+            schema,
+            plaintext_digest: Sha256::digest(ownership_plaintext.as_slice()).into(),
+            encrypted_blob: encrypted.encoded().to_vec(),
+        };
+        blob.validate()?;
+        let Some(TargetPayloadV1::ProviderCopy {
+            confirmation_ownership,
+            ..
+        }) = &mut effect.encrypted_payload
+        else {
+            return Err(bad);
+        };
+        *confirmation_ownership = Some(blob);
+        self.verify_session(session)?;
+        Ok(effect)
+    }
+}
+
+/// Private retained pending state from the same transaction as its ledger.
+pub(crate) struct NetconfPendingView {
+    device: NetconfDeviceView,
+    pending: PendingConfirmation,
+    original_deadline: i64,
+    ownership: TargetEncryptedBlobV1,
+    candidate_present: bool,
+}
+
+pub(crate) fn read_pending_view_sync(
+    conn: &Connection,
+    key: &AuditKey,
+    ledger: &LedgerState,
+    session: &crate::audit_authority::NetconfSessionOwner,
+    cancellation: &SqliteWorkCancellation,
+) -> io::Result<Result<crate::audit_authority::NetconfPendingRead, AuditAuthorityError>> {
+    let device = read_device_view_sync(conn, key, ledger, cancellation)?;
+    let state = read_state_sync(conn, key, ledger.identity, cancellation)?;
+    cancellation.check_io()?;
+    let Some(pending) = state.lifecycle.pending_confirmation else {
+        return Ok(Err(AuditAuthorityError::BindingMismatch));
+    };
+    let Some(original_deadline) = state.lifecycle.original_deadline else {
+        return Err(invalid());
+    };
+    let Some(ownership) = state.lifecycle.encrypted_confirmation_ownership else {
+        return Err(invalid());
+    };
+    let frozen = crate::audit_authority::NetconfPendingRead {
+        session: session.clone(),
+        view: NetconfPendingView {
+            device,
+            pending,
+            original_deadline,
+            ownership,
+            candidate_present: state.targets[0].present,
+        },
+    };
+    if let Err(error) = frozen.verify_session(session) {
+        return Ok(Err(error));
+    }
+    Ok(Ok(frozen))
+}
+
+impl crate::audit_authority::NetconfPendingRead {
+    /// Opaque identity of the exact pending operation selected by this read.
+    pub fn pending(&self) -> crate::audit_authority::NetconfPendingConfirmation {
+        self.view.pending.pending
+    }
+
+    /// Whether the original read contained staged candidate changes.
+    /// Empty confirmation refuses such a read; it cannot drop those changes.
+    pub fn has_staged_candidate(&self) -> bool {
+        self.view.candidate_present
+    }
+
+    pub(crate) fn verify_session(
+        &self,
+        session: &crate::audit_authority::NetconfSessionOwner,
+    ) -> Result<(), AuditAuthorityError> {
+        let bad = AuditAuthorityError::BindingMismatch;
+        if !self.session.same_session(session) {
+            return Err(bad);
+        }
+        self.view.device.verify_session(session)?;
+        let pending = &self.view.pending;
+        if pending.caller != session.caller
+            || pending.device_incarnation != session.device.device_incarnation
+            || (!pending.persistent && pending.owner_session != session.incarnation())
+        {
+            return Err(bad);
+        }
+        let lock = self.view.device.locks[0].ok_or(bad)?;
+        if lock.session.is_some_and(|s| s != session.incarnation())
+            || lock.caller.is_some_and(|c| c != session.caller)
+        {
+            return Err(bad);
+        }
+        Ok(())
+    }
+
+    pub(crate) fn running_base(&self) -> u64 {
+        self.view.device.running_version
+    }
+
+    pub(crate) async fn prepare_empty_confirmation(
+        &self,
+        session: &crate::audit_authority::NetconfSessionOwner,
+        input: crate::audit_authority::NetconfEmptyConfirmation<'_>,
+        tenant: &opc_types::TenantId,
+        event: &crate::audit_authority::ProjectedAuditEvent,
+        window: std::ops::Range<i64>,
+    ) -> Result<super::audit_mutation::TargetEffectV1, AuditAuthorityError> {
+        use crate::ManagementAuditTransportCode as Transport;
+        self.verify_session(session)?;
+        let bad = AuditAuthorityError::BindingMismatch;
+        if !std::ptr::eq(self, input.frozen)
+            || self.view.candidate_present
+            || event.caller != session.caller
+            || event.operation != crate::ManagementAuditOperationCode::Exec
+            || event.outcome != crate::ManagementAuditOutcomeCode::Intent
+            || !matches!(
+                event.transport,
+                Transport::NetconfSsh | Transport::NetconfTls
+            )
+            || window.start >= window.end
+            || window.start >= self.view.original_deadline
+        {
+            return Err(bad);
+        }
+        crate::audit_authority::confirmation::bounded_token(input.persist_id)?;
+        let content = &self.view.ownership;
+        content.validate()?;
+        let envelope =
+            opc_crypto::CryptoEnvelopeRef::decode(&content.encrypted_blob).map_err(|_| bad)?;
+        let (aad, _) = opc_key::decode_bound_aad(envelope.aad).map_err(|_| bad)?;
+        let opc_key::EnvelopeMetadata::Config(metadata) = aad.metadata() else {
+            return Err(bad);
+        };
+        if aad.tenant() != tenant
+            || aad.version() != self.view.pending.running_version
+            || metadata.store_kind() != self.view.pending.ownership_store_kind
+            || metadata.schema_digest() != &content.schema
+        {
+            return Err(bad);
+        }
+        let plaintext = opc_crypto::decrypt_envelope(input.provider, &aad, &content.encrypted_blob)
+            .await
+            .map_err(|_| AuditAuthorityError::Unavailable)?;
+        if <[u8; 32]>::from(Sha256::digest(plaintext.as_slice())) != content.plaintext_digest {
+            return Err(bad);
+        }
+        crate::audit_authority::confirmation::verify(
+            &plaintext,
+            self.view.pending.persistent,
+            input.persist_id,
+        )?;
+        self.verify_session(session)?;
+        let lock = self.view.device.locks[0].ok_or(bad)?;
+        Ok(super::audit_mutation::TargetEffectV1 {
+            format: 1,
+            authority: session.device.authority,
+            profile_incarnation: session.device.profile_incarnation,
+            device_incarnation: session.device.device_incarnation,
+            caller: event.caller,
+            request: event.request,
+            action: 10.try_into()?,
+            destination: TargetExpectationV1::Lifecycle {
+                state_digest: self.view.device.state_digest,
+            },
+            source: None,
+            lock: Some(super::audit_mutation::TargetLockExpectationV1 {
+                datastore: 0,
+                incarnation: lock.incarnation,
+                session: lock.session,
+                requester: session.incarnation(),
+            }),
+            expires_at: window.end,
+            encrypted_payload: None,
+            resolution: Some(TargetResolutionV1::ResolvePending {
+                pending: self.view.pending.pending,
+                original_deadline: self.view.original_deadline,
+            }),
+        })
     }
 }

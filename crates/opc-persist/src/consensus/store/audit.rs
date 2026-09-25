@@ -1984,3 +1984,201 @@ impl ConsensusConfigStore {
         Ok(prepared)
     }
 }
+
+impl ConsensusConfigStore {
+    /// Prepare an exact tentative candidate promotion, fixed original deadline
+    /// and provider-encrypted session/persistent ownership. Requires an original
+    /// nonempty running parent; admission, checkpoint and application remain
+    /// separate. Retain this prepared value before any possible transmission.
+    pub async fn prepare_netconf_tentative_promotion(
+        &self,
+        session: &crate::audit_authority::NetconfSessionOwner,
+        promotion: crate::audit_authority::NetconfTentativePromotion<'_>,
+        privacy: &dyn AuditPrivacyProjection,
+        event: &ManagementAuditEventRecord,
+        lifetime: std::time::Duration,
+    ) -> Result<crate::audit_authority::PreparedTargetMutation, AuditAuthorityError> {
+        self.require_netconf_target_profile()?;
+        if !session.device.worker.belongs_to(&self.inner) {
+            return Err(AuditAuthorityError::BindingMismatch);
+        }
+        let frozen = promotion.frozen;
+        frozen.verify_session(session)?;
+        if lifetime.subsec_nanos() != 0 || !(1..=3600).contains(&lifetime.as_secs()) {
+            return Err(AuditAuthorityError::InvalidInput);
+        }
+        let tenant = opc_types::TenantId::new(event.tenant())
+            .map_err(|_| AuditAuthorityError::InvalidInput)?;
+        let event = ProjectedAuditEvent::project(privacy, event)?;
+        let issued_at = self
+            .inner
+            .clock
+            .now_utc()
+            .as_offset_datetime()
+            .unix_timestamp();
+        let expires_at = issued_at
+            .checked_add(lifetime.as_secs() as i64)
+            .ok_or(AuditAuthorityError::InvalidInput)?;
+        let effect = frozen
+            .prepare_tentative(
+                session,
+                promotion,
+                &tenant,
+                &event,
+                issued_at..expires_at,
+                self.inner.backend.audit_key(),
+            )
+            .await?;
+        let digest = effect.digest(self.inner.backend.audit_key())?;
+        let binding = AuditOperationBinding::project(
+            privacy,
+            &event,
+            frozen.candidate().running_base_version(),
+            &digest,
+        )?;
+        let handle = AuditOperationHandle::issue(
+            HandleBody {
+                version: 1,
+                identity: self.inner.identity,
+                binding,
+                event,
+                issued_at,
+                expires_at,
+                nonce: *uuid::Uuid::new_v4().as_bytes(),
+                key_epoch: self.inner.backend.audit_key().epoch(),
+                mutation: Some(digest),
+            },
+            self.inner.backend.audit_key(),
+        )?;
+        let prepared = crate::audit_authority::PreparedTargetMutation { handle, effect };
+        prepared.verify_effect(self.inner.backend.audit_key())?;
+        self.preflight_netconf_target(&prepared).await?;
+        frozen.verify_session(session)?;
+        Ok(prepared)
+    }
+
+    /// Read the exact retained pending operation and candidate state under the
+    /// authenticated quorum-current transaction and independent checkpoint.
+    /// Persistent ownership still requires the same projected caller and tenant;
+    /// the credential is verified only during preparation. No local cache or
+    /// caller-supplied pending identity can create this capability.
+    pub async fn read_netconf_pending_confirmation(
+        &self,
+        session: &crate::audit_authority::NetconfSessionOwner,
+    ) -> Result<crate::audit_authority::NetconfPendingRead, AuditAuthorityError> {
+        self.require_netconf_target_profile()?;
+        if !session.device.worker.belongs_to(&self.inner) {
+            return Err(AuditAuthorityError::BindingMismatch);
+        }
+        session.require_active()?;
+        self.linearizable_barrier()
+            .await
+            .map_err(|_| AuditAuthorityError::Unavailable)?;
+        let retained_session = session.clone();
+        let backend = self.inner.backend.clone();
+        let identity = self.inner.identity;
+        let (ledger, view) = super::super::run_backend_sqlite_with_timeout(
+            &self.inner.backend,
+            self.inner.operation_timeout,
+            move |conn, cancellation| {
+                let unavailable = || std::io::Error::other("copy authority unavailable");
+                let tx = conn.unchecked_transaction().map_err(|_| unavailable())?;
+                super::super::sqlite::validate_live_history_schema_for_profile(
+                    &tx,
+                    cancellation,
+                    crate::RetainedConfigProfile::NetconfTargetsV1,
+                )?;
+                let keys = backend.management_audit_keys().ok_or_else(unavailable)?;
+                let ledger = super::super::audit::read_with_keys_sync(
+                    &tx,
+                    backend.audit_key(),
+                    Some(&keys),
+                    identity,
+                )?
+                .ok_or_else(unavailable)?;
+                let view = super::super::audit_targets::read_pending_view_sync(
+                    &tx,
+                    backend.audit_key(),
+                    &ledger,
+                    &retained_session,
+                    cancellation,
+                )?;
+                cancellation.check_io()?;
+                tx.commit().map_err(|_| unavailable())?;
+                Ok((ledger, view))
+            },
+        )
+        .await
+        .map_err(|_| AuditAuthorityError::Unavailable)?;
+        self.verify_audit_checkpoint(&ledger).await?;
+        let frozen = view?;
+        frozen.verify_session(session)?;
+        Ok(frozen)
+    }
+
+    /// Prepare confirmation of the original pending operation without another
+    /// running revision. This requires an empty candidate, correct original
+    /// credential/session ownership and deadline. The exact lifecycle digest
+    /// is rechecked atomically; it cannot discard concurrent staged changes.
+    pub async fn prepare_netconf_empty_confirmation(
+        &self,
+        session: &crate::audit_authority::NetconfSessionOwner,
+        confirmation: crate::audit_authority::NetconfEmptyConfirmation<'_>,
+        privacy: &dyn AuditPrivacyProjection,
+        event: &ManagementAuditEventRecord,
+        lifetime: std::time::Duration,
+    ) -> Result<crate::audit_authority::PreparedTargetMutation, AuditAuthorityError> {
+        self.require_netconf_target_profile()?;
+        if !session.device.worker.belongs_to(&self.inner) {
+            return Err(AuditAuthorityError::BindingMismatch);
+        }
+        let frozen = confirmation.frozen;
+        frozen.verify_session(session)?;
+        if lifetime.subsec_nanos() != 0 || !(1..=3600).contains(&lifetime.as_secs()) {
+            return Err(AuditAuthorityError::InvalidInput);
+        }
+        let tenant = opc_types::TenantId::new(event.tenant())
+            .map_err(|_| AuditAuthorityError::InvalidInput)?;
+        let event = ProjectedAuditEvent::project(privacy, event)?;
+        let issued_at = self
+            .inner
+            .clock
+            .now_utc()
+            .as_offset_datetime()
+            .unix_timestamp();
+        let expires_at = issued_at
+            .checked_add(lifetime.as_secs() as i64)
+            .ok_or(AuditAuthorityError::InvalidInput)?;
+        let effect = frozen
+            .prepare_empty_confirmation(
+                session,
+                confirmation,
+                &tenant,
+                &event,
+                issued_at..expires_at,
+            )
+            .await?;
+        let digest = effect.digest(self.inner.backend.audit_key())?;
+        let binding =
+            AuditOperationBinding::project(privacy, &event, frozen.running_base(), &digest)?;
+        let handle = AuditOperationHandle::issue(
+            HandleBody {
+                version: 1,
+                identity: self.inner.identity,
+                binding,
+                event,
+                issued_at,
+                expires_at,
+                nonce: *uuid::Uuid::new_v4().as_bytes(),
+                key_epoch: self.inner.backend.audit_key().epoch(),
+                mutation: Some(digest),
+            },
+            self.inner.backend.audit_key(),
+        )?;
+        let prepared = crate::audit_authority::PreparedTargetMutation { handle, effect };
+        prepared.verify_effect(self.inner.backend.audit_key())?;
+        self.preflight_netconf_target(&prepared).await?;
+        frozen.verify_session(session)?;
+        Ok(prepared)
+    }
+}

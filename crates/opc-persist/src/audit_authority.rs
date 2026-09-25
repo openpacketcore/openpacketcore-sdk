@@ -17,6 +17,7 @@ use crate::management_audit::{
 };
 
 pub use crate::consensus::{PreparedAuditedMutation, PreparedTargetMutation};
+pub(crate) mod confirmation;
 /// Authenticated retained epochs, portable exports and external checkpoints.
 pub mod continuity;
 pub(crate) mod ledger;
@@ -32,10 +33,11 @@ pub(crate) use targets::{
 };
 pub use targets::{
     CandidateGeneration, NetconfAppliedOutcome, NetconfCandidatePromotion,
-    NetconfCandidatePromotionRead, NetconfDeviceOwner, NetconfIncarnation, NetconfLockDatastore,
-    NetconfLockLease, NetconfPendingConfirmation, NetconfRunningCopy, NetconfRunningCopyRead,
-    NetconfSessionOwner, NetconfTargetCopy, NetconfTargetCopyRead, NetconfTargetRead,
-    NetconfTargetReplacement, NetconfTargetResult, PreparedNetconfDevice, PreparedNetconfLock,
+    NetconfCandidatePromotionRead, NetconfDeviceOwner, NetconfEmptyConfirmation,
+    NetconfIncarnation, NetconfLockDatastore, NetconfLockLease, NetconfPendingConfirmation,
+    NetconfPendingRead, NetconfRunningCopy, NetconfRunningCopyRead, NetconfSessionOwner,
+    NetconfTargetCopy, NetconfTargetCopyRead, NetconfTargetRead, NetconfTargetReplacement,
+    NetconfTargetResult, NetconfTentativePromotion, PreparedNetconfDevice, PreparedNetconfLock,
     StartupRevision,
 };
 

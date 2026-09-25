@@ -7210,3 +7210,474 @@ impl Fixture {
         self.request(conn, 233, 2, 0x62, 1)
     }
 }
+
+async fn confirmed_sdk_source(
+    fixture: &Fixture,
+    conn: &Connection,
+) -> (
+    opc_key::MemoryKeyProvider,
+    std::sync::Arc<()>,
+    crate::audit_authority::NetconfSessionOwner,
+    crate::audit_authority::NetconfCandidatePromotionRead,
+) {
+    fixture.active(conn);
+    let config = br#"{"retained":0}"#;
+    let (provider, source) = copy_provider_stage(fixture, conn, 0, config).await;
+    let running = fixture.running_target(conn, 181, 6, 0, 0x6a);
+    let running = provider_rewrap_running(fixture, conn, &provider, running, 181, config).await;
+    let running = bind_copy_provider(fixture, conn, &provider, &source, running)
+        .await
+        .unwrap();
+    assert!(matches!(
+        fixture.submit(conn, &running),
+        AuditOperationState::TargetV1(_)
+    ));
+    fixture.settle(conn, &running);
+    provider_stage_second_candidate(fixture, conn, br#"{"retained":1}"#).await;
+    let worker = std::sync::Arc::new(());
+    let session = fixture.session_owner(conn, &worker, 0x61);
+    let frozen = fixture.frozen_promotion(conn, &session).unwrap();
+    (provider, worker, session, frozen)
+}
+
+async fn confirmed_sdk_envelope(
+    conn: &Connection,
+    frozen: &crate::audit_authority::NetconfCandidatePromotionRead,
+    provider: &dyn opc_key::KeyProvider,
+    request: u8,
+    deadline: Option<opc_types::Timestamp>,
+) -> crate::AttestedConfigCommit {
+    use sha2::{Digest, Sha256};
+    let original =
+        frozen_running_envelope(conn, &frozen.copy, provider, request, br#"{"retained":1}"#).await;
+    let mut record = original.record().clone();
+    record.confirmed_deadline = deadline;
+    let envelope = opc_crypto::CryptoEnvelopeRef::decode(&record.encrypted_blob).unwrap();
+    let (aad, _) = opc_key::decode_bound_aad(envelope.aad).unwrap();
+    let plaintext = copy_plaintext(request, br#"{"retained":1}"#);
+    let encrypted = opc_crypto::encrypt_attested_envelope(provider, &aad, &plaintext)
+        .await
+        .unwrap();
+    record.encrypted_blob = encrypted.encoded().to_vec();
+    record.plaintext_digest = Sha256::digest(&plaintext).to_vec();
+    crate::AttestedConfigCommit::try_new(record, Vec::new(), encrypted.claim().unwrap()).unwrap()
+}
+
+impl Fixture {
+    fn frozen_pending(
+        &self,
+        conn: &Connection,
+        session: &crate::audit_authority::NetconfSessionOwner,
+    ) -> Result<crate::audit_authority::NetconfPendingRead, AuditAuthorityError> {
+        let tx = conn.unchecked_transaction().unwrap();
+        let frozen = crate::consensus::audit_targets::read_pending_view_sync(
+            &tx,
+            &self.key,
+            &self.ledger(&tx),
+            session,
+            &crate::consensus::sqlite::SqliteWorkCancellation::audit_test(),
+        )
+        .unwrap();
+        tx.commit().unwrap();
+        frozen
+    }
+
+    fn bind_pending_target(
+        &self,
+        frozen: &crate::audit_authority::NetconfPendingRead,
+        effect: TargetEffectV1,
+        event: ProjectedAuditEvent,
+    ) -> PreparedTargetMutation {
+        let digest = effect.digest(&self.key).unwrap();
+        let binding =
+            AuditOperationBinding::project(&self.privacy, &event, frozen.running_base(), &digest)
+                .unwrap();
+        let handle = AuditOperationHandle::issue(
+            HandleBody {
+                version: 1,
+                identity: self.identity,
+                binding,
+                event,
+                issued_at: 100,
+                expires_at: effect.expires_at,
+                nonce: [0x55; 16],
+                key_epoch: self.key.epoch(),
+                mutation: Some(digest),
+            },
+            &self.key,
+        )
+        .unwrap();
+        PreparedTargetMutation { handle, effect }
+    }
+}
+
+async fn confirmed_sdk_install(
+    fixture: &Fixture,
+    conn: &Connection,
+    session: &crate::audit_authority::NetconfSessionOwner,
+    frozen: &crate::audit_authority::NetconfCandidatePromotionRead,
+    provider: &dyn opc_key::KeyProvider,
+    token: Option<&str>,
+) -> PreparedTargetMutation {
+    let deadline = "2026-01-01T00:01:00Z".parse().unwrap();
+    let commit = confirmed_sdk_envelope(conn, frozen, provider, 234, Some(deadline)).await;
+    let event = fixture.event(234);
+    let changes = conn.total_changes();
+    let before = target_rows(conn);
+    let effect = frozen
+        .prepare_tentative(
+            session,
+            crate::audit_authority::NetconfTentativePromotion::new(frozen, commit, provider, token),
+            &opc_types::TenantId::from_static("fixture-tenant"),
+            &event,
+            100..160,
+            &fixture.key,
+        )
+        .await
+        .unwrap();
+    assert_eq!(conn.total_changes(), changes);
+    assert_eq!(target_rows(conn), before);
+    let prepared = fixture.bind_frozen_target(frozen.candidate(), effect, event);
+    assert_eq!(fixture.preflight(conn, &prepared, 100), Ok(None));
+    assert!(
+        matches!(fixture.submit(conn, &prepared), AuditOperationState::TargetV1(result)
+        if matches!(result.outcome(), NetconfAppliedOutcome::Tentative { running_version: 2, .. }))
+    );
+    prepared
+}
+
+#[tokio::test]
+async fn target_confirmed_sdk_tentative_and_empty_confirmation_retain_original_ownership() {
+    use crate::audit_authority::NetconfEmptyConfirmation;
+    for token in [None, Some("synthetic-persistent-credential")] {
+        let fixture = Fixture::new().await;
+        let shared = fixture.backend.conn();
+        let conn = shared.lock().await;
+        let (provider, worker, session, frozen) = confirmed_sdk_source(&fixture, &conn).await;
+        let prepared =
+            confirmed_sdk_install(&fixture, &conn, &session, &frozen, &provider, token).await;
+        let original = fixture
+            .ledger(&conn)
+            .lookup(&fixture.key, prepared.handle(), prepared.effect.caller)
+            .unwrap()
+            .unwrap();
+        assert!(!original.terminal_recorded());
+        assert!(fixture.frozen_pending(&conn, &session).is_err());
+        assert_eq!(fixture.submit(&conn, &prepared), original.state());
+        fixture.settle(&conn, &prepared);
+        let lifecycle = row(&conn, "config_netconf_lifecycle", "singleton", 1);
+        assert_eq!(
+            lifecycle["pending_confirmation"]["persistent"],
+            token.is_some()
+        );
+        let deadline = "2026-01-01T00:01:00Z"
+            .parse::<opc_types::Timestamp>()
+            .unwrap()
+            .as_offset_datetime()
+            .unix_timestamp();
+        assert_eq!(lifecycle["original_deadline"], deadline);
+        let pending = if token.is_some() {
+            fixture.session_owner(&conn, &worker, 0x62)
+        } else {
+            session.clone()
+        };
+        let read = fixture.frozen_pending(&conn, &pending).unwrap();
+        assert!(!read.has_staged_candidate());
+        let ownership = prepared
+            .effect
+            .encrypted_payload
+            .as_ref()
+            .unwrap()
+            .running()
+            .unwrap()
+            .1
+            .unwrap();
+        let credential = b"synthetic-persistent-credential";
+        assert!(!ownership
+            .encrypted_blob
+            .windows(credential.len())
+            .any(|v| v == credential));
+        // Reconstruct provider custody independently of the preparation object.
+        // This is component provider reconstruction, not a process restart.
+        drop(provider);
+        let provider = provider_lifecycle_keys();
+        let event = fixture.event(235);
+        let changes = conn.total_changes();
+        let before = target_rows(&conn);
+        let effect = read
+            .prepare_empty_confirmation(
+                &pending,
+                NetconfEmptyConfirmation::new(&read, &provider, token),
+                &opc_types::TenantId::from_static("fixture-tenant"),
+                &event,
+                100..160,
+            )
+            .await
+            .unwrap();
+        let confirmation = fixture.bind_pending_target(&read, effect, event);
+        assert_eq!(fixture.preflight(&conn, &confirmation, 100), Ok(None));
+        assert_eq!(conn.total_changes(), changes);
+        assert_eq!(target_rows(&conn), before);
+        let known = fixture.submit(&conn, &confirmation);
+        assert!(matches!(&known, AuditOperationState::TargetV1(result)
+            if matches!(result.outcome(), NetconfAppliedOutcome::Confirmed { pending: observed } if observed == read.pending())));
+        let after = target_rows(&conn);
+        assert_eq!(fixture.submit(&conn, &confirmation), known);
+        assert_eq!(target_rows(&conn), after);
+        assert!(!fixture
+            .ledger(&conn)
+            .lookup(&fixture.key, confirmation.handle(), event.caller)
+            .unwrap()
+            .unwrap()
+            .terminal_recorded());
+        assert_eq!(fixture.device_view(&conn).running_version, 2);
+        let lifecycle = row(&conn, "config_netconf_lifecycle", "singleton", 1);
+        for field in [
+            "pending_confirmation",
+            "rollback_parent",
+            "original_deadline",
+            "encrypted_confirmation_ownership",
+        ] {
+            assert!(lifecycle[field].is_null());
+        }
+        fixture.settle(&conn, &confirmation);
+        provider_assert_history(&conn, &provider, 1, 181, br#"{"retained":0}"#).await;
+        provider_assert_history(&conn, &provider, 2, 234, br#"{"retained":1}"#).await;
+        assert!(fixture.frozen_pending(&conn, &pending).is_err());
+    }
+}
+
+#[tokio::test]
+async fn target_confirmed_sdk_refuses_wrong_credentials_context_provider_and_original_read() {
+    use crate::audit_authority::NetconfEmptyConfirmation;
+    for token in [None, Some("synthetic-persistent-credential")] {
+        let fixture = Fixture::new().await;
+        let shared = fixture.backend.conn();
+        let conn = shared.lock().await;
+        let (provider, worker, session, frozen) = confirmed_sdk_source(&fixture, &conn).await;
+        let prepared =
+            confirmed_sdk_install(&fixture, &conn, &session, &frozen, &provider, token).await;
+        fixture.settle(&conn, &prepared);
+        let read = fixture.frozen_pending(&conn, &session).unwrap();
+        let other_read = fixture.frozen_pending(&conn, &session).unwrap();
+        let other = fixture.session_owner(&conn, &worker, 0x62);
+        if token.is_none() {
+            assert!(fixture.frozen_pending(&conn, &other).is_err());
+        }
+        let unavailable = opc_key::MemoryKeyProvider::new();
+        let before = target_rows(&conn);
+        let changes = conn.total_changes();
+        for change in [
+            "session",
+            "read",
+            "tenant",
+            "caller",
+            "operation",
+            "outcome",
+            "transport",
+            "credential",
+            "missing",
+            "provider",
+            "deadline",
+        ] {
+            if token.is_none() && change == "missing" {
+                continue;
+            }
+            let chosen = if change == "session" {
+                &other
+            } else {
+                &session
+            };
+            let frozen = if change == "read" { &other_read } else { &read };
+            let keys: &dyn opc_key::KeyProvider = if change == "provider" {
+                &unavailable
+            } else {
+                &provider
+            };
+            let mut event = fixture.event(236);
+            match change {
+                "caller" => {
+                    event.caller = crate::audit_authority::AuditCaller::project(
+                        &fixture.privacy,
+                        "fixture-tenant",
+                        "other-principal",
+                    )
+                    .unwrap()
+                }
+                "operation" => event.operation = ManagementAuditOperationCode::Read,
+                "outcome" => event.outcome = ManagementAuditOutcomeCode::Success,
+                "transport" => event.transport = ManagementAuditTransportCode::Internal,
+                _ => {}
+            }
+            let credential = match change {
+                "credential" => Some("different-credential"),
+                "missing" => None,
+                _ => token,
+            };
+            let tenant = opc_types::TenantId::from_static(if change == "tenant" {
+                "other-tenant"
+            } else {
+                "fixture-tenant"
+            });
+            let start = if change == "deadline" {
+                "2026-01-01T00:01:00Z"
+                    .parse::<opc_types::Timestamp>()
+                    .unwrap()
+                    .as_offset_datetime()
+                    .unix_timestamp()
+            } else {
+                100
+            };
+            assert!(
+                read.prepare_empty_confirmation(
+                    chosen,
+                    NetconfEmptyConfirmation::new(frozen, keys, credential),
+                    &tenant,
+                    &event,
+                    start..start + 60
+                )
+                .await
+                .is_err(),
+                "confirmation accepted substituted original authority or credential: {change}"
+            );
+            assert_eq!(conn.total_changes(), changes);
+            assert_eq!(target_rows(&conn), before);
+        }
+    }
+}
+
+#[tokio::test]
+async fn target_confirmed_sdk_empty_confirmation_refuses_concurrent_candidate_changes() {
+    use crate::audit_authority::NetconfEmptyConfirmation;
+    for token in [None, Some("synthetic-persistent-credential")] {
+        let fixture = Fixture::new().await;
+        let shared = fixture.backend.conn();
+        let conn = shared.lock().await;
+        let (provider, _worker, session, frozen) = confirmed_sdk_source(&fixture, &conn).await;
+        let prepared =
+            confirmed_sdk_install(&fixture, &conn, &session, &frozen, &provider, token).await;
+        fixture.settle(&conn, &prepared);
+        let read = fixture.frozen_pending(&conn, &session).unwrap();
+        let changed = fixture.encrypted(fixture.request(&conn, 237, 4, 0x61, 1), 0x6a);
+        let changed = fixture.rebind_at(&conn, changed, 100);
+        assert!(matches!(
+            fixture.submit(&conn, &changed),
+            AuditOperationState::TargetV1(_)
+        ));
+        fixture.settle(&conn, &changed);
+        let event = fixture.event(238);
+        let effect = read
+            .prepare_empty_confirmation(
+                &session,
+                NetconfEmptyConfirmation::new(&read, &provider, token),
+                &opc_types::TenantId::from_static("fixture-tenant"),
+                &event,
+                100..160,
+            )
+            .await
+            .unwrap();
+        let stale = fixture.bind_pending_target(&read, effect, event);
+        let before = target_rows(&conn);
+        let changes = conn.total_changes();
+        assert_eq!(
+            fixture.preflight(&conn, &stale, 100),
+            Err(AuditAuthorityError::BindingMismatch)
+        );
+        assert_eq!(conn.total_changes(), changes);
+        assert_eq!(target_rows(&conn), before);
+        assert_eq!(fixture.submit(&conn, &stale), AuditOperationState::Rejected);
+        assert_eq!(target_rows(&conn), before);
+        fixture.settle(&conn, &stale);
+        let now = fixture.frozen_pending(&conn, &session).unwrap();
+        assert!(now.has_staged_candidate());
+        assert!(now
+            .prepare_empty_confirmation(
+                &session,
+                NetconfEmptyConfirmation::new(&now, &provider, token),
+                &opc_types::TenantId::from_static("fixture-tenant"),
+                &fixture.event(239),
+                100..160
+            )
+            .await
+            .is_err());
+        assert_eq!(target_rows(&conn), before);
+    }
+}
+
+#[tokio::test]
+async fn target_confirmed_sdk_tentative_requires_deadline_context_and_bounded_credential() {
+    use crate::audit_authority::NetconfTentativePromotion;
+    let fixture = Fixture::new().await;
+    let shared = fixture.backend.conn();
+    let conn = shared.lock().await;
+    let (provider, worker, session, frozen) = confirmed_sdk_source(&fixture, &conn).await;
+    let other = fixture.session_owner(&conn, &worker, 0x62);
+    let other_read = fixture.frozen_promotion(&conn, &session).unwrap();
+    let unavailable = opc_key::MemoryKeyProvider::new();
+    let oversized = "x".repeat(crate::audit_authority::AUDIT_OPERATION_MAX_BYTES + 1);
+    let before = target_rows(&conn);
+    let changes = conn.total_changes();
+    for change in [
+        "deadline-missing",
+        "deadline-before-commit",
+        "session",
+        "read",
+        "tenant",
+        "operation",
+        "provider",
+        "credential-empty",
+        "credential-large",
+    ] {
+        let deadline = match change {
+            "deadline-missing" => None,
+            "deadline-before-commit" => Some("2025-12-31T23:59:59Z".parse().unwrap()),
+            _ => Some("2026-01-01T00:01:00Z".parse().unwrap()),
+        };
+        let commit = confirmed_sdk_envelope(&conn, &frozen, &provider, 240, deadline).await;
+        let keys: &dyn opc_key::KeyProvider = if change == "provider" {
+            &unavailable
+        } else {
+            &provider
+        };
+        let read = if change == "read" {
+            &other_read
+        } else {
+            &frozen
+        };
+        let chosen = if change == "session" {
+            &other
+        } else {
+            &session
+        };
+        let token = match change {
+            "credential-empty" => Some(""),
+            "credential-large" => Some(oversized.as_str()),
+            _ => None,
+        };
+        let mut event = fixture.event(240);
+        if change == "operation" {
+            event.operation = ManagementAuditOperationCode::Replace;
+        }
+        let tenant = opc_types::TenantId::from_static(if change == "tenant" {
+            "other-tenant"
+        } else {
+            "fixture-tenant"
+        });
+        assert!(
+            frozen
+                .prepare_tentative(
+                    chosen,
+                    NetconfTentativePromotion::new(read, commit, keys, token),
+                    &tenant,
+                    &event,
+                    100..160,
+                    &fixture.key
+                )
+                .await
+                .is_err(),
+            "tentative promotion accepted substituted input: {change}"
+        );
+        assert_eq!(conn.total_changes(), changes);
+        assert_eq!(target_rows(&conn), before);
+    }
+}
