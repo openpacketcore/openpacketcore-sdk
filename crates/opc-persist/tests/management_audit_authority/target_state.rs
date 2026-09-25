@@ -1318,3 +1318,221 @@ async fn target_running_promotion_rolls_back_running_and_retirement_on_storage_f
     );
     fixture.settle(&conn, &prepared);
 }
+
+impl Fixture {
+    fn bind_current_base(
+        &self,
+        conn: &Connection,
+        mut prepared: PreparedTargetMutation,
+    ) -> PreparedTargetMutation {
+        let base: u64 = conn
+            .query_row(
+                "SELECT COALESCE(MAX(version),0) FROM config_history",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        prepared.handle.body.binding.base_version = base;
+        prepared.handle = AuditOperationHandle::issue(prepared.handle.body, &self.key).unwrap();
+        prepared.verify_effect(&self.key).unwrap();
+        prepared
+    }
+
+    fn tentative_target(
+        &self,
+        conn: &Connection,
+        request: u8,
+        source_seed: u8,
+    ) -> PreparedTargetMutation {
+        use crate::consensus::audit_mutation::{TargetEncryptedBlobV1, TargetPayloadV1};
+        use opc_crypto::encrypt_attested_envelope_with_handle_and_nonce;
+        use opc_key::{ConfigAad, EnvelopeAad, KeyHandle, KeyId, KeyPurpose};
+        use sha2::{Digest, Sha256};
+        let mut prepared = self.running_target(conn, request, 6, 0, source_seed);
+        prepared.effect.action = 9.try_into().unwrap();
+        let Some(TargetPayloadV1::Running { commit, .. }) = &mut prepared.effect.encrypted_payload
+        else {
+            panic!("running fixture");
+        };
+        let pending = crate::audit_authority::NetconfPendingConfirmation {
+            authority: self.identity,
+            value: [request; 16],
+        };
+        let deadline = commit.record.committed_at.add_seconds(60).unwrap();
+        commit.record.confirmed_deadline = Some(deadline);
+        let schema = commit.record.schema_digest;
+        let version = commit.record.version.get();
+        prepared.effect.resolution = Some(TargetResolutionV1::InstallPending {
+            pending,
+            rollback_parent: commit.record.parent_tx_id.unwrap(),
+            rollback_version: prepared.handle.body.binding.base_version,
+            original_deadline: deadline.as_offset_datetime().unix_timestamp(),
+            owner_session: [0x61; 16],
+            persistent: true,
+        });
+        // The reviewed ownership domain uses the same bounded pre-encryption
+        // binding as target envelopes, with the fixed confirmation target tag.
+        // Spell it independently so this detector does not require a new API.
+        let effect = &prepared.effect;
+        let binding = serde_json::to_vec(&(
+            effect.format,
+            effect.authority,
+            effect.profile_incarnation,
+            effect.device_incarnation,
+            effect.caller,
+            effect.request,
+            effect.action,
+            &effect.destination,
+            &effect.source,
+            &effect.lock,
+            effect.expires_at,
+            &effect.resolution,
+            schema,
+            2_u8,
+        ))
+        .unwrap();
+        let mut hash = Sha256::new();
+        hash.update(b"openpacketcore/config-netconf/target-aad/v1\0");
+        hash.update(binding);
+        use std::fmt::Write;
+        let mut domain = "netconf-confirmation-v1-".to_owned();
+        for byte in hash.finalize() {
+            write!(&mut domain, "{byte:02x}").unwrap();
+        }
+        let aad = EnvelopeAad::config(
+            opc_types::TenantId::from_static("fixture-tenant"),
+            version,
+            ConfigAad::new(
+                opc_types::TxId::new(),
+                None,
+                "2026-01-01T00:00:00Z".parse().unwrap(),
+                "fixture-principal",
+                schema,
+                domain,
+            )
+            .unwrap(),
+        );
+        let key = KeyHandle::new(
+            KeyId::new("fixture-confirmation-key").unwrap(),
+            KeyPurpose::Config,
+            opc_types::TenantId::from_static("fixture-tenant"),
+            zeroize::Zeroizing::new([0x79; 32]),
+        );
+        let ownership = encrypt_attested_envelope_with_handle_and_nonce(
+            &key,
+            &aad,
+            b"synthetic-confirmation-owner",
+            [request; 12],
+        )
+        .unwrap();
+        let Some(TargetPayloadV1::Running {
+            confirmation_ownership,
+            ..
+        }) = &mut prepared.effect.encrypted_payload
+        else {
+            panic!("running fixture");
+        };
+        *confirmation_ownership = Some(TargetEncryptedBlobV1 {
+            schema,
+            plaintext_digest: Sha256::digest(b"synthetic-confirmation-owner").into(),
+            encrypted_blob: ownership.encoded().to_vec(),
+        });
+        let prepared = self.prepare(prepared.effect, prepared.handle.body.event);
+        self.bind_current_base(conn, prepared)
+    }
+}
+
+#[tokio::test]
+async fn target_confirmation_tentative_retains_exact_rollback_deadline_and_encrypted_ownership() {
+    use crate::consensus::audit_mutation::TargetPayloadV1;
+    let fixture = Fixture::new().await;
+    let shared = fixture.backend.conn();
+    let conn = shared.lock().await;
+    fixture.active(&conn);
+    let initial = fixture.encrypted(fixture.request(&conn, 91, 4, 0x61, 1), 0x36);
+    assert!(matches!(
+        fixture.submit(&conn, &initial),
+        AuditOperationState::TargetV1(_)
+    ));
+    fixture.settle(&conn, &initial);
+    let running = fixture.running_target(&conn, 92, 6, 0, 0x36);
+    assert!(matches!(
+        fixture.submit(&conn, &running),
+        AuditOperationState::TargetV1(_)
+    ));
+    fixture.settle(&conn, &running);
+    let staged = fixture.encrypted(fixture.request(&conn, 93, 4, 0x61, 1), 0x37);
+    let staged = fixture.bind_current_base(&conn, staged);
+    assert!(matches!(
+        fixture.submit(&conn, &staged),
+        AuditOperationState::TargetV1(_)
+    ));
+    fixture.settle(&conn, &staged);
+    let prepared = fixture.tentative_target(&conn, 94, 0x37);
+    let Some(TargetResolutionV1::InstallPending {
+        pending,
+        rollback_parent,
+        rollback_version,
+        original_deadline,
+        owner_session,
+        persistent,
+    }) = prepared.effect.resolution
+    else {
+        panic!("pending fixture");
+    };
+    let Some(TargetPayloadV1::Running {
+        commit,
+        confirmation_ownership: Some(ownership),
+    }) = &prepared.effect.encrypted_payload
+    else {
+        panic!("ownership fixture");
+    };
+    let result = fixture.submit(&conn, &prepared);
+    assert!(
+        matches!(result, AuditOperationState::TargetV1(result)
+        if matches!(result.outcome(), NetconfAppliedOutcome::Tentative { running_version: 2, retired_generation, pending: observed }
+            if retired_generation.get() == 4 && observed == pending)),
+        "checkpointed tentative promotion did not retain its ownership atomically"
+    );
+    fixture.assert_running_plaintext(&conn, &prepared);
+    let candidate = row(&conn, "config_netconf_targets", "target", 0);
+    assert_eq!(candidate["generation"], 4);
+    assert_eq!(candidate["present"], false);
+    let lifecycle = row(&conn, "config_netconf_lifecycle", "singleton", 1);
+    let retained = &lifecycle["pending_confirmation"];
+    assert_eq!(retained["pending"], serde_json::to_value(pending).unwrap());
+    assert_eq!(
+        retained["tx_id"],
+        serde_json::to_value(commit.record.tx_id).unwrap()
+    );
+    assert_eq!(retained["running_version"], 2);
+    assert_eq!(
+        retained["owner_session"],
+        serde_json::to_value(owner_session).unwrap()
+    );
+    assert_eq!(retained["persistent"], persistent);
+    assert_eq!(
+        lifecycle["rollback_parent"]["tx_id"],
+        serde_json::to_value(rollback_parent).unwrap()
+    );
+    assert_eq!(lifecycle["rollback_parent"]["version"], rollback_version);
+    assert_eq!(lifecycle["original_deadline"], original_deadline);
+    assert_eq!(
+        lifecycle["encrypted_confirmation_ownership"],
+        serde_json::to_value(ownership).unwrap()
+    );
+    let before = target_rows(&conn);
+    fixture
+        .apply(
+            &conn,
+            AuditCommand::NetconfTarget(Box::new(TargetAuditCommandV1::Apply(prepared.clone()))),
+            200,
+        )
+        .unwrap();
+    assert_eq!(
+        target_rows(&conn),
+        before,
+        "known replay cannot extend the pending deadline"
+    );
+    fixture.settle(&conn, &prepared);
+}
