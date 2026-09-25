@@ -153,6 +153,7 @@ pub(crate) fn write_sync(
     Ok(())
 }
 
+#[cfg(test)]
 pub(crate) fn apply_sync(
     conn: &Connection,
     key: &AuditKey,
@@ -161,10 +162,37 @@ pub(crate) fn apply_sync(
     now: i64,
     keys: Option<&AuditKeyRing>,
 ) -> io::Result<Result<(), ConfigMutationFailure>> {
+    apply_cancellable_sync(
+        conn,
+        key,
+        identity,
+        command,
+        now,
+        keys,
+        &super::sqlite::SqliteWorkCancellation::audit_test(),
+    )
+}
+
+pub(crate) fn apply_cancellable_sync(
+    conn: &Connection,
+    key: &AuditKey,
+    identity: ConfigConsensusIdentity,
+    command: &AuditCommand,
+    now: i64,
+    keys: Option<&AuditKeyRing>,
+    cancellation: &super::sqlite::SqliteWorkCancellation,
+) -> io::Result<Result<(), ConfigMutationFailure>> {
+    cancellation.check_io()?;
     if let AuditCommand::NetconfTarget(command) = command {
         if let super::audit_mutation::TargetAuditCommandV1::Apply(prepared) = &**command {
             return super::audit_targets::apply_target_sync(
-                conn, key, identity, prepared, now, keys,
+                conn,
+                key,
+                identity,
+                prepared,
+                now,
+                keys,
+                cancellation,
             );
         }
     }
@@ -280,21 +308,9 @@ pub(crate) fn apply_sync(
                         TargetAuditCommandV1::Admit(prepared) => {
                             ledger.admit_target(key, prepared, now)
                         }
-                        TargetAuditCommandV1::Apply(prepared) => (|| {
-                            prepared.verify_effect(key)?;
-                            let original = ledger.recover_target(
-                                key,
-                                prepared.handle(),
-                                prepared.handle.body.binding.caller,
-                            )?;
-                            if original.encode()? != prepared.encode()? {
-                                Err(AuditAuthorityError::BindingMismatch)
-                            } else {
-                                // Target effects stay unavailable until the complete
-                                // retained ownership/lifecycle path is connected.
-                                Err(AuditAuthorityError::RecoveryRequired)
-                            }
-                        })(),
+                        // Apply is dispatched above with the original cancellation
+                        // token and enclosing authority transaction.
+                        TargetAuditCommandV1::Apply(_) => Err(AuditAuthorityError::InvalidInput),
                     }
                 }
                 AuditCommand::Initialize { .. } | AuditCommand::InitializeWithContinuity { .. } => {
@@ -317,6 +333,7 @@ pub(crate) fn apply_sync(
         ledger.validate(key, identity).map_err(|_| invalid())?;
         ledger.validate_continuity(keys).map_err(|_| invalid())?;
     }
+    cancellation.check_io()?;
     write_sync(conn, key, identity, ledger, false)?;
     Ok(Ok(()))
 }

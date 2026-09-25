@@ -189,6 +189,11 @@ impl Drop for SqliteWorkCancelOnDrop {
 }
 
 impl SqliteWorkCancellation {
+    #[cfg(test)]
+    pub(crate) fn audit_test() -> Self {
+        Self::new()
+    }
+
     fn new() -> Self {
         Self {
             state: AtomicU8::new(SQLITE_WORK_RUNNING),
@@ -3105,14 +3110,17 @@ pub(crate) fn apply_entries_cancellable_sync(
                                 cancellation,
                             )?
                         }
-                        ConfigMutationIntent::ManagementAudit(audit) => super::audit::apply_sync(
-                            &tx,
-                            audit_key,
-                            identity,
-                            audit,
-                            logical_time.as_offset_datetime().unix_timestamp(),
-                            audit_keys,
-                        )?,
+                        ConfigMutationIntent::ManagementAudit(audit) => {
+                            super::audit::apply_cancellable_sync(
+                                &tx,
+                                audit_key,
+                                identity,
+                                audit,
+                                logical_time.as_offset_datetime().unix_timestamp(),
+                                audit_keys,
+                                cancellation,
+                            )?
+                        }
                         ConfigMutationIntent::RetainHistory(retention) => {
                             validate_sealed_state_sync(&tx, audit_key, cancellation)?;
                             super::history::retain_sync(&tx, audit_key, retention, cancellation)?

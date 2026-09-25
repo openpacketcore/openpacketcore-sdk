@@ -523,7 +523,12 @@ impl TargetState {
         }
     }
 
-    fn write(&self, conn: &Connection, key: &AuditKey) -> io::Result<()> {
+    fn write(
+        &self,
+        conn: &Connection,
+        key: &AuditKey,
+        cancellation: &SqliteWorkCancellation,
+    ) -> io::Result<()> {
         // Serialize and bound all rows before the first write. The enclosing
         // authority transaction owns both these rows and the ledger outcome.
         let rows = [
@@ -566,6 +571,7 @@ impl TargetState {
             }
         }
         for (table, column, slot, bytes, mac) in rows {
+            cancellation.check_io()?;
             let bytes = bytes.map_err(|_| invalid())?;
             let mac = mac.map_err(|_| invalid())?;
             if conn
@@ -908,14 +914,14 @@ impl TargetState {
                 self.advance_target(slot, prepared, blob)?;
                 if slot == 0 {
                     Ok(NetconfAppliedOutcome::Candidate {
-                        generation: crate::CandidateGeneration {
+                        generation: crate::audit_authority::CandidateGeneration {
                             authority: effect.authority,
                             value: self.targets[slot].generation,
                         },
                     })
                 } else {
                     Ok(NetconfAppliedOutcome::Startup {
-                        revision: crate::StartupRevision {
+                        revision: crate::audit_authority::StartupRevision {
                             authority: effect.authority,
                             value: self.targets[slot].generation,
                         },
@@ -980,6 +986,7 @@ pub(crate) fn apply_target_sync(
     prepared: &PreparedTargetMutation,
     now: i64,
     keys: Option<&AuditKeyRing>,
+    cancellation: &SqliteWorkCancellation,
 ) -> io::Result<Result<(), super::ConfigMutationFailure>> {
     use super::ConfigMutationFailure as Failure;
     if conn.is_autocommit() {
@@ -1026,10 +1033,9 @@ pub(crate) fn apply_target_sync(
     {
         return Ok(Err(Failure::InvalidInput));
     }
-    let cancellation = SqliteWorkCancellation::new();
-    let mut state = read_state_sync(conn, key, identity, &cancellation)?;
+    let mut state = read_state_sync(conn, key, identity, cancellation)?;
     state.validate_anchor(Some(&ledger))?;
-    super::history::validate_record_chain_sync(conn, key, &cancellation)?;
+    super::history::validate_record_chain_sync(conn, key, cancellation)?;
     let reduced = prepared
         .handle
         .require_live(now)
@@ -1070,8 +1076,9 @@ pub(crate) fn apply_target_sync(
         .map_err(|_| invalid())?;
     if result.is_ok() {
         state.validate_anchor(Some(&ledger))?;
-        state.write(conn, key)?;
+        state.write(conn, key, cancellation)?;
     }
+    cancellation.check_io()?;
     super::audit::write_sync(conn, key, identity, Some(ledger), false)?;
     Ok(result)
 }

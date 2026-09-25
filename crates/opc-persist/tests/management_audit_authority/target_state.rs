@@ -332,7 +332,7 @@ impl Fixture {
         let lifecycle = row(conn, "config_netconf_lifecycle", "singleton", 1);
         let destination = if matches!(action, 4 | 5) {
             TargetExpectationV1::Candidate {
-                generation: crate::CandidateGeneration {
+                generation: crate::audit_authority::CandidateGeneration {
                     authority: self.identity,
                     value: row(conn, "config_netconf_targets", "target", 0)["generation"]
                         .as_u64()
@@ -341,7 +341,7 @@ impl Fixture {
             }
         } else if matches!(action, 7 | 8) {
             TargetExpectationV1::Startup {
-                revision: crate::StartupRevision {
+                revision: crate::audit_authority::StartupRevision {
                     authority: self.identity,
                     value: row(conn, "config_netconf_targets", "target", 1)["generation"]
                         .as_u64()
@@ -667,7 +667,7 @@ async fn target_state_generations_locks_and_session_loss_fence_stale_effects() {
         &conn,
         &fixture.key,
         fixture.identity,
-        &crate::consensus::sqlite::SqliteWorkCancellation::new(),
+        &crate::consensus::sqlite::SqliteWorkCancellation::audit_test(),
     )
     .unwrap();
 }
@@ -720,7 +720,7 @@ async fn target_state_pruned_anchor_rejects_authenticated_older_rows_and_snapsho
             &conn,
             &fixture.key,
             fixture.identity,
-            &crate::consensus::sqlite::SqliteWorkCancellation::new(),
+            &crate::consensus::sqlite::SqliteWorkCancellation::audit_test(),
         )
     };
     validate().unwrap();

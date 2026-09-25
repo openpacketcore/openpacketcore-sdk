@@ -522,7 +522,12 @@ impl TargetEffectV1 {
         let mut digest = Sha256::new();
         digest.update(b"openpacketcore/config-netconf/target-aad/v1\0");
         digest.update(binding);
-        Ok(format!("netconf-{name}-v1-{:x}", digest.finalize()))
+        use std::fmt::Write;
+        let mut store_kind = format!("netconf-{name}-v1-");
+        for byte in digest.finalize() {
+            write!(&mut store_kind, "{byte:02x}").map_err(|_| AuditAuthorityError::InvalidInput)?;
+        }
+        Ok(store_kind)
     }
 }
 
