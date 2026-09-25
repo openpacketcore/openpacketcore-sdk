@@ -4,11 +4,11 @@
 use super::*;
 use crate::audit_authority::{AuditLedgerLimits, AuditToken};
 use crate::consensus::audit::AuditCommand;
+use crate::consensus::ConfigConsensusCommand;
 use crate::{
-    ConfigConsensusClusterId, ConfigConsensusCommand, ConfigConsensusConfigurationEpoch,
-    ConfigConsensusConfigurationId, ConfigConsensusRequestId, ConfigConsensusTopology,
-    RetainedConfigBinding, RetainedConfigDurability, RetainedConfigOptions,
-    CONFIG_CONSENSUS_COMMAND_VERSION,
+    ConfigConsensusClusterId, ConfigConsensusConfigurationEpoch, ConfigConsensusConfigurationId,
+    ConfigConsensusRequestId, ConfigConsensusTopology, RetainedConfigBinding,
+    RetainedConfigDurability, RetainedConfigOptions, CONFIG_CONSENSUS_COMMAND_VERSION,
 };
 use opc_consensus::engine::{CommittedLeaderId, Membership};
 
