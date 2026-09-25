@@ -2715,7 +2715,14 @@ async fn target_device_preparation_preserves_reboot_cleanup_before_serving() {
         device_incarnation: effect.device_incarnation,
         caller: event.caller,
     };
-    let prepared = fixture.prepare(effect, event);
+    let stale = fixture.prepare(effect, event);
+    assert_eq!(fixture.device_view(&conn).running_version, 2);
+    assert_eq!(stale.handle.body.binding.base_version, 0);
+    assert_eq!(
+        fixture.preflight(&conn, &stale, 100),
+        Err(AuditAuthorityError::BindingMismatch)
+    );
+    let prepared = fixture.rebind_at(&conn, stale, 100);
     assert!(matches!(
         fixture.submit(&conn, &prepared),
         AuditOperationState::TargetV1(_)
