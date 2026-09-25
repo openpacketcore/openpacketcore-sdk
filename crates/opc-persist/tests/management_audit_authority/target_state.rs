@@ -10560,3 +10560,100 @@ async fn target_recovery_pending_read_cannot_replace_a_later_original() {
         first_result
     );
 }
+
+// Append to target_state.rs. Existing APIs only; this is a prepared detector,
+// not a runtime result. It exercises the receipt producer used after apply.
+#[tokio::test]
+async fn target_receipt_requires_the_retained_description_after_admission_race() {
+    use crate::consensus::ConfigMutationIntent;
+    let fixture = Fixture::new().await;
+    let shared = fixture.backend.conn();
+    let conn = shared.lock().await;
+    fixture.active(&conn);
+
+    // An actual retained target result still produces truthful receipts for
+    // both phase replays, including when its terminal obligation is outstanding.
+    let original = fixture.request(&conn, 249, 5, 0x61, 1);
+    let applied = fixture.submit(&conn, &original);
+    assert!(matches!(applied, AuditOperationState::TargetV1(_)));
+    for phase in [
+        TargetAuditCommandV1::Admit(original.clone()),
+        TargetAuditCommandV1::Apply(original.clone()),
+    ] {
+        let tx = conn.unchecked_transaction().unwrap();
+        let proof = crate::consensus::audit::applied_receipt_sync(
+            &tx,
+            &fixture.key,
+            fixture.identity,
+            &ConfigMutationIntent::ManagementAudit(AuditCommand::NetconfTarget(Box::new(phase))),
+        )
+        .unwrap()
+        .unwrap();
+        let receipt = proof
+            .read_back(
+                &fixture.key,
+                fixture.identity,
+                original.handle(),
+                original.effect.caller,
+            )
+            .unwrap();
+        assert_eq!(receipt.state(), applied);
+        assert!(!receipt.terminal_recorded());
+        tx.commit().unwrap();
+    }
+    fixture.settle(&conn, &original);
+
+    let prepared = fixture.request(&conn, 250, 5, 0x61, 1);
+    assert!(fixture.preflight(&conn, &prepared, 100).unwrap().is_none());
+    // A caller can present the same authentic handle at the ordinary admission
+    // port while the target proposal is in flight. Its ordinary receipt does
+    // not retain the target description required for target recovery.
+    fixture
+        .apply(&conn, AuditCommand::Intent(prepared.handle().clone()), 100)
+        .unwrap();
+    assert!(matches!(
+        fixture.preflight(&conn, &prepared, 100),
+        Err(AuditAuthorityError::BindingMismatch)
+    ));
+    let ledger = fixture.ledger(&conn);
+    assert_eq!(
+        ledger
+            .lookup(&fixture.key, prepared.handle(), prepared.effect.caller)
+            .unwrap()
+            .unwrap()
+            .state(),
+        AuditOperationState::Intent
+    );
+    assert!(matches!(
+        ledger.recover_target(&fixture.key, prepared.handle(), prepared.effect.caller),
+        Err(AuditAuthorityError::BindingMismatch)
+    ));
+    let before = (target_rows(&conn), ledger.sequence);
+    assert!(fixture
+        .apply(
+            &conn,
+            AuditCommand::NetconfTarget(Box::new(TargetAuditCommandV1::Admit(prepared.clone()))),
+            100,
+        )
+        .is_err());
+    assert_eq!((target_rows(&conn), fixture.ledger(&conn).sequence), before);
+    for phase in [
+        TargetAuditCommandV1::Admit(prepared.clone()),
+        TargetAuditCommandV1::Apply(prepared.clone()),
+    ] {
+        let tx = conn.unchecked_transaction().unwrap();
+        let proof = crate::consensus::audit::applied_receipt_sync(
+            &tx,
+            &fixture.key,
+            fixture.identity,
+            &ConfigMutationIntent::ManagementAudit(AuditCommand::NetconfTarget(Box::new(phase))),
+        )
+        .unwrap();
+        assert!(
+            proof.is_none(),
+            "rejected target admission sealed an ordinary intent receipt"
+        );
+        tx.commit().unwrap();
+    }
+    assert_eq!((target_rows(&conn), fixture.ledger(&conn).sequence), before);
+}

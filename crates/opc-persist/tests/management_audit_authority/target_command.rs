@@ -813,3 +813,91 @@ fn retained_target_admission_rejects_unknown_nested_handle_fields() {
         .unwrap()
         .unwrap();
 }
+
+// Append to the existing target_command.rs codec fixtures. This uses only
+// existing APIs, so the absent command is a runnable behavior detector.
+// Parsing is deliberately not represented as authority authentication.
+#[test]
+fn target_empty_commit_command_preserves_allocated_phases_and_strict_bytes() {
+    use crate::consensus::audit_mutation::TargetAuditCommandV1;
+
+    let ordinary = signed_discard();
+    let key = AuditKey::new([0x24; 32]).unwrap();
+    let privacy = AuditPrivacyKey::new([0x23; 32]).unwrap();
+    let mut body = ordinary.handle.body.clone();
+    body.event.operation = ManagementAuditOperationCode::Commit;
+    body.event.outcome = ManagementAuditOutcomeCode::Success;
+    body.event.transaction = None;
+    body.binding =
+        AuditOperationBinding::project(&privacy, &body.event, 0, b"fixture-empty-commit").unwrap();
+    body.mutation = None;
+    let handle = AuditOperationHandle::issue(body, &key).unwrap();
+    let fixture = json!({"netconf-target": {"empty-commit": {
+        "handle": handle,
+        "guard": {
+            "format": 1,
+            "authority": handle.body.identity,
+            "profile_incarnation": vec![0x31u8; 16],
+            "device_incarnation": vec![0x32u8; 16],
+            "caller": handle.body.binding.caller,
+            "session": vec![0x33u8; 16],
+            "candidate_generation": 0,
+            "state_digest": vec![0x34u8; 32],
+            "running_base": 0
+        },
+        "guard_mac": vec![0x35u8; 32]
+    }}});
+
+    // New observation admission must not change the bytes used to distinguish
+    // the existing intent/effect phases, even before it becomes representable.
+    for (phase, command) in [
+        (0, TargetAuditCommandV1::Admit(ordinary.clone())),
+        (1, TargetAuditCommandV1::Apply(ordinary)),
+    ] {
+        let bytes =
+            opc_consensus::encode_bounded(&AuditCommand::NetconfTarget(Box::new(command))).unwrap();
+        assert_eq!(&bytes[..2], &[9, phase]);
+        let restored: AuditCommand = opc_consensus::decode_bounded(&bytes).unwrap();
+        assert_eq!(opc_consensus::encode_bounded(&restored).unwrap(), bytes);
+    }
+    let parsed = serde_json::from_value::<AuditCommand>(fixture.clone());
+    assert!(
+        parsed.is_ok(),
+        "guarded empty-commit observation is not representable"
+    );
+    let parsed = parsed.unwrap();
+    assert_eq!(serde_json::to_value(&parsed).unwrap(), fixture);
+    let encoded = opc_consensus::encode_bounded(&parsed).unwrap();
+    assert_eq!(&encoded[..2], &[9, 2]);
+    let restored: AuditCommand = opc_consensus::decode_bounded(&encoded).unwrap();
+    assert_eq!(serde_json::to_value(&restored).unwrap(), fixture);
+    for end in 0..encoded.len() {
+        assert!(opc_consensus::decode_bounded::<AuditCommand>(&encoded[..end]).is_err());
+    }
+    let mut trailing = encoded;
+    trailing.push(0);
+    assert!(opc_consensus::decode_bounded::<AuditCommand>(&trailing).is_err());
+    for pointer in [
+        "/netconf-target/empty-commit",
+        "/netconf-target/empty-commit/handle",
+        "/netconf-target/empty-commit/handle/body",
+        "/netconf-target/empty-commit/handle/body/identity",
+        "/netconf-target/empty-commit/handle/body/binding",
+        "/netconf-target/empty-commit/handle/body/event",
+        "/netconf-target/empty-commit/guard",
+        "/netconf-target/empty-commit/guard/authority",
+        "/netconf-target/empty-commit/guard/caller",
+    ] {
+        let mut unknown = fixture.clone();
+        unknown
+            .pointer_mut(pointer)
+            .unwrap()
+            .as_object_mut()
+            .unwrap()
+            .insert("unallocated".into(), true.into());
+        assert!(
+            serde_json::from_value::<AuditCommand>(unknown).is_err(),
+            "unknown guarded-observation field bypassed closed command decoding"
+        );
+    }
+}
