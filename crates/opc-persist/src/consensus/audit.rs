@@ -161,6 +161,13 @@ pub(crate) fn apply_sync(
     now: i64,
     keys: Option<&AuditKeyRing>,
 ) -> io::Result<Result<(), ConfigMutationFailure>> {
+    if let AuditCommand::NetconfTarget(command) = command {
+        if let super::audit_mutation::TargetAuditCommandV1::Apply(prepared) = &**command {
+            return super::audit_targets::apply_target_sync(
+                conn, key, identity, prepared, now, keys,
+            );
+        }
+    }
     let mut ledger = read_with_keys_sync(conn, key, keys, identity)?;
     let result = match command {
         AuditCommand::Initialize { .. } if keys.is_some() => {

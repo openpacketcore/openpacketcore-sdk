@@ -272,6 +272,15 @@ pub(crate) struct LedgerEntry {
     pub(crate) mac: [u8; 32],
 }
 
+// Root-authenticated retained anchor survives acknowledged prefix pruning. The
+// new field is absent in legacy JSON, preserving the historical MAC transcript.
+#[derive(Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct TargetStateAnchor {
+    pub(crate) sequence: u64,
+    pub(crate) result: super::NetconfTargetResult,
+}
+
 /// Exactly one bounded state, changed inside the existing Raft apply transaction.
 #[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -287,6 +296,8 @@ pub(crate) struct LedgerState {
     pub(crate) entries: Vec<LedgerEntry>,
     pub(crate) operations: Vec<LedgerOperation>,
     pub(crate) continuity: Option<super::continuity::chain::ContinuityState>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) target_anchor: Option<TargetStateAnchor>,
 }
 
 impl LedgerState {
@@ -307,6 +318,7 @@ impl LedgerState {
             entries: Vec::new(),
             operations: Vec::new(),
             continuity: None,
+            target_anchor: None,
         }
     }
 
@@ -570,6 +582,17 @@ impl LedgerState {
         if current.state != AuditOperationState::Intent || state == AuditOperationState::Intent {
             return Err(AuditAuthorityError::BindingMismatch);
         }
+        let target = self.entries.iter().any(|entry| {
+            matches!(&entry.payload, EntryPayload::TargetIntent(retained) if retained.handle == *handle)
+        });
+        if target
+            && !matches!(
+                state,
+                AuditOperationState::Rejected | AuditOperationState::TargetV1(_)
+            )
+        {
+            return Err(AuditAuthorityError::BindingMismatch);
+        }
         let sequence = self.append(
             key,
             EntryPayload::Outcome {
@@ -581,6 +604,11 @@ impl LedgerState {
         current.state = state;
         current.last_sequence = sequence;
         current.reserved = 1;
+        if target {
+            if let AuditOperationState::TargetV1(result) = state {
+                self.target_anchor = Some(TargetStateAnchor { sequence, result });
+            }
+        }
         Ok(())
     }
 
@@ -658,6 +686,7 @@ impl LedgerState {
         let mut sequence = self.floor;
         let mut previous = self.predecessor;
         let mut derived: Vec<LedgerOperation> = Vec::new();
+        let mut target_anchor = None;
         for entry in &self.entries {
             sequence = sequence
                 .checked_add(1)
@@ -734,6 +763,15 @@ impl LedgerState {
                         return Err(AuditAuthorityError::BindingMismatch);
                     }
                     state.validate_target_for(&op.handle)?;
+                    if self.entries.iter().any(|entry| {
+                        matches!(&entry.payload, EntryPayload::TargetIntent(retained) if retained.handle == op.handle)
+                    }) {
+                        match state {
+                            AuditOperationState::TargetV1(result) => target_anchor = Some(TargetStateAnchor { sequence, result: *result }),
+                            AuditOperationState::Rejected => {},
+                            _ => return Err(AuditAuthorityError::BindingMismatch),
+                        }
+                    }
                     op.state = *state;
                     op.last_sequence = sequence;
                     op.reserved = 1;
@@ -762,6 +800,15 @@ impl LedgerState {
                 }
             }
             previous = entry.mac;
+        }
+        match (target_anchor, self.target_anchor) {
+            (Some(derived), Some(stored)) if derived == stored => {}
+            (None, None) => {}
+            (None, Some(stored))
+                if stored.sequence > 0
+                    && stored.sequence <= self.floor
+                    && stored.result.authority() == identity => {}
+            _ => return Err(AuditAuthorityError::BindingMismatch),
         }
         if derived != self.operations {
             return Err(AuditAuthorityError::BindingMismatch);

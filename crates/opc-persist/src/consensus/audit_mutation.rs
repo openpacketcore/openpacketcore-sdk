@@ -219,6 +219,8 @@ pub(crate) struct TargetLockExpectationV1 {
     pub(crate) datastore: u8,
     pub(crate) incarnation: u64,
     pub(crate) session: Option<[u8; 16]>,
+    // Authenticated requesting session is separate from the observed lock owner.
+    pub(crate) requester: [u8; 16],
 }
 
 #[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -375,6 +377,7 @@ impl TargetEffectV1 {
         }
         if self.lock.as_ref().is_some_and(|lock| {
             lock.datastore > 2
+                || lock.requester == [0; 16]
                 || lock.session == Some([0; 16])
                 || (lock.session.is_some() && lock.incarnation == 0)
         }) {
@@ -487,8 +490,44 @@ impl TargetEffectV1 {
     }
 }
 
+impl TargetEffectV1 {
+    pub(crate) fn encryption_store_kind(
+        &self,
+        schema: opc_types::SchemaDigest,
+        target: u8,
+    ) -> Result<String, AuditAuthorityError> {
+        use sha2::{Digest, Sha256};
+        let name = match target {
+            0 => "candidate",
+            1 => "startup",
+            _ => return Err(AuditAuthorityError::InvalidInput),
+        };
+        let binding = serde_json::to_vec(&(
+            self.format,
+            self.authority,
+            self.profile_incarnation,
+            self.device_incarnation,
+            self.caller,
+            self.request,
+            self.action,
+            &self.destination,
+            &self.source,
+            &self.lock,
+            self.expires_at,
+            &self.resolution,
+            schema,
+            target,
+        ))
+        .map_err(|_| AuditAuthorityError::InvalidInput)?;
+        let mut digest = Sha256::new();
+        digest.update(b"openpacketcore/config-netconf/target-aad/v1\0");
+        digest.update(binding);
+        Ok(format!("netconf-{name}-v1-{:x}", digest.finalize()))
+    }
+}
+
 impl TargetEncryptedBlobV1 {
-    fn validate(&self) -> Result<(), AuditAuthorityError> {
+    pub(crate) fn validate(&self) -> Result<(), AuditAuthorityError> {
         if self.encrypted_blob.len() > super::sqlite::CONFIG_CONSENSUS_LOG_ENTRY_MAX_BYTES {
             return Err(AuditAuthorityError::InvalidInput);
         }

@@ -427,6 +427,10 @@ impl NetconfTargetResult {
         }
     }
 
+    pub(crate) const fn profile_incarnation(self) -> [u8; 16] {
+        self.profile_incarnation
+    }
+
     /// Digest of the complete resulting profile, targets and lifecycle state.
     pub const fn state_digest(self) -> [u8; 32] {
         self.state_digest
@@ -438,11 +442,17 @@ impl NetconfTargetResult {
     ) -> Result<(), AuditAuthorityError> {
         if self.authority != handle.body.identity
             || handle.body.mutation.is_none()
-            || !matches!(
+            || !(matches!(
                 handle.body.event.transport,
                 crate::ManagementAuditTransportCode::NetconfSsh
                     | crate::ManagementAuditTransportCode::NetconfTls
-            )
+            ) || (handle.body.event.transport
+                == crate::ManagementAuditTransportCode::Internal
+                && matches!(
+                    self.outcome(),
+                    NetconfAppliedOutcome::Lifecycle { .. }
+                        | NetconfAppliedOutcome::RolledBack { .. }
+                )))
             || handle.body.event.outcome != crate::ManagementAuditOutcomeCode::Intent
         {
             return Err(AuditAuthorityError::BindingMismatch);

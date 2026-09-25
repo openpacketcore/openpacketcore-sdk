@@ -64,7 +64,7 @@ fn discard_command() -> Value {
             "action": 5,
             "destination": {"candidate": {"generation": {"authority": identity, "value": 0}}},
             "source": null,
-            "lock": {"datastore": 1, "incarnation": 1, "session": vec![0x33u8; 16]},
+            "lock": {"datastore": 1, "incarnation": 1, "session": vec![0x33u8; 16], "requester": vec![0x33u8; 16]},
             "expires_at": 160,
             "encrypted_payload": null,
             "resolution": null
