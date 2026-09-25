@@ -530,3 +530,130 @@ impl NetconfWorkerBinding {
         self.worker.ptr_eq(&std::sync::Arc::downgrade(&erased))
     }
 }
+
+/// Datastore protected by a retained NETCONF lock. These codes do not identify
+/// a session or grant any permission to read or mutate that datastore.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum NetconfLockDatastore {
+    /// The current running configuration.
+    Running,
+    /// The retained candidate configuration.
+    Candidate,
+    /// The retained startup configuration.
+    Startup,
+}
+
+impl NetconfLockDatastore {
+    pub(crate) fn slot(self) -> usize {
+        match self {
+            Self::Running => 0,
+            Self::Candidate => 1,
+            Self::Startup => 2,
+        }
+    }
+}
+
+struct NetconfSessionState {
+    incarnation: [u8; 16],
+    active: std::sync::atomic::AtomicBool,
+}
+
+/// Authenticated session incarnation under one SDK-issued device owner.
+/// Numeric protocol session IDs are not accepted as ownership evidence.
+/// This token is local and cannot be reconstructed from a saved request.
+#[derive(Clone)]
+pub struct NetconfSessionOwner {
+    pub(crate) device: NetconfDeviceOwner,
+    pub(crate) caller: super::AuditCaller,
+    state: std::sync::Arc<NetconfSessionState>,
+}
+
+impl NetconfSessionOwner {
+    pub(crate) fn new(
+        device: NetconfDeviceOwner,
+        caller: super::AuditCaller,
+        incarnation: [u8; 16],
+    ) -> Result<Self, AuditAuthorityError> {
+        if incarnation == [0; 16] {
+            return Err(AuditAuthorityError::InvalidInput);
+        }
+        Ok(Self {
+            device,
+            caller,
+            state: std::sync::Arc::new(NetconfSessionState {
+                incarnation,
+                active: std::sync::atomic::AtomicBool::new(true),
+            }),
+        })
+    }
+
+    /// Immediately revoke this local session and every clone. This does not
+    /// acknowledge durable unlock, candidate discard, or confirmed rollback.
+    /// The owning worker must retain and complete the exact cleanup operation
+    /// before permitting subsequent effects; dropping an RPC future is not
+    /// that worker's lifetime boundary.
+    pub fn invalidate(&self) {
+        self.state
+            .active
+            .store(false, std::sync::atomic::Ordering::Release);
+    }
+
+    pub(crate) fn require_active(&self) -> Result<(), AuditAuthorityError> {
+        if self.state.active.load(std::sync::atomic::Ordering::Acquire) {
+            Ok(())
+        } else {
+            Err(AuditAuthorityError::BindingMismatch)
+        }
+    }
+
+    pub(crate) fn incarnation(&self) -> [u8; 16] {
+        self.state.incarnation
+    }
+
+    pub(crate) fn same_session(&self, other: &Self) -> bool {
+        std::sync::Arc::ptr_eq(&self.state, &other.state)
+    }
+}
+
+impl fmt::Debug for NetconfSessionOwner {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("NetconfSessionOwner(<redacted>)")
+    }
+}
+
+/// Closed acquisition or release preparation bound to the original session.
+/// Retain its mutation before admission and recover only that original handle.
+#[derive(Clone)]
+pub struct PreparedNetconfLock {
+    pub(crate) session: NetconfSessionOwner,
+    pub(crate) datastore: NetconfLockDatastore,
+    pub(crate) prepared: super::PreparedTargetMutation,
+}
+
+impl PreparedNetconfLock {
+    /// Exact closed lock effect for required intent and result admission.
+    pub fn mutation(&self) -> &super::PreparedTargetMutation {
+        &self.prepared
+    }
+}
+
+impl fmt::Debug for PreparedNetconfLock {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("PreparedNetconfLock(<redacted>)")
+    }
+}
+
+/// An applied, checkpointed retained lease belonging to one exact session.
+/// Possession alone does not prove the lease is still current.
+#[derive(Clone)]
+pub struct NetconfLockLease {
+    pub(crate) session: NetconfSessionOwner,
+    pub(crate) datastore: NetconfLockDatastore,
+    pub(crate) incarnation: u64,
+}
+
+impl fmt::Debug for NetconfLockLease {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("NetconfLockLease(<redacted>)")
+    }
+}

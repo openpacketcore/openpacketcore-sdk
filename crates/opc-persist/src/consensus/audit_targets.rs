@@ -1634,6 +1634,7 @@ pub(crate) struct NetconfDeviceView {
     pub(crate) state_digest: [u8; 32],
     pub(crate) unsettled: bool,
     pub(crate) cleanup_pending: bool,
+    locks: [Option<NetconfLockView>; 3],
     checkpoint: AuditCheckpoint,
     sequence: u64,
 }
@@ -1760,7 +1761,119 @@ pub(crate) fn read_device_view_sync(
             .iter()
             .any(|op| !op.terminal_recorded || ledger.mutation_outcome_needs_checkpoint(op)),
         cleanup_pending: state.lifecycle.cleanup.iter().any(Option::is_some),
+        locks: state.lifecycle.locks.each_ref().map(|lock| {
+            lock.as_ref().map(|value| NetconfLockView {
+                incarnation: value.incarnation,
+                session: value.session,
+                caller: value.caller,
+            })
+        }),
         checkpoint,
         sequence: ledger.sequence,
     })
+}
+
+/// Retained lease fields read in the same pinned transaction as the device.
+#[derive(Clone, Copy)]
+pub(crate) struct NetconfLockView {
+    incarnation: u64,
+    session: Option<[u8; 16]>,
+    caller: Option<AuditCaller>,
+}
+
+impl NetconfDeviceView {
+    pub(crate) fn verify_session(
+        &self,
+        session: &crate::audit_authority::NetconfSessionOwner,
+    ) -> Result<(), AuditAuthorityError> {
+        session.require_active()?;
+        self.verify_owner(&session.device)
+    }
+
+    pub(crate) fn verify_lease(
+        &self,
+        lease: &crate::audit_authority::NetconfLockLease,
+    ) -> Result<(), AuditAuthorityError> {
+        self.verify_session(&lease.session)?;
+        let current =
+            self.locks[lease.datastore.slot()].ok_or(AuditAuthorityError::BindingMismatch)?;
+        if current.incarnation != lease.incarnation
+            || current.session != Some(lease.session.incarnation())
+            || current.caller != Some(lease.session.caller)
+        {
+            return Err(AuditAuthorityError::BindingMismatch);
+        }
+        Ok(())
+    }
+
+    pub(crate) fn prepare_lock(
+        &self,
+        session: &crate::audit_authority::NetconfSessionOwner,
+        event: &crate::audit_authority::ProjectedAuditEvent,
+        datastore: crate::audit_authority::NetconfLockDatastore,
+        release: Option<&crate::audit_authority::NetconfLockLease>,
+        expires_at: i64,
+    ) -> Result<super::audit_mutation::TargetEffectV1, AuditAuthorityError> {
+        use crate::ManagementAuditTransportCode as Transport;
+        self.verify_session(session)?;
+        if event.caller != session.caller
+            || event.outcome != crate::ManagementAuditOutcomeCode::Intent
+            || event.operation != crate::ManagementAuditOperationCode::Exec
+            || !matches!(
+                event.transport,
+                Transport::NetconfSsh | Transport::NetconfTls
+            )
+        {
+            return Err(AuditAuthorityError::BindingMismatch);
+        }
+        let current = self.locks[datastore.slot()].ok_or(AuditAuthorityError::BindingMismatch)?;
+        current
+            .incarnation
+            .checked_add(1)
+            .ok_or(AuditAuthorityError::Full)?;
+        let (action, resolution) = if let Some(lease) = release {
+            if !lease.session.same_session(session) || lease.datastore != datastore {
+                return Err(AuditAuthorityError::BindingMismatch);
+            }
+            self.verify_lease(lease)?;
+            (
+                3,
+                TargetResolutionV1::ReleaseLock {
+                    session: session.incarnation(),
+                },
+            )
+        } else {
+            if current.session.is_some() {
+                return Err(AuditAuthorityError::BindingMismatch);
+            }
+            (
+                2,
+                TargetResolutionV1::AcquireLock {
+                    session: session.incarnation(),
+                },
+            )
+        };
+        Ok(super::audit_mutation::TargetEffectV1 {
+            format: 1,
+            authority: self.authority,
+            profile_incarnation: session.device.profile_incarnation,
+            device_incarnation: session.device.device_incarnation,
+            caller: event.caller,
+            request: event.request,
+            action: action.try_into()?,
+            destination: TargetExpectationV1::Lifecycle {
+                state_digest: self.state_digest,
+            },
+            source: None,
+            lock: Some(super::audit_mutation::TargetLockExpectationV1 {
+                datastore: datastore.slot() as u8,
+                incarnation: current.incarnation,
+                session: current.session,
+                requester: session.incarnation(),
+            }),
+            expires_at,
+            encrypted_payload: None,
+            resolution: Some(resolution),
+        })
+    }
 }

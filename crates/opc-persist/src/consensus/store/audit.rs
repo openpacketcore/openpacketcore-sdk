@@ -1029,3 +1029,184 @@ impl ConsensusConfigStore {
         Ok(view)
     }
 }
+
+impl ConsensusConfigStore {
+    /// Issue a fresh session incarnation after the trusted transport has
+    /// authenticated `caller` independently. This verifies the retained device;
+    /// it does not perform transport authentication or grant NACM permission.
+    /// Numeric NETCONF session IDs cannot be used as authority capabilities.
+    pub async fn open_netconf_session(
+        &self,
+        device: &crate::audit_authority::NetconfDeviceOwner,
+        caller: AuditCaller,
+    ) -> Result<crate::audit_authority::NetconfSessionOwner, AuditAuthorityError> {
+        self.verify_netconf_device_owner(device).await?;
+        crate::audit_authority::NetconfSessionOwner::new(
+            device.clone(),
+            caller,
+            *uuid::Uuid::new_v4().as_bytes(),
+        )
+    }
+
+    /// Check exact worker/device ownership and a locally active session belonging
+    /// to the independently authenticated caller. The registry and ConfigBus
+    /// must additionally hold their exact worker/operation capability.
+    pub async fn verify_netconf_session_owner(
+        &self,
+        session: &crate::audit_authority::NetconfSessionOwner,
+        caller: AuditCaller,
+    ) -> Result<(), AuditAuthorityError> {
+        if session.caller != caller || !session.device.worker.belongs_to(&self.inner) {
+            return Err(AuditAuthorityError::BindingMismatch);
+        }
+        session.require_active()?;
+        self.read_netconf_device_view()
+            .await?
+            .verify_session(session)?;
+        session.require_active()
+    }
+
+    /// Prepare an exact retained lock acquisition; no lock or intent is granted
+    /// by preparation alone. Retain the returned mutation before admission.
+    pub async fn prepare_netconf_lock_acquisition(
+        &self,
+        session: &crate::audit_authority::NetconfSessionOwner,
+        datastore: crate::audit_authority::NetconfLockDatastore,
+        privacy: &dyn AuditPrivacyProjection,
+        event: &ManagementAuditEventRecord,
+        lifetime: std::time::Duration,
+    ) -> Result<crate::audit_authority::PreparedNetconfLock, AuditAuthorityError> {
+        self.prepare_netconf_lock(session, datastore, None, privacy, event, lifetime)
+            .await
+    }
+
+    /// Prepare release of this session's exact retained lease. Candidate release
+    /// includes the authority's atomic discard and tombstone transition. A known
+    /// applied release remains known even when later audit reporting fails.
+    pub async fn prepare_netconf_lock_release(
+        &self,
+        session: &crate::audit_authority::NetconfSessionOwner,
+        lease: &crate::audit_authority::NetconfLockLease,
+        privacy: &dyn AuditPrivacyProjection,
+        event: &ManagementAuditEventRecord,
+        lifetime: std::time::Duration,
+    ) -> Result<crate::audit_authority::PreparedNetconfLock, AuditAuthorityError> {
+        self.prepare_netconf_lock(
+            session,
+            lease.datastore,
+            Some(lease),
+            privacy,
+            event,
+            lifetime,
+        )
+        .await
+    }
+
+    /// Claim the lease established by this exact acquisition after terminal
+    /// checkpoint completion. A receipt cannot restore a released or replaced
+    /// lease, nor can an equal principal stand in for the original session.
+    pub async fn claim_netconf_lock_lease(
+        &self,
+        prepared: &crate::audit_authority::PreparedNetconfLock,
+        receipt: &AuditOperationReceipt,
+        caller: AuditCaller,
+    ) -> Result<crate::audit_authority::NetconfLockLease, AuditAuthorityError> {
+        let bad = AuditAuthorityError::BindingMismatch;
+        if !prepared.session.device.worker.belongs_to(&self.inner)
+            || prepared.session.caller != caller
+            || receipt.handle != prepared.prepared.handle
+            || u8::from(prepared.prepared.effect.action) != 2
+        {
+            return Err(bad);
+        }
+        prepared.session.require_active()?;
+        self.verify_netconf_target(&prepared.prepared, caller)?;
+        let crate::audit_authority::AuditOperationState::TargetV1(result) = receipt.state() else {
+            return Err(bad);
+        };
+        prepared.prepared.validate_result(result)?;
+        let expected = prepared.prepared.effect.lock.as_ref().ok_or(bad)?;
+        let lease = crate::audit_authority::NetconfLockLease {
+            session: prepared.session.clone(),
+            datastore: prepared.datastore,
+            incarnation: expected
+                .incarnation
+                .checked_add(1)
+                .ok_or(AuditAuthorityError::Full)?,
+        };
+        self.verify_netconf_lock_lease(&lease, caller).await?;
+        Ok(lease)
+    }
+
+    /// Verify a currently held retained lease for the exact active session,
+    /// caller, worker, device, datastore and monotonically increasing counter.
+    pub async fn verify_netconf_lock_lease(
+        &self,
+        lease: &crate::audit_authority::NetconfLockLease,
+        caller: AuditCaller,
+    ) -> Result<(), AuditAuthorityError> {
+        if lease.session.caller != caller || !lease.session.device.worker.belongs_to(&self.inner) {
+            return Err(AuditAuthorityError::BindingMismatch);
+        }
+        lease.session.require_active()?;
+        self.read_netconf_device_view().await?.verify_lease(lease)?;
+        lease.session.require_active()
+    }
+
+    async fn prepare_netconf_lock(
+        &self,
+        session: &crate::audit_authority::NetconfSessionOwner,
+        datastore: crate::audit_authority::NetconfLockDatastore,
+        release: Option<&crate::audit_authority::NetconfLockLease>,
+        privacy: &dyn AuditPrivacyProjection,
+        event: &ManagementAuditEventRecord,
+        lifetime: std::time::Duration,
+    ) -> Result<crate::audit_authority::PreparedNetconfLock, AuditAuthorityError> {
+        self.require_netconf_target_profile()?;
+        if !session.device.worker.belongs_to(&self.inner) {
+            return Err(AuditAuthorityError::BindingMismatch);
+        }
+        if lifetime.subsec_nanos() != 0 || !(1..=3600).contains(&lifetime.as_secs()) {
+            return Err(AuditAuthorityError::InvalidInput);
+        }
+        session.require_active()?;
+        let event = ProjectedAuditEvent::project(privacy, event)?;
+        let issued_at = self
+            .inner
+            .clock
+            .now_utc()
+            .as_offset_datetime()
+            .unix_timestamp();
+        let expires_at = issued_at
+            .checked_add(lifetime.as_secs() as i64)
+            .ok_or(AuditAuthorityError::InvalidInput)?;
+        let view = self.read_netconf_device_view().await?;
+        let effect = view.prepare_lock(session, &event, datastore, release, expires_at)?;
+        let digest = effect.digest(self.inner.backend.audit_key())?;
+        let binding =
+            AuditOperationBinding::project(privacy, &event, view.running_version, &digest)?;
+        let handle = AuditOperationHandle::issue(
+            HandleBody {
+                version: 1,
+                identity: self.inner.identity,
+                binding,
+                event,
+                issued_at,
+                expires_at,
+                nonce: *uuid::Uuid::new_v4().as_bytes(),
+                key_epoch: self.inner.backend.audit_key().epoch(),
+                mutation: Some(digest),
+            },
+            self.inner.backend.audit_key(),
+        )?;
+        let prepared = crate::audit_authority::PreparedTargetMutation { handle, effect };
+        prepared.verify_effect(self.inner.backend.audit_key())?;
+        self.preflight_netconf_target(&prepared).await?;
+        session.require_active()?;
+        Ok(crate::audit_authority::PreparedNetconfLock {
+            session: session.clone(),
+            datastore,
+            prepared,
+        })
+    }
+}

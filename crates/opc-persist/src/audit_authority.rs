@@ -31,7 +31,8 @@ pub(crate) use targets::{
 };
 pub use targets::{
     CandidateGeneration, NetconfAppliedOutcome, NetconfDeviceOwner, NetconfIncarnation,
-    NetconfPendingConfirmation, NetconfTargetResult, PreparedNetconfDevice, StartupRevision,
+    NetconfLockDatastore, NetconfLockLease, NetconfPendingConfirmation, NetconfSessionOwner,
+    NetconfTargetResult, PreparedNetconfDevice, PreparedNetconfLock, StartupRevision,
 };
 
 /// Largest aggregate private tuple accepted before projection.

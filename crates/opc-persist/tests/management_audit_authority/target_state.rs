@@ -2749,3 +2749,253 @@ async fn target_device_preparation_preserves_reboot_cleanup_before_serving() {
     fixture.assert_no_pending(&conn);
     assert_eq!(fixture.device_view(&conn).verify_owner(&owner), Ok(()));
 }
+
+impl Fixture {
+    fn session_owner(
+        &self,
+        conn: &Connection,
+        worker: &std::sync::Arc<()>,
+        session: u8,
+    ) -> crate::audit_authority::NetconfSessionOwner {
+        use crate::audit_authority::{
+            NetconfDeviceOwner, NetconfSessionOwner, NetconfWorkerBinding,
+        };
+        let view = self.device_view(conn);
+        let device = NetconfDeviceOwner {
+            worker: NetconfWorkerBinding::new(worker),
+            authority: view.authority,
+            profile_incarnation: view.profile_incarnation.unwrap(),
+            device_incarnation: view.device_incarnation.unwrap(),
+            caller: view.caller.unwrap(),
+        };
+        NetconfSessionOwner::new(device, self.event(180).caller, [session; 16]).unwrap()
+    }
+}
+
+#[tokio::test]
+async fn target_session_locks_bind_all_datastores_and_refuse_stale_or_foreign_leases() {
+    use crate::audit_authority::{
+        NetconfLockDatastore as Store, NetconfLockLease, PreparedNetconfLock,
+    };
+    for datastore in [Store::Running, Store::Candidate, Store::Startup] {
+        let fixture = Fixture::new().await;
+        let shared = fixture.backend.conn();
+        let conn = shared.lock().await;
+        fixture.active(&conn);
+        let worker = std::sync::Arc::new(());
+        let session = fixture.session_owner(&conn, &worker, 0x61);
+        let foreign = fixture.session_owner(&conn, &worker, 0x62);
+        assert_eq!(session.caller, foreign.caller);
+        let event = fixture.event(180);
+        let effect = fixture
+            .device_view(&conn)
+            .prepare_lock(&session, &event, datastore, None, 160)
+            .unwrap();
+        let mutation = fixture.prepare(effect, event);
+        let prepared = PreparedNetconfLock {
+            session: session.clone(),
+            datastore,
+            prepared: mutation.clone(),
+        };
+        assert_eq!(prepared.mutation(), &mutation);
+        let lease = NetconfLockLease {
+            session: session.clone(),
+            datastore,
+            incarnation: 1,
+        };
+        assert_eq!(
+            fixture.device_view(&conn).verify_lease(&lease),
+            Err(AuditAuthorityError::BindingMismatch)
+        );
+        assert_eq!(fixture.preflight(&conn, &mutation, 100).unwrap(), None);
+        assert!(matches!(
+            fixture.submit(&conn, &mutation),
+            AuditOperationState::TargetV1(_)
+        ));
+        assert_eq!(
+            fixture.device_view(&conn).verify_lease(&lease),
+            Err(AuditAuthorityError::RecoveryRequired)
+        );
+        fixture.settle(&conn, &mutation);
+        assert_eq!(fixture.device_view(&conn).verify_lease(&lease), Ok(()));
+        assert!(matches!(
+            fixture.device_view(&conn).prepare_lock(
+                &foreign,
+                &fixture.event(181),
+                datastore,
+                Some(&lease),
+                160
+            ),
+            Err(AuditAuthorityError::BindingMismatch)
+        ));
+        let counterfeit = NetconfLockLease {
+            session: foreign.clone(),
+            ..lease.clone()
+        };
+        assert_eq!(
+            fixture.device_view(&conn).verify_lease(&counterfeit),
+            Err(AuditAuthorityError::BindingMismatch)
+        );
+        if datastore == Store::Candidate {
+            let staged = fixture.encrypted(fixture.request(&conn, 181, 4, 0x61, 1), 0x37);
+            assert!(matches!(
+                fixture.submit(&conn, &staged),
+                AuditOperationState::TargetV1(_)
+            ));
+            fixture.settle(&conn, &staged);
+            assert_eq!(
+                row(&conn, "config_netconf_targets", "target", 0)["generation"],
+                1
+            );
+        }
+        let event = fixture.event(182);
+        let effect = fixture
+            .device_view(&conn)
+            .prepare_lock(&session, &event, datastore, Some(&lease), 160)
+            .unwrap();
+        let release = fixture.prepare(effect, event);
+        assert!(matches!(
+            fixture.submit(&conn, &release),
+            AuditOperationState::TargetV1(_)
+        ));
+        fixture.settle(&conn, &release);
+        assert_eq!(
+            fixture.device_view(&conn).verify_lease(&lease),
+            Err(AuditAuthorityError::BindingMismatch)
+        );
+        if datastore == Store::Candidate {
+            let row = row(&conn, "config_netconf_targets", "target", 0);
+            assert_eq!(row["generation"], 2);
+            assert_eq!(row["present"], false);
+            assert!(row["encrypted_envelope"].is_null());
+        }
+        let event = fixture.event(183);
+        let effect = fixture
+            .device_view(&conn)
+            .prepare_lock(&session, &event, datastore, None, 160)
+            .unwrap();
+        let reacquire = fixture.prepare(effect, event);
+        assert!(matches!(
+            fixture.submit(&conn, &reacquire),
+            AuditOperationState::TargetV1(_)
+        ));
+        fixture.settle(&conn, &reacquire);
+        assert_eq!(
+            fixture.device_view(&conn).verify_lease(&lease),
+            Err(AuditAuthorityError::BindingMismatch)
+        );
+        let current = NetconfLockLease {
+            incarnation: 3,
+            ..lease.clone()
+        };
+        assert_eq!(fixture.device_view(&conn).verify_lease(&current), Ok(()));
+        assert!(matches!(
+            fixture.device_view(&conn).prepare_lock(
+                &session,
+                &fixture.event(184),
+                datastore,
+                Some(&lease),
+                160
+            ),
+            Err(AuditAuthorityError::BindingMismatch)
+        ));
+        assert_eq!(format!("{session:?} {prepared:?} {current:?}"),"NetconfSessionOwner(<redacted>) PreparedNetconfLock(<redacted>) NetconfLockLease(<redacted>)");
+    }
+}
+
+#[tokio::test]
+async fn target_session_invalidation_reaches_clones_and_cannot_be_reactivated_by_equal_values() {
+    use crate::audit_authority::{NetconfLockDatastore, NetconfSessionOwner};
+    let fixture = Fixture::new().await;
+    let shared = fixture.backend.conn();
+    let conn = shared.lock().await;
+    fixture.active(&conn);
+    let worker = std::sync::Arc::new(());
+    let session = fixture.session_owner(&conn, &worker, 0x61);
+    let clone = session.clone();
+    let equal = fixture.session_owner(&conn, &worker, 0x61);
+    assert!(session.same_session(&clone));
+    assert!(!session.same_session(&equal));
+    assert_eq!(fixture.device_view(&conn).verify_session(&clone), Ok(()));
+    assert!(matches!(
+        NetconfSessionOwner::new(session.device.clone(), session.caller, [0; 16]),
+        Err(AuditAuthorityError::InvalidInput)
+    ));
+    session.invalidate();
+    clone.invalidate();
+    assert_eq!(
+        session.require_active(),
+        Err(AuditAuthorityError::BindingMismatch)
+    );
+    assert_eq!(
+        clone.require_active(),
+        Err(AuditAuthorityError::BindingMismatch)
+    );
+    assert_eq!(
+        fixture.device_view(&conn).verify_session(&clone),
+        Err(AuditAuthorityError::BindingMismatch)
+    );
+    assert!(matches!(
+        fixture.device_view(&conn).prepare_lock(
+            &clone,
+            &fixture.event(185),
+            NetconfLockDatastore::Running,
+            None,
+            160
+        ),
+        Err(AuditAuthorityError::BindingMismatch)
+    ));
+    assert!(equal.require_active().is_ok());
+    assert!(!equal.same_session(&session));
+}
+
+#[tokio::test]
+async fn target_session_preparation_refuses_wrong_caller_transport_operation_and_old_device() {
+    use crate::audit_authority::NetconfLockDatastore;
+    let fixture = Fixture::new().await;
+    let shared = fixture.backend.conn();
+    let conn = shared.lock().await;
+    fixture.active(&conn);
+    let worker = std::sync::Arc::new(());
+    let session = fixture.session_owner(&conn, &worker, 0x61);
+    let view = fixture.device_view(&conn);
+    let before = target_rows(&conn);
+    let changes = conn.total_changes();
+    for variant in 0..3 {
+        let mut event = fixture.event(186);
+        match variant {
+            0 => {
+                event.caller = AuditCaller::project(
+                    &fixture.privacy,
+                    "fixture-tenant",
+                    "fixture-other-principal",
+                )
+                .unwrap()
+            }
+            1 => event.transport = ManagementAuditTransportCode::Internal,
+            _ => event.operation = ManagementAuditOperationCode::Read,
+        }
+        assert!(matches!(
+            view.prepare_lock(&session, &event, NetconfLockDatastore::Running, None, 160),
+            Err(AuditAuthorityError::BindingMismatch)
+        ));
+    }
+    assert_eq!(conn.total_changes(), changes);
+    assert_eq!(target_rows(&conn), before);
+    let event = fixture.device_event(187);
+    let effect = view.prepare(&event, 160, [0x57; 16], [0x58; 16]).unwrap();
+    let replacement = fixture.prepare(effect, event);
+    assert!(matches!(
+        fixture.submit(&conn, &replacement),
+        AuditOperationState::TargetV1(_)
+    ));
+    fixture.settle(&conn, &replacement);
+    assert_eq!(
+        fixture.device_view(&conn).verify_session(&session),
+        Err(AuditAuthorityError::BindingMismatch)
+    );
+    assert!(
+        session.require_active().is_ok(),
+        "local activity must not replace retained device verification"
+    );
+}
