@@ -2216,3 +2216,107 @@ async fn target_fallback_copy_binds_the_absent_candidate_and_exact_running_sourc
     fixture.assert_running_plaintext(&conn, &fresh);
     fixture.settle(&conn, &fresh);
 }
+
+// The target contract must reject unknown nested input even when a reused
+// legacy codec historically ignored it. No authority key or MAC is changed.
+fn assert_closed_target_input(prepared: &PreparedTargetMutation, paths: &[&str]) {
+    let encoded = prepared.encode().unwrap();
+    assert_eq!(PreparedTargetMutation::decode(&encoded).unwrap(), *prepared);
+    for phase in [false, true] {
+        let command = AuditCommand::NetconfTarget(Box::new(if phase {
+            TargetAuditCommandV1::Apply(prepared.clone())
+        } else {
+            TargetAuditCommandV1::Admit(prepared.clone())
+        }));
+        let bytes = opc_consensus::encode_bounded(&command).unwrap();
+        let restored: AuditCommand = opc_consensus::decode_bounded(&bytes).unwrap();
+        assert_eq!(
+            serde_json::to_value(&restored).unwrap(),
+            serde_json::to_value(&command).unwrap()
+        );
+        assert_eq!(opc_consensus::encode_bounded(&restored).unwrap(), bytes);
+    }
+    for path in paths {
+        let mut value = serde_json::to_value(prepared).unwrap();
+        value
+            .pointer_mut(path)
+            .unwrap()
+            .as_object_mut()
+            .unwrap()
+            .insert("unallocated-target-field".into(), serde_json::json!(0));
+        assert!(
+            PreparedTargetMutation::decode(&serde_json::to_vec(&value).unwrap()).is_err(),
+            "target recovery accepted unknown nested input"
+        );
+        for phase in ["admit", "apply"] {
+            let command = serde_json::json!({"netconf-target": {phase: value.clone()}});
+            assert!(
+                serde_json::from_value::<AuditCommand>(command).is_err(),
+                "target command accepted unknown nested input"
+            );
+        }
+    }
+}
+
+#[tokio::test]
+async fn target_closed_input_rejects_unknown_bootstrap_checkpoint_identity() {
+    let fixture = Fixture::new().await;
+    let shared = fixture.backend.conn();
+    let conn = shared.lock().await;
+    let prepared = fixture.activate(&conn);
+    assert_closed_target_input(
+        &prepared,
+        &[
+            "/effect/resolution/activate/checkpoint/body/identity",
+            "/effect/resolution/activate/checkpoint/body",
+            "/effect/resolution/activate/checkpoint",
+        ],
+    );
+}
+
+#[tokio::test]
+async fn target_closed_input_rejects_unknown_running_commit_and_audit_fields() {
+    use crate::consensus::audit_mutation::TargetPayloadV1;
+    let fixture = Fixture::new().await;
+    let shared = fixture.backend.conn();
+    let conn = shared.lock().await;
+    fixture.active(&conn);
+    let stage = fixture.encrypted(fixture.request(&conn, 141, 4, 0x61, 1), 0x41);
+    assert!(matches!(
+        fixture.submit(&conn, &stage),
+        AuditOperationState::TargetV1(_)
+    ));
+    fixture.settle(&conn, &stage);
+    let mut prepared = fixture.running_target(&conn, 142, 6, 0, 0x41);
+    let Some(TargetPayloadV1::Running { commit, .. }) = &mut prepared.effect.encrypted_payload
+    else {
+        panic!("running fixture");
+    };
+    let audit = crate::AuditRecord {
+        tx_id: commit.record.tx_id,
+        sequence: 0,
+        yang_path: "/fixture:configuration".into(),
+        op_type: crate::AuditOpType::Replace,
+        previous_value: None,
+        new_value: None,
+        redaction_applied: false,
+        previous_hash: [0; 32],
+        entry_hmac: [0; 32],
+    };
+    **commit = crate::consensus::PreparedConfigCommit::prepare(
+        commit.record.clone(),
+        vec![audit],
+        &fixture.key,
+    )
+    .unwrap();
+    let prepared = fixture.rebind_at(&conn, prepared, 100);
+    prepared.verify_effect(&fixture.key).unwrap();
+    assert_closed_target_input(
+        &prepared,
+        &[
+            "/effect/encrypted_payload/running/commit",
+            "/effect/encrypted_payload/running/commit/record",
+            "/effect/encrypted_payload/running/commit/audit/0",
+        ],
+    );
+}
