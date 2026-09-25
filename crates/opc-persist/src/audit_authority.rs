@@ -21,6 +21,9 @@ pub(crate) mod confirmation;
 pub(crate) use targets::NetconfPendingView;
 /// Authenticated retained epochs, portable exports and external checkpoints.
 pub mod continuity;
+mod empty_commit;
+pub(crate) use empty_commit::EmptyCommitGuard;
+pub use empty_commit::{NetconfEmptyCommitRead, PreparedNetconfEmptyCommit};
 pub(crate) mod ledger;
 mod netconf_recovery;
 pub(crate) mod receipt;

@@ -433,6 +433,18 @@ running effect, candidate retirement and pending resolution are one transaction.
 Validate/test-only and ordinary reads remain observations; they cannot acquire
 configuration-effect authority.
 
+The empty observation retains its exact authority/profile/device, caller/session,
+candidate generation, complete lifecycle digest and running base (including zero).
+Its append-only nested command phase and authenticated ledger payload are distinct
+from both target intent/effect phases and ordinary handle observations. A general
+observation of the same handle cannot prove that these expectations were checked.
+The committing receipt uses a separate existing-HMAC domain bound to the original
+guard, preserving known success without an additional available read. Exact
+retained replay precedes current-state and expiry checks; a different guard under
+the same request is refused. New admission rechecks absence, ownership, cleanup
+and terminal/checkpoint fences in the audit transaction without changing target
+or running rows.
+
 Tentative promotion retains the pending transaction, rollback parent, original
 deadline and encrypted session/persistent ownership in the same transaction as
 the tentative effect. Confirmation and cancellation compare that exact pending

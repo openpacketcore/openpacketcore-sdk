@@ -315,6 +315,11 @@ pub(crate) fn apply_cancellable_sync(
                         TargetAuditCommandV1::Admit(prepared) => {
                             ledger.admit_target(key, prepared, now)
                         }
+                        TargetAuditCommandV1::EmptyCommit(prepared) => {
+                            super::audit_targets::admit_empty_commit_sync(
+                                conn, key, ledger, prepared, context,
+                            )?
+                        }
                         // Apply is dispatched above with the original cancellation
                         // token and enclosing authority transaction.
                         TargetAuditCommandV1::Apply(_) => Err(AuditAuthorityError::InvalidInput),
@@ -375,7 +380,7 @@ pub(crate) fn applied_receipt_sync(
             | AuditCommand::Terminal(handle),
         ) => handle,
         super::ConfigMutationIntent::ManagementAudit(AuditCommand::NetconfTarget(command)) => {
-            command.prepared().handle()
+            command.handle()
         }
         _ => return Ok(None),
     };
@@ -389,6 +394,21 @@ pub(crate) fn applied_receipt_sync(
     let Some(ledger) = read_sync(conn, key, identity)? else {
         return Ok(None);
     };
+    if let super::ConfigMutationIntent::ManagementAudit(AuditCommand::NetconfTarget(command)) =
+        intent
+    {
+        let receipt = match command.lookup_receipt(&ledger, key, handle.body.binding.caller) {
+            Ok(Some(receipt)) => receipt,
+            Ok(None) | Err(_) => return Ok(None),
+        };
+        let proof = match &**command {
+            super::audit_mutation::TargetAuditCommandV1::EmptyCommit(prepared) => {
+                AuthenticatedAuditReceipt::seal_empty_commit(key, prepared, &receipt)
+            }
+            _ => AuthenticatedAuditReceipt::seal(key, &receipt),
+        };
+        return proof.map(Some).map_err(|_| invalid());
+    }
     ledger
         .lookup(key, handle, handle.body.binding.caller)
         .map_err(|_| invalid())?

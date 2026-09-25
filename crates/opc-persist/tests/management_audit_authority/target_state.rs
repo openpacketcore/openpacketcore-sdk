@@ -10657,3 +10657,569 @@ async fn target_receipt_requires_the_retained_description_after_admission_race()
     }
     assert_eq!((target_rows(&conn), fixture.ledger(&conn).sequence), before);
 }
+
+impl Fixture {
+    fn empty_commit_event(&self, request: u8) -> ProjectedAuditEvent {
+        let mut event = self.event(request);
+        event.operation = ManagementAuditOperationCode::Commit;
+        event.outcome = ManagementAuditOutcomeCode::Success;
+        event.transaction = None;
+        event
+    }
+
+    fn frozen_empty_commit(
+        &self,
+        conn: &Connection,
+        session: &crate::audit_authority::NetconfSessionOwner,
+    ) -> Result<crate::audit_authority::NetconfEmptyCommitRead, AuditAuthorityError> {
+        let tx = conn.unchecked_transaction().unwrap();
+        let read = crate::consensus::audit_targets::read_empty_commit_sync(
+            &tx,
+            &self.key,
+            &self.ledger(&tx),
+            session,
+            &crate::consensus::sqlite::SqliteWorkCancellation::audit_test(),
+        )
+        .unwrap();
+        tx.commit().unwrap();
+        read
+    }
+
+    fn prepare_empty_commit(
+        &self,
+        frozen: &crate::audit_authority::NetconfEmptyCommitRead,
+        session: &crate::audit_authority::NetconfSessionOwner,
+        request: u8,
+    ) -> crate::audit_authority::PreparedNetconfEmptyCommit {
+        frozen
+            .prepare(
+                &self.key,
+                &self.privacy,
+                session,
+                self.empty_commit_event(request),
+                100..160,
+                [0x55; 16],
+            )
+            .unwrap()
+    }
+
+    fn observe_empty_commit(
+        &self,
+        conn: &Connection,
+        prepared: &crate::audit_authority::PreparedNetconfEmptyCommit,
+        now: i64,
+    ) -> Result<(), ConfigMutationFailure> {
+        self.apply(
+            conn,
+            AuditCommand::NetconfTarget(Box::new(TargetAuditCommandV1::EmptyCommit(
+                prepared.clone(),
+            ))),
+            now,
+        )
+    }
+}
+
+#[tokio::test]
+async fn target_empty_commit_observes_only_the_original_empty_state_and_replays_it() {
+    let fixture = Fixture::new().await;
+    let shared = fixture.backend.conn();
+    let conn = shared.lock().await;
+    fixture.active(&conn);
+    let worker = std::sync::Arc::new(());
+    let session = fixture.session_owner(&conn, &worker, 0x61);
+    let before = target_rows(&conn);
+    let changes = conn.total_changes();
+    let frozen = fixture.frozen_empty_commit(&conn, &session).unwrap();
+    let prepared = fixture.prepare_empty_commit(&frozen, &session, 239);
+    assert_eq!(conn.total_changes(), changes);
+    assert_eq!(target_rows(&conn), before);
+    assert!(prepared.handle().body.mutation.is_none());
+    assert!(prepared.handle().body.event.transaction.is_none());
+    assert_eq!(prepared.handle().body.binding.base_version, 0);
+    let sequence = fixture.ledger(&conn).sequence;
+    assert!(
+        fixture.observe_empty_commit(&conn, &prepared, 100).is_ok(),
+        "authoritatively empty plain commit did not retain its guarded observation"
+    );
+    let ledger = fixture.ledger(&conn);
+    let receipt = ledger
+        .lookup_empty_commit(&fixture.key, &prepared, session.caller)
+        .unwrap()
+        .unwrap();
+    assert_eq!(ledger.sequence, sequence + 1);
+    assert_eq!(
+        receipt.state(),
+        AuditOperationState::Observed {
+            outcome: ManagementAuditOutcomeCode::Success,
+        }
+    );
+    assert!(receipt.terminal_recorded());
+    assert_eq!(target_rows(&conn), before);
+    let history_count: u64 = conn
+        .query_row("SELECT COUNT(*) FROM config_history", [], |row| row.get(0))
+        .unwrap();
+    assert_eq!(history_count, 0);
+
+    // A later state change and expired original deadline cannot rewrite a
+    // previously known empty-commit observation or append another observation.
+    let stage = fixture.encrypted(fixture.request(&conn, 240, 4, 0x61, 1), 0x7a);
+    assert!(matches!(
+        fixture.submit(&conn, &stage),
+        AuditOperationState::TargetV1(_)
+    ));
+    fixture.settle(&conn, &stage);
+    let before_replay = fixture.ledger(&conn).sequence;
+    assert!(fixture.observe_empty_commit(&conn, &prepared, 160).is_ok());
+    assert_eq!(fixture.ledger(&conn).sequence, before_replay);
+    assert_eq!(
+        fixture
+            .ledger(&conn)
+            .lookup_empty_commit(&fixture.key, &prepared, session.caller)
+            .unwrap()
+            .unwrap()
+            .state(),
+        receipt.state()
+    );
+    drop(conn);
+    let reopened = Connection::open(fixture.directory.path().join("authority.sqlite")).unwrap();
+    let decoded =
+        crate::audit_authority::PreparedNetconfEmptyCommit::decode(&prepared.encode().unwrap())
+            .unwrap();
+    assert_eq!(
+        fixture
+            .ledger(&reopened)
+            .lookup_empty_commit(&fixture.key, &decoded, session.caller)
+            .unwrap()
+            .unwrap()
+            .state(),
+        receipt.state()
+    );
+}
+
+#[tokio::test]
+async fn target_empty_commit_refuses_staging_and_stage_discard_aba() {
+    let fixture = Fixture::new().await;
+    let shared = fixture.backend.conn();
+    let conn = shared.lock().await;
+    fixture.active(&conn);
+    let worker = std::sync::Arc::new(());
+    let session = fixture.session_owner(&conn, &worker, 0x61);
+    let frozen = fixture.frozen_empty_commit(&conn, &session).unwrap();
+    let before_stage = fixture.prepare_empty_commit(&frozen, &session, 239);
+    let before_aba = fixture.prepare_empty_commit(&frozen, &session, 240);
+    let stage = fixture.encrypted(fixture.request(&conn, 241, 4, 0x61, 1), 0x7a);
+    assert!(matches!(
+        fixture.submit(&conn, &stage),
+        AuditOperationState::TargetV1(_)
+    ));
+    fixture.settle(&conn, &stage);
+    assert!(fixture.frozen_empty_commit(&conn, &session).is_err());
+    let before = (target_rows(&conn), fixture.ledger(&conn).sequence);
+    assert!(
+        fixture
+            .observe_empty_commit(&conn, &before_stage, 100)
+            .is_err(),
+        "staged candidate passed the frozen empty-commit guard"
+    );
+    assert_eq!((target_rows(&conn), fixture.ledger(&conn).sequence), before);
+    let discard = fixture.request(&conn, 242, 5, 0x61, 1);
+    assert!(matches!(
+        fixture.submit(&conn, &discard),
+        AuditOperationState::TargetV1(_)
+    ));
+    fixture.settle(&conn, &discard);
+    assert_eq!(
+        row(&conn, "config_netconf_targets", "target", 0)["present"],
+        false
+    );
+    let before = (target_rows(&conn), fixture.ledger(&conn).sequence);
+    assert!(
+        fixture
+            .observe_empty_commit(&conn, &before_aba, 100)
+            .is_err(),
+        "stage-discard ABA reused the original empty candidate generation"
+    );
+    assert_eq!((target_rows(&conn), fixture.ledger(&conn).sequence), before);
+    let fresh = fixture.frozen_empty_commit(&conn, &session).unwrap();
+    let new = fixture.prepare_empty_commit(&fresh, &session, 243);
+    assert!(fixture.observe_empty_commit(&conn, &new, 100).is_ok());
+}
+
+#[tokio::test]
+async fn target_empty_commit_refuses_an_ordinary_observation_receipt() {
+    use crate::consensus::ConfigMutationIntent;
+    let fixture = Fixture::new().await;
+    let shared = fixture.backend.conn();
+    let conn = shared.lock().await;
+    fixture.active(&conn);
+    let worker = std::sync::Arc::new(());
+    let session = fixture.session_owner(&conn, &worker, 0x61);
+    let frozen = fixture.frozen_empty_commit(&conn, &session).unwrap();
+    let prepared = fixture.prepare_empty_commit(&frozen, &session, 239);
+    // General observations remain valid. They cannot prove that the specific
+    // candidate/pending state was checked in their admission transaction.
+    fixture
+        .apply(&conn, AuditCommand::Intent(prepared.handle().clone()), 100)
+        .unwrap();
+    let ledger = fixture.ledger(&conn);
+    assert!(matches!(
+        ledger
+            .lookup(&fixture.key, prepared.handle(), session.caller)
+            .unwrap()
+            .unwrap()
+            .state(),
+        AuditOperationState::Observed { .. }
+    ));
+    assert!(
+        matches!(
+            ledger.lookup_empty_commit(&fixture.key, &prepared, session.caller),
+            Err(AuditAuthorityError::BindingMismatch)
+        ),
+        "ordinary observation supplied a guarded empty-commit receipt"
+    );
+    let before = (target_rows(&conn), ledger.sequence);
+    assert!(fixture.observe_empty_commit(&conn, &prepared, 100).is_err());
+    assert_eq!((target_rows(&conn), fixture.ledger(&conn).sequence), before);
+    let command = ConfigMutationIntent::ManagementAudit(AuditCommand::NetconfTarget(Box::new(
+        TargetAuditCommandV1::EmptyCommit(prepared.clone()),
+    )));
+    let tx = conn.unchecked_transaction().unwrap();
+    let proof = crate::consensus::audit::applied_receipt_sync(
+        &tx,
+        &fixture.key,
+        fixture.identity,
+        &command,
+    )
+    .unwrap();
+    assert!(
+        proof.is_none(),
+        "rejected empty commit sealed an ordinary observation proof"
+    );
+    tx.commit().unwrap();
+}
+
+#[tokio::test]
+async fn target_empty_commit_refuses_new_running_state_and_pending_confirmation() {
+    let fixture = Fixture::new().await;
+    let shared = fixture.backend.conn();
+    let conn = shared.lock().await;
+    fixture.active(&conn);
+    let worker = std::sync::Arc::new(());
+    let session = fixture.session_owner(&conn, &worker, 0x61);
+    let frozen = fixture.frozen_empty_commit(&conn, &session).unwrap();
+    let initial = fixture.prepare_empty_commit(&frozen, &session, 239);
+    let config = br#"{"retained":0}"#;
+    let (provider, source) = copy_provider_stage(&fixture, &conn, 0, config).await;
+    let running = fixture.running_target(&conn, 181, 6, 0, 0x6a);
+    let running = provider_rewrap_running(&fixture, &conn, &provider, running, 181, config).await;
+    let running = bind_copy_provider(&fixture, &conn, &provider, &source, running)
+        .await
+        .unwrap();
+    assert!(matches!(
+        fixture.submit(&conn, &running),
+        AuditOperationState::TargetV1(_)
+    ));
+    fixture.settle(&conn, &running);
+    assert!(
+        fixture.observe_empty_commit(&conn, &initial, 100).is_err(),
+        "initial running base zero acted as a wildcard for an empty commit"
+    );
+    let empty_running = fixture.frozen_empty_commit(&conn, &session).unwrap();
+    let before_pending = fixture.prepare_empty_commit(&empty_running, &session, 240);
+    provider_stage_second_candidate(&fixture, &conn, br#"{"retained":1}"#).await;
+    let promotion = fixture.frozen_promotion(&conn, &session).unwrap();
+    let pending =
+        confirmed_sdk_install(&fixture, &conn, &session, &promotion, &provider, None).await;
+    fixture.settle(&conn, &pending);
+    assert_eq!(
+        row(&conn, "config_netconf_targets", "target", 0)["present"],
+        false
+    );
+    assert!(
+        fixture.frozen_empty_commit(&conn, &session).is_err(),
+        "an empty pending confirmation was treated as an ordinary empty commit"
+    );
+    let before = (target_rows(&conn), fixture.ledger(&conn).sequence);
+    assert!(
+        fixture
+            .observe_empty_commit(&conn, &before_pending, 100)
+            .is_err(),
+        "pending confirmation passed a previously empty lifecycle guard"
+    );
+    assert_eq!((target_rows(&conn), fixture.ledger(&conn).sequence), before);
+}
+
+#[tokio::test]
+async fn target_empty_commit_binds_session_event_and_strict_recovery_bytes() {
+    use crate::audit_authority::{AuditCaller, PreparedNetconfEmptyCommit};
+    let fixture = Fixture::new().await;
+    let shared = fixture.backend.conn();
+    let conn = shared.lock().await;
+    fixture.active(&conn);
+    let worker = std::sync::Arc::new(());
+    let session = fixture.session_owner(&conn, &worker, 0x61);
+    let frozen = fixture.frozen_empty_commit(&conn, &session).unwrap();
+    let prepare = |owner: &crate::audit_authority::NetconfSessionOwner, event| {
+        frozen.prepare(
+            &fixture.key,
+            &fixture.privacy,
+            owner,
+            event,
+            100..160,
+            [0x55; 16],
+        )
+    };
+    let equal_worker = std::sync::Arc::new(());
+    let replacement = fixture.session_owner(&conn, &equal_worker, 0x61);
+    let other_session = fixture.session_owner(&conn, &worker, 0x62);
+    for foreign in [&replacement, &other_session] {
+        assert!(matches!(
+            prepare(foreign, fixture.empty_commit_event(239)),
+            Err(AuditAuthorityError::BindingMismatch)
+        ));
+    }
+    let mut other_caller = fixture.empty_commit_event(239);
+    other_caller.caller =
+        AuditCaller::project(&fixture.privacy, "fixture-tenant", "other-principal").unwrap();
+    let mut other_operation = fixture.empty_commit_event(239);
+    other_operation.operation = ManagementAuditOperationCode::Exec;
+    let mut other_transport = fixture.empty_commit_event(239);
+    other_transport.transport = ManagementAuditTransportCode::Internal;
+    let mut other_outcome = fixture.empty_commit_event(239);
+    other_outcome.outcome = ManagementAuditOutcomeCode::Intent;
+    let mut claimed_transaction = fixture.empty_commit_event(239);
+    claimed_transaction.transaction = Some(claimed_transaction.request);
+    for invalid in [
+        other_caller,
+        other_operation,
+        other_transport,
+        other_outcome,
+        claimed_transaction,
+    ] {
+        assert!(
+            prepare(&session, invalid).is_err(),
+            "empty commit accepted a different audit assertion"
+        );
+    }
+    let prepared = fixture.prepare_empty_commit(&frozen, &session, 239);
+    let bytes = prepared.encode().unwrap();
+    let decoded = PreparedNetconfEmptyCommit::decode(&bytes).unwrap();
+    decoded
+        .verify(&fixture.key, fixture.identity, session.caller)
+        .unwrap();
+    assert_eq!(decoded.encode().unwrap(), bytes);
+    let original = serde_json::to_value(&prepared).unwrap();
+    for pointer in [
+        "",
+        "/handle",
+        "/handle/body",
+        "/handle/body/identity",
+        "/handle/body/binding",
+        "/handle/body/event",
+        "/guard",
+        "/guard/authority",
+        "/guard/caller",
+    ] {
+        let mut unknown = original.clone();
+        unknown
+            .pointer_mut(pointer)
+            .unwrap()
+            .as_object_mut()
+            .unwrap()
+            .insert("unallocated".into(), true.into());
+        assert!(
+            PreparedNetconfEmptyCommit::decode(&serde_json::to_vec(&unknown).unwrap()).is_err(),
+            "unknown empty-commit recovery field bypassed strict decoding"
+        );
+    }
+    let mut substituted = original;
+    substituted["guard"]["candidate_generation"] = 1.into();
+    let substituted =
+        PreparedNetconfEmptyCommit::decode(&serde_json::to_vec(&substituted).unwrap()).unwrap();
+    assert_eq!(
+        substituted.verify(&fixture.key, fixture.identity, session.caller),
+        Err(AuditAuthorityError::BindingMismatch)
+    );
+    assert!(PreparedNetconfEmptyCommit::decode(&vec![b' '; 32 * 1024 + 1]).is_err());
+    let before = (target_rows(&conn), fixture.ledger(&conn).sequence);
+    assert!(fixture.observe_empty_commit(&conn, &prepared, 160).is_err());
+    assert_eq!((target_rows(&conn), fixture.ledger(&conn).sequence), before);
+    session.invalidate();
+    assert!(prepare(&session, fixture.empty_commit_event(240)).is_err());
+}
+
+#[tokio::test]
+async fn target_empty_commit_preserves_debt_locks_and_request_uniqueness() {
+    let fixture = Fixture::new().await;
+    let shared = fixture.backend.conn();
+    let conn = shared.lock().await;
+    fixture.active(&conn);
+    let worker = std::sync::Arc::new(());
+    let session = fixture.session_owner(&conn, &worker, 0x61);
+    let frozen = fixture.frozen_empty_commit(&conn, &session).unwrap();
+    let original = fixture.prepare_empty_commit(&frozen, &session, 239);
+    assert!(fixture.observe_empty_commit(&conn, &original, 100).is_ok());
+    let locked = fixture.request(&conn, 240, 2, 0x62, 1);
+    fixture
+        .apply(
+            &conn,
+            AuditCommand::NetconfTarget(Box::new(TargetAuditCommandV1::Admit(locked.clone()))),
+            100,
+        )
+        .unwrap();
+    assert!(matches!(
+        fixture.frozen_empty_commit(&conn, &session),
+        Err(AuditAuthorityError::RecoveryRequired)
+    ));
+    fixture.checkpoint(&conn);
+    fixture
+        .apply(
+            &conn,
+            AuditCommand::NetconfTarget(Box::new(TargetAuditCommandV1::Apply(locked.clone()))),
+            100,
+        )
+        .unwrap();
+    assert!(matches!(
+        fixture.frozen_empty_commit(&conn, &session),
+        Err(AuditAuthorityError::RecoveryRequired)
+    ));
+    fixture
+        .apply(&conn, AuditCommand::Terminal(locked.handle().clone()), 100)
+        .unwrap();
+    assert!(matches!(
+        fixture.frozen_empty_commit(&conn, &session),
+        Err(AuditAuthorityError::RecoveryRequired)
+    ));
+    fixture.checkpoint(&conn);
+    assert!(
+        fixture.frozen_empty_commit(&conn, &session).is_err(),
+        "foreign candidate lock permitted empty commit"
+    );
+    let release = fixture.request(&conn, 241, 3, 0x62, 1);
+    assert!(matches!(
+        fixture.submit(&conn, &release),
+        AuditOperationState::TargetV1(_)
+    ));
+    fixture.settle(&conn, &release);
+    let later = fixture.frozen_empty_commit(&conn, &session).unwrap();
+    let ambiguous = fixture.prepare_empty_commit(&later, &session, 239);
+    assert_ne!(ambiguous.encode().unwrap(), original.encode().unwrap());
+    let before = (target_rows(&conn), fixture.ledger(&conn).sequence);
+    assert!(
+        fixture
+            .observe_empty_commit(&conn, &ambiguous, 100)
+            .is_err(),
+        "duplicate request replaced the original guarded observation"
+    );
+    assert_eq!((target_rows(&conn), fixture.ledger(&conn).sequence), before);
+    assert!(fixture.observe_empty_commit(&conn, &original, 160).is_ok());
+}
+
+#[tokio::test]
+async fn target_empty_commit_proof_binds_guard_and_survives_later_unavailability() {
+    use crate::audit_authority::receipt::AuthenticatedAuditReceipt;
+    use crate::consensus::ConfigMutationIntent;
+    let fixture = Fixture::new().await;
+    let shared = fixture.backend.conn();
+    let conn = shared.lock().await;
+    fixture.active(&conn);
+    let worker = std::sync::Arc::new(());
+    let session = fixture.session_owner(&conn, &worker, 0x61);
+    let frozen = fixture.frozen_empty_commit(&conn, &session).unwrap();
+    let prepared = fixture.prepare_empty_commit(&frozen, &session, 239);
+    assert!(fixture.observe_empty_commit(&conn, &prepared, 100).is_ok());
+    let receipt = fixture
+        .ledger(&conn)
+        .lookup_empty_commit(&fixture.key, &prepared, session.caller)
+        .unwrap()
+        .unwrap();
+    let tx = conn.unchecked_transaction().unwrap();
+    let proof = crate::consensus::audit::applied_receipt_sync(
+        &tx,
+        &fixture.key,
+        fixture.identity,
+        &ConfigMutationIntent::ManagementAudit(AuditCommand::NetconfTarget(Box::new(
+            TargetAuditCommandV1::EmptyCommit(prepared.clone()),
+        ))),
+    )
+    .unwrap()
+    .unwrap();
+    tx.commit().unwrap();
+    assert_eq!(
+        proof
+            .read_back_empty_commit(&fixture.key, fixture.identity, &prepared, session.caller)
+            .unwrap()
+            .state(),
+        receipt.state()
+    );
+    let ordinary = AuthenticatedAuditReceipt::seal(&fixture.key, &receipt).unwrap();
+    assert_eq!(
+        ordinary
+            .read_back(
+                &fixture.key,
+                fixture.identity,
+                prepared.handle(),
+                session.caller
+            )
+            .unwrap()
+            .state(),
+        receipt.state()
+    );
+    assert!(
+        ordinary
+            .read_back_empty_commit(&fixture.key, fixture.identity, &prepared, session.caller)
+            .is_err(),
+        "ordinary point-in-time receipt supplied guarded empty-commit proof"
+    );
+    assert!(proof
+        .read_back(
+            &fixture.key,
+            fixture.identity,
+            prepared.handle(),
+            session.caller
+        )
+        .is_err());
+    let stage = fixture.encrypted(fixture.request(&conn, 240, 4, 0x61, 1), 0x7a);
+    assert!(matches!(
+        fixture.submit(&conn, &stage),
+        AuditOperationState::TargetV1(_)
+    ));
+    fixture.settle(&conn, &stage);
+    let discard = fixture.request(&conn, 241, 5, 0x61, 1);
+    assert!(matches!(
+        fixture.submit(&conn, &discard),
+        AuditOperationState::TargetV1(_)
+    ));
+    fixture.settle(&conn, &discard);
+    let later = fixture.frozen_empty_commit(&conn, &session).unwrap();
+    let different_guard = fixture.prepare_empty_commit(&later, &session, 239);
+    assert_ne!(
+        prepared.encode().unwrap(),
+        different_guard.encode().unwrap()
+    );
+    assert!(
+        proof
+            .read_back_empty_commit(
+                &fixture.key,
+                fixture.identity,
+                &different_guard,
+                session.caller
+            )
+            .is_err(),
+        "guarded proof authenticated a different original empty-state read"
+    );
+    let caller = session.caller;
+    session.invalidate();
+    drop(conn);
+    drop(shared);
+    drop(fixture.backend);
+    // Readback has only the authenticated preparation, key, caller and proof.
+    // It cannot depend on an additional successful backend/quorum lookup.
+    assert_eq!(
+        proof
+            .read_back_empty_commit(&fixture.key, fixture.identity, &prepared, caller)
+            .unwrap()
+            .state(),
+        receipt.state()
+    );
+}

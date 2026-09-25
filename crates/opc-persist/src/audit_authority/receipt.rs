@@ -11,6 +11,9 @@ use crate::{AuditKey, ConfigConsensusIdentity};
 
 const RECEIPT_DOMAIN: &[u8] = b"openpacketcore/management-audit/applied-receipt/v1\0";
 
+const EMPTY_COMMIT_RECEIPT_DOMAIN: &[u8] =
+    b"openpacketcore/management-audit/netconf-empty-commit-receipt/v1\0";
+
 #[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct ReceiptBody {
@@ -38,6 +41,66 @@ impl std::fmt::Debug for AuthenticatedAuditReceipt {
 }
 
 impl AuthenticatedAuditReceipt {
+    pub(crate) fn seal_empty_commit(
+        key: &AuditKey,
+        prepared: &super::PreparedNetconfEmptyCommit,
+        receipt: &AuditOperationReceipt,
+    ) -> Result<Self, AuditAuthorityError> {
+        prepared.verify(
+            key,
+            receipt.handle.body.identity,
+            receipt.handle.body.binding.caller,
+        )?;
+        if receipt.handle != *prepared.handle()
+            || receipt.state
+                != (AuditOperationState::Observed {
+                    outcome: crate::ManagementAuditOutcomeCode::Success,
+                })
+            || !receipt.terminal_recorded
+            || receipt.sequence == 0
+        {
+            return Err(AuditAuthorityError::BindingMismatch);
+        }
+        let mut proof = Self::seal(key, receipt)?;
+        // The separate transcript binds the complete original guard, not merely
+        // the handle or a later successful lookup of a generic observation.
+        proof.mac = authenticate(key, EMPTY_COMMIT_RECEIPT_DOMAIN, &(&proof.body, prepared))?;
+        Ok(proof)
+    }
+
+    pub(crate) fn read_back_empty_commit(
+        &self,
+        key: &AuditKey,
+        identity: ConfigConsensusIdentity,
+        prepared: &super::PreparedNetconfEmptyCommit,
+        caller: AuditCaller,
+    ) -> Result<AuditOperationReceipt, AuditAuthorityError> {
+        prepared.verify(key, identity, caller)?;
+        if self.body.identity != identity
+            || self.body.operation != prepared.handle().mac
+            || self.body.sequence == 0
+            || self.body.state
+                != (AuditOperationState::Observed {
+                    outcome: crate::ManagementAuditOutcomeCode::Success,
+                })
+            || !self.body.terminal_recorded
+        {
+            return Err(AuditAuthorityError::BindingMismatch);
+        }
+        verify(
+            key,
+            EMPTY_COMMIT_RECEIPT_DOMAIN,
+            &(&self.body, prepared),
+            &self.mac,
+        )?;
+        Ok(AuditOperationReceipt {
+            handle: prepared.handle().clone(),
+            state: self.body.state,
+            terminal_recorded: self.body.terminal_recorded,
+            sequence: self.body.sequence,
+        })
+    }
+
     pub(crate) fn seal(
         key: &AuditKey,
         receipt: &AuditOperationReceipt,

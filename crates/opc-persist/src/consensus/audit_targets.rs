@@ -3673,3 +3673,110 @@ impl NetconfDeviceView {
         self.bind_recovery_owner(registry, worker, owner)
     }
 }
+
+fn empty_commit_guard_sync(
+    conn: &Connection,
+    key: &AuditKey,
+    ledger: &LedgerState,
+    device: &NetconfDeviceView,
+    caller: AuditCaller,
+    session: [u8; 16],
+    cancellation: &SqliteWorkCancellation,
+) -> io::Result<Result<crate::audit_authority::EmptyCommitGuard, AuditAuthorityError>> {
+    use crate::audit_authority::EmptyCommitGuard;
+    let state = read_state_sync(conn, key, ledger.identity, cancellation)?;
+    if device.unsettled || device.cleanup_pending {
+        return Ok(Err(AuditAuthorityError::RecoveryRequired));
+    }
+    let (Some(profile_incarnation), Some(device_incarnation)) =
+        (device.profile_incarnation, device.device_incarnation)
+    else {
+        return Ok(Err(AuditAuthorityError::BindingMismatch));
+    };
+    // The exact digest also binds lock incarnations, cleanup and pending state.
+    // Explicit absence/ownership checks distinguish the advertised operation.
+    if state.targets[0].present
+        || state.lifecycle.pending_confirmation.is_some()
+        || device.locks[..2].iter().any(|lock| {
+            lock.as_ref().is_none_or(|lock| {
+                lock.session.is_some()
+                    && (lock.session != Some(session) || lock.caller != Some(caller))
+            })
+        })
+    {
+        return Ok(Err(AuditAuthorityError::BindingMismatch));
+    }
+    cancellation.check_io()?;
+    Ok(Ok(EmptyCommitGuard {
+        format: 1,
+        authority: ledger.identity,
+        profile_incarnation,
+        device_incarnation,
+        caller,
+        session,
+        candidate_generation: state.targets[0].generation,
+        state_digest: state.profile.state_digest,
+        running_base: device.running_version,
+    }))
+}
+
+pub(crate) fn read_empty_commit_sync(
+    conn: &Connection,
+    key: &AuditKey,
+    ledger: &LedgerState,
+    session: &crate::audit_authority::NetconfSessionOwner,
+    cancellation: &SqliteWorkCancellation,
+) -> io::Result<Result<crate::audit_authority::NetconfEmptyCommitRead, AuditAuthorityError>> {
+    let device = read_device_view_sync(conn, key, ledger, cancellation)?;
+    if let Err(error) = device.verify_session(session) {
+        return Ok(Err(error));
+    }
+    Ok(empty_commit_guard_sync(
+        conn,
+        key,
+        ledger,
+        &device,
+        session.caller,
+        session.incarnation(),
+        cancellation,
+    )?
+    .map(|guard| crate::audit_authority::NetconfEmptyCommitRead {
+        session: session.clone(),
+        guard,
+    }))
+}
+
+pub(crate) fn admit_empty_commit_sync(
+    conn: &Connection,
+    key: &AuditKey,
+    ledger: &mut LedgerState,
+    prepared: &crate::audit_authority::PreparedNetconfEmptyCommit,
+    context: &super::audit::ApplyContext<'_>,
+) -> io::Result<Result<(), AuditAuthorityError>> {
+    // A retained exact result precedes every fallible current-state/expiry check.
+    match ledger.lookup_empty_commit(key, prepared, prepared.guard.caller) {
+        Ok(Some(_)) => return Ok(Ok(())),
+        Ok(None) => {}
+        Err(error) => return Ok(Err(error)),
+    }
+    let device = read_device_view_sync(conn, key, ledger, context.cancellation)?;
+    let current = empty_commit_guard_sync(
+        conn,
+        key,
+        ledger,
+        &device,
+        prepared.guard.caller,
+        prepared.guard.session,
+        context.cancellation,
+    )?;
+    match current {
+        Ok(guard) if guard == prepared.guard => {}
+        Ok(_) => return Ok(Err(AuditAuthorityError::BindingMismatch)),
+        Err(error) => return Ok(Err(error)),
+    }
+    Ok(ledger.admit_empty_commit(
+        key,
+        prepared,
+        context.logical_time.as_offset_datetime().unix_timestamp(),
+    ))
+}

@@ -136,12 +136,60 @@ impl std::fmt::Debug for PreparedAuditedMutation {
 pub(crate) enum TargetAuditCommandV1 {
     Admit(PreparedTargetMutation),
     Apply(PreparedTargetMutation),
+    EmptyCommit(crate::audit_authority::PreparedNetconfEmptyCommit),
 }
 
 impl TargetAuditCommandV1 {
-    pub(crate) fn prepared(&self) -> &PreparedTargetMutation {
+    pub(crate) fn handle(&self) -> &AuditOperationHandle {
         match self {
-            Self::Admit(prepared) | Self::Apply(prepared) => prepared,
+            Self::Admit(prepared) | Self::Apply(prepared) => prepared.handle(),
+            Self::EmptyCommit(prepared) => prepared.handle(),
+        }
+    }
+
+    // Used both by the committing producer and by post-submit lookup. A general
+    // handle lookup cannot substitute for the retained command description.
+    pub(crate) fn lookup_receipt(
+        &self,
+        ledger: &crate::audit_authority::ledger::LedgerState,
+        key: &AuditKey,
+        caller: crate::audit_authority::AuditCaller,
+    ) -> Result<Option<crate::audit_authority::AuditOperationReceipt>, AuditAuthorityError> {
+        match self {
+            Self::Admit(prepared) | Self::Apply(prepared) => {
+                prepared.verify_effect(key)?;
+                let receipt = ledger.lookup(key, prepared.handle(), caller)?;
+                if receipt.is_some()
+                    && ledger.recover_target(key, prepared.handle(), caller)? != *prepared
+                {
+                    return Err(AuditAuthorityError::BindingMismatch);
+                }
+                Ok(receipt)
+            }
+            Self::EmptyCommit(prepared) => ledger.lookup_empty_commit(key, prepared, caller),
+        }
+    }
+
+    pub(crate) fn read_back_receipt(
+        &self,
+        proof: &crate::audit_authority::receipt::AuthenticatedAuditReceipt,
+        key: &AuditKey,
+        identity: crate::ConfigConsensusIdentity,
+        caller: crate::audit_authority::AuditCaller,
+    ) -> Result<crate::audit_authority::AuditOperationReceipt, AuditAuthorityError> {
+        match self {
+            Self::EmptyCommit(prepared) => {
+                proof.read_back_empty_commit(key, identity, prepared, caller)
+            }
+            Self::Admit(prepared) | Self::Apply(prepared) => {
+                let receipt = proof.read_back(key, identity, prepared.handle(), caller)?;
+                if let crate::audit_authority::AuditOperationState::TargetV1(result) =
+                    receipt.state()
+                {
+                    prepared.validate_result(result)?;
+                }
+                Ok(receipt)
+            }
         }
     }
 }

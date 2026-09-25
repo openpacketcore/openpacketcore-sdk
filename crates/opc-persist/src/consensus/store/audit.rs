@@ -386,10 +386,20 @@ impl ConsensusConfigStore {
             Ok(ledger) => ledger,
             Err(error) => return AuditAdmission::Rejected(error),
         };
+        let target_command = match &command {
+            ConfigMutationIntent::ManagementAudit(AuditCommand::NetconfTarget(target)) => {
+                Some(target.clone())
+            }
+            _ => None,
+        };
         // A pruned, expired handle cannot reuse an older successful request
         // cache entry as admission. Existing retained receipts remain readable
         // after expiry; only a proven absent operation requires a live handle.
-        match ledger.lookup(self.inner.backend.audit_key(), handle, caller) {
+        let original = match &target_command {
+            Some(target) => target.lookup_receipt(&ledger, self.inner.backend.audit_key(), caller),
+            None => ledger.lookup(self.inner.backend.audit_key(), handle, caller),
+        };
+        match original {
             Err(error) => return AuditAdmission::Rejected(error),
             Ok(None) => {
                 let now = self
@@ -436,12 +446,21 @@ impl ConsensusConfigStore {
             Err(_) => AuditAdmission::Unknown(handle.clone()),
             Ok(response) => {
                 if let Some(proof) = &response.audit_receipt {
-                    let receipt = match proof.read_back(
-                        self.inner.backend.audit_key(),
-                        self.inner.identity,
-                        handle,
-                        caller,
-                    ) {
+                    let verified = match &target_command {
+                        Some(target) => target.read_back_receipt(
+                            proof,
+                            self.inner.backend.audit_key(),
+                            self.inner.identity,
+                            caller,
+                        ),
+                        None => proof.read_back(
+                            self.inner.backend.audit_key(),
+                            self.inner.identity,
+                            handle,
+                            caller,
+                        ),
+                    };
+                    let receipt = match verified {
                         Ok(receipt) => receipt,
                         Err(_) => return AuditAdmission::Unknown(handle.clone()),
                     };
@@ -453,7 +472,27 @@ impl ConsensusConfigStore {
                         return AuditAdmission::Applied(receipt);
                     }
                 }
-                match self.lookup_audit_operation(handle, caller).await {
+                let refreshed = match &target_command {
+                    Some(target) => match self.read_audit_ledger().await {
+                        Ok(ledger) => target
+                            .lookup_receipt(&ledger, self.inner.backend.audit_key(), caller)
+                            .and_then(|receipt| {
+                                if receipt.is_none() {
+                                    handle.require_live(
+                                        self.inner
+                                            .clock
+                                            .now_utc()
+                                            .as_offset_datetime()
+                                            .unix_timestamp(),
+                                    )?;
+                                }
+                                Ok(receipt)
+                            }),
+                        Err(error) => Err(error),
+                    },
+                    None => self.lookup_audit_operation(handle, caller).await,
+                };
+                match refreshed {
                     Ok(Some(receipt)) => AuditAdmission::Applied(receipt),
                     Ok(None) => match response.result {
                         Err(failure) => {
@@ -2682,5 +2721,154 @@ impl ConsensusConfigStore {
             &self.inner,
             caller,
         )
+    }
+}
+
+impl ConsensusConfigStore {
+    /// Freeze an empty candidate and absent pending confirmation under the exact
+    /// worker/session, quorum-current authenticated history and independent
+    /// checkpoint. This read neither admits an observation nor grants an effect.
+    pub async fn read_netconf_empty_commit(
+        &self,
+        session: &crate::audit_authority::NetconfSessionOwner,
+    ) -> Result<crate::audit_authority::NetconfEmptyCommitRead, AuditAuthorityError> {
+        self.require_netconf_target_profile()?;
+        if !session.device.worker.belongs_to(&self.inner) {
+            return Err(AuditAuthorityError::BindingMismatch);
+        }
+        session.require_active()?;
+        self.linearizable_barrier()
+            .await
+            .map_err(|_| AuditAuthorityError::Unavailable)?;
+        let backend = self.inner.backend.clone();
+        let identity = self.inner.identity;
+        let retained_session = session.clone();
+        let (ledger, view) = super::super::run_backend_sqlite_with_timeout(
+            &self.inner.backend,
+            self.inner.operation_timeout,
+            move |conn, cancellation| {
+                let unavailable = || std::io::Error::other("empty commit authority unavailable");
+                let tx = conn.unchecked_transaction().map_err(|_| unavailable())?;
+                super::super::sqlite::validate_live_history_schema_for_profile(
+                    &tx,
+                    cancellation,
+                    crate::RetainedConfigProfile::NetconfTargetsV1,
+                )?;
+                let keys = backend.management_audit_keys().ok_or_else(unavailable)?;
+                let ledger = super::super::audit::read_with_keys_sync(
+                    &tx,
+                    backend.audit_key(),
+                    Some(&keys),
+                    identity,
+                )?
+                .ok_or_else(unavailable)?;
+                let view = super::super::audit_targets::read_empty_commit_sync(
+                    &tx,
+                    backend.audit_key(),
+                    &ledger,
+                    &retained_session,
+                    cancellation,
+                )?;
+                cancellation.check_io()?;
+                tx.commit().map_err(|_| unavailable())?;
+                Ok((ledger, view))
+            },
+        )
+        .await
+        .map_err(|_| AuditAuthorityError::Unavailable)?;
+        self.verify_audit_checkpoint(&ledger).await?;
+        let frozen = view?;
+        frozen.verify_session(session)?;
+        Ok(frozen)
+    }
+
+    /// Prepare a NETCONF Commit Success observation of the original frozen
+    /// empty state. No transaction or mutation assertion is accepted. Retain
+    /// this bounded original before awaiting admission; expiry never extends.
+    pub fn prepare_netconf_empty_commit(
+        &self,
+        session: &crate::audit_authority::NetconfSessionOwner,
+        frozen: &crate::audit_authority::NetconfEmptyCommitRead,
+        privacy: &dyn AuditPrivacyProjection,
+        event: &ManagementAuditEventRecord,
+        lifetime: std::time::Duration,
+    ) -> Result<crate::audit_authority::PreparedNetconfEmptyCommit, AuditAuthorityError> {
+        self.require_netconf_target_profile()?;
+        if !session.device.worker.belongs_to(&self.inner) {
+            return Err(AuditAuthorityError::BindingMismatch);
+        }
+        if lifetime.subsec_nanos() != 0 || !(1..=3600).contains(&lifetime.as_secs()) {
+            return Err(AuditAuthorityError::InvalidInput);
+        }
+        let issued_at = self
+            .inner
+            .clock
+            .now_utc()
+            .as_offset_datetime()
+            .unix_timestamp();
+        let expires_at = issued_at
+            .checked_add(lifetime.as_secs() as i64)
+            .ok_or(AuditAuthorityError::InvalidInput)?;
+        frozen.prepare(
+            self.inner.backend.audit_key(),
+            privacy,
+            session,
+            ProjectedAuditEvent::project(privacy, event)?,
+            issued_at..expires_at,
+            *uuid::Uuid::new_v4().as_bytes(),
+        )
+    }
+
+    /// Admit one guarded observation on the current local leader. The authority
+    /// atomically rechecks the exact empty state before its single observed row;
+    /// it never manufactures a configuration intent or result. Recover only the
+    /// original prepared value after cancellation or an Unknown result.
+    pub async fn admit_netconf_empty_commit_local(
+        &self,
+        prepared: &crate::audit_authority::PreparedNetconfEmptyCommit,
+        caller: AuditCaller,
+    ) -> AuditAdmission {
+        if let Err(error) = self.require_netconf_target_profile().and_then(|()| {
+            prepared.verify(self.inner.backend.audit_key(), self.inner.identity, caller)
+        }) {
+            return AuditAdmission::Rejected(error);
+        }
+        self.audit_operation_command_with_route(
+            prepared.handle(),
+            caller,
+            b"netconf-empty-commit",
+            ConfigMutationIntent::ManagementAudit(AuditCommand::NetconfTarget(Box::new(
+                crate::consensus::audit_mutation::TargetAuditCommandV1::EmptyCommit(
+                    prepared.clone(),
+                ),
+            ))),
+            true,
+        )
+        .await
+    }
+
+    /// Recover only this exact guard's retained observation under an authenticated
+    /// caller and quorum/checkpoint read. An ordinary observation of its handle
+    /// cannot satisfy this lookup; a retained result remains known after expiry.
+    pub async fn lookup_netconf_empty_commit(
+        &self,
+        prepared: &crate::audit_authority::PreparedNetconfEmptyCommit,
+        caller: AuditCaller,
+    ) -> Result<Option<AuditOperationReceipt>, AuditAuthorityError> {
+        self.require_netconf_target_profile()?;
+        prepared.verify(self.inner.backend.audit_key(), self.inner.identity, caller)?;
+        let ledger = self.read_audit_ledger().await?;
+        let receipt =
+            ledger.lookup_empty_commit(self.inner.backend.audit_key(), prepared, caller)?;
+        if receipt.is_none() {
+            prepared.handle().require_live(
+                self.inner
+                    .clock
+                    .now_utc()
+                    .as_offset_datetime()
+                    .unix_timestamp(),
+            )?;
+        }
+        Ok(receipt)
     }
 }
