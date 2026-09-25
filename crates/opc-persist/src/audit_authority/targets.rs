@@ -556,6 +556,7 @@ impl NetconfLockDatastore {
 struct NetconfSessionState {
     incarnation: [u8; 16],
     active: std::sync::atomic::AtomicBool,
+    cleanup: std::sync::OnceLock<super::PreparedTargetMutation>,
 }
 
 /// Authenticated session incarnation under one SDK-issued device owner.
@@ -583,6 +584,7 @@ impl NetconfSessionOwner {
             state: std::sync::Arc::new(NetconfSessionState {
                 incarnation,
                 active: std::sync::atomic::AtomicBool::new(true),
+                cleanup: std::sync::OnceLock::new(),
             }),
         })
     }
@@ -655,5 +657,76 @@ pub struct NetconfLockLease {
 impl fmt::Debug for NetconfLockLease {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str("NetconfLockLease(<redacted>)")
+    }
+}
+
+impl NetconfSessionOwner {
+    pub(crate) fn cleanup_context(
+        &self,
+        event: &super::ProjectedAuditEvent,
+    ) -> Result<(), AuditAuthorityError> {
+        if self.require_active().is_ok()
+            || event.caller != self.caller
+            || event.transport != crate::ManagementAuditTransportCode::Internal
+            || event.operation != crate::ManagementAuditOperationCode::Exec
+            || event.outcome != crate::ManagementAuditOutcomeCode::Intent
+        {
+            return Err(AuditAuthorityError::BindingMismatch);
+        }
+        Ok(())
+    }
+
+    pub(crate) fn original_cleanup(
+        &self,
+        event: &super::ProjectedAuditEvent,
+        lifetime: std::time::Duration,
+    ) -> Result<Option<super::PreparedTargetMutation>, AuditAuthorityError> {
+        self.cleanup_context(event)?;
+        let Some(original) = self.state.cleanup.get() else {
+            return Ok(None);
+        };
+        if original.handle.body.event != *event
+            || lifetime.subsec_nanos() != 0
+            || original
+                .handle
+                .body
+                .expires_at
+                .checked_sub(original.handle.body.issued_at)
+                != i64::try_from(lifetime.as_secs()).ok()
+        {
+            return Err(AuditAuthorityError::BindingMismatch);
+        }
+        Ok(Some(original.clone()))
+    }
+
+    pub(crate) fn retain_cleanup(
+        &self,
+        prepared: super::PreparedTargetMutation,
+    ) -> Result<super::PreparedTargetMutation, AuditAuthorityError> {
+        use crate::consensus::audit_mutation::TargetResolutionV1;
+        self.cleanup_context(&prepared.handle.body.event)?;
+        let seconds = prepared
+            .handle
+            .body
+            .expires_at
+            .checked_sub(prepared.handle.body.issued_at)
+            .filter(|seconds| (1..=3600).contains(seconds))
+            .ok_or(AuditAuthorityError::BindingMismatch)?;
+        if prepared.effect.authority != self.device.authority
+            || prepared.effect.profile_incarnation != self.device.profile_incarnation
+            || prepared.effect.device_incarnation != self.device.device_incarnation
+            || prepared.effect.caller != self.caller
+            || u8::from(prepared.effect.action) != 13
+            || !matches!(prepared.effect.resolution,
+                Some(TargetResolutionV1::EndSession { session }) if session == self.incarnation())
+        {
+            return Err(AuditAuthorityError::BindingMismatch);
+        }
+        let event = prepared.handle.body.event.clone();
+        // All clones select one original operation before the caller can admit
+        // it. A concurrent preparation never replaces that operation or expiry.
+        self.state.cleanup.get_or_init(|| prepared);
+        self.original_cleanup(&event, std::time::Duration::from_secs(seconds as u64))?
+            .ok_or(AuditAuthorityError::BindingMismatch)
     }
 }

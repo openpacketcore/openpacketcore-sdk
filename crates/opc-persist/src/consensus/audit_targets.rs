@@ -1877,3 +1877,34 @@ impl NetconfDeviceView {
         })
     }
 }
+
+impl NetconfDeviceView {
+    pub(crate) fn prepare_session_cleanup(
+        &self,
+        session: &crate::audit_authority::NetconfSessionOwner,
+        event: &crate::audit_authority::ProjectedAuditEvent,
+        expires_at: i64,
+    ) -> Result<super::audit_mutation::TargetEffectV1, AuditAuthorityError> {
+        session.cleanup_context(event)?;
+        self.verify_owner(&session.device)?;
+        Ok(super::audit_mutation::TargetEffectV1 {
+            format: 1,
+            authority: self.authority,
+            profile_incarnation: session.device.profile_incarnation,
+            device_incarnation: session.device.device_incarnation,
+            caller: event.caller,
+            request: event.request,
+            action: 13.try_into()?,
+            destination: TargetExpectationV1::Lifecycle {
+                state_digest: self.state_digest,
+            },
+            source: None,
+            lock: None,
+            expires_at,
+            encrypted_payload: None,
+            resolution: Some(TargetResolutionV1::EndSession {
+                session: session.incarnation(),
+            }),
+        })
+    }
+}

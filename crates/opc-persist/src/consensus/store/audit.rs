@@ -1210,3 +1210,76 @@ impl ConsensusConfigStore {
         })
     }
 }
+
+impl ConsensusConfigStore {
+    /// Prepare the original cleanup for a locally invalidated session. Only an
+    /// Internal Exec Intent attributed to that session's original caller is
+    /// accepted. This issues no replacement client credentials or serving token.
+    ///
+    /// All clones retain one original closed mutation before any admission.
+    /// Identical retries return it without extending expiry; another event or
+    /// lifetime is refused. Preparation does not release a lock, discard a
+    /// candidate, or acknowledge rollback. The ConfigBus worker must keep its
+    /// cleanup fence through admission, exact result recovery and checkpoint
+    /// completion, independently of the protocol future. A pending confirmed
+    /// rollback remains a separate retained obligation after session cleanup.
+    ///
+    /// The returned mutation uses the ordinary target admission/submission and
+    /// original-handle recovery APIs. Even if preparation is interrupted, any
+    /// cached original is reused by the next identical call. Replacing the
+    /// device owner is a distinct retained reboot operation, not session retry.
+    pub async fn prepare_netconf_session_cleanup(
+        &self,
+        session: &crate::audit_authority::NetconfSessionOwner,
+        privacy: &dyn AuditPrivacyProjection,
+        event: &ManagementAuditEventRecord,
+        lifetime: std::time::Duration,
+    ) -> Result<crate::audit_authority::PreparedTargetMutation, AuditAuthorityError> {
+        self.require_netconf_target_profile()?;
+        if !session.device.worker.belongs_to(&self.inner) {
+            return Err(AuditAuthorityError::BindingMismatch);
+        }
+        if lifetime.subsec_nanos() != 0 || !(1..=3600).contains(&lifetime.as_secs()) {
+            return Err(AuditAuthorityError::InvalidInput);
+        }
+        let event = ProjectedAuditEvent::project(privacy, event)?;
+        if let Some(original) = session.original_cleanup(&event, lifetime)? {
+            self.verify_netconf_target(&original, session.caller)?;
+            self.preflight_netconf_target(&original).await?;
+            return Ok(original);
+        }
+        let issued_at = self
+            .inner
+            .clock
+            .now_utc()
+            .as_offset_datetime()
+            .unix_timestamp();
+        let expires_at = issued_at
+            .checked_add(lifetime.as_secs() as i64)
+            .ok_or(AuditAuthorityError::InvalidInput)?;
+        let view = self.read_netconf_device_view().await?;
+        let effect = view.prepare_session_cleanup(session, &event, expires_at)?;
+        let digest = effect.digest(self.inner.backend.audit_key())?;
+        let binding =
+            AuditOperationBinding::project(privacy, &event, view.running_version, &digest)?;
+        let handle = AuditOperationHandle::issue(
+            HandleBody {
+                version: 1,
+                identity: self.inner.identity,
+                binding,
+                event,
+                issued_at,
+                expires_at,
+                nonce: *uuid::Uuid::new_v4().as_bytes(),
+                key_epoch: self.inner.backend.audit_key().epoch(),
+                mutation: Some(digest),
+            },
+            self.inner.backend.audit_key(),
+        )?;
+        let prepared = crate::audit_authority::PreparedTargetMutation { handle, effect };
+        prepared.verify_effect(self.inner.backend.audit_key())?;
+        let original = session.retain_cleanup(prepared)?;
+        self.preflight_netconf_target(&original).await?;
+        Ok(original)
+    }
+}

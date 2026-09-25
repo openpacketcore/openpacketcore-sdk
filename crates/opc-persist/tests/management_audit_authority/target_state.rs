@@ -2999,3 +2999,270 @@ async fn target_session_preparation_refuses_wrong_caller_transport_operation_and
         "local activity must not replace retained device verification"
     );
 }
+
+#[tokio::test]
+async fn target_session_cleanup_retains_one_original_across_clones_and_concurrent_retry() {
+    let fixture = Fixture::new().await;
+    let shared = fixture.backend.conn();
+    let conn = shared.lock().await;
+    fixture.active(&conn);
+    let worker = std::sync::Arc::new(());
+    let session = fixture.session_owner(&conn, &worker, 0x61);
+    session.invalidate();
+    let event = fixture.device_event(190);
+    let effect = fixture
+        .device_view(&conn)
+        .prepare_session_cleanup(&session, &event, 160)
+        .unwrap();
+    let original = fixture.prepare(effect, event.clone());
+    let later = fixture.rebind_at(&conn, original.clone(), 101);
+    assert_ne!(original, later);
+    let barrier = std::sync::Barrier::new(2);
+    let outcomes = std::thread::scope(|scope| {
+        let one = scope.spawn(|| {
+            barrier.wait();
+            session.retain_cleanup(original.clone()).unwrap()
+        });
+        let two = scope.spawn(|| {
+            barrier.wait();
+            session.clone().retain_cleanup(later.clone()).unwrap()
+        });
+        (one.join().unwrap(), two.join().unwrap())
+    });
+    assert_eq!(outcomes.0, outcomes.1);
+    assert!(outcomes.0 == original || outcomes.0 == later);
+    let selected = outcomes.0;
+    assert_eq!(
+        session
+            .clone()
+            .original_cleanup(&event, Duration::from_secs(60))
+            .unwrap(),
+        Some(selected.clone())
+    );
+    assert_eq!(session.retain_cleanup(later).unwrap(), selected);
+    assert_eq!(session.retain_cleanup(original).unwrap(), selected);
+    assert!(matches!(
+        session.original_cleanup(&fixture.device_event(191), Duration::from_secs(60)),
+        Err(AuditAuthorityError::BindingMismatch)
+    ));
+    assert!(matches!(
+        session.original_cleanup(&event, Duration::from_secs(61)),
+        Err(AuditAuthorityError::BindingMismatch)
+    ));
+    let mut changed = event.clone();
+    changed.operation = ManagementAuditOperationCode::Read;
+    assert!(matches!(
+        session.original_cleanup(&changed, Duration::from_secs(60)),
+        Err(AuditAuthorityError::BindingMismatch)
+    ));
+    assert_eq!(
+        fixture.ledger(&conn).operations.len(),
+        1,
+        "preparation must not admit an intent"
+    );
+    assert_eq!(
+        session.require_active(),
+        Err(AuditAuthorityError::BindingMismatch)
+    );
+}
+
+#[tokio::test]
+async fn target_session_cleanup_requires_original_scope_and_revoked_local_authority() {
+    use crate::audit_authority::AuditCaller;
+    let fixture = Fixture::new().await;
+    let shared = fixture.backend.conn();
+    let conn = shared.lock().await;
+    fixture.active(&conn);
+    let worker = std::sync::Arc::new(());
+    let session = fixture.session_owner(&conn, &worker, 0x61);
+    let event = fixture.device_event(192);
+    let view = fixture.device_view(&conn);
+    assert!(matches!(
+        view.prepare_session_cleanup(&session, &event, 160),
+        Err(AuditAuthorityError::BindingMismatch)
+    ));
+    session.invalidate();
+    for variant in 0..4 {
+        let mut changed = event.clone();
+        match variant {
+            0 => {
+                changed.caller =
+                    AuditCaller::project(&fixture.privacy, "fixture-tenant", "fixture-other")
+                        .unwrap()
+            }
+            1 => changed.transport = ManagementAuditTransportCode::NetconfSsh,
+            2 => changed.operation = ManagementAuditOperationCode::Read,
+            _ => changed.outcome = ManagementAuditOutcomeCode::Success,
+        }
+        assert!(matches!(
+            view.prepare_session_cleanup(&session, &changed, 160),
+            Err(AuditAuthorityError::BindingMismatch)
+        ));
+    }
+    let effect = view.prepare_session_cleanup(&session, &event, 160).unwrap();
+    let mut wrong_session = fixture.prepare(effect, event.clone());
+    wrong_session.effect.resolution = Some(TargetResolutionV1::EndSession {
+        session: [0x62; 16],
+    });
+    assert!(matches!(
+        session.retain_cleanup(wrong_session),
+        Err(AuditAuthorityError::BindingMismatch)
+    ));
+    assert!(session
+        .original_cleanup(&event, Duration::from_secs(60))
+        .unwrap()
+        .is_none());
+    let replacement_event = fixture.device_event(193);
+    let replacement = fixture.prepare(
+        view.prepare(&replacement_event, 160, [0x57; 16], [0x58; 16])
+            .unwrap(),
+        replacement_event,
+    );
+    assert!(matches!(
+        fixture.submit(&conn, &replacement),
+        AuditOperationState::TargetV1(_)
+    ));
+    fixture.settle(&conn, &replacement);
+    assert!(matches!(
+        fixture
+            .device_view(&conn)
+            .prepare_session_cleanup(&session, &event, 160),
+        Err(AuditAuthorityError::BindingMismatch)
+    ));
+}
+
+#[tokio::test]
+async fn target_session_cleanup_discards_only_owned_candidate_and_preserves_foreign_lease() {
+    use crate::audit_authority::{NetconfLockDatastore, NetconfLockLease};
+    let fixture = Fixture::new().await;
+    let shared = fixture.backend.conn();
+    let conn = shared.lock().await;
+    fixture.active(&conn);
+    let worker = std::sync::Arc::new(());
+    let session = fixture.session_owner(&conn, &worker, 0x61);
+    let foreign = fixture.session_owner(&conn, &worker, 0x62);
+    for (request, slot, owner) in [(194, 0, 0x61), (195, 1, 0x61), (196, 2, 0x62)] {
+        let lock = fixture.request(&conn, request, 2, owner, slot);
+        assert!(matches!(
+            fixture.submit(&conn, &lock),
+            AuditOperationState::TargetV1(_)
+        ));
+        fixture.settle(&conn, &lock);
+    }
+    let stage = fixture.encrypted(fixture.request(&conn, 197, 4, 0x61, 1), 0x39);
+    assert!(matches!(
+        fixture.submit(&conn, &stage),
+        AuditOperationState::TargetV1(_)
+    ));
+    fixture.settle(&conn, &stage);
+    let foreign_lease = NetconfLockLease {
+        session: foreign,
+        datastore: NetconfLockDatastore::Startup,
+        incarnation: 1,
+    };
+    assert_eq!(
+        fixture.device_view(&conn).verify_lease(&foreign_lease),
+        Ok(())
+    );
+    let before = target_rows(&conn);
+    let startup = row(&conn, "config_netconf_lifecycle", "singleton", 1)["locks"][2].clone();
+    session.invalidate();
+    let event = fixture.device_event(198);
+    let effect = fixture
+        .device_view(&conn)
+        .prepare_session_cleanup(&session, &event, 160)
+        .unwrap();
+    let cleanup = session
+        .retain_cleanup(fixture.prepare(effect, event.clone()))
+        .unwrap();
+    assert_eq!(target_rows(&conn), before);
+    fixture
+        .apply(
+            &conn,
+            AuditCommand::NetconfTarget(Box::new(TargetAuditCommandV1::Admit(cleanup.clone()))),
+            100,
+        )
+        .unwrap();
+    assert_eq!(
+        target_rows(&conn),
+        before,
+        "intent admission is not cleanup"
+    );
+    assert!(fixture
+        .apply(
+            &conn,
+            AuditCommand::NetconfTarget(Box::new(TargetAuditCommandV1::Apply(cleanup.clone()))),
+            100
+        )
+        .is_err());
+    assert_eq!(
+        target_rows(&conn),
+        before,
+        "uncheckpointed intent grants no cleanup"
+    );
+    fixture.checkpoint(&conn);
+    fixture
+        .apply(
+            &conn,
+            AuditCommand::NetconfTarget(Box::new(TargetAuditCommandV1::Apply(cleanup.clone()))),
+            100,
+        )
+        .unwrap();
+    let known = fixture
+        .ledger(&conn)
+        .lookup(&fixture.key, cleanup.handle(), session.caller)
+        .unwrap()
+        .unwrap();
+    assert!(matches!(known.state(), AuditOperationState::TargetV1(_)));
+    assert!(!known.terminal_recorded());
+    let candidate = row(&conn, "config_netconf_targets", "target", 0);
+    assert_eq!(candidate["generation"], 2);
+    assert_eq!(candidate["present"], false);
+    assert!(candidate["encrypted_envelope"].is_null());
+    let lifecycle = row(&conn, "config_netconf_lifecycle", "singleton", 1);
+    assert_eq!(lifecycle["locks"][0]["incarnation"], 2);
+    assert_eq!(lifecycle["locks"][1]["incarnation"], 2);
+    assert!(lifecycle["locks"][0]["session"].is_null());
+    assert!(lifecycle["locks"][1]["session"].is_null());
+    assert_eq!(lifecycle["locks"][2], startup);
+    assert_eq!(
+        fixture.device_view(&conn).verify_owner(&session.device),
+        Err(AuditAuthorityError::RecoveryRequired)
+    );
+    fixture.settle(&conn, &cleanup);
+    assert_eq!(
+        fixture.device_view(&conn).verify_lease(&foreign_lease),
+        Ok(())
+    );
+    let after = target_rows(&conn);
+    assert_eq!(fixture.submit(&conn, &cleanup), known.state());
+    assert_eq!(
+        target_rows(&conn),
+        after,
+        "original replay must not advance counters"
+    );
+    assert_eq!(
+        session
+            .clone()
+            .original_cleanup(&event, Duration::from_secs(60))
+            .unwrap(),
+        Some(cleanup.clone())
+    );
+    let reopened = Connection::open(fixture.directory.path().join("authority.sqlite")).unwrap();
+    assert_eq!(
+        fixture
+            .ledger(&reopened)
+            .recover_target(&fixture.key, cleanup.handle(), session.caller)
+            .unwrap(),
+        cleanup
+    );
+    assert_eq!(
+        fixture
+            .ledger(&reopened)
+            .lookup(&fixture.key, cleanup.handle(), session.caller)
+            .unwrap()
+            .unwrap()
+            .state(),
+        known.state()
+    );
+}
