@@ -27,7 +27,7 @@ use super::storage::ConfigConsensusStorageError;
 use super::types::{CONFIG_CONSENSUS_STORAGE_VERSION, LEGACY_CONFIG_CONSENSUS_COMMAND_VERSION};
 use super::{
     ApprovedLegacyConfigRecovery, ConfigConsensusResponse, ConfigMutationFailure,
-    ConfigMutationIntent, ConfigRaftTypeConfig,
+    ConfigMutationIntent, ConfigRaftTypeConfig, RetainedConfigProfile,
 };
 use crate::backend::SqliteBackend;
 use crate::types::{AuditKey, AuditOpType, CommitSource};
@@ -657,16 +657,56 @@ pub(crate) fn provision_retained_schema(
     topology: &super::ConfigConsensusTopology,
     audit_key: &AuditKey,
     deadline: std::time::Instant,
+    profile: RetainedConfigProfile,
 ) -> Result<(), ConfigConsensusStorageError> {
+    let cancellation = Arc::new(SqliteWorkCancellation::with_deadline(deadline));
     initialize_schema(
         conn,
         topology.identity(),
         topology.members(),
         audit_key,
         None,
-        &Arc::new(SqliteWorkCancellation::with_deadline(deadline)),
+        &cancellation,
         None,
-    )
+    )?;
+    if profile == RetainedConfigProfile::Legacy {
+        return Ok(());
+    }
+    // Each transaction has its own commit latch and the same original deadline.
+    let cancellation = SqliteWorkCancellation::with_deadline(deadline);
+    // This entry point is reachable only while provisioning a newly created
+    // retained file, before publishing its external admission record. It is
+    // not an upgrade path for an existing authority.
+    cancellation.check()?;
+    let tx = Transaction::new_unchecked(conn, TransactionBehavior::Immediate)
+        .map_err(|_| ConfigConsensusStorageError::BackendUnavailable)?;
+    super::audit_targets::initialize_inactive_sync(&tx, audit_key, topology.identity())
+        .map_err(|_| ConfigConsensusStorageError::CorruptState)?;
+    let manifest = config_schema_manifest_for_profile(&tx, &cancellation, profile)
+        .map_err(|_| ConfigConsensusStorageError::CorruptState)?;
+    let updated = tx.execute(
+        "UPDATE config_raft_identity SET schema_version=?1, schema_manifest_digest=?2 WHERE singleton=1 AND schema_version=?3",
+        params![super::audit_targets::TARGET_STORAGE_VERSION, manifest.as_slice(), CONFIG_CONSENSUS_STORAGE_VERSION],
+    ).map_err(|_| ConfigConsensusStorageError::BackendUnavailable)?;
+    if updated != 1 {
+        return Err(ConfigConsensusStorageError::CorruptState);
+    }
+    let base_digest = crate::schema::current_schema_digest(&tx)
+        .map_err(|_| ConfigConsensusStorageError::CorruptState)?;
+    crate::schema::set_schema_version(&tx, &base_digest)
+        .map_err(|_| ConfigConsensusStorageError::BackendUnavailable)?;
+    validate_existing_schema_for_profile(
+        &tx,
+        topology.identity(),
+        topology.members(),
+        audit_key,
+        false,
+        &cancellation,
+        profile,
+    )?;
+    cancellation.authorize_commit()?;
+    tx.commit()
+        .map_err(|_| ConfigConsensusStorageError::BackendUnavailable)
 }
 
 /// Read existing schema and authenticated history without any initialization.
@@ -675,14 +715,16 @@ pub(crate) fn validate_retained_schema(
     topology: &super::ConfigConsensusTopology,
     audit_key: &AuditKey,
     deadline: std::time::Instant,
+    profile: RetainedConfigProfile,
 ) -> Result<(), ConfigConsensusStorageError> {
-    validate_existing_schema(
+    validate_existing_schema_for_profile(
         conn,
         topology.identity(),
         topology.members(),
         audit_key,
         false,
         &SqliteWorkCancellation::with_deadline(deadline),
+        profile,
     )
 }
 
@@ -1108,6 +1150,26 @@ fn validate_existing_schema(
     allow_detached_snapshot: bool,
     cancellation: &SqliteWorkCancellation,
 ) -> Result<(), ConfigConsensusStorageError> {
+    validate_existing_schema_for_profile(
+        conn,
+        identity,
+        expected_members,
+        audit_key,
+        allow_detached_snapshot,
+        cancellation,
+        RetainedConfigProfile::Legacy,
+    )
+}
+
+fn validate_existing_schema_for_profile(
+    conn: &Connection,
+    identity: ConsensusIdentity,
+    expected_members: &BTreeSet<ConsensusNodeId>,
+    audit_key: &AuditKey,
+    allow_detached_snapshot: bool,
+    cancellation: &SqliteWorkCancellation,
+    profile: RetainedConfigProfile,
+) -> Result<(), ConfigConsensusStorageError> {
     for table in RAFT_TABLES {
         cancellation.check()?;
         if !table_exists(conn, table)
@@ -1116,7 +1178,7 @@ fn validate_existing_schema(
             return Err(ConfigConsensusStorageError::CorruptState);
         }
     }
-    let schema_manifest_digest = config_schema_manifest_digest(conn, cancellation)
+    let schema_manifest_digest = config_schema_manifest_for_profile(conn, cancellation, profile)
         .map_err(|_| ConfigConsensusStorageError::CorruptState)?;
     let row = conn
         .query_row(
@@ -1127,7 +1189,11 @@ fn validate_existing_schema(
         .optional()
         .map_err(|_| ConfigConsensusStorageError::BackendUnavailable)?
         .ok_or(ConfigConsensusStorageError::CorruptState)?;
-    if row.0 != i64::from(CONFIG_CONSENSUS_STORAGE_VERSION) {
+    let expected_version = match profile {
+        RetainedConfigProfile::Legacy => CONFIG_CONSENSUS_STORAGE_VERSION,
+        RetainedConfigProfile::NetconfTargetsV1 => super::audit_targets::TARGET_STORAGE_VERSION,
+    };
+    if row.0 != i64::from(expected_version) {
         return Err(ConfigConsensusStorageError::SchemaVersionMismatch);
     }
     if row.1.as_slice() != identity.cluster_id().as_bytes()
@@ -1171,7 +1237,13 @@ fn validate_existing_schema(
         cancellation,
     )
     .map_err(|_| ConfigConsensusStorageError::CorruptState)?;
-    validate_sealed_state_sync(conn, audit_key, cancellation)
+    validate_live_history_schema_for_profile(conn, cancellation, profile)
+        .map_err(|_| ConfigConsensusStorageError::CorruptState)?;
+    if profile == RetainedConfigProfile::NetconfTargetsV1 {
+        super::audit_targets::validate_inactive_sync(conn, audit_key, identity, cancellation)
+            .map_err(|_| ConfigConsensusStorageError::CorruptState)?;
+    }
+    validate_sealed_state_contents_sync(conn, audit_key, cancellation)
         .map_err(|_| ConfigConsensusStorageError::CorruptState)
 }
 
@@ -1251,12 +1323,37 @@ fn config_schema_manifest_digest(
     Ok(hasher.finalize().into())
 }
 
+fn config_schema_manifest_for_profile(
+    conn: &Connection,
+    cancellation: &SqliteWorkCancellation,
+    profile: RetainedConfigProfile,
+) -> io::Result<[u8; 32]> {
+    let legacy = config_schema_manifest_digest(conn, cancellation)?;
+    if profile == RetainedConfigProfile::Legacy {
+        return Ok(legacy);
+    }
+    let targets = super::audit_targets::schema_digest_sync(conn, cancellation)?;
+    let mut digest = Sha256::new();
+    digest.update(b"openpacketcore/config-consensus/storage-manifest/netconf-targets/v1\0");
+    digest.update(legacy);
+    digest.update(targets);
+    Ok(digest.finalize().into())
+}
+
 /// Validate the executable schema in the same transaction as history use.
 /// Authenticating rows alone cannot authorize a changed trigger or constraint
 /// to alter unrelated records during an otherwise legitimate lifecycle update.
 pub(super) fn validate_live_history_schema_sync(
     conn: &Connection,
     cancellation: &SqliteWorkCancellation,
+) -> io::Result<()> {
+    validate_live_history_schema_for_profile(conn, cancellation, RetainedConfigProfile::Legacy)
+}
+
+fn validate_live_history_schema_for_profile(
+    conn: &Connection,
+    cancellation: &SqliteWorkCancellation,
+    profile: RetainedConfigProfile,
 ) -> io::Result<()> {
     cancellation.check_io()?;
     // No SDK operation needs a trigger or a temporary object. Check all main
@@ -1269,9 +1366,14 @@ pub(super) fn validate_live_history_schema_sync(
     if unexpected {
         return Err(invalid_data("config history schema is not admitted"));
     }
-    crate::schema::validate_retained_base_schema(conn)
-        .map_err(|_| invalid_data("config history base schema does not match"))?;
-    config_schema_manifest_digest(conn, cancellation)?;
+    match profile {
+        RetainedConfigProfile::Legacy => crate::schema::validate_retained_base_schema(conn),
+        RetainedConfigProfile::NetconfTargetsV1 => {
+            crate::schema::validate_retained_base_schema_with_netconf_targets(conn)
+        }
+    }
+    .map_err(|_| invalid_data("config history base schema does not match"))?;
+    config_schema_manifest_for_profile(conn, cancellation, profile)?;
     cancellation.check_io()
 }
 
@@ -3123,6 +3225,14 @@ fn validate_sealed_state_sync(
     if super::history::has_consensus_metadata_sync(conn)? {
         validate_live_history_schema_sync(conn, cancellation)?;
     }
+    validate_sealed_state_contents_sync(conn, audit_key, cancellation)
+}
+
+fn validate_sealed_state_contents_sync(
+    conn: &Connection,
+    audit_key: &AuditKey,
+    cancellation: &SqliteWorkCancellation,
+) -> io::Result<()> {
     super::audit::validate_sync(conn, audit_key)?;
     super::history::validate_sync(conn, audit_key)?;
     super::history::validate_record_chain_sync(conn, audit_key, cancellation)?;

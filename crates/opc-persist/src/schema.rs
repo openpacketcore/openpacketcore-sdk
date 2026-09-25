@@ -276,22 +276,46 @@ fn validate_config_replay_lookup_index(conn: &Connection) -> Result<(), rusqlite
 /// Compare retained base DDL with the SDK schema without initializing `conn`.
 /// The caller separately validates the exact consensus and admission catalogs.
 pub(crate) fn validate_retained_base_schema(conn: &Connection) -> Result<(), rusqlite::Error> {
+    validate_retained_base_catalog(conn, false)
+}
+
+/// Validate base DDL after the caller admits the exact retained-target profile
+/// and separately authenticates its three sealed target tables. This does not
+/// exempt indexes, triggers, views, or any other object in that namespace.
+pub(crate) fn validate_retained_base_schema_with_netconf_targets(
+    conn: &Connection,
+) -> Result<(), rusqlite::Error> {
+    validate_retained_base_catalog(conn, true)
+}
+
+fn validate_retained_base_catalog(
+    conn: &Connection,
+    netconf_targets: bool,
+) -> Result<(), rusqlite::Error> {
     const OBJECTS: &str = "SELECT type, name, tbl_name, sql FROM sqlite_schema \
         WHERE sql IS NOT NULL AND name NOT GLOB 'sqlite_*' \
         AND NOT (name GLOB 'config_raft_*' OR tbl_name GLOB 'config_raft_*') \
         AND NOT (name = 'consensus_retained_binding' OR tbl_name = 'consensus_retained_binding')";
+    let objects = if netconf_targets {
+        format!(
+            "{OBJECTS} AND NOT (type = 'table' AND name = tbl_name AND name IN \
+             ('config_netconf_profile', 'config_netconf_targets', 'config_netconf_lifecycle'))"
+        )
+    } else {
+        OBJECTS.to_owned()
+    };
     // Only this private in-memory reference is initialized. The compatibility
     // digest in retained storage cannot authorize that storage's own DDL, and
     // its historical exclusions do not exempt any base object from admission.
     let expected = Connection::open_in_memory()?;
     initialize_schema(&expected)?;
-    let count_query = format!("SELECT COUNT(*) FROM ({OBJECTS})");
+    let count_query = format!("SELECT COUNT(*) FROM ({objects})");
     let expected_count: i64 = expected.query_row(&count_query, [], |row| row.get(0))?;
     let actual_count: i64 = conn.query_row(&count_query, [], |row| row.get(0))?;
     if actual_count != expected_count {
         return Err(rusqlite::Error::InvalidQuery);
     }
-    let mut statement = expected.prepare(OBJECTS)?;
+    let mut statement = expected.prepare(&objects)?;
     let mut rows = statement.query([])?;
     while let Some(row) = rows.next()? {
         // Read only bounded SDK-authored DDL into Rust memory. The supplied

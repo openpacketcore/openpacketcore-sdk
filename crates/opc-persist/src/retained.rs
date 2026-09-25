@@ -384,9 +384,6 @@ fn open_authority_sync(
 ) -> Result<SqliteBackend, RetainedConfigError> {
     let provision = !matches!(intent, OpenIntent::Reopen);
     work.check()?;
-    if provision && options.binding.profile() != RetainedConfigProfile::Legacy {
-        return Err(RetainedConfigError::Unsupported);
-    }
     reject_symlink_components(&options.path)?;
     if provision && std::fs::symlink_metadata(&options.path).is_ok() {
         return Err(RetainedConfigError::AlreadyExists);
@@ -451,9 +448,6 @@ fn open_authority_sync(
             .read_exact(&mut record)
             .map_err(|_| RetainedConfigError::RecoveryRequired)?;
         validate_record(&record, &options.binding, &audit_key)?;
-        if options.binding.profile() != RetainedConfigProfile::Legacy {
-            return Err(RetainedConfigError::Unsupported);
-        }
     }
     let database = if provision {
         work.mutation()?;
@@ -527,6 +521,7 @@ fn open_authority_sync(
             options.binding.topology(),
             &audit_key,
             work.deadline,
+            options.binding.profile(),
         )
         .map_err(|_| RetainedConfigError::Rejected)?;
         #[cfg(test)]
@@ -775,8 +770,13 @@ fn validate_connection(
     }
     // A digest supplied by the retained database is only a compatibility
     // check. The independent SDK catalog includes the exact replay index.
-    crate::schema::validate_retained_base_schema(conn)
-        .map_err(|_| RetainedConfigError::Rejected)?;
+    match options.binding.profile() {
+        RetainedConfigProfile::Legacy => crate::schema::validate_retained_base_schema(conn),
+        RetainedConfigProfile::NetconfTargetsV1 => {
+            crate::schema::validate_retained_base_schema_with_netconf_targets(conn)
+        }
+    }
+    .map_err(|_| RetainedConfigError::Rejected)?;
     let version =
         crate::schema::get_schema_version(conn).map_err(|_| RetainedConfigError::Rejected)?;
     let digest =
@@ -819,6 +819,7 @@ fn validate_connection(
         options.binding.topology(),
         key,
         work.deadline,
+        options.binding.profile(),
     )
     .map_err(|_| RetainedConfigError::Rejected)?;
     conn.progress_handler(0, None::<fn() -> bool>)
