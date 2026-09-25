@@ -71,9 +71,14 @@ pub(crate) struct NetconfRollbackView {
     pub(crate) encrypted: Vec<u8>,
 }
 
+struct NetconfRollbackAttempt {
+    prepared: PreparedTargetMutation,
+    predecessor: Option<super::AuditOperationHandle>,
+}
+
 struct NetconfRollbackState {
     view: NetconfRollbackView,
-    attempt: Mutex<Option<PreparedTargetMutation>>,
+    attempt: Mutex<Option<NetconfRollbackAttempt>>,
 }
 
 /// One original retained rollback parent and cause. All clones share the exact
@@ -138,7 +143,7 @@ impl NetconfRollbackRead {
         self.0
             .attempt
             .lock()
-            .map(|attempt| attempt.clone())
+            .map(|attempt| attempt.as_ref().map(|current| current.prepared.clone()))
             .map_err(|_| AuditAuthorityError::Unavailable)
     }
 
@@ -253,26 +258,12 @@ impl NetconfRollbackRead {
             .lock()
             .map_err(|_| AuditAuthorityError::Unavailable)?;
         if let Some(original) = &*slot {
-            let mut proposed = prepared.effect.clone();
-            proposed.expires_at = original.effect.expires_at;
-            if original.handle.body.event != prepared.handle.body.event
-                || original.effect != proposed
-                || original
-                    .handle
-                    .body
-                    .expires_at
-                    .checked_sub(original.handle.body.issued_at)
-                    != prepared
-                        .handle
-                        .body
-                        .expires_at
-                        .checked_sub(prepared.handle.body.issued_at)
-            {
-                return Err(AuditAuthorityError::BindingMismatch);
-            }
-            return Ok(original.clone());
+            return Self::same_preparation(&original.prepared, &prepared);
         }
-        *slot = Some(prepared.clone());
+        *slot = Some(NetconfRollbackAttempt {
+            prepared: prepared.clone(),
+            predecessor: None,
+        });
         Ok(prepared)
     }
 }
@@ -348,5 +339,146 @@ macro_rules! redacted {
 redacted!(
     NetconfRecoveryOwner,
     NetconfRollbackRead,
-    NetconfRollback<'_>
+    NetconfRollback<'_>,
+    NetconfRollbackSuccessor<'_>
 );
+
+impl NetconfRollbackRead {
+    fn same_preparation(
+        original: &PreparedTargetMutation,
+        proposed: &PreparedTargetMutation,
+    ) -> Result<PreparedTargetMutation, AuditAuthorityError> {
+        let mut effect = proposed.effect.clone();
+        effect.expires_at = original.effect.expires_at;
+        if original.handle.body.event != proposed.handle.body.event
+            || original.effect != effect
+            || original
+                .handle
+                .body
+                .expires_at
+                .checked_sub(original.handle.body.issued_at)
+                != proposed
+                    .handle
+                    .body
+                    .expires_at
+                    .checked_sub(proposed.handle.body.issued_at)
+        {
+            return Err(AuditAuthorityError::BindingMismatch);
+        }
+        Ok(original.clone())
+    }
+
+    pub(crate) fn successor_context(
+        &self,
+        owner: &NetconfRecoveryOwner,
+        previous: &PreparedTargetMutation,
+        event: &ProjectedAuditEvent,
+    ) -> Result<(), AuditAuthorityError> {
+        self.verify_owner(owner)?;
+        self.verify_event(event)?;
+        self.verify_event(&previous.handle.body.event)?;
+        if event.request == previous.handle.body.event.request {
+            return Err(AuditAuthorityError::BindingMismatch);
+        }
+        let slot = self
+            .0
+            .attempt
+            .lock()
+            .map_err(|_| AuditAuthorityError::Unavailable)?;
+        let current = slot.as_ref().ok_or(AuditAuthorityError::BindingMismatch)?;
+        if current.prepared == *previous {
+            return Ok(());
+        }
+        if current.predecessor.as_ref() == Some(previous.handle()) {
+            // Selection already happened. Recover that exact original without
+            // calling the provider, refreshing expiry or accepting new content.
+            return Err(AuditAuthorityError::RecoveryRequired);
+        }
+        Err(AuditAuthorityError::BindingMismatch)
+    }
+
+    pub(crate) fn verify_rejected_predecessor(
+        &self,
+        previous: &PreparedTargetMutation,
+        ledger: &super::ledger::LedgerState,
+        key: &crate::AuditKey,
+        now: i64,
+    ) -> Result<(), AuditAuthorityError> {
+        self.verify_event(&previous.handle.body.event)?;
+        previous.verify_effect(key)?;
+        if ledger.recover_target(key, previous.handle(), self.original_caller())? != *previous {
+            return Err(AuditAuthorityError::BindingMismatch);
+        }
+        let operation = ledger
+            .operations
+            .iter()
+            .find(|operation| operation.handle == previous.handle)
+            .ok_or(AuditAuthorityError::BindingMismatch)?;
+        if now < previous.handle.body.expires_at
+            || operation.state != super::AuditOperationState::Rejected
+            || !operation.terminal_recorded
+            || ledger
+                .continuity
+                .as_ref()
+                .and_then(|chain| chain.checkpoint.as_ref())
+                .is_none_or(|checkpoint| checkpoint.sequence() < operation.last_sequence)
+        {
+            return Err(AuditAuthorityError::RecoveryRequired);
+        }
+        Ok(())
+    }
+
+    pub(crate) fn retain_successor(
+        &self,
+        owner: &NetconfRecoveryOwner,
+        previous: &PreparedTargetMutation,
+        prepared: PreparedTargetMutation,
+        ledger: &super::ledger::LedgerState,
+        key: &crate::AuditKey,
+        now: i64,
+    ) -> Result<PreparedTargetMutation, AuditAuthorityError> {
+        self.verify_owner(owner)?;
+        self.verify_event(&prepared.handle.body.event)?;
+        prepared.verify_effect(key)?;
+        self.verify_rejected_predecessor(previous, ledger, key, now)?;
+        if prepared.handle.body.event.request == previous.handle.body.event.request
+            || prepared.handle.body.issued_at < previous.handle.body.expires_at
+        {
+            return Err(AuditAuthorityError::BindingMismatch);
+        }
+        let mut slot = self
+            .0
+            .attempt
+            .lock()
+            .map_err(|_| AuditAuthorityError::Unavailable)?;
+        let current = slot.as_ref().ok_or(AuditAuthorityError::BindingMismatch)?;
+        if current.prepared == *previous {
+            *slot = Some(NetconfRollbackAttempt {
+                prepared: prepared.clone(),
+                predecessor: Some(previous.handle().clone()),
+            });
+            return Ok(prepared);
+        }
+        if current.predecessor.as_ref() != Some(previous.handle()) {
+            return Err(AuditAuthorityError::BindingMismatch);
+        }
+        Self::same_preparation(&current.prepared, &prepared)
+    }
+}
+
+/// A separately authorized retry of an expired, settled rejected rollback.
+/// The exact previous attempt must belong to the original frozen read. Neither
+/// elapsed time nor an absent result proves rejection. The original confirmed
+/// deadline and parent are unchanged; a new request cannot discover an old result.
+pub struct NetconfRollbackSuccessor<'a> {
+    pub(crate) previous: &'a PreparedTargetMutation,
+    pub(crate) rollback: NetconfRollback<'a>,
+}
+
+impl<'a> NetconfRollbackSuccessor<'a> {
+    /// Supply the exact previous preparation and an attested successor for the
+    /// same original read. This constructs input only, without recovery authority.
+    pub fn new(previous: &'a PreparedTargetMutation, rollback: NetconfRollback<'a>) -> Self {
+        Self { previous, rollback }
+    }
+}

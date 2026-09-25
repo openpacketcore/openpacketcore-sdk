@@ -2562,3 +2562,93 @@ impl ConsensusConfigStore {
         Ok(original)
     }
 }
+
+impl ConsensusConfigStore {
+    /// Prepare a separate rollback only after the exact previous attempt expired,
+    /// was authoritatively rejected, and has a terminal covering checkpoint.
+    /// The original pending confirmation, parent, caller and confirmed deadline
+    /// remain fixed. Intent, missing/pruned results and applied outcomes refuse.
+    ///
+    /// Authenticate a new Internal Exec Intent for the same administrator. This
+    /// reads the independent checkpoint before provider work, retains one original
+    /// successor before transmission, and applies ordinary target preflight after
+    /// provider work. If selection already happened, use the read's `original`
+    /// operation. No new encryption, request or expiry can replace that original.
+    pub async fn prepare_netconf_rollback_successor(
+        &self,
+        owner: &crate::audit_authority::NetconfRecoveryOwner,
+        successor: crate::audit_authority::NetconfRollbackSuccessor<'_>,
+        tenant: &opc_types::TenantId,
+        privacy: &dyn AuditPrivacyProjection,
+        event: &ManagementAuditEventRecord,
+        lifetime: std::time::Duration,
+    ) -> Result<crate::audit_authority::PreparedTargetMutation, AuditAuthorityError> {
+        self.require_netconf_target_profile()?;
+        if !owner.worker.belongs_to(&self.inner) {
+            return Err(AuditAuthorityError::BindingMismatch);
+        }
+        let frozen = successor.rollback.frozen;
+        let previous = successor.previous;
+        frozen.verify_tenant(privacy, tenant)?;
+        if lifetime.subsec_nanos() != 0 || !(1..=3600).contains(&lifetime.as_secs()) {
+            return Err(AuditAuthorityError::InvalidInput);
+        }
+        self.verify_netconf_target(previous, frozen.original_caller())?;
+        let event = frozen.project_event(privacy, ProjectedAuditEvent::project(privacy, event)?)?;
+        frozen.successor_context(owner, previous, &event)?;
+        let issued_at = self
+            .inner
+            .clock
+            .now_utc()
+            .as_offset_datetime()
+            .unix_timestamp();
+        let expires_at = issued_at
+            .checked_add(lifetime.as_secs() as i64)
+            .ok_or(AuditAuthorityError::InvalidInput)?;
+        let ledger = self.read_audit_ledger().await?;
+        frozen.verify_rejected_predecessor(
+            previous,
+            &ledger,
+            self.inner.backend.audit_key(),
+            issued_at,
+        )?;
+        let effect = frozen
+            .prepare_rollback_successor(
+                owner,
+                successor,
+                tenant,
+                &event,
+                issued_at..expires_at,
+                self.inner.backend.audit_key(),
+            )
+            .await?;
+        let digest = effect.digest(self.inner.backend.audit_key())?;
+        let binding =
+            AuditOperationBinding::project(privacy, &event, frozen.running_version(), &digest)?;
+        let handle = AuditOperationHandle::issue(
+            HandleBody {
+                version: 1,
+                identity: self.inner.identity,
+                binding,
+                event,
+                issued_at,
+                expires_at,
+                nonce: *uuid::Uuid::new_v4().as_bytes(),
+                key_epoch: self.inner.backend.audit_key().epoch(),
+                mutation: Some(digest),
+            },
+            self.inner.backend.audit_key(),
+        )?;
+        let prepared = crate::audit_authority::PreparedTargetMutation { handle, effect };
+        let original = frozen.retain_successor(
+            owner,
+            previous,
+            prepared,
+            &ledger,
+            self.inner.backend.audit_key(),
+            issued_at,
+        )?;
+        self.preflight_netconf_target(&original).await?;
+        Ok(original)
+    }
+}

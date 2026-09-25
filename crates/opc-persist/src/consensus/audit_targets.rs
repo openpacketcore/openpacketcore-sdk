@@ -3525,6 +3525,39 @@ impl crate::audit_authority::NetconfRollbackRead {
         window: std::ops::Range<i64>,
         key: &AuditKey,
     ) -> Result<super::audit_mutation::TargetEffectV1, AuditAuthorityError> {
+        if self.original()?.is_some() {
+            return Err(AuditAuthorityError::RecoveryRequired);
+        }
+        self.prepare_rollback_effect(owner, input, tenant, event, window, key)
+            .await
+    }
+
+    pub(crate) async fn prepare_rollback_successor(
+        &self,
+        owner: &crate::audit_authority::NetconfRecoveryOwner,
+        input: crate::audit_authority::NetconfRollbackSuccessor<'_>,
+        tenant: &opc_types::TenantId,
+        event: &crate::audit_authority::ProjectedAuditEvent,
+        window: std::ops::Range<i64>,
+        key: &AuditKey,
+    ) -> Result<super::audit_mutation::TargetEffectV1, AuditAuthorityError> {
+        self.successor_context(owner, input.previous, event)?;
+        if window.start < input.previous.handle.body.expires_at {
+            return Err(AuditAuthorityError::RecoveryRequired);
+        }
+        self.prepare_rollback_effect(owner, input.rollback, tenant, event, window, key)
+            .await
+    }
+
+    async fn prepare_rollback_effect(
+        &self,
+        owner: &crate::audit_authority::NetconfRecoveryOwner,
+        input: crate::audit_authority::NetconfRollback<'_>,
+        tenant: &opc_types::TenantId,
+        event: &crate::audit_authority::ProjectedAuditEvent,
+        window: std::ops::Range<i64>,
+        key: &AuditKey,
+    ) -> Result<super::audit_mutation::TargetEffectV1, AuditAuthorityError> {
         use crate::audit_authority::NetconfRollbackCause as Cause;
         let bad = AuditAuthorityError::BindingMismatch;
         self.verify_owner(owner)?;
@@ -3535,9 +3568,6 @@ impl crate::audit_authority::NetconfRollbackRead {
             || (view.cause == Cause::Timeout && window.start < view.original_deadline)
         {
             return Err(bad);
-        }
-        if self.original()?.is_some() {
-            return Err(AuditAuthorityError::RecoveryRequired);
         }
         let envelope = opc_crypto::CryptoEnvelopeRef::decode(&view.encrypted).map_err(|_| bad)?;
         let (aad, _) = opc_key::decode_bound_aad(envelope.aad).map_err(|_| bad)?;

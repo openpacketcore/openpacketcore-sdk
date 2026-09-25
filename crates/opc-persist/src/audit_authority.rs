@@ -28,6 +28,7 @@ mod targets;
 pub(crate) use netconf_recovery::{NetconfRecoveryCache, NetconfRollbackView};
 pub use netconf_recovery::{
     NetconfRecoveryOwner, NetconfRollback, NetconfRollbackCause, NetconfRollbackRead,
+    NetconfRollbackSuccessor,
 };
 
 pub use ledger::{

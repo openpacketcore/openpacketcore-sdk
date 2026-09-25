@@ -618,3 +618,30 @@ proves rejection. Recovery of expired, definitively rejected rollback attempts
 requires an explicit settled-predecessor successor operation, not this initial
 preparation method. Public runtime/process/leadership and active-profile
 compatibility qualification remain required before full-profile availability.
+
+
+### Explicit rollback retry after settled rejection
+
+`NetconfRollbackSuccessor` binds the exact previously retained preparation to the
+same original read and an attested successor. `prepare_netconf_rollback_successor`
+requires a separately authenticated Internal Exec Intent with a new request. A
+quorum-current authenticated ledger and its independent checkpoint must prove the
+original fixed expiry elapsed, exact recovery bytes match, the outcome is Rejected,
+and terminal completion has a covering checkpoint before provider work begins.
+Missing or pruned proof, live or expired Intent, and applied outcomes refuse. An
+empty lookup never proves nonapplication.
+
+The provider and original effect guards still protect the parent configuration,
+tentative transaction, next version, caller, cause and original confirmed deadline.
+One current attempt plus its immediate predecessor is retained locally; all clones
+select the same first identical preparation. Another request, encrypted payload,
+lifetime or stale predecessor cannot replace that winner. Once selected, callers
+recover `NetconfRollbackRead::original` instead of preparing again. Cancellation
+before selection leaves the rejected original intact. No preparation admits an
+intent or changes configuration. Required audit admission, checkpoint, application
+and terminal completion remain the existing protocol, and the prior rejected
+result never changes into success.
+
+This API does not reconstruct a fresh process's recovery capability. Recovery
+opening for already-retained cleanup, runtime integration, and full restart and
+leadership qualification remain separate prerequisites for full-profile availability.
