@@ -1908,3 +1908,18 @@ impl NetconfDeviceView {
         })
     }
 }
+
+impl PreparedTargetMutation {
+    pub(crate) fn is_session_cleanup_for(
+        &self,
+        session: &crate::audit_authority::NetconfSessionOwner,
+    ) -> bool {
+        self.effect.authority == session.device.authority
+            && self.effect.profile_incarnation == session.device.profile_incarnation
+            && self.effect.device_incarnation == session.device.device_incarnation
+            && self.effect.caller == session.caller
+            && u8::from(self.effect.action) == 13
+            && matches!(self.effect.resolution,
+                Some(TargetResolutionV1::EndSession { session: incarnation }) if incarnation == session.incarnation())
+    }
+}

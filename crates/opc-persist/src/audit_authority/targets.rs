@@ -703,7 +703,6 @@ impl NetconfSessionOwner {
         &self,
         prepared: super::PreparedTargetMutation,
     ) -> Result<super::PreparedTargetMutation, AuditAuthorityError> {
-        use crate::consensus::audit_mutation::TargetResolutionV1;
         self.cleanup_context(&prepared.handle.body.event)?;
         let seconds = prepared
             .handle
@@ -712,14 +711,7 @@ impl NetconfSessionOwner {
             .checked_sub(prepared.handle.body.issued_at)
             .filter(|seconds| (1..=3600).contains(seconds))
             .ok_or(AuditAuthorityError::BindingMismatch)?;
-        if prepared.effect.authority != self.device.authority
-            || prepared.effect.profile_incarnation != self.device.profile_incarnation
-            || prepared.effect.device_incarnation != self.device.device_incarnation
-            || prepared.effect.caller != self.caller
-            || u8::from(prepared.effect.action) != 13
-            || !matches!(prepared.effect.resolution,
-                Some(TargetResolutionV1::EndSession { session }) if session == self.incarnation())
-        {
+        if !prepared.is_session_cleanup_for(self) {
             return Err(AuditAuthorityError::BindingMismatch);
         }
         let event = prepared.handle.body.event.clone();
