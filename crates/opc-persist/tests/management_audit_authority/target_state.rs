@@ -3731,3 +3731,149 @@ async fn target_cleanup_successor_refuses_pruned_original_without_changing_pendi
         "pending parent and deadline must remain unchanged"
     );
 }
+
+fn copy_plaintext(request: u8, config: &[u8]) -> Vec<u8> {
+    let mut bytes = b"\x89OPCCFG\x02\r\n\x1a\n{\"config\":".to_vec();
+    bytes.extend_from_slice(config);
+    bytes.extend_from_slice(
+        format!(",\"request_id\":\"00000000-0000-4000-8000-{request:012x}\"}}").as_bytes(),
+    );
+    bytes
+}
+
+async fn copy_provider_stage(
+    fixture: &Fixture,
+    conn: &Connection,
+    slot: u8,
+    config: &[u8],
+) -> (
+    opc_key::MemoryKeyProvider,
+    crate::consensus::audit_mutation::TargetEncryptedBlobV1,
+) {
+    use crate::consensus::audit_mutation::TargetPayloadV1;
+    use opc_key::{KeyId, KeyPurpose, MemoryKeyProvider};
+    use sha2::{Digest, Sha256};
+    let provider = MemoryKeyProvider::new();
+    provider
+        .insert_active_key(
+            KeyId::new("fixture-target-key").unwrap(),
+            KeyPurpose::Config,
+            opc_types::TenantId::from_static("fixture-tenant"),
+            zeroize::Zeroizing::new([0x6a; 32]),
+        )
+        .unwrap();
+    let mut stage = fixture.encrypted(
+        fixture.request(conn, 180, if slot == 0 { 4 } else { 7 }, 0x61, slot + 1),
+        0x6a,
+    );
+    let Some(TargetPayloadV1::Target(blob)) = &mut stage.effect.encrypted_payload else {
+        panic!("target copy fixture");
+    };
+    let envelope = opc_crypto::CryptoEnvelopeRef::decode(&blob.encrypted_blob).unwrap();
+    let (aad, _) = opc_key::decode_bound_aad(envelope.aad).unwrap();
+    let plaintext = copy_plaintext(180, config);
+    let encrypted = opc_crypto::encrypt_attested_envelope(&provider, &aad, &plaintext)
+        .await
+        .unwrap();
+    blob.encrypted_blob = encrypted.encoded().to_vec();
+    blob.plaintext_digest = Sha256::digest(&plaintext).into();
+    let source = blob.clone();
+    let stage = fixture.rebind_at(conn, stage, 100);
+    assert!(matches!(
+        fixture.submit(conn, &stage),
+        AuditOperationState::TargetV1(_)
+    ));
+    fixture.settle(conn, &stage);
+    provider
+        .insert_active_key(
+            KeyId::new("fixture-running-key").unwrap(),
+            KeyPurpose::Config,
+            opc_types::TenantId::from_static("fixture-tenant"),
+            zeroize::Zeroizing::new([0x7b; 32]),
+        )
+        .unwrap();
+    (provider, source)
+}
+
+async fn copy_provider_destination(
+    fixture: &Fixture,
+    conn: &Connection,
+    provider: &opc_key::MemoryKeyProvider,
+    slot: u8,
+    request: u8,
+    config: &[u8],
+) -> PreparedTargetMutation {
+    use crate::consensus::audit_mutation::TargetPayloadV1;
+    use sha2::{Digest, Sha256};
+    let mut prepared = fixture.running_target(conn, request, 15, slot, 0x6a);
+    let Some(TargetPayloadV1::Running { commit, .. }) = &mut prepared.effect.encrypted_payload
+    else {
+        panic!("running copy fixture");
+    };
+    let envelope = opc_crypto::CryptoEnvelopeRef::decode(&commit.record.encrypted_blob).unwrap();
+    let (aad, _) = opc_key::decode_bound_aad(envelope.aad).unwrap();
+    let plaintext = copy_plaintext(request, config);
+    let encrypted = opc_crypto::encrypt_attested_envelope(provider, &aad, &plaintext)
+        .await
+        .unwrap();
+    let mut record = commit.record.clone();
+    record.encrypted_blob = encrypted.encoded().to_vec();
+    record.plaintext_digest = Sha256::digest(&plaintext).to_vec();
+    let attested =
+        crate::AttestedConfigCommit::try_new(record, Vec::new(), encrypted.claim().unwrap())
+            .unwrap();
+    let (record, audit, _) = attested.into_parts();
+    **commit =
+        crate::consensus::PreparedConfigCommit::prepare(record, audit, &fixture.key).unwrap();
+    fixture.rebind_at(conn, prepared, 100)
+}
+
+#[tokio::test]
+async fn target_provider_copy_accepts_distinct_authenticated_replay_wrappers() {
+    use crate::consensus::audit_mutation::TargetPayloadV1;
+    for slot in [0, 1] {
+        let fixture = Fixture::new().await;
+        let shared = fixture.backend.conn();
+        let conn = shared.lock().await;
+        fixture.active(&conn);
+        let config = br#"{"limit":9007199254740993,"items":[1,2]}"#;
+        let (provider, source) = copy_provider_stage(&fixture, &conn, slot, config).await;
+        let prepared =
+            copy_provider_destination(&fixture, &conn, &provider, slot, 181, config).await;
+        let Some(TargetPayloadV1::Running { commit, .. }) = &prepared.effect.encrypted_payload
+        else {
+            panic!("running copy fixture");
+        };
+        assert_ne!(commit.record.plaintext_digest, source.plaintext_digest);
+        for (ciphertext, expected) in [
+            (&source.encrypted_blob, copy_plaintext(180, config)),
+            (&commit.record.encrypted_blob, copy_plaintext(181, config)),
+        ] {
+            let envelope = opc_crypto::CryptoEnvelopeRef::decode(ciphertext).unwrap();
+            let (aad, _) = opc_key::decode_bound_aad(envelope.aad).unwrap();
+            let decoded = opc_crypto::decrypt_envelope(&provider, &aad, ciphertext)
+                .await
+                .unwrap();
+            assert_eq!(
+                *decoded, expected,
+                "exact configuration and original replay wrapper"
+            );
+        }
+        let before = row(&conn, "config_netconf_targets", "target", slot);
+        assert!(
+            matches!(fixture.submit(&conn, &prepared), AuditOperationState::TargetV1(r)
+                if matches!(r.outcome(), NetconfAppliedOutcome::CopiedRunning { running_version: 1 })),
+            "provider-authenticated copy of identical configuration rejected distinct replay wrappers"
+        );
+        assert_eq!(row(&conn, "config_netconf_targets", "target", slot), before);
+        let retained: Vec<u8> = conn
+            .query_row(
+                "SELECT encrypted_blob FROM config_history WHERE version=1",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(retained, commit.record.encrypted_blob);
+        fixture.settle(&conn, &prepared);
+    }
+}
