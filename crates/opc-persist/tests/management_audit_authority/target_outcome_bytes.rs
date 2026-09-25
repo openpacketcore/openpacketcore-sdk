@@ -6,8 +6,8 @@ use serde_json::{json, Value};
 
 fn authority() -> Value {
     json!({
-        "cluster_id": [0x31; 32].as_slice(),
-        "configuration_id": [0x32; 32].as_slice(),
+        "cluster_id": vec![0x31; 32],
+        "configuration_id": vec![0x32; 32],
         "configuration_epoch": 1,
     })
 }
@@ -17,14 +17,14 @@ fn scoped_number(value: u64) -> Value {
 }
 
 fn scoped_token(byte: u8) -> Value {
-    json!({"authority": authority(), "value": [byte; 16].as_slice()})
+    json!({"authority": authority(), "value": vec![byte; 16]})
 }
 
 fn body(outcome: Value) -> Value {
     json!({"target-v1": {
         "authority": authority(),
-        "profile_incarnation": [0x41; 16].as_slice(),
-        "state_digest": [0x42; 32].as_slice(),
+        "profile_incarnation": vec![0x41; 16],
+        "state_digest": vec![0x42; 32],
         "outcome": outcome,
     }})
 }
@@ -123,7 +123,7 @@ fn target_outcomes_reject_unknown_fields_tags_and_invalid_scope() {
         fields.insert("unrecognized".into(), json!(1));
         assert!(serde_json::from_value::<AuditOperationState>(wrong_scope).is_err());
         let mut no_profile = value.clone();
-        no_profile["target-v1"]["profile_incarnation"] = json!([0; 16].as_slice());
+        no_profile["target-v1"]["profile_incarnation"] = json!(vec![0; 16]);
         assert!(serde_json::from_value::<AuditOperationState>(no_profile).is_err());
         let mut version = value["target-v1"].clone();
         version["outcome"] = json!({"unrecognized": {}});
@@ -174,7 +174,7 @@ fn target_outcomes_reject_unknown_fields_tags_and_invalid_scope() {
             if field == "running_version" {
                 zero["target-v1"]["outcome"][&kind][field] = json!(0);
             } else if matches!(field, "pending" | "incarnation") {
-                zero["target-v1"]["outcome"][&kind][field]["value"] = json!([0; 16].as_slice());
+                zero["target-v1"]["outcome"][&kind][field]["value"] = json!(vec![0; 16]);
             } else {
                 zero["target-v1"]["outcome"][&kind][field]["value"] = json!(0);
             }
