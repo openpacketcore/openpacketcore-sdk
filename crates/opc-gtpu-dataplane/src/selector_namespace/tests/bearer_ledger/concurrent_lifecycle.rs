@@ -29,6 +29,25 @@ fn next_child(parent: &GtpuSessionGroup, id: u8, teid: u32) -> GtpuSessionGroup 
 }
 
 #[tokio::test]
+async fn independent_fixtures_do_not_share_admission_capacity() {
+    let first = lab(3).await;
+    let second = lab(3).await;
+    let permits = selector_namespace_supervisors(first.authority.storage_scope_commitment)
+        .try_acquire_many_owned(SELECTOR_NAMESPACE_MAX_SUPERVISORS_PER_NAMESPACE as u32)
+        .unwrap();
+    let recovery = second
+        .authority
+        .concurrent_operations()
+        .recover_active(second.backend.clone(), second.parent.clone())
+        .await;
+    drop(permits);
+    assert!(
+        recovery.is_ok(),
+        "an independent fixture must not inherit another fixture's saturation"
+    );
+}
+
+#[tokio::test]
 async fn concurrent_retirement_preserves_retry_order_and_exact_mark_reuse() {
     retirement_progress(true, false).await;
 }

@@ -17,7 +17,16 @@ struct Lab<B: SessionBackend + SessionLeaseManager = Protected> {
 }
 
 async fn lab(capacity: usize) -> Lab {
-    let tenant = TenantId::from_static("bearer-codec-fixture");
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    // Independent stores are independent namespaces. Reusing a stable scope
+    // would deliberately share the process admission pool across parallel tests.
+    static NEXT_FIXTURE: AtomicU64 = AtomicU64::new(1);
+    let tenant = TenantId::new(format!(
+        "bearer-codec-fixture-{}",
+        NEXT_FIXTURE.fetch_add(1, Ordering::Relaxed)
+    ))
+    .unwrap();
     let keys = Arc::new(opc_key::MemoryKeyProvider::new());
     keys.insert_active_key(
         opc_key::KeyId::new("bearer-fixture-key").unwrap(),
