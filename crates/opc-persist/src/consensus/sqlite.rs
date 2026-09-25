@@ -7,8 +7,8 @@ use std::collections::BTreeSet;
 use std::io;
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicU8, Ordering};
+use std::sync::Arc;
 use std::time::Duration;
 
 use opc_consensus::engine::{
@@ -19,7 +19,7 @@ use opc_consensus::{
     ConsensusIdentity, ConsensusNodeId,
 };
 use opc_types::Timestamp;
-use rusqlite::{Connection, OptionalExtension, Transaction, TransactionBehavior, params};
+use rusqlite::{params, Connection, OptionalExtension, Transaction, TransactionBehavior};
 use serde::Serialize;
 use sha2::{Digest, Sha256};
 
@@ -1572,7 +1572,7 @@ pub(crate) fn read_vote_sync(
         _ => {
             return Err(invalid_data(
                 "persisted config consensus vote node mismatch",
-            ));
+            ))
         }
     }
     Ok(Some(vote))
@@ -1968,7 +1968,7 @@ fn validate_durable_log_state_sync(
         _ => {
             return Err(invalid_data(
                 "persisted config consensus log aggregate is invalid",
-            ));
+            ))
         }
     }
     Ok(())
@@ -2320,7 +2320,7 @@ pub(crate) fn purge_logs_sync(
         _ => {
             return Err(invalid_data(
                 "config consensus purge lacks exact durable lineage",
-            ));
+            ))
         }
     }
     tx.execute(
@@ -3511,7 +3511,7 @@ fn validate_history_chain_cancellable_sync(
             _ => {
                 return Err(invalid_data(
                     "config consensus history is not a contiguous linear chain",
-                ));
+                ))
             }
         }
         head = Some((tx_id, version));
@@ -3955,8 +3955,8 @@ mod tests {
     use opc_consensus::engine::{CommittedLeaderId, Entry, EntryPayload, LogId, Membership};
     use opc_crypto::CryptoEnvelopeV1;
     use opc_key::{
-        AES_256_GCM_SIV_NONCE_LEN, AeadAlgorithm, ConfigAad, EnvelopeAad, KeyId,
-        serialize_bound_aad,
+        serialize_bound_aad, AeadAlgorithm, ConfigAad, EnvelopeAad, KeyId,
+        AES_256_GCM_SIV_NONCE_LEN,
     };
     use opc_types::{ConfigVersion, SchemaDigest, TenantId, TxId};
 
@@ -3964,9 +3964,9 @@ mod tests {
     use crate::consensus::types::LEGACY_CONFIG_CONSENSUS_COMMAND_VERSION;
     use crate::consensus::types::{PreparedConfigCommit, ValidatedRollbackLabel};
     use crate::consensus::{
-        CONFIG_CONSENSUS_COMMAND_VERSION, ConfigConsensusClusterId, ConfigConsensusCommand,
-        ConfigConsensusConfigurationEpoch, ConfigConsensusConfigurationId,
-        ConfigConsensusRequestId, ConfigMutationIntent,
+        ConfigConsensusClusterId, ConfigConsensusCommand, ConfigConsensusConfigurationEpoch,
+        ConfigConsensusConfigurationId, ConfigConsensusRequestId, ConfigMutationIntent,
+        CONFIG_CONSENSUS_COMMAND_VERSION,
     };
     use crate::types::CommitRecord;
 
@@ -4555,10 +4555,12 @@ mod tests {
         let conn = shared_conn.lock().await;
         SqliteBackend::append_commit_raw(&conn, record, Vec::new(), backend.audit_key())
             .expect("seed externally malformed durable state");
-        assert!(
-            validate_sealed_state_sync(&conn, backend.audit_key(), &SqliteWorkCancellation::new(),)
-                .is_err()
-        );
+        assert!(validate_sealed_state_sync(
+            &conn,
+            backend.audit_key(),
+            &SqliteWorkCancellation::new(),
+        )
+        .is_err());
     }
 
     #[tokio::test]
@@ -4581,14 +4583,12 @@ mod tests {
             let record = sealed_record_for_exact_principal(principal, marker);
             SqliteBackend::append_commit_raw(&conn, record, Vec::new(), backend.audit_key())
                 .expect("seed externally malformed durable state");
-            assert!(
-                validate_sealed_state_sync(
-                    &conn,
-                    backend.audit_key(),
-                    &SqliteWorkCancellation::new(),
-                )
-                .is_err()
-            );
+            assert!(validate_sealed_state_sync(
+                &conn,
+                backend.audit_key(),
+                &SqliteWorkCancellation::new(),
+            )
+            .is_err());
         }
     }
 
@@ -4643,10 +4643,12 @@ mod tests {
         assert!(super::super::types::validate_encrypted_record(&record).is_err());
         SqliteBackend::append_commit_raw(&conn, record, Vec::new(), backend.audit_key())
             .expect("seed externally malformed durable state");
-        assert!(
-            validate_sealed_state_sync(&conn, backend.audit_key(), &SqliteWorkCancellation::new(),)
-                .is_err()
-        );
+        assert!(validate_sealed_state_sync(
+            &conn,
+            backend.audit_key(),
+            &SqliteWorkCancellation::new(),
+        )
+        .is_err());
     }
 
     #[tokio::test]
@@ -4712,15 +4714,13 @@ mod tests {
                 },
             }),
         };
-        assert!(
-            append_logs_sync(
-                &conn,
-                identity(),
-                &expected_members(),
-                std::slice::from_ref(&revision_one_new_intent),
-            )
-            .is_err()
-        );
+        assert!(append_logs_sync(
+            &conn,
+            identity(),
+            &expected_members(),
+            std::slice::from_ref(&revision_one_new_intent),
+        )
+        .is_err());
         assert_eq!(
             Some(log_id(2)),
             last_log_sync(&conn, identity()).expect("legacy log remains intact")
@@ -4965,20 +4965,18 @@ mod tests {
                 [],
             )
             .expect("target rejection sentinel");
-        assert!(
-            install_snapshot_database_sync(
-                &target_conn,
-                identity(),
-                &expected_members(),
-                target.audit_key(),
-                &snapshot_path,
-                &meta,
-                "snapshot-rejected.opc",
-                [0x82; 32],
-                1,
-            )
-            .is_err()
-        );
+        assert!(install_snapshot_database_sync(
+            &target_conn,
+            identity(),
+            &expected_members(),
+            target.audit_key(),
+            &snapshot_path,
+            &meta,
+            "snapshot-rejected.opc",
+            [0x82; 32],
+            1,
+        )
+        .is_err());
         let sequence: i64 = target_conn
             .query_row(
                 "SELECT application_sequence FROM config_raft_machine WHERE singleton = 1",
@@ -5037,20 +5035,18 @@ mod tests {
             last_membership,
             snapshot_id: "invalid-history".to_owned(),
         };
-        assert!(
-            install_snapshot_database_sync(
-                &target_conn,
-                identity(),
-                &expected_members(),
-                target.audit_key(),
-                &snapshot_path,
-                &meta,
-                "snapshot-invalid.opc",
-                [0x81; 32],
-                1,
-            )
-            .is_err()
-        );
+        assert!(install_snapshot_database_sync(
+            &target_conn,
+            identity(),
+            &expected_members(),
+            target.audit_key(),
+            &snapshot_path,
+            &meta,
+            "snapshot-invalid.opc",
+            [0x81; 32],
+            1,
+        )
+        .is_err());
         let sequence: i64 = target_conn
             .query_row(
                 "SELECT application_sequence FROM config_raft_machine WHERE singleton = 1",
@@ -5091,14 +5087,12 @@ mod tests {
         .expect("applied floor");
         purge_logs_sync(&conn, identity(), &log_id(0)).expect("purged floor");
 
-        assert!(
-            save_committed_sync(
-                &conn,
-                identity(),
-                Some(log_id_with_term(2, applied.log_id.index)),
-            )
-            .is_err()
-        );
+        assert!(save_committed_sync(
+            &conn,
+            identity(),
+            Some(log_id_with_term(2, applied.log_id.index)),
+        )
+        .is_err());
         assert_eq!(
             Some(applied.log_id),
             read_committed_sync(&conn, identity()).expect("committed pointer")
@@ -5118,15 +5112,13 @@ mod tests {
         assert!(truncate_logs_sync(&conn, identity(), &log_id(0)).is_err());
 
         let replacement = mark_confirmed_entry_with_term(2, 2, [0x33; 16], TxId::new());
-        assert!(
-            append_logs_sync(
-                &conn,
-                identity(),
-                &expected_members(),
-                std::slice::from_ref(&replacement),
-            )
-            .is_err()
-        );
+        assert!(append_logs_sync(
+            &conn,
+            identity(),
+            &expected_members(),
+            std::slice::from_ref(&replacement),
+        )
+        .is_err());
         assert_eq!(
             Some(tail.log_id),
             last_log_sync(&conn, identity()).expect("tail remains intact")
@@ -5245,15 +5237,13 @@ mod tests {
             std::slice::from_ref(&membership_entry()),
         )
         .expect("membership log");
-        assert!(
-            append_logs_sync(
-                &conn,
-                identity(),
-                &expected_members(),
-                std::slice::from_ref(&rejected),
-            )
-            .is_err()
-        );
+        assert!(append_logs_sync(
+            &conn,
+            identity(),
+            &expected_members(),
+            std::slice::from_ref(&rejected),
+        )
+        .is_err());
         assert_eq!(
             Some(log_id(0)),
             last_log_sync(&conn, identity()).expect("invalid append is atomic")
@@ -5484,15 +5474,13 @@ mod tests {
             baseline_machine,
             read_machine_sync(&conn, identity()).expect("machine after pre-commit fault")
         );
-        assert!(
-            read_outcome_sync(
-                &conn,
-                identity(),
-                ConfigConsensusRequestId::from_bytes([0xA1; 16]),
-            )
-            .expect("outcome after pre-commit fault")
-            .is_none()
-        );
+        assert!(read_outcome_sync(
+            &conn,
+            identity(),
+            ConfigConsensusRequestId::from_bytes([0xA1; 16]),
+        )
+        .expect("outcome after pre-commit fault")
+        .is_none());
 
         apply_entries_sync(
             &conn,
@@ -5506,15 +5494,13 @@ mod tests {
             Some(entry.log_id),
             read_applied_sync(&conn, identity()).expect("replayed applied pointer")
         );
-        assert!(
-            read_outcome_sync(
-                &conn,
-                identity(),
-                ConfigConsensusRequestId::from_bytes([0xA1; 16]),
-            )
-            .expect("replayed outcome")
-            .is_some()
-        );
+        assert!(read_outcome_sync(
+            &conn,
+            identity(),
+            ConfigConsensusRequestId::from_bytes([0xA1; 16]),
+        )
+        .expect("replayed outcome")
+        .is_some());
     }
 
     #[tokio::test]

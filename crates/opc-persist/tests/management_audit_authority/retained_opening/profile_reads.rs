@@ -6,48 +6,36 @@ use opc_persist::{ConfigStore, PersistErrorKind};
 use opc_types::ConfigVersion;
 
 async fn empty_reads(backend: &SqliteBackend) {
-    assert!(
-        backend
-            .load_latest()
-            .await
-            .expect("admitted latest read")
-            .is_none()
-    );
-    assert!(
-        backend
-            .load_committed_latest()
-            .await
-            .expect("admitted committed read")
-            .is_none()
-    );
-    assert!(
-        backend
-            .load_since(ConfigVersion::new(0), 1)
-            .await
-            .expect("admitted history page")
-            .is_empty()
-    );
-    assert!(
-        backend
-            .load_since(ConfigVersion::new(u64::MAX), 0)
-            .await
-            .expect("admitted empty page")
-            .is_empty()
-    );
-    assert!(
-        backend
-            .retained_history_floor()
-            .await
-            .expect("admitted history floor")
-            .is_none()
-    );
-    assert!(
-        backend
-            .load_by_replay_lookup_digest(&"51".repeat(32))
-            .await
-            .expect("admitted absent lookup")
-            .is_none()
-    );
+    assert!(backend
+        .load_latest()
+        .await
+        .expect("admitted latest read")
+        .is_none());
+    assert!(backend
+        .load_committed_latest()
+        .await
+        .expect("admitted committed read")
+        .is_none());
+    assert!(backend
+        .load_since(ConfigVersion::new(0), 1)
+        .await
+        .expect("admitted history page")
+        .is_empty());
+    assert!(backend
+        .load_since(ConfigVersion::new(u64::MAX), 0)
+        .await
+        .expect("admitted empty page")
+        .is_empty());
+    assert!(backend
+        .retained_history_floor()
+        .await
+        .expect("admitted history floor")
+        .is_none());
+    assert!(backend
+        .load_by_replay_lookup_digest(&"51".repeat(32))
+        .await
+        .expect("admitted absent lookup")
+        .is_none());
 }
 
 async fn rejected_reads(backend: &SqliteBackend) {

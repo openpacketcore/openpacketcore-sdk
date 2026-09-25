@@ -195,20 +195,16 @@ fn target_receipt_authenticates_profile_state_digest_and_disjoint_result() {
                 result[field][0] = serde_json::json!(0x58);
             }
             let tampered: AuthenticatedAuditReceipt = serde_json::from_value(value).unwrap();
-            assert!(
-                tampered
-                    .read_back(&key(), identity(), &handle, handle.body.binding.caller)
-                    .is_err()
-            );
+            assert!(tampered
+                .read_back(&key(), identity(), &handle, handle.body.binding.caller)
+                .is_err());
         }
         let mut value = serde_json::to_value(&proof).unwrap();
         value["body"]["state"] = serde_json::json!({"committed": {"version": 8}});
         let tampered: AuthenticatedAuditReceipt = serde_json::from_value(value).unwrap();
-        assert!(
-            tampered
-                .read_back(&key(), identity(), &handle, handle.body.binding.caller)
-                .is_err()
-        );
+        assert!(tampered
+            .read_back(&key(), identity(), &handle, handle.body.binding.caller)
+            .is_err());
     }
 }
 
