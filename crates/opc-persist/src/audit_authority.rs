@@ -33,13 +33,13 @@ pub(crate) use targets::{
     NetconfWorkerBinding,
 };
 pub use targets::{
-    CandidateGeneration, NetconfAppliedOutcome, NetconfCandidatePromotion,
+    CandidateGeneration, NetconfAppliedOutcome, NetconfCancellation, NetconfCandidatePromotion,
     NetconfCandidatePromotionRead, NetconfDeviceOwner, NetconfEmptyConfirmation,
     NetconfIncarnation, NetconfLockDatastore, NetconfLockLease, NetconfPendingConfirmation,
     NetconfPendingRead, NetconfRunningCopy, NetconfRunningCopyRead, NetconfSessionOwner,
-    NetconfTargetCopy, NetconfTargetCopyRead, NetconfTargetRead, NetconfTargetReplacement,
-    NetconfTargetResult, NetconfTentativePromotion, PreparedNetconfDevice, PreparedNetconfLock,
-    StartupRevision,
+    NetconfStagedConfirmation, NetconfStagedConfirmationRead, NetconfTargetCopy,
+    NetconfTargetCopyRead, NetconfTargetRead, NetconfTargetReplacement, NetconfTargetResult,
+    NetconfTentativePromotion, PreparedNetconfDevice, PreparedNetconfLock, StartupRevision,
 };
 
 /// Largest aggregate private tuple accepted before projection.

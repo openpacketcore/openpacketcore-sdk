@@ -980,7 +980,7 @@ pub(crate) struct NetconfTargetReadContent {
 }
 
 impl NetconfTargetRead {
-    /// Original destination, never running.
+    /// Original datastore. A protected copy or rollback source may be running.
     pub fn datastore(&self) -> NetconfLockDatastore {
         self.datastore
     }
@@ -1254,6 +1254,8 @@ impl fmt::Debug for NetconfEmptyConfirmation<'_> {
 /// Immutable pending state selected only by the authenticated pinned reader.
 /// Keep its representation in the audit module; it exposes no consensus internals.
 pub(crate) struct NetconfPendingView {
+    pub(crate) tentative_transaction: opc_types::TxId,
+    pub(crate) rollback: NetconfTargetRead,
     pub(crate) state_digest: [u8; 32],
     pub(crate) running_base: u64,
     pub(crate) pending: NetconfPendingConfirmation,
@@ -1269,4 +1271,97 @@ pub(crate) struct NetconfPendingView {
     pub(crate) lock_incarnation: u64,
     pub(crate) lock_session: Option<[u8; 16]>,
     pub(crate) lock_caller: Option<super::AuditCaller>,
+}
+
+/// One original staged candidate and pending confirmation from the same
+/// authenticated authority transaction. It cannot be constructed or decoded
+/// by a consumer, and does not expose an ordinary-promotion capability.
+pub struct NetconfStagedConfirmationRead {
+    pub(crate) promotion: NetconfCandidatePromotionRead,
+    pub(crate) pending: NetconfPendingRead,
+}
+
+impl NetconfStagedConfirmationRead {
+    /// Original candidate content and running base for configuration preparation.
+    pub fn candidate(&self) -> &NetconfTargetRead {
+        self.promotion.candidate()
+    }
+
+    /// Identity of the original pending operation, never a refreshed latest one.
+    pub fn pending(&self) -> NetconfPendingConfirmation {
+        self.pending.pending()
+    }
+}
+
+impl fmt::Debug for NetconfStagedConfirmationRead {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("NetconfStagedConfirmationRead(<redacted>)")
+    }
+}
+
+/// Exact staged confirmation input, including the original pending read and
+/// provider-attested successor running envelope. Ownership is authenticated
+/// before any intent admission; no provider or credential is retained.
+pub struct NetconfStagedConfirmation<'a> {
+    pub(crate) frozen: &'a NetconfStagedConfirmationRead,
+    pub(crate) commit: crate::AttestedConfigCommit,
+    pub(crate) provider: &'a dyn opc_key::KeyProvider,
+    pub(crate) persist_id: Option<&'a str>,
+}
+
+impl<'a> NetconfStagedConfirmation<'a> {
+    /// Pair the original read with its exact envelope and confirmation credential.
+    pub fn new(
+        frozen: &'a NetconfStagedConfirmationRead,
+        commit: crate::AttestedConfigCommit,
+        provider: &'a dyn opc_key::KeyProvider,
+        persist_id: Option<&'a str>,
+    ) -> Self {
+        Self {
+            frozen,
+            commit,
+            provider,
+            persist_id,
+        }
+    }
+}
+
+impl fmt::Debug for NetconfStagedConfirmation<'_> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("NetconfStagedConfirmation(<redacted>)")
+    }
+}
+
+/// Explicit cancellation of one original pending operation. Its attested
+/// successor must copy the retained rollback parent through the existing
+/// provider. This input cannot authorize timeout, session-loss or reboot work.
+pub struct NetconfCancellation<'a> {
+    pub(crate) frozen: &'a NetconfPendingRead,
+    pub(crate) commit: crate::AttestedConfigCommit,
+    pub(crate) provider: &'a dyn opc_key::KeyProvider,
+    pub(crate) persist_id: Option<&'a str>,
+}
+
+impl<'a> NetconfCancellation<'a> {
+    /// Pair an original pending read with the exact rollback successor and
+    /// its session-only or persistent ownership credential.
+    pub fn new(
+        frozen: &'a NetconfPendingRead,
+        commit: crate::AttestedConfigCommit,
+        provider: &'a dyn opc_key::KeyProvider,
+        persist_id: Option<&'a str>,
+    ) -> Self {
+        Self {
+            frozen,
+            commit,
+            provider,
+            persist_id,
+        }
+    }
+}
+
+impl fmt::Debug for NetconfCancellation<'_> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("NetconfCancellation(<redacted>)")
+    }
 }

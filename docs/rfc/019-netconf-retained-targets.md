@@ -539,3 +539,40 @@ retained original prepared operation.
 Staged confirmation, cancellation and internal timeout/session/reboot rollback
 require their distinct preparation contracts. These ports do not activate the
 public full-profile runtime or provide recipient-only/offline audit verification.
+
+### Staged confirmation and explicit cancellation preparation
+
+`read_netconf_staged_confirmation` freezes the original staged candidate and
+pending confirmation in the same authenticated transaction and checks the
+independent checkpoint. Its opaque `NetconfStagedConfirmationRead` preserves
+original staging owner, caller, generation, running base and both locks. It
+cannot grant ordinary promotion while a confirmation is pending.
+
+`NetconfStagedConfirmation` pairs that read with the exact provider-attested
+running successor and ownership credential. `prepare_netconf_staged_confirmation`
+authenticates the original ownership, then proves exact candidate configuration
+through the existing provider. Action 6 binds the original pending identity and
+deadline; running commit, candidate retirement and confirmation resolve together.
+
+The pending read also freezes the retained rollback parent's exact ciphertext,
+schema, digest and version under the authenticated history. Its protected
+`rollback_configuration` and `tentative_transaction` accessors support preparing
+the exact successor before intent admission. They grant no effect authority.
+`NetconfCancellation` supplies that original read, provider-attested successor
+and ownership credential to `prepare_netconf_cancellation`. The SDK verifies the
+expected tenant and exact retained parent configuration, `CommitConfirmedRestore`,
+the tentative transaction as parent and the next running revision. No confirmed
+deadline or legacy resolution is accepted in that successor. Action 11 resolves
+the same original pending identity and fixed deadline, under the original caller,
+session or persistent credential, and current running lock. Existing candidate
+state is preserved by cancellation.
+
+Both operations retain their original prepared command before possible
+transmission. Known effects stay known through terminal debt, and uncertain
+transmission recovers only that exact command. Provider failure or cancellation
+during preparation admits no intent or effect. Shared private ownership
+authentication preserves all empty-confirmation refusals and does not retain
+credentials or providers. Internal timeout, session-loss and reboot rollback
+require a distinct SDK recovery capability; caller-provided transport or a revoked
+session cannot confer it. These preparation ports do not activate the public
+full-profile runtime.
