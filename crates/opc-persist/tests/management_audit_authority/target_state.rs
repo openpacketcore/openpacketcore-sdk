@@ -920,3 +920,274 @@ async fn target_state_reconstruction_rejects_authentic_but_substituted_result() 
         serde_json::to_vec(&valid).unwrap()
     );
 }
+
+impl Fixture {
+    fn running_target(
+        &self,
+        conn: &Connection,
+        request: u8,
+        action: u8,
+        source_slot: u8,
+        source_seed: u8,
+    ) -> PreparedTargetMutation {
+        use crate::consensus::audit_mutation::{
+            TargetEncryptedBlobV1, TargetLockExpectationV1, TargetPayloadV1, TargetSourceV1,
+        };
+        use opc_crypto::{
+            decrypt_envelope_with_handle, encrypt_attested_envelope_with_handle_and_nonce,
+        };
+        use opc_key::{ConfigAad, EnvelopeAad, KeyHandle, KeyId, KeyPurpose};
+        use sha2::{Digest, Sha256};
+        let source = row(conn, "config_netconf_targets", "target", source_slot);
+        let blob: TargetEncryptedBlobV1 =
+            serde_json::from_value(source["encrypted_envelope"].clone()).unwrap();
+        let source_key = KeyHandle::new(
+            KeyId::new("fixture-target-key").unwrap(),
+            KeyPurpose::Config,
+            opc_types::TenantId::from_static("fixture-tenant"),
+            zeroize::Zeroizing::new([source_seed; 32]),
+        );
+        let envelope = opc_crypto::CryptoEnvelopeRef::decode(&blob.encrypted_blob).unwrap();
+        let (source_aad, _) = opc_key::decode_bound_aad(envelope.aad).unwrap();
+        let plaintext =
+            decrypt_envelope_with_handle(&source_key, &source_aad, &blob.encrypted_blob).unwrap();
+        assert_eq!(
+            <[u8; 32]>::from(Sha256::digest(&plaintext)),
+            blob.plaintext_digest
+        );
+        let base: u64 = conn
+            .query_row(
+                "SELECT COALESCE(MAX(version),0) FROM config_history",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        let parent = if base == 0 {
+            None
+        } else {
+            let bytes: Vec<u8> = conn
+                .query_row(
+                    "SELECT tx_id FROM config_history ORDER BY version DESC LIMIT 1",
+                    [],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            Some(opc_types::TxId::from_uuid(
+                uuid::Uuid::from_slice(&bytes).unwrap(),
+            ))
+        };
+        let tx_id = opc_types::TxId::new();
+        let committed_at = "2026-01-01T00:00:00Z"
+            .parse::<opc_types::Timestamp>()
+            .unwrap();
+        let principal = r#"{"tenant":"fixture-tenant","subject":"fixture-principal"}"#.to_owned();
+        let aad = EnvelopeAad::config(
+            opc_types::TenantId::from_static("fixture-tenant"),
+            base + 1,
+            ConfigAad::new(
+                tx_id,
+                parent,
+                committed_at,
+                &principal,
+                blob.schema,
+                "running",
+            )
+            .unwrap(),
+        );
+        let destination_key = KeyHandle::new(
+            KeyId::new("fixture-running-key").unwrap(),
+            KeyPurpose::Config,
+            opc_types::TenantId::from_static("fixture-tenant"),
+            zeroize::Zeroizing::new([0x7b; 32]),
+        );
+        let destination = encrypt_attested_envelope_with_handle_and_nonce(
+            &destination_key,
+            &aad,
+            &plaintext,
+            [request; 12],
+        )
+        .unwrap();
+        let commit = crate::consensus::PreparedConfigCommit::prepare(
+            crate::CommitRecord {
+                tx_id,
+                parent_tx_id: parent,
+                version: opc_types::ConfigVersion::new(base + 1),
+                committed_at,
+                principal,
+                source: crate::CommitSource::Netconf,
+                schema_digest: blob.schema,
+                plaintext_digest: blob.plaintext_digest.to_vec(),
+                encrypted_blob: destination.encoded().to_vec(),
+                rollback_point: false,
+                confirmed_deadline: None,
+            },
+            Vec::new(),
+            &self.key,
+        )
+        .unwrap();
+        let generation = source["generation"].as_u64().unwrap();
+        let ciphertext_digest = Sha256::digest(&blob.encrypted_blob).into();
+        let source = if source_slot == 0 {
+            TargetSourceV1::Candidate {
+                generation: crate::audit_authority::CandidateGeneration {
+                    authority: self.identity,
+                    value: generation,
+                },
+                schema: blob.schema,
+                ciphertext_digest,
+            }
+        } else {
+            TargetSourceV1::Startup {
+                revision: crate::audit_authority::StartupRevision {
+                    authority: self.identity,
+                    value: generation,
+                },
+                schema: blob.schema,
+                ciphertext_digest,
+            }
+        };
+        let mut prepared = self.request(conn, request, 6, 0x61, 0);
+        prepared.effect.action = action.try_into().unwrap();
+        prepared.effect.destination = TargetExpectationV1::Running { version: base };
+        prepared.effect.source = Some(source);
+        prepared.effect.encrypted_payload = Some(TargetPayloadV1::Running {
+            commit: Box::new(commit),
+            confirmation_ownership: None,
+        });
+        let lifecycle = row(conn, "config_netconf_lifecycle", "singleton", 1);
+        prepared.effect.lock = Some(TargetLockExpectationV1 {
+            datastore: 0,
+            incarnation: lifecycle["locks"][0]["incarnation"].as_u64().unwrap(),
+            session: serde_json::from_value(lifecycle["locks"][0]["session"].clone()).unwrap(),
+            requester: [0x61; 16],
+        });
+        // Reissue only within this synthetic SDK fixture, binding the exact observed base.
+        let mut prepared = self.prepare(prepared.effect, prepared.handle.body.event);
+        prepared.handle.body.binding.base_version = base;
+        prepared.handle = AuditOperationHandle::issue(prepared.handle.body, &self.key).unwrap();
+        prepared.verify_effect(&self.key).unwrap();
+        prepared
+    }
+
+    fn assert_running_plaintext(&self, conn: &Connection, expected: &PreparedTargetMutation) {
+        use crate::consensus::audit_mutation::TargetPayloadV1;
+        let Some(TargetPayloadV1::Running { commit, .. }) = &expected.effect.encrypted_payload
+        else {
+            panic!("running fixture");
+        };
+        let (version, bytes): (u64, Vec<u8>) = conn
+            .query_row(
+                "SELECT version,encrypted_blob FROM config_history ORDER BY version DESC LIMIT 1",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(version, commit.record.version.get());
+        assert_eq!(bytes, commit.record.encrypted_blob);
+        let key = opc_key::KeyHandle::new(
+            opc_key::KeyId::new("fixture-running-key").unwrap(),
+            opc_key::KeyPurpose::Config,
+            opc_types::TenantId::from_static("fixture-tenant"),
+            zeroize::Zeroizing::new([0x7b; 32]),
+        );
+        let envelope = opc_crypto::CryptoEnvelopeRef::decode(&bytes).unwrap();
+        let (aad, _) = opc_key::decode_bound_aad(envelope.aad).unwrap();
+        assert_eq!(
+            *opc_crypto::decrypt_envelope_with_handle(&key, &aad, &bytes).unwrap(),
+            vec![0x72; 32]
+        );
+        crate::consensus::history::validate_record_chain_sync(
+            conn,
+            &self.key,
+            &crate::consensus::sqlite::SqliteWorkCancellation::audit_test(),
+        )
+        .unwrap();
+    }
+}
+
+#[tokio::test]
+async fn target_running_promotion_atomically_retires_the_exact_candidate() {
+    let fixture = Fixture::new().await;
+    let shared = fixture.backend.conn();
+    let conn = shared.lock().await;
+    fixture.active(&conn);
+    let stage = fixture.encrypted(fixture.request(&conn, 81, 4, 0x61, 1), 0x31);
+    assert!(matches!(
+        fixture.submit(&conn, &stage),
+        AuditOperationState::TargetV1(_)
+    ));
+    fixture.settle(&conn, &stage);
+    let prepared = fixture.running_target(&conn, 82, 6, 0, 0x31);
+    let result = fixture.submit(&conn, &prepared);
+    assert!(
+        matches!(result, AuditOperationState::TargetV1(result)
+        if matches!(result.outcome(), NetconfAppliedOutcome::Promoted { running_version: 1, retired_generation } if retired_generation.get() == 2)),
+        "checkpointed candidate promotion did not atomically apply"
+    );
+    fixture.assert_running_plaintext(&conn, &prepared);
+    let candidate = row(&conn, "config_netconf_targets", "target", 0);
+    assert_eq!(candidate["generation"], 2);
+    assert_eq!(candidate["present"], false);
+    let before = target_rows(&conn);
+    fixture
+        .apply(
+            &conn,
+            AuditCommand::NetconfTarget(Box::new(TargetAuditCommandV1::Apply(prepared.clone()))),
+            200,
+        )
+        .unwrap();
+    assert_eq!(
+        target_rows(&conn),
+        before,
+        "known promotion must not retire again after expiry"
+    );
+    assert_eq!(
+        fixture
+            .ledger(&conn)
+            .lookup(&fixture.key, prepared.handle(), prepared.effect.caller)
+            .unwrap()
+            .unwrap()
+            .state(),
+        result
+    );
+    fixture.settle(&conn, &prepared);
+}
+
+#[tokio::test]
+async fn target_running_copy_preserves_candidate_and_startup_sources() {
+    for source_slot in [0, 1] {
+        let fixture = Fixture::new().await;
+        let shared = fixture.backend.conn();
+        let conn = shared.lock().await;
+        fixture.active(&conn);
+        let stage = fixture.encrypted(
+            fixture.request(
+                &conn,
+                83,
+                if source_slot == 0 { 4 } else { 7 },
+                0x61,
+                source_slot + 1,
+            ),
+            0x32,
+        );
+        assert!(matches!(
+            fixture.submit(&conn, &stage),
+            AuditOperationState::TargetV1(_)
+        ));
+        fixture.settle(&conn, &stage);
+        let source_before = row(&conn, "config_netconf_targets", "target", source_slot);
+        let prepared = fixture.running_target(&conn, 84, 15, source_slot, 0x32);
+        assert!(
+            matches!(fixture.submit(&conn, &prepared), AuditOperationState::TargetV1(result)
+            if matches!(result.outcome(), NetconfAppliedOutcome::CopiedRunning { running_version: 1 })),
+            "checkpointed target copy did not apply to running"
+        );
+        fixture.assert_running_plaintext(&conn, &prepared);
+        assert_eq!(
+            row(&conn, "config_netconf_targets", "target", source_slot),
+            source_before,
+            "copy must preserve its source generation and ciphertext"
+        );
+        fixture.settle(&conn, &prepared);
+    }
+}
