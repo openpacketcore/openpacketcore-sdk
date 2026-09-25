@@ -3563,11 +3563,31 @@ pub(crate) fn build_snapshot_database_cancellable_sync(
     path: &Path,
     cancellation: &Arc<SqliteWorkCancellation>,
 ) -> io::Result<AppliedMembership> {
+    build_snapshot_database_for_profile_sync(
+        conn,
+        identity,
+        expected_members,
+        audit_key,
+        path,
+        cancellation,
+        RetainedConfigProfile::Legacy,
+    )
+}
+
+pub(crate) fn build_snapshot_database_for_profile_sync(
+    conn: &Connection,
+    identity: ConsensusIdentity,
+    expected_members: &BTreeSet<ConsensusNodeId>,
+    audit_key: &AuditKey,
+    path: &Path,
+    cancellation: &Arc<SqliteWorkCancellation>,
+    profile: RetainedConfigProfile,
+) -> io::Result<AppliedMembership> {
     cancellation.check_io()?;
     // Validation, the advertised frontier and the copied database must describe
     // one WAL read view even when another connection commits during backup.
     let source = conn.unchecked_transaction().map_err(db_error)?;
-    validate_sealed_state_sync(&source, audit_key, cancellation)?;
+    validate_snapshot_source_state_sync(&source, identity, audit_key, cancellation, profile)?;
     let applied = read_applied_sync(&source, identity)?;
     let membership = read_membership_sync(&source, identity, expected_members)?;
     validate_fixed_membership(&membership, expected_members)?;
@@ -3611,17 +3631,39 @@ pub(crate) fn build_snapshot_database_cancellable_sync(
         )
         .map_err(db_error)?;
     cancellation.check_io()?;
-    validate_existing_schema(
+    validate_existing_schema_for_profile(
         &destination,
         identity,
         expected_members,
         audit_key,
         true,
         cancellation,
+        profile,
     )
     .map_err(|_| invalid_data("built config consensus snapshot failed validation"))?;
     validate_snapshot_has_no_log_authority(&destination, cancellation)?;
     Ok((applied, membership))
+}
+
+#[cfg(test)]
+#[path = "../../tests/management_audit_authority/target_snapshots.rs"]
+mod target_snapshot_tests;
+
+fn validate_snapshot_source_state_sync(
+    conn: &Connection,
+    identity: ConsensusIdentity,
+    audit_key: &AuditKey,
+    cancellation: &SqliteWorkCancellation,
+    profile: RetainedConfigProfile,
+) -> io::Result<()> {
+    match profile {
+        RetainedConfigProfile::Legacy => validate_sealed_state_sync(conn, audit_key, cancellation),
+        RetainedConfigProfile::NetconfTargetsV1 => {
+            validate_live_history_schema_for_profile(conn, cancellation, profile)?;
+            super::audit_targets::validate_inactive_sync(conn, audit_key, identity, cancellation)?;
+            validate_sealed_state_contents_sync(conn, audit_key, cancellation)
+        }
+    }
 }
 
 fn validate_snapshot_has_no_log_authority(
@@ -3667,6 +3709,7 @@ fn validate_snapshot_database_sync(
     audit_key: &AuditKey,
     meta: &SnapshotMeta<ConsensusNodeId, EmptyNode>,
     cancellation: &Arc<SqliteWorkCancellation>,
+    profile: RetainedConfigProfile,
 ) -> io::Result<Connection> {
     cancellation.check_io()?;
     validate_fixed_membership(&meta.last_membership, expected_members)?;
@@ -3691,16 +3734,17 @@ fn validate_snapshot_database_sync(
         ));
     }
     cancellation.check_io()?;
-    validate_existing_schema(
+    validate_existing_schema_for_profile(
         &conn,
         identity,
         expected_members,
         audit_key,
         true,
         cancellation,
+        profile,
     )
     .map_err(|_| invalid_data("config consensus snapshot identity is invalid"))?;
-    validate_sealed_state_sync(&conn, audit_key, cancellation)?;
+    validate_snapshot_source_state_sync(&conn, identity, audit_key, cancellation, profile)?;
     validate_snapshot_has_no_log_authority(&conn, cancellation)?;
     if read_applied_sync(&conn, identity)? != meta.last_log_id
         || read_membership_sync(&conn, identity, expected_members)? != meta.last_membership
@@ -3759,6 +3803,35 @@ pub(crate) fn install_snapshot_database_cancellable_sync(
     byte_length: u64,
     cancellation: &Arc<SqliteWorkCancellation>,
 ) -> io::Result<()> {
+    install_snapshot_database_for_profile_sync(
+        conn,
+        identity,
+        expected_members,
+        audit_key,
+        snapshot_db_path,
+        meta,
+        final_file_name,
+        checksum,
+        byte_length,
+        cancellation,
+        RetainedConfigProfile::Legacy,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn install_snapshot_database_for_profile_sync(
+    conn: &Connection,
+    identity: ConsensusIdentity,
+    expected_members: &BTreeSet<ConsensusNodeId>,
+    audit_key: &AuditKey,
+    snapshot_db_path: &Path,
+    meta: &SnapshotMeta<ConsensusNodeId, EmptyNode>,
+    final_file_name: &str,
+    checksum: [u8; 32],
+    byte_length: u64,
+    cancellation: &Arc<SqliteWorkCancellation>,
+    profile: RetainedConfigProfile,
+) -> io::Result<()> {
     let source = validate_snapshot_database_sync(
         snapshot_db_path,
         identity,
@@ -3766,6 +3839,7 @@ pub(crate) fn install_snapshot_database_cancellable_sync(
         audit_key,
         meta,
         cancellation,
+        profile,
     )?;
     if !valid_snapshot_file_name(final_file_name) {
         return Err(invalid_data("invalid config consensus snapshot file name"));
@@ -3791,7 +3865,7 @@ pub(crate) fn install_snapshot_database_cancellable_sync(
     // Validate the destination before replacing authority. Source authentication
     // cannot prevent a destination trigger or temporary table from changing the
     // imported state. Repair may replace damaged rows, so check only schema here.
-    validate_live_history_schema_sync(&tx, cancellation)?;
+    validate_live_history_schema_for_profile(&tx, cancellation, profile)?;
     for table in [
         "config_lifecycle_audit",
         "rollback_labels",
@@ -3849,6 +3923,27 @@ pub(crate) fn install_snapshot_database_cancellable_sync(
     ] {
         cancellation.check_io()?;
         copy_snapshot_table(&source, &tx, table, columns, cancellation)?;
+    }
+    if profile == RetainedConfigProfile::NetconfTargetsV1 {
+        // Source validation and this closed copy share the pinned source view.
+        // Independently selected profile validation precedes any destination write.
+        for (table, columns) in [
+            (
+                "config_netconf_profile",
+                "singleton, state_json, state_hmac",
+            ),
+            ("config_netconf_targets", "target, state_json, state_hmac"),
+            (
+                "config_netconf_lifecycle",
+                "singleton, state_json, state_hmac",
+            ),
+        ] {
+            cancellation.check_io()?;
+            tx.execute(&format!("DELETE FROM {table}"), [])
+                .map_err(db_error)?;
+            copy_snapshot_table(&source, &tx, table, columns, cancellation)?;
+        }
+        super::audit_targets::validate_inactive_sync(&tx, audit_key, identity, cancellation)?;
     }
     tx.execute(
         "INSERT OR REPLACE INTO config_raft_snapshot (singleton, configuration_epoch, meta_json, file_name, checksum, byte_length) VALUES (1, ?1, ?2, ?3, ?4, ?5)",

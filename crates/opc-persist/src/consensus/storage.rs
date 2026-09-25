@@ -1298,6 +1298,14 @@ async fn envelope_snapshot_database(
     raw: &Path,
     output: &Path,
 ) -> io::Result<([u8; 32], u64, StagingArtifact)> {
+    envelope_snapshot_database_for_profile(raw, output, super::RetainedConfigProfile::Legacy).await
+}
+
+async fn envelope_snapshot_database_for_profile(
+    raw: &Path,
+    output: &Path,
+    profile: super::RetainedConfigProfile,
+) -> io::Result<([u8; 32], u64, StagingArtifact)> {
     let metadata = tokio::fs::metadata(raw).await?;
     if metadata.len() == 0 || metadata.len() > SNAPSHOT_MAX_BYTES {
         return Err(sqlite::invalid_data(
@@ -1342,7 +1350,7 @@ async fn envelope_snapshot_database(
     let checksum: [u8; 32] = hasher.finalize().into();
     destination.write_all(SNAPSHOT_FOOTER_MAGIC).await?;
     destination
-        .write_all(&super::types::CONFIG_CONSENSUS_SNAPSHOT_VERSION.to_be_bytes())
+        .write_all(&snapshot_revision_for_profile(profile).to_be_bytes())
         .await?;
     destination.write_all(&copied.to_be_bytes()).await?;
     destination.write_all(&checksum).await?;
@@ -1354,6 +1362,26 @@ async fn envelope_snapshot_database(
 }
 
 async fn verify_snapshot_envelope(path: &Path) -> io::Result<(u64, [u8; 32], u64)> {
+    verify_snapshot_envelope_for_profile(path, super::RetainedConfigProfile::Legacy).await
+}
+
+fn snapshot_revision_for_profile(profile: super::RetainedConfigProfile) -> u16 {
+    match profile {
+        super::RetainedConfigProfile::Legacy => super::types::CONFIG_CONSENSUS_SNAPSHOT_VERSION,
+        super::RetainedConfigProfile::NetconfTargetsV1 => {
+            super::audit_targets::TARGET_STORAGE_VERSION
+        }
+    }
+}
+
+#[cfg(test)]
+#[path = "../../tests/management_audit_authority/target_snapshot_envelopes.rs"]
+mod target_snapshot_envelope_tests;
+
+async fn verify_snapshot_envelope_for_profile(
+    path: &Path,
+    profile: super::RetainedConfigProfile,
+) -> io::Result<(u64, [u8; 32], u64)> {
     let source = open_read_nofollow(path)?;
     let metadata = source.metadata()?;
     let total = metadata.len();
@@ -1374,7 +1402,7 @@ async fn verify_snapshot_envelope(path: &Path) -> io::Result<(u64, [u8; 32], u64
     }
     let mut revision = [0_u8; 2];
     file.read_exact(&mut revision).await?;
-    if u16::from_be_bytes(revision) != super::types::CONFIG_CONSENSUS_SNAPSHOT_VERSION {
+    if u16::from_be_bytes(revision) != snapshot_revision_for_profile(profile) {
         return Err(sqlite::invalid_data(
             "config consensus snapshot revision is unsupported",
         ));
