@@ -615,3 +615,254 @@ impl ConsensusConfigStore {
         .ok_or(AuditAuthorityError::Unavailable)
     }
 }
+
+impl ConsensusConfigStore {
+    fn require_netconf_target_profile(&self) -> Result<(), AuditAuthorityError> {
+        if self.inner.audit_continuity.is_none()
+            || self
+                .inner
+                .backend
+                .retained_binding
+                .as_ref()
+                .is_none_or(|binding| {
+                    binding.profile() != crate::RetainedConfigProfile::NetconfTargetsV1
+                })
+        {
+            return Err(AuditAuthorityError::Unavailable);
+        }
+        Ok(())
+    }
+
+    fn verify_netconf_target(
+        &self,
+        prepared: &crate::audit_authority::PreparedTargetMutation,
+        caller: AuditCaller,
+    ) -> Result<(), AuditAuthorityError> {
+        self.require_netconf_target_profile()?;
+        prepared
+            .handle()
+            .verify(self.inner.backend.audit_key(), self.inner.identity, caller)?;
+        prepared.verify_effect(self.inner.backend.audit_key())
+    }
+
+    /// Recover the original encrypted target description using its original
+    /// handle and independently authenticated caller. This quorum-current read
+    /// verifies the independent checkpoint and never submits an effect, creates
+    /// another request, or extends expiry. Retained results remain recoverable
+    /// after expiry; an absent expired operation fails closed.
+    ///
+    /// `caller` must come from trusted authentication, not from the handle or a
+    /// client-supplied field. Returned bytes are protected recovery data and must
+    /// not be placed in diagnostics. Only the independently admitted retained
+    /// NETCONF profile with audit continuity supports this operation.
+    pub async fn recover_netconf_target(
+        &self,
+        handle: &AuditOperationHandle,
+        caller: AuditCaller,
+    ) -> Result<Option<crate::audit_authority::PreparedTargetMutation>, AuditAuthorityError> {
+        self.require_netconf_target_profile()?;
+        handle.verify(self.inner.backend.audit_key(), self.inner.identity, caller)?;
+        let ledger = self.read_audit_ledger().await?;
+        if ledger
+            .lookup(self.inner.backend.audit_key(), handle, caller)?
+            .is_none()
+        {
+            handle.require_live(
+                self.inner
+                    .clock
+                    .now_utc()
+                    .as_offset_datetime()
+                    .unix_timestamp(),
+            )?;
+            return Ok(None);
+        }
+        ledger
+            .recover_target(self.inner.backend.audit_key(), handle, caller)
+            .map(Some)
+    }
+
+    /// Admit an exact SDK-prepared target intent through this node's local
+    /// leader. Before queueing, check current target/source/lock expectations,
+    /// retained recovery reservations, and both complete command sizes. The
+    /// independent checkpoint is verified before admission; submission must
+    /// additionally checkpoint this exact intent. No target or local registry
+    /// effect is authorized by rejected or indeterminate admission.
+    ///
+    /// Keep the original prepared value before calling. Cancellation does not
+    /// retract consensus work; recover the original handle instead of preparing
+    /// replacement work. This method cannot construct a target from caller-
+    /// asserted ciphertext, session, or outcome fields.
+    pub async fn admit_netconf_target_local(
+        &self,
+        prepared: &crate::audit_authority::PreparedTargetMutation,
+        caller: AuditCaller,
+    ) -> AuditAdmission {
+        use crate::consensus::audit_mutation::TargetAuditCommandV1;
+        if let Err(error) = self.verify_netconf_target(prepared, caller) {
+            return AuditAdmission::Rejected(error);
+        }
+        let admit = ConfigMutationIntent::ManagementAudit(AuditCommand::NetconfTarget(Box::new(
+            TargetAuditCommandV1::Admit(prepared.clone()),
+        )));
+        let apply = ConfigMutationIntent::ManagementAudit(AuditCommand::NetconfTarget(Box::new(
+            TargetAuditCommandV1::Apply(prepared.clone()),
+        )));
+        for (purpose, command) in [
+            (b"netconf-target-intent".as_slice(), &admit),
+            (b"netconf-target-effect".as_slice(), &apply),
+        ] {
+            let request =
+                derive_durable_request_id(self.inner.identity, purpose, &prepared.handle.mac);
+            if super::preflight_config_command_replication_budget(
+                self.inner.identity,
+                request,
+                command,
+            )
+            .is_err()
+            {
+                return AuditAdmission::Rejected(AuditAuthorityError::InvalidInput);
+            }
+        }
+        match self.preflight_netconf_target(prepared).await {
+            Ok(Some(receipt)) => return AuditAdmission::Applied(receipt),
+            Ok(None) => {}
+            Err(error) => return AuditAdmission::Rejected(error),
+        }
+        self.audit_operation_command_with_route(
+            prepared.handle(),
+            caller,
+            b"netconf-target-intent",
+            admit,
+            true,
+        )
+        .await
+    }
+
+    /// Submit only the exact retained target description with its acknowledged
+    /// admission receipt. The original intent must be independently checkpointed
+    /// before the effect is queued. Application rechecks changing generations,
+    /// ownership and fixed expiry, retaining an atomic typed result or rejection.
+    /// A known result is returned unchanged even when terminal completion is owed.
+    pub async fn submit_netconf_target_local(
+        &self,
+        prepared: &crate::audit_authority::PreparedTargetMutation,
+        admitted: &AuditOperationReceipt,
+        caller: AuditCaller,
+    ) -> AuditAdmission {
+        use crate::consensus::audit_mutation::TargetAuditCommandV1;
+        if let Err(error) = self.verify_netconf_target(prepared, caller) {
+            return AuditAdmission::Rejected(error);
+        }
+        if admitted.handle != prepared.handle {
+            return AuditAdmission::Rejected(AuditAuthorityError::BindingMismatch);
+        }
+        // Receipts have no public constructor or untrusted decoder. Preserve
+        // this already authenticated exact result before any fallible read.
+        match admitted.state() {
+            crate::audit_authority::AuditOperationState::TargetV1(result) => {
+                return match prepared.validate_result(result) {
+                    Ok(()) => AuditAdmission::Applied(admitted.clone()),
+                    Err(error) => AuditAdmission::Rejected(error),
+                };
+            }
+            crate::audit_authority::AuditOperationState::Rejected => {
+                return AuditAdmission::Applied(admitted.clone());
+            }
+            crate::audit_authority::AuditOperationState::Intent => {}
+            _ => return AuditAdmission::Rejected(AuditAuthorityError::BindingMismatch),
+        }
+        let ledger = match self.read_audit_ledger().await {
+            Ok(ledger) => ledger,
+            Err(error) => return AuditAdmission::Rejected(error),
+        };
+        if !ledger
+            .recover_target(self.inner.backend.audit_key(), prepared.handle(), caller)
+            .is_ok_and(|original| original == *prepared)
+        {
+            return AuditAdmission::Rejected(AuditAuthorityError::BindingMismatch);
+        }
+        let receipt = match ledger.lookup(self.inner.backend.audit_key(), prepared.handle(), caller)
+        {
+            Ok(Some(receipt)) => receipt,
+            _ => return AuditAdmission::Rejected(AuditAuthorityError::BindingMismatch),
+        };
+        if receipt.state() != crate::audit_authority::AuditOperationState::Intent {
+            return AuditAdmission::Applied(receipt);
+        }
+        if ledger.operations.iter().any(|operation| {
+            (operation.handle != prepared.handle && !operation.terminal_recorded)
+                || ledger.mutation_outcome_needs_checkpoint(operation)
+        }) {
+            return AuditAdmission::Rejected(AuditAuthorityError::RecoveryRequired);
+        }
+        if let Err(error) = self.checkpoint_audit_tail().await {
+            return AuditAdmission::Rejected(error);
+        }
+        self.audit_operation_command_with_route(
+            prepared.handle(),
+            caller,
+            b"netconf-target-effect",
+            ConfigMutationIntent::ManagementAudit(AuditCommand::NetconfTarget(Box::new(
+                TargetAuditCommandV1::Apply(prepared.clone()),
+            ))),
+            true,
+        )
+        .await
+    }
+
+    async fn preflight_netconf_target(
+        &self,
+        prepared: &crate::audit_authority::PreparedTargetMutation,
+    ) -> Result<Option<AuditOperationReceipt>, AuditAuthorityError> {
+        self.require_netconf_target_profile()?;
+        self.linearizable_barrier()
+            .await
+            .map_err(|_| AuditAuthorityError::Unavailable)?;
+        let prepared = prepared.clone();
+        let backend = self.inner.backend.clone();
+        let identity = self.inner.identity;
+        let now = self
+            .inner
+            .clock
+            .now_utc()
+            .as_offset_datetime()
+            .unix_timestamp();
+        let (ledger, decision) = super::super::run_backend_sqlite_with_timeout(
+            &self.inner.backend,
+            self.inner.operation_timeout,
+            move |conn, cancellation| {
+                let unavailable = || std::io::Error::other("target authority unavailable");
+                let tx = conn.unchecked_transaction().map_err(|_| unavailable())?;
+                super::super::sqlite::validate_live_history_schema_for_profile(
+                    &tx,
+                    cancellation,
+                    crate::RetainedConfigProfile::NetconfTargetsV1,
+                )?;
+                let keys = backend.management_audit_keys().ok_or_else(unavailable)?;
+                let ledger = super::super::audit::read_with_keys_sync(
+                    &tx,
+                    backend.audit_key(),
+                    Some(&keys),
+                    identity,
+                )?
+                .ok_or_else(unavailable)?;
+                let decision = super::super::audit_targets::preflight_target_sync(
+                    &tx,
+                    backend.audit_key(),
+                    &prepared,
+                    &ledger,
+                    &keys,
+                    now,
+                    cancellation,
+                )?;
+                cancellation.check_io()?;
+                tx.commit().map_err(|_| unavailable())?;
+                Ok((ledger, decision))
+            },
+        )
+        .await
+        .map_err(|_| AuditAuthorityError::Unavailable)?;
+        self.verify_audit_checkpoint(&ledger).await?;
+        decision
+    }
+}

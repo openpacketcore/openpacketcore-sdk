@@ -1545,3 +1545,80 @@ pub(crate) fn apply_target_sync(
     super::audit::write_sync(conn, key, identity, Some(ledger), false)?;
     Ok(result)
 }
+
+/// Check a new target intent against one authenticated, pinned authority view.
+/// This predicts the target state and reserves ledger space only in memory; it
+/// neither writes an intent nor grants permission to apply one. Application must
+/// recheck the same expectations after independently checkpointed admission.
+pub(crate) fn preflight_target_sync(
+    conn: &Connection,
+    key: &AuditKey,
+    prepared: &PreparedTargetMutation,
+    ledger: &LedgerState,
+    keys: &AuditKeyRing,
+    now: i64,
+    cancellation: &SqliteWorkCancellation,
+) -> io::Result<Result<Option<crate::audit_authority::AuditOperationReceipt>, AuditAuthorityError>>
+{
+    cancellation.check_io()?;
+    if conn.is_autocommit() {
+        return Err(invalid());
+    }
+    if let Err(error) = prepared.verify_effect(key) {
+        return Ok(Err(error));
+    }
+    let mut state = read_state_sync(conn, key, ledger.identity, cancellation)?;
+    state.validate_anchor(Some(ledger))?;
+    super::history::validate_record_chain_sync(conn, key, cancellation)?;
+    let caller = prepared.effect.caller;
+    let existing = match ledger.lookup(key, prepared.handle(), caller) {
+        Ok(existing) => existing,
+        Err(error) => return Ok(Err(error)),
+    };
+    if let Some(receipt) = existing {
+        // Current generations and expiry cannot relabel an original outcome.
+        // A handle admitted through a different command family is not a target
+        // intent, even if it authenticates under the same authority.
+        return Ok(
+            match ledger.recover_target(key, prepared.handle(), caller) {
+                Ok(original) if original == *prepared => Ok(Some(receipt)),
+                _ => Err(AuditAuthorityError::BindingMismatch),
+            },
+        );
+    }
+    if ledger.operations.iter().any(|operation| {
+        !operation.terminal_recorded || ledger.mutation_outcome_needs_checkpoint(operation)
+    }) {
+        return Ok(Err(AuditAuthorityError::RecoveryRequired));
+    }
+    let mut candidate = ledger.clone();
+    if let Err(error) = candidate.admit_target(key, prepared, now) {
+        return Ok(Err(error));
+    }
+    if let Err(error) = state.reduce(conn, prepared, &candidate, keys, now) {
+        return Ok(Err(error));
+    }
+    state.profile.last_target_transition_sequence =
+        candidate.sequence.checked_add(1).ok_or_else(invalid)?;
+    state.profile.state_digest = state_digest(&state.profile, &state.targets, &state.lifecycle)?;
+    state.validate(ledger.identity)?;
+    // The same four-row aggregate enforced at write/reopen must fit before
+    // admission. Existing ledger outcome/terminal reservations were checked by
+    // admit_target above. No per-field allowance multiplies either bound.
+    let mut total = 0usize;
+    for bytes in [
+        serde_json::to_vec(&state.profile),
+        serde_json::to_vec(&state.targets[0]),
+        serde_json::to_vec(&state.targets[1]),
+        serde_json::to_vec(&state.lifecycle),
+    ] {
+        total = total
+            .checked_add(bytes.map_err(|_| invalid())?.len())
+            .ok_or_else(invalid)?;
+        if total > MAX_STATE_BYTES {
+            return Ok(Err(AuditAuthorityError::Full));
+        }
+    }
+    cancellation.check_io()?;
+    Ok(Ok(None))
+}

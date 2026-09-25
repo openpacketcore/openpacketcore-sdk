@@ -846,3 +846,63 @@ async fn checkpointed_intent_cannot_become_rejected_after_committed_suffix_rollb
         progress.completed
     );
 }
+
+#[tokio::test]
+async fn target_recovery_refuses_legacy_profile_without_reinterpreting_running_receipt() {
+    let directory = tempfile::tempdir().unwrap();
+    let external = Arc::new(ExternalCheckpointFixture::default());
+    let store = open(
+        &directory.path().join("authority.sqlite"),
+        &directory.path().join("snapshots"),
+        external.clone(),
+        &[1, 2],
+        true,
+    )
+    .await
+    .unwrap();
+    store.initialize_cluster().await.unwrap();
+    store
+        .initialize_audit_authority(&privacy(), AuditLedgerLimits::new(6, 2).unwrap())
+        .await
+        .unwrap();
+    let tx = TxId::new();
+    let prepared = store
+        .prepare_audited_commit(
+            &privacy(),
+            &source_event(163, ManagementAuditOutcomeCode::Intent),
+            attested(commit(tx, None, 1, 7), audit(tx)),
+            Duration::from_secs(60),
+        )
+        .unwrap();
+    let intent = applied(
+        store
+            .admit_audit_operation(prepared.handle(), caller())
+            .await,
+    );
+    let committed = applied(
+        store
+            .submit_audited_mutation(&prepared, &intent, caller())
+            .await,
+    );
+    store
+        .complete_required_audit_outcome(&committed, caller())
+        .await
+        .unwrap();
+    let checkpoint = external.value.lock().unwrap().clone();
+    assert_eq!(
+        store
+            .recover_netconf_target(prepared.handle(), caller())
+            .await,
+        Err(AuditAuthorityError::Unavailable)
+    );
+    assert_eq!(external.value.lock().unwrap().clone(), checkpoint);
+    let after = store
+        .lookup_audit_operation(prepared.handle(), caller())
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(after.state(), committed.state());
+    assert!(after.terminal_recorded());
+    assert_eq!(store.load_latest().await.unwrap().unwrap().record.tx_id, tx);
+    store.shutdown().await.unwrap();
+}

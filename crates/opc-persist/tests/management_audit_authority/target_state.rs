@@ -2320,3 +2320,203 @@ async fn target_closed_input_rejects_unknown_running_commit_and_audit_fields() {
         ],
     );
 }
+
+use crate::audit_authority::AuditOperationReceipt;
+
+impl Fixture {
+    fn preflight(
+        &self,
+        conn: &Connection,
+        prepared: &PreparedTargetMutation,
+        now: i64,
+    ) -> Result<Option<AuditOperationReceipt>, AuditAuthorityError> {
+        let before = target_rows(conn);
+        let audit_before = serde_json::to_vec(&self.ledger(conn)).unwrap();
+        let changes: i64 = conn
+            .query_row("SELECT total_changes()", [], |row| row.get(0))
+            .unwrap();
+        let tx = conn.unchecked_transaction().unwrap();
+        let ledger = self.ledger(&tx);
+        let result = crate::consensus::audit_targets::preflight_target_sync(
+            &tx,
+            &self.key,
+            prepared,
+            &ledger,
+            &self.keys,
+            now,
+            &crate::consensus::sqlite::SqliteWorkCancellation::audit_test(),
+        )
+        .unwrap();
+        tx.commit().unwrap();
+        let after: i64 = conn
+            .query_row("SELECT total_changes()", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(after, changes, "preflight executed a SQL write");
+        assert_eq!(target_rows(conn), before);
+        assert_eq!(
+            serde_json::to_vec(&self.ledger(conn)).unwrap(),
+            audit_before
+        );
+        result
+    }
+}
+
+#[tokio::test]
+async fn target_sdk_preflight_predicts_current_transition_without_admission_or_effect() {
+    let fixture = Fixture::new().await;
+    let shared = fixture.backend.conn();
+    let conn = shared.lock().await;
+    let activation = fixture.activate(&conn);
+    assert_eq!(fixture.preflight(&conn, &activation, 100).unwrap(), None);
+    assert!(matches!(
+        fixture.submit(&conn, &activation),
+        AuditOperationState::TargetV1(_)
+    ));
+    fixture.settle(&conn, &activation);
+    let staged = fixture.encrypted(fixture.request(&conn, 150, 4, 0x61, 1), 0x39);
+    assert_eq!(fixture.preflight(&conn, &staged, 100).unwrap(), None);
+    assert!(matches!(
+        fixture.submit(&conn, &staged),
+        AuditOperationState::TargetV1(_)
+    ));
+    fixture.settle(&conn, &staged);
+    let running = fixture.running_target(&conn, 151, 6, 0, 0x39);
+    assert_eq!(fixture.preflight(&conn, &running, 100).unwrap(), None);
+    assert!(matches!(
+        fixture.submit(&conn, &running),
+        AuditOperationState::TargetV1(_)
+    ));
+    fixture.settle(&conn, &running);
+    fixture.assert_running_plaintext(&conn, &running);
+}
+
+#[tokio::test]
+async fn target_sdk_preflight_refuses_stale_generation_source_lock_and_expiry() {
+    let fixture = Fixture::new().await;
+    let shared = fixture.backend.conn();
+    let conn = shared.lock().await;
+    fixture.active(&conn);
+    let delayed = fixture.encrypted(fixture.request(&conn, 152, 4, 0x61, 1), 0x39);
+    let first = fixture.encrypted(fixture.request(&conn, 153, 4, 0x61, 1), 0x3a);
+    assert!(matches!(
+        fixture.submit(&conn, &first),
+        AuditOperationState::TargetV1(_)
+    ));
+    fixture.settle(&conn, &first);
+    assert_eq!(
+        fixture.preflight(&conn, &delayed, 100),
+        Err(AuditAuthorityError::BindingMismatch)
+    );
+    let copied = fixture.running_target(&conn, 154, 15, 0, 0x3a);
+    assert_eq!(fixture.preflight(&conn, &copied, 100).unwrap(), None);
+    let replacement = fixture.encrypted(fixture.request(&conn, 155, 4, 0x61, 1), 0x3b);
+    assert!(matches!(
+        fixture.submit(&conn, &replacement),
+        AuditOperationState::TargetV1(_)
+    ));
+    fixture.settle(&conn, &replacement);
+    assert_eq!(
+        fixture.preflight(&conn, &copied, 100),
+        Err(AuditAuthorityError::BindingMismatch)
+    );
+    let delayed = fixture.request(&conn, 156, 5, 0x61, 1);
+    let acquired = fixture.request(&conn, 157, 2, 0x61, 1);
+    assert_eq!(fixture.preflight(&conn, &acquired, 100).unwrap(), None);
+    assert!(matches!(
+        fixture.submit(&conn, &acquired),
+        AuditOperationState::TargetV1(_)
+    ));
+    fixture.settle(&conn, &acquired);
+    assert_eq!(
+        fixture.preflight(&conn, &delayed, 100),
+        Err(AuditAuthorityError::BindingMismatch)
+    );
+    let foreign = fixture.request(&conn, 158, 5, 0x62, 1);
+    assert_eq!(
+        fixture.preflight(&conn, &foreign, 100),
+        Err(AuditAuthorityError::BindingMismatch)
+    );
+    let fresh = fixture.request(&conn, 159, 5, 0x61, 1);
+    assert_eq!(fixture.preflight(&conn, &fresh, 100).unwrap(), None);
+    assert_eq!(
+        fixture.preflight(&conn, &fresh, 160),
+        Err(AuditAuthorityError::Expired)
+    );
+    // A second request with an identical intent body is still not a receipt.
+    assert!(fixture
+        .ledger(&conn)
+        .lookup(&fixture.key, fresh.handle(), fresh.effect.caller)
+        .unwrap()
+        .is_none());
+}
+
+#[tokio::test]
+async fn target_sdk_preflight_preserves_original_receipts_and_fences_unresolved_work() {
+    let fixture = Fixture::new().await;
+    let shared = fixture.backend.conn();
+    let conn = shared.lock().await;
+    fixture.active(&conn);
+    let original = fixture.encrypted(fixture.request(&conn, 160, 4, 0x61, 1), 0x3c);
+    fixture
+        .apply(
+            &conn,
+            AuditCommand::NetconfTarget(Box::new(TargetAuditCommandV1::Admit(original.clone()))),
+            100,
+        )
+        .unwrap();
+    let receipt = fixture.preflight(&conn, &original, 200).unwrap().unwrap();
+    assert_eq!(receipt.state(), AuditOperationState::Intent);
+    assert_eq!(
+        fixture
+            .ledger(&conn)
+            .recover_target(&fixture.key, original.handle(), original.effect.caller)
+            .unwrap(),
+        original
+    );
+    let next = fixture.request(&conn, 161, 5, 0x61, 1);
+    assert_eq!(
+        fixture.preflight(&conn, &next, 100),
+        Err(AuditAuthorityError::RecoveryRequired)
+    );
+    fixture.checkpoint(&conn);
+    fixture
+        .apply(
+            &conn,
+            AuditCommand::NetconfTarget(Box::new(TargetAuditCommandV1::Apply(original.clone()))),
+            100,
+        )
+        .unwrap();
+    let known = fixture.preflight(&conn, &original, 200).unwrap().unwrap();
+    assert!(matches!(known.state(), AuditOperationState::TargetV1(_)));
+    assert!(!known.terminal_recorded());
+    let next = fixture.request(&conn, 161, 5, 0x61, 1);
+    assert_eq!(
+        fixture.preflight(&conn, &next, 100),
+        Err(AuditAuthorityError::RecoveryRequired)
+    );
+    fixture.settle(&conn, &original);
+    assert_eq!(fixture.preflight(&conn, &next, 100).unwrap(), None);
+    assert!(matches!(
+        fixture.submit(&conn, &next),
+        AuditOperationState::TargetV1(_)
+    ));
+    fixture.settle(&conn, &next);
+    let replay = fixture.preflight(&conn, &original, 200).unwrap().unwrap();
+    assert_eq!(replay.state(), known.state());
+    assert!(replay.terminal_recorded());
+    // A newly signed, conflicting use of the original request does not inherit
+    // its retained receipt or replace its exact recovery description.
+    let collision = fixture.encrypted(fixture.request(&conn, 160, 4, 0x61, 1), 0x3d);
+    assert_eq!(
+        fixture.preflight(&conn, &collision, 100),
+        Err(AuditAuthorityError::BindingMismatch)
+    );
+    let wrong = fixture.request(&conn, 162, 5, 0x61, 1);
+    fixture
+        .apply(&conn, AuditCommand::Intent(wrong.handle.clone()), 100)
+        .unwrap();
+    assert_eq!(
+        fixture.preflight(&conn, &wrong, 100),
+        Err(AuditAuthorityError::BindingMismatch)
+    );
+}
