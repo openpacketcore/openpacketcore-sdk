@@ -59,8 +59,7 @@ CREATE TABLE config_netconf_lifecycle (
 "#;
 
 const OBJECTS: &str = "SELECT type, name, tbl_name, sql FROM main.sqlite_schema \
-    WHERE (name GLOB 'config_netconf_*' OR tbl_name GLOB 'config_netconf_*') \
-    AND name NOT GLOB 'sqlite_autoindex_*'";
+    WHERE (name GLOB 'config_netconf_*' OR tbl_name GLOB 'config_netconf_*')";
 
 fn invalid() -> io::Error {
     io::Error::new(
