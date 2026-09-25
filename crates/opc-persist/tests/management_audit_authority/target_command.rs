@@ -30,7 +30,7 @@ fn discard_command() -> Value {
         ManagementAuditTransportCode::NetconfSsh,
         ManagementAuditOperationCode::Exec,
         ManagementAuditOutcomeCode::Intent,
-        None,
+        None::<&str>,
         ["/fixture:configuration"],
         Some("fixture-transaction"),
     )
