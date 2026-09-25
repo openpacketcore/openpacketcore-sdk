@@ -4,6 +4,8 @@ use super::*;
 use crate::testkit::GroupedGtpuDataplaneSimulation;
 use opc_session_store::EncryptingSessionBackend;
 
+mod concurrent_lifecycle;
+
 type Protected = EncryptingSessionBackend<SqliteSessionBackend, opc_key::MemoryKeyProvider>;
 
 struct Lab<B: SessionBackend + SessionLeaseManager = Protected> {
@@ -247,6 +249,7 @@ async fn active_recovery_requires_fresh_durable_read_after_backend_readback() {
         inner: lab.backend.clone(),
         hold_next: AtomicBool::new(false),
         hold_before_effect: false,
+        hold_remove: std::sync::atomic::AtomicBool::new(false),
         read_calls: AtomicUsize::new(0),
         entered: tokio::sync::Notify::new(),
         release: tokio::sync::Notify::new(),
@@ -362,6 +365,7 @@ struct HeldAcknowledgement {
     inner: Arc<GroupedGtpuDataplaneSimulation>,
     hold_next: std::sync::atomic::AtomicBool,
     hold_before_effect: bool,
+    hold_remove: std::sync::atomic::AtomicBool,
     read_calls: std::sync::atomic::AtomicUsize,
     entered: tokio::sync::Notify,
     release: tokio::sync::Notify,
@@ -439,6 +443,35 @@ impl GtpuDataplaneBackend for HeldAcknowledgement {
         }
         result
     }
+
+    async fn remove_pdp_context_group_with_lease(
+        &self,
+        request: GtpuSessionSelectorRemovalRequest,
+    ) -> Result<GtpuSessionSelectorBackendReceipt, crate::GtpuError> {
+        let hold = self
+            .hold_remove
+            .swap(false, std::sync::atomic::Ordering::SeqCst);
+        if hold && self.hold_before_effect {
+            self.entered.notify_one();
+            self.release.notified().await;
+        }
+        let result = self
+            .inner
+            .remove_pdp_context_group_with_lease(request)
+            .await;
+        if hold && !self.hold_before_effect && result.is_ok() {
+            self.entered.notify_one();
+            self.release.notified().await;
+        }
+        result
+    }
+
+    async fn authorize_selector_reuse(
+        &self,
+        request: GtpuSessionSelectorReuseRequest,
+    ) -> Result<GtpuSessionSelectorReuseReceipt, crate::GtpuError> {
+        self.inner.authorize_selector_reuse(request).await
+    }
 }
 
 #[tokio::test]
@@ -463,6 +496,7 @@ async fn concurrent_child_progress(hold_before_effect: bool, cancel_observer: bo
         inner: lab.backend.clone(),
         hold_next: std::sync::atomic::AtomicBool::new(true),
         hold_before_effect,
+        hold_remove: std::sync::atomic::AtomicBool::new(false),
         read_calls: std::sync::atomic::AtomicUsize::new(0),
         entered: tokio::sync::Notify::new(),
         release: tokio::sync::Notify::new(),
