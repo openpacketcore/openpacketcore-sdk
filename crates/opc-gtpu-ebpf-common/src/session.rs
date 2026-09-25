@@ -881,8 +881,8 @@ fn entry_profile_is_canonical(value: &[u8; GTPU_SESSION_ENTRY_LEN]) -> bool {
 const fn n3_outer_is_unicast(family: u8, value: &[u8; 16]) -> bool {
     match family {
         4 => {
-            !(value[0] >= 224 && value[0] <= 239)
-                && !(value[0] == 255 && value[1] == 255 && value[2] == 255 && value[3] == 255)
+            !(value[0] >= 224 && value[0] <= 239
+                || value[0] == 255 && value[1] == 255 && value[2] == 255 && value[3] == 255)
         }
         6 => value[0] != 0xff,
         _ => false,
