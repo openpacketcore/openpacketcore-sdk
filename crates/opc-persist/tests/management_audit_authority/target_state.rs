@@ -5538,11 +5538,65 @@ async fn target_replacement_rejects_malformed_and_oversized_content_before_admis
         )
         .await
         .unwrap();
-    let prepared = fixture.bind_frozen_target(&frozen, effect, event);
-    assert!(matches!(
-        fixture.preflight(&conn, &prepared, 100),
-        Err(AuditAuthorityError::InvalidInput | AuditAuthorityError::Full)
-    ));
+    assert_eq!(
+        effect.digest(&fixture.key),
+        Err(AuditAuthorityError::InvalidInput)
+    );
     assert_eq!(target_rows(&conn), before);
+    assert_eq!(conn.total_changes(), changes);
+    drop(effect);
+    drop(bounded);
+
+    // Each operation below is representable on its own. Retaining the first
+    // original leaves insufficient aggregate space for the second recovery and
+    // future terminal obligations. No byte or event limit is increased.
+    let mut content =
+        vec![b'x'; crate::consensus::sqlite::CONFIG_CONSENSUS_LOG_ENTRY_MAX_BYTES / 16 * 3];
+    content[0] = b'"';
+    *content.last_mut().unwrap() = b'"';
+    let effect = frozen
+        .prepare_replacement(
+            &session,
+            NetconfTargetReplacement::edit(&frozen, &content, schema, &provider),
+            opc_types::TenantId::from_static("fixture-tenant"),
+            &event,
+            160,
+        )
+        .await
+        .unwrap();
+    let first = fixture.bind_frozen_target(&frozen, effect, event);
+    assert!(first.encode().is_ok());
+    assert_eq!(fixture.preflight(&conn, &first, 100).unwrap(), None);
+    assert!(matches!(
+        fixture.submit(&conn, &first),
+        AuditOperationState::TargetV1(_)
+    ));
+    fixture.settle(&conn, &first);
+    let next = fixture
+        .frozen_target(&conn, &session, Store::Candidate)
+        .unwrap();
+    let mut event = fixture.event(249);
+    event.operation = ManagementAuditOperationCode::Update;
+    let effect = next
+        .prepare_replacement(
+            &session,
+            NetconfTargetReplacement::edit(&next, &content, schema, &provider),
+            opc_types::TenantId::from_static("fixture-tenant"),
+            &event,
+            160,
+        )
+        .await
+        .unwrap();
+    let second = fixture.bind_frozen_target(&next, effect, event);
+    assert!(second.encode().is_ok());
+    let retained = target_rows(&conn);
+    let changes = conn.total_changes();
+    let sequence = fixture.ledger(&conn).sequence;
+    assert_eq!(
+        fixture.preflight(&conn, &second, 100),
+        Err(AuditAuthorityError::Full)
+    );
+    assert_eq!(target_rows(&conn), retained);
+    assert_eq!(fixture.ledger(&conn).sequence, sequence);
     assert_eq!(conn.total_changes(), changes);
 }
