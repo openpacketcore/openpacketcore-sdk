@@ -2983,15 +2983,6 @@ impl crate::audit_authority::NetconfCandidatePromotionRead {
     }
 }
 
-/// Private retained pending state from the same transaction as its ledger.
-pub(crate) struct NetconfPendingView {
-    device: NetconfDeviceView,
-    pending: PendingConfirmation,
-    original_deadline: i64,
-    ownership: TargetEncryptedBlobV1,
-    candidate_present: bool,
-}
-
 pub(crate) fn read_pending_view_sync(
     conn: &Connection,
     key: &AuditKey,
@@ -3011,14 +3002,32 @@ pub(crate) fn read_pending_view_sync(
     let Some(ownership) = state.lifecycle.encrypted_confirmation_ownership else {
         return Err(invalid());
     };
+    if let Err(error) = device.verify_session(session) {
+        return Ok(Err(error));
+    }
+    let lock = device.locks[0].ok_or_else(invalid)?;
     let frozen = crate::audit_authority::NetconfPendingRead {
         session: session.clone(),
-        view: NetconfPendingView {
-            device,
-            pending,
+        view: crate::audit_authority::NetconfPendingView {
+            state_digest: device.state_digest,
+            running_base: device.running_version,
+            pending: pending.pending,
+            caller: pending.caller,
+            device_incarnation: pending.device_incarnation,
+            owner_session: pending.owner_session,
+            persistent: pending.persistent,
+            running_version: pending.running_version,
             original_deadline,
-            ownership,
+            ownership_store_kind: pending.ownership_store_kind,
+            ownership: crate::audit_authority::NetconfTargetReadContent {
+                schema: ownership.schema,
+                plaintext_digest: ownership.plaintext_digest,
+                encrypted: ownership.encrypted_blob,
+            },
             candidate_present: state.targets[0].present,
+            lock_incarnation: lock.incarnation,
+            lock_session: lock.session,
+            lock_caller: lock.caller,
         },
     };
     if let Err(error) = frozen.verify_session(session) {
@@ -3030,7 +3039,7 @@ pub(crate) fn read_pending_view_sync(
 impl crate::audit_authority::NetconfPendingRead {
     /// Opaque identity of the exact pending operation selected by this read.
     pub fn pending(&self) -> crate::audit_authority::NetconfPendingConfirmation {
-        self.view.pending.pending
+        self.view.pending
     }
 
     /// Whether the original read contained staged candidate changes.
@@ -3047,17 +3056,19 @@ impl crate::audit_authority::NetconfPendingRead {
         if !self.session.same_session(session) {
             return Err(bad);
         }
-        self.view.device.verify_session(session)?;
-        let pending = &self.view.pending;
+        session.require_active()?;
+        let pending = &self.view;
         if pending.caller != session.caller
             || pending.device_incarnation != session.device.device_incarnation
             || (!pending.persistent && pending.owner_session != session.incarnation())
         {
             return Err(bad);
         }
-        let lock = self.view.device.locks[0].ok_or(bad)?;
-        if lock.session.is_some_and(|s| s != session.incarnation())
-            || lock.caller.is_some_and(|c| c != session.caller)
+        if self
+            .view
+            .lock_session
+            .is_some_and(|s| s != session.incarnation())
+            || self.view.lock_caller.is_some_and(|c| c != session.caller)
         {
             return Err(bad);
         }
@@ -3065,7 +3076,7 @@ impl crate::audit_authority::NetconfPendingRead {
     }
 
     pub(crate) fn running_base(&self) -> u64 {
-        self.view.device.running_version
+        self.view.running_base
     }
 
     pub(crate) async fn prepare_empty_confirmation(
@@ -3095,21 +3106,20 @@ impl crate::audit_authority::NetconfPendingRead {
         }
         crate::audit_authority::confirmation::bounded_token(input.persist_id)?;
         let content = &self.view.ownership;
-        content.validate()?;
         let envelope =
-            opc_crypto::CryptoEnvelopeRef::decode(&content.encrypted_blob).map_err(|_| bad)?;
+            opc_crypto::CryptoEnvelopeRef::decode(&content.encrypted).map_err(|_| bad)?;
         let (aad, _) = opc_key::decode_bound_aad(envelope.aad).map_err(|_| bad)?;
         let opc_key::EnvelopeMetadata::Config(metadata) = aad.metadata() else {
             return Err(bad);
         };
         if aad.tenant() != tenant
-            || aad.version() != self.view.pending.running_version
-            || metadata.store_kind() != self.view.pending.ownership_store_kind
+            || aad.version() != self.view.running_version
+            || metadata.store_kind() != self.view.ownership_store_kind
             || metadata.schema_digest() != &content.schema
         {
             return Err(bad);
         }
-        let plaintext = opc_crypto::decrypt_envelope(input.provider, &aad, &content.encrypted_blob)
+        let plaintext = opc_crypto::decrypt_envelope(input.provider, &aad, &content.encrypted)
             .await
             .map_err(|_| AuditAuthorityError::Unavailable)?;
         if <[u8; 32]>::from(Sha256::digest(plaintext.as_slice())) != content.plaintext_digest {
@@ -3117,11 +3127,10 @@ impl crate::audit_authority::NetconfPendingRead {
         }
         crate::audit_authority::confirmation::verify(
             &plaintext,
-            self.view.pending.persistent,
+            self.view.persistent,
             input.persist_id,
         )?;
         self.verify_session(session)?;
-        let lock = self.view.device.locks[0].ok_or(bad)?;
         Ok(super::audit_mutation::TargetEffectV1 {
             format: 1,
             authority: session.device.authority,
@@ -3131,19 +3140,19 @@ impl crate::audit_authority::NetconfPendingRead {
             request: event.request,
             action: 10.try_into()?,
             destination: TargetExpectationV1::Lifecycle {
-                state_digest: self.view.device.state_digest,
+                state_digest: self.view.state_digest,
             },
             source: None,
             lock: Some(super::audit_mutation::TargetLockExpectationV1 {
                 datastore: 0,
-                incarnation: lock.incarnation,
-                session: lock.session,
+                incarnation: self.view.lock_incarnation,
+                session: self.view.lock_session,
                 requester: session.incarnation(),
             }),
             expires_at: window.end,
             encrypted_payload: None,
             resolution: Some(TargetResolutionV1::ResolvePending {
-                pending: self.view.pending.pending,
+                pending: self.view.pending,
                 original_deadline: self.view.original_deadline,
             }),
         })

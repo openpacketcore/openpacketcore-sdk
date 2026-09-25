@@ -1211,7 +1211,7 @@ impl fmt::Debug for NetconfTentativePromotion<'_> {
 /// through provider preparation; stale admission must reject those expectations.
 pub struct NetconfPendingRead {
     pub(crate) session: NetconfSessionOwner,
-    pub(crate) view: crate::consensus::audit_targets::NetconfPendingView,
+    pub(crate) view: NetconfPendingView,
 }
 
 impl fmt::Debug for NetconfPendingRead {
@@ -1249,4 +1249,24 @@ impl fmt::Debug for NetconfEmptyConfirmation<'_> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str("NetconfEmptyConfirmation(<redacted>)")
     }
+}
+
+/// Immutable pending state selected only by the authenticated pinned reader.
+/// Keep its representation in the audit module; it exposes no consensus internals.
+pub(crate) struct NetconfPendingView {
+    pub(crate) state_digest: [u8; 32],
+    pub(crate) running_base: u64,
+    pub(crate) pending: NetconfPendingConfirmation,
+    pub(crate) caller: super::AuditCaller,
+    pub(crate) device_incarnation: [u8; 16],
+    pub(crate) owner_session: [u8; 16],
+    pub(crate) persistent: bool,
+    pub(crate) running_version: u64,
+    pub(crate) original_deadline: i64,
+    pub(crate) ownership_store_kind: String,
+    pub(crate) ownership: NetconfTargetReadContent,
+    pub(crate) candidate_present: bool,
+    pub(crate) lock_incarnation: u64,
+    pub(crate) lock_session: Option<[u8; 16]>,
+    pub(crate) lock_caller: Option<super::AuditCaller>,
 }

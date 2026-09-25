@@ -7426,7 +7426,11 @@ async fn target_confirmed_sdk_tentative_and_empty_confirmation_retain_original_o
         assert_eq!(target_rows(&conn), after);
         assert!(!fixture
             .ledger(&conn)
-            .lookup(&fixture.key, confirmation.handle(), event.caller)
+            .lookup(
+                &fixture.key,
+                confirmation.handle(),
+                confirmation.effect.caller
+            )
             .unwrap()
             .unwrap()
             .terminal_recorded());

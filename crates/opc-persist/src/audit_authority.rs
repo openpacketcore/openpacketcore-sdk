@@ -18,6 +18,7 @@ use crate::management_audit::{
 
 pub use crate::consensus::{PreparedAuditedMutation, PreparedTargetMutation};
 pub(crate) mod confirmation;
+pub(crate) use targets::NetconfPendingView;
 /// Authenticated retained epochs, portable exports and external checkpoints.
 pub mod continuity;
 pub(crate) mod ledger;
