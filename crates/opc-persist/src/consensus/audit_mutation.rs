@@ -236,6 +236,7 @@ pub(crate) struct TargetEncryptedBlobV1 {
 pub(crate) enum TargetPayloadV1 {
     Target(TargetEncryptedBlobV1),
     Running {
+        #[serde(deserialize_with = "target_commit_input::deserialize")]
         commit: Box<PreparedConfigCommit>,
         confirmation_ownership: Option<TargetEncryptedBlobV1>,
     },
@@ -245,6 +246,9 @@ pub(crate) enum TargetPayloadV1 {
 #[serde(rename_all = "kebab-case", deny_unknown_fields)]
 pub(crate) enum TargetResolutionV1 {
     Activate {
+        #[serde(
+            deserialize_with = "crate::audit_authority::continuity::checkpoint::deserialize_target_checkpoint"
+        )]
         checkpoint: crate::audit_authority::continuity::AuditCheckpoint,
     },
     BeginDevice {
@@ -732,5 +736,66 @@ impl PreparedTargetMutation {
 impl std::fmt::Debug for PreparedTargetMutation {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         formatter.write_str("PreparedTargetMutation(<redacted>)")
+    }
+}
+
+// The new target format rejects unknown nested fields while preserving the
+// original running commit/audit codecs and serialized field order.
+mod target_commit_input {
+    use super::*;
+    use opc_types::{ConfigVersion, SchemaDigest, Timestamp, TxId};
+
+    pub(super) fn deserialize<'de, D: serde::Deserializer<'de>>(
+        deserializer: D,
+    ) -> Result<Box<PreparedConfigCommit>, D::Error> {
+        Commit::deserialize(deserializer).map(Box::new)
+    }
+
+    #[derive(Deserialize)]
+    #[serde(remote = "PreparedConfigCommit", deny_unknown_fields)]
+    struct Commit {
+        #[serde(with = "Record")]
+        record: crate::CommitRecord,
+        #[serde(deserialize_with = "audit_entries")]
+        audit: Vec<crate::AuditRecord>,
+    }
+
+    #[derive(Deserialize)]
+    #[serde(remote = "crate::CommitRecord", deny_unknown_fields)]
+    struct Record {
+        tx_id: TxId,
+        parent_tx_id: Option<TxId>,
+        version: ConfigVersion,
+        committed_at: Timestamp,
+        principal: String,
+        source: crate::CommitSource,
+        schema_digest: SchemaDigest,
+        plaintext_digest: Vec<u8>,
+        encrypted_blob: Vec<u8>,
+        rollback_point: bool,
+        confirmed_deadline: Option<Timestamp>,
+    }
+
+    fn audit_entries<'de, D: serde::Deserializer<'de>>(
+        deserializer: D,
+    ) -> Result<Vec<crate::AuditRecord>, D::Error> {
+        #[derive(Deserialize)]
+        struct Item(#[serde(with = "Entry")] crate::AuditRecord);
+        Vec::<Item>::deserialize(deserializer)
+            .map(|entries| entries.into_iter().map(|item| item.0).collect())
+    }
+
+    #[derive(Deserialize)]
+    #[serde(remote = "crate::AuditRecord", deny_unknown_fields)]
+    struct Entry {
+        tx_id: TxId,
+        sequence: u32,
+        yang_path: String,
+        op_type: crate::AuditOpType,
+        previous_value: Option<String>,
+        new_value: Option<String>,
+        redaction_applied: bool,
+        previous_hash: [u8; 32],
+        entry_hmac: [u8; 32],
     }
 }

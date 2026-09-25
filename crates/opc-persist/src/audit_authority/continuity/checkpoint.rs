@@ -158,3 +158,31 @@ impl LedgerState {
         Ok(())
     }
 }
+
+// Only the target-v1 embedding uses this stricter nested identity decoder.
+// Legacy checkpoint representation and authentication bytes remain unchanged.
+pub(crate) fn deserialize_target_checkpoint<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> Result<AuditCheckpoint, D::Error> {
+    #[derive(Deserialize)]
+    #[serde(remote = "AuditCheckpoint", deny_unknown_fields)]
+    struct Checkpoint {
+        #[serde(with = "Body")]
+        body: CheckpointBody,
+        mac: [u8; 32],
+    }
+    #[derive(Deserialize)]
+    #[serde(remote = "CheckpointBody", deny_unknown_fields)]
+    struct Body {
+        version: u16,
+        #[serde(with = "crate::audit_authority::target_identity")]
+        identity: ConfigConsensusIdentity,
+        sequence: u64,
+        root_anchor: [u8; 32],
+        anchor: [u8; 32],
+        epoch_at_sequence: u64,
+        signing_epoch: u64,
+        acknowledged_export: [u8; 32],
+    }
+    Checkpoint::deserialize(deserializer)
+}
