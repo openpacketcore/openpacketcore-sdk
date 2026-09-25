@@ -886,7 +886,7 @@ jobs:
         uses: dtolnay/rust-toolchain@stable
 
       - name: Install cargo-hack
-        uses: taiki-e/install-action@3f74d7c16a4242f1c95561e98edc25d36adb4375 # v2.87.12
+        uses: taiki-e/install-action@dfae9bf3d6f6c6f20ef4ebb3486c01a51341ff12 # v2.87.18
         with:
           tool: cargo-hack@0.6.45
           fallback: none
