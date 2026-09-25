@@ -27,13 +27,14 @@ pub use ledger::{
     AuditOperationState,
 };
 pub(crate) use targets::{
-    caller as target_caller, identity as target_identity, NetconfWorkerBinding,
+    caller as target_caller, identity as target_identity, NetconfTargetReadContent,
+    NetconfWorkerBinding,
 };
 pub use targets::{
     CandidateGeneration, NetconfAppliedOutcome, NetconfDeviceOwner, NetconfIncarnation,
     NetconfLockDatastore, NetconfLockLease, NetconfPendingConfirmation, NetconfRunningCopy,
-    NetconfSessionOwner, NetconfTargetResult, PreparedNetconfDevice, PreparedNetconfLock,
-    StartupRevision,
+    NetconfSessionOwner, NetconfTargetRead, NetconfTargetReplacement, NetconfTargetResult,
+    PreparedNetconfDevice, PreparedNetconfLock, StartupRevision,
 };
 
 /// Largest aggregate private tuple accepted before projection.

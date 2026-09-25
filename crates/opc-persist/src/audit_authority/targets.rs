@@ -866,3 +866,148 @@ impl fmt::Debug for NetconfRunningCopy<'_> {
         f.write_str("NetconfRunningCopy(<redacted>)")
     }
 }
+
+/// A frozen encrypted candidate/startup read from one authenticated authority
+/// transaction. Its private binding names the original session, worker, target
+/// counter, running base and lock. It cannot be constructed or decoded by a
+/// consumer. Reading it grants no permission to admit or apply a mutation.
+///
+/// An absent candidate selects the exact current running fallback when one
+/// exists. An absent startup has no content. Neither case creates target state.
+pub struct NetconfTargetRead {
+    pub(crate) session: NetconfSessionOwner,
+    pub(crate) datastore: NetconfLockDatastore,
+    pub(crate) counter: u64,
+    pub(crate) running_base: u64,
+    pub(crate) lock_incarnation: u64,
+    pub(crate) lock_session: Option<[u8; 16]>,
+    pub(crate) fallback: bool,
+    pub(crate) content: Option<NetconfTargetReadContent>,
+}
+
+pub(crate) struct NetconfTargetReadContent {
+    pub(crate) schema: opc_types::SchemaDigest,
+    pub(crate) plaintext_digest: [u8; 32],
+    pub(crate) encrypted: Vec<u8>,
+}
+
+impl NetconfTargetRead {
+    /// Original destination, never running.
+    pub fn datastore(&self) -> NetconfLockDatastore {
+        self.datastore
+    }
+
+    /// Exact candidate counter, including an absent-state tombstone.
+    pub fn candidate_generation(&self) -> Option<CandidateGeneration> {
+        (self.datastore == NetconfLockDatastore::Candidate).then_some(CandidateGeneration {
+            authority: self.session.device.authority,
+            value: self.counter,
+        })
+    }
+
+    /// Exact startup counter, including an absent-state tombstone.
+    pub fn startup_revision(&self) -> Option<StartupRevision> {
+        (self.datastore == NetconfLockDatastore::Startup).then_some(StartupRevision {
+            authority: self.session.device.authority,
+            value: self.counter,
+        })
+    }
+
+    /// Running version captured with the target, not a target counter.
+    pub fn running_base_version(&self) -> u64 {
+        self.running_base
+    }
+
+    /// Whether this absent candidate selects its pinned running configuration.
+    pub fn uses_running_fallback(&self) -> bool {
+        self.fallback
+    }
+
+    /// Original bounded ciphertext. Decrypt through the existing provider and
+    /// expected tenant, then validate the configuration before preparing an edit.
+    /// The ciphertext is protected input, not suitable for diagnostic output.
+    pub fn encrypted_configuration(&self) -> Option<&[u8]> {
+        self.content
+            .as_ref()
+            .map(|content| content.encrypted.as_slice())
+    }
+
+    /// Schema of the exact encrypted source, when content exists.
+    pub fn schema(&self) -> Option<opc_types::SchemaDigest> {
+        self.content.as_ref().map(|content| content.schema)
+    }
+
+    pub(crate) fn verify_session(
+        &self,
+        session: &NetconfSessionOwner,
+    ) -> Result<(), AuditAuthorityError> {
+        session.require_active()?;
+        if !self.session.same_session(session) {
+            return Err(AuditAuthorityError::BindingMismatch);
+        }
+        Ok(())
+    }
+}
+
+impl fmt::Debug for NetconfTargetRead {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("NetconfTargetRead(<redacted>)")
+    }
+}
+
+/// Immutable serialized replacement supplied to SDK target preparation. The
+/// embedding worker must first authorize and validate the configuration model.
+/// Preparation checks bounds and creates the destination envelope through the
+/// existing provider. This input contains no claimed ciphertext or outcome.
+/// The provider and plaintext borrow are never retained in a command or row.
+pub struct NetconfTargetReplacement<'a> {
+    pub(crate) frozen: &'a NetconfTargetRead,
+    pub(crate) plaintext: &'a [u8],
+    pub(crate) schema: opc_types::SchemaDigest,
+    pub(crate) provider: &'a dyn opc_key::KeyProvider,
+    pub(crate) operation: crate::ManagementAuditOperationCode,
+}
+
+impl<'a> NetconfTargetReplacement<'a> {
+    /// Replacement computed by an edit against the accompanying frozen read.
+    /// Required audit must describe an Update intent.
+    pub fn edit(
+        frozen: &'a NetconfTargetRead,
+        plaintext: &'a [u8],
+        schema: opc_types::SchemaDigest,
+        provider: &'a dyn opc_key::KeyProvider,
+    ) -> Self {
+        Self {
+            frozen,
+            plaintext,
+            schema,
+            provider,
+            operation: crate::ManagementAuditOperationCode::Update,
+        }
+    }
+
+    /// Explicit inline copy content, with a Replace intent. This constructor
+    /// does not assert a relationship to any source datastore. Datastore copy
+    /// requires its own authenticated source selection and cannot use this as
+    /// a substitute for that binding.
+    pub fn inline_copy(
+        frozen: &'a NetconfTargetRead,
+        plaintext: &'a [u8],
+        schema: opc_types::SchemaDigest,
+        provider: &'a dyn opc_key::KeyProvider,
+    ) -> Self {
+        Self {
+            frozen,
+            plaintext,
+            schema,
+            provider,
+            operation: crate::ManagementAuditOperationCode::Replace,
+        }
+    }
+}
+
+impl fmt::Debug for NetconfTargetReplacement<'_> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("NetconfTargetReplacement(<redacted>)")
+    }
+}

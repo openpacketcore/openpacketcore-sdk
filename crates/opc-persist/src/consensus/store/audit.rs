@@ -1603,3 +1603,132 @@ impl ConsensusConfigStore {
         view
     }
 }
+
+impl ConsensusConfigStore {
+    /// Read one frozen candidate/startup edit base for this exact SDK session.
+    /// The target, running fallback, lock, device, ledger and checkpoint anchor
+    /// are read in one transaction after the quorum barrier. The independent
+    /// checkpoint is verified before the opaque value is returned. No state is
+    /// changed and no admission is granted; NACM authorization remains upstream.
+    pub async fn read_netconf_target(
+        &self,
+        session: &crate::audit_authority::NetconfSessionOwner,
+        datastore: crate::audit_authority::NetconfLockDatastore,
+    ) -> Result<crate::audit_authority::NetconfTargetRead, AuditAuthorityError> {
+        self.require_netconf_target_profile()?;
+        if !session.device.worker.belongs_to(&self.inner) {
+            return Err(AuditAuthorityError::BindingMismatch);
+        }
+        session.require_active()?;
+        self.linearizable_barrier()
+            .await
+            .map_err(|_| AuditAuthorityError::Unavailable)?;
+        let backend = self.inner.backend.clone();
+        let identity = self.inner.identity;
+        let original = session.clone();
+        let (ledger, view) = super::super::run_backend_sqlite_with_timeout(
+            &self.inner.backend,
+            self.inner.operation_timeout,
+            move |conn, cancellation| {
+                let unavailable = || std::io::Error::other("target read authority unavailable");
+                let tx = conn.unchecked_transaction().map_err(|_| unavailable())?;
+                super::super::sqlite::validate_live_history_schema_for_profile(
+                    &tx,
+                    cancellation,
+                    crate::RetainedConfigProfile::NetconfTargetsV1,
+                )?;
+                let keys = backend.management_audit_keys().ok_or_else(unavailable)?;
+                let ledger = super::super::audit::read_with_keys_sync(
+                    &tx,
+                    backend.audit_key(),
+                    Some(&keys),
+                    identity,
+                )?
+                .ok_or_else(unavailable)?;
+                let view = super::super::audit_targets::read_target_view_sync(
+                    &tx,
+                    backend.audit_key(),
+                    &ledger,
+                    datastore,
+                    &original,
+                    cancellation,
+                )?;
+                cancellation.check_io()?;
+                tx.commit().map_err(|_| unavailable())?;
+                Ok((ledger, view))
+            },
+        )
+        .await
+        .map_err(|_| AuditAuthorityError::Unavailable)?;
+        self.verify_audit_checkpoint(&ledger).await?;
+        let view = view?;
+        view.verify_session(session)?;
+        Ok(view)
+    }
+
+    /// Encrypt a validated edit or inline copy against its original frozen read.
+    /// This never refreshes a stale counter after the worker computed content.
+    /// The existing provider creates the exact target-bound envelope; plaintext
+    /// and provider references are not retained. This does not prepare a copy
+    /// from another datastore, admit an intent or change configuration state.
+    ///
+    /// Preserve the returned original before admission. Once transmission may
+    /// have occurred, recover that operation instead of preparing a replacement.
+    /// Required admission rechecks complete command/replication bounds, exact
+    /// expectations, independent checkpoint and terminal/lifecycle fences.
+    pub async fn prepare_netconf_target_replacement(
+        &self,
+        session: &crate::audit_authority::NetconfSessionOwner,
+        replacement: crate::audit_authority::NetconfTargetReplacement<'_>,
+        privacy: &dyn AuditPrivacyProjection,
+        event: &ManagementAuditEventRecord,
+        lifetime: std::time::Duration,
+    ) -> Result<crate::audit_authority::PreparedTargetMutation, AuditAuthorityError> {
+        self.require_netconf_target_profile()?;
+        let frozen = replacement.frozen;
+        if !session.device.worker.belongs_to(&self.inner) {
+            return Err(AuditAuthorityError::BindingMismatch);
+        }
+        frozen.verify_session(session)?;
+        if lifetime.subsec_nanos() != 0 || !(1..=3600).contains(&lifetime.as_secs()) {
+            return Err(AuditAuthorityError::InvalidInput);
+        }
+        let tenant = opc_types::TenantId::new(event.tenant())
+            .map_err(|_| AuditAuthorityError::InvalidInput)?;
+        let event = ProjectedAuditEvent::project(privacy, event)?;
+        let issued_at = self
+            .inner
+            .clock
+            .now_utc()
+            .as_offset_datetime()
+            .unix_timestamp();
+        let expires_at = issued_at
+            .checked_add(lifetime.as_secs() as i64)
+            .ok_or(AuditAuthorityError::InvalidInput)?;
+        let effect = frozen
+            .prepare_replacement(session, replacement, tenant, &event, expires_at)
+            .await?;
+        let digest = effect.digest(self.inner.backend.audit_key())?;
+        let binding =
+            AuditOperationBinding::project(privacy, &event, frozen.running_base, &digest)?;
+        let handle = AuditOperationHandle::issue(
+            HandleBody {
+                version: 1,
+                identity: self.inner.identity,
+                binding,
+                event,
+                issued_at,
+                expires_at,
+                nonce: *uuid::Uuid::new_v4().as_bytes(),
+                key_epoch: self.inner.backend.audit_key().epoch(),
+                mutation: Some(digest),
+            },
+            self.inner.backend.audit_key(),
+        )?;
+        let prepared = crate::audit_authority::PreparedTargetMutation { handle, effect };
+        prepared.verify_effect(self.inner.backend.audit_key())?;
+        self.preflight_netconf_target(&prepared).await?;
+        frozen.verify_session(session)?;
+        Ok(prepared)
+    }
+}

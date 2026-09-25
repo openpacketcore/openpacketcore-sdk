@@ -2217,3 +2217,195 @@ impl NetconfRemovalView {
         })
     }
 }
+
+/// Freeze the encrypted edit source and destination expectations in the same
+/// transaction as the ledger, device, locks, pending state and running history.
+pub(crate) fn read_target_view_sync(
+    conn: &Connection,
+    key: &AuditKey,
+    ledger: &LedgerState,
+    datastore: crate::audit_authority::NetconfLockDatastore,
+    session: &crate::audit_authority::NetconfSessionOwner,
+    cancellation: &SqliteWorkCancellation,
+) -> io::Result<Result<crate::audit_authority::NetconfTargetRead, AuditAuthorityError>> {
+    use crate::audit_authority::{
+        NetconfLockDatastore as Store, NetconfTargetRead, NetconfTargetReadContent,
+    };
+    let view = match read_removal_view_sync(conn, key, ledger, datastore, cancellation)? {
+        Ok(view) => view,
+        Err(error) => return Ok(Err(error)),
+    };
+    if let Err(error) = view.device.verify_session(session) {
+        return Ok(Err(error));
+    }
+    let bad = AuditAuthorityError::BindingMismatch;
+    let Some(lock) = view.device.locks[datastore.slot()] else {
+        return Ok(Err(bad));
+    };
+    if lock
+        .session
+        .is_some_and(|owner| owner != session.incarnation())
+        || lock.caller.is_some_and(|caller| caller != session.caller)
+        || view.pending_owner.is_some_and(|(caller, owner)| {
+            datastore != Store::Candidate
+                || caller != session.caller
+                || owner != session.incarnation()
+        })
+    {
+        return Ok(Err(bad));
+    }
+    let state = read_state_sync(conn, key, ledger.identity, cancellation)?;
+    let slot = datastore.slot() - 1;
+    let fallback = datastore == Store::Candidate
+        && !state.targets[slot].present
+        && view.device.running_version > 0;
+    let blob = if state.targets[slot].present || fallback {
+        match read_copy_view_sync(conn, key, ledger, datastore, cancellation)? {
+            Ok(copy) => Some(copy.blob),
+            Err(error) => return Ok(Err(error)),
+        }
+    } else {
+        None
+    };
+    cancellation.check_io()?;
+    Ok(Ok(NetconfTargetRead {
+        session: session.clone(),
+        datastore,
+        counter: view.generation,
+        running_base: view.device.running_version,
+        lock_incarnation: lock.incarnation,
+        lock_session: lock.session,
+        fallback,
+        content: blob.map(|blob| NetconfTargetReadContent {
+            schema: blob.schema,
+            plaintext_digest: blob.plaintext_digest,
+            encrypted: blob.encrypted_blob,
+        }),
+    }))
+}
+
+impl crate::audit_authority::NetconfTargetRead {
+    /// Authenticate and decrypt only this frozen source through the existing
+    /// provider for the expected tenant. The returned zeroizing buffer contains
+    /// the original serialized configuration wrapper; the embedding worker must
+    /// still authorize the read and validate its model. This does not refresh
+    /// the snapshot or grant any mutation authority.
+    pub async fn decrypt_configuration(
+        &self,
+        provider: &dyn opc_key::KeyProvider,
+        tenant: &opc_types::TenantId,
+    ) -> Result<Option<zeroize::Zeroizing<Vec<u8>>>, AuditAuthorityError> {
+        self.session.require_active()?;
+        let Some(content) = &self.content else {
+            return Ok(None);
+        };
+        let bad = AuditAuthorityError::BindingMismatch;
+        let envelope =
+            opc_crypto::CryptoEnvelopeRef::decode(&content.encrypted).map_err(|_| bad)?;
+        let (aad, _) = opc_key::decode_bound_aad(envelope.aad).map_err(|_| bad)?;
+        if aad.tenant() != tenant {
+            return Err(bad);
+        }
+        let plaintext = opc_crypto::decrypt_envelope(provider, &aad, &content.encrypted)
+            .await
+            .map_err(|_| AuditAuthorityError::Unavailable)?;
+        if <[u8; 32]>::from(Sha256::digest(plaintext.as_slice())) != content.plaintext_digest {
+            return Err(bad);
+        }
+        self.session.require_active()?;
+        Ok(Some(plaintext))
+    }
+
+    pub(crate) async fn prepare_replacement(
+        &self,
+        session: &crate::audit_authority::NetconfSessionOwner,
+        replacement: crate::audit_authority::NetconfTargetReplacement<'_>,
+        tenant: opc_types::TenantId,
+        event: &crate::audit_authority::ProjectedAuditEvent,
+        expires_at: i64,
+    ) -> Result<super::audit_mutation::TargetEffectV1, AuditAuthorityError> {
+        use crate::audit_authority::NetconfLockDatastore as Store;
+        use crate::ManagementAuditTransportCode as Transport;
+        self.verify_session(session)?;
+        let bad = AuditAuthorityError::BindingMismatch;
+        if !std::ptr::eq(self, replacement.frozen)
+            || event.caller != session.caller
+            || event.operation != replacement.operation
+            || event.outcome != crate::ManagementAuditOutcomeCode::Intent
+            || !matches!(
+                event.transport,
+                Transport::NetconfSsh | Transport::NetconfTls
+            )
+        {
+            return Err(bad);
+        }
+        let (action, destination) = match self.datastore {
+            Store::Candidate => (
+                4,
+                TargetExpectationV1::Candidate {
+                    generation: self.candidate_generation().ok_or(bad)?,
+                },
+            ),
+            Store::Startup => (
+                7,
+                TargetExpectationV1::Startup {
+                    revision: self.startup_revision().ok_or(bad)?,
+                },
+            ),
+            Store::Running => return Err(AuditAuthorityError::InvalidInput),
+        };
+        let source = if let Some(content) = &self.content {
+            let envelope =
+                opc_crypto::CryptoEnvelopeRef::decode(&content.encrypted).map_err(|_| bad)?;
+            let (aad, _) = opc_key::decode_bound_aad(envelope.aad).map_err(|_| bad)?;
+            if aad.tenant() != &tenant {
+                return Err(bad);
+            }
+            let ciphertext_digest = Sha256::digest(&content.encrypted).into();
+            Some(match self.datastore {
+                Store::Candidate if self.fallback => TargetSourceV1::CandidateFallback {
+                    generation: self.candidate_generation().ok_or(bad)?,
+                    running_version: self.running_base,
+                    schema: content.schema,
+                    ciphertext_digest,
+                },
+                Store::Candidate => TargetSourceV1::Candidate {
+                    generation: self.candidate_generation().ok_or(bad)?,
+                    schema: content.schema,
+                    ciphertext_digest,
+                },
+                Store::Startup => TargetSourceV1::Startup {
+                    revision: self.startup_revision().ok_or(bad)?,
+                    schema: content.schema,
+                    ciphertext_digest,
+                },
+                Store::Running => return Err(bad),
+            })
+        } else {
+            None
+        };
+        let mut effect = super::audit_mutation::TargetEffectV1 {
+            format: 1,
+            authority: session.device.authority,
+            profile_incarnation: session.device.profile_incarnation,
+            device_incarnation: session.device.device_incarnation,
+            caller: event.caller,
+            request: event.request,
+            action: action.try_into()?,
+            destination,
+            source,
+            lock: Some(super::audit_mutation::TargetLockExpectationV1 {
+                datastore: self.datastore.slot() as u8,
+                incarnation: self.lock_incarnation,
+                session: self.lock_session,
+                requester: session.incarnation(),
+            }),
+            expires_at,
+            encrypted_payload: None,
+            resolution: None,
+        };
+        effect.bind_target_plaintext(tenant, replacement).await?;
+        self.verify_session(session)?;
+        Ok(effect)
+    }
+}

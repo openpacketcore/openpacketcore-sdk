@@ -30,7 +30,7 @@ struct Wrapper {
     _request_id: Option<serde::de::IgnoredAny>,
 }
 
-fn configuration_bytes(plaintext: &[u8]) -> Result<&[u8], AuditAuthorityError> {
+pub(super) fn configuration_bytes(plaintext: &[u8]) -> Result<&[u8], AuditAuthorityError> {
     let bad = AuditAuthorityError::BindingMismatch;
     let Some(encoded) = plaintext.strip_prefix(V2_MAGIC) else {
         // Original config-only JSON has no binary prefix. Do not normalize it:

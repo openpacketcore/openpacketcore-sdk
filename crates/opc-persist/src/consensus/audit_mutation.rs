@@ -881,3 +881,60 @@ impl TargetEffectV1 {
         authenticate(key, TARGET_MUTATION_DOMAIN, self)
     }
 }
+
+impl TargetEffectV1 {
+    pub(crate) async fn bind_target_plaintext(
+        &mut self,
+        tenant: opc_types::TenantId,
+        replacement: crate::audit_authority::NetconfTargetReplacement<'_>,
+    ) -> Result<(), AuditAuthorityError> {
+        use opc_key::{ConfigAad, EnvelopeAad};
+        use sha2::{Digest, Sha256};
+        let bad = AuditAuthorityError::InvalidInput;
+        if self.encrypted_payload.is_some()
+            || replacement.plaintext.len() > super::sqlite::CONFIG_CONSENSUS_LOG_ENTRY_MAX_BYTES
+        {
+            return Err(bad);
+        }
+        // Validate the existing config-only or V2 wrapper without interpreting
+        // or normalizing configuration values. Model validation stays upstream.
+        target_copy::configuration_bytes(replacement.plaintext)?;
+        let (slot, next) = match self.destination {
+            TargetExpectationV1::Candidate { generation } if self.action.0 == 4 => {
+                (0, generation.checked_next()?.get())
+            }
+            TargetExpectationV1::Startup { revision } if self.action.0 == 7 => {
+                (1, revision.checked_next()?.get())
+            }
+            _ => return Err(bad),
+        };
+        let aad = EnvelopeAad::config(
+            tenant,
+            next,
+            ConfigAad::new(
+                opc_types::TxId::new(),
+                None,
+                opc_types::Timestamp::now_utc(),
+                "netconf-required-audit",
+                replacement.schema,
+                self.encryption_store_kind(replacement.schema, slot)?,
+            )
+            .map_err(|_| bad)?,
+        );
+        let encrypted = opc_crypto::encrypt_attested_envelope(
+            replacement.provider,
+            &aad,
+            replacement.plaintext,
+        )
+        .await
+        .map_err(|_| AuditAuthorityError::Unavailable)?;
+        let blob = TargetEncryptedBlobV1 {
+            schema: replacement.schema,
+            plaintext_digest: Sha256::digest(replacement.plaintext).into(),
+            encrypted_blob: encrypted.encoded().to_vec(),
+        };
+        blob.validate()?;
+        self.encrypted_payload = Some(TargetPayloadV1::Target(blob));
+        Ok(())
+    }
+}

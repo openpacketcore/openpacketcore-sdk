@@ -86,6 +86,38 @@ an unknown result grants no permission to resubmit different work. Separate
 SDK lifecycle methods create device/session/lock capabilities only after current
 authority and caller authorization; `submit` cannot mint them from request fields.
 
+### Frozen edit preparation
+
+The persistence preparation surface uses `ConsensusConfigStore::read_netconf_target`
+to return an opaque `NetconfTargetRead` bound to the exact active worker/session,
+destination counter, running base and lock. The encrypted target or absent-candidate
+running fallback comes from the same authenticated transaction as its ledger and
+checkpoint anchor. The independent checkpoint is verified before returning the
+read. Absence retains its exact tombstone; reading never creates target content.
+
+`NetconfTargetRead::decrypt_configuration` authenticates that frozen ciphertext
+through the existing provider for the expected tenant, verifies its full plaintext
+digest and returns zeroizing storage. The embedding worker remains responsible
+for read authorization, parsing and model validation. This is an edit base, not a
+replacement for the separate protocol read/observation path.
+
+`NetconfTargetReplacement::edit` pairs the validated replacement with that original
+read and an Update intent; `inline_copy` uses Replace for explicit inline content.
+Neither asserts a copy relationship to another datastore. The authority's
+`prepare_netconf_target_replacement` accepts the exact session, this immutable
+input, original audit event and fixed lifetime. It never fetches a newer counter
+to authorize content computed from an older read. The SDK creates the encrypted
+target envelope using the existing provider and complete pre-encryption binding,
+then rechecks retained expectations and reservations. Admission separately checks
+the complete command and replication bounds before transmission. Provider failure
+or cancellation during preparation admits no intent and permits no effect.
+
+Datastore-copy selection requires its own authenticated source binding; presenting
+inline content does not qualify that mutation mode. Once an original operation
+may have been transmitted, recovery must use that operation rather than repeat
+encryption or prepare a replacement. These preparation types do not activate the
+full NETCONF runtime profile or confer recipient-only audit verification.
+
 ## Closed effect representation
 
 `TargetEffectV1` is an explicitly tagged, bounded record. Its common fields, in
