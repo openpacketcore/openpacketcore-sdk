@@ -4611,3 +4611,315 @@ async fn target_provider_copy_preparation_accepts_exact_protocol_replace_operati
     fixture.settle(&conn, &prepared);
     provider_assert_history(&conn, &provider, 1, 181, config).await;
 }
+
+impl Fixture {
+    fn removal_view(
+        &self,
+        conn: &Connection,
+        datastore: crate::audit_authority::NetconfLockDatastore,
+    ) -> Result<crate::consensus::audit_targets::NetconfRemovalView, AuditAuthorityError> {
+        let tx = conn.unchecked_transaction().unwrap();
+        let view = crate::consensus::audit_targets::read_removal_view_sync(
+            &tx,
+            &self.key,
+            &self.ledger(&tx),
+            datastore,
+            &crate::consensus::sqlite::SqliteWorkCancellation::audit_test(),
+        )
+        .unwrap();
+        tx.commit().unwrap();
+        view
+    }
+
+    fn removal_event(
+        &self,
+        request: u8,
+        datastore: crate::audit_authority::NetconfLockDatastore,
+    ) -> ProjectedAuditEvent {
+        let mut event = self.event(request);
+        if datastore == crate::audit_authority::NetconfLockDatastore::Startup {
+            event.operation = ManagementAuditOperationCode::Delete;
+        }
+        event
+    }
+}
+
+#[tokio::test]
+async fn target_removal_advances_exact_tombstone_and_preserves_known_result_through_debt() {
+    use crate::audit_authority::NetconfLockDatastore as Store;
+    for datastore in [Store::Candidate, Store::Startup] {
+        let slot = u8::from(datastore == Store::Startup);
+        let fixture = Fixture::new().await;
+        let shared = fixture.backend.conn();
+        let conn = shared.lock().await;
+        fixture.active(&conn);
+        let worker = std::sync::Arc::new(());
+        let session = fixture.session_owner(&conn, &worker, 0x61);
+        let stage = fixture.encrypted(
+            fixture.request(&conn, 231, if slot == 0 { 4 } else { 7 }, 0x61, slot + 1),
+            0x73,
+        );
+        assert!(matches!(
+            fixture.submit(&conn, &stage),
+            AuditOperationState::TargetV1(_)
+        ));
+        fixture.settle(&conn, &stage);
+        let other = row(&conn, "config_netconf_targets", "target", 1 - slot);
+        for (request, generation) in [(232, 2), (233, 3)] {
+            let before = target_rows(&conn);
+            let sequence = fixture.ledger(&conn).sequence;
+            let event = fixture.removal_event(request, datastore);
+            let view = fixture.removal_view(&conn, datastore).unwrap();
+            let effect = view.prepare(&session, &event, 160).unwrap();
+            assert_eq!(target_rows(&conn), before);
+            assert_eq!(fixture.ledger(&conn).sequence, sequence);
+            let prepared = fixture.prepare(effect, event);
+            assert_eq!(fixture.preflight(&conn, &prepared, 100).unwrap(), None);
+            let outcome = fixture.submit(&conn, &prepared);
+            let AuditOperationState::TargetV1(result) = outcome else {
+                panic!("prepared target removal did not apply");
+            };
+            match (datastore, result.outcome()) {
+                (Store::Candidate, NetconfAppliedOutcome::Candidate { generation: value }) => {
+                    assert_eq!(value.get(), generation);
+                }
+                (Store::Startup, NetconfAppliedOutcome::Startup { revision }) => {
+                    assert_eq!(revision.get(), generation);
+                }
+                _ => panic!("target removal returned another target result"),
+            }
+            let target = row(&conn, "config_netconf_targets", "target", slot);
+            assert_eq!(target["generation"], generation);
+            assert_eq!(target["present"], false);
+            assert!(target["encrypted_envelope"].is_null());
+            assert_eq!(
+                row(&conn, "config_netconf_targets", "target", 1 - slot),
+                other
+            );
+            assert_eq!(fixture.device_view(&conn).running_version, 0);
+            let receipt = fixture
+                .ledger(&conn)
+                .lookup(&fixture.key, prepared.handle(), session.caller)
+                .unwrap()
+                .unwrap();
+            assert_eq!(receipt.state(), outcome);
+            assert!(!receipt.terminal_recorded());
+            assert!(matches!(
+                fixture.removal_view(&conn, datastore).unwrap().prepare(
+                    &session,
+                    &fixture.removal_event(234, datastore),
+                    160
+                ),
+                Err(AuditAuthorityError::RecoveryRequired)
+            ));
+            fixture.settle(&conn, &prepared);
+            let after = target_rows(&conn);
+            let sequence = fixture.ledger(&conn).sequence;
+            fixture
+                .apply(
+                    &conn,
+                    AuditCommand::NetconfTarget(Box::new(TargetAuditCommandV1::Apply(
+                        prepared.clone(),
+                    ))),
+                    if generation == 3 { 200 } else { 100 },
+                )
+                .unwrap();
+            assert_eq!(target_rows(&conn), after);
+            assert_eq!(fixture.ledger(&conn).sequence, sequence);
+            assert_eq!(
+                fixture
+                    .ledger(&conn)
+                    .lookup(&fixture.key, prepared.handle(), session.caller)
+                    .unwrap()
+                    .unwrap()
+                    .state(),
+                outcome
+            );
+        }
+    }
+}
+
+#[tokio::test]
+async fn target_removal_refuses_foreign_session_operation_and_observation_without_effect() {
+    use crate::audit_authority::{AuditCaller, NetconfLockDatastore as Store};
+    for datastore in [Store::Candidate, Store::Startup] {
+        let fixture = Fixture::new().await;
+        let shared = fixture.backend.conn();
+        let conn = shared.lock().await;
+        fixture.active(&conn);
+        let worker = std::sync::Arc::new(());
+        let session = fixture.session_owner(&conn, &worker, 0x61);
+        let foreign = fixture.session_owner(&conn, &worker, 0x62);
+        let event = fixture.event(235);
+        let acquire = fixture.prepare(
+            fixture
+                .device_view(&conn)
+                .prepare_lock(&session, &event, datastore, None, 160)
+                .unwrap(),
+            event,
+        );
+        assert!(matches!(
+            fixture.submit(&conn, &acquire),
+            AuditOperationState::TargetV1(_)
+        ));
+        fixture.settle(&conn, &acquire);
+        let view = fixture.removal_view(&conn, datastore).unwrap();
+        let event = fixture.removal_event(236, datastore);
+        assert!(view.prepare(&session, &event, 160).is_ok());
+        let before = target_rows(&conn);
+        let changes = conn.total_changes();
+        assert!(
+            matches!(
+                view.prepare(&foreign, &event, 160),
+                Err(AuditAuthorityError::BindingMismatch)
+            ),
+            "removal accepted another lock owner"
+        );
+        for variant in 0..4 {
+            let mut wrong = event.clone();
+            match variant {
+                0 => {
+                    wrong.caller = AuditCaller::project(
+                        &fixture.privacy,
+                        "fixture-tenant",
+                        "fixture-other-principal",
+                    )
+                    .unwrap()
+                }
+                1 => {
+                    wrong.operation = if datastore == Store::Candidate {
+                        ManagementAuditOperationCode::Delete
+                    } else {
+                        ManagementAuditOperationCode::Exec
+                    }
+                }
+                2 => wrong.transport = ManagementAuditTransportCode::Internal,
+                _ => wrong.outcome = ManagementAuditOutcomeCode::Success,
+            }
+            assert!(
+                matches!(
+                    view.prepare(&session, &wrong, 160),
+                    Err(AuditAuthorityError::BindingMismatch)
+                ),
+                "removal accepted mismatched audit context"
+            );
+        }
+        assert!(matches!(
+            fixture.removal_view(&conn, Store::Running),
+            Err(AuditAuthorityError::InvalidInput)
+        ));
+        session.invalidate();
+        assert!(matches!(
+            view.prepare(&session, &event, 160),
+            Err(AuditAuthorityError::BindingMismatch)
+        ));
+        assert_eq!(target_rows(&conn), before);
+        assert_eq!(conn.total_changes(), changes);
+    }
+}
+
+#[tokio::test]
+async fn target_removal_stale_generation_cannot_delete_recreated_target() {
+    use crate::audit_authority::NetconfLockDatastore as Store;
+    for datastore in [Store::Candidate, Store::Startup] {
+        let slot = u8::from(datastore == Store::Startup);
+        let fixture = Fixture::new().await;
+        let shared = fixture.backend.conn();
+        let conn = shared.lock().await;
+        fixture.active(&conn);
+        let worker = std::sync::Arc::new(());
+        let session = fixture.session_owner(&conn, &worker, 0x61);
+        let event = fixture.removal_event(237, datastore);
+        let stale = fixture.prepare(
+            fixture
+                .removal_view(&conn, datastore)
+                .unwrap()
+                .prepare(&session, &event, 160)
+                .unwrap(),
+            event,
+        );
+        let stage = fixture.encrypted(
+            fixture.request(&conn, 238, if slot == 0 { 4 } else { 7 }, 0x61, slot + 1),
+            0x74,
+        );
+        assert!(matches!(
+            fixture.submit(&conn, &stage),
+            AuditOperationState::TargetV1(_)
+        ));
+        fixture.settle(&conn, &stage);
+        let before = target_rows(&conn);
+        let sequence = fixture.ledger(&conn).sequence;
+        assert_eq!(
+            fixture.preflight(&conn, &stale, 100),
+            Err(AuditAuthorityError::BindingMismatch)
+        );
+        assert_eq!(target_rows(&conn), before);
+        assert_eq!(fixture.ledger(&conn).sequence, sequence);
+        // Retained application also refuses if a stale request bypasses the
+        // local preflight; its definite rejection and terminal are preserved.
+        assert_eq!(fixture.submit(&conn, &stale), AuditOperationState::Rejected);
+        assert_eq!(target_rows(&conn), before);
+        assert_eq!(fixture.device_view(&conn).running_version, 0);
+        fixture.settle(&conn, &stale);
+    }
+}
+
+#[tokio::test]
+async fn target_removal_preserves_pending_confirmation_and_original_owner() {
+    use crate::audit_authority::NetconfLockDatastore as Store;
+    for persistent in [false, true] {
+        let fixture = Fixture::new().await;
+        let shared = fixture.backend.conn();
+        let conn = shared.lock().await;
+        let tentative = fixture.pending_fixture(&conn, persistent);
+        assert!(matches!(
+            fixture.submit(&conn, &tentative),
+            AuditOperationState::TargetV1(_)
+        ));
+        fixture.settle(&conn, &tentative);
+        let worker = std::sync::Arc::new(());
+        let session = fixture.session_owner(&conn, &worker, 0x61);
+        let foreign = fixture.session_owner(&conn, &worker, 0x62);
+        let event = fixture.removal_event(239, Store::Candidate);
+        let candidate = fixture.removal_view(&conn, Store::Candidate).unwrap();
+        let before = target_rows(&conn);
+        let sequence = fixture.ledger(&conn).sequence;
+        assert!(
+            matches!(
+                candidate.prepare(&foreign, &event, 160),
+                Err(AuditAuthorityError::BindingMismatch)
+            ),
+            "pending removal accepted another session"
+        );
+        assert!(
+            matches!(
+                fixture
+                    .removal_view(&conn, Store::Startup)
+                    .unwrap()
+                    .prepare(&session, &fixture.removal_event(240, Store::Startup), 160),
+                Err(AuditAuthorityError::BindingMismatch)
+            ),
+            "pending confirmation allowed startup removal"
+        );
+        assert_eq!(target_rows(&conn), before);
+        assert_eq!(fixture.ledger(&conn).sequence, sequence);
+        let lifecycle = row(&conn, "config_netconf_lifecycle", "singleton", 1);
+        let startup = row(&conn, "config_netconf_targets", "target", 1);
+        let prepared = fixture.rebind_at(
+            &conn,
+            fixture.prepare(candidate.prepare(&session, &event, 160).unwrap(), event),
+            100,
+        );
+        assert!(
+            matches!(fixture.submit(&conn, &prepared), AuditOperationState::TargetV1(result)
+            if matches!(result.outcome(), NetconfAppliedOutcome::Candidate { .. }))
+        );
+        assert_eq!(
+            row(&conn, "config_netconf_lifecycle", "singleton", 1),
+            lifecycle
+        );
+        assert_eq!(row(&conn, "config_netconf_targets", "target", 1), startup);
+        assert_eq!(fixture.device_view(&conn).running_version, 2);
+        fixture.settle(&conn, &prepared);
+    }
+}

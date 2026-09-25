@@ -1487,3 +1487,119 @@ impl ConsensusConfigStore {
         view
     }
 }
+
+impl ConsensusConfigStore {
+    /// Prepare candidate discard or startup deletion for the exact active
+    /// session and current retained target. Candidate requires an Exec Intent;
+    /// startup requires a Delete Intent. Running is not a removable target.
+    ///
+    /// Preparation captures the target counter, running base, lock and device
+    /// ownership under a quorum-current, independently checkpointed read. It
+    /// changes no state and grants no admission. Retain the original prepared
+    /// value before required-intent admission and recover only that operation
+    /// after cancellation or an unknown outcome. Applying removal advances the
+    /// target tombstone even when it was already absent; exact replay does not.
+    ///
+    /// Pending confirmation permits only its original session's candidate
+    /// discard. Removal never confirms or cancels that pending operation, alters
+    /// its rollback parent, or extends its deadline. Terminal debt and lifecycle
+    /// cleanup continue to fence preparation and application.
+    pub async fn prepare_netconf_target_removal(
+        &self,
+        session: &crate::audit_authority::NetconfSessionOwner,
+        datastore: crate::audit_authority::NetconfLockDatastore,
+        privacy: &dyn AuditPrivacyProjection,
+        event: &ManagementAuditEventRecord,
+        lifetime: std::time::Duration,
+    ) -> Result<crate::audit_authority::PreparedTargetMutation, AuditAuthorityError> {
+        self.require_netconf_target_profile()?;
+        if !session.device.worker.belongs_to(&self.inner) {
+            return Err(AuditAuthorityError::BindingMismatch);
+        }
+        session.require_active()?;
+        if lifetime.subsec_nanos() != 0 || !(1..=3600).contains(&lifetime.as_secs()) {
+            return Err(AuditAuthorityError::InvalidInput);
+        }
+        let event = ProjectedAuditEvent::project(privacy, event)?;
+        let issued_at = self
+            .inner
+            .clock
+            .now_utc()
+            .as_offset_datetime()
+            .unix_timestamp();
+        let expires_at = issued_at
+            .checked_add(lifetime.as_secs() as i64)
+            .ok_or(AuditAuthorityError::InvalidInput)?;
+        let view = self.read_netconf_removal_view(datastore).await?;
+        let effect = view.prepare(session, &event, expires_at)?;
+        let digest = effect.digest(self.inner.backend.audit_key())?;
+        let binding =
+            AuditOperationBinding::project(privacy, &event, view.device.running_version, &digest)?;
+        let handle = AuditOperationHandle::issue(
+            HandleBody {
+                version: 1,
+                identity: self.inner.identity,
+                binding,
+                event,
+                issued_at,
+                expires_at,
+                nonce: *uuid::Uuid::new_v4().as_bytes(),
+                key_epoch: self.inner.backend.audit_key().epoch(),
+                mutation: Some(digest),
+            },
+            self.inner.backend.audit_key(),
+        )?;
+        let prepared = crate::audit_authority::PreparedTargetMutation { handle, effect };
+        prepared.verify_effect(self.inner.backend.audit_key())?;
+        self.preflight_netconf_target(&prepared).await?;
+        session.require_active()?;
+        Ok(prepared)
+    }
+
+    async fn read_netconf_removal_view(
+        &self,
+        datastore: crate::audit_authority::NetconfLockDatastore,
+    ) -> Result<super::super::audit_targets::NetconfRemovalView, AuditAuthorityError> {
+        self.require_netconf_target_profile()?;
+        self.linearizable_barrier()
+            .await
+            .map_err(|_| AuditAuthorityError::Unavailable)?;
+        let backend = self.inner.backend.clone();
+        let identity = self.inner.identity;
+        let (ledger, view) = super::super::run_backend_sqlite_with_timeout(
+            &self.inner.backend,
+            self.inner.operation_timeout,
+            move |conn, cancellation| {
+                let unavailable = || std::io::Error::other("target removal authority unavailable");
+                let tx = conn.unchecked_transaction().map_err(|_| unavailable())?;
+                super::super::sqlite::validate_live_history_schema_for_profile(
+                    &tx,
+                    cancellation,
+                    crate::RetainedConfigProfile::NetconfTargetsV1,
+                )?;
+                let keys = backend.management_audit_keys().ok_or_else(unavailable)?;
+                let ledger = super::super::audit::read_with_keys_sync(
+                    &tx,
+                    backend.audit_key(),
+                    Some(&keys),
+                    identity,
+                )?
+                .ok_or_else(unavailable)?;
+                let view = super::super::audit_targets::read_removal_view_sync(
+                    &tx,
+                    backend.audit_key(),
+                    &ledger,
+                    datastore,
+                    cancellation,
+                )?;
+                cancellation.check_io()?;
+                tx.commit().map_err(|_| unavailable())?;
+                Ok((ledger, view))
+            },
+        )
+        .await
+        .map_err(|_| AuditAuthorityError::Unavailable)?;
+        self.verify_audit_checkpoint(&ledger).await?;
+        view
+    }
+}

@@ -2097,3 +2097,123 @@ impl NetconfCopyView {
         })
     }
 }
+
+/// A target counter and its lifecycle fences captured in one pinned read.
+pub(crate) struct NetconfRemovalView {
+    pub(crate) device: NetconfDeviceView,
+    datastore: crate::audit_authority::NetconfLockDatastore,
+    generation: u64,
+    pending_owner: Option<(AuditCaller, [u8; 16])>,
+}
+
+pub(crate) fn read_removal_view_sync(
+    conn: &Connection,
+    key: &AuditKey,
+    ledger: &LedgerState,
+    datastore: crate::audit_authority::NetconfLockDatastore,
+    cancellation: &SqliteWorkCancellation,
+) -> io::Result<Result<NetconfRemovalView, AuditAuthorityError>> {
+    use crate::audit_authority::NetconfLockDatastore as Datastore;
+    let slot = match datastore {
+        Datastore::Candidate => 0,
+        Datastore::Startup => 1,
+        Datastore::Running => return Ok(Err(AuditAuthorityError::InvalidInput)),
+    };
+    let device = read_device_view_sync(conn, key, ledger, cancellation)?;
+    let state = read_state_sync(conn, key, ledger.identity, cancellation)?;
+    cancellation.check_io()?;
+    Ok(Ok(NetconfRemovalView {
+        device,
+        datastore,
+        generation: state.targets[slot].generation,
+        pending_owner: state
+            .lifecycle
+            .pending_confirmation
+            .as_ref()
+            .map(|pending| (pending.caller, pending.owner_session)),
+    }))
+}
+
+impl NetconfRemovalView {
+    pub(crate) fn prepare(
+        &self,
+        session: &crate::audit_authority::NetconfSessionOwner,
+        event: &crate::audit_authority::ProjectedAuditEvent,
+        expires_at: i64,
+    ) -> Result<super::audit_mutation::TargetEffectV1, AuditAuthorityError> {
+        use crate::audit_authority::NetconfLockDatastore as Datastore;
+        use crate::ManagementAuditOperationCode as Operation;
+        use crate::ManagementAuditTransportCode as Transport;
+        let bad = AuditAuthorityError::BindingMismatch;
+        self.device.verify_session(session)?;
+        let (action, operation, destination) = match self.datastore {
+            Datastore::Candidate => (
+                5,
+                Operation::Exec,
+                TargetExpectationV1::Candidate {
+                    generation: crate::audit_authority::CandidateGeneration {
+                        authority: self.device.authority,
+                        value: self.generation,
+                    },
+                },
+            ),
+            Datastore::Startup => (
+                8,
+                Operation::Delete,
+                TargetExpectationV1::Startup {
+                    revision: crate::audit_authority::StartupRevision {
+                        authority: self.device.authority,
+                        value: self.generation,
+                    },
+                },
+            ),
+            Datastore::Running => return Err(AuditAuthorityError::InvalidInput),
+        };
+        if event.caller != session.caller
+            || event.operation != operation
+            || event.outcome != crate::ManagementAuditOutcomeCode::Intent
+            || !matches!(
+                event.transport,
+                Transport::NetconfSsh | Transport::NetconfTls
+            )
+            || self.pending_owner.is_some_and(|(caller, owner)| {
+                self.datastore != Datastore::Candidate
+                    || caller != session.caller
+                    || owner != session.incarnation()
+            })
+        {
+            return Err(bad);
+        }
+        self.generation
+            .checked_add(1)
+            .ok_or(AuditAuthorityError::Full)?;
+        let lock = self.device.locks[self.datastore.slot()].ok_or(bad)?;
+        if lock
+            .session
+            .is_some_and(|owner| owner != session.incarnation())
+            || lock.caller.is_some_and(|caller| caller != session.caller)
+        {
+            return Err(bad);
+        }
+        Ok(super::audit_mutation::TargetEffectV1 {
+            format: 1,
+            authority: self.device.authority,
+            profile_incarnation: session.device.profile_incarnation,
+            device_incarnation: session.device.device_incarnation,
+            caller: event.caller,
+            request: event.request,
+            action: action.try_into()?,
+            destination,
+            source: None,
+            lock: Some(super::audit_mutation::TargetLockExpectationV1 {
+                datastore: self.datastore.slot() as u8,
+                incarnation: lock.incarnation,
+                session: lock.session,
+                requester: session.incarnation(),
+            }),
+            expires_at,
+            encrypted_payload: None,
+            resolution: None,
+        })
+    }
+}
