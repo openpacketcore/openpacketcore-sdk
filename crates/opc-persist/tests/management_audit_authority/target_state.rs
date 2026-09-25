@@ -9243,6 +9243,12 @@ async fn target_rollback_sdk_provider_cancellation_and_later_device_change_admit
         let after_device = target_rows(&conn);
         let changes = conn.total_changes();
         paused.resume.notify_one();
+        tokio::select! {
+            _ = paused.entered.notified() => {},
+            _ = &mut preparation => panic!("rollback skipped successor provider authentication"),
+        }
+        assert_eq!(paused.calls.load(std::sync::atomic::Ordering::SeqCst), 2);
+        paused.resume.notify_one();
         // Binding checks after provider await precede admission. The public
         // store port performs this same authoritative preflight before return.
         let effect = preparation.await.unwrap();
