@@ -249,10 +249,17 @@ pub(crate) enum EntryPayload {
     },
     // Append-only allocation. Both the ordinary root chain and the independent
     // continuity chain authenticate the exact closed recovery description.
-    TargetIntent {
-        handle: Box<AuditOperationHandle>,
-        recovery: String,
-    },
+    TargetIntent(Box<RetainedTargetIntent>),
+}
+
+// Scope strict decoding to the new format. Existing payload decoding and all
+// serialized field order/bytes remain unchanged.
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct RetainedTargetIntent {
+    #[serde(deserialize_with = "deserialize_target_handle")]
+    pub(crate) handle: AuditOperationHandle,
+    pub(crate) recovery: String,
 }
 
 #[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -405,7 +412,7 @@ impl LedgerState {
                 }
                 match &entry.payload {
                     EntryPayload::Intent(_) => Some(None),
-                    EntryPayload::TargetIntent { recovery, .. } => Some(Some(recovery)),
+                    EntryPayload::TargetIntent(retained) => Some(Some(&retained.recovery)),
                     _ => None,
                 }
             });
@@ -443,10 +450,10 @@ impl LedgerState {
         }
         let handle_payload = Box::new(handle.clone());
         let payload = match recovery {
-            Some(recovery) => EntryPayload::TargetIntent {
-                handle: handle_payload,
+            Some(recovery) => EntryPayload::TargetIntent(Box::new(RetainedTargetIntent {
+                handle: *handle_payload,
                 recovery,
-            },
+            })),
             None => EntryPayload::Intent(handle_payload),
         };
         let sequence = self.append(key, payload)?;
@@ -470,7 +477,7 @@ impl LedgerState {
     fn has_target_intents(&self) -> bool {
         self.entries
             .iter()
-            .any(|entry| matches!(entry.payload, EntryPayload::TargetIntent { .. }))
+            .any(|entry| matches!(entry.payload, EntryPayload::TargetIntent(_)))
     }
 
     // The existing 16 MiB aggregate is unchanged. Reserve a conservative 32 KiB
@@ -525,10 +532,9 @@ impl LedgerState {
             .find(|entry| entry.sequence == operation.first_sequence)
             .ok_or(AuditAuthorityError::BindingMismatch)?;
         match &entry.payload {
-            EntryPayload::TargetIntent {
-                handle: retained,
-                recovery,
-            } if **retained == *handle => validate_target_recovery(key, handle, recovery),
+            EntryPayload::TargetIntent(retained) if retained.handle == *handle => {
+                validate_target_recovery(key, handle, &retained.recovery)
+            }
             _ => Err(AuditAuthorityError::BindingMismatch),
         }
     }
@@ -674,39 +680,44 @@ impl LedgerState {
                 ),
                 &entry.mac,
             )?;
-            match &entry.payload {
-                EntryPayload::Intent(handle) | EntryPayload::TargetIntent { handle, .. } => {
-                    if let EntryPayload::TargetIntent { recovery, .. } = &entry.payload {
-                        if self.continuity.is_none() {
-                            return Err(AuditAuthorityError::BindingMismatch);
-                        }
-                        validate_target_recovery(key, handle, recovery)?;
-                    }
-                    handle.verify(key, identity, handle.body.binding.caller)?;
-                    if handle.body.event.projection != self.projection
-                        || derived
-                            .iter()
-                            .any(|op| op.handle.body.binding.request == handle.body.binding.request)
-                    {
+            let intent_handle = match &entry.payload {
+                EntryPayload::Intent(handle) => Some(&**handle),
+                EntryPayload::TargetIntent(retained) => {
+                    if self.continuity.is_none() {
                         return Err(AuditAuthorityError::BindingMismatch);
                     }
-                    let intent =
-                        handle.body.event.outcome == crate::ManagementAuditOutcomeCode::Intent;
-                    derived.push(LedgerOperation {
-                        handle: (**handle).clone(),
-                        state: if intent {
-                            AuditOperationState::Intent
-                        } else {
-                            AuditOperationState::Observed {
-                                outcome: handle.body.event.outcome,
-                            }
-                        },
-                        terminal_recorded: !intent,
-                        first_sequence: sequence,
-                        last_sequence: sequence,
-                        reserved: if intent { 2 } else { 0 },
-                    });
+                    validate_target_recovery(key, &retained.handle, &retained.recovery)?;
+                    Some(&retained.handle)
                 }
+                _ => None,
+            };
+            if let Some(handle) = intent_handle {
+                handle.verify(key, identity, handle.body.binding.caller)?;
+                if handle.body.event.projection != self.projection
+                    || derived
+                        .iter()
+                        .any(|op| op.handle.body.binding.request == handle.body.binding.request)
+                {
+                    return Err(AuditAuthorityError::BindingMismatch);
+                }
+                let intent = handle.body.event.outcome == crate::ManagementAuditOutcomeCode::Intent;
+                derived.push(LedgerOperation {
+                    handle: handle.clone(),
+                    state: if intent {
+                        AuditOperationState::Intent
+                    } else {
+                        AuditOperationState::Observed {
+                            outcome: handle.body.event.outcome,
+                        }
+                    },
+                    terminal_recorded: !intent,
+                    first_sequence: sequence,
+                    last_sequence: sequence,
+                    reserved: if intent { 2 } else { 0 },
+                });
+            }
+            match &entry.payload {
+                EntryPayload::Intent(_) | EntryPayload::TargetIntent(_) => {}
                 EntryPayload::Outcome { operation, state } => {
                     let op = derived
                         .iter_mut()
@@ -782,6 +793,73 @@ impl LedgerState {
             }
         }
         Ok(())
+    }
+}
+
+// The target format has strict nested input without changing the legacy handle,
+// event, caller or authority codecs (or their authentication byte domains).
+pub(crate) fn deserialize_target_handle<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> Result<AuditOperationHandle, D::Error> {
+    strict_target_handle::Handle::deserialize(deserializer)
+}
+
+mod strict_target_handle {
+    use super::*;
+    use crate::{
+        ManagementAuditOperationCode, ManagementAuditOutcomeCode, ManagementAuditTransportCode,
+    };
+
+    #[derive(Deserialize)]
+    #[serde(remote = "AuditOperationHandle", deny_unknown_fields)]
+    pub(super) struct Handle {
+        #[serde(with = "Body")]
+        body: HandleBody,
+        mac: [u8; 32],
+    }
+
+    #[derive(Deserialize)]
+    #[serde(remote = "HandleBody", deny_unknown_fields)]
+    struct Body {
+        version: u16,
+        #[serde(with = "crate::audit_authority::target_identity")]
+        identity: ConfigConsensusIdentity,
+        #[serde(with = "Binding")]
+        binding: AuditOperationBinding,
+        #[serde(with = "Event")]
+        event: ProjectedAuditEvent,
+        issued_at: i64,
+        expires_at: i64,
+        nonce: [u8; 16],
+        key_epoch: u64,
+        mutation: Option<[u8; 32]>,
+    }
+
+    #[derive(Deserialize)]
+    #[serde(remote = "AuditOperationBinding", deny_unknown_fields)]
+    struct Binding {
+        #[serde(with = "crate::audit_authority::target_caller")]
+        caller: AuditCaller,
+        request: AuditToken,
+        operation: AuditToken,
+        base_version: u64,
+    }
+
+    #[derive(Deserialize)]
+    #[serde(remote = "ProjectedAuditEvent", deny_unknown_fields)]
+    struct Event {
+        projection: AuditToken,
+        #[serde(with = "crate::audit_authority::target_caller")]
+        caller: AuditCaller,
+        request: AuditToken,
+        transaction: Option<AuditToken>,
+        paths: AuditToken,
+        reason: Option<AuditToken>,
+        transport: ManagementAuditTransportCode,
+        operation: ManagementAuditOperationCode,
+        outcome: ManagementAuditOutcomeCode,
+        utc_seconds: i64,
+        nanosecond: u32,
     }
 }
 

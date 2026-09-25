@@ -582,13 +582,10 @@ fn retained_target_admission_rejects_tampered_truncated_and_substituted_descript
     // Recompute the outer row chain to isolate validation of the original
     // handle/effect binding, rather than relying only on an enclosing MAC.
     let mut forged = ledger.clone();
-    let EntryPayload::TargetIntent {
-        recovery: retained, ..
-    } = &mut forged.entries[0].payload
-    else {
+    let EntryPayload::TargetIntent(retained) = &mut forged.entries[0].payload else {
         panic!("missing target intent");
     };
-    *retained = changed;
+    retained.recovery = changed;
     let entry = &mut forged.entries[0];
     entry.mac = authenticate(
         &key,
@@ -734,6 +731,79 @@ fn retained_target_admission_rejects_unknown_stored_intent_fields() {
         super::read_with_keys_sync(&conn, &key, Some(&keys), identity).is_err(),
         "unknown retained intent field bypassed authentication"
     );
+    conn.execute(
+        "UPDATE config_raft_management_audit SET state_json=?1 WHERE singleton=1",
+        [original],
+    )
+    .unwrap();
+    super::read_with_keys_sync(&conn, &key, Some(&keys), identity)
+        .unwrap()
+        .unwrap();
+}
+
+#[test]
+fn retained_target_admission_rejects_unknown_nested_handle_fields() {
+    let prepared = signed_discard();
+    let key = AuditKey::new([0x24; 32]).unwrap();
+    let identity = prepared.handle.body.identity;
+    let (_root, conn, keys) = retained_target_fixture();
+    super::apply_sync(
+        &conn,
+        &key,
+        identity,
+        &target_admission_command(&prepared),
+        100,
+        Some(&keys),
+    )
+    .unwrap()
+    .unwrap();
+    let original: Vec<u8> = conn
+        .query_row(
+            "SELECT state_json FROM config_raft_management_audit WHERE singleton=1",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    for path in [
+        "/handle",
+        "/handle/body",
+        "/handle/body/identity",
+        "/handle/body/binding",
+        "/handle/body/binding/caller",
+        "/handle/body/event",
+        "/handle/body/event/caller",
+    ] {
+        let mut recovery = serde_json::to_value(&prepared).unwrap();
+        recovery
+            .pointer_mut(path)
+            .unwrap()
+            .as_object_mut()
+            .unwrap()
+            .insert("unknown".into(), json!(0));
+        assert!(
+            crate::consensus::audit_mutation::PreparedTargetMutation::decode(
+                &serde_json::to_vec(&recovery).unwrap()
+            )
+            .is_err(),
+            "unknown target recovery handle field admitted"
+        );
+        let mut stored: Value = serde_json::from_slice(&original).unwrap();
+        let root = &mut stored["ledger"]["entries"][0]["payload"]["target-intent"];
+        root.pointer_mut(path)
+            .unwrap()
+            .as_object_mut()
+            .unwrap()
+            .insert("unknown".into(), json!(0));
+        conn.execute(
+            "UPDATE config_raft_management_audit SET state_json=?1 WHERE singleton=1",
+            [serde_json::to_vec(&stored).unwrap()],
+        )
+        .unwrap();
+        assert!(
+            super::read_with_keys_sync(&conn, &key, Some(&keys), identity).is_err(),
+            "unknown stored target handle field admitted"
+        );
+    }
     conn.execute(
         "UPDATE config_raft_management_audit SET state_json=?1 WHERE singleton=1",
         [original],

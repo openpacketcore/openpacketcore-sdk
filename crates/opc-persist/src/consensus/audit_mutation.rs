@@ -520,6 +520,7 @@ impl TargetEncryptedBlobV1 {
 #[derive(Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct PreparedTargetMutation {
+    #[serde(deserialize_with = "crate::audit_authority::ledger::deserialize_target_handle")]
     pub(crate) handle: AuditOperationHandle,
     pub(crate) effect: TargetEffectV1,
 }
