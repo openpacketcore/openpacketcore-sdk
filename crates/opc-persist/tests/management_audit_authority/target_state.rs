@@ -528,14 +528,18 @@ async fn target_state_requires_original_checkpoint_and_retains_rejections_and_te
     fixture.apply(&conn, apply(), 100).unwrap();
     let discard = fixture.request(&conn, 2, 5, 0x61, 1);
     let active = target_rows(&conn);
-    fixture
-        .apply(
-            &conn,
-            AuditCommand::NetconfTarget(Box::new(TargetAuditCommandV1::Admit(discard.clone()))),
-            100,
-        )
-        .unwrap();
-    fixture.checkpoint(&conn);
+    let owed = serde_json::to_vec(&fixture.ledger(&conn)).unwrap();
+    assert!(
+        fixture
+            .apply(
+                &conn,
+                AuditCommand::NetconfTarget(Box::new(TargetAuditCommandV1::Admit(discard.clone()))),
+                100,
+            )
+            .is_err(),
+        "terminal debt admitted a later target intent"
+    );
+    assert_eq!(serde_json::to_vec(&fixture.ledger(&conn)).unwrap(), owed);
     assert!(fixture
         .apply(
             &conn,
@@ -549,6 +553,14 @@ async fn target_state_requires_original_checkpoint_and_retains_rejections_and_te
         "terminal debt allowed a target effect"
     );
     fixture.settle(&conn, &activation);
+    fixture
+        .apply(
+            &conn,
+            AuditCommand::NetconfTarget(Box::new(TargetAuditCommandV1::Admit(discard.clone()))),
+            100,
+        )
+        .unwrap();
+    fixture.checkpoint(&conn);
     fixture
         .apply(
             &conn,
