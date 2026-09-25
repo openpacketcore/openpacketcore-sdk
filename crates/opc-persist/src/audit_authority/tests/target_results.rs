@@ -10,7 +10,7 @@ use crate::audit_authority::receipt::AuthenticatedAuditReceipt;
 fn target_handle(nonce: u8) -> AuditOperationHandle {
     let mut body = handle(nonce).body;
     body.mutation = Some([0x53; 32]);
-    body.event.transport = ManagementAuditTransportCode::Netconf;
+    body.event.transport = ManagementAuditTransportCode::NetconfTls;
     body.event.request = AuditToken::from_keyed_projection([nonce; 32]).unwrap();
     body.binding.request = body.event.request;
     AuditOperationHandle::issue(body, &key()).unwrap()
@@ -72,53 +72,60 @@ fn new_ledger() -> LedgerState {
 
 #[test]
 fn target_results_retain_exact_outcome_and_reserved_terminal_through_encoding() {
-    for outcome in outcomes() {
-        let mut ledger = new_ledger();
-        let handle = target_handle(71);
-        ledger.admit(&key(), &handle, 110).unwrap();
-        ledger.resolve(&key(), &handle, state(outcome)).unwrap();
-        assert_eq!(ledger.sequence, 2);
-        assert_eq!(ledger.operations[0].reserved, 1);
-        let recovered: LedgerState =
-            serde_json::from_slice(&serde_json::to_vec(&ledger).unwrap()).unwrap();
-        recovered.validate(&key(), identity()).unwrap();
-        let receipt = recovered
-            .lookup(&key(), &handle, handle.body.binding.caller)
-            .unwrap()
-            .unwrap();
-        assert_eq!(receipt.state(), state(outcome));
-        assert!(!receipt.terminal_recorded());
-        let proof = AuthenticatedAuditReceipt::seal(&key(), &receipt).unwrap();
-        assert_eq!(
-            proof
-                .read_back(&key(), identity(), &handle, handle.body.binding.caller)
-                .unwrap(),
-            receipt
-        );
-        assert_eq!(
-            ledger.resolve(&key(), &handle, AuditOperationState::Rejected),
-            Err(AuditAuthorityError::BindingMismatch)
-        );
-        ledger.resolve(&key(), &handle, state(outcome)).unwrap();
-        ledger.acknowledge_terminal(&key(), &handle).unwrap();
-        ledger.acknowledge_terminal(&key(), &handle).unwrap();
-        assert_eq!(ledger.sequence, 3);
-        assert_eq!(ledger.operations[0].reserved, 0);
-        ledger.validate(&key(), identity()).unwrap();
-        assert_eq!(
-            ledger
+    for transport in [
+        ManagementAuditTransportCode::NetconfSsh,
+        ManagementAuditTransportCode::NetconfTls,
+    ] {
+        for outcome in outcomes() {
+            let mut ledger = new_ledger();
+            let mut handle = target_handle(71);
+            handle.body.event.transport = transport;
+            let handle = AuditOperationHandle::issue(handle.body, &key()).unwrap();
+            ledger.admit(&key(), &handle, 110).unwrap();
+            ledger.resolve(&key(), &handle, state(outcome)).unwrap();
+            assert_eq!(ledger.sequence, 2);
+            assert_eq!(ledger.operations[0].reserved, 1);
+            let recovered: LedgerState =
+                serde_json::from_slice(&serde_json::to_vec(&ledger).unwrap()).unwrap();
+            recovered.validate(&key(), identity()).unwrap();
+            let receipt = recovered
                 .lookup(&key(), &handle, handle.body.binding.caller)
                 .unwrap()
-                .unwrap()
-                .state(),
-            state(outcome)
-        );
+                .unwrap();
+            assert_eq!(receipt.state(), state(outcome));
+            assert!(!receipt.terminal_recorded());
+            let proof = AuthenticatedAuditReceipt::seal(&key(), &receipt).unwrap();
+            assert_eq!(
+                proof
+                    .read_back(&key(), identity(), &handle, handle.body.binding.caller)
+                    .unwrap(),
+                receipt
+            );
+            assert_eq!(
+                ledger.resolve(&key(), &handle, AuditOperationState::Rejected),
+                Err(AuditAuthorityError::BindingMismatch)
+            );
+            ledger.resolve(&key(), &handle, state(outcome)).unwrap();
+            ledger.acknowledge_terminal(&key(), &handle).unwrap();
+            ledger.acknowledge_terminal(&key(), &handle).unwrap();
+            assert_eq!(ledger.sequence, 3);
+            assert_eq!(ledger.operations[0].reserved, 0);
+            ledger.validate(&key(), identity()).unwrap();
+            assert_eq!(
+                ledger
+                    .lookup(&key(), &handle, handle.body.binding.caller)
+                    .unwrap()
+                    .unwrap()
+                    .state(),
+                state(outcome)
+            );
+        }
     }
 }
 
 #[test]
 fn target_results_require_netconf_mutation_and_matching_authority() {
-    for kind in 0..3 {
+    for kind in 0..5 {
         let mut ledger = new_ledger();
         let mut handle = target_handle(72);
         let mut result = state(outcomes()[0]);
@@ -146,6 +153,8 @@ fn target_results_require_netconf_mutation_and_matching_authority() {
                     .unwrap(),
                 );
             }
+            3 => handle.body.event.transport = ManagementAuditTransportCode::RestconfHttps,
+            4 => handle.body.event.transport = ManagementAuditTransportCode::Internal,
             _ => unreachable!(),
         }
         handle = AuditOperationHandle::issue(handle.body, &key()).unwrap();
@@ -186,16 +195,20 @@ fn target_receipt_authenticates_profile_state_digest_and_disjoint_result() {
                 result[field][0] = serde_json::json!(0x58);
             }
             let tampered: AuthenticatedAuditReceipt = serde_json::from_value(value).unwrap();
-            assert!(tampered
-                .read_back(&key(), identity(), &handle, handle.body.binding.caller)
-                .is_err());
+            assert!(
+                tampered
+                    .read_back(&key(), identity(), &handle, handle.body.binding.caller)
+                    .is_err()
+            );
         }
         let mut value = serde_json::to_value(&proof).unwrap();
         value["body"]["state"] = serde_json::json!({"committed": {"version": 8}});
         let tampered: AuthenticatedAuditReceipt = serde_json::from_value(value).unwrap();
-        assert!(tampered
-            .read_back(&key(), identity(), &handle, handle.body.binding.caller)
-            .is_err());
+        assert!(
+            tampered
+                .read_back(&key(), identity(), &handle, handle.body.binding.caller)
+                .is_err()
+        );
     }
 }
 

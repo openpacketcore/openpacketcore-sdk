@@ -407,7 +407,11 @@ impl NetconfTargetResult {
     ) -> Result<(), AuditAuthorityError> {
         if self.authority != handle.body.identity
             || handle.body.mutation.is_none()
-            || handle.body.event.transport != crate::ManagementAuditTransportCode::Netconf
+            || !matches!(
+                handle.body.event.transport,
+                crate::ManagementAuditTransportCode::NetconfSsh
+                    | crate::ManagementAuditTransportCode::NetconfTls
+            )
             || handle.body.event.outcome != crate::ManagementAuditOutcomeCode::Intent
         {
             return Err(AuditAuthorityError::BindingMismatch);
