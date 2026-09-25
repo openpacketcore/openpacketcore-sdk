@@ -3542,6 +3542,19 @@ pub(crate) fn build_snapshot_database_sync(
     )
 }
 
+#[cfg(test)]
+type SnapshotFrontierHook = Box<dyn FnOnce()>;
+
+#[cfg(test)]
+thread_local! {
+    static SNAPSHOT_AFTER_FRONTIER: std::cell::RefCell<Option<SnapshotFrontierHook>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+#[cfg(test)]
+#[path = "../../tests/management_audit_authority/snapshot_pin.rs"]
+mod snapshot_pin_tests;
+
 pub(crate) fn build_snapshot_database_cancellable_sync(
     conn: &Connection,
     identity: ConsensusIdentity,
@@ -3555,6 +3568,10 @@ pub(crate) fn build_snapshot_database_cancellable_sync(
     let applied = read_applied_sync(conn, identity)?;
     let membership = read_membership_sync(conn, identity, expected_members)?;
     validate_fixed_membership(&membership, expected_members)?;
+    #[cfg(test)]
+    if let Some(hook) = SNAPSHOT_AFTER_FRONTIER.with(|hook| hook.borrow_mut().take()) {
+        hook();
+    }
     let mut destination = Connection::open(path).map_err(db_error)?;
     let progress_cancellation = cancellation.clone();
     destination
