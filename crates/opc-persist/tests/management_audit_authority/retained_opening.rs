@@ -544,3 +544,55 @@ async fn legacy_selection_cannot_open_target_profile_storage() {
             .unwrap(),
     );
 }
+
+#[tokio::test]
+async fn target_profile_rejects_an_internal_named_index_with_valid_sqlite_integrity() {
+    let fixture = &fixtures()[0];
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("targets.sqlite");
+    let options = options_for_profile(
+        &path,
+        fixture,
+        0x41,
+        RetainedConfigProfile::NetconfTargetsV1,
+    );
+    drop(
+        SqliteBackend::provision_config_authority(options.clone(), key(fixture))
+            .await
+            .unwrap(),
+    );
+    let conn = rusqlite::Connection::open(&path).unwrap();
+    conn.execute_batch(
+        "CREATE INDEX extra ON config_netconf_targets(state_json); \
+         PRAGMA writable_schema=ON; \
+         UPDATE sqlite_schema SET name='sqlite_autoindex_config_netconf_targets_1', \
+         sql='CREATE INDEX sqlite_autoindex_config_netconf_targets_1 ON config_netconf_targets(state_json)' \
+         WHERE name='extra'; \
+         PRAGMA writable_schema=OFF;",
+    ).unwrap();
+    drop(conn);
+    // This is valid SQLite, not an earlier malformed-schema refusal. Its
+    // executable catalog still differs from the SDK's exact three tables.
+    let check = rusqlite::Connection::open(&path).unwrap();
+    let integrity: String = check
+        .query_row("PRAGMA integrity_check", [], |row| row.get(0))
+        .unwrap();
+    assert_eq!(integrity, "ok");
+    let count: u64 = check.query_row(
+        "SELECT COUNT(*) FROM sqlite_schema WHERE name='sqlite_autoindex_config_netconf_targets_1' AND type='index'",
+        [], |row| row.get(0),
+    ).unwrap();
+    assert_eq!(count, 1);
+    drop(check);
+    let before = directory_bytes(dir.path());
+    let result = SqliteBackend::reopen_config_authority(options, key(fixture)).await;
+    assert!(
+        matches!(result, Err(RetainedConfigError::Rejected)),
+        "unrecognized internal-named index was admitted"
+    );
+    assert_eq!(
+        directory_bytes(dir.path()),
+        before,
+        "rejection changed retained files"
+    );
+}
