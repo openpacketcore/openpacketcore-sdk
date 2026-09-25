@@ -4529,3 +4529,81 @@ async fn target_provider_lifecycle_recovers_admitted_copy_without_repeating_prov
         1
     );
 }
+
+#[tokio::test]
+async fn target_provider_copy_preparation_accepts_exact_protocol_replace_operation() {
+    use crate::audit_authority::NetconfLockDatastore;
+    use crate::consensus::audit_mutation::TargetPayloadV1;
+    let fixture = Fixture::new().await;
+    let shared = fixture.backend.conn();
+    let conn = shared.lock().await;
+    fixture.active(&conn);
+    let config = br#"{"enabled":true}"#;
+    let (provider, _) = copy_provider_stage(&fixture, &conn, 0, config).await;
+    let original = copy_provider_destination(&fixture, &conn, &provider, 0, 181, config).await;
+    let Some(TargetPayloadV1::Running { commit, .. }) = original.effect.encrypted_payload else {
+        panic!("protocol copy fixture");
+    };
+    let tx = conn.unchecked_transaction().unwrap();
+    let view = crate::consensus::audit_targets::read_copy_view_sync(
+        &tx,
+        &fixture.key,
+        &fixture.ledger(&tx),
+        NetconfLockDatastore::Candidate,
+        &crate::consensus::sqlite::SqliteWorkCancellation::audit_test(),
+    )
+    .unwrap()
+    .unwrap();
+    tx.commit().unwrap();
+    let worker = std::sync::Arc::new(());
+    let session = fixture.session_owner(&conn, &worker, 0x61);
+    // NETCONF's copy-config handler uses Replace for its required Intent and
+    // both terminal paths. Preserve that operation through SDK preparation.
+    let mut protocol = fixture.event(181);
+    protocol.operation = ManagementAuditOperationCode::Replace;
+    let before = target_rows(&conn);
+    let candidate_before = row(&conn, "config_netconf_targets", "target", 0);
+    let sequence = fixture.ledger(&conn).sequence;
+    let effect = view.prepare(&session, &protocol, (*commit).clone(), 160);
+    assert_eq!(target_rows(&conn), before);
+    assert_eq!(fixture.ledger(&conn).sequence, sequence);
+    let mut effect = effect.expect("NETCONF Replace intent refused by copy preparation");
+    for wrong in [
+        ManagementAuditOperationCode::Exec,
+        ManagementAuditOperationCode::Read,
+        ManagementAuditOperationCode::Update,
+        ManagementAuditOperationCode::Delete,
+    ] {
+        let mut event = protocol.clone();
+        event.operation = wrong;
+        assert!(
+            matches!(
+                view.prepare(&session, &event, (*commit).clone(), 160),
+                Err(AuditAuthorityError::BindingMismatch)
+            ),
+            "copy preparation accepted another protocol operation"
+        );
+    }
+    let mut internal = protocol.clone();
+    internal.transport = ManagementAuditTransportCode::Internal;
+    assert!(view.prepare(&session, &internal, *commit, 160).is_err());
+    effect
+        .bind_provider_copy(&provider, &view.blob)
+        .await
+        .unwrap();
+    let prepared = fixture.rebind_at(&conn, fixture.prepare(effect, protocol), 100);
+    assert_eq!(
+        prepared.handle.body.event.operation,
+        ManagementAuditOperationCode::Replace
+    );
+    assert!(
+        matches!(fixture.submit(&conn, &prepared), AuditOperationState::TargetV1(r)
+        if matches!(r.outcome(), NetconfAppliedOutcome::CopiedRunning { running_version: 1 }))
+    );
+    assert_eq!(
+        row(&conn, "config_netconf_targets", "target", 0),
+        candidate_before
+    );
+    fixture.settle(&conn, &prepared);
+    provider_assert_history(&conn, &provider, 1, 181, config).await;
+}
