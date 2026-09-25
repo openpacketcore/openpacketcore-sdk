@@ -21,9 +21,14 @@ pub use crate::consensus::PreparedAuditedMutation;
 pub mod continuity;
 pub(crate) mod ledger;
 pub(crate) mod receipt;
+mod targets;
 pub use ledger::{
     AuditAdmission, AuditLedgerLimits, AuditOperationHandle, AuditOperationReceipt,
     AuditOperationState,
+};
+pub use targets::{
+    CandidateGeneration, NetconfAppliedOutcome, NetconfIncarnation, NetconfPendingConfirmation,
+    NetconfTargetResult, StartupRevision,
 };
 
 /// Largest aggregate private tuple accepted before projection.

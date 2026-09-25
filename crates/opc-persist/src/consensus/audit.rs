@@ -344,9 +344,18 @@ pub(crate) fn protects_config_prefix(
     retain_from: u64,
 ) -> io::Result<bool> {
     let stored = read_verified_sync(conn, key)?;
-    Ok(stored.ledger.is_some_and(|ledger| ledger.operations.iter().any(|op| {
-        if op.terminal_recorded { return false; }
-        let base = op.handle.body.binding.base_version;
-        (base > 0 && base < retain_from) || matches!(op.state, AuditOperationState::Committed { version } if version < retain_from)
-    })))
+    Ok(stored.ledger.is_some_and(|ledger| {
+        ledger.operations.iter().any(|op| {
+            if op.terminal_recorded {
+                return false;
+            }
+            let base = op.handle.body.binding.base_version;
+            let running = match op.state {
+                AuditOperationState::Committed { version } => Some(version),
+                AuditOperationState::TargetV1(result) => result.outcome().running_version(),
+                _ => None,
+            };
+            (base > 0 && base < retain_from) || running.is_some_and(|version| version < retain_from)
+        })
+    }))
 }

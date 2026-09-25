@@ -2856,9 +2856,9 @@ fn apply_audited_mutation_sync(
     };
     match receipt.state() {
         AuditOperationState::Committed { .. } => return Ok(Ok(())),
-        AuditOperationState::Rejected | AuditOperationState::Observed { .. } => {
-            return Ok(Err(ConfigMutationFailure::Conflict))
-        }
+        AuditOperationState::Rejected
+        | AuditOperationState::Observed { .. }
+        | AuditOperationState::TargetV1(_) => return Ok(Err(ConfigMutationFailure::Conflict)),
         AuditOperationState::Intent => {}
     }
     if let Some(chain) = &ledger.continuity {

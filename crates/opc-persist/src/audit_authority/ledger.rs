@@ -160,6 +160,21 @@ pub enum AuditOperationState {
         /// Source outcome, independent of configuration authority.
         outcome: crate::ManagementAuditOutcomeCode,
     },
+    /// Retained target/lifecycle effect with its complete resulting state anchor.
+    /// This is disjoint from a running-only committed revision.
+    TargetV1(super::NetconfTargetResult),
+}
+
+impl AuditOperationState {
+    pub(crate) fn validate_target_for(
+        self,
+        handle: &AuditOperationHandle,
+    ) -> Result<(), AuditAuthorityError> {
+        if let Self::TargetV1(result) = self {
+            result.validate_for(handle)?;
+        }
+        Ok(())
+    }
 }
 
 /// Authenticated operation result from a quorum-applied response or quorum read.
@@ -406,6 +421,7 @@ impl LedgerState {
         state: AuditOperationState,
     ) -> Result<(), AuditAuthorityError> {
         let index = self.operation_index(key, handle)?;
+        state.validate_target_for(handle)?;
         let current = &self.operations[index];
         if current.state == state {
             return Ok(());
@@ -558,11 +574,14 @@ impl LedgerState {
                     if op.state != AuditOperationState::Intent
                         || !matches!(
                             state,
-                            AuditOperationState::Committed { .. } | AuditOperationState::Rejected
+                            AuditOperationState::Committed { .. }
+                                | AuditOperationState::Rejected
+                                | AuditOperationState::TargetV1(_)
                         )
                     {
                         return Err(AuditAuthorityError::BindingMismatch);
                     }
+                    state.validate_target_for(&op.handle)?;
                     op.state = *state;
                     op.last_sequence = sequence;
                     op.reserved = 1;

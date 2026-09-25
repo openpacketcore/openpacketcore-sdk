@@ -42,6 +42,7 @@ impl AuthenticatedAuditReceipt {
         key: &AuditKey,
         receipt: &AuditOperationReceipt,
     ) -> Result<Self, AuditAuthorityError> {
+        receipt.state.validate_target_for(&receipt.handle)?;
         let body = ReceiptBody {
             identity: receipt.handle.body.identity,
             operation: receipt.handle.mac,
@@ -68,6 +69,7 @@ impl AuthenticatedAuditReceipt {
             return Err(AuditAuthorityError::BindingMismatch);
         }
         verify(key, RECEIPT_DOMAIN, &self.body, &self.mac)?;
+        self.body.state.validate_target_for(handle)?;
         Ok(AuditOperationReceipt {
             handle: handle.clone(),
             state: self.body.state,
