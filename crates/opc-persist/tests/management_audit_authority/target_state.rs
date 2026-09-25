@@ -10350,3 +10350,213 @@ async fn target_recovery_opening_preserves_concurrent_claims_and_refuses_delayed
     assert_eq!(target_rows(&conn), before);
     assert_eq!(fixture.submit_at(&conn, &original, 3600), result);
 }
+
+#[tokio::test]
+async fn target_recovery_pending_read_cannot_replace_a_later_original() {
+    use crate::audit_authority::{
+        NetconfLockDatastore, NetconfRollback, NetconfRollbackCause, NetconfTargetReplacement,
+        NetconfTentativePromotion,
+    };
+    let fixture = Fixture::new().await;
+    let shared = fixture.backend.conn();
+    let conn = shared.lock().await;
+    let (provider, worker, owner, first, original) =
+        prepared_rollback_source(&fixture, &conn, true, NetconfRollbackCause::Timeout).await;
+    // Keep an authentic old view, as if its read/checkpoint verification had
+    // completed before another thread advanced the retained lifecycle.
+    let delayed = first.view().clone();
+    let first_result = fixture.submit_at(&conn, &original, original.handle.body.issued_at);
+    assert!(matches!(first_result, AuditOperationState::TargetV1(_)));
+    fixture.settle(&conn, &original);
+    fixture.assert_no_pending(&conn);
+
+    let now = original.handle.body.issued_at + 1;
+    let tenant = opc_types::TenantId::from_static("fixture-tenant");
+    let session = fixture.session_owner(&conn, &worker, 0x61);
+    let staged_read = fixture
+        .frozen_target(&conn, &session, NetconfLockDatastore::Candidate)
+        .unwrap();
+    let mut stage_event = fixture.event(246);
+    stage_event.operation = ManagementAuditOperationCode::Update;
+    let plaintext = copy_plaintext(246, br#"{"retained":1}"#);
+    let effect = staged_read
+        .prepare_replacement(
+            &session,
+            NetconfTargetReplacement::edit(
+                &staged_read,
+                &plaintext,
+                staged_read.schema().unwrap(),
+                &provider,
+            ),
+            tenant.clone(),
+            &stage_event,
+            now + 60,
+        )
+        .await
+        .unwrap();
+    // Issue at the actual unchanged 60-second window; changing an encrypted
+    // target's expiry afterwards would invalidate its authenticated AAD.
+    let bind = |effect: TargetEffectV1, event: ProjectedAuditEvent, base: u64, issued_at: i64| {
+        let digest = effect.digest(&fixture.key).unwrap();
+        let binding =
+            AuditOperationBinding::project(&fixture.privacy, &event, base, &digest).unwrap();
+        let handle = AuditOperationHandle::issue(
+            HandleBody {
+                version: 1,
+                identity: fixture.identity,
+                binding,
+                event,
+                issued_at,
+                expires_at: effect.expires_at,
+                nonce: [0x5a; 16],
+                key_epoch: fixture.key.epoch(),
+                mutation: Some(digest),
+            },
+            &fixture.key,
+        )
+        .unwrap();
+        PreparedTargetMutation { handle, effect }
+    };
+    let stage = bind(effect, stage_event, staged_read.running_base_version(), now);
+    assert!(matches!(
+        fixture.submit_at(&conn, &stage, now),
+        AuditOperationState::TargetV1(_)
+    ));
+    fixture.settle(&conn, &stage);
+    let promotion = fixture.frozen_promotion(&conn, &session).unwrap();
+    let deadline = now + 120;
+    let deadline_timestamp = opc_types::Timestamp::from_offset_datetime(
+        time::OffsetDateTime::from_unix_timestamp(deadline).unwrap(),
+    );
+    let commit =
+        confirmed_sdk_envelope(&conn, &promotion, &provider, 247, Some(deadline_timestamp)).await;
+    let event = fixture.event(247);
+    let effect = promotion
+        .prepare_tentative(
+            &session,
+            NetconfTentativePromotion::new(
+                &promotion,
+                commit,
+                &provider,
+                Some("synthetic-next-credential"),
+            ),
+            &tenant,
+            &event,
+            now..now + 60,
+            &fixture.key,
+        )
+        .await
+        .unwrap();
+    let tentative = bind(
+        effect,
+        event,
+        promotion.candidate().running_base_version(),
+        now,
+    );
+    assert!(
+        matches!(fixture.submit_at(&conn, &tentative, now), AuditOperationState::TargetV1(result)
+        if matches!(result.outcome(), NetconfAppliedOutcome::Tentative { running_version: 4, .. }))
+    );
+    fixture.settle(&conn, &tentative);
+    let current = fixture
+        .frozen_rollback(&conn, &owner, deadline)
+        .unwrap()
+        .unwrap();
+    assert_ne!(current.pending(), first.pending());
+    assert!(current.running_version() > first.running_version());
+    let event = current
+        .project_event(&fixture.privacy, fixture.device_event(248))
+        .unwrap();
+    let commit = internal_rollback_envelope(&current, &provider, 248, "valid").await;
+    let effect = current
+        .prepare_rollback(
+            &owner,
+            NetconfRollback::new(&current, commit, &provider),
+            &tenant,
+            &event,
+            deadline..deadline + 60,
+            &fixture.key,
+        )
+        .await
+        .unwrap();
+    let next = current
+        .retain(
+            &owner,
+            fixture.bind_rollback(&current, effect, event, deadline),
+        )
+        .unwrap();
+    fixture
+        .apply(
+            &conn,
+            AuditCommand::NetconfTarget(Box::new(TargetAuditCommandV1::Admit(next.clone()))),
+            deadline,
+        )
+        .unwrap();
+    fixture.checkpoint(&conn);
+    assert_eq!(
+        fixture
+            .ledger(&conn)
+            .lookup(&fixture.key, next.handle(), current.original_caller())
+            .unwrap()
+            .unwrap()
+            .state(),
+        AuditOperationState::Intent
+    );
+    let before = (
+        target_rows(&conn),
+        fixture.ledger(&conn).sequence,
+        conn.total_changes(),
+    );
+    assert!(
+        matches!(
+            owner.remember(delayed),
+            Err(AuditAuthorityError::RollbackDetected)
+        ),
+        "delayed pending read replaced a later possibly transmitted original"
+    );
+    assert_eq!(
+        owner
+            .remember(current.view().clone())
+            .unwrap()
+            .original()
+            .unwrap(),
+        Some(next.clone())
+    );
+    // A different pending identity at the same running revision cannot be a
+    // valid forward lifecycle transition, even with otherwise equal fields.
+    let mut same_revision = current.view().clone();
+    same_revision.pending = first.pending();
+    assert!(
+        matches!(
+            owner.remember(same_revision),
+            Err(AuditAuthorityError::RollbackDetected)
+        ),
+        "same-revision pending substitution replaced the selected original"
+    );
+    assert_eq!(
+        owner
+            .remember(current.view().clone())
+            .unwrap()
+            .original()
+            .unwrap(),
+        Some(next)
+    );
+    assert_eq!(
+        (
+            target_rows(&conn),
+            fixture.ledger(&conn).sequence,
+            conn.total_changes()
+        ),
+        before
+    );
+    assert_eq!(first.original().unwrap(), Some(original.clone()));
+    assert_eq!(
+        fixture
+            .ledger(&conn)
+            .lookup(&fixture.key, original.handle(), first.original_caller())
+            .unwrap()
+            .unwrap()
+            .state(),
+        first_result
+    );
+}
