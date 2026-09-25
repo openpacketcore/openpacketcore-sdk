@@ -290,3 +290,115 @@ fn target_nested_identity_and_caller_fields_are_closed() {
         prepared
     );
 }
+
+fn retained_target_fixture() -> (
+    tempfile::TempDir,
+    rusqlite::Connection,
+    crate::audit_authority::continuity::AuditKeyRing,
+) {
+    use crate::audit_authority::continuity::{AuditKeyRing, AuditSigningKey};
+    let root = tempfile::tempdir().unwrap();
+    let conn = rusqlite::Connection::open(root.path().join("authority.db")).unwrap();
+    let prepared = signed_discard();
+    let identity = prepared.handle.body.identity;
+    let key = AuditKey::new([0x24; 32]).unwrap();
+    conn.execute_batch("CREATE TABLE config_raft_identity (singleton INTEGER PRIMARY KEY, cluster_id BLOB, configuration_id BLOB, configuration_epoch INTEGER); CREATE TABLE config_raft_management_audit (singleton INTEGER PRIMARY KEY, state_json BLOB, state_hmac BLOB);").unwrap();
+    conn.execute(
+        "INSERT INTO config_raft_identity VALUES (1,?1,?2,?3)",
+        rusqlite::params![
+            identity.cluster_id().as_bytes().as_slice(),
+            identity.configuration_id().as_bytes().as_slice(),
+            identity.configuration_epoch().get() as i64
+        ],
+    )
+    .unwrap();
+    super::initialize_sync(&conn, &key, identity).unwrap();
+    crate::consensus::audit_targets::initialize_inactive_sync(&conn, &key, identity).unwrap();
+    let keys = AuditKeyRing::new(vec![AuditSigningKey::new(1, [0x61; 32]).unwrap()]).unwrap();
+    super::apply_sync(
+        &conn,
+        &key,
+        identity,
+        &AuditCommand::InitializeWithContinuity {
+            projection: prepared.handle.body.event.projection,
+            limits: crate::audit_authority::AuditLedgerLimits::new(12, 4).unwrap(),
+            initial_epoch: 1,
+        },
+        100,
+        Some(&keys),
+    )
+    .unwrap()
+    .unwrap();
+    (root, conn, keys)
+}
+
+fn target_admission_command(
+    prepared: &crate::consensus::audit_mutation::PreparedTargetMutation,
+) -> AuditCommand {
+    let parsed = serde_json::from_value(json!({"netconf-target": {"admit": prepared}}));
+    assert!(
+        parsed.is_ok(),
+        "retained target admission phase is unavailable"
+    );
+    parsed.unwrap()
+}
+
+#[test]
+fn retained_target_admission_preserves_the_exact_closed_description_after_reopen() {
+    use crate::audit_authority::AuditOperationState;
+    let prepared = signed_discard();
+    let key = AuditKey::new([0x24; 32]).unwrap();
+    let identity = prepared.handle.body.identity;
+    let (root, conn, keys) = retained_target_fixture();
+    let command = target_admission_command(&prepared);
+    super::apply_sync(&conn, &key, identity, &command, 100, Some(&keys))
+        .unwrap()
+        .unwrap();
+    let retained = super::read_with_keys_sync(&conn, &key, Some(&keys), identity)
+        .unwrap()
+        .unwrap();
+    assert_eq!(retained.sequence, 1);
+    let receipt = retained
+        .lookup(&key, prepared.handle(), prepared.handle.body.binding.caller)
+        .unwrap()
+        .unwrap();
+    assert_eq!(receipt.state(), AuditOperationState::Intent);
+    assert!(!receipt.terminal_recorded());
+    let encoded = serde_json::to_value(&retained).unwrap();
+    let exact = String::from_utf8(prepared.encode().unwrap()).unwrap();
+    assert_eq!(
+        encoded["entries"][0]["payload"]["target-intent"]["recovery"],
+        exact
+    );
+    assert_eq!(
+        encoded["entries"][0]["payload"]["target-intent"]["handle"],
+        serde_json::to_value(prepared.handle()).unwrap()
+    );
+    drop(conn);
+    let reopened = rusqlite::Connection::open(root.path().join("authority.db")).unwrap();
+    let restored = super::read_with_keys_sync(&reopened, &key, Some(&keys), identity)
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        serde_json::to_vec(&restored).unwrap(),
+        serde_json::to_vec(&retained).unwrap()
+    );
+    // Recovery of an already-admitted request is allowed after its original
+    // expiry; this does not permit application of an expired effect.
+    super::apply_sync(&reopened, &key, identity, &command, 200, Some(&keys))
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        serde_json::to_value(
+            super::read_with_keys_sync(&reopened, &key, Some(&keys), identity)
+                .unwrap()
+                .unwrap()
+        )
+        .unwrap(),
+        encoded
+    );
+    let raw = prepared.encode().unwrap();
+    let recovered = crate::consensus::audit_mutation::PreparedTargetMutation::decode(&raw).unwrap();
+    assert_eq!(recovered.handle(), prepared.handle());
+    recovered.verify_effect(&key).unwrap();
+}
