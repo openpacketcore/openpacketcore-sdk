@@ -2520,3 +2520,225 @@ async fn target_sdk_preflight_preserves_original_receipts_and_fences_unresolved_
         Err(AuditAuthorityError::BindingMismatch)
     );
 }
+
+impl Fixture {
+    fn device_view(&self, conn: &Connection) -> crate::consensus::audit_targets::NetconfDeviceView {
+        let tx = conn.unchecked_transaction().unwrap();
+        let view = crate::consensus::audit_targets::read_device_view_sync(
+            &tx,
+            &self.key,
+            &self.ledger(&tx),
+            &crate::consensus::sqlite::SqliteWorkCancellation::audit_test(),
+        )
+        .unwrap();
+        tx.commit().unwrap();
+        view
+    }
+
+    fn device_event(&self, request: u8) -> ProjectedAuditEvent {
+        let event = ManagementAuditEventRecord::try_new(
+            [request; 16],
+            ManagementAuditInstant::try_new(100, 0, 1, ManagementAuditTimeSourceCode::NodeClock)
+                .unwrap(),
+            "fixture-tenant",
+            "fixture-principal",
+            ManagementAuditTransportCode::Internal,
+            ManagementAuditOperationCode::Exec,
+            ManagementAuditOutcomeCode::Intent,
+            None::<&str>,
+            ["/fixture:lifecycle"],
+            None::<&str>,
+        )
+        .unwrap();
+        ProjectedAuditEvent::project(&self.privacy, &event).unwrap()
+    }
+}
+
+#[tokio::test]
+async fn target_device_preparation_binds_activation_then_exact_previous_device() {
+    use crate::audit_authority::{NetconfDeviceOwner, NetconfWorkerBinding, PreparedNetconfDevice};
+    let fixture = Fixture::new().await;
+    let shared = fixture.backend.conn();
+    let conn = shared.lock().await;
+    let view = fixture.device_view(&conn);
+    let before = target_rows(&conn);
+    let event = fixture.device_event(170);
+    let effect = view.prepare(&event, 160, [0x51; 16], [0x52; 16]).unwrap();
+    assert_eq!(u8::from(effect.action), 0);
+    assert_eq!(effect.expires_at, 160);
+    let activation = fixture.prepare(effect, event.clone());
+    assert_eq!(target_rows(&conn), before);
+    assert_eq!(
+        activation.effect.digest(&fixture.key).unwrap(),
+        activation.handle.body.mutation.unwrap()
+    );
+    assert_eq!(fixture.preflight(&conn, &activation, 100).unwrap(), None);
+    let worker = std::sync::Arc::new(());
+    let prepared = PreparedNetconfDevice {
+        worker: NetconfWorkerBinding::new(&worker),
+        prepared: activation.clone(),
+    };
+    assert_eq!(prepared.mutation(), &activation);
+    let owner = NetconfDeviceOwner {
+        worker: prepared.worker.clone(),
+        authority: fixture.identity,
+        profile_incarnation: [0x51; 16],
+        device_incarnation: [0x52; 16],
+        caller: event.caller,
+    };
+    assert_eq!(
+        view.verify_owner(&owner),
+        Err(AuditAuthorityError::BindingMismatch)
+    );
+    assert!(matches!(
+        fixture.submit(&conn, &activation),
+        AuditOperationState::TargetV1(_)
+    ));
+    assert_eq!(
+        fixture.device_view(&conn).verify_owner(&owner),
+        Err(AuditAuthorityError::RecoveryRequired)
+    );
+    fixture.settle(&conn, &activation);
+    assert_eq!(fixture.device_view(&conn).verify_owner(&owner), Ok(()));
+    let next_event = fixture.device_event(171);
+    let next = fixture
+        .device_view(&conn)
+        .prepare(&next_event, 160, [0x53; 16], [0x54; 16])
+        .unwrap();
+    assert_eq!(u8::from(next.action), 1);
+    assert_eq!(next.profile_incarnation, [0x51; 16]);
+    assert!(
+        matches!(next.resolution, Some(TargetResolutionV1::BeginDevice { previous: Some(value) }) if value == [0x52;16])
+    );
+    let next = fixture.prepare(next, next_event);
+    assert_eq!(fixture.preflight(&conn, &next, 100).unwrap(), None);
+    assert!(matches!(
+        fixture.submit(&conn, &next),
+        AuditOperationState::TargetV1(_)
+    ));
+    fixture.settle(&conn, &next);
+    assert_eq!(
+        fixture.device_view(&conn).verify_owner(&owner),
+        Err(AuditAuthorityError::BindingMismatch)
+    );
+    assert_eq!(
+        format!("{owner:?} {prepared:?}"),
+        "NetconfDeviceOwner(<redacted>) PreparedNetconfDevice(<redacted>)"
+    );
+}
+
+#[tokio::test]
+async fn target_device_preparation_refuses_rpc_events_unsettled_and_reused_incarnations() {
+    let fixture = Fixture::new().await;
+    let shared = fixture.backend.conn();
+    let conn = shared.lock().await;
+    let view = fixture.device_view(&conn);
+    assert!(matches!(
+        view.prepare(&fixture.event(172), 160, [0x51; 16], [0x52; 16]),
+        Err(AuditAuthorityError::BindingMismatch)
+    ));
+    let event = fixture.device_event(173);
+    let prepared = fixture.prepare(
+        view.prepare(&event, 160, [0x51; 16], [0x52; 16]).unwrap(),
+        event,
+    );
+    fixture
+        .apply(
+            &conn,
+            AuditCommand::NetconfTarget(Box::new(TargetAuditCommandV1::Admit(prepared.clone()))),
+            100,
+        )
+        .unwrap();
+    let view = fixture.device_view(&conn);
+    assert!(matches!(
+        view.prepare(&fixture.device_event(174), 160, [0x55; 16], [0x56; 16]),
+        Err(AuditAuthorityError::RecoveryRequired)
+    ));
+    fixture.checkpoint(&conn);
+    fixture
+        .apply(
+            &conn,
+            AuditCommand::NetconfTarget(Box::new(TargetAuditCommandV1::Apply(prepared.clone()))),
+            100,
+        )
+        .unwrap();
+    fixture.settle(&conn, &prepared);
+    let view = fixture.device_view(&conn);
+    assert!(matches!(
+        view.prepare(&fixture.device_event(174), 160, [0x55; 16], [0x52; 16]),
+        Err(AuditAuthorityError::BindingMismatch)
+    ));
+    assert!(matches!(
+        view.prepare(&fixture.device_event(174), 160, [0; 16], [0x56; 16]),
+        Err(AuditAuthorityError::BindingMismatch)
+    ));
+}
+
+#[test]
+fn target_device_worker_binding_rejects_equal_value_replacement_and_outlives_no_worker() {
+    use crate::audit_authority::NetconfWorkerBinding;
+    let original = std::sync::Arc::new([0x61; 32]);
+    let clone = original.clone();
+    let replacement = std::sync::Arc::new([0x61; 32]);
+    let binding = NetconfWorkerBinding::new(&original);
+    assert!(binding.belongs_to(&clone));
+    assert!(!binding.belongs_to(&replacement));
+    drop(original);
+    assert!(binding.belongs_to(&clone));
+    drop(clone);
+    let later = std::sync::Arc::new([0x61; 32]);
+    assert!(!binding.belongs_to(&later));
+}
+
+#[tokio::test]
+async fn target_device_preparation_preserves_reboot_cleanup_before_serving() {
+    use crate::audit_authority::{NetconfDeviceOwner, NetconfWorkerBinding};
+    let fixture = Fixture::new().await;
+    let shared = fixture.backend.conn();
+    let conn = shared.lock().await;
+    let tentative = fixture.pending_fixture(&conn, true);
+    assert!(matches!(
+        fixture.submit(&conn, &tentative),
+        AuditOperationState::TargetV1(_)
+    ));
+    fixture.settle(&conn, &tentative);
+    let event = fixture.device_event(175);
+    let effect = fixture
+        .device_view(&conn)
+        .prepare(&event, 160, [0x57; 16], [0x58; 16])
+        .unwrap();
+    let worker = std::sync::Arc::new(());
+    let owner = NetconfDeviceOwner {
+        worker: NetconfWorkerBinding::new(&worker),
+        authority: fixture.identity,
+        profile_incarnation: effect.profile_incarnation,
+        device_incarnation: effect.device_incarnation,
+        caller: event.caller,
+    };
+    let prepared = fixture.prepare(effect, event);
+    assert!(matches!(
+        fixture.submit(&conn, &prepared),
+        AuditOperationState::TargetV1(_)
+    ));
+    fixture.settle(&conn, &prepared);
+    let view = fixture.device_view(&conn);
+    assert!(!view.unsettled);
+    assert!(view.cleanup_pending);
+    assert_eq!(
+        view.verify_owner(&owner),
+        Err(AuditAuthorityError::RecoveryRequired)
+    );
+    assert!(matches!(
+        view.prepare(&fixture.device_event(176), 160, [0x59; 16], [0x5a; 16]),
+        Err(AuditAuthorityError::RecoveryRequired)
+    ));
+    let rollback = fixture.resolve_fixture(&conn, 177, 14, true, 100);
+    assert!(matches!(
+        fixture.submit(&conn, &rollback),
+        AuditOperationState::TargetV1(_)
+    ));
+    fixture.assert_running_plaintext(&conn, &rollback);
+    fixture.settle(&conn, &rollback);
+    fixture.assert_no_pending(&conn);
+    assert_eq!(fixture.device_view(&conn).verify_owner(&owner), Ok(()));
+}

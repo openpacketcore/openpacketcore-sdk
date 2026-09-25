@@ -866,3 +866,166 @@ impl ConsensusConfigStore {
         decision
     }
 }
+
+impl ConsensusConfigStore {
+    /// Prepare one explicit NETCONF device start under trusted embedding
+    /// authorization. This is a lifecycle operation, not an authenticated
+    /// client's NETCONF RPC: only an Internal Intent event is accepted.
+    ///
+    /// A fresh inactive authority prepares activation; an established one binds
+    /// its exact previous device and profile. This does not upgrade a legacy
+    /// store. No owner is usable before this exact intent, result, and terminal
+    /// checkpoint complete. Retain the returned original mutation for admission
+    /// and recovery; calling this method again creates a different preparation
+    /// and cannot recover an already transmitted operation.
+    pub async fn prepare_netconf_device(
+        &self,
+        privacy: &dyn AuditPrivacyProjection,
+        event: &ManagementAuditEventRecord,
+        lifetime: std::time::Duration,
+    ) -> Result<crate::audit_authority::PreparedNetconfDevice, AuditAuthorityError> {
+        self.require_netconf_target_profile()?;
+        if event.transport() != crate::ManagementAuditTransportCode::Internal
+            || event.outcome() != crate::ManagementAuditOutcomeCode::Intent
+            || lifetime.subsec_nanos() != 0
+            || !(1..=3600).contains(&lifetime.as_secs())
+        {
+            return Err(AuditAuthorityError::InvalidInput);
+        }
+        let event = ProjectedAuditEvent::project(privacy, event)?;
+        let issued_at = self
+            .inner
+            .clock
+            .now_utc()
+            .as_offset_datetime()
+            .unix_timestamp();
+        let expires_at = issued_at
+            .checked_add(lifetime.as_secs() as i64)
+            .ok_or(AuditAuthorityError::InvalidInput)?;
+        let view = self.read_netconf_device_view().await?;
+        let effect = view.prepare(
+            &event,
+            expires_at,
+            *uuid::Uuid::new_v4().as_bytes(),
+            *uuid::Uuid::new_v4().as_bytes(),
+        )?;
+        let digest = effect.digest(self.inner.backend.audit_key())?;
+        let binding =
+            AuditOperationBinding::project(privacy, &event, view.running_version, &digest)?;
+        let handle = AuditOperationHandle::issue(
+            HandleBody {
+                version: 1,
+                identity: self.inner.identity,
+                binding,
+                event,
+                issued_at,
+                expires_at,
+                nonce: *uuid::Uuid::new_v4().as_bytes(),
+                key_epoch: self.inner.backend.audit_key().epoch(),
+                mutation: Some(digest),
+            },
+            self.inner.backend.audit_key(),
+        )?;
+        let prepared = crate::audit_authority::PreparedTargetMutation { handle, effect };
+        prepared.verify_effect(self.inner.backend.audit_key())?;
+        self.preflight_netconf_target(&prepared).await?;
+        Ok(crate::audit_authority::PreparedNetconfDevice {
+            worker: crate::audit_authority::NetconfWorkerBinding::new(&self.inner),
+            prepared,
+        })
+    }
+
+    /// Claim this worker's device capability after the exact lifecycle result
+    /// and its terminal/checkpoint obligations are complete. An older applied
+    /// result does not override a newer retained device. Outstanding cleanup
+    /// refuses serving ownership without erasing the already known result.
+    ///
+    /// Decoding an original mutation cannot reconstruct the preparation's local
+    /// worker binding. A replacement worker must first reconcile the old effect
+    /// and then perform its own explicit device-start transition.
+    pub async fn claim_netconf_device_owner(
+        &self,
+        prepared: &crate::audit_authority::PreparedNetconfDevice,
+        receipt: &AuditOperationReceipt,
+        caller: AuditCaller,
+    ) -> Result<crate::audit_authority::NetconfDeviceOwner, AuditAuthorityError> {
+        if !prepared.worker.belongs_to(&self.inner) {
+            return Err(AuditAuthorityError::BindingMismatch);
+        }
+        self.verify_netconf_target(&prepared.prepared, caller)?;
+        if receipt.handle != prepared.prepared.handle {
+            return Err(AuditAuthorityError::BindingMismatch);
+        }
+        let crate::audit_authority::AuditOperationState::TargetV1(result) = receipt.state() else {
+            return Err(AuditAuthorityError::BindingMismatch);
+        };
+        prepared.prepared.validate_result(result)?;
+        let owner = crate::audit_authority::NetconfDeviceOwner {
+            worker: prepared.worker.clone(),
+            authority: self.inner.identity,
+            profile_incarnation: prepared.prepared.effect.profile_incarnation,
+            device_incarnation: prepared.prepared.effect.device_incarnation,
+            caller,
+        };
+        self.verify_netconf_device_owner(&owner).await?;
+        Ok(owner)
+    }
+
+    /// Check the exact issuing worker, authority scope and current retained
+    /// device ownership through a quorum read and independent checkpoint.
+    /// This does not authenticate a NETCONF session or grant NACM permission.
+    pub async fn verify_netconf_device_owner(
+        &self,
+        owner: &crate::audit_authority::NetconfDeviceOwner,
+    ) -> Result<(), AuditAuthorityError> {
+        if !owner.worker.belongs_to(&self.inner) || owner.authority != self.inner.identity {
+            return Err(AuditAuthorityError::BindingMismatch);
+        }
+        self.read_netconf_device_view().await?.verify_owner(owner)
+    }
+
+    async fn read_netconf_device_view(
+        &self,
+    ) -> Result<super::super::audit_targets::NetconfDeviceView, AuditAuthorityError> {
+        self.require_netconf_target_profile()?;
+        self.linearizable_barrier()
+            .await
+            .map_err(|_| AuditAuthorityError::Unavailable)?;
+        let backend = self.inner.backend.clone();
+        let identity = self.inner.identity;
+        let (ledger, view) = super::super::run_backend_sqlite_with_timeout(
+            &self.inner.backend,
+            self.inner.operation_timeout,
+            move |conn, cancellation| {
+                let unavailable = || std::io::Error::other("device authority unavailable");
+                let tx = conn.unchecked_transaction().map_err(|_| unavailable())?;
+                super::super::sqlite::validate_live_history_schema_for_profile(
+                    &tx,
+                    cancellation,
+                    crate::RetainedConfigProfile::NetconfTargetsV1,
+                )?;
+                let keys = backend.management_audit_keys().ok_or_else(unavailable)?;
+                let ledger = super::super::audit::read_with_keys_sync(
+                    &tx,
+                    backend.audit_key(),
+                    Some(&keys),
+                    identity,
+                )?
+                .ok_or_else(unavailable)?;
+                let view = super::super::audit_targets::read_device_view_sync(
+                    &tx,
+                    backend.audit_key(),
+                    &ledger,
+                    cancellation,
+                )?;
+                cancellation.check_io()?;
+                tx.commit().map_err(|_| unavailable())?;
+                Ok((ledger, view))
+            },
+        )
+        .await
+        .map_err(|_| AuditAuthorityError::Unavailable)?;
+        self.verify_audit_checkpoint(&ledger).await?;
+        Ok(view)
+    }
+}

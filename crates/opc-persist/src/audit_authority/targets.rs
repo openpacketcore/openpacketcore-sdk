@@ -466,3 +466,67 @@ impl fmt::Debug for NetconfTargetResult {
         f.write_str("NetconfTargetResult(<redacted>)")
     }
 }
+
+/// SDK preparation for one explicit device-start transition. Preparing it does
+/// not establish device ownership. Preserve its original handle before intent
+/// admission, then claim ownership from the exact applied receipt.
+///
+/// The worker binding is deliberately neither serialized nor reconstructible
+/// from recovery bytes. A replacement worker must reconcile old work and start
+/// a fresh device incarnation before it can acquire its own serving capability.
+#[derive(Clone)]
+pub struct PreparedNetconfDevice {
+    pub(crate) worker: NetconfWorkerBinding,
+    pub(crate) prepared: super::PreparedTargetMutation,
+}
+
+impl PreparedNetconfDevice {
+    /// Exact closed lifecycle effect for the required intent/result protocol.
+    pub fn mutation(&self) -> &super::PreparedTargetMutation {
+        &self.prepared
+    }
+}
+
+impl fmt::Debug for PreparedNetconfDevice {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("PreparedNetconfDevice(<redacted>)")
+    }
+}
+
+/// One established device incarnation bound to the exact issuing store worker.
+/// This is not a principal, a numeric NETCONF session ID, or a lock lease.
+/// Every subsequent operation must also check current retained ownership and
+/// configuration authority; possession alone does not establish liveness.
+#[derive(Clone)]
+pub struct NetconfDeviceOwner {
+    pub(crate) worker: NetconfWorkerBinding,
+    pub(crate) authority: ConfigConsensusIdentity,
+    pub(crate) profile_incarnation: [u8; 16],
+    pub(crate) device_incarnation: [u8; 16],
+    pub(crate) caller: super::AuditCaller,
+}
+
+impl fmt::Debug for NetconfDeviceOwner {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("NetconfDeviceOwner(<redacted>)")
+    }
+}
+
+#[derive(Clone)]
+pub(crate) struct NetconfWorkerBinding {
+    worker: std::sync::Weak<dyn std::any::Any + Send + Sync>,
+}
+
+impl NetconfWorkerBinding {
+    pub(crate) fn new<T: Send + Sync + 'static>(worker: &std::sync::Arc<T>) -> Self {
+        let erased: std::sync::Arc<dyn std::any::Any + Send + Sync> = worker.clone();
+        Self {
+            worker: std::sync::Arc::downgrade(&erased),
+        }
+    }
+
+    pub(crate) fn belongs_to<T: Send + Sync + 'static>(&self, worker: &std::sync::Arc<T>) -> bool {
+        let erased: std::sync::Arc<dyn std::any::Any + Send + Sync> = worker.clone();
+        self.worker.ptr_eq(&std::sync::Arc::downgrade(&erased))
+    }
+}

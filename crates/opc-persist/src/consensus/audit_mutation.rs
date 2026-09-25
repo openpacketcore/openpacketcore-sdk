@@ -799,3 +799,10 @@ mod target_commit_input {
         entry_hmac: [u8; 32],
     }
 }
+
+impl TargetEffectV1 {
+    /// Seal an SDK-prepared effect with the same domain used by verification.
+    pub(crate) fn digest(&self, key: &AuditKey) -> Result<[u8; 32], AuditAuthorityError> {
+        authenticate(key, TARGET_MUTATION_DOMAIN, self)
+    }
+}

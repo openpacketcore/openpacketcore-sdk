@@ -1622,3 +1622,145 @@ pub(crate) fn preflight_target_sync(
     cancellation.check_io()?;
     Ok(Ok(None))
 }
+
+/// A bounded preparation view, obtained with the ledger in one pinned read.
+/// It exposes no signing material and cannot be constructed by a consumer.
+pub(crate) struct NetconfDeviceView {
+    pub(crate) authority: ConfigConsensusIdentity,
+    pub(crate) profile_incarnation: Option<[u8; 16]>,
+    pub(crate) device_incarnation: Option<[u8; 16]>,
+    pub(crate) caller: Option<AuditCaller>,
+    pub(crate) running_version: u64,
+    pub(crate) state_digest: [u8; 32],
+    pub(crate) unsettled: bool,
+    pub(crate) cleanup_pending: bool,
+    checkpoint: AuditCheckpoint,
+    sequence: u64,
+}
+
+impl NetconfDeviceView {
+    pub(crate) fn prepare(
+        &self,
+        event: &crate::audit_authority::ProjectedAuditEvent,
+        expires_at: i64,
+        fresh_profile: [u8; 16],
+        fresh_device: [u8; 16],
+    ) -> Result<super::audit_mutation::TargetEffectV1, AuditAuthorityError> {
+        if event.transport != crate::ManagementAuditTransportCode::Internal
+            || event.outcome != crate::ManagementAuditOutcomeCode::Intent
+            || fresh_profile == [0; 16]
+            || fresh_device == [0; 16]
+            || self.device_incarnation == Some(fresh_device)
+        {
+            return Err(AuditAuthorityError::BindingMismatch);
+        }
+        if self.unsettled || self.cleanup_pending {
+            return Err(AuditAuthorityError::RecoveryRequired);
+        }
+        let (action, profile_incarnation, resolution) = match self.profile_incarnation {
+            None => {
+                if self.running_version != 0 || self.checkpoint.sequence() != self.sequence {
+                    return Err(AuditAuthorityError::RecoveryRequired);
+                }
+                (
+                    0,
+                    fresh_profile,
+                    TargetResolutionV1::Activate {
+                        checkpoint: self.checkpoint.clone(),
+                    },
+                )
+            }
+            Some(profile) => (
+                1,
+                profile,
+                TargetResolutionV1::BeginDevice {
+                    previous: self.device_incarnation,
+                },
+            ),
+        };
+        Ok(super::audit_mutation::TargetEffectV1 {
+            format: 1,
+            authority: self.authority,
+            profile_incarnation,
+            device_incarnation: fresh_device,
+            caller: event.caller,
+            request: event.request,
+            action: action.try_into()?,
+            destination: TargetExpectationV1::Lifecycle {
+                state_digest: self.state_digest,
+            },
+            source: None,
+            lock: None,
+            expires_at,
+            encrypted_payload: None,
+            resolution: Some(resolution),
+        })
+    }
+
+    pub(crate) fn verify_owner(
+        &self,
+        owner: &crate::audit_authority::NetconfDeviceOwner,
+    ) -> Result<(), AuditAuthorityError> {
+        if self.authority != owner.authority
+            || self.profile_incarnation != Some(owner.profile_incarnation)
+            || self.device_incarnation != Some(owner.device_incarnation)
+            || self.caller != Some(owner.caller)
+        {
+            return Err(AuditAuthorityError::BindingMismatch);
+        }
+        if self.unsettled || self.cleanup_pending {
+            return Err(AuditAuthorityError::RecoveryRequired);
+        }
+        Ok(())
+    }
+}
+
+pub(crate) fn read_device_view_sync(
+    conn: &Connection,
+    key: &AuditKey,
+    ledger: &LedgerState,
+    cancellation: &SqliteWorkCancellation,
+) -> io::Result<NetconfDeviceView> {
+    if conn.is_autocommit() {
+        return Err(invalid());
+    }
+    let state = read_state_sync(conn, key, ledger.identity, cancellation)?;
+    state.validate_anchor(Some(ledger))?;
+    super::history::validate_record_chain_sync(conn, key, cancellation)?;
+    let checkpoint = ledger
+        .continuity
+        .as_ref()
+        .and_then(|chain| chain.checkpoint.clone())
+        .ok_or_else(invalid)?;
+    let running_version = conn
+        .query_row(
+            "SELECT COALESCE(MAX(version),0) FROM config_history",
+            [],
+            |row| row.get(0),
+        )
+        .map_err(|_| invalid())?;
+    cancellation.check_io()?;
+    Ok(NetconfDeviceView {
+        authority: ledger.identity,
+        profile_incarnation: state
+            .profile
+            .activation_operation
+            .as_ref()
+            .map(|a| a.profile_incarnation),
+        device_incarnation: state.profile.device_incarnation,
+        caller: state
+            .lifecycle
+            .device_ownership
+            .as_ref()
+            .map(|owner| owner.caller),
+        running_version,
+        state_digest: state.profile.state_digest,
+        unsettled: ledger
+            .operations
+            .iter()
+            .any(|op| !op.terminal_recorded || ledger.mutation_outcome_needs_checkpoint(op)),
+        cleanup_pending: state.lifecycle.cleanup.iter().any(Option::is_some),
+        checkpoint,
+        sequence: ledger.sequence,
+    })
+}
