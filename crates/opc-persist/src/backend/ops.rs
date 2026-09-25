@@ -489,6 +489,10 @@ impl SqliteBackend {
     {
         let audit_key = Arc::clone(&self.audit_key);
         let required = Arc::clone(&self.config_consensus_history_required);
+        let profile = self.retained_binding.as_ref().map_or(
+            crate::RetainedConfigProfile::Legacy,
+            |binding| binding.profile(),
+        );
         crate::consensus::run_backend_sqlite_with_timeout(
             self,
             crate::consensus::DEFAULT_CONFIG_CONSENSUS_OPERATION_TIMEOUT,
@@ -496,10 +500,11 @@ impl SqliteBackend {
                 let tx = conn.unchecked_transaction().map_err(|_| {
                     std::io::Error::other("config history read transaction unavailable")
                 })?;
-                let result = crate::consensus::history::validate_access_sync(
+                let result = crate::consensus::history::validate_access_for_profile_sync(
                     &tx,
                     audit_key.as_ref(),
                     required.load(std::sync::atomic::Ordering::Acquire),
+                    profile,
                     cancellation,
                 )
                 .map_err(|_| PersistError::corrupt_blob())
