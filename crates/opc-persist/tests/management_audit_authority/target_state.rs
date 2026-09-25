@@ -1191,3 +1191,130 @@ async fn target_running_copy_preserves_candidate_and_startup_sources() {
         fixture.settle(&conn, &prepared);
     }
 }
+
+#[tokio::test]
+async fn target_running_copy_rejects_replaced_source_without_any_effect() {
+    let fixture = Fixture::new().await;
+    let shared = fixture.backend.conn();
+    let conn = shared.lock().await;
+    fixture.active(&conn);
+    let stage = fixture.encrypted(fixture.request(&conn, 85, 4, 0x61, 1), 0x33);
+    assert!(matches!(
+        fixture.submit(&conn, &stage),
+        AuditOperationState::TargetV1(_)
+    ));
+    fixture.settle(&conn, &stage);
+    let old_copy = fixture.running_target(&conn, 86, 15, 0, 0x33);
+    let replacement = fixture.encrypted(fixture.request(&conn, 87, 4, 0x61, 1), 0x34);
+    assert!(matches!(
+        fixture.submit(&conn, &replacement),
+        AuditOperationState::TargetV1(_)
+    ));
+    fixture.settle(&conn, &replacement);
+    let before = target_rows(&conn);
+    assert_eq!(
+        fixture.submit(&conn, &old_copy),
+        AuditOperationState::Rejected,
+        "copy accepted a substituted source generation and ciphertext"
+    );
+    assert_eq!(target_rows(&conn), before);
+    assert_eq!(
+        conn.query_row("SELECT COUNT(*) FROM config_history", [], |r| r
+            .get::<_, u64>(0))
+            .unwrap(),
+        0
+    );
+    let receipt = fixture
+        .ledger(&conn)
+        .lookup(&fixture.key, old_copy.handle(), old_copy.effect.caller)
+        .unwrap()
+        .unwrap();
+    assert!(
+        !receipt.terminal_recorded(),
+        "retained rejection keeps its original terminal obligation"
+    );
+    fixture.settle(&conn, &old_copy);
+    let current_copy = fixture.running_target(&conn, 88, 15, 0, 0x34);
+    assert!(matches!(
+        fixture.submit(&conn, &current_copy),
+        AuditOperationState::TargetV1(_)
+    ));
+    fixture.assert_running_plaintext(&conn, &current_copy);
+    assert_eq!(
+        row(&conn, "config_netconf_targets", "target", 0)["generation"],
+        2
+    );
+}
+
+#[tokio::test]
+async fn target_running_promotion_rolls_back_running_and_retirement_on_storage_failure() {
+    let fixture = Fixture::new().await;
+    let shared = fixture.backend.conn();
+    let conn = shared.lock().await;
+    fixture.active(&conn);
+    let stage = fixture.encrypted(fixture.request(&conn, 89, 4, 0x61, 1), 0x35);
+    assert!(matches!(
+        fixture.submit(&conn, &stage),
+        AuditOperationState::TargetV1(_)
+    ));
+    fixture.settle(&conn, &stage);
+    let prepared = fixture.running_target(&conn, 90, 6, 0, 0x35);
+    fixture
+        .apply(
+            &conn,
+            AuditCommand::NetconfTarget(Box::new(TargetAuditCommandV1::Admit(prepared.clone()))),
+            100,
+        )
+        .unwrap();
+    fixture.checkpoint(&conn);
+    let before = target_rows(&conn);
+    let ledger_before = serde_json::to_vec(&fixture.ledger(&conn)).unwrap();
+    // Synthetic last-row I/O fault after running append and earlier target writes.
+    conn.execute_batch("CREATE TEMP TRIGGER fail_target_lifecycle BEFORE UPDATE ON config_netconf_lifecycle BEGIN SELECT RAISE(ABORT, 'synthetic target write failure'); END;").unwrap();
+    let tx = conn.unchecked_transaction().unwrap();
+    assert!(
+        apply_sync(
+            &tx,
+            &fixture.key,
+            fixture.identity,
+            &AuditCommand::NetconfTarget(Box::new(TargetAuditCommandV1::Apply(prepared.clone()))),
+            100,
+            Some(&fixture.keys)
+        )
+        .is_err(),
+        "injected storage failure must abort the authority transaction"
+    );
+    drop(tx);
+    conn.execute_batch("DROP TRIGGER fail_target_lifecycle")
+        .unwrap();
+    assert_eq!(target_rows(&conn), before);
+    assert_eq!(
+        serde_json::to_vec(&fixture.ledger(&conn)).unwrap(),
+        ledger_before
+    );
+    assert_eq!(
+        conn.query_row("SELECT COUNT(*) FROM config_history", [], |r| r
+            .get::<_, u64>(0))
+            .unwrap(),
+        0
+    );
+    crate::consensus::history::validate_record_chain_sync(
+        &conn,
+        &fixture.key,
+        &crate::consensus::sqlite::SqliteWorkCancellation::audit_test(),
+    )
+    .unwrap();
+    fixture
+        .apply(
+            &conn,
+            AuditCommand::NetconfTarget(Box::new(TargetAuditCommandV1::Apply(prepared.clone()))),
+            100,
+        )
+        .unwrap();
+    fixture.assert_running_plaintext(&conn, &prepared);
+    assert_eq!(
+        row(&conn, "config_netconf_targets", "target", 0)["generation"],
+        2
+    );
+    fixture.settle(&conn, &prepared);
+}

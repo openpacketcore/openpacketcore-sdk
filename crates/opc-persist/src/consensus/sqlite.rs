@@ -2794,6 +2794,29 @@ fn create_rollback_point_sync(
     Ok(Ok(()))
 }
 
+/// The target dispatcher owns the savepoint and retained outcome. Reuse the
+/// ordinary append and bounded history refresh with the original command context.
+pub(super) fn append_target_running_sync(
+    conn: &Connection,
+    key: &AuditKey,
+    commit: &super::PreparedConfigCommit,
+    context: &super::audit::ApplyContext<'_>,
+) -> io::Result<Result<(), ConfigMutationFailure>> {
+    let result = append_prepared_commit_sync(
+        conn,
+        commit,
+        None,
+        super::types::CONFIG_CONSENSUS_COMMAND_VERSION,
+        context.logical_time,
+        context.request_id,
+        context.cancellation,
+    )?;
+    if result.is_err() {
+        return Ok(result);
+    }
+    super::history::refresh_sync(conn, key, false, context.cancellation)
+}
+
 fn execute_intent_sync(
     conn: &Connection,
     intent: &ConfigMutationIntent,
@@ -3116,9 +3139,12 @@ pub(crate) fn apply_entries_cancellable_sync(
                                 audit_key,
                                 identity,
                                 audit,
-                                logical_time.as_offset_datetime().unix_timestamp(),
                                 audit_keys,
-                                cancellation,
+                                &super::audit::ApplyContext {
+                                    logical_time,
+                                    request_id: command.request_id,
+                                    cancellation,
+                                },
                             )?
                         }
                         ConfigMutationIntent::RetainHistory(retention) => {
@@ -3166,6 +3192,9 @@ pub(crate) fn apply_entries_cancellable_sync(
                     }
                     if result.is_err()
                         && !matches!(command.intent, ConfigMutationIntent::AuditedMutation(_))
+                        && !matches!(&command.intent,
+                            ConfigMutationIntent::ManagementAudit(super::audit::AuditCommand::NetconfTarget(target))
+                            if matches!(&**target, super::audit_mutation::TargetAuditCommandV1::Apply(_)))
                     {
                         tx.execute_batch("ROLLBACK TO config_history_command")
                             .map_err(db_error)?;

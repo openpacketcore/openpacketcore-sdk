@@ -928,6 +928,67 @@ impl TargetState {
                     })
                 }
             }
+            6 | 15 => {
+                self.check_lock(prepared, 0)?;
+                let Some(TargetPayloadV1::Running {
+                    commit,
+                    confirmation_ownership,
+                }) = &effect.encrypted_payload
+                else {
+                    return Err(bad);
+                };
+                // Confirmed ownership/resolution has a separate atomic transition;
+                // ordinary promotion and copy cannot implicitly establish or clear it.
+                if effect.resolution.is_some()
+                    || confirmation_ownership.is_some()
+                    || commit.record.confirmed_deadline.is_some()
+                {
+                    return Err(AuditAuthorityError::RecoveryRequired);
+                }
+                if current_version.checked_add(1) != Some(commit.record.version.get()) {
+                    return Err(bad);
+                }
+                let source_slot = match &effect.source {
+                    Some(TargetSourceV1::Candidate { .. }) => 0,
+                    Some(TargetSourceV1::Startup { .. }) if action == 15 => 1,
+                    _ => return Err(AuditAuthorityError::RecoveryRequired),
+                };
+                let expected = effect.lock.as_ref().ok_or(bad)?;
+                let source_lock = self.lifecycle.locks[source_slot + 1].as_ref().ok_or(bad)?;
+                if source_lock.session.is_some_and(|s| s != expected.requester)
+                    || source_lock.caller.is_some_and(|c| c != effect.caller)
+                {
+                    return Err(bad);
+                }
+                let source = &self.targets[source_slot];
+                let blob = source.encrypted_envelope.as_ref().ok_or(bad)?;
+                if commit.record.schema_digest != blob.schema
+                    || commit.record.plaintext_digest != blob.plaintext_digest
+                {
+                    return Err(bad);
+                }
+                if action == 6 {
+                    let binding = source.source_binding.as_ref().ok_or(bad)?;
+                    if binding.session != expected.requester
+                        || binding.caller != effect.caller
+                        || binding.base_version != current_version
+                    {
+                        return Err(bad);
+                    }
+                    self.advance_target(0, prepared, None)?;
+                    Ok(NetconfAppliedOutcome::Promoted {
+                        running_version: commit.record.version.get(),
+                        retired_generation: crate::audit_authority::CandidateGeneration {
+                            authority: effect.authority,
+                            value: self.targets[0].generation,
+                        },
+                    })
+                } else {
+                    Ok(NetconfAppliedOutcome::CopiedRunning {
+                        running_version: commit.record.version.get(),
+                    })
+                }
+            }
             13 => {
                 let Some(TargetResolutionV1::EndSession { session }) = effect.resolution else {
                     return Err(bad);
@@ -977,18 +1038,19 @@ impl TargetState {
     }
 }
 
-/// Atomic non-running target transition inside the caller's authority transaction.
+/// Atomic target/running transition inside the caller's authority transaction.
 /// Runtime activation is still gated by the independently selected store profile.
 pub(crate) fn apply_target_sync(
     conn: &Connection,
     key: &AuditKey,
     identity: ConfigConsensusIdentity,
     prepared: &PreparedTargetMutation,
-    now: i64,
     keys: Option<&AuditKeyRing>,
-    cancellation: &SqliteWorkCancellation,
+    context: &super::audit::ApplyContext<'_>,
 ) -> io::Result<Result<(), super::ConfigMutationFailure>> {
     use super::ConfigMutationFailure as Failure;
+    let cancellation = context.cancellation;
+    let now = context.logical_time.as_offset_datetime().unix_timestamp();
     if conn.is_autocommit() {
         return Err(invalid());
     }
@@ -1040,8 +1102,22 @@ pub(crate) fn apply_target_sync(
         .handle
         .require_live(now)
         .and_then(|()| state.reduce(conn, prepared, &ledger, keys));
-    let (result, applied) = match reduced {
-        Ok(outcome) => {
+    if matches!(reduced, Err(AuditAuthorityError::RecoveryRequired)) {
+        return Ok(Err(Failure::InvalidInput));
+    }
+    conn.execute_batch("SAVEPOINT audited_target_effect")
+        .map_err(|_| invalid())?;
+    let running_result = if reduced.is_ok() {
+        if let Some(TargetPayloadV1::Running { commit, .. }) = &prepared.effect.encrypted_payload {
+            super::sqlite::append_target_running_sync(conn, key, commit, context)?
+        } else {
+            Ok(())
+        }
+    } else {
+        Err(Failure::Conflict)
+    };
+    let (result, applied) = match (reduced, running_result) {
+        (Ok(outcome), Ok(())) => {
             state.profile.last_target_transition_sequence =
                 ledger.sequence.checked_add(1).ok_or_else(invalid)?;
             state.profile.state_digest =
@@ -1056,8 +1132,8 @@ pub(crate) fn apply_target_sync(
             .map_err(|_| invalid())?;
             (Ok(()), AuditOperationState::TargetV1(result))
         }
-        Err(AuditAuthorityError::RecoveryRequired) => return Ok(Err(Failure::InvalidInput)),
-        Err(error) => (
+        (Ok(_), Err(failure)) => (Err(failure), AuditOperationState::Rejected),
+        (Err(error), _) => (
             Err(if error == AuditAuthorityError::Full {
                 Failure::HistoryFull
             } else {
@@ -1066,6 +1142,10 @@ pub(crate) fn apply_target_sync(
             AuditOperationState::Rejected,
         ),
     };
+    if result.is_err() {
+        conn.execute_batch("ROLLBACK TO audited_target_effect")
+            .map_err(|_| invalid())?;
+    }
     ledger
         .resolve(key, prepared.handle(), applied)
         .map_err(|_| invalid())?;
@@ -1078,6 +1158,8 @@ pub(crate) fn apply_target_sync(
         state.validate_anchor(Some(&ledger))?;
         state.write(conn, key, cancellation)?;
     }
+    conn.execute_batch("RELEASE audited_target_effect")
+        .map_err(|_| invalid())?;
     cancellation.check_io()?;
     super::audit::write_sync(conn, key, identity, Some(ledger), false)?;
     Ok(result)

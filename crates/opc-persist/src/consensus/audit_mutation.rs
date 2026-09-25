@@ -622,6 +622,34 @@ impl PreparedTargetMutation {
                 matches!(self.effect.destination, TargetExpectationV1::Startup { revision: expected }
                     if expected.checked_next()? == revision)
             }
+            (
+                6,
+                Outcome::Promoted {
+                    running_version,
+                    retired_generation,
+                },
+            ) => {
+                matches!((&self.effect.source, &self.effect.encrypted_payload, &self.effect.destination),
+                    (Some(TargetSourceV1::Candidate { generation, .. }),
+                     Some(TargetPayloadV1::Running { commit, confirmation_ownership: None }),
+                     TargetExpectationV1::Running { version })
+                    if generation.checked_next()? == retired_generation
+                        && *version == self.handle.body.binding.base_version
+                        && version.checked_add(1) == Some(running_version)
+                        && commit.record.version.get() == running_version
+                        && commit.record.confirmed_deadline.is_none()
+                        && self.effect.resolution.is_none())
+            }
+            (15, Outcome::CopiedRunning { running_version }) => {
+                matches!((&self.effect.encrypted_payload, &self.effect.destination),
+                    (Some(TargetPayloadV1::Running { commit, confirmation_ownership: None }),
+                     TargetExpectationV1::Running { version })
+                    if *version == self.handle.body.binding.base_version
+                        && version.checked_add(1) == Some(running_version)
+                        && commit.record.version.get() == running_version
+                        && commit.record.confirmed_deadline.is_none()
+                        && self.effect.resolution.is_none())
+            }
             (13, Outcome::Lifecycle { incarnation }) => {
                 matches!(self.effect.resolution, Some(TargetResolutionV1::EndSession { session })
                     if session == incarnation.value)

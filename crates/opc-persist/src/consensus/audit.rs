@@ -153,6 +153,13 @@ pub(crate) fn write_sync(
     Ok(())
 }
 
+/// Original committed command context; followers never synthesize time or identity.
+pub(crate) struct ApplyContext<'a> {
+    pub(crate) logical_time: opc_types::Timestamp,
+    pub(crate) request_id: opc_consensus::ConsensusRequestId,
+    pub(crate) cancellation: &'a super::sqlite::SqliteWorkCancellation,
+}
+
 #[cfg(test)]
 pub(crate) fn apply_sync(
     conn: &Connection,
@@ -167,9 +174,14 @@ pub(crate) fn apply_sync(
         key,
         identity,
         command,
-        now,
         keys,
-        &super::sqlite::SqliteWorkCancellation::audit_test(),
+        &ApplyContext {
+            logical_time: opc_types::Timestamp::from_offset_datetime(
+                time::OffsetDateTime::from_unix_timestamp(now).map_err(|_| invalid())?,
+            ),
+            request_id: opc_consensus::ConsensusRequestId::from_bytes([0x61; 16]),
+            cancellation: &super::sqlite::SqliteWorkCancellation::audit_test(),
+        },
     )
 }
 
@@ -178,21 +190,16 @@ pub(crate) fn apply_cancellable_sync(
     key: &AuditKey,
     identity: ConfigConsensusIdentity,
     command: &AuditCommand,
-    now: i64,
     keys: Option<&AuditKeyRing>,
-    cancellation: &super::sqlite::SqliteWorkCancellation,
+    context: &ApplyContext<'_>,
 ) -> io::Result<Result<(), ConfigMutationFailure>> {
+    let now = context.logical_time.as_offset_datetime().unix_timestamp();
+    let cancellation = context.cancellation;
     cancellation.check_io()?;
     if let AuditCommand::NetconfTarget(command) = command {
         if let super::audit_mutation::TargetAuditCommandV1::Apply(prepared) = &**command {
             return super::audit_targets::apply_target_sync(
-                conn,
-                key,
-                identity,
-                prepared,
-                now,
-                keys,
-                cancellation,
+                conn, key, identity, prepared, keys, context,
             );
         }
     }
