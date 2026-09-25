@@ -83,8 +83,7 @@ where
                 .preflight_bearer_parent(&parent, &parent_claim.0, &desired)
                 .map_err(|_| GtpuSessionSelectorCoordinatorError::Namespace)?;
             let admission = self
-                .active_admission(&parent)
-                .await
+                .admission_for_final_phase_from_state(&parent, 0, &state)
                 .map_err(|_| GtpuSessionSelectorCoordinatorError::Namespace)?;
             self.require_exact_active(backend, parent.clone(), admission, &mut lease)
                 .await?;

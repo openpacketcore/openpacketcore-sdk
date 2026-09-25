@@ -9,21 +9,25 @@ use super::*;
 /// Gate the acknowledgement after SQLite has actually renewed the lease.
 /// This exercises cancellation/late replies without replacing the credential
 /// checks with a mock result or holding an SQLite transaction open.
-struct RenewalBackend {
+pub(super) struct RenewalBackend {
     inner: SqliteSessionBackend,
     acquisition_entered: Mutex<Option<Instant>>,
     renewals: AtomicUsize,
+    pub(super) reads: AtomicUsize,
+    pub(super) writes: AtomicUsize,
     hold_ack: AtomicBool,
     applied: tokio::sync::Notify,
     acknowledge: tokio::sync::Notify,
 }
 
 impl RenewalBackend {
-    fn new() -> Self {
+    pub(super) fn new() -> Self {
         Self {
             inner: SqliteSessionBackend::in_memory().unwrap(),
             acquisition_entered: Mutex::new(None),
             renewals: AtomicUsize::new(0),
+            reads: AtomicUsize::new(0),
+            writes: AtomicUsize::new(0),
             hold_ack: AtomicBool::new(false),
             applied: tokio::sync::Notify::new(),
             acknowledge: tokio::sync::Notify::new(),
@@ -42,10 +46,12 @@ impl SessionBackend for RenewalBackend {
     }
 
     async fn get(&self, key: &SessionKey) -> Result<Option<StoredSessionRecord>, StoreError> {
+        self.reads.fetch_add(1, Ordering::SeqCst);
         self.inner.get(key).await
     }
 
     async fn compare_and_set(&self, op: CompareAndSet) -> Result<CompareAndSetResult, StoreError> {
+        self.writes.fetch_add(1, Ordering::SeqCst);
         self.inner.compare_and_set(op).await
     }
 

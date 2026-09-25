@@ -6,8 +6,8 @@ use opc_session_store::EncryptingSessionBackend;
 
 type Protected = EncryptingSessionBackend<SqliteSessionBackend, opc_key::MemoryKeyProvider>;
 
-struct Lab {
-    authority: GtpuSessionSelectorNamespaceAuthority<Protected>,
+struct Lab<B: SessionBackend + SessionLeaseManager = Protected> {
+    authority: GtpuSessionSelectorNamespaceAuthority<B>,
     backend: Arc<GroupedGtpuDataplaneSimulation>,
     parent: GtpuSessionGroup,
     sibling: GtpuSessionGroup,
@@ -29,6 +29,13 @@ async fn lab(capacity: usize) -> Lab {
         keys,
         "bearer-codec-fixture",
     ));
+    lab_with_store(store, tenant, capacity).await
+}
+
+async fn lab_with_store<B>(store: SessionStore<B>, tenant: TenantId, capacity: usize) -> Lab<B>
+where
+    B: ProtectedSessionBackend + Send + Sync + 'static,
+{
     let backend = Arc::new(GroupedGtpuDataplaneSimulation::new().unwrap());
     let parent = group(1, 1, 0x1001, None);
     let sibling = group(2, 1, 0x1002, None);
@@ -93,6 +100,446 @@ async fn lab(capacity: usize) -> Lab {
         sibling,
         child,
     }
+}
+
+#[tokio::test]
+async fn bearer_admission_does_not_repeat_the_same_preflight_snapshot_read() {
+    use std::sync::atomic::Ordering;
+
+    let tenant = TenantId::from_static("bearer-read-budget");
+    let keys = Arc::new(opc_key::MemoryKeyProvider::new());
+    keys.insert_active_key(
+        opc_key::KeyId::new("bearer-read-budget-key").unwrap(),
+        opc_key::KeyPurpose::Session,
+        tenant.clone(),
+        opc_key::Zeroizing::new([0x79; 32]),
+    )
+    .unwrap();
+    let raw = Arc::new(super::worker_lease::RenewalBackend::new());
+    let store = SessionStore::new(EncryptingSessionBackend::new(
+        raw.clone(),
+        keys,
+        "bearer-read-budget",
+    ));
+    let lab = lab_with_store(store, tenant, 3).await;
+    let parent = lab
+        .authority
+        .recover_active(lab.backend.clone(), lab.parent.clone())
+        .await
+        .unwrap();
+    let reads_before = raw.reads.load(Ordering::SeqCst);
+    let writes_before = raw.writes.load(Ordering::SeqCst);
+    let child = lab
+        .authority
+        .reconcile_bearer(
+            lab.backend.clone(),
+            parent,
+            lab.parent.clone(),
+            lab.child.clone(),
+        )
+        .await
+        .unwrap();
+    let reads = raw.reads.load(Ordering::SeqCst) - reads_before;
+    let writes = raw.writes.load(Ordering::SeqCst) - writes_before;
+    // Admission, backend-start handoff and activation remain three separate
+    // fenced writes, each with exact durable readback. Read amplification
+    // excludes setup and explicit post-operation recovery.
+    assert_eq!(writes, 3);
+    drop(
+        lab.authority
+            .retire(lab.backend.clone(), child, lab.child)
+            .await
+            .unwrap(),
+    );
+    drop(
+        lab.authority
+            .recover_active(lab.backend, lab.parent)
+            .await
+            .unwrap(),
+    );
+    assert_eq!(
+        reads, 11,
+        "one fresh child repeated a preflight snapshot read"
+    );
+}
+
+#[tokio::test]
+async fn retained_transition_snapshot_cannot_replace_a_later_active_generation() {
+    let lab = lab(3).await;
+    let parent = lab
+        .authority
+        .recover_active(lab.backend.clone(), lab.parent.clone())
+        .await
+        .unwrap();
+    let mut lease = lab.authority.acquire_worker_lease().await.unwrap();
+    drop(
+        lab.authority
+            .claim_fresh_bearer_with_lease(
+                lab.backend.as_ref(),
+                &lab.child,
+                Some((&lab.parent, &parent.0)),
+                &mut lease,
+            )
+            .await
+            .unwrap(),
+    );
+    let handoff = lab
+        .authority
+        .mark_install_backend_started_with_lease(&lab.child, &mut lease)
+        .await
+        .unwrap();
+    let BackendStartHandoff::Transitioned(admission) = handoff else {
+        panic!("fresh child must receive one backend handoff");
+    };
+    let stale_admission = lab
+        .authority
+        .installing_admission(&lab.child, Some(true))
+        .await
+        .unwrap();
+    let stale_snapshot = lab.authority.read_state().await.unwrap();
+    let active = lab
+        .authority
+        .effect_and_activate_with_lease(
+            lab.backend.as_ref(),
+            lab.child.clone(),
+            admission,
+            None,
+            &mut lease,
+        )
+        .await
+        .unwrap();
+    let settled = lab.authority.read_state().await.unwrap().1.encode();
+    assert!(matches!(
+        lab.authority
+            .transition_phase_from_snapshot_with_lease(
+                &stale_admission,
+                0,
+                None,
+                &mut lease,
+                Some(stale_snapshot),
+            )
+            .await,
+        Err(GtpuSessionSelectorNamespaceError::StaleGeneration)
+    ));
+    assert_eq!(
+        lab.authority.read_state().await.unwrap().1.encode(),
+        settled
+    );
+    lab.authority.release_worker_lease(lease).await.unwrap();
+    drop(
+        lab.authority
+            .retire(lab.backend.clone(), active, lab.child)
+            .await
+            .unwrap(),
+    );
+    drop(
+        lab.authority
+            .recover_active(lab.backend, lab.parent)
+            .await
+            .unwrap(),
+    );
+}
+
+/// Hold one acknowledgement after the simulation has completed its exact
+/// effect and released its map lock. No durable or backend authority is forged.
+#[derive(Debug)]
+struct HeldAcknowledgement {
+    inner: Arc<GroupedGtpuDataplaneSimulation>,
+    hold_next: std::sync::atomic::AtomicBool,
+    entered: tokio::sync::Notify,
+    release: tokio::sync::Notify,
+}
+
+#[async_trait::async_trait]
+impl GtpuDataplaneBackend for HeldAcknowledgement {
+    async fn create_device(
+        &self,
+        request: crate::CreateGtpDeviceRequest,
+    ) -> Result<crate::GtpDevice, crate::GtpuError> {
+        self.inner.create_device(request).await
+    }
+
+    async fn resolve_device(&self, name: &str) -> Result<crate::GtpDevice, crate::GtpuError> {
+        self.inner.resolve_device(name).await
+    }
+
+    async fn remove_device(&self, device: &crate::GtpDevice) -> Result<(), crate::GtpuError> {
+        self.inner.remove_device(device).await
+    }
+
+    async fn install_pdp_context(
+        &self,
+        request: crate::GtpPdpContext,
+    ) -> Result<(), crate::GtpuError> {
+        self.inner.install_pdp_context(request).await
+    }
+
+    async fn remove_pdp_context(
+        &self,
+        request: crate::RemovePdpContextRequest,
+    ) -> Result<(), crate::GtpuError> {
+        self.inner.remove_pdp_context(request).await
+    }
+
+    async fn probe(&self) -> Result<crate::GtpuProbe, crate::GtpuError> {
+        self.inner.probe().await
+    }
+
+    async fn acquire_selector_namespace_lease(
+        &self,
+        request: GtpuSessionSelectorBindingLease,
+    ) -> Result<GtpuSessionSelectorBackendReceipt, crate::GtpuError> {
+        self.inner.acquire_selector_namespace_lease(request).await
+    }
+
+    async fn read_pdp_context_group_with_lease(
+        &self,
+        request: GtpuSessionSelectorReadbackRequest,
+    ) -> Result<GtpuSessionSelectorBackendReceipt, crate::GtpuError> {
+        self.inner.read_pdp_context_group_with_lease(request).await
+    }
+
+    async fn reconcile_pdp_context_group_authorized(
+        &self,
+        request: GtpuSessionSelectorEffectRequest,
+    ) -> Result<GtpuSessionSelectorBackendReceipt, crate::GtpuError> {
+        let result = self
+            .inner
+            .reconcile_pdp_context_group_authorized(request)
+            .await;
+        if result.is_ok()
+            && self
+                .hold_next
+                .swap(false, std::sync::atomic::Ordering::SeqCst)
+        {
+            self.entered.notify_one();
+            self.release.notified().await;
+        }
+        result
+    }
+}
+
+#[tokio::test]
+async fn unrelated_child_finishes_before_delayed_effect_acknowledgement() {
+    let lab = lab(3).await;
+    let backend = Arc::new(HeldAcknowledgement {
+        inner: lab.backend.clone(),
+        hold_next: std::sync::atomic::AtomicBool::new(true),
+        entered: tokio::sync::Notify::new(),
+        release: tokio::sync::Notify::new(),
+    });
+    let parent = lab
+        .authority
+        .recover_active(backend.clone(), lab.parent.clone())
+        .await
+        .unwrap();
+    let sibling = lab
+        .authority
+        .recover_active(backend.clone(), lab.sibling.clone())
+        .await
+        .unwrap();
+    let mut sibling_context = lab.child.entries()[0].context().clone();
+    sibling_context.ms_address = lab.sibling.entries()[0].context().ms_address;
+    sibling_context.local_teid = Teid::new(0x2001).unwrap();
+    sibling_context.peer_teid = Teid::new(0x2002).unwrap();
+    let sibling_child = GtpuSessionGroup::new(
+        GtpuSessionGroupId::new([4; 16]).unwrap(),
+        lab.sibling.device_id(),
+        vec![GtpuSessionEntry::new(
+            sibling_context,
+            lab.sibling.entries()[0].local_outer_address(),
+        )
+        .unwrap()],
+    )
+    .unwrap();
+    let mut first = lab.authority.reconcile_bearer(
+        backend.clone(),
+        parent,
+        lab.parent.clone(),
+        lab.child.clone(),
+    );
+    tokio::select! {
+        () = backend.entered.notified() => {},
+        result = &mut first => panic!("first effect escaped its acknowledgement gate: {result:?}"),
+    }
+    let mut second = lab.authority.reconcile_bearer(
+        backend.clone(),
+        sibling,
+        lab.sibling.clone(),
+        sibling_child.clone(),
+    );
+    // A progress oracle, not a latency acceptance threshold. Always settle
+    // both detached operations before asserting the failed ordering.
+    let progress = tokio::time::timeout(Duration::from_secs(1), &mut second).await;
+    let independent = progress.is_ok();
+    backend.release.notify_one();
+    drop(first.await.unwrap());
+    drop(match progress {
+        Ok(result) => result.unwrap(),
+        Err(_) => second.await.unwrap(),
+    });
+    for group in [lab.parent, lab.sibling, lab.child, sibling_child] {
+        drop(
+            lab.authority
+                .recover_active(backend.clone(), group)
+                .await
+                .unwrap(),
+        );
+    }
+    assert!(
+        independent,
+        "an unrelated child must finish before the held effect is released"
+    );
+}
+
+/// The default gate runs one pair. Explicit profiling repeats remain bounded
+/// by the reference ledger's permanent-history capacity. This is a component
+/// observation over real file-backed voters, not a packet or kernel benchmark.
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn durable_overlapping_bearer_phase_profile() {
+    use opc_session_testkit::authenticated_consumer_fixture::AuthenticatedPreparedFencedTransitionFixture;
+    use std::io::Write;
+
+    let cycles = std::env::var("OPC_SELECTOR_PROFILE_CYCLES")
+        .map(|value| value.parse::<u8>().expect("numeric cycle count"))
+        .unwrap_or(1);
+    assert!((1..=100).contains(&cycles));
+    let tenant = TenantId::from_static("bearer-durable-profile");
+    let remote = AuthenticatedPreparedFencedTransitionFixture::start_fixed_durable([
+        opc_session_store::SessionConsumerTenantNfScope::new(
+            tenant.clone(),
+            NetworkFunctionKind::from_static("epdg"),
+        ),
+    ])
+    .await
+    .unwrap();
+    let keys = Arc::new(opc_key::MemoryKeyProvider::new());
+    keys.insert_active_key(
+        opc_key::KeyId::new("bearer-profile-key").unwrap(),
+        opc_key::KeyPurpose::Session,
+        tenant.clone(),
+        opc_key::Zeroizing::new([0x68; 32]),
+    )
+    .unwrap();
+    let protected = remote
+        .open_protected_local_aead(keys, "bearer-durable-profile")
+        .await
+        .unwrap();
+    let lab = lab_with_store(SessionStore::new(protected), tenant, 3).await;
+    let snapshot = || {
+        gtpu_selector_duration_snapshot()
+            .into_iter()
+            .map(|sample| {
+                serde_json::json!({
+                    "phase": sample.phase.as_str(),
+                    "outcome": sample.outcome.as_str(),
+                    "count": sample.count,
+                    "sum_us": sample.sum_microseconds,
+                    "buckets": sample.bucket_counts,
+                })
+            })
+            .collect::<Vec<_>>()
+    };
+    let before = snapshot();
+    let storage_before = remote.local_storage_timing().unwrap().unwrap();
+    let mut create_us = Vec::new();
+    let mut delete_us = Vec::new();
+    let lab_ref = &lab;
+    for cycle in 0..cycles {
+        let parents = [&lab.parent, &lab.sibling];
+        let children: [GtpuSessionGroup; 2] = std::array::from_fn(|index| {
+            let mut context = parents[index].entries()[0].context().clone();
+            context.local_teid = Teid::new(0x2000 + u32::from(cycle) * 2 + index as u32).unwrap();
+            context.peer_teid = Teid::new(0x4000 + u32::from(cycle) * 2 + index as u32).unwrap();
+            context.bearer_mark = Some(crate::GtpBearerMark::new(6).unwrap());
+            GtpuSessionGroup::new(
+                GtpuSessionGroupId::new([3 + cycle * 2 + index as u8; 16]).unwrap(),
+                parents[index].device_id(),
+                vec![GtpuSessionEntry::new(
+                    context,
+                    parents[index].entries()[0].local_outer_address(),
+                )
+                .unwrap()],
+            )
+            .unwrap()
+        });
+        let children_ref = &children;
+        let parents_ref = &parents;
+        let create = |index: usize| async move {
+            let started = Instant::now();
+            let parent = parents_ref[index].clone();
+            let claim = lab_ref
+                .authority
+                .recover_active(lab_ref.backend.clone(), parent.clone())
+                .await
+                .unwrap();
+            let child = lab_ref
+                .authority
+                .reconcile_bearer(
+                    lab_ref.backend.clone(),
+                    claim,
+                    parent,
+                    children_ref[index].clone(),
+                )
+                .await
+                .unwrap();
+            (child, u64::try_from(started.elapsed().as_micros()).unwrap())
+        };
+        let (first, second) = tokio::join!(create(0), create(1));
+        let claims = [first.0, second.0];
+        create_us.extend([first.1, second.1]);
+        let remove = |index: usize, claim| async move {
+            let started = Instant::now();
+            let retired = lab_ref
+                .authority
+                .retire(lab_ref.backend.clone(), claim, children_ref[index].clone())
+                .await
+                .unwrap();
+            drop(retired);
+            u64::try_from(started.elapsed().as_micros()).unwrap()
+        };
+        let [first, second] = claims;
+        let (first, second) = tokio::join!(remove(0, first), remove(1, second));
+        delete_us.extend([first, second]);
+        for parent in parents {
+            drop(
+                lab.authority
+                    .recover_active(lab.backend.clone(), parent.clone())
+                    .await
+                    .unwrap(),
+            );
+        }
+    }
+    let evidence = serde_json::json!({
+        "schema": "opc-selector-component-profile-v1",
+        "resident_parents": 2,
+        "offered_concurrency": 2,
+        "cycles": cycles,
+        "create_us": create_us,
+        "delete_us": delete_us,
+        "phases_before": before,
+        "phases_after": snapshot(),
+        "storage_before": storage_before,
+        "storage_after": remote.local_storage_timing().unwrap().unwrap(),
+        "limits": ["component_boundary", "in_process_raft_transport", "simulated_dataplane"],
+    });
+    writeln!(std::io::stderr(), "selector_component_profile={evidence}").unwrap();
+    for parent in [&lab.parent, &lab.sibling] {
+        let active = lab
+            .authority
+            .recover_active(lab.backend.clone(), parent.clone())
+            .await
+            .unwrap();
+        drop(
+            lab.authority
+                .retire(lab.backend.clone(), active, parent.clone())
+                .await
+                .unwrap(),
+        );
+    }
+    drop(lab);
+    remote.shutdown().await.unwrap();
 }
 
 #[tokio::test]
