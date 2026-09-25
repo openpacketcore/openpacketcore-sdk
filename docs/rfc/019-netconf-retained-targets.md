@@ -118,6 +118,33 @@ may have been transmitted, recovery must use that operation rather than repeat
 encryption or prepare a replacement. These preparation types do not activate the
 full NETCONF runtime profile or confer recipient-only audit verification.
 
+### Frozen datastore-copy preparation
+
+`ConsensusConfigStore::read_netconf_target_copy` returns a private-field
+`NetconfTargetCopyRead` capturing a selected running/candidate/startup source
+and a distinct candidate/startup destination in one pinned authority transaction.
+Its ledger, current device/session, both lock owners and independent checkpoint
+are verified before return. An absent candidate source binds its exact tombstone
+and running fallback. An absent startup or running source is refused; the read
+does not synthesize an authenticated configuration from defaults.
+
+`decrypt_source` uses the existing provider, expected tenant and complete stored
+plaintext digest. The worker authorizes both paths and validates the configuration
+model, then pairs its immutable serialized wrapper with the original read through
+`NetconfTargetCopy::new`. `prepare_netconf_target_copy` authenticates that same
+source and compares exact serialized configuration bytes using the existing strict
+config-only/V2 parser. New replay metadata may differ; copied configuration and
+schema must remain the same. The destination envelope binds the original source
+and destination before encryption. No consumer-supplied digest asserts equality,
+and no provider or plaintext is retained in the operation or target state.
+
+Preparation preserves the original target counter, running base, destination
+lock and selected source even when state changes before it runs. Preflight and
+application independently refuse stale originals. Intent admission, terminal
+debt and original-operation recovery use the existing closed target path.
+These ports do not activate the public NETCONF target runtime; running as a
+destination continues to use its separate prepared running-copy port.
+
 Datastore copies into candidate/startup enforce the selected source's current
 lock owner as well as the destination's original lock expectation, matching the
 existing running-copy rule. An absent-candidate fallback uses the candidate

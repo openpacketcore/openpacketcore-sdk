@@ -938,3 +938,10 @@ impl TargetEffectV1 {
         Ok(())
     }
 }
+
+// Reuse the strict existing wrapper parser inside the audit preparation modules.
+pub(super) fn target_copy_configuration_bytes(
+    plaintext: &[u8],
+) -> Result<&[u8], AuditAuthorityError> {
+    target_copy::configuration_bytes(plaintext)
+}

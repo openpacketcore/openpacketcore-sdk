@@ -1011,3 +1011,72 @@ impl fmt::Debug for NetconfTargetReplacement<'_> {
         f.write_str("NetconfTargetReplacement(<redacted>)")
     }
 }
+
+/// Source and destination of one datastore copy, frozen together with their
+/// authenticated ledger and checkpoint. This SDK-issued value cannot be
+/// constructed or decoded by a consumer and grants no admission authority.
+pub struct NetconfTargetCopyRead {
+    pub(crate) destination: NetconfTargetRead,
+    pub(crate) source: NetconfTargetRead,
+}
+
+impl NetconfTargetCopyRead {
+    /// Original destination and its exact counter, running base and lock.
+    pub fn destination(&self) -> &NetconfTargetRead {
+        &self.destination
+    }
+
+    /// Source datastore selected in the same transaction as the destination.
+    pub fn source_datastore(&self) -> NetconfLockDatastore {
+        self.source.datastore()
+    }
+
+    /// Schema of the exact authenticated source. Copy preserves this schema.
+    pub fn schema(&self) -> Option<opc_types::SchemaDigest> {
+        self.source.schema()
+    }
+
+    /// Whether the original absent candidate selects its exact running fallback.
+    pub fn uses_running_fallback(&self) -> bool {
+        self.source.uses_running_fallback()
+    }
+}
+
+impl fmt::Debug for NetconfTargetCopyRead {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("NetconfTargetCopyRead(<redacted>)")
+    }
+}
+
+/// Validated serialized copy content paired with its original SDK source read.
+/// Preparation verifies exact configuration equality through the provider;
+/// new replay metadata may differ. Plaintext and provider borrows are not
+/// retained in a command, handle or target row.
+pub struct NetconfTargetCopy<'a> {
+    pub(crate) frozen: &'a NetconfTargetCopyRead,
+    pub(crate) plaintext: &'a [u8],
+    pub(crate) provider: &'a dyn opc_key::KeyProvider,
+}
+
+impl<'a> NetconfTargetCopy<'a> {
+    /// Pair the authorized, validated destination wrapper with its original
+    /// source/destination read. This constructor does not authenticate content
+    /// or grant admission. The SDK preparation port performs those checks.
+    pub fn new(
+        frozen: &'a NetconfTargetCopyRead,
+        plaintext: &'a [u8],
+        provider: &'a dyn opc_key::KeyProvider,
+    ) -> Self {
+        Self {
+            frozen,
+            plaintext,
+            provider,
+        }
+    }
+}
+
+impl fmt::Debug for NetconfTargetCopy<'_> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("NetconfTargetCopy(<redacted>)")
+    }
+}

@@ -5852,3 +5852,444 @@ async fn target_datastore_copy_refuses_source_replaced_after_preparation() {
         fixture.settle(&conn, &prepared);
     }
 }
+
+impl Fixture {
+    fn frozen_target_copy(
+        &self,
+        conn: &Connection,
+        session: &crate::audit_authority::NetconfSessionOwner,
+        source: crate::audit_authority::NetconfLockDatastore,
+        destination: crate::audit_authority::NetconfLockDatastore,
+    ) -> Result<crate::audit_authority::NetconfTargetCopyRead, AuditAuthorityError> {
+        let tx = conn.unchecked_transaction().unwrap();
+        let ledger = self.ledger(&tx);
+        let view = crate::consensus::audit_targets::read_target_copy_view_sync(
+            &tx,
+            &self.key,
+            &ledger,
+            source,
+            destination,
+            session,
+            &crate::consensus::sqlite::SqliteWorkCancellation::audit_test(),
+        )
+        .unwrap();
+        tx.commit().unwrap();
+        view
+    }
+}
+
+async fn target_copy_sdk_source(
+    fixture: &Fixture,
+    conn: &Connection,
+    source: crate::audit_authority::NetconfLockDatastore,
+    fallback: bool,
+    config: &[u8],
+) -> opc_key::MemoryKeyProvider {
+    use crate::audit_authority::NetconfLockDatastore as Store;
+    let slot = u8::from(source == Store::Startup);
+    let (provider, blob) = copy_provider_stage(fixture, conn, slot, config).await;
+    if source == Store::Running || fallback {
+        let running = copy_provider_destination(fixture, conn, &provider, slot, 181, config).await;
+        let running = bind_copy_provider(fixture, conn, &provider, &blob, running)
+            .await
+            .unwrap();
+        assert!(matches!(
+            fixture.submit(conn, &running),
+            AuditOperationState::TargetV1(_)
+        ));
+        fixture.settle(conn, &running);
+        if fallback {
+            let discard = fixture.rebind_at(conn, fixture.request(conn, 182, 5, 0x61, 1), 100);
+            assert!(matches!(
+                fixture.submit(conn, &discard),
+                AuditOperationState::TargetV1(_)
+            ));
+            fixture.settle(conn, &discard);
+        }
+    }
+    provider
+}
+
+#[tokio::test]
+async fn target_copy_sdk_freezes_each_source_and_preserves_exact_encrypted_configuration() {
+    use crate::audit_authority::{NetconfLockDatastore as Store, NetconfTargetCopy};
+    for (source, destination, fallback) in [
+        (Store::Running, Store::Candidate, false),
+        (Store::Running, Store::Startup, false),
+        (Store::Candidate, Store::Startup, false),
+        (Store::Candidate, Store::Startup, true),
+        (Store::Startup, Store::Candidate, false),
+    ] {
+        let fixture = Fixture::new().await;
+        let shared = fixture.backend.conn();
+        let conn = shared.lock().await;
+        fixture.active(&conn);
+        let config = br#"{"exact":18446744073709551617,"escaped":"\u0061","v":-0.0}"#;
+        let provider = target_copy_sdk_source(&fixture, &conn, source, fallback, config).await;
+        let worker = std::sync::Arc::new(());
+        let session = fixture.session_owner(&conn, &worker, 0x61);
+        let frozen = fixture
+            .frozen_target_copy(&conn, &session, source, destination)
+            .unwrap();
+        assert_eq!(frozen.source_datastore(), source);
+        assert_eq!(frozen.destination().datastore(), destination);
+        assert_eq!(frozen.uses_running_fallback(), fallback);
+        let source_plaintext = copy_plaintext(
+            if source == Store::Running || fallback {
+                181
+            } else {
+                180
+            },
+            config,
+        );
+        let tenant = opc_types::TenantId::from_static("fixture-tenant");
+        assert_eq!(
+            *frozen.decrypt_source(&provider, &tenant).await.unwrap(),
+            source_plaintext
+        );
+        let source_row = match source {
+            Store::Candidate => Some(row(&conn, "config_netconf_targets", "target", 0)),
+            Store::Startup => Some(row(&conn, "config_netconf_targets", "target", 1)),
+            Store::Running => None,
+        };
+        let running = fixture.device_view(&conn).running_version;
+        let plaintext = copy_plaintext(207, config);
+        let mut event = fixture.event(207);
+        event.operation = ManagementAuditOperationCode::Replace;
+        let before = target_rows(&conn);
+        let changes = conn.total_changes();
+        let effect = frozen
+            .prepare_copy(
+                &session,
+                NetconfTargetCopy::new(&frozen, &plaintext, &provider),
+                tenant.clone(),
+                &event,
+                160,
+            )
+            .await
+            .unwrap();
+        let prepared = fixture.bind_frozen_target(frozen.destination(), effect, event);
+        assert_eq!(fixture.preflight(&conn, &prepared, 100).unwrap(), None);
+        assert_eq!(conn.total_changes(), changes);
+        assert_eq!(target_rows(&conn), before);
+        let known = fixture.submit(&conn, &prepared);
+        assert!(matches!(&known, AuditOperationState::TargetV1(result)
+        if match (destination, result.outcome()) {
+            (Store::Candidate, NetconfAppliedOutcome::Candidate { generation }) =>
+                generation.get() == frozen.destination().candidate_generation().unwrap().get() + 1,
+            (Store::Startup, NetconfAppliedOutcome::Startup { revision }) =>
+                revision.get() == frozen.destination().startup_revision().unwrap().get() + 1,
+            _ => false,
+        }));
+        let retained = target_rows(&conn);
+        assert_eq!(fixture.submit(&conn, &prepared), known);
+        assert_eq!(target_rows(&conn), retained);
+        assert!(matches!(
+            fixture.frozen_target_copy(&conn, &session, source, destination),
+            Err(AuditAuthorityError::RecoveryRequired)
+        ));
+        assert!(!fixture
+            .ledger(&conn)
+            .lookup(&fixture.key, prepared.handle(), prepared.effect.caller)
+            .unwrap()
+            .unwrap()
+            .terminal_recorded());
+        fixture.settle(&conn, &prepared);
+        if let Some(original) = source_row {
+            let slot = u8::from(source == Store::Startup);
+            assert_eq!(
+                row(&conn, "config_netconf_targets", "target", slot),
+                original
+            );
+        }
+        assert_eq!(fixture.device_view(&conn).running_version, running);
+        let readback = fixture.frozen_target(&conn, &session, destination).unwrap();
+        assert_eq!(
+            *readback
+                .decrypt_configuration(&provider, &tenant)
+                .await
+                .unwrap()
+                .unwrap(),
+            plaintext
+        );
+        assert_ne!(source_plaintext, plaintext);
+    }
+}
+
+#[tokio::test]
+async fn target_copy_sdk_refuses_content_session_context_and_provider_substitution() {
+    use crate::audit_authority::{NetconfLockDatastore as Store, NetconfTargetCopy};
+    let fixture = Fixture::new().await;
+    let shared = fixture.backend.conn();
+    let conn = shared.lock().await;
+    fixture.active(&conn);
+    let config = br#"{"authorized":1}"#;
+    let provider = target_copy_sdk_source(&fixture, &conn, Store::Candidate, false, config).await;
+    let worker = std::sync::Arc::new(());
+    let session = fixture.session_owner(&conn, &worker, 0x61);
+    let other = fixture.session_owner(&conn, &worker, 0x62);
+    let mut frozen = fixture
+        .frozen_target_copy(&conn, &session, Store::Candidate, Store::Startup)
+        .unwrap();
+    let another = fixture
+        .frozen_target_copy(&conn, &session, Store::Candidate, Store::Startup)
+        .unwrap();
+    let plaintext = copy_plaintext(208, config);
+    let substituted = copy_plaintext(208, br#"{"authorized":2}"#);
+    let tenant = opc_types::TenantId::from_static("fixture-tenant");
+    let mut event = fixture.event(208);
+    event.operation = ManagementAuditOperationCode::Replace;
+    let before = target_rows(&conn);
+    let changes = conn.total_changes();
+    for bytes in [substituted.as_slice(), b"not-json".as_slice()] {
+        assert!(
+            matches!(
+                frozen
+                    .prepare_copy(
+                        &session,
+                        NetconfTargetCopy::new(&frozen, bytes, &provider),
+                        tenant.clone(),
+                        &event,
+                        160
+                    )
+                    .await,
+                Err(AuditAuthorityError::BindingMismatch)
+            ),
+            "SDK datastore copy accepted substituted configuration"
+        );
+    }
+    for (owner, original) in [(&other, &frozen), (&session, &another)] {
+        assert!(matches!(
+            frozen
+                .prepare_copy(
+                    owner,
+                    NetconfTargetCopy::new(original, &plaintext, &provider),
+                    tenant.clone(),
+                    &event,
+                    160
+                )
+                .await,
+            Err(AuditAuthorityError::BindingMismatch)
+        ));
+    }
+    for variant in 0..4 {
+        let mut wrong = event.clone();
+        match variant {
+            0 => wrong.operation = ManagementAuditOperationCode::Update,
+            1 => wrong.transport = ManagementAuditTransportCode::Internal,
+            2 => wrong.outcome = ManagementAuditOutcomeCode::Success,
+            _ => {
+                wrong.caller = crate::audit_authority::AuditCaller::project(
+                    &fixture.privacy,
+                    "fixture-tenant",
+                    "fixture-other",
+                )
+                .unwrap()
+            }
+        }
+        assert!(matches!(
+            frozen
+                .prepare_copy(
+                    &session,
+                    NetconfTargetCopy::new(&frozen, &plaintext, &provider),
+                    tenant.clone(),
+                    &wrong,
+                    160
+                )
+                .await,
+            Err(AuditAuthorityError::BindingMismatch)
+        ));
+    }
+    let missing = opc_key::MemoryKeyProvider::new();
+    assert!(matches!(
+        frozen
+            .prepare_copy(
+                &session,
+                NetconfTargetCopy::new(&frozen, &plaintext, &missing),
+                tenant.clone(),
+                &event,
+                160
+            )
+            .await,
+        Err(AuditAuthorityError::Unavailable)
+    ));
+    assert!(matches!(
+        frozen
+            .prepare_copy(
+                &session,
+                NetconfTargetCopy::new(&frozen, &plaintext, &provider),
+                opc_types::TenantId::from_static("fixture-other-tenant"),
+                &event,
+                160
+            )
+            .await,
+        Err(AuditAuthorityError::BindingMismatch)
+    ));
+    frozen.source.content.as_mut().unwrap().plaintext_digest[0] ^= 1;
+    assert!(matches!(
+        frozen
+            .prepare_copy(
+                &session,
+                NetconfTargetCopy::new(&frozen, &plaintext, &provider),
+                tenant.clone(),
+                &event,
+                160
+            )
+            .await,
+        Err(AuditAuthorityError::BindingMismatch)
+    ));
+    frozen.source.content.as_mut().unwrap().plaintext_digest[0] ^= 1;
+    *frozen
+        .source
+        .content
+        .as_mut()
+        .unwrap()
+        .encrypted
+        .last_mut()
+        .unwrap() ^= 1;
+    assert!(frozen
+        .prepare_copy(
+            &session,
+            NetconfTargetCopy::new(&frozen, &plaintext, &provider),
+            tenant,
+            &event,
+            160
+        )
+        .await
+        .is_err());
+    assert_eq!(conn.total_changes(), changes);
+    assert_eq!(target_rows(&conn), before);
+}
+
+#[tokio::test]
+async fn target_copy_sdk_refuses_absent_same_and_running_destinations_before_effect() {
+    use crate::audit_authority::NetconfLockDatastore as Store;
+    let fixture = Fixture::new().await;
+    let shared = fixture.backend.conn();
+    let conn = shared.lock().await;
+    fixture.active(&conn);
+    let worker = std::sync::Arc::new(());
+    let session = fixture.session_owner(&conn, &worker, 0x61);
+    let before = target_rows(&conn);
+    let changes = conn.total_changes();
+    for (source, destination) in [
+        (Store::Running, Store::Candidate),
+        (Store::Running, Store::Startup),
+        (Store::Candidate, Store::Startup),
+        (Store::Startup, Store::Candidate),
+        (Store::Candidate, Store::Candidate),
+        (Store::Startup, Store::Startup),
+        (Store::Candidate, Store::Running),
+    ] {
+        assert!(matches!(
+            fixture.frozen_target_copy(&conn, &session, source, destination),
+            Err(AuditAuthorityError::InvalidInput)
+        ));
+    }
+    assert_eq!(conn.total_changes(), changes);
+    assert_eq!(target_rows(&conn), before);
+}
+
+#[tokio::test]
+async fn target_copy_sdk_never_refreshes_original_source_destination_or_locks() {
+    use crate::audit_authority::{
+        NetconfLockDatastore as Store, NetconfTargetCopy, NetconfTargetReplacement,
+    };
+    for change in [
+        "source",
+        "destination",
+        "source-lock",
+        "destination-lock",
+        "fallback",
+    ] {
+        let fixture = Fixture::new().await;
+        let shared = fixture.backend.conn();
+        let conn = shared.lock().await;
+        fixture.active(&conn);
+        let config = br#"{"original":1}"#;
+        let provider = target_copy_sdk_source(
+            &fixture,
+            &conn,
+            Store::Candidate,
+            change == "fallback",
+            config,
+        )
+        .await;
+        let worker = std::sync::Arc::new(());
+        let session = fixture.session_owner(&conn, &worker, 0x62);
+        let frozen = fixture
+            .frozen_target_copy(&conn, &session, Store::Candidate, Store::Startup)
+            .unwrap();
+        let copied = copy_plaintext(209, config);
+        // Change authoritative state before encryption/preparation. The SDK
+        // must still prepare the exact saved read, then reject it at preflight.
+        if change.ends_with("-lock") {
+            let slot = if change == "source-lock" { 1 } else { 2 };
+            let locked = fixture.rebind_at(&conn, fixture.request(&conn, 210, 2, 0x61, slot), 100);
+            assert!(matches!(
+                fixture.submit(&conn, &locked),
+                AuditOperationState::TargetV1(_)
+            ));
+            fixture.settle(&conn, &locked);
+        } else {
+            let owner = fixture.session_owner(&conn, &worker, 0x61);
+            let changed_store = if change == "destination" {
+                Store::Startup
+            } else {
+                Store::Candidate
+            };
+            let base = fixture.frozen_target(&conn, &owner, changed_store).unwrap();
+            let replacement = copy_plaintext(210, br#"{"replacement":2}"#);
+            let mut event = fixture.event(210);
+            event.operation = ManagementAuditOperationCode::Update;
+            let effect = base
+                .prepare_replacement(
+                    &owner,
+                    NetconfTargetReplacement::edit(
+                        &base,
+                        &replacement,
+                        frozen.schema().unwrap(),
+                        &provider,
+                    ),
+                    opc_types::TenantId::from_static("fixture-tenant"),
+                    &event,
+                    160,
+                )
+                .await
+                .unwrap();
+            let changed = fixture.bind_frozen_target(&base, effect, event);
+            assert!(matches!(
+                fixture.submit(&conn, &changed),
+                AuditOperationState::TargetV1(_)
+            ));
+            fixture.settle(&conn, &changed);
+        }
+        let before = target_rows(&conn);
+        let changes = conn.total_changes();
+        let mut event = fixture.event(209);
+        event.operation = ManagementAuditOperationCode::Replace;
+        let effect = frozen
+            .prepare_copy(
+                &session,
+                NetconfTargetCopy::new(&frozen, &copied, &provider),
+                opc_types::TenantId::from_static("fixture-tenant"),
+                &event,
+                160,
+            )
+            .await
+            .unwrap();
+        let stale = fixture.bind_frozen_target(frozen.destination(), effect, event);
+        assert!(
+            matches!(
+                fixture.preflight(&conn, &stale, 100),
+                Err(AuditAuthorityError::BindingMismatch)
+            ),
+            "SDK target copy refreshed an original source, destination or lock expectation"
+        );
+        assert_eq!(conn.total_changes(), changes);
+        assert_eq!(target_rows(&conn), before);
+        assert_eq!(fixture.submit(&conn, &stale), AuditOperationState::Rejected);
+        assert_eq!(target_rows(&conn), before);
+        fixture.settle(&conn, &stale);
+    }
+}

@@ -2426,3 +2426,219 @@ impl crate::audit_authority::NetconfTargetRead {
         Ok(effect)
     }
 }
+
+/// Select the original source and destination in the caller's pinned read.
+pub(crate) fn read_target_copy_view_sync(
+    conn: &Connection,
+    key: &AuditKey,
+    ledger: &LedgerState,
+    source: crate::audit_authority::NetconfLockDatastore,
+    destination: crate::audit_authority::NetconfLockDatastore,
+    session: &crate::audit_authority::NetconfSessionOwner,
+    cancellation: &SqliteWorkCancellation,
+) -> io::Result<Result<crate::audit_authority::NetconfTargetCopyRead, AuditAuthorityError>> {
+    use crate::audit_authority::{
+        NetconfLockDatastore as Store, NetconfTargetCopyRead, NetconfTargetRead,
+        NetconfTargetReadContent,
+    };
+    if source == destination || destination == Store::Running {
+        return Ok(Err(AuditAuthorityError::InvalidInput));
+    }
+    let frozen = match read_target_view_sync(conn, key, ledger, destination, session, cancellation)?
+    {
+        Ok(frozen) => frozen,
+        Err(error) => return Ok(Err(error)),
+    };
+    let device = read_device_view_sync(conn, key, ledger, cancellation)?;
+    let bad = AuditAuthorityError::BindingMismatch;
+    let Some(lock) = device.locks[source.slot()] else {
+        return Ok(Err(bad));
+    };
+    if lock
+        .session
+        .is_some_and(|owner| owner != session.incarnation())
+        || lock.caller.is_some_and(|caller| caller != session.caller)
+    {
+        return Ok(Err(bad));
+    }
+    let (source, blob) = if source == Store::Running {
+        if device.running_version == 0 {
+            return Ok(Err(AuditAuthorityError::InvalidInput));
+        }
+        let (schema, plaintext, encrypted): (Vec<u8>, Vec<u8>, Vec<u8>) = conn.query_row(
+            "SELECT schema_digest,plaintext_digest,encrypted_blob FROM config_history WHERE version=?1",
+            [device.running_version], |r| Ok((r.get(0)?,r.get(1)?,r.get(2)?)),
+        ).map_err(|_| invalid())?;
+        let blob = TargetEncryptedBlobV1 {
+            schema: opc_types::SchemaDigest::from_bytes(schema.try_into().map_err(|_| invalid())?),
+            plaintext_digest: plaintext.try_into().map_err(|_| invalid())?,
+            encrypted_blob: encrypted,
+        };
+        (
+            TargetSourceV1::Running {
+                version: device.running_version,
+                schema: blob.schema,
+                ciphertext_digest: Sha256::digest(&blob.encrypted_blob).into(),
+            },
+            blob,
+        )
+    } else {
+        match read_copy_view_sync(conn, key, ledger, source, cancellation)? {
+            Ok(copy) => (copy.source, copy.blob),
+            Err(error) => return Ok(Err(error)),
+        }
+    };
+    let (datastore, counter, fallback) = match source {
+        TargetSourceV1::Running { version, .. } => (Store::Running, version, false),
+        TargetSourceV1::Candidate { generation, .. } => (Store::Candidate, generation.get(), false),
+        TargetSourceV1::CandidateFallback { generation, .. } => {
+            (Store::Candidate, generation.get(), true)
+        }
+        TargetSourceV1::Startup { revision, .. } => (Store::Startup, revision.get(), false),
+    };
+    cancellation.check_io()?;
+    Ok(Ok(NetconfTargetCopyRead {
+        destination: frozen,
+        source: NetconfTargetRead {
+            session: session.clone(),
+            datastore,
+            counter,
+            running_base: device.running_version,
+            lock_incarnation: lock.incarnation,
+            lock_session: lock.session,
+            fallback,
+            content: Some(NetconfTargetReadContent {
+                schema: blob.schema,
+                plaintext_digest: blob.plaintext_digest,
+                encrypted: blob.encrypted_blob,
+            }),
+        },
+    }))
+}
+
+impl crate::audit_authority::NetconfTargetCopyRead {
+    /// Authenticate the frozen source through the existing provider for the
+    /// expected tenant. The zeroizing result retains the original wrapper.
+    /// Model validation and authorization of both datastores remain upstream.
+    pub async fn decrypt_source(
+        &self,
+        provider: &dyn opc_key::KeyProvider,
+        tenant: &opc_types::TenantId,
+    ) -> Result<zeroize::Zeroizing<Vec<u8>>, AuditAuthorityError> {
+        self.source
+            .decrypt_configuration(provider, tenant)
+            .await?
+            .ok_or(AuditAuthorityError::BindingMismatch)
+    }
+
+    pub(crate) async fn prepare_copy(
+        &self,
+        session: &crate::audit_authority::NetconfSessionOwner,
+        copy: crate::audit_authority::NetconfTargetCopy<'_>,
+        tenant: opc_types::TenantId,
+        event: &crate::audit_authority::ProjectedAuditEvent,
+        expires_at: i64,
+    ) -> Result<super::audit_mutation::TargetEffectV1, AuditAuthorityError> {
+        use crate::audit_authority::{NetconfLockDatastore as Store, NetconfTargetReplacement};
+        use crate::ManagementAuditTransportCode as Transport;
+        self.destination.verify_session(session)?;
+        self.source.verify_session(session)?;
+        let bad = AuditAuthorityError::BindingMismatch;
+        if !std::ptr::eq(self, copy.frozen)
+            || event.caller != session.caller
+            || event.operation != crate::ManagementAuditOperationCode::Replace
+            || event.outcome != crate::ManagementAuditOutcomeCode::Intent
+            || !matches!(
+                event.transport,
+                Transport::NetconfSsh | Transport::NetconfTls
+            )
+        {
+            return Err(bad);
+        }
+        if copy.plaintext.len() > super::sqlite::CONFIG_CONSENSUS_LOG_ENTRY_MAX_BYTES {
+            return Err(AuditAuthorityError::InvalidInput);
+        }
+        let destination_config =
+            super::audit_mutation::target_copy_configuration_bytes(copy.plaintext)?;
+        let source_plaintext = self.decrypt_source(copy.provider, &tenant).await?;
+        if destination_config
+            != super::audit_mutation::target_copy_configuration_bytes(&source_plaintext)?
+        {
+            return Err(bad);
+        }
+        let frozen = &self.destination;
+        let content = self.source.content.as_ref().ok_or(bad)?;
+        let ciphertext_digest = Sha256::digest(&content.encrypted).into();
+        let source = match self.source.datastore {
+            Store::Running => TargetSourceV1::Running {
+                version: self.source.running_base,
+                schema: content.schema,
+                ciphertext_digest,
+            },
+            Store::Candidate if self.source.fallback => TargetSourceV1::CandidateFallback {
+                generation: self.source.candidate_generation().ok_or(bad)?,
+                running_version: self.source.running_base,
+                schema: content.schema,
+                ciphertext_digest,
+            },
+            Store::Candidate => TargetSourceV1::Candidate {
+                generation: self.source.candidate_generation().ok_or(bad)?,
+                schema: content.schema,
+                ciphertext_digest,
+            },
+            Store::Startup => TargetSourceV1::Startup {
+                revision: self.source.startup_revision().ok_or(bad)?,
+                schema: content.schema,
+                ciphertext_digest,
+            },
+        };
+        let (action, destination) = match frozen.datastore {
+            Store::Candidate => (
+                4,
+                TargetExpectationV1::Candidate {
+                    generation: frozen.candidate_generation().ok_or(bad)?,
+                },
+            ),
+            Store::Startup => (
+                7,
+                TargetExpectationV1::Startup {
+                    revision: frozen.startup_revision().ok_or(bad)?,
+                },
+            ),
+            Store::Running => return Err(AuditAuthorityError::InvalidInput),
+        };
+        let mut effect = super::audit_mutation::TargetEffectV1 {
+            format: 1,
+            authority: session.device.authority,
+            profile_incarnation: session.device.profile_incarnation,
+            device_incarnation: session.device.device_incarnation,
+            caller: event.caller,
+            request: event.request,
+            action: action.try_into()?,
+            destination,
+            source: Some(source),
+            lock: Some(super::audit_mutation::TargetLockExpectationV1 {
+                datastore: frozen.datastore.slot() as u8,
+                incarnation: frozen.lock_incarnation,
+                session: frozen.lock_session,
+                requester: session.incarnation(),
+            }),
+            expires_at,
+            encrypted_payload: None,
+            resolution: None,
+        };
+        effect
+            .bind_target_plaintext(
+                tenant,
+                NetconfTargetReplacement::inline_copy(
+                    frozen,
+                    copy.plaintext,
+                    content.schema,
+                    copy.provider,
+                ),
+            )
+            .await?;
+        frozen.verify_session(session)?;
+        Ok(effect)
+    }
+}
