@@ -368,6 +368,7 @@ impl ConfigMutationIntent {
                 | super::audit::AuditCommand::Reject(_)
                 | super::audit::AuditCommand::Terminal(_) => 5,
                 super::audit::AuditCommand::AcknowledgeExport(_) => 7,
+                super::audit::AuditCommand::NetconfTarget(_) => 9,
                 _ => 6,
             },
         }
@@ -465,7 +466,9 @@ impl ConfigConsensusCommand {
             4 => self.intent.minimum_command_version() <= 4,
             5 => self.intent.minimum_command_version() <= 5,
             6 => self.intent.minimum_command_version() <= 6,
-            CONFIG_CONSENSUS_COMMAND_VERSION => true,
+            CONFIG_CONSENSUS_COMMAND_VERSION => {
+                self.intent.minimum_command_version() <= CONFIG_CONSENSUS_COMMAND_VERSION
+            }
             _ => false,
         };
         if !supported_revision || self.identity != identity {

@@ -8,7 +8,7 @@
 mod audit;
 mod audit_mutation;
 mod audit_targets;
-pub use audit_mutation::PreparedAuditedMutation;
+pub use audit_mutation::{PreparedAuditedMutation, PreparedTargetMutation};
 pub use audit_targets::RetainedConfigProfile;
 pub(crate) mod history;
 mod raft_adapter;

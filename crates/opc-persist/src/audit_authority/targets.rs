@@ -10,7 +10,7 @@ use crate::ConfigConsensusIdentity;
 
 // Preserve the existing identity's bytes while rejecting unknown fields inside
 // the new target-v1 format. The legacy identity codec is not changed.
-mod identity {
+pub(crate) mod identity {
     use super::*;
     use crate::{
         ConfigConsensusClusterId, ConfigConsensusConfigurationEpoch, ConfigConsensusConfigurationId,
@@ -24,14 +24,14 @@ mod identity {
         configuration_epoch: ConfigConsensusConfigurationEpoch,
     }
 
-    pub(super) fn serialize<S: serde::Serializer>(
+    pub(crate) fn serialize<S: serde::Serializer>(
         value: &ConfigConsensusIdentity,
         serializer: S,
     ) -> Result<S::Ok, S::Error> {
         value.serialize(serializer)
     }
 
-    pub(super) fn deserialize<'de, D: serde::Deserializer<'de>>(
+    pub(crate) fn deserialize<'de, D: serde::Deserializer<'de>>(
         deserializer: D,
     ) -> Result<ConfigConsensusIdentity, D::Error> {
         let value = Body::deserialize(deserializer)?;
@@ -40,6 +40,37 @@ mod identity {
             value.configuration_id,
             value.configuration_epoch,
         ))
+    }
+}
+
+// The target format rejects extra caller fields without changing the legacy
+// projected event or operation-handle encoding.
+pub(crate) mod caller {
+    use super::super::{AuditCaller, AuditToken};
+    use serde::{Deserialize, Serialize};
+
+    #[derive(Deserialize)]
+    #[serde(deny_unknown_fields)]
+    struct Body {
+        tenant: AuditToken,
+        principal: AuditToken,
+    }
+
+    pub(crate) fn serialize<S: serde::Serializer>(
+        value: &AuditCaller,
+        serializer: S,
+    ) -> Result<S::Ok, S::Error> {
+        value.serialize(serializer)
+    }
+
+    pub(crate) fn deserialize<'de, D: serde::Deserializer<'de>>(
+        deserializer: D,
+    ) -> Result<AuditCaller, D::Error> {
+        let value = Body::deserialize(deserializer)?;
+        Ok(AuditCaller {
+            tenant: value.tenant,
+            principal: value.principal,
+        })
     }
 }
 

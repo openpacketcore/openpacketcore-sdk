@@ -16,7 +16,7 @@ use crate::audit_authority::{
 };
 use crate::{AuditKey, ConfigConsensusIdentity};
 
-#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub(crate) enum AuditCommand {
     Initialize {
@@ -38,6 +38,8 @@ pub(crate) enum AuditCommand {
         checkpoint: AuditCheckpoint,
     },
     AcknowledgeExport(AuditCheckpoint),
+    // Append-only nested allocation; outer management-audit remains tag 6.
+    NetconfTarget(Box<super::audit_mutation::PreparedTargetMutation>),
 }
 
 impl std::fmt::Debug for AuditCommand {
@@ -265,6 +267,9 @@ pub(crate) fn apply_sync(
                 } => keys
                     .ok_or(AuditAuthorityError::KeyUnavailable)
                     .and_then(|keys| ledger.prune(keys, *through, checkpoint, now)),
+                AuditCommand::NetconfTarget(prepared) => prepared
+                    .verify_effect(key)
+                    .and(Err(AuditAuthorityError::RecoveryRequired)),
                 AuditCommand::Initialize { .. } | AuditCommand::InitializeWithContinuity { .. } => {
                     Err(AuditAuthorityError::InvalidInput)
                 }

@@ -16,7 +16,7 @@ use crate::management_audit::{
     ManagementAuditTransportCode,
 };
 
-pub use crate::consensus::PreparedAuditedMutation;
+pub use crate::consensus::{PreparedAuditedMutation, PreparedTargetMutation};
 /// Authenticated retained epochs, portable exports and external checkpoints.
 pub mod continuity;
 pub(crate) mod ledger;
@@ -26,6 +26,7 @@ pub use ledger::{
     AuditAdmission, AuditLedgerLimits, AuditOperationHandle, AuditOperationReceipt,
     AuditOperationState,
 };
+pub(crate) use targets::{caller as target_caller, identity as target_identity};
 pub use targets::{
     CandidateGeneration, NetconfAppliedOutcome, NetconfIncarnation, NetconfPendingConfirmation,
     NetconfTargetResult, StartupRevision,
