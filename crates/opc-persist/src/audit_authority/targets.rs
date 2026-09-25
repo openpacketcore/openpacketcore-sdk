@@ -476,6 +476,7 @@ impl fmt::Debug for NetconfTargetResult {
 /// a fresh device incarnation before it can acquire its own serving capability.
 #[derive(Clone)]
 pub struct PreparedNetconfDevice {
+    pub(crate) recovery: super::NetconfRecoveryCache,
     pub(crate) worker: NetconfWorkerBinding,
     pub(crate) prepared: super::PreparedTargetMutation,
 }
@@ -499,6 +500,7 @@ impl fmt::Debug for PreparedNetconfDevice {
 /// configuration authority; possession alone does not establish liveness.
 #[derive(Clone)]
 pub struct NetconfDeviceOwner {
+    pub(crate) recovery: super::NetconfRecoveryCache,
     pub(crate) worker: NetconfWorkerBinding,
     pub(crate) authority: ConfigConsensusIdentity,
     pub(crate) profile_incarnation: [u8; 16],

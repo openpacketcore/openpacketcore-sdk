@@ -22,8 +22,14 @@ pub(crate) use targets::NetconfPendingView;
 /// Authenticated retained epochs, portable exports and external checkpoints.
 pub mod continuity;
 pub(crate) mod ledger;
+mod netconf_recovery;
 pub(crate) mod receipt;
 mod targets;
+pub(crate) use netconf_recovery::{NetconfRecoveryCache, NetconfRollbackView};
+pub use netconf_recovery::{
+    NetconfRecoveryOwner, NetconfRollback, NetconfRollbackCause, NetconfRollbackRead,
+};
+
 pub use ledger::{
     AuditAdmission, AuditLedgerLimits, AuditOperationHandle, AuditOperationReceipt,
     AuditOperationState,

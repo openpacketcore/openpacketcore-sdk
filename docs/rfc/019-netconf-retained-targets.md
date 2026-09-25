@@ -576,3 +576,45 @@ credentials or providers. Internal timeout, session-loss and reboot rollback
 require a distinct SDK recovery capability; caller-provided transport or a revoked
 session cannot confer it. These preparation ports do not activate the public
 full-profile runtime.
+
+
+### Internal rollback preparation
+
+The recovery owner is distinct from serving and session authority. It derives
+from the exact device owner or from that worker's exact applied device-start
+preparation after its terminal checkpoint settles. Retained reboot cleanup still
+refuses a serving owner. A numeric session, decoded target handle, local session
+invalidation, or store/voter reopen cannot construct a reboot or session-loss
+cause.
+
+A quorum-current read freezes the original pending confirmation, original deadline,
+tentative transaction/version and authenticated parent ciphertext. It selects
+session loss only after retained cleanup for the original nonpersistent owner,
+reboot only after the explicit device transition, and timeout only at the original
+deadline. Persistent session loss alone supplies no early rollback. Every new
+read verifies current device administrator scope and refuses unsettled audit debt.
+
+The trusted embedding authenticates the Internal Exec Intent's administrator.
+The SDK uses the admitted privacy projection to link this event to the original
+projected client and tentative transaction. No raw client principal or confirmation
+credential is reconstructed. The independently expected tenant must match the
+original caller projection and parent AAD. Existing provider authentication proves
+that the attested successor copies the exact parent configuration with the original
+tentative transaction as its parent, the next running version, and the unchanged
+rollback source. No new confirmed deadline or legacy resolution is accepted.
+
+Device/preparation clones share one bounded original read and prepared attempt.
+Provider cancellation before retention admits nothing; once retained, the exact
+original remains available independently of RPC cancellation or later device
+changes. Admission, intent checkpoint, exact application and terminal checkpoint
+use the existing target protocol. A duplicate preparation cannot silently replace
+that operation or extend its expiry. Recovered known outcomes keep their original
+meaning after reporting failures or ownership changes.
+
+A fresh process first uses the existing privileged audit-obligation reconciler.
+It finishes known original results and only rejects undecided intents after their
+fixed expiry. Live uncertainty blocks a new device; elapsed RPC time alone never
+proves rejection. Recovery of expired, definitively rejected rollback attempts
+requires an explicit settled-predecessor successor operation, not this initial
+preparation method. Public runtime/process/leadership and active-profile
+compatibility qualification remain required before full-profile availability.

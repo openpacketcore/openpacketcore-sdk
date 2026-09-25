@@ -930,6 +930,7 @@ impl ConsensusConfigStore {
         prepared.verify_effect(self.inner.backend.audit_key())?;
         self.preflight_netconf_target(&prepared).await?;
         Ok(crate::audit_authority::PreparedNetconfDevice {
+            recovery: Default::default(),
             worker: crate::audit_authority::NetconfWorkerBinding::new(&self.inner),
             prepared,
         })
@@ -961,6 +962,7 @@ impl ConsensusConfigStore {
         };
         prepared.prepared.validate_result(result)?;
         let owner = crate::audit_authority::NetconfDeviceOwner {
+            recovery: prepared.recovery.clone(),
             worker: prepared.worker.clone(),
             authority: self.inner.identity,
             profile_incarnation: prepared.prepared.effect.profile_incarnation,
@@ -2376,5 +2378,187 @@ impl ConsensusConfigStore {
         self.preflight_netconf_target(&prepared).await?;
         frozen.verify_session(session)?;
         Ok(prepared)
+    }
+}
+
+impl ConsensusConfigStore {
+    /// Claim only rollback recovery after this worker's exact device-start
+    /// result and terminal checkpoint settle. Pending reboot cleanup still
+    /// refuses a serving owner. No numeric session, decoded mutation or local
+    /// invalidation can construct this capability.
+    ///
+    /// On process restart, reconcile original audit debt through
+    /// `reconcile_audit_obligations` before preparing a new device. Live unknown
+    /// intents retain their fixed expiry and cannot authorize replacement work.
+    pub async fn claim_netconf_recovery_owner(
+        &self,
+        prepared: &crate::audit_authority::PreparedNetconfDevice,
+        receipt: &AuditOperationReceipt,
+        caller: AuditCaller,
+    ) -> Result<crate::audit_authority::NetconfRecoveryOwner, AuditAuthorityError> {
+        if !prepared.worker.belongs_to(&self.inner) {
+            return Err(AuditAuthorityError::BindingMismatch);
+        }
+        self.verify_netconf_target(&prepared.prepared, caller)?;
+        if receipt.handle != prepared.prepared.handle {
+            return Err(AuditAuthorityError::BindingMismatch);
+        }
+        let crate::audit_authority::AuditOperationState::TargetV1(result) = receipt.state() else {
+            return Err(AuditAuthorityError::BindingMismatch);
+        };
+        prepared.prepared.validate_result(result)?;
+        let owner = crate::audit_authority::NetconfRecoveryOwner {
+            worker: prepared.worker.clone(),
+            authority: self.inner.identity,
+            profile_incarnation: prepared.prepared.effect.profile_incarnation,
+            device_incarnation: prepared.prepared.effect.device_incarnation,
+            caller,
+            cache: prepared.recovery.clone(),
+        };
+        self.read_netconf_device_view()
+            .await?
+            .verify_recovery_owner(&owner)?;
+        Ok(owner)
+    }
+
+    /// Freeze an eligible original rollback under a quorum-current, independently
+    /// checkpointed retained read. The SDK selects timeout, retained session loss
+    /// or explicit device reboot; the caller cannot supply a cause. Persistent
+    /// session loss alone yields no rollback. A voter restart is not device reboot.
+    ///
+    /// Device-owner clones retain one original read/attempt. After uncertainty,
+    /// use the read's `original` operation and ordinary exact-handle recovery;
+    /// this method cannot turn unresolved audit debt into a fresh preparation.
+    pub async fn read_netconf_rollback(
+        &self,
+        owner: &crate::audit_authority::NetconfRecoveryOwner,
+    ) -> Result<Option<crate::audit_authority::NetconfRollbackRead>, AuditAuthorityError> {
+        self.require_netconf_target_profile()?;
+        if !owner.worker.belongs_to(&self.inner) || owner.authority != self.inner.identity {
+            return Err(AuditAuthorityError::BindingMismatch);
+        }
+        self.linearizable_barrier()
+            .await
+            .map_err(|_| AuditAuthorityError::Unavailable)?;
+        let now = self
+            .inner
+            .clock
+            .now_utc()
+            .as_offset_datetime()
+            .unix_timestamp();
+        let backend = self.inner.backend.clone();
+        let identity = self.inner.identity;
+        let scope = owner.clone();
+        let (ledger, view) = super::super::run_backend_sqlite_with_timeout(
+            &self.inner.backend,
+            self.inner.operation_timeout,
+            move |conn, cancellation| {
+                let unavailable = || std::io::Error::other("rollback authority unavailable");
+                let tx = conn.unchecked_transaction().map_err(|_| unavailable())?;
+                super::super::sqlite::validate_live_history_schema_for_profile(
+                    &tx,
+                    cancellation,
+                    crate::RetainedConfigProfile::NetconfTargetsV1,
+                )?;
+                let keys = backend.management_audit_keys().ok_or_else(unavailable)?;
+                let ledger = super::super::audit::read_with_keys_sync(
+                    &tx,
+                    backend.audit_key(),
+                    Some(&keys),
+                    identity,
+                )?
+                .ok_or_else(unavailable)?;
+                let view = super::super::audit_targets::read_rollback_view_sync(
+                    &tx,
+                    backend.audit_key(),
+                    &ledger,
+                    &scope,
+                    now,
+                    cancellation,
+                )?;
+                cancellation.check_io()?;
+                tx.commit().map_err(|_| unavailable())?;
+                Ok((ledger, view))
+            },
+        )
+        .await
+        .map_err(|_| AuditAuthorityError::Unavailable)?;
+        self.verify_audit_checkpoint(&ledger).await?;
+        view?.map(|view| owner.remember(view)).transpose()
+    }
+
+    /// Prepare one provider-authenticated rollback against the exact frozen
+    /// pending operation, parent and original confirmed deadline. The Internal
+    /// Exec Intent authenticates the device administrator; the SDK links it to
+    /// the original projected client without accepting new client credentials.
+    /// `tenant` is the independently expected configuration tenant.
+    ///
+    /// The first preparation is retained across all read/device clones before
+    /// any transmission. If an original already exists, recover it through
+    /// `NetconfRollbackRead::original`; do not encrypt or prepare a replacement.
+    /// No intent or effect is submitted here. Required admission, checkpoint,
+    /// submission and terminal completion use that exact mutation and its
+    /// authenticated `original_caller` through the existing target ports.
+    pub async fn prepare_netconf_rollback(
+        &self,
+        owner: &crate::audit_authority::NetconfRecoveryOwner,
+        rollback: crate::audit_authority::NetconfRollback<'_>,
+        tenant: &opc_types::TenantId,
+        privacy: &dyn AuditPrivacyProjection,
+        event: &ManagementAuditEventRecord,
+        lifetime: std::time::Duration,
+    ) -> Result<crate::audit_authority::PreparedTargetMutation, AuditAuthorityError> {
+        self.require_netconf_target_profile()?;
+        if !owner.worker.belongs_to(&self.inner) {
+            return Err(AuditAuthorityError::BindingMismatch);
+        }
+        let frozen = rollback.frozen;
+        frozen.verify_owner(owner)?;
+        frozen.verify_tenant(privacy, tenant)?;
+        if lifetime.subsec_nanos() != 0 || !(1..=3600).contains(&lifetime.as_secs()) {
+            return Err(AuditAuthorityError::InvalidInput);
+        }
+        let event = frozen.project_event(privacy, ProjectedAuditEvent::project(privacy, event)?)?;
+        let issued_at = self
+            .inner
+            .clock
+            .now_utc()
+            .as_offset_datetime()
+            .unix_timestamp();
+        let expires_at = issued_at
+            .checked_add(lifetime.as_secs() as i64)
+            .ok_or(AuditAuthorityError::InvalidInput)?;
+        let effect = frozen
+            .prepare_rollback(
+                owner,
+                rollback,
+                tenant,
+                &event,
+                issued_at..expires_at,
+                self.inner.backend.audit_key(),
+            )
+            .await?;
+        let digest = effect.digest(self.inner.backend.audit_key())?;
+        let binding =
+            AuditOperationBinding::project(privacy, &event, frozen.running_version(), &digest)?;
+        let handle = AuditOperationHandle::issue(
+            HandleBody {
+                version: 1,
+                identity: self.inner.identity,
+                binding,
+                event,
+                issued_at,
+                expires_at,
+                nonce: *uuid::Uuid::new_v4().as_bytes(),
+                key_epoch: self.inner.backend.audit_key().epoch(),
+                mutation: Some(digest),
+            },
+            self.inner.backend.audit_key(),
+        )?;
+        let prepared = crate::audit_authority::PreparedTargetMutation { handle, effect };
+        prepared.verify_effect(self.inner.backend.audit_key())?;
+        let original = frozen.retain(owner, prepared)?;
+        self.preflight_netconf_target(&original).await?;
+        Ok(original)
     }
 }

@@ -3425,3 +3425,191 @@ impl crate::audit_authority::NetconfPendingRead {
         Ok(effect)
     }
 }
+
+impl NetconfDeviceView {
+    pub(crate) fn verify_recovery_owner(
+        &self,
+        owner: &crate::audit_authority::NetconfRecoveryOwner,
+    ) -> Result<(), AuditAuthorityError> {
+        if self.authority != owner.authority
+            || self.profile_incarnation != Some(owner.profile_incarnation)
+            || self.device_incarnation != Some(owner.device_incarnation)
+            || self.caller != Some(owner.caller)
+        {
+            return Err(AuditAuthorityError::BindingMismatch);
+        }
+        if self.unsettled {
+            return Err(AuditAuthorityError::RecoveryRequired);
+        }
+        // Cleanup permits only this recovery read, never a serving owner.
+        Ok(())
+    }
+}
+
+pub(crate) fn read_rollback_view_sync(
+    conn: &Connection,
+    key: &AuditKey,
+    ledger: &LedgerState,
+    owner: &crate::audit_authority::NetconfRecoveryOwner,
+    now: i64,
+    cancellation: &SqliteWorkCancellation,
+) -> io::Result<Result<Option<crate::audit_authority::NetconfRollbackView>, AuditAuthorityError>> {
+    use crate::audit_authority::{NetconfRollbackCause as Cause, NetconfRollbackView};
+    let device = read_device_view_sync(conn, key, ledger, cancellation)?;
+    if let Err(error) = device.verify_recovery_owner(owner) {
+        return Ok(Err(error));
+    }
+    let state = read_state_sync(conn, key, ledger.identity, cancellation)?;
+    let Some(pending) = state.lifecycle.pending_confirmation else {
+        return Ok(Ok(None));
+    };
+    let deadline = state.lifecycle.original_deadline.ok_or_else(invalid)?;
+    let cause = match state.lifecycle.cleanup[0] {
+        Some(PendingCleanup::DeviceReboot { previous_device })
+            if previous_device == pending.device_incarnation =>
+        {
+            Cause::DeviceReboot
+        }
+        Some(PendingCleanup::SessionLoss { session })
+            if !pending.persistent && session == pending.owner_session =>
+        {
+            Cause::SessionLoss
+        }
+        None if now >= deadline => Cause::Timeout,
+        None => return Ok(Ok(None)),
+        _ => return Err(invalid()),
+    };
+    if device.running_version != pending.running_version {
+        return Err(invalid());
+    }
+    let parent = state.lifecycle.rollback_parent.ok_or_else(invalid)?;
+    let (schema, plaintext, encrypted): (Vec<u8>, Vec<u8>, Vec<u8>) = conn.query_row(
+        "SELECT schema_digest,plaintext_digest,encrypted_blob FROM config_history WHERE tx_id=?1 AND version=?2",
+        params![parent.tx_id.as_uuid().as_bytes().as_slice(), parent.version],
+        |row| Ok((row.get(0)?,row.get(1)?,row.get(2)?)),
+    ).map_err(|_| invalid())?;
+    if schema != parent.schema.as_bytes()
+        || plaintext.as_slice() != parent.plaintext_digest
+        || <[u8; 32]>::from(Sha256::digest(&encrypted)) != parent.ciphertext_digest
+    {
+        return Err(invalid());
+    }
+    cancellation.check_io()?;
+    Ok(Ok(Some(NetconfRollbackView {
+        authority: ledger.identity,
+        profile_incarnation: owner.profile_incarnation,
+        device_incarnation: owner.device_incarnation,
+        administrator: owner.caller,
+        projection: ledger.projection,
+        caller: pending.caller,
+        pending: pending.pending,
+        previous_device: pending.device_incarnation,
+        cause,
+        original_deadline: deadline,
+        tentative_transaction: pending.tx_id,
+        running_version: pending.running_version,
+        parent_version: parent.version,
+        source: TargetEncryptedBlobV1 {
+            schema: parent.schema,
+            plaintext_digest: parent.plaintext_digest,
+            encrypted_blob: encrypted,
+        },
+    })))
+}
+
+impl crate::audit_authority::NetconfRollbackRead {
+    pub(crate) async fn prepare_rollback(
+        &self,
+        owner: &crate::audit_authority::NetconfRecoveryOwner,
+        input: crate::audit_authority::NetconfRollback<'_>,
+        tenant: &opc_types::TenantId,
+        event: &crate::audit_authority::ProjectedAuditEvent,
+        window: std::ops::Range<i64>,
+        key: &AuditKey,
+    ) -> Result<super::audit_mutation::TargetEffectV1, AuditAuthorityError> {
+        use crate::audit_authority::NetconfRollbackCause as Cause;
+        let bad = AuditAuthorityError::BindingMismatch;
+        self.verify_owner(owner)?;
+        self.verify_event(event)?;
+        let view = self.view();
+        if !std::ptr::eq(self, input.frozen)
+            || window.end <= window.start
+            || (view.cause == Cause::Timeout && window.start < view.original_deadline)
+        {
+            return Err(bad);
+        }
+        if self.original()?.is_some() {
+            return Err(AuditAuthorityError::RecoveryRequired);
+        }
+        let envelope =
+            opc_crypto::CryptoEnvelopeRef::decode(&view.source.encrypted_blob).map_err(|_| bad)?;
+        let (aad, _) = opc_key::decode_bound_aad(envelope.aad).map_err(|_| bad)?;
+        if aad.tenant() != tenant || aad.version() != view.parent_version {
+            return Err(bad);
+        }
+        let (record, audit, resolution) = input.commit.into_parts();
+        if resolution.is_some()
+            || record.parent_tx_id != Some(view.tentative_transaction)
+            || view.running_version.checked_add(1) != Some(record.version.get())
+            || record.source != crate::CommitSource::CommitConfirmedRestore
+            || record.confirmed_deadline.is_some()
+        {
+            return Err(bad);
+        }
+        let commit = super::PreparedConfigCommit::prepare(record, audit, key)
+            .map_err(|_| AuditAuthorityError::InvalidInput)?;
+        let (action, resolution) = match view.cause {
+            Cause::Timeout => (
+                12,
+                TargetResolutionV1::ResolvePending {
+                    pending: view.pending,
+                    original_deadline: view.original_deadline,
+                },
+            ),
+            Cause::SessionLoss => (
+                11,
+                TargetResolutionV1::ResolvePending {
+                    pending: view.pending,
+                    original_deadline: view.original_deadline,
+                },
+            ),
+            Cause::DeviceReboot => (
+                14,
+                TargetResolutionV1::RebootRecovery {
+                    previous_device: view.previous_device,
+                    pending: Some(view.pending),
+                    original_deadline: Some(view.original_deadline),
+                },
+            ),
+        };
+        let mut effect = super::audit_mutation::TargetEffectV1 {
+            format: 1,
+            authority: view.authority,
+            profile_incarnation: view.profile_incarnation,
+            device_incarnation: view.device_incarnation,
+            caller: event.caller,
+            request: event.request,
+            action: action.try_into()?,
+            destination: TargetExpectationV1::Running {
+                version: view.running_version,
+            },
+            source: Some(TargetSourceV1::Running {
+                version: view.parent_version,
+                schema: view.source.schema,
+                ciphertext_digest: Sha256::digest(&view.source.encrypted_blob).into(),
+            }),
+            lock: None,
+            expires_at: window.end,
+            encrypted_payload: Some(TargetPayloadV1::Running {
+                commit: Box::new(commit),
+                confirmation_ownership: None,
+            }),
+            resolution: Some(resolution),
+        };
+        effect
+            .bind_provider_copy(input.provider, &view.source)
+            .await?;
+        self.verify_owner(owner)?;
+        Ok(effect)
+    }
+}
