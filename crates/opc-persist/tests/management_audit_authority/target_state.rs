@@ -832,7 +832,8 @@ async fn target_state_result_must_match_the_retained_action_profile_and_successo
 
 #[tokio::test]
 async fn target_state_reconstruction_rejects_authentic_but_substituted_result() {
-    use crate::audit_authority::ledger::{verify, EntryPayload, TargetStateAnchor, ENTRY_DOMAIN};
+    use crate::audit_authority::ledger::{verify, EntryPayload, TargetStateAnchor};
+    const ENTRY_DOMAIN: &[u8] = b"openpacketcore/management-audit/replicated-entry/v1\0";
     use crate::audit_authority::{NetconfTargetResult, StartupRevision};
     let fixture = Fixture::new().await;
     let shared = fixture.backend.conn();
