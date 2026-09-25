@@ -3509,11 +3509,9 @@ pub(crate) fn read_rollback_view_sync(
         tentative_transaction: pending.tx_id,
         running_version: pending.running_version,
         parent_version: parent.version,
-        source: TargetEncryptedBlobV1 {
-            schema: parent.schema,
-            plaintext_digest: parent.plaintext_digest,
-            encrypted_blob: encrypted,
-        },
+        schema: parent.schema,
+        plaintext_digest: parent.plaintext_digest,
+        encrypted,
     })))
 }
 
@@ -3541,8 +3539,7 @@ impl crate::audit_authority::NetconfRollbackRead {
         if self.original()?.is_some() {
             return Err(AuditAuthorityError::RecoveryRequired);
         }
-        let envelope =
-            opc_crypto::CryptoEnvelopeRef::decode(&view.source.encrypted_blob).map_err(|_| bad)?;
+        let envelope = opc_crypto::CryptoEnvelopeRef::decode(&view.encrypted).map_err(|_| bad)?;
         let (aad, _) = opc_key::decode_bound_aad(envelope.aad).map_err(|_| bad)?;
         if aad.tenant() != tenant || aad.version() != view.parent_version {
             return Err(bad);
@@ -3595,8 +3592,8 @@ impl crate::audit_authority::NetconfRollbackRead {
             },
             source: Some(TargetSourceV1::Running {
                 version: view.parent_version,
-                schema: view.source.schema,
-                ciphertext_digest: Sha256::digest(&view.source.encrypted_blob).into(),
+                schema: view.schema,
+                ciphertext_digest: Sha256::digest(&view.encrypted).into(),
             }),
             lock: None,
             expires_at: window.end,
@@ -3606,9 +3603,12 @@ impl crate::audit_authority::NetconfRollbackRead {
             }),
             resolution: Some(resolution),
         };
-        effect
-            .bind_provider_copy(input.provider, &view.source)
-            .await?;
+        let source = TargetEncryptedBlobV1 {
+            schema: view.schema,
+            plaintext_digest: view.plaintext_digest,
+            encrypted_blob: view.encrypted.clone(),
+        };
+        effect.bind_provider_copy(input.provider, &source).await?;
         self.verify_owner(owner)?;
         Ok(effect)
     }

@@ -66,7 +66,9 @@ pub(crate) struct NetconfRollbackView {
     pub(crate) tentative_transaction: opc_types::TxId,
     pub(crate) running_version: u64,
     pub(crate) parent_version: u64,
-    pub(crate) source: crate::consensus::audit_mutation::TargetEncryptedBlobV1,
+    pub(crate) schema: opc_types::SchemaDigest,
+    pub(crate) plaintext_digest: [u8; 32],
+    pub(crate) encrypted: Vec<u8>,
 }
 
 struct NetconfRollbackState {
@@ -120,13 +122,13 @@ impl NetconfRollbackRead {
 
     /// Schema of the exact original parent configuration.
     pub fn schema(&self) -> opc_types::SchemaDigest {
-        self.0.view.source.schema
+        self.0.view.schema
     }
 
     /// Encrypted original parent. Decrypt through the existing provider with
     /// expected tenant and schema before model validation; never log these bytes.
     pub fn encrypted_configuration(&self) -> &[u8] {
-        &self.0.view.source.encrypted_blob
+        &self.0.view.encrypted
     }
 
     /// Preserve this exact operation after cancellation or uncertain delivery.
