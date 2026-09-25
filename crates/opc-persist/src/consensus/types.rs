@@ -379,6 +379,13 @@ fn preflight_preparation_capacity(
             .ok_or_else(too_large)?;
         Ok(())
     };
+    // Preparation retains these owners while later SDK recovery encoding
+    // creates its output. Leave the encoder's existing maximum output extent
+    // inside the same allowance before admitting input capacity. A ciphertext
+    // length is insufficient: the recovery JSON represents bytes as decimal
+    // array elements. This necessary headroom is not a whole-operation bound;
+    // allocator overhead and concurrent later phases still need qualification.
+    charge(super::sqlite::CONFIG_CONSENSUS_LOG_ENTRY_MAX_BYTES)?;
     charge(record.encrypted_blob.capacity())?;
     charge(record.plaintext_digest.capacity())?;
     charge(record.principal.capacity())?;

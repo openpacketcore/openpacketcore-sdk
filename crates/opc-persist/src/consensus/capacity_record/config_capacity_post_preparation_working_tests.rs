@@ -275,3 +275,6 @@ fn config_capacity_957_preparation_reserves_for_actual_recovery_output() {
     recovery_case(false);
     recovery_case(true);
 }
+
+#[path = "config_capacity_recovery_headroom_tests.rs"]
+mod recovery_headroom_tests;
