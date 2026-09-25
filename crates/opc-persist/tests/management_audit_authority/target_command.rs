@@ -696,3 +696,50 @@ fn retained_target_admission_and_application_have_distinct_closed_phase_tags() {
         assert!(opc_consensus::decode_bounded::<AuditCommand>(&trailing).is_err());
     }
 }
+
+#[test]
+fn retained_target_admission_rejects_unknown_stored_intent_fields() {
+    let prepared = signed_discard();
+    let key = AuditKey::new([0x24; 32]).unwrap();
+    let identity = prepared.handle.body.identity;
+    let (_root, conn, keys) = retained_target_fixture();
+    super::apply_sync(
+        &conn,
+        &key,
+        identity,
+        &target_admission_command(&prepared),
+        100,
+        Some(&keys),
+    )
+    .unwrap()
+    .unwrap();
+    super::read_with_keys_sync(&conn, &key, Some(&keys), identity)
+        .unwrap()
+        .unwrap();
+    let original: Vec<u8> = conn
+        .query_row(
+            "SELECT state_json FROM config_raft_management_audit WHERE singleton=1",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    let mut altered: Value = serde_json::from_slice(&original).unwrap();
+    altered["ledger"]["entries"][0]["payload"]["target-intent"]["unknown"] = json!(0);
+    conn.execute(
+        "UPDATE config_raft_management_audit SET state_json=?1 WHERE singleton=1",
+        [serde_json::to_vec(&altered).unwrap()],
+    )
+    .unwrap();
+    assert!(
+        super::read_with_keys_sync(&conn, &key, Some(&keys), identity).is_err(),
+        "unknown retained intent field bypassed authentication"
+    );
+    conn.execute(
+        "UPDATE config_raft_management_audit SET state_json=?1 WHERE singleton=1",
+        [original],
+    )
+    .unwrap();
+    super::read_with_keys_sync(&conn, &key, Some(&keys), identity)
+        .unwrap()
+        .unwrap();
+}
