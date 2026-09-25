@@ -6293,3 +6293,507 @@ async fn target_copy_sdk_never_refreshes_original_source_destination_or_locks() 
         fixture.settle(&conn, &stale);
     }
 }
+
+impl Fixture {
+    fn frozen_running_copy(
+        &self,
+        conn: &Connection,
+        session: &crate::audit_authority::NetconfSessionOwner,
+        source: crate::audit_authority::NetconfLockDatastore,
+    ) -> Result<crate::audit_authority::NetconfRunningCopyRead, AuditAuthorityError> {
+        let tx = conn.unchecked_transaction().unwrap();
+        let view = crate::consensus::audit_targets::read_copy_view_sync(
+            &tx,
+            &self.key,
+            &self.ledger(&tx),
+            source,
+            &crate::consensus::sqlite::SqliteWorkCancellation::audit_test(),
+        )
+        .unwrap();
+        tx.commit().unwrap();
+        view?.freeze(session)
+    }
+}
+
+async fn frozen_running_envelope(
+    conn: &Connection,
+    frozen: &crate::audit_authority::NetconfRunningCopyRead,
+    provider: &dyn opc_key::KeyProvider,
+    request: u8,
+    config: &[u8],
+) -> crate::AttestedConfigCommit {
+    use opc_key::{ConfigAad, EnvelopeAad};
+    use sha2::{Digest, Sha256};
+    let base = frozen.source().running_base_version();
+    let parent = if base == 0 {
+        None
+    } else {
+        let bytes: Vec<u8> = conn
+            .query_row(
+                "SELECT tx_id FROM config_history WHERE version=?1",
+                [base],
+                |r| r.get(0),
+            )
+            .unwrap();
+        Some(opc_types::TxId::from_uuid(
+            uuid::Uuid::from_slice(&bytes).unwrap(),
+        ))
+    };
+    let tx_id = opc_types::TxId::new();
+    let committed_at = "2026-01-01T00:00:00Z"
+        .parse::<opc_types::Timestamp>()
+        .unwrap();
+    let principal = r#"{"tenant":"fixture-tenant","subject":"fixture-principal"}"#.to_owned();
+    let schema = frozen.source().schema().unwrap();
+    let aad = EnvelopeAad::config(
+        opc_types::TenantId::from_static("fixture-tenant"),
+        base + 1,
+        ConfigAad::new(tx_id, parent, committed_at, &principal, schema, "running").unwrap(),
+    );
+    let plaintext = copy_plaintext(request, config);
+    let encrypted = opc_crypto::encrypt_attested_envelope(provider, &aad, &plaintext)
+        .await
+        .unwrap();
+    crate::AttestedConfigCommit::try_new(
+        crate::CommitRecord {
+            tx_id,
+            parent_tx_id: parent,
+            version: opc_types::ConfigVersion::new(base + 1),
+            committed_at,
+            principal,
+            source: crate::CommitSource::Netconf,
+            schema_digest: schema,
+            plaintext_digest: Sha256::digest(&plaintext).to_vec(),
+            encrypted_blob: encrypted.encoded().to_vec(),
+            rollback_point: false,
+            confirmed_deadline: None,
+        },
+        Vec::new(),
+        encrypted.claim().unwrap(),
+    )
+    .unwrap()
+}
+
+#[tokio::test]
+async fn target_running_copy_sdk_preserves_frozen_sources_and_exact_configuration() {
+    use crate::audit_authority::{NetconfLockDatastore as Store, NetconfRunningCopy};
+    for (source, fallback) in [
+        (Store::Candidate, false),
+        (Store::Startup, false),
+        (Store::Candidate, true),
+    ] {
+        let fixture = Fixture::new().await;
+        let shared = fixture.backend.conn();
+        let conn = shared.lock().await;
+        fixture.active(&conn);
+        let config = br#"{"exact":18446744073709551617,"escaped":"\u0061","v":-0.0}"#;
+        let provider = target_copy_sdk_source(&fixture, &conn, source, fallback, config).await;
+        let worker = std::sync::Arc::new(());
+        let session = fixture.session_owner(&conn, &worker, 0x61);
+        let frozen = fixture
+            .frozen_running_copy(&conn, &session, source)
+            .unwrap();
+        assert_eq!(frozen.source().datastore(), source);
+        assert_eq!(frozen.source().uses_running_fallback(), fallback);
+        let tenant = opc_types::TenantId::from_static("fixture-tenant");
+        assert_eq!(
+            *frozen
+                .source()
+                .decrypt_configuration(&provider, &tenant)
+                .await
+                .unwrap()
+                .unwrap(),
+            copy_plaintext(if fallback { 181 } else { 180 }, config)
+        );
+        let commit = frozen_running_envelope(&conn, &frozen, &provider, 215, config).await;
+        let mut event = fixture.event(215);
+        event.operation = ManagementAuditOperationCode::Replace;
+        let before = target_rows(&conn);
+        let source_row = row(
+            &conn,
+            "config_netconf_targets",
+            "target",
+            u8::from(source == Store::Startup),
+        );
+        let changes = conn.total_changes();
+        let effect = frozen
+            .prepare_copy(
+                &session,
+                NetconfRunningCopy::new(&frozen, commit, &provider),
+                &tenant,
+                &event,
+                160,
+                &fixture.key,
+            )
+            .await
+            .unwrap();
+        let prepared = fixture.bind_frozen_target(frozen.source(), effect, event);
+        assert_eq!(fixture.preflight(&conn, &prepared, 100).unwrap(), None);
+        assert_eq!(conn.total_changes(), changes);
+        assert_eq!(target_rows(&conn), before);
+        let known = fixture.submit(&conn, &prepared);
+        let version = frozen.source().running_base_version() + 1;
+        assert!(matches!(&known, AuditOperationState::TargetV1(result)
+            if matches!(result.outcome(), NetconfAppliedOutcome::CopiedRunning {running_version} if running_version == version)));
+        assert_eq!(
+            row(
+                &conn,
+                "config_netconf_targets",
+                "target",
+                u8::from(source == Store::Startup)
+            ),
+            source_row
+        );
+        let retained = target_rows(&conn);
+        assert_eq!(fixture.submit(&conn, &prepared), known);
+        assert_eq!(target_rows(&conn), retained);
+        assert!(matches!(
+            fixture.frozen_running_copy(&conn, &session, source),
+            Err(AuditAuthorityError::RecoveryRequired)
+        ));
+        assert!(!fixture
+            .ledger(&conn)
+            .lookup(&fixture.key, prepared.handle(), prepared.effect.caller)
+            .unwrap()
+            .unwrap()
+            .terminal_recorded());
+        fixture.settle(&conn, &prepared);
+        provider_assert_history(&conn, &provider, version, 215, config).await;
+        assert_eq!(
+            *frozen
+                .source()
+                .decrypt_configuration(&provider, &tenant)
+                .await
+                .unwrap()
+                .unwrap(),
+            copy_plaintext(if fallback { 181 } else { 180 }, config)
+        );
+    }
+}
+
+#[tokio::test]
+async fn target_running_copy_sdk_refuses_identical_configuration_from_a_new_source_generation() {
+    use crate::audit_authority::{
+        NetconfLockDatastore as Store, NetconfRunningCopy, NetconfTargetReplacement,
+    };
+    for (source, fallback) in [
+        (Store::Candidate, false),
+        (Store::Startup, false),
+        (Store::Candidate, true),
+    ] {
+        let fixture = Fixture::new().await;
+        let shared = fixture.backend.conn();
+        let conn = shared.lock().await;
+        fixture.active(&conn);
+        let config = br#"{"same":true}"#;
+        let provider = target_copy_sdk_source(&fixture, &conn, source, fallback, config).await;
+        let worker = std::sync::Arc::new(());
+        let session = fixture.session_owner(&conn, &worker, 0x61);
+        let frozen = fixture
+            .frozen_running_copy(&conn, &session, source)
+            .unwrap();
+        let tenant = opc_types::TenantId::from_static("fixture-tenant");
+        let original = frozen
+            .source()
+            .decrypt_configuration(&provider, &tenant)
+            .await
+            .unwrap()
+            .unwrap();
+        let commit = frozen_running_envelope(&conn, &frozen, &provider, 216, config).await;
+        let base = fixture.frozen_target(&conn, &session, source).unwrap();
+        let replacement = copy_plaintext(217, config);
+        let mut event = fixture.event(217);
+        event.operation = ManagementAuditOperationCode::Update;
+        let effect = base
+            .prepare_replacement(
+                &session,
+                NetconfTargetReplacement::edit(
+                    &base,
+                    &replacement,
+                    frozen.source().schema().unwrap(),
+                    &provider,
+                ),
+                tenant.clone(),
+                &event,
+                160,
+            )
+            .await
+            .unwrap();
+        let changed = fixture.bind_frozen_target(&base, effect, event);
+        assert!(matches!(
+            fixture.submit(&conn, &changed),
+            AuditOperationState::TargetV1(_)
+        ));
+        fixture.settle(&conn, &changed);
+        let new = fixture
+            .frozen_running_copy(&conn, &session, source)
+            .unwrap();
+        assert_ne!(
+            new.source().encrypted_configuration(),
+            frozen.source().encrypted_configuration()
+        );
+        assert_ne!(new.source.counter, frozen.source.counter);
+        assert_eq!(
+            *new.source()
+                .decrypt_configuration(&provider, &tenant)
+                .await
+                .unwrap()
+                .unwrap(),
+            replacement
+        );
+        assert_eq!(
+            *frozen
+                .source()
+                .decrypt_configuration(&provider, &tenant)
+                .await
+                .unwrap()
+                .unwrap(),
+            *original
+        );
+        let before = target_rows(&conn);
+        let changes = conn.total_changes();
+        let running = fixture.device_view(&conn).running_version;
+        let mut event = fixture.event(216);
+        event.operation = ManagementAuditOperationCode::Replace;
+        let effect = frozen
+            .prepare_copy(
+                &session,
+                NetconfRunningCopy::new(&frozen, commit, &provider),
+                &tenant,
+                &event,
+                160,
+                &fixture.key,
+            )
+            .await
+            .unwrap();
+        let stale = fixture.bind_frozen_target(frozen.source(), effect, event);
+        assert!(
+            matches!(
+                fixture.preflight(&conn, &stale, 100),
+                Err(AuditAuthorityError::BindingMismatch)
+            ),
+            "running copy refreshed the original source generation"
+        );
+        assert_eq!(conn.total_changes(), changes);
+        assert_eq!(target_rows(&conn), before);
+        assert_eq!(fixture.submit(&conn, &stale), AuditOperationState::Rejected);
+        assert_eq!(target_rows(&conn), before);
+        assert_eq!(fixture.device_view(&conn).running_version, running);
+        fixture.settle(&conn, &stale);
+    }
+}
+
+#[tokio::test]
+async fn target_running_copy_sdk_preserves_original_running_version_and_locks() {
+    use crate::audit_authority::{NetconfLockDatastore as Store, NetconfRunningCopy};
+    for change in ["running", "source-lock", "running-lock"] {
+        let fixture = Fixture::new().await;
+        let shared = fixture.backend.conn();
+        let conn = shared.lock().await;
+        fixture.active(&conn);
+        let config = br#"{"value":1}"#;
+        let (provider, blob) = copy_provider_stage(&fixture, &conn, 0, config).await;
+        let worker = std::sync::Arc::new(());
+        let session = fixture.session_owner(&conn, &worker, 0x62);
+        let frozen = fixture
+            .frozen_running_copy(&conn, &session, Store::Candidate)
+            .unwrap();
+        let commit = frozen_running_envelope(&conn, &frozen, &provider, 218, config).await;
+        let changed = if change == "running" {
+            let other = copy_provider_destination(&fixture, &conn, &provider, 0, 219, config).await;
+            bind_copy_provider(&fixture, &conn, &provider, &blob, other)
+                .await
+                .unwrap()
+        } else {
+            fixture.rebind_at(
+                &conn,
+                fixture.request(&conn, 219, 2, 0x61, u8::from(change == "source-lock")),
+                100,
+            )
+        };
+        assert!(matches!(
+            fixture.submit(&conn, &changed),
+            AuditOperationState::TargetV1(_)
+        ));
+        fixture.settle(&conn, &changed);
+        let before = target_rows(&conn);
+        let running = fixture.device_view(&conn).running_version;
+        let changes = conn.total_changes();
+        let mut event = fixture.event(218);
+        event.operation = ManagementAuditOperationCode::Replace;
+        let effect = frozen
+            .prepare_copy(
+                &session,
+                NetconfRunningCopy::new(&frozen, commit, &provider),
+                &opc_types::TenantId::from_static("fixture-tenant"),
+                &event,
+                160,
+                &fixture.key,
+            )
+            .await
+            .unwrap();
+        let stale = fixture.bind_frozen_target(frozen.source(), effect, event);
+        assert!(
+            matches!(
+                fixture.preflight(&conn, &stale, 100),
+                Err(AuditAuthorityError::BindingMismatch)
+            ),
+            "running copy refreshed its original destination or ignored current lock ownership"
+        );
+        assert_eq!(conn.total_changes(), changes);
+        assert_eq!(target_rows(&conn), before);
+        assert_eq!(fixture.submit(&conn, &stale), AuditOperationState::Rejected);
+        assert_eq!(target_rows(&conn), before);
+        assert_eq!(fixture.device_view(&conn).running_version, running);
+        fixture.settle(&conn, &stale);
+    }
+}
+
+#[tokio::test]
+async fn target_running_copy_sdk_refuses_substituted_session_read_tenant_and_content() {
+    use crate::audit_authority::{NetconfLockDatastore as Store, NetconfRunningCopy};
+    let fixture = Fixture::new().await;
+    let shared = fixture.backend.conn();
+    let conn = shared.lock().await;
+    fixture.active(&conn);
+    let config = br#"{"authorized":1}"#;
+    let (provider, _) = copy_provider_stage(&fixture, &conn, 0, config).await;
+    let worker = std::sync::Arc::new(());
+    let another_worker = std::sync::Arc::new(());
+    let session = fixture.session_owner(&conn, &worker, 0x61);
+    let foreign_session = fixture.session_owner(&conn, &worker, 0x62);
+    let foreign_worker = fixture.session_owner(&conn, &another_worker, 0x61);
+    let frozen = fixture
+        .frozen_running_copy(&conn, &session, Store::Candidate)
+        .unwrap();
+    let another_read = fixture
+        .frozen_running_copy(&conn, &session, Store::Candidate)
+        .unwrap();
+    let unavailable = opc_key::MemoryKeyProvider::new();
+    let before = target_rows(&conn);
+    let changes = conn.total_changes();
+    for change in [
+        "session",
+        "worker",
+        "read",
+        "tenant",
+        "operation",
+        "outcome",
+        "transport",
+        "caller",
+        "provider",
+        "content",
+    ] {
+        let copied = if change == "content" {
+            br#"{"authorized":2}"#.as_slice()
+        } else {
+            config
+        };
+        let commit = frozen_running_envelope(&conn, &frozen, &provider, 220, copied).await;
+        let chosen = match change {
+            "session" => &foreign_session,
+            "worker" => &foreign_worker,
+            _ => &session,
+        };
+        let read = if change == "read" {
+            &another_read
+        } else {
+            &frozen
+        };
+        let tenant = opc_types::TenantId::from_static(if change == "tenant" {
+            "another-tenant"
+        } else {
+            "fixture-tenant"
+        });
+        let mut event = fixture.event(220);
+        event.operation = ManagementAuditOperationCode::Replace;
+        match change {
+            "operation" => event.operation = ManagementAuditOperationCode::Exec,
+            "outcome" => event.outcome = ManagementAuditOutcomeCode::Success,
+            "transport" => event.transport = ManagementAuditTransportCode::Internal,
+            "caller" => {
+                event.caller = crate::audit_authority::AuditCaller::project(
+                    &fixture.privacy,
+                    "fixture-tenant",
+                    "other-principal",
+                )
+                .unwrap()
+            }
+            _ => {}
+        }
+        let keys: &dyn opc_key::KeyProvider = if change == "provider" {
+            &unavailable
+        } else {
+            &provider
+        };
+        let result = frozen
+            .prepare_copy(
+                chosen,
+                NetconfRunningCopy::new(read, commit, keys),
+                &tenant,
+                &event,
+                160,
+                &fixture.key,
+            )
+            .await;
+        assert!(result.is_err(), "frozen running copy accepted substituted session, read, tenant, context, provider or configuration: {change}");
+        assert_eq!(conn.total_changes(), changes);
+        assert_eq!(target_rows(&conn), before);
+    }
+}
+
+#[tokio::test]
+async fn target_running_copy_sdk_read_refuses_absence_foreign_locks_and_pending_state() {
+    use crate::audit_authority::NetconfLockDatastore as Store;
+    for change in [
+        "absent",
+        "source-lock",
+        "running-lock",
+        "terminal-debt",
+        "pending",
+    ] {
+        let fixture = Fixture::new().await;
+        let shared = fixture.backend.conn();
+        let conn = shared.lock().await;
+        if change == "pending" {
+            let tentative = fixture.pending_fixture(&conn, true);
+            assert!(matches!(
+                fixture.submit(&conn, &tentative),
+                AuditOperationState::TargetV1(_)
+            ));
+            fixture.settle(&conn, &tentative);
+        } else {
+            fixture.active(&conn);
+            if change != "absent" {
+                copy_provider_stage(&fixture, &conn, 0, br#"{"value":1}"#).await;
+                let lock = fixture.rebind_at(
+                    &conn,
+                    fixture.request(&conn, 221, 2, 0x61, u8::from(change == "source-lock")),
+                    100,
+                );
+                assert!(matches!(
+                    fixture.submit(&conn, &lock),
+                    AuditOperationState::TargetV1(_)
+                ));
+                if change != "terminal-debt" {
+                    fixture.settle(&conn, &lock);
+                }
+            }
+        }
+        let worker = std::sync::Arc::new(());
+        let session = fixture.session_owner(&conn, &worker, 0x62);
+        let before = target_rows(&conn);
+        let changes = conn.total_changes();
+        assert!(fixture
+            .frozen_running_copy(&conn, &session, Store::Candidate)
+            .is_err());
+        assert!(fixture
+            .frozen_running_copy(&conn, &session, Store::Running)
+            .is_err());
+        assert!(fixture
+            .frozen_running_copy(&conn, &session, Store::Startup)
+            .is_err());
+        assert_eq!(conn.total_changes(), changes);
+        assert_eq!(target_rows(&conn), before);
+    }
+}

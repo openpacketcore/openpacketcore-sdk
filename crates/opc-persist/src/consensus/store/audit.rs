@@ -1373,7 +1373,8 @@ impl ConsensusConfigStore {
 impl ConsensusConfigStore {
     /// Prepare one exact encrypted candidate/startup copy into running under
     /// the existing RFC 019 target profile. The original source and destination
-    /// are authenticated through the key provider; request metadata may differ,
+    /// come from the original frozen read and are authenticated through the
+    /// key provider; preparation never refreshes either. Request metadata may differ,
     /// but their serialized configuration bytes and schema must be identical.
     /// The intent must carry the NETCONF copy-config `Replace` operation.
     ///
@@ -1392,10 +1393,13 @@ impl ConsensusConfigStore {
         if !session.device.worker.belongs_to(&self.inner) {
             return Err(AuditAuthorityError::BindingMismatch);
         }
-        session.require_active()?;
+        let frozen = copy.frozen;
+        frozen.verify_session(session)?;
         if lifetime.subsec_nanos() != 0 || !(1..=3600).contains(&lifetime.as_secs()) {
             return Err(AuditAuthorityError::InvalidInput);
         }
+        let tenant = opc_types::TenantId::new(event.tenant())
+            .map_err(|_| AuditAuthorityError::InvalidInput)?;
         let event = ProjectedAuditEvent::project(privacy, event)?;
         let issued_at = self
             .inner
@@ -1406,19 +1410,19 @@ impl ConsensusConfigStore {
         let expires_at = issued_at
             .checked_add(lifetime.as_secs() as i64)
             .ok_or(AuditAuthorityError::InvalidInput)?;
-        let (record, audit, resolution) = copy.commit.into_parts();
-        if resolution.is_some() {
-            return Err(AuditAuthorityError::BindingMismatch);
-        }
-        let commit = PreparedConfigCommit::prepare(record, audit, self.inner.backend.audit_key())
-            .map_err(|_| AuditAuthorityError::InvalidInput)?;
-        let view = self.read_netconf_copy_view(copy.source).await?;
-        let mut effect = view.prepare(session, &event, commit, expires_at)?;
-        effect.bind_provider_copy(copy.provider, &view.blob).await?;
-        session.require_active()?;
+        let effect = frozen
+            .prepare_copy(
+                session,
+                copy,
+                &tenant,
+                &event,
+                expires_at,
+                self.inner.backend.audit_key(),
+            )
+            .await?;
         let digest = effect.digest(self.inner.backend.audit_key())?;
         let binding =
-            AuditOperationBinding::project(privacy, &event, view.device.running_version, &digest)?;
+            AuditOperationBinding::project(privacy, &event, frozen.source.running_base, &digest)?;
         let handle = AuditOperationHandle::issue(
             HandleBody {
                 version: 1,
@@ -1436,15 +1440,26 @@ impl ConsensusConfigStore {
         let prepared = crate::audit_authority::PreparedTargetMutation { handle, effect };
         prepared.verify_effect(self.inner.backend.audit_key())?;
         self.preflight_netconf_target(&prepared).await?;
-        session.require_active()?;
+        frozen.verify_session(session)?;
         Ok(prepared)
     }
 
-    async fn read_netconf_copy_view(
+    /// Freeze a candidate/startup source and the running destination before
+    /// decrypting, validating or encrypting copy content. The quorum-current
+    /// transaction binds the source generation/fallback, running version, both
+    /// locks, device and ledger; the independent checkpoint is verified before
+    /// returning an opaque read. Absent startup and initial empty running are
+    /// refused. Authorization and model validation remain upstream.
+    pub async fn read_netconf_running_copy(
         &self,
+        session: &crate::audit_authority::NetconfSessionOwner,
         source: crate::audit_authority::NetconfLockDatastore,
-    ) -> Result<super::super::audit_targets::NetconfCopyView, AuditAuthorityError> {
+    ) -> Result<crate::audit_authority::NetconfRunningCopyRead, AuditAuthorityError> {
         self.require_netconf_target_profile()?;
+        if !session.device.worker.belongs_to(&self.inner) {
+            return Err(AuditAuthorityError::BindingMismatch);
+        }
+        session.require_active()?;
         self.linearizable_barrier()
             .await
             .map_err(|_| AuditAuthorityError::Unavailable)?;
@@ -1484,7 +1499,7 @@ impl ConsensusConfigStore {
         .await
         .map_err(|_| AuditAuthorityError::Unavailable)?;
         self.verify_audit_checkpoint(&ledger).await?;
-        view
+        view?.freeze(session)
     }
 }
 

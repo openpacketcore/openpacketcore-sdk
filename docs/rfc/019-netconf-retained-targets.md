@@ -118,6 +118,24 @@ may have been transmitted, recovery must use that operation rather than repeat
 encryption or prepare a replacement. These preparation types do not activate the
 full NETCONF runtime profile or confer recipient-only audit verification.
 
+### Original running-copy read
+
+`read_netconf_running_copy` returns an opaque `NetconfRunningCopyRead` before
+content is prepared. It freezes the exact candidate/startup source or candidate
+fallback, running destination version and running lock with the authenticated
+ledger/device/session transaction and independent checkpoint. Its `source()`
+uses the existing provider-backed read/decryption contract. The worker authorizes
+and validates that original content before preparing an attested running envelope.
+
+`NetconfRunningCopy::new` pairs that envelope with the original read, and
+`prepare_netconf_copy_to_running` authenticates the frozen source and destination
+for the event's tenant. It never selects a newer source during preparation.
+Identical configuration in a newer source generation is still a different effect
+and must not be substituted. Preflight and admission recheck the original source,
+running version and lock; unknown transmission recovers only the retained original.
+Copy into running preserves candidate/startup state and cannot install, confirm
+or resolve a confirmed commit. This API does not activate the public target runtime.
+
 ### Frozen datastore-copy preparation
 
 `ConsensusConfigStore::read_netconf_target_copy` returns a private-field

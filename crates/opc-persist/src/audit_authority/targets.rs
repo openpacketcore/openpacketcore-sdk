@@ -829,35 +829,62 @@ impl NetconfSessionOwner {
     }
 }
 
-/// A proposed encrypted copy from candidate or startup into running.
-///
-/// The destination carries a fresh attested running envelope and its own replay
-/// metadata. This input grants no authority: preparation reads the exact source
-/// and authenticates both configurations through the supplied existing provider.
-/// An absent candidate binds its exact tombstone and current running fallback.
+/// A source and running destination frozen before copy content is prepared.
+/// Its private fields retain the original session, source generation or
+/// fallback, running version and running lock. Consumers cannot construct or
+/// decode this value; reading it grants no mutation authority.
+pub struct NetconfRunningCopyRead {
+    pub(crate) source: NetconfTargetRead,
+    pub(crate) running_lock_incarnation: u64,
+    pub(crate) running_lock_session: Option<[u8; 16]>,
+}
+
+impl NetconfRunningCopyRead {
+    /// The original candidate/startup source, including its encrypted content
+    /// and pinned running fallback. Decrypt with the expected tenant through
+    /// the existing provider, then authorize and validate the configuration.
+    pub fn source(&self) -> &NetconfTargetRead {
+        &self.source
+    }
+
+    pub(crate) fn verify_session(
+        &self,
+        session: &NetconfSessionOwner,
+    ) -> Result<(), AuditAuthorityError> {
+        self.source.verify_session(session)
+    }
+}
+
+impl fmt::Debug for NetconfRunningCopyRead {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("NetconfRunningCopyRead(<redacted>)")
+    }
+}
+
+/// An encrypted running copy paired with its original frozen source and
+/// destination. The existing provider authenticates both configurations;
+/// request metadata may differ, but copied configuration bytes must match.
+/// This input grants no permission and retains no provider after preparation.
 pub struct NetconfRunningCopy<'a> {
-    pub(crate) source: NetconfLockDatastore,
+    pub(crate) frozen: &'a NetconfRunningCopyRead,
     pub(crate) commit: crate::AttestedConfigCommit,
     pub(crate) provider: &'a dyn opc_key::KeyProvider,
 }
 
 impl<'a> NetconfRunningCopy<'a> {
-    /// Select candidate or startup and the exact proposed running envelope.
-    /// The constructor refuses running as a source. Authority preparation also
-    /// refuses commits carrying a confirmed-resolution obligation.
+    /// Pair the original read with the exact proposed running envelope.
+    /// Preparation refuses a different session, stale original expectations,
+    /// or a commit carrying a confirmed-resolution obligation.
     pub fn new(
-        source: NetconfLockDatastore,
+        frozen: &'a NetconfRunningCopyRead,
         commit: crate::AttestedConfigCommit,
         provider: &'a dyn opc_key::KeyProvider,
-    ) -> Result<Self, AuditAuthorityError> {
-        if source == NetconfLockDatastore::Running {
-            return Err(AuditAuthorityError::InvalidInput);
-        }
-        Ok(Self {
-            source,
+    ) -> Self {
+        Self {
+            frozen,
             commit,
             provider,
-        })
+        }
     }
 }
 
