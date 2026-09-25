@@ -11223,3 +11223,161 @@ async fn target_empty_commit_proof_binds_guard_and_survives_later_unavailability
         receipt.state()
     );
 }
+
+#[tokio::test]
+async fn target_empty_commit_retains_authenticated_export_and_expired_prune_boundaries() {
+    use crate::audit_authority::continuity::{
+        AuditExportPage, AuditExportSession, AuditExportVerifier,
+    };
+    use std::sync::Arc;
+
+    let fixture = Fixture::new().await;
+    let shared = fixture.backend.conn();
+    let conn = shared.lock().await;
+    fixture.active(&conn);
+    let worker = Arc::new(());
+    let session = fixture.session_owner(&conn, &worker, 0x61);
+    let frozen = fixture.frozen_empty_commit(&conn, &session).unwrap();
+    // This observation outlives every earlier activation operation. The
+    // pre-expiry prune refusal must therefore depend on this new payload.
+    let prepared = frozen
+        .prepare(
+            &fixture.key,
+            &fixture.privacy,
+            &session,
+            fixture.empty_commit_event(239),
+            100..200,
+            [0x55; 16],
+        )
+        .unwrap();
+    fixture.observe_empty_commit(&conn, &prepared, 100).unwrap();
+    let ledger = fixture.ledger(&conn);
+    let before = target_rows(&conn);
+    // This fixture exercises the current authority-side HMAC contract. These
+    // signing keys are not a recipient-only capability; that is separate work.
+    let keys =
+        Arc::new(AuditKeyRing::new(vec![AuditSigningKey::new(1, [0x44; 32]).unwrap()]).unwrap());
+    let export = AuditExportSession::freeze(
+        &ledger,
+        keys.clone(),
+        session.caller,
+        100,
+        120,
+        Arc::new(tokio::sync::Semaphore::new(1))
+            .try_acquire_owned()
+            .unwrap(),
+    )
+    .unwrap();
+    let page = export.page_at(None, 256, session.caller, 100).unwrap();
+    assert!(page.next_cursor().is_none());
+    let verify = || {
+        AuditExportVerifier::new(
+            keys.clone(),
+            export.manifest().clone(),
+            fixture.identity,
+            session.caller,
+            100,
+        )
+        .unwrap()
+    };
+    let mut complete = verify();
+    complete.accept(&page).unwrap();
+    let verified = complete.finish().unwrap();
+    let page_json: Value = serde_json::from_slice(&page.encode().unwrap()).unwrap();
+    let empty_rows = page_json["rows"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .enumerate()
+        .filter(|(_, row)| row["entry"]["payload"].get("empty-commit").is_some())
+        .map(|(index, _)| index)
+        .collect::<Vec<_>>();
+    assert_eq!(empty_rows.len(), 1);
+    for corruption in ["guard", "omit", "substitute"] {
+        let mut altered = page_json.clone();
+        let rows = altered["rows"].as_array_mut().unwrap();
+        let index = empty_rows[0];
+        match corruption {
+            "guard" => {
+                rows[index]["entry"]["payload"]["empty-commit"]["guard"]["candidate_generation"] =
+                    serde_json::json!(77);
+            }
+            "omit" => {
+                rows.remove(index);
+            }
+            "substitute" => {
+                rows[index]["entry"]["payload"] = serde_json::json!({"intent": prepared.handle()});
+            }
+            _ => unreachable!(),
+        }
+        let altered = AuditExportPage::decode(&serde_json::to_vec(&altered).unwrap()).unwrap();
+        let mut rejected = verify();
+        assert!(
+            rejected.accept(&altered).is_err(),
+            "guarded observation export admitted {corruption}"
+        );
+        assert!(rejected.finish().is_err());
+    }
+    assert!(verify().finish().is_err());
+
+    let checkpoint = fixture.checkpoint(&conn);
+    let mut body = checkpoint.body.clone();
+    body.acknowledged_export = verified.manifest.mac;
+    let acknowledgement = AuditCheckpoint::issue(&fixture.keys, body).unwrap();
+    assert!(fixture
+        .apply(
+            &conn,
+            AuditCommand::Prune {
+                through: ledger.sequence,
+                checkpoint: acknowledgement.clone(),
+            },
+            200,
+        )
+        .is_err());
+    fixture
+        .apply(
+            &conn,
+            AuditCommand::AcknowledgeExport(acknowledgement.clone()),
+            100,
+        )
+        .unwrap();
+    let retained = fixture.ledger(&conn);
+    assert!(fixture
+        .apply(
+            &conn,
+            AuditCommand::Prune {
+                through: ledger.sequence,
+                checkpoint: acknowledgement.clone(),
+            },
+            199,
+        )
+        .is_err());
+    assert_eq!(fixture.ledger(&conn).floor, retained.floor);
+    fixture
+        .apply(
+            &conn,
+            AuditCommand::Prune {
+                through: ledger.sequence,
+                checkpoint: acknowledgement,
+            },
+            200,
+        )
+        .unwrap();
+    let pruned = fixture.ledger(&conn);
+    assert_eq!(pruned.floor, ledger.sequence);
+    assert!(pruned
+        .lookup_empty_commit(&fixture.key, &prepared, session.caller)
+        .unwrap()
+        .is_none());
+    assert!(fixture.observe_empty_commit(&conn, &prepared, 200).is_err());
+    assert_eq!(fixture.ledger(&conn).sequence, ledger.sequence);
+    assert_eq!(target_rows(&conn), before);
+    // The immutable export retains its authenticated old rows after pruning.
+    assert_eq!(
+        export.page_at(None, 256, session.caller, 200).unwrap(),
+        page
+    );
+    let mut after_prune = verify();
+    after_prune.accept(&page).unwrap();
+    after_prune.finish().unwrap();
+}
