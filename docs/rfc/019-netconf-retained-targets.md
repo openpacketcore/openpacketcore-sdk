@@ -645,3 +645,32 @@ result never changes into success.
 This API does not reconstruct a fresh process's recovery capability. Recovery
 opening for already-retained cleanup, runtime integration, and full restart and
 leadership qualification remain separate prerequisites for full-profile availability.
+
+
+### Recovery-only opening on a replacement worker
+
+`open_netconf_recovery_owner` requires the independently authenticated, projected
+current device administrator. The SDK authenticates a quorum-current target,
+history and ledger view and its independent checkpoint. Unsettled original Intent,
+outcome, terminal or checkpoint obligations refuse the opening and must first be
+reconciled through the exact retained operations. An absent operation is never
+proof that a possibly transmitted operation failed.
+
+The opening does not begin a device or serve a session. Retained session-loss or
+explicit-reboot cleanup permits recovery only. Its subsequent rollback read still
+selects the original retained cause, pending identity, caller, parent and confirmed
+deadline. Persistent session loss alone does not authorize rollback, and process
+or voter restart does not select a reboot cause.
+
+Each exact worker keeps one bounded recovery entry. Repeated opening and both
+existing device-claim paths share its original read/attempt. A monotonic ledger
+sequence prevents a delayed older read from evicting a newer device entry; a
+same-sequence different device or foreign worker/profile is refused. Only a proved
+newer retained device replaces the bounded entry. Old clones keep their exact
+original operation result. The entry contains only a weak worker reference and
+cannot extend the worker's lifetime. It is not a distributed lease: required
+audit admission and retained pending/source guards still fence effects across
+workers. After recovery, serving requires an explicit admitted device start.
+
+Component cache/reopen fixtures do not establish process-crash, public runtime,
+provider or leadership availability. Those remain full-profile qualification gates.

@@ -19,7 +19,7 @@ pub enum NetconfRollbackCause {
     DeviceReboot,
 }
 
-/// Recovery-only scope under an exact SDK device preparation. This cannot open
+/// Recovery-only scope under an exact SDK worker and retained device. This cannot open
 /// sessions, acquire locks, stage configuration or manufacture client authority.
 /// Every new read checks current retained device ownership and audit obligations.
 #[derive(Clone)]
@@ -480,5 +480,60 @@ impl<'a> NetconfRollbackSuccessor<'a> {
     /// same original read. This constructs input only, without recovery authority.
     pub fn new(previous: &'a PreparedTargetMutation, rollback: NetconfRollback<'a>) -> Self {
         Self { previous, rollback }
+    }
+}
+
+// One bounded entry per exact worker; the capability keeps only a weak link.
+#[derive(Default)]
+pub(crate) struct NetconfRecoveryRegistry(Mutex<Option<NetconfRecoveryEntry>>);
+
+struct NetconfRecoveryEntry {
+    owner: NetconfRecoveryOwner,
+    sequence: u64,
+}
+
+impl NetconfRecoveryRegistry {
+    // Call only after a current authenticated retained device read, settled
+    // obligations and independent checkpoint validation. A delayed older read
+    // cannot replace the registry installed by a newer completed opening.
+    pub(crate) fn bind<T: Send + Sync + 'static>(
+        &self,
+        worker: &Arc<T>,
+        owner: NetconfRecoveryOwner,
+        sequence: u64,
+    ) -> Result<NetconfRecoveryOwner, AuditAuthorityError> {
+        if !owner.worker.belongs_to(worker) {
+            return Err(AuditAuthorityError::BindingMismatch);
+        }
+        let mut slot = self
+            .0
+            .lock()
+            .map_err(|_| AuditAuthorityError::Unavailable)?;
+        if let Some(current) = slot.as_mut() {
+            if !current.owner.worker.belongs_to(worker)
+                || current.owner.authority != owner.authority
+                || current.owner.profile_incarnation != owner.profile_incarnation
+            {
+                return Err(AuditAuthorityError::BindingMismatch);
+            }
+            if sequence < current.sequence {
+                return Err(AuditAuthorityError::RollbackDetected);
+            }
+            if current.owner.device_incarnation == owner.device_incarnation {
+                if current.owner.caller != owner.caller {
+                    return Err(AuditAuthorityError::BindingMismatch);
+                }
+                current.sequence = sequence;
+                return Ok(current.owner.clone());
+            }
+            if sequence == current.sequence {
+                return Err(AuditAuthorityError::BindingMismatch);
+            }
+        }
+        *slot = Some(NetconfRecoveryEntry {
+            owner: owner.clone(),
+            sequence,
+        });
+        Ok(owner)
     }
 }

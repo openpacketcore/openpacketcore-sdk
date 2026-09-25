@@ -295,6 +295,7 @@ struct ConsensusConfigStoreInner {
     operation_timeout: Duration,
     admitted: AtomicBool,
     audit_continuity: Option<Arc<crate::audit_authority::continuity::AuditContinuityPolicy>>,
+    netconf_recovery: crate::audit_authority::NetconfRecoveryRegistry,
     linearizability: EnsureLinearizableSupervisor<ConfigRaftTypeConfig>,
     proposal_admission: Arc<tokio::sync::Semaphore>,
     metric_leader: std::sync::Mutex<Option<ConsensusNodeId>>,
@@ -498,6 +499,7 @@ impl ConsensusConfigStore {
                 operation_timeout,
                 admitted: AtomicBool::new(false),
                 audit_continuity,
+                netconf_recovery: Default::default(),
                 linearizability,
                 proposal_admission: Arc::new(tokio::sync::Semaphore::new(
                     DURABLE_OPENRAFT_PROPOSAL_ADMISSION_SLOTS,

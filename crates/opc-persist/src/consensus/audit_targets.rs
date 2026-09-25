@@ -3643,3 +3643,33 @@ impl crate::audit_authority::NetconfRollbackRead {
         Ok(effect)
     }
 }
+
+impl NetconfDeviceView {
+    pub(crate) fn bind_recovery_owner<T: Send + Sync + 'static>(
+        &self,
+        registry: &crate::audit_authority::NetconfRecoveryRegistry,
+        worker: &std::sync::Arc<T>,
+        owner: crate::audit_authority::NetconfRecoveryOwner,
+    ) -> Result<crate::audit_authority::NetconfRecoveryOwner, AuditAuthorityError> {
+        self.verify_recovery_owner(&owner)?;
+        registry.bind(worker, owner, self.sequence)
+    }
+
+    pub(crate) fn open_recovery_owner<T: Send + Sync + 'static>(
+        &self,
+        registry: &crate::audit_authority::NetconfRecoveryRegistry,
+        worker: &std::sync::Arc<T>,
+        caller: AuditCaller,
+    ) -> Result<crate::audit_authority::NetconfRecoveryOwner, AuditAuthorityError> {
+        let bad = AuditAuthorityError::BindingMismatch;
+        let owner = crate::audit_authority::NetconfRecoveryOwner {
+            worker: crate::audit_authority::NetconfWorkerBinding::new(worker),
+            authority: self.authority,
+            profile_incarnation: self.profile_incarnation.ok_or(bad)?,
+            device_incarnation: self.device_incarnation.ok_or(bad)?,
+            caller,
+            cache: Default::default(),
+        };
+        self.bind_recovery_owner(registry, worker, owner)
+    }
+}

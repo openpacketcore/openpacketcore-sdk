@@ -961,7 +961,7 @@ impl ConsensusConfigStore {
             return Err(AuditAuthorityError::BindingMismatch);
         };
         prepared.prepared.validate_result(result)?;
-        let owner = crate::audit_authority::NetconfDeviceOwner {
+        let mut owner = crate::audit_authority::NetconfDeviceOwner {
             recovery: prepared.recovery.clone(),
             worker: prepared.worker.clone(),
             authority: self.inner.identity,
@@ -969,7 +969,15 @@ impl ConsensusConfigStore {
             device_incarnation: prepared.prepared.effect.device_incarnation,
             caller,
         };
-        self.verify_netconf_device_owner(&owner).await?;
+        let view = self.read_netconf_device_view().await?;
+        view.verify_owner(&owner)?;
+        owner.recovery = view
+            .bind_recovery_owner(
+                &self.inner.netconf_recovery,
+                &self.inner,
+                owner.recovery_owner(),
+            )?
+            .cache;
         Ok(owner)
     }
 
@@ -2415,10 +2423,11 @@ impl ConsensusConfigStore {
             caller,
             cache: prepared.recovery.clone(),
         };
-        self.read_netconf_device_view()
-            .await?
-            .verify_recovery_owner(&owner)?;
-        Ok(owner)
+        self.read_netconf_device_view().await?.bind_recovery_owner(
+            &self.inner.netconf_recovery,
+            &self.inner,
+            owner,
+        )
     }
 
     /// Freeze an eligible original rollback under a quorum-current, independently
@@ -2650,5 +2659,28 @@ impl ConsensusConfigStore {
         )?;
         self.preflight_netconf_target(&original).await?;
         Ok(original)
+    }
+}
+
+impl ConsensusConfigStore {
+    /// Open recovery-only scope for the currently retained device administrator.
+    /// Authenticate the caller independently before projecting it. A quorum read
+    /// authenticates profile/device state and its independent checkpoint; all
+    /// prior required-audit debt must be reconciled first.
+    ///
+    /// This performs no device-start transition and cannot serve sessions or
+    /// writes. Retained cleanup remains fenced until its exact rollback resolves.
+    /// Reopening through any clone of this worker shares the same original read
+    /// and attempt. A new worker must recover retained original operations before
+    /// opening; process/voter restart alone never implies device reboot.
+    pub async fn open_netconf_recovery_owner(
+        &self,
+        caller: AuditCaller,
+    ) -> Result<crate::audit_authority::NetconfRecoveryOwner, AuditAuthorityError> {
+        self.read_netconf_device_view().await?.open_recovery_owner(
+            &self.inner.netconf_recovery,
+            &self.inner,
+            caller,
+        )
     }
 }

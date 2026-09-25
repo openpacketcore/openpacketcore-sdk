@@ -10034,3 +10034,319 @@ async fn target_rollback_successor_preserves_retained_session_loss_and_reboot_ca
         provider_assert_history(&conn, &provider, 3, 246, br#"{"retained":0}"#).await;
     }
 }
+
+#[tokio::test]
+async fn target_recovery_opening_new_worker_preserves_retained_cleanup_and_original() {
+    use crate::audit_authority::{NetconfRecoveryRegistry, NetconfRollback, NetconfRollbackCause};
+    for (persistent, cause) in [
+        (false, NetconfRollbackCause::SessionLoss),
+        (false, NetconfRollbackCause::DeviceReboot),
+        (true, NetconfRollbackCause::DeviceReboot),
+    ] {
+        let fixture = Fixture::new().await;
+        let shared = fixture.backend.conn();
+        let conn = shared.lock().await;
+        let (provider, old_worker, old_owner, prior_read, never_sent) =
+            prepared_rollback_source(&fixture, &conn, persistent, cause).await;
+        assert!(fixture
+            .ledger(&conn)
+            .lookup(
+                &fixture.key,
+                never_sent.handle(),
+                prior_read.original_caller()
+            )
+            .unwrap()
+            .is_none());
+        let caller = old_owner.caller;
+        let pending = prior_read.pending();
+        let deadline = prior_read.original_deadline();
+        assert_eq!(std::sync::Arc::strong_count(&old_worker), 1);
+        drop(old_worker);
+        let worker = std::sync::Arc::new(());
+        let registry = NetconfRecoveryRegistry::default();
+        assert!(!old_owner.worker.belongs_to(&worker));
+        // A real independent SQL reader and a new worker/cache. This is not a
+        // process-crash or public-runtime claim.
+        let reopened = Connection::open(fixture.directory.path().join("authority.sqlite")).unwrap();
+        let before = target_rows(&conn);
+        let changes = conn.total_changes();
+        let owner = fixture
+            .device_view(&reopened)
+            .open_recovery_owner(&registry, &worker, caller)
+            .unwrap();
+        assert_eq!(
+            std::sync::Arc::strong_count(&worker),
+            1,
+            "registry retained its worker strongly"
+        );
+        let view = fixture.device_view(&reopened);
+        let device_event = fixture.device_event(249);
+        assert!(
+            matches!(
+                view.prepare(&device_event, 160, [0x91; 16], [0x92; 16]),
+                Err(AuditAuthorityError::RecoveryRequired)
+            ),
+            "cleanup allowed serving-device preparation"
+        );
+        let read = fixture
+            .frozen_rollback(&reopened, &owner, 100)
+            .unwrap()
+            .unwrap();
+        assert_eq!(read.pending(), pending);
+        assert_eq!(read.original_deadline(), deadline);
+        assert_eq!(read.cause(), cause);
+        assert_eq!(read.original_caller(), prior_read.original_caller());
+        let mut event = fixture.device_event(249);
+        event.caller = caller;
+        let event = read.project_event(&fixture.privacy, event).unwrap();
+        let commit = internal_rollback_envelope(&read, &provider, 249, "valid").await;
+        let effect = read
+            .prepare_rollback(
+                &owner,
+                NetconfRollback::new(&read, commit, &provider),
+                &opc_types::TenantId::from_static("fixture-tenant"),
+                &event,
+                100..160,
+                &fixture.key,
+            )
+            .await
+            .unwrap();
+        let original = read
+            .retain(&owner, fixture.bind_rollback(&read, effect, event, 100))
+            .unwrap();
+        let repeated = fixture
+            .device_view(&reopened)
+            .open_recovery_owner(&registry, &worker, caller)
+            .unwrap();
+        let repeat_read = fixture
+            .frozen_rollback(&reopened, &repeated, 100)
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            repeat_read.original().unwrap(),
+            Some(original.clone()),
+            "recovery reopening lost the possibly transmitted original"
+        );
+        assert_eq!(conn.total_changes(), changes);
+        assert_eq!(target_rows(&conn), before);
+        let result = fixture.submit(&conn, &original);
+        assert!(matches!(result, AuditOperationState::TargetV1(_)));
+        assert!(
+            matches!(
+                fixture
+                    .device_view(&reopened)
+                    .open_recovery_owner(&registry, &worker, caller),
+                Err(AuditAuthorityError::RecoveryRequired)
+            ),
+            "known outcome erased terminal debt"
+        );
+        assert_eq!(read.original().unwrap(), Some(original.clone()));
+        assert_eq!(fixture.submit_at(&conn, &original, 3600), result);
+        fixture.settle(&conn, &original);
+        let settled = fixture
+            .device_view(&reopened)
+            .open_recovery_owner(&registry, &worker, caller)
+            .unwrap();
+        assert!(fixture
+            .frozen_rollback(&reopened, &settled, 3600)
+            .unwrap()
+            .is_none());
+        assert_eq!(repeat_read.original().unwrap(), Some(original));
+        provider_assert_history(&conn, &provider, 3, 249, br#"{"retained":0}"#).await;
+    }
+}
+
+#[tokio::test]
+async fn target_recovery_opening_refuses_wrong_administrator_and_all_retained_debt() {
+    use crate::audit_authority::{NetconfRecoveryRegistry, NetconfRollbackCause};
+    let fixture = Fixture::new().await;
+    let shared = fixture.backend.conn();
+    let conn = shared.lock().await;
+    let (_provider, worker, owner, read, original) =
+        prepared_rollback_source(&fixture, &conn, false, NetconfRollbackCause::SessionLoss).await;
+    let registry = NetconfRecoveryRegistry::default();
+    let view = fixture.device_view(&conn);
+    let other = crate::audit_authority::AuditCaller::project(
+        &fixture.privacy,
+        "fixture-tenant",
+        "synthetic-other-admin",
+    )
+    .unwrap();
+    assert!(matches!(
+        view.open_recovery_owner(&registry, &worker, other),
+        Err(AuditAuthorityError::BindingMismatch)
+    ));
+    assert!(view
+        .open_recovery_owner(&registry, &worker, owner.caller)
+        .is_ok());
+    fixture
+        .apply(
+            &conn,
+            AuditCommand::NetconfTarget(Box::new(TargetAuditCommandV1::Admit(original.clone()))),
+            100,
+        )
+        .unwrap();
+    assert!(
+        matches!(
+            fixture
+                .device_view(&conn)
+                .open_recovery_owner(&registry, &worker, owner.caller),
+            Err(AuditAuthorityError::RecoveryRequired)
+        ),
+        "intent without checkpoint authorized recovery opening"
+    );
+    fixture.checkpoint(&conn);
+    assert!(
+        matches!(
+            fixture
+                .device_view(&conn)
+                .open_recovery_owner(&registry, &worker, owner.caller),
+            Err(AuditAuthorityError::RecoveryRequired)
+        ),
+        "unknown intent authorized recovery opening"
+    );
+    fixture
+        .apply(
+            &conn,
+            AuditCommand::NetconfTarget(Box::new(TargetAuditCommandV1::Apply(original.clone()))),
+            100,
+        )
+        .unwrap();
+    assert!(
+        matches!(
+            fixture
+                .device_view(&conn)
+                .open_recovery_owner(&registry, &worker, owner.caller),
+            Err(AuditAuthorityError::RecoveryRequired)
+        ),
+        "outcome without terminal authorized recovery opening"
+    );
+    fixture
+        .apply(&conn, AuditCommand::Terminal(original.handle.clone()), 100)
+        .unwrap();
+    assert!(
+        matches!(
+            fixture
+                .device_view(&conn)
+                .open_recovery_owner(&registry, &worker, owner.caller),
+            Err(AuditAuthorityError::RecoveryRequired)
+        ),
+        "terminal without covering checkpoint authorized recovery opening"
+    );
+    fixture.checkpoint(&conn);
+    assert!(fixture
+        .device_view(&conn)
+        .open_recovery_owner(&registry, &worker, owner.caller)
+        .is_ok());
+    assert_eq!(
+        fixture
+            .ledger(&conn)
+            .lookup(&fixture.key, original.handle(), read.original_caller())
+            .unwrap()
+            .unwrap()
+            .state(),
+        fixture.submit_at(&conn, &original, 3600)
+    );
+}
+
+#[tokio::test]
+async fn target_recovery_opening_preserves_concurrent_claims_and_refuses_delayed_old_read() {
+    use crate::audit_authority::{NetconfRecoveryRegistry, NetconfRollbackCause};
+    let fixture = Fixture::new().await;
+    let shared = fixture.backend.conn();
+    let conn = shared.lock().await;
+    let (_provider, worker, owner, read, original) =
+        prepared_rollback_source(&fixture, &conn, true, NetconfRollbackCause::Timeout).await;
+    let old = fixture.device_view(&conn);
+    let registry = NetconfRecoveryRegistry::default();
+    let claimed = old
+        .bind_recovery_owner(&registry, &worker, owner.clone())
+        .unwrap();
+    let (a, b) = std::thread::scope(|scope| {
+        let a = scope.spawn(|| old.open_recovery_owner(&registry, &worker, owner.caller));
+        let b = scope.spawn(|| old.bind_recovery_owner(&registry, &worker, owner.clone()));
+        (a.join().unwrap().unwrap(), b.join().unwrap().unwrap())
+    });
+    for repeated in [claimed, a, b] {
+        let reread = fixture
+            .frozen_rollback(&conn, &repeated, original.handle.body.issued_at)
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            reread.original().unwrap(),
+            Some(original.clone()),
+            "another recovery claim discarded the retained original"
+        );
+    }
+    let foreign_worker = std::sync::Arc::new(());
+    assert!(
+        matches!(
+            old.bind_recovery_owner(&registry, &foreign_worker, owner.clone()),
+            Err(AuditAuthorityError::BindingMismatch)
+        ),
+        "foreign worker reused registry authority"
+    );
+    let mut foreign = owner.clone();
+    foreign.profile_incarnation = [0xee; 16];
+    assert!(matches!(
+        old.bind_recovery_owner(&registry, &worker, foreign),
+        Err(AuditAuthorityError::BindingMismatch)
+    ));
+    let mut same_sequence_device = owner.clone();
+    same_sequence_device.device_incarnation = [0xed; 16];
+    assert!(
+        matches!(
+            registry.bind(
+                &worker,
+                same_sequence_device,
+                fixture.ledger(&conn).sequence
+            ),
+            Err(AuditAuthorityError::BindingMismatch)
+        ),
+        "same-sequence device substitution replaced the recovery owner"
+    );
+    let result = fixture.submit_at(&conn, &original, original.handle.body.issued_at);
+    assert!(matches!(result, AuditOperationState::TargetV1(_)));
+    fixture.settle(&conn, &original);
+    let event = fixture.device_event(250);
+    let effect = fixture
+        .device_view(&conn)
+        .prepare(&event, 160, [0x91; 16], [0x92; 16])
+        .unwrap();
+    let start = fixture.rebind_at(
+        &conn,
+        fixture.prepare(effect, event),
+        original.handle.body.issued_at,
+    );
+    assert!(matches!(
+        fixture.submit_at(&conn, &start, original.handle.body.issued_at),
+        AuditOperationState::TargetV1(_)
+    ));
+    fixture.settle(&conn, &start);
+    let current = fixture.device_view(&conn);
+    let caller = current.caller.unwrap();
+    let replacement = current
+        .open_recovery_owner(&registry, &worker, caller)
+        .unwrap();
+    assert_ne!(replacement.device_incarnation, owner.device_incarnation);
+    let before = target_rows(&conn);
+    let changes = conn.total_changes();
+    assert!(
+        matches!(
+            old.open_recovery_owner(&registry, &worker, owner.caller),
+            Err(AuditAuthorityError::RollbackDetected)
+        ),
+        "delayed old recovery read replaced the newer registry owner"
+    );
+    let still_current = current
+        .open_recovery_owner(&registry, &worker, caller)
+        .unwrap();
+    assert_eq!(
+        still_current.device_incarnation,
+        replacement.device_incarnation
+    );
+    assert_eq!(read.original().unwrap(), Some(original.clone()));
+    assert_eq!(conn.total_changes(), changes);
+    assert_eq!(target_rows(&conn), before);
+    assert_eq!(fixture.submit_at(&conn, &original, 3600), result);
+}
