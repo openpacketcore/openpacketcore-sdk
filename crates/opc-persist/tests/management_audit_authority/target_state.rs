@@ -5600,3 +5600,189 @@ async fn target_replacement_rejects_malformed_and_oversized_content_before_admis
     assert_eq!(fixture.ledger(&conn).sequence, sequence);
     assert_eq!(conn.total_changes(), changes);
 }
+
+async fn datastore_copy_lock_fixture(
+    fixture: &Fixture,
+    conn: &Connection,
+    source_slot: u8,
+    requester: u8,
+    request: u8,
+    provider: &dyn opc_key::KeyProvider,
+    config: &[u8],
+) -> PreparedTargetMutation {
+    use crate::audit_authority::{NetconfLockDatastore as Store, NetconfTargetReplacement};
+    let worker = std::sync::Arc::new(());
+    let session = fixture.session_owner(conn, &worker, requester);
+    let (source, destination) = if source_slot == 0 {
+        (Store::Candidate, Store::Startup)
+    } else {
+        (Store::Startup, Store::Candidate)
+    };
+    let tx = conn.unchecked_transaction().unwrap();
+    let ledger = fixture.ledger(&tx);
+    let original = crate::consensus::audit_targets::read_copy_view_sync(
+        &tx,
+        &fixture.key,
+        &ledger,
+        source,
+        &crate::consensus::sqlite::SqliteWorkCancellation::audit_test(),
+    )
+    .unwrap()
+    .unwrap();
+    let frozen = crate::consensus::audit_targets::read_target_view_sync(
+        &tx,
+        &fixture.key,
+        &ledger,
+        destination,
+        &session,
+        &crate::consensus::sqlite::SqliteWorkCancellation::audit_test(),
+    )
+    .unwrap()
+    .unwrap();
+    tx.commit().unwrap();
+    let source_envelope =
+        opc_crypto::CryptoEnvelopeRef::decode(&original.blob.encrypted_blob).unwrap();
+    let (source_aad, _) = opc_key::decode_bound_aad(source_envelope.aad).unwrap();
+    let source_plaintext =
+        opc_crypto::decrypt_envelope(provider, &source_aad, &original.blob.encrypted_blob)
+            .await
+            .unwrap();
+    assert_eq!(*source_plaintext, copy_plaintext(180, config));
+    let plaintext = copy_plaintext(request, config);
+    let tenant = opc_types::TenantId::from_static("fixture-tenant");
+    let mut event = fixture.event(request);
+    event.operation = ManagementAuditOperationCode::Replace;
+    // This fixture exercises the existing closed authority reducer. Public
+    // datastore-copy preparation remains a separate, unavailable SDK port.
+    let mut effect = frozen
+        .prepare_replacement(
+            &session,
+            NetconfTargetReplacement::inline_copy(
+                &frozen,
+                &plaintext,
+                original.blob.schema,
+                provider,
+            ),
+            tenant.clone(),
+            &event,
+            160,
+        )
+        .await
+        .unwrap();
+    effect.source = Some(original.source);
+    effect.encrypted_payload = None;
+    effect
+        .bind_target_plaintext(
+            tenant,
+            NetconfTargetReplacement::inline_copy(
+                &frozen,
+                &plaintext,
+                original.blob.schema,
+                provider,
+            ),
+        )
+        .await
+        .unwrap();
+    fixture.bind_frozen_target(&frozen, effect, event)
+}
+
+#[tokio::test]
+async fn target_datastore_copy_preserves_source_with_unowned_or_own_source_lock() {
+    use crate::consensus::audit_mutation::TargetPayloadV1;
+    for source_slot in [0, 1] {
+        for locked in [false, true] {
+            let fixture = Fixture::new().await;
+            let shared = fixture.backend.conn();
+            let conn = shared.lock().await;
+            fixture.active(&conn);
+            let config = br#"{"source":9007199254740993}"#;
+            let (provider, _) = copy_provider_stage(&fixture, &conn, source_slot, config).await;
+            if locked {
+                let lock = fixture.request(&conn, 201, 2, 0x61, source_slot + 1);
+                assert!(matches!(
+                    fixture.submit(&conn, &lock),
+                    AuditOperationState::TargetV1(_)
+                ));
+                fixture.settle(&conn, &lock);
+            }
+            let prepared = datastore_copy_lock_fixture(
+                &fixture,
+                &conn,
+                source_slot,
+                0x61,
+                202,
+                &provider,
+                config,
+            )
+            .await;
+            assert_eq!(fixture.preflight(&conn, &prepared, 100).unwrap(), None);
+            let source = row(&conn, "config_netconf_targets", "target", source_slot);
+            let known = fixture.submit(&conn, &prepared);
+            assert!(matches!(known, AuditOperationState::TargetV1(_)));
+            let target = row(&conn, "config_netconf_targets", "target", 1 - source_slot);
+            assert_eq!(target["generation"], 1);
+            assert_eq!(
+                row(&conn, "config_netconf_targets", "target", source_slot),
+                source
+            );
+            let Some(TargetPayloadV1::Target(blob)) = &prepared.effect.encrypted_payload else {
+                panic!("datastore copy target payload");
+            };
+            let envelope = opc_crypto::CryptoEnvelopeRef::decode(&blob.encrypted_blob).unwrap();
+            let (aad, _) = opc_key::decode_bound_aad(envelope.aad).unwrap();
+            let actual = opc_crypto::decrypt_envelope(&provider, &aad, &blob.encrypted_blob)
+                .await
+                .unwrap();
+            assert_eq!(*actual, copy_plaintext(202, config));
+            let before_replay = target_rows(&conn);
+            assert_eq!(fixture.submit(&conn, &prepared), known);
+            assert_eq!(target_rows(&conn), before_replay);
+            fixture.settle(&conn, &prepared);
+        }
+    }
+}
+
+#[tokio::test]
+async fn target_datastore_copy_refuses_original_source_locked_by_another_session() {
+    for source_slot in [0, 1] {
+        let fixture = Fixture::new().await;
+        let shared = fixture.backend.conn();
+        let conn = shared.lock().await;
+        fixture.active(&conn);
+        let config = br#"{"source":"original"}"#;
+        let (provider, _) = copy_provider_stage(&fixture, &conn, source_slot, config).await;
+        let prepared =
+            datastore_copy_lock_fixture(&fixture, &conn, source_slot, 0x62, 203, &provider, config)
+                .await;
+        assert_eq!(fixture.preflight(&conn, &prepared, 100).unwrap(), None);
+        let lock = fixture.request(&conn, 204, 2, 0x61, source_slot + 1);
+        assert!(matches!(
+            fixture.submit(&conn, &lock),
+            AuditOperationState::TargetV1(_)
+        ));
+        fixture.settle(&conn, &lock);
+        let before = target_rows(&conn);
+        let changes = conn.total_changes();
+        assert!(
+            matches!(
+                fixture.preflight(&conn, &prepared, 100),
+                Err(AuditAuthorityError::BindingMismatch)
+            ),
+            "target copy ignored a source lock acquired by another session"
+        );
+        assert_eq!(conn.total_changes(), changes);
+        assert_eq!(target_rows(&conn), before);
+        assert_eq!(
+            fixture.submit(&conn, &prepared),
+            AuditOperationState::Rejected
+        );
+        assert_eq!(target_rows(&conn), before);
+        let receipt = fixture
+            .ledger(&conn)
+            .lookup(&fixture.key, prepared.handle(), prepared.effect.caller)
+            .unwrap()
+            .unwrap();
+        assert!(!receipt.terminal_recorded());
+        fixture.settle(&conn, &prepared);
+    }
+}
