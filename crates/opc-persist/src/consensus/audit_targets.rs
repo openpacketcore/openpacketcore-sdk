@@ -78,11 +78,36 @@ fn invalid() -> io::Error {
     )
 }
 
-/// Confirmation and cleanup records remain closed until the atomic running
-/// transition is connected. Non-null unsupported ownership cannot be treated
-/// as absent state or silently initialized.
 #[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
-enum Unactivated {}
+#[serde(deny_unknown_fields)]
+struct PendingConfirmation {
+    pending: crate::audit_authority::NetconfPendingConfirmation,
+    tx_id: opc_types::TxId,
+    running_version: u64,
+    owner_session: [u8; 16],
+    caller: AuditCaller,
+    persistent: bool,
+    device_incarnation: [u8; 16],
+    operation: [u8; 32],
+    ownership_store_kind: String,
+}
+
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RollbackParent {
+    tx_id: opc_types::TxId,
+    version: u64,
+    schema: opc_types::SchemaDigest,
+    ciphertext_digest: [u8; 32],
+    plaintext_digest: [u8; 32],
+}
+
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case", deny_unknown_fields)]
+enum PendingCleanup {
+    SessionLoss { session: [u8; 16] },
+    DeviceReboot { previous_device: [u8; 16] },
+}
 
 #[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -129,11 +154,11 @@ struct LifecycleBody {
     format: u16,
     device_ownership: Option<DeviceOwnership>,
     locks: [Option<LockState>; 3],
-    pending_confirmation: Option<Unactivated>,
-    rollback_parent: Option<Unactivated>,
-    original_deadline: Option<Unactivated>,
-    encrypted_confirmation_ownership: Option<Unactivated>,
-    cleanup: [Option<Unactivated>; 3],
+    pending_confirmation: Option<PendingConfirmation>,
+    rollback_parent: Option<RollbackParent>,
+    original_deadline: Option<i64>,
+    encrypted_confirmation_ownership: Option<TargetEncryptedBlobV1>,
+    cleanup: [Option<PendingCleanup>; 3],
 }
 
 #[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -420,9 +445,18 @@ fn read_state_sync(
         lifecycle,
     };
     state.validate(identity)?;
+    state.validate_pending_history(conn)?;
     cancellation.check_io()?;
     Ok(state)
 }
+
+type PendingHistoryRow = (
+    Vec<u8>,
+    u64,
+    Option<Vec<u8>>,
+    Option<String>,
+    Option<String>,
+);
 
 #[derive(Clone)]
 struct TargetState {
@@ -491,6 +525,7 @@ impl TargetState {
                 _ => return Err(invalid()),
             }
         }
+        self.validate_pending()?;
         for lock in &self.lifecycle.locks {
             let Some(lock) = lock else {
                 return Err(invalid());
@@ -503,6 +538,120 @@ impl TargetState {
             }
         }
         Ok(())
+    }
+
+    fn validate_pending(&self) -> io::Result<()> {
+        let lifecycle = &self.lifecycle;
+        match (
+            &lifecycle.pending_confirmation,
+            &lifecycle.rollback_parent,
+            lifecycle.original_deadline,
+            &lifecycle.encrypted_confirmation_ownership,
+        ) {
+            (None, None, None, None) if lifecycle.cleanup.iter().all(Option::is_none) => Ok(()),
+            (Some(pending), Some(parent), Some(deadline), Some(ownership)) => {
+                if pending.pending.authority() != self.profile.authority
+                    || pending.pending.value == [0; 16]
+                    || pending.owner_session == [0; 16]
+                    || pending.device_incarnation == [0; 16]
+                    || pending.operation == [0; 32]
+                    || parent.version == 0
+                    || parent.version.checked_add(1) != Some(pending.running_version)
+                    || deadline <= 0
+                    || lifecycle.cleanup[1..].iter().any(Option::is_some)
+                {
+                    return Err(invalid());
+                }
+                match &lifecycle.cleanup[0] {
+                    None if self.profile.device_incarnation == Some(pending.device_incarnation) => {
+                    }
+                    Some(PendingCleanup::SessionLoss { session })
+                        if *session == pending.owner_session
+                            && !pending.persistent
+                            && self.profile.device_incarnation
+                                == Some(pending.device_incarnation) => {}
+                    Some(PendingCleanup::DeviceReboot { previous_device })
+                        if *previous_device == pending.device_incarnation
+                            && self.profile.device_incarnation != Some(*previous_device) => {}
+                    _ => return Err(invalid()),
+                }
+                ownership.validate().map_err(|_| invalid())?;
+                let envelope = opc_crypto::CryptoEnvelopeRef::decode(&ownership.encrypted_blob)
+                    .map_err(|_| invalid())?;
+                let (aad, _) = opc_key::decode_bound_aad(envelope.aad).map_err(|_| invalid())?;
+                let opc_key::EnvelopeMetadata::Config(metadata) = aad.metadata() else {
+                    return Err(invalid());
+                };
+                if aad.version() != pending.running_version
+                    || metadata.store_kind() != pending.ownership_store_kind
+                {
+                    return Err(invalid());
+                }
+                Ok(())
+            }
+            _ => Err(invalid()),
+        }
+    }
+
+    fn validate_pending_history(&self, conn: &Connection) -> io::Result<()> {
+        let Some(pending) = &self.lifecycle.pending_confirmation else {
+            return Ok(());
+        };
+        let parent = self
+            .lifecycle
+            .rollback_parent
+            .as_ref()
+            .ok_or_else(invalid)?;
+        let (tx_id, version, previous, deadline, confirmed): PendingHistoryRow = conn.query_row(
+            "SELECT tx_id,version,parent_tx_id,confirmed_deadline,confirmed_at FROM config_history ORDER BY version DESC LIMIT 1", [],
+            |r| Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?,r.get(4)?))).map_err(|_| invalid())?;
+        let deadline = deadline
+            .ok_or_else(invalid)?
+            .parse::<opc_types::Timestamp>()
+            .map_err(|_| invalid())?;
+        if tx_id != pending.tx_id.as_uuid().as_bytes()
+            || version != pending.running_version
+            || previous.as_deref() != Some(parent.tx_id.as_uuid().as_bytes().as_slice())
+            || Some(deadline.as_offset_datetime().unix_timestamp())
+                != self.lifecycle.original_deadline
+            || confirmed.is_some()
+        {
+            return Err(invalid());
+        }
+        if *parent != Self::read_rollback_parent(conn, parent.tx_id).map_err(|_| invalid())? {
+            return Err(invalid());
+        }
+        Ok(())
+    }
+
+    fn read_rollback_parent(
+        conn: &Connection,
+        tx_id: opc_types::TxId,
+    ) -> Result<RollbackParent, AuditAuthorityError> {
+        let (version, schema, encrypted, plaintext): (u64, Vec<u8>, Vec<u8>, Vec<u8>) = conn.query_row(
+            "SELECT version,schema_digest,encrypted_blob,plaintext_digest FROM config_history WHERE tx_id=?1", [tx_id.as_uuid().as_bytes().as_slice()],
+            |r| Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?))).map_err(|_| AuditAuthorityError::BindingMismatch)?;
+        Ok(RollbackParent {
+            tx_id,
+            version,
+            schema: opc_types::SchemaDigest::from_bytes(
+                schema
+                    .try_into()
+                    .map_err(|_| AuditAuthorityError::BindingMismatch)?,
+            ),
+            ciphertext_digest: Sha256::digest(encrypted).into(),
+            plaintext_digest: plaintext
+                .try_into()
+                .map_err(|_| AuditAuthorityError::BindingMismatch)?,
+        })
+    }
+
+    fn clear_pending(&mut self) {
+        self.lifecycle.pending_confirmation = None;
+        self.lifecycle.rollback_parent = None;
+        self.lifecycle.original_deadline = None;
+        self.lifecycle.encrypted_confirmation_ownership = None;
+        self.lifecycle.cleanup = [None, None, None];
     }
 
     fn validate_anchor(&self, ledger: Option<&LedgerState>) -> io::Result<()> {
@@ -728,12 +877,65 @@ impl TargetState {
         Ok(())
     }
 
+    fn check_resolution(
+        &self,
+        prepared: &PreparedTargetMutation,
+        now: i64,
+        rollback: bool,
+    ) -> Result<&PendingConfirmation, AuditAuthorityError> {
+        let bad = AuditAuthorityError::BindingMismatch;
+        let effect = &prepared.effect;
+        let pending = self.lifecycle.pending_confirmation.as_ref().ok_or(bad)?;
+        let deadline = self.lifecycle.original_deadline.ok_or(bad)?;
+        let action = u8::from(effect.action);
+        let internal =
+            prepared.handle.body.event.transport == crate::ManagementAuditTransportCode::Internal;
+        if effect.caller != pending.caller {
+            return Err(bad);
+        }
+        if action == 14 {
+            if !internal
+                || !rollback
+                || !matches!(effect.resolution, Some(TargetResolutionV1::RebootRecovery { previous_device, pending: Some(token), original_deadline: Some(original) })
+                    if previous_device == pending.device_incarnation && token == pending.pending && original == deadline)
+                || !matches!(self.lifecycle.cleanup[0], Some(PendingCleanup::DeviceReboot { previous_device }) if previous_device == pending.device_incarnation)
+            {
+                return Err(bad);
+            }
+        } else {
+            if !matches!(effect.resolution, Some(TargetResolutionV1::ResolvePending { pending: token, original_deadline })
+                if token == pending.pending && original_deadline == deadline)
+            {
+                return Err(bad);
+            }
+            match action {
+                12 if internal && rollback && now >= deadline => {}
+                11 if internal
+                    && rollback
+                    && matches!(self.lifecycle.cleanup[0], Some(PendingCleanup::SessionLoss { session }) if session == pending.owner_session) =>
+                    {}
+                6 | 10 | 11
+                    if !internal && now < deadline && self.lifecycle.cleanup[0].is_none() =>
+                {
+                    self.check_lock(prepared, 0)?;
+                    let requester = effect.lock.as_ref().ok_or(bad)?.requester;
+                    if !pending.persistent && requester != pending.owner_session {
+                        return Err(bad);
+                    }
+                }
+                _ => return Err(bad),
+            }
+        }
+        Ok(pending)
+    }
+
     fn reduce(
         &mut self,
         conn: &Connection,
         prepared: &PreparedTargetMutation,
         ledger: &LedgerState,
         keys: &AuditKeyRing,
+        now: i64,
     ) -> Result<NetconfAppliedOutcome, AuditAuthorityError> {
         let effect = &prepared.effect;
         let bad = AuditAuthorityError::BindingMismatch;
@@ -759,7 +961,11 @@ impl TargetState {
             _ => return Err(bad),
         }
         if let Some(source) = &effect.source {
-            self.check_source(source, conn)?;
+            // A rollback reads its retained original parent, not the current
+            // tentative head. Its exact source is checked in that transition.
+            if !matches!(action, 11 | 12 | 14) {
+                self.check_source(source, conn)?;
+            }
         }
         let lifecycle_result = |value| NetconfAppliedOutcome::Lifecycle {
             incarnation: NetconfIncarnation {
@@ -811,9 +1017,22 @@ impl TargetState {
         {
             return Err(bad);
         }
-        // Pending ownership has no enabled constructor until the atomic running
-        // promotion/rollback component is connected. Non-null unknown state is
-        // rejected by the closed decoder instead of being treated as absent.
+        if let Some(pending) = &self.lifecycle.pending_confirmation {
+            if !matches!(action, 1 | 3 | 4 | 5 | 6 | 10 | 11 | 12 | 13 | 14)
+                || (self.lifecycle.cleanup[0].is_some() && !matches!(action, 1 | 11 | 12 | 13 | 14))
+            {
+                return Err(bad);
+            }
+            if matches!(action, 3 | 4 | 5)
+                && (effect.caller != pending.caller
+                    || effect
+                        .lock
+                        .as_ref()
+                        .is_none_or(|l| l.requester != pending.owner_session))
+            {
+                return Err(bad);
+            }
+        }
         match action {
             1 => {
                 let Some(TargetResolutionV1::BeginDevice { previous }) = effect.resolution else {
@@ -837,6 +1056,11 @@ impl TargetState {
                         .ok_or(AuditAuthorityError::Full)?;
                     lock.session = None;
                     lock.caller = None;
+                }
+                if let Some(pending) = &self.lifecycle.pending_confirmation {
+                    self.lifecycle.cleanup[0] = Some(PendingCleanup::DeviceReboot {
+                        previous_device: pending.device_incarnation,
+                    });
                 }
                 self.profile.device_incarnation = Some(effect.device_incarnation);
                 self.lifecycle.device_ownership = Some(DeviceOwnership {
@@ -928,7 +1152,7 @@ impl TargetState {
                     })
                 }
             }
-            6 | 15 => {
+            6 | 9 | 15 => {
                 self.check_lock(prepared, 0)?;
                 let Some(TargetPayloadV1::Running {
                     commit,
@@ -937,13 +1161,24 @@ impl TargetState {
                 else {
                     return Err(bad);
                 };
-                // Confirmed ownership/resolution has a separate atomic transition;
-                // ordinary promotion and copy cannot implicitly establish or clear it.
-                if effect.resolution.is_some()
-                    || confirmation_ownership.is_some()
-                    || commit.record.confirmed_deadline.is_some()
-                {
-                    return Err(AuditAuthorityError::RecoveryRequired);
+                if action == 9 {
+                    if self.lifecycle.pending_confirmation.is_some() {
+                        return Err(bad);
+                    }
+                } else {
+                    if confirmation_ownership.is_some()
+                        || commit.record.confirmed_deadline.is_some()
+                    {
+                        return Err(bad);
+                    }
+                    match &effect.resolution {
+                        None if self.lifecycle.pending_confirmation.is_none() => {}
+                        Some(TargetResolutionV1::ResolvePending { .. }) if action == 6 => {
+                            self.check_resolution(prepared, now, false)?;
+                            self.clear_pending();
+                        }
+                        _ => return Err(bad),
+                    }
                 }
                 if current_version.checked_add(1) != Some(commit.record.version.get()) {
                     return Err(bad);
@@ -967,13 +1202,80 @@ impl TargetState {
                 {
                     return Err(bad);
                 }
-                if action == 6 {
+                if matches!(action, 6 | 9) {
                     let binding = source.source_binding.as_ref().ok_or(bad)?;
                     if binding.session != expected.requester
                         || binding.caller != effect.caller
                         || binding.base_version != current_version
                     {
                         return Err(bad);
+                    }
+                    if action == 9 {
+                        let Some(TargetResolutionV1::InstallPending {
+                            pending,
+                            rollback_parent,
+                            rollback_version,
+                            original_deadline,
+                            owner_session,
+                            persistent,
+                        }) = effect.resolution
+                        else {
+                            return Err(bad);
+                        };
+                        let ownership = confirmation_ownership.as_ref().ok_or(bad)?;
+                        let deadline = commit.record.confirmed_deadline.ok_or(bad)?;
+                        if pending.authority() != effect.authority
+                            || pending.value == [0; 16]
+                            || owner_session != expected.requester
+                            || rollback_version != current_version
+                            || current_version == 0
+                            || commit.record.parent_tx_id != Some(rollback_parent)
+                            || deadline.as_offset_datetime().unix_timestamp() != original_deadline
+                            || deadline <= commit.record.committed_at
+                            || now >= original_deadline
+                        {
+                            return Err(bad);
+                        }
+                        let parent = Self::read_rollback_parent(conn, rollback_parent)?;
+                        if parent.version != rollback_version {
+                            return Err(bad);
+                        }
+                        let domain = effect.encryption_store_kind(ownership.schema, 2)?;
+                        let envelope =
+                            opc_crypto::CryptoEnvelopeRef::decode(&ownership.encrypted_blob)
+                                .map_err(|_| bad)?;
+                        let (aad, _) = opc_key::decode_bound_aad(envelope.aad).map_err(|_| bad)?;
+                        let opc_key::EnvelopeMetadata::Config(metadata) = aad.metadata() else {
+                            return Err(bad);
+                        };
+                        if aad.version() != commit.record.version.get()
+                            || metadata.store_kind() != domain
+                        {
+                            return Err(bad);
+                        }
+                        self.lifecycle.pending_confirmation = Some(PendingConfirmation {
+                            pending,
+                            tx_id: commit.record.tx_id,
+                            running_version: commit.record.version.get(),
+                            owner_session,
+                            caller: effect.caller,
+                            persistent,
+                            device_incarnation: effect.device_incarnation,
+                            operation: prepared.handle.mac,
+                            ownership_store_kind: domain,
+                        });
+                        self.lifecycle.rollback_parent = Some(parent);
+                        self.lifecycle.original_deadline = Some(original_deadline);
+                        self.lifecycle.encrypted_confirmation_ownership = Some(ownership.clone());
+                        self.advance_target(0, prepared, None)?;
+                        return Ok(NetconfAppliedOutcome::Tentative {
+                            running_version: commit.record.version.get(),
+                            retired_generation: crate::audit_authority::CandidateGeneration {
+                                authority: effect.authority,
+                                value: self.targets[0].generation,
+                            },
+                            pending,
+                        });
                     }
                     self.advance_target(0, prepared, None)?;
                     Ok(NetconfAppliedOutcome::Promoted {
@@ -988,6 +1290,54 @@ impl TargetState {
                         running_version: commit.record.version.get(),
                     })
                 }
+            }
+            10 => {
+                self.check_lock(prepared, 0)?;
+                let pending = self.check_resolution(prepared, now, false)?.pending;
+                if effect.source.is_some() {
+                    return Err(bad);
+                }
+                self.clear_pending();
+                Ok(NetconfAppliedOutcome::Confirmed { pending })
+            }
+            11 | 12 | 14 => {
+                let pending = self.check_resolution(prepared, now, true)?.clone();
+                let parent = self.lifecycle.rollback_parent.as_ref().ok_or(bad)?;
+                let Some(TargetSourceV1::Running {
+                    version,
+                    schema,
+                    ciphertext_digest,
+                }) = effect.source
+                else {
+                    return Err(bad);
+                };
+                if version != parent.version
+                    || schema != parent.schema
+                    || ciphertext_digest != parent.ciphertext_digest
+                {
+                    return Err(bad);
+                }
+                let Some(TargetPayloadV1::Running {
+                    commit,
+                    confirmation_ownership: None,
+                }) = &effect.encrypted_payload
+                else {
+                    return Err(bad);
+                };
+                if commit.record.parent_tx_id != Some(pending.tx_id)
+                    || pending.running_version.checked_add(1) != Some(commit.record.version.get())
+                    || commit.record.schema_digest != parent.schema
+                    || commit.record.plaintext_digest != parent.plaintext_digest
+                    || commit.record.confirmed_deadline.is_some()
+                    || commit.record.source != crate::CommitSource::CommitConfirmedRestore
+                {
+                    return Err(bad);
+                }
+                self.clear_pending();
+                Ok(NetconfAppliedOutcome::RolledBack {
+                    running_version: commit.record.version.get(),
+                    pending: pending.pending,
+                })
             }
             13 => {
                 let Some(TargetResolutionV1::EndSession { session }) = effect.resolution else {
@@ -1015,6 +1365,17 @@ impl TargetState {
                         .any(|l| l.session == Some(session) && l.caller != Some(effect.caller))
                 {
                     return Err(bad);
+                }
+                if let Some(pending) = &self.lifecycle.pending_confirmation {
+                    if pending.owner_session == session {
+                        if pending.caller != effect.caller {
+                            return Err(bad);
+                        }
+                        if !pending.persistent && self.lifecycle.cleanup[0].is_none() {
+                            self.lifecycle.cleanup[0] =
+                                Some(PendingCleanup::SessionLoss { session });
+                        }
+                    }
                 }
                 if discard {
                     self.advance_target(0, prepared, None)?;
@@ -1098,21 +1459,22 @@ pub(crate) fn apply_target_sync(
     let mut state = read_state_sync(conn, key, identity, cancellation)?;
     state.validate_anchor(Some(&ledger))?;
     super::history::validate_record_chain_sync(conn, key, cancellation)?;
+    let previous_pending = state
+        .lifecycle
+        .pending_confirmation
+        .as_ref()
+        .map(|p| p.tx_id);
     let reduced = prepared
         .handle
         .require_live(now)
-        .and_then(|()| state.reduce(conn, prepared, &ledger, keys));
+        .and_then(|()| state.reduce(conn, prepared, &ledger, keys, now));
     if matches!(reduced, Err(AuditAuthorityError::RecoveryRequired)) {
         return Ok(Err(Failure::InvalidInput));
     }
     conn.execute_batch("SAVEPOINT audited_target_effect")
         .map_err(|_| invalid())?;
     let running_result = if reduced.is_ok() {
-        if let Some(TargetPayloadV1::Running { commit, .. }) = &prepared.effect.encrypted_payload {
-            super::sqlite::append_target_running_sync(conn, key, commit, context)?
-        } else {
-            Ok(())
-        }
+        super::sqlite::apply_target_running_sync(conn, key, prepared, previous_pending, context)?
     } else {
         Err(Failure::Conflict)
     };
@@ -1123,6 +1485,7 @@ pub(crate) fn apply_target_sync(
             state.profile.state_digest =
                 state_digest(&state.profile, &state.targets, &state.lifecycle)?;
             state.validate(identity)?;
+            state.validate_pending_history(conn)?;
             let result = NetconfTargetResult::new(
                 identity,
                 prepared.effect.profile_incarnation,

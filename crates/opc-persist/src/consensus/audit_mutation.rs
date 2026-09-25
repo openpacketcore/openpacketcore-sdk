@@ -322,7 +322,7 @@ impl TargetEffectV1 {
                 Transport::NetconfSsh | Transport::NetconfTls | Transport::Internal
             )
             || (handle.body.event.transport == Transport::Internal
-                && !matches!(self.action.0, 0 | 1 | 12 | 13 | 14))
+                && !matches!(self.action.0, 0 | 1 | 11 | 12 | 13 | 14))
         {
             return Err(bad);
         }
@@ -500,6 +500,7 @@ impl TargetEffectV1 {
         let name = match target {
             0 => "candidate",
             1 => "startup",
+            2 => "confirmation",
             _ => return Err(AuditAuthorityError::InvalidInput),
         };
         let binding = serde_json::to_vec(&(
@@ -638,7 +639,7 @@ impl PreparedTargetMutation {
                         && version.checked_add(1) == Some(running_version)
                         && commit.record.version.get() == running_version
                         && commit.record.confirmed_deadline.is_none()
-                        && self.effect.resolution.is_none())
+                        && matches!(self.effect.resolution, None | Some(TargetResolutionV1::ResolvePending { .. })))
             }
             (15, Outcome::CopiedRunning { running_version }) => {
                 matches!((&self.effect.encrypted_payload, &self.effect.destination),
@@ -650,12 +651,58 @@ impl PreparedTargetMutation {
                         && commit.record.confirmed_deadline.is_none()
                         && self.effect.resolution.is_none())
             }
+            (
+                9,
+                Outcome::Tentative {
+                    running_version,
+                    retired_generation,
+                    pending,
+                },
+            ) => {
+                matches!((&self.effect.source, &self.effect.encrypted_payload, &self.effect.destination, &self.effect.resolution),
+                    (Some(TargetSourceV1::Candidate { generation, .. }),
+                     Some(TargetPayloadV1::Running { commit, confirmation_ownership: Some(_) }),
+                     TargetExpectationV1::Running { version },
+                     Some(TargetResolutionV1::InstallPending { pending: token, rollback_parent, rollback_version, original_deadline, .. }))
+                    if generation.checked_next()? == retired_generation && *token == pending
+                        && *version == self.handle.body.binding.base_version
+                        && version.checked_add(1) == Some(running_version)
+                        && commit.record.version.get() == running_version
+                        && *rollback_version == *version && commit.record.parent_tx_id == Some(*rollback_parent)
+                        && commit.record.confirmed_deadline.is_some_and(|d| d.as_offset_datetime().unix_timestamp() == *original_deadline))
+            }
+            (10, Outcome::Confirmed { pending }) => {
+                matches!(self.effect.resolution, Some(TargetResolutionV1::ResolvePending { pending: token, .. }) if token == pending)
+            }
+            (
+                11 | 12 | 14,
+                Outcome::RolledBack {
+                    running_version,
+                    pending,
+                },
+            ) => {
+                let token_matches = match self.effect.resolution {
+                    Some(TargetResolutionV1::ResolvePending { pending: token, .. }) => {
+                        token == pending
+                    }
+                    Some(TargetResolutionV1::RebootRecovery {
+                        pending: Some(token),
+                        ..
+                    }) => token == pending,
+                    _ => false,
+                };
+                token_matches
+                    && matches!((&self.effect.destination, &self.effect.encrypted_payload),
+                    (TargetExpectationV1::Running { version }, Some(TargetPayloadV1::Running { commit, confirmation_ownership: None }))
+                    if *version == self.handle.body.binding.base_version
+                        && version.checked_add(1) == Some(running_version)
+                        && commit.record.version.get() == running_version && commit.record.confirmed_deadline.is_none())
+            }
             (13, Outcome::Lifecycle { incarnation }) => {
                 matches!(self.effect.resolution, Some(TargetResolutionV1::EndSession { session })
                     if session == incarnation.value)
             }
-            // Pending and running target effects remain unavailable until their
-            // complete atomic transition and exact result binding are implemented.
+            // No result may stand in for a different action or pending identity.
             _ => false,
         };
         if matches {

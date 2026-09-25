@@ -1536,3 +1536,544 @@ async fn target_confirmation_tentative_retains_exact_rollback_deadline_and_encry
     );
     fixture.settle(&conn, &prepared);
 }
+
+impl Fixture {
+    fn rebind_at(
+        &self,
+        conn: &Connection,
+        mut prepared: PreparedTargetMutation,
+        now: i64,
+    ) -> PreparedTargetMutation {
+        prepared.effect.expires_at = now + 60;
+        prepared.handle.body.expires_at = now + 60;
+        prepared.handle.body.issued_at = now;
+        prepared.handle.body.mutation = Some(
+            authenticate(
+                &self.key,
+                b"openpacketcore/management-audit/netconf-target/v1\0",
+                &prepared.effect,
+            )
+            .unwrap(),
+        );
+        self.bind_current_base(conn, prepared)
+    }
+
+    fn submit_at(
+        &self,
+        conn: &Connection,
+        prepared: &PreparedTargetMutation,
+        now: i64,
+    ) -> AuditOperationState {
+        self.apply(
+            conn,
+            AuditCommand::NetconfTarget(Box::new(TargetAuditCommandV1::Admit(prepared.clone()))),
+            now,
+        )
+        .unwrap();
+        self.checkpoint(conn);
+        let _ = self.apply(
+            conn,
+            AuditCommand::NetconfTarget(Box::new(TargetAuditCommandV1::Apply(prepared.clone()))),
+            now,
+        );
+        self.ledger(conn)
+            .lookup(&self.key, prepared.handle(), prepared.effect.caller)
+            .unwrap()
+            .unwrap()
+            .state()
+    }
+
+    fn pending_fixture(&self, conn: &Connection, persistent: bool) -> PreparedTargetMutation {
+        use crate::consensus::audit_mutation::TargetPayloadV1;
+        use opc_crypto::encrypt_attested_envelope_with_handle_and_nonce;
+        use opc_key::{ConfigAad, EnvelopeAad, KeyHandle, KeyId, KeyPurpose};
+        use sha2::{Digest, Sha256};
+        self.active(conn);
+        let initial = self.encrypted(self.request(conn, 101, 4, 0x61, 1), 0x36);
+        assert!(matches!(
+            self.submit(conn, &initial),
+            AuditOperationState::TargetV1(_)
+        ));
+        self.settle(conn, &initial);
+        let first = self.running_target(conn, 102, 6, 0, 0x36);
+        assert!(matches!(
+            self.submit(conn, &first),
+            AuditOperationState::TargetV1(_)
+        ));
+        self.settle(conn, &first);
+        let mut staged = self.encrypted(self.request(conn, 103, 4, 0x61, 1), 0x37);
+        let Some(TargetPayloadV1::Target(blob)) = &mut staged.effect.encrypted_payload else {
+            panic!("staged fixture");
+        };
+        let envelope = opc_crypto::CryptoEnvelopeRef::decode(&blob.encrypted_blob).unwrap();
+        let (aad, _) = opc_key::decode_bound_aad(envelope.aad).unwrap();
+        let key = KeyHandle::new(
+            KeyId::new("fixture-target-key").unwrap(),
+            KeyPurpose::Config,
+            opc_types::TenantId::from_static("fixture-tenant"),
+            zeroize::Zeroizing::new([0x37; 32]),
+        );
+        blob.encrypted_blob =
+            encrypt_attested_envelope_with_handle_and_nonce(&key, &aad, &[0x73; 32], [0x38; 12])
+                .unwrap()
+                .encoded()
+                .to_vec();
+        blob.plaintext_digest = Sha256::digest([0x73; 32]).into();
+        let staged = self.rebind_at(conn, staged, 100);
+        assert!(matches!(
+            self.submit(conn, &staged),
+            AuditOperationState::TargetV1(_)
+        ));
+        self.settle(conn, &staged);
+        let mut tentative = self.tentative_target(conn, 104, 0x37);
+        let Some(TargetResolutionV1::InstallPending {
+            persistent: supplied,
+            ..
+        }) = &mut tentative.effect.resolution
+        else {
+            panic!("pending fixture");
+        };
+        *supplied = persistent;
+        let Some(TargetPayloadV1::Running { commit, .. }) = &tentative.effect.encrypted_payload
+        else {
+            panic!("running fixture");
+        };
+        let schema = commit.record.schema_digest;
+        let aad = EnvelopeAad::config(
+            opc_types::TenantId::from_static("fixture-tenant"),
+            commit.record.version.get(),
+            ConfigAad::new(
+                opc_types::TxId::new(),
+                None,
+                commit.record.committed_at,
+                "fixture-principal",
+                schema,
+                tentative.effect.encryption_store_kind(schema, 2).unwrap(),
+            )
+            .unwrap(),
+        );
+        let key = KeyHandle::new(
+            KeyId::new("fixture-confirmation-key").unwrap(),
+            KeyPurpose::Config,
+            opc_types::TenantId::from_static("fixture-tenant"),
+            zeroize::Zeroizing::new([0x79; 32]),
+        );
+        let Some(TargetPayloadV1::Running {
+            confirmation_ownership: Some(blob),
+            ..
+        }) = &mut tentative.effect.encrypted_payload
+        else {
+            panic!("ownership fixture");
+        };
+        blob.encrypted_blob = encrypt_attested_envelope_with_handle_and_nonce(
+            &key,
+            &aad,
+            b"synthetic-confirmation-owner",
+            [105; 12],
+        )
+        .unwrap()
+        .encoded()
+        .to_vec();
+        self.rebind_at(conn, tentative, 100)
+    }
+
+    fn resolve_fixture(
+        &self,
+        conn: &Connection,
+        request: u8,
+        action: u8,
+        internal: bool,
+        now: i64,
+    ) -> PreparedTargetMutation {
+        use crate::consensus::audit_mutation::{
+            TargetLockExpectationV1, TargetPayloadV1, TargetSourceV1,
+        };
+        use opc_crypto::{
+            decrypt_envelope_with_handle, encrypt_attested_envelope_with_handle_and_nonce,
+        };
+        use opc_key::{ConfigAad, EnvelopeAad, KeyHandle, KeyId, KeyPurpose};
+        let lifecycle = row(conn, "config_netconf_lifecycle", "singleton", 1);
+        let pending = &lifecycle["pending_confirmation"];
+        let token = serde_json::from_value(pending["pending"].clone()).unwrap();
+        let deadline = lifecycle["original_deadline"].as_i64().unwrap();
+        let mut prepared = self.request(conn, request, 10, 0x61, 0);
+        prepared.effect.action = action.try_into().unwrap();
+        prepared.effect.lock = Some(TargetLockExpectationV1 {
+            datastore: 0,
+            incarnation: lifecycle["locks"][0]["incarnation"].as_u64().unwrap(),
+            session: serde_json::from_value(lifecycle["locks"][0]["session"].clone()).unwrap(),
+            requester: [0x61; 16],
+        });
+        prepared.effect.resolution = if action == 14 {
+            Some(TargetResolutionV1::RebootRecovery {
+                previous_device: serde_json::from_value(pending["device_incarnation"].clone())
+                    .unwrap(),
+                pending: Some(token),
+                original_deadline: Some(deadline),
+            })
+        } else {
+            Some(TargetResolutionV1::ResolvePending {
+                pending: token,
+                original_deadline: deadline,
+            })
+        };
+        if internal {
+            prepared.handle.body.event.transport = ManagementAuditTransportCode::Internal;
+        }
+        if action != 10 {
+            let parent = &lifecycle["rollback_parent"];
+            let parent_tx: opc_types::TxId =
+                serde_json::from_value(parent["tx_id"].clone()).unwrap();
+            let encrypted: Vec<u8> = conn
+                .query_row(
+                    "SELECT encrypted_blob FROM config_history WHERE tx_id=?1",
+                    [parent_tx.as_uuid().as_bytes().as_slice()],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            let key = KeyHandle::new(
+                KeyId::new("fixture-running-key").unwrap(),
+                KeyPurpose::Config,
+                opc_types::TenantId::from_static("fixture-tenant"),
+                zeroize::Zeroizing::new([0x7b; 32]),
+            );
+            let envelope = opc_crypto::CryptoEnvelopeRef::decode(&encrypted).unwrap();
+            let (aad, _) = opc_key::decode_bound_aad(envelope.aad).unwrap();
+            let plaintext = decrypt_envelope_with_handle(&key, &aad, &encrypted).unwrap();
+            assert_eq!(
+                plaintext.as_slice(),
+                &[0x72; 32],
+                "rollback source must be original, not tentative plaintext"
+            );
+            let pending_tx: opc_types::TxId =
+                serde_json::from_value(pending["tx_id"].clone()).unwrap();
+            let version = pending["running_version"].as_u64().unwrap();
+            let tx_id = opc_types::TxId::new();
+            let committed_at = opc_types::Timestamp::from_offset_datetime(
+                time::OffsetDateTime::from_unix_timestamp(now).unwrap(),
+            );
+            let schema = serde_json::from_value(parent["schema"].clone()).unwrap();
+            let principal =
+                r#"{"tenant":"fixture-tenant","subject":"fixture-principal"}"#.to_owned();
+            let aad = EnvelopeAad::config(
+                opc_types::TenantId::from_static("fixture-tenant"),
+                version + 1,
+                ConfigAad::new(
+                    tx_id,
+                    Some(pending_tx),
+                    committed_at,
+                    &principal,
+                    schema,
+                    "running",
+                )
+                .unwrap(),
+            );
+            let encrypted = encrypt_attested_envelope_with_handle_and_nonce(
+                &key,
+                &aad,
+                &plaintext,
+                [request; 12],
+            )
+            .unwrap();
+            let commit = crate::consensus::PreparedConfigCommit::prepare(
+                crate::CommitRecord {
+                    tx_id,
+                    parent_tx_id: Some(pending_tx),
+                    version: opc_types::ConfigVersion::new(version + 1),
+                    committed_at,
+                    principal,
+                    source: crate::CommitSource::CommitConfirmedRestore,
+                    schema_digest: schema,
+                    plaintext_digest: serde_json::from_value::<Vec<u8>>(
+                        parent["plaintext_digest"].clone(),
+                    )
+                    .unwrap(),
+                    encrypted_blob: encrypted.encoded().to_vec(),
+                    rollback_point: false,
+                    confirmed_deadline: None,
+                },
+                Vec::new(),
+                &self.key,
+            )
+            .unwrap();
+            prepared.effect.destination = TargetExpectationV1::Running { version };
+            prepared.effect.source = Some(TargetSourceV1::Running {
+                version: parent["version"].as_u64().unwrap(),
+                schema,
+                ciphertext_digest: serde_json::from_value(parent["ciphertext_digest"].clone())
+                    .unwrap(),
+            });
+            prepared.effect.encrypted_payload = Some(TargetPayloadV1::Running {
+                commit: Box::new(commit),
+                confirmation_ownership: None,
+            });
+        }
+        self.rebind_at(conn, prepared, now)
+    }
+
+    fn assert_no_pending(&self, conn: &Connection) {
+        let lifecycle = row(conn, "config_netconf_lifecycle", "singleton", 1);
+        for field in [
+            "pending_confirmation",
+            "rollback_parent",
+            "original_deadline",
+            "encrypted_confirmation_ownership",
+        ] {
+            assert!(
+                lifecycle[field].is_null(),
+                "pending field retained after resolution"
+            );
+        }
+        assert_eq!(lifecycle["cleanup"], serde_json::json!([null, null, null]));
+        crate::consensus::history::validate_record_chain_sync(
+            conn,
+            &self.key,
+            &crate::consensus::sqlite::SqliteWorkCancellation::audit_test(),
+        )
+        .unwrap();
+        crate::consensus::audit_targets::validate_inactive_sync(
+            conn,
+            &self.key,
+            self.identity,
+            &crate::consensus::sqlite::SqliteWorkCancellation::audit_test(),
+        )
+        .unwrap();
+    }
+}
+
+#[tokio::test]
+async fn target_confirmation_rejects_substituted_ownership_aad_before_any_effect() {
+    let fixture = Fixture::new().await;
+    let shared = fixture.backend.conn();
+    let conn = shared.lock().await;
+    let original = fixture.pending_fixture(&conn, false);
+    let mut altered = original.clone();
+    let Some(TargetResolutionV1::InstallPending { persistent, .. }) =
+        &mut altered.effect.resolution
+    else {
+        panic!("fixture");
+    };
+    *persistent = true; // Valid AEAD still binds the nonpersistent ownership.
+    let altered = fixture.rebind_at(&conn, altered, 100);
+    let before = target_rows(&conn);
+    assert_eq!(
+        fixture.submit(&conn, &altered),
+        AuditOperationState::Rejected,
+        "ownership from another pending binding was accepted"
+    );
+    assert_eq!(target_rows(&conn), before);
+    assert_eq!(
+        conn.query_row("SELECT MAX(version) FROM config_history", [], |r| r
+            .get::<_, u64>(0))
+            .unwrap(),
+        1
+    );
+    fixture.settle(&conn, &altered);
+}
+
+#[tokio::test]
+async fn target_confirmation_exact_confirm_rejects_wrong_pending_deadline_and_session() {
+    let fixture = Fixture::new().await;
+    let shared = fixture.backend.conn();
+    let conn = shared.lock().await;
+    let tentative = fixture.pending_fixture(&conn, false);
+    assert!(matches!(
+        fixture.submit(&conn, &tentative),
+        AuditOperationState::TargetV1(_)
+    ));
+    fixture.settle(&conn, &tentative);
+    for (id, variant) in [(110, 0), (111, 1), (112, 2)] {
+        let mut wrong = fixture.resolve_fixture(&conn, id, 10, false, 100);
+        match variant {
+            0 => {
+                let Some(TargetResolutionV1::ResolvePending { pending, .. }) =
+                    &mut wrong.effect.resolution
+                else {
+                    panic!("fixture");
+                };
+                pending.value = [0xf1; 16];
+            }
+            1 => {
+                let Some(TargetResolutionV1::ResolvePending {
+                    original_deadline, ..
+                }) = &mut wrong.effect.resolution
+                else {
+                    panic!("fixture");
+                };
+                *original_deadline += 1;
+            }
+            _ => wrong.effect.lock.as_mut().unwrap().requester = [0xf2; 16],
+        }
+        let wrong = fixture.rebind_at(&conn, wrong, 100);
+        let before = target_rows(&conn);
+        assert_eq!(
+            fixture.submit(&conn, &wrong),
+            AuditOperationState::Rejected,
+            "confirmation ignored its exact pending ownership"
+        );
+        assert_eq!(target_rows(&conn), before);
+        fixture.settle(&conn, &wrong);
+    }
+    let exact = fixture.resolve_fixture(&conn, 113, 10, false, 100);
+    assert!(
+        matches!(fixture.submit(&conn,&exact),AuditOperationState::TargetV1(r) if matches!(r.outcome(),NetconfAppliedOutcome::Confirmed{..}))
+    );
+    fixture.assert_no_pending(&conn);
+    let confirmed: Option<String> = conn
+        .query_row(
+            "SELECT confirmed_at FROM config_history ORDER BY version DESC LIMIT 1",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert!(confirmed.is_some());
+    let before = target_rows(&conn);
+    fixture
+        .apply(
+            &conn,
+            AuditCommand::NetconfTarget(Box::new(TargetAuditCommandV1::Apply(exact.clone()))),
+            200,
+        )
+        .unwrap();
+    assert_eq!(target_rows(&conn), before);
+    fixture.settle(&conn, &exact);
+}
+
+#[tokio::test]
+async fn target_confirmation_cancel_restores_the_original_encrypted_parent() {
+    let fixture = Fixture::new().await;
+    let shared = fixture.backend.conn();
+    let conn = shared.lock().await;
+    let tentative = fixture.pending_fixture(&conn, true);
+    assert!(matches!(
+        fixture.submit(&conn, &tentative),
+        AuditOperationState::TargetV1(_)
+    ));
+    fixture.settle(&conn, &tentative);
+    let exact = fixture.resolve_fixture(&conn, 114, 11, false, 100);
+    assert!(
+        matches!(fixture.submit(&conn,&exact),AuditOperationState::TargetV1(r) if matches!(r.outcome(),NetconfAppliedOutcome::RolledBack{running_version:3,..}))
+    );
+    fixture.assert_running_plaintext(&conn, &exact);
+    fixture.assert_no_pending(&conn);
+    fixture.settle(&conn, &exact);
+}
+
+#[tokio::test]
+async fn target_confirmation_expiry_preserves_original_deadline_and_rejects_early_or_late_confirmation(
+) {
+    let fixture = Fixture::new().await;
+    let shared = fixture.backend.conn();
+    let conn = shared.lock().await;
+    let tentative = fixture.pending_fixture(&conn, true);
+    assert!(matches!(
+        fixture.submit(&conn, &tentative),
+        AuditOperationState::TargetV1(_)
+    ));
+    fixture.settle(&conn, &tentative);
+    let deadline = row(&conn, "config_netconf_lifecycle", "singleton", 1)["original_deadline"]
+        .as_i64()
+        .unwrap();
+    for (id, action, internal, now) in [(115, 12, true, deadline - 1), (116, 10, false, deadline)] {
+        let wrong = fixture.resolve_fixture(&conn, id, action, internal, now);
+        let before = target_rows(&conn);
+        assert_eq!(
+            fixture.submit_at(&conn, &wrong, now),
+            AuditOperationState::Rejected,
+            "original deadline did not fence resolution"
+        );
+        assert_eq!(target_rows(&conn), before);
+        fixture.settle(&conn, &wrong);
+    }
+    let exact = fixture.resolve_fixture(&conn, 117, 12, true, deadline);
+    assert!(
+        matches!(fixture.submit_at(&conn,&exact,deadline),AuditOperationState::TargetV1(r) if matches!(r.outcome(),NetconfAppliedOutcome::RolledBack{running_version:3,..}))
+    );
+    fixture.assert_running_plaintext(&conn, &exact);
+    fixture.assert_no_pending(&conn);
+    fixture.settle(&conn, &exact);
+}
+
+#[tokio::test]
+async fn target_confirmation_session_loss_distinguishes_persistent_ownership() {
+    for persistent in [false, true] {
+        let fixture = Fixture::new().await;
+        let shared = fixture.backend.conn();
+        let conn = shared.lock().await;
+        let tentative = fixture.pending_fixture(&conn, persistent);
+        assert!(matches!(
+            fixture.submit(&conn, &tentative),
+            AuditOperationState::TargetV1(_)
+        ));
+        fixture.settle(&conn, &tentative);
+        let end = fixture.request(&conn, 118, 13, 0x61, 0);
+        let end = fixture.rebind_at(&conn, end, 100);
+        assert!(matches!(
+            fixture.submit(&conn, &end),
+            AuditOperationState::TargetV1(_)
+        ));
+        fixture.settle(&conn, &end);
+        let lifecycle = row(&conn, "config_netconf_lifecycle", "singleton", 1);
+        assert_eq!(lifecycle["cleanup"][0].is_null(), persistent);
+        let exact = fixture.resolve_fixture(
+            &conn,
+            119,
+            if persistent { 10 } else { 11 },
+            !persistent,
+            100,
+        );
+        assert!(matches!(
+            fixture.submit(&conn, &exact),
+            AuditOperationState::TargetV1(_)
+        ));
+        if !persistent {
+            fixture.assert_running_plaintext(&conn, &exact);
+        }
+        fixture.assert_no_pending(&conn);
+        fixture.settle(&conn, &exact);
+    }
+}
+
+#[tokio::test]
+async fn target_confirmation_reopen_preserves_pending_and_device_reboot_requires_exact_rollback() {
+    let fixture = Fixture::new().await;
+    let shared = fixture.backend.conn();
+    let conn = shared.lock().await;
+    let tentative = fixture.pending_fixture(&conn, true);
+    assert!(matches!(
+        fixture.submit(&conn, &tentative),
+        AuditOperationState::TargetV1(_)
+    ));
+    fixture.settle(&conn, &tentative);
+    let before = target_rows(&conn);
+    drop(conn);
+    let conn = Connection::open(fixture.directory.path().join("authority.sqlite")).unwrap();
+    crate::consensus::audit_targets::validate_inactive_sync(
+        &conn,
+        &fixture.key,
+        fixture.identity,
+        &crate::consensus::sqlite::SqliteWorkCancellation::audit_test(),
+    )
+    .unwrap();
+    assert_eq!(target_rows(&conn), before);
+    let begin = fixture.request(&conn, 120, 1, 0x61, 0);
+    let begin = fixture.rebind_at(&conn, begin, 100);
+    assert!(matches!(
+        fixture.submit(&conn, &begin),
+        AuditOperationState::TargetV1(_)
+    ));
+    fixture.settle(&conn, &begin);
+    assert!(!row(&conn, "config_netconf_lifecycle", "singleton", 1)["cleanup"][0].is_null());
+    let wrong = fixture.resolve_fixture(&conn, 121, 10, false, 100);
+    let before = target_rows(&conn);
+    assert_eq!(fixture.submit(&conn, &wrong), AuditOperationState::Rejected);
+    assert_eq!(target_rows(&conn), before);
+    fixture.settle(&conn, &wrong);
+    let exact = fixture.resolve_fixture(&conn, 122, 14, true, 100);
+    assert!(
+        matches!(fixture.submit(&conn,&exact),AuditOperationState::TargetV1(r) if matches!(r.outcome(),NetconfAppliedOutcome::RolledBack{running_version:3,..}))
+    );
+    fixture.assert_running_plaintext(&conn, &exact);
+    fixture.assert_no_pending(&conn);
+    fixture.settle(&conn, &exact);
+}

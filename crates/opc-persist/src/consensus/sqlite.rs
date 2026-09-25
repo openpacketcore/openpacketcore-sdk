@@ -2796,25 +2796,67 @@ fn create_rollback_point_sync(
 
 /// The target dispatcher owns the savepoint and retained outcome. Reuse the
 /// ordinary append and bounded history refresh with the original command context.
-pub(super) fn append_target_running_sync(
+pub(super) fn apply_target_running_sync(
     conn: &Connection,
     key: &AuditKey,
-    commit: &super::PreparedConfigCommit,
+    prepared: &super::audit_mutation::PreparedTargetMutation,
+    pending_tx_id: Option<opc_types::TxId>,
     context: &super::audit::ApplyContext<'_>,
 ) -> io::Result<Result<(), ConfigMutationFailure>> {
-    let result = append_prepared_commit_sync(
-        conn,
-        commit,
-        None,
-        super::types::CONFIG_CONSENSUS_COMMAND_VERSION,
-        context.logical_time,
-        context.request_id,
-        context.cancellation,
-    )?;
+    use super::audit_mutation::{TargetPayloadV1, TargetResolutionV1};
+    let action = u8::from(prepared.effect.action);
+    let (result, updates_existing) = match &prepared.effect.encrypted_payload {
+        Some(TargetPayloadV1::Running { commit, .. }) => {
+            let resolution = match action {
+                6 if matches!(
+                    prepared.effect.resolution,
+                    Some(TargetResolutionV1::ResolvePending { .. })
+                ) =>
+                {
+                    Some(crate::ConfirmedCommitResolution::Confirm {
+                        pending_tx_id: pending_tx_id
+                            .ok_or_else(|| invalid_data("missing retained pending transaction"))?,
+                    })
+                }
+                11 | 12 | 14 => Some(crate::ConfirmedCommitResolution::Rollback {
+                    pending_tx_id: pending_tx_id
+                        .ok_or_else(|| invalid_data("missing retained pending transaction"))?,
+                }),
+                _ => None,
+            };
+            (
+                append_prepared_commit_sync(
+                    conn,
+                    commit,
+                    resolution,
+                    super::types::CONFIG_CONSENSUS_COMMAND_VERSION,
+                    context.logical_time,
+                    context.request_id,
+                    context.cancellation,
+                )?,
+                matches!(
+                    resolution,
+                    Some(crate::ConfirmedCommitResolution::Confirm { .. })
+                ),
+            )
+        }
+        None if action == 10 => (
+            mark_confirmed_sync(
+                conn,
+                pending_tx_id
+                    .ok_or_else(|| invalid_data("missing retained pending transaction"))?,
+                context.logical_time,
+                context.request_id,
+                true,
+            )?,
+            true,
+        ),
+        _ => return Ok(Ok(())),
+    };
     if result.is_err() {
         return Ok(result);
     }
-    super::history::refresh_sync(conn, key, false, context.cancellation)
+    super::history::refresh_sync(conn, key, updates_existing, context.cancellation)
 }
 
 fn execute_intent_sync(
