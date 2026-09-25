@@ -279,14 +279,14 @@ async fn exercise_cancelled_promise_owns_disk_until_shutdown_and_replacement(pro
         // Passive state remains observable while the accepted fsync is held.
         let observed = fleet.store(0).clone();
         let health = tokio::task::spawn_blocking(move || observed.persistence_health());
-        assert!(!tokio::time::timeout(OPERATION_BOUND, health)
+        assert!(tokio::time::timeout(OPERATION_BOUND, health)
             .await
             .unwrap()
             .unwrap()
             .asynchronous
             .unwrap()
             .background_failure
-            .is_some());
+            .is_none());
         let started = tokio::time::Instant::now();
         assert!(control(&fleet, 0, Action::Prepare(round.clone()))
             .await
