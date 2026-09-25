@@ -3564,9 +3564,12 @@ pub(crate) fn build_snapshot_database_cancellable_sync(
     cancellation: &Arc<SqliteWorkCancellation>,
 ) -> io::Result<AppliedMembership> {
     cancellation.check_io()?;
-    validate_sealed_state_sync(conn, audit_key, cancellation)?;
-    let applied = read_applied_sync(conn, identity)?;
-    let membership = read_membership_sync(conn, identity, expected_members)?;
+    // Validation, the advertised frontier and the copied database must describe
+    // one WAL read view even when another connection commits during backup.
+    let source = conn.unchecked_transaction().map_err(db_error)?;
+    validate_sealed_state_sync(&source, audit_key, cancellation)?;
+    let applied = read_applied_sync(&source, identity)?;
+    let membership = read_membership_sync(&source, identity, expected_members)?;
     validate_fixed_membership(&membership, expected_members)?;
     #[cfg(test)]
     if let Some(hook) = SNAPSHOT_AFTER_FRONTIER.with(|hook| hook.borrow_mut().take()) {
@@ -3578,7 +3581,7 @@ pub(crate) fn build_snapshot_database_cancellable_sync(
         .progress_handler(1_000, Some(move || progress_cancellation.is_cancelled()))
         .map_err(db_error)?;
     {
-        let backup = rusqlite::backup::Backup::new(conn, &mut destination).map_err(db_error)?;
+        let backup = rusqlite::backup::Backup::new(&source, &mut destination).map_err(db_error)?;
         loop {
             cancellation.check_io()?;
             match backup.step(128).map_err(db_error)? {
@@ -3591,6 +3594,7 @@ pub(crate) fn build_snapshot_database_cancellable_sync(
             }
         }
     }
+    source.commit().map_err(db_error)?;
     cancellation.check_io()?;
     destination
         .execute_batch(
