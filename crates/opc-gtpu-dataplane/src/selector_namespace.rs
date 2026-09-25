@@ -4366,6 +4366,7 @@ where
             .map_err(|_| GtpuSessionSelectorCoordinatorError::Namespace)?;
         let result = async {
             self.ensure_backend_namespace(backend, &mut lease).await?;
+            let _transition = self.concurrent_transition().await;
             for _ in 0..MAX_CAS_RETRIES {
                 let (record, mut state) = self.read_state().await?;
                 state.bind_or_validate(desired.device_id(), self.maximum_operation_atoms, None)?;

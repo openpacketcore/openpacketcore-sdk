@@ -47,6 +47,285 @@ async fn independent_fixtures_do_not_share_admission_capacity() {
     );
 }
 
+fn reattached(source: &GtpuSessionGroup, id: u8, teid: u32) -> GtpuSessionGroup {
+    let mut context = source.entries()[0].context().clone();
+    context.local_teid = Teid::new(teid).unwrap();
+    context.peer_teid = Teid::new(teid + 0x1000).unwrap();
+    GtpuSessionGroup::new(
+        GtpuSessionGroupId::new([id; 16]).unwrap(),
+        source.device_id(),
+        vec![GtpuSessionEntry::new(context, source.entries()[0].local_outer_address()).unwrap()],
+    )
+    .unwrap()
+}
+
+#[tokio::test]
+async fn unrelated_unadmitted_cleanup_progresses_during_held_installation() {
+    fallback_progress(false, true).await;
+}
+
+#[tokio::test]
+async fn unrelated_reattach_progresses_before_another_installation_effect() {
+    fallback_progress(true, true).await;
+}
+
+#[tokio::test]
+async fn unrelated_reattach_progresses_before_another_installation_acknowledgement() {
+    fallback_progress(true, false).await;
+}
+
+async fn fallback_progress(reattach: bool, before: bool) {
+    let lab = lab(4).await;
+    let concurrent = lab.authority.concurrent_operations();
+    let backend = held_backend(&lab, before);
+    if reattach {
+        let sibling = concurrent
+            .recover_active(backend.clone(), lab.sibling.clone())
+            .await
+            .unwrap();
+        drop(
+            concurrent
+                .retire(backend.clone(), sibling, lab.sibling.clone())
+                .await
+                .unwrap(),
+        );
+    }
+    let parent = concurrent
+        .recover_active(backend.clone(), lab.parent.clone())
+        .await
+        .unwrap();
+    backend.hold_next.store(true, Ordering::SeqCst);
+    let mut first = concurrent.reconcile_bearer(
+        backend.clone(),
+        parent,
+        lab.parent.clone(),
+        lab.child.clone(),
+    );
+    tokio::select! {
+        () = backend.entered.notified() => {},
+        result = &mut first => panic!("installation escaped its exact gate: {result:?}"),
+    }
+    let desired = reattached(&lab.sibling, 4, 0x3001);
+    let mut fallback = Box::pin(async {
+        if reattach {
+            let claim = concurrent
+                .reconcile_reattached(backend.clone(), desired.clone())
+                .await?;
+            drop(
+                concurrent
+                    .retire(backend.clone(), claim, desired.clone())
+                    .await?,
+            );
+        } else {
+            let claim = concurrent
+                .seal_unadmitted(backend.clone(), desired.clone())
+                .await?;
+            assert!(claim.confirms_group(&lab.authority, &desired));
+        }
+        Ok::<(), GtpuSessionSelectorCoordinatorError>(())
+    });
+    let progress = tokio::time::timeout(Duration::from_secs(1), &mut fallback).await;
+    let independent = progress.is_ok();
+    backend.release.notify_one();
+    drop(first.await.unwrap());
+    match progress {
+        Ok(result) => result.unwrap(),
+        Err(_) => fallback.await.unwrap(),
+    }
+    for group in [lab.parent.clone(), lab.child.clone()] {
+        drop(
+            concurrent
+                .recover_active(backend.clone(), group)
+                .await
+                .unwrap(),
+        );
+    }
+    assert!(
+        independent,
+        "unrelated lifecycle fallback must finish while installation is held"
+    );
+}
+
+#[tokio::test]
+async fn concurrent_seal_repeats_only_the_exact_never_admitted_graph() {
+    let lab = lab(4).await;
+    let concurrent = lab.authority.concurrent_operations();
+    let desired = reattached(&lab.sibling, 4, 0x3001);
+    let claim = concurrent
+        .seal_unadmitted(lab.backend.clone(), desired.clone())
+        .await
+        .unwrap();
+    assert!(claim.confirms_group(&lab.authority, &desired));
+    let before = lab.authority.read_state().await.unwrap().1.encode();
+    let repeated = concurrent
+        .seal_unadmitted(lab.backend.clone(), desired.clone())
+        .await
+        .unwrap();
+    assert!(repeated.confirms_group(&lab.authority, &desired));
+    let changed = reattached(&lab.sibling, 4, 0x4001);
+    for rejected in [changed, lab.parent.clone(), lab.sibling.clone()] {
+        assert!(concurrent
+            .seal_unadmitted(lab.backend.clone(), rejected)
+            .await
+            .is_err());
+        assert_eq!(lab.authority.read_state().await.unwrap().1.encode(), before);
+    }
+    assert!(concurrent
+        .reconcile_reattached(lab.backend.clone(), desired)
+        .await
+        .is_err());
+    assert_eq!(lab.authority.read_state().await.unwrap().1.encode(), before);
+    for active in [lab.parent, lab.sibling] {
+        drop(
+            concurrent
+                .recover_active(lab.backend.clone(), active)
+                .await
+                .unwrap(),
+        );
+    }
+}
+
+#[tokio::test]
+async fn concurrent_reattach_retains_exact_predecessor_and_burned_teid_rules() {
+    let lab = lab(4).await;
+    let concurrent = lab.authority.concurrent_operations();
+    let next = reattached(&lab.sibling, 4, 0x3001);
+    assert!(concurrent
+        .reconcile_reattached(lab.backend.clone(), next.clone())
+        .await
+        .is_err());
+    let old = concurrent
+        .recover_active(lab.backend.clone(), lab.sibling.clone())
+        .await
+        .unwrap();
+    drop(
+        concurrent
+            .retire(lab.backend.clone(), old, lab.sibling.clone())
+            .await
+            .unwrap(),
+    );
+    let before = lab.authority.read_state().await.unwrap().1.encode();
+    let old_teid = lab.sibling.entries()[0].context().local_teid.get();
+    for invalid in [
+        reattached(&lab.sibling, 4, old_teid),
+        reattached(&lab.sibling, 2, 0x3001),
+        next_child(&lab.sibling, 4, 0x3001),
+        reattached(&lab.parent, 4, 0x3001),
+    ] {
+        assert!(concurrent
+            .reconcile_reattached(lab.backend.clone(), invalid)
+            .await
+            .is_err());
+        assert_eq!(lab.authority.read_state().await.unwrap().1.encode(), before);
+    }
+    let active = concurrent
+        .reconcile_reattached(lab.backend.clone(), next.clone())
+        .await
+        .unwrap();
+    assert!(concurrent
+        .reconcile_reattached(lab.backend.clone(), next.clone())
+        .await
+        .is_err());
+    drop(
+        concurrent
+            .retire(lab.backend.clone(), active, next.clone())
+            .await
+            .unwrap(),
+    );
+    assert!(concurrent
+        .reconcile_reattached(lab.backend.clone(), reattached(&next, 5, old_teid))
+        .await
+        .is_err());
+    let replacement = reattached(&next, 5, 0x4001);
+    let active = concurrent
+        .reconcile_reattached(lab.backend.clone(), replacement.clone())
+        .await
+        .unwrap();
+    drop(
+        concurrent
+            .retire(lab.backend.clone(), active, replacement)
+            .await
+            .unwrap(),
+    );
+    drop(
+        concurrent
+            .recover_active(lab.backend.clone(), lab.parent)
+            .await
+            .unwrap(),
+    );
+}
+
+#[tokio::test]
+async fn concurrent_reattach_cancellation_retains_conflicts_and_one_successor() {
+    let lab = lab(4).await;
+    let concurrent = lab.authority.concurrent_operations();
+    let backend = held_backend(&lab, true);
+    let old = concurrent
+        .recover_active(backend.clone(), lab.sibling.clone())
+        .await
+        .unwrap();
+    drop(
+        concurrent
+            .retire(backend.clone(), old, lab.sibling.clone())
+            .await
+            .unwrap(),
+    );
+    let next = reattached(&lab.sibling, 4, 0x3001);
+    backend.hold_next.store(true, Ordering::SeqCst);
+    let mut first = concurrent.reconcile_reattached(backend.clone(), next.clone());
+    tokio::select! {
+        () = backend.entered.notified() => {},
+        result = &mut first => panic!("reattachment escaped its exact gate: {result:?}"),
+    }
+    drop(first);
+    let mut retry = concurrent.recover_active(backend.clone(), next.clone());
+    let competitor = reattached(&lab.sibling, 5, 0x4001);
+    let mut conflict = concurrent.reconcile_reattached(backend.clone(), competitor);
+    for observer in [&mut retry, &mut conflict] {
+        assert!(
+            std::future::poll_fn(|cx| Poll::Ready(Pin::new(&mut *observer).poll(cx).is_pending()))
+                .await
+        );
+    }
+    let mut unrelated = Box::pin(async {
+        let parent = concurrent
+            .recover_active(backend.clone(), lab.parent.clone())
+            .await?;
+        concurrent
+            .reconcile_bearer(
+                backend.clone(),
+                parent,
+                lab.parent.clone(),
+                lab.child.clone(),
+            )
+            .await
+    });
+    let progress = tokio::time::timeout(Duration::from_secs(1), &mut unrelated).await;
+    let independent = progress.is_ok();
+    backend.release.notify_one();
+    let child = match progress {
+        Ok(result) => result.unwrap(),
+        Err(_) => unrelated.await.unwrap(),
+    };
+    let active = retry.await.unwrap();
+    assert!(conflict.await.is_err());
+    let (left, right) = tokio::join!(
+        concurrent.retire(backend.clone(), active, next),
+        concurrent.retire(backend.clone(), child, lab.child.clone()),
+    );
+    drop((left.unwrap(), right.unwrap()));
+    drop(
+        concurrent
+            .recover_active(backend.clone(), lab.parent.clone())
+            .await
+            .unwrap(),
+    );
+    assert!(
+        independent,
+        "a dropped reattach observer must retain only its actual conflicts"
+    );
+}
+
 #[tokio::test]
 async fn concurrent_retirement_preserves_retry_order_and_exact_mark_reuse() {
     retirement_progress(true, false).await;

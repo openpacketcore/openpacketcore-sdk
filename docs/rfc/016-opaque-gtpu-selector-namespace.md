@@ -1153,6 +1153,16 @@ the same PAA guard. The protected record's complete ownership validation,
 including legacy global marks, remains mandatory. Local guards are scheduling
 exclusions and never authority.
 
+The handle includes fresh and marked-child reconciliation, their existing
+recovery/retirement operations, exact never-admitted sealing, and the bounded
+single-bearer reattachment profile. Sealing reserves the complete desired graph
+and serializes its protected no-admission transition. Reattachment's exact PAA
+guard also excludes every eligible retired predecessor: the existing predicate
+requires an identical PAA, mark, endpoint and transport family, with only one
+fresh TEID selector. Source discovery, backend quiescence qualification and the
+atomic one-successor reservation are unchanged. This does not expose concurrent
+general mixed-selector transfer or accept a cached reuse authorization.
+
 Authenticated root read/transition/CAS/exact-readback sections serialize under
 one cohort transition mutex. The full inventory observation also holds that
 mutex. Independent backend installation/removal sections may overlap; the

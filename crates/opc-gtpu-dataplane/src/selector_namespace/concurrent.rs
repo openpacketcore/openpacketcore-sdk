@@ -143,6 +143,42 @@ where
         })
     }
 
+    /// Permanently seal one exact never-admitted group without a backend effect.
+    pub fn seal_unadmitted<D>(
+        &self,
+        backend: Arc<D>,
+        desired: GtpuSessionGroup,
+    ) -> GtpuSessionSelectorOperation<GtpuSessionSelectorUnadmittedClaim>
+    where
+        D: GtpuDataplaneBackend + Send + Sync + 'static,
+    {
+        self.spawn(vec![desired.clone()], |authority| async move {
+            authority
+                .seal_unadmitted_owned(backend.as_ref(), desired)
+                .await
+        })
+    }
+
+    /// Reattach an exact retired single-bearer predecessor using a fresh TEID.
+    ///
+    /// The complete desired PAA reservation also excludes every eligible
+    /// predecessor. The original protected source discovery, quiescence receipt
+    /// and atomic one-successor transition remain mandatory.
+    pub fn reconcile_reattached<D>(
+        &self,
+        backend: Arc<D>,
+        desired: GtpuSessionGroup,
+    ) -> GtpuSessionSelectorOperation<GtpuSessionSelectorActiveClaim>
+    where
+        D: GtpuDataplaneBackend + Send + Sync + 'static,
+    {
+        self.spawn(vec![desired.clone()], |authority| async move {
+            authority
+                .reconcile_reattached_owned(backend.as_ref(), desired)
+                .await
+        })
+    }
+
     /// Reconcile a marked child, reserving its exact parent and complete set.
     pub fn reconcile_bearer<D>(
         &self,
