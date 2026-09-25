@@ -1375,6 +1375,7 @@ impl ConsensusConfigStore {
     /// the existing RFC 019 target profile. The original source and destination
     /// are authenticated through the key provider; request metadata may differ,
     /// but their serialized configuration bytes and schema must be identical.
+    /// The intent must carry the NETCONF copy-config `Replace` operation.
     ///
     /// This does not grant NACM permission or admit an effect. Retain the result
     /// before intent admission. Unknown outcomes recover this original operation;

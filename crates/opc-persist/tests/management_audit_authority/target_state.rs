@@ -4086,22 +4086,26 @@ async fn target_provider_copy_pinned_preparation_binds_current_session_and_locks
         assert!(view.blob == source);
         let worker = std::sync::Arc::new(());
         let session = fixture.session_owner(&conn, &worker, 0x61);
+        let mut protocol = fixture.event(181);
+        protocol.operation = ManagementAuditOperationCode::Replace;
         let mut effect = view
-            .prepare(&session, &fixture.event(181), (*commit).clone(), 160)
+            .prepare(&session, &protocol, (*commit).clone(), 160)
             .unwrap();
         effect
             .bind_provider_copy(&provider, &view.blob)
             .await
             .unwrap();
-        let prepared = fixture.rebind_at(&conn, fixture.prepare(effect, fixture.event(181)), 100);
+        let prepared = fixture.rebind_at(&conn, fixture.prepare(effect, protocol), 100);
         assert!(matches!(
             fixture.submit(&conn, &prepared),
             AuditOperationState::TargetV1(_)
         ));
         fixture.settle(&conn, &prepared);
         session.invalidate();
+        let mut later = fixture.event(182);
+        later.operation = ManagementAuditOperationCode::Replace;
         assert!(matches!(
-            view.prepare(&session, &fixture.event(182), *commit, 160),
+            view.prepare(&session, &later, *commit, 160),
             Err(AuditAuthorityError::BindingMismatch)
         ));
     }
@@ -4369,14 +4373,14 @@ async fn target_provider_lifecycle_promotes_and_copies_exact_absent_candidate_fa
     ));
     let worker = std::sync::Arc::new(());
     let session = fixture.session_owner(&conn, &worker, 0x61);
-    let mut effect = view
-        .prepare(&session, &fixture.event(182), *commit, 160)
-        .unwrap();
+    let mut protocol = fixture.event(182);
+    protocol.operation = ManagementAuditOperationCode::Replace;
+    let mut effect = view.prepare(&session, &protocol, *commit, 160).unwrap();
     effect
         .bind_provider_copy(&provider, &view.blob)
         .await
         .unwrap();
-    let fallback = fixture.rebind_at(&conn, fixture.prepare(effect, fixture.event(182)), 100);
+    let fallback = fixture.rebind_at(&conn, fixture.prepare(effect, protocol), 100);
     assert!(
         matches!(fixture.submit(&conn, &fallback), AuditOperationState::TargetV1(r)
         if matches!(r.outcome(), NetconfAppliedOutcome::CopiedRunning { running_version: 2 }))

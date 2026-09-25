@@ -2051,7 +2051,7 @@ impl NetconfCopyView {
         if self.pending
             || event.caller != session.caller
             || event.outcome != crate::ManagementAuditOutcomeCode::Intent
-            || event.operation != crate::ManagementAuditOperationCode::Exec
+            || event.operation != crate::ManagementAuditOperationCode::Replace
             || !matches!(
                 event.transport,
                 Transport::NetconfSsh | Transport::NetconfTls
