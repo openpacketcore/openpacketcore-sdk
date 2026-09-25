@@ -550,7 +550,7 @@ impl TargetState {
         ) {
             (None, None, None, None) if lifecycle.cleanup.iter().all(Option::is_none) => Ok(()),
             (Some(pending), Some(parent), Some(deadline), Some(ownership)) => {
-                if pending.pending.authority() != self.profile.authority
+                if pending.pending.authority != self.profile.authority
                     || pending.pending.value == [0; 16]
                     || pending.owner_session == [0; 16]
                     || pending.device_incarnation == [0; 16]
@@ -1224,7 +1224,7 @@ impl TargetState {
                         };
                         let ownership = confirmation_ownership.as_ref().ok_or(bad)?;
                         let deadline = commit.record.confirmed_deadline.ok_or(bad)?;
-                        if pending.authority() != effect.authority
+                        if pending.authority != effect.authority
                             || pending.value == [0; 16]
                             || owner_session != expected.requester
                             || rollback_version != current_version
