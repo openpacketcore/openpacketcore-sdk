@@ -118,6 +118,13 @@ may have been transmitted, recovery must use that operation rather than repeat
 encryption or prepare a replacement. These preparation types do not activate the
 full NETCONF runtime profile or confer recipient-only audit verification.
 
+Datastore copies into candidate/startup enforce the selected source's current
+lock owner as well as the destination's original lock expectation, matching the
+existing running-copy rule. An absent-candidate fallback uses the candidate
+source lock and still binds its exact running version and ciphertext. Acquiring
+a foreign source lock after preparation prevents application without advancing
+either target. Ordinary read observations do not use this mutation admission.
+
 ## Closed effect representation
 
 `TargetEffectV1` is an explicitly tagged, bounded record. Its common fields, in

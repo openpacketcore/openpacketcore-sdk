@@ -5786,3 +5786,69 @@ async fn target_datastore_copy_refuses_original_source_locked_by_another_session
         fixture.settle(&conn, &prepared);
     }
 }
+
+#[tokio::test]
+async fn target_datastore_copy_refuses_source_replaced_after_preparation() {
+    use crate::audit_authority::{NetconfLockDatastore as Store, NetconfTargetReplacement};
+    for source_slot in [0, 1] {
+        let fixture = Fixture::new().await;
+        let shared = fixture.backend.conn();
+        let conn = shared.lock().await;
+        fixture.active(&conn);
+        let config = br#"{"source":"original"}"#;
+        let (provider, _) = copy_provider_stage(&fixture, &conn, source_slot, config).await;
+        let prepared =
+            datastore_copy_lock_fixture(&fixture, &conn, source_slot, 0x61, 205, &provider, config)
+                .await;
+        assert_eq!(fixture.preflight(&conn, &prepared, 100).unwrap(), None);
+        let worker = std::sync::Arc::new(());
+        let session = fixture.session_owner(&conn, &worker, 0x61);
+        let datastore = if source_slot == 0 {
+            Store::Candidate
+        } else {
+            Store::Startup
+        };
+        let frozen = fixture.frozen_target(&conn, &session, datastore).unwrap();
+        let replacement = copy_plaintext(206, br#"{"source":"replacement"}"#);
+        let mut event = fixture.event(206);
+        event.operation = ManagementAuditOperationCode::Update;
+        let effect = frozen
+            .prepare_replacement(
+                &session,
+                NetconfTargetReplacement::edit(
+                    &frozen,
+                    &replacement,
+                    frozen.schema().unwrap(),
+                    &provider,
+                ),
+                opc_types::TenantId::from_static("fixture-tenant"),
+                &event,
+                160,
+            )
+            .await
+            .unwrap();
+        let changed = fixture.bind_frozen_target(&frozen, effect, event);
+        assert!(matches!(
+            fixture.submit(&conn, &changed),
+            AuditOperationState::TargetV1(_)
+        ));
+        fixture.settle(&conn, &changed);
+        let before = target_rows(&conn);
+        let changes = conn.total_changes();
+        assert!(
+            matches!(
+                fixture.preflight(&conn, &prepared, 100),
+                Err(AuditAuthorityError::BindingMismatch)
+            ),
+            "target copy accepted a source substituted after preparation"
+        );
+        assert_eq!(conn.total_changes(), changes);
+        assert_eq!(target_rows(&conn), before);
+        assert_eq!(
+            fixture.submit(&conn, &prepared),
+            AuditOperationState::Rejected
+        );
+        assert_eq!(target_rows(&conn), before);
+        fixture.settle(&conn, &prepared);
+    }
+}

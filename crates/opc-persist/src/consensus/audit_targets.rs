@@ -1112,6 +1112,23 @@ impl TargetState {
             4 | 5 | 7 | 8 => {
                 let slot = if matches!(action, 4 | 5) { 0 } else { 1 };
                 self.check_lock(prepared, slot + 1)?;
+                // A target copy has the same current source-owner fence as a
+                // copy to running. Exact source content was checked above.
+                if let Some(source) = &effect.source {
+                    let source_slot = match source {
+                        TargetSourceV1::Running { .. } => 0,
+                        TargetSourceV1::Candidate { .. }
+                        | TargetSourceV1::CandidateFallback { .. } => 1,
+                        TargetSourceV1::Startup { .. } => 2,
+                    };
+                    let requester = effect.lock.as_ref().ok_or(bad)?.requester;
+                    let source_lock = self.lifecycle.locks[source_slot].as_ref().ok_or(bad)?;
+                    if source_lock.session.is_some_and(|s| s != requester)
+                        || source_lock.caller.is_some_and(|c| c != effect.caller)
+                    {
+                        return Err(bad);
+                    }
+                }
                 let blob = match (&effect.encrypted_payload, action) {
                     (Some(TargetPayloadV1::Target(blob)), 4 | 7) => {
                         let next = self.targets[slot]
