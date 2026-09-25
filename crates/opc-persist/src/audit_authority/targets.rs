@@ -843,7 +843,8 @@ pub struct NetconfRunningCopy<'a> {
 
 impl<'a> NetconfRunningCopy<'a> {
     /// Select candidate or startup and the exact proposed running envelope.
-    /// Running as a source and confirmed-resolution commits are refused.
+    /// The constructor refuses running as a source. Authority preparation also
+    /// refuses commits carrying a confirmed-resolution obligation.
     pub fn new(
         source: NetconfLockDatastore,
         commit: crate::AttestedConfigCommit,

@@ -4106,3 +4106,426 @@ async fn target_provider_copy_pinned_preparation_binds_current_session_and_locks
         ));
     }
 }
+fn provider_lifecycle_keys() -> opc_key::MemoryKeyProvider {
+    let provider = opc_key::MemoryKeyProvider::new();
+    for (name, seed) in [("fixture-target-key", 0x6a), ("fixture-running-key", 0x7b)] {
+        provider
+            .insert_active_key(
+                opc_key::KeyId::new(name).unwrap(),
+                opc_key::KeyPurpose::Config,
+                opc_types::TenantId::from_static("fixture-tenant"),
+                zeroize::Zeroizing::new([seed; 32]),
+            )
+            .unwrap();
+    }
+    provider
+}
+
+fn provider_history_blob(
+    conn: &Connection,
+    version: u64,
+) -> crate::consensus::audit_mutation::TargetEncryptedBlobV1 {
+    let (schema, digest, encrypted): (Vec<u8>, Vec<u8>, Vec<u8>) = conn
+        .query_row(
+            "SELECT schema_digest,plaintext_digest,encrypted_blob FROM config_history WHERE version=?1",
+            [version],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+        )
+        .unwrap();
+    crate::consensus::audit_mutation::TargetEncryptedBlobV1 {
+        schema: opc_types::SchemaDigest::from_bytes(schema.try_into().unwrap()),
+        plaintext_digest: digest.try_into().unwrap(),
+        encrypted_blob: encrypted,
+    }
+}
+
+async fn provider_assert_history(
+    conn: &Connection,
+    provider: &dyn opc_key::KeyProvider,
+    version: u64,
+    request: u8,
+    config: &[u8],
+) {
+    use sha2::{Digest, Sha256};
+    let blob = provider_history_blob(conn, version);
+    let envelope = opc_crypto::CryptoEnvelopeRef::decode(&blob.encrypted_blob).unwrap();
+    let (aad, _) = opc_key::decode_bound_aad(envelope.aad).unwrap();
+    assert_eq!(aad.version(), version);
+    let plaintext = opc_crypto::decrypt_envelope(provider, &aad, &blob.encrypted_blob)
+        .await
+        .unwrap();
+    assert_eq!(*plaintext, copy_plaintext(request, config));
+    assert_eq!(
+        <[u8; 32]>::from(Sha256::digest(&plaintext)),
+        blob.plaintext_digest
+    );
+}
+
+async fn provider_rewrap_running(
+    fixture: &Fixture,
+    conn: &Connection,
+    provider: &dyn opc_key::KeyProvider,
+    mut prepared: PreparedTargetMutation,
+    request: u8,
+    config: &[u8],
+) -> PreparedTargetMutation {
+    use crate::consensus::audit_mutation::TargetPayloadV1;
+    use sha2::{Digest, Sha256};
+    let Some(TargetPayloadV1::Running { commit, .. }) = &mut prepared.effect.encrypted_payload
+    else {
+        panic!("running lifecycle fixture");
+    };
+    let envelope = opc_crypto::CryptoEnvelopeRef::decode(&commit.record.encrypted_blob).unwrap();
+    let (aad, _) = opc_key::decode_bound_aad(envelope.aad).unwrap();
+    let plaintext = copy_plaintext(request, config);
+    let encrypted = opc_crypto::encrypt_attested_envelope(provider, &aad, &plaintext)
+        .await
+        .unwrap();
+    let mut record = commit.record.clone();
+    record.encrypted_blob = encrypted.encoded().to_vec();
+    record.plaintext_digest = Sha256::digest(&plaintext).to_vec();
+    let attested =
+        crate::AttestedConfigCommit::try_new(record, Vec::new(), encrypted.claim().unwrap())
+            .unwrap();
+    let (record, audit, _) = attested.into_parts();
+    **commit =
+        crate::consensus::PreparedConfigCommit::prepare(record, audit, &fixture.key).unwrap();
+    fixture.rebind_at(conn, prepared, 100)
+}
+
+async fn provider_stage_second_candidate(
+    fixture: &Fixture,
+    conn: &Connection,
+    config: &[u8],
+) -> crate::consensus::audit_mutation::TargetEncryptedBlobV1 {
+    use crate::consensus::audit_mutation::TargetPayloadV1;
+    use sha2::{Digest, Sha256};
+    let provider = opc_key::MemoryKeyProvider::new();
+    provider
+        .insert_active_key(
+            opc_key::KeyId::new("fixture-target-key").unwrap(),
+            opc_key::KeyPurpose::Config,
+            opc_types::TenantId::from_static("fixture-tenant"),
+            zeroize::Zeroizing::new([0x6a; 32]),
+        )
+        .unwrap();
+    let mut stage = fixture.encrypted(fixture.request(conn, 182, 4, 0x61, 1), 0x6a);
+    let Some(TargetPayloadV1::Target(blob)) = &mut stage.effect.encrypted_payload else {
+        panic!("second candidate fixture");
+    };
+    let envelope = opc_crypto::CryptoEnvelopeRef::decode(&blob.encrypted_blob).unwrap();
+    let (aad, _) = opc_key::decode_bound_aad(envelope.aad).unwrap();
+    let plaintext = copy_plaintext(182, config);
+    let encrypted = opc_crypto::encrypt_attested_envelope(&provider, &aad, &plaintext)
+        .await
+        .unwrap();
+    blob.encrypted_blob = encrypted.encoded().to_vec();
+    blob.plaintext_digest = Sha256::digest(&plaintext).into();
+    let source = blob.clone();
+    let stage = fixture.rebind_at(conn, stage, 100);
+    assert!(matches!(
+        fixture.submit(conn, &stage),
+        AuditOperationState::TargetV1(_)
+    ));
+    fixture.settle(conn, &stage);
+    source
+}
+
+async fn provider_rollback(
+    fixture: &Fixture,
+    conn: &Connection,
+    provider: &dyn opc_key::KeyProvider,
+    action: u8,
+    now: i64,
+    config: &[u8],
+) -> PreparedTargetMutation {
+    use crate::consensus::audit_mutation::{TargetPayloadV1, TargetSourceV1};
+    use opc_key::{ConfigAad, EnvelopeAad};
+    use sha2::{Digest, Sha256};
+    // Reuse only the ordinary confirmation identity/lock fixture. The copied
+    // destination and original parent are constructed separately below.
+    let mut prepared = fixture.resolve_fixture(conn, 184, 10, false, now);
+    let lifecycle = row(conn, "config_netconf_lifecycle", "singleton", 1);
+    let pending = &lifecycle["pending_confirmation"];
+    let parent = &lifecycle["rollback_parent"];
+    let version = pending["running_version"].as_u64().unwrap();
+    let source = provider_history_blob(conn, parent["version"].as_u64().unwrap());
+    let parent_tx = serde_json::from_value(pending["tx_id"].clone()).unwrap();
+    let tx_id = opc_types::TxId::new();
+    let committed_at = opc_types::Timestamp::from_offset_datetime(
+        time::OffsetDateTime::from_unix_timestamp(now).unwrap(),
+    );
+    let principal = r#"{"tenant":"fixture-tenant","subject":"fixture-principal"}"#.to_owned();
+    let aad = EnvelopeAad::config(
+        opc_types::TenantId::from_static("fixture-tenant"),
+        version + 1,
+        ConfigAad::new(
+            tx_id,
+            Some(parent_tx),
+            committed_at,
+            &principal,
+            source.schema,
+            "running",
+        )
+        .unwrap(),
+    );
+    let plaintext = copy_plaintext(184, config);
+    let encrypted = opc_crypto::encrypt_attested_envelope(provider, &aad, &plaintext)
+        .await
+        .unwrap();
+    let record = crate::CommitRecord {
+        tx_id,
+        parent_tx_id: Some(parent_tx),
+        version: opc_types::ConfigVersion::new(version + 1),
+        committed_at,
+        principal,
+        source: crate::CommitSource::CommitConfirmedRestore,
+        schema_digest: source.schema,
+        plaintext_digest: Sha256::digest(&plaintext).to_vec(),
+        encrypted_blob: encrypted.encoded().to_vec(),
+        rollback_point: false,
+        confirmed_deadline: None,
+    };
+    let attested =
+        crate::AttestedConfigCommit::try_new(record, Vec::new(), encrypted.claim().unwrap())
+            .unwrap();
+    let (record, audit, _) = attested.into_parts();
+    let commit =
+        crate::consensus::PreparedConfigCommit::prepare(record, audit, &fixture.key).unwrap();
+    prepared.effect.action = action.try_into().unwrap();
+    prepared.effect.destination = TargetExpectationV1::Running { version };
+    prepared.effect.source = Some(TargetSourceV1::Running {
+        version: parent["version"].as_u64().unwrap(),
+        schema: source.schema,
+        ciphertext_digest: Sha256::digest(&source.encrypted_blob).into(),
+    });
+    prepared.effect.encrypted_payload = Some(TargetPayloadV1::Running {
+        commit: Box::new(commit),
+        confirmation_ownership: None,
+    });
+    if action == 12 || action == 14 {
+        prepared.handle.body.event.transport = ManagementAuditTransportCode::Internal;
+    }
+    if action == 14 {
+        prepared.effect.resolution = Some(TargetResolutionV1::RebootRecovery {
+            previous_device: serde_json::from_value(pending["device_incarnation"].clone()).unwrap(),
+            pending: Some(serde_json::from_value(pending["pending"].clone()).unwrap()),
+            original_deadline: lifecycle["original_deadline"].as_i64(),
+        });
+    }
+    prepared
+        .effect
+        .bind_provider_copy(provider, &source)
+        .await
+        .unwrap();
+    fixture.rebind_at(conn, prepared, now)
+}
+
+#[tokio::test]
+async fn target_provider_lifecycle_promotes_and_copies_exact_absent_candidate_fallback() {
+    use crate::audit_authority::NetconfLockDatastore;
+    use crate::consensus::audit_mutation::{TargetPayloadV1, TargetSourceV1};
+    let fixture = Fixture::new().await;
+    let shared = fixture.backend.conn();
+    let conn = shared.lock().await;
+    fixture.active(&conn);
+    let config = br#"{"counter":9007199254740993,"enabled":true}"#;
+    let (provider, source) = copy_provider_stage(&fixture, &conn, 0, config).await;
+    let promote = fixture.running_target(&conn, 181, 6, 0, 0x6a);
+    let promote = provider_rewrap_running(&fixture, &conn, &provider, promote, 181, config).await;
+    let promote = bind_copy_provider(&fixture, &conn, &provider, &source, promote)
+        .await
+        .unwrap();
+    assert!(
+        matches!(fixture.submit(&conn, &promote), AuditOperationState::TargetV1(r)
+        if matches!(r.outcome(), NetconfAppliedOutcome::Promoted { running_version: 1, retired_generation } if retired_generation.get() == 2))
+    );
+    fixture.settle(&conn, &promote);
+    provider_assert_history(&conn, &provider, 1, 181, config).await;
+    let candidate = row(&conn, "config_netconf_targets", "target", 0);
+    assert_eq!(candidate["present"], false);
+    let original = fixture.fallback_copy(&conn, 182);
+    let original = provider_rewrap_running(&fixture, &conn, &provider, original, 182, config).await;
+    let Some(TargetPayloadV1::Running { commit, .. }) = original.effect.encrypted_payload else {
+        panic!("fallback fixture");
+    };
+    let tx = conn.unchecked_transaction().unwrap();
+    let view = crate::consensus::audit_targets::read_copy_view_sync(
+        &tx,
+        &fixture.key,
+        &fixture.ledger(&tx),
+        NetconfLockDatastore::Candidate,
+        &crate::consensus::sqlite::SqliteWorkCancellation::audit_test(),
+    )
+    .unwrap()
+    .unwrap();
+    tx.commit().unwrap();
+    assert!(matches!(
+        view.source,
+        TargetSourceV1::CandidateFallback {
+            running_version: 1,
+            ..
+        }
+    ));
+    let worker = std::sync::Arc::new(());
+    let session = fixture.session_owner(&conn, &worker, 0x61);
+    let mut effect = view
+        .prepare(&session, &fixture.event(182), *commit, 160)
+        .unwrap();
+    effect
+        .bind_provider_copy(&provider, &view.blob)
+        .await
+        .unwrap();
+    let fallback = fixture.rebind_at(&conn, fixture.prepare(effect, fixture.event(182)), 100);
+    assert!(
+        matches!(fixture.submit(&conn, &fallback), AuditOperationState::TargetV1(r)
+        if matches!(r.outcome(), NetconfAppliedOutcome::CopiedRunning { running_version: 2 }))
+    );
+    assert_eq!(row(&conn, "config_netconf_targets", "target", 0), candidate);
+    provider_assert_history(&conn, &provider, 2, 182, config).await;
+    fixture.settle(&conn, &fallback);
+}
+
+#[tokio::test]
+async fn target_provider_lifecycle_confirms_or_restores_exact_parent_for_each_resolution() {
+    let original_config = br#"{"counter":9007199254740993,"enabled":false}"#;
+    let tentative_config = br#"{"counter":9007199254740992,"enabled":true}"#;
+    for action in [10, 11, 12, 14] {
+        let fixture = Fixture::new().await;
+        let shared = fixture.backend.conn();
+        let conn = shared.lock().await;
+        fixture.active(&conn);
+        let (provider, source) = copy_provider_stage(&fixture, &conn, 0, original_config).await;
+        let promote = fixture.running_target(&conn, 181, 6, 0, 0x6a);
+        let promote =
+            provider_rewrap_running(&fixture, &conn, &provider, promote, 181, original_config)
+                .await;
+        let promote = bind_copy_provider(&fixture, &conn, &provider, &source, promote)
+            .await
+            .unwrap();
+        assert!(matches!(
+            fixture.submit(&conn, &promote),
+            AuditOperationState::TargetV1(_)
+        ));
+        fixture.settle(&conn, &promote);
+        let source = provider_stage_second_candidate(&fixture, &conn, tentative_config).await;
+        let tentative = fixture.tentative_target(&conn, 183, 0x6a);
+        let tentative =
+            provider_rewrap_running(&fixture, &conn, &provider, tentative, 183, tentative_config)
+                .await;
+        let tentative = bind_copy_provider(&fixture, &conn, &provider, &source, tentative)
+            .await
+            .unwrap();
+        assert!(
+            matches!(fixture.submit(&conn, &tentative), AuditOperationState::TargetV1(r)
+            if matches!(r.outcome(), NetconfAppliedOutcome::Tentative { running_version: 2, retired_generation, .. } if retired_generation.get() == 4)),
+            "provider copy did not atomically retain tentative ownership"
+        );
+        fixture.settle(&conn, &tentative);
+        provider_assert_history(&conn, &provider, 1, 181, original_config).await;
+        provider_assert_history(&conn, &provider, 2, 183, tentative_config).await;
+        let retained = target_rows(&conn);
+        let deadline = row(&conn, "config_netconf_lifecycle", "singleton", 1)["original_deadline"]
+            .as_i64()
+            .unwrap();
+        drop(conn);
+        drop(provider);
+        // Reopen persisted rows and reconstruct a fresh provider using the same
+        // synthetic custody material. This is component recovery, not a process
+        // restart or public NETCONF server qualification.
+        let conn = Connection::open(fixture.directory.path().join("authority.sqlite")).unwrap();
+        assert_eq!(target_rows(&conn), retained);
+        let provider = provider_lifecycle_keys();
+        if action == 14 {
+            let begin = fixture.request(&conn, 185, 1, 0x61, 0);
+            let begin = fixture.rebind_at(&conn, begin, 100);
+            assert!(matches!(
+                fixture.submit(&conn, &begin),
+                AuditOperationState::TargetV1(_)
+            ));
+            fixture.settle(&conn, &begin);
+        }
+        let now = if action == 12 { deadline } else { 100 };
+        let resolution = if action == 10 {
+            fixture.resolve_fixture(&conn, 184, 10, false, now)
+        } else {
+            provider_rollback(&fixture, &conn, &provider, action, now, original_config).await
+        };
+        let result = fixture.submit_at(&conn, &resolution, now);
+        assert!(
+            matches!(result, AuditOperationState::TargetV1(ref r) if
+            (action == 10 && matches!(r.outcome(), NetconfAppliedOutcome::Confirmed { .. })) ||
+            (action != 10 && matches!(r.outcome(), NetconfAppliedOutcome::RolledBack { running_version: 3, .. }))),
+            "provider copy resolution did not preserve its exact applied outcome"
+        );
+        if action == 10 {
+            provider_assert_history(&conn, &provider, 2, 183, tentative_config).await;
+        } else {
+            provider_assert_history(&conn, &provider, 3, 184, original_config).await;
+        }
+        fixture.assert_no_pending(&conn);
+        fixture.settle(&conn, &resolution);
+    }
+}
+
+#[tokio::test]
+async fn target_provider_lifecycle_recovers_admitted_copy_without_repeating_provider_preparation() {
+    let fixture = Fixture::new().await;
+    let shared = fixture.backend.conn();
+    let conn = shared.lock().await;
+    fixture.active(&conn);
+    let config = br#"{"enabled":true}"#;
+    let (provider, source) = copy_provider_stage(&fixture, &conn, 0, config).await;
+    let prepared = copy_provider_destination(&fixture, &conn, &provider, 0, 181, config).await;
+    let prepared = bind_copy_provider(&fixture, &conn, &provider, &source, prepared)
+        .await
+        .unwrap();
+    let encoded = prepared.encode().unwrap();
+    fixture
+        .apply(
+            &conn,
+            AuditCommand::NetconfTarget(Box::new(TargetAuditCommandV1::Admit(prepared.clone()))),
+            100,
+        )
+        .unwrap();
+    fixture.checkpoint(&conn);
+    let candidate = row(&conn, "config_netconf_targets", "target", 0);
+    drop(prepared);
+    drop(provider);
+    drop(conn);
+    let conn = Connection::open(fixture.directory.path().join("authority.sqlite")).unwrap();
+    let original = PreparedTargetMutation::decode(&encoded).unwrap();
+    original.verify_effect(&fixture.key).unwrap();
+    fixture
+        .apply(
+            &conn,
+            AuditCommand::NetconfTarget(Box::new(TargetAuditCommandV1::Apply(original.clone()))),
+            100,
+        )
+        .unwrap();
+    let outcome = fixture
+        .ledger(&conn)
+        .lookup(&fixture.key, original.handle(), original.effect.caller)
+        .unwrap()
+        .unwrap();
+    assert!(matches!(outcome.state(), AuditOperationState::TargetV1(r)
+        if matches!(r.outcome(), NetconfAppliedOutcome::CopiedRunning { running_version: 1 })));
+    assert_eq!(row(&conn, "config_netconf_targets", "target", 0), candidate);
+    fixture.settle(&conn, &original);
+    let provider = provider_lifecycle_keys();
+    provider_assert_history(&conn, &provider, 1, 181, config).await;
+    // Replaying that exact original after its deadline does not append again.
+    fixture
+        .apply(
+            &conn,
+            AuditCommand::NetconfTarget(Box::new(TargetAuditCommandV1::Apply(original))),
+            200,
+        )
+        .unwrap();
+    assert_eq!(
+        conn.query_row("SELECT COUNT(*) FROM config_history", [], |r| r
+            .get::<_, u64>(0))
+            .unwrap(),
+        1
+    );
+}
