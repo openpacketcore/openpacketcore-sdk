@@ -13,15 +13,25 @@ use std::task::Poll;
 
 #[tokio::test]
 async fn config_capacity_957_shutdown_waits_for_native_state_machine_owner() {
-    run_shutdown_owner(ConfigCapacityProfile::Legacy).await;
+    run_shutdown_owner(ConfigCapacityProfile::Legacy, true).await;
 }
 
 #[tokio::test]
 async fn config_capacity_957_bounded_shutdown_waits_for_native_state_machine_owner() {
-    run_shutdown_owner(ConfigCapacityProfile::BoundedV1).await;
+    run_shutdown_owner(ConfigCapacityProfile::BoundedV1, true).await;
 }
 
-async fn run_shutdown_owner(profile: ConfigCapacityProfile) {
+#[tokio::test]
+async fn config_capacity_957_response_loss_completes_before_native_owner_drain() {
+    run_shutdown_owner(ConfigCapacityProfile::Legacy, false).await;
+}
+
+#[tokio::test]
+async fn config_capacity_957_bounded_response_loss_completes_before_native_owner_drain() {
+    run_shutdown_owner(ConfigCapacityProfile::BoundedV1, false).await;
+}
+
+async fn run_shutdown_owner(profile: ConfigCapacityProfile, cancel_caller: bool) {
     let scratch = std::env::var_os("TMPDIR")
         .or_else(|| {
             (std::env::var("GITHUB_ACTIONS").ok().as_deref() == Some("true"))
@@ -119,13 +129,22 @@ async fn run_shutdown_owner(profile: ConfigCapacityProfile) {
         .expect("initialized native log");
     let deadline = tokio::time::Instant::now() + store.inner.operation_timeout;
     let mut applied = store.inner.durable_progress.subscribe_applied();
-    let task_store = store.clone();
-    let caller =
-        tokio::spawn(async move { task_store.append_prepared_commit_local(operation).await });
-    tokio::time::timeout_at(deadline, entered.changed())
-        .await
-        .expect("accepted operation enters native state machine inside original budget")
-        .expect("original apply entry notification");
+    let mut response_loss = store
+        .inner
+        .durable_progress
+        .accepted_response_loss
+        .subscribe();
+    let mut caller = Some(Box::pin(store.append_prepared_commit_local(operation)));
+    tokio::time::timeout_at(deadline, async {
+        tokio::select! {
+            _ = caller.as_mut().expect("original caller").as_mut() => {
+                panic!("held native apply cannot complete the original caller");
+            }
+            entered = entered.changed() => entered.expect("original apply entry notification"),
+        }
+    })
+    .await
+    .expect("accepted operation enters native state machine inside original budget");
     let committed = tokio::time::timeout_at(
         deadline,
         store.inner.raft.with_raft_state(|state| state.committed),
@@ -149,11 +168,11 @@ async fn run_shutdown_owner(profile: ConfigCapacityProfile) {
         .await
         .expect("pre-apply read")
         .is_none());
-    caller.abort();
-    assert!(caller
-        .await
-        .expect_err("cancelled original caller")
-        .is_cancelled());
+    if cancel_caller {
+        // Cancel the actual caller future after acceptance, leaving only its
+        // existing accepted-work supervisor responsible for completion.
+        drop(caller.take());
+    }
 
     if profile == ConfigCapacityProfile::BoundedV1 {
         let error = store.try_reserve_config_preparation()
@@ -167,6 +186,38 @@ async fn run_shutdown_owner(profile: ConfigCapacityProfile) {
         .await
         .expect("original core stops inside operation bound")
         .expect("core shutdown");
+    tokio::time::timeout_at(deadline, response_loss.wait_for(Option::is_some))
+        .await
+        .expect("real supervisor observes response loss inside original budget")
+        .expect("supervisor poll observation");
+    // Poll the real caller directly after its supervisor, avoiding a spawned
+    // caller's scheduling order and the Tokio cooperative budget. Collect
+    // failures now, then always release and join the native owner below.
+    let prompt_unknown = if let Some(mut pending) = caller.take() {
+        let result = poll_fn(|context| {
+            let mut probe = tokio::task::unconstrained(pending.as_mut());
+            Poll::Ready(std::pin::Pin::new(&mut probe).poll(context))
+        })
+        .await;
+        match result {
+            Poll::Ready(result) => {
+                result.is_err_and(|error| matches!(error.kind(), PersistErrorKind::OutcomeUnknown))
+            }
+            Poll::Pending => {
+                caller = Some(pending);
+                false
+            }
+        }
+    } else {
+        true
+    };
+    let preparation_held =
+        profile == ConfigCapacityProfile::Legacy || store.try_reserve_config_preparation().is_err();
+    let proposals_before_release = store.inner.proposal_admission.available_permits();
+    eprintln!(
+        "CONFIG_CAPACITY_RESPONSE_LOSS caller_cancelled={cancel_caller} prompt_unknown={prompt_unknown} preparation_held={preparation_held} proposal_held={}",
+        proposals_before_release == DURABLE_OPENRAFT_PROPOSAL_ADMISSION_SLOTS - 1,
+    );
     let mut shutdown = Box::pin(store.shutdown());
     // A single explicit poll, without cooperative-budget interference, asks
     // whether shutdown has already returned while apply is provably held.
@@ -185,6 +236,13 @@ async fn run_shutdown_owner(profile: ConfigCapacityProfile) {
             .expect("complete store shutdown"),
     }
     drop(shutdown);
+    if let Some(pending) = caller.take() {
+        let result = tokio::time::timeout_at(deadline, pending)
+            .await
+            .expect("remaining caller drains inside original operation bound");
+        assert!(result.is_err_and(|error| matches!(error.kind(), PersistErrorKind::OutcomeUnknown)));
+    }
+    drop(caller);
     // Drain the held operation even on the old implementation, so the intended
     // rejection assertion cannot abandon a worker or its retained authority.
     tokio::time::timeout_at(deadline, applied.changed())
@@ -206,16 +264,16 @@ async fn run_shutdown_owner(profile: ConfigCapacityProfile) {
         !returned_before_release,
         "CONFIG_CAPACITY_SHUTDOWN_OWNER_RED: shutdown returned while native state-machine apply still owned authority"
     );
+    let completed = tokio::time::timeout_at(
+        deadline,
+        Arc::clone(&store.inner.proposal_admission).acquire_many_owned(
+            u32::try_from(DURABLE_OPENRAFT_PROPOSAL_ADMISSION_SLOTS).expect("proposal slots"),
+        ),
+    )
+    .await
+    .expect("supervisor releases inside original budget")
+    .expect("admission remains open");
     if profile == ConfigCapacityProfile::BoundedV1 {
-        let completed = tokio::time::timeout_at(
-            deadline,
-            Arc::clone(&store.inner.proposal_admission).acquire_many_owned(
-                u32::try_from(DURABLE_OPENRAFT_PROPOSAL_ADMISSION_SLOTS).expect("proposal slots"),
-            ),
-        )
-        .await
-        .expect("supervisor releases inside original budget")
-        .expect("admission remains open");
         let released = store
             .try_reserve_config_preparation()
             .expect("completed owner releases")
@@ -225,8 +283,12 @@ async fn run_shutdown_owner(profile: ConfigCapacityProfile) {
             .expect_err("only one owner was released");
         assert!(matches!(error.kind(), PersistErrorKind::Unavailable));
         drop(released);
-        drop(completed);
     }
+    drop(completed);
+    assert_eq!(
+        store.inner.proposal_admission.available_permits(),
+        DURABLE_OPENRAFT_PROPOSAL_ADMISSION_SLOTS
+    );
     drop(other_preparations);
     drop(entered);
     drop(applied);
@@ -245,6 +307,9 @@ async fn run_shutdown_owner(profile: ConfigCapacityProfile) {
             == expected,
         "accepted record survives native retained reopen"
     );
+    assert!(prompt_unknown, "UNKNOWN_BEFORE_OWNER_DRAIN: a lost response must complete the caller while native apply is still held");
+    assert!(preparation_held, "PREPARATION_HELD_AFTER_RESPONDER_CLOSE: accepted payload retains its preparation reservation until storage releases");
+    assert_eq!(proposals_before_release, DURABLE_OPENRAFT_PROPOSAL_ADMISSION_SLOTS - 1, "PROPOSAL_HELD_AFTER_RESPONDER_CLOSE: accepted payload retains proposal admission until storage releases");
 }
 
 async fn at_limit_commit(store: &ConsensusConfigStore) -> AttestedConfigCommit {

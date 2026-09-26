@@ -190,7 +190,7 @@ async fn config_capacity_957_recovery_proof_binds_request_payload_and_scope() {
         .is_err());
         conn.execute(
             "UPDATE config_raft_request_outcomes SET request_id = ?1, payload_digest = ?2",
-            params![REQUEST.as_slice(), [0xAA; 32].as_slice()],
+            params![REQUEST.as_slice(), [0xAA_u8; 32].as_slice()],
         )
         .unwrap();
         assert!(outcome_authentication::read(

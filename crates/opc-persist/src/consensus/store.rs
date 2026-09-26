@@ -1645,6 +1645,12 @@ impl ConsensusConfigStore {
                 None => None,
             }
         };
+        // Obtain observation before enqueue. A response channel can close
+        // before Openraft's detached state-machine worker releases its page.
+        let storage_release = match self.inner.durable_progress.storage_release_observer() {
+            Ok(observer) => observer,
+            Err(_) => return ForwardMutationReply::Unavailable,
+        };
         let response =
             match tokio::time::timeout_at(deadline, self.inner.raft.client_write_ff(command)).await
             {
@@ -1669,8 +1675,16 @@ impl ConsensusConfigStore {
         // request ID. Supervision, not the originating RPC/client future,
         // owns admission until that exact accepted proposal resolves.
         let (completion_tx, completion_rx) = tokio::sync::oneshot::channel();
-        tokio::spawn(async move {
-            let reply = match response.await {
+        #[cfg(test)]
+        let response_lost = Arc::new(AtomicBool::new(false));
+        #[cfg(test)]
+        let observed_response_lost = Arc::clone(&response_lost);
+        let supervision = async move {
+            let response = response.await;
+            let needs_storage_drain = response.is_err();
+            #[cfg(test)]
+            response_lost.store(needs_storage_drain, Ordering::SeqCst);
+            let reply = match response {
                 Err(_) => ForwardMutationReply::OutcomeUnknown,
                 Ok(Ok(response)) => ForwardMutationReply::Applied(Box::new(response.data)),
                 Ok(Err(ClientWriteError::ForwardToLeader(forward))) => {
@@ -1682,10 +1696,31 @@ impl ConsensusConfigStore {
                     ForwardMutationReply::Unavailable
                 }
             };
+            // Truthful response loss completes the caller independently of
+            // storage cleanup. The observer cannot keep that storage alive.
             let _ = completion_tx.send(reply);
+            if needs_storage_drain {
+                storage_release.wait().await;
+            }
             drop(ownership);
             drop(proposal_permit);
-        });
+        };
+        #[cfg(test)]
+        let supervision = {
+            let observed = self.inner.durable_progress.accepted_response_loss.clone();
+            async move {
+                tokio::pin!(supervision);
+                std::future::poll_fn(|context| {
+                    let result = supervision.as_mut().poll(context);
+                    if observed_response_lost.load(Ordering::SeqCst) {
+                        observed.send_replace(Some(result.is_ready()));
+                    }
+                    result
+                })
+                .await
+            }
+        };
+        tokio::spawn(supervision);
         match tokio::time::timeout_at(deadline, completion_rx).await {
             Err(_) | Ok(Err(_)) => ForwardMutationReply::OutcomeUnknown,
             Ok(Ok(ForwardMutationReply::Applied(response))) => {

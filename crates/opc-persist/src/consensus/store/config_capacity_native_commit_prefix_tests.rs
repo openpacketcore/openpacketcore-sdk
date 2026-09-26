@@ -1,20 +1,19 @@
-//! Native engine component: a valid committed prefix may cross an individual
-//! storage apply-batch boundary. This invokes the already-authenticated handler
-//! directly; it is not multi-node, mTLS, snapshot, or public-profile proof.
+//! Native Durable follower opened through the public store/profile path.
+//! A committed prefix crosses the production apply-page boundary through its
+//! actual RPC handler; direct injection is not multi-node or mTLS transport proof.
 
 use super::*;
-use crate::consensus::raft_adapter::{ConfigRaftNetworkFactory, ConfigRaftRpcHandler};
-use crate::consensus::{sqlite, storage, ConfigConsensusTopology, ConfigRaft};
+use crate::consensus::{sqlite, ConfigConsensusTopology};
 use crate::types::ConfigStore;
 use crate::{
-    RetainedConfigBinding, RetainedConfigDurability, RetainedConfigOptions, SqliteBackend,
+    ConsensusConfigStore, RetainedConfigBinding, RetainedConfigDurability, RetainedConfigOptions,
+    SqliteBackend,
 };
 use opc_consensus::engine::error::RaftError;
 use opc_consensus::engine::raft::AppendEntriesResponse;
 use opc_consensus::{
-    durable_openraft_config, ConsensusPeer, ConsensusPeerError, ConsensusRpcFamily,
-    ConsensusRpcHandler, ConsensusWireRequest, ConsensusWireResponse, DurableOpenraftDomain,
-    DURABLE_CONSENSUS_OPERATION_TIMEOUT,
+    ConsensusPeer, ConsensusPeerError, ConsensusRpcFamily, ConsensusRpcHandler,
+    ConsensusWireRequest, ConsensusWireResponse, DURABLE_CONSENSUS_OPERATION_TIMEOUT,
 };
 use std::collections::BTreeMap;
 use std::sync::Arc;
@@ -37,7 +36,7 @@ impl ConsensusPeer for OfflinePeer {
 }
 
 async fn append_prefix(
-    handler: &ConfigRaftRpcHandler,
+    handler: &dyn ConsensusRpcHandler,
     sender: ConsensusNodeId,
     request: AppendEntriesRequest<ConfigRaftTypeConfig>,
     deadline: tokio::time::Instant,
@@ -83,7 +82,7 @@ async fn committed_prefix_crosses_batch_boundary(count: usize) -> usize {
     let third = ConsensusNodeId::new(3).unwrap();
     let members = BTreeSet::from([local, leader, third]);
     let topology = ConfigConsensusTopology::try_new(identity(), local, members.clone()).unwrap();
-    let binding = RetainedConfigBinding::new(topology, [0xB7; 32], [0xB8; 32])
+    let binding = RetainedConfigBinding::new(topology.clone(), [0xB7; 32], [0xB8; 32])
         .unwrap()
         .with_capacity_profile(PROFILE);
     let options = RetainedConfigOptions::new(
@@ -99,27 +98,20 @@ async fn committed_prefix_crosses_batch_boundary(count: usize) -> usize {
     let backend = SqliteBackend::provision_config_authority(options, key())
         .await
         .expect("native capacity-bound backend");
-    let (log, state_machine, progress) = storage::open(
-        &backend,
-        root.join("snapshots"),
-        identity(),
-        members.clone(),
-    )
-    .await
-    .expect("native storage adapters");
     let peers: BTreeMap<_, Arc<dyn ConsensusPeer>> = [leader, third]
         .into_iter()
         .map(|id| (id, Arc::new(OfflinePeer(id)) as Arc<dyn ConsensusPeer>))
         .collect();
-    let network = ConfigRaftNetworkFactory::try_new(identity(), local, peers, PROFILE).unwrap();
-    // This private component construction does not lift the public store's
-    // closed-profile gate or change the shared engine configuration.
-    let mut config = durable_openraft_config(DurableOpenraftDomain::ConfigurationState).unwrap();
-    config.max_apply_entries = std::num::NonZeroU64::new(64);
-    let raft = ConfigRaft::new(local, Arc::new(config), network, log, state_machine)
-        .await
-        .expect("native engine");
-    let handler = ConfigRaftRpcHandler::new(raft.clone(), identity(), local, PROFILE, key());
+    // Consume the production profile selector, rather than repeating the
+    // desired page limit in a test-only Openraft configuration.
+    let store =
+        ConsensusConfigStore::open(topology, backend.clone(), root.join("snapshots"), peers)
+            .await
+            .expect("public native capacity-bound store");
+    assert_eq!(store.capacity_profile(), PROFILE);
+    let progress = Arc::clone(&store.inner.durable_progress);
+    let raft = store.inner.raft.clone();
+    let handler = store.rpc_handler();
     let make_id = |index| LogId::new(CommittedLeaderId::new(1, leader), index);
     let vote = Vote::new_committed(1, leader);
     let deadline = tokio::time::Instant::now() + DURABLE_CONSENSUS_OPERATION_TIMEOUT;
@@ -129,7 +121,7 @@ async fn committed_prefix_crosses_batch_boundary(count: usize) -> usize {
     };
     assert!(
         append_prefix(
-            &handler,
+            handler.as_ref(),
             leader,
             AppendEntriesRequest {
                 vote,
@@ -154,7 +146,7 @@ async fn committed_prefix_crosses_batch_boundary(count: usize) -> usize {
             .collect();
         assert!(
             append_prefix(
-                &handler,
+                handler.as_ref(),
                 leader,
                 AppendEntriesRequest {
                     vote,
@@ -176,7 +168,7 @@ async fn committed_prefix_crosses_batch_boundary(count: usize) -> usize {
     let expected = commit.record.clone();
     assert!(
         append_prefix(
-            &handler,
+            handler.as_ref(),
             leader,
             AppendEntriesRequest {
                 vote,
@@ -209,7 +201,7 @@ async fn committed_prefix_crosses_batch_boundary(count: usize) -> usize {
     }
     let mut metrics = raft.metrics();
     let acknowledgement = append_prefix(
-        &handler,
+        handler.as_ref(),
         leader,
         AppendEntriesRequest {
             vote,
@@ -245,7 +237,8 @@ async fn committed_prefix_crosses_batch_boundary(count: usize) -> usize {
         "config capacity native prefix: entries={count} append_ack={acknowledgement} applied={applied} exact_readback={exact}"
     );
     drop(handler);
-    raft.shutdown().await.expect("native engine task joins");
+    store.shutdown().await.expect("native store owners join");
+    drop(store);
     drop(raft);
     drop(metrics);
     progress
@@ -271,9 +264,9 @@ async fn capacity_native_committed_prefix_across_batch_limit_applies() {
     committed_prefix_crosses_batch_boundary(1025).await;
 }
 
-// Proposed engine apply-read population: use the existing 64-entry limited
-// reader and its unchanged byte target. This observes actual native reader
-// output before engine ownership. It is not a heap peak or queue-byte proof.
+// Production apply-read population uses the admitted store profile and its
+// unchanged byte target. Observe real native reader output before engine
+// ownership; this does not qualify aggregate heap or retained startup replay.
 #[tokio::test]
 async fn capacity_native_apply_read_at_entry_bound_is_complete() {
     let maximum = committed_prefix_crosses_batch_boundary(64).await;

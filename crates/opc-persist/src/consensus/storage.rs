@@ -138,6 +138,18 @@ pub(crate) struct ConfigStorageOwner {
     _released: tokio::sync::watch::Sender<()>,
 }
 
+// A release observer contains no storage owner. Only closure of the final
+// sender proves that all accepted native storage work has released ownership.
+pub(crate) struct ConfigStorageReleaseObserver {
+    released: tokio::sync::watch::Receiver<()>,
+}
+
+impl ConfigStorageReleaseObserver {
+    pub(crate) async fn wait(mut self) {
+        while self.released.changed().await.is_ok() {}
+    }
+}
+
 #[derive(Debug)]
 pub(crate) struct ConfigDurableProgress {
     apply_deadline: config_capacity_apply_deadline::ApplyPrefixDeadline,
@@ -147,6 +159,10 @@ pub(crate) struct ConfigDurableProgress {
     storage_released: std::sync::OnceLock<tokio::sync::watch::Receiver<()>>,
     #[cfg(test)]
     pub(crate) apply_entered: tokio::sync::watch::Sender<u64>,
+    // After a real response loss, report whether the accepted-work supervisor's
+    // latest poll completed. Observation happens after that poll's drops.
+    #[cfg(test)]
+    pub(crate) accepted_response_loss: tokio::sync::watch::Sender<Option<bool>>,
     #[cfg(test)]
     pub(crate) native_read_max_entries: std::sync::atomic::AtomicUsize,
     #[cfg(test)]
@@ -164,6 +180,8 @@ impl Default for ConfigDurableProgress {
             storage_released: std::sync::OnceLock::new(),
             #[cfg(test)]
             apply_entered: tokio::sync::watch::channel(0).0,
+            #[cfg(test)]
+            accepted_response_loss: tokio::sync::watch::channel(None).0,
             #[cfg(test)]
             native_read_max_entries: std::sync::atomic::AtomicUsize::new(0),
             #[cfg(test)]
@@ -185,12 +203,19 @@ impl ConfigDurableProgress {
         }))
     }
 
-    pub(crate) async fn wait_for_storage_release(&self) -> Result<(), ConfigConsensusStorageError> {
-        let mut released = self
+    pub(crate) fn storage_release_observer(
+        &self,
+    ) -> Result<ConfigStorageReleaseObserver, ConfigConsensusStorageError> {
+        let released = self
             .storage_released
             .get()
             .ok_or(ConfigConsensusStorageError::BackendUnavailable)?
             .clone();
+        Ok(ConfigStorageReleaseObserver { released })
+    }
+
+    pub(crate) async fn wait_for_storage_release(&self) -> Result<(), ConfigConsensusStorageError> {
+        let mut released = self.storage_release_observer()?.released;
         // No value is ever sent: closure proves that the last storage owner
         // has dropped. A value notification cannot stand in for task exit.
         if released.changed().await.is_err() {
