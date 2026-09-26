@@ -2890,6 +2890,10 @@ pub(super) fn apply_target_running_sync(
                     pending_tx_id: pending_tx_id
                         .ok_or_else(|| invalid_data("missing retained pending transaction"))?,
                 }),
+                // Direct Running replacement is an ordinary append. The
+                // target reducer has authenticated its exact session/base;
+                // retain the incoming logical time and cancellation context.
+                16 => None,
                 _ => None,
             };
             (

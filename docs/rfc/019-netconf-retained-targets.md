@@ -50,9 +50,11 @@ The typed applied result distinguishes `Candidate { generation }`,
 `Startup { revision }`, `CopiedRunning { running_version }`,
 `Promoted { running_version, retired_generation }`,
 `Tentative { running_version, retired_generation, pending }`,
-`Confirmed { pending }`, `RolledBack { running_version, pending }` and
-`Lifecycle { incarnation }`. Pending and incarnation values are opaque scoped
-tokens. Existing `AuditOperationState::Committed { version }` keeps its running
+`Confirmed { pending }`, `RolledBack { running_version, pending }`,
+`Lifecycle { incarnation }` and
+`RunningReplaced { tx_id, running_version, plaintext_digest }`. Pending and
+incarnation values are opaque scoped tokens. Existing
+`AuditOperationState::Committed { version }` keeps its running
 meaning and byte representation. New target outcomes use a separate variant;
 no candidate generation or startup revision is encoded as a running version.
 
@@ -74,8 +76,67 @@ operation still returns its known result while terminal persistence or checkpoin
 acknowledgement is owed. Already-admitted later effects remain fenced until that
 original obligation is settled, without replacing their original intents.
 
-The submission surface has these signatures (the proposed types above are not
-yet available):
+### Session-bound ordinary Running replacement
+
+The persistence prerequisite for retained Running edits is separate from the
+ordinary running-only port and from Copy. `read_netconf_running_edit(session)`
+returns an opaque `NetconfRunningEditRead`: the exact encrypted Running record,
+transaction/version (or explicitly `None`/zero for empty Running), current
+Running lock incarnation and the actual SDK session. One quorum-current pinned
+transaction authenticates device, target state, ledger and history; the
+independent checkpoint and live session are checked before returning it. Pending
+confirmation, cleanup, unresolved intent/terminal/checkpoint work and foreign
+Running locks refuse the read. No read grants mutation admission.
+
+`prepare_netconf_running_replacement(session, frozen, commit, privacy, event,
+lifetime)` consumes a real `AttestedConfigCommit`. It binds the original frozen
+parent and successor, source ciphertext/schema when nonempty, verified envelope
+tenant and ordinary `running` AAD domain, original event/caller/request/operation,
+optional exact event transaction and fixed expiry. It accepts ordinary
+Create/Update/Replace/Delete intents over NETCONF SSH/TLS. It refuses confirmation
+deadlines/resolutions and rechecks the current base/lock/device and retained debt
+before returning. The plaintext may change: Copy's identical-configuration proof
+is neither invoked nor weakened. Both original Admit/Apply commands must fit the
+existing replication bounds.
+
+Persistence verifies the event caller against the actual SDK session. It cannot
+authenticate the model-specific principal projection inside an outer adapter's
+AAD. The preparation-only adapter seam must verify its independently authenticated
+`TrustedPrincipal`, AAD principal and event association before calling this API;
+equal tenant or caller-supplied strings are insufficient. That adapter integration
+is a separate prerequisite, and this persistence slice enables no writable
+attachment, candidate/startup capability or confirmed-commit profile.
+
+New action-16 intents require
+`admit_netconf_running_replacement_local(session, original, caller)`. Generic
+`admit_netconf_target_local` may read an existing exact receipt but cannot admit
+a new action-16 intent, including after encode/decode. The narrow admission path
+checks the exact worker/device/session/requester and independently authenticated
+caller, then rechecks live session activity after proposal-permit and quorum
+waits immediately before polling Openraft enqueue. That last synchronous activity
+observation is the local admission boundary: revocation observed there refuses
+without an intent or effect; concurrent revocation after it cannot retract a
+possibly accepted operation. Cancellation never creates replacement authority.
+
+Target preflight is read-only, not a reservation of mutable base or lock state.
+Stale state observed there refuses with no new intent or history. A concurrent
+base/lock change after that observation may still admit the original intent;
+Apply rechecks those expectations and durably records its rejection without a
+Running effect. This does not convert a post-enqueue race into a claim of
+definite non-admission or permit a replacement original.
+
+An acknowledged original intent survives transport revocation. Its existing
+`submit_netconf_target_local`, protected recovery, authenticated lookup and
+completion paths remain usable to resolve it. The original compare-and-append,
+history/audit refresh, target anchor and disjoint `RunningReplaced` outcome are
+atomic under the existing effect savepoint. The outcome authenticates the exact
+original transaction/version/plaintext digest, never the latest Running head.
+Known applied results stay known when terminal/checkpoint completion is owed;
+that debt fences later preparation/admission. The incoming logical time,
+cancellation token, deadlines, WAL mode and durability semantics are unchanged.
+
+The following protocol submission surface remains proposed; the persistence
+prerequisite above does not enable it:
 
 ```text
 ConfigBus<C>::required_netconf_audit(&self)
@@ -216,8 +277,11 @@ Action tags are fixed within this new record: 0 activate, 1 begin device,
 2 acquire lock, 3 release lock, 4 stage candidate, 5 discard candidate,
 6 promote candidate, 7 replace startup, 8 delete startup, 9 tentative promotion,
 10 confirm pending, 11 cancel pending, 12 expire pending, 13 end session and
-14 reboot recovery and 15 copy to running. Unknown tags and trailing data are
-rejected. Legacy command and effect tags are not renumbered.
+14 reboot recovery, 15 copy to running and 16 ordinary Running replacement.
+Action 16 requires a Running destination, exact prior Running source when
+nonempty, an explicit Running lock expectation/requester, an ordinary attested
+Running payload and no confirmation ownership or resolution. Unknown tags and
+trailing data are rejected. Legacy command and effect tags are not renumbered.
 
 Destination expectations contain the exact current target generation, not just
 the desired successor. Source expectations bind source datastore, generation or
@@ -330,6 +394,14 @@ capacity profile is available. Implementation must preserve the exact landed
 capacity variants and bounds, and qualify each supported profile combination.
 The first target profile uses the currently supported capacity contract and
 refuses combinations without a landed, qualified implementation.
+
+This entire target V1 format is **unreleased**. Action 16 and the appended
+`RunningReplaced` outcome (outcome tag 8) finalize wire 9/storage 7 before its
+first runtime release; earlier unlanded target peers are not interoperable with
+this finalization. Actions 0–15 and outcome tags 0–7 retain their exact meanings
+and bytes. Legacy 7/5 and reserved bounded-capacity 8/6 remain unchanged. This is
+target1/capacity0 only; it neither allocates joint 10/8 nor broadens revision
+whitelists or enables target+bounded support.
 
 To avoid colliding with capacity append variants, the target command is appended
 inside the existing management-audit command family. At the inspected base,

@@ -1373,6 +1373,40 @@ impl TargetState {
                     })
                 }
             }
+            16 => {
+                self.check_lock(prepared, 0)?;
+                if self.lifecycle.pending_confirmation.is_some()
+                    || self.lifecycle.cleanup.iter().any(Option::is_some)
+                    || running_confirmation_pending_sync(conn)?
+                {
+                    return Err(bad);
+                }
+                let Some(TargetPayloadV1::Running {
+                    commit,
+                    confirmation_ownership: None,
+                }) = &effect.encrypted_payload
+                else {
+                    return Err(bad);
+                };
+                let parent = running_head_sync(conn)?;
+                if commit.record.parent_tx_id != parent
+                    || current_version.checked_add(1) != Some(commit.record.version.get())
+                    || commit.record.confirmed_deadline.is_some()
+                    || effect.resolution.is_some()
+                {
+                    return Err(bad);
+                }
+                Ok(NetconfAppliedOutcome::RunningReplaced {
+                    tx_id: commit.record.tx_id,
+                    running_version: commit.record.version.get(),
+                    plaintext_digest: commit
+                        .record
+                        .plaintext_digest
+                        .as_slice()
+                        .try_into()
+                        .map_err(|_| bad)?,
+                })
+            }
             10 => {
                 self.check_lock(prepared, 0)?;
                 let pending = self.check_resolution(prepared, now, false)?.pending;
@@ -2021,6 +2055,166 @@ impl PreparedTargetMutation {
             return Err(AuditAuthorityError::RecoveryRequired);
         }
         Ok(())
+    }
+}
+
+fn running_head_sync(conn: &Connection) -> Result<Option<opc_types::TxId>, AuditAuthorityError> {
+    use rusqlite::OptionalExtension;
+    let bytes: Option<Vec<u8>> = conn
+        .query_row(
+            "SELECT tx_id FROM config_history ORDER BY version DESC LIMIT 1",
+            [],
+            |row| row.get(0),
+        )
+        .optional()
+        .map_err(|_| AuditAuthorityError::Unavailable)?;
+    bytes
+        .map(|bytes| {
+            let bytes: [u8; 16] = bytes
+                .try_into()
+                .map_err(|_| AuditAuthorityError::BindingMismatch)?;
+            Ok(opc_types::TxId::from_uuid(uuid::Uuid::from_bytes(bytes)))
+        })
+        .transpose()
+}
+
+fn running_confirmation_pending_sync(conn: &Connection) -> Result<bool, AuditAuthorityError> {
+    conn.query_row(
+        "SELECT EXISTS(SELECT 1 FROM config_history WHERE confirmed_deadline IS NOT NULL AND confirmed_at IS NULL)",
+        [], |row| row.get(0),
+    ).map_err(|_| AuditAuthorityError::Unavailable)
+}
+
+/// The exact Running record and its lifecycle observations share the ledger's
+/// pinned transaction. The public read is minted only after checkpoint checking.
+pub(crate) fn read_running_edit_sync(
+    conn: &Connection,
+    key: &AuditKey,
+    ledger: &LedgerState,
+    session: &crate::audit_authority::NetconfSessionOwner,
+    cancellation: &SqliteWorkCancellation,
+) -> io::Result<Result<crate::audit_authority::NetconfRunningEditRead, AuditAuthorityError>> {
+    let device = read_device_view_sync(conn, key, ledger, cancellation)?;
+    if let Err(error) = device.verify_session(session) {
+        return Ok(Err(error));
+    }
+    let state = read_state_sync(conn, key, ledger.identity, cancellation)?;
+    if state.lifecycle.pending_confirmation.is_some()
+        || running_confirmation_pending_sync(conn).map_err(|_| invalid())?
+    {
+        return Ok(Err(AuditAuthorityError::RecoveryRequired));
+    }
+    let lock = device.locks[0].ok_or_else(invalid)?;
+    if lock
+        .session
+        .is_some_and(|owner| owner != session.incarnation())
+        || lock.caller.is_some_and(|caller| caller != session.caller)
+    {
+        return Ok(Err(AuditAuthorityError::BindingMismatch));
+    }
+    let tx_id = running_head_sync(conn).map_err(|_| invalid())?;
+    let record = tx_id
+        .map(|tx_id| {
+            crate::SqliteBackend::load_by_tx_id_bytes(conn, tx_id.as_uuid().as_bytes(), key)
+                .map_err(|_| invalid())?
+                .map(|stored| stored.record)
+                .ok_or_else(invalid)
+        })
+        .transpose()?;
+    if record.as_ref().map_or(0, |record| record.version.get()) != device.running_version {
+        return Err(invalid());
+    }
+    cancellation.check_io()?;
+    Ok(Ok(crate::audit_authority::NetconfRunningEditRead {
+        session: session.clone(),
+        record,
+        lock_incarnation: lock.incarnation,
+        lock_session: lock.session,
+    }))
+}
+
+impl crate::audit_authority::NetconfRunningEditRead {
+    pub(crate) fn prepare_replacement(
+        &self,
+        session: &crate::audit_authority::NetconfSessionOwner,
+        commit: crate::AttestedConfigCommit,
+        tenant: &str,
+        event: &crate::audit_authority::ProjectedAuditEvent,
+        expires_at: i64,
+        key: &AuditKey,
+    ) -> Result<super::audit_mutation::TargetEffectV1, AuditAuthorityError> {
+        use crate::ManagementAuditOperationCode as Operation;
+        use crate::ManagementAuditTransportCode as Transport;
+        self.verify_session(session)?;
+        let bad = AuditAuthorityError::BindingMismatch;
+        let (record, audit, resolution) = commit.into_parts();
+        if event.caller != session.caller
+            || event.outcome != crate::ManagementAuditOutcomeCode::Intent
+            || !matches!(
+                event.operation,
+                Operation::Create | Operation::Update | Operation::Replace | Operation::Delete
+            )
+            || !matches!(
+                event.transport,
+                Transport::NetconfSsh | Transport::NetconfTls
+            )
+            || record.parent_tx_id != self.tx_id()
+            || self.running_base_version().checked_add(1) != Some(record.version.get())
+            || record.confirmed_deadline.is_some()
+            || resolution.is_some()
+        {
+            return Err(bad);
+        }
+        // Preparation consumes the original AEAD claim. No ciphertext claim is
+        // reconstructed, and ordinary replacement deliberately has no copy proof.
+        let commit = super::PreparedConfigCommit::prepare(record, audit, key)
+            .map_err(|_| AuditAuthorityError::InvalidInput)?;
+        let envelope = opc_crypto::CryptoEnvelopeRef::decode(&commit.record.encrypted_blob)
+            .map_err(|_| bad)?;
+        let (aad, _) = opc_key::decode_bound_aad(envelope.aad).map_err(|_| bad)?;
+        let opc_key::EnvelopeMetadata::Config(metadata) = aad.metadata() else {
+            return Err(bad);
+        };
+        if aad.tenant().as_str() != tenant || metadata.store_kind() != "running" {
+            return Err(bad);
+        }
+        if let Some(record) = &self.record {
+            let envelope =
+                opc_crypto::CryptoEnvelopeRef::decode(&record.encrypted_blob).map_err(|_| bad)?;
+            let (aad, _) = opc_key::decode_bound_aad(envelope.aad).map_err(|_| bad)?;
+            if aad.tenant().as_str() != tenant {
+                return Err(bad);
+            }
+        }
+        Ok(super::audit_mutation::TargetEffectV1 {
+            format: 1,
+            authority: session.device.authority,
+            profile_incarnation: session.device.profile_incarnation,
+            device_incarnation: session.device.device_incarnation,
+            caller: event.caller,
+            request: event.request,
+            action: 16.try_into()?,
+            destination: TargetExpectationV1::Running {
+                version: self.running_base_version(),
+            },
+            source: self.record.as_ref().map(|record| TargetSourceV1::Running {
+                version: record.version.get(),
+                schema: record.schema_digest,
+                ciphertext_digest: Sha256::digest(&record.encrypted_blob).into(),
+            }),
+            lock: Some(super::audit_mutation::TargetLockExpectationV1 {
+                datastore: 0,
+                incarnation: self.lock_incarnation,
+                session: self.lock_session,
+                requester: session.incarnation(),
+            }),
+            expires_at,
+            encrypted_payload: Some(TargetPayloadV1::Running {
+                commit: Box::new(commit),
+                confirmation_ownership: None,
+            }),
+            resolution: None,
+        })
     }
 }
 

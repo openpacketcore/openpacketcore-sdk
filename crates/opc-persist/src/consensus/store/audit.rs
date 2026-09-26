@@ -365,6 +365,21 @@ impl ConsensusConfigStore {
         command: ConfigMutationIntent,
         local_only: bool,
     ) -> AuditAdmission {
+        self.audit_operation_command_with_session(
+            handle, caller, purpose, command, local_only, None,
+        )
+        .await
+    }
+
+    async fn audit_operation_command_with_session(
+        &self,
+        handle: &AuditOperationHandle,
+        caller: AuditCaller,
+        purpose: &[u8],
+        command: ConfigMutationIntent,
+        local_only: bool,
+        session: Option<&crate::audit_authority::NetconfSessionOwner>,
+    ) -> AuditAdmission {
         if let Err(error) =
             handle.verify(self.inner.backend.audit_key(), self.inner.identity, caller)
         {
@@ -413,6 +428,15 @@ impl ConsensusConfigStore {
                     return AuditAdmission::Rejected(error);
                 }
             }
+            Ok(Some(receipt))
+                if matches!(
+                    target_command.as_deref(),
+                    Some(super::super::audit_mutation::TargetAuditCommandV1::Admit(prepared))
+                        if u8::from(prepared.effect.action) == 16
+                ) =>
+            {
+                return AuditAdmission::Applied(receipt);
+            }
             Ok(Some(_)) => {}
         }
         if matches!(command, ConfigMutationIntent::AuditedMutation(_))
@@ -438,7 +462,18 @@ impl ConsensusConfigStore {
                 return AuditAdmission::Rejected(error);
             }
         }
-        let response = if local_only {
+        let response = if let Some(session) = session {
+            match self
+                .submit_request_on_local_leader_guarded(request, command, Some(session))
+                .await
+            {
+                Ok(response) => Ok(response),
+                Err(super::LocalSubmissionError::BeforeEnqueue(error)) => {
+                    return AuditAdmission::Rejected(error)
+                }
+                Err(super::LocalSubmissionError::Submission(error)) => Err(error),
+            }
+        } else if local_only {
             self.submit_request_on_local_leader(request, command).await
         } else {
             self.submit_request(request, command).await
@@ -737,9 +772,68 @@ impl ConsensusConfigStore {
         prepared: &crate::audit_authority::PreparedTargetMutation,
         caller: AuditCaller,
     ) -> AuditAdmission {
+        self.admit_netconf_target_with_session(prepared, caller, None)
+            .await
+    }
+
+    /// Admit a new ordinary Running replacement only for its exact live SDK
+    /// session and independently authenticated caller. Generic target admission
+    /// cannot create an action-16 intent, including from decoded recovery data.
+    ///
+    /// Activity is checked on entry and again after the proposal permit/quorum
+    /// waits immediately before polling enqueue. Revocation observed there is
+    /// a definite refusal. Once that check succeeds, concurrent revocation or
+    /// cancellation cannot retract possibly accepted work: retain and recover
+    /// the original. Existing authenticated receipts remain readable after
+    /// revocation, and an acknowledged intent may finish through original submit.
+    pub async fn admit_netconf_running_replacement_local(
+        &self,
+        session: &crate::audit_authority::NetconfSessionOwner,
+        prepared: &crate::audit_authority::PreparedTargetMutation,
+        caller: AuditCaller,
+    ) -> AuditAdmission {
+        if u8::from(prepared.effect.action) != 16
+            || !session.device.worker.belongs_to(&self.inner)
+            || session.caller != caller
+            || prepared.effect.authority != session.device.authority
+            || prepared.effect.profile_incarnation != session.device.profile_incarnation
+            || prepared.effect.device_incarnation != session.device.device_incarnation
+            || prepared
+                .effect
+                .lock
+                .as_ref()
+                .is_none_or(|lock| lock.requester != session.incarnation())
+        {
+            return AuditAdmission::Rejected(AuditAuthorityError::BindingMismatch);
+        }
+        self.admit_netconf_target_with_session(prepared, caller, Some(session))
+            .await
+    }
+
+    async fn admit_netconf_target_with_session(
+        &self,
+        prepared: &crate::audit_authority::PreparedTargetMutation,
+        caller: AuditCaller,
+        session: Option<&crate::audit_authority::NetconfSessionOwner>,
+    ) -> AuditAdmission {
         use crate::consensus::audit_mutation::TargetAuditCommandV1;
         if let Err(error) = self.verify_netconf_target(prepared, caller) {
             return AuditAdmission::Rejected(error);
+        }
+        let entry_guard = if u8::from(prepared.effect.action) == 16 {
+            session
+                .ok_or(AuditAuthorityError::BindingMismatch)
+                .and_then(|session| session.require_active())
+        } else {
+            Ok(())
+        };
+        if let Err(error) = entry_guard {
+            // Revocation cannot relabel an already admitted original. This
+            // branch performs read-only recovery and never enqueues an intent.
+            return match self.preflight_netconf_target(prepared).await {
+                Ok(Some(receipt)) => AuditAdmission::Applied(receipt),
+                _ => AuditAdmission::Rejected(error),
+            };
         }
         let admit = ConfigMutationIntent::ManagementAudit(AuditCommand::NetconfTarget(Box::new(
             TargetAuditCommandV1::Admit(prepared.clone()),
@@ -769,12 +863,13 @@ impl ConsensusConfigStore {
             Ok(None) => {}
             Err(error) => return AuditAdmission::Rejected(error),
         }
-        self.audit_operation_command_with_route(
+        self.audit_operation_command_with_session(
             prepared.handle(),
             caller,
             b"netconf-target-intent",
             admit,
             true,
+            session,
         )
         .await
     }
@@ -1563,6 +1658,168 @@ impl ConsensusConfigStore {
         )?;
         let prepared = crate::audit_authority::PreparedTargetMutation { handle, effect };
         prepared.verify_effect(self.inner.backend.audit_key())?;
+        self.preflight_netconf_target(&prepared).await?;
+        frozen.verify_session(session)?;
+        Ok(prepared)
+    }
+
+    /// Freeze the exact Running head, including an explicitly empty base, for
+    /// this live SDK session. Device, ledger, history and Running lock are read
+    /// in one quorum-current transaction and independently checkpointed. Pending
+    /// confirmation, cleanup, foreign locks and unsettled audit work refuse the
+    /// read. This grants neither NACM permission nor mutation admission.
+    pub async fn read_netconf_running_edit(
+        &self,
+        session: &crate::audit_authority::NetconfSessionOwner,
+    ) -> Result<crate::audit_authority::NetconfRunningEditRead, AuditAuthorityError> {
+        self.require_netconf_target_profile()?;
+        if !session.device.worker.belongs_to(&self.inner) {
+            return Err(AuditAuthorityError::BindingMismatch);
+        }
+        session.require_active()?;
+        self.linearizable_barrier()
+            .await
+            .map_err(|_| AuditAuthorityError::Unavailable)?;
+        let backend = self.inner.backend.clone();
+        let identity = self.inner.identity;
+        let owner = session.clone();
+        let (ledger, frozen) = super::super::run_backend_sqlite_with_timeout(
+            &self.inner.backend,
+            self.inner.operation_timeout,
+            move |conn, cancellation| {
+                let unavailable = || std::io::Error::other("running authority unavailable");
+                let tx = conn.unchecked_transaction().map_err(|_| unavailable())?;
+                super::super::sqlite::validate_live_history_schema_for_profile(
+                    &tx,
+                    cancellation,
+                    crate::RetainedConfigProfile::NetconfTargetsV1,
+                )?;
+                let keys = backend.management_audit_keys().ok_or_else(unavailable)?;
+                let ledger = super::super::audit::read_with_keys_sync(
+                    &tx,
+                    backend.audit_key(),
+                    Some(&keys),
+                    identity,
+                )?
+                .ok_or_else(unavailable)?;
+                let frozen = super::super::audit_targets::read_running_edit_sync(
+                    &tx,
+                    backend.audit_key(),
+                    &ledger,
+                    &owner,
+                    cancellation,
+                )?;
+                cancellation.check_io()?;
+                tx.commit().map_err(|_| unavailable())?;
+                Ok((ledger, frozen))
+            },
+        )
+        .await
+        .map_err(|_| AuditAuthorityError::Unavailable)?;
+        self.verify_audit_checkpoint(&ledger).await?;
+        let frozen = frozen?;
+        frozen.verify_session(session)?;
+        Ok(frozen)
+    }
+
+    /// Prepare one ordinary Running replacement from an original frozen read
+    /// and an actual SDK-attested commit. Exact parent, successor, tenant,
+    /// session, lock and optional event transaction are bound before any intent.
+    /// Confirmed lifecycle changes are refused; copy proof semantics are unchanged.
+    ///
+    /// The adapter must authenticate its model-specific principal/AAD-to-event
+    /// association before calling: persistence does not decode that principal
+    /// representation. This checks the independently authenticated event caller
+    /// against the real session. Preserve the original for admission/recovery;
+    /// preparation enables no protocol capability and changes no retained state.
+    pub async fn prepare_netconf_running_replacement(
+        &self,
+        session: &crate::audit_authority::NetconfSessionOwner,
+        frozen: &crate::audit_authority::NetconfRunningEditRead,
+        commit: AttestedConfigCommit,
+        privacy: &dyn AuditPrivacyProjection,
+        event: &ManagementAuditEventRecord,
+        lifetime: std::time::Duration,
+    ) -> Result<crate::audit_authority::PreparedTargetMutation, AuditAuthorityError> {
+        self.require_netconf_target_profile()?;
+        if !session.device.worker.belongs_to(&self.inner) {
+            return Err(AuditAuthorityError::BindingMismatch);
+        }
+        frozen.verify_session(session)?;
+        if lifetime.subsec_nanos() != 0 || !(1..=3600).contains(&lifetime.as_secs()) {
+            return Err(AuditAuthorityError::InvalidInput);
+        }
+        if event
+            .tx_id()
+            .is_some_and(|tx| tx != commit.record().tx_id.to_string())
+        {
+            return Err(AuditAuthorityError::BindingMismatch);
+        }
+        let tenant = event.tenant();
+        let event = ProjectedAuditEvent::project(privacy, event)?;
+        let issued_at = self
+            .inner
+            .clock
+            .now_utc()
+            .as_offset_datetime()
+            .unix_timestamp();
+        let expires_at = issued_at
+            .checked_add(lifetime.as_secs() as i64)
+            .ok_or(AuditAuthorityError::InvalidInput)?;
+        let effect = frozen.prepare_replacement(
+            session,
+            commit,
+            tenant,
+            &event,
+            expires_at,
+            self.inner.backend.audit_key(),
+        )?;
+        let digest = effect.digest(self.inner.backend.audit_key())?;
+        let binding = AuditOperationBinding::project(
+            privacy,
+            &event,
+            frozen.running_base_version(),
+            &digest,
+        )?;
+        let handle = AuditOperationHandle::issue(
+            HandleBody {
+                version: 1,
+                identity: self.inner.identity,
+                binding,
+                event,
+                issued_at,
+                expires_at,
+                nonce: *uuid::Uuid::new_v4().as_bytes(),
+                key_epoch: self.inner.backend.audit_key().epoch(),
+                mutation: Some(digest),
+            },
+            self.inner.backend.audit_key(),
+        )?;
+        let prepared = crate::audit_authority::PreparedTargetMutation { handle, effect };
+        prepared.verify_effect(self.inner.backend.audit_key())?;
+        // Both original phases must fit before returning any preparation.
+        for (purpose, command) in [
+            (
+                b"netconf-target-intent".as_slice(),
+                super::super::audit_mutation::TargetAuditCommandV1::Admit(prepared.clone()),
+            ),
+            (
+                b"netconf-target-effect".as_slice(),
+                super::super::audit_mutation::TargetAuditCommandV1::Apply(prepared.clone()),
+            ),
+        ] {
+            let request =
+                derive_durable_request_id(self.inner.identity, purpose, &prepared.handle.mac);
+            super::preflight_config_command_replication_budget(
+                self.inner.identity,
+                request,
+                &ConfigMutationIntent::ManagementAudit(AuditCommand::NetconfTarget(Box::new(
+                    command,
+                ))),
+                self.config_profile(),
+            )
+            .map_err(|_| AuditAuthorityError::InvalidInput)?;
+        }
         self.preflight_netconf_target(&prepared).await?;
         frozen.verify_session(session)?;
         Ok(prepared)

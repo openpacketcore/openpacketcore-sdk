@@ -75,6 +75,16 @@ fn fixtures() -> Vec<(Value, Vec<u8>)> {
             json!({"lifecycle": {"incarnation": scoped_token(0x44)}}),
             scoped_bytes(&[0x44; 16]),
         ),
+        (
+            json!({"running-replaced": {
+                "tx_id": "45454545-4545-4545-4545-454545454545",
+                "running_version": 9,
+                "plaintext_digest": vec![0x46; 32],
+            }}),
+            // TxId's UUID uses a 16-byte postcard byte sequence, followed by
+            // version 9 and the fixed digest array. No expected SDK encoding.
+            [vec![16], vec![0x45; 16], vec![9], vec![0x46; 32]].concat(),
+        ),
     ];
     variants
         .into_iter()
@@ -203,8 +213,37 @@ fn target_outcome_binary_refuses_truncation_trailing_data_and_unknown_tag() {
         assert!(opc_consensus::decode_bounded::<AuditOperationState>(&trailing).is_err());
         let mut unknown = bytes;
         // Outer tag, authority (32 + 32 + 1), profile (16), digest (32).
-        unknown[114] = 8;
+        unknown[114] = 9;
         assert!(opc_consensus::decode_bounded::<AuditOperationState>(&unknown).is_err());
+    }
+}
+
+#[test]
+fn running_replacement_outcome_refuses_malformed_original_identity() {
+    let (value, bytes) = fixtures()
+        .into_iter()
+        .find(|(value, _)| {
+            value["target-v1"]["outcome"]
+                .get("running-replaced")
+                .is_some()
+        })
+        .unwrap();
+    for (field, invalid) in [
+        ("tx_id", json!("invalid-transaction")),
+        ("tx_id", json!(vec![0x45; 15])),
+        ("plaintext_digest", json!(vec![0x46; 31])),
+        ("plaintext_digest", json!(vec![0x46; 33])),
+        ("running_version", json!(i64::MAX as u64 + 1)),
+    ] {
+        let mut malformed = value.clone();
+        malformed["target-v1"]["outcome"]["running-replaced"][field] = invalid;
+        assert!(serde_json::from_value::<AuditOperationState>(malformed).is_err());
+    }
+    for length in [0, 15, 17] {
+        let mut malformed = bytes.clone();
+        // Common result prefix ends at tag 8, then UUID's encoded length.
+        malformed[115] = length;
+        assert!(opc_consensus::decode_bounded::<AuditOperationState>(&malformed).is_err());
     }
 }
 

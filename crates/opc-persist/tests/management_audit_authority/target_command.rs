@@ -108,7 +108,7 @@ fn target_command_rejects_unknown_fields_and_unallocated_action_tags() {
             .insert("unknown".into(), json!(0));
         assert!(serde_json::from_value::<AuditCommand>(fixture).is_err());
     }
-    for tag in [16, 17, 255, 256, -1] {
+    for tag in [17, 255, 256, -1] {
         let mut fixture = discard_command();
         fixture["netconf-target"]["apply"]["effect"]["action"] = json!(tag);
         assert!(serde_json::from_value::<AuditCommand>(fixture).is_err());
@@ -257,14 +257,14 @@ fn target_recovery_bounds_and_shape_fail_without_exposing_values() {
 #[test]
 fn target_action_bytes_are_explicit_and_do_not_reuse_unallocated_tags() {
     use crate::consensus::audit_mutation::TargetActionV1;
-    for action in 0u8..=15 {
+    for action in 0u8..=16 {
         let decoded: TargetActionV1 = serde_json::from_value(json!(action)).unwrap();
         assert_eq!(serde_json::to_value(decoded).unwrap(), json!(action));
         assert_eq!(opc_consensus::encode_bounded(&decoded).unwrap(), [action]);
         let binary: TargetActionV1 = opc_consensus::decode_bounded(&[action]).unwrap();
         assert_eq!(serde_json::to_value(binary).unwrap(), json!(action));
     }
-    for action in 16u8..=255 {
+    for action in 17u8..=255 {
         assert!(serde_json::from_value::<TargetActionV1>(json!(action)).is_err());
         assert!(opc_consensus::decode_bounded::<TargetActionV1>(&[action]).is_err());
     }

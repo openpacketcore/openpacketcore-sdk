@@ -53,6 +53,19 @@ const ROUTE_RETRY_BACKOFF: Duration = Duration::from_millis(50);
 const MAX_FORWARDED_BUDGET: Duration = Duration::from_secs(60);
 const REQUEST_ID_DOMAIN: &[u8] = b"openpacketcore/config-consensus/request-id/v1\0";
 
+// A refused live session never entered Openraft; preserve that distinction from
+// uncertain storage/transport completion of an accepted original request.
+enum LocalSubmissionError {
+    BeforeEnqueue(crate::audit_authority::AuditAuthorityError),
+    Submission(PersistError),
+}
+
+impl From<PersistError> for LocalSubmissionError {
+    fn from(error: PersistError) -> Self {
+        Self::Submission(error)
+    }
+}
+
 fn map_watch_snapshot<T, R: 'static>(
     receiver: &tokio::sync::watch::Receiver<T>,
     map: impl FnOnce(&T) -> R,
@@ -1187,6 +1200,22 @@ impl ConsensusConfigStore {
         request_id: opc_consensus::ConsensusRequestId,
         intent: ConfigMutationIntent,
     ) -> Result<ConfigConsensusResponse, PersistError> {
+        match self
+            .submit_request_on_local_leader_guarded(request_id, intent, None)
+            .await
+        {
+            Ok(response) => Ok(response),
+            Err(LocalSubmissionError::Submission(error)) => Err(error),
+            Err(LocalSubmissionError::BeforeEnqueue(_)) => Err(consensus_unavailable()),
+        }
+    }
+
+    async fn submit_request_on_local_leader_guarded(
+        &self,
+        request_id: opc_consensus::ConsensusRequestId,
+        intent: ConfigMutationIntent,
+        session: Option<&crate::audit_authority::NetconfSessionOwner>,
+    ) -> Result<ConfigConsensusResponse, LocalSubmissionError> {
         let result = async {
             preflight_config_command_replication_budget(
                 self.inner.identity,
@@ -1205,12 +1234,18 @@ impl ConsensusConfigStore {
                 compatibility: self.peer_compatibility(),
                 budget: ForwardedBudget::from_deadline(deadline)?,
             };
-            match self.apply_on_local_leader(request, deadline).await {
+            match self
+                .apply_on_local_leader_guarded(request, deadline, session)
+                .await
+                .map_err(LocalSubmissionError::BeforeEnqueue)?
+            {
                 ForwardMutationReply::Applied(response) => Ok(*response),
-                ForwardMutationReply::Rejected(rejection) => Err(rejection.into_persist_error()),
-                ForwardMutationReply::OutcomeUnknown => Err(PersistError::outcome_unknown()),
+                ForwardMutationReply::Rejected(rejection) => {
+                    Err(rejection.into_persist_error().into())
+                }
+                ForwardMutationReply::OutcomeUnknown => Err(PersistError::outcome_unknown().into()),
                 ForwardMutationReply::NotLeader { .. } | ForwardMutationReply::Unavailable => {
-                    Err(consensus_unavailable())
+                    Err(consensus_unavailable().into())
                 }
             }
         }
@@ -1341,16 +1376,27 @@ impl ConsensusConfigStore {
         request: ForwardMutationRequest,
         deadline: tokio::time::Instant,
     ) -> ForwardMutationReply {
+        self.apply_on_local_leader_guarded(request, deadline, None)
+            .await
+            .unwrap_or(ForwardMutationReply::Unavailable)
+    }
+
+    async fn apply_on_local_leader_guarded(
+        &self,
+        request: ForwardMutationRequest,
+        deadline: tokio::time::Instant,
+        session: Option<&crate::audit_authority::NetconfSessionOwner>,
+    ) -> Result<ForwardMutationReply, crate::audit_authority::AuditAuthorityError> {
         if let Err(rejection) = preflight_config_command_replication_budget(
             self.inner.identity,
             request.request_id,
             &request.intent,
             self.config_profile(),
         ) {
-            return ForwardMutationReply::Rejected(rejection);
+            return Ok(ForwardMutationReply::Rejected(rejection));
         }
         if self.require_admission().is_err() {
-            return ForwardMutationReply::Unavailable;
+            return Ok(ForwardMutationReply::Unavailable);
         }
         let proposal_permit = match tokio::time::timeout_at(
             deadline,
@@ -1359,7 +1405,7 @@ impl ConsensusConfigStore {
         .await
         {
             Ok(Ok(permit)) => permit,
-            Ok(Err(_)) | Err(_) => return ForwardMutationReply::Unavailable,
+            Ok(Err(_)) | Err(_) => return Ok(ForwardMutationReply::Unavailable),
         };
         match self
             .inner
@@ -1369,14 +1415,14 @@ impl ConsensusConfigStore {
         {
             EnsureLinearizableOutcome::Ready { .. } if self.require_admission().is_ok() => {}
             EnsureLinearizableOutcome::Ready { .. } | EnsureLinearizableOutcome::Unavailable => {
-                return ForwardMutationReply::Unavailable;
+                return Ok(ForwardMutationReply::Unavailable);
             }
             EnsureLinearizableOutcome::Retry { leader_hint } => {
-                return ForwardMutationReply::NotLeader {
+                return Ok(ForwardMutationReply::NotLeader {
                     leader: leader_hint,
-                }
+                })
             }
-            _ => return ForwardMutationReply::Unavailable,
+            _ => return Ok(ForwardMutationReply::Unavailable),
         }
         let command = super::ConfigConsensusCommand {
             schema_version: self.config_profile().command_revision(),
@@ -1389,16 +1435,26 @@ impl ConsensusConfigStore {
             .validate_for_profile(self.inner.identity, self.config_profile())
             .is_err()
         {
-            return ForwardMutationReply::Rejected(ForwardMutationRejection::InvalidCommand);
+            return Ok(ForwardMutationReply::Rejected(
+                ForwardMutationRejection::InvalidCommand,
+            ));
         }
         if !config_command_fits_replication_budget(&command) {
-            return ForwardMutationReply::Rejected(ForwardMutationRejection::CommandTooLarge);
+            return Ok(ForwardMutationReply::Rejected(
+                ForwardMutationRejection::CommandTooLarge,
+            ));
+        }
+        // Admission linearizes at this live-session observation immediately
+        // before polling Openraft enqueue. No preparatory await remains. A
+        // concurrent revocation after this point does not retract accepted work.
+        if let Some(session) = session {
+            session.require_active()?;
         }
         let response =
             match tokio::time::timeout_at(deadline, self.inner.raft.client_write_ff(command)).await
             {
-                Err(_) => return ForwardMutationReply::OutcomeUnknown,
-                Ok(Err(_)) => return ForwardMutationReply::Unavailable,
+                Err(_) => return Ok(ForwardMutationReply::OutcomeUnknown),
+                Ok(Err(_)) => return Ok(ForwardMutationReply::Unavailable),
                 Ok(Ok(response)) => response,
             };
         // The returned receiver proves that Openraft accepted this durable
@@ -1421,13 +1477,15 @@ impl ConsensusConfigStore {
             let _ = completion_tx.send(reply);
             drop(proposal_permit);
         });
-        match tokio::time::timeout_at(deadline, completion_rx).await {
-            Err(_) | Ok(Err(_)) => ForwardMutationReply::OutcomeUnknown,
-            Ok(Ok(ForwardMutationReply::Applied(response))) => {
-                ForwardMutationReply::Applied(response)
-            }
-            Ok(Ok(reply)) => reply,
-        }
+        Ok(
+            match tokio::time::timeout_at(deadline, completion_rx).await {
+                Err(_) | Ok(Err(_)) => ForwardMutationReply::OutcomeUnknown,
+                Ok(Ok(ForwardMutationReply::Applied(response))) => {
+                    ForwardMutationReply::Applied(response)
+                }
+                Ok(Ok(reply)) => reply,
+            },
+        )
     }
 
     async fn wait_for_known_leader(
@@ -2943,3 +3001,7 @@ mod tests {
         writer_thread.join().expect("join watch writer");
     }
 }
+
+#[cfg(test)]
+#[path = "../../tests/management_audit_authority/running_replacement.rs"]
+mod running_replacement_tests;

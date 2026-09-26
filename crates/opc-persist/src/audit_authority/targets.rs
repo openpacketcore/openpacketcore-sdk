@@ -209,6 +209,15 @@ pub enum NetconfAppliedOutcome {
         /// Incarnation of the applied lifecycle effect.
         incarnation: NetconfIncarnation,
     },
+    /// Ordinary session-bound Running replacement, without source-copy semantics.
+    RunningReplaced {
+        /// Exact transaction from the originally attested commit.
+        tx_id: opc_types::TxId,
+        /// Applied running revision.
+        running_version: u64,
+        /// Exact originally attested plaintext digest, not a latest-head lookup.
+        plaintext_digest: [u8; 32],
+    },
 }
 
 impl NetconfAppliedOutcome {
@@ -223,6 +232,9 @@ impl NetconfAppliedOutcome {
                 running_version, ..
             }
             | Self::RolledBack {
+                running_version, ..
+            }
+            | Self::RunningReplaced {
                 running_version, ..
             } => Some(running_version),
             Self::Candidate { .. }
@@ -248,7 +260,7 @@ impl NetconfAppliedOutcome {
         match self {
             Self::Candidate { generation } => generation_ok(generation),
             Self::Startup { revision } => revision.authority == authority && revision.value > 0,
-            Self::CopiedRunning { .. } => true,
+            Self::CopiedRunning { .. } | Self::RunningReplaced { .. } => true,
             Self::Promoted {
                 retired_generation, ..
             } => generation_ok(retired_generation),
@@ -284,6 +296,7 @@ enum OutcomeBody {
     Confirmed([u8; 16]),
     RolledBack(u64, [u8; 16]),
     Lifecycle([u8; 16]),
+    RunningReplaced(opc_types::TxId, u64, [u8; 32]),
 }
 
 impl From<NetconfAppliedOutcome> for OutcomeBody {
@@ -309,6 +322,11 @@ impl From<NetconfAppliedOutcome> for OutcomeBody {
                 pending,
             } => Self::RolledBack(running_version, pending.value),
             NetconfAppliedOutcome::Lifecycle { incarnation } => Self::Lifecycle(incarnation.value),
+            NetconfAppliedOutcome::RunningReplaced {
+                tx_id,
+                running_version,
+                plaintext_digest,
+            } => Self::RunningReplaced(tx_id, running_version, plaintext_digest),
         }
     }
 }
@@ -424,6 +442,13 @@ impl NetconfTargetResult {
             OutcomeBody::Lifecycle(value) => NetconfAppliedOutcome::Lifecycle {
                 incarnation: NetconfIncarnation { authority, value },
             },
+            OutcomeBody::RunningReplaced(tx_id, running_version, plaintext_digest) => {
+                NetconfAppliedOutcome::RunningReplaced {
+                    tx_id,
+                    running_version,
+                    plaintext_digest,
+                }
+            }
         }
     }
 
@@ -954,6 +979,53 @@ impl<'a> NetconfCandidatePromotion<'a> {
 impl fmt::Debug for NetconfCandidatePromotion<'_> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str("NetconfCandidatePromotion(<redacted>)")
+    }
+}
+
+/// Opaque, session-bound Running head from one quorum-current authenticated read.
+/// An empty authority has no record and version zero. Reading grants no intent
+/// admission. The exact original record is protected configuration input, not
+/// diagnostic data; decrypt and validate it through the existing SDK adapter.
+pub struct NetconfRunningEditRead {
+    pub(crate) session: NetconfSessionOwner,
+    pub(crate) record: Option<crate::CommitRecord>,
+    pub(crate) lock_incarnation: u64,
+    pub(crate) lock_session: Option<[u8; 16]>,
+}
+
+impl NetconfRunningEditRead {
+    /// Original encrypted head, or the explicitly empty Running base.
+    pub fn record(&self) -> Option<&crate::CommitRecord> {
+        self.record.as_ref()
+    }
+
+    /// Exact predecessor transaction, never inferred from a later read.
+    pub fn tx_id(&self) -> Option<opc_types::TxId> {
+        self.record.as_ref().map(|record| record.tx_id)
+    }
+
+    /// Exact frozen Running version; zero denotes the empty base only.
+    pub fn running_base_version(&self) -> u64 {
+        self.record
+            .as_ref()
+            .map_or(0, |record| record.version.get())
+    }
+
+    pub(crate) fn verify_session(
+        &self,
+        session: &NetconfSessionOwner,
+    ) -> Result<(), AuditAuthorityError> {
+        session.require_active()?;
+        if !self.session.same_session(session) {
+            return Err(AuditAuthorityError::BindingMismatch);
+        }
+        Ok(())
+    }
+}
+
+impl fmt::Debug for NetconfRunningEditRead {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("NetconfRunningEditRead(<redacted>)")
     }
 }
 

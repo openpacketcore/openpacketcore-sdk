@@ -48,10 +48,11 @@ pub use targets::{
     CandidateGeneration, NetconfAppliedOutcome, NetconfCancellation, NetconfCandidatePromotion,
     NetconfCandidatePromotionRead, NetconfDeviceOwner, NetconfEmptyConfirmation,
     NetconfIncarnation, NetconfLockDatastore, NetconfLockLease, NetconfPendingConfirmation,
-    NetconfPendingRead, NetconfRunningCopy, NetconfRunningCopyRead, NetconfSessionOwner,
-    NetconfStagedConfirmation, NetconfStagedConfirmationRead, NetconfTargetCopy,
-    NetconfTargetCopyRead, NetconfTargetRead, NetconfTargetReplacement, NetconfTargetResult,
-    NetconfTentativePromotion, PreparedNetconfDevice, PreparedNetconfLock, StartupRevision,
+    NetconfPendingRead, NetconfRunningCopy, NetconfRunningCopyRead, NetconfRunningEditRead,
+    NetconfSessionOwner, NetconfStagedConfirmation, NetconfStagedConfirmationRead,
+    NetconfTargetCopy, NetconfTargetCopyRead, NetconfTargetRead, NetconfTargetReplacement,
+    NetconfTargetResult, NetconfTentativePromotion, PreparedNetconfDevice, PreparedNetconfLock,
+    StartupRevision,
 };
 
 /// Largest aggregate private tuple accepted before projection.

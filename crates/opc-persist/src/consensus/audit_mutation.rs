@@ -206,7 +206,7 @@ pub(crate) struct TargetActionV1(u8);
 impl TryFrom<u8> for TargetActionV1 {
     type Error = AuditAuthorityError;
     fn try_from(value: u8) -> Result<Self, Self::Error> {
-        if value <= 15 {
+        if value <= 16 {
             Ok(Self(value))
         } else {
             Err(AuditAuthorityError::InvalidInput)
@@ -608,6 +608,29 @@ impl TargetEffectV1 {
                 ) && ((running && running_payload) || (lifecycle && no_payload))
             }
             15 => running && running_payload && self.source.is_some() && no_resolution,
+            16 => {
+                no_resolution
+                    && self.lock.as_ref().is_some_and(|lock| lock.datastore == 0)
+                    && matches!((&self.destination, &self.source, &self.encrypted_payload),
+                    (TargetExpectationV1::Running { version }, source,
+                     Some(TargetPayloadV1::Running { commit, confirmation_ownership: None }))
+                    if *version == handle.body.binding.base_version
+                        && version.checked_add(1) == Some(commit.record.version.get())
+                        && commit.record.confirmed_deadline.is_none()
+                        && match source {
+                            None => *version == 0 && commit.record.parent_tx_id.is_none(),
+                            Some(TargetSourceV1::Running { version: source_version, .. }) =>
+                                *version > 0 && source_version == version && commit.record.parent_tx_id.is_some(),
+                            _ => false,
+                        })
+                    && matches!(
+                        handle.body.event.operation,
+                        crate::ManagementAuditOperationCode::Create
+                            | crate::ManagementAuditOperationCode::Update
+                            | crate::ManagementAuditOperationCode::Replace
+                            | crate::ManagementAuditOperationCode::Delete
+                    )
+            }
             _ => false,
         };
         if !valid_action {
@@ -775,6 +798,25 @@ impl PreparedTargetMutation {
                     if *version == self.handle.body.binding.base_version
                         && version.checked_add(1) == Some(running_version)
                         && commit.record.version.get() == running_version
+                        && commit.record.confirmed_deadline.is_none()
+                        && self.effect.resolution.is_none())
+            }
+            (
+                16,
+                Outcome::RunningReplaced {
+                    tx_id,
+                    running_version,
+                    plaintext_digest,
+                },
+            ) => {
+                matches!((&self.effect.encrypted_payload, &self.effect.destination),
+                    (Some(TargetPayloadV1::Running { commit, confirmation_ownership: None }),
+                     TargetExpectationV1::Running { version })
+                    if *version == self.handle.body.binding.base_version
+                        && version.checked_add(1) == Some(running_version)
+                        && commit.record.tx_id == tx_id
+                        && commit.record.version.get() == running_version
+                        && commit.record.plaintext_digest.as_slice() == plaintext_digest.as_slice()
                         && commit.record.confirmed_deadline.is_none()
                         && self.effect.resolution.is_none())
             }
