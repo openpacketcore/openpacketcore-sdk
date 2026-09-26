@@ -50,6 +50,34 @@ async fn partition_and_recover() {
   or a second consensus implementation.
 - Used by AMF-lite, IPsec ownership, cache, and session-store tests.
 
+## Authenticated consumer fixture
+
+The `consumer-fixture` feature exposes
+`AuthenticatedPreparedFencedTransitionFixture`. Its fixed durable mode uses
+three file-backed voters, authenticated persistent consumer connections and
+local payload encryption. Consensus transport remains in-process.
+
+`open_local_aead_pair` opens the original exclusive prepared journal and pairs
+the ordinary backend with its prepared-fenced facade. The pair's
+`protected_general_backend` clones that same encrypted backend for APIs requiring
+`ProtectedSessionBackend`; it does not reopen the journal. Protected-clone calls
+do not enter the ordinary accounting wrapper's mutation counters.
+
+For independent consumers on the same voters, provision each with
+`create_local_aead_pair` before offering its workload. Each pair retains a
+separate private journal and a reopener for that exact journal. Keep encryption
+configuration coherent and application ownership scopes distinct. Reopening
+recovers status only; it does not replay a prepared mutation. These APIs do not
+increase journal limits or authorize discarding history after rejection.
+
+With `test-control`, `consensus_rpc_observation` reports fixed-family counts,
+outcomes, in-flight/lifetime peaks and duration buckets for actual consensus
+peer calls. It includes background heartbeats and retries, and distinguishes
+ordinary read-index traffic from readiness/capability probes. It neither issues
+requests nor exposes payloads or voter identities. These round-trip counts are
+separate from client calls, Raft proposals and local WAL operations. Snapshot
+fields are sampled independently.
+
 ## Production-mTLS Candidate Harness
 
 The private `opc-session-quorum-node` binary now has a default production-mTLS

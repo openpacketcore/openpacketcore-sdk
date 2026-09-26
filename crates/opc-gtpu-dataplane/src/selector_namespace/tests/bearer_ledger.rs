@@ -5,6 +5,13 @@ use crate::testkit::GroupedGtpuDataplaneSimulation;
 use opc_session_store::EncryptingSessionBackend;
 
 mod concurrent_lifecycle;
+mod parent_admission;
+#[cfg(target_os = "linux")]
+mod resident_admission;
+#[cfg(target_os = "linux")]
+mod retained_read_profile;
+#[cfg(target_os = "linux")]
+mod stable_read_profile;
 
 type Protected = EncryptingSessionBackend<SqliteSessionBackend, opc_key::MemoryKeyProvider>;
 
@@ -485,20 +492,24 @@ impl GtpuDataplaneBackend for HeldAcknowledgement {
 
 #[tokio::test]
 async fn unrelated_child_finishes_before_delayed_effect_acknowledgement() {
-    concurrent_child_progress(false, false).await;
+    concurrent_child_progress(false, false, false).await;
 }
 
 #[tokio::test]
 async fn unrelated_child_finishes_while_exact_install_owner_has_not_published_a_stamp() {
-    concurrent_child_progress(true, false).await;
+    concurrent_child_progress(true, false, false).await;
 }
 
 #[tokio::test]
 async fn dropping_one_observer_retains_its_effect_while_an_unrelated_child_finishes() {
-    concurrent_child_progress(true, true).await;
+    concurrent_child_progress(true, true, false).await;
 }
 
-async fn concurrent_child_progress(hold_before_effect: bool, cancel_observer: bool) {
+async fn concurrent_child_progress(
+    hold_before_effect: bool,
+    cancel_observer: bool,
+    active_parent: bool,
+) {
     let lab = lab(3).await;
     let concurrent = lab.authority.concurrent_operations();
     let backend = Arc::new(HeldAcknowledgement {
@@ -510,16 +521,24 @@ async fn concurrent_child_progress(hold_before_effect: bool, cancel_observer: bo
         entered: tokio::sync::Notify::new(),
         release: tokio::sync::Notify::new(),
     });
-    let parent = lab
-        .authority
-        .recover_active(backend.clone(), lab.parent.clone())
-        .await
-        .unwrap();
-    let sibling = lab
-        .authority
-        .recover_active(backend.clone(), lab.sibling.clone())
-        .await
-        .unwrap();
+    let (parent, sibling) = if active_parent {
+        (None, None)
+    } else {
+        (
+            Some(
+                lab.authority
+                    .recover_active(backend.clone(), lab.parent.clone())
+                    .await
+                    .unwrap(),
+            ),
+            Some(
+                lab.authority
+                    .recover_active(backend.clone(), lab.sibling.clone())
+                    .await
+                    .unwrap(),
+            ),
+        )
+    };
     let mut sibling_context = lab.child.entries()[0].context().clone();
     sibling_context.ms_address = lab.sibling.entries()[0].context().ms_address;
     sibling_context.local_teid = Teid::new(0x2001).unwrap();
@@ -534,12 +553,19 @@ async fn concurrent_child_progress(hold_before_effect: bool, cancel_observer: bo
         .unwrap()],
     )
     .unwrap();
-    let mut first = concurrent.reconcile_bearer(
-        backend.clone(),
-        parent,
-        lab.parent.clone(),
-        lab.child.clone(),
-    );
+    let mut first = match parent {
+        Some(parent) => concurrent.reconcile_bearer(
+            backend.clone(),
+            parent,
+            lab.parent.clone(),
+            lab.child.clone(),
+        ),
+        None => concurrent.reconcile_bearer_under_active_parent(
+            backend.clone(),
+            lab.parent.clone(),
+            lab.child.clone(),
+        ),
+    };
     tokio::select! {
         () = backend.entered.notified() => {},
         result = &mut first => panic!("first effect escaped its acknowledgement gate: {result:?}"),
@@ -550,12 +576,19 @@ async fn concurrent_child_progress(hold_before_effect: bool, cancel_observer: bo
     } else {
         Some(first)
     };
-    let mut second = concurrent.reconcile_bearer(
-        backend.clone(),
-        sibling,
-        lab.sibling.clone(),
-        sibling_child.clone(),
-    );
+    let mut second = match sibling {
+        Some(sibling) => concurrent.reconcile_bearer(
+            backend.clone(),
+            sibling,
+            lab.sibling.clone(),
+            sibling_child.clone(),
+        ),
+        None => concurrent.reconcile_bearer_under_active_parent(
+            backend.clone(),
+            lab.sibling.clone(),
+            sibling_child.clone(),
+        ),
+    };
     // A progress oracle, not a latency acceptance threshold. Always settle
     // both detached operations before asserting the failed ordering.
     let progress = tokio::time::timeout(Duration::from_secs(1), &mut second).await;
@@ -568,10 +601,15 @@ async fn concurrent_child_progress(hold_before_effect: bool, cancel_observer: bo
         Ok(result) => result.unwrap(),
         Err(_) => second.await.unwrap(),
     });
-    for group in [lab.parent, lab.sibling, lab.child, sibling_child] {
+    for group in [lab.child, sibling_child, lab.parent, lab.sibling] {
+        let active = lab
+            .authority
+            .recover_active(backend.clone(), group.clone())
+            .await
+            .unwrap();
         drop(
             lab.authority
-                .recover_active(backend.clone(), group)
+                .retire(backend.clone(), active, group)
                 .await
                 .unwrap(),
         );
@@ -634,17 +672,23 @@ async fn selector_profile_step<T>(
 #[cfg(target_os = "linux")]
 #[tokio::test]
 async fn durable_overlapping_bearer_phase_profile() {
-    durable_bearer_phase_profile(false).await;
+    durable_bearer_phase_profile(false, false).await;
 }
 
 #[cfg(target_os = "linux")]
 #[tokio::test]
 async fn durable_concurrent_bearer_phase_profile() {
-    durable_bearer_phase_profile(true).await;
+    durable_bearer_phase_profile(true, false).await;
 }
 
 #[cfg(target_os = "linux")]
-async fn durable_bearer_phase_profile(concurrent: bool) {
+#[tokio::test]
+async fn durable_current_parent_bearer_phase_profile() {
+    durable_bearer_phase_profile(true, true).await;
+}
+
+#[cfg(target_os = "linux")]
+async fn durable_bearer_phase_profile(concurrent: bool, active_parent: bool) {
     use opc_session_testkit::authenticated_consumer_fixture::AuthenticatedPreparedFencedTransitionFixture;
     use std::io::Write;
 
@@ -675,10 +719,11 @@ async fn durable_bearer_phase_profile(concurrent: bool) {
         .unwrap();
     let lab = lab_with_store(SessionStore::new(protected), tenant, 3).await;
     let concurrent_authority = lab.authority.concurrent_operations();
-    let composition = if concurrent {
-        "concurrent"
-    } else {
-        "serialized"
+    let composition = match (concurrent, active_parent) {
+        (true, true) => "concurrent_active_parent",
+        (true, false) => "concurrent",
+        (false, true) => "serialized_active_parent",
+        (false, false) => "serialized",
     };
     let recover = |group| {
         if concurrent {
@@ -687,12 +732,22 @@ async fn durable_bearer_phase_profile(concurrent: bool) {
             lab.authority.recover_active(lab.backend.clone(), group)
         }
     };
-    let create = |claim, parent, child| {
-        if concurrent {
+    let create = |claim, parent, child| match (concurrent, claim) {
+        (true, Some(claim)) => {
             concurrent_authority.reconcile_bearer(lab.backend.clone(), claim, parent, child)
-        } else {
+        }
+        (false, Some(claim)) => {
             lab.authority
                 .reconcile_bearer(lab.backend.clone(), claim, parent, child)
+        }
+        (true, None) => concurrent_authority.reconcile_bearer_under_active_parent(
+            lab.backend.clone(),
+            parent,
+            child,
+        ),
+        (false, None) => {
+            lab.authority
+                .reconcile_bearer_under_active_parent(lab.backend.clone(), parent, child)
         }
     };
     let retire = |claim, group| {
@@ -730,9 +785,14 @@ async fn durable_bearer_phase_profile(concurrent: bool) {
         let create_pair_member = |index: usize| async move {
             let started = Instant::now();
             let parent = parents_ref[index].clone();
-            let claim =
-                selector_profile_step(cycle, index, "parent_recover", recover(parent.clone()))
-                    .await?;
+            let claim = if active_parent {
+                None
+            } else {
+                Some(
+                    selector_profile_step(cycle, index, "parent_recover", recover(parent.clone()))
+                        .await?,
+                )
+            };
             let child = selector_profile_step(
                 cycle,
                 index,

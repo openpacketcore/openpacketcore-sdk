@@ -242,7 +242,8 @@ pub struct AuthenticatedPreparedFencedTransitionFixture {
     general_consumer_counters: Arc<FixtureGeneralConsumerCounters>,
     ordinary_cas_fault: Arc<FixtureOrdinaryCasFault>,
     listeners: Vec<SessionQuorumConsumerServerHandle>,
-    _journal_directory: tempfile::TempDir,
+    journal_directory: tempfile::TempDir,
+    consumer_journal_directories: Mutex<Vec<tempfile::TempDir>>,
     journal_path: PathBuf,
     journal_key: PreparedFencedTransitionJournalKey,
 }
@@ -741,6 +742,22 @@ where
         self.general_backend.clone()
     }
 
+    /// Clone the already-open protected ordinary backend paired with this
+    /// facade. Both retain the same encrypted namespace, activated voter
+    /// authority and recovery journal; this never opens a second journal or
+    /// exports its key, physical clients or prepared transition tokens.
+    ///
+    /// The returned SDK backend can enter protected selector APIs while the
+    /// facade continues to own prepared-fenced transitions. Ordinary mutation
+    /// counters belong to the accounting wrapper from `general_backend`, not
+    /// to operations on this protected clone.
+    #[must_use]
+    pub fn protected_general_backend(
+        &self,
+    ) -> impl opc_session_store::ProtectedSessionBackend + Clone + 'static {
+        self.general_backend.inner.as_ref().clone()
+    }
+
     /// Borrow the initial opaque prepared-fenced facade.
     ///
     /// Use [`Self::into_parts`] when the product test must take ownership of
@@ -1147,7 +1164,8 @@ impl AuthenticatedPreparedFencedTransitionFixture {
             general_consumer_counters,
             ordinary_cas_fault,
             listeners,
-            _journal_directory: journal_directory,
+            journal_directory,
+            consumer_journal_directories: Mutex::new(Vec::new()),
             journal_path,
             journal_key,
         })
@@ -1199,9 +1217,71 @@ impl AuthenticatedPreparedFencedTransitionFixture {
     where
         P: KeyProvider + Send + Sync + 'static + ?Sized,
     {
+        self.local_aead_pair_with_journal(provider, backend_namespace, self.open_journal()?)
+            .await
+    }
+
+    /// Provision one additional consumer with its own retained prepared journal
+    /// against this fixture's existing authenticated three-voter store.
+    ///
+    /// Call once per independent consumer, before its workload begins. Keep the
+    /// returned pair or its reopener for that consumer's complete lifecycle;
+    /// creating another pair is not recovery or permission to discard history.
+    /// All consumers share the same voters, grants and aggregate observations.
+    /// The caller still supplies coherent encryption configuration and distinct
+    /// application ownership scopes. Journal limits and exclusive-open checks
+    /// are unchanged.
+    ///
+    /// The new private directory is retained until fixture shutdown, including
+    /// when activation is cancelled or fails. No path, key, client, prepared
+    /// token or activated roster is exposed. Existing `open_local_aead_pair`
+    /// continues to reopen only the fixture's original journal.
+    pub async fn create_local_aead_pair<P>(
+        &self,
+        provider: Arc<P>,
+        backend_namespace: impl Into<String>,
+    ) -> Result<
+        AuthenticatedPreparedFencedTransitionFixturePair<'_, P>,
+        AuthenticatedPreparedFencedTransitionFixtureError,
+    >
+    where
+        P: KeyProvider + Send + Sync + 'static + ?Sized,
+    {
+        let directory = tempfile::Builder::new()
+            .prefix("consumer-")
+            .tempdir_in(self.journal_directory.path())?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+
+            std::fs::set_permissions(directory.path(), std::fs::Permissions::from_mode(0o700))?;
+        }
+        let journal = Arc::new(PreparedFencedTransitionJournal::create_new(
+            directory.path().join("prepared-fenced.sqlite3"),
+            self.journal_key.clone(),
+        )?);
+        self.consumer_journal_directories
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .push(directory);
+        self.local_aead_pair_with_journal(provider, backend_namespace, journal)
+            .await
+    }
+
+    async fn local_aead_pair_with_journal<P>(
+        &self,
+        provider: Arc<P>,
+        backend_namespace: impl Into<String>,
+        journal: Arc<PreparedFencedTransitionJournal>,
+    ) -> Result<
+        AuthenticatedPreparedFencedTransitionFixturePair<'_, P>,
+        AuthenticatedPreparedFencedTransitionFixtureError,
+    >
+    where
+        P: KeyProvider + Send + Sync + 'static + ?Sized,
+    {
         let backend_namespace: Arc<str> = Arc::from(backend_namespace.into());
         let clients = self.persistent_clients()?;
-        let journal = self.open_journal()?;
         let prepared_fenced_transition_facade = self
             .open_local_aead_from_clients(
                 clients.clone(),
@@ -1459,6 +1539,17 @@ impl AuthenticatedPreparedFencedTransitionFixture {
         }
         #[cfg(not(all(target_os = "linux", feature = "test-control")))]
         Ok(None)
+    }
+
+    /// Observe actual consensus peer round trips on this fixture's shared voters.
+    ///
+    /// Available with `test-control`. Fixed numeric fields contain no endpoint,
+    /// owner, payload or storage identity. Calls include background traffic;
+    /// they are not application-operation or proposal counts. Snapshot fields
+    /// are independently sampled and duration histograms include handler wait.
+    #[cfg(feature = "test-control")]
+    pub fn consensus_rpc_observation(&self) -> serde_json::Value {
+        self.cluster.consensus_rpc_observation()
     }
 
     /// Restart only the private authenticated listener frontends.
@@ -1882,6 +1973,128 @@ mod tests {
         assert_paired_fixture_authority_and_reopen(true).await;
     }
 
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn fixture_multiple_consumers_share_voters_with_separate_retained_journals() {
+        let tenants = [
+            TenantId::new("consumer-fixture-left").expect("synthetic tenant"),
+            TenantId::new("consumer-fixture-right").expect("synthetic tenant"),
+        ];
+        let fixture = AuthenticatedPreparedFencedTransitionFixture::start_fixed_durable(
+            tenants.iter().cloned().map(fixture_scope),
+        )
+        .await
+        .expect("start one authenticated durable three-voter store");
+        let mut parts = Vec::new();
+        let mut protected = Vec::new();
+        for (tenant, namespace) in tenants.iter().zip(["consumer-left", "consumer-right"]) {
+            let pair = fixture
+                .create_local_aead_pair(fixture_provider(tenant.clone()), namespace)
+                .await
+                .expect("provision a distinct consumer before its workload");
+            protected.push(pair.protected_general_backend());
+            parts.push(pair.into_parts());
+        }
+        {
+            let directories = fixture.consumer_journal_directories.lock().unwrap();
+            assert_eq!(directories.len(), 2);
+            for directory in directories.iter() {
+                assert!(
+                    PreparedFencedTransitionJournal::open_existing(
+                        directory.path().join("prepared-fenced.sqlite3"),
+                        fixture.journal_key.clone(),
+                    )
+                    .is_err(),
+                    "each consumer retains exclusive ownership of its exact journal"
+                );
+            }
+        }
+        let ids = [
+            FencedTransitionRequestId::from_bytes([0x41; 16]),
+            FencedTransitionRequestId::from_bytes([0x42; 16]),
+        ];
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(3);
+        let (left, right) = tokio::join!(
+            parts[0].1.prepare_fenced_transition(
+                fixture_request(ids[0], tenants[0].clone()),
+                fixture_budget(deadline),
+            ),
+            parts[1].1.prepare_fenced_transition(
+                fixture_request(ids[1], tenants[1].clone()),
+                fixture_budget(deadline),
+            ),
+        );
+        let mut left = left.expect("prepare first consumer request");
+        let mut right = right.expect("prepare second consumer request");
+        let (left_result, right_result) = tokio::join!(left.execute_once(), right.execute_once());
+        left_result.expect("first overlapping request commits");
+        right_result.expect("second overlapping request commits");
+        assert_eq!(
+            fixture.diagnostics().fenced_transition_calls(),
+            2,
+            "the same voter fleet observes exactly one mutation per consumer"
+        );
+        for index in 0..2 {
+            let record = parts[index]
+                .0
+                .get(&fixture_key(tenants[index].clone()))
+                .await
+                .expect("read the consumer's durable state")
+                .expect("the committed record remains present");
+            assert_eq!(record.generation, Generation::new(1));
+            assert_eq!(
+                protected[index]
+                    .get(&record.key)
+                    .await
+                    .expect("protected clone reads the same exact record"),
+                Some(record),
+            );
+            let foreign_deadline = tokio::time::Instant::now() + Duration::from_secs(3);
+            assert!(
+                parts[index]
+                    .1
+                    .recover_fenced_transition_status(
+                        ids[1 - index],
+                        fixture_budget(foreign_deadline)
+                    )
+                    .await
+                    .expect("check the exact foreign request identity")
+                    .is_none(),
+                "a different consumer's journal cannot grant recovery authority"
+            );
+        }
+        drop(left);
+        drop(right);
+        for (index, (general, facade, reopener)) in parts.into_iter().enumerate() {
+            drop(facade);
+            let reopened = reopener
+                .reopen_prepared_fenced_transition_facade()
+                .await
+                .expect("reopen that consumer's retained journal");
+            let deadline = tokio::time::Instant::now() + Duration::from_secs(3);
+            let mut recovered = reopened
+                .recover_fenced_transition_status(ids[index], fixture_budget(deadline))
+                .await
+                .expect("recover the consumer's exact request")
+                .expect("the original local journal is retained");
+            assert!(matches!(
+                recovered.status_until_terminal(deadline).await.expect("read the exact receipt"),
+                FencedTransitionStatus::Recorded(result) if result.is_ok()
+            ));
+            drop(recovered);
+            drop(reopened);
+            drop(reopener);
+            drop(general);
+        }
+        assert_eq!(fixture.diagnostics().fenced_transition_calls(), 2);
+        assert_eq!(fixture.diagnostics().general_mutation_calls(), 0);
+        assert_eq!(fixture.diagnostics().general_compare_and_set_calls(), 0);
+        drop(protected);
+        fixture
+            .shutdown()
+            .await
+            .expect("shut down the shared store");
+    }
+
     async fn assert_paired_fixture_authority_and_reopen(lose_response: bool) {
         let tenant = fixture_tenant();
         let provider = fixture_provider(tenant.clone());
@@ -1896,6 +2109,14 @@ mod tests {
         assert_session_store_backend::<
             AuthenticatedPreparedFencedTransitionFixtureGeneralBackend<MemoryKeyProvider>,
         >();
+        let protected = pair.protected_general_backend();
+        assert!(
+            fixture
+                .open_protected_local_aead(Arc::clone(&provider), "fixture-paired-authority")
+                .await
+                .is_err(),
+            "a second journal open remains forbidden while paired authority is live"
+        );
         let (general, facade, reopener) = pair.into_parts();
         let request_id = FencedTransitionRequestId::from_bytes([0x30; 16]);
         let deadline = tokio::time::Instant::now() + Duration::from_secs(3);
@@ -1956,6 +2177,13 @@ mod tests {
             .expect("the opaque facade committed the authoritative record");
         assert_eq!(record.generation, Generation::new(1));
         assert_eq!(
+            protected
+                .get(&record.key)
+                .await
+                .expect("protected clone observes the paired authenticated authority"),
+            Some(record.clone()),
+        );
+        assert_eq!(
             general
                 .fenced_transition_capability()
                 .await
@@ -1989,10 +2217,18 @@ mod tests {
             "recovery on the fresh facade never replays the original mutation"
         );
 
+        assert_eq!(
+            protected
+                .get(&record.key)
+                .await
+                .expect("protected clone remains on the same journal after facade recovery"),
+            Some(record),
+        );
         drop(recovered);
         drop(reopened);
         drop(reopener);
         drop(general);
+        drop(protected);
         fixture.shutdown().await.expect("shut down fixture");
     }
 
