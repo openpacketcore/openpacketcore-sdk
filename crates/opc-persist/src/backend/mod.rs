@@ -202,6 +202,9 @@ pub struct SqliteBackend {
     /// Monotonic refusal fence shared by every clone. Once consensus is claimed,
     /// losing its tables cannot re-enable standalone reads or local mutation.
     config_consensus_history_required: Arc<AtomicBool>,
+    /// Independently admitted authority, shared by clones and never selected
+    /// from mutable history or identity rows during a read.
+    config_consensus_identity: Arc<std::sync::OnceLock<opc_consensus::ConsensusIdentity>>,
     /// Cached preflight result (populated after first successful preflight).
     cached_caps: std::sync::OnceLock<PersistCapabilities>,
     /// Exact retained scope, absent only on the existing create-or-open API.
@@ -273,6 +276,9 @@ impl SqliteBackend {
     ///
     /// Production callers must use this constructor so audit-trail rows are
     /// sealed with deployment-owned key material rather than a development key.
+    /// A reopened legacy consensus database refuses history reads until
+    /// [`crate::ConsensusConfigStore::open`] independently admits its topology.
+    /// Explicitly retained authorities require the retained lifecycle APIs.
     pub async fn open_with_audit_key(
         path: impl Into<PathBuf>,
         ephemeral: bool,
@@ -319,9 +325,20 @@ impl SqliteBackend {
         self.config_consensus_worker_gate.clone()
     }
 
-    pub(crate) fn require_config_consensus_history(&self) {
+    pub(crate) fn config_consensus_identity(&self) -> Option<opc_consensus::ConsensusIdentity> {
+        self.config_consensus_identity.get().copied()
+    }
+
+    pub(crate) fn require_config_consensus_history(
+        &self,
+        identity: opc_consensus::ConsensusIdentity,
+    ) -> Result<(), crate::consensus::ConfigConsensusStorageError> {
+        if *self.config_consensus_identity.get_or_init(|| identity) != identity {
+            return Err(crate::consensus::ConfigConsensusStorageError::InvalidIdentity);
+        }
         self.config_consensus_history_required
             .store(true, Ordering::Release);
+        Ok(())
     }
 
     pub(crate) const fn is_ephemeral(&self) -> bool {
@@ -398,6 +415,7 @@ impl SqliteBackend {
             management_audit_keys: Arc::new(std::sync::OnceLock::new()),
             management_audit_data_version: Arc::new(AtomicU64::new(0)),
             config_consensus_history_required: Arc::new(AtomicBool::new(consensus_required)),
+            config_consensus_identity: Arc::new(std::sync::OnceLock::new()),
             cached_caps: std::sync::OnceLock::new(),
             retained_binding: None,
             retained_repair_only: false,
@@ -438,6 +456,9 @@ impl SqliteBackend {
             management_audit_keys: Arc::new(std::sync::OnceLock::new()),
             management_audit_data_version: Arc::new(AtomicU64::new(0)),
             config_consensus_history_required: Arc::new(AtomicBool::new(true)),
+            config_consensus_identity: Arc::new(std::sync::OnceLock::from(
+                binding.topology().identity(),
+            )),
             cached_caps: std::sync::OnceLock::new(),
             retained_binding: Some(binding),
             retained_repair_only: repair_only,

@@ -154,13 +154,16 @@ pub struct StoredConfig {
 /// A config commit bound to one successful outer-adapter AEAD encryption.
 ///
 /// The one-shot encryption claim is consumed by [`Self::try_new`] and is not
-/// retained or serialized. Consensus therefore receives only ciphertext and
-/// deterministic metadata, while unauthenticated raw bytes cannot enter its
-/// proposal API.
+/// retained or serialized. Optional SDK-validated capacity evidence is retained
+/// together with its process-local preparation reservation after the exact
+/// ciphertext/digest checks. Consensus commands receive only ciphertext and
+/// deterministic metadata; preparation ownership stays with the submission.
 pub struct AttestedConfigCommit {
     record: CommitRecord,
     audit: Vec<AuditRecord>,
     confirmed_resolution: Option<ConfirmedCommitResolution>,
+    capacity_evidence: Option<opc_crypto::ConfigCapacityEvidence>,
+    preparation: Option<opc_crypto::ConfigPreparationReservation>,
 }
 
 impl AttestedConfigCommit {
@@ -174,10 +177,13 @@ impl AttestedConfigCommit {
         {
             return Err(PersistError::corrupt_blob());
         }
+        let (capacity_evidence, preparation) = claim.into_capacity_parts();
         Ok(Self {
             record,
             audit,
             confirmed_resolution: None,
+            capacity_evidence,
+            preparation,
         })
     }
 
@@ -202,11 +208,40 @@ impl AttestedConfigCommit {
         {
             return Err(PersistError::corrupt_blob());
         }
+        let (capacity_evidence, preparation) = claim.into_capacity_parts();
         Ok(Self {
             record,
             audit,
             confirmed_resolution: Some(resolution),
+            capacity_evidence,
+            preparation,
         })
+    }
+
+    pub(crate) const fn capacity_evidence(&self) -> Option<opc_crypto::ConfigCapacityEvidence> {
+        self.capacity_evidence
+    }
+
+    pub(crate) fn preparation(&self) -> Option<&opc_crypto::ConfigPreparationReservation> {
+        self.preparation.as_ref()
+    }
+
+    pub(crate) fn into_capacity_parts(
+        self,
+    ) -> (
+        CommitRecord,
+        Vec<AuditRecord>,
+        Option<ConfirmedCommitResolution>,
+        Option<opc_crypto::ConfigCapacityEvidence>,
+        Option<opc_crypto::ConfigPreparationReservation>,
+    ) {
+        (
+            self.record,
+            self.audit,
+            self.confirmed_resolution,
+            self.capacity_evidence,
+            self.preparation,
+        )
     }
 
     pub(crate) fn into_parts(
@@ -728,6 +763,13 @@ struct ConfigPrincipalMetadata {
     rollback_label: Option<String>,
 }
 
+#[path = "consensus/config_capacity_principal_value.rs"]
+mod config_principal_value;
+
+#[cfg(test)]
+#[path = "consensus/config_capacity_principal_working_tests.rs"]
+mod config_capacity_principal_working_tests;
+
 #[derive(Debug, Default)]
 struct ConfigPrincipalMetadataProbe {
     is_object: bool,
@@ -775,7 +817,11 @@ impl<'de> Deserialize<'de> for ConfigPrincipalMetadataProbe {
                                 probe.duplicate_reserved_field = true;
                             }
                             probe.saw_principal = true;
-                            let value = map.next_value::<serde_json::Value>()?;
+                            let value = map.next_value_seed(
+                                config_principal_value::PrincipalValueSeed::retained(),
+                            )?;
+                            #[cfg(test)]
+                            config_capacity_principal_working_tests::observe_reserved_value(&value);
                             match value {
                                 serde_json::Value::String(principal) => {
                                     probe.principal = Some(principal);
@@ -789,7 +835,11 @@ impl<'de> Deserialize<'de> for ConfigPrincipalMetadataProbe {
                                 probe.duplicate_reserved_field = true;
                             }
                             probe.saw_replay_lookup_digest = true;
-                            let value = map.next_value::<serde_json::Value>()?;
+                            let value = map.next_value_seed(
+                                config_principal_value::PrincipalValueSeed::retained(),
+                            )?;
+                            #[cfg(test)]
+                            config_capacity_principal_working_tests::observe_reserved_value(&value);
                             match value {
                                 serde_json::Value::Null => probe.replay_lookup_digest = None,
                                 serde_json::Value::String(digest) => {
@@ -804,7 +854,11 @@ impl<'de> Deserialize<'de> for ConfigPrincipalMetadataProbe {
                                 probe.duplicate_reserved_field = true;
                             }
                             probe.saw_recovery_required = true;
-                            let value = map.next_value::<serde_json::Value>()?;
+                            let value = map.next_value_seed(
+                                config_principal_value::PrincipalValueSeed::retained(),
+                            )?;
+                            #[cfg(test)]
+                            config_capacity_principal_working_tests::observe_reserved_value(&value);
                             match value {
                                 serde_json::Value::Bool(required) => {
                                     probe.recovery_required = Some(required);
@@ -818,7 +872,11 @@ impl<'de> Deserialize<'de> for ConfigPrincipalMetadataProbe {
                                 probe.duplicate_reserved_field = true;
                             }
                             probe.saw_rollback_label = true;
-                            let value = map.next_value::<serde_json::Value>()?;
+                            let value = map.next_value_seed(
+                                config_principal_value::PrincipalValueSeed::retained(),
+                            )?;
+                            #[cfg(test)]
+                            config_capacity_principal_working_tests::observe_reserved_value(&value);
                             match value {
                                 serde_json::Value::Null => probe.rollback_label = None,
                                 serde_json::Value::String(label) => {
@@ -990,9 +1048,11 @@ pub(crate) fn validate_rollback_label(label: &str) -> Result<(), PersistError> {
 pub fn extract_tenant(principal: &str) -> String {
     let wrapped = wrapped_config_principal(principal);
     let principal = wrapped.as_deref().unwrap_or(principal);
-    if let Some(tenant) = serde_json::from_str::<serde_json::Value>(principal)
+    if let Some(tenant) = config_principal_value::tenant_projection(principal)
         .ok()
         .and_then(|principal| {
+            #[cfg(test)]
+            config_capacity_principal_working_tests::tenant::observe_value(&principal);
             principal
                 .get("tenant")
                 .and_then(|value| value.as_str())

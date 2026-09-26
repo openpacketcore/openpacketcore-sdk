@@ -1190,6 +1190,8 @@ version = "0.2.0"
 dependencies = [
  "opc-key",
  "rand 0.10.2",
+ "serde",
+ "serde_json",
  "sha2",
  "thiserror 2.0.20",
 ]
@@ -1443,8 +1445,8 @@ dependencies = [
 
 [[package]]
 name = "openraft"
-version = "0.9.24"
-source = "git+https://github.com/openpacketcore/openraft?rev=702ff263d2122820e09d35abd53518b01c85823a#702ff263d2122820e09d35abd53518b01c85823a"
+version = "0.9.25"
+source = "git+https://github.com/openpacketcore/openraft?rev=7104baa5d31a45bd37bc104425ee4e7c3be5b9b5#7104baa5d31a45bd37bc104425ee4e7c3be5b9b5"
 dependencies = [
  "anyerror",
  "byte-unit",
@@ -1465,8 +1467,8 @@ dependencies = [
 
 [[package]]
 name = "openraft-macros"
-version = "0.9.24"
-source = "git+https://github.com/openpacketcore/openraft?rev=702ff263d2122820e09d35abd53518b01c85823a#702ff263d2122820e09d35abd53518b01c85823a"
+version = "0.9.25"
+source = "git+https://github.com/openpacketcore/openraft?rev=7104baa5d31a45bd37bc104425ee4e7c3be5b9b5#7104baa5d31a45bd37bc104425ee4e7c3be5b9b5"
 dependencies = [
  "chrono",
  "proc-macro2",
