@@ -3133,7 +3133,17 @@ fn apply_audited_mutation_sync(
     #[cfg(test)]
     let observed_ledger =
         super::config_capacity_simultaneous_working_tests::ledger::held(&ledger, prepared);
-    validate_sealed_state_for_profile_sync(conn, identity, key, capacity_profile, cancellation)?;
+    // The ledger above has already passed row authentication, full ledger
+    // validation, exact identity and continuity checks in this SQL transaction.
+    // Validate the remaining sealed state without decoding a second ledger
+    // while the original must remain live for the atomic outcome below.
+    validate_sealed_configuration_for_profile_sync(
+        conn,
+        identity,
+        key,
+        capacity_profile,
+        cancellation,
+    )?;
     #[cfg(test)]
     drop(observed_ledger);
     let current_version: u64 = conn
@@ -3581,6 +3591,26 @@ fn validate_sealed_state_for_profile_sync(
     capacity_profile: ConfigCapacityProfile,
     cancellation: &SqliteWorkCancellation,
 ) -> io::Result<()> {
+    super::audit::validate_sync(conn, audit_key)?;
+    validate_sealed_configuration_for_profile_sync(
+        conn,
+        identity,
+        audit_key,
+        capacity_profile,
+        cancellation,
+    )
+}
+
+// Configuration history and outcomes are authenticated separately from the
+// management ledger. An audited mutation reuses its already verified ledger;
+// every other caller uses the complete sealed-state validator above.
+fn validate_sealed_configuration_for_profile_sync(
+    conn: &Connection,
+    identity: ConsensusIdentity,
+    audit_key: &AuditKey,
+    capacity_profile: ConfigCapacityProfile,
+    cancellation: &SqliteWorkCancellation,
+) -> io::Result<()> {
     let consensus_required = super::history::has_consensus_metadata_sync(conn)?;
     super::history::validate_access_for_profile_sync(
         conn,
@@ -3590,7 +3620,6 @@ fn validate_sealed_state_for_profile_sync(
         capacity_profile,
         cancellation,
     )?;
-    super::audit::validate_sync(conn, audit_key)?;
     validate_history_chain_cancellable_sync(conn, cancellation)?;
     let mut statement = conn
         .prepare(
