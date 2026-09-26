@@ -131,18 +131,41 @@ async fn exact_readback(
     plaintext: &[u8],
 ) {
     for store in stores {
-        let read = store
-            .load_latest()
-            .await
-            .expect("original native read barrier")
-            .expect("native head");
-        assert!(read.record == *expected, "complete original record");
-        assert_decrypted(&read.record, aad, plaintext);
-        let status = store.status();
-        assert_eq!(
-            status.applied_index, status.committed_index,
-            "apply original positive control before baselines"
-        );
+        // The record can already be applied while the engine's metrics watch
+        // still reports the preceding apply notification. Establish a settled
+        // observation before hashing the authority baseline. The existing
+        // operation budget covers both the original read and this observation.
+        tokio::time::timeout(DURABLE_CONSENSUS_OPERATION_TIMEOUT, async {
+            let read = store
+                .load_latest()
+                .await
+                .expect("original native read barrier")
+                .expect("native head");
+            assert!(read.record == *expected, "complete original record");
+            assert_decrypted(&read.record, aad, plaintext);
+            let first = store.status();
+            let settled = loop {
+                let status = store.status();
+                if status.applied_index == status.committed_index {
+                    break status;
+                }
+                tokio::task::yield_now().await;
+            };
+            assert_eq!(
+                settled.applied_index, settled.committed_index,
+                "apply original positive control before baselines"
+            );
+            println!(
+                "CONFIG_CAPACITY_RESPONSE_FRONTIER member={} initial_applied={:?} initial_committed={:?} settled_applied={:?} settled_committed={:?} exact_record=true",
+                settled.node_id,
+                first.applied_index,
+                first.committed_index,
+                settled.applied_index,
+                settled.committed_index,
+            );
+        })
+        .await
+        .expect("native read and settled apply fit the original operation budget");
     }
 }
 
