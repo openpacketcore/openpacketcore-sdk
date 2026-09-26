@@ -15,6 +15,8 @@ mod config_capacity_attestation_tests;
 mod config_capacity_review_tests;
 #[cfg(test)]
 mod config_capacity_rpc_tests;
+#[cfg(all(test, target_os = "linux"))]
+pub(super) use tests::config_capacity_cost_tests::observation as config_capacity_cost_observation;
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
@@ -1616,6 +1618,9 @@ impl ConsensusConfigStore {
             logical_time: self.inner.clock.now_utc(),
             intent: request.intent,
         };
+        // This observation spans only synchronous finalized-command admission.
+        #[cfg(all(test, target_os = "linux"))]
+        let cost_scope = config_capacity_cost_observation::Scope::finalized(command.request_id);
         if command
             .validate_for_profile(
                 self.inner.identity,
@@ -1626,9 +1631,15 @@ impl ConsensusConfigStore {
         {
             return ForwardMutationReply::Rejected(ForwardMutationRejection::InvalidCommand);
         }
-        if !config_command_fits_replication_budget(&command, self.capacity_profile()) {
+        // The successful BoundedV1 validation above already ran this exact
+        // immutable command's complete encoding preflight.
+        if self.capacity_profile() != opc_crypto::ConfigCapacityProfile::BoundedV1
+            && !config_command_fits_replication_budget(&command, self.capacity_profile())
+        {
             return ForwardMutationReply::Rejected(ForwardMutationRejection::CommandTooLarge);
         }
+        #[cfg(all(test, target_os = "linux"))]
+        drop(cost_scope);
         #[cfg(all(test, target_os = "linux"))]
         let proposal_test_guard = {
             let hook = self
@@ -2089,7 +2100,12 @@ fn preflight_config_command_replication_budget(
         intent,
     };
     if profile == opc_crypto::ConfigCapacityProfile::BoundedV1 {
-        return config_capacity_admission::preflight(&probe, profile).map(|_| ());
+        #[cfg(all(test, target_os = "linux"))]
+        config_capacity_cost_observation::preflight_started();
+        return config_capacity_admission::preflight(&probe, profile).map(|_| {
+            #[cfg(all(test, target_os = "linux"))]
+            config_capacity_cost_observation::preflight_succeeded();
+        });
     }
     match config_command_encoded_size(&probe) {
         Ok(bytes)
@@ -2442,6 +2458,8 @@ impl ConfigStore for ConsensusConfigStore {
 mod tests {
     #[cfg(target_os = "linux")]
     pub(super) mod config_capacity_accepted_tests;
+    #[cfg(target_os = "linux")]
+    pub(super) mod config_capacity_cost_tests;
     mod config_capacity_encoding_tests;
     mod config_capacity_metadata_tests;
     #[cfg(target_os = "linux")]

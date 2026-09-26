@@ -1497,6 +1497,8 @@ fn json_length_bounded_cancellable<T: Serialize + ?Sized>(
         return Err(invalid_data(limit_message));
     }
     encoded.map_err(|_| invalid_data("config consensus encoding failed"))?;
+    #[cfg(all(test, target_os = "linux"))]
+    super::store::config_capacity_cost_observation::json_counted(writer.written);
     Ok(writer.written)
 }
 
@@ -1511,6 +1513,8 @@ fn encode_json_bounded_cancellable<T: Serialize + ?Sized>(
     output
         .try_reserve_exact(expected)
         .map_err(|_| io::Error::other("config consensus encoding allocation failed"))?;
+    #[cfg(all(test, target_os = "linux"))]
+    super::store::config_capacity_cost_observation::json_output_allocated(output.capacity());
     let mut writer = BoundedJsonWriter {
         bytes: Some(output),
         written: 0,
@@ -2357,6 +2361,8 @@ pub(crate) fn append_logs_cancellable_sync(
     let mut encoded_entries = Vec::with_capacity(entries.len());
     let mut encoded_bytes = 0_usize;
     for entry in entries {
+        #[cfg(all(test, target_os = "linux"))]
+        let _cost_scope = super::store::config_capacity_cost_observation::Scope::append(entry);
         cancellation.check_io()?;
         validate_entry(entry, identity, expected_members)?;
         let remaining = CONFIG_CONSENSUS_LOG_APPEND_MAX_BYTES
@@ -3221,6 +3227,8 @@ pub(crate) fn apply_entries_cancellable_sync(
     super::storage::config_capacity_apply_observations::observe("capacity_validated");
     let mut encoded_bytes = 0_usize;
     for entry in &entries {
+        #[cfg(all(test, target_os = "linux"))]
+        let _cost_scope = super::store::config_capacity_cost_observation::Scope::apply(entry);
         cancellation.check_io()?;
         validate_entry(entry, identity, expected_members)?;
         let remaining = CONFIG_CONSENSUS_LOG_APPEND_MAX_BYTES
@@ -3232,10 +3240,10 @@ pub(crate) fn apply_entries_cancellable_sync(
         } else {
             "config consensus apply entry exceeds storage limit"
         };
-        let encoded =
-            encode_json_bounded_cancellable(entry, entry_budget, limit_message, cancellation)?;
+        let encoded_len =
+            json_length_bounded_cancellable(entry, entry_budget, limit_message, cancellation)?;
         encoded_bytes = encoded_bytes
-            .checked_add(encoded.len())
+            .checked_add(encoded_len)
             .ok_or_else(|| invalid_data("config consensus apply byte count overflow"))?;
     }
     #[cfg(test)]
