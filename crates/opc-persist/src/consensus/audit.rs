@@ -230,6 +230,11 @@ pub(crate) fn write_sync(
 ) -> io::Result<()> {
     let stored = StoredLedger { identity, ledger };
     let (encoded, mac) = encode_state(&stored, key)?;
+    #[cfg(test)]
+    let _observed_write = super::config_capacity_simultaneous_working_tests::ledger::write(
+        &encoded,
+        stored.ledger.as_ref(),
+    );
     let statement = if initialize {
         "INSERT INTO config_raft_management_audit(singleton,state_json,state_hmac) VALUES(1,?1,?2)"
     } else {

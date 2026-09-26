@@ -17,6 +17,8 @@ const READ: usize = 1;
 const DECODED: usize = 2;
 const DERIVED: usize = 3;
 const AUTH: usize = 4;
+const APPLY: usize = 5;
+const WRITE: usize = 6;
 
 #[derive(Clone, Copy, Debug, Default)]
 pub(crate) struct Sample {
@@ -26,6 +28,7 @@ pub(crate) struct Sample {
     pub(crate) recovery: usize,
     pub(crate) held_ledger: usize,
     pub(crate) row_json: usize,
+    pub(crate) write_json: usize,
     pub(crate) decoded_ledger: usize,
     pub(crate) derived: usize,
     pub(crate) authentication: usize,
@@ -35,8 +38,10 @@ pub(crate) struct Sample {
 #[derive(Clone, Copy, Debug, Default)]
 pub(crate) struct Observation {
     base: Sample,
-    owners: [usize; 5],
+    owners: [usize; 7],
     pub(crate) reads: usize,
+    pub(crate) apply_reads: usize,
+    pub(crate) writes: usize,
     pub(crate) nested_reads: usize,
     pub(crate) derived_len: usize,
     pub(crate) derived_capacity: usize,
@@ -50,16 +55,12 @@ thread_local! {
 
 fn sample(observation: &mut Observation) {
     let mut current = Sample {
-        // The decoded page is measured before its move into apply. Charge it
-        // only while the actual nested call borrows that command and ledger;
-        // this never extends the observation beyond the moved entry's drop.
-        apply_page: if observation.owners[HELD] != 0 {
-            observation.base.apply_page
-        } else {
-            0
-        },
+        // The guard borrows the actual decoded command through its apply and
+        // retained receipt read, ending before that moved entry is dropped.
+        apply_page: observation.owners[APPLY],
         held_ledger: observation.owners[HELD],
         row_json: observation.owners[READ],
+        write_json: observation.owners[WRITE],
         decoded_ledger: observation.owners[DECODED],
         derived: observation.owners[DERIVED],
         authentication: observation.owners[AUTH],
@@ -72,6 +73,7 @@ fn sample(observation: &mut Observation) {
         current.recovery,
         current.held_ledger,
         current.row_json,
+        current.write_json,
         current.decoded_ledger,
         current.derived,
         current.authentication,
@@ -125,7 +127,11 @@ fn owner<'a>(category: usize, bytes: impl FnOnce() -> usize) -> OwnerGuard<'a> {
         observation.owners[category] = bytes();
         if category == READ {
             observation.reads += 1;
+            observation.apply_reads += usize::from(observation.owners[APPLY] != 0);
             observation.nested_reads += usize::from(observation.owners[HELD] != 0);
+        }
+        if category == WRITE {
+            observation.writes += 1;
         }
         sample(&mut observation);
         slot.set(Some(observation));
@@ -158,6 +164,12 @@ pub(crate) fn held<'a>(
     owner(HELD, || ledger_heap(ledger))
 }
 
+pub(crate) fn applying(_command: &AuditedConfigCommand) -> OwnerGuard<'_> {
+    owner(APPLY, || {
+        OBSERVATION.with(|slot| slot.get().expect("active observation").base.apply_page)
+    })
+}
+
 pub(crate) struct ReadGuard<'a> {
     _encoded: OwnerGuard<'a>,
     _ledger: OwnerGuard<'a>,
@@ -166,6 +178,13 @@ pub(crate) struct ReadGuard<'a> {
 pub(crate) fn read<'a>(encoded: &'a Vec<u8>, ledger: Option<&'a LedgerState>) -> ReadGuard<'a> {
     ReadGuard {
         _encoded: owner(READ, || encoded.capacity()),
+        _ledger: owner(DECODED, || ledger.map_or(0, ledger_heap)),
+    }
+}
+
+pub(crate) fn write<'a>(encoded: &'a Vec<u8>, ledger: Option<&'a LedgerState>) -> ReadGuard<'a> {
+    ReadGuard {
+        _encoded: owner(WRITE, || encoded.capacity()),
         _ledger: owner(DECODED, || ledger.map_or(0, ledger_heap)),
     }
 }
@@ -220,7 +239,7 @@ impl ObservationGuard {
     pub(crate) fn finish(self) -> Observation {
         OBSERVATION.with(|slot| {
             let observation = slot.take().expect("active observation");
-            assert_eq!(observation.owners, [0; 5], "all observed scopes have ended");
+            assert_eq!(observation.owners, [0; 7], "all observed scopes have ended");
             observation
         })
     }
