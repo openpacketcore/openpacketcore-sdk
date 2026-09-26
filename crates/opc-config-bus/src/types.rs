@@ -369,6 +369,8 @@ pub struct CommitAuditContext {
     request_id: RequestId,
     transport: TransportType,
     operation: ConfigOperation,
+    #[cfg(feature = "required-netconf-audit")]
+    ordinary_commit: bool,
 }
 
 impl CommitAuditContext {
@@ -378,6 +380,8 @@ impl CommitAuditContext {
                 request_id,
                 transport: fingerprint.transport,
                 operation: fingerprint.operation,
+                #[cfg(feature = "required-netconf-audit")]
+                ordinary_commit: matches!(fingerprint.mode, StoredRequestMode::Commit),
             }),
             (None, None)
                 if matches!(
@@ -393,6 +397,8 @@ impl CommitAuditContext {
                     } else {
                         ConfigOperation::Replace
                     },
+                    #[cfg(feature = "required-netconf-audit")]
+                    ordinary_commit: false,
                 })
             }
             _ => None,
@@ -497,6 +503,68 @@ impl<C: OpcConfig> CommitWrite<C> {
     /// never infer a request identity or transport from its source enum.
     pub fn audit_context(&self) -> Option<&CommitAuditContext> {
         self.audit_context.as_ref()
+    }
+
+    /// Check the authenticated request association for preparation of an
+    /// ordinary retained Running replacement. The encrypting wrapper calls
+    /// this before provider access; the sealed adapter repeats it before
+    /// consuming the fresh AEAD claim. The private context survives encryption
+    /// but is never serialized as an independent source of authority.
+    ///
+    /// Descriptor projection applies only to the audit event. Envelope AAD is
+    /// compared using the existing typed record builder, not an audit descriptor
+    /// or a second persisted-metadata codec. This grants no session, admission,
+    /// model-validation or NACM authority.
+    #[cfg(feature = "required-netconf-audit")]
+    pub fn validate_netconf_running_preparation(
+        &self,
+        authenticated: &TrustedPrincipal,
+        intent: &opc_mgmt_audit::AuditEvent,
+    ) -> Result<(), StoreError> {
+        let mismatch = || StoreError::unavailable("NETCONF Running request binding mismatch");
+        let context = self.audit_context().ok_or_else(mismatch)?;
+        let record = self.record();
+        let operation = match context.operation() {
+            ConfigOperation::Replace => opc_mgmt_audit::AuditOperation::Replace,
+            ConfigOperation::Patch => opc_mgmt_audit::AuditOperation::Update,
+            ConfigOperation::Delete => opc_mgmt_audit::AuditOperation::Delete,
+            ConfigOperation::Rollback => return Err(mismatch()),
+        };
+        if &record.principal != authenticated
+            || record.source != RequestSource::Northbound
+            || record.schema_digest != record.config.schema_digest()
+            || record.confirmed_deadline.is_some()
+            || self.confirmed_resolution().is_some()
+            || !context.ordinary_commit
+            || !matches!(
+                context.transport(),
+                TransportType::NetconfSsh | TransportType::NetconfTls
+            )
+            || intent.request_id != context.request_id()
+            || intent.transport != context.transport()
+            || intent.operation != operation
+            || intent.outcome != opc_mgmt_audit::AuditOutcome::Intent
+            || intent.tenant != authenticated.tenant.as_str()
+            || intent.principal != opc_mgmt_audit::principal_descriptor(authenticated)
+            || intent
+                .tx_id
+                .as_ref()
+                .is_some_and(|tx| tx.as_str() != record.tx_id.to_string())
+        {
+            return Err(mismatch());
+        }
+        if !record.encrypted_blob.is_empty() {
+            let envelope = opc_crypto::CryptoEnvelopeRef::decode(&record.encrypted_blob)
+                .map_err(|_| StoreError::crypto("invalid NETCONF Running envelope"))?;
+            let (aad, _) = opc_key::decode_bound_aad(envelope.aad)
+                .map_err(|_| StoreError::crypto("invalid NETCONF Running envelope AAD"))?;
+            if aad != crate::datastore::build_config_envelope_aad(record, "running", None)? {
+                return Err(StoreError::crypto(
+                    "NETCONF Running envelope binding mismatch",
+                ));
+            }
+        }
+        Ok(())
     }
 
     pub(crate) fn with_audit_context(mut self, context: Option<CommitAuditContext>) -> Self {

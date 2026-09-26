@@ -92,6 +92,28 @@ pub trait ManagedDatastore<C: OpcConfig>: Send + Sync {
         None
     }
 
+    /// Prepare one ordinary Running envelope for the retained NETCONF worker.
+    /// The authenticated principal is supplied independently of the write and
+    /// audit event. Implementations must bind all three before provider access.
+    /// This consumes fresh encryption evidence but never admits an Intent,
+    /// appends history, or completes audit. The result grants no session, NACM
+    /// or writable-profile authority; the original SDK session/base still must
+    /// authorize preparation and admission. Retain the original after admission
+    /// instead of encrypting again for effect submission or recovery.
+    ///
+    /// The default refuses without calling any append method.
+    #[cfg(feature = "required-netconf-audit")]
+    async fn prepare_netconf_running_commit(
+        &self,
+        _commit: CommitWrite<C>,
+        _authenticated: &opc_config_model::TrustedPrincipal,
+        _intent: &opc_mgmt_audit::AuditEvent,
+    ) -> Result<opc_persist::AttestedConfigCommit, StoreError> {
+        Err(StoreError::unavailable(
+            "NETCONF Running preparation is unsupported",
+        ))
+    }
+
     /// Admit one intent bound to this exact write before atomically applying it.
     /// Preserve the protocol request/caller/transport/operation, complete effect,
     /// fixed expiry and authoritative terminal recovery. Unknown persistence
@@ -294,6 +316,18 @@ where
     #[cfg(feature = "required-netconf-audit")]
     fn required_netconf_audit_store(&self) -> Option<crate::NetconfAuditStore> {
         (**self).required_netconf_audit_store()
+    }
+
+    #[cfg(feature = "required-netconf-audit")]
+    async fn prepare_netconf_running_commit(
+        &self,
+        commit: CommitWrite<C>,
+        authenticated: &opc_config_model::TrustedPrincipal,
+        intent: &opc_mgmt_audit::AuditEvent,
+    ) -> Result<opc_persist::AttestedConfigCommit, StoreError> {
+        (**self)
+            .prepare_netconf_running_commit(commit, authenticated, intent)
+            .await
     }
 
     async fn append_required_audit_commit(
@@ -620,6 +654,33 @@ where
         self.netconf.clone()
     }
 
+    #[cfg(feature = "required-netconf-audit")]
+    async fn prepare_netconf_running_commit(
+        &self,
+        commit: CommitWrite<C>,
+        authenticated: &opc_config_model::TrustedPrincipal,
+        intent: &opc_mgmt_audit::AuditEvent,
+    ) -> Result<opc_persist::AttestedConfigCommit, StoreError> {
+        let port = self
+            .netconf
+            .as_ref()
+            .ok_or_else(|| StoreError::unavailable("NETCONF Running preparation is unsupported"))?;
+        if self.store_kind() != CONFIG_STORE_KIND
+            || !commit.record().encrypted_blob.is_empty()
+            || commit.record().plaintext_digest.is_some()
+        {
+            return Err(StoreError::unavailable(
+                "NETCONF Running preparation requires a fresh Running write",
+            ));
+        }
+        commit.validate_netconf_running_preparation(authenticated, intent)?;
+        port.verify_current().await?;
+        let sealed = self.encrypt_write(commit).await?;
+        self.inner
+            .prepare_netconf_running_commit(sealed, authenticated, intent)
+            .await
+    }
+
     async fn append_required_audit_commit(
         &self,
         commit: CommitWrite<C>,
@@ -756,7 +817,7 @@ where
 {
 }
 
-fn build_config_envelope_aad<C: OpcConfig>(
+pub(crate) fn build_config_envelope_aad<C: OpcConfig>(
     record: &StoredConfig<C>,
     store_kind: &str,
     persisted_principal: Option<&str>,

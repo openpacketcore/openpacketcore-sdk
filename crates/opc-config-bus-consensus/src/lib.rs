@@ -430,6 +430,13 @@ where
 fn attested_bus_commit<C: OpcConfig>(
     commit: BusCommitWrite<SealedConfig<C>>,
 ) -> Result<AttestedConfigCommit, StoreError> {
+    attested_bus_commit_with_source(commit, None)
+}
+
+fn attested_bus_commit_with_source<C: OpcConfig>(
+    commit: BusCommitWrite<SealedConfig<C>>,
+    source: Option<CommitSource>,
+) -> Result<AttestedConfigCommit, StoreError> {
     let (commit, resolution) = commit.into_parts();
     validate_replay_lookup_digest(commit.idempotency_key.as_ref())?;
     validate_rollback_label(commit.rollback_label.as_deref())?;
@@ -450,11 +457,11 @@ fn attested_bus_commit<C: OpcConfig>(
         rollback_label: commit.rollback_label.clone(),
     })
     .map_err(|_| StoreError::internal("sealed config metadata serialization failed"))?;
-    let source = match commit.source {
+    let source = source.unwrap_or(match commit.source {
         RequestSource::Northbound => CommitSource::Gnmi,
         RequestSource::StartupRecovery => CommitSource::StartupRestore,
         _ => CommitSource::LocalOperator,
-    };
+    });
     let record = CommitRecord {
         tx_id: commit.tx_id,
         parent_tx_id: commit.parent_tx_id,
@@ -948,6 +955,24 @@ where
     #[cfg(feature = "required-netconf-audit")]
     fn required_netconf_audit_store(&self) -> Option<opc_config_bus::NetconfAuditStore> {
         self.netconf.clone()
+    }
+
+    #[cfg(feature = "required-netconf-audit")]
+    async fn prepare_netconf_running_commit(
+        &self,
+        commit: BusCommitWrite<SealedConfig<C>>,
+        authenticated: &TrustedPrincipal,
+        intent: &opc_mgmt_audit::AuditEvent,
+    ) -> Result<AttestedConfigCommit, StoreError> {
+        if self.netconf.is_none() {
+            return Err(StoreError::unavailable(
+                "NETCONF Running preparation is unsupported",
+            ));
+        }
+        commit.validate_netconf_running_preparation(authenticated, intent)?;
+        // Reuse the sole metadata codec and one-shot attestation path. Legacy
+        // append callers retain their original source classification.
+        attested_bus_commit_with_source(commit, Some(CommitSource::Netconf))
     }
 
     async fn append_required_audit_commit(
