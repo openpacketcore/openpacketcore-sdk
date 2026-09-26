@@ -57,10 +57,56 @@ where
         )
     }
 
+    /// Add a child by resolving an existing exact Active parent inside this
+    /// operation's fenced lease, without a separate completed recovery call.
+    ///
+    /// The complete parent descriptor must already be Active in this protected
+    /// namespace. Its authenticated issuance descriptor and exact backend state
+    /// are checked before the original child admission and all three durable
+    /// transitions. This cannot install, reattach, or repair a missing parent.
+    /// Child cancellation, recovery, overlap and capacity rules are identical
+    /// to [`Self::reconcile_bearer`]. No Active claim escapes before child
+    /// admission and no snapshot substitutes for a later durable readback.
+    pub fn reconcile_bearer_under_active_parent<D>(
+        &self,
+        backend: Arc<D>,
+        parent: GtpuSessionGroup,
+        desired: GtpuSessionGroup,
+    ) -> GtpuSessionSelectorOperation<GtpuSessionSelectorActiveClaim>
+    where
+        B: Send + Sync + 'static,
+        D: GtpuDataplaneBackend + Send + Sync + 'static,
+    {
+        let authority = self.clone();
+        spawn_selector_operation(
+            self.storage_scope_commitment,
+            GtpuSessionSelectorCoordinatorError::Backend,
+            async move {
+                authority
+                    .reconcile_bearer_with_parent_owned(backend.as_ref(), None, parent, desired)
+                    .await
+            },
+        )
+    }
+
     pub(super) async fn reconcile_bearer_owned<D>(
         &self,
         backend: &D,
         parent_claim: GtpuSessionSelectorActiveClaim,
+        parent: GtpuSessionGroup,
+        desired: GtpuSessionGroup,
+    ) -> Result<GtpuSessionSelectorActiveClaim, GtpuSessionSelectorCoordinatorError>
+    where
+        D: GtpuDataplaneBackend + ?Sized,
+    {
+        self.reconcile_bearer_with_parent_owned(backend, Some(parent_claim), parent, desired)
+            .await
+    }
+
+    pub(super) async fn reconcile_bearer_with_parent_owned<D>(
+        &self,
+        backend: &D,
+        parent_claim: Option<GtpuSessionSelectorActiveClaim>,
         parent: GtpuSessionGroup,
         desired: GtpuSessionGroup,
     ) -> Result<GtpuSessionSelectorActiveClaim, GtpuSessionSelectorCoordinatorError>
@@ -79,6 +125,13 @@ where
                 .read_state()
                 .await
                 .map_err(|_| GtpuSessionSelectorCoordinatorError::Namespace)?;
+            let parent_claim = match parent_claim {
+                Some(claim) => claim,
+                None => GtpuSessionSelectorActiveClaim(
+                    self.admission_for_final_phase_from_state(&parent, 0, &state)
+                        .map_err(|_| GtpuSessionSelectorCoordinatorError::Namespace)?,
+                ),
+            };
             state
                 .preflight_bearer_parent(&parent, &parent_claim.0, &desired)
                 .map_err(|_| GtpuSessionSelectorCoordinatorError::Namespace)?;
