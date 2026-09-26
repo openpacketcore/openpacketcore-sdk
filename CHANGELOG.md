@@ -9,6 +9,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- `opc-session-net`: remove the duplicate control probe before the first
+  bounded frame chunk copy. Preserve cancellation, absolute deadlines, exact
+  byte bounds and all pre-publication checks. Refs #972.
+
 - GTP-U eBPF sends validated nonzero unknown-TEID G-PDUs to the configured
   local control endpoint without decapsulation. Retained inconsistent
   ownership, foreign local endpoints, zero TEID and malformed envelopes
@@ -28,6 +32,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   replacement, shutdown and multihoming failover qualification (Refs #788).
 
 ### Added
+
+- `opc-session-testkit`: compose independent authenticated consumers over the
+  same three voters with separate retained journals, and clone paired protected
+  backends without a second journal open. Add fixed numeric consensus peer-call
+  observations under `test-control`; authority and journal limits are unchanged.
 
 - `opc-gtpu-dataplane`: add explicit grouped restart detachment that removes
   exact owned tc hooks while retaining all map objects and selector history.

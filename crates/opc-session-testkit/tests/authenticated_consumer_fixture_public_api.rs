@@ -5,7 +5,8 @@ use std::sync::Arc;
 use opc_key::KeyProvider;
 use opc_session_net::SessionConsumerPreparedFencedTransitionBackend;
 use opc_session_store::{
-    FencedTransitionOutcome, FencedTransitionRequest, PreparedCheckpointBudget, SessionStoreBackend,
+    FencedTransitionOutcome, FencedTransitionRequest, PreparedCheckpointBudget,
+    ProtectedSessionBackend, SessionStoreBackend,
 };
 use opc_session_testkit::authenticated_consumer_fixture::{
     AuthenticatedPreparedFencedTransitionFacadeReopener,
@@ -67,6 +68,19 @@ async fn public_fresh_process_reopen(
     reopener.reopen_prepared_fenced_transition_facade().await
 }
 
+async fn public_additional_consumer_constructor(
+    fixture: &AuthenticatedPreparedFencedTransitionFixture,
+    provider: Arc<dyn KeyProvider>,
+) -> Result<(), AuthenticatedPreparedFencedTransitionFixtureError> {
+    let pair = fixture
+        .create_local_aead_pair(provider, "external-fixture-pair")
+        .await?;
+    fn assert_protected<T: ProtectedSessionBackend + Clone + 'static>(_: &T) {}
+    assert_protected(&pair.protected_general_backend());
+    let _parts = pair.into_parts();
+    Ok(())
+}
+
 async fn public_semantic_successor_control(
     reopener: &AuthenticatedPreparedFencedTransitionFacadeReopener<'_, dyn KeyProvider>,
     request: FencedTransitionRequest,
@@ -83,6 +97,7 @@ fn assert_session_store_backend<T: SessionStoreBackend>() {}
 fn external_consumer_can_use_only_the_opaque_facade_and_redacted_diagnostics() {
     let _ = public_local_aead_constructor;
     let _ = public_paired_constructor;
+    let _ = public_additional_consumer_constructor;
     let _ = public_fresh_process_reopen;
     let _ = public_semantic_successor_control;
     let _ = public_diagnostics;

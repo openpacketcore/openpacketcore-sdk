@@ -5,6 +5,12 @@ use crate::testkit::GroupedGtpuDataplaneSimulation;
 use opc_session_store::EncryptingSessionBackend;
 
 mod concurrent_lifecycle;
+#[cfg(target_os = "linux")]
+mod resident_admission;
+#[cfg(target_os = "linux")]
+mod retained_read_profile;
+#[cfg(target_os = "linux")]
+mod stable_read_profile;
 
 type Protected = EncryptingSessionBackend<SqliteSessionBackend, opc_key::MemoryKeyProvider>;
 
