@@ -83,6 +83,15 @@ consensus authority remain unchanged. Historical HA profiles still bind the
 original revision above; current manifest/lock/metadata checks independently
 bind the new candidate. This source change does not confer qualification.
 
+SDK-957 advances the candidate to `b9559528561da526bea4c01dd885bab648366976`,
+which incorporates release-0.9 through v0.9.25 and the fork's bounded apply,
+joined replication retirement and fatal completion repairs. It also retires
+obsolete leadership and mismatched campaigns on an accepted newer self-vote. The exact
+`openraft`/`openraft-macros` versions are now 0.9.25. Frozen qualification
+profiles retain their original versions and revisions; the current manifest,
+lock and metadata checks bind this candidate separately. Dependency tests do
+not establish SDK qualification.
+
 Registry 0.9.24 SDK one-shot leader-loss runs happened to pass. They do not
 invalidate the deterministic scripted engine regression or the historical
 observed-leader split-vote in the multi-process qualification harness: the
