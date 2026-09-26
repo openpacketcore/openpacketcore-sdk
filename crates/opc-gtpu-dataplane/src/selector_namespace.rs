@@ -7,12 +7,21 @@
 //! module and all public diagnostics are summaries.
 
 mod bearer;
+mod concurrent;
 mod n3_end_marker;
+mod observability;
 mod pristine;
 pub use bearer::GTPU_SHARED_PAA_MAX_LIVE_BEARERS;
+pub use concurrent::GtpuSessionSelectorConcurrentNamespace;
 pub use n3_end_marker::{
     GtpuN3EndMarkerCompletion, GtpuN3EndMarkerError, GtpuN3EndMarkerReceipt, GtpuN3EndMarkerRequest,
 };
+pub use observability::{
+    gtpu_selector_activity_snapshot, gtpu_selector_duration_snapshot, GtpuSelectorActivitySnapshot,
+    GtpuSelectorDurationSnapshot, GtpuSelectorOutcome, GtpuSelectorPhase,
+    GTPU_SELECTOR_DURATION_BUCKETS_US,
+};
+use observability::{observe, observe_sync};
 pub use pristine::GtpuSessionSelectorPristineReadbackRequest;
 use pristine::PristineRelocation;
 
@@ -967,6 +976,7 @@ pub(crate) struct SelectorOperationStampInventoryExpectation {
     selector_set_fingerprint: [u8; 32],
     desired_fingerprint: [u8; 32],
     lifecycle: SelectorOperationStampLifecycleExpectation,
+    in_flight: Option<Arc<concurrent::InFlightInstall>>,
 }
 
 impl SelectorOperationStampInventoryExpectation {
@@ -1018,6 +1028,40 @@ impl SelectorOperationStampInventory {
     const fn summary(&self) -> [u8; 32] {
         self.summary
     }
+
+    pub(crate) fn concurrent_projection(&self, observed: &BTreeSet<[u8; 16]>) -> Option<Self> {
+        let mut expectations = Vec::with_capacity(self.expectations.len());
+        for expected in &self.expectations {
+            if let Some(proof) = &expected.in_flight {
+                if !proof.matches(expected) {
+                    return None;
+                }
+                if !observed.contains(&expected.group.id().to_bytes()) {
+                    continue;
+                }
+            }
+            expectations.push(expected.clone());
+        }
+        Some(Self {
+            expectations,
+            summary: self.summary,
+        })
+    }
+
+    pub(crate) fn has_concurrent_proofs(&self) -> bool {
+        self.expectations
+            .iter()
+            .any(|expected| expected.in_flight.is_some())
+    }
+
+    pub(crate) fn concurrent_proofs_are_current(&self) -> bool {
+        self.expectations.iter().all(|expected| {
+            expected
+                .in_flight
+                .as_ref()
+                .is_none_or(|proof| proof.matches(expected))
+        })
+    }
 }
 
 impl fmt::Debug for SelectorOperationStampInventory {
@@ -1026,9 +1070,9 @@ impl fmt::Debug for SelectorOperationStampInventory {
     }
 }
 
-/// Owned by one supervised namespace operation, never cached on an authority
-/// or shared across workers. Only a confirmed durable acquire/renew can install
-/// timing; clearing it permanently fences an uncertain or expired worker.
+/// One non-cloneable credential/timing owner for a serialized operation or an
+/// explicitly selected concurrent cohort. Only a confirmed durable acquire or
+/// renewal installs timing; clearing it permanently fences that owner.
 struct SelectorWorkerLease {
     guard: opc_session_store::LeaseGuard,
     timing: Option<SelectorLeaseTiming>,
@@ -2165,10 +2209,50 @@ where
     E: Clone + Send + 'static,
     F: Future<Output = Result<T, E>> + Send + 'static,
 {
+    spawn_selector_operation_with_gate(
+        storage_scope_commitment,
+        runtime_error,
+        Some(selector_namespace_worker(storage_scope_commitment)),
+        worker,
+    )
+}
+
+struct SelectorSupervisorSlots {
+    process: Option<tokio::sync::OwnedSemaphorePermit>,
+    namespace: Option<tokio::sync::OwnedSemaphorePermit>,
+    worker: Option<tokio::sync::OwnedSemaphorePermit>,
+    started: bool,
+    terminal: bool,
+    quarantine_on_abnormal: bool,
+}
+
+impl Drop for SelectorSupervisorSlots {
+    fn drop(&mut self) {
+        if self.quarantine_on_abnormal && self.started && !self.terminal {
+            // A panic or runtime teardown is not settled host work. Retain
+            // these bounded slots and worker exclusion until process recovery.
+            // At most the existing process admission limit can be retained.
+            std::mem::forget(self.process.take());
+            std::mem::forget(self.namespace.take());
+            std::mem::forget(self.worker.take());
+        }
+    }
+}
+
+fn spawn_selector_operation_with_gate<T, E, F>(
+    storage_scope_commitment: [u8; 32],
+    runtime_error: E,
+    namespace_worker: Option<Arc<tokio::sync::Semaphore>>,
+    worker: F,
+) -> GtpuSessionSelectorOperation<T, E>
+where
+    T: Send + 'static,
+    E: Clone + Send + 'static,
+    F: Future<Output = Result<T, E>> + Send + 'static,
+{
     let (sender, receiver) = tokio::sync::oneshot::channel();
     let process_permits = selector_process_supervisors();
     let namespace_permits = selector_namespace_supervisors(storage_scope_commitment);
-    let namespace_worker = selector_namespace_worker(storage_scope_commitment);
     let closed_error = runtime_error.clone();
     // Reserve both bounded supervisor slots before either durable admission or
     // task creation.  Spawning first would make an unbounded number of tasks
@@ -2201,16 +2285,32 @@ where
                 // The pre-reserved permits stay owned by this detached worker
                 // until its terminal result is sent. Dropping the caller's
                 // observer cannot release either slot or abort the effect.
-                let _process_permit = process_permit;
-                let _namespace_permit = namespace_permit;
-                let _worker_permit = match namespace_worker.acquire_owned().await {
-                    Ok(permit) => permit,
-                    Err(_) => {
-                        let _ = sender.send(Err(runtime_error));
-                        return;
-                    }
+                let mut slots = SelectorSupervisorSlots {
+                    process: Some(process_permit),
+                    namespace: Some(namespace_permit),
+                    worker: None,
+                    started: false,
+                    terminal: false,
+                    quarantine_on_abnormal: namespace_worker.is_none(),
                 };
-                let result = worker.await;
+                slots.worker = match namespace_worker {
+                    Some(namespace_worker) => match observe(
+                        GtpuSelectorPhase::WorkerWait,
+                        namespace_worker.acquire_owned(),
+                    )
+                    .await
+                    {
+                        Ok(permit) => Some(permit),
+                        Err(_) => {
+                            let _ = sender.send(Err(runtime_error));
+                            return;
+                        }
+                    },
+                    None => None,
+                };
+                slots.started = true;
+                let result = observe(GtpuSelectorPhase::WorkerHold, worker).await;
+                slots.terminal = true;
                 let _ = sender.send(result);
             });
         }
@@ -3901,6 +4001,9 @@ where
     /// Binds newly minted no-admission receipts to this opened authority and
     /// its clones. Reopening recovers a new receipt from the durable decision.
     instance: Arc<()>,
+    // Present only in an SDK-owned concurrent operation, never in the public
+    // opened authority. The operation owns borrowing and terminal settlement.
+    concurrent_operation: Option<Arc<concurrent::ConcurrentOperation>>,
     #[cfg(test)]
     allows_test_raw_open: bool,
 }
@@ -3929,6 +4032,7 @@ where
             stable_device: self.stable_device,
             pin_commitment: self.pin_commitment,
             instance: Arc::clone(&self.instance),
+            concurrent_operation: self.concurrent_operation.clone(),
             #[cfg(test)]
             allows_test_raw_open: self.allows_test_raw_open,
         }
@@ -4067,6 +4171,7 @@ where
             stable_device: scope.stable_device,
             pin_commitment: scope.pin_commitment,
             instance: Arc::new(()),
+            concurrent_operation: None,
             #[cfg(test)]
             allows_test_raw_open: false,
         })
@@ -4261,6 +4366,7 @@ where
             .map_err(|_| GtpuSessionSelectorCoordinatorError::Namespace)?;
         let result = async {
             self.ensure_backend_namespace(backend, &mut lease).await?;
+            let _transition = self.concurrent_transition().await;
             for _ in 0..MAX_CAS_RETRIES {
                 let (record, mut state) = self.read_state().await?;
                 state.bind_or_validate(desired.device_id(), self.maximum_operation_atoms, None)?;
@@ -4874,14 +4980,20 @@ where
             self.ensure_backend_namespace(backend, &mut lease)
                 .await
                 .map_err(|_| GtpuSessionSelectorCoordinatorError::Namespace)?;
-            let admission = self
-                .active_admission(&desired)
+            let (_, state) = self
+                .read_state()
                 .await
+                .map_err(|_| GtpuSessionSelectorCoordinatorError::Namespace)?;
+            // The rollback descriptor and consumed readback descriptor have
+            // identical authority. Derive both synchronously from this one
+            // authenticated snapshot; the post-backend read remains fresh.
+            let admission = self
+                .admission_for_final_phase_from_state(&desired, 0, &state)
                 .map_err(|_| GtpuSessionSelectorCoordinatorError::Namespace)?;
             let readback_admission = self
-                .active_admission(&desired)
-                .await
+                .admission_for_final_phase_from_state(&desired, 0, &state)
                 .map_err(|_| GtpuSessionSelectorCoordinatorError::Namespace)?;
+            drop(state);
             if self
                 .require_exact_active(backend, desired.clone(), readback_admission, &mut lease)
                 .await
@@ -5346,9 +5458,11 @@ where
             .map_err(|_| GtpuSessionSelectorCoordinatorError::Namespace)?;
         let request = GtpuSessionSelectorEffectRequest { request, window };
         let expected_receipt = request.receipt_coordinate();
-        let receipt =
-            settle_selector_backend_step(backend.reconcile_pdp_context_group_authorized(request))
-                .await;
+        let receipt = settle_selector_backend_step(observe(
+            GtpuSelectorPhase::BackendInstall,
+            backend.reconcile_pdp_context_group_authorized(request),
+        ))
+        .await;
         let outcome = match receipt {
             Some(Ok(receipt)) => receipt.into_effect(expected_receipt),
             Some(Err(_)) | None => None,
@@ -5438,10 +5552,12 @@ where
             window,
         };
         let expected_receipt = request.receipt_coordinate();
-        let receipt =
-            settle_selector_backend_step(backend.read_pdp_context_group_with_lease(request))
-                .await
-                .ok_or(GtpuSessionSelectorCoordinatorError::Backend)?;
+        let receipt = settle_selector_backend_step(observe(
+            GtpuSelectorPhase::BackendRead,
+            backend.read_pdp_context_group_with_lease(request),
+        ))
+        .await
+        .ok_or(GtpuSessionSelectorCoordinatorError::Backend)?;
         receipt
             .ok()
             .and_then(|receipt| receipt.into_readback(expected_receipt))
@@ -5472,9 +5588,11 @@ where
             window,
         };
         let expected_receipt = request.receipt_coordinate();
-        let receipt =
-            settle_selector_backend_step(backend.remove_pdp_context_group_with_lease(request))
-                .await;
+        let receipt = settle_selector_backend_step(observe(
+            GtpuSelectorPhase::BackendRemove,
+            backend.remove_pdp_context_group_with_lease(request),
+        ))
+        .await;
         let removal = match receipt {
             Some(Ok(receipt)) => receipt.into_removal(expected_receipt),
             Some(Err(_)) | None => None,
@@ -5607,6 +5725,7 @@ where
         D: GtpuDataplaneBackend + ?Sized,
     {
         self.ensure_backend_namespace(backend, lease).await?;
+        let _transition = self.concurrent_transition().await;
         let canonical = CanonicalClaim::from_group(desired);
         for _ in 0..MAX_CAS_RETRIES {
             let (record, mut state) = self.read_state().await?;
@@ -5690,6 +5809,7 @@ where
                 .replace_with_lease(record.as_ref(), state, lease)
                 .await?
             {
+                self.retain_concurrent_install(&admission)?;
                 return Ok(admission);
             }
         }
@@ -5744,6 +5864,7 @@ where
         D: GtpuDataplaneBackend + ?Sized,
     {
         self.ensure_backend_namespace(backend, lease).await?;
+        let _transition = self.concurrent_transition().await;
         let canonical = CanonicalClaim::from_group(desired);
         let source_canonical = CanonicalClaim::from_group(proof.retired_group());
         if desired.device_id() != proof.retired_group().device_id()
@@ -5898,6 +6019,7 @@ where
                 .replace_with_lease(record.as_ref(), state, lease)
                 .await?
             {
+                self.retain_concurrent_install(&admission)?;
                 return Ok(admission);
             }
         }
@@ -5908,11 +6030,12 @@ where
         &self,
     ) -> Result<(Option<StoredSessionRecord>, NamespaceState), GtpuSessionSelectorNamespaceError>
     {
-        let record = self
-            .store
-            .get(&self.namespace_key)
-            .await
-            .map_err(|_| GtpuSessionSelectorNamespaceError::Indeterminate)?;
+        let record = observe(
+            GtpuSelectorPhase::LedgerRead,
+            self.store.get(&self.namespace_key),
+        )
+        .await
+        .map_err(|_| GtpuSessionSelectorNamespaceError::Indeterminate)?;
         let state = match record.as_ref() {
             None => {
                 #[cfg(test)]
@@ -5927,8 +6050,10 @@ where
                     && record.state_type.as_str() == "gtpu-selector-namespace-v1"
                     && record.expires_at.is_none() =>
             {
-                NamespaceState::decode(record.payload.as_bytes())
-                    .ok_or(GtpuSessionSelectorNamespaceError::Indeterminate)?
+                observe_sync(GtpuSelectorPhase::LedgerDecode, || {
+                    NamespaceState::decode(record.payload.as_bytes())
+                        .ok_or(GtpuSessionSelectorNamespaceError::Indeterminate)
+                })?
             }
             Some(_) => return Err(GtpuSessionSelectorNamespaceError::Indeterminate),
         };
@@ -5977,9 +6102,15 @@ where
     where
         D: GtpuDataplaneBackend + ?Sized,
     {
+        let _transition = self.concurrent_transition().await;
         let (_, state) = self.read_state().await?;
         let binding = self.bound_binding(&state)?;
-        let inventory = state.operation_stamp_inventory(binding)?;
+        let mut inventory = observe_sync(GtpuSelectorPhase::InventoryDerive, || {
+            state.operation_stamp_inventory(binding)
+        })?;
+        if let Some(operation) = &self.concurrent_operation {
+            operation.shared.attach_inventory(&mut inventory);
+        }
         let window = self.mint_backend_mutation_window(lease).await?;
         let request = GtpuSessionSelectorBindingLease {
             binding,
@@ -5987,11 +6118,13 @@ where
             window,
         };
         let expected_receipt = request.receipt_coordinate();
-        let receipt =
-            settle_selector_backend_step(backend.acquire_selector_namespace_lease(request))
-                .await
-                .ok_or(GtpuSessionSelectorNamespaceError::Indeterminate)?
-                .map_err(|_| GtpuSessionSelectorNamespaceError::Indeterminate)?;
+        let receipt = settle_selector_backend_step(observe(
+            GtpuSelectorPhase::BackendInventory,
+            backend.acquire_selector_namespace_lease(request),
+        ))
+        .await
+        .ok_or(GtpuSessionSelectorNamespaceError::Indeterminate)?
+        .map_err(|_| GtpuSessionSelectorNamespaceError::Indeterminate)?;
         receipt
             .confirms_binding(expected_receipt)
             .then_some(())
@@ -6002,11 +6135,12 @@ where
         &self,
     ) -> Result<(Option<StoredSessionRecord>, NamespaceState), GtpuSessionSelectorNamespaceError>
     {
-        let record = self
-            .store
-            .get(&self.namespace_key)
-            .await
-            .map_err(|_| GtpuSessionSelectorNamespaceError::Indeterminate)?;
+        let record = observe(
+            GtpuSelectorPhase::LedgerRead,
+            self.store.get(&self.namespace_key),
+        )
+        .await
+        .map_err(|_| GtpuSessionSelectorNamespaceError::Indeterminate)?;
         let state = match record.as_ref() {
             None => NamespaceState::default(),
             Some(record)
@@ -6015,8 +6149,10 @@ where
                     && record.state_type.as_str() == "gtpu-selector-namespace-v1"
                     && record.expires_at.is_none() =>
             {
-                NamespaceState::decode(record.payload.as_bytes())
-                    .ok_or(GtpuSessionSelectorNamespaceError::Indeterminate)?
+                observe_sync(GtpuSelectorPhase::LedgerDecode, || {
+                    NamespaceState::decode(record.payload.as_bytes())
+                        .ok_or(GtpuSessionSelectorNamespaceError::Indeterminate)
+                })?
             }
             Some(_) => return Err(GtpuSessionSelectorNamespaceError::Indeterminate),
         };
@@ -6373,14 +6509,36 @@ where
     async fn acquire_worker_lease(
         &self,
     ) -> Result<SelectorWorkerLease, GtpuSessionSelectorNamespaceError> {
+        if let Some(operation) = &self.concurrent_operation {
+            operation.shared.check_current().await?;
+            let current = operation.shared.credential().await;
+            let current = current
+                .as_ref()
+                .ok_or(GtpuSessionSelectorNamespaceError::Indeterminate)?;
+            if operation.shared.is_abandoned() || current.timing.is_none() {
+                return Err(GtpuSessionSelectorNamespaceError::Indeterminate);
+            }
+            return Ok(SelectorWorkerLease {
+                guard: current.guard.clone(),
+                timing: None,
+            });
+        }
+        self.acquire_worker_lease_owned().await
+    }
+
+    async fn acquire_worker_lease_owned(
+        &self,
+    ) -> Result<SelectorWorkerLease, GtpuSessionSelectorNamespaceError> {
         // Start before the durable call: an acknowledgement never restarts
         // the lifetime of a lease already granted by the store.
         let timing = SelectorLeaseTiming::start(self.lease_ttl)?;
-        let guard = self
-            .store
-            .acquire(&self.namespace_key, self.owner.clone(), self.lease_ttl)
-            .await
-            .map_err(|_| GtpuSessionSelectorNamespaceError::Indeterminate)?;
+        let guard = observe(
+            GtpuSelectorPhase::LeaseAcquire,
+            self.store
+                .acquire(&self.namespace_key, self.owner.clone(), self.lease_ttl),
+        )
+        .await
+        .map_err(|_| GtpuSessionSelectorNamespaceError::Indeterminate)?;
         Ok(SelectorWorkerLease {
             guard,
             timing: Some(timing),
@@ -6391,16 +6549,28 @@ where
         &self,
         lease: SelectorWorkerLease,
     ) -> Result<(), GtpuSessionSelectorNamespaceError> {
-        self.store
-            .release(lease.guard)
-            .await
-            .map_err(|_| GtpuSessionSelectorNamespaceError::Indeterminate)
+        if let Some(operation) = &self.concurrent_operation {
+            return operation.shared.check_current().await;
+        }
+        self.release_worker_lease_owned(lease).await
+    }
+
+    async fn release_worker_lease_owned(
+        &self,
+        lease: SelectorWorkerLease,
+    ) -> Result<(), GtpuSessionSelectorNamespaceError> {
+        observe(
+            GtpuSelectorPhase::LeaseRelease,
+            self.store.release(lease.guard),
+        )
+        .await
+        .map_err(|_| GtpuSessionSelectorNamespaceError::Indeterminate)
     }
 
     /// Renew at the admitted cadence, retaining the exact credential. Every
     /// CAS still checks it at the store. An uncertain renewal invalidates this
-    /// worker even if the future is cancelled before returning an outcome.
-    async fn renew_worker_lease_if_due(
+    /// owner even if the future is cancelled before returning an outcome.
+    async fn renew_worker_lease_if_due_owned(
         &self,
         lease: &mut SelectorWorkerLease,
         reserve: Duration,
@@ -6416,11 +6586,12 @@ where
         lease.timing = None;
         due?;
         let timing = SelectorLeaseTiming::start(self.lease_ttl)?;
-        let renewed = self
-            .store
-            .renew(&lease.guard, self.lease_ttl)
-            .await
-            .map_err(|_| GtpuSessionSelectorNamespaceError::Indeterminate)?;
+        let renewed = observe(
+            GtpuSelectorPhase::LeaseRenew,
+            self.store.renew(&lease.guard, self.lease_ttl),
+        )
+        .await
+        .map_err(|_| GtpuSessionSelectorNamespaceError::Indeterminate)?;
         if renewed.key() != lease.guard.key()
             || renewed.owner() != lease.guard.owner()
             || renewed.fence() != lease.guard.fence()
@@ -6443,8 +6614,34 @@ where
         &self,
         lease: &mut SelectorWorkerLease,
     ) -> Result<SelectorBackendMutationWindow, GtpuSessionSelectorNamespaceError> {
+        if let Some(operation) = &self.concurrent_operation {
+            if operation.shared.is_abandoned() {
+                return Err(GtpuSessionSelectorNamespaceError::Indeterminate);
+            }
+            let mut current = operation.shared.credential().await;
+            let current = current
+                .as_mut()
+                .ok_or(GtpuSessionSelectorNamespaceError::Indeterminate)?;
+            if operation.shared.is_abandoned() {
+                current.timing = None;
+                return Err(GtpuSessionSelectorNamespaceError::Indeterminate);
+            }
+            let window = self.mint_backend_mutation_window_owned(current).await?;
+            if operation.shared.is_abandoned() {
+                current.timing = None;
+                return Err(GtpuSessionSelectorNamespaceError::Indeterminate);
+            }
+            return Ok(window);
+        }
+        self.mint_backend_mutation_window_owned(lease).await
+    }
+
+    async fn mint_backend_mutation_window_owned(
+        &self,
+        lease: &mut SelectorWorkerLease,
+    ) -> Result<SelectorBackendMutationWindow, GtpuSessionSelectorNamespaceError> {
         let reserve = SELECTOR_NAMESPACE_MAX_EFFECT_DURATION.min(self.lease_ttl / 2);
-        self.renew_worker_lease_if_due(lease, reserve).await?;
+        self.renew_worker_lease_if_due_owned(lease, reserve).await?;
         let timing = lease
             .timing
             .as_ref()
@@ -6512,13 +6709,45 @@ where
         state: NamespaceState,
         lease: &mut SelectorWorkerLease,
     ) -> Result<bool, GtpuSessionSelectorNamespaceError> {
-        if !state.is_complete() {
-            return Err(GtpuSessionSelectorNamespaceError::Indeterminate);
+        if let Some(operation) = &self.concurrent_operation {
+            let mut shared = operation.shared.credential().await;
+            let shared = shared
+                .as_mut()
+                .ok_or(GtpuSessionSelectorNamespaceError::Indeterminate)?;
+            if operation.shared.is_abandoned() {
+                shared.timing = None;
+                return Err(GtpuSessionSelectorNamespaceError::Indeterminate);
+            }
+            // Renewal changes the exact expiry in the durable credential.
+            // Retain its owner through CAS and exact readback so no sibling
+            // can renew between this write's guard check and store mutation.
+            let result = self.replace_with_lease_owned(current, state, shared).await;
+            lease.guard = shared.guard.clone();
+            if operation.shared.is_abandoned() {
+                shared.timing = None;
+                return Err(GtpuSessionSelectorNamespaceError::Indeterminate);
+            }
+            return result;
         }
-        let bytes = state.encode();
-        if bytes.len() > MAX_RECORD_BYTES {
-            return Err(GtpuSessionSelectorNamespaceError::CapacityExhausted);
-        }
+        self.replace_with_lease_owned(current, state, lease).await
+    }
+
+    async fn replace_with_lease_owned(
+        &self,
+        current: Option<&StoredSessionRecord>,
+        state: NamespaceState,
+        lease: &mut SelectorWorkerLease,
+    ) -> Result<bool, GtpuSessionSelectorNamespaceError> {
+        let bytes = observe_sync(GtpuSelectorPhase::LedgerEncode, || {
+            if !state.is_complete() {
+                return Err(GtpuSessionSelectorNamespaceError::Indeterminate);
+            }
+            let bytes = state.encode();
+            if bytes.len() > MAX_RECORD_BYTES {
+                return Err(GtpuSessionSelectorNamespaceError::CapacityExhausted);
+            }
+            Ok(bytes)
+        })?;
         let generation = match current {
             Some(record) => record
                 .generation
@@ -6526,7 +6755,7 @@ where
                 .ok_or(GtpuSessionSelectorNamespaceError::GenerationExhausted)?,
             None => Generation::new(1),
         };
-        self.renew_worker_lease_if_due(lease, Duration::ZERO)
+        self.renew_worker_lease_if_due_owned(lease, Duration::ZERO)
             .await?;
         let replacement = StoredSessionRecord {
             key: self.namespace_key.clone(),
@@ -6539,15 +6768,16 @@ where
             payload: EncryptedSessionPayload::new(bytes),
         };
         let expected_generation = current.map(|record| record.generation);
-        match self
-            .store
-            .compare_and_set(CompareAndSet {
+        match observe(
+            GtpuSelectorPhase::LedgerWrite,
+            self.store.compare_and_set(CompareAndSet {
                 key: self.namespace_key.clone(),
                 lease: lease.guard.clone(),
                 expected_generation,
                 new_record: replacement.clone(),
-            })
-            .await
+            }),
+        )
+        .await
         {
             Ok(CompareAndSetResult::Success) => self.readback_matches(&replacement).await,
             Ok(CompareAndSetResult::Conflict { .. }) => Ok(false),
@@ -6567,6 +6797,7 @@ where
         reason: PoisonReason,
         lease: &mut SelectorWorkerLease,
     ) -> Result<bool, GtpuSessionSelectorNamespaceError> {
+        let _transition = self.concurrent_transition().await;
         for _ in 0..MAX_CAS_RETRIES {
             let (record, mut state) = self.read_state().await?;
             let group = state
@@ -6621,11 +6852,12 @@ where
         &self,
         expected: &StoredSessionRecord,
     ) -> Result<bool, GtpuSessionSelectorNamespaceError> {
-        let observed = self
-            .store
-            .get(&self.namespace_key)
-            .await
-            .map_err(|_| GtpuSessionSelectorNamespaceError::Indeterminate)?;
+        let observed = observe(
+            GtpuSelectorPhase::LedgerRead,
+            self.store.get(&self.namespace_key),
+        )
+        .await
+        .map_err(|_| GtpuSessionSelectorNamespaceError::Indeterminate)?;
         Ok(
             matches!(observed, Some(record) if record.generation == expected.generation && record.key == expected.key && record.owner == expected.owner && record.fence == expected.fence && record.state_class == expected.state_class && record.state_type == expected.state_type && record.expires_at.is_none() && record.payload.as_bytes() == expected.payload.as_bytes()),
         )
@@ -6657,6 +6889,7 @@ where
         desired: &GtpuSessionGroup,
         lease: &mut SelectorWorkerLease,
     ) -> Result<BackendStartHandoff, GtpuSessionSelectorNamespaceError> {
+        let _transition = self.concurrent_transition().await;
         let canonical = CanonicalClaim::from_group(desired);
         for _ in 0..MAX_CAS_RETRIES {
             let (record, mut state) = self.read_state().await?;
@@ -6739,6 +6972,7 @@ where
         expected: &GtpuSessionGroup,
         lease: &mut SelectorWorkerLease,
     ) -> Result<BackendStartHandoff, GtpuSessionSelectorNamespaceError> {
+        let _transition = self.concurrent_transition().await;
         let canonical = CanonicalClaim::from_group(expected);
         for _ in 0..MAX_CAS_RETRIES {
             let (record, mut state) = self.read_state().await?;
@@ -6929,9 +7163,20 @@ where
         desired: &GtpuSessionGroup,
         phase: u8,
     ) -> Result<GtpuSessionSelectorAdmission, GtpuSessionSelectorNamespaceError> {
-        let canonical = CanonicalClaim::from_group(desired);
         let (_, state) = self.read_state().await?;
-        let claim = canonical
+        self.admission_for_final_phase_from_state(desired, phase, &state)
+    }
+
+    /// Decode an admission from the same authenticated snapshot used by its
+    /// caller's synchronous preflight. This retains no cross-call cache and
+    /// does not replace backend readback or a fenced mutation.
+    fn admission_for_final_phase_from_state(
+        &self,
+        desired: &GtpuSessionGroup,
+        phase: u8,
+        state: &NamespaceState,
+    ) -> Result<GtpuSessionSelectorAdmission, GtpuSessionSelectorNamespaceError> {
+        let claim = CanonicalClaim::from_group(desired)
             .with_key(&state.selector_digest_key)
             .ok_or(GtpuSessionSelectorNamespaceError::Indeterminate)?;
         let descriptor = match state.groups.get(&claim.group_fingerprint) {
@@ -7089,8 +7334,9 @@ where
         phase: u8,
         lease: &mut SelectorWorkerLease,
     ) -> Result<GtpuSessionSelectorAdmission, GtpuSessionSelectorNamespaceError> {
+        let _transition = self.concurrent_transition().await;
         let canonical = CanonicalClaim::from_group(desired);
-        let (_, state) = self.read_state().await?;
+        let (record, state) = self.read_state().await?;
         let claim = canonical
             .with_key(&state.selector_digest_key)
             .ok_or(GtpuSessionSelectorNamespaceError::Indeterminate)?;
@@ -7125,8 +7371,14 @@ where
             }
             _ => return Err(GtpuSessionSelectorNamespaceError::StaleGeneration),
         };
-        self.transition_phase_for_admission_with_lease(&admission, phase, None, lease)
-            .await
+        self.transition_phase_from_snapshot_with_lease(
+            &admission,
+            phase,
+            None,
+            lease,
+            Some((record, state)),
+        )
+        .await
     }
 
     async fn transition_phase_for_admission_with_lease(
@@ -7136,8 +7388,34 @@ where
         retired_dataplane_generation: Option<NonZeroU64>,
         lease: &mut SelectorWorkerLease,
     ) -> Result<GtpuSessionSelectorAdmission, GtpuSessionSelectorNamespaceError> {
+        let _transition = self.concurrent_transition().await;
+        self.transition_phase_from_snapshot_with_lease(
+            admission,
+            phase,
+            retired_dataplane_generation,
+            lease,
+            None,
+        )
+        .await
+    }
+
+    async fn transition_phase_from_snapshot_with_lease(
+        &self,
+        admission: &GtpuSessionSelectorAdmission,
+        phase: u8,
+        retired_dataplane_generation: Option<NonZeroU64>,
+        lease: &mut SelectorWorkerLease,
+        mut first_snapshot: Option<(Option<StoredSessionRecord>, NamespaceState)>,
+    ) -> Result<GtpuSessionSelectorAdmission, GtpuSessionSelectorNamespaceError> {
         for _ in 0..MAX_CAS_RETRIES {
-            let (record, mut state) = self.read_state().await?;
+            // No await separates the supplied snapshot's admission preflight
+            // from this first attempt. Its exact generation still fences the
+            // CAS; every conflict reloads the protected state and every
+            // successful write still requires an exact remote readback.
+            let (record, mut state) = match first_snapshot.take() {
+                Some(snapshot) => snapshot,
+                None => self.read_state().await?,
+            };
             let group = state
                 .groups
                 .get(&admission.group_fingerprint)
@@ -8390,6 +8668,7 @@ impl NamespaceState {
                         selector_set_fingerprint,
                         desired_fingerprint,
                         lifecycle,
+                        in_flight: None,
                     },
                 )
                 .is_none()
@@ -10868,7 +11147,7 @@ mod tests {
     mod bearer_ledger;
     mod n3_end_marker;
     mod n3_fixed_flow;
-    mod worker_lease;
+    pub(super) mod worker_lease;
 
     use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
     use std::sync::Arc;
@@ -10888,7 +11167,7 @@ mod tests {
 
     use super::*;
 
-    fn group(id: u8, device: u8, teid: u32, mark: Option<u32>) -> GtpuSessionGroup {
+    pub(super) fn group(id: u8, device: u8, teid: u32, mark: Option<u32>) -> GtpuSessionGroup {
         group_with_paa(
             id,
             device,
@@ -10898,7 +11177,7 @@ mod tests {
         )
     }
 
-    fn group_with_paa(
+    pub(super) fn group_with_paa(
         id: u8,
         device: u8,
         teid: u32,

@@ -9,24 +9,52 @@ use super::*;
 /// Gate the acknowledgement after SQLite has actually renewed the lease.
 /// This exercises cancellation/late replies without replacing the credential
 /// checks with a mock result or holding an SQLite transaction open.
-struct RenewalBackend {
+pub(in crate::selector_namespace) struct RenewalBackend {
     inner: SqliteSessionBackend,
     acquisition_entered: Mutex<Option<Instant>>,
-    renewals: AtomicUsize,
+    pub(in crate::selector_namespace) renewals: AtomicUsize,
+    pub(in crate::selector_namespace) acquisitions: AtomicUsize,
+    pub(in crate::selector_namespace) releases: AtomicUsize,
+    pub(in crate::selector_namespace) reject_renewal: AtomicBool,
+    pub(in crate::selector_namespace) reject_release: AtomicBool,
+    pub(in crate::selector_namespace) panic_release: AtomicBool,
+    pub(in crate::selector_namespace) hold_acquire: AtomicBool,
+    pub(in crate::selector_namespace) acquire_entered: tokio::sync::Notify,
+    pub(in crate::selector_namespace) acquire_release: tokio::sync::Notify,
+    pub(super) reads: AtomicUsize,
+    pub(super) writes: AtomicUsize,
+    pub(super) reject_read: AtomicUsize,
     hold_ack: AtomicBool,
     applied: tokio::sync::Notify,
     acknowledge: tokio::sync::Notify,
+    pub(in crate::selector_namespace) hold_cas: AtomicBool,
+    pub(in crate::selector_namespace) cas_entered: tokio::sync::Notify,
+    pub(in crate::selector_namespace) cas_release: tokio::sync::Notify,
 }
 
 impl RenewalBackend {
-    fn new() -> Self {
+    pub(in crate::selector_namespace) fn new() -> Self {
         Self {
             inner: SqliteSessionBackend::in_memory().unwrap(),
             acquisition_entered: Mutex::new(None),
             renewals: AtomicUsize::new(0),
+            acquisitions: AtomicUsize::new(0),
+            releases: AtomicUsize::new(0),
+            reject_renewal: AtomicBool::new(false),
+            reject_release: AtomicBool::new(false),
+            panic_release: AtomicBool::new(false),
+            hold_acquire: AtomicBool::new(false),
+            acquire_entered: tokio::sync::Notify::new(),
+            acquire_release: tokio::sync::Notify::new(),
+            reads: AtomicUsize::new(0),
+            writes: AtomicUsize::new(0),
+            reject_read: AtomicUsize::new(usize::MAX),
             hold_ack: AtomicBool::new(false),
             applied: tokio::sync::Notify::new(),
             acknowledge: tokio::sync::Notify::new(),
+            hold_cas: AtomicBool::new(false),
+            cas_entered: tokio::sync::Notify::new(),
+            cas_release: tokio::sync::Notify::new(),
         }
     }
 }
@@ -42,10 +70,19 @@ impl SessionBackend for RenewalBackend {
     }
 
     async fn get(&self, key: &SessionKey) -> Result<Option<StoredSessionRecord>, StoreError> {
+        let count = self.reads.fetch_add(1, Ordering::SeqCst) + 1;
+        if count == self.reject_read.load(Ordering::SeqCst) {
+            return Err(StoreError::BackendUnavailable("fixed read fault".into()));
+        }
         self.inner.get(key).await
     }
 
     async fn compare_and_set(&self, op: CompareAndSet) -> Result<CompareAndSetResult, StoreError> {
+        self.writes.fetch_add(1, Ordering::SeqCst);
+        if self.hold_cas.swap(false, Ordering::SeqCst) {
+            self.cas_entered.notify_one();
+            self.cas_release.notified().await;
+        }
         self.inner.compare_and_set(op).await
     }
 
@@ -70,12 +107,21 @@ impl SessionLeaseManager for RenewalBackend {
         owner: OwnerId,
         ttl: Duration,
     ) -> Result<LeaseGuard, LeaseError> {
+        self.acquisitions.fetch_add(1, Ordering::SeqCst);
         *self.acquisition_entered.lock().unwrap() = Some(Instant::now());
-        self.inner.acquire(key, owner, ttl).await
+        let result = self.inner.acquire(key, owner, ttl).await;
+        if self.hold_acquire.load(Ordering::SeqCst) {
+            self.acquire_entered.notify_one();
+            self.acquire_release.notified().await;
+        }
+        result
     }
 
     async fn renew(&self, lease: &LeaseGuard, ttl: Duration) -> Result<LeaseGuard, LeaseError> {
         self.renewals.fetch_add(1, Ordering::SeqCst);
+        if self.reject_renewal.load(Ordering::SeqCst) {
+            return Err(LeaseError::StaleFence);
+        }
         let renewed = self.inner.renew(lease, ttl).await?;
         if self.hold_ack.load(Ordering::SeqCst) {
             self.applied.notify_one();
@@ -85,11 +131,19 @@ impl SessionLeaseManager for RenewalBackend {
     }
 
     async fn release(&self, lease: LeaseGuard) -> Result<(), LeaseError> {
+        self.releases.fetch_add(1, Ordering::SeqCst);
+        assert!(
+            !self.panic_release.load(Ordering::SeqCst),
+            "fixed release panic"
+        );
+        if self.reject_release.load(Ordering::SeqCst) {
+            return Err(LeaseError::StaleFence);
+        }
         self.inner.release(lease).await
     }
 }
 
-async fn authority(
+pub(in crate::selector_namespace) async fn authority(
     ttl: Duration,
 ) -> (
     GtpuSessionSelectorNamespaceAuthority<RenewalBackend>,
@@ -105,6 +159,20 @@ async fn authority(
     )
     .await
     .unwrap();
+    (authority, backend)
+}
+
+pub(in crate::selector_namespace) async fn provisioned_authority(
+    ttl: Duration,
+) -> (
+    GtpuSessionSelectorNamespaceAuthority<RenewalBackend>,
+    Arc<RenewalBackend>,
+) {
+    let (authority, backend) = authority(ttl).await;
+    authority
+        .provision(&FaultingSelectorBackend::default())
+        .await
+        .unwrap();
     (authority, backend)
 }
 
