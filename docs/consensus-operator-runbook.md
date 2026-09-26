@@ -40,10 +40,10 @@ The session and configuration adapters use one fixed runtime profile from
 `opc-consensus`; operators cannot tune either domain onto a different election
 or heartbeat regime. This workspace revision exact-pins
 `https://github.com/openpacketcore/openraft` at
-`702ff263d2122820e09d35abd53518b01c85823a` so every election campaign samples
-a fresh timeout. Confirm the lock resolves only `openraft` and
-`openraft-macros` 0.9.24 from that full revision. Do not substitute registry
-0.9.24, a branch, a tag, or a downstream partial patch.
+`7104baa5d31a45bd37bc104425ee4e7c3be5b9b5` with the complete release-0.9 history
+through v0.9.25, bounded apply pages and joined replication retirement. Confirm the lock resolves only
+`openraft` and `openraft-macros` 0.9.25 from that full revision. Do not substitute
+a registry package, a branch, a tag, or a downstream partial patch.
 
 This is an interim source-build profile. The 26 workspace crates in the
 machine-readable `source_build_gate.affected_workspace_crates` closure must

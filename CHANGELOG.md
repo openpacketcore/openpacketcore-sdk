@@ -9,6 +9,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- Preserve bounded configuration preparation and proposal ownership until
+  native storage drains after response loss. Authenticate retained results,
+  retain the committed snapshot frontier, and refuse mismatched retained
+  identities. The experimental capacity profile remains under qualification.
+  Refs #957, #960.
+
+- Consume the exact Openraft 0.9.25 fork revision with bounded native apply
+  pages, joined replication retirement and fatal completion fixes. Preserve
+  frozen HA evidence and validate the current source pin separately.
+
+
 - `opc-session-net`: remove the duplicate control probe before the first
   bounded frame chunk copy. Preserve cancellation, absolute deadlines, exact
   byte bounds and all pre-publication checks. Refs #972.

@@ -294,6 +294,20 @@ jobs:
         with:
           components: clippy,rustfmt
 
+      - name: Prepare private disk scratch
+        run: |
+          set -euo pipefail
+          scratch="$(mktemp -d "${RUNNER_TEMP}/opc-persist.XXXXXX")"
+          filesystem="$(findmnt -n -o FSTYPE -T "${scratch}")"
+          case "${filesystem}" in
+            ""|tmpfs|ramfs) echo "disk-backed persistence scratch required" >&2; exit 1 ;;
+          esac
+          test "$(stat -c '%u:%a' -- "${scratch}")" = "$(id -u):700"
+          printf 'TMPDIR=%s\n' "${scratch}" >> "${GITHUB_ENV}"
+
+      - name: Prepare fs-verity snapshot storage
+        run: ci/setup-fsverity-tmp.sh
+
       - name: Cache Rust dependencies
         uses: Swatinem/rust-cache@v2
         with:
