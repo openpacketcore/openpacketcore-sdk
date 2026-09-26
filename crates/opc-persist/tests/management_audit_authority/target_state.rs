@@ -11381,3 +11381,243 @@ async fn target_empty_commit_retains_authenticated_export_and_expired_prune_boun
     after_prune.accept(&page).unwrap();
     after_prune.finish().unwrap();
 }
+
+impl Fixture {
+    fn ordinary_running(
+        &self,
+        conn: &Connection,
+        request: u8,
+    ) -> crate::consensus::PreparedAuditedMutation {
+        use crate::consensus::audit_mutation::AuditedConfigEffect;
+        use opc_crypto::encrypt_attested_envelope_with_handle_and_nonce;
+        use opc_key::{ConfigAad, EnvelopeAad, KeyHandle, KeyId, KeyPurpose};
+        use rusqlite::OptionalExtension;
+        use sha2::{Digest, Sha256};
+
+        let previous: Option<(Vec<u8>, u64)> = conn
+            .query_row(
+                "SELECT tx_id,version FROM config_history ORDER BY version DESC LIMIT 1",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .optional()
+            .unwrap();
+        let base = previous.as_ref().map_or(0, |(_, version)| *version);
+        let parent = previous
+            .map(|(bytes, _)| opc_types::TxId::from_uuid(uuid::Uuid::from_slice(&bytes).unwrap()));
+        let tx_id = opc_types::TxId::new();
+        let committed_at = opc_types::Timestamp::from_offset_datetime(
+            time::OffsetDateTime::from_unix_timestamp(100).unwrap(),
+        );
+        let schema = opc_types::SchemaDigest::from_bytes([0x74; 32]);
+        let principal = r#"{"tenant":"fixture-tenant","subject":"fixture-principal"}"#.to_owned();
+        let aad = EnvelopeAad::config(
+            opc_types::TenantId::from_static("fixture-tenant"),
+            base + 1,
+            ConfigAad::new(tx_id, parent, committed_at, &principal, schema, "running").unwrap(),
+        );
+        let encryption_key = KeyHandle::new(
+            KeyId::new("fixture-running-key").unwrap(),
+            KeyPurpose::Config,
+            opc_types::TenantId::from_static("fixture-tenant"),
+            zeroize::Zeroizing::new([0x75; 32]),
+        );
+        let plaintext = [0x76; 32];
+        let encrypted = encrypt_attested_envelope_with_handle_and_nonce(
+            &encryption_key,
+            &aad,
+            &plaintext,
+            [request; 12],
+        )
+        .unwrap();
+        let commit = crate::consensus::PreparedConfigCommit::prepare(
+            crate::CommitRecord {
+                tx_id,
+                parent_tx_id: parent,
+                version: opc_types::ConfigVersion::new(base + 1),
+                committed_at,
+                principal,
+                source: crate::CommitSource::Netconf,
+                schema_digest: schema,
+                plaintext_digest: Sha256::digest(plaintext).to_vec(),
+                encrypted_blob: encrypted.encoded().to_vec(),
+                rollback_point: false,
+                confirmed_deadline: None,
+            },
+            Vec::new(),
+            &self.key,
+        )
+        .unwrap();
+        let effect = AuditedConfigEffect::Append {
+            commit: Box::new(commit),
+            resolution: None,
+        };
+        let mutation = effect.digest(&self.key).unwrap();
+        let event = self.event(request);
+        let binding =
+            AuditOperationBinding::project(&self.privacy, &event, base, &mutation).unwrap();
+        let handle = AuditOperationHandle::issue(
+            HandleBody {
+                version: 1,
+                identity: self.identity,
+                binding,
+                event,
+                issued_at: 100,
+                expires_at: 160,
+                nonce: [request; 16],
+                key_epoch: self.key.epoch(),
+                mutation: Some(mutation),
+            },
+            &self.key,
+        )
+        .unwrap();
+        crate::consensus::PreparedAuditedMutation { handle, effect }
+    }
+
+    fn admit_ordinary(
+        &self,
+        conn: &Connection,
+        prepared: &crate::consensus::PreparedAuditedMutation,
+    ) {
+        self.apply(conn, AuditCommand::Intent(prepared.handle.clone()), 100)
+            .unwrap();
+        self.checkpoint(conn);
+    }
+
+    fn apply_ordinary(
+        &self,
+        conn: &Connection,
+        prepared: &crate::consensus::PreparedAuditedMutation,
+    ) -> std::io::Result<Result<(), ConfigMutationFailure>> {
+        crate::consensus::sqlite::target_snapshot_tests::apply_ordinary_running(
+            conn,
+            &self.key,
+            self.identity,
+            prepared,
+            &self.keys,
+        )
+    }
+}
+
+#[tokio::test]
+async fn ordinary_running_apply_preserves_target_state_and_known_commit() {
+    let fixture = Fixture::new().await;
+    let shared = fixture.backend.conn();
+    let conn = shared.lock().await;
+    fixture.active(&conn);
+    let before = target_rows(&conn);
+    let prepared = fixture.ordinary_running(&conn, 210);
+    fixture.admit_ordinary(&conn, &prepared);
+    let result = fixture.apply_ordinary(&conn, &prepared);
+    assert!(
+        matches!(result, Ok(Ok(()))),
+        "activated unlocked target authority refused ordinary running apply"
+    );
+    let receipt = fixture
+        .ledger(&conn)
+        .lookup(
+            &fixture.key,
+            prepared.handle(),
+            prepared.handle.body.binding.caller,
+        )
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        receipt.state(),
+        AuditOperationState::Committed { version: 1 }
+    );
+    assert!(!receipt.terminal_recorded());
+    assert!(
+        target_rows(&conn) == before,
+        "ordinary running apply changed target authority"
+    );
+    let original = fixture.ledger(&conn);
+    assert!(matches!(
+        fixture.apply_ordinary(&conn, &prepared),
+        Ok(Ok(()))
+    ));
+    assert!(
+        serde_json::to_vec(&fixture.ledger(&conn)).unwrap()
+            == serde_json::to_vec(&original).unwrap(),
+        "known committed replay changed its retained audit obligation"
+    );
+    let crate::consensus::audit_mutation::AuditedConfigEffect::Append { commit, .. } =
+        &prepared.effect
+    else {
+        panic!("ordinary append fixture");
+    };
+    let (tx, encrypted, count): (Vec<u8>, Vec<u8>, u64) = conn
+        .query_row(
+            "SELECT tx_id,encrypted_blob,(SELECT COUNT(*) FROM config_history) FROM config_history WHERE version=1",
+            [],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+        )
+        .unwrap();
+    assert!(tx == commit.record.tx_id.as_uuid().as_bytes());
+    assert!(encrypted == commit.record.encrypted_blob);
+    assert_eq!(count, 1);
+}
+
+#[tokio::test]
+async fn ordinary_running_apply_refuses_equal_caller_without_running_lock_lease() {
+    let fixture = Fixture::new().await;
+    let shared = fixture.backend.conn();
+    let conn = shared.lock().await;
+    fixture.active(&conn);
+    let lock = fixture.request(&conn, 220, 2, 0x61, 0);
+    assert!(matches!(
+        fixture.submit(&conn, &lock),
+        AuditOperationState::TargetV1(_)
+    ));
+    fixture.settle(&conn, &lock);
+    let before = target_rows(&conn);
+    let prepared = fixture.ordinary_running(&conn, 221);
+    assert!(prepared.handle.body.binding.caller == lock.effect.caller);
+    fixture.admit_ordinary(&conn, &prepared);
+    assert!(
+        matches!(
+            fixture.apply_ordinary(&conn, &prepared),
+            Ok(Err(ConfigMutationFailure::Conflict))
+        ),
+        "caller equality supplied no exact running lock lease"
+    );
+    assert!(
+        target_rows(&conn) == before,
+        "refused running apply changed target authority"
+    );
+    assert_eq!(
+        conn.query_row("SELECT COUNT(*) FROM config_history", [], |r| r
+            .get::<_, u64>(0))
+            .unwrap(),
+        0
+    );
+    assert_eq!(
+        fixture
+            .ledger(&conn)
+            .lookup(
+                &fixture.key,
+                prepared.handle(),
+                prepared.handle.body.binding.caller
+            )
+            .unwrap()
+            .unwrap()
+            .state(),
+        AuditOperationState::Rejected
+    );
+    fixture
+        .apply(&conn, AuditCommand::Terminal(prepared.handle.clone()), 100)
+        .unwrap();
+    fixture.checkpoint(&conn);
+    let unlock = fixture.request(&conn, 222, 3, 0x61, 0);
+    assert!(matches!(
+        fixture.submit(&conn, &unlock),
+        AuditOperationState::TargetV1(_)
+    ));
+    fixture.settle(&conn, &unlock);
+    let allowed = fixture.ordinary_running(&conn, 223);
+    fixture.admit_ordinary(&conn, &allowed);
+    assert!(
+        matches!(fixture.apply_ordinary(&conn, &allowed), Ok(Ok(()))),
+        "unlocked ordinary running authority remained fenced"
+    );
+}

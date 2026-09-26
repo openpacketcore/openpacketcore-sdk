@@ -3728,7 +3728,7 @@ pub(crate) fn build_snapshot_database_for_profile_sync(
 
 #[cfg(test)]
 #[path = "../../tests/management_audit_authority/target_snapshots.rs"]
-mod target_snapshot_tests;
+pub(super) mod target_snapshot_tests;
 
 fn validate_snapshot_source_state_sync(
     conn: &Connection,

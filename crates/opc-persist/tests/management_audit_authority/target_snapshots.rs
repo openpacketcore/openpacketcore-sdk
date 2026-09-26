@@ -330,3 +330,27 @@ async fn target_snapshot_build_rejects_invalid_source_before_creating_output() {
         "failed build retained its read transaction"
     );
 }
+
+// Exercise the actual effect transaction from the target lifecycle fixtures.
+// This test-only adapter deliberately supplies no consensus or provider mock.
+pub(in crate::consensus) fn apply_ordinary_running(
+    conn: &Connection,
+    key: &AuditKey,
+    identity: ConsensusIdentity,
+    prepared: &crate::consensus::PreparedAuditedMutation,
+    keys: &crate::audit_authority::continuity::AuditKeyRing,
+) -> io::Result<Result<(), ConfigMutationFailure>> {
+    let tx = conn.unchecked_transaction().unwrap();
+    let result = apply_audited_mutation_sync(
+        &tx,
+        key,
+        identity,
+        prepared,
+        Some(keys),
+        Timestamp::from_offset_datetime(time::OffsetDateTime::from_unix_timestamp(100).unwrap()),
+        opc_consensus::ConsensusRequestId::from_bytes([0x73; 16]),
+        &SqliteWorkCancellation::new(),
+    )?;
+    tx.commit().unwrap();
+    Ok(result)
+}
