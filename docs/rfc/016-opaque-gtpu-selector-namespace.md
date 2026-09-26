@@ -1086,8 +1086,9 @@ awaits a separate non-aborting result receiver; dropping or cancelling it MUST
 NOT release ownership or cancel blocking kernel work while a durable effect is
 pending.
 
-One process polls exactly one such worker for a protected storage-scope
-commitment from durable lease acquisition through release. Other admitted
+The default API polls exactly one such worker per process for a protected
+storage-scope commitment from durable lease acquisition through release.
+Section 7.6 specifies the separately selected concurrent composition. Other admitted
 same-scope supervisors remain bounded and unpolled. This is required because a
 same-`OwnerId` store acquire denotes recovery by that replica and replaces its
 prior credential; overlapping local acquisitions would invalidate a live guard
@@ -1123,14 +1124,86 @@ backend step would cross the ten-second cadence; minting another authorization
 never restarts that cadence. Clear the worker's timing before awaiting renewal,
 so cancellation, failure, or a late reply cannot revive it. Every ledger CAS
 still submits the exact guard for the store's expiry, credential, fence, and
-generation checks. This timing belongs only to the non-cloneable worker lease;
-it is never cached on an authority or shared between operations.
+generation checks. In the default API this timing belongs only to the
+non-cloneable worker lease; it is never cached on an authority or shared between
+operations. Section 7.6 permits sharing one owned lease only within its bounded
+cohort, with the additional credential and settlement ordering specified there.
 
 The durable lock/CAS authority, not a process mutex, decides cross-process
 ownership. The process-local worker gate prevents only reentrant acquisition by
 one replica identity; it is not a distributed fence. Concurrent replicas with
 distinct owner identities still serialize through the durable generation/CAS
 and the host-global control-marker lock.
+
+### 7.6 Explicit Concurrent Operation Composition
+
+The default API retains §7.5's one-operation worker. An experimental
+`GtpuSessionSelectorConcurrentNamespace` selects a separate, explicit
+composition over an already opened authority. Clones of that handle share one
+SDK-owned cohort. Independently selected handles, open/provision/rebind,
+terminal namespace lifecycle operations, and default API workers still exclude
+that cohort through the same process-local storage-scope gate. No concurrent
+same-owner lease acquisition is permitted.
+
+The cohort exists only while admitted operations overlap. It owns one durable
+worker credential and the complete acquire-to-release scope gate. Each member
+first reserves the existing bounded process and namespace supervisor slots and
+its complete group/PAA/TEID conflict guards. Parent and child operations share
+the same PAA guard. The protected record's complete ownership validation,
+including legacy global marks, remains mandatory. Local guards are scheduling
+exclusions and never authority.
+
+The handle includes fresh and marked-child reconciliation, their existing
+recovery/retirement operations, exact never-admitted sealing, and the bounded
+single-bearer reattachment profile. Sealing reserves the complete desired graph
+and serializes its protected no-admission transition. Reattachment's exact PAA
+guard also excludes every eligible retired predecessor: the existing predicate
+requires an identical PAA, mark, endpoint and transport family, with only one
+fresh TEID selector. Source discovery, backend quiescence qualification and the
+atomic one-successor reservation are unchanged. This does not expose concurrent
+general mixed-selector transfer or accept a cached reuse authorization.
+
+Authenticated root read/transition/CAS/exact-readback sections serialize under
+one cohort transition mutex. The full inventory observation also holds that
+mutex. Independent backend installation/removal sections may overlap; the
+backend retains its existing bounded host-lock sections and exact receipts.
+The cohort lease mutex serializes renewal, window minting, and every durable
+mutation through its exact readback. A renew changes the exact guard expiry,
+so it cannot overtake a CAS using the previous guard. Each member receives a
+fresh affine backend window with the original conservative deadlines. Timing
+is never copied into a member or cached after cohort settlement. A failed,
+late, cancelled, expired, or clock-ambiguous renewal permanently clears the
+cohort's timing. Every member then fails closed before another effect.
+
+A successful nonfinal member may return after its own complete terminal durable
+readback and current-lease check. Its unrelated peers need not finish first.
+The last member awaits exact durable lease release before returning success.
+A failed release changes that member's successful result to indeterminate;
+a primary lifecycle failure is retained. This changes only the explicit
+composition's lease ownership lifetime, never mandatory lifecycle durability.
+
+The complete backend inventory may explain an absent Installing stamp only
+with an SDK-private live in-flight proof. The owner registers that proof after
+the exact protected reservation CAS/readback, while holding the transition
+mutex. It binds device, group, complete selector set, desired graph, pending
+and terminal generations/nonces. The complete legacy predicate still checks
+every present stamp and every settled group. A proof cannot explain a wrong
+present stamp, missing Active/Retired stamp, foreign key, wrong epoch,
+changed generation/nonce, or expired owner. Proof currentness is checked again
+before accepting inventory. It grants no new selector or traffic authority.
+
+The proof is invalidated when the owned operation settles and is never durable
+or available to a public caller. After process loss, retained Installing state
+has no such proof and must follow the exact existing recovery rules. Dropping
+an observer never cancels the detached worker, releases conflict guards,
+releases cohort membership, or removes its proof. Unexpected destruction of a
+concurrent worker invalidates its proofs and quarantines the cohort; bounded
+supervisor slots and the scope gate remain retained until process recovery.
+This cannot convert uncertain host work into permission for a new owner.
+
+This explicit composition does not change the single-record permanent-history
+capacity profile. It provides no sharding, compaction, publication-identity
+reuse, product lifecycle policy, capacity claim, or traffic proof.
 
 ## 8. Persistent eBPF Control Marker
 
@@ -1304,7 +1377,10 @@ protected ledger. An extra stamp proves a rolled-back or foreign ledger; a
 missing stamp for a terminal operation proves map loss or rollback. A pending
 operation with no current-operation stamp is admissible only when §7.4's exact
 pre-effect inventory also holds; it must enter recovery before the namespace
-can serve. An `Installing` operation durably recorded as not backend-started
+can serve. The explicit live concurrent composition in §7.6 additionally
+allows the exact SDK-owned in-flight Installing proof; it never survives
+process loss or substitutes for recovery evidence. An `Installing` operation
+durably recorded as not backend-started
 may have no stamp and can only start its same precommitted coordinate under the
 exact recovery rule in §7.4. A missing, malformed, stale, wrong-generation,
 wrong-nonce, wrong-epoch, wrong-commitment, or journal-mismatched stamp is

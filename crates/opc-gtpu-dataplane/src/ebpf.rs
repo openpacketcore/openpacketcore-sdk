@@ -3031,6 +3031,25 @@ fn selector_operation_stamp_inventory_is_exact(
     expected: &crate::selector_namespace::SelectorOperationStampInventory,
     observed: &[SelectorOperationStampRecord],
 ) -> bool {
+    // Only a live SDK owner of an exactly committed Installing coordinate can
+    // explain an absent stamp while another independent operation progresses.
+    // The original complete validator still checks every present/settled key.
+    if !expected.has_concurrent_proofs() {
+        return selector_operation_stamp_inventory_is_exact_serial(binding, expected, observed);
+    }
+    let keys = observed.iter().map(|(key, _)| *key).collect();
+    let Some(projected) = expected.concurrent_projection(&keys) else {
+        return false;
+    };
+    selector_operation_stamp_inventory_is_exact_serial(binding, &projected, observed)
+        && expected.concurrent_proofs_are_current()
+}
+
+fn selector_operation_stamp_inventory_is_exact_serial(
+    binding: crate::selector_namespace::GtpuSessionSelectorBackendBinding,
+    expected: &crate::selector_namespace::SelectorOperationStampInventory,
+    observed: &[SelectorOperationStampRecord],
+) -> bool {
     let expectations = expected.expectations();
     if expectations.len() != observed.len()
         || observed.windows(2).any(|pair| pair[0].0 >= pair[1].0)

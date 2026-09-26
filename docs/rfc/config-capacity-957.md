@@ -63,6 +63,7 @@ to the repository root at the revision above.
 | Snapshot creation/transfer | SQLite body at most 68,719,476,736 bytes plus 50-byte footer; 1,048,576-byte chunks/copy buffers; at most 8,192 directory entries; storage operation bound 60 seconds. Existing profile triggers after 4,096 logs and retains 1,024 logs. | `crates/opc-persist/src/consensus/storage.rs`; `crates/opc-consensus/src/profile.rs` |
 | Retained history | Explicit limits support 2–1,000,000 records and 1–1,073,741,824 canonical bytes. They become authoritative through acknowledged retention; they are not a default total database-size cap. | `crates/opc-persist/src/consensus/history.rs`, `ConfigHistoryLimits` |
 | Exact-operation results | Ordinary internal results expire after a 4,096-applied-sequence window; they have no public read-only lookup. Audited operations have a distinct caller-bound lookup and bounded ledger. History, ordinary results and audit reservations have different retention rules. | `crates/opc-persist/src/consensus/sqlite.rs`, `read_outcome_sync`; `store/audit.rs`, `lookup_audit_operation` |
+| Retained startup concurrency | Four provision/reopen workers per process, including cancelled blocking work. Admission is fail-fast before spawning a worker; a caller-selected timeout must be positive and at most 3,600 seconds. This limits concurrent opening, not the number of already-open stores or consensus members. | `crates/opc-persist/src/retained.rs`, `ADMISSION_GATE`, `open_authority`, `RetainedConfigOptions::new` |
 | Reopen and restoration | Retained admission has a caller-selected byte budget, at most 68,719,476,736 bytes, for database plus recovery journals. Snapshot restore checks identity, checksum, membership, schema and bounded log/record structure. Disk space, journal space and validation copies remain separate requirements. | `crates/opc-persist/src/retained.rs`; `crates/opc-persist/src/consensus/{storage,sqlite}.rs` |
 | Readback/watch | Local history pages at most 64 records. Remote watch requests at most 16,384 bytes, responses at most 8,388,608 bytes, 32 concurrent connections and 256 client identities. Existing adaptive paging halves an oversized request down to one record while preserving its cursor. | `crates/opc-persist/src/types.rs`; `crates/opc-config-bus-consensus/src/remote_watch.rs`, `load_page_adaptive` |
 | Aggregate memory/storage | Existing component limits do not constitute a whole-process RSS cap or an automatically provisioned storage budget. Generic config models can have arbitrary heap amplification. | All boundaries above; qualification must measure composition. |
@@ -89,6 +90,7 @@ length, inspect plaintext inside consensus, or allocate the rejected encoding.
 | Complete configuration command | 1,966,080 | Dedicated hard ceiling; leaves 64,980 bytes beyond the combination above |
 | Complete private RPC | 2,097,152 | Unchanged; 131,072 bytes beyond the command ceiling for engine/forwarding framing |
 | Complete durable JSON entry | 16,777,216 | Unchanged; exact serialized-entry preflight is also mandatory |
+| Snapshot identifier | 128 | UTF-8 bytes in the bounded profile; SDK-generated identifiers are 36-byte UUIDs; applies to RPC and retained metadata |
 
 This choice admits values strictly above 1 MiB without widening a shared
 transport family or borrowing session-roster exceptions. The remaining RPC
@@ -299,6 +301,13 @@ and cancelled inbound traffic and the existing maximum of nine members. A
 three-node functional test does not qualify the maximum fan-out. Config
 admission cannot claim to bound memory already allocated by an unrelated
 transport listener.
+
+The existing four-worker retained-startup gate remains separate from the
+eight per-store preparation reservations and eight accepted-proposal slots.
+Provisioning or reopening nine members in one process must respect that
+startup gate; it must not enlarge the gate or retry an indeterminate open.
+Qualification must separate initial provisioning from starting consensus
+cores so its own setup does not force elections against unprovisioned peers.
 
 Snapshots remain file-backed and chunked. Installation must restore the full
 configuration, audit and replay binding atomically with the applied frontier.
