@@ -3005,3 +3005,7 @@ mod tests {
 #[cfg(test)]
 #[path = "../../tests/management_audit_authority/running_replacement.rs"]
 mod running_replacement_tests;
+
+#[cfg(test)]
+#[path = "../../tests/management_audit_authority/running_quorum_revocation.rs"]
+mod running_quorum_revocation_tests;
