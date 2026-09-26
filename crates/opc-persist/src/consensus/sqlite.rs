@@ -3302,6 +3302,15 @@ pub(crate) fn apply_entries_cancellable_sync(
                 }
             }
             EntryPayload::Normal(command) => {
+                #[cfg(test)]
+                let _observed_apply = match &command.intent {
+                    ConfigMutationIntent::AuditedMutation(prepared) => Some(
+                        super::config_capacity_simultaneous_working_tests::ledger::applying(
+                            prepared,
+                        ),
+                    ),
+                    _ => None,
+                };
                 command
                     .validate(identity)
                     .map_err(|_| invalid_data("invalid committed config consensus command"))?;

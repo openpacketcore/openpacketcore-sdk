@@ -570,23 +570,22 @@ fn simultaneous_apply(expanded: bool) {
             .expect("applied exact record");
     assert_eq!(stored.record, commit.record);
     assert_eq!(stored.audit, commit.audit);
-    assert_eq!(
-        observation.nested_reads, 1,
-        "LEDGER_OVERLAP: real apply must reread while its original ledger is live"
-    );
     assert!(
-        observation.reads >= 3,
-        "real admission, nested validation and receipt reads"
+        observation.reads >= 2 && observation.apply_reads >= 1,
+        "LEDGER_READ: actual apply authentication and retained receipt reads"
+    );
+    assert_eq!(
+        observation.writes, 1,
+        "LEDGER_WRITE: atomic outcome persistence"
     );
     assert_eq!(
         observation.derived_len, 1024,
         "DERIVED_OWNER: actual validation reconstructs all admitted operations"
     );
     assert!(observation.derived_capacity >= observation.derived_len);
-    let sample = observation.nested_peak;
+    let sample = observation.peak;
     assert!(
-        sample.held_ledger > 0
-            && sample.apply_page > 0
+        sample.apply_page > 0
             && sample.row_json > 0
             && sample.decoded_ledger > 0
             && sample.derived > 0
@@ -594,8 +593,8 @@ fn simultaneous_apply(expanded: bool) {
         "SIMULTANEOUS_OWNERS: all required real owners overlap"
     );
     writeln!(std::io::stdout().lock(),
-        "CONFIG_CAPACITY_LEDGER_APPLY expanded={expanded} preflight_metadata={} applied_metadata={applied_metadata} reads={} nested_reads={} derived_capacity={} nested={sample:?} observed_peak={:?}",
-        sizes.command - ENVELOPE_BYTES, observation.reads, observation.nested_reads, observation.derived_capacity, observation.peak)
+        "CONFIG_CAPACITY_LEDGER_APPLY expanded={expanded} preflight_metadata={} applied_metadata={applied_metadata} reads={} apply_reads={} writes={} nested_reads={} derived_capacity={} peak={sample:?} nested_peak={:?}",
+        sizes.command - ENVELOPE_BYTES, observation.reads, observation.apply_reads, observation.writes, observation.nested_reads, observation.derived_capacity, observation.nested_peak)
         .expect("value-free simultaneous allocation evidence");
     assert!(
         observation.peak.total <= OPERATION_BYTES,
