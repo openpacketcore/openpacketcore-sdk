@@ -14,6 +14,9 @@ use opc_key::{EnvelopeAad, EnvelopeMetadata, KeyId};
 use opc_types::{ConfigVersion, SchemaDigest, TenantId, Timestamp, TxId};
 use sha2::{Digest, Sha256};
 
+#[path = "tests/config_capacity_957_ledger_observation.rs"]
+pub(crate) mod ledger;
+
 const OPERATION_BYTES: usize = 33_554_432;
 const PROFILE: ConfigCapacityProfile = ConfigCapacityProfile::BoundedV1;
 

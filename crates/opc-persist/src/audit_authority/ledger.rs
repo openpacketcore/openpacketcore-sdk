@@ -501,6 +501,9 @@ impl LedgerState {
         let mut sequence = self.floor;
         let mut previous = self.predecessor;
         let mut derived: Vec<LedgerOperation> = Vec::new();
+        #[cfg(test)]
+        let observed_derived =
+            crate::consensus::config_capacity_simultaneous_working_tests::ledger::derived();
         for entry in &self.entries {
             sequence = sequence
                 .checked_add(1)
@@ -590,6 +593,8 @@ impl LedgerState {
                     }
                 }
             }
+            #[cfg(test)]
+            observed_derived.observe(&derived);
             previous = entry.mac;
         }
         if derived != self.operations {
@@ -652,6 +657,11 @@ fn authenticator<T: Serialize>(
     value: &T,
 ) -> Result<Hmac<Sha256>, AuditAuthorityError> {
     let encoded = serde_json::to_vec(value).map_err(|_| AuditAuthorityError::InvalidInput)?;
+    #[cfg(test)]
+    let _observed_authentication =
+        crate::consensus::config_capacity_simultaneous_working_tests::ledger::authentication(
+            &encoded,
+        );
     if encoded.len() > MAX_STATE_BYTES {
         return Err(AuditAuthorityError::InvalidInput);
     }

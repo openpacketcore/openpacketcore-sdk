@@ -201,3 +201,6 @@ pub(super) fn preflight(
 #[cfg(test)]
 #[path = "config_capacity_encoding_admission_tests.rs"]
 mod tests;
+
+#[cfg(test)]
+mod config_capacity_ledger_working_tests;
