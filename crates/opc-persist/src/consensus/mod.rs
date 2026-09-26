@@ -18,6 +18,7 @@ mod snapshot_file;
 mod sqlite;
 pub(crate) use sqlite::run_backend_sqlite_with_timeout;
 mod storage;
+pub(crate) use storage::ConfigConsensusStorageError;
 mod store;
 mod types;
 
