@@ -341,7 +341,7 @@ pub(in crate::consensus) fn apply_ordinary_running(
     keys: &crate::audit_authority::continuity::AuditKeyRing,
 ) -> io::Result<Result<(), ConfigMutationFailure>> {
     let tx = conn.unchecked_transaction().unwrap();
-    let result = apply_audited_mutation_sync(
+    let result = apply_audited_mutation_for_profile_sync(
         &tx,
         key,
         identity,
@@ -350,6 +350,7 @@ pub(in crate::consensus) fn apply_ordinary_running(
         Timestamp::from_offset_datetime(time::OffsetDateTime::from_unix_timestamp(100).unwrap()),
         opc_consensus::ConsensusRequestId::from_bytes([0x73; 16]),
         &SqliteWorkCancellation::new(),
+        RetainedConfigProfile::NetconfTargetsV1,
     )?;
     tx.commit().unwrap();
     Ok(result)

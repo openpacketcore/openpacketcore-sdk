@@ -11388,11 +11388,7 @@ impl Fixture {
         conn: &Connection,
         request: u8,
     ) -> crate::consensus::PreparedAuditedMutation {
-        use crate::consensus::audit_mutation::AuditedConfigEffect;
-        use opc_crypto::encrypt_attested_envelope_with_handle_and_nonce;
-        use opc_key::{ConfigAad, EnvelopeAad, KeyHandle, KeyId, KeyPurpose};
         use rusqlite::OptionalExtension;
-        use sha2::{Digest, Sha256};
 
         let previous: Option<(Vec<u8>, u64)> = conn
             .query_row(
@@ -11405,6 +11401,21 @@ impl Fixture {
         let base = previous.as_ref().map_or(0, |(_, version)| *version);
         let parent = previous
             .map(|(bytes, _)| opc_types::TxId::from_uuid(uuid::Uuid::from_slice(&bytes).unwrap()));
+        self.ordinary_running_at(base, parent, None, request)
+    }
+
+    fn ordinary_running_at(
+        &self,
+        base: u64,
+        parent: Option<opc_types::TxId>,
+        deadline: Option<opc_types::Timestamp>,
+        request: u8,
+    ) -> crate::consensus::PreparedAuditedMutation {
+        use crate::consensus::audit_mutation::AuditedConfigEffect;
+        use opc_crypto::encrypt_attested_envelope_with_handle_and_nonce;
+        use opc_key::{ConfigAad, EnvelopeAad, KeyHandle, KeyId, KeyPurpose};
+        use sha2::{Digest, Sha256};
+
         let tx_id = opc_types::TxId::new();
         let committed_at = opc_types::Timestamp::from_offset_datetime(
             time::OffsetDateTime::from_unix_timestamp(100).unwrap(),
@@ -11442,7 +11453,7 @@ impl Fixture {
                 plaintext_digest: Sha256::digest(plaintext).to_vec(),
                 encrypted_blob: encrypted.encoded().to_vec(),
                 rollback_point: false,
-                confirmed_deadline: None,
+                confirmed_deadline: deadline,
             },
             Vec::new(),
             &self.key,
@@ -11452,6 +11463,15 @@ impl Fixture {
             commit: Box::new(commit),
             resolution: None,
         };
+        self.ordinary_with_effect(effect, base, request)
+    }
+
+    fn ordinary_with_effect(
+        &self,
+        effect: crate::consensus::audit_mutation::AuditedConfigEffect,
+        base: u64,
+        request: u8,
+    ) -> crate::consensus::PreparedAuditedMutation {
         let mutation = effect.digest(&self.key).unwrap();
         let event = self.event(request);
         let binding =
@@ -11621,3 +11641,6 @@ async fn ordinary_running_apply_refuses_equal_caller_without_running_lock_lease(
         "unlocked ordinary running authority remained fenced"
     );
 }
+
+#[path = "ordinary_running.rs"]
+mod ordinary_running;

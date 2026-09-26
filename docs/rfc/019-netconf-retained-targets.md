@@ -63,6 +63,17 @@ running gNMI and NETCONF writes continue through their current required port;
 when the full profile is active, its retained debt/lifecycle fences also apply
 to those writes at the shared authority boundary.
 
+The ordinary running effect carries no retained session or lock lease. Under the
+explicitly selected target profile, a new effect therefore requires active device
+state, no held running lock, and no pending confirmation or cleanup. Equal
+projected principal/tenant identities cannot replace the exact lock capability.
+Candidate/startup locks alone do not fence an unrelated running effect. Ordinary
+append cannot install a confirmed deadline or resolve a pending commit; those
+changes require the closed target transition. A previously committed original
+operation still returns its known result while terminal persistence or checkpoint
+acknowledgement is owed. Already-admitted later effects remain fenced until that
+original obligation is settled, without replacing their original intents.
+
 The submission surface has these signatures (the proposed types above are not
 yet available):
 

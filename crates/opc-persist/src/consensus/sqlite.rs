@@ -2926,6 +2926,33 @@ fn apply_audited_mutation_sync(
     request_id: opc_consensus::ConsensusRequestId,
     cancellation: &SqliteWorkCancellation,
 ) -> io::Result<Result<(), ConfigMutationFailure>> {
+    apply_audited_mutation_for_profile_sync(
+        conn,
+        key,
+        identity,
+        prepared,
+        audit_keys,
+        logical_time,
+        request_id,
+        cancellation,
+        RetainedConfigProfile::Legacy,
+    )
+}
+
+// The independently admitted profile is supplied by the authority, never
+// inferred from a command tag or the presence of target tables.
+#[allow(clippy::too_many_arguments)]
+fn apply_audited_mutation_for_profile_sync(
+    conn: &Connection,
+    key: &AuditKey,
+    identity: ConsensusIdentity,
+    prepared: &super::PreparedAuditedMutation,
+    audit_keys: Option<&crate::audit_authority::continuity::AuditKeyRing>,
+    logical_time: Timestamp,
+    request_id: opc_consensus::ConsensusRequestId,
+    cancellation: &SqliteWorkCancellation,
+    profile: RetainedConfigProfile,
+) -> io::Result<Result<(), ConfigMutationFailure>> {
     use crate::audit_authority::AuditOperationState;
     let invalid = || invalid_data("invalid audited configuration mutation");
     if prepared.verify_effect(key).is_err() {
@@ -2965,7 +2992,23 @@ fn apply_audited_mutation_sync(
             return Ok(Err(ConfigMutationFailure::InvalidInput));
         }
     }
-    validate_sealed_state_sync(conn, key, cancellation)?;
+    let target_allows_effect = match profile {
+        RetainedConfigProfile::Legacy => {
+            validate_sealed_state_sync(conn, key, cancellation)?;
+            true
+        }
+        RetainedConfigProfile::NetconfTargetsV1 => {
+            validate_live_history_schema_for_profile(conn, cancellation, profile)?;
+            validate_sealed_state_contents_sync(conn, key, cancellation)?;
+            super::audit_targets::ordinary_running_allowed_sync(
+                conn,
+                key,
+                &ledger,
+                &prepared.effect,
+                cancellation,
+            )?
+        }
+    };
     let current_version: u64 = conn
         .query_row(
             "SELECT COALESCE(MAX(version),0) FROM config_history",
@@ -2974,7 +3017,8 @@ fn apply_audited_mutation_sync(
         )
         .map_err(db_error)?;
     let now = logical_time.as_offset_datetime().unix_timestamp();
-    let live = prepared.handle.require_live(now).is_ok()
+    let live = target_allows_effect
+        && prepared.handle.require_live(now).is_ok()
         && current_version == prepared.handle.body.binding.base_version;
     conn.execute_batch("SAVEPOINT audited_config_effect")
         .map_err(db_error)?;

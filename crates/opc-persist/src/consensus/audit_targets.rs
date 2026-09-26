@@ -752,6 +752,40 @@ pub(super) fn validate_inactive_sync(
     state.validate_anchor(ledger.as_ref())
 }
 
+/// An ordinary running effect has no retained session or exact lock lease.
+/// Authenticate the same target state and ledger anchor before deciding whether
+/// it may proceed. Refusal is a definite rejection of this effect; it never
+/// changes target state or resolves pending confirmation on the caller's behalf.
+pub(super) fn ordinary_running_allowed_sync(
+    conn: &Connection,
+    key: &AuditKey,
+    ledger: &LedgerState,
+    effect: &super::audit_mutation::AuditedConfigEffect,
+    cancellation: &SqliteWorkCancellation,
+) -> io::Result<bool> {
+    let state = read_state_sync(conn, key, ledger.identity, cancellation)?;
+    state.validate_anchor(Some(ledger))?;
+    if state.profile.activation_operation.is_none()
+        || state.lifecycle.device_ownership.is_none()
+        || state.lifecycle.locks[0]
+            .as_ref()
+            .is_some_and(|lock| lock.session.is_some())
+        || state.lifecycle.pending_confirmation.is_some()
+        || state.lifecycle.cleanup.iter().any(Option::is_some)
+    {
+        // Equal projected callers do not prove possession of a lock lease.
+        return Ok(false);
+    }
+    use super::audit_mutation::AuditedConfigEffect;
+    Ok(match effect {
+        AuditedConfigEffect::Append { commit, resolution } => {
+            commit.record.confirmed_deadline.is_none() && resolution.is_none()
+        }
+        AuditedConfigEffect::Confirm { .. } => false,
+        AuditedConfigEffect::RollbackPoint { .. } => true,
+    })
+}
+
 impl TargetState {
     fn advance_target(
         &mut self,
