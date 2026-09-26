@@ -213,6 +213,11 @@ impl Drop for SqliteWorkCancelOnDrop {
 }
 
 impl SqliteWorkCancellation {
+    #[cfg(test)]
+    pub(crate) fn new_for_capacity_observation() -> Self {
+        Self::new()
+    }
+
     fn new() -> Self {
         Self {
             state: AtomicU8::new(SQLITE_WORK_RUNNING),
@@ -3119,7 +3124,12 @@ fn apply_audited_mutation_sync(
             return Ok(Err(ConfigMutationFailure::InvalidInput));
         }
     }
+    #[cfg(test)]
+    let observed_ledger =
+        super::config_capacity_simultaneous_working_tests::ledger::held(&ledger, prepared);
     validate_sealed_state_for_profile_sync(conn, identity, key, capacity_profile, cancellation)?;
+    #[cfg(test)]
+    drop(observed_ledger);
     let current_version: u64 = conn
         .query_row(
             "SELECT COALESCE(MAX(version),0) FROM config_history",

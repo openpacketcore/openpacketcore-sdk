@@ -189,6 +189,11 @@ fn read_verified_sync(conn: &Connection, key: &AuditKey) -> io::Result<StoredLed
     ).optional().map_err(|_| invalid())?.ok_or_else(invalid)?;
     let mac: [u8; 32] = mac.try_into().map_err(|_| invalid())?;
     let stored: StoredLedger = serde_json::from_slice(&encoded).map_err(|_| invalid())?;
+    #[cfg(test)]
+    let observed_read = super::config_capacity_simultaneous_working_tests::ledger::read(
+        &encoded,
+        stored.ledger.as_ref(),
+    );
     let length = canonical_state_len(&stored)?;
     stream_state(&stored, key, length, None)?
         .verify_slice(&mac)
@@ -207,6 +212,8 @@ fn read_verified_sync(conn: &Connection, key: &AuditKey) -> io::Result<StoredLed
     if !matches {
         return Err(invalid());
     }
+    #[cfg(test)]
+    drop(observed_read);
     Ok(stored)
 }
 
