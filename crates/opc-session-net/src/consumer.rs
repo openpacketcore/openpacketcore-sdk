@@ -20867,6 +20867,9 @@ where
     }
 }
 #[cfg(test)]
+mod payload_profile;
+
+#[cfg(test)]
 mod tests {
     use std::io;
     use std::net::SocketAddr;
