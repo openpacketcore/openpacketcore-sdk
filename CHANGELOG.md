@@ -33,6 +33,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- `opc-gtpu-dataplane`: resolve an exact existing Active parent inside fenced
+  child admission with `reconcile_bearer_under_active_parent`. Avoid a separate
+  parent recovery lease while retaining selector reservations, fresh backend
+  qualification, all child writes/readbacks and supervised recovery. Refs #975.
+
 - `opc-session-testkit`: compose independent authenticated consumers over the
   same three voters with separate retained journals, and clone paired protected
   backends without a second journal open. Add fixed numeric consensus peer-call
