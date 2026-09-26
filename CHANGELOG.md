@@ -12,7 +12,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Preserve bounded configuration preparation and proposal ownership until
   native storage drains after response loss. Authenticate retained results,
   retain the committed snapshot frontier, and refuse mismatched retained
-  identities. The experimental capacity profile remains under qualification.
+  identities. Release completed audit preflight ledgers before checkpoint and
+  native submission. The experimental capacity profile remains under qualification.
   Refs #957, #960.
 
 - Consume the exact Openraft 0.9.25 fork revision with bounded native apply

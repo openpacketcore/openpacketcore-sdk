@@ -3237,6 +3237,9 @@ pub(crate) fn apply_entries_cancellable_sync(
     audit_keys: Option<&crate::audit_authority::continuity::AuditKeyRing>,
     capacity_profile: ConfigCapacityProfile,
 ) -> io::Result<Vec<ConfigConsensusResponse>> {
+    #[cfg(all(test, target_os = "linux"))]
+    let _caller_ledger_observation =
+        super::store::config_capacity_caller_ledger_observation::NativeApply::start(&entries);
     if entries.len() > CONFIG_CONSENSUS_LOG_APPEND_MAX_ENTRIES {
         return Err(invalid_data(
             "config consensus apply exceeds entry-count limit",

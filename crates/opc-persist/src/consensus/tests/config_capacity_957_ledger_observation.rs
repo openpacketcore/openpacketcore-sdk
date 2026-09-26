@@ -27,6 +27,7 @@ pub(crate) struct Sample {
     pub(crate) encryption_alias: usize,
     pub(crate) recovery: usize,
     pub(crate) held_ledger: usize,
+    pub(crate) caller_ledger: usize,
     pub(crate) row_json: usize,
     pub(crate) write_json: usize,
     pub(crate) decoded_ledger: usize,
@@ -54,7 +55,13 @@ thread_local! {
 }
 
 fn sample(observation: &mut Observation) {
+    #[cfg(target_os = "linux")]
+    let caller_ledger =
+        crate::consensus::store::config_capacity_caller_ledger_observation::current_bytes();
+    #[cfg(not(target_os = "linux"))]
+    let caller_ledger = 0;
     let mut current = Sample {
+        caller_ledger,
         // The guard borrows the actual decoded command through its apply and
         // retained receipt read, ending before that moved entry is dropped.
         apply_page: observation.owners[APPLY],
@@ -72,6 +79,7 @@ fn sample(observation: &mut Observation) {
         current.encryption_alias,
         current.recovery,
         current.held_ledger,
+        current.caller_ledger,
         current.row_json,
         current.write_json,
         current.decoded_ledger,
@@ -89,7 +97,7 @@ fn sample(observation: &mut Observation) {
     }
 }
 
-fn ledger_heap(ledger: &LedgerState) -> usize {
+pub(crate) fn ledger_heap(ledger: &LedgerState) -> usize {
     assert!(
         ledger.continuity.is_none(),
         "fixture excludes continuity rows"

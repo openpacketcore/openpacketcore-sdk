@@ -16,6 +16,8 @@ mod config_capacity_review_tests;
 #[cfg(test)]
 mod config_capacity_rpc_tests;
 #[cfg(all(test, target_os = "linux"))]
+pub(super) use tests::config_capacity_caller_ledger_tests::observation as config_capacity_caller_ledger_observation;
+#[cfg(all(test, target_os = "linux"))]
 pub(super) use tests::config_capacity_cost_tests::observation as config_capacity_cost_observation;
 
 use std::collections::{BTreeMap, BTreeSet};
@@ -2458,6 +2460,8 @@ impl ConfigStore for ConsensusConfigStore {
 mod tests {
     #[cfg(target_os = "linux")]
     pub(super) mod config_capacity_accepted_tests;
+    #[cfg(target_os = "linux")]
+    pub(super) mod config_capacity_caller_ledger_tests;
     #[cfg(target_os = "linux")]
     pub(super) mod config_capacity_cost_tests;
     mod config_capacity_encoding_tests;

@@ -525,6 +525,10 @@ impl ConsensusConfigStore {
             Ok(ledger) => ledger,
             Err(error) => return AuditAdmission::Rejected(error),
         };
+        #[cfg(all(test, target_os = "linux"))]
+        let ledger = super::config_capacity_caller_ledger_observation::CallerLedger::observe(
+            request, ledger,
+        );
         // A pruned, expired handle cannot reuse an older successful request
         // cache entry as admission. Existing retained receipts remain readable
         // after expiry; only a proven absent operation requires a live handle.
@@ -543,9 +547,10 @@ impl ConsensusConfigStore {
             }
             Ok(Some(_)) => {}
         }
-        if matches!(command, ConfigMutationIntent::AuditedMutation(_))
-            && self.inner.audit_continuity.is_some()
-        {
+        let checkpoint_before_submission =
+            matches!(command, ConfigMutationIntent::AuditedMutation(_))
+                && self.inner.audit_continuity.is_some();
+        if checkpoint_before_submission {
             let receipt = match ledger.lookup(self.inner.backend.audit_key(), handle, caller) {
                 Ok(Some(receipt)) => receipt,
                 _ => return AuditAdmission::Rejected(AuditAuthorityError::BindingMismatch),
@@ -562,6 +567,12 @@ impl ConsensusConfigStore {
             {
                 return AuditAdmission::Rejected(AuditAuthorityError::RecoveryRequired);
             }
+        }
+        // The authenticated preflight decision is complete. Checkpoint and
+        // apply read their own current ledger; retaining this copy across either
+        // await would overlap an unnecessary decoded audit allocation.
+        drop(ledger);
+        if checkpoint_before_submission {
             if let Err(error) = self.checkpoint_audit_tail().await {
                 return AuditAdmission::Rejected(error);
             }
