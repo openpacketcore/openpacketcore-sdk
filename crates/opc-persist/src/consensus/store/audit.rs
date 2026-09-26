@@ -377,6 +377,7 @@ impl ConsensusConfigStore {
             self.inner.identity,
             request,
             &command,
+            self.config_profile(),
         )
         .is_err()
         {
@@ -756,6 +757,7 @@ impl ConsensusConfigStore {
                 self.inner.identity,
                 request,
                 command,
+                self.config_profile(),
             )
             .is_err()
             {

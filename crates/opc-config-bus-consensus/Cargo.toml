@@ -13,6 +13,9 @@ documentation = "https://docs.rs/opc-config-bus-consensus"
 keywords = ["5g", "cnf", "config", "consensus", "openraft"]
 categories = ["network-programming", "data-structures"]
 
+[features]
+required-netconf-audit = ["opc-config-bus/required-netconf-audit"]
+
 [dependencies]
 async-trait = { workspace = true }
 futures-util = "0.3"

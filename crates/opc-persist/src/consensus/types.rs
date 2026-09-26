@@ -451,7 +451,16 @@ impl ConfigConsensusCommand {
     }
 
     /// Validate scope, schema, and encrypted command contents.
+    #[cfg(test)]
     pub(crate) fn validate(&self, identity: ConsensusIdentity) -> Result<(), PersistError> {
+        self.validate_for_profile(identity, super::RetainedConfigProfile::Legacy)
+    }
+
+    pub(crate) fn validate_for_profile(
+        &self,
+        identity: ConsensusIdentity,
+        profile: super::RetainedConfigProfile,
+    ) -> Result<(), PersistError> {
         let has_inline_rollback_label = self.intent.inline_rollback_label()?.is_some();
         let supported_revision = match self.schema_version {
             LEGACY_CONFIG_CONSENSUS_COMMAND_VERSION => {
@@ -466,6 +475,9 @@ impl ConfigConsensusCommand {
             4 => self.intent.minimum_command_version() <= 4,
             5 => self.intent.minimum_command_version() <= 5,
             6 => self.intent.minimum_command_version() <= 6,
+            9 if profile == super::RetainedConfigProfile::NetconfTargetsV1 => {
+                self.intent.minimum_command_version() <= 9
+            }
             CONFIG_CONSENSUS_COMMAND_VERSION => {
                 self.intent.minimum_command_version() <= CONFIG_CONSENSUS_COMMAND_VERSION
             }
@@ -489,7 +501,7 @@ impl ConfigConsensusCommand {
                     intent: prepared.effect.intent(),
                     ..self.clone()
                 };
-                nested.validate(identity)?;
+                nested.validate_for_profile(identity, profile)?;
             }
             ConfigMutationIntent::ClearRecoveryRequired { .. } => {}
             ConfigMutationIntent::MarkConfirmed { .. } => {}
@@ -564,8 +576,16 @@ pub(crate) struct ConfigWirePayload<T> {
     value: T,
 }
 
+#[cfg(test)]
 pub(crate) fn encode_config_wire<T: Serialize + ?Sized>(
     value: &T,
+) -> Result<Vec<u8>, opc_consensus::ConsensusCodecError> {
+    encode_config_wire_for_profile(value, super::RetainedConfigProfile::Legacy)
+}
+
+pub(crate) fn encode_config_wire_for_profile<T: Serialize + ?Sized>(
+    value: &T,
+    profile: super::RetainedConfigProfile,
 ) -> Result<Vec<u8>, opc_consensus::ConsensusCodecError> {
     #[derive(Serialize)]
     struct BorrowedConfigWirePayload<'a, T: ?Sized> {
@@ -573,16 +593,24 @@ pub(crate) fn encode_config_wire<T: Serialize + ?Sized>(
         value: &'a T,
     }
     opc_consensus::encode_bounded(&BorrowedConfigWirePayload {
-        revision: CONFIG_CONSENSUS_WIRE_VERSION,
+        revision: profile.wire_revision(),
         value,
     })
 }
 
+#[cfg(test)]
 pub(crate) fn decode_config_wire<T: serde::de::DeserializeOwned>(
     bytes: &[u8],
 ) -> Result<T, opc_consensus::ConsensusCodecError> {
+    decode_config_wire_for_profile(bytes, super::RetainedConfigProfile::Legacy)
+}
+
+pub(crate) fn decode_config_wire_for_profile<T: serde::de::DeserializeOwned>(
+    bytes: &[u8],
+    profile: super::RetainedConfigProfile,
+) -> Result<T, opc_consensus::ConsensusCodecError> {
     let payload: ConfigWirePayload<T> = opc_consensus::decode_bounded(bytes)?;
-    if payload.revision != CONFIG_CONSENSUS_WIRE_VERSION {
+    if payload.revision != profile.wire_revision() {
         return Err(opc_consensus::ConsensusCodecError::Decode);
     }
     Ok(payload.value)

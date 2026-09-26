@@ -901,3 +901,6 @@ fn target_empty_commit_command_preserves_allocated_phases_and_strict_bytes() {
         );
     }
 }
+
+#[path = "runtime_profile.rs"]
+mod runtime_profile_tests;

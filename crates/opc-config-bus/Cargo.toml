@@ -14,12 +14,16 @@ readme = "README.md"
 documentation = "https://docs.rs/opc-config-bus"
 keywords = ["5g", "cnf", "config", "telecom", "packet-core"]
 categories = ["network-programming", "data-structures"]
+[features]
+required-netconf-audit = ["dep:opc-persist"]
+
 [dependencies]
 async-trait = { workspace = true }
 futures-util = "0.3"
 opc-alarm = { path = "../opc-alarm", version = "0.2.0" }
 opc-config-model = { path = "../opc-config-model", version = "0.2.0" }
 opc-mgmt-audit = { path = "../opc-mgmt-audit", version = "0.2.0" }
+opc-persist = { path = "../opc-persist", version = "0.2.0", optional = true }
 opc-crypto = { path = "../opc-crypto", version = "0.2.0" }
 opc-key = { path = "../opc-key", version = "0.2.0" }
 opc-types = { path = "../opc-types", version = "0.2.0" }

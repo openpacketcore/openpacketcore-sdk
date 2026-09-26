@@ -1,6 +1,8 @@
 //! NETCONF server core.
 
 mod required_audit;
+#[cfg(feature = "required-netconf-audit")]
+mod retained_locks;
 use required_audit::ServerAudit;
 
 use std::future::Future;
@@ -189,6 +191,15 @@ impl<C: OpcConfig> From<RpcHandlingResult> for RpcSessionHandlingResult<C> {
 
 pub(crate) enum RpcSessionAction<C: OpcConfig> {
     StartNetconfNotifications(ConfigReceiver<C>),
+}
+
+/// Controls and authority borrowed from the actual transport runner. The
+/// numeric registry remains a legacy control plane, never retained lock authority.
+pub(crate) struct SessionRpcContext<'a> {
+    pub(crate) controls: Option<(u64, &'a SessionRegistry)>,
+    pub(crate) active_subscription_count: usize,
+    #[cfg(feature = "required-netconf-audit")]
+    pub(crate) retained: Option<&'a opc_config_bus::NetconfSession>,
 }
 
 struct RpcExecContext<'a> {
@@ -514,6 +525,8 @@ where
     authz: ReadAuthorizer<'static, P>,
     audit: Arc<ServerAudit<A>>,
     required_config_audit: Option<opc_config_bus::RequiredConfigAudit<C>>,
+    #[cfg(feature = "required-netconf-audit")]
+    pub(crate) retained_sessions: Option<opc_config_bus::RequiredNetconfAudit<C>>,
     transport: TransportType,
     candidate: Arc<Mutex<CandidateDatastore<C>>>,
     confirmed_commit: Arc<Mutex<ConfirmedCommitState>>,
@@ -545,6 +558,8 @@ where
             authz,
             audit: Arc::new(ServerAudit::Legacy(audit)),
             required_config_audit: None,
+            #[cfg(feature = "required-netconf-audit")]
+            retained_sessions: None,
             transport,
             candidate: Arc::new(Mutex::new(CandidateDatastore::default())),
             confirmed_commit: Arc::new(Mutex::new(ConfirmedCommitState::default())),
@@ -1008,8 +1023,12 @@ where
             principal,
             xml,
             limits,
-            Some((current_session_id, sessions)),
-            0,
+            SessionRpcContext {
+                controls: Some((current_session_id, sessions)),
+                active_subscription_count: 0,
+                #[cfg(feature = "required-netconf-audit")]
+                retained: None,
+            },
         )
         .await
         .reply
@@ -1018,6 +1037,7 @@ where
     /// Handles one XML RPC with access to live NETCONF session controls,
     /// async config-bus writes, and session-local side effects such as starting
     /// a notification stream.
+    #[cfg(test)]
     #[allow(clippy::too_many_arguments)]
     pub(crate) async fn handle_rpc_for_session_with_action_async(
         &self,
@@ -1037,8 +1057,12 @@ where
             principal,
             xml,
             limits,
-            Some((current_session_id, sessions)),
-            active_subscription_count,
+            SessionRpcContext {
+                controls: Some((current_session_id, sessions)),
+                active_subscription_count,
+                #[cfg(feature = "required-netconf-audit")]
+                retained: None,
+            },
         )
         .await
     }
@@ -1339,18 +1363,19 @@ where
         }
     }
 
-    async fn handle_rpc_inner_async_with_action(
+    pub(crate) async fn handle_rpc_inner_async_with_action(
         &self,
         request_id: RequestId,
         principal: &TrustedPrincipal,
         xml: &str,
         limits: &MgmtLimits,
-        session_context: Option<(u64, &SessionRegistry)>,
-        active_subscription_count: usize,
+        session: SessionRpcContext<'_>,
     ) -> RpcSessionHandlingResult<C>
     where
         A: 'static,
     {
+        let session_context = session.controls;
+        let active_subscription_count = session.active_subscription_count;
         let started = Instant::now();
         let parsed = match parse_rpc_with_context(xml, limits) {
             Ok(parsed) => parsed,
@@ -1398,7 +1423,7 @@ where
             }
         };
 
-        if self.required_config_audit.is_some() && !self.required_audit_profile_supported() {
+        if self.has_unsupported_audit_profile() {
             // A mutable application binding must not enable a local effect
             // owner after required-audit construction checked the composition.
             let event = AuditEvent::new(
@@ -1580,6 +1605,24 @@ where
                 .await
             }
             RpcOperation::Lock(request) => {
+                #[cfg(feature = "required-netconf-audit")]
+                if self.retained_sessions.is_some() {
+                    return self
+                        .handle_retained_lock(
+                            request.target,
+                            RpcExecContext {
+                                request_id,
+                                principal,
+                                message_id: &parsed.message_id,
+                                reply_attrs: &parsed.reply_attrs,
+                                started,
+                            },
+                            session.retained,
+                            false,
+                        )
+                        .await
+                        .into();
+                }
                 self.handle_lock_async(
                     request,
                     RpcExecContext {
@@ -1594,6 +1637,24 @@ where
                 .await
             }
             RpcOperation::Unlock(request) => {
+                #[cfg(feature = "required-netconf-audit")]
+                if self.retained_sessions.is_some() {
+                    return self
+                        .handle_retained_lock(
+                            request.target,
+                            RpcExecContext {
+                                request_id,
+                                principal,
+                                message_id: &parsed.message_id,
+                                reply_attrs: &parsed.reply_attrs,
+                                started,
+                            },
+                            session.retained,
+                            true,
+                        )
+                        .await
+                        .into();
+                }
                 self.handle_unlock_async(
                     request,
                     RpcExecContext {
@@ -2961,6 +3022,14 @@ where
         context: RpcExecContext<'_>,
         session_context: Option<(u64, &SessionRegistry)>,
     ) -> RpcHandlingResult {
+        #[cfg(feature = "required-netconf-audit")]
+        if self.retained_sessions.is_some() {
+            return Self::retained_lock_error(
+                &context,
+                NetconfOperation::Lock,
+                RpcError::operation_failed(),
+            );
+        }
         poll_ready(self.handle_lock_inner(
             request,
             context,
@@ -3539,6 +3608,14 @@ where
         context: RpcExecContext<'_>,
         session_context: Option<(u64, &SessionRegistry)>,
     ) -> RpcHandlingResult {
+        #[cfg(feature = "required-netconf-audit")]
+        if self.retained_sessions.is_some() {
+            return Self::retained_lock_error(
+                &context,
+                NetconfOperation::Unlock,
+                RpcError::operation_failed(),
+            );
+        }
         poll_ready(self.handle_unlock_inner(
             request,
             context,

@@ -23,6 +23,8 @@ pub mod commit;
 pub mod committed;
 pub mod datastore;
 pub mod metrics;
+#[cfg(feature = "required-netconf-audit")]
+mod netconf_audit;
 mod required_audit;
 pub mod restore;
 pub mod rollback;
@@ -46,6 +48,12 @@ pub use committed::{
 pub use datastore::{
     CommittedRevisionSource, EncryptingManagedDatastore, InMemoryManagedDatastore,
     ManagedDatastore, MockManagedDatastore,
+};
+#[cfg(feature = "required-netconf-audit")]
+pub use netconf_audit::{
+    NetconfAppliedReceipt, NetconfAuditStore, NetconfLockDatastore, NetconfMutationResult,
+    NetconfRecoveryHandle, NetconfRejectedReceipt, NetconfSession, NetconfWorkerExit,
+    NetconfWorkerLost, RequiredNetconfAudit,
 };
 pub use required_audit::RequiredConfigAudit;
 pub use subscribers::{ConfigReceiver, SubscriberDisconnectReason, SubscriberLagPolicy};

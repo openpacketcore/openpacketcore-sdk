@@ -654,6 +654,8 @@ impl ConfigStore for ConsensusConfigStoreAdapter {
 pub struct RaftManagedDatastore<C> {
     adapter: PersistManagedDatastore<C, ConsensusConfigStoreAdapter>,
     audit: Option<ConfigAuditPolicy>,
+    #[cfg(feature = "required-netconf-audit")]
+    netconf: Option<opc_config_bus::NetconfAuditStore>,
 }
 
 /// Management authority port backed directly by the config Openraft store.
@@ -846,6 +848,8 @@ impl<C> RaftManagedDatastore<C> {
                 MutationRoute::ForwardToLeader,
             ))),
             audit: None,
+            #[cfg(feature = "required-netconf-audit")]
+            netconf: None,
         }
     }
 
@@ -860,6 +864,8 @@ impl<C> RaftManagedDatastore<C> {
                 MutationRoute::LocalLeaderOnly,
             ))),
             audit: None,
+            #[cfg(feature = "required-netconf-audit")]
+            netconf: None,
         }
     }
 
@@ -876,6 +882,23 @@ impl<C> RaftManagedDatastore<C> {
         let mut adapter = Self::new_local_authority(store);
         adapter.audit = Some(audit);
         adapter
+    }
+
+    /// Bind the retained NETCONF profile to an already established SDK device.
+    ///
+    /// Verifies the exact store worker and current device ownership through the
+    /// existing audit/checkpoint authority before exposing its closed port.
+    /// This never provisions storage or starts a replacement device implicitly.
+    #[cfg(feature = "required-netconf-audit")]
+    pub async fn new_audited_netconf_local_authority(
+        store: Arc<ConsensusConfigStore>,
+        audit: ConfigAuditPolicy,
+        device: opc_persist::audit_authority::NetconfDeviceOwner,
+    ) -> Result<Self, StoreError> {
+        let port = audit.netconf_store(Arc::clone(&store), device).await?;
+        let mut adapter = Self::new_audited_local_authority(store, audit);
+        adapter.netconf = Some(port);
+        Ok(adapter)
     }
 
     /// Return the sole underlying config consensus authority for lifecycle,
@@ -896,6 +919,8 @@ impl<C> Clone for RaftManagedDatastore<C> {
         Self {
             adapter: self.adapter.clone(),
             audit: self.audit.clone(),
+            #[cfg(feature = "required-netconf-audit")]
+            netconf: self.netconf.clone(),
         }
     }
 }
@@ -918,6 +943,11 @@ where
         self.audit
             .as_ref()
             .map(|policy| policy.observation_sink(Arc::clone(self.consensus_store())))
+    }
+
+    #[cfg(feature = "required-netconf-audit")]
+    fn required_netconf_audit_store(&self) -> Option<opc_config_bus::NetconfAuditStore> {
+        self.netconf.clone()
     }
 
     async fn append_required_audit_commit(

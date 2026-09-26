@@ -14,6 +14,7 @@ keywords = ["5g", "cnf", "netconf", "yang", "management"]
 categories = ["network-programming", "parser-implementations"]
 
 [features]
+required-netconf-audit = ["opc-config-bus/required-netconf-audit"]
 testkit = ["dep:rand"]
 
 [dependencies]

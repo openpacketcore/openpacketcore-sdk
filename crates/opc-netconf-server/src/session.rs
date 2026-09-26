@@ -27,7 +27,7 @@ use crate::binding::NetconfConfigBinding;
 use crate::capabilities::{NETCONF_BASE_1_0, NETCONF_BASE_1_1};
 use crate::framing::{base10, base11, FramingError};
 use crate::metrics::{record_notification, NetconfNotificationOutcome};
-use crate::server::{ReadOnlyNetconfServer, RpcSessionAction};
+use crate::server::{ReadOnlyNetconfServer, RpcSessionAction, SessionRpcContext};
 use crate::session_registry::{
     session_id_for_hello, SessionRegistration, SessionRegistry, SessionRegistryError,
 };
@@ -162,15 +162,32 @@ where
             )),
         })?;
 
+    // This local is owned by the actual transport future, never by the worker
+    // or a queued RPC. Final drop revokes SDK authority even if this future is
+    // aborted during hello, an RPC, response delivery, or post-loop cleanup.
+    #[cfg(feature = "required-netconf-audit")]
+    let retained_session = match &server.retained_sessions {
+        Some(audit) => Some(audit.open_session(principal).await.map_err(|_| {
+            SessionError::Io(std::io::Error::other(
+                "NETCONF session authority unavailable",
+            ))
+        })?),
+        None => None,
+    };
+
     let session_id = registration.session_id();
     let result = AssertUnwindSafe(run_registered_session_loop(
         server,
         principal,
         stream,
         config,
-        &mut registration,
-        hello_session_id,
-        sessions,
+        RunnerSession {
+            registration: &mut registration,
+            hello_session_id,
+            sessions,
+            #[cfg(feature = "required-netconf-audit")]
+            retained: retained_session.as_ref(),
+        },
     ))
     .catch_unwind()
     .await;
@@ -183,14 +200,20 @@ where
     }
 }
 
+struct RunnerSession<'a> {
+    registration: &'a mut SessionRegistration,
+    hello_session_id: NonZeroU32,
+    sessions: &'a SessionRegistry,
+    #[cfg(feature = "required-netconf-audit")]
+    retained: Option<&'a opc_config_bus::NetconfSession>,
+}
+
 async fn run_registered_session_loop<C, B, P, A, S>(
     server: &ReadOnlyNetconfServer<C, B, P, A>,
     principal: &TrustedPrincipal,
     stream: &mut S,
     config: SessionConfig,
-    registration: &mut SessionRegistration,
-    hello_session_id: NonZeroU32,
-    sessions: &SessionRegistry,
+    session: RunnerSession<'_>,
 ) -> Result<SessionResult, SessionError>
 where
     C: OpcConfig,
@@ -199,6 +222,13 @@ where
     A: AuditSink + 'static,
     S: AsyncRead + AsyncWrite + Unpin,
 {
+    let RunnerSession {
+        registration,
+        hello_session_id,
+        sessions,
+        #[cfg(feature = "required-netconf-audit")]
+        retained,
+    } = session;
     let server_hello = server.server_hello(Some(hello_session_id));
     tokio::select! {
         _ = registration.terminated() => {
@@ -300,14 +330,17 @@ where
         };
         let rpc_xml = str::from_utf8(&message).map_err(|_| SessionError::InvalidUtf8)?;
         let result = server
-            .handle_rpc_for_session_with_action_async(
+            .handle_rpc_inner_async_with_action(
                 RequestId::new(),
                 principal,
                 rpc_xml,
                 &config.limits,
-                registration.session_id(),
-                sessions,
-                usize::from(notification_receiver.is_some()),
+                SessionRpcContext {
+                    controls: Some((registration.session_id(), sessions)),
+                    active_subscription_count: usize::from(notification_receiver.is_some()),
+                    #[cfg(feature = "required-netconf-audit")]
+                    retained,
+                },
             )
             .await;
         let reply = result.reply;
@@ -570,6 +603,8 @@ where
 #[cfg(test)]
 mod tests {
     #![allow(clippy::unwrap_used, clippy::expect_used)]
+    #[cfg(feature = "required-netconf-audit")]
+    mod retained_lifecycle;
 
     use std::pin::Pin;
     use std::sync::{Arc, Mutex};

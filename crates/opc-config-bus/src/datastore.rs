@@ -84,6 +84,14 @@ pub trait ManagedDatastore<C: OpcConfig>: Send + Sync {
         None
     }
 
+    /// Concrete retained NETCONF authority. An observation port alone cannot
+    /// provide it. The SDK encrypting wrapper explicitly binds its provider
+    /// before a full-profile ConfigBus capability can be attached.
+    #[cfg(feature = "required-netconf-audit")]
+    fn required_netconf_audit_store(&self) -> Option<crate::NetconfAuditStore> {
+        None
+    }
+
     /// Admit one intent bound to this exact write before atomically applying it.
     /// Preserve the protocol request/caller/transport/operation, complete effect,
     /// fixed expiry and authoritative terminal recovery. Unknown persistence
@@ -283,6 +291,11 @@ where
         (**self).required_audit_observations()
     }
 
+    #[cfg(feature = "required-netconf-audit")]
+    fn required_netconf_audit_store(&self) -> Option<crate::NetconfAuditStore> {
+        (**self).required_netconf_audit_store()
+    }
+
     async fn append_required_audit_commit(
         &self,
         commit: CommitWrite<C>,
@@ -383,6 +396,8 @@ where
 pub struct EncryptingManagedDatastore<C, P: ?Sized, S: ?Sized> {
     inner: Arc<S>,
     provider: Arc<P>,
+    #[cfg(feature = "required-netconf-audit")]
+    netconf: Option<crate::NetconfAuditStore>,
     store_kind: Arc<str>,
     marker: PhantomData<fn() -> C>,
 }
@@ -403,6 +418,8 @@ impl<C, P: ?Sized, S: ?Sized> EncryptingManagedDatastore<C, P, S> {
         Self {
             inner,
             provider,
+            #[cfg(feature = "required-netconf-audit")]
+            netconf: None,
             store_kind: Arc::<str>::from(store_kind.into()),
             marker: PhantomData,
         }
@@ -435,6 +452,31 @@ where
     P: KeyProvider + ?Sized,
     S: ManagedDatastore<SealedConfig<C>> + ?Sized,
 {
+    /// Attach this encrypting datastore's existing provider to its concrete
+    /// retained NETCONF authority. The underlying SDK device must already be
+    /// current and checkpointed. No default constructor enables this profile.
+    ///
+    /// This opt-in attachment requires an owned provider. Existing constructors
+    /// and ordinary ManagedDatastore implementations retain their original bounds.
+    #[cfg(feature = "required-netconf-audit")]
+    pub async fn with_required_netconf_audit(mut self) -> Result<Self, StoreError>
+    where
+        P: 'static,
+    {
+        if self.store_kind() != CONFIG_STORE_KIND {
+            return Err(StoreError::unavailable(
+                "NETCONF configuration store mismatch",
+            ));
+        }
+        let port = self
+            .inner
+            .required_netconf_audit_store()
+            .ok_or_else(|| StoreError::unavailable("required NETCONF audit is unsupported"))?;
+        port.verify_current().await?;
+        self.netconf = Some(port.with_provider(Arc::clone(&self.provider)));
+        Ok(self)
+    }
+
     async fn encrypt_write(
         &self,
         commit: CommitWrite<C>,
@@ -571,6 +613,11 @@ where
 {
     fn required_audit_observations(&self) -> Option<Arc<dyn opc_mgmt_audit::AuditSink>> {
         self.inner.required_audit_observations()
+    }
+
+    #[cfg(feature = "required-netconf-audit")]
+    fn required_netconf_audit_store(&self) -> Option<crate::NetconfAuditStore> {
+        self.netconf.clone()
     }
 
     async fn append_required_audit_commit(

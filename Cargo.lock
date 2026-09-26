@@ -2600,6 +2600,7 @@ dependencies = [
  "opc-config-model",
  "opc-crypto",
  "opc-key",
+ "opc-persist",
  "opc-mgmt-audit",
  "opc-redaction",
  "opc-types",

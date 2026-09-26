@@ -554,21 +554,7 @@ pub(crate) fn validate_sync(conn: &Connection, key: &AuditKey) -> io::Result<()>
 /// Authenticate once per read/apply transaction, before even a negative lookup
 /// or metadata-based admission decision. Per-row projection must not repeat the
 /// complete scan; it runs in this same authenticated SQLite snapshot instead.
-pub(crate) fn validate_access_sync(
-    conn: &Connection,
-    key: &AuditKey,
-    consensus_required: bool,
-    cancellation: &SqliteWorkCancellation,
-) -> io::Result<()> {
-    validate_access_for_profile_sync(
-        conn,
-        key,
-        consensus_required,
-        crate::RetainedConfigProfile::Legacy,
-        cancellation,
-    )
-}
-
+///
 /// The selection comes from the admitted backend, never from stored row tags.
 /// The existing read/apply transaction pins both history and target validation.
 pub(crate) fn validate_access_for_profile_sync(

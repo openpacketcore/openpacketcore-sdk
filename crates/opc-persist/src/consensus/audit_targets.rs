@@ -18,6 +18,22 @@ pub enum RetainedConfigProfile {
     NetconfTargetsV1,
 }
 
+impl RetainedConfigProfile {
+    pub(crate) const fn command_revision(self) -> u16 {
+        match self {
+            Self::Legacy => super::CONFIG_CONSENSUS_COMMAND_VERSION,
+            Self::NetconfTargetsV1 => 9,
+        }
+    }
+
+    pub(crate) const fn wire_revision(self) -> u16 {
+        match self {
+            Self::Legacy => super::CONFIG_CONSENSUS_WIRE_VERSION,
+            Self::NetconfTargetsV1 => 9,
+        }
+    }
+}
+
 impl std::fmt::Debug for RetainedConfigProfile {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.write_str("RetainedConfigProfile(<redacted>)")

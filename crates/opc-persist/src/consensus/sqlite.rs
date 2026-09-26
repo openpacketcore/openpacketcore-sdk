@@ -298,6 +298,7 @@ const LEGACY_RAFT_TABLES: &[&str] = &[
 pub(crate) struct ConfigConsensusCore {
     pub(crate) conn: Arc<tokio::sync::Mutex<crate::backend::BackendConnection>>,
     pub(crate) identity: ConsensusIdentity,
+    pub(crate) retained_profile: RetainedConfigProfile,
     pub(crate) expected_members: Arc<BTreeSet<ConsensusNodeId>>,
     pub(crate) snapshot_dir: Arc<PathBuf>,
     pub(crate) snapshot_gate: Arc<tokio::sync::Mutex<()>>,
@@ -396,6 +397,10 @@ impl ConfigConsensusCore {
         let worker_audit_key = backend.audit_key().clone();
         let worker_backend = backend.clone();
         let retained = backend.retained_binding.is_some();
+        let retained_profile = backend
+            .retained_binding
+            .as_ref()
+            .map_or(RetainedConfigProfile::Legacy, |binding| binding.profile());
         let cancellation = Arc::new(SqliteWorkCancellation::with_deadline(std_deadline));
         let mut cancel_on_drop = SqliteWorkCancelOnDrop::new(cancellation.clone());
         let worker_cancellation = cancellation.clone();
@@ -409,13 +414,14 @@ impl ConfigConsensusCore {
                 if recovery.is_some() {
                     Err(ConfigConsensusStorageError::RecoveryRequired)
                 } else {
-                    validate_existing_schema(
+                    validate_existing_schema_for_profile(
                         &worker_conn,
                         identity,
                         &worker_members,
                         &worker_audit_key,
                         false,
                         &worker_cancellation,
+                        retained_profile,
                     )
                 }
             } else {
@@ -465,6 +471,7 @@ impl ConfigConsensusCore {
         Ok(Self {
             conn,
             identity,
+            retained_profile,
             expected_members: Arc::new(expected_members),
             snapshot_dir: Arc::new(snapshot_dir),
             snapshot_gate: Arc::new(tokio::sync::Mutex::new(())),
@@ -1240,6 +1247,7 @@ fn validate_existing_schema_for_profile(
         expected_members,
         allow_detached_snapshot,
         cancellation,
+        profile,
     )
     .map_err(|_| ConfigConsensusStorageError::CorruptState)?;
     validate_live_history_schema_for_profile(conn, cancellation, profile)
@@ -1765,10 +1773,11 @@ fn validate_entry(
     entry: &Entry<ConfigRaftTypeConfig>,
     identity: ConsensusIdentity,
     expected_members: &BTreeSet<ConsensusNodeId>,
+    profile: RetainedConfigProfile,
 ) -> io::Result<()> {
     match &entry.payload {
         EntryPayload::Normal(command) => command
-            .validate(identity)
+            .validate_for_profile(identity, profile)
             .map_err(|_| invalid_data("invalid encrypted config consensus command")),
         EntryPayload::Membership(membership) => validate_fixed_membership(
             &StoredMembership::new(Some(entry.log_id), membership.clone()),
@@ -1871,6 +1880,7 @@ fn validate_durable_log_state_sync(
     expected_members: &BTreeSet<ConsensusNodeId>,
     allow_detached_snapshot: bool,
     cancellation: &SqliteWorkCancellation,
+    profile: RetainedConfigProfile,
 ) -> io::Result<()> {
     cancellation.check_io()?;
     let (committed, applied, purged) = validate_durable_pointer_relationships_sync(conn, identity)?;
@@ -1949,6 +1959,7 @@ fn validate_durable_log_state_sync(
                 conn,
                 identity,
                 expected_members,
+                profile,
                 LogRowRead {
                     start: minimum,
                     end: Some(
@@ -2011,6 +2022,7 @@ fn read_log_rows_unchecked_sync(
     conn: &Connection,
     identity: ConsensusIdentity,
     expected_members: &BTreeSet<ConsensusNodeId>,
+    profile: RetainedConfigProfile,
     read: LogRowRead<'_>,
 ) -> io::Result<Vec<Entry<ConfigRaftTypeConfig>>> {
     let start = checked_i64(read.start)?;
@@ -2058,7 +2070,7 @@ fn read_log_rows_unchecked_sync(
         {
             return Err(invalid_data("persisted config consensus log row mismatch"));
         }
-        validate_entry(&entry, identity, expected_members)?;
+        validate_entry(&entry, identity, expected_members, profile)?;
         let decision = batch
             .as_mut()
             .map(|batch| {
@@ -2086,6 +2098,7 @@ fn read_log_rows_unchecked_sync(
     Ok(entries)
 }
 
+#[cfg(test)]
 pub(crate) fn read_log_range_sync(
     conn: &Connection,
     identity: ConsensusIdentity,
@@ -2094,16 +2107,46 @@ pub(crate) fn read_log_range_sync(
     end: Option<u64>,
     limit: Option<usize>,
 ) -> io::Result<Vec<Entry<ConfigRaftTypeConfig>>> {
-    read_log_range_with_batch_sync(conn, identity, expected_members, start, end, limit, false)
+    read_log_range_for_profile_sync(
+        conn,
+        identity,
+        expected_members,
+        start,
+        end,
+        limit,
+        RetainedConfigProfile::Legacy,
+    )
 }
 
-pub(crate) fn read_limited_log_range_sync(
+pub(crate) fn read_log_range_for_profile_sync(
+    conn: &Connection,
+    identity: ConsensusIdentity,
+    expected_members: &BTreeSet<ConsensusNodeId>,
+    start: u64,
+    end: Option<u64>,
+    limit: Option<usize>,
+    profile: RetainedConfigProfile,
+) -> io::Result<Vec<Entry<ConfigRaftTypeConfig>>> {
+    read_log_range_with_batch_sync(
+        conn,
+        identity,
+        expected_members,
+        start,
+        end,
+        limit,
+        false,
+        profile,
+    )
+}
+
+pub(crate) fn read_limited_log_range_for_profile_sync(
     conn: &Connection,
     identity: ConsensusIdentity,
     expected_members: &BTreeSet<ConsensusNodeId>,
     start: u64,
     end: u64,
     limit: usize,
+    profile: RetainedConfigProfile,
 ) -> io::Result<Vec<Entry<ConfigRaftTypeConfig>>> {
     read_log_range_with_batch_sync(
         conn,
@@ -2113,9 +2156,11 @@ pub(crate) fn read_limited_log_range_sync(
         Some(end),
         Some(limit),
         true,
+        profile,
     )
 }
 
+#[allow(clippy::too_many_arguments)]
 fn read_log_range_with_batch_sync(
     conn: &Connection,
     identity: ConsensusIdentity,
@@ -2124,12 +2169,14 @@ fn read_log_range_with_batch_sync(
     end: Option<u64>,
     limit: Option<usize>,
     append_entries_batch: bool,
+    profile: RetainedConfigProfile,
 ) -> io::Result<Vec<Entry<ConfigRaftTypeConfig>>> {
     let (_, _, purged) = validate_durable_pointer_relationships_sync(conn, identity)?;
     let entries = read_log_rows_unchecked_sync(
         conn,
         identity,
         expected_members,
+        profile,
         LogRowRead {
             start,
             end,
@@ -2189,12 +2236,31 @@ pub(crate) fn append_logs_sync(
     )
 }
 
+#[cfg(test)]
 pub(crate) fn append_logs_cancellable_sync(
     conn: &Connection,
     identity: ConsensusIdentity,
     expected_members: &BTreeSet<ConsensusNodeId>,
     entries: &[Entry<ConfigRaftTypeConfig>],
     cancellation: &SqliteWorkCancellation,
+) -> io::Result<()> {
+    append_logs_cancellable_for_profile_sync(
+        conn,
+        identity,
+        expected_members,
+        entries,
+        cancellation,
+        RetainedConfigProfile::Legacy,
+    )
+}
+
+pub(crate) fn append_logs_cancellable_for_profile_sync(
+    conn: &Connection,
+    identity: ConsensusIdentity,
+    expected_members: &BTreeSet<ConsensusNodeId>,
+    entries: &[Entry<ConfigRaftTypeConfig>],
+    cancellation: &SqliteWorkCancellation,
+    profile: RetainedConfigProfile,
 ) -> io::Result<()> {
     if entries.is_empty() {
         return Ok(());
@@ -2208,7 +2274,7 @@ pub(crate) fn append_logs_cancellable_sync(
     let mut encoded_bytes = 0_usize;
     for entry in entries {
         cancellation.check_io()?;
-        validate_entry(entry, identity, expected_members)?;
+        validate_entry(entry, identity, expected_members, profile)?;
         let remaining = CONFIG_CONSENSUS_LOG_APPEND_MAX_BYTES
             .checked_sub(encoded_bytes)
             .ok_or_else(|| {
@@ -2915,30 +2981,6 @@ fn execute_intent_sync(
 /// The effect savepoint rolls back configuration failure only. Its audited
 /// rejection survives in the enclosing Raft transaction. An I/O failure still
 /// rolls back everything and never creates a caller-asserted commit receipt.
-#[allow(clippy::too_many_arguments)]
-fn apply_audited_mutation_sync(
-    conn: &Connection,
-    key: &AuditKey,
-    identity: ConsensusIdentity,
-    prepared: &super::PreparedAuditedMutation,
-    audit_keys: Option<&crate::audit_authority::continuity::AuditKeyRing>,
-    logical_time: Timestamp,
-    request_id: opc_consensus::ConsensusRequestId,
-    cancellation: &SqliteWorkCancellation,
-) -> io::Result<Result<(), ConfigMutationFailure>> {
-    apply_audited_mutation_for_profile_sync(
-        conn,
-        key,
-        identity,
-        prepared,
-        audit_keys,
-        logical_time,
-        request_id,
-        cancellation,
-        RetainedConfigProfile::Legacy,
-    )
-}
-
 // The independently admitted profile is supplied by the authority, never
 // inferred from a command tag or the presence of target tables.
 #[allow(clippy::too_many_arguments)]
@@ -3086,6 +3128,7 @@ pub(crate) fn apply_entries_sync(
     )
 }
 
+#[cfg(test)]
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn apply_entries_cancellable_sync(
     conn: &Connection,
@@ -3096,6 +3139,29 @@ pub(crate) fn apply_entries_cancellable_sync(
     audit_key: &AuditKey,
     audit_keys: Option<&crate::audit_authority::continuity::AuditKeyRing>,
 ) -> io::Result<Vec<ConfigConsensusResponse>> {
+    apply_entries_cancellable_for_profile_sync(
+        conn,
+        identity,
+        expected_members,
+        entries,
+        cancellation,
+        audit_key,
+        audit_keys,
+        RetainedConfigProfile::Legacy,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn apply_entries_cancellable_for_profile_sync(
+    conn: &Connection,
+    identity: ConsensusIdentity,
+    expected_members: &BTreeSet<ConsensusNodeId>,
+    entries: Vec<Entry<ConfigRaftTypeConfig>>,
+    cancellation: &SqliteWorkCancellation,
+    audit_key: &AuditKey,
+    audit_keys: Option<&crate::audit_authority::continuity::AuditKeyRing>,
+    profile: RetainedConfigProfile,
+) -> io::Result<Vec<ConfigConsensusResponse>> {
     if entries.len() > CONFIG_CONSENSUS_LOG_APPEND_MAX_ENTRIES {
         return Err(invalid_data(
             "config consensus apply exceeds entry-count limit",
@@ -3104,7 +3170,7 @@ pub(crate) fn apply_entries_cancellable_sync(
     let mut encoded_bytes = 0_usize;
     for entry in &entries {
         cancellation.check_io()?;
-        validate_entry(entry, identity, expected_members)?;
+        validate_entry(entry, identity, expected_members, profile)?;
         let remaining = CONFIG_CONSENSUS_LOG_APPEND_MAX_BYTES
             .checked_sub(encoded_bytes)
             .ok_or_else(|| invalid_data("config consensus apply exceeds aggregate byte limit"))?;
@@ -3121,7 +3187,7 @@ pub(crate) fn apply_entries_cancellable_sync(
             .ok_or_else(|| invalid_data("config consensus apply byte count overflow"))?;
     }
     let tx = conn.unchecked_transaction().map_err(db_error)?;
-    super::history::validate_access_sync(&tx, audit_key, true, cancellation)?;
+    super::history::validate_access_for_profile_sync(&tx, audit_key, true, profile, cancellation)?;
     let mut last_applied = read_applied_sync(&tx, identity)?;
     let mut machine = read_machine_sync(&tx, identity)?;
     let mut responses = Vec::with_capacity(entries.len());
@@ -3162,7 +3228,7 @@ pub(crate) fn apply_entries_cancellable_sync(
             }
             EntryPayload::Normal(command) => {
                 command
-                    .validate(identity)
+                    .validate_for_profile(identity, profile)
                     .map_err(|_| invalid_data("invalid committed config consensus command"))?;
                 let payload_digest = command
                     .payload_digest()
@@ -3210,7 +3276,7 @@ pub(crate) fn apply_entries_cancellable_sync(
                     }
                     let mut result = match &command.intent {
                         ConfigMutationIntent::AuditedMutation(prepared) => {
-                            apply_audited_mutation_sync(
+                            apply_audited_mutation_for_profile_sync(
                                 &tx,
                                 audit_key,
                                 identity,
@@ -3219,6 +3285,7 @@ pub(crate) fn apply_entries_cancellable_sync(
                                 logical_time,
                                 command.request_id,
                                 cancellation,
+                                profile,
                             )?
                         }
                         ConfigMutationIntent::ManagementAudit(audit) => {
@@ -3236,7 +3303,29 @@ pub(crate) fn apply_entries_cancellable_sync(
                             )?
                         }
                         ConfigMutationIntent::RetainHistory(retention) => {
-                            validate_sealed_state_sync(&tx, audit_key, cancellation)?;
+                            match profile {
+                                RetainedConfigProfile::Legacy => {
+                                    validate_sealed_state_sync(&tx, audit_key, cancellation)?;
+                                }
+                                RetainedConfigProfile::NetconfTargetsV1 => {
+                                    validate_live_history_schema_for_profile(
+                                        &tx,
+                                        cancellation,
+                                        profile,
+                                    )?;
+                                    super::audit_targets::validate_inactive_sync(
+                                        &tx,
+                                        audit_key,
+                                        identity,
+                                        cancellation,
+                                    )?;
+                                    validate_sealed_state_contents_sync(
+                                        &tx,
+                                        audit_key,
+                                        cancellation,
+                                    )?;
+                                }
+                            }
                             super::history::retain_sync(&tx, audit_key, retention, cancellation)?
                         }
                         _ => {
@@ -3680,6 +3769,7 @@ thread_local! {
 #[path = "../../tests/management_audit_authority/snapshot_pin.rs"]
 mod snapshot_pin_tests;
 
+#[cfg(test)]
 pub(crate) fn build_snapshot_database_cancellable_sync(
     conn: &Connection,
     identity: ConsensusIdentity,
@@ -3916,6 +4006,7 @@ pub(crate) fn install_snapshot_database_sync(
 }
 
 #[allow(clippy::too_many_arguments)]
+#[cfg(test)]
 pub(crate) fn install_snapshot_database_cancellable_sync(
     conn: &Connection,
     identity: ConsensusIdentity,

@@ -28,7 +28,11 @@ use thiserror::Error;
 
 use super::raft_adapter::{ConfigRaftAdapterError, ConfigRaftNetworkFactory, ConfigRaftRpcHandler};
 use super::storage::{self, ConfigConsensusStorageError};
-use super::types::{decode_config_wire, encode_config_wire, ValidatedRollbackLabel};
+#[cfg(test)]
+use super::types::{decode_config_wire, encode_config_wire};
+use super::types::{
+    decode_config_wire_for_profile, encode_config_wire_for_profile, ValidatedRollbackLabel,
+};
 use super::{
     ApprovedLegacyConfigRecovery, ConfigConsensusClock, ConfigConsensusResponse,
     ConfigConsensusTopology, ConfigMutationIntent, ConfigRaft, ConfigRaftTypeConfig,
@@ -438,6 +442,15 @@ impl ConsensusConfigStore {
         {
             return Err(ConfigConsensusOpenError::InvalidRuntimeConfiguration);
         }
+        let profile = backend
+            .retained_binding
+            .as_ref()
+            .map_or(super::RetainedConfigProfile::Legacy, |binding| {
+                binding.profile()
+            });
+        if profile == super::RetainedConfigProfile::NetconfTargetsV1 && audit_continuity.is_none() {
+            return Err(ConfigConsensusOpenError::AuditContinuityUnavailable);
+        }
         let identity = topology.identity();
         let local_node_id = topology.local_node_id();
         let members = topology.members().clone();
@@ -454,7 +467,8 @@ impl ConsensusConfigStore {
                 .attach_management_audit_keys(policy.keys.clone())
                 .map_err(|_| ConfigConsensusOpenError::AuditContinuityUnavailable)?;
         }
-        let network = ConfigRaftNetworkFactory::try_new(identity, local_node_id, peers.clone())?;
+        let network =
+            ConfigRaftNetworkFactory::try_new(identity, local_node_id, peers.clone(), profile)?;
         let (log_store, state_machine, durable_progress) = if let Some(recovery) = recovery {
             storage::open_with_recovery(
                 &backend,
@@ -484,7 +498,8 @@ impl ConsensusConfigStore {
         )
         .await
         .map_err(|_| ConfigConsensusOpenError::EngineUnavailable)?;
-        let raft_handler = ConfigRaftRpcHandler::new(raft.clone(), identity, local_node_id);
+        let raft_handler =
+            ConfigRaftRpcHandler::new(raft.clone(), identity, local_node_id, profile);
         let linearizability = EnsureLinearizableSupervisor::new(raft.clone());
         Ok(Self {
             inner: Arc::new(ConsensusConfigStoreInner {
@@ -1095,10 +1110,20 @@ impl ConsensusConfigStore {
         }
     }
 
+    fn config_profile(&self) -> super::RetainedConfigProfile {
+        self.inner
+            .backend
+            .retained_binding
+            .as_ref()
+            .map_or(super::RetainedConfigProfile::Legacy, |binding| {
+                binding.profile()
+            })
+    }
+
     fn peer_compatibility(&self) -> ConfigPeerCompatibility {
         ConfigPeerCompatibility {
-            wire_version: super::CONFIG_CONSENSUS_WIRE_VERSION,
-            command_version: super::CONFIG_CONSENSUS_COMMAND_VERSION,
+            wire_version: self.config_profile().wire_revision(),
+            command_version: self.config_profile().command_revision(),
             audit_key_epoch: self.inner.backend.audit_key().epoch(),
             audit_key_fingerprint: self.inner.backend.audit_key().fingerprint(),
         }
@@ -1163,8 +1188,13 @@ impl ConsensusConfigStore {
         intent: ConfigMutationIntent,
     ) -> Result<ConfigConsensusResponse, PersistError> {
         let result = async {
-            preflight_config_command_replication_budget(self.inner.identity, request_id, &intent)
-                .map_err(ForwardMutationRejection::into_persist_error)?;
+            preflight_config_command_replication_budget(
+                self.inner.identity,
+                request_id,
+                &intent,
+                self.config_profile(),
+            )
+            .map_err(ForwardMutationRejection::into_persist_error)?;
             self.require_admission()?;
             let deadline = tokio::time::Instant::now()
                 .checked_add(self.inner.operation_timeout)
@@ -1200,8 +1230,13 @@ impl ConsensusConfigStore {
         request_id: opc_consensus::ConsensusRequestId,
         intent: ConfigMutationIntent,
     ) -> Result<ConfigConsensusResponse, PersistError> {
-        preflight_config_command_replication_budget(self.inner.identity, request_id, &intent)
-            .map_err(ForwardMutationRejection::into_persist_error)?;
+        preflight_config_command_replication_budget(
+            self.inner.identity,
+            request_id,
+            &intent,
+            self.config_profile(),
+        )
+        .map_err(ForwardMutationRejection::into_persist_error)?;
         self.require_admission()?;
         let deadline = tokio::time::Instant::now()
             .checked_add(self.inner.operation_timeout)
@@ -1310,6 +1345,7 @@ impl ConsensusConfigStore {
             self.inner.identity,
             request.request_id,
             &request.intent,
+            self.config_profile(),
         ) {
             return ForwardMutationReply::Rejected(rejection);
         }
@@ -1343,13 +1379,16 @@ impl ConsensusConfigStore {
             _ => return ForwardMutationReply::Unavailable,
         }
         let command = super::ConfigConsensusCommand {
-            schema_version: super::CONFIG_CONSENSUS_COMMAND_VERSION,
+            schema_version: self.config_profile().command_revision(),
             identity: self.inner.identity,
             request_id: request.request_id,
             logical_time: self.inner.clock.now_utc(),
             intent: request.intent,
         };
-        if command.validate(self.inner.identity).is_err() {
+        if command
+            .validate_for_profile(self.inner.identity, self.config_profile())
+            .is_err()
+        {
             return ForwardMutationReply::Rejected(ForwardMutationRejection::InvalidCommand);
         }
         if !config_command_fits_replication_budget(&command) {
@@ -1450,7 +1489,8 @@ impl ConsensusConfigStore {
             .get(&target)
             .filter(|peer| peer.node_id() == target)
             .ok_or_else(consensus_unavailable)?;
-        let payload = encode_config_wire(request).map_err(|_| consensus_unavailable())?;
+        let payload = encode_config_wire_for_profile(request, self.config_profile())
+            .map_err(|_| consensus_unavailable())?;
         let wire = ConsensusWireRequest::try_new(
             self.inner.identity,
             self.inner.local_node_id,
@@ -1463,8 +1503,11 @@ impl ConsensusConfigStore {
             .map_err(|_| consensus_unavailable())?
             .map_err(|_| consensus_unavailable())?;
         response.validate().map_err(|_| consensus_unavailable())?;
-        decode_config_wire(&response.result.map_err(|_| consensus_unavailable())?)
-            .map_err(|_| consensus_unavailable())
+        decode_config_wire_for_profile(
+            &response.result.map_err(|_| consensus_unavailable())?,
+            self.config_profile(),
+        )
+        .map_err(|_| consensus_unavailable())
     }
 
     async fn local_read_barrier(&self, deadline: tokio::time::Instant) -> ReadBarrierReply {
@@ -1654,13 +1697,14 @@ fn preflight_config_command_replication_budget(
     identity: opc_consensus::ConsensusIdentity,
     request_id: opc_consensus::ConsensusRequestId,
     intent: &ConfigMutationIntent,
+    profile: super::RetainedConfigProfile,
 ) -> Result<(), ForwardMutationRejection> {
     // The maximum UTC RFC 3339 timestamp has the longest representation that
     // the leader-selected logical time can add to the postcard command. This
     // makes admission independent of the current clock value while retaining
     // the exact command shape and field order.
     let probe = ConfigConsensusCommandSizeProbe {
-        schema_version: super::CONFIG_CONSENSUS_COMMAND_VERSION,
+        schema_version: profile.command_revision(),
         identity,
         request_id,
         logical_time: maximum_encoded_config_timestamp()
@@ -1768,7 +1812,10 @@ impl ConsensusRpcHandler for ConfigConsensusService {
                         result: Err(ConsensusPeerError::ScopeMismatch),
                     };
                 }
-                let forwarded: ForwardMutationRequest = match decode_config_wire(&request.payload) {
+                let forwarded: ForwardMutationRequest = match decode_config_wire_for_profile(
+                    &request.payload,
+                    self.store.config_profile(),
+                ) {
                     Ok(forwarded) => forwarded,
                     Err(_) => return protocol_rejection(),
                 };
@@ -1783,10 +1830,16 @@ impl ConsensusRpcHandler for ConfigConsensusService {
                 else {
                     return protocol_rejection();
                 };
-                encode_service_reply(&self.store.apply_on_local_leader(forwarded, deadline).await)
+                encode_service_reply(
+                    &self.store.apply_on_local_leader(forwarded, deadline).await,
+                    self.store.config_profile(),
+                )
             }
             ConsensusRpcFamily::ReadBarrier => {
-                let read: ReadBarrierRequest = match decode_config_wire(&request.payload) {
+                let read: ReadBarrierRequest = match decode_config_wire_for_profile(
+                    &request.payload,
+                    self.store.config_profile(),
+                ) {
                     Ok(read) => read,
                     Err(_) => return protocol_rejection(),
                 };
@@ -1796,7 +1849,10 @@ impl ConsensusRpcHandler for ConfigConsensusService {
                     };
                 }
                 if read.compatibility_probe {
-                    return encode_service_reply(&ReadBarrierReply::Compatible);
+                    return encode_service_reply(
+                        &ReadBarrierReply::Compatible,
+                        self.store.config_profile(),
+                    );
                 }
                 if !self.store.is_live_voter(authenticated_sender) {
                     return ConsensusWireResponse {
@@ -1809,15 +1865,21 @@ impl ConsensusRpcHandler for ConfigConsensusService {
                 else {
                     return protocol_rejection();
                 };
-                encode_service_reply(&self.store.local_read_barrier(deadline).await)
+                encode_service_reply(
+                    &self.store.local_read_barrier(deadline).await,
+                    self.store.config_profile(),
+                )
             }
             _ => protocol_rejection(),
         }
     }
 }
 
-fn encode_service_reply<T: Serialize>(reply: &T) -> ConsensusWireResponse {
-    match encode_config_wire(reply) {
+fn encode_service_reply<T: Serialize>(
+    reply: &T,
+    profile: super::RetainedConfigProfile,
+) -> ConsensusWireResponse {
+    match encode_config_wire_for_profile(reply, profile) {
         Ok(payload) => ConsensusWireResponse {
             result: Ok(payload),
         },
@@ -2418,6 +2480,7 @@ mod tests {
                 store.inner.identity,
                 oversized_request.request_id,
                 &oversized_request.intent,
+                store.config_profile(),
             ),
             Err(ForwardMutationRejection::CommandTooLarge)
         );

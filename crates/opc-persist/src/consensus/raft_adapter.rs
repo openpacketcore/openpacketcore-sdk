@@ -21,7 +21,11 @@ use serde::de::DeserializeOwned;
 use serde::Serialize;
 use thiserror::Error;
 
-use super::types::{decode_config_wire, encode_config_wire};
+use super::types::{
+    decode_config_wire_for_profile as decode_config_wire,
+    encode_config_wire_for_profile as encode_config_wire,
+};
+use super::RetainedConfigProfile;
 use super::{ConfigRaft, ConfigRaftTypeConfig};
 
 type EngineRpcError<E = opc_consensus::engine::error::Infallible> =
@@ -38,6 +42,7 @@ pub(crate) enum ConfigRaftAdapterError {
 /// Openraft network factory backed only by shared consensus peers.
 #[derive(Clone)]
 pub(crate) struct ConfigRaftNetworkFactory {
+    profile: RetainedConfigProfile,
     identity: ConsensusIdentity,
     local_node_id: ConsensusNodeId,
     peers: Arc<BTreeMap<ConsensusNodeId, Arc<dyn ConsensusPeer>>>,
@@ -48,6 +53,7 @@ impl ConfigRaftNetworkFactory {
         identity: ConsensusIdentity,
         local_node_id: ConsensusNodeId,
         peers: BTreeMap<ConsensusNodeId, Arc<dyn ConsensusPeer>>,
+        profile: RetainedConfigProfile,
     ) -> Result<Self, ConfigRaftAdapterError> {
         if peers
             .iter()
@@ -59,6 +65,7 @@ impl ConfigRaftNetworkFactory {
             identity,
             local_node_id,
             peers: Arc::new(peers),
+            profile,
         })
     }
 }
@@ -79,6 +86,7 @@ impl RaftNetworkFactory<ConfigRaftTypeConfig> for ConfigRaftNetworkFactory {
 
     async fn new_client(&mut self, target: ConsensusNodeId, _node: &EmptyNode) -> Self::Network {
         ConfigRaftNetwork {
+            profile: self.profile,
             identity: self.identity,
             local_node_id: self.local_node_id,
             target,
@@ -92,6 +100,7 @@ impl RaftNetworkFactory<ConfigRaftTypeConfig> for ConfigRaftNetworkFactory {
 }
 
 pub(crate) struct ConfigRaftNetwork {
+    profile: RetainedConfigProfile,
     identity: ConsensusIdentity,
     local_node_id: ConsensusNodeId,
     target: ConsensusNodeId,
@@ -156,8 +165,8 @@ impl ConfigRaftNetwork {
         let payload = response
             .result
             .map_err(|error| map_peer_error(error, action, self, ttl))?;
-        let result: Result<Resp, RaftError<ConsensusNodeId, E>> = decode_config_wire(&payload)
-            .map_err(|error| {
+        let result: Result<Resp, RaftError<ConsensusNodeId, E>> =
+            decode_config_wire(&payload, self.profile).map_err(|error| {
                 EngineRpcError::Unreachable(Unreachable::new(&CodecTransportError(error)))
             })?;
         result.map_err(|error| EngineRpcError::RemoteError(RemoteError::new(self.target, error)))
@@ -171,7 +180,7 @@ impl ConfigRaftNetwork {
         option: RPCOption,
     ) -> Result<AppendEntriesResponse<ConsensusNodeId>, EngineRpcError> {
         let entry_count = request.entries.len();
-        let payload = match encode_config_wire(request) {
+        let payload = match encode_config_wire(request, self.profile) {
             Ok(payload) => payload,
             Err(ConsensusCodecError::TooLarge) => {
                 if let Some(entries_hint) = append_entries_split_hint(entry_count) {
@@ -218,7 +227,7 @@ impl RaftNetwork<ConfigRaftTypeConfig> for ConfigRaftNetwork {
         option: RPCOption,
     ) -> Result<InstallSnapshotResponse<ConsensusNodeId>, EngineRpcError<InstallSnapshotError>>
     {
-        let payload = encode_config_wire(&request).map_err(|error| {
+        let payload = encode_config_wire(&request, self.profile).map_err(|error| {
             EngineRpcError::Unreachable(Unreachable::new(&CodecTransportError(error)))
         })?;
         self.call(
@@ -235,7 +244,7 @@ impl RaftNetwork<ConfigRaftTypeConfig> for ConfigRaftNetwork {
         request: VoteRequest<ConsensusNodeId>,
         option: RPCOption,
     ) -> Result<VoteResponse<ConsensusNodeId>, EngineRpcError> {
-        let payload = encode_config_wire(&request).map_err(|error| {
+        let payload = encode_config_wire(&request, self.profile).map_err(|error| {
             EngineRpcError::Unreachable(Unreachable::new(&CodecTransportError(error)))
         })?;
         self.call(
@@ -277,6 +286,7 @@ where
 /// Engine-only inbound handler. Consumer forwarding is composed outside it.
 #[derive(Clone)]
 pub(crate) struct ConfigRaftRpcHandler {
+    profile: RetainedConfigProfile,
     raft: ConfigRaft,
     identity: ConsensusIdentity,
     local_node_id: ConsensusNodeId,
@@ -287,8 +297,10 @@ impl ConfigRaftRpcHandler {
         raft: ConfigRaft,
         identity: ConsensusIdentity,
         local_node_id: ConsensusNodeId,
+        profile: RetainedConfigProfile,
     ) -> Self {
         Self {
+            profile,
             raft,
             identity,
             local_node_id,
@@ -321,31 +333,34 @@ impl ConsensusRpcHandler for ConfigRaftRpcHandler {
                 let rpc = match decode_and_bind_sender::<AppendEntriesRequest<ConfigRaftTypeConfig>>(
                     &request.payload,
                     request.sender,
+                    self.profile,
                 ) {
                     Ok(rpc) => rpc,
                     Err(error) => return rejected_response(error),
                 };
-                encode_engine_result(&self.raft.append_entries(rpc).await)
+                encode_engine_result(&self.raft.append_entries(rpc).await, self.profile)
             }
             ConsensusRpcFamily::Vote => {
                 let rpc = match decode_and_bind_sender::<VoteRequest<ConsensusNodeId>>(
                     &request.payload,
                     request.sender,
+                    self.profile,
                 ) {
                     Ok(rpc) => rpc,
                     Err(error) => return rejected_response(error),
                 };
-                encode_engine_result(&self.raft.vote(rpc).await)
+                encode_engine_result(&self.raft.vote(rpc).await, self.profile)
             }
             ConsensusRpcFamily::InstallSnapshot => {
                 let rpc = match decode_and_bind_sender::<InstallSnapshotRequest<ConfigRaftTypeConfig>>(
                     &request.payload,
                     request.sender,
+                    self.profile,
                 ) {
                     Ok(rpc) => rpc,
                     Err(error) => return rejected_response(error),
                 };
-                encode_engine_result(&self.raft.install_snapshot(rpc).await)
+                encode_engine_result(&self.raft.install_snapshot(rpc).await, self.profile)
             }
             _ => return rejected_response(ConsensusPeerError::Rejected),
         };
@@ -398,23 +413,28 @@ impl EngineRequestSender for InstallSnapshotRequest<ConfigRaftTypeConfig> {
 fn decode_and_bind_sender<T>(
     payload: &[u8],
     sender: ConsensusNodeId,
+    profile: RetainedConfigProfile,
 ) -> Result<T, ConsensusPeerError>
 where
     T: DeserializeOwned + EngineRequestSender,
 {
-    let request: T = decode_config_wire(payload).map_err(|_| ConsensusPeerError::Protocol)?;
+    let request: T =
+        decode_config_wire(payload, profile).map_err(|_| ConsensusPeerError::Protocol)?;
     if request.vote().leader_id.voted_for() != Some(sender) {
         return Err(ConsensusPeerError::ScopeMismatch);
     }
     Ok(request)
 }
 
-fn encode_engine_result<T, E>(result: &Result<T, E>) -> Result<Vec<u8>, ConsensusPeerError>
+fn encode_engine_result<T, E>(
+    result: &Result<T, E>,
+    profile: RetainedConfigProfile,
+) -> Result<Vec<u8>, ConsensusPeerError>
 where
     T: Serialize,
     E: Serialize,
 {
-    encode_config_wire(result).map_err(|_| ConsensusPeerError::Protocol)
+    encode_config_wire(result, profile).map_err(|_| ConsensusPeerError::Protocol)
 }
 
 fn rejected_response(error: ConsensusPeerError) -> ConsensusWireResponse {
