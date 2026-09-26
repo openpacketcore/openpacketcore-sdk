@@ -2286,6 +2286,17 @@ canonical fingerprints and `Fresh` mark reservations are unchanged. The
 protected `OPCSN18` ledger records the immutable child-parent relationship;
 parent retirement waits for exact child retirement.
 
+When the caller needs no separate parent capability, use
+`reconcile_bearer_under_active_parent` with the complete parent and child
+groups. It resolves the exact existing Active parent inside the child
+operation's fenced lease, eliminating a separate `recover_active` operation.
+The protected parent descriptor and fresh backend qualification remain
+mandatory, as do all three child writes and their durable readbacks. Missing,
+changed, marked or retired parents are refused; this entry point cannot repair
+or reattach a parent. The concurrent operations handle reserves both groups
+and all conflicting selectors before resolution. Cancellation detaches only
+the observer, and independent groups retain the same bounded progress rules.
+
 Use the ordinary exact child recovery and retirement operations after a failed
 or cancelled call. Mark reuse requires source quiescence and a fresh local TEID;
 reuse after default reattach additionally requires the protected predecessor

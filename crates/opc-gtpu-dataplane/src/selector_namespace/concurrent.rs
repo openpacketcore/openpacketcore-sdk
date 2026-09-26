@@ -200,6 +200,32 @@ where
         )
     }
 
+    /// Add a child under an exact existing Active parent within one operation.
+    ///
+    /// Both complete groups are reserved before resolving the parent's durable
+    /// descriptor. The original fresh backend qualification, fenced child writes
+    /// and readbacks remain mandatory. A missing, changed, marked or retired
+    /// parent cannot be adopted. Cancellation detaches only the result observer,
+    /// exactly as for [`Self::reconcile_bearer`].
+    pub fn reconcile_bearer_under_active_parent<D>(
+        &self,
+        backend: Arc<D>,
+        parent: GtpuSessionGroup,
+        desired: GtpuSessionGroup,
+    ) -> GtpuSessionSelectorOperation<GtpuSessionSelectorActiveClaim>
+    where
+        D: GtpuDataplaneBackend + Send + Sync + 'static,
+    {
+        self.spawn(
+            vec![parent.clone(), desired.clone()],
+            |authority| async move {
+                authority
+                    .reconcile_bearer_with_parent_owned(backend.as_ref(), None, parent, desired)
+                    .await
+            },
+        )
+    }
+
     /// Recover exact Active authority without replaying an installation.
     pub fn recover_active<D>(
         &self,
