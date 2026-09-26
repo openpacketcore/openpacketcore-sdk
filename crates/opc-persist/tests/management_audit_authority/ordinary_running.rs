@@ -125,6 +125,7 @@ async fn ordinary_running_apply_preserves_original_pending_and_cleanup() {
         fixture.settle(&conn, &tentative);
         if cleanup {
             let end = fixture.request(&conn, 210, 13, 0x61, 0);
+            let end = fixture.rebind_at(&conn, end, 100);
             assert!(matches!(
                 fixture.submit(&conn, &end),
                 AuditOperationState::TargetV1(_)
