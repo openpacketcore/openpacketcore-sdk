@@ -18,19 +18,23 @@ use opc_consensus::{
     AppendEntriesBatchAccumulator, AppendEntriesBatchDecision, ConsensusEntryDigest,
     ConsensusIdentity, ConsensusNodeId,
 };
+use opc_crypto::ConfigCapacityProfile;
 use opc_types::Timestamp;
 use rusqlite::{params, Connection, OptionalExtension, Transaction, TransactionBehavior};
 use serde::Serialize;
 use sha2::{Digest, Sha256};
 
+use super::config_capacity_decode::engine as capacity_decode;
 use super::storage::ConfigConsensusStorageError;
-use super::types::{CONFIG_CONSENSUS_STORAGE_VERSION, LEGACY_CONFIG_CONSENSUS_COMMAND_VERSION};
+use super::types::{config_storage_revision, LEGACY_CONFIG_CONSENSUS_COMMAND_VERSION};
 use super::{
     ApprovedLegacyConfigRecovery, ConfigConsensusResponse, ConfigMutationFailure,
     ConfigMutationIntent, ConfigRaftTypeConfig,
 };
 use crate::backend::SqliteBackend;
 use crate::types::{AuditKey, AuditOpType, CommitSource};
+
+mod outcome_authentication;
 
 pub(crate) struct StagedLegacyRecovery {
     pub(crate) path: PathBuf,
@@ -145,6 +149,26 @@ CREATE TABLE config_raft_legacy_recovery (
     completed INTEGER NOT NULL CHECK (completed = 1)
 );
 "#;
+
+// Added only for explicitly provisioned storage revision 6. The legacy DDL
+// and its exact manifest digest remain unchanged.
+const CONFIG_RAFT_CAPACITY_SCHEMA: &str = r#"
+CREATE TABLE config_raft_capacity_records (
+    tx_id BLOB PRIMARY KEY NOT NULL CHECK (typeof(tx_id) = 'blob' AND length(tx_id) = 16),
+    binding BLOB NOT NULL CHECK (typeof(binding) = 'blob' AND length(binding) = 44),
+    FOREIGN KEY (tx_id) REFERENCES config_history(tx_id)
+);
+"#;
+
+fn create_capacity_schema(conn: &Connection, profile: ConfigCapacityProfile) -> io::Result<()> {
+    match profile {
+        ConfigCapacityProfile::Legacy => Ok(()),
+        ConfigCapacityProfile::BoundedV1 => conn
+            .execute_batch(CONFIG_RAFT_CAPACITY_SCHEMA)
+            .map_err(db_error),
+        _ => Err(invalid_data("unsupported config capacity profile")),
+    }
+}
 
 /// Hard ceiling for one serialized config Openraft entry on disk.
 pub(crate) const CONFIG_CONSENSUS_LOG_ENTRY_MAX_BYTES: usize = 16 * 1024 * 1024;
@@ -293,6 +317,7 @@ const LEGACY_RAFT_TABLES: &[&str] = &[
 pub(crate) struct ConfigConsensusCore {
     pub(crate) conn: Arc<tokio::sync::Mutex<crate::backend::BackendConnection>>,
     pub(crate) identity: ConsensusIdentity,
+    pub(crate) capacity_profile: ConfigCapacityProfile,
     pub(crate) expected_members: Arc<BTreeSet<ConsensusNodeId>>,
     pub(crate) snapshot_dir: Arc<PathBuf>,
     pub(crate) snapshot_gate: Arc<tokio::sync::Mutex<()>>,
@@ -304,6 +329,9 @@ pub(crate) struct ConfigConsensusCore {
     sqlite_worker_gate: Arc<tokio::sync::Semaphore>,
     #[cfg(test)]
     pub(crate) apply_gate: Arc<tokio::sync::Semaphore>,
+    // Last field: release is observable only after this core's connection and
+    // every other engine-storage resource have finished dropping.
+    storage_owner: Arc<super::storage::ConfigStorageOwner>,
 }
 
 impl ConfigConsensusCore {
@@ -391,6 +419,12 @@ impl ConfigConsensusCore {
         let worker_audit_key = backend.audit_key().clone();
         let worker_backend = backend.clone();
         let retained = backend.retained_binding.is_some();
+        let capacity_profile = backend
+            .retained_binding
+            .as_ref()
+            .map_or(ConfigCapacityProfile::Legacy, |binding| {
+                binding.capacity_profile()
+            });
         let cancellation = Arc::new(SqliteWorkCancellation::with_deadline(std_deadline));
         let mut cancel_on_drop = SqliteWorkCancelOnDrop::new(cancellation.clone());
         let worker_cancellation = cancellation.clone();
@@ -400,7 +434,12 @@ impl ConfigConsensusCore {
             worker_conn
                 .progress_handler(1_000, Some(move || progress_cancellation.is_cancelled()))
                 .map_err(|_| ConfigConsensusStorageError::BackendUnavailable)?;
-            let result = if retained {
+            let result = if worker_backend
+                .config_consensus_identity()
+                .is_some_and(|expected| expected != identity)
+            {
+                Err(ConfigConsensusStorageError::InvalidIdentity)
+            } else if retained {
                 if recovery.is_some() {
                     Err(ConfigConsensusStorageError::RecoveryRequired)
                 } else {
@@ -409,26 +448,28 @@ impl ConfigConsensusCore {
                         identity,
                         &worker_members,
                         &worker_audit_key,
+                        capacity_profile,
                         false,
                         &worker_cancellation,
                     )
                 }
             } else {
-                initialize_schema(
+                initialize_schema_for_profile(
                     &worker_conn,
                     identity,
                     &worker_members,
                     &worker_audit_key,
+                    capacity_profile,
                     recovery.as_ref(),
                     &worker_cancellation,
                     before_commit,
                 )
             };
-            if result.is_ok() {
+            let result = result.and_then(|()| {
                 // Latch before releasing the shared connection, including when
                 // the awaiting future is cancelled after the durable claim.
-                worker_backend.require_config_consensus_history();
-            }
+                worker_backend.require_config_consensus_history(identity)
+            });
             worker_conn
                 .progress_handler(0, None::<fn() -> bool>)
                 .expect("installed SQLite hook belongs to an owned connection");
@@ -457,9 +498,11 @@ impl ConfigConsensusCore {
             binding_path: snapshot_binding_path,
             guard: snapshot_dir_guard,
         } = snapshot_directory;
+        let storage_owner = durable_progress.track_storage_owners()?;
         Ok(Self {
             conn,
             identity,
+            capacity_profile,
             expected_members: Arc::new(expected_members),
             snapshot_dir: Arc::new(snapshot_dir),
             snapshot_gate: Arc::new(tokio::sync::Mutex::new(())),
@@ -471,6 +514,7 @@ impl ConfigConsensusCore {
             sqlite_worker_gate: worker_gate,
             #[cfg(test)]
             apply_gate: Arc::clone(&backend.consensus_apply_gate),
+            storage_owner,
         })
     }
 
@@ -506,6 +550,7 @@ impl ConfigConsensusCore {
         run_sqlite_worker_until(
             self.sqlite_worker_gate.clone(),
             self.conn.clone(),
+            Some(Arc::clone(&self.storage_owner)),
             deadline,
             operation,
         )
@@ -541,6 +586,7 @@ impl ConfigConsensusCore {
         run_sqlite_worker_until(
             self.sqlite_worker_gate.clone(),
             self.conn.clone(),
+            Some(Arc::clone(&self.storage_owner)),
             deadline,
             operation,
         )
@@ -568,15 +614,24 @@ where
     run_sqlite_worker_until(
         backend.config_consensus_worker_gate(),
         backend.conn(),
+        None,
         deadline,
         operation,
     )
     .await
 }
 
+// Retain the engine-storage owner through the final worker connection drop,
+// including a blocking worker whose caller was cancelled. Field order matters.
+struct ConfigSqliteWorkerConnection {
+    connection: tokio::sync::OwnedMutexGuard<crate::backend::BackendConnection>,
+    _storage_owner: Option<Arc<super::storage::ConfigStorageOwner>>,
+}
+
 async fn run_sqlite_worker_until<T, F>(
     worker_gate: Arc<tokio::sync::Semaphore>,
     conn: Arc<tokio::sync::Mutex<crate::backend::BackendConnection>>,
+    storage_owner: Option<Arc<super::storage::ConfigStorageOwner>>,
     deadline: tokio::time::Instant,
     operation: F,
 ) -> io::Result<T>
@@ -595,11 +650,19 @@ where
     let conn = tokio::time::timeout_at(deadline, conn.lock_owned())
         .await
         .map_err(|_| timed_out("config consensus SQLite connection timed out"))?;
+    let connection = ConfigSqliteWorkerConnection {
+        connection: conn,
+        _storage_owner: storage_owner,
+    };
     let cancellation = Arc::new(SqliteWorkCancellation::with_deadline(std_deadline));
     let mut cancel_on_drop = SqliteWorkCancelOnDrop::new(cancellation.clone());
     let worker_cancellation = cancellation.clone();
     let mut worker = tokio::task::spawn_blocking(move || {
+        // Move the complete wrapper so precise closure capture cannot split
+        // its connection from the owner that must outlive it.
+        let connection = connection;
         let _permit = permit;
+        let conn = &connection.connection;
         let commit_cancellation = worker_cancellation.clone();
         conn.commit_hook(Some(move || {
             commit_cancellation.authorize_commit().is_err()
@@ -613,7 +676,7 @@ where
             }),
         )
         .map_err(db_error)?;
-        let result = operation(&conn, &worker_cancellation);
+        let result = operation(conn, &worker_cancellation);
         conn.commit_hook(None::<fn() -> bool>)
             .expect("installed SQLite hook belongs to an owned connection");
         conn.progress_handler(0, None::<fn() -> bool>)
@@ -656,13 +719,15 @@ pub(crate) fn provision_retained_schema(
     conn: &Connection,
     topology: &super::ConfigConsensusTopology,
     audit_key: &AuditKey,
+    capacity_profile: ConfigCapacityProfile,
     deadline: std::time::Instant,
 ) -> Result<(), ConfigConsensusStorageError> {
-    initialize_schema(
+    initialize_schema_for_profile(
         conn,
         topology.identity(),
         topology.members(),
         audit_key,
+        capacity_profile,
         None,
         &Arc::new(SqliteWorkCancellation::with_deadline(deadline)),
         None,
@@ -674,6 +739,7 @@ pub(crate) fn validate_retained_schema(
     conn: &Connection,
     topology: &super::ConfigConsensusTopology,
     audit_key: &AuditKey,
+    capacity_profile: ConfigCapacityProfile,
     deadline: std::time::Instant,
 ) -> Result<(), ConfigConsensusStorageError> {
     validate_existing_schema(
@@ -681,11 +747,13 @@ pub(crate) fn validate_retained_schema(
         topology.identity(),
         topology.members(),
         audit_key,
+        capacity_profile,
         false,
         &SqliteWorkCancellation::with_deadline(deadline),
     )
 }
 
+#[cfg(test)]
 fn initialize_schema(
     conn: &Connection,
     identity: ConsensusIdentity,
@@ -695,6 +763,32 @@ fn initialize_schema(
     cancellation: &Arc<SqliteWorkCancellation>,
     before_commit: Option<InitializationCommitHook>,
 ) -> Result<(), ConfigConsensusStorageError> {
+    initialize_schema_for_profile(
+        conn,
+        identity,
+        expected_members,
+        audit_key,
+        ConfigCapacityProfile::Legacy,
+        recovery,
+        cancellation,
+        before_commit,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn initialize_schema_for_profile(
+    conn: &Connection,
+    identity: ConsensusIdentity,
+    expected_members: &BTreeSet<ConsensusNodeId>,
+    audit_key: &AuditKey,
+    capacity_profile: ConfigCapacityProfile,
+    recovery: Option<&StagedLegacyRecovery>,
+    cancellation: &Arc<SqliteWorkCancellation>,
+    before_commit: Option<InitializationCommitHook>,
+) -> Result<(), ConfigConsensusStorageError> {
+    if capacity_profile != ConfigCapacityProfile::Legacy && recovery.is_some() {
+        return Err(ConfigConsensusStorageError::InvalidIdentity);
+    }
     if let Some(recovery) = recovery {
         validate_legacy_recovery_snapshot(recovery, audit_key, cancellation)?;
         let path = recovery
@@ -709,6 +803,7 @@ fn initialize_schema(
         identity,
         expected_members,
         audit_key,
+        capacity_profile,
         recovery,
         cancellation,
         before_commit,
@@ -722,11 +817,13 @@ fn initialize_schema(
     result
 }
 
+#[allow(clippy::too_many_arguments)]
 fn initialize_schema_transaction(
     conn: &Connection,
     identity: ConsensusIdentity,
     expected_members: &BTreeSet<ConsensusNodeId>,
     audit_key: &AuditKey,
+    capacity_profile: ConfigCapacityProfile,
     recovery: Option<&StagedLegacyRecovery>,
     cancellation: &SqliteWorkCancellation,
     before_commit: Option<InitializationCommitHook>,
@@ -749,14 +846,17 @@ fn initialize_schema_transaction(
             .map_err(|_| ConfigConsensusStorageError::BackendUnavailable)?;
         tx.execute_batch(CONFIG_RAFT_SCHEMA)
             .map_err(|_| ConfigConsensusStorageError::BackendUnavailable)?;
+        create_capacity_schema(&tx, capacity_profile)
+            .map_err(|_| ConfigConsensusStorageError::InvalidIdentity)?;
         let epoch = checked_positive_i64(identity.configuration_epoch().get())
             .map_err(|_| ConfigConsensusStorageError::InvalidIdentity)?;
-        let schema_manifest_digest = config_schema_manifest_digest(&tx, cancellation)
-            .map_err(|_| ConfigConsensusStorageError::CorruptState)?;
+        let schema_manifest_digest =
+            config_schema_manifest_digest(&tx, capacity_profile, cancellation)
+                .map_err(|_| ConfigConsensusStorageError::CorruptState)?;
         tx.execute(
             "INSERT INTO config_raft_identity (singleton, schema_version, cluster_id, configuration_id, configuration_epoch, audit_key_epoch, audit_key_fingerprint, schema_manifest_digest) VALUES (1, ?1, ?2, ?3, ?4, ?5, ?6, ?7)",
             params![
-                i64::from(CONFIG_CONSENSUS_STORAGE_VERSION),
+                i64::from(config_storage_revision(capacity_profile)),
                 identity.cluster_id().as_bytes().as_slice(),
                 identity.configuration_id().as_bytes().as_slice(),
                 epoch,
@@ -768,7 +868,7 @@ fn initialize_schema_transaction(
         .map_err(|_| ConfigConsensusStorageError::BackendUnavailable)?;
         super::audit::initialize_sync(&tx, audit_key, identity)
             .map_err(|_| ConfigConsensusStorageError::CorruptState)?;
-        super::history::initialize_sync(&tx, identity, audit_key, cancellation)
+        super::history::initialize_sync(&tx, identity, audit_key, capacity_profile, cancellation)
             .map_err(|_| ConfigConsensusStorageError::CorruptState)?;
         if let Some(recovery) = recovery {
             tx.execute(
@@ -798,6 +898,7 @@ fn initialize_schema_transaction(
             identity,
             expected_members,
             audit_key,
+            capacity_profile,
             false,
             cancellation,
         )?;
@@ -808,6 +909,7 @@ fn initialize_schema_transaction(
             identity,
             expected_members,
             audit_key,
+            capacity_profile,
             false,
             cancellation,
         )?;
@@ -1105,6 +1207,7 @@ fn validate_existing_schema(
     identity: ConsensusIdentity,
     expected_members: &BTreeSet<ConsensusNodeId>,
     audit_key: &AuditKey,
+    capacity_profile: ConfigCapacityProfile,
     allow_detached_snapshot: bool,
     cancellation: &SqliteWorkCancellation,
 ) -> Result<(), ConfigConsensusStorageError> {
@@ -1116,31 +1219,7 @@ fn validate_existing_schema(
             return Err(ConfigConsensusStorageError::CorruptState);
         }
     }
-    let schema_manifest_digest = config_schema_manifest_digest(conn, cancellation)
-        .map_err(|_| ConfigConsensusStorageError::CorruptState)?;
-    let row = conn
-        .query_row(
-            "SELECT schema_version, cluster_id, configuration_id, configuration_epoch, audit_key_epoch, audit_key_fingerprint, schema_manifest_digest FROM config_raft_identity WHERE singleton = 1",
-            [],
-            |row| Ok((row.get::<_, i64>(0)?, row.get::<_, Vec<u8>>(1)?, row.get::<_, Vec<u8>>(2)?, row.get::<_, i64>(3)?, row.get::<_, i64>(4)?, row.get::<_, Vec<u8>>(5)?, row.get::<_, Vec<u8>>(6)?)),
-        )
-        .optional()
-        .map_err(|_| ConfigConsensusStorageError::BackendUnavailable)?
-        .ok_or(ConfigConsensusStorageError::CorruptState)?;
-    if row.0 != i64::from(CONFIG_CONSENSUS_STORAGE_VERSION) {
-        return Err(ConfigConsensusStorageError::SchemaVersionMismatch);
-    }
-    if row.1.as_slice() != identity.cluster_id().as_bytes()
-        || row.2.as_slice() != identity.configuration_id().as_bytes()
-        || checked_positive_u64(row.3).map_err(|_| ConfigConsensusStorageError::CorruptState)?
-            != identity.configuration_epoch().get()
-        || checked_positive_u64(row.4).map_err(|_| ConfigConsensusStorageError::CorruptState)?
-            != audit_key.epoch()
-        || row.5.as_slice() != audit_key.fingerprint()
-        || row.6.as_slice() != schema_manifest_digest
-    {
-        return Err(ConfigConsensusStorageError::IdentityMismatch);
-    }
+    validate_storage_identity_sync(conn, identity, audit_key, capacity_profile, cancellation)?;
     let machine_rows: i64 = conn
         .query_row("SELECT COUNT(*) FROM config_raft_machine", [], |row| {
             row.get(0)
@@ -1154,7 +1233,7 @@ fn validate_existing_schema(
     if machine_rows != 1 || membership_rows != 1 {
         return Err(ConfigConsensusStorageError::CorruptState);
     }
-    let membership = read_membership_unchecked_sync(conn, identity)
+    let membership = read_membership_unchecked_sync(conn, identity, capacity_profile)
         .map_err(|_| ConfigConsensusStorageError::CorruptState)?;
     if !is_pristine_membership(&membership) {
         validate_fixed_membership(&membership, expected_members)
@@ -1167,12 +1246,56 @@ fn validate_existing_schema(
         conn,
         identity,
         expected_members,
+        audit_key,
+        capacity_profile,
         allow_detached_snapshot,
         cancellation,
     )
     .map_err(|_| ConfigConsensusStorageError::CorruptState)?;
-    validate_sealed_state_sync(conn, audit_key, cancellation)
-        .map_err(|_| ConfigConsensusStorageError::CorruptState)
+    validate_sealed_state_for_profile_sync(
+        conn,
+        identity,
+        audit_key,
+        capacity_profile,
+        cancellation,
+    )
+    .map_err(|_| ConfigConsensusStorageError::CorruptState)
+}
+
+fn validate_storage_identity_sync(
+    conn: &Connection,
+    identity: ConsensusIdentity,
+    audit_key: &AuditKey,
+    capacity_profile: ConfigCapacityProfile,
+    cancellation: &SqliteWorkCancellation,
+) -> Result<(), ConfigConsensusStorageError> {
+    let schema_manifest_digest =
+        config_schema_manifest_digest(conn, capacity_profile, cancellation)
+            .map_err(|_| ConfigConsensusStorageError::CorruptState)?;
+    let row = conn
+        .query_row(
+            "SELECT schema_version, cluster_id, configuration_id, configuration_epoch, audit_key_epoch, audit_key_fingerprint, schema_manifest_digest FROM config_raft_identity WHERE singleton = 1",
+            [],
+            |row| Ok((row.get::<_, i64>(0)?, row.get::<_, Vec<u8>>(1)?, row.get::<_, Vec<u8>>(2)?, row.get::<_, i64>(3)?, row.get::<_, i64>(4)?, row.get::<_, Vec<u8>>(5)?, row.get::<_, Vec<u8>>(6)?)),
+        )
+        .optional()
+        .map_err(|_| ConfigConsensusStorageError::BackendUnavailable)?
+        .ok_or(ConfigConsensusStorageError::CorruptState)?;
+    if row.0 != i64::from(config_storage_revision(capacity_profile)) {
+        return Err(ConfigConsensusStorageError::SchemaVersionMismatch);
+    }
+    if row.1.as_slice() != identity.cluster_id().as_bytes()
+        || row.2.as_slice() != identity.configuration_id().as_bytes()
+        || checked_positive_u64(row.3).map_err(|_| ConfigConsensusStorageError::CorruptState)?
+            != identity.configuration_epoch().get()
+        || checked_positive_u64(row.4).map_err(|_| ConfigConsensusStorageError::CorruptState)?
+            != audit_key.epoch()
+        || row.5.as_slice() != audit_key.fingerprint()
+        || row.6.as_slice() != schema_manifest_digest
+    {
+        return Err(ConfigConsensusStorageError::IdentityMismatch);
+    }
+    Ok(())
 }
 
 const CONFIG_SCHEMA_OBJECTS: &str = "SELECT type, name, tbl_name, sql FROM main.sqlite_schema \
@@ -1207,6 +1330,7 @@ fn config_schema_manifest(
 
 fn config_schema_manifest_digest(
     conn: &Connection,
+    profile: ConfigCapacityProfile,
     cancellation: &SqliteWorkCancellation,
 ) -> io::Result<[u8; 32]> {
     cancellation.check_io()?;
@@ -1214,6 +1338,7 @@ fn config_schema_manifest_digest(
     expected
         .execute_batch(CONFIG_RAFT_SCHEMA)
         .map_err(db_error)?;
+    create_capacity_schema(&expected, profile)?;
     let expected_manifest = config_schema_manifest(&expected, cancellation)?;
     let live_count: i64 = conn
         .query_row(
@@ -1254,8 +1379,9 @@ fn config_schema_manifest_digest(
 /// Validate the executable schema in the same transaction as history use.
 /// Authenticating rows alone cannot authorize a changed trigger or constraint
 /// to alter unrelated records during an otherwise legitimate lifecycle update.
-pub(super) fn validate_live_history_schema_sync(
+pub(super) fn validate_live_history_schema_for_profile_sync(
     conn: &Connection,
+    profile: ConfigCapacityProfile,
     cancellation: &SqliteWorkCancellation,
 ) -> io::Result<()> {
     cancellation.check_io()?;
@@ -1271,7 +1397,7 @@ pub(super) fn validate_live_history_schema_sync(
     }
     crate::schema::validate_retained_base_schema(conn)
         .map_err(|_| invalid_data("config history base schema does not match"))?;
-    config_schema_manifest_digest(conn, cancellation)?;
+    config_schema_manifest_digest(conn, profile, cancellation)?;
     cancellation.check_io()
 }
 
@@ -1315,7 +1441,8 @@ fn encode_json<T: Serialize + ?Sized>(value: &T) -> io::Result<Vec<u8>> {
 }
 
 struct BoundedJsonWriter<'a> {
-    bytes: Vec<u8>,
+    bytes: Option<Vec<u8>>,
+    written: usize,
     limit: usize,
     limit_exceeded: bool,
     cancellation: &'a SqliteWorkCancellation,
@@ -1325,18 +1452,22 @@ impl io::Write for BoundedJsonWriter<'_> {
     fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
         self.cancellation.check_io()?;
         let next = self
-            .bytes
-            .len()
+            .written
             .checked_add(bytes.len())
             .ok_or_else(|| invalid_data("config consensus encoding length overflow"))?;
         if next > self.limit {
             self.limit_exceeded = true;
             return Err(invalid_data("config consensus encoding exceeds limit"));
         }
-        self.bytes
-            .try_reserve(bytes.len())
-            .map_err(|_| io::Error::other("config consensus encoding allocation failed"))?;
-        self.bytes.extend_from_slice(bytes);
+        if let Some(output) = self.bytes.as_mut() {
+            // The preceding counting pass reserved the exact closed DTO.
+            // A changed serialization cannot trigger another allocation.
+            if next > output.capacity() {
+                return Err(invalid_data("config consensus encoding length changed"));
+            }
+            output.extend_from_slice(bytes);
+        }
+        self.written = next;
         Ok(bytes.len())
     }
 
@@ -1345,29 +1476,107 @@ impl io::Write for BoundedJsonWriter<'_> {
     }
 }
 
-fn encode_json_bounded_cancellable<T: Serialize + ?Sized>(
+fn json_length_bounded_cancellable<T: Serialize + ?Sized>(
     value: &T,
     limit: usize,
     limit_message: &'static str,
     cancellation: &SqliteWorkCancellation,
-) -> io::Result<Vec<u8>> {
+) -> io::Result<usize> {
     let mut writer = BoundedJsonWriter {
-        bytes: Vec::new(),
+        bytes: None,
+        written: 0,
         limit,
         limit_exceeded: false,
         cancellation,
     };
-    let encoded = serde_json::to_writer(&mut writer, value);
+    let encoded = crate::consensus::config_capacity_json::to_writer(&mut writer, value);
     if cancellation.is_cancelled() {
         return Err(timed_out("config consensus SQLite operation timed out"));
     }
     if writer.limit_exceeded {
         return Err(invalid_data(limit_message));
     }
-    encoded
-        .map_err(|_| invalid_data("config consensus encoding failed"))
-        .map(|()| writer.bytes)
+    encoded.map_err(|_| invalid_data("config consensus encoding failed"))?;
+    Ok(writer.written)
 }
+
+fn encode_json_bounded_cancellable<T: Serialize + ?Sized>(
+    value: &T,
+    limit: usize,
+    limit_message: &'static str,
+    cancellation: &SqliteWorkCancellation,
+) -> io::Result<Vec<u8>> {
+    let expected = json_length_bounded_cancellable(value, limit, limit_message, cancellation)?;
+    let mut output = Vec::new();
+    output
+        .try_reserve_exact(expected)
+        .map_err(|_| io::Error::other("config consensus encoding allocation failed"))?;
+    let mut writer = BoundedJsonWriter {
+        bytes: Some(output),
+        written: 0,
+        limit: expected,
+        limit_exceeded: false,
+        cancellation,
+    };
+    let encoded = crate::consensus::config_capacity_json::to_writer(&mut writer, value);
+    if cancellation.is_cancelled() {
+        return Err(timed_out("config consensus SQLite operation timed out"));
+    }
+    encoded.map_err(|_| invalid_data("config consensus encoding failed"))?;
+    if writer.written != expected {
+        return Err(invalid_data("config consensus encoding length changed"));
+    }
+    writer
+        .bytes
+        .ok_or_else(|| invalid_data("config consensus encoding failed"))
+}
+
+/// Select one whole-entry transaction from an already committed prefix.
+/// Replication may have admitted that prefix through many separate appends.
+/// Counting borrows the immutable entries and allocates no JSON output.
+pub(crate) fn committed_apply_batch_end<T: Serialize>(
+    entries: &[T],
+    cancellation: &SqliteWorkCancellation,
+) -> io::Result<usize> {
+    cancellation.check_io()?;
+    if entries.len() > CONFIG_CONSENSUS_LOG_APPEND_MAX_ENTRIES {
+        return Err(invalid_data(
+            "config consensus apply batch collection exceeds limit",
+        ));
+    }
+    let mut bytes = 0_usize;
+    let mut end = 0;
+    for entry in entries {
+        let length = json_length_bounded_cancellable(
+            entry,
+            CONFIG_CONSENSUS_LOG_ENTRY_MAX_BYTES,
+            "config consensus apply entry exceeds storage limit",
+            cancellation,
+        )?;
+        let next = bytes
+            .checked_add(length)
+            .ok_or_else(|| invalid_data("config consensus apply byte count overflow"))?;
+        if next > CONFIG_CONSENSUS_LOG_APPEND_MAX_BYTES {
+            break;
+        }
+        bytes = next;
+        end += 1;
+    }
+    if !entries.is_empty() && end == 0 {
+        return Err(invalid_data(
+            "config consensus apply entry cannot fit transaction",
+        ));
+    }
+    Ok(end)
+}
+
+#[cfg(test)]
+#[path = "sqlite/config_capacity_json_allocation_tests.rs"]
+mod config_capacity_json_allocation_tests;
+
+#[cfg(test)]
+#[path = "sqlite/config_capacity_apply_batch_tests.rs"]
+mod config_capacity_apply_batch_tests;
 
 fn decode_json<T: serde::de::DeserializeOwned>(bytes: &[u8]) -> io::Result<T> {
     serde_json::from_slice(bytes).map_err(|_| invalid_data("config consensus decoding failed"))
@@ -1457,7 +1666,7 @@ pub(crate) fn read_vote_sync(
         _ => {
             return Err(invalid_data(
                 "persisted config consensus vote node mismatch",
-            ))
+            ));
         }
     }
     Ok(Some(vote))
@@ -1559,6 +1768,7 @@ pub(crate) fn save_committed_sync(
     conn: &Connection,
     identity: ConsensusIdentity,
     committed: Option<LogId<ConsensusNodeId>>,
+    capacity_profile: ConfigCapacityProfile,
 ) -> io::Result<()> {
     let Some(committed) = committed else {
         if read_committed_sync(conn, identity)?.is_some() {
@@ -1588,10 +1798,11 @@ pub(crate) fn save_committed_sync(
             ));
         }
     }
-    if validate_pointer_against_log_sync(&tx, identity, &committed).is_err() {
+    if validate_pointer_against_log_sync(&tx, identity, &committed, capacity_profile).is_err() {
         let covered = read_applied_sync(&tx, identity)? == Some(committed)
             || read_purged_sync(&tx, identity)? == Some(committed)
-            || read_snapshot_log_id_unchecked_sync(&tx, identity)? == Some(committed);
+            || read_snapshot_log_id_unchecked_sync(&tx, identity, capacity_profile)?
+                == Some(committed);
         if !covered {
             return Err(invalid_data(
                 "config consensus committed pointer lacks durable lineage",
@@ -1616,27 +1827,47 @@ pub(crate) fn read_applied_sync(
     read_log_pointer(conn, "config_raft_applied", identity)
 }
 
+// Borrow the SQLite value so an encoded-length rejection cannot first copy
+// the entire hostile row into an SDK-owned Vec.
+fn row_blob<'a>(row: &'a rusqlite::Row<'_>, index: usize) -> io::Result<&'a [u8]> {
+    row.get_ref(index)
+        .map_err(db_error)?
+        .as_blob()
+        .map_err(|_| invalid_data("invalid config consensus blob column"))
+}
+
+fn row_entry(
+    row: &rusqlite::Row<'_>,
+    identity: ConsensusIdentity,
+    capacity_profile: ConfigCapacityProfile,
+) -> io::Result<Entry<ConfigRaftTypeConfig>> {
+    validate_epoch(row.get(0).map_err(db_error)?, identity)?;
+    let term = checked_u64(row.get(1).map_err(db_error)?)?;
+    let index = checked_u64(row.get(2).map_err(db_error)?)?;
+    let encoded = row_blob(row, 3)?;
+    if encoded.len() > CONFIG_CONSENSUS_LOG_ENTRY_MAX_BYTES {
+        return Err(invalid_data(
+            "persisted config consensus log entry exceeds storage limit",
+        ));
+    }
+    let entry = capacity_decode::native_entry(capacity_profile, encoded)?;
+    if term != entry.log_id.leader_id.term || index != entry.log_id.index {
+        return Err(invalid_data("persisted config consensus log row mismatch"));
+    }
+    Ok(entry)
+}
+
 pub(crate) fn last_log_sync(
     conn: &Connection,
     identity: ConsensusIdentity,
+    capacity_profile: ConfigCapacityProfile,
 ) -> io::Result<Option<LogId<ConsensusNodeId>>> {
-    let row = conn
-        .query_row(
-            "SELECT configuration_epoch, term, log_index, entry_json FROM config_raft_log ORDER BY log_index DESC LIMIT 1",
-            [],
-            |row| Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?, row.get::<_, i64>(2)?, row.get::<_, Vec<u8>>(3)?)),
-        )
-        .optional()
-        .map_err(db_error)?;
-    if let Some((epoch, term, index, encoded)) = row {
-        validate_epoch(epoch, identity)?;
-        let entry: Entry<ConfigRaftTypeConfig> = decode_json(&encoded)?;
-        if checked_u64(term)? != entry.log_id.leader_id.term
-            || checked_u64(index)? != entry.log_id.index
-        {
-            return Err(invalid_data("persisted config consensus log row mismatch"));
-        }
-        return Ok(Some(entry.log_id));
+    let mut statement = conn.prepare(
+        "SELECT configuration_epoch, term, log_index, entry_json FROM config_raft_log ORDER BY log_index DESC LIMIT 1",
+    ).map_err(db_error)?;
+    let mut rows = statement.query([]).map_err(db_error)?;
+    if let Some(row) = rows.next().map_err(db_error)? {
+        return Ok(Some(row_entry(row, identity, capacity_profile)?.log_id));
     }
     read_purged_sync(conn, identity)
 }
@@ -1658,47 +1889,47 @@ fn validate_entry(
     }
 }
 
+/// Verify the immutable decoded entries against the independently admitted
+/// authority before an engine handoff, log write or state-machine effect.
+pub(super) fn validate_entry_capacities(
+    entries: &[Entry<ConfigRaftTypeConfig>],
+    identity: ConsensusIdentity,
+    key: &AuditKey,
+    profile: ConfigCapacityProfile,
+) -> io::Result<()> {
+    for entry in entries {
+        if let EntryPayload::Normal(command) = &entry.payload {
+            command
+                .validate_for_profile(identity, key, profile)
+                .map_err(|_| invalid_data("invalid config capacity command"))?;
+        }
+    }
+    Ok(())
+}
+
 fn read_log_id_at_sync(
     conn: &Connection,
     identity: ConsensusIdentity,
     index: u64,
+    capacity_profile: ConfigCapacityProfile,
 ) -> io::Result<Option<LogId<ConsensusNodeId>>> {
-    let row = conn
-        .query_row(
-            "SELECT configuration_epoch, term, entry_json FROM config_raft_log WHERE log_index = ?1",
-            [checked_i64(index)?],
-            |row| {
-                Ok((
-                    row.get::<_, i64>(0)?,
-                    row.get::<_, i64>(1)?,
-                    row.get::<_, Vec<u8>>(2)?,
-                ))
-            },
-        )
-        .optional()
-        .map_err(db_error)?;
-    let Some((epoch, term, encoded)) = row else {
-        return Ok(None);
-    };
-    validate_epoch(epoch, identity)?;
-    if encoded.len() > CONFIG_CONSENSUS_LOG_ENTRY_MAX_BYTES {
-        return Err(invalid_data(
-            "persisted config consensus log entry exceeds storage limit",
-        ));
-    }
-    let entry: Entry<ConfigRaftTypeConfig> = decode_json(&encoded)?;
-    if entry.log_id.index != index || checked_u64(term)? != entry.log_id.leader_id.term {
-        return Err(invalid_data("persisted config consensus log row mismatch"));
-    }
-    Ok(Some(entry.log_id))
+    let mut statement = conn.prepare(
+        "SELECT configuration_epoch, term, log_index, entry_json FROM config_raft_log WHERE log_index = ?1",
+    ).map_err(db_error)?;
+    let mut rows = statement.query([checked_i64(index)?]).map_err(db_error)?;
+    rows.next()
+        .map_err(db_error)?
+        .map(|row| row_entry(row, identity, capacity_profile).map(|entry| entry.log_id))
+        .transpose()
 }
 
 fn validate_pointer_against_log_sync(
     conn: &Connection,
     identity: ConsensusIdentity,
     pointer: &LogId<ConsensusNodeId>,
+    capacity_profile: ConfigCapacityProfile,
 ) -> io::Result<()> {
-    let Some(stored) = read_log_id_at_sync(conn, identity, pointer.index)? else {
+    let Some(stored) = read_log_id_at_sync(conn, identity, pointer.index, capacity_profile)? else {
         return Err(invalid_data(
             "config consensus pointer has no exact durable log entry",
         ));
@@ -1714,20 +1945,19 @@ fn validate_pointer_against_log_sync(
 fn read_snapshot_log_id_unchecked_sync(
     conn: &Connection,
     identity: ConsensusIdentity,
+    capacity_profile: ConfigCapacityProfile,
 ) -> io::Result<Option<LogId<ConsensusNodeId>>> {
-    let row = conn
-        .query_row(
+    let mut statement = conn
+        .prepare(
             "SELECT configuration_epoch, meta_json FROM config_raft_snapshot WHERE singleton = 1",
-            [],
-            |row| Ok((row.get::<_, i64>(0)?, row.get::<_, Vec<u8>>(1)?)),
         )
-        .optional()
         .map_err(db_error)?;
-    let Some((epoch, encoded)) = row else {
+    let mut rows = statement.query([]).map_err(db_error)?;
+    let Some(row) = rows.next().map_err(db_error)? else {
         return Ok(None);
     };
-    validate_epoch(epoch, identity)?;
-    let meta: SnapshotMeta<ConsensusNodeId, EmptyNode> = decode_json(&encoded)?;
+    validate_epoch(row.get(0).map_err(db_error)?, identity)?;
+    let meta = capacity_decode::native_snapshot_meta(capacity_profile, row_blob(row, 1)?)?;
     Ok(meta.last_log_id)
 }
 
@@ -1749,16 +1979,29 @@ fn validate_durable_log_state_sync(
     conn: &Connection,
     identity: ConsensusIdentity,
     expected_members: &BTreeSet<ConsensusNodeId>,
+    audit_key: &AuditKey,
+    capacity_profile: ConfigCapacityProfile,
     allow_detached_snapshot: bool,
     cancellation: &SqliteWorkCancellation,
 ) -> io::Result<()> {
     cancellation.check_io()?;
     let (committed, applied, purged) = validate_durable_pointer_relationships_sync(conn, identity)?;
-    let snapshot_log_id = read_current_snapshot_sync(conn, identity, expected_members)?
-        .and_then(|(meta, _, _, _)| meta.last_log_id);
+    let snapshot_log_id =
+        read_current_snapshot_sync(conn, identity, expected_members, capacity_profile)?
+            .and_then(|(meta, _, _, _)| meta.last_log_id);
+
+    if let Some(snapshot_pointer) = snapshot_log_id {
+        if read_log_id_at_sync(conn, identity, snapshot_pointer.index, capacity_profile)?
+            .is_some_and(|stored| stored != snapshot_pointer)
+        {
+            return Err(invalid_data(
+                "config consensus snapshot conflicts with durable log",
+            ));
+        }
+    }
 
     if let Some(applied_pointer) = applied {
-        let covered = read_log_id_at_sync(conn, identity, applied_pointer.index)?
+        let covered = read_log_id_at_sync(conn, identity, applied_pointer.index, capacity_profile)?
             .is_some_and(|stored| stored == applied_pointer)
             || purged == Some(applied_pointer)
             || snapshot_log_id == Some(applied_pointer)
@@ -1770,11 +2013,12 @@ fn validate_durable_log_state_sync(
         }
     }
     if let Some(committed_pointer) = committed {
-        let covered = read_log_id_at_sync(conn, identity, committed_pointer.index)?
-            .is_some_and(|stored| stored == committed_pointer)
-            || applied == Some(committed_pointer)
-            || purged == Some(committed_pointer)
-            || snapshot_log_id == Some(committed_pointer);
+        let covered =
+            read_log_id_at_sync(conn, identity, committed_pointer.index, capacity_profile)?
+                .is_some_and(|stored| stored == committed_pointer)
+                || applied == Some(committed_pointer)
+                || purged == Some(committed_pointer)
+                || snapshot_log_id == Some(committed_pointer);
         if !covered {
             return Err(invalid_data(
                 "config consensus committed pointer lacks durable lineage",
@@ -1820,12 +2064,17 @@ fn validate_durable_log_state_sync(
                     .ok_or_else(|| invalid_data("config consensus log floor overflow"))?,
                 None => 0,
             };
-            if minimum != expected_minimum {
+            // Installing or building a snapshot does not itself purge the log.
+            // Until a purge is persisted, a complete prefix from index zero is
+            // still valid. A truncated prefix must retain its exact floor.
+            let complete_unpurged_prefix = purged.is_none() && minimum == 0;
+            if !complete_unpurged_prefix && minimum != expected_minimum {
                 return Err(invalid_data(
                     "persisted config consensus log is detached from its floor",
                 ));
             }
-            let entries = read_log_rows_unchecked_sync(
+            let mut decoded = 0u64;
+            visit_log_rows_unchecked_sync(
                 conn,
                 identity,
                 expected_members,
@@ -1839,12 +2088,22 @@ fn validate_durable_log_state_sync(
                     limit: None,
                     cancellation: Some(cancellation),
                     append_entries_batch: false,
+                    capacity_profile,
+                },
+                |entry| {
+                    validate_entry_capacities(
+                        std::slice::from_ref(&entry),
+                        identity,
+                        audit_key,
+                        capacity_profile,
+                    )?;
+                    decoded = decoded
+                        .checked_add(1)
+                        .ok_or_else(|| invalid_data("config consensus log count overflow"))?;
+                    Ok(std::ops::ControlFlow::Continue(()))
                 },
             )?;
-            if entries.len()
-                != usize::try_from(expected_count)
-                    .map_err(|_| invalid_data("config consensus log count overflow"))?
-            {
+            if decoded != expected_count {
                 return Err(invalid_data(
                     "persisted config consensus log contains a hole",
                 ));
@@ -1853,7 +2112,7 @@ fn validate_durable_log_state_sync(
         _ => {
             return Err(invalid_data(
                 "persisted config consensus log aggregate is invalid",
-            ))
+            ));
         }
     }
     Ok(())
@@ -1885,14 +2144,16 @@ struct LogRowRead<'a> {
     limit: Option<usize>,
     cancellation: Option<&'a SqliteWorkCancellation>,
     append_entries_batch: bool,
+    capacity_profile: ConfigCapacityProfile,
 }
 
-fn read_log_rows_unchecked_sync(
+fn visit_log_rows_unchecked_sync(
     conn: &Connection,
     identity: ConsensusIdentity,
     expected_members: &BTreeSet<ConsensusNodeId>,
     read: LogRowRead<'_>,
-) -> io::Result<Vec<Entry<ConfigRaftTypeConfig>>> {
+    mut visit: impl FnMut(Entry<ConfigRaftTypeConfig>) -> io::Result<std::ops::ControlFlow<()>>,
+) -> io::Result<()> {
     let start = checked_i64(read.start)?;
     let end = read.end.map(checked_i64).transpose()?;
     let limit = read
@@ -1902,43 +2163,46 @@ fn read_log_rows_unchecked_sync(
         })
         .transpose()?
         .unwrap_or(i64::MAX);
-    let mut statement = conn
-        .prepare(
-            "SELECT configuration_epoch, term, log_index, entry_json FROM config_raft_log WHERE log_index >= ?1 AND (?2 IS NULL OR log_index < ?2) ORDER BY log_index ASC LIMIT ?3",
-        )
+    let mut statement = conn.prepare(
+        "SELECT configuration_epoch, term, log_index, entry_json FROM config_raft_log WHERE log_index >= ?1 AND (?2 IS NULL OR log_index < ?2) ORDER BY log_index ASC LIMIT ?3",
+    ).map_err(db_error)?;
+    let mut rows = statement
+        .query(params![start, end, limit])
         .map_err(db_error)?;
-    let rows = statement
-        .query_map(params![start, end, limit], |row| {
-            Ok((
-                row.get::<_, i64>(0)?,
-                row.get::<_, i64>(1)?,
-                row.get::<_, i64>(2)?,
-                row.get::<_, Vec<u8>>(3)?,
-            ))
-        })
-        .map_err(db_error)?;
+    let mut previous: Option<u64> = None;
+    loop {
+        if let Some(cancellation) = read.cancellation {
+            cancellation.check_io()?;
+        }
+        let Some(row) = rows.next().map_err(db_error)? else {
+            break;
+        };
+        let entry = row_entry(row, identity, read.capacity_profile)?;
+        if previous.is_some_and(|index| index.checked_add(1) != Some(entry.log_id.index)) {
+            return Err(invalid_data(
+                "persisted config consensus log contains a hole",
+            ));
+        }
+        validate_entry(&entry, identity, expected_members)?;
+        previous = Some(entry.log_id.index);
+        if visit(entry)?.is_break() {
+            break;
+        }
+    }
+    Ok(())
+}
+
+fn read_log_rows_unchecked_sync(
+    conn: &Connection,
+    identity: ConsensusIdentity,
+    expected_members: &BTreeSet<ConsensusNodeId>,
+    read: LogRowRead<'_>,
+) -> io::Result<Vec<Entry<ConfigRaftTypeConfig>>> {
     let mut entries = Vec::new();
     let mut batch = read
         .append_entries_batch
         .then(AppendEntriesBatchAccumulator::new);
-    for row in rows {
-        if let Some(cancellation) = read.cancellation {
-            cancellation.check_io()?;
-        }
-        let (epoch, term, index, encoded) = row.map_err(db_error)?;
-        validate_epoch(epoch, identity)?;
-        if encoded.len() > CONFIG_CONSENSUS_LOG_ENTRY_MAX_BYTES {
-            return Err(invalid_data(
-                "persisted config consensus log entry exceeds storage limit",
-            ));
-        }
-        let entry: Entry<ConfigRaftTypeConfig> = decode_json(&encoded)?;
-        if checked_u64(term)? != entry.log_id.leader_id.term
-            || checked_u64(index)? != entry.log_id.index
-        {
-            return Err(invalid_data("persisted config consensus log row mismatch"));
-        }
-        validate_entry(&entry, identity, expected_members)?;
+    visit_log_rows_unchecked_sync(conn, identity, expected_members, read, |entry| {
         let decision = batch
             .as_mut()
             .map(|batch| {
@@ -1951,18 +2215,14 @@ fn read_log_rows_unchecked_sync(
             Some(AppendEntriesBatchDecision::Include) | None => entries.push(entry),
             Some(AppendEntriesBatchDecision::IncludeAndStop) => {
                 entries.push(entry);
-                break;
+                return Ok(std::ops::ControlFlow::Break(()));
             }
-            Some(AppendEntriesBatchDecision::StopBefore) => break,
+            Some(AppendEntriesBatchDecision::StopBefore) => {
+                return Ok(std::ops::ControlFlow::Break(()));
+            }
         }
-    }
-    for pair in entries.windows(2) {
-        if pair[1].log_id.index != pair[0].log_id.index.saturating_add(1) {
-            return Err(invalid_data(
-                "persisted config consensus log contains a hole",
-            ));
-        }
-    }
+        Ok(std::ops::ControlFlow::Continue(()))
+    })?;
     Ok(entries)
 }
 
@@ -1973,8 +2233,21 @@ pub(crate) fn read_log_range_sync(
     start: u64,
     end: Option<u64>,
     limit: Option<usize>,
+    capacity_profile: ConfigCapacityProfile,
 ) -> io::Result<Vec<Entry<ConfigRaftTypeConfig>>> {
-    read_log_range_with_batch_sync(conn, identity, expected_members, start, end, limit, false)
+    read_log_range_with_batch_sync(
+        conn,
+        identity,
+        expected_members,
+        LogRowRead {
+            start,
+            end,
+            limit,
+            cancellation: None,
+            append_entries_batch: false,
+            capacity_profile,
+        },
+    )
 }
 
 pub(crate) fn read_limited_log_range_sync(
@@ -1984,15 +2257,20 @@ pub(crate) fn read_limited_log_range_sync(
     start: u64,
     end: u64,
     limit: usize,
+    capacity_profile: ConfigCapacityProfile,
 ) -> io::Result<Vec<Entry<ConfigRaftTypeConfig>>> {
     read_log_range_with_batch_sync(
         conn,
         identity,
         expected_members,
-        start,
-        Some(end),
-        Some(limit),
-        true,
+        LogRowRead {
+            start,
+            end: Some(end),
+            limit: Some(limit),
+            cancellation: None,
+            append_entries_batch: true,
+            capacity_profile,
+        },
     )
 }
 
@@ -2000,24 +2278,13 @@ fn read_log_range_with_batch_sync(
     conn: &Connection,
     identity: ConsensusIdentity,
     expected_members: &BTreeSet<ConsensusNodeId>,
-    start: u64,
-    end: Option<u64>,
-    limit: Option<usize>,
-    append_entries_batch: bool,
+    read: LogRowRead<'_>,
 ) -> io::Result<Vec<Entry<ConfigRaftTypeConfig>>> {
     let (_, _, purged) = validate_durable_pointer_relationships_sync(conn, identity)?;
-    let entries = read_log_rows_unchecked_sync(
-        conn,
-        identity,
-        expected_members,
-        LogRowRead {
-            start,
-            end,
-            limit,
-            cancellation: None,
-            append_entries_batch,
-        },
-    )?;
+    let entries = read_log_rows_unchecked_sync(conn, identity, expected_members, read)?;
+    let LogRowRead {
+        start, end, limit, ..
+    } = read;
     if limit == Some(0) {
         return Ok(entries);
     }
@@ -2059,6 +2326,7 @@ pub(crate) fn append_logs_sync(
     identity: ConsensusIdentity,
     expected_members: &BTreeSet<ConsensusNodeId>,
     entries: &[Entry<ConfigRaftTypeConfig>],
+    capacity_profile: ConfigCapacityProfile,
 ) -> io::Result<()> {
     append_logs_cancellable_sync(
         conn,
@@ -2066,6 +2334,7 @@ pub(crate) fn append_logs_sync(
         expected_members,
         entries,
         &SqliteWorkCancellation::new(),
+        capacity_profile,
     )
 }
 
@@ -2075,6 +2344,7 @@ pub(crate) fn append_logs_cancellable_sync(
     expected_members: &BTreeSet<ConsensusNodeId>,
     entries: &[Entry<ConfigRaftTypeConfig>],
     cancellation: &SqliteWorkCancellation,
+    capacity_profile: ConfigCapacityProfile,
 ) -> io::Result<()> {
     if entries.is_empty() {
         return Ok(());
@@ -2107,13 +2377,22 @@ pub(crate) fn append_logs_cancellable_sync(
             .ok_or_else(|| invalid_data("config consensus log append byte count overflow"))?;
         encoded_entries.push(encoded);
     }
+    #[cfg(test)]
+    super::storage::config_capacity_append_observations::observe("entries_encoded");
     cancellation.check_io()?;
     let tx = Transaction::new_unchecked(conn, TransactionBehavior::Immediate).map_err(db_error)?;
     let (committed, applied, purged) = validate_durable_pointer_relationships_sync(&tx, identity)?;
-    let floor = [last_log_sync(&tx, identity)?, committed, applied, purged]
-        .into_iter()
-        .flatten()
-        .max_by_key(|log_id| log_id.index);
+    let floor = [
+        last_log_sync(&tx, identity, capacity_profile)?,
+        committed,
+        applied,
+        purged,
+    ]
+    .into_iter()
+    .flatten()
+    .max_by_key(|log_id| log_id.index);
+    #[cfg(test)]
+    super::storage::config_capacity_append_observations::observe("durable_floor_validated");
     let expected = floor
         .map(|log_id| {
             log_id
@@ -2140,6 +2419,8 @@ pub(crate) fn append_logs_cancellable_sync(
             return Err(invalid_data("config consensus log batch is not contiguous"));
         }
     }
+    #[cfg(test)]
+    super::storage::config_capacity_append_observations::observe("contiguous_checked");
     for (entry, encoded) in entries.iter().zip(encoded_entries) {
         cancellation.check_io()?;
         tx.execute(
@@ -2154,6 +2435,8 @@ pub(crate) fn append_logs_cancellable_sync(
         .map_err(db_error)?;
     }
     cancellation.check_io()?;
+    #[cfg(test)]
+    super::storage::config_capacity_append_observations::observe("before_commit");
     tx.commit().map_err(db_error)
 }
 
@@ -2186,6 +2469,7 @@ pub(crate) fn purge_logs_sync(
     conn: &Connection,
     identity: ConsensusIdentity,
     log_id: &LogId<ConsensusNodeId>,
+    capacity_profile: ConfigCapacityProfile,
 ) -> io::Result<()> {
     let tx = Transaction::new_unchecked(conn, TransactionBehavior::Immediate).map_err(db_error)?;
     if read_applied_sync(&tx, identity)?.is_none_or(|applied| {
@@ -2198,14 +2482,15 @@ pub(crate) fn purge_logs_sync(
             return Err(invalid_data("config consensus purged pointer regressed"));
         }
     }
-    match read_log_id_at_sync(&tx, identity, log_id.index)? {
+    match read_log_id_at_sync(&tx, identity, log_id.index, capacity_profile)? {
         Some(stored) if stored == *log_id => {}
-        None if read_snapshot_log_id_unchecked_sync(&tx, identity)? == Some(*log_id)
+        None if read_snapshot_log_id_unchecked_sync(&tx, identity, capacity_profile)?
+            == Some(*log_id)
             || read_purged_sync(&tx, identity)? == Some(*log_id) => {}
         _ => {
             return Err(invalid_data(
                 "config consensus purge lacks exact durable lineage",
-            ))
+            ));
         }
     }
     tx.execute(
@@ -2220,24 +2505,27 @@ pub(crate) fn purge_logs_sync(
 fn read_membership_unchecked_sync(
     conn: &Connection,
     identity: ConsensusIdentity,
+    capacity_profile: ConfigCapacityProfile,
 ) -> io::Result<StoredMembership<ConsensusNodeId, EmptyNode>> {
-    let (epoch, encoded): (i64, Vec<u8>) = conn
-        .query_row(
-            "SELECT configuration_epoch, membership_json FROM config_raft_membership WHERE singleton = 1",
-            [],
-            |row| Ok((row.get(0)?, row.get(1)?)),
-        )
-        .map_err(db_error)?;
-    validate_epoch(epoch, identity)?;
-    decode_json(&encoded)
+    let mut statement = conn.prepare(
+        "SELECT configuration_epoch, membership_json FROM config_raft_membership WHERE singleton = 1",
+    ).map_err(db_error)?;
+    let mut rows = statement.query([]).map_err(db_error)?;
+    let row = rows
+        .next()
+        .map_err(db_error)?
+        .ok_or_else(|| invalid_data("missing config consensus membership"))?;
+    validate_epoch(row.get(0).map_err(db_error)?, identity)?;
+    capacity_decode::native_membership(capacity_profile, row_blob(row, 1)?)
 }
 
 pub(crate) fn read_membership_sync(
     conn: &Connection,
     identity: ConsensusIdentity,
     expected_members: &BTreeSet<ConsensusNodeId>,
+    capacity_profile: ConfigCapacityProfile,
 ) -> io::Result<StoredMembership<ConsensusNodeId, EmptyNode>> {
-    let membership = read_membership_unchecked_sync(conn, identity)?;
+    let membership = read_membership_unchecked_sync(conn, identity, capacity_profile)?;
     if is_pristine_membership(&membership) && read_applied_sync(conn, identity)?.is_none() {
         return Ok(membership);
     }
@@ -2290,29 +2578,53 @@ pub(crate) fn read_machine_sync(
     ))
 }
 
+pub(super) async fn read_commit_outcome_until(
+    backend: &SqliteBackend,
+    identity: ConsensusIdentity,
+    request_id: opc_consensus::ConsensusRequestId,
+    capacity_profile: ConfigCapacityProfile,
+    deadline: tokio::time::Instant,
+) -> io::Result<Option<([u8; 32], ConfigConsensusResponse)>> {
+    let audit_key = backend.audit_key().clone();
+    run_sqlite_worker_until(
+        backend.config_consensus_worker_gate(),
+        backend.conn(),
+        None,
+        deadline,
+        move |conn, cancellation| {
+            cancellation.check_io()?;
+            let tx = Transaction::new_unchecked(conn, TransactionBehavior::Deferred)
+                .map_err(db_error)?;
+            let outcome = outcome_authentication::read(
+                &tx,
+                identity,
+                &audit_key,
+                capacity_profile,
+                request_id,
+                true,
+            )?;
+            cancellation.check_io()?;
+            Ok(outcome)
+        },
+    )
+    .await
+}
+
 fn read_outcome_sync(
     conn: &Connection,
     identity: ConsensusIdentity,
+    audit_key: &AuditKey,
+    capacity_profile: ConfigCapacityProfile,
     request_id: opc_consensus::ConsensusRequestId,
 ) -> io::Result<Option<([u8; 32], ConfigConsensusResponse)>> {
-    let row = conn
-        .query_row(
-            "SELECT configuration_epoch, payload_digest, response_json FROM config_raft_request_outcomes WHERE request_id = ?1",
-            [request_id.as_bytes().as_slice()],
-            |row| Ok((row.get::<_, i64>(0)?, row.get::<_, Vec<u8>>(1)?, row.get::<_, Vec<u8>>(2)?)),
-        )
-        .optional()
-        .map_err(db_error)?;
-    let Some((epoch, digest, response)) = row else {
-        return Ok(None);
-    };
-    validate_epoch(epoch, identity)?;
-    Ok(Some((
-        digest
-            .try_into()
-            .map_err(|_| invalid_data("invalid config consensus outcome digest"))?,
-        decode_json(&response)?,
-    )))
+    outcome_authentication::read(
+        conn,
+        identity,
+        audit_key,
+        capacity_profile,
+        request_id,
+        false,
+    )
 }
 
 fn commit_source(source: &CommitSource) -> &'static str {
@@ -2683,6 +2995,34 @@ fn execute_intent_sync(
     cancellation: &SqliteWorkCancellation,
 ) -> io::Result<Result<(), ConfigMutationFailure>> {
     match intent {
+        ConfigMutationIntent::BoundedAppend {
+            commit,
+            binding,
+            resolution,
+        } => {
+            // The immutable command has already passed keyed profile admission.
+            // This stays inside the same ordinary/audited effect savepoint.
+            let result = append_prepared_commit_sync(
+                conn,
+                commit,
+                *resolution,
+                schema_version,
+                logical_time,
+                request_id,
+                cancellation,
+            )?;
+            if result.is_ok() {
+                conn.execute(
+                    "INSERT INTO config_raft_capacity_records (tx_id, binding) VALUES (?1, ?2)",
+                    params![
+                        commit.record.tx_id.as_uuid().as_bytes().as_slice(),
+                        binding.encode().as_slice()
+                    ],
+                )
+                .map_err(db_error)?;
+            }
+            Ok(result)
+        }
         ConfigMutationIntent::ManagementAudit(_) | ConfigMutationIntent::AuditedMutation(_) => Err(
             invalid_data("audit command requires its authority dispatcher"),
         ),
@@ -2733,7 +3073,8 @@ fn apply_audited_mutation_sync(
     conn: &Connection,
     key: &AuditKey,
     identity: ConsensusIdentity,
-    prepared: &super::PreparedAuditedMutation,
+    prepared: &super::audit_mutation::AuditedConfigCommand,
+    capacity_profile: ConfigCapacityProfile,
     audit_keys: Option<&crate::audit_authority::continuity::AuditKeyRing>,
     logical_time: Timestamp,
     request_id: opc_consensus::ConsensusRequestId,
@@ -2755,7 +3096,7 @@ fn apply_audited_mutation_sync(
     match receipt.state() {
         AuditOperationState::Committed { .. } => return Ok(Ok(())),
         AuditOperationState::Rejected | AuditOperationState::Observed { .. } => {
-            return Ok(Err(ConfigMutationFailure::Conflict))
+            return Ok(Err(ConfigMutationFailure::Conflict));
         }
         AuditOperationState::Intent => {}
     }
@@ -2778,7 +3119,7 @@ fn apply_audited_mutation_sync(
             return Ok(Err(ConfigMutationFailure::InvalidInput));
         }
     }
-    validate_sealed_state_sync(conn, key, cancellation)?;
+    validate_sealed_state_for_profile_sync(conn, identity, key, capacity_profile, cancellation)?;
     let current_version: u64 = conn
         .query_row(
             "SELECT COALESCE(MAX(version),0) FROM config_history",
@@ -2796,7 +3137,10 @@ fn apply_audited_mutation_sync(
         execute_intent_sync(
             conn,
             &prepared.effect.intent(),
-            super::types::CONFIG_CONSENSUS_COMMAND_VERSION,
+            prepared
+                .effect
+                .minimum_command_version()
+                .max(super::types::CONFIG_CONSENSUS_COMMAND_VERSION),
             logical_time,
             request_id,
             cancellation,
@@ -2852,6 +3196,7 @@ pub(crate) fn apply_entries_sync(
         &SqliteWorkCancellation::new(),
         audit_key,
         None,
+        ConfigCapacityProfile::Legacy,
     )
 }
 
@@ -2864,12 +3209,16 @@ pub(crate) fn apply_entries_cancellable_sync(
     cancellation: &SqliteWorkCancellation,
     audit_key: &AuditKey,
     audit_keys: Option<&crate::audit_authority::continuity::AuditKeyRing>,
+    capacity_profile: ConfigCapacityProfile,
 ) -> io::Result<Vec<ConfigConsensusResponse>> {
     if entries.len() > CONFIG_CONSENSUS_LOG_APPEND_MAX_ENTRIES {
         return Err(invalid_data(
             "config consensus apply exceeds entry-count limit",
         ));
     }
+    validate_entry_capacities(&entries, identity, audit_key, capacity_profile)?;
+    #[cfg(test)]
+    super::storage::config_capacity_apply_observations::observe("capacity_validated");
     let mut encoded_bytes = 0_usize;
     for entry in &entries {
         cancellation.check_io()?;
@@ -2889,11 +3238,24 @@ pub(crate) fn apply_entries_cancellable_sync(
             .checked_add(encoded.len())
             .ok_or_else(|| invalid_data("config consensus apply byte count overflow"))?;
     }
+    #[cfg(test)]
+    super::storage::config_capacity_apply_observations::observe("entries_encoded");
     let tx = conn.unchecked_transaction().map_err(db_error)?;
-    super::history::validate_access_sync(&tx, audit_key, true, cancellation)?;
+    super::history::validate_access_for_profile_sync(
+        &tx,
+        audit_key,
+        true,
+        Some(identity),
+        capacity_profile,
+        cancellation,
+    )?;
+    #[cfg(test)]
+    super::storage::config_capacity_apply_observations::observe("history_access_validated");
     let mut last_applied = read_applied_sync(&tx, identity)?;
     let mut machine = read_machine_sync(&tx, identity)?;
     let mut responses = Vec::with_capacity(entries.len());
+    #[cfg(test)]
+    super::storage::config_capacity_apply_observations::observe("machine_loaded");
     for entry in entries {
         cancellation.check_io()?;
         let expected_index = last_applied
@@ -2933,12 +3295,22 @@ pub(crate) fn apply_entries_cancellable_sync(
                 command
                     .validate(identity)
                     .map_err(|_| invalid_data("invalid committed config consensus command"))?;
+                #[cfg(test)]
+                super::storage::config_capacity_apply_observations::observe("command_validated");
                 let payload_digest = command
                     .payload_digest()
                     .map_err(|_| invalid_data("config consensus payload digest failed"))?;
-                if let Some((stored_digest, stored_response)) =
-                    read_outcome_sync(&tx, identity, command.request_id)?
-                {
+                #[cfg(test)]
+                super::storage::config_capacity_apply_observations::observe(
+                    "payload_digest_computed",
+                );
+                if let Some((stored_digest, stored_response)) = read_outcome_sync(
+                    &tx,
+                    identity,
+                    audit_key,
+                    capacity_profile,
+                    command.request_id,
+                )? {
                     if payload_digest != stored_digest {
                         ConfigConsensusResponse {
                             result: Err(ConfigMutationFailure::RequestIdCollision),
@@ -2962,9 +3334,16 @@ pub(crate) fn apply_entries_cancellable_sync(
                     let digest = command
                         .calculate_applied_digest(sequence, machine.1, logical_time)
                         .map_err(|_| invalid_data("config consensus applied digest failed"))?;
+                    #[cfg(test)]
+                    super::storage::config_capacity_apply_observations::observe(
+                        "applied_digest_computed",
+                    );
                     tx.execute_batch("SAVEPOINT config_history_command")
                         .map_err(db_error)?;
                     let updates_existing_records = match &command.intent {
+                        ConfigMutationIntent::BoundedAppend { resolution, .. } => {
+                            resolution.is_some()
+                        }
                         ConfigMutationIntent::AppendCommit(_)
                         | ConfigMutationIntent::RetainHistory(_)
                         | ConfigMutationIntent::ManagementAudit(_)
@@ -2977,6 +3356,10 @@ pub(crate) fn apply_entries_cancellable_sync(
                     if updates_existing_records {
                         super::history::validate_record_chain_sync(&tx, audit_key, cancellation)?;
                     }
+                    #[cfg(test)]
+                    super::storage::config_capacity_apply_observations::observe(
+                        "existing_chain_validated",
+                    );
                     let mut result = match &command.intent {
                         ConfigMutationIntent::AuditedMutation(prepared) => {
                             apply_audited_mutation_sync(
@@ -2984,6 +3367,7 @@ pub(crate) fn apply_entries_cancellable_sync(
                                 audit_key,
                                 identity,
                                 prepared,
+                                capacity_profile,
                                 audit_keys,
                                 logical_time,
                                 command.request_id,
@@ -2999,13 +3383,20 @@ pub(crate) fn apply_entries_cancellable_sync(
                             audit_keys,
                         )?,
                         ConfigMutationIntent::RetainHistory(retention) => {
-                            validate_sealed_state_sync(&tx, audit_key, cancellation)?;
+                            validate_sealed_state_for_profile_sync(
+                                &tx,
+                                identity,
+                                audit_key,
+                                capacity_profile,
+                                cancellation,
+                            )?;
                             super::history::retain_sync(&tx, audit_key, retention, cancellation)?
                         }
                         _ => {
                             let requires_audit = matches!(
                                 command.intent,
                                 ConfigMutationIntent::AppendCommit(_)
+                                    | ConfigMutationIntent::BoundedAppend { .. }
                                     | ConfigMutationIntent::ResolveConfirmedAndAppend { .. }
                                     | ConfigMutationIntent::MarkConfirmed { .. }
                                     | ConfigMutationIntent::CreateRollbackPoint { .. }
@@ -3027,6 +3418,8 @@ pub(crate) fn apply_entries_cancellable_sync(
                             }
                         }
                     };
+                    #[cfg(test)]
+                    super::storage::config_capacity_apply_observations::observe("intent_executed");
                     if result.is_ok()
                         && !matches!(
                             command.intent,
@@ -3041,6 +3434,10 @@ pub(crate) fn apply_entries_cancellable_sync(
                             cancellation,
                         )?;
                     }
+                    #[cfg(test)]
+                    super::storage::config_capacity_apply_observations::observe(
+                        "history_refreshed",
+                    );
                     if result.is_err()
                         && !matches!(command.intent, ConfigMutationIntent::AuditedMutation(_))
                     {
@@ -3049,12 +3446,20 @@ pub(crate) fn apply_entries_cancellable_sync(
                     }
                     tx.execute_batch("RELEASE config_history_command")
                         .map_err(db_error)?;
+                    #[cfg(test)]
+                    super::storage::config_capacity_apply_observations::observe(
+                        "savepoint_released",
+                    );
                     let audit_receipt = super::audit::applied_receipt_sync(
                         &tx,
                         audit_key,
                         identity,
                         &command.intent,
                     )?;
+                    #[cfg(test)]
+                    super::storage::config_capacity_apply_observations::observe(
+                        "audit_receipt_read",
+                    );
                     let response = ConfigConsensusResponse {
                         result,
                         sequence,
@@ -3070,7 +3475,10 @@ pub(crate) fn apply_entries_cancellable_sync(
                             epoch_i64(identity)?,
                             checked_positive_i64(sequence)?,
                             payload_digest.as_slice(),
-                            encode_json(&response)?,
+                            outcome_authentication::encode(
+                                audit_key, identity, capacity_profile, command.request_id,
+                                &payload_digest, &response,
+                            )?,
                         ],
                     )
                     .map_err(db_error)?;
@@ -3102,66 +3510,81 @@ pub(crate) fn apply_entries_cancellable_sync(
                 }
             }
         };
+        #[cfg(test)]
+        super::storage::config_capacity_apply_observations::observe("response_completed");
         save_log_pointer(&tx, "config_raft_applied", identity, &entry.log_id)?;
         last_applied = Some(entry.log_id);
         responses.push(response);
     }
-    let membership = read_membership_unchecked_sync(&tx, identity)?;
+    #[cfg(test)]
+    super::storage::config_capacity_apply_observations::observe("entries_applied");
+    let membership = read_membership_unchecked_sync(&tx, identity, capacity_profile)?;
     if !is_pristine_membership(&membership) {
         validate_fixed_membership(&membership, expected_members)?;
     }
     cancellation.check_io()?;
+    #[cfg(test)]
+    super::storage::config_capacity_apply_observations::observe("before_commit");
     tx.commit().map_err(db_error)?;
+    #[cfg(test)]
+    super::storage::config_capacity_apply_observations::observe("committed");
     Ok(responses)
 }
 
+#[cfg(test)]
 fn validate_sealed_state_sync(
     conn: &Connection,
+    identity: ConsensusIdentity,
     audit_key: &AuditKey,
     cancellation: &SqliteWorkCancellation,
 ) -> io::Result<()> {
-    if super::history::has_consensus_metadata_sync(conn)? {
-        validate_live_history_schema_sync(conn, cancellation)?;
-    }
+    validate_sealed_state_for_profile_sync(
+        conn,
+        identity,
+        audit_key,
+        ConfigCapacityProfile::Legacy,
+        cancellation,
+    )
+}
+
+fn validate_sealed_state_for_profile_sync(
+    conn: &Connection,
+    identity: ConsensusIdentity,
+    audit_key: &AuditKey,
+    capacity_profile: ConfigCapacityProfile,
+    cancellation: &SqliteWorkCancellation,
+) -> io::Result<()> {
+    let consensus_required = super::history::has_consensus_metadata_sync(conn)?;
+    super::history::validate_access_for_profile_sync(
+        conn,
+        audit_key,
+        consensus_required,
+        Some(identity),
+        capacity_profile,
+        cancellation,
+    )?;
     super::audit::validate_sync(conn, audit_key)?;
-    super::history::validate_sync(conn, audit_key)?;
-    super::history::validate_record_chain_sync(conn, audit_key, cancellation)?;
     validate_history_chain_cancellable_sync(conn, cancellation)?;
     let mut statement = conn
         .prepare(
             "SELECT tx_id, parent_tx_id, version, committed_at, principal, schema_digest, plaintext_digest, encrypted_blob, audit_count, audit_terminal_hash FROM config_history ORDER BY version ASC",
         )
         .map_err(db_error)?;
-    let rows = statement
-        .query_map([], |row| {
-            Ok((
-                row.get::<_, Vec<u8>>(0)?,
-                row.get::<_, Option<Vec<u8>>>(1)?,
-                row.get::<_, i64>(2)?,
-                row.get::<_, String>(3)?,
-                row.get::<_, String>(4)?,
-                row.get::<_, Vec<u8>>(5)?,
-                row.get::<_, Vec<u8>>(6)?,
-                row.get::<_, Vec<u8>>(7)?,
-                row.get::<_, i64>(8)?,
-                row.get::<_, Vec<u8>>(9)?,
-            ))
-        })
-        .map_err(db_error)?;
-    for row in rows {
+    let mut rows = statement.query([]).map_err(db_error)?;
+    while let Some(row) = rows.next().map_err(db_error)? {
         cancellation.check_io()?;
-        let (
-            tx_id,
-            parent_tx_id,
-            version,
-            committed_at,
-            principal,
-            schema_digest,
-            plaintext_digest,
-            encrypted_blob,
-            audit_count,
-            terminal_hash,
-        ) = row.map_err(db_error)?;
+        let tx_id: Vec<u8> = row.get(0).map_err(db_error)?;
+        let parent_tx_id: Option<Vec<u8>> = row.get(1).map_err(db_error)?;
+        let version: i64 = row.get(2).map_err(db_error)?;
+        let committed_at: String = row.get(3).map_err(db_error)?;
+        let principal: String = row.get(4).map_err(db_error)?;
+        let schema_digest: Vec<u8> = row.get(5).map_err(db_error)?;
+        let plaintext_digest: Vec<u8> = row.get(6).map_err(db_error)?;
+        let encrypted_blob = sealed_ciphertext_column(row, 7).map_err(db_error)?;
+        let audit_count: i64 = row.get(8).map_err(db_error)?;
+        let terminal_hash: Vec<u8> = row.get(9).map_err(db_error)?;
+        #[cfg(test)]
+        config_capacity_sealed_buffers::observe(&encrypted_blob);
         let parent_tx_id =
             super::history::original_parent_sync(conn, audit_key, &tx_id, version, parent_tx_id)?;
         if tx_id.len() != 16
@@ -3176,7 +3599,7 @@ fn validate_sealed_state_sync(
                 "config consensus sealed record metadata is invalid",
             ));
         }
-        let envelope = opc_crypto::CryptoEnvelopeV1::decode(&encrypted_blob).map_err(|_| {
+        let envelope = opc_crypto::CryptoEnvelopeRef::decode(&encrypted_blob).map_err(|_| {
             invalid_data("config consensus state contains plaintext or malformed envelope")
         })?;
         if envelope.nonce.len() != envelope.algorithm.nonce_len()
@@ -3185,7 +3608,7 @@ fn validate_sealed_state_sync(
         {
             return Err(invalid_data("config consensus state envelope is invalid"));
         }
-        let (aad, key_id) = opc_key::decode_bound_aad(&envelope.aad)
+        let (aad, key_id) = opc_key::decode_bound_aad(envelope.aad)
             .map_err(|_| invalid_data("config consensus state AAD is invalid"))?;
         let opc_key::EnvelopeMetadata::Config(metadata) = aad.metadata() else {
             return Err(invalid_data(
@@ -3312,34 +3735,23 @@ fn validate_sealed_state_sync(
         }
     }
 
-    let mut statement = conn
-        .prepare("SELECT applied_sequence, response_json FROM config_raft_request_outcomes")
-        .map_err(db_error)?;
-    let rows = statement
-        .query_map([], |row| {
-            Ok((row.get::<_, i64>(0)?, row.get::<_, Vec<u8>>(1)?))
-        })
-        .map_err(db_error)?;
-    let mut outcome_count = 0_u64;
-    for row in rows {
-        cancellation.check_io()?;
-        let (applied_sequence, encoded) = row.map_err(db_error)?;
-        let response: ConfigConsensusResponse = decode_json(&encoded)?;
-        if checked_positive_u64(applied_sequence)? != response.sequence {
-            return Err(invalid_data(
-                "config consensus request outcome sequence mismatch",
-            ));
-        }
-        outcome_count = outcome_count
-            .checked_add(1)
-            .ok_or_else(|| invalid_data("config consensus request outcome count overflow"))?;
-        if outcome_count > CONFIG_CONSENSUS_RETAINED_REQUEST_OUTCOMES {
-            return Err(invalid_data(
-                "config consensus request outcomes exceed retention bound",
-            ));
-        }
+    outcome_authentication::validate(conn, identity, audit_key, capacity_profile, cancellation)
+}
+
+// The view stays inside the current SQLite row until every envelope and audit
+// check finishes. It never escapes the cursor or advances to another row.
+fn sealed_ciphertext_column<'row>(
+    row: &'row rusqlite::Row<'_>,
+    index: usize,
+) -> rusqlite::Result<std::borrow::Cow<'row, [u8]>> {
+    match row.get_ref(index)? {
+        rusqlite::types::ValueRef::Blob(encrypted) => Ok(std::borrow::Cow::Borrowed(encrypted)),
+        _ => Err(rusqlite::Error::InvalidColumnType(
+            index,
+            "encrypted_blob".to_owned(),
+            row.get_ref(index)?.data_type(),
+        )),
     }
-    Ok(())
 }
 
 fn validate_history_chain_sync(conn: &Connection) -> io::Result<Option<(Vec<u8>, u64)>> {
@@ -3388,7 +3800,7 @@ fn validate_history_chain_cancellable_sync(
             _ => {
                 return Err(invalid_data(
                     "config consensus history is not a contiguous linear chain",
-                ))
+                ));
             }
         }
         head = Some((tx_id, version));
@@ -3414,6 +3826,7 @@ pub(crate) fn build_snapshot_database_sync(
         identity,
         expected_members,
         audit_key,
+        ConfigCapacityProfile::Legacy,
         path,
         &Arc::new(SqliteWorkCancellation::new()),
     )
@@ -3424,13 +3837,24 @@ pub(crate) fn build_snapshot_database_cancellable_sync(
     identity: ConsensusIdentity,
     expected_members: &BTreeSet<ConsensusNodeId>,
     audit_key: &AuditKey,
+    capacity_profile: ConfigCapacityProfile,
     path: &Path,
     cancellation: &Arc<SqliteWorkCancellation>,
 ) -> io::Result<AppliedMembership> {
     cancellation.check_io()?;
-    validate_sealed_state_sync(conn, audit_key, cancellation)?;
-    let applied = read_applied_sync(conn, identity)?;
-    let membership = read_membership_sync(conn, identity, expected_members)?;
+    // Pin validation, frontier capture and backup to one source read snapshot.
+    // The connection mutex alone does not exclude another SQLite connection.
+    let source =
+        Transaction::new_unchecked(conn, TransactionBehavior::Deferred).map_err(db_error)?;
+    validate_sealed_state_for_profile_sync(
+        &source,
+        identity,
+        audit_key,
+        capacity_profile,
+        cancellation,
+    )?;
+    let applied = read_applied_sync(&source, identity)?;
+    let membership = read_membership_sync(&source, identity, expected_members, capacity_profile)?;
     validate_fixed_membership(&membership, expected_members)?;
     let mut destination = Connection::open(path).map_err(db_error)?;
     let progress_cancellation = cancellation.clone();
@@ -3438,7 +3862,7 @@ pub(crate) fn build_snapshot_database_cancellable_sync(
         .progress_handler(1_000, Some(move || progress_cancellation.is_cancelled()))
         .map_err(db_error)?;
     {
-        let backup = rusqlite::backup::Backup::new(conn, &mut destination).map_err(db_error)?;
+        let backup = rusqlite::backup::Backup::new(&source, &mut destination).map_err(db_error)?;
         loop {
             cancellation.check_io()?;
             match backup.step(128).map_err(db_error)? {
@@ -3472,6 +3896,7 @@ pub(crate) fn build_snapshot_database_cancellable_sync(
         identity,
         expected_members,
         audit_key,
+        capacity_profile,
         true,
         cancellation,
     )
@@ -3521,6 +3946,7 @@ fn validate_snapshot_database_sync(
     identity: ConsensusIdentity,
     expected_members: &BTreeSet<ConsensusNodeId>,
     audit_key: &AuditKey,
+    capacity_profile: ConfigCapacityProfile,
     meta: &SnapshotMeta<ConsensusNodeId, EmptyNode>,
     cancellation: &Arc<SqliteWorkCancellation>,
 ) -> io::Result<Connection> {
@@ -3552,14 +3978,22 @@ fn validate_snapshot_database_sync(
         identity,
         expected_members,
         audit_key,
+        capacity_profile,
         true,
         cancellation,
     )
     .map_err(|_| invalid_data("config consensus snapshot identity is invalid"))?;
-    validate_sealed_state_sync(&conn, audit_key, cancellation)?;
+    validate_sealed_state_for_profile_sync(
+        &conn,
+        identity,
+        audit_key,
+        capacity_profile,
+        cancellation,
+    )?;
     validate_snapshot_has_no_log_authority(&conn, cancellation)?;
     if read_applied_sync(&conn, identity)? != meta.last_log_id
-        || read_membership_sync(&conn, identity, expected_members)? != meta.last_membership
+        || read_membership_sync(&conn, identity, expected_members, capacity_profile)?
+            != meta.last_membership
     {
         return Err(invalid_data("config consensus snapshot metadata mismatch"));
     }
@@ -3593,6 +4027,7 @@ pub(crate) fn install_snapshot_database_sync(
         identity,
         expected_members,
         audit_key,
+        ConfigCapacityProfile::Legacy,
         snapshot_db_path,
         meta,
         final_file_name,
@@ -3600,6 +4035,7 @@ pub(crate) fn install_snapshot_database_sync(
         byte_length,
         &Arc::new(SqliteWorkCancellation::new()),
     )
+    .map(|_| ())
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -3608,18 +4044,20 @@ pub(crate) fn install_snapshot_database_cancellable_sync(
     identity: ConsensusIdentity,
     expected_members: &BTreeSet<ConsensusNodeId>,
     audit_key: &AuditKey,
+    capacity_profile: ConfigCapacityProfile,
     snapshot_db_path: &Path,
     meta: &SnapshotMeta<ConsensusNodeId, EmptyNode>,
     final_file_name: &str,
     checksum: [u8; 32],
     byte_length: u64,
     cancellation: &Arc<SqliteWorkCancellation>,
-) -> io::Result<()> {
+) -> io::Result<Option<LogId<ConsensusNodeId>>> {
     let source = validate_snapshot_database_sync(
         snapshot_db_path,
         identity,
         expected_members,
         audit_key,
+        capacity_profile,
         meta,
         cancellation,
     )?;
@@ -3646,8 +4084,35 @@ pub(crate) fn install_snapshot_database_cancellable_sync(
     let tx = conn.unchecked_transaction().map_err(db_error)?;
     // Validate the destination before replacing authority. Source authentication
     // cannot prevent a destination trigger or temporary table from changing the
-    // imported state. Repair may replace damaged rows, so check only schema here.
-    validate_live_history_schema_sync(&tx, cancellation)?;
+    // imported state. Repair may replace damaged payload rows, so check the
+    // executable schema and immutable authority here.
+    validate_live_history_schema_for_profile_sync(&tx, capacity_profile, cancellation)?;
+    validate_storage_identity_sync(&tx, identity, audit_key, capacity_profile, cancellation)
+        .map_err(|_| invalid_data("config snapshot destination identity is invalid"))?;
+    for floor in [
+        read_applied_sync(&tx, identity)?,
+        read_purged_sync(&tx, identity)?,
+    ] {
+        if floor.is_some() && meta.last_log_id.is_none() {
+            return Err(invalid_data("config snapshot cannot clear durable state"));
+        }
+        validate_ordered_floor(floor, meta.last_log_id)?;
+    }
+    let committed = read_committed_sync(&tx, identity)?;
+    if let (Some(incoming), Some(committed)) = (meta.last_log_id, committed) {
+        if incoming.index <= committed.index {
+            validate_ordered_floor(Some(incoming), Some(committed))?;
+            if read_log_id_at_sync(&tx, identity, incoming.index, capacity_profile)?
+                .is_some_and(|stored| stored != incoming)
+            {
+                return Err(invalid_data("config snapshot conflicts with committed log"));
+            }
+        }
+    }
+    if capacity_profile == ConfigCapacityProfile::BoundedV1 {
+        tx.execute("DELETE FROM config_raft_capacity_records", [])
+            .map_err(db_error)?;
+    }
     for table in [
         "config_lifecycle_audit",
         "rollback_labels",
@@ -3706,6 +4171,23 @@ pub(crate) fn install_snapshot_database_cancellable_sync(
         cancellation.check_io()?;
         copy_snapshot_table(&source, &tx, table, columns, cancellation)?;
     }
+    if capacity_profile == ConfigCapacityProfile::BoundedV1 {
+        copy_snapshot_table(
+            &source,
+            &tx,
+            "config_raft_capacity_records",
+            "tx_id, binding",
+            cancellation,
+        )?;
+        // Refuse before commit even if a future copy-list edit omits a proof.
+        validate_sealed_state_for_profile_sync(
+            &tx,
+            identity,
+            audit_key,
+            capacity_profile,
+            cancellation,
+        )?;
+    }
     tx.execute(
         "INSERT OR REPLACE INTO config_raft_snapshot (singleton, configuration_epoch, meta_json, file_name, checksum, byte_length) VALUES (1, ?1, ?2, ?3, ?4, ?5)",
         params![
@@ -3717,8 +4199,24 @@ pub(crate) fn install_snapshot_database_cancellable_sync(
         ],
     )
     .map_err(db_error)?;
+    // Snapshot state is already committed. Persist that floor atomically with
+    // its applied pointer, preserving a newer local committed suffix. Otherwise
+    // an installed snapshot can leave applied ahead of committed on reopen.
+    let final_committed = if let Some(incoming) = meta.last_log_id {
+        if committed.is_none_or(|current| current.index < incoming.index) {
+            save_log_pointer(&tx, "config_raft_committed", identity, &incoming)?;
+            Some(incoming)
+        } else {
+            committed
+        }
+    } else {
+        committed
+    };
     cancellation.check_io()?;
-    tx.commit().map_err(db_error)
+    tx.commit().map_err(db_error)?;
+    // Return the value established by this transaction; a fallible reread
+    // after commit could turn installed state into a staging-cleanup failure.
+    Ok(final_committed)
 }
 
 fn copy_snapshot_table(
@@ -3799,36 +4297,37 @@ pub(crate) fn read_current_snapshot_sync(
     conn: &Connection,
     identity: ConsensusIdentity,
     expected_members: &BTreeSet<ConsensusNodeId>,
+    capacity_profile: ConfigCapacityProfile,
 ) -> io::Result<Option<CurrentSnapshot>> {
-    let row = conn
-        .query_row(
-            "SELECT configuration_epoch, meta_json, file_name, checksum, byte_length FROM config_raft_snapshot WHERE singleton = 1",
-            [],
-            |row| Ok((row.get::<_, i64>(0)?, row.get::<_, Vec<u8>>(1)?, row.get::<_, String>(2)?, row.get::<_, Vec<u8>>(3)?, row.get::<_, i64>(4)?)),
-        )
-        .optional()
-        .map_err(db_error)?;
-    let Some((epoch, encoded, file_name, checksum, length)) = row else {
+    let mut statement = conn.prepare(
+        "SELECT configuration_epoch, meta_json, file_name, checksum, byte_length FROM config_raft_snapshot WHERE singleton = 1",
+    ).map_err(db_error)?;
+    let mut rows = statement.query([]).map_err(db_error)?;
+    let Some(row) = rows.next().map_err(db_error)? else {
         return Ok(None);
     };
-    validate_epoch(epoch, identity)?;
-    if !valid_snapshot_file_name(&file_name) {
+    validate_epoch(row.get(0).map_err(db_error)?, identity)?;
+    let file_name = row
+        .get_ref(2)
+        .map_err(db_error)?
+        .as_str()
+        .map_err(|_| invalid_data("invalid persisted config snapshot file name"))?;
+    if !valid_snapshot_file_name(file_name) {
         return Err(invalid_data("invalid persisted config snapshot file name"));
     }
-    let meta: SnapshotMeta<ConsensusNodeId, EmptyNode> = decode_json(&encoded)?;
+    let checksum: [u8; 32] = row_blob(row, 3)?
+        .try_into()
+        .map_err(|_| invalid_data("invalid persisted config snapshot checksum"))?;
+    let length = checked_positive_u64(row.get(4).map_err(db_error)?)?;
+    let meta = capacity_decode::native_snapshot_meta(capacity_profile, row_blob(row, 1)?)?;
     validate_fixed_membership(&meta.last_membership, expected_members)?;
-    Ok(Some((
-        meta,
-        file_name,
-        checksum
-            .try_into()
-            .map_err(|_| invalid_data("invalid persisted config snapshot checksum"))?,
-        checked_positive_u64(length)?,
-    )))
+    Ok(Some((meta, file_name.to_owned(), checksum, length)))
 }
 
 #[cfg(test)]
 mod tests {
+    mod config_capacity_outcome_authentication_tests;
+
     use opc_consensus::engine::{CommittedLeaderId, Entry, EntryPayload, LogId, Membership};
     use opc_crypto::CryptoEnvelopeV1;
     use opc_key::{
@@ -4168,8 +4667,14 @@ mod tests {
             LEGACY_CONFIG_CONSENSUS_COMMAND_VERSION,
         );
         let entries = vec![membership, pending, successor, confirmation];
-        append_logs_sync(&conn, identity(), &expected_members(), &entries)
-            .expect("persist legacy revision-one log");
+        append_logs_sync(
+            &conn,
+            identity(),
+            &expected_members(),
+            &entries,
+            ConfigCapacityProfile::Legacy,
+        )
+        .expect("persist legacy revision-one log");
         drop(conn);
         drop(shared_conn);
         drop(backend);
@@ -4189,8 +4694,16 @@ mod tests {
             None,
         )
         .expect("validate reopened config consensus schema");
-        let persisted = read_log_range_sync(&conn, identity(), &expected_members(), 0, None, None)
-            .expect("read persisted legacy log");
+        let persisted = read_log_range_sync(
+            &conn,
+            identity(),
+            &expected_members(),
+            0,
+            None,
+            None,
+            ConfigCapacityProfile::Legacy,
+        )
+        .expect("read persisted legacy log");
         assert_eq!(persisted, entries);
         let responses = apply_entries_sync(
             &conn,
@@ -4434,6 +4947,7 @@ mod tests {
             .expect("seed externally malformed durable state");
         assert!(validate_sealed_state_sync(
             &conn,
+            identity(),
             backend.audit_key(),
             &SqliteWorkCancellation::new(),
         )
@@ -4462,6 +4976,7 @@ mod tests {
                 .expect("seed externally malformed durable state");
             assert!(validate_sealed_state_sync(
                 &conn,
+                identity(),
                 backend.audit_key(),
                 &SqliteWorkCancellation::new(),
             )
@@ -4522,6 +5037,7 @@ mod tests {
             .expect("seed externally malformed durable state");
         assert!(validate_sealed_state_sync(
             &conn,
+            identity(),
             backend.audit_key(),
             &SqliteWorkCancellation::new(),
         )
@@ -4555,10 +5071,19 @@ mod tests {
             identity(),
             &expected_members(),
             &[membership.clone(), legacy.clone(), replay.clone()],
+            ConfigCapacityProfile::Legacy,
         )
         .expect("revision-one legacy log and revision-two retry remain readable");
-        let persisted = read_log_range_sync(&conn, identity(), &expected_members(), 0, None, None)
-            .expect("read revision-one persisted command");
+        let persisted = read_log_range_sync(
+            &conn,
+            identity(),
+            &expected_members(),
+            0,
+            None,
+            None,
+            ConfigCapacityProfile::Legacy,
+        )
+        .expect("read revision-one persisted command");
         assert_eq!(
             vec![membership.clone(), legacy.clone(), replay.clone()],
             persisted
@@ -4596,11 +5121,13 @@ mod tests {
             identity(),
             &expected_members(),
             std::slice::from_ref(&revision_one_new_intent),
+            ConfigCapacityProfile::Legacy,
         )
         .is_err());
         assert_eq!(
             Some(log_id(2)),
-            last_log_sync(&conn, identity()).expect("legacy log remains intact")
+            last_log_sync(&conn, identity(), ConfigCapacityProfile::Legacy)
+                .expect("legacy log remains intact")
         );
         assert_eq!(
             Some(log_id(2)),
@@ -4951,9 +5478,16 @@ mod tests {
             identity(),
             &expected_members(),
             &[membership.clone(), applied.clone(), tail.clone()],
+            ConfigCapacityProfile::Legacy,
         )
         .expect("initial log");
-        save_committed_sync(&conn, identity(), Some(applied.log_id)).expect("committed floor");
+        save_committed_sync(
+            &conn,
+            identity(),
+            Some(applied.log_id),
+            ConfigCapacityProfile::Legacy,
+        )
+        .expect("committed floor");
         apply_entries_sync(
             &conn,
             backend.audit_key(),
@@ -4962,19 +5496,27 @@ mod tests {
             vec![membership, applied.clone()],
         )
         .expect("applied floor");
-        purge_logs_sync(&conn, identity(), &log_id(0)).expect("purged floor");
+        purge_logs_sync(&conn, identity(), &log_id(0), ConfigCapacityProfile::Legacy)
+            .expect("purged floor");
 
         assert!(save_committed_sync(
             &conn,
             identity(),
             Some(log_id_with_term(2, applied.log_id.index)),
+            ConfigCapacityProfile::Legacy,
         )
         .is_err());
         assert_eq!(
             Some(applied.log_id),
             read_committed_sync(&conn, identity()).expect("committed pointer")
         );
-        assert!(purge_logs_sync(&conn, identity(), &log_id_with_term(2, 0)).is_err());
+        assert!(purge_logs_sync(
+            &conn,
+            identity(),
+            &log_id_with_term(2, 0),
+            ConfigCapacityProfile::Legacy
+        )
+        .is_err());
         assert_eq!(
             Some(log_id(0)),
             read_purged_sync(&conn, identity()).expect("purged pointer")
@@ -4994,11 +5536,13 @@ mod tests {
             identity(),
             &expected_members(),
             std::slice::from_ref(&replacement),
+            ConfigCapacityProfile::Legacy,
         )
         .is_err());
         assert_eq!(
             Some(tail.log_id),
-            last_log_sync(&conn, identity()).expect("tail remains intact")
+            last_log_sync(&conn, identity(), ConfigCapacityProfile::Legacy)
+                .expect("tail remains intact")
         );
     }
 
@@ -5015,9 +5559,16 @@ mod tests {
             identity(),
             &expected_members(),
             &[membership.clone(), committed.clone(), stale_tail],
+            ConfigCapacityProfile::Legacy,
         )
         .expect("initial log");
-        save_committed_sync(&conn, identity(), Some(committed.log_id)).expect("committed floor");
+        save_committed_sync(
+            &conn,
+            identity(),
+            Some(committed.log_id),
+            ConfigCapacityProfile::Legacy,
+        )
+        .expect("committed floor");
         apply_entries_sync(
             &conn,
             backend.audit_key(),
@@ -5034,15 +5585,24 @@ mod tests {
             identity(),
             &expected_members(),
             std::slice::from_ref(&replacement),
+            ConfigCapacityProfile::Legacy,
         )
         .expect("append replacement tail");
         assert_eq!(
             vec![committed.log_id, replacement.log_id],
-            read_log_range_sync(&conn, identity(), &expected_members(), 1, None, None,)
-                .expect("read replacement")
-                .into_iter()
-                .map(|entry| entry.log_id)
-                .collect::<Vec<_>>()
+            read_log_range_sync(
+                &conn,
+                identity(),
+                &expected_members(),
+                1,
+                None,
+                None,
+                ConfigCapacityProfile::Legacy
+            )
+            .expect("read replacement")
+            .into_iter()
+            .map(|entry| entry.log_id)
+            .collect::<Vec<_>>()
         );
     }
 
@@ -5060,14 +5620,22 @@ mod tests {
                 mark_confirmed_entry(1, [0x51; 16], TxId::new()),
                 mark_confirmed_entry(2, [0x52; 16], TxId::new()),
             ],
+            ConfigCapacityProfile::Legacy,
         )
         .expect("initial log");
         conn.execute("DELETE FROM config_raft_log WHERE log_index = 1", [])
             .expect("inject persisted hole");
 
-        assert!(
-            read_log_range_sync(&conn, identity(), &expected_members(), 0, None, None,).is_err()
-        );
+        assert!(read_log_range_sync(
+            &conn,
+            identity(),
+            &expected_members(),
+            0,
+            None,
+            None,
+            ConfigCapacityProfile::Legacy
+        )
+        .is_err());
         assert_eq!(
             Err(ConfigConsensusStorageError::CorruptState),
             initialize_schema(
@@ -5097,6 +5665,7 @@ mod tests {
             identity(),
             &expected_members(),
             &[membership_entry(), accepted],
+            ConfigCapacityProfile::Legacy,
         )
         .expect("maximum valid label entry");
         drop(conn);
@@ -5112,6 +5681,7 @@ mod tests {
             identity(),
             &expected_members(),
             std::slice::from_ref(&membership_entry()),
+            ConfigCapacityProfile::Legacy,
         )
         .expect("membership log");
         assert!(append_logs_sync(
@@ -5119,11 +5689,13 @@ mod tests {
             identity(),
             &expected_members(),
             std::slice::from_ref(&rejected),
+            ConfigCapacityProfile::Legacy,
         )
         .is_err());
         assert_eq!(
             Some(log_id(0)),
-            last_log_sync(&conn, identity()).expect("invalid append is atomic")
+            last_log_sync(&conn, identity(), ConfigCapacityProfile::Legacy)
+                .expect("invalid append is atomic")
         );
     }
 
@@ -5140,6 +5712,7 @@ mod tests {
                 membership_entry(),
                 mark_confirmed_entry(1, [0x61; 16], TxId::new()),
             ],
+            ConfigCapacityProfile::Legacy,
         )
         .expect("initial log");
         save_log_pointer(&conn, "config_raft_committed", identity(), &log_id(0))
@@ -5187,10 +5760,16 @@ mod tests {
             identity(),
             &expected_members(),
             std::slice::from_ref(&membership),
+            ConfigCapacityProfile::Legacy,
         )
         .expect("membership log");
-        save_committed_sync(&conn, identity(), Some(membership.log_id))
-            .expect("membership committed");
+        save_committed_sync(
+            &conn,
+            identity(),
+            Some(membership.log_id),
+            ConfigCapacityProfile::Legacy,
+        )
+        .expect("membership committed");
         apply_entries_sync(
             &conn,
             backend.audit_key(),
@@ -5238,9 +5817,16 @@ mod tests {
             identity(),
             &expected_members(),
             std::slice::from_ref(&entry),
+            ConfigCapacityProfile::Legacy,
         )
         .expect("normal log");
-        save_committed_sync(&conn, identity(), Some(entry.log_id)).expect("normal committed");
+        save_committed_sync(
+            &conn,
+            identity(),
+            Some(entry.log_id),
+            ConfigCapacityProfile::Legacy,
+        )
+        .expect("normal committed");
         let baseline_machine = read_machine_sync(&conn, identity()).expect("baseline machine");
 
         // Schema faults are now refused before apply. Inject the two intended
@@ -5303,6 +5889,8 @@ mod tests {
                 read_outcome_sync(
                     &conn,
                     identity(),
+                    backend.audit_key(),
+                    ConfigCapacityProfile::Legacy,
                     ConfigConsensusRequestId::from_bytes([0xA1; 16]),
                 )
                 .expect("outcome lookup")
@@ -5354,6 +5942,8 @@ mod tests {
         assert!(read_outcome_sync(
             &conn,
             identity(),
+            backend.audit_key(),
+            ConfigCapacityProfile::Legacy,
             ConfigConsensusRequestId::from_bytes([0xA1; 16]),
         )
         .expect("outcome after pre-commit fault")
@@ -5374,6 +5964,8 @@ mod tests {
         assert!(read_outcome_sync(
             &conn,
             identity(),
+            backend.audit_key(),
+            ConfigCapacityProfile::Legacy,
             ConfigConsensusRequestId::from_bytes([0xA1; 16]),
         )
         .expect("replayed outcome")
@@ -5394,10 +5986,16 @@ mod tests {
             identity(),
             &expected_members(),
             std::slice::from_ref(&membership),
+            ConfigCapacityProfile::Legacy,
         )
         .expect("membership log");
-        save_committed_sync(&conn, identity(), Some(membership.log_id))
-            .expect("membership committed");
+        save_committed_sync(
+            &conn,
+            identity(),
+            Some(membership.log_id),
+            ConfigCapacityProfile::Legacy,
+        )
+        .expect("membership committed");
         apply_entries_sync(
             &conn,
             backend.audit_key(),
@@ -5418,10 +6016,21 @@ mod tests {
                     mark_confirmed_entry(index, u128::from(index).to_be_bytes(), missing_tx)
                 })
                 .collect::<Vec<_>>();
-            append_logs_sync(&conn, identity(), &expected_members(), &entries)
-                .expect("bounded log append");
-            save_committed_sync(&conn, identity(), entries.last().map(|entry| entry.log_id))
-                .expect("advance committed pointer");
+            append_logs_sync(
+                &conn,
+                identity(),
+                &expected_members(),
+                &entries,
+                ConfigCapacityProfile::Legacy,
+            )
+            .expect("bounded log append");
+            save_committed_sync(
+                &conn,
+                identity(),
+                entries.last().map(|entry| entry.log_id),
+                ConfigCapacityProfile::Legacy,
+            )
+            .expect("advance committed pointer");
             apply_entries_sync(
                 &conn,
                 backend.audit_key(),
@@ -5453,6 +6062,7 @@ mod tests {
             1,
             None,
             Some(CHUNK as usize),
+            ConfigCapacityProfile::Legacy,
         )
         .expect("bounded range read");
         assert_eq!(CHUNK as usize, bounded.len());
@@ -5469,7 +6079,13 @@ mod tests {
         .expect("large history snapshot");
         assert!(snapshot.metadata().expect("snapshot metadata").len() > 0);
 
-        purge_logs_sync(&conn, identity(), &log_id(HISTORY_ENTRIES)).expect("compact applied log");
+        purge_logs_sync(
+            &conn,
+            identity(),
+            &log_id(HISTORY_ENTRIES),
+            ConfigCapacityProfile::Legacy,
+        )
+        .expect("compact applied log");
         let remaining_logs: i64 = conn
             .query_row("SELECT COUNT(*) FROM config_raft_log", [], |row| row.get(0))
             .expect("remaining log count");
@@ -5480,3 +6096,19 @@ mod tests {
         );
     }
 }
+
+#[cfg(test)]
+#[path = "sqlite/config_capacity_history_reader_tests.rs"]
+mod config_capacity_history_reader_tests;
+
+#[cfg(test)]
+#[path = "sqlite/config_capacity_sealed_buffers.rs"]
+mod config_capacity_sealed_buffers;
+
+#[cfg(test)]
+#[path = "sqlite/config_capacity_retained_proof_tests.rs"]
+mod config_capacity_retained_proof_tests;
+
+#[cfg(test)]
+#[path = "sqlite/config_capacity_log_reader_tests.rs"]
+mod config_capacity_log_reader_tests;

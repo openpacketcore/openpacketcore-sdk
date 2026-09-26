@@ -8,6 +8,10 @@
 
 #![forbid(unsafe_code)]
 
+mod config_preparation;
+
+pub use config_preparation::{ConfigPreparationPool, ConfigPreparationReservation};
+
 use opc_key::{
     AeadAlgorithm, EnvelopeAad, KeyHandle, KeyId, KeyProvider, Zeroizing, AEAD_TAG_LEN,
     AES_256_GCM_SIV_NONCE_LEN,
@@ -22,6 +26,281 @@ const ENVELOPE_MAGIC: [u8; 4] = *b"OPCE";
 const ENVELOPE_VERSION: u16 = 1;
 const HEADER_LEN: usize = 4 + 2 + 2 + 2 + 2 + 4;
 
+/// Immutable configuration byte-policy selection. This does not by itself
+/// enable a larger consensus command or change a store's durability contract.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum ConfigCapacityProfile {
+    /// Existing admission and historical envelope behavior.
+    #[default]
+    Legacy,
+    /// Version-one bounded configuration plaintext attestation.
+    BoundedV1,
+}
+
+impl ConfigCapacityProfile {
+    /// Stable revision for immutable authority binding; zero is legacy.
+    pub const fn revision(self) -> u16 {
+        match self {
+            Self::Legacy => 0,
+            Self::BoundedV1 => 1,
+        }
+    }
+}
+
+/// Inclusive logical JSON byte limit for the bounded configuration profile.
+pub const CONFIG_CAPACITY_V1_LOGICAL_BYTES: usize = 1_572_864;
+/// Inclusive encrypted replay and framing allowance, excluding logical JSON.
+pub const CONFIG_CAPACITY_V1_REPLAY_BYTES: usize = 65_536;
+/// Inclusive complete AEAD plaintext limit; both constituent limits also apply.
+pub const CONFIG_CAPACITY_V1_PLAINTEXT_BYTES: usize = 1_638_400;
+/// Inclusive complete bound AAD limit, including key binding.
+pub const CONFIG_CAPACITY_V1_AAD_BYTES: usize = 65_536;
+/// Inclusive envelope limit, allowing the largest supported framing overhead.
+pub const CONFIG_CAPACITY_V1_ENVELOPE_BYTES: usize = 1_704_492;
+
+const CONFIG_CAPACITY_V2_MAGIC: &[u8] = b"\x89OPCCFG\x02\r\n\x1a\n";
+
+/// Value-free errors from bounded configuration encryption.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Error)]
+#[non_exhaustive]
+pub enum ConfigCapacityError {
+    /// No preparation slot is available, or a sealed reservation was reused.
+    #[error("configuration preparation admission unavailable")]
+    ResourceAdmission,
+    /// The input is not a supported, unambiguous configuration serialization.
+    #[error("invalid configuration plaintext framing")]
+    InvalidPlaintext,
+    /// Exact logical serialization exceeds its inclusive bound.
+    #[error("configuration logical byte limit exceeded")]
+    LogicalBytes,
+    /// Exact encrypted replay/framing bytes exceed their inclusive bound.
+    #[error("configuration replay byte limit exceeded")]
+    ReplayBytes,
+    /// Complete plaintext exceeds its inclusive bound.
+    #[error("configuration plaintext byte limit exceeded")]
+    PlaintextBytes,
+    /// Complete bound AAD exceeds its inclusive bound.
+    #[error("configuration AAD byte limit exceeded")]
+    AadBytes,
+    /// Complete encoded envelope exceeds its inclusive bound.
+    #[error("configuration envelope byte limit exceeded")]
+    EnvelopeBytes,
+    /// Key selection or authenticated encryption failed.
+    #[error("configuration encryption failed")]
+    EncryptionFailed,
+}
+
+/// SDK-issued lengths for the exact plaintext of a successful encryption.
+///
+/// This value has no public constructor or deserializer. The one-shot claim
+/// binds it to the envelope bytes and plaintext digest. Copying these lengths
+/// does not grant authority to attest different plaintext or ciphertext.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub struct ConfigCapacityEvidence {
+    logical_bytes: usize,
+    replay_bytes: usize,
+}
+
+impl ConfigCapacityEvidence {
+    /// Profile under which the exact plaintext was validated.
+    pub const fn profile(self) -> ConfigCapacityProfile {
+        ConfigCapacityProfile::BoundedV1
+    }
+
+    /// Actual logical JSON bytes, including adjacent raw-value whitespace.
+    pub const fn logical_bytes(self) -> usize {
+        self.logical_bytes
+    }
+
+    /// Actual remaining plaintext bytes, including all replay and framing.
+    pub const fn replay_bytes(self) -> usize {
+        self.replay_bytes
+    }
+
+    fn validate(plaintext: &[u8]) -> Result<Self, ConfigCapacityError> {
+        if plaintext.len() > CONFIG_CAPACITY_V1_PLAINTEXT_BYTES {
+            return Err(ConfigCapacityError::PlaintextBytes);
+        }
+        let logical_bytes = if let Some(encoded) = plaintext.strip_prefix(CONFIG_CAPACITY_V2_MAGIC)
+        {
+            let parsed: ConfigCapacityPlaintextV2<'_> = serde_json::from_slice(encoded)
+                .map_err(|_| ConfigCapacityError::InvalidPlaintext)?;
+            let value = parsed.config.get().as_bytes();
+            let mut start = (value.as_ptr() as usize)
+                .checked_sub(encoded.as_ptr() as usize)
+                .ok_or(ConfigCapacityError::InvalidPlaintext)?;
+            let mut end = start
+                .checked_add(value.len())
+                .filter(|end| *end <= encoded.len())
+                .ok_or(ConfigCapacityError::InvalidPlaintext)?;
+            // RawValue excludes adjacent JSON whitespace. A custom serializer
+            // can emit that whitespace as part of the config value: charge it
+            // to logical bytes so it cannot consume replay headroom instead.
+            while start > 0 && encoded[start - 1].is_ascii_whitespace() {
+                start -= 1;
+            }
+            while end < encoded.len() && encoded[end].is_ascii_whitespace() {
+                end += 1;
+            }
+            end - start
+        } else {
+            let _: &serde_json::value::RawValue = serde_json::from_slice(plaintext)
+                .map_err(|_| ConfigCapacityError::InvalidPlaintext)?;
+            plaintext.len()
+        };
+        let replay_bytes = plaintext
+            .len()
+            .checked_sub(logical_bytes)
+            .ok_or(ConfigCapacityError::InvalidPlaintext)?;
+        if logical_bytes > CONFIG_CAPACITY_V1_LOGICAL_BYTES {
+            return Err(ConfigCapacityError::LogicalBytes);
+        }
+        if replay_bytes > CONFIG_CAPACITY_V1_REPLAY_BYTES {
+            return Err(ConfigCapacityError::ReplayBytes);
+        }
+        Ok(Self {
+            logical_bytes,
+            replay_bytes,
+        })
+    }
+}
+
+impl std::fmt::Debug for ConfigCapacityEvidence {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("ConfigCapacityEvidence(<redacted>)")
+    }
+}
+
+// Borrow every field from the exact encrypted serialization. No JSON value
+// tree, second configuration serialization or caller-provided length is used.
+#[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ConfigCapacityPlaintextV2<'a> {
+    #[serde(borrow)]
+    config: &'a serde_json::value::RawValue,
+    #[serde(default, borrow, rename = "source")]
+    _source: Option<&'a serde_json::value::RawValue>,
+    #[serde(default, borrow, rename = "idempotency_key")]
+    _idempotency_key: Option<&'a serde_json::value::RawValue>,
+    #[serde(default, borrow, rename = "apply_plan")]
+    _apply_plan: Option<&'a serde_json::value::RawValue>,
+    #[serde(default, borrow, rename = "request_fingerprint")]
+    _request_fingerprint: Option<&'a serde_json::value::RawValue>,
+    #[serde(default, borrow, rename = "request_id")]
+    _request_id: Option<&'a serde_json::value::RawValue>,
+}
+
+struct ConfigCapacityAadCounter(usize);
+
+impl std::io::Write for ConfigCapacityAadCounter {
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        self.0 = self
+            .0
+            .checked_add(bytes.len())
+            .filter(|len| *len <= CONFIG_CAPACITY_V1_AAD_BYTES)
+            .ok_or_else(|| std::io::Error::other("configuration AAD byte limit exceeded"))?;
+        Ok(bytes.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+fn preflight_config_aad(aad: &EnvelopeAad) -> Result<(), ConfigCapacityError> {
+    if aad.purpose() != opc_key::KeyPurpose::Config {
+        return Err(ConfigCapacityError::InvalidPlaintext);
+    }
+    // The bound representation adds a key-id field to this same AAD shape.
+    // Reject an oversized base shape without allocating its encoding or asking
+    // a provider for a key. The exact bound encoder is checked after selection.
+    serde_json::to_writer(ConfigCapacityAadCounter(0), aad)
+        .map_err(|_| ConfigCapacityError::AadBytes)
+}
+
+fn seal_bounded_config(
+    handle: &KeyHandle,
+    aad: &EnvelopeAad,
+    plaintext: &[u8],
+    nonce: [u8; AES_256_GCM_SIV_NONCE_LEN],
+    evidence: ConfigCapacityEvidence,
+) -> Result<AuthenticatedEnvelope, ConfigCapacityError> {
+    // Preflight bounded the base shape. KeyId is bounded by its constructor;
+    // this allocation therefore cannot grow with arbitrary rejected AAD.
+    let bound_aad = opc_key::serialize_bound_aad(aad, handle.key_id())
+        .map_err(|_| ConfigCapacityError::EncryptionFailed)?;
+    if bound_aad.len() > CONFIG_CAPACITY_V1_AAD_BYTES {
+        return Err(ConfigCapacityError::AadBytes);
+    }
+    drop(bound_aad);
+    let encoded = encrypt_envelope_with_handle_and_nonce(handle, aad, plaintext, nonce)
+        .map_err(|_| ConfigCapacityError::EncryptionFailed)?;
+    if encoded.len() > CONFIG_CAPACITY_V1_ENVELOPE_BYTES {
+        return Err(ConfigCapacityError::EnvelopeBytes);
+    }
+    let mut envelope = AuthenticatedEnvelope::new(encoded, plaintext);
+    envelope.capacity_evidence = Some(evidence);
+    Ok(envelope)
+}
+
+/// Encrypt bounded config JSON or the SDK's version-two replay wrapper.
+///
+/// Logical/replay/full-plaintext checks run on the actual bytes before provider
+/// calls. The resulting one-shot claim carries immutable size evidence. This
+/// does not relax any consensus, RPC, memory, storage or durability limit.
+/// Existing unbounded encryption APIs retain their legacy behavior and yield
+/// no bounded-profile evidence.
+pub async fn encrypt_bounded_config_envelope<P: KeyProvider + ?Sized>(
+    provider: &P,
+    aad: &EnvelopeAad,
+    plaintext: &[u8],
+) -> Result<AuthenticatedEnvelope, ConfigCapacityError> {
+    let evidence = ConfigCapacityEvidence::validate(plaintext)?;
+    preflight_config_aad(aad)?;
+    let handle = provider
+        .get_active_key(aad.purpose(), aad.tenant())
+        .await
+        .map_err(|_| ConfigCapacityError::EncryptionFailed)?;
+    let mut nonce = [0_u8; AES_256_GCM_SIV_NONCE_LEN];
+    SysRng
+        .try_fill_bytes(&mut nonce)
+        .map_err(|_| ConfigCapacityError::EncryptionFailed)?;
+    seal_bounded_config(&handle, aad, plaintext, nonce, evidence)
+}
+
+/// Encrypt under one destination-store preparation reservation.
+///
+/// Consumes the reservation before any provider request or encryption buffer
+/// allocation. A reservation extracted from an earlier encryption claim cannot
+/// encrypt again. The caller owns the borrowed plaintext; SDK adapters must
+/// obtain this reservation before allocating their plaintext buffer.
+pub async fn encrypt_reserved_bounded_config_envelope<P: KeyProvider + ?Sized>(
+    reservation: ConfigPreparationReservation,
+    provider: &P,
+    aad: &EnvelopeAad,
+    plaintext: &[u8],
+) -> Result<AuthenticatedEnvelope, ConfigCapacityError> {
+    reservation.begin_encryption()?;
+    let mut envelope = encrypt_bounded_config_envelope(provider, aad, plaintext).await?;
+    envelope.preparation = Some(reservation.lease);
+    Ok(envelope)
+}
+
+/// Deterministic bounded configuration encryption for test vectors.
+/// Callers MUST NOT reuse a nonce with the same key. Prefer
+/// [`encrypt_bounded_config_envelope`] for production encryption.
+pub fn encrypt_bounded_config_envelope_with_handle_and_nonce(
+    handle: &KeyHandle,
+    aad: &EnvelopeAad,
+    plaintext: &[u8],
+    nonce: [u8; AES_256_GCM_SIV_NONCE_LEN],
+) -> Result<AuthenticatedEnvelope, ConfigCapacityError> {
+    let evidence = ConfigCapacityEvidence::validate(plaintext)?;
+    preflight_config_aad(aad)?;
+    seal_bounded_config(handle, aad, plaintext, nonce, evidence)
+}
+
 /// One-shot evidence that an envelope was returned by a successful encryption
 /// operation. The evidence is consumed at the persistence adapter boundary and
 /// is never serialized into a consensus command, log, RPC, or snapshot.
@@ -29,6 +308,8 @@ const HEADER_LEN: usize = 4 + 2 + 2 + 2 + 2 + 4;
 pub struct AuthenticatedEnvelope {
     encoded: Arc<[u8]>,
     plaintext_digest: [u8; 32],
+    capacity_evidence: Option<ConfigCapacityEvidence>,
+    preparation: Option<Arc<config_preparation::ConfigPreparationLease>>,
     unclaimed: Arc<AtomicBool>,
 }
 
@@ -37,6 +318,8 @@ impl AuthenticatedEnvelope {
         Self {
             encoded: Arc::from(encoded),
             plaintext_digest: Sha256::digest(plaintext).into(),
+            capacity_evidence: None,
+            preparation: None,
             unclaimed: Arc::new(AtomicBool::new(true)),
         }
     }
@@ -54,6 +337,13 @@ impl AuthenticatedEnvelope {
         Ok(AuthenticatedEnvelopeClaim {
             encoded: self.encoded.clone(),
             plaintext_digest: self.plaintext_digest,
+            capacity_evidence: self.capacity_evidence,
+            preparation: self
+                .preparation
+                .as_ref()
+                .map(|lease| ConfigPreparationReservation {
+                    lease: Arc::clone(lease),
+                }),
         })
     }
 }
@@ -73,9 +363,30 @@ impl std::fmt::Debug for AuthenticatedEnvelope {
 pub struct AuthenticatedEnvelopeClaim {
     encoded: Arc<[u8]>,
     plaintext_digest: [u8; 32],
+    capacity_evidence: Option<ConfigCapacityEvidence>,
+    preparation: Option<ConfigPreparationReservation>,
 }
 
 impl AuthenticatedEnvelopeClaim {
+    /// Validated exact-plaintext lengths, if bounded configuration encryption
+    /// produced this claim. Legacy encryption never issues this evidence.
+    pub const fn capacity_evidence(&self) -> Option<ConfigCapacityEvidence> {
+        self.capacity_evidence
+    }
+
+    /// Consume this claim's size evidence and process-local reservation.
+    ///
+    /// Persistence constructors must first check exact ciphertext and digest
+    /// equality. These parts alone do not attest another encrypted record.
+    pub fn into_capacity_parts(
+        self,
+    ) -> (
+        Option<ConfigCapacityEvidence>,
+        Option<ConfigPreparationReservation>,
+    ) {
+        (self.capacity_evidence, self.preparation)
+    }
+
     /// Verify that record bytes are exactly the successfully encrypted bytes.
     pub fn matches(&self, encoded: &[u8]) -> bool {
         self.encoded.as_ref() == encoded
@@ -112,9 +423,17 @@ pub struct CryptoEnvelopeRef<'a> {
     pub ciphertext_and_tag: &'a [u8],
 }
 
-impl<'a> CryptoEnvelopeRef<'a> {
-    /// Decode under the same binary profile as [`CryptoEnvelopeV1::decode`].
-    pub fn decode(bytes: &'a [u8]) -> Result<Self, CryptoError> {
+// Borrow only binary extents here: admission must precede key/AAD copies.
+struct EnvelopeFraming<'a> {
+    algorithm: AeadAlgorithm,
+    key_id: &'a str,
+    nonce: &'a [u8],
+    aad: &'a [u8],
+    ciphertext_and_tag: &'a [u8],
+}
+
+impl<'a> EnvelopeFraming<'a> {
+    fn decode(bytes: &'a [u8]) -> Result<Self, CryptoError> {
         if bytes.len() < HEADER_LEN {
             return Err(CryptoError::InvalidEnvelope);
         }
@@ -159,10 +478,37 @@ impl<'a> CryptoEnvelopeRef<'a> {
 
         Ok(Self {
             algorithm,
-            key_id: KeyId::new(key_id.to_owned()).map_err(|_| CryptoError::InvalidEnvelope)?,
+            key_id,
             nonce: &bytes[key_id_end..nonce_end],
             aad: &bytes[nonce_end..aad_end],
             ciphertext_and_tag,
+        })
+    }
+}
+
+impl<'a> CryptoEnvelopeRef<'a> {
+    /// Read header-key and AAD byte lengths without allocating or copying them.
+    ///
+    /// This checks V1 framing, supported algorithm, UTF-8 header key, and the
+    /// minimum tag length. It does not validate key-identifier grammar, nonce
+    /// policy, AAD schema or binding, or keyed authenticity. Callers must retain
+    /// their existing validation after using these lengths for admission.
+    /// The returned pair is `(header_key_bytes, aad_bytes)`.
+    pub fn encoded_metadata_lengths(bytes: &[u8]) -> Result<(usize, usize), CryptoError> {
+        let frame = EnvelopeFraming::decode(bytes)?;
+        Ok((frame.key_id.len(), frame.aad.len()))
+    }
+
+    /// Decode under the same binary profile as [`CryptoEnvelopeV1::decode`].
+    pub fn decode(bytes: &'a [u8]) -> Result<Self, CryptoError> {
+        let frame = EnvelopeFraming::decode(bytes)?;
+        Ok(Self {
+            algorithm: frame.algorithm,
+            key_id: KeyId::new(frame.key_id.to_owned())
+                .map_err(|_| CryptoError::InvalidEnvelope)?,
+            nonce: frame.nonce,
+            aad: frame.aad,
+            ciphertext_and_tag: frame.ciphertext_and_tag,
         })
     }
 
@@ -206,6 +552,10 @@ impl<'a> CryptoEnvelopeRef<'a> {
 #[cfg(test)]
 #[path = "envelope_view_tests.rs"]
 mod envelope_view_tests;
+
+#[cfg(test)]
+#[path = "config_capacity_metadata_lengths_tests.rs"]
+mod config_capacity_metadata_lengths_tests;
 
 /// Decoded RFC 001 envelope structure.
 #[derive(Debug, Clone, PartialEq, Eq)]
