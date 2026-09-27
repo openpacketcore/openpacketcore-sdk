@@ -754,11 +754,24 @@ impl ConfigConsensusCommand {
         let semantic_revision = self.intent.minimum_command_version();
         let mut hasher = Sha256::new();
         hasher.update(OUTCOME_DIGEST_DOMAIN);
-        crate::consensus::config_capacity_json::to_writer(
-            ConfigDigestWriter(&mut hasher),
-            &(semantic_revision, self.identity, &self.intent),
-        )
-        .map_err(|_| PersistError::inconsistent_state("config consensus encoding failed"))?;
+        {
+            let mut writer = ConfigDigestWriter::new(&mut hasher);
+            crate::consensus::config_capacity_json::to_writer(
+                &mut writer,
+                &(semantic_revision, self.identity, &self.intent),
+            )
+            .map_err(|_| PersistError::inconsistent_state("config consensus encoding failed"))?;
+            std::io::Write::flush(&mut writer).map_err(|_| {
+                PersistError::inconsistent_state("config consensus encoding failed")
+            })?;
+            #[cfg(all(test, target_os = "linux"))]
+            super::store::config_capacity_cost_observation::command_digest(
+                self.request_id,
+                true,
+                writer.sink.bytes,
+                writer.sink.updates,
+            );
+        }
         Ok(hasher.finalize().into())
     }
 
@@ -771,11 +784,23 @@ impl ConfigConsensusCommand {
     ) -> Result<ConfigConsensusEntryDigest, PersistError> {
         let mut hasher = Sha256::new();
         hasher.update(COMMAND_DIGEST_DOMAIN);
-        crate::consensus::config_capacity_json::to_writer(
-            ConfigDigestWriter(&mut hasher),
-            &(sequence, previous, effective_time, self),
-        )
-        .map_err(|_| PersistError::inconsistent_state("config consensus digest failed"))?;
+        {
+            let mut writer = ConfigDigestWriter::new(&mut hasher);
+            crate::consensus::config_capacity_json::to_writer(
+                &mut writer,
+                &(sequence, previous, effective_time, self),
+            )
+            .map_err(|_| PersistError::inconsistent_state("config consensus digest failed"))?;
+            std::io::Write::flush(&mut writer)
+                .map_err(|_| PersistError::inconsistent_state("config consensus digest failed"))?;
+            #[cfg(all(test, target_os = "linux"))]
+            super::store::config_capacity_cost_observation::command_digest(
+                self.request_id,
+                false,
+                writer.sink.bytes,
+                writer.sink.updates,
+            );
+        }
         Ok(ConsensusEntryDigest::from_bytes(hasher.finalize().into()))
     }
 
@@ -913,13 +938,75 @@ pub(super) fn config_command_revision(profile: opc_crypto::ConfigCapacityProfile
     }
 }
 
-// Feed the identical canonical JSON into the digest without retaining an
-// expanded JSON command allocation alongside the encrypted record.
-struct ConfigDigestWriter<'a>(&'a mut Sha256);
+// Keep both canonical digest transcripts unchanged without an expanded JSON
+// allocation. Vec<u8> uses Serde sequence callbacks, so its numeric JSON reaches
+// this sink as millions of small writes even with the byte-array formatter.
+// A fixed stack buffer bounds hash dispatch and is explicitly flushed before
+// either digest is finalized. No parsed record or authority is cached.
+struct ConfigDigestWriter<'a> {
+    sink: ConfigDigestSink<'a>,
+    buffer: [u8; 4096],
+    buffered: usize,
+}
+
+impl<'a> ConfigDigestWriter<'a> {
+    fn new(hasher: &'a mut Sha256) -> Self {
+        Self {
+            sink: ConfigDigestSink {
+                hasher,
+                #[cfg(test)]
+                bytes: 0,
+                #[cfg(test)]
+                updates: 0,
+            },
+            buffer: [0; 4096],
+            buffered: 0,
+        }
+    }
+}
 
 impl std::io::Write for ConfigDigestWriter<'_> {
     fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
-        self.0.update(bytes);
+        let mut remaining = bytes;
+        while !remaining.is_empty() {
+            let count = remaining.len().min(self.buffer.len() - self.buffered);
+            self.buffer[self.buffered..self.buffered + count].copy_from_slice(&remaining[..count]);
+            self.buffered += count;
+            remaining = &remaining[count..];
+            if self.buffered == self.buffer.len() {
+                self.flush()?;
+            }
+        }
+        Ok(bytes.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        if self.buffered != 0 {
+            std::io::Write::write_all(&mut self.sink, &self.buffer[..self.buffered])?;
+            self.buffered = 0;
+        }
+        Ok(())
+    }
+}
+
+// Keep observations at the actual SHA update, once per consumed chunk. Tests
+// report these local counters once after a complete digest, never per number.
+struct ConfigDigestSink<'a> {
+    hasher: &'a mut Sha256,
+    #[cfg(test)]
+    bytes: usize,
+    #[cfg(test)]
+    updates: usize,
+}
+
+impl std::io::Write for ConfigDigestSink<'_> {
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        self.hasher.update(bytes);
+        #[cfg(test)]
+        {
+            self.bytes += bytes.len();
+            self.updates += 1;
+        }
         Ok(bytes.len())
     }
 
@@ -927,6 +1014,9 @@ impl std::io::Write for ConfigDigestWriter<'_> {
         Ok(())
     }
 }
+
+#[cfg(test)]
+mod config_capacity_digest_writer_tests;
 
 /// Stable application rejection persisted in request outcomes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]

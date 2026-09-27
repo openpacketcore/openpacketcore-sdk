@@ -34,6 +34,12 @@ pub(crate) mod observation {
     pub(crate) struct Counts {
         pub(crate) native_canonical_decodes: usize,
         pub(crate) native_fallback_decodes: usize,
+        pub(crate) outcome_digest_calls: usize,
+        pub(crate) outcome_digest_bytes: usize,
+        pub(crate) outcome_digest_updates: usize,
+        pub(crate) applied_digest_calls: usize,
+        pub(crate) applied_digest_bytes: usize,
+        pub(crate) applied_digest_updates: usize,
         pub(crate) effect_verifications: usize,
         pub(crate) effect_serializations: usize,
         pub(crate) effect_encoded_bytes: usize,
@@ -181,6 +187,33 @@ pub(crate) mod observation {
                 update(*phase, &mut counts.lock().expect("cost counters"));
             }
         });
+    }
+
+    // The real command reports its local SHA counters only after all bytes
+    // have been hashed. This owns no payload or store and spans no await.
+    pub(crate) fn command_digest(
+        request_id: ConsensusRequestId,
+        outcome: bool,
+        bytes: usize,
+        updates: usize,
+    ) {
+        let counts = OBSERVERS
+            .lock()
+            .expect("cost observer registry")
+            .get(&request_id)
+            .and_then(Weak::upgrade);
+        if let Some(counts) = counts {
+            let mut counts = counts.lock().expect("cost counters");
+            if outcome {
+                counts.outcome_digest_calls += 1;
+                counts.outcome_digest_bytes += bytes;
+                counts.outcome_digest_updates += updates;
+            } else {
+                counts.applied_digest_calls += 1;
+                counts.applied_digest_bytes += bytes;
+                counts.applied_digest_updates += updates;
+            }
+        }
     }
 
     // A completed real row decode is selected by its actual request ID.
@@ -540,6 +573,29 @@ async fn run_native_cost_case(audited: bool, local_only: bool) {
         counts.native_canonical_decodes > 0 && counts.native_fallback_decodes == 0,
         "CONFIG_CAPACITY_NATIVE_AUDITED_DECODE_RED: ordinary and audited canonical native entries must decode without a discarded fallback, after exact readback and reopen; counts={counts:?}"
     );
+    for (domain, calls, bytes, updates) in [
+        (
+            "outcome",
+            counts.outcome_digest_calls,
+            counts.outcome_digest_bytes,
+            counts.outcome_digest_updates,
+        ),
+        (
+            "applied",
+            counts.applied_digest_calls,
+            counts.applied_digest_bytes,
+            counts.applied_digest_updates,
+        ),
+    ] {
+        assert!(
+            calls > 0 && bytes > plaintext.len(),
+            "real native {domain} digest"
+        );
+        assert!(
+            updates <= bytes / 4096 + calls,
+            "CONFIG_CAPACITY_COMMAND_DIGEST_DISPATCH_RED: actual {domain} digest must batch numeric JSON SHA updates after exact readback, original-handle recovery and retained reopen; calls={calls} bytes={bytes} updates={updates}"
+        );
+    }
     if audited {
         assert!(
             counts.effect_verifications > 0,
