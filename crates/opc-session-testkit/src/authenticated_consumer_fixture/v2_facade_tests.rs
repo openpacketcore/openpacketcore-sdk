@@ -618,6 +618,61 @@ async fn fixture_v2_facade_reclaim_sweep_retains_recorded_and_unresolved_rows() 
 /// transitions than one #701 V1 journal can ever hold. The recovery journal
 /// stays at one live row throughout, so the V1 absorbing bound no longer
 /// limits one consumer's lifetime.
+#[tokio::test]
+async fn fixture_v2_facade_keeps_the_linearized_history_read_off_the_preparation_path() {
+    let fixture = AuthenticatedPreparedFencedTransitionFixture::start([scope()])
+        .await
+        .expect("start authenticated three-voter fixture");
+    let provider = CountingProvider::new();
+    let facade = fixture
+        .open_local_aead_v2(Arc::clone(&provider), "fixture-v2-history-cache")
+        .await
+        .expect("activate every real voter's /2 lane");
+    let activated = fixture.diagnostics();
+    assert_eq!(
+        activated.fenced_transition_v2_history_state_calls(),
+        1,
+        "activation seeds the active-epoch cache with one linearized read"
+    );
+    for ordinal in 0..4 {
+        let id = request_id(0x4000 + ordinal);
+        let request = create(id, 0x4000 + ordinal, PAYLOAD);
+        let mut prepared = facade
+            .prepare_fenced_transition(request.clone(), budget(soon()))
+            .await
+            .expect("prepare in the cached active epoch");
+        let outcome = prepared
+            .execute_once()
+            .await
+            .expect("the cached active epoch binds on a real voter");
+        assert!(outcome.matches_request(&request));
+        prepared
+            .release_resolved()
+            .await
+            .expect("release the committed row");
+    }
+    let transitions = fixture.diagnostics();
+    assert_eq!(transitions.fenced_transition_v2_calls(), 4);
+    assert_eq!(
+        transitions.fenced_transition_v2_history_state_calls(),
+        activated.fenced_transition_v2_history_state_calls(),
+        "no transition pays a consensus-backed history read"
+    );
+    facade
+        .reclaim_resolved_fenced_transitions(16, budget(soon()))
+        .await
+        .expect("bounded sweep");
+    assert_eq!(
+        fixture
+            .diagnostics()
+            .fenced_transition_v2_history_state_calls(),
+        activated.fenced_transition_v2_history_state_calls() + 1,
+        "the maintenance sweep refreshes the cache with a linearized read"
+    );
+    drop(facade);
+    fixture.shutdown().await.expect("shut down fixture");
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[ignore = "release qualification: 4,097+ real three-voter protected V2 transitions"]
 async fn fixture_v2_facade_sustains_more_transitions_than_one_v1_journal_holds() {

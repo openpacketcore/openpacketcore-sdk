@@ -275,6 +275,7 @@ pub struct AuthenticatedPreparedFencedTransitionFixtureDiagnostics {
     general_compare_and_set_calls: usize,
     fenced_transition_v2_calls: usize,
     fenced_transition_v2_status_calls: usize,
+    fenced_transition_v2_history_state_calls: usize,
 }
 
 /// Fixed, nonidentifying evidence from one ordinary CAS response-loss fault.
@@ -747,6 +748,12 @@ impl AuthenticatedPreparedFencedTransitionFixtureDiagnostics {
     /// listener fleet on the `/2` lane.
     pub const fn fenced_transition_v2_status_calls(self) -> usize {
         self.fenced_transition_v2_status_calls
+    }
+
+    /// Number of linearized V2 history-state reads observed by the real
+    /// listener fleet on the `/2` lane.
+    pub const fn fenced_transition_v2_history_state_calls(self) -> usize {
+        self.fenced_transition_v2_history_state_calls
     }
 }
 
@@ -1646,6 +1653,16 @@ impl AuthenticatedPreparedFencedTransitionFixture {
                         .load(Ordering::SeqCst)
                 })
                 .sum(),
+            fenced_transition_v2_history_state_calls: self
+                .voters
+                .iter()
+                .map(|voter| {
+                    voter
+                        .service
+                        .fenced_transition_v2_history_state_calls
+                        .load(Ordering::SeqCst)
+                })
+                .sum(),
         }
     }
 
@@ -1794,6 +1811,7 @@ struct FixtureConsumer {
     forced_fenced_transition_status_misses: AtomicUsize,
     fenced_transition_v2_calls: AtomicUsize,
     fenced_transition_v2_status_calls: AtomicUsize,
+    fenced_transition_v2_history_state_calls: AtomicUsize,
     ordinary_cas_fault: Arc<FixtureOrdinaryCasFault>,
     voter: usize,
 }
@@ -1817,6 +1835,7 @@ impl FixtureConsumer {
             forced_fenced_transition_status_misses: AtomicUsize::new(0),
             fenced_transition_v2_calls: AtomicUsize::new(0),
             fenced_transition_v2_status_calls: AtomicUsize::new(0),
+            fenced_transition_v2_history_state_calls: AtomicUsize::new(0),
             ordinary_cas_fault,
             voter,
         }
@@ -1923,6 +1942,13 @@ impl SessionQuorumConsumer for FixtureConsumer {
             SessionConsumerV2Operation::FencedTransitionV2Status { .. }
         ) {
             self.fenced_transition_v2_status_calls
+                .fetch_add(1, Ordering::SeqCst);
+        }
+        if matches!(
+            request.operation(),
+            SessionConsumerV2Operation::FencedTransitionV2HistoryState
+        ) {
+            self.fenced_transition_v2_history_state_calls
                 .fetch_add(1, Ordering::SeqCst);
         }
         let response = self.inner.execute_v2(authorization, request).await;
