@@ -846,3 +846,5 @@ async fn checkpointed_intent_cannot_become_rejected_after_committed_suffix_rollb
         progress.completed
     );
 }
+
+mod recipient_online;

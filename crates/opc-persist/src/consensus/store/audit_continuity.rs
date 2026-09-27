@@ -323,6 +323,87 @@ impl ConsensusConfigStore {
             .await
     }
 
+    pub(crate) fn recipient_audit_now(&self) -> i64 {
+        self.inner
+            .clock
+            .now_utc()
+            .as_offset_datetime()
+            .unix_timestamp()
+    }
+
+    // Return the actual independently loaded witness checked against this exact
+    // quorum-current ledger. Verification is read-only: no CAS or maintenance.
+    pub(crate) async fn read_recipient_audit_checkpoint(
+        &self,
+    ) -> Result<(LedgerState, AuditCheckpoint), AuditAuthorityError> {
+        let policy = self
+            .inner
+            .audit_continuity
+            .as_ref()
+            .ok_or(AuditAuthorityError::Unavailable)?;
+        let ledger = self.read_audit_ledger_without_checkpoint().await?;
+        let external =
+            load_external(policy, self.inner.identity, self.inner.operation_timeout).await?;
+        verify_external(&ledger, &policy.keys, external.as_ref())?;
+        let checkpoint = external.ok_or(AuditAuthorityError::Unavailable)?;
+        Ok((ledger, checkpoint))
+    }
+
+    /// Begin an online export verifier owned by the authenticated transport's
+    /// authority-side session. The recipient needs no audit signing material.
+    /// The application supplies independent caller authentication and export
+    /// authorization; a caller claim decoded from `request` does not suffice.
+    ///
+    /// Uses the existing export permit, bounds and fixed expiry. Drop the session
+    /// on disconnect/cancellation. Verification cannot acknowledge or prune;
+    /// only a separate authorized action may use the authority-local completion.
+    pub async fn begin_recipient_audit_export(
+        &self,
+        recipient: AuditCaller,
+        expected_floor: u64,
+        lifetime: Duration,
+        request: &AuditRecipientVerificationRequest,
+    ) -> Result<AuditRecipientExportSession, AuditAuthorityError> {
+        request.check(self.inner.identity, recipient)?;
+        if lifetime.subsec_nanos() != 0 || !(1..=3600).contains(&lifetime.as_secs()) {
+            return Err(AuditAuthorityError::InvalidInput);
+        }
+        let policy = self
+            .inner
+            .audit_continuity
+            .as_ref()
+            .ok_or(AuditAuthorityError::Unavailable)?;
+        let permit = policy
+            .exports
+            .clone()
+            .try_acquire_owned()
+            .map_err(|_| AuditAuthorityError::Full)?;
+        let (ledger, checkpoint) = self.read_recipient_audit_checkpoint().await?;
+        if expected_floor < ledger.floor {
+            return Err(AuditAuthorityError::Pruned);
+        }
+        if expected_floor > ledger.floor {
+            return Err(AuditAuthorityError::InvalidInput);
+        }
+        let now = self.recipient_audit_now();
+        let export = AuditExportSession::freeze(
+            &ledger,
+            policy.keys.clone(),
+            recipient,
+            now,
+            lifetime.as_secs(),
+            permit,
+        )?;
+        AuditRecipientExportSession::new(
+            self.clone(),
+            export,
+            policy.keys.clone(),
+            checkpoint,
+            request.clone(),
+            now,
+        )
+    }
+
     /// Freeze exactly the complete currently retained range for an authorized
     /// recipient. An older expected floor returns `Pruned`; a future floor is
     /// invalid. The SDK never silently advances an old export request.
