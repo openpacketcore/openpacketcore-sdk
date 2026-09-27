@@ -1,10 +1,11 @@
 # Configuration preparation ownership
 
-The larger configuration profile remains unavailable. Its proposed logical
-limit and complete qualification are tracked in #957 and the draft bounded
-configuration RFC. Preparation ownership alone does not enable that profile,
-increase the existing 1 MiB complete-command admission fence, or establish the
-proposed per-operation and aggregate memory limits.
+This implementation provides the explicitly selected `ConfigCapacityProfile::BoundedV1`
+with a 1,572,864-byte logical configuration limit. Complete qualification remains
+tracked in #957 and the draft bounded configuration RFC. Legacy stores keep their
+existing 1 MiB complete-command admission fence. Preparation ownership alone does
+not select a profile or establish the proposed per-operation and aggregate memory
+limits; the complete larger-profile acceptance matrix remains open.
 
 `ConfigPreparationPool::bounded_v1()` provides eight nonwaiting preparation
 slots. A store keeps its own pool private. A reservation from another pool has
@@ -49,15 +50,15 @@ slot. A later resource rejection cannot erase an earlier uncertain outcome.
 Generic `PreparedAuditedMutation::decode` does not create a reservation.
 `ConsensusConfigStore::decode_prepared_audited_mutation` reserves first and
 authenticates the original handle and effect. It grants no audit receipt or
-caller identity. Bounded append decoding remains refused until retained size
-proofs can authenticate the original logical and replay lengths. Backend reads
-also check the immutable local profile and refuse to treat unsupported bounded
-history as legacy history.
+caller identity. Bounded append decoding requires an authenticated size proof
+for the original logical and replay lengths before attaching local preparation
+ownership. Backend reads check the immutable local profile and authenticate
+retained proofs; they do not interpret bounded history as legacy history.
 
 Remaining qualification includes complete allocation lifetimes and capacities,
 forwarded cancellation and receiver exhaustion, stopped-node release, maximum
-membership fan-out, retained size proofs, snapshot transfer/restore, and the
-full larger-configuration acceptance matrix. The component fixtures and native
+membership fan-out, combined retained recovery, snapshot transfer/restore, and
+the full larger-configuration acceptance matrix. The component fixtures and native
 singleton control do not establish those results.
 
 Refs #957.

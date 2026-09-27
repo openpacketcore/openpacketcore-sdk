@@ -44,6 +44,9 @@ pub(crate) mod observation {
         pub(crate) applied_digest_calls: usize,
         pub(crate) applied_digest_bytes: usize,
         pub(crate) applied_digest_updates: usize,
+        pub(crate) shared_digest_intent_calls: usize,
+        pub(crate) shared_digest_intent_bytes: usize,
+        pub(crate) shared_digest_intent_writes: usize,
         pub(crate) effect_verifications: usize,
         pub(crate) effect_serializations: usize,
         pub(crate) effect_encoded_bytes: usize,
@@ -241,6 +244,26 @@ pub(crate) mod observation {
                 counts.applied_digest_bytes += bytes;
                 counts.applied_digest_updates += updates;
             }
+        }
+    }
+
+    // Count bytes actually dispatched by the shared intent writer. This reports
+    // only a completed pair of transcripts and retains no command or store.
+    pub(crate) fn shared_digest_intent(
+        request_id: ConsensusRequestId,
+        bytes: usize,
+        writes: usize,
+    ) {
+        let counts = OBSERVERS
+            .lock()
+            .expect("cost observer registry")
+            .get(&request_id)
+            .and_then(Weak::upgrade);
+        if let Some(counts) = counts {
+            let mut counts = counts.lock().expect("cost counters");
+            counts.shared_digest_intent_calls += 1;
+            counts.shared_digest_intent_bytes += bytes;
+            counts.shared_digest_intent_writes += writes;
         }
     }
 
@@ -682,6 +705,16 @@ async fn run_native_cost_case(audited: bool, local_only: bool) {
             "CONFIG_CAPACITY_COMMAND_DIGEST_DISPATCH_RED: actual {domain} digest must batch numeric JSON SHA updates after exact readback, original-handle recovery and retained reopen; calls={calls} bytes={bytes} updates={updates}"
         );
     }
+    assert_eq!(
+        counts.shared_digest_intent_calls, counts.applied_digest_calls,
+        "CONFIG_CAPACITY_NATIVE_JOINT_DIGEST_RED: every actual applied digest must share its intent encoding with its outcome digest, after authenticated readback, recovery and reopen; counts={counts:?}"
+    );
+    assert!(
+        counts.shared_digest_intent_bytes > plaintext.len()
+            && counts.shared_digest_intent_writes > 0
+            && counts.shared_digest_intent_writes < counts.shared_digest_intent_bytes / 64,
+        "CONFIG_CAPACITY_NATIVE_JOINT_DIGEST_RED: real bounded shared writes must be observed; counts={counts:?}"
+    );
     if audited {
         assert!(
             counts.effect_verifications > 0,

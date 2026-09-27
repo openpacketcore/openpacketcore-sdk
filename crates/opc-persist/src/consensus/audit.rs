@@ -193,6 +193,8 @@ fn read_verified_sync(conn: &Connection, key: &AuditKey) -> io::Result<StoredLed
     stream_state(&stored, key, length, None)?
         .verify_slice(mac)
         .map_err(|_| invalid())?;
+    #[cfg(all(test, target_os = "linux"))]
+    super::audit_targets::history_gate_tests::row_authenticated();
     // Canonical authentication is complete. End the immutable row borrow and
     // finalize its statement before validation derives operations. The caller's
     // connection/transaction still owns the complete read and identity check.

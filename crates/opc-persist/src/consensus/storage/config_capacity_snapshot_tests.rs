@@ -1,6 +1,9 @@
 //! Real native Durable storage and snapshot-format controls. Direct file
 //! transfer here does not qualify authenticated multi-node transport.
 
+#[path = "config_capacity_snapshot_custody_tests.rs"]
+pub(super) mod custody;
+
 #[path = "config_capacity_snapshot_frontier_tests.rs"]
 mod frontier;
 

@@ -996,6 +996,21 @@ pub(in crate::consensus) async fn prepared_for_store(
     )
 }
 
+// Real bounded encryption with independently supplied identity/key and size.
+#[cfg(target_os = "linux")]
+pub(in crate::consensus) async fn prepared_for_history_gate(
+    pool: &ConfigPreparationPool,
+    identity: ConfigConsensusIdentity,
+    key: &AuditKey,
+    plaintext: &[u8],
+) -> PreparedTargetMutation {
+    signed_for(
+        payload_for(pool, plaintext, identity, key).await,
+        identity,
+        key,
+    )
+}
+
 #[path = "joint_target_submission_tests.rs"]
 mod submission;
 

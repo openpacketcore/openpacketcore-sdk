@@ -122,6 +122,8 @@ impl PreparedTargetMutation {
         );
         // The caller may inspect an original or validate its outcome, but must
         // acquire its destination reservation before decoding for new work.
+        #[cfg(all(test, target_os = "linux"))]
+        crate::consensus::audit_targets::history_gate_tests::recovered(original);
         Ok(prepared)
     }
 }

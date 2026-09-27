@@ -133,9 +133,9 @@ fn config_capacity_957_streamed_digests_match_original_canonical_json() {
             serde_json::to_vec(&(semantic_revision, command.identity, &command.intent))
                 .expect("original payload JSON"),
         );
-        let expected: [u8; 32] = old_payload.finalize().into();
+        let expected_payload: [u8; 32] = old_payload.finalize().into();
         assert!(
-            command.payload_digest().expect("streamed payload") == expected,
+            command.payload_digest().expect("streamed payload") == expected_payload,
             "outcome digest compatibility"
         );
 
@@ -156,6 +156,18 @@ fn config_capacity_957_streamed_digests_match_original_canonical_json() {
                 .as_bytes()
                 == &expected,
             "applied-chain digest compatibility"
+        );
+        let (paired_payload, paired_applied) = command
+            .payload_and_applied_digests(sequence, previous, effective_time)
+            .expect("paired calculators at original timestamp/sequence limits");
+        assert_eq!(
+            paired_payload, expected_payload,
+            "paired outcome compatibility"
+        );
+        assert_eq!(
+            paired_applied.as_bytes(),
+            &expected,
+            "paired applied compatibility"
         );
     }
 }

@@ -74,6 +74,10 @@ const TARGET_DOMAIN: &[u8] = b"openpacketcore/config-netconf/target/v1\0";
 const LIFECYCLE_DOMAIN: &[u8] = b"openpacketcore/config-netconf/lifecycle/v1\0";
 const STATE_DOMAIN: &[u8] = b"openpacketcore/config-netconf/state-digest/v1\0";
 
+#[cfg(all(test, target_os = "linux"))]
+#[path = "tests/joint_native_history_gate.rs"]
+pub(in crate::consensus) mod history_gate_tests;
+
 const SCHEMA: &str = r#"
 CREATE TABLE config_netconf_profile (
     singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
@@ -679,7 +683,7 @@ impl TargetState {
     }
 
     fn validate_anchor(&self, ledger: Option<&LedgerState>) -> io::Result<()> {
-        match (
+        let result = match (
             &self.profile.activation_operation,
             ledger.and_then(|l| l.target_anchor),
         ) {
@@ -693,7 +697,12 @@ impl TargetState {
                 Ok(())
             }
             _ => Err(invalid()),
+        };
+        #[cfg(all(test, target_os = "linux"))]
+        if result.is_ok() {
+            history_gate_tests::anchor_validated();
         }
+        result
     }
 
     fn write(
@@ -783,6 +792,34 @@ pub(super) fn validate_running_only_sync(
     cancellation: &SqliteWorkCancellation,
 ) -> io::Result<()> {
     let state = read_state_sync(conn, key, identity, cancellation)?;
+    validate_running_state(&state)?;
+    let ledger = super::audit::read_sync(conn, key, identity)?;
+    validate_running_ledger(ledger.as_ref(), key, identity, cancellation)
+}
+
+/// Validate the adjacent Running history gates in one pinned SQL transaction.
+/// The caller selects NetconfRunningV1 independently. Both checks use the same
+/// connection, key and identity without writes or transaction release between
+/// them. No authenticated value or authority escapes this invocation.
+pub(super) fn validate_running_history_sync(
+    conn: &Connection,
+    key: &AuditKey,
+    identity: ConfigConsensusIdentity,
+    cancellation: &SqliteWorkCancellation,
+) -> io::Result<()> {
+    if conn.is_autocommit() {
+        return Err(invalid());
+    }
+    let state = read_state_sync(conn, key, identity, cancellation)?;
+    let ledger = super::audit::read_sync(conn, key, identity)?;
+    state.validate_anchor(ledger.as_ref())?;
+    // Preserve the cancellation boundary formerly reached by the second read.
+    cancellation.check_io()?;
+    validate_running_state(&state)?;
+    validate_running_ledger(ledger.as_ref(), key, identity, cancellation)
+}
+
+fn validate_running_state(state: &TargetState) -> io::Result<()> {
     if state
         .targets
         .iter()
@@ -796,7 +833,16 @@ pub(super) fn validate_running_only_sync(
     {
         return Err(invalid());
     }
-    if let Some(ledger) = super::audit::read_sync(conn, key, identity)? {
+    Ok(())
+}
+
+fn validate_running_ledger(
+    ledger: Option<&LedgerState>,
+    key: &AuditKey,
+    identity: ConfigConsensusIdentity,
+    cancellation: &SqliteWorkCancellation,
+) -> io::Result<()> {
+    if let Some(ledger) = ledger {
         for entry in &ledger.entries {
             cancellation.check_io()?;
             use crate::audit_authority::ledger::EntryPayload;

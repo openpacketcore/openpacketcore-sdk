@@ -75,6 +75,8 @@ struct StagingArtifact {
     path: PathBuf,
     sqlite_sidecars: bool,
     armed: bool,
+    // Descriptor-relative cleanup must keep its directory open through Drop.
+    _directory_guard: Option<Arc<std::fs::File>>,
 }
 
 impl StagingArtifact {
@@ -83,6 +85,7 @@ impl StagingArtifact {
             path,
             sqlite_sidecars: false,
             armed: true,
+            _directory_guard: None,
         }
     }
 
@@ -91,7 +94,12 @@ impl StagingArtifact {
             path,
             sqlite_sidecars: true,
             armed: true,
+            _directory_guard: None,
         }
+    }
+
+    fn retain_directory(&mut self, directory: Arc<std::fs::File>) {
+        self._directory_guard = Some(directory);
     }
 
     fn replace_path(&mut self, path: PathBuf) {
@@ -1486,6 +1494,7 @@ impl RaftStateMachine<ConfigRaftTypeConfig> for SqliteConfigStateMachine {
                     error,
                 )
             })?;
+            final_cleanup.retain_directory(self.core._snapshot_dir_guard.clone());
             let identity = self.core.identity;
             let members = self.core.expected_members.clone();
             let audit_key = self.core.audit_key.clone();
@@ -1494,9 +1503,19 @@ impl RaftStateMachine<ConfigRaftTypeConfig> for SqliteConfigStateMachine {
             let meta_for_install = meta.clone();
             let file_name_for_install = file_name.clone();
             let progress = self.core.durable_progress.clone();
+            #[cfg(all(test, target_os = "linux"))]
+            let custody =
+                config_capacity_snapshot_tests::custody::observer(&self.core.snapshot_binding_path);
             let previous = self
                 .core
                 .run_sqlite_cancellable_until(deadline, move |conn, cancellation| {
+                    #[cfg(all(test, target_os = "linux"))]
+                    config_capacity_snapshot_tests::custody::checkpoint(
+                        &custody,
+                        config_capacity_snapshot_tests::custody::Phase::BeforeWrite,
+                        &file_name_for_install,
+                        cancellation,
+                    )?;
                     let previous =
                         sqlite::read_current_snapshot_sync(conn, identity, &members, mode)?;
                     let committed = sqlite::install_snapshot_database_cancellable_sync(
@@ -1510,6 +1529,16 @@ impl RaftStateMachine<ConfigRaftTypeConfig> for SqliteConfigStateMachine {
                         &file_name_for_install,
                         checksum,
                         total_length,
+                        cancellation,
+                    )?;
+                    // Cleanup follows this worker's commit decision even if its
+                    // awaiting task is cancelled before the worker returns.
+                    final_cleanup.disarm();
+                    #[cfg(all(test, target_os = "linux"))]
+                    config_capacity_snapshot_tests::custody::checkpoint(
+                        &custody,
+                        config_capacity_snapshot_tests::custody::Phase::AfterCommit,
+                        &file_name_for_install,
                         cancellation,
                     )?;
                     // Installation may advance the durable commit floor, or
@@ -1526,7 +1555,6 @@ impl RaftStateMachine<ConfigRaftTypeConfig> for SqliteConfigStateMachine {
                         error,
                     )
                 })?;
-            final_cleanup.disarm();
             let _ = tokio::time::timeout_at(
                 deadline,
                 remove_old_snapshot(&self.core.snapshot_dir, previous, &file_name),
@@ -1689,6 +1717,7 @@ impl RaftSnapshotBuilder<ConfigRaftTypeConfig> for SqliteConfigSnapshotBuilder {
             storage_error(ErrorSubject::Snapshot(None), ErrorVerb::Write, error)
         })?;
         final_cleanup.replace_path(final_path.clone());
+        final_cleanup.retain_directory(self.core._snapshot_dir_guard.clone());
         tokio::time::timeout_at(deadline, sync_directory(&self.core.snapshot_dir))
             .await
             .map_err(|_| {
@@ -1728,9 +1757,19 @@ impl RaftSnapshotBuilder<ConfigRaftTypeConfig> for SqliteConfigSnapshotBuilder {
         let members = self.core.expected_members.clone();
         let meta_for_save = meta.clone();
         let file_name_for_save = file_name.clone();
+        #[cfg(all(test, target_os = "linux"))]
+        let custody =
+            config_capacity_snapshot_tests::custody::observer(&self.core.snapshot_binding_path);
         let previous = self
             .core
             .run_sqlite_cancellable_until(deadline, move |conn, cancellation| {
+                #[cfg(all(test, target_os = "linux"))]
+                config_capacity_snapshot_tests::custody::checkpoint(
+                    &custody,
+                    config_capacity_snapshot_tests::custody::Phase::BeforeWrite,
+                    &file_name_for_save,
+                    cancellation,
+                )?;
                 cancellation.check_io()?;
                 let previous = sqlite::read_current_snapshot_sync(conn, identity, &members, mode)?;
                 sqlite::save_current_snapshot_sync(
@@ -1742,6 +1781,16 @@ impl RaftSnapshotBuilder<ConfigRaftTypeConfig> for SqliteConfigSnapshotBuilder {
                     checksum,
                     length,
                 )?;
+                // Cleanup follows this worker's commit decision even if its
+                // awaiting task is cancelled before the worker returns.
+                final_cleanup.disarm();
+                #[cfg(all(test, target_os = "linux"))]
+                config_capacity_snapshot_tests::custody::checkpoint(
+                    &custody,
+                    config_capacity_snapshot_tests::custody::Phase::AfterCommit,
+                    &file_name_for_save,
+                    cancellation,
+                )?;
                 Ok(previous)
             })
             .await
@@ -1752,7 +1801,6 @@ impl RaftSnapshotBuilder<ConfigRaftTypeConfig> for SqliteConfigSnapshotBuilder {
                     error,
                 )
             })?;
-        final_cleanup.disarm();
         let _ = tokio::time::timeout_at(
             deadline,
             remove_old_snapshot(&self.core.snapshot_dir, previous, &file_name),

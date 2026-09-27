@@ -437,9 +437,10 @@ and storage revision checks and the original limits, deadlines and WAL durabilit
 The experimental `NetconfRunningV1` selection adds command/wire10 and
 storage/snapshot8 for ordinary Running replacement with mandatory audit. It
 performs no migration and does not enable the complete target+bounded profile.
-Its implementation and focused detectors are present; native maximum-size
-execution and combined capacity qualification remain open. Revision recognition
-alone is not evidence of a qualified runtime capability.
+Its five focused native cases include maximum-size application and retained
+recovery under the existing operation deadline. Full combined capacity
+qualification remains open. Revision recognition alone is not evidence of a
+qualified runtime capability.
 
 
 The target extension proposes config command/wire revision **9** and
@@ -929,7 +930,17 @@ obligations needed for ordinary Running replacement; it refuses unsupported
 target actions and pending-confirmation resolution. Bounded ledger-original
 decoding and retained reopen/snapshot admission use the same selected mode.
 
-End-to-end maximum-size native execution, causal removal controls on the combined
-tree and full capacity qualification remain required. Native WAL and explicit
+For Running history validation inside a pinned SQL transaction, the adjacent
+anchor and Running-only gates share one authenticated state and ledger read.
+They retain independent profile selection, anchor and cancellation checks,
+closed-state restrictions, and complete retained-operation validation. No
+authenticated value escapes the invocation; autocommit and other profiles keep
+their existing validation path.
+
+The five focused native cases pass, including maximum-size application at the
+existing deadline. Removing authority selection or native profile opening fails
+the native detector; removing the bounded reducer fails earlier during genuine
+preparation. Separate controls require history-read reuse and anchor rejection.
+Full combined capacity qualification remains required. Native WAL and explicit
 Durable/Async behavior are unchanged. Do not infer completion of #957 or #958
-from payload decoding, isolated component tests or revision sizing.
+from these focused checks or revision sizing.

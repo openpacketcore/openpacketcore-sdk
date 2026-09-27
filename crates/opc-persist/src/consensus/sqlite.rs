@@ -242,6 +242,14 @@ impl SqliteWorkCancellation {
         Self::new()
     }
 
+    #[cfg(all(test, target_os = "linux"))]
+    pub(super) fn cancel_for_history_gate_test(&self) {
+        assert!(
+            self.cancel_before_commit(),
+            "history gate has no commit authority"
+        );
+    }
+
     #[cfg(test)]
     pub(crate) fn new_for_capacity_observation() -> Self {
         Self::new()
@@ -3716,16 +3724,16 @@ pub(crate) fn apply_entries_cancellable_sync(
                     .map_err(|_| invalid_data("invalid committed config consensus command"))?;
                 #[cfg(test)]
                 super::storage::config_capacity_apply_observations::observe("command_validated");
-                let payload_digest = command
-                    .payload_digest()
-                    .map_err(|_| invalid_data("config consensus payload digest failed"))?;
-                #[cfg(test)]
-                super::storage::config_capacity_apply_observations::observe(
-                    "payload_digest_computed",
-                );
                 if let Some((stored_digest, stored_response)) =
                     read_outcome_sync(&tx, identity, audit_key, mode, command.request_id)?
                 {
+                    let payload_digest = command
+                        .payload_digest()
+                        .map_err(|_| invalid_data("config consensus payload digest failed"))?;
+                    #[cfg(test)]
+                    super::storage::config_capacity_apply_observations::observe(
+                        "payload_digest_computed",
+                    );
                     if payload_digest != stored_digest {
                         ConfigConsensusResponse {
                             result: Err(ConfigMutationFailure::RequestIdCollision),
@@ -3746,13 +3754,18 @@ pub(crate) fn apply_entries_cancellable_sync(
                     let logical_time = machine
                         .2
                         .map_or(command.logical_time, |last| last.max(command.logical_time));
-                    let digest = command
-                        .calculate_applied_digest(sequence, machine.1, logical_time)
-                        .map_err(|_| invalid_data("config consensus applied digest failed"))?;
+                    let (payload_digest, digest) = command
+                        .payload_and_applied_digests(sequence, machine.1, logical_time)
+                        .map_err(|_| invalid_data("config consensus command digests failed"))?;
                     #[cfg(test)]
-                    super::storage::config_capacity_apply_observations::observe(
-                        "applied_digest_computed",
-                    );
+                    {
+                        super::storage::config_capacity_apply_observations::observe(
+                            "payload_digest_computed",
+                        );
+                        super::storage::config_capacity_apply_observations::observe(
+                            "applied_digest_computed",
+                        );
+                    }
                     tx.execute_batch("SAVEPOINT config_history_command")
                         .map_err(db_error)?;
                     let updates_existing_records = match &command.intent {

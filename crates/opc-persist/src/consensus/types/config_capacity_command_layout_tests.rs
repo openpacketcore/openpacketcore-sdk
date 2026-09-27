@@ -117,10 +117,9 @@ fn config_capacity_957_boxed_management_preserves_original_encoding_and_digests(
 
         let mut expected_payload = Sha256::new();
         expected_payload.update(b"openpacketcore/config-consensus/outcome/v1\0");
-        expected_payload.update(
-            serde_json::to_vec(&(revision, identity, &legacy.intent))
-                .expect("original payload digest transcript"),
-        );
+        let expected_outcome_bytes = serde_json::to_vec(&(revision, identity, &legacy.intent))
+            .expect("original payload digest transcript");
+        expected_payload.update(&expected_outcome_bytes);
         let expected_payload: [u8; 32] = expected_payload.finalize().into();
         assert_eq!(
             command.payload_digest().expect("payload digest"),
@@ -130,15 +129,43 @@ fn config_capacity_957_boxed_management_preserves_original_encoding_and_digests(
         let previous = ConfigConsensusEntryDigest::from_bytes([0x76; 32]);
         let mut expected_applied = Sha256::new();
         expected_applied.update(b"openpacketcore/config-consensus/command/v1\0");
-        expected_applied.update(
-            serde_json::to_vec(&(7_u64, previous, logical_time, &legacy))
-                .expect("original applied digest transcript"),
-        );
+        let expected_applied_bytes = serde_json::to_vec(&(7_u64, previous, logical_time, &legacy))
+            .expect("original applied digest transcript");
+        expected_applied.update(&expected_applied_bytes);
+        let expected_applied =
+            ConfigConsensusEntryDigest::from_bytes(expected_applied.finalize().into());
         assert_eq!(
             command
                 .calculate_applied_digest(7, previous, logical_time)
                 .expect("applied digest"),
-            ConfigConsensusEntryDigest::from_bytes(expected_applied.finalize().into())
+            expected_applied
+        );
+        let mut outcome_bytes = Vec::new();
+        let mut applied_bytes = Vec::new();
+        config_capacity_joint_digest::write_transcripts(
+            &command,
+            7,
+            previous,
+            logical_time,
+            &mut outcome_bytes,
+            &mut applied_bytes,
+        )
+        .expect("paired management streams");
+        assert_eq!(
+            outcome_bytes, expected_outcome_bytes,
+            "original management outcome bytes at revision {revision}"
+        );
+        assert_eq!(
+            applied_bytes, expected_applied_bytes,
+            "original management applied bytes at revision {revision}"
+        );
+        let pair = command
+            .payload_and_applied_digests(7, previous, logical_time)
+            .expect("paired management calculators");
+        assert_eq!(
+            pair,
+            (expected_payload, expected_applied),
+            "original management hash domains at revision {revision}"
         );
     }
 }
