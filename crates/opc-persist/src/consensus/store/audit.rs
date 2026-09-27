@@ -222,8 +222,8 @@ impl ConsensusConfigStore {
     /// Reserves before owned decoding, then authenticates the unchanged handle
     /// and effect. This grants neither an Intent receipt nor caller authority.
     /// A bounded append additionally authenticates its exact record size proof
-    /// before attaching local preparation ownership. The larger store profile
-    /// remains unavailable until retained storage qualification is complete.
+    /// before attaching local preparation ownership. Bounded stores require
+    /// explicit profile selection; complete capacity qualification remains open.
     pub fn decode_prepared_audited_mutation(
         &self,
         bytes: &[u8],

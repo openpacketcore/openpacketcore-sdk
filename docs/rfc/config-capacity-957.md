@@ -423,7 +423,8 @@ no package version upgrade or transport-budget expansion.
 Prepare the original-behavior detector and bounded implementation design while
 these decisions are reviewed. Before delivering a wider admission fence,
 complete the approved plaintext/sealed admission and resource contract, qualify
-every row, and integrate against current main. The existing 1 MiB command fence
-remains in place in this contract slice. Follow-up
-assessments of #724 and #683 begin only after #957 has complete evidence;
+every row, and integrate against current main. The implementation branch now
+provides explicit `BoundedV1` selection; legacy stores retain the existing
+1 MiB command fence. Implementation availability does not establish that this
+acceptance matrix is complete or supply RFC approval. Follow-up assessments of #724 and #683 begin only after #957 has complete evidence;
 those assessments do not authorize their implementations.
