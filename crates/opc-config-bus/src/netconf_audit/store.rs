@@ -15,6 +15,10 @@ use opc_types::TenantId;
 
 use crate::StoreError;
 
+#[cfg(test)]
+#[path = "retirement_reply_observation.rs"]
+mod retirement_reply_observation;
+
 /// A concrete SDK authority for the retained NETCONF profile.
 ///
 /// Construction checks the original store worker and already established device
@@ -34,6 +38,8 @@ struct Authority {
     privacy: Arc<dyn AuditPrivacyProjection>,
     lifetime: Duration,
     device: NetconfDeviceOwner,
+    #[cfg(test)]
+    retirement_reply: retirement_reply_observation::ReplySlot,
 }
 
 impl NetconfAuditStore {
@@ -62,6 +68,8 @@ impl NetconfAuditStore {
                 privacy,
                 lifetime,
                 device,
+                #[cfg(test)]
+                retirement_reply: retirement_reply_observation::ReplySlot::default(),
             }),
             provider: None,
         })
@@ -146,8 +154,134 @@ impl NetconfAuditStore {
                 &event,
                 self.inner.lifetime,
             )
-            .await?;
-        Ok(self.original_target(prepared, caller, None))
+            .await;
+        let prepared = match prepared {
+            Ok(prepared) => prepared,
+            Err(error) => self
+                .inner
+                .store
+                .retained_netconf_session_cleanup(
+                    session,
+                    caller,
+                    self.inner.privacy.as_ref(),
+                    &event,
+                )?
+                .ok_or(error)?,
+        };
+        let mut original = self.original_target(prepared, caller, None);
+        // Only this closed SDK preparation may resume cleanup after transport
+        // loss. A recovered payload or another generic target is insufficient.
+        original.cleanup = true;
+        Ok(original)
+    }
+
+    pub(super) async fn retire_cleanup(
+        &self,
+        session: &NetconfSessionOwner,
+        principal: &TrustedPrincipal,
+        attempt: &mut TargetAttempt,
+    ) -> TargetReply {
+        let caller = match self.caller(principal) {
+            Ok(caller)
+                if caller == attempt.caller && self.owns_original(attempt) && attempt.cleanup =>
+            {
+                caller
+            }
+            _ => return TargetReply::Refused(AuditAuthorityError::BindingMismatch),
+        };
+        if attempt.known.is_some() {
+            return self.complete_known(attempt).await;
+        }
+        let Some(prepared) = attempt.prepared.as_ref() else {
+            return TargetReply::Unknown;
+        };
+        // Retain the exact original through this await. A lost retirement reply
+        // is not a rejection and cannot authorize a successor. The SDK serializes
+        // this no-effect decision against any in-flight original Admit/Apply.
+        let was_pending = attempt.cleanup_retirement_pending;
+        attempt.cleanup_retirement_pending = true;
+        match self
+            .inner
+            .store
+            .retire_netconf_session_cleanup_local(session, prepared, caller)
+            .await
+        {
+            AuditAdmission::Applied(receipt)
+                if {
+                    #[cfg(test)]
+                    self.inner
+                        .retirement_reply
+                        .hold(prepared.handle(), &receipt)
+                        .await;
+                    attempt.accept_known(&receipt)
+                } =>
+            {
+                attempt.admission_refusal = None;
+                self.complete_known(attempt).await
+            }
+            AuditAdmission::Rejected(error) => {
+                // This refusal says nothing about an older cancelled/Unknown
+                // retirement. It cannot restore definite non-admission then.
+                attempt.cleanup_retirement_pending = was_pending;
+                if was_pending {
+                    TargetReply::Unknown
+                } else {
+                    TargetReply::Refused(error)
+                }
+            }
+            _ => TargetReply::Unknown,
+        }
+    }
+
+    pub(super) async fn prepare_cleanup_successor(
+        &self,
+        session: &NetconfSessionOwner,
+        principal: &TrustedPrincipal,
+        previous: &TargetAttempt,
+        event: &AuditEvent,
+    ) -> Result<TargetAttempt, AuditAuthorityError> {
+        let caller = self.caller(principal)?;
+        if caller != previous.caller
+            || !self.owns_original(previous)
+            || !previous.rejected_cleanup_settled()
+        {
+            return Err(AuditAuthorityError::BindingMismatch);
+        }
+        let prepared = previous
+            .prepared
+            .as_ref()
+            .ok_or(AuditAuthorityError::BindingMismatch)?;
+        let event =
+            super::event::convert_event(event).map_err(|_| AuditAuthorityError::BindingMismatch)?;
+        let next = self
+            .inner
+            .store
+            .prepare_netconf_session_cleanup_after_retirement(
+                session,
+                prepared,
+                self.inner.privacy.as_ref(),
+                &event,
+            )
+            .await;
+        let next = match next {
+            Ok(next) => next,
+            Err(error) => self
+                .inner
+                .store
+                .retained_netconf_session_cleanup(
+                    session,
+                    caller,
+                    self.inner.privacy.as_ref(),
+                    &event,
+                )?
+                .ok_or(error)?,
+        };
+        if next.handle() == previous.handle() {
+            return Err(AuditAuthorityError::BindingMismatch);
+        }
+        let mut next = self.original_target(next, caller, None);
+        next.cleanup = true;
+        Ok(next)
     }
 
     pub(super) async fn freeze_running(
@@ -352,7 +486,9 @@ impl NetconfAuditStore {
             lock: None,
             lock_ready: false,
             running_owner: None,
-            acknowledged_running_intent: None,
+            acknowledged_intent: None,
+            cleanup: false,
+            cleanup_retirement_pending: false,
             published_commit: None,
         }
     }
@@ -387,12 +523,23 @@ impl NetconfAuditStore {
 
     /// The caller retains `attempt` in the bounded worker registry before this
     /// first await. A cancelled RPC receiver never owns this future. Re-entering
-    /// after worker recovery performs only lookup/completion of the original.
+    /// after uncertainty performs only lookup/known completion. A retained real
+    /// acknowledgement permits original submission; a definite cleanup refusal
+    /// permits retrying only that same preparation on a later bounded pass.
     pub(super) async fn execute_target(&self, attempt: &mut TargetAttempt) -> TargetReply {
         if !Arc::ptr_eq(&self.inner, &attempt.authority) {
             return TargetReply::Refused(AuditAuthorityError::BindingMismatch);
         }
-        if attempt.started {
+        // A definite refusal permits another bounded pass over the same cleanup
+        // original. Unknown admission and acknowledged work never take this
+        // route. The SDK rechecks state and the unchanged handle/expiry; stale
+        // cleanup still requires a separately authorized SDK successor.
+        let retry_cleanup = attempt.cleanup
+            && !attempt.cleanup_retirement_pending
+            && attempt.admission_refusal.is_some()
+            && attempt.acknowledged_intent.is_none()
+            && attempt.known.is_none();
+        if attempt.started && !retry_cleanup {
             return self.recover_target(attempt).await;
         }
         let Some(prepared) = attempt.prepared.as_ref() else {
@@ -406,6 +553,7 @@ impl NetconfAuditStore {
             attempt.admission_refusal = Some(AuditAuthorityError::BindingMismatch);
             return TargetReply::Refused(AuditAuthorityError::BindingMismatch);
         }
+        attempt.admission_refusal = None;
         attempt.started = true;
         let admission = match &attempt.running_owner {
             Some(session) => {
@@ -424,7 +572,9 @@ impl NetconfAuditStore {
         let admitted = match admission {
             AuditAdmission::Rejected(error) => {
                 attempt.admission_refusal = Some(error);
-                attempt.prepared = None;
+                if !attempt.cleanup {
+                    attempt.prepared = None;
+                }
                 return TargetReply::Refused(error);
             }
             AuditAdmission::Unknown(_) => return TargetReply::Unknown,
@@ -439,11 +589,12 @@ impl NetconfAuditStore {
             | AuditOperationState::Rejected => {}
             _ => return TargetReply::Unknown,
         }
-        if attempt.running_owner.is_some() {
+        if attempt.running_owner.is_some() || attempt.cleanup {
             // Preserve the SDK-authenticated acknowledgement, not a caller claim
-            // or an indeterminate Intent lookup. This admitted original may
-            // finish after transport revocation, with its unchanged lifetime.
-            attempt.acknowledged_running_intent = Some(admitted.clone());
+            // or an indeterminate Intent lookup. Running and closed EndSession
+            // obligations may finish after revocation under their fixed original.
+            // Other generic targets retain their existing revocation policy.
+            attempt.acknowledged_intent = Some(admitted.clone());
         }
         if attempt.running_owner.is_none()
             && attempt
@@ -478,12 +629,16 @@ impl NetconfAuditStore {
         if !Arc::ptr_eq(&self.inner, &attempt.authority) {
             return TargetReply::Refused(AuditAuthorityError::BindingMismatch);
         }
-        if let Some(refusal) = attempt.admission_refusal {
-            return TargetReply::Refused(refusal);
-        }
-        // Once authenticated, the result precedes every fallible current read.
+        // Once authenticated, the result also precedes an older no-effect
+        // refusal retained before a cancelled retirement was recovered.
         if attempt.known.is_some() {
             return self.complete_known(attempt).await;
+        }
+        if let Some(refusal) = attempt
+            .admission_refusal
+            .filter(|_| !attempt.cleanup_retirement_pending)
+        {
+            return TargetReply::Refused(refusal);
         }
         if !attempt.started {
             return TargetReply::Refused(AuditAuthorityError::BindingMismatch);
@@ -491,7 +646,7 @@ impl NetconfAuditStore {
         let Some(prepared) = attempt.prepared.as_ref() else {
             return TargetReply::Unknown;
         };
-        if let Some(admitted) = attempt.acknowledged_running_intent.as_ref() {
+        if let Some(admitted) = attempt.acknowledged_intent.as_ref() {
             match self
                 .inner
                 .store
@@ -609,7 +764,12 @@ pub(super) struct TargetAttempt {
     // An SDK owner clone observes transport invalidation; it is not a transport
     // owner and cannot keep the transport's final-Drop lifetime alive.
     running_owner: Option<NetconfSessionOwner>,
-    acknowledged_running_intent: Option<AuditOperationReceipt>,
+    acknowledged_intent: Option<AuditOperationReceipt>,
+    // Set only by prepare_cleanup after actual inactive-session SDK preparation.
+    cleanup: bool,
+    // Retained before the no-effect retirement await. An older definite refusal
+    // cannot hide a later cancelled or indeterminate durable retirement.
+    cleanup_retirement_pending: bool,
     published_commit: Option<Box<opc_config_model::CommitResult>>,
 }
 
@@ -691,12 +851,21 @@ impl TargetAttempt {
             })
     }
 
+    pub(super) fn rejected_cleanup_settled(&self) -> bool {
+        self.cleanup
+            && self.completion_settled
+            && self
+                .known
+                .as_ref()
+                .is_some_and(|r| r.state() == AuditOperationState::Rejected)
+    }
+
     pub(super) fn completion_settled(&self) -> bool {
         self.completion_settled
     }
 
     pub(super) fn admission_refused(&self) -> bool {
-        self.admission_refusal.is_some()
+        self.admission_refusal.is_some() && !self.cleanup_retirement_pending
     }
 
     /// Inspect only worker-owned progress after a panic/report failure. This
@@ -707,6 +876,9 @@ impl TargetAttempt {
                 receipt: Box::new(receipt.clone()),
                 completion_pending: !self.completion_settled,
             };
+        }
+        if self.cleanup_retirement_pending {
+            return TargetReply::Unknown;
         }
         if let Some(refusal) = self.admission_refusal {
             return TargetReply::Refused(refusal);
@@ -765,12 +937,19 @@ impl TargetAttempt {
             return false;
         }
         self.known = Some(receipt.clone());
+        self.admission_refusal = None;
+        self.cleanup_retirement_pending = false;
         // The SDK validated this closed preparation against this exact known
         // result before accepting it. Only the bounded receipt is needed for
         // subsequent completion; do not retain completed encrypted payloads.
-        self.prepared = None;
+        // Cleanup retains its small signed original until slot retirement or
+        // an authenticated successor replaces it. Other completed encrypted
+        // target payloads keep the existing release behavior.
+        if !self.cleanup {
+            self.prepared = None;
+        }
         self.running_owner = None;
-        self.acknowledged_running_intent = None;
+        self.acknowledged_intent = None;
         true
     }
 }

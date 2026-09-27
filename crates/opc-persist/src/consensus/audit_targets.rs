@@ -1641,6 +1641,98 @@ pub(crate) fn apply_target_sync(
     Ok(result)
 }
 
+/// Retire only signed closed-session cleanup with a stale lifecycle or running base.
+/// This runs in the same authority transaction as Admit/Apply. Absence is not a
+/// rejection: a new retirement must reserve and retain the real Intent followed
+/// by Rejected. The ordinary terminal/checkpoint obligation remains outstanding.
+pub(crate) fn retire_cleanup_sync(
+    conn: &Connection,
+    key: &AuditKey,
+    ledger: &mut LedgerState,
+    prepared: &PreparedTargetMutation,
+    now: i64,
+    cancellation: &SqliteWorkCancellation,
+) -> io::Result<Result<(), AuditAuthorityError>> {
+    cancellation.check_io()?;
+    if conn.is_autocommit() {
+        return Err(invalid());
+    }
+    let decision = (|| {
+        // Authentication belongs inside the serialized transition, including
+        // the original caller/event and exact signed session-loss payload.
+        prepared.verify_cleanup_retirement(key)?;
+        if let Some(receipt) = ledger.lookup(key, prepared.handle(), prepared.effect.caller)? {
+            if ledger.recover_target(key, prepared.handle(), prepared.effect.caller)? != *prepared {
+                return Err(AuditAuthorityError::BindingMismatch);
+            }
+            // Original-result precedence: even expiry, a later lifecycle or
+            // outstanding terminal/checkpoint debt cannot replace this result.
+            match receipt.state() {
+                AuditOperationState::TargetV1(_) | AuditOperationState::Rejected => {
+                    return Ok(true)
+                }
+                AuditOperationState::Intent => {}
+                _ => return Err(AuditAuthorityError::BindingMismatch),
+            }
+        }
+        prepared.handle.require_live(now)?;
+        if ledger.operations.iter().any(|operation| {
+            (operation.handle != prepared.handle && !operation.terminal_recorded)
+                || ledger.mutation_outcome_needs_checkpoint(operation)
+        }) {
+            return Err(AuditAuthorityError::RecoveryRequired);
+        }
+        Ok(false)
+    })();
+    match decision {
+        Ok(true) => return Ok(Ok(())),
+        Ok(false) => {}
+        Err(error) => return Ok(Err(error)),
+    }
+    let state = read_state_sync(conn, key, ledger.identity, cancellation)?;
+    state.validate_anchor(Some(ledger))?;
+    super::history::validate_record_chain_sync(conn, key, cancellation)?;
+    let effect = &prepared.effect;
+    if state.profile.authority != effect.authority
+        || state
+            .profile
+            .activation_operation
+            .as_ref()
+            .map(|a| a.profile_incarnation)
+            != Some(effect.profile_incarnation)
+        || state.profile.device_incarnation != Some(effect.device_incarnation)
+    {
+        return Ok(Err(AuditAuthorityError::BindingMismatch));
+    }
+    let current_version: u64 = conn
+        .query_row(
+            "SELECT COALESCE(MAX(version),0) FROM config_history",
+            [],
+            |row| row.get(0),
+        )
+        .map_err(|_| invalid())?;
+    if !matches!(effect.destination,
+        TargetExpectationV1::Lifecycle { state_digest }
+            if state_digest != state.profile.state_digest
+                || current_version != prepared.handle.body.binding.base_version)
+    {
+        // A still-applicable uncertain original is not replaced. Its authentic
+        // acknowledgement/recovery must settle it, or the worker stays fenced.
+        return Ok(Err(AuditAuthorityError::RecoveryRequired));
+    }
+    let mut candidate = ledger.clone();
+    let result = candidate
+        .admit_target(key, prepared, now)
+        .and_then(|()| candidate.resolve(key, prepared.handle(), AuditOperationState::Rejected));
+    if result.is_ok() {
+        // No target/configuration row is changed. The outer consensus apply
+        // seals, validates and writes this exact retained rejection atomically.
+        *ledger = candidate;
+    }
+    cancellation.check_io()?;
+    Ok(result)
+}
+
 /// Check a new target intent against one authenticated, pinned authority view.
 /// This predicts the target state and reserves ledger space only in memory; it
 /// neither writes an intent nor grants permission to apply one. Application must
@@ -2002,6 +2094,64 @@ impl NetconfDeviceView {
                 session: session.incarnation(),
             }),
         })
+    }
+}
+
+impl PreparedTargetMutation {
+    pub(crate) fn verify_cleanup_retirement(
+        &self,
+        key: &AuditKey,
+    ) -> Result<(), AuditAuthorityError> {
+        self.verify_effect(key)?;
+        let event = &self.handle.body.event;
+        if u8::from(self.effect.action) != 13
+            || event.transport != crate::ManagementAuditTransportCode::Internal
+            || event.operation != crate::ManagementAuditOperationCode::Exec
+            || event.outcome != crate::ManagementAuditOutcomeCode::Intent
+            || self.effect.source.is_some()
+            || self.effect.lock.is_some()
+            || self.effect.encrypted_payload.is_some()
+            || !matches!(self.effect.resolution,
+                Some(TargetResolutionV1::EndSession { session }) if session != [0; 16])
+        {
+            return Err(AuditAuthorityError::BindingMismatch);
+        }
+        Ok(())
+    }
+
+    // A new, shorter closing attempt requires the exact authenticated retained
+    // rejection and independent terminal checkpoint. Missing/pruned/Intent and
+    // Applied originals never authorize a successor.
+    pub(crate) fn verify_settled_cleanup_retirement(
+        &self,
+        session: &crate::audit_authority::NetconfSessionOwner,
+        ledger: &LedgerState,
+        key: &AuditKey,
+        now: i64,
+    ) -> Result<(), AuditAuthorityError> {
+        session.cleanup_context(&self.handle.body.event)?;
+        self.verify_cleanup_retirement(key)?;
+        if !self.is_session_cleanup_for(session)
+            || ledger.recover_target(key, self.handle(), session.caller)? != *self
+        {
+            return Err(AuditAuthorityError::BindingMismatch);
+        }
+        let original = ledger
+            .operations
+            .iter()
+            .find(|op| op.handle == self.handle)
+            .ok_or(AuditAuthorityError::BindingMismatch)?;
+        if original.state != AuditOperationState::Rejected
+            || !original.terminal_recorded
+            || ledger
+                .continuity
+                .as_ref()
+                .and_then(|chain| chain.checkpoint.as_ref())
+                .is_none_or(|checkpoint| checkpoint.sequence() < original.last_sequence)
+        {
+            return Err(AuditAuthorityError::RecoveryRequired);
+        }
+        self.handle.require_live(now)
     }
 }
 

@@ -79,6 +79,7 @@ pub(super) struct WorkerSession {
     context: SessionContext,
     lifetime: OwnedSessionLifetime,
     cleanup: Option<TargetAttempt>,
+    cleanup_successor: Option<AuditEvent>,
     leases: [Option<NetconfLockLease>; 3],
 }
 
@@ -92,7 +93,7 @@ impl WorkerSession {
 
     /// Reuse this exact Internal Exec Intent when preparing/recovering cleanup.
     /// A successor requires its own SDK-authorized transition after definite,
-    /// checkpointed original expiry; it must not overwrite this original event.
+    /// checkpointed original retirement; its closing window is never extended.
     #[cfg(test)]
     pub(super) fn cleanup_event(&self) -> &AuditEvent {
         &self.context.cleanup
@@ -260,8 +261,9 @@ impl SessionRegistry {
         }
     }
 
-    /// A bounded pass retries original work only. Failure retains the same slot,
-    /// event, handle, expiry and known outcome. No timer or retry task is added.
+    /// A bounded pass settles originals and may prepare one SDK-authorized
+    /// successor after durable rejection plus terminal/checkpoint completion.
+    /// No timer, extra queue or unbounded retry loop is added.
     pub(super) async fn cleanup_revoked(&mut self, port: &NetconfAuditStore) {
         for slot in &mut self.entries {
             let Slot::Owned(session) = slot else { continue };
@@ -287,7 +289,51 @@ impl SessionRegistry {
             // Retention precedes the first possible admission await. Losing the
             // transport or a shutdown waiter never owns this future.
             let _ = port.execute_target(original).await;
-            if original.applied_cleanup_settled() && port.verify_current().await.is_ok() {
+            if !original.applied_cleanup_settled() {
+                let _ = port
+                    .retire_cleanup(
+                        session.lifetime.owner(),
+                        &session.context.principal,
+                        original,
+                    )
+                    .await;
+            }
+            if original.rejected_cleanup_settled() {
+                // Retain the separately authorized successor event before its
+                // first await. SDK caching recovers the same preparation if that
+                // await is cancelled; expiry stays capped by the original window.
+                let event = session.cleanup_successor.get_or_insert_with(|| {
+                    AuditEvent::new(
+                        RequestId::new(),
+                        &session.context.principal,
+                        TransportType::Internal,
+                        AuditOperation::Exec,
+                        AuditOutcome::Intent,
+                    )
+                });
+                if let Ok(next) = port
+                    .prepare_cleanup_successor(
+                        session.lifetime.owner(),
+                        &session.context.principal,
+                        original,
+                        event,
+                    )
+                    .await
+                {
+                    session.context.cleanup = event.clone();
+                    session.cleanup_successor = None;
+                    session.cleanup = Some(next);
+                    if let Some(next) = session.cleanup.as_mut() {
+                        let _ = port.execute_target(next).await;
+                    }
+                }
+            }
+            if session
+                .cleanup
+                .as_ref()
+                .is_some_and(TargetAttempt::applied_cleanup_settled)
+                && port.verify_current().await.is_ok()
+            {
                 *slot = Slot::Vacant;
             }
         }
@@ -325,6 +371,7 @@ impl SessionReservation<'_> {
             context,
             lifetime,
             cleanup: None,
+            cleanup_successor: None,
             leases: [None, None, None],
         }));
         let _ = reply.send(Ok(transport));
@@ -346,3 +393,7 @@ impl Drop for SessionReservation<'_> {
         }
     }
 }
+
+#[cfg(test)]
+#[path = "cleanup_retirement_tests.rs"]
+mod cleanup_retirement_tests;

@@ -800,3 +800,51 @@ view retain the same original attempt. Old read clones keep their known results.
 
 Component cache/reopen fixtures do not establish process-crash, public runtime,
 provider or leadership availability. Those remain full-profile qualification gates.
+
+### Stale closed-session cleanup retirement
+
+The unreleased target V1 command family appends phase 3, `RetireCleanup`, while
+retaining phase 0 (Admit), 1 (Apply), and 2 (EmptyCommit) and all existing action
+and outcome tags. This extends unreleased wire 9/storage 7; it makes no
+interoperability claim for old unlanded target peers. Legacy 7/5, bounded 8/6,
+profile selection, joint-profile refusal and the native WAL are unchanged.
+
+An inactive session retains one exact signed action-13 cleanup. If a settled
+operation changes its frozen lifecycle state or authenticated running base,
+absence of that cleanup's Intent is not rejection. An ordinary audited Running
+commit can advance the running base while preserving every target row. The
+session-taking retirement API authenticates the exact worker, caller, session
+and cached payload. The serialized SDK transition
+verifies the signed Internal Exec Intent and original session-loss payload,
+replays any real Applied/Rejected result before stale/expiry/debt checks, and
+otherwise requires the original live closing window, current profile/device,
+a stale lifecycle expectation or running base, and no competing unsettled/checkpoint
+obligation. It authenticates the retained history before comparing the running base.
+It reserves and stores the original Intent followed by Rejected atomically.
+Retirement changes no target, lock or running configuration. An old in-flight
+Admit/Apply can only observe that original result; it cannot revive the effect.
+
+Only real Rejected plus mandatory terminal audit and independent checkpoint
+completion permits a separately identified cleanup successor. Its expiry is
+exactly the predecessor's expiry, never a renewed timeout. The session caches
+one current preparation plus its immediate predecessor before the final read
+await, and the existing worker retains the successor event before preparation.
+Missing/pruned receipts, Unknown and a still-applicable uncertain original do
+not authorize replacement. Known applied cleanup is preserved with any remaining
+completion debt. Existing expired-successor authorization remains distinct.
+
+Retirement's outer Raft request is derived from the unchanged signed handle and
+a quorum-authenticated ledger revision (sequence, retained floor, checkpoint).
+Repeating a revision replays that envelope; a changed revision permits another
+bounded no-effect retirement decision after a cached definite command refusal.
+This never changes the audit operation, signed payload, event, nonce or expiry.
+Even overlapping retirement envelopes serialize to the same durable original.
+No observed absence or failed transport is promoted to rejection, and ordinary
+Admit/Apply retry identities remain unchanged.
+
+The worker still performs bounded cleanup passes and one final drain pass. It
+may retire a stale predecessor and attempt one genuine successor per pass.
+Unavailable storage, unresolved admission, expiry, capacity, confirmed rollback,
+concurrent activity or incomplete checkpointing retain the slot and produce
+RecoveryRequired. Simultaneous one-pass clean shutdown is not guaranteed; this
+contract adds no worker, queue, timer, deadline extension or protocol capability.

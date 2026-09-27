@@ -137,12 +137,16 @@ pub(crate) enum TargetAuditCommandV1 {
     Admit(PreparedTargetMutation),
     Apply(PreparedTargetMutation),
     EmptyCommit(crate::audit_authority::PreparedNetconfEmptyCommit),
+    // Append-only phase 3 of the unreleased target format; old phase bytes stay fixed.
+    RetireCleanup(PreparedTargetMutation),
 }
 
 impl TargetAuditCommandV1 {
     pub(crate) fn handle(&self) -> &AuditOperationHandle {
         match self {
-            Self::Admit(prepared) | Self::Apply(prepared) => prepared.handle(),
+            Self::Admit(prepared) | Self::Apply(prepared) | Self::RetireCleanup(prepared) => {
+                prepared.handle()
+            }
             Self::EmptyCommit(prepared) => prepared.handle(),
         }
     }
@@ -156,7 +160,7 @@ impl TargetAuditCommandV1 {
         caller: crate::audit_authority::AuditCaller,
     ) -> Result<Option<crate::audit_authority::AuditOperationReceipt>, AuditAuthorityError> {
         match self {
-            Self::Admit(prepared) | Self::Apply(prepared) => {
+            Self::Admit(prepared) | Self::Apply(prepared) | Self::RetireCleanup(prepared) => {
                 prepared.verify_effect(key)?;
                 let receipt = ledger.lookup(key, prepared.handle(), caller)?;
                 if receipt.is_some()
@@ -181,7 +185,7 @@ impl TargetAuditCommandV1 {
             Self::EmptyCommit(prepared) => {
                 proof.read_back_empty_commit(key, identity, prepared, caller)
             }
-            Self::Admit(prepared) | Self::Apply(prepared) => {
+            Self::Admit(prepared) | Self::Apply(prepared) | Self::RetireCleanup(prepared) => {
                 let receipt = proof.read_back(key, identity, prepared.handle(), caller)?;
                 if let crate::audit_authority::AuditOperationState::TargetV1(result) =
                     receipt.state()

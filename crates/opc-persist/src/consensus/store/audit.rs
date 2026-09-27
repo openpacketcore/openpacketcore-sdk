@@ -385,7 +385,7 @@ impl ConsensusConfigStore {
         {
             return AuditAdmission::Rejected(error);
         }
-        let request = derive_durable_request_id(self.inner.identity, purpose, &handle.mac);
+        let mut request = derive_durable_request_id(self.inner.identity, purpose, &handle.mac);
         // Preflight is known not to admit work. After submission starts any
         // transport/storage uncertainty is conservatively Unknown.
         if super::preflight_config_command_replication_budget(
@@ -408,6 +408,37 @@ impl ConsensusConfigStore {
             }
             _ => None,
         };
+        if matches!(
+            target_command.as_deref(),
+            Some(super::super::audit_mutation::TargetAuditCommandV1::RetireCleanup(_))
+        ) {
+            // A definite outer-command refusal is cached by Raft request ID.
+            // A new authenticated ledger revision may make retirement lawful.
+            // Keep the signed audit original unchanged; only this no-effect
+            // retirement envelope is revision-bound. Unknown never authorizes
+            // a successor and competing retirements serialize to one real result.
+            let mut revision = [0u8; 56];
+            revision[..32].copy_from_slice(&handle.mac);
+            revision[32..40].copy_from_slice(&ledger.sequence.to_be_bytes());
+            revision[40..48].copy_from_slice(&ledger.floor.to_be_bytes());
+            let checkpoint = ledger
+                .continuity
+                .as_ref()
+                .and_then(|c| c.checkpoint.as_ref())
+                .map_or(0, |c| c.sequence());
+            revision[48..].copy_from_slice(&checkpoint.to_be_bytes());
+            request = derive_durable_request_id(self.inner.identity, purpose, &revision);
+            if super::preflight_config_command_replication_budget(
+                self.inner.identity,
+                request,
+                &command,
+                self.config_profile(),
+            )
+            .is_err()
+            {
+                return AuditAdmission::Rejected(AuditAuthorityError::InvalidInput);
+            }
+        }
         // A pruned, expired handle cannot reuse an older successful request
         // cache entry as admission. Existing retained receipts remain readable
         // after expiry; only a proven absent operation requires a live handle.
@@ -434,6 +465,15 @@ impl ConsensusConfigStore {
                     Some(super::super::audit_mutation::TargetAuditCommandV1::Admit(prepared))
                         if u8::from(prepared.effect.action) == 16
                 ) =>
+            {
+                return AuditAdmission::Applied(receipt);
+            }
+            Ok(Some(receipt))
+                if receipt.state() != crate::audit_authority::AuditOperationState::Intent
+                    && matches!(
+                        target_command.as_deref(),
+                        Some(super::super::audit_mutation::TargetAuditCommandV1::RetireCleanup(_))
+                    ) =>
             {
                 return AuditAdmission::Applied(receipt);
             }
@@ -950,6 +990,14 @@ impl ConsensusConfigStore {
         &self,
         prepared: &crate::audit_authority::PreparedTargetMutation,
     ) -> Result<Option<AuditOperationReceipt>, AuditAuthorityError> {
+        self.preflight_netconf_target_phase(prepared, false).await
+    }
+
+    async fn preflight_netconf_target_phase(
+        &self,
+        prepared: &crate::audit_authority::PreparedTargetMutation,
+        retire_cleanup: bool,
+    ) -> Result<Option<AuditOperationReceipt>, AuditAuthorityError> {
         self.require_netconf_target_profile()?;
         self.linearizable_barrier()
             .await
@@ -982,15 +1030,42 @@ impl ConsensusConfigStore {
                     identity,
                 )?
                 .ok_or_else(unavailable)?;
-                let decision = super::super::audit_targets::preflight_target_sync(
-                    &tx,
-                    backend.audit_key(),
-                    &prepared,
-                    &ledger,
-                    &keys,
-                    now,
-                    cancellation,
-                )?;
+                let decision = if retire_cleanup {
+                    let mut candidate = ledger.clone();
+                    super::super::audit_targets::retire_cleanup_sync(
+                        &tx,
+                        backend.audit_key(),
+                        &mut candidate,
+                        &prepared,
+                        now,
+                        cancellation,
+                    )?
+                    .and_then(|()| {
+                        // Only the real retained ledger can supply a receipt.
+                        // The simulated Intent/Rejected is not admission proof.
+                        ledger
+                            .lookup(
+                                backend.audit_key(),
+                                prepared.handle(),
+                                prepared.effect.caller,
+                            )
+                            .map(|receipt| {
+                                receipt.filter(|r| {
+                                    r.state() != crate::audit_authority::AuditOperationState::Intent
+                                })
+                            })
+                    })
+                } else {
+                    super::super::audit_targets::preflight_target_sync(
+                        &tx,
+                        backend.audit_key(),
+                        &prepared,
+                        &ledger,
+                        &keys,
+                        now,
+                        cancellation,
+                    )?
+                };
                 cancellation.check_io()?;
                 tx.commit().map_err(|_| unavailable())?;
                 Ok((ledger, decision))
@@ -1425,6 +1500,177 @@ impl ConsensusConfigStore {
         let prepared = crate::audit_authority::PreparedTargetMutation { handle, effect };
         prepared.verify_effect(self.inner.backend.audit_key())?;
         let original = session.retain_cleanup(prepared)?;
+        self.preflight_netconf_target(&original).await?;
+        Ok(original)
+    }
+}
+
+impl ConsensusConfigStore {
+    /// Recover this exact inactive session's locally retained cleanup preparation.
+    /// This read-only value grants neither admission nor a known outcome. It also
+    /// recovers a preparation cached before cancellation or refused preflight.
+    pub fn retained_netconf_session_cleanup(
+        &self,
+        session: &crate::audit_authority::NetconfSessionOwner,
+        caller: AuditCaller,
+        privacy: &dyn AuditPrivacyProjection,
+        event: &ManagementAuditEventRecord,
+    ) -> Result<Option<crate::audit_authority::PreparedTargetMutation>, AuditAuthorityError> {
+        self.require_netconf_target_profile()?;
+        if !session.device.worker.belongs_to(&self.inner) {
+            return Err(AuditAuthorityError::BindingMismatch);
+        }
+        let event = ProjectedAuditEvent::project(privacy, event)?;
+        session.cleanup_context(&event)?;
+        let original = session.retained_cleanup(caller)?;
+        if let Some(prepared) = &original {
+            self.verify_netconf_target(prepared, caller)?;
+            if prepared.handle.body.event != event {
+                return Err(AuditAuthorityError::BindingMismatch);
+            }
+        }
+        Ok(original)
+    }
+
+    /// Durably retire the exact inactive session's stale original cleanup.
+    /// Missing Intent is not rejection. The existing consensus owner must retain
+    /// a real Intent/Rejected pair, or replay the actual Applied/Rejected original.
+    /// No lock, target or running record is changed by retirement. Mandatory
+    /// terminal audit and checkpoint completion are still required afterwards.
+    ///
+    /// A valid, still-applicable uncertain original, a foreign session/payload,
+    /// other unsettled work, or an expired unadmitted original is refused. Unknown
+    /// retains this same original; it never grants permission for a fresh cleanup.
+    pub async fn retire_netconf_session_cleanup_local(
+        &self,
+        session: &crate::audit_authority::NetconfSessionOwner,
+        prepared: &crate::audit_authority::PreparedTargetMutation,
+        caller: AuditCaller,
+    ) -> AuditAdmission {
+        let verified = self.require_netconf_target_profile().and_then(|()| {
+            if !session.device.worker.belongs_to(&self.inner) {
+                return Err(AuditAuthorityError::BindingMismatch);
+            }
+            session.require_cleanup_original(prepared, caller)?;
+            self.verify_netconf_target(prepared, caller)?;
+            prepared.verify_cleanup_retirement(self.inner.backend.audit_key())
+        });
+        if let Err(error) = verified {
+            return AuditAdmission::Rejected(error);
+        }
+        // A fresh authenticated lookup preserves an original settled result even
+        // when current lifecycle/expiry would refuse a new retirement. It grants
+        // no effect authority to an Intent obtained after a lost acknowledgement.
+        let ledger = match self.read_audit_ledger().await {
+            Ok(ledger) => ledger,
+            Err(error) => return AuditAdmission::Rejected(error),
+        };
+        let command =
+            super::super::audit_mutation::TargetAuditCommandV1::RetireCleanup(prepared.clone());
+        match command.lookup_receipt(&ledger, self.inner.backend.audit_key(), caller) {
+            Ok(Some(receipt))
+                if receipt.state() != crate::audit_authority::AuditOperationState::Intent =>
+            {
+                return AuditAdmission::Applied(receipt);
+            }
+            Err(error) => return AuditAdmission::Rejected(error),
+            _ => {}
+        }
+        match self.preflight_netconf_target_phase(prepared, true).await {
+            Ok(Some(receipt)) => return AuditAdmission::Applied(receipt),
+            Ok(None) => {}
+            Err(error) => return AuditAdmission::Rejected(error),
+        }
+        let decision = self
+            .audit_operation_command_with_route(
+                prepared.handle(),
+                caller,
+                b"netconf-cleanup-retire",
+                ConfigMutationIntent::ManagementAudit(AuditCommand::NetconfTarget(Box::new(
+                    command,
+                ))),
+                true,
+            )
+            .await;
+        match decision {
+            // An in-flight Admit may have won while retirement was refused.
+            // Its observed Intent is not this API's admission acknowledgement.
+            AuditAdmission::Applied(receipt)
+                if receipt.state() == crate::audit_authority::AuditOperationState::Intent =>
+            {
+                AuditAdmission::Unknown(prepared.handle().clone())
+            }
+            other => other,
+        }
+    }
+
+    /// Prepare a fresh cleanup only after the exact cached predecessor has a
+    /// durable Rejected result, terminal record and independent checkpoint.
+    /// Its new request remains within the predecessor's original closing window;
+    /// timeout, missing receipt or Unknown cannot renew that authority.
+    ///
+    /// The supplied Internal Exec Intent must keep the authenticated caller and
+    /// projection. This caches one immutable successor before any final preflight
+    /// await. Cancellation recovers that same value through the retained API.
+    pub async fn prepare_netconf_session_cleanup_after_retirement(
+        &self,
+        session: &crate::audit_authority::NetconfSessionOwner,
+        previous: &crate::audit_authority::PreparedTargetMutation,
+        privacy: &dyn AuditPrivacyProjection,
+        event: &ManagementAuditEventRecord,
+    ) -> Result<crate::audit_authority::PreparedTargetMutation, AuditAuthorityError> {
+        self.require_netconf_target_profile()?;
+        if !session.device.worker.belongs_to(&self.inner) {
+            return Err(AuditAuthorityError::BindingMismatch);
+        }
+        self.verify_netconf_target(previous, session.caller)?;
+        let event = ProjectedAuditEvent::project(privacy, event)?;
+        if let Some(original) = session.retirement_successor(previous, &event)? {
+            self.verify_netconf_target(&original, session.caller)?;
+            self.preflight_netconf_target(&original).await?;
+            return Ok(original);
+        }
+        let issued_at = self
+            .inner
+            .clock
+            .now_utc()
+            .as_offset_datetime()
+            .unix_timestamp();
+        let expires_at = previous.handle.body.expires_at;
+        let ledger = self.read_audit_ledger().await?;
+        previous.verify_settled_cleanup_retirement(
+            session,
+            &ledger,
+            self.inner.backend.audit_key(),
+            issued_at,
+        )?;
+        let view = self.read_netconf_device_view().await?;
+        let effect = view.prepare_session_cleanup(session, &event, expires_at)?;
+        let digest = effect.digest(self.inner.backend.audit_key())?;
+        let binding =
+            AuditOperationBinding::project(privacy, &event, view.running_version, &digest)?;
+        let handle = AuditOperationHandle::issue(
+            HandleBody {
+                version: 1,
+                identity: self.inner.identity,
+                binding,
+                event,
+                issued_at,
+                expires_at,
+                nonce: *uuid::Uuid::new_v4().as_bytes(),
+                key_epoch: self.inner.backend.audit_key().epoch(),
+                mutation: Some(digest),
+            },
+            self.inner.backend.audit_key(),
+        )?;
+        let prepared = crate::audit_authority::PreparedTargetMutation { handle, effect };
+        let original = session.retain_retirement_successor(
+            previous,
+            prepared,
+            &ledger,
+            self.inner.backend.audit_key(),
+            issued_at,
+        )?;
         self.preflight_netconf_target(&original).await?;
         Ok(original)
     }

@@ -330,6 +330,16 @@ pub(crate) fn apply_cancellable_sync(
                                 }
                                 ledger.admit_target(key, prepared, now)
                             }),
+                        TargetAuditCommandV1::RetireCleanup(prepared) => {
+                            super::audit_targets::retire_cleanup_sync(
+                                conn,
+                                key,
+                                ledger,
+                                prepared,
+                                now,
+                                cancellation,
+                            )?
+                        }
                         TargetAuditCommandV1::EmptyCommit(prepared) => {
                             super::audit_targets::admit_empty_commit_sync(
                                 conn, key, ledger, prepared, context,

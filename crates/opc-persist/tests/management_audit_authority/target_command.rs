@@ -904,3 +904,39 @@ fn target_empty_commit_command_preserves_allocated_phases_and_strict_bytes() {
 
 #[path = "runtime_profile.rs"]
 mod runtime_profile_tests;
+
+#[test]
+fn cleanup_retirement_phase_appends_without_changing_original_payload_bytes() {
+    use crate::consensus::audit_mutation::TargetAuditCommandV1;
+    let AuditCommand::NetconfTarget(command) = serde_json::from_value(discard_command()).unwrap()
+    else {
+        panic!("target fixture")
+    };
+    let TargetAuditCommandV1::Apply(prepared) = *command else {
+        panic!("apply fixture")
+    };
+    // Encoding is not authority: the retirement reducer separately refuses this
+    // discard payload. Compare only the unchanged signed payload and phase tag.
+    let old = opc_consensus::encode_bounded(&AuditCommand::NetconfTarget(Box::new(
+        TargetAuditCommandV1::Apply(prepared.clone()),
+    )))
+    .unwrap();
+    let bytes = opc_consensus::encode_bounded(&AuditCommand::NetconfTarget(Box::new(
+        TargetAuditCommandV1::RetireCleanup(prepared),
+    )))
+    .unwrap();
+    assert_eq!(&old[..2], &[9, 1]);
+    assert_eq!(&bytes[..2], &[9, 3]);
+    assert_eq!(&old[2..], &bytes[2..]);
+    let restored: AuditCommand = opc_consensus::decode_bounded(&bytes).unwrap();
+    assert_eq!(opc_consensus::encode_bounded(&restored).unwrap(), bytes);
+    for end in 0..bytes.len() {
+        assert!(opc_consensus::decode_bounded::<AuditCommand>(&bytes[..end]).is_err());
+    }
+    let mut unknown = bytes.clone();
+    unknown[1] = 4;
+    assert!(opc_consensus::decode_bounded::<AuditCommand>(&unknown).is_err());
+    let mut trailing = bytes;
+    trailing.push(0);
+    assert!(opc_consensus::decode_bounded::<AuditCommand>(&trailing).is_err());
+}

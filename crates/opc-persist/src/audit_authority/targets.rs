@@ -5,7 +5,7 @@ use std::fmt;
 
 use serde::{Deserialize, Serialize};
 
-use super::{AuditAuthorityError, AuditOperationHandle};
+use super::{AuditAuthorityError, AuditCaller, AuditOperationHandle};
 use crate::ConfigConsensusIdentity;
 
 // Preserve the existing identity's bytes while rejecting unknown fields inside
@@ -778,6 +778,100 @@ impl NetconfSessionOwner {
             predecessor: None,
         });
         Self::matching_cleanup(&original.prepared, &event, lifetime)
+    }
+
+    pub(crate) fn retained_cleanup(
+        &self,
+        caller: AuditCaller,
+    ) -> Result<Option<super::PreparedTargetMutation>, AuditAuthorityError> {
+        if caller != self.caller || self.require_active().is_ok() {
+            return Err(AuditAuthorityError::BindingMismatch);
+        }
+        let slot = self
+            .state
+            .cleanup
+            .lock()
+            .map_err(|_| AuditAuthorityError::Unavailable)?;
+        slot.as_ref()
+            .map(|current| {
+                self.cleanup_preparation_lifetime(&current.prepared)?;
+                Ok(current.prepared.clone())
+            })
+            .transpose()
+    }
+
+    pub(crate) fn require_cleanup_original(
+        &self,
+        prepared: &super::PreparedTargetMutation,
+        caller: AuditCaller,
+    ) -> Result<(), AuditAuthorityError> {
+        if self.retained_cleanup(caller)?.as_ref() != Some(prepared) {
+            return Err(AuditAuthorityError::BindingMismatch);
+        }
+        Ok(())
+    }
+
+    pub(crate) fn retirement_successor(
+        &self,
+        previous: &super::PreparedTargetMutation,
+        event: &super::ProjectedAuditEvent,
+    ) -> Result<Option<super::PreparedTargetMutation>, AuditAuthorityError> {
+        self.cleanup_successor_context(previous, event)?;
+        let slot = self
+            .state
+            .cleanup
+            .lock()
+            .map_err(|_| AuditAuthorityError::Unavailable)?;
+        let current = slot.as_ref().ok_or(AuditAuthorityError::BindingMismatch)?;
+        if current.prepared == *previous {
+            return Ok(None);
+        }
+        if current.predecessor.as_ref() != Some(previous.handle())
+            || current.prepared.handle.body.event != *event
+            || current.prepared.handle.body.expires_at != previous.handle.body.expires_at
+        {
+            return Err(AuditAuthorityError::BindingMismatch);
+        }
+        Ok(Some(current.prepared.clone()))
+    }
+
+    pub(crate) fn retain_retirement_successor(
+        &self,
+        previous: &super::PreparedTargetMutation,
+        prepared: super::PreparedTargetMutation,
+        ledger: &super::ledger::LedgerState,
+        key: &crate::AuditKey,
+        now: i64,
+    ) -> Result<super::PreparedTargetMutation, AuditAuthorityError> {
+        self.cleanup_successor_context(previous, &prepared.handle.body.event)?;
+        self.cleanup_preparation_lifetime(&prepared)?;
+        if prepared.handle.body.expires_at != previous.handle.body.expires_at
+            || prepared.handle.body.issued_at < previous.handle.body.issued_at
+        {
+            return Err(AuditAuthorityError::BindingMismatch);
+        }
+        prepared.verify_cleanup_retirement(key)?;
+        previous.verify_settled_cleanup_retirement(self, ledger, key, now)?;
+        let mut slot = self
+            .state
+            .cleanup
+            .lock()
+            .map_err(|_| AuditAuthorityError::Unavailable)?;
+        let current = slot.as_ref().ok_or(AuditAuthorityError::BindingMismatch)?;
+        if current.prepared == *previous {
+            *slot = Some(NetconfCleanupAttempt {
+                prepared: prepared.clone(),
+                predecessor: Some(previous.handle().clone()),
+            });
+            return Ok(prepared);
+        }
+        if current.predecessor.as_ref() != Some(previous.handle())
+            || current.prepared.handle.body.event != prepared.handle.body.event
+            || current.prepared.handle.body.expires_at != prepared.handle.body.expires_at
+        {
+            return Err(AuditAuthorityError::BindingMismatch);
+        }
+        Ok(current.prepared.clone())
     }
 
     fn cleanup_successor_context(

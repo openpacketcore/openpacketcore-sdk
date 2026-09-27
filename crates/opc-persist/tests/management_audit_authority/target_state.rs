@@ -11644,3 +11644,9 @@ async fn ordinary_running_apply_refuses_equal_caller_without_running_lock_lease(
 
 #[path = "ordinary_running.rs"]
 mod ordinary_running;
+
+#[path = "cleanup_retirement.rs"]
+mod cleanup_retirement_tests;
+
+#[path = "cleanup_running_base.rs"]
+mod cleanup_running_base;

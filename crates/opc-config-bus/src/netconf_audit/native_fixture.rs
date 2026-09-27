@@ -25,6 +25,13 @@ pub(super) struct Checkpoint {
     pub(super) pause: AtomicBool,
     pub(super) entered: tokio::sync::Notify,
     pub(super) release: tokio::sync::Notify,
+    // Narrow faults at actual independent-checkpoint boundaries. They never
+    // construct a receipt or replace native admission/application.
+    pub(super) fail_load_at: AtomicUsize,
+    pub(super) failed_load: AtomicUsize,
+    pub(super) fail_intent_checkpoint: AtomicBool,
+    pub(super) pause_advance: AtomicBool,
+    pub(super) pause_load_at: AtomicUsize,
 }
 #[async_trait::async_trait]
 impl AuditCheckpointPort for Checkpoint {
@@ -32,8 +39,14 @@ impl AuditCheckpointPort for Checkpoint {
         &self,
         _: ConfigConsensusIdentity,
     ) -> Result<Option<AuditCheckpoint>, AuditAuthorityError> {
-        self.loads.fetch_add(1, Ordering::AcqRel);
-        if self.pause.swap(false, Ordering::AcqRel) {
+        let load = self.loads.fetch_add(1, Ordering::AcqRel) + 1;
+        if self.fail_load_at.load(Ordering::Acquire) == load {
+            self.failed_load.store(load, Ordering::Release);
+            return Err(AuditAuthorityError::Unavailable);
+        }
+        if self.pause.swap(false, Ordering::AcqRel)
+            || self.pause_load_at.load(Ordering::Acquire) == load
+        {
             self.entered.notify_one();
             self.release.notified().await;
         }
@@ -48,7 +61,13 @@ impl AuditCheckpointPort for Checkpoint {
         expected: Option<AuditCheckpoint>,
         next: AuditCheckpoint,
     ) -> Result<AuditCheckpointAdvance, AuditAuthorityError> {
-        if self.unavailable.load(Ordering::Acquire) {
+        if self.pause_advance.swap(false, Ordering::AcqRel) {
+            self.entered.notify_one();
+            self.release.notified().await;
+        }
+        if self.unavailable.load(Ordering::Acquire)
+            || self.fail_intent_checkpoint.load(Ordering::Acquire)
+        {
             return Err(AuditAuthorityError::Unavailable);
         }
         // Submission checkpoints Intent before applying the effect; completion
@@ -77,6 +96,7 @@ pub(super) struct Fixture {
     pub(super) port: super::NetconfAuditStore,
     pub(super) caller: AuditCaller,
     pub(super) checkpoint: Arc<Checkpoint>,
+    pub(super) privacy: Arc<AuditPrivacyKey>,
     path: PathBuf,
 }
 impl Fixture {
@@ -165,7 +185,7 @@ impl Fixture {
             .unwrap();
         let port = super::NetconfAuditStore::new(
             store.clone(),
-            privacy,
+            privacy.clone(),
             Duration::from_secs(60),
             device.clone(),
         )
@@ -178,6 +198,7 @@ impl Fixture {
             port,
             caller,
             checkpoint,
+            privacy,
             path,
         }
     }
