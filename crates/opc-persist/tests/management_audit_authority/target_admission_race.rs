@@ -270,11 +270,11 @@ impl Fixture {
         self.store
             .submit_request_on_local_leader(
                 opc_consensus::ConsensusRequestId::from_bytes([request; 16]),
-                ConfigMutationIntent::ManagementAudit(
+                ConfigMutationIntent::ManagementAudit(Box::new(
                     super::super::audit::AuditCommand::NetconfTarget(Box::new(
                         super::super::audit_mutation::TargetAuditCommandV1::Admit(prepared.clone()),
                     )),
-                ),
+                )),
             )
             .await
             .unwrap()

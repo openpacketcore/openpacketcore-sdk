@@ -19,7 +19,7 @@ fn settle_ordinary(
     prepared: &crate::consensus::PreparedAuditedMutation,
 ) {
     fixture
-        .apply(conn, AuditCommand::Terminal(prepared.handle.clone()), 100)
+        .apply(conn, AuditCommand::Terminal(prepared.handle().clone()), 100)
         .unwrap();
     fixture.checkpoint(conn);
 }
@@ -47,7 +47,7 @@ async fn ordinary_running_apply_requires_active_target_authority() {
             .lookup(
                 &fixture.key,
                 prepared.handle(),
-                prepared.handle.body.binding.caller
+                prepared.handle().body.binding.caller
             )
             .unwrap()
             .unwrap()
@@ -143,7 +143,7 @@ async fn ordinary_running_apply_preserves_original_pending_and_cleanup() {
         for choice in 0..5 {
             let prepared = fixture.ordinary_running(&conn, 220 + choice);
             let effect = match choice {
-                0 => prepared.effect,
+                0 => prepared.command().effect.clone(),
                 1 => AuditedConfigEffect::Confirm {
                     tx_id: pending_tx_id,
                 },
@@ -152,7 +152,9 @@ async fn ordinary_running_apply_preserves_original_pending_and_cleanup() {
                     label: None,
                 },
                 _ => {
-                    let AuditedConfigEffect::Append { commit, .. } = prepared.effect else {
+                    let AuditedConfigEffect::Append { commit, .. } =
+                        prepared.command().effect.clone()
+                    else {
                         panic!("ordinary append fixture");
                     };
                     AuditedConfigEffect::Append {
@@ -196,7 +198,7 @@ async fn ordinary_running_apply_fences_already_admitted_effect_until_original_ch
     let conn = shared.lock().await;
     fixture.active(&conn);
     let first = fixture.ordinary_running(&conn, 210);
-    let AuditedConfigEffect::Append { commit, .. } = &first.effect else {
+    let AuditedConfigEffect::Append { commit, .. } = &first.command().effect else {
         panic!("ordinary append fixture");
     };
     let later = fixture.ordinary_running_at(1, Some(commit.record.tx_id), None, 211);
@@ -208,7 +210,7 @@ async fn ordinary_running_apply_fences_already_admitted_effect_until_original_ch
     for terminal_recorded in [false, true] {
         if terminal_recorded {
             fixture
-                .apply(&conn, AuditCommand::Terminal(first.handle.clone()), 100)
+                .apply(&conn, AuditCommand::Terminal(first.handle().clone()), 100)
                 .unwrap();
         }
         let ledger = serde_json::to_vec(&fixture.ledger(&conn)).unwrap();
@@ -237,7 +239,7 @@ async fn ordinary_running_apply_fences_already_admitted_effect_until_original_ch
             .lookup(
                 &fixture.key,
                 later.handle(),
-                later.handle.body.binding.caller
+                later.handle().body.binding.caller
             )
             .unwrap()
             .unwrap()

@@ -76,10 +76,12 @@ async fn snapshot_keeps_captured_frontier_and_audit_state_from_one_source_view()
                         identity,
                         request_id: ConfigConsensusRequestId::from_bytes([0x64; 16]),
                         logical_time: Timestamp::from_str("2026-01-01T00:00:00Z").unwrap(),
-                        intent: ConfigMutationIntent::ManagementAudit(AuditCommand::Initialize {
-                            projection: AuditToken::from_keyed_projection([0x65; 32]).unwrap(),
-                            limits: AuditLedgerLimits::new(6, 2).unwrap(),
-                        }),
+                        intent: ConfigMutationIntent::ManagementAudit(Box::new(
+                            AuditCommand::Initialize {
+                                projection: AuditToken::from_keyed_projection([0x65; 32]).unwrap(),
+                                limits: AuditLedgerLimits::new(6, 2).unwrap(),
+                            },
+                        )),
                     }),
                 }],
             )
@@ -106,7 +108,13 @@ async fn snapshot_keeps_captured_frontier_and_audit_state_from_one_source_view()
         "snapshot copied a frontier newer than its captured metadata"
     );
     assert_eq!(
-        read_membership_sync(&snapshot, identity, &members).unwrap(),
+        read_membership_sync(
+            &snapshot,
+            identity,
+            &members,
+            crate::consensus::RetainedConfigMode::Legacy
+        )
+        .unwrap(),
         membership
     );
     assert!(

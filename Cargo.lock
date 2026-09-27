@@ -2622,10 +2622,13 @@ dependencies = [
  "opc-config-bus",
  "opc-config-model",
  "opc-consensus",
+ "opc-crypto",
  "opc-identity",
  "opc-key",
  "opc-mgmt-audit",
  "opc-persist",
+ "opc-session-net",
+ "opc-session-store",
  "opc-tls",
  "opc-types",
  "rcgen",
@@ -2633,6 +2636,7 @@ dependencies = [
  "rustls-pki-types",
  "serde",
  "serde_json",
+ "sha2 0.11.0",
  "tempfile",
  "thiserror 2.0.20",
  "time",
@@ -2688,6 +2692,8 @@ dependencies = [
  "opc-key",
  "opc-types",
  "rand 0.10.2",
+ "serde",
+ "serde_json",
  "sha2 0.11.0",
  "thiserror 2.0.20",
  "tokio",
@@ -3874,7 +3880,7 @@ dependencies = [
 [[package]]
 name = "openraft"
 version = "0.9.25"
-source = "git+https://github.com/openpacketcore/openraft?rev=b9559528561da526bea4c01dd885bab648366976#b9559528561da526bea4c01dd885bab648366976"
+source = "git+https://github.com/openpacketcore/openraft?rev=72e327a4f25cbbe3a3695d8c3c0f0970ccb925d5#72e327a4f25cbbe3a3695d8c3c0f0970ccb925d5"
 dependencies = [
  "anyerror",
  "byte-unit",
@@ -3896,7 +3902,7 @@ dependencies = [
 [[package]]
 name = "openraft-macros"
 version = "0.9.25"
-source = "git+https://github.com/openpacketcore/openraft?rev=b9559528561da526bea4c01dd885bab648366976#b9559528561da526bea4c01dd885bab648366976"
+source = "git+https://github.com/openpacketcore/openraft?rev=72e327a4f25cbbe3a3695d8c3c0f0970ccb925d5#72e327a4f25cbbe3a3695d8c3c0f0970ccb925d5"
 dependencies = [
  "chrono",
  "proc-macro2",

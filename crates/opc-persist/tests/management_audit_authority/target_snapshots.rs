@@ -2,6 +2,7 @@
 use super::*;
 use crate::audit_authority::{AuditLedgerLimits, AuditToken};
 use crate::consensus::audit::AuditCommand;
+use crate::RetainedConfigProfile;
 use crate::{
     ConfigConsensusClusterId, ConfigConsensusConfigurationEpoch, ConfigConsensusConfigurationId,
     ConfigConsensusTopology, RetainedConfigBinding, RetainedConfigDurability,

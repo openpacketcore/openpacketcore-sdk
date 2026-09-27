@@ -208,3 +208,142 @@ async fn genuine_standalone_history_keeps_its_read_and_write_contract() {
         1
     );
 }
+
+async fn assert_consensus_history_identity(reopen: bool) {
+    let dir = tempfile::tempdir().expect("directory");
+    let mut backends = Vec::new();
+    for ordinal in [1_u8, 2] {
+        let backend = SqliteBackend::open_with_audit_key(
+            dir.path().join(format!("history-{ordinal}.sqlite")),
+            true,
+            0,
+            AuditKey::new([0x67; 32]).expect("shared synthetic audit key"),
+        )
+        .await
+        .expect("backend");
+        // Hold a clone made before the consensus claim; its identity must also
+        // tighten when initialization succeeds on the shared connection.
+        let reader = backend.clone();
+        let node = ConfigConsensusNodeId::new(1).expect("node");
+        let identity = ConfigConsensusIdentity::new(
+            ConfigConsensusClusterId::from_bytes([ordinal; 32]),
+            ConfigConsensusConfigurationId::from_bytes([ordinal; 32]),
+            ConfigConsensusConfigurationEpoch::new(1).expect("epoch"),
+        );
+        let topology =
+            ConfigConsensusTopology::try_new(identity, node, [node].into_iter().collect())
+                .expect("topology");
+        let store = ConsensusConfigStore::open(
+            topology.clone(),
+            backend,
+            dir.path().join(format!("snapshots-{ordinal}")),
+            BTreeMap::new(),
+        )
+        .await
+        .expect("consensus authority");
+        store
+            .shutdown()
+            .await
+            .expect("quiescent initialized authority");
+        drop(store);
+        assert!(reader
+            .load_latest()
+            .await
+            .expect("genuine empty authority")
+            .is_none());
+        if reopen {
+            let readmission = SqliteBackend::open_with_audit_key(
+                dir.path().join(format!("history-{ordinal}.sqlite")),
+                true,
+                0,
+                AuditKey::new([0x67; 32]).expect("same synthetic audit key"),
+            )
+            .await
+            .expect("generic reopen of claimed authority");
+            assert!(
+                matches!(readmission.load_latest().await, Err(error)
+                if matches!(error.kind(), crate::PersistErrorKind::CorruptBlob)),
+                "consensus metadata cannot supply its own trusted identity"
+            );
+            let store = ConsensusConfigStore::open(
+                topology,
+                readmission.clone(),
+                dir.path().join(format!("snapshots-{ordinal}")),
+                BTreeMap::new(),
+            )
+            .await
+            .expect("independent topology admits the legitimate reopened authority");
+            assert!(readmission
+                .load_latest()
+                .await
+                .expect("read after independent admission")
+                .is_none());
+            store
+                .shutdown()
+                .await
+                .expect("readmitted authority shutdown");
+            drop(store);
+            // Keep a distinct generic reopen unadmitted during the replay.
+            // Another backend's successful claim cannot authorize this one.
+            backends.push(
+                SqliteBackend::open_with_audit_key(
+                    dir.path().join(format!("history-{ordinal}.sqlite")),
+                    true,
+                    0,
+                    AuditKey::new([0x67; 32]).expect("same synthetic audit key"),
+                )
+                .await
+                .expect("independently unadmitted reopen"),
+            );
+        } else {
+            backends.push(reader);
+        }
+    }
+    let foreign_state: (Vec<u8>, Vec<u8>) = backends[1]
+        .conn
+        .lock()
+        .await
+        .query_row(
+            "SELECT state_json, state_hmac FROM config_raft_history_retention",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .expect("genuine foreign state and tag");
+    {
+        let conn = backends[0].conn.lock().await;
+        let tx = conn.unchecked_transaction().expect("atomic replay");
+        tx.execute(
+            "UPDATE config_raft_identity SET cluster_id = ?1, configuration_id = ?1",
+            [[2_u8; 32].as_slice()],
+        )
+        .expect("replay foreign identity fields");
+        tx.execute(
+            "UPDATE config_raft_history_retention SET state_json = ?1, state_hmac = ?2",
+            rusqlite::params![foreign_state.0, foreign_state.1],
+        )
+        .expect("replay authentic foreign state without resealing");
+        tx.commit().expect("commit replay");
+    }
+    for reader in [&backends[0], &backends[0].clone()] {
+        assert!(
+            matches!(reader.load_latest().await, Err(error)
+            if matches!(error.kind(), crate::PersistErrorKind::CorruptBlob)),
+            "a clone must retain the independently admitted identity"
+        );
+        assert!(
+            matches!(reader.retained_history_floor().await, Err(error)
+            if matches!(error.kind(), crate::PersistErrorKind::CorruptBlob)),
+            "negative metadata reads must retain the independently admitted identity"
+        );
+    }
+}
+
+#[tokio::test]
+async fn consensus_history_keeps_admitted_identity_after_live_sql_replacement() {
+    assert_consensus_history_identity(false).await;
+}
+
+#[tokio::test]
+async fn reopened_consensus_history_requires_independent_identity_before_reads() {
+    assert_consensus_history_identity(true).await;
+}

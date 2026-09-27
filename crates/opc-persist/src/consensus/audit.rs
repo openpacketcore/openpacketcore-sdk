@@ -1,16 +1,16 @@
 //! Management audit changes applied by the existing configuration state machine.
 
+use hmac::{Hmac, KeyInit, Mac};
 use rusqlite::{params, Connection, OptionalExtension};
 use serde::{Deserialize, Serialize};
+use sha2::Sha256;
 use std::io;
 
 use super::ConfigMutationFailure;
 use crate::audit_authority::continuity::{
     chain::ContinuityState, AuditCheckpoint, AuditKeyRing, AuditKeyTransition,
 };
-use crate::audit_authority::ledger::{
-    authenticate, verify, LedgerState, MAX_STATE_BYTES, STATE_DOMAIN,
-};
+use crate::audit_authority::ledger::{LedgerState, MAX_STATE_BYTES, STATE_DOMAIN};
 use crate::audit_authority::{
     AuditAuthorityError, AuditLedgerLimits, AuditOperationHandle, AuditOperationState, AuditToken,
 };
@@ -62,6 +62,97 @@ fn invalid() -> io::Error {
     )
 }
 
+// StoredLedger is a closed, immutable serde representation. Count its exact
+// canonical JSON before authenticating the length-prefixed bytes. Verification
+// needs no second complete JSON allocation alongside the SQL row and decoded
+// ledger; writes allocate their one output buffer once. The transcript remains
+// exactly the existing audit-authority STATE_DOMAIN, u64 length and JSON.
+struct StateByteCounter(usize);
+
+impl io::Write for StateByteCounter {
+    fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+        self.0 = self
+            .0
+            .checked_add(bytes.len())
+            .filter(|length| *length <= MAX_STATE_BYTES)
+            .ok_or_else(invalid)?;
+        Ok(bytes.len())
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        Ok(())
+    }
+}
+
+fn canonical_state_len(stored: &StoredLedger) -> io::Result<usize> {
+    let mut counter = StateByteCounter(0);
+    serde_json::to_writer(&mut counter, stored).map_err(|_| invalid())?;
+    Ok(counter.0)
+}
+
+struct StateWriter<'a> {
+    mac: Hmac<Sha256>,
+    remaining: usize,
+    encoded: Option<&'a mut Vec<u8>>,
+}
+
+impl io::Write for StateWriter<'_> {
+    fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+        let remaining = self
+            .remaining
+            .checked_sub(bytes.len())
+            .ok_or_else(invalid)?;
+        if let Some(encoded) = self.encoded.as_mut() {
+            if encoded.capacity().saturating_sub(encoded.len()) < bytes.len() {
+                return Err(invalid());
+            }
+            encoded.extend_from_slice(bytes);
+        }
+        self.mac.update(bytes);
+        self.remaining = remaining;
+        Ok(bytes.len())
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        Ok(())
+    }
+}
+
+fn stream_state(
+    stored: &StoredLedger,
+    key: &AuditKey,
+    length: usize,
+    encoded: Option<&mut Vec<u8>>,
+) -> io::Result<Hmac<Sha256>> {
+    if length > MAX_STATE_BYTES {
+        return Err(invalid());
+    }
+    let mut mac = Hmac::<Sha256>::new_from_slice(key.as_bytes()).map_err(|_| invalid())?;
+    mac.update(STATE_DOMAIN);
+    mac.update(&(length as u64).to_be_bytes());
+    let mut writer = StateWriter {
+        mac,
+        remaining: length,
+        encoded,
+    };
+    serde_json::to_writer(&mut writer, stored).map_err(|_| invalid())?;
+    if writer.remaining != 0 {
+        return Err(invalid());
+    }
+    Ok(writer.mac)
+}
+
+fn encode_state(stored: &StoredLedger, key: &AuditKey) -> io::Result<(Vec<u8>, [u8; 32])> {
+    let length = canonical_state_len(stored)?;
+    let mut encoded = Vec::new();
+    encoded.try_reserve_exact(length).map_err(|_| invalid())?;
+    #[cfg(test)]
+    let _observed_encoding =
+        super::config_capacity_simultaneous_working_tests::ledger::encoding(&encoded);
+    let mac = stream_state(stored, key, length, Some(&mut encoded))?;
+    Ok((encoded, mac.finalize().into_bytes().into()))
+}
+
 /// A signed inactive row distinguishes initial provisioning from lost authority.
 pub(crate) fn initialize_sync(
     conn: &Connection,
@@ -102,8 +193,20 @@ fn read_verified_sync(conn: &Connection, key: &AuditKey) -> io::Result<StoredLed
         [], |row| Ok((row.get(0)?,row.get(1)?)),
     ).optional().map_err(|_| invalid())?.ok_or_else(invalid)?;
     let mac: [u8; 32] = mac.try_into().map_err(|_| invalid())?;
+    #[cfg(test)]
+    let encoded =
+        super::config_capacity_simultaneous_working_tests::ledger::EncodedRead::observe(encoded);
     let stored: StoredLedger = serde_json::from_slice(&encoded).map_err(|_| invalid())?;
-    verify(key, STATE_DOMAIN, &stored, &mac).map_err(|_| invalid())?;
+    #[cfg(test)]
+    let observed_read =
+        super::config_capacity_simultaneous_working_tests::ledger::decoded(stored.ledger.as_ref());
+    let length = canonical_state_len(&stored)?;
+    stream_state(&stored, key, length, None)?
+        .verify_slice(&mac)
+        .map_err(|_| invalid())?;
+    // Canonical authentication is complete. The decoded state owns every field
+    // needed below; release the SQL JSON before validation derives operations.
+    drop(encoded);
     if let Some(ledger) = &stored.ledger {
         ledger
             .validate(key, stored.identity)
@@ -118,6 +221,8 @@ fn read_verified_sync(conn: &Connection, key: &AuditKey) -> io::Result<StoredLed
     if !matches {
         return Err(invalid());
     }
+    #[cfg(test)]
+    drop(observed_read);
     Ok(stored)
 }
 
@@ -133,11 +238,13 @@ pub(crate) fn write_sync(
     initialize: bool,
 ) -> io::Result<()> {
     let stored = StoredLedger { identity, ledger };
-    let encoded = serde_json::to_vec(&stored).map_err(|_| invalid())?;
-    if encoded.len() > MAX_STATE_BYTES {
-        return Err(invalid());
-    }
-    let mac = authenticate(key, STATE_DOMAIN, &stored).map_err(|_| invalid())?;
+    #[cfg(test)]
+    let _observed_ledger =
+        super::config_capacity_simultaneous_working_tests::ledger::decoded(stored.ledger.as_ref());
+    let (encoded, mac) = encode_state(&stored, key)?;
+    #[cfg(test)]
+    let _observed_write =
+        super::config_capacity_simultaneous_working_tests::ledger::write(&encoded);
     let statement = if initialize {
         "INSERT INTO config_raft_management_audit(singleton,state_json,state_hmac) VALUES(1,?1,?2)"
     } else {
@@ -204,6 +311,10 @@ pub(crate) fn apply_cancellable_sync(
         }
     }
     let mut ledger = read_with_keys_sync(conn, key, keys, identity)?;
+    #[cfg(test)]
+    let observed_mutation = ledger
+        .as_ref()
+        .map(super::config_capacity_simultaneous_working_tests::ledger::mutating);
     let result = match command {
         AuditCommand::Initialize { .. } if keys.is_some() => {
             Err(AuditAuthorityError::BindingMismatch)
@@ -371,6 +482,8 @@ pub(crate) fn apply_cancellable_sync(
         ledger.validate_continuity(keys).map_err(|_| invalid())?;
     }
     cancellation.check_io()?;
+    #[cfg(test)]
+    drop(observed_mutation);
     write_sync(conn, key, identity, ledger, false)?;
     Ok(Ok(()))
 }
@@ -399,14 +512,13 @@ pub(crate) fn applied_receipt_sync(
     use crate::audit_authority::receipt::AuthenticatedAuditReceipt;
     let handle = match intent {
         super::ConfigMutationIntent::AuditedMutation(prepared) => &prepared.handle,
-        super::ConfigMutationIntent::ManagementAudit(
+        super::ConfigMutationIntent::ManagementAudit(command) => match command.as_ref() {
             AuditCommand::Intent(handle)
             | AuditCommand::Reject(handle)
-            | AuditCommand::Terminal(handle),
-        ) => handle,
-        super::ConfigMutationIntent::ManagementAudit(AuditCommand::NetconfTarget(command)) => {
-            command.handle()
-        }
+            | AuditCommand::Terminal(handle) => handle,
+            AuditCommand::NetconfTarget(command) => command.handle(),
+            _ => return Ok(None),
+        },
         _ => return Ok(None),
     };
     // A rejected malformed/substituted handle has no receipt, not an I/O fault.
@@ -419,20 +531,20 @@ pub(crate) fn applied_receipt_sync(
     let Some(ledger) = read_sync(conn, key, identity)? else {
         return Ok(None);
     };
-    if let super::ConfigMutationIntent::ManagementAudit(AuditCommand::NetconfTarget(command)) =
-        intent
-    {
-        let receipt = match command.lookup_receipt(&ledger, key, handle.body.binding.caller) {
-            Ok(Some(receipt)) => receipt,
-            Ok(None) | Err(_) => return Ok(None),
-        };
-        let proof = match &**command {
-            super::audit_mutation::TargetAuditCommandV1::EmptyCommit(prepared) => {
-                AuthenticatedAuditReceipt::seal_empty_commit(key, prepared, &receipt)
-            }
-            _ => AuthenticatedAuditReceipt::seal(key, &receipt),
-        };
-        return proof.map(Some).map_err(|_| invalid());
+    if let super::ConfigMutationIntent::ManagementAudit(audit) = intent {
+        if let AuditCommand::NetconfTarget(command) = audit.as_ref() {
+            let receipt = match command.lookup_receipt(&ledger, key, handle.body.binding.caller) {
+                Ok(Some(receipt)) => receipt,
+                Ok(None) | Err(_) => return Ok(None),
+            };
+            let proof = match &**command {
+                super::audit_mutation::TargetAuditCommandV1::EmptyCommit(prepared) => {
+                    AuthenticatedAuditReceipt::seal_empty_commit(key, prepared, &receipt)
+                }
+                _ => AuthenticatedAuditReceipt::seal(key, &receipt),
+            };
+            return proof.map(Some).map_err(|_| invalid());
+        }
     }
     ledger
         .lookup(key, handle, handle.body.binding.caller)
@@ -463,6 +575,14 @@ pub(crate) fn protects_config_prefix(
         })
     }))
 }
+
+#[cfg(test)]
+#[path = "tests/config_capacity_957_ledger_allocations.rs"]
+mod config_capacity_957_ledger_allocations;
+
+#[cfg(test)]
+#[path = "tests/config_capacity_957_ledger_streaming.rs"]
+mod config_capacity_957_ledger_streaming;
 
 #[cfg(test)]
 #[path = "../../tests/management_audit_authority/target_command.rs"]

@@ -462,10 +462,13 @@ impl ConsensusConfigStore {
         let encoded = serde_json::to_vec(&(&command, uuid::Uuid::new_v4()))
             .map_err(|_| AuditAuthorityError::InvalidInput)?;
         let request = derive_durable_request_id(self.inner.identity, b"audit-continuity", &encoded);
-        self.submit_request(request, ConfigMutationIntent::ManagementAudit(command))
-            .await
-            .map_err(|_| AuditAuthorityError::Unavailable)?
-            .result
-            .map_err(crate::consensus::audit::map_failure)
+        self.submit_request(
+            request,
+            ConfigMutationIntent::ManagementAudit(Box::new(command)),
+        )
+        .await
+        .map_err(|_| AuditAuthorityError::Unavailable)?
+        .result
+        .map_err(crate::consensus::audit::map_failure)
     }
 }

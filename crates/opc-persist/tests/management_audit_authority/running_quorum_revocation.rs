@@ -161,7 +161,7 @@ impl ReadCall {
             matches!(
                 decode_config_wire_for_profile::<
                     Result<AppendEntriesResponse<ConsensusNodeId>, RaftError<ConsensusNodeId>>,
-                >(payload, RetainedConfigProfile::NetconfTargetsV1),
+                >(RetainedConfigProfile::NetconfTargetsV1, payload),
                 Ok(Ok(AppendEntriesResponse::Success))
             )
         });
@@ -248,8 +248,8 @@ impl ConsensusPeer for NativePeer {
     ) -> Result<ConsensusWireResponse, ConsensusPeerError> {
         let call = if request.family == ConsensusRpcFamily::AppendEntries {
             let rpc: AppendEntriesRequest<ConfigRaftTypeConfig> = decode_config_wire_for_profile(
-                &request.payload,
                 RetainedConfigProfile::NetconfTargetsV1,
+                &request.payload,
             )
             .map_err(|_| ConsensusPeerError::Rejected)?;
             let task = tokio::task::try_id().ok_or(ConsensusPeerError::Unavailable)?;

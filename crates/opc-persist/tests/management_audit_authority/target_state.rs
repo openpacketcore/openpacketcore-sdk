@@ -10585,7 +10585,9 @@ async fn target_receipt_requires_the_retained_description_after_admission_race()
             &tx,
             &fixture.key,
             fixture.identity,
-            &ConfigMutationIntent::ManagementAudit(AuditCommand::NetconfTarget(Box::new(phase))),
+            &ConfigMutationIntent::ManagementAudit(Box::new(AuditCommand::NetconfTarget(
+                Box::new(phase),
+            ))),
         )
         .unwrap()
         .unwrap();
@@ -10646,7 +10648,9 @@ async fn target_receipt_requires_the_retained_description_after_admission_race()
             &tx,
             &fixture.key,
             fixture.identity,
-            &ConfigMutationIntent::ManagementAudit(AuditCommand::NetconfTarget(Box::new(phase))),
+            &ConfigMutationIntent::ManagementAudit(Box::new(AuditCommand::NetconfTarget(
+                Box::new(phase),
+            ))),
         )
         .unwrap();
         assert!(
@@ -10880,8 +10884,8 @@ async fn target_empty_commit_refuses_an_ordinary_observation_receipt() {
     let before = (target_rows(&conn), ledger.sequence);
     assert!(fixture.observe_empty_commit(&conn, &prepared, 100).is_err());
     assert_eq!((target_rows(&conn), fixture.ledger(&conn).sequence), before);
-    let command = ConfigMutationIntent::ManagementAudit(AuditCommand::NetconfTarget(Box::new(
-        TargetAuditCommandV1::EmptyCommit(prepared.clone()),
+    let command = ConfigMutationIntent::ManagementAudit(Box::new(AuditCommand::NetconfTarget(
+        Box::new(TargetAuditCommandV1::EmptyCommit(prepared.clone())),
     )));
     let tx = conn.unchecked_transaction().unwrap();
     let proof = crate::consensus::audit::applied_receipt_sync(
@@ -11138,9 +11142,9 @@ async fn target_empty_commit_proof_binds_guard_and_survives_later_unavailability
         &tx,
         &fixture.key,
         fixture.identity,
-        &ConfigMutationIntent::ManagementAudit(AuditCommand::NetconfTarget(Box::new(
+        &ConfigMutationIntent::ManagementAudit(Box::new(AuditCommand::NetconfTarget(Box::new(
             TargetAuditCommandV1::EmptyCommit(prepared.clone()),
-        ))),
+        )))),
     )
     .unwrap()
     .unwrap();
@@ -11491,7 +11495,7 @@ impl Fixture {
             &self.key,
         )
         .unwrap();
-        crate::consensus::PreparedAuditedMutation { handle, effect }
+        crate::consensus::PreparedAuditedMutation::new(handle, effect, None)
     }
 
     fn admit_ordinary(
@@ -11499,7 +11503,7 @@ impl Fixture {
         conn: &Connection,
         prepared: &crate::consensus::PreparedAuditedMutation,
     ) {
-        self.apply(conn, AuditCommand::Intent(prepared.handle.clone()), 100)
+        self.apply(conn, AuditCommand::Intent(prepared.handle().clone()), 100)
             .unwrap();
         self.checkpoint(conn);
     }
@@ -11538,7 +11542,7 @@ async fn ordinary_running_apply_preserves_target_state_and_known_commit() {
         .lookup(
             &fixture.key,
             prepared.handle(),
-            prepared.handle.body.binding.caller,
+            prepared.handle().body.binding.caller,
         )
         .unwrap()
         .unwrap();
@@ -11562,7 +11566,7 @@ async fn ordinary_running_apply_preserves_target_state_and_known_commit() {
         "known committed replay changed its retained audit obligation"
     );
     let crate::consensus::audit_mutation::AuditedConfigEffect::Append { commit, .. } =
-        &prepared.effect
+        &prepared.command().effect
     else {
         panic!("ordinary append fixture");
     };
@@ -11592,7 +11596,7 @@ async fn ordinary_running_apply_refuses_equal_caller_without_running_lock_lease(
     fixture.settle(&conn, &lock);
     let before = target_rows(&conn);
     let prepared = fixture.ordinary_running(&conn, 221);
-    assert!(prepared.handle.body.binding.caller == lock.effect.caller);
+    assert!(prepared.handle().body.binding.caller == lock.effect.caller);
     fixture.admit_ordinary(&conn, &prepared);
     assert!(
         matches!(
@@ -11617,7 +11621,7 @@ async fn ordinary_running_apply_refuses_equal_caller_without_running_lock_lease(
             .lookup(
                 &fixture.key,
                 prepared.handle(),
-                prepared.handle.body.binding.caller
+                prepared.handle().body.binding.caller
             )
             .unwrap()
             .unwrap()
@@ -11625,7 +11629,11 @@ async fn ordinary_running_apply_refuses_equal_caller_without_running_lock_lease(
         AuditOperationState::Rejected
     );
     fixture
-        .apply(&conn, AuditCommand::Terminal(prepared.handle.clone()), 100)
+        .apply(
+            &conn,
+            AuditCommand::Terminal(prepared.handle().clone()),
+            100,
+        )
         .unwrap();
     fixture.checkpoint(&conn);
     let unlock = fixture.request(&conn, 222, 3, 0x61, 0);

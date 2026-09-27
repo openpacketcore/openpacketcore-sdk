@@ -193,6 +193,7 @@ fn target_binding_authenticates_every_common_field_and_preserves_original_handle
 #[test]
 fn target_command_cannot_enter_any_legacy_command_revision() {
     use crate::consensus::{ConfigConsensusCommand, ConfigMutationIntent};
+    use crate::retained::RetainedConfigMode;
     let prepared = signed_discard();
     let identity = prepared.handle.body.identity;
     for revision in 1..=9 {
@@ -201,13 +202,24 @@ fn target_command_cannot_enter_any_legacy_command_revision() {
             identity,
             request_id: crate::ConfigConsensusRequestId::from_bytes([0x51; 16]),
             logical_time: "2026-01-01T00:00:00Z".parse().unwrap(),
-            intent: ConfigMutationIntent::ManagementAudit(AuditCommand::NetconfTarget(Box::new(
-                crate::consensus::audit_mutation::TargetAuditCommandV1::Apply(prepared.clone()),
+            intent: ConfigMutationIntent::ManagementAudit(Box::new(AuditCommand::NetconfTarget(
+                Box::new(
+                    crate::consensus::audit_mutation::TargetAuditCommandV1::Apply(prepared.clone()),
+                ),
             ))),
         };
         assert!(
-            command.validate(identity).is_err(),
+            command
+                .validate_structure_for_mode(identity, RetainedConfigMode::Legacy)
+                .is_err(),
             "target effect admitted under the legacy profile"
+        );
+        assert_eq!(
+            command
+                .validate_structure_for_mode(identity, RetainedConfigMode::NetconfTargetsV1)
+                .is_ok(),
+            revision == 9,
+            "target effect must use its allocated target profile revision"
         );
         let bytes = opc_consensus::encode_bounded(&command.intent).unwrap();
         assert_eq!(&bytes[..2], &[6, 9]);

@@ -99,8 +99,8 @@ async fn cleanup_retirement_durable_original_blocks_delayed_admit_and_apply() {
             &tx,
             &fixture.key,
             fixture.identity,
-            &crate::consensus::ConfigMutationIntent::ManagementAudit(AuditCommand::NetconfTarget(
-                Box::new(phase.clone()),
+            &crate::consensus::ConfigMutationIntent::ManagementAudit(Box::new(
+                AuditCommand::NetconfTarget(Box::new(phase.clone())),
             )),
         )
         .unwrap()

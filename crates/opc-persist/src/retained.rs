@@ -41,6 +41,66 @@ const BINDING_SCHEMA: &str = "CREATE TABLE consensus_retained_binding (singleton
 // Bounds concurrent startup work, including cancelled blocking operations.
 static ADMISSION_GATE: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(4);
 
+/// One resolved runtime choice. This is never serialized and does not widen
+/// either independently selected public profile or any received wire format.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum RetainedConfigMode {
+    Legacy,
+    BoundedV1,
+    NetconfTargetsV1,
+}
+
+impl RetainedConfigMode {
+    pub(crate) fn resolve(
+        target: RetainedConfigProfile,
+        capacity: opc_crypto::ConfigCapacityProfile,
+    ) -> Result<Self, RetainedConfigError> {
+        match (target, capacity) {
+            (RetainedConfigProfile::Legacy, opc_crypto::ConfigCapacityProfile::Legacy) => {
+                Ok(Self::Legacy)
+            }
+            (RetainedConfigProfile::Legacy, opc_crypto::ConfigCapacityProfile::BoundedV1) => {
+                Ok(Self::BoundedV1)
+            }
+            (
+                RetainedConfigProfile::NetconfTargetsV1,
+                opc_crypto::ConfigCapacityProfile::Legacy,
+            ) => Ok(Self::NetconfTargetsV1),
+            _ => Err(RetainedConfigError::Unsupported),
+        }
+    }
+
+    pub(crate) const fn capacity_profile(self) -> opc_crypto::ConfigCapacityProfile {
+        match self {
+            Self::Legacy | Self::NetconfTargetsV1 => opc_crypto::ConfigCapacityProfile::Legacy,
+            Self::BoundedV1 => opc_crypto::ConfigCapacityProfile::BoundedV1,
+        }
+    }
+
+    pub(crate) const fn target_profile(self) -> RetainedConfigProfile {
+        match self {
+            Self::Legacy | Self::BoundedV1 => RetainedConfigProfile::Legacy,
+            Self::NetconfTargetsV1 => RetainedConfigProfile::NetconfTargetsV1,
+        }
+    }
+}
+
+impl TryFrom<opc_crypto::ConfigCapacityProfile> for RetainedConfigMode {
+    type Error = RetainedConfigError;
+    fn try_from(profile: opc_crypto::ConfigCapacityProfile) -> Result<Self, Self::Error> {
+        Self::resolve(RetainedConfigProfile::Legacy, profile)
+    }
+}
+
+impl From<RetainedConfigProfile> for RetainedConfigMode {
+    fn from(profile: RetainedConfigProfile) -> Self {
+        match profile {
+            RetainedConfigProfile::Legacy => Self::Legacy,
+            RetainedConfigProfile::NetconfTargetsV1 => Self::NetconfTargetsV1,
+        }
+    }
+}
+
 #[derive(Clone, Copy)]
 enum OpenIntent {
     NewAuthority,
@@ -59,6 +119,7 @@ pub struct RetainedConfigBinding {
     backing_identity: [u8; 32],
     key_scope: [u8; 32],
     profile: RetainedConfigProfile,
+    capacity_profile: opc_crypto::ConfigCapacityProfile,
 }
 
 impl RetainedConfigBinding {
@@ -76,6 +137,7 @@ impl RetainedConfigBinding {
             backing_identity,
             key_scope,
             profile: RetainedConfigProfile::Legacy,
+            capacity_profile: opc_crypto::ConfigCapacityProfile::Legacy,
         })
     }
 
@@ -93,11 +155,30 @@ impl RetainedConfigBinding {
         self.profile
     }
 
+    pub(crate) fn mode(&self) -> Result<RetainedConfigMode, RetainedConfigError> {
+        RetainedConfigMode::resolve(self.profile, self.capacity_profile)
+    }
+
+    /// Select an immutable plaintext capacity profile before provisioning or
+    /// reopening. This never promotes existing storage: the authenticated
+    /// binding must match before any original database/WAL recovery. Selecting
+    /// a profile does not enable unqualified consensus admission.
+    pub fn with_capacity_profile(mut self, profile: opc_crypto::ConfigCapacityProfile) -> Self {
+        self.capacity_profile = profile;
+        self
+    }
+
+    /// The exact caller-selected profile authenticated by this binding.
+    pub const fn capacity_profile(&self) -> opc_crypto::ConfigCapacityProfile {
+        self.capacity_profile
+    }
+
     pub(crate) fn topology(&self) -> &ConfigConsensusTopology {
         &self.topology
     }
 
-    fn digest(&self, key: &AuditKey) -> [u8; 32] {
+    fn digest(&self, key: &AuditKey) -> Result<[u8; 32], RetainedConfigError> {
+        let mode = self.mode()?;
         let identity = self.topology.identity();
         let mut digest = Sha256::new();
         digest.update(BINDING_DOMAIN);
@@ -113,17 +194,21 @@ impl RetainedConfigBinding {
         digest.update(self.key_scope);
         digest.update(key.epoch().to_be_bytes());
         digest.update(key.fingerprint());
-        let legacy: [u8; 32] = digest.finalize().into();
-        match self.profile {
-            RetainedConfigProfile::Legacy => legacy,
-            RetainedConfigProfile::NetconfTargetsV1 => {
-                let mut digest = Sha256::new();
-                digest.update(TARGET_BINDING_DOMAIN);
-                // Closed target profile 1, independently selected legacy capacity 0.
-                digest.update([1, 0]);
-                digest.update(legacy);
-                digest.finalize().into()
-            }
+        // Legacy bytes remain identical. A nonlegacy profile is part of the
+        // authenticated admission scope checked before original WAL recovery.
+        if self.capacity_profile != opc_crypto::ConfigCapacityProfile::Legacy {
+            digest.update(b"openpacketcore/config-retained-capacity/v1\0");
+            digest.update(self.capacity_profile.revision().to_be_bytes());
+        }
+        let base: [u8; 32] = digest.finalize().into();
+        if mode == RetainedConfigMode::NetconfTargetsV1 {
+            let mut digest = Sha256::new();
+            digest.update(TARGET_BINDING_DOMAIN);
+            digest.update([1, 0]);
+            digest.update(base);
+            Ok(digest.finalize().into())
+        } else {
+            Ok(base)
         }
     }
 }
@@ -328,6 +413,7 @@ async fn open_authority(
     audit_key: AuditKey,
     intent: OpenIntent,
 ) -> Result<SqliteBackend, RetainedConfigError> {
+    options.binding.mode()?;
     let admission_slot = ADMISSION_GATE
         .try_acquire()
         .map_err(|_| RetainedConfigError::AdmissionBound)?;
@@ -520,8 +606,8 @@ fn open_authority_sync(
             &conn,
             options.binding.topology(),
             &audit_key,
+            options.binding.mode()?,
             work.deadline,
-            options.binding.profile(),
         )
         .map_err(|_| RetainedConfigError::Rejected)?;
         #[cfg(test)]
@@ -636,7 +722,7 @@ fn make_record(
 ) -> Result<[u8; RECORD_BYTES], RetainedConfigError> {
     let mut record = [0; RECORD_BYTES];
     record[..8].copy_from_slice(RECORD_MAGIC);
-    record[8..40].copy_from_slice(&binding.digest(key));
+    record[8..40].copy_from_slice(&binding.digest(key)?);
     record[40..72].copy_from_slice(&nonce);
     record[72] = u8::from(repair_only);
     for (i, value) in identity.iter().enumerate() {
@@ -661,7 +747,7 @@ fn validate_record(
     mac.update(&record[..RECORD_BYTES - 32]);
     mac.verify_slice(&record[RECORD_BYTES - 32..])
         .map_err(|_| RetainedConfigError::Rejected)?;
-    if &record[..8] != RECORD_MAGIC || record[8..40] != binding.digest(key) || record[72] > 1 {
+    if &record[..8] != RECORD_MAGIC || record[8..40] != binding.digest(key)? || record[72] > 1 {
         return Err(RetainedConfigError::Rejected);
     }
     Ok(())
@@ -770,11 +856,11 @@ fn validate_connection(
     }
     // A digest supplied by the retained database is only a compatibility
     // check. The independent SDK catalog includes the exact replay index.
-    match options.binding.profile() {
-        RetainedConfigProfile::Legacy => crate::schema::validate_retained_base_schema(conn),
-        RetainedConfigProfile::NetconfTargetsV1 => {
+    match options.binding.mode()? {
+        RetainedConfigMode::NetconfTargetsV1 => {
             crate::schema::validate_retained_base_schema_with_netconf_targets(conn)
         }
+        _ => crate::schema::validate_retained_base_schema(conn),
     }
     .map_err(|_| RetainedConfigError::Rejected)?;
     let version =
@@ -818,8 +904,8 @@ fn validate_connection(
         conn,
         options.binding.topology(),
         key,
+        options.binding.mode()?,
         work.deadline,
-        options.binding.profile(),
     )
     .map_err(|_| RetainedConfigError::Rejected)?;
     conn.progress_handler(0, None::<fn() -> bool>)
@@ -829,3 +915,6 @@ fn validate_connection(
 
 #[cfg(all(test, unix))]
 mod tests;
+
+#[cfg(all(test, unix))]
+mod three_mode_tests;

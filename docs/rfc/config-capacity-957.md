@@ -280,7 +280,11 @@ Ordinary prepared operations remain non-cloneable; audited prepared aliases
 share immutable payload and preparation ownership. Separate nonwaiting guards
 bound concurrent SDK encoding and mutation submission by those aliases.
 Timeout or cancellation must retain ownership of accepted work until it
-finishes. The receiver acquires its own reservation before inner forwarded
+finishes. A closed Openraft response channel reports `OutcomeUnknown` to the
+caller independently of cleanup; it does not prove the accepted native apply
+has released its payload. The supervisor retains both admission owners until
+the final native storage owner drains, using observation that owns no storage.
+The receiver acquires its own reservation before inner forwarded
 command decoding. Slot counts alone are not allocated-byte accounting.
 
 `ConsensusConfigStore::decode_prepared_audited_mutation` reserves before owned

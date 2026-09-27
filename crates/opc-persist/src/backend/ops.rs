@@ -489,12 +489,15 @@ impl SqliteBackend {
     {
         let audit_key = Arc::clone(&self.audit_key);
         let required = Arc::clone(&self.config_consensus_history_required);
-        let profile = self
+        let expected_identity = Arc::clone(&self.config_consensus_identity);
+        let mode = self
             .retained_binding
             .as_ref()
-            .map_or(crate::RetainedConfigProfile::Legacy, |binding| {
-                binding.profile()
-            });
+            .map_or(
+                Ok(crate::consensus::RetainedConfigMode::Legacy),
+                crate::RetainedConfigBinding::mode,
+            )
+            .map_err(|_| PersistError::corrupt_blob())?;
         crate::consensus::run_backend_sqlite_with_timeout(
             self,
             crate::consensus::DEFAULT_CONFIG_CONSENSUS_OPERATION_TIMEOUT,
@@ -506,7 +509,8 @@ impl SqliteBackend {
                     &tx,
                     audit_key.as_ref(),
                     required.load(std::sync::atomic::Ordering::Acquire),
-                    profile,
+                    expected_identity.get().copied(),
+                    mode,
                     cancellation,
                 )
                 .map_err(|_| PersistError::corrupt_blob())

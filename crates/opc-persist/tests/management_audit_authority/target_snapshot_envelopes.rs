@@ -1,6 +1,16 @@
 //! Envelope compatibility is independent of SQLite body authentication.
 use super::*;
 use crate::RetainedConfigProfile;
+fn identity() -> ConsensusIdentity {
+    ConsensusIdentity::new(
+        crate::ConfigConsensusClusterId::from_bytes([0x31; 32]),
+        crate::ConfigConsensusConfigurationId::from_bytes([0x32; 32]),
+        crate::ConfigConsensusConfigurationEpoch::new(1).unwrap(),
+    )
+}
+fn key() -> AuditKey {
+    AuditKey::new([0x33; 32]).unwrap()
+}
 
 #[tokio::test]
 async fn target_snapshot_envelope_preserves_legacy_bytes_and_requires_selected_profile() {
@@ -13,25 +23,41 @@ async fn target_snapshot_envelope_preserves_legacy_bytes_and_requires_selected_p
         (RetainedConfigProfile::NetconfTargetsV1, 7u16),
     ] {
         let output = directory.path().join(format!("snapshot-{revision}.opc"));
-        let (_, _, _cleanup) = envelope_snapshot_database_for_profile(&raw, &output, profile)
-            .await
-            .unwrap();
+        let (_, _, _cleanup) = envelope_snapshot_database(
+            &raw,
+            &output,
+            crate::consensus::RetainedConfigMode::from(profile),
+            identity(),
+            &key(),
+        )
+        .await
+        .unwrap();
         let mut expected = payload.to_vec();
         expected.extend_from_slice(b"OPCCFG01");
         expected.extend_from_slice(&revision.to_be_bytes());
         expected.extend_from_slice(&(payload.len() as u64).to_be_bytes());
         expected.extend_from_slice(&Sha256::digest(payload));
         assert_eq!(std::fs::read(&output).unwrap(), expected);
-        assert!(verify_snapshot_envelope_for_profile(&output, profile)
-            .await
-            .is_ok());
+        assert!(verify_snapshot_envelope(
+            &output,
+            crate::consensus::RetainedConfigMode::from(profile),
+            identity(),
+            &key()
+        )
+        .await
+        .is_ok());
         let other = match profile {
             RetainedConfigProfile::Legacy => RetainedConfigProfile::NetconfTargetsV1,
             RetainedConfigProfile::NetconfTargetsV1 => RetainedConfigProfile::Legacy,
         };
-        assert!(verify_snapshot_envelope_for_profile(&output, other)
-            .await
-            .is_err());
+        assert!(verify_snapshot_envelope(
+            &output,
+            crate::consensus::RetainedConfigMode::from(other),
+            identity(),
+            &key()
+        )
+        .await
+        .is_err());
     }
 }
 
@@ -43,9 +69,15 @@ async fn target_snapshot_envelope_rejects_truncation_substitution_and_unknown_re
     std::fs::write(&raw, payload).unwrap();
     let output = directory.path().join("snapshot.opc");
     let profile = RetainedConfigProfile::NetconfTargetsV1;
-    let (_, _, _cleanup) = envelope_snapshot_database_for_profile(&raw, &output, profile)
-        .await
-        .unwrap();
+    let (_, _, _cleanup) = envelope_snapshot_database(
+        &raw,
+        &output,
+        crate::consensus::RetainedConfigMode::from(profile),
+        identity(),
+        &key(),
+    )
+    .await
+    .unwrap();
     let original = std::fs::read(&output).unwrap();
     let mut attacks = vec![
         Vec::new(),
@@ -65,12 +97,22 @@ async fn target_snapshot_envelope_rejects_truncation_substitution_and_unknown_re
     }
     for bytes in attacks {
         std::fs::write(&output, bytes).unwrap();
-        assert!(verify_snapshot_envelope_for_profile(&output, profile)
-            .await
-            .is_err());
+        assert!(verify_snapshot_envelope(
+            &output,
+            crate::consensus::RetainedConfigMode::from(profile),
+            identity(),
+            &key()
+        )
+        .await
+        .is_err());
     }
     std::fs::write(&output, original).unwrap();
-    assert!(verify_snapshot_envelope_for_profile(&output, profile)
-        .await
-        .is_ok());
+    assert!(verify_snapshot_envelope(
+        &output,
+        crate::consensus::RetainedConfigMode::from(profile),
+        identity(),
+        &key()
+    )
+    .await
+    .is_ok());
 }

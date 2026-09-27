@@ -797,6 +797,9 @@ pub(super) fn ordinary_running_allowed_sync(
         AuditedConfigEffect::Append { commit, resolution } => {
             commit.record.confirmed_deadline.is_none() && resolution.is_none()
         }
+        // Target9/7 has legacy capacity; bounded effects require the separate
+        // capacity8/6 authority and cannot be promoted by target state.
+        AuditedConfigEffect::BoundedAppend { .. } => false,
         AuditedConfigEffect::Confirm { .. } => false,
         AuditedConfigEffect::RollbackPoint { .. } => true,
     })

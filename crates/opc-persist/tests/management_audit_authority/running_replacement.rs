@@ -777,15 +777,18 @@ async fn running_replacement_revocation_while_waiting_for_real_proposal_permit_n
         b"netconf-target-intent",
         &prepared.handle.mac,
     );
-    let command = ConfigMutationIntent::ManagementAudit(
+    let command = ConfigMutationIntent::ManagementAudit(Box::new(
         super::super::audit::AuditCommand::NetconfTarget(Box::new(
             super::super::audit_mutation::TargetAuditCommandV1::Admit(prepared),
         )),
-    );
+    ));
     {
-        let pending =
-            f.store
-                .submit_request_on_local_leader_guarded(request, command, Some(&session));
+        let pending = f.store.submit_owned_request_on_local_leader_guarded(
+            request,
+            command,
+            f.store.reserve_submission().unwrap(),
+            Some(&session),
+        );
         tokio::pin!(pending);
         tokio::select! { biased;
             _ = &mut pending => panic!("proposal bypassed its actual held permit"),

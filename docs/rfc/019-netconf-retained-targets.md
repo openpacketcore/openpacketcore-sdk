@@ -413,6 +413,32 @@ replaying a possibly applied operation.
 
 ## Retained state and compatibility
 
+The independent `RetainedConfigBinding` selectors resolve once, before retained
+admission or engine startup, to a nonserialized closed mode:
+
+| Target selector | Capacity selector | Command/wire | Storage/snapshot |
+| --- | --- | --- | --- |
+| Legacy | Legacy | 7 | 5 |
+| Legacy | BoundedV1 | 8 | 6 |
+| NetconfTargetsV1 | Legacy | 9 | 7 |
+| NetconfTargetsV1 | BoundedV1 | Refused | Refused |
+
+The resolved mode is process-local selection, never authority inferred from a
+peer, database row or command. The existing Legacy and bounded retained-binding
+transcripts stay byte-identical; the target digest remains its target domain,
+`[1, 0]` and the Legacy digest. Native storage, RPCs, authenticated history and
+snapshots consume the same resolved selection. Bounded proof admission and
+local preparation ownership remain exclusive to capacity8/6. A target9 command
+cannot authorize a bounded payload. All three modes retain their exact peer and
+storage revision checks and original limits, deadlines and WAL durability.
+
+This composition allocates neither command/wire10 nor storage/snapshot8. It
+performs no migration and does not make the joint profile available. A future
+joint contract needs its own complete retained identity, authenticated target
+and history proofs, bounded decoders, publication/recovery behavior and native
+qualification; changing a revision whitelist alone cannot provide it.
+
+
 The target extension proposes config command/wire revision **9** and
 storage/snapshot revision **7**. Revision 8 and storage/snapshot 6 are reserved by
 the separate capacity contract. These numbers do not imply that an unimplemented

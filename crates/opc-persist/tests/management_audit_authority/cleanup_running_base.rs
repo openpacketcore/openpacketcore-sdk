@@ -14,18 +14,18 @@ fn commit_ordinary(fixture: &Fixture, conn: &Connection, request: u8) {
         .lookup(
             &fixture.key,
             prepared.handle(),
-            prepared.handle.body.binding.caller,
+            prepared.handle().body.binding.caller,
         )
         .unwrap()
         .unwrap();
     assert_eq!(
         receipt.state(),
         AuditOperationState::Committed {
-            version: prepared.handle.body.binding.base_version + 1,
+            version: prepared.handle().body.binding.base_version + 1,
         }
     );
     fixture
-        .apply(conn, AuditCommand::Terminal(prepared.handle.clone()), 100)
+        .apply(conn, AuditCommand::Terminal(prepared.handle().clone()), 100)
         .unwrap();
     fixture.checkpoint(conn);
     let ledger = fixture.ledger(conn);
