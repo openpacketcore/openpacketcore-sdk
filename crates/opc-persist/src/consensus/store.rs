@@ -4,6 +4,8 @@ mod audit;
 mod audit_continuity;
 mod config_capacity_admission;
 mod config_capacity_local_admission;
+#[cfg(all(test, target_os = "linux"))]
+pub(super) mod config_capacity_native_owner_observation;
 mod recovery;
 
 pub use recovery::{

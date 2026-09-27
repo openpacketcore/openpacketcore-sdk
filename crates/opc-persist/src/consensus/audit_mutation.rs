@@ -9,7 +9,9 @@ use target_copy::TargetCopyBindingV1;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
 use super::preparation::{PreparationOwnership, SubmissionOwnership};
-use super::{ConfigMutationIntent, PreparedConfigCommit};
+#[cfg(test)]
+use super::ConfigMutationIntent;
+use super::PreparedConfigCommit;
 use crate::audit_authority::ledger::{authenticate, verify};
 use crate::audit_authority::{AuditAuthorityError, AuditOperationHandle};
 use crate::{AuditKey, ConfirmedCommitResolution};
@@ -74,6 +76,7 @@ impl AuditedConfigEffect {
         }
     }
 
+    #[cfg(test)]
     pub(crate) fn intent(&self) -> ConfigMutationIntent {
         match self {
             Self::BoundedAppend {

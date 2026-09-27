@@ -38,6 +38,31 @@ pub(super) mod config_capacity_apply_observations;
 #[cfg(test)]
 pub(super) mod config_capacity_append_observations;
 
+#[cfg(all(test, target_os = "linux"))]
+pub(super) mod config_capacity_native_read_observations;
+
+#[cfg(all(test, target_os = "linux"))]
+use config_capacity_native_read_observations as native_io;
+
+macro_rules! native_io_result {
+    ($result:expr, $observer:ident $(, $entries:ident)?) => {{
+        #[cfg(all(test, target_os = "linux"))]
+        {
+            let result = $result;
+            match &result {
+                Ok(_value) => {
+                    $(native_io::$entries(_value);)?
+                    $observer.completed();
+                }
+                Err(error) => $observer.failed(error),
+            }
+            result
+        }
+        #[cfg(not(all(test, target_os = "linux")))]
+        { $result }
+    }};
+}
+
 const SNAPSHOT_FOOTER_MAGIC: &[u8; 8] = b"OPCCFG01";
 const SNAPSHOT_FOOTER_BYTES: u64 = 8 + 2 + 8 + 32;
 const SNAPSHOT_MAX_BYTES: u64 = 64 * 1024 * 1024 * 1024;
@@ -236,6 +261,22 @@ impl ConfigDurableProgress {
             self.committed_present.store(false, Ordering::Release);
             self.committed_index.store(0, Ordering::Release);
         }
+    }
+
+    #[cfg(all(test, target_os = "linux"))]
+    pub(crate) fn print_native_io_progress(&self) {
+        let committed = self.committed_index();
+        let applied_epoch = *self.applied_epoch.borrow();
+        let apply_entered = *self.apply_entered.borrow();
+        let storage_released = self
+            .storage_released
+            .get()
+            .map(|receiver| receiver.has_changed().is_err());
+        let response_loss_poll = *self.accepted_response_loss.borrow();
+        println!(
+            "CONFIG_CAPACITY_NATIVE_IO_PROGRESS committed={:?} applied_epoch={} apply_entered={} storage_released={:?} response_loss_poll={:?}",
+            committed, applied_epoch, apply_entered, storage_released, response_loss_poll,
+        );
     }
 
     pub(crate) fn committed_index(&self) -> Option<u64> {
@@ -713,25 +754,53 @@ impl RaftLogReader<ConfigRaftTypeConfig> for SqliteConfigLogStore {
     ) -> Result<Vec<Entry<ConfigRaftTypeConfig>>, StorageError<ConsensusNodeId>> {
         let (start, end) = range_to_half_open(&range)
             .map_err(|error| storage_error(ErrorSubject::Logs, ErrorVerb::Read, error))?;
+        #[cfg(all(test, target_os = "linux"))]
+        let mut native_io_call = native_io::Call::queued(
+            self.core
+                .durable_progress
+                .append_observed_from
+                .get()
+                .copied(),
+            native_io::Reason::NativeRangeRead,
+            Some(start),
+            end,
+            None,
+        );
+        #[cfg(all(test, target_os = "linux"))]
+        let native_io_token = native_io_call.worker();
         if end.is_some_and(|end| start >= end) {
+            #[cfg(all(test, target_os = "linux"))]
+            native_io_call.completed();
             return Ok(Vec::new());
         }
         let identity = self.core.identity;
         let mode = self.core.mode;
         let members = self.core.expected_members.clone();
-        self.core
-            .run_sqlite(move |conn| {
-                sqlite::read_log_range_sync(conn, identity, &members, start, end, None, mode)
-            })
-            .await
-            .inspect(|_entries| {
-                #[cfg(test)]
-                self.core
-                    .durable_progress
-                    .native_read_max_entries
-                    .fetch_max(_entries.len(), Ordering::AcqRel);
-            })
-            .map_err(|error| storage_error(ErrorSubject::Logs, ErrorVerb::Read, error))
+        native_io_result!(
+            self.core
+                .run_sqlite(move |conn| {
+                    #[cfg(all(test, target_os = "linux"))]
+                    let mut native_io_worker = native_io::Scope::enter(native_io_token);
+
+                    native_io_result!(
+                        sqlite::read_log_range_sync(
+                            conn, identity, &members, start, end, None, mode,
+                        ),
+                        native_io_worker,
+                        entries_returned
+                    )
+                })
+                .await,
+            native_io_call
+        )
+        .inspect(|_entries| {
+            #[cfg(test)]
+            self.core
+                .durable_progress
+                .native_read_max_entries
+                .fetch_max(_entries.len(), Ordering::AcqRel);
+        })
+        .map_err(|error| storage_error(ErrorSubject::Logs, ErrorVerb::Read, error))
     }
 
     async fn limited_get_log_entries(
@@ -739,39 +808,67 @@ impl RaftLogReader<ConfigRaftTypeConfig> for SqliteConfigLogStore {
         start: u64,
         end: u64,
     ) -> Result<Vec<Entry<ConfigRaftTypeConfig>>, StorageError<ConsensusNodeId>> {
+        #[cfg(all(test, target_os = "linux"))]
+        let mut native_io_call = native_io::Call::queued(
+            self.core
+                .durable_progress
+                .append_observed_from
+                .get()
+                .copied(),
+            native_io::Reason::NativeLimitedRead,
+            Some(start),
+            Some(end),
+            None,
+        );
+        #[cfg(all(test, target_os = "linux"))]
+        let native_io_token = native_io_call.worker();
         if start >= end {
+            #[cfg(all(test, target_os = "linux"))]
+            native_io_call.completed();
             return Ok(Vec::new());
         }
         let identity = self.core.identity;
         let mode = self.core.mode;
         let members = self.core.expected_members.clone();
-        self.core
-            .run_sqlite(move |conn| {
-                let entries = sqlite::read_limited_log_range_sync(
-                    conn,
-                    identity,
-                    &members,
-                    start,
-                    end,
-                    DURABLE_OPENRAFT_MAX_PAYLOAD_ENTRIES,
-                    mode,
-                )?;
-                if entries.is_empty() {
-                    return Err(sqlite::invalid_data(
-                        "config consensus limited nonempty log range returned no entry",
-                    ));
-                }
-                Ok(entries)
-            })
-            .await
-            .inspect(|_entries| {
-                #[cfg(test)]
-                self.core
-                    .durable_progress
-                    .native_read_max_entries
-                    .fetch_max(_entries.len(), Ordering::AcqRel);
-            })
-            .map_err(|error| storage_error(ErrorSubject::Logs, ErrorVerb::Read, error))
+        native_io_result!(
+            self.core
+                .run_sqlite(move |conn| {
+                    #[cfg(all(test, target_os = "linux"))]
+                    let mut native_io_worker = native_io::Scope::enter(native_io_token);
+
+                    let entries = native_io_result!(
+                        sqlite::read_limited_log_range_sync(
+                            conn,
+                            identity,
+                            &members,
+                            start,
+                            end,
+                            DURABLE_OPENRAFT_MAX_PAYLOAD_ENTRIES,
+                            mode,
+                        ),
+                        native_io_worker,
+                        entries_returned
+                    )?;
+                    if entries.is_empty() {
+                        #[cfg(all(test, target_os = "linux"))]
+                        native_io_worker.failed_kind(io::ErrorKind::InvalidData);
+                        return Err(sqlite::invalid_data(
+                            "config consensus limited nonempty log range returned no entry",
+                        ));
+                    }
+                    Ok(entries)
+                })
+                .await,
+            native_io_call
+        )
+        .inspect(|_entries| {
+            #[cfg(test)]
+            self.core
+                .durable_progress
+                .native_read_max_entries
+                .fetch_max(_entries.len(), Ordering::AcqRel);
+        })
+        .map_err(|error| storage_error(ErrorSubject::Logs, ErrorVerb::Read, error))
     }
 }
 
@@ -781,17 +878,43 @@ impl RaftLogStorage<ConfigRaftTypeConfig> for SqliteConfigLogStore {
     async fn get_log_state(
         &mut self,
     ) -> Result<LogState<ConfigRaftTypeConfig>, StorageError<ConsensusNodeId>> {
+        #[cfg(all(test, target_os = "linux"))]
+        let mut native_io_call = native_io::Call::queued(
+            self.core
+                .durable_progress
+                .append_observed_from
+                .get()
+                .copied(),
+            native_io::Reason::LogStateRead,
+            None,
+            None,
+            None,
+        );
+        #[cfg(all(test, target_os = "linux"))]
+        let native_io_token = native_io_call.worker();
         let identity = self.core.identity;
         let mode = self.core.mode;
-        self.core
-            .run_sqlite(move |conn| {
-                Ok(LogState {
-                    last_purged_log_id: sqlite::read_purged_sync(conn, identity)?,
-                    last_log_id: sqlite::last_log_sync(conn, identity, mode)?,
+        native_io_result!(
+            self.core
+                .run_sqlite(move |conn| {
+                    #[cfg(all(test, target_os = "linux"))]
+                    let mut native_io_worker = native_io::Scope::enter(native_io_token);
+
+                    Ok(LogState {
+                        last_purged_log_id: native_io_result!(
+                            sqlite::read_purged_sync(conn, identity),
+                            native_io_worker
+                        )?,
+                        last_log_id: native_io_result!(
+                            sqlite::last_log_sync(conn, identity, mode),
+                            native_io_worker
+                        )?,
+                    })
                 })
-            })
-            .await
-            .map_err(|error| storage_error(ErrorSubject::Logs, ErrorVerb::Read, error))
+                .await,
+            native_io_call
+        )
+        .map_err(|error| storage_error(ErrorSubject::Logs, ErrorVerb::Read, error))
     }
 
     async fn get_log_reader(&mut self) -> Self::LogReader {
@@ -826,19 +949,44 @@ impl RaftLogStorage<ConfigRaftTypeConfig> for SqliteConfigLogStore {
         &mut self,
         committed: Option<LogId<ConsensusNodeId>>,
     ) -> Result<(), StorageError<ConsensusNodeId>> {
+        #[cfg(all(test, target_os = "linux"))]
+        let mut native_io_call = native_io::Call::queued(
+            self.core
+                .durable_progress
+                .append_observed_from
+                .get()
+                .copied(),
+            native_io::Reason::CommittedLineage,
+            committed.map(|log| log.index),
+            committed.and_then(|log| log.index.checked_add(1)),
+            None,
+        );
+        #[cfg(all(test, target_os = "linux"))]
+        let native_io_token = native_io_call.worker();
         let identity = self.core.identity;
         let mode = self.core.mode;
         let progress = self.core.durable_progress.clone();
-        self.core
-            .run_sqlite(move |conn| {
-                sqlite::save_committed_sync(conn, identity, committed, mode)?;
-                // Publish while the same SQLite worker still owns the write
-                // order, including when the async caller has disappeared.
-                progress.set_committed(committed);
-                Ok(())
-            })
-            .await
-            .map_err(|error| storage_error(ErrorSubject::Logs, ErrorVerb::Write, error))?;
+        native_io_result!(
+            self.core
+                .run_sqlite(move |conn| {
+                    #[cfg(all(test, target_os = "linux"))]
+                    let mut native_io_worker = native_io::Scope::enter(native_io_token);
+
+                    native_io_result!(
+                        sqlite::save_committed_sync(conn, identity, committed, mode),
+                        native_io_worker
+                    )?;
+                    // Publish while the same SQLite worker still owns the write
+                    // order, including when the async caller has disappeared.
+                    progress.set_committed(committed);
+                    #[cfg(all(test, target_os = "linux"))]
+                    native_io::phase(native_io::Phase::ProgressPublished);
+                    Ok(())
+                })
+                .await,
+            native_io_call
+        )
+        .map_err(|error| storage_error(ErrorSubject::Logs, ErrorVerb::Write, error))?;
         Ok(())
     }
 
@@ -870,6 +1018,22 @@ impl RaftLogStorage<ConfigRaftTypeConfig> for SqliteConfigLogStore {
                 return Err(storage_error(ErrorSubject::Logs, ErrorVerb::Write, error));
             }
         };
+        #[cfg(all(test, target_os = "linux"))]
+        let mut native_io_call = native_io::Call::queued(
+            self.core
+                .durable_progress
+                .append_observed_from
+                .get()
+                .copied(),
+            native_io::Reason::AppendFloor,
+            entries.first().map(|entry| entry.log_id.index),
+            entries
+                .last()
+                .and_then(|entry| entry.log_id.index.checked_add(1)),
+            Some(entries.len()),
+        );
+        #[cfg(all(test, target_os = "linux"))]
+        let native_io_token = native_io_call.worker();
         let identity = self.core.identity;
         let members = self.core.expected_members.clone();
         let audit_key = self.core.audit_key.clone();
@@ -887,30 +1051,42 @@ impl RaftLogStorage<ConfigRaftTypeConfig> for SqliteConfigLogStore {
         match self
             .core
             .run_sqlite_cancellable(move |conn, cancellation| {
+                #[cfg(all(test, target_os = "linux"))]
+                let mut native_io_worker = native_io::Scope::enter(native_io_token);
                 #[cfg(test)]
                 let _observation =
                     config_capacity_append_observations::Scope::enter(append_observation);
-                sqlite::validate_entry_capacities(&entries, identity, &audit_key, mode)?;
+                native_io_result!(
+                    sqlite::validate_entry_capacities(&entries, identity, &audit_key, mode,),
+                    native_io_worker
+                )?;
                 #[cfg(test)]
                 config_capacity_append_observations::observe("capacity_validated");
-                sqlite::append_logs_cancellable_sync(
-                    conn,
-                    identity,
-                    &members,
-                    &entries,
-                    cancellation,
-                    mode,
+                native_io_result!(
+                    sqlite::append_logs_cancellable_sync(
+                        conn,
+                        identity,
+                        &members,
+                        &entries,
+                        cancellation,
+                        mode,
+                    ),
+                    native_io_worker
                 )
             })
             .await
         {
             Ok(()) => {
                 callback.log_io_completed(Ok(()));
+                #[cfg(all(test, target_os = "linux"))]
+                native_io_call.completed();
                 Ok(())
             }
             Err(error) => {
                 callback
                     .log_io_completed(Err(io::Error::other("config consensus log append failed")));
+                #[cfg(all(test, target_os = "linux"))]
+                native_io_call.failed(&error);
                 Err(storage_error(ErrorSubject::Logs, ErrorVerb::Write, error))
             }
         }
@@ -1088,7 +1264,7 @@ impl RaftStateMachine<ConfigRaftTypeConfig> for SqliteConfigStateMachine {
             let audit_key = self.core.audit_key.clone();
             let audit_keys = self.core.management_audit_keys.clone();
             let mode = self.core.mode;
-            let mut collected = pending;
+            let collected = pending;
             #[cfg(test)]
             let apply_observation = apply_origin.map(|origin| (origin, collected.len()));
             #[cfg(test)]
@@ -1099,11 +1275,17 @@ impl RaftStateMachine<ConfigRaftTypeConfig> for SqliteConfigStateMachine {
                     #[cfg(test)]
                     let _observation =
                         config_capacity_apply_observations::Scope::enter(apply_observation);
-                    let end = sqlite::committed_apply_batch_end(&collected, cancellation)?;
+                    let (collected, remainder) = {
+                        #[cfg(all(test, target_os = "linux"))]
+                        let _sizing_observation =
+                            super::store::config_capacity_cost_observation::Scope::batch_sizing(
+                                &collected,
+                            );
+                        sqlite::ApplyBatch::select(collected, cancellation)?
+                    };
                     #[cfg(test)]
                     config_capacity_apply_observations::observe("batch_sized");
-                    let remainder = collected.split_off(end);
-                    let last_applied = collected.last().map(|entry| entry.log_id.index);
+                    let last_applied = collected.last_log_index();
                     let applied = sqlite::apply_entries_cancellable_sync(
                         conn,
                         identity,

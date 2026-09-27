@@ -665,6 +665,29 @@ async fn public_audited_ledger_lifetime_with_transferred_owners(
     expanded: bool,
     transferred_owners: bool,
 ) {
+    public_audited_ledger_lifetime_with_native_owners(
+        continuity,
+        expanded,
+        transferred_owners,
+        None,
+    )
+    .await;
+}
+
+#[derive(Clone, Copy, Debug)]
+enum NativeOwnerCheck {
+    EffectBorrow,
+    CheckpointLedger,
+    AttemptEncoding,
+}
+
+async fn public_audited_ledger_lifetime_with_native_owners(
+    continuity: bool,
+    expanded: bool,
+    transferred_owners: bool,
+    native_check: Option<NativeOwnerCheck>,
+) {
+    assert!(native_check.is_none() || transferred_owners);
     assert!(!expanded || continuity);
     assert!(!transferred_owners || expanded);
     let scratch = std::env::var_os("TMPDIR")
@@ -933,6 +956,17 @@ async fn public_audited_ledger_lifetime_with_transferred_owners(
     let metadata =
         config_command_encoded_size(&probe).expect("real command size") - envelope.encoded().len();
     assert!((METADATA_BYTES - 8192..=METADATA_BYTES).contains(&metadata));
+    let native_owners = if native_check.is_some() {
+        Some(
+            crate::consensus::store::config_capacity_native_owner_observation::Registration::new(
+                &store.inner.backend,
+                request,
+            )
+            .await,
+        )
+    } else {
+        None
+    };
     let admitted = applied(store.admit_audit_operation_local(&handle, caller).await);
     assert_eq!(admitted.state(), AuditOperationState::Intent);
     let recovery = prepared.encode().expect("real original recovery encoding");
@@ -981,6 +1015,9 @@ async fn public_audited_ledger_lifetime_with_transferred_owners(
     }
     verify(&store, &provider, &aad, &plaintext, &prepared, caller).await;
     store.shutdown().await.expect("join native owners");
+    if let Some(native_owners) = &native_owners {
+        native_owners.detach();
+    }
     drop(store);
     let backend = SqliteBackend::reopen_config_authority(options, key)
         .await
@@ -997,6 +1034,54 @@ async fn public_audited_ledger_lifetime_with_transferred_owners(
     }
     if transferred_owners {
         println!("CONFIG_CAPACITY_TRANSFERRED_OWNERS_LIFECYCLE exact_readback=true original_recovery=true retained_reopen=true mandatory_checkpoint=true");
+    }
+    if let Some(native_owners) = native_owners {
+        let owners = native_owners.finish();
+        println!("CONFIG_CAPACITY_NATIVE_OWNERS_LIFECYCLE check={native_check:?} exact_readback=true original_recovery=true retained_reopen=true mandatory_checkpoint=true owners={owners:?}");
+        assert_eq!(owners.effects.len(), 1, "NATIVE_OWNERS_EFFECT_OBSERVED");
+        let effect = owners.effects[0];
+        assert!(
+            effect.same_ciphertext_digest,
+            "actual consumed ciphertext matches native source"
+        );
+        assert!(effect.native_commit_bytes > 0 && effect.consumed_commit_bytes > 0);
+        assert_eq!(
+            owners.checkpoints.len(),
+            2,
+            "NATIVE_OWNERS_CHECKPOINTS_OBSERVED"
+        );
+        for (checkpoint, expected) in owners.checkpoints.iter().zip([3077_u64, 3079]) {
+            assert_eq!(checkpoint.sequence, expected);
+            assert!(
+                checkpoint.page_bytes > 0,
+                "actual decoded native checkpoint page"
+            );
+            for kind in 0..2 {
+                for state in [checkpoint.at_submit[kind], checkpoint.at_native[kind]] {
+                    assert!(state.created > 0 && state.last_capacity > 0);
+                    assert!(state.dropped <= state.created);
+                    assert_eq!(state.live == 0, state.created == state.dropped);
+                }
+            }
+        }
+        match native_check.expect("selected ownership contract") {
+            NativeOwnerCheck::EffectBorrow => {
+                assert!(effect.same_record && effect.same_ciphertext && effect.extra_commit_bytes == 0,
+                    "NATIVE_EFFECT_BORROW: actual append input must borrow the native record/ciphertext; {effect:?}");
+            }
+            NativeOwnerCheck::CheckpointLedger => {
+                for checkpoint in &owners.checkpoints {
+                    assert!(checkpoint.at_submit[0].live == 0 && checkpoint.at_native[0].live == 0,
+                        "NATIVE_CHECKPOINT_LEDGER_RELEASE: actual caller ledger must end before native submission; {checkpoint:?}");
+                }
+            }
+            NativeOwnerCheck::AttemptEncoding => {
+                for checkpoint in &owners.checkpoints {
+                    assert!(checkpoint.at_submit[1].live == 0 && checkpoint.at_native[1].live == 0,
+                        "NATIVE_ATTEMPT_ENCODING_RELEASE: actual request-identity JSON must end before native submission; {checkpoint:?}");
+                }
+            }
+        }
     }
     let measured = observation.finish();
     // The complete real native lifecycle, exact readback, original recovery and
@@ -1190,6 +1275,39 @@ async fn config_capacity_957_public_audited_ledger_owner_closure() {
 #[tokio::test]
 async fn config_capacity_957_public_audited_transferred_owner_closure() {
     public_audited_ledger_lifetime_with_transferred_owners(true, true, true).await;
+}
+
+#[tokio::test]
+async fn config_capacity_957_public_audited_native_effect_borrow() {
+    public_audited_ledger_lifetime_with_native_owners(
+        true,
+        true,
+        true,
+        Some(NativeOwnerCheck::EffectBorrow),
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn config_capacity_957_public_audited_checkpoint_ledger_release() {
+    public_audited_ledger_lifetime_with_native_owners(
+        true,
+        true,
+        true,
+        Some(NativeOwnerCheck::CheckpointLedger),
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn config_capacity_957_public_audited_attempt_encoding_release() {
+    public_audited_ledger_lifetime_with_native_owners(
+        true,
+        true,
+        true,
+        Some(NativeOwnerCheck::AttemptEncoding),
+    )
+    .await;
 }
 
 async fn verify(

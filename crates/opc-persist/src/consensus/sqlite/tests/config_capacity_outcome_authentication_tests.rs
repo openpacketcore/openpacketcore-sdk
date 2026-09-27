@@ -328,7 +328,7 @@ async fn config_capacity_957_expired_authentic_result_cannot_be_replayed() {
         for start in (2..=4097).step_by(1024) {
             let entries = (start..start + 1024)
                 .map(|index| missing_entry(index, u128::from(index).to_be_bytes(), profile))
-                .collect();
+                .collect::<Vec<_>>();
             apply_entries_cancellable_sync(
                 &conn,
                 identity(),

@@ -131,6 +131,11 @@ impl ConsensusConfigStore {
             .as_ref()
             .ok_or(AuditAuthorityError::Unavailable)?;
         let ledger = self.read_audit_ledger().await?;
+        #[cfg(all(test, target_os = "linux"))]
+        let ledger = super::config_capacity_native_owner_observation::caller_ledger(
+            &self.inner.backend,
+            ledger,
+        );
         let chain = ledger
             .continuity
             .as_ref()
@@ -164,6 +169,9 @@ impl ConsensusConfigStore {
         } else {
             self.advance_external(&ledger, Some(current), next).await?
         };
+        // The exact external prefix has been authenticated and read back.
+        // Native Checkpoint independently validates its current ledger again.
+        drop(ledger);
         self.audit_maintenance(AuditCommand::Checkpoint(checkpoint))
             .await
     }
@@ -542,7 +550,21 @@ impl ConsensusConfigStore {
         // not change configuration-mutation or operation-handle retry identity.
         let encoded = serde_json::to_vec(&(&command, uuid::Uuid::new_v4()))
             .map_err(|_| AuditAuthorityError::InvalidInput)?;
+        #[cfg(all(test, target_os = "linux"))]
+        let encoded = super::config_capacity_native_owner_observation::attempt_encoding(
+            &self.inner.backend,
+            &command,
+            encoded,
+        );
         let request = derive_durable_request_id(self.inner.identity, b"audit-continuity", &encoded);
+        drop(encoded);
+        #[cfg(all(test, target_os = "linux"))]
+        let _native_owner_submission =
+            super::config_capacity_native_owner_observation::Submission::start(
+                &self.inner.backend,
+                request,
+                &command,
+            );
         self.submit_request(
             request,
             ConfigMutationIntent::ManagementAudit(Box::new(command)),

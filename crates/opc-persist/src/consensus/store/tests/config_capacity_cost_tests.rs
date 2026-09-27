@@ -62,9 +62,14 @@ pub(crate) mod observation {
         pub(crate) append_encoded_bytes: usize,
         pub(crate) append_output_allocations: usize,
         pub(crate) append_output_capacity: usize,
+        pub(crate) batch_sizing_scopes: usize,
+        pub(crate) batch_sizing_counts: usize,
+        pub(crate) batch_sizing_encoded_bytes: usize,
+        pub(crate) batch_entry_address: usize,
         pub(crate) apply_scopes: usize,
         pub(crate) apply_counts: usize,
         pub(crate) apply_encoded_bytes: usize,
+        pub(crate) apply_entry_address: usize,
         pub(crate) apply_output_allocations: usize,
         pub(crate) apply_output_capacity: usize,
     }
@@ -76,6 +81,7 @@ pub(crate) mod observation {
         NativeValidation,
         Finalized,
         Append,
+        BatchSizing,
         Apply,
     }
 
@@ -139,6 +145,7 @@ pub(crate) mod observation {
                     Phase::NativeValidation => counts.native_validation.scopes += 1,
                     Phase::Finalized => counts.finalized_scopes += 1,
                     Phase::Append => counts.append_scopes += 1,
+                    Phase::BatchSizing => counts.batch_sizing_scopes += 1,
                     Phase::Apply => counts.apply_scopes += 1,
                 }
             }
@@ -167,11 +174,28 @@ pub(crate) mod observation {
                 EntryPayload::Normal(command) => Some(command.request_id),
                 _ => None,
             };
-            Self::enter(request_id, phase)
+            let scope = Self::enter(request_id, phase);
+            let entry_address = entry as *const Entry<ConfigRaftTypeConfig> as usize;
+            observe(|phase, counts| match phase {
+                Phase::BatchSizing => counts.batch_entry_address = entry_address,
+                Phase::Apply => counts.apply_entry_address = entry_address,
+                _ => {}
+            });
+            scope
         }
 
         pub(crate) fn append(entry: &Entry<ConfigRaftTypeConfig>) -> Self {
             Self::entry(entry, Phase::Append)
+        }
+
+        // The at-limit native fixture is read as one whole entry. Refuse to
+        // attribute a multi-entry batch's counting work to a single request.
+        // This guard owns counters only and ends before the apply call.
+        pub(crate) fn batch_sizing(entries: &[Entry<ConfigRaftTypeConfig>]) -> Self {
+            match entries {
+                [entry] => Self::entry(entry, Phase::BatchSizing),
+                _ => Self::enter(None, Phase::BatchSizing),
+            }
         }
 
         pub(crate) fn apply(entry: &Entry<ConfigRaftTypeConfig>) -> Self {
@@ -323,7 +347,7 @@ pub(crate) mod observation {
             Phase::Ingress => Some(&mut counts.ingress),
             Phase::LocalApply => Some(&mut counts.local_apply),
             Phase::NativeValidation => Some(&mut counts.native_validation),
-            Phase::Finalized | Phase::Append | Phase::Apply => None,
+            Phase::Finalized | Phase::Append | Phase::BatchSizing | Phase::Apply => None,
         }
     }
 
@@ -373,6 +397,10 @@ pub(crate) mod observation {
                 counts.append_counts += 1;
                 counts.append_encoded_bytes += bytes;
             }
+            Phase::BatchSizing => {
+                counts.batch_sizing_counts += 1;
+                counts.batch_sizing_encoded_bytes += bytes;
+            }
             Phase::Apply => {
                 counts.apply_counts += 1;
                 counts.apply_encoded_bytes += bytes;
@@ -391,7 +419,11 @@ pub(crate) mod observation {
                 counts.apply_output_allocations += 1;
                 counts.apply_output_capacity += capacity;
             }
-            Phase::Finalized | Phase::Ingress | Phase::LocalApply | Phase::NativeValidation => {}
+            Phase::Finalized
+            | Phase::Ingress
+            | Phase::LocalApply
+            | Phase::NativeValidation
+            | Phase::BatchSizing => {}
         });
     }
 }
@@ -422,6 +454,16 @@ async fn config_capacity_957_native_ordinary_routed_costs_preserve_readback_and_
 #[tokio::test]
 async fn config_capacity_957_native_audited_routed_costs_preserve_readback_and_reopen() {
     run_native_cost_case(true, false).await;
+}
+
+#[tokio::test]
+async fn config_capacity_957_native_ordinary_apply_sizing_is_reused() {
+    run_native_cost_case(false, true).await;
+}
+
+#[tokio::test]
+async fn config_capacity_957_native_audited_apply_sizing_is_reused() {
+    run_native_cost_case(true, true).await;
 }
 
 async fn run_native_cost_case(audited: bool, local_only: bool) {
@@ -678,11 +720,27 @@ async fn run_native_cost_case(audited: bool, local_only: bool) {
     assert!(counts.append_output_capacity >= counts.append_encoded_bytes);
     assert!(counts.append_encoded_bytes > plaintext.len());
     assert_eq!(counts.apply_scopes, 1, "actual native apply entry observed");
+    println!("CONFIG_CAPACITY_APPLY_SIZING_LIFECYCLE audited={audited} logical_bytes={} native_committed=true exact_readback=true original_authenticated_recovery=true retained_reopen=true batch_scopes={} completed_batch_counts={} completed_apply_counts={} batch_bytes={} apply_bytes={}", plaintext.len(), counts.batch_sizing_scopes, counts.batch_sizing_counts, counts.apply_counts, counts.batch_sizing_encoded_bytes, counts.apply_encoded_bytes);
     assert_eq!(
-        counts.apply_counts, 1,
-        "apply still performs its full size check"
+        (counts.batch_sizing_scopes, counts.batch_sizing_counts),
+        (1, 1),
+        "the real singleton native batch completes its bounded prefix count"
     );
-    assert_eq!(counts.apply_encoded_bytes, counts.append_encoded_bytes);
+    assert_ne!(counts.batch_entry_address, 0);
+    assert_eq!(
+        counts.batch_entry_address, counts.apply_entry_address,
+        "the actual immutable native entry owner reaches apply unchanged"
+    );
+    assert_eq!(
+        counts.batch_sizing_counts + counts.apply_counts,
+        1,
+        "NATIVE_APPLY_JSON_SIZE_PASSES: the same immutable selected native entry must be fully counted exactly once after commit, readback, original recovery and retained reopen"
+    );
+    assert_eq!(
+        counts.batch_sizing_encoded_bytes + counts.apply_encoded_bytes,
+        counts.append_encoded_bytes,
+        "the completed size proof covers every byte of the actual native entry"
+    );
     assert_eq!(
         (counts.apply_output_allocations, counts.apply_output_capacity),
         (0, 0),
