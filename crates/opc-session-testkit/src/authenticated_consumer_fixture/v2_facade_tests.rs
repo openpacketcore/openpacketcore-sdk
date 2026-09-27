@@ -687,28 +687,66 @@ async fn fixture_v2_facade_sustains_more_transitions_than_one_v1_journal_holds()
         .expect("open protected V2 facade");
     let started = std::time::Instant::now();
     let mut peak = 0_usize;
+    let mut resolved_by_receipt = 0_u64;
     for ordinal in 1..=transitions {
+        let request = create(request_id(ordinal), ordinal, PAYLOAD);
         let mut prepared = facade
-            .prepare_fenced_transition(
-                create(request_id(ordinal), ordinal, PAYLOAD),
-                budget(soon()),
-            )
+            .prepare_fenced_transition(request.clone(), budget(soon()))
             .await
             .expect("prepare");
-        prepared.execute_once().await.expect("commit");
-        peak = peak.max(facade.retained_fenced_transitions().await.expect("count"));
-        prepared.release_resolved().await.expect("release");
+        match prepared.execute_once().await {
+            Ok(outcome) => {
+                assert!(outcome.matches_request(&request));
+                peak = peak.max(facade.retained_fenced_transitions().await.expect("count"));
+                prepared.release_resolved().await.expect("release");
+            }
+            // A durable commit that outlives one physical attempt is a
+            // possible send. The handle's immutable budget may already be
+            // spent, so a fresh receipt-only handle resolves the same caller
+            // ID by exact status, never by a second mutation.
+            Err(FencedTransitionExecuteError::OutcomeUnknown { request_id }) => {
+                assert_eq!(request_id, prepared.request_id());
+                resolved_by_receipt += 1;
+                let deadline = tokio::time::Instant::now() + Duration::from_secs(60);
+                let mut recovered = recovered_v2(
+                    facade
+                        .recover_fenced_transition_status(request_id, budget(deadline))
+                        .await
+                        .expect("recover the ambiguous transition by caller ID"),
+                );
+                match recovered.status_until_terminal(deadline).await {
+                    Ok(FencedTransitionV2Status::Recorded(result)) => {
+                        let outcome = (*result).expect("the ambiguous transition committed");
+                        assert!(outcome.matches_request(&request));
+                    }
+                    other => panic!("an ambiguous commit must resolve by receipt: {other:?}"),
+                }
+                peak = peak.max(facade.retained_fenced_transitions().await.expect("count"));
+                recovered.release_resolved().await.expect("release");
+            }
+            Err(error) => panic!("unexpected protected V2 execution result: {error:?}"),
+        }
     }
     let diagnostics = fixture.diagnostics();
-    assert_eq!(diagnostics.fenced_transition_v2_calls() as u64, transitions);
+    assert_eq!(
+        diagnostics.fenced_transition_v2_calls() as u64,
+        transitions,
+        "every transition dispatched exactly once"
+    );
     assert_eq!(diagnostics.fenced_transition_calls(), 0);
+    assert_eq!(
+        diagnostics.fenced_transition_v2_history_state_calls(),
+        1,
+        "the activation read serves every preparation"
+    );
     assert_eq!(peak, 1, "retention is bounded by in-flight transitions");
     assert_eq!(
         facade.retained_fenced_transitions().await.expect("count"),
         0
     );
     eprintln!(
-        "protected V2 facade sustained {transitions} committed transitions in {:?} (peak retained rows {peak})",
+        "protected V2 facade sustained {transitions} committed transitions in {:?} \
+         (peak retained rows {peak}, resolved by receipt {resolved_by_receipt})",
         started.elapsed()
     );
     drop(facade);
