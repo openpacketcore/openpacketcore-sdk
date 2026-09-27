@@ -954,3 +954,6 @@ fn cleanup_retirement_phase_appends_without_changing_original_payload_bytes() {
     trailing.push(0);
     assert!(opc_consensus::decode_bounded::<AuditCommand>(&trailing).is_err());
 }
+
+#[path = "target_ledger_budget.rs"]
+mod target_ledger_budget_tests;

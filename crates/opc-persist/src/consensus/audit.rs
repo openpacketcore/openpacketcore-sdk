@@ -11,7 +11,7 @@ use crate::audit_authority::continuity::{
     chain::ContinuityState, AuditCheckpoint, AuditKeyRing, AuditKeyTransition,
 };
 use crate::audit_authority::ledger::{
-    LedgerMutationError, LedgerState, MAX_STATE_BYTES, STATE_DOMAIN,
+    encoded_state_len, LedgerMutationError, LedgerState, MAX_STATE_BYTES, STATE_DOMAIN,
 };
 use crate::audit_authority::{
     AuditAuthorityError, AuditLedgerLimits, AuditOperationHandle, AuditOperationState, AuditToken,
@@ -71,27 +71,8 @@ fn invalid() -> io::Error {
 // needs no second complete JSON allocation alongside the SQL row and decoded
 // ledger; writes allocate their one output buffer once. The transcript remains
 // exactly the existing audit-authority STATE_DOMAIN, u64 length and JSON.
-struct StateByteCounter(usize);
-
-impl io::Write for StateByteCounter {
-    fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
-        self.0 = self
-            .0
-            .checked_add(bytes.len())
-            .filter(|length| *length <= MAX_STATE_BYTES)
-            .ok_or_else(invalid)?;
-        Ok(bytes.len())
-    }
-
-    fn flush(&mut self) -> io::Result<()> {
-        Ok(())
-    }
-}
-
 fn canonical_state_len(stored: &StoredLedger) -> io::Result<usize> {
-    let mut counter = StateByteCounter(0);
-    serde_json::to_writer(&mut counter, stored).map_err(|_| invalid())?;
-    Ok(counter.0)
+    encoded_state_len(stored).map_err(|_| invalid())
 }
 
 struct StateWriter<'a> {

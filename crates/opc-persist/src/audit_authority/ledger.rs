@@ -20,6 +20,46 @@ pub(crate) const MAX_LEDGER_OPERATIONS: usize = 1024;
 const MAX_HANDLE_BYTES: usize = 8192;
 const OPERATION_EVENT_RESERVATION: usize = 3;
 
+// The retained row and its target-budget preflight count the same canonical
+// serde_json representation. No complete JSON output is retained by this sink.
+#[derive(Default)]
+struct StateByteCounter {
+    bytes: usize,
+    exceeded: bool,
+}
+
+impl std::io::Write for StateByteCounter {
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        match self.bytes.checked_add(bytes.len()) {
+            Some(length) if length <= MAX_STATE_BYTES => {
+                self.bytes = length;
+                Ok(bytes.len())
+            }
+            _ => {
+                self.exceeded = true;
+                Err(std::io::Error::from(std::io::ErrorKind::InvalidData))
+            }
+        }
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+/// Count canonical retained JSON, stopping at its unchanged byte limit.
+/// Writer overflow is quota exhaustion; other serialization failure is invalid input.
+pub(crate) fn encoded_state_len<T: Serialize + ?Sized>(
+    value: &T,
+) -> Result<usize, AuditAuthorityError> {
+    let mut counter = StateByteCounter::default();
+    match serde_json::to_writer(&mut counter, value) {
+        Ok(()) => Ok(counter.bytes),
+        Err(_) if counter.exceeded => Err(AuditAuthorityError::Full),
+        Err(_) => Err(AuditAuthorityError::InvalidInput),
+    }
+}
+
 // Resource failure is replica-local and must not become a replicated logical
 // rejection. Only the authority variant may be serialized as a command result.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, thiserror::Error)]
@@ -324,6 +364,7 @@ pub(crate) struct LedgerState {
     pub(crate) floor: u64,
     pub(crate) predecessor: [u8; 32],
     pub(crate) entries: Vec<LedgerEntry>,
+    #[cfg_attr(test, serde(serialize_with = "target_budget_probe::operations"))]
     pub(crate) operations: Vec<LedgerOperation>,
     pub(crate) continuity: Option<super::continuity::chain::ContinuityState>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -574,7 +615,9 @@ impl LedgerState {
             .map_or(self.entries.len(), |chain| {
                 self.entries.len().saturating_sub(chain.rows.len())
             });
-        let encoded = serde_json::to_vec(self).map_err(|_| AuditAuthorityError::InvalidInput)?;
+        #[cfg(test)]
+        let _observed_budget = target_budget_probe::Serialization::enter();
+        let encoded_len = encoded_state_len(self)?;
         let required = reserved
             .checked_mul(32 * 1024)
             .and_then(|n| {
@@ -583,7 +626,7 @@ impl LedgerState {
                     .and_then(|rows| n.checked_add(rows))
             })
             .and_then(|n| n.checked_add(16 * 1024))
-            .and_then(|n| n.checked_add(encoded.len()))
+            .and_then(|n| n.checked_add(encoded_len))
             .ok_or(AuditAuthorityError::Full)?;
         if required > MAX_STATE_BYTES {
             return Err(AuditAuthorityError::Full);
@@ -1131,3 +1174,6 @@ pub(crate) mod allocation_probe {
         })
     }
 }
+
+#[cfg(test)]
+pub(crate) mod target_budget_probe;

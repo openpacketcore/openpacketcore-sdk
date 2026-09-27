@@ -11661,3 +11661,6 @@ mod cleanup_running_base;
 
 #[path = "target_allocation_boundary.rs"]
 mod target_allocation_boundary;
+
+#[path = "target_ledger_budget_native.rs"]
+mod target_ledger_budget_tests;
