@@ -65,6 +65,9 @@ macro_rules! native_case {
 #[path = "config_capacity_957_mtls_recovery/fixture_process.rs"]
 mod fixture_process;
 
+#[path = "config_capacity_957_mtls_recovery/phase_trace.rs"]
+mod phase_trace;
+
 #[path = "config_capacity_957_mtls_recovery/snapshot.rs"]
 mod snapshot;
 
@@ -261,10 +264,16 @@ impl ObservedPeer {
         if let Some(observation) = observation {
             observation.started.fetch_add(1, Ordering::SeqCst);
         }
-        let response = match timeout {
-            Some(timeout) => self.inner.call_with_timeout(request, timeout).await,
-            None => self.inner.call(request).await,
-        };
+        let mut phase = phase_trace::Span::outbound(&request, self.inner.node_id(), timeout);
+        let response = phase
+            .track(async {
+                match timeout {
+                    Some(timeout) => self.inner.call_with_timeout(request, timeout).await,
+                    None => self.inner.call(request).await,
+                }
+            })
+            .await;
+        phase.peer_returned(&response);
         if let Some(election) = election {
             self.fault.election.record(election, &response);
         }
@@ -363,6 +372,7 @@ struct HandlerLifetime {
     // sending the test-only lifetime observation.
     inner: Arc<dyn ConsensusRpcHandler>,
     _released: HandlerReleased,
+    local_node: ConsensusNodeId,
 }
 
 #[derive(Debug)]
@@ -383,7 +393,12 @@ impl ConsensusRpcHandler for HandlerLifetime {
         authenticated_sender: ConsensusNodeId,
         request: ConsensusWireRequest,
     ) -> ConsensusWireResponse {
-        self.inner.handle(authenticated_sender, request).await
+        let mut phase = phase_trace::Span::handler(&request, self.local_node);
+        let response = phase
+            .track(self.inner.handle(authenticated_sender, request))
+            .await;
+        phase.handler_returned(&response);
+        response
     }
 }
 
@@ -398,6 +413,7 @@ fn observed_handler(
         Arc::new(HandlerLifetime {
             inner: store.rpc_handler(),
             _released: HandlerReleased(Some(released)),
+            local_node: store.status().node_id,
         }),
         receiver,
     )
@@ -915,24 +931,37 @@ async fn run_recovery(profile: ConfigCapacityProfile) {
         status.admitted && status.leader_id == Some(leader_id)
     }));
 
-    let (control, control_aad, control_plaintext) = commit(&stores[leader], 1, None).await;
+    let trace = phase_trace::Session::start(
+        if profile == ConfigCapacityProfile::BoundedV1 {
+            "ordinary_bounded_control"
+        } else {
+            "ordinary_legacy_control"
+        },
+        &stores,
+    );
+    let mut phase = phase_trace::Span::api("ordinary_input");
+    let (control, control_aad, control_plaintext) =
+        phase.track(commit(&stores[leader], 1, None)).await;
+    phase.returned(phase_trace::ResultClass::Ok);
     let control_record = control.record().clone();
-    let control = stores[leader]
-        .prepare_recoverable_commit(
-            ConfigConsensusRequestId::from_bytes([0xDA; 16]),
-            control,
-            CALLER,
-        )
-        .expect("prepare leader-local positive control");
-    stores[leader]
-        .append_prepared_commit_local(control)
-        .await
-        .expect("Durable leader-local positive control");
-    let readback = stores[follower]
-        .load_latest()
-        .await
-        .expect("quorum read")
-        .expect("control");
+    let mut phase = phase_trace::Span::api("ordinary_prepare");
+    let control = stores[leader].prepare_recoverable_commit(
+        ConfigConsensusRequestId::from_bytes([0xDA; 16]),
+        control,
+        CALLER,
+    );
+    phase.returned(phase_trace::persist(&control));
+    let control = control.expect("prepare leader-local positive control");
+    let mut phase = phase_trace::Span::api("ordinary_submit_local");
+    let control_result = phase
+        .track(stores[leader].append_prepared_commit_local(control))
+        .await;
+    phase.returned(phase_trace::persist(&control_result));
+    control_result.expect("Durable leader-local positive control");
+    let mut phase = phase_trace::Span::api("ordinary_readback");
+    let readback = phase.track(stores[follower].load_latest()).await;
+    phase.returned(phase_trace::persist(&readback));
+    let readback = readback.expect("quorum read").expect("control");
     assert!(
         readback.record == control_record,
         "exact encrypted positive readback"
@@ -940,6 +969,7 @@ async fn run_recovery(profile: ConfigCapacityProfile) {
 
     assert_decrypted(&readback.record, &control_aad, &control_plaintext);
     drop((control_aad, control_plaintext));
+    trace.finish();
 
     let (successor, successor_aad, successor_plaintext) =
         commit(&stores[follower], 2, Some(control_record.tx_id)).await;
