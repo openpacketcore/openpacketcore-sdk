@@ -144,6 +144,9 @@ fn encode_state(stored: &StoredLedger, key: &AuditKey) -> io::Result<(Vec<u8>, [
     let length = canonical_state_len(stored)?;
     let mut encoded = Vec::new();
     encoded.try_reserve_exact(length).map_err(|_| invalid())?;
+    #[cfg(test)]
+    let _observed_encoding =
+        super::config_capacity_simultaneous_working_tests::ledger::encoding(&encoded);
     let mac = stream_state(stored, key, length, Some(&mut encoded))?;
     Ok((encoded, mac.finalize().into_bytes().into()))
 }
@@ -233,12 +236,13 @@ pub(crate) fn write_sync(
     initialize: bool,
 ) -> io::Result<()> {
     let stored = StoredLedger { identity, ledger };
+    #[cfg(test)]
+    let _observed_ledger =
+        super::config_capacity_simultaneous_working_tests::ledger::decoded(stored.ledger.as_ref());
     let (encoded, mac) = encode_state(&stored, key)?;
     #[cfg(test)]
-    let _observed_write = super::config_capacity_simultaneous_working_tests::ledger::write(
-        &encoded,
-        stored.ledger.as_ref(),
-    );
+    let _observed_write =
+        super::config_capacity_simultaneous_working_tests::ledger::write(&encoded);
     let statement = if initialize {
         "INSERT INTO config_raft_management_audit(singleton,state_json,state_hmac) VALUES(1,?1,?2)"
     } else {
@@ -263,6 +267,10 @@ pub(crate) fn apply_sync(
     keys: Option<&AuditKeyRing>,
 ) -> io::Result<Result<(), ConfigMutationFailure>> {
     let mut ledger = read_with_keys_sync(conn, key, keys, identity)?;
+    #[cfg(test)]
+    let observed_mutation = ledger
+        .as_ref()
+        .map(super::config_capacity_simultaneous_working_tests::ledger::mutating);
     let result = match command {
         AuditCommand::Initialize { .. } if keys.is_some() => {
             Err(AuditAuthorityError::BindingMismatch)
@@ -388,6 +396,8 @@ pub(crate) fn apply_sync(
         ledger.validate(key, identity).map_err(|_| invalid())?;
         ledger.validate_continuity(keys).map_err(|_| invalid())?;
     }
+    #[cfg(test)]
+    drop(observed_mutation);
     write_sync(conn, key, identity, ledger, false)?;
     Ok(Ok(()))
 }

@@ -23,6 +23,10 @@ use crate::{
 
 mod config_capacity_aad_shape;
 
+#[cfg(all(test, target_os = "linux"))]
+#[path = "tests/config_capacity_957_normalization_observation.rs"]
+pub(crate) mod normalization_observation;
+
 #[cfg(test)]
 thread_local! {
     static RECORD_ISSUES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
@@ -50,7 +54,29 @@ impl PreparedCapacityCommit {
         let (record, audit, resolution, evidence, reservation) = attested.into_capacity_parts();
         // The transferred capacities are checked before AAD decoding, proof
         // authentication or finalization of any audit metadata.
-        let commit = super::PreparedConfigCommit::prepare_for_profile(record, audit, key, profile)?;
+        let mut commit =
+            super::PreparedConfigCommit::prepare_for_profile(record, audit, key, profile)?;
+        if profile == ConfigCapacityProfile::BoundedV1 {
+            // The exact store reservation and original encryption claim were
+            // checked before this consumed path. Input-capacity and metadata
+            // checks above remain ahead of allocation. Capacity is not part of
+            // record identity: release unused ciphertext backing before the
+            // immutable prepared owner can overlap retained ledger processing.
+            let replacement = compact_ciphertext(&commit.record.encrypted_blob)?;
+            #[cfg(all(test, target_os = "linux"))]
+            let observed_normalization = normalization_observation::before_handoff(
+                &commit,
+                replacement.as_ref(),
+                reservation.is_some(),
+            );
+            if let Some(replacement) = replacement {
+                commit.record.encrypted_blob = replacement;
+            }
+            #[cfg(all(test, target_os = "linux"))]
+            if let Some(observation) = observed_normalization {
+                observation.after_handoff(&commit);
+            }
+        }
         let binding = match profile {
             ConfigCapacityProfile::Legacy => None,
             ConfigCapacityProfile::BoundedV1 => Some(CapacityRecordBinding::issue_record(
@@ -70,6 +96,26 @@ impl PreparedCapacityCommit {
             reservation,
         })
     }
+}
+
+// A distinct fallible allocation makes the old/new overlap explicit. Never
+// infer release from a shorter slice or assume that shrink_to_fit succeeded.
+fn compact_ciphertext(encoded: &Vec<u8>) -> Result<Option<Vec<u8>>, PersistError> {
+    if encoded.capacity() == encoded.len() {
+        return Ok(None);
+    }
+    let mut replacement = Vec::new();
+    replacement.try_reserve_exact(encoded.len()).map_err(|_| {
+        PersistError::preflight_failed("configuration ciphertext normalization allocation failed")
+    })?;
+    // Account the concrete Vec representation, not a requested allocation size.
+    if replacement.capacity() != encoded.len() {
+        return Err(PersistError::preflight_failed(
+            "configuration ciphertext normalization exceeded its exact extent",
+        ));
+    }
+    replacement.extend_from_slice(encoded);
+    Ok(Some(replacement))
 }
 
 /// Bounded-profile-only structural admission ahead of the general AAD parser.

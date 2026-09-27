@@ -3105,6 +3105,9 @@ fn apply_audited_mutation_sync(
     else {
         return Ok(Err(ConfigMutationFailure::InvalidInput));
     };
+    #[cfg(test)]
+    let observed_ledger =
+        super::config_capacity_simultaneous_working_tests::ledger::mutating(&ledger);
     let receipt = match ledger.lookup(key, &prepared.handle, prepared.handle.body.binding.caller) {
         Ok(Some(receipt)) => receipt,
         _ => return Ok(Err(ConfigMutationFailure::InvalidInput)),
@@ -3135,9 +3138,6 @@ fn apply_audited_mutation_sync(
             return Ok(Err(ConfigMutationFailure::InvalidInput));
         }
     }
-    #[cfg(test)]
-    let observed_ledger =
-        super::config_capacity_simultaneous_working_tests::ledger::held(&ledger, prepared);
     // The ledger above has already passed row authentication, full ledger
     // validation, exact identity and continuity checks in this SQL transaction.
     // Validate the remaining sealed state without decoding a second ledger
@@ -3149,8 +3149,6 @@ fn apply_audited_mutation_sync(
         capacity_profile,
         cancellation,
     )?;
-    #[cfg(test)]
-    drop(observed_ledger);
     let current_version: u64 = conn
         .query_row(
             "SELECT COALESCE(MAX(version),0) FROM config_history",
@@ -3207,6 +3205,8 @@ fn apply_audited_mutation_sync(
     ledger
         .validate_continuity(audit_keys)
         .map_err(|_| invalid())?;
+    #[cfg(test)]
+    drop(observed_ledger);
     super::audit::write_sync(conn, key, identity, Some(ledger), false)?;
     Ok(result)
 }

@@ -90,6 +90,9 @@ impl LedgerState {
         let Some(chain) = &self.continuity else {
             return Ok(());
         };
+        #[cfg(test)]
+        let _observed_continuity =
+            crate::consensus::config_capacity_simultaneous_working_tests::ledger::continuity(self);
         let keys = keys.ok_or(AuditAuthorityError::KeyUnavailable)?;
         if chain.version != 2 || chain.rows.len() != self.entries.len() {
             return Err(AuditAuthorityError::BindingMismatch);
@@ -144,6 +147,8 @@ impl LedgerState {
         &mut self,
         keys: Option<&AuditKeyRing>,
     ) -> Result<(), AuditAuthorityError> {
+        #[cfg(test)]
+        let observed_identity = std::ptr::from_ref(self) as usize;
         let Some(chain) = &mut self.continuity else {
             return Ok(());
         };
@@ -166,7 +171,15 @@ impl LedgerState {
             };
             chain.active_epoch = verify_row(keys, self.identity, epoch, previous, entry, &row)?;
             chain.terminal = signature;
+            #[cfg(test)]
+            let previous_capacity = chain.rows.capacity();
             chain.rows.push(row);
+            #[cfg(test)]
+            crate::consensus::config_capacity_simultaneous_working_tests::ledger::changed_rows(
+                observed_identity,
+                previous_capacity,
+                &chain.rows,
+            );
         }
         Ok(())
     }
@@ -259,6 +272,8 @@ impl LedgerState {
         self.entries.drain(..count);
         chain.rows.drain(..count);
         self.operations.retain(|op| op.first_sequence > through);
+        #[cfg(test)]
+        crate::consensus::config_capacity_simultaneous_working_tests::ledger::changed(self);
         Ok(())
     }
 }

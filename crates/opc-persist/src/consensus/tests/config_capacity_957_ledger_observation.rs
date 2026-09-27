@@ -43,6 +43,16 @@ pub(crate) struct Sample {
 pub(crate) struct Observation {
     base: Sample,
     owners: [usize; 7],
+    ledger_identities: [usize; 7],
+    continuity_depth: usize,
+    encoding_depth: usize,
+    pub(crate) encoding_calls: usize,
+    pub(crate) read_continuity_peak: Sample,
+    pub(crate) mutation_continuity_peak: Sample,
+    pub(crate) continuity_checks: usize,
+    pub(crate) continuity_peak: Sample,
+    pub(crate) mutation_peak: Sample,
+    pub(crate) encoding_peak: Sample,
     pub(crate) reads: usize,
     pub(crate) apply_reads: usize,
     pub(crate) writes: usize,
@@ -95,6 +105,29 @@ fn sample(observation: &mut Observation) {
     .into_iter()
     .try_fold(0_usize, usize::checked_add)
     .expect("finite concrete owner extents");
+    if observation.continuity_depth > 0 && current.total > observation.continuity_peak.total {
+        observation.continuity_peak = current;
+    }
+    if current.held_ledger > 0
+        && current.authentication > 0
+        && current.total > observation.mutation_peak.total
+    {
+        observation.mutation_peak = current;
+    }
+    if observation.continuity_depth > 0 && current.authentication > 0 {
+        if current.decoded_ledger > 0
+            && current.held_ledger == 0
+            && current.total > observation.read_continuity_peak.total
+        {
+            observation.read_continuity_peak = current;
+        }
+        if current.held_ledger > 0 && current.total > observation.mutation_continuity_peak.total {
+            observation.mutation_continuity_peak = current;
+        }
+    }
+    if observation.encoding_depth > 0 && current.total > observation.encoding_peak.total {
+        observation.encoding_peak = current;
+    }
     if current.total > observation.peak.total {
         observation.peak = current;
     }
@@ -116,8 +149,9 @@ pub(crate) fn ledger_heap(ledger: &LedgerState) -> usize {
         .map(|entry| match &entry.payload {
             EntryPayload::Intent(_) => size_of::<AuditOperationHandle>(),
             EntryPayload::Outcome { .. } | EntryPayload::Terminal { .. } => 0,
-            EntryPayload::Event(_) | EntryPayload::KeyTransition(_) => {
-                panic!("fixture uses only real operation admission and terminal transitions")
+            EntryPayload::Event(_) => size_of::<crate::audit_authority::ProjectedAuditEvent>(),
+            EntryPayload::KeyTransition(_) => {
+                size_of::<crate::audit_authority::continuity::AuditKeyTransition>()
             }
         })
         .sum::<usize>();
@@ -147,9 +181,6 @@ fn owner<'a>(category: usize, bytes: impl FnOnce() -> usize) -> OwnerGuard<'a> {
             observation.apply_reads += usize::from(observation.owners[APPLY] != 0);
             observation.nested_reads += usize::from(observation.owners[HELD] != 0);
         }
-        if category == WRITE {
-            observation.writes += 1;
-        }
         sample(&mut observation);
         slot.set(Some(observation));
         true
@@ -167,6 +198,7 @@ impl Drop for OwnerGuard<'_> {
             OBSERVATION.with(|slot| {
                 if let Some(mut observation) = slot.get() {
                     observation.owners[self.category] = 0;
+                    observation.ledger_identities[self.category] = 0;
                     slot.set(Some(observation));
                 }
             });
@@ -174,22 +206,10 @@ impl Drop for OwnerGuard<'_> {
     }
 }
 
-pub(crate) fn held<'a>(
-    ledger: &'a LedgerState,
-    _command: &'a AuditedConfigCommand,
-) -> OwnerGuard<'a> {
-    owner(HELD, || ledger_heap(ledger))
-}
-
 pub(crate) fn applying(_command: &AuditedConfigCommand) -> OwnerGuard<'_> {
     owner(APPLY, || {
         OBSERVATION.with(|slot| slot.get().expect("active observation").base.apply_page)
     })
-}
-
-pub(crate) struct ReadGuard<'a> {
-    _encoded: OwnerGuard<'a>,
-    _ledger: OwnerGuard<'a>,
 }
 
 // This wrapper contains the actual SQL result Vec. It never clones the row or
@@ -234,14 +254,164 @@ fn observe_continuity(ledger: Option<&LedgerState>) {
 
 pub(crate) fn decoded(ledger: Option<&LedgerState>) -> OwnerGuard<'_> {
     observe_continuity(ledger);
-    owner(DECODED, || ledger.map_or(0, ledger_heap))
+    match ledger {
+        Some(ledger) => ledger_owner(DECODED, ledger),
+        None => owner(DECODED, || 0),
+    }
 }
 
-pub(crate) fn write<'a>(encoded: &'a Vec<u8>, ledger: Option<&'a LedgerState>) -> ReadGuard<'a> {
-    observe_continuity(ledger);
-    ReadGuard {
-        _encoded: owner(WRITE, || encoded.capacity()),
-        _ledger: owner(DECODED, || ledger.map_or(0, ledger_heap)),
+pub(crate) fn write(encoded: &Vec<u8>) -> OwnerGuard<'_> {
+    OBSERVATION.with(|slot| {
+        if let Some(mut observation) = slot.get() {
+            observation.writes += 1;
+            slot.set(Some(observation));
+        }
+    });
+    owner(WRITE, || encoded.capacity())
+}
+
+// The caller cannot grow this Vec: StateWriter rejects writes past the one
+// reserved extent. A counter-only guard permits the real serializer's mutation.
+pub(crate) struct EncodingGuard {
+    _encoded: OwnerGuard<'static>,
+    active: bool,
+}
+
+pub(crate) fn encoding(encoded: &Vec<u8>) -> EncodingGuard {
+    let guard = owner(WRITE, || encoded.capacity());
+    let active = OBSERVATION.with(|slot| {
+        let Some(mut observation) = slot.get() else {
+            return false;
+        };
+        observation.encoding_depth += 1;
+        observation.encoding_calls += 1;
+        sample(&mut observation);
+        slot.set(Some(observation));
+        true
+    });
+    EncodingGuard {
+        _encoded: guard,
+        active,
+    }
+}
+
+impl Drop for EncodingGuard {
+    fn drop(&mut self) {
+        if self.active {
+            OBSERVATION.with(|slot| {
+                if let Some(mut observation) = slot.get() {
+                    observation.encoding_depth -= 1;
+                    slot.set(Some(observation));
+                }
+            });
+        }
+    }
+}
+
+fn ledger_owner<'a>(category: usize, ledger: &LedgerState) -> OwnerGuard<'a> {
+    observe_continuity(Some(ledger));
+    OBSERVATION.with(|slot| {
+        if let Some(mut observation) = slot.get() {
+            assert_eq!(observation.ledger_identities[category], 0);
+            observation.ledger_identities[category] = std::ptr::from_ref(ledger) as usize;
+            slot.set(Some(observation));
+        }
+    });
+    owner(category, || ledger_heap(ledger))
+}
+
+// The actual caller keeps the same mutable ledger until the explicit handoff
+// to write_sync. This guard stores counters only and cannot extend its lifetime.
+pub(crate) fn mutating(ledger: &LedgerState) -> OwnerGuard<'static> {
+    ledger_owner(HELD, ledger)
+}
+
+// Refresh only an already registered real owner, immediately after mutation.
+// Test setup and unrelated ledgers neither allocate inventory nor affect totals.
+pub(crate) fn changed(ledger: &LedgerState) {
+    let identity = std::ptr::from_ref(ledger) as usize;
+    OBSERVATION.with(|slot| {
+        let Some(mut observation) = slot.get() else {
+            return;
+        };
+        for category in [HELD, DECODED] {
+            if observation.ledger_identities[category] == identity {
+                observation.owners[category] = ledger_heap(ledger);
+            }
+        }
+        sample(&mut observation);
+        slot.set(Some(observation));
+    });
+    observe_continuity(Some(ledger));
+}
+
+// seal_continuity mutably borrows just its chain. Update the allocation delta
+// after each push without borrowing that chain and the enclosing ledger twice.
+pub(crate) fn changed_rows(identity: usize, previous_capacity: usize, rows: &Vec<SignedAuditRow>) {
+    OBSERVATION.with(|slot| {
+        let Some(mut observation) = slot.get() else {
+            return;
+        };
+        for category in [HELD, DECODED] {
+            if observation.ledger_identities[category] == identity {
+                observation.owners[category] = observation.owners[category]
+                    .checked_sub(previous_capacity * size_of::<SignedAuditRow>())
+                    .and_then(|bytes| {
+                        bytes.checked_add(rows.capacity() * size_of::<SignedAuditRow>())
+                    })
+                    .expect("actual continuity allocation delta");
+            }
+        }
+        observation.continuity_rows = observation.continuity_rows.max(rows.len());
+        observation.continuity_bytes = observation
+            .continuity_bytes
+            .max(rows.capacity() * size_of::<SignedAuditRow>());
+        sample(&mut observation);
+        slot.set(Some(observation));
+    });
+}
+
+pub(crate) struct ContinuityGuard<'a> {
+    _ledger: Option<OwnerGuard<'a>>,
+    active: bool,
+}
+
+pub(crate) fn continuity(ledger: &LedgerState) -> ContinuityGuard<'_> {
+    let identity = std::ptr::from_ref(ledger) as usize;
+    let registered = OBSERVATION.with(|slot| {
+        slot.get().is_some_and(|observation| {
+            [HELD, DECODED]
+                .into_iter()
+                .any(|category| observation.ledger_identities[category] == identity)
+        })
+    });
+    let guard = (!registered).then(|| ledger_owner(DECODED, ledger));
+    let active = OBSERVATION.with(|slot| {
+        let Some(mut observation) = slot.get() else {
+            return false;
+        };
+        observation.continuity_depth += 1;
+        observation.continuity_checks += 1;
+        sample(&mut observation);
+        slot.set(Some(observation));
+        true
+    });
+    ContinuityGuard {
+        _ledger: guard,
+        active,
+    }
+}
+
+impl Drop for ContinuityGuard<'_> {
+    fn drop(&mut self) {
+        if self.active {
+            OBSERVATION.with(|slot| {
+                if let Some(mut observation) = slot.get() {
+                    observation.continuity_depth -= 1;
+                    slot.set(Some(observation));
+                }
+            });
+        }
     }
 }
 
@@ -296,6 +466,9 @@ impl ObservationGuard {
         OBSERVATION.with(|slot| {
             let observation = slot.take().expect("active observation");
             assert_eq!(observation.owners, [0; 7], "all observed scopes have ended");
+            assert_eq!(observation.ledger_identities, [0; 7]);
+            assert_eq!(observation.continuity_depth, 0);
+            assert_eq!(observation.encoding_depth, 0);
             observation
         })
     }

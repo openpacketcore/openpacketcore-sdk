@@ -318,6 +318,8 @@ impl LedgerState {
         });
         self.sequence = next;
         self.terminal = mac;
+        #[cfg(test)]
+        crate::consensus::config_capacity_simultaneous_working_tests::ledger::changed(self);
         Ok(next)
     }
 
@@ -380,6 +382,8 @@ impl LedgerState {
             last_sequence: sequence,
             reserved: reservation - 1,
         });
+        #[cfg(test)]
+        crate::consensus::config_capacity_simultaneous_working_tests::ledger::changed(self);
         Ok(())
     }
 
