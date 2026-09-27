@@ -547,6 +547,73 @@ async fn fixture_v2_facade_remote_sealing_commits_through_real_voters() {
     fixture.shutdown().await.expect("shut down fixture");
 }
 
+#[tokio::test]
+async fn fixture_v2_facade_reclaim_sweep_retains_recorded_and_unresolved_rows() {
+    let fixture = AuthenticatedPreparedFencedTransitionFixture::start([scope()])
+        .await
+        .expect("start authenticated three-voter fixture");
+    let provider = CountingProvider::new();
+    let facade = fixture
+        .open_local_aead_v2(Arc::clone(&provider), "fixture-v2-sweep")
+        .await
+        .expect("open protected V2 facade");
+    let mut committed = facade
+        .prepare_fenced_transition(create(request_id(30), 30, PAYLOAD), budget(soon()))
+        .await
+        .expect("prepare the committed row");
+    committed.execute_once().await.expect("commit it");
+    let pending = facade
+        .prepare_fenced_transition(create(request_id(31), 31, PAYLOAD), budget(soon()))
+        .await
+        .expect("prepare a row that is never dispatched");
+    assert!(matches!(
+        facade
+            .reclaim_resolved_fenced_transitions(0, budget(soon()))
+            .await,
+        Err(StoreError::InvalidKey(_))
+    ));
+    let mutations = fixture.diagnostics().fenced_transition_v2_calls();
+    let report = facade
+        .reclaim_resolved_fenced_transitions(16, budget(soon()))
+        .await
+        .expect("bounded sweep");
+    assert_eq!(report.examined(), 2);
+    assert_eq!(
+        report.retained(),
+        2,
+        "Recorded and NotFound rows are retained"
+    );
+    assert_eq!(report.reclaimed(), 0);
+    assert!(!report.interrupted());
+    assert_eq!(
+        facade.retained_fenced_transitions().await.expect("count"),
+        2
+    );
+    assert_eq!(
+        fixture.diagnostics().fenced_transition_v2_calls(),
+        mutations,
+        "the sweep never dispatches a mutation"
+    );
+    committed
+        .release_resolved()
+        .await
+        .expect("the committed row is released by its caller");
+    let report = facade
+        .reclaim_resolved_fenced_transitions(16, budget(soon()))
+        .await
+        .expect("a completed pass restarts from the beginning");
+    assert_eq!(report.examined(), 1);
+    assert_eq!(report.retained(), 1);
+    assert_eq!(
+        facade.retained_fenced_transitions().await.expect("count"),
+        1
+    );
+    drop(pending);
+    drop(committed);
+    drop(facade);
+    fixture.shutdown().await.expect("shut down fixture");
+}
+
 /// Release-profile qualification: more committed-and-released protected
 /// transitions than one #701 V1 journal can ever hold. The recovery journal
 /// stays at one live row throughout, so the V1 absorbing bound no longer
