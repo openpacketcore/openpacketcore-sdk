@@ -479,6 +479,7 @@ impl Fixture {
 }
 fn record(prepared: &crate::audit_authority::PreparedTargetMutation) -> &CommitRecord {
     &prepared
+        .command()
         .effect
         .encrypted_payload
         .as_ref()
@@ -779,11 +780,11 @@ async fn running_replacement_revocation_while_waiting_for_real_proposal_permit_n
     let request = derive_durable_request_id(
         f.store.inner.identity,
         b"netconf-target-intent",
-        &prepared.handle.mac,
+        &prepared.command().handle.mac,
     );
     let command = ConfigMutationIntent::ManagementAudit(Box::new(
         super::super::audit::AuditCommand::NetconfTarget(Box::new(
-            super::super::audit_mutation::TargetAuditCommandV1::Admit(prepared),
+            super::super::audit_mutation::TargetAuditCommandV1::Admit(prepared.command().clone()),
         )),
     ));
     {
@@ -984,7 +985,8 @@ async fn running_replacement_outcome_authenticates_exact_action_transaction_vers
             &substituted,
         )
         .unwrap();
-        let command = super::super::audit_mutation::TargetAuditCommandV1::Apply(prepared.clone());
+        let command =
+            super::super::audit_mutation::TargetAuditCommandV1::Apply(prepared.command().clone());
         assert_eq!(
             command.read_back_receipt(
                 &proof,
@@ -1197,17 +1199,19 @@ async fn running_replacement_fixed_expiry_and_confirmed_metadata_never_create_an
         .now_utc()
         .as_offset_datetime()
         .unix_timestamp();
-    expired.effect.expires_at = now - 1;
+    expired.command_mut().effect.expires_at = now - 1;
     let digest = expired
+        .command()
         .effect
         .digest(f.store.inner.backend.audit_key())
         .unwrap();
-    let mut body = expired.handle.body.clone();
+    let mut body = expired.command().handle.body.clone();
     body.issued_at = now - 61;
     body.expires_at = now - 1;
     body.binding = AuditOperationBinding::project(&privacy(), &body.event, 0, &digest).unwrap();
     body.mutation = Some(digest);
-    expired.handle = AuditOperationHandle::issue(body, f.store.inner.backend.audit_key()).unwrap();
+    expired.command_mut().handle =
+        AuditOperationHandle::issue(body, f.store.inner.backend.audit_key()).unwrap();
     let result = f
         .store
         .admit_netconf_running_replacement_local(&session, &expired, caller())

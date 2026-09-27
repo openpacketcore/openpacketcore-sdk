@@ -9,6 +9,7 @@ mod audit;
 mod audit_mutation;
 mod audit_targets;
 pub(crate) use crate::retained::RetainedConfigMode;
+pub(crate) use audit_mutation::TargetMutationCommand;
 pub use audit_mutation::{PreparedAuditedMutation, PreparedTargetMutation};
 pub use audit_targets::RetainedConfigProfile;
 mod capacity_record;

@@ -272,7 +272,9 @@ impl Fixture {
                 opc_consensus::ConsensusRequestId::from_bytes([request; 16]),
                 ConfigMutationIntent::ManagementAudit(Box::new(
                     super::super::audit::AuditCommand::NetconfTarget(Box::new(
-                        super::super::audit_mutation::TargetAuditCommandV1::Admit(prepared.clone()),
+                        super::super::audit_mutation::TargetAuditCommandV1::Admit(
+                            prepared.command().clone(),
+                        ),
                     )),
                 )),
             )

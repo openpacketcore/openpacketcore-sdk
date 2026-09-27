@@ -509,25 +509,6 @@ impl ConsensusConfigStore {
         .await
     }
 
-    async fn audit_operation_command_with_session(
-        &self,
-        handle: &AuditOperationHandle,
-        caller: AuditCaller,
-        purpose: &[u8],
-        command: ConfigMutationIntent,
-        local_only: bool,
-        session: Option<&crate::audit_authority::NetconfSessionOwner>,
-    ) -> AuditAdmission {
-        let ownership = match self.reserve_submission() {
-            Ok(ownership) => ownership,
-            Err(_) => return AuditAdmission::Rejected(AuditAuthorityError::Unavailable),
-        };
-        self.audit_operation_command_with_owned_session(
-            handle, caller, purpose, command, local_only, session, ownership,
-        )
-        .await
-    }
-
     #[allow(clippy::too_many_arguments)]
     async fn audit_operation_command_with_owned_session(
         &self,
@@ -884,29 +865,87 @@ impl ConsensusConfigStore {
     pub(super) async fn read_audit_ledger_without_checkpoint(
         &self,
     ) -> Result<LedgerState, AuditAuthorityError> {
+        self.read_audit_ledger_with_reservation(None)
+            .await?
+            .ledger
+            .ok_or(AuditAuthorityError::Unavailable)
+    }
+
+    async fn read_audit_ledger_with_reservation(
+        &self,
+        reservation: Option<opc_crypto::ConfigPreparationReservation>,
+    ) -> Result<AuditLedgerRead, AuditAuthorityError> {
         self.linearizable_barrier()
             .await
             .map_err(|_| AuditAuthorityError::Unavailable)?;
-        let backend = self.inner.backend.clone();
-        let identity = self.inner.identity;
-        super::super::run_backend_sqlite_with_timeout(
+        read_audit_ledger_worker(
             &self.inner.backend,
+            self.inner.identity,
             self.inner.operation_timeout,
-            move |conn, cancellation| {
-                cancellation.check_io()?;
-                super::super::audit::read_with_keys_sync(
-                    conn,
-                    backend.audit_key(),
-                    backend.management_audit_keys().as_deref(),
-                    identity,
-                )
-            },
+            reservation,
         )
         .await
-        .map_err(|_| AuditAuthorityError::Unavailable)?
-        .ok_or(AuditAuthorityError::Unavailable)
     }
 }
+
+// Field order keeps the real destination lease until the returned ledger has
+// dropped, including an unread blocking-task result after caller cancellation.
+struct AuditLedgerRead {
+    ledger: Option<LedgerState>,
+    reservation: Option<opc_crypto::ConfigPreparationReservation>,
+    #[cfg(all(test, target_os = "linux"))]
+    _observation: Option<target_recovery_worker_tests::ReadObservation>,
+}
+
+async fn read_audit_ledger_worker(
+    backend: &crate::SqliteBackend,
+    identity: crate::ConfigConsensusIdentity,
+    timeout: std::time::Duration,
+    reservation: Option<opc_crypto::ConfigPreparationReservation>,
+) -> Result<AuditLedgerRead, AuditAuthorityError> {
+    #[cfg(all(test, target_os = "linux"))]
+    let observation = target_recovery_worker_tests::observe(backend);
+    let worker_backend = backend.clone();
+    let read = super::super::run_backend_sqlite_with_timeout(
+        backend,
+        timeout,
+        move |conn, cancellation| {
+            #[cfg(all(test, target_os = "linux"))]
+            let observation = observation;
+            // This local must own the destination lease during decoding,
+            // including after the async receiver has been dropped.
+            let reservation = reservation;
+            cancellation.check_io()?;
+            #[cfg(all(test, target_os = "linux"))]
+            if let Some(observation) = &observation {
+                observation.before_decode();
+            }
+            let ledger = super::super::audit::read_with_keys_sync(
+                conn,
+                worker_backend.audit_key(),
+                worker_backend.management_audit_keys().as_deref(),
+                identity,
+            )?;
+            #[cfg(all(test, target_os = "linux"))]
+            if let Some(observation) = &observation {
+                observation.after_decode();
+            }
+            Ok(AuditLedgerRead {
+                ledger,
+                reservation,
+                #[cfg(all(test, target_os = "linux"))]
+                _observation: observation,
+            })
+        },
+    )
+    .await
+    .map_err(|_| AuditAuthorityError::Unavailable)?;
+    Ok(read)
+}
+
+#[cfg(all(test, target_os = "linux"))]
+#[path = "audit/target_recovery_worker_tests.rs"]
+mod target_recovery_worker_tests;
 
 impl ConsensusConfigStore {
     fn require_netconf_target_profile(&self) -> Result<(), AuditAuthorityError> {
@@ -937,6 +976,47 @@ impl ConsensusConfigStore {
         prepared.verify_effect(self.inner.backend.audit_key())
     }
 
+    /// Decode original protected target recovery data for an independently
+    /// authenticated caller. This grants no Intent receipt, session or effect
+    /// authority. Existing target9 data retains its decoder and representation.
+    ///
+    /// The proposed bounded target payload uses a distinct strict decoder and
+    /// reserves before allocation, then authenticates both the original effect
+    /// and record proof. No supported retained mode selects that branch yet:
+    /// target+bounded opening, admission and apply remain closed.
+    pub fn decode_prepared_netconf_target(
+        &self,
+        bytes: &[u8],
+        caller: AuditCaller,
+    ) -> Result<crate::audit_authority::PreparedTargetMutation, AuditAuthorityError> {
+        self.require_netconf_target_profile()?;
+        let prepared = match self.capacity_profile() {
+            opc_crypto::ConfigCapacityProfile::Legacy => {
+                let prepared = crate::audit_authority::PreparedTargetMutation::decode(bytes)?;
+                self.verify_netconf_target(&prepared, caller)?;
+                prepared
+            }
+            opc_crypto::ConfigCapacityProfile::BoundedV1 => {
+                // The destination, never decoded data, chooses this pool.
+                let reservation = self
+                    .inner
+                    .preparation_admission
+                    .try_reserve()
+                    .map_err(|_| AuditAuthorityError::Unavailable)?;
+                super::super::audit_mutation::joint_running::recover(
+                    bytes,
+                    reservation,
+                    &self.inner.preparation_admission,
+                    self.inner.identity,
+                    self.inner.backend.audit_key(),
+                    caller,
+                )?
+            }
+            _ => return Err(AuditAuthorityError::Unavailable),
+        };
+        Ok(prepared)
+    }
+
     /// Recover the original encrypted target description using its original
     /// handle and independently authenticated caller. This quorum-current read
     /// verifies the independent checkpoint and never submits an effect, creates
@@ -954,7 +1034,24 @@ impl ConsensusConfigStore {
     ) -> Result<Option<crate::audit_authority::PreparedTargetMutation>, AuditAuthorityError> {
         self.require_netconf_target_profile()?;
         handle.verify(self.inner.backend.audit_key(), self.inner.identity, caller)?;
-        let ledger = self.read_audit_ledger().await?;
+        // Reserve before any retained-original decoding. The blocking worker,
+        // its returned ledger and checkpoint verification retain this same owner.
+        let reservation = match self.capacity_profile() {
+            opc_crypto::ConfigCapacityProfile::Legacy => None,
+            opc_crypto::ConfigCapacityProfile::BoundedV1 => Some(
+                self.inner
+                    .preparation_admission
+                    .try_reserve()
+                    .map_err(|_| AuditAuthorityError::Unavailable)?,
+            ),
+            _ => return Err(AuditAuthorityError::Unavailable),
+        };
+        let read = self.read_audit_ledger_with_reservation(reservation).await?;
+        let ledger = read
+            .ledger
+            .as_ref()
+            .ok_or(AuditAuthorityError::Unavailable)?;
+        self.verify_audit_checkpoint(ledger).await?;
         if ledger
             .lookup(self.inner.backend.audit_key(), handle, caller)?
             .is_none()
@@ -968,9 +1065,25 @@ impl ConsensusConfigStore {
             )?;
             return Ok(None);
         }
-        ledger
-            .recover_target(self.inner.backend.audit_key(), handle, caller)
-            .map(Some)
+        let prepared = ledger.recover_target(self.inner.backend.audit_key(), handle, caller)?;
+        // The exact original is now decoded and authenticated. Release its
+        // ledger before transferring, never releasing/reacquiring, the lease.
+        drop(read.ledger);
+        let prepared = match read.reservation {
+            Some(reservation) => super::super::audit_mutation::joint_running::hydrate(
+                prepared,
+                reservation,
+                &self.inner.preparation_admission,
+                self.inner.identity,
+                self.inner.backend.audit_key(),
+                caller,
+            )?,
+            None => {
+                self.verify_netconf_target(&prepared, caller)?;
+                prepared
+            }
+        };
+        Ok(Some(prepared))
     }
 
     /// Admit an exact SDK-prepared target intent through this node's local
@@ -1009,13 +1122,14 @@ impl ConsensusConfigStore {
         prepared: &crate::audit_authority::PreparedTargetMutation,
         caller: AuditCaller,
     ) -> AuditAdmission {
-        if u8::from(prepared.effect.action) != 16
+        if u8::from(prepared.command().effect.action) != 16
             || !session.device.worker.belongs_to(&self.inner)
             || session.caller != caller
-            || prepared.effect.authority != session.device.authority
-            || prepared.effect.profile_incarnation != session.device.profile_incarnation
-            || prepared.effect.device_incarnation != session.device.device_incarnation
+            || prepared.command().effect.authority != session.device.authority
+            || prepared.command().effect.profile_incarnation != session.device.profile_incarnation
+            || prepared.command().effect.device_incarnation != session.device.device_incarnation
             || prepared
+                .command()
                 .effect
                 .lock
                 .as_ref()
@@ -1025,6 +1139,20 @@ impl ConsensusConfigStore {
         }
         self.admit_netconf_target_with_session(prepared, caller, Some(session))
             .await
+    }
+
+    pub(super) fn begin_netconf_target_submission(
+        &self,
+        prepared: &crate::audit_authority::PreparedTargetMutation,
+    ) -> Result<SubmissionOwnership, AuditAuthorityError> {
+        let ownership = prepared
+            .begin_submission(&self.inner.preparation_admission, self.capacity_profile())?;
+        match ownership {
+            Some(ownership) => Ok(Some(ownership)),
+            None => self
+                .reserve_submission()
+                .map_err(|_| AuditAuthorityError::Unavailable),
+        }
     }
 
     async fn admit_netconf_target_with_session(
@@ -1037,7 +1165,7 @@ impl ConsensusConfigStore {
         if let Err(error) = self.verify_netconf_target(prepared, caller) {
             return AuditAdmission::Rejected(error);
         }
-        let entry_guard = if u8::from(prepared.effect.action) == 16 {
+        let entry_guard = if u8::from(prepared.command().effect.action) == 16 {
             session
                 .ok_or(AuditAuthorityError::BindingMismatch)
                 .and_then(|session| session.require_active())
@@ -1052,18 +1180,25 @@ impl ConsensusConfigStore {
                 _ => AuditAdmission::Rejected(error),
             };
         }
+        let ownership = match self.begin_netconf_target_submission(prepared) {
+            Ok(ownership) => ownership,
+            Err(error) => return AuditAdmission::Rejected(error),
+        };
         let admit = ConfigMutationIntent::ManagementAudit(Box::new(AuditCommand::NetconfTarget(
-            Box::new(TargetAuditCommandV1::Admit(prepared.clone())),
+            Box::new(TargetAuditCommandV1::Admit(prepared.command().clone())),
         )));
         let apply = ConfigMutationIntent::ManagementAudit(Box::new(AuditCommand::NetconfTarget(
-            Box::new(TargetAuditCommandV1::Apply(prepared.clone())),
+            Box::new(TargetAuditCommandV1::Apply(prepared.command().clone())),
         )));
         for (purpose, command) in [
             (b"netconf-target-intent".as_slice(), &admit),
             (b"netconf-target-effect".as_slice(), &apply),
         ] {
-            let request =
-                derive_durable_request_id(self.inner.identity, purpose, &prepared.handle.mac);
+            let request = derive_durable_request_id(
+                self.inner.identity,
+                purpose,
+                &prepared.command().handle.mac,
+            );
             if super::preflight_config_command_replication_budget(
                 self.inner.identity,
                 request,
@@ -1080,13 +1215,14 @@ impl ConsensusConfigStore {
             Ok(None) => {}
             Err(error) => return AuditAdmission::Rejected(error),
         }
-        self.audit_operation_command_with_session(
+        self.audit_operation_command_with_owned_session(
             prepared.handle(),
             caller,
             b"netconf-target-intent",
             admit,
             true,
             session,
+            ownership,
         )
         .await
     }
@@ -1106,7 +1242,7 @@ impl ConsensusConfigStore {
         if let Err(error) = self.verify_netconf_target(prepared, caller) {
             return AuditAdmission::Rejected(error);
         }
-        if admitted.handle != prepared.handle {
+        if admitted.handle != prepared.command().handle {
             return AuditAdmission::Rejected(AuditAuthorityError::BindingMismatch);
         }
         // Receipts have no public constructor or untrusted decoder. Preserve
@@ -1124,6 +1260,10 @@ impl ConsensusConfigStore {
             crate::audit_authority::AuditOperationState::Intent => {}
             _ => return AuditAdmission::Rejected(AuditAuthorityError::BindingMismatch),
         }
+        let ownership = match self.begin_netconf_target_submission(prepared) {
+            Ok(ownership) => ownership,
+            Err(error) => return AuditAdmission::Rejected(error),
+        };
         let ledger = match self.read_audit_ledger().await {
             Ok(ledger) => ledger,
             Err(error) => return AuditAdmission::Rejected(error),
@@ -1143,7 +1283,7 @@ impl ConsensusConfigStore {
             return AuditAdmission::Applied(receipt);
         }
         if ledger.operations.iter().any(|operation| {
-            (operation.handle != prepared.handle && !operation.terminal_recorded)
+            (operation.handle != prepared.command().handle && !operation.terminal_recorded)
                 || ledger.mutation_outcome_needs_checkpoint(operation)
         }) {
             return AuditAdmission::Rejected(AuditAuthorityError::RecoveryRequired);
@@ -1156,10 +1296,10 @@ impl ConsensusConfigStore {
             caller,
             b"netconf-target-effect",
             ConfigMutationIntent::ManagementAudit(Box::new(AuditCommand::NetconfTarget(Box::new(
-                TargetAuditCommandV1::Apply(prepared.clone()),
+                TargetAuditCommandV1::Apply(prepared.command().clone()),
             )))),
             true,
-            None,
+            ownership,
         )
         .await
     }
@@ -1214,7 +1354,7 @@ impl ConsensusConfigStore {
                         &tx,
                         backend.audit_key(),
                         &mut candidate,
-                        &prepared,
+                        prepared.command(),
                         now,
                         cancellation,
                     )?
@@ -1225,7 +1365,7 @@ impl ConsensusConfigStore {
                             .lookup(
                                 backend.audit_key(),
                                 prepared.handle(),
-                                prepared.effect.caller,
+                                prepared.command().effect.caller,
                             )
                             .map(|receipt| {
                                 receipt.filter(|r| {
@@ -1237,7 +1377,7 @@ impl ConsensusConfigStore {
                     super::super::audit_targets::preflight_target_sync(
                         &tx,
                         backend.audit_key(),
-                        &prepared,
+                        prepared.command(),
                         &ledger,
                         &keys,
                         now,
@@ -1315,7 +1455,7 @@ impl ConsensusConfigStore {
             },
             self.inner.backend.audit_key(),
         )?;
-        let prepared = crate::audit_authority::PreparedTargetMutation { handle, effect };
+        let prepared = crate::audit_authority::PreparedTargetMutation::new(handle, effect, None);
         prepared.verify_effect(self.inner.backend.audit_key())?;
         self.preflight_netconf_target(&prepared).await?;
         Ok(crate::audit_authority::PreparedNetconfDevice {
@@ -1343,7 +1483,7 @@ impl ConsensusConfigStore {
             return Err(AuditAuthorityError::BindingMismatch);
         }
         self.verify_netconf_target(&prepared.prepared, caller)?;
-        if receipt.handle != prepared.prepared.handle {
+        if receipt.handle != prepared.prepared.command().handle {
             return Err(AuditAuthorityError::BindingMismatch);
         }
         let crate::audit_authority::AuditOperationState::TargetV1(result) = receipt.state() else {
@@ -1354,8 +1494,8 @@ impl ConsensusConfigStore {
             recovery: prepared.recovery.clone(),
             worker: prepared.worker.clone(),
             authority: self.inner.identity,
-            profile_incarnation: prepared.prepared.effect.profile_incarnation,
-            device_incarnation: prepared.prepared.effect.device_incarnation,
+            profile_incarnation: prepared.prepared.command().effect.profile_incarnation,
+            device_incarnation: prepared.prepared.command().effect.device_incarnation,
             caller,
         };
         let view = self.read_netconf_device_view().await?;
@@ -1513,8 +1653,8 @@ impl ConsensusConfigStore {
         let bad = AuditAuthorityError::BindingMismatch;
         if !prepared.session.device.worker.belongs_to(&self.inner)
             || prepared.session.caller != caller
-            || receipt.handle != prepared.prepared.handle
-            || u8::from(prepared.prepared.effect.action) != 2
+            || receipt.handle != prepared.prepared.command().handle
+            || u8::from(prepared.prepared.command().effect.action) != 2
         {
             return Err(bad);
         }
@@ -1524,7 +1664,13 @@ impl ConsensusConfigStore {
             return Err(bad);
         };
         prepared.prepared.validate_result(result)?;
-        let expected = prepared.prepared.effect.lock.as_ref().ok_or(bad)?;
+        let expected = prepared
+            .prepared
+            .command()
+            .effect
+            .lock
+            .as_ref()
+            .ok_or(bad)?;
         let lease = crate::audit_authority::NetconfLockLease {
             session: prepared.session.clone(),
             datastore: prepared.datastore,
@@ -1598,7 +1744,7 @@ impl ConsensusConfigStore {
             },
             self.inner.backend.audit_key(),
         )?;
-        let prepared = crate::audit_authority::PreparedTargetMutation { handle, effect };
+        let prepared = crate::audit_authority::PreparedTargetMutation::new(handle, effect, None);
         prepared.verify_effect(self.inner.backend.audit_key())?;
         self.preflight_netconf_target(&prepared).await?;
         session.require_active()?;
@@ -1675,7 +1821,7 @@ impl ConsensusConfigStore {
             },
             self.inner.backend.audit_key(),
         )?;
-        let prepared = crate::audit_authority::PreparedTargetMutation { handle, effect };
+        let prepared = crate::audit_authority::PreparedTargetMutation::new(handle, effect, None);
         prepared.verify_effect(self.inner.backend.audit_key())?;
         let original = session.retain_cleanup(prepared)?;
         self.preflight_netconf_target(&original).await?;
@@ -1703,7 +1849,7 @@ impl ConsensusConfigStore {
         let original = session.retained_cleanup(caller)?;
         if let Some(prepared) = &original {
             self.verify_netconf_target(prepared, caller)?;
-            if prepared.handle.body.event != event {
+            if prepared.command().handle.body.event != event {
                 return Err(AuditAuthorityError::BindingMismatch);
             }
         }
@@ -1743,8 +1889,9 @@ impl ConsensusConfigStore {
             Ok(ledger) => ledger,
             Err(error) => return AuditAdmission::Rejected(error),
         };
-        let command =
-            super::super::audit_mutation::TargetAuditCommandV1::RetireCleanup(prepared.clone());
+        let command = super::super::audit_mutation::TargetAuditCommandV1::RetireCleanup(
+            prepared.command().clone(),
+        );
         match command.lookup_receipt(&ledger, self.inner.backend.audit_key(), caller) {
             Ok(Some(receipt))
                 if receipt.state() != crate::audit_authority::AuditOperationState::Intent =>
@@ -1815,7 +1962,7 @@ impl ConsensusConfigStore {
             .now_utc()
             .as_offset_datetime()
             .unix_timestamp();
-        let expires_at = previous.handle.body.expires_at;
+        let expires_at = previous.command().handle.body.expires_at;
         let ledger = self.read_audit_ledger().await?;
         previous.verify_settled_cleanup_retirement(
             session,
@@ -1842,7 +1989,7 @@ impl ConsensusConfigStore {
             },
             self.inner.backend.audit_key(),
         )?;
-        let prepared = crate::audit_authority::PreparedTargetMutation { handle, effect };
+        let prepared = crate::audit_authority::PreparedTargetMutation::new(handle, effect, None);
         let original = session.retain_retirement_successor(
             previous,
             prepared,
@@ -1928,7 +2075,7 @@ impl ConsensusConfigStore {
             },
             self.inner.backend.audit_key(),
         )?;
-        let prepared = crate::audit_authority::PreparedTargetMutation { handle, effect };
+        let prepared = crate::audit_authority::PreparedTargetMutation::new(handle, effect, None);
         let original = session.retain_cleanup_successor(
             previous,
             prepared,
@@ -2008,7 +2155,7 @@ impl ConsensusConfigStore {
             },
             self.inner.backend.audit_key(),
         )?;
-        let prepared = crate::audit_authority::PreparedTargetMutation { handle, effect };
+        let prepared = crate::audit_authority::PreparedTargetMutation::new(handle, effect, None);
         prepared.verify_effect(self.inner.backend.audit_key())?;
         self.preflight_netconf_target(&prepared).await?;
         frozen.verify_session(session)?;
@@ -2081,7 +2228,7 @@ impl ConsensusConfigStore {
             },
             self.inner.backend.audit_key(),
         )?;
-        let prepared = crate::audit_authority::PreparedTargetMutation { handle, effect };
+        let prepared = crate::audit_authority::PreparedTargetMutation::new(handle, effect, None);
         prepared.verify_effect(self.inner.backend.audit_key())?;
         self.preflight_netconf_target(&prepared).await?;
         frozen.verify_session(session)?;
@@ -2191,13 +2338,15 @@ impl ConsensusConfigStore {
         let expires_at = issued_at
             .checked_add(lifetime.as_secs() as i64)
             .ok_or(AuditAuthorityError::InvalidInput)?;
-        let effect = frozen.prepare_replacement(
+        self.require_commit_capacity(&commit)
+            .map_err(|_| AuditAuthorityError::InvalidInput)?;
+        let (effect, ownership) = frozen.prepare_replacement(
             session,
             commit,
             tenant,
             &event,
             expires_at,
-            self.inner.backend.audit_key(),
+            (self.inner.backend.audit_key(), self.capacity_profile()),
         )?;
         let digest = effect.digest(self.inner.backend.audit_key())?;
         let binding = AuditOperationBinding::project(
@@ -2220,21 +2369,29 @@ impl ConsensusConfigStore {
             },
             self.inner.backend.audit_key(),
         )?;
-        let prepared = crate::audit_authority::PreparedTargetMutation { handle, effect };
+        let prepared =
+            crate::audit_authority::PreparedTargetMutation::new(handle, effect, ownership);
         prepared.verify_effect(self.inner.backend.audit_key())?;
         // Both original phases must fit before returning any preparation.
         for (purpose, command) in [
             (
                 b"netconf-target-intent".as_slice(),
-                super::super::audit_mutation::TargetAuditCommandV1::Admit(prepared.clone()),
+                super::super::audit_mutation::TargetAuditCommandV1::Admit(
+                    prepared.command().clone(),
+                ),
             ),
             (
                 b"netconf-target-effect".as_slice(),
-                super::super::audit_mutation::TargetAuditCommandV1::Apply(prepared.clone()),
+                super::super::audit_mutation::TargetAuditCommandV1::Apply(
+                    prepared.command().clone(),
+                ),
             ),
         ] {
-            let request =
-                derive_durable_request_id(self.inner.identity, purpose, &prepared.handle.mac);
+            let request = derive_durable_request_id(
+                self.inner.identity,
+                purpose,
+                &prepared.command().handle.mac,
+            );
             super::preflight_config_command_replication_budget(
                 self.inner.identity,
                 request,
@@ -2397,7 +2554,7 @@ impl ConsensusConfigStore {
             },
             self.inner.backend.audit_key(),
         )?;
-        let prepared = crate::audit_authority::PreparedTargetMutation { handle, effect };
+        let prepared = crate::audit_authority::PreparedTargetMutation::new(handle, effect, None);
         prepared.verify_effect(self.inner.backend.audit_key())?;
         self.preflight_netconf_target(&prepared).await?;
         session.require_active()?;
@@ -2573,7 +2730,7 @@ impl ConsensusConfigStore {
             },
             self.inner.backend.audit_key(),
         )?;
-        let prepared = crate::audit_authority::PreparedTargetMutation { handle, effect };
+        let prepared = crate::audit_authority::PreparedTargetMutation::new(handle, effect, None);
         prepared.verify_effect(self.inner.backend.audit_key())?;
         self.preflight_netconf_target(&prepared).await?;
         frozen.verify_session(session)?;
@@ -2709,7 +2866,7 @@ impl ConsensusConfigStore {
             },
             self.inner.backend.audit_key(),
         )?;
-        let prepared = crate::audit_authority::PreparedTargetMutation { handle, effect };
+        let prepared = crate::audit_authority::PreparedTargetMutation::new(handle, effect, None);
         prepared.verify_effect(self.inner.backend.audit_key())?;
         self.preflight_netconf_target(&prepared).await?;
         frozen.destination.verify_session(session)?;
@@ -2783,7 +2940,7 @@ impl ConsensusConfigStore {
             },
             self.inner.backend.audit_key(),
         )?;
-        let prepared = crate::audit_authority::PreparedTargetMutation { handle, effect };
+        let prepared = crate::audit_authority::PreparedTargetMutation::new(handle, effect, None);
         prepared.verify_effect(self.inner.backend.audit_key())?;
         self.preflight_netconf_target(&prepared).await?;
         frozen.verify_session(session)?;
@@ -2908,7 +3065,7 @@ impl ConsensusConfigStore {
             },
             self.inner.backend.audit_key(),
         )?;
-        let prepared = crate::audit_authority::PreparedTargetMutation { handle, effect };
+        let prepared = crate::audit_authority::PreparedTargetMutation::new(handle, effect, None);
         prepared.verify_effect(self.inner.backend.audit_key())?;
         self.preflight_netconf_target(&prepared).await?;
         frozen.verify_session(session)?;
@@ -3037,7 +3194,7 @@ impl ConsensusConfigStore {
             },
             self.inner.backend.audit_key(),
         )?;
-        let prepared = crate::audit_authority::PreparedTargetMutation { handle, effect };
+        let prepared = crate::audit_authority::PreparedTargetMutation::new(handle, effect, None);
         prepared.verify_effect(self.inner.backend.audit_key())?;
         self.preflight_netconf_target(&prepared).await?;
         frozen.verify_session(session)?;
@@ -3104,7 +3261,7 @@ impl ConsensusConfigStore {
             },
             self.inner.backend.audit_key(),
         )?;
-        let prepared = crate::audit_authority::PreparedTargetMutation { handle, effect };
+        let prepared = crate::audit_authority::PreparedTargetMutation::new(handle, effect, None);
         prepared.verify_effect(self.inner.backend.audit_key())?;
         self.preflight_netconf_target(&prepared).await?;
         frozen.verify_session(session)?;
@@ -3131,7 +3288,7 @@ impl ConsensusConfigStore {
             return Err(AuditAuthorityError::BindingMismatch);
         }
         self.verify_netconf_target(&prepared.prepared, caller)?;
-        if receipt.handle != prepared.prepared.handle {
+        if receipt.handle != prepared.prepared.command().handle {
             return Err(AuditAuthorityError::BindingMismatch);
         }
         let crate::audit_authority::AuditOperationState::TargetV1(result) = receipt.state() else {
@@ -3141,8 +3298,8 @@ impl ConsensusConfigStore {
         let owner = crate::audit_authority::NetconfRecoveryOwner {
             worker: prepared.worker.clone(),
             authority: self.inner.identity,
-            profile_incarnation: prepared.prepared.effect.profile_incarnation,
-            device_incarnation: prepared.prepared.effect.device_incarnation,
+            profile_incarnation: prepared.prepared.command().effect.profile_incarnation,
+            device_incarnation: prepared.prepared.command().effect.device_incarnation,
             caller,
             cache: prepared.recovery.clone(),
         };
@@ -3287,7 +3444,7 @@ impl ConsensusConfigStore {
             },
             self.inner.backend.audit_key(),
         )?;
-        let prepared = crate::audit_authority::PreparedTargetMutation { handle, effect };
+        let prepared = crate::audit_authority::PreparedTargetMutation::new(handle, effect, None);
         prepared.verify_effect(self.inner.backend.audit_key())?;
         let original = frozen.retain(owner, prepared)?;
         self.preflight_netconf_target(&original).await?;
@@ -3371,7 +3528,7 @@ impl ConsensusConfigStore {
             },
             self.inner.backend.audit_key(),
         )?;
-        let prepared = crate::audit_authority::PreparedTargetMutation { handle, effect };
+        let prepared = crate::audit_authority::PreparedTargetMutation::new(handle, effect, None);
         let original = frozen.retain_successor(
             owner,
             previous,
@@ -3522,9 +3679,9 @@ impl ConsensusConfigStore {
             caller,
             b"netconf-empty-commit",
             ConfigMutationIntent::ManagementAudit(Box::new(AuditCommand::NetconfTarget(Box::new(
-                crate::consensus::audit_mutation::TargetAuditCommandV1::EmptyCommit(
+                crate::consensus::audit_mutation::TargetAuditCommandV1::EmptyCommit(Box::new(
                     prepared.clone(),
-                ),
+                )),
             )))),
             true,
             None,

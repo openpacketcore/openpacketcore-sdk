@@ -110,13 +110,33 @@ impl CommandBuffers {
                 }
             }
             ConfigMutationIntent::CreateRollbackPoint { label, .. } => (None, label.as_ref()),
-            ConfigMutationIntent::ManagementAudit(_) => {
-                // The closed management command owns fixed-size projected
-                // values; its boxed allocation still belongs in the count.
+            ConfigMutationIntent::ManagementAudit(command) => {
+                // The outer box and any nested joint record owner both count.
+                // Other management commands retain their existing accounting.
                 let bytes = size_of::<crate::consensus::audit::AuditCommand>();
                 add(&mut buffers.resident, bytes)?;
                 add(&mut buffers.copied, bytes)?;
-                (None, None)
+                if let crate::consensus::audit::AuditCommand::NetconfTarget(target) =
+                    command.as_ref()
+                {
+                    if let Some(payload) = target.bounded_running() {
+                        let fixed =
+                            size_of::<crate::consensus::audit_mutation::TargetAuditCommandV1>();
+                        add(&mut buffers.resident, fixed)?;
+                        add(&mut buffers.copied, fixed)?;
+                        add(
+                            &mut buffers.resident,
+                            size_of::<crate::consensus::audit_mutation::TargetMutationFields>(),
+                        )?;
+                        add(&mut buffers.resident, 2 * size_of::<usize>())?;
+                        add(&mut buffers.resident, payload.fixed_owner_bytes())?;
+                        (Some(payload.commit()), None)
+                    } else {
+                        (None, None)
+                    }
+                } else {
+                    (None, None)
+                }
             }
             _ => (None, None),
         };

@@ -201,7 +201,7 @@ impl Fixture {
             &self.key,
         )
         .unwrap();
-        PreparedTargetMutation { handle, effect }
+        PreparedTargetMutation::new(handle, effect, None)
     }
 }
 
@@ -225,14 +225,18 @@ async fn target_state_activation_retains_the_exact_audit_anchor_and_tombstones()
     fixture
         .apply(
             &conn,
-            AuditCommand::NetconfTarget(Box::new(TargetAuditCommandV1::Admit(prepared.clone()))),
+            AuditCommand::NetconfTarget(Box::new(TargetAuditCommandV1::Admit(
+                prepared.command().clone(),
+            ))),
             100,
         )
         .unwrap();
     fixture.checkpoint(&conn);
     let applied = fixture.apply(
         &conn,
-        AuditCommand::NetconfTarget(Box::new(TargetAuditCommandV1::Apply(prepared.clone()))),
+        AuditCommand::NetconfTarget(Box::new(TargetAuditCommandV1::Apply(
+            prepared.command().clone(),
+        ))),
         100,
     );
     assert!(
@@ -241,7 +245,11 @@ async fn target_state_activation_retains_the_exact_audit_anchor_and_tombstones()
     );
     let ledger = fixture.ledger(&conn);
     let receipt = ledger
-        .lookup(&fixture.key, prepared.handle(), prepared.effect.caller)
+        .lookup(
+            &fixture.key,
+            prepared.handle(),
+            prepared.command().effect.caller,
+        )
         .unwrap()
         .unwrap();
     let AuditOperationState::TargetV1(result) = receipt.state() else {
@@ -274,7 +282,11 @@ async fn target_state_activation_retains_the_exact_audit_anchor_and_tombstones()
     assert_eq!(
         fixture
             .ledger(&reopened)
-            .lookup(&fixture.key, prepared.handle(), prepared.effect.caller)
+            .lookup(
+                &fixture.key,
+                prepared.handle(),
+                prepared.command().effect.caller
+            )
             .unwrap()
             .unwrap()
             .state(),
@@ -286,26 +298,38 @@ impl Fixture {
     fn submit(&self, conn: &Connection, prepared: &PreparedTargetMutation) -> AuditOperationState {
         self.apply(
             conn,
-            AuditCommand::NetconfTarget(Box::new(TargetAuditCommandV1::Admit(prepared.clone()))),
+            AuditCommand::NetconfTarget(Box::new(TargetAuditCommandV1::Admit(
+                prepared.command().clone(),
+            ))),
             100,
         )
         .unwrap();
         self.checkpoint(conn);
         let _ = self.apply(
             conn,
-            AuditCommand::NetconfTarget(Box::new(TargetAuditCommandV1::Apply(prepared.clone()))),
+            AuditCommand::NetconfTarget(Box::new(TargetAuditCommandV1::Apply(
+                prepared.command().clone(),
+            ))),
             100,
         );
         self.ledger(conn)
-            .lookup(&self.key, prepared.handle(), prepared.effect.caller)
+            .lookup(
+                &self.key,
+                prepared.handle(),
+                prepared.command().effect.caller,
+            )
             .unwrap()
             .unwrap()
             .state()
     }
 
     fn settle(&self, conn: &Connection, prepared: &PreparedTargetMutation) {
-        self.apply(conn, AuditCommand::Terminal(prepared.handle.clone()), 100)
-            .unwrap();
+        self.apply(
+            conn,
+            AuditCommand::Terminal(prepared.command().handle.clone()),
+            100,
+        )
+        .unwrap();
         self.checkpoint(conn);
     }
 
@@ -415,7 +439,7 @@ impl Fixture {
             AES_256_GCM_SIV_NONCE_LEN,
         };
         use sha2::{Digest, Sha256};
-        let (target, version) = match prepared.effect.destination {
+        let (target, version) = match prepared.command().effect.destination {
             TargetExpectationV1::Candidate { generation } => (0, generation.get() + 1),
             TargetExpectationV1::Startup { revision } => (1, revision.get() + 1),
             _ => panic!("target fixture required"),
@@ -431,6 +455,7 @@ impl Fixture {
                 "fixture-principal",
                 schema,
                 prepared
+                    .command()
                     .effect
                     .encryption_store_kind(schema, target)
                     .unwrap(),
@@ -450,12 +475,16 @@ impl Fixture {
             [seed; AES_256_GCM_SIV_NONCE_LEN],
         )
         .unwrap();
-        prepared.effect.encrypted_payload = Some(TargetPayloadV1::Target(TargetEncryptedBlobV1 {
-            schema,
-            plaintext_digest: Sha256::digest([0x72; 32]).into(),
-            encrypted_blob: envelope.encoded().to_vec(),
-        }));
-        self.prepare(prepared.effect, prepared.handle.body.event)
+        prepared.command_mut().effect.encrypted_payload =
+            Some(TargetPayloadV1::Target(TargetEncryptedBlobV1 {
+                schema,
+                plaintext_digest: Sha256::digest([0x72; 32]).into(),
+                encrypted_blob: envelope.encoded().to_vec(),
+            }));
+        self.prepare(
+            prepared.command().effect.clone(),
+            prepared.command().handle.body.event.clone(),
+        )
     }
 }
 
@@ -502,14 +531,19 @@ async fn target_state_requires_original_checkpoint_and_retains_rejections_and_te
     let conn = shared.lock().await;
     let activation = fixture.activate(&conn);
     let before = target_rows(&conn);
-    let apply =
-        || AuditCommand::NetconfTarget(Box::new(TargetAuditCommandV1::Apply(activation.clone())));
+    let apply = || {
+        AuditCommand::NetconfTarget(Box::new(TargetAuditCommandV1::Apply(
+            activation.command().clone(),
+        )))
+    };
     assert!(fixture.apply(&conn, apply(), 100).is_err());
     assert_eq!(target_rows(&conn), before);
     fixture
         .apply(
             &conn,
-            AuditCommand::NetconfTarget(Box::new(TargetAuditCommandV1::Admit(activation.clone()))),
+            AuditCommand::NetconfTarget(Box::new(TargetAuditCommandV1::Admit(
+                activation.command().clone(),
+            ))),
             100,
         )
         .unwrap();
@@ -518,7 +552,11 @@ async fn target_state_requires_original_checkpoint_and_retains_rejections_and_te
     assert_eq!(
         fixture
             .ledger(&conn)
-            .lookup(&fixture.key, activation.handle(), activation.effect.caller)
+            .lookup(
+                &fixture.key,
+                activation.handle(),
+                activation.command().effect.caller
+            )
             .unwrap()
             .unwrap()
             .state(),
@@ -533,7 +571,9 @@ async fn target_state_requires_original_checkpoint_and_retains_rejections_and_te
         fixture
             .apply(
                 &conn,
-                AuditCommand::NetconfTarget(Box::new(TargetAuditCommandV1::Admit(discard.clone()))),
+                AuditCommand::NetconfTarget(Box::new(TargetAuditCommandV1::Admit(
+                    discard.command().clone()
+                ))),
                 100,
             )
             .is_err(),
@@ -543,7 +583,9 @@ async fn target_state_requires_original_checkpoint_and_retains_rejections_and_te
     assert!(fixture
         .apply(
             &conn,
-            AuditCommand::NetconfTarget(Box::new(TargetAuditCommandV1::Apply(discard.clone()))),
+            AuditCommand::NetconfTarget(Box::new(TargetAuditCommandV1::Apply(
+                discard.command().clone()
+            ))),
             100
         )
         .is_err());
@@ -556,7 +598,9 @@ async fn target_state_requires_original_checkpoint_and_retains_rejections_and_te
     fixture
         .apply(
             &conn,
-            AuditCommand::NetconfTarget(Box::new(TargetAuditCommandV1::Admit(discard.clone()))),
+            AuditCommand::NetconfTarget(Box::new(TargetAuditCommandV1::Admit(
+                discard.command().clone(),
+            ))),
             100,
         )
         .unwrap();
@@ -564,7 +608,9 @@ async fn target_state_requires_original_checkpoint_and_retains_rejections_and_te
     fixture
         .apply(
             &conn,
-            AuditCommand::NetconfTarget(Box::new(TargetAuditCommandV1::Apply(discard.clone()))),
+            AuditCommand::NetconfTarget(Box::new(TargetAuditCommandV1::Apply(
+                discard.command().clone(),
+            ))),
             200,
         )
         .unwrap_err();
@@ -572,7 +618,11 @@ async fn target_state_requires_original_checkpoint_and_retains_rejections_and_te
     assert_eq!(
         fixture
             .ledger(&conn)
-            .lookup(&fixture.key, discard.handle(), discard.effect.caller)
+            .lookup(
+                &fixture.key,
+                discard.handle(),
+                discard.command().effect.caller
+            )
             .unwrap()
             .unwrap()
             .state(),
@@ -662,7 +712,9 @@ async fn target_state_generations_locks_and_session_loss_fence_stale_effects() {
     fixture
         .apply(
             &conn,
-            AuditCommand::NetconfTarget(Box::new(TargetAuditCommandV1::Apply(stage.clone()))),
+            AuditCommand::NetconfTarget(Box::new(TargetAuditCommandV1::Apply(
+                stage.command().clone(),
+            ))),
             200,
         )
         .unwrap();
@@ -755,7 +807,9 @@ async fn target_state_result_must_match_the_retained_action_profile_and_successo
     fixture
         .apply(
             &conn,
-            AuditCommand::NetconfTarget(Box::new(TargetAuditCommandV1::Admit(discard.clone()))),
+            AuditCommand::NetconfTarget(Box::new(TargetAuditCommandV1::Admit(
+                discard.command().clone(),
+            ))),
             100,
         )
         .unwrap();
@@ -861,7 +915,7 @@ async fn target_state_reconstruction_rejects_authentic_but_substituted_result() 
     let op = substituted
         .operations
         .iter_mut()
-        .find(|op| op.handle == discard.handle)
+        .find(|op| op.handle == discard.command().handle)
         .unwrap();
     op.state = AuditOperationState::TargetV1(wrong);
     substituted.target_anchor = Some(TargetStateAnchor {
@@ -870,7 +924,7 @@ async fn target_state_reconstruction_rejects_authentic_but_substituted_result() 
     });
     for entry in &mut substituted.entries {
         if let EntryPayload::Outcome { operation, state } = &mut entry.payload {
-            if *operation == discard.handle.mac {
+            if *operation == discard.command().handle.mac {
                 *state = AuditOperationState::TargetV1(wrong);
             }
         }
@@ -1047,31 +1101,36 @@ impl Fixture {
             }
         };
         let mut prepared = self.request(conn, request, 6, 0x61, 0);
-        prepared.effect.action = action.try_into().unwrap();
-        prepared.effect.destination = TargetExpectationV1::Running { version: base };
-        prepared.effect.source = Some(source);
-        prepared.effect.encrypted_payload = Some(TargetPayloadV1::Running {
+        prepared.command_mut().effect.action = action.try_into().unwrap();
+        prepared.command_mut().effect.destination = TargetExpectationV1::Running { version: base };
+        prepared.command_mut().effect.source = Some(source);
+        prepared.command_mut().effect.encrypted_payload = Some(TargetPayloadV1::Running {
             commit: Box::new(commit),
             confirmation_ownership: None,
         });
         let lifecycle = row(conn, "config_netconf_lifecycle", "singleton", 1);
-        prepared.effect.lock = Some(TargetLockExpectationV1 {
+        prepared.command_mut().effect.lock = Some(TargetLockExpectationV1 {
             datastore: 0,
             incarnation: lifecycle["locks"][0]["incarnation"].as_u64().unwrap(),
             session: serde_json::from_value(lifecycle["locks"][0]["session"].clone()).unwrap(),
             requester: [0x61; 16],
         });
         // Reissue only within this synthetic SDK fixture, binding the exact observed base.
-        let mut prepared = self.prepare(prepared.effect, prepared.handle.body.event);
-        prepared.handle.body.binding.base_version = base;
-        prepared.handle = AuditOperationHandle::issue(prepared.handle.body, &self.key).unwrap();
+        let mut prepared = self.prepare(
+            prepared.command().effect.clone(),
+            prepared.command().handle.body.event.clone(),
+        );
+        prepared.command_mut().handle.body.binding.base_version = base;
+        prepared.command_mut().handle =
+            AuditOperationHandle::issue(prepared.command().handle.body.clone(), &self.key).unwrap();
         prepared.verify_effect(&self.key).unwrap();
         prepared
     }
 
     fn assert_running_plaintext(&self, conn: &Connection, expected: &PreparedTargetMutation) {
         use crate::consensus::audit_mutation::TargetPayloadV1;
-        let Some(TargetPayloadV1::Running { commit, .. }) = &expected.effect.encrypted_payload
+        let Some(TargetPayloadV1::Running { commit, .. }) =
+            &expected.command().effect.encrypted_payload
         else {
             panic!("running fixture");
         };
@@ -1132,7 +1191,9 @@ async fn target_running_promotion_atomically_retires_the_exact_candidate() {
     fixture
         .apply(
             &conn,
-            AuditCommand::NetconfTarget(Box::new(TargetAuditCommandV1::Apply(prepared.clone()))),
+            AuditCommand::NetconfTarget(Box::new(TargetAuditCommandV1::Apply(
+                prepared.command().clone(),
+            ))),
             200,
         )
         .unwrap();
@@ -1144,7 +1205,11 @@ async fn target_running_promotion_atomically_retires_the_exact_candidate() {
     assert_eq!(
         fixture
             .ledger(&conn)
-            .lookup(&fixture.key, prepared.handle(), prepared.effect.caller)
+            .lookup(
+                &fixture.key,
+                prepared.handle(),
+                prepared.command().effect.caller
+            )
             .unwrap()
             .unwrap()
             .state(),
@@ -1226,7 +1291,11 @@ async fn target_running_copy_rejects_replaced_source_without_any_effect() {
     );
     let receipt = fixture
         .ledger(&conn)
-        .lookup(&fixture.key, old_copy.handle(), old_copy.effect.caller)
+        .lookup(
+            &fixture.key,
+            old_copy.handle(),
+            old_copy.command().effect.caller,
+        )
         .unwrap()
         .unwrap();
     assert!(
@@ -1262,7 +1331,9 @@ async fn target_running_promotion_rolls_back_running_and_retirement_on_storage_f
     fixture
         .apply(
             &conn,
-            AuditCommand::NetconfTarget(Box::new(TargetAuditCommandV1::Admit(prepared.clone()))),
+            AuditCommand::NetconfTarget(Box::new(TargetAuditCommandV1::Admit(
+                prepared.command().clone(),
+            ))),
             100,
         )
         .unwrap();
@@ -1277,7 +1348,9 @@ async fn target_running_promotion_rolls_back_running_and_retirement_on_storage_f
             &tx,
             &fixture.key,
             fixture.identity,
-            &AuditCommand::NetconfTarget(Box::new(TargetAuditCommandV1::Apply(prepared.clone()))),
+            &AuditCommand::NetconfTarget(Box::new(TargetAuditCommandV1::Apply(
+                prepared.command().clone()
+            ))),
             100,
             Some(&fixture.keys)
         )
@@ -1307,7 +1380,9 @@ async fn target_running_promotion_rolls_back_running_and_retirement_on_storage_f
     fixture
         .apply(
             &conn,
-            AuditCommand::NetconfTarget(Box::new(TargetAuditCommandV1::Apply(prepared.clone()))),
+            AuditCommand::NetconfTarget(Box::new(TargetAuditCommandV1::Apply(
+                prepared.command().clone(),
+            ))),
             100,
         )
         .unwrap();
@@ -1332,8 +1407,9 @@ impl Fixture {
                 |r| r.get(0),
             )
             .unwrap();
-        prepared.handle.body.binding.base_version = base;
-        prepared.handle = AuditOperationHandle::issue(prepared.handle.body, &self.key).unwrap();
+        prepared.command_mut().handle.body.binding.base_version = base;
+        prepared.command_mut().handle =
+            AuditOperationHandle::issue(prepared.command().handle.body.clone(), &self.key).unwrap();
         prepared.verify_effect(&self.key).unwrap();
         prepared
     }
@@ -1349,8 +1425,9 @@ impl Fixture {
         use opc_key::{ConfigAad, EnvelopeAad, KeyHandle, KeyId, KeyPurpose};
         use sha2::{Digest, Sha256};
         let mut prepared = self.running_target(conn, request, 6, 0, source_seed);
-        prepared.effect.action = 9.try_into().unwrap();
-        let Some(TargetPayloadV1::Running { commit, .. }) = &mut prepared.effect.encrypted_payload
+        prepared.command_mut().effect.action = 9.try_into().unwrap();
+        let Some(TargetPayloadV1::Running { commit, .. }) =
+            &mut prepared.command_mut().effect.encrypted_payload
         else {
             panic!("running fixture");
         };
@@ -1362,10 +1439,10 @@ impl Fixture {
         commit.record.confirmed_deadline = Some(deadline);
         let schema = commit.record.schema_digest;
         let version = commit.record.version.get();
-        prepared.effect.resolution = Some(TargetResolutionV1::InstallPending {
+        prepared.command_mut().effect.resolution = Some(TargetResolutionV1::InstallPending {
             pending,
             rollback_parent: commit.record.parent_tx_id.unwrap(),
-            rollback_version: prepared.handle.body.binding.base_version,
+            rollback_version: prepared.command().handle.body.binding.base_version,
             original_deadline: deadline.as_offset_datetime().unix_timestamp(),
             owner_session: [0x61; 16],
             persistent: true,
@@ -1373,7 +1450,7 @@ impl Fixture {
         // The reviewed ownership domain uses the same bounded pre-encryption
         // binding as target envelopes, with the fixed confirmation target tag.
         // Spell it independently so this detector does not require a new API.
-        let effect = &prepared.effect;
+        let effect = &prepared.command().effect;
         let binding = serde_json::to_vec(&(
             effect.format,
             effect.authority,
@@ -1428,7 +1505,7 @@ impl Fixture {
         let Some(TargetPayloadV1::Running {
             confirmation_ownership,
             ..
-        }) = &mut prepared.effect.encrypted_payload
+        }) = &mut prepared.command_mut().effect.encrypted_payload
         else {
             panic!("running fixture");
         };
@@ -1437,7 +1514,10 @@ impl Fixture {
             plaintext_digest: Sha256::digest(b"synthetic-confirmation-owner").into(),
             encrypted_blob: ownership.encoded().to_vec(),
         });
-        let prepared = self.prepare(prepared.effect, prepared.handle.body.event);
+        let prepared = self.prepare(
+            prepared.command().effect.clone(),
+            prepared.command().handle.body.event.clone(),
+        );
         self.bind_current_base(conn, prepared)
     }
 }
@@ -1476,14 +1556,14 @@ async fn target_confirmation_tentative_retains_exact_rollback_deadline_and_encry
         original_deadline,
         owner_session,
         persistent,
-    }) = prepared.effect.resolution
+    }) = prepared.command().effect.resolution
     else {
         panic!("pending fixture");
     };
     let Some(TargetPayloadV1::Running {
         commit,
         confirmation_ownership: Some(ownership),
-    }) = &prepared.effect.encrypted_payload
+    }) = &prepared.command().effect.encrypted_payload
     else {
         panic!("ownership fixture");
     };
@@ -1525,7 +1605,9 @@ async fn target_confirmation_tentative_retains_exact_rollback_deadline_and_encry
     fixture
         .apply(
             &conn,
-            AuditCommand::NetconfTarget(Box::new(TargetAuditCommandV1::Apply(prepared.clone()))),
+            AuditCommand::NetconfTarget(Box::new(TargetAuditCommandV1::Apply(
+                prepared.command().clone(),
+            ))),
             200,
         )
         .unwrap();
@@ -1544,14 +1626,14 @@ impl Fixture {
         mut prepared: PreparedTargetMutation,
         now: i64,
     ) -> PreparedTargetMutation {
-        prepared.effect.expires_at = now + 60;
-        prepared.handle.body.expires_at = now + 60;
-        prepared.handle.body.issued_at = now;
-        prepared.handle.body.mutation = Some(
+        prepared.command_mut().effect.expires_at = now + 60;
+        prepared.command_mut().handle.body.expires_at = now + 60;
+        prepared.command_mut().handle.body.issued_at = now;
+        prepared.command_mut().handle.body.mutation = Some(
             authenticate(
                 &self.key,
                 b"openpacketcore/management-audit/netconf-target/v1\0",
-                &prepared.effect,
+                &prepared.command().effect,
             )
             .unwrap(),
         );
@@ -1566,18 +1648,26 @@ impl Fixture {
     ) -> AuditOperationState {
         self.apply(
             conn,
-            AuditCommand::NetconfTarget(Box::new(TargetAuditCommandV1::Admit(prepared.clone()))),
+            AuditCommand::NetconfTarget(Box::new(TargetAuditCommandV1::Admit(
+                prepared.command().clone(),
+            ))),
             now,
         )
         .unwrap();
         self.checkpoint(conn);
         let _ = self.apply(
             conn,
-            AuditCommand::NetconfTarget(Box::new(TargetAuditCommandV1::Apply(prepared.clone()))),
+            AuditCommand::NetconfTarget(Box::new(TargetAuditCommandV1::Apply(
+                prepared.command().clone(),
+            ))),
             now,
         );
         self.ledger(conn)
-            .lookup(&self.key, prepared.handle(), prepared.effect.caller)
+            .lookup(
+                &self.key,
+                prepared.handle(),
+                prepared.command().effect.caller,
+            )
             .unwrap()
             .unwrap()
             .state()
@@ -1602,7 +1692,9 @@ impl Fixture {
         ));
         self.settle(conn, &first);
         let mut staged = self.encrypted(self.request(conn, 103, 4, 0x61, 1), 0x37);
-        let Some(TargetPayloadV1::Target(blob)) = &mut staged.effect.encrypted_payload else {
+        let Some(TargetPayloadV1::Target(blob)) =
+            &mut staged.command_mut().effect.encrypted_payload
+        else {
             panic!("staged fixture");
         };
         let envelope = opc_crypto::CryptoEnvelopeRef::decode(&blob.encrypted_blob).unwrap();
@@ -1629,12 +1721,13 @@ impl Fixture {
         let Some(TargetResolutionV1::InstallPending {
             persistent: supplied,
             ..
-        }) = &mut tentative.effect.resolution
+        }) = &mut tentative.command_mut().effect.resolution
         else {
             panic!("pending fixture");
         };
         *supplied = persistent;
-        let Some(TargetPayloadV1::Running { commit, .. }) = &tentative.effect.encrypted_payload
+        let Some(TargetPayloadV1::Running { commit, .. }) =
+            &tentative.command().effect.encrypted_payload
         else {
             panic!("running fixture");
         };
@@ -1648,7 +1741,11 @@ impl Fixture {
                 commit.record.committed_at,
                 "fixture-principal",
                 schema,
-                tentative.effect.encryption_store_kind(schema, 2).unwrap(),
+                tentative
+                    .command()
+                    .effect
+                    .encryption_store_kind(schema, 2)
+                    .unwrap(),
             )
             .unwrap(),
         );
@@ -1661,7 +1758,7 @@ impl Fixture {
         let Some(TargetPayloadV1::Running {
             confirmation_ownership: Some(blob),
             ..
-        }) = &mut tentative.effect.encrypted_payload
+        }) = &mut tentative.command_mut().effect.encrypted_payload
         else {
             panic!("ownership fixture");
         };
@@ -1697,14 +1794,14 @@ impl Fixture {
         let token = serde_json::from_value(pending["pending"].clone()).unwrap();
         let deadline = lifecycle["original_deadline"].as_i64().unwrap();
         let mut prepared = self.request(conn, request, 10, 0x61, 0);
-        prepared.effect.action = action.try_into().unwrap();
-        prepared.effect.lock = Some(TargetLockExpectationV1 {
+        prepared.command_mut().effect.action = action.try_into().unwrap();
+        prepared.command_mut().effect.lock = Some(TargetLockExpectationV1 {
             datastore: 0,
             incarnation: lifecycle["locks"][0]["incarnation"].as_u64().unwrap(),
             session: serde_json::from_value(lifecycle["locks"][0]["session"].clone()).unwrap(),
             requester: [0x61; 16],
         });
-        prepared.effect.resolution = if action == 14 {
+        prepared.command_mut().effect.resolution = if action == 14 {
             Some(TargetResolutionV1::RebootRecovery {
                 previous_device: serde_json::from_value(pending["device_incarnation"].clone())
                     .unwrap(),
@@ -1718,7 +1815,8 @@ impl Fixture {
             })
         };
         if internal {
-            prepared.handle.body.event.transport = ManagementAuditTransportCode::Internal;
+            prepared.command_mut().handle.body.event.transport =
+                ManagementAuditTransportCode::Internal;
         }
         if action != 10 {
             let parent = &lifecycle["rollback_parent"];
@@ -1796,14 +1894,14 @@ impl Fixture {
                 &self.key,
             )
             .unwrap();
-            prepared.effect.destination = TargetExpectationV1::Running { version };
-            prepared.effect.source = Some(TargetSourceV1::Running {
+            prepared.command_mut().effect.destination = TargetExpectationV1::Running { version };
+            prepared.command_mut().effect.source = Some(TargetSourceV1::Running {
                 version: parent["version"].as_u64().unwrap(),
                 schema,
                 ciphertext_digest: serde_json::from_value(parent["ciphertext_digest"].clone())
                     .unwrap(),
             });
-            prepared.effect.encrypted_payload = Some(TargetPayloadV1::Running {
+            prepared.command_mut().effect.encrypted_payload = Some(TargetPayloadV1::Running {
                 commit: Box::new(commit),
                 confirmation_ownership: None,
             });
@@ -1849,7 +1947,7 @@ async fn target_confirmation_rejects_substituted_ownership_aad_before_any_effect
     let original = fixture.pending_fixture(&conn, false);
     let mut altered = original.clone();
     let Some(TargetResolutionV1::InstallPending { persistent, .. }) =
-        &mut altered.effect.resolution
+        &mut altered.command_mut().effect.resolution
     else {
         panic!("fixture");
     };
@@ -1887,7 +1985,7 @@ async fn target_confirmation_exact_confirm_rejects_wrong_pending_deadline_and_se
         match variant {
             0 => {
                 let Some(TargetResolutionV1::ResolvePending { pending, .. }) =
-                    &mut wrong.effect.resolution
+                    &mut wrong.command_mut().effect.resolution
                 else {
                     panic!("fixture");
                 };
@@ -1896,13 +1994,13 @@ async fn target_confirmation_exact_confirm_rejects_wrong_pending_deadline_and_se
             1 => {
                 let Some(TargetResolutionV1::ResolvePending {
                     original_deadline, ..
-                }) = &mut wrong.effect.resolution
+                }) = &mut wrong.command_mut().effect.resolution
                 else {
                     panic!("fixture");
                 };
                 *original_deadline += 1;
             }
-            _ => wrong.effect.lock.as_mut().unwrap().requester = [0xf2; 16],
+            _ => wrong.command_mut().effect.lock.as_mut().unwrap().requester = [0xf2; 16],
         }
         let wrong = fixture.rebind_at(&conn, wrong, 100);
         let before = target_rows(&conn);
@@ -1931,7 +2029,9 @@ async fn target_confirmation_exact_confirm_rejects_wrong_pending_deadline_and_se
     fixture
         .apply(
             &conn,
-            AuditCommand::NetconfTarget(Box::new(TargetAuditCommandV1::Apply(exact.clone()))),
+            AuditCommand::NetconfTarget(Box::new(TargetAuditCommandV1::Apply(
+                exact.command().clone(),
+            ))),
             200,
         )
         .unwrap();
@@ -2143,9 +2243,9 @@ impl Fixture {
         )
         .unwrap();
         let mut prepared = self.request(conn, request, 6, 0x61, 0);
-        prepared.effect.action = 15.try_into().unwrap();
-        prepared.effect.destination = TargetExpectationV1::Running { version };
-        prepared.effect.source = Some(TargetSourceV1::CandidateFallback {
+        prepared.command_mut().effect.action = 15.try_into().unwrap();
+        prepared.command_mut().effect.destination = TargetExpectationV1::Running { version };
+        prepared.command_mut().effect.source = Some(TargetSourceV1::CandidateFallback {
             generation: crate::audit_authority::CandidateGeneration {
                 authority: self.identity,
                 value: candidate["generation"].as_u64().unwrap(),
@@ -2154,7 +2254,7 @@ impl Fixture {
             schema,
             ciphertext_digest: Sha256::digest(encrypted).into(),
         });
-        prepared.effect.encrypted_payload = Some(TargetPayloadV1::Running {
+        prepared.command_mut().effect.encrypted_payload = Some(TargetPayloadV1::Running {
             commit: Box::new(commit),
             confirmation_ownership: None,
         });
@@ -2224,9 +2324,9 @@ fn assert_closed_target_input(prepared: &PreparedTargetMutation, paths: &[&str])
     assert_eq!(PreparedTargetMutation::decode(&encoded).unwrap(), *prepared);
     for phase in [false, true] {
         let command = AuditCommand::NetconfTarget(Box::new(if phase {
-            TargetAuditCommandV1::Apply(prepared.clone())
+            TargetAuditCommandV1::Apply(prepared.command().clone())
         } else {
-            TargetAuditCommandV1::Admit(prepared.clone())
+            TargetAuditCommandV1::Admit(prepared.command().clone())
         }));
         let bytes = opc_consensus::encode_bounded(&command).unwrap();
         let restored: AuditCommand = opc_consensus::decode_bounded(&bytes).unwrap();
@@ -2288,7 +2388,8 @@ async fn target_closed_input_rejects_unknown_running_commit_and_audit_fields() {
     ));
     fixture.settle(&conn, &stage);
     let mut prepared = fixture.running_target(&conn, 142, 6, 0, 0x41);
-    let Some(TargetPayloadV1::Running { commit, .. }) = &mut prepared.effect.encrypted_payload
+    let Some(TargetPayloadV1::Running { commit, .. }) =
+        &mut prepared.command_mut().effect.encrypted_payload
     else {
         panic!("running fixture");
     };
@@ -2340,7 +2441,7 @@ impl Fixture {
         let result = crate::consensus::audit_targets::preflight_target_sync(
             &tx,
             &self.key,
-            prepared,
+            prepared.command(),
             &ledger,
             &self.keys,
             now,
@@ -2445,7 +2546,7 @@ async fn target_sdk_preflight_refuses_stale_generation_source_lock_and_expiry() 
     // A second request with an identical intent body is still not a receipt.
     assert!(fixture
         .ledger(&conn)
-        .lookup(&fixture.key, fresh.handle(), fresh.effect.caller)
+        .lookup(&fixture.key, fresh.handle(), fresh.command().effect.caller)
         .unwrap()
         .is_none());
 }
@@ -2460,7 +2561,9 @@ async fn target_sdk_preflight_preserves_original_receipts_and_fences_unresolved_
     fixture
         .apply(
             &conn,
-            AuditCommand::NetconfTarget(Box::new(TargetAuditCommandV1::Admit(original.clone()))),
+            AuditCommand::NetconfTarget(Box::new(TargetAuditCommandV1::Admit(
+                original.command().clone(),
+            ))),
             100,
         )
         .unwrap();
@@ -2469,7 +2572,11 @@ async fn target_sdk_preflight_preserves_original_receipts_and_fences_unresolved_
     assert_eq!(
         fixture
             .ledger(&conn)
-            .recover_target(&fixture.key, original.handle(), original.effect.caller)
+            .recover_target(
+                &fixture.key,
+                original.handle(),
+                original.command().effect.caller
+            )
             .unwrap(),
         original
     );
@@ -2482,7 +2589,9 @@ async fn target_sdk_preflight_preserves_original_receipts_and_fences_unresolved_
     fixture
         .apply(
             &conn,
-            AuditCommand::NetconfTarget(Box::new(TargetAuditCommandV1::Apply(original.clone()))),
+            AuditCommand::NetconfTarget(Box::new(TargetAuditCommandV1::Apply(
+                original.command().clone(),
+            ))),
             100,
         )
         .unwrap();
@@ -2513,7 +2622,11 @@ async fn target_sdk_preflight_preserves_original_receipts_and_fences_unresolved_
     );
     let wrong = fixture.request(&conn, 162, 5, 0x61, 1);
     fixture
-        .apply(&conn, AuditCommand::Intent(wrong.handle.clone()), 100)
+        .apply(
+            &conn,
+            AuditCommand::Intent(wrong.command().handle.clone()),
+            100,
+        )
         .unwrap();
     assert_eq!(
         fixture.preflight(&conn, &wrong, 100),
@@ -2569,8 +2682,8 @@ async fn target_device_preparation_binds_activation_then_exact_previous_device()
     let activation = fixture.prepare(effect, event.clone());
     assert_eq!(target_rows(&conn), before);
     assert_eq!(
-        activation.effect.digest(&fixture.key).unwrap(),
-        activation.handle.body.mutation.unwrap()
+        activation.command().effect.digest(&fixture.key).unwrap(),
+        activation.command().handle.body.mutation.unwrap()
     );
     assert_eq!(fixture.preflight(&conn, &activation, 100).unwrap(), None);
     let worker = std::sync::Arc::new(());
@@ -2647,7 +2760,9 @@ async fn target_device_preparation_refuses_rpc_events_unsettled_and_reused_incar
     fixture
         .apply(
             &conn,
-            AuditCommand::NetconfTarget(Box::new(TargetAuditCommandV1::Admit(prepared.clone()))),
+            AuditCommand::NetconfTarget(Box::new(TargetAuditCommandV1::Admit(
+                prepared.command().clone(),
+            ))),
             100,
         )
         .unwrap();
@@ -2660,7 +2775,9 @@ async fn target_device_preparation_refuses_rpc_events_unsettled_and_reused_incar
     fixture
         .apply(
             &conn,
-            AuditCommand::NetconfTarget(Box::new(TargetAuditCommandV1::Apply(prepared.clone()))),
+            AuditCommand::NetconfTarget(Box::new(TargetAuditCommandV1::Apply(
+                prepared.command().clone(),
+            ))),
             100,
         )
         .unwrap();
@@ -2720,7 +2837,7 @@ async fn target_device_preparation_preserves_reboot_cleanup_before_serving() {
     };
     let stale = fixture.prepare(effect, event);
     assert_eq!(fixture.device_view(&conn).running_version, 2);
-    assert_eq!(stale.handle.body.binding.base_version, 0);
+    assert_eq!(stale.command().handle.body.binding.base_version, 0);
     assert_eq!(
         fixture.preflight(&conn, &stale, 100),
         Err(AuditAuthorityError::BindingMismatch)
@@ -3105,7 +3222,7 @@ async fn target_session_cleanup_requires_original_scope_and_revoked_local_author
     }
     let effect = view.prepare_session_cleanup(&session, &event, 160).unwrap();
     let mut wrong_session = fixture.prepare(effect, event.clone());
-    wrong_session.effect.resolution = Some(TargetResolutionV1::EndSession {
+    wrong_session.command_mut().effect.resolution = Some(TargetResolutionV1::EndSession {
         session: [0x62; 16],
     });
     assert!(matches!(
@@ -3183,7 +3300,9 @@ async fn target_session_cleanup_discards_only_owned_candidate_and_preserves_fore
     fixture
         .apply(
             &conn,
-            AuditCommand::NetconfTarget(Box::new(TargetAuditCommandV1::Admit(cleanup.clone()))),
+            AuditCommand::NetconfTarget(Box::new(TargetAuditCommandV1::Admit(
+                cleanup.command().clone(),
+            ))),
             100,
         )
         .unwrap();
@@ -3195,7 +3314,9 @@ async fn target_session_cleanup_discards_only_owned_candidate_and_preserves_fore
     assert!(fixture
         .apply(
             &conn,
-            AuditCommand::NetconfTarget(Box::new(TargetAuditCommandV1::Apply(cleanup.clone()))),
+            AuditCommand::NetconfTarget(Box::new(TargetAuditCommandV1::Apply(
+                cleanup.command().clone()
+            ))),
             100
         )
         .is_err());
@@ -3208,7 +3329,9 @@ async fn target_session_cleanup_discards_only_owned_candidate_and_preserves_fore
     fixture
         .apply(
             &conn,
-            AuditCommand::NetconfTarget(Box::new(TargetAuditCommandV1::Apply(cleanup.clone()))),
+            AuditCommand::NetconfTarget(Box::new(TargetAuditCommandV1::Apply(
+                cleanup.command().clone(),
+            ))),
             100,
         )
         .unwrap();
@@ -3290,8 +3413,10 @@ impl Fixture {
     fn expire_cleanup(&self, conn: &Connection, original: &PreparedTargetMutation) {
         self.apply(
             conn,
-            AuditCommand::NetconfTarget(Box::new(TargetAuditCommandV1::Admit(original.clone()))),
-            original.handle.body.issued_at,
+            AuditCommand::NetconfTarget(Box::new(TargetAuditCommandV1::Admit(
+                original.command().clone(),
+            ))),
+            original.command().handle.body.issued_at,
         )
         .unwrap();
         self.checkpoint(conn);
@@ -3299,14 +3424,18 @@ impl Fixture {
             .apply(
                 conn,
                 AuditCommand::NetconfTarget(Box::new(TargetAuditCommandV1::Apply(
-                    original.clone()
+                    original.command().clone()
                 ))),
-                original.handle.body.expires_at,
+                original.command().handle.body.expires_at,
             )
             .is_err());
         assert_eq!(
             self.ledger(conn)
-                .lookup(&self.key, original.handle(), original.effect.caller)
+                .lookup(
+                    &self.key,
+                    original.handle(),
+                    original.command().effect.caller
+                )
                 .unwrap()
                 .unwrap()
                 .state(),
@@ -3345,7 +3474,9 @@ async fn target_cleanup_successor_requires_expiry_rejection_terminal_and_checkpo
     fixture
         .apply(
             &conn,
-            AuditCommand::NetconfTarget(Box::new(TargetAuditCommandV1::Admit(original.clone()))),
+            AuditCommand::NetconfTarget(Box::new(TargetAuditCommandV1::Admit(
+                original.command().clone(),
+            ))),
             100,
         )
         .unwrap();
@@ -3366,7 +3497,9 @@ async fn target_cleanup_successor_requires_expiry_rejection_terminal_and_checkpo
     assert!(fixture
         .apply(
             &conn,
-            AuditCommand::NetconfTarget(Box::new(TargetAuditCommandV1::Apply(original.clone()))),
+            AuditCommand::NetconfTarget(Box::new(TargetAuditCommandV1::Apply(
+                original.command().clone()
+            ))),
             160
         )
         .is_err());
@@ -3393,7 +3526,11 @@ async fn target_cleanup_successor_requires_expiry_rejection_terminal_and_checkpo
         "rejection without terminal is unsettled"
     );
     fixture
-        .apply(&conn, AuditCommand::Terminal(original.handle.clone()), 160)
+        .apply(
+            &conn,
+            AuditCommand::Terminal(original.command().handle.clone()),
+            160,
+        )
         .unwrap();
     assert!(
         matches!(
@@ -3770,7 +3907,8 @@ async fn copy_provider_stage(
         fixture.request(conn, 180, if slot == 0 { 4 } else { 7 }, 0x61, slot + 1),
         0x6a,
     );
-    let Some(TargetPayloadV1::Target(blob)) = &mut stage.effect.encrypted_payload else {
+    let Some(TargetPayloadV1::Target(blob)) = &mut stage.command_mut().effect.encrypted_payload
+    else {
         panic!("target copy fixture");
     };
     let envelope = opc_crypto::CryptoEnvelopeRef::decode(&blob.encrypted_blob).unwrap();
@@ -3810,7 +3948,8 @@ async fn copy_provider_destination(
     use crate::consensus::audit_mutation::TargetPayloadV1;
     use sha2::{Digest, Sha256};
     let mut prepared = fixture.running_target(conn, request, 15, slot, 0x6a);
-    let Some(TargetPayloadV1::Running { commit, .. }) = &mut prepared.effect.encrypted_payload
+    let Some(TargetPayloadV1::Running { commit, .. }) =
+        &mut prepared.command_mut().effect.encrypted_payload
     else {
         panic!("running copy fixture");
     };
@@ -3839,7 +3978,11 @@ async fn bind_copy_provider(
     source: &crate::consensus::audit_mutation::TargetEncryptedBlobV1,
     mut prepared: PreparedTargetMutation,
 ) -> Result<PreparedTargetMutation, AuditAuthorityError> {
-    prepared.effect.bind_provider_copy(provider, source).await?;
+    prepared
+        .command_mut()
+        .effect
+        .bind_provider_copy(provider, source)
+        .await?;
     Ok(fixture.rebind_at(conn, prepared, 100))
 }
 
@@ -3859,6 +4002,7 @@ async fn target_provider_copy_accepts_distinct_authenticated_replay_wrappers() {
             .await
             .unwrap();
         let (commit, _) = prepared
+            .command()
             .effect
             .encrypted_payload
             .as_ref()
@@ -3954,7 +4098,7 @@ async fn target_provider_copy_refuses_content_substitution_and_authentication_fa
     ));
     let mut tampered_destination = exact.clone();
     let Some(TargetPayloadV1::Running { commit, .. }) =
-        &mut tampered_destination.effect.encrypted_payload
+        &mut tampered_destination.command_mut().effect.encrypted_payload
     else {
         panic!("running copy fixture");
     };
@@ -3967,7 +4111,7 @@ async fn target_provider_copy_refuses_content_substitution_and_authentication_fa
     let mut false_source = exact.clone();
     let Some(crate::consensus::audit_mutation::TargetSourceV1::Candidate {
         ciphertext_digest, ..
-    }) = &mut false_source.effect.source
+    }) = &mut false_source.command_mut().effect.source
     else {
         panic!("candidate source fixture");
     };
@@ -4072,7 +4216,8 @@ async fn target_provider_copy_pinned_preparation_binds_current_session_and_locks
         let (provider, source) = copy_provider_stage(&fixture, &conn, slot, config).await;
         let original =
             copy_provider_destination(&fixture, &conn, &provider, slot, 181, config).await;
-        let Some(TargetPayloadV1::Running { commit, .. }) = original.effect.encrypted_payload
+        let Some(TargetPayloadV1::Running { commit, .. }) =
+            original.command().effect.encrypted_payload.clone()
         else {
             panic!("running copy fixture");
         };
@@ -4179,7 +4324,8 @@ async fn provider_rewrap_running(
 ) -> PreparedTargetMutation {
     use crate::consensus::audit_mutation::TargetPayloadV1;
     use sha2::{Digest, Sha256};
-    let Some(TargetPayloadV1::Running { commit, .. }) = &mut prepared.effect.encrypted_payload
+    let Some(TargetPayloadV1::Running { commit, .. }) =
+        &mut prepared.command_mut().effect.encrypted_payload
     else {
         panic!("running lifecycle fixture");
     };
@@ -4218,7 +4364,8 @@ async fn provider_stage_second_candidate(
         )
         .unwrap();
     let mut stage = fixture.encrypted(fixture.request(conn, 182, 4, 0x61, 1), 0x6a);
-    let Some(TargetPayloadV1::Target(blob)) = &mut stage.effect.encrypted_payload else {
+    let Some(TargetPayloadV1::Target(blob)) = &mut stage.command_mut().effect.encrypted_payload
+    else {
         panic!("second candidate fixture");
     };
     let envelope = opc_crypto::CryptoEnvelopeRef::decode(&blob.encrypted_blob).unwrap();
@@ -4300,28 +4447,29 @@ async fn provider_rollback(
     let (record, audit, _) = attested.into_parts();
     let commit =
         crate::consensus::PreparedConfigCommit::prepare(record, audit, &fixture.key).unwrap();
-    prepared.effect.action = action.try_into().unwrap();
-    prepared.effect.destination = TargetExpectationV1::Running { version };
-    prepared.effect.source = Some(TargetSourceV1::Running {
+    prepared.command_mut().effect.action = action.try_into().unwrap();
+    prepared.command_mut().effect.destination = TargetExpectationV1::Running { version };
+    prepared.command_mut().effect.source = Some(TargetSourceV1::Running {
         version: parent["version"].as_u64().unwrap(),
         schema: source.schema,
         ciphertext_digest: Sha256::digest(&source.encrypted_blob).into(),
     });
-    prepared.effect.encrypted_payload = Some(TargetPayloadV1::Running {
+    prepared.command_mut().effect.encrypted_payload = Some(TargetPayloadV1::Running {
         commit: Box::new(commit),
         confirmation_ownership: None,
     });
     if action == 12 || action == 14 {
-        prepared.handle.body.event.transport = ManagementAuditTransportCode::Internal;
+        prepared.command_mut().handle.body.event.transport = ManagementAuditTransportCode::Internal;
     }
     if action == 14 {
-        prepared.effect.resolution = Some(TargetResolutionV1::RebootRecovery {
+        prepared.command_mut().effect.resolution = Some(TargetResolutionV1::RebootRecovery {
             previous_device: serde_json::from_value(pending["device_incarnation"].clone()).unwrap(),
             pending: Some(serde_json::from_value(pending["pending"].clone()).unwrap()),
             original_deadline: lifecycle["original_deadline"].as_i64(),
         });
     }
     prepared
+        .command_mut()
         .effect
         .bind_provider_copy(provider, &source)
         .await
@@ -4354,7 +4502,9 @@ async fn target_provider_lifecycle_promotes_and_copies_exact_absent_candidate_fa
     assert_eq!(candidate["present"], false);
     let original = fixture.fallback_copy(&conn, 182);
     let original = provider_rewrap_running(&fixture, &conn, &provider, original, 182, config).await;
-    let Some(TargetPayloadV1::Running { commit, .. }) = original.effect.encrypted_payload else {
+    let Some(TargetPayloadV1::Running { commit, .. }) =
+        original.command().effect.encrypted_payload.clone()
+    else {
         panic!("fallback fixture");
     };
     let tx = conn.unchecked_transaction().unwrap();
@@ -4492,7 +4642,9 @@ async fn target_provider_lifecycle_recovers_admitted_copy_without_repeating_prov
     fixture
         .apply(
             &conn,
-            AuditCommand::NetconfTarget(Box::new(TargetAuditCommandV1::Admit(prepared.clone()))),
+            AuditCommand::NetconfTarget(Box::new(TargetAuditCommandV1::Admit(
+                prepared.command().clone(),
+            ))),
             100,
         )
         .unwrap();
@@ -4507,13 +4659,19 @@ async fn target_provider_lifecycle_recovers_admitted_copy_without_repeating_prov
     fixture
         .apply(
             &conn,
-            AuditCommand::NetconfTarget(Box::new(TargetAuditCommandV1::Apply(original.clone()))),
+            AuditCommand::NetconfTarget(Box::new(TargetAuditCommandV1::Apply(
+                original.command().clone(),
+            ))),
             100,
         )
         .unwrap();
     let outcome = fixture
         .ledger(&conn)
-        .lookup(&fixture.key, original.handle(), original.effect.caller)
+        .lookup(
+            &fixture.key,
+            original.handle(),
+            original.command().effect.caller,
+        )
         .unwrap()
         .unwrap();
     assert!(matches!(outcome.state(), AuditOperationState::TargetV1(r)
@@ -4526,7 +4684,9 @@ async fn target_provider_lifecycle_recovers_admitted_copy_without_repeating_prov
     fixture
         .apply(
             &conn,
-            AuditCommand::NetconfTarget(Box::new(TargetAuditCommandV1::Apply(original))),
+            AuditCommand::NetconfTarget(Box::new(TargetAuditCommandV1::Apply(
+                original.command().clone(),
+            ))),
             200,
         )
         .unwrap();
@@ -4549,7 +4709,9 @@ async fn target_provider_copy_preparation_accepts_exact_protocol_replace_operati
     let config = br#"{"enabled":true}"#;
     let (provider, _) = copy_provider_stage(&fixture, &conn, 0, config).await;
     let original = copy_provider_destination(&fixture, &conn, &provider, 0, 181, config).await;
-    let Some(TargetPayloadV1::Running { commit, .. }) = original.effect.encrypted_payload else {
+    let Some(TargetPayloadV1::Running { commit, .. }) =
+        original.command().effect.encrypted_payload.clone()
+    else {
         panic!("protocol copy fixture");
     };
     let tx = conn.unchecked_transaction().unwrap();
@@ -4601,7 +4763,7 @@ async fn target_provider_copy_preparation_accepts_exact_protocol_replace_operati
         .unwrap();
     let prepared = fixture.rebind_at(&conn, fixture.prepare(effect, protocol), 100);
     assert_eq!(
-        prepared.handle.body.event.operation,
+        prepared.command().handle.body.event.operation,
         ManagementAuditOperationCode::Replace
     );
     assert!(
@@ -4723,7 +4885,7 @@ async fn target_removal_advances_exact_tombstone_and_preserves_known_result_thro
                 .apply(
                     &conn,
                     AuditCommand::NetconfTarget(Box::new(TargetAuditCommandV1::Apply(
-                        prepared.clone(),
+                        prepared.command().clone(),
                     ))),
                     if generation == 3 { 200 } else { 100 },
                 )
@@ -4979,7 +5141,7 @@ impl Fixture {
             &self.key,
         )
         .unwrap();
-        PreparedTargetMutation { handle, effect }
+        PreparedTargetMutation::new(handle, effect, None)
     }
 }
 
@@ -5456,7 +5618,7 @@ async fn target_replacement_binds_absent_candidate_fallback_and_pending_owner() 
             .await
             .unwrap();
         let prepared = fixture.bind_frozen_target(&frozen, effect, event);
-        assert_eq!(prepared.handle.body.binding.base_version, 2);
+        assert_eq!(prepared.command().handle.body.binding.base_version, 2);
         assert_eq!(fixture.preflight(&conn, &prepared, 100).unwrap(), None);
         assert!(matches!(
             fixture.submit(&conn, &prepared),
@@ -5729,7 +5891,8 @@ async fn target_datastore_copy_preserves_source_with_unowned_or_own_source_lock(
                 row(&conn, "config_netconf_targets", "target", source_slot),
                 source
             );
-            let Some(TargetPayloadV1::Target(blob)) = &prepared.effect.encrypted_payload else {
+            let Some(TargetPayloadV1::Target(blob)) = &prepared.command().effect.encrypted_payload
+            else {
                 panic!("datastore copy target payload");
             };
             let envelope = opc_crypto::CryptoEnvelopeRef::decode(&blob.encrypted_blob).unwrap();
@@ -5783,7 +5946,11 @@ async fn target_datastore_copy_refuses_original_source_locked_by_another_session
         assert_eq!(target_rows(&conn), before);
         let receipt = fixture
             .ledger(&conn)
-            .lookup(&fixture.key, prepared.handle(), prepared.effect.caller)
+            .lookup(
+                &fixture.key,
+                prepared.handle(),
+                prepared.command().effect.caller,
+            )
             .unwrap()
             .unwrap();
         assert!(!receipt.terminal_recorded());
@@ -5994,7 +6161,11 @@ async fn target_copy_sdk_freezes_each_source_and_preserves_exact_encrypted_confi
         ));
         assert!(!fixture
             .ledger(&conn)
-            .lookup(&fixture.key, prepared.handle(), prepared.effect.caller)
+            .lookup(
+                &fixture.key,
+                prepared.handle(),
+                prepared.command().effect.caller
+            )
             .unwrap()
             .unwrap()
             .terminal_recorded());
@@ -6457,7 +6628,11 @@ async fn target_running_copy_sdk_preserves_frozen_sources_and_exact_configuratio
         ));
         assert!(!fixture
             .ledger(&conn)
-            .lookup(&fixture.key, prepared.handle(), prepared.effect.caller)
+            .lookup(
+                &fixture.key,
+                prepared.handle(),
+                prepared.command().effect.caller
+            )
             .unwrap()
             .unwrap()
             .terminal_recorded());
@@ -6895,7 +7070,11 @@ async fn target_promotion_sdk_retires_original_candidate_with_exact_running_resu
         // The known promotion remains truthful while terminal durability is owed.
         let receipt = fixture
             .ledger(&conn)
-            .lookup(&fixture.key, prepared.handle(), prepared.effect.caller)
+            .lookup(
+                &fixture.key,
+                prepared.handle(),
+                prepared.command().effect.caller,
+            )
             .unwrap()
             .unwrap();
         assert!(!receipt.terminal_recorded());
@@ -7311,7 +7490,7 @@ impl Fixture {
             &self.key,
         )
         .unwrap();
-        PreparedTargetMutation { handle, effect }
+        PreparedTargetMutation::new(handle, effect, None)
     }
 }
 
@@ -7362,7 +7541,11 @@ async fn target_confirmed_sdk_tentative_and_empty_confirmation_retain_original_o
             confirmed_sdk_install(&fixture, &conn, &session, &frozen, &provider, token).await;
         let original = fixture
             .ledger(&conn)
-            .lookup(&fixture.key, prepared.handle(), prepared.effect.caller)
+            .lookup(
+                &fixture.key,
+                prepared.handle(),
+                prepared.command().effect.caller,
+            )
             .unwrap()
             .unwrap();
         assert!(!original.terminal_recorded());
@@ -7388,6 +7571,7 @@ async fn target_confirmed_sdk_tentative_and_empty_confirmation_retain_original_o
         let read = fixture.frozen_pending(&conn, &pending).unwrap();
         assert!(!read.has_staged_candidate());
         let ownership = prepared
+            .command()
             .effect
             .encrypted_payload
             .as_ref()
@@ -7433,7 +7617,7 @@ async fn target_confirmed_sdk_tentative_and_empty_confirmation_retain_original_o
             .lookup(
                 &fixture.key,
                 confirmation.handle(),
-                confirmation.effect.caller
+                confirmation.command().effect.caller
             )
             .unwrap()
             .unwrap()
@@ -7720,7 +7904,8 @@ async fn resolution_sdk_stage(
     use crate::consensus::audit_mutation::TargetPayloadV1;
     use sha2::{Digest, Sha256};
     let mut stage = fixture.encrypted(fixture.request(conn, request, 4, 0x61, 1), 0x6a);
-    let Some(TargetPayloadV1::Target(blob)) = &mut stage.effect.encrypted_payload else {
+    let Some(TargetPayloadV1::Target(blob)) = &mut stage.command_mut().effect.encrypted_payload
+    else {
         panic!("staged confirmation fixture");
     };
     let envelope = opc_crypto::CryptoEnvelopeRef::decode(&blob.encrypted_blob).unwrap();
@@ -7876,7 +8061,11 @@ async fn target_resolution_sdk_staged_confirmation_atomically_promotes_and_resol
         );
         assert!(!fixture
             .ledger(&conn)
-            .lookup(&fixture.key, prepared.handle(), prepared.effect.caller)
+            .lookup(
+                &fixture.key,
+                prepared.handle(),
+                prepared.command().effect.caller
+            )
             .unwrap()
             .unwrap()
             .terminal_recorded());
@@ -8135,7 +8324,11 @@ async fn target_resolution_sdk_cancellation_restores_original_parent_and_preserv
             assert_eq!(target_rows(&conn), after);
             assert!(!fixture
                 .ledger(&conn)
-                .lookup(&fixture.key, prepared.handle(), prepared.effect.caller)
+                .lookup(
+                    &fixture.key,
+                    prepared.handle(),
+                    prepared.command().effect.caller
+                )
                 .unwrap()
                 .unwrap()
                 .terminal_recorded());
@@ -8575,7 +8768,7 @@ impl Fixture {
             &self.key,
         )
         .unwrap();
-        let prepared = PreparedTargetMutation { handle, effect };
+        let prepared = PreparedTargetMutation::new(handle, effect, None);
         prepared.verify_effect(&self.key).unwrap();
         prepared
     }
@@ -9121,7 +9314,9 @@ async fn target_rollback_sdk_retains_ambiguous_original_and_refuses_replacement(
     fixture
         .apply(
             &conn,
-            AuditCommand::NetconfTarget(Box::new(TargetAuditCommandV1::Admit(prepared.clone()))),
+            AuditCommand::NetconfTarget(Box::new(TargetAuditCommandV1::Admit(
+                prepared.command().clone(),
+            ))),
             deadline,
         )
         .unwrap();
@@ -9143,9 +9338,9 @@ async fn target_rollback_sdk_retains_ambiguous_original_and_refuses_replacement(
     for change in ["request", "parent", "lifetime"] {
         let mut other = prepared.clone();
         match change {
-            "request" => other.handle.body.event.request = fixture.event(246).request,
-            "parent" => other.effect.source = None,
-            "lifetime" => other.handle.body.expires_at += 1,
+            "request" => other.command_mut().handle.body.event.request = fixture.event(246).request,
+            "parent" => other.command_mut().effect.source = None,
+            "lifetime" => other.command_mut().handle.body.expires_at += 1,
             _ => unreachable!(),
         }
         assert!(
@@ -9449,16 +9644,20 @@ fn reject_rollback(fixture: &Fixture, conn: &Connection, original: &PreparedTarg
     fixture
         .apply(
             conn,
-            AuditCommand::NetconfTarget(Box::new(TargetAuditCommandV1::Admit(original.clone()))),
-            original.handle.body.issued_at,
+            AuditCommand::NetconfTarget(Box::new(TargetAuditCommandV1::Admit(
+                original.command().clone(),
+            ))),
+            original.command().handle.body.issued_at,
         )
         .unwrap();
     fixture.checkpoint(conn);
     assert!(fixture
         .apply(
             conn,
-            AuditCommand::NetconfTarget(Box::new(TargetAuditCommandV1::Apply(original.clone()))),
-            original.handle.body.expires_at
+            AuditCommand::NetconfTarget(Box::new(TargetAuditCommandV1::Apply(
+                original.command().clone()
+            ))),
+            original.command().handle.body.expires_at
         )
         .is_err());
     assert_eq!(
@@ -9467,7 +9666,7 @@ fn reject_rollback(fixture: &Fixture, conn: &Connection, original: &PreparedTarg
             .lookup(
                 &fixture.key,
                 original.handle(),
-                original.handle.body.binding.caller
+                original.command().handle.body.binding.caller
             )
             .unwrap()
             .unwrap()
@@ -9490,7 +9689,7 @@ async fn target_rollback_successor_requires_exact_settled_rejection_without_chan
             crate::audit_authority::NetconfRollbackCause::Timeout,
         )
         .await;
-        let now = original.handle.body.expires_at;
+        let now = original.command().handle.body.expires_at;
         let before = target_rows(&conn);
         let original_bytes = original.encode().unwrap();
         assert!(
@@ -9502,9 +9701,9 @@ async fn target_rollback_successor_requires_exact_settled_rejection_without_chan
             .apply(
                 &conn,
                 AuditCommand::NetconfTarget(Box::new(TargetAuditCommandV1::Admit(
-                    original.clone(),
+                    original.command().clone(),
                 ))),
-                original.handle.body.issued_at,
+                original.command().handle.body.issued_at,
             )
             .unwrap();
         fixture.checkpoint(&conn);
@@ -9524,7 +9723,7 @@ async fn target_rollback_successor_requires_exact_settled_rejection_without_chan
             .apply(
                 &conn,
                 AuditCommand::NetconfTarget(Box::new(TargetAuditCommandV1::Apply(
-                    original.clone()
+                    original.command().clone()
                 ))),
                 now
             )
@@ -9535,7 +9734,11 @@ async fn target_rollback_successor_requires_exact_settled_rejection_without_chan
             "rejection without terminal authorized a successor"
         );
         fixture
-            .apply(&conn, AuditCommand::Terminal(original.handle.clone()), now)
+            .apply(
+                &conn,
+                AuditCommand::Terminal(original.command().handle.clone()),
+                now,
+            )
             .unwrap();
         assert_eq!(
             read.verify_rejected_predecessor(&original, &fixture.ledger(&conn), &fixture.key, now),
@@ -9597,7 +9800,10 @@ async fn target_rollback_successor_requires_exact_settled_rejection_without_chan
         assert_eq!(target_rows(&conn), before);
         assert_eq!(read.original().unwrap(), Some(successor.clone()));
         assert_eq!(original.encode().unwrap(), original_bytes);
-        assert_eq!(read.original_deadline(), original.handle.body.issued_at);
+        assert_eq!(
+            read.original_deadline(),
+            original.command().handle.body.issued_at
+        );
         assert_eq!(
             fixture
                 .ledger(&conn)
@@ -9638,18 +9844,18 @@ async fn target_rollback_successor_selects_one_attempt_and_refuses_ambiguous_or_
     .await;
     reject_rollback(&fixture, &conn, &original);
     fixture.settle(&conn, &original);
-    let now = original.handle.body.expires_at;
+    let now = original.command().handle.body.expires_at;
     let ledger = fixture.ledger(&conn);
     let event = read
         .project_event(&fixture.privacy, fixture.device_event(246))
         .unwrap();
     assert_eq!(
-        read.successor_context(&owner, &original, &original.handle.body.event),
+        read.successor_context(&owner, &original, &original.command().handle.body.event),
         Err(AuditAuthorityError::BindingMismatch),
         "successor reused original request"
     );
     let mut unrelated = original.clone();
-    unrelated.effect.source = None;
+    unrelated.command_mut().effect.source = None;
     assert!(read.successor_context(&owner, &unrelated, &event).is_err());
     assert!(read
         .verify_rejected_predecessor(&unrelated, &ledger, &fixture.key, now)
@@ -9747,7 +9953,7 @@ async fn target_rollback_successor_selects_one_attempt_and_refuses_ambiguous_or_
     assert_eq!(target_rows(&conn), before);
     reject_rollback(&fixture, &conn, &selected);
     fixture.settle(&conn, &selected);
-    let later = selected.handle.body.expires_at;
+    let later = selected.command().handle.body.expires_at;
     let event = read
         .project_event(&fixture.privacy, fixture.device_event(248))
         .unwrap();
@@ -9810,7 +10016,7 @@ async fn target_rollback_successor_refuses_applied_outcomes_and_other_original_s
         crate::audit_authority::NetconfRollbackCause::Timeout,
     )
     .await;
-    let result = fixture.submit_at(&conn, &original, original.handle.body.issued_at);
+    let result = fixture.submit_at(&conn, &original, original.command().handle.body.issued_at);
     assert!(matches!(result, AuditOperationState::TargetV1(_)));
     fixture.settle(&conn, &original);
     let before = target_rows(&conn);
@@ -9820,7 +10026,7 @@ async fn target_rollback_successor_refuses_applied_outcomes_and_other_original_s
             &original,
             &fixture.ledger(&conn),
             &fixture.key,
-            original.handle.body.expires_at
+            original.command().handle.body.expires_at
         ),
         Err(AuditAuthorityError::RecoveryRequired),
         "known rollback authorized replacement"
@@ -9843,7 +10049,11 @@ async fn target_rollback_successor_refuses_applied_outcomes_and_other_original_s
     assert_eq!(conn.total_changes(), changes);
     assert_eq!(target_rows(&conn), before);
     assert_eq!(
-        fixture.submit_at(&conn, &original, original.handle.body.expires_at + 3600),
+        fixture.submit_at(
+            &conn,
+            &original,
+            original.command().handle.body.expires_at + 3600
+        ),
         result
     );
 }
@@ -9862,7 +10072,7 @@ async fn target_rollback_successor_refuses_acknowledged_pruned_predecessor() {
     .await;
     reject_rollback(&fixture, &conn, &original);
     fixture.settle(&conn, &original);
-    let now = original.handle.body.expires_at;
+    let now = original.command().handle.body.expires_at;
     let ledger = fixture.ledger(&conn);
     assert_eq!(
         read.verify_rejected_predecessor(&original, &ledger, &fixture.key, now),
@@ -9922,7 +10132,7 @@ async fn target_rollback_successor_provider_cancellation_preserves_rejected_orig
     .await;
     reject_rollback(&fixture, &conn, &original);
     fixture.settle(&conn, &original);
-    let now = original.handle.body.expires_at;
+    let now = original.command().handle.body.expires_at;
     let ledger = fixture.ledger(&conn);
     read.verify_rejected_predecessor(&original, &ledger, &fixture.key, now)
         .unwrap();
@@ -9975,7 +10185,7 @@ async fn target_rollback_successor_preserves_retained_session_loss_and_reboot_ca
         let pending = read.pending();
         reject_rollback(&fixture, &conn, &original);
         fixture.settle(&conn, &original);
-        let now = original.handle.body.expires_at;
+        let now = original.command().handle.body.expires_at;
         let ledger = fixture.ledger(&conn);
         read.verify_rejected_predecessor(&original, &ledger, &fixture.key, now)
             .unwrap();
@@ -10182,7 +10392,9 @@ async fn target_recovery_opening_refuses_wrong_administrator_and_all_retained_de
     fixture
         .apply(
             &conn,
-            AuditCommand::NetconfTarget(Box::new(TargetAuditCommandV1::Admit(original.clone()))),
+            AuditCommand::NetconfTarget(Box::new(TargetAuditCommandV1::Admit(
+                original.command().clone(),
+            ))),
             100,
         )
         .unwrap();
@@ -10208,7 +10420,9 @@ async fn target_recovery_opening_refuses_wrong_administrator_and_all_retained_de
     fixture
         .apply(
             &conn,
-            AuditCommand::NetconfTarget(Box::new(TargetAuditCommandV1::Apply(original.clone()))),
+            AuditCommand::NetconfTarget(Box::new(TargetAuditCommandV1::Apply(
+                original.command().clone(),
+            ))),
             100,
         )
         .unwrap();
@@ -10222,7 +10436,11 @@ async fn target_recovery_opening_refuses_wrong_administrator_and_all_retained_de
         "outcome without terminal authorized recovery opening"
     );
     fixture
-        .apply(&conn, AuditCommand::Terminal(original.handle.clone()), 100)
+        .apply(
+            &conn,
+            AuditCommand::Terminal(original.command().handle.clone()),
+            100,
+        )
         .unwrap();
     assert!(
         matches!(
@@ -10269,7 +10487,7 @@ async fn target_recovery_opening_preserves_concurrent_claims_and_refuses_delayed
     });
     for repeated in [claimed, a, b] {
         let reread = fixture
-            .frozen_rollback(&conn, &repeated, original.handle.body.issued_at)
+            .frozen_rollback(&conn, &repeated, original.command().handle.body.issued_at)
             .unwrap()
             .unwrap();
         assert_eq!(
@@ -10305,7 +10523,7 @@ async fn target_recovery_opening_preserves_concurrent_claims_and_refuses_delayed
         ),
         "same-sequence device substitution replaced the recovery owner"
     );
-    let result = fixture.submit_at(&conn, &original, original.handle.body.issued_at);
+    let result = fixture.submit_at(&conn, &original, original.command().handle.body.issued_at);
     assert!(matches!(result, AuditOperationState::TargetV1(_)));
     fixture.settle(&conn, &original);
     let event = fixture.device_event(250);
@@ -10316,10 +10534,10 @@ async fn target_recovery_opening_preserves_concurrent_claims_and_refuses_delayed
     let start = fixture.rebind_at(
         &conn,
         fixture.prepare(effect, event),
-        original.handle.body.issued_at,
+        original.command().handle.body.issued_at,
     );
     assert!(matches!(
-        fixture.submit_at(&conn, &start, original.handle.body.issued_at),
+        fixture.submit_at(&conn, &start, original.command().handle.body.issued_at),
         AuditOperationState::TargetV1(_)
     ));
     fixture.settle(&conn, &start);
@@ -10365,12 +10583,13 @@ async fn target_recovery_pending_read_cannot_replace_a_later_original() {
     // Keep an authentic old view, as if its read/checkpoint verification had
     // completed before another thread advanced the retained lifecycle.
     let delayed = first.view().clone();
-    let first_result = fixture.submit_at(&conn, &original, original.handle.body.issued_at);
+    let first_result =
+        fixture.submit_at(&conn, &original, original.command().handle.body.issued_at);
     assert!(matches!(first_result, AuditOperationState::TargetV1(_)));
     fixture.settle(&conn, &original);
     fixture.assert_no_pending(&conn);
 
-    let now = original.handle.body.issued_at + 1;
+    let now = original.command().handle.body.issued_at + 1;
     let tenant = opc_types::TenantId::from_static("fixture-tenant");
     let session = fixture.session_owner(&conn, &worker, 0x61);
     let staged_read = fixture
@@ -10415,7 +10634,7 @@ async fn target_recovery_pending_read_cannot_replace_a_later_original() {
             &fixture.key,
         )
         .unwrap();
-        PreparedTargetMutation { handle, effect }
+        PreparedTargetMutation::new(handle, effect, None)
     };
     let stage = bind(effect, stage_event, staged_read.running_base_version(), now);
     assert!(matches!(
@@ -10488,7 +10707,9 @@ async fn target_recovery_pending_read_cannot_replace_a_later_original() {
     fixture
         .apply(
             &conn,
-            AuditCommand::NetconfTarget(Box::new(TargetAuditCommandV1::Admit(next.clone()))),
+            AuditCommand::NetconfTarget(Box::new(TargetAuditCommandV1::Admit(
+                next.command().clone(),
+            ))),
             deadline,
         )
         .unwrap();
@@ -10577,8 +10798,8 @@ async fn target_receipt_requires_the_retained_description_after_admission_race()
     let applied = fixture.submit(&conn, &original);
     assert!(matches!(applied, AuditOperationState::TargetV1(_)));
     for phase in [
-        TargetAuditCommandV1::Admit(original.clone()),
-        TargetAuditCommandV1::Apply(original.clone()),
+        TargetAuditCommandV1::Admit(original.command().clone()),
+        TargetAuditCommandV1::Apply(original.command().clone()),
     ] {
         let tx = conn.unchecked_transaction().unwrap();
         let proof = crate::consensus::audit::applied_receipt_sync(
@@ -10596,7 +10817,7 @@ async fn target_receipt_requires_the_retained_description_after_admission_race()
                 &fixture.key,
                 fixture.identity,
                 original.handle(),
-                original.effect.caller,
+                original.command().effect.caller,
             )
             .unwrap();
         assert_eq!(receipt.state(), applied);
@@ -10620,28 +10841,38 @@ async fn target_receipt_requires_the_retained_description_after_admission_race()
     let ledger = fixture.ledger(&conn);
     assert_eq!(
         ledger
-            .lookup(&fixture.key, prepared.handle(), prepared.effect.caller)
+            .lookup(
+                &fixture.key,
+                prepared.handle(),
+                prepared.command().effect.caller
+            )
             .unwrap()
             .unwrap()
             .state(),
         AuditOperationState::Intent
     );
     assert!(matches!(
-        ledger.recover_target(&fixture.key, prepared.handle(), prepared.effect.caller),
+        ledger.recover_target(
+            &fixture.key,
+            prepared.handle(),
+            prepared.command().effect.caller
+        ),
         Err(AuditAuthorityError::BindingMismatch)
     ));
     let before = (target_rows(&conn), ledger.sequence);
     assert!(fixture
         .apply(
             &conn,
-            AuditCommand::NetconfTarget(Box::new(TargetAuditCommandV1::Admit(prepared.clone()))),
+            AuditCommand::NetconfTarget(Box::new(TargetAuditCommandV1::Admit(
+                prepared.command().clone()
+            ))),
             100,
         )
         .is_err());
     assert_eq!((target_rows(&conn), fixture.ledger(&conn).sequence), before);
     for phase in [
-        TargetAuditCommandV1::Admit(prepared.clone()),
-        TargetAuditCommandV1::Apply(prepared.clone()),
+        TargetAuditCommandV1::Admit(prepared.command().clone()),
+        TargetAuditCommandV1::Apply(prepared.command().clone()),
     ] {
         let tx = conn.unchecked_transaction().unwrap();
         let proof = crate::consensus::audit::applied_receipt_sync(
@@ -10715,9 +10946,9 @@ impl Fixture {
     ) -> Result<(), ConfigMutationFailure> {
         self.apply(
             conn,
-            AuditCommand::NetconfTarget(Box::new(TargetAuditCommandV1::EmptyCommit(
+            AuditCommand::NetconfTarget(Box::new(TargetAuditCommandV1::EmptyCommit(Box::new(
                 prepared.clone(),
-            ))),
+            )))),
             now,
         )
     }
@@ -10735,6 +10966,17 @@ async fn target_empty_commit_observes_only_the_original_empty_state_and_replays_
     let changes = conn.total_changes();
     let frozen = fixture.frozen_empty_commit(&conn, &session).unwrap();
     let prepared = fixture.prepare_empty_commit(&frozen, &session, 239);
+    let command = TargetAuditCommandV1::EmptyCommit(Box::new(prepared.clone()));
+    // Heap ownership must preserve the existing JSON tag and binary phase 2.
+    let mut original_json = br#"{"empty-commit":"#.to_vec();
+    original_json.extend(serde_json::to_vec(&prepared).unwrap());
+    original_json.push(b'}');
+    assert_eq!(serde_json::to_vec(&command).unwrap(), original_json);
+    assert!(serde_json::from_slice::<TargetAuditCommandV1>(&original_json).unwrap() == command);
+    let mut original_binary = vec![2];
+    original_binary.extend(postcard::to_stdvec(&prepared).unwrap());
+    assert_eq!(postcard::to_stdvec(&command).unwrap(), original_binary);
+    assert!(postcard::from_bytes::<TargetAuditCommandV1>(&original_binary).unwrap() == command);
     assert_eq!(conn.total_changes(), changes);
     assert_eq!(target_rows(&conn), before);
     assert!(prepared.handle().body.mutation.is_none());
@@ -10884,9 +11126,10 @@ async fn target_empty_commit_refuses_an_ordinary_observation_receipt() {
     let before = (target_rows(&conn), ledger.sequence);
     assert!(fixture.observe_empty_commit(&conn, &prepared, 100).is_err());
     assert_eq!((target_rows(&conn), fixture.ledger(&conn).sequence), before);
-    let command = ConfigMutationIntent::ManagementAudit(Box::new(AuditCommand::NetconfTarget(
-        Box::new(TargetAuditCommandV1::EmptyCommit(prepared.clone())),
-    )));
+    let command =
+        ConfigMutationIntent::ManagementAudit(Box::new(AuditCommand::NetconfTarget(Box::new(
+            TargetAuditCommandV1::EmptyCommit(Box::new(prepared.clone())),
+        ))));
     let tx = conn.unchecked_transaction().unwrap();
     let proof = crate::consensus::audit::applied_receipt_sync(
         &tx,
@@ -11067,7 +11310,9 @@ async fn target_empty_commit_preserves_debt_locks_and_request_uniqueness() {
     fixture
         .apply(
             &conn,
-            AuditCommand::NetconfTarget(Box::new(TargetAuditCommandV1::Admit(locked.clone()))),
+            AuditCommand::NetconfTarget(Box::new(TargetAuditCommandV1::Admit(
+                locked.command().clone(),
+            ))),
             100,
         )
         .unwrap();
@@ -11079,7 +11324,9 @@ async fn target_empty_commit_preserves_debt_locks_and_request_uniqueness() {
     fixture
         .apply(
             &conn,
-            AuditCommand::NetconfTarget(Box::new(TargetAuditCommandV1::Apply(locked.clone()))),
+            AuditCommand::NetconfTarget(Box::new(TargetAuditCommandV1::Apply(
+                locked.command().clone(),
+            ))),
             100,
         )
         .unwrap();
@@ -11143,7 +11390,7 @@ async fn target_empty_commit_proof_binds_guard_and_survives_later_unavailability
         &fixture.key,
         fixture.identity,
         &ConfigMutationIntent::ManagementAudit(Box::new(AuditCommand::NetconfTarget(Box::new(
-            TargetAuditCommandV1::EmptyCommit(prepared.clone()),
+            TargetAuditCommandV1::EmptyCommit(Box::new(prepared.clone())),
         )))),
     )
     .unwrap()
@@ -11596,7 +11843,7 @@ async fn ordinary_running_apply_refuses_equal_caller_without_running_lock_lease(
     fixture.settle(&conn, &lock);
     let before = target_rows(&conn);
     let prepared = fixture.ordinary_running(&conn, 221);
-    assert!(prepared.handle().body.binding.caller == lock.effect.caller);
+    assert!(prepared.handle().body.binding.caller == lock.command().effect.caller);
     fixture.admit_ordinary(&conn, &prepared);
     assert!(
         matches!(

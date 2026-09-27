@@ -121,6 +121,30 @@ pub(super) fn preflight(
     command: &ConfigConsensusCommandSizeProbe<'_>,
     profile: ConfigCapacityProfile,
 ) -> Result<EncodingSizes, ForwardMutationRejection> {
+    preflight_revisions(
+        command,
+        profile,
+        config_wire_revision(profile),
+        config_command_revision(profile),
+    )
+}
+
+// Sizing a proposed encoding does not enable its peer, storage or runtime mode.
+pub(super) fn preflight_joint_target_payload(
+    command: &ConfigConsensusCommandSizeProbe<'_>,
+) -> Result<EncodingSizes, ForwardMutationRejection> {
+    if command.schema_version != 10 || command.intent.minimum_command_version() != 10 {
+        return Err(ForwardMutationRejection::InvalidCommand);
+    }
+    preflight_revisions(command, ConfigCapacityProfile::BoundedV1, 10, 10)
+}
+
+fn preflight_revisions(
+    command: &ConfigConsensusCommandSizeProbe<'_>,
+    profile: ConfigCapacityProfile,
+    wire_revision: u16,
+    command_revision: u16,
+) -> Result<EncodingSizes, ForwardMutationRejection> {
     if profile != ConfigCapacityProfile::BoundedV1 {
         return Err(ForwardMutationRejection::InvalidCommand);
     }
@@ -133,8 +157,8 @@ pub(super) fn preflight(
         request_id: command.request_id,
         intent: command.intent,
         compatibility: ConfigPeerCompatibility {
-            wire_version: config_wire_revision(profile),
-            command_version: config_command_revision(profile),
+            wire_version: wire_revision,
+            command_version: command_revision,
             audit_key_epoch: u64::MAX,
             audit_key_fingerprint: [u8::MAX; 32],
         },
@@ -145,7 +169,7 @@ pub(super) fn preflight(
     };
     let forwarded = postcard_size(
         &BorrowedWire {
-            revision: config_wire_revision(profile),
+            revision: wire_revision,
             value: &forward,
         },
         CONSENSUS_MAX_RPC_PAYLOAD_BYTES,
@@ -168,7 +192,7 @@ pub(super) fn preflight(
     };
     let singleton = postcard_size(
         &BorrowedWire {
-            revision: config_wire_revision(profile),
+            revision: wire_revision,
             value: &append,
         },
         CONSENSUS_MAX_RPC_PAYLOAD_BYTES,
@@ -185,6 +209,21 @@ pub(super) fn preflight(
             prepared,
             crate::consensus::sqlite::CONFIG_CONSENSUS_LOG_ENTRY_MAX_BYTES,
         )?,
+        ConfigMutationIntent::ManagementAudit(command) => match command.as_ref() {
+            crate::consensus::audit::AuditCommand::NetconfTarget(target) => match target.as_ref() {
+                crate::consensus::audit_mutation::TargetAuditCommandV1::Admit(prepared)
+                | crate::consensus::audit_mutation::TargetAuditCommandV1::Apply(prepared)
+                    if prepared.bounded_running().is_some() =>
+                {
+                    json_size(
+                        prepared,
+                        crate::consensus::sqlite::CONFIG_CONSENSUS_LOG_ENTRY_MAX_BYTES,
+                    )?
+                }
+                _ => 0,
+            },
+            _ => 0,
+        },
         _ => 0,
     };
     let sizes = EncodingSizes {

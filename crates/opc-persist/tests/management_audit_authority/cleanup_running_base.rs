@@ -58,8 +58,9 @@ async fn cleanup_retirement_running_base_only_requires_real_rejection_and_settle
     let original = session
         .retain_cleanup(fixture.cleanup_at(&conn, &session, 222, 100))
         .unwrap();
-    assert_eq!(original.handle.body.binding.base_version, 1);
-    let TargetExpectationV1::Lifecycle { state_digest } = &original.effect.destination else {
+    assert_eq!(original.command().handle.body.binding.base_version, 1);
+    let TargetExpectationV1::Lifecycle { state_digest } = &original.command().effect.destination
+    else {
         panic!("signed cleanup must retain a lifecycle expectation")
     };
     let rows = target_rows(&conn);
@@ -106,7 +107,7 @@ async fn cleanup_retirement_running_base_only_requires_real_rejection_and_settle
     let retired = fixture.apply(
         &conn,
         AuditCommand::NetconfTarget(Box::new(TargetAuditCommandV1::RetireCleanup(
-            original.clone(),
+            original.command().clone(),
         ))),
         100,
     );
@@ -133,7 +134,11 @@ async fn cleanup_retirement_running_base_only_requires_real_rejection_and_settle
         Err(AuditAuthorityError::RecoveryRequired)
     );
     fixture
-        .apply(&conn, AuditCommand::Terminal(original.handle.clone()), 100)
+        .apply(
+            &conn,
+            AuditCommand::Terminal(original.command().handle.clone()),
+            100,
+        )
         .unwrap();
     assert_eq!(
         original.verify_settled_cleanup_retirement(
@@ -154,18 +159,21 @@ async fn cleanup_retirement_running_base_only_requires_real_rejection_and_settle
     let event = fixture.device_event(224);
     let effect = fixture
         .device_view(&conn)
-        .prepare_session_cleanup(&session, &event, original.handle.body.expires_at)
+        .prepare_session_cleanup(&session, &event, original.command().handle.body.expires_at)
         .unwrap();
     let mut next = fixture.prepare(effect, event);
-    next.handle.body.issued_at = 110;
+    next.command_mut().handle.body.issued_at = 110;
     let next = fixture.bind_current_base(&conn, next);
     let next = session
         .retain_retirement_successor(&original, next, &ledger, &fixture.key, 110)
         .unwrap();
-    assert!(next.handle != original.handle);
-    assert!(next.effect.destination == original.effect.destination);
-    assert_eq!(next.handle.body.binding.base_version, 2);
-    assert_eq!(next.handle.body.expires_at, original.handle.body.expires_at);
+    assert!(next.command().handle != original.command().handle);
+    assert!(next.command().effect.destination == original.command().effect.destination);
+    assert_eq!(next.command().handle.body.binding.base_version, 2);
+    assert_eq!(
+        next.command().handle.body.expires_at,
+        original.command().handle.body.expires_at
+    );
     assert!(fixture.ledger(&conn) == ledger);
     assert!(matches!(
         fixture.submit_at(&conn, &next, 110),
@@ -184,7 +192,9 @@ async fn cleanup_retirement_running_base_only_requires_real_rejection_and_settle
     fixture
         .apply(
             &conn,
-            AuditCommand::NetconfTarget(Box::new(TargetAuditCommandV1::RetireCleanup(original))),
+            AuditCommand::NetconfTarget(Box::new(TargetAuditCommandV1::RetireCleanup(
+                original.command().clone(),
+            ))),
             3600,
         )
         .unwrap();

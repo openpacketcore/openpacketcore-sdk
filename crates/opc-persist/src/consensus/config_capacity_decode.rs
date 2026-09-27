@@ -34,7 +34,7 @@ fn invalid<E: de::Error>() -> E {
     E::custom("configuration decoding exceeds admitted capacity")
 }
 
-pub(super) struct Text<const MAX: usize>(String);
+pub(super) struct Text<const MAX: usize>(pub(super) String);
 
 impl<'de, const MAX: usize> Deserialize<'de> for Text<MAX> {
     fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
@@ -66,7 +66,7 @@ impl<'de, const MAX: usize> Deserialize<'de> for Text<MAX> {
 // its initialized length and never above that limit. Reallocation can retain
 // old and new backing stores at once; resource accounting must charge both.
 // These are decoder buffers, not a complete operation or engine queue bound.
-fn reserve_next<T, E: de::Error>(
+pub(super) fn reserve_next<T, E: de::Error>(
     values: &mut Vec<T>,
     limit: usize,
     hint: Option<usize>,
@@ -83,7 +83,7 @@ fn reserve_next<T, E: de::Error>(
     values.try_reserve_exact(additional).map_err(|_| invalid())
 }
 
-struct Bytes<const MAX: usize>(Vec<u8>);
+pub(super) struct Bytes<const MAX: usize>(pub(super) Vec<u8>);
 
 impl<'de, const MAX: usize> Deserialize<'de> for Bytes<MAX> {
     fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
@@ -432,7 +432,7 @@ impl From<Intent> for ConfigMutationIntent {
 // each raw string's encoded extent in a nonallocating scan first. Six bytes
 // per Unicode escape covers every valid representation of the largest field;
 // the real parser still checks escapes, UTF-8, syntax, depth and trailing data.
-fn json_string_preflight(bytes: &[u8]) -> Result<(), AuditAuthorityError> {
+pub(super) fn json_string_preflight(bytes: &[u8]) -> Result<(), AuditAuthorityError> {
     let mut index = 0;
     while index < bytes.len() {
         if bytes[index] != b'"' {

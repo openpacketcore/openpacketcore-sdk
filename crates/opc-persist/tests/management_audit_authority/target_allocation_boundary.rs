@@ -111,7 +111,7 @@ fn preflight_io(
     let result = crate::consensus::audit_targets::preflight_target_sync(
         &tx,
         &fixture.key,
-        original,
+        original.command(),
         &fixture.ledger(&tx),
         &fixture.keys,
         100,
@@ -145,7 +145,11 @@ fn command(phase: TargetAuditCommandV1) -> AuditCommand {
 fn assert_absent(fixture: &Fixture, conn: &Connection, original: &PreparedTargetMutation) {
     assert!(fixture
         .ledger(conn)
-        .lookup(&fixture.key, original.handle(), original.effect.caller)
+        .lookup(
+            &fixture.key,
+            original.handle(),
+            original.command().effect.caller
+        )
         .unwrap()
         .is_none());
 }
@@ -159,7 +163,11 @@ fn assert_original(
     let ledger = fixture.ledger(conn);
     assert_eq!(
         ledger
-            .lookup(&fixture.key, original.handle(), original.effect.caller)
+            .lookup(
+                &fixture.key,
+                original.handle(),
+                original.command().effect.caller
+            )
             .unwrap()
             .unwrap()
             .state(),
@@ -167,7 +175,11 @@ fn assert_original(
     );
     assert!(
         ledger
-            .recover_target(&fixture.key, original.handle(), original.effect.caller)
+            .recover_target(
+                &fixture.key,
+                original.handle(),
+                original.command().effect.caller
+            )
             .unwrap()
             == *original
     );
@@ -189,7 +201,7 @@ async fn target_admit_allocation_fault_preserves_original() {
             apply_io(
                 &fixture,
                 &conn,
-                &command(TargetAuditCommandV1::Admit(original.clone())),
+                &command(TargetAuditCommandV1::Admit(original.command().clone())),
                 100,
             )
         });
@@ -201,7 +213,7 @@ async fn target_admit_allocation_fault_preserves_original() {
         fixture
             .apply(
                 &conn,
-                command(TargetAuditCommandV1::Admit(retry.clone())),
+                command(TargetAuditCommandV1::Admit(retry.command().clone())),
                 100,
             )
             .unwrap();
@@ -211,7 +223,7 @@ async fn target_admit_allocation_fault_preserves_original() {
         fixture
             .apply(
                 &conn,
-                command(TargetAuditCommandV1::Admit(retry.clone())),
+                command(TargetAuditCommandV1::Admit(retry.command().clone())),
                 100,
             )
             .unwrap();
@@ -229,7 +241,7 @@ async fn target_admit_allocation_fault_preserves_original() {
         fixture
             .apply(
                 &conn,
-                command(TargetAuditCommandV1::Admit(retry.clone())),
+                command(TargetAuditCommandV1::Admit(retry.command().clone())),
                 3600,
             )
             .unwrap();
@@ -314,7 +326,7 @@ async fn retirement_fault(after: usize, acknowledged: bool) {
         fixture
             .apply(
                 &conn,
-                command(TargetAuditCommandV1::Admit(original.clone())),
+                command(TargetAuditCommandV1::Admit(original.command().clone())),
                 100,
             )
             .unwrap();
@@ -333,7 +345,9 @@ async fn retirement_fault(after: usize, acknowledged: bool) {
         apply_io(
             &fixture,
             &conn,
-            &command(TargetAuditCommandV1::RetireCleanup(original.clone())),
+            &command(TargetAuditCommandV1::RetireCleanup(
+                original.command().clone(),
+            )),
             100,
         )
     });
@@ -348,7 +362,7 @@ async fn retirement_fault(after: usize, acknowledged: bool) {
     fixture
         .apply(
             &conn,
-            command(TargetAuditCommandV1::RetireCleanup(retry.clone())),
+            command(TargetAuditCommandV1::RetireCleanup(retry.command().clone())),
             100,
         )
         .unwrap();
@@ -366,7 +380,7 @@ async fn retirement_fault(after: usize, acknowledged: bool) {
     fixture
         .apply(
             &conn,
-            command(TargetAuditCommandV1::RetireCleanup(retry.clone())),
+            command(TargetAuditCommandV1::RetireCleanup(retry.command().clone())),
             3600,
         )
         .unwrap();
@@ -409,7 +423,9 @@ async fn target_empty_commit_allocation_fault_preserves_original() {
             apply_io(
                 &fixture,
                 &conn,
-                &command(TargetAuditCommandV1::EmptyCommit(original.clone())),
+                &command(TargetAuditCommandV1::EmptyCommit(Box::new(
+                    original.clone(),
+                ))),
                 100,
             )
         });
@@ -493,7 +509,7 @@ async fn target_admit_logical_full_is_deterministic() {
     full_apply(
         &fixture,
         &conn,
-        &command(TargetAuditCommandV1::Admit(original.clone())),
+        &command(TargetAuditCommandV1::Admit(original.command().clone())),
         "TARGET_ADMIT_FULL_IS_DETERMINISTIC",
     );
     assert_absent(&fixture, &conn, &original);
@@ -535,7 +551,9 @@ async fn target_retirement_logical_full_is_deterministic() {
     full_apply(
         &fixture,
         &conn,
-        &command(TargetAuditCommandV1::RetireCleanup(original.clone())),
+        &command(TargetAuditCommandV1::RetireCleanup(
+            original.command().clone(),
+        )),
         "TARGET_RETIREMENT_FULL_IS_DETERMINISTIC",
     );
     assert_absent(&fixture, &conn, &original);
@@ -555,7 +573,9 @@ async fn target_empty_commit_logical_full_is_deterministic() {
     full_apply(
         &fixture,
         &conn,
-        &command(TargetAuditCommandV1::EmptyCommit(original.clone())),
+        &command(TargetAuditCommandV1::EmptyCommit(Box::new(
+            original.clone(),
+        ))),
         "TARGET_EMPTY_COMMIT_FULL_IS_DETERMINISTIC",
     );
     assert!(fixture

@@ -40,7 +40,7 @@ fn retire(
     fixture.apply(
         conn,
         AuditCommand::NetconfTarget(Box::new(TargetAuditCommandV1::RetireCleanup(
-            prepared.clone(),
+            prepared.command().clone(),
         ))),
         now,
     )
@@ -84,8 +84,8 @@ async fn cleanup_retirement_durable_original_blocks_delayed_admit_and_apply() {
     );
     assert_eq!(target_rows(&conn), rows, "RETIREMENT_HAS_NO_TARGET_EFFECT");
     for phase in [
-        TargetAuditCommandV1::Admit(original.clone()),
-        TargetAuditCommandV1::Apply(original.clone()),
+        TargetAuditCommandV1::Admit(original.command().clone()),
+        TargetAuditCommandV1::Apply(original.command().clone()),
     ] {
         // Even a command that was already in flight before retirement uses the
         // same serial transition and authentic result producer afterwards.
@@ -137,15 +137,15 @@ async fn cleanup_retirement_authenticates_closed_signed_payload_inside_transacti
     let rows = target_rows(&conn);
     let ledger = fixture.ledger(&conn);
     let mut forged = original.clone();
-    forged.effect.resolution = Some(TargetResolutionV1::EndSession {
+    forged.command_mut().effect.resolution = Some(TargetResolutionV1::EndSession {
         session: [0x63; 16],
     });
     let mut foreign_caller = original.clone();
-    foreign_caller.effect.caller =
+    foreign_caller.command_mut().effect.caller =
         AuditCaller::project(&fixture.privacy, "other", "other").unwrap();
-    let mut event = original.handle.body.event.clone();
+    let mut event = original.command().handle.body.event.clone();
     event.transport = ManagementAuditTransportCode::NetconfSsh;
-    let signed_wrong_transport = fixture.prepare(original.effect.clone(), event);
+    let signed_wrong_transport = fixture.prepare(original.command().effect.clone(), event);
     // This valid general target signature is deliberately not the closed
     // Internal Exec cleanup authority. Ordinary codec/admit checks accept its
     // signature; retirement must authenticate its narrower action context.
@@ -212,7 +212,11 @@ async fn cleanup_retirement_successor_requires_checkpoint_and_caps_original_wind
         Err(AuditAuthorityError::RecoveryRequired)
     );
     fixture
-        .apply(&conn, AuditCommand::Terminal(original.handle.clone()), 100)
+        .apply(
+            &conn,
+            AuditCommand::Terminal(original.command().handle.clone()),
+            100,
+        )
         .unwrap();
     assert_eq!(
         original.verify_settled_cleanup_retirement(
@@ -245,17 +249,17 @@ async fn cleanup_retirement_successor_requires_checkpoint_and_caps_original_wind
     let event = fixture.device_event(214);
     let effect = fixture
         .device_view(&conn)
-        .prepare_session_cleanup(&session, &event, original.handle.body.expires_at)
+        .prepare_session_cleanup(&session, &event, original.command().handle.body.expires_at)
         .unwrap();
     let mut shorter = fixture.prepare(effect, event.clone());
-    shorter.handle.body.issued_at = 110;
+    shorter.command_mut().handle.body.issued_at = 110;
     shorter = fixture.bind_current_base(&conn, shorter);
     let selected = session
         .retain_retirement_successor(&original, shorter, &ledger, &fixture.key, 110)
         .unwrap();
     assert_eq!(
-        selected.handle.body.expires_at,
-        original.handle.body.expires_at
+        selected.command().handle.body.expires_at,
+        original.command().handle.body.expires_at
     );
     assert_eq!(
         session.retirement_successor(&original, &event).unwrap(),

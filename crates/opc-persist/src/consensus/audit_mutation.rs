@@ -6,6 +6,12 @@ use std::sync::Arc;
 mod target_copy;
 use target_copy::TargetCopyBindingV1;
 
+#[path = "joint_target_payload.rs"]
+pub(super) mod joint_running;
+
+#[path = "target_recovery.rs"]
+mod target_recovery;
+
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
 use super::preparation::{PreparationOwnership, SubmissionOwnership};
@@ -453,14 +459,34 @@ impl std::fmt::Debug for PreparedAuditedMutation {
 #[derive(Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub(crate) enum TargetAuditCommandV1 {
-    Admit(PreparedTargetMutation),
-    Apply(PreparedTargetMutation),
-    EmptyCommit(crate::audit_authority::PreparedNetconfEmptyCommit),
+    Admit(TargetMutationCommand),
+    Apply(TargetMutationCommand),
+    EmptyCommit(Box<crate::audit_authority::PreparedNetconfEmptyCommit>),
     // Append-only phase 3 of the unreleased target format; old phase bytes stay fixed.
-    RetireCleanup(PreparedTargetMutation),
+    RetireCleanup(TargetMutationCommand),
 }
 
 impl TargetAuditCommandV1 {
+    pub(super) fn minimum_command_version(&self) -> u16 {
+        match self {
+            Self::Admit(prepared) | Self::Apply(prepared) | Self::RetireCleanup(prepared)
+                if prepared.bounded_running().is_some() =>
+            {
+                10
+            }
+            _ => 9,
+        }
+    }
+
+    pub(super) fn bounded_running(&self) -> Option<&joint_running::BoundedRunningPayload> {
+        match self {
+            Self::Admit(prepared) | Self::Apply(prepared) if prepared.effect.action.0 == 16 => {
+                prepared.bounded_running()
+            }
+            _ => None,
+        }
+    }
+
     pub(crate) fn handle(&self) -> &AuditOperationHandle {
         match self {
             Self::Admit(prepared) | Self::Apply(prepared) | Self::RetireCleanup(prepared) => {
@@ -483,7 +509,10 @@ impl TargetAuditCommandV1 {
                 prepared.verify_effect(key)?;
                 let receipt = ledger.lookup(key, prepared.handle(), caller)?;
                 if receipt.is_some()
-                    && ledger.recover_target(key, prepared.handle(), caller)? != *prepared
+                    && ledger
+                        .recover_target(key, prepared.handle(), caller)?
+                        .command()
+                        != prepared
                 {
                     return Err(AuditAuthorityError::BindingMismatch);
                 }
@@ -621,9 +650,49 @@ pub(crate) enum TargetPayloadV1 {
         confirmation_ownership: Option<TargetEncryptedBlobV1>,
         binding: TargetCopyBindingV1,
     },
+    // Proposed joint payload tag 3. Old target9 decoders reject this tag before
+    // reading its contents. Only the distinct strict joint input admits it.
+    #[serde(skip_deserializing)]
+    BoundedRunning(joint_running::BoundedRunningPayload),
 }
 
 impl TargetPayloadV1 {
+    fn ordinary_running(&self) -> Option<&PreparedConfigCommit> {
+        match self {
+            Self::Running {
+                commit,
+                confirmation_ownership: None,
+            } => Some(commit),
+            Self::BoundedRunning(payload) => Some(payload.commit()),
+            _ => None,
+        }
+    }
+
+    pub(super) fn from_prepared_running(
+        prepared: super::capacity_record::PreparedCapacityCommit,
+    ) -> Result<(Self, Option<Arc<PreparationOwnership>>), AuditAuthorityError> {
+        if prepared.resolution.is_some() {
+            return Err(AuditAuthorityError::BindingMismatch);
+        }
+        if prepared.binding.is_some() {
+            joint_running::BoundedRunningPayload::from_prepared(prepared)
+                .map(|(payload, owner)| (Self::BoundedRunning(payload), Some(owner)))
+        } else {
+            // Legacy profiles do not require a capacity reservation. Their
+            // deterministic payload fields and bytes remain exactly unchanged.
+            let ownership = prepared
+                .reservation
+                .map(|reservation| PreparationOwnership::new(reservation, prepared.evidence));
+            Ok((
+                Self::Running {
+                    commit: Box::new(prepared.commit),
+                    confirmation_ownership: None,
+                },
+                ownership,
+            ))
+        }
+    }
+
     pub(crate) fn running(
         &self,
     ) -> Option<(&PreparedConfigCommit, Option<&TargetEncryptedBlobV1>)> {
@@ -637,7 +706,7 @@ impl TargetPayloadV1 {
                 confirmation_ownership,
                 ..
             } => Some((commit, confirmation_ownership.as_ref())),
-            Self::Target(_) => None,
+            Self::Target(_) | Self::BoundedRunning(_) => None,
         }
     }
 
@@ -645,7 +714,7 @@ impl TargetPayloadV1 {
         match self {
             Self::Running { commit, .. } => commit.record.plaintext_digest == digest,
             Self::ProviderCopy { binding, .. } => binding.matches_source_digest(digest),
-            Self::Target(_) => false,
+            Self::Target(_) | Self::BoundedRunning(_) => false,
         }
     }
 }
@@ -744,6 +813,23 @@ pub(crate) struct TargetEffectV1 {
 
 impl TargetEffectV1 {
     fn validate(&self, handle: &AuditOperationHandle) -> Result<(), AuditAuthorityError> {
+        self.validate_for_capacity(handle, opc_crypto::ConfigCapacityProfile::Legacy)
+    }
+
+    fn validate_for_capacity(
+        &self,
+        handle: &AuditOperationHandle,
+        profile: opc_crypto::ConfigCapacityProfile,
+    ) -> Result<(), AuditAuthorityError> {
+        let bounded = matches!(
+            self.encrypted_payload,
+            Some(TargetPayloadV1::BoundedRunning(_))
+        );
+        match profile {
+            opc_crypto::ConfigCapacityProfile::Legacy if !bounded => {}
+            opc_crypto::ConfigCapacityProfile::BoundedV1 if bounded && self.action.0 == 16 => {}
+            _ => return Err(AuditAuthorityError::BindingMismatch),
+        }
         use crate::{
             ManagementAuditOutcomeCode as Outcome, ManagementAuditTransportCode as Transport,
         };
@@ -828,6 +914,7 @@ impl TargetEffectV1 {
         if let Some(payload) = &self.encrypted_payload {
             match payload {
                 TargetPayloadV1::Target(blob) => blob.validate()?,
+                TargetPayloadV1::BoundedRunning(payload) => payload.validate()?,
                 TargetPayloadV1::Running {
                     commit,
                     confirmation_ownership,
@@ -934,9 +1021,9 @@ impl TargetEffectV1 {
             16 => {
                 no_resolution
                     && self.lock.as_ref().is_some_and(|lock| lock.datastore == 0)
-                    && matches!((&self.destination, &self.source, &self.encrypted_payload),
-                    (TargetExpectationV1::Running { version }, source,
-                     Some(TargetPayloadV1::Running { commit, confirmation_ownership: None }))
+                    && matches!((&self.destination, &self.source,
+                        self.encrypted_payload.as_ref().and_then(TargetPayloadV1::ordinary_running)),
+                    (TargetExpectationV1::Running { version }, source, Some(commit))
                     if *version == handle.body.binding.base_version
                         && version.checked_add(1) == Some(commit.record.version.get())
                         && commit.record.confirmed_deadline.is_none()
@@ -1029,28 +1116,59 @@ impl TargetEncryptedBlobV1 {
     }
 }
 
-/// Closed NETCONF target effect and the original authenticated operation handle.
-///
-/// The full retained-target submission profile is not enabled by decoding this
-/// value. Decoded recovery data is untrusted until the authority verifies its
-/// handle, effect binding, caller and current retained ownership. This type has
-/// no public constructor from caller-asserted ciphertext or applied results.
+// Preserve target9 serde name, field order, and strict handle decoding. These
+// fields, including any capacity proof, contain no process-local slot owner.
 #[derive(Clone, PartialEq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct PreparedTargetMutation {
+#[serde(rename = "PreparedTargetMutation", deny_unknown_fields)]
+pub(crate) struct TargetMutationFields {
     #[serde(deserialize_with = "crate::audit_authority::ledger::deserialize_target_handle")]
     pub(crate) handle: AuditOperationHandle,
     pub(crate) effect: TargetEffectV1,
 }
 
-impl PreparedTargetMutation {
-    /// Original operation to retain before admission or possible response loss.
-    pub fn handle(&self) -> &AuditOperationHandle {
+#[derive(Clone, PartialEq)]
+pub(crate) struct TargetMutationCommand(Arc<TargetMutationFields>);
+
+impl std::ops::Deref for TargetMutationCommand {
+    type Target = TargetMutationFields;
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
+}
+
+#[cfg(test)]
+impl std::ops::DerefMut for TargetMutationCommand {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        Arc::make_mut(&mut self.0)
+    }
+}
+
+impl Serialize for TargetMutationCommand {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        self.0.as_ref().serialize(serializer)
+    }
+}
+
+impl<'de> Deserialize<'de> for TargetMutationCommand {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        TargetMutationFields::deserialize(deserializer).map(|fields| Self(Arc::new(fields)))
+    }
+}
+
+impl std::fmt::Debug for TargetMutationCommand {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("TargetMutationCommand(<redacted>)")
+    }
+}
+
+impl TargetMutationCommand {
+    pub(crate) fn handle(&self) -> &AuditOperationHandle {
         &self.handle
     }
 
-    /// Encode opaque protected recovery data, never diagnostic output.
-    pub fn encode(&self) -> Result<Vec<u8>, AuditAuthorityError> {
+    // Generic legacy encoding retains its target9 representation and fence.
+    // Retained commands use the separate authenticated, bounded internal codec.
+    pub(crate) fn encode_legacy(&self) -> Result<Vec<u8>, AuditAuthorityError> {
         self.effect.validate(&self.handle)?;
         let bytes = serde_json::to_vec(self).map_err(|_| AuditAuthorityError::InvalidInput)?;
         if bytes.len() > super::sqlite::CONFIG_CONSENSUS_LOG_ENTRY_MAX_BYTES {
@@ -1058,17 +1176,44 @@ impl PreparedTargetMutation {
         }
         Ok(bytes)
     }
-
-    /// Decode bounded recovery data. This validates representation only; it does
-    /// not authenticate the supplied effect or mint a capability for it.
-    pub fn decode(bytes: &[u8]) -> Result<Self, AuditAuthorityError> {
-        if bytes.len() > super::sqlite::CONFIG_CONSENSUS_LOG_ENTRY_MAX_BYTES {
-            return Err(AuditAuthorityError::InvalidInput);
+    pub(super) fn bounded_running(&self) -> Option<&joint_running::BoundedRunningPayload> {
+        match &self.effect.encrypted_payload {
+            Some(TargetPayloadV1::BoundedRunning(payload)) => Some(payload),
+            _ => None,
         }
-        let value: Self =
-            serde_json::from_slice(bytes).map_err(|_| AuditAuthorityError::InvalidInput)?;
-        value.effect.validate(&value.handle)?;
-        Ok(value)
+    }
+
+    pub(super) fn verify_bounded_running(
+        &self,
+        key: &AuditKey,
+        identity: super::ConfigConsensusIdentity,
+        caller: crate::audit_authority::AuditCaller,
+    ) -> Result<super::capacity_record::RecoveredRecordCapacity, AuditAuthorityError> {
+        self.effect
+            .validate_for_capacity(&self.handle, opc_crypto::ConfigCapacityProfile::BoundedV1)?;
+        self.handle.verify(key, identity, caller)?;
+        verify(
+            key,
+            TARGET_MUTATION_DOMAIN,
+            &self.effect,
+            &self
+                .handle
+                .body
+                .mutation
+                .ok_or(AuditAuthorityError::BindingMismatch)?,
+        )?;
+        let payload = self
+            .bounded_running()
+            .ok_or(AuditAuthorityError::BindingMismatch)?;
+        payload
+            .binding()
+            .recover(
+                &payload.commit().record,
+                identity,
+                key,
+                opc_crypto::ConfigCapacityProfile::BoundedV1,
+            )
+            .map_err(|_| AuditAuthorityError::BindingMismatch)
     }
 
     pub(crate) fn validate_result(
@@ -1132,9 +1277,8 @@ impl PreparedTargetMutation {
                     plaintext_digest,
                 },
             ) => {
-                matches!((&self.effect.encrypted_payload, &self.effect.destination),
-                    (Some(TargetPayloadV1::Running { commit, confirmation_ownership: None }),
-                     TargetExpectationV1::Running { version })
+                matches!((self.effect.encrypted_payload.as_ref().and_then(TargetPayloadV1::ordinary_running), &self.effect.destination),
+                    (Some(commit), TargetExpectationV1::Running { version })
                     if *version == self.handle.body.binding.base_version
                         && version.checked_add(1) == Some(running_version)
                         && commit.record.tx_id == tx_id
@@ -1218,6 +1362,166 @@ impl PreparedTargetMutation {
                 .mutation
                 .ok_or(AuditAuthorityError::BindingMismatch)?,
         )
+    }
+}
+
+/// Closed NETCONF target effect and its original authenticated operation handle.
+///
+/// Clones share immutable command bytes and the same preparation reservation.
+/// Native commands and retained logs carry only deterministic fields. Generic
+/// decoding grants no slot, session, Intent receipt, or effect authority; the
+/// store's reserved recovery decoder authenticates and owns bounded originals.
+#[derive(Clone)]
+pub struct PreparedTargetMutation {
+    command: TargetMutationCommand,
+    preparation: Option<Arc<PreparationOwnership>>,
+}
+
+impl PartialEq for PreparedTargetMutation {
+    fn eq(&self, other: &Self) -> bool {
+        self.command == other.command
+    }
+}
+
+impl Serialize for PreparedTargetMutation {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        self.command.serialize(serializer)
+    }
+}
+
+impl<'de> Deserialize<'de> for PreparedTargetMutation {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        Ok(Self {
+            command: TargetMutationCommand::deserialize(deserializer)?,
+            preparation: None,
+        })
+    }
+}
+
+impl PreparedTargetMutation {
+    pub(crate) fn new(
+        handle: AuditOperationHandle,
+        effect: TargetEffectV1,
+        preparation: Option<Arc<PreparationOwnership>>,
+    ) -> Self {
+        Self {
+            command: TargetMutationCommand(Arc::new(TargetMutationFields { handle, effect })),
+            preparation,
+        }
+    }
+
+    pub(crate) fn command(&self) -> &TargetMutationCommand {
+        &self.command
+    }
+
+    #[cfg(test)]
+    pub(crate) fn from_command(command: TargetMutationCommand) -> Self {
+        Self {
+            command,
+            preparation: None,
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn command_mut(&mut self) -> &mut TargetMutationCommand {
+        &mut self.command
+    }
+
+    pub(super) fn bounded_running(&self) -> Option<&joint_running::BoundedRunningPayload> {
+        self.command.bounded_running()
+    }
+
+    pub(super) fn verify_bounded_running(
+        &self,
+        key: &AuditKey,
+        identity: super::ConfigConsensusIdentity,
+        caller: crate::audit_authority::AuditCaller,
+    ) -> Result<super::capacity_record::RecoveredRecordCapacity, AuditAuthorityError> {
+        self.command.verify_bounded_running(key, identity, caller)
+    }
+
+    pub(crate) fn begin_submission(
+        &self,
+        pool: &opc_crypto::ConfigPreparationPool,
+        profile: opc_crypto::ConfigCapacityProfile,
+    ) -> Result<SubmissionOwnership, AuditAuthorityError> {
+        match (profile, self.bounded_running()) {
+            (opc_crypto::ConfigCapacityProfile::Legacy, None) => match &self.preparation {
+                None => Ok(None),
+                // Legacy has no destination capacity pool contract. Preserve
+                // an optional real owner as ordinary audited submission does.
+                Some(owner) => owner.try_submit().map(|guard| Some(Arc::new(guard))),
+            },
+            (opc_crypto::ConfigCapacityProfile::BoundedV1, Some(_)) => {
+                let owner = self
+                    .preparation
+                    .as_ref()
+                    .ok_or(AuditAuthorityError::InvalidInput)?;
+                // SUBMISSION_TARGET_POOL: proof bytes cannot grant destination admission.
+                if !owner.belongs_to(pool, profile, true) {
+                    return Err(AuditAuthorityError::InvalidInput);
+                }
+                // SUBMISSION_TARGET_GUARD: every alias shares this one active attempt.
+                owner.try_submit().map(|guard| Some(Arc::new(guard)))
+            }
+            _ => Err(AuditAuthorityError::InvalidInput),
+        }
+    }
+
+    /// Original operation to retain before admission or possible response loss.
+    pub fn handle(&self) -> &AuditOperationHandle {
+        self.command.handle()
+    }
+
+    /// Encode opaque protected recovery data, never diagnostic output.
+    pub fn encode(&self) -> Result<Vec<u8>, AuditAuthorityError> {
+        if self.bounded_running().is_some() {
+            self.command.effect.validate_for_capacity(
+                self.handle(),
+                opc_crypto::ConfigCapacityProfile::BoundedV1,
+            )?;
+            let _encoding = self
+                .preparation
+                .as_ref()
+                .ok_or(AuditAuthorityError::InvalidInput)?
+                .try_encode()?;
+            let mut size = RecoverySizeCounter(0);
+            serde_json::to_writer(&mut size, self)
+                .map_err(|_| AuditAuthorityError::InvalidInput)?;
+            let mut bytes = Vec::new();
+            bytes
+                .try_reserve_exact(size.0)
+                .map_err(|_| AuditAuthorityError::Unavailable)?;
+            serde_json::to_writer(&mut bytes, self)
+                .map_err(|_| AuditAuthorityError::InvalidInput)?;
+            return Ok(bytes);
+        }
+        self.command.encode_legacy()
+    }
+
+    /// Decode bounded recovery data. This validates representation only; it does
+    /// not authenticate the supplied effect or mint a capability for it.
+    pub fn decode(bytes: &[u8]) -> Result<Self, AuditAuthorityError> {
+        #[cfg(test)]
+        joint_running::tests::retained_recovery::observe_legacy_decode();
+        if bytes.len() > super::sqlite::CONFIG_CONSENSUS_LOG_ENTRY_MAX_BYTES {
+            return Err(AuditAuthorityError::InvalidInput);
+        }
+        let value: Self =
+            serde_json::from_slice(bytes).map_err(|_| AuditAuthorityError::InvalidInput)?;
+        value.command.effect.validate(value.handle())?;
+        Ok(value)
+    }
+
+    pub(crate) fn validate_result(
+        &self,
+        result: crate::audit_authority::NetconfTargetResult,
+    ) -> Result<(), AuditAuthorityError> {
+        self.command.validate_result(result)
+    }
+
+    pub(crate) fn verify_effect(&self, key: &AuditKey) -> Result<(), AuditAuthorityError> {
+        self.command.verify_effect(key)
     }
 }
 

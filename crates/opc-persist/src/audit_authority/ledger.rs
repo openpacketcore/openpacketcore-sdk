@@ -454,15 +454,14 @@ impl LedgerState {
     pub(crate) fn admit_target(
         &mut self,
         key: &AuditKey,
-        prepared: &super::PreparedTargetMutation,
+        prepared: &crate::consensus::TargetMutationCommand,
         now: i64,
     ) -> Result<(), LedgerMutationError> {
         if self.continuity.is_none() {
             return Err(AuditAuthorityError::RecoveryRequired.into());
         }
-        prepared.verify_effect(key)?;
-        let recovery =
-            String::from_utf8(prepared.encode()?).map_err(|_| AuditAuthorityError::InvalidInput)?;
+        let recovery = String::from_utf8(prepared.encode_retained(key, self.identity)?)
+            .map_err(|_| AuditAuthorityError::InvalidInput)?;
         self.admit_with_payload(
             key,
             prepared.handle(),
@@ -650,7 +649,7 @@ impl LedgerState {
             .ok_or(AuditAuthorityError::BindingMismatch)?;
         match &entry.payload {
             EntryPayload::TargetIntent(retained) if retained.handle == *handle => {
-                validate_target_recovery(key, handle, &retained.recovery)
+                validate_target_recovery(key, self.identity, handle, &retained.recovery)
             }
             _ => Err(AuditAuthorityError::BindingMismatch),
         }
@@ -686,7 +685,7 @@ impl LedgerState {
         });
         let target = retained.is_some();
         if let Some(retained) = retained {
-            validate_target_outcome(key, retained, state)?;
+            validate_target_outcome(key, self.identity, retained, state)?;
         }
         let current = &self.operations[index];
         if current.state == state {
@@ -842,7 +841,12 @@ impl LedgerState {
                     if self.continuity.is_none() {
                         return Err(AuditAuthorityError::BindingMismatch);
                     }
-                    validate_target_recovery(key, &retained.handle, &retained.recovery)?;
+                    validate_target_recovery(
+                        key,
+                        self.identity,
+                        &retained.handle,
+                        &retained.recovery,
+                    )?;
                     Some(&retained.handle)
                 }
                 EntryPayload::EmptyCommit(prepared) => {
@@ -909,7 +913,7 @@ impl LedgerState {
                             _ => None,
                         })
                     {
-                        validate_target_outcome(key, retained, *state)?;
+                        validate_target_outcome(key, self.identity, retained, *state)?;
                         if let AuditOperationState::TargetV1(result) = state {
                             target_anchor = Some(TargetStateAnchor {
                                 sequence,
@@ -1059,10 +1063,11 @@ mod strict_target_handle {
 
 fn validate_target_outcome(
     key: &AuditKey,
+    identity: ConfigConsensusIdentity,
     retained: &RetainedTargetIntent,
     state: AuditOperationState,
 ) -> Result<(), AuditAuthorityError> {
-    let prepared = validate_target_recovery(key, &retained.handle, &retained.recovery)?;
+    let prepared = validate_target_recovery(key, identity, &retained.handle, &retained.recovery)?;
     match state {
         AuditOperationState::Rejected => Ok(()),
         AuditOperationState::TargetV1(result) => prepared.validate_result(result),
@@ -1072,15 +1077,17 @@ fn validate_target_outcome(
 
 fn validate_target_recovery(
     key: &AuditKey,
+    identity: ConfigConsensusIdentity,
     handle: &AuditOperationHandle,
     recovery: &str,
 ) -> Result<super::PreparedTargetMutation, AuditAuthorityError> {
-    let prepared = super::PreparedTargetMutation::decode(recovery.as_bytes())?;
-    if prepared.handle() != handle || prepared.encode()?.as_slice() != recovery.as_bytes() {
-        return Err(AuditAuthorityError::BindingMismatch);
-    }
-    prepared.verify_effect(key)?;
-    Ok(prepared)
+    super::PreparedTargetMutation::decode_retained(
+        recovery.as_bytes(),
+        key,
+        identity,
+        handle,
+        handle.body.binding.caller,
+    )
 }
 
 pub(crate) fn authenticate<T: Serialize>(

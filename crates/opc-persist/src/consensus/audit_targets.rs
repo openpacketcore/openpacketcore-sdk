@@ -47,8 +47,8 @@ use serde::de::DeserializeOwned;
 use sha2::{Digest, Sha256};
 
 use super::audit_mutation::{
-    PreparedTargetMutation, TargetEncryptedBlobV1, TargetExpectationV1, TargetPayloadV1,
-    TargetResolutionV1, TargetSourceV1,
+    PreparedTargetMutation, TargetEncryptedBlobV1, TargetExpectationV1, TargetMutationCommand,
+    TargetPayloadV1, TargetResolutionV1, TargetSourceV1,
 };
 use super::sqlite::SqliteWorkCancellation;
 use crate::audit_authority::continuity::{AuditCheckpoint, AuditKeyRing};
@@ -809,7 +809,7 @@ impl TargetState {
     fn advance_target(
         &mut self,
         slot: usize,
-        prepared: &PreparedTargetMutation,
+        prepared: &TargetMutationCommand,
         blob: Option<TargetEncryptedBlobV1>,
     ) -> Result<(), AuditAuthorityError> {
         let target = &mut self.targets[slot];
@@ -841,7 +841,7 @@ impl TargetState {
 
     fn check_lock(
         &self,
-        prepared: &PreparedTargetMutation,
+        prepared: &TargetMutationCommand,
         slot: usize,
     ) -> Result<(), AuditAuthorityError> {
         let expected = prepared
@@ -932,7 +932,7 @@ impl TargetState {
 
     fn check_resolution(
         &self,
-        prepared: &PreparedTargetMutation,
+        prepared: &TargetMutationCommand,
         now: i64,
         rollback: bool,
     ) -> Result<&PendingConfirmation, AuditAuthorityError> {
@@ -985,7 +985,7 @@ impl TargetState {
     fn reduce(
         &mut self,
         conn: &Connection,
-        prepared: &PreparedTargetMutation,
+        prepared: &TargetMutationCommand,
         ledger: &LedgerState,
         keys: &AuditKeyRing,
         now: i64,
@@ -1521,7 +1521,7 @@ pub(crate) fn apply_target_sync(
     conn: &Connection,
     key: &AuditKey,
     identity: ConfigConsensusIdentity,
-    prepared: &PreparedTargetMutation,
+    prepared: &TargetMutationCommand,
     keys: Option<&AuditKeyRing>,
     context: &super::audit::ApplyContext<'_>,
 ) -> io::Result<Result<(), super::ConfigMutationFailure>> {
@@ -1545,7 +1545,7 @@ pub(crate) fn apply_target_sync(
         Ok(original) => original,
         Err(_) => return Ok(Err(Failure::Conflict)),
     };
-    if original != *prepared {
+    if original.command() != prepared {
         return Ok(Err(Failure::Conflict));
     }
     let Some(operation) = ledger
@@ -1652,7 +1652,7 @@ pub(crate) fn retire_cleanup_sync(
     conn: &Connection,
     key: &AuditKey,
     ledger: &mut LedgerState,
-    prepared: &PreparedTargetMutation,
+    prepared: &TargetMutationCommand,
     now: i64,
     cancellation: &SqliteWorkCancellation,
 ) -> io::Result<Result<(), AuditAuthorityError>> {
@@ -1665,7 +1665,11 @@ pub(crate) fn retire_cleanup_sync(
         // the original caller/event and exact signed session-loss payload.
         prepared.verify_cleanup_retirement(key)?;
         if let Some(receipt) = ledger.lookup(key, prepared.handle(), prepared.effect.caller)? {
-            if ledger.recover_target(key, prepared.handle(), prepared.effect.caller)? != *prepared {
+            if ledger
+                .recover_target(key, prepared.handle(), prepared.effect.caller)?
+                .command()
+                != prepared
+            {
                 return Err(AuditAuthorityError::BindingMismatch);
             }
             // Original-result precedence: even expiry, a later lifecycle or
@@ -1744,7 +1748,7 @@ pub(crate) fn retire_cleanup_sync(
 pub(crate) fn preflight_target_sync(
     conn: &Connection,
     key: &AuditKey,
-    prepared: &PreparedTargetMutation,
+    prepared: &TargetMutationCommand,
     ledger: &LedgerState,
     keys: &AuditKeyRing,
     now: i64,
@@ -1772,7 +1776,7 @@ pub(crate) fn preflight_target_sync(
         // intent, even if it authenticates under the same authority.
         return Ok(
             match ledger.recover_target(key, prepared.handle(), caller) {
-                Ok(original) if original == *prepared => Ok(Some(receipt)),
+                Ok(original) if original.command() == prepared => Ok(Some(receipt)),
                 _ => Err(AuditAuthorityError::BindingMismatch),
             },
         );
@@ -2101,7 +2105,7 @@ impl NetconfDeviceView {
     }
 }
 
-impl PreparedTargetMutation {
+impl TargetMutationCommand {
     pub(crate) fn verify_cleanup_retirement(
         &self,
         key: &AuditKey,
@@ -2136,7 +2140,10 @@ impl PreparedTargetMutation {
         session.cleanup_context(&self.handle.body.event)?;
         self.verify_cleanup_retirement(key)?;
         if !self.is_session_cleanup_for(session)
-            || ledger.recover_target(key, self.handle(), session.caller)? != *self
+            || ledger
+                .recover_target(key, self.handle(), session.caller)?
+                .command()
+                != self
         {
             return Err(AuditAuthorityError::BindingMismatch);
         }
@@ -2159,7 +2166,7 @@ impl PreparedTargetMutation {
     }
 }
 
-impl PreparedTargetMutation {
+impl TargetMutationCommand {
     pub(crate) fn is_session_cleanup_for(
         &self,
         session: &crate::audit_authority::NetconfSessionOwner,
@@ -2174,7 +2181,7 @@ impl PreparedTargetMutation {
     }
 }
 
-impl PreparedTargetMutation {
+impl TargetMutationCommand {
     // The caller supplies an authenticated quorum-current ledger after checking
     // its independent checkpoint. This checks the exact original operation,
     // never a timeout, an absent receipt, or another operation's terminal state.
@@ -2188,7 +2195,10 @@ impl PreparedTargetMutation {
         session.cleanup_context(&self.handle.body.event)?;
         self.verify_effect(key)?;
         if !self.is_session_cleanup_for(session)
-            || ledger.recover_target(key, self.handle(), session.caller)? != *self
+            || ledger
+                .recover_target(key, self.handle(), session.caller)?
+                .command()
+                != self
         {
             return Err(AuditAuthorityError::BindingMismatch);
         }
@@ -2209,6 +2219,41 @@ impl PreparedTargetMutation {
             return Err(AuditAuthorityError::RecoveryRequired);
         }
         Ok(())
+    }
+}
+
+impl PreparedTargetMutation {
+    pub(crate) fn verify_cleanup_retirement(
+        &self,
+        key: &AuditKey,
+    ) -> Result<(), AuditAuthorityError> {
+        self.command().verify_cleanup_retirement(key)
+    }
+    pub(crate) fn is_session_cleanup_for(
+        &self,
+        session: &crate::audit_authority::NetconfSessionOwner,
+    ) -> bool {
+        self.command().is_session_cleanup_for(session)
+    }
+    pub(crate) fn verify_settled_cleanup_retirement(
+        &self,
+        session: &crate::audit_authority::NetconfSessionOwner,
+        ledger: &LedgerState,
+        key: &AuditKey,
+        now: i64,
+    ) -> Result<(), AuditAuthorityError> {
+        self.command()
+            .verify_settled_cleanup_retirement(session, ledger, key, now)
+    }
+    pub(crate) fn verify_settled_cleanup_rejection(
+        &self,
+        session: &crate::audit_authority::NetconfSessionOwner,
+        ledger: &LedgerState,
+        key: &AuditKey,
+        now: i64,
+    ) -> Result<(), AuditAuthorityError> {
+        self.command()
+            .verify_settled_cleanup_rejection(session, ledger, key, now)
     }
 }
 
@@ -2297,13 +2342,20 @@ impl crate::audit_authority::NetconfRunningEditRead {
         tenant: &str,
         event: &crate::audit_authority::ProjectedAuditEvent,
         expires_at: i64,
-        key: &AuditKey,
-    ) -> Result<super::audit_mutation::TargetEffectV1, AuditAuthorityError> {
+        preparation: (&AuditKey, opc_crypto::ConfigCapacityProfile),
+    ) -> Result<
+        (
+            super::audit_mutation::TargetEffectV1,
+            Option<std::sync::Arc<super::preparation::PreparationOwnership>>,
+        ),
+        AuditAuthorityError,
+    > {
         use crate::ManagementAuditOperationCode as Operation;
         use crate::ManagementAuditTransportCode as Transport;
         self.verify_session(session)?;
+        let (key, profile) = preparation;
         let bad = AuditAuthorityError::BindingMismatch;
-        let (record, audit, resolution) = commit.into_parts();
+        let record = commit.record();
         if event.caller != session.caller
             || event.outcome != crate::ManagementAuditOutcomeCode::Intent
             || !matches!(
@@ -2317,14 +2369,20 @@ impl crate::audit_authority::NetconfRunningEditRead {
             || record.parent_tx_id != self.tx_id()
             || self.running_base_version().checked_add(1) != Some(record.version.get())
             || record.confirmed_deadline.is_some()
-            || resolution.is_some()
+            || commit.confirmed_resolution().is_some()
         {
             return Err(bad);
         }
         // Preparation consumes the original AEAD claim. No ciphertext claim is
         // reconstructed, and ordinary replacement deliberately has no copy proof.
-        let commit = super::PreparedConfigCommit::prepare(record, audit, key)
-            .map_err(|_| AuditAuthorityError::InvalidInput)?;
+        let prepared = super::capacity_record::PreparedCapacityCommit::prepare(
+            commit,
+            session.device.authority,
+            key,
+            profile,
+        )
+        .map_err(|_| AuditAuthorityError::InvalidInput)?;
+        let commit = &prepared.commit;
         let envelope = opc_crypto::CryptoEnvelopeRef::decode(&commit.record.encrypted_blob)
             .map_err(|_| bad)?;
         let (aad, _) = opc_key::decode_bound_aad(envelope.aad).map_err(|_| bad)?;
@@ -2342,35 +2400,36 @@ impl crate::audit_authority::NetconfRunningEditRead {
                 return Err(bad);
             }
         }
-        Ok(super::audit_mutation::TargetEffectV1 {
-            format: 1,
-            authority: session.device.authority,
-            profile_incarnation: session.device.profile_incarnation,
-            device_incarnation: session.device.device_incarnation,
-            caller: event.caller,
-            request: event.request,
-            action: 16.try_into()?,
-            destination: TargetExpectationV1::Running {
-                version: self.running_base_version(),
+        let (payload, ownership) = TargetPayloadV1::from_prepared_running(prepared)?;
+        Ok((
+            super::audit_mutation::TargetEffectV1 {
+                format: 1,
+                authority: session.device.authority,
+                profile_incarnation: session.device.profile_incarnation,
+                device_incarnation: session.device.device_incarnation,
+                caller: event.caller,
+                request: event.request,
+                action: 16.try_into()?,
+                destination: TargetExpectationV1::Running {
+                    version: self.running_base_version(),
+                },
+                source: self.record.as_ref().map(|record| TargetSourceV1::Running {
+                    version: record.version.get(),
+                    schema: record.schema_digest,
+                    ciphertext_digest: Sha256::digest(&record.encrypted_blob).into(),
+                }),
+                lock: Some(super::audit_mutation::TargetLockExpectationV1 {
+                    datastore: 0,
+                    incarnation: self.lock_incarnation,
+                    session: self.lock_session,
+                    requester: session.incarnation(),
+                }),
+                expires_at,
+                encrypted_payload: Some(payload),
+                resolution: None,
             },
-            source: self.record.as_ref().map(|record| TargetSourceV1::Running {
-                version: record.version.get(),
-                schema: record.schema_digest,
-                ciphertext_digest: Sha256::digest(&record.encrypted_blob).into(),
-            }),
-            lock: Some(super::audit_mutation::TargetLockExpectationV1 {
-                datastore: 0,
-                incarnation: self.lock_incarnation,
-                session: self.lock_session,
-                requester: session.incarnation(),
-            }),
-            expires_at,
-            encrypted_payload: Some(TargetPayloadV1::Running {
-                commit: Box::new(commit),
-                confirmation_ownership: None,
-            }),
-            resolution: None,
-        })
+            ownership,
+        ))
     }
 }
 
@@ -3942,7 +4001,7 @@ impl crate::audit_authority::NetconfRollbackRead {
         key: &AuditKey,
     ) -> Result<super::audit_mutation::TargetEffectV1, AuditAuthorityError> {
         self.successor_context(owner, input.previous, event)?;
-        if window.start < input.previous.handle.body.expires_at {
+        if window.start < input.previous.handle().body.expires_at {
             return Err(AuditAuthorityError::RecoveryRequired);
         }
         self.prepare_rollback_effect(owner, input.rollback, tenant, event, window, key)

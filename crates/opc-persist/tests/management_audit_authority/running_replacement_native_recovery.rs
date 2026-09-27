@@ -319,7 +319,9 @@ async fn target_rejection_native_outcome_fault_rolls_back_replays_and_reopens() 
                 request_id: request,
                 logical_time,
                 intent: ConfigMutationIntent::ManagementAudit(Box::new(
-                    AuditCommand::NetconfTarget(Box::new(TargetAuditCommandV1::Apply(prepared))),
+                    AuditCommand::NetconfTarget(Box::new(TargetAuditCommandV1::Apply(
+                        prepared.command().clone(),
+                    ))),
                 )),
             }),
         };

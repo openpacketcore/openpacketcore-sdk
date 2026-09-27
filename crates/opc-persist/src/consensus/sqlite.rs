@@ -38,6 +38,7 @@ use crate::backend::SqliteBackend;
 use crate::types::{AuditKey, AuditOpType, CommitSource};
 
 mod config_capacity_checked_apply_batch;
+mod joint_running;
 mod outcome_authentication;
 
 pub(crate) use config_capacity_checked_apply_batch::ApplyBatch;
@@ -54,6 +55,11 @@ macro_rules! native_io_after_success {
         }
     }};
 }
+
+#[cfg(all(test, target_os = "linux"))]
+mod joint_running_gate_tests;
+#[cfg(all(test, target_os = "linux"))]
+mod joint_running_tests;
 
 pub(crate) struct StagedLegacyRecovery {
     pub(crate) path: PathBuf,
@@ -3149,13 +3155,40 @@ fn create_rollback_point_sync(
 pub(super) fn apply_target_running_sync(
     conn: &Connection,
     key: &AuditKey,
-    prepared: &super::audit_mutation::PreparedTargetMutation,
+    prepared: &super::audit_mutation::TargetMutationCommand,
     pending_tx_id: Option<opc_types::TxId>,
     context: &super::audit::ApplyContext<'_>,
+) -> io::Result<Result<(), ConfigMutationFailure>> {
+    // The current target dispatcher has no independently selected capacity
+    // context. Joint opening and dispatch remain closed until that context is
+    // threaded from the native core through the authoritative target reducer.
+    apply_target_running_with_authority_sync(conn, key, prepared, pending_tx_id, context, None)
+}
+
+fn apply_target_running_with_authority_sync(
+    conn: &Connection,
+    key: &AuditKey,
+    prepared: &super::audit_mutation::TargetMutationCommand,
+    pending_tx_id: Option<opc_types::TxId>,
+    context: &super::audit::ApplyContext<'_>,
+    capacity_authority: Option<&joint_running::CapacityRunningAuthority>,
 ) -> io::Result<Result<(), ConfigMutationFailure>> {
     use super::audit_mutation::{TargetPayloadV1, TargetResolutionV1};
     let action = u8::from(prepared.effect.action);
     let (result, updates_existing) = match &prepared.effect.encrypted_payload {
+        Some(TargetPayloadV1::BoundedRunning(_)) => {
+            let Some(authority) = capacity_authority else {
+                return Ok(Err(ConfigMutationFailure::InvalidInput));
+            };
+            return joint_running::apply_sync(
+                conn,
+                key,
+                prepared,
+                pending_tx_id,
+                context,
+                authority,
+            );
+        }
         Some(
             TargetPayloadV1::Running { commit, .. } | TargetPayloadV1::ProviderCopy { commit, .. },
         ) => {

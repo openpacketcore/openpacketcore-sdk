@@ -251,7 +251,7 @@ impl NetconfRollbackRead {
         prepared: PreparedTargetMutation,
     ) -> Result<PreparedTargetMutation, AuditAuthorityError> {
         self.verify_owner(owner)?;
-        self.verify_event(&prepared.handle.body.event)?;
+        self.verify_event(&prepared.command().handle.body.event)?;
         let mut slot = self
             .0
             .attempt
@@ -353,20 +353,22 @@ impl NetconfRollbackRead {
         original: &PreparedTargetMutation,
         proposed: &PreparedTargetMutation,
     ) -> Result<PreparedTargetMutation, AuditAuthorityError> {
-        let mut effect = proposed.effect.clone();
-        effect.expires_at = original.effect.expires_at;
-        if original.handle.body.event != proposed.handle.body.event
-            || original.effect != effect
+        let mut effect = proposed.command().effect.clone();
+        effect.expires_at = original.command().effect.expires_at;
+        if original.command().handle.body.event != proposed.command().handle.body.event
+            || original.command().effect != effect
             || original
+                .command()
                 .handle
                 .body
                 .expires_at
-                .checked_sub(original.handle.body.issued_at)
+                .checked_sub(original.command().handle.body.issued_at)
                 != proposed
+                    .command()
                     .handle
                     .body
                     .expires_at
-                    .checked_sub(proposed.handle.body.issued_at)
+                    .checked_sub(proposed.command().handle.body.issued_at)
         {
             return Err(AuditAuthorityError::BindingMismatch);
         }
@@ -381,8 +383,8 @@ impl NetconfRollbackRead {
     ) -> Result<(), AuditAuthorityError> {
         self.verify_owner(owner)?;
         self.verify_event(event)?;
-        self.verify_event(&previous.handle.body.event)?;
-        if event.request == previous.handle.body.event.request {
+        self.verify_event(&previous.command().handle.body.event)?;
+        if event.request == previous.command().handle.body.event.request {
             return Err(AuditAuthorityError::BindingMismatch);
         }
         let slot = self
@@ -409,7 +411,7 @@ impl NetconfRollbackRead {
         key: &crate::AuditKey,
         now: i64,
     ) -> Result<(), AuditAuthorityError> {
-        self.verify_event(&previous.handle.body.event)?;
+        self.verify_event(&previous.command().handle.body.event)?;
         previous.verify_effect(key)?;
         if ledger.recover_target(key, previous.handle(), self.original_caller())? != *previous {
             return Err(AuditAuthorityError::BindingMismatch);
@@ -417,9 +419,9 @@ impl NetconfRollbackRead {
         let operation = ledger
             .operations
             .iter()
-            .find(|operation| operation.handle == previous.handle)
+            .find(|operation| operation.handle == previous.command().handle)
             .ok_or(AuditAuthorityError::BindingMismatch)?;
-        if now < previous.handle.body.expires_at
+        if now < previous.command().handle.body.expires_at
             || operation.state != super::AuditOperationState::Rejected
             || !operation.terminal_recorded
             || ledger
@@ -443,11 +445,12 @@ impl NetconfRollbackRead {
         now: i64,
     ) -> Result<PreparedTargetMutation, AuditAuthorityError> {
         self.verify_owner(owner)?;
-        self.verify_event(&prepared.handle.body.event)?;
+        self.verify_event(&prepared.command().handle.body.event)?;
         prepared.verify_effect(key)?;
         self.verify_rejected_predecessor(previous, ledger, key, now)?;
-        if prepared.handle.body.event.request == previous.handle.body.event.request
-            || prepared.handle.body.issued_at < previous.handle.body.expires_at
+        if prepared.command().handle.body.event.request
+            == previous.command().handle.body.event.request
+            || prepared.command().handle.body.issued_at < previous.command().handle.body.expires_at
         {
             return Err(AuditAuthorityError::BindingMismatch);
         }

@@ -111,7 +111,7 @@ fn target_profile_wire_codec_preserves_legacy_and_refuses_both_downgrade_directi
 #[test]
 fn target_profile_command_requires_explicit_profile_and_allocated_revision() {
     let prepared = super::signed_discard();
-    let identity = prepared.handle.body.identity;
+    let identity = prepared.command().handle.body.identity;
     let mut command = ConfigConsensusCommand {
         schema_version: 9,
         identity,
@@ -119,7 +119,9 @@ fn target_profile_command_requires_explicit_profile_and_allocated_revision() {
         logical_time: "2026-01-01T00:00:00Z".parse().unwrap(),
         intent: ConfigMutationIntent::ManagementAudit(Box::new(
             super::AuditCommand::NetconfTarget(Box::new(
-                crate::consensus::audit_mutation::TargetAuditCommandV1::Apply(prepared),
+                crate::consensus::audit_mutation::TargetAuditCommandV1::Apply(
+                    prepared.command().clone(),
+                ),
             )),
         )),
     };
@@ -177,7 +179,7 @@ fn target_profile_command_requires_explicit_profile_and_allocated_revision() {
 
 #[test]
 fn target_profile_keeps_historical_command_validation_without_admitting_capacity_revision() {
-    let identity = super::signed_discard().handle.body.identity;
+    let identity = super::signed_discard().handle().body.identity;
     let mut command = ConfigConsensusCommand {
         schema_version: 1,
         identity,

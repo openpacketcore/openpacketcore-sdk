@@ -605,7 +605,9 @@ impl ConfigMutationIntent {
                 | super::audit::AuditCommand::Reject(_)
                 | super::audit::AuditCommand::Terminal(_) => 5,
                 super::audit::AuditCommand::AcknowledgeExport(_) => 7,
-                super::audit::AuditCommand::NetconfTarget(_) => 9,
+                super::audit::AuditCommand::NetconfTarget(target) => {
+                    target.minimum_command_version()
+                }
                 _ => 6,
             },
         }
@@ -660,6 +662,18 @@ impl ConfigMutationIntent {
                 .effect
                 .verify_capacity(identity, key, profile)
                 .map(|_| ()),
+            Self::ManagementAudit(command) => match command.as_ref() {
+                super::audit::AuditCommand::NetconfTarget(target) => match target.bounded_running()
+                {
+                    Some(payload) => {
+                        payload
+                            .binding()
+                            .verify(&payload.commit().record, identity, key, profile)
+                    }
+                    None => Ok(()),
+                },
+                _ => Ok(()),
+            },
             _ => Ok(()),
         };
         #[cfg(all(test, target_os = "linux"))]
@@ -694,11 +708,24 @@ impl ConfigMutationIntent {
                 super::audit_mutation::AuditedConfigEffect::Confirm { .. }
                 | super::audit_mutation::AuditedConfigEffect::RollbackPoint { .. } => 0,
             },
+            Self::ManagementAudit(command) => match command.as_ref() {
+                super::audit::AuditCommand::NetconfTarget(target) => match target.bounded_running()
+                {
+                    // Keyed verification remains a separate, mandatory scoped
+                    // step. Only the structurally proved envelope content is
+                    // subtracted: its length prefix and every other field count.
+                    Some(payload) if payload.validate().is_ok() => {
+                        payload.commit().record.encrypted_blob.len()
+                    }
+                    Some(_) => return false,
+                    None => 0,
+                },
+                _ => 0,
+            },
             Self::MarkConfirmed { .. }
             | Self::CreateRollbackPoint { .. }
             | Self::ClearRecoveryRequired { .. }
-            | Self::RetainHistory(_)
-            | Self::ManagementAudit(_) => 0,
+            | Self::RetainHistory(_) => 0,
         };
         complete_bytes
             .checked_sub(envelope_bytes)
@@ -1274,6 +1301,8 @@ pub(super) fn validate_encrypted_record_view(
     if record.plaintext_digest.len() != 32 || record.encrypted_blob.is_empty() {
         return Err(PersistError::corrupt_blob());
     }
+    #[cfg(test)]
+    super::audit_mutation::joint_running::observe_record_envelope_decode();
     let envelope = CryptoEnvelopeRef::decode(record.encrypted_blob)
         .map_err(|_| PersistError::corrupt_blob())?;
     if envelope.nonce.len() != envelope.algorithm.nonce_len()
@@ -1282,6 +1311,8 @@ pub(super) fn validate_encrypted_record_view(
     {
         return Err(PersistError::corrupt_blob());
     }
+    #[cfg(test)]
+    super::audit_mutation::joint_running::observe_record_aad_decode();
     let (aad, bound_key_id) =
         opc_key::decode_bound_aad(envelope.aad).map_err(|_| PersistError::corrupt_blob())?;
     let opc_key::EnvelopeMetadata::Config(metadata) = aad.metadata() else {

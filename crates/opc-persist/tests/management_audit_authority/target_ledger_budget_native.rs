@@ -120,7 +120,7 @@ async fn target_ledger_budget_stops_oversized_native_admission_without_partial_s
                 fixture.apply(
                     &conn,
                     AuditCommand::NetconfTarget(Box::new(TargetAuditCommandV1::Admit(
-                        second.clone()
+                        second.command().clone()
                     ))),
                     100
                 ),
@@ -143,7 +143,11 @@ async fn target_ledger_budget_stops_oversized_native_admission_without_partial_s
         assert!(fixture.ledger(&conn) == before_ledger);
         assert!(fixture
             .ledger(&conn)
-            .lookup(&fixture.key, second.handle(), second.effect.caller)
+            .lookup(
+                &fixture.key,
+                second.handle(),
+                second.command().effect.caller
+            )
             .unwrap()
             .is_none());
     }
@@ -159,7 +163,11 @@ async fn target_ledger_budget_stops_oversized_native_admission_without_partial_s
     assert!(receipt.terminal_recorded());
     assert_eq!(
         before_ledger
-            .recover_target(&fixture.key, original.handle(), original.effect.caller)
+            .recover_target(
+                &fixture.key,
+                original.handle(),
+                original.command().effect.caller
+            )
             .unwrap()
             .encode()
             .unwrap(),
@@ -181,7 +189,11 @@ async fn target_ledger_budget_stops_oversized_native_admission_without_partial_s
     assert!(restored == before_ledger);
     assert_eq!(
         restored
-            .lookup(&fixture.key, original.handle(), original.effect.caller)
+            .lookup(
+                &fixture.key,
+                original.handle(),
+                original.command().effect.caller
+            )
             .unwrap()
             .unwrap()
             .state(),

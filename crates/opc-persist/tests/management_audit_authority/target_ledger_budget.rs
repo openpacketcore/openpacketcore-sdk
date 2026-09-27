@@ -18,7 +18,7 @@ fn target_ledger() -> LedgerState {
     );
     ledger.continuity = Some(ContinuityState::new(1));
     ledger
-        .admit_target(&AuditKey::new([0x24; 32]).unwrap(), &original, 100)
+        .admit_target(&AuditKey::new([0x24; 32]).unwrap(), original.command(), 100)
         .unwrap();
     ledger
 }
@@ -78,7 +78,7 @@ fn target_ledger_budget_preserves_legacy_target_bytes_and_original_result() {
     let unchanged = serde_json::to_vec(&ledger).unwrap();
     // Exact acknowledged originals remain replayable even after their original
     // expiry. No new identity or extended expiry is issued by this retry.
-    ledger.admit_target(&key, &original, 160).unwrap();
+    ledger.admit_target(&key, original.command(), 160).unwrap();
     assert_eq!(serde_json::to_vec(&ledger).unwrap(), unchanged);
     ledger
         .resolve(&key, original.handle(), AuditOperationState::Rejected)
@@ -95,12 +95,12 @@ fn target_ledger_budget_preserves_legacy_target_bytes_and_original_result() {
     let restored: LedgerState = serde_json::from_slice(&retained).unwrap();
     assert_eq!(
         restored
-            .recover_target(&key, original.handle(), original.effect.caller)
+            .recover_target(&key, original.handle(), original.command().effect.caller)
             .unwrap(),
         original
     );
     let receipt = restored
-        .lookup(&key, original.handle(), original.effect.caller)
+        .lookup(&key, original.handle(), original.command().effect.caller)
         .unwrap()
         .unwrap();
     assert_eq!(receipt.state(), AuditOperationState::Rejected);

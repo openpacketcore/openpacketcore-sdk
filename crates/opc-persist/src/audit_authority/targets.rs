@@ -713,13 +713,14 @@ impl NetconfSessionOwner {
         event: &super::ProjectedAuditEvent,
         lifetime: std::time::Duration,
     ) -> Result<super::PreparedTargetMutation, AuditAuthorityError> {
-        if original.handle.body.event != *event
+        if original.command().handle.body.event != *event
             || lifetime.subsec_nanos() != 0
             || original
+                .command()
                 .handle
                 .body
                 .expires_at
-                .checked_sub(original.handle.body.issued_at)
+                .checked_sub(original.command().handle.body.issued_at)
                 != i64::try_from(lifetime.as_secs()).ok()
         {
             return Err(AuditAuthorityError::BindingMismatch);
@@ -731,12 +732,13 @@ impl NetconfSessionOwner {
         &self,
         prepared: &super::PreparedTargetMutation,
     ) -> Result<std::time::Duration, AuditAuthorityError> {
-        self.cleanup_context(&prepared.handle.body.event)?;
+        self.cleanup_context(&prepared.command().handle.body.event)?;
         let seconds = prepared
+            .command()
             .handle
             .body
             .expires_at
-            .checked_sub(prepared.handle.body.issued_at)
+            .checked_sub(prepared.command().handle.body.issued_at)
             .filter(|seconds| (1..=3600).contains(seconds))
             .ok_or(AuditAuthorityError::BindingMismatch)?;
         if !prepared.is_session_cleanup_for(self) {
@@ -766,7 +768,7 @@ impl NetconfSessionOwner {
         prepared: super::PreparedTargetMutation,
     ) -> Result<super::PreparedTargetMutation, AuditAuthorityError> {
         let lifetime = self.cleanup_preparation_lifetime(&prepared)?;
-        let event = prepared.handle.body.event.clone();
+        let event = prepared.command().handle.body.event.clone();
         let mut slot = self
             .state
             .cleanup
@@ -827,8 +829,9 @@ impl NetconfSessionOwner {
             return Ok(None);
         }
         if current.predecessor.as_ref() != Some(previous.handle())
-            || current.prepared.handle.body.event != *event
-            || current.prepared.handle.body.expires_at != previous.handle.body.expires_at
+            || current.prepared.command().handle.body.event != *event
+            || current.prepared.command().handle.body.expires_at
+                != previous.command().handle.body.expires_at
         {
             return Err(AuditAuthorityError::BindingMismatch);
         }
@@ -843,10 +846,10 @@ impl NetconfSessionOwner {
         key: &crate::AuditKey,
         now: i64,
     ) -> Result<super::PreparedTargetMutation, AuditAuthorityError> {
-        self.cleanup_successor_context(previous, &prepared.handle.body.event)?;
+        self.cleanup_successor_context(previous, &prepared.command().handle.body.event)?;
         self.cleanup_preparation_lifetime(&prepared)?;
-        if prepared.handle.body.expires_at != previous.handle.body.expires_at
-            || prepared.handle.body.issued_at < previous.handle.body.issued_at
+        if prepared.command().handle.body.expires_at != previous.command().handle.body.expires_at
+            || prepared.command().handle.body.issued_at < previous.command().handle.body.issued_at
         {
             return Err(AuditAuthorityError::BindingMismatch);
         }
@@ -866,8 +869,9 @@ impl NetconfSessionOwner {
             return Ok(prepared);
         }
         if current.predecessor.as_ref() != Some(previous.handle())
-            || current.prepared.handle.body.event != prepared.handle.body.event
-            || current.prepared.handle.body.expires_at != prepared.handle.body.expires_at
+            || current.prepared.command().handle.body.event != prepared.command().handle.body.event
+            || current.prepared.command().handle.body.expires_at
+                != prepared.command().handle.body.expires_at
         {
             return Err(AuditAuthorityError::BindingMismatch);
         }
@@ -881,8 +885,8 @@ impl NetconfSessionOwner {
     ) -> Result<(), AuditAuthorityError> {
         self.cleanup_context(event)?;
         self.cleanup_preparation_lifetime(previous)?;
-        if event.request == previous.handle.body.event.request
-            || event.projection != previous.handle.body.event.projection
+        if event.request == previous.command().handle.body.event.request
+            || event.projection != previous.command().handle.body.event.projection
         {
             return Err(AuditAuthorityError::BindingMismatch);
         }
@@ -919,9 +923,9 @@ impl NetconfSessionOwner {
         key: &crate::AuditKey,
         now: i64,
     ) -> Result<super::PreparedTargetMutation, AuditAuthorityError> {
-        self.cleanup_successor_context(previous, &prepared.handle.body.event)?;
+        self.cleanup_successor_context(previous, &prepared.command().handle.body.event)?;
         let lifetime = self.cleanup_preparation_lifetime(&prepared)?;
-        if prepared.handle.body.issued_at < previous.handle.body.expires_at {
+        if prepared.command().handle.body.issued_at < previous.command().handle.body.expires_at {
             return Err(AuditAuthorityError::BindingMismatch);
         }
         prepared.verify_effect(key)?;
@@ -946,7 +950,11 @@ impl NetconfSessionOwner {
         }
         // A concurrent identical preparation gets the first selected original.
         // Another event, predecessor or lifetime cannot replace that winner.
-        Self::matching_cleanup(&current.prepared, &prepared.handle.body.event, lifetime)
+        Self::matching_cleanup(
+            &current.prepared,
+            &prepared.command().handle.body.event,
+            lifetime,
+        )
     }
 }
 

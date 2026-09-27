@@ -17,6 +17,14 @@ pub(crate) struct ProposalTestGate {
 }
 
 impl ProposalTestGate {
+    pub(super) fn unblocked() -> Self {
+        Self {
+            permits: Arc::new(tokio::sync::Semaphore::new(1)),
+            arrived: tokio::sync::watch::channel(0).0,
+            accepted: std::sync::atomic::AtomicUsize::new(0),
+        }
+    }
+
     pub(crate) async fn enter(
         &self,
         deadline: tokio::time::Instant,

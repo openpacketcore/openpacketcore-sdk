@@ -2148,6 +2148,44 @@ pub(super) fn preflight_received_config_command(
     .map_err(ForwardMutationRejection::into_persist_error)
 }
 
+// Encoding-only boundary for the proposed joint action-16 representation.
+// No RetainedConfigMode selects revision 10 and no submission calls this helper.
+// Both phases include their full framing and the same maximum clock input.
+pub(super) fn preflight_joint_target_payload(
+    prepared: &super::audit_mutation::PreparedTargetMutation,
+) -> Result<(), crate::audit_authority::AuditAuthorityError> {
+    use crate::audit_authority::AuditAuthorityError;
+    for (purpose, phase) in [
+        (
+            b"netconf-target-intent".as_slice(),
+            super::audit_mutation::TargetAuditCommandV1::Admit(prepared.command().clone()),
+        ),
+        (
+            b"netconf-target-effect".as_slice(),
+            super::audit_mutation::TargetAuditCommandV1::Apply(prepared.command().clone()),
+        ),
+    ] {
+        let intent = ConfigMutationIntent::ManagementAudit(Box::new(
+            super::audit::AuditCommand::NetconfTarget(Box::new(phase)),
+        ));
+        let probe = ConfigConsensusCommandSizeProbe {
+            schema_version: 10,
+            identity: prepared.command().handle.body.identity,
+            request_id: derive_durable_request_id(
+                prepared.command().handle.body.identity,
+                purpose,
+                &prepared.command().handle.mac,
+            ),
+            logical_time: maximum_encoded_config_timestamp()
+                .ok_or(AuditAuthorityError::InvalidInput)?,
+            intent: &intent,
+        };
+        config_capacity_admission::preflight_joint_target_payload(&probe)
+            .map_err(|_| AuditAuthorityError::InvalidInput)?;
+    }
+    Ok(())
+}
+
 fn maximum_encoded_config_timestamp() -> Option<opc_types::Timestamp> {
     let date = time::Date::from_calendar_date(9999, time::Month::December, 31).ok()?;
     let clock_time = time::Time::from_hms_nano(23, 59, 59, 999_999_999).ok()?;
@@ -2476,6 +2514,8 @@ mod tests {
     mod config_capacity_preparation_tests;
     #[cfg(target_os = "linux")]
     mod config_capacity_shutdown_tests;
+    #[cfg(target_os = "linux")]
+    mod joint_target_submission_native_tests;
 
     use super::super::{
         ConfigConsensusClusterId, ConfigConsensusConfigurationEpoch, ConfigConsensusConfigurationId,
