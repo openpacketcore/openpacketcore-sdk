@@ -1908,6 +1908,11 @@ pub(super) fn validate_entry_capacities(
 ) -> io::Result<()> {
     for entry in entries {
         if let EntryPayload::Normal(command) = &entry.payload {
+            #[cfg(all(test, target_os = "linux"))]
+            let _cost_scope =
+                super::store::config_capacity_cost_observation::Scope::native_validation(
+                    command.request_id,
+                );
             command
                 .validate_for_profile(identity, key, profile)
                 .map_err(|_| invalid_data("invalid config capacity command"))?;

@@ -9,6 +9,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- `opc-persist`: reuse admission checks for the same locally owned bounded
+  append. Received requests, legacy operations, native storage and retained
+  reopen keep independent validation. Preserve admission ordering, cancellation
+  and original deadlines. Full capacity qualification remains open. Refs #957.
+
 - `opc-persist`: decode canonical audited bounded appends without the generic
   ciphertext-array fallback and batch audit-effect JSON writes. Preserve exact
   canonical bytes, HMAC compatibility, authenticated recovery, retained reopen

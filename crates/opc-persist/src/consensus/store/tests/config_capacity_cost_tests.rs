@@ -21,6 +21,15 @@ pub(crate) mod observation {
 
     use crate::consensus::ConfigRaftTypeConfig;
 
+    #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+    pub(crate) struct AdmissionCounts {
+        pub(crate) scopes: usize,
+        pub(crate) preflight_calls: usize,
+        pub(crate) preflight_successes: usize,
+        pub(crate) capacity_calls: usize,
+        pub(crate) capacity_successes: usize,
+    }
+
     #[derive(Clone, Copy, Debug, Default)]
     pub(crate) struct Counts {
         pub(crate) native_canonical_decodes: usize,
@@ -30,6 +39,11 @@ pub(crate) mod observation {
         pub(crate) effect_encoded_bytes: usize,
         pub(crate) effect_length_writes: usize,
         pub(crate) effect_mac_writes: usize,
+        pub(crate) ingress: AdmissionCounts,
+        pub(crate) local_apply: AdmissionCounts,
+        pub(crate) native_validation: AdmissionCounts,
+        pub(crate) finalized_capacity_calls: usize,
+        pub(crate) finalized_capacity_successes: usize,
         pub(crate) finalized_scopes: usize,
         pub(crate) preflight_calls: usize,
         pub(crate) preflight_successes: usize,
@@ -47,6 +61,9 @@ pub(crate) mod observation {
 
     #[derive(Clone, Copy)]
     enum Phase {
+        Ingress,
+        LocalApply,
+        NativeValidation,
         Finalized,
         Append,
         Apply,
@@ -107,6 +124,9 @@ pub(crate) mod observation {
             if let Some(counts) = &counts {
                 let mut counts = counts.lock().expect("cost counters");
                 match phase {
+                    Phase::Ingress => counts.ingress.scopes += 1,
+                    Phase::LocalApply => counts.local_apply.scopes += 1,
+                    Phase::NativeValidation => counts.native_validation.scopes += 1,
                     Phase::Finalized => counts.finalized_scopes += 1,
                     Phase::Append => counts.append_scopes += 1,
                     Phase::Apply => counts.apply_scopes += 1,
@@ -114,6 +134,18 @@ pub(crate) mod observation {
             }
             let previous = ACTIVE.with(|active| active.replace(counts.map(|c| (phase, c))));
             Self { previous }
+        }
+
+        pub(crate) fn ingress(request_id: ConsensusRequestId) -> Self {
+            Self::enter(Some(request_id), Phase::Ingress)
+        }
+
+        pub(crate) fn local_apply(request_id: ConsensusRequestId) -> Self {
+            Self::enter(Some(request_id), Phase::LocalApply)
+        }
+
+        pub(crate) fn native_validation(request_id: ConsensusRequestId) -> Self {
+            Self::enter(Some(request_id), Phase::NativeValidation)
         }
 
         pub(crate) fn finalized(request_id: ConsensusRequestId) -> Self {
@@ -223,9 +255,40 @@ pub(crate) mod observation {
         });
     }
 
+    fn admission(phase: Phase, counts: &mut Counts) -> Option<&mut AdmissionCounts> {
+        match phase {
+            Phase::Ingress => Some(&mut counts.ingress),
+            Phase::LocalApply => Some(&mut counts.local_apply),
+            Phase::NativeValidation => Some(&mut counts.native_validation),
+            Phase::Finalized | Phase::Append | Phase::Apply => None,
+        }
+    }
+
+    pub(crate) fn capacity_validation_started() {
+        observe(|phase, counts| {
+            if matches!(phase, Phase::Finalized) {
+                counts.finalized_capacity_calls += 1;
+            } else if let Some(counts) = admission(phase, counts) {
+                counts.capacity_calls += 1;
+            }
+        });
+    }
+
+    pub(crate) fn capacity_validation_succeeded() {
+        observe(|phase, counts| {
+            if matches!(phase, Phase::Finalized) {
+                counts.finalized_capacity_successes += 1;
+            } else if let Some(counts) = admission(phase, counts) {
+                counts.capacity_successes += 1;
+            }
+        });
+    }
+
     pub(crate) fn preflight_started() {
         observe(|phase, counts| {
             if matches!(phase, Phase::Finalized) {
+                counts.preflight_calls += 1;
+            } else if let Some(counts) = admission(phase, counts) {
                 counts.preflight_calls += 1;
             }
         });
@@ -234,6 +297,8 @@ pub(crate) mod observation {
     pub(crate) fn preflight_succeeded() {
         observe(|phase, counts| {
             if matches!(phase, Phase::Finalized) {
+                counts.preflight_successes += 1;
+            } else if let Some(counts) = admission(phase, counts) {
                 counts.preflight_successes += 1;
             }
         });
@@ -249,7 +314,7 @@ pub(crate) mod observation {
                 counts.apply_counts += 1;
                 counts.apply_encoded_bytes += bytes;
             }
-            Phase::Finalized => {}
+            Phase::Finalized | Phase::Ingress | Phase::LocalApply | Phase::NativeValidation => {}
         });
     }
 
@@ -263,7 +328,7 @@ pub(crate) mod observation {
                 counts.apply_output_allocations += 1;
                 counts.apply_output_capacity += capacity;
             }
-            Phase::Finalized => {}
+            Phase::Finalized | Phase::Ingress | Phase::LocalApply | Phase::NativeValidation => {}
         });
     }
 }
@@ -278,15 +343,25 @@ enum Recovery {
 
 #[tokio::test]
 async fn config_capacity_957_native_ordinary_costs_preserve_readback_and_reopen() {
-    run_native_cost_case(false).await;
+    run_native_cost_case(false, true).await;
 }
 
 #[tokio::test]
 async fn config_capacity_957_native_audited_costs_preserve_readback_and_reopen() {
-    run_native_cost_case(true).await;
+    run_native_cost_case(true, true).await;
 }
 
-async fn run_native_cost_case(audited: bool) {
+#[tokio::test]
+async fn config_capacity_957_native_ordinary_routed_costs_preserve_readback_and_reopen() {
+    run_native_cost_case(false, false).await;
+}
+
+#[tokio::test]
+async fn config_capacity_957_native_audited_routed_costs_preserve_readback_and_reopen() {
+    run_native_cost_case(true, false).await;
+}
+
+async fn run_native_cost_case(audited: bool, local_only: bool) {
     let scratch = std::env::var_os("TMPDIR")
         .or_else(|| {
             (std::env::var("GITHUB_ACTIONS").ok().as_deref() == Some("true"))
@@ -406,11 +481,16 @@ async fn run_native_cost_case(audited: bool) {
         let request_id =
             derive_durable_request_id(store.inner.identity, b"audit-config", &handle.mac);
         let observation = observation::Observation::new(request_id);
-        let receipt = applied(
+        let admission = if local_only {
             store
                 .submit_audited_mutation_local(&prepared, &admitted, caller)
-                .await,
-        );
+                .await
+        } else {
+            store
+                .submit_audited_mutation(&prepared, &admitted, caller)
+                .await
+        };
+        let receipt = applied(admission);
         assert_eq!(
             receipt.state(),
             AuditOperationState::Committed { version: 1 }
@@ -432,13 +512,16 @@ async fn run_native_cost_case(audited: bool) {
             .expect("prepare exact ordinary effect");
         let handle = operation.recovery_handle().clone();
         let observation = observation::Observation::new(request_id);
-        store
-            .append_prepared_commit_local(operation)
-            .await
-            .expect("actual native committed result");
+        let committed = if local_only {
+            store.append_prepared_commit_local(operation).await
+        } else {
+            store.append_prepared_commit(operation).await
+        };
+        committed.expect("actual native committed result");
         (observation, Recovery::Ordinary(handle))
     };
     verify(&store, &provider, &aad, &plaintext, &expected, &recovery).await;
+    let before_reopen_counts = observation.snapshot();
     store.shutdown().await.expect("join native owners");
     drop(store);
     let backend = SqliteBackend::reopen_config_authority(options, key)
@@ -452,7 +535,7 @@ async fn run_native_cost_case(audited: bool) {
     verify(&reopened, &provider, &aad, &plaintext, &expected, &recovery).await;
     reopened.shutdown().await.expect("join reopened owners");
     let counts = observation.snapshot();
-    println!("CONFIG_CAPACITY_NATIVE_COST audited={audited} logical_bytes={} exact_readback=true authenticated_recovery=true retained_reopen=true counts={counts:?}", plaintext.len());
+    println!("CONFIG_CAPACITY_NATIVE_COST audited={audited} local_only={local_only} logical_bytes={} exact_readback=true authenticated_recovery=true retained_reopen=true counts={counts:?}", plaintext.len());
     assert!(
         counts.native_canonical_decodes > 0 && counts.native_fallback_decodes == 0,
         "CONFIG_CAPACITY_NATIVE_AUDITED_DECODE_RED: ordinary and audited canonical native entries must decode without a discarded fallback, after exact readback and reopen; counts={counts:?}"
@@ -505,10 +588,42 @@ async fn run_native_cost_case(audited: bool) {
         (0, 0),
         "CONFIG_CAPACITY_APPLY_OUTPUT_RED: native apply must count without allocating discarded JSON"
     );
+    let native_before_reopen = observation::AdmissionCounts {
+        scopes: 2,
+        preflight_calls: 2,
+        preflight_successes: 2,
+        capacity_calls: 2,
+        capacity_successes: 2,
+    };
     assert_eq!(
-        (counts.preflight_calls, counts.preflight_successes),
-        (1, 1),
-        "CONFIG_CAPACITY_FINAL_PREFLIGHT_RED: finalized command requires exactly one complete bounded preflight, never zero or two"
+        before_reopen_counts.native_validation, native_before_reopen,
+        "both native append and apply fully validate the actual request"
+    );
+    assert!(
+        counts.native_validation.scopes > before_reopen_counts.native_validation.scopes
+            && counts.native_validation.preflight_calls == counts.native_validation.scopes
+            && counts.native_validation.preflight_successes == counts.native_validation.scopes
+            && counts.native_validation.capacity_calls == counts.native_validation.scopes
+            && counts.native_validation.capacity_successes == counts.native_validation.scopes,
+        "native durable boundaries independently complete full admission; counts={counts:?}"
+    );
+    let admitted_once = observation::AdmissionCounts {
+        scopes: 1,
+        preflight_calls: 1,
+        preflight_successes: 1,
+        capacity_calls: 1,
+        capacity_successes: 1,
+    };
+    let reused = observation::AdmissionCounts {
+        scopes: 1,
+        ..observation::AdmissionCounts::default()
+    };
+    assert!(
+        counts.ingress == admitted_once
+            && counts.local_apply == reused
+            && (counts.preflight_calls, counts.preflight_successes) == (0, 0)
+            && (counts.finalized_capacity_calls, counts.finalized_capacity_successes) == (0, 0),
+        "CONFIG_CAPACITY_LOCAL_ADMISSION_REUSE_RED: one complete owned-input preflight/proof, zero repeated local/final passes, after real readback and retained reopen; counts={counts:?}"
     );
 }
 

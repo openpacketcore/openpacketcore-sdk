@@ -3,6 +3,7 @@
 mod audit;
 mod audit_continuity;
 mod config_capacity_admission;
+mod config_capacity_local_admission;
 mod recovery;
 
 pub use recovery::{
@@ -44,6 +45,8 @@ use opc_consensus::{
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use thiserror::Error;
+
+use config_capacity_local_admission::{LocalIntent, LocalMutation};
 
 use super::capacity_record::PreparedCapacityCommit;
 use super::preparation::{PreparationOwnership, SubmissionOwnership};
@@ -1370,32 +1373,13 @@ impl ConsensusConfigStore {
         ownership: SubmissionOwnership,
     ) -> Result<ConfigConsensusResponse, PersistError> {
         let result = async {
-            intent.validate_capacity(
-                self.inner.identity,
-                self.inner.backend.audit_key(),
-                self.capacity_profile(),
-            )?;
-            preflight_config_command_replication_budget(
-                self.inner.identity,
-                request_id,
-                &intent,
-                self.capacity_profile(),
-            )
-            .map_err(ForwardMutationRejection::into_persist_error)?;
+            let input = LocalIntent::new(self, request_id, intent)?;
             self.require_admission()?;
             let deadline = tokio::time::Instant::now()
                 .checked_add(self.inner.operation_timeout)
                 .ok_or_else(consensus_unavailable)?;
-            let request = ForwardMutationRequest {
-                request_id,
-                intent,
-                compatibility: self.peer_compatibility(),
-                budget: ForwardedBudget::from_deadline(deadline)?,
-            };
-            match self
-                .apply_owned_on_local_leader(request, deadline, ownership)
-                .await
-            {
+            let input = input.into_local(ForwardedBudget::from_deadline(deadline)?);
+            match self.apply_local_mutation(input, deadline, ownership).await {
                 ForwardMutationReply::Applied(response) => Ok(*response),
                 ForwardMutationReply::Rejected(rejection) => Err(rejection.into_persist_error()),
                 ForwardMutationReply::OutcomeUnknown => Err(PersistError::outcome_unknown()),
@@ -1431,18 +1415,7 @@ impl ConsensusConfigStore {
         intent: ConfigMutationIntent,
         ownership: SubmissionOwnership,
     ) -> Result<ConfigConsensusResponse, PersistError> {
-        intent.validate_capacity(
-            self.inner.identity,
-            self.inner.backend.audit_key(),
-            self.capacity_profile(),
-        )?;
-        preflight_config_command_replication_budget(
-            self.inner.identity,
-            request_id,
-            &intent,
-            self.capacity_profile(),
-        )
-        .map_err(ForwardMutationRejection::into_persist_error)?;
+        let input = LocalIntent::new(self, request_id, intent)?;
         self.require_admission()?;
         let deadline = tokio::time::Instant::now()
             .checked_add(self.inner.operation_timeout)
@@ -1469,18 +1442,12 @@ impl ConsensusConfigStore {
                 }
                 Err(error) => return Err(error),
             };
-            let request = ForwardMutationRequest {
-                request_id,
-                intent: intent.clone(),
-                compatibility: self.peer_compatibility(),
-                budget,
-            };
             let reply = if leader == self.inner.local_node_id {
-                self.apply_owned_on_local_leader(request, deadline, ownership.clone())
+                self.apply_local_mutation(input.local(budget), deadline, ownership.clone())
                     .await
             } else {
                 match self
-                    .call_mutation_peer(leader, request, deadline, ownership.clone())
+                    .call_mutation_peer(leader, input.forward(budget), deadline, ownership.clone())
                     .await
                 {
                     Ok(reply) => reply,
@@ -1565,25 +1532,20 @@ impl ConsensusConfigStore {
         deadline: tokio::time::Instant,
         ownership: SubmissionOwnership,
     ) -> ForwardMutationReply {
-        if request
-            .intent
-            .validate_capacity(
-                self.inner.identity,
-                self.inner.backend.audit_key(),
-                self.capacity_profile(),
-            )
-            .is_err()
-        {
-            return ForwardMutationReply::Rejected(ForwardMutationRejection::InvalidCommand);
-        }
-        if let Err(rejection) = preflight_config_command_replication_budget(
-            self.inner.identity,
-            request.request_id,
-            &request.intent,
-            self.capacity_profile(),
-        ) {
-            return ForwardMutationReply::Rejected(rejection);
-        }
+        self.apply_local_mutation(LocalMutation::received(request), deadline, ownership)
+            .await
+    }
+
+    async fn apply_local_mutation(
+        &self,
+        input: LocalMutation<'_>,
+        deadline: tokio::time::Instant,
+        ownership: SubmissionOwnership,
+    ) -> ForwardMutationReply {
+        let input = match input.validate(self) {
+            Ok(input) => input,
+            Err(rejection) => return ForwardMutationReply::Rejected(rejection),
+        };
         if self.require_admission().is_err() {
             return ForwardMutationReply::Unavailable;
         }
@@ -1613,35 +1575,10 @@ impl ConsensusConfigStore {
             }
             _ => return ForwardMutationReply::Unavailable,
         }
-        let command = super::ConfigConsensusCommand {
-            schema_version: config_command_revision(self.capacity_profile()),
-            identity: self.inner.identity,
-            request_id: request.request_id,
-            logical_time: self.inner.clock.now_utc(),
-            intent: request.intent,
+        let command = match input.finalize(self.inner.clock.now_utc()) {
+            Ok(command) => command,
+            Err(rejection) => return ForwardMutationReply::Rejected(rejection),
         };
-        // This observation spans only synchronous finalized-command admission.
-        #[cfg(all(test, target_os = "linux"))]
-        let cost_scope = config_capacity_cost_observation::Scope::finalized(command.request_id);
-        if command
-            .validate_for_profile(
-                self.inner.identity,
-                self.inner.backend.audit_key(),
-                self.capacity_profile(),
-            )
-            .is_err()
-        {
-            return ForwardMutationReply::Rejected(ForwardMutationRejection::InvalidCommand);
-        }
-        // The successful BoundedV1 validation above already ran this exact
-        // immutable command's complete encoding preflight.
-        if self.capacity_profile() != opc_crypto::ConfigCapacityProfile::BoundedV1
-            && !config_command_fits_replication_budget(&command, self.capacity_profile())
-        {
-            return ForwardMutationReply::Rejected(ForwardMutationRejection::CommandTooLarge);
-        }
-        #[cfg(all(test, target_os = "linux"))]
-        drop(cost_scope);
         #[cfg(all(test, target_os = "linux"))]
         let proposal_test_guard = {
             let hook = self

@@ -631,13 +631,15 @@ impl ConfigMutationIntent {
         profile: opc_crypto::ConfigCapacityProfile,
     ) -> Result<(), PersistError> {
         use opc_crypto::ConfigCapacityProfile;
+        #[cfg(all(test, target_os = "linux"))]
+        super::store::config_capacity_cost_observation::capacity_validation_started();
         if !matches!(
             profile,
             ConfigCapacityProfile::Legacy | ConfigCapacityProfile::BoundedV1
         ) {
             return Err(PersistError::corrupt_blob());
         }
-        match self {
+        let result = match self {
             Self::BoundedAppend {
                 commit, binding, ..
             } => binding.verify(&commit.record, identity, key, profile),
@@ -651,7 +653,12 @@ impl ConfigMutationIntent {
                 .verify_capacity(identity, key, profile)
                 .map(|_| ()),
             _ => Ok(()),
+        };
+        #[cfg(all(test, target_os = "linux"))]
+        if result.is_ok() {
+            super::store::config_capacity_cost_observation::capacity_validation_succeeded();
         }
+        result
     }
 
     /// Charge the actual complete encoding, excluding only the single
