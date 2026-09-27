@@ -33,6 +33,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- `opc-persist`: add an online audit recipient client and authority-owned
+  verification session without exporting signing keys. Verify actual received
+  pages, frozen-range completeness and fresh independent checkpoints; bind
+  results to the original caller, authority, request and expiry. Verification
+  retains no acknowledgement authority at the recipient. The application owns
+  authenticated transport and authorization. Refs #959.
+
 - `opc-gtpu-dataplane`: resolve an exact existing Active parent inside fenced
   child admission with `reconcile_bearer_under_active_parent`. Avoid a separate
   parent recovery lease while retaining selector reservations, fresh backend

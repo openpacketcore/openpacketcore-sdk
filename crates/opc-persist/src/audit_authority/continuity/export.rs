@@ -225,6 +225,48 @@ impl AuditExportSession {
         })
     }
 
+    // The checkpoint was authenticated against the current ledger by the store.
+    // Check any overlapping witness against the immutable rows without retaining
+    // a second full ledger or upgrading the freeze checkpoint's coverage.
+    pub(crate) fn matches_checkpoint(
+        &self,
+        checkpoint: &super::AuditCheckpoint,
+    ) -> Result<(), AuditAuthorityError> {
+        let manifest = &self.manifest.body;
+        let body = &checkpoint.body;
+        if body.identity != manifest.identity {
+            return Err(AuditAuthorityError::BindingMismatch);
+        }
+        if body.sequence < manifest.floor || body.sequence > manifest.sequence {
+            return Err(AuditAuthorityError::RollbackDetected);
+        }
+        let (root, anchor, epoch) = if body.sequence == manifest.floor {
+            (
+                manifest.predecessor,
+                manifest.floor_anchor,
+                manifest.floor_epoch,
+            )
+        } else {
+            let index = usize::try_from(body.sequence - manifest.floor - 1)
+                .map_err(|_| AuditAuthorityError::BindingMismatch)?;
+            let row = self
+                .rows
+                .get(index)
+                .ok_or(AuditAuthorityError::BindingMismatch)?;
+            let epoch = match &row.entry.payload {
+                crate::audit_authority::ledger::EntryPayload::KeyTransition(transition) => {
+                    transition.body.to_epoch
+                }
+                _ => row.proof.epoch,
+            };
+            (row.entry.mac, row.proof.signature, epoch)
+        };
+        if body.root_anchor != root || body.anchor != anchor || body.epoch_at_sequence != epoch {
+            return Err(AuditAuthorityError::BindingMismatch);
+        }
+        Ok(())
+    }
+
     /// Portable manifest. Recipients must verify it with their admitted key set.
     pub fn manifest(&self) -> &AuditExportManifest {
         &self.manifest
