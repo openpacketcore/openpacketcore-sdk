@@ -44,6 +44,9 @@ use serde::{Deserialize, Serialize};
 
 const LIFETIME: Duration = Duration::from_secs(60);
 
+#[path = "netconf_running_worker/revocation.rs"]
+mod revocation;
+
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 struct Settings {
     label: String,
@@ -163,6 +166,7 @@ struct Checkpoint {
     current: Mutex<Option<AuditCheckpoint>>,
     database: std::path::PathBuf,
     fail_after_effect: AtomicBool,
+    revocation: revocation::CheckpointControls,
 }
 
 #[async_trait::async_trait]
@@ -171,6 +175,7 @@ impl AuditCheckpointPort for Checkpoint {
         &self,
         _: ConfigConsensusIdentity,
     ) -> Result<Option<AuditCheckpoint>, AuditAuthorityError> {
+        self.revocation.before_load().await;
         Ok(self.current.lock().unwrap().clone())
     }
     async fn compare_advance(
@@ -179,6 +184,7 @@ impl AuditCheckpointPort for Checkpoint {
         expected: Option<AuditCheckpoint>,
         next: AuditCheckpoint,
     ) -> Result<AuditCheckpointAdvance, AuditAuthorityError> {
+        self.revocation.before_advance(&next).await?;
         if self.fail_after_effect.load(Ordering::Acquire) {
             let conn = rusqlite::Connection::open_with_flags(
                 &self.database,
@@ -291,6 +297,7 @@ impl Fixture {
             current: Mutex::new(None),
             database: directory.path().join("authority.sqlite"),
             fail_after_effect: AtomicBool::new(false),
+            revocation: revocation::CheckpointControls::default(),
         });
         let policy = AuditContinuityPolicy::new(
             AuditKeyRing::new(vec![AuditSigningKey::new(1, [0x38; 32]).unwrap()]).unwrap(),
@@ -494,6 +501,7 @@ impl ConfigAuthorizer for Authorizer {
 // retained adapter; no callback supplies an effect or an SDK receipt.
 struct PublicationStore {
     inner: Arc<Encrypted>,
+    checkpoint: Arc<Checkpoint>,
     fail_marker: AtomicBool,
     wrong_readback: Mutex<Option<TxId>>,
 }
@@ -511,9 +519,14 @@ impl ManagedDatastore<Settings> for PublicationStore {
         principal: &TrustedPrincipal,
         event: &AuditEvent,
     ) -> Result<opc_persist::AttestedConfigCommit, StoreError> {
-        self.inner
+        let attested = self
+            .inner
             .prepare_netconf_running_commit(commit, principal, event)
-            .await
+            .await?;
+        self.checkpoint
+            .revocation
+            .after_preparation(attested.record().tx_id);
+        Ok(attested)
     }
     async fn load_latest(&self) -> Result<Option<StoredConfig<Settings>>, StoreError> {
         self.inner.load_latest().await
@@ -560,6 +573,7 @@ impl Worker {
         let authorizer = Arc::new(Authorizer::default());
         let publication = Arc::new(PublicationStore {
             inner: f.encrypted.clone(),
+            checkpoint: f.checkpoint.clone(),
             fail_marker: AtomicBool::new(false),
             wrong_readback: Mutex::new(None),
         });
@@ -1152,6 +1166,7 @@ async fn running_worker_later_incarnation_keeps_known_result_and_publication_deb
     let authorizer = Arc::new(Authorizer::default());
     let publication = Arc::new(PublicationStore {
         inner: f.encrypted.clone(),
+        checkpoint: f.checkpoint.clone(),
         fail_marker: AtomicBool::new(false),
         wrong_readback: Mutex::new(None),
     });
