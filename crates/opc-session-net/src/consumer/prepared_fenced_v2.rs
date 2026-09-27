@@ -1765,3 +1765,516 @@ fn prepared_fenced_v2_status_retryable_before(
         _ => Ok(false),
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use std::collections::VecDeque;
+
+    use bytes::Bytes;
+    use opc_key::{KeyId, KeyPurpose, MemoryKeyProvider, Zeroizing, AES_256_GCM_SIV_KEY_LEN};
+    use opc_session_store::{
+        FenceToken, FencedTransitionLease, FencedTransitionMutation,
+        FencedTransitionMutationResult, FencedTransitionV2RecoveryJournalKey, Generation,
+        SessionKeyType,
+    };
+    use opc_types::{NetworkFunctionKind, TenantId, Timestamp};
+
+    use super::*;
+
+    const VOTERS: usize = 3;
+
+    #[derive(Clone)]
+    enum Step {
+        NotTransmitted,
+        Commit,
+        Unknown,
+        Reject(StoreError),
+        HangBeforeAdmission,
+        HangAfterAdmission,
+    }
+
+    /// Scripted V2 physical boundary that mimics the private adapter's
+    /// dispatch-admission latch on the handle's own route.
+    struct ScriptedV2Physical {
+        route: Arc<PreparedFencedTransitionV2Route>,
+        steps: StdMutex<VecDeque<Step>>,
+        voters: StdMutex<Vec<usize>>,
+        status: StdMutex<FencedTransitionV2Status>,
+        committed: StdMutex<Option<FencedTransitionOutcome>>,
+    }
+
+    impl ScriptedV2Physical {
+        fn new(route: Arc<PreparedFencedTransitionV2Route>, steps: Vec<Step>) -> Arc<Self> {
+            Arc::new(Self {
+                route,
+                steps: StdMutex::new(steps.into()),
+                voters: StdMutex::new(Vec::new()),
+                status: StdMutex::new(FencedTransitionV2Status::NotFound),
+                committed: StdMutex::new(None),
+            })
+        }
+
+        fn push(&self, step: Step) {
+            self.steps.lock().expect("steps").push_back(step);
+        }
+
+        fn voters(&self) -> Vec<usize> {
+            self.voters.lock().expect("voters").clone()
+        }
+
+        fn set_status(&self, status: FencedTransitionV2Status) {
+            *self.status.lock().expect("status") = status;
+        }
+    }
+
+    /// Public DTO construction: the guard and outcome constructors are
+    /// store-private, so tests build them through their frozen serde shapes.
+    fn lease_guard(
+        key: opc_session_store::SessionKey,
+        acquired_at: Timestamp,
+        expires_at: Timestamp,
+    ) -> LeaseGuard {
+        serde_json::from_value(serde_json::json!({
+            "key": key,
+            "owner": OwnerId::new("prepared-fenced-v2-unit-owner").expect("owner"),
+            "fence": FenceToken::new(1),
+            "acquired_at": acquired_at,
+            "expires_at": expires_at,
+            "credential_id": 1,
+        }))
+        .expect("public lease wire shape")
+    }
+
+    fn outcome_for(request: &FencedTransitionV2Request) -> FencedTransitionOutcome {
+        let recorded_at = Timestamp::now_utc();
+        let FencedTransitionLease::Renew { lease, ttl } = request.lease() else {
+            panic!("scripted tests use renewals");
+        };
+        let renewed = lease_guard(
+            lease.key().clone(),
+            lease.acquired_at(),
+            checked_session_deadline(recorded_at, *ttl).expect("lease expiry"),
+        );
+        let outcome: FencedTransitionOutcome = serde_json::from_value(serde_json::json!({
+            "lease": renewed,
+            "committed_generation": Generation::new(1),
+            "mutation": FencedTransitionMutationResult::Deleted,
+            "recorded_at": recorded_at,
+            "retained_until": checked_session_deadline(
+                recorded_at,
+                opc_session_store::FENCED_TRANSITION_OUTCOME_RETENTION,
+            )
+            .expect("retention deadline"),
+        }))
+        .expect("public outcome wire shape");
+        assert!(outcome.matches_v2_request(request));
+        outcome
+    }
+
+    #[async_trait::async_trait]
+    impl SessionBackend for ScriptedV2Physical {
+        fn fenced_transition_preserves_protected_payloads(&self) -> bool {
+            true
+        }
+
+        async fn capabilities(&self) -> BackendCapabilities {
+            BackendCapabilities::minimal()
+        }
+
+        async fn get(
+            &self,
+            _key: &opc_session_store::SessionKey,
+        ) -> Result<Option<opc_session_store::StoredSessionRecord>, StoreError> {
+            Err(authenticated_consumer_fenced_transition_only())
+        }
+
+        async fn fenced_transition_v2_capability(
+            &self,
+        ) -> Result<Option<FencedTransitionV2Capability>, StoreError> {
+            Ok(Some(FencedTransitionV2Capability::V2))
+        }
+
+        async fn fenced_transition_v2_history_state(
+            &self,
+        ) -> Result<FencedTransitionV2HistoryState, StoreError> {
+            FencedTransitionV2HistoryState::new(
+                Some(opc_session_store::FencedTransitionV2HistoryEpoch::new(1).expect("epoch")),
+                None,
+                None,
+                0,
+                1,
+                0,
+                0,
+            )
+        }
+
+        async fn fenced_transition_v2_effect(
+            &self,
+            request: FencedTransitionV2Request,
+        ) -> FencedTransitionV2Effect<Result<FencedTransitionOutcome, StoreError>> {
+            self.voters
+                .lock()
+                .expect("voters")
+                .push(self.route.mutation_voter(VOTERS));
+            let step = self
+                .steps
+                .lock()
+                .expect("steps")
+                .pop_front()
+                .expect("scripted step");
+            match step {
+                Step::NotTransmitted => FencedTransitionV2Effect::NotTransmitted(
+                    StoreError::BackendUnavailable("scripted pre-write failure".into()),
+                ),
+                Step::Commit => {
+                    self.route.admit_dispatch();
+                    let outcome = outcome_for(&request);
+                    *self.committed.lock().expect("committed") = Some(outcome.clone());
+                    FencedTransitionV2Effect::Resolved(Ok(outcome))
+                }
+                Step::Unknown => {
+                    self.route.admit_dispatch();
+                    FencedTransitionV2Effect::OutcomeUnknown {
+                        request_ids: vec![request.request_id()],
+                    }
+                }
+                Step::Reject(error) => {
+                    self.route.admit_dispatch();
+                    FencedTransitionV2Effect::Resolved(Err(error))
+                }
+                Step::HangBeforeAdmission => std::future::pending().await,
+                Step::HangAfterAdmission => {
+                    self.route.admit_dispatch();
+                    std::future::pending().await
+                }
+            }
+        }
+
+        async fn fenced_transition_v2_status(
+            &self,
+            _request: &FencedTransitionV2Request,
+        ) -> Result<FencedTransitionV2Status, StoreError> {
+            Ok(self.status.lock().expect("status").clone())
+        }
+
+        async fn compare_and_set(
+            &self,
+            _operation: CompareAndSet,
+        ) -> Result<CompareAndSetResult, StoreError> {
+            Err(authenticated_consumer_fenced_transition_only())
+        }
+
+        async fn delete_fenced(&self, _lease: &LeaseGuard) -> Result<(), StoreError> {
+            Err(authenticated_consumer_fenced_transition_only())
+        }
+
+        async fn refresh_ttl(&self, _lease: &LeaseGuard, _ttl: Duration) -> Result<(), StoreError> {
+            Err(authenticated_consumer_fenced_transition_only())
+        }
+
+        async fn batch(&self, _ops: Vec<SessionOp>) -> Result<Vec<SessionOpResult>, StoreError> {
+            Err(authenticated_consumer_fenced_transition_only())
+        }
+    }
+
+    struct Harness {
+        _directory: tempfile::TempDir,
+        physical: Arc<ScriptedV2Physical>,
+        backend: Arc<dyn ProtectedFencedTransitionV2Backend>,
+        route: Arc<PreparedFencedTransitionV2Route>,
+        request_id: FencedTransitionRequestId,
+    }
+
+    const ORIGIN: usize = 1;
+
+    fn tenant() -> TenantId {
+        TenantId::from_static("prepared-fenced-v2-unit")
+    }
+
+    fn delete_request(request_id: FencedTransitionRequestId) -> FencedTransitionRequest {
+        let key = opc_session_store::SessionKey {
+            tenant: tenant(),
+            nf_kind: NetworkFunctionKind::smf(),
+            key_type: SessionKeyType::PduSession,
+            stable_id: Bytes::from_static(b"prepared-fenced-v2-unit")
+                .try_into()
+                .expect("stable ID"),
+        };
+        let acquired_at = Timestamp::now_utc();
+        let guard = lease_guard(
+            key,
+            acquired_at,
+            checked_session_deadline(acquired_at, Duration::from_secs(60)).expect("expiry"),
+        );
+        FencedTransitionRequest::new(
+            request_id,
+            FencedTransitionLease::renew(guard, Duration::from_secs(60)).expect("renewal"),
+            FencedTransitionMutation::delete(Generation::new(1)),
+        )
+        .expect("delete request")
+    }
+
+    async fn harness(steps: Vec<Step>) -> Harness {
+        let directory = tempfile::tempdir().expect("journal directory");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+
+            std::fs::set_permissions(directory.path(), std::fs::Permissions::from_mode(0o700))
+                .expect("private journal directory");
+        }
+        let journal = Arc::new(
+            FencedTransitionV2RecoveryJournal::create_new(
+                directory.path().join("recovery.sqlite3"),
+                FencedTransitionV2RecoveryJournalKey::from_bytes([0x71; 32]),
+            )
+            .expect("recovery journal"),
+        );
+        let provider = Arc::new(MemoryKeyProvider::new());
+        provider
+            .insert_active_key(
+                KeyId::new("prepared-fenced-v2-unit").expect("key ID"),
+                KeyPurpose::Session,
+                tenant(),
+                Zeroizing::new([0x72; AES_256_GCM_SIV_KEY_LEN]),
+            )
+            .expect("active key");
+        let route = Arc::new(PreparedFencedTransitionV2Route::new(ORIGIN));
+        let physical = ScriptedV2Physical::new(Arc::clone(&route), steps);
+        let erased: Arc<dyn SessionBackend> = physical.clone();
+        let backend: Arc<dyn ProtectedFencedTransitionV2Backend> = Arc::new(
+            EncryptingSessionBackend::new(erased, provider, "prepared-fenced-v2-unit")
+                .with_fenced_transition_v2_recovery_journal(journal)
+                .with_fenced_transition_v2_journal_scope(
+                    FencedTransitionV2JournalScope::from_bytes([0x73; 32]),
+                ),
+        );
+        Harness {
+            _directory: directory,
+            physical,
+            backend,
+            route,
+            request_id: FencedTransitionRequestId::from_bytes([0x74; 16]),
+        }
+    }
+
+    fn budget() -> PreparedCheckpointBudget {
+        PreparedCheckpointBudget::new(
+            tokio::time::Instant::now() + Duration::from_secs(5),
+            Duration::from_millis(100),
+        )
+        .expect("budget")
+    }
+
+    impl Harness {
+        async fn prepare(&self) -> PersistentPreparedFencedTransitionV2Token {
+            let prepared = self
+                .backend
+                .prepare_protected_fenced_transition_v2(delete_request(self.request_id))
+                .await
+                .expect("prepare");
+            PersistentPreparedFencedTransitionV2Token::new(
+                Arc::clone(&self.backend),
+                prepared,
+                budget(),
+                VOTERS,
+                Arc::clone(&self.route),
+                PreparedRequestState::new(0),
+                true,
+            )
+        }
+
+        async fn retained(&self) -> usize {
+            self.backend
+                .retained_protected_fenced_transitions_v2()
+                .await
+                .expect("retained count")
+        }
+    }
+
+    #[tokio::test]
+    async fn v2_handle_rotates_only_after_proven_pre_write_failure_and_discards_an_unsent_row() {
+        let harness = harness(vec![
+            Step::NotTransmitted,
+            Step::NotTransmitted,
+            Step::NotTransmitted,
+        ])
+        .await;
+        let token = harness.prepare().await;
+        assert_eq!(harness.retained().await, 1);
+        assert_eq!(
+            token.execute_once().await,
+            Err(FencedTransitionExecuteError::NotTransmitted)
+        );
+        assert_eq!(
+            harness.physical.voters(),
+            vec![ORIGIN, (ORIGIN + 1) % VOTERS, (ORIGIN + 2) % VOTERS],
+            "one attempt per canonical voter, starting at the origin"
+        );
+        assert_eq!(
+            harness.retained().await,
+            0,
+            "no copy was sent, so the handle removes its own row"
+        );
+        assert_eq!(
+            token
+                .status_once(tokio::time::Instant::now() + Duration::from_secs(1))
+                .await,
+            Err(SessionConsumerPreparedFencedTransitionStatusError::NotExecuted)
+        );
+        assert_eq!(
+            token.execute_once().await,
+            Err(FencedTransitionExecuteError::NotTransmitted),
+            "a terminal handle never dispatches again"
+        );
+    }
+
+    #[tokio::test]
+    async fn v2_handle_commit_after_rotation_is_resolved_and_releasable() {
+        let harness = harness(vec![Step::NotTransmitted, Step::Commit]).await;
+        let token = harness.prepare().await;
+        token
+            .execute_once()
+            .await
+            .expect("the second canonical voter commits");
+        assert_eq!(
+            harness.physical.voters(),
+            vec![ORIGIN, (ORIGIN + 1) % VOTERS]
+        );
+        assert_eq!(
+            harness.retained().await,
+            1,
+            "a committed row stays until release"
+        );
+        token.release_resolved().await.expect("release");
+        assert_eq!(harness.retained().await, 0);
+    }
+
+    #[tokio::test]
+    async fn v2_handle_possible_send_is_receipt_only_until_a_terminal_status() {
+        let harness = harness(vec![Step::Unknown]).await;
+        let token = harness.prepare().await;
+        assert_eq!(
+            token.execute_once().await,
+            Err(FencedTransitionExecuteError::OutcomeUnknown {
+                request_id: harness.request_id
+            }),
+            "ambiguity names the caller-stable ID"
+        );
+        assert_eq!(
+            token.execute_once().await,
+            Err(FencedTransitionExecuteError::NotTransmitted),
+            "a possible send permanently removes dispatch authority"
+        );
+        assert_eq!(harness.physical.voters().len(), 1);
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(1);
+        assert_eq!(
+            token.status_once(deadline).await,
+            Ok(FencedTransitionV2Status::NotFound),
+            "status is read-only and NotFound stays nonterminal"
+        );
+        assert_eq!(
+            token.release_resolved().await,
+            Err(SessionConsumerFencedTransitionV2ReleaseError::NotResolved)
+        );
+        assert_eq!(harness.retained().await, 1);
+        harness
+            .physical
+            .set_status(FencedTransitionV2Status::EpochNotActive);
+        assert_eq!(
+            token.status_until_terminal(deadline).await,
+            Ok(FencedTransitionV2Status::EpochNotActive),
+            "a closed epoch proves the request can never bind"
+        );
+        token
+            .release_resolved()
+            .await
+            .expect("a terminal exclusion permits release");
+        assert_eq!(harness.retained().await, 0);
+        assert_eq!(
+            harness.physical.voters().len(),
+            1,
+            "status never dispatched"
+        );
+    }
+
+    #[tokio::test]
+    async fn v2_handle_definitive_unbound_rejection_discards_its_row() {
+        let harness = harness(vec![Step::Reject(
+            StoreError::FencedTransitionHistoryEpochNotActive,
+        )])
+        .await;
+        let token = harness.prepare().await;
+        assert_eq!(
+            token.execute_once().await,
+            Err(FencedTransitionExecuteError::Rejected(
+                StoreError::FencedTransitionHistoryEpochNotActive
+            ))
+        );
+        assert_eq!(harness.retained().await, 0);
+        token
+            .release_resolved()
+            .await
+            .expect("an already removed row releases idempotently");
+    }
+
+    #[tokio::test]
+    async fn v2_handle_cancellation_before_dispatch_admission_returns_to_ready() {
+        let harness = harness(vec![Step::HangBeforeAdmission]).await;
+        let token = harness.prepare().await;
+        assert!(
+            tokio::time::timeout(Duration::from_millis(50), token.execute_once())
+                .await
+                .is_err(),
+            "the scripted boundary never completes"
+        );
+        assert!(!harness.route.may_have_dispatched());
+        harness.physical.push(Step::Commit);
+        token
+            .execute_once()
+            .await
+            .expect("a proven pre-dispatch cancellation keeps dispatch authority");
+    }
+
+    #[tokio::test]
+    async fn v2_handle_cancellation_after_dispatch_admission_is_receipt_only() {
+        let harness = harness(vec![Step::HangAfterAdmission]).await;
+        let token = harness.prepare().await;
+        assert!(
+            tokio::time::timeout(Duration::from_millis(50), token.execute_once())
+                .await
+                .is_err()
+        );
+        assert!(harness.route.may_have_dispatched());
+        assert_eq!(
+            token.execute_once().await,
+            Err(FencedTransitionExecuteError::NotTransmitted),
+            "a cancelled possible send never regains mutation authority"
+        );
+        assert_eq!(harness.physical.voters().len(), 1);
+        assert_eq!(
+            token
+                .status_once(tokio::time::Instant::now() + Duration::from_secs(1))
+                .await,
+            Ok(FencedTransitionV2Status::NotFound),
+            "the handle keeps receipt authority"
+        );
+        assert_eq!(harness.retained().await, 1);
+    }
+
+    #[tokio::test]
+    async fn v2_handle_rejects_a_missing_row_before_any_dispatch() {
+        let harness = harness(vec![]).await;
+        let token = harness.prepare().await;
+        assert!(harness
+            .backend
+            .discard_protected_fenced_transition_v2(&token.prepared)
+            .await
+            .expect("remove the row out from under the handle"));
+        assert_eq!(
+            token.execute_once().await,
+            Err(FencedTransitionExecuteError::NotTransmitted)
+        );
+        assert!(harness.physical.voters().is_empty());
+    }
+}
