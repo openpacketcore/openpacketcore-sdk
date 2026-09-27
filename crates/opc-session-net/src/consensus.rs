@@ -48,6 +48,11 @@ use crate::protocol::{
     SESSION_CONSENSUS_ALPN, SESSION_CONSENSUS_TRANSPORT_REVISION,
 };
 
+/// Explicitly enabled transport buffer qualification observations.
+#[cfg(feature = "test-control")]
+#[doc(hidden)]
+pub mod capacity_observation;
+
 const DEFAULT_CONSENSUS_IDLE_TIMEOUT: Duration =
     DURABLE_CONSENSUS_TIMING_PROFILE.server_idle_timeout();
 const DEFAULT_CONSENSUS_RPC_TIMEOUT: Duration =
@@ -1917,6 +1922,8 @@ pub struct RemoteSessionConsensusPeer {
     connection_pool: Arc<ConsensusConnectionPool>,
     lifecycle_policy: ConnectionLifecyclePolicy,
     reauthentication: SessionReauthenticationControl,
+    #[cfg(feature = "test-control")]
+    buffer_observation: Option<Arc<capacity_observation::ConsensusBufferObservation>>,
 }
 
 impl fmt::Debug for RemoteSessionConsensusPeer {
@@ -2038,7 +2045,24 @@ impl RemoteSessionConsensusPeer {
             connection_pool: Arc::new(ConsensusConnectionPool::new(lifecycle_policy)),
             lifecycle_policy,
             reauthentication: SessionReauthenticationControl::new(),
+            #[cfg(feature = "test-control")]
+            buffer_observation: None,
         }
+    }
+
+    /// Attach an opt-in qualification observer to this peer and its clones.
+    ///
+    /// This records negotiated large append/snapshot payloads and outer frames.
+    /// It neither observes queued/inbound/native owners nor changes deadlines.
+    #[cfg(feature = "test-control")]
+    #[doc(hidden)]
+    #[must_use]
+    pub fn with_buffer_observation(
+        mut self,
+        observation: Arc<capacity_observation::ConsensusBufferObservation>,
+    ) -> Self {
+        self.buffer_observation = Some(observation);
+        self
     }
 
     /// Set the negotiated encoded request/response frame budget.
@@ -2793,6 +2817,18 @@ impl RemoteSessionConsensusPeer {
     ) -> Result<SessionConsensusWireResponse, SessionConsensusPeerError> {
         let call_id = uuid::Uuid::new_v4();
         let request = SessionConsensusTransportRequest::from_wire_call(call_id, request)?;
+        #[cfg(feature = "test-control")]
+        let owner = match (&self.buffer_observation, &request) {
+            (Some(observation), SessionConsensusTransportRequest::Call { request, .. }) => {
+                observation.observe_call(
+                    request.sender,
+                    self.binding.remote_consensus_node_id(),
+                    request.family,
+                    &request.payload,
+                )
+            }
+            _ => None,
+        };
         let mut loss = ConsensusNegotiatedLoss {
             reconnect_gate: &self.connection_pool.reconnect_gate,
             epoch: self.connection_epoch(connection),
@@ -2821,6 +2857,8 @@ impl RemoteSessionConsensusPeer {
             response.validate()?;
             Ok(response)
         };
+        #[cfg(feature = "test-control")]
+        let call = capacity_observation::scope(owner.as_ref(), call);
         tokio::pin!(call);
         let mut lifecycle = connection.lifecycle.clone();
         let mut reauthentication_rx = self.reauthentication.subscribe();
