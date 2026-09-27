@@ -347,7 +347,7 @@ fn pruning_requires_export_checkpoint_and_expired_whole_operations_before_key_re
         .is_none());
     assert_eq!(
         state.admit(&root(), &handle, 201),
-        Err(AuditAuthorityError::Expired)
+        Err(AuditAuthorityError::Expired.into())
     );
 }
 

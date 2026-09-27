@@ -117,6 +117,10 @@ struct Fixture {
 }
 impl Fixture {
     async fn new() -> Self {
+        Self::new_with_durability(RetainedConfigDurability::Ephemeral).await
+    }
+
+    async fn new_with_durability(durability: RetainedConfigDurability) -> Self {
         let dir = tempfile::tempdir().unwrap();
         let node = super::super::ConfigConsensusNodeId::new(1).unwrap();
         let identity = super::super::ConfigConsensusIdentity::new(
@@ -132,7 +136,7 @@ impl Fixture {
                 RetainedConfigBinding::new(topology.clone(), [0x41; 32], [0x42; 32])
                     .unwrap()
                     .with_profile(RetainedConfigProfile::NetconfTargetsV1),
-                RetainedConfigDurability::Ephemeral,
+                durability,
                 64 * 1024 * 1024,
                 Duration::from_secs(30),
             )
@@ -1467,3 +1471,7 @@ async fn running_replacement_after_settled_confirmation_rollback_uses_current_he
     f.assert_head(record(&next), next_plaintext).await;
     f.close().await;
 }
+
+#[cfg(target_os = "linux")]
+#[path = "running_replacement_native_recovery.rs"]
+mod native_recovery;

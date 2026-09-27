@@ -11658,3 +11658,6 @@ mod cleanup_retirement_tests;
 
 #[path = "cleanup_running_base.rs"]
 mod cleanup_running_base;
+
+#[path = "target_allocation_boundary.rs"]
+mod target_allocation_boundary;

@@ -119,24 +119,53 @@ impl LedgerState {
         &self,
         checkpoint: &AuditCheckpoint,
     ) -> Result<(), AuditAuthorityError> {
+        self.matches_prefix(
+            checkpoint.body.identity,
+            checkpoint.body.sequence,
+            checkpoint.body.root_anchor,
+            checkpoint.body.anchor,
+            checkpoint.body.epoch_at_sequence,
+        )
+    }
+
+    pub(crate) fn matches_export_manifest(
+        &self,
+        manifest: &super::AuditExportManifest,
+    ) -> Result<(), AuditAuthorityError> {
+        self.matches_prefix(
+            manifest.body.identity,
+            manifest.body.sequence,
+            manifest.body.terminal,
+            manifest.body.anchor,
+            manifest.body.active_epoch,
+        )
+    }
+
+    fn matches_prefix(
+        &self,
+        identity: ConfigConsensusIdentity,
+        sequence: u64,
+        root_anchor: [u8; 32],
+        signing_anchor: [u8; 32],
+        epoch_at_sequence: u64,
+    ) -> Result<(), AuditAuthorityError> {
         let chain = self
             .continuity
             .as_ref()
             .ok_or(AuditAuthorityError::Unavailable)?;
-        let body = &checkpoint.body;
-        if body.identity != self.identity {
+        if identity != self.identity {
             return Err(AuditAuthorityError::BindingMismatch);
         }
-        if body.sequence > self.sequence {
+        if sequence > self.sequence {
             return Err(AuditAuthorityError::RollbackDetected);
         }
-        if body.sequence < self.floor {
+        if sequence < self.floor {
             return Err(AuditAuthorityError::RollbackDetected);
         }
-        let (root, anchor, epoch) = if body.sequence == self.floor {
+        let (root, anchor, epoch) = if sequence == self.floor {
             (self.predecessor, chain.floor_anchor, chain.floor_epoch)
         } else {
-            let index = usize::try_from(body.sequence - self.floor - 1)
+            let index = usize::try_from(sequence - self.floor - 1)
                 .map_err(|_| AuditAuthorityError::BindingMismatch)?;
             let entry = self
                 .entries
@@ -152,7 +181,7 @@ impl LedgerState {
             };
             (entry.mac, row.signature, epoch)
         };
-        if body.root_anchor != root || body.anchor != anchor || body.epoch_at_sequence != epoch {
+        if root_anchor != root || signing_anchor != anchor || epoch_at_sequence != epoch {
             return Err(AuditAuthorityError::BindingMismatch);
         }
         Ok(())

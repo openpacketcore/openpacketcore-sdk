@@ -999,6 +999,52 @@ async fn public_audited_ledger_lifetime_with_transferred_owners(
         println!("CONFIG_CAPACITY_TRANSFERRED_OWNERS_LIFECYCLE exact_readback=true original_recovery=true retained_reopen=true mandatory_checkpoint=true");
     }
     let measured = observation.finish();
+    // The complete real native lifecycle, exact readback, original recovery and
+    // retained reopen above must finish before a growth control can fail here.
+    assert_eq!(
+        measured.mutation_owners, 1,
+        "one real native mutable ledger"
+    );
+    let initial = measured.mutation_initial.expect("native decoded ledger");
+    let final_collections = measured.mutation_final.expect("native mutated ledger");
+    let before_entries = 3070 + transition_rows(expanded);
+    assert_eq!(
+        initial.lengths,
+        [
+            before_entries,
+            1024,
+            if continuity { before_entries } else { 0 }
+        ],
+        "LEDGER_GROWTH_NATIVE_PREFIX: actual admitted prefix"
+    );
+    assert_eq!(
+        initial.capacities, initial.lengths,
+        "LEDGER_GROWTH_NATIVE_EXACT_DECODE: real decoded collection capacities"
+    );
+    assert_eq!(
+        final_collections.lengths,
+        [
+            before_entries + 1,
+            1024,
+            if continuity { before_entries + 1 } else { 0 },
+        ],
+        "LEDGER_GROWTH_NATIVE_OUTCOME: one real authoritative outcome"
+    );
+    println!(
+        "CONFIG_CAPACITY_LEDGER_GROWTH_NATIVE initial={initial:?} final={final_collections:?} exact_readback=true original_recovery=true retained_reopen=true"
+    );
+    assert_eq!(
+        final_collections.capacities[0], final_collections.lengths[0],
+        "LEDGER_GROWTH_NATIVE_ENTRIES: append must reserve its actual next element"
+    );
+    assert_eq!(
+        final_collections.capacities[1], final_collections.lengths[1],
+        "LEDGER_GROWTH_NATIVE_OPERATIONS: retained operations do not grow on outcome"
+    );
+    assert_eq!(
+        final_collections.capacities[2], final_collections.lengths[2],
+        "LEDGER_GROWTH_NATIVE_ROWS: sealing must reserve its actual missing rows"
+    );
     // These legal original owners actually survive the measured native apply.
     // Test-only plaintext/decryption witnesses are outside the production inventory.
     assert!(!recovery.is_empty());

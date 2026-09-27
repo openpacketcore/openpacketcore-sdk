@@ -1089,3 +1089,5 @@ async fn target_runtime_prepares_and_retains_one_native_device_operation() {
     assert!(reopened.load_latest().await.unwrap().is_none());
     reopened.shutdown().await.unwrap();
 }
+
+mod recipient_online;

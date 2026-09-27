@@ -423,3 +423,100 @@ fn config_capacity_native_json_audited_preserves_fallback_and_wrong_span_rejecti
     whitespace.extend_from_slice(b" \n\t");
     require_compatible(&whitespace);
 }
+
+// These are codec compatibility checks, not fabricated authority successes.
+// The request-specific native cost tests exercise encryption, authentication,
+// committed readback, original recovery and retained reopen before this bound.
+#[cfg(target_os = "linux")]
+#[test]
+fn config_capacity_native_json_comparison_reuses_validated_ciphertext_span() {
+    use crate::consensus::store::config_capacity_cost_observation::Observation;
+
+    for source in [fixture(16_384, None), audited_fixture(16_384)] {
+        let EntryPayload::Normal(command) = &source.payload else {
+            unreachable!()
+        };
+        let observation = Observation::new(command.request_id);
+        let bytes = serde_json::to_vec(&source).unwrap();
+        let key = bytes
+            .windows(FIELD.len())
+            .position(|part| part == FIELD)
+            .unwrap();
+        let (extent, count) = array_extent(&bytes[key + FIELD.len()..]).unwrap();
+        assert_eq!(count, 16_384);
+        let actual = entry(&bytes).expect("canonical bounded native entry");
+        assert!(actual == original(&bytes).unwrap());
+        assert_eq!(serde_json::to_vec(&actual).unwrap(), bytes);
+        let counts = observation.snapshot();
+        assert_eq!(counts.native_canonical_decodes, 1);
+        assert_eq!(counts.native_fallback_decodes, 0);
+        assert_eq!(counts.native_canonical_compares, 1);
+        assert!(counts.native_canonical_compare_writes > 0);
+        assert_eq!(counts.native_canonical_compare_ciphertext_bytes, extent);
+        assert_eq!(
+            counts.native_canonical_compare_largest_writes,
+            extent,
+            "CONFIG_CAPACITY_NATIVE_CANONICAL_SPAN_RED: observe the actual comparison write, after independent full-value and exact-byte equality"
+        );
+    }
+}
+
+#[test]
+fn config_capacity_native_json_span_reuse_preserves_all_fields_and_tokens() {
+    for source in [fixture(16_384, None), audited_fixture(16_384)] {
+        let bytes = serde_json::to_vec(&source).unwrap();
+        let body = std::str::from_utf8(&bytes).unwrap();
+        let start = body.find("\"encrypted_blob\":").unwrap() + FIELD.len();
+        let (extent, _) = array_extent(&bytes[start..]).unwrap();
+        let end = start + extent;
+
+        // Valid changed ciphertext remains changed data; the codec confers no
+        // authentication. Native proof tests separately reject forged bindings.
+        let mut changed_value = body.to_owned();
+        changed_value.replace_range(start + 1..start + 2, "1");
+        require_compatible(changed_value.as_bytes());
+        let decoded = entry(changed_value.as_bytes()).unwrap();
+        assert!(decoded != source);
+        assert_eq!(
+            serde_json::to_vec(&decoded).unwrap(),
+            changed_value.as_bytes()
+        );
+
+        // This field follows the ciphertext. Every suffix byte must still be
+        // compared against the bounded DTO's canonical representation.
+        let changed_metadata =
+            body.replacen("\"rollback_point\":true", "\"rollback_point\":false", 1);
+        assert_ne!(changed_metadata, body);
+        require_compatible(changed_metadata.as_bytes());
+        let decoded = entry(changed_metadata.as_bytes()).unwrap();
+        assert!(decoded != source);
+        assert_eq!(
+            serde_json::to_vec(&decoded).unwrap(),
+            changed_metadata.as_bytes()
+        );
+
+        // A fully canonical but unrelated equal-sized span cannot bind the
+        // selected typed ciphertext; preserve the original fallback behavior.
+        let mut wrong_span = body.to_owned();
+        wrong_span.insert_str(
+            1,
+            &format!("\"unused\":{{\"encrypted_blob\":{}}},", &body[start..end]),
+        );
+        assert!(canonical_entry(wrong_span.as_bytes()).unwrap().is_none());
+        require_compatible(wrong_span.as_bytes());
+
+        // Exercise malformed tokens at the end, beyond a long valid prefix.
+        let last = body[..end - 1].rfind(',').unwrap() + 1;
+        for token in ["256", "-1", "00", "1.0", "null", "\"1\"", "[]"] {
+            let mut malformed = body.to_owned();
+            malformed.replace_range(last..end - 1, token);
+            assert!(entry(malformed.as_bytes()).is_err());
+            require_compatible(malformed.as_bytes());
+        }
+        let mut duplicate_suffix = body.to_owned();
+        duplicate_suffix.insert_str(end, ",\"encrypted_blob\":[]");
+        assert!(entry(duplicate_suffix.as_bytes()).is_err());
+        require_compatible(duplicate_suffix.as_bytes());
+        require_compatible(&serde_json::to_vec_pretty(&source).unwrap());
+    }
+}

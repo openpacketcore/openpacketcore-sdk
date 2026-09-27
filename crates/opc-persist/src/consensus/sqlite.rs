@@ -3329,6 +3329,8 @@ fn apply_audited_mutation_sync(
     }
     conn.execute_batch("RELEASE audited_config_effect")
         .map_err(db_error)?;
+    #[cfg(all(test, target_os = "linux"))]
+    config_capacity_ledger_fault_tests::effect_released(conn, request_id);
     let state = if result.is_ok() {
         let version: u64 = conn
             .query_row(
@@ -6464,3 +6466,7 @@ fn apply_audited_mutation_for_profile_sync(
         cancellation,
     )
 }
+
+#[cfg(all(test, target_os = "linux"))]
+#[path = "sqlite/config_capacity_ledger_fault_tests.rs"]
+mod config_capacity_ledger_fault_tests;

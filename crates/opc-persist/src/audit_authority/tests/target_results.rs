@@ -103,7 +103,7 @@ fn target_results_retain_exact_outcome_and_reserved_terminal_through_encoding() 
             );
             assert_eq!(
                 ledger.resolve(&key(), &handle, AuditOperationState::Rejected),
-                Err(AuditAuthorityError::BindingMismatch)
+                Err(AuditAuthorityError::BindingMismatch.into())
             );
             ledger.resolve(&key(), &handle, state(outcome)).unwrap();
             ledger.acknowledge_terminal(&key(), &handle).unwrap();
@@ -161,7 +161,7 @@ fn target_results_require_netconf_mutation_and_matching_authority() {
         ledger.admit(&key(), &handle, 110).unwrap();
         assert_eq!(
             ledger.resolve(&key(), &handle, result),
-            Err(AuditAuthorityError::BindingMismatch)
+            Err(AuditAuthorityError::BindingMismatch.into())
         );
         assert_eq!(ledger.sequence, 1);
         assert_eq!(ledger.operations[0].state, AuditOperationState::Intent);
@@ -249,7 +249,7 @@ fn target_terminal_debt_survives_restore_until_independent_checkpoint() {
         ledger.seal_continuity(Some(&keys)).unwrap();
         assert_eq!(
             ledger.admit(&key(), &second, 110),
-            Err(AuditAuthorityError::RecoveryRequired)
+            Err(AuditAuthorityError::RecoveryRequired.into())
         );
         ledger.acknowledge_terminal(&key(), &first).unwrap();
         ledger.seal_continuity(Some(&keys)).unwrap();
@@ -259,7 +259,7 @@ fn target_terminal_debt_survives_restore_until_independent_checkpoint() {
         recovered.validate_continuity(Some(&keys)).unwrap();
         assert_eq!(
             recovered.admit(&key(), &second, 110),
-            Err(AuditAuthorityError::RecoveryRequired)
+            Err(AuditAuthorityError::RecoveryRequired.into())
         );
         assert_eq!(
             recovered

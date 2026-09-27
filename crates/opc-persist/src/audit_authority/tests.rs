@@ -224,7 +224,7 @@ fn full_ledger_preserves_reserved_outcomes_and_idempotent_receipts() {
     ledger.admit(&key(), &handle, 110).unwrap();
     assert_eq!(
         ledger.append_event(&key(), event()),
-        Err(AuditAuthorityError::Full)
+        Err(AuditAuthorityError::Full.into())
     );
     assert_eq!(ledger.sequence, 1);
     ledger.admit(&key(), &handle, 150).unwrap();
@@ -263,7 +263,7 @@ fn full_ledger_preserves_reserved_outcomes_and_idempotent_receipts() {
     assert!(receipt.terminal_recorded());
     assert_eq!(
         ledger.admit(&key(), &super::tests::handle(2), 150),
-        Err(AuditAuthorityError::BindingMismatch)
+        Err(AuditAuthorityError::BindingMismatch.into())
     );
 }
 
@@ -279,7 +279,7 @@ fn expired_unadmitted_handle_cannot_become_fresh_after_restart() {
     let mut restored: LedgerState = serde_json::from_slice(&bytes).unwrap();
     assert_eq!(
         restored.admit(&key(), &handle, 200),
-        Err(AuditAuthorityError::Expired)
+        Err(AuditAuthorityError::Expired.into())
     );
     assert_eq!(restored.sequence, 0);
     assert!(restored

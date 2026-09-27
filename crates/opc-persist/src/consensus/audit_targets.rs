@@ -1724,9 +1724,10 @@ pub(crate) fn retire_cleanup_sync(
         return Ok(Err(AuditAuthorityError::RecoveryRequired));
     }
     let mut candidate = ledger.clone();
-    let result = candidate
-        .admit_target(key, prepared, now)
-        .and_then(|()| candidate.resolve(key, prepared.handle(), AuditOperationState::Rejected));
+    let result =
+        super::audit::mutation_result(candidate.admit_target(key, prepared, now).and_then(|()| {
+            candidate.resolve(key, prepared.handle(), AuditOperationState::Rejected)
+        }))?;
     if result.is_ok() {
         // No target/configuration row is changed. The outer consensus apply
         // seals, validates and writes this exact retained rejection atomically.
@@ -1782,7 +1783,7 @@ pub(crate) fn preflight_target_sync(
         return Ok(Err(AuditAuthorityError::RecoveryRequired));
     }
     let mut candidate = ledger.clone();
-    if let Err(error) = candidate.admit_target(key, prepared, now) {
+    if let Err(error) = super::audit::mutation_result(candidate.admit_target(key, prepared, now))? {
         return Ok(Err(error));
     }
     if let Err(error) = state.reduce(conn, prepared, &candidate, keys, now) {
@@ -4173,7 +4174,7 @@ pub(crate) fn admit_empty_commit_sync(
         Ok(_) => return Ok(Err(AuditAuthorityError::BindingMismatch)),
         Err(error) => return Ok(Err(error)),
     }
-    Ok(ledger.admit_empty_commit(
+    super::audit::mutation_result(ledger.admit_empty_commit(
         key,
         prepared,
         context.logical_time.as_offset_datetime().unix_timestamp(),

@@ -453,11 +453,11 @@ fn retained_target_admission_rejects_conflicts_and_handle_only_recovery() {
     resign_target(&mut different);
     assert_eq!(
         ledger.admit_target(&key, &different, 100),
-        Err(AuditAuthorityError::BindingMismatch)
+        Err(AuditAuthorityError::BindingMismatch.into())
     );
     assert_eq!(
         ledger.admit(&key, prepared.handle(), 100),
-        Err(AuditAuthorityError::BindingMismatch)
+        Err(AuditAuthorityError::BindingMismatch.into())
     );
     assert_eq!(serde_json::to_vec(&ledger).unwrap(), unchanged);
     let mut caller = serde_json::to_value(prepared.handle.body.binding.caller).unwrap();
@@ -514,7 +514,7 @@ fn retained_target_admission_rejects_conflicts_and_handle_only_recovery() {
         .is_err());
     assert_eq!(
         ordinary.admit_target(&key, &prepared, 100),
-        Err(AuditAuthorityError::BindingMismatch)
+        Err(AuditAuthorityError::BindingMismatch.into())
     );
     assert_eq!(serde_json::to_vec(&ordinary).unwrap(), before);
 }
@@ -534,7 +534,7 @@ fn retained_target_admission_requires_live_original_and_independent_continuity()
     let original = serde_json::to_vec(&ledger).unwrap();
     assert_eq!(
         ledger.admit_target(&key, &prepared, 100),
-        Err(AuditAuthorityError::RecoveryRequired)
+        Err(AuditAuthorityError::RecoveryRequired.into())
     );
     assert_eq!(serde_json::to_vec(&ledger).unwrap(), original);
     ledger.continuity = Some(crate::audit_authority::continuity::chain::ContinuityState::new(1));
@@ -542,7 +542,7 @@ fn retained_target_admission_requires_live_original_and_independent_continuity()
         let original = serde_json::to_vec(&ledger).unwrap();
         assert_eq!(
             ledger.admit_target(&key, &prepared, time),
-            Err(AuditAuthorityError::Expired)
+            Err(AuditAuthorityError::Expired.into())
         );
         assert_eq!(serde_json::to_vec(&ledger).unwrap(), original);
     }
@@ -647,7 +647,9 @@ fn retained_target_admission_reserves_aggregate_capacity_for_terminal_recovery()
         let unchanged = serde_json::to_vec(&ledger).unwrap();
         match ledger.admit_target(&key, &next, 100) {
             Ok(()) => admitted.push(next),
-            Err(AuditAuthorityError::Full) => {
+            Err(crate::audit_authority::ledger::LedgerMutationError::Authority(
+                AuditAuthorityError::Full,
+            )) => {
                 assert_eq!(serde_json::to_vec(&ledger).unwrap(), unchanged);
                 full = true;
                 break;

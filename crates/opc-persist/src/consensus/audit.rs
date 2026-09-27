@@ -1,7 +1,7 @@
 //! Management audit changes applied by the existing configuration state machine.
 
 use hmac::{Hmac, KeyInit, Mac};
-use rusqlite::{params, Connection, OptionalExtension};
+use rusqlite::{params, Connection};
 use serde::{Deserialize, Serialize};
 use sha2::Sha256;
 use std::io;
@@ -10,7 +10,9 @@ use super::ConfigMutationFailure;
 use crate::audit_authority::continuity::{
     chain::ContinuityState, AuditCheckpoint, AuditKeyRing, AuditKeyTransition,
 };
-use crate::audit_authority::ledger::{LedgerState, MAX_STATE_BYTES, STATE_DOMAIN};
+use crate::audit_authority::ledger::{
+    LedgerMutationError, LedgerState, MAX_STATE_BYTES, STATE_DOMAIN,
+};
 use crate::audit_authority::{
     AuditAuthorityError, AuditLedgerLimits, AuditOperationHandle, AuditOperationState, AuditToken,
 };
@@ -54,6 +56,8 @@ struct StoredLedger {
     identity: ConfigConsensusIdentity,
     ledger: Option<LedgerState>,
 }
+
+mod ledger_decode;
 
 fn invalid() -> io::Error {
     io::Error::new(
@@ -188,25 +192,33 @@ pub(crate) fn read_with_keys_sync(
 }
 
 fn read_verified_sync(conn: &Connection, key: &AuditKey) -> io::Result<StoredLedger> {
-    let (encoded, mac): (Vec<u8>,Vec<u8>) = conn.query_row(
+    let mut statement = conn.prepare(
         "SELECT state_json, state_hmac FROM config_raft_management_audit WHERE singleton = 1 AND length(state_json) BETWEEN 1 AND 16777216 AND length(state_hmac) = 32",
-        [], |row| Ok((row.get(0)?,row.get(1)?)),
-    ).optional().map_err(|_| invalid())?.ok_or_else(invalid)?;
-    let mac: [u8; 32] = mac.try_into().map_err(|_| invalid())?;
+    ).map_err(|_| invalid())?;
+    let mut rows = statement.query([]).map_err(|_| invalid())?;
+    let row = rows.next().map_err(|_| invalid())?.ok_or_else(invalid)?;
+    let encoded = row.get_ref(0).map_err(|_| invalid())?;
+    let encoded = encoded.as_blob().map_err(|_| invalid())?;
+    let mac = row.get_ref(1).map_err(|_| invalid())?;
+    let mac = mac.as_blob().map_err(|_| invalid())?;
     #[cfg(test)]
-    let encoded =
-        super::config_capacity_simultaneous_working_tests::ledger::EncodedRead::observe(encoded);
-    let stored: StoredLedger = serde_json::from_slice(&encoded).map_err(|_| invalid())?;
+    let observed_row =
+        super::config_capacity_simultaneous_working_tests::ledger::borrowed_read(encoded);
+    let stored = ledger_decode::decode(encoded)?;
     #[cfg(test)]
     let observed_read =
         super::config_capacity_simultaneous_working_tests::ledger::decoded(stored.ledger.as_ref());
     let length = canonical_state_len(&stored)?;
     stream_state(&stored, key, length, None)?
-        .verify_slice(&mac)
+        .verify_slice(mac)
         .map_err(|_| invalid())?;
-    // Canonical authentication is complete. The decoded state owns every field
-    // needed below; release the SQL JSON before validation derives operations.
-    drop(encoded);
+    // Canonical authentication is complete. End the immutable row borrow and
+    // finalize its statement before validation derives operations. The caller's
+    // connection/transaction still owns the complete read and identity check.
+    #[cfg(test)]
+    drop(observed_row);
+    drop(rows);
+    drop(statement);
     if let Some(ledger) = &stored.ledger {
         ledger
             .validate(key, stored.identity)
@@ -265,6 +277,16 @@ pub(crate) struct ApplyContext<'a> {
     pub(crate) logical_time: opc_types::Timestamp,
     pub(crate) request_id: opc_consensus::ConsensusRequestId,
     pub(crate) cancellation: &'a super::sqlite::SqliteWorkCancellation,
+}
+
+pub(super) fn mutation_result(
+    result: Result<(), LedgerMutationError>,
+) -> io::Result<Result<(), AuditAuthorityError>> {
+    match result {
+        Ok(()) => Ok(Ok(())),
+        Err(LedgerMutationError::Authority(error)) => Ok(Err(error)),
+        Err(LedgerMutationError::Allocation) => Err(io::ErrorKind::OutOfMemory.into()),
+    }
 }
 
 #[cfg(test)]
@@ -362,14 +384,17 @@ pub(crate) fn apply_cancellable_sync(
         command => match ledger.as_mut() {
             None => Err(AuditAuthorityError::Unavailable),
             Some(ledger) => match command {
-                AuditCommand::Intent(handle) => ledger.admit(key, handle, now),
+                AuditCommand::Intent(handle) => mutation_result(ledger.admit(key, handle, now))?,
                 AuditCommand::Reject(handle) => {
-                    ledger.resolve(key, handle, AuditOperationState::Rejected)
+                    mutation_result(ledger.resolve(key, handle, AuditOperationState::Rejected))?
                 }
-                AuditCommand::Terminal(handle) => ledger.acknowledge_terminal(key, handle),
-                AuditCommand::Transition(transition) => keys
-                    .ok_or(AuditAuthorityError::KeyUnavailable)
-                    .and_then(|keys| ledger.transition_key(key, keys, transition)),
+                AuditCommand::Terminal(handle) => {
+                    mutation_result(ledger.acknowledge_terminal(key, handle))?
+                }
+                AuditCommand::Transition(transition) => match keys {
+                    Some(keys) => mutation_result(ledger.transition_key(key, keys, transition))?,
+                    None => Err(AuditAuthorityError::KeyUnavailable),
+                },
                 AuditCommand::Checkpoint(checkpoint) => keys
                     .ok_or(AuditAuthorityError::KeyUnavailable)
                     .and_then(|keys| {
@@ -423,24 +448,28 @@ pub(crate) fn apply_cancellable_sync(
                 AuditCommand::NetconfTarget(command) => {
                     use super::audit_mutation::TargetAuditCommandV1;
                     match &**command {
-                        TargetAuditCommandV1::Admit(prepared) => ledger
-                            .lookup(key, prepared.handle(), prepared.effect.caller)
-                            .and_then(|existing| {
-                                // A read-only preflight cannot reserve this ledger.
-                                // Serialize new target intents against the current
-                                // authenticated transaction, or two original intents
-                                // can each block the other's effect forever. Exact
-                                // replay still reaches admit_target's payload check.
-                                if existing.is_none()
-                                    && ledger.operations.iter().any(|operation| {
-                                        !operation.terminal_recorded
-                                            || ledger.mutation_outcome_needs_checkpoint(operation)
-                                    })
-                                {
-                                    return Err(AuditAuthorityError::RecoveryRequired);
-                                }
-                                ledger.admit_target(key, prepared, now)
-                            }),
+                        TargetAuditCommandV1::Admit(prepared) => mutation_result(
+                            ledger
+                                .lookup(key, prepared.handle(), prepared.effect.caller)
+                                .map_err(LedgerMutationError::from)
+                                .and_then(|existing| {
+                                    // A read-only preflight cannot reserve this ledger.
+                                    // Serialize new target intents against the current
+                                    // authenticated transaction, or two original intents
+                                    // can each block the other's effect forever. Exact
+                                    // replay still reaches admit_target's payload check.
+                                    if existing.is_none()
+                                        && ledger.operations.iter().any(|operation| {
+                                            !operation.terminal_recorded
+                                                || ledger
+                                                    .mutation_outcome_needs_checkpoint(operation)
+                                        })
+                                    {
+                                        return Err(AuditAuthorityError::RecoveryRequired.into());
+                                    }
+                                    ledger.admit_target(key, prepared, now)
+                                }),
+                        )?,
                         TargetAuditCommandV1::RetireCleanup(prepared) => {
                             super::audit_targets::retire_cleanup_sync(
                                 conn,
@@ -591,3 +620,7 @@ mod target_command_tests;
 #[cfg(test)]
 #[path = "../../tests/management_audit_authority/target_state.rs"]
 mod target_state_tests;
+
+#[cfg(test)]
+#[path = "tests/config_capacity_957_ledger_decode.rs"]
+mod config_capacity_957_ledger_decode;

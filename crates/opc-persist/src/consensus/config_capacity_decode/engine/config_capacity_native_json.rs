@@ -4,12 +4,14 @@
 
 use std::io::{self, Read, Write};
 
-use opc_consensus::engine::Entry;
+use opc_consensus::engine::{Entry, EntryPayload};
 use opc_crypto::CONFIG_CAPACITY_V1_ENVELOPE_BYTES;
+use serde::Serialize;
+use serde_json::ser::Formatter;
 
 use super::super::{Effect, Intent};
 use super::{ConfigRaftTypeConfig, EntryFields, Payload};
-#[cfg(test)]
+use crate::consensus::audit_mutation::AuditedConfigEffect;
 use crate::consensus::types::ConfigMutationIntent;
 
 const FIELD: &[u8] = b"\"encrypted_blob\":";
@@ -63,19 +65,87 @@ fn array_extent(bytes: &[u8]) -> Option<(usize, usize)> {
     }
 }
 
-struct MatchesInput<'a>(&'a [u8]);
+struct MatchesInput<'a> {
+    remaining: &'a [u8],
+    #[cfg(all(test, target_os = "linux"))]
+    writes: usize,
+    #[cfg(all(test, target_os = "linux"))]
+    largest_write: usize,
+}
+
+impl<'a> MatchesInput<'a> {
+    fn new(bytes: &'a [u8]) -> Self {
+        Self {
+            remaining: bytes,
+            #[cfg(all(test, target_os = "linux"))]
+            writes: 0,
+            #[cfg(all(test, target_os = "linux"))]
+            largest_write: 0,
+        }
+    }
+}
 
 impl Write for MatchesInput<'_> {
     fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
-        if !self.0.starts_with(bytes) {
+        if !self.remaining.starts_with(bytes) {
             return Err(invalid());
         }
-        self.0 = &self.0[bytes.len()..];
+        self.remaining = &self.remaining[bytes.len()..];
+        #[cfg(all(test, target_os = "linux"))]
+        {
+            self.writes += 1;
+            self.largest_write = self.largest_write.max(bytes.len());
+        }
         Ok(bytes.len())
     }
 
     fn flush(&mut self) -> io::Result<()> {
         Ok(())
+    }
+}
+
+// This formatter is only used by the in-memory canonical-equality sink. It
+// does not replace the bounded/cancellable writers used by append or apply.
+// Both complete token passes have already established that `encoded` is the
+// canonical representation of this exact immutable `decoded` buffer.
+struct CanonicalCiphertext<'a> {
+    decoded: &'a [u8],
+    encoded: &'a [u8],
+    emitted: &'a mut bool,
+}
+
+impl Formatter for CanonicalCiphertext<'_> {
+    fn write_byte_array<W: ?Sized + Write>(
+        &mut self,
+        writer: &mut W,
+        value: &[u8],
+    ) -> io::Result<()> {
+        // Pointer-and-length identity binds reuse to the selected typed field;
+        // another byte field, even with equal values, is serialized normally.
+        if std::ptr::eq(value, self.decoded) {
+            if *self.emitted {
+                return Err(invalid());
+            }
+            *self.emitted = true;
+            return writer.write_all(self.encoded);
+        }
+        serde_json::ser::CompactFormatter.write_byte_array(writer, value)
+    }
+}
+
+fn ciphertext(entry: &Entry<ConfigRaftTypeConfig>) -> Option<&[u8]> {
+    let EntryPayload::Normal(command) = &entry.payload else {
+        return None;
+    };
+    match &command.intent {
+        ConfigMutationIntent::BoundedAppend { commit, .. } => Some(&commit.record.encrypted_blob),
+        ConfigMutationIntent::AuditedMutation(prepared) => match &prepared.effect {
+            AuditedConfigEffect::BoundedAppend { commit, .. } => {
+                Some(&commit.record.encrypted_blob)
+            }
+            _ => None,
+        },
+        _ => None,
     }
 }
 
@@ -130,12 +200,33 @@ fn canonical_entry(bytes: &[u8]) -> io::Result<Option<Entry<ConfigRaftTypeConfig
     // speculative mismatch, duplicate/unknown field, alias or reordered form.
     // Any mismatch falls back to the original parser with original input;
     // no speculative object or owning ciphertext survives that fallback.
-    let mut compare = MatchesInput(bytes);
-    if crate::consensus::config_capacity_json::to_writer(&mut compare, &entry).is_err()
-        || !compare.0.is_empty()
-    {
+    let Some(decoded) = ciphertext(&entry) else {
+        return Ok(None);
+    };
+    if decoded.len() != count {
+        return Err(invalid());
+    }
+    let mut emitted = false;
+    let formatter = CanonicalCiphertext {
+        decoded,
+        encoded: &bytes[start..end],
+        emitted: &mut emitted,
+    };
+    let mut compare = MatchesInput::new(bytes);
+    let result = entry.serialize(&mut serde_json::Serializer::with_formatter(
+        &mut compare,
+        formatter,
+    ));
+    if result.is_err() || !emitted || !compare.remaining.is_empty() {
         return Ok(None);
     }
+    #[cfg(all(test, target_os = "linux"))]
+    crate::consensus::store::config_capacity_cost_observation::native_canonical_compared(
+        &entry,
+        extent,
+        compare.writes,
+        compare.largest_write,
+    );
     Ok(Some(entry))
 }
 
