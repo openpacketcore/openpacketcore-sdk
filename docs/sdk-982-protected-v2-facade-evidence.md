@@ -184,6 +184,23 @@ does not cause it.
 The Go modules did not change and were not rerun for this head; they passed
 on the earlier head `be0dfab7`.
 
+Two hosted `misc` runs of head `bade5b2f` failed on this timing
+sensitivity:
+
+- The first failed in
+  `scoped_sql_reads_preserve_expiry_rollback_cold_state_and_majority`, an
+  unchanged consensus-store test. A scoped read with a one-second deadline
+  reported quorum unavailable. That test passed 5 of 5 local runs.
+- The rerun failed in two real-voter V2 facade tests. A commit outlived the
+  250 ms `PREPARED_CHECKPOINT_MAX_PHYSICAL_ATTEMPT` cap, and `execute_once`
+  correctly returned `OutcomeUnknown`.
+
+The V2 facade functional tests now resolve such a possible send on the same
+handle by exact receipt, as the release qualification does. They still
+require the matching outcome and the exact physical call counts. Twelve
+concurrent copies of the V2 facade tests, each with eight test threads,
+passed.
+
 These gates were not run locally:
 
 - i686 test execution. The host lacks the 32-bit `libatomic` runtime, so i686
