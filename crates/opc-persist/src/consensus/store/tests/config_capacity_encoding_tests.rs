@@ -437,14 +437,14 @@ async fn config_capacity_957_borrowed_audit_validation_preserves_effect_checks()
         panic!("audited fixture");
     };
     prepared.effect = AuditedConfigEffect::Confirm { tx_id };
-    // Revision 8 is structurally recognized for the bounded profile. Keep the
-    // legacy authority's original revision fence, and reject unknown revision 9
-    // at both structural and admitted-profile boundaries.
-    for revision in 1..=9 {
+    // Structural recognition includes the target and Running command families.
+    // It must not authorize those revisions under a different retained mode,
+    // or authorize this older audited effect under the Running-only family.
+    for revision in (0..=11).chain([u16::MAX]) {
         fixture.schema_version = revision;
         assert_eq!(
             fixture.validate(fixture.identity).is_ok(),
-            (5..=8).contains(&revision),
+            (5..=10).contains(&revision),
             "outer audit revision must be structurally supported",
         );
         assert_eq!(
@@ -468,6 +468,27 @@ async fn config_capacity_957_borrowed_audit_validation_preserves_effect_checks()
                 .is_ok(),
             (5..=8).contains(&revision),
             "bounded admission supports only recognized outer audit revisions",
+        );
+        assert_eq!(
+            fixture
+                .validate_for_profile(
+                    fixture.identity,
+                    store.inner.backend.audit_key(),
+                    crate::consensus::RetainedConfigMode::NetconfTargetsV1,
+                )
+                .is_ok(),
+            matches!(revision, 5..=7 | 9),
+            "target admission must not accept bounded or Running revisions",
+        );
+        assert!(
+            fixture
+                .validate_for_profile(
+                    fixture.identity,
+                    store.inner.backend.audit_key(),
+                    crate::consensus::RetainedConfigMode::NetconfRunningV1,
+                )
+                .is_err(),
+            "Running admission must reject the older audited mutation family",
         );
     }
     fixture.schema_version = crate::consensus::CONFIG_CONSENSUS_COMMAND_VERSION;
