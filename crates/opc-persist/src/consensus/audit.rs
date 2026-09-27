@@ -1,7 +1,7 @@
 //! Management audit changes applied by the existing configuration state machine.
 
 use hmac::{Hmac, KeyInit, Mac};
-use rusqlite::{params, Connection, OptionalExtension};
+use rusqlite::{params, Connection};
 use serde::{Deserialize, Serialize};
 use sha2::Sha256;
 use std::io;
@@ -52,6 +52,8 @@ struct StoredLedger {
     identity: ConfigConsensusIdentity,
     ledger: Option<LedgerState>,
 }
+
+mod ledger_decode;
 
 fn invalid() -> io::Error {
     io::Error::new(
@@ -186,25 +188,33 @@ pub(crate) fn read_with_keys_sync(
 }
 
 fn read_verified_sync(conn: &Connection, key: &AuditKey) -> io::Result<StoredLedger> {
-    let (encoded, mac): (Vec<u8>,Vec<u8>) = conn.query_row(
+    let mut statement = conn.prepare(
         "SELECT state_json, state_hmac FROM config_raft_management_audit WHERE singleton = 1 AND length(state_json) BETWEEN 1 AND 16777216 AND length(state_hmac) = 32",
-        [], |row| Ok((row.get(0)?,row.get(1)?)),
-    ).optional().map_err(|_| invalid())?.ok_or_else(invalid)?;
-    let mac: [u8; 32] = mac.try_into().map_err(|_| invalid())?;
+    ).map_err(|_| invalid())?;
+    let mut rows = statement.query([]).map_err(|_| invalid())?;
+    let row = rows.next().map_err(|_| invalid())?.ok_or_else(invalid)?;
+    let encoded = row.get_ref(0).map_err(|_| invalid())?;
+    let encoded = encoded.as_blob().map_err(|_| invalid())?;
+    let mac = row.get_ref(1).map_err(|_| invalid())?;
+    let mac = mac.as_blob().map_err(|_| invalid())?;
     #[cfg(test)]
-    let encoded =
-        super::config_capacity_simultaneous_working_tests::ledger::EncodedRead::observe(encoded);
-    let stored: StoredLedger = serde_json::from_slice(&encoded).map_err(|_| invalid())?;
+    let observed_row =
+        super::config_capacity_simultaneous_working_tests::ledger::borrowed_read(encoded);
+    let stored = ledger_decode::decode(encoded)?;
     #[cfg(test)]
     let observed_read =
         super::config_capacity_simultaneous_working_tests::ledger::decoded(stored.ledger.as_ref());
     let length = canonical_state_len(&stored)?;
     stream_state(&stored, key, length, None)?
-        .verify_slice(&mac)
+        .verify_slice(mac)
         .map_err(|_| invalid())?;
-    // Canonical authentication is complete. The decoded state owns every field
-    // needed below; release the SQL JSON before validation derives operations.
-    drop(encoded);
+    // Canonical authentication is complete. End the immutable row borrow and
+    // finalize its statement before validation derives operations. The caller's
+    // connection/transaction still owns the complete read and identity check.
+    #[cfg(test)]
+    drop(observed_row);
+    drop(rows);
+    drop(statement);
     if let Some(ledger) = &stored.ledger {
         ledger
             .validate(key, stored.identity)
@@ -472,3 +482,7 @@ mod config_capacity_957_ledger_allocations;
 #[cfg(test)]
 #[path = "tests/config_capacity_957_ledger_streaming.rs"]
 mod config_capacity_957_ledger_streaming;
+
+#[cfg(test)]
+#[path = "tests/config_capacity_957_ledger_decode.rs"]
+mod config_capacity_957_ledger_decode;

@@ -15,6 +15,8 @@ const HANDLE_DOMAIN: &[u8] = b"openpacketcore/management-audit/operation-handle/
 const ENTRY_DOMAIN: &[u8] = b"openpacketcore/management-audit/replicated-entry/v1\0";
 pub(crate) const STATE_DOMAIN: &[u8] = b"openpacketcore/management-audit/replicated-state/v1\0";
 pub(crate) const MAX_STATE_BYTES: usize = 16 * 1024 * 1024;
+pub(crate) const MAX_LEDGER_EVENTS: usize = 4096;
+pub(crate) const MAX_LEDGER_OPERATIONS: usize = 1024;
 const MAX_HANDLE_BYTES: usize = 8192;
 const OPERATION_EVENT_RESERVATION: usize = 3;
 
@@ -40,8 +42,8 @@ impl AuditLedgerLimits {
     }
 
     fn validate(self) -> Result<(), AuditAuthorityError> {
-        if !(3..=4096).contains(&self.max_events)
-            || !(1..=1024).contains(&self.max_operations)
+        if !(3..=MAX_LEDGER_EVENTS).contains(&self.max_events)
+            || !(1..=MAX_LEDGER_OPERATIONS).contains(&self.max_operations)
             || self.max_operations > self.max_events / OPERATION_EVENT_RESERVATION
         {
             return Err(AuditAuthorityError::InvalidInput);

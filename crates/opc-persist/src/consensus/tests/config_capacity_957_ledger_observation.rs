@@ -212,6 +212,12 @@ pub(crate) fn applying(_command: &AuditedConfigCommand) -> OwnerGuard<'_> {
     })
 }
 
+// A borrowed SQLite blob has no SDK-owned row buffer. Keep read counters live
+// without charging SQLite's separate storage to the mutation working buffer.
+pub(crate) fn borrowed_read(_encoded: &[u8]) -> OwnerGuard<'_> {
+    owner(READ, || 0)
+}
+
 // This wrapper contains the actual SQL result Vec. It never clones the row or
 // lends an encoded-byte reference to the decoded-ledger guard. Field order
 // clears the observation immediately before the actual Vec is dropped.
