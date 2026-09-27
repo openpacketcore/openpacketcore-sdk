@@ -33,6 +33,31 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- `opc-session-store`: add `FencedTransitionV2RecoveryJournal`, an SDK-owned
+  journal that binds a caller-stable `FencedTransitionRequestId` to its
+  complete sealed V2 request before dispatch, with #701-equivalent path,
+  SQLite, and per-row plus full-set authentication rules. Its authenticated
+  4,096-row count is an admission fence, not an absorbing lifetime: rows are
+  removed only by exact compare-and-delete once the transition is resolved or
+  provably unbound. The protection wrappers gain
+  `with_fenced_transition_v2_recovery_journal`. V1, the #701 journal, the raw
+  V2 wrapper path, and the `/2` wire are unchanged. Refs #982.
+
+- `opc-session-net`: add `SessionConsumerPreparedFencedTransitionV2Backend`,
+  the protected V2 prepared consumer facade for local-AEAD and remote-sealing
+  protection. It keeps the V1 facade's exact-voter activation, canonical
+  routing, and affine execute handle, selects the active epoch internally from
+  a cached linearized history state, and recovers status by caller-stable ID.
+  It adds `release_resolved`, a bounded `reclaim_resolved_fenced_transitions`
+  sweep, and `with_legacy_v1_recovery` so retained V1 transitions stay
+  status-recoverable after an upgrade. It adds no wire operation. Refs #982.
+
+- `opc-session-testkit`: forward `/2` requests through
+  `AuthenticatedPreparedFencedTransitionFixture`, open the protected V2 facade
+  over its real voters (optionally composed with V1 recovery), withhold one
+  committed V2 response, and count V2 transition, status, and history-state
+  requests. Refs #982.
+
 - `opc-gtpu-dataplane`: resolve an exact existing Active parent inside fenced
   child admission with `reconcile_bearer_under_active_parent`. Avoid a separate
   parent recovery lease while retaining selector reservations, fresh backend
