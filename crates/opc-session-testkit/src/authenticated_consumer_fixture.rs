@@ -1597,6 +1597,21 @@ impl AuthenticatedPreparedFencedTransitionFixture {
             .store(FIXTURE_VOTER_COUNT, Ordering::Release);
     }
 
+    /// Stall every `/2` receipt lookup on the voter at `canonical_index` in
+    /// node-ordinal order, the order the protected facades route by.
+    #[cfg(test)]
+    pub(crate) fn stall_fenced_transition_v2_status_on_canonical_voter(
+        &self,
+        canonical_index: usize,
+    ) {
+        let mut canonical = self.voters.iter().collect::<Vec<_>>();
+        canonical.sort_unstable_by_key(|voter| voter.authority.node_id());
+        canonical[canonical_index]
+            .service
+            .stall_fenced_transition_v2_status
+            .store(true, Ordering::Release);
+    }
+
     /// Return redacted aggregate transport activity for no-replay assertions.
     pub fn diagnostics(&self) -> AuthenticatedPreparedFencedTransitionFixtureDiagnostics {
         AuthenticatedPreparedFencedTransitionFixtureDiagnostics {
@@ -1812,6 +1827,8 @@ struct FixtureConsumer {
     fenced_transition_v2_calls: AtomicUsize,
     fenced_transition_v2_status_calls: AtomicUsize,
     fenced_transition_v2_history_state_calls: AtomicUsize,
+    #[cfg(test)]
+    stall_fenced_transition_v2_status: AtomicBool,
     ordinary_cas_fault: Arc<FixtureOrdinaryCasFault>,
     voter: usize,
 }
@@ -1836,6 +1853,8 @@ impl FixtureConsumer {
             fenced_transition_v2_calls: AtomicUsize::new(0),
             fenced_transition_v2_status_calls: AtomicUsize::new(0),
             fenced_transition_v2_history_state_calls: AtomicUsize::new(0),
+            #[cfg(test)]
+            stall_fenced_transition_v2_status: AtomicBool::new(false),
             ordinary_cas_fault,
             voter,
         }
@@ -1943,6 +1962,15 @@ impl SessionQuorumConsumer for FixtureConsumer {
         ) {
             self.fenced_transition_v2_status_calls
                 .fetch_add(1, Ordering::SeqCst);
+            // A stalled voter never answers a read-only receipt lookup; the
+            // production client's own attempt deadline classifies it.
+            #[cfg(test)]
+            if self
+                .stall_fenced_transition_v2_status
+                .load(Ordering::Acquire)
+            {
+                std::future::pending::<()>().await;
+            }
         }
         if matches!(
             request.operation(),

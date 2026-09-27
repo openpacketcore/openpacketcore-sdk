@@ -1196,13 +1196,17 @@ impl SessionConsumerPreparedFencedTransitionV2Backend {
     /// Run one bounded reclamation sweep over retained rows.
     ///
     /// It first reads the linearized history state once and removes rows at
-    /// or below its retired floor without further I/O. It then reads the exact status of at most `limit` rows in
-    /// caller-ID order from a process-local cursor and removes those whose
-    /// status is `Expired`, `Retired`, `HistoryFull`, `RetentionExhausted`,
-    /// or `EpochNotActive` for an epoch below the active epoch. It retains
-    /// `Recorded`, `NotFound`, and `RequestConflict` rows and stops at the
-    /// first unavailable status or at the budget's deadline. `limit` must be
-    /// in `1..=FENCED_TRANSITION_V2_RECOVERY_RECLAIM_BATCH_MAX`.
+    /// or below its retired floor without further I/O. It then reads the
+    /// exact status of at most `limit` rows in caller-ID order from a
+    /// process-local cursor and removes those whose status is `Expired`,
+    /// `Retired`, `HistoryFull`, `RetentionExhausted`, or `EpochNotActive`
+    /// for an epoch below the active epoch. It retains `Recorded`,
+    /// `NotFound`, and `RequestConflict` rows. A row's read-only status moves
+    /// to the next canonical voter when one is unavailable. The sweep stops
+    /// as interrupted when every voter failed for one row, when a local
+    /// journal read or removal fails, or at the budget's deadline. `limit`
+    /// must be in
+    /// `1..=FENCED_TRANSITION_V2_RECOVERY_RECLAIM_BATCH_MAX`.
     ///
     /// The caller owns scheduling. Epoch rotation and retired-floor
     /// advancement remain the state process's replicated maintenance.
@@ -1250,20 +1254,12 @@ impl SessionConsumerPreparedFencedTransitionV2Backend {
         .map_err(|_| prepared_fenced_v2_deadline())??;
         let mut next_cursor = cursor;
         let wrapped = page.len() < remaining;
+        let voter_count = self.router.clients.len();
         for (request_id, history_epoch) in page {
-            let now = tokio::time::Instant::now();
-            if now >= deadline {
-                report.interrupted = true;
-                break;
-            }
-            let Some(attempt_deadline) = now
-                .checked_add(budget.physical_attempt_timeout())
-                .map(|capped| capped.min(deadline))
-            else {
+            let Some(attempt_deadline) = reclaim_attempt_deadline(&budget, deadline) else {
                 report.interrupted = true;
                 break;
             };
-            route.install_attempt_deadline(attempt_deadline);
             let prepared = match tokio::time::timeout_at(
                 attempt_deadline,
                 backend.recover_protected_fenced_transition_v2(request_id),
@@ -1282,27 +1278,45 @@ impl SessionConsumerPreparedFencedTransitionV2Backend {
                     break;
                 }
             };
-            let status = tokio::time::timeout_at(
-                attempt_deadline,
-                backend.protected_fenced_transition_v2_status(&prepared),
-            )
-            .await;
-            let reclaimable = match status {
-                Ok(Ok(
+            // Status is read-only, so one unavailable voter moves the row's
+            // read to the next canonical voter. Each physical call advances
+            // the sweep's status cursor, and one row makes at most one
+            // attempt per voter before the sweep stops as interrupted.
+            let mut status = None;
+            for _ in 0..voter_count {
+                let Some(attempt_deadline) = reclaim_attempt_deadline(&budget, deadline) else {
+                    break;
+                };
+                route.install_attempt_deadline(attempt_deadline);
+                match tokio::time::timeout_at(
+                    attempt_deadline,
+                    backend.protected_fenced_transition_v2_status(&prepared),
+                )
+                .await
+                {
+                    Ok(Ok(observed)) => {
+                        status = Some(Ok(observed));
+                        break;
+                    }
+                    Ok(Err(StoreError::TopologyAuthorityRevoked)) => {
+                        return Err(StoreError::TopologyAuthorityRevoked);
+                    }
+                    Ok(Err(_)) | Err(_) => {}
+                }
+            }
+            let reclaimable = match status.unwrap_or(Err(())) {
+                Ok(
                     FencedTransitionV2Status::Expired
                     | FencedTransitionV2Status::Retired
                     | FencedTransitionV2Status::HistoryFull
                     | FencedTransitionV2Status::RetentionExhausted,
-                )) => true,
+                ) => true,
                 // A request in an epoch below the active epoch can never bind.
-                Ok(Ok(FencedTransitionV2Status::EpochNotActive)) => history
+                Ok(FencedTransitionV2Status::EpochNotActive) => history
                     .active_epoch()
                     .is_some_and(|active| history_epoch < active),
-                Ok(Ok(_)) => false,
-                Ok(Err(StoreError::TopologyAuthorityRevoked)) => {
-                    return Err(StoreError::TopologyAuthorityRevoked);
-                }
-                Ok(Err(_)) | Err(_) => {
+                Ok(_) => false,
+                Err(()) => {
                     report.interrupted = true;
                     break;
                 }
@@ -1347,6 +1361,19 @@ impl SessionConsumerPreparedFencedTransitionV2Backend {
     }
 }
 
+/// One reclamation attempt's deadline: the budget's physical-attempt cap,
+/// bounded by the sweep's absolute deadline. `None` once that has elapsed.
+fn reclaim_attempt_deadline(
+    budget: &PreparedCheckpointBudget,
+    deadline: tokio::time::Instant,
+) -> Option<tokio::time::Instant> {
+    let now = tokio::time::Instant::now();
+    let attempt_deadline = now
+        .checked_add(budget.physical_attempt_timeout())
+        .map_or(deadline, |capped| capped.min(deadline));
+    (attempt_deadline > now).then_some(attempt_deadline)
+}
+
 /// Resolution the handle observed through this facade.
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum V2Resolution {
@@ -1387,8 +1414,10 @@ impl SessionConsumerPreparedFencedTransitionV2 {
     /// A possible send permanently removes dispatch authority and returns
     /// `OutcomeUnknown` with the caller-stable ID; use receipt status only
     /// afterwards. When every candidate voter proved a pre-dispatch failure,
-    /// or the V2 history definitively rejected the request without binding
-    /// it, this handle removes its own retained row.
+    /// topology authority was revoked before any Call byte, or the V2 history
+    /// definitively rejected the request without binding it, this handle
+    /// removes its own retained row. If that removal fails or is cancelled,
+    /// the handle stays resolved and `release_resolved` retries it.
     pub async fn execute_once(
         &mut self,
     ) -> Result<FencedTransitionOutcome, FencedTransitionExecuteError> {
@@ -1406,6 +1435,11 @@ impl SessionConsumerPreparedFencedTransitionV2 {
     /// Rotate read-only receipt lookups over the roster until a terminal
     /// status is found or the caller's absolute deadline is reached. It never
     /// re-enters mutation dispatch.
+    ///
+    /// A retained row that is missing or fails authentication is a local
+    /// fail-closed condition: `Unavailable` is then returned at once and is
+    /// final for this handle. `recover_fenced_transition_status` reports
+    /// whether the caller ID is still retained.
     pub async fn status_until_terminal(
         &mut self,
         deadline: tokio::time::Instant,
@@ -1415,8 +1449,9 @@ impl SessionConsumerPreparedFencedTransitionV2 {
 
     /// Remove the retained row after this handle observed a resolution.
     ///
-    /// A matching outcome, a definitive rejection other than
-    /// `TopologyAuthorityRevoked`, or a terminal status other than
+    /// A matching outcome, any execution result that proved the request was
+    /// never sent or never bound (see `execute_once`), any other definitive
+    /// rejection except `RequestConflict`, or a terminal status other than
     /// `RequestConflict` permits release. Afterwards the caller-stable ID is
     /// no longer retained: recovery returns `None`, and the ID may name a new
     /// transition. Callers must derive later work from authoritative
@@ -1465,7 +1500,9 @@ impl SessionConsumerRecoveredFencedTransitionV2Status {
     }
 
     /// Rotate read-only receipt lookups until a terminal status is found or
-    /// the caller's absolute deadline is reached.
+    /// the caller's absolute deadline is reached. As for a live handle, a
+    /// local row failure returns `Unavailable` at once and is final for this
+    /// handle.
     pub async fn status_until_terminal(
         &mut self,
         deadline: tokio::time::Instant,
@@ -1569,8 +1606,10 @@ impl Drop for PreparedFencedV2PreparationGuard<'_> {
     }
 }
 
-/// Definitive V2 rejections that prove the exact request has not bound a
-/// receipt and never will.
+/// Definitive V2 rejections of the original handle's single possible
+/// dispatch that prove the exact request has not bound a receipt and never
+/// will. As a later status, `Retired` does not prove that: V2 classifies the
+/// retired floor before any receipt lookup.
 fn v2_rejection_never_binds(error: &StoreError) -> bool {
     matches!(
         error,
@@ -1698,8 +1737,10 @@ impl PersistentPreparedFencedTransitionV2Token {
                 }
                 FencedTransitionV2Effect::Resolved(Err(StoreError::TopologyAuthorityRevoked)) => {
                     // Revocation is classified before any Call byte, and every
-                    // earlier attempt proved the same. Nothing was sent.
+                    // earlier attempt proved the same. Nothing was sent, so a
+                    // failed discard stays releasable.
                     preparation.terminal();
+                    self.set_resolution(V2Resolution::Resolved);
                     self.discard_own_unbound_row().await;
                     return Err(FencedTransitionExecuteError::Rejected(
                         StoreError::TopologyAuthorityRevoked,
@@ -1740,8 +1781,10 @@ impl PersistentPreparedFencedTransitionV2Token {
             }
         }
         // Every candidate proved that no Call byte was accepted, and only this
-        // handle can dispatch the row, so no copy of the request was sent.
+        // handle can dispatch the row, so no copy of the request was sent. A
+        // failed or cancelled discard therefore stays releasable.
         preparation.terminal();
+        self.set_resolution(V2Resolution::Resolved);
         self.discard_own_unbound_row().await;
         Err(FencedTransitionExecuteError::NotTransmitted)
     }
@@ -1872,6 +1915,12 @@ impl PersistentPreparedFencedTransitionV2Token {
         loop {
             for _ in 0..self.voter_count {
                 let result = self.status_once(deadline).await;
+                // A cached terminal receipt, including a local fail-closed
+                // row failure, never changes; retrying it only spends the
+                // caller's deadline. A concurrent call may have cached it.
+                if let Some(cached) = self.cached_terminal_receipt() {
+                    return cached;
+                }
                 if !prepared_fenced_v2_status_retryable_before(&result, deadline)? {
                     return result;
                 }
@@ -1957,6 +2006,8 @@ mod tests {
         Reject(StoreError),
         HangBeforeAdmission,
         HangAfterAdmission,
+        /// A proven pre-write failure that first runs a local fault action.
+        NotTransmittedAfter(Arc<dyn Fn() + Send + Sync>),
     }
 
     /// Scripted V2 physical boundary that mimics the private adapter's
@@ -2084,6 +2135,12 @@ mod tests {
                 Step::NotTransmitted => FencedTransitionV2Effect::NotTransmitted(
                     StoreError::BackendUnavailable("scripted pre-write failure".into()),
                 ),
+                Step::NotTransmittedAfter(fault) => {
+                    fault();
+                    FencedTransitionV2Effect::NotTransmitted(StoreError::BackendUnavailable(
+                        "scripted pre-write failure".into(),
+                    ))
+                }
                 Step::Commit => {
                     self.route.admit_dispatch();
                     let outcome = outcome_for(&request);
@@ -2542,6 +2599,74 @@ mod tests {
             harness.history.bindable(),
             Some(history_state(1, 1, 0)),
             "only an epoch or capacity rejection names a stale active epoch"
+        );
+    }
+
+    #[tokio::test]
+    async fn v2_handle_unsent_row_whose_discard_failed_stays_releasable() {
+        let directory = std::sync::Arc::new(StdMutex::new(None::<std::path::PathBuf>));
+        let moved = Arc::clone(&directory);
+        let harness = harness(vec![
+            Step::NotTransmitted,
+            Step::NotTransmitted,
+            Step::NotTransmittedAfter(Arc::new(move || {
+                // Move the journal away after the last authenticated reload,
+                // so the handle's own discard fails closed.
+                let path = moved.lock().expect("path").clone().expect("journal path");
+                std::fs::rename(&path, path.with_extension("moved")).expect("move journal");
+            })),
+        ])
+        .await;
+        let journal = harness._directory.path().join("recovery.sqlite3");
+        *directory.lock().expect("path") = Some(journal.clone());
+        let token = harness.prepare().await;
+        assert_eq!(
+            token.execute_once().await,
+            Err(FencedTransitionExecuteError::NotTransmitted)
+        );
+        assert_eq!(
+            token.release_resolved().await,
+            Err(SessionConsumerFencedTransitionV2ReleaseError::Unavailable),
+            "the proven-unsent row is releasable, and the moved journal fails closed"
+        );
+        std::fs::rename(journal.with_extension("moved"), &journal).expect("restore journal");
+        assert_eq!(
+            harness.retained().await,
+            1,
+            "the failed discard kept the row"
+        );
+        token
+            .release_resolved()
+            .await
+            .expect("a proven-unsent row is released once the journal is back");
+        assert_eq!(harness.retained().await, 0);
+    }
+
+    #[tokio::test]
+    async fn v2_status_until_terminal_returns_a_cached_local_failure_without_spinning() {
+        let harness = harness(vec![Step::Unknown]).await;
+        let token = harness.prepare().await;
+        assert!(matches!(
+            token.execute_once().await,
+            Err(FencedTransitionExecuteError::OutcomeUnknown { .. })
+        ));
+        // Another handle or a sweep removed the row after this handle became
+        // receipt-only.
+        assert!(harness
+            .backend
+            .discard_protected_fenced_transition_v2(&token.prepared)
+            .await
+            .expect("remove the row out from under the handle"));
+        let started = tokio::time::Instant::now();
+        let deadline = started + Duration::from_secs(2);
+        assert_eq!(
+            token.status_until_terminal(deadline).await,
+            Err(SessionConsumerPreparedFencedTransitionStatusError::Unavailable),
+            "the cached local failure is returned, not the caller's deadline"
+        );
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "a cached terminal receipt ends the loop at once"
         );
     }
 }

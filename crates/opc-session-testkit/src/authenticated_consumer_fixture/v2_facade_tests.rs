@@ -614,10 +614,49 @@ async fn fixture_v2_facade_reclaim_sweep_retains_recorded_and_unresolved_rows() 
     fixture.shutdown().await.expect("shut down fixture");
 }
 
-/// Release-profile qualification: more committed-and-released protected
-/// transitions than one #701 V1 journal can ever hold. The recovery journal
-/// stays at one live row throughout, so the V1 absorbing bound no longer
-/// limits one consumer's lifetime.
+/// A voter that never answers receipt lookups is a fault the quorum
+/// tolerates, so it must not stall reclamation: each row's read-only status
+/// moves on to the next canonical voter.
+#[tokio::test]
+async fn fixture_v2_facade_reclaim_sweep_reads_past_a_stalled_voter() {
+    let fixture = AuthenticatedPreparedFencedTransitionFixture::start([scope()])
+        .await
+        .expect("start authenticated three-voter fixture");
+    let provider = CountingProvider::new();
+    let facade = fixture
+        .open_local_aead_v2(Arc::clone(&provider), "fixture-v2-sweep-stalled")
+        .await
+        .expect("open protected V2 facade");
+    let mut prepared = Vec::new();
+    for ordinal in 40..44 {
+        let mut handle = facade
+            .prepare_fenced_transition(
+                create(request_id(ordinal), ordinal, PAYLOAD),
+                budget(soon()),
+            )
+            .await
+            .expect("prepare");
+        handle.execute_once().await.expect("commit");
+        prepared.push(handle);
+    }
+    // A fresh sweep reads its first row's status on canonical voter 1.
+    fixture.stall_fenced_transition_v2_status_on_canonical_voter(1);
+    let report = facade
+        .reclaim_resolved_fenced_transitions(16, budget(soon()))
+        .await
+        .expect("bounded sweep");
+    assert!(
+        !report.interrupted(),
+        "a stalled voter is skipped, not a sweep-wide unavailability"
+    );
+    assert_eq!(report.examined(), 4);
+    assert_eq!(report.retained(), 4, "Recorded rows are retained");
+    assert_eq!(report.reclaimed(), 0);
+    drop(prepared);
+    drop(facade);
+    fixture.shutdown().await.expect("shut down fixture");
+}
+
 #[tokio::test]
 async fn fixture_v2_facade_keeps_the_linearized_history_read_off_the_preparation_path() {
     let fixture = AuthenticatedPreparedFencedTransitionFixture::start([scope()])
@@ -673,6 +712,10 @@ async fn fixture_v2_facade_keeps_the_linearized_history_read_off_the_preparation
     fixture.shutdown().await.expect("shut down fixture");
 }
 
+/// Release-profile qualification: more committed-and-released protected
+/// transitions than one #701 V1 journal can ever hold. The recovery journal
+/// stays at one live row throughout, so the V1 absorbing bound no longer
+/// limits one consumer's lifetime.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[ignore = "release qualification: 4,097+ real three-voter protected V2 transitions"]
 async fn fixture_v2_facade_sustains_more_transitions_than_one_v1_journal_holds() {
