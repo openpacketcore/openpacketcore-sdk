@@ -327,9 +327,11 @@ impl TargetWorker {
         // State lives outside the unwind boundary. In particular, a panic in
         // terminal persistence cannot erase an already authenticated receipt.
         let attempted = AssertUnwindSafe(async {
+            // Erase the nested store future's layout while keeping its polling
+            // and original state owned by this worker's unwind boundary.
             let result = match dispatch {
-                Dispatch::Execute => port.execute_target(original).await,
-                Dispatch::Recover => port.recover_target(original).await,
+                Dispatch::Execute => port.execute_target(original).boxed().await,
+                Dispatch::Recover => port.recover_target(original).boxed().await,
             };
             self.sessions.finalize_lock(&port, original).await;
             super::running::publish_original(self.publication.as_deref(), original).await;

@@ -45,6 +45,7 @@ pub(super) enum ResultClass {
     AuditCommitted,
     AuditRejectedReceipt,
     AuditObserved,
+    AuditTarget,
     WireOk,
     TransportError,
     ServiceError,
@@ -438,6 +439,7 @@ pub(super) fn audit(result: &AuditAdmission) -> ResultClass {
             AuditOperationState::Committed { .. } => ResultClass::AuditCommitted,
             AuditOperationState::Rejected => ResultClass::AuditRejectedReceipt,
             AuditOperationState::Observed { .. } => ResultClass::AuditObserved,
+            AuditOperationState::TargetV1(_) => ResultClass::AuditTarget,
         },
     }
 }

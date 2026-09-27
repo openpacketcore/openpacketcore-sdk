@@ -53,3 +53,4 @@ workspace = true
 [dev-dependencies]
 tokio = { workspace = true, features = ["rt-multi-thread", "macros", "process"] }
 opc-alarm = { path = "../opc-alarm", version = "0.2.0" }
+postcard = { workspace = true }
