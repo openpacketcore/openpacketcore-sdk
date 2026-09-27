@@ -129,6 +129,9 @@ pub mod ttl;
 mod protected_fenced_transition_tests;
 
 #[cfg(test)]
+mod protected_fenced_transition_v2_recovery_tests;
+
+#[cfg(test)]
 mod test_process;
 
 pub use backend::{
@@ -144,14 +147,15 @@ pub use backend::{
     PreparedCompareAndSetStatus, PreparedCompareAndSetStatusError,
     PreparedLeaseAcquireExecuteError, PreparedLeaseAcquirePrepareError,
     PreparedLeaseAcquireRequest, PreparedLeaseAcquireStatusError, ProtectedFencedTransitionBackend,
-    ProtectedRosterEstablishedSuccessor, ProtectedSelectorLedgerBase, ProtectedSessionBackend,
-    RecordExpiryPreflight, RemoteSealingSessionBackend, ReplicationEntry, ReplicationLogRange,
-    ReplicationOp, ReplicationTxId, ReplicationTxIdError, ReplicationWatchCursor,
-    SelectorLedgerStorageScope, SessionBackend, SessionOp, SessionOpResult,
-    MAX_RECORD_EXPIRY_PREFLIGHTS, MAX_REPLICATION_LOG_PAGE_ENTRIES,
-    MAX_REPLICATION_OPERATIONS_PER_ENTRY, MAX_REPLICATION_OPERATION_DEPTH,
-    MAX_REPLICATION_WATCH_BACKLOG_ENTRIES, PREPARED_CHECKPOINT_MAX_PHYSICAL_ATTEMPT,
-    REPLICATION_TX_ID_CANONICAL_BYTES, REPLICATION_TX_ID_MAX_BYTES, REPLICATION_TX_ID_MIN_BYTES,
+    ProtectedFencedTransitionV2Backend, ProtectedRosterEstablishedSuccessor,
+    ProtectedSelectorLedgerBase, ProtectedSessionBackend, RecordExpiryPreflight,
+    RemoteSealingSessionBackend, ReplicationEntry, ReplicationLogRange, ReplicationOp,
+    ReplicationTxId, ReplicationTxIdError, ReplicationWatchCursor, SelectorLedgerStorageScope,
+    SessionBackend, SessionOp, SessionOpResult, MAX_RECORD_EXPIRY_PREFLIGHTS,
+    MAX_REPLICATION_LOG_PAGE_ENTRIES, MAX_REPLICATION_OPERATIONS_PER_ENTRY,
+    MAX_REPLICATION_OPERATION_DEPTH, MAX_REPLICATION_WATCH_BACKLOG_ENTRIES,
+    PREPARED_CHECKPOINT_MAX_PHYSICAL_ATTEMPT, REPLICATION_TX_ID_CANONICAL_BYTES,
+    REPLICATION_TX_ID_MAX_BYTES, REPLICATION_TX_ID_MIN_BYTES,
 };
 pub use capability::{
     assert_backend_suitable_for_profile, assert_suitable_for,
@@ -284,11 +288,11 @@ pub use fenced_transition::{
     FencedTransitionV2CallerNonce, FencedTransitionV2Capability, FencedTransitionV2HistoryEpoch,
     FencedTransitionV2HistoryState, FencedTransitionV2Request, FencedTransitionV2RequestId,
     FencedTransitionV2Status, PreparedFencedTransition, PreparedFencedTransitionError,
-    PreparedFencedTransitionLookup, FENCED_TRANSITION_MAX_HISTORY_ENTRIES,
-    FENCED_TRANSITION_MAX_OUTCOME_BYTES, FENCED_TRANSITION_MAX_PREPARED_BYTES,
-    FENCED_TRANSITION_MAX_PREPARED_LAYERS, FENCED_TRANSITION_OUTCOME_RETENTION,
-    FENCED_TRANSITION_PREPARED_SCHEMA_V1, FENCED_TRANSITION_REQUEST_ID_BYTES,
-    FENCED_TRANSITION_SCHEMA_V1, FENCED_TRANSITION_SCHEMA_V2,
+    PreparedFencedTransitionLookup, PreparedFencedTransitionV2, PreparedFencedTransitionV2Lookup,
+    FENCED_TRANSITION_MAX_HISTORY_ENTRIES, FENCED_TRANSITION_MAX_OUTCOME_BYTES,
+    FENCED_TRANSITION_MAX_PREPARED_BYTES, FENCED_TRANSITION_MAX_PREPARED_LAYERS,
+    FENCED_TRANSITION_OUTCOME_RETENTION, FENCED_TRANSITION_PREPARED_SCHEMA_V1,
+    FENCED_TRANSITION_REQUEST_ID_BYTES, FENCED_TRANSITION_SCHEMA_V1, FENCED_TRANSITION_SCHEMA_V2,
     FENCED_TRANSITION_V2_BODY_COMMITMENT_BYTES, FENCED_TRANSITION_V2_CALLER_NONCE_BYTES,
     FENCED_TRANSITION_V2_COMMAND_TRANSPORT_PROFILE_INPUTS,
     FENCED_TRANSITION_V2_COMMAND_TRANSPORT_SCHEMA_DESCRIPTOR,
@@ -321,9 +325,12 @@ pub use fenced_transition::{
 };
 pub use fenced_transition_journal::{
     FencedTransitionV2JournalScope, FencedTransitionV2PreparedJournal,
-    FencedTransitionV2PreparedJournalKey, PreparedFencedTransitionJournal,
+    FencedTransitionV2PreparedJournalKey, FencedTransitionV2RecoveryJournal,
+    FencedTransitionV2RecoveryJournalKey, PreparedFencedTransitionJournal,
     PreparedFencedTransitionJournalKey, FENCED_TRANSITION_V2_PREPARED_JOURNAL_KEY_BYTES,
-    PREPARED_FENCED_TRANSITION_JOURNAL_KEY_BYTES,
+    FENCED_TRANSITION_V2_RECOVERY_JOURNAL_KEY_BYTES,
+    FENCED_TRANSITION_V2_RECOVERY_JOURNAL_MAX_ENTRIES,
+    FENCED_TRANSITION_V2_RECOVERY_RECLAIM_BATCH_MAX, PREPARED_FENCED_TRANSITION_JOURNAL_KEY_BYTES,
 };
 pub use handover::{
     HandoverEnvelope, HandoverEnvelopeDecodeError, HandoverEnvelopeFormat, HandoverError,
