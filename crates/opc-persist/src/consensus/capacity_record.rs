@@ -27,6 +27,10 @@ mod config_capacity_aad_shape;
 #[path = "tests/config_capacity_957_normalization_observation.rs"]
 pub(crate) mod normalization_observation;
 
+#[cfg(all(test, target_os = "linux"))]
+#[path = "tests/config_capacity_957_transferred_owner_observation.rs"]
+pub(crate) mod transferred_owner_observation;
+
 #[cfg(test)]
 thread_local! {
     static RECORD_ISSUES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
@@ -76,6 +80,45 @@ impl PreparedCapacityCommit {
             if let Some(observation) = observed_normalization {
                 observation.after_handoff(&commit);
             }
+            #[cfg(all(test, target_os = "linux"))]
+            let transferred_owners =
+                transferred_owner_observation::begin(&commit, reservation.is_some());
+            // These remaining transferred backing allocations survive audit
+            // finalization. Replace only spare capacity, while the original
+            // destination reservation still owns the consumed preparation.
+            let principal = compact_principal(&commit.record.principal)?;
+            let mut digest = compact_vec_backing(&commit.record.plaintext_digest)?;
+            if let Some(replacement) = digest.as_mut() {
+                replacement.extend_from_slice(&commit.record.plaintext_digest);
+            }
+            let audit = compact_vec_backing(&commit.audit)?;
+            #[cfg(all(test, target_os = "linux"))]
+            if let Some(observation) = transferred_owners.as_ref() {
+                observation.before_handoff(
+                    &commit,
+                    principal.as_ref(),
+                    digest.as_ref(),
+                    audit.as_ref(),
+                );
+            }
+            if let Some(replacement) = principal {
+                commit.record.principal = replacement;
+            }
+            if let Some(replacement) = digest {
+                commit.record.plaintext_digest = replacement;
+            }
+            if let Some(mut replacement) = audit {
+                // Move initialized entries and their nested owners exactly once.
+                // The empty replacement already has room for every entry.
+                for entry in commit.audit.drain(..) {
+                    replacement.push(entry);
+                }
+                commit.audit = replacement;
+            }
+            #[cfg(all(test, target_os = "linux"))]
+            if let Some(observation) = transferred_owners {
+                observation.after_handoff(&commit);
+            }
         }
         let binding = match profile {
             ConfigCapacityProfile::Legacy => None,
@@ -115,6 +158,42 @@ fn compact_ciphertext(encoded: &Vec<u8>) -> Result<Option<Vec<u8>>, PersistError
         ));
     }
     replacement.extend_from_slice(encoded);
+    Ok(Some(replacement))
+}
+
+// Exact fallible replacements make simultaneous old/new allocations explicit.
+// No spare backing or nested owner is hidden by a shorter logical view.
+fn compact_principal(original: &String) -> Result<Option<String>, PersistError> {
+    if original.capacity() == original.len() {
+        return Ok(None);
+    }
+    let mut replacement = String::new();
+    replacement.try_reserve_exact(original.len()).map_err(|_| {
+        PersistError::preflight_failed("configuration principal normalization allocation failed")
+    })?;
+    if replacement.capacity() != original.len() {
+        return Err(PersistError::preflight_failed(
+            "configuration principal normalization exceeded its exact extent",
+        ));
+    }
+    replacement.push_str(original);
+    Ok(Some(replacement))
+}
+
+// The caller fills the reserved extent by copying bytes or moving audit entries.
+fn compact_vec_backing<T>(original: &Vec<T>) -> Result<Option<Vec<T>>, PersistError> {
+    if original.capacity() == original.len() {
+        return Ok(None);
+    }
+    let mut replacement = Vec::new();
+    replacement.try_reserve_exact(original.len()).map_err(|_| {
+        PersistError::preflight_failed("configuration metadata normalization allocation failed")
+    })?;
+    if replacement.capacity() != original.len() {
+        return Err(PersistError::preflight_failed(
+            "configuration metadata normalization exceeded its exact extent",
+        ));
+    }
     Ok(Some(replacement))
 }
 

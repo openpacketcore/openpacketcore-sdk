@@ -657,7 +657,16 @@ async fn ready(store: &ConsensusConfigStore) {
 }
 
 async fn public_audited_ledger_lifetime(continuity: bool, expanded: bool) {
+    public_audited_ledger_lifetime_with_transferred_owners(continuity, expanded, false).await;
+}
+
+async fn public_audited_ledger_lifetime_with_transferred_owners(
+    continuity: bool,
+    expanded: bool,
+    transferred_owners: bool,
+) {
     assert!(!expanded || continuity);
+    assert!(!transferred_owners || expanded);
     let scratch = std::env::var_os("TMPDIR")
         .or_else(|| {
             (std::env::var("GITHUB_ACTIONS").ok().as_deref() == Some("true"))
@@ -807,9 +816,13 @@ async fn public_audited_ledger_lifetime(continuity: bool, expanded: bool) {
     // guard, which refuses 15 MiB before any Intent can be admitted. Both the
     // reserved backing and eventual prepared owner are measured concretely.
     let transferred_capacity = 14 * 1024 * 1024 + usize::from(expanded) * 512 * 1024;
-    encrypted_blob.reserve_exact(transferred_capacity - encrypted_blob.len());
-    assert!(encrypted_blob.capacity() >= transferred_capacity);
-    let record = CommitRecord {
+    if !transferred_owners {
+        encrypted_blob.reserve_exact(transferred_capacity - encrypted_blob.len());
+        assert!(encrypted_blob.capacity() >= transferred_capacity);
+    } else {
+        assert_eq!(encrypted_blob.capacity(), encrypted_blob.len());
+    }
+    let mut record = CommitRecord {
         tx_id,
         parent_tx_id: None,
         version: ConfigVersion::new(1),
@@ -822,7 +835,7 @@ async fn public_audited_ledger_lifetime(continuity: bool, expanded: bool) {
         rollback_point: false,
         confirmed_deadline: None,
     };
-    let audit = (0..22)
+    let mut audit: Vec<crate::AuditRecord> = (0..22)
         .map(|sequence| crate::AuditRecord {
             tx_id,
             sequence,
@@ -838,6 +851,50 @@ async fn public_audited_ledger_lifetime(continuity: bool, expanded: bool) {
             entry_hmac: [0; 32],
         })
         .collect();
+    if transferred_owners {
+        // Redistribute exactly the existing ciphertext case's spare backing.
+        // No logical bytes, audit entries or admission formula are changed.
+        let spare = transferred_capacity - record.encrypted_blob.capacity();
+        let principal_capacity = record.principal.capacity();
+        let digest_capacity = record.plaintext_digest.capacity();
+        let audit_capacity = audit.capacity();
+        let principal_extra = spare / 3;
+        let audit_extra = (spare / 3) / size_of::<crate::AuditRecord>();
+        let digest_extra = spare - principal_extra - audit_extra * size_of::<crate::AuditRecord>();
+        record
+            .principal
+            .reserve_exact(principal_capacity + principal_extra - record.principal.len());
+        record
+            .plaintext_digest
+            .reserve_exact(digest_capacity + digest_extra - record.plaintext_digest.len());
+        audit.reserve_exact(audit_capacity + audit_extra - audit.len());
+        assert_eq!(
+            record.principal.capacity(),
+            principal_capacity + principal_extra
+        );
+        assert_eq!(
+            record.plaintext_digest.capacity(),
+            digest_capacity + digest_extra
+        );
+        assert_eq!(audit.capacity(), audit_capacity + audit_extra);
+        assert_eq!(record.principal.len(), 16_384);
+        assert_eq!(record.plaintext_digest.len(), 32);
+        assert_eq!(audit.len(), 22);
+        assert_eq!(
+            record.principal.capacity() - principal_capacity + record.plaintext_digest.capacity()
+                - digest_capacity
+                + (audit.capacity() - audit_capacity) * size_of::<crate::AuditRecord>(),
+            spare,
+            "real transferred allocations exactly replace the old ciphertext spare capacity"
+        );
+    }
+    let transferred_observation = transferred_owners.then(|| {
+        crate::consensus::capacity_record::transferred_owner_observation::Registration::new(
+            &record,
+            &audit,
+            envelope.encoded(),
+        )
+    });
     // The retained record's canonical principal metadata and the management
     // caller projection have independent size contracts; keep both valid.
     let caller_principal =
@@ -938,6 +995,9 @@ async fn public_audited_ledger_lifetime(continuity: bool, expanded: bool) {
     if expanded {
         println!("CONFIG_CAPACITY_LEDGER_CLOSURE_LIFECYCLE exact_readback=true original_recovery=true retained_reopen=true mandatory_checkpoint=true");
     }
+    if transferred_owners {
+        println!("CONFIG_CAPACITY_TRANSFERRED_OWNERS_LIFECYCLE exact_readback=true original_recovery=true retained_reopen=true mandatory_checkpoint=true");
+    }
     let measured = observation.finish();
     // These legal original owners actually survive the measured native apply.
     // Test-only plaintext/decryption witnesses are outside the production inventory.
@@ -992,7 +1052,11 @@ async fn public_audited_ledger_lifetime(continuity: bool, expanded: bool) {
             measured.peak.caller_ledger, 0,
             "PRIOR_CALLER_DROP: the previous repair remains active"
         );
-        if expanded {
+        if transferred_owners {
+            println!("CONFIG_CAPACITY_TRANSFERRED_OWNERS metadata={metadata} retained_rows=3079 signing_epochs=8 measured={measured:?}");
+            assert!(measured.peak.total <= OPERATION_BYTES,
+                "CONFIG_CAPACITY_TRANSFERRED_OWNERS_BOUND: real principal/digest/audit backing and native owners exceed 32 MiB: {:?}", measured.peak);
+        } else if expanded {
             println!("CONFIG_CAPACITY_LEDGER_CLOSURE metadata={metadata} retained_rows=3079 signing_epochs=8 exact_readback=true original_recovery=true retained_reopen=true mandatory_checkpoint=true measured={measured:?}");
             assert!(measured.peak.total <= OPERATION_BYTES,
                 "CONFIG_CAPACITY_LEDGER_CLOSURE_BOUND: actual reachable retained ledger/native owners exceed 32 MiB: {:?}", measured.peak);
@@ -1010,13 +1074,13 @@ async fn public_audited_ledger_lifetime(continuity: bool, expanded: bool) {
     // Check the actual copy overlap after the full lifecycle as well. Baseline
     // and removal controls must fail at the native bound above, not this gate.
     let normalization = normalization.finish();
-    if expanded {
+    if expanded && !transferred_owners {
         assert!(
             normalization.is_some(),
             "real reserved normalization observed"
         );
     }
-    if let Some(normalized) = normalization {
+    if let Some(normalized) = normalization.filter(|_| !transferred_owners) {
         assert!(
             normalized.has_reservation && normalized.same_bytes && normalized.old_owner_released
         );
@@ -1031,6 +1095,33 @@ async fn public_audited_ledger_lifetime(continuity: bool, expanded: bool) {
         assert!(
             normalized.total <= OPERATION_BYTES,
             "CONFIG_CAPACITY_NORMALIZATION_BOUND: real old/new/alias payloads exceed 32 MiB"
+        );
+    }
+    if let Some(observation) = transferred_observation {
+        let normalized = observation.finish();
+        assert!(normalized.has_reservation && normalized.copy_observed);
+        assert_eq!(normalized.released, [true; 3]);
+        assert_eq!(
+            normalized.post_capacities,
+            [
+                commit.record.principal.capacity(),
+                commit.record.plaintext_digest.capacity(),
+                commit.audit.capacity() * size_of::<crate::AuditRecord>()
+            ],
+        );
+        assert_eq!(
+            normalized.post_capacities,
+            [
+                commit.record.principal.len(),
+                commit.record.plaintext_digest.len(),
+                commit.audit.len() * size_of::<crate::AuditRecord>()
+            ]
+        );
+        assert!(normalized.alias_bytes > 0 && normalized.nested_bytes > 0);
+        println!("CONFIG_CAPACITY_TRANSFERRED_OWNERS_NORMALIZATION owners={normalized:?}");
+        assert!(
+            normalized.total <= OPERATION_BYTES,
+            "CONFIG_CAPACITY_TRANSFERRED_OWNERS_COPY_BOUND: old/new/alias owners exceed 32 MiB"
         );
     }
 }
@@ -1048,6 +1139,11 @@ async fn config_capacity_957_public_audited_continuity_row_lifetime() {
 #[tokio::test]
 async fn config_capacity_957_public_audited_ledger_owner_closure() {
     public_audited_ledger_lifetime(true, true).await;
+}
+
+#[tokio::test]
+async fn config_capacity_957_public_audited_transferred_owner_closure() {
+    public_audited_ledger_lifetime_with_transferred_owners(true, true, true).await;
 }
 
 async fn verify(
