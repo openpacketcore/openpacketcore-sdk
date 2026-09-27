@@ -2,7 +2,8 @@
 
 use super::{AuditKeyRing, AuditKeyTransition};
 use crate::audit_authority::ledger::{
-    authenticate, verify, EntryPayload, LedgerEntry, LedgerState,
+    authenticate, reserve_mutation, verify, EntryPayload, LedgerEntry, LedgerMutationError,
+    LedgerState,
 };
 use crate::audit_authority::AuditAuthorityError;
 use crate::ConfigConsensusIdentity;
@@ -146,7 +147,7 @@ impl LedgerState {
     pub(crate) fn seal_continuity(
         &mut self,
         keys: Option<&AuditKeyRing>,
-    ) -> Result<(), AuditAuthorityError> {
+    ) -> Result<(), LedgerMutationError> {
         #[cfg(test)]
         let observed_identity = std::ptr::from_ref(self) as usize;
         let Some(chain) = &mut self.continuity else {
@@ -154,8 +155,18 @@ impl LedgerState {
         };
         let keys = keys.ok_or(AuditAuthorityError::KeyUnavailable)?;
         if chain.rows.len() > self.entries.len() {
-            return Err(AuditAuthorityError::BindingMismatch);
+            return Err(AuditAuthorityError::BindingMismatch.into());
         }
+        #[cfg(test)]
+        let reserved_from = chain.rows.capacity();
+        let missing = self.entries.len() - chain.rows.len();
+        reserve_mutation(&mut chain.rows, missing)?;
+        #[cfg(test)]
+        crate::consensus::config_capacity_simultaneous_working_tests::ledger::changed_rows(
+            observed_identity,
+            reserved_from,
+            &chain.rows,
+        );
         for entry in &self.entries[chain.rows.len()..] {
             let epoch = chain.active_epoch;
             let previous = chain.terminal;
@@ -189,7 +200,7 @@ impl LedgerState {
         root: &crate::AuditKey,
         keys: &AuditKeyRing,
         transition: &AuditKeyTransition,
-    ) -> Result<(), AuditAuthorityError> {
+    ) -> Result<(), LedgerMutationError> {
         self.validate_continuity(Some(keys))?;
         let chain = self
             .continuity
@@ -210,7 +221,7 @@ impl LedgerState {
             chain.active_epoch,
         )?;
         if self.used_capacity()? >= self.limits.max_events {
-            return Err(AuditAuthorityError::Full);
+            return Err(AuditAuthorityError::Full.into());
         }
         self.append(
             root,

@@ -537,3 +537,287 @@ fn config_capacity_957_retained_decode_reachable_limit_roundtrip() {
     transaction.commit().expect("read transaction");
     assert!(row(&connection) == before, "at-limit read has no effects");
 }
+
+// Growth checks use the actual SQL authority dispatcher and decoded mutable
+// owner. These are component controls; the public native detector separately
+// retains mandatory completion, exact readback and retained reopen.
+fn measured_decoded_growth(continuity: bool) -> observation::Observation {
+    let (key, keys, mut stored) = fixture(3, 1);
+    if !continuity {
+        stored.ledger.as_mut().expect("active ledger").continuity = None;
+    }
+    let (_, _, fourth) = fixture(4, 1);
+    let handle = fourth.ledger.expect("real fourth lifecycle").operations[3]
+        .handle
+        .clone();
+    let signing = continuity.then_some(&keys);
+    let mut connection = database(&key, &stored);
+    let before = row(&connection);
+    let transaction = connection.transaction().expect("real apply transaction");
+    let observed = ObservationGuard::start(Sample::default());
+    apply_sync(
+        &transaction,
+        &key,
+        stored.identity,
+        &AuditCommand::Intent(handle.clone()),
+        100,
+        signing,
+    )
+    .expect("actual authority dispatcher")
+    .expect("new original Intent admitted");
+    let measured = observed.finish();
+    transaction.commit().expect("commit actual Intent");
+    let admitted = read_with_keys_sync(&connection, &key, signing, stored.identity)
+        .expect("complete authenticated readback")
+        .expect("active ledger");
+    let receipt = admitted
+        .lookup(&key, &handle, handle.body.binding.caller)
+        .expect("original authenticated lookup")
+        .expect("actual new operation");
+    assert_eq!(receipt.state(), AuditOperationState::Intent);
+    let mut expected = stored.ledger.expect("original prefix");
+    expected
+        .admit(&key, &handle, 100)
+        .expect("real expected transition");
+    expected
+        .seal_continuity(signing)
+        .expect("real expected signatures");
+    assert!(
+        admitted == expected,
+        "exact canonical state and original handles"
+    );
+    let after = row(&connection);
+    assert_eq!(after.2, before.2 + 1, "one authoritative row write");
+    assert!(after.0 != before.0 && after.1 != before.1);
+    // Complete the genuine retained operation before checking allocation shape.
+    for command in [
+        AuditCommand::Reject(handle.clone()),
+        AuditCommand::Terminal(handle.clone()),
+    ] {
+        let transaction = connection.transaction().expect("completion transaction");
+        apply_sync(&transaction, &key, stored.identity, &command, 100, signing)
+            .expect("real completion apply")
+            .expect("reserved completion admitted");
+        transaction.commit().expect("commit actual completion");
+    }
+    let completed = read_with_keys_sync(&connection, &key, signing, stored.identity)
+        .expect("authenticated complete retained read")
+        .expect("active ledger");
+    let recovered = completed
+        .lookup(&key, &handle, handle.body.binding.caller)
+        .expect("authenticate original handle")
+        .expect("original retained operation");
+    assert_eq!(recovered.state(), AuditOperationState::Rejected);
+    assert!(recovered.terminal_recorded());
+    assert_eq!(
+        measured.mutation_owners, 1,
+        "one actual decoded apply owner"
+    );
+    let initial = measured.mutation_initial.expect("decoded retained owner");
+    let final_collections = measured.mutation_final.expect("mutated retained owner");
+    assert_eq!(initial.lengths, [9, 3, if continuity { 9 } else { 0 }]);
+    assert_eq!(
+        initial.capacities, initial.lengths,
+        "real exact decoder input"
+    );
+    assert_eq!(
+        final_collections.lengths,
+        [10, 4, if continuity { 10 } else { 0 }]
+    );
+    println!(
+        "CONFIG_CAPACITY_LEDGER_GROWTH_SQL continuity={continuity} initial={initial:?} final={final_collections:?} original_recovery=true terminal=true"
+    );
+    measured
+}
+
+#[test]
+fn config_capacity_957_ledger_growth_entries() {
+    for continuity in [false, true] {
+        let measured = measured_decoded_growth(continuity);
+        let final_collections = measured.mutation_final.expect("actual owner");
+        assert_eq!(
+            final_collections.capacities[0], final_collections.lengths[0],
+            "LEDGER_GROWTH_ENTRIES: decoded append must reserve only the new entry"
+        );
+    }
+}
+
+#[test]
+fn config_capacity_957_ledger_growth_operations() {
+    for continuity in [false, true] {
+        let measured = measured_decoded_growth(continuity);
+        let final_collections = measured.mutation_final.expect("actual owner");
+        assert_eq!(
+            final_collections.capacities[1], final_collections.lengths[1],
+            "LEDGER_GROWTH_OPERATIONS: admission must reserve only the new operation"
+        );
+    }
+}
+
+#[test]
+fn config_capacity_957_ledger_growth_rows() {
+    let measured = measured_decoded_growth(true);
+    let final_collections = measured.mutation_final.expect("actual owner");
+    assert_eq!(
+        final_collections.capacities[2], final_collections.lengths[2],
+        "LEDGER_GROWTH_ROWS: sealing must reserve only the new signed row"
+    );
+}
+
+#[test]
+fn config_capacity_957_ledger_growth_full_and_exact_retry_preserve_bytes() {
+    let (key, keys, mut stored) = fixture(3, 1);
+    let ledger = stored.ledger.as_mut().expect("active ledger");
+    ledger.limits = AuditLedgerLimits::new(9, 3).expect("original supported limits");
+    let existing = ledger.operations[0].handle.clone();
+    let (_, _, fourth) = fixture(4, 1);
+    let handle = fourth.ledger.expect("real fourth lifecycle").operations[3]
+        .handle
+        .clone();
+    let mut connection = database(&key, &stored);
+    let before = row(&connection);
+    let transaction = connection.transaction().expect("full apply transaction");
+    assert!(matches!(
+        apply_sync(
+            &transaction,
+            &key,
+            stored.identity,
+            &AuditCommand::Intent(handle),
+            100,
+            Some(&keys),
+        ),
+        Ok(Err(ConfigMutationFailure::HistoryFull))
+    ));
+    transaction
+        .commit()
+        .expect("unchanged rejection transaction");
+    assert!(
+        row(&connection) == before,
+        "logical capacity refusal has no effects"
+    );
+    let transaction = connection.transaction().expect("exact retry transaction");
+    apply_sync(
+        &transaction,
+        &key,
+        stored.identity,
+        &AuditCommand::Intent(existing.clone()),
+        100,
+        Some(&keys),
+    )
+    .expect("retry apply")
+    .expect("exact admitted retry remains valid at the limit");
+    transaction.commit().expect("retry transaction");
+    let after = row(&connection);
+    assert!(after.0 == before.0 && after.1 == before.1);
+    let read = read_with_keys_sync(&connection, &key, Some(&keys), stored.identity)
+        .expect("full authentication and continuity")
+        .expect("active ledger");
+    assert!(Some(read.clone()) == stored.ledger);
+    let receipt = read
+        .lookup(&key, &existing, existing.body.binding.caller)
+        .expect("authenticate original operation")
+        .expect("retained original result");
+    assert_eq!(receipt.state(), AuditOperationState::Rejected);
+    assert!(receipt.terminal_recorded());
+}
+
+#[test]
+fn config_capacity_957_ledger_growth_intent_allocation_failure_is_storage_error() {
+    use crate::audit_authority::ledger::allocation_probe::FailureGuard;
+
+    for fail_after in 0..3 {
+        let (key, keys, stored) = fixture(3, 1);
+        let (_, _, fourth) = fixture(4, 1);
+        let handle = fourth.ledger.expect("real fourth lifecycle").operations[3]
+            .handle
+            .clone();
+        let mut connection = database(&key, &stored);
+        let before = row(&connection);
+        let transaction = connection.transaction().expect("actual apply transaction");
+        let fault = FailureGuard::start(fail_after);
+        let result = apply_sync(
+            &transaction,
+            &key,
+            stored.identity,
+            &AuditCommand::Intent(handle),
+            100,
+            Some(&keys),
+        );
+        assert!(
+            result.is_err(),
+            "LEDGER_GROWTH_ALLOCATION_IS_STORAGE: local allocation refusal cannot be a replicated command result"
+        );
+        assert!(
+            fault.injected(),
+            "actual reservation produced TryReserveError"
+        );
+        drop(fault);
+        transaction
+            .commit()
+            .expect("no authoritative mutation to commit");
+        assert!(
+            row(&connection) == before,
+            "no result or ledger write on allocation failure"
+        );
+        assert!(
+            read_with_keys_sync(&connection, &key, Some(&keys), stored.identity)
+                .expect("original state still authenticates")
+                == stored.ledger
+        );
+    }
+}
+
+#[test]
+fn config_capacity_957_ledger_growth_transition_allocation_failure_is_storage_error() {
+    use crate::audit_authority::ledger::allocation_probe::FailureGuard;
+
+    let (key, _, stored) = fixture(3, 1);
+    let (_, keys, _) = fixture(3, 2);
+    let ledger = stored.ledger.as_ref().expect("original signing prefix");
+    let chain = ledger.continuity.as_ref().expect("original continuity");
+    let transition = AuditKeyTransition::prepare(
+        &keys,
+        stored.identity,
+        ledger.sequence,
+        chain.terminal,
+        1,
+        2,
+    )
+    .expect("actual accepted next transition");
+    let mut connection = database(&key, &stored);
+    let before = row(&connection);
+    let transaction = connection
+        .transaction()
+        .expect("actual transition transaction");
+    // Append succeeds; the real following signing-row reservation refuses.
+    let fault = FailureGuard::start(1);
+    let result = apply_sync(
+        &transaction,
+        &key,
+        stored.identity,
+        &AuditCommand::Transition(transition),
+        100,
+        Some(&keys),
+    );
+    assert!(
+        result.is_err(),
+        "LEDGER_GROWTH_TRANSITION_STORAGE: post-append allocation refusal cannot become HistoryFull"
+    );
+    assert!(
+        fault.injected(),
+        "actual signing reservation produced TryReserveError"
+    );
+    drop(fault);
+    transaction
+        .commit()
+        .expect("no authoritative transition to commit");
+    assert!(
+        row(&connection) == before,
+        "original epoch and exact bytes remain"
+    );
+    assert!(
+        read_with_keys_sync(&connection, &key, Some(&keys), stored.identity)
+            .expect("original signing prefix still authenticates")
+            == stored.ledger
+    );
+}

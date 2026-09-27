@@ -10,7 +10,9 @@ use super::ConfigMutationFailure;
 use crate::audit_authority::continuity::{
     chain::ContinuityState, AuditCheckpoint, AuditKeyRing, AuditKeyTransition,
 };
-use crate::audit_authority::ledger::{LedgerState, MAX_STATE_BYTES, STATE_DOMAIN};
+use crate::audit_authority::ledger::{
+    LedgerMutationError, LedgerState, MAX_STATE_BYTES, STATE_DOMAIN,
+};
 use crate::audit_authority::{
     AuditAuthorityError, AuditLedgerLimits, AuditOperationHandle, AuditOperationState, AuditToken,
 };
@@ -268,6 +270,16 @@ pub(crate) fn write_sync(
     Ok(())
 }
 
+fn mutation_result(
+    result: Result<(), LedgerMutationError>,
+) -> io::Result<Result<(), AuditAuthorityError>> {
+    match result {
+        Ok(()) => Ok(Ok(())),
+        Err(LedgerMutationError::Authority(error)) => Ok(Err(error)),
+        Err(LedgerMutationError::Allocation) => Err(io::ErrorKind::OutOfMemory.into()),
+    }
+}
+
 pub(crate) fn apply_sync(
     conn: &Connection,
     key: &AuditKey,
@@ -328,14 +340,17 @@ pub(crate) fn apply_sync(
         command => match ledger.as_mut() {
             None => Err(AuditAuthorityError::Unavailable),
             Some(ledger) => match command {
-                AuditCommand::Intent(handle) => ledger.admit(key, handle, now),
+                AuditCommand::Intent(handle) => mutation_result(ledger.admit(key, handle, now))?,
                 AuditCommand::Reject(handle) => {
-                    ledger.resolve(key, handle, AuditOperationState::Rejected)
+                    mutation_result(ledger.resolve(key, handle, AuditOperationState::Rejected))?
                 }
-                AuditCommand::Terminal(handle) => ledger.acknowledge_terminal(key, handle),
-                AuditCommand::Transition(transition) => keys
-                    .ok_or(AuditAuthorityError::KeyUnavailable)
-                    .and_then(|keys| ledger.transition_key(key, keys, transition)),
+                AuditCommand::Terminal(handle) => {
+                    mutation_result(ledger.acknowledge_terminal(key, handle))?
+                }
+                AuditCommand::Transition(transition) => match keys {
+                    Some(keys) => mutation_result(ledger.transition_key(key, keys, transition))?,
+                    None => Err(AuditAuthorityError::KeyUnavailable),
+                },
                 AuditCommand::Checkpoint(checkpoint) => keys
                     .ok_or(AuditAuthorityError::KeyUnavailable)
                     .and_then(|keys| {

@@ -39,6 +39,29 @@ pub(crate) struct Sample {
     pub(crate) total: usize,
 }
 
+// Before/after capacities of the actual mutable ledger, not simultaneous byte
+// charges and not estimates of parser storage or allocator-internal overlap.
+#[derive(Clone, Copy, Debug, Default)]
+pub(crate) struct LedgerCollections {
+    pub(crate) lengths: [usize; 3],
+    pub(crate) capacities: [usize; 3],
+}
+
+fn ledger_collections(ledger: &LedgerState) -> LedgerCollections {
+    let (row_len, row_capacity) = ledger
+        .continuity
+        .as_ref()
+        .map_or((0, 0), |chain| (chain.rows.len(), chain.rows.capacity()));
+    LedgerCollections {
+        lengths: [ledger.entries.len(), ledger.operations.len(), row_len],
+        capacities: [
+            ledger.entries.capacity(),
+            ledger.operations.capacity(),
+            row_capacity,
+        ],
+    }
+}
+
 #[derive(Clone, Copy, Debug, Default)]
 pub(crate) struct Observation {
     base: Sample,
@@ -52,6 +75,9 @@ pub(crate) struct Observation {
     pub(crate) continuity_checks: usize,
     pub(crate) continuity_peak: Sample,
     pub(crate) mutation_peak: Sample,
+    pub(crate) mutation_owners: usize,
+    pub(crate) mutation_initial: Option<LedgerCollections>,
+    pub(crate) mutation_final: Option<LedgerCollections>,
     pub(crate) encoding_peak: Sample,
     pub(crate) reads: usize,
     pub(crate) apply_reads: usize,
@@ -329,7 +355,19 @@ fn ledger_owner<'a>(category: usize, ledger: &LedgerState) -> OwnerGuard<'a> {
 // The actual caller keeps the same mutable ledger until the explicit handoff
 // to write_sync. This guard stores counters only and cannot extend its lifetime.
 pub(crate) fn mutating(ledger: &LedgerState) -> OwnerGuard<'static> {
-    ledger_owner(HELD, ledger)
+    let guard = ledger_owner(HELD, ledger);
+    OBSERVATION.with(|slot| {
+        if let Some(mut observation) = slot.get() {
+            observation.mutation_owners += 1;
+            let current = ledger_collections(ledger);
+            if observation.mutation_initial.is_none() {
+                observation.mutation_initial = Some(current);
+            }
+            observation.mutation_final = Some(current);
+            slot.set(Some(observation));
+        }
+    });
+    guard
 }
 
 // Refresh only an already registered real owner, immediately after mutation.
@@ -343,6 +381,9 @@ pub(crate) fn changed(ledger: &LedgerState) {
         for category in [HELD, DECODED] {
             if observation.ledger_identities[category] == identity {
                 observation.owners[category] = ledger_heap(ledger);
+                if category == HELD {
+                    observation.mutation_final = Some(ledger_collections(ledger));
+                }
             }
         }
         sample(&mut observation);
@@ -366,6 +407,12 @@ pub(crate) fn changed_rows(identity: usize, previous_capacity: usize, rows: &Vec
                         bytes.checked_add(rows.capacity() * size_of::<SignedAuditRow>())
                     })
                     .expect("actual continuity allocation delta");
+                if category == HELD {
+                    if let Some(current) = &mut observation.mutation_final {
+                        current.lengths[2] = rows.len();
+                        current.capacities[2] = rows.capacity();
+                    }
+                }
             }
         }
         observation.continuity_rows = observation.continuity_rows.max(rows.len());
