@@ -18,6 +18,22 @@ fn original_digest<T: Serialize>(domain: &[u8], value: &T) -> [u8; 32] {
 }
 
 fn require_original_transcripts(command: &ConfigConsensusCommand, semantic_revision: u16) {
+    require_original_transcripts_at(
+        command,
+        semantic_revision,
+        17,
+        ConfigConsensusEntryDigest::from_bytes([0xA1; 32]),
+        Timestamp::from_str("2026-01-01T00:00:02Z").expect("synthetic time"),
+    );
+}
+
+fn require_original_transcripts_at(
+    command: &ConfigConsensusCommand,
+    semantic_revision: u16,
+    sequence: u64,
+    previous: ConfigConsensusEntryDigest,
+    effective_time: Timestamp,
+) {
     // Literal domains and independently selected semantic revision prevent the
     // oracle from accepting a changed domain or replay-version policy.
     assert_eq!(
@@ -28,17 +44,50 @@ fn require_original_transcripts(command: &ConfigConsensusCommand, semantic_revis
         ),
         "CONFIG_CAPACITY_COMMAND_DIGEST_BYTES_RED: exact outcome transcript"
     );
-    let previous = ConfigConsensusEntryDigest::from_bytes([0xA1; 32]);
-    let effective_time = Timestamp::from_str("2026-01-01T00:00:02Z").expect("synthetic time");
     assert_eq!(
         command
-            .calculate_applied_digest(17, previous, effective_time)
+            .calculate_applied_digest(sequence, previous, effective_time)
             .expect("real applied digest"),
         ConfigConsensusEntryDigest::from_bytes(original_digest(
             b"openpacketcore/config-consensus/command/v1\0",
-            &(17_u64, previous, effective_time, command),
+            &(sequence, previous, effective_time, command),
         )),
         "CONFIG_CAPACITY_COMMAND_DIGEST_BYTES_RED: exact applied transcript"
+    );
+    let expected_outcome =
+        serde_json::to_vec(&(semantic_revision, command.identity, &command.intent))
+            .expect("independent outcome transcript");
+    let expected_applied = serde_json::to_vec(&(sequence, previous, effective_time, command))
+        .expect("independent applied transcript");
+    let mut outcome = Vec::new();
+    let mut applied = Vec::new();
+    config_capacity_joint_digest::write_transcripts(
+        command,
+        sequence,
+        previous,
+        effective_time,
+        &mut outcome,
+        &mut applied,
+    )
+    .expect("real paired transcript writer");
+    assert_eq!(outcome, expected_outcome, "exact shared outcome JSON bytes");
+    assert_eq!(applied, expected_applied, "exact shared applied JSON bytes");
+    let (outcome, applied) = command
+        .payload_and_applied_digests(sequence, previous, effective_time)
+        .expect("real paired digests");
+    assert_eq!(
+        outcome,
+        original_digest(
+            b"openpacketcore/config-consensus/outcome/v1\0",
+            &(semantic_revision, command.identity, &command.intent),
+        )
+    );
+    assert_eq!(
+        applied,
+        ConfigConsensusEntryDigest::from_bytes(original_digest(
+            b"openpacketcore/config-consensus/command/v1\0",
+            &(sequence, previous, effective_time, command),
+        ))
     );
 }
 
@@ -99,17 +148,22 @@ fn identity() -> ConfigConsensusIdentity {
 }
 
 fn fixture(profile: ConfigCapacityProfile) -> Fixture {
+    fixture_with_parent(profile, None)
+}
+
+fn fixture_with_parent(profile: ConfigCapacityProfile, parent: Option<TxId>) -> Fixture {
     let bounded = profile == ConfigCapacityProfile::BoundedV1;
+    let version = if parent.is_some() { 2 } else { 1 };
     let tx_id = TxId::from_uuid(uuid::Uuid::from_u128(0xA4));
     let committed_at = Timestamp::from_str("2026-01-01T00:00:00Z").expect("synthetic time");
     let principal = "spiffe://qualification.invalid/tenant/test/ns/test/sa/config";
     let schema_digest = SchemaDigest::from_bytes([0xA5; 32]);
     let aad = opc_key::EnvelopeAad::config(
         TenantId::from_static("test"),
-        1,
+        version,
         opc_key::ConfigAad::new(
             tx_id,
-            None,
+            parent,
             committed_at,
             principal,
             schema_digest,
@@ -137,8 +191,8 @@ fn fixture(profile: ConfigCapacityProfile) -> Fixture {
     };
     let record = CommitRecord {
         tx_id,
-        parent_tx_id: None,
-        version: ConfigVersion::new(1),
+        parent_tx_id: parent,
+        version: ConfigVersion::new(version),
         committed_at,
         principal: principal.to_owned(),
         source: CommitSource::Gnmi,
@@ -312,5 +366,82 @@ fn config_capacity_command_digests_preserve_legacy_replay_and_bind_applied_metad
                 .expect("changed chain framing"),
             "applied chain retains sequence, predecessor and deterministic time"
         );
+        let (joint_outcome, joint_applied) = command
+            .payload_and_applied_digests(sequence, prior, time)
+            .expect("paired changed chain framing");
+        assert_eq!(
+            joint_outcome, original_payload,
+            "chain framing leaves semantic replay unchanged"
+        );
+        assert_eq!(
+            joint_applied,
+            ConfigConsensusEntryDigest::from_bytes(original_digest(
+                b"openpacketcore/config-consensus/command/v1\0",
+                &(sequence, prior, time, &command),
+            ))
+        );
+        assert_ne!(
+            joint_applied, applied,
+            "paired digest retains every applied chain field"
+        );
     }
 }
+
+#[test]
+fn config_capacity_joint_digests_emit_one_intent_and_preserve_transcripts() {
+    let mut emissions = Vec::new();
+    for profile in [
+        ConfigCapacityProfile::Legacy,
+        ConfigCapacityProfile::BoundedV1,
+    ] {
+        let fixture = fixture(profile);
+        let command = &fixture.command;
+        command
+            .validate_for_profile(command.identity, &fixture.audit_key, profile)
+            .expect("existing authenticated ordinary command");
+        let ciphertext = match &command.intent {
+            ConfigMutationIntent::AppendCommit(commit)
+            | ConfigMutationIntent::BoundedAppend { commit, .. } => &commit.record.encrypted_blob,
+            _ => unreachable!("ordinary fixture"),
+        };
+        let semantic_revision = if profile == ConfigCapacityProfile::Legacy {
+            1
+        } else {
+            8
+        };
+        require_original_transcripts(command, semantic_revision);
+        let expected_emission = serde_json::to_vec(ciphertext)
+            .expect("independent numeric byte array")
+            .len()
+            - 2;
+        let previous = ConfigConsensusEntryDigest::from_bytes([0xB2; 32]);
+        let effective_time = Timestamp::from_str("2026-01-01T00:00:02Z").expect("synthetic time");
+        let (result, emitted) =
+            crate::consensus::config_capacity_json::tests::observe_emission(|| {
+                command.payload_and_applied_digests(17, previous, effective_time)
+            });
+        let (outcome, applied) = result.expect("paired real digests");
+        assert_eq!(
+            outcome,
+            original_digest(
+                b"openpacketcore/config-consensus/outcome/v1\0",
+                &(semantic_revision, command.identity, &command.intent),
+            )
+        );
+        assert_eq!(
+            applied,
+            ConfigConsensusEntryDigest::from_bytes(original_digest(
+                b"openpacketcore/config-consensus/command/v1\0",
+                &(17_u64, previous, effective_time, command),
+            ))
+        );
+        emissions.push((profile, emitted, expected_emission));
+    }
+    assert!(
+        emissions.iter().all(|(_, emitted, expected)| emitted == expected),
+        "CONFIG_CAPACITY_JOINT_DIGEST_EMISSION_RED: all family transcript and hash oracles completed before emission comparison; observations={emissions:?}"
+    );
+}
+
+#[path = "config_capacity_digest_coverage_tests.rs"]
+mod coverage;

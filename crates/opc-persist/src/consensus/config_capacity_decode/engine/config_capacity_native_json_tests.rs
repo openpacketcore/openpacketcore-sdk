@@ -520,3 +520,64 @@ fn config_capacity_native_json_span_reuse_preserves_all_fields_and_tokens() {
         require_compatible(&serde_json::to_vec_pretty(&source).unwrap());
     }
 }
+
+#[test]
+fn config_capacity_joint_digests_cover_ordinary_and_audited_native_transcripts() {
+    use crate::consensus::types::ConfigConsensusEntryDigest;
+    use sha2::{Digest, Sha256};
+
+    // These existing fixtures are codec inputs, not admission authorities.
+    // Actual authenticated readback/recovery/reopen remains in native cost tests.
+    let mut emissions = Vec::new();
+    for (family, source) in [
+        ("ordinary", fixture(16_384, None)),
+        ("audited", audited_fixture(16_384)),
+    ] {
+        let expected_emission = serde_json::to_vec(ciphertext(&source).expect("ciphertext"))
+            .expect("independent byte array")
+            .len()
+            - 2;
+        let EntryPayload::Normal(command) = source.payload else {
+            unreachable!()
+        };
+        let previous = ConfigConsensusEntryDigest::from_bytes([0xB3; 32]);
+        let effective_time = Timestamp::from_str("2026-01-01T00:00:02Z").expect("synthetic time");
+        let (result, emitted) =
+            crate::consensus::config_capacity_json::tests::observe_emission(|| {
+                command.payload_and_applied_digests(29, previous, effective_time)
+            });
+        let (outcome, applied) = result.expect("paired digests");
+        let mut expected_outcome = Sha256::new();
+        expected_outcome.update(b"openpacketcore/config-consensus/outcome/v1\0");
+        expected_outcome.update(
+            serde_json::to_vec(&(8_u16, command.identity, &command.intent))
+                .expect("independent semantic revision-8 outcome"),
+        );
+        let expected_outcome: [u8; 32] = expected_outcome.finalize().into();
+        assert_eq!(outcome, expected_outcome, "exact ordinary/audited outcome");
+        assert_eq!(
+            command.payload_digest().expect("old outcome calculator"),
+            expected_outcome
+        );
+        let mut expected_applied = Sha256::new();
+        expected_applied.update(b"openpacketcore/config-consensus/command/v1\0");
+        expected_applied.update(
+            serde_json::to_vec(&(29_u64, previous, effective_time, &command))
+                .expect("independent complete applied command"),
+        );
+        let expected_applied =
+            ConfigConsensusEntryDigest::from_bytes(expected_applied.finalize().into());
+        assert_eq!(applied, expected_applied);
+        assert_eq!(
+            command
+                .calculate_applied_digest(29, previous, effective_time)
+                .expect("old applied calculator"),
+            expected_applied
+        );
+        emissions.push((family, emitted, expected_emission));
+    }
+    assert!(
+        emissions.iter().all(|(_, emitted, expected)| emitted == expected),
+        "CONFIG_CAPACITY_JOINT_DIGEST_EMISSION_RED: ordinary and audited byte/hash oracles completed before emission comparison; observations={emissions:?}"
+    );
+}

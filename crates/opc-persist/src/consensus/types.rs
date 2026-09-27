@@ -5,7 +5,9 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use hmac::{Hmac, KeyInit, Mac};
-use opc_consensus::{ConsensusEntryDigest, ConsensusIdentity};
+#[cfg(test)]
+use opc_consensus::ConsensusEntryDigest;
+use opc_consensus::ConsensusIdentity;
 use opc_crypto::CryptoEnvelopeRef;
 use opc_types::{Timestamp, TxId};
 use serde::{Deserialize, Serialize};
@@ -775,7 +777,8 @@ impl ConfigConsensusCommand {
         Ok(hasher.finalize().into())
     }
 
-    /// Chain one applied command to its predecessor and deterministic time.
+    /// Independent applied transcript retained for compatibility tests.
+    #[cfg(test)]
     pub(crate) fn calculate_applied_digest(
         &self,
         sequence: u64,
@@ -1014,6 +1017,8 @@ impl std::io::Write for ConfigDigestSink<'_> {
         Ok(())
     }
 }
+
+mod config_capacity_joint_digest;
 
 #[cfg(test)]
 mod config_capacity_digest_writer_tests;
