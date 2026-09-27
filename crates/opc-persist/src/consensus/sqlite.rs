@@ -1512,7 +1512,7 @@ fn json_length_bounded_cancellable<T: Serialize + ?Sized>(
         limit_exceeded: false,
         cancellation,
     };
-    let encoded = crate::consensus::config_capacity_json::to_writer(&mut writer, value);
+    let encoded = crate::consensus::config_capacity_json::count_to_writer(&mut writer, value);
     if cancellation.is_cancelled() {
         return Err(timed_out("config consensus SQLite operation timed out"));
     }
@@ -1907,6 +1907,8 @@ fn row_entry(
     }
     #[cfg(all(test, target_os = "linux"))]
     native_io::row_decoded(&entry);
+    #[cfg(test)]
+    config_capacity_retained_pointer_tests::row_decoded(entry.log_id.index);
     Ok(entry)
 }
 
@@ -2053,41 +2055,16 @@ fn validate_durable_log_state_sync(
         read_current_snapshot_sync(conn, identity, expected_members, capacity_profile)?
             .and_then(|(meta, _, _, _)| meta.last_log_id);
 
-    if let Some(snapshot_pointer) = snapshot_log_id {
-        if read_log_id_at_sync(conn, identity, snapshot_pointer.index, capacity_profile)?
-            .is_some_and(|stored| stored != snapshot_pointer)
-        {
-            return Err(invalid_data(
-                "config consensus snapshot conflicts with durable log",
-            ));
-        }
+    // Resolve the three pointer lookups from the mandatory validated scan.
+    // Keep only scalar IDs; no decoded entry or authority survives this call.
+    let expected_pointers = [snapshot_log_id, applied, committed];
+    let mut retained_pointers = [None; 3];
+    for pointer in expected_pointers.iter().flatten() {
+        // Point reads previously checked the SQLite index domain, including
+        // snapshot IDs that do not have a retained row.
+        checked_i64(pointer.index)?;
     }
 
-    if let Some(applied_pointer) = applied {
-        let covered = read_log_id_at_sync(conn, identity, applied_pointer.index, capacity_profile)?
-            .is_some_and(|stored| stored == applied_pointer)
-            || purged == Some(applied_pointer)
-            || snapshot_log_id == Some(applied_pointer)
-            || (allow_detached_snapshot && snapshot_log_id.is_none());
-        if !covered {
-            return Err(invalid_data(
-                "config consensus applied pointer lacks log or snapshot lineage",
-            ));
-        }
-    }
-    if let Some(committed_pointer) = committed {
-        let covered =
-            read_log_id_at_sync(conn, identity, committed_pointer.index, capacity_profile)?
-                .is_some_and(|stored| stored == committed_pointer)
-                || applied == Some(committed_pointer)
-                || purged == Some(committed_pointer)
-                || snapshot_log_id == Some(committed_pointer);
-        if !covered {
-            return Err(invalid_data(
-                "config consensus committed pointer lacks durable lineage",
-            ));
-        }
-    }
     if purged.is_some() && snapshot_log_id.is_none() && !allow_detached_snapshot {
         return Err(invalid_data(
             "config consensus purged pointer lacks snapshot lineage",
@@ -2160,6 +2137,12 @@ fn validate_durable_log_state_sync(
                         audit_key,
                         capacity_profile,
                     )?;
+                    for (expected, retained) in expected_pointers.iter().zip(&mut retained_pointers)
+                    {
+                        if expected.is_some_and(|pointer| pointer.index == entry.log_id.index) {
+                            *retained = Some(entry.log_id);
+                        }
+                    }
                     decoded = decoded
                         .checked_add(1)
                         .ok_or_else(|| invalid_data("config consensus log count overflow"))?;
@@ -2175,6 +2158,36 @@ fn validate_durable_log_state_sync(
         _ => {
             return Err(invalid_data(
                 "persisted config consensus log aggregate is invalid",
+            ));
+        }
+    }
+    if let Some(snapshot_pointer) = snapshot_log_id {
+        if retained_pointers[0].is_some_and(|stored| stored != snapshot_pointer) {
+            return Err(invalid_data(
+                "config consensus snapshot conflicts with durable log",
+            ));
+        }
+    }
+
+    if let Some(applied_pointer) = applied {
+        let covered = retained_pointers[1].is_some_and(|stored| stored == applied_pointer)
+            || purged == Some(applied_pointer)
+            || snapshot_log_id == Some(applied_pointer)
+            || (allow_detached_snapshot && snapshot_log_id.is_none());
+        if !covered {
+            return Err(invalid_data(
+                "config consensus applied pointer lacks log or snapshot lineage",
+            ));
+        }
+    }
+    if let Some(committed_pointer) = committed {
+        let covered = retained_pointers[2].is_some_and(|stored| stored == committed_pointer)
+            || applied == Some(committed_pointer)
+            || purged == Some(committed_pointer)
+            || snapshot_log_id == Some(committed_pointer);
+        if !covered {
+            return Err(invalid_data(
+                "config consensus committed pointer lacks durable lineage",
             ));
         }
     }
@@ -6341,3 +6354,7 @@ mod config_capacity_log_reader_tests;
 #[cfg(all(test, target_os = "linux"))]
 #[path = "sqlite/config_capacity_ledger_fault_tests.rs"]
 mod config_capacity_ledger_fault_tests;
+
+#[cfg(test)]
+#[path = "sqlite/config_capacity_retained_pointer_tests.rs"]
+mod config_capacity_retained_pointer_tests;

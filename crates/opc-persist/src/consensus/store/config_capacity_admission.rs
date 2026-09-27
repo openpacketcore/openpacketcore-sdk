@@ -110,7 +110,7 @@ fn json_size<T: Serialize>(value: &T, limit: usize) -> Result<usize, ForwardMuta
         limit,
         exceeded: false,
     };
-    match crate::consensus::config_capacity_json::to_writer(&mut sink, value) {
+    match crate::consensus::config_capacity_json::count_to_writer(&mut sink, value) {
         Ok(()) => Ok(sink.bytes),
         Err(_) if sink.exceeded => Err(ForwardMutationRejection::CommandTooLarge),
         Err(_) => Err(ForwardMutationRejection::InvalidCommand),

@@ -109,3 +109,85 @@ fn capacity_native_json_preserves_cancellation_on_both_passes() {
         assert!(cancellation.authorize_commit().is_err());
     }
 }
+
+#[test]
+fn capacity_native_count_only_matches_all_byte_widths_and_escapes() {
+    use crate::consensus::config_capacity_json::tests::{byte_cases, observe_emission, Bytes};
+
+    let cancellation = SqliteWorkCancellation::new();
+    let metadata = "synthetic\0\n\r\t\"\\\u{0001}é🦀";
+    let mut emitted_total = 0_usize;
+    for bytes in byte_cases() {
+        let value = (metadata, Bytes(&bytes));
+        let original = serde_json::to_vec(&(metadata, bytes.as_slice())).unwrap();
+        let (count, emitted) = observe_emission(|| {
+            json_length_bounded_cancellable(
+                &value,
+                original.len(),
+                "synthetic entry limit",
+                &cancellation,
+            )
+        });
+        assert_eq!(count.unwrap(), original.len());
+        let over = json_length_bounded_cancellable(
+            &value,
+            original.len() - 1,
+            "synthetic entry limit",
+            &cancellation,
+        )
+        .unwrap_err();
+        assert_eq!(over.kind(), io::ErrorKind::InvalidData);
+        assert_eq!(over.to_string(), "synthetic entry limit");
+        let encoded = encode_json_bounded_cancellable(
+            &value,
+            original.len(),
+            "synthetic entry limit",
+            &cancellation,
+        )
+        .unwrap();
+        assert_eq!(encoded, original);
+        assert_eq!(encoded.capacity(), encoded.len());
+        let decoded: (String, Vec<u8>) = serde_json::from_slice(&encoded).unwrap();
+        assert_eq!(decoded, (metadata.to_owned(), bytes));
+        emitted_total = emitted_total.checked_add(emitted).unwrap();
+    }
+    assert_eq!(emitted_total, 0, "CONFIG_CAPACITY_NATIVE_COUNT_DIGITS_RED");
+}
+
+#[test]
+fn capacity_native_count_only_preserves_overflow_and_serialization_errors() {
+    use std::io::Write;
+
+    let cancellation = SqliteWorkCancellation::new();
+    let mut writer = BoundedJsonWriter {
+        bytes: None,
+        written: usize::MAX,
+        limit: usize::MAX,
+        limit_exceeded: false,
+        cancellation: &cancellation,
+    };
+    let error = writer.write(&[0]).unwrap_err();
+    assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+    assert_eq!(
+        error.to_string(),
+        "config consensus encoding length overflow"
+    );
+    assert_eq!(writer.written, usize::MAX);
+    assert!(!writer.limit_exceeded);
+
+    struct Refuses;
+    impl Serialize for Refuses {
+        fn serialize<S: serde::Serializer>(&self, _: S) -> Result<S::Ok, S::Error> {
+            Err(serde::ser::Error::custom("synthetic serialization refusal"))
+        }
+    }
+    let error = json_length_bounded_cancellable(
+        &Refuses,
+        usize::MAX,
+        "synthetic entry limit",
+        &cancellation,
+    )
+    .unwrap_err();
+    assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+    assert_eq!(error.to_string(), "config consensus encoding failed");
+}

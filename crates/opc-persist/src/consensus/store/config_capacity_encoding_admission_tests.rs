@@ -371,3 +371,132 @@ fn capacity_final_command_admission_uses_the_independent_store_profile() {
         ConfigCapacityProfile::Legacy,
     ));
 }
+
+#[test]
+fn capacity_admission_count_only_matches_all_byte_widths_and_escapes() {
+    use crate::consensus::config_capacity_json::tests::{byte_cases, observe_emission, Bytes};
+
+    let metadata = "synthetic\0\n\r\t\"\\\u{0001}é🦀";
+    let mut emitted_total = 0_usize;
+    for bytes in byte_cases() {
+        let value = (metadata, Bytes(&bytes));
+        let original = serde_json::to_vec(&(metadata, bytes.as_slice())).unwrap();
+        let (count, emitted) = observe_emission(|| json_size(&value, original.len()));
+        assert_eq!(count, Ok(original.len()));
+        assert_eq!(
+            json_size(&value, original.len() - 1),
+            Err(ForwardMutationRejection::CommandTooLarge)
+        );
+        emitted_total = emitted_total.checked_add(emitted).unwrap();
+    }
+    assert_eq!(
+        emitted_total, 0,
+        "CONFIG_CAPACITY_ADMISSION_COUNT_DIGITS_RED"
+    );
+}
+
+fn assert_count_only_at_limit_command(audited: bool) {
+    use crate::consensus::audit_mutation::AuditedConfigEffect;
+    use crate::consensus::config_capacity_json::{self, tests::observe_emission};
+    use crate::consensus::sqlite::{committed_apply_batch_end, SqliteWorkCancellation};
+    #[cfg(target_os = "linux")]
+    use crate::consensus::store::config_capacity_cost_observation::{Observation, Scope};
+
+    let mut command = command(opc_crypto::CONFIG_CAPACITY_V1_LOGICAL_BYTES);
+    command.request_id = ConsensusRequestId::from_bytes([if audited { 0xB8 } else { 0xB9 }; 16]);
+    if audited {
+        let ConfigMutationIntent::BoundedAppend {
+            commit,
+            binding,
+            resolution,
+        } = command.intent
+        else {
+            panic!("genuine bounded fixture");
+        };
+        let prepared = decoding::audited(AuditedConfigEffect::BoundedAppend {
+            commit,
+            binding,
+            resolution,
+        });
+        prepared.verify_effect(&key()).unwrap();
+        command.intent = ConfigMutationIntent::AuditedMutation(prepared.command().clone());
+    }
+    command
+        .intent
+        .validate_capacity(identity(), &key(), PROFILE)
+        .expect("real encryption, retained binding and capacity checks");
+    let node = ConsensusNodeId::new(CONSENSUS_NODE_ID_MAX).unwrap();
+    let entry = Entry::<ConfigRaftTypeConfig> {
+        log_id: LogId::new(CommittedLeaderId::new(u64::MAX, node), u64::MAX),
+        payload: EntryPayload::Normal(command.clone()),
+    };
+    let original = serde_json::to_vec(&entry).unwrap();
+    let recovery = match &command.intent {
+        ConfigMutationIntent::AuditedMutation(prepared) => serde_json::to_vec(prepared).unwrap(),
+        _ => Vec::new(),
+    };
+    let (sizes, admission_emitted) = observe_emission(|| preflight(&probe(&command), PROFILE));
+    let sizes = sizes.expect("all unchanged admission bounds");
+    assert_eq!(sizes.durable_json, original.len());
+    assert_eq!(sizes.recovery_json, recovery.len());
+    assert_eq!(sizes.command, encode_bounded(&command).unwrap().len());
+
+    #[cfg(target_os = "linux")]
+    let native_counts = Observation::new(command.request_id);
+    let entries = std::slice::from_ref(&entry);
+    let (end, native_emitted) = observe_emission(|| {
+        #[cfg(target_os = "linux")]
+        let _scope = Scope::batch_sizing(entries);
+        committed_apply_batch_end(
+            entries,
+            &SqliteWorkCancellation::new_for_capacity_observation(),
+        )
+    });
+    assert_eq!(end.unwrap(), 1);
+    #[cfg(target_os = "linux")]
+    {
+        let counts = native_counts.snapshot();
+        assert_eq!(counts.batch_sizing_counts, 1);
+        assert_eq!(counts.batch_sizing_encoded_bytes, original.len());
+    }
+
+    // Calibrate the work detector against the real emitting formatter, then
+    // retain exact bytes and typed readback independently of the work checks.
+    let mut emitted_json = Vec::new();
+    let (result, output_emitted) =
+        observe_emission(|| config_capacity_json::to_writer(&mut emitted_json, &entry));
+    result.unwrap();
+    assert!(output_emitted > opc_crypto::CONFIG_CAPACITY_V1_LOGICAL_BYTES);
+    assert_eq!(emitted_json, original);
+    let decoded: Entry<ConfigRaftTypeConfig> = serde_json::from_slice(&emitted_json).unwrap();
+    assert_eq!(serde_json::to_vec(&decoded).unwrap(), original);
+    assert_eq!(
+        admission_emitted, 0,
+        "CONFIG_CAPACITY_ADMISSION_COUNT_DIGITS_RED"
+    );
+    assert_eq!(native_emitted, 0, "CONFIG_CAPACITY_NATIVE_COUNT_DIGITS_RED");
+}
+
+#[test]
+fn capacity_count_only_at_limit_ordinary_preserves_admission_and_native_json() {
+    assert_count_only_at_limit_command(false);
+}
+
+#[test]
+fn capacity_count_only_at_limit_audited_preserves_admission_and_native_json() {
+    assert_count_only_at_limit_command(true);
+}
+
+#[test]
+fn capacity_admission_count_only_preserves_serialization_error_mapping() {
+    struct Refuses;
+    impl Serialize for Refuses {
+        fn serialize<S: Serializer>(&self, _: S) -> Result<S::Ok, S::Error> {
+            Err(serde::ser::Error::custom("synthetic serialization refusal"))
+        }
+    }
+    assert_eq!(
+        json_size(&Refuses, usize::MAX),
+        Err(ForwardMutationRejection::InvalidCommand)
+    );
+}
