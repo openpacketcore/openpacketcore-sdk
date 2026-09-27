@@ -34,6 +34,10 @@ pub(crate) mod observation {
     pub(crate) struct Counts {
         pub(crate) native_canonical_decodes: usize,
         pub(crate) native_fallback_decodes: usize,
+        pub(crate) native_canonical_compares: usize,
+        pub(crate) native_canonical_compare_writes: usize,
+        pub(crate) native_canonical_compare_largest_writes: usize,
+        pub(crate) native_canonical_compare_ciphertext_bytes: usize,
         pub(crate) outcome_digest_calls: usize,
         pub(crate) outcome_digest_bytes: usize,
         pub(crate) outcome_digest_updates: usize,
@@ -213,6 +217,32 @@ pub(crate) mod observation {
                 counts.applied_digest_bytes += bytes;
                 counts.applied_digest_updates += updates;
             }
+        }
+    }
+
+    // Measure the real comparison sink only after complete canonical equality.
+    // The ciphertext extent comes from its fully checked native input array;
+    // the largest write is measured by the sink, not by the formatter branch.
+    pub(crate) fn native_canonical_compared(
+        entry: &Entry<ConfigRaftTypeConfig>,
+        ciphertext_bytes: usize,
+        writes: usize,
+        largest_write: usize,
+    ) {
+        let EntryPayload::Normal(command) = &entry.payload else {
+            return;
+        };
+        let counts = OBSERVERS
+            .lock()
+            .expect("cost observer registry")
+            .get(&command.request_id)
+            .and_then(Weak::upgrade);
+        if let Some(counts) = counts {
+            let mut counts = counts.lock().expect("cost counters");
+            counts.native_canonical_compares += 1;
+            counts.native_canonical_compare_writes += writes;
+            counts.native_canonical_compare_largest_writes += largest_write;
+            counts.native_canonical_compare_ciphertext_bytes += ciphertext_bytes;
         }
     }
 
@@ -572,6 +602,20 @@ async fn run_native_cost_case(audited: bool, local_only: bool) {
     assert!(
         counts.native_canonical_decodes > 0 && counts.native_fallback_decodes == 0,
         "CONFIG_CAPACITY_NATIVE_AUDITED_DECODE_RED: ordinary and audited canonical native entries must decode without a discarded fallback, after exact readback and reopen; counts={counts:?}"
+    );
+    assert_eq!(
+        counts.native_canonical_compares, counts.native_canonical_decodes,
+        "every real canonical native row comparison is observed"
+    );
+    assert!(
+        counts.native_canonical_compares > before_reopen_counts.native_canonical_compares,
+        "the retained reopen independently decodes the original request"
+    );
+    assert!(
+        counts.native_canonical_compare_ciphertext_bytes > plaintext.len()
+            && counts.native_canonical_compare_largest_writes
+                == counts.native_canonical_compare_ciphertext_bytes,
+        "CONFIG_CAPACITY_NATIVE_CANONICAL_SPAN_RED: the real native comparison must reuse each fully validated numeric ciphertext span after exact readback, original-handle recovery and retained reopen; counts={counts:?}"
     );
     for (domain, calls, bytes, updates) in [
         (
