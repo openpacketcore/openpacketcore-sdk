@@ -14,6 +14,18 @@ use opc_types::{NetworkFunctionKind, SpiffeId, TenantId};
 use p256::ecdsa::{signature::hazmat::PrehashSigner, SigningKey};
 use serde::{Deserialize, Serialize};
 
+pub use super::membership::{
+    is_replayed_joint_voting_for_test, observe_next_unstage_supervisor_for_test,
+    pause_next_learner_barrier_snapshot_for_test, pause_next_outbound_learner_barrier_for_test,
+    pause_next_outbound_voting_barrier_for_test, pause_next_staged_reconciliation_for_test,
+    replay_applied_learner_barrier_for_test, replay_joint_voting_barrier_for_test,
+    replay_joint_voting_barrier_with_gate_probe_for_test,
+    replay_learner_barrier_with_gate_probe_for_test,
+    replay_staging_barrier_with_gate_probe_for_test, topology_admission_state_for_test,
+    wait_for_applied_learner_marker_for_test, wait_for_applied_uniform_membership_for_test,
+    wait_for_completed_staged_transition_for_test, LocalAdmissionGatePollForTest,
+    StagedReconciliationProbeForTest, TopologyAdmissionStateForTest, UnstageSupervisorProbeForTest,
+};
 use super::*;
 use crate::backend::{CompareAndSet, CompareAndSetResult, SessionBackend};
 use crate::consensus::SessionConsensusClusterId;

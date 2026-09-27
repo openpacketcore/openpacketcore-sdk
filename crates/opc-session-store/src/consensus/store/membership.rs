@@ -372,10 +372,518 @@ fn terminal_membership_is_complete(
 /// and a set-once local transport adapter.
 pub(super) struct SessionTopologyCoordinatorState {
     operation_gate: Arc<tokio::sync::RwLock<()>>,
+    local_admission_gate: Arc<tokio::sync::Mutex<()>>,
     bindings: RwLock<TopologyBindingState>,
     transport: OnceLock<Arc<dyn SessionTopologyTransportAdmission>>,
     supervisor_started: AtomicBool,
     supervisor_notify: Arc<tokio::sync::Notify>,
+    #[cfg(feature = "test-control")]
+    learner_barrier_snapshot_pause_for_test: Mutex<Option<LearnerBarrierSnapshotPauseForTest>>,
+    #[cfg(feature = "test-control")]
+    reconciliation_pause_for_test: Mutex<Option<ReconciliationPauseForTest>>,
+    #[cfg(feature = "test-control")]
+    outbound_learner_pause_for_test: Mutex<Option<LocalTransitionPauseForTest>>,
+    #[cfg(feature = "test-control")]
+    outbound_voting_pause_for_test: Mutex<Option<LocalTransitionPauseForTest>>,
+    #[cfg(feature = "test-control")]
+    unstage_supervisor_probe_for_test: Mutex<Option<UnstageSupervisorObservationForTest>>,
+}
+
+#[cfg(feature = "test-control")]
+struct LearnerBarrierSnapshotPauseForTest {
+    entered: tokio::sync::oneshot::Sender<()>,
+    release: tokio::sync::oneshot::Receiver<()>,
+}
+
+/// Pause one authenticated learner-marker barrier after it captures staging.
+///
+/// The returned receiver observes that exact boundary. Sending on the returned
+/// sender releases the real handler; dropping it makes the handler fail closed.
+#[cfg(feature = "test-control")]
+pub fn pause_next_learner_barrier_snapshot_for_test(
+    store: &ConsensusSessionStore,
+) -> Result<
+    (
+        tokio::sync::oneshot::Receiver<()>,
+        tokio::sync::oneshot::Sender<()>,
+    ),
+    SessionTopologyTransitionError,
+> {
+    let mut pause = store
+        .inner
+        .topology_coordinator
+        .learner_barrier_snapshot_pause_for_test
+        .lock()
+        .map_err(|_| SessionTopologyTransitionError::Unavailable)?;
+    if pause.is_some() {
+        return Err(SessionTopologyTransitionError::TransitionInProgress);
+    }
+    let (entered, observed) = tokio::sync::oneshot::channel();
+    let (release, released) = tokio::sync::oneshot::channel();
+    *pause = Some(LearnerBarrierSnapshotPauseForTest {
+        entered,
+        release: released,
+    });
+    Ok((observed, release))
+}
+
+/// Replay an exact locally applied learner marker through the real admission handler.
+///
+/// The marker comes from durable transition evidence; the normal handler still
+/// validates the sender, scope, transition identity, evidence, and admission.
+#[cfg(feature = "test-control")]
+pub async fn replay_applied_learner_barrier_for_test(
+    store: &ConsensusSessionStore,
+    request: &SessionTopologyTransitionRequest,
+    authenticated_sender: SessionConsensusNodeId,
+) -> Result<bool, SessionTopologyTransitionError> {
+    let durable = store
+        .read_transition_state_before(request, transition_deadline(request)?)
+        .await?;
+    let log_index = durable
+        .evidence
+        .and_then(|evidence| evidence.learners_ready_log_index)
+        .ok_or(SessionTopologyTransitionError::InvalidEvidenceState)?;
+    let reply = store
+        .handle_topology_admission_barrier(
+            authenticated_sender,
+            request.desired_identity(),
+            TopologyAdmissionBarrierRequest {
+                transition_id: request.transition_id().as_bytes(),
+                request_digest: request.request_digest().as_bytes(),
+                action: TopologyAdmissionBarrierAction::AppliedLearnerMarker { log_index },
+            },
+        )
+        .await;
+    Ok(matches!(reply, TopologyAdmissionBarrierReply::Ready))
+}
+
+#[cfg(feature = "test-control")]
+struct LocalTransitionPauseForTest {
+    entered: tokio::sync::oneshot::Sender<tokio::time::Instant>,
+    release: tokio::sync::oneshot::Receiver<()>,
+}
+
+#[cfg(feature = "test-control")]
+struct ReconciliationPauseForTest {
+    pause: LocalTransitionPauseForTest,
+    first_poll: tokio::sync::oneshot::Sender<LocalAdmissionGatePollForTest>,
+}
+
+/// Result of the first actual poll of the local admission acquisition future.
+#[cfg(feature = "test-control")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LocalAdmissionGatePollForTest {
+    /// The real acquisition future was blocked by an existing owner.
+    Pending,
+    /// The real acquisition future returned its owned guard immediately.
+    Acquired,
+}
+
+/// One store-local reconciliation pause and its first admission-gate observation.
+#[cfg(feature = "test-control")]
+#[derive(Debug)]
+pub struct StagedReconciliationProbeForTest {
+    /// Reports the original absolute operation deadline before gate acquisition.
+    pub entered: tokio::sync::oneshot::Receiver<tokio::time::Instant>,
+    /// Releases the actual reconciliation future; dropping it fails closed.
+    pub release: tokio::sync::oneshot::Sender<()>,
+    /// Observes only this future's first actual local admission-gate poll.
+    pub first_poll: tokio::sync::oneshot::Receiver<LocalAdmissionGatePollForTest>,
+}
+
+#[cfg(feature = "test-control")]
+tokio::task_local! {
+    static ADMISSION_GATE_PROBE_FOR_TEST: std::cell::RefCell<
+        Option<tokio::sync::oneshot::Sender<LocalAdmissionGatePollForTest>>
+    >;
+    static REPLAYED_JOINT_VOTING_FOR_TEST: ();
+}
+
+#[cfg(feature = "test-control")]
+async fn observe_admission_gate_poll_for_test<F: std::future::Future>(acquisition: F) -> F::Output {
+    let observing = ADMISSION_GATE_PROBE_FOR_TEST
+        .try_with(|probe| probe.borrow().is_some())
+        .unwrap_or(false);
+    if !observing {
+        return acquisition.await;
+    }
+    // Observe the real acquisition without a cooperative-budget yield being
+    // mistaken for lock contention. Only this test-scoped lock future is
+    // unconstrained; its guard, pending state and wakeup are unmodified.
+    let acquisition = tokio::task::unconstrained(acquisition);
+    tokio::pin!(acquisition);
+    std::future::poll_fn(|context| {
+        let polled = std::future::Future::poll(acquisition.as_mut(), context);
+        if let Some(sender) = ADMISSION_GATE_PROBE_FOR_TEST
+            .try_with(|probe| probe.borrow_mut().take())
+            .ok()
+            .flatten()
+        {
+            let observation = if polled.is_pending() {
+                LocalAdmissionGatePollForTest::Pending
+            } else {
+                LocalAdmissionGatePollForTest::Acquired
+            };
+            let _ = sender.send(observation);
+        }
+        polled
+    })
+    .await
+}
+
+/// Pause the next actual background reconciliation before its operation gate.
+#[cfg(feature = "test-control")]
+pub fn pause_next_staged_reconciliation_for_test(
+    store: &ConsensusSessionStore,
+) -> Result<StagedReconciliationProbeForTest, SessionTopologyTransitionError> {
+    let mut slot = store
+        .inner
+        .topology_coordinator
+        .reconciliation_pause_for_test
+        .lock()
+        .map_err(|_| SessionTopologyTransitionError::Unavailable)?;
+    if slot.is_some() {
+        return Err(SessionTopologyTransitionError::TransitionInProgress);
+    }
+    let (entered, observed) = tokio::sync::oneshot::channel();
+    let (release, released) = tokio::sync::oneshot::channel();
+    let (first_poll, polled) = tokio::sync::oneshot::channel();
+    *slot = Some(ReconciliationPauseForTest {
+        pause: LocalTransitionPauseForTest {
+            entered,
+            release: released,
+        },
+        first_poll,
+    });
+    drop(slot);
+    store.inner.topology_coordinator.notify_supervisor();
+    Ok(StagedReconciliationProbeForTest {
+        entered: observed,
+        release,
+        first_poll: polled,
+    })
+}
+
+/// Pause a real caller after its local learner barrier, before outbound calls.
+#[cfg(feature = "test-control")]
+pub fn pause_next_outbound_learner_barrier_for_test(
+    store: &ConsensusSessionStore,
+) -> Result<
+    (
+        tokio::sync::oneshot::Receiver<tokio::time::Instant>,
+        tokio::sync::oneshot::Sender<()>,
+    ),
+    SessionTopologyTransitionError,
+> {
+    let mut slot = store
+        .inner
+        .topology_coordinator
+        .outbound_learner_pause_for_test
+        .lock()
+        .map_err(|_| SessionTopologyTransitionError::Unavailable)?;
+    if slot.is_some() {
+        return Err(SessionTopologyTransitionError::TransitionInProgress);
+    }
+    let (entered, observed) = tokio::sync::oneshot::channel();
+    let (release, released) = tokio::sync::oneshot::channel();
+    *slot = Some(LocalTransitionPauseForTest {
+        entered,
+        release: released,
+    });
+    Ok((observed, release))
+}
+
+/// True only inside the exact typed incoming joint-voting replay future.
+#[cfg(feature = "test-control")]
+pub fn is_replayed_joint_voting_for_test() -> bool {
+    REPLAYED_JOINT_VOTING_FOR_TEST.try_with(|_| ()).is_ok()
+}
+
+/// Execute the real incoming voting barrier, including its real transport callback.
+#[cfg(feature = "test-control")]
+pub async fn replay_joint_voting_barrier_for_test(
+    store: &ConsensusSessionStore,
+    request: &SessionTopologyTransitionRequest,
+    authenticated_sender: SessionConsensusNodeId,
+) -> bool {
+    let reply = REPLAYED_JOINT_VOTING_FOR_TEST
+        .scope(
+            (),
+            store.handle_topology_admission_barrier(
+                authenticated_sender,
+                request.desired_identity(),
+                TopologyAdmissionBarrierRequest {
+                    transition_id: request.transition_id().as_bytes(),
+                    request_digest: request.request_digest().as_bytes(),
+                    action: TopologyAdmissionBarrierAction::AdmitJointVoting,
+                },
+            ),
+        )
+        .await;
+    matches!(reply, TopologyAdmissionBarrierReply::Ready)
+}
+
+/// Observe the actual gate acquisition of an authenticated learner-barrier replay.
+#[cfg(feature = "test-control")]
+pub async fn replay_learner_barrier_with_gate_probe_for_test(
+    store: &ConsensusSessionStore,
+    request: &SessionTopologyTransitionRequest,
+    authenticated_sender: SessionConsensusNodeId,
+    first_poll: tokio::sync::oneshot::Sender<LocalAdmissionGatePollForTest>,
+) -> Result<bool, SessionTopologyTransitionError> {
+    ADMISSION_GATE_PROBE_FOR_TEST
+        .scope(
+            std::cell::RefCell::new(Some(first_poll)),
+            replay_applied_learner_barrier_for_test(store, request, authenticated_sender),
+        )
+        .await
+}
+
+/// Read fixed local admission facts without taking either async gate.
+#[cfg(feature = "test-control")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TopologyAdmissionStateForTest {
+    /// Raw application-admission latch, independent of other public status predicates.
+    pub admitted_latch: bool,
+    /// Exact transition staging is still present.
+    pub staged: bool,
+    /// The local descriptor binding names the exact successor request.
+    pub current_request: bool,
+}
+
+/// Return local admission facts for controlled scheduling assertions.
+#[cfg(feature = "test-control")]
+pub fn topology_admission_state_for_test(
+    store: &ConsensusSessionStore,
+    request: &SessionTopologyTransitionRequest,
+) -> Result<TopologyAdmissionStateForTest, SessionTopologyTransitionError> {
+    Ok(TopologyAdmissionStateForTest {
+        admitted_latch: store.inner.admitted.load(Ordering::Acquire),
+        staged: store
+            .inner
+            .topology_coordinator
+            .has_exact_staged_request(request)?,
+        current_request: store
+            .inner
+            .topology_coordinator
+            .is_current_request(request)?,
+    })
+}
+
+/// Observe the exact durable learner marker using Raft apply notifications.
+/// The caller supplies an already-running operation's original absolute deadline.
+#[cfg(feature = "test-control")]
+pub async fn wait_for_applied_learner_marker_for_test(
+    store: &ConsensusSessionStore,
+    request: &SessionTopologyTransitionRequest,
+    deadline: tokio::time::Instant,
+) -> Result<u64, SessionTopologyTransitionError> {
+    let mut metrics = store.inner.raft.metrics();
+    loop {
+        drop(metrics.borrow_and_update());
+        let durable = store
+            .read_transition_state_before(request, deadline)
+            .await?;
+        if let Some(log_index) = durable
+            .evidence
+            .and_then(|evidence| evidence.learners_ready_log_index)
+        {
+            return Ok(log_index);
+        }
+        tokio::time::timeout_at(deadline, metrics.changed())
+            .await
+            .map_err(|_| SessionTopologyTransitionError::DeadlineExceededResumable)?
+            .map_err(|_| SessionTopologyTransitionError::Unavailable)?;
+    }
+}
+
+/// Observe real durable terminal application while reconciliation is held.
+/// The caller supplies the already-running operation's original absolute deadline.
+#[cfg(feature = "test-control")]
+pub async fn wait_for_completed_staged_transition_for_test(
+    store: &ConsensusSessionStore,
+    request: &SessionTopologyTransitionRequest,
+    deadline: tokio::time::Instant,
+) -> Result<(), SessionTopologyTransitionError> {
+    let mut metrics = store.inner.raft.metrics();
+    loop {
+        drop(metrics.borrow_and_update());
+        let durable = store
+            .read_transition_state_before(request, deadline)
+            .await?;
+        if status_from_durable(request, &durable)?
+            .is_some_and(|status| status.phase() == SessionTopologyTransitionPhase::Completed)
+        {
+            if !store
+                .inner
+                .topology_coordinator
+                .has_exact_staged_request(request)?
+            {
+                return Err(SessionTopologyTransitionError::InvalidEvidenceState);
+            }
+            return Ok(());
+        }
+        tokio::time::timeout_at(deadline, metrics.changed())
+            .await
+            .map_err(|_| SessionTopologyTransitionError::DeadlineExceededResumable)?
+            .map_err(|_| SessionTopologyTransitionError::Unavailable)?;
+    }
+}
+
+#[cfg(feature = "test-control")]
+struct UnstageSupervisorObservationForTest {
+    entered: tokio::sync::oneshot::Sender<tokio::time::Instant>,
+    completed: tokio::sync::oneshot::Sender<bool>,
+}
+
+/// Observations from the actual owned pre-Prepare cleanup supervisor.
+#[cfg(feature = "test-control")]
+#[derive(Debug)]
+pub struct UnstageSupervisorProbeForTest {
+    /// Original absolute deadline, emitted after the supervisor owns its guards.
+    pub entered: tokio::sync::oneshot::Receiver<tokio::time::Instant>,
+    /// Whether the unchanged cleanup result succeeded, including after caller cancellation.
+    pub completed: tokio::sync::oneshot::Receiver<bool>,
+}
+
+/// Observe one actual cleanup supervisor without owning or cancelling it.
+#[cfg(feature = "test-control")]
+pub fn observe_next_unstage_supervisor_for_test(
+    store: &ConsensusSessionStore,
+) -> Result<UnstageSupervisorProbeForTest, SessionTopologyTransitionError> {
+    let mut slot = store
+        .inner
+        .topology_coordinator
+        .unstage_supervisor_probe_for_test
+        .lock()
+        .map_err(|_| SessionTopologyTransitionError::Unavailable)?;
+    if slot.is_some() {
+        return Err(SessionTopologyTransitionError::TransitionInProgress);
+    }
+    let (entered, observed) = tokio::sync::oneshot::channel();
+    let (completed, completion) = tokio::sync::oneshot::channel();
+    *slot = Some(UnstageSupervisorObservationForTest { entered, completed });
+    Ok(UnstageSupervisorProbeForTest {
+        entered: observed,
+        completed: completion,
+    })
+}
+
+/// Pause a real caller after its local voting callback and before outbound barriers.
+#[cfg(feature = "test-control")]
+pub fn pause_next_outbound_voting_barrier_for_test(
+    store: &ConsensusSessionStore,
+) -> Result<
+    (
+        tokio::sync::oneshot::Receiver<tokio::time::Instant>,
+        tokio::sync::oneshot::Sender<()>,
+    ),
+    SessionTopologyTransitionError,
+> {
+    let mut slot = store
+        .inner
+        .topology_coordinator
+        .outbound_voting_pause_for_test
+        .lock()
+        .map_err(|_| SessionTopologyTransitionError::Unavailable)?;
+    if slot.is_some() {
+        return Err(SessionTopologyTransitionError::TransitionInProgress);
+    }
+    let (entered, observed) = tokio::sync::oneshot::channel();
+    let (release, released) = tokio::sync::oneshot::channel();
+    *slot = Some(LocalTransitionPauseForTest {
+        entered,
+        release: released,
+    });
+    Ok((observed, release))
+}
+
+/// Observe the actual gate acquisition of the real joint-voting replay.
+#[cfg(feature = "test-control")]
+pub async fn replay_joint_voting_barrier_with_gate_probe_for_test(
+    store: &ConsensusSessionStore,
+    request: &SessionTopologyTransitionRequest,
+    authenticated_sender: SessionConsensusNodeId,
+    first_poll: tokio::sync::oneshot::Sender<LocalAdmissionGatePollForTest>,
+) -> bool {
+    ADMISSION_GATE_PROBE_FOR_TEST
+        .scope(
+            std::cell::RefCell::new(Some(first_poll)),
+            replay_joint_voting_barrier_for_test(store, request, authenticated_sender),
+        )
+        .await
+}
+
+/// Observe a real current-scope staging barrier through the normal typed handler.
+#[cfg(feature = "test-control")]
+pub async fn replay_staging_barrier_with_gate_probe_for_test(
+    store: &ConsensusSessionStore,
+    request: &SessionTopologyTransitionRequest,
+    authenticated_sender: SessionConsensusNodeId,
+    first_poll: tokio::sync::oneshot::Sender<LocalAdmissionGatePollForTest>,
+) -> Result<bool, SessionTopologyTransitionError> {
+    let (identity, _) = store
+        .inner
+        .peer_directory
+        .current_scope()
+        .map_err(|_| SessionTopologyTransitionError::Unavailable)?;
+    let reply = ADMISSION_GATE_PROBE_FOR_TEST
+        .scope(
+            std::cell::RefCell::new(Some(first_poll)),
+            store.handle_topology_admission_barrier(
+                authenticated_sender,
+                identity,
+                TopologyAdmissionBarrierRequest {
+                    transition_id: request.transition_id().as_bytes(),
+                    request_digest: request.request_digest().as_bytes(),
+                    action: TopologyAdmissionBarrierAction::ConfirmStaged,
+                },
+            ),
+        )
+        .await;
+    Ok(matches!(reply, TopologyAdmissionBarrierReply::Ready))
+}
+
+/// Observe real uniform evidence after Raft has published its completed local apply.
+/// The caller supplies an already-running operation's original absolute deadline.
+#[cfg(feature = "test-control")]
+pub async fn wait_for_applied_uniform_membership_for_test(
+    store: &ConsensusSessionStore,
+    request: &SessionTopologyTransitionRequest,
+    deadline: tokio::time::Instant,
+) -> Result<u64, SessionTopologyTransitionError> {
+    let mut metrics = store.inner.raft.metrics();
+    loop {
+        // Consume the watch version before reading durable state. A concurrent
+        // apply then remains observable by changed(); no borrow crosses await.
+        let applied = metrics
+            .borrow_and_update()
+            .last_applied
+            .as_ref()
+            .map(|log| log.index);
+        let durable = store
+            .read_transition_state_before(request, deadline)
+            .await?;
+        if let Some(status) = status_from_durable(request, &durable)? {
+            if let Some(uniform) = status.log_indexes().uniform() {
+                SessionTopologyUniformCommitAdmissionProof::try_from_status(request, &status)?;
+                if applied.is_some_and(|applied| applied >= uniform)
+                    && classify_applied_membership(
+                        &durable.applied_membership,
+                        &durable.scope.current_members,
+                        &request.desired_consensus_node_ids(),
+                    ) == AppliedMembershipShape::DesiredUniform
+                {
+                    return Ok(uniform);
+                }
+            }
+        }
+        tokio::time::timeout_at(deadline, metrics.changed())
+            .await
+            .map_err(|_| SessionTopologyTransitionError::DeadlineExceededResumable)?
+            .map_err(|_| SessionTopologyTransitionError::Unavailable)?;
+    }
 }
 
 impl fmt::Debug for SessionTopologyCoordinatorState {
@@ -413,6 +921,7 @@ impl SessionTopologyCoordinatorState {
             .ok_or(ConsensusSessionStoreOpenError::InvalidTopology)?;
         Ok(Self {
             operation_gate: Arc::new(tokio::sync::RwLock::new(())),
+            local_admission_gate: Arc::new(tokio::sync::Mutex::new(())),
             bindings: RwLock::new(TopologyBindingState {
                 current_identity: identity,
                 current_descriptors: descriptors,
@@ -424,6 +933,16 @@ impl SessionTopologyCoordinatorState {
             transport: OnceLock::new(),
             supervisor_started: AtomicBool::new(false),
             supervisor_notify: Arc::new(tokio::sync::Notify::new()),
+            #[cfg(feature = "test-control")]
+            learner_barrier_snapshot_pause_for_test: Mutex::new(None),
+            #[cfg(feature = "test-control")]
+            reconciliation_pause_for_test: Mutex::new(None),
+            #[cfg(feature = "test-control")]
+            outbound_learner_pause_for_test: Mutex::new(None),
+            #[cfg(feature = "test-control")]
+            outbound_voting_pause_for_test: Mutex::new(None),
+            #[cfg(feature = "test-control")]
+            unstage_supervisor_probe_for_test: Mutex::new(None),
         })
     }
 
@@ -1666,8 +2185,10 @@ impl ConsensusSessionStore {
     /// This operation is cancellation-safe and idempotent. It holds the same
     /// transition fence as Prepare, proves that no durable pending command for
     /// this request exists, then removes transport admission, engine routes,
-    /// and descriptor bindings in that order. Once Prepare exists, callers
-    /// must use [`Self::abort_topology_transition`] instead.
+    /// and descriptor bindings in that order. Local admission stays serialized
+    /// from the absence read through the owned cleanup supervisor, including
+    /// after caller cancellation. Once Prepare exists, callers must use
+    /// [`Self::abort_topology_transition`] instead.
     pub async fn unstage_topology_transition_peers(
         &self,
         request: &SessionTopologyTransitionRequest,
@@ -1678,6 +2199,7 @@ impl ConsensusSessionStore {
         let operation_guard = tokio::time::timeout_at(deadline, operation_gate.write_owned())
             .await
             .map_err(|_| SessionTopologyTransitionError::DeadlineExceededResumable)?;
+        let admission_guard = self.lock_local_admission_before(deadline).await?;
         let durable = self.read_transition_state_before(request, deadline).await?;
         if let Some(pending) = durable.scope.pending.as_ref() {
             if pending.transition_id == request.transition_id().as_bytes() {
@@ -1701,21 +2223,41 @@ impl ConsensusSessionStore {
         let request = request.clone();
         let supervisor = tokio::spawn(async move {
             let _operation_guard = operation_guard;
-            transport
-                .unstage_successor_before_prepare(&request, &proof)
-                .await
-                .map_err(map_transport_error)?;
-            peer_directory
-                .unstage_before_prepare(
-                    request.transition_id(),
-                    request.request_digest(),
-                    request.expected_epoch(),
-                )
-                .map_err(|_| SessionTopologyTransitionError::InvalidTransitionBindings)?;
-            topology_coordinator
-                .drop_staged_bindings(request.transition_id(), request.request_digest())?;
-            topology_coordinator.notify_supervisor();
-            Ok::<_, SessionTopologyTransitionError>(())
+            let _admission_guard = admission_guard;
+            #[cfg(feature = "test-control")]
+            let observation = topology_coordinator
+                .unstage_supervisor_probe_for_test
+                .lock()
+                .ok()
+                .and_then(|mut slot| slot.take());
+            #[cfg(feature = "test-control")]
+            let completed = observation.map(|observation| {
+                let _ = observation.entered.send(deadline);
+                observation.completed
+            });
+            let result = async {
+                transport
+                    .unstage_successor_before_prepare(&request, &proof)
+                    .await
+                    .map_err(map_transport_error)?;
+                peer_directory
+                    .unstage_before_prepare(
+                        request.transition_id(),
+                        request.request_digest(),
+                        request.expected_epoch(),
+                    )
+                    .map_err(|_| SessionTopologyTransitionError::InvalidTransitionBindings)?;
+                topology_coordinator
+                    .drop_staged_bindings(request.transition_id(), request.request_digest())?;
+                topology_coordinator.notify_supervisor();
+                Ok::<_, SessionTopologyTransitionError>(())
+            }
+            .await;
+            #[cfg(feature = "test-control")]
+            if let Some(completed) = completed {
+                let _ = completed.send(result.is_ok());
+            }
+            result
         });
         tokio::time::timeout_at(deadline, supervisor)
             .await
@@ -1780,6 +2322,39 @@ impl ConsensusSessionStore {
         request: &SessionTopologyTransitionRequest,
     ) -> Result<(), SessionTopologyTransitionError> {
         let deadline = transition_deadline(request)?;
+        #[cfg(feature = "test-control")]
+        {
+            let pause = {
+                self.inner
+                    .topology_coordinator
+                    .reconciliation_pause_for_test
+                    .lock()
+                    .map_err(|_| SessionTopologyTransitionError::Unavailable)?
+                    .take()
+            };
+            if let Some(pause) = pause {
+                let _ = pause.pause.entered.send(deadline);
+                tokio::time::timeout_at(deadline, pause.pause.release)
+                    .await
+                    .map_err(|_| SessionTopologyTransitionError::DeadlineExceededResumable)?
+                    .map_err(|_| SessionTopologyTransitionError::Unavailable)?;
+                return ADMISSION_GATE_PROBE_FOR_TEST
+                    .scope(
+                        std::cell::RefCell::new(Some(pause.first_poll)),
+                        self.reconcile_local_staged_transition_before(request, deadline),
+                    )
+                    .await;
+            }
+        }
+        self.reconcile_local_staged_transition_before(request, deadline)
+            .await
+    }
+
+    async fn reconcile_local_staged_transition_before(
+        &self,
+        request: &SessionTopologyTransitionRequest,
+        deadline: tokio::time::Instant,
+    ) -> Result<(), SessionTopologyTransitionError> {
         let operation_gate = self.inner.topology_coordinator.operation_gate();
         let _operation_guard = tokio::time::timeout_at(deadline, operation_gate.write_owned())
             .await
@@ -2305,21 +2880,24 @@ impl ConsensusSessionStore {
             deadline,
         )
         .await?;
-        self.inner
-            .topology_coordinator
-            .finalize_staged_successor_transport(request, &status, deadline)
-            .await?;
+        {
+            let _admission_guard = self.lock_local_admission_before(deadline).await?;
+            self.inner
+                .topology_coordinator
+                .finalize_staged_successor_transport(request, &status, deadline)
+                .await?;
 
-        self.inner
-            .peer_directory
-            .finalize(
-                request.transition_id(),
-                request.request_digest(),
-                request.expected_epoch(),
-                &desired_members,
-            )
-            .map_err(|_| SessionTopologyTransitionError::Unavailable)?;
-        self.inner.topology_coordinator.finalize_bindings(request)?;
+            self.inner
+                .peer_directory
+                .finalize(
+                    request.transition_id(),
+                    request.request_digest(),
+                    request.expected_epoch(),
+                    &desired_members,
+                )
+                .map_err(|_| SessionTopologyTransitionError::Unavailable)?;
+            self.inner.topology_coordinator.finalize_bindings(request)?;
+        }
 
         // A leader removed by the new uniform set cannot manufacture terminal
         // success. A retained successor leader retries this exact request.
@@ -2988,6 +3566,45 @@ impl ConsensusSessionStore {
                 ) => {}
                 Err(error) => return Err(error),
             }
+            #[cfg(feature = "test-control")]
+            if matches!(
+                action,
+                TopologyAdmissionBarrierAction::AppliedLearnerMarker { .. }
+            ) {
+                let pause = {
+                    self.inner
+                        .topology_coordinator
+                        .outbound_learner_pause_for_test
+                        .lock()
+                        .map_err(|_| SessionTopologyTransitionError::Unavailable)?
+                        .take()
+                };
+                if let Some(pause) = pause {
+                    let _ = pause.entered.send(deadline);
+                    tokio::time::timeout_at(deadline, pause.release)
+                        .await
+                        .map_err(|_| SessionTopologyTransitionError::DeadlineExceededResumable)?
+                        .map_err(|_| SessionTopologyTransitionError::Unavailable)?;
+                }
+            }
+            #[cfg(feature = "test-control")]
+            if matches!(action, TopologyAdmissionBarrierAction::AdmitJointVoting) {
+                let pause = {
+                    self.inner
+                        .topology_coordinator
+                        .outbound_voting_pause_for_test
+                        .lock()
+                        .map_err(|_| SessionTopologyTransitionError::Unavailable)?
+                        .take()
+                };
+                if let Some(pause) = pause {
+                    let _ = pause.entered.send(deadline);
+                    tokio::time::timeout_at(deadline, pause.release)
+                        .await
+                        .map_err(|_| SessionTopologyTransitionError::DeadlineExceededResumable)?
+                        .map_err(|_| SessionTopologyTransitionError::Unavailable)?;
+                }
+            }
             let mut calls = FuturesUnordered::new();
             for (node_id, peer) in &peers {
                 let wire = SessionConsensusWireRequest::try_new(
@@ -3250,7 +3867,34 @@ impl ConsensusSessionStore {
         while calls.next().await.is_some() {}
     }
 
+    // This gate encloses no SDK-owned outbound barrier or Raft proposal. Local
+    // callers retain their existing operation gate; incoming peers need only
+    // this admission gate, avoiding reciprocal operation-gate waits.
+    async fn lock_local_admission_before(
+        &self,
+        deadline: tokio::time::Instant,
+    ) -> Result<tokio::sync::OwnedMutexGuard<()>, SessionTopologyTransitionError> {
+        let gate = Arc::clone(&self.inner.topology_coordinator.local_admission_gate);
+        let acquisition = gate.lock_owned();
+        #[cfg(feature = "test-control")]
+        let acquisition = observe_admission_gate_poll_for_test(acquisition);
+        tokio::time::timeout_at(deadline, acquisition)
+            .await
+            .map_err(|_| SessionTopologyTransitionError::DeadlineExceededResumable)
+    }
+
     async fn apply_local_transition_barrier(
+        &self,
+        request: &SessionTopologyTransitionRequest,
+        action: TopologyAdmissionBarrierAction,
+        deadline: tokio::time::Instant,
+    ) -> Result<(), SessionTopologyTransitionError> {
+        let _admission_guard = self.lock_local_admission_before(deadline).await?;
+        self.apply_local_transition_barrier_under_admission_gate(request, action, deadline)
+            .await
+    }
+
+    async fn apply_local_transition_barrier_under_admission_gate(
         &self,
         request: &SessionTopologyTransitionRequest,
         action: TopologyAdmissionBarrierAction,
@@ -3544,8 +4188,48 @@ impl ConsensusSessionStore {
         ) {
             return TopologyAdmissionBarrierReply::Ready;
         }
+        #[cfg(feature = "test-control")]
+        if matches!(
+            barrier.action,
+            TopologyAdmissionBarrierAction::AppliedLearnerMarker { .. }
+        ) {
+            let pause = match self
+                .inner
+                .topology_coordinator
+                .learner_barrier_snapshot_pause_for_test
+                .lock()
+            {
+                Ok(mut pause) => pause.take(),
+                Err(_) => return TopologyAdmissionBarrierReply::NotReady,
+            };
+            if let Some(pause) = pause {
+                let _ = pause.entered.send(());
+                if !matches!(
+                    tokio::time::timeout_at(deadline, pause.release).await,
+                    Ok(Ok(()))
+                ) {
+                    return TopologyAdmissionBarrierReply::NotReady;
+                }
+            }
+        }
+        // A caller can hold its operation gate while contacting this peer.
+        // Serialize only local admission work, never wait for that outbound gate.
+        let _admission_guard = match self.lock_local_admission_before(deadline).await {
+            Ok(guard) => guard,
+            Err(_) => return TopologyAdmissionBarrierReply::NotReady,
+        };
+        // The request above was captured before waiting for the fence. Terminal
+        // reconciliation may have consumed its staging while this call waited.
+        if !self
+            .inner
+            .topology_coordinator
+            .staged_request(transition_id, request_digest)
+            .is_ok_and(|staged| staged == request)
+        {
+            return TopologyAdmissionBarrierReply::NotReady;
+        }
         if self
-            .apply_local_transition_barrier(&request, barrier.action, deadline)
+            .apply_local_transition_barrier_under_admission_gate(&request, barrier.action, deadline)
             .await
             .is_ok()
         {
@@ -3561,6 +4245,7 @@ impl ConsensusSessionStore {
         status: &SessionTopologyTransitionStatus,
         deadline: tokio::time::Instant,
     ) -> Result<(), SessionTopologyTransitionError> {
+        let _admission_guard = self.lock_local_admission_before(deadline).await?;
         if !self
             .inner
             .topology_coordinator
@@ -3595,6 +4280,7 @@ impl ConsensusSessionStore {
         status: &SessionTopologyTransitionStatus,
         deadline: tokio::time::Instant,
     ) -> Result<(), SessionTopologyTransitionError> {
+        let _admission_guard = self.lock_local_admission_before(deadline).await?;
         if !self
             .inner
             .topology_coordinator
@@ -3839,6 +4525,7 @@ mod scope_refresh_tests {
     fn coordinator(current_identity: SessionConsensusIdentity) -> SessionTopologyCoordinatorState {
         SessionTopologyCoordinatorState {
             operation_gate: Arc::new(tokio::sync::RwLock::new(())),
+            local_admission_gate: Arc::new(tokio::sync::Mutex::new(())),
             bindings: RwLock::new(TopologyBindingState {
                 current_identity,
                 current_descriptors: BTreeMap::new(),
@@ -3850,6 +4537,16 @@ mod scope_refresh_tests {
             transport: OnceLock::new(),
             supervisor_started: AtomicBool::new(false),
             supervisor_notify: Arc::new(tokio::sync::Notify::new()),
+            #[cfg(feature = "test-control")]
+            learner_barrier_snapshot_pause_for_test: Mutex::new(None),
+            #[cfg(feature = "test-control")]
+            reconciliation_pause_for_test: Mutex::new(None),
+            #[cfg(feature = "test-control")]
+            outbound_learner_pause_for_test: Mutex::new(None),
+            #[cfg(feature = "test-control")]
+            outbound_voting_pause_for_test: Mutex::new(None),
+            #[cfg(feature = "test-control")]
+            unstage_supervisor_probe_for_test: Mutex::new(None),
         }
     }
 
