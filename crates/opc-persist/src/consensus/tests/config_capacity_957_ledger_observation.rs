@@ -7,6 +7,9 @@
 use std::cell::Cell;
 use std::marker::PhantomData;
 use std::mem::size_of;
+use std::ops::Deref;
+
+use crate::audit_authority::continuity::chain::SignedAuditRow;
 
 use crate::audit_authority::ledger::{EntryPayload, LedgerEntry, LedgerOperation, LedgerState};
 use crate::audit_authority::AuditOperationHandle;
@@ -46,6 +49,9 @@ pub(crate) struct Observation {
     pub(crate) nested_reads: usize,
     pub(crate) derived_len: usize,
     pub(crate) derived_capacity: usize,
+    pub(crate) continuity_rows: usize,
+    pub(crate) continuity_bytes: usize,
+    pub(crate) validation_peak: Sample,
     pub(crate) peak: Sample,
     pub(crate) nested_peak: Sample,
 }
@@ -92,16 +98,18 @@ fn sample(observation: &mut Observation) {
     if current.total > observation.peak.total {
         observation.peak = current;
     }
+    if current.derived != 0 && current.total > observation.validation_peak.total {
+        observation.validation_peak = current;
+    }
     if current.held_ledger != 0 && current.total > observation.nested_peak.total {
         observation.nested_peak = current;
     }
 }
 
 pub(crate) fn ledger_heap(ledger: &LedgerState) -> usize {
-    assert!(
-        ledger.continuity.is_none(),
-        "fixture excludes continuity rows"
-    );
+    let continuity = ledger.continuity.as_ref().map_or(0, |chain| {
+        chain.rows.capacity() * size_of::<SignedAuditRow>()
+    });
     let boxes = ledger
         .entries
         .iter()
@@ -116,6 +124,7 @@ pub(crate) fn ledger_heap(ledger: &LedgerState) -> usize {
     ledger.entries.capacity() * size_of::<LedgerEntry>()
         + ledger.operations.capacity() * size_of::<LedgerOperation>()
         + boxes
+        + continuity
 }
 
 // Guards borrow owners wherever they do not grow. Drop order is deliberate:
@@ -183,14 +192,53 @@ pub(crate) struct ReadGuard<'a> {
     _ledger: OwnerGuard<'a>,
 }
 
-pub(crate) fn read<'a>(encoded: &'a Vec<u8>, ledger: Option<&'a LedgerState>) -> ReadGuard<'a> {
-    ReadGuard {
-        _encoded: owner(READ, || encoded.capacity()),
-        _ledger: owner(DECODED, || ledger.map_or(0, ledger_heap)),
+// This wrapper contains the actual SQL result Vec. It never clones the row or
+// lends an encoded-byte reference to the decoded-ledger guard. Field order
+// clears the observation immediately before the actual Vec is dropped.
+pub(crate) struct EncodedRead {
+    _observed: OwnerGuard<'static>,
+    encoded: Vec<u8>,
+}
+
+impl EncodedRead {
+    pub(crate) fn observe(encoded: Vec<u8>) -> Self {
+        Self {
+            _observed: owner(READ, || encoded.capacity()),
+            encoded,
+        }
     }
 }
 
+impl Deref for EncodedRead {
+    type Target = Vec<u8>;
+
+    fn deref(&self) -> &Self::Target {
+        &self.encoded
+    }
+}
+
+fn observe_continuity(ledger: Option<&LedgerState>) {
+    OBSERVATION.with(|slot| {
+        let Some(mut observation) = slot.get() else {
+            return;
+        };
+        if let Some(chain) = ledger.and_then(|ledger| ledger.continuity.as_ref()) {
+            observation.continuity_rows = observation.continuity_rows.max(chain.rows.len());
+            observation.continuity_bytes = observation
+                .continuity_bytes
+                .max(chain.rows.capacity() * size_of::<SignedAuditRow>());
+        }
+        slot.set(Some(observation));
+    });
+}
+
+pub(crate) fn decoded(ledger: Option<&LedgerState>) -> OwnerGuard<'_> {
+    observe_continuity(ledger);
+    owner(DECODED, || ledger.map_or(0, ledger_heap))
+}
+
 pub(crate) fn write<'a>(encoded: &'a Vec<u8>, ledger: Option<&'a LedgerState>) -> ReadGuard<'a> {
+    observe_continuity(ledger);
     ReadGuard {
         _encoded: owner(WRITE, || encoded.capacity()),
         _ledger: owner(DECODED, || ledger.map_or(0, ledger_heap)),

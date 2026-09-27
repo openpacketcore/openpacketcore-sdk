@@ -586,11 +586,17 @@ fn simultaneous_apply(expanded: bool) {
     let sample = observation.peak;
     assert!(
         sample.apply_page > 0
-            && sample.row_json > 0
-            && sample.decoded_ledger > 0
-            && sample.derived > 0
-            && sample.authentication > 0,
-        "SIMULTANEOUS_OWNERS: all required real owners overlap"
+            && (sample.row_json > 0 || sample.write_json > 0)
+            && sample.decoded_ledger > 0,
+        "SIMULTANEOUS_OWNERS: the real encoded ledger and decoded owner overlap"
+    );
+    let validation = observation.validation_peak;
+    assert!(
+        validation.apply_page > 0
+            && validation.decoded_ledger > 0
+            && validation.derived > 0
+            && validation.authentication > 0,
+        "VALIDATION_OWNERS: actual ledger authentication retains the derived operations"
     );
     writeln!(std::io::stdout().lock(),
         "CONFIG_CAPACITY_LEDGER_APPLY expanded={expanded} preflight_metadata={} applied_metadata={applied_metadata} reads={} apply_reads={} writes={} nested_reads={} derived_capacity={} peak={sample:?} nested_peak={:?}",

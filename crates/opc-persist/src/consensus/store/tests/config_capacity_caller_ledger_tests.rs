@@ -1,13 +1,21 @@
 //! A public audited caller must release its authenticated preflight ledger
 //! before native apply allocates an independent ledger. This observes real
 //! payload capacities; it does not measure allocator/RSS or transport buffers.
+//! The continuity case also includes the real retained signing rows and their
+//! encoded SQL owner through native apply, with mandatory external checkpoints.
 
 use super::*;
+use crate::audit_authority::continuity::chain::{ContinuityState, SignedAuditRow};
+use crate::audit_authority::continuity::checkpoint::CheckpointBody;
+use crate::audit_authority::continuity::{
+    AuditCheckpoint, AuditCheckpointAdvance, AuditCheckpointPort, AuditContinuityPolicy,
+    AuditKeyRing, AuditSigningKey,
+};
 use crate::audit_authority::ledger::{HandleBody, LedgerState};
 use crate::audit_authority::{
-    AuditAdmission, AuditCaller, AuditLedgerLimits, AuditOperationBinding, AuditOperationHandle,
-    AuditOperationReceipt, AuditOperationState, AuditPrivacyKey, AuditPrivacyProjection,
-    AuditPrivacyPurpose, PreparedAuditedMutation, ProjectedAuditEvent,
+    AuditAdmission, AuditAuthorityError, AuditCaller, AuditLedgerLimits, AuditOperationBinding,
+    AuditOperationHandle, AuditOperationReceipt, AuditOperationState, AuditPrivacyKey,
+    AuditPrivacyProjection, AuditPrivacyPurpose, PreparedAuditedMutation, ProjectedAuditEvent,
 };
 use crate::consensus::audit_mutation::{
     AuditedConfigCommand, AuditedConfigEffect, AuditedMutationFields,
@@ -22,6 +30,155 @@ use std::mem::size_of;
 
 const OPERATION_BYTES: usize = 33_554_432;
 const METADATA_BYTES: usize = 196_608;
+// The public signing-key constructor admits every nonzero epoch through i64::MAX.
+const CONTINUITY_EPOCH: u64 = i64::MAX as u64;
+
+fn continuity_keys() -> AuditKeyRing {
+    AuditKeyRing::new(vec![AuditSigningKey::new(CONTINUITY_EPOCH, [0x9C; 32])
+        .expect("distinct synthetic management signing key")])
+    .expect("admitted signing epoch")
+}
+
+// A separate monotonic authority, outside the SQLite restore domain. It keeps
+// full opaque checkpoints and compares the exact prior value, not just sequence.
+struct ExternalCheckpointFixture {
+    identity: ConfigConsensusIdentity,
+    value: std::sync::Mutex<Option<AuditCheckpoint>>,
+}
+
+impl ExternalCheckpointFixture {
+    fn new(identity: ConfigConsensusIdentity) -> Self {
+        Self {
+            identity,
+            value: std::sync::Mutex::new(None),
+        }
+    }
+}
+
+#[async_trait::async_trait]
+impl AuditCheckpointPort for ExternalCheckpointFixture {
+    async fn load(
+        &self,
+        identity: ConfigConsensusIdentity,
+    ) -> Result<Option<AuditCheckpoint>, AuditAuthorityError> {
+        if identity != self.identity {
+            return Err(AuditAuthorityError::BindingMismatch);
+        }
+        Ok(self.value.lock().expect("external checkpoint").clone())
+    }
+
+    async fn compare_advance(
+        &self,
+        identity: ConfigConsensusIdentity,
+        expected: Option<AuditCheckpoint>,
+        next: AuditCheckpoint,
+    ) -> Result<AuditCheckpointAdvance, AuditAuthorityError> {
+        if identity != self.identity {
+            return Err(AuditAuthorityError::BindingMismatch);
+        }
+        let mut current = self.value.lock().expect("external checkpoint");
+        if *current != expected
+            || current
+                .as_ref()
+                .is_some_and(|old| old.sequence() >= next.sequence())
+        {
+            return Ok(AuditCheckpointAdvance::Conflict);
+        }
+        *current = Some(next);
+        Ok(AuditCheckpointAdvance::Applied)
+    }
+}
+
+fn continuity_policy(external: &Arc<ExternalCheckpointFixture>) -> AuditContinuityPolicy {
+    AuditContinuityPolicy::new(continuity_keys(), external.clone(), CONTINUITY_EPOCH, 1)
+        .expect("independent checkpoint policy at original export limit")
+}
+
+async fn checkpoint_retained_prefix(
+    prefix: &mut LedgerState,
+    external: &Arc<ExternalCheckpointFixture>,
+) {
+    let keys = continuity_keys();
+    prefix
+        .validate_continuity(Some(&keys))
+        .expect("verify every genuine retained signature");
+    let chain = prefix.continuity.as_ref().expect("signed prefix");
+    assert_eq!(chain.rows.len(), 3069);
+    let checkpoint = AuditCheckpoint::issue(
+        &keys,
+        CheckpointBody {
+            version: 1,
+            identity: prefix.identity,
+            sequence: prefix.sequence,
+            root_anchor: prefix.terminal,
+            anchor: chain.terminal,
+            epoch_at_sequence: chain.active_epoch,
+            signing_epoch: chain.active_epoch,
+            acknowledged_export: [0; 32],
+        },
+    )
+    .expect("authenticate the exact completed prefix");
+    assert_eq!(
+        external
+            .compare_advance(prefix.identity, None, checkpoint.clone())
+            .await
+            .expect("component checkpoint CAS"),
+        AuditCheckpointAdvance::Applied
+    );
+    assert_eq!(
+        external.load(prefix.identity).await.expect("CAS readback"),
+        Some(checkpoint)
+    );
+}
+
+async fn open_fixture(
+    topology: ConfigConsensusTopology,
+    backend: SqliteBackend,
+    snapshots: std::path::PathBuf,
+    external: Option<&Arc<ExternalCheckpointFixture>>,
+) -> ConsensusConfigStore {
+    match external {
+        Some(external) => {
+            ConsensusConfigStore::open_with_audit_continuity(
+                topology,
+                backend,
+                snapshots,
+                BTreeMap::new(),
+                continuity_policy(external),
+            )
+            .await
+        }
+        None => ConsensusConfigStore::open(topology, backend, snapshots, BTreeMap::new()).await,
+    }
+    .expect("full native validation of retained identity, state and required continuity")
+}
+
+async fn verify_continuity(
+    store: &ConsensusConfigStore,
+    external: &Arc<ExternalCheckpointFixture>,
+) {
+    let ledger = store
+        .read_audit_ledger()
+        .await
+        .expect("real quorum read validates independent continuity");
+    let checkpoint = external
+        .load(store.inner.identity)
+        .await
+        .expect("independent checkpoint read")
+        .expect("required checkpoint");
+    checkpoint
+        .verify(&continuity_keys(), store.inner.identity)
+        .expect("authenticate exact independent checkpoint identity");
+    ledger
+        .matches_checkpoint(&checkpoint)
+        .expect("same retained prefix and independent signature anchor");
+    let chain = ledger.continuity.as_ref().expect("required signed state");
+    assert_eq!(ledger.sequence, 3072);
+    assert_eq!(ledger.operations.len(), 1024);
+    assert_eq!(ledger.entries.len(), chain.rows.len());
+    assert_eq!(checkpoint.sequence(), ledger.sequence);
+    assert_eq!(chain.checkpoint.as_ref(), Some(&checkpoint));
+}
 
 /// The registry retains counters only. The wrapper owns the very ledger moved
 /// out of the real quorum read, without cloning it or changing its drop scope.
@@ -277,6 +434,7 @@ fn retained_prefix(
     identity: ConfigConsensusIdentity,
     key: &AuditKey,
     privacy: &AuditPrivacyKey,
+    continuity: bool,
 ) -> LedgerState {
     let mut ledger = LedgerState::new(
         identity,
@@ -285,6 +443,10 @@ fn retained_prefix(
             .expect("projection identity"),
         AuditLedgerLimits::new(4096, 1024).expect("unchanged ledger limits"),
     );
+    let keys = continuity.then(continuity_keys);
+    if keys.is_some() {
+        ledger.continuity = Some(ContinuityState::new(CONTINUITY_EPOCH));
+    }
     // Finite component setup before the core starts. Every historical operation
     // follows real authenticated admission, rejection and terminal transitions.
     // The final operation below is publicly prepared, admitted and submitted.
@@ -318,15 +480,27 @@ fn retained_prefix(
         .expect("authenticated historical operation");
         ledger.admit(key, &handle, 100).expect("historical Intent");
         ledger
+            .seal_continuity(keys.as_ref())
+            .expect("sign actual Intent");
+        ledger
             .resolve(key, &handle, AuditOperationState::Rejected)
             .expect("historical rejection");
         ledger
+            .seal_continuity(keys.as_ref())
+            .expect("sign actual rejection");
+        ledger
             .acknowledge_terminal(key, &handle)
             .expect("historical terminal");
+        ledger
+            .seal_continuity(keys.as_ref())
+            .expect("sign actual terminal");
     }
     ledger
         .validate(key, identity)
         .expect("full authenticated prefix validation");
+    ledger
+        .validate_continuity(keys.as_ref())
+        .expect("full retained signing validation");
     assert_eq!(
         (ledger.operations.len(), ledger.entries.len()),
         (1023, 3069)
@@ -358,8 +532,7 @@ async fn ready(store: &ConsensusConfigStore) {
     ));
 }
 
-#[tokio::test]
-async fn config_capacity_957_public_audited_caller_ledger_lifetime() {
+async fn public_audited_ledger_lifetime(continuity: bool) {
     let scratch = std::env::var_os("TMPDIR")
         .or_else(|| {
             (std::env::var("GITHUB_ACTIONS").ok().as_deref() == Some("true"))
@@ -384,6 +557,7 @@ async fn config_capacity_957_public_audited_caller_ledger_lifetime() {
     assert!(!filesystem.is_empty() && !matches!(filesystem, "tmpfs" | "ramfs"));
     let topology = topology();
     let identity = topology.identity();
+    let external = continuity.then(|| Arc::new(ExternalCheckpointFixture::new(identity)));
     let key = AuditKey::new([0x93; 32]).expect("synthetic key");
     let privacy = AuditPrivacyKey::new([0x94; 32]).expect("synthetic privacy key");
     let options = RetainedConfigOptions::new(
@@ -401,7 +575,10 @@ async fn config_capacity_957_public_audited_caller_ledger_lifetime() {
     let backend = SqliteBackend::provision_config_authority(options.clone(), key.clone())
         .await
         .expect("real retained authority");
-    let prefix = retained_prefix(identity, &key, &privacy);
+    let mut prefix = retained_prefix(identity, &key, &privacy, continuity);
+    if let Some(external) = &external {
+        checkpoint_retained_prefix(&mut prefix, external).await;
+    }
     let setup_key = key.clone();
     crate::consensus::run_backend_sqlite_with_timeout(
         &backend,
@@ -413,14 +590,13 @@ async fn config_capacity_957_public_audited_caller_ledger_lifetime() {
     )
     .await
     .expect("canonical authenticated component preseed before core open");
-    let store = ConsensusConfigStore::open(
+    let store = open_fixture(
         topology.clone(),
         backend,
         root.join("snapshots"),
-        BTreeMap::new(),
+        external.as_ref(),
     )
-    .await
-    .expect("full native validation of retained prefix");
+    .await;
     ready(&store).await;
     store
         .initialize_audit_authority(
@@ -568,21 +744,40 @@ async fn config_capacity_957_public_audited_caller_ledger_lifetime() {
         receipt.state(),
         AuditOperationState::Committed { version: 1 }
     );
+    if let Some(external) = &external {
+        assert_eq!(
+            external
+                .load(identity)
+                .await
+                .expect("effect checkpoint")
+                .expect("required Intent checkpoint")
+                .sequence(),
+            3070,
+            "CONTINUITY_ADMITTED: native effect required the exact checkpointed Intent"
+        );
+    }
     let terminal = applied(store.finish_audit_operation(&handle, caller).await);
     assert!(terminal.terminal_recorded());
     assert_eq!(terminal.state(), receipt.state());
+    if let Some(external) = &external {
+        store
+            .complete_required_audit_outcome(&terminal, caller)
+            .await
+            .expect("mandatory terminal and independent checkpoint completion");
+        verify_continuity(&store, external).await;
+    }
     verify(&store, &provider, &aad, &plaintext, &prepared, caller).await;
     store.shutdown().await.expect("join native owners");
     drop(store);
     let backend = SqliteBackend::reopen_config_authority(options, key)
         .await
         .expect("full original retained authority validation");
-    let reopened =
-        ConsensusConfigStore::open(topology, backend, root.join("snapshots"), BTreeMap::new())
-            .await
-            .expect("real retained engine reopen");
+    let reopened = open_fixture(topology, backend, root.join("snapshots"), external.as_ref()).await;
     ready(&reopened).await;
     verify(&reopened, &provider, &aad, &plaintext, &prepared, caller).await;
+    if let Some(external) = &external {
+        verify_continuity(&reopened, external).await;
+    }
     reopened.shutdown().await.expect("join reopened owners");
     let measured = observation.finish();
     // These legal original owners actually survive the measured native apply.
@@ -601,11 +796,38 @@ async fn config_capacity_957_public_audited_caller_ledger_lifetime() {
     assert!(
         measured.peak.apply_page > 0
             && measured.peak.decoded_ledger > 0
-            && measured.peak.row_json > 0
+            && (measured.peak.row_json > 0 || measured.peak.write_json > 0)
     );
-    println!("CONFIG_CAPACITY_PUBLIC_CALLER_LEDGER metadata={metadata} exact_readback=true original_recovery=true retained_reopen=true measured={measured:?}");
-    assert!(measured.peak.total <= OPERATION_BYTES,
-        "CONFIG_CAPACITY_PUBLIC_CALLER_LEDGER_BOUND: real public caller and native apply payloads exceed 32 MiB: {:?}", measured.peak);
+    assert!(measured.validation_peak.derived > 0 && measured.validation_peak.authentication > 0);
+    if continuity {
+        assert_eq!(
+            measured.continuity_rows, 3071,
+            "CONTINUITY_ROWS: the measured native read includes the real committed signature"
+        );
+        assert!(measured.continuity_bytes >= 3071 * size_of::<SignedAuditRow>());
+        assert_eq!(
+            measured.peak.caller_ledger, 0,
+            "PRIOR_CALLER_DROP: the previous repair remains active"
+        );
+        println!("CONFIG_CAPACITY_PUBLIC_CONTINUITY metadata={metadata} exact_readback=true original_recovery=true retained_reopen=true mandatory_checkpoint=true measured={measured:?}");
+        assert!(measured.peak.total <= OPERATION_BYTES,
+            "CONFIG_CAPACITY_PUBLIC_CONTINUITY_BOUND: real signed retained state and native apply payloads exceed 32 MiB: {:?}", measured.peak);
+    } else {
+        assert_eq!(measured.continuity_rows, 0);
+        println!("CONFIG_CAPACITY_PUBLIC_CALLER_LEDGER metadata={metadata} exact_readback=true original_recovery=true retained_reopen=true measured={measured:?}");
+        assert!(measured.peak.total <= OPERATION_BYTES,
+            "CONFIG_CAPACITY_PUBLIC_CALLER_LEDGER_BOUND: real public caller and native apply payloads exceed 32 MiB: {:?}", measured.peak);
+    }
+}
+
+#[tokio::test]
+async fn config_capacity_957_public_audited_caller_ledger_lifetime() {
+    public_audited_ledger_lifetime(false).await;
+}
+
+#[tokio::test]
+async fn config_capacity_957_public_audited_continuity_row_lifetime() {
+    public_audited_ledger_lifetime(true).await;
 }
 
 async fn verify(

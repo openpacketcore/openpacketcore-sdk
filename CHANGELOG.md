@@ -9,6 +9,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- `opc-persist`: release the authenticated audit SQL encoding before deriving
+  retained operations. Preserve canonical authentication, identity and signing
+  continuity checks; qualify the lifetime with native durable commit and reopen
+  coverage. Full capacity qualification remains open. Refs #957.
+
 - `opc-persist`: reuse admission checks for the same locally owned bounded
   append. Received requests, legacy operations, native storage and retained
   reopen keep independent validation. Preserve admission ordering, cancellation

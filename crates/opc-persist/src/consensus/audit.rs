@@ -188,16 +188,20 @@ fn read_verified_sync(conn: &Connection, key: &AuditKey) -> io::Result<StoredLed
         [], |row| Ok((row.get(0)?,row.get(1)?)),
     ).optional().map_err(|_| invalid())?.ok_or_else(invalid)?;
     let mac: [u8; 32] = mac.try_into().map_err(|_| invalid())?;
+    #[cfg(test)]
+    let encoded =
+        super::config_capacity_simultaneous_working_tests::ledger::EncodedRead::observe(encoded);
     let stored: StoredLedger = serde_json::from_slice(&encoded).map_err(|_| invalid())?;
     #[cfg(test)]
-    let observed_read = super::config_capacity_simultaneous_working_tests::ledger::read(
-        &encoded,
-        stored.ledger.as_ref(),
-    );
+    let observed_read =
+        super::config_capacity_simultaneous_working_tests::ledger::decoded(stored.ledger.as_ref());
     let length = canonical_state_len(&stored)?;
     stream_state(&stored, key, length, None)?
         .verify_slice(&mac)
         .map_err(|_| invalid())?;
+    // Canonical authentication is complete. The decoded state owns every field
+    // needed below; release the SQL JSON before validation derives operations.
+    drop(encoded);
     if let Some(ledger) = &stored.ledger {
         ledger
             .validate(key, stored.identity)
