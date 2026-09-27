@@ -2195,9 +2195,13 @@ consumer facade for #702's epoch-fenced V2 protocol. It has the V1 facade's
 exact-roster activation, canonical routing, affine execute handle,
 receipt-only restart recovery, and single-seal journal discipline, with these
 differences. The caller supplies the same `FencedTransitionRequest`, whose
-16-byte ID is the caller-stable recovery identity. The facade reads the
-linearized V2 history state and MUST name the active epoch; callers never
-choose an epoch or a nonce. It seals once, builds the sealed V2 request, and
+16-byte ID is the caller-stable recovery identity. The facade MUST name an
+active epoch from a linearized V2 history state it observed; callers never
+choose an epoch or a nonce. It MAY reuse that observation across preparations
+because epochs only advance: a request whose epoch has since closed is
+rejected without binding, and that rejection MUST invalidate the reused
+state. A reused state that records no active epoch or a full one MUST NOT be
+used. It seals once, builds the sealed V2 request, and
 MUST durably bind caller ID to that complete request in the SDK-owned
 `FencedTransitionV2RecoveryJournal` before returning a dispatchable handle.
 Execution and status MUST dispatch only that authenticated journaled request.

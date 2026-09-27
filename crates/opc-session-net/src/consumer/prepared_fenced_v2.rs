@@ -11,11 +11,11 @@
 use super::*;
 use opc_session_store::fenced_transition::FencedTransitionV2Effect;
 use opc_session_store::{
-    FencedTransitionV2Capability, FencedTransitionV2HistoryState, FencedTransitionV2JournalScope,
-    FencedTransitionV2RecoveryJournal, FencedTransitionV2Request, FencedTransitionV2Status,
-    PreparedFencedTransitionV2, PreparedFencedTransitionV2Lookup,
+    FencedTransitionV2Capability, FencedTransitionV2HistoryEpoch, FencedTransitionV2HistoryState,
+    FencedTransitionV2JournalScope, FencedTransitionV2RecoveryJournal, FencedTransitionV2Request,
+    FencedTransitionV2Status, PreparedFencedTransitionV2, PreparedFencedTransitionV2Lookup,
     ProtectedFencedTransitionV2Backend, SessionConsumerV2FencedTransitionStatus,
-    FENCED_TRANSITION_V2_RECOVERY_RECLAIM_BATCH_MAX,
+    FENCED_TRANSITION_V2_MAX_HISTORY_ENTRIES, FENCED_TRANSITION_V2_RECOVERY_RECLAIM_BATCH_MAX,
 };
 
 const PREPARED_FENCED_V2_DEADLINE: &str = "prepared fenced transition V2 deadline elapsed";
@@ -46,6 +46,7 @@ pub struct SessionConsumerPreparedFencedTransitionV2BackendError;
 /// `FencedTransitionV2Capability::V2` over a prewarmed `/2` lane.
 pub struct ActivatedSessionConsumerFencedTransitionV2Voters {
     router: Arc<PreparedConsumerRouter>,
+    history: Option<FencedTransitionV2HistoryState>,
 }
 
 impl fmt::Debug for ActivatedSessionConsumerFencedTransitionV2Voters {
@@ -351,12 +352,95 @@ impl PreparedFencedTransitionV2Route {
     }
 }
 
+/// Most recent linearized V2 history state observed by one facade.
+///
+/// Every V2 history-state read is a consensus-backed linearized read, so the
+/// facade keeps it off the per-transition path. Any previously linearized
+/// active epoch is safe for a new preparation: epochs only advance, and a
+/// request that names an epoch that has since closed is rejected at execution
+/// without binding a receipt. The handle then invalidates this cache so the
+/// next preparation reads the successor epoch. Maintenance opens a successor
+/// only after the active epoch is full, so a request that names the cached
+/// epoch after it filled would have been rejected as `HistoryFull` by a fresh
+/// read as well. A state that names no active epoch, or a full one, is never
+/// served from the cache: preparation reads again instead of rejecting on
+/// stale capacity.
+#[derive(Default)]
+struct PreparedFencedV2HistoryCache {
+    state: StdMutex<Option<FencedTransitionV2HistoryState>>,
+}
+
+impl PreparedFencedV2HistoryCache {
+    fn primed(state: Option<FencedTransitionV2HistoryState>) -> Self {
+        Self {
+            state: StdMutex::new(state),
+        }
+    }
+
+    /// The cached state, only while it names an active epoch with remaining
+    /// capacity.
+    fn bindable(&self) -> Option<FencedTransitionV2HistoryState> {
+        self.state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .filter(|state| {
+                state.active_epoch().is_some()
+                    && state.bound_entries() < FENCED_TRANSITION_V2_MAX_HISTORY_ENTRIES
+            })
+    }
+
+    /// Retain the newest lifecycle state; an older concurrent read never
+    /// replaces a newer one. Epochs, maintenance generations, and bound
+    /// counts within one generation only advance.
+    fn observe(&self, observed: FencedTransitionV2HistoryState) {
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if state.is_none_or(|cached| {
+            (
+                observed.active_epoch(),
+                observed.generation(),
+                observed.bound_entries(),
+            ) >= (
+                cached.active_epoch(),
+                cached.generation(),
+                cached.bound_entries(),
+            )
+        }) {
+            *state = Some(observed);
+        }
+    }
+
+    /// Forget a cached state whose active epoch is at or below `epoch`, after
+    /// an execution proved that epoch can no longer bind new requests.
+    fn invalidate_through(&self, epoch: FencedTransitionV2HistoryEpoch) {
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if state.is_some_and(|cached| cached.active_epoch().is_none_or(|active| active <= epoch)) {
+            *state = None;
+        }
+    }
+}
+
+/// Whether a physical adapter may answer a history-state read from the
+/// facade cache (preparation) or must read linearized state (reclamation).
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum V2HistoryRead {
+    Cached,
+    Fresh,
+}
+
 /// Net-private physical V2 adapter for one affine handle or one bounded
 /// facade operation. It owns the activated roster but no global cursor map,
 /// serves only the V2 subset, and fails every other operation locally.
 struct ActivatedFencedTransitionV2Backend {
     router: Arc<PreparedConsumerRouter>,
     route: Arc<PreparedFencedTransitionV2Route>,
+    history: Arc<PreparedFencedV2HistoryCache>,
+    history_read: V2HistoryRead,
     deadline: tokio::time::Instant,
     attempt_timeout: Duration,
 }
@@ -385,6 +469,38 @@ impl ActivatedFencedTransitionV2Backend {
             .map_or(self.deadline, |capped| capped.min(self.deadline));
         (deadline > now).then_some(deadline)
     }
+}
+
+/// Read linearized V2 history state, traversing the canonical roster from
+/// `origin`. Every attempt is read-only, so an interrupted read may move to
+/// the next voter under the caller's deadline.
+async fn linearized_v2_history_state(
+    router: &PreparedConsumerRouter,
+    origin: usize,
+    attempt_deadline: impl Fn() -> Option<tokio::time::Instant>,
+) -> Result<FencedTransitionV2HistoryState, StoreError> {
+    let voter_count = router.clients.len();
+    for offset in 0..voter_count {
+        let Some(deadline) = attempt_deadline() else {
+            break;
+        };
+        let client =
+            &router.clients[prepared_voter_index(origin.wrapping_add(offset), voter_count)];
+        let request = SessionConsumerV2Request::new(
+            router.scope,
+            SessionConsumerV2Operation::FencedTransitionV2HistoryState,
+        );
+        let response = client.execute_v2_before(&request, deadline).await;
+        if v2_authority_revoked(&response) {
+            return Err(StoreError::TopologyAuthorityRevoked);
+        }
+        if let Ok(SessionConsumerV2Response::FencedTransitionV2HistoryState(Ok(state))) = response {
+            return Ok(state);
+        }
+    }
+    Err(StoreError::BackendUnavailable(
+        PREPARED_FENCED_V2_HISTORY_UNAVAILABLE.into(),
+    ))
 }
 
 fn v2_authority_revoked(
@@ -547,32 +663,19 @@ impl SessionBackend for ActivatedFencedTransitionV2Backend {
     async fn fenced_transition_v2_history_state(
         &self,
     ) -> Result<FencedTransitionV2HistoryState, StoreError> {
-        let voter_count = self.voter_count();
-        for offset in 0..voter_count {
-            let Some(deadline) = self.read_attempt_deadline() else {
-                break;
-            };
-            let client = &self.router.clients[prepared_voter_index(
-                self.route.mutation_voter(voter_count).wrapping_add(offset),
-                voter_count,
-            )];
-            let request = SessionConsumerV2Request::new(
-                self.router.scope,
-                SessionConsumerV2Operation::FencedTransitionV2HistoryState,
-            );
-            let response = client.execute_v2_before(&request, deadline).await;
-            if v2_authority_revoked(&response) {
-                return Err(StoreError::TopologyAuthorityRevoked);
-            }
-            if let Ok(SessionConsumerV2Response::FencedTransitionV2HistoryState(Ok(state))) =
-                response
-            {
+        if self.history_read == V2HistoryRead::Cached {
+            if let Some(state) = self.history.bindable() {
                 return Ok(state);
             }
         }
-        Err(StoreError::BackendUnavailable(
-            PREPARED_FENCED_V2_HISTORY_UNAVAILABLE.into(),
-        ))
+        let state = linearized_v2_history_state(
+            &self.router,
+            self.route.mutation_voter(self.voter_count()),
+            || self.read_attempt_deadline(),
+        )
+        .await?;
+        self.history.observe(state);
+        Ok(state)
     }
 
     async fn fenced_transition_v2(
@@ -715,6 +818,7 @@ pub struct SessionConsumerPreparedFencedTransitionV2Backend {
     router: Arc<PreparedConsumerRouter>,
     wrapper_factory: Arc<dyn PreparedFencedTransitionV2WrapperFactory>,
     legacy_v1: Option<SessionConsumerPreparedFencedTransitionBackend>,
+    history: Arc<PreparedFencedV2HistoryCache>,
     reclaim_cursor: StdMutex<Option<FencedTransitionRequestId>>,
 }
 
@@ -733,6 +837,11 @@ impl SessionConsumerPreparedFencedTransitionV2Backend {
     /// prewarmed and must return `FencedTransitionV2Capability::V2`; any
     /// other result refuses construction. The returned roster is opaque and
     /// canonicalized by node ordinal.
+    ///
+    /// Activation also reads the linearized V2 history state once to seed
+    /// the facade's active-epoch cache. A revoked topology authority refuses
+    /// activation; any other failed read only defers that read to the first
+    /// preparation.
     pub async fn persistent_exact_voter_prewarm_roster(
         voters: impl IntoIterator<Item = PersistentSessionConsumerClient>,
     ) -> Result<ActivatedSessionConsumerFencedTransitionV2Voters, StoreError> {
@@ -821,8 +930,26 @@ impl SessionConsumerPreparedFencedTransitionV2Backend {
         clients.sort_unstable_by_key(|client| client.pool.client.voter.node_id());
         let router = PreparedConsumerRouter::persistent(clients)
             .map_err(|_| prepared_fenced_v2_readiness_unavailable())?;
+        // Prime the facade's active-epoch cache off the request hot path. A
+        // revoked authority refuses activation like the capability proof; any
+        // other failed read only defers the read to the first preparation.
+        let read_deadline = tokio::time::Instant::now()
+            .checked_add(DEFAULT_CONSUMER_OPERATION_TIMEOUT)
+            .unwrap_or_else(tokio::time::Instant::now);
+        let history = match linearized_v2_history_state(&router, 0, || {
+            (tokio::time::Instant::now() < read_deadline).then_some(read_deadline)
+        })
+        .await
+        {
+            Ok(state) => Some(state),
+            Err(StoreError::TopologyAuthorityRevoked) => {
+                return Err(StoreError::TopologyAuthorityRevoked);
+            }
+            Err(_) => None,
+        };
         Ok(ActivatedSessionConsumerFencedTransitionV2Voters {
             router: Arc::new(router),
+            history,
         })
     }
 
@@ -848,6 +975,7 @@ impl SessionConsumerPreparedFencedTransitionV2Backend {
                 legacy_journal: None,
             }),
             legacy_v1: None,
+            history: Arc::new(PreparedFencedV2HistoryCache::primed(voters.history)),
             reclaim_cursor: StdMutex::new(None),
         })
     }
@@ -874,6 +1002,7 @@ impl SessionConsumerPreparedFencedTransitionV2Backend {
                 legacy_journal: None,
             }),
             legacy_v1: None,
+            history: Arc::new(PreparedFencedV2HistoryCache::primed(voters.history)),
             reclaim_cursor: StdMutex::new(None),
         })
     }
@@ -899,15 +1028,29 @@ impl SessionConsumerPreparedFencedTransitionV2Backend {
         Ok(self)
     }
 
+    fn handle_routing(
+        &self,
+        route: Arc<PreparedFencedTransitionV2Route>,
+    ) -> PreparedFencedV2HandleRouting {
+        PreparedFencedV2HandleRouting {
+            voter_count: self.router.clients.len(),
+            route,
+            history: Arc::clone(&self.history),
+        }
+    }
+
     fn backend_for_route(
         &self,
         route: Arc<PreparedFencedTransitionV2Route>,
         budget: PreparedCheckpointBudget,
+        history_read: V2HistoryRead,
     ) -> Arc<dyn ProtectedFencedTransitionV2Backend> {
         self.wrapper_factory
             .wrap(Arc::new(ActivatedFencedTransitionV2Backend {
                 router: Arc::clone(&self.router),
                 route,
+                history: Arc::clone(&self.history),
+                history_read,
                 deadline: budget.original_deadline(),
                 attempt_timeout: budget.physical_attempt_timeout(),
             }))
@@ -923,6 +1066,8 @@ impl SessionConsumerPreparedFencedTransitionV2Backend {
             .wrap(Arc::new(ActivatedFencedTransitionV2Backend {
                 router: Arc::clone(&self.router),
                 route: Arc::new(PreparedFencedTransitionV2Route::new(0)),
+                history: Arc::clone(&self.history),
+                history_read: V2HistoryRead::Cached,
                 deadline,
                 attempt_timeout: DEFAULT_CONSUMER_OPERATION_TIMEOUT,
             }))
@@ -963,7 +1108,7 @@ impl SessionConsumerPreparedFencedTransitionV2Backend {
         let route = Arc::new(PreparedFencedTransitionV2Route::new(
             prepared_fenced_v2_origin(&self.router, request.request_id()),
         ));
-        let backend = self.backend_for_route(Arc::clone(&route), budget);
+        let backend = self.backend_for_route(Arc::clone(&route), budget, V2HistoryRead::Cached);
         let prepared = tokio::time::timeout_at(
             deadline,
             backend.prepare_protected_fenced_transition_v2(request),
@@ -975,8 +1120,7 @@ impl SessionConsumerPreparedFencedTransitionV2Backend {
                 backend,
                 prepared,
                 budget,
-                self.router.clients.len(),
-                route,
+                self.handle_routing(route),
                 PreparedRequestState::new(0),
                 true,
             ),
@@ -1003,7 +1147,7 @@ impl SessionConsumerPreparedFencedTransitionV2Backend {
         let route = Arc::new(PreparedFencedTransitionV2Route::new(
             prepared_fenced_v2_origin(&self.router, request_id),
         ));
-        let backend = self.backend_for_route(Arc::clone(&route), budget);
+        let backend = self.backend_for_route(Arc::clone(&route), budget, V2HistoryRead::Cached);
         tokio::time::timeout_at(deadline, async {
             let retained = backend
                 .recover_protected_fenced_transition_v2(request_id)
@@ -1026,8 +1170,7 @@ impl SessionConsumerPreparedFencedTransitionV2Backend {
                                 Arc::clone(&backend),
                                 prepared,
                                 budget,
-                                self.router.clients.len(),
-                                Arc::clone(&route),
+                                self.handle_routing(Arc::clone(&route)),
                                 state,
                                 false,
                             ),
@@ -1078,7 +1221,7 @@ impl SessionConsumerPreparedFencedTransitionV2Backend {
             return Err(prepared_fenced_v2_deadline());
         }
         let route = Arc::new(PreparedFencedTransitionV2Route::new(0));
-        let backend = self.backend_for_route(Arc::clone(&route), budget);
+        let backend = self.backend_for_route(Arc::clone(&route), budget, V2HistoryRead::Fresh);
         let history = tokio::time::timeout_at(
             deadline,
             backend.protected_fenced_transition_v2_history_state(),
@@ -1349,6 +1492,7 @@ struct PersistentPreparedFencedTransitionV2Token {
     budget: PreparedCheckpointBudget,
     voter_count: usize,
     route: Arc<PreparedFencedTransitionV2Route>,
+    history: Arc<PreparedFencedV2HistoryCache>,
     state: PreparedRequestState,
     // Only the handle that prepared the row holds dispatch authority, so only
     // it may conclude that no copy of the request was ever sent.
@@ -1440,22 +1584,36 @@ fn v2_rejection_never_binds(error: &StoreError) -> bool {
     )
 }
 
+/// Routing context one handle shares with its physical adapter: the
+/// canonical roster size, the handle's own cursors and dispatch latch, and
+/// the facade-wide active-epoch cache.
+struct PreparedFencedV2HandleRouting {
+    voter_count: usize,
+    route: Arc<PreparedFencedTransitionV2Route>,
+    history: Arc<PreparedFencedV2HistoryCache>,
+}
+
 impl PersistentPreparedFencedTransitionV2Token {
     fn new(
         backend: Arc<dyn ProtectedFencedTransitionV2Backend>,
         prepared: PreparedFencedTransitionV2,
         budget: PreparedCheckpointBudget,
-        voter_count: usize,
-        route: Arc<PreparedFencedTransitionV2Route>,
+        routing: PreparedFencedV2HandleRouting,
         state: PreparedRequestState,
         original: bool,
     ) -> Self {
+        let PreparedFencedV2HandleRouting {
+            voter_count,
+            route,
+            history,
+        } = routing;
         Self {
             backend,
             prepared,
             budget,
             voter_count,
             route,
+            history,
             state,
             original,
             terminal_receipt: StdMutex::new(None),
@@ -1552,6 +1710,17 @@ impl PersistentPreparedFencedTransitionV2Token {
                 }
                 FencedTransitionV2Effect::Resolved(Err(error)) => {
                     preparation.terminal();
+                    if matches!(
+                        error,
+                        StoreError::FencedTransitionHistoryEpochNotActive
+                            | StoreError::FencedTransitionHistoryEpochRetired
+                            | StoreError::FencedTransitionHistoryFull
+                    ) {
+                        // The cached active epoch can no longer bind new
+                        // requests; the next preparation reads its successor.
+                        self.history
+                            .invalidate_through(self.prepared.history_epoch());
+                    }
                     if v2_rejection_never_binds(&error) {
                         self.set_resolution(V2Resolution::Resolved);
                         self.discard_own_unbound_row().await;
@@ -1897,15 +2066,7 @@ mod tests {
         async fn fenced_transition_v2_history_state(
             &self,
         ) -> Result<FencedTransitionV2HistoryState, StoreError> {
-            FencedTransitionV2HistoryState::new(
-                Some(opc_session_store::FencedTransitionV2HistoryEpoch::new(1).expect("epoch")),
-                None,
-                None,
-                0,
-                1,
-                0,
-                0,
-            )
+            Ok(history_state(1, 1, 0))
         }
 
         async fn fenced_transition_v2_effect(
@@ -1982,7 +2143,25 @@ mod tests {
         physical: Arc<ScriptedV2Physical>,
         backend: Arc<dyn ProtectedFencedTransitionV2Backend>,
         route: Arc<PreparedFencedTransitionV2Route>,
+        history: Arc<PreparedFencedV2HistoryCache>,
         request_id: FencedTransitionRequestId,
+    }
+
+    fn history_state(
+        epoch: u64,
+        generation: u64,
+        bound_entries: usize,
+    ) -> FencedTransitionV2HistoryState {
+        FencedTransitionV2HistoryState::new(
+            Some(FencedTransitionV2HistoryEpoch::new(epoch).expect("epoch")),
+            None,
+            None,
+            0,
+            generation,
+            bound_entries,
+            0,
+        )
+        .expect("history state")
     }
 
     const ORIGIN: usize = 1;
@@ -2054,6 +2233,10 @@ mod tests {
             physical,
             backend,
             route,
+            // The scripted boundary's active epoch, as activation would seed it.
+            history: Arc::new(PreparedFencedV2HistoryCache::primed(Some(history_state(
+                1, 1, 0,
+            )))),
             request_id: FencedTransitionRequestId::from_bytes([0x74; 16]),
         }
     }
@@ -2077,8 +2260,11 @@ mod tests {
                 Arc::clone(&self.backend),
                 prepared,
                 budget(),
-                VOTERS,
-                Arc::clone(&self.route),
+                PreparedFencedV2HandleRouting {
+                    voter_count: VOTERS,
+                    route: Arc::clone(&self.route),
+                    history: Arc::clone(&self.history),
+                },
                 PreparedRequestState::new(0),
                 true,
             )
@@ -2276,5 +2462,89 @@ mod tests {
             Err(FencedTransitionExecuteError::NotTransmitted)
         );
         assert!(harness.physical.voters().is_empty());
+    }
+
+    #[test]
+    fn v2_history_cache_serves_only_a_bindable_newest_state() {
+        let cache = PreparedFencedV2HistoryCache::default();
+        assert_eq!(cache.bindable(), None, "an empty cache forces a read");
+        cache.observe(history_state(1, 1, 5));
+        assert_eq!(cache.bindable(), Some(history_state(1, 1, 5)));
+        cache.observe(history_state(1, 1, 3));
+        assert_eq!(
+            cache.bindable(),
+            Some(history_state(1, 1, 5)),
+            "an older concurrent read never replaces a newer one"
+        );
+        cache.observe(history_state(2, 2, 0));
+        assert_eq!(cache.bindable(), Some(history_state(2, 2, 0)));
+        cache.observe(history_state(1, 3, 0));
+        assert_eq!(
+            cache.bindable(),
+            Some(history_state(2, 2, 0)),
+            "an older active epoch never replaces a newer one"
+        );
+        cache.observe(history_state(
+            2,
+            2,
+            FENCED_TRANSITION_V2_MAX_HISTORY_ENTRIES,
+        ));
+        assert_eq!(
+            cache.bindable(),
+            None,
+            "a full active epoch is never served, so preparation reads again"
+        );
+        cache.observe(history_state(3, 3, 0));
+        cache.invalidate_through(FencedTransitionV2HistoryEpoch::new(2).expect("epoch"));
+        assert_eq!(
+            cache.bindable(),
+            Some(history_state(3, 3, 0)),
+            "a rejection for an older epoch keeps a newer cached epoch"
+        );
+        cache.invalidate_through(FencedTransitionV2HistoryEpoch::new(3).expect("epoch"));
+        assert_eq!(cache.bindable(), None);
+    }
+
+    #[tokio::test]
+    async fn v2_handle_closed_or_full_epoch_rejection_invalidates_the_cached_epoch() {
+        for error in [
+            StoreError::FencedTransitionHistoryEpochNotActive,
+            StoreError::FencedTransitionHistoryEpochRetired,
+            StoreError::FencedTransitionHistoryFull,
+        ] {
+            let harness = harness(vec![Step::Reject(error.clone())]).await;
+            let token = harness.prepare().await;
+            assert!(harness.history.bindable().is_some());
+            assert_eq!(
+                token.execute_once().await,
+                Err(FencedTransitionExecuteError::Rejected(error))
+            );
+            assert_eq!(
+                harness.history.bindable(),
+                None,
+                "the next preparation reads the successor epoch"
+            );
+            assert_eq!(harness.retained().await, 0);
+        }
+    }
+
+    #[tokio::test]
+    async fn v2_handle_other_rejections_keep_the_cached_epoch() {
+        let harness = harness(vec![Step::Reject(
+            StoreError::FencedTransitionRetentionExhausted,
+        )])
+        .await;
+        let token = harness.prepare().await;
+        assert_eq!(
+            token.execute_once().await,
+            Err(FencedTransitionExecuteError::Rejected(
+                StoreError::FencedTransitionRetentionExhausted
+            ))
+        );
+        assert_eq!(
+            harness.history.bindable(),
+            Some(history_state(1, 1, 0)),
+            "only an epoch or capacity rejection names a stale active epoch"
+        );
     }
 }

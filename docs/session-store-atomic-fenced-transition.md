@@ -746,7 +746,10 @@ authenticated identity. It then prewarms every voter's `/2` lane and requires
 `FencedTransitionV2Capability::V2` from every voter. A partial roster or any
 other reply refuses construction. Admitted voters are canonicalized by node
 ordinal, and only the facade's local-AEAD and remote-sealing constructors can
-consume the opaque roster.
+consume the opaque roster. Activation then reads the linearized V2 history
+state once to seed the facade's active-epoch cache. A revoked topology
+authority refuses activation; any other failed read only defers the read to
+the first preparation.
 
 Mutation starts at an origin derived from the authenticated scope, the
 canonical roster, and the caller-stable ID under a V2-specific domain. It
@@ -772,11 +775,23 @@ Preparation runs in this order:
    journal already retains it, or if a configured legacy V1 journal retains
    it. Reject a full recovery journal with `FencedTransitionHistoryFull`.
    These checks run before provider or record-expiry work.
-4. Read the linearized V2 history state through the exact roster. The active
-   epoch is the only epoch a new request may name. A full active epoch
-   (131,072 bound receipts) returns `FencedTransitionHistoryFull` without
-   provider work or a journal row; the operator's maintenance must open the
-   successor.
+4. Take the active epoch from the facade's cached linearized V2 history
+   state. The active epoch is the only epoch a new request may name. Every
+   history read commits a consensus logical-time fence, so the facade keeps
+   the read off the per-transition path: activation seeds the cache with one
+   linearized read through the exact roster, each reclamation sweep refreshes
+   it, and a preparation reads again only when the cache is empty or records
+   no active epoch or a full one. A newer observation always replaces an
+   older one. A cached epoch is safe because epochs only advance: a request
+   never names an epoch above the active one, and a request whose epoch
+   closed after it was cached is rejected at execution with `EpochNotActive`,
+   `Retired`, or `HistoryFull` without binding. That rejection invalidates
+   the cached epoch, so the next preparation reads its successor.
+   Maintenance opens a successor only after the active epoch is full, so a
+   fresh read would have given the same request `HistoryFull`. A read that
+   finds the active epoch full (131,072 bound receipts) returns
+   `FencedTransitionHistoryFull` without provider work or a journal row; the
+   operator's maintenance must open the successor.
 5. Run the authoritative record-expiry preflight for create and update
    before any provider call.
 6. Seal a create or update record exactly once. Delete and refresh perform no
@@ -903,9 +918,13 @@ replicated operator maintenance through
 leader, as described in [Epoch lifecycle and maintenance](#epoch-lifecycle-and-maintenance).
 The facade has no maintenance authority and adds no consumer-lane maintenance
 operation. It observes maintenance only through the linearized history state.
-New preparations follow a rotated active epoch, and the sweep uses the retired
-floor. While the active epoch is full and its successor is not open,
-preparation fails closed with `FencedTransitionHistoryFull`.
+New preparations follow a rotated active epoch once the facade observes it:
+through the next reclamation sweep, or after the first epoch rejection
+invalidates its cache. The sweep uses the retired floor. While the active
+epoch is full and its successor is not open, preparation fails closed with
+`FencedTransitionHistoryFull`. A downstream consumer that runs the sweep on a
+regular cadence therefore also bounds how long its facade can keep a closed
+epoch cached.
 
 ### Mixed V1/V2 upgrade
 
