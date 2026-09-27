@@ -2079,8 +2079,10 @@ fn running_head_sync(conn: &Connection) -> Result<Option<opc_types::TxId>, Audit
 }
 
 fn running_confirmation_pending_sync(conn: &Connection) -> Result<bool, AuditAuthorityError> {
+    // Rollback appends an ordinary successor while retaining the tentative row's
+    // deadline. Only the current head's metadata can still require confirmation.
     conn.query_row(
-        "SELECT EXISTS(SELECT 1 FROM config_history WHERE confirmed_deadline IS NOT NULL AND confirmed_at IS NULL)",
+        "SELECT EXISTS(SELECT 1 FROM config_history WHERE tx_id = (SELECT tx_id FROM config_history ORDER BY version DESC LIMIT 1) AND confirmed_deadline IS NOT NULL AND confirmed_at IS NULL)",
         [], |row| row.get(0),
     ).map_err(|_| AuditAuthorityError::Unavailable)
 }

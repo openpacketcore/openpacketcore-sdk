@@ -9,6 +9,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- `opc-persist`: allow an ordinary Running replacement after a confirmed
+  configuration has been rolled back and its original audit obligations settled.
+  Retained tentative history does not fence the current ordinary head; a current
+  pending confirmation still refuses replacement. Refs #958.
+
 - `opc-session-net`: remove the duplicate control probe before the first
   bounded frame chunk copy. Preserve cancellation, absolute deadlines, exact
   byte bounds and all pre-publication checks. Refs #972.
