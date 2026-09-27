@@ -251,7 +251,13 @@ fn head_sync(conn: &Connection) -> io::Result<Option<HistoryHead>> {
             let encrypted = encrypted_column(row, 2)?;
             #[cfg(test)]
             config_capacity_read_buffers::observe(0, &encrypted);
-            Ok((tx_id, version, <[u8; 32]>::from(Sha256::digest(encrypted))))
+            let encrypted_digest = <[u8; 32]>::from(Sha256::digest(encrypted.as_ref()));
+            #[cfg(test)]
+            config_capacity_read_buffers::ciphertext_hashed(
+                config_capacity_read_buffers::CiphertextHashSite::Head,
+                encrypted.as_ref(),
+            );
+            Ok((tx_id, version, encrypted_digest))
         },
     ).optional().map_err(database_error)?;
     row.map(|(tx_id, version, encrypted_digest)| {
@@ -276,7 +282,12 @@ fn audit_anchor_digest(count: i64, terminal: &[u8]) -> io::Result<[u8; 32]> {
     let mut digest = Sha256::new();
     digest.update(count.to_be_bytes());
     digest.update(terminal);
-    Ok(digest.finalize().into())
+    let value = digest.finalize().into();
+    #[cfg(test)]
+    config_capacity_read_buffers::completed(
+        config_capacity_read_buffers::CompletedCheck::AuditAnchor,
+    );
+    Ok(value)
 }
 
 fn record_metadata_digest(
@@ -337,7 +348,10 @@ fn record_metadata_digest(
         digest.update(b"capacity-record\0");
         digest.update(record_capacity_bytes(conn, head.tx_id)?);
     }
-    Ok(digest.finalize().into())
+    let value = digest.finalize().into();
+    #[cfg(test)]
+    config_capacity_read_buffers::completed(config_capacity_read_buffers::CompletedCheck::Metadata);
+    Ok(value)
 }
 
 fn record_capacity_bytes(
@@ -372,7 +386,12 @@ fn extend_record_chain(
     digest.update(head.encrypted_digest);
     digest.update(audit_anchor);
     digest.update(metadata);
-    digest.finalize().into()
+    let value = digest.finalize().into();
+    #[cfg(test)]
+    config_capacity_read_buffers::completed(
+        config_capacity_read_buffers::CompletedCheck::ChainExtension,
+    );
+    value
 }
 
 fn record_chain_sync(
@@ -401,10 +420,18 @@ fn record_chain_sync(
         let terminal = fixed_blob_column::<32>(row, 4).map_err(database_error)?;
         #[cfg(test)]
         config_capacity_read_buffers::observe_fixed_width(2, &terminal);
+        let tx_id = TxId::from_uuid(uuid::Uuid::from_slice(&tx_id).map_err(|_| corrupt())?);
+        let version = ConfigVersion::new(u64::try_from(version).map_err(|_| corrupt())?);
+        let encrypted_digest = Sha256::digest(encrypted.as_ref()).into();
+        #[cfg(test)]
+        config_capacity_read_buffers::ciphertext_hashed(
+            config_capacity_read_buffers::CiphertextHashSite::Chain,
+            encrypted.as_ref(),
+        );
         let head = HistoryHead {
-            tx_id: TxId::from_uuid(uuid::Uuid::from_slice(&tx_id).map_err(|_| corrupt())?),
-            version: ConfigVersion::new(u64::try_from(version).map_err(|_| corrupt())?),
-            encrypted_digest: Sha256::digest(encrypted).into(),
+            tx_id,
+            version,
+            encrypted_digest,
         };
         digest = extend_record_chain(
             digest,
@@ -571,7 +598,13 @@ fn validate_state(conn: &Connection, state: &HistoryState) -> io::Result<()> {
                 let encrypted = encrypted_column(row, 3)?;
                 #[cfg(test)]
                 config_capacity_read_buffers::observe(2, &encrypted);
-                Ok((tx_id, version, parent, <[u8; 32]>::from(Sha256::digest(encrypted))))
+                let encrypted_digest = <[u8; 32]>::from(Sha256::digest(encrypted.as_ref()));
+                #[cfg(test)]
+                config_capacity_read_buffers::ciphertext_hashed(
+                    config_capacity_read_buffers::CiphertextHashSite::Boundary,
+                    encrypted.as_ref(),
+                );
+                Ok((tx_id, version, parent, encrypted_digest))
             },
         ).map_err(database_error)?;
         if first_tx != *boundary.first.tx_id.as_uuid().as_bytes()
@@ -759,10 +792,19 @@ pub(crate) fn validate_access_for_profile_sync(
         }
     }
     validate_limited_state(conn, &state)?;
-    if record_chain_sync(conn, capacity_profile, cancellation)? != state.record_chain {
+    let record_chain = if capacity_profile == ConfigCapacityProfile::Legacy {
+        record_chain_sync(conn, capacity_profile, cancellation)?
+    } else {
+        capacity_record_chain_sync(conn, &state, key, cancellation)?
+    };
+    if record_chain != state.record_chain {
         return Err(corrupt());
     }
-    validate_capacity_records(conn, &state, key, cancellation)
+    #[cfg(test)]
+    config_capacity_read_buffers::completed(
+        config_capacity_read_buffers::CompletedCheck::ChainComparison,
+    );
+    Ok(())
 }
 
 /// Authenticate legacy consensus history within its existing transaction.
@@ -784,20 +826,19 @@ pub(crate) fn validate_access_sync(
     )
 }
 
-/// No owning ciphertext copy or view escapes this pinned consuming transaction.
-/// The caller has already authenticated the state, its chain and boundary.
-fn validate_capacity_records(
+/// Verify each bounded proof and construct the independent record chain from
+/// the same borrowed row. The caller has authenticated state and boundary, but
+/// must compare the completed chain before exposing any read or mutation.
+/// No ciphertext view or owning copy escapes this pinned consuming transaction.
+fn capacity_record_chain_sync(
     conn: &Connection,
     state: &HistoryState,
     key: &AuditKey,
     cancellation: &SqliteWorkCancellation,
-) -> io::Result<()> {
+) -> io::Result<[u8; 32]> {
     use super::capacity_record::CapacityRecordBinding;
     use super::types::ConfigRecordView;
     use std::str::FromStr;
-    if state.profile()? == ConfigCapacityProfile::Legacy {
-        return Ok(());
-    }
     let orphans: bool = conn.query_row(
         "SELECT EXISTS(SELECT 1 FROM config_raft_capacity_records p WHERE NOT EXISTS(SELECT 1 FROM config_history h WHERE h.tx_id = p.tx_id))",
         [], |row| row.get(0),
@@ -806,10 +847,15 @@ fn validate_capacity_records(
         return Err(corrupt());
     }
     let mut query = conn.prepare(
-        "SELECT h.tx_id, h.parent_tx_id, h.version, h.committed_at, h.principal, h.schema_digest, h.plaintext_digest, h.encrypted_blob, p.binding FROM config_history h LEFT JOIN config_raft_capacity_records p ON p.tx_id = h.tx_id ORDER BY h.version ASC",
+        "SELECT h.tx_id, h.parent_tx_id, h.version, h.committed_at, h.principal, h.schema_digest, h.plaintext_digest, h.encrypted_blob, p.binding, h.audit_count, h.audit_terminal_hash FROM config_history h LEFT JOIN config_raft_capacity_records p ON p.tx_id = h.tx_id ORDER BY h.version ASC",
     ).map_err(database_error)?;
     let mut rows = query.query([]).map_err(database_error)?;
-    while let Some(row) = rows.next().map_err(database_error)? {
+    let mut digest = empty_record_chain();
+    loop {
+        cancellation.check_io()?;
+        let Some(row) = rows.next().map_err(database_error)? else {
+            break;
+        };
         cancellation.check_io()?;
         let blob = |index| {
             row.get_ref(index)
@@ -823,7 +869,10 @@ fn validate_capacity_records(
                 .as_str()
                 .map_err(|_| corrupt())
         };
-        let tx_id = TxId::from_uuid(uuid::Uuid::from_slice(blob(0)?).map_err(|_| corrupt())?);
+        let tx_id = fixed_blob_column::<16>(row, 0).map_err(database_error)?;
+        #[cfg(test)]
+        config_capacity_read_buffers::observe_fixed_width(1, &tx_id);
+        let tx_id = TxId::from_uuid(uuid::Uuid::from_slice(&tx_id).map_err(|_| corrupt())?);
         let version = ConfigVersion::new(
             u64::try_from(row.get::<_, i64>(2).map_err(database_error)?).map_err(|_| corrupt())?,
         );
@@ -842,6 +891,13 @@ fn validate_capacity_records(
                 parent_tx_id = Some(boundary.original_parent);
             }
         }
+        let encrypted = encrypted_column(row, 7).map_err(database_error)?;
+        #[cfg(test)]
+        config_capacity_read_buffers::observe(1, &encrypted);
+        let count: i64 = row.get(9).map_err(database_error)?;
+        let terminal = fixed_blob_column::<32>(row, 10).map_err(database_error)?;
+        #[cfg(test)]
+        config_capacity_read_buffers::observe_fixed_width(2, &terminal);
         let record = ConfigRecordView {
             tx_id,
             parent_tx_id,
@@ -852,14 +908,25 @@ fn validate_capacity_records(
                 blob(5)?.try_into().map_err(|_| corrupt())?,
             ),
             plaintext_digest: blob(6)?,
-            encrypted_blob: blob(7)?,
+            encrypted_blob: encrypted.as_ref(),
         };
-        CapacityRecordBinding::decode(blob(8)?)
+        let encrypted_digest = CapacityRecordBinding::decode(blob(8)?)
             .map_err(|_| corrupt())?
-            .verify_borrowed(record, state.identity, key, state.profile()?)
+            .verify_borrowed_digest(record, state.identity, key, state.profile()?)
             .map_err(|_| corrupt())?;
+        let head = HistoryHead {
+            tx_id,
+            version,
+            encrypted_digest,
+        };
+        digest = extend_record_chain(
+            digest,
+            &head,
+            audit_anchor_digest(count, &terminal)?,
+            record_metadata_digest(conn, &head, state.profile()?, cancellation)?,
+        );
     }
-    Ok(())
+    Ok(digest)
 }
 
 /// Runs in the existing per-command SQLite savepoint after a possible mutation.

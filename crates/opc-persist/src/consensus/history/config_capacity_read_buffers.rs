@@ -5,9 +5,12 @@
 use std::borrow::Cow;
 use std::cell::Cell;
 
-#[derive(Clone, Copy, Default)]
+#[derive(Clone, Copy, Debug, Default)]
 pub(in crate::consensus) struct Sample {
     pub calls: [usize; 4],
+    pub ciphertext_hash_calls: [usize; 4],
+    pub ciphertext_hash_bytes: [usize; 4],
+    pub completed_checks: [usize; 5],
     pub peak_owned_ciphertext: usize,
     pub fixed_width_calls: [usize; 9],
     pub peak_owned_fixed_width: [usize; 9],
@@ -102,4 +105,45 @@ impl Drop for Observation {
     fn drop(&mut self) {
         CURRENT.with(|current| current.set(None));
     }
+}
+
+// Raw ciphertext hashing is separate from the small chain/HMAC transcripts.
+#[derive(Clone, Copy)]
+pub(in crate::consensus) enum CiphertextHashSite {
+    Head,
+    Chain,
+    Capacity,
+    Boundary,
+}
+
+#[derive(Clone, Copy)]
+pub(in crate::consensus) enum CompletedCheck {
+    CapacityMac,
+    AuditAnchor,
+    Metadata,
+    ChainExtension,
+    ChainComparison,
+}
+
+// Called after the real SHA operation with the very slice it consumed. This
+// observer owns no ciphertext and never estimates work from profile limits.
+pub(in crate::consensus) fn ciphertext_hashed(site: CiphertextHashSite, bytes: &[u8]) {
+    CURRENT.with(|current| {
+        if let Some(mut sample) = current.get() {
+            sample.ciphertext_hash_calls[site as usize] += 1;
+            sample.ciphertext_hash_bytes[site as usize] += bytes.len();
+            current.set(Some(sample));
+        }
+    });
+}
+
+// Each caller records a completed real check/contribution, never an expected
+// number of records. Negative fixtures separately require authentication errors.
+pub(in crate::consensus) fn completed(check: CompletedCheck) {
+    CURRENT.with(|current| {
+        if let Some(mut sample) = current.get() {
+            sample.completed_checks[check as usize] += 1;
+            current.set(Some(sample));
+        }
+    });
 }

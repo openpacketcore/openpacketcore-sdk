@@ -447,3 +447,75 @@ fn config_capacity_957_record_proof_checks_borrowed_sql_ciphertext() {
 
 #[path = "capacity_record/config_capacity_preparation_order_tests.rs"]
 mod config_capacity_preparation_order_tests;
+
+#[test]
+fn config_capacity_957_history_ciphertext_digest_capacity_transcript_matches_independent_oracle() {
+    use super::super::history::config_capacity_read_buffers::{Observation, Sample};
+
+    // A changed domain, field order, raw-ciphertext digest or omitted verifier
+    // must fail independently of the production issuer and MAC helper.
+    for (logical, replay) in [(32_usize, 0_usize), (96 * 1024 + 7, 64)] {
+        let commit = fixture(logical, replay, true);
+        let record = commit.record();
+        let mut expected = [0_u8; 44];
+        expected[..4].copy_from_slice(&[0, 1, 0, 1]);
+        expected[4..8]
+            .copy_from_slice(&u32::try_from(logical).expect("logical count").to_be_bytes());
+        expected[8..12]
+            .copy_from_slice(&u32::try_from(replay).expect("replay count").to_be_bytes());
+        let mut oracle = Hmac::<Sha256>::new_from_slice(key().as_bytes()).expect("synthetic key");
+        oracle.update(b"openpacketcore/config-capacity/record/v1\0");
+        oracle.update(&expected[..12]);
+        oracle.update(&4_u64.to_be_bytes());
+        oracle.update(&[0xA1; 32]);
+        oracle.update(&[0xA2; 32]);
+        oracle.update(&3_u64.to_be_bytes());
+        oracle.update(record.tx_id.as_uuid().as_bytes());
+        oracle.update(&7_u64.to_be_bytes());
+        oracle.update(
+            &u64::try_from(record.encrypted_blob.len())
+                .expect("actual envelope length")
+                .to_be_bytes(),
+        );
+        let expected_digest: [u8; 32] = Sha256::digest(&record.encrypted_blob).into();
+        oracle.update(&expected_digest);
+        oracle.update(&record.plaintext_digest);
+        expected[12..].copy_from_slice(&oracle.finalize().into_bytes());
+        let issued =
+            CapacityRecordBinding::issue(&commit, scope(), &key(), PROFILE).expect("issue");
+        assert_eq!(
+            issued.encode(),
+            expected,
+            "original independent capacity transcript"
+        );
+        let independent =
+            CapacityRecordBinding::decode(&expected).expect("independent fixed proof");
+        let observation = Observation::start();
+        independent
+            .verify_borrowed(ConfigRecordView::from(record), scope(), &key(), PROFILE)
+            .expect("independent proof verifies against the actual borrowed bytes");
+        let actual_digest = independent
+            .verify_borrowed_digest(ConfigRecordView::from(record), scope(), &key(), PROFILE)
+            .expect("same actual record passes the digest-returning verifier");
+        assert_eq!(
+            actual_digest, expected_digest,
+            "the returned digest is the independent raw SHA of this borrowed ciphertext"
+        );
+        let Sample {
+            ciphertext_hash_calls,
+            ciphertext_hash_bytes,
+            completed_checks,
+            ..
+        } = observation.finish();
+        assert_eq!(ciphertext_hash_calls, [0, 0, 2, 0]);
+        assert_eq!(
+            ciphertext_hash_bytes,
+            [0, 0, 2 * record.encrypted_blob.len(), 0]
+        );
+        assert_eq!(
+            completed_checks,
+            [2, 0, 0, 0, 0],
+            "both verifier entry points completed the full capacity MAC"
+        );
+    }
+}

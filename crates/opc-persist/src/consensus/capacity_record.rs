@@ -334,10 +334,29 @@ impl CapacityRecordBinding {
         key: &AuditKey,
         profile: ConfigCapacityProfile,
     ) -> Result<(), PersistError> {
+        self.verify_borrowed_digest(record, identity, key, profile)
+            .map(|_| ())
+    }
+
+    /// Verify the actual borrowed record and return its raw ciphertext digest.
+    /// The digest is computed here, never supplied as unchecked authority. A
+    /// history caller may consume it immediately for the same pinned row's
+    /// independent chain contribution; the whole chain must still authenticate.
+    pub(super) fn verify_borrowed_digest(
+        &self,
+        record: ConfigRecordView<'_>,
+        identity: ConfigConsensusIdentity,
+        key: &AuditKey,
+        profile: ConfigCapacityProfile,
+    ) -> Result<[u8; 32], PersistError> {
         self.validate_record(record, profile)?;
-        self.mac_borrowed(record, identity, key)?
-            .verify_slice(&self.tag)
-            .map_err(|_| invalid())
+        let (mac, encrypted_digest) = self.mac_borrowed(record, identity, key)?;
+        mac.verify_slice(&self.tag).map_err(|_| invalid())?;
+        #[cfg(test)]
+        super::history::config_capacity_read_buffers::completed(
+            super::history::config_capacity_read_buffers::CompletedCheck::CapacityMac,
+        );
+        Ok(encrypted_digest)
     }
 
     pub(super) fn encode(self) -> [u8; RECORD_CAPACITY_BYTES] {
@@ -424,6 +443,7 @@ impl CapacityRecordBinding {
         key: &AuditKey,
     ) -> Result<Hmac<Sha256>, PersistError> {
         self.mac_borrowed(ConfigRecordView::from(record), identity, key)
+            .map(|(mac, _)| mac)
     }
 
     fn mac_borrowed(
@@ -431,7 +451,7 @@ impl CapacityRecordBinding {
         record: ConfigRecordView<'_>,
         identity: ConfigConsensusIdentity,
         key: &AuditKey,
-    ) -> Result<Hmac<Sha256>, PersistError> {
+    ) -> Result<(Hmac<Sha256>, [u8; 32]), PersistError> {
         let envelope_bytes = u64::try_from(record.encrypted_blob.len()).map_err(|_| invalid())?;
         if record.plaintext_digest.len() != 32 {
             return Err(invalid());
@@ -446,9 +466,15 @@ impl CapacityRecordBinding {
         mac.update(record.tx_id.as_uuid().as_bytes());
         mac.update(&record.version.get().to_be_bytes());
         mac.update(&envelope_bytes.to_be_bytes());
-        mac.update(&Sha256::digest(record.encrypted_blob));
+        let encrypted_digest: [u8; 32] = Sha256::digest(record.encrypted_blob).into();
+        #[cfg(test)]
+        super::history::config_capacity_read_buffers::ciphertext_hashed(
+            super::history::config_capacity_read_buffers::CiphertextHashSite::Capacity,
+            record.encrypted_blob,
+        );
+        mac.update(&encrypted_digest);
         mac.update(record.plaintext_digest);
-        Ok(mac)
+        Ok((mac, encrypted_digest))
     }
 }
 
