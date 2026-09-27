@@ -1195,8 +1195,8 @@ impl SessionConsumerPreparedFencedTransitionV2Backend {
 
     /// Run one bounded reclamation sweep over retained rows.
     ///
-    /// It first removes rows at or below the linearized retired floor without
-    /// further I/O. It then reads the exact status of at most `limit` rows in
+    /// It first reads the linearized history state once and removes rows at
+    /// or below its retired floor without further I/O. It then reads the exact status of at most `limit` rows in
     /// caller-ID order from a process-local cursor and removes those whose
     /// status is `Expired`, `Retired`, `HistoryFull`, `RetentionExhausted`,
     /// or `EpochNotActive` for an epoch below the active epoch. It retains
@@ -1222,21 +1222,18 @@ impl SessionConsumerPreparedFencedTransitionV2Backend {
         }
         let route = Arc::new(PreparedFencedTransitionV2Route::new(0));
         let backend = self.backend_for_route(Arc::clone(&route), budget, V2HistoryRead::Fresh);
-        let history = tokio::time::timeout_at(
+        // One linearized history read supplies both the retired floor, which
+        // the wrapper applies itself, and the active epoch used below.
+        let (history, retired) = tokio::time::timeout_at(
             deadline,
-            backend.protected_fenced_transition_v2_history_state(),
+            backend.reclaim_retired_protected_fenced_transitions_v2(limit),
         )
         .await
         .map_err(|_| prepared_fenced_v2_deadline())??;
-        let mut report = SessionConsumerFencedTransitionV2ReclaimReport::default();
-        if let Some(floor) = history.retired_through() {
-            report.reclaimed = tokio::time::timeout_at(
-                deadline,
-                backend.discard_retired_protected_fenced_transitions_v2(floor, limit),
-            )
-            .await
-            .map_err(|_| prepared_fenced_v2_deadline())??;
-        }
+        let mut report = SessionConsumerFencedTransitionV2ReclaimReport {
+            reclaimed: retired,
+            ..SessionConsumerFencedTransitionV2ReclaimReport::default()
+        };
         let remaining = limit.saturating_sub(report.reclaimed);
         if remaining == 0 {
             return Ok(report);

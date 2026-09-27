@@ -14,7 +14,9 @@ use crate::{
         FencedTransitionV2CallerNonce, FencedTransitionV2HistoryEpoch, PreparedFencedTransitionV2,
         PreparedFencedTransitionV2Lookup, FENCED_TRANSITION_V2_MAX_HISTORY_ENTRIES,
     },
-    fenced_transition_journal::{canonical_recovery_request, FencedTransitionV2RecoveryJournal},
+    fenced_transition_journal::{
+        canonical_recovery_request, FencedTransitionV2RecoveryJournal, RecoveryJournalAdmission,
+    },
 };
 
 const PROTECTED_V2_RECOVERY_CAPABILITY: &str = "protected_fenced_transition_v2_recovery";
@@ -108,13 +110,16 @@ pub trait ProtectedFencedTransitionV2Backend:
         limit: usize,
     ) -> Result<Vec<(FencedTransitionRequestId, FencedTransitionV2HistoryEpoch)>, StoreError>;
 
-    /// Remove at most `limit` retained rows at or below a linearized retired
-    /// floor.
-    async fn discard_retired_protected_fenced_transitions_v2(
+    /// Read the linearized V2 history state through the physical boundary,
+    /// then remove at most `limit` retained rows at or below its retired
+    /// floor. Returns that state and the number of rows removed.
+    ///
+    /// The floor is never caller-supplied: a request at or below the floor
+    /// observed here can never bind again.
+    async fn reclaim_retired_protected_fenced_transitions_v2(
         &self,
-        retired_through: FencedTransitionV2HistoryEpoch,
         limit: usize,
-    ) -> Result<usize, StoreError>;
+    ) -> Result<(FencedTransitionV2HistoryState, usize), StoreError>;
 
     /// Return the authenticated number of retained rows.
     async fn retained_protected_fenced_transitions_v2(&self) -> Result<usize, StoreError>;
@@ -227,6 +232,10 @@ where
         let (journal, scope) = self.bound_journal().await?;
         self.require_v2_boundary().await?;
         let request_id = request.request_id();
+        // Held from the cross-journal check through this journal's insert, so
+        // a concurrent V1 or V2 preparation of the same ID cannot pass its
+        // own check in between.
+        let _admission = journal.admit(request_id)?;
         // A caller-stable ID names exactly one logical operation across both
         // protected compositions. A retained #701 row keeps its V1 recovery
         // authority; V2 preparation must not start a second lineage under it.
@@ -401,15 +410,18 @@ where
             .collect())
     }
 
-    pub(super) async fn discard_retired(
+    pub(super) async fn reclaim_retired(
         &self,
-        retired_through: FencedTransitionV2HistoryEpoch,
         limit: usize,
-    ) -> Result<usize, StoreError> {
+    ) -> Result<(FencedTransitionV2HistoryState, usize), StoreError> {
         let (journal, scope) = self.bound_journal().await?;
-        journal
-            .remove_retired_through(scope, retired_through, limit)
-            .await
+        self.require_v2_boundary().await?;
+        let history = self.inner.fenced_transition_v2_history_state().await?;
+        let removed = match history.retired_through() {
+            Some(floor) => journal.remove_retired_through(scope, floor, limit).await?,
+            None => 0,
+        };
+        Ok((history, removed))
     }
 
     pub(super) async fn retained(&self) -> Result<usize, StoreError> {
@@ -420,23 +432,28 @@ where
 
 /// Reject a #701 V1 preparation whose caller ID is retained by a configured
 /// #982 recovery journal on the same wrapper.
+///
+/// The returned admission must be held through the V1 journal insert, so a
+/// concurrent V2 preparation of the same ID cannot pass its own check of the
+/// V1 journal in between.
 pub(super) async fn reject_v1_id_retained_by_recovery_journal(
     recovery_journal: Option<&Arc<FencedTransitionV2RecoveryJournal>>,
     configured_scope: Option<FencedTransitionV2JournalScope>,
     backend_namespace: &str,
     mode: ProtectedFencedTransitionV2JournalMode,
     request_id: FencedTransitionRequestId,
-) -> Result<(), StoreError> {
+) -> Result<Option<RecoveryJournalAdmission>, StoreError> {
     let Some(journal) = recovery_journal else {
-        return Ok(());
+        return Ok(None);
     };
     let scope =
         protected_fenced_transition_v2_recovery_scope(configured_scope, backend_namespace, mode)?;
     journal.ensure_scope(scope).await?;
+    let admission = journal.admit(request_id)?;
     if journal.lookup(scope, request_id).await?.is_some() {
         return Err(StoreError::FencedTransitionRequestConflict);
     }
-    Ok(())
+    Ok(Some(admission))
 }
 
 #[async_trait]
@@ -512,14 +529,11 @@ where
         self.v2_recovery_parts().page(after, limit).await
     }
 
-    async fn discard_retired_protected_fenced_transitions_v2(
+    async fn reclaim_retired_protected_fenced_transitions_v2(
         &self,
-        retired_through: FencedTransitionV2HistoryEpoch,
         limit: usize,
-    ) -> Result<usize, StoreError> {
-        self.v2_recovery_parts()
-            .discard_retired(retired_through, limit)
-            .await
+    ) -> Result<(FencedTransitionV2HistoryState, usize), StoreError> {
+        self.v2_recovery_parts().reclaim_retired(limit).await
     }
 
     async fn retained_protected_fenced_transitions_v2(&self) -> Result<usize, StoreError> {
@@ -600,14 +614,11 @@ where
         self.v2_recovery_parts().page(after, limit).await
     }
 
-    async fn discard_retired_protected_fenced_transitions_v2(
+    async fn reclaim_retired_protected_fenced_transitions_v2(
         &self,
-        retired_through: FencedTransitionV2HistoryEpoch,
         limit: usize,
-    ) -> Result<usize, StoreError> {
-        self.v2_recovery_parts()
-            .discard_retired(retired_through, limit)
-            .await
+    ) -> Result<(FencedTransitionV2HistoryState, usize), StoreError> {
+        self.v2_recovery_parts().reclaim_retired(limit).await
     }
 
     async fn retained_protected_fenced_transitions_v2(&self) -> Result<usize, StoreError> {

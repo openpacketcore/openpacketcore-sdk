@@ -3202,7 +3202,7 @@ where
         let journal = require_fenced_transition_journal(self.fenced_transition_journal.as_ref())?;
         require_fenced_transition_capability(self.inner.as_ref()).await?;
         journal.ensure_absent(request.request_id()).await?;
-        reject_v1_id_retained_by_recovery_journal(
+        let _recovery_admission = reject_v1_id_retained_by_recovery_journal(
             self.fenced_transition_v2_recovery_journal.as_ref(),
             self.fenced_transition_v2_journal_scope,
             self.backend_namespace(),
@@ -4352,7 +4352,7 @@ where
         let journal = require_fenced_transition_journal(self.fenced_transition_journal.as_ref())?;
         require_fenced_transition_capability(self.inner.as_ref()).await?;
         journal.ensure_absent(request.request_id()).await?;
-        reject_v1_id_retained_by_recovery_journal(
+        let _recovery_admission = reject_v1_id_retained_by_recovery_journal(
             self.fenced_transition_v2_recovery_journal.as_ref(),
             self.fenced_transition_v2_journal_scope,
             self.backend_namespace(),

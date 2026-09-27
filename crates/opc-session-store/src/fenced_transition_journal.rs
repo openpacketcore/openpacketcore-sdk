@@ -41,7 +41,7 @@ use crate::{
 
 mod recovery;
 
-pub(crate) use recovery::canonical_recovery_request;
+pub(crate) use recovery::{canonical_recovery_request, RecoveryJournalAdmission};
 pub use recovery::{
     FencedTransitionV2RecoveryJournal, FencedTransitionV2RecoveryJournalKey,
     FENCED_TRANSITION_V2_RECOVERY_JOURNAL_KEY_BYTES,

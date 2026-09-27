@@ -1185,16 +1185,18 @@ async fn protected_v2_recovery_sustains_operation_beyond_retained_epochs_with_bo
     let retired = unresolved.pop().expect("final pending row");
     spy.set_history(history(retired.history_epoch().get() + 8, 0));
     let statuses = spy.state().statuses;
+    let (observed, removed) = wrapper
+        .reclaim_retired_protected_fenced_transitions_v2(
+            FENCED_TRANSITION_V2_RECOVERY_RECLAIM_BATCH_MAX,
+        )
+        .await
+        .expect("retired-floor discard");
     assert_eq!(
-        wrapper
-            .discard_retired_protected_fenced_transitions_v2(
-                retired.history_epoch(),
-                FENCED_TRANSITION_V2_RECOVERY_RECLAIM_BATCH_MAX,
-            )
-            .await
-            .expect("retired-floor discard"),
-        1
+        observed.retired_through(),
+        Some(retired.history_epoch()),
+        "the floor is the one linearized by the physical boundary"
     );
+    assert_eq!(removed, 1);
     assert_eq!(spy.state().statuses, statuses);
     assert_eq!(
         wrapper
@@ -1203,6 +1205,137 @@ async fn protected_v2_recovery_sustains_operation_beyond_retained_epochs_with_bo
             .expect("count"),
         0
     );
+}
+
+/// A key provider whose first active-key lookup waits for the test, so a
+/// preparation can be held between its absence checks and its insert.
+struct GatedKeyProvider {
+    inner: MemoryKeyProvider,
+    first: std::sync::atomic::AtomicBool,
+    entered: tokio::sync::Notify,
+    gate: tokio::sync::Semaphore,
+}
+
+impl GatedKeyProvider {
+    fn with_key(id: &str, fill: u8) -> Arc<Self> {
+        let inner = MemoryKeyProvider::new();
+        inner
+            .insert_active_key(
+                KeyId::new(id).expect("valid key ID"),
+                KeyPurpose::Session,
+                tenant(),
+                Zeroizing::new([fill; AES_256_GCM_SIV_KEY_LEN]),
+            )
+            .expect("insert active key");
+        Arc::new(Self {
+            inner,
+            first: std::sync::atomic::AtomicBool::new(true),
+            entered: tokio::sync::Notify::new(),
+            gate: tokio::sync::Semaphore::new(0),
+        })
+    }
+}
+
+#[async_trait]
+impl KeyProvider for GatedKeyProvider {
+    async fn get_active_key(
+        &self,
+        purpose: KeyPurpose,
+        tenant: &TenantId,
+    ) -> Result<KeyHandle, KeyError> {
+        if self.first.swap(false, Ordering::AcqRel) {
+            self.entered.notify_one();
+            self.gate
+                .acquire()
+                .await
+                .expect("test gate stays open")
+                .forget();
+        }
+        self.inner.get_active_key(purpose, tenant).await
+    }
+
+    async fn get_key_by_id(&self, key_id: &KeyId) -> Result<KeyHandle, KeyError> {
+        self.inner.get_key_by_id(key_id).await
+    }
+
+    async fn rotate_key(&self, purpose: KeyPurpose, tenant: &TenantId) -> Result<KeyId, KeyError> {
+        self.inner.rotate_key(purpose, tenant).await
+    }
+}
+
+/// Concurrent V1 and V2 preparations of one caller ID on an upgraded wrapper
+/// each check the other journal before either inserts. Exactly one may bind.
+#[tokio::test]
+async fn protected_v2_recovery_and_legacy_v1_exclude_one_concurrent_caller_id() {
+    for v2_first in [true, false] {
+        let fixture = RecoveryFixture::new(0x8a);
+        let spy = Arc::new(LegacyAndV2Spy::new());
+        let provider = GatedKeyProvider::with_key("v2-recovery-concurrent", 0x8a);
+        let wrapper =
+            EncryptingSessionBackend::new(Arc::clone(&spy), Arc::clone(&provider), NAMESPACE)
+                .with_fenced_transition_journal(fixture.open_legacy())
+                .with_fenced_transition_v2_recovery_journal(fixture.open())
+                .with_fenced_transition_v2_journal_scope(fixture.scope());
+        let id = request_id(45);
+        let held = async {
+            if v2_first {
+                wrapper
+                    .prepare_protected_fenced_transition_v2(create_request(id, 45))
+                    .await
+                    .map(|_| ())
+            } else {
+                wrapper
+                    .prepare_fenced_transition(create_request(id, 45))
+                    .await
+                    .map(|_| ())
+            }
+        };
+        let racing = async {
+            // The held preparation is sealing: it passed every absence check
+            // and has not inserted its row yet.
+            provider.entered.notified().await;
+            let result = if v2_first {
+                wrapper
+                    .prepare_fenced_transition(create_request(id, 46))
+                    .await
+                    .map(|_| ())
+            } else {
+                wrapper
+                    .prepare_protected_fenced_transition_v2(create_request(id, 46))
+                    .await
+                    .map(|_| ())
+            };
+            provider.gate.add_permits(1);
+            result
+        };
+        let (held, racing) = tokio::join!(held, racing);
+        held.expect("the first preparation binds the caller ID");
+        assert_eq!(
+            racing,
+            Err(StoreError::FencedTransitionRequestConflict),
+            "a concurrent preparation in the other composition must not bind the same ID \
+             (V2 first: {v2_first})"
+        );
+        let v1_retained = matches!(
+            wrapper
+                .recover_prepared_fenced_transition(id)
+                .await
+                .expect("V1 lookup"),
+            crate::PreparedFencedTransitionLookup::Found(_)
+        );
+        let v2_retained = matches!(
+            wrapper
+                .recover_protected_fenced_transition_v2(id)
+                .await
+                .expect("V2 lookup"),
+            PreparedFencedTransitionV2Lookup::Found(_)
+        );
+        assert_eq!(
+            (v1_retained, v2_retained),
+            (!v2_first, v2_first),
+            "exactly one journal binds the caller ID"
+        );
+    }
 }
 
 /// A physical double that also implements the frozen V1 prepared-token hooks

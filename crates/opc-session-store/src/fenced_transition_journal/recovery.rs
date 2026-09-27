@@ -11,7 +11,7 @@
 //! authenticated admission fence rather than a lifetime cap: callers remove a
 //! row only after its transition is resolved or proved unable to bind.
 
-use std::{fmt, path::Path, sync::Arc, sync::Mutex};
+use std::{collections::BTreeSet, fmt, path::Path, sync::Arc, sync::Mutex};
 
 use rand::{rngs::SysRng, TryRng};
 use rusqlite::{
@@ -185,6 +185,34 @@ struct RecoveryJournalInner {
 pub struct FencedTransitionV2RecoveryJournal {
     inner: Arc<RecoveryJournalInner>,
     operation_permit: Arc<tokio::sync::Semaphore>,
+    // Caller IDs whose preparation is between its cross-journal absence
+    // check and its create-only insert, in this process.
+    admissions: Arc<Mutex<BTreeSet<[u8; FENCED_TRANSITION_REQUEST_ID_BYTES]>>>,
+    // The scope this process proved bound. Later scope checks still
+    // authenticate the journal read-only; this only keeps the
+    // bind-on-first-use write and parent sync off later operations.
+    bound_scope: Arc<std::sync::OnceLock<[u8; FENCED_TRANSITION_V2_RECOVERY_JOURNAL_KEY_BYTES]>>,
+}
+
+/// Exclusive in-process admission of one caller-stable ID for preparation.
+///
+/// A V1 preparation checks this journal and inserts into the #701 journal,
+/// and a V2 preparation checks the #701 journal and inserts into this one.
+/// Neither insert can see the other's in-flight check, so both hold this
+/// admission from the check through their own insert. Dropping it releases
+/// the ID.
+pub(crate) struct RecoveryJournalAdmission {
+    admissions: Arc<Mutex<BTreeSet<[u8; FENCED_TRANSITION_REQUEST_ID_BYTES]>>>,
+    request_id: [u8; FENCED_TRANSITION_REQUEST_ID_BYTES],
+}
+
+impl Drop for RecoveryJournalAdmission {
+    fn drop(&mut self) {
+        self.admissions
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .remove(&self.request_id);
+    }
 }
 
 impl fmt::Debug for FencedTransitionV2RecoveryJournal {
@@ -300,6 +328,30 @@ impl FencedTransitionV2RecoveryJournal {
                 path_guard: path.path_guard,
             }),
             operation_permit: Arc::new(tokio::sync::Semaphore::new(1)),
+            admissions: Arc::new(Mutex::new(BTreeSet::new())),
+            bound_scope: Arc::new(std::sync::OnceLock::new()),
+        })
+    }
+
+    /// Admit one caller-stable ID to preparation in this process.
+    ///
+    /// A second concurrent preparation of the same ID, through either
+    /// protected composition, is a conflict before provider or journal work.
+    pub(crate) fn admit(
+        &self,
+        request_id: FencedTransitionRequestId,
+    ) -> Result<RecoveryJournalAdmission, StoreError> {
+        let request_id = *request_id.as_bytes();
+        let mut admissions = self
+            .admissions
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if !admissions.insert(request_id) {
+            return Err(StoreError::FencedTransitionRequestConflict);
+        }
+        Ok(RecoveryJournalAdmission {
+            admissions: Arc::clone(&self.admissions),
+            request_id,
         })
     }
 
@@ -314,6 +366,24 @@ impl FencedTransitionV2RecoveryJournal {
     ) -> Result<(), StoreError> {
         if scope == RECOVERY_UNBOUND_SCOPE {
             return Err(recovery_unavailable());
+        }
+        // Binding is irreversible. Once this process proved it, a same-scope
+        // caller only re-authenticates the journal read-only, without the
+        // write transaction and parent sync; a different scope can never be
+        // bound.
+        if let Some(bound) = self.bound_scope.get() {
+            if *bound != scope {
+                return Err(recovery_unavailable());
+            }
+            return self
+                .with_connection(false, move |conn, key| {
+                    let transaction = recovery_read_transaction(conn)?;
+                    verify_recovery_metadata(&transaction, key, Some(&scope))?;
+                    verify_sqlite_main_file_binding(&transaction)
+                        .map_err(|_| recovery_unavailable())?;
+                    transaction.commit().map_err(|_| recovery_unavailable())
+                })
+                .await;
         }
         self.with_connection(true, move |conn, key| {
             let transaction = conn
@@ -344,7 +414,10 @@ impl FencedTransitionV2RecoveryJournal {
             verify_sqlite_main_file_binding(&transaction).map_err(|_| recovery_unavailable())?;
             transaction.commit().map_err(|_| recovery_unavailable())
         })
-        .await
+        .await?;
+        // A concurrent first user can only have proved this same scope.
+        let _ = self.bound_scope.set(scope);
+        Ok(())
     }
 
     /// Authenticate the complete bounded journal for `scope` and return its
