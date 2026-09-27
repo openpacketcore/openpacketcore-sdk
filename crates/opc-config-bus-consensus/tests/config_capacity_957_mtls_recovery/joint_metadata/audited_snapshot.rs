@@ -35,8 +35,13 @@ async fn commit_audited(
     principal: &str,
     local: bool,
 ) -> Expected {
-    let (input, aad, plaintext) = input(store, version, parent, principal, 0).await;
+    let mut phase = phase_trace::Span::api("audited_input");
+    let (input, aad, plaintext) = phase
+        .track(input(store, version, parent, principal, 0))
+        .await;
+    phase.returned(phase_trace::ResultClass::Ok);
     let record = input.record().clone();
+    let mut phase = phase_trace::Span::api("audited_prepare");
     let prepared = store
         .prepare_audited_commit(
             &privacy(),
@@ -45,33 +50,48 @@ async fn commit_audited(
             Duration::from_secs(60),
         )
         .expect("joint-maximum audited snapshot input");
+    phase.returned(phase_trace::ResultClass::Ok);
+    let mut phase = phase_trace::Span::api("audited_handle_roundtrip");
     let original_handle = prepared
         .handle()
         .encode()
         .expect("original handle encoding");
     let handle = AuditOperationHandle::decode(&original_handle).expect("original handle only");
-    let admission = if local {
-        store
-            .admit_audit_operation_local(&handle, caller(principal))
-            .await
-    } else {
-        store
-            .admit_audit_operation(&handle, caller(principal))
-            .await
-    };
+    phase.returned(phase_trace::ResultClass::Ok);
+    let mut phase = phase_trace::Span::api("audited_admit");
+    let admission = phase
+        .track(async {
+            if local {
+                store
+                    .admit_audit_operation_local(&handle, caller(principal))
+                    .await
+            } else {
+                store
+                    .admit_audit_operation(&handle, caller(principal))
+                    .await
+            }
+        })
+        .await;
+    phase.returned(phase_trace::audit(&admission));
     let AuditAdmission::Applied(admission) = admission else {
         panic!("snapshot operation requires an authoritative intent receipt");
     };
     assert_eq!(admission.state(), AuditOperationState::Intent);
-    let result = if local {
-        store
-            .submit_audited_mutation_local(&prepared, &admission, caller(principal))
-            .await
-    } else {
-        store
-            .submit_audited_mutation(&prepared, &admission, caller(principal))
-            .await
-    };
+    let mut phase = phase_trace::Span::api("audited_submit");
+    let result = phase
+        .track(async {
+            if local {
+                store
+                    .submit_audited_mutation_local(&prepared, &admission, caller(principal))
+                    .await
+            } else {
+                store
+                    .submit_audited_mutation(&prepared, &admission, caller(principal))
+                    .await
+            }
+        })
+        .await;
+    phase.returned(phase_trace::audit(&result));
     let AuditAdmission::Applied(receipt) = result else {
         panic!("snapshot operation requires a durable original result");
     };
@@ -144,17 +164,25 @@ native_case!(
         let follower = (leader + 1) % 3;
         let lagging = (leader + 2) % 3;
         let principal = principal(true);
-        stores[leader]
-            .initialize_audit_authority(
+        let trace = phase_trace::Session::start("audited_snapshot_control", &stores);
+        let mut phase = phase_trace::Span::api("audit_authority_initialize");
+        let initialized = phase
+            .track(stores[leader].initialize_audit_authority(
                 &privacy(),
                 AuditLedgerLimits::new(12, 4).expect("original finite audit limits"),
-            )
-            .await
-            .expect("native replicated audit authority");
+            ))
+            .await;
+        phase.returned(phase_trace::audit_initialization(&initialized));
+        initialized.expect("native replicated audit authority");
         let first = commit_audited(&stores[leader], 1, None, &principal, true).await;
         for store in &stores {
-            recover(store, std::slice::from_ref(&first), &principal).await;
+            let mut phase = phase_trace::Span::api("audited_initial_recovery_readback");
+            phase
+                .track(recover(store, std::slice::from_ref(&first), &principal))
+                .await;
+            phase.returned(phase_trace::ResultClass::Ok);
         }
+        trace.finish();
         let original_ledger = databases.each_ref().map(|path| ledger_digest(path));
         assert!(original_ledger
             .iter()
@@ -177,6 +205,7 @@ native_case!(
             .applied_index
             .expect("offline applied frontier");
         let offline_counts = effect_counts(&databases[lagging]);
+        let trace = phase_trace::Session::start("audited_snapshot_forwarded_successor", &stores);
         let second = commit_audited(
             &stores[follower],
             2,
@@ -185,6 +214,7 @@ native_case!(
             false,
         )
         .await;
+        trace.finish();
         let expected = [first, second];
         for index in [leader, follower] {
             recover(&stores[index], &expected, &principal).await;
