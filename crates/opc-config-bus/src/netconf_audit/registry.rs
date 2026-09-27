@@ -1,8 +1,9 @@
 //! Original-operation retention owned by the existing serial ConfigBus worker.
 //!
 //! There is no secondary admission queue. At most one unsettled encrypted
-//! preparation survives between worker messages. Settled entries retain only
-//! bounded authenticated handles/receipts; only those entries may be evicted.
+//! preparation survives between worker messages. Settled entries retain bounded
+//! authenticated handles/receipts and publication replay metadata, never model
+//! payloads or ciphertext; only fully settled entries may be evicted.
 //! Authority-side reservations and recovery remain authoritative after restart.
 
 use opc_config_model::RequestId;
@@ -76,6 +77,7 @@ impl TargetRegistry {
     fn reclaimable(entry: &RegisteredTarget) -> bool {
         (entry.attempt.completion_settled() || entry.attempt.admission_refused())
             && !entry.attempt.requires_lock_publication()
+            && !entry.attempt.requires_running_publication()
     }
 
     // Return only an opaque bounded handle. The registry owns the complete
@@ -157,11 +159,13 @@ impl TargetRegistry {
         &mut self,
         port: &super::store::NetconfAuditStore,
         sessions: &mut super::session_registry::SessionRegistry,
+        publication: Option<&dyn super::running::RunningPublicationPort>,
     ) {
         for entry in &mut self.entries {
             if !Self::reclaimable(entry) {
                 let _ = port.recover_target(&mut entry.attempt).await;
                 sessions.finalize_lock(port, &mut entry.attempt).await;
+                super::running::publish_original(publication, &mut entry.attempt).await;
             }
         }
     }

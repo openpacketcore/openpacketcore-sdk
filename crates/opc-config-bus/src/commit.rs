@@ -39,6 +39,10 @@ use crate::types::{
 };
 use crate::{ConfigProjectionHead, ConfigProjectionPublication, ConfigProjectionRebuilder};
 
+#[cfg(feature = "required-netconf-audit")]
+#[path = "netconf_audit/running_commit.rs"]
+pub(crate) mod netconf_running;
+
 pub(crate) const DEFAULT_COMMIT_QUEUE_CAPACITY: usize = 32;
 const UNSUPPORTED_VALIDATE_ONLY_OPERATION_MESSAGE: &str =
     "validate-only only supports replace operations in this skeleton config bus";
@@ -83,6 +87,8 @@ pub(crate) enum WorkerRequest<C: OpcConfig> {
     NetconfRecovery(Box<crate::netconf_audit::RecoveryMessage>),
     #[cfg(feature = "required-netconf-audit")]
     NetconfSession(Box<crate::netconf_audit::SessionMessage>),
+    #[cfg(feature = "required-netconf-audit")]
+    NetconfRunning(Box<netconf_running::RunningMessage<C>>),
     Reconcile {
         source: Arc<dyn CommittedRevisionSource<C>>,
         reply: oneshot::Sender<Result<ConfigProjectionHead, StoreError>>,
@@ -652,6 +658,16 @@ async fn worker_loop<C: OpcConfig>(
         .as_ref()
         .map(pending_deadline_fire_at);
 
+    #[cfg(feature = "required-netconf-audit")]
+    if let Some(worker) = netconf_worker.as_mut() {
+        worker.attach_running_publication(Arc::new(netconf_running::RunningPublisher::new(
+            Arc::clone(&store),
+            Arc::clone(&snapshot),
+            Arc::clone(&subscribers),
+            worker.port_for_publication(),
+        )));
+    }
+
     loop {
         #[cfg(feature = "required-netconf-audit")]
         if let Some(worker) = netconf_worker.as_mut() {
@@ -688,10 +704,28 @@ async fn worker_loop<C: OpcConfig>(
                         ).await;
                         continue;
                     }
+                    #[cfg(feature = "required-netconf-audit")]
+                    WorkerRequest::NetconfRunning(message) => {
+                        netconf_running::running_in_worker(
+                            netconf_worker.as_mut(), *message, snapshot.as_ref(),
+                            recovery.as_ref(), admission_limits.as_ref(), store.as_ref(),
+                            authorizer.as_ref(), Arc::clone(&impact_classifier), authority.as_ref(),
+                            pending_fire_at.is_some(),
+                            signal.as_ref().is_some_and(|signal| signal.is_draining()),
+                        ).await;
+                        continue;
+                    }
                     WorkerRequest::Reconcile {
                         source,
                         reply,
                     } => {
+                        #[cfg(feature = "required-netconf-audit")]
+                        if netconf_worker.as_ref().is_some_and(|worker| worker.has_unsettled()) {
+                            let _ = reply.send(Err(StoreError::unavailable(
+                                "original NETCONF publication requires recovery",
+                            )));
+                            continue;
+                        }
                         let Some(authority) = authority_port(authority.as_ref()) else {
                             let _ = reply.send(Err(StoreError::unavailable(
                                 "authoritative projection reconciliation requires a local authority port",

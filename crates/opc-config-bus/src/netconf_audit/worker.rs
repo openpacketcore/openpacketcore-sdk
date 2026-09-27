@@ -21,6 +21,7 @@ use super::{
 pub(crate) struct TargetWorker {
     port: NetconfAuditStore,
     originals: TargetRegistry,
+    publication: Option<std::sync::Arc<dyn super::running::RunningPublicationPort>>,
     pub(super) sessions: super::session_registry::SessionRegistry,
 }
 
@@ -30,6 +31,7 @@ pub(super) struct OriginalReply {
     pub(super) handle: AuditOperationHandle,
     pub(super) result: TargetReply,
     pub(super) lock_ready: bool,
+    pub(super) published_commit: Option<Box<opc_config_model::CommitResult>>,
 }
 
 pub(super) enum BeforeAdmissionRefusal {
@@ -64,8 +66,21 @@ impl TargetWorker {
         Self {
             port,
             originals: TargetRegistry::new(),
+            publication: None,
             sessions: super::session_registry::SessionRegistry::new(capacity, wake),
         }
+    }
+
+    pub(crate) fn attach_running_publication(
+        &mut self,
+        publication: std::sync::Arc<dyn super::running::RunningPublicationPort>,
+    ) {
+        // Called once by the existing worker with its own snapshot and store.
+        self.publication.get_or_insert(publication);
+    }
+
+    pub(crate) fn port_for_publication(&self) -> NetconfAuditStore {
+        self.port.clone()
     }
 
     pub(super) fn port(&self) -> &NetconfAuditStore {
@@ -83,7 +98,7 @@ impl TargetWorker {
         // An unresolved effect precedes cleanup; it cannot be replaced by an
         // EndSession request under a fresh operation identity.
         self.originals
-            .recover_unsettled(&self.port, &mut self.sessions)
+            .recover_unsettled(&self.port, &mut self.sessions, self.publication.as_deref())
             .await;
         if !self.originals.has_unsettled() {
             self.sessions.cleanup_revoked(&self.port).await;
@@ -317,6 +332,7 @@ impl TargetWorker {
                 Dispatch::Recover => port.recover_target(original).await,
             };
             self.sessions.finalize_lock(&port, original).await;
+            super::running::publish_original(self.publication.as_deref(), original).await;
             result
         })
         .catch_unwind()
@@ -329,6 +345,7 @@ impl TargetWorker {
             handle,
             result,
             lock_ready: original.lock_ready(),
+            published_commit: original.published_commit().cloned().map(Box::new),
         }
     }
 }
@@ -343,5 +360,6 @@ fn unknown(handle: AuditOperationHandle) -> OriginalReply {
         handle,
         result: TargetReply::Unknown,
         lock_ready: false,
+        published_commit: None,
     }
 }

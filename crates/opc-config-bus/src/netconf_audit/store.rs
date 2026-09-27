@@ -150,6 +150,49 @@ impl NetconfAuditStore {
         Ok(self.original_target(prepared, caller, None))
     }
 
+    pub(super) async fn freeze_running(
+        &self,
+        session: &NetconfSessionOwner,
+        principal: &TrustedPrincipal,
+    ) -> Result<opc_persist::audit_authority::NetconfRunningEditRead, AuditAuthorityError> {
+        self.verify_session(session, principal).await?;
+        self.inner.store.read_netconf_running_edit(session).await
+    }
+
+    pub(super) async fn prepare_running(
+        &self,
+        session: &NetconfSessionOwner,
+        frozen: &opc_persist::audit_authority::NetconfRunningEditRead,
+        commit: opc_persist::AttestedConfigCommit,
+        principal: &TrustedPrincipal,
+        event: &AuditEvent,
+    ) -> Result<TargetAttempt, AuditAuthorityError> {
+        let intent = self
+            .bind_intent(
+                event.request_id,
+                principal,
+                event.transport,
+                AuditOperation::Replace,
+                event,
+            )
+            .map_err(|_| AuditAuthorityError::BindingMismatch)?;
+        let prepared = self
+            .inner
+            .store
+            .prepare_netconf_running_replacement(
+                session,
+                frozen,
+                commit,
+                self.inner.privacy.as_ref(),
+                &intent.event,
+                self.inner.lifetime,
+            )
+            .await?;
+        let mut original = self.original_target(prepared, intent.caller, Some(intent.request_id));
+        original.running_owner = Some(session.clone());
+        Ok(original)
+    }
+
     pub(super) async fn prepare_lock(
         &self,
         session: &NetconfSessionOwner,
@@ -308,6 +351,9 @@ impl NetconfAuditStore {
             session: None,
             lock: None,
             lock_ready: false,
+            running_owner: None,
+            acknowledged_running_intent: None,
+            published_commit: None,
         }
     }
 
@@ -361,11 +407,20 @@ impl NetconfAuditStore {
             return TargetReply::Refused(AuditAuthorityError::BindingMismatch);
         }
         attempt.started = true;
-        let admission = self
-            .inner
-            .store
-            .admit_netconf_target_local(prepared, attempt.caller)
-            .await;
+        let admission = match &attempt.running_owner {
+            Some(session) => {
+                self.inner
+                    .store
+                    .admit_netconf_running_replacement_local(session, prepared, attempt.caller)
+                    .await
+            }
+            None => {
+                self.inner
+                    .store
+                    .admit_netconf_target_local(prepared, attempt.caller)
+                    .await
+            }
+        };
         let admitted = match admission {
             AuditAdmission::Rejected(error) => {
                 attempt.admission_refusal = Some(error);
@@ -384,10 +439,17 @@ impl NetconfAuditStore {
             | AuditOperationState::Rejected => {}
             _ => return TargetReply::Unknown,
         }
-        if attempt
-            .session
-            .as_ref()
-            .is_some_and(|session| session.is_revoked())
+        if attempt.running_owner.is_some() {
+            // Preserve the SDK-authenticated acknowledgement, not a caller claim
+            // or an indeterminate Intent lookup. This admitted original may
+            // finish after transport revocation, with its unchanged lifetime.
+            attempt.acknowledged_running_intent = Some(admitted.clone());
+        }
+        if attempt.running_owner.is_none()
+            && attempt
+                .session
+                .as_ref()
+                .is_some_and(|session| session.is_revoked())
         {
             // Intent may exist. Refusing the effect does not erase its debt.
             return TargetReply::Unknown;
@@ -429,6 +491,19 @@ impl NetconfAuditStore {
         let Some(prepared) = attempt.prepared.as_ref() else {
             return TargetReply::Unknown;
         };
+        if let Some(admitted) = attempt.acknowledged_running_intent.as_ref() {
+            match self
+                .inner
+                .store
+                .submit_netconf_target_local(prepared, admitted, attempt.caller)
+                .await
+            {
+                AuditAdmission::Applied(receipt) if attempt.accept_known(&receipt) => {
+                    return self.complete_known(attempt).await;
+                }
+                _ => return TargetReply::Unknown,
+            }
+        }
         match self
             .inner
             .store
@@ -531,6 +606,11 @@ pub(super) struct TargetAttempt {
     session: Option<super::session_lifetime::SessionReference>,
     lock: Option<Box<LockTransition>>,
     lock_ready: bool,
+    // An SDK owner clone observes transport invalidation; it is not a transport
+    // owner and cannot keep the transport's final-Drop lifetime alive.
+    running_owner: Option<NetconfSessionOwner>,
+    acknowledged_running_intent: Option<AuditOperationReceipt>,
+    published_commit: Option<Box<opc_config_model::CommitResult>>,
 }
 
 struct LockTransition {
@@ -638,6 +718,39 @@ impl TargetAttempt {
         }
     }
 
+    pub(super) fn published_commit(&self) -> Option<&opc_config_model::CommitResult> {
+        self.published_commit.as_deref()
+    }
+
+    pub(super) fn mark_running_published(&mut self, result: opc_config_model::CommitResult) {
+        self.published_commit = Some(Box::new(result));
+    }
+
+    pub(super) fn running_publication(&self) -> Option<super::running::RunningPublication> {
+        let AuditOperationState::TargetV1(result) = self.known.as_ref()?.state() else {
+            return None;
+        };
+        let NetconfAppliedOutcome::RunningReplaced {
+            tx_id,
+            running_version,
+            plaintext_digest,
+        } = result.outcome()
+        else {
+            return None;
+        };
+        Some(super::running::RunningPublication::new(
+            tx_id,
+            running_version,
+            plaintext_digest,
+            self.caller,
+            self.request_id,
+        ))
+    }
+
+    pub(super) fn requires_running_publication(&self) -> bool {
+        self.running_publication().is_some() && self.published_commit.is_none()
+    }
+
     fn accept_known(&mut self, receipt: &AuditOperationReceipt) -> bool {
         if receipt.handle() != &self.handle
             || !matches!(
@@ -656,6 +769,8 @@ impl TargetAttempt {
         // result before accepting it. Only the bounded receipt is needed for
         // subsequent completion; do not retain completed encrypted payloads.
         self.prepared = None;
+        self.running_owner = None;
+        self.acknowledged_running_intent = None;
         true
     }
 }

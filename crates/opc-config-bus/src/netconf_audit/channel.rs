@@ -207,6 +207,52 @@ impl<C: OpcConfig> RequiredNetconfAudit<C> {
         receiver.await.map_err(|_| recovery_unavailable())
     }
 
+    /// Replace ordinary Running through this exact transport session.
+    ///
+    /// The independently authenticated principal must match the request, event
+    /// and worker session. The worker derives changed paths and runs its model
+    /// authorizer/validation before encryption or Intent. This method enables
+    /// no protocol capability and accepts no confirmed or other datastore mode.
+    ///
+    /// `Applied` identifies a known SDK effect, including audit/publication debt.
+    /// Only `NetconfAppliedReceipt::published_commit()` acknowledges completed
+    /// Running publication. After cancellation or reply loss, recover the same
+    /// request or opaque handle; never prepare replacement work to retry it.
+    pub async fn replace_running(
+        &self,
+        session: &super::session_lifetime::TransportSessionLifetime,
+        principal: &TrustedPrincipal,
+        request: opc_config_model::CommitRequest<C>,
+        event: opc_mgmt_audit::AuditEvent,
+    ) -> Result<NetconfMutationResult, CommitError> {
+        if !session.belongs_to(&self.attachment.signal.wake) || self.attachment.signal.is_draining()
+        {
+            return Err(CommitError::new(
+                opc_config_model::CommitErrorCode::AdmissionRejected,
+                "NETCONF session worker mismatch",
+            ));
+        }
+        let (reply, receiver) = oneshot::channel();
+        self.bus
+            .tx
+            .try_send(WorkerRequest::NetconfRunning(Box::new(
+                crate::commit::netconf_running::RunningMessage {
+                    session: session.reference(),
+                    principal: principal.clone(),
+                    request,
+                    event,
+                    reply,
+                },
+            )))
+            .map_err(|_| {
+                CommitError::new(
+                    opc_config_model::CommitErrorCode::AdmissionRejected,
+                    "NETCONF worker queue unavailable",
+                )
+            })?;
+        receiver.await.map_err(|_| recovery_unavailable())
+    }
+
     /// Close admission out of band, drain the existing worker, and join it.
     /// A cancelled waiter leaves both the shutdown latch and JoinHandle owned.
     /// RecoveryRequired is not successful cleanup or rollback completion.

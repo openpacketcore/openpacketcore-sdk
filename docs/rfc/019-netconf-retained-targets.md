@@ -135,8 +135,34 @@ Known applied results stay known when terminal/checkpoint completion is owed;
 that debt fences later preparation/admission. The incoming logical time,
 cancellation token, deadlines, WAL mode and durability semantics are unchanged.
 
-The following protocol submission surface remains proposed; the persistence
-prerequisite above does not enable it:
+The bounded worker now exposes
+`RequiredNetconfAudit::replace_running(session, principal, request, event)`.
+It independently binds the authenticated principal to the actual worker session,
+freezes the quorum-current Running base, and performs model diff, NACM and
+validation before encryption. A nonempty base must decrypt to the exact published
+model. The worker retains the complete prepared original before polling admission;
+reply cancellation does not cancel its owned operation. Only an acknowledged
+Intent grants the retained original permission to continue Apply after transport
+revocation. Indeterminate admission remains lookup-only recovery.
+
+`NetconfAppliedReceipt::published_commit()` is populated only after the original
+audit/checkpoint obligation and exact committed readback are settled. The worker
+checks the original transaction, version, digest, request, caller and model before
+publication. It publishes the snapshot, awaits recovery-marker clearance, then
+notifies subscribers. Failure keeps the known applied result and explicit
+publication debt, which fences new mutations, reclamation and clean drain. A
+different worker cannot reuse an in-memory publication acknowledgement or move a
+newer projection backwards.
+
+Focused native tests cover ten Running worker cases, with production-removal
+controls for admission, authentication, frozen base, NACM, readback, publication,
+debt fences and cancellation. Their retained single-voter Ephemeral fixture does
+not establish Durable crash recovery or multi-voter qualification. Concurrent
+cleanup admission and complete protocol lifecycle qualification remain open;
+this worker slice does not enable the full server attachment.
+
+The following complete protocol submission surface remains proposed; the bounded
+worker implementation does not enable it:
 
 ```text
 ConfigBus<C>::required_netconf_audit(&self)

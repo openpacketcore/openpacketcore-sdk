@@ -38,6 +38,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- `opc-config-bus`: retain session-bound Running replacements in the required
+  NETCONF worker through reply cancellation and exact-original recovery. Keep
+  known applied results separate from audit and publication debt; publish only
+  authenticated original readback after terminal settlement. This bounded worker
+  slice does not enable the complete retained NETCONF profile. Refs #958.
+
 - `opc-gtpu-dataplane`: resolve an exact existing Active parent inside fenced
   child admission with `reconcile_bearer_under_active_parent`. Avoid a separate
   parent recovery lease while retaining selector reservations, fresh backend

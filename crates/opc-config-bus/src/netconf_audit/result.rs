@@ -47,9 +47,24 @@ pub struct NetconfAppliedReceipt {
     terminal_recorded: bool,
     completion_pending: bool,
     lock_ready: bool,
+    publication_pending: bool,
+    published_commit: Option<Box<opc_config_model::CommitResult>>,
 }
 
 impl NetconfAppliedReceipt {
+    /// Whether a known Running effect still owes exact bus publication and
+    /// durable recovery-marker clearance. Other target outcomes return false.
+    pub const fn publication_pending(&self) -> bool {
+        self.publication_pending
+    }
+
+    /// Successful ordinary Running completion, available only after the original
+    /// audit/checkpoint and exact committed bus publication have both completed.
+    /// A known applied receipt with debt deliberately exposes no commit success.
+    pub fn published_commit(&self) -> Option<&opc_config_model::CommitResult> {
+        self.published_commit.as_deref()
+    }
+
     /// Whether this original's required session lease publication completed.
     /// This is a historical acknowledgement, not a current lease capability;
     /// release still requires the SDK lease held by the original worker session.
@@ -164,6 +179,11 @@ pub(super) fn from_original(original: OriginalReply) -> NetconfMutationResult {
                     terminal_recorded: receipt.terminal_recorded() || !completion_pending,
                     completion_pending,
                     lock_ready: original.lock_ready,
+                    publication_pending: matches!(
+                        result.outcome(),
+                        NetconfAppliedOutcome::RunningReplaced { .. }
+                    ) && original.published_commit.is_none(),
+                    published_commit: original.published_commit,
                 })
             }
             AuditOperationState::Rejected => {

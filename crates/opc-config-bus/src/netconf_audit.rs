@@ -3,6 +3,7 @@ mod channel;
 mod event;
 mod registry;
 mod result;
+pub(crate) mod running;
 mod store;
 mod worker;
 
@@ -16,6 +17,7 @@ pub use opc_persist::audit_authority::NetconfLockDatastore;
 pub use result::{
     NetconfAppliedReceipt, NetconfMutationResult, NetconfRecoveryHandle, NetconfRejectedReceipt,
 };
+pub(crate) use session_lifetime::SessionReference;
 pub use session_lifetime::TransportSessionLifetime as NetconfSession;
 pub use store::NetconfAuditStore;
 pub(crate) use worker::TargetWorker;
