@@ -3,6 +3,9 @@
 
 #![cfg(target_os = "linux")]
 
+#[path = "config_capacity_957_recovery/encoded_audited.rs"]
+mod encoded_audited;
+
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
