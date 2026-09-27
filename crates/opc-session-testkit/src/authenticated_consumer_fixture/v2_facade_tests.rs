@@ -15,8 +15,9 @@ use opc_key::{
     AES_256_GCM_SIV_KEY_LEN,
 };
 use opc_session_net::{
-    SessionConsumerFencedTransitionV2ReleaseError,
-    SessionConsumerPreparedFencedTransitionStatusError, SessionConsumerRecoveredFencedTransition,
+    SessionConsumerFencedTransitionV2ReleaseError, SessionConsumerPreparedFencedTransition,
+    SessionConsumerPreparedFencedTransitionStatusError, SessionConsumerPreparedFencedTransitionV2,
+    SessionConsumerRecoveredFencedTransition,
 };
 use opc_session_store::{
     EncryptedSessionPayload, FenceToken, FencedTransitionExecuteError, FencedTransitionLease,
@@ -154,6 +155,58 @@ fn recovered_v2(
     }
 }
 
+/// Commit one prepared V2 transition and return its exact outcome.
+///
+/// The SDK caps one physical attempt at
+/// `PREPARED_CHECKPOINT_MAX_PHYSICAL_ATTEMPT` (250 ms), so a commit that
+/// outlives it on a loaded host is a possible send. The same handle then
+/// resolves it by exact receipt, never by a second mutation; callers still
+/// assert the exact physical call count.
+async fn committed_v2(
+    prepared: &mut SessionConsumerPreparedFencedTransitionV2,
+    request: &FencedTransitionRequest,
+    deadline: tokio::time::Instant,
+) -> FencedTransitionOutcome {
+    let outcome = match prepared.execute_once().await {
+        Ok(outcome) => outcome,
+        Err(FencedTransitionExecuteError::OutcomeUnknown { request_id }) => {
+            assert_eq!(request_id, prepared.request_id());
+            match prepared.status_until_terminal(deadline).await {
+                Ok(FencedTransitionV2Status::Recorded(result)) => {
+                    (*result).expect("the ambiguous transition committed")
+                }
+                other => panic!("an ambiguous commit must resolve by receipt: {other:?}"),
+            }
+        }
+        Err(error) => panic!("unexpected protected V2 execution result: {error:?}"),
+    };
+    assert!(outcome.matches_request(request));
+    outcome
+}
+
+/// [`committed_v2`] for a #701 V1 handle.
+async fn committed_v1(
+    prepared: &mut SessionConsumerPreparedFencedTransition,
+    request: &FencedTransitionRequest,
+    deadline: tokio::time::Instant,
+) -> FencedTransitionOutcome {
+    let outcome = match prepared.execute_once().await {
+        Ok(outcome) => outcome,
+        Err(FencedTransitionExecuteError::OutcomeUnknown { request_id }) => {
+            assert_eq!(request_id, request.request_id());
+            match prepared.status_until_terminal(deadline).await {
+                Ok(FencedTransitionStatus::Recorded(result)) => {
+                    (*result).expect("the ambiguous transition committed")
+                }
+                other => panic!("an ambiguous commit must resolve by receipt: {other:?}"),
+            }
+        }
+        Err(error) => panic!("unexpected protected V1 execution result: {error:?}"),
+    };
+    assert!(outcome.matches_request(request));
+    outcome
+}
+
 #[tokio::test]
 async fn fixture_v2_facade_commits_releases_and_readmits_one_caller_id() {
     let fixture = AuthenticatedPreparedFencedTransitionFixture::start([scope()])
@@ -166,8 +219,9 @@ async fn fixture_v2_facade_commits_releases_and_readmits_one_caller_id() {
         .expect("activate every real voter's /2 lane");
     let id = request_id(1);
     let request = create(id, 1, PAYLOAD);
+    let deadline = soon();
     let mut prepared = facade
-        .prepare_fenced_transition(request.clone(), budget(soon()))
+        .prepare_fenced_transition(request.clone(), budget(deadline))
         .await
         .expect("prepare in the linearized active epoch");
     assert_eq!(prepared.request_id(), id);
@@ -182,11 +236,7 @@ async fn fixture_v2_facade_commits_releases_and_readmits_one_caller_id() {
         "preparation never dispatches"
     );
 
-    let outcome = prepared
-        .execute_once()
-        .await
-        .expect("one real protected V2 transition commits");
-    assert!(outcome.matches_request(&request));
+    let outcome = committed_v2(&mut prepared, &request, deadline).await;
     assert_eq!(fixture.diagnostics().fenced_transition_v2_calls(), 1);
     assert_eq!(
         fixture.diagnostics().fenced_transition_calls(),
@@ -229,14 +279,12 @@ async fn fixture_v2_facade_commits_releases_and_readmits_one_caller_id() {
         FencedTransitionMutation::delete(Generation::new(1)),
     )
     .expect("fixture delete transition");
+    let deadline = soon();
     let mut successor = facade
-        .prepare_fenced_transition(renewal, budget(soon()))
+        .prepare_fenced_transition(renewal.clone(), budget(deadline))
         .await
         .expect("prepare a successor under the released ID");
-    successor
-        .execute_once()
-        .await
-        .expect("the successor commits");
+    committed_v2(&mut successor, &renewal, deadline).await;
     assert_eq!(provider.calls(), 2, "delete performs no provider work");
     assert!(facade
         .observe_fenced_transition(&session_key(1))
@@ -428,11 +476,13 @@ async fn fixture_v2_facade_upgrade_keeps_retained_v1_transitions_recoverable() {
             .open_local_aead(Arc::clone(&provider), "fixture-v2-upgrade")
             .await
             .expect("open the pre-upgrade V1 facade");
+        let request = create(legacy_id, 10, PAYLOAD);
+        let deadline = soon();
         let mut prepared = v1
-            .prepare_fenced_transition(create(legacy_id, 10, PAYLOAD), budget(soon()))
+            .prepare_fenced_transition(request.clone(), budget(deadline))
             .await
             .expect("prepare one retained V1 transition");
-        prepared.execute_once().await.expect("commit it through V1");
+        committed_v1(&mut prepared, &request, deadline).await;
     }
     assert_eq!(fixture.diagnostics().fenced_transition_calls(), 1);
 
@@ -472,11 +522,13 @@ async fn fixture_v2_facade_upgrade_keeps_retained_v1_transitions_recoverable() {
     );
 
     let v2_id = request_id(12);
+    let request = create(v2_id, 12, PAYLOAD);
+    let deadline = soon();
     let mut prepared = upgraded
-        .prepare_fenced_transition(create(v2_id, 12, PAYLOAD), budget(soon()))
+        .prepare_fenced_transition(request.clone(), budget(deadline))
         .await
         .expect("new transitions use V2");
-    prepared.execute_once().await.expect("commit through V2");
+    committed_v2(&mut prepared, &request, deadline).await;
     let diagnostics = fixture.diagnostics();
     assert_eq!(
         diagnostics.fenced_transition_calls(),
@@ -521,14 +573,13 @@ async fn fixture_v2_facade_remote_sealing_commits_through_real_voters() {
         fixture.open_recovery_journal().expect("recovery journal"),
     )
     .expect("compose the remote-seal V2 facade");
+    let request = create(request_id(20), 20, PAYLOAD);
+    let deadline = soon();
     let mut prepared = facade
-        .prepare_fenced_transition(create(request_id(20), 20, PAYLOAD), budget(soon()))
+        .prepare_fenced_transition(request.clone(), budget(deadline))
         .await
         .expect("remote-seal preparation");
-    prepared
-        .execute_once()
-        .await
-        .expect("one remote-sealed V2 transition commits");
+    committed_v2(&mut prepared, &request, deadline).await;
     let observed = facade
         .observe_fenced_transition(&session_key(20))
         .await
@@ -557,11 +608,13 @@ async fn fixture_v2_facade_reclaim_sweep_retains_recorded_and_unresolved_rows() 
         .open_local_aead_v2(Arc::clone(&provider), "fixture-v2-sweep")
         .await
         .expect("open protected V2 facade");
+    let request = create(request_id(30), 30, PAYLOAD);
+    let deadline = soon();
     let mut committed = facade
-        .prepare_fenced_transition(create(request_id(30), 30, PAYLOAD), budget(soon()))
+        .prepare_fenced_transition(request.clone(), budget(deadline))
         .await
         .expect("prepare the committed row");
-    committed.execute_once().await.expect("commit it");
+    committed_v2(&mut committed, &request, deadline).await;
     let pending = facade
         .prepare_fenced_transition(create(request_id(31), 31, PAYLOAD), budget(soon()))
         .await
@@ -629,14 +682,13 @@ async fn fixture_v2_facade_reclaim_sweep_reads_past_a_stalled_voter() {
         .expect("open protected V2 facade");
     let mut prepared = Vec::new();
     for ordinal in 40..44 {
+        let request = create(request_id(ordinal), ordinal, PAYLOAD);
+        let deadline = soon();
         let mut handle = facade
-            .prepare_fenced_transition(
-                create(request_id(ordinal), ordinal, PAYLOAD),
-                budget(soon()),
-            )
+            .prepare_fenced_transition(request.clone(), budget(deadline))
             .await
             .expect("prepare");
-        handle.execute_once().await.expect("commit");
+        committed_v2(&mut handle, &request, deadline).await;
         prepared.push(handle);
     }
     // A fresh sweep reads its first row's status on canonical voter 1.
@@ -676,15 +728,12 @@ async fn fixture_v2_facade_keeps_the_linearized_history_read_off_the_preparation
     for ordinal in 0..4 {
         let id = request_id(0x4000 + ordinal);
         let request = create(id, 0x4000 + ordinal, PAYLOAD);
+        let deadline = soon();
         let mut prepared = facade
-            .prepare_fenced_transition(request.clone(), budget(soon()))
+            .prepare_fenced_transition(request.clone(), budget(deadline))
             .await
             .expect("prepare in the cached active epoch");
-        let outcome = prepared
-            .execute_once()
-            .await
-            .expect("the cached active epoch binds on a real voter");
-        assert!(outcome.matches_request(&request));
+        committed_v2(&mut prepared, &request, deadline).await;
         prepared
             .release_resolved()
             .await
