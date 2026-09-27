@@ -6,7 +6,7 @@ use crate::consensus::capacity_record::CapacityRecordBinding;
 use crate::consensus::types::{ConfigConsensusCommand, PreparedConfigCommit};
 use crate::types::CommitSource;
 use crate::CommitRecord;
-use opc_consensus::engine::{CommittedLeaderId, LogId};
+use opc_consensus::engine::{CommittedLeaderId, EntryPayload, LogId};
 use opc_consensus::{
     ConsensusClusterId, ConsensusConfigurationEpoch, ConsensusConfigurationId, ConsensusIdentity,
     ConsensusNodeId, ConsensusRequestId,
@@ -271,4 +271,155 @@ fn config_capacity_native_json_tokens_preserve_complete_array_preflight() {
         previous_array_extent(array).is_none() && array_extent(array).is_none(),
         "CONFIG_CAPACITY_NATIVE_JSON_TOKEN_PREFLIGHT_RED"
     );
+}
+
+// Synthetic codec input only. Native cost tests separately require a real
+// encryption claim, intent receipt, authenticated result and retained reopen.
+fn audited_fixture(length: usize) -> Entry<ConfigRaftTypeConfig> {
+    use crate::audit_authority::ledger::HandleBody;
+    use crate::audit_authority::{
+        AuditCaller, AuditOperationBinding, AuditOperationHandle, AuditPrivacyKey, AuditToken,
+        ProjectedAuditEvent,
+    };
+    use crate::consensus::audit_mutation::{AuditedConfigEffect, PreparedAuditedMutation};
+
+    let Entry { log_id, payload } = fixture(length, None);
+    let EntryPayload::Normal(mut command) = payload else {
+        unreachable!()
+    };
+    let ConfigMutationIntent::BoundedAppend {
+        commit,
+        binding,
+        resolution,
+    } = command.intent
+    else {
+        unreachable!()
+    };
+    let effect = AuditedConfigEffect::BoundedAppend {
+        commit,
+        binding,
+        resolution,
+    };
+    let key = crate::AuditKey::new([0x95; 32]).unwrap();
+    let privacy = AuditPrivacyKey::new([0x96; 32]).unwrap();
+    let caller = AuditCaller::project(&privacy, "test", "synthetic").unwrap();
+    let token = AuditToken::from_keyed_projection([0x97; 32]).unwrap();
+    let handle = AuditOperationHandle::issue(
+        HandleBody {
+            version: 1,
+            identity: command.identity,
+            binding: AuditOperationBinding {
+                caller,
+                request: token,
+                operation: token,
+                base_version: 1,
+            },
+            event: ProjectedAuditEvent {
+                projection: token,
+                caller,
+                request: token,
+                transaction: None,
+                paths: token,
+                reason: None,
+                transport: crate::ManagementAuditTransportCode::Gnmi,
+                operation: crate::ManagementAuditOperationCode::Update,
+                outcome: crate::ManagementAuditOutcomeCode::Intent,
+                utc_seconds: 100,
+                nanosecond: 0,
+            },
+            issued_at: 100,
+            expires_at: 160,
+            nonce: [0x98; 16],
+            key_epoch: key.epoch(),
+            mutation: Some(effect.digest(&key).unwrap()),
+        },
+        &key,
+    )
+    .unwrap();
+    command.schema_version = 8;
+    command.intent = ConfigMutationIntent::AuditedMutation(
+        PreparedAuditedMutation::new(handle, effect, None)
+            .command()
+            .clone(),
+    );
+    Entry {
+        log_id,
+        payload: EntryPayload::Normal(command),
+    }
+}
+
+#[test]
+fn config_capacity_native_json_audited_matches_original_at_envelope_boundaries() {
+    for length in [
+        4095,
+        4096,
+        4097,
+        CONFIG_CAPACITY_V1_ENVELOPE_BYTES,
+        CONFIG_CAPACITY_V1_ENVELOPE_BYTES + 1,
+    ] {
+        let source = audited_fixture(length);
+        let bytes = serde_json::to_vec(&source).unwrap();
+        require_compatible(&bytes);
+        if (MIN_FAST_BYTES..=CONFIG_CAPACITY_V1_ENVELOPE_BYTES).contains(&length) {
+            let fast = canonical_entry(&bytes)
+                .unwrap()
+                .expect("canonical bounded audited append");
+            assert!(fast == source, "exact audited command, handle and binding");
+            let EntryPayload::Normal(command) = fast.payload else {
+                unreachable!()
+            };
+            let ConfigMutationIntent::AuditedMutation(prepared) = command.intent else {
+                unreachable!()
+            };
+            let crate::consensus::audit_mutation::AuditedConfigEffect::BoundedAppend {
+                commit, ..
+            } = &prepared.effect
+            else {
+                unreachable!()
+            };
+            assert_eq!(commit.record.encrypted_blob.len(), length);
+            assert_eq!(commit.record.encrypted_blob.capacity(), length);
+        }
+    }
+}
+
+#[test]
+fn config_capacity_native_json_audited_preserves_fallback_and_wrong_span_rejection() {
+    let source = audited_fixture(4096);
+    let bytes = serde_json::to_vec(&source).unwrap();
+    let body = std::str::from_utf8(&bytes).unwrap();
+    let field = body.find("\"encrypted_blob\":").unwrap() + FIELD.len();
+    require_compatible(&serde_json::to_vec_pretty(&source).unwrap());
+    let value: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+    require_compatible(&serde_json::to_vec(&value).unwrap());
+    let mut wrong_span = body.to_owned();
+    wrong_span.insert_str(
+        1,
+        &format!(
+            "\"unused\":{{\"encrypted_blob\":[{}]}},",
+            vec!["1"; 4096].join(",")
+        ),
+    );
+    assert!(canonical_entry(wrong_span.as_bytes()).unwrap().is_none());
+    require_compatible(wrong_span.as_bytes());
+    let mut duplicate = body.to_owned();
+    duplicate.insert_str(1, "\"log_id\":null,");
+    require_compatible(duplicate.as_bytes());
+    for replacement in ["256", "-1", "1.0", "01", "null", "true", "\"1\"", " 0 "] {
+        let mut changed = body.to_owned();
+        changed.replace_range(field + 1..field + 2, replacement);
+        require_compatible(changed.as_bytes());
+    }
+    let legacy_effect = body.replacen("\"BoundedAppend\":", "\"Append\":", 1);
+    assert!(canonical_entry(legacy_effect.as_bytes()).unwrap().is_none());
+    require_compatible(legacy_effect.as_bytes());
+    for cut in [0, 1, field, field + 1, field + 2, bytes.len() - 1] {
+        require_compatible(&bytes[..cut]);
+    }
+    let mut trailing = bytes.clone();
+    trailing.extend_from_slice(b" true");
+    require_compatible(&trailing);
+    let mut whitespace = bytes;
+    whitespace.extend_from_slice(b" \n\t");
+    require_compatible(&whitespace);
 }

@@ -23,6 +23,13 @@ pub(crate) mod observation {
 
     #[derive(Clone, Copy, Debug, Default)]
     pub(crate) struct Counts {
+        pub(crate) native_canonical_decodes: usize,
+        pub(crate) native_fallback_decodes: usize,
+        pub(crate) effect_verifications: usize,
+        pub(crate) effect_serializations: usize,
+        pub(crate) effect_encoded_bytes: usize,
+        pub(crate) effect_length_writes: usize,
+        pub(crate) effect_mac_writes: usize,
         pub(crate) finalized_scopes: usize,
         pub(crate) preflight_calls: usize,
         pub(crate) preflight_successes: usize,
@@ -140,6 +147,78 @@ pub(crate) mod observation {
         ACTIVE.with(|active| {
             if let Some((phase, counts)) = active.borrow().as_ref() {
                 update(*phase, &mut counts.lock().expect("cost counters"));
+            }
+        });
+    }
+
+    // A completed real row decode is selected by its actual request ID.
+    // This owns neither the entry nor its native store, and spans no await.
+    pub(crate) fn native_decoded(entry: &Entry<ConfigRaftTypeConfig>, canonical: bool) {
+        let EntryPayload::Normal(command) = &entry.payload else {
+            return;
+        };
+        let counts = OBSERVERS
+            .lock()
+            .expect("cost observer registry")
+            .get(&command.request_id)
+            .and_then(Weak::upgrade);
+        if let Some(counts) = counts {
+            let mut counts = counts.lock().expect("cost counters");
+            if canonical {
+                counts.native_canonical_decodes += 1;
+            } else {
+                counts.native_fallback_decodes += 1;
+            }
+        }
+    }
+
+    thread_local! {
+        static ACTIVE_EFFECT: RefCell<Option<SharedCounts>> = const { RefCell::new(None) };
+    }
+
+    // Select the real effect's handle-derived request ID; no payload is owned,
+    // and this guard exists only across one synchronous authentication call.
+    pub(crate) struct EffectScope {
+        previous: Option<SharedCounts>,
+    }
+
+    impl EffectScope {
+        pub(crate) fn enter(handle: &crate::audit_authority::AuditOperationHandle) -> Self {
+            let request_id = crate::consensus::store::derive_durable_request_id(
+                handle.body.identity,
+                b"audit-config",
+                &handle.mac,
+            );
+            let counts = OBSERVERS
+                .lock()
+                .expect("cost observer registry")
+                .get(&request_id)
+                .and_then(Weak::upgrade);
+            if let Some(counts) = &counts {
+                counts.lock().expect("cost counters").effect_verifications += 1;
+            }
+            Self {
+                previous: ACTIVE_EFFECT.with(|active| active.replace(counts)),
+            }
+        }
+    }
+
+    impl Drop for EffectScope {
+        fn drop(&mut self) {
+            let _ = ACTIVE_EFFECT.with(|active| active.replace(self.previous.take()));
+        }
+    }
+
+    // Called once after real length counting, exact transcript consumption and
+    // the final MAC flush. Per-write accounting stays local to the real sinks.
+    pub(crate) fn effect_serialized(bytes: usize, length_writes: usize, mac_writes: usize) {
+        ACTIVE_EFFECT.with(|active| {
+            if let Some(counts) = active.borrow().as_ref() {
+                let mut counts = counts.lock().expect("cost counters");
+                counts.effect_serializations += 1;
+                counts.effect_encoded_bytes += bytes;
+                counts.effect_length_writes += length_writes;
+                counts.effect_mac_writes += mac_writes;
             }
         });
     }
@@ -374,6 +453,35 @@ async fn run_native_cost_case(audited: bool) {
     reopened.shutdown().await.expect("join reopened owners");
     let counts = observation.snapshot();
     println!("CONFIG_CAPACITY_NATIVE_COST audited={audited} logical_bytes={} exact_readback=true authenticated_recovery=true retained_reopen=true counts={counts:?}", plaintext.len());
+    assert!(
+        counts.native_canonical_decodes > 0 && counts.native_fallback_decodes == 0,
+        "CONFIG_CAPACITY_NATIVE_AUDITED_DECODE_RED: ordinary and audited canonical native entries must decode without a discarded fallback, after exact readback and reopen; counts={counts:?}"
+    );
+    if audited {
+        assert!(
+            counts.effect_verifications > 0,
+            "real audited effect verification"
+        );
+        assert_eq!(counts.effect_serializations, counts.effect_verifications);
+        assert!(counts.effect_encoded_bytes > plaintext.len());
+        assert!(
+            counts.effect_length_writes < counts.effect_encoded_bytes / 64
+                && counts.effect_mac_writes < counts.effect_encoded_bytes / 64,
+            "CONFIG_CAPACITY_AUDITED_EFFECT_WRITES_RED: actual authenticated effect must avoid per-number sink dispatch after exact readback and reopen; counts={counts:?}"
+        );
+    } else {
+        assert_eq!(
+            (
+                counts.effect_verifications,
+                counts.effect_serializations,
+                counts.effect_encoded_bytes,
+                counts.effect_length_writes,
+                counts.effect_mac_writes,
+            ),
+            (0, 0, 0, 0, 0),
+            "ordinary native operation is the negative effect-authentication control"
+        );
+    }
     assert_eq!(
         counts.finalized_scopes, 1,
         "actual finalized command observed"

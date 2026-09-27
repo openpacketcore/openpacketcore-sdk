@@ -4,10 +4,12 @@
 
 use std::io::{self, Read, Write};
 
-use opc_consensus::engine::{Entry, EntryPayload};
+use opc_consensus::engine::Entry;
 use opc_crypto::CONFIG_CAPACITY_V1_ENVELOPE_BYTES;
 
-use super::{ConfigRaftTypeConfig, EntryFields};
+use super::super::{Effect, Intent};
+use super::{ConfigRaftTypeConfig, EntryFields, Payload};
+#[cfg(test)]
 use crate::consensus::types::ConfigMutationIntent;
 
 const FIELD: &[u8] = b"\"encrypted_blob\":";
@@ -93,22 +95,27 @@ fn canonical_entry(bytes: &[u8]) -> io::Result<Option<Entry<ConfigRaftTypeConfig
     // reader allocates no second JSON document. Its parser scratch is dropped
     // before reserving the ciphertext. No field name search confers authority.
     let reader = bytes[..start].chain(b"[]".as_slice()).chain(&bytes[end..]);
-    let Ok(fields) = serde_json::from_reader::<_, EntryFields>(reader) else {
+    let Ok(mut fields) = serde_json::from_reader::<_, EntryFields>(reader) else {
         return Ok(None);
     };
-    let mut entry: Entry<ConfigRaftTypeConfig> = fields.into();
-    let EntryPayload::Normal(command) = &mut entry.payload else {
+    let Payload::Normal(command) = &mut fields.payload else {
         return Ok(None);
     };
-    let ConfigMutationIntent::BoundedAppend { commit, .. } = &mut command.intent else {
-        return Ok(None);
+    // Select the exact bounded field before conversion creates an immutable
+    // audited command. Both forms still require complete canonical equality.
+    let output = match &mut command.intent {
+        Intent::BoundedAppend { commit, .. } => &mut commit.record.encrypted_blob.0,
+        Intent::AuditedMutation(prepared) => match &mut prepared.effect {
+            Effect::BoundedAppend { commit, .. } => &mut commit.record.encrypted_blob.0,
+            _ => return Ok(None),
+        },
+        _ => return Ok(None),
     };
-    if !commit.record.encrypted_blob.is_empty() {
+    if !output.is_empty() {
         return Ok(None);
     }
     // The fixed envelope ceiling and complete count precede this allocation.
     // Fill exactly that count from the same immutable borrowed input.
-    let output = &mut commit.record.encrypted_blob;
     output.try_reserve_exact(count).map_err(|_| invalid())?;
     let mut index = start + 1;
     for _ in 0..count {
@@ -118,6 +125,7 @@ fn canonical_entry(bytes: &[u8]) -> io::Result<Option<Entry<ConfigRaftTypeConfig
     if index != end {
         return Err(invalid());
     }
+    let entry: Entry<ConfigRaftTypeConfig> = fields.into();
     // This binds the selected span to its exact typed field and rejects every
     // speculative mismatch, duplicate/unknown field, alias or reordered form.
     // Any mismatch falls back to the original parser with original input;
@@ -134,11 +142,16 @@ fn canonical_entry(bytes: &[u8]) -> io::Result<Option<Entry<ConfigRaftTypeConfig
 pub(super) fn entry(bytes: &[u8]) -> io::Result<Entry<ConfigRaftTypeConfig>> {
     super::native_json_preflight(bytes)?;
     if let Some(entry) = canonical_entry(bytes)? {
+        #[cfg(all(test, target_os = "linux"))]
+        crate::consensus::store::config_capacity_cost_observation::native_decoded(&entry, true);
         return Ok(entry);
     }
-    serde_json::from_slice::<EntryFields>(bytes)
+    let entry = serde_json::from_slice::<EntryFields>(bytes)
         .map(Into::into)
-        .map_err(|_| invalid())
+        .map_err(|_| invalid())?;
+    #[cfg(all(test, target_os = "linux"))]
+    crate::consensus::store::config_capacity_cost_observation::native_decoded(&entry, false);
+    Ok(entry)
 }
 
 #[cfg(test)]

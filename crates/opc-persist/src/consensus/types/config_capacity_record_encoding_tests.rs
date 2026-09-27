@@ -114,3 +114,92 @@ fn config_capacity_record_encoding_preserves_large_decimal_expansion_and_binary_
         );
     }
 }
+
+#[test]
+fn config_capacity_audited_effect_preserves_original_mac_and_tamper_rejection() {
+    use crate::consensus::audit_mutation::AuditedConfigEffect;
+    use crate::consensus::capacity_record::{CapacityRecordBinding, RECORD_CAPACITY_BYTES};
+    use hmac::{Hmac, KeyInit, Mac};
+    use sha2::Sha256;
+
+    let key = crate::AuditKey::new([0xa7; 32]).unwrap();
+    let wrong_key = crate::AuditKey::new([0xb8; 32]).unwrap();
+    for length in [0, 4096, opc_crypto::CONFIG_CAPACITY_V1_ENVELOPE_BYTES] {
+        for bounded in [false, true] {
+            let commit = Box::new(prepared(
+                (0..=255).cycle().take(length).collect(),
+                CommitSource::LocalOperator,
+                true,
+            ));
+            let effect = if bounded {
+                AuditedConfigEffect::BoundedAppend {
+                    commit,
+                    binding: CapacityRecordBinding::decode(&[0; RECORD_CAPACITY_BYTES]).unwrap(),
+                    resolution: None,
+                }
+            } else {
+                AuditedConfigEffect::Append {
+                    commit,
+                    resolution: None,
+                }
+            };
+            // Original compact JSON and independent domain/length transcript.
+            // Dummy bounded bindings are codec fixtures, not capacity authority.
+            let original = serde_json::to_vec(&effect).unwrap();
+            let mut mac = Hmac::<Sha256>::new_from_slice(key.as_bytes()).unwrap();
+            mac.update(b"openpacketcore/management-audit/config-mutation/v1\0");
+            mac.update(&(original.len() as u64).to_be_bytes());
+            mac.update(&original);
+            let expected: [u8; 32] = mac.finalize().into_bytes().into();
+            assert_eq!(effect.digest(&key).unwrap(), expected);
+            effect.verify(&key, &expected).unwrap();
+            assert!(effect.verify(&wrong_key, &expected).is_err());
+            let mut changed = effect.clone();
+            match &mut changed {
+                AuditedConfigEffect::Append { commit, .. }
+                | AuditedConfigEffect::BoundedAppend { commit, .. } => {
+                    commit.record.encrypted_blob.push(255);
+                }
+                _ => unreachable!(),
+            }
+            assert!(changed.verify(&key, &expected).is_err());
+        }
+    }
+}
+
+#[test]
+fn config_capacity_audited_effect_retains_exact_original_size_ceiling() {
+    use crate::consensus::audit_mutation::AuditedConfigEffect;
+
+    let key = crate::AuditKey::new([0xa7; 32]).unwrap();
+    let mut commit = Box::new(prepared(Vec::new(), CommitSource::LocalOperator, false));
+    let empty = AuditedConfigEffect::Append {
+        commit: commit.clone(),
+        resolution: None,
+    };
+    let overhead = serde_json::to_vec(&empty).unwrap().len();
+    let ceiling = crate::audit_authority::ledger::MAX_STATE_BYTES;
+    // Every 255 adds four bytes, except the missing leading comma. Adjust
+    // principal ASCII bytes to reach the exact preexisting limit.
+    let length = (ceiling - overhead + 1) / 4;
+    commit.record.encrypted_blob = vec![255; length];
+    let exact = overhead + length * 4 - 1;
+    commit
+        .record
+        .principal
+        .push_str(&"x".repeat(ceiling - exact));
+    let mut effect = AuditedConfigEffect::Append {
+        commit,
+        resolution: None,
+    };
+    assert_eq!(serde_json::to_vec(&effect).unwrap().len(), ceiling);
+    assert!(effect.digest(&key).is_ok());
+    if let AuditedConfigEffect::Append { commit, .. } = &mut effect {
+        commit.record.principal.push('x');
+    }
+    assert_eq!(serde_json::to_vec(&effect).unwrap().len(), ceiling + 1);
+    assert!(matches!(
+        effect.digest(&key),
+        Err(crate::audit_authority::AuditAuthorityError::InvalidInput)
+    ));
+}

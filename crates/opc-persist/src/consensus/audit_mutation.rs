@@ -174,6 +174,9 @@ impl<'de> Deserialize<'de> for AuditedConfigCommand {
 
 impl AuditedConfigCommand {
     pub(crate) fn verify_effect(&self, key: &AuditKey) -> Result<(), AuditAuthorityError> {
+        #[cfg(all(test, target_os = "linux"))]
+        let _effect_scope =
+            super::store::config_capacity_cost_observation::EffectScope::enter(&self.handle);
         self.effect.verify(
             key,
             &self
@@ -318,32 +321,51 @@ fn effect_authenticator(
     effect: &AuditedConfigEffect,
     key: &AuditKey,
 ) -> Result<Hmac<Sha256>, AuditAuthorityError> {
-    let mut length = EffectSizeCounter(0);
-    serde_json::to_writer(&mut length, effect).map_err(|_| AuditAuthorityError::InvalidInput)?;
+    let mut length = EffectSizeCounter::default();
+    super::config_capacity_json::to_writer(&mut length, effect)
+        .map_err(|_| AuditAuthorityError::InvalidInput)?;
     let mut mac = Hmac::<Sha256>::new_from_slice(key.as_bytes())
         .map_err(|_| AuditAuthorityError::KeyUnavailable)?;
     mac.update(MUTATION_DOMAIN);
-    mac.update(&(length.0 as u64).to_be_bytes());
+    mac.update(&(length.bytes as u64).to_be_bytes());
     let mut writer = EffectMacWriter {
         mac,
-        remaining: length.0,
+        remaining: length.bytes,
         chunk: [0; 8192],
         used: 0,
+        #[cfg(all(test, target_os = "linux"))]
+        writes: 0,
     };
-    serde_json::to_writer(&mut writer, effect).map_err(|_| AuditAuthorityError::InvalidInput)?;
+    super::config_capacity_json::to_writer(&mut writer, effect)
+        .map_err(|_| AuditAuthorityError::InvalidInput)?;
     if writer.remaining != 0 {
         return Err(AuditAuthorityError::InvalidInput);
     }
     std::io::Write::flush(&mut writer).map_err(|_| AuditAuthorityError::InvalidInput)?;
+    #[cfg(all(test, target_os = "linux"))]
+    super::store::config_capacity_cost_observation::effect_serialized(
+        length.bytes,
+        length.writes,
+        writer.writes,
+    );
     Ok(writer.mac)
 }
 
-struct EffectSizeCounter(usize);
+#[derive(Default)]
+struct EffectSizeCounter {
+    bytes: usize,
+    #[cfg(all(test, target_os = "linux"))]
+    writes: usize,
+}
 
 impl std::io::Write for EffectSizeCounter {
     fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
-        self.0 = self
-            .0
+        #[cfg(all(test, target_os = "linux"))]
+        {
+            self.writes += 1;
+        }
+        self.bytes = self
+            .bytes
             .checked_add(bytes.len())
             .filter(|length| *length <= crate::audit_authority::ledger::MAX_STATE_BYTES)
             .ok_or_else(|| std::io::Error::from(std::io::ErrorKind::InvalidInput))?;
@@ -359,10 +381,16 @@ struct EffectMacWriter {
     remaining: usize,
     chunk: [u8; 8192],
     used: usize,
+    #[cfg(all(test, target_os = "linux"))]
+    writes: usize,
 }
 
 impl std::io::Write for EffectMacWriter {
     fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        #[cfg(all(test, target_os = "linux"))]
+        {
+            self.writes += 1;
+        }
         self.remaining = self
             .remaining
             .checked_sub(bytes.len())
