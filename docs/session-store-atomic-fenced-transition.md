@@ -713,7 +713,8 @@ non-absorbing, but its journal is keyed by the body-committed 56-byte V2 ID,
 so a caller that does not retain the exact plaintext body cannot recover
 status after a restart. The facade combines V2 receipt history with
 caller-stable recovery, so a restarted caller can still refuse to start a
-second lineage while an earlier transition might commit.
+second lineage while an earlier transition might commit. The qualification
+record is [SDK-982 protected V2 consumer facade evidence](sdk-982-protected-v2-facade-evidence.md).
 
 ### Surfaces
 
@@ -943,6 +944,40 @@ The recovery journal's schema and key domain are downgrade fences. A binary
 that predates this facade cannot read the journal and cannot recover a V2
 transition prepared through it. Before rolling back, release or reclaim every
 retained row.
+
+### Consumer adoption
+
+A downstream consumer of the #701 V1 facade adopts the V2 facade in these
+steps:
+
+1. Provision a `FencedTransitionV2RecoveryJournal` with its own independent
+   key on a private durable volume: `create_new` exactly once, then
+   `open_existing` on every restart.
+2. Activate the same persistent clients with
+   `persistent_exact_voter_prewarm_roster`, and construct the facade with the
+   constructor that matches the existing protection mode and payload
+   namespace. Compose the existing V1 facade with `with_legacy_v1_recovery`
+   before the first V2 preparation.
+3. Replace the V1 facade's `prepare_fenced_transition` and the handle's
+   `execute_once` with the V2 methods of the same names. The request type,
+   caller-stable ID, and execution result types are unchanged. Receipt status
+   is `FencedTransitionV2Status`.
+4. Replace V1 restart recovery with `recover_fenced_transition_status`, which
+   returns `V2` or `LegacyV1`. `Recorded` carries the exact result.
+   `EpochNotActive`, `Retired`, `HistoryFull`, and `RetentionExhausted` prove
+   that the transition has not taken effect and never will.
+5. Call `release_resolved` once a transition's result has been consumed, and
+   run `reclaim_resolved_fenced_transitions` on a regular cadence. The
+   consumer process owns that sweep. The state process's operator loop owns
+   `ConsensusSessionStore::maintain_fenced_transition_v2_history`.
+6. Treat `Rejected` with `FencedTransitionHistoryEpochNotActive`,
+   `FencedTransitionHistoryEpochRetired`, or `FencedTransitionHistoryFull`
+   from `execute_once` as a definitive rejection that bound nothing. The
+   handle has already removed its row and invalidated the cached epoch, so
+   the caller may prepare the same caller ID again. After `HistoryFull`, that
+   preparation fails closed until maintenance opens the successor epoch. If
+   the row could not be removed, recovery reports the terminal status and
+   `release_resolved` removes it.
 
 ### Recovery journal persistence and security
 
