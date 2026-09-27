@@ -59,8 +59,9 @@ All names below are under `protected_fenced_transition_v2_recovery_tests`.
 | Misconfigured, full-epoch, non-V2, and non-plaintext preparations fail before provider, journal, or dispatch effects, and a removed row is never dispatched | `protected_v2_recovery_fails_closed_before_provider_journal_or_dispatch_effects` |
 | A substituted journal row is rejected before dispatch | `protected_v2_recovery_rejects_a_substituted_row_before_dispatch` |
 | V1 and V2 compositions reject each other's retained caller IDs | `protected_v2_recovery_and_legacy_v1_reject_each_others_retained_ids` |
+| Concurrent V1 and V2 preparations of one caller ID cannot both bind | `protected_v2_recovery_and_legacy_v1_exclude_one_concurrent_caller_id` |
 | Remote sealing prepares with one seal and unprotects only observations | `protected_v2_recovery_remote_seal_prepares_once_and_observes_unprotected_records` |
-| Operation continues past the eight retained epochs with at most two live rows, and no V2 identity executes twice | `protected_v2_recovery_sustains_operation_beyond_retained_epochs_with_bounded_rows` |
+| Operation continues past the eight retained epochs with at most two live rows, no V2 identity executes twice, and retired-floor reclamation uses the floor the port linearized itself | `protected_v2_recovery_sustains_operation_beyond_retained_epochs_with_bounded_rows` |
 
 ### Affine handle and epoch cache (`opc-session-net`)
 
@@ -78,6 +79,8 @@ All names below are under `consumer::prepared_fenced_v2::tests`.
 | The epoch cache serves only a bindable, newest state | `v2_history_cache_serves_only_a_bindable_newest_state` |
 | `EpochNotActive`, `Retired`, and `HistoryFull` rejections invalidate the cached epoch | `v2_handle_closed_or_full_epoch_rejection_invalidates_the_cached_epoch` |
 | Other rejections keep the cached epoch | `v2_handle_other_rejections_keep_the_cached_epoch` |
+| A proven-unsent row whose self-removal failed stays releasable | `v2_handle_unsent_row_whose_discard_failed_stays_releasable` |
+| A cached local row failure ends `status_until_terminal` at once | `v2_status_until_terminal_returns_a_cached_local_failure_without_spinning` |
 
 ## Real three-voter evidence
 
@@ -95,6 +98,7 @@ are under `authenticated_consumer_fixture::v2_facade_tests`.
 | An upgrade keeps retained V1 transitions status-recoverable | `fixture_v2_facade_upgrade_keeps_retained_v1_transitions_recoverable` |
 | Remote sealing commits through real voters | `fixture_v2_facade_remote_sealing_commits_through_real_voters` |
 | The sweep retains `Recorded` and unresolved rows and rejects a zero limit | `fixture_v2_facade_reclaim_sweep_retains_recorded_and_unresolved_rows` |
+| The sweep reads each row's status past a voter that never answers | `fixture_v2_facade_reclaim_sweep_reads_past_a_stalled_voter` |
 | Activation performs one history read, transitions perform none, and a sweep refreshes it with one | `fixture_v2_facade_keeps_the_linearized_history_read_off_the_preparation_path` |
 
 ## Release qualification
@@ -115,37 +119,70 @@ cargo test --locked -p opc-session-testkit --all-features --lib -- \
 A durable commit that outlives one physical attempt is a possible send. The
 qualification resolves such a transition by recovering it by caller ID and
 reading its exact receipt, never by a second mutation, and reports the count.
-On the recorded head, a debug build on a shared 128-core Linux host committed
-all 4,160 transitions with a peak of one retained row, no transition resolved
-by receipt, and one history read, in 109.4 s. That duration describes this
-run only; it is not a performance claim.
+It still requires exactly one physical V2 call per transition and that every
+recovered receipt is the matching recorded outcome.
+
+An earlier version of this qualification required every `execute_once` to
+return the outcome directly, and it failed intermittently with
+`OutcomeUnknown`. The cause is the shared host, not the facade. Every failing
+attempt took 252 ms, which is the qualification's 250 ms physical-attempt
+budget plus classification time. Four independent qualification processes
+were started 23 s apart on the same host. Their failing attempts coincided in
+wall-clock time: two processes failed within 40 ms of each other, and all
+four failed within 270 ms of one instant. Their relative run times and
+ordinals differed. The cause is therefore host-wide storage stalls longer than
+the budget. A durable commit that outlives its attempt is correctly reported
+as a possible send. Accepting only direct outcomes would have made a latency
+claim on shared hardware. That belongs to the separate CNF performance
+profiles, not to this functional qualification.
+
+Local results for the qualification, all debug builds on a shared 128-core
+Linux host:
+
+- One run committed all 4,160 transitions. It had a peak of one retained row
+  and one history read, and it resolved none by receipt.
+- The four staggered concurrent runs each committed all 4,160. They resolved
+  1, 3, 1, and 2 transitions by receipt, each with exactly one physical call.
+
+These durations describe those runs only; they are not a performance claim.
 
 ## Local gates
 
-Recorded on code head `be0dfab71d7a39c3e21b85f1800f3b0f1aa50261`. This
-record was added afterwards without code changes. The commands mirror the
-hosted `CI` workflow. They ran on a Linux x86_64 host with a private
-fs-verity snapshot filesystem and a disk-backed `TMPDIR`, which the workflow
-also provisions.
+Recorded on code head `fcd6fff650fd779f733ab7cc67c41353e9f104a0`; later
+commits change documents only. The commands mirror the hosted `CI`
+workflow. They ran on a shared Linux x86_64 host with a private fs-verity
+snapshot filesystem (`ci/setup-fsverity-tmp.sh`, with
+`OPC_FS_VERITY_QUALIFICATION=required`) and a disk-backed `TMPDIR` on XFS.
+The `TMPDIR` path must be short: a Unix-socket test in `opc-ipsec-lb` fails
+with "File name too long" under a deep path.
 
 | Gate | Result |
 | --- | --- |
 | `cargo fmt --all --check`, and `git diff --check` from the merge base | pass |
 | `cargo clippy --locked --workspace --all-targets --all-features -- -D warnings` | pass |
 | `python3 ci/test-shards.py verify`, `precheck` for every shard, and `verify-heavy`, plus the shard-manifest and performance-plan self-tests | pass |
-| Every command of every test shard (`misc`, `quiescent-o1`, `it-0`, `it-1`, `it-2`, `heavy-0`, `heavy-1`) from `python3 ci/test-shards.py plan`, in order | pass (23 commands) |
+| Every command of every test shard (`misc`, `quiescent-o1`, `it-0`, `it-1`, `it-2`, `heavy-0`, `heavy-1`) from `python3 ci/test-shards.py plan`, in order | pass (24 commands) |
 | `opc-persist` default-feature Clippy and contract tests, and its serial all-features suite | pass |
 | `RUSTDOCFLAGS="-D warnings" cargo doc --workspace --no-deps --all-features` | pass |
 | MSRV `cargo +1.89.0 check --workspace --all-targets --all-features`, and `python3 scripts/publish-order.py --check` | pass |
 | Reference SMF consumer: formatting, Clippy, and tests | pass |
-| Both Go modules: `gofmt`, `go vet`, `go test -race`, and the downstream import check | pass |
 | Repository Python gates: management-plane policy, N3IWF fixture contracts, reference vectors, IKE AUTH known answers, the release-attestation wrapper, live-memory validators, and the Diameter corpus self-test | pass |
-| `cargo check --target i686-unknown-linux-gnu -p opc-session-net --all-targets --all-features` | pass |
+| `cargo check --target i686-unknown-linux-gnu -p opc-session-net --all-targets --all-features`, with the workflow's `-m32` linker and C settings | pass |
 | Default-feature checks of the three changed crates, and `opc-sdk` with `--no-default-features --features session` and with default features | pass |
+| Release qualification `fixture_v2_facade_sustains_more_transitions_than_one_v1_journal_holds` | pass: 4,160 transitions, peak one row, none resolved by receipt, 81.8 s |
 
-The Go module tests need a `TMPDIR` outside the repository tree. Otherwise a
-bridge test finds, through a relative path, a CLI binary that the Rust shards
-built.
+`heavy-0` runs
+`five_process_projected_mtls_unavailable_malformed_and_expiry_recovery`. That
+test failed once in the first hosted run of this pull request, with a
+recovered-member availability budget exceeded. It also failed twice out of two
+local runs of unchanged `origin/main` on this loaded host, at the same
+assertions. It passed on the hosted rerun of the failed job and in the local
+run above. It exercises the multiprocess quorum-node qualification, which
+this change does not touch. The failure is load-sensitive, and this change
+does not cause it.
+
+The Go modules did not change and were not rerun for this head; they passed
+on the earlier head `be0dfab7`.
 
 These gates were not run locally:
 
@@ -168,17 +205,34 @@ These gates were not run locally:
 
 - Real-voter epoch rotation through the facade. Opening a successor epoch
   needs 131,072 bindings in the active epoch. The facade's rotation behavior
-  is covered with scripted history boundaries above, and real rotation and
-  retirement are qualified for the store itself by the SDK-702 record. An
-  attempt to bind one epoch in bulk through the testkit's fixed-durable
-  fixture, using the store's public V2 batch API, stopped at about 10,000
-  bindings: the fixture's leader stopped admitting application traffic,
-  whatever the batch size or pacing. That fixture behavior is outside this
-  change and is not investigated here.
+  is covered with scripted history boundaries above. Real rotation and
+  retirement are qualified for the store itself by the SDK-702 record, whose
+  voters are separate processes.
+
+  The testkit's in-process fixture cannot fill one epoch. Its three voters
+  share the single process-wide 128 MiB snapshot-verification budget, which
+  production gives to each voter process. After about 40 s of 256-item
+  batches, the test-control build logs `verification_memory_admission_failure`
+  and the fleet stops making progress.
+
+  As a local diagnostic only, the budget was raised to 1 GiB; that change is
+  not part of this branch. With it, the fixture filled epoch 1, and operator
+  maintenance opened epoch 2. The complete facade scenario then passed on
+  real voters:
+  - a cached-epoch request was rejected as `HistoryFull` without binding;
+  - preparation failed closed until the rotation;
+  - transitions committed in epoch 2;
+  - the sweep removed the row stranded in epoch 1 while no retired floor
+    existed, and kept the recorded row.
+
+  #984 tracks per-voter accounting for in-process fleets and the committed
+  real-voter qualification.
 - Host failover, volume loss, or a replicated recovery journal. Restart
   recovery needs the same durable volume, path, journal key, protection mode
   and namespace, local identity, and stable cluster.
 - Latency percentiles or throughput. The history cache removes one consensus
-  logical-time fence per transition. No latency figure is claimed.
+  logical-time fence per transition. The recovery journal skips its
+  bind-on-first-use write and parent sync once the scope is proven bound. No
+  latency figure is claimed.
 - Downgrade. A binary that predates this facade cannot read the recovery
   journal; release or reclaim every row before rolling back.
