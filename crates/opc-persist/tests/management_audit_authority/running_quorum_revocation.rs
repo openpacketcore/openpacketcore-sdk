@@ -463,7 +463,23 @@ async fn running_replacement_revocation_during_native_quorum_is_definite_and_ato
         .unwrap();
     let leader = nodes.iter().position(|node| *node == leader_id).unwrap();
     let store = &stores[leader];
-    let initial_index = store.status().applied_index.unwrap();
+    // Cluster admission observes replicated membership, which can precede
+    // the first state-machine apply. Wait for that real apply before recording
+    // the baseline; do not introduce an unpaired quorum read into this fixture.
+    let mut metrics = store.inner.raft.metrics();
+    let initial_index = tokio::time::timeout(WAIT, async {
+        loop {
+            if let Some(log) = metrics.borrow().last_applied.as_ref() {
+                return log.index;
+            }
+            metrics
+                .changed()
+                .await
+                .expect("PINNED_QUORUM_SETUP: native metrics remain live");
+        }
+    })
+    .await
+    .expect("PINNED_QUORUM_SETUP: first native apply inside original deadline");
     for member in &stores {
         assert!(wait_applied(member, initial_index).await);
     }

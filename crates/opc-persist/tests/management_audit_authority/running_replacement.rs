@@ -741,11 +741,16 @@ async fn running_replacement_post_preflight_lock_change_retains_rejection_withou
         "RUNNING_REJECTED_TARGET_UNCHANGED"
     );
     assert!(f.store.load_latest().await.unwrap().is_none());
+    assert_eq!(
+        f.store.verify_netconf_lock_lease(&lease, caller()).await,
+        Err(AuditAuthorityError::RecoveryRequired),
+        "RUNNING_REJECTION_DEBT_FENCES_LEASE_VERIFICATION"
+    );
+    f.settle(&receipt).await;
     f.store
         .verify_netconf_lock_lease(&lease, caller())
         .await
         .unwrap();
-    f.settle(&receipt).await;
     f.unlock(&session, &lease, 4).await;
     f.close().await;
 }

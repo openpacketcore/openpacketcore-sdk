@@ -312,9 +312,24 @@ pub(crate) fn apply_cancellable_sync(
                 AuditCommand::NetconfTarget(command) => {
                     use super::audit_mutation::TargetAuditCommandV1;
                     match &**command {
-                        TargetAuditCommandV1::Admit(prepared) => {
-                            ledger.admit_target(key, prepared, now)
-                        }
+                        TargetAuditCommandV1::Admit(prepared) => ledger
+                            .lookup(key, prepared.handle(), prepared.effect.caller)
+                            .and_then(|existing| {
+                                // A read-only preflight cannot reserve this ledger.
+                                // Serialize new target intents against the current
+                                // authenticated transaction, or two original intents
+                                // can each block the other's effect forever. Exact
+                                // replay still reaches admit_target's payload check.
+                                if existing.is_none()
+                                    && ledger.operations.iter().any(|operation| {
+                                        !operation.terminal_recorded
+                                            || ledger.mutation_outcome_needs_checkpoint(operation)
+                                    })
+                                {
+                                    return Err(AuditAuthorityError::RecoveryRequired);
+                                }
+                                ledger.admit_target(key, prepared, now)
+                            }),
                         TargetAuditCommandV1::EmptyCommit(prepared) => {
                             super::audit_targets::admit_empty_commit_sync(
                                 conn, key, ledger, prepared, context,

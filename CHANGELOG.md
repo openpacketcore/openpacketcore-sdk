@@ -9,6 +9,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- `opc-persist`: serialize new retained-target audit Intents against unsettled
+  operations in the authenticated ledger transaction. Preserve exact-original
+  replay and reject stale effects without applying them. Concurrent cleanup
+  convergence remains under qualification. Refs #958.
+
 - `opc-persist`: allow an ordinary Running replacement after a confirmed
   configuration has been rolled back and its original audit obligations settled.
   Retained tentative history does not fence the current ordinary head; a current
