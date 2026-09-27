@@ -797,6 +797,18 @@ impl LedgerState {
         key: &AuditKey,
         identity: ConfigConsensusIdentity,
     ) -> Result<(), AuditAuthorityError> {
+        self.validate_with_original(key, identity, None)
+    }
+
+    // Receipt readback may lend its current typed command as a representation
+    // candidate. Matching handles still require the complete verifier and exact
+    // comparison to this freshly authenticated row's canonical retained bytes.
+    pub(crate) fn validate_with_original(
+        &self,
+        key: &AuditKey,
+        identity: ConfigConsensusIdentity,
+        original: Option<&crate::consensus::TargetMutationCommand>,
+    ) -> Result<(), AuditAuthorityError> {
         self.limits.validate()?;
         if self.version != 1
             || self.identity != identity
@@ -841,11 +853,12 @@ impl LedgerState {
                     if self.continuity.is_none() {
                         return Err(AuditAuthorityError::BindingMismatch);
                     }
-                    validate_target_recovery(
+                    recover_target_for_validation(
                         key,
                         self.identity,
                         &retained.handle,
                         &retained.recovery,
+                        original,
                     )?;
                     Some(&retained.handle)
                 }
@@ -913,7 +926,13 @@ impl LedgerState {
                             _ => None,
                         })
                     {
-                        validate_target_outcome(key, self.identity, retained, *state)?;
+                        validate_target_outcome_with_original(
+                            key,
+                            self.identity,
+                            retained,
+                            *state,
+                            original,
+                        )?;
                         if let AuditOperationState::TargetV1(result) = state {
                             target_anchor = Some(TargetStateAnchor {
                                 sequence,
@@ -1067,12 +1086,57 @@ fn validate_target_outcome(
     retained: &RetainedTargetIntent,
     state: AuditOperationState,
 ) -> Result<(), AuditAuthorityError> {
-    let prepared = validate_target_recovery(key, identity, &retained.handle, &retained.recovery)?;
+    validate_target_outcome_with_original(key, identity, retained, state, None)
+}
+
+fn validate_target_outcome_with_original(
+    key: &AuditKey,
+    identity: ConfigConsensusIdentity,
+    retained: &RetainedTargetIntent,
+    state: AuditOperationState,
+    original: Option<&crate::consensus::TargetMutationCommand>,
+) -> Result<(), AuditAuthorityError> {
+    let prepared = recover_target_for_validation(
+        key,
+        identity,
+        &retained.handle,
+        &retained.recovery,
+        original,
+    )?;
     match state {
         AuditOperationState::Rejected => Ok(()),
-        AuditOperationState::TargetV1(result) => prepared.validate_result(result),
+        AuditOperationState::TargetV1(result) => prepared.command().validate_result(result),
         _ => Err(AuditAuthorityError::BindingMismatch),
     }
+}
+
+enum TargetForValidation<'a> {
+    Decoded(super::PreparedTargetMutation),
+    Borrowed(&'a crate::consensus::TargetMutationCommand),
+}
+
+impl TargetForValidation<'_> {
+    fn command(&self) -> &crate::consensus::TargetMutationCommand {
+        match self {
+            Self::Decoded(prepared) => prepared.command(),
+            Self::Borrowed(original) => original,
+        }
+    }
+}
+
+fn recover_target_for_validation<'a>(
+    key: &AuditKey,
+    identity: ConfigConsensusIdentity,
+    handle: &AuditOperationHandle,
+    recovery: &str,
+    original: Option<&'a crate::consensus::TargetMutationCommand>,
+) -> Result<TargetForValidation<'a>, AuditAuthorityError> {
+    if let Some(original) = original.filter(|original| original.handle() == handle) {
+        if original.verify_canonical_retained(recovery.as_bytes(), key, identity, handle)? {
+            return Ok(TargetForValidation::Borrowed(original));
+        }
+    }
+    validate_target_recovery(key, identity, handle, recovery).map(TargetForValidation::Decoded)
 }
 
 fn validate_target_recovery(

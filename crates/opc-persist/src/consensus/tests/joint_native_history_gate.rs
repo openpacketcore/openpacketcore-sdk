@@ -41,6 +41,7 @@ thread_local! {
 }
 
 pub(in crate::consensus) fn row_authenticated() {
+    receipt_cost_tests::row_authenticated();
     ACTIVE.with(|slot| {
         if let Some(active) = slot.borrow_mut().as_mut() {
             active.counts.rows += 1;
@@ -49,6 +50,7 @@ pub(in crate::consensus) fn row_authenticated() {
 }
 
 pub(in crate::consensus) fn recovered(handle: &AuditOperationHandle) {
+    receipt_cost_tests::recovered(handle);
     ACTIVE.with(|slot| {
         if let Some(active) = slot.borrow_mut().as_mut() {
             active.counts.recoveries += 1;
@@ -824,3 +826,6 @@ fn joint_history_gate_other_profiles_keep_original_paths() {
         tx.rollback().unwrap();
     }
 }
+
+#[path = "joint_native_receipt_cost.rs"]
+pub(in crate::consensus) mod receipt_cost_tests;

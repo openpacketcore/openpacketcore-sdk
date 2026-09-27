@@ -3896,12 +3896,21 @@ pub(crate) fn apply_entries_cancellable_sync(
                     super::storage::config_capacity_apply_observations::observe(
                         "savepoint_released",
                     );
-                    let audit_receipt = super::audit::applied_receipt_sync(
+                    #[cfg(all(test, target_os = "linux"))]
+                    super::audit_targets::history_gate_tests::receipt_cost_tests::before_receipt(
+                        &tx,
+                    );
+                    #[cfg(all(test, target_os = "linux"))]
+                    let receipt_cost = super::audit_targets::history_gate_tests::receipt_cost_tests::ReceiptScope::enter(&command.intent);
+                    let audit_receipt = super::audit::applied_receipt_for_mode_sync(
                         &tx,
                         audit_key,
                         identity,
                         &command.intent,
+                        mode,
                     )?;
+                    #[cfg(all(test, target_os = "linux"))]
+                    receipt_cost.complete(audit_receipt.is_some());
                     #[cfg(test)]
                     super::storage::config_capacity_apply_observations::observe(
                         "audit_receipt_read",

@@ -37,6 +37,36 @@ impl TargetMutationCommand {
         Ok(())
     }
 
+    // Validate the actual retained bytes against a borrowed candidate without
+    // decoding another owned copy. The complete verifier runs again; exact
+    // canonical equality rejects malformed, noncanonical or substituted input.
+    // No result or validation fact survives this call.
+    pub(crate) fn verify_canonical_retained(
+        &self,
+        bytes: &[u8],
+        key: &AuditKey,
+        identity: ConfigConsensusIdentity,
+        original: &AuditOperationHandle,
+    ) -> Result<bool, AuditAuthorityError> {
+        original.verify(key, identity, original.body.binding.caller)?;
+        if bytes.len() > crate::consensus::sqlite::CONFIG_CONSENSUS_LOG_ENTRY_MAX_BYTES {
+            return Err(AuditAuthorityError::InvalidInput);
+        }
+        if self.handle() != original || self.bounded_running().is_none() {
+            return Ok(false);
+        }
+        let mut comparison = CanonicalRecovery { remaining: bytes };
+        if crate::consensus::config_capacity_json::to_writer(&mut comparison, self).is_err()
+            || !comparison.remaining.is_empty()
+        {
+            // A different submitted command must not invalidate a valid stored
+            // original. Preserve the ordinary decoder and receipt classification.
+            return Ok(false);
+        }
+        self.verify_retained(key, identity, original.body.binding.caller)?;
+        Ok(true)
+    }
+
     pub(crate) fn encode_retained(
         &self,
         key: &AuditKey,

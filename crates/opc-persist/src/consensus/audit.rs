@@ -152,7 +152,16 @@ pub(crate) fn read_sync(
     key: &AuditKey,
     identity: ConfigConsensusIdentity,
 ) -> io::Result<Option<LedgerState>> {
-    let stored = read_verified_sync(conn, key)?;
+    read_with_original_sync(conn, key, identity, None)
+}
+
+fn read_with_original_sync(
+    conn: &Connection,
+    key: &AuditKey,
+    identity: ConfigConsensusIdentity,
+    original: Option<&super::TargetMutationCommand>,
+) -> io::Result<Option<LedgerState>> {
+    let stored = read_verified_with_original_sync(conn, key, original)?;
     if stored.identity != identity {
         return Err(invalid());
     }
@@ -173,6 +182,14 @@ pub(crate) fn read_with_keys_sync(
 }
 
 fn read_verified_sync(conn: &Connection, key: &AuditKey) -> io::Result<StoredLedger> {
+    read_verified_with_original_sync(conn, key, None)
+}
+
+fn read_verified_with_original_sync(
+    conn: &Connection,
+    key: &AuditKey,
+    original: Option<&super::TargetMutationCommand>,
+) -> io::Result<StoredLedger> {
     let mut statement = conn.prepare(
         "SELECT state_json, state_hmac FROM config_raft_management_audit WHERE singleton = 1 AND length(state_json) BETWEEN 1 AND 16777216 AND length(state_hmac) = 32",
     ).map_err(|_| invalid())?;
@@ -203,9 +220,11 @@ fn read_verified_sync(conn: &Connection, key: &AuditKey) -> io::Result<StoredLed
     drop(rows);
     drop(statement);
     if let Some(ledger) = &stored.ledger {
-        ledger
-            .validate(key, stored.identity)
-            .map_err(|_| invalid())?;
+        match original {
+            Some(original) => ledger.validate_with_original(key, stored.identity, Some(original)),
+            None => ledger.validate(key, stored.identity),
+        }
+        .map_err(|_| invalid())?;
     }
     let identity = stored.identity;
     let matches: bool = conn.query_row(
@@ -543,6 +562,53 @@ pub(crate) fn applied_receipt_sync(
     identity: ConfigConsensusIdentity,
     intent: &super::ConfigMutationIntent,
 ) -> io::Result<Option<crate::audit_authority::receipt::AuthenticatedAuditReceipt>> {
+    applied_receipt_with_original_sync(conn, key, identity, intent, None)
+}
+
+// Selection comes from the admitted SQLite mode, never from retained bytes.
+// The supplied command is only a candidate representation of an original. It
+// grants no authority: fresh row/entry authentication and every ledger check
+// still run, and lookup_receipt still recovers the exact stored original.
+pub(crate) fn applied_receipt_for_mode_sync(
+    conn: &Connection,
+    key: &AuditKey,
+    identity: ConfigConsensusIdentity,
+    intent: &super::ConfigMutationIntent,
+    mode: super::RetainedConfigMode,
+) -> io::Result<Option<crate::audit_authority::receipt::AuthenticatedAuditReceipt>> {
+    let original = if mode == super::RetainedConfigMode::NetconfRunningV1 && !conn.is_autocommit() {
+        match intent {
+            super::ConfigMutationIntent::ManagementAudit(audit) => match audit.as_ref() {
+                AuditCommand::NetconfTarget(target) => match target.as_ref() {
+                    super::audit_mutation::TargetAuditCommandV1::Apply(prepared)
+                        if prepared.bounded_running().is_some() =>
+                    {
+                        Some(prepared)
+                    }
+                    _ => None,
+                },
+                _ => None,
+            },
+            _ => None,
+        }
+    } else {
+        None
+    };
+    match original {
+        Some(original) => {
+            applied_receipt_with_original_sync(conn, key, identity, intent, Some(original))
+        }
+        None => applied_receipt_sync(conn, key, identity, intent),
+    }
+}
+
+fn applied_receipt_with_original_sync(
+    conn: &Connection,
+    key: &AuditKey,
+    identity: ConfigConsensusIdentity,
+    intent: &super::ConfigMutationIntent,
+    original: Option<&super::TargetMutationCommand>,
+) -> io::Result<Option<crate::audit_authority::receipt::AuthenticatedAuditReceipt>> {
     use crate::audit_authority::receipt::AuthenticatedAuditReceipt;
     let handle = match intent {
         super::ConfigMutationIntent::AuditedMutation(prepared) => &prepared.handle,
@@ -562,7 +628,7 @@ pub(crate) fn applied_receipt_sync(
     {
         return Ok(None);
     }
-    let Some(ledger) = read_sync(conn, key, identity)? else {
+    let Some(ledger) = read_with_original_sync(conn, key, identity, original)? else {
         return Ok(None);
     };
     if let super::ConfigMutationIntent::ManagementAudit(audit) = intent {
