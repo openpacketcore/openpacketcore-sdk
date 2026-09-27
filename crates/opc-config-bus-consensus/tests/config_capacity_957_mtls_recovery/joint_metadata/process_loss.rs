@@ -4,7 +4,7 @@ use super::*;
 use rusqlite::OptionalExtension;
 use serde::{Deserialize, Serialize};
 use std::fs::{File, OpenOptions};
-use std::io::{BufRead, BufReader, Read, Write};
+use std::io::{BufRead, BufReader, BufWriter, Read, Write};
 use std::os::unix::fs::OpenOptionsExt;
 use std::os::unix::process::ExitStatusExt;
 use std::process::{Child, Command, Stdio};
@@ -26,10 +26,36 @@ fn new_file(path: &Path) -> File {
         .expect("new private synthetic fixture file")
 }
 
-fn save<T: Serialize>(path: &Path, value: &T) {
-    let mut file = new_file(path);
-    serde_json::to_writer(&mut file, value).expect("serialize synthetic recovery evidence");
-    file.sync_all().expect("retain original recovery evidence");
+struct EvidenceFile {
+    file: File,
+    writes: usize,
+}
+
+impl Write for EvidenceFile {
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        self.writes += 1;
+        self.file.write(bytes)
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        self.file.flush()
+    }
+}
+
+fn save<T: Serialize>(path: &Path, value: &T) -> usize {
+    let mut file = EvidenceFile {
+        file: new_file(path),
+        writes: 0,
+    };
+    {
+        let mut buffered = BufWriter::with_capacity(8_192, &mut file);
+        serde_json::to_writer(&mut buffered, value).expect("serialize synthetic recovery evidence");
+        buffered.flush().expect("flush original recovery evidence");
+    }
+    file.file
+        .sync_all()
+        .expect("retain original recovery evidence");
+    file.writes
 }
 
 fn load<T: serde::de::DeserializeOwned>(path: &Path) -> T {
@@ -57,6 +83,34 @@ fn retained_pki(directory: &Path) -> Pki {
 struct Original {
     record: CommitRecord,
     handle: Vec<u8>,
+}
+
+#[test]
+fn process_loss_evidence_batches_file_writes_without_changing_retained_bytes() {
+    let directory = disk_fixture();
+    let path = directory.join("original-evidence.json");
+    let mut record = record(1, None, &principal(false));
+    record.encrypted_blob = (0..=u8::MAX).cycle().take(ENVELOPE_BYTES).collect();
+    record.plaintext_digest = vec![0xB4; 32];
+    let original = Original {
+        record,
+        handle: (0..=u8::MAX).cycle().take(REPLAY_BYTES).collect(),
+    };
+    let writes = save(&path, &original);
+    let actual = std::fs::read(&path).expect("read the flushed and synced original");
+    let expected = serde_json::to_vec(&original).expect("independent retained JSON encoding");
+    assert!(actual == expected, "retain exact original JSON bytes");
+    let reopened: Original = load(&path);
+    assert!(reopened.record == original.record, "retain exact record");
+    assert!(reopened.handle == original.handle, "retain exact handle");
+    eprintln!(
+        "CONFIG_CAPACITY_PROCESS_EVIDENCE writes={writes} encoded_bytes={} exact_readback=true",
+        actual.len()
+    );
+    assert!(
+        writes < 2_048,
+        "CONFIG_CAPACITY_PROCESS_EVIDENCE_WRITE_AMPLIFICATION"
+    );
 }
 
 impl Original {
