@@ -842,12 +842,21 @@ handle is permanently receipt-only. There is no automatic re-dispatch.
 for the exact retained request. `Recorded`, `Expired`, `Retired`,
 `EpochNotActive`, `HistoryFull`, `RetentionExhausted`, and `RequestConflict`
 are terminal and cached. `NotFound`, unavailability, and per-attempt
-deadlines are not terminal while the caller's absolute deadline remains. The
-facade chose the active epoch at preparation, so the request's epoch is never
-above the active epoch. `EpochNotActive`, `Retired`, `HistoryFull`, and
-`RetentionExhausted` therefore prove that the retained transition has not
-bound a receipt and never will. `NotFound` remains non-exclusionary, as in
-V1: it does not prove that a delayed proposal cannot commit.
+deadlines are not terminal while the caller's absolute deadline remains. A
+local fail-closed row failure, for example a row that was released or
+reclaimed after the handle was opened, is cached as `Unavailable` and
+returned at once; it is final for that handle. The facade chose the active epoch at preparation, so the
+request's epoch is never above the active epoch. V2 status reads an exact
+receipt before it classifies the epoch or capacity, so `EpochNotActive`,
+`HistoryFull`, and `RetentionExhausted` prove that the retained transition
+has not bound a receipt and never will. `Retired` and `Expired` only prove
+that it can no longer bind: V2 classifies a request at or below the retired
+floor before any receipt lookup, and a floor advances only after the 24-hour
+result window, so a transition that committed earlier can later report
+either status. After a possible send, a caller must treat both as "may have
+taken effect" and derive later work from authoritative observation.
+`NotFound` remains non-exclusionary, as in V1: it does not prove that a
+delayed proposal cannot commit.
 
 `recover_fenced_transition_status(request_id, budget)` is a local journal
 lookup followed by receipt-only status:
@@ -875,24 +884,31 @@ or transport work until a row is removed. A row is removed only by
 compare-and-delete of its exact authenticated bytes, and only in these cases:
 
 1. The original affine handle removes its own row when every candidate voter
-   proved `NotTransmitted`, or after a definitive unbound rejection
-   (`EpochNotActive`, `Retired`, `HistoryFull`, or `RetentionExhausted`). In
-   both cases the transition never bound a receipt and cannot bind one later.
+   proved `NotTransmitted`, when its execution was refused with
+   `TopologyAuthorityRevoked` (classified before any Call byte), or after a
+   definitive unbound rejection (`EpochNotActive`, `Retired`, `HistoryFull`,
+   or `RetentionExhausted`) of its single possible dispatch. In each case the
+   transition never bound a receipt and cannot bind one later. If that
+   removal fails or is cancelled, the handle stays resolved and
+   `release_resolved` retries it.
 2. `release_resolved` on a live or recovered handle removes its row after
-   that handle has observed a resolution: a matching outcome, a definitive
-   rejection other than `TopologyAuthorityRevoked`, or a terminal status
-   other than `RequestConflict`.
+   that handle has observed a resolution: a matching outcome, one of the
+   execution results in case 1, any other definitive rejection, or a
+   terminal status other than `RequestConflict`.
 3. `reclaim_resolved_fenced_transitions(limit, budget)` is a bounded,
-   caller-scheduled sweep of at most 256 rows per call. It first reads the
-   linearized history state and removes rows at or below the retired floor
-   without further I/O. It then examines rows in caller-ID order from a
-   process-local cursor, reads each row's exact status, and removes those
-   whose status is `Expired`, `Retired`, `HistoryFull`, `RetentionExhausted`,
-   or `EpochNotActive` for an epoch below the linearized active epoch. It
+   caller-scheduled sweep of at most 256 rows per call. The wrapper first
+   reads the linearized history state itself and removes rows at or below
+   that retired floor without further I/O; no caller supplies the floor. The
+   sweep then examines rows in caller-ID order from a process-local cursor,
+   reads each row's exact status, and removes those whose status is
+   `Expired`, `Retired`, `HistoryFull`, `RetentionExhausted`, or
+   `EpochNotActive` for an epoch below the linearized active epoch. It
    retains `Recorded` rows until their receipt expires (the exact 24-hour V2
    result window), and it retains `NotFound`, `RequestConflict`, and every
-   row whose status is unavailable. It stops at the first unavailable status
-   or at the caller's deadline.
+   row whose status is unavailable. Status is read-only, so an unavailable
+   voter moves a row's read to the next canonical voter. The sweep stops as
+   interrupted when every voter failed for one row, when a local journal
+   read or removal fails, or at the caller's deadline.
 
 After a row is removed, `recover_fenced_transition_status` returns `None` for
 that ID. Removal ends the caller-level binding: the SDK keeps no tombstone,
@@ -909,7 +925,11 @@ row metadata. It uses the same main-file, WAL, and shared-memory ceilings as
 the #701 journal; typical rows are the size of the sealed record. The bound
 is not absorbing. A resolved row is removable immediately. An unresolved
 `NotFound` row becomes removable once its epoch closes, because a request in a
-closed epoch can never bind.
+closed epoch can never bind. Until then it is retained: a crash after
+preparation, or a possible send whose status stays `NotFound`, holds one row
+until the shared active epoch reaches its 131,072 bindings and maintenance
+opens the successor. A deployment with little V2 traffic should therefore
+watch `retained_fenced_transitions` against the 4,096-row fence.
 
 ### Maintenance composition
 
@@ -940,6 +960,14 @@ stop V1 preparation, compose legacy recovery, and then enable V2 preparation.
 Running a separate V1 facade over the same journal after that point is
 unsupported.
 
+A protection wrapper configured with both journals also excludes concurrent
+preparations of one caller ID in-process, per opened recovery-journal
+instance. Each preparation holds an admission for its ID on that instance
+from its check of the other
+journal through its own create-only insert, so a concurrent V1 and V2
+preparation of the same ID cannot both bind; the later one is
+`FencedTransitionRequestConflict` before provider work.
+
 The recovery journal's schema and key domain are downgrade fences. A binary
 that predates this facade cannot read the journal and cannot recover a V2
 transition prepared through it. Before rolling back, release or reclaim every
@@ -964,12 +992,18 @@ steps:
    is `FencedTransitionV2Status`.
 4. Replace V1 restart recovery with `recover_fenced_transition_status`, which
    returns `V2` or `LegacyV1`. `Recorded` carries the exact result.
-   `EpochNotActive`, `Retired`, `HistoryFull`, and `RetentionExhausted` prove
-   that the transition has not taken effect and never will.
+   `EpochNotActive`, `HistoryFull`, and `RetentionExhausted` prove that the
+   transition has not taken effect and never will. `Retired` and `Expired`
+   prove only that it can no longer take effect; like V1 `Expired`, the
+   caller derives later work from authoritative observation. `NotFound` is
+   never an absence decision: keep the row and retry later.
 5. Call `release_resolved` once a transition's result has been consumed, and
    run `reclaim_resolved_fenced_transitions` on a regular cadence. The
    consumer process owns that sweep. The state process's operator loop owns
-   `ConsensusSessionStore::maintain_fenced_transition_v2_history`.
+   `ConsensusSessionStore::maintain_fenced_transition_v2_history`: it opens
+   the successor once the active epoch is full and later advances the
+   retired floor. Without it, a full epoch fails every new preparation
+   closed with `FencedTransitionHistoryFull`.
 6. Treat `Rejected` with `FencedTransitionHistoryEpochNotActive`,
    `FencedTransitionHistoryEpochRetired`, or `FencedTransitionHistoryFull`
    from `execute_once` as a definitive rejection that bound nothing. The

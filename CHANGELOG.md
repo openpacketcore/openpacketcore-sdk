@@ -41,7 +41,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   removed only by exact compare-and-delete once the transition is resolved or
   provably unbound. The protection wrappers gain
   `with_fenced_transition_v2_recovery_journal`. V1, the #701 journal, the raw
-  V2 wrapper path, and the `/2` wire are unchanged. Refs #982.
+  V2 wrapper path, and the `/2` wire are unchanged. A wrapper holding both
+  journals excludes concurrent V1 and V2 preparations of one caller ID, and
+  retired-floor reclamation reads the floor itself. Refs #982.
 
 - `opc-session-net`: add `SessionConsumerPreparedFencedTransitionV2Backend`,
   the protected V2 prepared consumer facade for local-AEAD and remote-sealing
@@ -50,7 +52,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   a cached linearized history state, and recovers status by caller-stable ID.
   It adds `release_resolved`, a bounded `reclaim_resolved_fenced_transitions`
   sweep, and `with_legacy_v1_recovery` so retained V1 transitions stay
-  status-recoverable after an upgrade. It adds no wire operation. Refs #982.
+  status-recoverable after an upgrade. It adds no wire operation. The sweep
+  reads each row's status past an unavailable voter, a proven-unsent row whose
+  self-removal failed stays releasable, and a cached local row failure ends
+  `status_until_terminal` at once. Refs #982.
 
 - `opc-session-testkit`: forward `/2` requests through
   `AuthenticatedPreparedFencedTransitionFixture`, open the protected V2 facade
