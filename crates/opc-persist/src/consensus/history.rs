@@ -166,7 +166,15 @@ fn corrupt() -> io::Error {
     )
 }
 
-fn database_error(_: rusqlite::Error) -> io::Error {
+fn database_error(error: rusqlite::Error) -> io::Error {
+    if let rusqlite::Error::FromSqlConversionFailure(_, _, source) = &error {
+        if matches!(
+            source.downcast_ref::<rusqlite::types::FromSqlError>(),
+            Some(rusqlite::types::FromSqlError::InvalidBlobSize { .. })
+        ) {
+            return corrupt();
+        }
+    }
     io::Error::other("config history storage unavailable")
 }
 
@@ -205,11 +213,40 @@ fn encrypted_column<'row>(
     Ok(std::borrow::Cow::Borrowed(encrypted))
 }
 
+// Inspect the borrowed SQLite value before copying only the exact admitted
+// width. A malformed retained field must never become an unbounded Rust Vec.
+fn fixed_blob_column<const N: usize>(
+    row: &rusqlite::Row<'_>,
+    index: usize,
+) -> rusqlite::Result<[u8; N]> {
+    let blob = row.get_ref(index)?.as_blob()?;
+    blob.try_into().map_err(|_| {
+        rusqlite::types::FromSqlError::InvalidBlobSize {
+            expected_size: N,
+            blob_size: blob.len(),
+        }
+        .into()
+    })
+}
+
+fn optional_fixed_blob_column<const N: usize>(
+    row: &rusqlite::Row<'_>,
+    index: usize,
+) -> rusqlite::Result<Option<[u8; N]>> {
+    if matches!(row.get_ref(index)?, rusqlite::types::ValueRef::Null) {
+        Ok(None)
+    } else {
+        fixed_blob_column(row, index).map(Some)
+    }
+}
+
 fn head_sync(conn: &Connection) -> io::Result<Option<HistoryHead>> {
     let row = conn.query_row(
         "SELECT tx_id, version, encrypted_blob FROM config_history ORDER BY version DESC LIMIT 1",
         [], |row| {
-            let tx_id = row.get::<_, Vec<u8>>(0)?;
+            let tx_id = fixed_blob_column::<16>(row, 0)?;
+            #[cfg(test)]
+            config_capacity_read_buffers::observe_fixed_width(0, &tx_id);
             let version = row.get::<_, i64>(1)?;
             let encrypted = encrypted_column(row, 2)?;
             #[cfg(test)]
@@ -353,13 +390,17 @@ fn record_chain_sync(
         let Some(row) = rows.next().map_err(database_error)? else {
             break;
         };
-        let tx_id: Vec<u8> = row.get(0).map_err(database_error)?;
+        let tx_id = fixed_blob_column::<16>(row, 0).map_err(database_error)?;
+        #[cfg(test)]
+        config_capacity_read_buffers::observe_fixed_width(1, &tx_id);
         let version: i64 = row.get(1).map_err(database_error)?;
         let encrypted = encrypted_column(row, 2).map_err(database_error)?;
         #[cfg(test)]
         config_capacity_read_buffers::observe(1, &encrypted);
         let count: i64 = row.get(3).map_err(database_error)?;
-        let terminal: Vec<u8> = row.get(4).map_err(database_error)?;
+        let terminal = fixed_blob_column::<32>(row, 4).map_err(database_error)?;
+        #[cfg(test)]
+        config_capacity_read_buffers::observe_fixed_width(2, &terminal);
         let head = HistoryHead {
             tx_id: TxId::from_uuid(uuid::Uuid::from_slice(&tx_id).map_err(|_| corrupt())?),
             version: ConfigVersion::new(u64::try_from(version).map_err(|_| corrupt())?),
@@ -516,19 +557,23 @@ fn validate_state(conn: &Connection, state: &HistoryState) -> io::Result<()> {
         return Err(corrupt());
     }
     if let Some(boundary) = &state.boundary {
-        let (first_tx, first_version, parent, encrypted_digest): (Vec<u8>, i64, Option<Vec<u8>>, [u8; 32]) = conn.query_row(
+        let (first_tx, first_version, parent, encrypted_digest) = conn.query_row(
             "SELECT tx_id, version, parent_tx_id, encrypted_blob FROM config_history ORDER BY version ASC LIMIT 1",
             [], |row| {
-                let tx_id = row.get(0)?;
-                let version = row.get(1)?;
-                let parent = row.get(2)?;
+                let tx_id = fixed_blob_column::<16>(row, 0)?;
+                #[cfg(test)]
+                config_capacity_read_buffers::observe_fixed_width(3, &tx_id);
+                let version = row.get::<_, i64>(1)?;
+                let parent = optional_fixed_blob_column::<16>(row, 2)?;
+                #[cfg(test)]
+                config_capacity_read_buffers::observe_fixed_width(4, &parent);
                 let encrypted = encrypted_column(row, 3)?;
                 #[cfg(test)]
                 config_capacity_read_buffers::observe(2, &encrypted);
                 Ok((tx_id, version, parent, <[u8; 32]>::from(Sha256::digest(encrypted))))
             },
         ).map_err(database_error)?;
-        if first_tx != boundary.first.tx_id.as_uuid().as_bytes()
+        if first_tx != *boundary.first.tx_id.as_uuid().as_bytes()
             || u64::try_from(first_version).ok() != Some(boundary.first.version.get())
             || parent.is_some()
             || encrypted_digest != boundary.first.encrypted_digest
@@ -836,13 +881,15 @@ pub(crate) fn refresh_sync(
         }
         // Extend the authenticated prior digest with only this new record.
         // Rehashing old rows here would bless unrelated on-disk corruption.
-        let (count, terminal): (i64, Vec<u8>) = conn
+        let (count, terminal): (i64, [u8; 32]) = conn
             .query_row(
                 "SELECT audit_count, audit_terminal_hash FROM config_history WHERE tx_id = ?1",
                 [next.tx_id.as_uuid().as_bytes().as_slice()],
-                |row| Ok((row.get(0)?, row.get(1)?)),
+                |row| Ok((row.get(0)?, fixed_blob_column(row, 1)?)),
             )
             .map_err(database_error)?;
+        #[cfg(test)]
+        config_capacity_read_buffers::observe_fixed_width(5, &terminal);
         if !updates_existing_records {
             state.record_chain = extend_record_chain(
                 state.record_chain,
@@ -893,13 +940,17 @@ pub(crate) fn retain_sync(
         return Ok(Err(ConfigMutationFailure::HistoryProtected));
     }
     let from = i64::try_from(decision.retain_from.get()).map_err(|_| corrupt())?;
-    let (first_tx, parent, encrypted_digest): (Vec<u8>, Option<Vec<u8>>, [u8; 32]) = conn
+    let (first_tx, parent, encrypted_digest) = conn
         .query_row(
             "SELECT tx_id, parent_tx_id, encrypted_blob FROM config_history WHERE version = ?1",
             [from],
             |row| {
-                let tx_id = row.get(0)?;
-                let parent = row.get(1)?;
+                let tx_id = fixed_blob_column::<16>(row, 0)?;
+                #[cfg(test)]
+                config_capacity_read_buffers::observe_fixed_width(6, &tx_id);
+                let parent = optional_fixed_blob_column::<16>(row, 1)?;
+                #[cfg(test)]
+                config_capacity_read_buffers::observe_fixed_width(7, &parent);
                 let encrypted = encrypted_column(row, 2)?;
                 #[cfg(test)]
                 config_capacity_read_buffers::observe(3, &encrypted);
@@ -961,13 +1012,15 @@ pub(crate) fn retain_sync(
         // remains in the authenticated boundary and unchanged AEAD metadata.
         let original_parent =
             TxId::from_uuid(uuid::Uuid::from_slice(&parent).map_err(|_| corrupt())?);
-        let previous: Vec<u8> = conn
+        let previous = conn
             .query_row(
                 "SELECT tx_id FROM config_history WHERE version = ?1",
                 [from - 1],
-                |row| row.get(0),
+                |row| fixed_blob_column::<16>(row, 0),
             )
             .map_err(database_error)?;
+        #[cfg(test)]
+        config_capacity_read_buffers::observe_fixed_width(8, &previous);
         if previous != parent {
             return Err(corrupt());
         }
@@ -981,7 +1034,7 @@ pub(crate) fn retain_sync(
         });
         conn.execute(
             "UPDATE config_history SET parent_tx_id = NULL WHERE tx_id = ?1",
-            [&first_tx],
+            [first_tx.as_slice()],
         )
         .map_err(database_error)?;
         conn.execute("DELETE FROM audit_trail WHERE tx_id IN (SELECT tx_id FROM config_history WHERE version < ?1)", [from]).map_err(database_error)?;

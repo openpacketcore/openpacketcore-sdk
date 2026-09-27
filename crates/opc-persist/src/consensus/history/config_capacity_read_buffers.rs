@@ -1,4 +1,5 @@
-//! Test-only observations of the four history-authentication ciphertext copies.
+//! Test-only observations of history-authentication Rust buffers.
+//! Fixed-width projections report actual heap capacity (arrays own none).
 //! SQLite pages, returned records and other Rust buffers are outside this probe.
 
 use std::borrow::Cow;
@@ -8,6 +9,8 @@ use std::cell::Cell;
 pub(in crate::consensus) struct Sample {
     pub calls: [usize; 4],
     pub peak_owned_ciphertext: usize,
+    pub fixed_width_calls: [usize; 9],
+    pub peak_owned_fixed_width: [usize; 9],
 }
 
 thread_local! {
@@ -39,6 +42,42 @@ pub(in crate::consensus) fn observe(site: usize, ciphertext: &impl CiphertextBuf
         if let Some(mut sample) = current.get() {
             sample.calls[site] += 1;
             sample.peak_owned_ciphertext = sample.peak_owned_ciphertext.max(owned_capacity);
+            current.set(Some(sample));
+        }
+    });
+}
+
+pub(in crate::consensus) trait FixedWidthBuffer {
+    fn owned_capacity(&self) -> usize;
+}
+
+impl FixedWidthBuffer for Vec<u8> {
+    fn owned_capacity(&self) -> usize {
+        self.capacity()
+    }
+}
+
+impl<const N: usize> FixedWidthBuffer for [u8; N] {
+    fn owned_capacity(&self) -> usize {
+        0
+    }
+}
+
+impl<T: FixedWidthBuffer> FixedWidthBuffer for Option<T> {
+    fn owned_capacity(&self) -> usize {
+        self.as_ref().map_or(0, FixedWidthBuffer::owned_capacity)
+    }
+}
+
+// Sites: head UUID; chain UUID/hash; boundary UUID/parent; append hash;
+// retention UUID/parent/predecessor. Observe after projection, before use.
+pub(in crate::consensus) fn observe_fixed_width(site: usize, value: &impl FixedWidthBuffer) {
+    let owned_capacity = value.owned_capacity();
+    CURRENT.with(|current| {
+        if let Some(mut sample) = current.get() {
+            sample.fixed_width_calls[site] += 1;
+            sample.peak_owned_fixed_width[site] =
+                sample.peak_owned_fixed_width[site].max(owned_capacity);
             current.set(Some(sample));
         }
     });

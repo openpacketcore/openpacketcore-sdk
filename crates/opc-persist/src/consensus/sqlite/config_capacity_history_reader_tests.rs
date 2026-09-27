@@ -1,5 +1,6 @@
 //! Disk-backed native WAL controls for history-authentication Rust copies.
 //! These do not qualify the complete memory envelope or a multi-node profile.
+//! Scalar probes measure owned projection buffers, not total allocator traffic.
 
 use super::*;
 use crate::consensus::history::config_capacity_read_buffers::{Observation, Sample};
@@ -184,6 +185,19 @@ async fn fixture() -> Fixture {
     }
 }
 
+fn assert_fixed_width(sample: Sample, required_sites: &[usize]) {
+    for &site in required_sites {
+        assert!(
+            sample.fixed_width_calls[site] > 0,
+            "required fixed-width projection was reached"
+        );
+    }
+    assert_eq!(
+        sample.peak_owned_fixed_width, [0; 9],
+        "fixed-width history projections must not own heap buffers"
+    );
+}
+
 fn assert_borrowed(sample: Sample, required_sites: &[usize]) {
     for &site in required_sites {
         assert!(
@@ -217,6 +231,7 @@ async fn config_capacity_957_history_authentication_borrows_ciphertext() {
     let sample = observation.finish();
     tx.commit().expect("finish read transaction");
     assert_borrowed(sample, &[0, 1]);
+    assert_fixed_width(sample, &[0, 1, 2]);
 }
 
 #[tokio::test]
@@ -247,6 +262,7 @@ async fn config_capacity_957_history_rejection_borrows_ciphertext() {
     );
     tx.commit().expect("finish rejected read transaction");
     assert_borrowed(sample, &[0, 1]);
+    assert_fixed_width(sample, &[0, 1, 2]);
 }
 
 #[tokio::test]
@@ -294,6 +310,7 @@ async fn config_capacity_957_history_retention_boundary_borrows_ciphertext() {
     let sample = observation.finish();
     tx.commit().expect("durable retention");
     assert_borrowed(sample, &[0, 1, 2, 3]);
+    assert_fixed_width(sample, &[0, 1, 2, 3, 4, 6, 7, 8]);
     drop(conn);
     drop(shared);
     drop(fixture.backend);
@@ -311,7 +328,9 @@ async fn config_capacity_957_history_retention_boundary_borrows_ciphertext() {
         std::time::Instant::now() + Duration::from_secs(10),
     )
     .expect("retained schema and original parent");
-    assert_borrowed(observation.finish(), &[0, 1, 2]);
+    let sample = observation.finish();
+    assert_borrowed(sample, &[0, 1, 2]);
+    assert_fixed_width(sample, &[0, 1, 2, 3, 4]);
 }
 
 fn assert_sealed_borrowed(sample: super::config_capacity_sealed_buffers::Sample, rows: usize) {
@@ -437,4 +456,188 @@ async fn config_capacity_957_sealed_rejection_borrows_ciphertext() {
         &SqliteWorkCancellation::new(),
     )
     .expect("original retained records remain valid");
+}
+
+// These cases preserve the original schema, ciphertext and authenticated state.
+// Deferred foreign keys permit a deliberately corrupt UUID/parent in a transaction
+// that is always rolled back; the malformed data is never admitted or resigned.
+fn assert_fixed_width_rejection(
+    conn: &Connection,
+    fixture: &Fixture,
+    update: &str,
+    width: usize,
+    site: usize,
+    accepted_before_rejection: usize,
+) {
+    // The large value is an adversarial field size, not a mutation-memory budget.
+    for length in [128 * 1024, 0, width - 1, width + 1] {
+        let tx = conn
+            .unchecked_transaction()
+            .expect("pinned corrupt fixture");
+        tx.execute_batch("PRAGMA defer_foreign_keys = ON")
+            .expect("defer only the negative fixture's foreign keys");
+        assert_eq!(
+            tx.execute(update, [i64::try_from(length).expect("fixture length")])
+                .expect("replace exactly one retained field"),
+            1
+        );
+        let observation = Observation::start();
+        let error = super::super::history::validate_access_sync(
+            &tx,
+            &fixture.key,
+            true,
+            fixture.topology.identity(),
+            &SqliteWorkCancellation::new(),
+        )
+        .expect_err("malformed fixed-width history field must be rejected");
+        let sample = observation.finish();
+        assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
+        assert_eq!(
+            sample.peak_owned_fixed_width[site], 0,
+            "field site {site}, length {length}: rejection must precede an owned copy"
+        );
+        assert_eq!(
+            sample.fixed_width_calls[site], accepted_before_rejection,
+            "field site {site}, length {length}: malformed field must not be projected"
+        );
+        assert_eq!(sample.peak_owned_ciphertext, 0);
+        tx.rollback().expect("restore valid retained bytes");
+        super::super::history::validate_access_sync(
+            conn,
+            &fixture.key,
+            true,
+            fixture.topology.identity(),
+            &SqliteWorkCancellation::new(),
+        )
+        .expect("the original full authenticated history remains valid");
+    }
+}
+
+#[tokio::test]
+async fn config_capacity_957_retained_fixed_width_head_uuid_rejects_before_copy() {
+    let fixture = fixture().await;
+    let shared = fixture.backend.conn();
+    let conn = shared.lock().await;
+    assert_fixed_width_rejection(
+        &conn,
+        &fixture,
+        "UPDATE config_history SET tx_id = zeroblob(?1) WHERE version = 3",
+        16,
+        0,
+        0,
+    );
+}
+
+#[tokio::test]
+async fn config_capacity_957_retained_fixed_width_chain_uuid_rejects_before_copy() {
+    let fixture = fixture().await;
+    let shared = fixture.backend.conn();
+    let conn = shared.lock().await;
+    assert_fixed_width_rejection(
+        &conn,
+        &fixture,
+        "UPDATE config_history SET tx_id = zeroblob(?1) WHERE version = 2",
+        16,
+        1,
+        1,
+    );
+}
+
+#[tokio::test]
+async fn config_capacity_957_retained_fixed_width_terminal_hash_rejects_before_copy() {
+    let fixture = fixture().await;
+    let shared = fixture.backend.conn();
+    let conn = shared.lock().await;
+    assert_fixed_width_rejection(
+        &conn,
+        &fixture,
+        "UPDATE config_history SET audit_terminal_hash = zeroblob(?1) WHERE version = 2",
+        32,
+        2,
+        1,
+    );
+}
+
+async fn fixed_width_retained_fixture() -> Fixture {
+    let fixture = fixture().await;
+    let shared = fixture.backend.conn();
+    let conn = shared.lock().await;
+    let decision = ConfigHistoryRetention::new(
+        tx_id(3),
+        ConfigVersion::new(3),
+        ConfigVersion::new(1),
+        ConfigVersion::new(2),
+        ConfigHistoryLimits::new(2, 1024 * 1024).expect("unchanged retention limits"),
+    )
+    .expect("acknowledged prefix");
+    let tx = conn
+        .unchecked_transaction()
+        .expect("atomic retained prefix");
+    super::super::history::retain_sync(
+        &tx,
+        &fixture.key,
+        &decision,
+        &SqliteWorkCancellation::new(),
+    )
+    .expect("retention storage")
+    .expect("admitted retention");
+    tx.commit().expect("durable retained prefix");
+    drop(conn);
+    drop(shared);
+    fixture
+}
+
+#[tokio::test]
+async fn config_capacity_957_retained_fixed_width_boundary_uuid_rejects_before_copy() {
+    let fixture = fixed_width_retained_fixture().await;
+    let shared = fixture.backend.conn();
+    let conn = shared.lock().await;
+    assert_fixed_width_rejection(
+        &conn,
+        &fixture,
+        "UPDATE config_history SET tx_id = zeroblob(?1) WHERE version = 2",
+        16,
+        3,
+        0,
+    );
+}
+
+#[tokio::test]
+async fn config_capacity_957_retained_fixed_width_boundary_parent_rejects_before_copy() {
+    let fixture = fixed_width_retained_fixture().await;
+    let shared = fixture.backend.conn();
+    let conn = shared.lock().await;
+    assert_fixed_width_rejection(
+        &conn,
+        &fixture,
+        "UPDATE config_history SET parent_tx_id = zeroblob(?1) WHERE version = 2",
+        16,
+        4,
+        0,
+    );
+    // Correct width still cannot change the authenticated NULL boundary link.
+    let tx = conn
+        .unchecked_transaction()
+        .expect("pinned boundary tamper");
+    tx.execute(
+        "UPDATE config_history SET parent_tx_id = ?1 WHERE version = 2",
+        [tx_id(3).as_uuid().as_bytes().as_slice()],
+    )
+    .expect("existing fixed-width foreign key");
+    assert!(super::super::history::validate_access_sync(
+        &tx,
+        &fixture.key,
+        true,
+        fixture.topology.identity(),
+        &SqliteWorkCancellation::new(),
+    )
+    .is_err());
+    tx.rollback().expect("restore NULL boundary link");
+    drop(conn);
+    drop(shared);
+    drop(fixture.backend);
+    let reopened = SqliteBackend::reopen_config_authority(fixture.options, fixture.key)
+        .await
+        .expect("valid history reopens after every malformed scalar is rolled back");
+    drop(reopened);
 }
