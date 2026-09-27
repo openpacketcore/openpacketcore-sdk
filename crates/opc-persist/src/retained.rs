@@ -48,9 +48,14 @@ pub(crate) enum RetainedConfigMode {
     Legacy,
     BoundedV1,
     NetconfTargetsV1,
+    NetconfRunningV1,
 }
 
 impl RetainedConfigMode {
+    pub(crate) const fn has_netconf_targets(self) -> bool {
+        matches!(self, Self::NetconfTargetsV1 | Self::NetconfRunningV1)
+    }
+
     pub(crate) fn resolve(
         target: RetainedConfigProfile,
         capacity: opc_crypto::ConfigCapacityProfile,
@@ -66,6 +71,10 @@ impl RetainedConfigMode {
                 RetainedConfigProfile::NetconfTargetsV1,
                 opc_crypto::ConfigCapacityProfile::Legacy,
             ) => Ok(Self::NetconfTargetsV1),
+            (
+                RetainedConfigProfile::NetconfRunningV1,
+                opc_crypto::ConfigCapacityProfile::BoundedV1,
+            ) => Ok(Self::NetconfRunningV1),
             _ => Err(RetainedConfigError::Unsupported),
         }
     }
@@ -73,7 +82,9 @@ impl RetainedConfigMode {
     pub(crate) const fn capacity_profile(self) -> opc_crypto::ConfigCapacityProfile {
         match self {
             Self::Legacy | Self::NetconfTargetsV1 => opc_crypto::ConfigCapacityProfile::Legacy,
-            Self::BoundedV1 => opc_crypto::ConfigCapacityProfile::BoundedV1,
+            Self::BoundedV1 | Self::NetconfRunningV1 => {
+                opc_crypto::ConfigCapacityProfile::BoundedV1
+            }
         }
     }
 
@@ -81,6 +92,7 @@ impl RetainedConfigMode {
         match self {
             Self::Legacy | Self::BoundedV1 => RetainedConfigProfile::Legacy,
             Self::NetconfTargetsV1 => RetainedConfigProfile::NetconfTargetsV1,
+            Self::NetconfRunningV1 => RetainedConfigProfile::NetconfRunningV1,
         }
     }
 }
@@ -97,6 +109,7 @@ impl From<RetainedConfigProfile> for RetainedConfigMode {
         match profile {
             RetainedConfigProfile::Legacy => Self::Legacy,
             RetainedConfigProfile::NetconfTargetsV1 => Self::NetconfTargetsV1,
+            RetainedConfigProfile::NetconfRunningV1 => Self::NetconfRunningV1,
         }
     }
 }
@@ -151,10 +164,6 @@ impl RetainedConfigBinding {
         self
     }
 
-    pub(crate) const fn profile(&self) -> RetainedConfigProfile {
-        self.profile
-    }
-
     pub(crate) fn mode(&self) -> Result<RetainedConfigMode, RetainedConfigError> {
         RetainedConfigMode::resolve(self.profile, self.capacity_profile)
     }
@@ -201,10 +210,16 @@ impl RetainedConfigBinding {
             digest.update(self.capacity_profile.revision().to_be_bytes());
         }
         let base: [u8; 32] = digest.finalize().into();
-        if mode == RetainedConfigMode::NetconfTargetsV1 {
+        if mode.has_netconf_targets() {
             let mut digest = Sha256::new();
             digest.update(TARGET_BINDING_DOMAIN);
-            digest.update([1, 0]);
+            // Domain-separate the narrower contract; neither old admission
+            // records nor a stored row can opt into the new family.
+            digest.update(if mode == RetainedConfigMode::NetconfRunningV1 {
+                [2, 0]
+            } else {
+                [1, 0]
+            });
             digest.update(base);
             Ok(digest.finalize().into())
         } else {
@@ -857,7 +872,7 @@ fn validate_connection(
     // A digest supplied by the retained database is only a compatibility
     // check. The independent SDK catalog includes the exact replay index.
     match options.binding.mode()? {
-        RetainedConfigMode::NetconfTargetsV1 => {
+        RetainedConfigMode::NetconfTargetsV1 | RetainedConfigMode::NetconfRunningV1 => {
             crate::schema::validate_retained_base_schema_with_netconf_targets(conn)
         }
         _ => crate::schema::validate_retained_base_schema(conn),

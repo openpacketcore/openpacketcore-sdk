@@ -1479,3 +1479,7 @@ async fn running_replacement_after_settled_confirmation_rollback_uses_current_he
 #[cfg(target_os = "linux")]
 #[path = "running_replacement_native_recovery.rs"]
 mod native_recovery;
+
+#[cfg(target_os = "linux")]
+#[path = "running_replacement_joint_native.rs"]
+mod joint_native;

@@ -422,21 +422,24 @@ admission or engine startup, to a nonserialized closed mode:
 | Legacy | BoundedV1 | 8 | 6 |
 | NetconfTargetsV1 | Legacy | 9 | 7 |
 | NetconfTargetsV1 | BoundedV1 | Refused | Refused |
+| NetconfRunningV1 | BoundedV1 | 10 | 8 |
+| NetconfRunningV1 | Legacy | Refused | Refused |
 
 The resolved mode is process-local selection, never authority inferred from a
-peer, database row or command. The existing Legacy and bounded retained-binding
-transcripts stay byte-identical; the target digest remains its target domain,
-`[1, 0]` and the Legacy digest. Native storage, RPCs, authenticated history and
-snapshots consume the same resolved selection. Bounded proof admission and
-local preparation ownership remain exclusive to capacity8/6. A target9 command
-cannot authorize a bounded payload. All three modes retain their exact peer and
-storage revision checks and original limits, deadlines and WAL durability.
+peer, database row or command. The existing Legacy, bounded and target retained
+binding transcripts stay byte-identical. The target9 digest remains its target
+domain, `[1, 0]` and the Legacy digest. The narrower Running10 digest uses that
+target domain, `[2, 0]` and the bounded digest. Native storage, RPCs,
+authenticated history and snapshots consume the same resolved selection. A
+target9 command cannot authorize a bounded payload. Each mode retains exact peer
+and storage revision checks and the original limits, deadlines and WAL durability.
 
-This composition allocates neither command/wire10 nor storage/snapshot8. It
-performs no migration and does not make the joint profile available. A future
-joint contract needs its own complete retained identity, authenticated target
-and history proofs, bounded decoders, publication/recovery behavior and native
-qualification; changing a revision whitelist alone cannot provide it.
+The experimental `NetconfRunningV1` selection adds command/wire10 and
+storage/snapshot8 for ordinary Running replacement with mandatory audit. It
+performs no migration and does not enable the complete target+bounded profile.
+Its implementation and focused detectors are present; native maximum-size
+execution and combined capacity qualification remain open. Revision recognition
+alone is not evidence of a qualified runtime capability.
 
 
 The target extension proposes config command/wire revision **9** and
@@ -876,47 +879,57 @@ RecoveryRequired. Simultaneous one-pass clean shutdown is not guaranteed; this
 contract adds no worker, queue, timer, deadline extension or protocol capability.
 
 
-### Preparation-only joint Running payload boundary
+### Experimental joint Running implementation boundary
 
-The closed implementation seam for a future target+bounded profile appends
+The separately selected Running implementation appends
 `TargetPayloadV1::BoundedRunning` at payload tag 3. It pairs one ordinary Running
 commit with its actual `CapacityRecordBinding`. Existing tags 0–2 and all
 existing wire7/8/9 and storage5/6/7 bytes are unchanged. Target9 decoding refuses
 tag 3 before reading its record; a distinct strict joint input bounds strings,
 byte arrays and audit collections and rejects unknown nested fields. This is a
-proposed command10/storage8 representation, not an allocated or available runtime
-profile. All supported modes continue to reject command10 and joint opening.
+command10/storage8 representation. Only explicit `NetconfRunningV1` with
+`BoundedV1` selects it; the older modes continue to reject command10 and cannot
+select it from received bytes or retained rows.
 
 Action16 preparation consumes the existing capacity-bearing attestation path.
 The preparation wrapper shares immutable record/proof fields and retains the
 original process-local preparation reservation. The deterministic target command
 contains no reservation: native/routing/retained command clones cannot hold a
-preparation slot after the operation and its accepted work finish. Recovery reserves in the destination
-store before parsing, verifies the independently expected authority and caller,
-authenticates the original effect and record proof, then attaches recovered local
-ownership. Decoding or encoding grants no session, NACM, Intent receipt or effect
-authority, and does not extend the original expiry. The existing target9 recovery
-API/codec remains valid; the new store-owned reserved decode port cannot select a
-joint branch under any currently supported mode.
+preparation slot after the operation and its accepted work finish. Recovery
+reserves in the destination store before parsing, verifies the independently
+expected authority and caller, authenticates the original effect and record
+proof, then attaches recovered local ownership. Decoding or encoding grants no
+session, NACM, Intent receipt or effect authority, and does not extend the
+original expiry. The existing target9 recovery API/codec remains valid. The
+store-owned reserved decode port selects the bounded branch only under the
+independently configured Running mode. Its early routing hint grants no
+authority: complete bounded decoding, original-handle checks, authentication and
+canonical-byte verification still follow it.
 
-Both proposed Admit and Apply representations have encoding-only preflight for
-complete command, forwarding, maximum singleton replication, native JSON and
-recovery output. The 192 KiB metadata bound subtracts only the single proved
-envelope's byte content. Its length prefix, proof, complete target description,
-audit handle, audit records and every outer field stay charged. Existing byte,
-slot, working-buffer and deadline bounds are unchanged.
+Both Admit and Apply representations have encoding-only preflight for complete
+command, forwarding, maximum singleton replication, native JSON and recovery
+output. The 192 KiB metadata bound subtracts only the single proved envelope's
+byte content. Its length prefix, proof, complete target description, audit
+handle, audit records and every outer field stay charged. Existing byte, slot,
+working-buffer and deadline bounds are unchanged.
 
-This seam does not connect bounded target payloads to live admission or Apply.
 The submission seam checks the actual destination pool and acquires one guard
 shared by all aliases of the original preparation. Admission and Apply pass that
 guard through the existing owned routing and accepted-work supervisor. A busy or
 foreign owner is refused; proof bytes and generic decoding cannot supply a guard.
 Cancellation does not retract accepted work, and response loss keeps its owner
 until the existing storage-release observation completes. Legacy target9 without
-a capacity owner preserves its existing submission path. This does not create a
-joint mode or qualify native joint target execution.
+a capacity owner preserves its existing submission path.
 
-Bounded ledger-original decoding, atomic record/proof/target/history updates,
-authenticated reopen/snapshot admission and profile opening remain required work. Native WAL and explicit Durable/Async
-behavior are unchanged. Do not infer an enabled capability from payload decoding
-or from a proposed revision's sizing result.
+The native Running path now supplies an independently selected authority context
+to the existing target transaction and savepoint. It authenticates the original
+bounded payload and updates its record, proof and retained history with the target
+result. The narrower family retains the device, session, lock, recovery and audit
+obligations needed for ordinary Running replacement; it refuses unsupported
+target actions and pending-confirmation resolution. Bounded ledger-original
+decoding and retained reopen/snapshot admission use the same selected mode.
+
+End-to-end maximum-size native execution, causal removal controls on the combined
+tree and full capacity qualification remain required. Native WAL and explicit
+Durable/Async behavior are unchanged. Do not infer completion of #957 or #958
+from payload decoding, isolated component tests or revision sizing.

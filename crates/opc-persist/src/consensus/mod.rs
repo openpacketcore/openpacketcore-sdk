@@ -14,7 +14,7 @@ pub use audit_mutation::{PreparedAuditedMutation, PreparedTargetMutation};
 pub use audit_targets::RetainedConfigProfile;
 mod capacity_record;
 mod config_capacity_decode;
-mod config_capacity_json;
+pub(crate) mod config_capacity_json;
 pub(crate) mod history;
 mod preparation;
 mod raft_adapter;

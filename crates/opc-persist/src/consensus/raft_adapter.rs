@@ -411,8 +411,8 @@ impl EngineRequestSender for AppendEntriesRequest<ConfigRaftTypeConfig> {
         profile: super::RetainedConfigMode,
         payload: &[u8],
     ) -> Result<Self, ConsensusCodecError> {
-        if profile == super::RetainedConfigMode::BoundedV1 {
-            super::config_capacity_decode::engine::append(profile.capacity_profile(), payload)
+        if profile.capacity_profile() == opc_crypto::ConfigCapacityProfile::BoundedV1 {
+            super::config_capacity_decode::engine::append(profile, payload)
         } else {
             decode_config_wire_for_profile(profile, payload)
         }
@@ -441,8 +441,8 @@ impl EngineRequestSender for InstallSnapshotRequest<ConfigRaftTypeConfig> {
         profile: super::RetainedConfigMode,
         payload: &[u8],
     ) -> Result<Self, ConsensusCodecError> {
-        if profile == super::RetainedConfigMode::BoundedV1 {
-            super::config_capacity_decode::engine::snapshot(profile.capacity_profile(), payload)
+        if profile.capacity_profile() == opc_crypto::ConfigCapacityProfile::BoundedV1 {
+            super::config_capacity_decode::engine::snapshot(profile, payload)
         } else {
             decode_config_wire_for_profile(profile, payload)
         }

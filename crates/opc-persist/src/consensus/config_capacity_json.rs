@@ -1,4 +1,4 @@
-//! Compact JSON with bounded writes for the closed configuration byte payload.
+//! Compact JSON with bounded byte-array writes.
 //! Field encodings and numeric arrays are unchanged; existing sinks retain
 //! their own capacity, cancellation and digest rules.
 
@@ -6,10 +6,15 @@ use serde::Serialize;
 use std::io;
 
 const BYTE_ARRAY_BATCH_BYTES: usize = 1024;
+// serde_json::to_vec starts at 128 bytes. Audit uses batches no larger than
+// that initial capacity, retaining the original Vec capacity growth sequence.
+const AUDIT_BYTE_ARRAY_BATCH_BYTES: usize = 128;
 
-struct ConfigJsonFormatter<const COUNT_ONLY: bool>;
+struct ConfigJsonFormatter<const COUNT_ONLY: bool, const BATCH_BYTES: usize>;
 
-impl<const COUNT_ONLY: bool> serde_json::ser::Formatter for ConfigJsonFormatter<COUNT_ONLY> {
+impl<const COUNT_ONLY: bool, const BATCH_BYTES: usize> serde_json::ser::Formatter
+    for ConfigJsonFormatter<COUNT_ONLY, BATCH_BYTES>
+{
     fn write_byte_array<W: ?Sized + io::Write>(
         &mut self,
         writer: &mut W,
@@ -19,9 +24,9 @@ impl<const COUNT_ONLY: bool> serde_json::ser::Formatter for ConfigJsonFormatter<
             return count_byte_array(writer, value);
         }
         writer.write_all(b"[")?;
-        // At most 1024 encoded bytes between sink checks, with no heap buffer.
+        // At most BATCH_BYTES encoded bytes between sink checks, with no heap buffer.
         // A value needs at most one comma and three unsigned decimal digits.
-        let mut buffer = [0_u8; BYTE_ARRAY_BATCH_BYTES];
+        let mut buffer = [0_u8; BATCH_BYTES];
         let mut used = 0;
         for (index, byte) in value.iter().copied().enumerate() {
             if buffer.len() - used < 4 {
@@ -86,7 +91,7 @@ pub(super) fn count_to_writer<W: io::Write, T: Serialize + ?Sized>(
 ) -> serde_json::Result<()> {
     value.serialize(&mut serde_json::Serializer::with_formatter(
         writer,
-        ConfigJsonFormatter::<true>,
+        ConfigJsonFormatter::<true, BYTE_ARRAY_BATCH_BYTES>,
     ))
 }
 
@@ -96,7 +101,21 @@ pub(super) fn to_writer<W: io::Write, T: Serialize + ?Sized>(
 ) -> serde_json::Result<()> {
     value.serialize(&mut serde_json::Serializer::with_formatter(
         writer,
-        ConfigJsonFormatter::<false>,
+        ConfigJsonFormatter::<false, BYTE_ARRAY_BATCH_BYTES>,
+    ))
+}
+
+/// Emit unchanged JSON in one pass for an audit Vec starting at 128 bytes.
+/// Each byte-array batch is at most the current Vec capacity, so it can cross
+/// at most one growth boundary. All non-byte-array writes remain unchanged.
+/// This preserves the original growth sequence as well as the final capacity.
+pub(crate) fn to_audit_writer<W: io::Write, T: Serialize + ?Sized>(
+    writer: W,
+    value: &T,
+) -> serde_json::Result<()> {
+    value.serialize(&mut serde_json::Serializer::with_formatter(
+        writer,
+        ConfigJsonFormatter::<false, AUDIT_BYTE_ARRAY_BATCH_BYTES>,
     ))
 }
 

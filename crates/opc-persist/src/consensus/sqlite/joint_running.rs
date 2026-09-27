@@ -1,10 +1,8 @@
-//! Closed native component for an authenticated bounded Running record.
+//! Native application of an authenticated bounded Running record.
 //!
-//! This context must come from the independently admitted native authority;
-//! neither a signed payload nor an authenticated stored profile supplies it.
-//! The existing target dispatcher passes no context and refuses this payload.
-//! This component does not establish an Intent, session, lock or target result.
-//! Its future caller must retain the existing authoritative reducer/savepoint.
+//! Context comes from the independently selected Running authority. The target
+//! reducer retains Intent, session, lock and result ownership in its existing
+//! savepoint. Legacy dispatch supplies no context and still refuses the payload.
 
 use super::*;
 use crate::audit_authority::AuditCaller;
@@ -60,10 +58,14 @@ pub(super) fn apply_sync(
             "bounded Running requires an authority transaction",
         ));
     }
-    // Only the independently selected capacity8 native substrate is available
-    // for this component. No joint mode, target9 whitelist or stored-row
-    // inference is introduced. A future joint mode needs its own validation.
-    if authority.mode != RetainedConfigMode::BoundedV1 || pending_tx_id.is_some() {
+    // Keep the existing isolated capacity component and admit only the explicit
+    // Running subset through native target dispatch. Pending resolution remains
+    // unsupported; neither command bytes nor stored rows select this context.
+    if !matches!(
+        authority.mode,
+        RetainedConfigMode::BoundedV1 | RetainedConfigMode::NetconfRunningV1
+    ) || pending_tx_id.is_some()
+    {
         return Ok(Err(ConfigMutationFailure::InvalidInput));
     }
     let checked = match AuthenticatedRunning::check(prepared, key, authority) {

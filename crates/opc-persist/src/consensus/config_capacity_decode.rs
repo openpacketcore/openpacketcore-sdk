@@ -9,6 +9,8 @@
 
 use std::fmt;
 
+pub(super) mod joint;
+
 use opc_crypto::{ConfigCapacityProfile, CONFIG_CAPACITY_V1_ENVELOPE_BYTES};
 use opc_types::{ConfigVersion, SchemaDigest, Timestamp, TxId};
 use serde::de::{self, SeqAccess, Visitor};

@@ -1117,7 +1117,14 @@ fn authenticator<T: Serialize>(
     domain: &[u8],
     value: &T,
 ) -> Result<Hmac<Sha256>, AuditAuthorityError> {
-    let encoded = serde_json::to_vec(value).map_err(|_| AuditAuthorityError::InvalidInput)?;
+    // Match serde_json::to_vec's original allocation and one Serialize pass.
+    let mut encoded = Vec::with_capacity(128);
+    #[cfg(test)]
+    let output = native_cost_tests::AuthenticationWriter::new(&mut encoded);
+    #[cfg(not(test))]
+    let output = &mut encoded;
+    crate::consensus::config_capacity_json::to_audit_writer(output, value)
+        .map_err(|_| AuditAuthorityError::InvalidInput)?;
     #[cfg(test)]
     let _observed_authentication =
         crate::consensus::config_capacity_simultaneous_working_tests::ledger::authentication(
@@ -1184,3 +1191,6 @@ pub(crate) mod allocation_probe {
 
 #[cfg(test)]
 pub(crate) mod target_budget_probe;
+
+#[cfg(test)]
+pub(crate) mod native_cost_tests;

@@ -48,7 +48,9 @@ async fn target_snapshot_envelope_preserves_legacy_bytes_and_requires_selected_p
         .is_ok());
         let other = match profile {
             RetainedConfigProfile::Legacy => RetainedConfigProfile::NetconfTargetsV1,
-            RetainedConfigProfile::NetconfTargetsV1 => RetainedConfigProfile::Legacy,
+            RetainedConfigProfile::NetconfTargetsV1 | RetainedConfigProfile::NetconfRunningV1 => {
+                RetainedConfigProfile::Legacy
+            }
         };
         assert!(verify_snapshot_envelope(
             &output,

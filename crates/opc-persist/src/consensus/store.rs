@@ -274,6 +274,23 @@ fn decode_forward_mutation(
     let profile = profile
         .try_into()
         .map_err(|_| opc_consensus::ConsensusCodecError::Decode)?;
+    if profile == super::RetainedConfigMode::NetconfRunningV1 {
+        #[derive(Deserialize)]
+        #[serde(rename = "ForwardMutationRequest", deny_unknown_fields)]
+        struct RunningForward {
+            request_id: opc_consensus::ConsensusRequestId,
+            intent: super::config_capacity_decode::joint::Intent,
+            compatibility: ConfigPeerCompatibility,
+            budget: ForwardedBudget,
+        }
+        let request: RunningForward = decode_config_wire_for_profile(profile, bytes)?;
+        return Ok(ForwardMutationRequest {
+            request_id: request.request_id,
+            intent: request.intent.into(),
+            compatibility: request.compatibility,
+            budget: request.budget,
+        });
+    }
     if profile != super::RetainedConfigMode::BoundedV1 {
         return decode_config_wire_for_profile(profile, bytes);
     }
@@ -526,7 +543,7 @@ impl ConsensusConfigStore {
                 crate::RetainedConfigBinding::mode,
             )
             .map_err(|_| ConfigConsensusOpenError::InvalidRuntimeConfiguration)?;
-        if mode == super::RetainedConfigMode::NetconfTargetsV1 && audit_continuity.is_none() {
+        if mode.has_netconf_targets() && audit_continuity.is_none() {
             return Err(ConfigConsensusOpenError::AuditContinuityUnavailable);
         }
         let identity = topology.identity();
@@ -1603,10 +1620,33 @@ impl ConsensusConfigStore {
         ownership: SubmissionOwnership,
         session: Option<&crate::audit_authority::NetconfSessionOwner>,
     ) -> Result<ForwardMutationReply, LocalSubmissionError> {
+        #[cfg(test)]
+        let diagnostic_origin = self
+            .inner
+            .durable_progress
+            .append_observed_from
+            .get()
+            .copied();
+        #[cfg(test)]
+        let diagnostic = move |phase: &'static str| {
+            if let Some(origin) = diagnostic_origin {
+                eprintln!(
+                    "JOINT_NATIVE_LOCAL phase={phase} elapsed_ms={} remaining_ms={}",
+                    origin.elapsed().as_millis(),
+                    deadline
+                        .saturating_duration_since(tokio::time::Instant::now())
+                        .as_millis(),
+                );
+            }
+        };
+        #[cfg(test)]
+        diagnostic("before_validate");
         let input = match input.validate(self) {
             Ok(input) => input,
             Err(rejection) => return Ok(ForwardMutationReply::Rejected(rejection)),
         };
+        #[cfg(test)]
+        diagnostic("after_validate");
         if self.require_admission().is_err() {
             return Ok(ForwardMutationReply::Unavailable);
         }
@@ -1636,10 +1676,14 @@ impl ConsensusConfigStore {
             }
             _ => return Ok(ForwardMutationReply::Unavailable),
         }
+        #[cfg(test)]
+        diagnostic("after_linearizable");
         let command = match input.finalize(self.inner.clock.now_utc()) {
             Ok(command) => command,
             Err(rejection) => return Ok(ForwardMutationReply::Rejected(rejection)),
         };
+        #[cfg(test)]
+        diagnostic("after_finalize");
         #[cfg(all(test, target_os = "linux"))]
         let proposal_test_guard = {
             let hook = self
@@ -1670,9 +1714,21 @@ impl ConsensusConfigStore {
         let response =
             match tokio::time::timeout_at(deadline, self.inner.raft.client_write_ff(command)).await
             {
-                Err(_) => return Ok(ForwardMutationReply::OutcomeUnknown),
-                Ok(Err(_)) => return Ok(ForwardMutationReply::Unavailable),
-                Ok(Ok(response)) => response,
+                Err(_) => {
+                    #[cfg(test)]
+                    diagnostic("enqueue_timeout");
+                    return Ok(ForwardMutationReply::OutcomeUnknown);
+                }
+                Ok(Err(_)) => {
+                    #[cfg(test)]
+                    diagnostic("enqueue_error");
+                    return Ok(ForwardMutationReply::Unavailable);
+                }
+                Ok(Ok(response)) => {
+                    #[cfg(test)]
+                    diagnostic("accepted");
+                    response
+                }
             };
         #[cfg(all(test, target_os = "linux"))]
         if let Some(hook) = self
@@ -1701,7 +1757,11 @@ impl ConsensusConfigStore {
             #[cfg(test)]
             response_lost.store(needs_storage_drain, Ordering::SeqCst);
             let reply = match response {
-                Err(_) => ForwardMutationReply::OutcomeUnknown,
+                Err(_) => {
+                    #[cfg(test)]
+                    diagnostic("accepted_response_closed");
+                    ForwardMutationReply::OutcomeUnknown
+                }
                 Ok(Ok(response)) => ForwardMutationReply::Applied(Box::new(response.data)),
                 Ok(Err(ClientWriteError::ForwardToLeader(forward))) => {
                     ForwardMutationReply::NotLeader {
@@ -1739,8 +1799,19 @@ impl ConsensusConfigStore {
         tokio::spawn(supervision);
         Ok(
             match tokio::time::timeout_at(deadline, completion_rx).await {
-                Err(_) | Ok(Err(_)) => ForwardMutationReply::OutcomeUnknown,
+                Err(_) => {
+                    #[cfg(test)]
+                    diagnostic("completion_timeout");
+                    ForwardMutationReply::OutcomeUnknown
+                }
+                Ok(Err(_)) => {
+                    #[cfg(test)]
+                    diagnostic("completion_closed");
+                    ForwardMutationReply::OutcomeUnknown
+                }
                 Ok(Ok(ForwardMutationReply::Applied(response))) => {
+                    #[cfg(test)]
+                    diagnostic("completed_response");
                     ForwardMutationReply::Applied(response)
                 }
                 Ok(Ok(reply)) => reply,
@@ -2113,7 +2184,12 @@ fn preflight_config_command_replication_budget(
     if profile == opc_crypto::ConfigCapacityProfile::BoundedV1 {
         #[cfg(all(test, target_os = "linux"))]
         config_capacity_cost_observation::preflight_started();
-        return config_capacity_admission::preflight(&probe, profile).map(|_| {
+        let sized = if mode == super::RetainedConfigMode::NetconfRunningV1 {
+            config_capacity_admission::preflight_running_mode(&probe)
+        } else {
+            config_capacity_admission::preflight(&probe, profile)
+        };
+        return sized.map(|_| {
             #[cfg(all(test, target_os = "linux"))]
             config_capacity_cost_observation::preflight_succeeded();
         });
@@ -2137,13 +2213,13 @@ fn preflight_config_command_replication_budget(
 // revision or an attached record proof cannot select them.
 pub(super) fn preflight_received_config_command(
     command: &super::ConfigConsensusCommand,
-    profile: opc_crypto::ConfigCapacityProfile,
+    mode: impl TryInto<super::RetainedConfigMode>,
 ) -> Result<(), PersistError> {
     preflight_config_command_replication_budget(
         command.identity,
         command.request_id,
         &command.intent,
-        profile,
+        mode,
     )
     .map_err(ForwardMutationRejection::into_persist_error)
 }

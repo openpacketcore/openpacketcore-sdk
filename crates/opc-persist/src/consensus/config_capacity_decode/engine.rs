@@ -128,16 +128,16 @@ impl<'de> Deserialize<'de> for FixedMembership {
 
 #[derive(Deserialize)]
 #[serde(rename = "ConfigConsensusCommand")]
-struct Command {
+struct Command<I = Intent> {
     schema_version: u16,
     identity: ConfigConsensusIdentity,
     request_id: ConfigConsensusRequestId,
     logical_time: Timestamp,
-    intent: Intent,
+    intent: I,
 }
 
-impl From<Command> for ConfigConsensusCommand {
-    fn from(value: Command) -> Self {
+impl<I: Into<ConfigMutationIntent>> From<Command<I>> for ConfigConsensusCommand {
+    fn from(value: Command<I>) -> Self {
         Self {
             schema_version: value.schema_version,
             identity: value.identity,
@@ -150,21 +150,21 @@ impl From<Command> for ConfigConsensusCommand {
 
 #[derive(Deserialize)]
 #[serde(rename = "EntryPayload")]
-enum Payload {
+enum Payload<I = Intent> {
     Blank,
-    Normal(Box<Command>),
+    Normal(Box<Command<I>>),
     Membership(FixedMembership),
 }
 
 #[derive(Deserialize)]
 #[serde(rename = "Entry")]
-struct EntryFields {
+struct EntryFields<I = Intent> {
     log_id: LogId<ConsensusNodeId>,
-    payload: Payload,
+    payload: Payload<I>,
 }
 
-impl From<EntryFields> for Entry<ConfigRaftTypeConfig> {
-    fn from(value: EntryFields) -> Self {
+impl<I: Into<ConfigMutationIntent>> From<EntryFields<I>> for Entry<ConfigRaftTypeConfig> {
+    fn from(value: EntryFields<I>) -> Self {
         Self {
             log_id: value.log_id,
             payload: match value.payload {
@@ -178,10 +178,10 @@ impl From<EntryFields> for Entry<ConfigRaftTypeConfig> {
 
 #[derive(Deserialize)]
 #[serde(rename = "AppendEntriesRequest")]
-struct Append {
+struct Append<I = Intent> {
     vote: Vote<ConsensusNodeId>,
     prev_log_id: Option<LogId<ConsensusNodeId>>,
-    entries: BoundedVec<EntryFields, { opc_consensus::DURABLE_OPENRAFT_MAX_PAYLOAD_ENTRIES }>,
+    entries: BoundedVec<EntryFields<I>, { opc_consensus::DURABLE_OPENRAFT_MAX_PAYLOAD_ENTRIES }>,
     leader_commit: Option<LogId<ConsensusNodeId>>,
 }
 
@@ -211,34 +211,46 @@ struct Snapshot {
 }
 
 pub(in crate::consensus) fn append(
-    profile: ConfigCapacityProfile,
+    mode: impl TryInto<crate::consensus::RetainedConfigMode>,
     bytes: &[u8],
 ) -> Result<AppendEntriesRequest<ConfigRaftTypeConfig>, ConsensusCodecError> {
-    use crate::consensus::types::decode_config_wire_for_profile;
-    match profile {
-        ConfigCapacityProfile::Legacy => decode_config_wire_for_profile(profile, bytes),
-        ConfigCapacityProfile::BoundedV1 => {
-            let value: Append = decode_config_wire_for_profile(profile, bytes)?;
-            Ok(AppendEntriesRequest {
-                vote: value.vote,
-                prev_log_id: value.prev_log_id,
-                entries: value.entries.0.into_iter().map(Into::into).collect(),
-                leader_commit: value.leader_commit,
-            })
+    use crate::consensus::{types::decode_config_wire_for_profile, RetainedConfigMode};
+    let mode = mode.try_into().map_err(|_| ConsensusCodecError::Decode)?;
+    match mode {
+        RetainedConfigMode::Legacy | RetainedConfigMode::NetconfTargetsV1 => {
+            decode_config_wire_for_profile(mode, bytes)
         }
-        _ => Err(ConsensusCodecError::Decode),
+        RetainedConfigMode::BoundedV1 => {
+            let value: Append = decode_config_wire_for_profile(mode, bytes)?;
+            Ok(value.into())
+        }
+        RetainedConfigMode::NetconfRunningV1 => {
+            let value: Append<super::joint::Intent> = decode_config_wire_for_profile(mode, bytes)?;
+            Ok(value.into())
+        }
+    }
+}
+impl<I: Into<ConfigMutationIntent>> From<Append<I>> for AppendEntriesRequest<ConfigRaftTypeConfig> {
+    fn from(value: Append<I>) -> Self {
+        Self {
+            vote: value.vote,
+            prev_log_id: value.prev_log_id,
+            entries: value.entries.0.into_iter().map(Into::into).collect(),
+            leader_commit: value.leader_commit,
+        }
     }
 }
 
 pub(in crate::consensus) fn snapshot(
-    profile: ConfigCapacityProfile,
+    mode: impl TryInto<crate::consensus::RetainedConfigMode>,
     bytes: &[u8],
 ) -> Result<InstallSnapshotRequest<ConfigRaftTypeConfig>, ConsensusCodecError> {
     use crate::consensus::types::decode_config_wire_for_profile;
-    let request: InstallSnapshotRequest<ConfigRaftTypeConfig> = match profile {
-        ConfigCapacityProfile::Legacy => decode_config_wire_for_profile(profile, bytes),
+    let mode = mode.try_into().map_err(|_| ConsensusCodecError::Decode)?;
+    let request: InstallSnapshotRequest<ConfigRaftTypeConfig> = match mode.capacity_profile() {
+        ConfigCapacityProfile::Legacy => decode_config_wire_for_profile(mode, bytes),
         ConfigCapacityProfile::BoundedV1 => {
-            let value: Snapshot = decode_config_wire_for_profile(profile, bytes)?;
+            let value: Snapshot = decode_config_wire_for_profile(mode, bytes)?;
             Ok(InstallSnapshotRequest {
                 vote: value.vote,
                 meta: SnapshotMeta {
@@ -308,17 +320,23 @@ fn native<T: serde::de::DeserializeOwned>(bytes: &[u8]) -> std::io::Result<T> {
 // being decoded. In particular, an older command revision cannot select the
 // permissive decoder within a bounded store. Legacy keeps its original serde.
 pub(in crate::consensus) fn native_entry(
-    profile: ConfigCapacityProfile,
+    mode: impl TryInto<crate::consensus::RetainedConfigMode>,
     bytes: &[u8],
 ) -> std::io::Result<Entry<ConfigRaftTypeConfig>> {
-    match profile {
-        ConfigCapacityProfile::Legacy => serde_json::from_slice(bytes).map_err(|_| {
-            crate::consensus::sqlite::invalid_data("config consensus decoding failed")
-        }),
-        ConfigCapacityProfile::BoundedV1 => config_capacity_native_json::entry(bytes),
-        _ => Err(crate::consensus::sqlite::invalid_data(
-            "invalid config capacity profile",
-        )),
+    use crate::consensus::RetainedConfigMode;
+    let mode = mode
+        .try_into()
+        .map_err(|_| crate::consensus::sqlite::invalid_data("invalid retained config mode"))?;
+    match mode {
+        RetainedConfigMode::Legacy | RetainedConfigMode::NetconfTargetsV1 => {
+            serde_json::from_slice(bytes).map_err(|_| {
+                crate::consensus::sqlite::invalid_data("config consensus decoding failed")
+            })
+        }
+        RetainedConfigMode::BoundedV1 => config_capacity_native_json::entry(bytes),
+        RetainedConfigMode::NetconfRunningV1 => {
+            native::<EntryFields<super::joint::Intent>>(bytes).map(Into::into)
+        }
     }
 }
 

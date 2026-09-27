@@ -693,8 +693,16 @@ pub(crate) fn validate_access_for_profile_sync(
     {
         return Err(corrupt());
     }
-    if mode == super::RetainedConfigMode::NetconfTargetsV1 {
+    if mode.has_netconf_targets() {
         super::audit_targets::validate_inactive_sync(conn, key, state.identity, cancellation)?;
+        if mode == super::RetainedConfigMode::NetconfRunningV1 {
+            super::audit_targets::validate_running_only_sync(
+                conn,
+                key,
+                state.identity,
+                cancellation,
+            )?;
+        }
     }
     validate_limited_state(conn, &state)?;
     if record_chain_sync(conn, capacity_profile, cancellation)? != state.record_chain {

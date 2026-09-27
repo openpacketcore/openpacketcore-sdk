@@ -61,7 +61,8 @@ pub(crate) fn config_storage_revision(profile: impl TryInto<RetainedConfigMode>)
     match profile {
         RetainedConfigMode::Legacy => CONFIG_CONSENSUS_STORAGE_VERSION,
         RetainedConfigMode::BoundedV1 => 6,
-        RetainedConfigMode::NetconfTargetsV1 => 7,
+        RetainedConfigMode::NetconfTargetsV1 => super::audit_targets::TARGET_STORAGE_VERSION,
+        RetainedConfigMode::NetconfRunningV1 => 8,
     }
 }
 
@@ -72,7 +73,8 @@ pub(crate) fn config_snapshot_revision(profile: impl TryInto<RetainedConfigMode>
     match profile {
         RetainedConfigMode::Legacy => CONFIG_CONSENSUS_SNAPSHOT_VERSION,
         RetainedConfigMode::BoundedV1 => 6,
-        RetainedConfigMode::NetconfTargetsV1 => 7,
+        RetainedConfigMode::NetconfTargetsV1 => super::audit_targets::TARGET_STORAGE_VERSION,
+        RetainedConfigMode::NetconfRunningV1 => 8,
     }
 }
 
@@ -880,6 +882,7 @@ impl ConfigConsensusCommand {
             }
             8 => self.intent.minimum_command_version() <= 8,
             9 => self.intent.minimum_command_version() <= 9,
+            10 => self.intent.minimum_command_version() <= 10,
             _ => false,
         };
         if !supported_revision || self.identity != identity {
@@ -947,6 +950,17 @@ impl ConfigConsensusCommand {
         mode: RetainedConfigMode,
     ) -> Result<(), PersistError> {
         self.validate(identity)?;
+        if mode == RetainedConfigMode::NetconfRunningV1 {
+            // Exact family, not a >= revision negotiation. Fixed control
+            // commands and the bounded action-16 record share this family.
+            return if self.schema_version == 10
+                && super::config_capacity_decode::joint::allows(&self.intent)
+            {
+                Ok(())
+            } else {
+                Err(PersistError::corrupt_blob())
+            };
+        }
         if self.schema_version > config_command_revision(mode)
             || (self.schema_version == 8 && mode != RetainedConfigMode::BoundedV1)
             || (self.schema_version == 9 && mode != RetainedConfigMode::NetconfTargetsV1)
@@ -968,12 +982,12 @@ impl ConfigConsensusCommand {
             .map_err(|_| PersistError::corrupt_blob())?;
         match profile {
             RetainedConfigMode::Legacy | RetainedConfigMode::NetconfTargetsV1 => {}
-            RetainedConfigMode::BoundedV1 => {
+            RetainedConfigMode::BoundedV1 | RetainedConfigMode::NetconfRunningV1 => {
                 // The same borrowed preflight covers local/forwarded proposals
                 // and received/retained entries, before structural helpers or
                 // native WAL effects. The largest leader-selected framing is
                 // included even when this particular entry uses smaller IDs.
-                super::store::preflight_received_config_command(self, profile.capacity_profile())?;
+                super::store::preflight_received_config_command(self, profile)?;
             }
         }
         self.validate_structure_for_mode(identity, profile)?;
@@ -989,7 +1003,9 @@ pub(super) fn config_command_revision(profile: impl TryInto<RetainedConfigMode>)
     match profile {
         RetainedConfigMode::Legacy => CONFIG_CONSENSUS_COMMAND_VERSION,
         RetainedConfigMode::BoundedV1 => 8,
-        RetainedConfigMode::NetconfTargetsV1 => profile.target_profile().command_revision(),
+        RetainedConfigMode::NetconfTargetsV1 | RetainedConfigMode::NetconfRunningV1 => {
+            profile.target_profile().command_revision()
+        }
     }
 }
 
@@ -1149,7 +1165,9 @@ pub(crate) fn config_wire_revision(profile: impl TryInto<RetainedConfigMode>) ->
     match profile {
         RetainedConfigMode::Legacy => CONFIG_CONSENSUS_WIRE_VERSION,
         RetainedConfigMode::BoundedV1 => 8,
-        RetainedConfigMode::NetconfTargetsV1 => profile.target_profile().wire_revision(),
+        RetainedConfigMode::NetconfTargetsV1 | RetainedConfigMode::NetconfRunningV1 => {
+            profile.target_profile().wire_revision()
+        }
     }
 }
 
@@ -1247,6 +1265,10 @@ pub(crate) fn decode_config_wire_for_profile<T: serde::de::DeserializeOwned>(
         }
         RetainedConfigMode::NetconfTargetsV1 => {
             opc_consensus::decode_bounded::<CheckedConfigWire<T, 9>>(bytes).map(|payload| payload.0)
+        }
+        RetainedConfigMode::NetconfRunningV1 => {
+            opc_consensus::decode_bounded::<CheckedConfigWire<T, 10>>(bytes)
+                .map(|payload| payload.0)
         }
     }
 }

@@ -16,6 +16,12 @@ pub enum RetainedConfigProfile {
     /// Command/wire revision 9 and storage/snapshot revision 7 are required;
     /// this does not opt in to the separately reserved capacity profile.
     NetconfTargetsV1,
+    /// Bounded ordinary writable Running with retained audit/session authority.
+    /// Select together with `ConfigCapacityProfile::BoundedV1` on a new store.
+    /// Uses command/wire 10 and storage/snapshot 8. Candidate, startup, copy,
+    /// empty commit and confirmed-commit lifecycles are deliberately unavailable.
+    /// This profile does not advertise any protocol capability by itself.
+    NetconfRunningV1,
 }
 
 impl RetainedConfigProfile {
@@ -23,6 +29,7 @@ impl RetainedConfigProfile {
         match self {
             Self::Legacy => super::CONFIG_CONSENSUS_COMMAND_VERSION,
             Self::NetconfTargetsV1 => 9,
+            Self::NetconfRunningV1 => 10,
         }
     }
 
@@ -30,6 +37,7 @@ impl RetainedConfigProfile {
         match self {
             Self::Legacy => super::CONFIG_CONSENSUS_WIRE_VERSION,
             Self::NetconfTargetsV1 => 9,
+            Self::NetconfRunningV1 => 10,
         }
     }
 }
@@ -768,6 +776,55 @@ pub(super) fn validate_inactive_sync(
     state.validate_anchor(ledger.as_ref())
 }
 
+pub(super) fn validate_running_only_sync(
+    conn: &Connection,
+    key: &AuditKey,
+    identity: ConfigConsensusIdentity,
+    cancellation: &SqliteWorkCancellation,
+) -> io::Result<()> {
+    let state = read_state_sync(conn, key, identity, cancellation)?;
+    if state
+        .targets
+        .iter()
+        .any(|target| target.present || target.generation != 0)
+        || state.lifecycle.pending_confirmation.is_some()
+        || state.lifecycle.cleanup.iter().any(Option::is_some)
+        || state.lifecycle.locks[1..]
+            .iter()
+            .flatten()
+            .any(|lock| lock.session.is_some())
+    {
+        return Err(invalid());
+    }
+    if let Some(ledger) = super::audit::read_sync(conn, key, identity)? {
+        for entry in &ledger.entries {
+            cancellation.check_io()?;
+            use crate::audit_authority::ledger::EntryPayload;
+            match &entry.payload {
+                EntryPayload::TargetIntent(original) => {
+                    let prepared = PreparedTargetMutation::decode_retained(
+                        original.recovery.as_bytes(),
+                        key,
+                        identity,
+                        &original.handle,
+                        original.handle.body.binding.caller,
+                    )
+                    .map_err(|_| invalid())?;
+                    if !super::audit_mutation::joint_running::allows_native(prepared.command()) {
+                        return Err(invalid());
+                    }
+                }
+                EntryPayload::EmptyCommit(_) => return Err(invalid()),
+                EntryPayload::Intent(handle) if handle.body.mutation.is_some() => {
+                    return Err(invalid())
+                }
+                _ => {}
+            }
+        }
+    }
+    Ok(())
+}
+
 /// An ordinary running effect has no retained session or exact lock lease.
 /// Authenticate the same target state and ledger anchor before deciding whether
 /// it may proceed. Refusal is a definite rejection of this effect; it never
@@ -1384,13 +1441,11 @@ impl TargetState {
                 {
                     return Err(bad);
                 }
-                let Some(TargetPayloadV1::Running {
-                    commit,
-                    confirmation_ownership: None,
-                }) = &effect.encrypted_payload
-                else {
-                    return Err(bad);
-                };
+                let commit = effect
+                    .encrypted_payload
+                    .as_ref()
+                    .and_then(TargetPayloadV1::ordinary_running)
+                    .ok_or(bad)?;
                 let parent = running_head_sync(conn)?;
                 if commit.record.parent_tx_id != parent
                     || current_version.checked_add(1) != Some(commit.record.version.get())
@@ -1517,13 +1572,14 @@ impl TargetState {
 
 /// Atomic target/running transition inside the caller's authority transaction.
 /// Runtime activation is still gated by the independently selected store profile.
-pub(crate) fn apply_target_sync(
+pub(crate) fn apply_target_for_mode_sync(
     conn: &Connection,
     key: &AuditKey,
     identity: ConfigConsensusIdentity,
     prepared: &TargetMutationCommand,
     keys: Option<&AuditKeyRing>,
     context: &super::audit::ApplyContext<'_>,
+    mode: super::RetainedConfigMode,
 ) -> io::Result<Result<(), super::ConfigMutationFailure>> {
     use super::ConfigMutationFailure as Failure;
     let cancellation = context.cancellation;
@@ -1531,9 +1587,18 @@ pub(crate) fn apply_target_sync(
     if conn.is_autocommit() {
         return Err(invalid());
     }
-    if prepared.verify_effect(key).is_err() {
+    #[cfg(test)]
+    crate::consensus::storage::config_capacity_apply_observations::observe("target_apply_entered");
+    if prepared
+        .verify_for_mode(key, identity, prepared.effect.caller, mode)
+        .is_err()
+    {
         return Ok(Err(Failure::Conflict));
     }
+    #[cfg(test)]
+    crate::consensus::storage::config_capacity_apply_observations::observe(
+        "target_prepared_verified",
+    );
     let Some(keys) = keys else {
         return Ok(Err(Failure::InvalidInput));
     };
@@ -1541,10 +1606,16 @@ pub(crate) fn apply_target_sync(
     else {
         return Ok(Err(Failure::InvalidInput));
     };
+    #[cfg(test)]
+    crate::consensus::storage::config_capacity_apply_observations::observe("target_ledger_read");
     let original = match ledger.recover_target(key, prepared.handle(), prepared.effect.caller) {
         Ok(original) => original,
         Err(_) => return Ok(Err(Failure::Conflict)),
     };
+    #[cfg(test)]
+    crate::consensus::storage::config_capacity_apply_observations::observe(
+        "target_original_recovered",
+    );
     if original.command() != prepared {
         return Ok(Err(Failure::Conflict));
     }
@@ -1572,9 +1643,17 @@ pub(crate) fn apply_target_sync(
     {
         return Ok(Err(Failure::InvalidInput));
     }
+    #[cfg(test)]
+    crate::consensus::storage::config_capacity_apply_observations::observe(
+        "target_ledger_guards_checked",
+    );
     let mut state = read_state_sync(conn, key, identity, cancellation)?;
     state.validate_anchor(Some(&ledger))?;
     super::history::validate_record_chain_sync(conn, key, cancellation)?;
+    #[cfg(test)]
+    crate::consensus::storage::config_capacity_apply_observations::observe(
+        "target_state_history_validated",
+    );
     let previous_pending = state
         .lifecycle
         .pending_confirmation
@@ -1584,16 +1663,30 @@ pub(crate) fn apply_target_sync(
         .handle
         .require_live(now)
         .and_then(|()| state.reduce(conn, prepared, &ledger, keys, now));
+    #[cfg(test)]
+    crate::consensus::storage::config_capacity_apply_observations::observe("target_reduced");
     if matches!(reduced, Err(AuditAuthorityError::RecoveryRequired)) {
         return Ok(Err(Failure::InvalidInput));
     }
     conn.execute_batch("SAVEPOINT audited_target_effect")
         .map_err(|_| invalid())?;
     let running_result = if reduced.is_ok() {
-        super::sqlite::apply_target_running_sync(conn, key, prepared, previous_pending, context)?
+        super::sqlite::apply_target_running_for_mode_sync(
+            conn,
+            key,
+            prepared,
+            previous_pending,
+            context,
+            identity,
+            mode,
+        )?
     } else {
         Err(Failure::Conflict)
     };
+    #[cfg(test)]
+    crate::consensus::storage::config_capacity_apply_observations::observe(
+        "target_running_applied",
+    );
     let (result, applied) = match (reduced, running_result) {
         (Ok(outcome), Ok(())) => {
             state.profile.last_target_transition_sequence =
@@ -1625,22 +1718,42 @@ pub(crate) fn apply_target_sync(
         conn.execute_batch("ROLLBACK TO audited_target_effect")
             .map_err(|_| invalid())?;
     }
+    #[cfg(test)]
+    crate::consensus::storage::config_capacity_apply_observations::observe("target_before_resolve");
     ledger
         .resolve(key, prepared.handle(), applied)
         .map_err(|_| invalid())?;
+    #[cfg(test)]
+    crate::consensus::storage::config_capacity_apply_observations::observe("target_resolved");
     ledger.seal_continuity(Some(keys)).map_err(|_| invalid())?;
+    #[cfg(test)]
+    crate::consensus::storage::config_capacity_apply_observations::observe(
+        "target_continuity_sealed",
+    );
     ledger.validate(key, identity).map_err(|_| invalid())?;
+    #[cfg(test)]
+    crate::consensus::storage::config_capacity_apply_observations::observe(
+        "target_ledger_validated",
+    );
     ledger
         .validate_continuity(Some(keys))
         .map_err(|_| invalid())?;
+    #[cfg(test)]
+    crate::consensus::storage::config_capacity_apply_observations::observe(
+        "target_continuity_validated",
+    );
     if result.is_ok() {
         state.validate_anchor(Some(&ledger))?;
         state.write(conn, key, cancellation)?;
     }
+    #[cfg(test)]
+    crate::consensus::storage::config_capacity_apply_observations::observe("target_state_written");
     conn.execute_batch("RELEASE audited_target_effect")
         .map_err(|_| invalid())?;
     cancellation.check_io()?;
     super::audit::write_sync(conn, key, identity, Some(ledger), false)?;
+    #[cfg(test)]
+    crate::consensus::storage::config_capacity_apply_observations::observe("target_ledger_written");
     Ok(result)
 }
 
@@ -1745,6 +1858,7 @@ pub(crate) fn retire_cleanup_sync(
 /// This predicts the target state and reserves ledger space only in memory; it
 /// neither writes an intent nor grants permission to apply one. Application must
 /// recheck the same expectations after independently checkpointed admission.
+#[cfg(test)]
 pub(crate) fn preflight_target_sync(
     conn: &Connection,
     key: &AuditKey,
@@ -1755,11 +1869,36 @@ pub(crate) fn preflight_target_sync(
     cancellation: &SqliteWorkCancellation,
 ) -> io::Result<Result<Option<crate::audit_authority::AuditOperationReceipt>, AuditAuthorityError>>
 {
+    preflight_target_for_mode_sync(
+        conn,
+        key,
+        prepared,
+        ledger,
+        keys,
+        now,
+        cancellation,
+        super::RetainedConfigMode::NetconfTargetsV1,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn preflight_target_for_mode_sync(
+    conn: &Connection,
+    key: &AuditKey,
+    prepared: &TargetMutationCommand,
+    ledger: &LedgerState,
+    keys: &AuditKeyRing,
+    now: i64,
+    cancellation: &SqliteWorkCancellation,
+    mode: super::RetainedConfigMode,
+) -> io::Result<Result<Option<crate::audit_authority::AuditOperationReceipt>, AuditAuthorityError>>
+{
     cancellation.check_io()?;
     if conn.is_autocommit() {
         return Err(invalid());
     }
-    if let Err(error) = prepared.verify_effect(key) {
+    if let Err(error) = prepared.verify_for_mode(key, ledger.identity, prepared.effect.caller, mode)
+    {
         return Ok(Err(error));
     }
     let mut state = read_state_sync(conn, key, ledger.identity, cancellation)?;

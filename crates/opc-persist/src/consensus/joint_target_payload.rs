@@ -430,6 +430,113 @@ impl Received {
     }
 }
 
+/// Selected writable-Running subset. This is a command fence, never proof
+/// of an admitted session or Intent. The existing reducer authenticates both.
+pub(in crate::consensus) fn allows_native(command: &super::TargetMutationCommand) -> bool {
+    let effect = &command.effect;
+    match u8::from(effect.action) {
+        0 | 1 | 13 => {
+            effect.encrypted_payload.is_none() && effect.source.is_none() && effect.lock.is_none()
+        }
+        2 | 3 => {
+            effect.encrypted_payload.is_none()
+                && effect.source.is_none()
+                && effect.lock.as_ref().is_some_and(|lock| lock.datastore == 0)
+        }
+        16 => {
+            command.bounded_running().is_some()
+                && effect.resolution.is_none()
+                && matches!(effect.source, None | Some(TargetSourceV1::Running { .. }))
+                && effect.lock.as_ref().is_some_and(|lock| lock.datastore == 0)
+        }
+        _ => false,
+    }
+}
+
+#[derive(Deserialize)]
+#[serde(rename = "TargetEffectV1", deny_unknown_fields)]
+struct NativeEffectInput {
+    format: u16,
+    #[serde(with = "crate::audit_authority::target_identity")]
+    authority: ConfigConsensusIdentity,
+    profile_incarnation: [u8; 16],
+    device_incarnation: [u8; 16],
+    #[serde(with = "crate::audit_authority::target_caller")]
+    caller: AuditCaller,
+    request: AuditToken,
+    action: TargetActionV1,
+    destination: TargetExpectationV1,
+    #[serde(deserialize_with = "source_input")]
+    source: Option<TargetSourceV1>,
+    lock: Option<TargetLockExpectationV1>,
+    expires_at: i64,
+    encrypted_payload: Option<PayloadInputTag>,
+    // This closed type owns no unbounded string or collection. The command
+    // validator rejects all confirmed/rollback variants in this native family.
+    resolution: Option<TargetResolutionV1>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename = "PreparedTargetMutation", deny_unknown_fields)]
+struct NativeFields {
+    #[serde(deserialize_with = "crate::audit_authority::ledger::deserialize_target_handle")]
+    handle: AuditOperationHandle,
+    effect: NativeEffectInput,
+}
+
+pub(in crate::consensus) struct NativeReceived(
+    pub(in crate::consensus) super::TargetMutationCommand,
+);
+
+impl<'de> Deserialize<'de> for NativeReceived {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let value = NativeFields::deserialize(deserializer)?;
+        let effect = value.effect;
+        let encrypted_payload = match effect.encrypted_payload {
+            None => None,
+            Some(PayloadInputTag::BoundedRunning(payload)) => {
+                Some(TargetPayloadV1::BoundedRunning((*payload).into()))
+            }
+            // Old tags do not deserialize any record fields in this input.
+            Some(_) => return Err(invalid()),
+        };
+        let prepared = PreparedTargetMutation::new(
+            value.handle,
+            TargetEffectV1 {
+                format: effect.format,
+                authority: effect.authority,
+                profile_incarnation: effect.profile_incarnation,
+                device_incarnation: effect.device_incarnation,
+                caller: effect.caller,
+                request: effect.request,
+                action: effect.action,
+                destination: effect.destination,
+                source: effect.source,
+                lock: effect.lock,
+                expires_at: effect.expires_at,
+                encrypted_payload,
+                resolution: effect.resolution,
+            },
+            None,
+        );
+        if !allows_native(prepared.command()) {
+            return Err(invalid());
+        }
+        let capacity = if prepared.bounded_running().is_some() {
+            ConfigCapacityProfile::BoundedV1
+        } else {
+            ConfigCapacityProfile::Legacy
+        };
+        prepared
+            .command()
+            .effect
+            .validate_for_capacity(prepared.handle(), capacity)
+            .map_err(|_| invalid::<D::Error>())?;
+        Ok(Self(prepared.command))
+    }
+}
+
+#[cfg(test)]
 pub(in crate::consensus) fn recover(
     bytes: &[u8],
     reservation: ConfigPreparationReservation,

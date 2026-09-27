@@ -1001,3 +1001,9 @@ mod submission;
 
 #[path = "joint_target_retained_recovery_tests.rs"]
 pub(in crate::consensus) mod retained_recovery;
+
+#[path = "joint_native_cost_tests.rs"]
+mod native_cost;
+
+#[path = "joint_native_route_tests.rs"]
+pub(in crate::consensus) mod native_route;

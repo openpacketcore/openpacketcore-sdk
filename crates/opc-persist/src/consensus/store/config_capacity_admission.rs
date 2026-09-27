@@ -129,6 +129,17 @@ pub(super) fn preflight(
     )
 }
 
+pub(super) fn preflight_running_mode(
+    command: &ConfigConsensusCommandSizeProbe<'_>,
+) -> Result<EncodingSizes, ForwardMutationRejection> {
+    if command.schema_version != 10
+        || !crate::consensus::config_capacity_decode::joint::allows(command.intent)
+    {
+        return Err(ForwardMutationRejection::InvalidCommand);
+    }
+    preflight_revisions(command, ConfigCapacityProfile::BoundedV1, 10, 10)
+}
+
 // Sizing a proposed encoding does not enable its peer, storage or runtime mode.
 pub(super) fn preflight_joint_target_payload(
     command: &ConfigConsensusCommandSizeProbe<'_>,

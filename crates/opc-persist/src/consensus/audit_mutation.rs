@@ -506,7 +506,7 @@ impl TargetAuditCommandV1 {
     ) -> Result<Option<crate::audit_authority::AuditOperationReceipt>, AuditAuthorityError> {
         match self {
             Self::Admit(prepared) | Self::Apply(prepared) | Self::RetireCleanup(prepared) => {
-                prepared.verify_effect(key)?;
+                prepared.verify_retained(key, ledger.identity, caller)?;
                 let receipt = ledger.lookup(key, prepared.handle(), caller)?;
                 if receipt.is_some()
                     && ledger
@@ -657,7 +657,7 @@ pub(crate) enum TargetPayloadV1 {
 }
 
 impl TargetPayloadV1 {
-    fn ordinary_running(&self) -> Option<&PreparedConfigCommit> {
+    pub(super) fn ordinary_running(&self) -> Option<&PreparedConfigCommit> {
         match self {
             Self::Running {
                 commit,
@@ -1162,6 +1162,24 @@ impl std::fmt::Debug for TargetMutationCommand {
 }
 
 impl TargetMutationCommand {
+    pub(in crate::consensus) fn verify_for_mode(
+        &self,
+        key: &AuditKey,
+        identity: super::ConfigConsensusIdentity,
+        caller: crate::audit_authority::AuditCaller,
+        mode: super::RetainedConfigMode,
+    ) -> Result<(), AuditAuthorityError> {
+        self.handle.verify(key, identity, caller)?;
+        if mode == super::RetainedConfigMode::NetconfRunningV1 {
+            if !joint_running::allows_native(self) {
+                return Err(AuditAuthorityError::BindingMismatch);
+            }
+            self.verify_retained(key, identity, caller)
+        } else {
+            self.verify_effect(key)
+        }
+    }
+
     pub(crate) fn handle(&self) -> &AuditOperationHandle {
         &self.handle
     }
@@ -1412,6 +1430,13 @@ impl PreparedTargetMutation {
 
     pub(crate) fn command(&self) -> &TargetMutationCommand {
         &self.command
+    }
+
+    pub(in crate::consensus) fn from_native_command(command: TargetMutationCommand) -> Self {
+        Self {
+            command,
+            preparation: None,
+        }
     }
 
     #[cfg(test)]

@@ -188,7 +188,7 @@ CREATE TABLE config_raft_capacity_records (
 fn create_capacity_schema(conn: &Connection, profile: RetainedConfigMode) -> io::Result<()> {
     match profile {
         RetainedConfigMode::Legacy | RetainedConfigMode::NetconfTargetsV1 => Ok(()),
-        RetainedConfigMode::BoundedV1 => conn
+        RetainedConfigMode::BoundedV1 | RetainedConfigMode::NetconfRunningV1 => conn
             .execute_batch(CONFIG_RAFT_CAPACITY_SCHEMA)
             .map_err(db_error),
     }
@@ -762,8 +762,9 @@ pub(crate) fn provision_retained_schema(
         topology.identity(),
         topology.members(),
         audit_key,
-        if mode == RetainedConfigMode::NetconfTargetsV1 {
-            RetainedConfigMode::Legacy
+        if mode.has_netconf_targets() {
+            RetainedConfigMode::try_from(mode.capacity_profile())
+                .map_err(|_| ConfigConsensusStorageError::InvalidIdentity)?
         } else {
             mode
         },
@@ -771,7 +772,7 @@ pub(crate) fn provision_retained_schema(
         &cancellation,
         None,
     )?;
-    if mode != RetainedConfigMode::NetconfTargetsV1 {
+    if !mode.has_netconf_targets() {
         return Ok(());
     }
     // Each transaction has its own commit latch and the same original deadline.
@@ -788,7 +789,7 @@ pub(crate) fn provision_retained_schema(
         .map_err(|_| ConfigConsensusStorageError::CorruptState)?;
     let updated = tx.execute(
         "UPDATE config_raft_identity SET schema_version=?1, schema_manifest_digest=?2 WHERE singleton=1 AND schema_version=?3",
-        params![super::audit_targets::TARGET_STORAGE_VERSION, manifest.as_slice(), super::types::CONFIG_CONSENSUS_STORAGE_VERSION],
+        params![config_storage_revision(mode), manifest.as_slice(), config_storage_revision(mode.capacity_profile())],
     ).map_err(|_| ConfigConsensusStorageError::BackendUnavailable)?;
     if updated != 1 {
         return Err(ConfigConsensusStorageError::CorruptState);
@@ -1443,7 +1444,7 @@ fn config_schema_manifest_digest(
         }
     }
     let base: [u8; 32] = hasher.finalize().into();
-    if profile == RetainedConfigMode::NetconfTargetsV1 {
+    if profile.has_netconf_targets() {
         let targets = super::audit_targets::schema_digest_sync(conn, cancellation)?;
         let mut digest = sha2::Sha256::new();
         digest.update(b"openpacketcore/config-consensus/storage-manifest/netconf-targets/v1\0");
@@ -1475,21 +1476,19 @@ pub(super) fn validate_live_history_schema_for_profile_sync(
         return Err(invalid_data("config history schema is not admitted"));
     }
     match profile {
-        RetainedConfigMode::NetconfTargetsV1 => {
+        RetainedConfigMode::NetconfTargetsV1 | RetainedConfigMode::NetconfRunningV1 => {
             crate::schema::validate_retained_base_schema_with_netconf_targets(conn)
         }
         _ => crate::schema::validate_retained_base_schema(conn),
     }
     .map_err(|_| invalid_data("config history base schema does not match"))?;
     let expected_manifest = config_schema_manifest_digest(conn, profile, cancellation)?;
-    if profile == RetainedConfigMode::NetconfTargetsV1 {
+    if profile.has_netconf_targets() {
         let (version, manifest): (u16, Vec<u8>) = conn.query_row(
             "SELECT schema_version, schema_manifest_digest FROM config_raft_identity WHERE singleton=1",
             [], |row| Ok((row.get(0)?, row.get(1)?)),
         ).map_err(db_error)?;
-        if version != super::audit_targets::TARGET_STORAGE_VERSION
-            || manifest.as_slice() != expected_manifest
-        {
+        if version != config_storage_revision(profile) || manifest.as_slice() != expected_manifest {
             return Err(invalid_data(
                 "config history target profile is not admitted",
             ));
@@ -1974,7 +1973,7 @@ fn row_entry(
     if mode.capacity_profile() == ConfigCapacityProfile::Legacy {
         native_io::route(native_io::Route::Legacy);
     }
-    let entry = capacity_decode::native_entry(mode.capacity_profile(), encoded)?;
+    let entry = capacity_decode::native_entry(mode, encoded)?;
     if term != entry.log_id.leader_id.term || index != entry.log_id.index {
         return Err(invalid_data("persisted config consensus log row mismatch"));
     }
@@ -3166,6 +3165,7 @@ fn create_rollback_point_sync(
 }
 
 /// Apply the authenticated target reducer's exact Running effect in its existing savepoint.
+#[cfg(test)]
 pub(super) fn apply_target_running_sync(
     conn: &Connection,
     key: &AuditKey,
@@ -3173,10 +3173,35 @@ pub(super) fn apply_target_running_sync(
     pending_tx_id: Option<opc_types::TxId>,
     context: &super::audit::ApplyContext<'_>,
 ) -> io::Result<Result<(), ConfigMutationFailure>> {
-    // The current target dispatcher has no independently selected capacity
-    // context. Joint opening and dispatch remain closed until that context is
-    // threaded from the native core through the authoritative target reducer.
+    // Preserve the legacy component detector: without independently selected
+    // native context even an authenticated bounded payload must be refused.
     apply_target_running_with_authority_sync(conn, key, prepared, pending_tx_id, context, None)
+}
+
+pub(super) fn apply_target_running_for_mode_sync(
+    conn: &Connection,
+    key: &AuditKey,
+    prepared: &super::audit_mutation::TargetMutationCommand,
+    pending_tx_id: Option<opc_types::TxId>,
+    context: &super::audit::ApplyContext<'_>,
+    identity: ConsensusIdentity,
+    mode: RetainedConfigMode,
+) -> io::Result<Result<(), ConfigMutationFailure>> {
+    let authority = (mode == RetainedConfigMode::NetconfRunningV1).then(|| {
+        joint_running::CapacityRunningAuthority {
+            identity,
+            caller: prepared.handle.body.binding.caller,
+            mode,
+        }
+    });
+    apply_target_running_with_authority_sync(
+        conn,
+        key,
+        prepared,
+        pending_tx_id,
+        context,
+        authority.as_ref(),
+    )
 }
 
 fn apply_target_running_with_authority_sync(
@@ -3472,7 +3497,7 @@ fn apply_audited_mutation_sync(
     // Validate the remaining sealed state without decoding a second ledger
     // while the original must remain live for the atomic outcome below.
     validate_sealed_configuration_for_profile_sync(conn, identity, key, mode, cancellation)?;
-    let target_allows_effect = if mode == RetainedConfigMode::NetconfTargetsV1 {
+    let target_allows_effect = if mode.has_netconf_targets() {
         super::audit_targets::ordinary_running_allowed_sync(
             conn,
             key,
@@ -3765,7 +3790,7 @@ pub(crate) fn apply_entries_cancellable_sync(
                             )?
                         }
                         ConfigMutationIntent::ManagementAudit(audit) => {
-                            super::audit::apply_cancellable_sync(
+                            super::audit::apply_cancellable_for_mode_sync(
                                 &tx,
                                 audit_key,
                                 identity,
@@ -3776,6 +3801,7 @@ pub(crate) fn apply_entries_cancellable_sync(
                                     request_id: command.request_id,
                                     cancellation,
                                 },
+                                mode,
                             )?
                         }
                         ConfigMutationIntent::RetainHistory(retention) => {
@@ -4539,7 +4565,7 @@ pub(crate) fn install_snapshot_database_cancellable_sync(
             }
         }
     }
-    if mode == RetainedConfigMode::BoundedV1 {
+    if mode.capacity_profile() == ConfigCapacityProfile::BoundedV1 {
         tx.execute("DELETE FROM config_raft_capacity_records", [])
             .map_err(db_error)?;
     }
@@ -4601,7 +4627,7 @@ pub(crate) fn install_snapshot_database_cancellable_sync(
         cancellation.check_io()?;
         copy_snapshot_table(&source, &tx, table, columns, cancellation)?;
     }
-    if mode == RetainedConfigMode::NetconfTargetsV1 {
+    if mode.has_netconf_targets() {
         // Source validation and this closed copy share the pinned source view.
         // Independently selected profile validation precedes any destination write.
         for (table, columns) in [
@@ -4622,7 +4648,7 @@ pub(crate) fn install_snapshot_database_cancellable_sync(
         }
         super::audit_targets::validate_inactive_sync(&tx, audit_key, identity, cancellation)?;
     }
-    if mode == RetainedConfigMode::BoundedV1 {
+    if mode.capacity_profile() == ConfigCapacityProfile::BoundedV1 {
         copy_snapshot_table(
             &source,
             &tx,
@@ -6568,7 +6594,7 @@ pub(super) mod target_snapshot_tests;
 pub(super) fn validate_live_history_schema_for_profile(
     conn: &Connection,
     cancellation: &SqliteWorkCancellation,
-    profile: super::RetainedConfigProfile,
+    profile: impl Into<RetainedConfigMode>,
 ) -> io::Result<()> {
     validate_live_history_schema_for_profile_sync(conn, profile.into(), cancellation)
 }

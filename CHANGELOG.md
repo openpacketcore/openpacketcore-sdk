@@ -9,6 +9,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- `opc-persist`: connect the explicit bounded Running profile to native audited
+  admission and application, preserving its original recovery identity and WAL
+  durability. Avoid repeated ledger serialization and bounded recovery routing
+  scans while preserving canonical authentication. Maximum-size native execution
+  and combined capacity qualification remain open. Refs #957, #958.
+
 - `opc-persist`: serialize new retained-target audit Intents against unsettled
   operations in the authenticated ledger transaction. Preserve exact-original
   replay and reject stale effects without applying them. Concurrent cleanup

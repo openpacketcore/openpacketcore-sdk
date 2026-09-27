@@ -1219,7 +1219,8 @@ impl RaftStateMachine<ConfigRaftTypeConfig> for SqliteConfigStateMachine {
         // original storage deadline until the complete committed frontier has
         // applied; another page or a later commit must not refresh it. Legacy
         // direct callers retain bounded transactions under one per-call clock.
-        let bounded = self.core.mode == RetainedConfigMode::BoundedV1;
+        let bounded =
+            self.core.mode.capacity_profile() == opc_crypto::ConfigCapacityProfile::BoundedV1;
         let deadline = if bounded {
             self.core
                 .durable_progress
@@ -1295,11 +1296,26 @@ impl RaftStateMachine<ConfigRaftTypeConfig> for SqliteConfigStateMachine {
                         &audit_key,
                         audit_keys.as_deref(),
                         mode,
-                    )?;
+                    );
+                    #[cfg(test)]
+                    if let (Err(error), true) = (&applied, apply_observation.is_some()) {
+                        eprintln!(
+                            "JOINT_NATIVE_STORAGE stage=apply_error kind={:?}",
+                            error.kind()
+                        );
+                    }
+                    let applied = applied?;
                     Ok((applied, remainder, last_applied))
                 })
                 .await
                 .map_err(|error| {
+                    #[cfg(test)]
+                    if apply_observation.is_some() {
+                        eprintln!(
+                            "JOINT_NATIVE_STORAGE stage=await_error kind={:?}",
+                            error.kind()
+                        );
+                    }
                     storage_error(ErrorSubject::StateMachine, ErrorVerb::Write, error)
                 })?;
             #[cfg(test)]
@@ -1755,6 +1771,7 @@ impl RaftSnapshotBuilder<ConfigRaftTypeConfig> for SqliteConfigSnapshotBuilder {
 enum SnapshotIntegrity {
     Legacy(Sha256),
     Bounded(Hmac<Sha256>),
+    Running(Hmac<Sha256>),
 }
 
 impl SnapshotIntegrity {
@@ -1767,16 +1784,24 @@ impl SnapshotIntegrity {
             RetainedConfigMode::Legacy | RetainedConfigMode::NetconfTargetsV1 => {
                 Ok(Self::Legacy(Sha256::new()))
             }
-            RetainedConfigMode::BoundedV1 => {
+            RetainedConfigMode::BoundedV1 | RetainedConfigMode::NetconfRunningV1 => {
                 let mut mac = <Hmac<Sha256> as KeyInit>::new_from_slice(audit_key.as_bytes())
                     .map_err(|_| sqlite::invalid_data("config snapshot key is unavailable"))?;
-                mac.update(b"openpacketcore/config-snapshot-capacity/v1\0");
+                if profile == RetainedConfigMode::NetconfRunningV1 {
+                    mac.update(b"openpacketcore/config-snapshot-netconf-running/v1\0");
+                } else {
+                    mac.update(b"openpacketcore/config-snapshot-capacity/v1\0");
+                }
                 mac.update(&profile.capacity_profile().revision().to_be_bytes());
                 mac.update(identity.cluster_id().as_bytes());
                 mac.update(identity.configuration_id().as_bytes());
                 mac.update(&identity.configuration_epoch().get().to_be_bytes());
                 mac.update(&audit_key.epoch().to_be_bytes());
-                Ok(Self::Bounded(mac))
+                Ok(if profile == RetainedConfigMode::NetconfRunningV1 {
+                    Self::Running(mac)
+                } else {
+                    Self::Bounded(mac)
+                })
             }
         }
     }
@@ -1784,26 +1809,26 @@ impl SnapshotIntegrity {
     fn update(&mut self, bytes: &[u8]) {
         match self {
             Self::Legacy(digest) => digest.update(bytes),
-            Self::Bounded(mac) => mac.update(bytes),
+            Self::Bounded(mac) | Self::Running(mac) => mac.update(bytes),
         }
     }
 
     fn bind_footer(&mut self, length: u64) {
-        if let Self::Bounded(mac) = self {
-            mac.update(SNAPSHOT_FOOTER_MAGIC);
-            mac.update(
-                &super::types::config_snapshot_revision(RetainedConfigMode::BoundedV1)
-                    .to_be_bytes(),
-            );
-            mac.update(&length.to_be_bytes());
-        }
+        let (mac, mode) = match self {
+            Self::Legacy(_) => return,
+            Self::Bounded(mac) => (mac, RetainedConfigMode::BoundedV1),
+            Self::Running(mac) => (mac, RetainedConfigMode::NetconfRunningV1),
+        };
+        mac.update(SNAPSHOT_FOOTER_MAGIC);
+        mac.update(&super::types::config_snapshot_revision(mode).to_be_bytes());
+        mac.update(&length.to_be_bytes());
     }
 
     fn finish(mut self, length: u64) -> [u8; 32] {
         self.bind_footer(length);
         match self {
             Self::Legacy(digest) => digest.finalize().into(),
-            Self::Bounded(mac) => mac.finalize().into_bytes().into(),
+            Self::Bounded(mac) | Self::Running(mac) => mac.finalize().into_bytes().into(),
         }
     }
 
@@ -1811,7 +1836,7 @@ impl SnapshotIntegrity {
         self.bind_footer(length);
         let valid = match self {
             Self::Legacy(digest) => <[u8; 32]>::from(digest.finalize()) == *expected,
-            Self::Bounded(mac) => mac.verify_slice(expected).is_ok(),
+            Self::Bounded(mac) | Self::Running(mac) => mac.verify_slice(expected).is_ok(),
         };
         if !valid {
             return Err(sqlite::invalid_data(

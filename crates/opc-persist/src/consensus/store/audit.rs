@@ -677,7 +677,24 @@ impl ConsensusConfigStore {
             self.submit_owned_request(request, command, ownership).await
         };
         match response {
-            Err(_) => AuditAdmission::Unknown(handle.clone()),
+            Err(_error) => {
+                #[cfg(test)]
+                if self
+                    .inner
+                    .durable_progress
+                    .append_observed_from
+                    .get()
+                    .is_some()
+                {
+                    let category = match _error.kind() {
+                        crate::PersistErrorKind::OutcomeUnknown => "outcome_unknown",
+                        crate::PersistErrorKind::Unavailable => "unavailable",
+                        _ => "other",
+                    };
+                    eprintln!("JOINT_NATIVE_UNKNOWN submission_error={category}");
+                }
+                AuditAdmission::Unknown(handle.clone())
+            }
             Ok(response) => {
                 if let Some(proof) = &response.audit_receipt {
                     let verified = match &target_command {
@@ -696,7 +713,19 @@ impl ConsensusConfigStore {
                     };
                     let receipt = match verified {
                         Ok(receipt) => receipt,
-                        Err(_) => return AuditAdmission::Unknown(handle.clone()),
+                        Err(_) => {
+                            #[cfg(test)]
+                            if self
+                                .inner
+                                .durable_progress
+                                .append_observed_from
+                                .get()
+                                .is_some()
+                            {
+                                eprintln!("JOINT_NATIVE_UNKNOWN proof_readback");
+                            }
+                            return AuditAdmission::Unknown(handle.clone());
+                        }
                     };
                     // Settled outcomes cannot change. The applying quorum has
                     // already authenticated this result; a later read outage
@@ -732,7 +761,21 @@ impl ConsensusConfigStore {
                         Err(failure) => {
                             AuditAdmission::Rejected(super::super::audit::map_failure(failure))
                         }
-                        Ok(()) => AuditAdmission::Unknown(handle.clone()),
+                        Ok(()) => {
+                            #[cfg(test)]
+                            if self
+                                .inner
+                                .durable_progress
+                                .append_observed_from
+                                .get()
+                                .is_some()
+                            {
+                                eprintln!(
+                                    "JOINT_NATIVE_UNKNOWN successful_response_missing_receipt"
+                                );
+                            }
+                            AuditAdmission::Unknown(handle.clone())
+                        }
                     },
                     // Lookup returns Expired only after a quorum read proved no
                     // receipt exists. Preserve that definite refusal when apply
@@ -740,7 +783,19 @@ impl ConsensusConfigStore {
                     Err(AuditAuthorityError::Expired) if response.result.is_err() => {
                         AuditAdmission::Rejected(AuditAuthorityError::Expired)
                     }
-                    Err(_) => AuditAdmission::Unknown(handle.clone()),
+                    Err(_) => {
+                        #[cfg(test)]
+                        if self
+                            .inner
+                            .durable_progress
+                            .append_observed_from
+                            .get()
+                            .is_some()
+                        {
+                            eprintln!("JOINT_NATIVE_UNKNOWN receipt_refresh");
+                        }
+                        AuditAdmission::Unknown(handle.clone())
+                    }
                 }
             }
         }
@@ -955,9 +1010,7 @@ impl ConsensusConfigStore {
                 .backend
                 .retained_binding
                 .as_ref()
-                .is_none_or(|binding| {
-                    binding.profile() != crate::RetainedConfigProfile::NetconfTargetsV1
-                })
+                .is_none_or(|binding| !binding.mode().is_ok_and(|mode| mode.has_netconf_targets()))
         {
             return Err(AuditAuthorityError::Unavailable);
         }
@@ -973,17 +1026,21 @@ impl ConsensusConfigStore {
         prepared
             .handle()
             .verify(self.inner.backend.audit_key(), self.inner.identity, caller)?;
-        prepared.verify_effect(self.inner.backend.audit_key())
+        prepared.command().verify_for_mode(
+            self.inner.backend.audit_key(),
+            self.inner.identity,
+            caller,
+            self.mode(),
+        )
     }
 
     /// Decode original protected target recovery data for an independently
     /// authenticated caller. This grants no Intent receipt, session or effect
     /// authority. Existing target9 data retains its decoder and representation.
     ///
-    /// The proposed bounded target payload uses a distinct strict decoder and
-    /// reserves before allocation, then authenticates both the original effect
-    /// and record proof. No supported retained mode selects that branch yet:
-    /// target+bounded opening, admission and apply remain closed.
+    /// The explicit bounded Running profile reserves before strict decoding,
+    /// then authenticates the original effect and record proof. Fixed lifecycle
+    /// controls share that decoder; broader target+bounded modes remain closed.
     pub fn decode_prepared_netconf_target(
         &self,
         bytes: &[u8],
@@ -1003,8 +1060,31 @@ impl ConsensusConfigStore {
                     .preparation_admission
                     .try_reserve()
                     .map_err(|_| AuditAuthorityError::Unavailable)?;
-                super::super::audit_mutation::joint_running::recover(
-                    bytes,
+                // Strict native decoding also admits the fixed lifecycle
+                // controls needed to recover this selected Running family.
+                if bytes.len() > super::super::sqlite::CONFIG_CONSENSUS_LOG_ENTRY_MAX_BYTES {
+                    return Err(AuditAuthorityError::InvalidInput);
+                }
+                super::super::config_capacity_decode::json_string_preflight(bytes)?;
+                let decoded = serde_json::from_slice::<
+                    super::super::audit_mutation::joint_running::NativeReceived,
+                >(bytes)
+                .map_err(|_| AuditAuthorityError::InvalidInput)?;
+                if decoded.0.bounded_running().is_none() {
+                    let prepared = super::super::audit_mutation::PreparedTargetMutation::new(
+                        decoded.0.handle.clone(),
+                        decoded.0.effect.clone(),
+                        None,
+                    );
+                    self.verify_netconf_target(&prepared, caller)?;
+                    return Ok(prepared);
+                }
+                let prepared =
+                    super::super::audit_mutation::PreparedTargetMutation::from_native_command(
+                        decoded.0,
+                    );
+                super::super::audit_mutation::joint_running::hydrate(
+                    prepared,
                     reservation,
                     &self.inner.preparation_admission,
                     self.inner.identity,
@@ -1070,19 +1150,22 @@ impl ConsensusConfigStore {
         // ledger before transferring, never releasing/reacquiring, the lease.
         drop(read.ledger);
         let prepared = match read.reservation {
-            Some(reservation) => super::super::audit_mutation::joint_running::hydrate(
-                prepared,
-                reservation,
-                &self.inner.preparation_admission,
-                self.inner.identity,
-                self.inner.backend.audit_key(),
-                caller,
-            )?,
-            None => {
+            Some(reservation) if prepared.bounded_running().is_some() => {
+                super::super::audit_mutation::joint_running::hydrate(
+                    prepared,
+                    reservation,
+                    &self.inner.preparation_admission,
+                    self.inner.identity,
+                    self.inner.backend.audit_key(),
+                    caller,
+                )?
+            }
+            _ => {
                 self.verify_netconf_target(&prepared, caller)?;
                 prepared
             }
         };
+        self.verify_netconf_target(&prepared, caller)?;
         Ok(Some(prepared))
     }
 
@@ -1145,6 +1228,14 @@ impl ConsensusConfigStore {
         &self,
         prepared: &crate::audit_authority::PreparedTargetMutation,
     ) -> Result<SubmissionOwnership, AuditAuthorityError> {
+        if self.mode() == super::super::RetainedConfigMode::NetconfRunningV1
+            && prepared.bounded_running().is_none()
+        {
+            self.verify_netconf_target(prepared, prepared.command().effect.caller)?;
+            return self
+                .reserve_submission()
+                .map_err(|_| AuditAuthorityError::Unavailable);
+        }
         let ownership = prepared
             .begin_submission(&self.inner.preparation_admission, self.capacity_profile())?;
         match ownership {
@@ -1316,7 +1407,10 @@ impl ConsensusConfigStore {
         prepared: &crate::audit_authority::PreparedTargetMutation,
         retire_cleanup: bool,
     ) -> Result<Option<AuditOperationReceipt>, AuditAuthorityError> {
-        self.require_netconf_target_profile()?;
+        self.verify_netconf_target(prepared, prepared.command().effect.caller)?;
+        if retire_cleanup && self.mode() == super::super::RetainedConfigMode::NetconfRunningV1 {
+            return Err(AuditAuthorityError::Unavailable);
+        }
         self.linearizable_barrier()
             .await
             .map_err(|_| AuditAuthorityError::Unavailable)?;
@@ -1338,7 +1432,12 @@ impl ConsensusConfigStore {
                 super::super::sqlite::validate_live_history_schema_for_profile(
                     &tx,
                     cancellation,
-                    crate::RetainedConfigProfile::NetconfTargetsV1,
+                    backend
+                        .retained_binding
+                        .as_ref()
+                        .ok_or_else(unavailable)?
+                        .mode()
+                        .map_err(|_| unavailable())?,
                 )?;
                 let keys = backend.management_audit_keys().ok_or_else(unavailable)?;
                 let ledger = super::super::audit::read_with_keys_sync(
@@ -1374,7 +1473,7 @@ impl ConsensusConfigStore {
                             })
                     })
                 } else {
-                    super::super::audit_targets::preflight_target_sync(
+                    super::super::audit_targets::preflight_target_for_mode_sync(
                         &tx,
                         backend.audit_key(),
                         prepared.command(),
@@ -1382,6 +1481,12 @@ impl ConsensusConfigStore {
                         &keys,
                         now,
                         cancellation,
+                        backend
+                            .retained_binding
+                            .as_ref()
+                            .ok_or_else(unavailable)?
+                            .mode()
+                            .map_err(|_| unavailable())?,
                     )?
                 };
                 cancellation.check_io()?;
@@ -1541,7 +1646,12 @@ impl ConsensusConfigStore {
                 super::super::sqlite::validate_live_history_schema_for_profile(
                     &tx,
                     cancellation,
-                    crate::RetainedConfigProfile::NetconfTargetsV1,
+                    backend
+                        .retained_binding
+                        .as_ref()
+                        .ok_or_else(unavailable)?
+                        .mode()
+                        .map_err(|_| unavailable())?,
                 )?;
                 let keys = backend.management_audit_keys().ok_or_else(unavailable)?;
                 let ledger = super::super::audit::read_with_keys_sync(
@@ -2264,7 +2374,12 @@ impl ConsensusConfigStore {
                 super::super::sqlite::validate_live_history_schema_for_profile(
                     &tx,
                     cancellation,
-                    crate::RetainedConfigProfile::NetconfTargetsV1,
+                    backend
+                        .retained_binding
+                        .as_ref()
+                        .ok_or_else(unavailable)?
+                        .mode()
+                        .map_err(|_| unavailable())?,
                 )?;
                 let keys = backend.management_audit_keys().ok_or_else(unavailable)?;
                 let ledger = super::super::audit::read_with_keys_sync(
@@ -2371,7 +2486,7 @@ impl ConsensusConfigStore {
         )?;
         let prepared =
             crate::audit_authority::PreparedTargetMutation::new(handle, effect, ownership);
-        prepared.verify_effect(self.inner.backend.audit_key())?;
+        self.verify_netconf_target(&prepared, session.caller)?;
         // Both original phases must fit before returning any preparation.
         for (purpose, command) in [
             (
@@ -2464,7 +2579,12 @@ impl ConsensusConfigStore {
                 super::super::sqlite::validate_live_history_schema_for_profile(
                     &tx,
                     cancellation,
-                    crate::RetainedConfigProfile::NetconfTargetsV1,
+                    backend
+                        .retained_binding
+                        .as_ref()
+                        .ok_or_else(unavailable)?
+                        .mode()
+                        .map_err(|_| unavailable())?,
                 )?;
                 let keys = backend.management_audit_keys().ok_or_else(unavailable)?;
                 let ledger = super::super::audit::read_with_keys_sync(
@@ -2580,7 +2700,12 @@ impl ConsensusConfigStore {
                 super::super::sqlite::validate_live_history_schema_for_profile(
                     &tx,
                     cancellation,
-                    crate::RetainedConfigProfile::NetconfTargetsV1,
+                    backend
+                        .retained_binding
+                        .as_ref()
+                        .ok_or_else(unavailable)?
+                        .mode()
+                        .map_err(|_| unavailable())?,
                 )?;
                 let keys = backend.management_audit_keys().ok_or_else(unavailable)?;
                 let ledger = super::super::audit::read_with_keys_sync(
@@ -2640,7 +2765,12 @@ impl ConsensusConfigStore {
                 super::super::sqlite::validate_live_history_schema_for_profile(
                     &tx,
                     cancellation,
-                    crate::RetainedConfigProfile::NetconfTargetsV1,
+                    backend
+                        .retained_binding
+                        .as_ref()
+                        .ok_or_else(unavailable)?
+                        .mode()
+                        .map_err(|_| unavailable())?,
                 )?;
                 let keys = backend.management_audit_keys().ok_or_else(unavailable)?;
                 let ledger = super::super::audit::read_with_keys_sync(
@@ -2770,7 +2900,12 @@ impl ConsensusConfigStore {
                 super::super::sqlite::validate_live_history_schema_for_profile(
                     &tx,
                     cancellation,
-                    crate::RetainedConfigProfile::NetconfTargetsV1,
+                    backend
+                        .retained_binding
+                        .as_ref()
+                        .ok_or_else(unavailable)?
+                        .mode()
+                        .map_err(|_| unavailable())?,
                 )?;
                 let keys = backend.management_audit_keys().ok_or_else(unavailable)?;
                 let ledger = super::super::audit::read_with_keys_sync(
@@ -2976,7 +3111,12 @@ impl ConsensusConfigStore {
                 super::super::sqlite::validate_live_history_schema_for_profile(
                     &tx,
                     cancellation,
-                    crate::RetainedConfigProfile::NetconfTargetsV1,
+                    backend
+                        .retained_binding
+                        .as_ref()
+                        .ok_or_else(unavailable)?
+                        .mode()
+                        .map_err(|_| unavailable())?,
                 )?;
                 let keys = backend.management_audit_keys().ok_or_else(unavailable)?;
                 let ledger = super::super::audit::read_with_keys_sync(
@@ -3101,7 +3241,12 @@ impl ConsensusConfigStore {
                 super::super::sqlite::validate_live_history_schema_for_profile(
                     &tx,
                     cancellation,
-                    crate::RetainedConfigProfile::NetconfTargetsV1,
+                    backend
+                        .retained_binding
+                        .as_ref()
+                        .ok_or_else(unavailable)?
+                        .mode()
+                        .map_err(|_| unavailable())?,
                 )?;
                 let keys = backend.management_audit_keys().ok_or_else(unavailable)?;
                 let ledger = super::super::audit::read_with_keys_sync(
@@ -3347,7 +3492,12 @@ impl ConsensusConfigStore {
                 super::super::sqlite::validate_live_history_schema_for_profile(
                     &tx,
                     cancellation,
-                    crate::RetainedConfigProfile::NetconfTargetsV1,
+                    backend
+                        .retained_binding
+                        .as_ref()
+                        .ok_or_else(unavailable)?
+                        .mode()
+                        .map_err(|_| unavailable())?,
                 )?;
                 let keys = backend.management_audit_keys().ok_or_else(unavailable)?;
                 let ledger = super::super::audit::read_with_keys_sync(
@@ -3593,7 +3743,12 @@ impl ConsensusConfigStore {
                 super::super::sqlite::validate_live_history_schema_for_profile(
                     &tx,
                     cancellation,
-                    crate::RetainedConfigProfile::NetconfTargetsV1,
+                    backend
+                        .retained_binding
+                        .as_ref()
+                        .ok_or_else(unavailable)?
+                        .mode()
+                        .map_err(|_| unavailable())?,
                 )?;
                 let keys = backend.management_audit_keys().ok_or_else(unavailable)?;
                 let ledger = super::super::audit::read_with_keys_sync(

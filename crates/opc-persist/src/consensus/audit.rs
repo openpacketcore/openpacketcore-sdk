@@ -295,6 +295,7 @@ pub(crate) fn apply_sync(
     )
 }
 
+#[cfg(test)]
 pub(crate) fn apply_cancellable_sync(
     conn: &Connection,
     key: &AuditKey,
@@ -303,13 +304,34 @@ pub(crate) fn apply_cancellable_sync(
     keys: Option<&AuditKeyRing>,
     context: &ApplyContext<'_>,
 ) -> io::Result<Result<(), ConfigMutationFailure>> {
+    apply_cancellable_for_mode_sync(
+        conn,
+        key,
+        identity,
+        command,
+        keys,
+        context,
+        super::RetainedConfigMode::NetconfTargetsV1,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn apply_cancellable_for_mode_sync(
+    conn: &Connection,
+    key: &AuditKey,
+    identity: ConfigConsensusIdentity,
+    command: &AuditCommand,
+    keys: Option<&AuditKeyRing>,
+    context: &ApplyContext<'_>,
+    mode: super::RetainedConfigMode,
+) -> io::Result<Result<(), ConfigMutationFailure>> {
     let now = context.logical_time.as_offset_datetime().unix_timestamp();
     let cancellation = context.cancellation;
     cancellation.check_io()?;
     if let AuditCommand::NetconfTarget(command) = command {
         if let super::audit_mutation::TargetAuditCommandV1::Apply(prepared) = &**command {
-            return super::audit_targets::apply_target_sync(
-                conn, key, identity, prepared, keys, context,
+            return super::audit_targets::apply_target_for_mode_sync(
+                conn, key, identity, prepared, keys, context, mode,
             );
         }
     }
