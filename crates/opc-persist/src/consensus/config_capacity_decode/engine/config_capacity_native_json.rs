@@ -12,6 +12,8 @@ use serde_json::ser::Formatter;
 use super::super::{Effect, Intent};
 use super::{ConfigRaftTypeConfig, EntryFields, Payload};
 use crate::consensus::audit_mutation::AuditedConfigEffect;
+#[cfg(all(test, target_os = "linux"))]
+use crate::consensus::storage::config_capacity_native_read_observations as native_io;
 use crate::consensus::types::ConfigMutationIntent;
 
 const FIELD: &[u8] = b"\"encrypted_blob\":";
@@ -160,6 +162,8 @@ fn canonical_entry(bytes: &[u8]) -> io::Result<Option<Entry<ConfigRaftTypeConfig
     if count < MIN_FAST_BYTES {
         return Ok(None);
     }
+    #[cfg(all(test, target_os = "linux"))]
+    native_io::canonical_span(extent, count);
     let end = start + extent;
     // Parse every other field with the original bounded DTO. This borrowed
     // reader allocates no second JSON document. Its parser scratch is dropped
@@ -231,12 +235,23 @@ fn canonical_entry(bytes: &[u8]) -> io::Result<Option<Entry<ConfigRaftTypeConfig
 }
 
 pub(super) fn entry(bytes: &[u8]) -> io::Result<Entry<ConfigRaftTypeConfig>> {
+    #[cfg(all(test, target_os = "linux"))]
+    native_io::phase(native_io::Phase::JsonPreflightBegin);
     super::native_json_preflight(bytes)?;
+    #[cfg(all(test, target_os = "linux"))]
+    native_io::phase(native_io::Phase::JsonPreflightReturned);
+    #[cfg(all(test, target_os = "linux"))]
+    native_io::phase(native_io::Phase::CanonicalBegin);
+
     if let Some(entry) = canonical_entry(bytes)? {
+        #[cfg(all(test, target_os = "linux"))]
+        native_io::route(native_io::Route::Canonical);
         #[cfg(all(test, target_os = "linux"))]
         crate::consensus::store::config_capacity_cost_observation::native_decoded(&entry, true);
         return Ok(entry);
     }
+    #[cfg(all(test, target_os = "linux"))]
+    native_io::route(native_io::Route::Fallback);
     let entry = serde_json::from_slice::<EntryFields>(bytes)
         .map(Into::into)
         .map_err(|_| invalid())?;

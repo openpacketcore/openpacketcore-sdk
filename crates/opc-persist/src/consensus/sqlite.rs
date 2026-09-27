@@ -25,6 +25,8 @@ use serde::Serialize;
 use sha2::{Digest, Sha256};
 
 use super::config_capacity_decode::engine as capacity_decode;
+#[cfg(all(test, target_os = "linux"))]
+use super::storage::config_capacity_native_read_observations as native_io;
 use super::storage::ConfigConsensusStorageError;
 use super::types::{config_storage_revision, LEGACY_CONFIG_CONSENSUS_COMMAND_VERSION};
 use super::{
@@ -34,7 +36,23 @@ use super::{
 use crate::backend::SqliteBackend;
 use crate::types::{AuditKey, AuditOpType, CommitSource};
 
+mod config_capacity_checked_apply_batch;
 mod outcome_authentication;
+
+pub(crate) use config_capacity_checked_apply_batch::ApplyBatch;
+
+macro_rules! native_io_after_success {
+    ($result:expr, $phase:ident) => {{
+        #[cfg(all(test, target_os = "linux"))]
+        {
+            $result.inspect(|_| native_io::phase(native_io::Phase::$phase))
+        }
+        #[cfg(not(all(test, target_os = "linux")))]
+        {
+            $result
+        }
+    }};
+}
 
 pub(crate) struct StagedLegacyRecovery {
     pub(crate) path: PathBuf,
@@ -1787,7 +1805,14 @@ pub(crate) fn save_committed_sync(
         }
         return Ok(());
     };
+    #[cfg(all(test, target_os = "linux"))]
+    native_io::phase(native_io::Phase::TransactionBegin);
     let tx = Transaction::new_unchecked(conn, TransactionBehavior::Immediate).map_err(db_error)?;
+    #[cfg(all(test, target_os = "linux"))]
+    native_io::phase(native_io::Phase::TransactionBegun);
+    #[cfg(all(test, target_os = "linux"))]
+    native_io::phase(native_io::Phase::PointersBegin);
+
     if let Some(current) = read_committed_sync(&tx, identity)? {
         if committed.index < current.index
             || (committed.index == current.index && committed != current)
@@ -1807,6 +1832,10 @@ pub(crate) fn save_committed_sync(
             ));
         }
     }
+    #[cfg(all(test, target_os = "linux"))]
+    native_io::phase(native_io::Phase::PointersValidated);
+    #[cfg(all(test, target_os = "linux"))]
+    native_io::phase(native_io::Phase::LineageBegin);
     if validate_pointer_against_log_sync(&tx, identity, &committed, capacity_profile).is_err() {
         let covered = read_applied_sync(&tx, identity)? == Some(committed)
             || read_purged_sync(&tx, identity)? == Some(committed)
@@ -1818,8 +1847,15 @@ pub(crate) fn save_committed_sync(
             ));
         }
     }
+    #[cfg(all(test, target_os = "linux"))]
+    native_io::phase(native_io::Phase::LineageValidated);
     save_log_pointer(&tx, "config_raft_committed", identity, &committed)?;
-    tx.commit().map_err(db_error)
+    #[cfg(all(test, target_os = "linux"))]
+    native_io::phase(native_io::Phase::PointerWritten);
+    #[cfg(all(test, target_os = "linux"))]
+    native_io::phase(native_io::Phase::CommitBegin);
+
+    native_io_after_success!(tx.commit().map_err(db_error), CommitReturned)
 }
 
 pub(crate) fn read_purged_sync(
@@ -1854,15 +1890,23 @@ fn row_entry(
     let term = checked_u64(row.get(1).map_err(db_error)?)?;
     let index = checked_u64(row.get(2).map_err(db_error)?)?;
     let encoded = row_blob(row, 3)?;
+    #[cfg(all(test, target_os = "linux"))]
+    native_io::row_begin(index, encoded.len());
     if encoded.len() > CONFIG_CONSENSUS_LOG_ENTRY_MAX_BYTES {
         return Err(invalid_data(
             "persisted config consensus log entry exceeds storage limit",
         ));
     }
+    #[cfg(all(test, target_os = "linux"))]
+    if capacity_profile == ConfigCapacityProfile::Legacy {
+        native_io::route(native_io::Route::Legacy);
+    }
     let entry = capacity_decode::native_entry(capacity_profile, encoded)?;
     if term != entry.log_id.leader_id.term || index != entry.log_id.index {
         return Err(invalid_data("persisted config consensus log row mismatch"));
     }
+    #[cfg(all(test, target_os = "linux"))]
+    native_io::row_decoded(&entry);
     Ok(entry)
 }
 
@@ -1871,14 +1915,19 @@ pub(crate) fn last_log_sync(
     identity: ConsensusIdentity,
     capacity_profile: ConfigCapacityProfile,
 ) -> io::Result<Option<LogId<ConsensusNodeId>>> {
+    #[cfg(all(test, target_os = "linux"))]
+    native_io::phase(native_io::Phase::LastLogBegin);
     let mut statement = conn.prepare(
         "SELECT configuration_epoch, term, log_index, entry_json FROM config_raft_log ORDER BY log_index DESC LIMIT 1",
     ).map_err(db_error)?;
     let mut rows = statement.query([]).map_err(db_error)?;
     if let Some(row) = rows.next().map_err(db_error)? {
-        return Ok(Some(row_entry(row, identity, capacity_profile)?.log_id));
+        let log_id = row_entry(row, identity, capacity_profile)?.log_id;
+        #[cfg(all(test, target_os = "linux"))]
+        native_io::phase(native_io::Phase::LastLogReturned);
+        return Ok(Some(log_id));
     }
-    read_purged_sync(conn, identity)
+    native_io_after_success!(read_purged_sync(conn, identity), LastLogReturned)
 }
 
 fn validate_entry(
@@ -2198,6 +2247,9 @@ fn visit_log_rows_unchecked_sync(
             ));
         }
         validate_entry(&entry, identity, expected_members)?;
+        #[cfg(all(test, target_os = "linux"))]
+        native_io::phase(native_io::Phase::EntryValidated);
+
         previous = Some(entry.log_id.index);
         if visit(entry)?.is_break() {
             break;
@@ -2225,9 +2277,19 @@ fn read_log_rows_unchecked_sync(
                     .map_err(|_| invalid_data("config consensus log entry cannot be sized"))
             })
             .transpose()?;
+        #[cfg(all(test, target_os = "linux"))]
+        if read.append_entries_batch {
+            native_io::phase(native_io::Phase::BatchSized);
+        }
         match decision {
-            Some(AppendEntriesBatchDecision::Include) | None => entries.push(entry),
+            Some(AppendEntriesBatchDecision::Include) | None => {
+                #[cfg(all(test, target_os = "linux"))]
+                native_io::row_returned(&entry);
+                entries.push(entry);
+            }
             Some(AppendEntriesBatchDecision::IncludeAndStop) => {
+                #[cfg(all(test, target_os = "linux"))]
+                native_io::row_returned(&entry);
                 entries.push(entry);
                 return Ok(std::ops::ControlFlow::Break(()));
             }
@@ -2391,13 +2453,25 @@ pub(crate) fn append_logs_cancellable_sync(
         encoded_bytes = encoded_bytes
             .checked_add(encoded.len())
             .ok_or_else(|| invalid_data("config consensus log append byte count overflow"))?;
+        #[cfg(all(test, target_os = "linux"))]
+        native_io::encoded(entry, encoded.len());
         encoded_entries.push(encoded);
     }
     #[cfg(test)]
     super::storage::config_capacity_append_observations::observe("entries_encoded");
     cancellation.check_io()?;
+    #[cfg(all(test, target_os = "linux"))]
+    native_io::phase(native_io::Phase::TransactionBegin);
     let tx = Transaction::new_unchecked(conn, TransactionBehavior::Immediate).map_err(db_error)?;
+    #[cfg(all(test, target_os = "linux"))]
+    native_io::phase(native_io::Phase::TransactionBegun);
+    #[cfg(all(test, target_os = "linux"))]
+    native_io::phase(native_io::Phase::PointersBegin);
+
     let (committed, applied, purged) = validate_durable_pointer_relationships_sync(&tx, identity)?;
+    #[cfg(all(test, target_os = "linux"))]
+    native_io::phase(native_io::Phase::PointersValidated);
+
     let floor = [
         last_log_sync(&tx, identity, capacity_profile)?,
         committed,
@@ -2453,7 +2527,9 @@ pub(crate) fn append_logs_cancellable_sync(
     cancellation.check_io()?;
     #[cfg(test)]
     super::storage::config_capacity_append_observations::observe("before_commit");
-    tx.commit().map_err(db_error)
+    #[cfg(all(test, target_os = "linux"))]
+    native_io::phase(native_io::Phase::CommitBegin);
+    native_io_after_success!(tx.commit().map_err(db_error), CommitReturned)
 }
 
 pub(crate) fn truncate_logs_sync(
@@ -2689,6 +2765,8 @@ fn append_prepared_commit_sync(
     cancellation: &SqliteWorkCancellation,
 ) -> io::Result<Result<(), ConfigMutationFailure>> {
     cancellation.check_io()?;
+    #[cfg(all(test, target_os = "linux"))]
+    super::store::config_capacity_native_owner_observation::consuming_commit(commit);
     if commit.validate().is_err() {
         return Ok(Err(ConfigMutationFailure::InvalidInput));
     }
@@ -3002,6 +3080,87 @@ fn create_rollback_point_sync(
     Ok(Ok(()))
 }
 
+// Shared by ordinary and audited dispatch after keyed profile admission.
+// The borrowed commit and binding remain inside their original savepoint.
+#[allow(clippy::too_many_arguments)]
+fn append_bounded_commit_sync(
+    conn: &Connection,
+    commit: &super::PreparedConfigCommit,
+    binding: &super::capacity_record::CapacityRecordBinding,
+    resolution: Option<crate::ConfirmedCommitResolution>,
+    schema_version: u16,
+    logical_time: Timestamp,
+    request_id: opc_consensus::ConsensusRequestId,
+    cancellation: &SqliteWorkCancellation,
+) -> io::Result<Result<(), ConfigMutationFailure>> {
+    let result = append_prepared_commit_sync(
+        conn,
+        commit,
+        resolution,
+        schema_version,
+        logical_time,
+        request_id,
+        cancellation,
+    )?;
+    if result.is_ok() {
+        conn.execute(
+            "INSERT INTO config_raft_capacity_records (tx_id, binding) VALUES (?1, ?2)",
+            params![
+                commit.record.tx_id.as_uuid().as_bytes().as_slice(),
+                binding.encode().as_slice()
+            ],
+        )
+        .map_err(db_error)?;
+    }
+    Ok(result)
+}
+
+fn execute_audited_effect_sync(
+    conn: &Connection,
+    effect: &super::audit_mutation::AuditedConfigEffect,
+    schema_version: u16,
+    logical_time: Timestamp,
+    request_id: opc_consensus::ConsensusRequestId,
+    cancellation: &SqliteWorkCancellation,
+) -> io::Result<Result<(), ConfigMutationFailure>> {
+    use super::audit_mutation::AuditedConfigEffect;
+    match effect {
+        AuditedConfigEffect::BoundedAppend {
+            commit,
+            binding,
+            resolution,
+        } => append_bounded_commit_sync(
+            conn,
+            commit,
+            binding,
+            *resolution,
+            schema_version,
+            logical_time,
+            request_id,
+            cancellation,
+        ),
+        AuditedConfigEffect::Append { commit, resolution } => append_prepared_commit_sync(
+            conn,
+            commit,
+            *resolution,
+            schema_version,
+            logical_time,
+            request_id,
+            cancellation,
+        ),
+        AuditedConfigEffect::Confirm { tx_id } => mark_confirmed_sync(
+            conn,
+            *tx_id,
+            logical_time,
+            request_id,
+            schema_version != LEGACY_CONFIG_CONSENSUS_COMMAND_VERSION,
+        ),
+        AuditedConfigEffect::RollbackPoint { tx_id, label } => {
+            create_rollback_point_sync(conn, *tx_id, label, logical_time, request_id)
+        }
+    }
+}
+
 fn execute_intent_sync(
     conn: &Connection,
     intent: &ConfigMutationIntent,
@@ -3015,30 +3174,16 @@ fn execute_intent_sync(
             commit,
             binding,
             resolution,
-        } => {
-            // The immutable command has already passed keyed profile admission.
-            // This stays inside the same ordinary/audited effect savepoint.
-            let result = append_prepared_commit_sync(
-                conn,
-                commit,
-                *resolution,
-                schema_version,
-                logical_time,
-                request_id,
-                cancellation,
-            )?;
-            if result.is_ok() {
-                conn.execute(
-                    "INSERT INTO config_raft_capacity_records (tx_id, binding) VALUES (?1, ?2)",
-                    params![
-                        commit.record.tx_id.as_uuid().as_bytes().as_slice(),
-                        binding.encode().as_slice()
-                    ],
-                )
-                .map_err(db_error)?;
-            }
-            Ok(result)
-        }
+        } => append_bounded_commit_sync(
+            conn,
+            commit,
+            binding,
+            *resolution,
+            schema_version,
+            logical_time,
+            request_id,
+            cancellation,
+        ),
         ConfigMutationIntent::ManagementAudit(_) | ConfigMutationIntent::AuditedMutation(_) => Err(
             invalid_data("audit command requires its authority dispatcher"),
         ),
@@ -3163,9 +3308,9 @@ fn apply_audited_mutation_sync(
         .map_err(db_error)?;
     let updates = prepared.effect.updates_existing_records();
     let mut result = if live {
-        execute_intent_sync(
+        execute_audited_effect_sync(
             conn,
-            &prepared.effect.intent(),
+            &prepared.effect,
             prepared
                 .effect
                 .minimum_command_version()
@@ -3238,46 +3383,58 @@ pub(crate) fn apply_entries_cancellable_sync(
     conn: &Connection,
     identity: ConsensusIdentity,
     expected_members: &BTreeSet<ConsensusNodeId>,
-    entries: Vec<Entry<ConfigRaftTypeConfig>>,
+    entries: impl Into<ApplyBatch>,
     cancellation: &SqliteWorkCancellation,
     audit_key: &AuditKey,
     audit_keys: Option<&crate::audit_authority::continuity::AuditKeyRing>,
     capacity_profile: ConfigCapacityProfile,
 ) -> io::Result<Vec<ConfigConsensusResponse>> {
+    let batch = entries.into();
+    let check_encoded_size = batch.needs_sizing();
+    let entries = batch.entries();
     #[cfg(all(test, target_os = "linux"))]
     let _caller_ledger_observation =
-        super::store::config_capacity_caller_ledger_observation::NativeApply::start(&entries);
+        super::store::config_capacity_caller_ledger_observation::NativeApply::start(entries);
+    #[cfg(all(test, target_os = "linux"))]
+    let _native_owner_observation =
+        super::store::config_capacity_native_owner_observation::NativeApply::start(conn, entries);
     if entries.len() > CONFIG_CONSENSUS_LOG_APPEND_MAX_ENTRIES {
         return Err(invalid_data(
             "config consensus apply exceeds entry-count limit",
         ));
     }
-    validate_entry_capacities(&entries, identity, audit_key, capacity_profile)?;
+    validate_entry_capacities(entries, identity, audit_key, capacity_profile)?;
     #[cfg(test)]
     super::storage::config_capacity_apply_observations::observe("capacity_validated");
     let mut encoded_bytes = 0_usize;
-    for entry in &entries {
+    for entry in entries {
         #[cfg(all(test, target_os = "linux"))]
         let _cost_scope = super::store::config_capacity_cost_observation::Scope::apply(entry);
         cancellation.check_io()?;
         validate_entry(entry, identity, expected_members)?;
-        let remaining = CONFIG_CONSENSUS_LOG_APPEND_MAX_BYTES
-            .checked_sub(encoded_bytes)
-            .ok_or_else(|| invalid_data("config consensus apply exceeds aggregate byte limit"))?;
-        let entry_budget = CONFIG_CONSENSUS_LOG_ENTRY_MAX_BYTES.min(remaining);
-        let limit_message = if remaining < CONFIG_CONSENSUS_LOG_ENTRY_MAX_BYTES {
-            "config consensus apply exceeds aggregate byte limit"
-        } else {
-            "config consensus apply entry exceeds storage limit"
-        };
-        let encoded_len =
-            json_length_bounded_cancellable(entry, entry_budget, limit_message, cancellation)?;
-        encoded_bytes = encoded_bytes
-            .checked_add(encoded_len)
-            .ok_or_else(|| invalid_data("config consensus apply byte count overflow"))?;
+        if check_encoded_size {
+            let remaining = CONFIG_CONSENSUS_LOG_APPEND_MAX_BYTES
+                .checked_sub(encoded_bytes)
+                .ok_or_else(|| {
+                    invalid_data("config consensus apply exceeds aggregate byte limit")
+                })?;
+            let entry_budget = CONFIG_CONSENSUS_LOG_ENTRY_MAX_BYTES.min(remaining);
+            let limit_message = if remaining < CONFIG_CONSENSUS_LOG_ENTRY_MAX_BYTES {
+                "config consensus apply exceeds aggregate byte limit"
+            } else {
+                "config consensus apply entry exceeds storage limit"
+            };
+            let encoded_len =
+                json_length_bounded_cancellable(entry, entry_budget, limit_message, cancellation)?;
+            encoded_bytes = encoded_bytes
+                .checked_add(encoded_len)
+                .ok_or_else(|| invalid_data("config consensus apply byte count overflow"))?;
+        }
     }
     #[cfg(test)]
     super::storage::config_capacity_apply_observations::observe("entries_encoded");
+    // A size proof does not authorize effects after cancellation or expiry.
+    cancellation.check_io()?;
     let tx = conn.unchecked_transaction().map_err(db_error)?;
     super::history::validate_access_for_profile_sync(
         &tx,
@@ -3294,7 +3451,7 @@ pub(crate) fn apply_entries_cancellable_sync(
     let mut responses = Vec::with_capacity(entries.len());
     #[cfg(test)]
     super::storage::config_capacity_apply_observations::observe("machine_loaded");
-    for entry in entries {
+    for entry in batch.into_entries() {
         cancellation.check_io()?;
         let expected_index = last_applied
             .map(|log_id| {
@@ -4392,6 +4549,8 @@ pub(crate) fn read_current_snapshot_sync(
 
 #[cfg(test)]
 mod tests {
+    #[cfg(target_os = "linux")]
+    mod config_capacity_checked_apply_batch_tests;
     mod config_capacity_outcome_authentication_tests;
 
     use opc_consensus::engine::{CommittedLeaderId, Entry, EntryPayload, LogId, Membership};

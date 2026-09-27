@@ -5,7 +5,9 @@ use std::sync::Arc;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
 use super::preparation::{PreparationOwnership, SubmissionOwnership};
-use super::{ConfigMutationIntent, PreparedConfigCommit};
+#[cfg(test)]
+use super::ConfigMutationIntent;
+use super::PreparedConfigCommit;
 use crate::audit_authority::{AuditAuthorityError, AuditOperationHandle};
 use crate::{AuditKey, ConfirmedCommitResolution};
 use hmac::{Hmac, KeyInit, Mac};
@@ -69,6 +71,7 @@ impl AuditedConfigEffect {
         }
     }
 
+    #[cfg(test)]
     pub(crate) fn intent(&self) -> ConfigMutationIntent {
         match self {
             Self::BoundedAppend {

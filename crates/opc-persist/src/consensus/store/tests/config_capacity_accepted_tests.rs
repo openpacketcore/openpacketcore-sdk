@@ -190,6 +190,18 @@ async fn config_capacity_957_eight_native_accepted_operations_survive_cancellati
         .append_observed_from
         .set(std::time::Instant::now())
         .expect("enable this store's append observations once");
+    let mut native_io_observation =
+        storage::config_capacity_native_read_observations::Registration::new(
+            *store
+                .inner
+                .durable_progress
+                .append_observed_from
+                .get()
+                .expect("observation origin"),
+            std::array::from_fn(|ordinal| {
+                opc_consensus::ConsensusRequestId::from_bytes([0x80 + ordinal as u8; 16])
+            }),
+        );
     let observed_from = tokio::time::Instant::now();
     let deadline = observed_from + store.inner.operation_timeout;
     let mut callers = Vec::with_capacity(8);
@@ -244,6 +256,24 @@ async fn config_capacity_957_eight_native_accepted_operations_survive_cancellati
     })
     .await;
     println!("CONFIG_CAPACITY_EIGHT_NATIVE_STAGE handed_off={} logged={} callers_finished={} available_proposal_permits={} elapsed_ms={} deadline_met={}", hook.accepted.load(std::sync::atomic::Ordering::SeqCst), metrics.borrow().last_log_index.unwrap_or(before).saturating_sub(before), callers.iter().filter(|caller| caller.is_finished()).count(), store.inner.proposal_admission.available_permits(), observed_from.elapsed().as_millis(), logged.is_ok());
+    if logged.is_err() {
+        let (last_log, last_applied, fatal) = {
+            let current = metrics.borrow();
+            (
+                current.last_log_index,
+                current.last_applied.map(|log| log.index),
+                current.running_state.is_err(),
+            )
+        };
+        println!("CONFIG_CAPACITY_EIGHT_LOG_DEADLINE log={:?} applied={:?} fatal={} accepted={} available_proposals={}",
+            last_log,
+            last_applied,
+            fatal,
+            hook.accepted.load(std::sync::atomic::Ordering::SeqCst),
+            store.inner.proposal_admission.available_permits());
+        store.inner.durable_progress.print_native_io_progress();
+        native_io_observation.finish();
+    }
     logged.expect("all eight operations reach the real native log within original deadline");
     assert!(metrics
         .borrow()
@@ -275,10 +305,35 @@ async fn config_capacity_957_eight_native_accepted_operations_survive_cancellati
         deadline,
         Arc::clone(&store.inner.proposal_admission).acquire_many_owned(8),
     )
-    .await
-    .expect("all eight accepted supervisors resolve inside original deadline")
-    .expect("proposal admission remains open");
+    .await;
+    // Read only already-published state. In particular, do not acquire a new
+    // preparation owner, wait for a native worker, or clone a storage owner.
+    if completed.is_err() {
+        let (last_log, last_applied, fatal) = {
+            let current = metrics.borrow();
+            (
+                current.last_log_index,
+                current.last_applied.map(|log| log.index),
+                current.running_state.is_err(),
+            )
+        };
+        println!(
+            "CONFIG_CAPACITY_EIGHT_DEADLINE deadline_met=false elapsed_ms={} accepted={} available_proposals={} log={:?} applied={:?} fatal={}",
+            observed_from.elapsed().as_millis(),
+            hook.accepted.load(std::sync::atomic::Ordering::SeqCst),
+            store.inner.proposal_admission.available_permits(),
+            last_log,
+            last_applied,
+            fatal,
+        );
+        store.inner.durable_progress.print_native_io_progress();
+        native_io_observation.finish();
+    }
+    let completed = completed
+        .expect("all eight accepted supervisors resolve inside original deadline")
+        .expect("proposal admission remains open");
     drop(completed);
+    native_io_observation.finish();
     let recovered_slots: Vec<_> = (0..8)
         .map(|_| {
             store
