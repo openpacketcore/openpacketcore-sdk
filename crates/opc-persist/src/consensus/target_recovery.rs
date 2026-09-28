@@ -64,6 +64,8 @@ impl TargetMutationCommand {
             return Ok(false);
         }
         self.verify_retained(key, identity, original.body.binding.caller)?;
+        #[cfg(all(test, target_os = "linux"))]
+        crate::consensus::audit_targets::history_gate_tests::apply_original_tests::borrowed_verified(original, bytes.len());
         Ok(true)
     }
 
@@ -128,6 +130,11 @@ impl PreparedTargetMutation {
         } else {
             Self::decode(bytes)?
         };
+        #[cfg(all(test, target_os = "linux"))]
+        crate::consensus::audit_targets::history_gate_tests::apply_original_tests::owned_decoded(
+            prepared.handle(),
+            bytes.len(),
+        );
         #[cfg(test)]
         crate::consensus::storage::config_capacity_apply_observations::observe(
             "target_recovery_decoded",
@@ -154,6 +161,11 @@ impl PreparedTargetMutation {
         // acquire its destination reservation before decoding for new work.
         #[cfg(all(test, target_os = "linux"))]
         crate::consensus::audit_targets::history_gate_tests::recovered(original);
+        #[cfg(all(test, target_os = "linux"))]
+        crate::consensus::audit_targets::history_gate_tests::apply_original_tests::owned_verified(
+            original,
+            bytes.len(),
+        );
         Ok(prepared)
     }
 }

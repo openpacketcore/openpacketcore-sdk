@@ -427,6 +427,7 @@ async fn joint_native_running_intent_apply_terminal_debt_reopens_exact_original(
         "JOINT_NATIVE_INTENT_RETAINED_ORIGINAL"
     );
     drop(original);
+    let apply_watch = crate::consensus::audit_targets::history_gate_tests::apply_original_tests::ApplyWatch::start(&handle);
     let receipt = applied_in_phase(
         "apply",
         f.store
@@ -581,6 +582,7 @@ async fn joint_native_running_intent_apply_terminal_debt_reopens_exact_original(
     drop(shared);
     drop(backend);
     drop(dir);
+    apply_watch.assert_native_after_cleanup(bytes.len());
 }
 
 #[tokio::test]

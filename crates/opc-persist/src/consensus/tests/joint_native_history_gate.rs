@@ -829,3 +829,6 @@ fn joint_history_gate_other_profiles_keep_original_paths() {
 
 #[path = "joint_native_receipt_cost.rs"]
 pub(in crate::consensus) mod receipt_cost_tests;
+
+#[path = "joint_native_apply_original.rs"]
+pub(in crate::consensus) mod apply_original_tests;

@@ -165,6 +165,10 @@ fn read_with_original_sync(
     if stored.identity != identity {
         return Err(invalid());
     }
+    #[cfg(all(test, target_os = "linux"))]
+    crate::consensus::audit_targets::history_gate_tests::apply_original_tests::identity_verified(
+        identity,
+    );
     Ok(stored.ledger)
 }
 
@@ -174,9 +178,24 @@ pub(crate) fn read_with_keys_sync(
     keys: Option<&AuditKeyRing>,
     identity: ConfigConsensusIdentity,
 ) -> io::Result<Option<LedgerState>> {
-    let ledger = read_sync(conn, key, identity)?;
+    read_with_keys_and_original_sync(conn, key, keys, identity, None)
+}
+
+// The supplied command is only a representation candidate. Fresh row, entry,
+// identity and continuity authentication still run, and each matching original
+// must pass exact retained-byte comparison and the complete retained verifier.
+pub(super) fn read_with_keys_and_original_sync(
+    conn: &Connection,
+    key: &AuditKey,
+    keys: Option<&AuditKeyRing>,
+    identity: ConfigConsensusIdentity,
+    original: Option<&super::TargetMutationCommand>,
+) -> io::Result<Option<LedgerState>> {
+    let ledger = read_with_original_sync(conn, key, identity, original)?;
     if let Some(ledger) = &ledger {
         ledger.validate_continuity(keys).map_err(|_| invalid())?;
+        #[cfg(all(test, target_os = "linux"))]
+        crate::consensus::audit_targets::history_gate_tests::apply_original_tests::continuity_verified();
     }
     Ok(ledger)
 }
@@ -210,6 +229,10 @@ fn read_verified_with_original_sync(
     stream_state(&stored, key, length, None)?
         .verify_slice(mac)
         .map_err(|_| invalid())?;
+    #[cfg(all(test, target_os = "linux"))]
+    crate::consensus::audit_targets::history_gate_tests::apply_original_tests::row_authenticated(
+        encoded.len(),
+    );
     #[cfg(all(test, target_os = "linux"))]
     super::audit_targets::history_gate_tests::row_authenticated();
     // Canonical authentication is complete. End the immutable row borrow and

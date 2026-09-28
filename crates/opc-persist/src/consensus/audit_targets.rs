@@ -1633,6 +1633,9 @@ pub(crate) fn apply_target_for_mode_sync(
     if conn.is_autocommit() {
         return Err(invalid());
     }
+    #[cfg(all(test, target_os = "linux"))]
+    let observed_apply =
+        history_gate_tests::apply_original_tests::ApplyScope::enter(prepared.handle());
     #[cfg(test)]
     crate::consensus::storage::config_capacity_apply_observations::observe("target_apply_entered");
     if prepared
@@ -1648,7 +1651,20 @@ pub(crate) fn apply_target_for_mode_sync(
     let Some(keys) = keys else {
         return Ok(Err(Failure::InvalidInput));
     };
-    let Some(mut ledger) = super::audit::read_with_keys_sync(conn, key, Some(keys), identity)?
+    // Lend only this immutable bounded command inside the pinned Apply
+    // transaction. This is not an authentication token: the fresh ledger read
+    // and the post-resolution validation each compare its actual retained bytes
+    // and rerun the full verifier. No validation result crosses either call.
+    let borrowed_original = (mode == super::RetainedConfigMode::NetconfRunningV1
+        && prepared.bounded_running().is_some())
+    .then_some(prepared);
+    let Some(mut ledger) = super::audit::read_with_keys_and_original_sync(
+        conn,
+        key,
+        Some(keys),
+        identity,
+        borrowed_original,
+    )?
     else {
         return Ok(Err(Failure::InvalidInput));
     };
@@ -1776,7 +1792,9 @@ pub(crate) fn apply_target_for_mode_sync(
     crate::consensus::storage::config_capacity_apply_observations::observe(
         "target_continuity_sealed",
     );
-    ledger.validate(key, identity).map_err(|_| invalid())?;
+    ledger
+        .validate_with_original(key, identity, borrowed_original)
+        .map_err(|_| invalid())?;
     #[cfg(test)]
     crate::consensus::storage::config_capacity_apply_observations::observe(
         "target_ledger_validated",
@@ -1784,6 +1802,8 @@ pub(crate) fn apply_target_for_mode_sync(
     ledger
         .validate_continuity(Some(keys))
         .map_err(|_| invalid())?;
+    #[cfg(all(test, target_os = "linux"))]
+    history_gate_tests::apply_original_tests::continuity_verified();
     #[cfg(test)]
     crate::consensus::storage::config_capacity_apply_observations::observe(
         "target_continuity_validated",
@@ -1800,6 +1820,8 @@ pub(crate) fn apply_target_for_mode_sync(
     super::audit::write_sync(conn, key, identity, Some(ledger), false)?;
     #[cfg(test)]
     crate::consensus::storage::config_capacity_apply_observations::observe("target_ledger_written");
+    #[cfg(all(test, target_os = "linux"))]
+    observed_apply.complete();
     Ok(result)
 }
 
