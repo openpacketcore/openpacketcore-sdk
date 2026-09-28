@@ -9020,6 +9020,10 @@ impl EbpfGtpuDataplaneBackend {
                 || self.pin_dir(&device.name),
                 |grouped| self.grouped_pin_dir(grouped.device_id),
             );
+        #[cfg(target_os = "linux")]
+        let control_slot = devices
+            .get(&device.ifindex)
+            .map(|managed| Arc::clone(&managed.control_socket));
         drop(devices);
         let related_attempts = self
             .traffic_attempts()?
@@ -9044,6 +9048,18 @@ impl EbpfGtpuDataplaneBackend {
                 stores.remove(&group_key);
             }
         }
+        // Control-port operations are excluded per attachment by this slot, not
+        // by the backend-wide operation lock. Hold it across the hook change so
+        // an in-flight receive, authorization or send linearizes entirely
+        // before the attachment changes; retire it only once removal commits.
+        #[cfg(target_os = "linux")]
+        let mut control_guard = match control_slot.as_ref() {
+            Some(slot) => Some(
+                slot.lock()
+                    .map_err(|_| GtpuError::io("ebpf_control_port_state", poisoned_lock()))?,
+            ),
+            None => None,
+        };
         if retain_grouped {
             self.inner.runtime.suspend_grouped(
                 &device.name,
@@ -9060,6 +9076,10 @@ impl EbpfGtpuDataplaneBackend {
             )?;
         }
         self.devices()?.remove(&device.ifindex);
+        #[cfg(target_os = "linux")]
+        if let Some(guard) = control_guard.as_mut() {
+            guard.retire();
+        }
         self.traffic_sequence_sources()?.remove(&device.ifindex);
         Ok(())
     }
