@@ -159,6 +159,7 @@ jobs:
           grep -Fq 'OPC_GTPU_ORDINARY_INNER_IPV6_PROVEN' "${datapath_log}"
           grep -Fq 'OPC_GTPU_ORDINARY_INNER_IPV6_CLEANUP_PROVEN' "${datapath_log}"
           grep -Fq 'OPC_GTPU_CLEANUP_ACTIVATION_FORWARDS_PROVEN' "${datapath_log}"
+          grep -Fq 'OPC_GTPU_CLEANUP_ACTIVATION_ROLLBACK_PROVEN' "${datapath_log}"
 
           # These lib proofs return Ok early without printing `skipping:` when
           # the environment is not privileged, so the skip check above cannot
@@ -810,6 +811,7 @@ jobs:
           grep -Fq 'OPC_GTPU_ORDINARY_INNER_IPV6_PROVEN' "${datapath_log}"
           grep -Fq 'OPC_GTPU_ORDINARY_INNER_IPV6_CLEANUP_PROVEN' "${datapath_log}"
           grep -Fq 'OPC_GTPU_CLEANUP_ACTIVATION_FORWARDS_PROVEN' "${datapath_log}"
+          grep -Fq 'OPC_GTPU_CLEANUP_ACTIVATION_ROLLBACK_PROVEN' "${datapath_log}"
 
   ebpf-object:
     name: eBPF datapath object rebuild
