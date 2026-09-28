@@ -9,6 +9,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- `opc-proto-gtpv2c`: model TS 29.274 Causes 18 (new PDN type due to network
+  preference) and 19 (new PDN type due to single address bearer only). A
+  Create Session Response carrying either now projects as accepted with its
+  bearer, PGW F-TEIDs and narrowed PAA instead of as a rejection. The
+  procedure-generic `CauseValue::is_accepted` keeps its 16/17 scope; the new
+  `is_create_session_accepted` and `is_new_pdn_type` predicates expose the
+  wider set. `CauseValue` gains two variants. Refs #990.
+
 - `opc-session-net`: remove the duplicate control probe before the first
   bounded frame chunk copy. Preserve cancellation, absolute deadlines, exact
   byte bounds and all pre-publication checks. Refs #972.
