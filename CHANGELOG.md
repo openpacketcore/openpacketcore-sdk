@@ -14,7 +14,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   rules. `None` keeps the previous IPv4 default and wire bytes; a prefix still
   determines the family, and a conflicting explicit family is rejected. IPv4
   and IPv6 rules with the same mark, table and priority are distinct objects.
-  Struct-literal constructors must add `family: None`. Refs #989.
+  Breaking: struct-literal constructors must add `family: None`. Refs #989.
 - `opc-proto-gtpv2c`: model TS 29.274 Causes 18 (new PDN type due to network
   preference) and 19 (new PDN type due to single address bearer only). A
   Create Session Response carrying either now projects as accepted with its
@@ -59,6 +59,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   requested route or scope. IPv6 routes require 1280 bytes. Breaking:
   struct-literal constructors must add
   `locked_mtu: None`, and `RouteMismatch` literals `mtu`. Refs #991.
+- `opc-gtpu-dataplane`: `TftUplinkClassifier` owns a typed `TftUplinkPaaSet`
+  holding at most one IPv4 `/32` and one canonical IPv6 `/64` (TS 23.401
+  5.3.1.2.2, TS 23.402 4.7). IPv6 uplink from any address in the prefix,
+  including RFC 8981 temporary addresses, is classified; an IPv4v6 PDN uses
+  one classifier for both families. `new` stays source-compatible and
+  canonicalizes an IPv6 PAA; `with_paa_set` and `paa_set` are added.
+  Unspecified, loopback, multicast and broadcast PAAs are rejected. The native
+  eBPF backend still rejects any IPv6 family, including a dual set, without
+  truncating it (#988). Closes #987.
+
+  Behaviour changes: `TftUplinkClassifier::paa` now returns the set's primary
+  PAA, which is the IPv4 PAA when present and otherwise the canonical `/64`
+  prefix address with a zero interface identifier, so an IPv6 PAA given to
+  `new` no longer reads back unchanged. `paa` is no longer a `const fn`
+  (breaking for const callers). The mock identifies a PDN's classifier by
+  overlapping PAA set on the attachment: widening or narrowing its families
+  is `Replaced` for either family, exact removal by a set that only overlaps
+  the resident is `Conflict`, and a set spanning two residents is `Conflict`.
+
 - `opc-session-store`: add `FencedTransitionV2RecoveryJournal`, an SDK-owned
   journal that binds a caller-stable `FencedTransitionRequestId` to its
   complete sealed V2 request before dispatch, with #701-equivalent path,
