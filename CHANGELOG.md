@@ -9,6 +9,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- `opc-gtpu-dataplane`: an IPv6 `remove_pdp_context` on an ordinary eBPF
+  attachment no longer falls through to the IPv4 removal by local TEID, which
+  removed the IPv4 context sharing that TEID. Removal is now family-scoped.
 - `opc-route-steering`: `RuleRequest` gains an explicit `family` so mark-only
   policy rules can be created, read back, converged and removed as `AF_INET6`
   rules. `None` keeps the previous IPv4 default and wire bytes; a prefix still
@@ -46,6 +49,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   replacement, shutdown and multihoming failover qualification (Refs #788).
 
 ### Added
+
+- `opc-gtpu-dataplane`: the ordinary eBPF PDP-context API accepts an inner
+  IPv6 PDN prefix. Uplink selects the inner source `/64` plus mark, downlink
+  requires the destination inside the `/64`, and transport stays IPv4. An
+  IPv4v6 PDN is two family-scoped contexts sharing one bearer TEID. Readback,
+  exact removal, restart adoption and cleanup-only recovery are family-aware;
+  `pdp_inner_ipv6_capability()` reports support. The family-tagged authority
+  is retired with the last inner-IPv6 context, so drained attachments stay
+  eligible for legacy terminal-successor recovery. An IPv6 context on a grouped
+  attachment reports `ordinary_inner_ipv6_pdp_on_grouped_attachment`. Refs
+  #986.
 
 - `opc-gtpu-dataplane`: `TftUplinkClassifier` owns a typed `TftUplinkPaaSet`
   holding at most one IPv4 `/32` and one canonical IPv6 `/64` (TS 23.401
