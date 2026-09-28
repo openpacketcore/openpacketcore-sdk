@@ -25,6 +25,8 @@ use rusqlite::{params, Connection, OptionalExtension, Transaction, TransactionBe
 use serde::Serialize;
 use sha2::{Digest, Sha256};
 
+#[cfg(feature = "dangerous-test-hooks")]
+use super::completion_observation::Phase as CompletionPhase;
 use super::config_capacity_decode::engine as capacity_decode;
 #[cfg(all(test, target_os = "linux"))]
 use super::storage::config_capacity_native_read_observations as native_io;
@@ -3626,6 +3628,8 @@ pub(crate) fn apply_entries_cancellable_sync(
     let entries = batch.entries();
     #[cfg(feature = "dangerous-test-hooks")]
     let _completion = super::completion_observation::Batch::current(conn, entries);
+    #[cfg(feature = "dangerous-test-hooks")]
+    let mut _completion_exit = _completion.observe_exit();
     #[cfg(all(test, target_os = "linux"))]
     let _caller_ledger_observation =
         super::store::config_capacity_caller_ledger_observation::NativeApply::start(entries);
@@ -3638,6 +3642,8 @@ pub(crate) fn apply_entries_cancellable_sync(
         ));
     }
     validate_entry_capacities(entries, identity, audit_key, mode)?;
+    #[cfg(feature = "dangerous-test-hooks")]
+    _completion.record_batch_phase(CompletionPhase::ApplyCapacitiesValidated);
     #[cfg(test)]
     super::storage::config_capacity_apply_observations::observe("capacity_validated");
     let mut encoded_bytes = 0_usize;
@@ -3665,6 +3671,8 @@ pub(crate) fn apply_entries_cancellable_sync(
                 .ok_or_else(|| invalid_data("config consensus apply byte count overflow"))?;
         }
     }
+    #[cfg(feature = "dangerous-test-hooks")]
+    _completion.record_batch_phase(CompletionPhase::ApplyEntriesValidated);
     #[cfg(test)]
     super::storage::config_capacity_apply_observations::observe("entries_encoded");
     // A size proof does not authorize effects after cancellation or expiry.
@@ -3678,6 +3686,8 @@ pub(crate) fn apply_entries_cancellable_sync(
         mode,
         cancellation,
     )?;
+    #[cfg(feature = "dangerous-test-hooks")]
+    _completion.record_batch_phase(CompletionPhase::ApplyHistoryAccessValidated);
     #[cfg(test)]
     super::storage::config_capacity_apply_observations::observe("history_access_validated");
     let mut last_applied = read_applied_sync(&tx, identity)?;
@@ -3733,6 +3743,12 @@ pub(crate) fn apply_entries_cancellable_sync(
                 command
                     .validate(identity)
                     .map_err(|_| invalid_data("invalid committed config consensus command"))?;
+                #[cfg(feature = "dangerous-test-hooks")]
+                _completion.record_entry_phase(
+                    CompletionPhase::ApplyCommandValidated,
+                    command.request_id,
+                    entry.log_id.index,
+                );
                 #[cfg(test)]
                 super::storage::config_capacity_apply_observations::observe("command_validated");
                 if let Some((stored_digest, stored_response)) =
@@ -3741,6 +3757,12 @@ pub(crate) fn apply_entries_cancellable_sync(
                     let payload_digest = command
                         .payload_digest()
                         .map_err(|_| invalid_data("config consensus payload digest failed"))?;
+                    #[cfg(feature = "dangerous-test-hooks")]
+                    _completion.record_entry_phase(
+                        CompletionPhase::ApplyCommandDigestsComputed,
+                        command.request_id,
+                        entry.log_id.index,
+                    );
                     #[cfg(test)]
                     super::storage::config_capacity_apply_observations::observe(
                         "payload_digest_computed",
@@ -3768,6 +3790,12 @@ pub(crate) fn apply_entries_cancellable_sync(
                     let (payload_digest, digest) = command
                         .payload_and_applied_digests(sequence, machine.1, logical_time)
                         .map_err(|_| invalid_data("config consensus command digests failed"))?;
+                    #[cfg(feature = "dangerous-test-hooks")]
+                    _completion.record_entry_phase(
+                        CompletionPhase::ApplyCommandDigestsComputed,
+                        command.request_id,
+                        entry.log_id.index,
+                    );
                     #[cfg(test)]
                     {
                         super::storage::config_capacity_apply_observations::observe(
@@ -3864,6 +3892,12 @@ pub(crate) fn apply_entries_cancellable_sync(
                             }
                         }
                     };
+                    #[cfg(feature = "dangerous-test-hooks")]
+                    _completion.record_entry_phase(
+                        CompletionPhase::ApplyIntentReturned,
+                        command.request_id,
+                        entry.log_id.index,
+                    );
                     #[cfg(test)]
                     super::storage::config_capacity_apply_observations::observe("intent_executed");
                     if result.is_ok()
@@ -3922,6 +3956,12 @@ pub(crate) fn apply_entries_cancellable_sync(
                     )?;
                     #[cfg(all(test, target_os = "linux"))]
                     receipt_cost.complete(audit_receipt.is_some());
+                    #[cfg(feature = "dangerous-test-hooks")]
+                    _completion.record_entry_phase(
+                        CompletionPhase::ApplyReceiptRead,
+                        command.request_id,
+                        entry.log_id.index,
+                    );
                     #[cfg(test)]
                     super::storage::config_capacity_apply_observations::observe(
                         "audit_receipt_read",
@@ -3991,11 +4031,15 @@ pub(crate) fn apply_entries_cancellable_sync(
     cancellation.check_io()?;
     #[cfg(test)]
     super::storage::config_capacity_apply_observations::observe("before_commit");
+    #[cfg(feature = "dangerous-test-hooks")]
+    _completion.record_batch_phase(CompletionPhase::ApplyTransactionCommitting);
     tx.commit().map_err(db_error)?;
     #[cfg(test)]
     super::storage::config_capacity_apply_observations::observe("committed");
     #[cfg(feature = "dangerous-test-hooks")]
     _completion.committed();
+    #[cfg(feature = "dangerous-test-hooks")]
+    _completion_exit.committed();
     Ok(responses)
 }
 

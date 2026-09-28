@@ -41,6 +41,25 @@ pub enum Phase {
     ApplyWorkerEntered,
     /// Native apply received the selected transaction prefix containing this index.
     NativeApplyEntered,
+    /// Capacity validation returned for the batch containing this request/index.
+    ApplyCapacitiesValidated,
+    /// Entry validation and any required sizing returned for the selected batch.
+    ApplyEntriesValidated,
+    /// The initial in-transaction history access validation returned.
+    ApplyHistoryAccessValidated,
+    /// The exact selected entry's command validator returned successfully.
+    ApplyCommandValidated,
+    /// Required command digest calculation returned, including replay checks.
+    ApplyCommandDigestsComputed,
+    /// The exact selected entry's intent returned; its effect may be rejected.
+    ApplyIntentReturned,
+    /// The exact selected entry's existing audit receipt read returned.
+    ApplyReceiptRead,
+    /// Immediately before committing the transaction containing this request/index.
+    ApplyTransactionCommitting,
+    /// The native scope exited without observing successful transaction commit.
+    /// Includes error or unwind exits; it does not prove absence of physical effects.
+    NativeApplyExitedBeforeCommitObservation,
     /// The transaction containing this exact request/index returned from commit.
     ApplyTransactionCommitted,
     /// The native result for this index returned to the async storage adapter.
@@ -404,8 +423,48 @@ impl Batch {
         batch
     }
 
+    pub(crate) fn observe_exit(&self) -> NativeExit {
+        NativeExit {
+            batch: *self,
+            commit_observed: false,
+        }
+    }
+
+    pub(crate) fn record_batch_phase(&self, phase: Phase) {
+        self.record(phase, None);
+    }
+
+    pub(crate) fn record_entry_phase(&self, phase: Phase, request: ConsensusRequestId, index: u64) {
+        if self.indices[..self.len].contains(&index) {
+            if let Some(key) = self.key.filter(|key| key.request() == Some(request)) {
+                key.record(phase, Some(index), None);
+            }
+        }
+    }
+
     pub(crate) fn committed(&self) {
         self.record(Phase::ApplyTransactionCommitted, None);
+    }
+}
+
+// Scalar metadata only. Dropping this never changes native cancellation or owners.
+pub(crate) struct NativeExit {
+    batch: Batch,
+    commit_observed: bool,
+}
+
+impl NativeExit {
+    pub(crate) fn committed(&mut self) {
+        self.commit_observed = true;
+    }
+}
+
+impl Drop for NativeExit {
+    fn drop(&mut self) {
+        if !self.commit_observed {
+            self.batch
+                .record(Phase::NativeApplyExitedBeforeCommitObservation, None);
+        }
     }
 }
 
@@ -523,6 +582,49 @@ mod tests {
             [Some(17)],
             "same request on another node must remain separate"
         );
+    }
+
+    #[test]
+    fn completion_observation_internal_phases_keep_exact_entry_and_cutoff() {
+        let progress = ConfigDurableProgress::default();
+        let registration =
+            Registration::new(&progress, node(1), request(1), Instant::now()).unwrap();
+        let batch = Batch::capture(
+            registration.key,
+            [(request(2), 9), (request(1), 9), (request(1), 12)],
+        );
+        batch.record_batch_phase(Phase::ApplyEntriesValidated);
+        batch.record_entry_phase(Phase::ApplyIntentReturned, request(1), 7);
+        batch.record_entry_phase(Phase::ApplyIntentReturned, request(2), 9);
+        batch.record_entry_phase(Phase::ApplyIntentReturned, request(1), 9);
+        {
+            let mut exit = batch.observe_exit();
+            exit.committed();
+        }
+        drop(batch.observe_exit());
+        let snapshot = registration.finish().unwrap();
+        assert_eq!(snapshot.omitted, 0);
+        assert_eq!(
+            snapshot
+                .events
+                .iter()
+                .map(|event| (event.phase, event.index))
+                .collect::<Vec<_>>(),
+            [
+                (Phase::ApplyEntriesValidated, Some(9)),
+                (Phase::ApplyEntriesValidated, Some(12)),
+                (Phase::ApplyIntentReturned, Some(9)),
+                (Phase::NativeApplyExitedBeforeCommitObservation, Some(9)),
+                (Phase::NativeApplyExitedBeforeCommitObservation, Some(12)),
+            ],
+            "batch checkpoints must not misattribute another entry's work"
+        );
+        let replacement =
+            Registration::new(&progress, node(1), request(1), Instant::now()).unwrap();
+        batch.record_entry_phase(Phase::ApplyReceiptRead, request(1), 12);
+        batch.record_batch_phase(Phase::ApplyTransactionCommitting);
+        drop(batch.observe_exit());
+        assert!(replacement.finish().unwrap().events.is_empty());
     }
 
     #[test]

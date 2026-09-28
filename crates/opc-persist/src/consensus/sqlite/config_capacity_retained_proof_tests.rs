@@ -21,6 +21,9 @@ use opc_types::{ConfigVersion, SchemaDigest, TenantId, TxId};
 
 const PROFILE: ConfigCapacityProfile = ConfigCapacityProfile::BoundedV1;
 
+#[path = "config_capacity_retained_proof_tests/same_read_chain.rs"]
+mod same_read_chain;
+
 struct Fixture {
     backend: SqliteBackend,
     options: RetainedConfigOptions,

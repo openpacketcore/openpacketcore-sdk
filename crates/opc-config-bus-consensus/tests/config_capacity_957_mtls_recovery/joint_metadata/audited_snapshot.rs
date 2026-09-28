@@ -143,28 +143,55 @@ async fn commit_audited(
             .iter()
             .find(|snapshot| snapshot.node == leader)
             .expect("native completion trace must bind the original leader");
-        let index = selected
+        let (response_position, response) = selected
             .events
             .iter()
-            .find(|event| event.phase == Phase::EngineResponseOk)
-            .and_then(|event| event.index)
+            .enumerate()
+            .find(|(_, event)| event.phase == Phase::EngineResponseOk)
+            .expect("native completion trace must observe the original engine response");
+        let index = response
+            .index
             .expect("native completion trace must observe the original engine response index");
+        let mut previous_position = None;
         for phase in [
             Phase::ApplyQueued,
             Phase::ApplyWorkerEntered,
             Phase::NativeApplyEntered,
+            Phase::ApplyCapacitiesValidated,
+            Phase::ApplyEntriesValidated,
+            Phase::ApplyHistoryAccessValidated,
+            Phase::ApplyCommandValidated,
+            Phase::ApplyCommandDigestsComputed,
+            Phase::ApplyIntentReturned,
+            Phase::ApplyReceiptRead,
+            Phase::ApplyTransactionCommitting,
             Phase::ApplyTransactionCommitted,
             Phase::NativeApplyReturned,
             Phase::StorageApplyReturned,
         ] {
+            let (position, event) = selected
+                .events
+                .iter()
+                .enumerate()
+                .find(|(_, event)| event.phase == phase && event.index == Some(index))
+                .unwrap_or_else(|| {
+                    panic!("native completion trace omitted matching {phase:?} for original leader/index")
+                });
             assert!(
-                selected
-                    .events
-                    .iter()
-                    .any(|event| event.phase == phase && event.index == Some(index)),
-                "native completion trace omitted matching {phase:?} for original leader/index"
+                previous_position.is_none_or(|previous| previous < position)
+                    && position < response_position
+                    && event.at_us <= response.at_us,
+                "native completion trace out of order at {phase:?} for original leader/index"
             );
+            previous_position = Some(position);
         }
+        assert!(
+            !selected.events.iter().any(|event| {
+                event.phase == Phase::NativeApplyExitedBeforeCommitObservation
+                    && event.index == Some(index)
+            }),
+            "successful original native apply must not report exit before commit observation"
+        );
     }
     Expected {
         record,

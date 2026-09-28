@@ -839,6 +839,11 @@ fn capacity_record_chain_sync(
     use super::capacity_record::CapacityRecordBinding;
     use super::types::ConfigRecordView;
     use std::str::FromStr;
+    let profile = state.profile()?;
+    if profile != ConfigCapacityProfile::BoundedV1 {
+        return Err(corrupt());
+    }
+    cancellation.check_io()?;
     let orphans: bool = conn.query_row(
         "SELECT EXISTS(SELECT 1 FROM config_raft_capacity_records p WHERE NOT EXISTS(SELECT 1 FROM config_history h WHERE h.tx_id = p.tx_id))",
         [], |row| row.get(0),
@@ -912,7 +917,7 @@ fn capacity_record_chain_sync(
         };
         let encrypted_digest = CapacityRecordBinding::decode(blob(8)?)
             .map_err(|_| corrupt())?
-            .verify_borrowed_digest(record, state.identity, key, state.profile()?)
+            .verify_borrowed_digest(record, state.identity, key, profile)
             .map_err(|_| corrupt())?;
         let head = HistoryHead {
             tx_id,
@@ -923,7 +928,7 @@ fn capacity_record_chain_sync(
             digest,
             &head,
             audit_anchor_digest(count, &terminal)?,
-            record_metadata_digest(conn, &head, state.profile()?, cancellation)?,
+            record_metadata_digest(conn, &head, profile, cancellation)?,
         );
     }
     Ok(digest)
