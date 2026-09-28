@@ -707,6 +707,10 @@ impl<'de> Deserialize<'de> for CompactRosterWireRequest {
 pub(crate) enum SessionConsensusTransportRequest {
     Call {
         call_id: uuid::Uuid,
+        #[cfg_attr(
+            all(test, feature = "test-control"),
+            serde(deserialize_with = "inbound_decode_observation::deserialize_request")
+        )]
         request: SessionConsensusWireRequest,
     },
     RosterCall {
@@ -4893,9 +4897,21 @@ where
             Some(payload) => payload,
             None => return Ok(None),
         };
-    serde_json::from_slice(&payload)
-        .map(Some)
-        .map_err(ProtocolError::from)
+    #[cfg(all(test, feature = "test-control"))]
+    {
+        let _owner = inbound_decode_observation::borrow_raw_decode(&payload);
+        let decoded = serde_json::from_slice(&payload)
+            .map(Some)
+            .map_err(ProtocolError::from);
+        inbound_decode_observation::capture_decode_result(&payload, decoded.is_err());
+        decoded
+    }
+    #[cfg(not(all(test, feature = "test-control")))]
+    {
+        serde_json::from_slice(&payload)
+            .map(Some)
+            .map_err(ProtocolError::from)
+    }
 }
 
 pub(crate) async fn read_authenticated_frame_payload_within<R>(
@@ -4998,7 +5014,11 @@ where
     let mut remaining = len;
     while remaining != 0 {
         let chunk_len = remaining.min(chunk.len());
+        #[cfg(all(test, feature = "test-control"))]
+        let owner = inbound_decode_observation::borrow_raw_read(&payload, len);
         read_exact_frame_bytes_until(reader, &mut chunk[..chunk_len], deadline).await?;
+        #[cfg(all(test, feature = "test-control"))]
+        drop(owner);
         payload.extend_from_slice(&chunk[..chunk_len]);
         remaining -= chunk_len;
     }
@@ -5052,6 +5072,9 @@ where
         .map(Some)
         .map_err(|_| ProtocolError::InvalidWireValue)
 }
+
+#[cfg(all(test, feature = "test-control"))]
+pub(crate) mod inbound_decode_observation;
 
 #[cfg(all(test, feature = "test-control"))]
 mod capacity_owner_tests;

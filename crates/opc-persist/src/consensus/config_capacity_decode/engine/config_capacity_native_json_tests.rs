@@ -581,3 +581,143 @@ fn config_capacity_joint_digests_cover_ordinary_and_audited_native_transcripts()
         "CONFIG_CAPACITY_JOINT_DIGEST_EMISSION_RED: ordinary and audited byte/hash oracles completed before emission comparison; observations={emissions:?}"
     );
 }
+
+// One opt-in observation per completed array, outside the per-token loop. This
+// proves the entry decoder actually called the specialized fill; independent
+// full-value and exact-JSON oracles run before the work assertion below.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+struct ValidatedFillCounts {
+    arrays: usize,
+    bytes: usize,
+}
+
+thread_local! {
+    static VALIDATED_FILL_COUNTS: std::cell::Cell<Option<ValidatedFillCounts>> =
+        const { std::cell::Cell::new(None) };
+}
+
+pub(super) fn record_validated_fill(bytes: usize) {
+    VALIDATED_FILL_COUNTS.with(|slot| {
+        if let Some(mut counts) = slot.get() {
+            counts.arrays += 1;
+            counts.bytes += bytes;
+            slot.set(Some(counts));
+        }
+    });
+}
+
+fn observe_validated_fill<R>(f: impl FnOnce() -> R) -> (R, ValidatedFillCounts) {
+    struct Reset;
+    impl Drop for Reset {
+        fn drop(&mut self) {
+            VALIDATED_FILL_COUNTS.with(|slot| slot.set(None));
+        }
+    }
+
+    VALIDATED_FILL_COUNTS.with(|slot| {
+        assert!(slot.replace(Some(ValidatedFillCounts::default())).is_none());
+    });
+    let _reset = Reset;
+    let result = f();
+    let counts = VALIDATED_FILL_COUNTS.with(|slot| slot.get().expect("active fill observation"));
+    (result, counts)
+}
+
+#[test]
+fn config_capacity_native_json_validated_fill_matches_every_adjacent_byte_pair() {
+    // Include every possible adjacent pair, including short tokens immediately
+    // before wider tokens. A match may consume exactly one token, never two.
+    let mut expected = Vec::<u8>::new();
+    for first in 0..=255 {
+        for second in 0..=255 {
+            expected.extend_from_slice(&[first, second]);
+        }
+    }
+    let bytes = serde_json::to_vec(&expected).unwrap();
+    let array = ValidatedArray::new(&bytes).expect("complete canonical preflight");
+    let mut actual = Vec::new();
+    array.fill(&mut actual).expect("validated fill");
+    assert_eq!(
+        actual, expected,
+        "CONFIG_CAPACITY_NATIVE_VALIDATED_FILL_MAPPING_RED"
+    );
+    assert_eq!(actual, serde_json::from_slice::<Vec<u8>>(&bytes).unwrap());
+    assert_eq!(serde_json::to_vec(&actual).unwrap(), bytes);
+    assert_eq!(actual.capacity(), expected.len());
+
+    // Exact end consumption and tiny arrays also exercise the descriptor itself;
+    // the entry decoder retains its unchanged 4096-byte fast-path threshold.
+    for length in [0, 1, 2, 255, 256, 4095, 4096, 4097] {
+        let expected: Vec<u8> = (0..=255).cycle().take(length).collect();
+        let bytes = serde_json::to_vec(&expected).unwrap();
+        let array = ValidatedArray::new(&bytes).unwrap();
+        let mut actual = Vec::new();
+        array.fill(&mut actual).unwrap();
+        assert_eq!(
+            actual, expected,
+            "CONFIG_CAPACITY_NATIVE_VALIDATED_FILL_MAPPING_RED"
+        );
+        assert_eq!(serde_json::to_vec(&actual).unwrap(), bytes);
+        assert_eq!(actual.capacity(), length);
+    }
+}
+
+#[test]
+fn config_capacity_native_json_entry_uses_validated_fill_after_exact_oracles() {
+    for source in [fixture(16_384, None), audited_fixture(16_384)] {
+        let bytes = serde_json::to_vec(&source).unwrap();
+        let expected = original(&bytes).expect("independent bounded Serde decode");
+        let (actual, work) = observe_validated_fill(|| entry(&bytes));
+        let actual = actual.expect("canonical native entry");
+        assert!(
+            actual == expected && actual == source,
+            "CONFIG_CAPACITY_NATIVE_VALIDATED_FILL_MAPPING_RED"
+        );
+        assert_eq!(serde_json::to_vec(&actual).unwrap(), bytes);
+        let decoded = ciphertext(&actual).expect("selected bounded ciphertext");
+        assert_eq!(decoded.len(), 16_384);
+        assert_eq!(
+            work,
+            ValidatedFillCounts {
+                arrays: 1,
+                bytes: decoded.len(),
+            },
+            "CONFIG_CAPACITY_NATIVE_VALIDATED_FILL_WORK_RED: exact values and canonical bytes passed before observing the production fill"
+        );
+    }
+}
+
+#[test]
+fn config_capacity_native_json_validated_fill_rejects_late_invalid_tokens_before_fill() {
+    for source in [fixture(4096, None), audited_fixture(4096)] {
+        let bytes = serde_json::to_vec(&source).unwrap();
+        let body = std::str::from_utf8(&bytes).unwrap();
+        let start = body.find("\"encrypted_blob\":").unwrap() + FIELD.len();
+        let (extent, _) = array_extent(&bytes[start..]).unwrap();
+        let end = start + extent;
+        let last = body[..end - 1].rfind(',').unwrap() + 1;
+        for token in [
+            "256", "-1", "00", "1.0", "1e2", "null", "true", "\"1\"", "[]", "",
+        ] {
+            let mut malformed = body.to_owned();
+            malformed.replace_range(last..end - 1, token);
+            assert!(
+                ValidatedArray::new(&malformed.as_bytes()[start..]).is_none(),
+                "CONFIG_CAPACITY_NATIVE_VALIDATED_FILL_PREFLIGHT_RED"
+            );
+            let expected = original(malformed.as_bytes()).unwrap_err();
+            let (actual, work) = observe_validated_fill(|| entry(malformed.as_bytes()));
+            let actual = actual.unwrap_err();
+            assert_eq!(actual.kind(), expected.kind());
+            assert_eq!(actual.to_string(), expected.to_string());
+            assert_eq!(work, ValidatedFillCounts::default());
+        }
+        // Valid whitespace keeps the original bounded fallback and exact values.
+        let mut noncanonical = body.to_owned();
+        noncanonical.insert(last, ' ');
+        let expected = original(noncanonical.as_bytes()).unwrap();
+        let (actual, work) = observe_validated_fill(|| entry(noncanonical.as_bytes()));
+        assert!(actual.unwrap() == expected);
+        assert_eq!(work, ValidatedFillCounts::default());
+    }
+}

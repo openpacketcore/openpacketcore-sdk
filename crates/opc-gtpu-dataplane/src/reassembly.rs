@@ -1081,6 +1081,152 @@ impl fmt::Debug for GtpuReassemblyOutcome {
     }
 }
 
+/// Stable, redaction-safe reason a backend-authoritative downlink consumer
+/// dropped one received G-PDU.
+///
+/// Every variant is value-free. It is returned by
+/// [`GtpuControlPort::try_receive_downlink`](crate::control_port::GtpuControlPort::try_receive_downlink)
+/// and never carries addresses, TEIDs, marks or packet bytes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum GtpuDownlinkDrop {
+    /// GTP-U framing or the inner packet violates the fast-path invariants,
+    /// or the persisted PDR state is corrupt (dual-map TEID, reserved mark).
+    Malformed,
+    /// The outer endpoint binding, owner journal, grouped generation, or
+    /// complete Active commit graph did not authorize the packet.
+    BindingMismatch(DownlinkBindingMismatch),
+    /// The inner destination is not the session's UE PAA.
+    DestinationMismatch,
+    /// The attachment is not currently authoritative: cleanup-only,
+    /// successor-pending, traffic gate closed, hooks replaced, or a map read
+    /// failed. Nothing is decapsulated while authority is unknown.
+    StateUnavailable,
+}
+
+/// Bounded, value-free counters of one backend-owned downlink consumer.
+///
+/// These count the userspace post-reassembly path of one managed attachment
+/// registration. They are separate from the tc datapath's per-CPU counters
+/// and from the kernel's `/proc/net/snmp` reassembly counters.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct GtpuDownlinkCounters {
+    /// G-PDUs authorized and decapsulated exactly once.
+    pub decapsulated: u64,
+    /// Non-G-PDU messages handed back for control processing.
+    pub control_plane: u64,
+    /// G-PDUs whose TEID selects no installed tunnel (no inner forwarding).
+    pub unknown_tunnel: u64,
+    /// Malformed framing, malformed inner packets and corrupt PDR state.
+    pub malformed: u64,
+    /// Endpoint, owner, generation or commit-graph authorization failures.
+    pub binding_drops: u64,
+    /// Inner destination was not the session PAA.
+    pub destination_mismatches: u64,
+    /// Attachment authority was unavailable when the datagram was processed.
+    pub state_unavailable: u64,
+}
+
+impl GtpuDownlinkCounters {
+    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+    pub(crate) fn record_drop(&mut self, reason: GtpuDownlinkDrop) {
+        let slot = match reason {
+            GtpuDownlinkDrop::Malformed => &mut self.malformed,
+            GtpuDownlinkDrop::BindingMismatch(_) => &mut self.binding_drops,
+            GtpuDownlinkDrop::DestinationMismatch => &mut self.destination_mismatches,
+            GtpuDownlinkDrop::StateUnavailable => &mut self.state_unavailable,
+        };
+        *slot = slot.saturating_add(1);
+    }
+}
+
+/// One authorized inner packet produced from a received G-PDU.
+///
+/// The inner bytes are subscriber traffic. `Debug` exposes only the family
+/// and length; the bearer mark is redacted.
+#[derive(Clone, PartialEq, Eq)]
+pub struct GtpuDecapsulatedDownlink {
+    inner_packet: bytes::Bytes,
+    bearer_mark: Option<GtpBearerMark>,
+    family: crate::model::GtpAddressFamily,
+}
+
+impl fmt::Debug for GtpuDecapsulatedDownlink {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("GtpuDecapsulatedDownlink")
+            .field("family", &self.family)
+            .field("inner_packet_len", &self.inner_packet.len())
+            .field(
+                "bearer_mark",
+                &self.bearer_mark.map(|_| "<redacted>").unwrap_or("default"),
+            )
+            .finish()
+    }
+}
+
+impl GtpuDecapsulatedDownlink {
+    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+    pub(crate) fn new(
+        inner_packet: bytes::Bytes,
+        bearer_mark: Option<GtpBearerMark>,
+        family: crate::model::GtpAddressFamily,
+    ) -> Self {
+        Self {
+            inner_packet,
+            bearer_mark,
+            family,
+        }
+    }
+
+    /// Complete inner IP packet, exactly as carried by the T-PDU.
+    #[must_use]
+    pub fn inner_packet(&self) -> &[u8] {
+        &self.inner_packet
+    }
+
+    /// Consume the event and return the inner packet bytes.
+    #[must_use]
+    pub fn into_inner_packet(self) -> bytes::Bytes {
+        self.inner_packet
+    }
+
+    /// Output bearer mark for XFRM policy selection. `None` is the default
+    /// bearer (mark zero), exactly as the tc fast path stamps it.
+    #[must_use]
+    pub const fn bearer_mark(&self) -> Option<GtpBearerMark> {
+        self.bearer_mark
+    }
+
+    /// Inner packet family.
+    #[must_use]
+    pub const fn family(&self) -> crate::model::GtpAddressFamily {
+        self.family
+    }
+}
+
+/// One event from a backend-authoritative shared GTP-U receive queue.
+///
+/// See [`GtpuControlPort::try_receive_downlink`](crate::control_port::GtpuControlPort::try_receive_downlink).
+#[derive(Debug)]
+#[non_exhaustive]
+pub enum GtpuDownlinkEvent {
+    /// The G-PDU was authorized by the backend's own commit-last map reads
+    /// and decapsulated exactly once. The caller delivers the inner packet
+    /// (route/XFRM injection with the returned mark).
+    Decapsulated(GtpuDecapsulatedDownlink),
+    /// A non-G-PDU message (typed control, unmodelled message or unsupported
+    /// required extension). Use the existing response planners.
+    Control(crate::control_port::GtpuControlDatagram),
+    /// A G-PDU whose TEID currently selects no installed tunnel. It was not
+    /// decapsulated. This is an observation, not an absence receipt: the
+    /// caller must establish tunnel absence before planning an Error
+    /// Indication.
+    UnknownTunnel(crate::control_port::GtpuControlDatagram),
+    /// Fail-closed drop with a bounded typed reason.
+    Dropped(GtpuDownlinkDrop),
+}
+
 /// Post-reassembly downlink consumer: the SDK GTP-U consumer that kernel
 /// reassembly re-enters, backed by the caller's authoritative PDR,
 /// endpoint-binding, and complete commit-graph state.

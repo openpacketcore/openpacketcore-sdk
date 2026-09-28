@@ -23,9 +23,9 @@ fn invalid() -> io::Error {
     crate::consensus::sqlite::invalid_data("invalid bounded config consensus encoding")
 }
 
-// Match the three canonical unsigned-byte token widths directly. Both passes
-// still validate every value and delimiter before any decoded entry escapes;
-// the complete first pass bounds and validates the ciphertext before allocation.
+// Match the three canonical unsigned-byte token widths directly. The complete
+// first pass bounds and validates every ciphertext value and delimiter before
+// allocation. Only that immutable validated span may use the specialized fill.
 fn decimal_byte(bytes: &[u8], index: &mut usize) -> Option<u8> {
     let (value, digits) = match bytes.get(*index..)? {
         [first @ b'1'..=b'2', second @ b'0'..=b'9', third @ b'0'..=b'9', b',' | b']', ..] => {
@@ -64,6 +64,71 @@ fn array_extent(bytes: &[u8]) -> Option<(usize, usize)> {
             b',' => index += 1,
             _ => return None,
         }
+    }
+}
+
+// The constructor is the only production source of this borrowed descriptor.
+// Its complete, allocation-free preflight proves the token grammar, exact count
+// and envelope bound before either metadata parsing or ciphertext allocation.
+// This descriptor borrows one row only; it never caches a decoded entry.
+struct ValidatedArray<'a> {
+    encoded: &'a [u8],
+    count: usize,
+}
+
+impl<'a> ValidatedArray<'a> {
+    fn new(bytes: &'a [u8]) -> Option<Self> {
+        let (extent, count) = array_extent(bytes)?;
+        Some(Self {
+            encoded: bytes.get(..extent)?,
+            count,
+        })
+    }
+
+    fn fill(self, output: &mut Vec<u8>) -> io::Result<()> {
+        if !output.is_empty() {
+            return Err(invalid());
+        }
+        // The descriptor owns no buffer. Reserve exactly the fully validated
+        // count, after the original bounded metadata DTO has selected its field.
+        output
+            .try_reserve_exact(self.count)
+            .map_err(|_| invalid())?;
+        let mut remaining = self.encoded.strip_prefix(b"[").ok_or_else(invalid)?;
+        if self.count == 0 {
+            if remaining != b"]" {
+                return Err(invalid());
+            }
+            remaining = &[];
+        }
+        for _ in 0..self.count {
+            // The first pass proved that each non-delimiter byte is an ASCII
+            // decimal digit, so its low nibble is its exact numeric value.
+            // Shortest-first matching prevents crossing a one-byte token's
+            // delimiter while looking for a wider token. All reads are checked
+            // slice patterns; even the three-nibble arithmetic fits in u16.
+            let (value, rest) = match remaining {
+                [first, b',' | b']', rest @ ..] => (*first & 0x0f, rest),
+                [first, second, b',' | b']', rest @ ..] => {
+                    ((*first & 0x0f) * 10 + (*second & 0x0f), rest)
+                }
+                [first, second, third, b',' | b']', rest @ ..] => {
+                    let value = u16::from(*first & 0x0f) * 100
+                        + u16::from(*second & 0x0f) * 10
+                        + u16::from(*third & 0x0f);
+                    (u8::try_from(value).map_err(|_| invalid())?, rest)
+                }
+                _ => return Err(invalid()),
+            };
+            output.push(value);
+            remaining = rest;
+        }
+        if !remaining.is_empty() || output.len() != self.count {
+            return Err(invalid());
+        }
+        #[cfg(test)]
+        tests::record_validated_fill(output.len());
+        Ok(())
     }
 }
 
@@ -108,8 +173,9 @@ impl Write for MatchesInput<'_> {
 
 // This formatter is only used by the in-memory canonical-equality sink. It
 // does not replace the bounded/cancellable writers used by append or apply.
-// Both complete token passes have already established that `encoded` is the
-// canonical representation of this exact immutable `decoded` buffer.
+// Complete token validation followed by the bounded fill has established that
+// `encoded` is the canonical representation of this exact immutable `decoded`
+// buffer. The independent codec tests cover every adjacent byte-value pair.
 struct CanonicalCiphertext<'a> {
     decoded: &'a [u8],
     encoded: &'a [u8],
@@ -156,9 +222,11 @@ fn canonical_entry(bytes: &[u8]) -> io::Result<Option<Entry<ConfigRaftTypeConfig
         return Ok(None);
     };
     let start = key + FIELD.len();
-    let Some((extent, count)) = array_extent(&bytes[start..]) else {
+    let Some(array) = ValidatedArray::new(&bytes[start..]) else {
         return Ok(None);
     };
+    let extent = array.encoded.len();
+    let count = array.count;
     if count < MIN_FAST_BYTES {
         return Ok(None);
     }
@@ -188,17 +256,9 @@ fn canonical_entry(bytes: &[u8]) -> io::Result<Option<Entry<ConfigRaftTypeConfig
     if !output.is_empty() {
         return Ok(None);
     }
-    // The fixed envelope ceiling and complete count precede this allocation.
-    // Fill exactly that count from the same immutable borrowed input.
-    output.try_reserve_exact(count).map_err(|_| invalid())?;
-    let mut index = start + 1;
-    for _ in 0..count {
-        output.push(decimal_byte(bytes, &mut index).ok_or_else(invalid)?);
-        index += 1;
-    }
-    if index != end {
-        return Err(invalid());
-    }
+    // Reuse only the first pass's immutable, fully validated span. This fill
+    // maps its decimal digits without repeating the full token classification.
+    array.fill(output)?;
     let entry: Entry<ConfigRaftTypeConfig> = fields.into();
     // This binds the selected span to its exact typed field and rejects every
     // speculative mismatch, duplicate/unknown field, alias or reordered form.

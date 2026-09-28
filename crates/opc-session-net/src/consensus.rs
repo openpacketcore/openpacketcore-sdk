@@ -4266,6 +4266,8 @@ mod tests {
     mod negotiated_loss;
     #[cfg(feature = "test-control")]
     mod pending_rpc;
+    #[cfg(feature = "test-control")]
+    mod rejected_decode;
 
     use std::sync::atomic::AtomicUsize;
     use std::sync::Mutex as StdMutex;

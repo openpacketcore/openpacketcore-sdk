@@ -39,6 +39,16 @@ use crate::{
     FENCED_TRANSITION_V2_REQUEST_ID_BYTES,
 };
 
+mod recovery;
+
+pub(crate) use recovery::{canonical_recovery_request, RecoveryJournalAdmission};
+pub use recovery::{
+    FencedTransitionV2RecoveryJournal, FencedTransitionV2RecoveryJournalKey,
+    FENCED_TRANSITION_V2_RECOVERY_JOURNAL_KEY_BYTES,
+    FENCED_TRANSITION_V2_RECOVERY_JOURNAL_MAX_ENTRIES,
+    FENCED_TRANSITION_V2_RECOVERY_RECLAIM_BATCH_MAX,
+};
+
 /// Width of the independent integrity key protecting one prepared journal.
 pub const PREPARED_FENCED_TRANSITION_JOURNAL_KEY_BYTES: usize = 32;
 
