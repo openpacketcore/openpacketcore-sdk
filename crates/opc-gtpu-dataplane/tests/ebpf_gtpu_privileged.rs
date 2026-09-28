@@ -358,6 +358,37 @@ fn parse_link_address(value: &str) -> [u8; 6] {
     address
 }
 
+/// Resolve the harness IPv6 gateway neighbour on `s2bu` before an exact
+/// inner-IPv6 uplink assertion.
+///
+/// The kernel routes an inner IPv6 packet toward `2001:db8:2::10` and must
+/// resolve that neighbour before the frame reaches tc egress. On the el9 5.14
+/// kernel the Neighbor Solicitation is withheld until `s2bu`'s link-local
+/// address completes DAD (about two seconds after link up), so a first packet
+/// sent earlier is held in the neighbour queue past a two-second receive. Wait,
+/// bounded, for DAD to finish and then resolve the neighbour, so every later
+/// send is a single-packet assertion on the tc datapath itself.
+fn resolve_s2bu_ipv6_gateway_neighbour() {
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        let output = Command::new("ip")
+            .args(["-6", "addr", "show", "dev", "s2bu", "tentative"])
+            .output()
+            .expect("read s2bu tentative IPv6 addresses");
+        assert!(output.status.success(), "ip -6 addr show dev s2bu failed");
+        if output.stdout.is_empty() {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "s2bu IPv6 DAD did not complete: {}",
+            String::from_utf8_lossy(&output.stdout)
+        );
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    run("ping", &["-6", "-c", "1", "-W", "1", "2001:db8:2::10"]);
+}
+
 fn main_link_address(interface: &str) -> [u8; 6] {
     let output = Command::new("ip")
         .args(["link", "show", "dev", interface])
@@ -13194,6 +13225,7 @@ async fn ebpf_gtpu_ordinary_inner_ipv6_live_contract() -> Result<(), Box<dyn std
     assert_eq!(pinned_config(&pin_dir), EPDG_S2BU_IP.octets());
 
     run("ping", &["-c", "1", "-W", "1", "192.0.2.10"]);
+    resolve_s2bu_ipv6_gateway_neighbour();
     let pgw = in_netns(&net.pgw_ns, || {
         UdpSocket::bind((PGW_IP, GTPU_PORT)).expect("bind PGW IPv4 GTP-U socket")
     });
