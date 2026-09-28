@@ -2946,6 +2946,11 @@ fn parse_rule_candidate(body: &[u8]) -> Result<Option<ParsedRuleCandidate>, Rout
             fwmark,
             table,
             priority: priority.unwrap_or(0),
+            family: match family {
+                AF_INET => Some(RouteSteeringIpFamily::Ipv4),
+                AF_INET6 => Some(RouteSteeringIpFamily::Ipv6),
+                _ => None,
+            },
         })
     } else {
         None
@@ -3132,15 +3137,13 @@ fn parse_netlink_error(body: &[u8]) -> Result<(), RouteSteeringError> {
 }
 
 fn rule_family(request: &RuleRequest) -> Result<u8, RouteSteeringError> {
-    if let Some(source) = request.source {
-        return Ok(encode_family(source.address));
-    }
-    if let Some(destination) = request.destination {
-        return Ok(encode_family(destination.address));
-    }
-    // `fib_rules` rejects AF_UNSPEC for a mark-only create. Preserve the
-    // existing request shape by applying the same IPv4 default as `ip rule`.
-    Ok(AF_INET)
+    // A prefix determines the family. `fib_rules` rejects AF_UNSPEC for a
+    // mark-only create, so a rule without a prefix uses its explicit family
+    // or, when absent, the same IPv4 default as `ip rule`.
+    Ok(match request.effective_family() {
+        RouteSteeringIpFamily::Ipv4 => AF_INET,
+        RouteSteeringIpFamily::Ipv6 => AF_INET6,
+    })
 }
 
 fn table_header_value(table: u32) -> Result<u8, RouteSteeringError> {
@@ -3633,6 +3636,7 @@ mod tests {
             }),
             table: 1000,
             priority: 100,
+            family: None,
         }
     }
 
@@ -3656,6 +3660,7 @@ mod tests {
             fwmark: None,
             table: 1000,
             priority: 900,
+            family: None,
         }
     }
 
@@ -3682,6 +3687,7 @@ mod tests {
             fwmark: None,
             table: 1000,
             priority: 900,
+            family: None,
         }
     }
 
@@ -3695,6 +3701,7 @@ mod tests {
             fwmark: None,
             table: 1000,
             priority: 900,
+            family: None,
         }
     }
 
@@ -3714,6 +3721,7 @@ mod tests {
             }),
             table: 1000,
             priority: 100,
+            family: None,
         }
     }
 
@@ -3836,8 +3844,113 @@ mod tests {
             fwmark: rule().fwmark,
             table: rule().table,
             priority: rule().priority,
+            family: None,
         };
         assert_eq!(encode_rule_request(&mark_only).unwrap()[0], AF_INET);
+    }
+
+    fn mark_only_rule(family: Option<RouteSteeringIpFamily>) -> RuleRequest {
+        RuleRequest {
+            source: None,
+            destination: None,
+            fwmark: rule().fwmark,
+            table: rule().table,
+            priority: rule().priority,
+            family,
+        }
+    }
+
+    #[test]
+    fn mark_only_rule_family_selects_the_kernel_rule_list() {
+        let explicit_ipv4 = mark_only_rule(Some(RouteSteeringIpFamily::Ipv4));
+        let ipv6 = mark_only_rule(Some(RouteSteeringIpFamily::Ipv6));
+
+        // The implicit and explicit IPv4 forms are the same wire request.
+        assert_eq!(
+            encode_rule_request(&explicit_ipv4).unwrap(),
+            encode_rule_request(&mark_only_rule(None)).unwrap()
+        );
+        let body = encode_rule_request(&ipv6).unwrap();
+        assert_eq!(body[0], AF_INET6);
+        assert_eq!(body[1], 0);
+        assert_eq!(body[2], 0);
+        assert!(attr_payload(&body, FIB_RULE_HEADER_LEN, FRA_SRC).is_none());
+        assert!(attr_payload(&body, FIB_RULE_HEADER_LEN, FRA_DST).is_none());
+        assert_eq!(attr_u32(&body, FIB_RULE_HEADER_LEN, FRA_FWMARK), 0x40);
+        assert_eq!(attr_u32(&body, FIB_RULE_HEADER_LEN, FRA_FWMASK), 0xff);
+        assert_eq!(encode_legacy_rule_request(&ipv6).unwrap()[0], AF_INET6);
+        assert_eq!(encode_rule_dump_request(&ipv6).unwrap()[0], AF_INET6);
+        assert_eq!(
+            encode_rule_dump_request(&mark_only_rule(None)).unwrap()[0],
+            AF_INET
+        );
+    }
+
+    #[test]
+    fn mark_only_rule_readback_never_crosses_families() {
+        let ipv4 = mark_only_rule(None);
+        let ipv6 = mark_only_rule(Some(RouteSteeringIpFamily::Ipv6));
+        // Kernel dump bodies built independently of the family under test.
+        let ipv4_body = encode_rule_request(&ipv4).unwrap();
+        let mut ipv6_body = ipv4_body.clone();
+        ipv6_body[0] = AF_INET6;
+
+        assert_eq!(
+            classify_rule_readback(&ipv6, std::slice::from_ref(&ipv4_body)).unwrap(),
+            RuleReadback::Absent
+        );
+        assert_eq!(
+            classify_rule_readback(&ipv4, std::slice::from_ref(&ipv6_body)).unwrap(),
+            RuleReadback::Absent
+        );
+        assert_eq!(
+            classify_rule_readback(&ipv6, std::slice::from_ref(&ipv6_body)).unwrap(),
+            RuleReadback::ExactPresent
+        );
+        assert_eq!(
+            classify_rule_readback(&ipv6, &[ipv4_body.clone(), ipv6_body.clone()]).unwrap(),
+            RuleReadback::ExactPresent
+        );
+        assert_eq!(
+            classify_rule_readback(&ipv4, &[ipv4_body, ipv6_body.clone()]).unwrap(),
+            RuleReadback::ExactPresent
+        );
+
+        let resident = parse_rule_candidate(&ipv6_body)
+            .unwrap()
+            .unwrap()
+            .resident
+            .unwrap();
+        assert_eq!(resident, ipv6);
+        assert_ne!(resident, ipv4);
+        assert_eq!(resident.effective_family(), RouteSteeringIpFamily::Ipv6);
+    }
+
+    #[test]
+    fn explicit_rule_family_must_match_its_prefix() {
+        let mut conflicting = rule();
+        conflicting.family = Some(RouteSteeringIpFamily::Ipv6);
+        assert!(matches!(
+            encode_rule_request(&conflicting),
+            Err(RouteSteeringError::InvalidConfig {
+                field: "rule.family",
+                ..
+            })
+        ));
+        assert!(matches!(
+            encode_legacy_rule_request(&conflicting),
+            Err(RouteSteeringError::InvalidConfig {
+                field: "rule.family",
+                ..
+            })
+        ));
+        let mut matching = rule();
+        matching.family = Some(RouteSteeringIpFamily::Ipv4);
+        assert_eq!(matching, rule());
+        assert_eq!(
+            encode_rule_request(&matching).unwrap(),
+            encode_rule_request(&rule()).unwrap()
+        );
     }
 
     #[test]
@@ -4052,6 +4165,7 @@ mod tests {
             fwmark: None,
             table: 100,
             priority: 100,
+            family: None,
         };
         assert!(matches!(
             encode_rule_request(&bad_rule),
@@ -4133,6 +4247,7 @@ mod tests {
                 }),
                 table: 1000,
                 priority: 100,
+                family: None,
             };
             let body = encode_legacy_rule_request(&request).unwrap();
             assert_eq!(body[0], expected_family);
@@ -4182,6 +4297,7 @@ mod tests {
                 }),
                 table: 1000,
                 priority: 100,
+                family: None,
             },
             RuleRequest {
                 source: Some(prefix([192, 0, 2, 0], 24)),
@@ -4192,6 +4308,7 @@ mod tests {
                 }),
                 table: 1000,
                 priority: 100,
+                family: None,
             },
         ] {
             let transport = CapturingTransport::default();
@@ -5942,6 +6059,7 @@ mod tests {
             fwmark: None,
             table: 1000,
             priority: 900,
+            family: None,
         };
         let transport = ScriptedTransport::new(vec![
             ScriptedResponse::Dump(Ok(Vec::new())),
@@ -5998,6 +6116,7 @@ mod tests {
             fwmark: None,
             table: 1000,
             priority: 900,
+            family: None,
         };
         let wildcard_body =
             encode_rule_request_with_protocol(&wildcard, Some(LINUX_ROUTE_STEERING_PROTOCOL))
@@ -6417,6 +6536,7 @@ mod tests {
                     fwmark: None,
                     table: 2000,
                     priority: 900,
+                    family: None,
                 })
                 .unwrap(),
             );
@@ -6455,6 +6575,7 @@ mod tests {
                     fwmark: None,
                     table: 2000,
                     priority: 900,
+                    family: None,
                 })
                 .unwrap(),
             );
