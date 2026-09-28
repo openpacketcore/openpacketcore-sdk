@@ -26,7 +26,7 @@ use opc_session_store::{
 use opc_types::SpiffeId;
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::net::{TcpListener, TcpStream};
-use tokio::sync::{Mutex, MutexGuard, Notify, Semaphore, SemaphorePermit};
+use tokio::sync::{Mutex, MutexGuard, Notify, OwnedSemaphorePermit, Semaphore, SemaphorePermit};
 
 use crate::error::{classify_tls_io_error, ProtocolError};
 use crate::identity::{LocalReplicaBinding, RemoteReplicaBinding};
@@ -52,6 +52,23 @@ const DEFAULT_CONSENSUS_IDLE_TIMEOUT: Duration =
     DURABLE_CONSENSUS_TIMING_PROFILE.server_idle_timeout();
 const DEFAULT_CONSENSUS_RPC_TIMEOUT: Duration =
     DURABLE_CONSENSUS_TIMING_PROFILE.server_handler_timeout();
+
+// A call abandoned by its caller (its deadline expired or its future was
+// dropped) may still be executing on the server, which will answer it. The
+// abandoned connection is closed gracefully: the client half-closes its write
+// direction, then reads and discards until the server closes. The server
+// answers within its handler bound, reads the close at its next frame boundary
+// and ends the connection cleanly. Closing abruptly instead makes the server's
+// late response write fail, and the server then records a transport failure
+// that never happened (#1005).
+//
+// Each close is bounded by the server's handler bound plus one cold-connect
+// interval, by a byte budget and by pool shutdown. At most this many closes per
+// peer run at once; any further abandoned connection is closed immediately.
+const ABANDONED_CONSENSUS_CALL_CLOSE_BOUND: Duration = DURABLE_CONSENSUS_TIMING_PROFILE
+    .server_handler_timeout()
+    .saturating_add(DURABLE_CONSENSUS_TIMING_PROFILE.cold_connect_timeout());
+const ABANDONED_CONSENSUS_CALL_CLOSE_LIMIT: usize = 32;
 
 // Cold establishment is contained inside the caller's existing logical
 // deadline. Limiting it to two thirds of the remaining budget guarantees that
@@ -1012,6 +1029,7 @@ struct ConsensusConnectionPool {
     cold_connection: Arc<ConsensusColdConnectionCoordinator>,
     reconnect_gate: Arc<ReconnectGate>,
     shutdown: tokio::sync::watch::Sender<bool>,
+    abandoned_call_closes: Arc<Semaphore>,
 }
 
 impl ConsensusConnectionPool {
@@ -1023,6 +1041,16 @@ impl ConsensusConnectionPool {
             cold_connection: ConsensusColdConnectionCoordinator::new(),
             reconnect_gate: ReconnectGate::new(lifecycle_policy),
             shutdown,
+            abandoned_call_closes: Arc::new(Semaphore::new(ABANDONED_CONSENSUS_CALL_CLOSE_LIMIT)),
+        }
+    }
+
+    fn outstanding_call(&self, connection: ConsensusConnection) -> OutstandingConsensusCall {
+        OutstandingConsensusCall {
+            connection: Some(connection),
+            exchange_complete: false,
+            closes: Arc::clone(&self.abandoned_call_closes),
+            shutdown: self.shutdown.subscribe(),
         }
     }
 
@@ -1108,6 +1136,103 @@ impl ConsensusConnectionPool {
 impl Drop for ConsensusConnectionPool {
     fn drop(&mut self) {
         self.shutdown.send_replace(true);
+    }
+}
+
+/// Owns a connection while one call on it may be outstanding.
+///
+/// Dropping the guard without releasing the connection means the call did not
+/// complete a correlated exchange: its deadline expired, its future was
+/// cancelled, or the stream failed. The connection is then never reused, and
+/// it is closed gracefully so that the server can still deliver the response
+/// of a call it has already admitted.
+struct OutstandingConsensusCall {
+    connection: Option<ConsensusConnection>,
+    exchange_complete: bool,
+    closes: Arc<Semaphore>,
+    shutdown: tokio::sync::watch::Receiver<bool>,
+}
+
+impl OutstandingConsensusCall {
+    fn connection(&mut self) -> Option<&mut ConsensusConnection> {
+        self.connection.as_mut()
+    }
+
+    /// Record that a complete, correlated response was read. No request is
+    /// then outstanding and the connection may be dropped at once.
+    fn complete_exchange(&mut self) {
+        self.exchange_complete = true;
+    }
+
+    fn release(mut self) -> Option<ConsensusConnection> {
+        self.connection.take()
+    }
+}
+
+impl Drop for OutstandingConsensusCall {
+    fn drop(&mut self) {
+        let Some(connection) = self.connection.take() else {
+            return;
+        };
+        if self.exchange_complete {
+            return;
+        }
+        let ConsensusConnection {
+            reader,
+            writer,
+            response_frame_size,
+            lifecycle,
+            ..
+        } = connection;
+        // The connection leaves service now. Only the socket outlives it.
+        drop(lifecycle);
+        let Ok(permit) = Arc::clone(&self.closes).try_acquire_owned() else {
+            return;
+        };
+        let Ok(runtime) = tokio::runtime::Handle::try_current() else {
+            return;
+        };
+        runtime.spawn(close_abandoned_consensus_call(
+            reader,
+            writer,
+            response_frame_size,
+            self.shutdown.clone(),
+            permit,
+        ));
+    }
+}
+
+async fn close_abandoned_consensus_call(
+    mut reader: Box<dyn AsyncRead + Unpin + Send>,
+    mut writer: Box<dyn AsyncWrite + Unpin + Send>,
+    response_frame_size: usize,
+    mut shutdown: tokio::sync::watch::Receiver<bool>,
+    _permit: OwnedSemaphorePermit,
+) {
+    use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+
+    // At most the one outstanding response frame plus TLS record overhead can
+    // legitimately arrive before the server closes.
+    let mut remaining = response_frame_size
+        .saturating_mul(2)
+        .saturating_add(64 * 1024);
+    let close = async move {
+        // TLS close_notify and TCP FIN. The server may still write.
+        if writer.shutdown().await.is_err() {
+            return;
+        }
+        let mut discard = vec![0_u8; 8 * 1024];
+        while remaining > 0 {
+            match reader.read(&mut discard).await {
+                Ok(0) | Err(_) => return,
+                Ok(read) => remaining = remaining.saturating_sub(read),
+            }
+        }
+    };
+    tokio::select! {
+        biased;
+        _ = shutdown.wait_for(|stopped| *stopped) => {}
+        _ = tokio::time::timeout(ABANDONED_CONSENSUS_CALL_CLOSE_BOUND, close) => {}
     }
 }
 
@@ -2536,33 +2661,14 @@ impl RemoteSessionConsensusPeer {
                 // Sample no later than request dispatch, then commit only
                 // after a complete correlated and payload-validated response.
                 // A failed/cancelled write never refreshes this idle epoch.
-                let dispatched_at = tokio::time::Instant::now();
-                let result = self
-                    .call_negotiated(&mut connection, request, deadline)
+                return self
+                    .call_outstanding(
+                        self.connection_pool.outstanding_call(connection),
+                        connection_slot,
+                        request,
+                        deadline,
+                    )
                     .await;
-                if result.is_ok() {
-                    connection.last_successful_correlated_use = Some(dispatched_at);
-                }
-                if result
-                    .as_ref()
-                    .is_ok_and(consensus_response_allows_connection_reuse)
-                {
-                    let now = tokio::time::Instant::now();
-                    if self.connection_is_current(&mut connection, now) {
-                        self.mark_connection_usable(&connection);
-                        *connection_slot = Some(connection);
-                    } else if let Some(reason) = connection.lifecycle.retirement(now) {
-                        let epoch = self.connection_epoch(&connection);
-                        self.seed_connection_credential_retirement_probe(
-                            epoch,
-                            connection.admission_attempt_id,
-                            connection.lifecycle.peer_certificate_effective_expiry(),
-                            reason,
-                        )
-                        .await;
-                    }
-                }
-                return result;
             }
             if let Some(reason) = connection.lifecycle.retirement(now) {
                 let epoch = self.connection_epoch(&connection);
@@ -2636,31 +2742,67 @@ impl RemoteSessionConsensusPeer {
                 .fetch_add(1, Ordering::Relaxed);
             return Err(SessionConsensusPeerError::Unavailable);
         }
-        let dispatched_at = tokio::time::Instant::now();
-        let result = self
-            .call_negotiated(&mut connection, request, deadline)
-            .await;
+        self.call_outstanding(
+            self.connection_pool.outstanding_call(connection),
+            connection_slot,
+            request,
+            deadline,
+        )
+        .await
+    }
+
+    /// Run one negotiated call on a connection owned by `call`, then either
+    /// return the connection to its lane or retire it.
+    ///
+    /// If this future is dropped, or the call ends without a complete
+    /// correlated response, `call` closes the connection gracefully instead
+    /// of reusing it; see [`OutstandingConsensusCall`].
+    async fn call_outstanding(
+        &self,
+        mut call: OutstandingConsensusCall,
+        connection_slot: &mut Option<ConsensusConnection>,
+        request: SessionConsensusWireRequest,
+        deadline: tokio::time::Instant,
+    ) -> Result<SessionConsensusWireResponse, SessionConsensusPeerError> {
+        let result = match call.connection() {
+            Some(connection) => {
+                let dispatched_at = tokio::time::Instant::now();
+                let result = self.call_negotiated(connection, request, deadline).await;
+                if result.is_ok() {
+                    connection.last_successful_correlated_use = Some(dispatched_at);
+                }
+                result
+            }
+            None => Err(SessionConsensusPeerError::Unavailable),
+        };
         if result.is_ok() {
-            connection.last_successful_correlated_use = Some(dispatched_at);
+            call.complete_exchange();
         }
-        if result
+        if !result
             .as_ref()
             .is_ok_and(consensus_response_allows_connection_reuse)
         {
-            let now = tokio::time::Instant::now();
-            if self.connection_is_current(&mut connection, now) {
-                self.mark_connection_usable(&connection);
-                *connection_slot = Some(connection);
-            } else if let Some(reason) = connection.lifecycle.retirement(now) {
-                let epoch = self.connection_epoch(&connection);
-                self.seed_connection_credential_retirement_probe(
-                    epoch,
-                    connection.admission_attempt_id,
-                    connection.lifecycle.peer_certificate_effective_expiry(),
-                    reason,
-                )
-                .await;
-            }
+            return result;
+        }
+        let now = tokio::time::Instant::now();
+        let Some(connection) = call.connection() else {
+            return result;
+        };
+        if self.connection_is_current(connection, now) {
+            self.mark_connection_usable(connection);
+            *connection_slot = call.release();
+        } else if let Some(reason) = connection.lifecycle.retirement(now) {
+            let epoch = self.connection_epoch(connection);
+            let admission_attempt_id = connection.admission_attempt_id;
+            let peer_certificate_effective_expiry =
+                connection.lifecycle.peer_certificate_effective_expiry();
+            self.seed_connection_credential_retirement_probe(
+                epoch,
+                admission_attempt_id,
+                peer_certificate_effective_expiry,
+                reason,
+            )
+            .await;
         }
         result
     }
