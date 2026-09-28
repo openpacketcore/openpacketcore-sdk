@@ -33,6 +33,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- `opc-gtpu-dataplane`: the ordinary eBPF PDP-context API accepts an inner
+  IPv6 PDN prefix. Uplink selects the inner source `/64` plus mark, downlink
+  requires the destination inside the `/64`, and transport stays IPv4. An
+  IPv4v6 PDN is two family-scoped contexts sharing one bearer TEID. Readback,
+  exact removal, restart adoption and cleanup-only recovery are family-aware;
+  `pdp_inner_ipv6_capability()` reports support. Refs #986.
+
 - `opc-session-store`: add `FencedTransitionV2RecoveryJournal`, an SDK-owned
   journal that binds a caller-stable `FencedTransitionRequestId` to its
   complete sealed V2 request before dispatch, with #701-equivalent path,

@@ -70,7 +70,10 @@ async fn ordinary_attachment_installs_reads_and_removes_an_inner_ipv6_context() 
         PdpContextInstallOutcome::Installed
     );
     assert_eq!(
-        backend.read_pdp_context(local_selector(&desired)).await.unwrap(),
+        backend
+            .read_pdp_context(local_selector(&desired))
+            .await
+            .unwrap(),
         PdpContextReadback::Present(desired.clone())
     );
     assert_eq!(
@@ -115,7 +118,10 @@ async fn ordinary_attachment_installs_reads_and_removes_an_inner_ipv6_context() 
         assert!(record.entry(GtpuSessionIpFamily::Ipv4).is_none());
         let entry = record.entry(GtpuSessionIpFamily::Ipv6).unwrap();
         assert!(entry.inner_paa().contains(GtpuEndpointAddress::Ipv6(
-            "2001:db8:45:1:a:b:c:d".parse::<Ipv6Addr>().unwrap().octets()
+            "2001:db8:45:1:a:b:c:d"
+                .parse::<Ipv6Addr>()
+                .unwrap()
+                .octets()
         )));
         assert!(!entry.inner_paa().contains(GtpuEndpointAddress::Ipv6(
             "2001:db8:45:2::1".parse::<Ipv6Addr>().unwrap().octets()
@@ -139,11 +145,17 @@ async fn ordinary_attachment_installs_reads_and_removes_an_inner_ipv6_context() 
         PdpContextInstallOutcome::ExactAlreadyPresent
     );
     assert_eq!(
-        backend.remove_pdp_context_exact(desired.clone()).await.unwrap(),
+        backend
+            .remove_pdp_context_exact(desired.clone())
+            .await
+            .unwrap(),
         PdpContextRemovalOutcome::Removed
     );
     assert_eq!(
-        backend.read_pdp_context(local_selector(&desired)).await.unwrap(),
+        backend
+            .read_pdp_context(local_selector(&desired))
+            .await
+            .unwrap(),
         PdpContextReadback::Absent
     );
     assert_eq!(
@@ -170,11 +182,17 @@ async fn ordinary_ipv4v6_contexts_share_one_bearer_teid_per_family() {
     backend.install_pdp_context(ipv4.clone()).await.unwrap();
     backend.install_pdp_context(ipv6.clone()).await.unwrap();
     assert_eq!(
-        backend.read_pdp_context(local_selector(&ipv4)).await.unwrap(),
+        backend
+            .read_pdp_context(local_selector(&ipv4))
+            .await
+            .unwrap(),
         PdpContextReadback::Present(ipv4.clone())
     );
     assert_eq!(
-        backend.read_pdp_context(local_selector(&ipv6)).await.unwrap(),
+        backend
+            .read_pdp_context(local_selector(&ipv6))
+            .await
+            .unwrap(),
         PdpContextReadback::Present(ipv6.clone())
     );
 
@@ -184,11 +202,17 @@ async fn ordinary_ipv4v6_contexts_share_one_bearer_teid_per_family() {
         .await
         .unwrap();
     assert_eq!(
-        backend.read_pdp_context(local_selector(&ipv6)).await.unwrap(),
+        backend
+            .read_pdp_context(local_selector(&ipv6))
+            .await
+            .unwrap(),
         PdpContextReadback::Absent
     );
     assert_eq!(
-        backend.read_pdp_context(local_selector(&ipv4)).await.unwrap(),
+        backend
+            .read_pdp_context(local_selector(&ipv4))
+            .await
+            .unwrap(),
         PdpContextReadback::Present(ipv4.clone())
     );
 
@@ -198,11 +222,17 @@ async fn ordinary_ipv4v6_contexts_share_one_bearer_teid_per_family() {
         .await
         .unwrap();
     assert_eq!(
-        backend.read_pdp_context(local_selector(&ipv4)).await.unwrap(),
+        backend
+            .read_pdp_context(local_selector(&ipv4))
+            .await
+            .unwrap(),
         PdpContextReadback::Absent
     );
     assert_eq!(
-        backend.read_pdp_context(local_selector(&ipv6)).await.unwrap(),
+        backend
+            .read_pdp_context(local_selector(&ipv6))
+            .await
+            .unwrap(),
         PdpContextReadback::Present(ipv6)
     );
     assert!(runtime.state().far.is_empty());
@@ -230,17 +260,26 @@ async fn ordinary_ipv6_marked_bearers_share_one_prefix() {
     }
     for context in [&default, &dedicated] {
         assert_eq!(
-            backend.read_pdp_context(uplink_selector(context)).await.unwrap(),
+            backend
+                .read_pdp_context(uplink_selector(context))
+                .await
+                .unwrap(),
             PdpContextReadback::Present(context.clone())
         );
     }
     assert_eq!(runtime.state().session_groups.len(), 2);
     assert_eq!(
-        backend.remove_pdp_context_exact(dedicated.clone()).await.unwrap(),
+        backend
+            .remove_pdp_context_exact(dedicated.clone())
+            .await
+            .unwrap(),
         PdpContextRemovalOutcome::Removed
     );
     assert_eq!(
-        backend.read_pdp_context(uplink_selector(&default)).await.unwrap(),
+        backend
+            .read_pdp_context(uplink_selector(&default))
+            .await
+            .unwrap(),
         PdpContextReadback::Present(default)
     );
 }
@@ -286,7 +325,10 @@ async fn ordinary_ipv6_conflicts_are_classified_without_mutation() {
     };
     assert_eq!(conflict.occupied(), PdpContextSelectorOccupancy::Both);
     assert!(matches!(
-        backend.remove_pdp_context_exact(other_peer_teid).await.unwrap(),
+        backend
+            .remove_pdp_context_exact(other_peer_teid)
+            .await
+            .unwrap(),
         PdpContextRemovalOutcome::Conflict(_)
     ));
 
@@ -370,7 +412,10 @@ async fn ordinary_ipv6_install_completes_an_interrupted_publication() {
     ));
     backend.install_pdp_context(desired.clone()).await.unwrap();
     assert_eq!(
-        backend.read_pdp_context(local_selector(&desired)).await.unwrap(),
+        backend
+            .read_pdp_context(local_selector(&desired))
+            .await
+            .unwrap(),
         PdpContextReadback::Present(desired.clone())
     );
 
@@ -398,6 +443,8 @@ async fn ordinary_ipv6_state_survives_backend_restart() {
         backend.create_device(create_request()).await.unwrap();
         backend.install_pdp_context(desired.clone()).await.unwrap();
     }
+    // Model a process restart: pins survive, the tc attachment is re-adopted.
+    suspend_fake_attachment(&mut runtime.state(), S2BU_IFINDEX);
     let restarted = EbpfGtpuDataplaneBackend::with_runtime(runtime.clone());
     restarted.resolve_device("s2bu").await.unwrap();
     assert_eq!(
@@ -419,5 +466,85 @@ async fn ordinary_backend_reports_inner_ipv6_capability() {
     assert_eq!(
         backend.pdp_inner_ipv6_capability(),
         GtpuCapability::Available
+    );
+}
+
+#[tokio::test]
+async fn cleanup_only_recovery_removes_stale_ordinary_ipv6_contexts() {
+    let (backend, runtime) = backend_with_fake();
+    backend.create_device(create_request()).await.unwrap();
+    let ipv4 = context();
+    let ipv6 = ipv6_context();
+    for stale in [&ipv4, &ipv6] {
+        assert_eq!(
+            backend
+                .install_pdp_context_classified(stale.clone())
+                .await
+                .unwrap(),
+            PdpContextInstallOutcome::Installed
+        );
+    }
+    simulate_process_loss(&runtime, false);
+
+    let recovered = EbpfGtpuDataplaneBackend::with_runtime(runtime.clone());
+    assert_eq!(
+        recovered
+            .acquire_cleanup_only_recovery(cleanup_request(
+                Ipv4Addr::new(192, 0, 2, 1),
+                S2BU_IFINDEX,
+            ))
+            .await
+            .unwrap(),
+        RetainedGraphCleanupClassification::Acquired,
+        "the ordinary attachment's own inner-IPv6 authority is cleanup authority"
+    );
+    assert!(!runtime.state().uplink_filter_ready.contains(&S2BU_IFINDEX));
+    assert_eq!(
+        recovered
+            .read_pdp_context(local_selector(&ipv6))
+            .await
+            .unwrap(),
+        PdpContextReadback::Present(ipv6.clone())
+    );
+    for stale in [&ipv6, &ipv4] {
+        assert_eq!(
+            recovered
+                .remove_pdp_context_exact(stale.clone())
+                .await
+                .unwrap(),
+            PdpContextRemovalOutcome::Removed
+        );
+    }
+    let state = runtime.state();
+    assert!(state.session_groups.is_empty());
+    assert!(state.session_uplink_index.is_empty());
+    assert!(state.session_downlink_index.is_empty());
+}
+
+#[tokio::test]
+async fn cleanup_only_recovery_still_refuses_a_grouped_journal_on_an_ordinary_graph() {
+    let (backend, runtime) = backend_with_fake();
+    backend.create_device(create_request()).await.unwrap();
+    backend
+        .install_pdp_context_classified(ipv6_context())
+        .await
+        .unwrap();
+    runtime.state().session_transactions.insert(
+        (S2BU_IFINDEX, [0x5a; GTPU_SESSION_GROUP_ID_LEN]),
+        [0; GTPU_SESSION_TRANSACTION_VALUE_LEN],
+    );
+    simulate_process_loss(&runtime, false);
+
+    let recovered = EbpfGtpuDataplaneBackend::with_runtime(runtime.clone());
+    assert_eq!(
+        recovered
+            .acquire_cleanup_only_recovery(cleanup_request(
+                Ipv4Addr::new(192, 0, 2, 1),
+                S2BU_IFINDEX,
+            ))
+            .await
+            .unwrap(),
+        RetainedGraphCleanupClassification::Refused(RetainedGraphCleanupRefusal::NotCurrentSchema),
+        "a grouped transaction journal is a different writer domain"
     );
 }
