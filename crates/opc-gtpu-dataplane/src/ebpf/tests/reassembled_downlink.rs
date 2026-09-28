@@ -1092,3 +1092,20 @@ async fn ordinary_inner_ipv6_context_decapsulates_through_its_family_authority()
     );
     assert_eq!(counters.decapsulated, 2);
 }
+
+/// The family-tagged entry that carries an ordinary inner-IPv6 context has
+/// no downlink inner MTU field, so an opted-in IPv6 context must be refused
+/// explicitly rather than installed without enforcement.
+#[tokio::test]
+async fn ordinary_inner_ipv6_context_refuses_the_in_tunnel_packet_too_big_opt_in() {
+    let (backend, runtime) = ordinary_fixture(context()).await;
+    let mut ipv6 = ordinary_ipv6_context();
+    ipv6.downlink_inner_mtu = crate::GtpuDownlinkInnerMtu::in_tunnel_packet_too_big(1_300);
+    assert!(matches!(
+        backend.install_pdp_context(ipv6).await,
+        Err(GtpuError::UnsupportedFeature {
+            feature: "downlink_inner_mtu_inner_ipv6"
+        })
+    ));
+    assert!(runtime.state().session_downlink_index.is_empty());
+}
