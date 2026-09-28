@@ -2307,6 +2307,25 @@ pub(crate) trait EbpfGtpuRuntime: Send + Sync + fmt::Debug {
         })
     }
 
+    /// Retire an ordinary attachment's family-tagged device authority once no
+    /// inner-IPv6 state remains, so the drained graph is identical to one
+    /// that never carried inner IPv6.
+    ///
+    /// Only exactly `config` (complete or config-only) is retired. It returns
+    /// `false`, changing nothing, while any record, selector, or transaction
+    /// journal remains. The schema marker is cleared and read back before the
+    /// configuration, so an interrupted retirement leaves a config-only
+    /// authority that a later retirement or install completes.
+    fn retire_ordinary_family_authority(
+        &self,
+        _ifindex: u32,
+        _config: [u8; GTPU_SESSION_CONFIG_VALUE_LEN],
+    ) -> Result<bool, GtpuError> {
+        Err(GtpuError::UnsupportedFeature {
+            feature: "ebpf_ordinary_inner_ipv6",
+        })
+    }
+
     /// Prove the exact grouped schema, config, held pins, live hooks, program
     /// references, and namespace lease for this attachment. Implementations
     /// repeat exact named-map identity around schema/config/live-hook
@@ -11268,7 +11287,7 @@ impl EbpfGtpuDataplaneBackend {
                     });
                 }
                 device.local_ip.ok_or(GtpuError::UnsupportedFeature {
-                    feature: "legacy_ipv4_pdp_on_grouped_attachment",
+                    feature: ordinary_ipv6::ORDINARY_INNER_IPV6_ON_GROUPED_ATTACHMENT,
                 })?
             };
             return self.install_ordinary_ipv6_locked(&request, local_ip);
@@ -11752,7 +11771,11 @@ impl EbpfGtpuDataplaneBackend {
                 .ok_or(GtpuError::NotFound)?;
             if device.local_ip.is_none() {
                 return Err(GtpuError::UnsupportedFeature {
-                    feature: "legacy_ipv4_pdp_on_grouped_attachment",
+                    feature: if request.address_family == GtpAddressFamily::Ipv6 {
+                        ordinary_ipv6::ORDINARY_INNER_IPV6_ON_GROUPED_ATTACHMENT
+                    } else {
+                        "legacy_ipv4_pdp_on_grouped_attachment"
+                    },
                 });
             }
         }
@@ -30240,6 +30263,22 @@ mod aya_runtime {
             .map_err(|_| CurrentIdentityError::Mismatch)?
             .get(&GTPU_SESSION_CONFIG_KEY, 0)
             .map_err(|_| CurrentIdentityError::Indeterminate)?;
+            let canonical_config = GtpuSessionDeviceConfig::decode(&config_ipv6)
+                .is_some_and(|decoded| decoded.encode() == config_ipv6);
+            let local_ip = config
+                .get(&0, 0)
+                .map_err(|_| CurrentIdentityError::Indeterminate)?;
+            // The ordinary attachment's own authority names exactly the
+            // retained IPv4 S2b-U endpoint, no IPv6 endpoint, and has no
+            // grouped transaction journal.
+            let ordinary = canonical_config
+                && local_ip != [0; 4]
+                && !transactions_populated
+                && GtpuSessionDeviceConfig::decode(&config_ipv6).is_some_and(|decoded| {
+                    decoded.local_endpoint(GtpuSessionIpFamily::Ipv4)
+                        == Some(opc_gtpu_ebpf_common::GtpuEndpointAddress::Ipv4(local_ip))
+                        && decoded.local_endpoint(GtpuSessionIpFamily::Ipv6).is_none()
+                });
             let grouped = if config_ipv6 == [0; GTPU_SESSION_CONFIG_VALUE_LEN]
                 && schema == [0; GTPU_SESSION_SCHEMA_MARKER_LEN]
             {
@@ -30247,20 +30286,16 @@ mod aya_runtime {
                     return Err(CurrentIdentityError::Mismatch);
                 }
                 CurrentGroupedAuthority::Uninitialized
-            } else if schema == GTPU_SESSION_SCHEMA_MARKER_VALUE
-                && GtpuSessionDeviceConfig::decode(&config_ipv6)
-                    .is_some_and(|decoded| decoded.encode() == config_ipv6)
-            {
-                let local_ip = config
-                    .get(&0, 0)
-                    .map_err(|_| CurrentIdentityError::Indeterminate)?;
-                let ordinary = local_ip != [0; 4]
-                    && !transactions_populated
-                    && GtpuSessionDeviceConfig::decode(&config_ipv6).is_some_and(|decoded| {
-                        decoded.local_endpoint(GtpuSessionIpFamily::Ipv4)
-                            == Some(opc_gtpu_ebpf_common::GtpuEndpointAddress::Ipv4(local_ip))
-                            && decoded.local_endpoint(GtpuSessionIpFamily::Ipv6).is_none()
-                    });
+            } else if schema == [0; GTPU_SESSION_SCHEMA_MARKER_LEN] && ordinary {
+                // An ordinary authority interrupted between its config and
+                // schema writes (or during retirement). Nothing can have been
+                // published under it; the install path resumes it and the
+                // next removal retires it.
+                if grouped_populated {
+                    return Err(CurrentIdentityError::Mismatch);
+                }
+                CurrentGroupedAuthority::Ordinary { populated: false }
+            } else if schema == GTPU_SESSION_SCHEMA_MARKER_VALUE && canonical_config {
                 if ordinary {
                     CurrentGroupedAuthority::Ordinary {
                         populated: grouped_populated,
@@ -31707,6 +31742,68 @@ mod aya_runtime {
             }
             let _ = write;
             Err(state_indeterminate("ebpf_grouped_schema_write"))
+        }
+
+        fn grouped_schema_clear_verified(ebpf: &mut Ebpf) -> Result<(), GtpuError> {
+            let write = {
+                let map = ebpf.map_mut(MAP_SESSION_SCHEMA).ok_or_else(|| {
+                    GtpuError::io("ebpf_grouped_schema", invalid_data("map missing"))
+                })?;
+                let mut array = Array::<_, [u8; GTPU_SESSION_SCHEMA_MARKER_LEN]>::try_from(map)
+                    .map_err(|error| map_error("ebpf_grouped_schema", error))?;
+                array.set(
+                    GTPU_SESSION_CONFIG_KEY,
+                    [0; GTPU_SESSION_SCHEMA_MARKER_LEN],
+                    0,
+                )
+            };
+            if matches!(
+                Self::grouped_schema_read(ebpf),
+                Ok(observed) if observed == [0; GTPU_SESSION_SCHEMA_MARKER_LEN]
+            ) {
+                return Ok(());
+            }
+            let _ = write;
+            Err(state_indeterminate("ebpf_grouped_schema_clear"))
+        }
+
+        /// Whether any family-tagged record, selector, or transaction journal
+        /// exists in this graph.
+        fn family_tagged_state_populated(
+            ebpf: &Ebpf,
+            operation: &'static str,
+        ) -> Result<bool, GtpuError> {
+            macro_rules! populated {
+                ($name:expr, $key:ty, $value:ty) => {{
+                    let map = ebpf
+                        .map($name)
+                        .ok_or_else(|| state_indeterminate(operation))?;
+                    BpfHashMap::<_, $key, $value>::try_from(map)
+                        .map_err(|_| state_indeterminate(operation))?
+                        .iter()
+                        .next()
+                        .transpose()
+                        .map_err(|_| state_indeterminate(operation))?
+                        .is_some()
+                }};
+            }
+            Ok(populated!(
+                MAP_SESSION_GROUPS,
+                [u8; GTPU_SESSION_GROUP_ID_LEN],
+                [u8; GTPU_SESSION_GROUP_VALUE_LEN]
+            ) || populated!(
+                MAP_SESSION_UPLINK_INDEX,
+                [u8; GTPU_SESSION_UPLINK_KEY_LEN],
+                [u8; GTPU_SESSION_GROUP_REF_LEN]
+            ) || populated!(
+                MAP_SESSION_DOWNLINK_INDEX,
+                [u8; GTPU_SESSION_DOWNLINK_KEY_LEN],
+                [u8; GTPU_SESSION_GROUP_REF_LEN]
+            ) || populated!(
+                MAP_SESSION_TRANSACTIONS,
+                [u8; GTPU_SESSION_GROUP_ID_LEN],
+                [u8; GTPU_SESSION_TRANSACTION_VALUE_LEN]
+            ))
         }
 
         /// Grouped attachment never adopts legacy IPv4 authority. Every
@@ -47352,6 +47449,38 @@ mod aya_runtime {
             })
         }
 
+        fn retire_ordinary_family_authority(
+            &self,
+            ifindex: u32,
+            config: [u8; GTPU_SESSION_CONFIG_VALUE_LEN],
+        ) -> Result<bool, GtpuError> {
+            const OPERATION: &str = "ebpf_ordinary_family_authority_retire";
+            self.with_device(ifindex, OPERATION, |device| {
+                match classify_ordinary_family_authority(
+                    Self::grouped_config_read(&device.ebpf)?,
+                    Self::grouped_schema_read(&device.ebpf)?,
+                )? {
+                    OrdinaryFamilyAuthority::Uninitialized => return Ok(true),
+                    OrdinaryFamilyAuthority::ConfigOnly(existing)
+                    | OrdinaryFamilyAuthority::Initialized(existing)
+                        if existing == config => {}
+                    OrdinaryFamilyAuthority::ConfigOnly(_)
+                    | OrdinaryFamilyAuthority::Initialized(_) => {
+                        return Err(state_indeterminate(OPERATION));
+                    }
+                }
+                if Self::family_tagged_state_populated(&device.ebpf, OPERATION)? {
+                    return Ok(false);
+                }
+                Self::grouped_schema_clear_verified(&mut device.ebpf)?;
+                Self::grouped_config_write_verified(
+                    &mut device.ebpf,
+                    [0; GTPU_SESSION_CONFIG_VALUE_LEN],
+                )?;
+                Ok(true)
+            })
+        }
+
         fn grouped_datapath_usable(
             &self,
             ifindex: u32,
@@ -58086,7 +58215,7 @@ mod tests {
             let grouped_schema_zero = !state.grouped_schema_ready.contains(pin_dir);
             // The ordinary attachment's own inner-IPv6 authority names exactly
             // its retained IPv4 endpoint and has no grouped journal.
-            let ordinary_family = !grouped_schema_zero
+            let ordinary_family = (!grouped_schema_zero || !grouped_populated)
                 && !transactions_populated
                 && state.pinned_config.get(pin_dir).is_some_and(|local_ip| {
                     *local_ip != [0; 4]
@@ -62200,6 +62329,57 @@ mod tests {
                 }
             }
             Ok(())
+        }
+
+        fn retire_ordinary_family_authority(
+            &self,
+            ifindex: u32,
+            config: [u8; GTPU_SESSION_CONFIG_VALUE_LEN],
+        ) -> Result<bool, GtpuError> {
+            let current = self.ordinary_family_authority(ifindex)?;
+            let mut state = self.state();
+            state.operations.push("retire_ordinary_family_authority");
+            Self::fail_if_requested(&mut state, "retire_ordinary_family_authority")?;
+            match current {
+                OrdinaryFamilyAuthority::Uninitialized => return Ok(true),
+                OrdinaryFamilyAuthority::ConfigOnly(existing)
+                | OrdinaryFamilyAuthority::Initialized(existing)
+                    if existing == config => {}
+                OrdinaryFamilyAuthority::ConfigOnly(_)
+                | OrdinaryFamilyAuthority::Initialized(_) => {
+                    return Err(GtpuError::StateIndeterminate {
+                        operation: "ebpf_ordinary_family_authority_retire",
+                    });
+                }
+            }
+            let populated = state
+                .session_groups
+                .keys()
+                .any(|(index, _)| *index == ifindex)
+                || state
+                    .session_uplink_index
+                    .keys()
+                    .any(|(index, _)| *index == ifindex)
+                || state
+                    .session_downlink_index
+                    .keys()
+                    .any(|(index, _)| *index == ifindex)
+                || state
+                    .session_transactions
+                    .keys()
+                    .any(|(index, _)| *index == ifindex);
+            if populated {
+                return Ok(false);
+            }
+            let pin_dir = state
+                .attached
+                .get(&ifindex)
+                .map(|attachment| attachment.pin_dir.clone())
+                .ok_or(GtpuError::NotFound)?;
+            state.grouped_schema_ready.remove(&pin_dir);
+            Self::crash_if_requested(&mut state, "retire_ordinary_family_schema");
+            state.pinned_grouped_config.remove(&pin_dir);
+            Ok(true)
         }
 
         fn grouped_datapath_usable(
@@ -67786,6 +67966,25 @@ mod tests {
                 feature: "legacy_ipv4_pdp_on_grouped_attachment"
             }
         ));
+        // An ordinary inner-IPv6 context names its own family.
+        let ordinary_ipv6 = GtpPdpContext {
+            ms_address: IpAddr::V6("2001:db8:45:1::".parse().unwrap()),
+            ..context()
+        };
+        assert!(matches!(
+            backend.install_pdp_context(ordinary_ipv6.clone()).await,
+            Err(GtpuError::UnsupportedFeature {
+                feature: "ordinary_inner_ipv6_pdp_on_grouped_attachment"
+            })
+        ));
+        assert!(matches!(
+            backend
+                .remove_pdp_context(RemovePdpContextRequest::from_context(&ordinary_ipv6))
+                .await,
+            Err(GtpuError::UnsupportedFeature {
+                feature: "ordinary_inner_ipv6_pdp_on_grouped_attachment"
+            })
+        ));
 
         let group = grouped_group(
             11,
@@ -67828,10 +68027,12 @@ mod tests {
             ))
             .await
             .unwrap_err();
+        // The grouped entry is inner IPv6, so the ordinary removal names that
+        // family rather than the legacy IPv4 path.
         assert!(matches!(
             legacy_remove_error,
             GtpuError::UnsupportedFeature {
-                feature: "legacy_ipv4_pdp_on_grouped_attachment"
+                feature: "ordinary_inner_ipv6_pdp_on_grouped_attachment"
             }
         ));
         let grouped_after_legacy_remove = {

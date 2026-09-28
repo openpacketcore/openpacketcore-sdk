@@ -16,18 +16,32 @@
 //! transaction journal, and selector stamps are never used on an ordinary
 //! attachment.
 //!
-//! Publication writes both selectors before the authority record, so tc drops
-//! (rather than falls back) while a publication is incomplete. Removal deletes
-//! the authority record first, which fences the context in tc before either
-//! selector is removed. An interrupted publication or removal is completed by
-//! the next ordinary install or family-scoped removal; readback reports it as
-//! indeterminate.
+//! Publication writes the downlink selector, then the uplink selector, then
+//! the authority record, so tc drops (rather than falls back) while a
+//! publication is incomplete. Removal deletes the authority record first,
+//! which fences the context in tc, then the uplink selector, then the downlink
+//! selector. The downlink selector is therefore the first written and the last
+//! removed: every interrupted publication or removal retains it, so the
+//! family-scoped removal by local TEID always reaches the whole residue. An
+//! interrupted publication or removal is completed by the next ordinary
+//! install or family-scoped removal; readback reports it as indeterminate.
+//!
+//! The authority exists only while inner-IPv6 state does. The removal that
+//! drains the last record, selector, and journal retires it (schema marker,
+//! then configuration), so a drained graph is identical to one that never
+//! carried inner IPv6. An interrupted retirement is completed by the next
+//! family-scoped removal on the attachment.
 
 use super::*;
 use crate::GtpuSessionGroupId;
 use opc_gtpu_ebpf_common::{GtpuSessionPaa, GTPU_SESSION_IPV6_SLOT};
 
 const OPERATION: &str = "ebpf_ordinary_inner_ipv6";
+
+/// Feature reported when an inner-IPv6 PDP context targets a grouped
+/// attachment, which has no ordinary IPv4 S2b-U endpoint.
+pub(super) const ORDINARY_INNER_IPV6_ON_GROUPED_ATTACHMENT: &str =
+    "ordinary_inner_ipv6_pdp_on_grouped_attachment";
 
 /// Validated projection of one ordinary inner-IPv6 PDP context.
 #[derive(Clone, Copy)]
@@ -178,6 +192,30 @@ fn context_from_entry(entry: EbpfSessionEntry, ifindex: u32) -> Option<GtpPdpCon
 }
 
 impl EbpfGtpuDataplaneBackend {
+    /// IPv4 S2b-U endpoint of the ordinary attachment owning inner IPv6.
+    fn ordinary_ipv6_local_ip_locked(&self, ifindex: u32) -> Result<Ipv4Addr, GtpuError> {
+        self.devices()?
+            .get(&ifindex)
+            .ok_or(GtpuError::NotFound)?
+            .local_ip
+            .ok_or(GtpuError::UnsupportedFeature {
+                feature: ORDINARY_INNER_IPV6_ON_GROUPED_ATTACHMENT,
+            })
+    }
+
+    /// Retire the authority once no inner-IPv6 state remains on the
+    /// attachment; while any remains, keep it unchanged.
+    fn retire_drained_ordinary_ipv6_authority_locked(
+        &self,
+        ifindex: u32,
+        config: GtpuSessionDeviceConfig,
+    ) -> Result<(), GtpuError> {
+        self.inner
+            .runtime
+            .retire_ordinary_family_authority(ifindex, config.encode())
+            .map(|_| ())
+    }
+
     /// Return the validated family-tagged authority of an ordinary attachment.
     ///
     /// `None` means it was never initialized, so no inner-IPv6 context can be
@@ -306,7 +344,7 @@ impl EbpfGtpuDataplaneBackend {
         ifindex: u32,
         local_teid: Teid,
     ) -> Result<PdpContextReadback, GtpuError> {
-        let local_ip = self.managed_local_ip_locked(ifindex)?;
+        let local_ip = self.ordinary_ipv6_local_ip_locked(ifindex)?;
         let Some((config, _)) = self.ordinary_ipv6_authority_locked(ifindex, local_ip)? else {
             return Ok(PdpContextReadback::Absent);
         };
@@ -328,7 +366,7 @@ impl EbpfGtpuDataplaneBackend {
         bearer_mark: Option<GtpBearerMark>,
     ) -> Result<PdpContextReadback, GtpuError> {
         let paa = ordinary_ipv6_paa(ms_address, "pdp.selector.ms_address")?;
-        let local_ip = self.managed_local_ip_locked(ifindex)?;
+        let local_ip = self.ordinary_ipv6_local_ip_locked(ifindex)?;
         let Some((config, _)) = self.ordinary_ipv6_authority_locked(ifindex, local_ip)? else {
             return Ok(PdpContextReadback::Absent);
         };
@@ -515,14 +553,15 @@ impl EbpfGtpuDataplaneBackend {
             Some(plan.entry),
         )
         .ok_or_else(indeterminate)?;
+        // Downlink first: it is the selector the TEID-scoped removal reaches.
         self.put_ordinary_ipv6_selector_locked(
             ifindex,
-            GroupedIndexKey::Uplink(plan.uplink_key),
+            GroupedIndexKey::Downlink(plan.downlink_key),
             encoded_reference,
         )?;
         self.put_ordinary_ipv6_selector_locked(
             ifindex,
-            GroupedIndexKey::Downlink(plan.downlink_key),
+            GroupedIndexKey::Uplink(plan.uplink_key),
             encoded_reference,
         )?;
         let key = reference.group_id().to_bytes();
@@ -546,13 +585,14 @@ impl EbpfGtpuDataplaneBackend {
     /// The authority record is deleted first so tc fences the context before
     /// either selector is removed. A retained selector whose record is absent
     /// is an interrupted publication or removal; its exact selector inventory
-    /// is removed.
+    /// is removed. When no inner-IPv6 state remains afterwards, the
+    /// attachment's authority is retired.
     pub(super) fn remove_ordinary_ipv6_locked(
         &self,
         ifindex: u32,
         local_teid: Teid,
     ) -> Result<(), GtpuError> {
-        let local_ip = self.managed_local_ip_locked(ifindex)?;
+        let local_ip = self.ordinary_ipv6_local_ip_locked(ifindex)?;
         let Some((config, _)) = self.ordinary_ipv6_authority_locked(ifindex, local_ip)? else {
             return Ok(());
         };
@@ -563,7 +603,9 @@ impl EbpfGtpuDataplaneBackend {
             .runtime
             .session_downlink_get(ifindex, downlink_key)?
         else {
-            return Ok(());
+            // Nothing of this context remains; complete an interrupted
+            // retirement if the attachment has drained.
+            return self.retire_drained_ordinary_ipv6_authority_locked(ifindex, config);
         };
         let (reference, entry) =
             self.read_ordinary_ipv6_reference_locked(ifindex, config, encoded_reference)?;
@@ -637,7 +679,7 @@ impl EbpfGtpuDataplaneBackend {
                 return Err(indeterminate());
             }
         }
-        Ok(())
+        self.retire_drained_ordinary_ipv6_authority_locked(ifindex, config)
     }
 }
 

@@ -935,12 +935,19 @@ Each IPv6 context is stored in the family-tagged tc authority as one
 single-entry record and exactly its uplink and downlink selectors, under the
 ordinary per-device writer gate; IPv4 contexts keep their byte-exact v5 maps.
 The first IPv6 install publishes the attachment's IPv4 endpoint and a random
-device identity in `GTPU_CONFIG6`/`GTPU_SCHEMA6`. Publication writes both
-selectors before the record, so tc drops rather than falls back while it is
-incomplete; removal deletes the record first. An interrupted publication or
-removal reads back as indeterminate and is completed by the next ordinary
-install or family-scoped removal. Cleanup-only recovery accepts this ordinary
-family authority (its own IPv4 endpoint, no IPv6 endpoint, no grouped journal)
+device identity in `GTPU_CONFIG6` and then `GTPU_SCHEMA6`. The removal that
+drains the last IPv6 record, selector and journal retires both (schema, then
+config), so a drained attachment is identical to one that never carried inner
+IPv6 and legacy terminal-successor recovery accepts it. Publication writes the
+downlink selector, the uplink selector, then the record, so tc drops rather
+than falls back while it is incomplete; removal deletes the record, the uplink
+selector, then the downlink selector. The downlink selector is thus present in
+every interrupted state, and the family-scoped removal by local TEID always
+reaches the whole residue. An interrupted publication, removal or retirement
+reads back as indeterminate and is completed by the next ordinary install or
+family-scoped removal. Cleanup-only recovery accepts this ordinary family
+authority (its own IPv4 endpoint, no IPv6 endpoint, no grouped journal),
+including a config-only authority left between the two initialization writes,
 and removes stale IPv6 contexts exactly. Outer-IPv4 fragments carrying an inner
 IPv6 G-PDU are passed to the host, as for the grouped path, and are not
 reassembled into the datapath.
