@@ -1,0 +1,247 @@
+//! Bounded, payload-free classification of a qualification child's stderr.
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum ChildStderrDiagnostic {
+    Unavailable,
+    Empty,
+    QualificationNodeFailed,
+    QualificationNodeTransportFailed,
+    QualificationNodeSqliteFailed,
+    QualificationNodeConsensusFailed,
+    QualificationNodeListenerFailed,
+    InitializationFailed {
+        stage: &'static str,
+        error_class: &'static str,
+    },
+    Redacted,
+}
+
+fn initialization_failure(line: &[u8]) -> Option<ChildStderrDiagnostic> {
+    let suffix = line.strip_prefix(b"qualification node initialize failed: ")?;
+    let split = suffix.iter().position(|byte| *byte == b' ')?;
+    let (stage, classes): (&'static str, &[&'static str]) = match &suffix[..split] {
+        b"cluster" => (
+            "cluster",
+            &[
+                "PersistenceModeMismatch",
+                "SnapshotIntegrityUnavailable",
+                "DynamicConsensusUnsupportedPlatform",
+                "InvalidTopology",
+                "PeerSetMismatch",
+                "RecoveryRequired",
+                "DurableIdentityMismatch",
+                "StorageUnavailable",
+                "FixedQuorumUnsupportedPlatform",
+                "InvalidRuntimeConfiguration",
+                "EngineUnavailable",
+                "ClusterFormationRejected",
+                "CandidateTransitionCancelled",
+            ],
+        ),
+        stage @ (b"fenced_transition" | b"protected_roster_v2") => (
+            if stage == b"fenced_transition" {
+                "fenced_transition"
+            } else {
+                "protected_roster_v2"
+            },
+            &[
+                "BackendUnavailable",
+                "CasIdempotencyOutcomeUnavailable",
+                "BackendOperationOutcomeUnavailable",
+                "LeaseLostOrInvalid",
+                "Other",
+            ],
+        ),
+        _ => return None,
+    };
+    let error_class = classes
+        .iter()
+        .copied()
+        .find(|class| class.as_bytes() == &suffix[split + 1..])?;
+    // Both fields come from literals above, never from child-supplied text.
+    Some(ChildStderrDiagnostic::InitializationFailed { stage, error_class })
+}
+
+pub(super) fn classify(bytes: &[u8], truncated: bool) -> ChildStderrDiagnostic {
+    if bytes.iter().all(u8::is_ascii_whitespace) {
+        return ChildStderrDiagnostic::Empty;
+    }
+    if truncated {
+        return ChildStderrDiagnostic::Redacted;
+    }
+    let mut initialization = None;
+    let mut open_failures = [false; 4];
+    for line in bytes
+        .split(|byte| *byte == b'\n')
+        .filter(|line| !line.is_empty())
+    {
+        match line {
+            b"qualification node failed" => {}
+            b"qualification node open failed: transport" => {
+                initialization = None;
+                open_failures[0] = true;
+            }
+            b"qualification node open failed: sqlite" => {
+                initialization = None;
+                open_failures[1] = true;
+            }
+            b"qualification node open failed: consensus" => {
+                initialization = None;
+                open_failures[2] = true;
+            }
+            b"qualification node open failed: listener" => {
+                initialization = None;
+                open_failures[3] = true;
+            }
+            _ => match initialization_failure(line) {
+                Some(failure) => initialization = Some(failure),
+                None => return ChildStderrDiagnostic::Redacted,
+            },
+        }
+    }
+    if let Some(failure) = initialization {
+        return failure;
+    }
+    if open_failures[3] {
+        ChildStderrDiagnostic::QualificationNodeListenerFailed
+    } else if open_failures[2] {
+        ChildStderrDiagnostic::QualificationNodeConsensusFailed
+    } else if open_failures[1] {
+        ChildStderrDiagnostic::QualificationNodeSqliteFailed
+    } else if open_failures[0] {
+        ChildStderrDiagnostic::QualificationNodeTransportFailed
+    } else {
+        ChildStderrDiagnostic::QualificationNodeFailed
+    }
+}
+
+#[test]
+fn initialization_stages_and_payload_free_classes_are_observable() {
+    for (stage, class) in [
+        ("cluster", "RecoveryRequired"),
+        ("cluster", "EngineUnavailable"),
+        ("cluster", "ClusterFormationRejected"),
+        ("fenced_transition", "BackendUnavailable"),
+        ("protected_roster_v2", "BackendOperationOutcomeUnavailable"),
+    ] {
+        let line = format!("qualification node initialize failed: {stage} {class}\n");
+        assert_eq!(
+            classify(line.as_bytes(), false),
+            ChildStderrDiagnostic::InitializationFailed {
+                stage,
+                error_class: class
+            },
+        );
+    }
+}
+
+#[test]
+fn initialization_diagnostics_reject_payloads_and_unknown_or_truncated_lines() {
+    let valid = b"qualification node initialize failed: cluster RecoveryRequired\n";
+    assert_eq!(classify(valid, true), ChildStderrDiagnostic::Redacted);
+    for suffix in [
+        "cluster RecoveryRequired extra",
+        "cluster BackendUnavailable",
+        "protected_roster_v2 RecoveryRequired",
+        "unknown Other",
+        "cluster RecoveryRequired\r",
+        "cluster RecoveryRequired\nprivate text",
+    ] {
+        let line = format!("qualification node initialize failed: {suffix}\n");
+        assert_eq!(
+            classify(line.as_bytes(), false),
+            ChildStderrDiagnostic::Redacted
+        );
+    }
+    let mut invalid_utf8 = valid.to_vec();
+    invalid_utf8.push(0xff);
+    assert_eq!(
+        classify(&invalid_utf8, false),
+        ChildStderrDiagnostic::Redacted
+    );
+}
+
+#[test]
+fn most_recent_initialization_failure_is_reported() {
+    let lines = b"qualification node initialize failed: cluster RecoveryRequired\nqualification node initialize failed: protected_roster_v2 BackendUnavailable\nqualification node failed\n";
+    assert_eq!(
+        classify(lines, false),
+        ChildStderrDiagnostic::InitializationFailed {
+            stage: "protected_roster_v2",
+            error_class: "BackendUnavailable",
+        },
+    );
+}
+
+#[test]
+fn newer_open_failure_supersedes_old_initialization_diagnostic() {
+    let initialization = "qualification node initialize failed: cluster RecoveryRequired";
+    for (kind, expected) in [
+        (
+            "transport",
+            ChildStderrDiagnostic::QualificationNodeTransportFailed,
+        ),
+        (
+            "sqlite",
+            ChildStderrDiagnostic::QualificationNodeSqliteFailed,
+        ),
+        (
+            "consensus",
+            ChildStderrDiagnostic::QualificationNodeConsensusFailed,
+        ),
+        (
+            "listener",
+            ChildStderrDiagnostic::QualificationNodeListenerFailed,
+        ),
+    ] {
+        let open = format!("qualification node open failed: {kind}");
+        let newer_open = format!("{initialization}\n{open}\nqualification node failed\n");
+        assert_eq!(classify(newer_open.as_bytes(), false), expected);
+        let newer_initialize = format!("{open}\nqualification node failed\n{initialization}\n");
+        assert_eq!(
+            classify(newer_initialize.as_bytes(), false),
+            ChildStderrDiagnostic::InitializationFailed {
+                stage: "cluster",
+                error_class: "RecoveryRequired",
+            },
+        );
+    }
+}
+
+#[test]
+fn existing_open_failure_priority_and_redaction_are_preserved() {
+    assert_eq!(classify(b" \n\t", false), ChildStderrDiagnostic::Empty);
+    for (line, expected) in [
+        (
+            "qualification node failed",
+            ChildStderrDiagnostic::QualificationNodeFailed,
+        ),
+        (
+            "qualification node open failed: transport",
+            ChildStderrDiagnostic::QualificationNodeTransportFailed,
+        ),
+        (
+            "qualification node open failed: sqlite",
+            ChildStderrDiagnostic::QualificationNodeSqliteFailed,
+        ),
+        (
+            "qualification node open failed: consensus",
+            ChildStderrDiagnostic::QualificationNodeConsensusFailed,
+        ),
+        (
+            "qualification node open failed: listener",
+            ChildStderrDiagnostic::QualificationNodeListenerFailed,
+        ),
+    ] {
+        assert_eq!(classify(line.as_bytes(), false), expected);
+        let contaminated = format!("{line}\nprivate text");
+        assert_eq!(
+            classify(contaminated.as_bytes(), false),
+            ChildStderrDiagnostic::Redacted
+        );
+    }
+    assert_eq!(
+        classify(b"qualification node open failed: listener\nqualification node open failed: transport\n", false),
+        ChildStderrDiagnostic::QualificationNodeListenerFailed,
+    );
+}

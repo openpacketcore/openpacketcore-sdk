@@ -1,8 +1,11 @@
 #![cfg(target_os = "linux")]
 
+#[path = "qualification_mtls_multiprocess/child_stderr.rs"]
+mod child_stderr;
 #[path = "qualification_mtls_multiprocess/isolated_scale.rs"]
 mod isolated_scale;
 
+use child_stderr::ChildStderrDiagnostic;
 use std::env;
 use std::ffi::OsString;
 use std::fs::{self, DirBuilder, File, OpenOptions, Permissions};
@@ -2840,18 +2843,6 @@ enum ChildResponseFailure {
     Eof,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum ChildStderrDiagnostic {
-    Unavailable,
-    Empty,
-    QualificationNodeFailed,
-    QualificationNodeTransportFailed,
-    QualificationNodeSqliteFailed,
-    QualificationNodeConsensusFailed,
-    QualificationNodeListenerFailed,
-    Redacted,
-}
-
 /// Receive one child reply within the supplied absolute deadline. A zero-timeout
 /// channel receive can return an already queued reply, so both admission and
 /// successful completion must be observed before the deadline expires.
@@ -3098,53 +3089,7 @@ impl ChildNode {
         if file.take(MAX_STDERR_BYTES).read_to_end(&mut bytes).is_err() {
             return ChildStderrDiagnostic::Unavailable;
         }
-        if bytes.iter().all(u8::is_ascii_whitespace) {
-            return ChildStderrDiagnostic::Empty;
-        }
-        if start != 0 {
-            return ChildStderrDiagnostic::Redacted;
-        }
-        let lines = bytes
-            .split(|byte| *byte == b'\n')
-            .filter(|line| !line.is_empty())
-            .collect::<Vec<_>>();
-        let allowed = lines.iter().all(|line| {
-            *line == b"qualification node failed"
-                || *line == b"qualification node open failed: transport"
-                || *line == b"qualification node open failed: sqlite"
-                || *line == b"qualification node open failed: consensus"
-                || *line == b"qualification node open failed: listener"
-        });
-        if !allowed {
-            return ChildStderrDiagnostic::Redacted;
-        }
-        if lines
-            .iter()
-            .rev()
-            .any(|line| *line == b"qualification node open failed: listener")
-        {
-            ChildStderrDiagnostic::QualificationNodeListenerFailed
-        } else if lines
-            .iter()
-            .rev()
-            .any(|line| *line == b"qualification node open failed: consensus")
-        {
-            ChildStderrDiagnostic::QualificationNodeConsensusFailed
-        } else if lines
-            .iter()
-            .rev()
-            .any(|line| *line == b"qualification node open failed: sqlite")
-        {
-            ChildStderrDiagnostic::QualificationNodeSqliteFailed
-        } else if lines
-            .iter()
-            .rev()
-            .any(|line| *line == b"qualification node open failed: transport")
-        {
-            ChildStderrDiagnostic::QualificationNodeTransportFailed
-        } else {
-            ChildStderrDiagnostic::QualificationNodeFailed
-        }
+        child_stderr::classify(&bytes, start != 0)
     }
 
     fn invoke(&mut self, command: &QualificationNodeCommand) -> QualificationNodeReply {
@@ -4130,7 +4075,11 @@ impl Fleet {
             match node.receive() {
                 QualificationNodeReply::Initialized => {}
                 QualificationNodeReply::Error { code } => {
-                    panic!("qualification initial fleet initialization rejected: {code:?}");
+                    panic!(
+                        "qualification initial fleet initialization rejected: {code:?}, node={}, stderr={:?}",
+                        node.node_index,
+                        node.stderr_diagnostic(),
+                    );
                 }
                 _ => panic!("qualification initial fleet initialization reply mismatch"),
             }

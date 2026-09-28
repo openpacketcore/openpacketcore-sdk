@@ -8,9 +8,9 @@ use std::env;
 use std::fs::{self, File};
 #[cfg(unix)]
 use std::fs::{DirBuilder, Permissions};
-use std::io::{self, BufReader, BufWriter, Read};
 #[cfg(unix)]
-use std::io::{BufRead, Write};
+use std::io::BufRead;
+use std::io::{self, BufReader, BufWriter, Read, Write};
 #[cfg(unix)]
 use std::net::Shutdown;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
@@ -1936,7 +1936,14 @@ impl QualificationNode {
     }
 
     async fn initialize(&self) -> Result<(), ()> {
-        self.store.initialize_cluster().await.map_err(|_| ())?;
+        self.store.initialize_cluster().await.map_err(|error| {
+            // This enum has no payload. Keep the control reply unchanged while
+            // retaining which startup operation failed for the parent test.
+            let _ = writeln!(
+                io::stderr().lock(),
+                "qualification node initialize failed: cluster {error:?}",
+            );
+        })?;
         if self.isolated_scale.is_some_and(|scale| {
             scale.workload == opc_session_testkit::qualification::QualificationIsolatedScaleWorkload::ProtectedRecoveryControl
         }) {
@@ -1946,11 +1953,23 @@ impl QualificationNode {
             self.store
                 .activate_fenced_transition_capability()
                 .await
-                .map_err(|_| ())?;
+                .map_err(|error| {
+                    let _ = writeln!(
+                        io::stderr().lock(),
+                        "qualification node initialize failed: fenced_transition {:?}",
+                        qualification_store_error_class(&error),
+                    );
+                })?;
             self.store
                 .activate_protected_roster_profile_v2()
                 .await
-                .map_err(|_| ())?;
+                .map_err(|error| {
+                    let _ = writeln!(
+                        io::stderr().lock(),
+                        "qualification node initialize failed: protected_roster_v2 {:?}",
+                        qualification_store_error_class(&error),
+                    );
+                })?;
         }
         Ok(())
     }
