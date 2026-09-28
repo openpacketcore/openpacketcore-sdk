@@ -35,6 +35,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   pages, joined replication retirement and fatal completion fixes. Preserve
   frozen HA evidence and validate the current source pin separately.
 
+- `opc-gtpu-dataplane`: `activate_cleanup_recovery` now re-enables the
+  retained traffic gate that cleanup-only acquisition leaves packet-inert. It
+  starts a fresh source incarnation while the hooks are fenced, attaches them,
+  proves quiescence and enables the gate as ordinary adoption does, and on
+  failure restores the even gate and detaches, leaving the device cleanup-only
+  and retryable. Before this, the reattached programs passed every packet
+  unchanged until a later adoption. Refs #997.
 - `opc-gtpu-dataplane`: an IPv6 `remove_pdp_context` on an ordinary eBPF
   attachment no longer falls through to the IPv4 removal by local TEID, which
   removed the IPv4 context sharing that TEID. Removal is now family-scoped.
@@ -75,6 +82,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   replacement, shutdown and multihoming failover qualification (Refs #788).
 
 ### Added
+
+- `opc-gtpu-dataplane`: backend-authoritative post-reassembly downlink
+  consumer. `GtpuControlPort::try_receive_downlink` receives one datagram from
+  the eBPF attachment's backend-owned UDP/2152 queue and, under the same
+  serialization as attachment mutation, authorizes a reassembled or handed-off
+  G-PDU with the tc fast path's own decisions: grouped index first (Active
+  generation, device, slot, endpoints, source-port policy, inner PAA, N3 PSC),
+  otherwise the v5 PDR, endpoint binding, owner journal, FAR and DSCP with the
+  Active commit read last. It returns `GtpuDownlinkEvent::Decapsulated` with
+  the exact inner packet and bearer mark, the untouched datagram for controls
+  or unknown tunnels, or a value-free `GtpuDownlinkDrop`; a closed traffic
+  gate, cleanup-only, successor-pending or unreadable state fails closed.
+  `downlink_counters` exposes bounded per-registration counters. Grouped
+  attachments with an IPv4 outer endpoint now report
+  `KernelReassemblyHandoff` for outer IPv4 fragments. Native tests cover
+  in-order, reordered, duplicated, missing, foreign-TEID, stale-generation,
+  owner-only, mixed-binding and gate-closed fragment sets. On an ordinary
+  attachment, inner-IPv6 contexts (#998) decapsulate through the attachment's
+  published family authority. Refs #1001.
 
 - `opc-gtpu-dataplane`: the ordinary eBPF PDP-context API accepts an inner
   IPv6 PDN prefix. Uplink selects the inner source `/64` plus mark, downlink
