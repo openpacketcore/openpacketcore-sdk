@@ -11357,6 +11357,178 @@ async fn cleanup_only_recovery_fences_forwarding_and_removes_stale_contexts(
     Ok(())
 }
 
+/// A cleanup-only activation that fails after its hooks are attached is
+/// rolled back completely (SDK issue 1010).
+///
+/// Acquisition proved an executable PMTU policy slot. Corrupting it afterwards
+/// is invisible to every activation step except the re-proof of the attached
+/// graph, which requires an executable slot. That failure must leave both
+/// hooks detached and the traffic gate even, and the backend must still hold
+/// the device cleanup-only, agreeing with the runtime. Once the graph is exact
+/// again, a retry activates it: the device forwards in both directions and is
+/// removable. A commit before that re-proof would instead leave a forwarding
+/// datapath recorded as cleanup-only, with every retry refused as already
+/// active.
+#[tokio::test]
+// The serial guard is deliberately held for the entire test body; see
+// PRIVILEGED_TEST_LOCK.
+#[allow(clippy::await_holding_lock)]
+#[ignore = "requires root (CAP_BPF/CAP_NET_ADMIN), a fresh netns, and bpffs"]
+async fn cleanup_only_activation_failure_leaves_the_device_fenced_and_retryable(
+) -> Result<(), Box<dyn std::error::Error>> {
+    if env::var("OPC_GTPU_RUN_PRIVILEGED").as_deref() != Ok("1") {
+        eprintln!("skipping: set OPC_GTPU_RUN_PRIVILEGED=1 inside a fresh privileged netns");
+        return Ok(());
+    }
+
+    let _serial = PRIVILEGED_TEST_LOCK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let net = TestNet::provision();
+    let config = EbpfGtpuDataplaneBackendConfig {
+        bpffs_pin_root: net.pin_root.clone(),
+        ..EbpfGtpuDataplaneBackendConfig::default()
+    };
+    let owner = EbpfGtpuDataplaneBackend::with_config(config.clone());
+    let mut create = CreateGtpDeviceRequest::new("s2bu");
+    create.bind_address = IpAddr::V4(EPDG_S2BU_IP);
+    let device = owner.create_device(create).await?;
+    let stale = session_context(device.ifindex);
+    assert_eq!(
+        owner.install_pdp_context_classified(stale.clone()).await?,
+        PdpContextInstallOutcome::Installed
+    );
+    let pin_dir = net.pin_root.join("s2bu");
+    drop(owner);
+
+    let recovered = EbpfGtpuDataplaneBackend::with_config(config);
+    assert_eq!(
+        recovered
+            .acquire_cleanup_only_recovery(RetainedGraphCleanupRequest::new(
+                device.clone(),
+                EPDG_S2BU_IP,
+                CurrentEbpfGraphWriterProof::previous_writer_stopped(),
+            ))
+            .await?,
+        RetainedGraphCleanupClassification::Acquired
+    );
+    assert_eq!(
+        recovered.remove_pdp_context_exact(stale.clone()).await?,
+        PdpContextRemovalOutcome::Removed
+    );
+    let traffic_gate = |pin_dir: &std::path::Path| {
+        pinned_u64_array_values(
+            pin_dir,
+            GTPU_TRAFFIC_OBSERVATION_GATE_MAP_NAME,
+            GTPU_TRAFFIC_OBSERVATION_GATE_MAX_ENTRIES,
+        )[GTPU_TRAFFIC_OBSERVATION_GATE_INDEX as usize]
+    };
+
+    let executable = pinned_pmtu_policy(&pin_dir);
+    replace_pinned_pmtu_policy(&pin_dir, [0, 0, 0, 1]);
+    let failed = recovered.activate_cleanup_recovery(&device).await;
+    assert!(
+        matches!(failed, Err(GtpuError::StateIndeterminate { .. })),
+        "a failed graph re-proof must fail activation: {failed:?}"
+    );
+    for direction in ["egress", "ingress"] {
+        let filters = tc_filters(direction);
+        assert!(
+            !filters.contains("opc_gtpu"),
+            "a failed activation must leave no SDK hook on {direction}: {filters}"
+        );
+    }
+    let gate = traffic_gate(&pin_dir);
+    assert!(
+        gate != 0 && gate % 2 == 0,
+        "a failed activation must leave the traffic gate packet-inert: {gate}"
+    );
+    // With the graph exact again, the backend still holds the device
+    // cleanup-only, agreeing with the runtime: installation stays fenced.
+    replace_pinned_pmtu_policy(&pin_dir, executable);
+    assert_eq!(
+        recovered
+            .install_pdp_context_classified(stale.clone())
+            .await?,
+        PdpContextInstallOutcome::Indeterminate(
+            PdpContextIndeterminateReason::AuthorityUnavailable
+        ),
+        "the backend must still hold the device cleanup-only"
+    );
+
+    recovered.activate_cleanup_recovery(&device).await?;
+    for direction in ["egress", "ingress"] {
+        let filters = tc_filters(direction);
+        assert!(
+            filters.contains("opc_gtpu"),
+            "a retried activation must attach the SDK hook on {direction}: {filters}"
+        );
+    }
+    let gate = traffic_gate(&pin_dir);
+    assert!(
+        gate % 2 == 1,
+        "a retried activation must enable the traffic gate: {gate}"
+    );
+    assert_eq!(
+        recovered.install_pdp_context_classified(stale).await?,
+        PdpContextInstallOutcome::Installed
+    );
+
+    run("ping", &["-c", "1", "-W", "1", "192.0.2.10"]);
+    let pgw = in_netns(&net.pgw_ns, || {
+        UdpSocket::bind((PGW_IP, GTPU_PORT)).expect("bind PGW IPv4 GTP-U socket")
+    });
+    let ue = in_netns(&net.ue_ns, || {
+        UdpSocket::bind((UE_PAA, 5600)).expect("bind UE IPv4 socket")
+    });
+    let ue_capture = packet_capture_socket(&net.ue_ns);
+    let uplink_payload = b"cleanup-retried-uplink";
+    ue.send_to(uplink_payload, (REMOTE_HOST, 53))?;
+    let uplink_inner = capture_inner_udp_packet(
+        &ue_capture,
+        IpAddr::V4(UE_PAA),
+        IpAddr::V4(REMOTE_HOST),
+        5600,
+        53,
+        uplink_payload,
+    );
+    receive_grouped_uplink(
+        &pgw,
+        SocketAddr::from((EPDG_S2BU_IP, GTPU_PORT)),
+        PEER_TEID,
+        &uplink_inner,
+    );
+    let downlink_payload = b"cleanup-retried-downlink";
+    let downlink = build_outer_gtpu_frame(
+        main_link_address("s2bu"),
+        net.pgw_link_address("s2bup"),
+        &[],
+        &build_gpdu(
+            LOCAL_TEID,
+            None,
+            &build_inner_udp(REMOTE_HOST, UE_PAA, 53, 5600, downlink_payload),
+        ),
+        true,
+        0,
+    );
+    send_raw_gtpu_frame(
+        &net.pgw_ns,
+        "s2bup",
+        &downlink,
+        RawChecksumMetadata::Unverified,
+    );
+    receive_grouped_downlink(&ue, SocketAddr::from((REMOTE_HOST, 53)), downlink_payload);
+
+    recovered.remove_device(&device).await?;
+    assert!(tc_filters("ingress").trim().is_empty());
+    assert!(tc_filters("egress").trim().is_empty());
+    eprintln!(
+        "OPC_GTPU_CLEANUP_ACTIVATION_ROLLBACK_PROVEN: failed re-proof rolled back, retry forwards"
+    );
+    drop(net);
+    Ok(())
+}
+
 /// The redirect-outcome counter must move with real delivery, not with
 /// submission.
 ///
