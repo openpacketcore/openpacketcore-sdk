@@ -2424,6 +2424,8 @@ pub(crate) trait EbpfGtpuRuntime: Send + Sync + fmt::Debug {
     /// Read the exact loader traffic gate the tc programs consult before any
     /// packet effect. `Ok(false)` means tc passes packets unprocessed, so a
     /// userspace consumer must not decapsulate on the attachment's behalf.
+    // Only the Linux-only post-reassembly consumer reads the gate.
+    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
     fn traffic_gate_allows_packet_effects(&self, _ifindex: u32) -> Result<bool, GtpuError> {
         Err(GtpuError::UnsupportedFeature {
             feature: "gtpu_traffic_gate_readback",
@@ -67738,10 +67740,17 @@ mod tests {
             .unwrap();
         assert_eq!(capabilities.outer_ipv4, GtpuCapability::Available);
         assert_eq!(capabilities.outer_ipv6, GtpuCapability::Available);
+        #[cfg(target_os = "linux")]
         assert!(matches!(
             capabilities.downlink_outer_ipv4_fragment_handling,
             GtpuDownlinkFragmentContract::KernelReassemblyHandoff { .. }
         ));
+        // The kernel stack the handoff hands off to exists only on Linux.
+        #[cfg(not(target_os = "linux"))]
+        assert_eq!(
+            capabilities.downlink_outer_ipv4_fragment_handling,
+            GtpuDownlinkFragmentContract::Unsupported
+        );
         assert_eq!(
             capabilities.downlink_outer_ipv6_fragment_handling,
             GtpuDownlinkFragmentContract::Unsupported
