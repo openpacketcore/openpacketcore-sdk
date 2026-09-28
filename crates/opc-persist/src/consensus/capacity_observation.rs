@@ -97,6 +97,11 @@ fn ledger_allocations(ledger: &LedgerState) -> Allocations {
             LedgerPayload::Intent(value) => boxed(&mut allocations, &**value),
             LedgerPayload::Event(value) => boxed(&mut allocations, &**value),
             LedgerPayload::KeyTransition(value) => boxed(&mut allocations, &**value),
+            LedgerPayload::TargetIntent(value) => {
+                boxed(&mut allocations, &**value);
+                string(&mut allocations, &value.recovery);
+            }
+            LedgerPayload::EmptyCommit(value) => boxed(&mut allocations, &**value),
             LedgerPayload::Outcome { .. } | LedgerPayload::Terminal { .. } => {}
         }
     }

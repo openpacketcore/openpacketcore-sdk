@@ -179,8 +179,12 @@ pub(crate) fn ledger_heap(ledger: &LedgerState) -> usize {
             EntryPayload::KeyTransition(_) => {
                 size_of::<crate::audit_authority::continuity::AuditKeyTransition>()
             }
-            EntryPayload::TargetIntent(_) | EntryPayload::EmptyCommit(_) => {
-                panic!("capacity-only observer does not inventory retained target payloads")
+            EntryPayload::TargetIntent(value) => {
+                size_of::<crate::audit_authority::ledger::RetainedTargetIntent>()
+                    + value.recovery.capacity()
+            }
+            EntryPayload::EmptyCommit(_) => {
+                size_of::<crate::audit_authority::PreparedNetconfEmptyCommit>()
             }
         })
         .sum::<usize>();
