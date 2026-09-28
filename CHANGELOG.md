@@ -33,6 +33,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- `opc-gtpu-dataplane`: `TftUplinkClassifier` owns a typed `TftUplinkPaaSet`
+  holding at most one IPv4 `/32` and one canonical IPv6 `/64` (TS 23.401
+  5.3.1.2.2, TS 23.402 4.7). IPv6 uplink from any address in the prefix,
+  including RFC 8981 temporary addresses, is classified; an IPv4v6 PDN uses
+  one classifier for both families. `new` stays source-compatible and
+  canonicalizes an IPv6 PAA; `with_paa_set` and `paa_set` are added.
+  Unspecified, loopback, multicast and broadcast PAAs are rejected. The native
+  eBPF backend still rejects any IPv6 family, including a dual set, without
+  truncating it (#988). Closes #987.
+
 - `opc-session-store`: add `FencedTransitionV2RecoveryJournal`, an SDK-owned
   journal that binds a caller-stable `FencedTransitionRequestId` to its
   complete sealed V2 request before dispatch, with #701-equivalent path,
