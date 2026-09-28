@@ -15,6 +15,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   no-progress retry pacing. Preserve native WAL and Durable/Async semantics.
   Refs #957.
 
+- `opc-gtpu-dataplane`: cleanup-only activation is now all or nothing. It
+  re-proves the attached graph (interface, tc placement, exact identity,
+  executable PMTU policy) and the quiescent traffic source while the gate is
+  still even, and enabling the gate is the commit. Before, it enabled the gate
+  and committed the device as active before that re-proof, so a failed
+  re-proof left a forwarding datapath that the backend still recorded as
+  cleanup-only: every retry was refused as already active and the device could
+  not be removed. Any failure now leaves the runtime and the backend agreeing
+  that the device is cleanup-only, with its hooks detached and the gate even,
+  so a retry can activate it. The host traffic sequence window is dropped only
+  after the runtime reports success. Fixes #1010.
 - `opc-gtpu-dataplane`: `activate_cleanup_recovery` now re-enables the
   retained traffic gate that cleanup-only acquisition leaves packet-inert. It
   starts a fresh source incarnation while the hooks are fenced, attaches them,
