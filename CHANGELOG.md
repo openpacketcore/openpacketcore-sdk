@@ -15,6 +15,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   no-progress retry pacing. Preserve native WAL and Durable/Async semantics.
   Refs #957.
 
+- `opc-gtpu-dataplane`: `activate_cleanup_recovery` now re-enables the
+  retained traffic gate that cleanup-only acquisition leaves packet-inert. It
+  starts a fresh source incarnation while the hooks are fenced, attaches them,
+  proves quiescence and enables the gate as ordinary adoption does, and on
+  failure restores the even gate and detaches, leaving the device cleanup-only
+  and retryable. Before this, the reattached programs passed every packet
+  unchanged until a later adoption. Refs #997.
 - `opc-gtpu-dataplane`: an IPv6 `remove_pdp_context` on an ordinary eBPF
   attachment no longer falls through to the IPv4 removal by local TEID, which
   removed the IPv4 context sharing that TEID. Removal is now family-scoped.
