@@ -19,6 +19,10 @@ name = "authenticated_replica_identity"
 path = "tests/authenticated_replica_identity.rs"
 
 [[test]]
+name = "consensus_abandoned_call"
+path = "tests/consensus_abandoned_call.rs"
+
+[[test]]
 name = "consensus_transport"
 path = "tests/consensus_transport.rs"
 
