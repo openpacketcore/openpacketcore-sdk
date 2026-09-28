@@ -355,6 +355,30 @@ async fn live_locked_route_mtu_makes_the_kernel_signal_oversized_packets_for_bot
         ),
     ];
 
+    // Foreign routes carrying the string metric RTAX_CC_ALGO sit in the same
+    // table. They are out of every scope below and must not disturb readback.
+    ip(&[
+        "route",
+        "add",
+        "203.0.113.0/24",
+        "dev",
+        "mtus1",
+        "congctl",
+        "reno",
+    ]);
+    ip(&[
+        "-6",
+        "route",
+        "add",
+        "2001:db8:ffff::/48",
+        "dev",
+        "mtus1",
+        "congctl",
+        "reno",
+    ]);
+    assert!(ip(&["route", "show", "203.0.113.0/24"]).contains("congctl reno"));
+    assert!(ip(&["-6", "route", "show", "2001:db8:ffff::/48"]).contains("congctl reno"));
+
     for (family, destination, route, mtu, icmp_type, icmp_code, router, emsgsize) in cases {
         // Control: through the 1500-byte link alone, every datagram (including
         // the resend) arrives and no ICMP error is raised.
@@ -477,6 +501,43 @@ async fn live_locked_route_mtu_makes_the_kernel_signal_oversized_packets_for_bot
         );
         // Let the next family's probe start from a quiet link.
         thread::sleep(Duration::from_millis(100));
+    }
+    // Kernel removal semantics the backend relies on. IPv4 deletion compares
+    // the supplied metrics, so a delete naming another MTU matches nothing.
+    // IPv6 deletion does not compare metrics: it removes the one route keyed
+    // by destination, table, metric and device whatever its MTU. The backend
+    // therefore proves the exact MTU by readback before every delete.
+    for (family, destination, mtu, wrong_mtu_delete_succeeds) in [
+        ("4", "198.51.100.9/32", IPV4_ROUTE_MTU, false),
+        ("6", "2001:db8:2::9/128", IPV6_ROUTE_MTU, true),
+    ] {
+        let family = format!("-{family}");
+        let key = [
+            family.as_str(),
+            "route",
+            "add",
+            destination,
+            "dev",
+            "mtur1",
+            "proto",
+            "242",
+            "metric",
+            "10",
+        ];
+        let mtu = mtu.to_string();
+        let wrong = (IPV4_ROUTE_MTU.max(IPV6_ROUTE_MTU) + 8).to_string();
+        ip(&[&key[..], &["mtu", "lock", &mtu]].concat());
+        let mut delete = key;
+        delete[2] = "del";
+        let deleted = Command::new("ip")
+            .args([&delete[..], &["mtu", "lock", &wrong]].concat())
+            .status()
+            .unwrap()
+            .success();
+        assert_eq!(deleted, wrong_mtu_delete_succeeds, "{family}");
+        if !deleted {
+            ip(&[&delete[..], &["mtu", "lock", &mtu]].concat());
+        }
     }
     eprintln!(
         "OPC_ROUTE_LOCKED_MTU_ICMP_PROVEN: IPv4 Fragmentation Needed and IPv6 Packet Too Big"

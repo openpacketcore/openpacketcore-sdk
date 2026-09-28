@@ -5408,6 +5408,65 @@ mod tests {
         assert_malformed(classify_route_readback(&request, &[body]), &nested);
     }
 
+    /// `RTAX_CC_ALGO` (`ip route ... congctl cubic`) is a NUL-terminated
+    /// string metric. Any unmodeled metric, whatever its width, is only an
+    /// unrepresentable object: in scope it fails closed, out of scope it is
+    /// ignored, so one foreign `congctl` route never breaks a family readback.
+    #[test]
+    fn unmodeled_string_or_odd_width_metrics_are_unrepresentable_not_malformed() {
+        const RTAX_CC_ALGO: u16 = 16;
+        let unmodeled = [
+            metrics_payload(&[(RTAX_CC_ALGO, b"cubic\0")]),
+            metrics_payload(&[(RTAX_CC_ALGO, b"bbr\0")]),
+            metrics_payload(&[(9, &[1_u8, 2])]),
+            metrics_payload(&[
+                (RTAX_MTU, &1300_u32.to_ne_bytes()),
+                (RTAX_CC_ALGO, b"cubic\0"),
+            ]),
+        ];
+        for request in [ipv4_locked_mtu_route(1200), ipv6_locked_mtu_route(1300)] {
+            let mut foreign = request.clone();
+            foreign.table = 254;
+            foreign.destination = match request.destination.address {
+                IpAddr::V4(_) => IpPrefix::new(IpAddr::V4(Ipv4Addr::new(203, 0, 113, 0)), 24),
+                IpAddr::V6(_) => IpPrefix::new(IpAddr::V6("2001:db8:ffff::".parse().unwrap()), 48),
+            };
+            for nested in &unmodeled {
+                let in_scope = route_body_with_metrics(&request, RTA_METRICS, nested);
+                assert_eq!(
+                    classify_route_readback(&request, &[in_scope]).unwrap(),
+                    RouteReadback::Indeterminate(
+                        ReadbackIndeterminateReason::UnrepresentableObject
+                    ),
+                    "in-scope nested metrics {nested:?}"
+                );
+                let out_of_scope = route_body_with_metrics(&foreign, RTA_METRICS, nested);
+                assert_eq!(
+                    classify_route_readback(&request, &[out_of_scope.clone()]).unwrap(),
+                    RouteReadback::Absent,
+                    "foreign nested metrics {nested:?}"
+                );
+                assert_eq!(
+                    classify_route_readback(
+                        &request,
+                        &[out_of_scope, encode_route_request(&request).unwrap()]
+                    )
+                    .unwrap(),
+                    RouteReadback::ExactPresent,
+                    "foreign nested metrics {nested:?}"
+                );
+            }
+        }
+        let scope = ipv6_collection_scope();
+        let mut foreign = ipv6_collection_route();
+        foreign.table = 254;
+        for nested in &unmodeled {
+            let body = route_body_with_metrics(&foreign, RTA_METRICS, nested);
+            let state = classify_owned_collection(scope, &[body], &[], 16, 16).unwrap();
+            assert!(state.snapshot.routes().is_empty(), "{nested:?}");
+        }
+    }
+
     #[test]
     fn route_and_rule_readback_compare_every_modeled_field() {
         assert_eq!(
