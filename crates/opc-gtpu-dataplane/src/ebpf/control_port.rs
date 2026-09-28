@@ -284,8 +284,12 @@ impl EbpfGtpuDataplaneBackend {
 mod tests {
     use super::*;
 
+    /// PDP churn holds the backend-wide operation lock almost continuously
+    /// after a mass re-attach. The shared queue (Echo, reassembled G-PDUs)
+    /// must neither wait for nor yield to that lock: its exclusion is the
+    /// attachment's own socket slot.
     #[test]
-    fn control_port_does_not_wait_for_a_mutating_writer() {
+    fn control_port_does_not_wait_for_or_yield_to_backend_mutation() {
         let backend = EbpfGtpuDataplaneBackend::new();
         let port = BackendControlPort {
             backend: Arc::downgrade(&backend.inner),
@@ -295,7 +299,8 @@ mod tests {
         let guard = backend.operation_guard().unwrap();
         assert_eq!(
             port.try_receive_datagram(8).unwrap_err(),
-            GtpuControlPortError::Busy
+            GtpuControlPortError::Unavailable,
+            "an unregistered port is unavailable, never Busy behind another mutation"
         );
         drop(guard);
         assert_eq!(
@@ -310,7 +315,7 @@ mod tests {
     }
 
     #[test]
-    fn downlink_consumer_is_serialized_with_attachment_mutation() {
+    fn downlink_consumer_does_not_yield_to_backend_mutation() {
         let backend = EbpfGtpuDataplaneBackend::new();
         let port = BackendControlPort {
             backend: Arc::downgrade(&backend.inner),
@@ -320,11 +325,11 @@ mod tests {
         let guard = backend.operation_guard().unwrap();
         assert_eq!(
             port.try_receive_downlink(2048).unwrap_err(),
-            GtpuControlPortError::Busy
+            GtpuControlPortError::Unavailable
         );
         assert_eq!(
             port.downlink_counters().unwrap_err(),
-            GtpuControlPortError::Busy
+            GtpuControlPortError::Unavailable
         );
         drop(guard);
         assert_eq!(

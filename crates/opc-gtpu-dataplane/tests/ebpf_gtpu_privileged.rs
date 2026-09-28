@@ -9060,6 +9060,13 @@ async fn ebpf_gtpu_backend_consumer_decapsulates_grouped_outer_fragmented_downli
 }
 
 #[tokio::test]
+#[ignore = "requires root (CAP_BPF/CAP_NET_ADMIN), a fresh netns, and bpffs"]
+async fn ebpf_gtpu_backend_consumer_drains_shared_queue_under_pdp_churn(
+) -> Result<(), Box<dyn std::error::Error>> {
+    backend_reassembly::qualify_churn().await
+}
+
+#[tokio::test]
 // The serial guard is deliberately held for the entire test body; see
 // PRIVILEGED_TEST_LOCK.
 #[allow(clippy::await_holding_lock)]
