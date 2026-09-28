@@ -4261,6 +4261,8 @@ where
 
 #[cfg(test)]
 mod tests {
+    #[cfg(feature = "test-control")]
+    mod inbound_budget;
     mod negotiated_loss;
     #[cfg(feature = "test-control")]
     mod pending_rpc;
