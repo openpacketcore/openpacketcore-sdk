@@ -54,8 +54,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   (RFC 4443) or, for IPv4 with DF set, an ICMP Fragmentation Needed carrying
   the next-hop MTU (RFC 1191), proven live on the host and RHEL 9.4 kernels.
   Readback, convergence, the owned collection and the mock compare it exactly
-  (`RouteMismatch::mtu`); any other resident metric is unrepresentable. IPv6
-  routes require 1280 bytes. Struct-literal constructors must add
+  (`RouteMismatch::mtu`); any other resident metric, of any width (such as
+  the `congctl` string metric), is unrepresentable and is ignored outside the
+  requested route or scope. IPv6 routes require 1280 bytes. Breaking:
+  struct-literal constructors must add
   `locked_mtu: None`, and `RouteMismatch` literals `mtu`. Refs #991.
 - `opc-session-store`: add `FencedTransitionV2RecoveryJournal`, an SDK-owned
   journal that binds a caller-stable `FencedTransitionRequestId` to its

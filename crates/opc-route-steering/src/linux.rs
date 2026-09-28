@@ -2133,8 +2133,12 @@ fn encode_route_request_with_protocol(
         append_attr_u32_ne(&mut out, RTA_TABLE, request.table)?;
     }
     if let Some(mtu) = request.locked_mtu {
-        // One metrics nest: the MTU and exactly its lock bit. Linux deletion
-        // compares supplied metrics, so removal matches only this route.
+        // One metrics nest: the MTU and exactly its lock bit. IPv4 deletion
+        // compares the supplied metrics, so it matches only this locked
+        // route. IPv6 deletion ignores metrics and removes the single route
+        // keyed by destination, table, metric and device whatever its MTU;
+        // removal is safe there only because the exact MTU is proven by
+        // readback immediately before the delete and absence after it.
         let mut metrics = Vec::with_capacity(2 * (ROUTE_ATTRIBUTE_HEADER_LEN + 4));
         append_attr_u32_ne(&mut metrics, RTAX_LOCK, ROUTE_MTU_LOCK_MASK)?;
         append_attr_u32_ne(&mut metrics, RTAX_MTU, mtu.get())?;
@@ -3085,9 +3089,10 @@ enum RouteMetrics {
     Unrepresentable,
 }
 
-/// Parse one `RTA_METRICS` nest strictly. Its members are `u32` metrics keyed
-/// by `RTAX_*`; a repeated member, a wrong-width member, or a flag on a
-/// member or a byte-order flag on the nest is malformed.
+/// Parse one `RTA_METRICS` nest strictly. The modeled members `RTAX_LOCK`
+/// and `RTAX_MTU` are `u32`; repeating one, a wrong width, or a flag on one is
+/// malformed, as is a byte-order flag on the nest. Any other member, of any
+/// width, only makes the route unrepresentable.
 fn set_once_route_metrics(
     slot: &mut Option<RouteMetrics>,
     payload: &[u8],
@@ -3104,10 +3109,10 @@ fn set_once_route_metrics(
         match metric {
             RTAX_LOCK => set_once_u32(&mut lock, value, flagged),
             RTAX_MTU => set_once_u32(&mut mtu, value, flagged),
+            // Every other metric is unmodeled whatever its shape: most are
+            // `u32`, but `RTAX_CC_ALGO` is a NUL-terminated string. It makes
+            // the route unrepresentable, which fails closed only in scope.
             _ => {
-                if flagged || value.len() != 4 {
-                    return Err(malformed_readback());
-                }
                 other = true;
                 Ok(())
             }
@@ -5442,7 +5447,7 @@ mod tests {
                 );
                 let out_of_scope = route_body_with_metrics(&foreign, RTA_METRICS, nested);
                 assert_eq!(
-                    classify_route_readback(&request, &[out_of_scope.clone()]).unwrap(),
+                    classify_route_readback(&request, std::slice::from_ref(&out_of_scope)).unwrap(),
                     RouteReadback::Absent,
                     "foreign nested metrics {nested:?}"
                 );

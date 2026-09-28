@@ -228,19 +228,26 @@ impl Topology {
         ]);
         ip(&["link", "set", "mtus1", "up"]);
         ip(&["link", "set", "mtur1", "up"]);
-        // Resolve every neighbour before the exact probes.
+        // Resolve every neighbour before the exact probes. A freshly raised
+        // veth may drop the first IPv6 solicitation, so warm-up waits for one
+        // reply out of a few attempts; the probes themselves stay exact.
         for (namespace, target) in [
             (&sender, "192.0.2.1"),
             (&sender, "2001:db8:1::1"),
             (&receiver, "198.51.100.1"),
             (&receiver, "2001:db8:2::1"),
         ] {
-            run(
-                "ip",
-                &[
-                    "netns", "exec", namespace, "ping", "-c", "1", "-W", "2", target,
-                ],
-            );
+            let reachable = (0..5).any(|_| {
+                Command::new("ip")
+                    .args([
+                        "netns", "exec", namespace, "ping", "-c", "1", "-W", "1", target,
+                    ])
+                    .output()
+                    .unwrap()
+                    .status
+                    .success()
+            });
+            assert!(reachable, "{namespace}: neighbour {target} never answered");
         }
         let receiver_link = ifindex("mtur1");
         Self {

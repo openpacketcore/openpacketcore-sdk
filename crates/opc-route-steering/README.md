@@ -108,6 +108,10 @@ previous wire bytes. The node needs a unicast address on the ingress interface
 of each family to source the ICMP error. Readback compares the MTU exactly, so
 changing it on a resident route is a conflict (`RouteMismatch::mtu`); an owned
 collection refuses an MTU change for a resident destination before mutation.
+Removal proves the exact MTU by readback before the delete: IPv4 deletion also
+compares metrics in the kernel, but IPv6 deletion does not. A route carrying
+any other metric, such as `congctl`, is unrepresentable: readback of it fails
+closed, and it is ignored when it lies outside the requested route or scope.
 
 For a complete writer-owned set, use the collection API. This is also the API
 for provably disjoint source rules that intentionally share one family and
