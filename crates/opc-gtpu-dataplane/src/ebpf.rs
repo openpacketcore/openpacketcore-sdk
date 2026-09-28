@@ -10407,14 +10407,17 @@ impl EbpfGtpuDataplaneBackend {
                 return Err(GtpuError::AlreadyExists);
             }
         }
+        // Activation starts a fresh kernel traffic source before it enables
+        // the gate, so drop the host high-water first. Acquisition already
+        // reset it and the gate stayed even since, so a failed activation
+        // loses no accepted sequence.
+        self.reset_traffic_sequence_source(device.ifindex)?;
         self.inner.runtime.activate_cleanup_only(
             &device.name,
             device.ifindex,
             &self.pin_dir(&device.name),
             self.inner.config.tc_priority,
         )?;
-        // Activation started a fresh kernel traffic source before enabling it.
-        self.reset_traffic_sequence_source(device.ifindex)?;
         if let Some(managed) = devices.get_mut(&device.ifindex) {
             managed.cleanup_only = false;
         }
@@ -40713,26 +40716,25 @@ mod aya_runtime {
                 Self::enable_traffic_observation_source(&mut device.ebpf, traffic_observation_gate)
             }) {
                 // Keep the device cleanup-only and fenced: restore the even
-                // gate and detach the hooks this call attached.
+                // gate and always detach the hooks this call attached, even
+                // when they replaced an exact predecessor, so no attachment
+                // survives behind a gate that may still be odd. Any failed
+                // step, or a replaced predecessor, is indeterminate.
                 let gate_restored = Self::disable_traffic_observation_source_exact(
                     &mut device.ebpf,
                     traffic_observation_gate,
                 );
-                if attached.replaced_existing {
-                    return Err(state_indeterminate("ebpf_activate_cleanup_only"));
-                }
-                let rollback = detach_datapath_if_current(
+                let detached = detach_datapath_if_current(
                     attached.links,
                     &attached.identity,
                     ifindex,
                     tc_priority,
-                )
-                .and(gate_restored);
+                );
                 return Err(error_after_rollback(
                     error,
-                    rollback,
-                    false,
-                    "ebpf_tc_attach_rollback",
+                    detached.and(gate_restored),
+                    attached.replaced_existing,
+                    "ebpf_activate_cleanup_only",
                 ));
             }
             device.datapath_identity = attached.identity;
@@ -58205,16 +58207,28 @@ mod tests {
             state
                 .downlink_filter_pin_dir
                 .insert(ifindex, pin_dir.to_path_buf());
-            let disabled = state.traffic_observation_gate.get(&ifindex).copied();
+            let enabled = state
+                .traffic_observation_gate
+                .get(&ifindex)
+                .copied()
+                .and_then(|disabled| disabled.checked_add(1));
             if let Err(error) = Self::enable_traffic_observation_source(&mut state, ifindex) {
-                if let Some(disabled) = disabled {
-                    state.traffic_observation_gate.insert(ifindex, disabled);
-                }
+                // Restore through the exact disable path, then detach
+                // regardless; a failed restore is indeterminate.
+                let gate_restored = enabled.map_or_else(
+                    || Err(state_indeterminate("traffic_observation_disable")),
+                    |enabled| {
+                        Self::disable_traffic_observation_source_exact(&mut state, ifindex, enabled)
+                    },
+                );
                 state.uplink_filter_ready.remove(&ifindex);
                 state.downlink_filter_ready.remove(&ifindex);
                 state.uplink_filter_pin_dir.remove(&ifindex);
                 state.downlink_filter_pin_dir.remove(&ifindex);
-                return Err(error);
+                return Err(match gate_restored {
+                    Ok(()) => error,
+                    Err(_) => state_indeterminate("ebpf_activate_cleanup_only"),
+                });
             }
             state.cleanup_only.remove(&ifindex);
             Ok(EbpfAttachmentDisposition::Retained)
