@@ -1,8 +1,9 @@
 # Atomic Fenced Transition Contract
 
-This document defines the generic V1 store-side contract from issue #696 and
-the protected V2 composition from issue #701. It covers
-`AtomicFencedTransitionCapability`, `FencedTransitionRequest`,
+This document defines the generic V1 store-side contract from issue #696,
+the protected V2 composition from issue #701, the epoch-fenced V2 history
+from issue #702, and the protected V2 prepared consumer facade from issue
+#982. It covers `AtomicFencedTransitionCapability`, `FencedTransitionRequest`,
 `FencedTransitionOutcome`, and `FencedTransitionStatus` in `opc-session-store`.
 It is not a product workflow or a network protocol.
 
@@ -697,6 +698,345 @@ must carry the persistent schema fence, immutable V2 profile, any exact-current
 scope certificate, the nonregressing retired floor and reclaim cursor, and
 every binding not covered by that floor, including compacted tombstones.
 
+## Protected V2 prepared consumer facade (#982)
+
+This section defines an additive consumer composition over the #702
+epoch-fenced V2 protocol. It changes neither V1, the #701 protected V1
+composition, the raw `fenced_transition_v2` protection-wrapper path and its
+`FencedTransitionV2PreparedJournal`, nor the `/2` wire.
+
+The #701 composition recovers a protected request by a caller-stable
+`FencedTransitionRequestId`, but its physical contract is V1: every protected
+transition permanently consumes one of the identity's 4,096 absorbing V1
+bindings and one of its journal's 4,096 rows. The raw V2 wrapper path is
+non-absorbing, but its journal is keyed by the body-committed 56-byte V2 ID,
+so a caller that does not retain the exact plaintext body cannot recover
+status after a restart. The facade combines V2 receipt history with
+caller-stable recovery, so a restarted caller can still refuse to start a
+second lineage while an earlier transition might commit. The qualification
+record is [SDK-982 protected V2 consumer facade evidence](sdk-982-protected-v2-facade-evidence.md).
+
+### Surfaces
+
+- `opc-session-store` adds `FencedTransitionV2RecoveryJournal` and its
+  independent `FencedTransitionV2RecoveryJournalKey`, the opaque
+  `PreparedFencedTransitionV2` and `PreparedFencedTransitionV2Lookup`, and
+  `EncryptingSessionBackend::with_fenced_transition_v2_recovery_journal` and
+  its `RemoteSealingSessionBackend` counterpart. The wrappers implement a
+  sealed, hidden `ProtectedFencedTransitionV2Backend` port. No other type can
+  implement it, and it is not an application API.
+- `opc-session-net` adds `SessionConsumerPreparedFencedTransitionV2Backend`,
+  its opaque `ActivatedSessionConsumerFencedTransitionV2Voters` roster, the
+  affine `SessionConsumerPreparedFencedTransitionV2` handle, the receipt-only
+  `SessionConsumerRecoveredFencedTransitionV2Status` handle, and the
+  `SessionConsumerRecoveredFencedTransition` recovery result.
+- The `opc-session-testkit` authenticated fixture forwards `/2` requests to
+  its real voters and can open the V2 facade over them.
+
+The physical exact-roster adapter stays private to the net crate, as for V1.
+Neither facade handle exposes a physical request, a sealed body, or a
+dispatchable token.
+
+### Activation and exact-voter routing
+
+`SessionConsumerPreparedFencedTransitionV2Backend::persistent_exact_voter_prewarm_roster`
+consumes the complete persistent client set for one scope. It applies the V1
+activation's exactness checks: one scope, one roster commitment, a client for
+every voter, distinct node IDs and voter TLS identities, and one local
+authenticated identity. It then prewarms every voter's `/2` lane and requires
+`FencedTransitionV2Capability::V2` from every voter. A partial roster or any
+other reply refuses construction. Admitted voters are canonicalized by node
+ordinal, and only the facade's local-AEAD and remote-sealing constructors can
+consume the opaque roster. Activation then reads the linearized V2 history
+state once to seed the facade's active-epoch cache. A revoked topology
+authority refuses activation; any other failed read only defers the read to
+the first preparation.
+
+Mutation starts at an origin derived from the authenticated scope, the
+canonical roster, and the caller-stable ID under a V2-specific domain. It
+advances to the next canonical voter only after a proven pre-dispatch
+`NotTransmitted`, and makes at most one attempt per voter. Status starts at
+the successor of the last voter that may have received the mutation, and
+rotates through the roster. Each physical attempt is capped by the prepared
+budget's physical-attempt timeout and bounded by its immutable absolute
+deadline.
+
+### Preparation and internal epoch selection
+
+`prepare_fenced_transition` accepts the same `FencedTransitionRequest` as the
+V1 facade. Its 16-byte ID is the caller-stable identity; its lease and
+mutation are the transition. The caller never supplies an epoch or a nonce.
+Preparation runs in this order:
+
+1. Validate the request and require a caller-plaintext record payload.
+2. Require the recovery journal, bind it to the wrapper scope on first use,
+   and require an inner physical boundary that preserves protected payloads
+   and advertises `FencedTransitionV2Capability::V2`.
+3. Reject the ID with `FencedTransitionRequestConflict` if the recovery
+   journal already retains it, or if a configured legacy V1 journal retains
+   it. Reject a full recovery journal with `FencedTransitionHistoryFull`.
+   These checks run before provider or record-expiry work.
+4. Take the active epoch from the facade's cached linearized V2 history
+   state. The active epoch is the only epoch a new request may name. Every
+   history read commits a consensus logical-time fence, so the facade keeps
+   the read off the per-transition path: activation seeds the cache with one
+   linearized read through the exact roster, each reclamation sweep refreshes
+   it, and a preparation reads again only when the cache is empty or records
+   no active epoch or a full one. A newer observation always replaces an
+   older one. A cached epoch is safe because epochs only advance: a request
+   never names an epoch above the active one, and a request whose epoch
+   closed after it was cached is rejected at execution with `EpochNotActive`,
+   `Retired`, or `HistoryFull` without binding. That rejection invalidates
+   the cached epoch, so the next preparation reads its successor.
+   Maintenance opens a successor only after the active epoch is full, so a
+   fresh read would have given the same request `HistoryFull`. A read that
+   finds the active epoch full (131,072 bound receipts) returns
+   `FencedTransitionHistoryFull` without provider work or a journal row; the
+   operator's maintenance must open the successor.
+5. Run the authoritative record-expiry preflight for create and update
+   before any provider call.
+6. Seal a create or update record exactly once. Delete and refresh perform no
+   provider work.
+7. Build the V2 request from the active epoch, a fresh random caller nonce,
+   the lease, and the protected mutation. Its 56-byte ID commits to the sealed
+   body.
+8. Insert the binding from caller ID to the complete sealed request
+   create-only into the recovery journal, and sync it, before returning the
+   affine handle.
+
+Two concurrent preparations of the same absent ID may each make a provider
+call. Exactly one journal binding wins and the loser is a conflict before
+dispatch. If preparation fails after its row committed, for example because
+its deadline elapsed, the row is recoverable by the same ID and the ID
+conflicts until the row is released or reclaimed.
+
+### Execution, status, and recovery
+
+`execute_once` reloads and authenticates the journal row before every
+attempt. It compares the complete canonical row with the handle and
+dispatches only that sealed request through `/2`. A missing, corrupt, or
+mismatched row fails as `NotTransmitted` with no transport I/O. The result is
+one of:
+
+- an outcome that matches the exact request;
+- `Rejected` with a V2 pre-dispatch deterministic result
+  (`FencedTransitionHistoryEpochNotActive`,
+  `FencedTransitionHistoryEpochRetired`, `FencedTransitionHistoryFull`,
+  `FencedTransitionRetentionExhausted`, `FencedTransitionRequestExpired`,
+  `FencedTransitionRequestConflict`, or
+  `FencedTransitionStorageExhausted`), or with terminal
+  `TopologyAuthorityRevoked`;
+- `NotTransmitted` after every candidate voter proved a pre-dispatch failure;
+  or
+- `OutcomeUnknown { request_id }` carrying the caller-stable ID for any
+  may-have-sent result.
+
+`OutcomeUnknown` includes every response the `/2` client does not accept as
+an exact completion. For example, a recorded deterministic error such as a
+stale fence is not accepted on the execute response; exact status then
+reports it as `Recorded(Err(..))`. Cancellation after physical dispatch
+admission began is also treated as a possible send. After a possible send the
+handle is permanently receipt-only. There is no automatic re-dispatch.
+
+`status_once` and `status_until_terminal` return `FencedTransitionV2Status`
+for the exact retained request. `Recorded`, `Expired`, `Retired`,
+`EpochNotActive`, `HistoryFull`, `RetentionExhausted`, and `RequestConflict`
+are terminal and cached. `NotFound`, unavailability, and per-attempt
+deadlines are not terminal while the caller's absolute deadline remains. A
+local fail-closed row failure, for example a row that was released or
+reclaimed after the handle was opened, is cached as `Unavailable` and
+returned at once; it is final for that handle. The facade chose the active epoch at preparation, so the
+request's epoch is never above the active epoch. V2 status reads an exact
+receipt before it classifies the epoch or capacity, so `EpochNotActive`,
+`HistoryFull`, and `RetentionExhausted` prove that the retained transition
+has not bound a receipt and never will. `Retired` and `Expired` only prove
+that it can no longer bind: V2 classifies a request at or below the retired
+floor before any receipt lookup, and a floor advances only after the 24-hour
+result window, so a transition that committed earlier can later report
+either status. After a possible send, a caller must treat both as "may have
+taken effect" and derive later work from authoritative observation.
+`NotFound` remains non-exclusionary, as in V1: it does not prove that a
+delayed proposal cannot commit.
+
+`recover_fenced_transition_status(request_id, budget)` is a local journal
+lookup followed by receipt-only status:
+
+- a retained recovery-journal row yields
+  `SessionConsumerRecoveredFencedTransition::V2`;
+- otherwise, a row in a composed legacy V1 journal yields `LegacyV1` through
+  the existing V1 facade;
+- otherwise the result is `None`. This caller's journals retain no
+  transition for that ID: it was never prepared through them, or its row was
+  released or reclaimed after resolution;
+- a row in both journals fails closed with
+  `FencedTransitionRequestConflict`.
+
+A recovered handle has no execute method and never regains dispatch
+authority.
+
+### Reclamation and storage bound
+
+The recovery journal retains at most
+`FENCED_TRANSITION_V2_RECOVERY_JOURNAL_MAX_ENTRIES` (4,096) live rows. This is
+an admission fence, not a lifetime cap. The count is authenticated, and a full
+journal rejects a new ID with `FencedTransitionHistoryFull` before provider
+or transport work until a row is removed. A row is removed only by
+compare-and-delete of its exact authenticated bytes, and only in these cases:
+
+1. The original affine handle removes its own row when every candidate voter
+   proved `NotTransmitted`, when its execution was refused with
+   `TopologyAuthorityRevoked` (classified before any Call byte), or after a
+   definitive unbound rejection (`EpochNotActive`, `Retired`, `HistoryFull`,
+   or `RetentionExhausted`) of its single possible dispatch. In each case the
+   transition never bound a receipt and cannot bind one later. If that
+   removal fails or is cancelled, the handle stays resolved and
+   `release_resolved` retries it.
+2. `release_resolved` on a live or recovered handle removes its row after
+   that handle has observed a resolution: a matching outcome, one of the
+   execution results in case 1, any other definitive rejection, or a
+   terminal status other than `RequestConflict`.
+3. `reclaim_resolved_fenced_transitions(limit, budget)` is a bounded,
+   caller-scheduled sweep of at most 256 rows per call. The wrapper first
+   reads the linearized history state itself and removes rows at or below
+   that retired floor without further I/O; no caller supplies the floor. The
+   sweep then examines rows in caller-ID order from a process-local cursor,
+   reads each row's exact status, and removes those whose status is
+   `Expired`, `Retired`, `HistoryFull`, `RetentionExhausted`, or
+   `EpochNotActive` for an epoch below the linearized active epoch. It
+   retains `Recorded` rows until their receipt expires (the exact 24-hour V2
+   result window), and it retains `NotFound`, `RequestConflict`, and every
+   row whose status is unavailable. Status is read-only, so an unavailable
+   voter moves a row's read to the next canonical voter. The sweep stops as
+   interrupted when every voter failed for one row, when a local journal
+   read or removal fails, or at the caller's deadline.
+
+After a row is removed, `recover_fenced_transition_status` returns `None` for
+that ID. Removal ends the caller-level binding: the SDK keeps no tombstone,
+and the ID may be prepared again as a new transition. A caller must derive
+later work from authoritative observation, exactly as after `Expired`. Within
+the retention described above, exact replay, conflict, expiry, and
+`OutcomeUnknown` semantics are unchanged. A removed row can never make a
+retained body execute twice: only an original affine handle dispatches, and
+only its own authenticated row.
+
+The main database therefore never exceeds 4,096 rows of at most
+`FENCED_TRANSITION_MAX_PREPARED_BYTES` canonical sealed request plus fixed
+row metadata. It uses the same main-file, WAL, and shared-memory ceilings as
+the #701 journal; typical rows are the size of the sealed record. The bound
+is not absorbing. A resolved row is removable immediately. An unresolved
+`NotFound` row becomes removable once its epoch closes, because a request in a
+closed epoch can never bind. Until then it is retained: a crash after
+preparation, or a possible send whose status stays `NotFound`, holds one row
+until the shared active epoch reaches its 131,072 bindings and maintenance
+opens the successor. A deployment with little V2 traffic should therefore
+watch `retained_fenced_transitions` against the 4,096-row fence.
+
+### Maintenance composition
+
+V2 epoch rotation and retired-floor advancement remain the state process's
+replicated operator maintenance through
+`ConsensusSessionStore::maintain_fenced_transition_v2_history` on the local
+leader, as described in [Epoch lifecycle and maintenance](#epoch-lifecycle-and-maintenance).
+The facade has no maintenance authority and adds no consumer-lane maintenance
+operation. It observes maintenance only through the linearized history state.
+New preparations follow a rotated active epoch once the facade observes it:
+through the next reclamation sweep, or after the first epoch rejection
+invalidates its cache. The sweep uses the retired floor. While the active
+epoch is full and its successor is not open, preparation fails closed with
+`FencedTransitionHistoryFull`. A downstream consumer that runs the sweep on a
+regular cadence therefore also bounds how long its facade can keep a closed
+epoch cached.
+
+### Mixed V1/V2 upgrade
+
+`with_legacy_v1_recovery` composes an existing
+`SessionConsumerPreparedFencedTransitionBackend` for the same scope. It
+consumes that V1 facade, so the upgraded process can no longer prepare V1
+transitions through it. V2 preparation rejects an ID retained in the V1
+journal, and unified recovery returns `LegacyV1` for it. Retained V1 rows keep
+their exact V1 status recovery; the V1 journal never deletes rows, and V1
+capacity and semantics are unchanged. The only supported upgrade order is to
+stop V1 preparation, compose legacy recovery, and then enable V2 preparation.
+Running a separate V1 facade over the same journal after that point is
+unsupported.
+
+A protection wrapper configured with both journals also excludes concurrent
+preparations of one caller ID in-process, per opened recovery-journal
+instance. Each preparation holds an admission for its ID on that instance
+from its check of the other
+journal through its own create-only insert, so a concurrent V1 and V2
+preparation of the same ID cannot both bind; the later one is
+`FencedTransitionRequestConflict` before provider work.
+
+The recovery journal's schema and key domain are downgrade fences. A binary
+that predates this facade cannot read the journal and cannot recover a V2
+transition prepared through it. Before rolling back, release or reclaim every
+retained row.
+
+### Consumer adoption
+
+A downstream consumer of the #701 V1 facade adopts the V2 facade in these
+steps:
+
+1. Provision a `FencedTransitionV2RecoveryJournal` with its own independent
+   key on a private durable volume: `create_new` exactly once, then
+   `open_existing` on every restart.
+2. Activate the same persistent clients with
+   `persistent_exact_voter_prewarm_roster`, and construct the facade with the
+   constructor that matches the existing protection mode and payload
+   namespace. Compose the existing V1 facade with `with_legacy_v1_recovery`
+   before the first V2 preparation.
+3. Replace the V1 facade's `prepare_fenced_transition` and the handle's
+   `execute_once` with the V2 methods of the same names. The request type,
+   caller-stable ID, and execution result types are unchanged. Receipt status
+   is `FencedTransitionV2Status`.
+4. Replace V1 restart recovery with `recover_fenced_transition_status`, which
+   returns `V2` or `LegacyV1`. `Recorded` carries the exact result.
+   `EpochNotActive`, `HistoryFull`, and `RetentionExhausted` prove that the
+   transition has not taken effect and never will. `Retired` and `Expired`
+   prove only that it can no longer take effect; like V1 `Expired`, the
+   caller derives later work from authoritative observation. `NotFound` is
+   never an absence decision: keep the row and retry later.
+5. Call `release_resolved` once a transition's result has been consumed, and
+   run `reclaim_resolved_fenced_transitions` on a regular cadence. The
+   consumer process owns that sweep. The state process's operator loop owns
+   `ConsensusSessionStore::maintain_fenced_transition_v2_history`: it opens
+   the successor once the active epoch is full and later advances the
+   retired floor. Without it, a full epoch fails every new preparation
+   closed with `FencedTransitionHistoryFull`.
+6. Treat `Rejected` with `FencedTransitionHistoryEpochNotActive`,
+   `FencedTransitionHistoryEpochRetired`, or `FencedTransitionHistoryFull`
+   from `execute_once` as a definitive rejection that bound nothing. The
+   handle has already removed its row and invalidated the cached epoch, so
+   the caller may prepare the same caller ID again. After `HistoryFull`, that
+   preparation fails closed until maintenance opens the successor epoch. If
+   the row could not be removed, recovery reports the terminal status and
+   `release_resolved` removes it.
+
+### Recovery journal persistence and security
+
+The recovery journal uses the #701 journal's provisioning rules: `create_new`
+exactly once for a missing path and `open_existing` on every restart. It uses
+the same private path, local-filesystem, POSIX lock and sync requirements, the
+same SQLite profile and bounded limits, an exact catalog whitelist, an
+authenticated membership count and root, per-row HMAC authentication, and the
+same wiping allocations. It has a separate file, application ID, schema, and
+key domain. On first use it binds to one wrapper scope: the protection mode,
+the payload namespace, and the facade's authenticated-consumer binding (the
+local authenticated identity commitment and the stable cluster ID). That scope
+excludes endpoint, leader, configuration epoch, and credential material, so
+authorized topology and credential rotation keep the same journal. A different
+scope cannot turn a retained row into an absence decision. The journal key
+must be independent of payload, provider, TLS, and other journal keys.
+
+The journal authenticates rows but does not encrypt them; create and update
+rows contain ciphertext, never payload plaintext. Request IDs, rows, payloads,
+paths, keys, and provider material must not appear in logs, metrics, errors,
+diagnostics, or evidence. The facade claims process-restart recovery only
+while the same durable volume, path, key, protection mode and namespace,
+local identity, and stable cluster remain available. It does not claim host
+failover, volume-loss recovery, or a replicated journal.
+
 ## Validation and diagnostics
 
 Request construction and the public entry point run time-independent semantic
@@ -740,7 +1080,9 @@ V2-specific status set. The protected-roster `/3` lane is also revision 5, but
 is roster-only under its tenant/scope/fence authority; `/2` neither counts nor
 reclaims its lanes. None of the lanes exposes a generic backend, replication,
 membership, snapshot, rebuild, or administrative authority. Product/ePDG
-composition and workflow semantics remain outside this SDK operation.
+composition and workflow semantics remain outside this SDK operation. The #982
+facade composes the existing `/2` operations only; it adds no wire operation,
+and its caller-stable ID never crosses the wire.
 
 For the general `/1` revision-6 consumer surface, the public request ID is byte-identical
 to the nested 16-byte V1 transition ID. The internal V1 receipt ID is

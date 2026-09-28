@@ -2404,3 +2404,90 @@ fn value_truncated_ie_reports_start_offset() {
         Err(error) if matches!(error.code(), DecodeErrorCode::Truncated) && error.offset() == 0
     ));
 }
+
+/// TS 29.274 Table 8.4-1 places causes 18 and 19 in the acceptance range. A
+/// PGW that narrows an IPv4v6 request returns one of them together with the
+/// complete accepted session and a PAA of the selected PDN type.
+#[test]
+fn create_session_new_pdn_type_causes_project_as_accepted_with_narrowed_paa() {
+    let ipv6_prefix = [
+        0x20, 0x01, 0x0d, 0xb8, 0x00, 0x01, 0x00, 0x02, 0, 0, 0, 0, 0, 0, 0, 0,
+    ];
+    let mut ipv6_paa = vec![IE_TYPE_PAA, 0x00, 0x12, 0x00, 0x02, 64];
+    ipv6_paa.extend_from_slice(&ipv6_prefix);
+    let ipv4_paa = [IE_TYPE_PAA, 0x00, 0x05, 0x00, 0x01, 192, 0, 2, 33];
+    let fixtures: [(u8, &[u8], PdnTypeValue); 4] = [
+        (18, &ipv4_paa, PdnTypeValue::Ipv4),
+        (18, &ipv6_paa, PdnTypeValue::Ipv6),
+        (19, &ipv4_paa, PdnTypeValue::Ipv4),
+        (19, &ipv6_paa, PdnTypeValue::Ipv6),
+    ];
+
+    for (code, paa, expected_pdn_type) in fixtures {
+        let expected_cause = CauseValue::from(code);
+        assert_eq!(expected_cause.as_u8(), code, "cause {code}");
+        let cause_ie = [IE_TYPE_CAUSE, 0x00, 0x02, 0x00, code, 0x00];
+        let response = create_session_response_with_projection_ies(
+            Some(0x0102_0304),
+            0x0000_2000,
+            &[
+                cause_ie.as_slice(),
+                PGW_CONTROL_F_TEID_IE,
+                BEARER_CONTEXT_WITH_USER_PLANE_FTEID_IE,
+                paa,
+            ],
+        );
+        assert!(
+            S2bMessage::decode(&response, procedure_context()).is_ok(),
+            "cause {code} accepted response validates"
+        );
+        let summary = s2b::decode_create_session_response_summary(&response, procedure_context())
+            .unwrap_or_else(|error| panic!("cause {code} projection failed: {error:?}"));
+        let s2b::CreateSessionResponseSummary::Accepted(accepted) = summary else {
+            panic!("cause {code} projected as rejected");
+        };
+        assert_eq!(accepted.cause, expected_cause);
+        assert_eq!(accepted.pgw_control_f_teid.teid, 0x5566_7788);
+        assert_eq!(accepted.bearer_ebi.value, 5);
+        assert_eq!(accepted.bearer_user_plane_f_teid.teid, 0x1122_3344);
+        let projected_paa = accepted.paa.expect("narrowed PAA is projected");
+        assert_eq!(projected_paa.pdn_type, expected_pdn_type, "cause {code}");
+
+        // An accepted narrowed response still requires the accepted bearer.
+        let missing_bearer = create_session_response_with_projection_ies(
+            Some(0x0102_0304),
+            0x0000_2000,
+            &[cause_ie.as_slice(), PGW_CONTROL_F_TEID_IE, paa],
+        );
+        assert!(S2bMessage::decode(&missing_bearer, procedure_context()).is_err());
+        assert_eq!(
+            s2b::decode_create_session_response_summary(&missing_bearer, procedure_context()),
+            Err(s2b::CreateSessionResponseSummaryError::AcceptedResponseMissingBearerContext)
+        );
+    }
+}
+
+#[test]
+fn new_pdn_type_cause_values_are_modelled_and_scoped_to_create_session() {
+    for (code, cause) in [
+        (18, CauseValue::NewPdnTypeDueToNetworkPreference),
+        (19, CauseValue::NewPdnTypeDueToSingleAddressBearerOnly),
+    ] {
+        assert_eq!(CauseValue::from(code), cause);
+        assert_eq!(cause.as_u8(), code);
+        assert!(!cause.is_rejection());
+        assert!(!cause.is_partially_accepted());
+        assert!(cause.is_new_pdn_type());
+        assert!(cause.is_create_session_accepted());
+    }
+
+    // The generic acceptance predicate keeps its existing 16/17 scope; 18 and
+    // 19 are only defined for PDN connection establishment responses.
+    assert!(!CauseValue::NewPdnTypeDueToNetworkPreference.is_accepted());
+    assert!(!CauseValue::NewPdnTypeDueToSingleAddressBearerOnly.is_accepted());
+    assert!(CauseValue::RequestAccepted.is_create_session_accepted());
+    assert!(CauseValue::RequestAcceptedPartially.is_create_session_accepted());
+    assert!(!CauseValue::RequestAccepted.is_new_pdn_type());
+    assert!(!CauseValue::MandatoryIeMissing.is_create_session_accepted());
+    assert!(!CauseValue::Unknown(20).is_create_session_accepted());
+}
