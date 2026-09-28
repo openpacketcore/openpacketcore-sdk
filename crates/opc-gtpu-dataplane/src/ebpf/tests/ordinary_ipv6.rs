@@ -548,3 +548,26 @@ async fn cleanup_only_recovery_still_refuses_a_grouped_journal_on_an_ordinary_gr
         "a grouped transaction journal is a different writer domain"
     );
 }
+
+#[tokio::test]
+async fn ipv6_scoped_removal_never_reaches_the_ipv4_context_on_the_same_teid() {
+    let (backend, _runtime) = backend_with_fake();
+    backend.create_device(create_request()).await.unwrap();
+    let ipv4 = context();
+    backend.install_pdp_context(ipv4.clone()).await.unwrap();
+
+    backend
+        .remove_pdp_context(RemovePdpContextRequest {
+            address_family: GtpAddressFamily::Ipv6,
+            ..RemovePdpContextRequest::from_context(&ipv4)
+        })
+        .await
+        .unwrap();
+    assert_eq!(
+        backend
+            .read_pdp_context(local_selector(&ipv4))
+            .await
+            .unwrap(),
+        PdpContextReadback::Present(ipv4)
+    );
+}
