@@ -571,3 +571,164 @@ async fn ipv6_scoped_removal_never_reaches_the_ipv4_context_on_the_same_teid() {
         PdpContextReadback::Present(ipv4)
     );
 }
+
+fn second_ipv6_context() -> GtpPdpContext {
+    GtpPdpContext {
+        ms_address: IpAddr::V6("2001:db8:45:2::".parse().unwrap()),
+        local_teid: Teid::new(context().local_teid.get() + 1).unwrap(),
+        ..context()
+    }
+}
+
+fn ordinary_authority_present(state: &FakeState) -> (bool, bool) {
+    let pin_dir = PathBuf::from(DEFAULT_BPFFS_PIN_ROOT).join("s2bu");
+    (
+        state.pinned_grouped_config.contains_key(&pin_dir),
+        state.grouped_schema_ready.contains(&pin_dir),
+    )
+}
+
+/// The family-tagged authority exists only while an inner-IPv6 context does.
+/// Removing the last one retires it, so a drained graph is identical to one
+/// that never carried inner IPv6 (legacy terminal-successor recovery requires
+/// both slots zero).
+#[tokio::test]
+async fn ordinary_ipv6_authority_is_retired_with_the_last_inner_ipv6_context() {
+    let (backend, runtime) = backend_with_fake();
+    backend.create_device(create_request()).await.unwrap();
+    let ipv4 = context();
+    let first = ipv6_context();
+    let second = second_ipv6_context();
+    for desired in [&ipv4, &first, &second] {
+        backend.install_pdp_context(desired.clone()).await.unwrap();
+    }
+    assert_eq!(ordinary_authority_present(&runtime.state()), (true, true));
+    assert_eq!(
+        backend.remove_pdp_context_exact(first).await.unwrap(),
+        PdpContextRemovalOutcome::Removed
+    );
+    assert_eq!(
+        ordinary_authority_present(&runtime.state()),
+        (true, true),
+        "another inner-IPv6 context still needs the authority"
+    );
+    assert_eq!(
+        backend
+            .remove_pdp_context_exact(second.clone())
+            .await
+            .unwrap(),
+        PdpContextRemovalOutcome::Removed
+    );
+    assert_eq!(ordinary_authority_present(&runtime.state()), (false, false));
+    // IPv4 is untouched, and a later inner-IPv6 install initializes afresh.
+    assert_eq!(
+        backend
+            .read_pdp_context(local_selector(&ipv4))
+            .await
+            .unwrap(),
+        PdpContextReadback::Present(ipv4)
+    );
+    assert_eq!(
+        backend
+            .install_pdp_context_classified(second)
+            .await
+            .unwrap(),
+        PdpContextInstallOutcome::Installed
+    );
+    assert_eq!(ordinary_authority_present(&runtime.state()), (true, true));
+}
+
+/// A drained authority left by an interrupted retirement is retired by the
+/// next inner-IPv6 removal on that attachment, even for an absent context.
+#[tokio::test]
+async fn ordinary_ipv6_removal_completes_an_interrupted_retirement() {
+    for schema_written in [true, false] {
+        let (backend, runtime) = backend_with_fake();
+        backend.create_device(create_request()).await.unwrap();
+        let config = GtpuSessionDeviceConfig::new(
+            GtpuSessionDeviceId::new([0x42; GTPU_SESSION_GROUP_ID_LEN]).unwrap(),
+            S2BU_IFINDEX,
+            Some([192, 0, 2, 1]),
+            None,
+        )
+        .unwrap();
+        {
+            let mut state = runtime.state();
+            let pin_dir = PathBuf::from(DEFAULT_BPFFS_PIN_ROOT).join("s2bu");
+            state
+                .pinned_grouped_config
+                .insert(pin_dir.clone(), config.encode());
+            if schema_written {
+                state.grouped_schema_ready.insert(pin_dir);
+            }
+        }
+        backend
+            .remove_pdp_context(RemovePdpContextRequest::from_context(&ipv6_context()))
+            .await
+            .unwrap();
+        assert_eq!(
+            ordinary_authority_present(&runtime.state()),
+            (false, false),
+            "schema written: {schema_written}"
+        );
+    }
+}
+
+/// A crash between the authority's config and schema writes leaves a
+/// config-only authority with nothing published. Cleanup-only recovery
+/// accepts it as the ordinary attachment's own authority, exactly as the
+/// ordinary install path resumes it.
+#[tokio::test]
+async fn cleanup_only_recovery_accepts_a_config_only_ordinary_authority() {
+    let (backend, runtime) = backend_with_fake();
+    backend.create_device(create_request()).await.unwrap();
+    let config = GtpuSessionDeviceConfig::new(
+        GtpuSessionDeviceId::new([0x42; GTPU_SESSION_GROUP_ID_LEN]).unwrap(),
+        S2BU_IFINDEX,
+        Some([192, 0, 2, 1]),
+        None,
+    )
+    .unwrap();
+    runtime.state().pinned_grouped_config.insert(
+        PathBuf::from(DEFAULT_BPFFS_PIN_ROOT).join("s2bu"),
+        config.encode(),
+    );
+    simulate_process_loss(&runtime, false);
+
+    let recovered = EbpfGtpuDataplaneBackend::with_runtime(runtime.clone());
+    assert_eq!(
+        recovered
+            .acquire_cleanup_only_recovery(cleanup_request(
+                Ipv4Addr::new(192, 0, 2, 1),
+                S2BU_IFINDEX,
+            ))
+            .await
+            .unwrap(),
+        RetainedGraphCleanupClassification::Acquired
+    );
+}
+
+/// Whichever selector write an interrupted publication completed, the
+/// family-scoped removal by local TEID finds and removes it: no uplink
+/// selector can be orphaned beyond the downlink selector's reach.
+#[tokio::test]
+async fn ordinary_ipv6_teid_removal_leaves_no_selector_after_an_interrupted_publication() {
+    for failed_put in ["session_uplink_put", "session_downlink_put"] {
+        let (backend, runtime) = backend_with_fake();
+        backend.create_device(create_request()).await.unwrap();
+        let desired = ipv6_context();
+        runtime.fail_in_order([failed_put]);
+        assert!(
+            backend.install_pdp_context(desired.clone()).await.is_err(),
+            "{failed_put}"
+        );
+        backend
+            .remove_pdp_context(RemovePdpContextRequest::from_context(&desired))
+            .await
+            .unwrap();
+        let state = runtime.state();
+        assert!(state.session_groups.is_empty(), "{failed_put}");
+        assert!(state.session_uplink_index.is_empty(), "{failed_put}");
+        assert!(state.session_downlink_index.is_empty(), "{failed_put}");
+    }
+}

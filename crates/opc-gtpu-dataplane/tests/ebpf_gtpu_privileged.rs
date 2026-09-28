@@ -10448,6 +10448,23 @@ async fn current_graph_recovery_fences_live_owner_and_recovers_after_interface_l
     let mut create = CreateGtpDeviceRequest::new("s2bu");
     create.bind_address = IpAddr::V4(EPDG_S2BU_IP);
     let old_device = owner.create_device(create).await?;
+    // The ordinary owner once carried an inner-IPv6 context and drained it.
+    // Recovery of that drained graph must succeed exactly as for a graph that
+    // never carried inner IPv6.
+    let drained_ipv6 = GtpPdpContext {
+        ms_address: IpAddr::V6(Ipv6Addr::new(0x2001, 0xdb8, 0x45, 0, 0, 0, 0, 0)),
+        ..session_context(old_device.ifindex)
+    };
+    assert_eq!(
+        owner
+            .install_pdp_context_classified(drained_ipv6.clone())
+            .await?,
+        PdpContextInstallOutcome::Installed
+    );
+    assert_eq!(
+        owner.remove_pdp_context_exact(drained_ipv6).await?,
+        PdpContextRemovalOutcome::Removed
+    );
     let pin_dir = net.pin_root.join("s2bu");
     let recovery = EbpfGtpuDataplaneBackend::with_config(config.clone());
     let legacy_request = CurrentEbpfGraphRecoveryRequest::new(
@@ -13422,6 +13439,27 @@ async fn ebpf_gtpu_ordinary_inner_ipv6_live_contract() -> Result<(), Box<dyn std
     assert_eq!(
         adopted.remove_pdp_context_exact(ipv6.clone()).await?,
         PdpContextRemovalOutcome::Removed
+    );
+    // The last inner-IPv6 context retires the family-tagged authority, so the
+    // drained graph is identical to one that never carried inner IPv6.
+    let authority_pin_dir = net.pin_root.join("s2bu");
+    assert_eq!(
+        pinned_array_values::<GTPU_SESSION_CONFIG_VALUE_LEN>(
+            &authority_pin_dir,
+            MAP_CONFIG_IPV6,
+            1
+        ),
+        vec![[0; GTPU_SESSION_CONFIG_VALUE_LEN]],
+        "the last inner-IPv6 removal must retire GTPU_CONFIG6"
+    );
+    assert_eq!(
+        pinned_array_values::<GTPU_SESSION_SCHEMA_MARKER_LEN>(
+            &authority_pin_dir,
+            MAP_SESSION_SCHEMA,
+            1
+        ),
+        vec![[0; GTPU_SESSION_SCHEMA_MARKER_LEN]],
+        "the last inner-IPv6 removal must retire GTPU_SCHEMA6"
     );
     send_raw_ipv6_packet(
         &net.ue_ns,
