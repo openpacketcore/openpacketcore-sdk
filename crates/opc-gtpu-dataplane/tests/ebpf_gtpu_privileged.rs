@@ -11443,6 +11443,9 @@ async fn cleanup_only_activation_failure_leaves_the_device_fenced_and_retryable(
         gate != 0 && gate % 2 == 0,
         "a failed activation must leave the traffic gate packet-inert: {gate}"
     );
+    // With the graph exact again, the backend still holds the device
+    // cleanup-only, agreeing with the runtime: installation stays fenced.
+    replace_pinned_pmtu_policy(&pin_dir, executable);
     assert_eq!(
         recovered
             .install_pdp_context_classified(stale.clone())
@@ -11453,7 +11456,6 @@ async fn cleanup_only_activation_failure_leaves_the_device_fenced_and_retryable(
         "the backend must still hold the device cleanup-only"
     );
 
-    replace_pinned_pmtu_policy(&pin_dir, executable);
     recovered.activate_cleanup_recovery(&device).await?;
     for direction in ["egress", "ingress"] {
         let filters = tc_filters(direction);

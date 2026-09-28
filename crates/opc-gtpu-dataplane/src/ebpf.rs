@@ -1522,6 +1522,14 @@ pub(crate) trait EbpfGtpuRuntime: Send + Sync + fmt::Debug {
 
     /// Activate a cleanup-only managed device: attach the forwarding programs
     /// and links, transitioning it to a normal active attachment.
+    ///
+    /// Activation is all or nothing. Every fallible proof of the attached
+    /// graph and of the fresh traffic source runs while the traffic gate is
+    /// still even (packet-inert), and enabling the gate is the commit. On any
+    /// error the device is still cleanup-only, with its hooks detached and the
+    /// gate even; a rollback that cannot be proven is
+    /// [`GtpuError::StateIndeterminate`], and the device is still cleanup-only
+    /// then too, so a retry fences the gate again before it reattaches.
     #[cfg(any(target_os = "linux", test))]
     fn activate_cleanup_only(
         &self,
@@ -10469,29 +10477,30 @@ impl EbpfGtpuDataplaneBackend {
             Err(error) => return Err(error),
         }
         let mut devices = self.devices()?;
-        {
-            let managed = devices.get(&device.ifindex).ok_or(GtpuError::NotFound)?;
-            if managed.name != device.name {
-                return Err(GtpuError::NotFound);
-            }
-            if !managed.cleanup_only {
-                return Err(GtpuError::AlreadyExists);
-            }
+        let managed = devices
+            .get_mut(&device.ifindex)
+            .ok_or(GtpuError::NotFound)?;
+        if managed.name != device.name {
+            return Err(GtpuError::NotFound);
         }
-        // Activation starts a fresh kernel traffic source before it enables
-        // the gate, so drop the host high-water first. Acquisition already
-        // reset it and the gate stayed even since, so a failed activation
-        // loses no accepted sequence.
-        self.reset_traffic_sequence_source(device.ifindex)?;
+        if !managed.cleanup_only {
+            return Err(GtpuError::AlreadyExists);
+        }
+        // The runtime either commits the whole activation or leaves the
+        // device cleanup-only and fenced, and every fallible host step runs
+        // before it, so this flag and the runtime change together or not at
+        // all. The host sequence window is held across the call and dropped
+        // only once the runtime reports that its fresh traffic source is
+        // reset and enabled, as `reset_traffic_sequence_source` requires.
+        let mut sequence_sources = self.traffic_sequence_sources()?;
         self.inner.runtime.activate_cleanup_only(
             &device.name,
             device.ifindex,
             &self.pin_dir(&device.name),
             self.inner.config.tc_priority,
         )?;
-        if let Some(managed) = devices.get_mut(&device.ifindex) {
-            managed.cleanup_only = false;
-        }
+        sequence_sources.remove(&device.ifindex);
+        managed.cleanup_only = false;
         Ok(device)
     }
 
@@ -12311,7 +12320,9 @@ impl EbpfGtpuDataplaneBackend {
     /// The kernel source reset starts its producer sequence from zero. Drop
     /// only the matching host high-water after the runtime reports that reset
     /// fully succeeded; retaining it would reject every new-source event as a
-    /// replay.
+    /// replay. A caller that must not fail once the runtime has committed
+    /// (cleanup-only activation) instead holds [`Self::traffic_sequence_sources`]
+    /// across the runtime call and removes the entry after it succeeds.
     fn reset_traffic_sequence_source(&self, ifindex: u32) -> Result<(), GtpuError> {
         self.traffic_sequence_sources()?.remove(&ifindex);
         Ok(())
@@ -40822,17 +40833,16 @@ mod aya_runtime {
             _pin_dir: &Path,
             tc_priority: u16,
         ) -> Result<EbpfAttachmentDisposition, GtpuError> {
-            let ownership =
-                self.selector_namespace_ownership(ifindex, "ebpf_activate_cleanup_only")?;
-            let _graph_lock =
-                Self::acquire_operation_control_lock(&ownership, "ebpf_activate_cleanup_only")?;
+            const OPERATION: &str = "ebpf_activate_cleanup_only";
+            let ownership = self.selector_namespace_ownership(ifindex, OPERATION)?;
+            let _graph_lock = Self::acquire_operation_control_lock(&ownership, OPERATION)?;
             let mut devices = self
                 .devices
                 .lock()
-                .map_err(|_| GtpuError::io("ebpf_activate_cleanup_only", super::poisoned_lock()))?;
+                .map_err(|_| GtpuError::io(OPERATION, super::poisoned_lock()))?;
             let device = devices.get_mut(&ifindex).ok_or(GtpuError::NotFound)?;
             if !Arc::ptr_eq(&device._reconciler_ownership, &ownership) {
-                return Err(state_indeterminate("ebpf_activate_cleanup_only"));
+                return Err(state_indeterminate(OPERATION));
             }
             if !device.cleanup_only {
                 return Err(GtpuError::AlreadyExists);
@@ -40846,9 +40856,9 @@ mod aya_runtime {
             }
             // Cleanup-only acquisition left the retained traffic gate at an
             // even, packet-inert incarnation. Start a fresh source incarnation
-            // while the hooks are still fenced, attach, then prove quiescence
-            // and enable it exactly as ordinary adoption does; otherwise the
-            // reattached programs would pass every packet unchanged.
+            // while the hooks are still fenced and attach them. The gate stays
+            // even, so the attached programs pass every packet unchanged
+            // until the commit below.
             let traffic_observation_gate =
                 Self::reset_traffic_observation_source(&mut device.ebpf)?;
             let attached = self.attach_programs_by_ifindex(
@@ -40857,18 +40867,41 @@ mod aya_runtime {
                 &device.pin_dir,
                 tc_priority,
             )?;
-            if let Err(error) = Self::verify_traffic_observation_source_quiescent(
-                &mut device.ebpf,
-                traffic_observation_gate,
+            // Every fallible proof precedes the commit. Present the attached
+            // graph as active in memory only, re-prove the complete live graph
+            // (interface, control directory, exact identity, tc placement,
+            // executable PMTU policy) and the quiescent fresh source while the
+            // gate is still even, then enable the gate as ordinary adoption
+            // does. The enable is the commit and the last fallible step.
+            let fenced_identity =
+                std::mem::replace(&mut device.datapath_identity, attached.identity.clone());
+            device.cleanup_only = false;
+            let committed = Self::selector_namespace_graph_identity(
+                ifindex,
+                device,
+                &ownership,
+                &_graph_lock,
+                OPERATION,
             )
+            .and_then(|_| {
+                Self::verify_traffic_observation_source_quiescent(
+                    &mut device.ebpf,
+                    traffic_observation_gate,
+                )
+            })
             .and_then(|()| {
                 Self::enable_traffic_observation_source(&mut device.ebpf, traffic_observation_gate)
-            }) {
-                // Keep the device cleanup-only and fenced: restore the even
-                // gate and always detach the hooks this call attached, even
-                // when they replaced an exact predecessor, so no attachment
-                // survives behind a gate that may still be odd. Any failed
-                // step, or a replaced predecessor, is indeterminate.
+            });
+            if let Err(error) = committed {
+                // Keep the device cleanup-only and fenced: restore its fenced
+                // identity and the even gate, and always detach the hooks this
+                // call attached, even when they replaced an exact predecessor,
+                // so no attachment survives behind a gate that may still be
+                // odd. Any failed step, or a replaced predecessor, is
+                // indeterminate; the device stays cleanup-only either way, so
+                // a retry fences the gate again before it reattaches.
+                device.cleanup_only = true;
+                device.datapath_identity = fenced_identity;
                 let gate_restored = Self::disable_traffic_observation_source_exact(
                     &mut device.ebpf,
                     traffic_observation_gate,
@@ -40883,19 +40916,10 @@ mod aya_runtime {
                     error,
                     detached.and(gate_restored),
                     attached.replaced_existing,
-                    "ebpf_activate_cleanup_only",
+                    OPERATION,
                 ));
             }
-            device.datapath_identity = attached.identity;
             device.links = Some(attached.links);
-            device.cleanup_only = false;
-            Self::selector_namespace_graph_identity(
-                ifindex,
-                device,
-                &ownership,
-                &_graph_lock,
-                "ebpf_activate_cleanup_only",
-            )?;
             Ok(EbpfAttachmentDisposition::Retained)
         }
 
@@ -58467,8 +58491,10 @@ mod tests {
                 });
             }
             // Mirror the production order: a fresh even source incarnation
-            // while fenced, attach, then enable the gate. A failure at any
-            // step leaves the device fenced, cleanup-only and retryable.
+            // while fenced, attach, re-prove the attached graph and the
+            // quiescent source while the gate is still even, then enable the
+            // gate as the commit. A failure at any step leaves the device
+            // fenced, cleanup-only and retryable.
             Self::reset_traffic_observation_source(&mut state, [ifindex])?;
             Self::fail_if_requested(&mut state, "activate_cleanup_only_attach")?;
             state.uplink_filter_ready.insert(ifindex);
@@ -58484,11 +58510,14 @@ mod tests {
                 .get(&ifindex)
                 .copied()
                 .and_then(|disabled| disabled.checked_add(1));
-            if let Err(error) = Self::verify_traffic_observation_source_quiescent(
-                &mut state, ifindex,
-            )
-            .and_then(|()| Self::enable_traffic_observation_source(&mut state, ifindex).map(|_| ()))
-            {
+            let committed = Self::cleanup_activation_graph_is_exact(&mut state, ifindex, pin_dir)
+                .and_then(|()| {
+                    Self::verify_traffic_observation_source_quiescent(&mut state, ifindex)
+                })
+                .and_then(|()| {
+                    Self::enable_traffic_observation_source(&mut state, ifindex).map(|_| ())
+                });
+            if let Err(error) = committed {
                 // Restore through the exact disable path, then detach
                 // regardless; a failed restore is indeterminate.
                 let gate_restored = enabled.map_or_else(
@@ -58507,7 +58536,6 @@ mod tests {
                 });
             }
             state.cleanup_only.remove(&ifindex);
-            Self::cleanup_activation_graph_is_exact(&mut state, ifindex, pin_dir)?;
             Ok(EbpfAttachmentDisposition::Retained)
         }
 
@@ -79775,19 +79803,23 @@ mod tests {
             } else {
                 runtime.fail_in_order(["activate_cleanup_only_graph_identity"]);
             }
+            let activation = recovered.activate_cleanup_recovery(&device).await;
+            // The re-proof reports a non-executable slot as indeterminate; an
+            // injected failure is returned as is once the rollback is proven.
             assert!(
-                matches!(
-                    recovered.activate_cleanup_recovery(&device).await,
-                    Err(GtpuError::StateIndeterminate { .. })
-                ),
-                "{failure}"
+                if failure == "non_executable_pmtu_slot" {
+                    matches!(activation, Err(GtpuError::StateIndeterminate { .. }))
+                } else {
+                    activation.is_err()
+                },
+                "{failure}: {activation:?}"
             );
             assert!(runtime.state().failures.is_empty(), "{failure}");
+            runtime.state().pmtu_policy.insert(S2BU_IFINDEX, executable);
             assert_failed_activation_is_fenced_and_retryable(
                 &runtime, &recovered, &installed, failure,
             )
             .await;
-            runtime.state().pmtu_policy.insert(S2BU_IFINDEX, executable);
             assert_activation_retry_forwards(&runtime, &recovered, installed, &device, failure)
                 .await;
         }
