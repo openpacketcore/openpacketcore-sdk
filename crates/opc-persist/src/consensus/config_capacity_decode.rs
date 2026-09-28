@@ -95,6 +95,23 @@ impl<'de, const MAX: usize> Deserialize<'de> for Bytes<MAX> {
                 f.write_str("bounded configuration byte array")
             }
 
+            fn visit_bytes<E: de::Error>(self, value: &[u8]) -> Result<Self::Value, E> {
+                // Postcard has already checked that the whole declared slice
+                // exists in the bounded frame. Check the independent field
+                // ceiling before allocating, then copy once into its owner.
+                if value.len() > MAX {
+                    return Err(invalid());
+                }
+                let mut bytes = Vec::new();
+                bytes
+                    .try_reserve_exact(value.len())
+                    .map_err(|_| invalid::<E>())?;
+                bytes.extend_from_slice(value);
+                #[cfg(test)]
+                allocation_tests::observe_bulk_copy(value.len(), bytes.capacity());
+                Ok(Bytes(bytes))
+            }
+
             fn visit_seq<A: SeqAccess<'de>>(self, mut input: A) -> Result<Self::Value, A::Error> {
                 let hint = input.size_hint();
                 let extent = hint.unwrap_or(MAX);
@@ -103,6 +120,8 @@ impl<'de, const MAX: usize> Deserialize<'de> for Bytes<MAX> {
                 }
                 let mut bytes = Vec::new();
                 while let Some(byte) = input.next_element::<u8>()? {
+                    #[cfg(test)]
+                    allocation_tests::observe_sequence_element();
                     if bytes.len() == extent {
                         return Err(invalid());
                     }
@@ -115,7 +134,15 @@ impl<'de, const MAX: usize> Deserialize<'de> for Bytes<MAX> {
                 Ok(Bytes(bytes))
             }
         }
-        deserializer.deserialize_seq(BytesVisitor::<MAX>)
+        if deserializer.is_human_readable() {
+            // JSON byte strings are not part of the existing schema. Keep
+            // strict numeric arrays and their bounded incremental reserves.
+            deserializer.deserialize_seq(BytesVisitor::<MAX>)
+        } else {
+            // Vec<u8> and a byte slice have the same postcard length prefix
+            // and byte body. Avoid millions of per-element Serde callbacks.
+            deserializer.deserialize_bytes(BytesVisitor::<MAX>)
+        }
     }
 }
 

@@ -2,6 +2,133 @@
 //! field ceilings. These are component observations, not a whole-store peak.
 
 use super::*;
+use std::cell::Cell;
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct DecodeWork {
+    bulk_copies: usize,
+    copied_bytes: usize,
+    allocated_bytes: usize,
+    sequence_elements: usize,
+}
+
+thread_local! {
+    static WORK: Cell<Option<DecodeWork>> = const { Cell::new(None) };
+}
+
+pub(super) fn observe_bulk_copy(bytes: usize, capacity: usize) {
+    WORK.with(|work| {
+        if let Some(mut value) = work.get() {
+            value.bulk_copies += 1;
+            value.copied_bytes += bytes;
+            value.allocated_bytes += capacity;
+            work.set(Some(value));
+        }
+    });
+}
+
+pub(super) fn observe_sequence_element() {
+    WORK.with(|work| {
+        if let Some(mut value) = work.get() {
+            value.sequence_elements += 1;
+            work.set(Some(value));
+        }
+    });
+}
+
+fn observe<T>(run: impl FnOnce() -> T) -> (T, DecodeWork) {
+    struct Reset;
+    impl Drop for Reset {
+        fn drop(&mut self) {
+            WORK.with(|work| work.set(None));
+        }
+    }
+    WORK.with(|work| {
+        assert!(work.get().is_none());
+        work.set(Some(DecodeWork::default()));
+    });
+    let reset = Reset;
+    let result = run();
+    let work = WORK.with(|work| work.get().unwrap());
+    drop(reset);
+    (result, work)
+}
+
+#[test]
+fn capacity_decode_binary_bytes_copy_once_without_per_element_dispatch() {
+    const MAX: usize = CONFIG_CAPACITY_V1_ENVELOPE_BYTES;
+    for length in [0, 1, 127, 128, 255, 256, 16_383, 16_384, MAX] {
+        let source: Vec<u8> = (0..=255).cycle().take(length).collect();
+        // The independent original Vec encoder still determines the wire.
+        let wire = opc_consensus::encode_bounded(&source).unwrap();
+        let (decoded, work) = observe(|| opc_consensus::decode_bounded::<Bytes<MAX>>(&wire));
+        let decoded = decoded.unwrap();
+        assert_eq!(decoded.0, source);
+        assert_eq!(decoded.0.capacity(), length);
+        assert_eq!(
+            work,
+            DecodeWork {
+                bulk_copies: 1,
+                copied_bytes: length,
+                allocated_bytes: length,
+                sequence_elements: 0,
+            },
+            "CONFIG_CAPACITY_BINARY_BULK_DECODE_RED"
+        );
+    }
+}
+
+#[test]
+fn capacity_decode_binary_rejects_incomplete_and_oversized_bodies_before_copy() {
+    let source: Vec<u8> = (0..=255).collect();
+    let wire = opc_consensus::encode_bounded(&source).unwrap();
+    for end in 0..wire.len() {
+        let (decoded, work) = observe(|| opc_consensus::decode_bounded::<Bytes<256>>(&wire[..end]));
+        assert!(decoded.is_err());
+        assert_eq!(work, DecodeWork::default());
+    }
+    for wire in [
+        opc_consensus::encode_bounded(&vec![0x55_u8; 257]).unwrap(),
+        vec![0xff, 0xff, 0xff, 0xff, 0x0f],
+    ] {
+        let (decoded, work) = observe(|| opc_consensus::decode_bounded::<Bytes<256>>(&wire));
+        assert!(decoded.is_err(), "CONFIG_CAPACITY_BINARY_FIELD_LIMIT_RED");
+        assert_eq!(work, DecodeWork::default());
+    }
+    let mut trailing = wire;
+    trailing.push(0);
+    assert!(opc_consensus::decode_bounded::<Bytes<256>>(&trailing).is_err());
+}
+
+#[test]
+fn capacity_decode_bulk_binary_path_does_not_accept_json_strings() {
+    for malformed in [
+        "\"\"",
+        "\"abc\"",
+        "\"\\u0000\"",
+        "null",
+        "{}",
+        "[-1]",
+        "[256]",
+        "[1.0]",
+        "[true]",
+        "[\"1\"]",
+        "[[1]]",
+        "[0]0",
+    ] {
+        assert!(serde_json::from_str::<Vec<u8>>(malformed).is_err());
+        assert!(
+            serde_json::from_str::<Bytes<256>>(malformed).is_err(),
+            "CONFIG_CAPACITY_JSON_BYTE_TYPE_RED"
+        );
+    }
+    let source: Vec<u8> = (0..=255).collect();
+    let json = serde_json::to_vec(&source).unwrap();
+    let (decoded, work) = observe(|| serde_json::from_slice::<Bytes<256>>(&json));
+    assert_eq!(decoded.unwrap().0, source);
+    assert_eq!(work.sequence_elements, 256);
+    assert_eq!(work.bulk_copies, 0);
+}
 
 #[test]
 fn capacity_decode_json_bytes_do_not_allocate_the_ceiling_for_small_values() {
