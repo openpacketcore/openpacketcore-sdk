@@ -10413,6 +10413,8 @@ impl EbpfGtpuDataplaneBackend {
             &self.pin_dir(&device.name),
             self.inner.config.tc_priority,
         )?;
+        // Activation started a fresh kernel traffic source before enabling it.
+        self.reset_traffic_sequence_source(device.ifindex)?;
         if let Some(managed) = devices.get_mut(&device.ifindex) {
             managed.cleanup_only = false;
         }
@@ -40690,12 +40692,49 @@ mod aya_runtime {
             if !tft_classifier_schema_is_current(&Self::tft_schema_slot(&device.ebpf)?) {
                 return Err(state_indeterminate("ebpf_cleanup_schema"));
             }
+            // Cleanup-only acquisition left the retained traffic gate at an
+            // even, packet-inert incarnation. Start a fresh source incarnation
+            // while the hooks are still fenced, attach, then prove quiescence
+            // and enable it exactly as ordinary adoption does; otherwise the
+            // reattached programs would pass every packet unchanged.
+            let traffic_observation_gate =
+                Self::reset_traffic_observation_source(&mut device.ebpf)?;
             let attached = self.attach_programs_by_ifindex(
                 &mut device.ebpf,
                 ifindex,
                 &device.pin_dir,
                 tc_priority,
             )?;
+            if let Err(error) = Self::verify_traffic_observation_source_quiescent(
+                &mut device.ebpf,
+                traffic_observation_gate,
+            )
+            .and_then(|()| {
+                Self::enable_traffic_observation_source(&mut device.ebpf, traffic_observation_gate)
+            }) {
+                // Keep the device cleanup-only and fenced: restore the even
+                // gate and detach the hooks this call attached.
+                let gate_restored = Self::disable_traffic_observation_source_exact(
+                    &mut device.ebpf,
+                    traffic_observation_gate,
+                );
+                if attached.replaced_existing {
+                    return Err(state_indeterminate("ebpf_activate_cleanup_only"));
+                }
+                let rollback = detach_datapath_if_current(
+                    attached.links,
+                    &attached.identity,
+                    ifindex,
+                    tc_priority,
+                )
+                .and(gate_restored);
+                return Err(error_after_rollback(
+                    error,
+                    rollback,
+                    false,
+                    "ebpf_tc_attach_rollback",
+                ));
+            }
             device.datapath_identity = attached.identity;
             device.links = Some(attached.links);
             device.cleanup_only = false;
@@ -58153,11 +58192,11 @@ mod tests {
                     operation: "ebpf_cleanup_schema",
                 });
             }
-            // Model the attach failure before clearing cleanup-only so a
-            // failed activation leaves the device fenced and retryable,
-            // matching the real runtime's error semantics.
+            // Mirror the production order: a fresh even source incarnation
+            // while fenced, attach, then enable the gate. A failure at any
+            // step leaves the device fenced, cleanup-only and retryable.
+            Self::reset_traffic_observation_source(&mut state, [ifindex])?;
             Self::fail_if_requested(&mut state, "activate_cleanup_only_attach")?;
-            state.cleanup_only.remove(&ifindex);
             state.uplink_filter_ready.insert(ifindex);
             state.downlink_filter_ready.insert(ifindex);
             state
@@ -58166,6 +58205,18 @@ mod tests {
             state
                 .downlink_filter_pin_dir
                 .insert(ifindex, pin_dir.to_path_buf());
+            let disabled = state.traffic_observation_gate.get(&ifindex).copied();
+            if let Err(error) = Self::enable_traffic_observation_source(&mut state, ifindex) {
+                if let Some(disabled) = disabled {
+                    state.traffic_observation_gate.insert(ifindex, disabled);
+                }
+                state.uplink_filter_ready.remove(&ifindex);
+                state.downlink_filter_ready.remove(&ifindex);
+                state.uplink_filter_pin_dir.remove(&ifindex);
+                state.downlink_filter_pin_dir.remove(&ifindex);
+                return Err(error);
+            }
+            state.cleanup_only.remove(&ifindex);
             Ok(EbpfAttachmentDisposition::Retained)
         }
 

@@ -9,6 +9,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- `opc-gtpu-dataplane`: `activate_cleanup_recovery` now re-enables the
+  retained traffic gate that cleanup-only acquisition leaves packet-inert. It
+  starts a fresh source incarnation while the hooks are fenced, attaches them,
+  proves quiescence and enables the gate as ordinary adoption does, and on
+  failure restores the even gate and detaches, leaving the device cleanup-only
+  and retryable. Before this, the reattached programs passed every packet
+  unchanged until a later adoption. Refs #997.
 - `opc-proto-gtpv2c`: model TS 29.274 Causes 18 (new PDN type due to network
   preference) and 19 (new PDN type due to single address bearer only). A
   Create Session Response carrying either now projects as accepted with its
