@@ -79001,6 +79001,115 @@ mod tests {
         );
     }
 
+    /// Cleanup-only acquisition leaves the retained traffic gate at an even
+    /// (packet-inert) incarnation. Activation must re-enable it after the
+    /// hooks are attached, or the reattached programs pass every packet.
+    #[tokio::test]
+    async fn cleanup_only_activation_reenables_the_retained_traffic_gate() {
+        let (backend, runtime) = backend_with_fake();
+        let installed = create_device_with_context(&backend).await;
+        simulate_process_loss(&runtime, false);
+        let recovered = EbpfGtpuDataplaneBackend::with_runtime(runtime.clone());
+        assert_eq!(
+            recovered
+                .acquire_cleanup_only_recovery(cleanup_request(
+                    Ipv4Addr::new(192, 0, 2, 1),
+                    S2BU_IFINDEX,
+                ))
+                .await
+                .unwrap(),
+            RetainedGraphCleanupClassification::Acquired
+        );
+        let fenced_gate = runtime.state().traffic_observation_gate[&S2BU_IFINDEX];
+        assert!(fenced_gate != 0 && fenced_gate & 1 == 0);
+        recovered
+            .remove_pdp_context_exact(installed.clone())
+            .await
+            .unwrap();
+
+        let device = GtpDevice {
+            name: "s2bu".to_string(),
+            ifindex: S2BU_IFINDEX,
+        };
+        recovered.activate_cleanup_recovery(&device).await.unwrap();
+        let active_gate = runtime.state().traffic_observation_gate[&S2BU_IFINDEX];
+        assert!(
+            active_gate & 1 == 1 && active_gate > fenced_gate,
+            "activation must enable a fresh traffic gate: {fenced_gate} -> {active_gate}"
+        );
+        assert_eq!(
+            recovered
+                .install_pdp_context_classified(installed)
+                .await
+                .unwrap(),
+            PdpContextInstallOutcome::Installed
+        );
+    }
+
+    /// A failed gate enable rolls activation back: the hooks are detached
+    /// again, the gate is even, the device stays cleanup-only and fenced, and
+    /// a retry activates it.
+    #[tokio::test]
+    async fn cleanup_only_activation_rolls_back_when_the_traffic_gate_cannot_be_enabled() {
+        let (backend, runtime) = backend_with_fake();
+        let installed = create_device_with_context(&backend).await;
+        simulate_process_loss(&runtime, false);
+        let recovered = EbpfGtpuDataplaneBackend::with_runtime(runtime.clone());
+        assert_eq!(
+            recovered
+                .acquire_cleanup_only_recovery(cleanup_request(
+                    Ipv4Addr::new(192, 0, 2, 1),
+                    S2BU_IFINDEX,
+                ))
+                .await
+                .unwrap(),
+            RetainedGraphCleanupClassification::Acquired
+        );
+        recovered
+            .remove_pdp_context_exact(installed.clone())
+            .await
+            .unwrap();
+        let device = GtpDevice {
+            name: "s2bu".to_string(),
+            ifindex: S2BU_IFINDEX,
+        };
+
+        runtime.fail_after_in_order(["traffic_observation_enable"]);
+        assert!(recovered.activate_cleanup_recovery(&device).await.is_err());
+        {
+            let state = runtime.state();
+            assert!(!state.uplink_filter_ready.contains(&S2BU_IFINDEX));
+            assert!(!state.downlink_filter_ready.contains(&S2BU_IFINDEX));
+            assert!(state.cleanup_only.contains(&S2BU_IFINDEX));
+            let gate = state.traffic_observation_gate[&S2BU_IFINDEX];
+            assert!(
+                gate != 0 && gate & 1 == 0,
+                "rollback must leave the gate even: {gate}"
+            );
+        }
+        assert!(matches!(
+            recovered
+                .install_pdp_context_classified(installed.clone())
+                .await
+                .unwrap(),
+            PdpContextInstallOutcome::Indeterminate(
+                PdpContextIndeterminateReason::AuthorityUnavailable
+            )
+        ));
+
+        recovered.activate_cleanup_recovery(&device).await.unwrap();
+        let gate = runtime.state().traffic_observation_gate[&S2BU_IFINDEX];
+        assert_eq!(gate & 1, 1);
+        assert!(runtime.state().uplink_filter_ready.contains(&S2BU_IFINDEX));
+        assert_eq!(
+            recovered
+                .install_pdp_context_classified(installed)
+                .await
+                .unwrap(),
+            PdpContextInstallOutcome::Installed
+        );
+    }
+
     #[tokio::test]
     async fn cleanup_only_recovery_refuses_stale_interface_identity_before_mutation() {
         let (backend, runtime) = backend_with_fake();
