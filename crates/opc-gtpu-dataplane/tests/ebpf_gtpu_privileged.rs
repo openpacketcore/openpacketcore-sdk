@@ -11254,6 +11254,125 @@ async fn cleanup_only_recovery_fences_forwarding_and_removes_stale_contexts(
         PdpContextInstallOutcome::Installed
     );
 
+    // Activation restores packet effects, not only the hooks: a fresh context
+    // forwards in both directions and every datapath counter moves.
+    run("ping", &["-c", "1", "-W", "1", "192.0.2.10"]);
+    let pgw = in_netns(&net.pgw_ns, || {
+        UdpSocket::bind((PGW_IP, GTPU_PORT)).expect("bind PGW IPv4 GTP-U socket")
+    });
+    let ue = in_netns(&net.ue_ns, || {
+        UdpSocket::bind((UE_PAA, 5600)).expect("bind UE IPv4 socket")
+    });
+    let ue_capture = packet_capture_socket(&net.ue_ns);
+    let before = recovered.datapath_snapshot(&device).await?;
+    let uplink_payload = b"cleanup-activated-uplink";
+    ue.send_to(uplink_payload, (REMOTE_HOST, 53))?;
+    let uplink_inner = capture_inner_udp_packet(
+        &ue_capture,
+        IpAddr::V4(UE_PAA),
+        IpAddr::V4(REMOTE_HOST),
+        5600,
+        53,
+        uplink_payload,
+    );
+    receive_grouped_uplink(
+        &pgw,
+        SocketAddr::from((EPDG_S2BU_IP, GTPU_PORT)),
+        PEER_TEID,
+        &uplink_inner,
+    );
+    let downlink_payload = b"cleanup-activated-downlink";
+    let downlink = build_outer_gtpu_frame(
+        main_link_address("s2bu"),
+        net.pgw_link_address("s2bup"),
+        &[],
+        &build_gpdu(
+            LOCAL_TEID,
+            None,
+            &build_inner_udp(REMOTE_HOST, UE_PAA, 53, 5600, downlink_payload),
+        ),
+        true,
+        0,
+    );
+    send_raw_gtpu_frame(
+        &net.pgw_ns,
+        "s2bup",
+        &downlink,
+        RawChecksumMetadata::Unverified,
+    );
+    receive_grouped_downlink(&ue, SocketAddr::from((REMOTE_HOST, 53)), downlink_payload);
+    let after = recovered.datapath_snapshot(&device).await?;
+    assert_eq!(
+        after.counters.uplink_encapsulated,
+        before.counters.uplink_encapsulated + 1,
+        "activated cleanup recovery must encapsulate uplink: {after:?}"
+    );
+    assert_eq!(
+        after.counters.downlink_decapsulated,
+        before.counters.downlink_decapsulated + 1,
+        "activated cleanup recovery must decapsulate downlink: {after:?}"
+    );
+
+    // Inner IPv6 on the same activated ordinary attachment forwards too: the
+    // re-enabled gate covers the family-tagged authority path.
+    let ipv6 = GtpPdpContext {
+        ms_address: IpAddr::V6(Ipv6Addr::new(0x2001, 0xdb8, 0x45, 0, 0, 0, 0, 0)),
+        ..session_context(device.ifindex)
+    };
+    assert_eq!(
+        recovered.install_pdp_context_classified(ipv6).await?,
+        PdpContextInstallOutcome::Installed
+    );
+    resolve_s2bu_ipv6_gateway_neighbour();
+    let ue_v6 = in_netns(&net.ue_ns, || {
+        UdpSocket::bind((UE_PAA_IPV6, 5601)).expect("bind UE IPv6 socket")
+    });
+    let before_v6 = recovered.datapath_snapshot(&device).await?;
+    let uplink_v6 = build_inner_udp_v6(
+        UE_PAA_IPV6,
+        REMOTE_HOST_IPV6,
+        5601,
+        53,
+        b"cleanup-activated-v6",
+    );
+    send_raw_ipv6_packet(&net.ue_ns, &uplink_v6);
+    receive_grouped_uplink(
+        &pgw,
+        SocketAddr::from((EPDG_S2BU_IP, GTPU_PORT)),
+        PEER_TEID,
+        &forwarded_ipv6_packet(uplink_v6),
+    );
+    let downlink_v6_payload = b"cleanup-activated-downlink-v6";
+    let downlink_v6 = build_outer_gtpu_frame(
+        main_link_address("s2bu"),
+        net.pgw_link_address("s2bup"),
+        &[],
+        &build_gpdu(
+            LOCAL_TEID,
+            None,
+            &build_inner_udp_v6(REMOTE_HOST_IPV6, UE_PAA_IPV6, 53, 5601, downlink_v6_payload),
+        ),
+        true,
+        0,
+    );
+    send_raw_gtpu_frame(
+        &net.pgw_ns,
+        "s2bup",
+        &downlink_v6,
+        RawChecksumMetadata::Unverified,
+    );
+    receive_grouped_downlink(
+        &ue_v6,
+        SocketAddr::from((REMOTE_HOST_IPV6, 53)),
+        downlink_v6_payload,
+    );
+    let after_v6 = recovered.datapath_snapshot(&device).await?;
+    assert!(
+        after_v6.counters != before_v6.counters,
+        "activated cleanup recovery must move datapath counters for inner IPv6: {after_v6:?}"
+    );
+    eprintln!("OPC_GTPU_CLEANUP_ACTIVATION_FORWARDS_PROVEN: IPv4 and IPv6 uplink and downlink after cleanup-only activation");
+
     drop(net);
     Ok(())
 }
