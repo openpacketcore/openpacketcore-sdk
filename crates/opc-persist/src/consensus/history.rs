@@ -684,6 +684,10 @@ fn retained_size(
 
 fn validate_limited_state(conn: &Connection, state: &HistoryState) -> io::Result<()> {
     validate_state(conn, state)?;
+    validate_history_limits(conn, state)
+}
+
+fn validate_history_limits(conn: &Connection, state: &HistoryState) -> io::Result<()> {
     if let Some(limits) = state.limits {
         let (records, bytes) = retained_size(conn, None, state.profile()?)?;
         if records > u64::from(limits.max_records) || bytes > limits.max_bytes {
@@ -748,10 +752,13 @@ pub(crate) fn validate_access_for_profile_sync(
     {
         return Err(corrupt());
     }
-    validate_limited_state(conn, &state)?;
     let record_chain = match capacity_profile {
-        ConfigCapacityProfile::Legacy => record_chain_sync(conn, capacity_profile, cancellation)?,
+        ConfigCapacityProfile::Legacy => {
+            validate_limited_state(conn, &state)?;
+            record_chain_sync(conn, capacity_profile, cancellation)?
+        }
         ConfigCapacityProfile::BoundedV1 => {
+            validate_history_limits(conn, &state)?;
             validated_capacity_record_chain(conn, &state, key, cancellation)?
         }
         _ => return Err(corrupt()),
@@ -781,10 +788,12 @@ pub(crate) fn validate_access_sync(
     )
 }
 
-/// Authenticate each current row's capacity proof and assemble the history
-/// chain from that same borrowed ciphertext. The caller has authenticated the
-/// state, scope and retention boundary and must compare the complete chain
-/// before returning success. No digest or row is reused by a later read.
+/// Authenticate each current row's capacity proof and compare its fresh digest
+/// with the authenticated head and first retained boundary in this same scan.
+/// The caller has authenticated the state and scope and must still compare the
+/// complete history chain before returning success. Neither endpoint metadata
+/// nor a successful proof replaces that chain comparison. No row or digest is
+/// reused by a later read.
 fn validated_capacity_record_chain(
     conn: &Connection,
     state: &HistoryState,
@@ -811,6 +820,8 @@ fn validated_capacity_record_chain(
     ).map_err(database_error)?;
     let mut rows = query.query([]).map_err(database_error)?;
     let mut digest = empty_record_chain();
+    let mut records = 0_u64;
+    let mut last_head = None;
     loop {
         cancellation.check_io()?;
         let Some(row) = rows.next().map_err(database_error)? else {
@@ -842,13 +853,21 @@ fn validated_capacity_record_chain(
                     .map_err(|_| corrupt())?,
             )),
         };
-        if let Some(boundary) = &state.boundary {
-            if version == boundary.first.version {
-                if tx_id != boundary.first.tx_id || parent_tx_id.is_some() {
-                    return Err(corrupt());
-                }
-                parent_tx_id = Some(boundary.original_parent);
+        // Only the actual first retained row may borrow the detached parent.
+        // Do not search for a later matching version from replayed metadata.
+        let first_boundary = if records == 0 {
+            state.boundary.as_ref()
+        } else {
+            None
+        };
+        if let Some(boundary) = first_boundary {
+            if tx_id != boundary.first.tx_id
+                || version != boundary.first.version
+                || parent_tx_id.is_some()
+            {
+                return Err(corrupt());
             }
+            parent_tx_id = Some(boundary.original_parent);
         }
         let encrypted = encrypted_column(row, 7).map_err(database_error)?;
         #[cfg(test)]
@@ -877,12 +896,20 @@ fn validated_capacity_record_chain(
             version,
             encrypted_digest,
         };
+        if first_boundary.is_some_and(|boundary| head != boundary.first) {
+            return Err(corrupt());
+        }
         digest = extend_record_chain(
             digest,
             &head,
             audit_anchor_digest(row.get(9).map_err(database_error)?, &terminal)?,
             record_metadata_digest(conn, &head, profile, cancellation)?,
         );
+        records = records.checked_add(1).ok_or_else(corrupt)?;
+        last_head = Some(head);
+    }
+    if last_head != state.head || records != state.records {
+        return Err(corrupt());
     }
     Ok(digest)
 }

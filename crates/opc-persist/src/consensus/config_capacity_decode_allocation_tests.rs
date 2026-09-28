@@ -57,7 +57,8 @@ fn observe<T>(run: impl FnOnce() -> T) -> (T, DecodeWork) {
 #[test]
 fn capacity_decode_binary_bytes_copy_once_without_per_element_dispatch() {
     const MAX: usize = CONFIG_CAPACITY_V1_ENVELOPE_BYTES;
-    for length in [0, 1, 127, 128, 255, 256, 16_383, 16_384, MAX] {
+    // Removal controls must exercise nonempty per-element work before failing.
+    for length in [256, 0, 1, 127, 128, 255, 16_383, 16_384, MAX] {
         let source: Vec<u8> = (0..=255).cycle().take(length).collect();
         // The independent original Vec encoder still determines the wire.
         let wire = opc_consensus::encode_bounded(&source).unwrap();
