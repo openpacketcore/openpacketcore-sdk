@@ -393,6 +393,9 @@ pub trait GtpuDataplaneBackend: Send + Sync + std::fmt::Debug {
 
     /// Read the exact desired/observed TFT classifier for one attachment/PAA.
     ///
+    /// `paa` selects the classifier whose [`crate::TftUplinkPaaSet`] contains
+    /// it: the IPv4 PAA, or any address inside the owned IPv6 `/64`.
+    ///
     /// `Present` proves one complete classifier under this backend's authority.
     /// Partial, mixed, stale, or otherwise unprovable state is `Indeterminate`,
     /// never `Absent`.

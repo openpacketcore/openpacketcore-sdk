@@ -4477,6 +4477,23 @@ impl EbpfGtpuDataplaneBackend {
         }
     }
 
+    /// Map key for one complete desired or expected classifier.
+    ///
+    /// The native ABI is IPv4-only (#988). A classifier owning an IPv6 prefix,
+    /// including an IPv4v6 set, is rejected rather than truncated to its IPv4
+    /// family.
+    fn native_tft_classifier_key(
+        classifier: &TftUplinkClassifier,
+    ) -> Result<TftClassifierKey, GtpuError> {
+        if classifier.paa_set().ipv6_prefix().is_some() {
+            return Err(GtpuError::invalid_config(
+                "tft_uplink_classifier.paa",
+                "native eBPF TFT classifier supports IPv4 PAA only",
+            ));
+        }
+        Self::tft_classifier_key(classifier.link_ifindex(), classifier.paa())
+    }
+
     fn tft_classifier_key(link_ifindex: u32, paa: IpAddr) -> Result<TftClassifierKey, GtpuError> {
         let IpAddr::V4(paa) = paa else {
             return Err(GtpuError::invalid_config(
@@ -4618,7 +4635,7 @@ impl EbpfGtpuDataplaneBackend {
         authority: EbpfTftAuthority,
         snapshot_generation: u64,
     ) -> Result<EncodedTftClassifier, GtpuError> {
-        let key = Self::tft_classifier_key(desired.link_ifindex(), desired.paa())?;
+        let key = Self::native_tft_classifier_key(desired)?;
         if snapshot_generation == 0 {
             return Err(GtpuError::StateIndeterminate {
                 operation: "ebpf_tft_snapshot_generation",
@@ -5304,7 +5321,7 @@ impl EbpfGtpuDataplaneBackend {
         desired: TftUplinkClassifier,
     ) -> Result<TftUplinkClassifierReconcileOutcome, GtpuError> {
         Self::validate_tft_uplink_classifier_native(&desired)?;
-        let key = Self::tft_classifier_key(desired.link_ifindex(), desired.paa())?;
+        let key = Self::native_tft_classifier_key(&desired)?;
         let _operation = self.operation_guard()?;
         match self.require_tft_attachment(desired.link_ifindex()) {
             Ok(()) => {}
@@ -5688,7 +5705,7 @@ impl EbpfGtpuDataplaneBackend {
         &self,
         expected: TftUplinkClassifier,
     ) -> Result<TftUplinkClassifierRemovalOutcome, GtpuError> {
-        let key = Self::tft_classifier_key(expected.link_ifindex(), expected.paa())?;
+        let key = Self::native_tft_classifier_key(&expected)?;
         let _operation = self.operation_guard()?;
         match self.require_tft_attachment(expected.link_ifindex()) {
             Ok(()) => {}
@@ -63286,6 +63303,43 @@ mod tests {
         .expect("globally unique test precedences are canonical")
     }
 
+    #[tokio::test]
+    async fn native_tft_lifecycle_rejects_dual_family_paa_without_truncation() {
+        let (backend, runtime) = backend_with_fake();
+        let before = {
+            let state = runtime.state();
+            (state.tft_meta.clone(), state.tft_filters.clone())
+        };
+        let dual_paa = TftUplinkClassifier::with_paa_set(
+            S2BU_IFINDEX,
+            crate::TftUplinkPaaSet::new_dual(
+                Ipv4Addr::new(10, 45, 0, 2),
+                Ipv6Addr::new(0x2001, 0xdb8, 0xa, 1, 0, 0, 0, 0x10),
+            )
+            .expect("dual-family PAA set is canonical"),
+            vec![TftUplinkBearer::default_bearer()],
+        )
+        .expect("backend-neutral classifier permits an IPv4v6 PAA set");
+        assert!(matches!(
+            backend
+                .reconcile_tft_uplink_classifier(dual_paa.clone())
+                .await,
+            Err(GtpuError::InvalidConfig {
+                field: "tft_uplink_classifier.paa",
+                ..
+            })
+        ));
+        assert!(matches!(
+            backend.remove_tft_uplink_classifier_exact(dual_paa).await,
+            Err(GtpuError::InvalidConfig {
+                field: "tft_uplink_classifier.paa",
+                ..
+            })
+        ));
+        let state = runtime.state();
+        assert_eq!(before, (state.tft_meta.clone(), state.tft_filters.clone()));
+    }
+
     #[test]
     fn tft_classifier_validation_is_pure_and_rejects_unsupported_native_forms() {
         let (backend, runtime) = backend_with_fake();
@@ -63299,12 +63353,31 @@ mod tests {
         };
         let ipv6_paa = TftUplinkClassifier::new(
             S2BU_IFINDEX,
-            IpAddr::V6(Ipv6Addr::LOCALHOST),
+            IpAddr::V6(Ipv6Addr::new(0x2001, 0xdb8, 0xa, 1, 0, 0, 0, 0x10)),
             vec![TftUplinkBearer::default_bearer()],
         )
         .expect("backend-neutral classifier permits IPv6 PAA");
         assert!(matches!(
             backend.validate_tft_uplink_classifier(&ipv6_paa),
+            Err(GtpuError::InvalidConfig {
+                field: "tft_uplink_classifier.paa",
+                ..
+            })
+        ));
+        // An IPv4v6 set must be rejected as a whole, never truncated to the
+        // IPv4 family the native ABI can key.
+        let dual_paa = TftUplinkClassifier::with_paa_set(
+            S2BU_IFINDEX,
+            crate::TftUplinkPaaSet::new_dual(
+                Ipv4Addr::new(10, 45, 0, 2),
+                Ipv6Addr::new(0x2001, 0xdb8, 0xa, 1, 0, 0, 0, 0x10),
+            )
+            .expect("dual-family PAA set is canonical"),
+            vec![TftUplinkBearer::default_bearer()],
+        )
+        .expect("backend-neutral classifier permits an IPv4v6 PAA set");
+        assert!(matches!(
+            backend.validate_tft_uplink_classifier(&dual_paa),
             Err(GtpuError::InvalidConfig {
                 field: "tft_uplink_classifier.paa",
                 ..

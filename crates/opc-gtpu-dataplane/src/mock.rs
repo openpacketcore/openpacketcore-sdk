@@ -439,14 +439,38 @@ impl MockGtpuDataplaneBackend {
         link_ifindex: u32,
         paa: std::net::IpAddr,
     ) -> TftUplinkClassifierReadback {
+        // A read selects by any address the PAA set owns: the IPv4 PAA or any
+        // address inside the IPv6 /64.
         state
             .tft_classifiers
-            .get(&(link_ifindex, paa))
+            .values()
+            .find(|classifier| {
+                classifier.link_ifindex() == link_ifindex && classifier.paa_set().contains(paa)
+            })
             .cloned()
             .map_or(
                 TftUplinkClassifierReadback::Absent,
                 TftUplinkClassifierReadback::Present,
             )
+    }
+
+    /// Keys of the stored classifiers on `classifier`'s attachment whose PAA
+    /// set shares any address with it. Distinct residents never overlap, so
+    /// one key is the PDN's own classifier and two or more mean `classifier`
+    /// straddles distinct PDNs.
+    fn tft_classifier_overlapping_keys_locked(
+        state: &MockState,
+        classifier: &TftUplinkClassifier,
+    ) -> Vec<(u32, std::net::IpAddr)> {
+        state
+            .tft_classifiers
+            .iter()
+            .filter(|(_, existing)| {
+                existing.link_ifindex() == classifier.link_ifindex()
+                    && existing.paa_set().overlaps(&classifier.paa_set())
+            })
+            .map(|(key, _)| *key)
+            .collect()
     }
 
     fn validate_tft_uplink_classifier_capability(
@@ -537,20 +561,24 @@ impl GtpuDataplaneBackend for MockGtpuDataplaneBackend {
             return Ok(TftUplinkClassifierReconcileOutcome::Indeterminate);
         }
         let key = (desired.link_ifindex(), desired.paa());
-        match state.tft_classifiers.get(&key) {
-            None => {
+        match Self::tft_classifier_overlapping_keys_locked(&state, &desired).as_slice() {
+            [] => {
                 state.tft_classifiers.insert(key, desired);
                 Ok(TftUplinkClassifierReconcileOutcome::Installed)
             }
-            Some(existing) if existing == &desired => {
+            [resident] if state.tft_classifiers.get(resident) == Some(&desired) => {
                 Ok(TftUplinkClassifierReconcileOutcome::AlreadyPresent)
             }
-            Some(_) => {
+            [resident] => {
                 // Every classifier in this map was installed by this backend, so
-                // replacing its complete snapshot is within this authority.
+                // replacing the PDN's complete snapshot, including widening or
+                // narrowing its PAA families, is within this authority.
+                let resident = *resident;
+                state.tft_classifiers.remove(&resident);
                 state.tft_classifiers.insert(key, desired);
                 Ok(TftUplinkClassifierReconcileOutcome::Replaced)
             }
+            _ => Ok(TftUplinkClassifierReconcileOutcome::Conflict),
         }
     }
 
@@ -566,14 +594,16 @@ impl GtpuDataplaneBackend for MockGtpuDataplaneBackend {
         if state.pdp_fault.is_some() {
             return Ok(TftUplinkClassifierRemovalOutcome::Indeterminate);
         }
-        let key = (expected.link_ifindex(), expected.paa());
-        match state.tft_classifiers.get(&key) {
-            None => Ok(TftUplinkClassifierRemovalOutcome::AlreadyAbsent),
-            Some(existing) if existing == &expected => {
-                state.tft_classifiers.remove(&key);
+        // Any resident owning an address of `expected` that is not exactly
+        // `expected` is a conflict, whichever family keys it.
+        match Self::tft_classifier_overlapping_keys_locked(&state, &expected).as_slice() {
+            [] => Ok(TftUplinkClassifierRemovalOutcome::AlreadyAbsent),
+            [resident] if state.tft_classifiers.get(resident) == Some(&expected) => {
+                let resident = *resident;
+                state.tft_classifiers.remove(&resident);
                 Ok(TftUplinkClassifierRemovalOutcome::Removed)
             }
-            Some(_) => Ok(TftUplinkClassifierRemovalOutcome::Conflict),
+            _ => Ok(TftUplinkClassifierRemovalOutcome::Conflict),
         }
     }
 
@@ -1366,6 +1396,206 @@ mod tests {
                 feature: "tft_uplink_classification"
             })
         ));
+    }
+
+    #[tokio::test]
+    async fn mock_tft_classifier_reads_dual_family_set_by_either_family() {
+        let backend = MockGtpuDataplaneBackend::new();
+        let v4 = Ipv4Addr::new(192, 0, 2, 44);
+        let v6 = std::net::Ipv6Addr::new(0x2001, 0xdb8, 0xa, 1, 0, 0, 0, 0x10);
+        let desired = TftUplinkClassifier::with_paa_set(
+            7,
+            crate::TftUplinkPaaSet::new_dual(v4, v6).unwrap(),
+            vec![crate::TftUplinkBearer::default_bearer()],
+        )
+        .unwrap();
+        assert_eq!(
+            backend
+                .reconcile_tft_uplink_classifier(desired.clone())
+                .await
+                .unwrap(),
+            TftUplinkClassifierReconcileOutcome::Installed
+        );
+        let temporary = std::net::Ipv6Addr::new(0x2001, 0xdb8, 0xa, 1, 0x3c91, 0x7e02, 0xa455, 1);
+        for address in [IpAddr::V4(v4), IpAddr::V6(v6), IpAddr::V6(temporary)] {
+            assert_eq!(
+                backend
+                    .read_tft_uplink_classifier(7, address)
+                    .await
+                    .unwrap(),
+                TftUplinkClassifierReadback::Present(desired.clone())
+            );
+        }
+        let outside = std::net::Ipv6Addr::new(0x2001, 0xdb8, 0xa, 2, 0, 0, 0, 0x10);
+        assert_eq!(
+            backend
+                .read_tft_uplink_classifier(7, IpAddr::V6(outside))
+                .await
+                .unwrap(),
+            TftUplinkClassifierReadback::Absent
+        );
+        // A classifier claiming only the already-owned IPv6 prefix is the same
+        // PDN narrowed to one family. It replaces the resident, exactly as
+        // narrowing to the IPv4 PAA does, and never creates a second owner of
+        // that prefix.
+        let overlapping = TftUplinkClassifier::new(
+            7,
+            IpAddr::V6(temporary),
+            vec![crate::TftUplinkBearer::default_bearer()],
+        )
+        .unwrap();
+        assert_eq!(
+            backend
+                .reconcile_tft_uplink_classifier(overlapping.clone())
+                .await
+                .unwrap(),
+            TftUplinkClassifierReconcileOutcome::Replaced
+        );
+        assert_eq!(
+            backend
+                .read_tft_uplink_classifier(7, IpAddr::V4(v4))
+                .await
+                .unwrap(),
+            TftUplinkClassifierReadback::Absent
+        );
+        assert_eq!(
+            backend
+                .read_tft_uplink_classifier(7, IpAddr::V6(v6))
+                .await
+                .unwrap(),
+            TftUplinkClassifierReadback::Present(overlapping)
+        );
+        assert_eq!(
+            backend
+                .reconcile_tft_uplink_classifier(desired.clone())
+                .await
+                .unwrap(),
+            TftUplinkClassifierReconcileOutcome::Replaced
+        );
+        assert_eq!(
+            backend
+                .remove_tft_uplink_classifier_exact(desired.clone())
+                .await
+                .unwrap(),
+            TftUplinkClassifierRemovalOutcome::Removed
+        );
+        assert_eq!(
+            backend
+                .read_tft_uplink_classifier(7, IpAddr::V6(temporary))
+                .await
+                .unwrap(),
+            TftUplinkClassifierReadback::Absent
+        );
+    }
+
+    /// The PDN's classifier is the one resident whose PAA set overlaps.
+    /// Widening or narrowing its families replaces it the same way for both
+    /// families, exact removal by a set that only overlaps it conflicts, and
+    /// a set straddling two residents conflicts.
+    #[tokio::test]
+    async fn mock_tft_classifier_family_transitions_are_symmetric() {
+        let v4 = Ipv4Addr::new(192, 0, 2, 44);
+        let v6 = std::net::Ipv6Addr::new(0x2001, 0xdb8, 0xa, 1, 0, 0, 0, 0x10);
+        let bearers = || vec![crate::TftUplinkBearer::default_bearer()];
+        let classifier = |set: crate::TftUplinkPaaSet| {
+            TftUplinkClassifier::with_paa_set(7, set, bearers()).unwrap()
+        };
+        let only_v4 = classifier(crate::TftUplinkPaaSet::new_ipv4(v4).unwrap());
+        let only_v6 = classifier(crate::TftUplinkPaaSet::new_ipv6(v6).unwrap());
+        let dual = classifier(crate::TftUplinkPaaSet::new_dual(v4, v6).unwrap());
+
+        for single in [&only_v4, &only_v6] {
+            // Single family to dual, and back, replaces the one resident.
+            let backend = MockGtpuDataplaneBackend::new();
+            for (desired, outcome) in [
+                (single, TftUplinkClassifierReconcileOutcome::Installed),
+                (&dual, TftUplinkClassifierReconcileOutcome::Replaced),
+                (&dual, TftUplinkClassifierReconcileOutcome::AlreadyPresent),
+            ] {
+                assert_eq!(
+                    backend
+                        .reconcile_tft_uplink_classifier(desired.clone())
+                        .await
+                        .unwrap(),
+                    outcome,
+                    "{single:?} -> {desired:?}"
+                );
+            }
+            for address in [IpAddr::V4(v4), IpAddr::V6(v6)] {
+                assert_eq!(
+                    backend
+                        .read_tft_uplink_classifier(7, address)
+                        .await
+                        .unwrap(),
+                    TftUplinkClassifierReadback::Present(dual.clone())
+                );
+            }
+            // Exact removal of a set that only overlaps the resident conflicts
+            // and leaves it in place.
+            assert_eq!(
+                backend
+                    .remove_tft_uplink_classifier_exact(single.clone())
+                    .await
+                    .unwrap(),
+                TftUplinkClassifierRemovalOutcome::Conflict,
+                "{single:?}"
+            );
+            assert_eq!(
+                backend
+                    .reconcile_tft_uplink_classifier(single.clone())
+                    .await
+                    .unwrap(),
+                TftUplinkClassifierReconcileOutcome::Replaced,
+                "dual -> {single:?}"
+            );
+            assert_eq!(
+                backend
+                    .remove_tft_uplink_classifier_exact(dual.clone())
+                    .await
+                    .unwrap(),
+                TftUplinkClassifierRemovalOutcome::Conflict
+            );
+            assert_eq!(
+                backend
+                    .remove_tft_uplink_classifier_exact(single.clone())
+                    .await
+                    .unwrap(),
+                TftUplinkClassifierRemovalOutcome::Removed
+            );
+            assert_eq!(
+                backend
+                    .remove_tft_uplink_classifier_exact(single.clone())
+                    .await
+                    .unwrap(),
+                TftUplinkClassifierRemovalOutcome::AlreadyAbsent
+            );
+        }
+
+        // A dual set straddling two distinct residents conflicts.
+        let backend = MockGtpuDataplaneBackend::new();
+        for single in [&only_v4, &only_v6] {
+            assert_eq!(
+                backend
+                    .reconcile_tft_uplink_classifier(single.clone())
+                    .await
+                    .unwrap(),
+                TftUplinkClassifierReconcileOutcome::Installed
+            );
+        }
+        assert_eq!(
+            backend
+                .reconcile_tft_uplink_classifier(dual.clone())
+                .await
+                .unwrap(),
+            TftUplinkClassifierReconcileOutcome::Conflict
+        );
+        assert_eq!(
+            backend
+                .remove_tft_uplink_classifier_exact(dual)
+                .await
+                .unwrap(),
+            TftUplinkClassifierRemovalOutcome::Conflict
+        );
     }
 
     #[tokio::test]
