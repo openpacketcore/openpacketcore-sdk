@@ -4150,7 +4150,6 @@ mod tests {
             // admission and one consumer adoption publication.
             consumer.persist().await;
             completed_at_us[0] = Some(started.elapsed().as_micros());
-            phase = "prepare";
             let prepared =
                 prepare_object_roster(&store, group(0x91), generation(1), &roster).unwrap();
             completed_at_us[1] = Some(started.elapsed().as_micros());
