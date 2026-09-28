@@ -1,9 +1,10 @@
-//! A consensus caller that abandons an in-flight RPC must not make the
-//! server record a transport failure.
+//! A consensus client that abandons work already sent to a server must not
+//! make that server record a transport failure.
 //!
-//! A client deadline, or cancellation of the caller's future, is a local
-//! outcome. The server still completes the call and writes its response.
-//! Before #1005 the client dropped the socket at once, so that response write
+//! A client deadline, cancellation of the caller's future, or a local
+//! reauthentication that supersedes a connection being set up is a local
+//! outcome. The server still completes its side of the exchange. Before #1005
+//! the client dropped the socket at once, so the server's next read or write
 //! failed. The server then recorded `connection_failure_transport` although no
 //! transport had failed.
 
@@ -11,6 +12,9 @@ use std::net::SocketAddr;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
+
+use tokio::io::AsyncWriteExt as _;
+use tokio::net::{TcpListener, TcpStream};
 
 use async_trait::async_trait;
 use opc_identity::{build_identity_state, parse_certs_pem, parse_key_pem, TrustBundle};
@@ -242,21 +246,26 @@ impl Outcomes {
     }
 }
 
-/// Wait until every physical attempt in this interval (the client's cold
-/// connection and the server's accepted connection) has recorded exactly
-/// one terminal outcome, then return that complete ledger.
-async fn settled_outcomes(before: Outcomes, expected_attempts: u64) -> Outcomes {
+/// Wait until exactly `expected_attempts` physical attempts (client cold
+/// connections and server accepted connections) started in this interval and
+/// `expected_terminal` of them recorded their one terminal outcome, then
+/// return that ledger.
+async fn settled_outcomes(
+    before: Outcomes,
+    expected_attempts: u64,
+    expected_terminal: u64,
+) -> Outcomes {
     tokio::time::timeout(OUTCOME_DEADLINE, async {
         loop {
             let delta = Outcomes::capture().since(before);
-            if delta.attempts == expected_attempts && delta.terminal() == expected_attempts {
+            if delta.attempts == expected_attempts && delta.terminal() == expected_terminal {
                 return delta;
             }
             tokio::time::sleep(Duration::from_millis(5)).await;
         }
     })
     .await
-    .expect("both connection ends must record their terminal outcome")
+    .expect("every settled connection end must record its terminal outcome")
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -349,7 +358,7 @@ async fn assert_abandoned_call_is_not_a_server_transport_failure(
     // That exchange and both ends of the connection must settle without any
     // failure outcome.
     handler.release.notify_one();
-    let delta = settled_outcomes(before, 2).await;
+    let delta = settled_outcomes(before, 2, 2).await;
     assert_eq!(
         handler.completed.load(Ordering::SeqCst),
         2,
@@ -386,6 +395,142 @@ async fn assert_abandoned_call_is_not_a_server_transport_failure(
     handle.abort_and_wait().await;
 }
 
+/// A TCP relay to one upstream. On its first connection it forwards client
+/// bytes at once but holds every server byte until released, which stops a
+/// client's TLS setup at a known point. Later connections are relayed in both
+/// directions without delay.
+struct HeldRelay {
+    address: SocketAddr,
+    connected: Arc<Notify>,
+    release: Arc<Notify>,
+}
+
+async fn relay_connection(client: TcpStream, upstream: SocketAddr, hold: Option<Arc<Notify>>) {
+    let server = TcpStream::connect(upstream)
+        .await
+        .expect("connect relay upstream");
+    let (mut client_read, mut client_write) = client.into_split();
+    let (mut server_read, mut server_write) = server.into_split();
+    let to_server = tokio::spawn(async move {
+        let _ = tokio::io::copy(&mut client_read, &mut server_write).await;
+        let _ = server_write.shutdown().await;
+    });
+    if let Some(hold) = hold {
+        hold.notified().await;
+    }
+    let _ = tokio::io::copy(&mut server_read, &mut client_write).await;
+    let _ = client_write.shutdown().await;
+    let _ = to_server.await;
+}
+
+async fn held_relay(upstream: SocketAddr) -> HeldRelay {
+    let listener = TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind held relay");
+    let address = listener.local_addr().expect("held relay address");
+    let connected = Arc::new(Notify::new());
+    let release = Arc::new(Notify::new());
+    let (relay_connected, relay_release) = (Arc::clone(&connected), Arc::clone(&release));
+    tokio::spawn(async move {
+        let mut hold = Some(relay_release);
+        loop {
+            let (client, _) = listener.accept().await.expect("accept relay client");
+            let held = hold.take();
+            let first = held.is_some();
+            tokio::spawn(relay_connection(client, upstream, held));
+            if first {
+                relay_connected.notify_one();
+            }
+        }
+    });
+    HeldRelay {
+        address,
+        connected,
+        release,
+    }
+}
+
+async fn assert_superseded_setup_is_not_a_server_transport_failure(
+    pki: &TestPki,
+    manifest: &Arc<SessionReplicationManifest>,
+) {
+    let (_server_source, server_config) = pki.server_config(SERVER_REPLICA);
+    let handler = Arc::new(HeldEchoHandler::default());
+    let server_binding = manifest
+        .bind_local(replica_id(SERVER_REPLICA))
+        .expect("consensus server binding");
+    let (handle, server_address) =
+        SessionConsensusServer::new(handler.clone(), server_config, server_binding)
+            .with_connection_lifecycle(lifecycle_policy())
+            .listen("127.0.0.1:0".parse().expect("listen address"))
+            .await
+            .expect("start consensus server");
+    let relay = held_relay(server_address).await;
+    let (_client_source, client_config) = pki.client_config(CLIENT_REPLICA);
+    let binding = manifest
+        .bind_local(replica_id(CLIENT_REPLICA))
+        .expect("client binding")
+        .bind_remote(replica_id(SERVER_REPLICA))
+        .expect("remote binding");
+    let superseded = request(&binding, b"superseded");
+    let peer = RemoteSessionConsensusPeer::new_with_resolver(
+        binding,
+        resolver(relay.address),
+        client_config,
+        Some(Duration::from_secs(5)),
+    )
+    .with_connection_lifecycle(lifecycle_policy());
+    let reauthentication = peer.reauthentication_control();
+
+    let before = Outcomes::capture();
+    {
+        let call = peer.call(superseded);
+        tokio::pin!(call);
+        tokio::select! {
+            outcome = &mut call => panic!("setup cannot finish while the relay holds it: {outcome:?}"),
+            () = relay.connected.notified() => {}
+        }
+        // A local reauthentication supersedes the first connection while its
+        // TLS setup is in flight. The caller then completes on a fresh
+        // connection that the relay does not hold.
+        reauthentication
+            .request_reauthentication()
+            .expect("request local reauthentication");
+        assert_eq!(
+            call.await,
+            Ok(SessionConsensusWireResponse {
+                result: Ok(b"superseded".to_vec()),
+            }),
+            "the caller completes on a fresh connection"
+        );
+    }
+    relay.release.notify_one();
+
+    // Four connection ends start: the superseded client setup, the fresh
+    // client setup, and the server end of each. All but the cached fresh
+    // server end settle now; the superseded server end must settle cleanly.
+    let delta = settled_outcomes(before, 4, 3).await;
+    assert_eq!(
+        delta,
+        Outcomes {
+            attempts: 4,
+            successes: 2,
+            transport: 0,
+            authentication: 0,
+            timeout: 0,
+            superseded: 1,
+            abandoned: 0,
+            protocol: 0,
+            backend: 0,
+        },
+        "a locally superseded setup is one superseded client attempt and one clean \
+         server connection, never a server transport failure"
+    );
+    assert_eq!(handler.completed.load(Ordering::SeqCst), 1);
+    drop(peer);
+    handle.abort_and_wait().await;
+}
+
 #[test]
 fn abandoned_consensus_call_is_not_a_server_transport_failure() {
     let runtime = tokio::runtime::Builder::new_multi_thread()
@@ -408,5 +553,6 @@ fn abandoned_consensus_call_is_not_a_server_transport_failure() {
             Abandonment::CallerCancellation,
         )
         .await;
+        assert_superseded_setup_is_not_a_server_transport_failure(&pki, &manifest).await;
     });
 }
