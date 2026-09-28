@@ -79804,13 +79804,26 @@ mod tests {
                 runtime.fail_in_order(["activate_cleanup_only_graph_identity"]);
             }
             let activation = recovered.activate_cleanup_recovery(&device).await;
-            // The re-proof reports a non-executable slot as indeterminate; an
-            // injected failure is returned as is once the rollback is proven.
+            // The re-proof reports a non-executable slot as indeterminate. An
+            // injected re-proof failure is returned unchanged, because the
+            // rollback is proven and no predecessor hook was replaced.
             assert!(
                 if failure == "non_executable_pmtu_slot" {
-                    matches!(activation, Err(GtpuError::StateIndeterminate { .. }))
+                    matches!(
+                        activation,
+                        Err(GtpuError::StateIndeterminate {
+                            operation: "ebpf_activate_cleanup_only"
+                        })
+                    )
                 } else {
-                    activation.is_err()
+                    matches!(
+                        activation,
+                        Err(GtpuError::Io {
+                            operation: "activate_cleanup_only_graph_identity",
+                            kind: io::ErrorKind::Other,
+                            raw_os_error: None,
+                        })
+                    )
                 },
                 "{failure}: {activation:?}"
             );
@@ -79884,6 +79897,91 @@ mod tests {
             retained(&recovered),
             None,
             "a successful activation drops the host high-water"
+        );
+    }
+
+    /// Every fallible host step precedes the runtime commit. With the host
+    /// sequence window unavailable (its lock poisoned), activation fails
+    /// before the runtime is asked to activate, so the runtime never commits
+    /// a device that the backend still records as cleanup-only.
+    #[tokio::test]
+    async fn cleanup_only_activation_takes_the_host_sequence_window_before_the_runtime_commit() {
+        let runtime = Arc::new(FakeRuntime::new());
+        let (recovered, _installed, device) = acquired_cleanup_only_device(&runtime).await;
+        std::thread::scope(|scope| {
+            let poisoner = scope.spawn(|| {
+                let _window = recovered
+                    .inner
+                    .traffic_observation_sequences
+                    .lock()
+                    .unwrap();
+                panic!("poison the host traffic sequence window");
+            });
+            assert!(poisoner.join().is_err());
+        });
+        assert!(recovered.inner.traffic_observation_sequences.is_poisoned());
+        let operations_before = runtime.state().operations.len();
+        let activation = recovered.activate_cleanup_recovery(&device).await;
+        assert!(
+            matches!(
+                activation,
+                Err(GtpuError::Io {
+                    operation: "ebpf_traffic_sequence",
+                    ..
+                })
+            ),
+            "{activation:?}"
+        );
+        let state = runtime.state();
+        assert!(
+            !state.operations[operations_before..].contains(&"activate_cleanup_only"),
+            "the runtime must not be asked to activate after a host step failed"
+        );
+        assert!(state.cleanup_only.contains(&S2BU_IFINDEX));
+        assert!(!state.uplink_filter_ready.contains(&S2BU_IFINDEX));
+        assert!(!state.downlink_filter_ready.contains(&S2BU_IFINDEX));
+        let gate = state.traffic_observation_gate[&S2BU_IFINDEX];
+        assert!(gate != 0 && gate & 1 == 0, "{gate}");
+    }
+
+    /// Aya tc hooks and maps cannot be exercised in this unit-test target,
+    /// and no deterministic kernel fault exists that only the attach itself
+    /// creates. Pin the production commit order at the source level instead:
+    /// the attached graph (its tc placement included) is re-proven after the
+    /// hooks are attached and before the gate is enabled, and the activation
+    /// is committed only after the enable. A re-proof moved before the attach
+    /// would pass a corrupt PMTU slot test yet miss an inexact placement.
+    #[test]
+    fn cleanup_only_activation_reproves_the_attached_graph_before_the_commit() {
+        let source = include_str!("ebpf.rs");
+        let (_, aya_runtime) = source
+            .split_once("impl EbpfGtpuRuntime for AyaGtpuRuntime {")
+            .expect("Aya runtime implementation is present");
+        let (_, activation) = aya_runtime
+            .split_once("        fn activate_cleanup_only(")
+            .expect("Aya cleanup-only activation is present");
+        let (activation, _) = activation
+            .split_once("        fn teardown_drained_v2(")
+            .expect("Aya cleanup-only activation has a bounded body");
+        let steps = [
+            "Self::reset_traffic_observation_source(&mut device.ebpf)?",
+            "self.attach_programs_by_ifindex(",
+            "device.cleanup_only = false;",
+            "Self::selector_namespace_graph_identity(",
+            "Self::verify_traffic_observation_source_quiescent(",
+            "Self::enable_traffic_observation_source(",
+            "device.links = Some(attached.links);",
+        ];
+        let positions = steps
+            .iter()
+            .map(|step| {
+                assert_eq!(activation.matches(step).count(), 1, "{step}");
+                activation.find(step).expect("step is present")
+            })
+            .collect::<Vec<_>>();
+        assert!(
+            positions.windows(2).all(|pair| pair[0] < pair[1]),
+            "activation steps must run in this order: {steps:?}"
         );
     }
 
