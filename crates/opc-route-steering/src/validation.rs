@@ -36,6 +36,7 @@ pub(crate) fn canonical_route_request(request: &RouteRequest) -> RouteRequest {
         oif_ifindex: request.oif_ifindex,
         table: request.table,
         priority: canonical_route_priority(request),
+        locked_mtu: None,
     }
 }
 
