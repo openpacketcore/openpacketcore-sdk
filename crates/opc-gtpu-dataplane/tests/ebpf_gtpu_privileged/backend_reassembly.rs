@@ -779,3 +779,103 @@ pub(super) async fn qualify_churn() -> Result<(), Box<dyn std::error::Error>> {
     );
     Ok(())
 }
+
+/// Ordinary attachment carrying an IPv4v6 PDN (#998): the inner-IPv6 context
+/// lives in the family-tagged authority, and an outer-fragmented G-PDU for it
+/// must be reassembled and decapsulated like its IPv4 sibling.
+// The serial guard is deliberately held for the entire body; see
+// PRIVILEGED_TEST_LOCK.
+#[allow(clippy::await_holding_lock)]
+pub(super) async fn qualify_ordinary_ipv6() -> Result<(), Box<dyn std::error::Error>> {
+    if env::var("OPC_GTPU_RUN_PRIVILEGED").as_deref() != Ok("1") {
+        eprintln!("skipping: set OPC_GTPU_RUN_PRIVILEGED=1 inside a fresh privileged netns");
+        return Ok(());
+    }
+    let _serial = PRIVILEGED_TEST_LOCK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let _fragment_limits = FragmentSysctlGuard::configure(2, 4 * 1024 * 1024)?;
+    let net = TestNet::provision();
+    let backend = EbpfGtpuDataplaneBackend::with_config(EbpfGtpuDataplaneBackendConfig {
+        bpffs_pin_root: net.pin_root.clone(),
+        ..EbpfGtpuDataplaneBackendConfig::default()
+    });
+    let mut request = CreateGtpDeviceRequest::new("s2bu");
+    request.bind_address = IpAddr::V4(EPDG_S2BU_IP);
+    let device = backend.create_device(request).await?;
+    let ipv4 = session_context(device.ifindex);
+    let ipv6 = GtpPdpContext {
+        ms_address: IpAddr::V6(Ipv6Addr::new(0x2001, 0xdb8, 0x45, 0, 0, 0, 0, 0)),
+        ..ipv4.clone()
+    };
+    backend.install_pdp_context(ipv4).await?;
+    backend.install_pdp_context(ipv6.clone()).await?;
+    let port = backend.open_gtpu_control_port(&device).await?;
+    let sender = FragmentSender {
+        net: &net,
+        destination_mac: main_link_address("s2bu"),
+        source_mac: net.pgw_link_address("s2bup"),
+    };
+
+    let v6 = build_inner_udp_v6(
+        REMOTE_HOST_IPV6,
+        UE_PAA_IPV6,
+        5060,
+        5060,
+        &sip_invite_payload(b"ordinv6!"),
+    );
+    sender.send_set(LOCAL_TEID, &v6, 0x4400, SetOrder::Reordered);
+    match receive_event(port.as_ref()) {
+        GtpuDownlinkEvent::Decapsulated(decapsulated) => {
+            assert_eq!(decapsulated.inner_packet(), v6.as_slice());
+            assert_eq!(decapsulated.family(), GtpAddressFamily::Ipv6);
+            assert_eq!(decapsulated.bearer_mark(), None);
+        }
+        other => panic!("ordinary inner-IPv6 fragments must decapsulate, got {other:?}"),
+    }
+    let v4 = build_inner_udp(
+        REMOTE_HOST,
+        UE_PAA,
+        5060,
+        5060,
+        &sip_invite_payload(b"ordinv4!"),
+    );
+    sender.send_set(LOCAL_TEID, &v4, 0x4401, SetOrder::InOrder);
+    expect_decapsulated(port.as_ref(), &v4, None);
+
+    // A destination outside the context's /64 fails its family authority.
+    let outside = build_inner_udp_v6(
+        REMOTE_HOST_IPV6,
+        Ipv6Addr::new(0x2001, 0xdb8, 0x46, 0, 0, 0, 0, 2),
+        5060,
+        5060,
+        &sip_invite_payload(b"outside!"),
+    );
+    sender.send_set(LOCAL_TEID, &outside, 0x4402, SetOrder::InOrder);
+    expect_drop(
+        port.as_ref(),
+        GtpuDownlinkDrop::BindingMismatch(opc_gtpu_ebpf_common::DownlinkBindingMismatch::Invalid),
+    );
+
+    // Family-scoped removal leaves only the IPv4-only v5 path, which (like tc)
+    // refuses an IPv6 T-PDU.
+    backend
+        .remove_pdp_context(RemovePdpContextRequest {
+            local_teid: Teid::new(LOCAL_TEID).expect("nonzero"),
+            link_ifindex: device.ifindex,
+            gtp_version: GtpVersion::V1,
+            address_family: GtpAddressFamily::Ipv6,
+        })
+        .await?;
+    sender.send_set(LOCAL_TEID, &v6, 0x4403, SetOrder::InOrder);
+    expect_drop(port.as_ref(), GtpuDownlinkDrop::Malformed);
+    let counters = port.downlink_counters()?;
+    assert_eq!(counters.decapsulated, 2);
+    drop(port);
+    backend.remove_device(&device).await?;
+    drop(net);
+    eprintln!(
+        "OPC_GTPU_BACKEND_ORDINARY_IPV6_REASSEMBLY_CONSUMER_PROVEN: ordinary inner-IPv6 reassembled, /64 authority, family removal"
+    );
+    Ok(())
+}

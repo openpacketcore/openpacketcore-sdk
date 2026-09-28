@@ -292,8 +292,12 @@ Both privileged lanes require `OPC_GTPU_DOWNLINK_PACKET_TOO_BIG_PROVEN` and
 `Unsupported` result. The consumer does not inject packets, admit peers, rate
 limit, or plan Error Indications. Grouped attachments with an IPv4 outer
 endpoint report `KernelReassemblyHandoff` for outer IPv4 fragments; outer IPv6
-fragments remain unsupported. Inner IPv6 on the ordinary v5 path is
-malformed, as in tc, until that path supports it.
+fragments remain unsupported. An ordinary attachment's inner-IPv6 contexts
+live in the family-tagged authority under the attachment's own published
+configuration, which is bound to its IPv4 endpoint. The consumer reads and
+checks that configuration, exactly as tc selects those contexts, so
+reassembled inner-IPv6 G-PDUs decapsulate on ordinary attachments too. An
+IPv6 T-PDU that only reaches the IPv4-only v5 maps stays malformed, as in tc.
 
 Native evidence runs the committed classifier on ordinary and grouped
 attachments: in-order, reordered, duplicated head and tail, missing,
