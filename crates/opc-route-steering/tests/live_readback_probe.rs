@@ -47,6 +47,7 @@ async fn live_absent_documentation_rule_readback_completes() {
         fwmark: None,
         table: 4_000_000_001,
         priority: u32::MAX,
+        family: None,
     };
     assert_eq!(
         backend.read_rule(&request).await.unwrap(),
@@ -174,6 +175,7 @@ async fn live_privileged_pair_converges_retries_and_removes_exact_state() {
         fwmark: None,
         table: route.table,
         priority: u32::MAX - 1,
+        family: None,
     };
 
     let installed = backend
@@ -224,6 +226,7 @@ async fn live_privileged_pair_converges_retries_and_removes_exact_state() {
         }),
         table: route.table,
         priority: u32::MAX - 2,
+        family: None,
     };
     assert_eq!(
         backend.converge_rule(mark_only_rule.clone()).await.unwrap(),
@@ -262,6 +265,7 @@ async fn live_privileged_pair_converges_retries_and_removes_exact_state() {
         fwmark: None,
         table: route.table,
         priority: u32::MAX - 3,
+        family: None,
     };
     let ipv6_installed = backend
         .converge_route_and_rule(ipv6_route.clone(), ipv6_rule.clone())
@@ -307,6 +311,7 @@ async fn live_owned_collection_same_priority_siblings_retry_and_remove_exactly()
         fwmark: None,
         table: 1000,
         priority: 900,
+        family: None,
     };
     let second = RuleRequest {
         source: Some(IpPrefix::new(IpAddr::V4(Ipv4Addr::new(192, 0, 2, 11)), 32)),
@@ -314,6 +319,7 @@ async fn live_owned_collection_same_priority_siblings_retry_and_remove_exactly()
         fwmark: None,
         table: 1000,
         priority: 900,
+        family: None,
     };
     let both =
         OwnedRouteRuleSet::new(scope, Vec::new(), vec![first.clone(), second.clone()]).unwrap();
@@ -401,6 +407,7 @@ async fn live_multiple_candidates_are_conflicts_and_exact_removal_preserves_them
         fwmark: None,
         table: route.table,
         priority: 30_101,
+        family: None,
     };
     ip(&[
         "rule",
@@ -482,6 +489,7 @@ async fn live_foreign_protocol_and_zero_mark_rules_are_never_adopted_or_deleted(
         fwmark: None,
         table: foreign_route.table,
         priority: 30_102,
+        family: None,
     };
     ip(&[
         "rule",
@@ -518,6 +526,7 @@ async fn live_foreign_protocol_and_zero_mark_rules_are_never_adopted_or_deleted(
         }),
         table: 4_000_000_103,
         priority: 30_103,
+        family: None,
     };
     ip(&[
         "rule",
@@ -554,6 +563,7 @@ async fn live_foreign_protocol_and_zero_mark_rules_are_never_adopted_or_deleted(
         }),
         table: 4_000_000_103,
         priority: 30_104,
+        family: None,
     };
     ip(&[
         "rule",
@@ -635,6 +645,7 @@ async fn live_default_route_priorities_and_cancelled_clone_pair_are_stable() {
         fwmark: None,
         table: pair_route.table,
         priority: 30_106,
+        family: None,
     };
     ip(&[
         "rule",
@@ -677,4 +688,80 @@ async fn live_default_route_priorities_and_cancelled_clone_pair_are_stable() {
         backend.read_rule(&pair_rule).await.unwrap(),
         RuleReadback::Conflict(_)
     ));
+}
+
+#[tokio::test]
+#[ignore = "requires CAP_NET_ADMIN in an isolated network namespace"]
+async fn live_ipv4_and_ipv6_mark_only_rules_are_distinct_kernel_objects() {
+    let backend = LinuxRouteSteeringBackend::new();
+    let mark_only = |family| RuleRequest {
+        source: None,
+        destination: None,
+        fwmark: Some(FirewallMark {
+            value: 0x46,
+            mask: 0xff,
+        }),
+        table: 4_000_000_106,
+        priority: 30_106,
+        family,
+    };
+    let ipv4 = mark_only(None);
+    let ipv6 = mark_only(Some(RouteSteeringIpFamily::Ipv6));
+
+    assert_eq!(
+        backend.converge_rule(ipv6.clone()).await.unwrap(),
+        RuleConvergenceOutcome::Installed
+    );
+    // The kernel holds the rule in the IPv6 list only.
+    let ipv6_rules = ip_stdout(&["-6", "rule", "show", "priority", "30106"]);
+    assert!(ipv6_rules.contains("fwmark 0x46/0xff"), "{ipv6_rules}");
+    assert!(ipv6_rules.contains("lookup 4000000106"), "{ipv6_rules}");
+    assert!(ip_stdout(&["-4", "rule", "show", "priority", "30106"])
+        .trim()
+        .is_empty());
+    assert_eq!(
+        backend.read_rule(&ipv4).await.unwrap(),
+        RuleReadback::Absent
+    );
+    assert_eq!(
+        backend.read_rule(&ipv6).await.unwrap(),
+        RuleReadback::ExactPresent
+    );
+    assert_eq!(
+        backend.converge_rule(ipv6.clone()).await.unwrap(),
+        RuleConvergenceOutcome::ExactAlreadyPresent
+    );
+
+    // An IPv4 rule with the same mark, table, and priority is a separate
+    // object in the IPv4 list and does not disturb the IPv6 rule.
+    assert_eq!(
+        backend.converge_rule(ipv4.clone()).await.unwrap(),
+        RuleConvergenceOutcome::Installed
+    );
+    assert_eq!(
+        backend.read_rule(&ipv4).await.unwrap(),
+        RuleReadback::ExactPresent
+    );
+    assert_eq!(
+        backend.read_rule(&ipv6).await.unwrap(),
+        RuleReadback::ExactPresent
+    );
+
+    backend.remove_converged_rule(ipv4.clone()).await.unwrap();
+    assert_eq!(
+        backend.read_rule(&ipv4).await.unwrap(),
+        RuleReadback::Absent
+    );
+    assert_eq!(
+        backend.read_rule(&ipv6).await.unwrap(),
+        RuleReadback::ExactPresent
+    );
+    backend.remove_converged_rule(ipv6.clone()).await.unwrap();
+    assert_eq!(
+        backend.read_rule(&ipv6).await.unwrap(),
+        RuleReadback::Absent
+    );
+    assert!(ip_stdout(&["-6", "rule", "show", "priority", "30106"])
+        .trim()
+        .is_empty());
 }

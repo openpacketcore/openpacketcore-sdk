@@ -9,6 +9,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- `opc-route-steering`: `RuleRequest` gains an explicit `family` so mark-only
+  policy rules can be created, read back, converged and removed as `AF_INET6`
+  rules. `None` keeps the previous IPv4 default and wire bytes; a prefix still
+  determines the family, and a conflicting explicit family is rejected. IPv4
+  and IPv6 rules with the same mark, table and priority are distinct objects.
+  Struct-literal constructors must add `family: None`. Refs #989.
+
 - `opc-session-net`: remove the duplicate control probe before the first
   bounded frame chunk copy. Preserve cancellation, absolute deadlines, exact
   byte bounds and all pre-publication checks. Refs #972.

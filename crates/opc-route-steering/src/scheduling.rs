@@ -205,6 +205,7 @@ mod tests {
             fwmark: None,
             table: 1000,
             priority: 900,
+            family: None,
         }
     }
 
