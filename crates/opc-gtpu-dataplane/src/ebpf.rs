@@ -79161,6 +79161,50 @@ mod tests {
         );
     }
 
+    /// If the gate cannot be restored to even after a failed enable, the
+    /// hooks are still detached and the outcome is indeterminate: the device
+    /// never keeps attached hooks behind a possibly odd gate.
+    #[tokio::test]
+    async fn cleanup_only_activation_detaches_when_the_gate_cannot_be_restored() {
+        let (backend, runtime) = backend_with_fake();
+        let installed = create_device_with_context(&backend).await;
+        simulate_process_loss(&runtime, false);
+        let recovered = EbpfGtpuDataplaneBackend::with_runtime(runtime.clone());
+        assert_eq!(
+            recovered
+                .acquire_cleanup_only_recovery(cleanup_request(
+                    Ipv4Addr::new(192, 0, 2, 1),
+                    S2BU_IFINDEX,
+                ))
+                .await
+                .unwrap(),
+            RetainedGraphCleanupClassification::Acquired
+        );
+        recovered
+            .remove_pdp_context_exact(installed.clone())
+            .await
+            .unwrap();
+        let device = GtpDevice {
+            name: "s2bu".to_string(),
+            ifindex: S2BU_IFINDEX,
+        };
+
+        runtime.fail_after_in_order(["traffic_observation_enable"]);
+        runtime.fail_in_order(["traffic_observation_disable"]);
+        assert!(matches!(
+            recovered.activate_cleanup_recovery(&device).await,
+            Err(GtpuError::StateIndeterminate { .. })
+        ));
+        let state = runtime.state();
+        assert!(
+            state.failures.is_empty(),
+            "the gate restore must be attempted"
+        );
+        assert!(!state.uplink_filter_ready.contains(&S2BU_IFINDEX));
+        assert!(!state.downlink_filter_ready.contains(&S2BU_IFINDEX));
+        assert!(state.cleanup_only.contains(&S2BU_IFINDEX));
+    }
+
     #[tokio::test]
     async fn cleanup_only_recovery_refuses_stale_interface_identity_before_mutation() {
         let (backend, runtime) = backend_with_fake();
