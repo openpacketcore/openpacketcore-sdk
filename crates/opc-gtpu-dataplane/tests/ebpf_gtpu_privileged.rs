@@ -42,6 +42,8 @@
 
 #![cfg(target_os = "linux")]
 
+#[path = "ebpf_gtpu_privileged/backend_reassembly.rs"]
+mod backend_reassembly;
 #[path = "ebpf_gtpu_privileged/n3_end_marker.rs"]
 mod n3_end_marker;
 #[path = "ebpf_gtpu_privileged/n3_fixed_flow.rs"]
@@ -9075,6 +9077,34 @@ async fn ebpf_gtpu_downlink_outer_fragments_reenter_sdk_consumer_exactly_once(
 }
 
 #[tokio::test]
+#[ignore = "requires root (CAP_BPF/CAP_NET_ADMIN), a fresh netns, and bpffs"]
+async fn ebpf_gtpu_backend_consumer_decapsulates_outer_fragmented_downlink(
+) -> Result<(), Box<dyn std::error::Error>> {
+    backend_reassembly::qualify_ordinary().await
+}
+
+#[tokio::test]
+#[ignore = "requires root (CAP_BPF/CAP_NET_ADMIN), a fresh netns, and bpffs"]
+async fn ebpf_gtpu_backend_consumer_decapsulates_grouped_outer_fragmented_downlink(
+) -> Result<(), Box<dyn std::error::Error>> {
+    backend_reassembly::qualify_grouped().await
+}
+
+#[tokio::test]
+#[ignore = "requires root (CAP_BPF/CAP_NET_ADMIN), a fresh netns, and bpffs"]
+async fn ebpf_gtpu_backend_consumer_decapsulates_ordinary_inner_ipv6_fragments(
+) -> Result<(), Box<dyn std::error::Error>> {
+    backend_reassembly::qualify_ordinary_ipv6().await
+}
+
+#[tokio::test]
+#[ignore = "requires root (CAP_BPF/CAP_NET_ADMIN), a fresh netns, and bpffs"]
+async fn ebpf_gtpu_backend_consumer_drains_shared_queue_under_pdp_churn(
+) -> Result<(), Box<dyn std::error::Error>> {
+    backend_reassembly::qualify_churn().await
+}
+
+#[tokio::test]
 // The serial guard is deliberately held for the entire test body; see
 // PRIVILEGED_TEST_LOCK.
 #[allow(clippy::await_holding_lock)]
@@ -9732,10 +9762,10 @@ async fn ebpf_gtpu_grouped_dual_stack_live_contract() -> Result<(), Box<dyn std:
         capabilities.uplink_checksum_offload,
         GtpuUplinkChecksumOffloadContract::MaterializedOnly
     );
-    assert_eq!(
+    assert!(matches!(
         capabilities.downlink_outer_ipv4_fragment_handling,
-        GtpuDownlinkFragmentContract::Unsupported
-    );
+        GtpuDownlinkFragmentContract::KernelReassemblyHandoff { .. }
+    ));
     assert_eq!(
         capabilities.downlink_outer_ipv6_fragment_handling,
         GtpuDownlinkFragmentContract::Unsupported

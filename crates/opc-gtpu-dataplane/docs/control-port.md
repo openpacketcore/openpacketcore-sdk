@@ -57,9 +57,15 @@ return `UnsupportedFeature { feature: "gtpu_control_port" }`. They do not
 open another listener or expose their private file descriptors.
 
 The backend checks its exact current tc hooks/maps and serializes each socket
-operation with attachment mutation through that backend instance. External
-attachment changes are refused when observed by the live hook/binding checks. A busy writer returns `Busy` without
-waiting for the mutation. Removal closes the queue and invalidates all old
+operation per attachment, through that registration's socket slot. PDP
+installs, replacements and removals on any attachment do not block or defer
+the queue: authorization reads the commit-last graph exactly like tc, so a
+sustained PDP churn (for example a mass re-attach after failover) cannot
+starve Echo or reassembled G-PDUs. Device removal holds the slot across its
+hook change and then retires it, so a socket operation linearizes entirely
+before or after removal; a replaced or fenced registration is detected under
+the slot before anything is received or sent. External attachment changes
+are refused when observed by the live hook/binding checks. Removal closes the queue and invalidates all old
 ports, including when a replacement has the same name, ifindex and address.
 Ports hold weak references; keeping them alive cannot keep the backend or
 its socket alive. Observed attachment loss retires the queue. Restoring hooks
@@ -147,3 +153,57 @@ sources and the rebuilt object are byte-identical and pass. The local endpoint
 check adds the existing IPv4 configuration map to the downlink program's exact
 map-identity set; map layouts, pin inventory and frozen historical objects do
 not change.
+
+## Backend-authoritative downlink consumer
+
+`GtpuControlPort::try_receive_downlink` is the production consumer for G-PDUs
+the kernel delivers to this queue: outer-fragmented downlink G-PDUs after
+kernel reassembly (TS 29.281 clauses 4.2.4 and 4.2.5) and unknown-TEID
+handoffs. Receive and authorization run under the attachment's own socket
+slot, never behind unrelated backend mutation.
+
+A consumer-decapsulated grouped packet emits no traffic observation record.
+tc publishes those records to a kernel ring with a kernel-owned sequence that
+userspace cannot advance atomically, so the post-reassembly path cannot join
+that ordered stream. Traffic-continuity proofs therefore see only tc-path
+packets; missing observations can only withhold a proof, never create one.
+
+Authorization repeats the tc downlink decisions with the shared wire
+validators and the backend's own map reads:
+
+1. The loader traffic gate must be open. While it is closed tc passes
+   packets untouched, so nothing is decapsulated on its behalf.
+2. The grouped downlink index is read first. A present index never falls
+   back: the Active generation, device, inner-family slot, local and peer
+   endpoints, source-port policy, inner destination and any N3 PSC must
+   match, and the inner length must be exact.
+3. On a true index miss the v5 PDR, endpoint binding, owner journal, FAR and
+   DSCP are read and the Active `PdpContextCommit` is read last as the
+   publication fence. Pending, Removing, absent or mixed graphs fail closed.
+
+| Event | Meaning |
+| --- | --- |
+| `Decapsulated` | Exact inner packet, inner family and bearer mark (default bearer is `None`). The caller injects it toward XFRM with that mark. |
+| `Control` | Non-G-PDU message; use the response planners above. |
+| `UnknownTunnel` | Untouched G-PDU whose TEID selects no tunnel. An observation, not an absence receipt. |
+| `Dropped` | Value-free `GtpuDownlinkDrop`: malformed, binding mismatch, destination mismatch or state unavailable. |
+
+`downlink_counters` returns bounded, value-free counters for the current
+attachment registration. The ordinary legacy socket port keeps the default
+`Unsupported` result. The consumer does not inject packets, admit peers, rate
+limit, or plan Error Indications. Grouped attachments with an IPv4 outer
+endpoint report `KernelReassemblyHandoff` for outer IPv4 fragments; outer IPv6
+fragments remain unsupported. An ordinary attachment's inner-IPv6 contexts
+live in the family-tagged authority under the attachment's own published
+configuration, which is bound to its IPv4 endpoint. The consumer reads and
+checks that configuration, exactly as tc selects those contexts, so
+reassembled inner-IPv6 G-PDUs decapsulate on ordinary attachments too. An
+IPv6 T-PDU that only reaches the IPv4-only v5 maps stays malformed, as in tc.
+
+Native evidence runs the committed classifier on ordinary and grouped
+attachments: in-order, reordered, duplicated head and tail, missing,
+foreign-TEID, wrong-peer, wrong-destination, stale Pending/Removing commit,
+owner-only Pending, mixed binding, closed gate, stale grouped generation,
+retirement and removal. Both privileged lanes require the
+`OPC_GTPU_BACKEND_REASSEMBLY_CONSUMER_PROVEN` and
+`OPC_GTPU_BACKEND_GROUPED_REASSEMBLY_CONSUMER_PROVEN` markers.

@@ -39,6 +39,8 @@ pub(crate) mod grouped_simulation;
 #[cfg(target_os = "linux")]
 mod n3_end_marker;
 mod ordinary_ipv6;
+#[cfg(target_os = "linux")]
+mod reassembled_downlink;
 mod workload_scope;
 use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::fmt;
@@ -2516,6 +2518,17 @@ pub(crate) trait EbpfGtpuRuntime: Send + Sync + fmt::Debug {
     /// Return whether readback can trust the exact programs, every named map,
     /// and the held reconciler lease for this managed device.
     fn pdp_readback_datapath_usable(&self, ifindex: u32) -> bool;
+
+    /// Read the exact loader traffic gate the tc programs consult before any
+    /// packet effect. `Ok(false)` means tc passes packets unprocessed, so a
+    /// userspace consumer must not decapsulate on the attachment's behalf.
+    // Only the Linux-only post-reassembly consumer reads the gate.
+    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+    fn traffic_gate_allows_packet_effects(&self, _ifindex: u32) -> Result<bool, GtpuError> {
+        Err(GtpuError::UnsupportedFeature {
+            feature: "gtpu_traffic_gate_readback",
+        })
+    }
 
     /// Return whether PDP cleanup can safely mutate the held maps.
     ///
@@ -8169,11 +8182,13 @@ impl EbpfGtpuDataplaneBackend {
             } else {
                 GtpuUplinkChecksumOffloadContract::Unsupported
             },
-            // The existing userspace reassembly consumer authorizes only the
-            // frozen single-context IPv4 graph. Grouped maps deliberately
-            // contain no legacy PDR/commit authority, so a reassembled
-            // grouped TEID cannot safely re-enter that consumer.
-            downlink_outer_ipv4_fragment_handling: GtpuDownlinkFragmentContract::Unsupported,
+            // The backend-owned IPv4 queue authorizes a reassembled grouped
+            // G-PDU against the exact grouped index, Active generation and
+            // endpoint authority (`GtpuControlPort::try_receive_downlink`).
+            // The caller-closure consumer remains single-context only.
+            downlink_outer_ipv4_fragment_handling: downlink_outer_fragment_contract(
+                outer_ipv4 == GtpuCapability::Available,
+            ),
             downlink_outer_ipv6_fragment_handling: GtpuDownlinkFragmentContract::Unsupported,
         })
     }
@@ -9105,6 +9120,10 @@ impl EbpfGtpuDataplaneBackend {
                 || self.pin_dir(&device.name),
                 |grouped| self.grouped_pin_dir(grouped.device_id),
             );
+        #[cfg(target_os = "linux")]
+        let control_slot = devices
+            .get(&device.ifindex)
+            .map(|managed| Arc::clone(&managed.control_socket));
         drop(devices);
         let related_attempts = self
             .traffic_attempts()?
@@ -9129,6 +9148,18 @@ impl EbpfGtpuDataplaneBackend {
                 stores.remove(&group_key);
             }
         }
+        // Control-port operations are excluded per attachment by this slot, not
+        // by the backend-wide operation lock. Hold it across the hook change so
+        // an in-flight receive, authorization or send linearizes entirely
+        // before the attachment changes; retire it only once removal commits.
+        #[cfg(target_os = "linux")]
+        let mut control_guard = match control_slot.as_ref() {
+            Some(slot) => Some(
+                slot.lock()
+                    .map_err(|_| GtpuError::io("ebpf_control_port_state", poisoned_lock()))?,
+            ),
+            None => None,
+        };
         if retain_grouped {
             self.inner.runtime.suspend_grouped(
                 &device.name,
@@ -9145,6 +9176,10 @@ impl EbpfGtpuDataplaneBackend {
             )?;
         }
         self.devices()?.remove(&device.ifindex);
+        #[cfg(target_os = "linux")]
+        if let Some(guard) = control_guard.as_mut() {
+            guard.retire();
+        }
         self.traffic_sequence_sources()?.remove(&device.ifindex);
         Ok(())
     }
@@ -47974,6 +48009,22 @@ mod aya_runtime {
             })
         }
 
+        fn traffic_gate_allows_packet_effects(&self, ifindex: u32) -> Result<bool, GtpuError> {
+            const OPERATION: &str = "ebpf_traffic_gate_readback";
+            self.with_device(ifindex, OPERATION, |device| {
+                let map = device
+                    .ebpf
+                    .map(GTPU_TRAFFIC_OBSERVATION_GATE_MAP_NAME)
+                    .ok_or_else(|| state_indeterminate(OPERATION))?;
+                let gate =
+                    Array::<_, u64>::try_from(map).map_err(|_| state_indeterminate(OPERATION))?;
+                let value = gate
+                    .get(&GTPU_TRAFFIC_OBSERVATION_GATE_INDEX, 0)
+                    .map_err(|_| state_indeterminate(OPERATION))?;
+                Ok(value != 0 && value & 1 == 1)
+            })
+        }
+
         fn pdp_readback_datapath_usable(&self, ifindex: u32) -> bool {
             let Ok(devices) = self.devices.lock() else {
                 return false;
@@ -54433,6 +54484,8 @@ mod tests {
     #[cfg(target_os = "linux")]
     mod n3_end_marker;
     mod ordinary_ipv6;
+    #[cfg(target_os = "linux")]
+    mod reassembled_downlink;
     mod retained_namespace_boundary;
     // This fixture constructs real durable consensus, whose public platform
     // contract is Linux-only. The portable fake-runtime tests remain below.
@@ -63050,6 +63103,18 @@ mod tests {
                 && !state.downlink_filter_foreign.contains(&ifindex)
         }
 
+        fn traffic_gate_allows_packet_effects(&self, ifindex: u32) -> Result<bool, GtpuError> {
+            let state = self.state();
+            if !state.attached.contains_key(&ifindex) || state.successor_pending.contains(&ifindex)
+            {
+                return Err(state_indeterminate("fake_traffic_gate_readback"));
+            }
+            Ok(state
+                .traffic_observation_gate
+                .get(&ifindex)
+                .is_some_and(|gate| *gate != 0 && *gate & 1 == 1))
+        }
+
         fn pdp_readback_datapath_usable(&self, ifindex: u32) -> bool {
             let state = self.state();
             !state.successor_pending.contains(&ifindex)
@@ -68249,6 +68314,13 @@ mod tests {
             .unwrap();
         assert_eq!(capabilities.outer_ipv4, GtpuCapability::Available);
         assert_eq!(capabilities.outer_ipv6, GtpuCapability::Available);
+        #[cfg(target_os = "linux")]
+        assert!(matches!(
+            capabilities.downlink_outer_ipv4_fragment_handling,
+            GtpuDownlinkFragmentContract::KernelReassemblyHandoff { .. }
+        ));
+        // The kernel stack the handoff hands off to exists only on Linux.
+        #[cfg(not(target_os = "linux"))]
         assert_eq!(
             capabilities.downlink_outer_ipv4_fragment_handling,
             GtpuDownlinkFragmentContract::Unsupported
