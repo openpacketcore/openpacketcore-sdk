@@ -151,7 +151,11 @@ drop.
   backend-neutral parser can represent (including IPv4 and IPv6 semantics),
   and returns a pre-existing bearer mark or a silent drop. The unfiltered
   bearer is the explicit default fallback; absent one, no-match, malformed,
-  fragmented, unsafe-to-parse, and foreign-PAA packets drop.
+  fragmented, unsafe-to-parse, and foreign-PAA packets drop. Its typed
+  `TftUplinkPaaSet` holds at most one IPv4 `/32` and one canonical IPv6
+  `/64`; any inner source inside the IPv6 prefix matches, and an IPv4v6 PDN
+  uses one classifier for both families. The native eBPF ABI remains
+  IPv4-only and rejects an IPv6 or dual-family set.
   `GtpuDataplaneBackend::tft_uplink_classification_capability` is separate from
   `per_bearer_marking`: a backend must not advertise it until its actual
   dataplane program and exact readback ABI support it. The deterministic mock
