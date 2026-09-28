@@ -222,6 +222,14 @@ fn read_verified_with_original_sync(
     let observed_row =
         super::config_capacity_simultaneous_working_tests::ledger::borrowed_read(encoded);
     let stored = ledger_decode::decode(encoded)?;
+    #[cfg(feature = "dangerous-test-hooks")]
+    if let Some(ledger) = &stored.ledger {
+        super::capacity_observation::sample(
+            super::capacity_observation::NativeStage::DecodedLedger,
+            ledger,
+            None,
+        );
+    }
     #[cfg(test)]
     let observed_read =
         super::config_capacity_simultaneous_working_tests::ledger::decoded(stored.ledger.as_ref());
@@ -279,6 +287,14 @@ pub(crate) fn write_sync(
     let _observed_ledger =
         super::config_capacity_simultaneous_working_tests::ledger::decoded(stored.ledger.as_ref());
     let (encoded, mac) = encode_state(&stored, key)?;
+    #[cfg(feature = "dangerous-test-hooks")]
+    if let Some(ledger) = &stored.ledger {
+        super::capacity_observation::sample(
+            super::capacity_observation::NativeStage::LedgerWrite,
+            ledger,
+            Some(&encoded),
+        );
+    }
     #[cfg(test)]
     let _observed_write =
         super::config_capacity_simultaneous_working_tests::ledger::write(&encoded);

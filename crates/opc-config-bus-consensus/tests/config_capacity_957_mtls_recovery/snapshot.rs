@@ -33,6 +33,139 @@ struct Chunk {
     done: bool,
 }
 
+/// One setup heartbeat observation; it cannot retain a request or backend.
+#[derive(Debug, Default)]
+pub(super) struct VoteProbe {
+    pending: Mutex<Option<tokio::sync::oneshot::Sender<VoteAgreement>>>,
+}
+
+/// Metadata from one actual empty AppendEntries invocation and its reply.
+#[derive(Clone, Copy, Debug)]
+pub(super) struct VoteAgreement {
+    pub(super) vote: Vote<ConsensusNodeId>,
+    pub(super) started: tokio::time::Instant,
+    pub(super) accepted: bool,
+    pub(super) reason: &'static str,
+    pub(super) higher: Option<Vote<ConsensusNodeId>>,
+}
+
+/// Single native invocation metadata and its one-shot completion sender.
+pub(super) struct PendingVote {
+    vote: Vote<ConsensusNodeId>,
+    started: tokio::time::Instant,
+    completion: tokio::sync::oneshot::Sender<VoteAgreement>,
+}
+
+// Deserialize only a genuinely empty entry sequence. No application payload
+// is decoded, allocated, cloned or retained by the setup observer.
+struct EmptyEntries;
+
+impl<'de> Deserialize<'de> for EmptyEntries {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        struct EmptyVisitor;
+        impl<'de> serde::de::Visitor<'de> for EmptyVisitor {
+            type Value = EmptyEntries;
+            fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                formatter.write_str("an empty heartbeat entry sequence")
+            }
+            fn visit_seq<A: serde::de::SeqAccess<'de>>(
+                self,
+                sequence: A,
+            ) -> Result<Self::Value, A::Error> {
+                if sequence.size_hint() == Some(0) {
+                    Ok(EmptyEntries)
+                } else {
+                    Err(serde::de::Error::custom("not an empty heartbeat"))
+                }
+            }
+        }
+        deserializer.deserialize_seq(EmptyVisitor)
+    }
+}
+
+impl VoteProbe {
+    /// Arm a single original native heartbeat completion, not a retry loop.
+    pub(super) fn arm(&self) -> tokio::sync::oneshot::Receiver<VoteAgreement> {
+        let (completion, receiver) = tokio::sync::oneshot::channel();
+        assert!(self.pending.lock().unwrap().replace(completion).is_none());
+        receiver
+    }
+
+    /// Disarm an unconsumed setup observation on either success or failure.
+    pub(super) fn disarm(&self) {
+        self.pending.lock().unwrap().take();
+    }
+
+    /// Capture the first genuine empty committed-vote request after arming.
+    pub(super) fn capture(&self, request: &ConsensusWireRequest) -> Option<PendingVote> {
+        // The metadata-only empty request is smaller than this fixture limit.
+        // Full application appends never enter this observer's decoder.
+        if request.family != ConsensusRpcFamily::AppendEntries || request.payload.len() > 512 {
+            return None;
+        }
+        let mut pending = self.pending.lock().unwrap();
+        pending.as_ref()?;
+        type Heartbeat = (
+            Vote<ConsensusNodeId>,
+            Option<opc_consensus::engine::LogId<ConsensusNodeId>>,
+            EmptyEntries,
+            Option<opc_consensus::engine::LogId<ConsensusNodeId>>,
+        );
+        let request_body: Wire<Heartbeat> = opc_consensus::decode_bounded(&request.payload).ok()?;
+        if request_body.revision != 8
+            || !request_body.value.0.committed
+            || request_body.value.0.leader_id.voted_for() != Some(request.sender)
+        {
+            return None;
+        }
+        Some(PendingVote {
+            vote: request_body.value.0,
+            started: tokio::time::Instant::now(),
+            completion: pending.take().unwrap(),
+        })
+    }
+}
+
+impl PendingVote {
+    /// Record this invocation only; a later reply cannot replace it.
+    pub(super) fn record(self, result: &Result<ConsensusWireResponse, ConsensusPeerError>) {
+        use opc_consensus::engine::raft::AppendEntriesResponse;
+        type Reply = Result<AppendEntriesResponse<ConsensusNodeId>, RaftError<ConsensusNodeId>>;
+        let (accepted, reason, higher) = match result {
+            Err(_) => (false, "transport_error", None),
+            Ok(response) => match &response.result {
+                Err(_) => (false, "service_error", None),
+                Ok(payload) => match opc_consensus::decode_bounded::<Wire<Reply>>(payload) {
+                    Err(_) => (false, "decode_error", None),
+                    Ok(reply) if reply.revision != 8 => (false, "revision", None),
+                    Ok(reply) => match reply.value {
+                        Err(_) => (false, "engine_error", None),
+                        Ok(AppendEntriesResponse::HigherVote(vote)) => {
+                            (false, "higher_vote", Some(vote))
+                        }
+                        // A log conflict still follows successful native vote
+                        // acceptance. It is never a snapshot acknowledgment.
+                        Ok(AppendEntriesResponse::Conflict) => {
+                            (true, "conflict_vote_accepted", None)
+                        }
+                        Ok(AppendEntriesResponse::Success) => (true, "success", None),
+                        Ok(AppendEntriesResponse::PartialSuccess(_)) => {
+                            (false, "unexpected_partial", None)
+                        }
+                    },
+                },
+            },
+        };
+        let _ = self.completion.send(VoteAgreement {
+            vote: self.vote,
+            started: self.started,
+            accepted,
+            reason,
+            higher,
+        });
+    }
+}
+
 pub(super) struct PendingChunk {
     vote: Vote<ConsensusNodeId>,
     snapshot: [u8; 32],
@@ -78,18 +211,19 @@ impl Observation {
         })
     }
 
-    pub(super) fn record(&self, chunk: PendingChunk, response: &ConsensusWireResponse) {
+    /// Record and return the acknowledgment for this exact captured request.
+    pub(super) fn record(&self, chunk: PendingChunk, response: &ConsensusWireResponse) -> bool {
         let Ok(payload) = &response.result else {
-            return;
+            return false;
         };
         let reply: Wire<SnapshotReply> =
             opc_consensus::decode_bounded(payload).expect("authenticated snapshot reply");
         assert_eq!(reply.revision, 8);
         let Ok(reply) = reply.value else {
-            return;
+            return false;
         };
         if reply.vote != chunk.vote {
-            return;
+            return false;
         }
         let mut transfers = self.transfers.lock().expect("snapshot observation lock");
         let transfer = transfers.entry(chunk.snapshot).or_default();
@@ -109,6 +243,7 @@ impl Observation {
                 assert_eq!(previous, total, "repeated final chunk preserves length");
             }
         }
+        true
     }
 
     pub(super) fn complete(&self, snapshot: [u8; 32], length: u64) -> Option<usize> {
@@ -483,3 +618,81 @@ native_case!(
     );
     }
 );
+
+#[cfg(test)]
+mod vote_probe_tests {
+    use super::*;
+    use opc_consensus::engine::raft::AppendEntriesResponse;
+    use serde::Serialize;
+
+    #[derive(Serialize)]
+    struct Encoded<T> {
+        revision: u16,
+        value: T,
+    }
+
+    async fn observe(reply: AppendEntriesResponse<ConsensusNodeId>, expected: bool) {
+        let source = ConsensusNodeId::new(11).unwrap();
+        let vote = Vote::new_committed(7, source);
+        let (agreement, released) = {
+            let probe = Arc::new(VoteProbe::default());
+            let released = Arc::downgrade(&probe);
+            let local = manifest().bind_local(replica_id(0)).unwrap();
+            let request = ConsensusWireRequest::try_new(
+                local.consensus_identity(),
+                source,
+                ConsensusRpcFamily::AppendEntries,
+                opc_consensus::encode_bounded(&Encoded {
+                    revision: 8,
+                    value: (
+                        vote,
+                        None::<opc_consensus::engine::LogId<ConsensusNodeId>>,
+                        Vec::<u8>::new(),
+                        None::<opc_consensus::engine::LogId<ConsensusNodeId>>,
+                    ),
+                })
+                .unwrap(),
+            )
+            .unwrap();
+            let reply: Result<_, RaftError<ConsensusNodeId>> = Ok(reply);
+            let response = Ok(ConsensusWireResponse {
+                result: Ok(opc_consensus::encode_bounded(&Encoded {
+                    revision: 8,
+                    value: reply,
+                })
+                .unwrap()),
+            });
+            let receiver = probe.arm();
+            let pending = probe
+                .capture(&request)
+                .expect("actual shared heartbeat capture");
+            pending.record(&response);
+            let agreement = receiver.await.unwrap();
+            probe.disarm();
+            (agreement, released)
+        };
+        // Synthetic codec/observer coverage only; no native operation is claimed.
+        assert!(released.upgrade().is_none());
+        println!("CONFIG_CAPACITY_VOTE_PROBE_LOCAL_CLEANUP released=true native_operation=false");
+        assert_eq!(agreement.vote, vote);
+        assert_eq!(
+            agreement.accepted, expected,
+            "CONFIG_CAPACITY_VOTE_PROBE_RED: higher votes never establish agreement"
+        );
+    }
+
+    #[tokio::test]
+    async fn native_vote_probe_rejects_higher_vote() {
+        observe(
+            AppendEntriesResponse::HigherVote(Vote::new(8, ConsensusNodeId::new(12).unwrap())),
+            false,
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn native_vote_probe_records_current_committed_vote() {
+        observe(AppendEntriesResponse::Success, true).await;
+        observe(AppendEntriesResponse::Conflict, true).await;
+    }
+}

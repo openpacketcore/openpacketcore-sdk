@@ -65,7 +65,7 @@ impl KeyProvider for JointProvider {
     }
 }
 
-fn principal(audited: bool) -> String {
+pub(super) fn principal(audited: bool) -> String {
     let bytes = if audited {
         assert_eq!(opc_persist::MANAGEMENT_AUDIT_MAX_PRINCIPAL_BYTES, 1_024);
         1_024
@@ -148,7 +148,7 @@ enum CommitMode {
     Resolve(opc_persist::ConfirmedCommitResolution),
 }
 
-async fn input(
+pub(super) async fn input(
     store: &ConsensusConfigStore,
     version: u64,
     parent: Option<TxId>,
@@ -235,7 +235,7 @@ async fn input_mode(
     (commit, aad, plaintext)
 }
 
-fn assert_readback(
+pub(super) fn assert_readback(
     value: &StoredConfig,
     record: &CommitRecord,
     aad: &EnvelopeAad,
@@ -265,15 +265,15 @@ fn assert_readback(
         .expect("complete atomic audit chain");
 }
 
-fn privacy() -> AuditPrivacyKey {
+pub(super) fn privacy() -> AuditPrivacyKey {
     AuditPrivacyKey::new([0xB4; 32]).expect("synthetic projection key")
 }
 
-fn caller(principal: &str) -> AuditCaller {
+pub(super) fn caller(principal: &str) -> AuditCaller {
     AuditCaller::project(&privacy(), "test", principal).expect("supported audited caller")
 }
 
-fn event(version: u64, principal: &str) -> ManagementAuditEventRecord {
+pub(super) fn event(version: u64, principal: &str) -> ManagementAuditEventRecord {
     ManagementAuditEventRecord::try_new(
         [u8::try_from(version).expect("fixture version"); 16],
         ManagementAuditInstant::try_new(100, 0, 1, ManagementAuditTimeSourceCode::NodeClock)

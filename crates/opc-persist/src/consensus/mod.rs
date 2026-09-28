@@ -12,6 +12,8 @@ pub(crate) use crate::retained::RetainedConfigMode;
 pub(crate) use audit_mutation::TargetMutationCommand;
 pub use audit_mutation::{PreparedAuditedMutation, PreparedTargetMutation};
 pub use audit_targets::RetainedConfigProfile;
+#[cfg(feature = "dangerous-test-hooks")]
+pub mod capacity_observation;
 mod capacity_record;
 mod config_capacity_decode;
 pub(crate) mod config_capacity_json;

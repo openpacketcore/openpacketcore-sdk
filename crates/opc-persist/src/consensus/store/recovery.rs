@@ -26,6 +26,11 @@ pub struct PreparedConfigCommitOperation {
 }
 
 impl PreparedConfigCommitOperation {
+    #[cfg(feature = "dangerous-test-hooks")]
+    pub(crate) fn capacity_intent(&self) -> &ConfigMutationIntent {
+        &self.intent
+    }
+
     /// Exact original-operation handle, available before any proposal is sent.
     pub fn recovery_handle(&self) -> &ConfigCommitRecoveryHandle {
         &self.handle

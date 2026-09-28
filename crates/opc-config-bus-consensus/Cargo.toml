@@ -37,7 +37,8 @@ tracing = { workspace = true }
 uuid = { workspace = true }
 
 [dev-dependencies]
-opc-session-net = { path = "../opc-session-net", version = "0.2.0" }
+opc-persist = { path = "../opc-persist", version = "0.2.0", features = ["dangerous-test-hooks"] }
+opc-session-net = { path = "../opc-session-net", version = "0.2.0", features = ["test-control"] }
 opc-session-store = { path = "../opc-session-store", version = "0.2.0" }
 sha2 = { workspace = true }
 opc-consensus = { path = "../opc-consensus", version = "0.2.0" }
