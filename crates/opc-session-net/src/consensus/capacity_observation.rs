@@ -65,9 +65,54 @@ pub struct BufferSnapshot {
     pub overlap: Option<BufferOverlap>,
 }
 
-/// Current typed append/snapshot pair captured inside a native checkpoint.
-/// Snapshot input, snapshot RPC and outer transport are separate categories.
+/// One actually registered call at a single native checkpoint.
+/// Call IDs distinguish registrations; typed generation zero remains untyped.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct TransportCensusCall {
+    /// Observer-local registration identity, independent of pointer reuse.
+    pub call_id: u64,
+    /// Actual recipient of this live call.
+    pub target: ConsensusNodeId,
+    /// Original typed provenance, or zero for an untyped observed call.
+    pub generation: u64,
+    /// Whether native provenance selected this exact append operation.
+    pub selected_append: bool,
+    /// This call's capacities; shared RPC allocations can occur in other rows.
+    pub buffers: BufferTotals,
+}
+
+/// Current owners for one source and RPC family, deduplicated within this group.
+/// Groups can share RPC backing; never add their byte totals as a global union.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct TransportCensusGroup {
+    /// Actual source of every included call.
+    pub source: ConsensusNodeId,
+    /// Observed family: large AppendEntries or InstallSnapshot only.
+    pub family: ConsensusRpcFamily,
+    /// Exact allocation union within this source/family group.
+    pub totals: BufferTotals,
+    /// All current call registrations, including RPC-only and untyped owners.
+    pub owners: Vec<TransportCensusCall>,
+}
+
+/// Coherent census of all currently registered negotiated RPC/frame owners.
+/// Excludes small appends, other RPC families, queues, inbound buffers and TLS.
+/// Native and snapshot-input storage remain separate from this census.
+/// Owns numeric metadata only and never extends the observed payload lifetime.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct CurrentTransportCensus {
+    /// Global allocation union, deduplicated across every source and family.
+    pub total: BufferTotals,
+    /// Calls outside the selected pair and allocated bytes not already in it.
+    /// Pair plus additional equals total even when additional calls alias it.
+    pub additional: BufferTotals,
+    /// Independent source/family unions and exact target/generation evidence.
+    pub groups: Vec<TransportCensusGroup>,
+}
+
+/// Current typed pair and all observed calls inside one native checkpoint.
+/// Snapshot input, snapshot RPC and outer transport are separate categories.
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct NativeTransportOverlap {
     /// Actual pair of live encoded RPC/frame owners at this instant.
     pub pair: BufferOverlap,
@@ -77,6 +122,12 @@ pub struct NativeTransportOverlap {
     pub append_generation: u64,
     /// Different typed-call generation for the actual snapshot's moved allocation.
     pub snapshot_generation: u64,
+    /// Current registration identity of the selected append.
+    pub append_call_id: u64,
+    /// Current registration identity of the selected snapshot.
+    pub snapshot_call_id: u64,
+    /// All registered call owners from this exact locked checkpoint.
+    pub current: CurrentTransportCensus,
 }
 
 #[derive(Clone, Copy, Default)]
@@ -176,6 +227,106 @@ fn totals<'a>(calls: impl Iterator<Item = &'a CallRecord>) -> BufferTotals {
     result
 }
 
+#[derive(Default)]
+struct CensusAllocations {
+    calls: usize,
+    ready_frames: usize,
+    payloads: BTreeMap<usize, usize>,
+    frames: BTreeMap<usize, usize>,
+}
+
+impl CensusAllocations {
+    fn include(&mut self, call: &CallRecord) {
+        self.calls += 1;
+        if call.payload.bytes != 0 {
+            self.payloads
+                .insert(call.payload.address, call.payload.bytes);
+        }
+        if let Some(frame) = &call.frame {
+            self.ready_frames += usize::from(frame.ready);
+            for (address, bytes) in frame.allocations() {
+                if bytes != 0 {
+                    self.frames.insert(address, bytes);
+                }
+            }
+        }
+    }
+
+    fn totals(&self) -> BufferTotals {
+        BufferTotals {
+            calls: self.calls,
+            rpc_bytes: self.payloads.values().sum(),
+            ready_frames: self.ready_frames,
+            frame_allocations: self.frames.len(),
+            frame_bytes: self.frames.values().sum(),
+        }
+    }
+}
+
+// Run only for the synchronous native capture, never on each frame allocation
+// or gate refresh. The caller keeps the registration mutex held throughout.
+fn current_census<'a>(
+    calls: impl Iterator<Item = (u64, &'a CallRecord)>,
+    pair_ids: [u64; 2],
+) -> CurrentTransportCensus {
+    let mut all = CensusAllocations::default();
+    let mut pair = CensusAllocations::default();
+    let mut groups: BTreeMap<_, (TransportCensusGroup, CensusAllocations)> = BTreeMap::new();
+    for (id, call) in calls {
+        all.include(call);
+        if pair_ids.contains(&id) {
+            pair.include(call);
+        }
+        // observe_call admits only these two families. Use the family key
+        // without adding an ordering requirement to the shared RPC enum.
+        let key = (
+            call.source,
+            call.family == ConsensusRpcFamily::InstallSnapshot,
+        );
+        let (group, allocations) = groups.entry(key).or_insert_with(|| {
+            (
+                TransportCensusGroup {
+                    source: call.source,
+                    family: call.family,
+                    totals: BufferTotals::default(),
+                    owners: Vec::new(),
+                },
+                CensusAllocations::default(),
+            )
+        });
+        allocations.include(call);
+        group.owners.push(TransportCensusCall {
+            call_id: id,
+            target: call.target,
+            generation: call.typed.generation,
+            selected_append: call.typed.selected_append,
+            buffers: totals(std::iter::once(call)),
+        });
+    }
+    let total = all.totals();
+    let pair = pair.totals();
+    // The pair is a subset of this same current allocation union. Subtraction
+    // charges only genuinely additional backing, including aliases across groups.
+    let additional = BufferTotals {
+        calls: total.calls - pair.calls,
+        rpc_bytes: total.rpc_bytes - pair.rpc_bytes,
+        ready_frames: total.ready_frames - pair.ready_frames,
+        frame_allocations: total.frame_allocations - pair.frame_allocations,
+        frame_bytes: total.frame_bytes - pair.frame_bytes,
+    };
+    CurrentTransportCensus {
+        total,
+        additional,
+        groups: groups
+            .into_values()
+            .map(|(mut group, allocations)| {
+                group.totals = allocations.totals();
+                group
+            })
+            .collect(),
+    }
+}
+
 impl State {
     fn snapshot_provenance_matches(&self, call: &CallRecord) -> bool {
         self.native_source.is_none_or(|source| {
@@ -185,11 +336,11 @@ impl State {
         })
     }
 
-    fn native_overlap(&self) -> Option<NativeTransportOverlap> {
+    fn native_pair(&self) -> Option<[(u64, &CallRecord); 2]> {
         let source = self.native_source?;
         let append_target = self.held_append_target?;
         let snapshot_target = self.held_snapshot_target?;
-        let snapshot = self.calls.values().find(|call| {
+        let (snapshot_id, snapshot) = self.calls.iter().find(|(_, call)| {
             call.source == source
                 && call.target == snapshot_target
                 && call.family == ConsensusRpcFamily::InstallSnapshot
@@ -197,7 +348,7 @@ impl State {
                 && call.typed.snapshot_data_bytes > 0
                 && call.frame.as_ref().is_some_and(|frame| frame.ready)
         })?;
-        let append = self.calls.values().find(|call| {
+        let (append_id, append) = self.calls.iter().find(|(_, call)| {
             call.source == source
                 && call.target == append_target
                 && call.family == ConsensusRpcFamily::AppendEntries
@@ -205,12 +356,19 @@ impl State {
                 && call.typed.generation != 0
                 && call.frame.as_ref().is_some_and(|frame| frame.ready)
         })?;
+        Some([(*append_id, append), (*snapshot_id, snapshot)])
+    }
+
+    fn native_overlap(&self) -> Option<NativeTransportOverlap> {
+        let [(append_id, append), (snapshot_id, snapshot)] = self.native_pair()?;
         let pair = totals([snapshot, append].into_iter());
+        let pair_ids = [append_id, snapshot_id];
+        let current = current_census(self.calls.iter().map(|(&id, call)| (id, call)), pair_ids);
         Some(NativeTransportOverlap {
             pair: BufferOverlap {
-                source,
-                snapshot_target,
-                append_target,
+                source: append.source,
+                snapshot_target: snapshot.target,
+                append_target: append.target,
                 snapshot_rpc_bytes: snapshot.payload.bytes,
                 append_rpc_bytes: append.payload.bytes,
                 rpc_bytes: pair.rpc_bytes,
@@ -220,6 +378,9 @@ impl State {
             snapshot_data_bytes: snapshot.typed.snapshot_data_bytes,
             append_generation: append.typed.generation,
             snapshot_generation: snapshot.typed.generation,
+            append_call_id: append_id,
+            snapshot_call_id: snapshot_id,
+            current,
         })
     }
 
@@ -234,7 +395,7 @@ impl State {
         peak.frame_bytes = peak.frame_bytes.max(live.frame_bytes);
         // Admit quorum progress as soon as the selected minority frame is
         // really ready beside the snapshot. Only those two frames remain held.
-        if !self.append_quorum_released && self.native_overlap().is_some() {
+        if !self.append_quorum_released && self.native_pair().is_some() {
             self.append_quorum_released = true;
         }
         if self.snapshot.overlap.is_some() {
@@ -274,7 +435,8 @@ impl State {
 /// Registrations contain only addresses, extents, IDs and notifications. They do
 /// not clone payloads or retain a store, prepared operation, frame or TLS stream.
 /// Pointer identities stay private; live registrations end before owners free.
-/// Metadata is bounded by active calls/frames plus one fixed-size witness.
+/// Metadata is bounded by active calls/frames and owned numeric census rows.
+/// The census copies no buffers and contains no public allocation addresses.
 pub struct ConsensusBufferObservation {
     state: Mutex<State>,
     changed: watch::Sender<()>,
