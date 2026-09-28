@@ -710,8 +710,8 @@ async fn live_ipv4_and_ipv6_mark_only_rules_are_distinct_kernel_objects() {
             value: 0x46,
             mask: 0xff,
         }),
-        table: 4_000_000_106,
-        priority: 30_106,
+        table: 4_000_000_189,
+        priority: 30_189,
         family,
     };
     let ipv4 = mark_only(None);
@@ -722,10 +722,10 @@ async fn live_ipv4_and_ipv6_mark_only_rules_are_distinct_kernel_objects() {
         RuleConvergenceOutcome::Installed
     );
     // The kernel holds the rule in the IPv6 list only.
-    let ipv6_rules = ip_stdout(&["-6", "rule", "show", "priority", "30106"]);
+    let ipv6_rules = ip_stdout(&["-6", "rule", "show", "priority", "30189"]);
     assert!(ipv6_rules.contains("fwmark 0x46/0xff"), "{ipv6_rules}");
-    assert!(ipv6_rules.contains("lookup 4000000106"), "{ipv6_rules}");
-    assert!(ip_stdout(&["-4", "rule", "show", "priority", "30106"])
+    assert!(ipv6_rules.contains("lookup 4000000189"), "{ipv6_rules}");
+    assert!(ip_stdout(&["-4", "rule", "show", "priority", "30189"])
         .trim()
         .is_empty());
     assert_eq!(
@@ -770,7 +770,7 @@ async fn live_ipv4_and_ipv6_mark_only_rules_are_distinct_kernel_objects() {
         backend.read_rule(&ipv6).await.unwrap(),
         RuleReadback::Absent
     );
-    assert!(ip_stdout(&["-6", "rule", "show", "priority", "30106"])
+    assert!(ip_stdout(&["-6", "rule", "show", "priority", "30189"])
         .trim()
         .is_empty());
 }
