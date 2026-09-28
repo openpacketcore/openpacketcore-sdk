@@ -1525,11 +1525,16 @@ pub(crate) trait EbpfGtpuRuntime: Send + Sync + fmt::Debug {
     ///
     /// Activation is all or nothing. Every fallible proof of the attached
     /// graph and of the fresh traffic source runs while the traffic gate is
-    /// still even (packet-inert), and enabling the gate is the commit. On any
-    /// error the device is still cleanup-only, with its hooks detached and the
-    /// gate even; a rollback that cannot be proven is
-    /// [`GtpuError::StateIndeterminate`], and the device is still cleanup-only
-    /// then too, so a retry fences the gate again before it reattaches.
+    /// still even (packet-inert), and enabling the gate is the commit.
+    ///
+    /// An error never changes whether the device is cleanup-only.
+    /// [`GtpuError::NotFound`] and [`GtpuError::AlreadyExists`] are returned
+    /// before any effect, the latter when the device is already active or
+    /// another operation holds its graph's operation lock. Once activation of
+    /// a cleanup-only device has begun, any error leaves the gate even and no
+    /// hook attached by this call, or is [`GtpuError::StateIndeterminate`]
+    /// when that rollback cannot be proven. The device is still cleanup-only
+    /// either way, so a retry fences the gate again before it reattaches.
     #[cfg(any(target_os = "linux", test))]
     fn activate_cleanup_only(
         &self,
@@ -4051,18 +4056,34 @@ impl EbpfGtpuDataplaneBackend {
     /// consumer has reconciled durable GTP-U state. It is refused unless the
     /// device is currently held cleanup-only by this backend.
     ///
+    /// Activation is all or nothing. The attached hooks and the fresh traffic
+    /// source are re-proven while forwarding is still fenced, and forwarding
+    /// is enabled only as the final step. If activation fails, the device is
+    /// still held cleanup-only, by this backend and its runtime alike: no hook
+    /// it attached remains and forwarding stays fenced, or the error is
+    /// [`GtpuError::StateIndeterminate`] when that rollback cannot be proven.
+    /// Either way a retry attempts the whole activation again, fencing
+    /// forwarding before it reattaches.
+    ///
     /// Unlike the acquisition handle, this is a plain blocking operation.
     /// Cancellation before worker admission is no-effect; once the worker
     /// claims execution, dropping the returned future does not stop it. The
-    /// worker completes reattachment under the operation lock, and a retry
-    /// observes the converged state (the device is active, so it is refused
-    /// with [`GtpuError::AlreadyExists`]) rather than overlapping a second
-    /// attach.
+    /// worker completes or rolls back the activation under the operation
+    /// lock, and a retry observes the converged state rather than overlapping
+    /// a second attach: a completed activation left the device active, so the
+    /// retry is refused with [`GtpuError::AlreadyExists`]; a failed one left
+    /// it cleanup-only, so the retry activates it again.
     ///
     /// # Errors
     ///
     /// Returns [`GtpuError::NotFound`] when `device` is not managed by this
-    /// backend and [`GtpuError::AlreadyExists`] when it is already active.
+    /// backend or its interface no longer resolves to the managed index.
+    /// Returns [`GtpuError::AlreadyExists`] when the device is already active,
+    /// or when another operation holds its graph's operation lock; the device
+    /// is then unchanged, and in the second case a later retry can succeed.
+    /// Returns [`GtpuError::StateIndeterminate`] when the attached graph or
+    /// the rollback cannot be proven. After any error the device is still
+    /// cleanup-only unless it was already active.
     #[cfg(any(target_os = "linux", test))]
     pub async fn activate_cleanup_recovery(
         &self,
