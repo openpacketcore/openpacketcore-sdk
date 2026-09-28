@@ -4139,12 +4139,22 @@ mod tests {
         let store = open_store(&roster_root);
         let before = store.advance_writer_epoch().unwrap().get();
 
+        // Keep diagnostics outside the authority and durability decisions. The
+        // fixed slots record completed boundaries without formatting or I/O
+        // inside the original timeout.
+        let mut phase = "consumer_admission";
+        let mut completed_at_us = [None; 5];
+        let started = std::time::Instant::now();
         let roster_lifecycle = async {
             // The actual five-member roster lifecycle has one consumer
             // admission and one consumer adoption publication.
             consumer.persist().await;
+            completed_at_us[0] = Some(started.elapsed().as_micros());
+            phase = "prepare";
             let prepared =
                 prepare_object_roster(&store, group(0x91), generation(1), &roster).unwrap();
+            completed_at_us[1] = Some(started.elapsed().as_micros());
+            phase = "issue";
             let outcome = issue_durable_object_roster(
                 &store,
                 &prepared,
@@ -4155,17 +4165,39 @@ mod tests {
             )
             .await
             .unwrap();
+            completed_at_us[2] = Some(started.elapsed().as_micros());
             assert_eq!(outcome.as_str(), "applied");
+            phase = "consumer_adoption";
             consumer.persist().await;
+            completed_at_us[3] = Some(started.elapsed().as_micros());
+            phase = "finalize";
             assert_eq!(
                 finalize_durable_object_roster(&store, group(0x91), generation(1), &roster)
                     .unwrap(),
                 XfrmObjectRosterDurablePhase::Committed
             );
+            completed_at_us[4] = Some(started.elapsed().as_micros());
+            phase = "complete";
         };
-        assert!(tokio::time::timeout(HARD_BUDGET, roster_lifecycle)
-            .await
-            .is_ok());
+        let timed_result = tokio::time::timeout(HARD_BUDGET, roster_lifecycle).await;
+        eprintln!(
+            "XFRM_ROSTER_LIFECYCLE_TIMING completed={} budget_ms={} elapsed_us={} phase={} \
+             completed_at_us={:?} (admission, prepare, issue, adoption, finalize)",
+            timed_result.is_ok(),
+            HARD_BUDGET.as_millis(),
+            started.elapsed().as_micros(),
+            phase,
+            completed_at_us,
+        );
+        assert!(
+            timed_result.is_ok(),
+            "XFRM_ROSTER_LIFECYCLE_TIMEOUT budget_ms={} elapsed_us={} phase={} \
+             completed_at_us={:?} (admission, prepare, issue, adoption, finalize)",
+            HARD_BUDGET.as_millis(),
+            started.elapsed().as_micros(),
+            phase,
+            completed_at_us,
+        );
         let after = store.advance_writer_epoch().unwrap().get();
         // These are code-under-test facts, independent of the delayed
         // external consumer boundary above.

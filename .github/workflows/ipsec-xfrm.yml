@@ -128,7 +128,7 @@ jobs:
         run: python3 scripts/n3iwf_child_sa_relocation_reference.py --check
 
       - name: Run conformance tests
-        run: cargo test --locked -p opc-ipsec-xfrm -p opc-ipsec-xfrm-ebpf-common -p opc-types --all-features --quiet -- --test-threads=4
+        run: cargo test --locked -p opc-ipsec-xfrm -p opc-ipsec-xfrm-ebpf-common -p opc-types --all-features --quiet -- --test-threads=4 --show-output
 
       - name: Build crate docs
         run: RUSTDOCFLAGS="-D warnings" cargo doc --locked -p opc-ipsec-xfrm -p opc-ipsec-xfrm-ebpf-common -p opc-types --no-deps --all-features
