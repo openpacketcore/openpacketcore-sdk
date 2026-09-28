@@ -610,3 +610,172 @@ pub(super) async fn qualify_grouped() -> Result<(), Box<dyn std::error::Error>> 
     );
     Ok(())
 }
+
+/// Sustained PDP churn on the same attachment (the mass re-attach pattern
+/// after failover) must not starve the shared UDP/2152 queue: every Echo is
+/// answered and every reassembled G-PDU is decapsulated, and the consumer is
+/// never told to back off.
+// The serial guard is deliberately held for the entire body; see
+// PRIVILEGED_TEST_LOCK.
+#[allow(clippy::await_holding_lock)]
+pub(super) async fn qualify_churn() -> Result<(), Box<dyn std::error::Error>> {
+    if env::var("OPC_GTPU_RUN_PRIVILEGED").as_deref() != Ok("1") {
+        eprintln!("skipping: set OPC_GTPU_RUN_PRIVILEGED=1 inside a fresh privileged netns");
+        return Ok(());
+    }
+    let _serial = PRIVILEGED_TEST_LOCK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let _fragment_limits = FragmentSysctlGuard::configure(2, 4 * 1024 * 1024)?;
+    let net = TestNet::provision();
+    let backend = Arc::new(EbpfGtpuDataplaneBackend::with_config(
+        EbpfGtpuDataplaneBackendConfig {
+            bpffs_pin_root: net.pin_root.clone(),
+            ..EbpfGtpuDataplaneBackendConfig::default()
+        },
+    ));
+    let mut request = CreateGtpDeviceRequest::new("s2bu");
+    request.bind_address = IpAddr::V4(EPDG_S2BU_IP);
+    let device = backend.create_device(request).await?;
+    backend
+        .install_pdp_context(session_context(device.ifindex))
+        .await?;
+    let port = backend.open_gtpu_control_port(&device).await?;
+
+    // Churn: install and remove a dedicated bearer back to back, each
+    // holding the backend-wide mutation lock for its whole duration.
+    let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let churn = {
+        let backend = Arc::clone(&backend);
+        let stop = Arc::clone(&stop);
+        let ifindex = device.ifindex;
+        std::thread::spawn(move || {
+            let runtime = tokio::runtime::Builder::new_multi_thread()
+                .worker_threads(2)
+                .enable_all()
+                .build()
+                .expect("churn runtime");
+            let mut cycles = 0_u64;
+            while !stop.load(Ordering::Relaxed) {
+                runtime.block_on(async {
+                    backend
+                        .install_pdp_context(dedicated_session_context(
+                            ifindex,
+                            MARK_B,
+                            LOCAL_TEID_B,
+                            PEER_TEID_B,
+                        ))
+                        .await
+                        .expect("churn install");
+                    backend
+                        .remove_pdp_context(RemovePdpContextRequest {
+                            local_teid: Teid::new(LOCAL_TEID_B).expect("nonzero"),
+                            link_ifindex: ifindex,
+                            gtp_version: GtpVersion::V1,
+                            address_family: opc_gtpu_dataplane::GtpAddressFamily::Ipv4,
+                        })
+                        .await
+                        .expect("churn removal");
+                });
+                cycles += 1;
+            }
+            cycles
+        })
+    };
+    std::thread::sleep(Duration::from_millis(200));
+
+    let pgw = in_netns(&net.pgw_ns, || {
+        let socket = UdpSocket::bind((PGW_IP, GTPU_PORT)).expect("bind PGW GTP-U socket");
+        socket
+            .set_read_timeout(Some(Duration::from_millis(5)))
+            .expect("PGW receive timeout");
+        socket
+    });
+    run("ping", &["-c", "1", "-W", "1", "192.0.2.10"]);
+    let sender = FragmentSender {
+        net: &net,
+        destination_mac: main_link_address("s2bu"),
+        source_mac: net.pgw_link_address("s2bup"),
+    };
+    const ROUNDS: u16 = 20;
+    let mut busy = 0_u32;
+    let mut echo_responses = 0_u16;
+    let mut decapsulated = 0_u16;
+    let deadline = Instant::now() + Duration::from_secs(20);
+    for round in 0..ROUNDS {
+        let sequence = 0x7000 + round;
+        let mut echo = vec![0x32, 1, 0, 4, 0, 0, 0, 0];
+        echo.extend_from_slice(&sequence.to_be_bytes());
+        echo.extend_from_slice(&[0, 0]);
+        pgw.send_to(&echo, (EPDG_S2BU_IP, GTPU_PORT))?;
+        let packet = build_inner_udp(
+            REMOTE_HOST,
+            UE_PAA,
+            5060,
+            5060,
+            &sip_invite_payload(&[
+                b'c',
+                b'h',
+                b'u',
+                b'r',
+                b'n',
+                b'-',
+                b'0' + (round / 10) as u8,
+                b'0' + (round % 10) as u8,
+            ]),
+        );
+        sender.send_set(LOCAL_TEID, &packet, 0x4300 + round, SetOrder::InOrder);
+        let mut round_echo = false;
+        let mut round_decap = false;
+        while !(round_echo && round_decap) {
+            assert!(
+                Instant::now() < deadline,
+                "shared queue starved under churn (round {round}, busy {busy})"
+            );
+            match port.try_receive_downlink(4096) {
+                Ok(Some(GtpuDownlinkEvent::Control(event))) => {
+                    let plan = event.echo_response(
+                        opc_gtpu_dataplane::control_port::GtpuControlResponseBudget::new(14, 2)?,
+                    )?;
+                    port.send_control_response(plan)?;
+                    round_echo = true;
+                }
+                Ok(Some(GtpuDownlinkEvent::Decapsulated(decap))) => {
+                    assert_eq!(decap.inner_packet(), packet.as_slice());
+                    round_decap = true;
+                }
+                Ok(Some(other)) => panic!("unexpected event under churn: {other:?}"),
+                Ok(None) => std::thread::sleep(Duration::from_millis(1)),
+                Err(GtpuControlPortError::Busy) => busy += 1,
+                Err(error) => panic!("consumer failed under churn: {error}"),
+            }
+        }
+        let mut response = [0_u8; 64];
+        let response_deadline = Instant::now() + Duration::from_secs(2);
+        loop {
+            if let Ok((length, _)) = pgw.recv_from(&mut response) {
+                assert_eq!(&response[8..10], &sequence.to_be_bytes());
+                assert_eq!(length, 14);
+                echo_responses += 1;
+                break;
+            }
+            assert!(Instant::now() < response_deadline, "Echo response lost");
+        }
+        decapsulated += 1;
+    }
+    stop.store(true, Ordering::Relaxed);
+    let cycles = churn.join().expect("churn thread");
+    assert!(cycles > 0, "the churn must actually overlap the traffic");
+    assert_eq!((echo_responses, decapsulated), (ROUNDS, ROUNDS));
+    assert_eq!(
+        busy, 0,
+        "the consumer must never yield to unrelated mutation"
+    );
+    drop(port);
+    backend.remove_device(&device).await?;
+    drop(net);
+    eprintln!(
+        "OPC_GTPU_BACKEND_CONSUMER_CHURN_PROVEN: {ROUNDS} Echo and reassembled rounds drained during {cycles} install/remove cycles"
+    );
+    Ok(())
+}

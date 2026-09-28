@@ -57,9 +57,15 @@ return `UnsupportedFeature { feature: "gtpu_control_port" }`. They do not
 open another listener or expose their private file descriptors.
 
 The backend checks its exact current tc hooks/maps and serializes each socket
-operation with attachment mutation through that backend instance. External
-attachment changes are refused when observed by the live hook/binding checks. A busy writer returns `Busy` without
-waiting for the mutation. Removal closes the queue and invalidates all old
+operation per attachment, through that registration's socket slot. PDP
+installs, replacements and removals on any attachment do not block or defer
+the queue: authorization reads the commit-last graph exactly like tc, so a
+sustained PDP churn (for example a mass re-attach after failover) cannot
+starve Echo or reassembled G-PDUs. Device removal holds the slot across its
+hook change and then retires it, so a socket operation linearizes entirely
+before or after removal; a replaced or fenced registration is detected under
+the slot before anything is received or sent. External attachment changes
+are refused when observed by the live hook/binding checks. Removal closes the queue and invalidates all old
 ports, including when a replacement has the same name, ifindex and address.
 Ports hold weak references; keeping them alive cannot keep the backend or
 its socket alive. Observed attachment loss retires the queue. Restoring hooks
@@ -153,8 +159,14 @@ not change.
 `GtpuControlPort::try_receive_downlink` is the production consumer for G-PDUs
 the kernel delivers to this queue: outer-fragmented downlink G-PDUs after
 kernel reassembly (TS 29.281 clauses 4.2.4 and 4.2.5) and unknown-TEID
-handoffs. Receive and authorization run under the backend's attachment
-serialization; `Busy` consumes nothing from the queue.
+handoffs. Receive and authorization run under the attachment's own socket
+slot, never behind unrelated backend mutation.
+
+A consumer-decapsulated grouped packet emits no traffic observation record.
+tc publishes those records to a kernel ring with a kernel-owned sequence that
+userspace cannot advance atomically, so the post-reassembly path cannot join
+that ordered stream. Traffic-continuity proofs therefore see only tc-path
+packets; missing observations can only withhold a proof, never create one.
 
 Authorization repeats the tc downlink decisions with the shared wire
 validators and the backend's own map reads:

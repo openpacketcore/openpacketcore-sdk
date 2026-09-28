@@ -67,9 +67,9 @@ pub trait GtpuControlPort: fmt::Debug + Send + Sync {
     /// handoffs. An authorized G-PDU is decapsulated exactly once with the
     /// same selector, endpoint-binding, owner, generation and commit-last
     /// checks as the tc fast path. Non-G-PDU messages are returned for the
-    /// existing control planners. Receive and processing run under the same
-    /// serialization boundary as attachment mutation, so a `Busy` result
-    /// consumes nothing from the queue.
+    /// existing control planners. Receive and processing are serialized per
+    /// attachment and never wait behind PDP mutation; a `Busy` result from an
+    /// implementation consumes nothing from the queue.
     ///
     /// The default implementation belongs to ports without backend state and
     /// returns [`GtpuControlPortError::Unsupported`] without receiving.

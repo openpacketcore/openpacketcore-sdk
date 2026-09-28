@@ -23,7 +23,7 @@ impl ControlSocketState {
         self.socket.is_none()
     }
 
-    fn retire(&mut self) {
+    pub(super) fn retire(&mut self) {
         self.retired = true;
         self.socket = None;
     }
@@ -57,8 +57,15 @@ impl BackendControlPort {
         })
     }
 
-    /// Run one operation under the attachment mutation guard with the exact
-    /// live socket state and the attachment's authority scope.
+    /// Run one operation under this attachment's exclusion with the exact live
+    /// socket state and the attachment's authority scope.
+    ///
+    /// Exclusion is per attachment: the registration's socket slot. PDP
+    /// installs and removals on this or any other attachment never block the
+    /// shared queue, because every authorization reads the commit-last graph
+    /// exactly like tc. Device removal holds this slot across its hook change
+    /// and retires it, and a replaced or fenced registration is detected under
+    /// the slot before anything is received or sent.
     fn with_attachment<T>(
         &self,
         operation: impl FnOnce(
@@ -70,36 +77,13 @@ impl BackendControlPort {
         let unavailable = || GtpuControlPortError::Unavailable;
         let inner = self.backend.upgrade().ok_or_else(unavailable)?;
         let backend = EbpfGtpuDataplaneBackend { inner };
-        let _operation = backend
-            .inner
-            .operation_lock
-            .try_lock()
-            .map_err(|error| match error {
-                std::sync::TryLockError::WouldBlock => GtpuControlPortError::Busy,
-                std::sync::TryLockError::Poisoned(_) => unavailable(),
-            })?;
         let slot = self.socket.upgrade().ok_or_else(unavailable)?;
-        let devices = backend.devices().map_err(|_| unavailable())?;
-        let managed = devices.get(&self.ifindex).ok_or_else(unavailable)?;
-        if !Arc::ptr_eq(&slot, &managed.control_socket)
-            || managed.cleanup_only
-            || managed.successor_pending
-        {
+        let registration = self.current_registration(&backend, &slot);
+        let Some((name, scope)) = registration else {
+            // Lock order is slot before device registry; never hold both here.
             slot.lock().map_err(|_| unavailable())?.retire();
             return Err(unavailable());
-        }
-        let name = managed.name.clone();
-        let scope = super::reassembled_downlink::DownlinkAuthorityScope {
-            ifindex: self.ifindex,
-            grouped_config: managed.grouped.and_then(|grouped| {
-                grouped_device_config(grouped.device_id, self.ifindex, grouped.local_endpoints)
-            }),
         };
-        if managed.grouped.is_some() && scope.grouped_config.is_none() {
-            slot.lock().map_err(|_| unavailable())?.retire();
-            return Err(unavailable());
-        }
-        drop(devices);
         if backend.inner.runtime.ifindex_by_name(&name).ok() != Some(self.ifindex)
             || !backend
                 .inner
@@ -113,10 +97,40 @@ impl BackendControlPort {
         if state.retired || state.socket.is_none() {
             return Err(unavailable());
         }
-        // Keep the mutation guard across the nonblocking syscall and every
-        // authority read: removal, replacement and cleanup-only adoption may
-        // linearize before or after this operation, never midway through it.
+        // Revalidate under the slot: removal retires it while holding it, so
+        // an operation that passes here linearizes before any removal effect.
+        if self.current_registration(&backend, &slot).is_none() {
+            state.retire();
+            return Err(unavailable());
+        }
         operation(&backend, &mut state, scope)
+    }
+
+    /// Return the exact live registration for this port, or `None` when the
+    /// attachment was removed, replaced, fenced or is otherwise unusable.
+    fn current_registration(
+        &self,
+        backend: &EbpfGtpuDataplaneBackend,
+        slot: &Arc<SocketSlot>,
+    ) -> Option<(String, super::reassembled_downlink::DownlinkAuthorityScope)> {
+        let devices = backend.devices().ok()?;
+        let managed = devices.get(&self.ifindex)?;
+        if !Arc::ptr_eq(slot, &managed.control_socket)
+            || managed.cleanup_only
+            || managed.successor_pending
+        {
+            return None;
+        }
+        let scope = super::reassembled_downlink::DownlinkAuthorityScope {
+            ifindex: self.ifindex,
+            grouped_config: managed.grouped.and_then(|grouped| {
+                grouped_device_config(grouped.device_id, self.ifindex, grouped.local_endpoints)
+            }),
+        };
+        if managed.grouped.is_some() && scope.grouped_config.is_none() {
+            return None;
+        }
+        Some((managed.name.clone(), scope))
     }
 }
 
@@ -331,8 +345,12 @@ impl EbpfGtpuDataplaneBackend {
 mod tests {
     use super::*;
 
+    /// PDP churn holds the backend-wide operation lock almost continuously
+    /// after a mass re-attach. The shared queue (Echo, reassembled G-PDUs)
+    /// must neither wait for nor yield to that lock: its exclusion is the
+    /// attachment's own socket slot.
     #[test]
-    fn control_port_does_not_wait_for_a_mutating_writer() {
+    fn control_port_does_not_wait_for_or_yield_to_backend_mutation() {
         let backend = EbpfGtpuDataplaneBackend::new();
         let port = BackendControlPort {
             backend: Arc::downgrade(&backend.inner),
@@ -342,7 +360,8 @@ mod tests {
         let guard = backend.operation_guard().unwrap();
         assert_eq!(
             port.try_receive_datagram(8).unwrap_err(),
-            GtpuControlPortError::Busy
+            GtpuControlPortError::Unavailable,
+            "an unregistered port is unavailable, never Busy behind another mutation"
         );
         drop(guard);
         assert_eq!(
@@ -357,7 +376,7 @@ mod tests {
     }
 
     #[test]
-    fn downlink_consumer_is_serialized_with_attachment_mutation() {
+    fn downlink_consumer_does_not_yield_to_backend_mutation() {
         let backend = EbpfGtpuDataplaneBackend::new();
         let port = BackendControlPort {
             backend: Arc::downgrade(&backend.inner),
@@ -367,11 +386,11 @@ mod tests {
         let guard = backend.operation_guard().unwrap();
         assert_eq!(
             port.try_receive_downlink(2048).unwrap_err(),
-            GtpuControlPortError::Busy
+            GtpuControlPortError::Unavailable
         );
         assert_eq!(
             port.downlink_counters().unwrap_err(),
-            GtpuControlPortError::Busy
+            GtpuControlPortError::Unavailable
         );
         drop(guard);
         assert_eq!(
