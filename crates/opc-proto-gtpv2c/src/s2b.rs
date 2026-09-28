@@ -1614,10 +1614,14 @@ impl Default for S2bCreateSessionResponseReceivePolicy {
 /// Accepted Create Session Response projection.
 ///
 /// This projection is intentionally complete: it is returned for TS 29.274
-/// accepted causes 16 (`RequestAccepted`) and 17
-/// (`RequestAcceptedPartially`) and includes the accepted-bearer fields that
-/// products need to derive an established bearer context. Consumers must
-/// inspect [`Self::cause`] to distinguish full and partial acceptance.
+/// accepted causes 16 (`RequestAccepted`), 17 (`RequestAcceptedPartially`),
+/// 18 (`NewPdnTypeDueToNetworkPreference`) and 19
+/// (`NewPdnTypeDueToSingleAddressBearerOnly`), and includes the
+/// accepted-bearer fields that products need to derive an established bearer
+/// context. Consumers must inspect [`Self::cause`] to distinguish full and
+/// partial acceptance, and [`CauseValue::is_new_pdn_type`] to detect that the
+/// PGW narrowed the requested PDN type; [`Self::paa`] then carries the
+/// selected family.
 #[derive(Clone, PartialEq, Eq)]
 pub struct CreateSessionAcceptedResponseSummary {
     /// TEID carried in the Create Session Response common header.
@@ -5459,10 +5463,7 @@ fn resolve_accepted_create_session_response_fields(
 }
 
 fn is_accepted_create_session_cause(cause: CauseValue) -> bool {
-    matches!(
-        cause,
-        CauseValue::RequestAccepted | CauseValue::RequestAcceptedPartially
-    )
+    cause.is_create_session_accepted()
 }
 
 fn project_create_session_response(
