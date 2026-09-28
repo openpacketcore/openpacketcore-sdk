@@ -1426,6 +1426,7 @@ mod tests {
             bearer_mark: None,
             egress_dscp: None,
             uplink_source_port_policy: crate::GtpuUplinkSourcePortPolicy::LegacyServicePort,
+            downlink_inner_mtu: None,
         };
         assert!(matches!(
             backend.acquire_pdp_live_writer_proof().await,

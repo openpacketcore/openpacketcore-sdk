@@ -57,7 +57,8 @@ use opc_gtpu_ebpf_common::{
     internet_checksum_sum_is_valid, marked_owner_wire_authorizes_downlink,
     marked_owner_wire_authorizes_uplink, n3_downlink_psc_matches, n3_uplink_extension,
     pack_downlink_parse_result, pdp_commit_wire_authorized_source_port,
-    pdp_commit_wire_authorizes_downlink, pdp_commit_wire_authorizes_graph,
+    downlink_ipv4_requires_packet_too_big, pdp_commit_wire_authorizes_downlink,
+    pdp_commit_wire_authorizes_graph, pdp_commit_wire_downlink_inner_mtu,
     select_gtpu_session_entry_wire, tft_classifier_filter_matches,
     tft_classifier_schema_is_current, uplink_non_encapsulation_drops,
     validate_ipv4_downlink_binding_wire, DownlinkBindingMismatch, DownlinkPdr, GtpuClass,
@@ -4198,6 +4199,31 @@ fn parse_downlink(ctx: &mut TcContext) -> u64 {
 /// software-checksum phase uses a bounded `bpf_loop` callback stack;
 /// separating the map-graph authorization phase ensures the callback and the
 /// endpoint/owner checks do not share one oversized caller frame.
+/// Return whether an authorized inner IPv4 packet exceeds its Active commit's
+/// optional downlink inner MTU with Don't Fragment set.
+#[inline(never)]
+fn downlink_inner_exceeds_session_mtu(
+    ctx: &TcContext,
+    commit: &[u8; UPLINK_SOURCE_PORT_VALUE_LEN],
+    payload_offset: usize,
+) -> bool {
+    let mtu = pdp_commit_wire_downlink_inner_mtu(commit);
+    if mtu == 0 {
+        return false;
+    }
+    let Ok(total_length) = ctx.load::<u16>(payload_offset + 2) else {
+        return false;
+    };
+    let Ok(flags_fragment) = ctx.load::<u16>(payload_offset + 6) else {
+        return false;
+    };
+    downlink_ipv4_requires_packet_too_big(
+        mtu,
+        u16::from_be(total_length),
+        u16::from_be(flags_fragment),
+    )
+}
+
 #[inline(never)]
 fn authorize_and_decap_legacy_downlink(
     ctx: &mut TcContext,
@@ -4348,6 +4374,15 @@ fn authorize_and_decap_legacy_downlink(
     if inner_dst != pdr.ue_ip {
         count(COUNTER_DL_DST_MISMATCH);
         return TC_ACT_SHOT as i32;
+    }
+    if downlink_inner_exceeds_session_mtu(ctx, commit, payload_offset) {
+        // RFC 1191: the session's optional downlink inner MTU cannot carry
+        // this DF packet after access-side encapsulation. Hand the exact
+        // authorized G-PDU, undecapsulated, to the backend-owned UDP/2152
+        // queue, which signals the originator inside this session's uplink
+        // tunnel. Decapsulating here would let the host emit an unroutable,
+        // plaintext-quoting ICMP error instead.
+        return TC_ACT_OK as i32;
     }
 
     // Strip outer IPv4 + UDP + GTP-U (+ optional block and extension

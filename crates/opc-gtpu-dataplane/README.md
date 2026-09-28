@@ -94,7 +94,9 @@ On an eBPF attachment, `try_receive_downlink` on the same port is the
 backend-authoritative consumer for kernel-reassembled and handed-off G-PDUs:
 it authorizes against the backend's own grouped and v5 maps (commit read
 last) and returns the exact inner packet and bearer mark, or a value-free
-drop.
+drop. With `GtpPdpContext::downlink_inner_mtu`, an over-MTU DF
+downlink packet is refused there and signalled once inside the session's
+uplink G-PDU (RFC 1191) instead of by the host.
 
 - `GtpuDataplaneBackend`: async port for device and PDP lifecycle, typed PDP
   readback, classified installation, authority-safe exact removal, and probes.

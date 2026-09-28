@@ -13,6 +13,8 @@ pub(super) struct ControlSocketState {
     retired: bool,
     /// Value-free counters of this registration's downlink consumer.
     downlink_counters: crate::GtpuDownlinkCounters,
+    /// Per-registration in-tunnel Packet Too Big rate limit.
+    too_big_limiter: crate::reassembly::PacketTooBigLimiter,
 }
 
 impl ControlSocketState {
@@ -145,14 +147,59 @@ impl GtpuControlPort for BackendControlPort {
             let Some(datagram) = socket.try_receive_datagram(maximum_bytes)? else {
                 return Ok(None);
             };
-            Ok(Some(
-                super::reassembled_downlink::process_downlink_datagram(
-                    backend.inner.runtime.as_ref(),
-                    scope,
-                    datagram,
-                    &mut state.downlink_counters,
+            let plan = match super::reassembled_downlink::process_downlink_datagram(
+                backend.inner.runtime.as_ref(),
+                scope,
+                datagram,
+                &mut state.downlink_counters,
+            ) {
+                super::reassembled_downlink::ProcessedDownlink::Event(event) => {
+                    return Ok(Some(event));
+                }
+                super::reassembled_downlink::ProcessedDownlink::PacketTooBig(plan) => plan,
+            };
+            // Exactly one error per offending packet, subject to the limit.
+            // It is always carried in the session's uplink G-PDU; nothing is
+            // ever sent unencapsulated.
+            let signal = if !state.too_big_limiter.admit(std::time::Instant::now()) {
+                crate::GtpuPacketTooBigSignal::RateLimited
+            } else {
+                let (local, peer) = plan.endpoints();
+                match plan.build_uplink_gpdu() {
+                    Some(gpdu) if socket.send_in_tunnel_error(local, peer, &gpdu).is_ok() => {
+                        crate::GtpuPacketTooBigSignal::Sent
+                    }
+                    Some(_) | None => crate::GtpuPacketTooBigSignal::Unsendable,
+                }
+            };
+            let counters = &mut state.downlink_counters;
+            let slot = match signal {
+                crate::GtpuPacketTooBigSignal::Sent => &mut counters.packet_too_big_signalled,
+                crate::GtpuPacketTooBigSignal::RateLimited => {
+                    &mut counters.packet_too_big_rate_limited
+                }
+                crate::GtpuPacketTooBigSignal::Unsendable => {
+                    &mut counters.packet_too_big_unsendable
+                }
+            };
+            *slot = slot.saturating_add(1);
+            Ok(Some(crate::GtpuDownlinkEvent::PacketTooBig(
+                crate::GtpuDownlinkPacketTooBig::new(
+                    crate::GtpAddressFamily::Ipv4,
+                    plan.mtu(),
+                    signal,
                 ),
-            ))
+            )))
+        })
+    }
+
+    fn set_packet_too_big_rate_limit(
+        &self,
+        limit: crate::GtpuPacketTooBigRateLimit,
+    ) -> Result<(), GtpuControlPortError> {
+        self.with_attachment(|_, state, _| {
+            state.too_big_limiter = crate::reassembly::PacketTooBigLimiter::new(limit);
+            Ok(())
         })
     }
 

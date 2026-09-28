@@ -11074,6 +11074,7 @@ fn decode_canonical_desired(bytes: &[u8]) -> Option<GtpuSessionGroup> {
                 bearer_mark,
                 uplink_source_port_policy,
                 egress_dscp,
+                downlink_inner_mtu: None,
             },
             local_outer_address,
         )
@@ -11195,6 +11196,7 @@ mod tests {
             bearer_mark: mark.and_then(crate::GtpBearerMark::new),
             egress_dscp: None,
             uplink_source_port_policy: GtpuUplinkSourcePortPolicy::LegacyServicePort,
+            downlink_inner_mtu: None,
         };
         GtpuSessionGroup::new(
             GtpuSessionGroupId::new([id; 16]).unwrap(),

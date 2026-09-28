@@ -4668,6 +4668,44 @@ impl fmt::Debug for GtpuDownlinkEndpoint {
     }
 }
 
+/// Per-session downlink inner (tunnel) MTU supplied by the consumer.
+///
+/// For an ePDG this is the SWu access MTU minus the negotiated ESP/UDP/IP
+/// encapsulation overhead. An inner packet larger than this value cannot
+/// reach the UE without fragmentation after encapsulation. The value is at
+/// least [`opc_gtpu_ebpf_common::DOWNLINK_INNER_MTU_MIN`] (576, the RFC 791
+/// IPv4 floor). `Debug` exposes the value; it is a path property, not a
+/// subscriber identifier.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct GtpuDownlinkInnerMtu(std::num::NonZeroU16);
+
+impl GtpuDownlinkInnerMtu {
+    /// Create a downlink inner MTU. Values below the RFC 791 floor of 576
+    /// return `None`.
+    #[must_use]
+    pub const fn new(mtu: u16) -> Option<Self> {
+        if mtu < opc_gtpu_ebpf_common::DOWNLINK_INNER_MTU_MIN {
+            return None;
+        }
+        match std::num::NonZeroU16::new(mtu) {
+            Some(mtu) => Some(Self(mtu)),
+            None => None,
+        }
+    }
+
+    /// Return the MTU in octets.
+    #[must_use]
+    pub const fn get(self) -> u16 {
+        self.0.get()
+    }
+
+    /// Return the non-zero wire value.
+    #[must_use]
+    pub const fn as_non_zero(self) -> std::num::NonZeroU16 {
+        self.0
+    }
+}
+
 /// GTP-U PDP context programmed into the Linux `gtp` kernel module.
 #[derive(Clone, PartialEq, Eq, Hash)]
 pub struct GtpPdpContext {
@@ -4720,6 +4758,17 @@ pub struct GtpPdpContext {
     /// reject `Some` rather than silently ignoring it. `None` preserves the
     /// backend's pre-DSCP packet and kernel-message behavior.
     pub egress_dscp: Option<DscpCodepoint>,
+    /// Optional downlink inner (tunnel) MTU enforced before decapsulation.
+    ///
+    /// With `Some`, a downlink inner IPv4 packet larger than this value with
+    /// Don't Fragment set is not forwarded. The backend-owned control port
+    /// instead returns one RFC 1191 Fragmentation Needed error, carried in
+    /// this session's uplink G-PDU toward the peer; see
+    /// [`GtpuControlPort::try_receive_downlink`](crate::control_port::GtpuControlPort::try_receive_downlink).
+    /// Backends whose [`GtpuProbe::downlink_inner_mtu_enforcement`] is not
+    /// [`GtpuCapability::Available`] reject `Some`. `None` preserves the
+    /// existing packet behavior and the original commit-record bytes.
+    pub downlink_inner_mtu: Option<GtpuDownlinkInnerMtu>,
 }
 
 impl fmt::Debug for GtpPdpContext {
@@ -4735,6 +4784,7 @@ impl fmt::Debug for GtpPdpContext {
             .field("bearer_mark", &self.bearer_mark)
             .field("egress_dscp", &self.egress_dscp)
             .field("uplink_source_port_policy", &"<redacted>")
+            .field("downlink_inner_mtu", &self.downlink_inner_mtu)
             .finish()
     }
 }
@@ -4775,6 +4825,9 @@ impl GtpuSessionEntry {
             || context.peer_address.is_unspecified()
             || local_outer_address.is_unspecified()
             || context.link_ifindex == 0
+            // The grouped entry ABI carries no downlink inner MTU; refuse it
+            // rather than silently dropping enforcement.
+            || context.downlink_inner_mtu.is_some()
         {
             return Err(GtpuSessionModelError::InvalidContext);
         }
@@ -4833,6 +4886,7 @@ impl GtpuSessionEntry {
                 bearer_mark: intent.flow().mark(),
                 egress_dscp,
                 uplink_source_port_policy,
+                downlink_inner_mtu: None,
             },
             intent.local_downlink().local_address(),
         )?;
@@ -5656,6 +5710,8 @@ pub enum PdpContextMismatchField {
     DownlinkSourcePortPolicy,
     /// Uplink GTP-U source-port selection policy.
     UplinkSourcePortPolicy,
+    /// Optional downlink inner (tunnel) MTU.
+    DownlinkInnerMtu,
 }
 
 /// Selector axes occupied by valid state that conflicts with a request.
@@ -6432,6 +6488,9 @@ pub(crate) fn pdp_context_mismatches(
     if existing.uplink_source_port_policy != desired.uplink_source_port_policy {
         fields.push(PdpContextMismatchField::UplinkSourcePortPolicy);
     }
+    if existing.downlink_inner_mtu != desired.downlink_inner_mtu {
+        fields.push(PdpContextMismatchField::DownlinkInnerMtu);
+    }
     fields
 }
 
@@ -6690,6 +6749,9 @@ pub struct GtpuProbe {
     /// port unreachable and dropped. A backend must never leave this
     /// implicit.
     pub downlink_outer_fragment_handling: GtpuDownlinkFragmentContract,
+    /// Per-session downlink inner MTU enforcement with an in-tunnel RFC 1191
+    /// Fragmentation Needed error (see [`GtpPdpContext::downlink_inner_mtu`]).
+    pub downlink_inner_mtu_enforcement: GtpuCapability,
     /// Optional human-readable detail; static so the probe stays `Copy`.
     pub details: Option<&'static str>,
 }
@@ -6712,6 +6774,7 @@ impl GtpuProbe {
             uplink_source_port_selection: GtpuCapability::Missing,
             uplink_pmtu_enforcement: GtpuCapability::Missing,
             downlink_outer_fragment_handling: GtpuDownlinkFragmentContract::Unsupported,
+            downlink_inner_mtu_enforcement: GtpuCapability::Missing,
             details: Some("dry-run/mock backend"),
         }
     }
@@ -6733,6 +6796,7 @@ impl GtpuProbe {
             uplink_source_port_selection: GtpuCapability::Missing,
             uplink_pmtu_enforcement: GtpuCapability::Missing,
             downlink_outer_fragment_handling: GtpuDownlinkFragmentContract::Unsupported,
+            downlink_inner_mtu_enforcement: GtpuCapability::Missing,
             details: Some("GTP-U dataplane operations are not supported on this platform"),
         }
     }
@@ -6755,6 +6819,7 @@ mod tests {
             bearer_mark: Some(GtpBearerMark::new(0x3456_789a).unwrap()),
             egress_dscp: Some(DscpCodepoint::new(46).unwrap()),
             uplink_source_port_policy: GtpuUplinkSourcePortPolicy::selected(40_000).unwrap(),
+            downlink_inner_mtu: None,
         }
     }
 
@@ -6803,6 +6868,7 @@ mod tests {
             bearer_mark: Some(GtpBearerMark::new(0x3456_789a).unwrap()),
             egress_dscp: None,
             uplink_source_port_policy: GtpuUplinkSourcePortPolicy::selected(40_000).unwrap(),
+            downlink_inner_mtu: None,
         };
         let debug = format!("{ctx:?}");
         assert!(!debug.contains("12345678"));
@@ -6996,6 +7062,7 @@ mod tests {
             bearer_mark: None,
             egress_dscp: None,
             uplink_source_port_policy: GtpuUplinkSourcePortPolicy::LegacyServicePort,
+            downlink_inner_mtu: None,
         };
         let remove = RemovePdpContextRequest::from_context(&ctx);
         assert_eq!(remove.local_teid, ctx.local_teid);

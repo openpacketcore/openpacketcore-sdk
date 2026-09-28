@@ -41,6 +41,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- `opc-gtpu-dataplane` / `opc-gtpu-dataplane-ebpf`: downlink tunnel-MTU
+  enforcement with an in-tunnel RFC 1191 error.
+  - **Configuration.** `GtpPdpContext::downlink_inner_mtu` (source-breaking
+    new field; use `None` to keep today's behaviour) carries an optional
+    per-session inner MTU, at least 576. It is stored in the formerly
+    reserved bytes of the Active commit record; records without it are
+    byte-identical.
+  - **Datapath.** tc hands an authorized over-MTU DF IPv4 packet to the
+    backend-owned queue undecapsulated. `try_receive_downlink` returns
+    `GtpuDownlinkEvent::PacketTooBig` and sends at most one ICMP
+    Fragmentation Needed inside the session's uplink G-PDU. It is sent from
+    the session PAA to the originator, quoting the header plus 64 bits.
+  - **Rate limit and counters.** A per-attachment rate limit applies
+    (`set_packet_too_big_rate_limit`), with value-free counters.
+  - **Refusals.** Linux kernel-GTP and mock backends refuse the field. So
+    do grouped entries, and a selected uplink source port.
+  - **Evidence.** On main, the host emitted a plaintext Fragmentation Needed
+    that quoted 548 octets toward the core, and nothing reached the tunnel
+    (RED). Now: exactly one well-formed in-tunnel error per packet, no host
+    ICMP, and the rate limit holds, on Linux 7.1 and on el9 5.14. Inner
+    IPv6 Packet Too Big follows the ordinary inner-IPv6 path. Refs #1002.
+
 - `opc-gtpu-dataplane`: backend-authoritative post-reassembly downlink
   consumer. `GtpuControlPort::try_receive_downlink` receives one datagram from
   the eBPF attachment's backend-owned UDP/2152 queue and, under the same

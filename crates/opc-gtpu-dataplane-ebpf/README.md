@@ -34,9 +34,13 @@ The crate exposes tc entry points, not a Rust library API:
   outer peer/local endpoint, UDP source-port policy, and inner destination may
   decapsulate. The program strips the proven outer envelope, writes the
   dedicated-bearer mark (or zero), and continues through the ePDG's XFRM
-  output policy. A true grouped-index miss alone may enter the legacy IPv4
-  PDR/commit path. Outer-IPv4 fragments, legacy or grouped, retain the
-  bounded kernel-reassembly handoff; the backend-owned consumer
+  output policy. On the legacy path, an authorized inner IPv4 packet with
+  Don't Fragment set that exceeds the Active commit's optional downlink inner
+  MTU is not decapsulated. Its exact G-PDU is passed to the backend-owned
+  UDP/2152 queue, which sends one in-tunnel RFC 1191 error. A true
+  grouped-index miss alone may enter the legacy IPv4 PDR/commit path.
+  Outer-IPv4 fragments, legacy or grouped, retain the bounded
+  kernel-reassembly handoff; the backend-owned consumer
   (`GtpuControlPort::try_receive_downlink`) authorizes the reassembled G-PDU
   against the same grouped and legacy state. Grouped outer-IPv6 packets
   requiring reassembly pass to the host, and the backend reports that

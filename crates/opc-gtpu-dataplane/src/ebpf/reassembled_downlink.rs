@@ -19,9 +19,10 @@
 
 use bytes::Bytes;
 use opc_gtpu_ebpf_common::{
-    gtpu_endpoint_requires_extension_control, marked_owner_wire_authorizes_downlink,
-    n3_downlink_psc_matches, parse_gtpu_tpdu, pdp_commit_wire_authorized_source_port,
-    pdp_commit_wire_authorizes_downlink, select_gtpu_session_entry_wire,
+    downlink_ipv4_requires_packet_too_big, gtpu_endpoint_requires_extension_control,
+    marked_owner_wire_authorizes_downlink, n3_downlink_psc_matches, parse_gtpu_tpdu,
+    pdp_commit_wire_authorized_source_port, pdp_commit_wire_authorizes_downlink,
+    pdp_commit_wire_downlink_inner_mtu, select_gtpu_session_entry_wire,
     validate_ipv4_downlink_binding_wire, DownlinkBindingMismatch, DownlinkPdr,
     GtpuSessionDeviceConfig, GtpuSessionIpFamily, MarkedDownlinkPdr, UplinkFar, UplinkFarKey,
     GTPU_SESSION_DOWNLINK_KEY_LEN, GTPU_SESSION_GROUP_ID_LEN,
@@ -56,9 +57,107 @@ enum Verdict {
         bearer_mark: [u8; 4],
         family: GtpAddressFamily,
     },
+    PacketTooBig(PacketTooBigRoute),
     Control,
     UnknownTunnel,
     Drop(GtpuDownlinkDrop),
+}
+
+/// Authorized uplink route for one in-tunnel error, taken from the same
+/// Active commit that authorized the offending downlink packet.
+#[derive(Clone, Copy)]
+struct PacketTooBigRoute {
+    payload_offset: usize,
+    mtu: u16,
+    peer: [u8; 4],
+    local: [u8; 4],
+    peer_teid: [u8; 4],
+}
+
+/// One over-MTU packet whose error the caller sends under its socket and
+/// rate limit. The inner packet never leaves this plan except as the quote
+/// inside the error.
+pub(super) struct PacketTooBigPlan {
+    datagram: GtpuControlDatagram,
+    route: PacketTooBigRoute,
+}
+
+impl PacketTooBigPlan {
+    /// The session's downlink inner MTU.
+    pub(super) const fn mtu(&self) -> u16 {
+        self.route.mtu
+    }
+
+    /// Build the complete uplink G-PDU carrying one RFC 1191 Fragmentation
+    /// Needed error toward the offending packet's source.
+    ///
+    /// The error's source is the session PAA: the invoking packet's own
+    /// destination, and the only inner source the peer's uplink anti-spoofing
+    /// admits for this PDN connection. RFC 792/1191 quote exactly the
+    /// invoking IPv4 header and its first 64 bits of data.
+    pub(super) fn build_uplink_gpdu(&self) -> Option<Vec<u8>> {
+        let inner = datagram_payload(&self.datagram, self.route.payload_offset)?;
+        let source = std::net::Ipv4Addr::new(inner[16], inner[17], inner[18], inner[19]);
+        let destination = std::net::Ipv4Addr::new(inner[12], inner[13], inner[14], inner[15]);
+        if destination.is_unspecified()
+            || destination.is_multicast()
+            || destination.is_broadcast()
+            || destination.is_loopback()
+        {
+            return None;
+        }
+        // RFC 1122 3.2.2: never answer a non-initial fragment.
+        let fragment_offset = u16::from_be_bytes([inner[6], inner[7]]) & 0x1fff;
+        if fragment_offset != 0 || inner[9] == 1 && is_icmp_error(inner) {
+            return None;
+        }
+        let icmp = crate::icmp::build_icmpv4_packet_too_big(
+            source,
+            destination,
+            opc_gtpu_ebpf_common::GtpuPmtuSignal::Icmpv4FragmentationNeeded {
+                inner_mtu: self.route.mtu,
+            },
+            inner,
+        )?;
+        let length = u16::try_from(icmp.len()).ok()?;
+        let mut gpdu = Vec::with_capacity(8 + icmp.len());
+        gpdu.extend_from_slice(&[0x30, 0xff]);
+        gpdu.extend_from_slice(&length.to_be_bytes());
+        gpdu.extend_from_slice(&self.route.peer_teid);
+        gpdu.extend_from_slice(&icmp);
+        Some(gpdu)
+    }
+
+    /// Committed uplink peer and local outer addresses.
+    pub(super) fn endpoints(&self) -> (std::net::Ipv4Addr, std::net::Ipv4Addr) {
+        (
+            std::net::Ipv4Addr::from(self.route.local),
+            std::net::Ipv4Addr::from(self.route.peer),
+        )
+    }
+}
+
+fn datagram_payload(datagram: &GtpuControlDatagram, offset: usize) -> Option<&[u8]> {
+    datagram
+        .bytes()
+        .get(offset..)
+        .filter(|inner| inner.len() >= 28)
+}
+
+/// RFC 1122 3.2.2: an ICMP error is never sent in response to an ICMP error.
+fn is_icmp_error(inner: &[u8]) -> bool {
+    let header_len = usize::from(inner[0] & 0x0f) * 4;
+    inner
+        .get(header_len)
+        .is_some_and(|kind| matches!(*kind, 3 | 4 | 5 | 11 | 12))
+}
+
+/// Result of processing one received datagram.
+pub(super) enum ProcessedDownlink {
+    /// A complete event for the caller.
+    Event(GtpuDownlinkEvent),
+    /// An authorized over-MTU packet; the caller signals it in-tunnel.
+    PacketTooBig(PacketTooBigPlan),
 }
 
 /// Authorize and decapsulate one received datagram, recording exactly one
@@ -68,9 +167,12 @@ pub(super) fn process_downlink_datagram(
     scope: DownlinkAuthorityScope,
     datagram: GtpuControlDatagram,
     counters: &mut GtpuDownlinkCounters,
-) -> GtpuDownlinkEvent {
-    let verdict = authorize(runtime, scope, &datagram);
-    match verdict {
+) -> ProcessedDownlink {
+    let event = match authorize(runtime, scope, &datagram) {
+        Verdict::PacketTooBig(route) => {
+            counters.packet_too_big = counters.packet_too_big.saturating_add(1);
+            return ProcessedDownlink::PacketTooBig(PacketTooBigPlan { datagram, route });
+        }
         Verdict::Decapsulate {
             payload_offset,
             bearer_mark,
@@ -96,7 +198,8 @@ pub(super) fn process_downlink_datagram(
             counters.record_drop(reason);
             GtpuDownlinkEvent::Dropped(reason)
         }
-    }
+    };
+    ProcessedDownlink::Event(event)
 }
 
 fn authorize(
@@ -374,6 +477,20 @@ fn authorize_legacy(
     }
     if payload[16..20] != pdr.ue_ip {
         return Verdict::Drop(GtpuDownlinkDrop::DestinationMismatch);
+    }
+    // tc hands an over-MTU DF packet to this queue undecapsulated; the same
+    // Active commit carries the session's optional downlink inner MTU.
+    let total_length = u16::from_be_bytes([payload[2], payload[3]]);
+    let flags_fragment = u16::from_be_bytes([payload[6], payload[7]]);
+    let mtu = pdp_commit_wire_downlink_inner_mtu(&commit);
+    if downlink_ipv4_requires_packet_too_big(mtu, total_length, flags_fragment) {
+        return Verdict::PacketTooBig(PacketTooBigRoute {
+            payload_offset,
+            mtu,
+            peer: far.peer_ip,
+            local: far.local_ip,
+            peer_teid: far.o_teid,
+        });
     }
     Verdict::Decapsulate {
         payload_offset,

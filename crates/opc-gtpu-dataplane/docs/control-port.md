@@ -177,7 +177,60 @@ validators and the backend's own map reads:
 | `Dropped` | Value-free `GtpuDownlinkDrop`: malformed, binding mismatch, destination mismatch or state unavailable. |
 
 `downlink_counters` returns bounded, value-free counters for the current
-attachment registration. The ordinary legacy socket port keeps the default
+attachment registration.
+
+### Downlink tunnel-MTU enforcement
+
+`GtpPdpContext::downlink_inner_mtu` is an optional per-session inner MTU
+supplied by the consumer: for an ePDG, the SWu access MTU minus the negotiated
+ESP/UDP/IP overhead. It is stored in the previously reserved bytes 66..68 of
+the Active `PdpContextCommit`, so it is published and read back atomically
+with the rest of the graph, and a record without an MTU is byte-identical to
+the original layout. An older SDK treats a record carrying an MTU as
+non-canonical and fails that context closed. The value is at least 576
+(RFC 791). It requires the legacy service-port uplink policy because the
+error leaves through the UDP/2152 socket. Grouped entries refuse it, and the
+eBPF probe reports `downlink_inner_mtu_enforcement`.
+
+When an authorized downlink inner IPv4 packet with Don't Fragment set exceeds
+that MTU, tc does not decapsulate it. The host therefore never forwards it
+toward XFRM and never generates its own Fragmentation Needed, which would
+leave unencapsulated from a host address and quote up to 548 octets of the
+subscriber packet. tc hands the exact authorized G-PDU to this queue, and
+the kernel reassembles outer fragments first. `try_receive_downlink`
+re-authorizes the G-PDU against the same Active commit and returns
+`GtpuDownlinkEvent::PacketTooBig`. At most one RFC 792/1191 Destination
+Unreachable, Fragmentation Needed error is sent:
+
+- The error is carried in the session's plain uplink G-PDU, from the
+  committed local UDP/2152 tuple to the committed peer UDP/2152 with the
+  committed peer TEID. Nothing is ever sent unencapsulated.
+- Source address policy: the session PAA, which is the invoking packet's
+  destination. This is the only inner source that the peer's per-PDN uplink
+  anti-spoofing admits. The destination is the invoking packet's source.
+- Quote: exactly the invoking IPv4 header and its first 64 data bits, as
+  RFC 792 requires. No further application payload is quoted.
+- No error is sent for a non-initial fragment, an ICMP error, or an unusable
+  destination (RFC 1122 3.2.2).
+- Rate limit: a per-registration token bucket, by default a burst of 16 with
+  one token per 10 ms. `set_packet_too_big_rate_limit` replaces it.
+  Suppressed or unsendable errors are counted and nothing is sent.
+
+Oversized packets without DF are fragmentable and are decapsulated normally.
+Inner IPv6 Packet Too Big (RFC 4443 / RFC 8201) is designed to use the same
+path and the IPv6 builder once the ordinary inner-IPv6 PDP path lands.
+
+Native evidence on the committed classifier covers:
+
+- default, dedicated and outer-fragmented oversized DF packets;
+- the exact error bytes, peer TEID, source and destination;
+- the 28-octet quote and the next-hop MTU;
+- fitting DF and oversized non-DF packets that are forwarded;
+- the rate limit;
+- zero plaintext ICMP frames in the peer and UE namespaces;
+- an unchanged host `OutDestUnreachs` counter.
+
+Both privileged lanes require `OPC_GTPU_DOWNLINK_PACKET_TOO_BIG_PROVEN`. The ordinary legacy socket port keeps the default
 `Unsupported` result. The consumer does not inject packets, admit peers, rate
 limit, or plan Error Indications. Grouped attachments with an IPv4 outer
 endpoint report `KernelReassemblyHandoff` for outer IPv4 fragments; outer IPv6

@@ -666,6 +666,11 @@ impl GtpuDataplaneBackend for MockGtpuDataplaneBackend {
                 feature: "fixed_outer_dscp",
             });
         }
+        if request.downlink_inner_mtu.is_some() {
+            return Err(GtpuError::UnsupportedFeature {
+                feature: "downlink_inner_mtu",
+            });
+        }
         if request.uplink_source_port_policy != crate::GtpuUplinkSourcePortPolicy::LegacyServicePort
         {
             return Err(GtpuError::UnsupportedFeature {
@@ -896,6 +901,7 @@ mod tests {
             bearer_mark: None,
             egress_dscp: None,
             uplink_source_port_policy: crate::GtpuUplinkSourcePortPolicy::LegacyServicePort,
+            downlink_inner_mtu: None,
         }
     }
 
