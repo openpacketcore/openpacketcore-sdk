@@ -96,9 +96,9 @@ pub trait GtpuControlPort: fmt::Debug + Send + Sync {
         Err(GtpuControlPortError::Unsupported)
     }
 
-    /// Replace this attachment registration's in-tunnel Packet Too Big rate
-    /// limit (see [`crate::GtpuPacketTooBigRateLimit`]); the bucket restarts
-    /// full.
+    /// Replace the per-session in-tunnel Packet Too Big rate limit applied by
+    /// this attachment registration (see [`crate::GtpuPacketTooBigRateLimit`]);
+    /// every session's bucket restarts full.
     ///
     /// # Errors
     /// Returns [`GtpuControlPortError::Unsupported`] for ports without a

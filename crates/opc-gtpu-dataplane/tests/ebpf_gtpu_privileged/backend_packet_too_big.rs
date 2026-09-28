@@ -174,7 +174,8 @@ pub(super) async fn qualify() -> Result<(), Box<dyn std::error::Error>> {
         backend.probe().await?.downlink_inner_mtu_enforcement,
         GtpuCapability::Available
     );
-    let mtu = GtpuDownlinkInnerMtu::new(SESSION_MTU).expect("canonical session MTU");
+    let mtu =
+        GtpuDownlinkInnerMtu::in_tunnel_packet_too_big(SESSION_MTU).expect("canonical session MTU");
     let mut default_bearer = session_context(device.ifindex);
     default_bearer.downlink_inner_mtu = Some(mtu);
     backend.install_pdp_context(default_bearer.clone()).await?;
@@ -254,11 +255,13 @@ pub(super) async fn qualify() -> Result<(), Box<dyn std::error::Error>> {
     assert_in_tunnel_error(&receive_pgw()?, PEER_TEID, &oversized);
     expect_pgw_silent();
 
-    // 2. The dedicated bearer signals inside its own uplink tunnel.
+    // 2. An offending packet on the dedicated bearer is signalled on the
+    //    UE's default-bearer uplink (TS 23.401 uplink bearer binding: the
+    //    dedicated TFT may admit only its media flows).
     let dedicated_oversized = inner(0x52, OVERSIZED_PAYLOAD, true);
     send_gpdu(LOCAL_TEID_A, &dedicated_oversized);
     expect_too_big(port.as_ref(), GtpuPacketTooBigSignal::Sent);
-    assert_in_tunnel_error(&receive_pgw()?, PEER_TEID_A, &dedicated_oversized);
+    assert_in_tunnel_error(&receive_pgw()?, PEER_TEID, &dedicated_oversized);
     expect_pgw_silent();
 
     // 3. An outer-fragmented oversized DF packet is reassembled by the kernel
@@ -320,6 +323,53 @@ pub(super) async fn qualify() -> Result<(), Box<dyn std::error::Error>> {
         }
     }
     expect_pgw_silent();
+    // The limit is per session: the exhausted default bearer does not
+    // silence the dedicated bearer's first error.
+    let other_session = inner(0x66, OVERSIZED_PAYLOAD, true);
+    send_gpdu(LOCAL_TEID_A, &other_session);
+    expect_too_big(port.as_ref(), GtpuPacketTooBigSignal::Sent);
+    assert_in_tunnel_error(&receive_pgw()?, PEER_TEID, &other_session);
+    expect_pgw_silent();
+
+    // 6. A backlog of over-MTU hand-offs never delays the shared queue: with
+    //    40 steered packets waiting, a later Echo Request is served first.
+    for index in 0..40_u8 {
+        send_gpdu(LOCAL_TEID, &inner(0x70 + index, OVERSIZED_PAYLOAD, true));
+    }
+    let echo = [0x32, 1, 0, 4, 0, 0, 0, 0, 0x5e, 0x11, 0, 0];
+    pgw.send_to(&echo, (EPDG_S2BU_IP, GTPU_PORT))?;
+    std::thread::sleep(Duration::from_millis(200));
+    match receive_event(port.as_ref()) {
+        GtpuDownlinkEvent::Control(event) => assert_eq!(event.bytes(), echo),
+        other => panic!("Echo must be served ahead of the hand-off backlog, got {other:?}"),
+    }
+    for _ in 0..40 {
+        expect_too_big(port.as_ref(), GtpuPacketTooBigSignal::RateLimited);
+    }
+    expect_no_event(port.as_ref());
+    expect_pgw_silent();
+
+    // 7. Never-answer packets (RFC 1122 3.2.2: a 0/8 originator) are refused
+    //    before any token is taken, so they cannot drain a session's budget.
+    port.set_packet_too_big_rate_limit(
+        GtpuPacketTooBigRateLimit::new(1, Duration::from_secs(3_600)).expect("canonical limit"),
+    )?;
+    for index in 0..3_u8 {
+        let unanswerable = with_dont_fragment(build_inner_udp(
+            Ipv4Addr::new(0, 1, 2, 3),
+            UE_PAA,
+            5060,
+            5060,
+            &vec![0x90 + index; OVERSIZED_PAYLOAD],
+        ));
+        send_gpdu(LOCAL_TEID, &unanswerable);
+        expect_too_big(port.as_ref(), GtpuPacketTooBigSignal::Unsendable);
+    }
+    let answerable = inner(0x93, OVERSIZED_PAYLOAD, true);
+    send_gpdu(LOCAL_TEID, &answerable);
+    expect_too_big(port.as_ref(), GtpuPacketTooBigSignal::Sent);
+    assert_in_tunnel_error(&receive_pgw()?, PEER_TEID, &answerable);
+    expect_pgw_silent();
 
     // Nothing oversized reached the UE, no plaintext ICMP crossed either
     // neighbour namespace, and the host generated no Destination Unreachable.
@@ -343,17 +393,20 @@ pub(super) async fn qualify() -> Result<(), Box<dyn std::error::Error>> {
         "the host must not generate its own Fragmentation Needed"
     );
     let counters = port.downlink_counters()?;
-    assert_eq!(counters.packet_too_big, 7);
-    assert_eq!(counters.packet_too_big_signalled, 5);
-    assert_eq!(counters.packet_too_big_rate_limited, 2);
-    assert_eq!(counters.packet_too_big_unsendable, 0);
+    assert_eq!(counters.packet_too_big, 52);
+    assert_eq!(counters.packet_too_big_signalled, 7);
+    assert_eq!(counters.packet_too_big_rate_limited, 42);
+    assert_eq!(counters.packet_too_big_unsendable, 3);
     assert_eq!(counters.decapsulated, 0);
+    assert_eq!(counters.control_plane, 1);
+    assert_eq!(counters.shared_queue_drops, 0);
+    assert_eq!(counters.packet_too_big_queue_drops, 0);
 
     drop(port);
     backend.remove_device(&device).await?;
     drop(net);
     eprintln!(
-        "OPC_GTPU_DOWNLINK_PACKET_TOO_BIG_PROVEN: IPv4 default/dedicated/reassembled in-tunnel RFC 1191, exact quote, rate limit, no host ICMP"
+        "OPC_GTPU_DOWNLINK_PACKET_TOO_BIG_PROVEN: IPv4 default/dedicated(default-bearer uplink)/reassembled in-tunnel RFC 1191, exact quote, per-session rate limit, Echo ahead of hand-off backlog, no host ICMP"
     );
     Ok(())
 }

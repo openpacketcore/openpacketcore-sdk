@@ -2551,7 +2551,7 @@ fn commit_downlink_inner_mtu(
 ) -> Option<Option<crate::GtpuDownlinkInnerMtu>> {
     match commit.downlink_inner_mtu() {
         None => Some(None),
-        Some(mtu) => crate::GtpuDownlinkInnerMtu::new(mtu.get()).map(Some),
+        Some(mtu) => crate::GtpuDownlinkInnerMtu::in_tunnel_packet_too_big(mtu.get()).map(Some),
     }
 }
 
@@ -11976,8 +11976,9 @@ impl EbpfGtpuDataplaneBackend {
             downlink_inner_mtu_enforcement: GtpuCapability::Missing,
             details,
         };
-        // The MTU rides in the complete commit record, and the in-tunnel
-        // error leaves through the Linux backend-owned UDP/2152 queue.
+        // The MTU rides in the complete commit record; steered packets land
+        // in the Linux backend-owned packet-too-big queue and the error leaves
+        // through the UDP/2152 socket.
         probe.downlink_inner_mtu_enforcement = if cfg!(target_os = "linux") {
             probe.uplink_source_port_selection
         } else {

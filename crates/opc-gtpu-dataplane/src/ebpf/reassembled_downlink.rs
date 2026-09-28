@@ -22,10 +22,10 @@ use opc_gtpu_ebpf_common::{
     downlink_ipv4_requires_packet_too_big, gtpu_endpoint_requires_extension_control,
     marked_owner_wire_authorizes_downlink, n3_downlink_psc_matches, parse_gtpu_tpdu,
     pdp_commit_wire_authorized_source_port, pdp_commit_wire_authorizes_downlink,
-    pdp_commit_wire_downlink_inner_mtu, select_gtpu_session_entry_wire,
-    validate_ipv4_downlink_binding_wire, DownlinkBindingMismatch, DownlinkPdr,
-    GtpuSessionDeviceConfig, GtpuSessionIpFamily, MarkedDownlinkPdr, UplinkFar, UplinkFarKey,
-    GTPU_SESSION_DOWNLINK_KEY_LEN, GTPU_SESSION_GROUP_ID_LEN,
+    pdp_commit_wire_authorizes_graph, pdp_commit_wire_downlink_inner_mtu,
+    select_gtpu_session_entry_wire, validate_ipv4_downlink_binding_wire, DownlinkBindingMismatch,
+    DownlinkPdr, GtpuSessionDeviceConfig, GtpuSessionIpFamily, MarkedDownlinkPdr, UplinkFar,
+    UplinkFarKey, GTPU_SESSION_DOWNLINK_KEY_LEN, GTPU_SESSION_GROUP_ID_LEN,
 };
 
 use super::EbpfGtpuRuntime;
@@ -63,12 +63,24 @@ enum Verdict {
     Drop(GtpuDownlinkDrop),
 }
 
-/// Authorized uplink route for one in-tunnel error, taken from the same
-/// Active commit that authorized the offending downlink packet.
+/// One over-MTU packet's error context: its session (the rate-limit key)
+/// and the UE's authorized default-bearer uplink, if any.
 #[derive(Clone, Copy)]
 struct PacketTooBigRoute {
     payload_offset: usize,
     mtu: u16,
+    session: [u8; 4],
+    uplink: Option<DefaultBearerUplink>,
+}
+
+/// The UE's default-bearer (mark zero) uplink tunnel, proven by its own
+/// complete Active commit graph with the legacy UDP/2152 source port.
+///
+/// TS 23.401 uplink bearer binding: a dedicated bearer's TFT may admit only
+/// its media flows, so the PGW can discard an ICMP error sent on it. The
+/// default bearer carries all traffic no dedicated TFT claims.
+#[derive(Clone, Copy)]
+struct DefaultBearerUplink {
     peer: [u8; 4],
     local: [u8; 4],
     peer_teid: [u8; 4],
@@ -88,6 +100,11 @@ impl PacketTooBigPlan {
         self.route.mtu
     }
 
+    /// The offending session's local TEID, the rate-limit key.
+    pub(super) const fn session(&self) -> [u8; 4] {
+        self.route.session
+    }
+
     /// Build the complete uplink G-PDU carrying one RFC 1191 Fragmentation
     /// Needed error toward the offending packet's source.
     ///
@@ -95,15 +112,22 @@ impl PacketTooBigPlan {
     /// destination, and the only inner source the peer's uplink anti-spoofing
     /// admits for this PDN connection. RFC 792/1191 quote exactly the
     /// invoking IPv4 header and its first 64 bits of data.
-    pub(super) fn build_uplink_gpdu(&self) -> Option<Vec<u8>> {
+    ///
+    /// Every never-answer rule is applied here, before any rate-limit token
+    /// is taken. Returns the G-PDU with its committed local and peer outer
+    /// addresses, or `None` when no error may be sent.
+    pub(super) fn build_uplink_gpdu(
+        &self,
+    ) -> Option<(Vec<u8>, std::net::Ipv4Addr, std::net::Ipv4Addr)> {
+        let uplink = self.route.uplink?;
         let inner = datagram_payload(&self.datagram, self.route.payload_offset)?;
         let source = std::net::Ipv4Addr::new(inner[16], inner[17], inner[18], inner[19]);
         let destination = std::net::Ipv4Addr::new(inner[12], inner[13], inner[14], inner[15]);
-        if destination.is_unspecified()
-            || destination.is_multicast()
-            || destination.is_broadcast()
-            || destination.is_loopback()
-        {
+        // RFC 1122 3.2.2: never answer a source that does not identify one
+        // host: 0/8 ("this network"), 127/8, multicast, or 240/4 including the
+        // limited broadcast.
+        let first = destination.octets()[0];
+        if first == 0 || destination.is_loopback() || destination.is_multicast() || first >= 240 {
             return None;
         }
         // RFC 1122 3.2.2: never answer a non-initial fragment.
@@ -123,18 +147,53 @@ impl PacketTooBigPlan {
         let mut gpdu = Vec::with_capacity(8 + icmp.len());
         gpdu.extend_from_slice(&[0x30, 0xff]);
         gpdu.extend_from_slice(&length.to_be_bytes());
-        gpdu.extend_from_slice(&self.route.peer_teid);
+        gpdu.extend_from_slice(&uplink.peer_teid);
         gpdu.extend_from_slice(&icmp);
-        Some(gpdu)
+        Some((
+            gpdu,
+            std::net::Ipv4Addr::from(uplink.local),
+            std::net::Ipv4Addr::from(uplink.peer),
+        ))
     }
+}
 
-    /// Committed uplink peer and local outer addresses.
-    pub(super) fn endpoints(&self) -> (std::net::Ipv4Addr, std::net::Ipv4Addr) {
-        (
-            std::net::Ipv4Addr::from(self.route.local),
-            std::net::Ipv4Addr::from(self.route.peer),
-        )
+/// Resolve the UE's default-bearer uplink from its own complete Active graph,
+/// exactly as tc authorizes default-bearer uplink encapsulation. Any read
+/// failure, transitional or mixed graph, or selected source port yields
+/// `None`: the error is then unsendable rather than misrouted.
+fn default_bearer_uplink(
+    runtime: &dyn EbpfGtpuRuntime,
+    ifindex: u32,
+    ue_ip: [u8; 4],
+) -> Option<DefaultBearerUplink> {
+    let far = runtime.far_get(ifindex, ue_ip).ok()??;
+    let far = UplinkFar::decode(&far);
+    let dscp_wire = match runtime.dscp_get(ifindex, ue_ip).ok()? {
+        Some(value) if value[0] > 63 => return None,
+        Some(value) => value[0],
+        None => 0xff,
+    };
+    // Publication fence: the commit is read last among the graph components
+    // that name it; the PDR and binding are keyed by the commit's own TEID.
+    let commit = runtime.sport_get(ifindex, ue_ip).ok()??;
+    let teid = [commit[0], commit[1], commit[2], commit[3]];
+    if runtime.pdr_get(ifindex, teid).ok()? != Some(DownlinkPdr { ue_ip }.encode())
+        || runtime.marked_pdr_get(ifindex, teid).ok()?.is_some()
+    {
+        return None;
     }
+    let binding = runtime.downlink_binding_get(ifindex, teid).ok()??;
+    if !pdp_commit_wire_authorizes_graph(&commit, teid, &far, dscp_wire, &binding)
+        || pdp_commit_wire_authorized_source_port(&commit, &far, dscp_wire)
+            != Some(opc_gtpu_ebpf_common::GTPU_UDP_PORT)
+    {
+        return None;
+    }
+    Some(DefaultBearerUplink {
+        peer: far.peer_ip,
+        local: far.local_ip,
+        peer_teid: far.o_teid,
+    })
 }
 
 fn datagram_payload(datagram: &GtpuControlDatagram, offset: usize) -> Option<&[u8]> {
@@ -487,9 +546,8 @@ fn authorize_legacy(
         return Verdict::PacketTooBig(PacketTooBigRoute {
             payload_offset,
             mtu,
-            peer: far.peer_ip,
-            local: far.local_ip,
-            peer_teid: far.o_teid,
+            session: teid,
+            uplink: default_bearer_uplink(runtime, ifindex, pdr.ue_ip),
         });
     }
     Verdict::Decapsulate {

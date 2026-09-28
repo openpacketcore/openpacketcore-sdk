@@ -10,6 +10,9 @@ use crate::control_port::{
 #[derive(Default)]
 pub(super) struct ControlSocketState {
     socket: Option<crate::GtpuReassemblySocket>,
+    /// Dedicated queue for tc-steered over-MTU G-PDUs; see
+    /// [`opc_gtpu_ebpf_common::GTPU_PACKET_TOO_BIG_QUEUE_PORT`].
+    too_big_socket: Option<crate::GtpuReassemblySocket>,
     retired: bool,
     /// Value-free counters of this registration's downlink consumer.
     downlink_counters: crate::GtpuDownlinkCounters,
@@ -26,6 +29,7 @@ impl ControlSocketState {
     pub(super) fn retire(&mut self) {
         self.retired = true;
         self.socket = None;
+        self.too_big_socket = None;
     }
 }
 
@@ -158,32 +162,66 @@ impl GtpuControlPort for BackendControlPort {
                 .socket
                 .as_ref()
                 .ok_or(GtpuControlPortError::Unavailable)?;
-            let Some(datagram) = socket.try_receive_datagram(maximum_bytes)? else {
-                return Ok(None);
+            // The shared queue (Echo, reassembled G-PDUs) is always served
+            // first; tc-steered over-MTU G-PDUs wait in their own queue and can
+            // never delay or crowd it out.
+            let (datagram, steered) = match socket.try_receive_datagram(maximum_bytes)? {
+                Some(datagram) => (datagram, false),
+                None => match state.too_big_socket.as_ref() {
+                    Some(queue) => match queue.try_receive_datagram(maximum_bytes)? {
+                        Some(datagram) => (datagram, true),
+                        None => return Ok(None),
+                    },
+                    None => return Ok(None),
+                },
             };
-            let plan = match super::reassembled_downlink::process_downlink_datagram(
+            let processed = super::reassembled_downlink::process_downlink_datagram(
                 backend.inner.runtime.as_ref(),
                 scope,
                 datagram,
                 &mut state.downlink_counters,
-            ) {
-                super::reassembled_downlink::ProcessedDownlink::Event(event) => {
-                    return Ok(Some(event));
-                }
+            );
+            let plan = match processed {
                 super::reassembled_downlink::ProcessedDownlink::PacketTooBig(plan) => plan,
+                super::reassembled_downlink::ProcessedDownlink::Event(event) => {
+                    // A steered datagram only ever carries an authorized
+                    // over-MTU packet. If authority changed since tc steered
+                    // it, never expose it as a control or unknown-tunnel
+                    // event bound to the wrong socket.
+                    return Ok(Some(match event {
+                        crate::GtpuDownlinkEvent::Control(_)
+                        | crate::GtpuDownlinkEvent::UnknownTunnel(_)
+                            if steered =>
+                        {
+                            state
+                                .downlink_counters
+                                .record_drop(crate::GtpuDownlinkDrop::StateUnavailable);
+                            crate::GtpuDownlinkEvent::Dropped(
+                                crate::GtpuDownlinkDrop::StateUnavailable,
+                            )
+                        }
+                        event => event,
+                    }));
+                }
             };
-            // Exactly one error per offending packet, subject to the limit.
-            // It is always carried in the session's uplink G-PDU; nothing is
-            // ever sent unencapsulated.
-            let signal = if !state.too_big_limiter.admit(std::time::Instant::now()) {
-                crate::GtpuPacketTooBigSignal::RateLimited
-            } else {
-                let (local, peer) = plan.endpoints();
-                match plan.build_uplink_gpdu() {
-                    Some(gpdu) if socket.send_in_tunnel_error(local, peer, &gpdu).is_ok() => {
-                        crate::GtpuPacketTooBigSignal::Sent
+            // At most one error per offending packet. The never-answer rules
+            // run before a token is taken, so suppressed packets cannot drain
+            // a session's budget. The error is always carried in the UE's
+            // default-bearer uplink G-PDU; nothing is ever sent unencapsulated.
+            let signal = match plan.build_uplink_gpdu() {
+                None => crate::GtpuPacketTooBigSignal::Unsendable,
+                Some(_)
+                    if !state
+                        .too_big_limiter
+                        .admit(plan.session(), std::time::Instant::now()) =>
+                {
+                    crate::GtpuPacketTooBigSignal::RateLimited
+                }
+                Some((gpdu, local, peer)) => {
+                    match socket.send_in_tunnel_error(local, peer, &gpdu) {
+                        Ok(_) => crate::GtpuPacketTooBigSignal::Sent,
+                        Err(_) => crate::GtpuPacketTooBigSignal::Unsendable,
                     }
-                    Some(_) | None => crate::GtpuPacketTooBigSignal::Unsendable,
                 }
             };
             let counters = &mut state.downlink_counters;
@@ -218,7 +256,18 @@ impl GtpuControlPort for BackendControlPort {
     }
 
     fn downlink_counters(&self) -> Result<crate::GtpuDownlinkCounters, GtpuControlPortError> {
-        self.with_attachment(|_, state, _| Ok(state.downlink_counters))
+        self.with_attachment(|_, state, _| {
+            let mut counters = state.downlink_counters;
+            counters.shared_queue_drops = state
+                .socket
+                .as_ref()
+                .map_or(0, |socket| u64::from(socket.queue_drops()));
+            counters.packet_too_big_queue_drops = state
+                .too_big_socket
+                .as_ref()
+                .map_or(0, |socket| u64::from(socket.queue_drops()));
+            Ok(counters)
+        })
     }
 }
 
@@ -331,6 +380,16 @@ impl EbpfGtpuDataplaneBackend {
             socket.socket = Some(
                 crate::GtpuReassemblySocket::bind(local_ip, &device.name)
                     .map_err(|error| GtpuError::io("ebpf_control_port_bind", error))?,
+            );
+        }
+        if socket.too_big_socket.is_none() {
+            // Without this queue, tc-steered over-MTU G-PDUs would be
+            // answered by the kernel with port unreachable; refuse instead.
+            socket.too_big_socket = Some(
+                crate::GtpuReassemblySocket::bind_packet_too_big_queue(local_ip, &device.name)
+                    .map_err(|error| {
+                        GtpuError::io("ebpf_control_port_packet_too_big_bind", error)
+                    })?,
             );
         }
         Ok(Arc::new(BackendControlPort {

@@ -94,6 +94,15 @@ pub use trusted_traffic_observation_abi::{
 
 /// GTP-U UDP port (TS 29.281 §4.4.2).
 pub const GTPU_UDP_PORT: u16 = 2152;
+/// Local UDP port of the backend-owned queue that receives authorized
+/// over-MTU downlink G-PDUs.
+///
+/// tc rewrites only the destination port of such a G-PDU (with an exact
+/// incremental checksum update) instead of decapsulating it. The packet stays
+/// addressed to the concrete local S2b-U endpoint, so a flood of over-MTU
+/// packets fills this dedicated socket queue and never the shared UDP/2152
+/// queue that carries Echo and reassembled G-PDUs.
+pub const GTPU_PACKET_TOO_BIG_QUEUE_PORT: u16 = 2153;
 
 /// Ethernet header length on the attach interface.
 pub const ETH_HDR_LEN: usize = 14;
@@ -1581,8 +1590,10 @@ impl MarkedBearerOwner {
 /// big-endian downlink inner MTU: zero means unset, otherwise it is at least
 /// [`DOWNLINK_INNER_MTU_MIN`]. Records without an MTU are byte-identical to the
 /// original v4 layout, whose bytes 66..68 were reserved zero, so retained
-/// graphs keep their exact values. An older SDK treats a record carrying an
-/// MTU as non-canonical and fails that context closed. This is an additive
+/// graphs keep their exact values. An older SDK's retained-graph recovery
+/// rejects a record carrying an MTU and refuses the whole attachment as
+/// indeterminate, so MTU-bearing contexts must be drained (reinstalled
+/// without an MTU, or removed) before a downgrade. This is an additive
 /// v4-map ABI: pre-v4 pin sets have no source-port maps and are materialized
 /// from their already validated graph before v4 is committed.
 #[derive(Clone, Copy, PartialEq, Eq)]

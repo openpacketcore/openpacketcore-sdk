@@ -36,8 +36,12 @@ The crate exposes tc entry points, not a Rust library API:
   dedicated-bearer mark (or zero), and continues through the ePDG's XFRM
   output policy. On the legacy path, an authorized inner IPv4 packet with
   Don't Fragment set that exceeds the Active commit's optional downlink inner
-  MTU is not decapsulated. Its exact G-PDU is passed to the backend-owned
-  UDP/2152 queue, which sends one in-tunnel RFC 1191 error. A true
+  MTU is not decapsulated. tc rewrites only its UDP destination port (with an
+  incremental checksum update) to the backend-owned packet-too-big queue
+  (`GTPU_PACKET_TOO_BIG_QUEUE_PORT`, 2153), which sends at most one in-tunnel
+  RFC 1191 error. A hand-off flood therefore never fills the shared UDP/2152
+  queue. tc keeps no hand-off counter: adding a counter or policing map would
+  change the retained pin inventory and durable recovery records. A true
   grouped-index miss alone may enter the legacy IPv4 PDR/commit path.
   Outer-IPv4 fragments, legacy or grouped, retain the bounded
   kernel-reassembly handoff; the backend-owned consumer

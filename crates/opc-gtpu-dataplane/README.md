@@ -94,9 +94,23 @@ On an eBPF attachment, `try_receive_downlink` on the same port is the
 backend-authoritative consumer for kernel-reassembled and handed-off G-PDUs:
 it authorizes against the backend's own grouped and v5 maps (commit read
 last) and returns the exact inner packet and bearer mark, or a value-free
-drop. With `GtpPdpContext::downlink_inner_mtu`, an over-MTU DF
-downlink packet is refused there and signalled once inside the session's
-uplink G-PDU (RFC 1191) instead of by the host.
+drop. With the explicit per-context opt-in
+`GtpPdpContext::downlink_inner_mtu`, an over-MTU DF downlink packet is not
+forwarded. tc steers it to a dedicated backend-owned queue, and it is
+signalled at most once inside the UE's default-bearer uplink G-PDU
+(RFC 1191) instead of by the host.
+
+The opt-in is a deliberate RFC 4459 tradeoff:
+
+- The error's source is the subscriber's own PAA. That is the only address
+  the PGW's anti-spoofing admits, but it departs from RFC 1812 4.3.2.4, and
+  the originator attributes the error to the subscriber.
+- The alternatives are to clear the inner DF bit and fragment the inner
+  packet before encryption, or to use MSS clamping with SIP over TCP for
+  large requests.
+
+MTU-bearing contexts must be drained before an SDK downgrade. See
+[control port](docs/control-port.md).
 
 - `GtpuDataplaneBackend`: async port for device and PDP lifecycle, typed PDP
   readback, classified installation, authority-safe exact removal, and probes.
