@@ -81,7 +81,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     octets. The opt-in test shows exactly one well-formed in-tunnel error
     and no host ICMP. It also covers per-session limiting and Echo served
     ahead of a hand-off backlog.
-  - **IPv6.** Inner IPv6 Packet Too Big follows the ordinary inner-IPv6 path.
+  - **IPv6.** An opted-in ordinary inner-IPv6 context is refused
+    (`downlink_inner_mtu_inner_ipv6`). Inner IPv6 Packet Too Big is a
+    follow-up, because it needs an MTU in the family-tagged entry wire.
 
 - `opc-gtpu-dataplane`: backend-authoritative post-reassembly downlink
   consumer. `GtpuControlPort::try_receive_downlink` receives one datagram from

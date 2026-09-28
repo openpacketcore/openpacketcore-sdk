@@ -268,9 +268,15 @@ the error to the subscriber. RFC 4459 alternatives are:
 
 This path implements only the in-tunnel error.
 
-**IPv6.** Inner IPv6 Packet Too Big (RFC 4443 / RFC 8201) is designed to use
-the same path and the IPv6 builder once the ordinary inner-IPv6 PDP path
-lands.
+**IPv6.** Ordinary inner-IPv6 contexts (#998) are stored as family-tagged
+entries, and those entries have no MTU field, so an opted-in IPv6 context is
+refused with `downlink_inner_mtu_inner_ipv6` rather than installed without
+enforcement. Inner IPv6 Packet Too Big (RFC 4443 / RFC 8201) is a follow-up.
+It needs three pieces:
+- an MTU in the family-tagged entry wire, which is shared with grouped
+  records and the protected selector ledger;
+- the same steering in tc's family-tagged decapsulation;
+- the existing ICMPv6 builder, quoting up to 1,232 octets.
 
 **Native evidence.** The committed classifier is exercised with:
 

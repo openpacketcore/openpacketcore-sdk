@@ -107,6 +107,13 @@ pub(super) fn ordinary_ipv6_plan(
     local_ip: Ipv4Addr,
 ) -> Result<OrdinaryIpv6Plan, GtpuError> {
     validate_gtp_version(context.gtp_version)?;
+    // The family-tagged entry carries no downlink inner MTU. Refuse the
+    // in-tunnel Packet Too Big opt-in rather than install without it.
+    if context.downlink_inner_mtu.is_some() {
+        return Err(GtpuError::UnsupportedFeature {
+            feature: "downlink_inner_mtu_inner_ipv6",
+        });
+    }
     let IpAddr::V6(ms_address) = context.ms_address else {
         return Err(GtpuError::invalid_config(
             "pdp.ms_address",
