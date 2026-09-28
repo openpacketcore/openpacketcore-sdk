@@ -121,6 +121,7 @@ impl BackendControlPort {
         }
         let scope = super::reassembled_downlink::DownlinkAuthorityScope {
             ifindex: self.ifindex,
+            ordinary_local_ipv4: managed.local_ip,
             grouped_config: managed.grouped.and_then(|grouped| {
                 grouped_device_config(grouped.device_id, self.ifindex, grouped.local_endpoints)
             }),

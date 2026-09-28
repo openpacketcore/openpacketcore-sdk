@@ -65,7 +65,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   attachments with an IPv4 outer endpoint now report
   `KernelReassemblyHandoff` for outer IPv4 fragments. Native tests cover
   in-order, reordered, duplicated, missing, foreign-TEID, stale-generation,
-  owner-only, mixed-binding and gate-closed fragment sets. Refs #1001.
+  owner-only, mixed-binding and gate-closed fragment sets. On an ordinary
+  attachment, inner-IPv6 contexts (#998) decapsulate through the attachment's
+  published family authority. Refs #1001.
 
 - `opc-gtpu-dataplane`: the ordinary eBPF PDP-context API accepts an inner
   IPv6 PDN prefix. Uplink selects the inner source `/64` plus mark, downlink

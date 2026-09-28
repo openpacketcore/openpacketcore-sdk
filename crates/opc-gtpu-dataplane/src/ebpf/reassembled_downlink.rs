@@ -48,6 +48,10 @@ pub(super) struct DownlinkAuthorityScope {
     /// Canonical grouped device configuration; `None` for an ordinary
     /// attachment, whose grouped index must stay empty.
     pub(super) grouped_config: Option<GtpuSessionDeviceConfig>,
+    /// The ordinary attachment's IPv4 S2b-U endpoint; `None` on a grouped
+    /// attachment. An ordinary attachment carrying inner-IPv6 contexts
+    /// publishes its own family-tagged configuration bound to this endpoint.
+    pub(super) ordinary_local_ipv4: Option<std::net::Ipv4Addr>,
 }
 
 enum Verdict {
@@ -188,10 +192,18 @@ fn authorize_grouped(
     let invalid = Verdict::Drop(GtpuDownlinkDrop::BindingMismatch(
         DownlinkBindingMismatch::Invalid,
     ));
-    // An ordinary attachment has no canonical grouped configuration, so tc
-    // cannot select any retained grouped entry for it.
-    let Some(config) = scope.grouped_config else {
-        return invalid;
+    // A grouped attachment's configuration is its registration. An ordinary
+    // attachment has one only while it carries inner-IPv6 contexts (#998),
+    // published once and bound to its IPv4 endpoint; without it tc cannot
+    // select any retained family-tagged entry.
+    let config = match (scope.grouped_config, scope.ordinary_local_ipv4) {
+        (Some(config), _) => config,
+        (None, Some(local)) => match ordinary_family_config(runtime, scope.ifindex, local) {
+            Ok(Some(config)) => config,
+            Ok(None) => return invalid,
+            Err(()) => return Verdict::Drop(GtpuDownlinkDrop::StateUnavailable),
+        },
+        (None, None) => return invalid,
     };
     let config_wire = config.encode();
     // Proves the live pinned configuration, schema marker, and exact hooks.
@@ -258,6 +270,35 @@ fn authorize_grouped(
             GtpuSessionIpFamily::Ipv6 => GtpAddressFamily::Ipv6,
         },
     }
+}
+
+/// Read an ordinary attachment's complete family-tagged configuration and
+/// prove it names exactly this attachment and IPv4 endpoint, with no IPv6
+/// endpoint. `Ok(None)` means no complete authority exists; `Err` means the
+/// read failed or the published value is not this attachment's.
+fn ordinary_family_config(
+    runtime: &dyn EbpfGtpuRuntime,
+    ifindex: u32,
+    local: std::net::Ipv4Addr,
+) -> Result<Option<GtpuSessionDeviceConfig>, ()> {
+    let raw = match runtime.ordinary_family_authority(ifindex).map_err(|_| ())? {
+        super::OrdinaryFamilyAuthority::Initialized(raw) => raw,
+        super::OrdinaryFamilyAuthority::Uninitialized
+        | super::OrdinaryFamilyAuthority::ConfigOnly(_) => return Ok(None),
+    };
+    let config = GtpuSessionDeviceConfig::decode(&raw)
+        .filter(|config| config.encode() == raw)
+        .ok_or(())?;
+    if config.ingress_ifindex() != ifindex
+        || config.local_endpoint(GtpuSessionIpFamily::Ipv4)
+            != Some(opc_gtpu_ebpf_common::GtpuEndpointAddress::Ipv4(
+                local.octets(),
+            ))
+        || config.local_endpoint(GtpuSessionIpFamily::Ipv6).is_some()
+    {
+        return Err(());
+    }
+    Ok(Some(config))
 }
 
 /// tc: `authorize_and_decap_legacy_downlink`, with the commit read last.

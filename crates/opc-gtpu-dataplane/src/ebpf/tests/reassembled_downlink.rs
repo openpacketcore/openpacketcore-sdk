@@ -66,6 +66,7 @@ fn ordinary_scope() -> DownlinkAuthorityScope {
     DownlinkAuthorityScope {
         ifindex: S2BU_IFINDEX,
         grouped_config: None,
+        ordinary_local_ipv4: Some(LOCAL),
     }
 }
 
@@ -337,6 +338,7 @@ async fn outer_binding_and_inner_destination_are_enforced() {
     let foreign_attachment = DownlinkAuthorityScope {
         ifindex: S2BU_IFINDEX + 1,
         grouped_config: None,
+        ordinary_local_ipv4: Some(LOCAL),
     };
     assert_eq!(
         expect_drop(process(
@@ -560,6 +562,7 @@ async fn grouped_fixture(
     let scope = DownlinkAuthorityScope {
         ifindex: S2BU_IFINDEX,
         grouped_config: grouped_device_config(device_id, S2BU_IFINDEX, endpoints),
+        ordinary_local_ipv4: None,
     };
     assert!(scope.grouped_config.is_some());
     (runtime, backend, authority, desired, scope)
