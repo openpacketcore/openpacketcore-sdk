@@ -9,6 +9,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- `opc-route-steering`: `RuleRequest` gains an explicit `family` so mark-only
+  policy rules can be created, read back, converged and removed as `AF_INET6`
+  rules. `None` keeps the previous IPv4 default and wire bytes; a prefix still
+  determines the family, and a conflicting explicit family is rejected. IPv4
+  and IPv6 rules with the same mark, table and priority are distinct objects.
+  Breaking: struct-literal constructors must add `family: None`. Refs #989.
 - `opc-proto-gtpv2c`: model TS 29.274 Causes 18 (new PDN type due to network
   preference) and 19 (new PDN type due to single address bearer only). A
   Create Session Response carrying either now projects as accepted with its
