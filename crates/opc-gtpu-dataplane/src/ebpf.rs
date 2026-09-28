@@ -56558,6 +56558,79 @@ mod tests {
                 .ok_or_else(|| state_indeterminate("traffic_observation_disable"))
         }
 
+        /// Mirror the production quiescence proof that precedes a gate
+        /// enable: the source is still at a nonzero even incarnation and holds
+        /// no registration, redirect, retained record, loss, or sequence.
+        fn verify_traffic_observation_source_quiescent(
+            state: &mut FakeState,
+            ifindex: u32,
+        ) -> Result<(), GtpuError> {
+            state.operations.push("traffic_observation_quiescence");
+            Self::fail_if_requested(state, "traffic_observation_quiescence")?;
+            let quiescent = state
+                .traffic_observation_gate
+                .get(&ifindex)
+                .is_some_and(|gate| *gate != 0 && *gate & 1 == 0)
+                && !state
+                    .traffic_observation_registrations
+                    .keys()
+                    .any(|(index, _)| *index == ifindex)
+                && !state
+                    .traffic_observation_redirects
+                    .keys()
+                    .any(|(index, _)| *index == ifindex)
+                && state
+                    .traffic_observation_events
+                    .get(&ifindex)
+                    .is_none_or(VecDeque::is_empty)
+                && state
+                    .traffic_observation_loss
+                    .get(&ifindex)
+                    .is_none_or(|loss| *loss == 0)
+                && state
+                    .traffic_observation_next_sequence
+                    .get(&ifindex)
+                    .is_none_or(|sequence| *sequence == 0);
+            quiescent
+                .then_some(())
+                .ok_or_else(|| state_indeterminate("ebpf_traffic_source_reset"))
+        }
+
+        /// Mirror the production re-proof of an activated cleanup-only graph
+        /// (`selector_namespace_graph_identity` on the attached device): the
+        /// exact attachment, both hooks on this pin graph, and an executable
+        /// PMTU policy slot.
+        fn cleanup_activation_graph_is_exact(
+            state: &mut FakeState,
+            ifindex: u32,
+            pin_dir: &Path,
+        ) -> Result<(), GtpuError> {
+            state
+                .operations
+                .push("activate_cleanup_only_graph_identity");
+            Self::fail_if_requested(state, "activate_cleanup_only_graph_identity")?;
+            let exact = state
+                .attached
+                .get(&ifindex)
+                .is_some_and(|attachment| attachment.pin_dir == pin_dir)
+                && state.uplink_filter_ready.contains(&ifindex)
+                && state.downlink_filter_ready.contains(&ifindex)
+                && state
+                    .uplink_filter_pin_dir
+                    .get(&ifindex)
+                    .is_some_and(|attached| attached == pin_dir)
+                && state
+                    .downlink_filter_pin_dir
+                    .get(&ifindex)
+                    .is_some_and(|attached| attached == pin_dir)
+                && state.pmtu_policy.get(&ifindex).is_some_and(|value| {
+                    ebpf_pmtu_map_state_is_executable(GtpuUplinkMtuPolicy::decode_map_value(value))
+                });
+            exact
+                .then_some(())
+                .ok_or_else(|| state_indeterminate("ebpf_activate_cleanup_only"))
+        }
+
         /// Mirror the production pre-load TFT schema guard. The fake stores
         /// map readiness separately from rows, so it also rejects impossible
         /// partial graphs rather than silently materializing their missing
@@ -58411,7 +58484,11 @@ mod tests {
                 .get(&ifindex)
                 .copied()
                 .and_then(|disabled| disabled.checked_add(1));
-            if let Err(error) = Self::enable_traffic_observation_source(&mut state, ifindex) {
+            if let Err(error) = Self::verify_traffic_observation_source_quiescent(
+                &mut state, ifindex,
+            )
+            .and_then(|()| Self::enable_traffic_observation_source(&mut state, ifindex).map(|_| ()))
+            {
                 // Restore through the exact disable path, then detach
                 // regardless; a failed restore is indeterminate.
                 let gate_restored = enabled.map_or_else(
@@ -58430,6 +58507,7 @@ mod tests {
                 });
             }
             state.cleanup_only.remove(&ifindex);
+            Self::cleanup_activation_graph_is_exact(&mut state, ifindex, pin_dir)?;
             Ok(EbpfAttachmentDisposition::Retained)
         }
 
@@ -79563,6 +79641,218 @@ mod tests {
         assert!(!state.uplink_filter_ready.contains(&S2BU_IFINDEX));
         assert!(!state.downlink_filter_ready.contains(&S2BU_IFINDEX));
         assert!(state.cleanup_only.contains(&S2BU_IFINDEX));
+    }
+
+    /// Acquire a retained graph cleanup-only and remove its stale context,
+    /// leaving it ready for activation.
+    async fn acquired_cleanup_only_device(
+        runtime: &Arc<FakeRuntime>,
+    ) -> (EbpfGtpuDataplaneBackend, GtpPdpContext, GtpDevice) {
+        let backend = EbpfGtpuDataplaneBackend::with_runtime(runtime.clone());
+        let installed = create_device_with_context(&backend).await;
+        drop(backend);
+        simulate_process_loss(runtime, false);
+        let recovered = EbpfGtpuDataplaneBackend::with_runtime(runtime.clone());
+        assert_eq!(
+            recovered
+                .acquire_cleanup_only_recovery(cleanup_request(
+                    Ipv4Addr::new(192, 0, 2, 1),
+                    S2BU_IFINDEX,
+                ))
+                .await
+                .unwrap(),
+            RetainedGraphCleanupClassification::Acquired
+        );
+        assert_eq!(
+            recovered
+                .remove_pdp_context_exact(installed.clone())
+                .await
+                .unwrap(),
+            PdpContextRemovalOutcome::Removed
+        );
+        let device = GtpDevice {
+            name: "s2bu".to_string(),
+            ifindex: S2BU_IFINDEX,
+        };
+        (recovered, installed, device)
+    }
+
+    /// A failed activation leaves the runtime and the backend agreeing that
+    /// the device is cleanup-only: both hooks detached, the traffic gate even,
+    /// installation fenced, and a retry able to activate it.
+    async fn assert_failed_activation_is_fenced_and_retryable(
+        runtime: &Arc<FakeRuntime>,
+        recovered: &EbpfGtpuDataplaneBackend,
+        installed: &GtpPdpContext,
+        failure: &str,
+    ) {
+        {
+            let state = runtime.state();
+            assert!(
+                state.cleanup_only.contains(&S2BU_IFINDEX),
+                "{failure}: the runtime must still hold the device cleanup-only"
+            );
+            assert!(
+                !state.uplink_filter_ready.contains(&S2BU_IFINDEX)
+                    && !state.downlink_filter_ready.contains(&S2BU_IFINDEX),
+                "{failure}: a failed activation must detach both hooks"
+            );
+            let gate = state.traffic_observation_gate[&S2BU_IFINDEX];
+            assert!(
+                gate != 0 && gate & 1 == 0,
+                "{failure}: a failed activation must leave the gate packet-inert: {gate}"
+            );
+        }
+        assert!(
+            matches!(
+                recovered
+                    .install_pdp_context_classified(installed.clone())
+                    .await
+                    .unwrap(),
+                PdpContextInstallOutcome::Indeterminate(
+                    PdpContextIndeterminateReason::AuthorityUnavailable
+                )
+            ),
+            "{failure}: the backend must still hold the device cleanup-only"
+        );
+    }
+
+    async fn assert_activation_retry_forwards(
+        runtime: &Arc<FakeRuntime>,
+        recovered: &EbpfGtpuDataplaneBackend,
+        installed: GtpPdpContext,
+        device: &GtpDevice,
+        failure: &str,
+    ) {
+        recovered
+            .activate_cleanup_recovery(device)
+            .await
+            .unwrap_or_else(|error| panic!("{failure}: retry must activate: {error:?}"));
+        {
+            let state = runtime.state();
+            assert!(!state.cleanup_only.contains(&S2BU_IFINDEX), "{failure}");
+            assert!(
+                state.uplink_filter_ready.contains(&S2BU_IFINDEX),
+                "{failure}"
+            );
+            assert!(
+                state.downlink_filter_ready.contains(&S2BU_IFINDEX),
+                "{failure}"
+            );
+            assert_eq!(
+                state.traffic_observation_gate[&S2BU_IFINDEX] & 1,
+                1,
+                "{failure}"
+            );
+        }
+        assert_eq!(
+            recovered
+                .install_pdp_context_classified(installed)
+                .await
+                .unwrap(),
+            PdpContextInstallOutcome::Installed,
+            "{failure}"
+        );
+    }
+
+    /// The activated graph is re-proven (interface, tc placement, exact
+    /// identity, executable PMTU policy) before the gate is enabled and the
+    /// activation committed. A failed re-proof, whether from a PMTU slot that
+    /// is no longer executable or any other re-proof failure, is rolled back
+    /// completely: never a forwarding datapath the backend still records as
+    /// cleanup-only, and never a device a retry reports as already active.
+    #[tokio::test]
+    async fn cleanup_only_activation_rolls_back_a_failed_graph_reproof() {
+        for failure in ["non_executable_pmtu_slot", "injected_reproof_failure"] {
+            let runtime = Arc::new(FakeRuntime::new());
+            let (recovered, installed, device) = acquired_cleanup_only_device(&runtime).await;
+            let executable = runtime.state().pmtu_policy[&S2BU_IFINDEX];
+            if failure == "non_executable_pmtu_slot" {
+                runtime
+                    .state()
+                    .pmtu_policy
+                    .insert(S2BU_IFINDEX, [0, 0, 0, 1]);
+            } else {
+                runtime.fail_in_order(["activate_cleanup_only_graph_identity"]);
+            }
+            assert!(
+                matches!(
+                    recovered.activate_cleanup_recovery(&device).await,
+                    Err(GtpuError::StateIndeterminate { .. })
+                ),
+                "{failure}"
+            );
+            assert!(runtime.state().failures.is_empty(), "{failure}");
+            assert_failed_activation_is_fenced_and_retryable(
+                &runtime, &recovered, &installed, failure,
+            )
+            .await;
+            runtime.state().pmtu_policy.insert(S2BU_IFINDEX, executable);
+            assert_activation_retry_forwards(&runtime, &recovered, installed, &device, failure)
+                .await;
+        }
+    }
+
+    /// A failed quiescence proof is rolled back like a failed gate enable.
+    #[tokio::test]
+    async fn cleanup_only_activation_rolls_back_a_failed_quiescence_proof() {
+        let runtime = Arc::new(FakeRuntime::new());
+        let (recovered, installed, device) = acquired_cleanup_only_device(&runtime).await;
+        runtime.fail_in_order(["traffic_observation_quiescence"]);
+        assert!(recovered.activate_cleanup_recovery(&device).await.is_err());
+        assert!(runtime.state().failures.is_empty());
+        assert_failed_activation_is_fenced_and_retryable(
+            &runtime,
+            &recovered,
+            &installed,
+            "quiescence",
+        )
+        .await;
+        assert_activation_retry_forwards(&runtime, &recovered, installed, &device, "quiescence")
+            .await;
+    }
+
+    /// The host sequence window follows the helper contract: it is dropped
+    /// only after the runtime reports that activation reset and enabled a
+    /// fresh kernel source. A failed activation keeps it.
+    #[tokio::test]
+    async fn cleanup_only_activation_drops_the_host_sequence_window_only_after_success() {
+        let runtime = Arc::new(FakeRuntime::new());
+        let (recovered, _installed, device) = acquired_cleanup_only_device(&runtime).await;
+        let retained = |backend: &EbpfGtpuDataplaneBackend| {
+            backend
+                .inner
+                .traffic_observation_sequences
+                .lock()
+                .unwrap()
+                .get(&S2BU_IFINDEX)
+                .map(|window| window.high_water)
+        };
+        recovered
+            .inner
+            .traffic_observation_sequences
+            .lock()
+            .unwrap()
+            .insert(
+                S2BU_IFINDEX,
+                TrafficObservationSequenceWindow {
+                    high_water: 7,
+                    ..TrafficObservationSequenceWindow::default()
+                },
+            );
+        runtime.fail_in_order(["activate_cleanup_only_graph_identity"]);
+        assert!(recovered.activate_cleanup_recovery(&device).await.is_err());
+        assert_eq!(
+            retained(&recovered),
+            Some(7),
+            "a failed activation must not drop the host high-water"
+        );
+        recovered.activate_cleanup_recovery(&device).await.unwrap();
+        assert_eq!(
+            retained(&recovered),
+            None,
+            "a successful activation drops the host high-water"
+        );
     }
 
     #[tokio::test]
