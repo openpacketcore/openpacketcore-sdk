@@ -657,3 +657,80 @@ async fn grouped_stale_generation_and_unusable_datapath_fail_closed() {
         GtpuDownlinkDrop::StateUnavailable
     );
 }
+
+fn ordinary_ipv6_context() -> GtpPdpContext {
+    GtpPdpContext {
+        ms_address: IpAddr::V6("2001:db8:45:1::".parse().unwrap()),
+        ..context()
+    }
+}
+
+/// An ordinary attachment carries an inner-IPv6 context in the family-tagged
+/// authority with its own published configuration (#998). A reassembled
+/// G-PDU for it must decapsulate exactly as tc does, and nothing outside its
+/// /64 or without that authority may.
+#[tokio::test]
+async fn ordinary_inner_ipv6_context_decapsulates_through_its_family_authority() {
+    let (backend, runtime) = ordinary_fixture(context()).await;
+    backend
+        .install_pdp_context(ordinary_ipv6_context())
+        .await
+        .unwrap();
+    let mut counters = GtpuDownlinkCounters::default();
+    let inside = inner_ipv6("2001:db8:45:1::abcd".parse().unwrap(), b"ordinary v6");
+    let GtpuDownlinkEvent::Decapsulated(decapsulated) = process(
+        &runtime,
+        ordinary_scope(),
+        gpdu(LOCAL_TEID, &inside),
+        &mut counters,
+    ) else {
+        panic!("an ordinary inner-IPv6 G-PDU must decapsulate");
+    };
+    assert_eq!(decapsulated.inner_packet(), inside.as_slice());
+    assert_eq!(decapsulated.family(), crate::GtpAddressFamily::Ipv6);
+    assert_eq!(decapsulated.bearer_mark(), None);
+    // The IPv4 context on the same TEID is unaffected.
+    assert!(matches!(
+        process(
+            &runtime,
+            ordinary_scope(),
+            gpdu(LOCAL_TEID, &inner_ipv4(UE, b"v4")),
+            &mut counters
+        ),
+        GtpuDownlinkEvent::Decapsulated(_)
+    ));
+    // Outside the /64 fails the family authority.
+    assert_eq!(
+        expect_drop(process(
+            &runtime,
+            ordinary_scope(),
+            gpdu(
+                LOCAL_TEID,
+                &inner_ipv6("2001:db8:45:2::1".parse().unwrap(), b"outside")
+            ),
+            &mut counters,
+        )),
+        GtpuDownlinkDrop::BindingMismatch(DownlinkBindingMismatch::Invalid)
+    );
+    // After family-scoped removal the IPv6 T-PDU reaches the IPv4-only v5
+    // path, which (like tc) treats it as malformed.
+    backend
+        .remove_pdp_context(RemovePdpContextRequest {
+            local_teid: teid(LOCAL_TEID),
+            link_ifindex: S2BU_IFINDEX,
+            gtp_version: GtpVersion::V1,
+            address_family: GtpAddressFamily::Ipv6,
+        })
+        .await
+        .unwrap();
+    assert_eq!(
+        expect_drop(process(
+            &runtime,
+            ordinary_scope(),
+            gpdu(LOCAL_TEID, &inside),
+            &mut counters,
+        )),
+        GtpuDownlinkDrop::Malformed
+    );
+    assert_eq!(counters.decapsulated, 2);
+}
