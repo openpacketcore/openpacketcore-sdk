@@ -3074,6 +3074,15 @@ impl SessionConsensusPeer for RemoteSessionConsensusPeer {
         Some(self.binding.consensus_identity())
     }
 
+    fn local_credentials_admit_connections(&self) -> bool {
+        self.tls_config.as_ref().is_none_or(|config| {
+            crate::lifecycle::local_material_admits_connections(
+                config.material_status(),
+                self.lifecycle_policy,
+            )
+        })
+    }
+
     async fn call(
         &self,
         request: SessionConsensusWireRequest,

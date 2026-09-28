@@ -1212,6 +1212,36 @@ impl ConnectionLifecycle {
     }
 }
 
+/// Whether local material could authenticate a connection established now
+/// that would not already be due for retirement.
+///
+/// The material must be usable, and the earlier of its leaf and chain
+/// expiries must lie beyond the rotation drain window. A connection
+/// established inside that window is retired as soon as it is admitted, so
+/// such material admits no usable connection even before it expires.
+pub(crate) fn local_material_admits_connections(
+    status: opc_tls::TlsMaterialStatus,
+    policy: ConnectionLifecyclePolicy,
+) -> bool {
+    if !matches!(
+        status.availability(),
+        opc_tls::TlsMaterialAvailability::Ready
+            | opc_tls::TlsMaterialAvailability::RetainingLastGood
+    ) {
+        return false;
+    }
+    let (Some(leaf), Some(chain)) = (
+        status.leaf_expires_at(),
+        status.certificate_chain_expires_at(),
+    ) else {
+        return false;
+    };
+    let now = TlsCompletionTime::now();
+    wall_expiry_deadline(leaf.min(chain), now)
+        .checked_sub(policy.rotation_drain_window())
+        .is_some_and(|retire_at| retire_at > now.instant())
+}
+
 pub(crate) fn wall_expiry_deadline(
     expiry: opc_types::Timestamp,
     completed: TlsCompletionTime,

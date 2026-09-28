@@ -1399,6 +1399,7 @@ impl ConsensusSessionStore {
             .load_retained_transitions(&membership_scope)
             .map_err(|_| ConsensusSessionStoreOpenError::StorageUnavailable)?;
         let config = Arc::new(session_raft_config()?);
+        let election_admission = election_admission::ElectionAdmission::new(config.enable_elect);
         let raft = SessionRaft::new(local_node_id, config, network, log_store, state_machine)
             .await
             .map_err(|_| ConsensusSessionStoreOpenError::EngineUnavailable)?;
@@ -1441,6 +1442,7 @@ impl ConsensusSessionStore {
             FencedTransitionV2StatusBatchSupervisor::new();
         let inner = Arc::new(ConsensusSessionStoreInner {
             raft,
+            election_admission,
             persistence: SessionPersistenceMode::Durable,
             persistence_protocol: PersistenceProtocol::default(),
             storage_shutdown,
@@ -1492,6 +1494,7 @@ impl ConsensusSessionStore {
             accepted_receiver_test_outcomes: Mutex::new(VecDeque::new()),
         });
         LogicalReadTimeSupervisor::start(logical_read_time_receiver, Arc::downgrade(&inner));
+        election_admission::ElectionAdmission::start_monitor(Arc::downgrade(&inner));
         FencedTransitionV2StatusLogicalTimeIngressSupervisor::start(
             fenced_transition_v2_status_logical_time_ingress_receiver,
             Arc::downgrade(&inner),

@@ -322,6 +322,10 @@ impl SessionConsensusPeer for QualificationGatedConsensusPeer {
         self.inner.scope_identity()
     }
 
+    fn local_credentials_admit_connections(&self) -> bool {
+        self.inner.local_credentials_admit_connections()
+    }
+
     async fn call(
         &self,
         request: SessionConsensusWireRequest,

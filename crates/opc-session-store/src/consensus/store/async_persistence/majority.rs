@@ -515,7 +515,9 @@ impl ConsensusSessionStore {
             selection: None,
             proposal: None,
         });
-        self.inner.raft.runtime_config().elect(false);
+        self.inner
+            .election_admission
+            .set_engine(&self.inner.raft, false);
         self.inner.raft.runtime_config().heartbeat(false);
         protocol
             .prepare_recovery_before(bound.plan(), bound.era(), deadline, || async {
@@ -980,7 +982,9 @@ impl ConsensusSessionStore {
         {
             return Err(SessionConsensusPeerError::Rejected);
         }
-        self.inner.raft.runtime_config().elect(true);
+        self.inner
+            .election_admission
+            .set_engine(&self.inner.raft, true);
         self.inner.raft.runtime_config().heartbeat(true);
         Ok(Reply::Active)
     }

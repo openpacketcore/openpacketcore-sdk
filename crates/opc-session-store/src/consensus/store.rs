@@ -160,6 +160,7 @@ pub fn validate_consensus_physical_fenced_transition_request(
 }
 
 mod async_persistence;
+mod election_admission;
 mod membership;
 mod planned_shutdown;
 mod quorum_readiness;
@@ -1848,6 +1849,7 @@ impl ConsensusStoreDiagnosticCounters {
 
 struct ConsensusSessionStoreInner {
     raft: SessionRaft,
+    election_admission: election_admission::ElectionAdmission,
     persistence: SessionPersistenceMode,
     persistence_protocol: PersistenceProtocol,
     storage_shutdown: storage::ConsensusStorageShutdownObserver,
@@ -3120,7 +3122,9 @@ impl ConsensusSessionStore {
     #[cfg(feature = "test-control")]
     #[doc(hidden)]
     pub fn set_automatic_election_for_test(&self, enabled: bool) {
-        self.inner.raft.runtime_config().elect(enabled);
+        self.inner
+            .election_admission
+            .set_engine(&self.inner.raft, enabled);
     }
 
     /// Ask Openraft to start one normal campaign for deterministic integration
@@ -3460,6 +3464,7 @@ impl ConsensusSessionStore {
             .map_err(|_| ConsensusSessionStoreOpenError::StorageUnavailable)?;
         let mut config = session_raft_config()?;
         config.enable_elect = persistence_protocol.is_active();
+        let election_admission = election_admission::ElectionAdmission::new(config.enable_elect);
         let config = Arc::new(config);
         let raft = SessionRaft::new(local_node_id, config, network, log_store, state_machine)
             .await
@@ -3520,6 +3525,7 @@ impl ConsensusSessionStore {
 
         let inner = Arc::new(ConsensusSessionStoreInner {
             raft,
+            election_admission,
             persistence,
             persistence_protocol,
             storage_shutdown,
@@ -3571,6 +3577,7 @@ impl ConsensusSessionStore {
             accepted_receiver_test_outcomes: Mutex::new(VecDeque::new()),
         });
         LogicalReadTimeSupervisor::start(logical_read_time_receiver, Arc::downgrade(&inner));
+        election_admission::ElectionAdmission::start_monitor(Arc::downgrade(&inner));
         FencedTransitionV2StatusLogicalTimeIngressSupervisor::start(
             fenced_transition_v2_status_logical_time_ingress_receiver,
             Arc::downgrade(&inner),
@@ -3705,6 +3712,7 @@ impl ConsensusSessionStore {
             .load_retained_transitions(&membership_scope)
             .map_err(|_| ConsensusSessionStoreOpenError::StorageUnavailable)?;
         let config = Arc::new(session_raft_config()?);
+        let election_admission = election_admission::ElectionAdmission::new(config.enable_elect);
         let raft = SessionRaft::new(local_node_id, config, network, log_store, state_machine)
             .await
             .map_err(|_| ConsensusSessionStoreOpenError::EngineUnavailable)?;
@@ -3749,6 +3757,7 @@ impl ConsensusSessionStore {
 
         let inner = Arc::new(ConsensusSessionStoreInner {
             raft,
+            election_admission,
             persistence: SessionPersistenceMode::Durable,
             persistence_protocol: PersistenceProtocol::default(),
             storage_shutdown,
@@ -3800,6 +3809,7 @@ impl ConsensusSessionStore {
             accepted_receiver_test_outcomes: Mutex::new(VecDeque::new()),
         });
         LogicalReadTimeSupervisor::start(logical_read_time_receiver, Arc::downgrade(&inner));
+        election_admission::ElectionAdmission::start_monitor(Arc::downgrade(&inner));
         FencedTransitionV2StatusLogicalTimeIngressSupervisor::start(
             fenced_transition_v2_status_logical_time_ingress_receiver,
             Arc::downgrade(&inner),

@@ -260,7 +260,9 @@ impl ConsensusSessionStore {
             .await
             .map_err(|_| ConsensusSessionStoreOpenError::RecoveryRequired)?;
         if active {
-            self.inner.raft.runtime_config().elect(true);
+            self.inner
+                .election_admission
+                .set_engine(&self.inner.raft, true);
         }
         Ok(active)
     }
