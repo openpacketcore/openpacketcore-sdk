@@ -343,6 +343,19 @@ pub trait ConsensusPeer: Send + Sync + std::fmt::Debug {
         None
     }
 
+    /// Whether the local credentials this transport presents can currently
+    /// establish a new authenticated connection to the peer.
+    ///
+    /// A voter whose credentials admit no connection to a quorum cannot win
+    /// an election. Each campaign it starts only raises its term, and that
+    /// higher term later forces the healthy leader to step down when the
+    /// voter rejoins. The consensus store therefore suspends timer-driven
+    /// elections while this is `false` for too many peers. Transports without
+    /// a credential lifecycle keep the default `true`.
+    fn local_credentials_admit_connections(&self) -> bool {
+        true
+    }
+
     /// Send one scoped call under one complete logical deadline.
     async fn call(
         &self,

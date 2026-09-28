@@ -149,6 +149,7 @@ struct InProcessConsensusPeer {
     scope: Option<SessionConsensusIdentity>,
     handler: Arc<tokio::sync::RwLock<Option<Arc<dyn SessionConsensusRpcHandler>>>>,
     online: Arc<AtomicBool>,
+    local_credentials_admitted: Arc<AtomicBool>,
     ordinary_read_barrier_online: Arc<AtomicBool>,
     rejected_ordinary_read_barriers: Arc<AtomicUsize>,
     #[cfg(feature = "test-control")]
@@ -162,6 +163,7 @@ impl InProcessConsensusPeer {
             scope: None,
             handler: Arc::new(tokio::sync::RwLock::new(None)),
             online: Arc::new(AtomicBool::new(true)),
+            local_credentials_admitted: Arc::new(AtomicBool::new(true)),
             ordinary_read_barrier_online: Arc::new(AtomicBool::new(true)),
             rejected_ordinary_read_barriers: Arc::new(AtomicUsize::new(0)),
             #[cfg(feature = "test-control")]
@@ -196,6 +198,10 @@ impl SessionConsensusPeer for InProcessConsensusPeer {
 
     fn node_id(&self) -> SessionConsensusNodeId {
         self.node_id
+    }
+
+    fn local_credentials_admit_connections(&self) -> bool {
+        self.local_credentials_admitted.load(Ordering::SeqCst)
     }
 
     async fn call(
@@ -465,6 +471,22 @@ impl ConsensusTestCluster {
         for ((source, target), path) in &self.paths {
             if *source == index || *target == index {
                 path.set_online(online);
+            }
+        }
+    }
+
+    /// Model whether one member's local credentials admit new authenticated
+    /// connections, as a transport with a credential lifecycle reports it.
+    /// This changes no path's connectivity.
+    pub fn set_local_credentials_admitted(&self, index: usize, admitted: bool) {
+        assert!(
+            index < self.stores.len(),
+            "consensus test node does not exist"
+        );
+        for ((source, _), path) in &self.paths {
+            if *source == index {
+                path.local_credentials_admitted
+                    .store(admitted, Ordering::SeqCst);
             }
         }
     }
