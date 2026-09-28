@@ -10443,6 +10443,11 @@ impl EbpfGtpuDataplaneBackend {
                 return Err(GtpuError::AlreadyExists);
             }
         }
+        // Activation starts a fresh kernel traffic source before it enables
+        // the gate, so drop the host high-water first. Acquisition already
+        // reset it and the gate stayed even since, so a failed activation
+        // loses no accepted sequence.
+        self.reset_traffic_sequence_source(device.ifindex)?;
         self.inner.runtime.activate_cleanup_only(
             &device.name,
             device.ifindex,
@@ -40804,12 +40809,48 @@ mod aya_runtime {
             if !tft_classifier_schema_is_current(&Self::tft_schema_slot(&device.ebpf)?) {
                 return Err(state_indeterminate("ebpf_cleanup_schema"));
             }
+            // Cleanup-only acquisition left the retained traffic gate at an
+            // even, packet-inert incarnation. Start a fresh source incarnation
+            // while the hooks are still fenced, attach, then prove quiescence
+            // and enable it exactly as ordinary adoption does; otherwise the
+            // reattached programs would pass every packet unchanged.
+            let traffic_observation_gate =
+                Self::reset_traffic_observation_source(&mut device.ebpf)?;
             let attached = self.attach_programs_by_ifindex(
                 &mut device.ebpf,
                 ifindex,
                 &device.pin_dir,
                 tc_priority,
             )?;
+            if let Err(error) = Self::verify_traffic_observation_source_quiescent(
+                &mut device.ebpf,
+                traffic_observation_gate,
+            )
+            .and_then(|()| {
+                Self::enable_traffic_observation_source(&mut device.ebpf, traffic_observation_gate)
+            }) {
+                // Keep the device cleanup-only and fenced: restore the even
+                // gate and always detach the hooks this call attached, even
+                // when they replaced an exact predecessor, so no attachment
+                // survives behind a gate that may still be odd. Any failed
+                // step, or a replaced predecessor, is indeterminate.
+                let gate_restored = Self::disable_traffic_observation_source_exact(
+                    &mut device.ebpf,
+                    traffic_observation_gate,
+                );
+                let detached = detach_datapath_if_current(
+                    attached.links,
+                    &attached.identity,
+                    ifindex,
+                    tc_priority,
+                );
+                return Err(error_after_rollback(
+                    error,
+                    detached.and(gate_restored),
+                    attached.replaced_existing,
+                    "ebpf_activate_cleanup_only",
+                ));
+            }
             device.datapath_identity = attached.identity;
             device.links = Some(attached.links);
             device.cleanup_only = false;
@@ -58299,11 +58340,11 @@ mod tests {
                     operation: "ebpf_cleanup_schema",
                 });
             }
-            // Model the attach failure before clearing cleanup-only so a
-            // failed activation leaves the device fenced and retryable,
-            // matching the real runtime's error semantics.
+            // Mirror the production order: a fresh even source incarnation
+            // while fenced, attach, then enable the gate. A failure at any
+            // step leaves the device fenced, cleanup-only and retryable.
+            Self::reset_traffic_observation_source(&mut state, [ifindex])?;
             Self::fail_if_requested(&mut state, "activate_cleanup_only_attach")?;
-            state.cleanup_only.remove(&ifindex);
             state.uplink_filter_ready.insert(ifindex);
             state.downlink_filter_ready.insert(ifindex);
             state
@@ -58312,6 +58353,30 @@ mod tests {
             state
                 .downlink_filter_pin_dir
                 .insert(ifindex, pin_dir.to_path_buf());
+            let enabled = state
+                .traffic_observation_gate
+                .get(&ifindex)
+                .copied()
+                .and_then(|disabled| disabled.checked_add(1));
+            if let Err(error) = Self::enable_traffic_observation_source(&mut state, ifindex) {
+                // Restore through the exact disable path, then detach
+                // regardless; a failed restore is indeterminate.
+                let gate_restored = enabled.map_or_else(
+                    || Err(state_indeterminate("traffic_observation_disable")),
+                    |enabled| {
+                        Self::disable_traffic_observation_source_exact(&mut state, ifindex, enabled)
+                    },
+                );
+                state.uplink_filter_ready.remove(&ifindex);
+                state.downlink_filter_ready.remove(&ifindex);
+                state.uplink_filter_pin_dir.remove(&ifindex);
+                state.downlink_filter_pin_dir.remove(&ifindex);
+                return Err(match gate_restored {
+                    Ok(()) => error,
+                    Err(_) => state_indeterminate("ebpf_activate_cleanup_only"),
+                });
+            }
+            state.cleanup_only.remove(&ifindex);
             Ok(EbpfAttachmentDisposition::Retained)
         }
 
@@ -79273,6 +79338,159 @@ mod tests {
                 .unwrap(),
             PdpContextInstallOutcome::Installed
         );
+    }
+
+    /// Cleanup-only acquisition leaves the retained traffic gate at an even
+    /// (packet-inert) incarnation. Activation must re-enable it after the
+    /// hooks are attached, or the reattached programs pass every packet.
+    #[tokio::test]
+    async fn cleanup_only_activation_reenables_the_retained_traffic_gate() {
+        let (backend, runtime) = backend_with_fake();
+        let installed = create_device_with_context(&backend).await;
+        simulate_process_loss(&runtime, false);
+        let recovered = EbpfGtpuDataplaneBackend::with_runtime(runtime.clone());
+        assert_eq!(
+            recovered
+                .acquire_cleanup_only_recovery(cleanup_request(
+                    Ipv4Addr::new(192, 0, 2, 1),
+                    S2BU_IFINDEX,
+                ))
+                .await
+                .unwrap(),
+            RetainedGraphCleanupClassification::Acquired
+        );
+        let fenced_gate = runtime.state().traffic_observation_gate[&S2BU_IFINDEX];
+        assert!(fenced_gate != 0 && fenced_gate & 1 == 0);
+        recovered
+            .remove_pdp_context_exact(installed.clone())
+            .await
+            .unwrap();
+
+        let device = GtpDevice {
+            name: "s2bu".to_string(),
+            ifindex: S2BU_IFINDEX,
+        };
+        recovered.activate_cleanup_recovery(&device).await.unwrap();
+        let active_gate = runtime.state().traffic_observation_gate[&S2BU_IFINDEX];
+        assert!(
+            active_gate & 1 == 1 && active_gate > fenced_gate,
+            "activation must enable a fresh traffic gate: {fenced_gate} -> {active_gate}"
+        );
+        assert_eq!(
+            recovered
+                .install_pdp_context_classified(installed)
+                .await
+                .unwrap(),
+            PdpContextInstallOutcome::Installed
+        );
+    }
+
+    /// A failed gate enable rolls activation back: the hooks are detached
+    /// again, the gate is even, the device stays cleanup-only and fenced, and
+    /// a retry activates it.
+    #[tokio::test]
+    async fn cleanup_only_activation_rolls_back_when_the_traffic_gate_cannot_be_enabled() {
+        let (backend, runtime) = backend_with_fake();
+        let installed = create_device_with_context(&backend).await;
+        simulate_process_loss(&runtime, false);
+        let recovered = EbpfGtpuDataplaneBackend::with_runtime(runtime.clone());
+        assert_eq!(
+            recovered
+                .acquire_cleanup_only_recovery(cleanup_request(
+                    Ipv4Addr::new(192, 0, 2, 1),
+                    S2BU_IFINDEX,
+                ))
+                .await
+                .unwrap(),
+            RetainedGraphCleanupClassification::Acquired
+        );
+        recovered
+            .remove_pdp_context_exact(installed.clone())
+            .await
+            .unwrap();
+        let device = GtpDevice {
+            name: "s2bu".to_string(),
+            ifindex: S2BU_IFINDEX,
+        };
+
+        runtime.fail_after_in_order(["traffic_observation_enable"]);
+        assert!(recovered.activate_cleanup_recovery(&device).await.is_err());
+        {
+            let state = runtime.state();
+            assert!(!state.uplink_filter_ready.contains(&S2BU_IFINDEX));
+            assert!(!state.downlink_filter_ready.contains(&S2BU_IFINDEX));
+            assert!(state.cleanup_only.contains(&S2BU_IFINDEX));
+            let gate = state.traffic_observation_gate[&S2BU_IFINDEX];
+            assert!(
+                gate != 0 && gate & 1 == 0,
+                "rollback must leave the gate even: {gate}"
+            );
+        }
+        assert!(matches!(
+            recovered
+                .install_pdp_context_classified(installed.clone())
+                .await
+                .unwrap(),
+            PdpContextInstallOutcome::Indeterminate(
+                PdpContextIndeterminateReason::AuthorityUnavailable
+            )
+        ));
+
+        recovered.activate_cleanup_recovery(&device).await.unwrap();
+        let gate = runtime.state().traffic_observation_gate[&S2BU_IFINDEX];
+        assert_eq!(gate & 1, 1);
+        assert!(runtime.state().uplink_filter_ready.contains(&S2BU_IFINDEX));
+        assert_eq!(
+            recovered
+                .install_pdp_context_classified(installed)
+                .await
+                .unwrap(),
+            PdpContextInstallOutcome::Installed
+        );
+    }
+
+    /// If the gate cannot be restored to even after a failed enable, the
+    /// hooks are still detached and the outcome is indeterminate: the device
+    /// never keeps attached hooks behind a possibly odd gate.
+    #[tokio::test]
+    async fn cleanup_only_activation_detaches_when_the_gate_cannot_be_restored() {
+        let (backend, runtime) = backend_with_fake();
+        let installed = create_device_with_context(&backend).await;
+        simulate_process_loss(&runtime, false);
+        let recovered = EbpfGtpuDataplaneBackend::with_runtime(runtime.clone());
+        assert_eq!(
+            recovered
+                .acquire_cleanup_only_recovery(cleanup_request(
+                    Ipv4Addr::new(192, 0, 2, 1),
+                    S2BU_IFINDEX,
+                ))
+                .await
+                .unwrap(),
+            RetainedGraphCleanupClassification::Acquired
+        );
+        recovered
+            .remove_pdp_context_exact(installed.clone())
+            .await
+            .unwrap();
+        let device = GtpDevice {
+            name: "s2bu".to_string(),
+            ifindex: S2BU_IFINDEX,
+        };
+
+        runtime.fail_after_in_order(["traffic_observation_enable"]);
+        runtime.fail_in_order(["traffic_observation_disable"]);
+        assert!(matches!(
+            recovered.activate_cleanup_recovery(&device).await,
+            Err(GtpuError::StateIndeterminate { .. })
+        ));
+        let state = runtime.state();
+        assert!(
+            state.failures.is_empty(),
+            "the gate restore must be attempted"
+        );
+        assert!(!state.uplink_filter_ready.contains(&S2BU_IFINDEX));
+        assert!(!state.downlink_filter_ready.contains(&S2BU_IFINDEX));
+        assert!(state.cleanup_only.contains(&S2BU_IFINDEX));
     }
 
     #[tokio::test]
