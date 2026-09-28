@@ -334,10 +334,26 @@ impl CapacityRecordBinding {
         key: &AuditKey,
         profile: ConfigCapacityProfile,
     ) -> Result<(), PersistError> {
+        self.verify_borrowed_and_digest(record, identity, key, profile)
+            .map(|_| ())
+    }
+
+    /// Return the ciphertext digest computed while authenticating this exact
+    /// borrowed record. A pinned history read may also consume it in its chain;
+    /// the scalar is not authority for any later read or mutation.
+    pub(super) fn verify_borrowed_and_digest(
+        &self,
+        record: ConfigRecordView<'_>,
+        identity: ConfigConsensusIdentity,
+        key: &AuditKey,
+        profile: ConfigCapacityProfile,
+    ) -> Result<[u8; 32], PersistError> {
         self.validate_record(record, profile)?;
-        self.mac_borrowed(record, identity, key)?
+        let digest = ciphertext_digest(record.encrypted_blob);
+        self.mac_with_ciphertext_digest(record, identity, key, &digest)?
             .verify_slice(&self.tag)
-            .map_err(|_| invalid())
+            .map_err(|_| invalid())?;
+        Ok(digest)
     }
 
     pub(super) fn encode(self) -> [u8; RECORD_CAPACITY_BYTES] {
@@ -432,6 +448,19 @@ impl CapacityRecordBinding {
         identity: ConfigConsensusIdentity,
         key: &AuditKey,
     ) -> Result<Hmac<Sha256>, PersistError> {
+        let digest = ciphertext_digest(record.encrypted_blob);
+        self.mac_with_ciphertext_digest(record, identity, key, &digest)
+    }
+
+    // Private to the verifier/issuer above: callers cannot supply a digest in
+    // place of authenticating their current record bytes.
+    fn mac_with_ciphertext_digest(
+        &self,
+        record: ConfigRecordView<'_>,
+        identity: ConfigConsensusIdentity,
+        key: &AuditKey,
+        digest: &[u8; 32],
+    ) -> Result<Hmac<Sha256>, PersistError> {
         let envelope_bytes = u64::try_from(record.encrypted_blob.len()).map_err(|_| invalid())?;
         if record.plaintext_digest.len() != 32 {
             return Err(invalid());
@@ -446,10 +475,16 @@ impl CapacityRecordBinding {
         mac.update(record.tx_id.as_uuid().as_bytes());
         mac.update(&record.version.get().to_be_bytes());
         mac.update(&envelope_bytes.to_be_bytes());
-        mac.update(&Sha256::digest(record.encrypted_blob));
+        mac.update(digest);
         mac.update(record.plaintext_digest);
         Ok(mac)
     }
+}
+
+fn ciphertext_digest(encoded: &[u8]) -> [u8; 32] {
+    #[cfg(test)]
+    super::history::config_capacity_read_buffers::observe_ciphertext_hash(1, encoded.len());
+    Sha256::digest(encoded).into()
 }
 
 /// The general borrowed envelope parser owns its key-ID string before that

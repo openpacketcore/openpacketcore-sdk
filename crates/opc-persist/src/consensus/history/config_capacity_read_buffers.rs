@@ -11,10 +11,23 @@ pub(in crate::consensus) struct Sample {
     pub peak_owned_ciphertext: usize,
     pub fixed_width_calls: [usize; 9],
     pub peak_owned_fixed_width: [usize; 9],
+    // Actual ciphertext hash inputs: independent chain scan; record proof.
+    pub ciphertext_hashes: [usize; 2],
+    pub ciphertext_hash_bytes: [usize; 2],
 }
 
 thread_local! {
     static CURRENT: Cell<Option<Sample>> = const { Cell::new(None) };
+}
+
+pub(in crate::consensus) fn observe_ciphertext_hash(site: usize, bytes: usize) {
+    CURRENT.with(|current| {
+        if let Some(mut sample) = current.get() {
+            sample.ciphertext_hashes[site] += 1;
+            sample.ciphertext_hash_bytes[site] += bytes;
+            current.set(Some(sample));
+        }
+    });
 }
 
 pub(in crate::consensus) trait CiphertextBuffer {
