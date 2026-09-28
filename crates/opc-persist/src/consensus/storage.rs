@@ -265,6 +265,8 @@ impl ConfigDurableProgress {
             self.committed_index
                 .store(committed.index, Ordering::Release);
             self.committed_present.store(true, Ordering::Release);
+            #[cfg(feature = "dangerous-test-hooks")]
+            super::completion_observation::frontier(self, committed.index);
         } else {
             self.committed_present.store(false, Ordering::Release);
             self.committed_index.store(0, Ordering::Release);
@@ -1243,6 +1245,9 @@ impl RaftStateMachine<ConfigRaftTypeConfig> for SqliteConfigStateMachine {
         } else {
             tokio::time::Instant::now() + std::time::Duration::from_secs(30)
         };
+        #[cfg(feature = "dangerous-test-hooks")]
+        let mut completion_observation =
+            super::completion_observation::ApplyCall::new(&self.core.durable_progress);
         let mut incoming = entries.into_iter();
         let mut pending = Vec::new();
         let mut responses = Vec::new();
@@ -1278,12 +1283,16 @@ impl RaftStateMachine<ConfigRaftTypeConfig> for SqliteConfigStateMachine {
             let apply_observation = apply_origin.map(|origin| (origin, collected.len()));
             #[cfg(test)]
             config_capacity_apply_observations::record(apply_observation, "queued");
+            #[cfg(feature = "dangerous-test-hooks")]
+            let completion_batch = completion_observation.queued(&collected, deadline);
             let (applied, remainder, last_applied) = self
                 .core
                 .run_sqlite_cancellable_until(deadline, move |conn, cancellation| {
                     #[cfg(test)]
                     let _observation =
                         config_capacity_apply_observations::Scope::enter(apply_observation);
+                    #[cfg(feature = "dangerous-test-hooks")]
+                    let _completion_scope = completion_batch.enter_worker(conn);
                     let (collected, remainder) = {
                         #[cfg(all(test, target_os = "linux"))]
                         let _sizing_observation =
@@ -1328,6 +1337,8 @@ impl RaftStateMachine<ConfigRaftTypeConfig> for SqliteConfigStateMachine {
                 })?;
             #[cfg(test)]
             config_capacity_apply_observations::record(apply_observation, "await_returned");
+            #[cfg(feature = "dangerous-test-hooks")]
+            completion_observation.native_returned(&completion_batch, last_applied);
             responses.extend(applied);
             pending = remainder;
             if bounded {
@@ -1346,6 +1357,8 @@ impl RaftStateMachine<ConfigRaftTypeConfig> for SqliteConfigStateMachine {
             // or caller success is claimed for a failed apply operation.
             self.core.durable_progress.notify_applied();
         }
+        #[cfg(feature = "dangerous-test-hooks")]
+        completion_observation.returned();
         Ok(responses)
     }
 

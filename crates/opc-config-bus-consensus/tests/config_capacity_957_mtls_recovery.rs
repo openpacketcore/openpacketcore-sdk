@@ -1271,26 +1271,59 @@ async fn run_recovery(profile: ConfigCapacityProfile) {
         *addresses[source].write().expect("new address publication") = Some(address);
         servers.push(server);
     }
-    tokio::time::timeout(DURABLE_CONSENSUS_OPERATION_TIMEOUT, async {
+    let readmission_trace = phase_trace::Session::start(
+        match profile {
+            ConfigCapacityProfile::Legacy => "ordinary_legacy_retained_readmission",
+            ConfigCapacityProfile::BoundedV1 => "ordinary_bounded_retained_readmission",
+            _ => unreachable!("fixed native fixture profiles"),
+        },
+        &stores,
+    );
+    let readmission_result = tokio::time::timeout(DURABLE_CONSENSUS_OPERATION_TIMEOUT, async {
         let (one, two, three) = tokio::join!(
-            stores[0].initialize_cluster(),
-            stores[1].initialize_cluster(),
-            stores[2].initialize_cluster(),
+            phase_trace::api_call(
+                "retained_initialize_0",
+                stores[0].initialize_cluster(),
+                phase_trace::initialization,
+            ),
+            phase_trace::api_call(
+                "retained_initialize_1",
+                stores[1].initialize_cluster(),
+                phase_trace::initialization,
+            ),
+            phase_trace::api_call(
+                "retained_initialize_2",
+                stores[2].initialize_cluster(),
+                phase_trace::initialization,
+            ),
         );
         one.expect("first retained voter readmission");
         two.expect("second retained voter readmission");
         three.expect("third retained voter readmission");
         let (one, two, three) = tokio::join!(
-            stores[0].probe_durable_readiness(),
-            stores[1].probe_durable_readiness(),
-            stores[2].probe_durable_readiness(),
+            phase_trace::api_call(
+                "retained_readiness_0",
+                stores[0].probe_durable_readiness(),
+                phase_trace::persist,
+            ),
+            phase_trace::api_call(
+                "retained_readiness_1",
+                stores[1].probe_durable_readiness(),
+                phase_trace::persist,
+            ),
+            phase_trace::api_call(
+                "retained_readiness_2",
+                stores[2].probe_durable_readiness(),
+                phase_trace::persist,
+            ),
         );
         one.expect("first retained voter ready");
         two.expect("second retained voter ready");
         three.expect("third retained voter ready");
     })
-    .await
-    .expect("retained readmission inside original operation budget");
+    .await;
+    readmission_trace.finish();
+    readmission_result.expect("retained readmission inside original operation budget");
     let retained_leader = stores[0]
         .status()
         .leader_id

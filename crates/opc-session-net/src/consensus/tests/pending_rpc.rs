@@ -1,4 +1,4 @@
-//! Actual pool waits and allocation identities; no native-operation claim.
+//! Actual pool/cold-acquisition waits and allocation identities; no native-operation claim.
 
 use super::*;
 use crate::consensus::capacity_observation::{
@@ -7,6 +7,218 @@ use crate::consensus::capacity_observation::{
 use std::collections::{BTreeMap, BTreeSet};
 use std::future::Future;
 use std::task::Waker;
+
+struct ResolverLifetime {
+    active: Arc<AtomicUsize>,
+    dropped: Arc<Notify>,
+}
+
+impl Drop for ResolverLifetime {
+    fn drop(&mut self) {
+        self.active.fetch_sub(1, Ordering::SeqCst);
+        self.dropped.notify_one();
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn pending_rpc_cold_acquisition_cancellation_and_timeout_conserve_payload() {
+    let observation = Arc::new(ConsensusBufferObservation::default());
+    let entered = Arc::new(Notify::new());
+    let dropped = Arc::new(Notify::new());
+    let active = Arc::new(AtomicUsize::new(0));
+    let resolver: RemoteAddrResolver = {
+        let entered = entered.clone();
+        let dropped = dropped.clone();
+        let active = active.clone();
+        Arc::new(move || {
+            let entered = entered.clone();
+            let dropped = dropped.clone();
+            let active = active.clone();
+            Box::pin(async move {
+                active.fetch_add(1, Ordering::SeqCst);
+                let _lifetime = ResolverLifetime { active, dropped };
+                entered.notify_one();
+                std::future::pending::<io::Result<SocketAddr>>().await
+            })
+        })
+    };
+    let (_, binding) = bindings();
+    let peer = RemoteSessionConsensusPeer::from_transport(
+        ConsensusTarget::resolved(&binding, resolver),
+        None,
+        binding,
+        None,
+    )
+    .with_buffer_observation(observation.clone());
+    let cancelled_request = request(&peer, ConsensusRpcFamily::ForwardMutation, 1_048_577, 137);
+    let timed_request = request(&peer, ConsensusRpcFamily::ReadBarrier, 19, 333);
+    let queued_request = request(&peer, ConsensusRpcFamily::Vote, 29, 555);
+    let expected = allocation_union([
+        &cancelled_request.payload,
+        &timed_request.payload,
+        &queued_request.payload,
+    ]);
+    let after_cancel_expected = allocation_union([&timed_request.payload, &queued_request.payload]);
+    let queued_capacity = queued_request.payload.capacity();
+    let source = peer.binding.local_consensus_node_id();
+    let target = peer.binding.remote_consensus_node_id();
+    let mut cancelled =
+        Box::pin(peer.call_with_timeout_inner(cancelled_request, Duration::from_secs(10)));
+    assert!(poll_once(cancelled.as_mut()).is_pending());
+    tokio::time::timeout(Duration::from_secs(1), entered.notified())
+        .await
+        .expect("the actual pending resolver starts before its physical setup deadline");
+    let mut timed =
+        Box::pin(peer.call_with_timeout_inner(timed_request, Duration::from_millis(300)));
+    let mut queued =
+        Box::pin(peer.call_with_timeout_inner(queued_request, Duration::from_secs(10)));
+    assert!(poll_once(timed.as_mut()).is_pending());
+    assert!(poll_once(queued.as_mut()).is_pending());
+    let waiting = observation.pending_snapshot();
+    drop(cancelled);
+    let after_cancel = observation.pending_snapshot();
+    // The released lane moves this actual caller from pool wait to cold wait.
+    // Both cold callers now join the original physical attempt.
+    assert!(poll_once(queued.as_mut()).is_pending());
+    let after_lane = observation.pending_snapshot();
+    tokio::time::advance(Duration::from_millis(300)).await;
+    let timed_result = timed.await;
+    let after_timeout = observation.pending_snapshot();
+    drop(queued);
+    let callers_drained = observation.pending_snapshot();
+    let physical_attempt_still_active = active.load(Ordering::SeqCst);
+    let permits = (
+        peer.connection_pool.primary.in_flight.available_permits(),
+        peer.connection_pool.overflow.in_flight.available_permits(),
+    );
+    drop(peer);
+    // The pool's real shutdown cancels the supervised physical attempt. Its
+    // lifetime is separate from the payload owners whose callers already left.
+    let resolver_drained = tokio::time::timeout(Duration::from_secs(1), dropped.notified()).await;
+    assert!(resolver_drained.is_ok());
+    assert_eq!(active.load(Ordering::SeqCst), 0);
+    assert_eq!(timed_result, Err(SessionConsensusPeerError::Timeout));
+    assert_eq!(permits, (1, 1));
+    assert_eq!(physical_attempt_still_active, 1);
+    assert_eq!(callers_drained, PendingRpcCensus::default());
+    assert_eq!(observation.pending_snapshot(), PendingRpcCensus::default());
+    assert_eq!(observation.snapshot().live, Default::default());
+    println!("CONFIG_CAPACITY_COLD_WAIT_LIFECYCLE cancelled=true timeout=true pool_to_cold=true lanes_released=2 physical_resolver_drained=true payloads_drained=true full_memory_bound=false");
+
+    assert_eq!(waiting.owners.len(), 3, "CONFIG_CAPACITY_COLD_OWNER_RED");
+    assert_eq!((waiting.rpc_allocations, waiting.rpc_bytes), expected);
+    assert_eq!(waiting.additional_rpc_bytes, expected.1);
+    assert_eq!(waiting.observed_rpc_bytes, expected.1);
+    for sample in [&waiting, &after_cancel, &after_lane, &after_timeout] {
+        assert!(sample.owners.iter().all(|owner| owner.source == source
+            && owner.target == target
+            && owner.generation == 0
+            && !owner.selected_append));
+    }
+    assert_eq!(
+        waiting
+            .owners
+            .iter()
+            .map(|owner| (owner.family, owner.phase))
+            .collect::<Vec<_>>(),
+        vec![
+            (
+                ConsensusRpcFamily::ForwardMutation,
+                PendingRpcPhase::ColdConnectionAcquire
+            ),
+            (
+                ConsensusRpcFamily::ReadBarrier,
+                PendingRpcPhase::ColdConnectionAcquire
+            ),
+            (ConsensusRpcFamily::Vote, PendingRpcPhase::PoolAcquire),
+        ],
+        "CONFIG_CAPACITY_COLD_PHASE_RED"
+    );
+    for sample in [&after_cancel, &after_lane] {
+        assert_eq!(sample.owners.len(), 2);
+        assert_eq!(
+            (sample.rpc_allocations, sample.rpc_bytes),
+            after_cancel_expected
+        );
+        assert_eq!(sample.observed_rpc_bytes, after_cancel_expected.1);
+    }
+    assert!(after_lane
+        .owners
+        .iter()
+        .all(|owner| owner.phase == PendingRpcPhase::ColdConnectionAcquire));
+    assert_eq!(after_timeout.owners.len(), 1);
+    assert_eq!(after_timeout.owners[0].family, ConsensusRpcFamily::Vote);
+    assert_eq!(
+        after_timeout.owners[0].phase,
+        PendingRpcPhase::ColdConnectionAcquire
+    );
+    assert_eq!(after_timeout.rpc_allocations, 1);
+    assert_eq!(after_timeout.rpc_bytes, queued_capacity);
+}
+
+#[cfg(feature = "insecure-test")]
+#[tokio::test]
+async fn pending_rpc_cold_bootstrap_handoff_counts_payload_once() {
+    let observation = Arc::new(ConsensusBufferObservation::default());
+    let (server_binding, client_binding) = bindings();
+    let handler = Arc::new(CountingHandler(AtomicUsize::new(0)));
+    let hook = ConsensusAcceptedSetupHook::new();
+    let mut server = SessionConsensusServer::new_insecure(handler.clone(), server_binding);
+    server.post_accept_setup_hook = Some(hook.clone());
+    let (handle, address) = server.listen("127.0.0.1:0".parse().unwrap()).await.unwrap();
+    let peer = RemoteSessionConsensusPeer::new_insecure(client_binding, address, None)
+        .with_buffer_observation(observation.clone());
+    let target = peer.binding.remote_consensus_node_id();
+    let request = request(&peer, ConsensusRpcFamily::InstallSnapshot, 257, 1_019);
+    let capacity = request.payload.capacity();
+    let expected_payload = request.payload.clone();
+    observation.hold_snapshot_writes(target);
+    let mut call = Box::pin(peer.call_with_timeout_inner(request, Duration::from_secs(10)));
+    let result = tokio::time::timeout(Duration::from_secs(10), async {
+        tokio::select! {
+            _ = &mut call => return Err("call ended before held bootstrap"),
+            () = hook.entered.notified() => {}
+        }
+        let cold = observation.pending_snapshot();
+        hook.release.notify_one();
+        tokio::select! {
+            _ = &mut call => return Err("call ended before held negotiated frame"),
+            () = observation.wait_for_snapshot_write(target) => {}
+        }
+        let negotiated_pending = observation.pending_snapshot();
+        let negotiated = observation.snapshot().live;
+        observation.release_snapshot_writes();
+        let response = (&mut call).await;
+        Ok((cold, negotiated_pending, negotiated, response))
+    })
+    .await;
+    observation.release_snapshot_writes();
+    drop(call);
+    drop(peer);
+    handle.abort_and_drain_handlers_for_test().await;
+    let drained = observation.pending_snapshot();
+    assert_eq!(drained, PendingRpcCensus::default());
+    assert_eq!(observation.snapshot().live, Default::default());
+    println!("CONFIG_CAPACITY_COLD_HANDOFF_LIFECYCLE listener_connections_joined=true handlers_drained=true payloads_drained=true full_memory_bound=false");
+
+    let (cold, pending, negotiated, response) = result.unwrap().unwrap();
+    assert_eq!(cold.owners.len(), 1, "CONFIG_CAPACITY_COLD_HANDOFF_RED");
+    assert_eq!(cold.owners[0].phase, PendingRpcPhase::ColdConnectionAcquire);
+    assert_eq!(cold.owners[0].family, ConsensusRpcFamily::InstallSnapshot);
+    assert_eq!(cold.rpc_allocations, 1);
+    assert_eq!(cold.rpc_bytes, capacity);
+    assert_eq!(cold.observed_rpc_bytes, capacity);
+    assert!(pending.owners.is_empty());
+    assert_eq!(pending.rpc_bytes, 0);
+    assert_eq!(pending.additional_rpc_bytes, 0);
+    assert_eq!(pending.observed_rpc_bytes, capacity);
+    assert_eq!(negotiated.calls, 1);
+    assert_eq!(negotiated.rpc_bytes, capacity);
+    assert_eq!(negotiated.ready_frames, 1);
+    assert!(negotiated.frame_bytes > 0);
+    assert_eq!(response.unwrap().result, Ok(expected_payload));
+    assert_eq!(handler.0.load(Ordering::Relaxed), 1);
+}
 
 fn peer(observation: Arc<ConsensusBufferObservation>) -> RemoteSessionConsensusPeer {
     let (_, binding) = bindings();

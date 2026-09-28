@@ -440,6 +440,23 @@ impl fmt::Debug for ConsensusConfigStore {
 }
 
 impl ConsensusConfigStore {
+    /// Observe only metadata for one exact audited request on this native node.
+    /// Qualification only; registration owns no storage or mutation authority.
+    #[cfg(feature = "dangerous-test-hooks")]
+    #[doc(hidden)]
+    pub fn observe_capacity_completion_for_test(
+        &self,
+        prepared: &super::PreparedAuditedMutation,
+        origin: std::time::Instant,
+    ) -> Option<super::completion_observation::Registration<'_>> {
+        super::completion_observation::Registration::new(
+            &self.inner.durable_progress,
+            self.inner.local_node_id,
+            derive_durable_request_id(self.inner.identity, b"audit-config", &prepared.handle().mac),
+            origin,
+        )
+    }
+
     /// Attach a metadata-only native owner bridge to one exact audited mutation.
     /// Qualification only; the callback must not retain commands or storage.
     #[cfg(feature = "dangerous-test-hooks")]
@@ -1755,6 +1772,12 @@ impl ConsensusConfigStore {
             Ok(observer) => observer,
             Err(_) => return Ok(ForwardMutationReply::Unavailable),
         };
+        #[cfg(feature = "dangerous-test-hooks")]
+        let completion_observation = super::completion_observation::submission(
+            &self.inner.durable_progress,
+            command.request_id,
+            deadline,
+        );
         if let Some(admission) = admission {
             // No await intervenes between this last deadline/session check and
             // polling enqueue. Once polling starts, preserve possible acceptance
@@ -1795,6 +1818,14 @@ impl ConsensusConfigStore {
         }
         #[cfg(all(test, target_os = "linux"))]
         drop(proposal_test_guard);
+        #[cfg(feature = "dangerous-test-hooks")]
+        if let Some(observation) = completion_observation {
+            observation.record(
+                super::completion_observation::Phase::EnqueueAccepted,
+                None,
+                None,
+            );
+        }
         // The returned receiver proves that Openraft accepted this durable
         // request ID. Supervision, not the originating RPC/client future,
         // owns admission until that exact accepted proposal resolves.
@@ -1805,6 +1836,16 @@ impl ConsensusConfigStore {
         let observed_response_lost = Arc::clone(&response_lost);
         let supervision = async move {
             let response = response.await;
+            #[cfg(feature = "dangerous-test-hooks")]
+            if let Some(observation) = completion_observation {
+                use super::completion_observation::Phase;
+                let (phase, index) = match &response {
+                    Ok(Ok(response)) => (Phase::EngineResponseOk, Some(response.log_id.index)),
+                    Ok(Err(_)) => (Phase::EngineResponseError, None),
+                    Err(_) => (Phase::EngineResponseLost, None),
+                };
+                observation.record(phase, index, None);
+            }
             let needs_storage_drain = response.is_err();
             #[cfg(test)]
             response_lost.store(needs_storage_drain, Ordering::SeqCst);
@@ -1826,6 +1867,21 @@ impl ConsensusConfigStore {
             };
             // Truthful response loss completes the caller independently of
             // storage cleanup. The observer cannot keep that storage alive.
+            #[cfg(feature = "dangerous-test-hooks")]
+            {
+                if let Some(observation) = completion_observation {
+                    observation.record(
+                        super::completion_observation::Phase::CompletionSending,
+                        None,
+                        None,
+                    );
+                }
+                let _ = super::completion_observation::sent(
+                    completion_observation,
+                    completion_tx.send(reply),
+                );
+            }
+            #[cfg(not(feature = "dangerous-test-hooks"))]
             let _ = completion_tx.send(reply);
             if needs_storage_drain {
                 storage_release.wait().await;

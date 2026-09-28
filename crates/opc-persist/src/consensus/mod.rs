@@ -15,6 +15,8 @@ pub use audit_targets::RetainedConfigProfile;
 #[cfg(feature = "dangerous-test-hooks")]
 pub mod capacity_observation;
 mod capacity_record;
+#[cfg(feature = "dangerous-test-hooks")]
+pub mod completion_observation;
 mod config_capacity_decode;
 pub(crate) mod config_capacity_json;
 pub(crate) mod history;

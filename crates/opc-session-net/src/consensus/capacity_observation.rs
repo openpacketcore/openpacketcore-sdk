@@ -1,9 +1,9 @@
 //! Qualification-only census of pending/negotiated RPCs and owned outer frames.
 //!
 //! This observes real allocation extents and a same-instant frame intersection.
-//! Pool-acquisition requests are separate from negotiated calls. Cold setup,
-//! other queues, engine/prepared owners, inbound decoding, TLS and allocator
-//! overhead remain outside this incomplete per-operation/aggregate census.
+//! Pool and cold-connection acquisition requests are separate from negotiated
+//! calls. Physical setup, other queues, engine/prepared owners, inbound decoding,
+//! TLS and allocator overhead remain outside this incomplete aggregate census.
 //! Snapshot RPC backing and outer framing remain separate categories. No buffer
 //! contents or allocation addresses leave this module. Enabling the feature alone
 //! does not arm an observer or a write gate.
@@ -117,14 +117,18 @@ pub enum PendingRpcPhase {
     /// The real pool-acquisition future has begun and has not returned a lane.
     /// This includes its first poll, even when acquisition can finish promptly.
     PoolAcquire,
+    /// The real cold-connection acquisition future has begun and has not returned.
+    /// Includes coordinator/admission waits and joining a shared setup attempt;
+    /// this observes the caller's RPC payload, not the physical setup's buffers.
+    ColdConnectionAcquire,
 }
 
-/// One borrowed RPC owner during actual pool acquisition.
+/// One borrowed RPC owner during an actual pool or cold-connection acquisition.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct PendingRpcOwner {
     /// Registration identity, shared with the negotiated-call ID sequence.
     pub call_id: u64,
-    /// The exact observed interval; connection setup is outside this phase.
+    /// The exact observed acquisition interval; physical setup buffers are separate.
     pub phase: PendingRpcPhase,
     /// Declared request sender, not yet checked against the peer binding.
     pub source: ConsensusNodeId,
@@ -145,7 +149,7 @@ pub struct PendingRpcOwner {
 /// included; negotiated coverage remains the existing large append/snapshot slice.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct PendingRpcCensus {
-    /// All registered pool acquisitions at this instant, including aliases.
+    /// All registered acquisition waits at this instant, including aliases.
     pub owners: Vec<PendingRpcOwner>,
     /// Distinct nonempty backing allocations among pending owners.
     pub rpc_allocations: usize,
@@ -175,7 +179,7 @@ pub struct NativeTransportOverlap {
     pub snapshot_call_id: u64,
     /// All registered call owners from this exact locked checkpoint.
     pub current: CurrentTransportCensus,
-    /// Actual pool acquisitions, captured under the same lock as `current`.
+    /// Actual acquisition waits, captured under the same lock as `current`.
     pub pending: PendingRpcCensus,
 }
 
@@ -245,6 +249,7 @@ struct CallRecord {
 }
 
 struct PendingCallRecord {
+    phase: PendingRpcPhase,
     source: ConsensusNodeId,
     target: ConsensusNodeId,
     family: ConsensusRpcFamily,
@@ -403,7 +408,7 @@ impl State {
             }
             owners.push(PendingRpcOwner {
                 call_id: id,
-                phase: PendingRpcPhase::PoolAcquire,
+                phase: call.phase,
                 source: call.source,
                 target: call.target,
                 family: call.family,
@@ -663,6 +668,7 @@ impl ConsensusBufferObservation {
 
     pub(crate) fn observe_pending_call<'a>(
         self: &Arc<Self>,
+        phase: PendingRpcPhase,
         source: ConsensusNodeId,
         target: ConsensusNodeId,
         family: ConsensusRpcFamily,
@@ -675,6 +681,7 @@ impl ConsensusBufferObservation {
             state.pending_calls.insert(
                 id,
                 PendingCallRecord {
+                    phase,
                     source,
                     target,
                     family,
