@@ -869,6 +869,15 @@ native_case!(
             current.total.calls, current.additional.calls, current_append_targets.len(),
             native.node_mutation_bytes, append_group.totals.rpc_bytes, snapshot_group.totals.rpc_bytes,
             current_node_mutation_bytes, current.total.frame_bytes);
+        let pending = &transport.pending;
+        let pending_after_shutdown = observation.pending_snapshot();
+        assert_eq!(pending_after_shutdown, Default::default(),
+            "CONFIG_CAPACITY_PENDING_NATIVE_DRAIN_RED: pool-acquisition registrations drain after the original lifecycle");
+        // Zero is a valid current observation; this scenario does not require
+        // both lanes of any one peer pool to be contended at the checkpoint.
+        println!("CONFIG_CAPACITY_PENDING_NATIVE_LIFECYCLE pending_calls={} pending_rpc_allocations={} pending_rpc_bytes={} additional_pending_rpc_bytes={} observed_rpc_union_bytes={} pending={pending:?} drained=true full_memory_bound=false",
+            pending.owners.len(), pending.rpc_allocations, pending.rpc_bytes,
+            pending.additional_rpc_bytes, pending.observed_rpc_bytes);
         // Preserve the original selected-owner partial bounds separately from
         // the broader current census; neither establishes a complete budget.
         let selected_mutation_bytes =

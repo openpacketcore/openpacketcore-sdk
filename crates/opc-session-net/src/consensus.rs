@@ -1060,6 +1060,27 @@ impl ConsensusConnectionPool {
         self.slot(lane, connection, permit)
     }
 
+    // Keep the payload borrowed across the real acquisition future. Its guard
+    // ends before returning the slot, so call_once can move the request; dropping
+    // this future on timeout/cancellation also deregisters before payload drop.
+    #[cfg(feature = "test-control")]
+    async fn acquire_observed(
+        &self,
+        observation: Option<&Arc<capacity_observation::ConsensusBufferObservation>>,
+        target: SessionConsensusNodeId,
+        request: &SessionConsensusWireRequest,
+    ) -> ConsensusConnectionSlot<'_> {
+        let _pending_owner = observation.and_then(|observation| {
+            observation.observe_pending_call(
+                request.sender,
+                target,
+                request.family,
+                &request.payload,
+            )
+        });
+        self.acquire().await
+    }
+
     fn slot<'a>(
         &'a self,
         lane: ConsensusConnectionLane,
@@ -2052,8 +2073,10 @@ impl RemoteSessionConsensusPeer {
 
     /// Attach an opt-in qualification observer to this peer and its clones.
     ///
-    /// This records negotiated large append/snapshot payloads and outer frames.
-    /// It neither observes queued/inbound/native owners nor changes deadlines.
+    /// This records RPC owners during pool acquisition, then the separate
+    /// negotiated large append/snapshot slice and its outer frames. Cold setup,
+    /// inbound/native owners and other queues are outside this observation.
+    /// It does not change deadlines or lane admission.
     #[cfg(feature = "test-control")]
     #[doc(hidden)]
     #[must_use]
@@ -2703,7 +2726,15 @@ impl RemoteSessionConsensusPeer {
         // negotiated RPC. A pre-request cold task has a separate absolute
         // deadline fixed when the coordinator admits it; no outer timeout may
         // cancel that supervised guard and misreport it as abandoned.
-        let mut slot = tokio::time::timeout_at(deadline, self.connection_pool.acquire())
+        #[cfg(feature = "test-control")]
+        let acquire = self.connection_pool.acquire_observed(
+            self.buffer_observation.as_ref(),
+            self.binding.remote_consensus_node_id(),
+            &request,
+        );
+        #[cfg(not(feature = "test-control"))]
+        let acquire = self.connection_pool.acquire();
+        let mut slot = tokio::time::timeout_at(deadline, acquire)
             .await
             .map_err(|_| SessionConsensusPeerError::Timeout)?;
         let result = self.call_once(slot.connection(), request, deadline).await;
@@ -4231,6 +4262,8 @@ where
 #[cfg(test)]
 mod tests {
     mod negotiated_loss;
+    #[cfg(feature = "test-control")]
+    mod pending_rpc;
 
     use std::sync::atomic::AtomicUsize;
     use std::sync::Mutex as StdMutex;
