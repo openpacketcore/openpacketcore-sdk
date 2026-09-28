@@ -72,6 +72,10 @@ where
         if !self.required_audit_profile_supported() {
             return Err(ServerInitError::RequiredAuditProfileUnsupported);
         }
+        #[cfg(feature = "required-netconf-audit")]
+        if self.retained_running {
+            return Err(ServerInitError::RequiredAuditProfileUnsupported);
+        }
         self.audit = Arc::new(ServerAudit::Required(audit.observation_sink()));
         self.required_config_audit = Some(audit);
         Ok(self)
@@ -106,13 +110,16 @@ where
             return true;
         }
         #[cfg(feature = "required-netconf-audit")]
-        if self.retained_sessions.is_some()
-            && (self.binding.writable_running_capability()
-                || !self.required_audit_profile_supported())
-        {
+        if self.retained_sessions.is_some() && !self.retained_audit_profile_supported() {
             return true;
         }
         false
+    }
+
+    #[cfg(feature = "required-netconf-audit")]
+    pub(super) fn retained_audit_profile_supported(&self) -> bool {
+        self.required_audit_profile_supported()
+            && (!self.binding.writable_running_capability() || self.retained_running)
     }
 
     pub(super) fn required_audit_profile_supported(&self) -> bool {

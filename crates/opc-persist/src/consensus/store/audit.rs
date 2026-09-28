@@ -517,7 +517,7 @@ impl ConsensusConfigStore {
         purpose: &[u8],
         command: ConfigMutationIntent,
         local_only: bool,
-        session: Option<&crate::audit_authority::NetconfSessionOwner>,
+        admission: Option<super::NetconfRunningAdmission<'_>>,
         ownership: SubmissionOwnership,
     ) -> AuditAdmission {
         if let Err(error) =
@@ -654,13 +654,13 @@ impl ConsensusConfigStore {
                 return AuditAdmission::Rejected(error);
             }
         }
-        let response = if let Some(session) = session {
+        let response = if let Some(admission) = admission {
             match self
                 .submit_owned_request_on_local_leader_guarded(
                     request,
                     command,
                     ownership,
-                    Some(session),
+                    Some(admission),
                 )
                 .await
             {
@@ -1205,6 +1205,50 @@ impl ConsensusConfigStore {
         prepared: &crate::audit_authority::PreparedTargetMutation,
         caller: AuditCaller,
     ) -> AuditAdmission {
+        self.admit_netconf_running_replacement_guarded(
+            super::NetconfRunningAdmission {
+                session,
+                deadline: None,
+            },
+            prepared,
+            caller,
+        )
+        .await
+    }
+
+    /// Admit an ordinary Running replacement only while its original local
+    /// request deadline and exact SDK session remain live.
+    ///
+    /// The deadline is checked on entry and after native waits immediately
+    /// before polling enqueue. A slow preflight may return after the deadline,
+    /// but cannot use a fresh native timeout to admit expired work. This bounds
+    /// new Intent admission only: existing authenticated receipts remain readable
+    /// and acknowledged originals retain their original completion/recovery.
+    pub async fn admit_netconf_running_replacement_local_until(
+        &self,
+        session: &crate::audit_authority::NetconfSessionOwner,
+        prepared: &crate::audit_authority::PreparedTargetMutation,
+        caller: AuditCaller,
+        deadline: std::time::Instant,
+    ) -> AuditAdmission {
+        self.admit_netconf_running_replacement_guarded(
+            super::NetconfRunningAdmission {
+                session,
+                deadline: Some(deadline),
+            },
+            prepared,
+            caller,
+        )
+        .await
+    }
+
+    async fn admit_netconf_running_replacement_guarded(
+        &self,
+        admission: super::NetconfRunningAdmission<'_>,
+        prepared: &crate::audit_authority::PreparedTargetMutation,
+        caller: AuditCaller,
+    ) -> AuditAdmission {
+        let session = admission.session;
         if u8::from(prepared.command().effect.action) != 16
             || !session.device.worker.belongs_to(&self.inner)
             || session.caller != caller
@@ -1220,7 +1264,7 @@ impl ConsensusConfigStore {
         {
             return AuditAdmission::Rejected(AuditAuthorityError::BindingMismatch);
         }
-        self.admit_netconf_target_with_session(prepared, caller, Some(session))
+        self.admit_netconf_target_with_session(prepared, caller, Some(admission))
             .await
     }
 
@@ -1250,21 +1294,21 @@ impl ConsensusConfigStore {
         &self,
         prepared: &crate::audit_authority::PreparedTargetMutation,
         caller: AuditCaller,
-        session: Option<&crate::audit_authority::NetconfSessionOwner>,
+        admission: Option<super::NetconfRunningAdmission<'_>>,
     ) -> AuditAdmission {
         use crate::consensus::audit_mutation::TargetAuditCommandV1;
         if let Err(error) = self.verify_netconf_target(prepared, caller) {
             return AuditAdmission::Rejected(error);
         }
         let entry_guard = if u8::from(prepared.command().effect.action) == 16 {
-            session
+            admission
                 .ok_or(AuditAuthorityError::BindingMismatch)
-                .and_then(|session| session.require_active())
+                .and_then(super::NetconfRunningAdmission::check)
         } else {
             Ok(())
         };
         if let Err(error) = entry_guard {
-            // Revocation cannot relabel an already admitted original. This
+            // Revocation or expiry cannot relabel an already admitted original. This
             // branch performs read-only recovery and never enqueues an intent.
             return match self.preflight_netconf_target(prepared).await {
                 Ok(Some(receipt)) => AuditAdmission::Applied(receipt),
@@ -1312,7 +1356,7 @@ impl ConsensusConfigStore {
             b"netconf-target-intent",
             admit,
             true,
-            session,
+            admission,
             ownership,
         )
         .await

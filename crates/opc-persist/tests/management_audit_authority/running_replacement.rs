@@ -792,7 +792,10 @@ async fn running_replacement_revocation_while_waiting_for_real_proposal_permit_n
             request,
             command,
             f.store.reserve_submission().unwrap(),
-            Some(&session),
+            Some(NetconfRunningAdmission {
+                session: &session,
+                deadline: None,
+            }),
         );
         tokio::pin!(pending);
         tokio::select! { biased;

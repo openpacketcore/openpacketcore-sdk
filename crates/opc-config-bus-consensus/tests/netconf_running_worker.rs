@@ -44,6 +44,8 @@ use serde::{Deserialize, Serialize};
 
 const LIFETIME: Duration = Duration::from_secs(60);
 
+#[path = "netconf_running_worker/patch_operation.rs"]
+mod patch_operation;
 #[path = "netconf_running_worker/revocation.rs"]
 mod revocation;
 

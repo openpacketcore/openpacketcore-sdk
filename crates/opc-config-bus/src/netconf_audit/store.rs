@@ -298,6 +298,7 @@ impl NetconfAuditStore {
         session: &NetconfSessionOwner,
         frozen: &opc_persist::audit_authority::NetconfRunningEditRead,
         commit: opc_persist::AttestedConfigCommit,
+        operation: super::running::RunningOperation,
         principal: &TrustedPrincipal,
         event: &AuditEvent,
     ) -> Result<TargetAttempt, AuditAuthorityError> {
@@ -306,7 +307,7 @@ impl NetconfAuditStore {
                 event.request_id,
                 principal,
                 event.transport,
-                AuditOperation::Replace,
+                operation.audit_operation(),
                 event,
             )
             .map_err(|_| AuditAuthorityError::BindingMismatch)?;
@@ -486,6 +487,7 @@ impl NetconfAuditStore {
             lock: None,
             lock_ready: false,
             running_owner: None,
+            running_admission_deadline: None,
             acknowledged_intent: None,
             cleanup: false,
             cleanup_retirement_pending: false,
@@ -555,14 +557,20 @@ impl NetconfAuditStore {
         }
         attempt.admission_refusal = None;
         attempt.started = true;
-        let admission = match &attempt.running_owner {
-            Some(session) => {
+        let admission = match (&attempt.running_owner, attempt.running_admission_deadline) {
+            (Some(session), Some(deadline)) => {
                 self.inner
                     .store
-                    .admit_netconf_running_replacement_local(session, prepared, attempt.caller)
+                    .admit_netconf_running_replacement_local_until(
+                        session,
+                        prepared,
+                        attempt.caller,
+                        deadline,
+                    )
                     .await
             }
-            None => {
+            (Some(_), None) => AuditAdmission::Rejected(AuditAuthorityError::BindingMismatch),
+            (None, _) => {
                 self.inner
                     .store
                     .admit_netconf_target_local(prepared, attempt.caller)
@@ -764,6 +772,9 @@ pub(super) struct TargetAttempt {
     // An SDK owner clone observes transport invalidation; it is not a transport
     // owner and cannot keep the transport's final-Drop lifetime alive.
     running_owner: Option<NetconfSessionOwner>,
+    // Only fresh Running Intent admission uses the original request deadline.
+    // Acknowledged/known originals retain their separate recovery obligation.
+    running_admission_deadline: Option<std::time::Instant>,
     acknowledged_intent: Option<AuditOperationReceipt>,
     // Set only by prepare_cleanup after actual inactive-session SDK preparation.
     cleanup: bool,
@@ -824,6 +835,15 @@ impl TargetAttempt {
 
     pub(super) fn lock_ready(&self) -> bool {
         self.lock_ready
+    }
+
+    pub(super) fn bind_running_session(
+        &mut self,
+        session: super::session_lifetime::SessionReference,
+        deadline: std::time::Instant,
+    ) {
+        self.bind_session(session);
+        self.running_admission_deadline = Some(deadline);
     }
 
     pub(super) fn bind_session(&mut self, session: super::session_lifetime::SessionReference) {
@@ -949,6 +969,7 @@ impl TargetAttempt {
             self.prepared = None;
         }
         self.running_owner = None;
+        self.running_admission_deadline = None;
         self.acknowledged_intent = None;
         true
     }

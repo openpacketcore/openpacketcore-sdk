@@ -3,10 +3,10 @@
 //! validation, fingerprint and fanout implementation without a second worker.
 
 use super::*;
-use crate::netconf_audit::running::{RunningPublication, RunningPublicationPort};
+use crate::netconf_audit::running::{RunningOperation, RunningPublication, RunningPublicationPort};
 use crate::netconf_audit::{NetconfMutationResult, SessionReference, TargetWorker};
 use opc_config_model::TransportType;
-use opc_mgmt_audit::{AuditEvent, AuditOperation, AuditOutcome};
+use opc_mgmt_audit::{AuditEvent, AuditOutcome};
 
 pub(crate) struct RunningMessage<C: OpcConfig> {
     pub(crate) session: SessionReference,
@@ -78,9 +78,9 @@ async fn prepare_running<C: OpcConfig>(
     authority: &Mutex<Option<Arc<dyn crate::ConfigAuthorityPort>>>,
 ) -> Result<NetconfMutationResult, CommitError> {
     ensure_deadline(request.deadline)?;
+    let operation = RunningOperation::from_config(request.operation).ok_or_else(refused)?;
     if request.principal != *principal
         || !matches!(request.mode, CommitMode::Commit)
-        || request.operation != ConfigOperation::Replace
         || request.source != RequestSource::Northbound
         || !matches!(
             request.transport,
@@ -90,7 +90,7 @@ async fn prepare_running<C: OpcConfig>(
         || event.principal != opc_mgmt_audit::principal_descriptor(principal)
         || event.tenant != principal.tenant.as_str()
         || event.transport != request.transport
-        || event.operation != AuditOperation::Replace
+        || event.operation != operation.audit_operation()
         || event.outcome != AuditOutcome::Intent
         || event.tx_id.is_some()
     {
@@ -102,7 +102,9 @@ async fn prepare_running<C: OpcConfig>(
     if request.base_version != current.version {
         return Err(refused());
     }
-    let preparation = worker.freeze_running(session, principal, event).await?;
+    let preparation = worker
+        .freeze_running(session, principal, operation, event)
+        .await?;
     if !preparation.matches_base(current.tx_id, current.version, current.config.as_ref()) {
         return Err(refused());
     }
@@ -251,7 +253,7 @@ impl<C: OpcConfig> RunningPublicationPort for RunningPublisher<C> {
             .as_ref()
             .ok_or_else(unavailable)?;
         if !matches!(fingerprint.mode, StoredRequestMode::Commit)
-            || fingerprint.operation != ConfigOperation::Replace
+            || RunningOperation::from_config(fingerprint.operation).is_none()
             || !matches!(
                 fingerprint.transport,
                 TransportType::NetconfSsh | TransportType::NetconfTls

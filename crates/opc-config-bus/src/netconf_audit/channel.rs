@@ -207,7 +207,12 @@ impl<C: OpcConfig> RequiredNetconfAudit<C> {
         receiver.await.map_err(|_| recovery_unavailable())
     }
 
-    /// Replace ordinary Running through this exact transport session.
+    /// Replace the complete computed Running model through this exact session.
+    ///
+    /// Ordinary `Replace`/`Replace` and `Patch`/`Update` request/audit pairs are
+    /// supported. A patch supplies the resulting complete model; its original
+    /// operation remains bound to the audit Intent and encrypted fingerprint.
+    /// Delete, rollback, confirmed and other datastore modes are unsupported.
     ///
     /// The independently authenticated principal must match the request, event
     /// and worker session. The worker derives changed paths and runs its model

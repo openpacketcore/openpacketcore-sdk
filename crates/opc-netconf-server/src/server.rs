@@ -3,6 +3,8 @@
 mod required_audit;
 #[cfg(feature = "required-netconf-audit")]
 mod retained_locks;
+#[cfg(feature = "required-netconf-audit")]
+mod retained_running;
 use required_audit::ServerAudit;
 
 use std::future::Future;
@@ -527,6 +529,8 @@ where
     required_config_audit: Option<opc_config_bus::RequiredConfigAudit<C>>,
     #[cfg(feature = "required-netconf-audit")]
     pub(crate) retained_sessions: Option<opc_config_bus::RequiredNetconfAudit<C>>,
+    #[cfg(feature = "required-netconf-audit")]
+    retained_running: bool,
     transport: TransportType,
     candidate: Arc<Mutex<CandidateDatastore<C>>>,
     confirmed_commit: Arc<Mutex<ConfirmedCommitState>>,
@@ -560,6 +564,8 @@ where
             required_config_audit: None,
             #[cfg(feature = "required-netconf-audit")]
             retained_sessions: None,
+            #[cfg(feature = "required-netconf-audit")]
+            retained_running: false,
             transport,
             candidate: Arc::new(Mutex::new(CandidateDatastore::default())),
             confirmed_commit: Arc::new(Mutex::new(ConfirmedCommitState::default())),
@@ -1477,6 +1483,8 @@ where
                         started,
                     },
                     session_context,
+                    #[cfg(feature = "required-netconf-audit")]
+                    session.retained,
                 )
                 .await
             }
@@ -1491,6 +1499,8 @@ where
                         started,
                     },
                     session_context,
+                    #[cfg(feature = "required-netconf-audit")]
+                    session.retained,
                 )
                 .await
             }
@@ -5046,6 +5056,12 @@ where
         context: RpcExecContext<'_>,
         session_context: Option<(u64, &SessionRegistry)>,
     ) -> RpcHandlingResult {
+        #[cfg(feature = "required-netconf-audit")]
+        if self.retained_running {
+            return self
+                .copy_config_failure_reply(&context, DatastoreFailure::Unsupported)
+                .await;
+        }
         if !self.datastore_available(request.source) || !self.datastore_available(request.target) {
             return self
                 .copy_config_failure_reply(&context, DatastoreFailure::Unsupported)
@@ -5861,9 +5877,19 @@ where
         request: &XmlEditConfigRequest,
         context: RpcExecContext<'_>,
         session_context: Option<(u64, &SessionRegistry)>,
+        #[cfg(feature = "required-netconf-audit")] retained: Option<
+            &opc_config_bus::NetconfSession,
+        >,
     ) -> RpcHandlingResult {
-        self.handle_edit_request(request, context, session_context, EditRpcKind::EditConfig)
-            .await
+        self.handle_edit_request(
+            request,
+            context,
+            session_context,
+            #[cfg(feature = "required-netconf-audit")]
+            retained,
+            EditRpcKind::EditConfig,
+        )
+        .await
     }
 
     async fn handle_edit_data(
@@ -5871,6 +5897,9 @@ where
         request: &XmlEditDataRequest,
         context: RpcExecContext<'_>,
         session_context: Option<(u64, &SessionRegistry)>,
+        #[cfg(feature = "required-netconf-audit")] retained: Option<
+            &opc_config_bus::NetconfSession,
+        >,
     ) -> RpcHandlingResult {
         if !self.binding.nmda_edit_data_supported() {
             return self
@@ -5929,6 +5958,8 @@ where
             &edit_request,
             context,
             session_context,
+            #[cfg(feature = "required-netconf-audit")]
+            retained,
             EditRpcKind::EditData,
         )
         .await
@@ -5939,6 +5970,9 @@ where
         request: &XmlEditConfigRequest,
         context: RpcExecContext<'_>,
         session_context: Option<(u64, &SessionRegistry)>,
+        #[cfg(feature = "required-netconf-audit")] retained: Option<
+            &opc_config_bus::NetconfSession,
+        >,
         kind: EditRpcKind,
     ) -> RpcHandlingResult {
         let target_supported = match request.target {
@@ -6117,6 +6151,20 @@ where
             Instant::now() + Duration::from_secs(30),
         )
         .with_base_version(snapshot.version);
+
+        #[cfg(feature = "required-netconf-audit")]
+        if self.retained_running {
+            return self
+                .submit_retained_running(
+                    &context,
+                    kind,
+                    bus.as_ref(),
+                    retained,
+                    commit_request,
+                    intent_event,
+                )
+                .await;
+        }
 
         if self.required_config_audit.is_none()
             && commit_audit_failed(&self.audit, &intent_event).await

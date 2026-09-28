@@ -84,7 +84,7 @@ const ROUTE_RETRY_BACKOFF: Duration = Duration::from_millis(50);
 const MAX_FORWARDED_BUDGET: Duration = Duration::from_secs(60);
 const REQUEST_ID_DOMAIN: &[u8] = b"openpacketcore/config-consensus/request-id/v1\0";
 
-// A refused live session never entered Openraft; preserve that distinction from
+// A refused session or expired admission never entered Openraft; distinguish it from
 // uncertain storage/transport completion of an accepted original request.
 enum LocalSubmissionError {
     BeforeEnqueue(crate::audit_authority::AuditAuthorityError),
@@ -94,6 +94,27 @@ enum LocalSubmissionError {
 impl From<PersistError> for LocalSubmissionError {
     fn from(error: PersistError) -> Self {
         Self::Submission(error)
+    }
+}
+
+// This local guard grants no target authority and is never serialized. The
+// prepared original still supplies all authenticated effect and caller binding.
+#[derive(Clone, Copy)]
+struct NetconfRunningAdmission<'a> {
+    session: &'a crate::audit_authority::NetconfSessionOwner,
+    deadline: Option<std::time::Instant>,
+}
+
+impl NetconfRunningAdmission<'_> {
+    fn check(self) -> Result<(), crate::audit_authority::AuditAuthorityError> {
+        self.session.require_active()?;
+        if self
+            .deadline
+            .is_some_and(|deadline| std::time::Instant::now() >= deadline)
+        {
+            return Err(crate::audit_authority::AuditAuthorityError::Expired);
+        }
+        Ok(())
     }
 }
 
@@ -1455,7 +1476,7 @@ impl ConsensusConfigStore {
         request_id: opc_consensus::ConsensusRequestId,
         intent: ConfigMutationIntent,
         ownership: SubmissionOwnership,
-        session: Option<&crate::audit_authority::NetconfSessionOwner>,
+        admission: Option<NetconfRunningAdmission<'_>>,
     ) -> Result<ConfigConsensusResponse, LocalSubmissionError> {
         let result = async {
             let input = LocalIntent::new(self, request_id, intent)?;
@@ -1465,7 +1486,7 @@ impl ConsensusConfigStore {
                 .ok_or_else(consensus_unavailable)?;
             let input = input.into_local(ForwardedBudget::from_deadline(deadline)?);
             match self
-                .apply_local_mutation_guarded(input, deadline, ownership, session)
+                .apply_local_mutation_guarded(input, deadline, ownership, admission)
                 .await?
             {
                 ForwardMutationReply::Applied(response) => Ok(*response),
@@ -1646,7 +1667,7 @@ impl ConsensusConfigStore {
         input: LocalMutation<'_>,
         deadline: tokio::time::Instant,
         ownership: SubmissionOwnership,
-        session: Option<&crate::audit_authority::NetconfSessionOwner>,
+        admission: Option<NetconfRunningAdmission<'_>>,
     ) -> Result<ForwardMutationReply, LocalSubmissionError> {
         #[cfg(test)]
         let diagnostic_origin = self
@@ -1734,9 +1755,12 @@ impl ConsensusConfigStore {
             Ok(observer) => observer,
             Err(_) => return Ok(ForwardMutationReply::Unavailable),
         };
-        if let Some(session) = session {
-            session
-                .require_active()
+        if let Some(admission) = admission {
+            // No await intervenes between this last deadline/session check and
+            // polling enqueue. Once polling starts, preserve possible acceptance
+            // and recover the exact original even if the request later expires.
+            admission
+                .check()
                 .map_err(LocalSubmissionError::BeforeEnqueue)?;
         }
         let response =

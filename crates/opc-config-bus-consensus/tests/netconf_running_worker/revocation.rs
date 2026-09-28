@@ -11,6 +11,9 @@ use std::path::Path;
 
 const WAIT: Duration = opc_consensus::DURABLE_CONSENSUS_OPERATION_TIMEOUT;
 
+#[path = "revocation/deadline.rs"]
+mod deadline;
+
 #[derive(Default)]
 pub(super) struct CheckpointControls {
     arm_after_preparation: AtomicBool,

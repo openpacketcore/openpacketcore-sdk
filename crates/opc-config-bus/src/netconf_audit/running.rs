@@ -4,7 +4,8 @@ use std::panic::AssertUnwindSafe;
 
 use futures_util::FutureExt;
 use opc_config_model::{
-    CommitError, CommitErrorCode, CommitResult, OpcConfig, RequestId, TrustedPrincipal,
+    CommitError, CommitErrorCode, CommitResult, ConfigOperation, OpcConfig, RequestId,
+    TrustedPrincipal,
 };
 use opc_mgmt_audit::{AuditEvent, AuditOperation};
 use opc_persist::audit_authority::{AuditCaller, NetconfRunningEditRead, NetconfSessionOwner};
@@ -16,10 +17,36 @@ use super::{
 };
 use crate::{StoreError, StoredConfig};
 
+/// Derived from the complete model request, never from its audit event.
+/// Both edits replace the stored model while preserving their original operation.
+#[derive(Clone, Copy)]
+pub(crate) enum RunningOperation {
+    Replace,
+    Patch,
+}
+
+impl RunningOperation {
+    pub(crate) fn from_config(operation: ConfigOperation) -> Option<Self> {
+        match operation {
+            ConfigOperation::Replace => Some(Self::Replace),
+            ConfigOperation::Patch => Some(Self::Patch),
+            ConfigOperation::Delete | ConfigOperation::Rollback => None,
+        }
+    }
+
+    pub(crate) fn audit_operation(self) -> AuditOperation {
+        match self {
+            Self::Replace => AuditOperation::Replace,
+            Self::Patch => AuditOperation::Update,
+        }
+    }
+}
+
 pub(crate) struct RunningPreparation {
     owner: NetconfSessionOwner,
     frozen: NetconfRunningEditRead,
     reference: SessionReference,
+    operation: RunningOperation,
 }
 
 impl RunningPreparation {
@@ -68,6 +95,7 @@ impl TargetWorker {
         &self,
         reference: &SessionReference,
         principal: &TrustedPrincipal,
+        operation: RunningOperation,
         event: &AuditEvent,
     ) -> Result<RunningPreparation, CommitError> {
         self.check_new(event.request_id, principal)
@@ -90,7 +118,7 @@ impl TargetWorker {
                 event.request_id,
                 principal,
                 event.transport,
-                AuditOperation::Replace,
+                operation.audit_operation(),
                 event,
             )
             .map_err(|_| refused())?;
@@ -107,6 +135,7 @@ impl TargetWorker {
             owner,
             frozen,
             reference: reference.clone(),
+            operation,
         })
     }
 
@@ -126,6 +155,7 @@ impl TargetWorker {
                 &preparation.owner,
                 &preparation.frozen,
                 attested,
+                preparation.operation,
                 principal,
                 event,
             )
@@ -142,9 +172,10 @@ impl TargetWorker {
                 "commit deadline exceeded",
             ));
         }
-        original.bind_session(preparation.reference);
+        original.bind_running_session(preparation.reference, deadline);
         // execute retains the complete original before polling SDK admission.
-        // The SDK's final post-wait active-session check is authoritative.
+        // The SDK rechecks this original deadline and live session after
+        // native waits, immediately before polling new Intent admission.
         match self.execute(event.request_id, principal, original).await {
             Ok(reply) => from_original(reply),
             Err(refusal) => refusal.into_result(),

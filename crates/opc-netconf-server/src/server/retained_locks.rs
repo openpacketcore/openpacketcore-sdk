@@ -58,8 +58,7 @@ where
             return Self::retained_lock_error(&context, metric, RpcError::operation_failed());
         };
         if !audit.belongs_to(self.binding.config_bus().as_ref())
-            || self.binding.writable_running_capability()
-            || !self.required_audit_profile_supported()
+            || !self.retained_audit_profile_supported()
         {
             return Self::retained_lock_error(&context, metric, RpcError::operation_failed());
         }
