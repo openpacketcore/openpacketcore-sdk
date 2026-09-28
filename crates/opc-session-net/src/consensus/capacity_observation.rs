@@ -1,8 +1,9 @@
-//! Qualification-only census of borrowed negotiated RPC and owned outer frames.
+//! Qualification-only census of pending/negotiated RPCs and owned outer frames.
 //!
 //! This observes real allocation extents and a same-instant frame intersection.
-//! It does not measure queued requests, engine/prepared owners, inbound decoding,
-//! TLS, allocator overhead or the complete per-operation/aggregate memory bound.
+//! Pool-acquisition requests are separate from negotiated calls. Cold setup,
+//! other queues, engine/prepared owners, inbound decoding, TLS and allocator
+//! overhead remain outside this incomplete per-operation/aggregate census.
 //! Snapshot RPC backing and outer framing remain separate categories. No buffer
 //! contents or allocation addresses leave this module. Enabling the feature alone
 //! does not arm an observer or a write gate.
@@ -110,6 +111,52 @@ pub struct CurrentTransportCensus {
     pub groups: Vec<TransportCensusGroup>,
 }
 
+/// Exact request interval covered by the pending RPC observer.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PendingRpcPhase {
+    /// The real pool-acquisition future has begun and has not returned a lane.
+    /// This includes its first poll, even when acquisition can finish promptly.
+    PoolAcquire,
+}
+
+/// One borrowed RPC owner during actual pool acquisition.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct PendingRpcOwner {
+    /// Registration identity, shared with the negotiated-call ID sequence.
+    pub call_id: u64,
+    /// The exact observed interval; connection setup is outside this phase.
+    pub phase: PendingRpcPhase,
+    /// Declared request sender, not yet checked against the peer binding.
+    pub source: ConsensusNodeId,
+    /// Recipient from the actual peer binding.
+    pub target: ConsensusNodeId,
+    /// Declared request family, including small control and forwarded calls.
+    pub family: ConsensusRpcFamily,
+    /// Original typed provenance when present; zero otherwise.
+    pub generation: u64,
+    /// Whether existing typed provenance selected this append operation.
+    pub selected_append: bool,
+    /// Actual capacity of this borrowed Vec; other rows may alias it.
+    pub rpc_bytes: usize,
+}
+
+/// One locked census of pending RPCs and their union with negotiated RPCs.
+/// Contains numeric metadata only. No frame, snapshot-input or native bytes are
+/// included; negotiated coverage remains the existing large append/snapshot slice.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct PendingRpcCensus {
+    /// All registered pool acquisitions at this instant, including aliases.
+    pub owners: Vec<PendingRpcOwner>,
+    /// Distinct nonempty backing allocations among pending owners.
+    pub rpc_allocations: usize,
+    /// Allocation-identity union of actual pending Vec capacities.
+    pub rpc_bytes: usize,
+    /// Pending backing not already charged by the negotiated RPC census.
+    pub additional_rpc_bytes: usize,
+    /// One allocation union across pending and currently observed negotiated RPCs.
+    pub observed_rpc_bytes: usize,
+}
+
 /// Current typed pair and all observed calls inside one native checkpoint.
 /// Snapshot input, snapshot RPC and outer transport are separate categories.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -128,6 +175,8 @@ pub struct NativeTransportOverlap {
     pub snapshot_call_id: u64,
     /// All registered call owners from this exact locked checkpoint.
     pub current: CurrentTransportCensus,
+    /// Actual pool acquisitions, captured under the same lock as `current`.
+    pub pending: PendingRpcCensus,
 }
 
 #[derive(Clone, Copy, Default)]
@@ -195,10 +244,19 @@ struct CallRecord {
     frame: Option<FrameRecord>,
 }
 
+struct PendingCallRecord {
+    source: ConsensusNodeId,
+    target: ConsensusNodeId,
+    family: ConsensusRpcFamily,
+    payload: Allocation,
+    typed: TypedTransportTag,
+}
+
 #[derive(Default)]
 struct State {
     next_id: u64,
     calls: BTreeMap<u64, CallRecord>,
+    pending_calls: BTreeMap<u64, PendingCallRecord>,
     held_snapshot_target: Option<ConsensusNodeId>,
     native_source: Option<ConsensusNodeId>,
     held_append_target: Option<ConsensusNodeId>,
@@ -328,6 +386,42 @@ fn current_census<'a>(
 }
 
 impl State {
+    fn pending_census(&self) -> PendingRpcCensus {
+        let mut combined: BTreeMap<_, _> = self
+            .calls
+            .values()
+            .filter(|call| call.payload.bytes != 0)
+            .map(|call| (call.payload.address, call.payload.bytes))
+            .collect();
+        let negotiated_bytes: usize = combined.values().sum();
+        let mut pending = BTreeMap::new();
+        let mut owners = Vec::with_capacity(self.pending_calls.len());
+        for (&id, call) in &self.pending_calls {
+            if call.payload.bytes != 0 {
+                pending.insert(call.payload.address, call.payload.bytes);
+                combined.insert(call.payload.address, call.payload.bytes);
+            }
+            owners.push(PendingRpcOwner {
+                call_id: id,
+                phase: PendingRpcPhase::PoolAcquire,
+                source: call.source,
+                target: call.target,
+                family: call.family,
+                generation: call.typed.generation,
+                selected_append: call.typed.selected_append,
+                rpc_bytes: call.payload.bytes,
+            });
+        }
+        let observed_rpc_bytes = combined.values().sum::<usize>();
+        PendingRpcCensus {
+            owners,
+            rpc_allocations: pending.len(),
+            rpc_bytes: pending.values().sum(),
+            additional_rpc_bytes: observed_rpc_bytes - negotiated_bytes,
+            observed_rpc_bytes,
+        }
+    }
+
     fn snapshot_provenance_matches(&self, call: &CallRecord) -> bool {
         self.native_source.is_none_or(|source| {
             call.source == source
@@ -381,6 +475,7 @@ impl State {
             append_call_id: append_id,
             snapshot_call_id: snapshot_id,
             current,
+            pending: self.pending_census(),
         })
     }
 
@@ -435,7 +530,7 @@ impl State {
 /// Registrations contain only addresses, extents, IDs and notifications. They do
 /// not clone payloads or retain a store, prepared operation, frame or TLS stream.
 /// Pointer identities stay private; live registrations end before owners free.
-/// Metadata is bounded by active calls/frames and owned numeric census rows.
+/// Metadata follows observed pending/active calls, frames and numeric census rows.
 /// The census copies no buffers and contains no public allocation addresses.
 pub struct ConsensusBufferObservation {
     state: Mutex<State>,
@@ -560,6 +655,48 @@ impl ConsensusBufferObservation {
         self.state().snapshot
     }
 
+    /// Observe pending and negotiated RPC backing under their shared lock.
+    /// This is a current sample, not a peak or an aggregate transport bound.
+    pub fn pending_snapshot(&self) -> PendingRpcCensus {
+        self.state().pending_census()
+    }
+
+    pub(crate) fn observe_pending_call<'a>(
+        self: &Arc<Self>,
+        source: ConsensusNodeId,
+        target: ConsensusNodeId,
+        family: ConsensusRpcFamily,
+        payload: &'a Vec<u8>,
+    ) -> Option<PendingCallOwner<'a>> {
+        let id = {
+            let mut state = self.state();
+            let id = state.next_id.checked_add(1)?;
+            state.next_id = id;
+            state.pending_calls.insert(
+                id,
+                PendingCallRecord {
+                    source,
+                    target,
+                    family,
+                    payload: Allocation {
+                        address: payload.as_ptr() as usize,
+                        bytes: payload.capacity(),
+                    },
+                    typed: TYPED_TRANSPORT.try_with(|tag| *tag).unwrap_or_default(),
+                },
+            );
+            id
+        };
+        // Pending owners do not participate in frame gates or peak refresh.
+        Some(PendingCallOwner {
+            context: CallContext {
+                observation: self.clone(),
+                id,
+            },
+            _payload: payload,
+        })
+    }
+
     pub(crate) fn observe_call<'a>(
         self: &Arc<Self>,
         source: ConsensusNodeId,
@@ -609,6 +746,22 @@ impl ConsensusBufferObservation {
 struct CallContext {
     observation: Arc<ConsensusBufferObservation>,
     id: u64,
+}
+
+/// The request stays borrowed until the acquisition guard deregisters.
+pub(crate) struct PendingCallOwner<'a> {
+    context: CallContext,
+    _payload: &'a Vec<u8>,
+}
+
+impl Drop for PendingCallOwner<'_> {
+    fn drop(&mut self) {
+        self.context
+            .observation
+            .state()
+            .pending_calls
+            .remove(&self.context.id);
+    }
 }
 
 /// The borrow prevents freeing/moving the observed request before deregistration.
