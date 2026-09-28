@@ -54035,6 +54035,7 @@ mod load_capability_tests {
 #[cfg(test)]
 mod tests {
     mod grouped_bearer_transition;
+    mod ordinary_ipv6;
     #[cfg(target_os = "linux")]
     mod n3_end_marker;
     mod retained_namespace_boundary;
