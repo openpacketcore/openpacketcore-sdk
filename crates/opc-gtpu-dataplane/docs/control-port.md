@@ -147,3 +147,47 @@ sources and the rebuilt object are byte-identical and pass. The local endpoint
 check adds the existing IPv4 configuration map to the downlink program's exact
 map-identity set; map layouts, pin inventory and frozen historical objects do
 not change.
+
+## Backend-authoritative downlink consumer
+
+`GtpuControlPort::try_receive_downlink` is the production consumer for G-PDUs
+the kernel delivers to this queue: outer-fragmented downlink G-PDUs after
+kernel reassembly (TS 29.281 clauses 4.2.4 and 4.2.5) and unknown-TEID
+handoffs. Receive and authorization run under the backend's attachment
+serialization; `Busy` consumes nothing from the queue.
+
+Authorization repeats the tc downlink decisions with the shared wire
+validators and the backend's own map reads:
+
+1. The loader traffic gate must be open. While it is closed tc passes
+   packets untouched, so nothing is decapsulated on its behalf.
+2. The grouped downlink index is read first. A present index never falls
+   back: the Active generation, device, inner-family slot, local and peer
+   endpoints, source-port policy, inner destination and any N3 PSC must
+   match, and the inner length must be exact.
+3. On a true index miss the v5 PDR, endpoint binding, owner journal, FAR and
+   DSCP are read and the Active `PdpContextCommit` is read last as the
+   publication fence. Pending, Removing, absent or mixed graphs fail closed.
+
+| Event | Meaning |
+| --- | --- |
+| `Decapsulated` | Exact inner packet, inner family and bearer mark (default bearer is `None`). The caller injects it toward XFRM with that mark. |
+| `Control` | Non-G-PDU message; use the response planners above. |
+| `UnknownTunnel` | Untouched G-PDU whose TEID selects no tunnel. An observation, not an absence receipt. |
+| `Dropped` | Value-free `GtpuDownlinkDrop`: malformed, binding mismatch, destination mismatch or state unavailable. |
+
+`downlink_counters` returns bounded, value-free counters for the current
+attachment registration. The ordinary legacy socket port keeps the default
+`Unsupported` result. The consumer does not inject packets, admit peers, rate
+limit, or plan Error Indications. Grouped attachments with an IPv4 outer
+endpoint report `KernelReassemblyHandoff` for outer IPv4 fragments; outer IPv6
+fragments remain unsupported. Inner IPv6 on the ordinary v5 path is
+malformed, as in tc, until that path supports it.
+
+Native evidence runs the committed classifier on ordinary and grouped
+attachments: in-order, reordered, duplicated head and tail, missing,
+foreign-TEID, wrong-peer, wrong-destination, stale Pending/Removing commit,
+owner-only Pending, mixed binding, closed gate, stale grouped generation,
+retirement and removal. Both privileged lanes require the
+`OPC_GTPU_BACKEND_REASSEMBLY_CONSUMER_PROVEN` and
+`OPC_GTPU_BACKEND_GROUPED_REASSEMBLY_CONSUMER_PROVEN` markers.

@@ -11,6 +11,8 @@ use crate::control_port::{
 pub(super) struct ControlSocketState {
     socket: Option<crate::GtpuReassemblySocket>,
     retired: bool,
+    /// Value-free counters of this registration's downlink consumer.
+    downlink_counters: crate::GtpuDownlinkCounters,
 }
 
 impl ControlSocketState {
@@ -44,6 +46,25 @@ impl BackendControlPort {
         &self,
         operation: impl FnOnce(&crate::GtpuReassemblySocket) -> Result<T, GtpuControlPortError>,
     ) -> Result<T, GtpuControlPortError> {
+        self.with_attachment(|_, state, _| {
+            let socket = state
+                .socket
+                .as_ref()
+                .ok_or(GtpuControlPortError::Unavailable)?;
+            operation(socket)
+        })
+    }
+
+    /// Run one operation under the attachment mutation guard with the exact
+    /// live socket state and the attachment's authority scope.
+    fn with_attachment<T>(
+        &self,
+        operation: impl FnOnce(
+            &EbpfGtpuDataplaneBackend,
+            &mut ControlSocketState,
+            super::reassembled_downlink::DownlinkAuthorityScope,
+        ) -> Result<T, GtpuControlPortError>,
+    ) -> Result<T, GtpuControlPortError> {
         let unavailable = || GtpuControlPortError::Unavailable;
         let inner = self.backend.upgrade().ok_or_else(unavailable)?;
         let backend = EbpfGtpuDataplaneBackend { inner };
@@ -66,6 +87,16 @@ impl BackendControlPort {
             return Err(unavailable());
         }
         let name = managed.name.clone();
+        let scope = super::reassembled_downlink::DownlinkAuthorityScope {
+            ifindex: self.ifindex,
+            grouped_config: managed.grouped.and_then(|grouped| {
+                grouped_device_config(grouped.device_id, self.ifindex, grouped.local_endpoints)
+            }),
+        };
+        if managed.grouped.is_some() && scope.grouped_config.is_none() {
+            slot.lock().map_err(|_| unavailable())?.retire();
+            return Err(unavailable());
+        }
         drop(devices);
         if backend.inner.runtime.ifindex_by_name(&name).ok() != Some(self.ifindex)
             || !backend
@@ -76,14 +107,14 @@ impl BackendControlPort {
             slot.lock().map_err(|_| unavailable())?.retire();
             return Err(unavailable());
         }
-        let socket = slot.lock().map_err(|_| unavailable())?;
-        if socket.retired {
+        let mut state = slot.lock().map_err(|_| unavailable())?;
+        if state.retired || state.socket.is_none() {
             return Err(unavailable());
         }
-        let socket = socket.socket.as_ref().ok_or_else(unavailable)?;
-        // Keep the mutation guard across the nonblocking syscall: removal may
+        // Keep the mutation guard across the nonblocking syscall and every
+        // authority read: removal, replacement and cleanup-only adoption may
         // linearize before or after this operation, never midway through it.
-        operation(socket)
+        operation(&backend, &mut state, scope)
     }
 }
 
@@ -100,6 +131,33 @@ impl GtpuControlPort for BackendControlPort {
         plan: GtpuControlSendPlan,
     ) -> Result<usize, GtpuControlPortError> {
         self.with_socket(|socket| socket.send_control_response(plan))
+    }
+
+    fn try_receive_downlink(
+        &self,
+        maximum_bytes: usize,
+    ) -> Result<Option<crate::GtpuDownlinkEvent>, GtpuControlPortError> {
+        self.with_attachment(|backend, state, scope| {
+            let socket = state
+                .socket
+                .as_ref()
+                .ok_or(GtpuControlPortError::Unavailable)?;
+            let Some(datagram) = socket.try_receive_datagram(maximum_bytes)? else {
+                return Ok(None);
+            };
+            Ok(Some(
+                super::reassembled_downlink::process_downlink_datagram(
+                    backend.inner.runtime.as_ref(),
+                    scope,
+                    datagram,
+                    &mut state.downlink_counters,
+                ),
+            ))
+        })
+    }
+
+    fn downlink_counters(&self) -> Result<crate::GtpuDownlinkCounters, GtpuControlPortError> {
+        self.with_attachment(|_, state, _| Ok(state.downlink_counters))
     }
 }
 
@@ -247,6 +305,35 @@ mod tests {
         drop(backend);
         assert_eq!(
             port.try_receive_datagram(8).unwrap_err(),
+            GtpuControlPortError::Unavailable
+        );
+    }
+
+    #[test]
+    fn downlink_consumer_is_serialized_with_attachment_mutation() {
+        let backend = EbpfGtpuDataplaneBackend::new();
+        let port = BackendControlPort {
+            backend: Arc::downgrade(&backend.inner),
+            socket: Weak::new(),
+            ifindex: 731,
+        };
+        let guard = backend.operation_guard().unwrap();
+        assert_eq!(
+            port.try_receive_downlink(2048).unwrap_err(),
+            GtpuControlPortError::Busy
+        );
+        assert_eq!(
+            port.downlink_counters().unwrap_err(),
+            GtpuControlPortError::Busy
+        );
+        drop(guard);
+        assert_eq!(
+            port.try_receive_downlink(2048).unwrap_err(),
+            GtpuControlPortError::Unavailable
+        );
+        drop(backend);
+        assert_eq!(
+            port.try_receive_downlink(2048).unwrap_err(),
             GtpuControlPortError::Unavailable
         );
     }

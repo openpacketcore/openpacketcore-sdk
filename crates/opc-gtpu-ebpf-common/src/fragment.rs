@@ -28,7 +28,9 @@ use crate::{
 /// socket bound on the *concrete* local S2b-U address (never `0.0.0.0`). The
 /// contract is only complete when the operator actually runs an SDK consumer
 /// on that socket: without one, the kernel answers each fragment set with
-/// ICMP port unreachable and the packet is lost. A backend that cannot
+/// ICMP port unreachable and the packet is lost. For the eBPF backend that
+/// consumer is `GtpuControlPort::try_receive_downlink` on the attachment's
+/// backend-owned queue, which authorizes against the backend's own maps. A backend that cannot
 /// demonstrate that re-entry must report
 /// [`GtpuDownlinkFragmentContract::Unsupported`] rather than silently
 /// dropping or ignoring fragments.
