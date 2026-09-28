@@ -8,6 +8,10 @@
 use super::*;
 use futures_util::{future::join_all, stream, StreamExt};
 use opc_persist::PreparedConfigCommitOperation;
+use opc_session_net::consensus::capacity_observation::ConsensusBufferObservation;
+
+#[path = "nine_member/overlap.rs"]
+mod overlap;
 
 const MEMBERS: usize = 9;
 const PREPARATIONS: usize = 8;
@@ -19,6 +23,94 @@ struct Transfers {
     active_capacity: AtomicUsize,
     peak_active: AtomicUsize,
     peak_capacity: AtomicUsize,
+    snapshots: [Arc<snapshot::Observation>; MEMBERS],
+    defer_snapshots: [AtomicBool; MEMBERS],
+    deferred_snapshot_attempts: [AtomicUsize; MEMBERS],
+    snapshot_pauses: [SnapshotPause; MEMBERS],
+    vote_probes: [snapshot::VoteProbe; MEMBERS],
+}
+
+impl Transfers {
+    fn record_snapshot_completion(
+        &self,
+        target: usize,
+        paused_snapshot: bool,
+        chunk: Option<snapshot::PendingChunk>,
+        result: &Result<ConsensusWireResponse, ConsensusPeerError>,
+    ) {
+        // Consume this invocation's captured chunk once. The aggregate chunk
+        // oracle and one-shot pause use the same decoded acknowledgment.
+        let acknowledged = match (chunk, result) {
+            (Some(chunk), Ok(response)) => self.snapshots[target].record(chunk, response),
+            _ => false,
+        };
+        if paused_snapshot {
+            self.snapshot_pauses[target].complete(acknowledged);
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+struct SnapshotPauseTotals {
+    entered: usize,
+    completed: usize,
+    untyped: bool,
+    success: bool,
+}
+
+/// Schedule one real pre-registration snapshot; retain only controls/counters.
+#[derive(Debug, Default)]
+struct SnapshotPause {
+    armed: AtomicBool,
+    totals: std::sync::Mutex<SnapshotPauseTotals>,
+    entered: tokio::sync::Notify,
+    resumed: tokio::sync::Notify,
+    completed: tokio::sync::Notify,
+}
+
+impl SnapshotPause {
+    fn arm(&self) {
+        self.armed.store(true, Ordering::SeqCst);
+    }
+
+    async fn pause_once(&self, untyped: bool) -> bool {
+        if !self.armed.swap(false, Ordering::SeqCst) {
+            return false;
+        }
+        {
+            let mut totals = self.totals.lock().unwrap();
+            totals.entered += 1;
+            totals.untyped = untyped;
+        }
+        self.entered.notify_one();
+        self.resumed.notified().await;
+        true
+    }
+
+    async fn wait_entered(&self) {
+        self.entered.notified().await;
+    }
+
+    fn resume(&self) {
+        self.resumed.notify_one();
+    }
+
+    fn complete(&self, success: bool) {
+        {
+            let mut totals = self.totals.lock().unwrap();
+            totals.completed += 1;
+            totals.success = success;
+        }
+        self.completed.notify_one();
+    }
+
+    async fn wait_completed(&self) {
+        self.completed.notified().await;
+    }
+
+    fn snapshot(&self) -> SnapshotPauseTotals {
+        *self.totals.lock().unwrap()
+    }
 }
 
 struct ActiveRequest<'a> {
@@ -65,16 +157,55 @@ impl NinePeer {
         timeout: Option<Duration>,
     ) -> Result<ConsensusWireResponse, ConsensusPeerError> {
         assert!(request.payload.len() <= opc_consensus::CONSENSUS_MAX_RPC_PAYLOAD_BYTES);
+        let typed = opc_persist::config_capacity_observation::transport_witness(
+            &request,
+            self.inner.node_id(),
+        );
+        // The typed context was captured by the real adapter before this peer
+        // was invoked. Pause before reading defer_snapshots so arming exercises
+        // the exact pre-registration interleaving, without restarting the RPC.
+        let paused_snapshot = request.family == ConsensusRpcFamily::InstallSnapshot
+            && self.transfers.snapshot_pauses[self.target]
+                .pause_once(typed.is_none())
+                .await;
+        // Setup-only fault: keep compatibility probes, votes and append/heartbeat
+        // traffic on the real authenticated transport while deferring state transfer.
+        if request.family == ConsensusRpcFamily::InstallSnapshot
+            && self.transfers.defer_snapshots[self.target].load(Ordering::SeqCst)
+        {
+            self.transfers.deferred_snapshot_attempts[self.target].fetch_add(1, Ordering::SeqCst);
+            if paused_snapshot {
+                self.transfers.snapshot_pauses[self.target].complete(false);
+            }
+            return Err(ConsensusPeerError::Unavailable);
+        }
         let large_append = request.family == ConsensusRpcFamily::AppendEntries
             && request.payload.len() > 1_048_576;
         // This observes the one public request buffer at the peer boundary.
         // TLS, inner encoders, responses and retained engine entries are not
         // measured by this guard and cannot be inferred from its high water.
         let _active = ActiveRequest::new(&self.transfers, request.payload.capacity());
-        let result = match timeout {
-            Some(timeout) => self.inner.call_with_timeout(request, timeout).await,
-            None => self.inner.call(request).await,
-        };
+        // Test-only decoding for the existing contiguous acknowledged-chunk
+        // witness. Its temporary copy is not a measured production owner.
+        let chunk = self.transfers.snapshots[self.target].capture(&request);
+        let vote_probe = self.transfers.vote_probes[self.target].capture(&request);
+        let result = opc_session_net::consensus::capacity_observation::scope_typed_transport(
+            typed.is_some_and(|witness| witness.selected_append),
+            typed.map_or(0, |witness| witness.snapshot_data_bytes),
+            typed.map_or(0, |witness| witness.generation),
+            async {
+                match timeout {
+                    Some(timeout) => self.inner.call_with_timeout(request, timeout).await,
+                    None => self.inner.call(request).await,
+                }
+            },
+        )
+        .await;
+        if let Some(probe) = vote_probe {
+            probe.record(&result);
+        }
+        self.transfers
+            .record_snapshot_completion(self.target, paused_snapshot, chunk, &result);
         if large_append
             && result
                 .as_ref()
@@ -142,6 +273,8 @@ async fn open_nine(
     pki: &Pki,
     addresses: &[Arc<RwLock<Option<SocketAddr>>>; MEMBERS],
     transfers: &[Arc<Transfers>; MEMBERS],
+    reopen: bool,
+    observation: Option<&Arc<ConsensusBufferObservation>>,
 ) -> Vec<ConsensusConfigStore> {
     let node_ids: [_; MEMBERS] = std::array::from_fn(|member| {
         manifest
@@ -168,6 +301,10 @@ async fn open_nine(
                         resolver(addresses[target].clone()),
                         pki.client(source),
                     );
+                    let inner = match observation {
+                        Some(observation) => inner.with_buffer_observation(observation.clone()),
+                        None => inner,
+                    };
                     (
                         node_ids[target],
                         Arc::new(NinePeer {
@@ -200,12 +337,13 @@ async fn open_nine(
                 DURABLE_CONSENSUS_OPERATION_TIMEOUT,
             )
             .expect("unchanged native Durable options");
-            let backend = SqliteBackend::provision_config_authority(
-                options,
-                AuditKey::new([0xD9; 32]).expect("synthetic shared audit key"),
-            )
-            .await
-            .expect("real native authority");
+            let key = AuditKey::new([0xD9; 32]).expect("synthetic shared audit key");
+            let backend = if reopen {
+                SqliteBackend::reopen_config_authority(options, key).await
+            } else {
+                SqliteBackend::provision_config_authority(options, key).await
+            }
+            .expect("real native authority on original paths");
             (topology, backend, peers)
         }
     };
@@ -301,7 +439,10 @@ native_case!(
         let manifest = nine_manifest();
         let addresses: [_; MEMBERS] = std::array::from_fn(|_| Arc::new(RwLock::new(None)));
         let transfers: [_; MEMBERS] = std::array::from_fn(|_| Arc::new(Transfers::default()));
-        let stores = open_nine(&directory, &manifest, &pki, &addresses, &transfers).await;
+        let stores = open_nine(
+            &directory, &manifest, &pki, &addresses, &transfers, false, None,
+        )
+        .await;
         let mut servers = Vec::new();
         let mut released = Vec::new();
         for (member, store) in stores.iter().enumerate() {
@@ -481,3 +622,223 @@ native_case!(
         println!("CONFIG_CAPACITY_NINE members=9 encrypted_preparations=72 per_node=8 rejected_ninth=9 real_large_targets=8 native_atomic_readback=true exact_recovery=true owner_conservation=true full_memory_bound=false");
     }
 );
+
+#[cfg(test)]
+mod snapshot_ack_tests {
+    use super::*;
+    use opc_consensus::engine::error::{Fatal, InstallSnapshotError, RaftError};
+    use opc_consensus::engine::raft::InstallSnapshotResponse;
+    use opc_consensus::engine::{EmptyNode, SnapshotMeta, StoredMembership, Vote};
+    use serde::Serialize;
+
+    type SnapshotReply = Result<
+        InstallSnapshotResponse<ConsensusNodeId>,
+        RaftError<ConsensusNodeId, InstallSnapshotError>,
+    >;
+
+    #[derive(Serialize)]
+    struct Wire<T> {
+        revision: u16,
+        value: T,
+    }
+
+    // The same public request field order captured by snapshot::Observation.
+    #[derive(Serialize)]
+    struct Chunk {
+        vote: Vote<ConsensusNodeId>,
+        meta: SnapshotMeta<ConsensusNodeId, EmptyNode>,
+        offset: u64,
+        data: Vec<u8>,
+        done: bool,
+    }
+
+    fn request(
+        vote: Vote<ConsensusNodeId>,
+        offset: u64,
+        data: Vec<u8>,
+        done: bool,
+    ) -> ConsensusWireRequest {
+        let local = nine_manifest().bind_local(replica_id(0)).unwrap();
+        ConsensusWireRequest::try_new(
+            local.consensus_identity(),
+            local.local_consensus_node_id(),
+            ConsensusRpcFamily::InstallSnapshot,
+            opc_consensus::encode_bounded(&Wire {
+                revision: 8,
+                value: Chunk {
+                    vote,
+                    meta: SnapshotMeta {
+                        last_log_id: None,
+                        last_membership: StoredMembership::default(),
+                        snapshot_id: "synthetic-snapshot-ack".into(),
+                    },
+                    offset,
+                    data,
+                    done,
+                },
+            })
+            .unwrap(),
+        )
+        .unwrap()
+    }
+
+    fn response(reply: SnapshotReply) -> Result<ConsensusWireResponse, ConsensusPeerError> {
+        Ok(ConsensusWireResponse {
+            result: Ok(opc_consensus::encode_bounded(&Wire {
+                revision: 8,
+                value: reply,
+            })
+            .unwrap()),
+        })
+    }
+
+    async fn exercise(
+        reply: SnapshotReply,
+        expected_success: bool,
+        expected_before_retry: Option<usize>,
+    ) {
+        // These encoded responses isolate the real shared recording path. They
+        // do not claim a native snapshot, network or storage operation occurred.
+        let (
+            original,
+            after_tail,
+            after_retry,
+            before_retry,
+            complete,
+            captured,
+            pauses,
+            active,
+            weak,
+        ) = {
+            let transfers = Transfers::default();
+            let target = 1;
+            transfers.snapshots[target]
+                .enabled
+                .store(true, Ordering::SeqCst);
+            let pause = &transfers.snapshot_pauses[target];
+            pause.arm();
+            let (original_paused, ()) = tokio::join!(pause.pause_once(true), async {
+                pause.wait_entered().await;
+                pause.resume();
+            });
+            let sender = nine_manifest()
+                .bind_local(replica_id(0))
+                .unwrap()
+                .local_consensus_node_id();
+            let vote = Vote::new_committed(7, sender);
+            let first = request(vote, 0, vec![1, 2, 3], false);
+            let final_chunk = request(vote, 3, vec![4, 5], true);
+            let first_reply = response(reply);
+            let chunk = transfers.snapshots[target].capture(&first);
+            let captured = chunk.is_some();
+            transfers.record_snapshot_completion(target, original_paused, chunk, &first_reply);
+            pause.wait_completed().await;
+            let original = pause.snapshot();
+
+            // Finish the other offset before retrying the failed original one.
+            // An aggregate transfer can complete later without acknowledging
+            // the one exact invocation which passed through the pause.
+            let tail_paused = pause.pause_once(false).await;
+            let accepted = response(Ok(InstallSnapshotResponse { vote }));
+            transfers.record_snapshot_completion(
+                target,
+                tail_paused,
+                transfers.snapshots[target].capture(&final_chunk),
+                &accepted,
+            );
+            let after_tail = pause.snapshot();
+            let snapshot_id = Sha256::digest(b"synthetic-snapshot-ack").into();
+            let before_retry = transfers.snapshots[target].complete(snapshot_id, 5);
+            let retry_paused = pause.pause_once(false).await;
+            transfers.record_snapshot_completion(
+                target,
+                retry_paused,
+                transfers.snapshots[target].capture(&first),
+                &accepted,
+            );
+            let after_retry = pause.snapshot();
+            let complete = transfers.snapshots[target].complete(snapshot_id, 5);
+            let active = (
+                transfers.active.load(Ordering::SeqCst),
+                transfers.active_capacity.load(Ordering::SeqCst),
+            );
+            let weak = Arc::downgrade(&transfers.snapshots[target]);
+            (
+                original,
+                after_tail,
+                after_retry,
+                before_retry,
+                complete,
+                captured,
+                (original_paused, tail_paused, retry_paused),
+                active,
+                weak,
+            )
+        };
+        // All local requests, encoded replies, observers and pause controls
+        // have been dropped before any acknowledgment/coverage assertion.
+        assert!(weak.upgrade().is_none(), "local snapshot observer released");
+        assert_eq!(active, (0, 0));
+        println!("CONFIG_CAPACITY_SNAPSHOT_ACK_LOCAL_CLEANUP owners_released=true native_operation=false");
+        assert!(captured);
+        assert_eq!(pauses, (true, false, false));
+        assert_eq!((original.entered, original.completed), (1, 1));
+        assert!(original.untyped);
+        assert_eq!(
+            complete,
+            Some(2),
+            "later matching retry completes both exact chunks"
+        );
+        assert_eq!((after_tail.entered, after_tail.completed), (1, 1),
+            "CONFIG_CAPACITY_SNAPSHOT_ACK_RETRY_RED: later chunk acknowledgments cannot complete the original pause");
+        assert_eq!((after_retry.entered, after_retry.completed), (1, 1),
+            "CONFIG_CAPACITY_SNAPSHOT_ACK_RETRY_RED: only the original invocation completes the pause");
+        assert_eq!(after_tail.success, original.success);
+        assert_eq!(after_retry.success, original.success,
+            "CONFIG_CAPACITY_SNAPSHOT_ACK_RETRY_RED: a later successful retry cannot replace the original result");
+        assert_eq!(
+            before_retry, expected_before_retry,
+            "exact original chunk acknowledgment"
+        );
+        assert_eq!(original.success, expected_success,
+            "CONFIG_CAPACITY_SNAPSHOT_ACK_SEMANTIC_RED: decoded engine Ok must acknowledge the captured request vote");
+        println!("CONFIG_CAPACITY_SNAPSHOT_ACK_PASS original_success={expected_success} chunks=2 native_operation=false");
+    }
+
+    #[tokio::test]
+    async fn paused_snapshot_rejects_encoded_engine_error() {
+        exercise(Err(RaftError::Fatal(Fatal::Stopped)), false, None).await;
+    }
+
+    #[tokio::test]
+    async fn paused_snapshot_rejects_wrong_vote() {
+        let sender = nine_manifest()
+            .bind_local(replica_id(0))
+            .unwrap()
+            .local_consensus_node_id();
+        exercise(
+            Ok(InstallSnapshotResponse {
+                vote: Vote::new_committed(8, sender),
+            }),
+            false,
+            None,
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn paused_snapshot_accepts_matching_ack() {
+        let sender = nine_manifest()
+            .bind_local(replica_id(0))
+            .unwrap()
+            .local_consensus_node_id();
+        exercise(
+            Ok(InstallSnapshotResponse {
+                vote: Vote::new_committed(7, sender),
+            }),
+            true,
+            Some(2),
+        )
+        .await;
+    }
+}

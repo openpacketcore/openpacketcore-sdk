@@ -18,6 +18,8 @@ mod config_capacity_attestation_tests;
 mod config_capacity_review_tests;
 #[cfg(test)]
 mod config_capacity_rpc_tests;
+#[cfg(all(test, target_os = "linux", feature = "dangerous-test-hooks"))]
+pub(super) use tests::config_capacity_caller_ledger_tests::command_heap as observed_command_heap;
 #[cfg(all(test, target_os = "linux"))]
 pub(super) use tests::config_capacity_caller_ledger_tests::observation as config_capacity_caller_ledger_observation;
 #[cfg(all(test, target_os = "linux"))]
@@ -382,6 +384,32 @@ impl fmt::Debug for ConsensusConfigStore {
 }
 
 impl ConsensusConfigStore {
+    /// Attach a metadata-only native owner bridge to one exact audited mutation.
+    /// Qualification only; the callback must not retain commands or storage.
+    #[cfg(feature = "dangerous-test-hooks")]
+    #[doc(hidden)]
+    pub async fn observe_capacity_native_owners_for_test(
+        &self,
+        prepared: &super::PreparedAuditedMutation,
+        preparations: Arc<super::capacity_observation::PreparationCensus>,
+        observer: Arc<dyn super::capacity_observation::NativeOwnerObserver>,
+    ) -> Result<super::capacity_observation::NativeRegistration, PersistError> {
+        let request =
+            derive_durable_request_id(self.inner.identity, b"audit-config", &prepared.handle().mac);
+        let connection = self.inner.backend.conn();
+        let conn = connection.lock().await;
+        super::capacity_observation::NativeRegistration::new(
+            &conn,
+            self.inner.identity,
+            self.inner.local_node_id,
+            request,
+            prepared,
+            preparations,
+            observer,
+        )
+        .ok_or_else(consensus_unavailable)
+    }
+
     /// Ask Openraft to start one normal campaign for deterministic integration
     /// qualification. Openraft owns vote creation, persistence, and transport.
     #[cfg(feature = "dangerous-test-hooks")]

@@ -3255,6 +3255,9 @@ fn apply_audited_mutation_sync(
     cancellation: &SqliteWorkCancellation,
 ) -> io::Result<Result<(), ConfigMutationFailure>> {
     use crate::audit_authority::AuditOperationState;
+    #[cfg(feature = "dangerous-test-hooks")]
+    let _capacity_native_scope =
+        super::capacity_observation::NativeScope::start(conn, request_id, prepared);
     let invalid = || invalid_data("invalid audited configuration mutation");
     if prepared.verify_effect(key).is_err() {
         return Ok(Err(ConfigMutationFailure::InvalidInput));
@@ -3266,6 +3269,12 @@ fn apply_audited_mutation_sync(
     #[cfg(test)]
     let observed_ledger =
         super::config_capacity_simultaneous_working_tests::ledger::mutating(&ledger);
+    #[cfg(feature = "dangerous-test-hooks")]
+    super::capacity_observation::sample(
+        super::capacity_observation::NativeStage::AuthenticatedMutation,
+        &ledger,
+        None,
+    );
     let receipt = match ledger.lookup(key, &prepared.handle, prepared.handle.body.binding.caller) {
         Ok(Some(receipt)) => receipt,
         _ => return Ok(Err(ConfigMutationFailure::InvalidInput)),

@@ -28,6 +28,34 @@ use opc_key::{ConfigAad, EnvelopeAad, KeyId, KeyPurpose, MemoryKeyProvider, Zero
 use opc_types::{ConfigVersion, SchemaDigest, TenantId, Timestamp, TxId};
 use std::mem::size_of;
 
+#[cfg(feature = "dangerous-test-hooks")]
+struct BridgeOracles {
+    census: Arc<crate::config_capacity_observation::PreparationCensus>,
+    result: std::sync::Mutex<(usize, usize, usize)>,
+}
+
+#[cfg(feature = "dangerous-test-hooks")]
+impl crate::config_capacity_observation::NativeOwnerObserver for BridgeOracles {
+    fn observe(&self, sample: crate::config_capacity_observation::NativeOwnerSample) {
+        // This permitted metadata-only callback reenters the public counter
+        // read while the real native sample holds its preparation drop barrier.
+        // A counter-lock removal control must run in its own exact test process.
+        println!(
+            "CONFIG_CAPACITY_NATIVE_COUNTER_READ_ENTER stage={:?}",
+            sample.stage
+        );
+        let counters = self.census.snapshot();
+        let mut result = self.result.lock().unwrap();
+        result.0 += 1;
+        result.1 += usize::from(sample.independent_oracles_match);
+        result.2 += usize::from(
+            counters == sample.preparations
+                && counters.registrations == 1
+                && counters.commands == 1,
+        );
+    }
+}
+
 const OPERATION_BYTES: usize = 33_554_432;
 const METADATA_BYTES: usize = 196_608;
 // The public signing-key constructor admits every nonzero epoch through i64::MAX.
@@ -419,7 +447,7 @@ pub(crate) mod observation {
     }
 }
 
-fn command_heap(command: &AuditedConfigCommand) -> usize {
+pub(crate) fn command_heap(command: &AuditedConfigCommand) -> usize {
     let AuditedConfigEffect::BoundedAppend { commit, .. } = &command.effect else {
         panic!("bounded append fixture");
     };
@@ -976,6 +1004,26 @@ async fn public_audited_ledger_lifetime_with_native_owners(
         recovery: recovery.capacity(),
         ..Sample::default()
     };
+    #[cfg(feature = "dangerous-test-hooks")]
+    let bridge_census = Arc::new(crate::config_capacity_observation::PreparationCensus::default());
+    #[cfg(feature = "dangerous-test-hooks")]
+    let bridge_preparation_owner = bridge_census
+        .observe_audited(store.status().node_id, &prepared)
+        .expect("borrow one genuine native preparation for the callback regression");
+    #[cfg(feature = "dangerous-test-hooks")]
+    let bridge_oracles = Arc::new(BridgeOracles {
+        census: bridge_census.clone(),
+        result: std::sync::Mutex::new((0, 0, 0)),
+    });
+    #[cfg(feature = "dangerous-test-hooks")]
+    let bridge_registration = store
+        .observe_capacity_native_owners_for_test(
+            &prepared,
+            bridge_census.clone(),
+            bridge_oracles.clone(),
+        )
+        .await
+        .expect("attach actual owner oracle comparison");
     let observation = observation::Registration::new(
         request,
         base,
@@ -1015,6 +1063,8 @@ async fn public_audited_ledger_lifetime_with_native_owners(
     }
     verify(&store, &provider, &aad, &plaintext, &prepared, caller).await;
     store.shutdown().await.expect("join native owners");
+    #[cfg(feature = "dangerous-test-hooks")]
+    bridge_registration.detach();
     if let Some(native_owners) = &native_owners {
         native_owners.detach();
     }
@@ -1029,6 +1079,21 @@ async fn public_audited_ledger_lifetime_with_native_owners(
         verify_continuity(&reopened, external).await;
     }
     reopened.shutdown().await.expect("join reopened owners");
+    #[cfg(feature = "dangerous-test-hooks")]
+    {
+        let result = *bridge_oracles.result.lock().unwrap();
+        let drained = bridge_registration.snapshot();
+        drop(bridge_preparation_owner);
+        let preparation_drain = bridge_census.snapshot();
+        println!("CONFIG_CAPACITY_NATIVE_BRIDGE_ORACLES_LIFECYCLE exact_readback=true original_recovery=true retained_reopen=true compared={} matched={}", result.0, result.1);
+        assert_eq!((result.0, result.1), (3, 3), "CONFIG_CAPACITY_NATIVE_BRIDGE_ORACLE_RED: actual command_heap and ledger_heap capacities");
+        println!("CONFIG_CAPACITY_NATIVE_COUNTER_READ_LIFECYCLE reads={} preparation_drain={preparation_drain:?} original_recovery=true retained_reopen=true joined_shutdown=true", result.2);
+        assert_eq!(result.2, 3, "CONFIG_CAPACITY_NATIVE_COUNTER_READ_RED: metadata callback reads the same current census at every real native checkpoint");
+        assert_eq!(preparation_drain, Default::default());
+        assert!(!drained.registered);
+        assert_eq!(drained.native_scopes, 0);
+        assert_eq!(drained.transport_scopes, 0);
+    }
     if expanded {
         println!("CONFIG_CAPACITY_LEDGER_CLOSURE_LIFECYCLE exact_readback=true original_recovery=true retained_reopen=true mandatory_checkpoint=true");
     }

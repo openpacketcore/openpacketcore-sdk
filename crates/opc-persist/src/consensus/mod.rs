@@ -8,6 +8,8 @@
 mod audit;
 mod audit_mutation;
 pub use audit_mutation::PreparedAuditedMutation;
+#[cfg(feature = "dangerous-test-hooks")]
+pub mod capacity_observation;
 mod capacity_record;
 mod config_capacity_decode;
 mod config_capacity_json;

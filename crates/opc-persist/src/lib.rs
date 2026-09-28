@@ -103,6 +103,8 @@ pub mod audit_authority;
 mod backend;
 pub mod break_glass;
 mod consensus;
+#[cfg(feature = "dangerous-test-hooks")]
+pub use consensus::capacity_observation as config_capacity_observation;
 mod consumer_checkpoint;
 mod error;
 mod local_sqlite;

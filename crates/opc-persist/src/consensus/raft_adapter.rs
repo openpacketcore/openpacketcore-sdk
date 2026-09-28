@@ -194,13 +194,23 @@ impl ConfigRaftNetwork {
                 )))
             }
         };
-        self.call(
+        #[cfg(feature = "dangerous-test-hooks")]
+        let observation = super::capacity_observation::append_context(
+            self.identity,
+            self.local_node_id,
+            self.target,
+            request,
+            &payload,
+        );
+        let call = self.call(
             ConsensusRpcFamily::AppendEntries,
             opc_consensus::engine::RPCTypes::AppendEntries,
             payload,
             option,
-        )
-        .await
+        );
+        #[cfg(feature = "dangerous-test-hooks")]
+        let call = super::capacity_observation::scope_transport(observation, call);
+        call.await
     }
 }
 
@@ -227,13 +237,23 @@ impl RaftNetwork<ConfigRaftTypeConfig> for ConfigRaftNetwork {
             encode_config_wire_for_profile(self.capacity_profile, &request).map_err(|error| {
                 EngineRpcError::Unreachable(Unreachable::new(&CodecTransportError(error)))
             })?;
-        self.call(
+        #[cfg(feature = "dangerous-test-hooks")]
+        let observation = super::capacity_observation::snapshot_context(
+            self.identity,
+            self.local_node_id,
+            self.target,
+            &request.data,
+            &payload,
+        );
+        let call = self.call(
             ConsensusRpcFamily::InstallSnapshot,
             opc_consensus::engine::RPCTypes::InstallSnapshot,
             payload,
             option,
-        )
-        .await
+        );
+        #[cfg(feature = "dangerous-test-hooks")]
+        let call = super::capacity_observation::scope_transport(observation, call);
+        call.await
     }
 
     async fn vote(
