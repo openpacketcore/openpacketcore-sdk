@@ -1438,6 +1438,84 @@ impl Serialize for PreparedFencedTransition {
     }
 }
 
+/// Protected V2 transition retained under one caller-stable identity.
+///
+/// A protected wrapper creates this value only after it has durably bound the
+/// caller's [`FencedTransitionRequestId`] to the exact sealed physical V2
+/// request in its [`crate::FencedTransitionV2RecoveryJournal`]. The value is
+/// opaque: it exposes neither the sealed request nor any way to construct
+/// one, so a caller cannot lower it into a replayable physical transition.
+/// Only the wrapper that journaled it can dispatch or query it, and only
+/// after reloading and comparing its authenticated journal row.
+#[derive(Clone, PartialEq, Eq)]
+pub struct PreparedFencedTransitionV2 {
+    request_id: FencedTransitionRequestId,
+    request: Box<FencedTransitionV2Request>,
+}
+
+impl PreparedFencedTransitionV2 {
+    pub(crate) fn new(
+        request_id: FencedTransitionRequestId,
+        request: FencedTransitionV2Request,
+    ) -> Self {
+        Self {
+            request_id,
+            request: Box::new(request),
+        }
+    }
+
+    /// Caller-stable identity under which the sealed request is retained.
+    pub const fn request_id(&self) -> FencedTransitionRequestId {
+        self.request_id
+    }
+
+    /// History epoch that the protected wrapper selected at preparation.
+    ///
+    /// The epoch is chosen internally from the linearized active epoch; it is
+    /// exposed only so a caller can relate the retained transition to a later
+    /// linearized history state.
+    pub fn history_epoch(&self) -> FencedTransitionV2HistoryEpoch {
+        self.request.request_id().epoch()
+    }
+
+    pub(crate) fn physical_request(&self) -> &FencedTransitionV2Request {
+        &self.request
+    }
+}
+
+impl fmt::Debug for PreparedFencedTransitionV2 {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("PreparedFencedTransitionV2(<redacted>)")
+    }
+}
+
+/// Durable lookup result for one caller-stable protected V2 identity.
+///
+/// `Absent` describes only the SDK recovery journal. It is distinct from
+/// [`FencedTransitionV2Status::NotFound`], which is a non-exclusionary
+/// observation of the consensus receipt history.
+#[derive(Clone, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum PreparedFencedTransitionV2Lookup {
+    /// The exact sealed request is durably retained for status recovery.
+    Found(PreparedFencedTransitionV2),
+    /// No sealed request is retained for this identity in the journal.
+    Absent,
+}
+
+impl fmt::Debug for PreparedFencedTransitionV2Lookup {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let kind = match self {
+            Self::Found(_) => "found",
+            Self::Absent => "absent",
+        };
+        formatter
+            .debug_struct("PreparedFencedTransitionV2Lookup")
+            .field("kind", &kind)
+            .finish_non_exhaustive()
+    }
+}
+
 /// A V2 request whose identity commits to its exact canonical body.
 ///
 /// Construct it once with [`FencedTransitionV2Request::new`] and retain the
