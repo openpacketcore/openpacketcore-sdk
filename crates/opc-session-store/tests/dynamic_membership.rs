@@ -22,12 +22,14 @@ use opc_key::{
 use opc_session_store::test_support::{
     assert_mixed_compacted_roster_status_and_terminal_conflict_for_test,
     assert_stale_predecessor_signed_fresh_roster_admission_rejected_for_test,
-    consensus_local_durable_progress_for_test, is_replayed_joint_voting_for_test,
-    observe_next_unstage_supervisor_for_test, pause_next_learner_barrier_snapshot_for_test,
-    pause_next_outbound_learner_barrier_for_test, pause_next_outbound_voting_barrier_for_test,
-    pause_next_staged_reconciliation_for_test, recover_signed_roster_terminal_authority_for_test,
+    close_consensus_application_admission_for_test, consensus_local_durable_progress_for_test,
+    is_replayed_joint_voting_for_test, observe_next_unstage_supervisor_for_test,
+    pause_next_learner_barrier_snapshot_for_test, pause_next_outbound_learner_barrier_for_test,
+    pause_next_outbound_voting_barrier_for_test, pause_next_staged_reconciliation_for_test,
+    recover_signed_roster_terminal_authority_for_test,
     release_signed_fresh_roster_admission_for_test, replay_applied_learner_barrier_for_test,
-    replay_joint_voting_barrier_for_test, replay_joint_voting_barrier_with_gate_probe_for_test,
+    replay_joint_voting_barrier_for_test, replay_joint_voting_barrier_request_for_test,
+    replay_joint_voting_barrier_with_gate_probe_for_test,
     replay_learner_barrier_with_gate_probe_for_test,
     replay_staging_barrier_with_gate_probe_for_test, roster_attestation_trust_root_for_test,
     submit_signed_fresh_roster_admission_for_test, submit_signed_fresh_roster_cycle_for_test,
@@ -1294,6 +1296,61 @@ impl DynamicFleet {
         self.stores[index] = reopened;
     }
 
+    #[cfg(feature = "test-control")]
+    async fn restart_current_member_without_transition_request(
+        &mut self,
+        index: usize,
+        active_indices: &[usize],
+        identity: SessionConsensusIdentity,
+    ) {
+        self.network.retire_incarnation(index).await;
+        let placeholder_index = active_indices
+            .iter()
+            .copied()
+            .find(|candidate| *candidate != index)
+            .expect("restart placeholder");
+        let placeholder = self.stores[placeholder_index].clone();
+        let retired = std::mem::replace(&mut self.stores[index], placeholder);
+        retired
+            .shutdown()
+            .await
+            .expect("fully drain current follower before durable reopen");
+        drop(retired);
+
+        let topology = ValidatedQuorumTopology::try_from(
+            self.topology_configuration(
+                replica_id(index),
+                active_indices
+                    .iter()
+                    .map(|member| self.members[*member].clone())
+                    .collect(),
+                identity,
+            ),
+        )
+        .expect("restart current topology without a transition request");
+        let peers = self
+            .network
+            .peers_for_indices(index, identity, active_indices.iter().copied());
+        let reopened = ConsensusSessionStore::open_with_clock(
+            topology,
+            self._backends[index].clone(),
+            self._directory.path().join(format!("snapshots-{index}")),
+            peers,
+            self.clock.clone(),
+            STORE_OPERATION_TIMEOUT,
+        )
+        .await
+        .expect("reopen current follower from its real durable state");
+        self.network.install(index, reopened.rpc_handler()).await;
+        let transport = Arc::new(RecordingTransportAdmission::default());
+        let binding: Arc<dyn SessionTopologyTransportAdmission> = transport.clone();
+        reopened
+            .bind_topology_transport_admission(binding)
+            .expect("bind current follower transport without staging a request");
+        self.transports[index] = transport;
+        self.stores[index] = reopened;
+    }
+
     fn bind_transport_admission(&mut self) {
         self.transports = self
             .stores
@@ -1489,6 +1546,35 @@ async fn live_three_to_five_to_three_preserves_quorum_and_fences_removed_voters(
     fleet.commit(&contract, &contract_proof, &[0, 1, 2]).await;
     wait_completed_and_admitted(&fleet.stores, &contract, &[0, 1, 2], &[3, 4]).await;
     prove_read_write_on_every_active_store(&fleet.stores, &[0, 1, 2], "epoch-3").await;
+
+    #[cfg(feature = "test-control")]
+    for index in 0..INITIAL_MEMBER_COUNT {
+        let sender = fleet.network.node_ids[(index + 1) % INITIAL_MEMBER_COUNT];
+        let before = topology_admission_state_for_test(&fleet.stores[index], &contract)
+            .expect("contracted local admission");
+        assert!(
+            !replay_joint_voting_barrier_for_test(&fleet.stores[index], &expand, sender).await,
+            "an earlier finalized request must not acknowledge a later current scope"
+        );
+        assert!(
+            replay_joint_voting_barrier_for_test(&fleet.stores[index], &contract, sender).await,
+            "retained admitted members acknowledge the current successor"
+        );
+        assert!(
+            !replay_joint_voting_barrier_for_test(
+                &fleet.stores[index],
+                &contract,
+                fleet.network.node_ids[3],
+            )
+            .await,
+            "a removed sender must not obtain a current-successor acknowledgment"
+        );
+        assert_eq!(
+            topology_admission_state_for_test(&fleet.stores[index], &contract)
+                .expect("contracted admission readback"),
+            before,
+        );
+    }
 
     let contracted_leader = fleet.stores[0]
         .status()
@@ -2295,6 +2381,233 @@ async fn run_lost_joint_quorum_case(case: LostJointQuorum, seed: u8) {
 
 #[cfg(feature = "test-control")]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn current_voting_ack_requires_live_application_admission() {
+    let active = [0, 1, 2, 3, 4];
+    let mut fleet = DynamicFleet::start_three().await;
+    let request = fleet.transition_request(1, &active, 0xA8);
+    fleet.provision_expansion(&request).await;
+    let leader = fleet.wait_transition_caller(&[0, 1, 2]).await;
+    let proof = fleet.stores[leader]
+        .prepare_topology_transition(&request, fleet.network.peers_for_request(leader, &request))
+        .await
+        .expect("prepare one real expansion");
+    let completed = fleet.stores[leader]
+        .commit_topology_transition(&request, &proof)
+        .await
+        .expect("complete one real expansion at its original deadline");
+    assert_eq!(completed.phase(), SessionTopologyTransitionPhase::Completed);
+    wait_completed_and_admitted(&fleet.stores, &request, &active, &[]).await;
+
+    let leader = fleet.wait_transition_caller(&active).await;
+    let follower = (0..INITIAL_MEMBER_COUNT)
+        .find(|index| *index != leader)
+        .expect("retained follower");
+    let store = &fleet.stores[follower];
+    let sender = fleet.network.node_ids[leader];
+    let uniform_log = wait_for_applied_uniform_membership_for_test(
+        store,
+        &request,
+        tokio::time::Instant::now() + STORE_OPERATION_TIMEOUT,
+    )
+    .await
+    .expect("follower has exact durable and applied uniform membership");
+    let before =
+        topology_admission_state_for_test(store, &request).expect("completed follower admission");
+    assert!(before.current_request && !before.staged && before.admitted_latch);
+    assert!(store.status().admitted);
+    let callbacks_before = (
+        fleet.transports[follower].voting_admissions(),
+        fleet.transports[follower].finalizations(),
+    );
+    assert!(
+        replay_joint_voting_barrier_for_test(store, &request, sender).await,
+        "the exact current request must reach the Ready path before admission closes"
+    );
+    assert_eq!(
+        topology_admission_state_for_test(store, &request).expect("after initial Ready"),
+        before
+    );
+
+    // This test-only operation can only close admission. It leaves the exact
+    // durable proof, authenticated sender, request, and current bindings intact.
+    close_consensus_application_admission_for_test(store);
+    let closed =
+        topology_admission_state_for_test(store, &request).expect("closed application admission");
+    assert!(closed.current_request && !closed.staged && !closed.admitted_latch);
+    assert!(!store.status().admitted);
+    let closed_ready = replay_joint_voting_barrier_for_test(store, &request, sender).await;
+    let after_closed = topology_admission_state_for_test(store, &request);
+    let callbacks_after_closed = (
+        fleet.transports[follower].voting_admissions(),
+        fleet.transports[follower].finalizations(),
+    );
+    eprintln!(
+        "current_voting_ack_admission boundary=closed uniform_log={uniform_log} current={} staged={} admitted={} ready={closed_ready}",
+        closed.current_request, closed.staged, closed.admitted_latch
+    );
+
+    // Restore authority through one supported completed-request resume, before
+    // evaluating the negative response. Ordinary initialization still checks
+    // this incarnation's predecessor bootstrap voters after the expansion.
+    let readmitted = store
+        .commit_topology_transition(&request, &proof)
+        .await
+        .expect("exact completed-request resume restores application admission");
+    assert_eq!(
+        readmitted.phase(),
+        SessionTopologyTransitionPhase::Completed
+    );
+    let restored =
+        topology_admission_state_for_test(store, &request).expect("readmitted current follower");
+    assert_eq!(restored, before);
+    assert!(store.status().admitted);
+    let restored_ready = replay_joint_voting_barrier_for_test(store, &request, sender).await;
+    assert!(
+        restored_ready,
+        "exact readmission restores current voting acknowledgment"
+    );
+    wait_completed_and_admitted(&fleet.stores, &request, &active, &[]).await;
+    prove_read_write_on_every_active_store(&fleet.stores, &active, "current-voting-ack-readmitted")
+        .await;
+    assert_eq!(
+        after_closed.expect("closed probe admission readback"),
+        closed
+    );
+    assert_eq!(callbacks_after_closed, callbacks_before);
+    assert_eq!(
+        (
+            fleet.transports[follower].voting_admissions(),
+            fleet.transports[follower].finalizations(),
+        ),
+        callbacks_before,
+        "current acknowledgments and exact completed resume must not invoke transport admission"
+    );
+    eprintln!(
+        "current_voting_ack_admission cleanup=complete admitted={} ready={restored_ready} callbacks_unchanged=true read_write=complete",
+        store.status().admitted
+    );
+    assert!(
+        !closed_ready,
+        "current voting acknowledgment must reject closed application admission after cleanup"
+    );
+}
+
+#[cfg(feature = "test-control")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn current_voting_ack_after_restart_requires_exact_completed_request_resume() {
+    let active = [0, 1, 2, 3, 4];
+    let mut fleet = DynamicFleet::start_three().await;
+    let request = fleet.transition_request(1, &active, 0xA9);
+    fleet.provision_expansion(&request).await;
+    let leader = fleet.wait_transition_caller(&[0, 1, 2]).await;
+    let proof = fleet.stores[leader]
+        .prepare_topology_transition(&request, fleet.network.peers_for_request(leader, &request))
+        .await
+        .expect("prepare one real expansion before follower restart");
+    let completed = fleet.stores[leader]
+        .commit_topology_transition(&request, &proof)
+        .await
+        .expect("complete one real expansion before follower restart");
+    assert_eq!(completed.phase(), SessionTopologyTransitionPhase::Completed);
+    wait_completed_and_admitted(&fleet.stores, &request, &active, &[]).await;
+
+    let leader = fleet.wait_transition_caller(&active).await;
+    let follower = (0..INITIAL_MEMBER_COUNT)
+        .find(|index| *index != leader)
+        .expect("retained follower to reopen");
+    let sender = fleet.network.node_ids[leader];
+    let original = topology_admission_state_for_test(&fleet.stores[follower], &request)
+        .expect("current follower before restart");
+    assert!(original.current_request && !original.staged && original.admitted_latch);
+    assert!(
+        replay_joint_voting_barrier_for_test(&fleet.stores[follower], &request, sender).await,
+        "real finalization retained the current request before restart"
+    );
+
+    // This helper has no request parameter: it drains the old incarnation and
+    // opens only the durable current topology, with no staging or exact resume.
+    fleet
+        .restart_current_member_without_transition_request(
+            follower,
+            &active,
+            request.desired_identity(),
+        )
+        .await;
+    let store = &fleet.stores[follower];
+    store
+        .initialize_cluster()
+        .await
+        .expect("ordinary cold initialization of a retained current follower");
+    wait_completed_and_admitted(&fleet.stores, &request, &active, &[]).await;
+    let uniform_log = wait_for_applied_uniform_membership_for_test(
+        store,
+        &request,
+        tokio::time::Instant::now() + STORE_OPERATION_TIMEOUT,
+    )
+    .await
+    .expect("reopened follower retains exact durable and applied uniform membership");
+    let cold = topology_admission_state_for_test(store, &request)
+        .expect("ordinary initialization restored current admission");
+    assert_eq!(cold, original);
+    assert!(store.status().admitted);
+    let callbacks_before = (
+        fleet.transports[follower].voting_admissions(),
+        fleet.transports[follower].finalizations(),
+    );
+    assert_eq!(callbacks_before, (0, 0));
+    let cold_ready = replay_joint_voting_barrier_for_test(store, &request, sender).await;
+    let after_cold = topology_admission_state_for_test(store, &request);
+    let callbacks_after_cold = (
+        fleet.transports[follower].voting_admissions(),
+        fleet.transports[follower].finalizations(),
+    );
+    eprintln!(
+        "current_voting_ack_restart boundary=ordinary_initialization uniform_log={uniform_log} current={} staged={} admitted={} ready={cold_ready}",
+        cold.current_request, cold.staged, cold.admitted_latch
+    );
+
+    // Staging a completed retained request may be an idempotent no-op. Resume
+    // the exact completed request once through its supported finalization path.
+    let resumed = store
+        .commit_topology_transition(&request, &proof)
+        .await
+        .expect("exact completed-request resume restores request retention");
+    assert_eq!(resumed.phase(), SessionTopologyTransitionPhase::Completed);
+    assert_eq!(
+        topology_admission_state_for_test(store, &request).expect("after exact completed resume"),
+        cold
+    );
+    assert!(store.status().admitted);
+    let resumed_ready = replay_joint_voting_barrier_for_test(store, &request, sender).await;
+    assert!(
+        resumed_ready,
+        "exact completed-request resume restores current acknowledgment"
+    );
+    wait_completed_and_admitted(&fleet.stores, &request, &active, &[]).await;
+    prove_read_write_on_every_active_store(&fleet.stores, &active, "current-voting-ack-reopened")
+        .await;
+    assert_eq!(after_cold.expect("cold probe admission readback"), cold);
+    assert_eq!(callbacks_after_cold, callbacks_before);
+    assert_eq!(
+        (
+            fleet.transports[follower].voting_admissions(),
+            fleet.transports[follower].finalizations(),
+        ),
+        callbacks_before,
+        "the current exact-resume path and voting probes need no transport callback"
+    );
+    eprintln!(
+        "current_voting_ack_restart cleanup=complete admitted={} ready={resumed_ready} callbacks_unchanged=true read_write=complete",
+        store.status().admitted
+    );
+    assert!(
+        !cold_ready,
+        "ordinary cold initialization must not reconstruct the full request from its digest"
+    );
+}
+
+#[cfg(feature = "test-control")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn delayed_learner_barrier_cannot_refence_completed_successor() {
     let mut fleet = DynamicFleet::start_three().await;
     let request = fleet.transition_request(1, &[0, 1, 2, 3, 4], 0xA3);
@@ -2510,14 +2823,169 @@ async fn incoming_barrier_progresses_while_concurrent_commits_hold_operation_gat
                 assert!(commit.await.expect_err("paused nonleader cancellation").is_cancelled());
             }
         }
+        // Hold one real finalization callback so a voting request can capture
+        // staging and then wait while that callback consumes it under the gate.
+        let raced_follower = (0..fleet.stores.len()).find(|index| *index != leader)
+            .expect("follower for admission-gate revalidation");
+        fleet.transports[raced_follower].block_next_finalization();
+        // Let the real follower reconcilers consume uniform staging before
+        // this same leader dispatches its first remote voting barriers.
+        let (voting_entered, voting_release) =
+            pause_next_outbound_voting_barrier_for_test(&fleet.stores[leader])
+                .expect("observe the original leader's outbound voting boundary");
         for (index, release) in releases.into_iter().enumerate() {
             if index == leader {
                 release.send(()).expect("release the original leader's outbound barrier");
             }
         }
-        let status = leader_commit.expect("retained leader future").await
-            .expect("leader commit task").expect("real leader commit after boundary proof");
+        let mut leader_commit = leader_commit.expect("retained leader future");
+        let voting_deadline = tokio::select! {
+            result = &mut leader_commit => panic!("leader returned before voting boundary: {result:?}"),
+            result = voting_entered => result.expect("original leader reached voting boundary"),
+        };
+        assert_eq!(voting_deadline, deadline, "the operation deadline must not renew");
+        fleet.transports[raced_follower].wait_for_blocked_finalization().await;
+        let before_race = topology_admission_state_for_test(&fleet.stores[raced_follower], &request)
+            .expect("actual finalizer still owns staging and the admission gate");
+        assert!(before_race.staged && !before_race.current_request && !before_race.admitted_latch);
+        let (observed, first_poll) = tokio::sync::oneshot::channel();
+        let mut waiting_vote = {
+            let store = fleet.stores[raced_follower].clone();
+            let request = request.clone();
+            let sender = fleet.network.node_ids[leader];
+            tokio::spawn(async move {
+                replay_joint_voting_barrier_with_gate_probe_for_test(&store, &request, sender, observed).await
+            })
+        };
+        let first_poll = tokio::select! {
+            biased;
+            result = first_poll => result.expect("captured voting request reaches the real admission gate"),
+            result = &mut waiting_vote => panic!("voting request returned before gate observation: {result:?}"),
+        };
+        assert_eq!(first_poll, LocalAdmissionGatePollForTest::Pending,
+            "the proof-validating finalization callback must own the real admission gate");
+        fleet.transports[raced_follower].release_finalization();
+        let waited_vote_ready = waiting_vote.await.expect("same voting request after finalization");
+        let after_race = topology_admission_state_for_test(&fleet.stores[raced_follower], &request)
+            .expect("finalizer consumed staging while the voting request waited");
+        assert!(after_race.current_request && !after_race.staged && after_race.admitted_latch);
+        eprintln!("current_voting_ack gate_revalidation=consumed_staging ready={waited_vote_ready}");
+        let sender = fleet.network.node_ids[leader];
+        let identity = request.desired_identity();
+        let transition_id = request.transition_id().as_bytes();
+        let request_digest = request.request_digest().as_bytes();
+        let mut wrong_id = transition_id;
+        wrong_id[0] ^= 1;
+        let mut wrong_digest = request_digest;
+        wrong_digest[0] ^= 1;
+        let outsider = opc_consensus::derive_node_id(request.cluster_id(), b"unlisted-voting-sender")
+            .expect("synthetic outsider node ID");
+        assert!(!request.desired_consensus_node_ids().contains(&outsider));
+        let wrong_epoch = SessionConsensusIdentity::new(
+            identity.cluster_id(), identity.configuration_id(), request.expected_epoch(),
+        );
+        let wrong_configuration = SessionConsensusIdentity::new(
+            identity.cluster_id(),
+            opc_consensus::ConsensusConfigurationId::from_bytes([0xEE; 32]),
+            identity.configuration_epoch(),
+        );
+        let wrong_cluster = SessionConsensusIdentity::new(
+            ConsensusClusterId::new("unrelated-voting-cluster").expect("synthetic cluster"),
+            identity.configuration_id(), identity.configuration_epoch(),
+        );
+        let wrong_membership = SessionTopologyTransitionRequest::try_new(
+            request.transition_id(), request.cluster_id(), request.expected_epoch(),
+            request.desired_epoch(), fleet.members[..INITIAL_MEMBER_COUNT].to_vec(),
+            request.operation_timeout(),
+        ).expect("valid but conflicting desired membership");
+        assert_ne!(wrong_membership.request_digest(), request.request_digest());
+
+        let mut reconciled_followers = 0;
+        let mut reconciled_ready = 0;
+        for index in (0..fleet.stores.len()).filter(|index| *index != leader) {
+            let uniform = wait_for_applied_uniform_membership_for_test(
+                &fleet.stores[index], &request, deadline,
+            ).await.expect("follower durably applied actual uniform membership");
+            loop {
+                let state = topology_admission_state_for_test(&fleet.stores[index], &request)
+                    .expect("read follower admission facts");
+                if state.current_request && !state.staged && state.admitted_latch {
+                    break;
+                }
+                tokio::time::sleep(POLL_INTERVAL).await;
+            }
+            reconciled_followers += 1;
+            let before = topology_admission_state_for_test(&fleet.stores[index], &request)
+                .expect("reconciled follower admission");
+            let callbacks = fleet.transports[index].voting_admissions();
+            for (case, probe_sender, scope, id, digest) in [
+                ("transition", sender, identity, wrong_id, request_digest),
+                ("request", sender, identity, transition_id, wrong_digest),
+                ("sender", outsider, identity, transition_id, request_digest),
+                ("epoch", sender, wrong_epoch, transition_id, request_digest),
+                ("configuration", sender, wrong_configuration, transition_id, request_digest),
+                ("cluster", sender, wrong_cluster, transition_id, request_digest),
+            ] {
+                assert!(
+                    !replay_joint_voting_barrier_request_for_test(
+                        &fleet.stores[index], probe_sender, scope, id, digest,
+                    ).await,
+                    "reconciled follower accepted a mismatched {case}"
+                );
+            }
+            assert!(
+                !replay_joint_voting_barrier_for_test(
+                    &fleet.stores[index], &wrong_membership, sender,
+                ).await,
+                "reconciled follower accepted a conflicting desired membership"
+            );
+            assert!(
+                !replay_applied_learner_barrier_for_test(
+                    &fleet.stores[index], &request, sender,
+                ).await.expect("replay the real durable learner marker"),
+                "a stale learner barrier must remain NotReady"
+            );
+            let ready = replay_joint_voting_barrier_for_test(
+                &fleet.stores[index], &request, sender,
+            ).await;
+            reconciled_ready += usize::from(ready);
+            assert_eq!(
+                topology_admission_state_for_test(&fleet.stores[index], &request)
+                    .expect("admission readback after voting and stale learner replays"),
+                before,
+                "acknowledgment and rejected replays must not change local admission"
+            );
+            assert_eq!(fleet.transports[index].voting_admissions(), callbacks,
+                "current-successor acknowledgment must not repeat transport admission");
+            eprintln!(
+                "current_voting_ack follower={index} uniform_log={uniform} ready={ready} remaining_us={}",
+                deadline.saturating_duration_since(tokio::time::Instant::now()).as_micros(),
+            );
+        }
+        assert_eq!(reconciled_followers, EXPANDED_MEMBER_COUNT - 1);
+        let leader_state = topology_admission_state_for_test(&fleet.stores[leader], &request)
+            .expect("leader admission at its real outbound voting boundary");
+        assert!(leader_state.staged && !leader_state.current_request);
+        assert!(tokio::time::Instant::now() < deadline, "reconciliation must precede original expiry");
+        eprintln!(
+            "current_voting_ack boundary=reconciled followers={reconciled_followers} ready={reconciled_ready} leader_staged=true leader_current=false"
+        );
+        voting_release.send(()).expect("release the same original leader voting boundary");
+        // Defer the positive replay assertion until the real leader completes.
+        // Removing the repair must reach the boundary above and fail here,
+        // rather than stop at a probe before attempting the actual quorum.
+        let result = tokio::select! {
+            biased;
+            result = &mut leader_commit => result.expect("leader commit task"),
+            () = tokio::time::sleep_until(deadline) => {
+                panic!("original leader completion deadline after reconciled voting boundary")
+            },
+        };
+        let status = result.expect("real leader commit after reconciled voting boundary");
         assert_eq!(status.phase(), SessionTopologyTransitionPhase::Completed);
+        assert!(waited_vote_ready, "a captured voting request must revalidate consumed staging");
+        assert_eq!(reconciled_ready, EXPANDED_MEMBER_COUNT - 1,
+            "every reconciled current follower must acknowledge the exact voting barrier");
         wait_completed_and_admitted(&fleet.stores, &request, &[0, 1, 2, 3, 4], &[]).await;
     }).await.expect("concurrent boundary schedule must fit the original leader operation deadline");
     prove_read_write_on_every_active_store(

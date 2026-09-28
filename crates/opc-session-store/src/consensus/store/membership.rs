@@ -278,6 +278,11 @@ struct TopologyBindingState {
     current_identity: SessionConsensusIdentity,
     current_descriptors: BTreeMap<SessionConsensusNodeId, QuorumReplicaDescriptor>,
     staged: Option<StagedTopologyBindings>,
+    // One process-local request, not authority or history. Retain its exact
+    // digest-bound timeout after staging is consumed so voting acknowledgments
+    // can revalidate durable evidence. A later finalization replaces it;
+    // reopening requires the caller to supply the exact request again.
+    finalized_request: Option<SessionTopologyTransitionRequest>,
     // Maximum replicated log index represented by the last accepted scope.
     // This orders async SQLite observations without clocks or task ordering.
     last_scope_progress_index: Option<u64>,
@@ -607,15 +612,35 @@ pub async fn replay_joint_voting_barrier_for_test(
     request: &SessionTopologyTransitionRequest,
     authenticated_sender: SessionConsensusNodeId,
 ) -> bool {
+    replay_joint_voting_barrier_request_for_test(
+        store,
+        authenticated_sender,
+        request.desired_identity(),
+        request.transition_id().as_bytes(),
+        request.request_digest().as_bytes(),
+    )
+    .await
+}
+
+/// Exercise the authenticated voting handler with independently supplied wire fields.
+/// This permits rejection tests to change one identity field at a time.
+#[cfg(feature = "test-control")]
+pub async fn replay_joint_voting_barrier_request_for_test(
+    store: &ConsensusSessionStore,
+    authenticated_sender: SessionConsensusNodeId,
+    identity: SessionConsensusIdentity,
+    transition_id: [u8; 16],
+    request_digest: [u8; 32],
+) -> bool {
     let reply = REPLAYED_JOINT_VOTING_FOR_TEST
         .scope(
             (),
             store.handle_topology_admission_barrier(
                 authenticated_sender,
-                request.desired_identity(),
+                identity,
                 TopologyAdmissionBarrierRequest {
-                    transition_id: request.transition_id().as_bytes(),
-                    request_digest: request.request_digest().as_bytes(),
+                    transition_id,
+                    request_digest,
                     action: TopologyAdmissionBarrierAction::AdmitJointVoting,
                 },
             ),
@@ -926,6 +951,7 @@ impl SessionTopologyCoordinatorState {
                 current_identity: identity,
                 current_descriptors: descriptors,
                 staged: None,
+                finalized_request: None,
                 last_scope_progress_index: None,
                 blocking_terminal: None,
                 retained_transitions: BTreeMap::new(),
@@ -1233,6 +1259,7 @@ impl SessionTopologyCoordinatorState {
                 }
                 state.staged = None;
             }
+            state.finalized_request = Some(request.clone());
             return Ok(());
         }
         if state.current_identity.configuration_epoch() != request.expected_epoch()
@@ -1254,6 +1281,7 @@ impl SessionTopologyCoordinatorState {
         }
         state.current_identity = staged.desired_identity;
         state.current_descriptors = staged.desired_descriptors;
+        state.finalized_request = Some(staged.request);
         Ok(())
     }
 
@@ -1352,6 +1380,34 @@ impl SessionTopologyCoordinatorState {
             return Err(SessionTopologyTransitionError::IdempotencyConflict);
         }
         Ok(staged.request.clone())
+    }
+
+    fn finalized_request(
+        &self,
+        transition_id: crate::membership::SessionTopologyTransitionId,
+        request_digest: crate::membership::SessionTopologyTransitionDigest,
+    ) -> Result<SessionTopologyTransitionRequest, SessionTopologyTransitionError> {
+        let state = self
+            .bindings
+            .read()
+            .map_err(|_| SessionTopologyTransitionError::Unavailable)?;
+        let request = state
+            .finalized_request
+            .as_ref()
+            .ok_or(SessionTopologyTransitionError::InvalidTransitionBindings)?;
+        if request.transition_id() != transition_id || request.request_digest() != request_digest {
+            return Err(SessionTopologyTransitionError::IdempotencyConflict);
+        }
+        let desired_descriptors =
+            descriptors_by_node_id(request.desired_identity(), request.desired_members())
+                .ok_or(SessionTopologyTransitionError::InvalidTransitionBindings)?;
+        if state.staged.is_some()
+            || state.current_identity != request.desired_identity()
+            || state.current_descriptors != desired_descriptors
+        {
+            return Err(SessionTopologyTransitionError::InvalidTransitionBindings);
+        }
+        Ok(request.clone())
     }
 
     fn is_current_request(
@@ -4105,7 +4161,18 @@ impl ConsensusSessionStore {
             .inner
             .topology_coordinator
             .staged_request(transition_id, request_digest)
-        {
+            .or_else(|error| {
+                if matches!(
+                    barrier.action,
+                    TopologyAdmissionBarrierAction::AdmitJointVoting
+                ) {
+                    self.inner
+                        .topology_coordinator
+                        .finalized_request(transition_id, request_digest)
+                } else {
+                    Err(error)
+                }
+            }) {
             Ok(request) => request,
             Err(_) => return TopologyAdmissionBarrierReply::NotReady,
         };
@@ -4226,7 +4293,21 @@ impl ConsensusSessionStore {
             .staged_request(transition_id, request_digest)
             .is_ok_and(|staged| staged == request)
         {
-            return TopologyAdmissionBarrierReply::NotReady;
+            // Reconciliation may have consumed staging before this call or
+            // while it waited for this same gate. Only voting may acknowledge
+            // an already admitted current successor, without changing its latch.
+            return if matches!(
+                barrier.action,
+                TopologyAdmissionBarrierAction::AdmitJointVoting
+            ) && self
+                .acknowledge_current_voting_barrier(&request, authenticated_sender, deadline)
+                .await
+                .is_ok()
+            {
+                TopologyAdmissionBarrierReply::Ready
+            } else {
+                TopologyAdmissionBarrierReply::NotReady
+            };
         }
         if self
             .apply_local_transition_barrier_under_admission_gate(&request, barrier.action, deadline)
@@ -4237,6 +4318,78 @@ impl ConsensusSessionStore {
         } else {
             TopologyAdmissionBarrierReply::NotReady
         }
+    }
+
+    // The caller holds local_admission_gate and passes its original deadline.
+    // This path acknowledges existing admission; it never grants or re-fences it.
+    async fn acknowledge_current_voting_barrier(
+        &self,
+        request: &SessionTopologyTransitionRequest,
+        authenticated_sender: SessionConsensusNodeId,
+        deadline: tokio::time::Instant,
+    ) -> Result<(), SessionTopologyTransitionError> {
+        let durable = self.read_transition_state_before(request, deadline).await?;
+        let status = status_from_durable(request, &durable)?
+            .ok_or(SessionTopologyTransitionError::InvalidEvidenceState)?;
+        let _proof = SessionTopologyUniformCommitAdmissionProof::try_from_status(request, &status)?;
+        let uniform = status
+            .log_indexes()
+            .uniform()
+            .ok_or(SessionTopologyTransitionError::InvalidEvidenceState)?;
+        let desired_members = request.desired_consensus_node_ids();
+        let scope_matches = match durable.scope.pending.as_ref() {
+            Some(pending) => {
+                pending.transition_id == request.transition_id().as_bytes()
+                    && pending.transition_digest == request.request_digest().as_bytes()
+                    && pending.desired_identity == request.desired_identity()
+                    && pending.desired_members == desired_members
+            }
+            None => {
+                durable.scope.current_identity == request.desired_identity()
+                    && durable.scope.current_members == desired_members
+            }
+        };
+        if !scope_matches
+            || durable.scope.application_authority_epoch != request.desired_epoch()
+            || durable.scope.application_authority_members != desired_members
+            || classify_applied_membership(
+                &durable.applied_membership,
+                &durable.scope.current_members,
+                &desired_members,
+            ) != AppliedMembershipShape::DesiredUniform
+            || !durable
+                .applied_membership
+                .log_id()
+                .as_ref()
+                .is_some_and(|log| log.index >= uniform)
+        {
+            return Err(SessionTopologyTransitionError::Unavailable);
+        }
+        // Revalidate process-local state after the durable read. The retained
+        // request is only a lookup key; it cannot authorize a stale scope, a
+        // removed sender/member, or a currently fenced application latch.
+        if self
+            .inner
+            .topology_coordinator
+            .finalized_request(request.transition_id(), request.request_digest())?
+            != *request
+        {
+            return Err(SessionTopologyTransitionError::IdempotencyConflict);
+        }
+        let (identity, members) = self
+            .inner
+            .peer_directory
+            .current_scope()
+            .map_err(|_| SessionTopologyTransitionError::Unavailable)?;
+        if identity != request.desired_identity()
+            || members != desired_members
+            || !members.contains(&authenticated_sender)
+            || !members.contains(&self.inner.local_node_id)
+            || !self.exact_membership_is_admitted()
+        {
+            return Err(SessionTopologyTransitionError::Unavailable);
+        }
+        Ok(())
     }
 
     async fn finish_local_successor_admission(
@@ -4530,6 +4683,7 @@ mod scope_refresh_tests {
                 current_identity,
                 current_descriptors: BTreeMap::new(),
                 staged: None,
+                finalized_request: None,
                 last_scope_progress_index: None,
                 blocking_terminal: None,
                 retained_transitions: BTreeMap::new(),
