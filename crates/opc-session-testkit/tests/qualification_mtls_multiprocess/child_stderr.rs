@@ -1,5 +1,63 @@
 //! Bounded, payload-free classification of a qualification child's stderr.
 
+use std::fs::File;
+use std::io::{Read, Seek, SeekFrom};
+use std::os::unix::fs::MetadataExt;
+use std::path::Path;
+
+const MAX_STDERR_BYTES: u64 = 8 * 1024;
+
+/// The append-only diagnostic file boundary observed before sending a command.
+#[derive(Debug, Clone, Copy)]
+pub(super) struct StderrBoundary {
+    device: u64,
+    inode: u64,
+    bytes: u64,
+}
+
+pub(super) fn boundary(path: &Path) -> Option<StderrBoundary> {
+    let metadata = std::fs::metadata(path).ok()?;
+    Some(StderrBoundary {
+        device: metadata.dev(),
+        inode: metadata.ino(),
+        bytes: metadata.len(),
+    })
+}
+
+pub(super) fn classify_since(path: &Path, boundary: StderrBoundary) -> ChildStderrDiagnostic {
+    let Ok(mut file) = File::open(path) else {
+        return ChildStderrDiagnostic::Unavailable;
+    };
+    let Ok(metadata) = file.metadata() else {
+        return ChildStderrDiagnostic::Unavailable;
+    };
+    if metadata.dev() != boundary.device || metadata.ino() != boundary.inode {
+        return ChildStderrDiagnostic::Unavailable;
+    }
+    classify_range(&mut file, metadata.len(), boundary.bytes)
+}
+
+fn classify_range(
+    reader: &mut (impl Read + Seek),
+    total_bytes: u64,
+    start: u64,
+) -> ChildStderrDiagnostic {
+    let Some(length) = total_bytes.checked_sub(start) else {
+        return ChildStderrDiagnostic::Unavailable;
+    };
+    if length > MAX_STDERR_BYTES {
+        return ChildStderrDiagnostic::Redacted;
+    }
+    if reader.seek(SeekFrom::Start(start)).is_err() {
+        return ChildStderrDiagnostic::Unavailable;
+    }
+    let mut bytes = Vec::with_capacity(length as usize);
+    if reader.take(length).read_to_end(&mut bytes).is_err() || bytes.len() as u64 != length {
+        return ChildStderrDiagnostic::Unavailable;
+    }
+    classify(&bytes, false)
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum ChildStderrDiagnostic {
     Unavailable,
@@ -129,7 +187,7 @@ fn initialization_stages_and_payload_free_classes_are_observable() {
             classify(line.as_bytes(), false),
             ChildStderrDiagnostic::InitializationFailed {
                 stage,
-                error_class: class
+                error_class: class,
             },
         );
     }
@@ -243,5 +301,99 @@ fn existing_open_failure_priority_and_redaction_are_preserved() {
     assert_eq!(
         classify(b"qualification node open failed: listener\nqualification node open failed: transport\n", false),
         ChildStderrDiagnostic::QualificationNodeListenerFailed,
+    );
+}
+
+#[test]
+fn current_command_without_output_cannot_inherit_an_earlier_failure() {
+    let old = b"qualification node initialize failed: cluster RecoveryRequired\n";
+    assert_eq!(
+        classify_range(
+            &mut std::io::Cursor::new(old),
+            old.len() as u64,
+            old.len() as u64
+        ),
+        ChildStderrDiagnostic::Empty,
+    );
+}
+
+#[test]
+fn current_command_can_be_classified_after_large_private_history() {
+    let mut bytes = vec![b'x'; MAX_STDERR_BYTES as usize + 1];
+    bytes.push(b'\n');
+    let start = bytes.len() as u64;
+    bytes.extend_from_slice(b"qualification node initialize failed: cluster RecoveryRequired\n");
+    let end = bytes.len() as u64;
+    assert_eq!(
+        classify_range(&mut std::io::Cursor::new(bytes), end, start),
+        ChildStderrDiagnostic::InitializationFailed {
+            stage: "cluster",
+            error_class: "RecoveryRequired",
+        },
+    );
+}
+
+#[test]
+fn current_command_window_rejects_truncation_and_excessive_output() {
+    let bytes = b"qualification node failed\n";
+    let mut reader = std::io::Cursor::new(bytes);
+    assert_eq!(
+        classify_range(&mut reader, 0, 1),
+        ChildStderrDiagnostic::Unavailable
+    );
+    assert_eq!(
+        classify_range(&mut reader, bytes.len() as u64 + 1, 0),
+        ChildStderrDiagnostic::Unavailable,
+    );
+    assert_eq!(
+        classify_range(&mut reader, MAX_STDERR_BYTES + 1, 0),
+        ChildStderrDiagnostic::Redacted,
+    );
+}
+
+#[test]
+fn append_file_boundary_is_checked_against_the_opened_file() {
+    use std::io::Write;
+    struct TestDirectory(std::path::PathBuf);
+    impl Drop for TestDirectory {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+    let directory_path = std::env::temp_dir().join(format!(
+        "qualification-stderr-boundary-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos(),
+    ));
+    std::fs::create_dir(&directory_path).unwrap();
+    let directory = TestDirectory(directory_path);
+    let path = directory.0.join("stderr");
+    let mut file = std::fs::OpenOptions::new()
+        .create_new(true)
+        .append(true)
+        .open(&path)
+        .unwrap();
+    file.write_all(b"qualification node initialize failed: cluster RecoveryRequired\n")
+        .unwrap();
+    let before = boundary(&path).unwrap();
+    assert_eq!(classify_since(&path, before), ChildStderrDiagnostic::Empty);
+    file.write_all(b"qualification node initialize failed: cluster EngineUnavailable\n")
+        .unwrap();
+    assert_eq!(
+        classify_since(&path, before),
+        ChildStderrDiagnostic::InitializationFailed {
+            stage: "cluster",
+            error_class: "EngineUnavailable",
+        },
+    );
+    // Preserve the original inode so replacement cannot recycle its identity.
+    std::fs::rename(&path, directory.0.join("predecessor")).unwrap();
+    std::fs::write(&path, b"qualification node failed\n").unwrap();
+    assert_eq!(
+        classify_since(&path, before),
+        ChildStderrDiagnostic::Unavailable
     );
 }

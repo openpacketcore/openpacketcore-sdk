@@ -2814,6 +2814,7 @@ struct PendingCommand {
     kind: PendingCommandKind,
     sequence: u64,
     sent_at: Instant,
+    initialization_stderr: Option<child_stderr::StderrBoundary>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -2986,6 +2987,7 @@ impl ChildNode {
                 kind: PendingCommandKind::AwaitBound,
                 sequence: 0,
                 sent_at: Instant::now(),
+                initialization_stderr: None,
             }),
             next_command_sequence: 1,
         };
@@ -3007,6 +3009,11 @@ impl ChildNode {
             self.pending.is_none(),
             "qualification child already has one pending command"
         );
+        // Capture before the write: a child may fail before send returns.
+        // Earlier attempts and a prior process append to this same file.
+        let initialization_stderr = matches!(command, QualificationNodeCommand::Initialize)
+            .then(|| child_stderr::boundary(&self.stderr_path))
+            .flatten();
         write_json_line(
             self.stdin.as_mut().expect("qualification child stdin open"),
             command,
@@ -3021,6 +3028,7 @@ impl ChildNode {
             kind: PendingCommandKind::from_command(command),
             sequence,
             sent_at: Instant::now(),
+            initialization_stderr,
         });
     }
 
@@ -3061,11 +3069,23 @@ impl ChildNode {
     }
 
     fn fail_response(&mut self, failure: ChildResponseFailure, pending: PendingCommand) -> ! {
-        let pending = pending.diagnostic_at(Instant::now());
+        let diagnostic = pending.diagnostic_at(Instant::now());
+        let current_initialize_stderr = matches!(
+            pending.kind,
+            PendingCommandKind::Command(QualificationNodeCommandKind::Initialize)
+        )
+        .then(|| {
+            pending
+                .initialization_stderr
+                .map_or(ChildStderrDiagnostic::Unavailable, |boundary| {
+                    child_stderr::classify_since(&self.stderr_path, boundary)
+                })
+        });
+        let pending = diagnostic;
         let status = self.child.try_wait().ok().flatten();
         let stderr = self.stderr_diagnostic();
         panic!(
-            "qualification child response failed: node={}, failure={failure:?}, pending={pending:?}, status={status:?}, stderr={stderr:?}",
+            "qualification child response failed: node={}, failure={failure:?}, pending={pending:?}, status={status:?}, current_initialize_stderr={current_initialize_stderr:?}, historical_stderr={stderr:?}",
             self.node_index
         )
     }
@@ -21469,6 +21489,7 @@ fn pending_command_diagnostic_is_deterministic_and_payload_free() {
         kind: PendingCommandKind::from_command(&command),
         sequence: 7,
         sent_at,
+        initialization_stderr: None,
     };
     let diagnostic = pending.diagnostic_at(sent_at + Duration::from_millis(42));
 
