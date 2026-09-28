@@ -2397,6 +2397,45 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn owned_collection_carries_locked_route_mtu_and_refuses_changing_it_in_place() {
+        let backend = MockRouteSteeringBackend::new();
+        let locked = |mtu| RouteRequest {
+            locked_mtu: crate::model::RouteMtu::new(mtu),
+            ..sibling_route(10)
+        };
+        let desired =
+            OwnedRouteRuleSet::new(owned_scope(), vec![locked(1300)], Vec::new()).unwrap();
+        let installed = backend
+            .reconcile_owned_route_rules(desired.clone())
+            .await
+            .unwrap();
+        assert_eq!(installed.installed_routes, 1);
+        assert_eq!(
+            backend
+                .snapshot_owned_route_rules(owned_scope())
+                .await
+                .unwrap()
+                .routes(),
+            &[locked(1300)]
+        );
+        let operations = backend.operations().len();
+        let changed =
+            OwnedRouteRuleSet::new(owned_scope(), vec![locked(1400)], Vec::new()).unwrap();
+        assert!(matches!(
+            backend.reconcile_owned_route_rules(changed).await,
+            Err(RouteSteeringError::InvalidConfig {
+                field: "owned.routes",
+                ..
+            })
+        ));
+        assert_eq!(backend.operations().len(), operations);
+        assert_eq!(
+            backend.read_route(&locked(1300)).await.unwrap(),
+            RouteReadback::ExactPresent
+        );
+    }
+
+    #[tokio::test]
     async fn owned_collection_converges_retries_and_removes_same_priority_siblings_exactly() {
         let backend = MockRouteSteeringBackend::new();
         let desired = OwnedRouteRuleSet::new(

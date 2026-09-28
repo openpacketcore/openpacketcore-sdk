@@ -15,8 +15,9 @@ use std::thread;
 use std::time::Duration;
 
 use opc_route_steering::{
-    IpPrefix, LinuxRouteSteeringBackend, RouteConvergenceOutcome, RouteMismatch, RouteMtu,
-    RouteReadback, RouteRequest, RouteSteeringBackend,
+    IpPrefix, LinuxRouteSteeringBackend, OwnedRouteRuleScope, OwnedRouteRuleSet,
+    RouteConvergenceOutcome, RouteMismatch, RouteMtu, RouteReadback, RouteRequest,
+    RouteSteeringBackend, RouteSteeringIpFamily,
 };
 
 const MAIN_TABLE: u32 = 254;
@@ -431,6 +432,45 @@ async fn live_locked_route_mtu_makes_the_kernel_signal_oversized_packets_for_bot
         assert_eq!(received, format!("[{SMALL_PAYLOAD}]"), "{family}");
 
         backend.remove_converged_route(route.clone()).await.unwrap();
+        assert_eq!(
+            backend.read_route(&route).await.unwrap(),
+            RouteReadback::Absent
+        );
+
+        // The owned-collection API installs, snapshots and removes the same
+        // locked route exactly.
+        let ip_family = if family == "4" {
+            RouteSteeringIpFamily::Ipv4
+        } else {
+            RouteSteeringIpFamily::Ipv6
+        };
+        let scope = OwnedRouteRuleScope::new(
+            ip_family,
+            MAIN_TABLE,
+            topology.receiver_link,
+            Some(10),
+            1000,
+        )
+        .unwrap();
+        let owned = OwnedRouteRuleSet::new(scope, vec![route.clone()], Vec::new()).unwrap();
+        let installed = backend.reconcile_owned_route_rules(owned).await.unwrap();
+        assert_eq!(installed.installed_routes, 1, "{family}");
+        assert_eq!(
+            backend
+                .snapshot_owned_route_rules(scope)
+                .await
+                .unwrap()
+                .routes(),
+            std::slice::from_ref(&route),
+            "{family}"
+        );
+        let emptied = backend
+            .reconcile_owned_route_rules(
+                OwnedRouteRuleSet::new(scope, Vec::new(), Vec::new()).unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(emptied.removed_routes, 1, "{family}");
         assert_eq!(
             backend.read_route(&route).await.unwrap(),
             RouteReadback::Absent
