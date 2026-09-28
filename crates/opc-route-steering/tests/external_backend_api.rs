@@ -69,6 +69,7 @@ fn rule() -> RuleRequest {
         fwmark: None,
         table: 100,
         priority: 1000,
+        family: None,
     }
 }
 
