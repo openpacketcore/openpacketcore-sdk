@@ -31,7 +31,7 @@ const LARGE_PAYLOAD: usize = 1400;
 /// reports the path MTU the sender kernel learned from it.
 const SENDER: &str = r#"
 import json, select, socket, struct, sys, time
-family, destination, small, large = sys.argv[1], sys.argv[2], int(sys.argv[3]), int(sys.argv[4])
+family, destination, small, large, port = sys.argv[1], sys.argv[2], int(sys.argv[3]), int(sys.argv[4]), int(sys.argv[5])
 if family == "6":
     icmp = socket.socket(socket.AF_INET6, socket.SOCK_RAW, socket.IPPROTO_ICMPV6)
     udp = socket.socket(socket.AF_INET6, socket.SOCK_DGRAM)
@@ -42,7 +42,7 @@ else:
     udp = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     udp.setsockopt(socket.IPPROTO_IP, 10, 2)  # IP_MTU_DISCOVER = IP_PMTUDISC_DO
     mtu_option = (socket.IPPROTO_IP, 14)  # IP_MTU
-udp.connect((destination, 9999))
+udp.connect((destination, port))
 udp.send(b"s" * small)
 udp.send(b"l" * large)
 error = None
@@ -87,7 +87,7 @@ const RECEIVER: &str = r#"
 import json, socket, sys, time
 family = socket.AF_INET6 if sys.argv[1] == "6" else socket.AF_INET
 sock = socket.socket(family, socket.SOCK_DGRAM)
-sock.bind(("::" if sys.argv[1] == "6" else "0.0.0.0", 9999))
+sock.bind(("::" if sys.argv[1] == "6" else "0.0.0.0", int(sys.argv[2])))
 sock.settimeout(0.2)
 print("ready", flush=True)
 lengths = []
@@ -261,6 +261,7 @@ impl Topology {
                 "-c",
                 RECEIVER,
                 family,
+                &PROBE_PORT.to_string(),
             ])
             .stdout(Stdio::piped())
             .spawn()
@@ -282,6 +283,7 @@ impl Topology {
                 destination,
                 &SMALL_PAYLOAD.to_string(),
                 &LARGE_PAYLOAD.to_string(),
+                &PROBE_PORT.to_string(),
             ],
         );
         let mut received = String::new();

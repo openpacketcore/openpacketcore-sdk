@@ -51,6 +51,10 @@ const ROUTE_ATTRIBUTE_HEADER_LEN: usize = 4;
 const ROUTE_MESSAGE_LEN: usize = 12;
 const FIB_RULE_HEADER_LEN: usize = 12;
 const ROUTE_CACHEINFO_LEN: usize = 32;
+/// `RTAX_LOCK` value locking exactly the MTU metric.
+const ROUTE_MTU_LOCK_MASK: u32 = 1 << RTAX_MTU;
+/// `NLA_F_NESTED`: the only flag a kernel metrics nest may carry.
+const NLA_F_NESTED: u16 = 0x8000;
 const CAP_NET_ADMIN: u32 = 12;
 const ENOENT: i32 = 2;
 const ESRCH: i32 = 3;
@@ -2128,6 +2132,14 @@ fn encode_route_request_with_protocol(
     if request.table > u32::from(u8::MAX) {
         append_attr_u32_ne(&mut out, RTA_TABLE, request.table)?;
     }
+    if let Some(mtu) = request.locked_mtu {
+        // One metrics nest: the MTU and exactly its lock bit. Linux deletion
+        // compares supplied metrics, so removal matches only this route.
+        let mut metrics = Vec::with_capacity(2 * (ROUTE_ATTRIBUTE_HEADER_LEN + 4));
+        append_attr_u32_ne(&mut metrics, RTAX_LOCK, ROUTE_MTU_LOCK_MASK)?;
+        append_attr_u32_ne(&mut metrics, RTAX_MTU, mtu.get())?;
+        append_attr(&mut out, RTA_METRICS, &metrics)?;
+    }
     Ok(out)
 }
 
@@ -2618,9 +2630,9 @@ fn classify_route_readback(
             output_interface: current.oif_ifindex != request.oif_ifindex,
             table: current.table != request.table,
             priority: current.priority != request.priority,
+            mtu: current.locked_mtu != request.locked_mtu,
             kernel_semantics: !candidate.fixed_semantics_exact
                 || candidate.protocol != LINUX_ROUTE_STEERING_PROTOCOL,
-            mtu: false,
         };
         let exact = current == request
             && candidate.fixed_semantics_exact
@@ -2629,6 +2641,7 @@ fn classify_route_readback(
         aggregate.output_interface |= mismatch.output_interface;
         aggregate.table |= mismatch.table;
         aggregate.priority |= mismatch.priority;
+        aggregate.mtu |= mismatch.mtu;
         aggregate.kernel_semantics |= mismatch.kernel_semantics;
         if resident.as_ref().is_none_or(|prior| current < *prior) {
             resident = Some(current);
@@ -2798,10 +2811,12 @@ fn parse_route_candidate(body: &[u8]) -> Result<Option<ParsedRouteCandidate>, Ro
     let mut table_attr = None;
     let mut preference = None;
     let mut cacheinfo_semantic_state = None;
+    let mut metrics = None;
     let mut unrepresented = false;
     parse_attributes(body, ROUTE_MESSAGE_LEN, |attr_type, raw_type, payload| {
         let flagged = attr_type != raw_type;
         match attr_type {
+            RTA_METRICS => set_once_route_metrics(&mut metrics, payload, raw_type),
             RTA_DST => set_once_ip(&mut destination, family, payload, flagged),
             RTA_OIF => set_once_u32(&mut oif, payload, flagged),
             RTA_PRIORITY => set_once_u32(&mut priority, payload, flagged),
@@ -2836,6 +2851,14 @@ fn parse_route_candidate(body: &[u8]) -> Result<Option<ParsedRouteCandidate>, Ro
     if cacheinfo_semantic_state == Some(true) {
         unrepresented = true;
     }
+    let locked_mtu = match metrics {
+        None => None,
+        Some(RouteMetrics::LockedMtu(mtu)) => Some(mtu),
+        Some(RouteMetrics::Unrepresentable) => {
+            unrepresented = true;
+            None
+        }
+    };
     let table = table_attr.unwrap_or(header_table);
     let address = destination.unwrap_or_else(|| unspecified_address(family));
     let destination = IpPrefix::new(address, destination_prefix_len);
@@ -2846,7 +2869,7 @@ fn parse_route_candidate(body: &[u8]) -> Result<Option<ParsedRouteCandidate>, Ro
             oif_ifindex,
             table,
             priority,
-            locked_mtu: None,
+            locked_mtu,
         })
     });
     Ok(Some(ParsedRouteCandidate {
@@ -3049,6 +3072,51 @@ fn set_once_route_cacheinfo(
     let expires = read_i32_ne(payload, 8).map_err(|_| malformed_readback())?;
     let error = read_i32_ne(payload, 12).map_err(|_| malformed_readback())?;
     *semantic_state = Some(expires != 0 || error != 0);
+    Ok(())
+}
+
+/// Route metrics as represented by [`RouteRequest`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RouteMetrics {
+    /// Exactly one MTU and a lock on it alone.
+    LockedMtu(RouteMtu),
+    /// Any other well-formed metric set: an unlocked MTU, a lock without an
+    /// MTU or on another metric, an additional metric, or an empty nest.
+    Unrepresentable,
+}
+
+/// Parse one `RTA_METRICS` nest strictly. Its members are `u32` metrics keyed
+/// by `RTAX_*`; a repeated member, a wrong-width member, or a flag on a
+/// member or a byte-order flag on the nest is malformed.
+fn set_once_route_metrics(
+    slot: &mut Option<RouteMetrics>,
+    payload: &[u8],
+    raw_type: u16,
+) -> Result<(), RouteSteeringError> {
+    if slot.is_some() || raw_type & !NLA_F_NESTED != RTA_METRICS {
+        return Err(malformed_readback());
+    }
+    let mut lock = None;
+    let mut mtu = None;
+    let mut other = false;
+    parse_attributes(payload, 0, |metric, raw_metric, value| {
+        let flagged = metric != raw_metric;
+        match metric {
+            RTAX_LOCK => set_once_u32(&mut lock, value, flagged),
+            RTAX_MTU => set_once_u32(&mut mtu, value, flagged),
+            _ => {
+                if flagged || value.len() != 4 {
+                    return Err(malformed_readback());
+                }
+                other = true;
+                Ok(())
+            }
+        }
+    })?;
+    *slot = Some(match (lock, mtu.and_then(RouteMtu::new), other) {
+        (Some(ROUTE_MTU_LOCK_MASK), Some(mtu), false) => RouteMetrics::LockedMtu(mtu),
+        _ => RouteMetrics::Unrepresentable,
+    });
     Ok(())
 }
 
@@ -5277,6 +5345,18 @@ mod tests {
         }
     }
 
+    fn assert_malformed(readback: Result<RouteReadback, RouteSteeringError>, nested: &[u8]) {
+        assert!(
+            matches!(
+                readback,
+                Err(RouteSteeringError::ReadbackIndeterminate {
+                    reason: ReadbackIndeterminateReason::MalformedReply
+                })
+            ),
+            "nested metrics {nested:?}: {readback:?}"
+        );
+    }
+
     #[test]
     fn route_metrics_outside_one_locked_mtu_are_unrepresentable_or_malformed() {
         let request = ipv6_locked_mtu_route(1300);
@@ -5317,25 +5397,15 @@ mod tests {
         ];
         for nested in malformed {
             let body = route_body_with_metrics(&request, RTA_METRICS, &nested);
-            assert_eq!(
-                classify_route_readback(&request, &[body]).unwrap(),
-                RouteReadback::Indeterminate(ReadbackIndeterminateReason::MalformedReply),
-                "nested metrics {nested:?}"
-            );
+            assert_malformed(classify_route_readback(&request, &[body]), &nested);
         }
         let mut duplicated = encode_route_request(&request).unwrap();
         let nested = metrics_payload(&[(RTAX_LOCK, &lock), (RTAX_MTU, &mtu)]);
         append_attr(&mut duplicated, RTA_METRICS, &nested).unwrap();
-        assert_eq!(
-            classify_route_readback(&request, &[duplicated]).unwrap(),
-            RouteReadback::Indeterminate(ReadbackIndeterminateReason::MalformedReply)
-        );
+        assert_malformed(classify_route_readback(&request, &[duplicated]), &nested);
         // A byte-order-flagged metrics attribute is not a kernel metrics nest.
         let body = route_body_with_metrics(&request, RTA_METRICS | 0x4000, &nested);
-        assert_eq!(
-            classify_route_readback(&request, &[body]).unwrap(),
-            RouteReadback::Indeterminate(ReadbackIndeterminateReason::MalformedReply)
-        );
+        assert_malformed(classify_route_readback(&request, &[body]), &nested);
     }
 
     #[test]
@@ -5384,8 +5454,8 @@ mod tests {
                 output_interface: true,
                 table: false,
                 priority: true,
-                kernel_semantics: false,
                 mtu: false,
+                kernel_semantics: false,
             }
         );
 

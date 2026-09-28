@@ -567,12 +567,13 @@ impl MockRouteSteeringBackend {
                 output_interface: candidate.request.oif_ifindex != request.oif_ifindex,
                 table: candidate.request.table != request.table,
                 priority: candidate.request.priority != request.priority,
+                mtu: candidate.request.locked_mtu != request.locked_mtu,
                 kernel_semantics: !candidate.owned,
-                mtu: false,
             };
             aggregate.output_interface |= mismatch.output_interface;
             aggregate.table |= mismatch.table;
             aggregate.priority |= mismatch.priority;
+            aggregate.mtu |= mismatch.mtu;
             aggregate.kernel_semantics |= mismatch.kernel_semantics;
             if candidate.owned && candidate.request == *request {
                 exact_count = exact_count.saturating_add(1);
@@ -1967,8 +1968,8 @@ mod tests {
                 output_interface: true,
                 table: false,
                 priority: true,
-                kernel_semantics: false,
                 mtu: false,
+                kernel_semantics: false,
             }
         );
 
