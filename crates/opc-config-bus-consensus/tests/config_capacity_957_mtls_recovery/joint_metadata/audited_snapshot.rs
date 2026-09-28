@@ -34,6 +34,7 @@ async fn commit_audited(
     parent: Option<TxId>,
     principal: &str,
     local: bool,
+    completion_stores: Option<(&[ConsensusConfigStore], opc_consensus::ConsensusNodeId)>,
 ) -> Expected {
     let mut phase = phase_trace::Span::api("audited_input");
     let (input, aad, plaintext) = phase
@@ -77,6 +78,18 @@ async fn commit_audited(
         panic!("snapshot operation requires an authoritative intent receipt");
     };
     assert_eq!(admission.state(), AuditOperationState::Intent);
+    let completion = completion_stores.map(|(stores, leader)| {
+        let origin = std::time::Instant::now();
+        let registrations = stores
+            .iter()
+            .map(|store| {
+                store
+                    .observe_capacity_completion_for_test(&prepared, origin)
+                    .expect("bounded native completion registration")
+            })
+            .collect::<Vec<_>>();
+        (registrations, leader)
+    });
     let mut phase = phase_trace::Span::api("audited_submit");
     let result = phase
         .track(async {
@@ -92,10 +105,67 @@ async fn commit_audited(
         })
         .await;
     phase.returned(phase_trace::audit(&result));
+    let completion = completion.map(|(registrations, leader)| {
+        let snapshots = registrations
+            .into_iter()
+            .map(|registration| {
+                registration
+                    .finish()
+                    .expect("matching native completion registration")
+            })
+            .collect::<Vec<_>>();
+        // Deactivate every node before printing; output never runs in a worker.
+        for (node, snapshot) in snapshots.iter().enumerate() {
+            eprintln!(
+                "CONFIG_CAPACITY_NATIVE_COMPLETION node={node} cutoff_us={} events={} omitted={}",
+                snapshot.cutoff_us, snapshot.events.len(), snapshot.omitted,
+            );
+            for event in &snapshot.events {
+                eprintln!(
+                    "CONFIG_CAPACITY_NATIVE_COMPLETION_EVENT node={node} at_us={} phase={:?} index={:?} deadline_us={:?}",
+                    event.at_us, event.phase, event.index, event.deadline_us,
+                );
+            }
+        }
+        (snapshots, leader)
+    });
     let AuditAdmission::Applied(receipt) = result else {
         panic!("snapshot operation requires a durable original result");
     };
     assert_eq!(receipt.state(), AuditOperationState::Committed { version });
+    if let Some((snapshots, leader)) = completion {
+        use opc_persist::config_completion_observation::Phase;
+        assert!(
+            snapshots.iter().all(|snapshot| snapshot.omitted == 0),
+            "native completion trace must remain bounded without omission"
+        );
+        let selected = snapshots
+            .iter()
+            .find(|snapshot| snapshot.node == leader)
+            .expect("native completion trace must bind the original leader");
+        let index = selected
+            .events
+            .iter()
+            .find(|event| event.phase == Phase::EngineResponseOk)
+            .and_then(|event| event.index)
+            .expect("native completion trace must observe the original engine response index");
+        for phase in [
+            Phase::ApplyQueued,
+            Phase::ApplyWorkerEntered,
+            Phase::NativeApplyEntered,
+            Phase::ApplyTransactionCommitted,
+            Phase::NativeApplyReturned,
+            Phase::StorageApplyReturned,
+        ] {
+            assert!(
+                selected
+                    .events
+                    .iter()
+                    .any(|event| event.phase == phase && event.index == Some(index)),
+                "native completion trace omitted matching {phase:?} for original leader/index"
+            );
+        }
+    }
     Expected {
         record,
         aad,
@@ -174,7 +244,15 @@ native_case!(
             .await;
         phase.returned(phase_trace::audit_initialization(&initialized));
         initialized.expect("native replicated audit authority");
-        let first = commit_audited(&stores[leader], 1, None, &principal, true).await;
+        let first = commit_audited(
+            &stores[leader],
+            1,
+            None,
+            &principal,
+            true,
+            Some((&stores, leader_id)),
+        )
+        .await;
         for store in &stores {
             let mut phase = phase_trace::Span::api("audited_initial_recovery_readback");
             phase
@@ -212,6 +290,7 @@ native_case!(
             Some(first.record.tx_id),
             &principal,
             false,
+            None,
         )
         .await;
         trace.finish();

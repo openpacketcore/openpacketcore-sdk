@@ -3414,6 +3414,8 @@ pub(crate) fn apply_entries_cancellable_sync(
     let batch = entries.into();
     let check_encoded_size = batch.needs_sizing();
     let entries = batch.entries();
+    #[cfg(feature = "dangerous-test-hooks")]
+    let _completion = super::completion_observation::Batch::current(conn, entries);
     #[cfg(all(test, target_os = "linux"))]
     let _caller_ledger_observation =
         super::store::config_capacity_caller_ledger_observation::NativeApply::start(entries);
@@ -3759,6 +3761,8 @@ pub(crate) fn apply_entries_cancellable_sync(
     tx.commit().map_err(db_error)?;
     #[cfg(test)]
     super::storage::config_capacity_apply_observations::observe("committed");
+    #[cfg(feature = "dangerous-test-hooks")]
+    _completion.committed();
     Ok(responses)
 }
 

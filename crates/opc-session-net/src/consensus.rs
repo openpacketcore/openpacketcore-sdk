@@ -1072,6 +1072,7 @@ impl ConsensusConnectionPool {
     ) -> ConsensusConnectionSlot<'_> {
         let _pending_owner = observation.and_then(|observation| {
             observation.observe_pending_call(
+                capacity_observation::PendingRpcPhase::PoolAcquire,
                 request.sender,
                 target,
                 request.family,
@@ -2073,9 +2074,10 @@ impl RemoteSessionConsensusPeer {
 
     /// Attach an opt-in qualification observer to this peer and its clones.
     ///
-    /// This records RPC owners during pool acquisition, then the separate
-    /// negotiated large append/snapshot slice and its outer frames. Cold setup,
-    /// inbound/native owners and other queues are outside this observation.
+    /// This records RPC owners during pool and cold-connection acquisition,
+    /// then the separate negotiated large append/snapshot slice and its outer
+    /// frames. Physical setup/TLS buffers, inbound/native owners and other
+    /// queues are outside this observation.
     /// It does not change deadlines or lane admission.
     #[cfg(feature = "test-control")]
     #[doc(hidden)]
@@ -2626,7 +2628,24 @@ impl RemoteSessionConsensusPeer {
                 .fetch_add(1, Ordering::Relaxed);
         }
 
-        let mut connection = self.claim_or_start_cold_connection(deadline).await?;
+        let mut connection = {
+            // The lane already belongs to this caller, but its request still
+            // owns the RPC allocation while cold acquisition waits. Borrow it
+            // until that exact future returns or is cancelled, before moving
+            // the request into negotiated dispatch. A shared physical setup
+            // can outlive this caller and owns separate buffers.
+            #[cfg(feature = "test-control")]
+            let _cold_owner = self.buffer_observation.as_ref().and_then(|observation| {
+                observation.observe_pending_call(
+                    capacity_observation::PendingRpcPhase::ColdConnectionAcquire,
+                    request.sender,
+                    self.binding.remote_consensus_node_id(),
+                    request.family,
+                    &request.payload,
+                )
+            });
+            self.claim_or_start_cold_connection(deadline).await?
+        };
         let now = tokio::time::Instant::now();
         let current_generation = self.reauthentication.generation();
         let current_material_epoch = self

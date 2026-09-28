@@ -1,8 +1,8 @@
 //! Bounded observations of the existing integration calls, never payload decoding.
 //!
-//! Only the ordinary control and the two existing audited snapshot writes activate this
-//! recorder. It runs in their existing isolated child, uses no background task,
-//! and stops before snapshot construction/transfer or ordinary response loss. A returned
+//! The ordinary control/readmission and two existing audited snapshot writes activate
+//! this recorder. It runs in their existing isolated child, uses no background task,
+//! and wraps only the original API futures under their existing deadlines. A returned
 //! wire success is not a decoded engine success. Missing terminal events at the
 //! cutoff are censored; only dropping a polled wrapper records cancellation.
 
@@ -33,6 +33,7 @@ enum Boundary {
 #[derive(Clone, Copy, Debug)]
 pub(super) enum ResultClass {
     Ok,
+    InitializationError,
     PersistUnknown,
     PersistUnavailable,
     PersistOther,
@@ -405,6 +406,25 @@ impl Drop for Span {
         } else {
             ResultClass::Cancelled
         }));
+    }
+}
+
+/// Observe one original future and return its unchanged result to the caller.
+pub(super) async fn api_call<F: Future>(
+    phase: &'static str,
+    future: F,
+    classify: impl FnOnce(&F::Output) -> ResultClass,
+) -> F::Output {
+    let mut span = Span::api(phase);
+    let result = span.track(future).await;
+    span.returned(classify(&result));
+    result
+}
+
+pub(super) fn initialization<E>(result: &Result<(), E>) -> ResultClass {
+    match result {
+        Ok(()) => ResultClass::Ok,
+        Err(_) => ResultClass::InitializationError,
     }
 }
 
