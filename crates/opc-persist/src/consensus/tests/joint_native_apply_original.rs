@@ -70,14 +70,14 @@ impl ApplyWatch {
         assert!(work.other_owned > 0 && work.other_owned == work.other_verified);
         assert_eq!(work.owned, work.verified);
         assert_eq!(work.owned_bytes, work.verified_bytes);
-        assert_eq!(work.verified + work.borrowed, 7);
+        assert_eq!(work.verified + work.borrowed, 6);
         assert_eq!(
             work.verified_bytes + work.borrowed_bytes,
-            7 * retained_bytes
+            6 * retained_bytes
         );
-        assert_eq!(work.owned, 4, "APPLY_ORIGINAL_NATIVE_OWNED_DECODES");
+        assert_eq!(work.owned, 3, "APPLY_ORIGINAL_NATIVE_OWNED_DECODES");
         assert_eq!(work.borrowed, 3);
-        assert_eq!(work.owned_bytes, 4 * retained_bytes);
+        assert_eq!(work.owned_bytes, 3 * retained_bytes);
         assert_eq!(work.borrowed_bytes, 3 * retained_bytes);
     }
 }

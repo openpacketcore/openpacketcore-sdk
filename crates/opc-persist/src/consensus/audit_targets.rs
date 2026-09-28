@@ -811,12 +811,34 @@ pub(super) fn validate_running_history_sync(
         return Err(invalid());
     }
     let state = read_state_sync(conn, key, identity, cancellation)?;
-    let ledger = super::audit::read_sync(conn, key, identity)?;
+    let mut first_unsupported_target = None;
+    let ledger = super::audit::read_with_target_observer_sync(
+        conn,
+        key,
+        identity,
+        None,
+        |sequence, prepared| {
+            if first_unsupported_target.is_none()
+                && !super::audit_mutation::joint_running::allows_native(prepared)
+            {
+                first_unsupported_target = Some(sequence);
+            }
+        },
+    )?;
     state.validate_anchor(ledger.as_ref())?;
     // Preserve the cancellation boundary formerly reached by the second read.
     cancellation.check_io()?;
     validate_running_state(&state)?;
-    validate_running_ledger(ledger.as_ref(), key, identity, cancellation)
+    // The exact same immutable ledger has just passed full authentication and
+    // retained recovery. Defer policy rejection to its original entry boundary:
+    // the sequence is only a local predicate result, never reusable authority.
+    validate_running_ledger_entries(ledger.as_ref(), cancellation, |sequence, _| {
+        if first_unsupported_target == Some(sequence) {
+            Err(invalid())
+        } else {
+            Ok(())
+        }
+    })
 }
 
 fn validate_running_state(state: &TargetState) -> io::Result<()> {
@@ -842,23 +864,37 @@ fn validate_running_ledger(
     identity: ConfigConsensusIdentity,
     cancellation: &SqliteWorkCancellation,
 ) -> io::Result<()> {
+    validate_running_ledger_entries(ledger, cancellation, |_, original| {
+        let prepared = PreparedTargetMutation::decode_retained(
+            original.recovery.as_bytes(),
+            key,
+            identity,
+            &original.handle,
+            original.handle.body.binding.caller,
+        )
+        .map_err(|_| invalid())?;
+        if !super::audit_mutation::joint_running::allows_native(prepared.command()) {
+            return Err(invalid());
+        }
+        Ok(())
+    })
+}
+
+fn validate_running_ledger_entries(
+    ledger: Option<&LedgerState>,
+    cancellation: &SqliteWorkCancellation,
+    mut validate_target: impl FnMut(
+        u64,
+        &crate::audit_authority::ledger::RetainedTargetIntent,
+    ) -> io::Result<()>,
+) -> io::Result<()> {
     if let Some(ledger) = ledger {
         for entry in &ledger.entries {
             cancellation.check_io()?;
             use crate::audit_authority::ledger::EntryPayload;
             match &entry.payload {
                 EntryPayload::TargetIntent(original) => {
-                    let prepared = PreparedTargetMutation::decode_retained(
-                        original.recovery.as_bytes(),
-                        key,
-                        identity,
-                        &original.handle,
-                        original.handle.body.binding.caller,
-                    )
-                    .map_err(|_| invalid())?;
-                    if !super::audit_mutation::joint_running::allows_native(prepared.command()) {
-                        return Err(invalid());
-                    }
+                    validate_target(entry.sequence, original)?;
                 }
                 EntryPayload::EmptyCommit(_) => return Err(invalid()),
                 EntryPayload::Intent(handle) if handle.body.mutation.is_some() => {

@@ -161,7 +161,19 @@ fn read_with_original_sync(
     identity: ConfigConsensusIdentity,
     original: Option<&super::TargetMutationCommand>,
 ) -> io::Result<Option<LedgerState>> {
-    let stored = read_verified_with_original_sync(conn, key, original)?;
+    read_with_target_observer_sync(conn, key, identity, original, |_, _| {})
+}
+
+// Observations are local to this fresh, fully authenticated read. No decoded
+// original is retained after its validator iteration or reused across reads.
+pub(super) fn read_with_target_observer_sync(
+    conn: &Connection,
+    key: &AuditKey,
+    identity: ConfigConsensusIdentity,
+    original: Option<&super::TargetMutationCommand>,
+    observe_target: impl FnMut(u64, &super::TargetMutationCommand),
+) -> io::Result<Option<LedgerState>> {
+    let stored = read_verified_with_original_sync(conn, key, original, observe_target)?;
     if stored.identity != identity {
         return Err(invalid());
     }
@@ -201,13 +213,14 @@ pub(super) fn read_with_keys_and_original_sync(
 }
 
 fn read_verified_sync(conn: &Connection, key: &AuditKey) -> io::Result<StoredLedger> {
-    read_verified_with_original_sync(conn, key, None)
+    read_verified_with_original_sync(conn, key, None, |_, _| {})
 }
 
 fn read_verified_with_original_sync(
     conn: &Connection,
     key: &AuditKey,
     original: Option<&super::TargetMutationCommand>,
+    observe_target: impl FnMut(u64, &super::TargetMutationCommand),
 ) -> io::Result<StoredLedger> {
     let mut statement = conn.prepare(
         "SELECT state_json, state_hmac FROM config_raft_management_audit WHERE singleton = 1 AND length(state_json) BETWEEN 1 AND 16777216 AND length(state_hmac) = 32",
@@ -251,11 +264,9 @@ fn read_verified_with_original_sync(
     drop(rows);
     drop(statement);
     if let Some(ledger) = &stored.ledger {
-        match original {
-            Some(original) => ledger.validate_with_original(key, stored.identity, Some(original)),
-            None => ledger.validate(key, stored.identity),
-        }
-        .map_err(|_| invalid())?;
+        ledger
+            .validate_with_target_observer(key, stored.identity, original, observe_target)
+            .map_err(|_| invalid())?;
     }
     let identity = stored.identity;
     let matches: bool = conn.query_row(

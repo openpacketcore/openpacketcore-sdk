@@ -489,8 +489,8 @@ fn joint_history_gate_reuses_only_adjacent_authenticated_read() {
     );
     assert_eq!(
         (counts.rows, counts.watched, counts.recoveries),
-        (1, 2, 5),
-        "HISTORY_GATE_ONE_READ_TWO_BOUNDED_FIVE_TOTAL"
+        (1, 1, 3),
+        "HISTORY_GATE_ONE_READ_ONE_BOUNDED_THREE_TOTAL"
     );
     assert_eq!(counts.anchors, 1);
     tx.commit().unwrap();
@@ -522,9 +522,10 @@ fn joint_history_gate_reauthenticates_each_transaction_after_tampering() {
             validate(&tx, &SqliteWorkCancellation::audit_test())
         });
         result.unwrap();
-        assert!(
-            counts.rows > 0 && counts.watched >= 2,
-            "no authority survives a return"
+        assert_eq!(
+            (counts.rows, counts.watched, counts.recoveries),
+            (1, 1, 3),
+            "every invocation performs fresh authentication and retained recovery"
         );
         tx.commit().unwrap();
     }
@@ -536,6 +537,32 @@ fn joint_history_gate_reauthenticates_each_transaction_after_tampering() {
         )
         .unwrap();
     reject(&fixture);
+}
+
+#[test]
+fn joint_history_gate_reauthenticates_again_inside_same_transaction() {
+    let fixture = Fixture::new(4096);
+    let before = snapshot(&fixture.conn);
+    let tx = fixture.conn.unchecked_transaction().unwrap();
+    let (result, counts) = observe(Some(fixture.original.handle()), None, || {
+        validate(&tx, &SqliteWorkCancellation::audit_test())
+    });
+    result.unwrap();
+    assert_eq!((counts.rows, counts.watched, counts.recoveries), (1, 1, 3));
+    tx.execute(
+        "UPDATE config_raft_management_audit SET state_hmac=zeroblob(32) WHERE singleton=1",
+        [],
+    )
+    .unwrap();
+    let tampered = snapshot(&tx);
+    let (result, counts) = observe(Some(fixture.original.handle()), None, || {
+        validate(&tx, &SqliteWorkCancellation::audit_test())
+    });
+    assert_eq!(result.unwrap_err().kind(), io::ErrorKind::InvalidData);
+    assert_eq!(counts, Counts::default());
+    assert_eq!(snapshot(&tx), tampered, "rejection writes no state");
+    tx.rollback().unwrap();
+    assert_eq!(snapshot(&fixture.conn).rows, before.rows);
 }
 
 #[test]

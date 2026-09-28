@@ -809,6 +809,20 @@ impl LedgerState {
         identity: ConfigConsensusIdentity,
         original: Option<&crate::consensus::TargetMutationCommand>,
     ) -> Result<(), AuditAuthorityError> {
+        self.validate_with_target_observer(key, identity, original, |_, _| {})
+    }
+
+    // The observer borrows each TargetIntent only after its complete retained
+    // verifier and canonical comparison. It cannot substitute for validation:
+    // all entry, operation, replay and anchor checks below still run. Callers
+    // must discard observations if this validation or their enclosing read fails.
+    pub(crate) fn validate_with_target_observer(
+        &self,
+        key: &AuditKey,
+        identity: ConfigConsensusIdentity,
+        original: Option<&crate::consensus::TargetMutationCommand>,
+        mut observe_target: impl FnMut(u64, &crate::consensus::TargetMutationCommand),
+    ) -> Result<(), AuditAuthorityError> {
         self.limits.validate()?;
         if self.version != 1
             || self.identity != identity
@@ -853,13 +867,14 @@ impl LedgerState {
                     if self.continuity.is_none() {
                         return Err(AuditAuthorityError::BindingMismatch);
                     }
-                    recover_target_for_validation(
+                    let prepared = recover_target_for_validation(
                         key,
                         self.identity,
                         &retained.handle,
                         &retained.recovery,
                         original,
                     )?;
+                    observe_target(entry.sequence, prepared.command());
                     Some(&retained.handle)
                 }
                 EntryPayload::EmptyCommit(prepared) => {
