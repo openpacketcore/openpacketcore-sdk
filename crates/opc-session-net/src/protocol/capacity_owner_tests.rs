@@ -189,3 +189,323 @@ async fn descriptor_growth_tracks_actual_backing_and_spare_slots() {
         check.assert_exact();
     }
 }
+
+#[derive(Clone, Copy)]
+struct CensusCallSpec {
+    source: ConsensusNodeId,
+    target: ConsensusNodeId,
+    family: ConsensusRpcFamily,
+    generation: u64,
+    selected_append: bool,
+    snapshot_data_bytes: usize,
+}
+
+struct CensusFrame<'a> {
+    // Deregister the actual frame before its buffers, then release the RPC borrow.
+    frame: EncodedFrame,
+    _owner: crate::consensus::capacity_observation::CallOwner<'a>,
+}
+
+impl CensusFrame<'_> {
+    async fn write<W: tokio::io::AsyncWrite + Unpin>(
+        self,
+        mut writer: W,
+    ) -> Result<W, ProtocolError> {
+        let write = async {
+            self.frame
+                .observation
+                .as_ref()
+                .unwrap()
+                .ready_and_wait()
+                .await;
+            writer
+                .write_all(&u32::try_from(self.frame.encoded_len).unwrap().to_be_bytes())
+                .await?;
+            for chunk in &self.frame.chunks {
+                writer.write_all(chunk.initialized_bytes()).await?;
+            }
+            writer.flush().await
+        };
+        tokio::time::timeout(Duration::from_secs(2), write)
+            .await
+            .expect("real test frame write remains bounded")
+            .map_err(ProtocolError::Io)?;
+        Ok(writer)
+    }
+}
+
+async fn census_frame<'a>(
+    observation: &Arc<ConsensusBufferObservation>,
+    payload: &'a Vec<u8>,
+    spec: CensusCallSpec,
+) -> (
+    CensusFrame<'a>,
+    crate::consensus::capacity_observation::tests::ActualTransportOwner,
+) {
+    use crate::consensus::capacity_observation::{
+        scope_typed_transport, tests::ActualTransportOwner,
+    };
+    let owner = scope_typed_transport(
+        spec.selected_append,
+        spec.snapshot_data_bytes,
+        spec.generation,
+        async {
+            observation
+                .observe_call(spec.source, spec.target, spec.family, payload)
+                .unwrap()
+        },
+    )
+    .await;
+    let frame = scope(Some(&owner), async {
+        encode_frame_bounded(
+            payload,
+            4 * 1_048_576,
+            EncodingControl {
+                deadline: Some(tokio::time::Instant::now() + Duration::from_secs(2)),
+                cancellation: &NEVER_CANCELLED,
+            },
+        )
+        .unwrap()
+    })
+    .await;
+    // Enumerate original allocated owners directly, not registry summaries or
+    // a second encoding. Only numeric identities/extents survive the capture.
+    let mut allocations: Vec<_> = frame
+        .chunks
+        .iter()
+        .map(|chunk| (chunk.bytes.as_ptr() as usize, chunk.bytes.len()))
+        .collect();
+    allocations.push((
+        frame.chunks.as_ptr() as usize,
+        frame.chunks.capacity() * std::mem::size_of::<EncodedFrameChunk>(),
+    ));
+    let actual = ActualTransportOwner {
+        source: spec.source,
+        target: spec.target,
+        family: spec.family,
+        generation: spec.generation,
+        selected_append: spec.selected_append,
+        payload: (payload.as_ptr() as usize, payload.capacity()),
+        frame: allocations,
+        ready: true,
+    };
+    (
+        CensusFrame {
+            frame,
+            _owner: owner,
+        },
+        actual,
+    )
+}
+
+#[tokio::test]
+async fn current_native_census_counts_live_aliases_and_removes_cancelled_owners() {
+    use crate::consensus::capacity_observation::tests::{
+        assert_current_census, ActualTransportOwner,
+    };
+    use std::future::Future;
+    use std::task::{Context, Waker};
+    use tokio::io::AsyncReadExt;
+
+    let observation = Arc::new(ConsensusBufferObservation::default());
+    let node = |id| ConsensusNodeId::new(id).unwrap();
+    let source = node(1);
+    let snapshot_target = node(2);
+    let append_target = node(3);
+    let mut shared = vec![0_u8; 1_048_577];
+    shared.reserve_exact(8_193);
+    let mut distinct = vec![0_u8; shared.len()];
+    distinct.reserve_exact(16_385);
+    assert_eq!(shared, distinct);
+    assert_ne!(shared.as_ptr(), distinct.as_ptr());
+    let mut snapshot = vec![7_u8; 1_025];
+    snapshot.reserve_exact(1_027);
+    let snapshot_input = vec![8_u8; 257];
+    observation.hold_snapshot_writes(snapshot_target);
+    observation.hold_native_append_writes(source, append_target);
+
+    let append_spec = CensusCallSpec {
+        source,
+        target: append_target,
+        family: ConsensusRpcFamily::AppendEntries,
+        generation: 12,
+        selected_append: true,
+        snapshot_data_bytes: 0,
+    };
+    let (append, actual_append) = census_frame(&observation, &shared, append_spec).await;
+    let (snap, actual_snapshot) = census_frame(
+        &observation,
+        &snapshot,
+        CensusCallSpec {
+            source,
+            target: snapshot_target,
+            family: ConsensusRpcFamily::InstallSnapshot,
+            generation: 11,
+            selected_append: false,
+            snapshot_data_bytes: snapshot_input.capacity(),
+        },
+    )
+    .await;
+    let (alias, actual_alias) = census_frame(
+        &observation,
+        &shared,
+        CensusCallSpec {
+            target: node(4),
+            generation: 13,
+            ..append_spec
+        },
+    )
+    .await;
+    let (other, actual_other) = census_frame(
+        &observation,
+        &distinct,
+        CensusCallSpec {
+            target: node(5),
+            generation: 0,
+            selected_append: false,
+            ..append_spec
+        },
+    )
+    .await;
+    let (foreign, actual_foreign) = census_frame(
+        &observation,
+        &shared,
+        CensusCallSpec {
+            source: node(9),
+            target: node(6),
+            family: ConsensusRpcFamily::InstallSnapshot,
+            generation: 21,
+            selected_append: false,
+            snapshot_data_bytes: snapshot_input.capacity(),
+        },
+    )
+    .await;
+    let rpc_only = observation
+        .observe_call(
+            node(9),
+            node(7),
+            ConsensusRpcFamily::InstallSnapshot,
+            &snapshot,
+        )
+        .unwrap();
+    let actual_rpc_only = ActualTransportOwner {
+        source: node(9),
+        target: node(7),
+        family: ConsensusRpcFamily::InstallSnapshot,
+        generation: 0,
+        selected_append: false,
+        payload: (snapshot.as_ptr() as usize, snapshot.capacity()),
+        frame: Vec::new(),
+        ready: false,
+    };
+    let expected = vec![
+        actual_append,
+        actual_snapshot,
+        actual_alias,
+        actual_other,
+        actual_foreign,
+        actual_rpc_only,
+    ];
+
+    // Backpressure is real IO, not an extra observer gate. The normal minority
+    // pair releases quorum traffic; the three duplex writers reach actual bytes.
+    let (alias_writer, mut alias_reader) = tokio::io::duplex(65_536);
+    let (other_writer, mut other_reader) = tokio::io::duplex(65_536);
+    let (foreign_writer, mut foreign_reader) = tokio::io::duplex(65_536);
+    let mut append = Box::pin(append.write(Vec::new()));
+    let mut snap = Box::pin(snap.write(Vec::new()));
+    let mut alias = Box::pin(alias.write(alias_writer));
+    let mut other = Box::pin(other.write(other_writer));
+    let mut foreign = Box::pin(foreign.write(foreign_writer));
+    let mut context = Context::from_waker(Waker::noop());
+    assert!(snap.as_mut().poll(&mut context).is_pending());
+    assert!(append.as_mut().poll(&mut context).is_pending());
+    assert!(alias.as_mut().poll(&mut context).is_pending());
+    assert!(other.as_mut().poll(&mut context).is_pending());
+    assert!(foreign.as_mut().poll(&mut context).is_pending());
+    let all_current = observation.capture_native_overlap_and_release(source);
+
+    // Drop one real in-progress writer plus an RPC-only alias. Other aliases
+    // remain borrowed. A fresh same-instant capture must exclude both owners.
+    drop(alias);
+    drop(rpc_only);
+    observation.hold_snapshot_writes(snapshot_target);
+    observation.hold_native_append_writes(source, append_target);
+    let after_cancel = observation.capture_native_overlap_and_release(source);
+    let mut cancelled_wire = Vec::new();
+    tokio::time::timeout(
+        Duration::from_secs(2),
+        alias_reader.read_to_end(&mut cancelled_wire),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    let append_wire = append.await.unwrap();
+    let snapshot_wire = snap.await.unwrap();
+    let mut other_wire = Vec::new();
+    let mut foreign_wire = Vec::new();
+    let (_, other_read, _, foreign_read) = tokio::join!(
+        async {
+            drop(other.await.unwrap());
+        },
+        other_reader.read_to_end(&mut other_wire),
+        async {
+            drop(foreign.await.unwrap());
+        },
+        foreign_reader.read_to_end(&mut foreign_wire),
+    );
+    other_read.unwrap();
+    foreign_read.unwrap();
+
+    for (wire, payload) in [
+        (&append_wire, &shared),
+        (&snapshot_wire, &snapshot),
+        (&other_wire, &distinct),
+        (&foreign_wire, &shared),
+    ] {
+        let original = serde_json::to_vec(payload).unwrap();
+        assert_eq!(
+            &wire[..4],
+            &u32::try_from(original.len()).unwrap().to_be_bytes()
+        );
+        assert_eq!(&wire[4..], original);
+    }
+    assert!(cancelled_wire.len() > 4 && cancelled_wire.len() < append_wire.len());
+    assert_eq!(cancelled_wire, append_wire[..cancelled_wire.len()]);
+    assert_eq!(observation.snapshot().live, BufferTotals::default());
+    drop(shared);
+    drop(distinct);
+    drop(snapshot);
+    drop(snapshot_input);
+    println!("CONFIG_CAPACITY_CURRENT_CENSUS_LIFECYCLE full_writes=4 partial_cancel=1 rpc_only_drop=1 drained=true native_operation=false");
+
+    let captured =
+        all_current.expect("original selected pair existed beside all additional owners");
+    assert_current_census(&captured, &expected, [0, 1]);
+    assert_eq!(captured.current.total.calls, 6);
+    assert_eq!(captured.current.total.ready_frames, 5);
+    assert_eq!(captured.current.groups.len(), 3);
+    assert_eq!(captured.current.additional.calls, 4);
+    // Only the distinct additional Vec adds RPC capacity: two aliases of the
+    // selected append and one alias of the snapshot never duplicate that charge.
+    assert_eq!(captured.current.additional.rpc_bytes, expected[3].payload.1);
+    let after_cancel = after_cancel.expect("original pair survives unrelated cancellation");
+    let remaining: Vec<_> = expected
+        .into_iter()
+        .enumerate()
+        .filter_map(|(index, owner)| (!matches!(index, 2 | 5)).then_some(owner))
+        .collect();
+    assert_current_census(&after_cancel, &remaining, [0, 1]);
+    assert_eq!(after_cancel.current.total.calls, 4);
+    assert_eq!(after_cancel.current.total.ready_frames, 4);
+    assert_eq!(after_cancel.current.additional.calls, 2);
+    assert_eq!(
+        after_cancel.current.total.rpc_bytes,
+        captured.current.total.rpc_bytes
+    );
+    assert!(
+        after_cancel.current.total.frame_bytes < captured.current.total.frame_bytes,
+        "CONFIG_CAPACITY_CURRENT_DROP_RED: cancelled frames no longer belong to the current census"
+    );
+    println!("CONFIG_CAPACITY_CURRENT_CENSUS_PASS before_calls=6 after_calls=4 distinct_sources=2 groups=3 full_memory_bound=false");
+}

@@ -10,7 +10,7 @@ use opc_persist::config_capacity_observation::{
 use opc_persist::{ConfigHistoryLimits, ConfigHistoryRetention};
 use opc_session_net::consensus::capacity_observation::NativeTransportOverlap;
 
-#[derive(Clone, Copy, Debug, Default)]
+#[derive(Debug, Default)]
 struct NativeResults {
     decoded: Option<NativeOwnerSample>,
     mutation: Option<(NativeOwnerSample, Option<NativeTransportOverlap>)>,
@@ -660,7 +660,7 @@ native_case!(
         )
         .await;
         let native_drain = native_registration.snapshot();
-        let native_results = *native_bridge.results.lock().unwrap();
+        let native_results = std::mem::take(&mut *native_bridge.results.lock().unwrap());
         drop(native_registration);
         let drained = observation.snapshot();
         assert_eq!(drained.live, Default::default());
@@ -791,8 +791,86 @@ native_case!(
         assert!(transport.pair.frame_allocations > 2);
         assert!(transport.pair.frame_bytes > transport.pair.rpc_bytes);
         assert_ne!(transport.append_generation, transport.snapshot_generation);
-        // Only this selected RPC is added once. The other six appends, snapshot
-        // input/RPC, outer frames and retained engine entries have separate scope.
+        let current = &transport.current;
+        let owners: Vec<_> = current
+            .groups
+            .iter()
+            .flat_map(|group| group.owners.iter().map(move |owner| (group, owner)))
+            .collect();
+        let call_ids: BTreeSet<_> = owners.iter().map(|(_, owner)| owner.call_id).collect();
+        assert_eq!(
+            current.total.calls,
+            owners.len(),
+            "CONFIG_CAPACITY_CURRENT_NATIVE_RED: every current registration has provenance"
+        );
+        assert_eq!(call_ids.len(), owners.len());
+        assert!(call_ids.iter().all(|id| *id > 0));
+        assert_eq!(current.total.calls, current.additional.calls + 2);
+        assert_eq!(
+            current.total.ready_frames,
+            current.additional.ready_frames + 2
+        );
+        assert_eq!(
+            current.total.rpc_bytes,
+            transport.pair.rpc_bytes + current.additional.rpc_bytes
+        );
+        assert_eq!(
+            current.total.frame_bytes,
+            transport.pair.frame_bytes + current.additional.frame_bytes
+        );
+        assert_eq!(
+            current.total.frame_allocations,
+            transport.pair.frame_allocations + current.additional.frame_allocations
+        );
+        for group in &current.groups {
+            assert_eq!(group.totals.calls, group.owners.len());
+            assert!(group.owners.iter().all(|owner| owner.buffers.calls == 1));
+        }
+        let (append_group, append_owner) = owners
+            .iter()
+            .find(|(_, owner)| owner.call_id == transport.append_call_id)
+            .copied()
+            .expect("selected actual append is part of the current census");
+        let (snapshot_group, snapshot_owner) = owners
+            .iter()
+            .find(|(_, owner)| owner.call_id == transport.snapshot_call_id)
+            .copied()
+            .expect("selected actual snapshot is part of the current census");
+        assert_eq!(append_group.source, leader_id);
+        assert_eq!(append_group.family, ConsensusRpcFamily::AppendEntries);
+        assert_eq!(append_owner.target, minority_id);
+        assert_eq!(append_owner.generation, transport.append_generation);
+        assert!(append_owner.selected_append);
+        assert_eq!(append_owner.buffers.ready_frames, 1);
+        assert_eq!(
+            append_owner.buffers.rpc_bytes,
+            transport.pair.append_rpc_bytes
+        );
+        assert_eq!(snapshot_group.source, leader_id);
+        assert_eq!(snapshot_group.family, ConsensusRpcFamily::InstallSnapshot);
+        assert_eq!(snapshot_owner.target, lagging_id);
+        assert_eq!(snapshot_owner.generation, transport.snapshot_generation);
+        assert_eq!(snapshot_owner.buffers.ready_frames, 1);
+        assert_eq!(
+            snapshot_owner.buffers.rpc_bytes,
+            transport.pair.snapshot_rpc_bytes
+        );
+        let current_append_targets: BTreeSet<_> = append_group
+            .owners
+            .iter()
+            .map(|owner| owner.target)
+            .collect();
+        // All currently registered append RPCs from this source are distinct
+        // from native mutation storage. Snapshot RPC and outer-frame storage
+        // remain separate; source/family groups can alias and are not summed.
+        let current_node_mutation_bytes =
+            native.node_mutation_bytes + append_group.totals.rpc_bytes;
+        println!("CONFIG_CAPACITY_CURRENT_NATIVE_LIFECYCLE observed_calls={} additional_calls={} current_append_targets={} completed_append_targets=7 native_node_mutation_bytes={} current_append_rpc_bytes={} current_snapshot_rpc_bytes={} current_node_mutation_bytes={} current_outer_frame_bytes={} current={current:?} full_memory_bound=false",
+            current.total.calls, current.additional.calls, current_append_targets.len(),
+            native.node_mutation_bytes, append_group.totals.rpc_bytes, snapshot_group.totals.rpc_bytes,
+            current_node_mutation_bytes, current.total.frame_bytes);
+        // Preserve the original selected-owner partial bounds separately from
+        // the broader current census; neither establishes a complete budget.
         let selected_mutation_bytes =
             native.selected_mutation_bytes + transport.pair.append_rpc_bytes;
         let node_mutation_bytes = native.node_mutation_bytes + transport.pair.append_rpc_bytes;
