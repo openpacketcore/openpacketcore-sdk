@@ -9,6 +9,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- `opc-gtpu-dataplane`: an IPv6 `remove_pdp_context` on an ordinary eBPF
+  attachment no longer falls through to the IPv4 removal by local TEID, which
+  removed the IPv4 context sharing that TEID. Removal is now family-scoped.
+- `opc-route-steering`: `RuleRequest` gains an explicit `family` so mark-only
+  policy rules can be created, read back, converged and removed as `AF_INET6`
+  rules. `None` keeps the previous IPv4 default and wire bytes; a prefix still
+  determines the family, and a conflicting explicit family is rejected. IPv4
+  and IPv6 rules with the same mark, table and priority are distinct objects.
+  Breaking: struct-literal constructors must add `family: None`. Refs #989.
 - `opc-proto-gtpv2c`: model TS 29.274 Causes 18 (new PDN type due to network
   preference) and 19 (new PDN type due to single address bearer only). A
   Create Session Response carrying either now projects as accepted with its
@@ -57,6 +66,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `KernelReassemblyHandoff` for outer IPv4 fragments. Native tests cover
   in-order, reordered, duplicated, missing, foreign-TEID, stale-generation,
   owner-only, mixed-binding and gate-closed fragment sets. Refs #1001.
+
+- `opc-gtpu-dataplane`: the ordinary eBPF PDP-context API accepts an inner
+  IPv6 PDN prefix. Uplink selects the inner source `/64` plus mark, downlink
+  requires the destination inside the `/64`, and transport stays IPv4. An
+  IPv4v6 PDN is two family-scoped contexts sharing one bearer TEID. Readback,
+  exact removal, restart adoption and cleanup-only recovery are family-aware;
+  `pdp_inner_ipv6_capability()` reports support. The family-tagged authority
+  is retired with the last inner-IPv6 context, so drained attachments stay
+  eligible for legacy terminal-successor recovery. An IPv6 context on a grouped
+  attachment reports `ordinary_inner_ipv6_pdp_on_grouped_attachment`. Refs
+  #986.
 
 - `opc-gtpu-dataplane`: `TftUplinkClassifier` owns a typed `TftUplinkPaaSet`
   holding at most one IPv4 `/32` and one canonical IPv6 `/64` (TS 23.401

@@ -63,6 +63,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         fwmark: None,
         table: 100,
         priority: 1000,
+        family: None,
     };
 
     let outcome = backend
@@ -84,6 +85,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 ```
+
+Linux keeps separate IPv4 and IPv6 rule lists. A rule with a source or
+destination prefix takes that prefix's family. A mark-only rule has no prefix,
+so `RuleRequest::family` selects its list: `None` keeps the IPv4 default used
+by `ip rule`, and `Some(RouteSteeringIpFamily::Ipv6)` creates the equivalent of
+`ip -6 rule add fwmark ...`. Steering one mark for both families takes two
+rules, one per family; they are distinct objects for readback, convergence,
+and exact removal. An explicit family that conflicts with a prefix is rejected.
 
 For a complete writer-owned set, use the collection API. This is also the API
 for provably disjoint source rules that intentionally share one family and
@@ -116,6 +125,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         fwmark: None,
         table: 100,
         priority: 1000,
+        family: None,
     };
     let second = RuleRequest {
         source: Some(IpPrefix::new(
@@ -126,6 +136,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         fwmark: None,
         table: 100,
         priority: 1000,
+        family: None,
     };
 
     let desired = OwnedRouteRuleSet::new(scope, Vec::new(), vec![first, second.clone()])?;
