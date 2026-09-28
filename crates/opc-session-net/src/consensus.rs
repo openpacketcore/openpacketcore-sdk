@@ -1604,6 +1604,46 @@ impl ConsensusColdConnector {
     }
 }
 
+/// One bounded cold setup: TCP, TLS and consensus bootstrap under the attempt
+/// deadline.
+type SupersededConsensusSetup = std::pin::Pin<
+    Box<
+        dyn std::future::Future<
+                Output = Result<
+                    Result<ConsensusConnection, SessionConsensusPeerError>,
+                    tokio::time::error::Elapsed,
+                >,
+            > + Send,
+    >,
+>;
+
+/// Let a superseded setup finish in the background, then drop it.
+///
+/// A local reauthentication or material change supersedes a setup that may
+/// already be in the middle of its TLS handshake or bootstrap with the
+/// server. Cancelling it there leaves the server with a handshake or
+/// bootstrap cut off mid-exchange, which the server records as a transport
+/// failure that never happened (#1005). The superseded setup is never
+/// published or used: its callers were already told it failed. It only
+/// completes the exchange it started, still under its original attempt
+/// deadline, and then closes at a frame boundary. Pool shutdown still
+/// cancels it at once.
+fn finish_superseded_consensus_setup(
+    setup: SupersededConsensusSetup,
+    mut shutdown: tokio::sync::watch::Receiver<bool>,
+) {
+    let Ok(runtime) = tokio::runtime::Handle::try_current() else {
+        return;
+    };
+    runtime.spawn(async move {
+        tokio::select! {
+            biased;
+            _ = shutdown.wait_for(|stopped| *stopped) => {}
+            _ = setup => {}
+        }
+    });
+}
+
 enum DetachedConsensusConnectionOutcome {
     Established(Result<Box<ConsensusConnection>, SessionConsensusPeerError>),
     Superseded,
@@ -1727,11 +1767,11 @@ async fn run_detached_consensus_connection_attempt(
     };
 
     let mut attempt_metrics = ConnectionAttemptMetricGuard::started();
-    let establish = tokio::time::timeout_at(
-        attempt_deadline,
-        connector.establish(epoch, attempt_deadline),
-    );
-    tokio::pin!(establish);
+    let establish_connector = connector.clone();
+    let mut establish: SupersededConsensusSetup =
+        Box::pin(tokio::time::timeout_at(attempt_deadline, async move {
+            establish_connector.establish(epoch, attempt_deadline).await
+        }));
     let outcome = {
         let superseded = reconnect_attempt.superseded();
         tokio::pin!(superseded);
@@ -1779,6 +1819,9 @@ async fn run_detached_consensus_connection_attempt(
         pause_after_accepted_consensus_bootstrap().await;
     }
 
+    // Only a supersession observed by the select above leaves the setup
+    // future in flight; every other outcome has already consumed it.
+    let setup_in_flight = matches!(outcome, DetachedConsensusConnectionOutcome::Superseded);
     let connection = match outcome {
         DetachedConsensusConnectionOutcome::Established(Ok(connection))
             if connector.epoch() == epoch =>
@@ -1787,6 +1830,9 @@ async fn run_detached_consensus_connection_attempt(
         }
         DetachedConsensusConnectionOutcome::Established(Ok(_))
         | DetachedConsensusConnectionOutcome::Superseded => {
+            if setup_in_flight {
+                finish_superseded_consensus_setup(establish, shutdown.clone());
+            }
             METRICS
                 .session_net_reconnect_attempts
                 .fetch_add(1, Ordering::Relaxed);
