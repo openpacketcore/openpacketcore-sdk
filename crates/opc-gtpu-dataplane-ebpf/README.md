@@ -35,11 +35,12 @@ The crate exposes tc entry points, not a Rust library API:
   decapsulate. The program strips the proven outer envelope, writes the
   dedicated-bearer mark (or zero), and continues through the ePDG's XFRM
   output policy. A true grouped-index miss alone may enter the legacy IPv4
-  PDR/commit path. Legacy outer-IPv4 fragments retain the bounded
-  kernel-reassembly handoff. Grouped outer-IPv4 and outer-IPv6 packets
-  requiring reassembly pass to the host, but the backend reports both
-  per-family grouped fragment capabilities as unsupported because the current
-  consumer cannot authorize the grouped graph. A bounded IPv6 extension walk
+  PDR/commit path. Outer-IPv4 fragments, legacy or grouped, retain the
+  bounded kernel-reassembly handoff; the backend-owned consumer
+  (`GtpuControlPort::try_receive_downlink`) authorizes the reassembled G-PDU
+  against the same grouped and legacy state. Grouped outer-IPv6 packets
+  requiring reassembly pass to the host, and the backend reports that
+  capability as unsupported because no IPv6 consumer exists. A bounded IPv6 extension walk
   accepts canonical Hop-by-Hop, Destination Options,
   Routing-with-zero-Segments-Left, and atomic Fragment headers. AH, ESP, active
   routing, discard-required options, non-atomic fragments, or chains outside

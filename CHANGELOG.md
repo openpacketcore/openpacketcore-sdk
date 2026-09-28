@@ -63,6 +63,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- `opc-gtpu-dataplane`: backend-authoritative post-reassembly downlink
+  consumer. `GtpuControlPort::try_receive_downlink` receives one datagram from
+  the eBPF attachment's backend-owned UDP/2152 queue and, under the same
+  serialization as attachment mutation, authorizes a reassembled or handed-off
+  G-PDU with the tc fast path's own decisions: grouped index first (Active
+  generation, device, slot, endpoints, source-port policy, inner PAA, N3 PSC),
+  otherwise the v5 PDR, endpoint binding, owner journal, FAR and DSCP with the
+  Active commit read last. It returns `GtpuDownlinkEvent::Decapsulated` with
+  the exact inner packet and bearer mark, the untouched datagram for controls
+  or unknown tunnels, or a value-free `GtpuDownlinkDrop`; a closed traffic
+  gate, cleanup-only, successor-pending or unreadable state fails closed.
+  `downlink_counters` exposes bounded per-registration counters. Grouped
+  attachments with an IPv4 outer endpoint now report
+  `KernelReassemblyHandoff` for outer IPv4 fragments. Native tests cover
+  in-order, reordered, duplicated, missing, foreign-TEID, stale-generation,
+  owner-only, mixed-binding and gate-closed fragment sets. On an ordinary
+  attachment, inner-IPv6 contexts (#998) decapsulate through the attachment's
+  published family authority. Refs #1001.
+
 - `opc-gtpu-dataplane`: the ordinary eBPF PDP-context API accepts an inner
   IPv6 PDN prefix. Uplink selects the inner source `/64` plus mark, downlink
   requires the destination inside the `/64`, and transport stays IPv4. An

@@ -174,7 +174,8 @@ pub use reassembly::{
     GtpuKernelReassemblyStatsError, GtpuReassemblySocket,
 };
 pub use reassembly::{
-    reassembly_commit_authorizes_graph, DownlinkOuterProvenance, GtpuReassemblyConsumer,
+    reassembly_commit_authorizes_graph, DownlinkOuterProvenance, GtpuDecapsulatedDownlink,
+    GtpuDownlinkCounters, GtpuDownlinkDrop, GtpuDownlinkEvent, GtpuReassemblyConsumer,
     GtpuReassemblyCounters, GtpuReassemblyDrop, GtpuReassemblyGraphIdentity, GtpuReassemblyOutcome,
     GtpuReassemblyPdr, GtpuReassemblySelector,
 };
