@@ -2524,4 +2524,54 @@ mod tests {
         );
         assert_eq!(worst_case_lifetime_admissions(default), 63_814);
     }
+
+    /// Past 4,096 tracked destinations the least recently used one is
+    /// evicted, and a refused admission still counts as a use, so a flooding
+    /// destination stays tracked and limited.
+    #[test]
+    fn session_buckets_evict_the_least_recently_used_key() {
+        use std::time::{Duration, Instant};
+        let limit = GtpuInnerFragmentRateLimit::new(1, Duration::from_secs(3_600)).unwrap();
+        let mut budget = InnerFragmentBudget::new(limit);
+        let start = Instant::now();
+        let at = |step: u32| start + Duration::from_micros(u64::from(step));
+        // Fill the table; every bucket is then empty.
+        for key in 0..4_096_u32 {
+            assert!(budget.admit(key.to_be_bytes(), at(key), true).is_some());
+        }
+        // Key 0 is refused but used, so key 1 is now the oldest.
+        assert_eq!(budget.admit(0_u32.to_be_bytes(), at(4_096), true), None);
+        assert!(budget
+            .admit(4_096_u32.to_be_bytes(), at(4_097), true)
+            .is_some());
+        assert_eq!(budget.admit(0_u32.to_be_bytes(), at(4_098), true), None);
+        assert_eq!(budget.admit(2_u32.to_be_bytes(), at(4_099), true), None);
+        assert!(
+            budget.admit(1_u32.to_be_bytes(), at(4_100), true).is_some(),
+            "only the least recently used key was evicted"
+        );
+    }
+
+    /// A re-tracked destination's Identification sequence restarts from a
+    /// fresh keyed seed, not from the start it had before its eviction.
+    #[test]
+    fn a_retracked_destination_restarts_from_a_fresh_seed() {
+        use std::time::{Duration, Instant};
+        let limit = GtpuInnerFragmentRateLimit::new(1, Duration::from_secs(3_600)).unwrap();
+        let mut budget = InnerFragmentBudget::new(limit);
+        let start = Instant::now();
+        let mut starts = std::collections::HashSet::new();
+        for round in 0..3_u32 {
+            let now = start + Duration::from_secs(u64::from(round));
+            starts.insert(budget.admit(UE.octets(), now, true).unwrap().unwrap());
+            // 4,096 other destinations push it out of the table.
+            for index in 0..4_096_u32 {
+                let other = (0x0100_0000 + round * 4_096 + index).to_be_bytes();
+                let later = now + Duration::from_micros(u64::from(index) + 1);
+                assert!(budget.admit(other, later, true).is_some());
+            }
+        }
+        // Equal starts in all three rounds have probability 65,535^-2.
+        assert!(starts.len() > 1, "a re-tracked destination reused its seed");
+    }
 }
