@@ -716,6 +716,10 @@ fn retained_size(
 
 fn validate_limited_state(conn: &Connection, state: &HistoryState) -> io::Result<()> {
     validate_state(conn, state)?;
+    validate_history_limits(conn, state)
+}
+
+fn validate_history_limits(conn: &Connection, state: &HistoryState) -> io::Result<()> {
     if let Some(limits) = state.limits {
         let (records, bytes) = retained_size(conn, None, state.profile()?)?;
         if records > u64::from(limits.max_records) || bytes > limits.max_bytes {
@@ -791,10 +795,11 @@ pub(crate) fn validate_access_for_profile_sync(
             }
         }
     }
-    validate_limited_state(conn, &state)?;
     let record_chain = if capacity_profile == ConfigCapacityProfile::Legacy {
+        validate_limited_state(conn, &state)?;
         record_chain_sync(conn, capacity_profile, cancellation)?
     } else {
+        validate_history_limits(conn, &state)?;
         capacity_record_chain_sync(conn, &state, key, cancellation)?
     };
     if record_chain != state.record_chain {
@@ -826,10 +831,12 @@ pub(crate) fn validate_access_sync(
     )
 }
 
-/// Verify each bounded proof and construct the independent record chain from
-/// the same borrowed row. The caller has authenticated state and boundary, but
-/// must compare the completed chain before exposing any read or mutation.
-/// No ciphertext view or owning copy escapes this pinned consuming transaction.
+/// Authenticate each current row's capacity proof and compare its fresh digest
+/// with the authenticated head and first retained boundary in this same scan.
+/// The caller has authenticated the state and scope and must still compare the
+/// complete history chain before returning success. Neither endpoint metadata
+/// nor a successful proof replaces that chain comparison. No row or digest is
+/// reused by a later read.
 fn capacity_record_chain_sync(
     conn: &Connection,
     state: &HistoryState,
@@ -856,6 +863,8 @@ fn capacity_record_chain_sync(
     ).map_err(database_error)?;
     let mut rows = query.query([]).map_err(database_error)?;
     let mut digest = empty_record_chain();
+    let mut records = 0_u64;
+    let mut last_head = None;
     loop {
         cancellation.check_io()?;
         let Some(row) = rows.next().map_err(database_error)? else {
@@ -888,13 +897,21 @@ fn capacity_record_chain_sync(
                     .map_err(|_| corrupt())?,
             )),
         };
-        if let Some(boundary) = &state.boundary {
-            if version == boundary.first.version {
-                if tx_id != boundary.first.tx_id || parent_tx_id.is_some() {
-                    return Err(corrupt());
-                }
-                parent_tx_id = Some(boundary.original_parent);
+        // Only the actual first retained row may borrow the detached parent.
+        // Do not search for a later matching version from replayed metadata.
+        let first_boundary = if records == 0 {
+            state.boundary.as_ref()
+        } else {
+            None
+        };
+        if let Some(boundary) = first_boundary {
+            if tx_id != boundary.first.tx_id
+                || version != boundary.first.version
+                || parent_tx_id.is_some()
+            {
+                return Err(corrupt());
             }
+            parent_tx_id = Some(boundary.original_parent);
         }
         let encrypted = encrypted_column(row, 7).map_err(database_error)?;
         #[cfg(test)]
@@ -924,12 +941,20 @@ fn capacity_record_chain_sync(
             version,
             encrypted_digest,
         };
+        if first_boundary.is_some_and(|boundary| head != boundary.first) {
+            return Err(corrupt());
+        }
         digest = extend_record_chain(
             digest,
             &head,
             audit_anchor_digest(count, &terminal)?,
             record_metadata_digest(conn, &head, profile, cancellation)?,
         );
+        records = records.checked_add(1).ok_or_else(corrupt)?;
+        last_head = Some(head);
+    }
+    if last_head != state.head || records != state.records {
+        return Err(corrupt());
     }
     Ok(digest)
 }

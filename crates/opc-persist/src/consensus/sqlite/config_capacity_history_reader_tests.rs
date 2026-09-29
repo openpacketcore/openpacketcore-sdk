@@ -987,22 +987,22 @@ fn assert_digest_work(sample: Sample, input: DigestInput) {
         "every capacity MAC, anchor, metadata, chain extension and final comparison must complete"
     );
     assert_eq!(
-        sample.ciphertext_hash_calls[head],
-        usize::from(input.rows != 0)
+        [
+            sample.ciphertext_hash_calls[head],
+            sample.ciphertext_hash_calls[boundary],
+            sample.ciphertext_hash_bytes[head],
+            sample.ciphertext_hash_bytes[boundary],
+        ],
+        [0; 4],
+        "HISTORY_CIPHERTEXT_ENDPOINT_NO_DUPLICATE_READ: authenticated endpoints share each fresh capacity proof"
     );
-    assert_eq!(sample.ciphertext_hash_bytes[head], input.head_bytes);
-    assert_eq!(
-        sample.ciphertext_hash_calls[boundary],
-        usize::from(input.boundary_bytes != 0)
-    );
-    assert_eq!(sample.ciphertext_hash_bytes[boundary], input.boundary_bytes);
     assert_eq!(
         sample.peak_owned_ciphertext, 0,
         "no ciphertext clone in authentication"
     );
     let actual_calls = sample.ciphertext_hash_calls[chain] + sample.ciphertext_hash_calls[capacity];
     let actual_bytes = sample.ciphertext_hash_bytes[chain] + sample.ciphertext_hash_bytes[capacity];
-    println!("HISTORY_CIPHERTEXT_DIGEST_WORK rows={} bytes={} actual_calls={actual_calls} actual_bytes={actual_bytes} completed={:?}", input.rows, input.bytes, sample.completed_checks);
+    println!("HISTORY_CIPHERTEXT_DIGEST_WORK rows={} bytes={} head_bytes={} boundary_bytes={} actual_calls={actual_calls} actual_bytes={actual_bytes} completed={:?}", input.rows, input.bytes, input.head_bytes, input.boundary_bytes, sample.completed_checks);
     assert_eq!((actual_calls, actual_bytes), (input.rows, input.bytes),
         "HISTORY_CIPHERTEXT_DIGEST_REUSE: one real raw SHA per retained row after all checks and native reopen");
 }

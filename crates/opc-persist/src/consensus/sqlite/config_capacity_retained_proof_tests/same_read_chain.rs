@@ -86,6 +86,11 @@ async fn config_capacity_history_same_read_hashes_each_proof_ciphertext_once() {
         assert_eq!(sample.peak_owned_ciphertext, 0);
         assert_eq!(sample.peak_owned_fixed_width, [0; 9]);
         assert_eq!(
+            [sample.calls[0], sample.calls[2]],
+            [0, 0],
+            "CONFIG_CAPACITY_ENDPOINT_SCAN_RED: no separate head or boundary ciphertext projection"
+        );
+        assert_eq!(
             [
                 sample.ciphertext_hash_calls[CiphertextHashSite::Chain as usize],
                 sample.ciphertext_hash_calls[CiphertextHashSite::Capacity as usize],
@@ -211,4 +216,282 @@ async fn config_capacity_history_same_read_checks_independent_capacity_mac() {
 #[tokio::test]
 async fn config_capacity_history_same_read_checks_complete_chain_metadata() {
     rejects_fresh_corruption(Corruption::ChainMetadata).await;
+}
+
+async fn retained() -> Fixture {
+    let fixture = populated().await;
+    let retention = ConfigHistoryRetention::new(
+        tx_id(3),
+        ConfigVersion::new(3),
+        ConfigVersion::new(1),
+        ConfigVersion::new(2),
+        ConfigHistoryLimits::new(2, 8 * 1024 * 1024).expect("retained limits"),
+    )
+    .expect("explicit prefix acknowledgement");
+    assert!(apply(
+        &fixture,
+        vec![entry(
+            &fixture,
+            4,
+            ConfigMutationIntent::RetainHistory(retention)
+        )]
+    )
+    .await[0]
+        .result
+        .is_ok());
+    fixture
+}
+
+#[tokio::test]
+async fn config_capacity_history_same_read_retained_endpoints_survive_reopen() {
+    let fixture = retained().await;
+    let shared = fixture.backend.conn();
+    let conn = shared.lock().await;
+    let before = authority_digest(&conn);
+    let changes = conn.total_changes();
+    let expected_bytes: i64 = conn
+        .query_row(
+            "SELECT SUM(length(encrypted_blob)) FROM config_history",
+            [],
+            |row| row.get(0),
+        )
+        .expect("retained ciphertext extent");
+    let tx = conn.unchecked_transaction().expect("pinned retained read");
+    let mut samples = Vec::new();
+    for _ in 0..2 {
+        let observation = Observation::start();
+        validate(&tx, &fixture).expect("fresh authenticated retained endpoints");
+        samples.push(observation.finish());
+        assert_eq!(authority_digest(&tx), before);
+        assert_eq!(tx.total_changes(), changes);
+    }
+    tx.commit().expect("finish pinned read");
+    drop(conn);
+    drop(shared);
+    let expected = fixture
+        .backend
+        .load_since(ConfigVersion::new(1), 2)
+        .await
+        .expect("first retained row and head");
+    assert_eq!(expected.len(), 2);
+    assert_eq!(expected[0].record.version, ConfigVersion::new(2));
+    assert_eq!(expected[0].record.parent_tx_id, Some(tx_id(1)));
+    assert_eq!(expected[1].record.version, ConfigVersion::new(3));
+    drop(fixture.backend);
+    let reopened = SqliteBackend::reopen_config_authority(fixture.options, fixture.key)
+        .await
+        .expect("retained endpoint reopen");
+    let actual = reopened
+        .load_since(ConfigVersion::new(1), 2)
+        .await
+        .expect("same retained projections after reopen");
+    assert_eq!(actual.len(), expected.len());
+    for (actual, expected) in actual.iter().zip(&expected) {
+        assert_eq!(actual.record, expected.record);
+        assert_eq!(actual.audit, expected.audit);
+    }
+    let shared = reopened.conn();
+    let conn = shared.lock().await;
+    assert_eq!(authority_digest(&conn), before);
+    for sample in samples {
+        assert_eq!(sample.peak_owned_ciphertext, 0);
+        assert_eq!(sample.peak_owned_fixed_width, [0; 9]);
+        assert_eq!(
+            [
+                sample.ciphertext_hash_calls[CiphertextHashSite::Chain as usize],
+                sample.ciphertext_hash_calls[CiphertextHashSite::Capacity as usize],
+            ],
+            [0, 2]
+        );
+        assert_eq!(
+            [
+                sample.ciphertext_hash_bytes[CiphertextHashSite::Chain as usize],
+                sample.ciphertext_hash_bytes[CiphertextHashSite::Capacity as usize],
+            ],
+            [0, usize::try_from(expected_bytes).unwrap()]
+        );
+        assert_eq!(
+            [sample.calls[0], sample.calls[2]],
+            [0, 0],
+            "CONFIG_CAPACITY_ENDPOINT_SCAN_RED: retained endpoint hashes share the fresh row proof"
+        );
+    }
+}
+
+fn sign_synthetic_state(
+    conn: &Connection,
+    key: &AuditKey,
+    mutate: impl FnOnce(&mut serde_json::Value),
+) {
+    use hmac::{Hmac, KeyInit, Mac};
+    let bytes: Vec<u8> = conn
+        .query_row(
+            "SELECT state_json FROM config_raft_history_retention WHERE singleton = 1",
+            [],
+            |row| row.get(0),
+        )
+        .expect("authenticated fixture state");
+    let mut state: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+    mutate(&mut state);
+    let bytes = serde_json::to_vec(&state).unwrap();
+    // This fixture owns its synthetic signing key. Keep the MAC valid so that
+    // inconsistent endpoint/count metadata must fail its independent check.
+    let mut mac = Hmac::<Sha256>::new_from_slice(key.as_bytes()).unwrap();
+    mac.update(b"openpacketcore/config-consensus/history-retention/v1\0");
+    mac.update(&bytes);
+    let tag = mac.finalize().into_bytes();
+    assert_eq!(
+        conn.execute(
+            "UPDATE config_raft_history_retention SET state_json = ?1, state_hmac = ?2 WHERE singleton = 1",
+            params![bytes, tag.as_slice()],
+        )
+        .expect("synthetic authenticated inconsistent state"),
+        1
+    );
+}
+
+fn rejects_signed_inconsistency(
+    conn: &Connection,
+    fixture: &Fixture,
+    mutate: impl FnOnce(&mut serde_json::Value),
+    marker: &str,
+) {
+    let before = authority_digest(conn);
+    let tx = conn
+        .unchecked_transaction()
+        .expect("pinned read and change");
+    validate(&tx, fixture).expect("original consistent authenticated state");
+    sign_synthetic_state(&tx, &fixture.key, mutate);
+    let changed = authority_digest(&tx);
+    assert_ne!(changed, before);
+    let changes = tx.total_changes();
+    let error = validate(&tx, fixture).expect_err(marker);
+    assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+    assert_eq!(authority_digest(&tx), changed);
+    assert_eq!(tx.total_changes(), changes, "rejection performs no writes");
+    tx.rollback().expect("restore original authority");
+    assert_eq!(authority_digest(conn), before);
+    validate(conn, fixture).expect("restored original remains readable");
+}
+
+#[tokio::test]
+async fn config_capacity_history_same_read_checks_authenticated_head() {
+    let fixture = populated().await;
+    let shared = fixture.backend.conn();
+    let conn = shared.lock().await;
+    let marker = "CONFIG_CAPACITY_AUTHENTICATED_HEAD_RED";
+    rejects_signed_inconsistency(
+        &conn,
+        &fixture,
+        |s| s["head"] = serde_json::Value::Null,
+        marker,
+    );
+    rejects_signed_inconsistency(
+        &conn,
+        &fixture,
+        |s| s["head"]["tx_id"] = serde_json::to_value(tx_id(2)).unwrap(),
+        marker,
+    );
+    rejects_signed_inconsistency(&conn, &fixture, |s| s["head"]["version"] = 2.into(), marker);
+    rejects_signed_inconsistency(
+        &conn,
+        &fixture,
+        |s| {
+            let byte = s["head"]["encrypted_digest"][0].as_u64().unwrap();
+            s["head"]["encrypted_digest"][0] = (byte ^ 1).into();
+        },
+        marker,
+    );
+    drop(conn);
+    drop(shared);
+    drop(fixture);
+
+    // The terminal comparison must also authenticate a history with no rows.
+    let empty = super::fixture(PROFILE).await;
+    initialize(&empty).await;
+    let shared = empty.backend.conn();
+    let conn = shared.lock().await;
+    rejects_signed_inconsistency(
+        &conn,
+        &empty,
+        |s| {
+            s["head"] = serde_json::json!({
+                "tx_id": tx_id(1),
+                "version": ConfigVersion::new(1),
+                "encrypted_digest": vec![0_u8; 32],
+            });
+        },
+        "CONFIG_CAPACITY_AUTHENTICATED_EMPTY_HEAD_RED",
+    );
+}
+
+#[tokio::test]
+async fn config_capacity_history_same_read_checks_authenticated_record_count() {
+    let fixture = populated().await;
+    let shared = fixture.backend.conn();
+    let conn = shared.lock().await;
+    for count in [0, 2, 4, u64::MAX] {
+        rejects_signed_inconsistency(
+            &conn,
+            &fixture,
+            |s| s["records"] = count.into(),
+            "CONFIG_CAPACITY_AUTHENTICATED_COUNT_RED",
+        );
+    }
+    drop(conn);
+    drop(shared);
+    drop(fixture);
+
+    let empty = super::fixture(PROFILE).await;
+    initialize(&empty).await;
+    let shared = empty.backend.conn();
+    let conn = shared.lock().await;
+    for count in [1, u64::MAX] {
+        rejects_signed_inconsistency(
+            &conn,
+            &empty,
+            |s| s["records"] = count.into(),
+            "CONFIG_CAPACITY_AUTHENTICATED_EMPTY_COUNT_RED",
+        );
+    }
+}
+
+#[tokio::test]
+async fn config_capacity_history_same_read_checks_actual_first_retained_boundary() {
+    let fixture = retained().await;
+    let shared = fixture.backend.conn();
+    let conn = shared.lock().await;
+    let marker = "CONFIG_CAPACITY_AUTHENTICATED_BOUNDARY_RED";
+    rejects_signed_inconsistency(
+        &conn,
+        &fixture,
+        |s| {
+            let byte = s["boundary"]["first"]["encrypted_digest"][0]
+                .as_u64()
+                .unwrap();
+            s["boundary"]["first"]["encrypted_digest"][0] = (byte ^ 1).into();
+        },
+        marker,
+    );
+    rejects_signed_inconsistency(
+        &conn,
+        &fixture,
+        |s| s["boundary"]["first"]["tx_id"] = serde_json::to_value(tx_id(3)).unwrap(),
+        marker,
+    );
+    rejects_signed_inconsistency(
+        &conn,
+        &fixture,
+        |s| {
+            s["boundary"]["first"]["version"] = 3.into();
+            s["acknowledged_through"] = 2.into();
+        },
+        marker,
+    );
+    rejects_signed_inconsistency(
+        &conn,
+        &fixture,
+        |s| s["boundary"]["original_parent"] = serde_json::to_value(tx_id(2)).unwrap(),
+        marker,
+    );
 }
