@@ -162,14 +162,18 @@ impl PacketTooBigPlan {
     /// admits for this PDN connection. RFC 792/1191 quote exactly the
     /// invoking IPv4 header and its first 64 bits of data.
     ///
-    /// Every never-answer rule is applied here, before any rate-limit token
-    /// is taken. Returns the G-PDU with its committed local and peer outer
-    /// addresses, or `None` when no error may be sent.
+    /// The invoking header is validated and every never-answer rule is
+    /// applied here, before any rate-limit token is taken. Returns the G-PDU
+    /// with its committed local and peer outer addresses, or `None` when no
+    /// error may be sent.
     pub(super) fn build_uplink_gpdu(
         &self,
     ) -> Option<(Vec<u8>, std::net::Ipv4Addr, std::net::Ipv4Addr)> {
         let uplink = self.route.uplink?;
         let inner = datagram_payload(&self.datagram, self.route.payload_offset)?;
+        // RFC 1812 section 5.2.2 and RFC 1122 section 3.2.1.2: a bad header
+        // checksum or a truncated datagram is silently discarded.
+        crate::inner_fragment::valid_ipv4_header(inner)?;
         let source = std::net::Ipv4Addr::new(inner[16], inner[17], inner[18], inner[19]);
         let destination = std::net::Ipv4Addr::new(inner[12], inner[13], inner[14], inner[15]);
         // RFC 1122 3.2.2: never answer a source that does not identify one

@@ -1208,9 +1208,9 @@ pub struct GtpuDownlinkCounters {
     pub packet_too_big_signalled: u64,
     /// Over-MTU packets dropped without an error by the rate limit.
     pub packet_too_big_rate_limited: u64,
-    /// Over-MTU packets for which no error may or could be sent: a
-    /// never-answer rule (RFC 1122 3.2.2), no authorized default-bearer
-    /// uplink, or a failed submission.
+    /// Over-MTU packets for which no error may or could be sent: an invalid
+    /// invoking header (RFC 1812 5.2.2), a never-answer rule (RFC 1122
+    /// 3.2.2), no authorized default-bearer uplink, or a failed submission.
     pub packet_too_big_unsendable: u64,
     /// Cumulative datagrams the kernel dropped from the shared UDP/2152 queue
     /// before the consumer read them (`SO_RXQ_OVFL`).

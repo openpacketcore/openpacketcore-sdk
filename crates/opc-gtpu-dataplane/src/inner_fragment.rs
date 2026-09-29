@@ -45,6 +45,28 @@ pub(crate) enum InnerFragmentRefusal {
     Options,
 }
 
+/// Validate an IPv4 header as RFC 1812 section 5.2.2 requires of a router,
+/// and RFC 1122 section 3.2.1.2 of a host: version 4, a header length of at
+/// least 20 octets, a correct header checksum, and a total length that covers
+/// the header and is not truncated. Returns the header and total lengths, or
+/// `None` for a packet to discard silently.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+pub(crate) fn valid_ipv4_header(packet: &[u8]) -> Option<(usize, usize)> {
+    let first = *packet.first()?;
+    let header_len = usize::from(first & 0x0f) * 4;
+    if first >> 4 != 4 || header_len < IPV4_HEADER_LEN {
+        return None;
+    }
+    let header = packet.get(..header_len)?;
+    if internet_checksum(header) != 0 {
+        return None;
+    }
+    let total_len = usize::from(u16::from_be_bytes([header[2], header[3]]));
+    (header_len..=packet.len())
+        .contains(&total_len)
+        .then_some((header_len, total_len))
+}
+
 /// One validated, option-free IPv4 datagram (possibly itself a fragment).
 #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
 pub(crate) struct Ipv4FragmentSource<'a> {
@@ -57,19 +79,7 @@ impl<'a> Ipv4FragmentSource<'a> {
     /// Validate `packet`, whose first octet begins the IPv4 header.
     pub(crate) fn parse(packet: &'a [u8]) -> Result<Self, InnerFragmentRefusal> {
         use InnerFragmentRefusal::{Malformed, Options};
-        let first = *packet.first().ok_or(Malformed)?;
-        let header_len = usize::from(first & 0x0f) * 4;
-        if first >> 4 != 4 || header_len < IPV4_HEADER_LEN {
-            return Err(Malformed);
-        }
-        let header_bytes = packet.get(..header_len).ok_or(Malformed)?;
-        if internet_checksum(header_bytes) != 0 {
-            return Err(Malformed);
-        }
-        let total_len = usize::from(u16::from_be_bytes([packet[2], packet[3]]));
-        if total_len < header_len || total_len > packet.len() {
-            return Err(Malformed);
-        }
+        let (header_len, total_len) = valid_ipv4_header(packet).ok_or(Malformed)?;
         if header_len != IPV4_HEADER_LEN {
             return Err(Options);
         }
