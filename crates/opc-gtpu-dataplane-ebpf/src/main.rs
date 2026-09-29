@@ -34,7 +34,7 @@ use aya_ebpf::{
         __sk_buff, bpf_adj_room_mode::BPF_ADJ_ROOM_MAC, bpf_spin_lock as BpfSpinLock,
         BPF_CSUM_LEVEL_QUERY, BPF_F_ADJ_ROOM_DECAP_L3_IPV4, BPF_F_ADJ_ROOM_DECAP_L3_IPV6,
         BPF_F_ADJ_ROOM_ENCAP_L3_IPV4, BPF_F_ADJ_ROOM_ENCAP_L3_IPV6, BPF_F_ADJ_ROOM_ENCAP_L4_UDP,
-        TC_ACT_OK, TC_ACT_REDIRECT, TC_ACT_SHOT,
+        BPF_F_MARK_MANGLED_0, TC_ACT_OK, TC_ACT_REDIRECT, TC_ACT_SHOT,
     },
     btf_maps::Array as BtfArray,
     cty::c_void,
@@ -51,23 +51,23 @@ use opc_gtpu_ebpf_common::trusted_traffic_observation_abi::{
 };
 use opc_gtpu_ebpf_common::{
     apply_uplink_mtu_policy, build_uplink_encap_with_dscp_and_source_port, classify_gtpu,
-    classify_udp_checksum, decide_uplink_pmtu, downlink_frame_end,
+    classify_udp_checksum, decide_uplink_pmtu, downlink_frame_end, downlink_ipv4_exceeds_inner_mtu,
     downlink_parse_ipv4_total_length, downlink_parse_payload_offset, downlink_parse_teid,
     gtpu_session_config_wire_owns_local_ipv4, gtpu_session_config_wire_owns_local_ipv6,
     internet_checksum_sum_is_valid, marked_owner_wire_authorizes_downlink,
     marked_owner_wire_authorizes_uplink, n3_downlink_psc_matches, n3_uplink_extension,
     pack_downlink_parse_result, pdp_commit_wire_authorized_source_port,
     pdp_commit_wire_authorizes_downlink, pdp_commit_wire_authorizes_graph,
-    select_gtpu_session_entry_wire, tft_classifier_filter_matches,
-    tft_classifier_schema_is_current, uplink_non_encapsulation_drops,
-    validate_ipv4_downlink_binding_wire, DownlinkBindingMismatch, DownlinkPdr, GtpuClass,
-    GtpuEnvelopeBounds, GtpuOuterFragmentPolicy, GtpuPmtuProtocol, GtpuSessionAuthorityWireView,
-    GtpuSessionEntryWireView, GtpuSessionGroupPhase, GtpuSessionIpFamily,
-    GtpuTrafficObservationDirection, GtpuUplinkMtuPolicy, Ipv4EnvelopeBounds, Ipv6ExtensionStep,
-    MarkedDownlinkPdr, TftClassifierFilter, TftClassifierFilterKey, TftClassifierIpv4Packet,
-    TftClassifierKey, TftClassifierMeta, UdpChecksumDisposition, UdpChecksumEvidence,
-    UdpEnvelopeBounds, UplinkFar, UplinkFarKey, UplinkMtuMapState, UplinkPmtuDecision,
-    COUNTER_DL_BINDING_FAMILY_MISMATCH, COUNTER_DL_BINDING_INGRESS_MISMATCH,
+    pdp_commit_wire_downlink_inner_mtu, select_gtpu_session_entry_wire,
+    tft_classifier_filter_matches, tft_classifier_schema_is_current,
+    uplink_non_encapsulation_drops, validate_ipv4_downlink_binding_wire, DownlinkBindingMismatch,
+    DownlinkPdr, GtpuClass, GtpuEnvelopeBounds, GtpuOuterFragmentPolicy, GtpuPmtuProtocol,
+    GtpuSessionAuthorityWireView, GtpuSessionEntryWireView, GtpuSessionGroupPhase,
+    GtpuSessionIpFamily, GtpuTrafficObservationDirection, GtpuUplinkMtuPolicy, Ipv4EnvelopeBounds,
+    Ipv6ExtensionStep, MarkedDownlinkPdr, TftClassifierFilter, TftClassifierFilterKey,
+    TftClassifierIpv4Packet, TftClassifierKey, TftClassifierMeta, UdpChecksumDisposition,
+    UdpChecksumEvidence, UdpEnvelopeBounds, UplinkFar, UplinkFarKey, UplinkMtuMapState,
+    UplinkPmtuDecision, COUNTER_DL_BINDING_FAMILY_MISMATCH, COUNTER_DL_BINDING_INGRESS_MISMATCH,
     COUNTER_DL_BINDING_INVALID, COUNTER_DL_BINDING_LOCAL_MISMATCH,
     COUNTER_DL_BINDING_PEER_MISMATCH, COUNTER_DL_BINDING_SOURCE_PORT_MISMATCH, COUNTER_DL_DECAP,
     COUNTER_DL_DST_MISMATCH, COUNTER_DL_MALFORMED, COUNTER_DL_UNKNOWN_TEID, COUNTER_SLOTS,
@@ -77,12 +77,12 @@ use opc_gtpu_ebpf_common::{
     DOWNLINK_ENDPOINT_BINDING_VALUE_LEN, DOWNLINK_PDR_VALUE_LEN, ETH_HDR_LEN, ETH_P_IPV4,
     ETH_P_IPV6, GTPU_ENCAP_LEN, GTPU_FLAGS_V1_GPDU, GTPU_FLAG_E, GTPU_IPV6_ENCAP_LEN,
     GTPU_MANDATORY_HDR_LEN, GTPU_MAX_EXT_HEADERS, GTPU_MSG_TYPE_GPDU, GTPU_OPT_LEN,
-    GTPU_SESSION_CONFIG_KEY, GTPU_SESSION_CONFIG_VALUE_LEN, GTPU_SESSION_DOWNLINK_KEY_LEN,
-    GTPU_SESSION_GROUP_ID_LEN, GTPU_SESSION_GROUP_REF_LEN, GTPU_SESSION_GROUP_VALUE_LEN,
-    GTPU_SESSION_SCHEMA_MARKER_LEN, GTPU_SESSION_SELECTOR_STAMP_VALUE_LEN,
-    GTPU_SESSION_TRANSACTION_VALUE_LEN, GTPU_SESSION_UPLINK_KEY_LEN,
-    GTPU_TRAFFIC_OBSERVATION_EVENT_LEN, GTPU_TRAFFIC_OBSERVATION_GATE_INDEX,
-    GTPU_TRAFFIC_OBSERVATION_GATE_MAX_ENTRIES,
+    GTPU_PACKET_TOO_BIG_QUEUE_PORT, GTPU_SESSION_CONFIG_KEY, GTPU_SESSION_CONFIG_VALUE_LEN,
+    GTPU_SESSION_DOWNLINK_KEY_LEN, GTPU_SESSION_GROUP_ID_LEN, GTPU_SESSION_GROUP_REF_LEN,
+    GTPU_SESSION_GROUP_VALUE_LEN, GTPU_SESSION_SCHEMA_MARKER_LEN,
+    GTPU_SESSION_SELECTOR_STAMP_VALUE_LEN, GTPU_SESSION_TRANSACTION_VALUE_LEN,
+    GTPU_SESSION_UPLINK_KEY_LEN, GTPU_TRAFFIC_OBSERVATION_EVENT_LEN,
+    GTPU_TRAFFIC_OBSERVATION_GATE_INDEX, GTPU_TRAFFIC_OBSERVATION_GATE_MAX_ENTRIES,
     GTPU_TRAFFIC_OBSERVATION_ICMP_ECHO_CHALLENGE_PAYLOAD_LEN,
     GTPU_TRAFFIC_OBSERVATION_ICMP_ECHO_CHALLENGE_PROFILE, GTPU_TRAFFIC_OBSERVATION_ICMP_ECHO_MAGIC,
     GTPU_TRAFFIC_OBSERVATION_ICMP_ECHO_VERSION, GTPU_TRAFFIC_OBSERVATION_REDIRECT_NONCE_LEN,
@@ -4192,6 +4192,58 @@ fn parse_downlink(ctx: &mut TcContext) -> u64 {
     pack_downlink_parse_result(u16::from_be(total_length), payload_offset, teid)
 }
 
+/// Return whether an authorized inner IPv4 packet exceeds its Active commit's
+/// optional downlink inner MTU with Don't Fragment set.
+#[inline(never)]
+fn downlink_inner_exceeds_session_mtu(
+    ctx: &TcContext,
+    commit: &[u8; UPLINK_SOURCE_PORT_VALUE_LEN],
+    payload_offset: usize,
+) -> bool {
+    let mtu = pdp_commit_wire_downlink_inner_mtu(commit);
+    if mtu == 0 {
+        return false;
+    }
+    let Ok(total_length) = ctx.load::<u16>(payload_offset + 2) else {
+        return false;
+    };
+    let Ok(flags_fragment) = ctx.load::<u16>(payload_offset + 6) else {
+        return false;
+    };
+    downlink_ipv4_exceeds_inner_mtu(
+        mtu,
+        u16::from_be(total_length),
+        u16::from_be(flags_fragment),
+    )
+}
+
+/// Steer one authorized over-MTU G-PDU, undecapsulated, to the backend-owned
+/// packet-too-big queue by rewriting only its UDP destination port.
+///
+/// The UDP checksum is updated incrementally (a zero checksum stays zero), so
+/// the port change and its compensation cancel in any complete-checksum
+/// state. A flood of such packets can then fill only the dedicated queue,
+/// never the shared UDP/2152 queue carrying Echo and reassembled G-PDUs.
+#[inline(never)]
+fn hand_off_packet_too_big(ctx: &mut TcContext, l4_offset: usize) -> i32 {
+    let from = u16::from_ne_bytes(GTPU_UDP_PORT.to_be_bytes());
+    let to = u16::from_ne_bytes(GTPU_PACKET_TOO_BIG_QUEUE_PORT.to_be_bytes());
+    if ctx
+        .l4_csum_replace(
+            l4_offset + 6,
+            u64::from(from),
+            u64::from(to),
+            u64::from(BPF_F_MARK_MANGLED_0) | 2,
+        )
+        .is_err()
+        || ctx.store(l4_offset + 2, &to, 0).is_err()
+    {
+        count(COUNTER_DL_MALFORMED);
+        return TC_ACT_SHOT as i32;
+    }
+    TC_ACT_OK as i32
+}
+
 /// Authorize the complete downlink forwarding identity and perform decap.
 ///
 /// Keep this phase in a verifier-visible BPF subprogram. The envelope and
@@ -4348,6 +4400,17 @@ fn authorize_and_decap_legacy_downlink(
     if inner_dst != pdr.ue_ip {
         count(COUNTER_DL_DST_MISMATCH);
         return TC_ACT_SHOT as i32;
+    }
+    if downlink_inner_exceeds_session_mtu(ctx, commit, payload_offset) {
+        // The session's optional downlink inner MTU cannot carry this DF
+        // packet after access-side encapsulation. Hand the exact authorized
+        // G-PDU, undecapsulated, to the backend-owned packet-too-big queue.
+        // Its consumer fragments the inner packet by default (RFC 4459
+        // section 3.4), or signals the originator inside the UE's
+        // default-bearer uplink tunnel when the session opted in (RFC 1191).
+        // Decapsulating here would let the host emit an unroutable,
+        // plaintext-quoting ICMP error instead.
+        return hand_off_packet_too_big(ctx, l4_offset);
     }
 
     // Strip outer IPv4 + UDP + GTP-U (+ optional block and extension

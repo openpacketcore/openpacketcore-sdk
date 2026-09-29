@@ -68,6 +68,99 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- `opc-gtpu-dataplane` / `opc-gtpu-ebpf-common`: inner fragmentation is the
+  default policy for an over-MTU downlink IPv4 packet with Don't Fragment set.
+  Refs #1002.
+  - **Policy.** `GtpuDownlinkInnerMtu::new(mtu)` selects the default: the
+    backend-owned consumer clears DF and fragments the inner packet before
+    encapsulation (RFC 4459 section 3.4), an owner-approved deviation from the
+    DF rules of RFC 791, RFC 1191 and RFC 6864.
+    `GtpuDownlinkInnerMtu::in_tunnel_packet_too_big(mtu)` stays the explicit
+    opt-in; `GtpuDownlinkOversizePolicy` names both.
+  - **Wire.** The commit record's MTU field keeps the MTU in its low 15 bits
+    (576 to 32,767); bit 15 marks the in-tunnel Packet Too Big opt-in. tc reads
+    only the MTU and steers identically. Records without an MTU are unchanged.
+  - **Consumer.** `GtpuDownlinkEvent::Fragmented` returns RFC 791 fragments
+    of at most the MTU with the bearer mark, for the caller to inject toward
+    XFRM. The header is validated first (RFC 1812 section 5.2.2); IPv4
+    options are refused (`InnerUnfragmentable`). A fragment keeps its own
+    Identification; an atomic datagram gets a fresh non-zero value from a
+    per-destination sequence (RFC 6864 sections 4.1 and 4.3).
+  - **Budget.** Per-destination token buckets (`GtpuInnerFragmentRateLimit`,
+    burst 64, one token per 4 ms, set by `set_inner_fragment_rate_limit`)
+    admit at most burst + ⌈255 s / interval⌉ packets in 255 seconds (63,814
+    by default); `new` refuses any limit above 65,535. While a destination
+    stays tracked under one limit, this bounds its work and keeps its
+    sequence from repeating within 255 seconds. Past 4,096 concurrently
+    tracked destinations, LRU eviction makes uniqueness probabilistic and
+    removes the per-destination bound. A new attachment registration
+    (restart, re-adoption, re-created attachment) restarts every sequence
+    from a new random value (#1018). Excess packets are
+    `InnerFragmentRateLimited` drops. Value-free counters record fragmented
+    packets, fragments and refusals.
+  - **Costs.** Over-MTU DF traffic is capped at 250 packets per second per
+    destination by default, beyond which it is dropped silently with no
+    Packet Too Big. Slow-path packets can be reordered behind later
+    fast-path packets. Fresh Identifications share the (source,
+    destination, protocol) space with the originator's own non-atomic
+    datagrams. They therefore cannot comply "as if the datagram were
+    sourced by that device" as RFC 6864 section 5.3.1 requires. That
+    deviation is inherent to clearing DF and fragmenting, and is part of the
+    owner-approved default policy decided on #1002. The consumer does not
+    decrement TTL (RFC 1812 section 5.3.1).
+  - **Integration.** Open the control port before installing any
+    MTU-bearing context and keep draining it. Until it is first opened,
+    while the process is down, and after a retirement, nothing is bound.
+    Adopting a retained graph reopens tc's gate before the port can be
+    opened, so this window cannot be avoided after a restart. The kernel
+    may then answer steered packets with rate-limited ICMP Port Unreachable
+    toward the peer, quoting up to about 512 octets of the inner packet
+    (#1019).
+  - **Evidence.** On a real kernel a 1,450-octet DF datagram over a
+    1,400-octet access link reaches the UE as two exact fragments, on the
+    default bearer, after outer reassembly and on a dedicated bearer through
+    its ESP Child SA, with no host ICMP.
+
+- `opc-gtpu-dataplane` / `opc-gtpu-dataplane-ebpf`: opt-in downlink tunnel-MTU
+  enforcement with an in-tunnel RFC 1191 error. Refs #1002.
+  - **Opt-in.** `GtpPdpContext::downlink_inner_mtu` is a new field and is
+    source-breaking; `None` keeps today's behaviour. It is set with
+    `GtpuDownlinkInnerMtu::in_tunnel_packet_too_big(mtu)`, where the MTU is
+    at least 576. `GtpuProbe::downlink_inner_mtu_enforcement` is a new public
+    field of `GtpuProbe`, which is not `#[non_exhaustive]`, so struct
+    literals of `GtpuProbe` are source-breaking too.
+  - **Storage and downgrade.** The MTU is stored in the formerly reserved
+    bytes of the Active commit record; records without it are byte-identical.
+    An older SDK's recovery refuses an attachment holding any MTU record, so
+    drain those contexts before downgrading.
+  - **tc steering.** tc does not decapsulate an authorized over-MTU DF IPv4
+    packet. It rewrites the packet's UDP destination port to a dedicated
+    backend-owned queue (2153), so hand-offs never fill the UDP/2152 queue
+    used by Echo.
+  - **Consumer.** `try_receive_downlink` serves UDP/2152 first. It returns
+    `GtpuDownlinkEvent::PacketTooBig` and sends at most one Fragmentation
+    Needed on the UE's default-bearer uplink, from the PAA to the originator,
+    quoting the header plus 64 bits.
+  - **Never answered** (RFC 1122 3.2.2), checked before any rate-limit
+    token: 0/8, 127/8, 224/4 and 240/4 originators, non-initial fragments
+    and ICMP errors. An invoking packet with a bad header checksum, or one
+    shorter than its total length, is silently discarded (RFC 1812 section
+    5.2.2).
+  - **Rate limit and counters.** Per-session token buckets (RFC 1812 section
+    4.3.2.8; `set_packet_too_big_rate_limit`), per session while it stays
+    tracked (#1018), with value-free counters, including `SO_RXQ_OVFL`
+    queue-drop counts.
+  - **Not provided.** tc has no hand-off counter or policer, because either
+    would change the map ABI.
+  - **Evidence.** The baseline test (the RED on `main`) shows the host
+    emitting a plaintext Fragmentation Needed toward the core, quoting 548
+    octets. The opt-in test shows exactly one well-formed in-tunnel error
+    and no host ICMP. It also covers per-session limiting and Echo served
+    ahead of a hand-off backlog.
+  - **IPv6.** An opted-in ordinary inner-IPv6 context is refused
+    (`downlink_inner_mtu_inner_ipv6`). Inner IPv6 Packet Too Big is a
+    follow-up, because it needs an MTU in the family-tagged entry wire.
+
 - `opc-gtpu-dataplane`: backend-authoritative post-reassembly downlink
   consumer. `GtpuControlPort::try_receive_downlink` receives one datagram from
   the eBPF attachment's backend-owned UDP/2152 queue and, under the same
