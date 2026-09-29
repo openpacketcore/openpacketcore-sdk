@@ -1099,6 +1099,19 @@ fn traffic_failure_retains_known_authority(failure: QualificationTrafficFailure)
         )
 }
 
+fn write_qualification_initialization_failure(
+    stderr: &mut impl io::Write,
+    stage: &'static str,
+    error_class: std::fmt::Arguments<'_>,
+) {
+    // Diagnostic I/O must not replace the original InitializationUnavailable
+    // reply with a panic or EOF when stderr is unavailable (for example ENOSPC).
+    let _ = writeln!(
+        stderr,
+        "qualification initialization rejected: stage={stage} class={error_class}"
+    );
+}
+
 fn qualification_store_error_class(error: &StoreError) -> QualificationTrafficErrorClass {
     match error {
         StoreError::BackendUnavailable(_) => QualificationTrafficErrorClass::BackendUnavailable,
@@ -1936,7 +1949,30 @@ impl QualificationNode {
     }
 
     async fn initialize(&self) -> Result<(), ()> {
-        self.store.initialize_cluster().await.map_err(|_| ())?;
+        self.store.initialize_cluster().await.map_err(|error| {
+            // Keep the public failure code coarse while retaining the exact
+            // startup stage and a closed, body-free error category on stderr.
+            let class = match error {
+                opc_session_store::ConsensusSessionStoreOpenError::ClusterFormationRejected => {
+                    "ClusterFormationRejected"
+                }
+                opc_session_store::ConsensusSessionStoreOpenError::EngineUnavailable => {
+                    "EngineUnavailable"
+                }
+                opc_session_store::ConsensusSessionStoreOpenError::StorageUnavailable => {
+                    "StorageUnavailable"
+                }
+                opc_session_store::ConsensusSessionStoreOpenError::RecoveryRequired => {
+                    "RecoveryRequired"
+                }
+                _ => "Other",
+            };
+            write_qualification_initialization_failure(
+                &mut io::stderr().lock(),
+                "cluster",
+                format_args!("{class}"),
+            );
+        })?;
         if self.isolated_scale.is_some_and(|scale| {
             scale.workload == opc_session_testkit::qualification::QualificationIsolatedScaleWorkload::ProtectedRecoveryControl
         }) {
@@ -1946,11 +1982,23 @@ impl QualificationNode {
             self.store
                 .activate_fenced_transition_capability()
                 .await
-                .map_err(|_| ())?;
+                .map_err(|error| {
+                    write_qualification_initialization_failure(
+                        &mut io::stderr().lock(),
+                        "fenced_transition",
+                        format_args!("{:?}", qualification_store_error_class(&error)),
+                    );
+                })?;
             self.store
                 .activate_protected_roster_profile_v2()
                 .await
-                .map_err(|_| ())?;
+                .map_err(|error| {
+                    write_qualification_initialization_failure(
+                        &mut io::stderr().lock(),
+                        "protected_roster_v2",
+                        format_args!("{:?}", qualification_store_error_class(&error)),
+                    );
+                })?;
         }
         Ok(())
     }
@@ -7068,6 +7116,56 @@ mod tests {
             qualification_lease_authority_failure_reason(&LeaseError::OperationOutcomeUnavailable),
             None,
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn initialization_failure_diagnostic_is_exact_and_io_failure_is_nonfatal() {
+        struct FullWriter;
+        impl Write for FullWriter {
+            fn write(&mut self, _: &[u8]) -> io::Result<usize> {
+                Err(io::Error::from_raw_os_error(28))
+            }
+
+            fn flush(&mut self) -> io::Result<()> {
+                Err(io::Error::from_raw_os_error(28))
+            }
+        }
+
+        let mut bytes = Vec::new();
+        write_qualification_initialization_failure(
+            &mut bytes,
+            "cluster",
+            format_args!("StorageUnavailable"),
+        );
+        assert_eq!(
+            bytes,
+            b"qualification initialization rejected: stage=cluster class=StorageUnavailable\n"
+        );
+        for stage in ["fenced_transition", "protected_roster_v2"] {
+            bytes.clear();
+            let error = StoreError::BackendUnavailable("synthetic-sensitive-body".to_owned());
+            write_qualification_initialization_failure(
+                &mut bytes,
+                stage,
+                format_args!("{:?}", qualification_store_error_class(&error)),
+            );
+            assert_eq!(
+                bytes,
+                format!("qualification initialization rejected: stage={stage} class=BackendUnavailable\n")
+                    .as_bytes(),
+            );
+        }
+        for stage in ["cluster", "fenced_transition", "protected_roster_v2"] {
+            let rejected = Err::<(), _>(()).map_err(|()| {
+                write_qualification_initialization_failure(
+                    &mut FullWriter,
+                    stage,
+                    format_args!("Other"),
+                );
+            });
+            assert_eq!(rejected, Err(()));
+        }
     }
 
     #[test]
