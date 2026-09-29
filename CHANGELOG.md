@@ -9,6 +9,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- Shared Openraft dependency: consume the exact 0.9.25 fork revision
+  `72e327a4f25cbbe3a3695d8c3c0f0970ccb925d5`, including bounded apply dispatch,
+  joined replication retirement, stale-campaign cleanup and cancellable
+  no-progress retry pacing. Preserve native WAL and Durable/Async semantics.
+  Refs #957.
+
 - `opc-gtpu-dataplane`: cleanup-only activation is now all or nothing. It
   re-proves the attached graph (interface, tc placement, exact identity,
   executable PMTU policy) and the quiescent traffic source while the gate is
