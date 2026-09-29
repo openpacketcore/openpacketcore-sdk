@@ -8,8 +8,9 @@
 //! `IP_PKTINFO` source is the inner source (so a source-specific XFRM OUT
 //! selector matches). The contract: the datagram reaches the UE's socket as
 //! inner fragments that the UE reassembles exactly, on the default bearer,
-//! after outer reassembly, and on a dedicated bearer through its real ESP
-//! Child SA, and the host generates no ICMP anywhere.
+//! after outer reassembly, with a zero outer UDP checksum, and on a dedicated
+//! bearer through its real ESP Child SA, and the host generates no ICMP
+//! anywhere. Datagrams sent straight to the hand-off queue are dropped.
 
 use super::*;
 use opc_gtpu_dataplane::control_port::{GtpuControlPort, GtpuControlPortError};
@@ -434,6 +435,26 @@ pub(super) async fn qualify() -> Result<(), Box<dyn std::error::Error>> {
         2
     );
 
+    // 2b. Many PGWs send IPv4 G-PDUs with a zero UDP checksum. tc must steer
+    //     one without turning the zero into a wrong checksum
+    //     (BPF_F_MARK_MANGLED_0), or the kernel drops it before the queue.
+    let zero_checksum = datagram(0x58, OVERSIZED_PAYLOAD, true);
+    let gpdu = build_gpdu(LOCAL_TEID, None, &zero_checksum);
+    send(&[&build_outer_gtpu_frame(
+        destination_mac,
+        source_mac,
+        &[],
+        &gpdu,
+        false,
+        0,
+    )]);
+    expect_fragmented(&serve_consumer(port.as_ref(), window), None, &zero_checksum);
+    expect_ue_delivery(
+        &ue,
+        &application_payload(0x58, OVERSIZED_PAYLOAD),
+        "zero UDP checksum",
+    );
+
     // 3. A fitting DF datagram and an oversized fragmentable one stay on the
     //    tc fast path: no consumer event.
     send(&[&frame(LOCAL_TEID, &datagram(0x53, FITTING_PAYLOAD, true))]);
@@ -448,6 +469,33 @@ pub(super) async fn qualify() -> Result<(), Box<dyn std::error::Error>> {
         &ue,
         &application_payload(0x54, OVERSIZED_PAYLOAD),
         "fragmentable",
+    );
+
+    // 3b. A datagram sent straight to the hand-off queue is never exposed as
+    //     a control or unknown-tunnel event bound to that queue: an Echo
+    //     Request and a G-PDU for no tunnel are both dropped.
+    let peer = in_netns(&net.pgw_ns, || {
+        UdpSocket::bind((PGW_IP, 0)).expect("bind PGW sender")
+    });
+    let queue = (
+        EPDG_S2BU_IP,
+        opc_gtpu_ebpf_common::GTPU_PACKET_TOO_BIG_QUEUE_PORT,
+    );
+    peer.send_to(&[0x32, 1, 0, 4, 0, 0, 0, 0, 0x5e, 0x11, 0, 0], queue)?;
+    peer.send_to(
+        &build_gpdu(0x7777_0001, None, &datagram(0x59, 64, false)),
+        queue,
+    )?;
+    let events = serve_consumer(port.as_ref(), window);
+    assert!(
+        matches!(
+            &events[..],
+            [
+                GtpuDownlinkEvent::Dropped(GtpuDownlinkDrop::StateUnavailable),
+                GtpuDownlinkEvent::Dropped(GtpuDownlinkDrop::StateUnavailable)
+            ]
+        ),
+        "datagrams sent to the hand-off queue: {events:?}"
     );
 
     // 4. The per-destination budget bounds the work: with a burst of one and
@@ -512,8 +560,9 @@ pub(super) async fn qualify() -> Result<(), Box<dyn std::error::Error>> {
         "the host must not generate its own Fragmentation Needed"
     );
     let counters = port.downlink_counters()?;
-    assert_eq!(counters.inner_fragmented, 4);
-    assert_eq!(counters.inner_fragments, 8);
+    assert_eq!(counters.inner_fragmented, 5);
+    assert_eq!(counters.inner_fragments, 10);
+    assert_eq!(counters.state_unavailable, 2);
     assert_eq!(counters.inner_fragment_rate_limited, 1);
     assert_eq!(counters.inner_unfragmentable, 0);
     assert_eq!(counters.packet_too_big, 0, "no in-tunnel error by default");
@@ -525,7 +574,7 @@ pub(super) async fn qualify() -> Result<(), Box<dyn std::error::Error>> {
     backend.remove_device(&device).await?;
     drop(net);
     eprintln!(
-        "OPC_GTPU_DOWNLINK_INNER_FRAGMENTATION_PROVEN: IPv4 DF datagram over the session MTU delivered as exact inner fragments (default, outer-reassembled, dedicated via ESP), no host ICMP"
+        "OPC_GTPU_DOWNLINK_INNER_FRAGMENTATION_PROVEN: IPv4 DF datagram over the session MTU delivered as exact inner fragments (default, outer-reassembled, zero UDP checksum, dedicated via ESP), queue-direct datagrams dropped, no host ICMP"
     );
     Ok(())
 }
