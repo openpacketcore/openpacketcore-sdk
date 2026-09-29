@@ -1168,6 +1168,14 @@ pub enum GtpuDownlinkDrop {
     /// successor-pending, traffic gate closed, hooks replaced, or a map read
     /// failed. Nothing is decapsulated while authority is unknown.
     StateUnavailable,
+    /// An authorized over-MTU packet exceeded its destination's inner
+    /// fragmentation budget ([`GtpuInnerFragmentRateLimit`]). It was neither
+    /// fragmented nor signalled.
+    InnerFragmentRateLimited,
+    /// An authorized over-MTU packet carries IPv4 options. The inner
+    /// fragmenter implements neither the RFC 791 option copy rules nor a
+    /// router's option processing, so the packet is not fragmented.
+    InnerUnfragmentable,
 }
 
 /// Bounded, value-free counters of one backend-owned downlink consumer.
@@ -1193,7 +1201,8 @@ pub struct GtpuDownlinkCounters {
     /// Attachment authority was unavailable when the datagram was processed.
     pub state_unavailable: u64,
     /// Authorized G-PDUs whose inner packet exceeded the session's downlink
-    /// inner MTU and was not forwarded.
+    /// inner MTU under the in-tunnel Packet Too Big opt-in and was not
+    /// forwarded.
     pub packet_too_big: u64,
     /// In-tunnel ICMP errors accepted by the local kernel for the peer.
     pub packet_too_big_signalled: u64,
@@ -1210,6 +1219,15 @@ pub struct GtpuDownlinkCounters {
     /// dedicated packet-too-big queue (`SO_RXQ_OVFL`). This is the hand-off
     /// overload signal; tc itself keeps no hand-off counter.
     pub packet_too_big_queue_drops: u64,
+    /// Authorized over-MTU packets fragmented under the default policy and
+    /// returned as [`GtpuDownlinkEvent::Fragmented`].
+    pub inner_fragmented: u64,
+    /// Fragments returned in those events.
+    pub inner_fragments: u64,
+    /// Over-MTU packets dropped by the per-destination fragmentation budget.
+    pub inner_fragment_rate_limited: u64,
+    /// Over-MTU packets not fragmented because they carry IPv4 options.
+    pub inner_unfragmentable: u64,
 }
 
 impl GtpuDownlinkCounters {
@@ -1220,6 +1238,8 @@ impl GtpuDownlinkCounters {
             GtpuDownlinkDrop::BindingMismatch(_) => &mut self.binding_drops,
             GtpuDownlinkDrop::DestinationMismatch => &mut self.destination_mismatches,
             GtpuDownlinkDrop::StateUnavailable => &mut self.state_unavailable,
+            GtpuDownlinkDrop::InnerFragmentRateLimited => &mut self.inner_fragment_rate_limited,
+            GtpuDownlinkDrop::InnerUnfragmentable => &mut self.inner_unfragmentable,
         };
         *slot = slot.saturating_add(1);
     }
@@ -1393,7 +1413,8 @@ impl GtpuPacketTooBigRateLimit {
     }
 }
 
-/// One token bucket for [`GtpuPacketTooBigRateLimit`].
+/// One token bucket for [`GtpuPacketTooBigRateLimit`] and
+/// [`GtpuInnerFragmentRateLimit`].
 #[derive(Debug, Clone, Copy)]
 #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
 struct TokenBucket {
@@ -1405,15 +1426,19 @@ struct TokenBucket {
 impl TokenBucket {
     /// Take one token at `now`, refilling whole intervals since the last
     /// refill. Returns `false` when the bucket is empty.
-    fn admit(&mut self, limit: GtpuPacketTooBigRateLimit, now: std::time::Instant) -> bool {
+    fn admit(
+        &mut self,
+        burst: u32,
+        refill_interval: std::time::Duration,
+        now: std::time::Instant,
+    ) -> bool {
         let last = self.last_refill;
         let elapsed = now.saturating_duration_since(last);
-        let intervals = elapsed.as_nanos() / limit.refill_interval.as_nanos().max(1);
+        let intervals = elapsed.as_nanos() / refill_interval.as_nanos().max(1);
         if intervals > 0 {
             let restored = u32::try_from(intervals).unwrap_or(u32::MAX);
-            self.tokens = self.tokens.saturating_add(restored).min(limit.burst);
-            let advanced = limit
-                .refill_interval
+            self.tokens = self.tokens.saturating_add(restored).min(burst);
+            let advanced = refill_interval
                 .checked_mul(restored)
                 .and_then(|advance| last.checked_add(advance));
             self.last_refill = advanced.unwrap_or(now).min(now);
@@ -1426,16 +1451,81 @@ impl TokenBucket {
     }
 }
 
-/// Maximum sessions whose Packet Too Big budget one attachment tracks.
+/// Maximum sessions whose Packet Too Big budget, or destinations whose inner
+/// fragmentation budget, one attachment tracks.
 const PACKET_TOO_BIG_TRACKED_SESSIONS: usize = 4_096;
+
+/// Bounded per-key token buckets, least recently used first out, each with
+/// a small piece of per-key state.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+struct SessionBuckets<T> {
+    burst: u32,
+    refill_interval: std::time::Duration,
+    sessions: std::collections::HashMap<[u8; 4], (TokenBucket, std::time::Instant, T)>,
+}
+
+// Keys are TEIDs or UE addresses: never render them.
+impl<T> fmt::Debug for SessionBuckets<T> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("SessionBuckets")
+            .field("burst", &self.burst)
+            .field("refill_interval", &self.refill_interval)
+            .field("tracked", &self.sessions.len())
+            .finish()
+    }
+}
+
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+impl<T> SessionBuckets<T> {
+    fn new(burst: u32, refill_interval: std::time::Duration) -> Self {
+        Self {
+            burst,
+            refill_interval,
+            sessions: std::collections::HashMap::new(),
+        }
+    }
+
+    /// Take one token from `key`'s bucket at `now`, creating it full with
+    /// `init` state when untracked. Returns that key's state, or `None` when
+    /// its bucket is empty; other keys are unaffected.
+    fn admit(
+        &mut self,
+        key: [u8; 4],
+        now: std::time::Instant,
+        init: impl FnOnce() -> T,
+    ) -> Option<&mut T> {
+        if !self.sessions.contains_key(&key)
+            && self.sessions.len() >= PACKET_TOO_BIG_TRACKED_SESSIONS
+        {
+            if let Some(oldest) = self
+                .sessions
+                .iter()
+                .min_by_key(|(_, (_, last_use, _))| *last_use)
+                .map(|(key, _)| *key)
+            {
+                self.sessions.remove(&oldest);
+            }
+        }
+        let (burst, refill_interval) = (self.burst, self.refill_interval);
+        let (bucket, last_use, state) = self.sessions.entry(key).or_insert_with(|| {
+            (
+                TokenBucket {
+                    tokens: burst,
+                    last_refill: now,
+                },
+                now,
+                init(),
+            )
+        });
+        *last_use = now;
+        bucket.admit(burst, refill_interval, now).then_some(state)
+    }
+}
 
 /// Per-session token buckets for [`GtpuPacketTooBigRateLimit`].
 #[derive(Debug)]
 #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
-pub(crate) struct PacketTooBigLimiter {
-    limit: GtpuPacketTooBigRateLimit,
-    sessions: std::collections::HashMap<[u8; 4], (TokenBucket, std::time::Instant)>,
-}
+pub(crate) struct PacketTooBigLimiter(SessionBuckets<()>);
 
 impl Default for PacketTooBigLimiter {
     fn default() -> Self {
@@ -1446,37 +1536,238 @@ impl Default for PacketTooBigLimiter {
 #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
 impl PacketTooBigLimiter {
     pub(crate) fn new(limit: GtpuPacketTooBigRateLimit) -> Self {
-        Self {
-            limit,
-            sessions: std::collections::HashMap::new(),
-        }
+        Self(SessionBuckets::new(limit.burst, limit.refill_interval))
     }
 
     /// Take one token from `session`'s bucket at `now`. Returns `false` when
     /// that session's bucket is empty; other sessions are unaffected.
     pub(crate) fn admit(&mut self, session: [u8; 4], now: std::time::Instant) -> bool {
-        if !self.sessions.contains_key(&session)
-            && self.sessions.len() >= PACKET_TOO_BIG_TRACKED_SESSIONS
-        {
-            if let Some(oldest) = self
-                .sessions
-                .iter()
-                .min_by_key(|(_, (_, last_use))| *last_use)
-                .map(|(key, _)| *key)
-            {
-                self.sessions.remove(&oldest);
-            }
+        self.0.admit(session, now, || ()).is_some()
+    }
+}
+
+/// An authorized over-MTU downlink IPv4 packet fragmented before
+/// encapsulation under the default
+/// [`GtpuDownlinkOversizePolicy::FragmentInner`](crate::GtpuDownlinkOversizePolicy::FragmentInner).
+///
+/// Every fragment is one complete IPv4 datagram of at most [`Self::mtu`]
+/// octets, in offset order, built by the RFC 791 section 3.2 procedure: the
+/// original 20-octet header is copied, and the total length, More Fragments
+/// flag, fragment offset and header checksum are set per fragment. Don't
+/// Fragment is cleared, the owner-approved RFC 4459 section 3.4 policy. All
+/// fragments carry one Identification: the original's when the packet was
+/// itself a fragment, otherwise a fresh non-zero value from the destination's
+/// own sequence (RFC 6864 sections 4.1 and 4.3). TTL and every other field
+/// are unchanged.
+///
+/// The caller injects every fragment, in order, toward XFRM with
+/// [`Self::bearer_mark`], exactly as it injects a
+/// [`GtpuDecapsulatedDownlink`]. The fragments are subscriber traffic:
+/// `Debug` exposes only their count and the MTU; the bearer mark is
+/// redacted.
+#[derive(Clone, PartialEq, Eq)]
+pub struct GtpuFragmentedDownlink {
+    fragments: Vec<bytes::Bytes>,
+    bearer_mark: Option<GtpBearerMark>,
+    mtu: u16,
+}
+
+impl fmt::Debug for GtpuFragmentedDownlink {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("GtpuFragmentedDownlink")
+            .field("fragments", &self.fragments.len())
+            .field("mtu", &self.mtu)
+            .field(
+                "bearer_mark",
+                &self.bearer_mark.map(|_| "<redacted>").unwrap_or("default"),
+            )
+            .finish()
+    }
+}
+
+impl GtpuFragmentedDownlink {
+    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+    pub(crate) fn new(
+        fragments: Vec<bytes::Bytes>,
+        bearer_mark: Option<GtpBearerMark>,
+        mtu: u16,
+    ) -> Self {
+        Self {
+            fragments,
+            bearer_mark,
+            mtu,
         }
-        let limit = self.limit;
-        let (bucket, last_use) = self.sessions.entry(session).or_insert((
-            TokenBucket {
-                tokens: limit.burst,
-                last_refill: now,
-            },
-            now,
-        ));
-        *last_use = now;
-        bucket.admit(limit, now)
+    }
+
+    /// The complete IPv4 fragments, in offset order.
+    #[must_use]
+    pub fn fragments(&self) -> &[bytes::Bytes] {
+        &self.fragments
+    }
+
+    /// Consume the event and return the fragments, in offset order.
+    #[must_use]
+    pub fn into_fragments(self) -> Vec<bytes::Bytes> {
+        self.fragments
+    }
+
+    /// Output bearer mark for XFRM policy selection. `None` is the default
+    /// bearer (mark zero), exactly as the tc fast path stamps it.
+    #[must_use]
+    pub const fn bearer_mark(&self) -> Option<GtpBearerMark> {
+        self.bearer_mark
+    }
+
+    /// The session's downlink inner MTU that the packet exceeded; no
+    /// fragment is longer.
+    #[must_use]
+    pub const fn mtu(&self) -> u16 {
+        self.mtu
+    }
+
+    /// Inner packet family: always IPv4. IPv6 has no in-network
+    /// fragmentation (RFC 8200 section 4.5).
+    #[must_use]
+    pub const fn family(&self) -> crate::model::GtpAddressFamily {
+        crate::model::GtpAddressFamily::Ipv4
+    }
+}
+
+/// Longest time an IPv4 datagram can remain in the internet system: the
+/// 255-second Time to Live ceiling of RFC 791 section 3.1. It bounds the
+/// maximum datagram lifetime within which RFC 6864 section 4.3 forbids a
+/// source of non-atomic datagrams to repeat an Identification.
+const MAXIMUM_DATAGRAM_LIFETIME: std::time::Duration = std::time::Duration::from_secs(255);
+
+/// Explicit per-destination rate limit for inner fragmentation under the
+/// default [`GtpuDownlinkOversizePolicy::FragmentInner`](crate::GtpuDownlinkOversizePolicy::FragmentInner).
+///
+/// Each destination (the session's UE address) has its own token bucket:
+/// up to `burst` over-MTU packets may be fragmented back to back, and one
+/// token is restored every `refill_interval`. This bounds the consumer's
+/// fragmentation work per destination, so a flood toward one PAA exhausts
+/// only its own budget. It also keeps the destination's 16-bit
+/// Identification sequence from repeating within the maximum datagram
+/// lifetime, as RFC 6864 sections 4.3 and 5.2 require of a source of
+/// non-atomic datagrams: a limit that could admit more than 65,535 packets
+/// in 255 seconds is refused. The default is a burst of 64 with one token
+/// per 4 ms (250 packets per second per destination), at most
+/// 64 + 63,750 packets in any 255 seconds. At most 4,096 destinations are
+/// tracked per attachment; the least recently used is evicted first, and
+/// restarts with a full bucket and a fresh Identification sequence.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct GtpuInnerFragmentRateLimit {
+    burst: u32,
+    refill_interval: std::time::Duration,
+}
+
+impl Default for GtpuInnerFragmentRateLimit {
+    fn default() -> Self {
+        Self {
+            burst: 64,
+            refill_interval: std::time::Duration::from_millis(4),
+        }
+    }
+}
+
+impl GtpuInnerFragmentRateLimit {
+    /// Create a limit. A zero burst, a zero interval, or a limit that could
+    /// admit more than 65,535 packets within 255 seconds returns `None`.
+    #[must_use]
+    pub fn new(burst: u32, refill_interval: std::time::Duration) -> Option<Self> {
+        if burst == 0 || refill_interval.is_zero() {
+            return None;
+        }
+        let refills = MAXIMUM_DATAGRAM_LIFETIME.as_nanos() / refill_interval.as_nanos();
+        (u128::from(burst) + refills <= u128::from(u16::MAX)).then_some(Self {
+            burst,
+            refill_interval,
+        })
+    }
+
+    /// Maximum back-to-back fragmented packets per destination.
+    #[must_use]
+    pub const fn burst(&self) -> u32 {
+        self.burst
+    }
+
+    /// Interval restoring one token.
+    #[must_use]
+    pub const fn refill_interval(&self) -> std::time::Duration {
+        self.refill_interval
+    }
+}
+
+/// Per-destination budgets and Identification sequences for
+/// [`GtpuInnerFragmentRateLimit`].
+#[derive(Debug)]
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+pub(crate) struct InnerFragmentBudget {
+    buckets: SessionBuckets<u16>,
+    /// Per-registration random SipHash keys seeding each destination's
+    /// first Identification, so a re-tracked destination does not restart a
+    /// predictable or recently used sequence.
+    seed_keys: std::collections::hash_map::RandomState,
+    seeded: u64,
+}
+
+impl Default for InnerFragmentBudget {
+    fn default() -> Self {
+        Self::new(GtpuInnerFragmentRateLimit::default())
+    }
+}
+
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+impl InnerFragmentBudget {
+    pub(crate) fn new(limit: GtpuInnerFragmentRateLimit) -> Self {
+        Self {
+            buckets: SessionBuckets::new(limit.burst, limit.refill_interval),
+            seed_keys: std::collections::hash_map::RandomState::new(),
+            seeded: 0,
+        }
+    }
+
+    /// Replace the limit. Tracked destinations keep their Identification
+    /// sequences and at most their current tokens, so a replacement never
+    /// grants an extra burst.
+    pub(crate) fn set_limit(&mut self, limit: GtpuInnerFragmentRateLimit) {
+        self.buckets.burst = limit.burst;
+        self.buckets.refill_interval = limit.refill_interval;
+        for (bucket, _, _) in self.buckets.sessions.values_mut() {
+            bucket.tokens = bucket.tokens.min(limit.burst);
+        }
+    }
+
+    /// Take one token from `destination`'s budget at `now` and, for an
+    /// atomic datagram (RFC 6864 section 4), assign the next non-zero
+    /// Identification of its sequence. Returns `None` when the budget is
+    /// empty; `Some(None)` admits a datagram that keeps its own
+    /// Identification.
+    pub(crate) fn admit(
+        &mut self,
+        destination: [u8; 4],
+        now: std::time::Instant,
+        atomic: bool,
+    ) -> Option<Option<u16>> {
+        use std::hash::{BuildHasher, Hash, Hasher};
+        self.seeded = self.seeded.wrapping_add(1);
+        let (keys, seeded) = (&self.seed_keys, self.seeded);
+        let next = self.buckets.admit(destination, now, || {
+            let mut hasher = keys.build_hasher();
+            destination.hash(&mut hasher);
+            seeded.hash(&mut hasher);
+            // 1..=65,535: zero is never assigned.
+            u16::try_from(hasher.finish() % u64::from(u16::MAX)).map_or(1, |value| value + 1)
+        })?;
+        if !atomic {
+            return Some(None);
+        }
+        let identification = *next;
+        *next = match next.wrapping_add(1) {
+            0 => 1,
+            following => following,
+        };
+        Some(Some(identification))
     }
 }
 
@@ -1500,9 +1791,15 @@ pub enum GtpuDownlinkEvent {
     UnknownTunnel(crate::control_port::GtpuControlDatagram),
     /// Fail-closed drop with a bounded typed reason.
     Dropped(GtpuDownlinkDrop),
-    /// An authorized packet exceeded the session's downlink inner MTU. It was
-    /// not forwarded; at most one in-tunnel error was sent for it.
+    /// An authorized packet exceeded the session's downlink inner MTU under
+    /// the in-tunnel Packet Too Big opt-in. It was not forwarded; at most one
+    /// in-tunnel error was sent for it.
     PacketTooBig(GtpuDownlinkPacketTooBig),
+    /// An authorized inner IPv4 packet with Don't Fragment set exceeded the
+    /// session's downlink inner MTU and was fragmented (the default policy).
+    /// The caller injects every fragment, in order, toward XFRM with the
+    /// returned mark, exactly like a `Decapsulated` packet.
+    Fragmented(GtpuFragmentedDownlink),
 }
 
 /// Post-reassembly downlink consumer: the SDK GTP-U consumer that kernel

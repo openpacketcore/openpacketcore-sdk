@@ -18,12 +18,28 @@ pub(super) struct ControlSocketState {
     downlink_counters: crate::GtpuDownlinkCounters,
     /// Per-registration in-tunnel Packet Too Big rate limit.
     too_big_limiter: crate::reassembly::PacketTooBigLimiter,
+    /// Per-destination inner fragmentation budgets and Identification
+    /// sequences of this registration.
+    inner_fragment_budget: crate::reassembly::InnerFragmentBudget,
 }
 
 impl ControlSocketState {
     #[cfg(test)]
     pub(super) fn is_unopened(&self) -> bool {
         self.socket.is_none()
+    }
+
+    #[cfg(test)]
+    pub(super) fn with_inner_fragment_limit(limit: crate::GtpuInnerFragmentRateLimit) -> Self {
+        Self {
+            inner_fragment_budget: crate::reassembly::InnerFragmentBudget::new(limit),
+            ..Self::default()
+        }
+    }
+
+    #[cfg(test)]
+    pub(super) fn downlink_counters(&self) -> crate::GtpuDownlinkCounters {
+        self.downlink_counters
     }
 
     pub(super) fn retire(&mut self) {
@@ -184,6 +200,9 @@ impl GtpuControlPort for BackendControlPort {
             );
             let plan = match processed {
                 super::reassembled_downlink::ProcessedDownlink::PacketTooBig(plan) => plan,
+                super::reassembled_downlink::ProcessedDownlink::FragmentInner(plan) => {
+                    return Ok(Some(fragment_inner(state, &plan)));
+                }
                 super::reassembled_downlink::ProcessedDownlink::Event(event) => {
                     // A steered datagram only ever carries an authorized
                     // over-MTU packet. If authority changed since tc steered
@@ -256,6 +275,16 @@ impl GtpuControlPort for BackendControlPort {
         })
     }
 
+    fn set_inner_fragment_rate_limit(
+        &self,
+        limit: crate::GtpuInnerFragmentRateLimit,
+    ) -> Result<(), GtpuControlPortError> {
+        self.with_attachment(|_, state, _| {
+            state.inner_fragment_budget.set_limit(limit);
+            Ok(())
+        })
+    }
+
     fn downlink_counters(&self) -> Result<crate::GtpuDownlinkCounters, GtpuControlPortError> {
         self.with_attachment(|_, state, _| {
             let mut counters = state.downlink_counters;
@@ -270,6 +299,52 @@ impl GtpuControlPort for BackendControlPort {
             Ok(counters)
         })
     }
+}
+
+/// Fragment one authorized over-MTU packet under the default policy, recording
+/// exactly one outcome counter.
+///
+/// The header is validated first, so a malformed or option-bearing packet
+/// takes no token; the destination's budget is taken next, and only then is
+/// an Identification assigned from its sequence (atomic datagrams only).
+pub(super) fn fragment_inner(
+    state: &mut ControlSocketState,
+    plan: &super::reassembled_downlink::InnerFragmentPlan,
+) -> crate::GtpuDownlinkEvent {
+    let drop = |state: &mut ControlSocketState, reason| {
+        state.downlink_counters.record_drop(reason);
+        crate::GtpuDownlinkEvent::Dropped(reason)
+    };
+    let source = match crate::inner_fragment::Ipv4FragmentSource::parse(plan.inner_packet()) {
+        Ok(source) => source,
+        Err(crate::inner_fragment::InnerFragmentRefusal::Options) => {
+            return drop(state, crate::GtpuDownlinkDrop::InnerUnfragmentable);
+        }
+        Err(crate::inner_fragment::InnerFragmentRefusal::Malformed) => {
+            return drop(state, crate::GtpuDownlinkDrop::Malformed);
+        }
+    };
+    let Some(assigned) = state.inner_fragment_budget.admit(
+        plan.destination(),
+        std::time::Instant::now(),
+        source.is_atomic(),
+    ) else {
+        return drop(state, crate::GtpuDownlinkDrop::InnerFragmentRateLimited);
+    };
+    let identification = assigned.unwrap_or_else(|| source.identification());
+    let Some(fragments) = source.fragment(plan.mtu(), identification) else {
+        return drop(state, crate::GtpuDownlinkDrop::Malformed);
+    };
+    let counters = &mut state.downlink_counters;
+    counters.inner_fragmented = counters.inner_fragmented.saturating_add(1);
+    counters.inner_fragments = counters
+        .inner_fragments
+        .saturating_add(u64::try_from(fragments.len()).unwrap_or(u64::MAX));
+    crate::GtpuDownlinkEvent::Fragmented(crate::GtpuFragmentedDownlink::new(
+        fragments,
+        plan.bearer_mark(),
+        plan.mtu(),
+    ))
 }
 
 impl EbpfGtpuDataplaneBackend {

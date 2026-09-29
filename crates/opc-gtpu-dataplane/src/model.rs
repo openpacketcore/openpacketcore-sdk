@@ -4668,38 +4668,86 @@ impl fmt::Debug for GtpuDownlinkEndpoint {
     }
 }
 
-/// Explicit per-session opt-in to downlink tunnel-MTU enforcement with an
-/// in-tunnel ICMP error (RFC 4459 option "in-tunnel Packet Too Big").
+/// What the eBPF backend does with a downlink inner IPv4 packet that has
+/// Don't Fragment set and exceeds its session's [`GtpuDownlinkInnerMtu`].
 ///
-/// The value is the session's downlink inner (tunnel) MTU supplied by the
-/// consumer: for an ePDG, the SWu access MTU minus the negotiated ESP/UDP/IP
-/// encapsulation overhead. An inner IPv4 packet with Don't Fragment set that
-/// exceeds it is not forwarded; instead one RFC 1191 Fragmentation Needed
-/// error is sent toward its originator inside the UE's default-bearer uplink
-/// tunnel.
-///
-/// Opting in is a deliberate tradeoff. That error's source is the UE's own
-/// PAA: the only inner source the PGW's per-PDN anti-spoofing admits. The
-/// ePDG is acting as a router on that path, so RFC 1812 section 4.3.2.4 would
-/// have it use its own address, and the originator attributes the error to
-/// the subscriber. Leave the field `None` to keep the existing behaviour.
-///
-/// The value is at least [`opc_gtpu_ebpf_common::DOWNLINK_INNER_MTU_MIN`]
-/// (576, the RFC 791 IPv4 floor). `Debug` exposes the value; it is a path
-/// property, not a subscriber identifier.
+/// Under both policies tc hands the packet, undecapsulated, to the
+/// backend-owned consumer
+/// ([`GtpuControlPort::try_receive_downlink`](crate::control_port::GtpuControlPort::try_receive_downlink)),
+/// so the host never forwards it and never emits its own error.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
-pub struct GtpuDownlinkInnerMtu(std::num::NonZeroU16);
+#[non_exhaustive]
+pub enum GtpuDownlinkOversizePolicy {
+    /// The default: fragment the inner packet before encapsulation (RFC 4459
+    /// section 3.4). The consumer clears DF and returns RFC 791 fragments of
+    /// at most the MTU as
+    /// [`GtpuDownlinkEvent::Fragmented`](crate::GtpuDownlinkEvent::Fragmented),
+    /// which the caller injects toward XFRM; the UE reassembles them.
+    ///
+    /// Clearing DF is an owner-approved policy, not standard router
+    /// behaviour. RFC 791 section 2.3 and RFC 6864 section 4.3 forbid
+    /// fragmenting a datagram with DF set or clearing DF in transit, and RFC
+    /// 1191 section 4 has a router discard it and signal the originator
+    /// instead. RFC 4459 section 3.4 describes clearing DF before
+    /// encapsulation as a non-compliant but deployed tunnel practice. The
+    /// originator's Path MTU Discovery never learns the tunnel MTU.
+    FragmentInner,
+    /// The explicit opt-in alternative: do not forward the packet, and send at
+    /// most one RFC 1191 Fragmentation Needed error toward its originator,
+    /// sourced from the UE PAA and carried in the UE's default-bearer uplink
+    /// G-PDU. The PAA is the only inner source the PGW's per-PDN
+    /// anti-spoofing admits. The ePDG is acting as a router on that path, so
+    /// RFC 1812 section 4.3.2.4 would have it use its own address, and the
+    /// originator attributes the error to the subscriber.
+    InTunnelPacketTooBig,
+}
+
+/// Per-session downlink inner (tunnel) MTU with its oversized-packet policy.
+///
+/// The value is the session's downlink inner MTU supplied by the consumer:
+/// for an ePDG, the SWu access MTU minus the negotiated ESP/UDP/IP
+/// encapsulation overhead. An inner IPv4 packet with Don't Fragment set that
+/// exceeds it is handled by its [`GtpuDownlinkOversizePolicy`]: fragmented by
+/// default ([`Self::new`]), or signalled in-tunnel when explicitly opted in
+/// ([`Self::in_tunnel_packet_too_big`]). Leave
+/// [`GtpPdpContext::downlink_inner_mtu`] `None` to keep the existing
+/// behaviour.
+///
+/// The MTU is from [`opc_gtpu_ebpf_common::DOWNLINK_INNER_MTU_MIN`] (576, the
+/// RFC 791 IPv4 floor) to [`opc_gtpu_ebpf_common::DOWNLINK_INNER_MTU_MAX`]
+/// (32,767, the commit record's 15-bit field). `Debug` exposes the value and
+/// policy; they are path properties, not subscriber identifiers.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct GtpuDownlinkInnerMtu {
+    mtu: std::num::NonZeroU16,
+    policy: GtpuDownlinkOversizePolicy,
+}
 
 impl GtpuDownlinkInnerMtu {
-    /// Opt one context into in-tunnel Packet Too Big enforcement at `mtu`.
-    /// Values below the RFC 791 floor of 576 return `None`.
+    /// The default policy at `mtu`: fragment an oversized DF inner packet
+    /// ([`GtpuDownlinkOversizePolicy::FragmentInner`]). Values outside
+    /// 576..=32,767 return `None`.
+    #[must_use]
+    pub const fn new(mtu: u16) -> Option<Self> {
+        Self::with_policy(mtu, GtpuDownlinkOversizePolicy::FragmentInner)
+    }
+
+    /// Explicitly opt one context into in-tunnel Packet Too Big at `mtu`
+    /// ([`GtpuDownlinkOversizePolicy::InTunnelPacketTooBig`]). Values outside
+    /// 576..=32,767 return `None`.
     #[must_use]
     pub const fn in_tunnel_packet_too_big(mtu: u16) -> Option<Self> {
-        if mtu < opc_gtpu_ebpf_common::DOWNLINK_INNER_MTU_MIN {
+        Self::with_policy(mtu, GtpuDownlinkOversizePolicy::InTunnelPacketTooBig)
+    }
+
+    const fn with_policy(mtu: u16, policy: GtpuDownlinkOversizePolicy) -> Option<Self> {
+        if mtu < opc_gtpu_ebpf_common::DOWNLINK_INNER_MTU_MIN
+            || mtu > opc_gtpu_ebpf_common::DOWNLINK_INNER_MTU_MAX
+        {
             return None;
         }
         match std::num::NonZeroU16::new(mtu) {
-            Some(mtu) => Some(Self(mtu)),
+            Some(mtu) => Some(Self { mtu, policy }),
             None => None,
         }
     }
@@ -4707,13 +4755,40 @@ impl GtpuDownlinkInnerMtu {
     /// Return the MTU in octets.
     #[must_use]
     pub const fn get(self) -> u16 {
-        self.0.get()
+        self.mtu.get()
     }
 
-    /// Return the non-zero wire value.
+    /// Return the non-zero MTU.
     #[must_use]
     pub const fn as_non_zero(self) -> std::num::NonZeroU16 {
-        self.0
+        self.mtu
+    }
+
+    /// Return the oversized-packet policy.
+    #[must_use]
+    pub const fn policy(self) -> GtpuDownlinkOversizePolicy {
+        self.policy
+    }
+
+    /// Encode as the commit record's downlink inner MTU field.
+    pub(crate) const fn to_wire(self) -> Option<opc_gtpu_ebpf_common::DownlinkInnerMtu> {
+        match self.policy {
+            GtpuDownlinkOversizePolicy::FragmentInner => {
+                opc_gtpu_ebpf_common::DownlinkInnerMtu::fragment_inner(self.mtu.get())
+            }
+            GtpuDownlinkOversizePolicy::InTunnelPacketTooBig => {
+                opc_gtpu_ebpf_common::DownlinkInnerMtu::in_tunnel_packet_too_big(self.mtu.get())
+            }
+        }
+    }
+
+    /// Decode the commit record's downlink inner MTU field.
+    pub(crate) const fn from_wire(wire: opc_gtpu_ebpf_common::DownlinkInnerMtu) -> Option<Self> {
+        if wire.is_packet_too_big() {
+            Self::in_tunnel_packet_too_big(wire.mtu())
+        } else {
+            Self::new(wire.mtu())
+        }
     }
 }
 
@@ -4769,13 +4844,15 @@ pub struct GtpPdpContext {
     /// reject `Some` rather than silently ignoring it. `None` preserves the
     /// backend's pre-DSCP packet and kernel-message behavior.
     pub egress_dscp: Option<DscpCodepoint>,
-    /// Explicit per-context opt-in to downlink tunnel-MTU enforcement with an
-    /// in-tunnel error; see [`GtpuDownlinkInnerMtu`] for the tradeoff.
+    /// Optional per-context downlink inner MTU and its oversized-packet
+    /// policy; see [`GtpuDownlinkInnerMtu`] and [`GtpuDownlinkOversizePolicy`].
     ///
     /// With `Some`, a downlink inner IPv4 packet larger than this value with
-    /// Don't Fragment set is not forwarded. The backend-owned control port
-    /// instead sends at most one RFC 1191 Fragmentation Needed error, carried
-    /// in the UE's default-bearer uplink G-PDU toward the peer; see
+    /// Don't Fragment set is not forwarded by tc. The backend-owned control
+    /// port fragments it by default and returns the fragments for the caller
+    /// to inject, or, when the context opted into in-tunnel Packet Too Big,
+    /// sends at most one RFC 1191 Fragmentation Needed error carried in the
+    /// UE's default-bearer uplink G-PDU toward the peer; see
     /// [`GtpuControlPort::try_receive_downlink`](crate::control_port::GtpuControlPort::try_receive_downlink).
     /// Backends whose [`GtpuProbe::downlink_inner_mtu_enforcement`] is not
     /// [`GtpuCapability::Available`] reject `Some`. `None` preserves the
@@ -6766,15 +6843,17 @@ pub struct GtpuProbe {
     /// port unreachable and dropped. A backend must never leave this
     /// implicit.
     pub downlink_outer_fragment_handling: GtpuDownlinkFragmentContract,
-    /// Per-session downlink inner MTU enforcement with an in-tunnel RFC 1191
-    /// Fragmentation Needed error (see [`GtpPdpContext::downlink_inner_mtu`]).
+    /// Per-session downlink inner MTU enforcement: inner fragmentation by
+    /// default, or an in-tunnel RFC 1191 Fragmentation Needed error when
+    /// opted in (see [`GtpPdpContext::downlink_inner_mtu`]).
     ///
     /// `Available` states that the datapath can enforce the MTU and steer
-    /// over-MTU packets to the backend-owned queue. The error is sent only
-    /// while the embedding application drains that queue through
-    /// [`GtpuControlPort::try_receive_downlink`](crate::control_port::GtpuControlPort::try_receive_downlink);
-    /// otherwise over-MTU packets are dropped in that queue, never forwarded
-    /// or answered by the host.
+    /// over-MTU packets to the backend-owned queue. Fragments are produced,
+    /// and errors sent, only while the embedding application drains that
+    /// queue through
+    /// [`GtpuControlPort::try_receive_downlink`](crate::control_port::GtpuControlPort::try_receive_downlink)
+    /// and injects the returned fragments; otherwise over-MTU packets are
+    /// dropped in that queue, never forwarded or answered by the host.
     pub downlink_inner_mtu_enforcement: GtpuCapability,
     /// Optional human-readable detail; static so the probe stays `Copy`.
     pub details: Option<&'static str>,

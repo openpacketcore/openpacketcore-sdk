@@ -19,13 +19,14 @@
 
 use bytes::Bytes;
 use opc_gtpu_ebpf_common::{
-    downlink_ipv4_requires_packet_too_big, gtpu_endpoint_requires_extension_control,
+    downlink_ipv4_exceeds_inner_mtu, gtpu_endpoint_requires_extension_control,
     marked_owner_wire_authorizes_downlink, n3_downlink_psc_matches, parse_gtpu_tpdu,
     pdp_commit_wire_authorized_source_port, pdp_commit_wire_authorizes_downlink,
     pdp_commit_wire_authorizes_graph, pdp_commit_wire_downlink_inner_mtu,
-    select_gtpu_session_entry_wire, validate_ipv4_downlink_binding_wire, DownlinkBindingMismatch,
-    DownlinkPdr, GtpuSessionDeviceConfig, GtpuSessionIpFamily, MarkedDownlinkPdr, UplinkFar,
-    UplinkFarKey, GTPU_SESSION_DOWNLINK_KEY_LEN, GTPU_SESSION_GROUP_ID_LEN,
+    pdp_commit_wire_downlink_packet_too_big, select_gtpu_session_entry_wire,
+    validate_ipv4_downlink_binding_wire, DownlinkBindingMismatch, DownlinkPdr,
+    GtpuSessionDeviceConfig, GtpuSessionIpFamily, MarkedDownlinkPdr, UplinkFar, UplinkFarKey,
+    GTPU_SESSION_DOWNLINK_KEY_LEN, GTPU_SESSION_GROUP_ID_LEN,
 };
 
 use super::EbpfGtpuRuntime;
@@ -62,9 +63,53 @@ enum Verdict {
         family: GtpAddressFamily,
     },
     PacketTooBig(PacketTooBigRoute),
+    FragmentInner(InnerFragmentRoute),
     Control,
     UnknownTunnel,
     Drop(GtpuDownlinkDrop),
+}
+
+/// One over-MTU packet under the default inner fragmentation policy.
+#[derive(Clone, Copy)]
+struct InnerFragmentRoute {
+    payload_offset: usize,
+    mtu: u16,
+    bearer_mark: [u8; 4],
+    /// The session PAA, which tc and this consumer proved is the inner
+    /// destination: the fragmentation budget and Identification key.
+    destination: [u8; 4],
+}
+
+/// One authorized over-MTU packet that the caller fragments under its
+/// per-destination budget. The packet leaves this plan only as fragments.
+pub(super) struct InnerFragmentPlan {
+    datagram: GtpuControlDatagram,
+    route: InnerFragmentRoute,
+}
+
+impl InnerFragmentPlan {
+    /// The session's downlink inner MTU.
+    pub(super) const fn mtu(&self) -> u16 {
+        self.route.mtu
+    }
+
+    /// The inner destination (the session PAA), the budget key.
+    pub(super) const fn destination(&self) -> [u8; 4] {
+        self.route.destination
+    }
+
+    /// The output bearer mark, exactly as tc would stamp it.
+    pub(super) fn bearer_mark(&self) -> Option<GtpBearerMark> {
+        GtpBearerMark::new(u32::from_be_bytes(self.route.bearer_mark))
+    }
+
+    /// The complete inner packet as carried by the T-PDU.
+    pub(super) fn inner_packet(&self) -> &[u8] {
+        self.datagram
+            .bytes()
+            .get(self.route.payload_offset..)
+            .unwrap_or_default()
+    }
 }
 
 /// One over-MTU packet's error context: its session (the rate-limit key)
@@ -221,6 +266,8 @@ pub(super) enum ProcessedDownlink {
     Event(GtpuDownlinkEvent),
     /// An authorized over-MTU packet; the caller signals it in-tunnel.
     PacketTooBig(PacketTooBigPlan),
+    /// An authorized over-MTU packet; the caller fragments it.
+    FragmentInner(InnerFragmentPlan),
 }
 
 /// Authorize and decapsulate one received datagram, recording exactly one
@@ -235,6 +282,9 @@ pub(super) fn process_downlink_datagram(
         Verdict::PacketTooBig(route) => {
             counters.packet_too_big = counters.packet_too_big.saturating_add(1);
             return ProcessedDownlink::PacketTooBig(PacketTooBigPlan { datagram, route });
+        }
+        Verdict::FragmentInner(route) => {
+            return ProcessedDownlink::FragmentInner(InnerFragmentPlan { datagram, route });
         }
         Verdict::Decapsulate {
             payload_offset,
@@ -579,11 +629,21 @@ fn authorize_legacy(
         return Verdict::Drop(GtpuDownlinkDrop::DestinationMismatch);
     }
     // tc hands an over-MTU DF packet to this queue undecapsulated; the same
-    // Active commit carries the session's optional downlink inner MTU.
+    // Active commit carries the session's optional downlink inner MTU and
+    // its policy: inner fragmentation by default, or the explicit in-tunnel
+    // Packet Too Big opt-in.
     let total_length = u16::from_be_bytes([payload[2], payload[3]]);
     let flags_fragment = u16::from_be_bytes([payload[6], payload[7]]);
     let mtu = pdp_commit_wire_downlink_inner_mtu(&commit);
-    if downlink_ipv4_requires_packet_too_big(mtu, total_length, flags_fragment) {
+    if downlink_ipv4_exceeds_inner_mtu(mtu, total_length, flags_fragment) {
+        if !pdp_commit_wire_downlink_packet_too_big(&commit) {
+            return Verdict::FragmentInner(InnerFragmentRoute {
+                payload_offset,
+                mtu,
+                bearer_mark: pdr.bearer_mark,
+                destination: pdr.ue_ip,
+            });
+        }
         return Verdict::PacketTooBig(PacketTooBigRoute {
             payload_offset,
             mtu,

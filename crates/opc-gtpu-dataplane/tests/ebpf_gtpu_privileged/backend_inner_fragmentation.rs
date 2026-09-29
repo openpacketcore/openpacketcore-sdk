@@ -13,7 +13,9 @@
 
 use super::*;
 use opc_gtpu_dataplane::control_port::{GtpuControlPort, GtpuControlPortError};
-use opc_gtpu_dataplane::GtpuDownlinkEvent;
+use opc_gtpu_dataplane::{
+    GtpuDownlinkDrop, GtpuDownlinkEvent, GtpuDownlinkInnerMtu, GtpuInnerFragmentRateLimit,
+};
 
 /// The access-side (SWu) link MTU.
 const ACCESS_MTU: u16 = 1_400;
@@ -218,8 +220,16 @@ fn serve_consumer(port: &dyn GtpuControlPort, window: Duration) -> Vec<GtpuDownl
     while Instant::now() < deadline {
         match port.try_receive_downlink(4096) {
             Ok(Some(event)) => {
-                if let GtpuDownlinkEvent::Decapsulated(packet) = &event {
-                    inject_toward_xfrm(packet.inner_packet(), packet.bearer_mark());
+                match &event {
+                    GtpuDownlinkEvent::Decapsulated(packet) => {
+                        inject_toward_xfrm(packet.inner_packet(), packet.bearer_mark());
+                    }
+                    GtpuDownlinkEvent::Fragmented(fragmented) => {
+                        for fragment in fragmented.fragments() {
+                            inject_toward_xfrm(fragment, fragmented.bearer_mark());
+                        }
+                    }
+                    _ => {}
                 }
                 events.push(event);
             }
@@ -230,6 +240,27 @@ fn serve_consumer(port: &dyn GtpuControlPort, window: Duration) -> Vec<GtpuDownl
         }
     }
     events
+}
+
+/// Require exactly one event: the inner packet fragmented to the session MTU
+/// under the default policy, with the expected bearer mark.
+fn expect_fragmented(events: &[GtpuDownlinkEvent], mark: Option<GtpBearerMark>) {
+    match events {
+        [GtpuDownlinkEvent::Fragmented(fragmented)] => {
+            assert_eq!(fragmented.mtu(), SESSION_MTU);
+            assert_eq!(fragmented.bearer_mark(), mark);
+            assert_eq!(
+                fragmented
+                    .fragments()
+                    .iter()
+                    .map(|fragment| fragment.len())
+                    .collect::<Vec<_>>(),
+                [1_300, 170],
+                "RFC 791: a full first fragment, then the rest"
+            );
+        }
+        other => panic!("expected one Fragmented event, got {other:?}"),
+    }
 }
 
 /// Require the UE's socket to receive exactly `payload` from the remote host.
@@ -274,10 +305,25 @@ pub(super) async fn qualify() -> Result<(), Box<dyn std::error::Error>> {
         backend.probe().await?.downlink_inner_mtu_enforcement,
         GtpuCapability::Available
     );
-    let default_bearer = session_context(device.ifindex);
-    backend.install_pdp_context(default_bearer).await?;
-    let dedicated = dedicated_session_context(device.ifindex, MARK_A, LOCAL_TEID_A, PEER_TEID_A);
+    // The default oversized-DF policy: inner fragmentation.
+    let mtu = GtpuDownlinkInnerMtu::new(SESSION_MTU).expect("canonical session MTU");
+    let mut default_bearer = session_context(device.ifindex);
+    default_bearer.downlink_inner_mtu = Some(mtu);
+    backend.install_pdp_context(default_bearer.clone()).await?;
+    let mut dedicated =
+        dedicated_session_context(device.ifindex, MARK_A, LOCAL_TEID_A, PEER_TEID_A);
+    dedicated.downlink_inner_mtu = Some(mtu);
     backend.install_pdp_context(dedicated).await?;
+    // Exact readback and idempotent reinstall include the MTU and policy.
+    backend.install_pdp_context(default_bearer.clone()).await?;
+    assert!(matches!(
+        backend
+            .read_pdp_context(PdpContextSelector::LocalTeid(
+                PdpContextLocalTeidSelector::from_context(&default_bearer).expect("selector")
+            ))
+            .await?,
+        PdpContextReadback::Present(context) if context.downlink_inner_mtu == Some(mtu)
+    ));
 
     let port = backend.open_gtpu_control_port(&device).await?;
     let pgw_capture = packet_capture_socket(&net.pgw_ns);
@@ -339,6 +385,7 @@ pub(super) async fn qualify() -> Result<(), Box<dyn std::error::Error>> {
         assert_inner_fragments(&captured_ipv4(&ue_capture), &crc_case),
         2
     );
+    expect_fragmented(&events, None);
 
     // 2. The same datagram fragmented on the outer path: the kernel
     //    reassembles the G-PDU into the shared queue, and the consumer
@@ -346,7 +393,7 @@ pub(super) async fn qualify() -> Result<(), Box<dyn std::error::Error>> {
     let reassembled = datagram(0x52, OVERSIZED_PAYLOAD, true);
     let (head, tail) = build_outer_fragments(&frame(LOCAL_TEID, &reassembled), 1_000, 0x5200);
     send(&[&head, &tail]);
-    serve_consumer(port.as_ref(), window);
+    expect_fragmented(&serve_consumer(port.as_ref(), window), None);
     expect_ue_delivery(
         &ue,
         &application_payload(0x52, OVERSIZED_PAYLOAD),
@@ -373,7 +420,34 @@ pub(super) async fn qualify() -> Result<(), Box<dyn std::error::Error>> {
         "fragmentable",
     );
 
-    // 4. A dedicated bearer through its real ESP Child SA: every fragment is
+    // 4. The per-destination budget bounds the work: with a burst of one and
+    //    no refill during the test, a second oversized datagram toward the
+    //    same UE is dropped, never forwarded or signalled.
+    port.set_inner_fragment_rate_limit(
+        GtpuInnerFragmentRateLimit::new(1, Duration::from_secs(3_600)).expect("canonical limit"),
+    )?;
+    send(&[&frame(LOCAL_TEID, &datagram(0x56, OVERSIZED_PAYLOAD, true))]);
+    send(&[&frame(LOCAL_TEID, &datagram(0x57, OVERSIZED_PAYLOAD, true))]);
+    let events = serve_consumer(port.as_ref(), window);
+    match &events[..] {
+        [GtpuDownlinkEvent::Fragmented(first), GtpuDownlinkEvent::Dropped(GtpuDownlinkDrop::InnerFragmentRateLimited)] =>
+        {
+            assert_eq!(first.mtu(), SESSION_MTU);
+        }
+        other => panic!("expected one fragmented and one rate-limited packet, got {other:?}"),
+    }
+    expect_ue_delivery(
+        &ue,
+        &application_payload(0x56, OVERSIZED_PAYLOAD),
+        "within the budget",
+    );
+    assert!(
+        ue.recv_from(&mut buffer).is_err(),
+        "a rate-limited datagram is never forwarded"
+    );
+    port.set_inner_fragment_rate_limit(GtpuInnerFragmentRateLimit::default())?;
+
+    // 5. A dedicated bearer through its real ESP Child SA: every fragment is
     //    injected with the bearer mark, leaves under the dedicated SPI, is
     //    decrypted by the UE and reassembled.
     let _epdg_nat_t_socket = nat_t_socket(EPDG_SWU_IP);
@@ -382,7 +456,10 @@ pub(super) async fn qualify() -> Result<(), Box<dyn std::error::Error>> {
     let _ = captured_ipv4(&ue_capture);
     let dedicated_case = datagram(0x55, OVERSIZED_PAYLOAD, true);
     send(&[&frame(LOCAL_TEID_A, &dedicated_case)]);
-    serve_consumer(port.as_ref(), window);
+    expect_fragmented(
+        &serve_consumer(port.as_ref(), window),
+        GtpBearerMark::new(MARK_A),
+    );
     expect_ue_delivery(
         &ue,
         &application_payload(0x55, OVERSIZED_PAYLOAD),
@@ -404,6 +481,11 @@ pub(super) async fn qualify() -> Result<(), Box<dyn std::error::Error>> {
         "the host must not generate its own Fragmentation Needed"
     );
     let counters = port.downlink_counters()?;
+    assert_eq!(counters.inner_fragmented, 4);
+    assert_eq!(counters.inner_fragments, 8);
+    assert_eq!(counters.inner_fragment_rate_limited, 1);
+    assert_eq!(counters.inner_unfragmentable, 0);
+    assert_eq!(counters.packet_too_big, 0, "no in-tunnel error by default");
     assert_eq!(counters.decapsulated, 0);
     assert_eq!(counters.shared_queue_drops, 0);
     assert_eq!(counters.packet_too_big_queue_drops, 0);

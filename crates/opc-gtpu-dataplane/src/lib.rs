@@ -60,6 +60,7 @@ pub mod control_port;
 pub mod ebpf;
 pub mod error;
 pub mod icmp;
+mod inner_fragment;
 pub mod linux;
 pub mod mock;
 pub mod model;
@@ -114,10 +115,10 @@ pub use model::{
     EbpfDatapathGeneration, EbpfHistoricalDatapathGeneration, GtpAddressFamily, GtpBearerMark,
     GtpDevice, GtpPdpContext, GtpRole, GtpVersion, GtpuBackendKind, GtpuCapability,
     GtpuDownlinkEndpoint, GtpuDownlinkFragmentContract, GtpuDownlinkInnerMtu,
-    GtpuIpFamilyCapabilities, GtpuLocalEndpointSet, GtpuOuterFragmentPolicy, GtpuProbe,
-    GtpuReassemblyBounds, GtpuSessionAttachmentSelector, GtpuSessionDeviceId, GtpuSessionEntry,
-    GtpuSessionGroup, GtpuSessionGroupConflict, GtpuSessionGroupId,
-    GtpuSessionGroupIndeterminateReason, GtpuSessionGroupReadback,
+    GtpuDownlinkOversizePolicy, GtpuIpFamilyCapabilities, GtpuLocalEndpointSet,
+    GtpuOuterFragmentPolicy, GtpuProbe, GtpuReassemblyBounds, GtpuSessionAttachmentSelector,
+    GtpuSessionDeviceId, GtpuSessionEntry, GtpuSessionGroup, GtpuSessionGroupConflict,
+    GtpuSessionGroupId, GtpuSessionGroupIndeterminateReason, GtpuSessionGroupReadback,
     GtpuSessionGroupReconcileOutcome, GtpuSessionGroupReconcileRequest,
     GtpuSessionGroupRemovalOutcome, GtpuSessionGroupSelector, GtpuSessionModelError,
     GtpuSessionPaa, GtpuSessionSelectorProvenance, GtpuSessionSelectorReuseEvidence,
@@ -177,9 +178,9 @@ pub use reassembly::{
 pub use reassembly::{
     reassembly_commit_authorizes_graph, DownlinkOuterProvenance, GtpuDecapsulatedDownlink,
     GtpuDownlinkCounters, GtpuDownlinkDrop, GtpuDownlinkEvent, GtpuDownlinkPacketTooBig,
-    GtpuPacketTooBigRateLimit, GtpuPacketTooBigSignal, GtpuReassemblyConsumer,
-    GtpuReassemblyCounters, GtpuReassemblyDrop, GtpuReassemblyGraphIdentity, GtpuReassemblyOutcome,
-    GtpuReassemblyPdr, GtpuReassemblySelector,
+    GtpuFragmentedDownlink, GtpuInnerFragmentRateLimit, GtpuPacketTooBigRateLimit,
+    GtpuPacketTooBigSignal, GtpuReassemblyConsumer, GtpuReassemblyCounters, GtpuReassemblyDrop,
+    GtpuReassemblyGraphIdentity, GtpuReassemblyOutcome, GtpuReassemblyPdr, GtpuReassemblySelector,
 };
 pub use selector_namespace::GtpuSelectorNamespaceBootstrap;
 pub use selector_namespace::{

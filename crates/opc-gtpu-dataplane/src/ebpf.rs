@@ -2657,14 +2657,15 @@ fn grouped_device_config(
     )
 }
 
-/// Project a validated commit's optional downlink inner MTU into the model.
-/// `None` means a valid record carried a value the model cannot represent.
+/// Project a validated commit's optional downlink inner MTU and policy into
+/// the model. `None` means a valid record carried a value the model cannot
+/// represent.
 fn commit_downlink_inner_mtu(
     commit: PdpContextCommit,
 ) -> Option<Option<crate::GtpuDownlinkInnerMtu>> {
     match commit.downlink_inner_mtu() {
         None => Some(None),
-        Some(mtu) => crate::GtpuDownlinkInnerMtu::in_tunnel_packet_too_big(mtu.get()).map(Some),
+        Some(wire) => crate::GtpuDownlinkInnerMtu::from_wire(wire).map(Some),
     }
 }
 
@@ -11474,28 +11475,31 @@ impl EbpfGtpuDataplaneBackend {
                 "uplink source-port policy and PDP graph must be canonical",
             )
         })?;
-        if request.downlink_inner_mtu.is_some()
-            && request.uplink_source_port_policy
-                != crate::GtpuUplinkSourcePortPolicy::LegacyServicePort
+        if request.downlink_inner_mtu.is_some_and(|mtu| {
+            mtu.policy() == crate::GtpuDownlinkOversizePolicy::InTunnelPacketTooBig
+        }) && request.uplink_source_port_policy
+            != crate::GtpuUplinkSourcePortPolicy::LegacyServicePort
         {
             // The in-tunnel error leaves through the backend-owned UDP/2152
-            // socket, which cannot honor a selected uplink source port.
+            // socket, which cannot honor a selected uplink source port. The
+            // default inner fragmentation sends nothing uplink.
             return Err(GtpuError::UnsupportedFeature {
                 feature: "downlink_inner_mtu_with_selected_uplink_source_port",
             });
         }
-        let commit = commit
-            .with_downlink_inner_mtu(
-                request
-                    .downlink_inner_mtu
-                    .map(crate::GtpuDownlinkInnerMtu::as_non_zero),
+        let invalid_mtu = || {
+            GtpuError::invalid_config(
+                "pdp.downlink_inner_mtu",
+                "downlink inner MTU must be from the IPv4 minimum to the 15-bit maximum",
             )
-            .ok_or_else(|| {
-                GtpuError::invalid_config(
-                    "pdp.downlink_inner_mtu",
-                    "downlink inner MTU must be at least the IPv4 minimum",
-                )
-            })?;
+        };
+        let downlink_inner_mtu = request
+            .downlink_inner_mtu
+            .map(|mtu| mtu.to_wire().ok_or_else(invalid_mtu))
+            .transpose()?;
+        let commit = commit
+            .with_downlink_inner_mtu(downlink_inner_mtu)
+            .ok_or_else(invalid_mtu)?;
         if request.bearer_mark.is_some()
             && !self
                 .inner

@@ -110,6 +110,22 @@ pub trait GtpuControlPort: fmt::Debug + Send + Sync {
         let _ = limit;
         Err(GtpuControlPortError::Unsupported)
     }
+
+    /// Replace the per-destination inner fragmentation rate limit applied by
+    /// this attachment registration (see [`crate::GtpuInnerFragmentRateLimit`]).
+    /// Tracked destinations keep their Identification sequences and at most
+    /// their current tokens.
+    ///
+    /// # Errors
+    /// Returns [`GtpuControlPortError::Unsupported`] for ports without a
+    /// backend-authoritative consumer, or `Unavailable`/`Busy`.
+    fn set_inner_fragment_rate_limit(
+        &self,
+        limit: crate::GtpuInnerFragmentRateLimit,
+    ) -> Result<(), GtpuControlPortError> {
+        let _ = limit;
+        Err(GtpuControlPortError::Unsupported)
+    }
 }
 
 /// Stable failures without peer, packet, tunnel or deployment values.

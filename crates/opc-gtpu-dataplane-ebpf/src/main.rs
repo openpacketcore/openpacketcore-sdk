@@ -51,24 +51,23 @@ use opc_gtpu_ebpf_common::trusted_traffic_observation_abi::{
 };
 use opc_gtpu_ebpf_common::{
     apply_uplink_mtu_policy, build_uplink_encap_with_dscp_and_source_port, classify_gtpu,
-    classify_udp_checksum, decide_uplink_pmtu, downlink_frame_end,
-    downlink_ipv4_requires_packet_too_big, downlink_parse_ipv4_total_length,
-    downlink_parse_payload_offset, downlink_parse_teid, gtpu_session_config_wire_owns_local_ipv4,
-    gtpu_session_config_wire_owns_local_ipv6, internet_checksum_sum_is_valid,
-    marked_owner_wire_authorizes_downlink, marked_owner_wire_authorizes_uplink,
-    n3_downlink_psc_matches, n3_uplink_extension, pack_downlink_parse_result,
-    pdp_commit_wire_authorized_source_port, pdp_commit_wire_authorizes_downlink,
-    pdp_commit_wire_authorizes_graph, pdp_commit_wire_downlink_inner_mtu,
-    select_gtpu_session_entry_wire, tft_classifier_filter_matches,
-    tft_classifier_schema_is_current, uplink_non_encapsulation_drops,
-    validate_ipv4_downlink_binding_wire, DownlinkBindingMismatch, DownlinkPdr, GtpuClass,
-    GtpuEnvelopeBounds, GtpuOuterFragmentPolicy, GtpuPmtuProtocol, GtpuSessionAuthorityWireView,
-    GtpuSessionEntryWireView, GtpuSessionGroupPhase, GtpuSessionIpFamily,
-    GtpuTrafficObservationDirection, GtpuUplinkMtuPolicy, Ipv4EnvelopeBounds, Ipv6ExtensionStep,
-    MarkedDownlinkPdr, TftClassifierFilter, TftClassifierFilterKey, TftClassifierIpv4Packet,
-    TftClassifierKey, TftClassifierMeta, UdpChecksumDisposition, UdpChecksumEvidence,
-    UdpEnvelopeBounds, UplinkFar, UplinkFarKey, UplinkMtuMapState, UplinkPmtuDecision,
-    COUNTER_DL_BINDING_FAMILY_MISMATCH, COUNTER_DL_BINDING_INGRESS_MISMATCH,
+    classify_udp_checksum, decide_uplink_pmtu, downlink_frame_end, downlink_ipv4_exceeds_inner_mtu,
+    downlink_parse_ipv4_total_length, downlink_parse_payload_offset, downlink_parse_teid,
+    gtpu_session_config_wire_owns_local_ipv4, gtpu_session_config_wire_owns_local_ipv6,
+    internet_checksum_sum_is_valid, marked_owner_wire_authorizes_downlink,
+    marked_owner_wire_authorizes_uplink, n3_downlink_psc_matches, n3_uplink_extension,
+    pack_downlink_parse_result, pdp_commit_wire_authorized_source_port,
+    pdp_commit_wire_authorizes_downlink, pdp_commit_wire_authorizes_graph,
+    pdp_commit_wire_downlink_inner_mtu, select_gtpu_session_entry_wire,
+    tft_classifier_filter_matches, tft_classifier_schema_is_current,
+    uplink_non_encapsulation_drops, validate_ipv4_downlink_binding_wire, DownlinkBindingMismatch,
+    DownlinkPdr, GtpuClass, GtpuEnvelopeBounds, GtpuOuterFragmentPolicy, GtpuPmtuProtocol,
+    GtpuSessionAuthorityWireView, GtpuSessionEntryWireView, GtpuSessionGroupPhase,
+    GtpuSessionIpFamily, GtpuTrafficObservationDirection, GtpuUplinkMtuPolicy, Ipv4EnvelopeBounds,
+    Ipv6ExtensionStep, MarkedDownlinkPdr, TftClassifierFilter, TftClassifierFilterKey,
+    TftClassifierIpv4Packet, TftClassifierKey, TftClassifierMeta, UdpChecksumDisposition,
+    UdpChecksumEvidence, UdpEnvelopeBounds, UplinkFar, UplinkFarKey, UplinkMtuMapState,
+    UplinkPmtuDecision, COUNTER_DL_BINDING_FAMILY_MISMATCH, COUNTER_DL_BINDING_INGRESS_MISMATCH,
     COUNTER_DL_BINDING_INVALID, COUNTER_DL_BINDING_LOCAL_MISMATCH,
     COUNTER_DL_BINDING_PEER_MISMATCH, COUNTER_DL_BINDING_SOURCE_PORT_MISMATCH, COUNTER_DL_DECAP,
     COUNTER_DL_DST_MISMATCH, COUNTER_DL_MALFORMED, COUNTER_DL_UNKNOWN_TEID, COUNTER_SLOTS,
@@ -4211,7 +4210,7 @@ fn downlink_inner_exceeds_session_mtu(
     let Ok(flags_fragment) = ctx.load::<u16>(payload_offset + 6) else {
         return false;
     };
-    downlink_ipv4_requires_packet_too_big(
+    downlink_ipv4_exceeds_inner_mtu(
         mtu,
         u16::from_be(total_length),
         u16::from_be(flags_fragment),
@@ -4403,12 +4402,14 @@ fn authorize_and_decap_legacy_downlink(
         return TC_ACT_SHOT as i32;
     }
     if downlink_inner_exceeds_session_mtu(ctx, commit, payload_offset) {
-        // RFC 1191: the session's optional downlink inner MTU cannot carry
-        // this DF packet after access-side encapsulation. Hand the exact
-        // authorized G-PDU, undecapsulated, to the backend-owned
-        // packet-too-big queue, which signals the originator inside the
-        // UE's default-bearer uplink tunnel. Decapsulating here would let
-        // the host emit an unroutable, plaintext-quoting ICMP error instead.
+        // The session's optional downlink inner MTU cannot carry this DF
+        // packet after access-side encapsulation. Hand the exact authorized
+        // G-PDU, undecapsulated, to the backend-owned packet-too-big queue.
+        // Its consumer fragments the inner packet by default (RFC 4459
+        // section 3.4), or signals the originator inside the UE's
+        // default-bearer uplink tunnel when the session opted in (RFC 1191).
+        // Decapsulating here would let the host emit an unroutable,
+        // plaintext-quoting ICMP error instead.
         return hand_off_packet_too_big(ctx, l4_offset);
     }
 
