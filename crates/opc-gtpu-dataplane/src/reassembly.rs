@@ -1650,9 +1650,9 @@ const MAXIMUM_DATAGRAM_LIFETIME: std::time::Duration = std::time::Duration::from
 /// Identification sequence from repeating within the maximum datagram
 /// lifetime, as RFC 6864 sections 4.3 and 5.2 require of a source of
 /// non-atomic datagrams: a limit that could admit more than 65,535 packets
-/// in 255 seconds is refused. The default is a burst of 64 with one token
-/// per 4 ms (250 packets per second per destination), at most
-/// 64 + 63,750 packets in any 255 seconds. At most 4,096 destinations are
+/// in 255 seconds (`burst` + ⌈255 s / `refill_interval`⌉) is refused. The
+/// default is a burst of 64 with one token per 4 ms (250 packets per second
+/// per destination), at most 64 + 63,750 packets in any 255 seconds. At most 4,096 destinations are
 /// tracked per attachment; the least recently used is evicted first, and
 /// restarts with a full bucket and a fresh Identification sequence.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1673,12 +1673,18 @@ impl Default for GtpuInnerFragmentRateLimit {
 impl GtpuInnerFragmentRateLimit {
     /// Create a limit. A zero burst, a zero interval, or a limit that could
     /// admit more than 65,535 packets within 255 seconds returns `None`.
+    ///
+    /// A bucket can admit `burst` + ⌈255 s / `refill_interval`⌉ packets in a
+    /// half-open 255-second window: it opens with a full bucket just before
+    /// a refill instant and takes every refill as it arrives.
     #[must_use]
     pub fn new(burst: u32, refill_interval: std::time::Duration) -> Option<Self> {
         if burst == 0 || refill_interval.is_zero() {
             return None;
         }
-        let refills = MAXIMUM_DATAGRAM_LIFETIME.as_nanos() / refill_interval.as_nanos();
+        let refills = MAXIMUM_DATAGRAM_LIFETIME
+            .as_nanos()
+            .div_ceil(refill_interval.as_nanos());
         (u128::from(burst) + refills <= u128::from(u16::MAX)).then_some(Self {
             burst,
             refill_interval,

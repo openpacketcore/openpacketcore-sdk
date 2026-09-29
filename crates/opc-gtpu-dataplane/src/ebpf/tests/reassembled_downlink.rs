@@ -1418,8 +1418,10 @@ fn inner_fragment_budget_is_per_destination_with_non_repeating_identifications()
         (64, Duration::from_millis(4))
     );
     assert_eq!(Limit::new(64, Duration::from_millis(4)), Some(default));
-    // RFC 6864: no more than 65,535 admissions in the 255-second lifetime.
-    assert!(Limit::new(65_535, Duration::from_secs(3_600)).is_some());
+    // RFC 6864: no more than 65,535 admissions in the 255-second lifetime,
+    // counting the one refill a 255-second window can hold.
+    assert!(Limit::new(65_534, Duration::from_secs(3_600)).is_some());
+    assert!(Limit::new(65_535, Duration::from_secs(3_600)).is_none());
     assert!(Limit::new(65_535, Duration::from_secs(255)).is_none());
     assert!(Limit::new(1, Duration::from_nanos(3_891_000)).is_none());
     assert!(Limit::new(1, Duration::from_nanos(3_892_000)).is_some());
@@ -1448,17 +1450,20 @@ fn inner_fragment_budget_is_per_destination_with_non_repeating_identifications()
     assert_eq!(budget.admit(a, refilled, true), None);
 
     // One destination's sequence assigns every non-zero Identification
-    // exactly once before its budget is exhausted.
+    // exactly once before its budget is exhausted: the largest burst, then
+    // the one refill an hour later.
     let mut budget =
-        InnerFragmentBudget::new(Limit::new(65_535, Duration::from_secs(3_600)).unwrap());
+        InnerFragmentBudget::new(Limit::new(65_534, Duration::from_secs(3_600)).unwrap());
     let mut seen = vec![false; 65_536];
-    for _ in 0..65_535 {
-        let identification = budget.admit(a, start, true).unwrap().unwrap();
+    let hour_later = start + Duration::from_secs(3_600);
+    for index in 0..65_535 {
+        let now = if index < 65_534 { start } else { hour_later };
+        let identification = budget.admit(a, now, true).unwrap().unwrap();
         assert_ne!(identification, 0);
         assert!(!seen[usize::from(identification)]);
         seen[usize::from(identification)] = true;
     }
-    assert_eq!(budget.admit(a, start, true), None);
+    assert_eq!(budget.admit(a, hour_later, true), None);
     assert!(format!("{budget:?}").contains("tracked: 1"));
 
     // The table is bounded; the least recently used destination is evicted.
