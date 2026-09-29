@@ -832,7 +832,7 @@ async fn only_an_authorized_oversized_dont_fragment_packet_becomes_a_plan() {
             GtpuDownlinkEvent::Decapsulated(_)
         ));
     }
-    let oversized = dont_fragment(sized_inner(1_301));
+    let oversized = checksummed(dont_fragment(sized_inner(1_301)));
     let plan = plan(process_downlink_datagram(
         runtime.as_ref(),
         ordinary_scope(),
@@ -875,7 +875,7 @@ async fn only_an_authorized_oversized_dont_fragment_packet_becomes_a_plan() {
 #[tokio::test]
 async fn in_tunnel_error_matches_an_independent_rfc_1191_literal() {
     let (_backend, runtime) = ordinary_fixture(mtu_context(1_300)).await;
-    let oversized = dont_fragment(sized_inner(1_400));
+    let oversized = checksummed(dont_fragment(sized_inner(1_400)));
     let mut counters = GtpuDownlinkCounters::default();
     let gpdu_bytes = plan(process_downlink_datagram(
         runtime.as_ref(),
@@ -922,13 +922,14 @@ fn oversized_plan(
     ))
 }
 
-/// Replace the invoking packet's originator (its source) and protocol.
+/// Replace the invoking packet's originator (its source) and protocol,
+/// keeping its header checksum valid.
 fn from_originator(originator: [u8; 4], protocol: u8, icmp_type: u8) -> Vec<u8> {
     let mut packet = dont_fragment(sized_inner(1_400));
     packet[12..16].copy_from_slice(&originator);
     packet[9] = protocol;
     packet[20] = icmp_type;
-    packet
+    checksummed(packet)
 }
 
 #[tokio::test]
@@ -971,6 +972,7 @@ async fn rfc_1122_never_answer_rules_apply_to_each_class() {
     // A non-initial fragment is never answered.
     let mut non_initial = dont_fragment(sized_inner(1_400));
     non_initial[7] = 1;
+    let non_initial = checksummed(non_initial);
     assert!(oversized_plan(&runtime, LOCAL_TEID, &non_initial)
         .build_uplink_gpdu()
         .is_none());
@@ -982,12 +984,35 @@ async fn rfc_1122_never_answer_rules_apply_to_each_class() {
     );
 }
 
+/// RFC 1812 section 5.2.2 and RFC 1122 section 3.2.1.2: an invoking packet
+/// whose header fails validation is silently discarded, never answered.
+#[tokio::test]
+async fn in_tunnel_error_requires_a_valid_invoking_header() {
+    let (_backend, runtime) = ordinary_fixture(mtu_context(1_300)).await;
+    let valid = checksummed(dont_fragment(sized_inner(1_400)));
+    assert!(oversized_plan(&runtime, LOCAL_TEID, &valid)
+        .build_uplink_gpdu()
+        .is_some());
+    let mut corrupt = valid.clone();
+    corrupt[10] ^= 0xff;
+    // The header still claims 1,400 octets; only 1,000 arrived.
+    let truncated = valid[..1_000].to_vec();
+    for (case, packet) in [("header checksum", corrupt), ("truncated", truncated)] {
+        assert!(
+            oversized_plan(&runtime, LOCAL_TEID, &packet)
+                .build_uplink_gpdu()
+                .is_none(),
+            "{case}: the invoking packet must be discarded, not answered"
+        );
+    }
+}
+
 #[tokio::test]
 async fn dedicated_bearer_errors_use_the_default_bearer_uplink() {
     let mut dedicated = marked_context(0x0001_0001, 0x1000_0002, 0x2000_0002);
     dedicated.downlink_inner_mtu = crate::GtpuDownlinkInnerMtu::in_tunnel_packet_too_big(1_300);
     let (backend, runtime) = ordinary_fixture(dedicated).await;
-    let packet = dont_fragment(sized_inner(1_400));
+    let packet = checksummed(dont_fragment(sized_inner(1_400)));
     // Only a dedicated bearer: there is no default-bearer uplink to use.
     let plan = oversized_plan(&runtime, 0x1000_0002, &packet);
     assert_eq!(plan.session(), 0x1000_0002_u32.to_be_bytes());
