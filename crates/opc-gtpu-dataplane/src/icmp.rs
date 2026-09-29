@@ -10,7 +10,7 @@
 //! counted drop, and operators of that backend must size the inner MTU out
 //! of band (for example MSS clamping) unless they run a host component that
 //! consumes the signal. The eBPF backend's downlink tunnel-MTU enforcement
-//! uses the IPv4 builder for its in-tunnel RFC 1191 error; see
+//! uses the IPv4 builder for its opt-in in-tunnel RFC 1191 error; see
 //! [`GtpPdpContext::downlink_inner_mtu`](crate::GtpPdpContext::downlink_inner_mtu).
 
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};

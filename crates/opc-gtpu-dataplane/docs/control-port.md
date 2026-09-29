@@ -186,44 +186,146 @@ validators and the backend's own map reads:
 | `Decapsulated` | Exact inner packet, inner family and bearer mark (default bearer is `None`). The caller injects it toward XFRM with that mark. |
 | `Control` | Non-G-PDU message; use the response planners above. |
 | `UnknownTunnel` | Untouched G-PDU whose TEID selects no tunnel. An observation, not an absence receipt. |
-| `Dropped` | Value-free `GtpuDownlinkDrop`: malformed, binding mismatch, destination mismatch or state unavailable. |
+| `Dropped` | Value-free `GtpuDownlinkDrop`: malformed, binding mismatch, destination mismatch, state unavailable, or an over-MTU packet refused by the inner fragmenter (rate limited, or carrying IPv4 options). |
+| `Fragmented` | An over-MTU DF IPv4 packet split into RFC 791 inner fragments under the default policy below, with the bearer mark. The caller injects every fragment, in order, toward XFRM with that mark. |
+| `PacketTooBig` | An over-MTU DF IPv4 packet under the explicit in-tunnel Packet Too Big opt-in below; never forwarded. |
 
 `downlink_counters` returns bounded, value-free counters for the current
-attachment registration.
+attachment registration. The ordinary legacy socket port keeps the default
+`Unsupported` result. Apart from the over-MTU handling below, the consumer
+does not inject packets, admit peers, rate limit, or plan Error Indications.
+Grouped attachments with an IPv4 outer
+endpoint report `KernelReassemblyHandoff` for outer IPv4 fragments; outer IPv6
+fragments remain unsupported. An ordinary attachment's inner-IPv6 contexts
+live in the family-tagged authority under the attachment's own published
+configuration, which is bound to its IPv4 endpoint. The consumer reads and
+checks that configuration, exactly as tc selects those contexts, so
+reassembled inner-IPv6 G-PDUs decapsulate on ordinary attachments too. An
+IPv6 T-PDU that only reaches the IPv4-only v5 maps stays malformed, as in tc.
 
-### Downlink tunnel-MTU enforcement (opt-in)
+Native evidence runs the committed classifier on ordinary and grouped
+attachments: in-order, reordered, duplicated head and tail, missing,
+foreign-TEID, wrong-peer, wrong-destination, stale Pending/Removing commit,
+owner-only Pending, mixed binding, closed gate, stale grouped generation,
+retirement and removal. Both privileged lanes require the
+`OPC_GTPU_BACKEND_REASSEMBLY_CONSUMER_PROVEN` and
+`OPC_GTPU_BACKEND_GROUPED_REASSEMBLY_CONSUMER_PROVEN` markers.
 
-`GtpPdpContext::downlink_inner_mtu`
-(`GtpuDownlinkInnerMtu::in_tunnel_packet_too_big`) is an explicit per-context
-opt-in. It carries the session's downlink inner MTU: for an ePDG, the SWu
-access MTU minus the negotiated ESP/UDP/IP overhead, at least 576 (RFC 791).
+### Downlink tunnel-MTU enforcement
 
-**Storage.** The MTU lives in the previously reserved bytes 66..68 of the
+`GtpPdpContext::downlink_inner_mtu` is optional per context. It carries the
+session's downlink inner MTU: for an ePDG, the SWu access MTU minus the
+negotiated ESP/UDP/IP overhead, from 576 (RFC 791) to 32,767. It also
+carries the policy for an authorized inner IPv4 packet with Don't Fragment
+set that exceeds the MTU:
+
+- `GtpuDownlinkInnerMtu::new(mtu)` selects the **default**, inner
+  fragmentation before encapsulation (RFC 4459 section 3.4);
+- `GtpuDownlinkInnerMtu::in_tunnel_packet_too_big(mtu)` is the **explicit
+  opt-in** alternative, one in-tunnel RFC 1191 error.
+
+`None` keeps today's behaviour: tc decapsulates the packet and the host
+drops it with its own Fragmentation Needed toward the core.
+
+**Storage.** The field lives in the previously reserved bytes 66..68 of the
 Active `PdpContextCommit`, so it is published, replaced and read back
-atomically with the rest of the graph. A record without it is byte-identical
-to the original layout. An older SDK does not tolerate a record carrying an MTU: its retained-graph
+atomically with the rest of the graph. The MTU is in the low 15 bits; bit 15
+is set only for the in-tunnel Packet Too Big opt-in. A record without an MTU
+is byte-identical to the original layout, so retained graphs are unchanged.
+An older SDK does not tolerate a record carrying an MTU: its retained-graph
 recovery rejects the non-canonical commit and refuses the whole attachment
 as indeterminate, not just that context. Before downgrading, drain every
 MTU-bearing context (reinstall it with `None`, or remove it).
 
-**Refusals and capability.** The legacy service-port uplink policy is
-required. Grouped entries refuse the field. The eBPF probe reports
-`downlink_inner_mtu_enforcement`. `Available` covers the datapath only: an
-error is sent only while the application drains this port.
+**Refusals and capability.** The in-tunnel Packet Too Big opt-in requires
+the legacy service-port uplink policy; the default fragmentation sends
+nothing uplink and accepts either. Grouped entries and ordinary inner-IPv6
+contexts refuse both policies. The eBPF probe reports
+`downlink_inner_mtu_enforcement`. `Available` covers the datapath only:
+fragments are produced, and errors sent, only while the application drains
+this port.
 
 **tc.** When an authorized inner IPv4 packet with Don't Fragment set exceeds
 the MTU, tc does not decapsulate it, so the host never forwards it and never
 emits its own error. tc rewrites only the UDP destination port, with an
 incremental checksum update, to the backend-owned packet-too-big queue on the
-same local address (`GTPU_PACKET_TOO_BIG_QUEUE_PORT`, 2153). Outer fragments
+same local address (`GTPU_PACKET_TOO_BIG_QUEUE_PORT`, 2153). tc reads only
+the MTU bits, so it steers identically under both policies. Outer fragments
 are reassembled first and arrive on the shared queue.
 
 **Queue priority.** `try_receive_downlink` always serves the shared UDP/2152
 queue first. A backlog of hand-offs therefore cannot delay or crowd out Echo
 or reassembled G-PDUs.
 
-**Signalling.** The G-PDU is re-authorized against the same Active commit and
-`GtpuDownlinkEvent::PacketTooBig` is returned. At most one RFC 792/1191
+#### Default: inner fragmentation
+
+The G-PDU is re-authorized against the same Active commit. Then, in order:
+
+1. **Header validation** (RFC 1812 section 5.2.2): version 4, a header
+   length of at least 20, a valid header checksum, and a total length that
+   covers the header and is not truncated. A failure is a `Malformed` drop.
+   Octets after the total length are not part of the datagram and are
+   ignored, as the kernel's receive path trims them.
+2. **IPv4 options** are not fragmented: this path implements neither the
+   RFC 791 option copy rules nor a router's Record Route and Timestamp
+   processing. Such a packet is dropped as `InnerUnfragmentable`.
+3. **Budget.** One token bucket per destination (the session PAA):
+   `GtpuInnerFragmentRateLimit`, a burst of 64 with one token per 4 ms by
+   default, set by `set_inner_fragment_rate_limit`. At most 4,096
+   destinations are tracked per attachment, least recently used first out.
+   An empty bucket is an `InnerFragmentRateLimited` drop. Steps 1 and 2 take
+   no token.
+4. **Fragmentation** by the RFC 791 section 3.2 procedure, generalized to
+   an n-way split. Every fragment except the last carries the largest
+   multiple of 8 data octets that fits the MTU, so the count is minimal
+   and the fragments are in order (RFC 1812 section 4.2.2.7). The original
+   header is copied; the total length, More Fragments flag (the original's
+   on the last fragment), fragment offset (the original's plus the
+   fragment's own) and header checksum are set per fragment. TTL, TOS,
+   protocol and addresses are copied unchanged.
+5. **Identification.** All fragments carry one Identification (RFC 791).
+   A packet that is itself a fragment keeps its own, which its sibling
+   fragments share. An atomic datagram (DF set, not a fragment) has no
+   meaningful Identification (RFC 6864 section 4.1), and senders often use
+   zero or a constant, so the fragments get the destination's next value
+   from a sequence that starts at a random non-zero value and never uses
+   zero. The budget's default admits at most 64 + 63,750 packets in 255
+   seconds, so the sequence cannot repeat within the maximum datagram
+   lifetime (RFC 791 Time to Live; RFC 6864 sections 4.3 and 5.2), and
+   `GtpuInnerFragmentRateLimit::new` refuses any limit that could.
+
+The result is `GtpuDownlinkEvent::Fragmented`: the fragments in offset order,
+the MTU and the bearer mark. Its `Debug` output shows only the fragment
+count and MTU.
+
+**Injection.** The caller injects every fragment, in order, toward XFRM
+with the returned mark, exactly as for a `Decapsulated` packet. On Linux an
+`IPPROTO_RAW` socket (`IP_HDRINCL`) does this with `SO_MARK` set to the
+bearer mark (zero for the default bearer). Linux builds the XFRM flow for
+such a socket from the socket, not the packet: pass the inner source as the
+`IP_PKTINFO` source so a source-specific OUT selector matches, and do not
+rely on port or protocol selectors. Linux also replaces an Identification
+of zero on an `IP_HDRINCL` send, which would break reassembly; fragments of
+an atomic datagram never carry zero, but a received DF fragment's own
+Identification is preserved as it is. The consumer does not decrement TTL,
+for fragments or for `Decapsulated` packets.
+
+**Owner-approved policy.** Fragmenting a datagram with Don't Fragment set is
+not standard router behaviour. RFC 791 section 2.3 and RFC 6864 section 4.3
+forbid fragmenting it or clearing DF in transit; RFC 1191 section 4 has a
+router discard it and signal the originator instead. RFC 4459 section 3.4
+describes clearing DF before encapsulation as a non-compliant but deployed
+tunnel practice. The
+ePDG owner chose it as the default because it delivers the packet whatever
+the originator does, and sources nothing from the subscriber's address. The
+cost: the originator's Path MTU Discovery never learns the tunnel MTU, so
+every oversized DF packet takes this slower path, and the UE must
+reassemble.
+
+#### Opt-in: in-tunnel Packet Too Big
+
+With `GtpuDownlinkInnerMtu::in_tunnel_packet_too_big`, the re-authorized
+G-PDU produces `GtpuDownlinkEvent::PacketTooBig`. At most one RFC 792/1191
 Destination Unreachable (Fragmentation Needed) error is sent:
 
 - **Bearer.** The error goes on the UE's default-bearer uplink (mark zero),
@@ -245,9 +347,16 @@ Destination Unreachable (Fragmentation Needed) error is sent:
   `set_packet_too_big_rate_limit`. At most 4,096 sessions are tracked per
   attachment, least recently used first out. A flood toward one PAA exhausts
   only that session's budget.
-- **Counters.** Value-free counters report too-big, signalled, rate-limited
-  and unsendable packets. `SO_RXQ_OVFL` reports kernel drops from the shared
-  queue and from the packet-too-big queue.
+- **Tradeoff.** The error's source is the subscriber's own address. The ePDG
+  is routing, so RFC 1812 4.3.2.4 would have it use its own address, but the
+  PGW's per-PDN anti-spoofing admits only the PAA. The originator therefore
+  attributes the error to the subscriber.
+
+**Counters.** Value-free counters report fragmented packets and fragments,
+rate-limited and unfragmentable packets under the default policy, and
+too-big, signalled, rate-limited and unsendable packets under the opt-in.
+`SO_RXQ_OVFL` reports kernel drops from the shared queue and from the
+packet-too-big queue.
 
 **Limits.**
 
@@ -257,22 +366,13 @@ Destination Unreachable (Fragmentation Needed) error is sent:
   does, the kernel drops further hand-offs from any session, and those drops
   are counted. It can never affect the shared queue.
 
-**Tradeoff.** The error's source is the subscriber's own address. The ePDG is
-routing, so RFC 1812 4.3.2.4 would have it use its own address, but the PGW's
-per-PDN anti-spoofing admits only the PAA. The originator therefore attributes
-the error to the subscriber. RFC 4459 alternatives are:
-
-- clearing the inner DF bit and fragmenting the inner packet before
-  encryption;
-- MSS clamping plus SIP over TCP for large requests.
-
-This path implements only the in-tunnel error.
-
-**IPv6.** Ordinary inner-IPv6 contexts (#998) are stored as family-tagged
-entries, and those entries have no MTU field, so an opted-in IPv6 context is
-refused with `downlink_inner_mtu_inner_ipv6` rather than installed without
-enforcement. Inner IPv6 Packet Too Big (RFC 4443 / RFC 8201) is a follow-up.
-It needs three pieces:
+**IPv6.** IPv6 has no in-network fragmentation: only the source fragments
+(RFC 8200 sections 4.5 and 5), and a router answers an oversized packet with
+Packet Too Big (RFC 4443 section 3.2). Ordinary inner-IPv6 contexts (#998) are
+stored as family-tagged entries, and those entries have no MTU field, so an
+inner-IPv6 context with a downlink inner MTU is refused with
+`downlink_inner_mtu_inner_ipv6` under either policy rather than installed
+without enforcement. Inner IPv6 Packet Too Big (#1007) needs three pieces:
 - an MTU in the family-tagged entry wire, which is shared with grouped
   records and the protected selector ledger;
 - the same steering in tc's family-tagged decapsulation;
@@ -280,35 +380,24 @@ It needs three pieces:
 
 **Native evidence.** The committed classifier is exercised with:
 
-- default, dedicated (answered on the default-bearer uplink) and
-  outer-fragmented oversized DF packets;
-- the exact error bytes, the 28-octet quote and the next-hop MTU;
-- fitting DF packets and oversized non-DF packets, which are forwarded;
-- the per-session rate limit;
-- an Echo served ahead of a 40-packet hand-off backlog;
-- never-answer packets that consume no token;
+- the default policy: a 1,450-octet DF datagram over a 1,400-octet access
+  link, on the default bearer, after outer reassembly, and on a dedicated
+  bearer through its real ESP Child SA. The UE receives the exact payload;
+  captures show two RFC 791 fragments with one non-zero Identification and
+  Don't Fragment clear, and one dedicated-SPI ESP packet per fragment. The
+  per-destination budget drops a second datagram without forwarding it;
+- the opt-in: default, dedicated (answered on the default-bearer uplink) and
+  outer-fragmented oversized DF packets; the exact error bytes, the 28-octet
+  quote and the next-hop MTU; the per-session rate limit; an Echo served
+  ahead of a 40-packet hand-off backlog; never-answer packets that consume no
+  token;
+- fitting DF packets and oversized non-DF packets, which tc forwards;
 - zero plaintext ICMP in the peer and UE namespaces, and an unchanged host
   `OutDestUnreachs`.
 
-A baseline test pins the unchanged default without the opt-in: the host emits
+A baseline test pins the unchanged default without an MTU: the host emits
 its own error, quoting 548 octets toward the core.
 
-Both privileged lanes require `OPC_GTPU_DOWNLINK_PACKET_TOO_BIG_PROVEN` and
+Both privileged lanes require `OPC_GTPU_DOWNLINK_INNER_FRAGMENTATION_PROVEN`,
+`OPC_GTPU_DOWNLINK_PACKET_TOO_BIG_PROVEN` and
 `OPC_GTPU_DOWNLINK_PACKET_TOO_BIG_BASELINE_PROVEN`.
-`Unsupported` result. The consumer does not inject packets, admit peers, rate
-limit, or plan Error Indications. Grouped attachments with an IPv4 outer
-endpoint report `KernelReassemblyHandoff` for outer IPv4 fragments; outer IPv6
-fragments remain unsupported. An ordinary attachment's inner-IPv6 contexts
-live in the family-tagged authority under the attachment's own published
-configuration, which is bound to its IPv4 endpoint. The consumer reads and
-checks that configuration, exactly as tc selects those contexts, so
-reassembled inner-IPv6 G-PDUs decapsulate on ordinary attachments too. An
-IPv6 T-PDU that only reaches the IPv4-only v5 maps stays malformed, as in tc.
-
-Native evidence runs the committed classifier on ordinary and grouped
-attachments: in-order, reordered, duplicated head and tail, missing,
-foreign-TEID, wrong-peer, wrong-destination, stale Pending/Removing commit,
-owner-only Pending, mixed binding, closed gate, stale grouped generation,
-retirement and removal. Both privileged lanes require the
-`OPC_GTPU_BACKEND_REASSEMBLY_CONSUMER_PROVEN` and
-`OPC_GTPU_BACKEND_GROUPED_REASSEMBLY_CONSUMER_PROVEN` markers.

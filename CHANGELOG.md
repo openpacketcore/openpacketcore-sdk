@@ -68,6 +68,34 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- `opc-gtpu-dataplane` / `opc-gtpu-ebpf-common`: inner fragmentation is the
+  default policy for an over-MTU downlink IPv4 packet with Don't Fragment set.
+  Refs #1002.
+  - **Policy.** `GtpuDownlinkInnerMtu::new(mtu)` selects the default: the
+    backend-owned consumer clears DF and fragments the inner packet before
+    encapsulation (RFC 4459 section 3.4), an owner-approved deviation from the
+    DF rules of RFC 791, RFC 1191 and RFC 6864.
+    `GtpuDownlinkInnerMtu::in_tunnel_packet_too_big(mtu)` stays the explicit
+    opt-in; `GtpuDownlinkOversizePolicy` names both.
+  - **Wire.** The commit record's MTU field keeps the MTU in its low 15 bits
+    (576 to 32,767); bit 15 marks the in-tunnel Packet Too Big opt-in. tc reads
+    only the MTU and steers identically. Records without an MTU are unchanged.
+  - **Consumer.** `GtpuDownlinkEvent::Fragmented` returns RFC 791 fragments
+    of at most the MTU with the bearer mark, for the caller to inject toward
+    XFRM. The header is validated first (RFC 1812 section 5.2.2); IPv4
+    options are refused (`InnerUnfragmentable`). A fragment keeps its own
+    Identification; an atomic datagram gets a fresh non-zero value from a
+    per-destination sequence (RFC 6864 sections 4.1 and 4.3).
+  - **Budget.** Per-destination token buckets (`GtpuInnerFragmentRateLimit`,
+    burst 64, one token per 4 ms, set by `set_inner_fragment_rate_limit`)
+    bound the work and keep each sequence from repeating within 255 seconds;
+    excess packets are `InnerFragmentRateLimited` drops. Value-free counters
+    record fragmented packets, fragments and refusals.
+  - **Evidence.** On a real kernel a 1,450-octet DF datagram over a
+    1,400-octet access link reaches the UE as two exact fragments, on the
+    default bearer, after outer reassembly and on a dedicated bearer through
+    its ESP Child SA, with no host ICMP.
+
 - `opc-gtpu-dataplane` / `opc-gtpu-dataplane-ebpf`: opt-in downlink tunnel-MTU
   enforcement with an in-tunnel RFC 1191 error. Refs #1002.
   - **Opt-in.** `GtpPdpContext::downlink_inner_mtu` is a new field and is

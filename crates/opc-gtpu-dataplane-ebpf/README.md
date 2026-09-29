@@ -38,8 +38,10 @@ The crate exposes tc entry points, not a Rust library API:
   Don't Fragment set that exceeds the Active commit's optional downlink inner
   MTU is not decapsulated. tc rewrites only its UDP destination port (with an
   incremental checksum update) to the backend-owned packet-too-big queue
-  (`GTPU_PACKET_TOO_BIG_QUEUE_PORT`, 2153), which sends at most one in-tunnel
-  RFC 1191 error. A hand-off flood therefore never fills the shared UDP/2152
+  (`GTPU_PACKET_TOO_BIG_QUEUE_PORT`, 2153). Its consumer fragments the inner
+  packet by default, or sends at most one in-tunnel RFC 1191 error when the
+  session opted in; tc reads only the MTU bits and steers identically under
+  both policies. A hand-off flood therefore never fills the shared UDP/2152
   queue. tc keeps no hand-off counter: adding a counter or policing map would
   change the retained pin inventory and durable recovery records. A true
   grouped-index miss alone may enter the legacy IPv4 PDR/commit path.

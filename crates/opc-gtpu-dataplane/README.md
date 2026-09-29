@@ -94,23 +94,26 @@ On an eBPF attachment, `try_receive_downlink` on the same port is the
 backend-authoritative consumer for kernel-reassembled and handed-off G-PDUs:
 it authorizes against the backend's own grouped and v5 maps (commit read
 last) and returns the exact inner packet and bearer mark, or a value-free
-drop. With the explicit per-context opt-in
-`GtpPdpContext::downlink_inner_mtu`, an over-MTU DF downlink packet is not
-forwarded. tc steers it to a dedicated backend-owned queue, and it is
-signalled at most once inside the UE's default-bearer uplink G-PDU
-(RFC 1191) instead of by the host.
+drop. With an optional per-context `GtpPdpContext::downlink_inner_mtu`, tc
+steers an over-MTU DF downlink IPv4 packet to a dedicated backend-owned queue
+instead of letting the host drop it with its own error. The consumer then
+applies the context's RFC 4459 policy:
 
-The opt-in is a deliberate RFC 4459 tradeoff:
+- **Default** (`GtpuDownlinkInnerMtu::new`): clear DF and fragment the inner
+  packet before encapsulation (RFC 4459 section 3.4). `try_receive_downlink`
+  returns RFC 791 fragments of at most the MTU, with the bearer mark, for the
+  caller to inject toward XFRM; the UE reassembles them. Fragmenting a DF
+  datagram is an owner-approved deviation from RFC 791, RFC 1191 and RFC 6864
+  DF semantics, and the originator's PMTUD never learns the tunnel MTU.
+- **Opt-in** (`GtpuDownlinkInnerMtu::in_tunnel_packet_too_big`): drop the
+  packet and signal it at most once inside the UE's default-bearer uplink
+  G-PDU (RFC 1191). The error's source is the subscriber's own PAA, the only
+  address the PGW's anti-spoofing admits; this departs from RFC 1812 4.3.2.4,
+  and the originator attributes the error to the subscriber.
 
-- The error's source is the subscriber's own PAA. That is the only address
-  the PGW's anti-spoofing admits, but it departs from RFC 1812 4.3.2.4, and
-  the originator attributes the error to the subscriber.
-- The alternatives are to clear the inner DF bit and fragment the inner
-  packet before encryption, or to use MSS clamping with SIP over TCP for
-  large requests.
-
-MTU-bearing contexts must be drained before an SDK downgrade. See
-[control port](docs/control-port.md).
+Inner IPv6 contexts refuse both policies: IPv6 has no in-network
+fragmentation (RFC 8200). MTU-bearing contexts must be drained before an SDK
+downgrade. See [control port](docs/control-port.md).
 
 - `GtpuDataplaneBackend`: async port for device and PDP lifecycle, typed PDP
   readback, classified installation, authority-safe exact removal, and probes.
