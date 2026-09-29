@@ -5297,7 +5297,7 @@ async fn persistent_three_voter_first_transition_has_one_leader_activation_proof
 }
 
 #[cfg(feature = "test-control")]
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 1)]
 async fn persistent_three_voter_consumer_write_does_not_spend_budget_on_a_read_quorum() {
     // An authenticated consumer mutation is linearized by its Raft write. A
     // separate read quorum before that write can consume the entire cellular

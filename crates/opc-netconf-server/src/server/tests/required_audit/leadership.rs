@@ -162,8 +162,15 @@ impl Quorum {
     }
 
     async fn leader_except(&self, excluded: Option<usize>) -> usize {
-        tokio::time::timeout(TRANSITION_TIMEOUT, async {
+        let mut scans = 0_u64;
+        let mut probes = 0_u64;
+        let mut activity_waits = 0_u64;
+        let mut proving = None;
+        let mut observations = [None; 3];
+        let mut outcomes = [None; 3];
+        let result = tokio::time::timeout(TRANSITION_TIMEOUT, async {
             loop {
+                scans = scans.saturating_add(1);
                 // Register before observing status, so a completed RPC between
                 // inspection and awaiting the next engine event is not lost.
                 let activity = self.activity.notified();
@@ -174,20 +181,40 @@ impl Quorum {
                         continue;
                     }
                     let status = store.status();
-                    if status.leader_id == Some(status.node_id)
-                        && matches!(
-                            store.ensure_local_authority().await,
-                            ConfigLocalAuthorityOutcome::LocalAuthority
-                        )
-                    {
-                        return index;
+                    // Cache only existing observations: no additional status
+                    // read, authority probe, wakeup, or payload in diagnostics.
+                    observations[index] = Some((
+                        status.node_id,
+                        status.term,
+                        status.leader_id,
+                        status.applied_index,
+                        status.committed_index,
+                        status.admitted,
+                    ));
+                    if status.leader_id == Some(status.node_id) {
+                        proving = Some(index);
+                        probes = probes.saturating_add(1);
+                        let outcome = store.ensure_local_authority().await;
+                        outcomes[index] = Some(outcome);
+                        proving = None;
+                        if matches!(outcome, ConfigLocalAuthorityOutcome::LocalAuthority) {
+                            return index;
+                        }
                     }
                 }
+                activity_waits = activity_waits.saturating_add(1);
                 activity.await;
             }
         })
-        .await
-        .expect("quorum did not establish fresh local authority")
+        .await;
+        result.unwrap_or_else(|error| {
+            panic!(
+                "quorum did not establish fresh local authority: {error:?}; \
+                 excluded={excluded:?} scans={scans} probes={probes} \
+                 activity_waits={activity_waits} proving={proving:?} \
+                 observations={observations:?} outcomes={outcomes:?}"
+            )
+        })
     }
 
     fn isolate(&self, node: usize) {
@@ -208,6 +235,69 @@ impl Quorum {
         two.unwrap();
         three.unwrap();
     }
+}
+
+fn assert_authority_timeout_observed(
+    result: std::thread::Result<usize>,
+    prefix: &str,
+    first_node: ConfigConsensusNodeId,
+) {
+    let panic = result.expect_err("partitioned voters unexpectedly proved fresh authority");
+    let message = panic
+        .downcast_ref::<String>()
+        .map(String::as_str)
+        .or_else(|| panic.downcast_ref::<&str>().copied())
+        .expect("authority timeout must have a string panic");
+    assert!(
+        message.starts_with(&format!("{prefix}: Elapsed(())")),
+        "expected the original authority timeout, got {message}"
+    );
+    assert!(
+        message.contains("excluded=None"),
+        "missing acquisition phase"
+    );
+    assert!(
+        message.contains(&format!("observations=[Some(({first_node:?},")),
+        "authority timeout lost observed voter state: {message}"
+    );
+    let scans = message
+        .split("scans=")
+        .nth(1)
+        .and_then(|value| value.split_whitespace().next())
+        .and_then(|value| value.parse::<u64>().ok());
+    assert!(
+        scans.is_some_and(|count| count > 0),
+        "missing completed observation"
+    );
+    // Fixed-size status tuples and counters must never expose request payloads
+    // or unbounded error/debug bodies in the timeout report.
+    assert!(
+        message.len() <= 1600,
+        "authority diagnostic exceeded its bound"
+    );
+}
+
+#[tokio::test]
+async fn partitioned_authority_timeout_reports_observed_voter_state() {
+    use futures_util::FutureExt;
+    use std::panic::AssertUnwindSafe;
+
+    let quorum = Quorum::start().await;
+    let first_node = quorum.stores[0].status().node_id;
+    // Cut every real RPC path. The original fresh proof must fail closed under
+    // the original transition deadline, while preserving its last observation.
+    for node in 0..3 {
+        quorum.isolate(node);
+    }
+    let result = AssertUnwindSafe(quorum.leader_except(None))
+        .catch_unwind()
+        .await;
+    quorum.shutdown().await;
+    assert_authority_timeout_observed(
+        result,
+        "quorum did not establish fresh local authority",
+        first_node,
+    );
 }
 
 struct WorkerLifetime(Arc<tokio::sync::Notify>);

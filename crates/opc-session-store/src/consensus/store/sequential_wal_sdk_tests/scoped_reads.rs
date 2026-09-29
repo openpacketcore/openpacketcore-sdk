@@ -1,7 +1,8 @@
 //! Exact expiry and authority boundaries for the optimized scoped read path.
 
+use super::super::scoped_read_diagnostics::{Outcome, Phase, Trace};
 use super::*;
-use crate::SessionConsumerScope;
+use crate::{SessionConsumerScope, StoreError};
 
 #[derive(Debug)]
 struct ReadClock(std::sync::Mutex<crate::Timestamp>);
@@ -43,6 +44,7 @@ async fn expiry_and_authority(native: bool) {
         .peers
         .iter()
         .all(|peer| peer.identity == scope.consensus_identity()));
+    let mut released_reader_trace = None;
     let result = AssertUnwindSafe(async {
         for store in &fleet.stores {
             assert_eq!(
@@ -95,17 +97,19 @@ async fn expiry_and_authority(native: bool) {
                 store.consumer_scope().is_err(),
                 "synchronous scope rediscovery cannot wait for the held test reader"
             );
-            let read = store.consumer_get(
-                scope,
-                &key,
-                tokio::time::Instant::now() + Duration::from_secs(1),
-            );
+            let deadline = tokio::time::Instant::now() + Duration::from_secs(1);
+            let trace = Trace::new(deadline);
+            let read = trace.run(store.consumer_get(scope, &key, deadline));
             tokio::pin!(read);
             assert!(read.as_mut().now_or_never().is_none());
             drop(held);
+            let actual = read.await;
+            // Emit only after the unchanged operation has settled. A diagnostic
+            // cannot turn its error into success or suppress fixture cleanup.
+            trace.emit("released_sql_reader");
+            released_reader_trace = Some(trace.clone());
             assert_eq!(
-                read.await
-                    .expect("admitted scope read after reader release"),
+                actual.expect("admitted scope read after reader release"),
                 Some(encrypted.clone())
             );
         }
@@ -200,6 +204,18 @@ async fn expiry_and_authority(native: bool) {
     }
     drop(fleet.close().await);
     result.unwrap_or_else(|panic| std::panic::resume_unwind(panic));
+    if let Some(trace) = released_reader_trace {
+        let snapshot = trace.snapshot();
+        snapshot.assert_complete();
+        // Assert instrumentation only after every original semantic assertion
+        // and orderly shutdown, including rollback, cold state and quorum loss.
+        snapshot.assert_observed(Phase::ConsumerGet, Outcome::Ready);
+        snapshot.assert_observed(Phase::SqlScopeConnection, Outcome::Ready);
+        snapshot.assert_observed(Phase::SqlScopeGuardAndQuery, Outcome::Ready);
+        snapshot.assert_observed(Phase::DurableScope, Outcome::Ready);
+        snapshot.assert_observed(Phase::LogicalTime, Outcome::Ready);
+        snapshot.assert_observed(Phase::FinalAuthority, Outcome::Ready);
+    }
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -210,4 +226,47 @@ async fn scoped_native_reads_preserve_expiry_rollback_cold_state_and_majority() 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn scoped_sql_reads_preserve_expiry_rollback_cold_state_and_majority() {
     expiry_and_authority(false).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn scoped_sql_reader_timeout_is_attributed_after_orderly_cleanup() {
+    let mut fleet = Fleet::new_with_mode("scoped-read-timeout-diagnostic", false);
+    fleet.open().await;
+    let result = AssertUnwindSafe(async {
+        let store = &fleet.stores[0];
+        let scope = SessionConsumerScope::new(fleet.peers[0].identity);
+        let key = key(0);
+        let held = store.inner.backend.lock_connection_for_test().await;
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(1);
+        let trace = Trace::new(deadline);
+        let actual = {
+            let read = trace.run(store.consumer_get(scope, &key, deadline));
+            tokio::pin!(read);
+            assert!(read.as_mut().now_or_never().is_none());
+            // Deliberately retain the real SQL connection through the original
+            // caller deadline. No injected error, bypass or replacement future.
+            read.await
+        };
+        drop(held);
+        assert!(matches!(actual, Err(StoreError::BackendUnavailable(_))));
+        trace
+    })
+    .catch_unwind()
+    .await;
+    for peer in &fleet.peers {
+        *peer.handler.write().await = None;
+    }
+    drop(fleet.close().await);
+    let trace = result.unwrap_or_else(|panic| std::panic::resume_unwind(panic));
+    trace.emit("held_sql_reader_timeout");
+    let snapshot = trace.snapshot();
+    snapshot.assert_complete();
+    snapshot.assert_observed(Phase::ConsumerGet, Outcome::BackendUnavailable);
+    snapshot.assert_observed(Phase::TopologyGate, Outcome::Ready);
+    snapshot.assert_observed(Phase::SqlScopeConnection, Outcome::Dropped);
+    snapshot.assert_observed(Phase::DurableScope, Outcome::DeadlineElapsed);
+    assert!(!snapshot.has_phase(Phase::SqlScopeGuardAndQuery));
+    assert!(!snapshot.has_phase(Phase::InitialAuthority));
+    assert!(!snapshot.has_phase(Phase::ReadBarrier));
+    assert!(!snapshot.has_phase(Phase::LogicalTime));
 }

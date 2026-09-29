@@ -2,6 +2,7 @@
 
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 
+use crate::collection::RouteSteeringIpFamily;
 use crate::error::RouteSteeringError;
 use crate::model::{FirewallMark, IpPrefix, RouteRequest, RuleRequest};
 
@@ -73,6 +74,19 @@ pub(crate) fn validate_rule_request(request: &RuleRequest) -> Result<(), RouteSt
             return Err(RouteSteeringError::invalid_config(
                 "rule.family",
                 "source and destination selectors must use the same family",
+            ));
+        }
+    }
+    if let (Some(family), Some(prefix)) = (request.family, request.source.or(request.destination)) {
+        let prefix_family = if prefix.is_ipv4() {
+            RouteSteeringIpFamily::Ipv4
+        } else {
+            RouteSteeringIpFamily::Ipv6
+        };
+        if family != prefix_family {
+            return Err(RouteSteeringError::invalid_config(
+                "rule.family",
+                "explicit family conflicts with the selector prefix family",
             ));
         }
     }

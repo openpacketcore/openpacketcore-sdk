@@ -616,6 +616,16 @@ pub enum CauseValue {
     RequestAccepted,
     /// Request accepted partially (17).
     RequestAcceptedPartially,
+    /// New PDN type due to network preference (18).
+    ///
+    /// An acceptance Cause: the PDN connection is established with the PDN
+    /// type the PGW selected, which differs from the requested one.
+    NewPdnTypeDueToNetworkPreference,
+    /// New PDN type due to single address bearer only (19).
+    ///
+    /// An acceptance Cause: the PDN connection is established as a single
+    /// address bearer of the PDN type the PGW selected.
+    NewPdnTypeDueToSingleAddressBearerOnly,
     /// Context not found (64).
     ContextNotFound,
     /// Invalid message format (65).
@@ -693,6 +703,8 @@ impl CauseValue {
             Self::EpsTo5gsMobility => 15,
             Self::RequestAccepted => 16,
             Self::RequestAcceptedPartially => 17,
+            Self::NewPdnTypeDueToNetworkPreference => 18,
+            Self::NewPdnTypeDueToSingleAddressBearerOnly => 19,
             Self::ContextNotFound => 64,
             Self::InvalidMessageFormat => 65,
             Self::InvalidLength => 67,
@@ -726,10 +738,36 @@ impl CauseValue {
         }
     }
 
-    /// Return `true` for Cause values in the acceptance range used here.
+    /// Return `true` for the procedure-generic acceptance Causes 16 and 17.
+    ///
+    /// TS 29.274 Table 8.4-1 also places 18 and 19 in the acceptance range,
+    /// but those values are defined only for PDN connection establishment
+    /// responses. They are deliberately excluded here so bearer and other
+    /// response classifiers keep their strict scope; use
+    /// [`Self::is_create_session_accepted`] for a Create Session Response.
     #[must_use]
     pub const fn is_accepted(self) -> bool {
         matches!(self, Self::RequestAccepted | Self::RequestAcceptedPartially)
+    }
+
+    /// Return `true` for a Create Session Response acceptance Cause.
+    ///
+    /// This is [`Self::is_accepted`] plus the TS 29.274 PDN-type narrowing
+    /// Causes 18 and 19, which establish the session with the PDN type the
+    /// PGW selected.
+    #[must_use]
+    pub const fn is_create_session_accepted(self) -> bool {
+        self.is_accepted() || self.is_new_pdn_type()
+    }
+
+    /// Return `true` when the PGW accepted the session with a different PDN
+    /// type than requested (Cause 18 or 19).
+    #[must_use]
+    pub const fn is_new_pdn_type(self) -> bool {
+        matches!(
+            self,
+            Self::NewPdnTypeDueToNetworkPreference | Self::NewPdnTypeDueToSingleAddressBearerOnly
+        )
     }
 
     /// Return `true` when this is the partial-acceptance Cause.
@@ -759,6 +797,8 @@ impl From<u8> for CauseValue {
             15 => Self::EpsTo5gsMobility,
             16 => Self::RequestAccepted,
             17 => Self::RequestAcceptedPartially,
+            18 => Self::NewPdnTypeDueToNetworkPreference,
+            19 => Self::NewPdnTypeDueToSingleAddressBearerOnly,
             64 => Self::ContextNotFound,
             65 => Self::InvalidMessageFormat,
             67 => Self::InvalidLength,

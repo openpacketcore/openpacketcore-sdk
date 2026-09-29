@@ -10,7 +10,17 @@ use crate::control_port::{
 #[derive(Default)]
 pub(super) struct ControlSocketState {
     socket: Option<crate::GtpuReassemblySocket>,
+    /// Dedicated queue for tc-steered over-MTU G-PDUs; see
+    /// [`opc_gtpu_ebpf_common::GTPU_PACKET_TOO_BIG_QUEUE_PORT`].
+    too_big_socket: Option<crate::GtpuReassemblySocket>,
     retired: bool,
+    /// Value-free counters of this registration's downlink consumer.
+    downlink_counters: crate::GtpuDownlinkCounters,
+    /// Per-registration in-tunnel Packet Too Big rate limit.
+    too_big_limiter: crate::reassembly::PacketTooBigLimiter,
+    /// Per-destination inner fragmentation budgets and Identification
+    /// sequences of this registration.
+    inner_fragment_budget: crate::reassembly::InnerFragmentBudget,
 }
 
 impl ControlSocketState {
@@ -19,9 +29,23 @@ impl ControlSocketState {
         self.socket.is_none()
     }
 
-    fn retire(&mut self) {
+    #[cfg(test)]
+    pub(super) fn with_inner_fragment_limit(limit: crate::GtpuInnerFragmentRateLimit) -> Self {
+        Self {
+            inner_fragment_budget: crate::reassembly::InnerFragmentBudget::new(limit),
+            ..Self::default()
+        }
+    }
+
+    #[cfg(test)]
+    pub(super) fn downlink_counters(&self) -> crate::GtpuDownlinkCounters {
+        self.downlink_counters
+    }
+
+    pub(super) fn retire(&mut self) {
         self.retired = true;
         self.socket = None;
+        self.too_big_socket = None;
     }
 }
 
@@ -44,29 +68,42 @@ impl BackendControlPort {
         &self,
         operation: impl FnOnce(&crate::GtpuReassemblySocket) -> Result<T, GtpuControlPortError>,
     ) -> Result<T, GtpuControlPortError> {
+        self.with_attachment(|_, state, _| {
+            let socket = state
+                .socket
+                .as_ref()
+                .ok_or(GtpuControlPortError::Unavailable)?;
+            operation(socket)
+        })
+    }
+
+    /// Run one operation under this attachment's exclusion with the exact live
+    /// socket state and the attachment's authority scope.
+    ///
+    /// Exclusion is per attachment: the registration's socket slot. PDP
+    /// installs and removals on this or any other attachment never block the
+    /// shared queue, because every authorization reads the commit-last graph
+    /// exactly like tc. Device removal holds this slot across its hook change
+    /// and retires it, and a replaced or fenced registration is detected under
+    /// the slot before anything is received or sent.
+    fn with_attachment<T>(
+        &self,
+        operation: impl FnOnce(
+            &EbpfGtpuDataplaneBackend,
+            &mut ControlSocketState,
+            super::reassembled_downlink::DownlinkAuthorityScope,
+        ) -> Result<T, GtpuControlPortError>,
+    ) -> Result<T, GtpuControlPortError> {
         let unavailable = || GtpuControlPortError::Unavailable;
         let inner = self.backend.upgrade().ok_or_else(unavailable)?;
         let backend = EbpfGtpuDataplaneBackend { inner };
-        let _operation = backend
-            .inner
-            .operation_lock
-            .try_lock()
-            .map_err(|error| match error {
-                std::sync::TryLockError::WouldBlock => GtpuControlPortError::Busy,
-                std::sync::TryLockError::Poisoned(_) => unavailable(),
-            })?;
         let slot = self.socket.upgrade().ok_or_else(unavailable)?;
-        let devices = backend.devices().map_err(|_| unavailable())?;
-        let managed = devices.get(&self.ifindex).ok_or_else(unavailable)?;
-        if !Arc::ptr_eq(&slot, &managed.control_socket)
-            || managed.cleanup_only
-            || managed.successor_pending
-        {
+        let registration = self.current_registration(&backend, &slot);
+        let Some((name, scope)) = registration else {
+            // Lock order is slot before device registry; never hold both here.
             slot.lock().map_err(|_| unavailable())?.retire();
             return Err(unavailable());
-        }
-        let name = managed.name.clone();
-        drop(devices);
+        };
         if backend.inner.runtime.ifindex_by_name(&name).ok() != Some(self.ifindex)
             || !backend
                 .inner
@@ -76,14 +113,45 @@ impl BackendControlPort {
             slot.lock().map_err(|_| unavailable())?.retire();
             return Err(unavailable());
         }
-        let socket = slot.lock().map_err(|_| unavailable())?;
-        if socket.retired {
+        let mut state = slot.lock().map_err(|_| unavailable())?;
+        if state.retired || state.socket.is_none() {
             return Err(unavailable());
         }
-        let socket = socket.socket.as_ref().ok_or_else(unavailable)?;
-        // Keep the mutation guard across the nonblocking syscall: removal may
-        // linearize before or after this operation, never midway through it.
-        operation(socket)
+        // Revalidate under the slot: removal retires it while holding it, so
+        // an operation that passes here linearizes before any removal effect.
+        if self.current_registration(&backend, &slot).is_none() {
+            state.retire();
+            return Err(unavailable());
+        }
+        operation(&backend, &mut state, scope)
+    }
+
+    /// Return the exact live registration for this port, or `None` when the
+    /// attachment was removed, replaced, fenced or is otherwise unusable.
+    fn current_registration(
+        &self,
+        backend: &EbpfGtpuDataplaneBackend,
+        slot: &Arc<SocketSlot>,
+    ) -> Option<(String, super::reassembled_downlink::DownlinkAuthorityScope)> {
+        let devices = backend.devices().ok()?;
+        let managed = devices.get(&self.ifindex)?;
+        if !Arc::ptr_eq(slot, &managed.control_socket)
+            || managed.cleanup_only
+            || managed.successor_pending
+        {
+            return None;
+        }
+        let scope = super::reassembled_downlink::DownlinkAuthorityScope {
+            ifindex: self.ifindex,
+            ordinary_local_ipv4: managed.local_ip,
+            grouped_config: managed.grouped.and_then(|grouped| {
+                grouped_device_config(grouped.device_id, self.ifindex, grouped.local_endpoints)
+            }),
+        };
+        if managed.grouped.is_some() && scope.grouped_config.is_none() {
+            return None;
+        }
+        Some((managed.name.clone(), scope))
     }
 }
 
@@ -101,6 +169,182 @@ impl GtpuControlPort for BackendControlPort {
     ) -> Result<usize, GtpuControlPortError> {
         self.with_socket(|socket| socket.send_control_response(plan))
     }
+
+    fn try_receive_downlink(
+        &self,
+        maximum_bytes: usize,
+    ) -> Result<Option<crate::GtpuDownlinkEvent>, GtpuControlPortError> {
+        self.with_attachment(|backend, state, scope| {
+            let socket = state
+                .socket
+                .as_ref()
+                .ok_or(GtpuControlPortError::Unavailable)?;
+            // The shared queue (Echo, reassembled G-PDUs) is always served
+            // first; tc-steered over-MTU G-PDUs wait in their own queue and can
+            // never delay or crowd it out.
+            let (datagram, steered) = match socket.try_receive_datagram(maximum_bytes)? {
+                Some(datagram) => (datagram, false),
+                None => match state.too_big_socket.as_ref() {
+                    Some(queue) => match queue.try_receive_datagram(maximum_bytes)? {
+                        Some(datagram) => (datagram, true),
+                        None => return Ok(None),
+                    },
+                    None => return Ok(None),
+                },
+            };
+            let processed = super::reassembled_downlink::process_downlink_datagram(
+                backend.inner.runtime.as_ref(),
+                scope,
+                datagram,
+                &mut state.downlink_counters,
+            );
+            let plan = match processed {
+                super::reassembled_downlink::ProcessedDownlink::PacketTooBig(plan) => plan,
+                super::reassembled_downlink::ProcessedDownlink::FragmentInner(plan) => {
+                    return Ok(Some(fragment_inner(state, &plan)));
+                }
+                super::reassembled_downlink::ProcessedDownlink::Event(event) => {
+                    // A steered datagram only ever carries an authorized
+                    // over-MTU packet. If authority changed since tc steered
+                    // it, never expose it as a control or unknown-tunnel
+                    // event bound to the wrong socket.
+                    return Ok(Some(match event {
+                        crate::GtpuDownlinkEvent::Control(_)
+                        | crate::GtpuDownlinkEvent::UnknownTunnel(_)
+                            if steered =>
+                        {
+                            state
+                                .downlink_counters
+                                .record_drop(crate::GtpuDownlinkDrop::StateUnavailable);
+                            crate::GtpuDownlinkEvent::Dropped(
+                                crate::GtpuDownlinkDrop::StateUnavailable,
+                            )
+                        }
+                        event => event,
+                    }));
+                }
+            };
+            // At most one error per offending packet. The never-answer rules
+            // run before a token is taken, so suppressed packets cannot drain
+            // a session's budget. The error is always carried in the UE's
+            // default-bearer uplink G-PDU; nothing is ever sent unencapsulated.
+            let signal = match plan.build_uplink_gpdu() {
+                None => crate::GtpuPacketTooBigSignal::Unsendable,
+                Some(_)
+                    if !state
+                        .too_big_limiter
+                        .admit(plan.session(), std::time::Instant::now()) =>
+                {
+                    crate::GtpuPacketTooBigSignal::RateLimited
+                }
+                Some((gpdu, local, peer)) => {
+                    match socket.send_in_tunnel_error(local, peer, &gpdu) {
+                        Ok(_) => crate::GtpuPacketTooBigSignal::Sent,
+                        Err(_) => crate::GtpuPacketTooBigSignal::Unsendable,
+                    }
+                }
+            };
+            let counters = &mut state.downlink_counters;
+            let slot = match signal {
+                crate::GtpuPacketTooBigSignal::Sent => &mut counters.packet_too_big_signalled,
+                crate::GtpuPacketTooBigSignal::RateLimited => {
+                    &mut counters.packet_too_big_rate_limited
+                }
+                crate::GtpuPacketTooBigSignal::Unsendable => {
+                    &mut counters.packet_too_big_unsendable
+                }
+            };
+            *slot = slot.saturating_add(1);
+            Ok(Some(crate::GtpuDownlinkEvent::PacketTooBig(
+                crate::GtpuDownlinkPacketTooBig::new(
+                    crate::GtpAddressFamily::Ipv4,
+                    plan.mtu(),
+                    signal,
+                ),
+            )))
+        })
+    }
+
+    fn set_packet_too_big_rate_limit(
+        &self,
+        limit: crate::GtpuPacketTooBigRateLimit,
+    ) -> Result<(), GtpuControlPortError> {
+        self.with_attachment(|_, state, _| {
+            state.too_big_limiter = crate::reassembly::PacketTooBigLimiter::new(limit);
+            Ok(())
+        })
+    }
+
+    fn set_inner_fragment_rate_limit(
+        &self,
+        limit: crate::GtpuInnerFragmentRateLimit,
+    ) -> Result<(), GtpuControlPortError> {
+        self.with_attachment(|_, state, _| {
+            state.inner_fragment_budget.set_limit(limit);
+            Ok(())
+        })
+    }
+
+    fn downlink_counters(&self) -> Result<crate::GtpuDownlinkCounters, GtpuControlPortError> {
+        self.with_attachment(|_, state, _| {
+            let mut counters = state.downlink_counters;
+            counters.shared_queue_drops = state
+                .socket
+                .as_ref()
+                .map_or(0, |socket| u64::from(socket.queue_drops()));
+            counters.packet_too_big_queue_drops = state
+                .too_big_socket
+                .as_ref()
+                .map_or(0, |socket| u64::from(socket.queue_drops()));
+            Ok(counters)
+        })
+    }
+}
+
+/// Fragment one authorized over-MTU packet under the default policy, recording
+/// exactly one outcome counter.
+///
+/// The header is validated first, so a malformed or option-bearing packet
+/// takes no token; the destination's budget is taken next, and only then is
+/// an Identification assigned from its sequence (atomic datagrams only).
+pub(super) fn fragment_inner(
+    state: &mut ControlSocketState,
+    plan: &super::reassembled_downlink::InnerFragmentPlan,
+) -> crate::GtpuDownlinkEvent {
+    let drop = |state: &mut ControlSocketState, reason| {
+        state.downlink_counters.record_drop(reason);
+        crate::GtpuDownlinkEvent::Dropped(reason)
+    };
+    let source = match crate::inner_fragment::Ipv4FragmentSource::parse(plan.inner_packet()) {
+        Ok(source) => source,
+        Err(crate::inner_fragment::InnerFragmentRefusal::Options) => {
+            return drop(state, crate::GtpuDownlinkDrop::InnerUnfragmentable);
+        }
+        Err(crate::inner_fragment::InnerFragmentRefusal::Malformed) => {
+            return drop(state, crate::GtpuDownlinkDrop::Malformed);
+        }
+    };
+    let Some(assigned) = state.inner_fragment_budget.admit(
+        plan.destination(),
+        std::time::Instant::now(),
+        source.is_atomic(),
+    ) else {
+        return drop(state, crate::GtpuDownlinkDrop::InnerFragmentRateLimited);
+    };
+    let identification = assigned.unwrap_or_else(|| source.identification());
+    let Some(fragments) = source.fragment(plan.mtu(), identification) else {
+        return drop(state, crate::GtpuDownlinkDrop::Malformed);
+    };
+    let counters = &mut state.downlink_counters;
+    counters.inner_fragmented = counters.inner_fragmented.saturating_add(1);
+    counters.inner_fragments = counters
+        .inner_fragments
+        .saturating_add(u64::try_from(fragments.len()).unwrap_or(u64::MAX));
+    crate::GtpuDownlinkEvent::Fragmented(crate::GtpuFragmentedDownlink::new(
+        fragments,
+        plan.bearer_mark(),
+        plan.mtu(),
+    ))
 }
 
 impl EbpfGtpuDataplaneBackend {
@@ -214,6 +458,16 @@ impl EbpfGtpuDataplaneBackend {
                     .map_err(|error| GtpuError::io("ebpf_control_port_bind", error))?,
             );
         }
+        if socket.too_big_socket.is_none() {
+            // Without this queue, tc-steered over-MTU G-PDUs would be
+            // answered by the kernel with port unreachable; refuse instead.
+            socket.too_big_socket = Some(
+                crate::GtpuReassemblySocket::bind_packet_too_big_queue(local_ip, &device.name)
+                    .map_err(|error| {
+                        GtpuError::io("ebpf_control_port_packet_too_big_bind", error)
+                    })?,
+            );
+        }
         Ok(Arc::new(BackendControlPort {
             backend: Arc::downgrade(&self.inner),
             socket: Arc::downgrade(&slot),
@@ -226,8 +480,12 @@ impl EbpfGtpuDataplaneBackend {
 mod tests {
     use super::*;
 
+    /// PDP churn holds the backend-wide operation lock almost continuously
+    /// after a mass re-attach. The shared queue (Echo, reassembled G-PDUs)
+    /// must neither wait for nor yield to that lock: its exclusion is the
+    /// attachment's own socket slot.
     #[test]
-    fn control_port_does_not_wait_for_a_mutating_writer() {
+    fn control_port_does_not_wait_for_or_yield_to_backend_mutation() {
         let backend = EbpfGtpuDataplaneBackend::new();
         let port = BackendControlPort {
             backend: Arc::downgrade(&backend.inner),
@@ -237,7 +495,8 @@ mod tests {
         let guard = backend.operation_guard().unwrap();
         assert_eq!(
             port.try_receive_datagram(8).unwrap_err(),
-            GtpuControlPortError::Busy
+            GtpuControlPortError::Unavailable,
+            "an unregistered port is unavailable, never Busy behind another mutation"
         );
         drop(guard);
         assert_eq!(
@@ -247,6 +506,35 @@ mod tests {
         drop(backend);
         assert_eq!(
             port.try_receive_datagram(8).unwrap_err(),
+            GtpuControlPortError::Unavailable
+        );
+    }
+
+    #[test]
+    fn downlink_consumer_does_not_yield_to_backend_mutation() {
+        let backend = EbpfGtpuDataplaneBackend::new();
+        let port = BackendControlPort {
+            backend: Arc::downgrade(&backend.inner),
+            socket: Weak::new(),
+            ifindex: 731,
+        };
+        let guard = backend.operation_guard().unwrap();
+        assert_eq!(
+            port.try_receive_downlink(2048).unwrap_err(),
+            GtpuControlPortError::Unavailable
+        );
+        assert_eq!(
+            port.downlink_counters().unwrap_err(),
+            GtpuControlPortError::Unavailable
+        );
+        drop(guard);
+        assert_eq!(
+            port.try_receive_downlink(2048).unwrap_err(),
+            GtpuControlPortError::Unavailable
+        );
+        drop(backend);
+        assert_eq!(
+            port.try_receive_downlink(2048).unwrap_err(),
             GtpuControlPortError::Unavailable
         );
     }
