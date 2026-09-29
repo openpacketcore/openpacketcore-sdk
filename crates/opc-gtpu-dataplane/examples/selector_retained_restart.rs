@@ -125,6 +125,7 @@ mod linux {
                     bearer_mark: None,
                     egress_dscp: None,
                     uplink_source_port_policy: GtpuUplinkSourcePortPolicy::LegacyServicePort,
+                    downlink_inner_mtu: None,
                 },
                 "192.0.2.1".parse()?,
             )?],
