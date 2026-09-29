@@ -259,6 +259,7 @@ fn authoritative_ingress_ifindex(
 fn validate_reassembly_socket_address(
     local: std::net::SocketAddr,
     expected_address: Ipv4Addr,
+    expected_port: u16,
 ) -> std::io::Result<()> {
     if expected_address.is_unspecified() {
         return Err(std::io::Error::new(
@@ -268,7 +269,7 @@ fn validate_reassembly_socket_address(
     }
     match local {
         std::net::SocketAddr::V4(local)
-            if *local.ip() == expected_address && local.port() == GTPU_PORT =>
+            if *local.ip() == expected_address && local.port() == expected_port =>
         {
             Ok(())
         }
@@ -418,6 +419,9 @@ pub struct GtpuReassemblySocket {
     interface_name: std::ffi::OsString,
     ingress_ifindex: u32,
     local_address: Ipv4Addr,
+    port: u16,
+    /// Cumulative kernel receive-queue drops reported by `SO_RXQ_OVFL`.
+    queue_drops: std::sync::atomic::AtomicU32,
 }
 
 #[cfg(target_os = "linux")]
@@ -467,6 +471,30 @@ impl GtpuReassemblySocket {
     /// binding, packet-info setup, or mismatched kernel readback return stable
     /// operation labels without the interface name or address.
     pub fn bind(local_address: Ipv4Addr, interface_name: &str) -> std::io::Result<Self> {
+        Self::bind_on_port(local_address, interface_name, GTPU_PORT)
+    }
+
+    /// Bind the backend-owned queue that receives authorized over-MTU G-PDUs
+    /// steered away from UDP/2152 by tc
+    /// ([`opc_gtpu_ebpf_common::GTPU_PACKET_TOO_BIG_QUEUE_PORT`]). A flood of
+    /// such packets therefore fills only this queue, never the shared queue
+    /// that carries Echo and reassembled G-PDUs.
+    pub(crate) fn bind_packet_too_big_queue(
+        local_address: Ipv4Addr,
+        interface_name: &str,
+    ) -> std::io::Result<Self> {
+        Self::bind_on_port(
+            local_address,
+            interface_name,
+            opc_gtpu_ebpf_common::GTPU_PACKET_TOO_BIG_QUEUE_PORT,
+        )
+    }
+
+    fn bind_on_port(
+        local_address: Ipv4Addr,
+        interface_name: &str,
+        port: u16,
+    ) -> std::io::Result<Self> {
         use nix::sys::socket::{
             bind, getsockopt, setsockopt, socket, sockopt, AddressFamily, SockFlag, SockType,
             SockaddrIn,
@@ -511,7 +539,7 @@ impl GtpuReassemblySocket {
             let error = std::io::Error::from(error);
             std::io::Error::new(error.kind(), "reassembly device binding failed")
         })?;
-        let address = SocketAddrV4::new(local_address, GTPU_PORT);
+        let address = SocketAddrV4::new(local_address, port);
         bind(fd.as_raw_fd(), &SockaddrIn::from(address)).map_err(|error| {
             let error = std::io::Error::from(error);
             std::io::Error::new(error.kind(), "reassembly address binding failed")
@@ -520,12 +548,17 @@ impl GtpuReassemblySocket {
             let error = std::io::Error::from(error);
             std::io::Error::new(error.kind(), "reassembly packet-info setup failed")
         })?;
+        setsockopt(&fd, sockopt::RxqOvfl, &1).map_err(|error| {
+            let error = std::io::Error::from(error);
+            std::io::Error::new(error.kind(), "reassembly queue-drop reporting setup failed")
+        })?;
         let socket = std::net::UdpSocket::from(fd);
         validate_reassembly_socket_address(
             socket.local_addr().map_err(|error| {
                 std::io::Error::new(error.kind(), "reassembly local binding readback failed")
             })?,
             local_address,
+            port,
         )?;
         let observed_name = getsockopt(&socket, sockopt::BindToDevice).map_err(|error| {
             let error = std::io::Error::from(error);
@@ -551,6 +584,8 @@ impl GtpuReassemblySocket {
             interface_name,
             ingress_ifindex,
             local_address,
+            port,
+            queue_drops: std::sync::atomic::AtomicU32::new(0),
         })
     }
 
@@ -606,7 +641,7 @@ impl GtpuReassemblySocket {
         let local = self.socket.local_addr().map_err(|error| {
             std::io::Error::new(error.kind(), "reassembly local binding readback failed")
         })?;
-        validate_reassembly_socket_address(local, self.local_address)?;
+        validate_reassembly_socket_address(local, self.local_address, self.port)?;
         let observed_name = getsockopt(&self.socket, sockopt::BindToDevice).map_err(|error| {
             let error = std::io::Error::from(error);
             std::io::Error::new(error.kind(), "reassembly device readback failed")
@@ -711,6 +746,34 @@ impl GtpuReassemblySocket {
         self.send_control_bytes(plan.peer, &plan.bytes)
     }
 
+    /// Cumulative datagrams the kernel dropped from this socket's receive
+    /// queue before they could be read, as last reported by `SO_RXQ_OVFL`.
+    pub(crate) fn queue_drops(&self) -> u32 {
+        self.queue_drops.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// Internal send path for one in-tunnel error G-PDU, used only by the
+    /// backend-owned downlink consumer under the attachment mutation guard.
+    /// The G-PDU is sent from this socket's exact local UDP/2152 tuple to the
+    /// committed peer's UDP/2152; its payload is already encapsulated.
+    pub(crate) fn send_in_tunnel_error(
+        &self,
+        local: Ipv4Addr,
+        peer: Ipv4Addr,
+        gpdu: &[u8],
+    ) -> Result<usize, crate::control_port::GtpuControlPortError> {
+        use crate::control_port::GtpuControlPortError;
+        if local != self.local_address
+            || self.port != GTPU_PORT
+            || peer.is_unspecified()
+            || peer.is_multicast()
+            || peer.is_broadcast()
+        {
+            return Err(GtpuControlPortError::InvalidTuple);
+        }
+        self.send_control_bytes(std::net::SocketAddrV4::new(peer, GTPU_PORT), gpdu)
+    }
+
     /// Internal send path used only under the backend's retired-source request,
     /// attachment mutation lock and protected namespace effect lease. Public
     /// control responses continue to require their receive-bound affine plan.
@@ -771,7 +834,7 @@ impl GtpuReassemblySocket {
         use std::os::fd::AsRawFd;
 
         self.verify_live_binding()?;
-        let mut cmsg_space = nix::cmsg_space!(nix::libc::in_pktinfo);
+        let mut cmsg_space = nix::cmsg_space!(nix::libc::in_pktinfo, u32);
         let mut iov = [std::io::IoSliceMut::new(buffer)];
         let message = recvmsg::<SockaddrIn>(
             self.socket.as_raw_fd(),
@@ -793,24 +856,27 @@ impl GtpuReassemblySocket {
                 "non-IPv4 datagram source",
             ));
         };
-        let packet_info = message
-            .cmsgs()
-            .map_err(|_| {
-                std::io::Error::new(
-                    std::io::ErrorKind::InvalidData,
-                    "invalid reassembly control-message envelope",
-                )
-            })?
-            .find_map(|control| match control {
-                ControlMessageOwned::Ipv4PacketInfo(info) => Some(info),
-                _ => None,
-            })
-            .ok_or_else(|| {
-                std::io::Error::new(
-                    std::io::ErrorKind::InvalidData,
-                    "missing IP_PKTINFO control message",
-                )
-            })?;
+        let mut packet_info = None;
+        for control in message.cmsgs().map_err(|_| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "invalid reassembly control-message envelope",
+            )
+        })? {
+            match control {
+                ControlMessageOwned::Ipv4PacketInfo(info) => packet_info = Some(info),
+                ControlMessageOwned::RxqOvfl(drops) => self
+                    .queue_drops
+                    .store(drops, std::sync::atomic::Ordering::Relaxed),
+                _ => {}
+            }
+        }
+        let packet_info = packet_info.ok_or_else(|| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "missing IP_PKTINFO control message",
+            )
+        })?;
         let ingress_ifindex =
             authoritative_ingress_ifindex(packet_info.ipi_ifindex, self.ingress_ifindex)?;
         let local = Ipv4Addr::from(u32::from_be(packet_info.ipi_addr.s_addr));
@@ -1126,6 +1192,24 @@ pub struct GtpuDownlinkCounters {
     pub destination_mismatches: u64,
     /// Attachment authority was unavailable when the datagram was processed.
     pub state_unavailable: u64,
+    /// Authorized G-PDUs whose inner packet exceeded the session's downlink
+    /// inner MTU and was not forwarded.
+    pub packet_too_big: u64,
+    /// In-tunnel ICMP errors accepted by the local kernel for the peer.
+    pub packet_too_big_signalled: u64,
+    /// Over-MTU packets dropped without an error by the rate limit.
+    pub packet_too_big_rate_limited: u64,
+    /// Over-MTU packets for which no error may or could be sent: a
+    /// never-answer rule (RFC 1122 3.2.2), no authorized default-bearer
+    /// uplink, or a failed submission.
+    pub packet_too_big_unsendable: u64,
+    /// Cumulative datagrams the kernel dropped from the shared UDP/2152 queue
+    /// before the consumer read them (`SO_RXQ_OVFL`).
+    pub shared_queue_drops: u64,
+    /// Cumulative tc-steered over-MTU G-PDUs the kernel dropped from the
+    /// dedicated packet-too-big queue (`SO_RXQ_OVFL`). This is the hand-off
+    /// overload signal; tc itself keeps no hand-off counter.
+    pub packet_too_big_queue_drops: u64,
 }
 
 impl GtpuDownlinkCounters {
@@ -1205,6 +1289,197 @@ impl GtpuDecapsulatedDownlink {
     }
 }
 
+/// What happened to the single in-tunnel error for one over-MTU packet.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum GtpuPacketTooBigSignal {
+    /// One RFC 1191 error was encapsulated in the default-bearer uplink G-PDU and
+    /// accepted by the local kernel toward the peer (not a delivery receipt).
+    Sent,
+    /// The attachment's error rate limit suppressed the error.
+    RateLimited,
+    /// The error could not be built or submitted; nothing was sent.
+    Unsendable,
+}
+
+/// A downlink inner packet that exceeded its session's inner MTU.
+///
+/// The packet itself is never forwarded or returned. `Debug` exposes only
+/// the family, the MTU (a path property) and the signal outcome.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct GtpuDownlinkPacketTooBig {
+    family: crate::model::GtpAddressFamily,
+    mtu: u16,
+    signal: GtpuPacketTooBigSignal,
+}
+
+impl GtpuDownlinkPacketTooBig {
+    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+    pub(crate) const fn new(
+        family: crate::model::GtpAddressFamily,
+        mtu: u16,
+        signal: GtpuPacketTooBigSignal,
+    ) -> Self {
+        Self {
+            family,
+            mtu,
+            signal,
+        }
+    }
+
+    /// Inner packet family.
+    #[must_use]
+    pub const fn family(&self) -> crate::model::GtpAddressFamily {
+        self.family
+    }
+
+    /// The session's downlink inner MTU that the packet exceeded.
+    #[must_use]
+    pub const fn mtu(&self) -> u16 {
+        self.mtu
+    }
+
+    /// Outcome of the in-tunnel error for this packet.
+    #[must_use]
+    pub const fn signal(&self) -> GtpuPacketTooBigSignal {
+        self.signal
+    }
+}
+
+/// Explicit per-session rate limit for in-tunnel Packet Too Big errors.
+///
+/// Each offending session (its local TEID) has its own token bucket
+/// (RFC 4443 section 2.4 (f)): up to `burst` errors may be sent back to back,
+/// and one token is restored every `refill_interval`. A flood toward one PAA
+/// therefore exhausts only that session's budget, never another
+/// subscriber's. The default is a burst of 16 with one token per 10 ms (100
+/// errors per second per session). At most 4,096 sessions are tracked per
+/// attachment; the least recently used bucket is evicted first.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct GtpuPacketTooBigRateLimit {
+    burst: u32,
+    refill_interval: std::time::Duration,
+}
+
+impl Default for GtpuPacketTooBigRateLimit {
+    fn default() -> Self {
+        Self {
+            burst: 16,
+            refill_interval: std::time::Duration::from_millis(10),
+        }
+    }
+}
+
+impl GtpuPacketTooBigRateLimit {
+    /// Create a limit. A zero burst or zero interval returns `None`.
+    #[must_use]
+    pub fn new(burst: u32, refill_interval: std::time::Duration) -> Option<Self> {
+        (burst != 0 && !refill_interval.is_zero()).then_some(Self {
+            burst,
+            refill_interval,
+        })
+    }
+
+    /// Maximum back-to-back errors.
+    #[must_use]
+    pub const fn burst(&self) -> u32 {
+        self.burst
+    }
+
+    /// Interval restoring one token.
+    #[must_use]
+    pub const fn refill_interval(&self) -> std::time::Duration {
+        self.refill_interval
+    }
+}
+
+/// One token bucket for [`GtpuPacketTooBigRateLimit`].
+#[derive(Debug, Clone, Copy)]
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+struct TokenBucket {
+    tokens: u32,
+    last_refill: std::time::Instant,
+}
+
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+impl TokenBucket {
+    /// Take one token at `now`, refilling whole intervals since the last
+    /// refill. Returns `false` when the bucket is empty.
+    fn admit(&mut self, limit: GtpuPacketTooBigRateLimit, now: std::time::Instant) -> bool {
+        let last = self.last_refill;
+        let elapsed = now.saturating_duration_since(last);
+        let intervals = elapsed.as_nanos() / limit.refill_interval.as_nanos().max(1);
+        if intervals > 0 {
+            let restored = u32::try_from(intervals).unwrap_or(u32::MAX);
+            self.tokens = self.tokens.saturating_add(restored).min(limit.burst);
+            let advanced = limit
+                .refill_interval
+                .checked_mul(restored)
+                .and_then(|advance| last.checked_add(advance));
+            self.last_refill = advanced.unwrap_or(now).min(now);
+        }
+        if self.tokens == 0 {
+            return false;
+        }
+        self.tokens -= 1;
+        true
+    }
+}
+
+/// Maximum sessions whose Packet Too Big budget one attachment tracks.
+const PACKET_TOO_BIG_TRACKED_SESSIONS: usize = 4_096;
+
+/// Per-session token buckets for [`GtpuPacketTooBigRateLimit`].
+#[derive(Debug)]
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+pub(crate) struct PacketTooBigLimiter {
+    limit: GtpuPacketTooBigRateLimit,
+    sessions: std::collections::HashMap<[u8; 4], (TokenBucket, std::time::Instant)>,
+}
+
+impl Default for PacketTooBigLimiter {
+    fn default() -> Self {
+        Self::new(GtpuPacketTooBigRateLimit::default())
+    }
+}
+
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+impl PacketTooBigLimiter {
+    pub(crate) fn new(limit: GtpuPacketTooBigRateLimit) -> Self {
+        Self {
+            limit,
+            sessions: std::collections::HashMap::new(),
+        }
+    }
+
+    /// Take one token from `session`'s bucket at `now`. Returns `false` when
+    /// that session's bucket is empty; other sessions are unaffected.
+    pub(crate) fn admit(&mut self, session: [u8; 4], now: std::time::Instant) -> bool {
+        if !self.sessions.contains_key(&session)
+            && self.sessions.len() >= PACKET_TOO_BIG_TRACKED_SESSIONS
+        {
+            if let Some(oldest) = self
+                .sessions
+                .iter()
+                .min_by_key(|(_, (_, last_use))| *last_use)
+                .map(|(key, _)| *key)
+            {
+                self.sessions.remove(&oldest);
+            }
+        }
+        let limit = self.limit;
+        let (bucket, last_use) = self.sessions.entry(session).or_insert((
+            TokenBucket {
+                tokens: limit.burst,
+                last_refill: now,
+            },
+            now,
+        ));
+        *last_use = now;
+        bucket.admit(limit, now)
+    }
+}
+
 /// One event from a backend-authoritative shared GTP-U receive queue.
 ///
 /// See [`GtpuControlPort::try_receive_downlink`](crate::control_port::GtpuControlPort::try_receive_downlink).
@@ -1225,6 +1500,9 @@ pub enum GtpuDownlinkEvent {
     UnknownTunnel(crate::control_port::GtpuControlDatagram),
     /// Fail-closed drop with a bounded typed reason.
     Dropped(GtpuDownlinkDrop),
+    /// An authorized packet exceeded the session's downlink inner MTU. It was
+    /// not forwarded; at most one in-tunnel error was sent for it.
+    PacketTooBig(GtpuDownlinkPacketTooBig),
 }
 
 /// Post-reassembly downlink consumer: the SDK GTP-U consumer that kernel
@@ -1810,9 +2088,9 @@ mod tests {
         }
 
         let valid = SocketAddr::V4(SocketAddrV4::new(LOCAL, GTPU_PORT));
-        assert!(validate_reassembly_socket_address(valid, LOCAL).is_ok());
+        assert!(validate_reassembly_socket_address(valid, LOCAL, GTPU_PORT).is_ok());
         assert_eq!(
-            validate_reassembly_socket_address(valid, Ipv4Addr::UNSPECIFIED)
+            validate_reassembly_socket_address(valid, Ipv4Addr::UNSPECIFIED, GTPU_PORT)
                 .unwrap_err()
                 .kind(),
             std::io::ErrorKind::InvalidInput
@@ -1823,7 +2101,7 @@ mod tests {
             SocketAddr::V6(SocketAddrV6::new(Ipv6Addr::LOCALHOST, GTPU_PORT, 0, 0)),
         ] {
             assert_eq!(
-                validate_reassembly_socket_address(invalid, LOCAL)
+                validate_reassembly_socket_address(invalid, LOCAL, GTPU_PORT)
                     .unwrap_err()
                     .kind(),
                 std::io::ErrorKind::InvalidData

@@ -189,7 +189,112 @@ validators and the backend's own map reads:
 | `Dropped` | Value-free `GtpuDownlinkDrop`: malformed, binding mismatch, destination mismatch or state unavailable. |
 
 `downlink_counters` returns bounded, value-free counters for the current
-attachment registration. The ordinary legacy socket port keeps the default
+attachment registration.
+
+### Downlink tunnel-MTU enforcement (opt-in)
+
+`GtpPdpContext::downlink_inner_mtu`
+(`GtpuDownlinkInnerMtu::in_tunnel_packet_too_big`) is an explicit per-context
+opt-in. It carries the session's downlink inner MTU: for an ePDG, the SWu
+access MTU minus the negotiated ESP/UDP/IP overhead, at least 576 (RFC 791).
+
+**Storage.** The MTU lives in the previously reserved bytes 66..68 of the
+Active `PdpContextCommit`, so it is published, replaced and read back
+atomically with the rest of the graph. A record without it is byte-identical
+to the original layout. An older SDK does not tolerate a record carrying an MTU: its retained-graph
+recovery rejects the non-canonical commit and refuses the whole attachment
+as indeterminate, not just that context. Before downgrading, drain every
+MTU-bearing context (reinstall it with `None`, or remove it).
+
+**Refusals and capability.** The legacy service-port uplink policy is
+required. Grouped entries refuse the field. The eBPF probe reports
+`downlink_inner_mtu_enforcement`. `Available` covers the datapath only: an
+error is sent only while the application drains this port.
+
+**tc.** When an authorized inner IPv4 packet with Don't Fragment set exceeds
+the MTU, tc does not decapsulate it, so the host never forwards it and never
+emits its own error. tc rewrites only the UDP destination port, with an
+incremental checksum update, to the backend-owned packet-too-big queue on the
+same local address (`GTPU_PACKET_TOO_BIG_QUEUE_PORT`, 2153). Outer fragments
+are reassembled first and arrive on the shared queue.
+
+**Queue priority.** `try_receive_downlink` always serves the shared UDP/2152
+queue first. A backlog of hand-offs therefore cannot delay or crowd out Echo
+or reassembled G-PDUs.
+
+**Signalling.** The G-PDU is re-authorized against the same Active commit and
+`GtpuDownlinkEvent::PacketTooBig` is returned. At most one RFC 792/1191
+Destination Unreachable (Fragmentation Needed) error is sent:
+
+- **Bearer.** The error goes on the UE's default-bearer uplink (mark zero),
+  proven by its own complete Active graph with the UDP/2152 source port. Under
+  TS 23.401 uplink bearer binding, a dedicated bearer's TFT may admit only its
+  media flows. If there is no usable default bearer, nothing is sent.
+- **Addresses.** The source is the session PAA and the destination is the
+  originator. Nothing is ever sent unencapsulated.
+- **Quote.** The invoking IPv4 header plus its first 64 data bits.
+- **Never answered** (RFC 1122 3.2.2), checked before any rate-limit token
+  is taken:
+  - an originator in 0/8, 127/8, 224/4 or 240/4 (including the limited
+    broadcast);
+  - a non-initial fragment;
+  - an ICMP error (types 3, 4, 5, 11 and 12). Informational ICMP, such as
+    Echo, is answered.
+- **Rate limit.** One token bucket per offending session (RFC 4443 2.4 (f)):
+  a burst of 16 with one token per 10 ms by default, set by
+  `set_packet_too_big_rate_limit`. At most 4,096 sessions are tracked per
+  attachment, least recently used first out. A flood toward one PAA exhausts
+  only that session's budget.
+- **Counters.** Value-free counters report too-big, signalled, rate-limited
+  and unsendable packets. `SO_RXQ_OVFL` reports kernel drops from the shared
+  queue and from the packet-too-big queue.
+
+**Limits.**
+
+- tc has no hand-off counter and no in-kernel policer. Either would add a map
+  and change the retained pin inventory and the durable recovery records.
+- A flood toward one PAA can still fill the packet-too-big queue. When it
+  does, the kernel drops further hand-offs from any session, and those drops
+  are counted. It can never affect the shared queue.
+
+**Tradeoff.** The error's source is the subscriber's own address. The ePDG is
+routing, so RFC 1812 4.3.2.4 would have it use its own address, but the PGW's
+per-PDN anti-spoofing admits only the PAA. The originator therefore attributes
+the error to the subscriber. RFC 4459 alternatives are:
+
+- clearing the inner DF bit and fragmenting the inner packet before
+  encryption;
+- MSS clamping plus SIP over TCP for large requests.
+
+This path implements only the in-tunnel error.
+
+**IPv6.** Ordinary inner-IPv6 contexts (#998) are stored as family-tagged
+entries, and those entries have no MTU field, so an opted-in IPv6 context is
+refused with `downlink_inner_mtu_inner_ipv6` rather than installed without
+enforcement. Inner IPv6 Packet Too Big (RFC 4443 / RFC 8201) is a follow-up.
+It needs three pieces:
+- an MTU in the family-tagged entry wire, which is shared with grouped
+  records and the protected selector ledger;
+- the same steering in tc's family-tagged decapsulation;
+- the existing ICMPv6 builder, quoting up to 1,232 octets.
+
+**Native evidence.** The committed classifier is exercised with:
+
+- default, dedicated (answered on the default-bearer uplink) and
+  outer-fragmented oversized DF packets;
+- the exact error bytes, the 28-octet quote and the next-hop MTU;
+- fitting DF packets and oversized non-DF packets, which are forwarded;
+- the per-session rate limit;
+- an Echo served ahead of a 40-packet hand-off backlog;
+- never-answer packets that consume no token;
+- zero plaintext ICMP in the peer and UE namespaces, and an unchanged host
+  `OutDestUnreachs`.
+
+A baseline test pins the unchanged default without the opt-in: the host emits
+its own error, quoting 548 octets toward the core.
+
+Both privileged lanes require `OPC_GTPU_DOWNLINK_PACKET_TOO_BIG_PROVEN` and
+`OPC_GTPU_DOWNLINK_PACKET_TOO_BIG_BASELINE_PROVEN`.
 `Unsupported` result. The consumer does not inject packets, admit peers, rate
 limit, or plan Error Indications. Grouped attachments with an IPv4 outer
 endpoint report `KernelReassemblyHandoff` for outer IPv4 fragments; outer IPv6

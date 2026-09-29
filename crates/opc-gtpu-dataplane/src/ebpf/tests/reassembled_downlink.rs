@@ -4,7 +4,9 @@
 
 use super::*;
 use crate::control_port::GtpuControlDatagram;
-use crate::ebpf::reassembled_downlink::{process_downlink_datagram, DownlinkAuthorityScope};
+use crate::ebpf::reassembled_downlink::{
+    process_downlink_datagram, DownlinkAuthorityScope, ProcessedDownlink,
+};
 use crate::{
     GtpuDownlinkCounters, GtpuDownlinkDrop, GtpuDownlinkEvent,
     GtpuSessionSelectorNamespaceAuthority,
@@ -76,7 +78,19 @@ fn process(
     message: Vec<u8>,
     counters: &mut GtpuDownlinkCounters,
 ) -> GtpuDownlinkEvent {
-    process_downlink_datagram(runtime, scope, datagram_from(message, PEER, 2152), counters)
+    event(process_downlink_datagram(
+        runtime,
+        scope,
+        datagram_from(message, PEER, 2152),
+        counters,
+    ))
+}
+
+fn event(processed: ProcessedDownlink) -> GtpuDownlinkEvent {
+    match processed {
+        ProcessedDownlink::Event(event) => event,
+        ProcessedDownlink::PacketTooBig(_) => panic!("unexpected over-MTU plan"),
+    }
 }
 
 async fn ordinary_fixture(context: GtpPdpContext) -> (EbpfGtpuDataplaneBackend, Arc<FakeRuntime>) {
@@ -312,7 +326,7 @@ async fn marked_owner_journal_is_mandatory() {
 async fn outer_binding_and_inner_destination_are_enforced() {
     let (_backend, runtime) = ordinary_fixture(context()).await;
     let mut counters = GtpuDownlinkCounters::default();
-    let wrong_peer = process_downlink_datagram(
+    let wrong_peer = event(process_downlink_datagram(
         runtime.as_ref(),
         ordinary_scope(),
         datagram_from(
@@ -321,7 +335,7 @@ async fn outer_binding_and_inner_destination_are_enforced() {
             2152,
         ),
         &mut counters,
-    );
+    ));
     assert_eq!(
         expect_drop(wrong_peer),
         GtpuDownlinkDrop::BindingMismatch(DownlinkBindingMismatch::PeerAddress)
@@ -661,6 +675,347 @@ async fn grouped_stale_generation_and_unusable_datapath_fail_closed() {
     );
 }
 
+fn mtu_context(mtu: u16) -> GtpPdpContext {
+    let mut context = context();
+    context.downlink_inner_mtu =
+        Some(crate::GtpuDownlinkInnerMtu::in_tunnel_packet_too_big(mtu).unwrap());
+    context
+}
+
+fn dont_fragment(mut packet: Vec<u8>) -> Vec<u8> {
+    packet[6] |= 0x40;
+    packet
+}
+
+/// A fragmentable (DF clear) inner packet of exactly `total` octets.
+fn sized_inner(total: usize) -> Vec<u8> {
+    let mut packet = inner_ipv4(UE, &vec![0x5a; total - 28]);
+    packet[6] &= !0x40;
+    packet
+}
+
+fn plan(processed: ProcessedDownlink) -> crate::ebpf::reassembled_downlink::PacketTooBigPlan {
+    match processed {
+        ProcessedDownlink::PacketTooBig(plan) => plan,
+        ProcessedDownlink::Event(event) => panic!("expected an over-MTU plan, got {event:?}"),
+    }
+}
+
+#[tokio::test]
+async fn downlink_inner_mtu_is_committed_read_back_replaced_and_cleared() {
+    let (backend, runtime) = ordinary_fixture(mtu_context(1_300)).await;
+    let key = (S2BU_IFINDEX, UE);
+    assert_eq!(&runtime.state().sport[&key][66..], &1_300_u16.to_be_bytes());
+    let selector = crate::PdpContextSelector::LocalTeid(
+        crate::PdpContextLocalTeidSelector::from_context(&mtu_context(1_300)).unwrap(),
+    );
+    assert_eq!(
+        backend.read_pdp_context(selector.clone()).await.unwrap(),
+        crate::PdpContextReadback::Present(mtu_context(1_300))
+    );
+    // Idempotent reinstall, then commit-last replacement of the MTU alone.
+    backend
+        .install_pdp_context(mtu_context(1_300))
+        .await
+        .unwrap();
+    backend
+        .install_pdp_context(mtu_context(1_400))
+        .await
+        .unwrap();
+    assert_eq!(&runtime.state().sport[&key][66..], &1_400_u16.to_be_bytes());
+    assert_eq!(
+        backend.read_pdp_context(selector.clone()).await.unwrap(),
+        crate::PdpContextReadback::Present(mtu_context(1_400))
+    );
+    // Clearing restores the original reserved-zero bytes exactly.
+    backend.install_pdp_context(context()).await.unwrap();
+    assert_eq!(&runtime.state().sport[&key][66..], &[0, 0]);
+    assert_eq!(
+        crate::model::pdp_context_mismatches(&mtu_context(1_300), &context()),
+        vec![crate::PdpContextMismatchField::DownlinkInnerMtu]
+    );
+}
+
+#[tokio::test]
+async fn downlink_inner_mtu_requires_the_service_port_uplink_policy() {
+    let (backend, _runtime) = backend_with_fake();
+    backend.create_device(create_request()).await.unwrap();
+    let mut selected = mtu_context(1_300);
+    selected.uplink_source_port_policy =
+        crate::GtpuUplinkSourcePortPolicy::selected(40_000).unwrap();
+    assert!(matches!(
+        backend.install_pdp_context(selected).await,
+        Err(GtpuError::UnsupportedFeature {
+            feature: "downlink_inner_mtu_with_selected_uplink_source_port"
+        })
+    ));
+    assert!(crate::GtpuDownlinkInnerMtu::in_tunnel_packet_too_big(575).is_none());
+    assert_eq!(
+        crate::GtpuDownlinkInnerMtu::in_tunnel_packet_too_big(576)
+            .unwrap()
+            .get(),
+        576
+    );
+    // The grouped entry ABI carries no MTU, so grouped contexts refuse it.
+    let mut grouped = grouped_v4_entry(0x1100_0001, 0x2100_0001).context().clone();
+    grouped.downlink_inner_mtu = crate::GtpuDownlinkInnerMtu::in_tunnel_packet_too_big(1_300);
+    assert!(GtpuSessionEntry::new(grouped, IpAddr::V4(LOCAL)).is_err());
+}
+
+#[tokio::test]
+async fn only_an_authorized_oversized_dont_fragment_packet_becomes_a_plan() {
+    let (_backend, runtime) = ordinary_fixture(mtu_context(1_300)).await;
+    let mut counters = GtpuDownlinkCounters::default();
+    // Exactly the MTU, and an oversized fragmentable packet, are forwarded.
+    for packet in [dont_fragment(sized_inner(1_300)), sized_inner(1_400)] {
+        assert!(matches!(
+            process(
+                &runtime,
+                ordinary_scope(),
+                gpdu(LOCAL_TEID, &packet),
+                &mut counters
+            ),
+            GtpuDownlinkEvent::Decapsulated(_)
+        ));
+    }
+    let oversized = dont_fragment(sized_inner(1_301));
+    let plan = plan(process_downlink_datagram(
+        runtime.as_ref(),
+        ordinary_scope(),
+        datagram_from(gpdu(LOCAL_TEID, &oversized), PEER, 2152),
+        &mut counters,
+    ));
+    assert_eq!(plan.mtu(), 1_300);
+    assert_eq!(plan.session(), LOCAL_TEID.to_be_bytes());
+    let (_, local, peer) = plan.build_uplink_gpdu().unwrap();
+    assert_eq!((local, peer), (LOCAL, PEER));
+    assert_eq!(counters.packet_too_big, 1);
+    assert_eq!(counters.decapsulated, 2);
+    // An unauthorized oversized packet is never a plan.
+    assert!(matches!(
+        event(process_downlink_datagram(
+            runtime.as_ref(),
+            ordinary_scope(),
+            datagram_from(
+                gpdu(LOCAL_TEID, &oversized),
+                Ipv4Addr::new(192, 0, 2, 11),
+                2152
+            ),
+            &mut counters,
+        )),
+        GtpuDownlinkEvent::Dropped(GtpuDownlinkDrop::BindingMismatch(_))
+    ));
+    // A session without an MTU forwards the same packet.
+    let (_backend, runtime) = ordinary_fixture(context()).await;
+    assert!(matches!(
+        process(
+            &runtime,
+            ordinary_scope(),
+            gpdu(LOCAL_TEID, &oversized),
+            &mut counters
+        ),
+        GtpuDownlinkEvent::Decapsulated(_)
+    ));
+}
+
+#[tokio::test]
+async fn in_tunnel_error_matches_an_independent_rfc_1191_literal() {
+    let (_backend, runtime) = ordinary_fixture(mtu_context(1_300)).await;
+    let oversized = dont_fragment(sized_inner(1_400));
+    let mut counters = GtpuDownlinkCounters::default();
+    let gpdu_bytes = plan(process_downlink_datagram(
+        runtime.as_ref(),
+        ordinary_scope(),
+        datagram_from(gpdu(LOCAL_TEID, &oversized), PEER, 2152),
+        &mut counters,
+    ))
+    .build_uplink_gpdu()
+    .unwrap()
+    .0;
+    // G-PDU header: v1/PT, T-PDU, length 56, the default bearer's peer TEID.
+    let mut expected = vec![0x30, 0xff, 0x00, 0x38, 0x20, 0x00, 0x00, 0x01];
+    // IPv4: 56 octets, TTL 64, ICMP, from the UE PAA to the originator.
+    let mut ip = vec![
+        0x45, 0x00, 0x00, 0x38, 0, 0, 0, 0, 64, 1, 0, 0, 10, 45, 0, 2, 8, 8, 8, 8,
+    ];
+    let checksum = opc_gtpu_ebpf_common::internet_checksum(&ip);
+    ip[10..12].copy_from_slice(&checksum.to_be_bytes());
+    // ICMP type 3 code 4, next-hop MTU 1300, then exactly 28 quoted octets.
+    let mut icmp = vec![3, 4, 0, 0, 0, 0, 0x05, 0x14];
+    icmp.extend_from_slice(&oversized[..28]);
+    let checksum = opc_gtpu_ebpf_common::internet_checksum(&icmp);
+    icmp[2..4].copy_from_slice(&checksum.to_be_bytes());
+    expected.extend_from_slice(&ip);
+    expected.extend_from_slice(&icmp);
+    assert_eq!(gpdu_bytes, expected);
+    assert!(
+        !gpdu_bytes.windows(8).any(|window| window == [0x5a; 8]),
+        "no application payload beyond the RFC 792 64 bits is quoted"
+    );
+}
+
+fn oversized_plan(
+    runtime: &FakeRuntime,
+    teid: u32,
+    packet: &[u8],
+) -> crate::ebpf::reassembled_downlink::PacketTooBigPlan {
+    let mut counters = GtpuDownlinkCounters::default();
+    plan(process_downlink_datagram(
+        runtime,
+        ordinary_scope(),
+        datagram_from(gpdu(teid, packet), PEER, 2152),
+        &mut counters,
+    ))
+}
+
+/// Replace the invoking packet's originator (its source) and protocol.
+fn from_originator(originator: [u8; 4], protocol: u8, icmp_type: u8) -> Vec<u8> {
+    let mut packet = dont_fragment(sized_inner(1_400));
+    packet[12..16].copy_from_slice(&originator);
+    packet[9] = protocol;
+    packet[20] = icmp_type;
+    packet
+}
+
+#[tokio::test]
+async fn rfc_1122_never_answer_rules_apply_to_each_class() {
+    let (_backend, runtime) = ordinary_fixture(mtu_context(1_300)).await;
+    // Originators that do not identify one host.
+    for originator in [
+        [0, 0, 0, 0],
+        [0, 1, 2, 3],
+        [127, 0, 0, 1],
+        [224, 0, 0, 1],
+        [239, 255, 255, 255],
+        [240, 0, 0, 1],
+        [255, 255, 255, 255],
+    ] {
+        let plan = oversized_plan(&runtime, LOCAL_TEID, &from_originator(originator, 17, 0));
+        assert!(
+            plan.build_uplink_gpdu().is_none(),
+            "originator {originator:?} must not be answered"
+        );
+    }
+    // Every ICMP error type is never answered (RFC 1122 3.2.2 / RFC 792).
+    for icmp_type in [3, 4, 5, 11, 12] {
+        let plan = oversized_plan(
+            &runtime,
+            LOCAL_TEID,
+            &from_originator([8, 8, 8, 8], 1, icmp_type),
+        );
+        assert!(plan.build_uplink_gpdu().is_none(), "ICMP type {icmp_type}");
+    }
+    // Informational ICMP (an oversized DF Echo Request) is answered.
+    for icmp_type in [0, 8, 13] {
+        let plan = oversized_plan(
+            &runtime,
+            LOCAL_TEID,
+            &from_originator([8, 8, 8, 8], 1, icmp_type),
+        );
+        assert!(plan.build_uplink_gpdu().is_some(), "ICMP type {icmp_type}");
+    }
+    // A non-initial fragment is never answered.
+    let mut non_initial = dont_fragment(sized_inner(1_400));
+    non_initial[7] = 1;
+    assert!(oversized_plan(&runtime, LOCAL_TEID, &non_initial)
+        .build_uplink_gpdu()
+        .is_none());
+    // An ordinary unicast originator is answered.
+    assert!(
+        oversized_plan(&runtime, LOCAL_TEID, &from_originator([8, 8, 8, 8], 17, 0))
+            .build_uplink_gpdu()
+            .is_some()
+    );
+}
+
+#[tokio::test]
+async fn dedicated_bearer_errors_use_the_default_bearer_uplink() {
+    let mut dedicated = marked_context(0x0001_0001, 0x1000_0002, 0x2000_0002);
+    dedicated.downlink_inner_mtu = crate::GtpuDownlinkInnerMtu::in_tunnel_packet_too_big(1_300);
+    let (backend, runtime) = ordinary_fixture(dedicated).await;
+    let packet = dont_fragment(sized_inner(1_400));
+    // Only a dedicated bearer: there is no default-bearer uplink to use.
+    let plan = oversized_plan(&runtime, 0x1000_0002, &packet);
+    assert_eq!(plan.session(), 0x1000_0002_u32.to_be_bytes());
+    assert!(plan.build_uplink_gpdu().is_none());
+    // With the default bearer installed, the error rides its uplink TEID.
+    backend.install_pdp_context(context()).await.unwrap();
+    let (gpdu, local, peer) = oversized_plan(&runtime, 0x1000_0002, &packet)
+        .build_uplink_gpdu()
+        .unwrap();
+    assert_eq!((local, peer), (LOCAL, PEER));
+    assert_eq!(&gpdu[4..8], &0x2000_0001_u32.to_be_bytes());
+    // A transitional default commit is not a usable route.
+    {
+        let mut state = runtime.state();
+        let key = (S2BU_IFINDEX, UE);
+        let commit = PdpContextCommit::decode(&state.sport[&key]);
+        state.sport.insert(
+            key,
+            commit.with_phase(MarkedBearerOwnerPhase::Pending).encode(),
+        );
+    }
+    assert!(oversized_plan(&runtime, 0x1000_0002, &packet)
+        .build_uplink_gpdu()
+        .is_none());
+}
+
+#[test]
+fn packet_too_big_limiter_is_an_exact_per_session_token_bucket() {
+    use crate::reassembly::PacketTooBigLimiter;
+    use std::time::Instant;
+    assert!(crate::GtpuPacketTooBigRateLimit::new(0, Duration::from_secs(1)).is_none());
+    assert!(crate::GtpuPacketTooBigRateLimit::new(1, Duration::ZERO).is_none());
+    let limit = crate::GtpuPacketTooBigRateLimit::new(2, Duration::from_millis(100)).unwrap();
+    let mut limiter = PacketTooBigLimiter::new(limit);
+    let (a, b) = ([0, 0, 0, 1], [0, 0, 0, 2]);
+    let start = Instant::now();
+    assert!(limiter.admit(a, start));
+    assert!(limiter.admit(a, start));
+    assert!(!limiter.admit(a, start));
+    // Exhausting one session never limits another.
+    assert!(limiter.admit(b, start));
+    assert!(limiter.admit(b, start));
+    assert!(!limiter.admit(b, start));
+    assert!(!limiter.admit(a, start + Duration::from_millis(99)));
+    assert!(limiter.admit(a, start + Duration::from_millis(100)));
+    assert!(!limiter.admit(a, start + Duration::from_millis(150)));
+    // A long idle period refills to the burst, never beyond it.
+    let later = start + Duration::from_secs(60);
+    assert!(limiter.admit(a, later));
+    assert!(limiter.admit(a, later));
+    assert!(!limiter.admit(a, later));
+    // The table is bounded; the least recently used session is evicted.
+    let mut limiter = PacketTooBigLimiter::new(limit);
+    for index in 0..4_097_u32 {
+        let now = start + Duration::from_micros(u64::from(index));
+        assert!(limiter.admit(index.to_be_bytes(), now));
+    }
+    let default = crate::GtpuPacketTooBigRateLimit::default();
+    assert_eq!(
+        (default.burst(), default.refill_interval()),
+        (16, Duration::from_millis(10))
+    );
+}
+
+#[tokio::test]
+async fn backends_without_enforcement_refuse_a_downlink_inner_mtu() {
+    let mock = crate::MockGtpuDataplaneBackend::new();
+    assert_eq!(
+        crate::GtpuDataplaneBackend::probe(&mock)
+            .await
+            .unwrap()
+            .downlink_inner_mtu_enforcement,
+        crate::GtpuCapability::Missing
+    );
+    assert!(matches!(
+        crate::GtpuDataplaneBackend::install_pdp_context(&mock, mtu_context(1_300)).await,
+        Err(GtpuError::UnsupportedFeature {
+            feature: "downlink_inner_mtu"
+        })
+    ));
+}
+
 fn ordinary_ipv6_context() -> GtpPdpContext {
     GtpPdpContext {
         ms_address: IpAddr::V6("2001:db8:45:1::".parse().unwrap()),
@@ -736,4 +1091,21 @@ async fn ordinary_inner_ipv6_context_decapsulates_through_its_family_authority()
         GtpuDownlinkDrop::Malformed
     );
     assert_eq!(counters.decapsulated, 2);
+}
+
+/// The family-tagged entry that carries an ordinary inner-IPv6 context has
+/// no downlink inner MTU field, so an opted-in IPv6 context must be refused
+/// explicitly rather than installed without enforcement.
+#[tokio::test]
+async fn ordinary_inner_ipv6_context_refuses_the_in_tunnel_packet_too_big_opt_in() {
+    let (backend, runtime) = ordinary_fixture(context()).await;
+    let mut ipv6 = ordinary_ipv6_context();
+    ipv6.downlink_inner_mtu = crate::GtpuDownlinkInnerMtu::in_tunnel_packet_too_big(1_300);
+    assert!(matches!(
+        backend.install_pdp_context(ipv6).await,
+        Err(GtpuError::UnsupportedFeature {
+            feature: "downlink_inner_mtu_inner_ipv6"
+        })
+    ));
+    assert!(runtime.state().session_downlink_index.is_empty());
 }

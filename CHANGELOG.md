@@ -68,6 +68,41 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- `opc-gtpu-dataplane` / `opc-gtpu-dataplane-ebpf`: opt-in downlink tunnel-MTU
+  enforcement with an in-tunnel RFC 1191 error. Refs #1002.
+  - **Opt-in.** `GtpPdpContext::downlink_inner_mtu` is a new field and is
+    source-breaking; `None` keeps today's behaviour. It is set with
+    `GtpuDownlinkInnerMtu::in_tunnel_packet_too_big(mtu)`, where the MTU is
+    at least 576.
+  - **Storage and downgrade.** The MTU is stored in the formerly reserved
+    bytes of the Active commit record; records without it are byte-identical.
+    An older SDK's recovery refuses an attachment holding any MTU record, so
+    drain those contexts before downgrading.
+  - **tc steering.** tc does not decapsulate an authorized over-MTU DF IPv4
+    packet. It rewrites the packet's UDP destination port to a dedicated
+    backend-owned queue (2153), so hand-offs never fill the UDP/2152 queue
+    used by Echo.
+  - **Consumer.** `try_receive_downlink` serves UDP/2152 first. It returns
+    `GtpuDownlinkEvent::PacketTooBig` and sends at most one Fragmentation
+    Needed on the UE's default-bearer uplink, from the PAA to the originator,
+    quoting the header plus 64 bits.
+  - **Never answered** (RFC 1122 3.2.2), checked before any rate-limit
+    token: 0/8, 127/8, 224/4 and 240/4 originators, non-initial fragments
+    and ICMP errors.
+  - **Rate limit and counters.** Per-session token buckets
+    (`set_packet_too_big_rate_limit`) with value-free counters, including
+    `SO_RXQ_OVFL` queue-drop counts.
+  - **Not provided.** tc has no hand-off counter or policer, because either
+    would change the map ABI.
+  - **Evidence.** The baseline test (the RED on `main`) shows the host
+    emitting a plaintext Fragmentation Needed toward the core, quoting 548
+    octets. The opt-in test shows exactly one well-formed in-tunnel error
+    and no host ICMP. It also covers per-session limiting and Echo served
+    ahead of a hand-off backlog.
+  - **IPv6.** An opted-in ordinary inner-IPv6 context is refused
+    (`downlink_inner_mtu_inner_ipv6`). Inner IPv6 Packet Too Big is a
+    follow-up, because it needs an MTU in the family-tagged entry wire.
+
 - `opc-gtpu-dataplane`: backend-authoritative post-reassembly downlink
   consumer. `GtpuControlPort::try_receive_downlink` receives one datagram from
   the eBPF attachment's backend-owned UDP/2152 queue and, under the same

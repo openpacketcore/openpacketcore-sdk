@@ -113,11 +113,12 @@ pub use model::{
     DrainedV2TeardownProgress, DrainedV2TeardownRefusal, DrainedV2TeardownRequest,
     EbpfDatapathGeneration, EbpfHistoricalDatapathGeneration, GtpAddressFamily, GtpBearerMark,
     GtpDevice, GtpPdpContext, GtpRole, GtpVersion, GtpuBackendKind, GtpuCapability,
-    GtpuDownlinkEndpoint, GtpuDownlinkFragmentContract, GtpuIpFamilyCapabilities,
-    GtpuLocalEndpointSet, GtpuOuterFragmentPolicy, GtpuProbe, GtpuReassemblyBounds,
-    GtpuSessionAttachmentSelector, GtpuSessionDeviceId, GtpuSessionEntry, GtpuSessionGroup,
-    GtpuSessionGroupConflict, GtpuSessionGroupId, GtpuSessionGroupIndeterminateReason,
-    GtpuSessionGroupReadback, GtpuSessionGroupReconcileOutcome, GtpuSessionGroupReconcileRequest,
+    GtpuDownlinkEndpoint, GtpuDownlinkFragmentContract, GtpuDownlinkInnerMtu,
+    GtpuIpFamilyCapabilities, GtpuLocalEndpointSet, GtpuOuterFragmentPolicy, GtpuProbe,
+    GtpuReassemblyBounds, GtpuSessionAttachmentSelector, GtpuSessionDeviceId, GtpuSessionEntry,
+    GtpuSessionGroup, GtpuSessionGroupConflict, GtpuSessionGroupId,
+    GtpuSessionGroupIndeterminateReason, GtpuSessionGroupReadback,
+    GtpuSessionGroupReconcileOutcome, GtpuSessionGroupReconcileRequest,
     GtpuSessionGroupRemovalOutcome, GtpuSessionGroupSelector, GtpuSessionModelError,
     GtpuSessionPaa, GtpuSessionSelectorProvenance, GtpuSessionSelectorReuseEvidence,
     GtpuSessionSelectorReuseProof, GtpuSourcePortPolicy, GtpuSourcePortRange,
@@ -175,7 +176,8 @@ pub use reassembly::{
 };
 pub use reassembly::{
     reassembly_commit_authorizes_graph, DownlinkOuterProvenance, GtpuDecapsulatedDownlink,
-    GtpuDownlinkCounters, GtpuDownlinkDrop, GtpuDownlinkEvent, GtpuReassemblyConsumer,
+    GtpuDownlinkCounters, GtpuDownlinkDrop, GtpuDownlinkEvent, GtpuDownlinkPacketTooBig,
+    GtpuPacketTooBigRateLimit, GtpuPacketTooBigSignal, GtpuReassemblyConsumer,
     GtpuReassemblyCounters, GtpuReassemblyDrop, GtpuReassemblyGraphIdentity, GtpuReassemblyOutcome,
     GtpuReassemblyPdr, GtpuReassemblySelector,
 };
@@ -246,6 +248,7 @@ mod integration_tests {
             bearer_mark: None,
             egress_dscp: None,
             uplink_source_port_policy: GtpuUplinkSourcePortPolicy::LegacyServicePort,
+            downlink_inner_mtu: None,
         }
     }
 

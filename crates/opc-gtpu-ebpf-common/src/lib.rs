@@ -94,6 +94,15 @@ pub use trusted_traffic_observation_abi::{
 
 /// GTP-U UDP port (TS 29.281 §4.4.2).
 pub const GTPU_UDP_PORT: u16 = 2152;
+/// Local UDP port of the backend-owned queue that receives authorized
+/// over-MTU downlink G-PDUs.
+///
+/// tc rewrites only the destination port of such a G-PDU (with an exact
+/// incremental checksum update) instead of decapsulating it. The packet stays
+/// addressed to the concrete local S2b-U endpoint, so a flood of over-MTU
+/// packets fills this dedicated socket queue and never the shared UDP/2152
+/// queue that carries Echo and reassembled G-PDUs.
+pub const GTPU_PACKET_TOO_BIG_QUEUE_PORT: u16 = 2153;
 
 /// Ethernet header length on the attach interface.
 pub const ETH_HDR_LEN: usize = 14;
@@ -213,11 +222,17 @@ pub const UPLINK_SOURCE_PORT_POLICY_LEN: usize = 2;
 /// source-port map.
 ///
 /// The record extends the existing 64-byte marked-owner journal with the
-/// canonical two-byte source-port policy and two reserved bytes. Keeping the
+/// canonical two-byte source-port policy and the optional two-byte downlink
+/// inner MTU (zero when unset). Keeping the
 /// complete FAR, binding, DSCP, local TEID, phase, and source-port policy in
 /// one atomically replaced value gives both tc directions one coherent commit
 /// authority.
 pub const UPLINK_SOURCE_PORT_VALUE_LEN: usize = 68;
+/// Smallest configurable downlink inner MTU carried by a commit record.
+///
+/// RFC 791 requires every IPv4 host to accept 576-octet datagrams, so a
+/// smaller per-session tunnel MTU is not a usable IPv4 path and is refused.
+pub const DOWNLINK_INNER_MTU_MIN: u16 = 576;
 
 /// Reserved impossible UE-PAA key carrying durable DSCP-schema evidence in
 /// the existing uplink FAR map.
@@ -1571,13 +1586,21 @@ impl MarkedBearerOwner {
 ///
 /// The first 64 bytes intentionally reuse the canonical
 /// [`MarkedBearerOwner`] encoding. Bytes 64..66 contain the explicit big-endian
-/// source port (including legacy 2152); bytes 66..68 are reserved zero. This is
-/// an additive v4-map ABI: pre-v4 pin sets have no source-port maps and are
-/// materialized from their already validated graph before v4 is committed.
+/// source port (including legacy 2152). Bytes 66..68 contain the optional
+/// big-endian downlink inner MTU: zero means unset, otherwise it is at least
+/// [`DOWNLINK_INNER_MTU_MIN`]. Records without an MTU are byte-identical to the
+/// original v4 layout, whose bytes 66..68 were reserved zero, so retained
+/// graphs keep their exact values. An older SDK's retained-graph recovery
+/// rejects a record carrying an MTU and refuses the whole attachment as
+/// indeterminate, so MTU-bearing contexts must be drained (reinstalled
+/// without an MTU, or removed) before a downgrade. This is an additive
+/// v4-map ABI: pre-v4 pin sets have no source-port maps and are materialized
+/// from their already validated graph before v4 is committed.
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub struct PdpContextCommit {
     owner: MarkedBearerOwner,
     uplink_source_port_policy: GtpuUplinkSourcePortPolicy,
+    downlink_inner_mtu: u16,
     format_valid: bool,
 }
 
@@ -1590,9 +1613,15 @@ impl core::fmt::Debug for PdpContextCommit {
             .field("phase", &self.phase())
             .field("downlink_binding", &"<redacted>")
             .field("uplink_source_port_policy", &"<redacted>")
+            .field("downlink_inner_mtu_set", &(self.downlink_inner_mtu != 0))
             .field("format_valid", &self.format_valid)
             .finish()
     }
+}
+
+#[inline(always)]
+const fn downlink_inner_mtu_wire_is_valid(mtu: u16) -> bool {
+    mtu == 0 || mtu >= DOWNLINK_INNER_MTU_MIN
 }
 
 impl PdpContextCommit {
@@ -1616,9 +1645,30 @@ impl PdpContextCommit {
                 phase,
             ),
             uplink_source_port_policy,
+            downlink_inner_mtu: 0,
             format_valid: true,
         };
         value.is_valid().then_some(value)
+    }
+
+    /// Return this record with an optional downlink inner MTU.
+    ///
+    /// `None` clears it. A value below [`DOWNLINK_INNER_MTU_MIN`] or a
+    /// malformed record returns `None`.
+    #[must_use]
+    pub fn with_downlink_inner_mtu(self, mtu: Option<core::num::NonZeroU16>) -> Option<Self> {
+        let downlink_inner_mtu = mtu.map_or(0, core::num::NonZeroU16::get);
+        let value = Self {
+            downlink_inner_mtu,
+            ..self
+        };
+        (self.is_valid() && value.is_valid()).then_some(value)
+    }
+
+    /// Return the optional downlink inner MTU owned by this transaction.
+    #[must_use]
+    pub const fn downlink_inner_mtu(self) -> Option<core::num::NonZeroU16> {
+        core::num::NonZeroU16::new(self.downlink_inner_mtu)
     }
 
     /// Return this record with a different durable transaction phase.
@@ -1634,6 +1684,7 @@ impl PdpContextCommit {
                 phase,
             ),
             uplink_source_port_policy: self.uplink_source_port_policy,
+            downlink_inner_mtu: self.downlink_inner_mtu,
             // A phase transition must never normalize malformed decoded
             // state into a record that can later become authoritative.
             format_valid,
@@ -1694,6 +1745,7 @@ impl PdpContextCommit {
         self.format_valid
             && self.owner.is_valid()
             && self.uplink_source_port_policy.map_value().is_some()
+            && downlink_inner_mtu_wire_is_valid(self.downlink_inner_mtu)
     }
 
     /// Return whether this Active record matches a complete live default graph.
@@ -1729,6 +1781,9 @@ impl PdpContextCommit {
         }
         encoded[64] = policy[0];
         encoded[65] = policy[1];
+        let mtu = self.downlink_inner_mtu.to_be_bytes();
+        encoded[66] = mtu[0];
+        encoded[67] = mtu[1];
         encoded
     }
 
@@ -1746,10 +1801,12 @@ impl PdpContextCommit {
                 Some(policy) => (policy, true),
                 None => (GtpuUplinkSourcePortPolicy::LegacyServicePort, false),
             };
+        let downlink_inner_mtu = u16::from_be_bytes([value[66], value[67]]);
         Self {
             owner: MarkedBearerOwner::decode(&owner),
             uplink_source_port_policy,
-            format_valid: policy_valid && value[66] == 0 && value[67] == 0,
+            downlink_inner_mtu,
+            format_valid: policy_valid && downlink_inner_mtu_wire_is_valid(downlink_inner_mtu),
         }
     }
 }
@@ -1783,7 +1840,35 @@ fn pdp_commit_wire_is_valid(value: &[u8; UPLINK_SOURCE_PORT_VALUE_LEN]) -> bool 
     if !bearer_owner_ipv4_wire_is_valid(value) {
         return false;
     }
-    wire_u16(value, 64) != 0 && value[66] == 0 && value[67] == 0
+    wire_u16(value, 64) != 0 && downlink_inner_mtu_wire_is_valid(wire_u16(value, 66))
+}
+
+/// Return the optional downlink inner MTU of an encoded commit record, or
+/// zero when unset.
+///
+/// Callers must first authorize the record with
+/// [`pdp_commit_wire_authorizes_downlink`]; this accessor only reads the
+/// already validated field.
+#[must_use]
+#[inline(always)]
+pub fn pdp_commit_wire_downlink_inner_mtu(value: &[u8; UPLINK_SOURCE_PORT_VALUE_LEN]) -> u16 {
+    wire_u16(value, 66)
+}
+
+/// Return whether a downlink inner IPv4 packet exceeds the session's tunnel
+/// MTU with Don't Fragment set, so it must be signalled rather than
+/// forwarded (RFC 1191).
+///
+/// `mtu == 0` (unset) never signals. An IPv4 packet without DF is
+/// fragmentable and is never signalled.
+#[must_use]
+#[inline(always)]
+pub const fn downlink_ipv4_requires_packet_too_big(
+    mtu: u16,
+    total_length: u16,
+    flags_fragment: u16,
+) -> bool {
+    mtu != 0 && total_length > mtu && flags_fragment & 0x4000 != 0
 }
 
 /// Return the committed UDP source port when an encoded Active record
@@ -2662,6 +2747,88 @@ mod tests {
                 .is_valid(),
             "a phase change must preserve malformed owner evidence"
         );
+    }
+
+    #[test]
+    fn pdp_commit_carries_optional_downlink_inner_mtu_in_former_reserved_bytes() {
+        let commit = canonical_commit(MarkedBearerOwnerPhase::Active);
+        // Unset is byte-identical to the original v4 layout.
+        assert_eq!(commit.downlink_inner_mtu(), None);
+        assert_eq!(&commit.encode()[66..], &[0, 0]);
+        assert_eq!(
+            commit.with_downlink_inner_mtu(None),
+            Some(commit),
+            "clearing an unset MTU is the identity"
+        );
+
+        let mtu = core::num::NonZeroU16::new(1_300).unwrap();
+        let with_mtu = commit.with_downlink_inner_mtu(Some(mtu)).unwrap();
+        let encoded = with_mtu.encode();
+        assert_eq!(&encoded[..66], &commit.encode()[..66]);
+        assert_eq!(&encoded[66..], &1_300_u16.to_be_bytes());
+        assert_eq!(PdpContextCommit::decode(&encoded), with_mtu);
+        assert_eq!(pdp_commit_wire_downlink_inner_mtu(&encoded), 1_300);
+        assert_ne!(with_mtu, commit, "the MTU is part of the exact record");
+        assert_eq!(
+            with_mtu
+                .with_phase(MarkedBearerOwnerPhase::Pending)
+                .downlink_inner_mtu(),
+            Some(mtu),
+            "a phase change preserves the MTU"
+        );
+        let owner = with_mtu.marked_owner();
+        let binding = owner.downlink_binding.encode();
+        assert_eq!(owner, commit.marked_owner());
+        assert!(pdp_commit_wire_authorizes_downlink(
+            &encoded,
+            owner.local_teid,
+            &binding
+        ));
+        assert_eq!(
+            pdp_commit_wire_authorized_source_port(&encoded, &owner.uplink_far, 46),
+            Some(40_000)
+        );
+        assert!(pdp_commit_wire_authorizes_graph(
+            &encoded,
+            owner.local_teid,
+            &owner.uplink_far,
+            46,
+            &binding,
+        ));
+
+        // Below the RFC 791 floor is never canonical, in either direction.
+        let minimum = core::num::NonZeroU16::new(DOWNLINK_INNER_MTU_MIN).unwrap();
+        assert!(commit.with_downlink_inner_mtu(Some(minimum)).is_some());
+        let below = core::num::NonZeroU16::new(DOWNLINK_INNER_MTU_MIN - 1).unwrap();
+        assert_eq!(commit.with_downlink_inner_mtu(Some(below)), None);
+        let mut malformed = encoded;
+        malformed[66..].copy_from_slice(&(DOWNLINK_INNER_MTU_MIN - 1).to_be_bytes());
+        assert!(!PdpContextCommit::decode(&malformed).is_valid());
+        assert!(!pdp_commit_wire_authorizes_downlink(
+            &malformed,
+            owner.local_teid,
+            &binding
+        ));
+    }
+
+    #[test]
+    fn downlink_packet_too_big_requires_set_mtu_excess_and_dont_fragment() {
+        // (mtu, total length, flags/fragment offset, signal)
+        for (mtu, total, flags, expected) in [
+            (0, 1_400, 0x4000, false),
+            (1_300, 1_300, 0x4000, false),
+            (1_300, 1_301, 0x4000, true),
+            (1_300, 1_400, 0x0000, false),
+            (1_300, 1_400, 0x2000, false),
+            (1_300, 1_400, 0x6000, true),
+            (1_300, u16::MAX, 0x4000, true),
+        ] {
+            assert_eq!(
+                downlink_ipv4_requires_packet_too_big(mtu, total, flags),
+                expected,
+                "mtu {mtu} total {total} flags {flags:#06x}"
+            );
+        }
     }
 
     #[test]

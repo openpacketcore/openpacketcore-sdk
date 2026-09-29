@@ -42,12 +42,16 @@
 
 #![cfg(target_os = "linux")]
 
+#[path = "ebpf_gtpu_privileged/backend_packet_too_big.rs"]
+mod backend_packet_too_big;
 #[path = "ebpf_gtpu_privileged/backend_reassembly.rs"]
 mod backend_reassembly;
 #[path = "ebpf_gtpu_privileged/n3_end_marker.rs"]
 mod n3_end_marker;
 #[path = "ebpf_gtpu_privileged/n3_fixed_flow.rs"]
 mod n3_fixed_flow;
+#[path = "ebpf_gtpu_privileged/packet_too_big_baseline.rs"]
+mod packet_too_big_baseline;
 
 use std::cell::RefCell;
 use std::env;
@@ -2062,6 +2066,7 @@ fn session_context(link_ifindex: u32) -> GtpPdpContext {
         bearer_mark: None,
         egress_dscp: None,
         uplink_source_port_policy: GtpuUplinkSourcePortPolicy::LegacyServicePort,
+        downlink_inner_mtu: None,
     }
 }
 
@@ -2122,6 +2127,7 @@ fn grouped_entry(
             bearer_mark: None,
             egress_dscp: None,
             uplink_source_port_policy: GtpuUplinkSourcePortPolicy::LegacyServicePort,
+            downlink_inner_mtu: None,
         },
         local_outer,
     )
@@ -9081,6 +9087,20 @@ async fn ebpf_gtpu_downlink_outer_fragments_reenter_sdk_consumer_exactly_once(
 async fn ebpf_gtpu_backend_consumer_decapsulates_outer_fragmented_downlink(
 ) -> Result<(), Box<dyn std::error::Error>> {
     backend_reassembly::qualify_ordinary().await
+}
+
+#[tokio::test]
+#[ignore = "requires root (CAP_BPF/CAP_NET_ADMIN), a fresh netns, and bpffs"]
+async fn ebpf_gtpu_downlink_packet_too_big_is_signalled_in_tunnel(
+) -> Result<(), Box<dyn std::error::Error>> {
+    backend_packet_too_big::qualify().await
+}
+
+#[tokio::test]
+#[ignore = "requires root (CAP_BPF/CAP_NET_ADMIN), a fresh netns, and bpffs"]
+async fn ebpf_gtpu_downlink_packet_too_big_baseline_without_opt_in(
+) -> Result<(), Box<dyn std::error::Error>> {
+    packet_too_big_baseline::qualify().await
 }
 
 #[tokio::test]

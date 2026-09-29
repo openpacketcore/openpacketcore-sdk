@@ -95,6 +95,21 @@ pub trait GtpuControlPort: fmt::Debug + Send + Sync {
     fn downlink_counters(&self) -> Result<crate::GtpuDownlinkCounters, GtpuControlPortError> {
         Err(GtpuControlPortError::Unsupported)
     }
+
+    /// Replace the per-session in-tunnel Packet Too Big rate limit applied by
+    /// this attachment registration (see [`crate::GtpuPacketTooBigRateLimit`]);
+    /// every session's bucket restarts full.
+    ///
+    /// # Errors
+    /// Returns [`GtpuControlPortError::Unsupported`] for ports without a
+    /// backend-authoritative consumer, or `Unavailable`/`Busy`.
+    fn set_packet_too_big_rate_limit(
+        &self,
+        limit: crate::GtpuPacketTooBigRateLimit,
+    ) -> Result<(), GtpuControlPortError> {
+        let _ = limit;
+        Err(GtpuControlPortError::Unsupported)
+    }
 }
 
 /// Stable failures without peer, packet, tunnel or deployment values.

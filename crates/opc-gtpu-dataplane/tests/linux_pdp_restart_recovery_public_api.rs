@@ -90,6 +90,7 @@ fn linux_pdp_restart_recovery_request_is_redaction_safe() {
             egress_dscp: None,
             uplink_source_port_policy:
                 opc_gtpu_dataplane::GtpuUplinkSourcePortPolicy::LegacyServicePort,
+            downlink_inner_mtu: None,
         },
         PdpRestartRecoveryProof::previous_writer_stopped(),
     );
