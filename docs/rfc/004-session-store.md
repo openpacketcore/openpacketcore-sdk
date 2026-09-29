@@ -1801,6 +1801,14 @@ creates nor substitutes for this durable recovery boundary, and MUST NOT fall
 back to V1. A legacy protection wrapper without that journal, an older binary,
 and raw V1 transport MUST fail closed for the V2 history path.
 
+The #982 `SessionConsumerPreparedFencedTransitionV2Backend` composes only the
+existing `/2` capability, history-state, singleton-transition, and status
+operations over an opaque exact roster whose every voter proved
+`FencedTransitionV2Capability::V2`. It adds no wire operation, and its
+caller-stable `FencedTransitionRequestId` never crosses the wire. Its
+durable recovery boundary is the separate caller-keyed
+`FencedTransitionV2RecoveryJournal` described in §14.1.
+
 The first authorized transition after that unanimous proof carries the scope
 identity and canonical voter-set commitment inside its same single user command
 and application position. Apply atomically installs its receipt/effects, the
@@ -2181,6 +2189,39 @@ is proof that a delayed mutation cannot commit. A terminal receipt is cached
 locally. Restart recovery returns only the status-only
 `SessionConsumerRecoveredFencedTransitionStatus` handle; it deliberately has
 no execute authority, even if the recovered token is otherwise valid.
+
+`SessionConsumerPreparedFencedTransitionV2Backend` (#982) is the protected
+consumer facade for #702's epoch-fenced V2 protocol. It has the V1 facade's
+exact-roster activation, canonical routing, affine execute handle,
+receipt-only restart recovery, and single-seal journal discipline, with these
+differences. The caller supplies the same `FencedTransitionRequest`, whose
+16-byte ID is the caller-stable recovery identity. The facade MUST name an
+active epoch from a linearized V2 history state it observed; callers never
+choose an epoch or a nonce. It MAY reuse that observation across preparations
+because epochs only advance: a request whose epoch has since closed is
+rejected without binding, and that rejection MUST invalidate the reused
+state. A reused state that records no active epoch or a full one MUST NOT be
+used. It seals once, builds the sealed V2 request, and
+MUST durably bind caller ID to that complete request in the SDK-owned
+`FencedTransitionV2RecoveryJournal` before returning a dispatchable handle.
+Execution and status MUST dispatch only that authenticated journaled request.
+`recover_fenced_transition_status` MUST NOT require the plaintext body.
+
+The recovery journal holds at most 4,096 live rows. That count is an
+authenticated admission fence, not an absorbing lifetime: a row is removed by
+exact compare-and-delete only after a proven all-voter pre-dispatch failure, a
+definitive unbound rejection, a caller `release_resolved` on a handle that
+observed a resolution, or a bounded `reclaim_resolved_fenced_transitions`
+sweep. The sweep removes rows at or below the retired floor, or whose fresh
+exact status is `Expired`, `Retired`, `HistoryFull`, `RetentionExhausted`,
+or `EpochNotActive` below the active epoch. It MUST retain `Recorded`,
+`NotFound`, and `RequestConflict` rows. `NotFound` stays non-exclusionary.
+Epoch rotation and retired-floor advancement remain the state process's
+local-leader `ConsensusSessionStore::maintain_fenced_transition_v2_history`
+authority; the facade observes it and adds no maintenance authority.
+`with_legacy_v1_recovery` composes a consumed V1 facade so retained V1 rows
+stay status-recoverable and V2 preparation rejects their IDs. The
+session-store atomic-transition document defines the complete contract.
 
 Journal provisioning and reopening are distinct. A deployment MUST call
 `PreparedFencedTransitionJournal::create_new` exactly once for a missing path

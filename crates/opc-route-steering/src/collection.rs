@@ -525,18 +525,11 @@ fn validate_same_priority_rule_siblings(rules: &[RuleRequest]) -> Result<(), Rou
 }
 
 pub(crate) fn rule_is_ipv4(rule: &RuleRequest) -> bool {
-    rule.source
-        .or(rule.destination)
-        .map(IpPrefix::is_ipv4)
-        .unwrap_or(true)
+    rule_family(rule) == RouteSteeringIpFamily::Ipv4
 }
 
 pub(crate) fn rule_family(rule: &RuleRequest) -> RouteSteeringIpFamily {
-    if rule_is_ipv4(rule) {
-        RouteSteeringIpFamily::Ipv4
-    } else {
-        RouteSteeringIpFamily::Ipv6
-    }
+    rule.effective_family()
 }
 
 fn prefix_family(prefix: IpPrefix) -> RouteSteeringIpFamily {
@@ -575,6 +568,7 @@ fn prefix_range(prefix: IpPrefix) -> (u128, u128) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::model::FirewallMark;
     use std::net::{IpAddr, Ipv4Addr};
 
     fn source_rule(host: u8) -> RuleRequest {
@@ -587,6 +581,7 @@ mod tests {
             fwmark: None,
             table: 1000,
             priority: 900,
+            family: None,
         }
     }
 
@@ -620,5 +615,31 @@ mod tests {
         assert!(
             OwnedRouteRuleSet::new(scope(), Vec::new(), vec![source_rule(10), marked]).is_err()
         );
+    }
+
+    #[test]
+    fn owned_scope_selects_mark_only_rules_by_explicit_family() {
+        let mark_only = |family| RuleRequest {
+            source: None,
+            destination: None,
+            fwmark: Some(FirewallMark {
+                value: 0x40,
+                mask: 0xff,
+            }),
+            table: 1000,
+            priority: 900,
+            family,
+        };
+        let ipv4 =
+            OwnedRouteRuleScope::new(RouteSteeringIpFamily::Ipv4, 1000, 42, None, 900).unwrap();
+        let ipv6 =
+            OwnedRouteRuleScope::new(RouteSteeringIpFamily::Ipv6, 1000, 42, None, 900).unwrap();
+        let implicit = mark_only(None);
+        let explicit_ipv6 = mark_only(Some(RouteSteeringIpFamily::Ipv6));
+        assert!(ipv4.contains_rule(&implicit));
+        assert!(!ipv6.contains_rule(&implicit));
+        assert!(ipv6.contains_rule(&explicit_ipv6));
+        assert!(!ipv4.contains_rule(&explicit_ipv6));
+        assert!(OwnedRouteRuleSet::new(ipv6, Vec::new(), vec![explicit_ipv6]).is_ok());
     }
 }

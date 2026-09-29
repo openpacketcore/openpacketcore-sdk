@@ -6,10 +6,12 @@
 //! it can turn the typed [`GtpuPmtuSignal`] into a wire packet toward the
 //! inner source here: RFC 792 type 3 code 4 with the RFC 1191 next-hop MTU
 //! for IPv4, or RFC 8200 section 5 / RFC 8201 type 2 for IPv6. The eBPF tc
-//! backend deliberately does not use this helper: its reject path is a
-//! silent, counted drop, and operators of that backend must size the inner
-//! MTU out of band (for example MSS clamping) unless they run a host
-//! component that consumes the signal.
+//! uplink reject path deliberately does not use this helper: it is a silent,
+//! counted drop, and operators of that backend must size the inner MTU out
+//! of band (for example MSS clamping) unless they run a host component that
+//! consumes the signal. The eBPF backend's downlink tunnel-MTU enforcement
+//! uses the IPv4 builder for its opt-in in-tunnel RFC 1191 error; see
+//! [`GtpPdpContext::downlink_inner_mtu`](crate::GtpPdpContext::downlink_inner_mtu).
 
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 

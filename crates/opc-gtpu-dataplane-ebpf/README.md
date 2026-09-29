@@ -34,12 +34,25 @@ The crate exposes tc entry points, not a Rust library API:
   outer peer/local endpoint, UDP source-port policy, and inner destination may
   decapsulate. The program strips the proven outer envelope, writes the
   dedicated-bearer mark (or zero), and continues through the ePDG's XFRM
-  output policy. A true grouped-index miss alone may enter the legacy IPv4
-  PDR/commit path. Legacy outer-IPv4 fragments retain the bounded
-  kernel-reassembly handoff. Grouped outer-IPv4 and outer-IPv6 packets
-  requiring reassembly pass to the host, but the backend reports both
-  per-family grouped fragment capabilities as unsupported because the current
-  consumer cannot authorize the grouped graph. A bounded IPv6 extension walk
+  output policy. On the legacy path, an authorized inner IPv4 packet with
+  Don't Fragment set that exceeds the Active commit's optional downlink inner
+  MTU is not decapsulated. tc rewrites only its UDP destination port (with an
+  incremental checksum update) to the backend-owned packet-too-big queue
+  (`GTPU_PACKET_TOO_BIG_QUEUE_PORT`, 2153). Its consumer fragments the inner
+  packet by default, or sends at most one in-tunnel RFC 1191 error when the
+  session opted in; tc reads only the MTU bits and steers identically under
+  both policies. A hand-off flood therefore never fills the shared UDP/2152
+  queue. tc steers whether or not the queue is bound. While it is not, the
+  kernel may answer with rate-limited ICMP Port Unreachable toward the peer
+  (#1019). tc keeps no hand-off counter: adding a counter or policing map
+  would change the retained pin inventory and durable recovery records. A true
+  grouped-index miss alone may enter the legacy IPv4 PDR/commit path.
+  Outer-IPv4 fragments, legacy or grouped, retain the bounded
+  kernel-reassembly handoff; the backend-owned consumer
+  (`GtpuControlPort::try_receive_downlink`) authorizes the reassembled G-PDU
+  against the same grouped and legacy state. Grouped outer-IPv6 packets
+  requiring reassembly pass to the host, and the backend reports that
+  capability as unsupported because no IPv6 consumer exists. A bounded IPv6 extension walk
   accepts canonical Hop-by-Hop, Destination Options,
   Routing-with-zero-Segments-Left, and atomic Fragment headers. AH, ESP, active
   routing, discard-required options, non-atomic fragments, or chains outside

@@ -165,7 +165,8 @@ failures and must cover at least these rules:
   applicability decisions explicit. PCO/APCO, Recovery, MEI, and Indication
   use their existing typed codecs rather than parallel containers.
 - Create Session Response must include Cause, PGW S2b control F-TEID instance
-  1/interface type 32, and Bearer Context for accepted responses (Cause 16/17).
+  1/interface type 32, and Bearer Context for accepted responses (Cause 16/17,
+  and the PDN-type narrowing Causes 18/19 of TS 29.274 Table 8.4-1).
   The control endpoint requires a non-zero TEID and at least one address;
   instance-0 Sender F-TEID is unexpected on this S2b response profile and is
   discarded. Rejected responses may expose Cause-only summaries. The explicit

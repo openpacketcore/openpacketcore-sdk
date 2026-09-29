@@ -90,6 +90,7 @@ mod integration_tests {
             }),
             table: 100,
             priority: 1000,
+            family: None,
         };
 
         backend.install_route(route.clone()).await.unwrap();

@@ -69,35 +69,226 @@ impl fmt::Debug for TftUplinkBearer {
     }
 }
 
+/// Prefix length of the IPv6 PAA owned by one PDN connection.
+///
+/// TS 23.401 clause 5.3.1.2.2 and TS 23.402 clause 4.7 assign one `/64`
+/// prefix per PDN connection; the UE selects its own interface identifier and
+/// may use RFC 8981 temporary addresses inside that prefix.
+pub const TFT_UPLINK_IPV6_PAA_PREFIX_LEN: u8 = 64;
+
+/// Typed subscriber PAA set owned by one shared-SA TFT classifier.
+///
+/// The set holds at most one IPv4 `/32` address and at most one canonical
+/// IPv6 `/64` prefix, so an IPv4v6 PDN connection is one set and one
+/// classifier. Each family is represented by one typed slot, so a duplicate
+/// family cannot be represented. IPv6 input is canonicalized by clearing the
+/// interface identifier. Unspecified, loopback, multicast, IPv4 broadcast, and
+/// zero-prefix values are rejected. Formatting redacts every address.
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
+pub struct TftUplinkPaaSet {
+    ipv4: Option<Ipv4Addr>,
+    ipv6_prefix: Option<Ipv6Addr>,
+}
+
+impl TftUplinkPaaSet {
+    /// Build an IPv4-only PAA set.
+    pub fn new_ipv4(address: Ipv4Addr) -> Result<Self, GtpuError> {
+        Ok(Self {
+            ipv4: Some(validate_ipv4_paa(address)?),
+            ipv6_prefix: None,
+        })
+    }
+
+    /// Build an IPv6-only PAA set from any address inside the assigned `/64`.
+    pub fn new_ipv6(address: Ipv6Addr) -> Result<Self, GtpuError> {
+        Ok(Self {
+            ipv4: None,
+            ipv6_prefix: Some(canonical_ipv6_paa_prefix(address)?),
+        })
+    }
+
+    /// Build an IPv4v6 PAA set.
+    pub fn new_dual(ipv4: Ipv4Addr, ipv6: Ipv6Addr) -> Result<Self, GtpuError> {
+        Ok(Self {
+            ipv4: Some(validate_ipv4_paa(ipv4)?),
+            ipv6_prefix: Some(canonical_ipv6_paa_prefix(ipv6)?),
+        })
+    }
+
+    /// Build a single-family PAA set from one address.
+    pub fn from_address(address: IpAddr) -> Result<Self, GtpuError> {
+        match address {
+            IpAddr::V4(address) => Self::new_ipv4(address),
+            IpAddr::V6(address) => Self::new_ipv6(address),
+        }
+    }
+
+    /// Build a PAA set from one or two addresses of distinct families.
+    ///
+    /// An empty input, more than two addresses, or two addresses of the same
+    /// family are rejected.
+    pub fn from_addresses(addresses: &[IpAddr]) -> Result<Self, GtpuError> {
+        let mut set = Self {
+            ipv4: None,
+            ipv6_prefix: None,
+        };
+        if addresses.is_empty() {
+            return Err(GtpuError::invalid_config(
+                "tft_uplink_classifier.paa",
+                "at least one PAA is required",
+            ));
+        }
+        for address in addresses {
+            let duplicate = match *address {
+                IpAddr::V4(address) => set.ipv4.replace(validate_ipv4_paa(address)?).is_some(),
+                IpAddr::V6(address) => set
+                    .ipv6_prefix
+                    .replace(canonical_ipv6_paa_prefix(address)?)
+                    .is_some(),
+            };
+            if duplicate {
+                return Err(GtpuError::invalid_config(
+                    "tft_uplink_classifier.paa",
+                    "at most one PAA per address family is permitted",
+                ));
+            }
+        }
+        Ok(set)
+    }
+
+    /// IPv4 PAA, if the set owns the IPv4 family.
+    #[must_use]
+    pub const fn ipv4(&self) -> Option<Ipv4Addr> {
+        self.ipv4
+    }
+
+    /// Canonical IPv6 `/64` prefix address (interface identifier zero), if
+    /// the set owns the IPv6 family.
+    #[must_use]
+    pub const fn ipv6_prefix(&self) -> Option<Ipv6Addr> {
+        self.ipv6_prefix
+    }
+
+    /// Return whether both address families are owned.
+    #[must_use]
+    pub const fn is_dual_stack(&self) -> bool {
+        self.ipv4.is_some() && self.ipv6_prefix.is_some()
+    }
+
+    /// Primary identity: the IPv4 PAA when present, otherwise the canonical
+    /// IPv6 prefix address.
+    #[must_use]
+    pub fn primary(&self) -> IpAddr {
+        match (self.ipv4, self.ipv6_prefix) {
+            (Some(ipv4), _) => IpAddr::V4(ipv4),
+            (None, Some(prefix)) => IpAddr::V6(prefix),
+            // Every constructor populates at least one family.
+            (None, None) => IpAddr::V4(Ipv4Addr::UNSPECIFIED),
+        }
+    }
+
+    /// Return whether `address` is the IPv4 PAA or lies inside the IPv6 `/64`.
+    #[must_use]
+    pub fn contains(&self, address: IpAddr) -> bool {
+        match address {
+            IpAddr::V4(address) => self.ipv4 == Some(address),
+            IpAddr::V6(address) => self
+                .ipv6_prefix
+                .is_some_and(|prefix| ipv6_slash_64(address) == prefix),
+        }
+    }
+
+    /// Return whether both sets own at least one common address.
+    #[must_use]
+    pub fn overlaps(&self, other: &Self) -> bool {
+        (self.ipv4.is_some() && self.ipv4 == other.ipv4)
+            || (self.ipv6_prefix.is_some() && self.ipv6_prefix == other.ipv6_prefix)
+    }
+}
+
+impl fmt::Debug for TftUplinkPaaSet {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("TftUplinkPaaSet")
+            .field("ipv4", &self.ipv4.map(|_| "<redacted>"))
+            .field("ipv6_prefix", &self.ipv6_prefix.map(|_| "<redacted>/64"))
+            .finish()
+    }
+}
+
+fn validate_ipv4_paa(address: Ipv4Addr) -> Result<Ipv4Addr, GtpuError> {
+    if address.is_unspecified()
+        || address.is_loopback()
+        || address.is_multicast()
+        || address.is_broadcast()
+    {
+        return Err(GtpuError::invalid_config(
+            "tft_uplink_classifier.paa",
+            "IPv4 PAA must be a unicast subscriber address",
+        ));
+    }
+    Ok(address)
+}
+
+fn ipv6_slash_64(address: Ipv6Addr) -> Ipv6Addr {
+    let mut octets = address.octets();
+    octets[8..].fill(0);
+    Ipv6Addr::from(octets)
+}
+
+fn canonical_ipv6_paa_prefix(address: Ipv6Addr) -> Result<Ipv6Addr, GtpuError> {
+    let prefix = ipv6_slash_64(address);
+    if address.is_unspecified()
+        || address.is_loopback()
+        || address.is_multicast()
+        || prefix.is_unspecified()
+    {
+        return Err(GtpuError::invalid_config(
+            "tft_uplink_classifier.paa",
+            "IPv6 PAA must be a unicast subscriber /64 prefix",
+        ));
+    }
+    Ok(prefix)
+}
+
 /// Exact desired classifier for a single shared-PAA attachment.
 #[derive(Clone, PartialEq, Eq)]
 pub struct TftUplinkClassifier {
     link_ifindex: u32,
-    paa: IpAddr,
+    paas: TftUplinkPaaSet,
     bearers: Vec<TftUplinkBearer>,
 }
 
 impl TftUplinkClassifier {
-    /// Validate one complete classifier snapshot.
+    /// Validate one complete single-family classifier snapshot.
     ///
-    /// A packet is considered uplink only when its inner source equals `paa`.
-    /// At most one unfiltered bearer may exist; it is the ETSI fallback. If it
-    /// is absent and no TFT matches, the packet is discarded.
+    /// This is [`Self::with_paa_set`] with [`TftUplinkPaaSet::from_address`].
+    /// An IPv4 `paa` must equal the packet's inner source. An IPv6 `paa` may
+    /// be any address inside the assigned `/64`; it is canonicalized and the
+    /// classifier owns every source inside that prefix.
     pub fn new(
         link_ifindex: u32,
         paa: IpAddr,
+        bearers: Vec<TftUplinkBearer>,
+    ) -> Result<Self, GtpuError> {
+        Self::with_paa_set(link_ifindex, TftUplinkPaaSet::from_address(paa)?, bearers)
+    }
+
+    /// Validate one complete classifier snapshot for a typed PAA set.
+    ///
+    /// A packet is considered uplink only when its inner source is the IPv4
+    /// PAA or lies inside the IPv6 `/64`. An IPv4v6 PDN connection uses one
+    /// classifier whose TFTs apply to both families. At most one unfiltered
+    /// bearer may exist; it is the ETSI fallback. If it is absent and no TFT
+    /// matches, the packet is discarded.
+    pub fn with_paa_set(
+        link_ifindex: u32,
+        paas: TftUplinkPaaSet,
         bearers: Vec<TftUplinkBearer>,
     ) -> Result<Self, GtpuError> {
         if link_ifindex == 0 {
             return Err(GtpuError::invalid_config(
                 "tft_uplink_classifier.link_ifindex",
                 "ifindex must be nonzero",
-            ));
-        }
-        if paa.is_unspecified() {
-            return Err(GtpuError::invalid_config(
-                "tft_uplink_classifier.paa",
-                "PAA must not be unspecified",
             ));
         }
         if bearers.is_empty() {
@@ -149,7 +340,7 @@ impl TftUplinkClassifier {
         canonical_bearers.extend(dedicated);
         Ok(Self {
             link_ifindex,
-            paa,
+            paas,
             bearers: canonical_bearers,
         })
     }
@@ -160,10 +351,20 @@ impl TftUplinkClassifier {
         self.link_ifindex
     }
 
-    /// Shared subscriber PAA. This value is redacted in diagnostics.
+    /// Primary shared subscriber PAA. This value is redacted in diagnostics.
+    ///
+    /// This is [`TftUplinkPaaSet::primary`]: the IPv4 PAA when present,
+    /// otherwise the canonical IPv6 `/64` prefix address with a zero
+    /// interface identifier. Use [`Self::paa_set`] for the complete set.
     #[must_use]
-    pub const fn paa(&self) -> IpAddr {
-        self.paa
+    pub fn paa(&self) -> IpAddr {
+        self.paas.primary()
+    }
+
+    /// Complete typed PAA set owned by this classifier.
+    #[must_use]
+    pub const fn paa_set(&self) -> TftUplinkPaaSet {
+        self.paas
     }
 
     /// Ordered configured bearer snapshots.
@@ -182,7 +383,7 @@ impl TftUplinkClassifier {
             Ok(parsed) => parsed,
             Err(reason) => return TftUplinkClassification::Drop(reason),
         };
-        if parsed.local != self.paa {
+        if !self.paas.contains(parsed.local) {
             return TftUplinkClassification::Drop(TftUplinkDropReason::PaaMismatch);
         }
 
@@ -229,7 +430,8 @@ impl fmt::Debug for TftUplinkClassifier {
 pub enum TftUplinkDropReason {
     /// The input was malformed, truncated, fragmented, or unsafe to parse.
     MalformedOrUnsupportedPacket,
-    /// The packet's source does not equal the owned shared PAA.
+    /// The packet's source is neither the owned IPv4 PAA nor inside the owned
+    /// IPv6 `/64` prefix.
     PaaMismatch,
     /// No filter matched and there is no unfiltered/default bearer.
     NoMatch,
@@ -1177,6 +1379,187 @@ mod tests {
             esp_classifier.classify(&esp),
             TftUplinkClassification::Selected(GtpBearerMark::new(13))
         );
+    }
+
+    const PREFIX: [u8; 8] = [0x20, 0x01, 0x0d, 0xb8, 0x00, 0x0a, 0x00, 0x01];
+
+    fn in_prefix(interface_id: [u8; 8]) -> [u8; 16] {
+        let mut address = [0_u8; 16];
+        address[..8].copy_from_slice(&PREFIX);
+        address[8..].copy_from_slice(&interface_id);
+        address
+    }
+
+    fn voice_bearers() -> Vec<TftUplinkBearer> {
+        vec![
+            TftUplinkBearer::default_bearer(),
+            dedicated(21, 5, vec![PacketFilterComponent::SingleRemotePort(5060)]),
+        ]
+    }
+
+    #[test]
+    fn ipv6_paa_matches_every_address_inside_its_slash_64() {
+        let assigned = in_prefix([0, 0, 0, 0, 0, 0, 0, 0x10]);
+        let classifier =
+            TftUplinkClassifier::new(7, IpAddr::V6(Ipv6Addr::from(assigned)), voice_bearers())
+                .unwrap();
+        let remote = [0x20, 1, 0xd, 0xb8, 0xff, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 5];
+        // RFC 8981 temporary address inside the same prefix.
+        let temporary = in_prefix([0x3c, 0x91, 0x7e, 0x02, 0xa4, 0x55, 0x19, 0xc8]);
+        for source in [assigned, temporary] {
+            assert_eq!(
+                classifier.classify(&ipv6_udp(source, remote, 40000, 5060)),
+                TftUplinkClassification::Selected(GtpBearerMark::new(21))
+            );
+            assert_eq!(
+                classifier.classify(&ipv6_udp(source, remote, 40000, 443)),
+                TftUplinkClassification::Selected(None)
+            );
+        }
+        let mut outside = temporary;
+        outside[7] ^= 1;
+        assert_eq!(
+            classifier.classify(&ipv6_udp(outside, remote, 40000, 5060)),
+            TftUplinkClassification::Drop(TftUplinkDropReason::PaaMismatch)
+        );
+    }
+
+    #[test]
+    fn ipv6_paa_is_canonicalized_to_its_slash_64() {
+        let one = TftUplinkClassifier::new(
+            7,
+            IpAddr::V6(Ipv6Addr::from(in_prefix([0, 0, 0, 0, 0, 0, 0, 1]))),
+            voice_bearers(),
+        )
+        .unwrap();
+        let other = TftUplinkClassifier::new(
+            7,
+            IpAddr::V6(Ipv6Addr::from(in_prefix([9, 8, 7, 6, 5, 4, 3, 2]))),
+            voice_bearers(),
+        )
+        .unwrap();
+        assert_eq!(one, other);
+        assert_eq!(one.paa(), IpAddr::V6(Ipv6Addr::from(in_prefix([0; 8]))));
+    }
+
+    #[test]
+    fn rejects_non_unicast_paa_values() {
+        for paa in [
+            IpAddr::V4(Ipv4Addr::UNSPECIFIED),
+            IpAddr::V4(Ipv4Addr::LOCALHOST),
+            IpAddr::V4(Ipv4Addr::new(224, 0, 0, 1)),
+            IpAddr::V4(Ipv4Addr::BROADCAST),
+            IpAddr::V6(Ipv6Addr::UNSPECIFIED),
+            IpAddr::V6(Ipv6Addr::LOCALHOST),
+            IpAddr::V6(Ipv6Addr::new(0xff02, 0, 0, 0, 0, 0, 0, 1)),
+        ] {
+            assert!(
+                matches!(
+                    TftUplinkClassifier::new(7, paa, voice_bearers()),
+                    Err(GtpuError::InvalidConfig {
+                        field: "tft_uplink_classifier.paa",
+                        ..
+                    })
+                ),
+                "PAA must be rejected"
+            );
+        }
+    }
+
+    #[test]
+    fn dual_family_set_classifies_both_families_against_one_tft_set() {
+        let ipv4 = Ipv4Addr::new(192, 0, 2, 44);
+        let set =
+            TftUplinkPaaSet::new_dual(ipv4, Ipv6Addr::from(in_prefix([0, 0, 0, 0, 0, 0, 0, 0x10])))
+                .unwrap();
+        assert!(set.is_dual_stack());
+        assert_eq!(set.ipv4(), Some(ipv4));
+        assert_eq!(set.ipv6_prefix(), Some(Ipv6Addr::from(in_prefix([0; 8]))));
+        let classifier = TftUplinkClassifier::with_paa_set(7, set, voice_bearers()).unwrap();
+        assert_eq!(classifier.paa(), IpAddr::V4(ipv4));
+        assert_eq!(classifier.paa_set(), set);
+
+        let remote6 = [0x20, 1, 0xd, 0xb8, 0xff, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 5];
+        let source6 = in_prefix([0x3c, 0x91, 0x7e, 0x02, 0xa4, 0x55, 0x19, 0xc8]);
+        let mark = TftUplinkClassification::Selected(GtpBearerMark::new(21));
+        assert_eq!(
+            classifier.classify(&ipv4_udp(ipv4.octets(), [198, 51, 100, 5], 40000, 5060)),
+            mark
+        );
+        assert_eq!(
+            classifier.classify(&ipv6_udp(source6, remote6, 40000, 5060)),
+            mark
+        );
+        assert_eq!(
+            classifier.classify(&ipv4_udp(ipv4.octets(), [198, 51, 100, 5], 40000, 443)),
+            TftUplinkClassification::Selected(None)
+        );
+        assert_eq!(
+            classifier.classify(&ipv4_udp([192, 0, 2, 45], [198, 51, 100, 5], 40000, 5060)),
+            TftUplinkClassification::Drop(TftUplinkDropReason::PaaMismatch)
+        );
+        let mut foreign6 = source6;
+        foreign6[5] ^= 0x80;
+        assert_eq!(
+            classifier.classify(&ipv6_udp(foreign6, remote6, 40000, 5060)),
+            TftUplinkClassification::Drop(TftUplinkDropReason::PaaMismatch)
+        );
+    }
+
+    #[test]
+    fn paa_set_constructors_reject_empty_duplicate_and_invalid_families() {
+        let v4 = IpAddr::V4(Ipv4Addr::new(192, 0, 2, 44));
+        let v6 = IpAddr::V6(Ipv6Addr::from(in_prefix([0, 0, 0, 0, 0, 0, 0, 1])));
+        let other_v6 = IpAddr::V6(Ipv6Addr::from(in_prefix([0, 0, 0, 0, 0, 0, 0, 2])));
+        for addresses in [
+            vec![],
+            vec![v4, v4],
+            vec![v6, other_v6],
+            vec![v4, v6, other_v6],
+            vec![v4, IpAddr::V6(Ipv6Addr::LOCALHOST)],
+            vec![IpAddr::V4(Ipv4Addr::new(224, 0, 0, 5)), v6],
+            // IPv4-mapped IPv6 falls into the zero /64 prefix.
+            vec![IpAddr::V6(Ipv4Addr::new(192, 0, 2, 44).to_ipv6_mapped())],
+        ] {
+            assert!(matches!(
+                TftUplinkPaaSet::from_addresses(&addresses),
+                Err(GtpuError::InvalidConfig {
+                    field: "tft_uplink_classifier.paa",
+                    ..
+                })
+            ));
+        }
+        let set = TftUplinkPaaSet::from_addresses(&[v6, v4]).unwrap();
+        assert_eq!(
+            set,
+            TftUplinkPaaSet::new_dual(
+                Ipv4Addr::new(192, 0, 2, 44),
+                Ipv6Addr::from(in_prefix([7; 8]))
+            )
+            .unwrap()
+        );
+        assert!(set.contains(other_v6));
+        assert!(set.overlaps(&TftUplinkPaaSet::from_address(other_v6).unwrap()));
+        assert!(!TftUplinkPaaSet::from_address(v4)
+            .unwrap()
+            .overlaps(&TftUplinkPaaSet::from_address(v6).unwrap()));
+    }
+
+    #[test]
+    fn paa_set_diagnostics_are_redacted() {
+        let set = TftUplinkPaaSet::new_dual(
+            Ipv4Addr::new(192, 0, 2, 44),
+            Ipv6Addr::from(in_prefix([0, 0, 0, 0, 0, 0, 0, 1])),
+        )
+        .unwrap();
+        let rendered = format!("{set:?}");
+        assert!(!rendered.contains("192"));
+        assert!(!rendered.contains("2001"));
+        assert!(!rendered.contains("db8"));
+        let classifier = TftUplinkClassifier::with_paa_set(7, set, voice_bearers()).unwrap();
+        let rendered = format!("{classifier:?}");
+        assert!(!rendered.contains("192"));
+        assert!(!rendered.contains("db8"));
     }
 
     #[test]

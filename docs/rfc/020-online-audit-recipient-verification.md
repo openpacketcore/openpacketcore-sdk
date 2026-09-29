@@ -1,8 +1,9 @@
 # RFC 020: Authority-owned online audit recipient verification
 
-**Status:** Proposed public API and trust contract; not approved or declared
-implemented. A maintainer must approve the RFC before an implementation PR can
-cite it as an approved contract. An ADR or source candidate is not RFC approval.
+**Status:** Public API and trust contract. Maintainer-approved merge of
+[#979](https://github.com/openpacketcore/openpacketcore-sdk/pull/979) records
+acceptance; until then this remains a proposal. Acceptance does not declare an
+implementation qualified. An ADR or source candidate is not RFC approval.
 
 **Date:** 2026-09-26
 

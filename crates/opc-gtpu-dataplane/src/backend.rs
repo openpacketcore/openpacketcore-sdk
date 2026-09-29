@@ -393,6 +393,9 @@ pub trait GtpuDataplaneBackend: Send + Sync + std::fmt::Debug {
 
     /// Read the exact desired/observed TFT classifier for one attachment/PAA.
     ///
+    /// `paa` selects the classifier whose [`crate::TftUplinkPaaSet`] contains
+    /// it: the IPv4 PAA, or any address inside the owned IPv6 `/64`.
+    ///
     /// `Present` proves one complete classifier under this backend's authority.
     /// Partial, mixed, stale, or otherwise unprovable state is `Indeterminate`,
     /// never `Absent`.
@@ -1264,6 +1267,21 @@ pub trait GtpuDataplaneBackend: Send + Sync + std::fmt::Debug {
         Ok(GtpuCapability::Missing)
     }
 
+    /// Report support for PDP contexts whose inner UE address is IPv6.
+    ///
+    /// `Available` means [`Self::install_pdp_context`],
+    /// [`Self::install_pdp_context_classified`], [`Self::read_pdp_context`],
+    /// [`Self::remove_pdp_context`] and [`Self::remove_pdp_context_exact`]
+    /// accept an IPv6 `ms_address` naming the PDN connection's /64 prefix
+    /// (TS 23.401 clause 5.3.1.2.2, TS 29.274 clause 8.14) and match every
+    /// packet address inside that prefix. An IPv4v6 PDN connection is two
+    /// family-scoped contexts, one per inner family, which may share the
+    /// bearer's TEIDs, peer and mark. This coarse report grants no attachment
+    /// or mutation authority; every mutation still revalidates it.
+    fn pdp_inner_ipv6_capability(&self) -> GtpuCapability {
+        GtpuCapability::Missing
+    }
+
     /// Report support for the authority-bearing durable restart-recovery
     /// request independently of generationless exact removal.
     fn pdp_restart_recovery_capability(&self) -> GtpuCapability {
@@ -1426,6 +1444,7 @@ mod tests {
             bearer_mark: None,
             egress_dscp: None,
             uplink_source_port_policy: crate::GtpuUplinkSourcePortPolicy::LegacyServicePort,
+            downlink_inner_mtu: None,
         };
         assert!(matches!(
             backend.acquire_pdp_live_writer_proof().await,
