@@ -115,8 +115,8 @@ Inner IPv6 contexts refuse both policies: IPv6 has no in-network
 fragmentation (RFC 8200).
 
 Open the control port before installing an MTU-bearing context, and keep
-draining it. While its queues are not bound, the kernel answers steered
-packets with ICMP Port Unreachable toward the peer (#1019). MTU-bearing
+draining it. While its queues are not bound, the kernel may answer steered
+packets with rate-limited ICMP Port Unreachable toward the peer (#1019). MTU-bearing
 contexts must be drained before an SDK downgrade. See
 [control port](docs/control-port.md).
 

@@ -254,11 +254,13 @@ the attachment is removed or its queue is retired. Nothing is bound:
 - after a retirement, until the attachment is re-created or adopted and the
   port reopened.
 
-In those windows the kernel answers each steered packet with ICMP Port
-Unreachable toward the peer (RFC 1122 section 4.1.3.1). The error quotes as
-much of the datagram as fits in 576 octets (RFC 1812 section 4.3.2.3): up to
-about 512 octets of the inner packet, in plaintext, toward the core. The
-UDP/2152 hand-offs of #1003 have always behaved the same way.
+In those windows the kernel may answer steered packets with ICMP Port
+Unreachable toward the peer (RFC 1122 section 4.1.3.1). Its ICMP rate limits
+apply: `icmp_ratemask` covers Destination Unreachable, `icmp_ratelimit` is
+per peer, and `icmp_msgs_per_sec` is global. Each error holds at most 576
+octets (RFC 1812 section 4.3.2.3), so its quote holds at most 548. That quote
+includes up to about 512 octets of the inner packet, in plaintext, toward
+the core. The UDP/2152 hand-offs of #1003 have always behaved the same way.
 
 Open the control port right after creating or adopting the attachment, before
 installing any context with a downlink inner MTU. Keep draining it for the
@@ -322,8 +324,12 @@ The G-PDU is re-authorized against the same Active commit. Then, in order:
    therefore cannot repeat within the maximum datagram lifetime (RFC 791
    Time to Live; RFC 6864 sections 4.3 and 5.2). Past 4,096 concurrently
    tracked destinations, an evicted destination restarts from a fresh
-   keyed-random value, so uniqueness is probabilistic. Admissions before
-   and after a limit replacement are not counted together (#1018).
+   keyed-random value, so uniqueness is probabilistic. A new attachment
+   registration (a process restart, a re-adoption or a re-created
+   attachment) likewise restarts every destination from a new random value
+   and a full bucket, possibly within 255 seconds of the previous
+   registration's Identifications. Admissions before and after a limit
+   replacement are not counted together (#1018).
 
 The result is `GtpuDownlinkEvent::Fragmented`: the fragments in offset order,
 the MTU and the bearer mark. Its `Debug` output shows only the fragment
@@ -365,10 +371,19 @@ subscriber's address.
   the tc fast path.
 - **Identification space.** Fresh Identifications share the (source,
   destination, protocol) space with the originator's own non-atomic
-  datagrams, which this path cannot see. A collision can misassemble at the
-  UE: the hazard RFC 6864 section 5.3.1 describes for devices that rewrite
-  datagrams. UDP and TCP checksums catch most such errors (RFC 6864 section
-  5.2).
+  datagrams, which this path cannot see.
+  - **The requirement.** RFC 6864 section 5.3.1 requires a device that
+    rewrites datagrams to generate their Identifications "as if the datagram
+    were sourced by that device": unique for that tuple within the maximum
+    datagram lifetime (section 4.3). This path cannot meet that against the
+    originator's own Identifications.
+  - **Owner-approved policy.** The deviation is inherent to clearing DF and
+    fragmenting. It is part of the default decided on #1002 as product
+    policy, not standard behaviour.
+  - **The hazard.** A collision can misassemble at the UE. RFC 6864 section
+    5.2 calls the UDP and TCP checksums "weak in this regard, but better than
+    nothing" against such errors, and an IPv4 UDP datagram may carry no
+    checksum at all.
 
 #### Opt-in: in-tunnel Packet Too Big
 

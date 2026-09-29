@@ -93,7 +93,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     stays tracked under one limit, this bounds its work and keeps its
     sequence from repeating within 255 seconds. Past 4,096 concurrently
     tracked destinations, LRU eviction makes uniqueness probabilistic and
-    removes the per-destination bound (#1018). Excess packets are
+    removes the per-destination bound. A new attachment registration
+    (restart, re-adoption, re-created attachment) restarts every sequence
+    from a new random value (#1018). Excess packets are
     `InnerFragmentRateLimited` drops. Value-free counters record fragmented
     packets, fragments and refusals.
   - **Costs.** Over-MTU DF traffic is capped at 250 packets per second per
@@ -101,15 +103,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     Packet Too Big. Slow-path packets can be reordered behind later
     fast-path packets. Fresh Identifications share the (source,
     destination, protocol) space with the originator's own non-atomic
-    datagrams (RFC 6864 section 5.3.1). The consumer does not decrement TTL
-    (RFC 1812 section 5.3.1).
+    datagrams. They therefore cannot comply "as if the datagram were
+    sourced by that device" as RFC 6864 section 5.3.1 requires. That
+    deviation is inherent to clearing DF and fragmenting, and is part of the
+    owner-approved default policy decided on #1002. The consumer does not
+    decrement TTL (RFC 1812 section 5.3.1).
   - **Integration.** Open the control port before installing any
     MTU-bearing context and keep draining it. Until it is first opened,
     while the process is down, and after a retirement, nothing is bound.
     Adopting a retained graph reopens tc's gate before the port can be
     opened, so this window cannot be avoided after a restart. The kernel
-    then answers each steered packet with ICMP Port Unreachable toward the
-    peer, quoting up to about 512 octets of the inner packet (#1019).
+    may then answer steered packets with rate-limited ICMP Port Unreachable
+    toward the peer, quoting up to about 512 octets of the inner packet
+    (#1019).
   - **Evidence.** On a real kernel a 1,450-octet DF datagram over a
     1,400-octet access link reaches the UE as two exact fragments, on the
     default bearer, after outer reassembly and on a dedicated bearer through

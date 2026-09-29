@@ -6864,10 +6864,10 @@ pub struct GtpuProbe {
     /// the attachment and keeps it until the attachment is removed or the
     /// queue is retired. Nothing is bound before that first open, while the
     /// process is down across a restart (tc keeps steering from the pinned
-    /// graph), or after a retirement. In those windows the kernel answers each
-    /// steered packet with ICMP Port Unreachable toward the peer, quoting up to
-    /// about 512 octets of the inner packet, as it answers the UDP/2152
-    /// hand-offs. Open the control port before installing any context with a
+    /// graph), or after a retirement. In those windows the kernel may answer
+    /// steered packets with rate-limited ICMP Port Unreachable toward the
+    /// peer, quoting up to about 512 octets of the inner packet, as it
+    /// answers the UDP/2152 hand-offs. Open the control port before installing any context with a
     /// downlink inner MTU. Enforcement is tracked in #1019.
     pub downlink_inner_mtu_enforcement: GtpuCapability,
     /// Optional human-readable detail; static so the probe stays `Copy`.

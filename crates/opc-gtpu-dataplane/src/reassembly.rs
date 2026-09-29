@@ -1663,8 +1663,12 @@ const MAXIMUM_DATAGRAM_LIFETIME: std::time::Duration = std::time::Duration::from
 /// used is evicted first, and restarts with a full bucket and a fresh
 /// keyed-random Identification sequence. Past 4,096 concurrently tracked
 /// destinations, Identification uniqueness is therefore probabilistic and
-/// the per-destination bound does not hold. Admissions before and after a
-/// limit replacement are not counted together (#1018).
+/// the per-destination bound does not hold. A new attachment registration
+/// (a process restart, a re-adoption or a re-created attachment) likewise
+/// restarts every destination with a full bucket and a new random sequence,
+/// possibly within 255 seconds of the previous registration's
+/// Identifications. Admissions before and after a limit replacement are not
+/// counted together (#1018).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct GtpuInnerFragmentRateLimit {
     burst: u32,

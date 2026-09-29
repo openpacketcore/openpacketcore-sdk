@@ -82,8 +82,8 @@ pub trait GtpuControlPort: fmt::Debug + Send + Sync {
     /// attachment and keeps them until the attachment is removed or its queue
     /// is retired. Open the port before installing any context with a
     /// downlink inner MTU, and keep draining it for the attachment's lifetime:
-    /// while nothing is bound, the kernel answers each handed-off datagram
-    /// with ICMP Port Unreachable toward the peer (#1019).
+    /// while nothing is bound, the kernel may answer handed-off datagrams
+    /// with rate-limited ICMP Port Unreachable toward the peer (#1019).
     ///
     /// The default implementation belongs to ports without backend state and
     /// returns [`GtpuControlPortError::Unsupported`] without receiving.
