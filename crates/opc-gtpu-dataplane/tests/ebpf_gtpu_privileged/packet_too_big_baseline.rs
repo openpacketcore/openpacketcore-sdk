@@ -1,14 +1,15 @@
 //! Baseline (and reproducible RED) for downlink tunnel-MTU handling.
 //!
 //! An oversized DF downlink packet reaches an installed session whose access
-//! path (here `ue0`, MTU 1300) is narrower than the packet. Without the
-//! per-context opt-in (`GtpPdpContext::downlink_inner_mtu`), tc decapsulates
-//! and the host emits its own Fragmentation Needed: from a host address,
-//! unencapsulated, toward the core, quoting 548 octets of the subscriber
-//! packet, while nothing reaches the tunnel. This test pins that unchanged
-//! default. Copied unmodified onto `origin/main` (0bf44952) it passes with
-//! the same observations, which is the RED for #1002: the opted-in test
-//! `ebpf_gtpu_downlink_packet_too_big_is_signalled_in_tunnel` fails there.
+//! path (here `ue0`, MTU 1300) is narrower than the packet. Without a
+//! per-context downlink inner MTU (`GtpPdpContext::downlink_inner_mtu`), tc
+//! decapsulates and the host emits its own Fragmentation Needed: from a host
+//! address, unencapsulated, toward the core, quoting 548 octets of the
+//! subscriber packet, while nothing reaches the tunnel. This test pins that
+//! unchanged behaviour. Copied unmodified onto `origin/main` (0bf44952) it
+//! passes with the same observations, which is the RED for #1002: the
+//! opted-in test `ebpf_gtpu_downlink_packet_too_big_is_signalled_in_tunnel`
+//! fails there.
 
 use super::*;
 

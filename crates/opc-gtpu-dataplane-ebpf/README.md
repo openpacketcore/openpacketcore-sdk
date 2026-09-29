@@ -42,7 +42,8 @@ The crate exposes tc entry points, not a Rust library API:
   packet by default, or sends at most one in-tunnel RFC 1191 error when the
   session opted in; tc reads only the MTU bits and steers identically under
   both policies. A hand-off flood therefore never fills the shared UDP/2152
-  queue. tc keeps no hand-off counter: adding a counter or policing map would
+  queue. tc steers whether or not the queue is bound. While it is not, the
+  kernel answers with ICMP Port Unreachable toward the peer (#1019). tc keeps no hand-off counter: adding a counter or policing map would
   change the retained pin inventory and durable recovery records. A true
   grouped-index miss alone may enter the legacy IPv4 PDR/commit path.
   Outer-IPv4 fragments, legacy or grouped, retain the bounded

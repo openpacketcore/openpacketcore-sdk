@@ -112,8 +112,13 @@ applies the context's RFC 4459 policy:
   and the originator attributes the error to the subscriber.
 
 Inner IPv6 contexts refuse both policies: IPv6 has no in-network
-fragmentation (RFC 8200). MTU-bearing contexts must be drained before an SDK
-downgrade. See [control port](docs/control-port.md).
+fragmentation (RFC 8200).
+
+Open the control port before installing an MTU-bearing context, and keep
+draining it. While its queues are not bound, the kernel answers steered
+packets with ICMP Port Unreachable toward the peer (#1019). MTU-bearing
+contexts must be drained before an SDK downgrade. See
+[control port](docs/control-port.md).
 
 - `GtpuDataplaneBackend`: async port for device and PDP lifecycle, typed PDP
   readback, classified installation, authority-safe exact removal, and probes.

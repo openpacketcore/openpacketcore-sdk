@@ -245,9 +245,29 @@ contexts refuse both policies. The eBPF probe reports
 fragments are produced, and errors sent, only while the application drains
 this port.
 
+**Binding and integration order.** The backend binds UDP/2152 and UDP/2153
+when the control port is first opened for the attachment. It keeps them until
+the attachment is removed or its queue is retired. Nothing is bound:
+- before that first open;
+- while the process is down across a restart, because tc keeps steering from
+  the pinned graph;
+- after a retirement, until the attachment is re-created or adopted and the
+  port reopened.
+
+In those windows the kernel answers each steered packet with ICMP Port
+Unreachable toward the peer (RFC 1122 section 4.1.3.1). The error quotes as
+much of the datagram as fits in 576 octets (RFC 1812 section 4.3.2.3): up to
+about 512 octets of the inner packet, in plaintext, toward the core. The
+UDP/2152 hand-offs of #1003 have always behaved the same way.
+
+Open the control port right after creating or adopting the attachment, before
+installing any context with a downlink inner MTU. Keep draining it for the
+attachment's lifetime. Enforcement is tracked in #1019.
+
 **tc.** When an authorized inner IPv4 packet with Don't Fragment set exceeds
-the MTU, tc does not decapsulate it, so the host never forwards it and never
-emits its own error. tc rewrites only the UDP destination port, with an
+the MTU, tc does not decapsulate it, so the host never forwards it. The host
+also never emits its own error, as long as the hand-off queue is bound (see
+above). tc rewrites only the UDP destination port, with an
 incremental checksum update, to the backend-owned packet-too-big queue on the
 same local address (`GTPU_PACKET_TOO_BIG_QUEUE_PORT`, 2153). tc reads only
 the MTU bits, so it steers identically under both policies. Outer fragments
@@ -272,9 +292,12 @@ The G-PDU is re-authorized against the same Active commit. Then, in order:
 3. **Budget.** One token bucket per destination (the session PAA):
    `GtpuInnerFragmentRateLimit`, a burst of 64 with one token per 4 ms by
    default, set by `set_inner_fragment_rate_limit`. At most 4,096
-   destinations are tracked per attachment, least recently used first out.
-   An empty bucket is an `InnerFragmentRateLimited` drop. Steps 1 and 2 take
-   no token.
+   destinations are tracked per attachment, least recently used first out;
+   a refused admission still counts as a use. An evicted destination
+   restarts with a full bucket, so past 4,096 concurrently tracked
+   destinations the per-destination bound does not hold (#1018). An empty
+   bucket is an `InnerFragmentRateLimited` drop. Steps 1 and 2 take no
+   token.
 4. **Fragmentation** by the RFC 791 section 3.2 procedure, generalized to
    an n-way split. Every fragment except the last carries the largest
    multiple of 8 data octets that fits the MTU, so the count is minimal
@@ -289,10 +312,15 @@ The G-PDU is re-authorized against the same Active commit. Then, in order:
    meaningful Identification (RFC 6864 section 4.1), and senders often use
    zero or a constant, so the fragments get the destination's next value
    from a sequence that starts at a random non-zero value and never uses
-   zero. The budget's default admits at most 64 + 63,750 packets in 255
-   seconds, so the sequence cannot repeat within the maximum datagram
-   lifetime (RFC 791 Time to Live; RFC 6864 sections 4.3 and 5.2), and
-   `GtpuInnerFragmentRateLimit::new` refuses any limit that could.
+   zero. A budget admits at most `burst` + ⌈255 s / interval⌉ packets in
+   any 255 seconds (64 + 63,750 by default), and
+   `GtpuInnerFragmentRateLimit::new` refuses any limit above 65,535. While
+   the destination stays tracked under one unchanged limit, its sequence
+   therefore cannot repeat within the maximum datagram lifetime (RFC 791
+   Time to Live; RFC 6864 sections 4.3 and 5.2). Past 4,096 concurrently
+   tracked destinations, an evicted destination restarts from a fresh
+   keyed-random value, so uniqueness is probabilistic. Admissions before
+   and after a limit replacement are not counted together (#1018).
 
 The result is `GtpuDownlinkEvent::Fragmented`: the fragments in offset order,
 the MTU and the bearer mark. Its `Debug` output shows only the fragment
@@ -307,20 +335,37 @@ such a socket from the socket, not the packet: pass the inner source as the
 rely on port or protocol selectors. Linux also replaces an Identification
 of zero on an `IP_HDRINCL` send, which would break reassembly; fragments of
 an atomic datagram never carry zero, but a received DF fragment's own
-Identification is preserved as it is. The consumer does not decrement TTL,
-for fragments or for `Decapsulated` packets.
+Identification is preserved as it is. Unlike a forwarding router (RFC 1812
+section 5.3.1), the consumer does not decrement TTL, for fragments or for
+`Decapsulated` packets. This is a documented limitation of this path.
 
 **Owner-approved policy.** Fragmenting a datagram with Don't Fragment set is
 not standard router behaviour. RFC 791 section 2.3 and RFC 6864 section 4.3
 forbid fragmenting it or clearing DF in transit; RFC 1191 section 4 has a
 router discard it and signal the originator instead. RFC 4459 section 3.4
 describes clearing DF before encapsulation as a non-compliant but deployed
-tunnel practice. The
-ePDG owner chose it as the default because it delivers the packet whatever
-the originator does, and sources nothing from the subscriber's address. The
-cost: the originator's Path MTU Discovery never learns the tunnel MTU, so
-every oversized DF packet takes this slower path, and the UE must
-reassemble.
+tunnel practice. The ePDG owner chose it as the default because it delivers
+the packet whatever the originator does, and sources nothing from the
+subscriber's address.
+
+**Costs of the policy.**
+
+- **PMTUD.** The originator's Path MTU Discovery never learns the tunnel
+  MTU, so every oversized DF packet takes this slower path, and the UE must
+  reassemble.
+- **Rate cap.** Over-MTU DF traffic toward one destination is capped by its
+  budget: 250 packets per second by default, after a burst of 64. Excess
+  packets are dropped silently (`InnerFragmentRateLimited`). No Packet Too
+  Big is sent, so the sender never learns to send smaller packets.
+- **Reordering.** Slow-path packets can be reordered: a fragmented packet
+  can arrive after later packets of the same flow that fit the MTU and took
+  the tc fast path.
+- **Identification space.** Fresh Identifications share the (source,
+  destination, protocol) space with the originator's own non-atomic
+  datagrams, which this path cannot see. A collision can misassemble at the
+  UE: the hazard RFC 6864 section 5.3.1 describes for devices that rewrite
+  datagrams. UDP and TCP checksums catch most such errors (RFC 6864 section
+  5.2).
 
 #### Opt-in: in-tunnel Packet Too Big
 
@@ -342,11 +387,16 @@ Destination Unreachable (Fragmentation Needed) error is sent:
   - a non-initial fragment;
   - an ICMP error (types 3, 4, 5, 11 and 12). Informational ICMP, such as
     Echo, is answered.
-- **Rate limit.** One token bucket per offending session (RFC 4443 2.4 (f)):
-  a burst of 16 with one token per 10 ms by default, set by
+- **Header validation.** An invoking packet with a bad header checksum, or
+  one shorter than its total length, is silently discarded (RFC 1812 section
+  5.2.2, RFC 1122 section 3.2.1.2) and counted as unsendable.
+- **Rate limit.** One token bucket per offending session (RFC 1812 section
+  4.3.2.8): a burst of 16 with one token per 10 ms by default, set by
   `set_packet_too_big_rate_limit`. At most 4,096 sessions are tracked per
-  attachment, least recently used first out. A flood toward one PAA exhausts
-  only that session's budget.
+  attachment, least recently used first out. While the session stays
+  tracked, a flood toward one PAA exhausts only that session's budget. Past
+  4,096 concurrently tracked sessions, a re-tracked session restarts with a
+  full bucket (#1018).
 - **Tradeoff.** The error's source is the subscriber's own address. The ePDG
   is routing, so RFC 1812 4.3.2.4 would have it use its own address, but the
   PGW's per-PDN anti-spoofing admits only the PAA. The originator therefore
@@ -381,11 +431,19 @@ without enforcement. Inner IPv6 Packet Too Big (#1007) needs three pieces:
 **Native evidence.** The committed classifier is exercised with:
 
 - the default policy: a 1,450-octet DF datagram over a 1,400-octet access
-  link, on the default bearer, after outer reassembly, and on a dedicated
-  bearer through its real ESP Child SA. The UE receives the exact payload;
-  captures show two RFC 791 fragments with one non-zero Identification and
-  Don't Fragment clear, and one dedicated-SPI ESP packet per fragment. The
-  per-destination budget drops a second datagram without forwarding it;
+  link:
+  - on the default bearer;
+  - after outer reassembly;
+  - with a zero outer UDP checksum;
+  - on a dedicated bearer through its real ESP Child SA.
+
+  The UE receives the exact payload. Captures show two RFC 791 fragments
+  with one non-zero Identification and Don't Fragment clear, and one
+  dedicated-SPI ESP packet per fragment. The default-bearer legs are plainly
+  routed; a default-bearer Child SA leg is tracked in #1020. The
+  per-destination budget drops a second datagram without forwarding it.
+  Datagrams sent straight to UDP/2153 are dropped, never exposed as control
+  or unknown-tunnel events;
 - the opt-in: default, dedicated (answered on the default-bearer uplink) and
   outer-fragmented oversized DF packets; the exact error bytes, the 28-octet
   quote and the next-hop MTU; the per-session rate limit; an Echo served

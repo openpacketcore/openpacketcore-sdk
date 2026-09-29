@@ -88,9 +88,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     per-destination sequence (RFC 6864 sections 4.1 and 4.3).
   - **Budget.** Per-destination token buckets (`GtpuInnerFragmentRateLimit`,
     burst 64, one token per 4 ms, set by `set_inner_fragment_rate_limit`)
-    bound the work and keep each sequence from repeating within 255 seconds;
-    excess packets are `InnerFragmentRateLimited` drops. Value-free counters
-    record fragmented packets, fragments and refusals.
+    admit at most burst + ⌈255 s / interval⌉ packets in 255 seconds (63,814
+    by default); `new` refuses any limit above 65,535. While a destination
+    stays tracked under one limit, this bounds its work and keeps its
+    sequence from repeating within 255 seconds. Past 4,096 concurrently
+    tracked destinations, LRU eviction makes uniqueness probabilistic and
+    removes the per-destination bound (#1018). Excess packets are
+    `InnerFragmentRateLimited` drops. Value-free counters record fragmented
+    packets, fragments and refusals.
+  - **Costs.** Over-MTU DF traffic is capped at 250 packets per second per
+    destination by default, beyond which it is dropped silently with no
+    Packet Too Big. Slow-path packets can be reordered behind later
+    fast-path packets. Fresh Identifications share the (source,
+    destination, protocol) space with the originator's own non-atomic
+    datagrams (RFC 6864 section 5.3.1). The consumer does not decrement TTL
+    (RFC 1812 section 5.3.1).
+  - **Integration.** Open the control port before installing any
+    MTU-bearing context and keep draining it. Until it is first opened,
+    while the process is down, and after a retirement, nothing is bound.
+    The kernel then answers each steered packet with ICMP Port Unreachable
+    toward the peer, quoting up to about 512 octets of the inner packet
+    (#1019).
   - **Evidence.** On a real kernel a 1,450-octet DF datagram over a
     1,400-octet access link reaches the UE as two exact fragments, on the
     default bearer, after outer reassembly and on a dedicated bearer through
@@ -101,7 +119,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - **Opt-in.** `GtpPdpContext::downlink_inner_mtu` is a new field and is
     source-breaking; `None` keeps today's behaviour. It is set with
     `GtpuDownlinkInnerMtu::in_tunnel_packet_too_big(mtu)`, where the MTU is
-    at least 576.
+    at least 576. `GtpuProbe::downlink_inner_mtu_enforcement` is a new public
+    field of `GtpuProbe`, which is not `#[non_exhaustive]`, so struct
+    literals of `GtpuProbe` are source-breaking too.
   - **Storage and downgrade.** The MTU is stored in the formerly reserved
     bytes of the Active commit record; records without it are byte-identical.
     An older SDK's recovery refuses an attachment holding any MTU record, so
@@ -116,10 +136,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     quoting the header plus 64 bits.
   - **Never answered** (RFC 1122 3.2.2), checked before any rate-limit
     token: 0/8, 127/8, 224/4 and 240/4 originators, non-initial fragments
-    and ICMP errors.
-  - **Rate limit and counters.** Per-session token buckets
-    (`set_packet_too_big_rate_limit`) with value-free counters, including
-    `SO_RXQ_OVFL` queue-drop counts.
+    and ICMP errors. An invoking packet with a bad header checksum, or one
+    shorter than its total length, is silently discarded (RFC 1812 section
+    5.2.2).
+  - **Rate limit and counters.** Per-session token buckets (RFC 1812 section
+    4.3.2.8; `set_packet_too_big_rate_limit`), per session while it stays
+    tracked (#1018), with value-free counters, including `SO_RXQ_OVFL`
+    queue-drop counts.
   - **Not provided.** tc has no hand-off counter or policer, because either
     would change the map ABI.
   - **Evidence.** The baseline test (the RED on `main`) shows the host

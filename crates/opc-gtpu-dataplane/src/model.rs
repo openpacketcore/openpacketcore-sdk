@@ -4674,7 +4674,9 @@ impl fmt::Debug for GtpuDownlinkEndpoint {
 /// Under both policies tc hands the packet, undecapsulated, to the
 /// backend-owned consumer
 /// ([`GtpuControlPort::try_receive_downlink`](crate::control_port::GtpuControlPort::try_receive_downlink)),
-/// so the host never forwards it and never emits its own error.
+/// so the host never forwards it. The host also never emits its own error
+/// while the backend-owned queue is bound; see
+/// [`GtpuProbe::downlink_inner_mtu_enforcement`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 #[non_exhaustive]
 pub enum GtpuDownlinkOversizePolicy {
@@ -4856,7 +4858,10 @@ pub struct GtpPdpContext {
     /// [`GtpuControlPort::try_receive_downlink`](crate::control_port::GtpuControlPort::try_receive_downlink).
     /// Backends whose [`GtpuProbe::downlink_inner_mtu_enforcement`] is not
     /// [`GtpuCapability::Available`] reject `Some`. `None` preserves the
-    /// existing packet behavior and the original commit-record bytes.
+    /// existing packet behavior and the original commit-record bytes. Open
+    /// the attachment's control port before installing a context with
+    /// `Some`, and keep draining it for the attachment's lifetime; see
+    /// [`GtpuProbe::downlink_inner_mtu_enforcement`].
     ///
     /// An older SDK does not tolerate a record carrying an MTU: its retained-graph
     /// recovery rejects the non-canonical commit and refuses the whole attachment
@@ -6852,8 +6857,18 @@ pub struct GtpuProbe {
     /// and errors sent, only while the embedding application drains that
     /// queue through
     /// [`GtpuControlPort::try_receive_downlink`](crate::control_port::GtpuControlPort::try_receive_downlink)
-    /// and injects the returned fragments; otherwise over-MTU packets are
-    /// dropped in that queue, never forwarded or answered by the host.
+    /// and injects the returned fragments; otherwise over-MTU packets wait in
+    /// that queue and are dropped when it overflows, never forwarded.
+    ///
+    /// The backend binds that queue when the control port is first opened for
+    /// the attachment and keeps it until the attachment is removed or the
+    /// queue is retired. Nothing is bound before that first open, while the
+    /// process is down across a restart (tc keeps steering from the pinned
+    /// graph), or after a retirement. In those windows the kernel answers each
+    /// steered packet with ICMP Port Unreachable toward the peer, quoting up to
+    /// about 512 octets of the inner packet, as it answers the UDP/2152
+    /// hand-offs. Open the control port before installing any context with a
+    /// downlink inner MTU. Enforcement is tracked in #1019.
     pub downlink_inner_mtu_enforcement: GtpuCapability,
     /// Optional human-readable detail; static so the probe stays `Copy`.
     pub details: Option<&'static str>,

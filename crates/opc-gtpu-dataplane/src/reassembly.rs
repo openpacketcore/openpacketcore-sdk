@@ -1369,12 +1369,15 @@ impl GtpuDownlinkPacketTooBig {
 /// Explicit per-session rate limit for in-tunnel Packet Too Big errors.
 ///
 /// Each offending session (its local TEID) has its own token bucket
-/// (RFC 4443 section 2.4 (f)): up to `burst` errors may be sent back to back,
-/// and one token is restored every `refill_interval`. A flood toward one PAA
-/// therefore exhausts only that session's budget, never another
-/// subscriber's. The default is a burst of 16 with one token per 10 ms (100
-/// errors per second per session). At most 4,096 sessions are tracked per
-/// attachment; the least recently used bucket is evicted first.
+/// (RFC 1812 section 4.3.2.8): up to `burst` errors may be sent back to back,
+/// and one token is restored every `refill_interval`. While the session
+/// stays tracked, a flood toward one PAA therefore exhausts only that
+/// session's budget, never another subscriber's. The default is a burst of
+/// 16 with one token per 10 ms (100 errors per second per session). At most
+/// 4,096 sessions are tracked per attachment; the least recently used bucket
+/// is evicted first, and a re-tracked session restarts with a full bucket.
+/// Past 4,096 concurrently tracked sessions, the per-session bound therefore
+/// does not hold (#1018).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct GtpuPacketTooBigRateLimit {
     burst: u32,
@@ -1558,7 +1561,8 @@ impl PacketTooBigLimiter {
 /// fragments carry one Identification: the original's when the packet was
 /// itself a fragment, otherwise a fresh non-zero value from the destination's
 /// own sequence (RFC 6864 sections 4.1 and 4.3). TTL and every other field
-/// are unchanged.
+/// are unchanged: unlike a forwarding router (RFC 1812 section 5.3.1), this
+/// path does not decrement TTL.
 ///
 /// The caller injects every fragment, in order, toward XFRM with
 /// [`Self::bearer_mark`], exactly as it injects a
@@ -1644,7 +1648,8 @@ const MAXIMUM_DATAGRAM_LIFETIME: std::time::Duration = std::time::Duration::from
 ///
 /// Each destination (the session's UE address) has its own token bucket:
 /// up to `burst` over-MTU packets may be fragmented back to back, and one
-/// token is restored every `refill_interval`. This bounds the consumer's
+/// token is restored every `refill_interval`. While the destination stays
+/// tracked under one unchanged limit, this bounds the consumer's
 /// fragmentation work per destination, so a flood toward one PAA exhausts
 /// only its own budget. It also keeps the destination's 16-bit
 /// Identification sequence from repeating within the maximum datagram
@@ -1652,9 +1657,14 @@ const MAXIMUM_DATAGRAM_LIFETIME: std::time::Duration = std::time::Duration::from
 /// non-atomic datagrams: a limit that could admit more than 65,535 packets
 /// in 255 seconds (`burst` + ⌈255 s / `refill_interval`⌉) is refused. The
 /// default is a burst of 64 with one token per 4 ms (250 packets per second
-/// per destination), at most 64 + 63,750 packets in any 255 seconds. At most 4,096 destinations are
-/// tracked per attachment; the least recently used is evicted first, and
-/// restarts with a full bucket and a fresh Identification sequence.
+/// per destination), at most 64 + 63,750 packets in any 255 seconds.
+///
+/// At most 4,096 destinations are tracked per attachment. The least recently
+/// used is evicted first, and restarts with a full bucket and a fresh
+/// keyed-random Identification sequence. Past 4,096 concurrently tracked
+/// destinations, Identification uniqueness is therefore probabilistic and
+/// the per-destination bound does not hold. Admissions before and after a
+/// limit replacement are not counted together (#1018).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct GtpuInnerFragmentRateLimit {
     burst: u32,
@@ -1711,8 +1721,9 @@ impl GtpuInnerFragmentRateLimit {
 pub(crate) struct InnerFragmentBudget {
     buckets: SessionBuckets<u16>,
     /// Per-registration random SipHash keys seeding each destination's
-    /// first Identification, so a re-tracked destination does not restart a
-    /// predictable or recently used sequence.
+    /// first Identification, so a re-tracked destination restarts from an
+    /// unpredictable value rather than a fixed one. It can still overlap
+    /// recently used values (#1018).
     seed_keys: std::collections::hash_map::RandomState,
     seeded: u64,
 }
