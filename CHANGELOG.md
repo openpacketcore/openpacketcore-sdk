@@ -106,9 +106,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - **Integration.** Open the control port before installing any
     MTU-bearing context and keep draining it. Until it is first opened,
     while the process is down, and after a retirement, nothing is bound.
-    The kernel then answers each steered packet with ICMP Port Unreachable
-    toward the peer, quoting up to about 512 octets of the inner packet
-    (#1019).
+    Adopting a retained graph reopens tc's gate before the port can be
+    opened, so this window cannot be avoided after a restart. The kernel
+    then answers each steered packet with ICMP Port Unreachable toward the
+    peer, quoting up to about 512 octets of the inner packet (#1019).
   - **Evidence.** On a real kernel a 1,450-octet DF datagram over a
     1,400-octet access link reaches the UE as two exact fragments, on the
     default bearer, after outer reassembly and on a dedicated bearer through

@@ -21,7 +21,9 @@ use opc_gtpu_dataplane::{
 /// The access-side (SWu) link MTU.
 const ACCESS_MTU: u16 = 1_400;
 /// The largest ESP tunnel-mode overhead of the test Child SAs: outer IPv4
-/// 20, UDP 8, ESP 8, IV 16, padding 15, trailer 2, ICV 12.
+/// 20, UDP 8, ESP 8, AES-CBC IV 16, padding 15, trailer 2, ICV 12. The
+/// harness truncates HMAC-SHA-256 to 96 bits, a legacy length. An RFC 4868
+/// HMAC-SHA-256-128 SA has a 16-octet ICV (section 2.3), so its overhead is 85.
 const ESP_OVERHEAD: u16 = 81;
 /// The session's downlink inner MTU: the access MTU minus that overhead. It
 /// is not a multiple of 8, so RFC 791's 8-octet rule shapes the fragments:

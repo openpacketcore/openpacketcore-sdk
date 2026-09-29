@@ -262,7 +262,10 @@ UDP/2152 hand-offs of #1003 have always behaved the same way.
 
 Open the control port right after creating or adopting the attachment, before
 installing any context with a downlink inner MTU. Keep draining it for the
-attachment's lifetime. Enforcement is tracked in #1019.
+attachment's lifetime. That order cannot close one window. Adopting a retained
+graph after a restart reopens tc's traffic gate before the port can be opened,
+so its MTU contexts steer to an unbound UDP/2153 until the port is open.
+Enforcement is tracked in #1019.
 
 **tc.** When an authorized inner IPv4 packet with Don't Fragment set exceeds
 the MTU, tc does not decapsulate it, so the host never forwards it. The host
