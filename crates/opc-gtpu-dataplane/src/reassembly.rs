@@ -2454,4 +2454,68 @@ mod tests {
             std::io::ErrorKind::InvalidData
         );
     }
+
+    /// The most packets `limit` lets one destination fragment in any
+    /// half-open 255-second window: open the window with a full bucket just
+    /// before a refill instant, drain it, then take every refill as it comes.
+    fn worst_case_lifetime_admissions(limit: GtpuInnerFragmentRateLimit) -> u32 {
+        use std::time::{Duration, Instant};
+        let mut budget = InnerFragmentBudget::new(limit);
+        let destination = UE.octets();
+        let start = Instant::now();
+        // Refill instants are start + k * interval; idle until full again.
+        assert!(budget.admit(destination, start, true).is_some());
+        let interval = limit.refill_interval();
+        let full_refill = start + interval * (limit.burst() + 2);
+        let window_start = full_refill - Duration::from_nanos(1);
+        let window_end = window_start + Duration::from_secs(255);
+        let mut admitted = 0;
+        while budget.admit(destination, window_start, true).is_some() {
+            admitted += 1;
+        }
+        let mut now = full_refill;
+        while now < window_end {
+            assert!(budget.admit(destination, now, true).is_some());
+            admitted += 1;
+            now += interval;
+        }
+        admitted
+    }
+
+    /// RFC 6864 section 4.3: a destination's 65,535 non-zero Identifications
+    /// must not wrap within the 255-second maximum datagram lifetime, so an
+    /// accepted limit may admit at most 65,535 packets in any such window.
+    #[test]
+    fn inner_fragment_rate_limit_never_admits_65_536_in_one_lifetime() {
+        use std::time::Duration;
+        for (burst, nanos) in [
+            (1, 3_891_000),
+            (1, 3_892_000),
+            (16, 3_892_000),
+            (1_785, 4_000_000),
+            (1_786, 4_000_000),
+        ] {
+            let Some(limit) = GtpuInnerFragmentRateLimit::new(burst, Duration::from_nanos(nanos))
+            else {
+                continue;
+            };
+            let admitted = worst_case_lifetime_admissions(limit);
+            assert!(
+                admitted <= u32::from(u16::MAX),
+                "burst {burst}, interval {nanos} ns admits {admitted} in 255 s"
+            );
+        }
+        // burst + ceil(255 s / interval): 16 + 65,520 > 65,535.
+        assert_eq!(
+            GtpuInnerFragmentRateLimit::new(16, Duration::from_nanos(3_892_000)),
+            None
+        );
+        // The default is accepted, and its bound is tight: 64 + 63,750.
+        let default = GtpuInnerFragmentRateLimit::default();
+        assert_eq!(
+            GtpuInnerFragmentRateLimit::new(64, Duration::from_millis(4)),
+            Some(default)
+        );
+        assert_eq!(worst_case_lifetime_admissions(default), 63_814);
+    }
 }
