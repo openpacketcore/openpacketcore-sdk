@@ -19,10 +19,15 @@ use opc_gtpu_dataplane::{
 
 /// The access-side (SWu) link MTU.
 const ACCESS_MTU: u16 = 1_400;
-/// The session's downlink inner MTU: the access MTU minus the largest ESP
-/// tunnel-mode overhead of the test Child SAs (outer IPv4 20, UDP 8, ESP 8,
-/// IV 16, padding 15, trailer 2, ICV 12 = 81 octets), rounded down.
-const SESSION_MTU: u16 = 1_300;
+/// The largest ESP tunnel-mode overhead of the test Child SAs: outer IPv4
+/// 20, UDP 8, ESP 8, IV 16, padding 15, trailer 2, ICV 12.
+const ESP_OVERHEAD: u16 = 81;
+/// The session's downlink inner MTU: the access MTU minus that overhead. It
+/// is not a multiple of 8, so RFC 791's 8-octet rule shapes the fragments:
+/// (1,319 - 20) / 8 = 162 blocks, 1,296 data octets in the first fragment.
+const SESSION_MTU: u16 = ACCESS_MTU - ESP_OVERHEAD;
+/// The CRC datagram's two fragments: 20 + 1,296 and 20 + (1,430 - 1,296).
+const FRAGMENT_LENGTHS: [usize; 2] = [1_316, 154];
 /// 20 + 8 + 1,422 = a 1,450-octet inner datagram, the CRC case.
 const OVERSIZED_PAYLOAD: usize = 1_422;
 const FITTING_PAYLOAD: usize = 1_200;
@@ -242,25 +247,47 @@ fn serve_consumer(port: &dyn GtpuControlPort, window: Duration) -> Vec<GtpuDownl
     events
 }
 
-/// Require exactly one event: the inner packet fragmented to the session MTU
-/// under the default policy, with the expected bearer mark.
-fn expect_fragmented(events: &[GtpuDownlinkEvent], mark: Option<GtpBearerMark>) {
+/// Require exactly one event: `datagram` fragmented to the session MTU under
+/// the default policy, with the expected bearer mark. The returned fragments
+/// themselves must be exact RFC 791 fragments: an `IP_HDRINCL` send would
+/// repair a wrong header checksum or total length on the wire. Returns them.
+fn expect_fragmented(
+    events: &[GtpuDownlinkEvent],
+    mark: Option<GtpBearerMark>,
+    datagram: &[u8],
+) -> Vec<Vec<u8>> {
     match events {
         [GtpuDownlinkEvent::Fragmented(fragmented)] => {
             assert_eq!(fragmented.mtu(), SESSION_MTU);
             assert_eq!(fragmented.bearer_mark(), mark);
+            let fragments: Vec<Vec<u8>> = fragmented
+                .fragments()
+                .iter()
+                .map(|fragment| fragment.to_vec())
+                .collect();
             assert_eq!(
-                fragmented
-                    .fragments()
-                    .iter()
-                    .map(|fragment| fragment.len())
-                    .collect::<Vec<_>>(),
-                [1_300, 170],
-                "RFC 791: a full first fragment, then the rest"
+                fragments.iter().map(Vec::len).collect::<Vec<_>>(),
+                FRAGMENT_LENGTHS,
+                "RFC 791: the largest 8-octet multiple that fits, then the rest"
             );
+            assert_eq!(assert_inner_fragments(&fragments, datagram), 2);
+            fragments
         }
         other => panic!("expected one Fragmented event, got {other:?}"),
     }
+}
+
+/// The captured packets that carry `datagram`'s fragments, in capture order.
+fn wire_fragments(packets: &[Vec<u8>]) -> Vec<Vec<u8>> {
+    packets
+        .iter()
+        .filter(|packet| {
+            packet[9] == IPPROTO_UDP
+                && packet[12..16] == REMOTE_HOST.octets()
+                && packet[16..20] == UE_PAA.octets()
+        })
+        .cloned()
+        .collect()
 }
 
 /// Require the UE's socket to receive exactly `payload` from the remote host.
@@ -381,11 +408,14 @@ pub(super) async fn qualify() -> Result<(), Box<dyn std::error::Error>> {
         &buffer[..length],
         application_payload(0x51, OVERSIZED_PAYLOAD).as_slice()
     );
+    let returned = expect_fragmented(&events, None, &crc_case);
+    let wire = captured_ipv4(&ue_capture);
+    assert_eq!(assert_inner_fragments(&wire, &crc_case), 2);
     assert_eq!(
-        assert_inner_fragments(&captured_ipv4(&ue_capture), &crc_case),
-        2
+        wire_fragments(&wire),
+        returned,
+        "the UE receives exactly the returned fragments"
     );
-    expect_fragmented(&events, None);
 
     // 2. The same datagram fragmented on the outer path: the kernel
     //    reassembles the G-PDU into the shared queue, and the consumer
@@ -393,7 +423,7 @@ pub(super) async fn qualify() -> Result<(), Box<dyn std::error::Error>> {
     let reassembled = datagram(0x52, OVERSIZED_PAYLOAD, true);
     let (head, tail) = build_outer_fragments(&frame(LOCAL_TEID, &reassembled), 1_000, 0x5200);
     send(&[&head, &tail]);
-    expect_fragmented(&serve_consumer(port.as_ref(), window), None);
+    expect_fragmented(&serve_consumer(port.as_ref(), window), None, &reassembled);
     expect_ue_delivery(
         &ue,
         &application_payload(0x52, OVERSIZED_PAYLOAD),
@@ -459,6 +489,7 @@ pub(super) async fn qualify() -> Result<(), Box<dyn std::error::Error>> {
     expect_fragmented(
         &serve_consumer(port.as_ref(), window),
         GtpBearerMark::new(MARK_A),
+        &dedicated_case,
     );
     expect_ue_delivery(
         &ue,
