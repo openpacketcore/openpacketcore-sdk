@@ -2527,6 +2527,11 @@ mod tests {
             GtpuInnerFragmentRateLimit::new(16, Duration::from_nanos(3_892_000)),
             None
         );
+        // The bound is exact, not merely safe: 1,785 + 63,750 = 65,535 is
+        // accepted, and its worst case uses every Identification once.
+        let exact = GtpuInnerFragmentRateLimit::new(1_785, Duration::from_millis(4));
+        assert!(exact.is_some(), "the largest safe burst must be accepted");
+        assert_eq!(exact.map(worst_case_lifetime_admissions), Some(65_535));
         // The default is accepted, and its bound is tight: 64 + 63,750.
         let default = GtpuInnerFragmentRateLimit::default();
         assert_eq!(
