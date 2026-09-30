@@ -516,9 +516,22 @@ pub(crate) fn apply_cancellable_for_mode_sync(
                 AuditCommand::Prune {
                     through,
                     checkpoint,
-                } => keys
-                    .ok_or(AuditAuthorityError::KeyUnavailable)
-                    .and_then(|keys| ledger.prune(keys, *through, checkpoint, now)),
+                } => {
+                    if mode == super::RetainedConfigMode::NetconfRunningV1
+                        && super::audit_targets::publication::protects_prune_sync(
+                            conn,
+                            key,
+                            ledger,
+                            *through,
+                            cancellation,
+                        )?
+                    {
+                        Err(AuditAuthorityError::RecoveryRequired)
+                    } else {
+                        keys.ok_or(AuditAuthorityError::KeyUnavailable)
+                            .and_then(|keys| ledger.prune(keys, *through, checkpoint, now))
+                    }
+                }
                 AuditCommand::NetconfTarget(command) => {
                     use super::audit_mutation::TargetAuditCommandV1;
                     match &**command {

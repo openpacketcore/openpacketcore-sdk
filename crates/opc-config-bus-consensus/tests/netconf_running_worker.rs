@@ -44,6 +44,8 @@ use serde::{Deserialize, Serialize};
 
 const LIFETIME: Duration = Duration::from_secs(60);
 
+#[path = "netconf_running_worker/bounded_publication.rs"]
+mod bounded_publication;
 #[path = "netconf_running_worker/patch_operation.rs"]
 mod patch_operation;
 #[path = "netconf_running_worker/revocation.rs"]
@@ -271,6 +273,17 @@ struct Fixture {
 
 impl Fixture {
     async fn new() -> Self {
+        Self::with_profiles(
+            RetainedConfigProfile::NetconfTargetsV1,
+            opc_crypto::ConfigCapacityProfile::Legacy,
+        )
+        .await
+    }
+
+    async fn with_profiles(
+        profile: RetainedConfigProfile,
+        capacity: opc_crypto::ConfigCapacityProfile,
+    ) -> Self {
         let directory = tempfile::tempdir().unwrap();
         let node = ConfigConsensusNodeId::new(1).unwrap();
         let identity = ConfigConsensusIdentity::new(
@@ -285,7 +298,8 @@ impl Fixture {
                 directory.path().join("authority.sqlite"),
                 RetainedConfigBinding::new(topology.clone(), [0x33; 32], [0x34; 32])
                     .unwrap()
-                    .with_profile(RetainedConfigProfile::NetconfTargetsV1),
+                    .with_profile(profile)
+                    .with_capacity_profile(capacity),
                 RetainedConfigDurability::Ephemeral,
                 64 * 1024 * 1024,
                 Duration::from_secs(30),

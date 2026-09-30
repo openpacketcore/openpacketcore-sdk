@@ -1452,9 +1452,6 @@ impl ConsensusConfigStore {
         retire_cleanup: bool,
     ) -> Result<Option<AuditOperationReceipt>, AuditAuthorityError> {
         self.verify_netconf_target(prepared, prepared.command().effect.caller)?;
-        if retire_cleanup && self.mode() == super::super::RetainedConfigMode::NetconfRunningV1 {
-            return Err(AuditAuthorityError::Unavailable);
-        }
         self.linearizable_barrier()
             .await
             .map_err(|_| AuditAuthorityError::Unavailable)?;

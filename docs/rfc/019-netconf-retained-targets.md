@@ -451,13 +451,22 @@ capacity variants and bounds, and qualify each supported profile combination.
 The first target profile uses the currently supported capacity contract and
 refuses combinations without a landed, qualified implementation.
 
-This entire target V1 format is **unreleased**. Action 16 and the appended
-`RunningReplaced` outcome (outcome tag 8) finalize wire 9/storage 7 before its
-first runtime release; earlier unlanded target peers are not interoperable with
-this finalization. Actions 0–15 and outcome tags 0–7 retain their exact meanings
-and bytes. Legacy 7/5 and reserved bounded-capacity 8/6 remain unchanged. This is
-target1/capacity0 only; it neither allocates joint 10/8 nor broadens revision
-whitelists or enables target+bounded support.
+Action 16 and the appended `RunningReplaced` outcome (outcome tag 8) implement
+ordinary Running replacement in `NetconfTargetsV1` at wire 9/storage 7 and the
+separate bounded `NetconfRunningV1` selection at wire 10/storage 8. Actions 0–15
+and outcome tags 0–7 retain their exact meanings and bytes; Legacy 7/5 and
+bounded-capacity 8/6 remain unchanged. The full target+bounded profile remains
+refused. Approval of this format contract under RFC #974 remains pending;
+whether earlier target V1 formats were supported or deployed is not established,
+so these allocations do not assert compatibility with such deployments.
+
+Bounded Running publication clears the existing recovery marker only for the
+exact authenticated current `RunningReplaced` result after its terminal record
+and independent checkpoint. Snapshot publication still precedes marker clearing.
+Audit prefix pruning retains the original result while that marker is owed.
+Closed-session cleanup may retire an authentically stale action-13 original as
+`Rejected`, checkpoint it, and prepare a distinct successor with the original
+closing deadline; unknown or still-applicable originals remain fenced.
 
 To avoid colliding with capacity append variants, the target command is appended
 inside the existing management-audit command family. At the inspected base,

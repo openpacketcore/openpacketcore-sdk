@@ -101,6 +101,19 @@ pub(super) struct Fixture {
 }
 impl Fixture {
     pub(super) async fn new(principal: &TrustedPrincipal) -> Self {
+        Self::with_profiles(
+            principal,
+            RetainedConfigProfile::NetconfTargetsV1,
+            opc_crypto::ConfigCapacityProfile::Legacy,
+        )
+        .await
+    }
+
+    pub(super) async fn with_profiles(
+        principal: &TrustedPrincipal,
+        profile: RetainedConfigProfile,
+        capacity: opc_crypto::ConfigCapacityProfile,
+    ) -> Self {
         let path = std::env::temp_dir().join(format!("opc-session-{}", RequestId::new()));
         std::fs::create_dir(&path).unwrap();
         let node = ConfigConsensusNodeId::new(1).unwrap();
@@ -113,7 +126,8 @@ impl Fixture {
             ConfigConsensusTopology::try_new(identity, node, BTreeSet::from([node])).unwrap();
         let binding = RetainedConfigBinding::new(topology.clone(), [0x31; 32], [0x61; 32])
             .unwrap()
-            .with_profile(RetainedConfigProfile::NetconfTargetsV1);
+            .with_profile(profile)
+            .with_capacity_profile(capacity);
         let backend = SqliteBackend::provision_config_authority(
             RetainedConfigOptions::new(
                 path.join("authority.sqlite"),

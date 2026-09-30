@@ -1140,19 +1140,37 @@ impl ConsensusConfigStore {
         .into_result()
     }
 
-    /// Clear a recovery marker on this local leader using the deterministic
-    /// lifecycle request identity.
+    /// Clear a recovery marker on this local leader. Bounded Running uses a
+    /// fresh attempt so a refusal before checkpoint completion can be retried.
     pub async fn clear_recovery_required_local(
         &self,
         tx_id: opc_types::TxId,
     ) -> Result<(), PersistError> {
-        let request_id = derive_durable_request_id(
-            self.inner.identity,
-            b"clear-recovery",
-            tx_id.as_uuid().as_bytes(),
-        );
+        let request_id = self.recovery_clear_request_id(tx_id);
         self.clear_recovery_required_local_idempotent(request_id, tx_id)
             .await
+    }
+
+    fn recovery_clear_request_id(
+        &self,
+        tx_id: opc_types::TxId,
+    ) -> opc_consensus::ConsensusRequestId {
+        if self.mode() == super::RetainedConfigMode::NetconfRunningV1 {
+            // The exact current marker is the idempotency authority. A cached
+            // rejection while its audit terminal/checkpoint is owed must not
+            // prevent a later eligible attempt from publishing that original.
+            derive_durable_request_id(
+                self.inner.identity,
+                b"running-publication-attempt",
+                uuid::Uuid::new_v4().as_bytes(),
+            )
+        } else {
+            derive_durable_request_id(
+                self.inner.identity,
+                b"clear-recovery",
+                tx_id.as_uuid().as_bytes(),
+            )
+        }
     }
 
     /// Create a rollback point with a caller-retained durable request ID.
@@ -2645,11 +2663,7 @@ impl ConfigStore for ConsensusConfigStore {
     }
 
     async fn clear_recovery_required(&self, tx_id: opc_types::TxId) -> Result<(), PersistError> {
-        let request_id = derive_durable_request_id(
-            self.inner.identity,
-            b"clear-recovery",
-            tx_id.as_uuid().as_bytes(),
-        );
+        let request_id = self.recovery_clear_request_id(tx_id);
         self.clear_recovery_required_idempotent(request_id, tx_id)
             .await
     }

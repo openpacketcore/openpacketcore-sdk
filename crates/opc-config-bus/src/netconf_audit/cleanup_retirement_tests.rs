@@ -351,7 +351,24 @@ async fn exact_rejected(fixture: &Fixture, original: &Original, terminal: bool) 
 
 #[tokio::test]
 async fn native_concurrent_cleanup_retires_stale_original_then_joins_both() {
-    let fixture = Fixture::new(&principal()).await;
+    concurrent_cleanup(Fixture::new(&principal()).await).await;
+}
+
+#[tokio::test]
+async fn bounded_concurrent_cleanup_retires_stale_original_then_joins_both() {
+    concurrent_cleanup(bounded_fixture().await).await;
+}
+
+async fn bounded_fixture() -> Fixture {
+    Fixture::with_profiles(
+        &principal(),
+        opc_persist::RetainedConfigProfile::NetconfRunningV1,
+        opc_crypto::ConfigCapacityProfile::BoundedV1,
+    )
+    .await
+}
+
+async fn concurrent_cleanup(fixture: Fixture) {
     let (mut first, a) = worker_with_original(&fixture).await;
     let (mut second, b) = worker_with_original(&fixture).await;
     fixture
@@ -476,7 +493,15 @@ async fn native_concurrent_cleanup_retires_stale_original_then_joins_both() {
 
 #[tokio::test]
 async fn native_cleanup_retirement_refuses_foreign_session_caller_and_payload() {
-    let fixture = Fixture::new(&principal()).await;
+    cleanup_retirement_bindings(Fixture::new(&principal()).await).await;
+}
+
+#[tokio::test]
+async fn bounded_cleanup_retirement_refuses_foreign_session_caller_and_payload() {
+    cleanup_retirement_bindings(bounded_fixture().await).await;
+}
+
+async fn cleanup_retirement_bindings(fixture: Fixture) {
     let (first, a) = worker_with_original(&fixture).await;
     let (second, b) = worker_with_original(&fixture).await;
     assert_eq!(joined(first).await, WorkerExit::Drained);

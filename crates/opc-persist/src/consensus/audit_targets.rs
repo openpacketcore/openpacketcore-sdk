@@ -68,6 +68,9 @@ use crate::audit_authority::{
 };
 use crate::{AuditKey, ConfigConsensusIdentity};
 
+#[path = "audit_target_publication.rs"]
+pub(super) mod publication;
+
 pub(super) const TARGET_STORAGE_VERSION: u16 = 7;
 const PROFILE_DOMAIN: &[u8] = b"openpacketcore/config-netconf/profile/v1\0";
 const TARGET_DOMAIN: &[u8] = b"openpacketcore/config-netconf/target/v1\0";

@@ -26,14 +26,15 @@ pub(in crate::consensus) enum Target {
     Admit(joint_running::NativeReceived),
     Apply(joint_running::NativeReceived),
     EmptyCommit(Unsupported),
-    RetireCleanup(Unsupported),
+    RetireCleanup(joint_running::NativeReceived),
 }
 impl From<Target> for TargetAuditCommandV1 {
     fn from(value: Target) -> Self {
         match value {
             Target::Admit(value) => Self::Admit(value.0),
             Target::Apply(value) => Self::Apply(value.0),
-            Target::EmptyCommit(value) | Target::RetireCleanup(value) => match value {},
+            Target::RetireCleanup(value) => Self::RetireCleanup(value.0),
+            Target::EmptyCommit(value) => match value {},
         }
     }
 }
@@ -106,7 +107,7 @@ pub(in crate::consensus) enum Intent {
     MarkConfirmed(Unsupported),
     CreateRollbackPoint(Unsupported),
     ResolveConfirmedAndAppend(Unsupported),
-    ClearRecoveryRequired(Unsupported),
+    ClearRecoveryRequired { tx_id: opc_types::TxId },
     RetainHistory(Unsupported),
     ManagementAudit(Box<Management>),
     AuditedMutation(Unsupported),
@@ -116,11 +117,11 @@ impl From<Intent> for ConfigMutationIntent {
     fn from(value: Intent) -> Self {
         match value {
             Intent::ManagementAudit(value) => Self::ManagementAudit(Box::new((*value).into())),
+            Intent::ClearRecoveryRequired { tx_id } => Self::ClearRecoveryRequired { tx_id },
             Intent::AppendCommit(value)
             | Intent::MarkConfirmed(value)
             | Intent::CreateRollbackPoint(value)
             | Intent::ResolveConfirmedAndAppend(value)
-            | Intent::ClearRecoveryRequired(value)
             | Intent::RetainHistory(value)
             | Intent::AuditedMutation(value)
             | Intent::BoundedAppend(value) => match value {},
@@ -130,10 +131,23 @@ impl From<Intent> for ConfigMutationIntent {
 
 pub(in crate::consensus) fn allows(intent: &ConfigMutationIntent) -> bool {
     match intent {
+        // Publication acknowledgement is checked against the exact retained
+        // Running outcome and its completed checkpoint inside native apply.
+        ConfigMutationIntent::ClearRecoveryRequired { .. } => true,
         ConfigMutationIntent::ManagementAudit(audit) => match audit.as_ref() {
             AuditCommand::NetconfTarget(target) => match target.as_ref() {
                 TargetAuditCommandV1::Admit(command) | TargetAuditCommandV1::Apply(command) => {
                     joint_running::allows_native(command)
+                }
+                TargetAuditCommandV1::RetireCleanup(command) => {
+                    joint_running::allows_native(command)
+                        && u8::from(command.effect.action) == 13
+                        && matches!(
+                            command.effect.resolution,
+                            Some(
+                                crate::consensus::audit_mutation::TargetResolutionV1::EndSession { .. }
+                            )
+                        )
                 }
                 _ => false,
             },

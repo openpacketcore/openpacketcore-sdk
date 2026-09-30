@@ -3828,6 +3828,26 @@ pub(crate) fn apply_entries_cancellable_sync(
                         "existing_chain_validated",
                     );
                     let mut result = match &command.intent {
+                        ConfigMutationIntent::ClearRecoveryRequired { tx_id }
+                            if mode == RetainedConfigMode::NetconfRunningV1 =>
+                        {
+                            match super::audit_targets::publication::authorize_clear_sync(
+                                &tx,
+                                audit_key,
+                                identity,
+                                audit_keys,
+                                *tx_id,
+                                cancellation,
+                            )? {
+                                Ok(()) => clear_recovery_required_sync(
+                                    &tx,
+                                    *tx_id,
+                                    logical_time,
+                                    command.request_id,
+                                )?,
+                                Err(error) => Err(error),
+                            }
+                        }
                         ConfigMutationIntent::AuditedMutation(prepared) => {
                             apply_audited_mutation_sync(
                                 &tx,

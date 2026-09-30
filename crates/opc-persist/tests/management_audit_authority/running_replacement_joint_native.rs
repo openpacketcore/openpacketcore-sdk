@@ -155,6 +155,16 @@ async fn prepare(
     request: u8,
     plaintext: &[u8],
 ) -> (PreparedTargetMutation, CommitRecord) {
+    prepare_with_marker(f, session, request, plaintext, false).await
+}
+
+async fn prepare_with_marker(
+    f: &Fixture,
+    session: &NetconfSessionOwner,
+    request: u8,
+    plaintext: &[u8],
+    recovery_required: bool,
+) -> (PreparedTargetMutation, CommitRecord) {
     let frozen = f.store.read_netconf_running_edit(session).await.unwrap();
     // Reserve before this SDK-owned record/encryption allocation, with the
     // destination's actual public pool; a provider claim alone cannot admit it.
@@ -164,7 +174,11 @@ async fn prepare(
         parent_tx_id: frozen.tx_id(),
         version: ConfigVersion::new(frozen.running_base_version() + 1),
         committed_at: Timestamp::now_utc(),
-        principal: PRINCIPAL.to_owned(),
+        principal: if recovery_required {
+            serde_json::json!({"principal": PRINCIPAL, "recovery_required": true}).to_string()
+        } else {
+            PRINCIPAL.to_owned()
+        },
         source: crate::CommitSource::Netconf,
         schema_digest: SchemaDigest::from_bytes([0x62; 32]),
         plaintext_digest: Sha256::digest(plaintext).to_vec(),
@@ -179,7 +193,7 @@ async fn prepare(
             record.tx_id,
             record.parent_tx_id,
             record.committed_at,
-            &record.principal,
+            PRINCIPAL,
             record.schema_digest,
             "running",
         )
@@ -230,6 +244,9 @@ async fn prepare(
     );
     (prepared, record)
 }
+
+#[path = "running_replacement_publication.rs"]
+mod publication;
 
 async fn readback(
     store: &ConsensusConfigStore,

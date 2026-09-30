@@ -519,6 +519,8 @@ impl ConsensusConfigStore {
     /// Remove an exact acknowledged prefix, only when every included operation
     /// is terminal and expired, no operation straddles the cut, and the external
     /// checkpoint is still proven. Exhaustion never triggers automatic data loss.
+    /// Bounded Running also retains its current original while publication's
+    /// recovery marker remains set.
     pub async fn retain_audit_history_through(
         &self,
         through: u64,
