@@ -175,6 +175,13 @@ impl ConfigRaftNetwork {
         request: &AppendEntriesRequest<ConfigRaftTypeConfig>,
         option: RPCOption,
     ) -> Result<AppendEntriesResponse<ConsensusNodeId>, EngineRpcError> {
+        #[cfg(feature = "dangerous-test-hooks")]
+        let original = super::capacity_observation::raft_buffers::OriginalAppend::start(
+            self.identity,
+            self.local_node_id,
+            self.target,
+            request,
+        );
         let entry_count = request.entries.len();
         let payload = match encode_config_wire_for_profile(self.capacity_profile, request) {
             Ok(payload) => payload,
@@ -202,6 +209,8 @@ impl ConfigRaftNetwork {
             request,
             &payload,
         );
+        #[cfg(feature = "dangerous-test-hooks")]
+        let original_wire = original.as_ref().map(|owner| owner.wire(&payload));
         let call = self.call(
             ConsensusRpcFamily::AppendEntries,
             opc_consensus::engine::RPCTypes::AppendEntries,
@@ -210,6 +219,8 @@ impl ConfigRaftNetwork {
         );
         #[cfg(feature = "dangerous-test-hooks")]
         let call = super::capacity_observation::scope_transport(observation, call);
+        #[cfg(feature = "dangerous-test-hooks")]
+        let call = super::capacity_observation::raft_buffers::scope_wire(original_wire, call);
         call.await
     }
 }

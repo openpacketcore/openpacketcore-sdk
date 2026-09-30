@@ -175,28 +175,31 @@ impl Buffers {
             );
         }
         shared.append_callbacks.fetch_add(1, Ordering::SeqCst);
-        shared.observer.observe_append(AppendOwnerSample {
-            source: shared.source,
-            request: shared.request,
-            batch,
-            stage,
-            preparations: preparation_totals(&preparations),
-            entries: self.entries,
-            selected_entries: self.selected_entries,
-            unmeasured_entries: self.unmeasured_entries,
-            completed_outputs: self.completed_outputs,
-            entry_payload_bytes: self.payloads.values().sum(),
-            selected_entry_bytes: self.selected_payloads.values().sum(),
-            descriptor_bytes: self.descriptors.values().sum(),
-            json_bytes: json.values().sum(),
-            selected_json_bytes: selected_json.values().sum(),
-            current_output_bytes: current.map_or(0, Vec::capacity),
-            current_output_len: current.map_or(0, Vec::len),
-            node_prepared_bytes,
-            selected_prepared_bytes,
-            selected_mutation_bytes: selected.values().sum(),
-            node_mutation_bytes: node.values().sum(),
-        });
+        shared.observer.observe_append_with_allocations(
+            AppendOwnerSample {
+                source: shared.source,
+                request: shared.request,
+                batch,
+                stage,
+                preparations: preparation_totals(&preparations),
+                entries: self.entries,
+                selected_entries: self.selected_entries,
+                unmeasured_entries: self.unmeasured_entries,
+                completed_outputs: self.completed_outputs,
+                entry_payload_bytes: self.payloads.values().sum(),
+                selected_entry_bytes: self.selected_payloads.values().sum(),
+                descriptor_bytes: self.descriptors.values().sum(),
+                json_bytes: json.values().sum(),
+                selected_json_bytes: selected_json.values().sum(),
+                current_output_bytes: current.map_or(0, Vec::capacity),
+                current_output_len: current.map_or(0, Vec::len),
+                node_prepared_bytes,
+                selected_prepared_bytes,
+                selected_mutation_bytes: selected.values().sum(),
+                node_mutation_bytes: node.values().sum(),
+            },
+            raft_buffers::AllocationView::new(shared.identity, shared.source, &node),
+        );
     }
 }
 

@@ -31,6 +31,7 @@ use crate::audit_authority::ledger::{EntryPayload as LedgerPayload, LedgerOperat
 
 pub(crate) mod append_buffers;
 pub use append_buffers::{AppendOwnerSample, AppendStage};
+pub mod raft_buffers;
 
 type Allocations = BTreeMap<usize, usize>;
 
@@ -285,6 +286,24 @@ pub trait NativeOwnerObserver: Send + Sync {
     /// Join transport here while the original native append buffers are borrowed.
     /// This is a separate instant from an apply callback, never an added peak.
     fn observe_append(&self, _sample: AppendOwnerSample) {}
+
+    /// Join original Raft owners while the exact current native union is borrowed.
+    fn observe_with_allocations(
+        &self,
+        sample: NativeOwnerSample,
+        _owners: raft_buffers::AllocationView<'_>,
+    ) {
+        self.observe(sample);
+    }
+
+    /// Join original Raft owners while the exact current append union is borrowed.
+    fn observe_append_with_allocations(
+        &self,
+        sample: AppendOwnerSample,
+        _owners: raft_buffers::AllocationView<'_>,
+    ) {
+        self.observe_append(sample);
+    }
 }
 
 struct Shared {
@@ -503,26 +522,29 @@ fn sample_owners(
         node.extend(native.iter().map(|(&address, &bytes)| (address, bytes)));
         selected.extend(native);
         shared.callbacks.fetch_add(1, Ordering::SeqCst);
-        shared.observer.observe(NativeOwnerSample {
-            source: shared.source,
-            stage,
-            preparations: preparation_totals(&preparations),
-            node_prepared_commands,
-            node_prepared_bytes,
-            selected_prepared_bytes,
-            native_command_bytes: active.command.values().sum(),
-            native_ledger_bytes: ledger.values().sum(),
-            native_derived_bytes: derived
-                .map_or(0, |values| values.capacity() * size_of::<LedgerOperation>()),
-            native_write_bytes: write.map_or(0, Vec::capacity),
-            native_is_distinct,
-            selected_mutation_bytes: selected.values().sum(),
-            node_mutation_bytes: node.values().sum(),
-            #[cfg(all(test, target_os = "linux"))]
-            independent_oracles_match: active.command.values().sum::<usize>()
-                == active.command_oracle_bytes
-                && ledger.values().sum::<usize>() == ledger_oracle_bytes,
-        });
+        shared.observer.observe_with_allocations(
+            NativeOwnerSample {
+                source: shared.source,
+                stage,
+                preparations: preparation_totals(&preparations),
+                node_prepared_commands,
+                node_prepared_bytes,
+                selected_prepared_bytes,
+                native_command_bytes: active.command.values().sum(),
+                native_ledger_bytes: ledger.values().sum(),
+                native_derived_bytes: derived
+                    .map_or(0, |values| values.capacity() * size_of::<LedgerOperation>()),
+                native_write_bytes: write.map_or(0, Vec::capacity),
+                native_is_distinct,
+                selected_mutation_bytes: selected.values().sum(),
+                node_mutation_bytes: node.values().sum(),
+                #[cfg(all(test, target_os = "linux"))]
+                independent_oracles_match: active.command.values().sum::<usize>()
+                    == active.command_oracle_bytes
+                    && ledger.values().sum::<usize>() == ledger_oracle_bytes,
+            },
+            raft_buffers::AllocationView::new(shared.identity, shared.source, &node),
+        );
     });
 }
 
