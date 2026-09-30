@@ -43,7 +43,13 @@ successor through the closed edit constructor:
 
 | Mode | Constructor | Intent | Proposed action | Typed applied result |
 | --- | --- | --- | --- | --- |
-| `edit-config` / advertised `edit-data` targeting running | `NetconfRunningWrite::edit` | Update | 16 | `EditedRunning { running_version }` |
+| `edit-config` / advertised `edit-data` targeting running | `NetconfRunningWrite::edit` | Replace / Update / Delete, from the request | 16 | `EditedRunning { running_version }` |
+
+The intent operation follows the actual request: Replace maps to
+`AuditOperation::Replace`, Patch maps to `AuditOperation::Update`, and Delete maps
+to `AuditOperation::Delete`, as required by the parent RFC. The closed pairing
+binds that operation to the validated successor; a caller cannot relabel an edit
+by supplying an unrelated audit operation.
 
 `prepare_netconf_running_write` takes that immutable pairing, the original
 session, event and fixed lifetime. Preparation authenticates the proposed
@@ -60,6 +66,11 @@ an edit base; it is not required to equal the edited successor. Copy from a
 datastore continues to use action 15 and its authenticated source equality.
 
 ## Admission, application and recovery
+
+The parent retained-target contract remains normative for this action, including
+apply-time session ownership and original-expiry checks, complete bounded command
+reservations, profile refusal before WAL admission, and authenticated replay,
+snapshot, history and export handling. This addition does not relax those rules.
 
 The original prepared handle and exact encrypted successor are retained before
 intent admission can be transmitted. Rejected or indeterminate intent admission
@@ -121,6 +132,10 @@ proposal grants no implicit migration or mixed-version compatibility.
   fresh-process/provider/leader recovery must retain the original operation.
 - Frozen original absence and an existing running record both work. Neither a
   newer base nor a source-copy envelope can be substituted during preparation.
+- Replace, Patch and Delete requests each retain their matching intent operation;
+  substituting another operation during preparation, admission or apply is refused
+  without an effect. The retained applied result and recovered terminal event
+  preserve the original request operation.
 - Lock/source/operation/result substitution, unknown tags, oversized/trailing
   encodings and legacy-profile use fail with typed, value-free errors.
 - Fix-removal and a distinct adversarial mutation hit their intended assertions,
