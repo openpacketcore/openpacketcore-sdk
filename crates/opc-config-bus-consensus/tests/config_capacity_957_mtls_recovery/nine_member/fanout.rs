@@ -4,6 +4,12 @@
 //! native deadlines. It releases those same calls before any allocation
 //! assertion; successful IO, readback, recovery and shutdown are prerequisites.
 
+#[path = "fanout/native_tail.rs"]
+mod native_tail;
+
+#[path = "fanout/working.rs"]
+mod working;
+
 use super::super::joint_metadata as joint;
 use super::*;
 use opc_crypto::capacity_observation::{
@@ -51,6 +57,7 @@ struct CallTiming {
 #[derive(Default)]
 struct State {
     source: Option<ConsensusNodeId>,
+    retained_targets: Option<BTreeSet<ConsensusNodeId>>,
     epoch: Option<tokio::time::Instant>,
     next: u64,
     rows: BTreeMap<u64, (Wire, usize)>,
@@ -154,6 +161,7 @@ impl Gate {
         let mut state = self.state.lock().unwrap();
         assert!(state.source.is_none() && state.rows.is_empty());
         state.source = Some(source);
+        state.retained_targets = None;
         state.epoch = Some(tokio::time::Instant::now());
     }
 
@@ -172,7 +180,12 @@ impl Gate {
         let mut changed = self.changed.subscribe();
         let guard = {
             let mut state = self.state.lock().unwrap();
-            if state.source != Some(request.sender) {
+            if state.source != Some(request.sender)
+                || state
+                    .retained_targets
+                    .as_ref()
+                    .is_some_and(|targets| !targets.contains(&target))
+            {
                 return None;
             }
             state.next = state.next.checked_add(1).expect("finite original calls");
@@ -226,8 +239,16 @@ impl Gate {
         };
         self.changed.send_replace(());
         loop {
-            if self.state.lock().unwrap().source.is_none() {
-                break;
+            {
+                let state = self.state.lock().unwrap();
+                if state.source.is_none()
+                    || state
+                        .retained_targets
+                        .as_ref()
+                        .is_some_and(|targets| !targets.contains(&target))
+                {
+                    break;
+                }
             }
             changed
                 .changed()
@@ -422,6 +443,15 @@ impl Gate {
             state.rows.values().map(|(wire, _)| *wire).collect(),
             identities.len(),
         )
+    }
+
+    fn retain_targets(&self, targets: BTreeSet<ConsensusNodeId>) {
+        {
+            let mut state = self.state.lock().unwrap();
+            assert!(state.source.is_some() && state.retained_targets.is_none());
+            state.retained_targets = Some(targets);
+        }
+        self.changed.send_replace(());
     }
 
     fn release(&self) {

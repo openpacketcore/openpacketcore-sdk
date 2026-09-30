@@ -20,7 +20,7 @@ const PREPARATIONS: usize = 8;
 
 #[derive(Default, Debug)]
 struct Transfers {
-    fanout: fanout::Gate,
+    fanout: Arc<fanout::Gate>,
     native_raft: Arc<std::sync::Mutex<BTreeMap<u64, u64>>>,
     large_append_success: [AtomicUsize; MEMBERS],
     active: AtomicUsize,
