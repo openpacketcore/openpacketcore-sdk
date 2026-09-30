@@ -29,6 +29,9 @@ use super::{
 };
 use crate::audit_authority::ledger::{EntryPayload as LedgerPayload, LedgerOperation, LedgerState};
 
+pub(crate) mod append_buffers;
+pub use append_buffers::{AppendOwnerSample, AppendStage};
+
 type Allocations = BTreeMap<usize, usize>;
 
 fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
@@ -278,6 +281,10 @@ pub struct NativeOwnerSample {
 pub trait NativeOwnerObserver: Send + Sync {
     /// Join a current transport census here, before the borrowed owners can drop.
     fn observe(&self, sample: NativeOwnerSample);
+
+    /// Join transport here while the original native append buffers are borrowed.
+    /// This is a separate instant from an apply callback, never an added peak.
+    fn observe_append(&self, _sample: AppendOwnerSample) {}
 }
 
 struct Shared {
@@ -291,6 +298,9 @@ struct Shared {
     transport_scopes: AtomicUsize,
     callbacks: AtomicUsize,
     next_transport: AtomicU64,
+    append_scopes: AtomicUsize,
+    append_callbacks: AtomicUsize,
+    next_append: AtomicU64,
 }
 
 static REGISTRY: LazyLock<Mutex<BTreeMap<usize, Weak<Shared>>>> =
@@ -307,6 +317,10 @@ pub struct NativeDrain {
     pub transport_scopes: usize,
     /// Total concrete native checkpoint callbacks, not a capacity total.
     pub callbacks: usize,
+    /// Selected synchronous append calls still running, including error unwind.
+    pub append_scopes: usize,
+    /// Concrete append checkpoints; contains no historical capacity maximum.
+    pub append_callbacks: usize,
 }
 
 /// Metadata-only exact-connection/request attachment; detach after joined work.
@@ -341,6 +355,9 @@ impl NativeRegistration {
             transport_scopes: AtomicUsize::new(0),
             callbacks: AtomicUsize::new(0),
             next_transport: AtomicU64::new(0),
+            append_scopes: AtomicUsize::new(0),
+            append_callbacks: AtomicUsize::new(0),
+            next_append: AtomicU64::new(0),
         });
         registry.insert(connection, Arc::downgrade(&shared));
         Some(Self { connection, shared })
@@ -368,6 +385,8 @@ impl NativeRegistration {
             native_scopes: self.shared.native_scopes.load(Ordering::SeqCst),
             transport_scopes: self.shared.transport_scopes.load(Ordering::SeqCst),
             callbacks: self.shared.callbacks.load(Ordering::SeqCst),
+            append_scopes: self.shared.append_scopes.load(Ordering::SeqCst),
+            append_callbacks: self.shared.append_callbacks.load(Ordering::SeqCst),
         }
     }
 }
@@ -461,30 +480,8 @@ fn sample_owners(
         // Keep this lock through the callback: a preparation registration cannot
         // disappear and permit its owner to drop between native and transport reads.
         let preparations = lock(&shared.preparations.state);
-        let mut node = Allocations::new();
-        let mut selected = Allocations::new();
-        let mut roots = BTreeSet::new();
-        for owner in preparations
-            .owners
-            .values()
-            .filter(|owner| owner.node == shared.source)
-        {
-            roots.insert(owner.root);
-            node.extend(
-                owner
-                    .allocations
-                    .iter()
-                    .map(|(&address, &bytes)| (address, bytes)),
-            );
-            if owner.root == shared.selected_root {
-                selected.extend(
-                    owner
-                        .allocations
-                        .iter()
-                        .map(|(&address, &bytes)| (address, bytes)),
-                );
-            }
-        }
+        let (mut node, mut selected, node_prepared_commands) =
+            preparation_allocations(&preparations, shared);
         let native_is_distinct = active
             .command
             .keys()
@@ -510,7 +507,7 @@ fn sample_owners(
             source: shared.source,
             stage,
             preparations: preparation_totals(&preparations),
-            node_prepared_commands: roots.len(),
+            node_prepared_commands,
             node_prepared_bytes,
             selected_prepared_bytes,
             native_command_bytes: active.command.values().sum(),
@@ -527,6 +524,37 @@ fn sample_owners(
                 && ledger.values().sum::<usize>() == ledger_oracle_bytes,
         });
     });
+}
+
+fn preparation_allocations(
+    preparations: &Preparations,
+    shared: &Shared,
+) -> (Allocations, Allocations, usize) {
+    let mut node = Allocations::new();
+    let mut selected = Allocations::new();
+    let mut roots = BTreeSet::new();
+    for owner in preparations
+        .owners
+        .values()
+        .filter(|owner| owner.node == shared.source)
+    {
+        roots.insert(owner.root);
+        node.extend(
+            owner
+                .allocations
+                .iter()
+                .map(|(&address, &bytes)| (address, bytes)),
+        );
+        if owner.root == shared.selected_root {
+            selected.extend(
+                owner
+                    .allocations
+                    .iter()
+                    .map(|(&address, &bytes)| (address, bytes)),
+            );
+        }
+    }
+    (node, selected, roots.len())
 }
 
 pub(crate) struct TypedTransport {

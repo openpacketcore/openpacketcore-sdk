@@ -25,6 +25,8 @@ use serde::Serialize;
 use sha2::{Digest, Sha256};
 
 #[cfg(feature = "dangerous-test-hooks")]
+use super::capacity_observation::append_buffers::{self, AppendScope, AppendStage};
+#[cfg(feature = "dangerous-test-hooks")]
 use super::completion_observation::Phase as CompletionPhase;
 use super::config_capacity_decode::engine as capacity_decode;
 #[cfg(all(test, target_os = "linux"))]
@@ -1490,7 +1492,13 @@ impl io::Write for BoundedJsonWriter<'_> {
             if next > output.capacity() {
                 return Err(invalid_data("config consensus encoding length changed"));
             }
+            #[cfg(feature = "dangerous-test-hooks")]
+            let first_write = output.is_empty() && !bytes.is_empty();
             output.extend_from_slice(bytes);
+            #[cfg(feature = "dangerous-test-hooks")]
+            if first_write {
+                append_buffers::encoding_output(AppendStage::JsonWriting, Some(output));
+            }
         }
         self.written = next;
         Ok(bytes.len())
@@ -1538,6 +1546,8 @@ fn encode_json_bounded_cancellable<T: Serialize + ?Sized>(
     output
         .try_reserve_exact(expected)
         .map_err(|_| io::Error::other("config consensus encoding allocation failed"))?;
+    #[cfg(feature = "dangerous-test-hooks")]
+    append_buffers::encoding_output(AppendStage::JsonAllocated, Some(&output));
     #[cfg(all(test, target_os = "linux"))]
     super::store::config_capacity_cost_observation::json_output_allocated(output.capacity());
     let mut writer = BoundedJsonWriter {
@@ -1548,6 +1558,15 @@ fn encode_json_bounded_cancellable<T: Serialize + ?Sized>(
         cancellation,
     };
     let encoded = crate::consensus::config_capacity_json::to_writer(&mut writer, value);
+    #[cfg(feature = "dangerous-test-hooks")]
+    append_buffers::encoding_output(
+        if encoded.is_err() || cancellation.is_cancelled() {
+            AppendStage::JsonRejected
+        } else {
+            AppendStage::JsonWritten
+        },
+        writer.bytes.as_ref(),
+    );
     if cancellation.is_cancelled() {
         return Err(timed_out("config consensus SQLite operation timed out"));
     }
@@ -2445,12 +2464,23 @@ pub(crate) fn append_logs_cancellable_sync(
             "config consensus log append exceeds entry-count limit",
         ));
     }
+    #[cfg(feature = "dangerous-test-hooks")]
+    let append_scope = AppendScope::start(conn, identity, entries);
     let mut encoded_entries = Vec::with_capacity(entries.len());
     let mut encoded_bytes = 0_usize;
     for entry in entries {
         #[cfg(all(test, target_os = "linux"))]
         let _cost_scope = super::store::config_capacity_cost_observation::Scope::append(entry);
-        cancellation.check_io()?;
+        #[cfg(feature = "dangerous-test-hooks")]
+        let append_encoding = append_scope
+            .as_ref()
+            .and_then(|scope| scope.encoding(entries, &encoded_entries));
+        #[cfg(feature = "dangerous-test-hooks")]
+        append_buffers::encoding_output(AppendStage::EncodingStarted, None);
+        cancellation.check_io().inspect_err(|_| {
+            #[cfg(feature = "dangerous-test-hooks")]
+            append_buffers::encoding_output(AppendStage::EncodingRejected, None);
+        })?;
         validate_entry(entry, identity, expected_members)?;
         let remaining = CONFIG_CONSENSUS_LOG_APPEND_MAX_BYTES
             .checked_sub(encoded_bytes)
@@ -2464,13 +2494,23 @@ pub(crate) fn append_logs_cancellable_sync(
             "config consensus log entry exceeds storage limit"
         };
         let encoded =
-            encode_json_bounded_cancellable(entry, entry_budget, limit_message, cancellation)?;
+            encode_json_bounded_cancellable(entry, entry_budget, limit_message, cancellation)
+                .inspect_err(|_| {
+                    #[cfg(feature = "dangerous-test-hooks")]
+                    append_buffers::encoding_output(AppendStage::EncodingRejected, None);
+                })?;
+        #[cfg(feature = "dangerous-test-hooks")]
+        drop(append_encoding);
         encoded_bytes = encoded_bytes
             .checked_add(encoded.len())
             .ok_or_else(|| invalid_data("config consensus log append byte count overflow"))?;
         #[cfg(all(test, target_os = "linux"))]
         native_io::encoded(entry, encoded.len());
         encoded_entries.push(encoded);
+    }
+    #[cfg(feature = "dangerous-test-hooks")]
+    if let Some(scope) = &append_scope {
+        scope.capture(entries, &encoded_entries, AppendStage::OutputsReady);
     }
     #[cfg(test)]
     super::storage::config_capacity_append_observations::observe("entries_encoded");
@@ -6420,3 +6460,7 @@ mod config_capacity_ledger_fault_tests;
 #[cfg(test)]
 #[path = "sqlite/config_capacity_retained_pointer_tests.rs"]
 mod config_capacity_retained_pointer_tests;
+
+#[cfg(all(test, feature = "dangerous-test-hooks"))]
+#[path = "sqlite/config_capacity_append_buffers_tests.rs"]
+mod config_capacity_append_buffers_tests;
