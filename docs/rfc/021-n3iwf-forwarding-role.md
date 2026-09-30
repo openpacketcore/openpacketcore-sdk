@@ -313,6 +313,7 @@ Construction validates the following rules exactly and refuses everything else:
 | At most one UE inner address per family in the session | TS 24.502 §8.3.2: one `INTERNAL_IP4_ADDRESS` or `INTERNAL_IP6_ADDRESS` from IKE_AUTH |
 | A UE inner address equals no UP address and neither N3 endpoint, and a UP address differs from the UPF address | SDK policy against aliasing |
 | Nonzero N3 link ifindex; both N3 TNLs in one family | Existing N3 intent rules |
+| A canonical uplink source-port policy (no port zero and no `Selected(2152)`) | Existing ordinary GTP-U rule |
 
 A Child SA with no explicit QFIs is valid, because `5G_QOS_INFO` allows "zero
 or more QFIs". The pure functions `uplink_admission` and `downlink_selection`
@@ -507,9 +508,11 @@ reports `Available` only for an attachment whose exact current program
 generation, maps, hooks and kernel profile are qualified by §10. The coarse
 `n3_forwarding_capability(N3ForwardingRole::N3iwf)` then follows it. The
 Linux kernel-GTP and unsupported adapters stay `Missing`. The mock implements
-the state lifecycle for tests with parity to this contract, reports it as
-available, and keeps reporting forwarding as `Missing` because it forwards no
-packets.
+readback, classified install, the flow swap and exact removal for tests, with
+the ordering and conflict rules of §5.5, and reports those four as available.
+It has no durable writer authority, so restart recovery and live-writer
+removal stay `Missing`, and it keeps reporting forwarding as `Missing` because
+it forwards no packets.
 
 ## 10. Delivery plan and acceptance evidence
 
