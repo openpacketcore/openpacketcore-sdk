@@ -87,6 +87,101 @@ the caller-owned object: the owner must drop it to reclaim its capacity. A
 frozen session remains immutable during live append or pruning. It is not
 restored after process loss; the consumer must start a newly verified export.
 
+## Online recipient verification without signing material
+
+[RFC 020](../rfc/020-online-audit-recipient-verification.md) defines this
+online trust and public API contract. Its acceptance and this implementation
+qualification are separate from authenticated application transport evidence.
+
+`begin_recipient_audit_export` adds an online authority-owned verification
+profile. The authority keeps its admitted `AuditKeyRing`, independent checkpoint
+port and existing export permit. `AuditRecipientClient` contains only public
+protocol state: the independently selected authority identity, authenticated
+recipient scope, an SDK-generated fresh random request nonce, and the exact
+returned session binding. The recipient receives neither signing keys nor a
+`VerifiedAuditExport`. The existing trusted-secret offline verifier remains
+unchanged; this online profile is not public-key proof or non-repudiation.
+
+The application supplies its existing authenticated export transport and export
+authorization. It must authenticate the expected authority independently of the
+response bytes and derive `AuditCaller` from trusted authentication on every
+server call. A decoded caller claim or possession of a session binding is not
+that authentication. The SDK's bounded request/binding/report codecs and closed
+client state check the fresh request, exact manifest and fixed expiry. They do
+not implement TLS, a network listener, recipient credential provisioning, or a
+replacement authorization policy. A client must feed `accept_opened` and
+`accept_report` only replies from that same admitted authority channel. Saved
+reports and decoded messages are untrusted data, not portable proofs. A hostile
+authority or compromised authenticated channel is outside this profile's trust
+boundary; export authorization does not grant any signing capability.
+
+The authority reserves the existing export slot before reading or freezing. It
+performs the existing quorum-current ledger read and independently loads and
+verifies the required external checkpoint. The exact checked object becomes
+`checkpoint_at_freeze`. The returned binding contains that witness, the full
+immutable manifest and the recipient's fresh request. The server retains one
+frozen row set and one constant-space streaming verifier, not a second snapshot,
+registry, queue or persistence owner. Existing 4096-row/16-MiB ledger, 256-row
+page and one-through-eight export-slot bounds remain. The new fixed-shape control
+messages have a 32-KiB encoded ceiling; received pages use the existing bounded
+page decoder. Applications must also bound input framing before allocation.
+
+Page generation never counts as received verification. The recipient sends the
+actual received page bytes back through the authorized channel; the authority
+calls the existing decoder and streaming verifier over those bytes. Exact order,
+all rows, transitions, cursor and terminal bindings must pass. A malformed page,
+wrong caller/binding, duplicate terminal page or failed decoder poisons receipt
+verification. Even an empty export requires its one empty terminal page. Once
+poisoned, the session cannot produce completion. The page generation method is
+read-only and may still refuse a bad fetch without poisoning received state.
+
+After complete received-range verification, finish performs another quorum read
+and fresh independent checkpoint load under the unchanged operation deadlines.
+It rechecks the original fixed expiry after those awaits. The current checkpoint
+must verify against the current ledger, must not precede the freeze witness, and
+must match its complete authenticated object at an equal sequence. A current
+ledger behind the frozen tail is refused; any retained overlap with the frozen
+tail or either checkpoint must have the same root, signing anchor and epoch.
+Outage, missing authority, coherent observed rollback, conflicting equal mark,
+wrong key or mismatched available overlap never yields a successful fresh report.
+No provider outage can fall back to the checkpoint captured at freeze.
+
+The report separates `checkpoint_at_freeze` from `checkpoint_at_finish`. Only the
+freeze witness establishes the reported independent coverage of the frozen
+range. Its manifest tail may include a newer uncheckpointed suffix. A later
+checkpoint is a fresh observation against the live authority, not proof that
+all archived suffix rows are rollback protected. Frozen pages remain unchanged
+through lawful append and pruning. If pruning removes a bridge to a later
+checkpoint, the report still states only the original freeze coverage; it does
+not infer a stronger relation from sequence counters. A request at an old floor
+continues to return `Pruned`, rather than silently choosing a new range.
+
+Verification performs no checkpoint CAS, maintenance command, export receipt or
+retention advance. `CompletedAuditRecipientVerification` stays on the authority
+and holds its genuine verifier result and export owner. Only the encoded report
+crosses the recipient boundary. The report has no constructor/conversion for a
+`VerifiedAuditExport`. The authority may separately authorize acknowledgement
+using the genuine completion and the existing acknowledgement API, which still
+checks expiry, recipient, exact prefix and independent checkpoint. Successful
+transport delivery is not proof of durable recipient archival.
+
+The authority-side authenticated connection owner must retain the session and
+drop it on disconnect or cancelled work. No SDK background task or new session
+registry is added. Cancellation of begin/finish releases the corresponding
+owned permit; dropping an unfinished session or completed result releases its
+frozen rows and historical key references without acknowledging anything.
+Expiry refuses further use but cannot reclaim an object its application owner
+continues to hold. A lost finish reply may be resent only from the same retained
+completion within the same fixed expiry and client binding. Process loss does
+not restore these objects: start a fresh nonce and manifest after authoritative
+reopen. Historical keys must remain available to the server until its retained
+owners are dropped; offline verification after key retirement is not promised.
+
+This additive online protocol does not change command, RPC, snapshot or ledger
+representations, continuity key rotation, WAL, or Durable/Async persistence
+semantics. It does not enable any protocol write capability. Runtime and actual
+platform transport qualification are separate from this API contract.
+
 ## External checkpoint and safe retention
 
 Fresh provisioning initializes an authenticated empty ledger and provisions an

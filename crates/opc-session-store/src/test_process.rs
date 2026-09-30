@@ -17,6 +17,12 @@ use std::sync::RwLock;
 #[cfg(target_os = "linux")]
 pub(crate) static SNAPSHOT_PROCESS_FD_GATE: RwLock<()> = RwLock::new(());
 
+#[cfg(target_os = "linux")]
+mod snapshot_descriptor_probe;
+
+#[cfg(target_os = "linux")]
+pub(crate) use snapshot_descriptor_probe::record_snapshot_seal_failure;
+
 /// Use for every child launch in this crate's shared unit-test process.
 pub(crate) trait CommandExt {
     fn test_spawn(&mut self) -> io::Result<Child>;

@@ -74,6 +74,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- `opc-persist`: add an online audit recipient client and authority-owned
+  verification session without exporting signing keys. Verify actual received
+  pages, frozen-range completeness and fresh independent checkpoints; bind
+  results to the original caller, authority, request and expiry. Verification
+  retains no acknowledgement authority at the recipient. The application owns
+  authenticated transport and authorization. Refs #959.
+
 - `opc-gtpu-dataplane` / `opc-gtpu-ebpf-common`: inner fragmentation is the
   default policy for an over-MTU downlink IPv4 packet with Don't Fragment set.
   Refs #1002.
