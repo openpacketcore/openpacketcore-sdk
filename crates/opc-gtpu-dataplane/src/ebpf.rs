@@ -5658,6 +5658,22 @@ impl EbpfGtpuDataplaneBackend {
         authority: EbpfTftAuthority,
         key: TftClassifierKey,
     ) -> TftUplinkClassifierRemovalOutcome {
+        // A TC invocation that copied the active selector before the fence
+        // may still read its rows; one that copies the fence reads none. Wait
+        // out the former once, before this attempt deletes any row, even when
+        // an earlier attempt published the fence. Outside the qualified kernel
+        // profile the wait is unavailable and removal proceeds without it.
+        let mut reader_grace_done = false;
+        let mut await_reader_grace = || {
+            reader_grace_done
+                || match self.inner.runtime.synchronize_tft_readers() {
+                    Ok(()) | Err(GtpuError::UnsupportedFeature { .. }) => {
+                        reader_grace_done = true;
+                        true
+                    }
+                    Err(_) => false,
+                }
+        };
         loop {
             let Some((raw_fence, records)) =
                 self.stable_tft_removal_fence_locked(expected, authority, key)
@@ -5680,6 +5696,9 @@ impl EbpfGtpuDataplaneBackend {
                 .collect::<Vec<_>>();
 
             if !authorized_active_keys.is_empty() {
+                if !await_reader_grace() {
+                    return TftUplinkClassifierRemovalOutcome::Indeterminate;
+                }
                 for record_key in authorized_active_keys {
                     if !matches!(
                         self.inner
@@ -5730,6 +5749,9 @@ impl EbpfGtpuDataplaneBackend {
             // Every active rank has been durably authorized and proved absent.
             // Any remaining records belong to the inactive bank and may be
             // cleaned idempotently under the same exact owner authority.
+            if !records.is_empty() && !await_reader_grace() {
+                return TftUplinkClassifierRemovalOutcome::Indeterminate;
+            }
             for (record_key, _) in records {
                 if !matches!(
                     self.inner
@@ -39469,6 +39491,12 @@ mod aya_runtime {
             }
             membarrier(MembarrierCommand::Global)
                 .map_err(|_| state_indeterminate("ebpf_selector_global_grace"))
+        }
+
+        fn synchronize_tft_readers(&self) -> Result<(), GtpuError> {
+            // TFT classifier readers are non-sleepable TC read-side sections,
+            // so the same qualified GLOBAL grace covers them.
+            self.synchronize_grouped_readers()
         }
 
         fn reset_workload_graph(

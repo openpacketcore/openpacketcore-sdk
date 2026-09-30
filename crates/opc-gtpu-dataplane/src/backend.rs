@@ -436,9 +436,9 @@ pub trait GtpuDataplaneBackend: Send + Sync + std::fmt::Debug {
     ///
     /// Removal never interrupts default-bearer uplink: while a classifier
     /// with a default bearer is being removed, including after an
-    /// interrupted removal, every unmarked packet it owns is forwarded as it
-    /// will be once the classifier is absent. A classifier without a default
-    /// bearer keeps dropping until it is absent.
+    /// interrupted removal, every unmarked packet it owns is forwarded as
+    /// either the complete classifier or its absent successor forwards it. A
+    /// classifier without a default bearer keeps dropping until it is absent.
     async fn remove_tft_uplink_classifier_exact(
         &self,
         _expected: TftUplinkClassifier,
