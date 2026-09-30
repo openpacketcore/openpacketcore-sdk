@@ -19,6 +19,8 @@ for TLS and service clients.
   SVID updates from a SPIRE-like Unix socket and emits reload events.
 - `FileSvidSource::new(cert_path, key_path, bundle_paths, poll_interval)` polls
   independently managed PEM files and emits the same state/events interface.
+  `shutdown(&mut self).await` stops the source and joins both owned async tasks;
+  `FileSvidShutdownError` reports task failures without carrying panic payloads.
 - `ProjectedSvidSource::new(volume_root, cert_file, key_file, bundle_files,
   poll_interval)` preserves the compatibility source without process-global
   telemetry. `new_authoritative(...)` is the production Kubernetes
@@ -51,6 +53,20 @@ fn file_source() -> FileSvidSource {
     )
 }
 ```
+
+Call `FileSvidSource::shutdown` while its Tokio runtime is running. Cancelling
+that future preserves the handles and any completed join results in the source,
+so another call resumes shutdown; completed calls are idempotent. A return,
+including an error, means both joins were observed. The poller finishes its
+current pass and can publish one final update. Shutdown has no fixed completion
+bound because filesystem I/O may block indefinitely.
+
+Dropping a file source requests cancellation of its async tasks but cannot await
+them. Blocking filesystem work started by `tokio::fs` can outlive cancellation;
+an aborted task's join is not evidence that such work has drained. Existing
+state subscriptions close after both tasks finish and retain the last snapshot;
+its expiry is no longer monitored. Event subscriptions close after the source is
+dropped and both async tasks have released their senders.
 
 For a projected Secret with keys `tls.crt`, `tls.key`, and `ca.crt`:
 
@@ -137,8 +153,9 @@ fn projected_source() -> ProjectedSvidSource {
 
 ## Compatibility
 
-`FileSvidSource`, `SvidWatcher`, `IdentityReloadEvent`, and their subscription
-APIs are unchanged. `ProjectedSvidSource` is additive and emits the same legacy
+`FileSvidSource` construction and subscriptions, `SvidWatcher`, and
+`IdentityReloadEvent` retain their existing APIs. File-source shutdown is
+additive; dropping a file source now requests task cancellation. `ProjectedSvidSource` is additive and emits the same legacy
 success/failure events; its failure strings are fixed reason codes. The opaque
 projected generation restarts at zero with the process and must not be persisted
 or compared across process restarts. Rollback to an earlier Kubernetes Secret

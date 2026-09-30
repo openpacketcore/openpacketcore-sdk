@@ -13,9 +13,10 @@ use opc_session_net::consensus::capacity_observation::NativeTransportOverlap;
 #[derive(Debug, Default)]
 struct NativeResults {
     decoded: Option<NativeOwnerSample>,
+    validated: Option<NativeOwnerSample>,
     mutation: Option<(NativeOwnerSample, Option<NativeTransportOverlap>)>,
     written: Option<NativeOwnerSample>,
-    counts: [usize; 3],
+    counts: [usize; 4],
 }
 
 // Owns only counter snapshots and transport controls; never the observed
@@ -36,6 +37,10 @@ impl NativeOwnerObserver for NativeBridge {
             NativeStage::DecodedLedger => {
                 results.counts[0] += 1;
                 results.decoded = Some(sample);
+            }
+            NativeStage::ValidatedLedger => {
+                results.counts[3] += 1;
+                results.validated = Some(sample);
             }
             NativeStage::AuthenticatedMutation => {
                 results.counts[1] += 1;
@@ -754,10 +759,10 @@ native_case!(
         );
         assert_eq!(
             native_results.counts,
-            [1, 1, 1],
-            "one actual decoded/mutation/write checkpoint"
+            [1, 1, 1, 1],
+            "one actual decoded/validated/mutation/write checkpoint"
         );
-        assert_eq!(native_drain.callbacks, 3);
+        assert_eq!(native_drain.callbacks, 4);
         assert!(!native_drain.registered);
         assert_eq!(native_drain.native_scopes, 0);
         assert_eq!(native_drain.transport_scopes, 0);
@@ -776,6 +781,10 @@ native_case!(
             "real independent native decoding, no prepared alias charge"
         );
         assert_eq!(native.native_write_bytes, 0);
+        assert_eq!(native.native_derived_bytes, 0);
+        let validated = native_results.validated.unwrap();
+        assert!(validated.native_derived_bytes > 0);
+        assert_eq!(validated.native_write_bytes, 0);
         assert!(native_results.decoded.unwrap().native_ledger_bytes > 0);
         assert!(native_results.written.unwrap().native_write_bytes > 0);
         assert_eq!(transport.pair.source, leader_id);

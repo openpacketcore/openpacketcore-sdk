@@ -163,7 +163,8 @@ pub use mock::{FaultInjectingStore, FaultType};
 pub use mock::{MockConfigStore, UnsafePathMock};
 pub use preflight::PersistCapabilities;
 pub use retained::{
-    RetainedConfigBinding, RetainedConfigDurability, RetainedConfigError, RetainedConfigOptions,
+    RetainedConfigBinding, RetainedConfigDurability, RetainedConfigError, RetainedConfigOpen,
+    RetainedConfigOpenRetirement, RetainedConfigOptions,
 };
 pub use security_policy::{
     ActivePolicyMetadata, PolicyHistoryEntry, SecurityPolicyError, SecurityPolicyService,

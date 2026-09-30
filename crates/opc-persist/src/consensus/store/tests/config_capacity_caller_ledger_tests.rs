@@ -32,6 +32,19 @@ use std::mem::size_of;
 struct BridgeOracles {
     census: Arc<crate::config_capacity_observation::PreparationCensus>,
     result: std::sync::Mutex<(usize, usize, usize)>,
+    derived: std::sync::Mutex<DerivedBridgeOracle>,
+}
+
+#[cfg(feature = "dangerous-test-hooks")]
+#[derive(Clone, Copy, Debug, Default)]
+struct DerivedBridgeOracle {
+    callbacks: usize,
+    capacity_bytes: usize,
+    selected_bytes: usize,
+    expected_selected_bytes: usize,
+    node_bytes: usize,
+    expected_node_bytes: usize,
+    matched_oracles: usize,
 }
 
 #[cfg(feature = "dangerous-test-hooks")]
@@ -45,6 +58,33 @@ impl crate::config_capacity_observation::NativeOwnerObserver for BridgeOracles {
             sample.stage
         );
         let counters = self.census.snapshot();
+        let derived =
+            crate::consensus::config_capacity_simultaneous_working_tests::ledger::live_derived_bytes();
+        if derived != 0 {
+            // The existing component observer is inside the real validate()
+            // scope. No returned ledger or historical peak can satisfy this.
+            let mut result = self.derived.lock().unwrap();
+            result.callbacks += 1;
+            result.capacity_bytes = derived;
+            result.selected_bytes = sample.selected_mutation_bytes;
+            result.expected_selected_bytes = sample.selected_prepared_bytes
+                + sample.native_command_bytes
+                + sample.native_ledger_bytes
+                + sample.native_write_bytes
+                + derived;
+            result.node_bytes = sample.node_mutation_bytes;
+            result.expected_node_bytes = sample.node_prepared_bytes
+                + sample.native_command_bytes
+                + sample.native_ledger_bytes
+                + sample.native_write_bytes
+                + derived;
+            result.matched_oracles += usize::from(
+                counters == sample.preparations
+                    && sample.native_is_distinct
+                    && sample.independent_oracles_match,
+            );
+            return;
+        }
         let mut result = self.result.lock().unwrap();
         result.0 += 1;
         result.1 += usize::from(sample.independent_oracles_match);
@@ -1014,6 +1054,7 @@ async fn public_audited_ledger_lifetime_with_native_owners(
     let bridge_oracles = Arc::new(BridgeOracles {
         census: bridge_census.clone(),
         result: std::sync::Mutex::new((0, 0, 0)),
+        derived: std::sync::Mutex::new(DerivedBridgeOracle::default()),
     });
     #[cfg(feature = "dangerous-test-hooks")]
     let bridge_registration = store
@@ -1085,6 +1126,22 @@ async fn public_audited_ledger_lifetime_with_native_owners(
         let drained = bridge_registration.snapshot();
         drop(bridge_preparation_owner);
         let preparation_drain = bridge_census.snapshot();
+        let derived = *bridge_oracles.derived.lock().unwrap();
+        println!("CONFIG_CAPACITY_NATIVE_DERIVED_LIFECYCLE observed={derived:?} exact_readback=true original_recovery=true retained_reopen=true joined_shutdown=true full_memory_bound=false");
+        assert_eq!(
+            derived.callbacks, 1,
+            "CONFIG_CAPACITY_NATIVE_DERIVED_CHECKPOINT_RED: observe the original derived Vec before validate returns"
+        );
+        assert!(derived.capacity_bytes > 0);
+        assert_eq!(derived.matched_oracles, 1);
+        assert_eq!(
+            derived.selected_bytes, derived.expected_selected_bytes,
+            "CONFIG_CAPACITY_NATIVE_DERIVED_BYTES_RED: charge the live validation Vec capacity"
+        );
+        assert_eq!(
+            derived.node_bytes, derived.expected_node_bytes,
+            "CONFIG_CAPACITY_NATIVE_DERIVED_NODE_RED: the same live allocation belongs to this node"
+        );
         println!("CONFIG_CAPACITY_NATIVE_BRIDGE_ORACLES_LIFECYCLE exact_readback=true original_recovery=true retained_reopen=true compared={} matched={}", result.0, result.1);
         assert_eq!((result.0, result.1), (3, 3), "CONFIG_CAPACITY_NATIVE_BRIDGE_ORACLE_RED: actual command_heap and ledger_heap capacities");
         println!("CONFIG_CAPACITY_NATIVE_COUNTER_READ_LIFECYCLE reads={} preparation_drain={preparation_drain:?} original_recovery=true retained_reopen=true joined_shutdown=true", result.2);

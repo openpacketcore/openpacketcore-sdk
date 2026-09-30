@@ -10,7 +10,6 @@ use std::marker::PhantomData;
 use std::rc::Rc;
 use std::sync::{Arc, Mutex};
 
-use serde::Deserialize;
 use tokio::runtime::{Handle, RuntimeFlavor};
 use tokio::sync::Notify;
 
@@ -312,9 +311,15 @@ pub(crate) fn deserialize_request<'de, D>(
 where
     D: serde::Deserializer<'de>,
 {
-    let request = SessionConsensusWireRequest::deserialize(deserializer)?;
+    let request = super::consensus_decode_tests::deserialize_request(deserializer)?;
+    capture_request(&request);
+    Ok(request)
+}
+
+/// Borrow the completed real payload before it moves into the outer enum.
+pub(crate) fn capture_request(request: &SessionConsensusWireRequest) {
     let Some(observation) = current() else {
-        return Ok(request);
+        return;
     };
     let owner = borrow(
         &request.payload,
@@ -345,5 +350,4 @@ where
     }
     drop(alias);
     drop(owner);
-    Ok(request)
 }

@@ -37,6 +37,7 @@ fn work() -> AdmissionWork {
         deadline: Instant::now() + Duration::from_secs(30),
         hook: None,
         lock_hook: None,
+        completion_hook: None,
     }
 }
 fn files(path: &Path) -> BTreeMap<std::ffi::OsString, Vec<u8>> {
