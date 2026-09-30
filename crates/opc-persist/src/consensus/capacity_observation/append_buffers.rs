@@ -8,7 +8,8 @@ use opc_consensus::engine::Entry;
 /// Concrete checkpoints within one native append, not independently added peaks.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum AppendStage {
-    /// Before the next entry's cancellation, validation and JSON count pass.
+    /// After semantic prevalidation, before the next entry's cancellation
+    /// check and JSON count pass.
     EncodingStarted,
     /// The current output has reserved its actual capacity but is still empty.
     JsonAllocated,
