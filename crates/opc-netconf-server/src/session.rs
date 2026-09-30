@@ -340,9 +340,16 @@ where
         };
         let rpc_xml = str::from_utf8(&message).map_err(|_| SessionError::InvalidUtf8)?;
         let session_id = registration.session_id();
+        // The retained worker owns accepted mutations beyond an RPC's lifetime.
+        // Legacy handlers must finish their owner bookkeeping before the
+        // session-exit confirmed-commit rollback can run.
+        #[cfg(feature = "required-netconf-audit")]
+        let interrupt_rpc = retained.is_some();
+        #[cfg(not(feature = "required-netconf-audit"))]
+        let interrupt_rpc = false;
         let result = tokio::select! {
             biased;
-            _ = registration.terminated() => {
+            _ = registration.terminated(), if interrupt_rpc => {
                 return Ok(SessionResult {
                     client_capabilities: client_hello.capabilities,
                     framing,

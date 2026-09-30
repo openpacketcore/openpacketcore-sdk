@@ -1153,6 +1153,8 @@ mod tests {
                 Arc::new(SessionEntry {
                     kill_tx,
                     active: AtomicBool::new(true),
+                    #[cfg(feature = "required-netconf-audit")]
+                    retained: Mutex::new(std::sync::Weak::new()),
                 }),
             );
 

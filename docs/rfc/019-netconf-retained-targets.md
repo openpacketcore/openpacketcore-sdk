@@ -150,8 +150,10 @@ After the mandatory kill observation succeeds, `kill-session` revokes that owner
 before acknowledging success, including when the victim cannot poll its RPC
 future. An owner attached after a concurrent kill observes the termination signal
 and is immediately revoked. The registry cannot prolong transport ownership,
-and a failed kill observation leaves the session usable. Termination interrupts
-the RPC reply future while the existing worker retains any accepted original.
+and a failed kill observation leaves the session usable. For an attached retained
+owner, termination interrupts the RPC reply future while the existing worker
+retains any accepted original. Legacy handlers finish their accepted confirmed
+commit bookkeeping before session-exit rollback runs.
 
 `NetconfAppliedReceipt::published_commit()` is populated only after the original
 audit/checkpoint obligation and exact committed readback are settled. The worker

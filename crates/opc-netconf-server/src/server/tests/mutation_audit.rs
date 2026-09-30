@@ -4,6 +4,8 @@
 
 use super::*;
 
+mod session_termination;
+
 #[derive(Clone, Copy, Debug)]
 enum LocalMutation {
     CandidateEdit,
