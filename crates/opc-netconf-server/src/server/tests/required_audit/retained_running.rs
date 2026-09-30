@@ -11,6 +11,7 @@ use opc_persist::ConfigStore;
 use std::sync::atomic::AtomicU8;
 
 mod fixture;
+mod kill_session;
 mod patch;
 use fixture::Fixture;
 

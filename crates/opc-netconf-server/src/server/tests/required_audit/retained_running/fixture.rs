@@ -280,6 +280,17 @@ pub(super) struct Fixture {
 }
 impl Fixture {
     pub(super) async fn new() -> Self {
+        Self::with_profiles(
+            RetainedConfigProfile::NetconfTargetsV1,
+            opc_crypto::ConfigCapacityProfile::Legacy,
+        )
+        .await
+    }
+
+    pub(super) async fn with_profiles(
+        profile: RetainedConfigProfile,
+        capacity: opc_crypto::ConfigCapacityProfile,
+    ) -> Self {
         let directory = tempfile::tempdir().unwrap();
         let node = ConfigConsensusNodeId::new(1).unwrap();
         let identity = ConfigConsensusIdentity::new(
@@ -294,7 +305,8 @@ impl Fixture {
                 directory.path().join("authority.sqlite"),
                 RetainedConfigBinding::new(topology.clone(), [0x33; 32], [0x34; 32])
                     .unwrap()
-                    .with_profile(RetainedConfigProfile::NetconfTargetsV1),
+                    .with_profile(profile)
+                    .with_capacity_profile(capacity),
                 RetainedConfigDurability::Ephemeral,
                 64 * 1024 * 1024,
                 Duration::from_secs(30),

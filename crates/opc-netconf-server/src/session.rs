@@ -167,13 +167,19 @@ where
     // aborted during hello, an RPC, response delivery, or post-loop cleanup.
     #[cfg(feature = "required-netconf-audit")]
     let retained_session = match &server.retained_sessions {
-        Some(audit) => Some(audit.open_session(principal).await.map_err(|_| {
-            SessionError::Io(std::io::Error::other(
-                "NETCONF session authority unavailable",
-            ))
-        })?),
+        Some(audit) => Some(std::sync::Arc::new(
+            audit.open_session(principal).await.map_err(|_| {
+                SessionError::Io(std::io::Error::other(
+                    "NETCONF session authority unavailable",
+                ))
+            })?,
+        )),
         None => None,
     };
+    #[cfg(feature = "required-netconf-audit")]
+    if let Some(retained) = &retained_session {
+        registration.bind_retained_session(retained);
+    }
 
     let session_id = registration.session_id();
     let result = AssertUnwindSafe(run_registered_session_loop(
@@ -186,11 +192,15 @@ where
             hello_session_id,
             sessions,
             #[cfg(feature = "required-netconf-audit")]
-            retained: retained_session.as_ref(),
+            retained: retained_session.as_deref(),
         },
     ))
     .catch_unwind()
     .await;
+    #[cfg(feature = "required-netconf-audit")]
+    if let Some(retained) = &retained_session {
+        retained.revoke();
+    }
     server
         .rollback_pending_confirmed_commit_for_session(session_id, principal)
         .await;
@@ -329,20 +339,29 @@ where
             });
         };
         let rpc_xml = str::from_utf8(&message).map_err(|_| SessionError::InvalidUtf8)?;
-        let result = server
-            .handle_rpc_inner_async_with_action(
+        let session_id = registration.session_id();
+        let result = tokio::select! {
+            biased;
+            _ = registration.terminated() => {
+                return Ok(SessionResult {
+                    client_capabilities: client_hello.capabilities,
+                    framing,
+                    rpc_count,
+                });
+            }
+            result = server.handle_rpc_inner_async_with_action(
                 RequestId::new(),
                 principal,
                 rpc_xml,
                 &config.limits,
                 SessionRpcContext {
-                    controls: Some((registration.session_id(), sessions)),
+                    controls: Some((session_id, sessions)),
                     active_subscription_count: usize::from(notification_receiver.is_some()),
                     #[cfg(feature = "required-netconf-audit")]
                     retained,
                 },
-            )
-            .await;
+            ) => result,
+        };
         let reply = result.reply;
         tokio::select! {
             _ = registration.terminated() => {

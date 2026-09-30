@@ -30,8 +30,9 @@ pub(crate) fn session_id_for_hello(session_id: u64) -> Option<NonZeroU32> {
 
 /// Shared registry of live NETCONF sessions for base `<kill-session>`.
 ///
-/// The registry stores only session ids and termination signals. It deliberately
-/// does not store principals, peer addresses, or request payloads.
+/// The registry stores session ids, termination signals and weak references to
+/// attached retained session owners. It does not store principals, peer addresses
+/// or request payloads, and cannot prolong a transport owner's lifetime.
 #[derive(Clone)]
 pub struct SessionRegistry {
     inner: Arc<Mutex<RegistryState>>,
@@ -134,6 +135,8 @@ impl SessionRegistry {
         let entry = Arc::new(SessionEntry {
             kill_tx,
             active: AtomicBool::new(true),
+            #[cfg(feature = "required-netconf-audit")]
+            retained: Mutex::new(std::sync::Weak::new()),
         });
         let mut state = self.inner.lock().unwrap_or_else(|err| err.into_inner());
         state.prune_inactive();
@@ -188,6 +191,21 @@ impl SessionRegistry {
         // The liveness pin makes send infallible with respect to receiver
         // disappearance. Ignore the result without exposing any stale receiver.
         let _ = entry.kill_tx.send(true);
+        // Signal before taking the attachment lock: a concurrently completed
+        // session opening either supplies this exact owner here or observes
+        // termination while attaching and revokes itself. Acknowledgement must
+        // not depend on the victim runner being scheduled again.
+        #[cfg(feature = "required-netconf-audit")]
+        {
+            let retained = entry
+                .retained
+                .lock()
+                .unwrap_or_else(|err| err.into_inner())
+                .upgrade();
+            if let Some(retained) = retained {
+                retained.revoke();
+            }
+        }
         Ok(KillSessionResult::Terminated)
     }
 
@@ -670,6 +688,8 @@ impl RegistryState {
 struct SessionEntry {
     kill_tx: watch::Sender<bool>,
     active: AtomicBool,
+    #[cfg(feature = "required-netconf-audit")]
+    retained: Mutex<std::sync::Weak<opc_config_bus::NetconfSession>>,
 }
 
 #[derive(Debug, Clone)]
@@ -815,6 +835,22 @@ pub(crate) struct SessionRegistration {
 }
 
 impl SessionRegistration {
+    /// Attach only the actual transport owner's exact registration generation.
+    /// A weak reference cannot delay final transport drop or retain serving
+    /// authority. A kill completed during opening must revoke this late owner.
+    #[cfg(feature = "required-netconf-audit")]
+    pub(crate) fn bind_retained_session(&self, retained: &Arc<opc_config_bus::NetconfSession>) {
+        let mut attached = self
+            .entry
+            .retained
+            .lock()
+            .unwrap_or_else(|err| err.into_inner());
+        *attached = Arc::downgrade(retained);
+        if self.is_terminated() {
+            retained.revoke();
+        }
+    }
+
     /// Registered session id.
     pub const fn session_id(&self) -> u64 {
         self.session_id

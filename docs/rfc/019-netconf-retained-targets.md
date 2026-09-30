@@ -145,6 +145,14 @@ reply cancellation does not cancel its owned operation. Only an acknowledged
 Intent grants the retained original permission to continue Apply after transport
 revocation. Indeterminate admission remains lookup-only recovery.
 
+The runner weakly binds its retained session owner to its exact local registration.
+After the mandatory kill observation succeeds, `kill-session` revokes that owner
+before acknowledging success, including when the victim cannot poll its RPC
+future. An owner attached after a concurrent kill observes the termination signal
+and is immediately revoked. The registry cannot prolong transport ownership,
+and a failed kill observation leaves the session usable. Termination interrupts
+the RPC reply future while the existing worker retains any accepted original.
+
 `NetconfAppliedReceipt::published_commit()` is populated only after the original
 audit/checkpoint obligation and exact committed readback are settled. The worker
 checks the original transaction, version, digest, request, caller and model before
