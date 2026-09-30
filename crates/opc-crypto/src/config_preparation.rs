@@ -19,14 +19,32 @@ pub struct ConfigPreparationPool {
 
 struct PoolInner {
     available: AtomicUsize,
+    // Retain the destination lifetime through every lease, without using this
+    // owner as pool identity or keeping a back-reference to the pool.
+    _owner: Option<Arc<dyn Send + Sync>>,
 }
 
 impl ConfigPreparationPool {
     /// Construct the version-one pool with exactly eight preparation slots.
     pub fn bounded_v1() -> Self {
+        Self::with_owner(None)
+    }
+
+    /// Construct eight slots retaining an opaque destination lifetime owner.
+    ///
+    /// The owner is released only after this pool and every reservation or
+    /// encrypted-envelope alias have dropped. Each call still creates a fresh
+    /// private pool identity; sharing the owner does not make reservations
+    /// interchangeable or merge the pools' capacity.
+    pub fn bounded_v1_with_owner(owner: Arc<dyn Send + Sync>) -> Self {
+        Self::with_owner(Some(owner))
+    }
+
+    fn with_owner(owner: Option<Arc<dyn Send + Sync>>) -> Self {
         Self {
             inner: Arc::new(PoolInner {
                 available: AtomicUsize::new(PREPARATION_SLOTS),
+                _owner: owner,
             }),
         }
     }
@@ -94,3 +112,6 @@ impl Drop for ConfigPreparationLease {
         self.pool.available.fetch_add(1, Ordering::Release);
     }
 }
+
+#[cfg(test)]
+mod tests;

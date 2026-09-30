@@ -244,6 +244,18 @@ async fn run_native_cancellation(profile: ConfigCapacityProfile) {
     store.shutdown().await.expect("stop native engine");
     drop(metrics);
     drop(store);
+    if profile == ConfigCapacityProfile::BoundedV1 {
+        assert_eq!(
+            SqliteBackend::reopen_config_authority(options.clone(), key.clone())
+                .await
+                .err(),
+            Some(crate::RetainedConfigError::InUse),
+            "the seven still-live preparations retain the original bounded engine"
+        );
+    }
+    // The pressure reservations have completed their ownership check. Retire
+    // them before admitting the next engine; shutdown alone cannot release them.
+    drop(_other_preparations);
     let reopened = SqliteBackend::reopen_config_authority(options, key)
         .await
         .expect("retained reopen");
