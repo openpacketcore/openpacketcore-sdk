@@ -19,6 +19,11 @@ use std::sync::{Arc, Mutex, MutexGuard};
 use opc_consensus::{ConsensusNodeId, ConsensusRpcFamily};
 use tokio::sync::watch;
 
+pub(crate) mod tls_allocations;
+pub use tls_allocations::{
+    TlsAllocationObserver, TlsAllocationPhase, TlsAllocationSource, TlsEndpoint,
+};
+
 mod inbound_sockets;
 pub(crate) use inbound_sockets::{
     current_inbound_listener, inbound_socket_phase, scope_inbound_socket, InboundSocket,
@@ -27,7 +32,8 @@ pub use inbound_sockets::{InboundSocketCensus, InboundSocketOwner, InboundSocket
 
 mod outbound_sockets;
 pub(crate) use outbound_sockets::{
-    observe_outbound_attempt, outbound_attempt_phase, OutboundSocket, OutboundSocketContext,
+    observe_outbound_attempt, outbound_attempt_phase, outbound_tls_material, OutboundSocket,
+    OutboundSocketContext,
 };
 pub use outbound_sockets::{
     OutboundAttemptOwner, OutboundAttemptPhase, OutboundSocketCensus, OutboundSocketOwner,
@@ -199,6 +205,13 @@ pub struct NativeTransportOverlap {
     pub current: CurrentTransportCensus,
     /// Actual acquisition waits, captured under the same lock as `current`.
     pub pending: PendingRpcCensus,
+    /// Accepted inbound TCP owners captured under the same observer lock.
+    /// These are endpoint counts, with the documented destructor tail, not bytes.
+    pub inbound: InboundSocketCensus,
+    /// Detached outbound attempts and TCP owners from this exact checkpoint.
+    /// Attempts overlap endpoints; inbound/outbound endpoints are not summed
+    /// as unique network connections, and no TLS storage is inferred.
+    pub outbound: OutboundSocketCensus,
 }
 
 #[derive(Clone, Copy, Default)]
@@ -285,6 +298,7 @@ struct State {
     outbound_attempts: BTreeMap<u64, OutboundAttemptOwner>,
     outbound_sockets: BTreeMap<u64, OutboundSocketOwner>,
     outbound_registration_exhausted: bool,
+    tls_allocations: Option<Arc<dyn TlsAllocationObserver>>,
     held_snapshot_target: Option<ConsensusNodeId>,
     native_source: Option<ConsensusNodeId>,
     held_append_target: Option<ConsensusNodeId>,
@@ -504,6 +518,15 @@ impl State {
             snapshot_call_id: snapshot_id,
             current,
             pending: self.pending_census(),
+            inbound: InboundSocketCensus {
+                owners: self.inbound_sockets.values().copied().collect(),
+                registration_exhausted: self.inbound_socket_registration_exhausted,
+            },
+            outbound: OutboundSocketCensus {
+                attempts: self.outbound_attempts.values().copied().collect(),
+                sockets: self.outbound_sockets.values().copied().collect(),
+                registration_exhausted: self.outbound_registration_exhausted,
+            },
         })
     }
 
@@ -1104,13 +1127,21 @@ mod native_arming_tests {
         assert_wire(&minority_wire, &minority_payload);
         assert_wire(&quorum_wire, &quorum_payload);
         assert_eq!(observation.snapshot().live, BufferTotals::default());
-        println!("CONFIG_CAPACITY_NATIVE_ARMING_LIFECYCLE original_wire=true drained=true no_timeout=true no_retry=true");
-        assert!(old_wrote_without_gate_release,
-            "CONFIG_CAPACITY_UNTYPED_SNAPSHOT_GATE_RED: an old untyped frame must reach actual IO without waiting for native quorum");
-        assert!(!old_satisfied_readiness,
-            "CONFIG_CAPACITY_UNTYPED_SNAPSHOT_READY_RED: an old untyped frame cannot satisfy the typed snapshot wait");
-        assert!(typed_ready && quorum_progress,
-            "CONFIG_CAPACITY_NATIVE_QUORUM_GATE_RED: the current typed pair releases only quorum traffic");
+        println!(
+            "CONFIG_CAPACITY_NATIVE_ARMING_LIFECYCLE original_wire=true drained=true no_timeout=true no_retry=true"
+        );
+        assert!(
+            old_wrote_without_gate_release,
+            "CONFIG_CAPACITY_UNTYPED_SNAPSHOT_GATE_RED: an old untyped frame must reach actual IO without waiting for native quorum"
+        );
+        assert!(
+            !old_satisfied_readiness,
+            "CONFIG_CAPACITY_UNTYPED_SNAPSHOT_READY_RED: an old untyped frame cannot satisfy the typed snapshot wait"
+        );
+        assert!(
+            typed_ready && quorum_progress,
+            "CONFIG_CAPACITY_NATIVE_QUORUM_GATE_RED: the current typed pair releases only quorum traffic"
+        );
         let pair = pair.expect("current typed append and snapshot are still owned together");
         assert_eq!(pair.pair.append_target, minority_target);
         assert_eq!(pair.pair.snapshot_target, snapshot_target);

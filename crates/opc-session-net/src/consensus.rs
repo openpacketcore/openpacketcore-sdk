@@ -54,6 +54,11 @@ use crate::protocol::{
 pub mod capacity_observation;
 
 #[cfg(feature = "test-control")]
+use capacity_observation::tls_allocations::{TlsHandshake, TlsIo, TlsOwner};
+#[cfg(feature = "test-control")]
+use capacity_observation::TlsAllocationPhase;
+
+#[cfg(feature = "test-control")]
 type ConsensusInboundStream = capacity_observation::InboundSocket;
 #[cfg(not(feature = "test-control"))]
 type ConsensusInboundStream = TcpStream;
@@ -1350,115 +1355,172 @@ impl ConsensusColdConnector {
             capacity_observation::outbound_attempt_phase(
                 capacity_observation::OutboundAttemptPhase::MaterialAdmission,
             );
-            let outcome = tls_config
-                .run_handshake(|attempt| {
-                    let connector = self.clone();
-                    async move {
-                        #[cfg(feature = "test-control")]
+            #[cfg(feature = "test-control")]
+            let material_context = std::sync::Mutex::new(None);
+            let operation = |attempt: opc_tls::TlsClientHandshake| {
+                let connector = self.clone();
+                #[cfg(feature = "test-control")]
+                let material = material_context
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .take();
+                async move {
+                    #[cfg(feature = "test-control")]
+                    capacity_observation::outbound_attempt_phase(
+                        capacity_observation::OutboundAttemptPhase::Resolving,
+                    );
+                    let addr = connector
+                        .target
+                        .resolve()
+                        .await
+                        .map_err(|_| SessionConsensusPeerError::Unavailable)?;
+                    #[cfg(feature = "test-control")]
+                    capacity_observation::outbound_attempt_phase(
+                        capacity_observation::OutboundAttemptPhase::Connecting,
+                    );
+                    let tcp = TcpStream::connect(addr)
+                        .await
+                        .map_err(|_| SessionConsensusPeerError::Unavailable)?;
+                    #[cfg(feature = "test-control")]
+                    let tcp = capacity_observation::OutboundSocket::new(tcp);
+                    #[cfg(feature = "test-control")]
+                    let outbound_socket_context = tcp.context();
+                    configure_consensus_tcp_socket(&tcp)
+                        .map_err(|_| SessionConsensusPeerError::Unavailable)?;
+                    #[cfg(not(feature = "test-control"))]
+                    let tls_connector = tokio_rustls::TlsConnector::from(
+                        consensus_client_tls_config(attempt.rustls_config()),
+                    );
+                    #[cfg(not(feature = "test-control"))]
+                    let server_name = connector.target.tls_server_name(addr)?;
+                    #[cfg(feature = "test-control")]
+                    let tls_connect = {
+                        let owner = tcp.tls_owner();
+                        TlsOwner::link_material(owner.as_ref(), material.as_ref());
+                        let mut tcp = Some(TlsIo::new(tcp, owner.as_ref()));
+                        let future =
+                            TlsOwner::run(owner.as_ref(), TlsAllocationPhase::Construct, || {
+                                let tcp =
+                                    tcp.take().ok_or(SessionConsensusPeerError::Unavailable)?;
+                                let tls_connector = tokio_rustls::TlsConnector::from(
+                                    consensus_client_tls_config(attempt.rustls_config()),
+                                );
+                                let server_name = connector.target.tls_server_name(addr)?;
+                                Ok::<_, SessionConsensusPeerError>(
+                                    tls_connector.connect(server_name, tcp),
+                                )
+                            })?;
+                        TlsHandshake::new(future, owner)
+                    };
+                    #[cfg(feature = "test-control")]
+                    {
                         capacity_observation::outbound_attempt_phase(
-                            capacity_observation::OutboundAttemptPhase::Resolving,
+                            capacity_observation::OutboundAttemptPhase::TlsHandshake,
                         );
-                        let addr = connector
-                            .target
-                            .resolve()
-                            .await
-                            .map_err(|_| SessionConsensusPeerError::Unavailable)?;
-                        #[cfg(feature = "test-control")]
-                        capacity_observation::outbound_attempt_phase(
-                            capacity_observation::OutboundAttemptPhase::Connecting,
-                        );
-                        let tcp = TcpStream::connect(addr)
-                            .await
-                            .map_err(|_| SessionConsensusPeerError::Unavailable)?;
-                        #[cfg(feature = "test-control")]
-                        let tcp = capacity_observation::OutboundSocket::new(tcp);
-                        #[cfg(feature = "test-control")]
-                        let outbound_socket_context = tcp.context();
-                        configure_consensus_tcp_socket(&tcp)
-                            .map_err(|_| SessionConsensusPeerError::Unavailable)?;
-                        let tls_connector = tokio_rustls::TlsConnector::from(
-                            consensus_client_tls_config(attempt.rustls_config()),
-                        );
-                        let server_name = connector.target.tls_server_name(addr)?;
-                        #[cfg(feature = "test-control")]
-                        {
-                            capacity_observation::outbound_attempt_phase(
-                                capacity_observation::OutboundAttemptPhase::TlsHandshake,
-                            );
-                            if let Some(context) = &outbound_socket_context {
-                                context
-                                    .phase(capacity_observation::OutboundSocketPhase::TlsHandshake);
-                            }
+                        if let Some(context) = &outbound_socket_context {
+                            context.phase(capacity_observation::OutboundSocketPhase::TlsHandshake);
                         }
-                        let tls_stream = tls_connector
-                            .connect(server_name, tcp)
-                            .await
-                            .map_err(map_tls_connect_error)?;
-                        if tls_stream.get_ref().1.alpn_protocol() != Some(SESSION_CONSENSUS_ALPN) {
-                            return Err(SessionConsensusPeerError::Protocol);
-                        }
-                        let peer = opc_tls::peer_tls_identity_from_client_connection(
-                            tls_stream.get_ref().1,
-                        )
+                    }
+                    #[cfg(not(feature = "test-control"))]
+                    let tls_stream = tls_connector
+                        .connect(server_name, tcp)
+                        .await
+                        .map_err(map_tls_connect_error)?;
+                    #[cfg(feature = "test-control")]
+                    let tls_stream = tls_connect.await.map_err(map_tls_connect_error)?;
+                    #[cfg(feature = "test-control")]
+                    let tls_connection = tls_stream
+                        .inner()
+                        .ok_or(SessionConsensusPeerError::Unavailable)?
+                        .get_ref()
+                        .1;
+                    #[cfg(not(feature = "test-control"))]
+                    let tls_connection = tls_stream.get_ref().1;
+                    if tls_connection.alpn_protocol() != Some(SESSION_CONSENSUS_ALPN) {
+                        return Err(SessionConsensusPeerError::Protocol);
+                    }
+                    let peer = opc_tls::peer_tls_identity_from_client_connection(tls_connection)
                         .map_err(|_| SessionConsensusPeerError::Authentication)?;
-                        if peer.spiffe_id().as_str()
-                            != connector.binding.remote_spiffe_id().as_str()
-                        {
-                            return Err(SessionConsensusPeerError::Authentication);
+                    if peer.spiffe_id().as_str() != connector.binding.remote_spiffe_id().as_str() {
+                        return Err(SessionConsensusPeerError::Authentication);
+                    }
+                    let tls_completion = TlsCompletionTime::now();
+                    let tls_completed_at = tls_completion.instant();
+                    let local_expiry = CertificateExpiryEvidence::capture(
+                        attempt.leaf_expires_at(),
+                        attempt.certificate_chain_expires_at(),
+                        tls_completion,
+                    );
+                    let peer_expiry = CertificateExpiryEvidence::capture(
+                        peer.leaf_expires_at(),
+                        peer.certificate_chain_expires_at(),
+                        tls_completion,
+                    );
+                    let lifecycle = ConnectionLifecycle::new(
+                        connector.lifecycle_policy,
+                        tls_completed_at,
+                        Some(local_expiry),
+                        Some(peer_expiry),
+                        epoch.reauthentication_generation,
+                        Some(attempt.epoch()),
+                    )
+                    .map_err(|_| SessionConsensusPeerError::Protocol)?;
+                    #[cfg(not(feature = "test-control"))]
+                    let (mut reader, mut writer) = tokio::io::split(tls_stream);
+                    #[cfg(feature = "test-control")]
+                    let (mut reader, mut writer) = tls_stream
+                        .split()
+                        .ok_or(SessionConsensusPeerError::Unavailable)?;
+                    #[cfg(feature = "test-control")]
+                    {
+                        capacity_observation::outbound_attempt_phase(
+                            capacity_observation::OutboundAttemptPhase::Bootstrap,
+                        );
+                        if let Some(context) = &outbound_socket_context {
+                            context.phase(capacity_observation::OutboundSocketPhase::Bootstrap);
                         }
-                        let tls_completion = TlsCompletionTime::now();
-                        let tls_completed_at = tls_completion.instant();
-                        let local_expiry = CertificateExpiryEvidence::capture(
-                            attempt.leaf_expires_at(),
-                            attempt.certificate_chain_expires_at(),
-                            tls_completion,
-                        );
-                        let peer_expiry = CertificateExpiryEvidence::capture(
-                            peer.leaf_expires_at(),
-                            peer.certificate_chain_expires_at(),
-                            tls_completion,
-                        );
-                        let lifecycle = ConnectionLifecycle::new(
-                            connector.lifecycle_policy,
-                            tls_completed_at,
-                            Some(local_expiry),
-                            Some(peer_expiry),
-                            epoch.reauthentication_generation,
-                            Some(attempt.epoch()),
-                        )
-                        .map_err(|_| SessionConsensusPeerError::Protocol)?;
-                        let (mut reader, mut writer) = tokio::io::split(tls_stream);
+                    }
+                    let (response_frame_size, request_frame_size) = connector
+                        .bootstrap(&mut reader, &mut writer, deadline)
+                        .await?;
+                    Ok::<_, SessionConsensusPeerError>((
+                        Box::new(reader) as Box<dyn AsyncRead + Unpin + Send>,
+                        Box::new(writer) as Box<dyn AsyncWrite + Unpin + Send>,
+                        response_frame_size,
+                        request_frame_size,
+                        tls_completed_at,
+                        lifecycle,
                         #[cfg(feature = "test-control")]
-                        {
-                            capacity_observation::outbound_attempt_phase(
-                                capacity_observation::OutboundAttemptPhase::Bootstrap,
-                            );
-                            if let Some(context) = &outbound_socket_context {
-                                context.phase(capacity_observation::OutboundSocketPhase::Bootstrap);
-                            }
-                        }
-                        let (response_frame_size, request_frame_size) = connector
-                            .bootstrap(&mut reader, &mut writer, deadline)
-                            .await?;
-                        Ok::<_, SessionConsensusPeerError>((
-                            Box::new(reader) as Box<dyn AsyncRead + Unpin + Send>,
-                            Box::new(writer) as Box<dyn AsyncWrite + Unpin + Send>,
-                            response_frame_size,
-                            request_frame_size,
-                            tls_completed_at,
-                            lifecycle,
-                            #[cfg(feature = "test-control")]
-                            outbound_socket_context,
-                        ))
-                    }
-                })
-                .await
-                .map_err(|error| match error {
-                    opc_tls::TlsHandshakeRunError::Material(_) => {
-                        SessionConsensusPeerError::Authentication
-                    }
-                    opc_tls::TlsHandshakeRunError::Operation(error) => error,
-                })?;
+                        outbound_socket_context,
+                    ))
+                }
+            };
+            #[cfg(not(feature = "test-control"))]
+            let outcome = tls_config.run_handshake(operation).await;
+            #[cfg(feature = "test-control")]
+            let outcome = tls_config
+                .run_handshake_observed(
+                    |construct| {
+                        let owner = capacity_observation::outbound_tls_material();
+                        *material_context
+                            .lock()
+                            .unwrap_or_else(std::sync::PoisonError::into_inner) =
+                            owner.as_ref().map(TlsOwner::context);
+                        TlsOwner::run(
+                            owner.as_ref(),
+                            TlsAllocationPhase::MaterialConstruct,
+                            construct,
+                        );
+                    },
+                    operation,
+                )
+                .await;
+            let outcome = outcome.map_err(|error| match error {
+                opc_tls::TlsHandshakeRunError::Material(_) => {
+                    SessionConsensusPeerError::Authentication
+                }
+                opc_tls::TlsHandshakeRunError::Operation(error) => error,
+            })?;
             let admission = outcome.admission();
             if Some(admission.epoch()) != epoch.material_epoch {
                 return Err(SessionConsensusPeerError::Unavailable);
@@ -3775,21 +3837,65 @@ async fn handle_consensus_connection(
             capacity_observation::InboundSocketPhase::TlsSetup,
         );
         let generation = reauthentication.generation();
+        #[cfg(not(feature = "test-control"))]
         let handshake = tls_config
             .begin_handshake()
             .map_err(|_| ProtocolError::Authentication)?;
+        #[cfg(feature = "test-control")]
+        let (handshake, material) = {
+            let owner = stream.tls_material_owner();
+            let handshake = tls_config
+                .begin_handshake_observed(|construct| {
+                    TlsOwner::run(
+                        owner.as_ref(),
+                        TlsAllocationPhase::MaterialConstruct,
+                        construct,
+                    );
+                })
+                .map_err(|_| ProtocolError::Authentication)?;
+            (handshake, owner.as_ref().map(TlsOwner::context))
+        };
+        #[cfg(not(feature = "test-control"))]
         let acceptor =
             tokio_rustls::TlsAcceptor::from(consensus_server_tls_config(handshake.rustls_config()));
+        #[cfg(feature = "test-control")]
+        let tls_accept = {
+            let owner = stream.tls_owner();
+            TlsOwner::link_material(owner.as_ref(), material.as_ref());
+            let mut stream = Some(TlsIo::new(stream, owner.as_ref()));
+            let future = TlsOwner::run(owner.as_ref(), TlsAllocationPhase::Construct, || {
+                let stream = stream.take().ok_or(ProtocolError::UnexpectedResponse)?;
+                let acceptor = tokio_rustls::TlsAcceptor::from(consensus_server_tls_config(
+                    handshake.rustls_config(),
+                ));
+                Ok::<_, ProtocolError>(acceptor.accept(stream))
+            })?;
+            TlsHandshake::new(future, owner)
+        };
+        #[cfg(not(feature = "test-control"))]
         let tls_stream = tokio::time::timeout_at(setup_deadline, acceptor.accept(stream))
+            .await
+            .map_err(|_| consensus_setup_timeout_error())?
+            .map_err(classify_tls_io_error)?;
+        #[cfg(feature = "test-control")]
+        let tls_stream = tokio::time::timeout_at(setup_deadline, tls_accept)
             .await
             .map_err(|_| consensus_setup_timeout_error())?
             .map_err(classify_tls_io_error)?;
         let tls_completion = TlsCompletionTime::now();
         let established_at = tls_completion.instant();
-        if tls_stream.get_ref().1.alpn_protocol() != Some(SESSION_CONSENSUS_ALPN) {
+        #[cfg(feature = "test-control")]
+        let tls_connection = tls_stream
+            .inner()
+            .ok_or(ProtocolError::UnexpectedResponse)?
+            .get_ref()
+            .1;
+        #[cfg(not(feature = "test-control"))]
+        let tls_connection = tls_stream.get_ref().1;
+        if tls_connection.alpn_protocol() != Some(SESSION_CONSENSUS_ALPN) {
             return Err(ProtocolError::UnexpectedResponse);
         }
-        let peer = opc_tls::peer_tls_identity_from_server_connection(tls_stream.get_ref().1)
+        let peer = opc_tls::peer_tls_identity_from_server_connection(tls_connection)
             .map_err(|_| ProtocolError::Authentication)?;
         let local_certificate_expiry = CertificateExpiryEvidence::capture(
             handshake.leaf_expires_at(),
@@ -3801,7 +3907,12 @@ async fn handle_consensus_connection(
             peer.certificate_chain_expires_at(),
             tls_completion,
         );
+        #[cfg(not(feature = "test-control"))]
         let (mut reader, mut writer) = tokio::io::split(tls_stream);
+        #[cfg(feature = "test-control")]
+        let (mut reader, mut writer) = tls_stream
+            .split()
+            .ok_or(ProtocolError::UnexpectedResponse)?;
         #[cfg(feature = "test-control")]
         capacity_observation::inbound_socket_phase(
             capacity_observation::InboundSocketPhase::Bootstrap,
@@ -4471,12 +4582,15 @@ mod tests {
     mod negotiated_loss;
     #[cfg(all(feature = "test-control", feature = "insecure-test"))]
     pub(super) mod outbound_sockets;
+
     #[cfg(feature = "test-control")]
     mod pending_rpc;
     #[cfg(feature = "test-control")]
     mod rejected_decode;
     #[cfg(all(feature = "test-control", feature = "insecure-test"))]
     mod setup_cleanup;
+    #[cfg(all(feature = "test-control", feature = "insecure-test"))]
+    mod tls_allocations;
 
     use std::sync::atomic::AtomicUsize;
     use std::sync::Mutex as StdMutex;

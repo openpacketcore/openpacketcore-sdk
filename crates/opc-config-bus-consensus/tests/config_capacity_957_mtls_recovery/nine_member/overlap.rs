@@ -8,7 +8,9 @@ use opc_persist::config_capacity_observation::{
     NativeOwnerObserver, NativeOwnerSample, NativeRegistration, NativeStage, PreparationCensus,
 };
 use opc_persist::{ConfigHistoryLimits, ConfigHistoryRetention};
-use opc_session_net::consensus::capacity_observation::NativeTransportOverlap;
+use opc_session_net::consensus::capacity_observation::{
+    NativeTransportOverlap, OutboundSocketPhase,
+};
 
 #[derive(Debug, Default)]
 struct NativeResults {
@@ -64,18 +66,23 @@ async fn listen_one(
     pki: &Pki,
     manifest: &Arc<SessionReplicationManifest>,
     addresses: &[Arc<RwLock<Option<SocketAddr>>>; MEMBERS],
+    observation: &Arc<ConsensusBufferObservation>,
 ) -> (SessionConsensusServerHandle, Released) {
     let (handler, released) = observed_handler(&stores[member]);
-    let (server, address) = SessionConsensusServer::new(
+    let listener = SessionConsensusServer::new(
         handler,
         pki.server(member),
         manifest
             .bind_local(replica_id(member))
             .expect("original nine-voter binding"),
     )
-    .listen("127.0.0.1:0".parse().unwrap())
-    .await
-    .expect("real authenticated listener");
+    .listen("127.0.0.1:0".parse().unwrap());
+    // Each real listener captures enrollment when listen is polled. Merely
+    // observing outbound clients does not enroll these separately spawned tasks.
+    let (server, address) = observation
+        .scope_inbound_sockets(listener)
+        .await
+        .expect("real authenticated listener");
     *addresses[member].write().unwrap() = Some(address);
     (server, released)
 }
@@ -165,10 +172,19 @@ async fn snapshot_vote_checkpoint(
     let agreement = agreement.expect("the exact observed native heartbeat returned, not cancelled");
     let source_status = stores[source].status();
     let target_status = stores[target].status();
-    println!("CONFIG_CAPACITY_SNAPSHOT_VOTE_CHECKPOINT force={force} source={:?} target={:?} vote={:?} accepted={} reason={} higher={:?} elapsed_ms={} local_authority={authority:?} source_term={} target_term={} target_leader={:?}",
-        source_status.node_id, target_status.node_id, agreement.vote, agreement.accepted, agreement.reason,
-        agreement.higher, agreement.started.elapsed().as_millis(), source_status.term,
-        target_status.term, target_status.leader_id);
+    println!(
+        "CONFIG_CAPACITY_SNAPSHOT_VOTE_CHECKPOINT force={force} source={:?} target={:?} vote={:?} accepted={} reason={} higher={:?} elapsed_ms={} local_authority={authority:?} source_term={} target_term={} target_leader={:?}",
+        source_status.node_id,
+        target_status.node_id,
+        agreement.vote,
+        agreement.accepted,
+        agreement.reason,
+        agreement.higher,
+        agreement.started.elapsed().as_millis(),
+        source_status.term,
+        target_status.term,
+        target_status.leader_id
+    );
     assert!(
         tokio::time::Instant::now() < deadline,
         "native vote setup barrier stays inside the prior proof budget"
@@ -217,6 +233,7 @@ async fn stop(
     servers: Vec<Option<SessionConsensusServerHandle>>,
     released: Vec<Released>,
     addresses: &[Arc<RwLock<Option<SocketAddr>>>; MEMBERS],
+    observation: &Arc<ConsensusBufferObservation>,
 ) {
     for (store, server) in stores.iter().zip(servers) {
         if let Some(server) = server {
@@ -237,6 +254,15 @@ async fn stop(
     for address in addresses {
         *address.write().unwrap() = None;
     }
+    // Producers and listeners have stopped and original peer pools are gone.
+    // Observe the final TCP/attempt destructor tails under the existing guard;
+    // this is not a join of unobserved tasks or a private TLS allocation barrier.
+    tokio::time::timeout(DURABLE_CONSENSUS_OPERATION_TIMEOUT, async {
+        observation.wait_for_no_inbound_sockets().await;
+        observation.wait_for_no_outbound_owners().await;
+    })
+    .await
+    .expect("original endpoint census drains after native shutdown");
 }
 
 native_case!(
@@ -263,7 +289,8 @@ native_case!(
         let mut servers = Vec::new();
         let mut released = Vec::new();
         for member in 0..MEMBERS {
-            let (server, receipt) = listen_one(&stores, member, &pki, &manifest, &addresses).await;
+            let (server, receipt) =
+                listen_one(&stores, member, &pki, &manifest, &addresses, &observation).await;
             servers.push(Some(server));
             released.push(receipt);
         }
@@ -369,7 +396,7 @@ native_case!(
         .expect("production compaction finishes under original guard");
         assert_eq!(effect_counts(&databases[lagging]), offline_counts);
         assert!(snapshot::current_snapshot(&databases[lagging]).is_none());
-        stop(None, stores, servers, released, &addresses).await;
+        stop(None, stores, servers, released, &addresses, &observation).await;
         assert_eq!(observation.snapshot().live.calls, 0);
 
         // Every donor has purged beyond the lagging prefix. Keep the real
@@ -378,7 +405,9 @@ native_case!(
         for transfer in &transfers {
             transfer.defer_snapshots[lagging].store(true, Ordering::SeqCst);
         }
-        println!("CONFIG_CAPACITY_NINE_OVERLAP_PHASE phase=reopened stage=snapshot_fault_armed target={lagging}");
+        println!(
+            "CONFIG_CAPACITY_NINE_OVERLAP_PHASE phase=reopened stage=snapshot_fault_armed target={lagging}"
+        );
         let stores = open_nine(
             &directory,
             &manifest,
@@ -393,7 +422,8 @@ native_case!(
             (0..MEMBERS).map(|_| None).collect();
         let mut released = Vec::new();
         for (member, slot) in servers.iter_mut().enumerate() {
-            let (server, receipt) = listen_one(&stores, member, &pki, &manifest, &addresses).await;
+            let (server, receipt) =
+                listen_one(&stores, member, &pki, &manifest, &addresses, &observation).await;
             *slot = Some(server);
             released.push(receipt);
         }
@@ -545,15 +575,19 @@ native_case!(
         for transfer in &transfers {
             transfer.defer_snapshots[lagging].store(false, Ordering::SeqCst);
         }
-        assert!(transfers.iter().all(|transfer| transfer
-            .defer_snapshots
-            .iter()
-            .all(|deferred| !deferred.load(Ordering::SeqCst))));
+        assert!(transfers.iter().all(|transfer| {
+            transfer
+                .defer_snapshots
+                .iter()
+                .all(|deferred| !deferred.load(Ordering::SeqCst))
+        }));
         let deferred_requests: usize = transfers
             .iter()
             .map(|transfer| transfer.deferred_snapshot_attempts[lagging].load(Ordering::SeqCst))
             .sum();
-        println!("CONFIG_CAPACITY_NINE_OVERLAP_PHASE phase=overlap stage=snapshot_fault_released deferred_requests={deferred_requests}");
+        println!(
+            "CONFIG_CAPACITY_NINE_OVERLAP_PHASE phase=overlap stage=snapshot_fault_released deferred_requests={deferred_requests}"
+        );
         paused_snapshot.resume();
         let old_snapshot_progress = tokio::time::timeout(
             DURABLE_CONSENSUS_OPERATION_TIMEOUT,
@@ -588,7 +622,9 @@ native_case!(
             AuditAdmission::Rejected(_) => "rejected",
             AuditAdmission::Unknown(_) => "unknown",
         };
-        println!("CONFIG_CAPACITY_NINE_OVERLAP_SUBMISSION intent_age_ms={intent_age_ms} submission_ms={submission_ms} disposition={disposition}");
+        println!(
+            "CONFIG_CAPACITY_NINE_OVERLAP_SUBMISSION intent_age_ms={intent_age_ms} submission_ms={submission_ms} disposition={disposition}"
+        );
         let receipt = match result {
             AuditAdmission::Applied(receipt) => receipt,
             AuditAdmission::Rejected(error) => panic!(
@@ -662,12 +698,15 @@ native_case!(
             servers,
             released,
             &addresses,
+            &observation,
         )
         .await;
         let native_drain = native_registration.snapshot();
         let native_results = std::mem::take(&mut *native_bridge.results.lock().unwrap());
         drop(native_registration);
         let drained = observation.snapshot();
+        let inbound_drained = observation.inbound_socket_snapshot();
+        let outbound_drained = observation.outbound_socket_snapshot();
         assert_eq!(drained.live, Default::default());
 
         let stores = open_nine(
@@ -683,7 +722,8 @@ native_case!(
         let mut servers = Vec::new();
         let mut released = Vec::new();
         for member in 0..MEMBERS {
-            let (server, receipt) = listen_one(&stores, member, &pki, &manifest, &addresses).await;
+            let (server, receipt) =
+                listen_one(&stores, member, &pki, &manifest, &addresses, &observation).await;
             servers.push(Some(server));
             released.push(receipt);
         }
@@ -710,14 +750,16 @@ native_case!(
             committed,
             "original handle recovery and reopen do not resubmit or mutate effects"
         );
-        stop(None, stores, servers, released, &addresses).await;
+        stop(None, stores, servers, released, &addresses, &observation).await;
         assert_eq!(observation.snapshot().live, Default::default());
         for transfer in &transfers {
             assert_eq!(transfer.active.load(Ordering::SeqCst), 0);
             assert_eq!(transfer.active_capacity.load(Ordering::SeqCst), 0);
         }
         // Allocation assertions follow the entire real lifecycle in every control.
-        println!("CONFIG_CAPACITY_NINE_OVERLAP_LIFECYCLE members=9 prepared=72 audited_commits=1 append_targets=7 snapshot_chunks={chunks} exact_readback=true original_handle=true original_paths=true drained=true native_wal=true durability=Durable");
+        println!(
+            "CONFIG_CAPACITY_NINE_OVERLAP_LIFECYCLE members=9 prepared=72 audited_commits=1 append_targets=7 snapshot_chunks={chunks} exact_readback=true original_handle=true original_paths=true drained=true native_wal=true durability=Durable"
+        );
         let overlap = overlap.expect(
             "CONFIG_CAPACITY_FRAME_OVERLAP_RED: real append and snapshot frame intersection",
         );
@@ -734,23 +776,37 @@ native_case!(
             overlap.frame_allocations > 2,
             "CONFIG_CAPACITY_FRAME_OWNER_RED: actual independent boxed frame owners"
         );
-        assert!(overlap.frame_bytes > overlap.rpc_bytes,
-        "CONFIG_CAPACITY_FRAME_OWNER_RED: actual outer JSON capacities overlap actual RPC buffers");
-        println!("CONFIG_CAPACITY_SNAPSHOT_VOTE_ALIGNMENT_LIFECYCLE agreement={setup_vote:?} source_term={} target_term={} target_leader={:?} original_call=true joined_shutdown=true",
-            vote_at_arm.0.term, vote_at_arm.1.term, vote_at_arm.1.leader_id);
-        assert!(setup_vote.is_some_and(|agreement| agreement.accepted
-            && agreement.vote == opc_consensus::engine::Vote::new_committed(vote_at_arm.0.term, leader_id))
-            && vote_at_arm.0.leader_id == Some(leader_id)
-            && vote_at_arm.1.leader_id == Some(leader_id)
-            && vote_at_arm.0.term == vote_at_arm.1.term,
-            "CONFIG_CAPACITY_SNAPSHOT_VOTE_ALIGNMENT_RED: the exact original call starts after real native vote agreement");
+        assert!(
+            overlap.frame_bytes > overlap.rpc_bytes,
+            "CONFIG_CAPACITY_FRAME_OWNER_RED: actual outer JSON capacities overlap actual RPC buffers"
+        );
+        println!(
+            "CONFIG_CAPACITY_SNAPSHOT_VOTE_ALIGNMENT_LIFECYCLE agreement={setup_vote:?} source_term={} target_term={} target_leader={:?} original_call=true joined_shutdown=true",
+            vote_at_arm.0.term, vote_at_arm.1.term, vote_at_arm.1.leader_id
+        );
+        assert!(
+            setup_vote.is_some_and(|agreement| agreement.accepted
+                && agreement.vote
+                    == opc_consensus::engine::Vote::new_committed(vote_at_arm.0.term, leader_id))
+                && vote_at_arm.0.leader_id == Some(leader_id)
+                && vote_at_arm.1.leader_id == Some(leader_id)
+                && vote_at_arm.0.term == vote_at_arm.1.term,
+            "CONFIG_CAPACITY_SNAPSHOT_VOTE_ALIGNMENT_RED: the exact original call starts after real native vote agreement"
+        );
         let scheduled_snapshot = paused_snapshot.snapshot();
-        println!("CONFIG_CAPACITY_NATIVE_SNAPSHOT_SCHEDULE_LIFECYCLE scheduled={scheduled_snapshot:?} original_call=true joined_shutdown=true");
+        println!(
+            "CONFIG_CAPACITY_NATIVE_SNAPSHOT_SCHEDULE_LIFECYCLE scheduled={scheduled_snapshot:?} original_call=true joined_shutdown=true"
+        );
         assert_eq!(scheduled_snapshot.entered, 1);
         assert_eq!(scheduled_snapshot.completed, 1);
-        assert!(scheduled_snapshot.untyped && scheduled_snapshot.success,
-            "CONFIG_CAPACITY_UNTYPED_SNAPSHOT_SCHEDULE_RED: the original untyped call completed successfully, without expiry or retry masking");
-        println!("CONFIG_CAPACITY_NATIVE_OWNER_BRIDGE_LIFECYCLE members=9 prepared=72 aliases=73 native={native_drain:?} preparations_before={preparations_before_drop:?} preparations_after={preparations_after_drop:?} native_counts={:?} full_memory_bound=false", native_results.counts);
+        assert!(
+            scheduled_snapshot.untyped && scheduled_snapshot.success,
+            "CONFIG_CAPACITY_UNTYPED_SNAPSHOT_SCHEDULE_RED: the original untyped call completed successfully, without expiry or retry masking"
+        );
+        println!(
+            "CONFIG_CAPACITY_NATIVE_OWNER_BRIDGE_LIFECYCLE members=9 prepared=72 aliases=73 native={native_drain:?} preparations_before={preparations_before_drop:?} preparations_after={preparations_after_drop:?} native_counts={:?} full_memory_bound=false",
+            native_results.counts
+        );
         let (native, transport) = native_results.mutation.expect(
             "CONFIG_CAPACITY_NATIVE_OWNER_BRIDGE_RED: actual native mutation checkpoint after completed lifecycle",
         );
@@ -874,29 +930,118 @@ native_case!(
         // remain separate; source/family groups can alias and are not summed.
         let current_node_mutation_bytes =
             native.node_mutation_bytes + append_group.totals.rpc_bytes;
-        println!("CONFIG_CAPACITY_CURRENT_NATIVE_LIFECYCLE observed_calls={} additional_calls={} current_append_targets={} completed_append_targets=7 native_node_mutation_bytes={} current_append_rpc_bytes={} current_snapshot_rpc_bytes={} current_node_mutation_bytes={} current_outer_frame_bytes={} current={current:?} full_memory_bound=false",
-            current.total.calls, current.additional.calls, current_append_targets.len(),
-            native.node_mutation_bytes, append_group.totals.rpc_bytes, snapshot_group.totals.rpc_bytes,
-            current_node_mutation_bytes, current.total.frame_bytes);
+        println!(
+            "CONFIG_CAPACITY_CURRENT_NATIVE_LIFECYCLE observed_calls={} additional_calls={} current_append_targets={} completed_append_targets=7 native_node_mutation_bytes={} current_append_rpc_bytes={} current_snapshot_rpc_bytes={} current_node_mutation_bytes={} current_outer_frame_bytes={} current={current:?} full_memory_bound=false",
+            current.total.calls,
+            current.additional.calls,
+            current_append_targets.len(),
+            native.node_mutation_bytes,
+            append_group.totals.rpc_bytes,
+            snapshot_group.totals.rpc_bytes,
+            current_node_mutation_bytes,
+            current.total.frame_bytes
+        );
+        let inbound = &transport.inbound;
+        let outbound = &transport.outbound;
+        let inbound_final = observation.inbound_socket_snapshot();
+        let outbound_final = observation.outbound_socket_snapshot();
+        let endpoint_ids: BTreeSet<_> = inbound
+            .owners
+            .iter()
+            .map(|owner| owner.socket_id)
+            .chain(outbound.sockets.iter().map(|owner| owner.socket_id))
+            .collect();
+        let attempt_ids: BTreeSet<_> = outbound
+            .attempts
+            .iter()
+            .map(|owner| owner.attempt_id)
+            .collect();
+        let node_ids: BTreeSet<_> = (0..MEMBERS)
+            .map(|member| {
+                manifest
+                    .bind_local(replica_id(member))
+                    .unwrap()
+                    .local_consensus_node_id()
+            })
+            .collect();
+        println!(
+            "CONFIG_CAPACITY_NINE_SOCKET_LIFECYCLE members=9 inbound_endpoints={} outbound_endpoints={} detached_attempts={} inbound={inbound:?} outbound={outbound:?} drained=true exact_checkpoint=true full_memory_bound=false",
+            inbound.owners.len(),
+            outbound.sockets.len(),
+            outbound.attempts.len()
+        );
+        assert_eq!(inbound_drained, Default::default());
+        assert_eq!(outbound_drained, Default::default());
+        assert_eq!(inbound_final, Default::default());
+        assert_eq!(outbound_final, Default::default());
+        assert!(
+            !inbound.registration_exhausted && !inbound.owners.is_empty(),
+            "CONFIG_CAPACITY_NINE_INBOUND_SOCKET_RED: enrolled real listeners retain TCP owners at native mutation"
+        );
+        assert!(
+            !outbound.registration_exhausted
+                && [lagging_id, minority_id]
+                    .into_iter()
+                    .all(|target| outbound
+                        .sockets
+                        .iter()
+                        .any(|owner| owner.source == leader_id
+                            && owner.target == target
+                            && owner.phase == OutboundSocketPhase::Active)),
+            "CONFIG_CAPACITY_NINE_OUTBOUND_SOCKET_RED: both held frames coexist with their actual active TCP endpoints"
+        );
+        assert_eq!(
+            endpoint_ids.len(),
+            inbound.owners.len() + outbound.sockets.len()
+        );
+        assert_eq!(attempt_ids.len(), outbound.attempts.len());
+        assert!(endpoint_ids.iter().chain(&attempt_ids).all(|id| *id > 0));
+        assert!(endpoint_ids.is_disjoint(&attempt_ids));
+        assert!(outbound.sockets.iter().all(|owner| owner.attempt_id > 0
+            && node_ids.contains(&owner.source)
+            && node_ids.contains(&owner.target)
+            && owner.source != owner.target));
+        assert!(outbound
+            .attempts
+            .iter()
+            .all(|owner| node_ids.contains(&owner.source)
+                && node_ids.contains(&owner.target)
+                && owner.source != owner.target));
         let pending = &transport.pending;
         let pending_after_shutdown = observation.pending_snapshot();
-        assert_eq!(pending_after_shutdown, Default::default(),
-            "CONFIG_CAPACITY_PENDING_NATIVE_DRAIN_RED: pool-acquisition registrations drain after the original lifecycle");
+        assert_eq!(
+            pending_after_shutdown,
+            Default::default(),
+            "CONFIG_CAPACITY_PENDING_NATIVE_DRAIN_RED: pool-acquisition registrations drain after the original lifecycle"
+        );
         // Zero is a valid current observation; this scenario does not require
         // both lanes of any one peer pool to be contended at the checkpoint.
-        println!("CONFIG_CAPACITY_PENDING_NATIVE_LIFECYCLE pending_calls={} pending_rpc_allocations={} pending_rpc_bytes={} additional_pending_rpc_bytes={} observed_rpc_union_bytes={} pending={pending:?} drained=true full_memory_bound=false",
-            pending.owners.len(), pending.rpc_allocations, pending.rpc_bytes,
-            pending.additional_rpc_bytes, pending.observed_rpc_bytes);
+        println!(
+            "CONFIG_CAPACITY_PENDING_NATIVE_LIFECYCLE pending_calls={} pending_rpc_allocations={} pending_rpc_bytes={} additional_pending_rpc_bytes={} observed_rpc_union_bytes={} pending={pending:?} drained=true full_memory_bound=false",
+            pending.owners.len(),
+            pending.rpc_allocations,
+            pending.rpc_bytes,
+            pending.additional_rpc_bytes,
+            pending.observed_rpc_bytes
+        );
         // Preserve the original selected-owner partial bounds separately from
         // the broader current census; neither establishes a complete budget.
         let selected_mutation_bytes =
             native.selected_mutation_bytes + transport.pair.append_rpc_bytes;
         let node_mutation_bytes = native.node_mutation_bytes + transport.pair.append_rpc_bytes;
-        assert!(selected_mutation_bytes <= 32 * 1024 * 1024,
-            "CONFIG_CAPACITY_NATIVE_OPERATION_BYTES_RED: measured simultaneous partial owners exceed operation envelope");
-        assert!(node_mutation_bytes <= 256 * 1024 * 1024,
-            "CONFIG_CAPACITY_NATIVE_NODE_BYTES_RED: measured simultaneous partial owners exceed node envelope");
-        println!("CONFIG_CAPACITY_NATIVE_OWNER_BRIDGE native={native:?} transport={transport:?} selected_mutation_bytes={selected_mutation_bytes} node_mutation_bytes={node_mutation_bytes} full_memory_bound=false");
-        println!("CONFIG_CAPACITY_NINE_OVERLAP members=9 prepared=72 audited_commits=1 append_targets=7 snapshot_chunks={chunks} snapshot_bytes={snapshot_bytes} overlap={overlap:?} drained=true original_paths=true original_handle=true native_wal=true durability=Durable full_memory_bound=false");
+        assert!(
+            selected_mutation_bytes <= 32 * 1024 * 1024,
+            "CONFIG_CAPACITY_NATIVE_OPERATION_BYTES_RED: measured simultaneous partial owners exceed operation envelope"
+        );
+        assert!(
+            node_mutation_bytes <= 256 * 1024 * 1024,
+            "CONFIG_CAPACITY_NATIVE_NODE_BYTES_RED: measured simultaneous partial owners exceed node envelope"
+        );
+        println!(
+            "CONFIG_CAPACITY_NATIVE_OWNER_BRIDGE native={native:?} transport={transport:?} selected_mutation_bytes={selected_mutation_bytes} node_mutation_bytes={node_mutation_bytes} full_memory_bound=false"
+        );
+        println!(
+            "CONFIG_CAPACITY_NINE_OVERLAP members=9 prepared=72 audited_commits=1 append_targets=7 snapshot_chunks={chunks} snapshot_bytes={snapshot_bytes} overlap={overlap:?} drained=true original_paths=true original_handle=true native_wal=true durability=Durable full_memory_bound=false"
+        );
     }
 );

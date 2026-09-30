@@ -63,7 +63,7 @@ default = []
 insecure-test = []
 # Non-production controls used only by deterministic consensus integration
 # qualification. Canonical CI enables this through `--all-features`.
-test-control = ["opc-session-store/test-control"]
+test-control = ["opc-session-store/test-control", "opc-tls/test-control"]
 # Quarantined protocol-v5 remote-backend RPCs. This compatibility surface
 # includes direct mutations and raw replication-log/rebuild authority and must
 # not be enabled on a production Openraft endpoint.
@@ -94,6 +94,8 @@ rand = { workspace = true }
 opc-key = { path = "../opc-key", version = "0.2.0" }
 
 [dev-dependencies]
+# Released safe provenance wrapper; selected only by the feature-gated unit test binary.
+tracking-allocator = { version = "=0.4.0", default-features = false }
 opc-fs-verity-sys = { path = "../opc-fs-verity-sys", version = "0.2.0" }
 opc-identity = { path = "../opc-identity", version = "0.2.0" }
 opc-persist = { path = "../opc-persist", version = "0.2.0" }
