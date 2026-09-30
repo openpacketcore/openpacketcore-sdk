@@ -284,6 +284,14 @@ pub struct NativeOwnerSample {
     pub native_command_bytes: usize,
     /// Actual ledger vectors and boxed payload extents at this checkpoint.
     pub native_ledger_bytes: usize,
+    /// Actual retained event count at this checkpoint.
+    pub native_ledger_entries: usize,
+    /// Actual retained operation count at this checkpoint.
+    pub native_ledger_operations: usize,
+    /// Actual continuity row count, or zero without continuity.
+    pub native_continuity_rows: usize,
+    /// Allocated element capacities for entries, operations and continuity rows.
+    pub native_ledger_capacities: [usize; 3],
     /// Actual derived-operation Vec capacity, or zero outside validation.
     pub native_derived_bytes: usize,
     /// Actual native row-write Vec capacity, or zero outside that checkpoint.
@@ -534,6 +542,17 @@ fn sample_owners(
         #[cfg(all(test, target_os = "linux"))]
         let ledger_oracle_bytes =
             super::config_capacity_simultaneous_working_tests::ledger::ledger_heap(ledger);
+        let native_ledger_entries = ledger.entries.len();
+        let native_ledger_operations = ledger.operations.len();
+        let (native_continuity_rows, continuity_capacity) = ledger
+            .continuity
+            .as_ref()
+            .map_or((0, 0), |chain| (chain.rows.len(), chain.rows.capacity()));
+        let native_ledger_capacities = [
+            ledger.entries.capacity(),
+            ledger.operations.capacity(),
+            continuity_capacity,
+        ];
         let ledger = ledger_allocations(ledger);
         let mut native = active.command.clone();
         native.extend(ledger.iter().map(|(&address, &bytes)| (address, bytes)));
@@ -556,6 +575,10 @@ fn sample_owners(
                 selected_prepared_bytes,
                 native_command_bytes: active.command.values().sum(),
                 native_ledger_bytes: ledger.values().sum(),
+                native_ledger_entries,
+                native_ledger_operations,
+                native_continuity_rows,
+                native_ledger_capacities,
                 native_derived_bytes: derived
                     .map_or(0, |values| values.capacity() * size_of::<LedgerOperation>()),
                 native_write_bytes: write.map_or(0, Vec::capacity),

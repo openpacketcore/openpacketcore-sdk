@@ -40,6 +40,8 @@ use opc_types::{ConfigVersion, SchemaDigest, TenantId, Timestamp, TxId};
 use rusqlite::Connection;
 use sha2::{Digest, Sha256};
 
+mod workspace;
+
 const PROFILE: ConfigCapacityProfile = ConfigCapacityProfile::BoundedV1;
 const OPERATION_BYTES: usize = 33_554_432;
 const METADATA_BYTES: usize = 196_608;
@@ -390,6 +392,15 @@ fn apply(
     topology: &ConfigConsensusTopology,
     entries: Vec<Entry<ConfigRaftTypeConfig>>,
 ) -> ConfigConsensusResponse {
+    apply_with_keys(conn, topology, entries, None)
+}
+
+fn apply_with_keys(
+    conn: &Connection,
+    topology: &ConfigConsensusTopology,
+    entries: Vec<Entry<ConfigRaftTypeConfig>>,
+    keys: Option<&crate::audit_authority::continuity::AuditKeyRing>,
+) -> ConfigConsensusResponse {
     let mut responses = sqlite::apply_entries_cancellable_sync(
         conn,
         identity(),
@@ -397,7 +408,7 @@ fn apply(
         entries,
         &SqliteWorkCancellation::new_for_capacity_observation(),
         &key(),
-        None,
+        keys,
         crate::consensus::RetainedConfigMode::try_from(PROFILE).expect("supported fixture mode"),
     )
     .expect("real atomic accepted apply");
@@ -470,6 +481,10 @@ fn maximize_admitted_spare(
 }
 
 fn simultaneous_apply(expanded: bool) {
+    simultaneous_apply_for_shape(expanded, workspace::Shape::Operations);
+}
+
+fn simultaneous_apply_for_shape(expanded: bool, shape: workspace::Shape) {
     let pool = ConfigPreparationPool::bounded_v1();
     let (commit, binding, envelope) = maximum_parts();
     let mut commit = maximize_metadata(commit, binding, &pool);
@@ -530,8 +545,16 @@ fn simultaneous_apply(expanded: bool) {
     );
     drop(decoded);
     let (conn, topology) = initialize();
-    crate::consensus::audit::write_sync(&conn, &key(), identity(), Some(ledger(&prepared)), false)
-        .expect("actual canonical authenticated retained state");
+    let keys = shape.keys();
+    crate::consensus::audit::write_sync(
+        &conn,
+        &key(),
+        identity(),
+        Some(shape.ledger(&prepared, keys.as_ref())),
+        false,
+    )
+    .expect("actual canonical authenticated retained state");
+    shape.checkpoint(&conn, keys.as_ref());
     let entry = Entry {
         log_id: LogId::new(CommittedLeaderId::new(1, topology.local_node_id()), 1),
         payload: EntryPayload::Normal(value),
@@ -574,9 +597,13 @@ fn simultaneous_apply(expanded: bool) {
         recovery: recovery.capacity(),
         ..Sample::default()
     };
+    #[cfg(feature = "dangerous-test-hooks")]
+    let native = workspace::NativeCapture::new(&conn, &topology, &prepared);
     let observation = ObservationGuard::start(base);
-    let response = apply(&conn, &topology, entries);
+    let response = apply_with_keys(&conn, &topology, entries, keys.as_ref());
     let observation = observation.finish();
+    #[cfg(feature = "dangerous-test-hooks")]
+    native.finish(shape);
     assert!(
         response.result.is_ok(),
         "measured operation must actually commit"
@@ -599,6 +626,7 @@ fn simultaneous_apply(expanded: bool) {
     let retained = crate::consensus::audit::read_sync(&conn, &key(), identity())
         .expect("authenticated retained readback")
         .expect("active ledger");
+    shape.check(&retained, keys.as_ref(), 1);
     assert!(matches!(
         retained
             .lookup(
@@ -649,7 +677,7 @@ fn simultaneous_apply(expanded: bool) {
         "VALIDATION_OWNERS: actual ledger authentication retains the derived operations"
     );
     writeln!(std::io::stdout().lock(),
-        "CONFIG_CAPACITY_LEDGER_APPLY expanded={expanded} preflight_metadata={} applied_metadata={applied_metadata} reads={} apply_reads={} writes={} nested_reads={} derived_capacity={} peak={sample:?} nested_peak={:?}",
+        "CONFIG_CAPACITY_LEDGER_APPLY expanded={expanded} shape={shape:?} preflight_metadata={} applied_metadata={applied_metadata} reads={} apply_reads={} writes={} nested_reads={} derived_capacity={} peak={sample:?} nested_peak={:?}",
         sizes.command - ENVELOPE_BYTES, observation.reads, observation.apply_reads, observation.writes, observation.nested_reads, observation.derived_capacity, observation.nested_peak)
         .expect("value-free simultaneous allocation evidence");
     assert!(
@@ -661,6 +689,8 @@ fn simultaneous_apply(expanded: bool) {
     // recovery/native-encoder phase sum and no duplicate shared Arc charges.
     assert_eq!(recovery.len(), sizes.recovery_json);
     assert_eq!(envelope.encoded(), commit.record.encrypted_blob);
+    drop(retained);
+    shape.finish(&conn, &topology, &prepared, keys.as_ref());
     drop(submission);
 }
 
