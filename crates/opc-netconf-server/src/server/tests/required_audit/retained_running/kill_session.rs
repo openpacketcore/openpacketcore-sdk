@@ -162,6 +162,9 @@ async fn retained_running_kill_after_effect_preserves_exact_original_publication
             .is_ok();
         runner_gate.pause();
         let killed = killer.rpc(&kill_session_rpc(93)).await;
+        // Close the controller before the negative control's victim hang
+        // guard, so its ordinary idle deadline cannot mask the assertion.
+        let closed = killer.close().await;
         // Termination must also interrupt the RPC while the real worker still
         // owns its blocked publication. Only the response future is cancelled.
         runner_gate.resume();
@@ -181,7 +184,6 @@ async fn retained_running_kill_after_effect_preserves_exact_original_publication
             }
         }
         let encrypted = f.provider.active.load(Ordering::Acquire);
-        let closed = killer.close().await;
         drop(server);
         let drained = f.close().await;
         eprintln!("{CLEAN}: killed-after-effect profile={profile:?} finished={finished} closed={closed} drained={drained}");
