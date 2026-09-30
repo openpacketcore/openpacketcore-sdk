@@ -33,6 +33,7 @@ engineers.
 | RFC | Title | Status and scope |
 | :--- | :--- | :--- |
 | [020](020-online-audit-recipient-verification.md) | Authority-owned online audit recipient verification | Acceptance is recorded by maintainer-approved merge of #979; implementation qualification remains separate. Online recipient custody, authenticated application boundary and checkpoint/report semantics for #959. |
+| [021](021-n3iwf-forwarding-role.md) | N3IWF forwarding role between NWu GRE and N3 GTP-U | Proposed for #1028; acceptance is recorded by maintainer-approved merge of the introducing pull request, and implementation qualification remains separate. XFRM-interface NWu leg, composite session record on the ordinary durable path, and labelled receiver dispositions. |
 
 ## Recommended Reading Order
 
@@ -56,6 +57,8 @@ engineers.
 18. RFC 018: never-admitted selector namespace relocation (after RFC 016 and RFC 017's scope boundaries).
 
 19. RFC 019: NETCONF exact-effect required audit (after RFC 001, RFC 003 and ADR 0025).
+20. RFC 021: N3IWF forwarding role (after RFC 016 and the N3 fixed-flow,
+    End Marker and installed Child SA contracts).
 
 RFC 006 should be revisited after each implementation slice because it defines
 the evidence required to claim that the slice is complete.
