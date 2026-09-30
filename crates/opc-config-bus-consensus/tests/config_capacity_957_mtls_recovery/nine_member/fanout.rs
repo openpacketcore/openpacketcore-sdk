@@ -4,6 +4,9 @@
 //! native deadlines. It releases those same calls before any allocation
 //! assertion; successful IO, readback, recovery and shutdown are prerequisites.
 
+#[path = "fanout/working.rs"]
+mod working;
+
 use super::super::joint_metadata as joint;
 use super::*;
 use opc_crypto::capacity_observation::{
