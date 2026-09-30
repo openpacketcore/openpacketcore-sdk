@@ -2,8 +2,11 @@
 //!
 //! This observes real allocation extents and a same-instant frame intersection.
 //! Pool and cold-connection acquisition requests are separate from negotiated
-//! calls. Physical setup, other queues, engine/prepared owners, inbound decoding,
-//! TLS and allocator overhead remain outside this incomplete aggregate census.
+//! calls. Accepted inbound TCP endpoints have a separate count-only census.
+//! Detached outbound attempts and connected outbound TCP have separate counts.
+//! DNS/material/connect internals, other queues, engine/prepared owners,
+//! inbound decoding, TLS allocation bytes and allocator overhead remain
+//! outside this incomplete census.
 //! Snapshot RPC backing and outer framing remain separate categories. No buffer
 //! contents or allocation addresses leave this module. Enabling the feature alone
 //! does not arm an observer or a write gate.
@@ -15,6 +18,21 @@ use std::sync::{Arc, Mutex, MutexGuard};
 
 use opc_consensus::{ConsensusNodeId, ConsensusRpcFamily};
 use tokio::sync::watch;
+
+mod inbound_sockets;
+pub(crate) use inbound_sockets::{
+    current_inbound_listener, inbound_socket_phase, scope_inbound_socket, InboundSocket,
+};
+pub use inbound_sockets::{InboundSocketCensus, InboundSocketOwner, InboundSocketPhase};
+
+mod outbound_sockets;
+pub(crate) use outbound_sockets::{
+    observe_outbound_attempt, outbound_attempt_phase, OutboundSocket, OutboundSocketContext,
+};
+pub use outbound_sockets::{
+    OutboundAttemptOwner, OutboundAttemptPhase, OutboundSocketCensus, OutboundSocketOwner,
+    OutboundSocketPhase,
+};
 
 /// Simultaneous capacities in the observed negotiated calls only.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -262,6 +280,11 @@ struct State {
     next_id: u64,
     calls: BTreeMap<u64, CallRecord>,
     pending_calls: BTreeMap<u64, PendingCallRecord>,
+    inbound_sockets: BTreeMap<u64, InboundSocketOwner>,
+    inbound_socket_registration_exhausted: bool,
+    outbound_attempts: BTreeMap<u64, OutboundAttemptOwner>,
+    outbound_sockets: BTreeMap<u64, OutboundSocketOwner>,
+    outbound_registration_exhausted: bool,
     held_snapshot_target: Option<ConsensusNodeId>,
     native_source: Option<ConsensusNodeId>,
     held_append_target: Option<ConsensusNodeId>,
@@ -534,8 +557,9 @@ impl State {
 ///
 /// Registrations contain only addresses, extents, IDs and notifications. They do
 /// not clone payloads or retain a store, prepared operation, frame or TLS stream.
-/// Pointer identities stay private; live registrations end before owners free.
-/// Metadata follows observed pending/active calls, frames and numeric census rows.
+/// Pointer identities stay private; buffer registrations end before owners free.
+/// Inbound TCP registrations instead end after their socket field is destroyed.
+/// Metadata follows observed calls, frames, inbound sockets and numeric rows.
 /// The census copies no buffers and contains no public allocation addresses.
 pub struct ConsensusBufferObservation {
     state: Mutex<State>,

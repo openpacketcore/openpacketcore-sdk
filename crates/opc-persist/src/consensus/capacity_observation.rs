@@ -27,7 +27,7 @@ use super::{
     ConfigMutationIntent, ConfigRaftTypeConfig, PreparedAuditedMutation, PreparedConfigCommit,
     PreparedConfigCommitOperation,
 };
-use crate::audit_authority::ledger::{EntryPayload as LedgerPayload, LedgerState};
+use crate::audit_authority::ledger::{EntryPayload as LedgerPayload, LedgerOperation, LedgerState};
 
 type Allocations = BTreeMap<usize, usize>;
 
@@ -229,6 +229,8 @@ impl Drop for PreparationOwner<'_> {
 pub enum NativeStage {
     /// Actual owned ledger after decoding; SQL's borrowed blob is excluded.
     DecodedLedger,
+    /// Validated ledger while its original derived-operation Vec is still live.
+    ValidatedLedger,
     /// Authenticated ledger and decoded effect before the actual mutation.
     AuthenticatedMutation,
     /// Actual mutated ledger and its one owned encoded write buffer.
@@ -254,6 +256,8 @@ pub struct NativeOwnerSample {
     pub native_command_bytes: usize,
     /// Actual ledger vectors and boxed payload extents at this checkpoint.
     pub native_ledger_bytes: usize,
+    /// Actual derived-operation Vec capacity, or zero outside validation.
+    pub native_derived_bytes: usize,
     /// Actual native row-write Vec capacity, or zero outside that checkpoint.
     pub native_write_bytes: usize,
     /// Whether native allocations are distinct from the selected prepared ones.
@@ -433,6 +437,21 @@ impl Drop for NativeScope<'_> {
 }
 
 pub(crate) fn sample(stage: NativeStage, ledger: &LedgerState, write: Option<&Vec<u8>>) {
+    sample_owners(stage, ledger, write, None);
+}
+
+pub(crate) fn validated_ledger(ledger: &LedgerState, derived: &Vec<LedgerOperation>) {
+    // This borrows the original validation local, before its scope can end.
+    // An inactive native registration returns before constructing any census.
+    sample_owners(NativeStage::ValidatedLedger, ledger, None, Some(derived));
+}
+
+fn sample_owners(
+    stage: NativeStage,
+    ledger: &LedgerState,
+    write: Option<&Vec<u8>>,
+    derived: Option<&Vec<LedgerOperation>>,
+) {
     NATIVE.with(|slot| {
         let active = slot.borrow();
         let Some(active) = active.as_ref() else {
@@ -481,6 +500,9 @@ pub(crate) fn sample(stage: NativeStage, ledger: &LedgerState, write: Option<&Ve
         if let Some(write) = write {
             vector(&mut native, write);
         }
+        if let Some(derived) = derived {
+            vector(&mut native, derived);
+        }
         node.extend(native.iter().map(|(&address, &bytes)| (address, bytes)));
         selected.extend(native);
         shared.callbacks.fetch_add(1, Ordering::SeqCst);
@@ -493,6 +515,8 @@ pub(crate) fn sample(stage: NativeStage, ledger: &LedgerState, write: Option<&Ve
             selected_prepared_bytes,
             native_command_bytes: active.command.values().sum(),
             native_ledger_bytes: ledger.values().sum(),
+            native_derived_bytes: derived
+                .map_or(0, |values| values.capacity() * size_of::<LedgerOperation>()),
             native_write_bytes: write.map_or(0, Vec::capacity),
             native_is_distinct,
             selected_mutation_bytes: selected.values().sum(),

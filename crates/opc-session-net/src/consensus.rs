@@ -53,6 +53,11 @@ use crate::protocol::{
 #[doc(hidden)]
 pub mod capacity_observation;
 
+#[cfg(feature = "test-control")]
+type ConsensusInboundStream = capacity_observation::InboundSocket;
+#[cfg(not(feature = "test-control"))]
+type ConsensusInboundStream = TcpStream;
+
 const DEFAULT_CONSENSUS_IDLE_TIMEOUT: Duration =
     DURABLE_CONSENSUS_TIMING_PROFILE.server_idle_timeout();
 const DEFAULT_CONSENSUS_RPC_TIMEOUT: Duration =
@@ -369,6 +374,17 @@ struct ConsensusConnection {
     // establishment/bootstrapping age is therefore the conservative fallback
     // used to prevent `None` from granting unbounded reuse.
     idle_deadline_origin: tokio::time::Instant,
+    #[cfg(feature = "test-control")]
+    outbound_socket_context: Option<capacity_observation::OutboundSocketContext>,
+}
+
+#[cfg(feature = "test-control")]
+impl ConsensusConnection {
+    fn observe_outbound_phase(&self, phase: capacity_observation::OutboundSocketPhase) {
+        if let Some(context) = &self.outbound_socket_context {
+            context.phase(phase);
+        }
+    }
 }
 
 // A negotiated call owns its socket until a complete correlated response is
@@ -661,6 +677,10 @@ impl ConsensusColdConnectionCoordinator {
         epoch: ConsensusColdConnectionEpoch,
         mut connection: Box<ConsensusConnection>,
     ) -> ConsensusPublishReadyOutcome {
+        #[cfg(feature = "test-control")]
+        capacity_observation::outbound_attempt_phase(
+            capacity_observation::OutboundAttemptPhase::Publishing,
+        );
         let mut state = self.state.lock().await;
         let Some((receipt, attempt_deadline)) = (match &state.phase {
             ConsensusColdConnectionPhase::Connecting {
@@ -729,6 +749,10 @@ impl ConsensusColdConnectionCoordinator {
             epoch,
             connection,
         };
+        #[cfg(feature = "test-control")]
+        if let ConsensusColdConnectionPhase::Ready { connection, .. } = &state.phase {
+            connection.observe_outbound_phase(capacity_observation::OutboundSocketPhase::Ready);
+        }
         // A usable authenticated Accepted bootstrap proves that this exact
         // peer/epoch is no longer remotely retired. A delayed older attempt
         // cannot, however, erase a causally newer or incomparable gate that
@@ -750,6 +774,10 @@ impl ConsensusColdConnectionCoordinator {
         epoch: ConsensusColdConnectionEpoch,
         error: SessionConsensusPeerError,
     ) {
+        #[cfg(feature = "test-control")]
+        capacity_observation::outbound_attempt_phase(
+            capacity_observation::OutboundAttemptPhase::Publishing,
+        );
         let mut state = self.state.lock().await;
         let receipt = match &state.phase {
             ConsensusColdConnectionPhase::Connecting {
@@ -797,6 +825,10 @@ impl ConsensusColdConnectionCoordinator {
         epoch: ConsensusColdConnectionEpoch,
         error: SessionConsensusPeerError,
     ) {
+        #[cfg(feature = "test-control")]
+        capacity_observation::outbound_attempt_phase(
+            capacity_observation::OutboundAttemptPhase::Publishing,
+        );
         let mut state = self.state.lock().await;
         let receipt = match &state.phase {
             ConsensusColdConnectionPhase::Connecting {
@@ -1314,24 +1346,50 @@ impl ConsensusColdConnector {
         deadline: tokio::time::Instant,
     ) -> Result<ConsensusConnection, SessionConsensusPeerError> {
         if let Some(tls_config) = &self.tls_config {
+            #[cfg(feature = "test-control")]
+            capacity_observation::outbound_attempt_phase(
+                capacity_observation::OutboundAttemptPhase::MaterialAdmission,
+            );
             let outcome = tls_config
                 .run_handshake(|attempt| {
                     let connector = self.clone();
                     async move {
+                        #[cfg(feature = "test-control")]
+                        capacity_observation::outbound_attempt_phase(
+                            capacity_observation::OutboundAttemptPhase::Resolving,
+                        );
                         let addr = connector
                             .target
                             .resolve()
                             .await
                             .map_err(|_| SessionConsensusPeerError::Unavailable)?;
+                        #[cfg(feature = "test-control")]
+                        capacity_observation::outbound_attempt_phase(
+                            capacity_observation::OutboundAttemptPhase::Connecting,
+                        );
                         let tcp = TcpStream::connect(addr)
                             .await
                             .map_err(|_| SessionConsensusPeerError::Unavailable)?;
+                        #[cfg(feature = "test-control")]
+                        let tcp = capacity_observation::OutboundSocket::new(tcp);
+                        #[cfg(feature = "test-control")]
+                        let outbound_socket_context = tcp.context();
                         configure_consensus_tcp_socket(&tcp)
                             .map_err(|_| SessionConsensusPeerError::Unavailable)?;
                         let tls_connector = tokio_rustls::TlsConnector::from(
                             consensus_client_tls_config(attempt.rustls_config()),
                         );
                         let server_name = connector.target.tls_server_name(addr)?;
+                        #[cfg(feature = "test-control")]
+                        {
+                            capacity_observation::outbound_attempt_phase(
+                                capacity_observation::OutboundAttemptPhase::TlsHandshake,
+                            );
+                            if let Some(context) = &outbound_socket_context {
+                                context
+                                    .phase(capacity_observation::OutboundSocketPhase::TlsHandshake);
+                            }
+                        }
                         let tls_stream = tls_connector
                             .connect(server_name, tcp)
                             .await
@@ -1370,6 +1428,15 @@ impl ConsensusColdConnector {
                         )
                         .map_err(|_| SessionConsensusPeerError::Protocol)?;
                         let (mut reader, mut writer) = tokio::io::split(tls_stream);
+                        #[cfg(feature = "test-control")]
+                        {
+                            capacity_observation::outbound_attempt_phase(
+                                capacity_observation::OutboundAttemptPhase::Bootstrap,
+                            );
+                            if let Some(context) = &outbound_socket_context {
+                                context.phase(capacity_observation::OutboundSocketPhase::Bootstrap);
+                            }
+                        }
                         let (response_frame_size, request_frame_size) = connector
                             .bootstrap(&mut reader, &mut writer, deadline)
                             .await?;
@@ -1380,6 +1447,8 @@ impl ConsensusColdConnector {
                             request_frame_size,
                             tls_completed_at,
                             lifecycle,
+                            #[cfg(feature = "test-control")]
+                            outbound_socket_context,
                         ))
                     }
                 })
@@ -1395,6 +1464,8 @@ impl ConsensusColdConnector {
                 return Err(SessionConsensusPeerError::Unavailable);
             }
             let (parts, _) = outcome.into_parts();
+            #[cfg(feature = "test-control")]
+            let outbound_socket_context = parts.6;
             let (
                 reader,
                 writer,
@@ -1402,8 +1473,15 @@ impl ConsensusColdConnector {
                 request_frame_size,
                 tls_completed_at,
                 lifecycle,
+                ..,
             ) = parts;
+            #[cfg(feature = "test-control")]
+            if let Some(context) = &outbound_socket_context {
+                context.phase(capacity_observation::OutboundSocketPhase::Returned);
+            }
             return Ok(ConsensusConnection {
+                #[cfg(feature = "test-control")]
+                outbound_socket_context,
                 reader,
                 writer,
                 response_frame_size,
@@ -1415,20 +1493,47 @@ impl ConsensusColdConnector {
             });
         }
 
+        #[cfg(feature = "test-control")]
+        capacity_observation::outbound_attempt_phase(
+            capacity_observation::OutboundAttemptPhase::Resolving,
+        );
         let addr = self
             .target
             .resolve()
             .await
             .map_err(|_| SessionConsensusPeerError::Unavailable)?;
+        #[cfg(feature = "test-control")]
+        capacity_observation::outbound_attempt_phase(
+            capacity_observation::OutboundAttemptPhase::Connecting,
+        );
         let tcp = TcpStream::connect(addr)
             .await
             .map_err(|_| SessionConsensusPeerError::Unavailable)?;
+        #[cfg(feature = "test-control")]
+        let tcp = capacity_observation::OutboundSocket::new(tcp);
+        #[cfg(feature = "test-control")]
+        let outbound_socket_context = tcp.context();
         configure_consensus_tcp_socket(&tcp).map_err(|_| SessionConsensusPeerError::Unavailable)?;
         let (mut reader, mut writer) = tokio::io::split(tcp);
+        #[cfg(feature = "test-control")]
+        {
+            capacity_observation::outbound_attempt_phase(
+                capacity_observation::OutboundAttemptPhase::Bootstrap,
+            );
+            if let Some(context) = &outbound_socket_context {
+                context.phase(capacity_observation::OutboundSocketPhase::Bootstrap);
+            }
+        }
         let established_at = tokio::time::Instant::now();
         let (response_frame_size, request_frame_size) =
             self.bootstrap(&mut reader, &mut writer, deadline).await?;
+        #[cfg(feature = "test-control")]
+        if let Some(context) = &outbound_socket_context {
+            context.phase(capacity_observation::OutboundSocketPhase::Returned);
+        }
         Ok(ConsensusConnection {
+            #[cfg(feature = "test-control")]
+            outbound_socket_context,
             reader: Box::new(reader),
             writer: Box::new(writer),
             response_frame_size,
@@ -1545,6 +1650,10 @@ async fn run_detached_consensus_connection_attempt(
     epoch: ConsensusColdConnectionEpoch,
     attempt_deadline: tokio::time::Instant,
 ) {
+    #[cfg(feature = "test-control")]
+    capacity_observation::outbound_attempt_phase(
+        capacity_observation::OutboundAttemptPhase::ReconnectAdmission,
+    );
     if tokio::time::Instant::now() >= attempt_deadline {
         coordinator
             .publish_no_admission(attempt_id, epoch, SessionConsensusPeerError::Timeout)
@@ -1629,12 +1738,14 @@ async fn run_detached_consensus_connection_attempt(
     };
 
     let mut attempt_metrics = ConnectionAttemptMetricGuard::started();
-    let establish = tokio::time::timeout_at(
-        attempt_deadline,
-        connector.establish(epoch, attempt_deadline),
-    );
-    tokio::pin!(establish);
     let outcome = {
+        // Drop pending TCP/TLS/bootstrap owners before terminal accounting or
+        // publication can release admission and then wait for the state lock.
+        let establish = tokio::time::timeout_at(
+            attempt_deadline,
+            connector.establish(epoch, attempt_deadline),
+        );
+        tokio::pin!(establish);
         let superseded = reconnect_attempt.superseded();
         tokio::pin!(superseded);
         tokio::select! {
@@ -1681,14 +1792,20 @@ async fn run_detached_consensus_connection_attempt(
         pause_after_accepted_consensus_bootstrap().await;
     }
 
-    let connection = match outcome {
+    let outcome = match outcome {
         DetachedConsensusConnectionOutcome::Established(Ok(connection))
-            if connector.epoch() == epoch =>
+            if connector.epoch() != epoch =>
         {
-            connection
+            // A completed bootstrap owns its connection outside the setup
+            // future. Release that owner before reporting supersession too.
+            drop(connection);
+            DetachedConsensusConnectionOutcome::Superseded
         }
-        DetachedConsensusConnectionOutcome::Established(Ok(_))
-        | DetachedConsensusConnectionOutcome::Superseded => {
+        outcome => outcome,
+    };
+    let connection = match outcome {
+        DetachedConsensusConnectionOutcome::Established(Ok(connection)) => connection,
+        DetachedConsensusConnectionOutcome::Superseded => {
             METRICS
                 .session_net_reconnect_attempts
                 .fetch_add(1, Ordering::Relaxed);
@@ -1808,6 +1925,10 @@ async fn run_detached_consensus_connection_attempt(
             return;
         }
     }
+    #[cfg(feature = "test-control")]
+    capacity_observation::outbound_attempt_phase(
+        capacity_observation::OutboundAttemptPhase::ReadyMonitor,
+    );
     monitor_staged_consensus_connection(
         &connector,
         &coordinator,
@@ -2076,8 +2197,11 @@ impl RemoteSessionConsensusPeer {
     ///
     /// This records RPC owners during pool and cold-connection acquisition,
     /// then the separate negotiated large append/snapshot slice and its outer
-    /// frames. Physical setup/TLS buffers, inbound/native owners and other
-    /// queues are outside this observation.
+    /// frames. Separate count-only rows follow the actual shared setup future
+    /// spawned by this peer clone and its successfully connected TCP owners.
+    /// Existing attempts/connections in its shared pool are not retroactively
+    /// enrolled, nor are older clones modified. DNS/material/connect internals,
+    /// TLS capacities, native owners and other queues remain unmeasured.
     /// It does not change deadlines or lane admission.
     #[cfg(feature = "test-control")]
     #[doc(hidden)]
@@ -2446,6 +2570,9 @@ impl RemoteSessionConsensusPeer {
             let mut probe_wait = None;
             match action {
                 ConsensusColdConnectionAction::Ready(connection) => {
+                    #[cfg(feature = "test-control")]
+                    connection
+                        .observe_outbound_phase(capacity_observation::OutboundSocketPhase::Claimed);
                     coordinator.changed.notify_waiters();
                     return Ok(*connection);
                 }
@@ -2486,12 +2613,19 @@ impl RemoteSessionConsensusPeer {
                         epoch,
                         attempt_deadline,
                     );
+                    #[cfg(feature = "test-control")]
+                    let attempt = capacity_observation::observe_outbound_attempt(
+                        self.buffer_observation.as_ref(),
+                        self.binding.local_consensus_node_id(),
+                        self.binding.remote_consensus_node_id(),
+                        attempt,
+                    );
                     #[cfg(test)]
                     {
                         let accounting = crate::lifecycle::CONNECTION_ATTEMPT_TEST_ACCOUNTING
                             .try_with(Arc::clone)
                             .ok();
-                        tokio::spawn(async move {
+                        let _attempt_task = tokio::spawn(async move {
                             if let Some(accounting) = accounting {
                                 crate::lifecycle::CONNECTION_ATTEMPT_TEST_ACCOUNTING
                                     .scope(accounting, attempt)
@@ -2500,6 +2634,8 @@ impl RemoteSessionConsensusPeer {
                                 attempt.await;
                             }
                         });
+                        #[cfg(all(feature = "test-control", feature = "insecure-test"))]
+                        tests::outbound_sockets::capture_spawned_attempt(_attempt_task);
                     }
                     #[cfg(not(test))]
                     tokio::spawn(attempt);
@@ -2600,6 +2736,12 @@ impl RemoteSessionConsensusPeer {
                     if self.connection_is_current(&mut connection, now) {
                         self.mark_connection_usable(&connection);
                         *connection_slot = Some(connection);
+                        #[cfg(feature = "test-control")]
+                        if let Some(connection) = connection_slot.as_ref() {
+                            connection.observe_outbound_phase(
+                                capacity_observation::OutboundSocketPhase::Cached,
+                            );
+                        }
                     } else if let Some(reason) = connection.lifecycle.retirement(now) {
                         let epoch = self.connection_epoch(&connection);
                         self.seed_connection_credential_retirement_probe(
@@ -2717,6 +2859,11 @@ impl RemoteSessionConsensusPeer {
             if self.connection_is_current(&mut connection, now) {
                 self.mark_connection_usable(&connection);
                 *connection_slot = Some(connection);
+                #[cfg(feature = "test-control")]
+                if let Some(connection) = connection_slot.as_ref() {
+                    connection
+                        .observe_outbound_phase(capacity_observation::OutboundSocketPhase::Cached);
+                }
             } else if let Some(reason) = connection.lifecycle.retirement(now) {
                 let epoch = self.connection_epoch(&connection);
                 self.seed_connection_credential_retirement_probe(
@@ -2865,6 +3012,8 @@ impl RemoteSessionConsensusPeer {
         request: SessionConsensusWireRequest,
         deadline: tokio::time::Instant,
     ) -> Result<SessionConsensusWireResponse, SessionConsensusPeerError> {
+        #[cfg(feature = "test-control")]
+        connection.observe_outbound_phase(capacity_observation::OutboundSocketPhase::Active);
         let call_id = uuid::Uuid::new_v4();
         let request = SessionConsensusTransportRequest::from_wire_call(call_id, request)?;
         #[cfg(feature = "test-control")]
@@ -2894,9 +3043,12 @@ impl RemoteSessionConsensusPeer {
             .await
             .map_err(|error| map_protocol_error(&error))?;
             let response: SessionConsensusTransportResponse =
-                read_frame(&mut connection.reader, connection.response_frame_size)
-                    .await
-                    .map_err(|error| map_protocol_error(&error))?;
+                crate::protocol::read_consensus_response_frame(
+                    &mut connection.reader,
+                    connection.response_frame_size,
+                )
+                .await
+                .map_err(|error| map_protocol_error(&error))?;
             let SessionConsensusTransportResponse::Call {
                 call_id: response_call_id,
                 response,
@@ -3231,6 +3383,8 @@ impl SessionConsensusServer {
         let post_accept_setup_hook = self.post_accept_setup_hook;
         let accept_cancellation = cancellation.clone();
         let task_registry = connection_tasks.clone();
+        #[cfg(feature = "test-control")]
+        let inbound_observation = capacity_observation::current_inbound_listener();
 
         let accept_handle = tokio::spawn(async move {
             loop {
@@ -3246,8 +3400,11 @@ impl SessionConsensusServer {
                 // Capture it before registry contention or child scheduling so
                 // TLS, Hello, authority admission, and Accepted cannot each
                 // replenish the listener's setup budget.
-                let Some(setup_deadline) = tokio::time::Instant::now().checked_add(idle_timeout)
-                else {
+                let setup_deadline = tokio::time::Instant::now().checked_add(idle_timeout);
+                #[cfg(feature = "test-control")]
+                let stream =
+                    capacity_observation::InboundSocket::new(stream, inbound_observation.as_ref());
+                let Some(setup_deadline) = setup_deadline else {
                     // A later unrepresentable instant must fail closed.
                     continue;
                 };
@@ -3267,7 +3424,9 @@ impl SessionConsensusServer {
                 let reauthentication = reauthentication.clone();
                 #[cfg(test)]
                 let post_accept_setup_hook = post_accept_setup_hook.clone();
-                let handle = tokio::spawn(async move {
+                #[cfg(feature = "test-control")]
+                let socket_context = stream.context();
+                let task = async move {
                     let _permit = permit;
                     #[cfg(test)]
                     if let Some(hook) = post_accept_setup_hook {
@@ -3293,7 +3452,10 @@ impl SessionConsensusServer {
                     .await;
                     record_consensus_server_connection_outcome(&result);
                     attempt_metrics.finish();
-                });
+                };
+                #[cfg(feature = "test-control")]
+                let task = capacity_observation::scope_inbound_socket(socket_context, task);
+                let handle = tokio::spawn(task);
                 registry.handles.push(handle);
             }
         });
@@ -3589,7 +3751,7 @@ fn spawn_consensus_lifecycle(
 
 #[allow(clippy::too_many_arguments)]
 async fn handle_consensus_connection(
-    stream: TcpStream,
+    stream: ConsensusInboundStream,
     tls_config: Option<opc_tls::AuthenticatedServerConfig>,
     membership: SessionMembershipAdmission,
     handler: Arc<dyn SessionConsensusRpcHandler>,
@@ -3608,6 +3770,10 @@ async fn handle_consensus_connection(
     }
     configure_consensus_tcp_socket(&stream).map_err(ProtocolError::Io)?;
     if let Some(tls_config) = tls_config {
+        #[cfg(feature = "test-control")]
+        capacity_observation::inbound_socket_phase(
+            capacity_observation::InboundSocketPhase::TlsSetup,
+        );
         let generation = reauthentication.generation();
         let handshake = tls_config
             .begin_handshake()
@@ -3636,6 +3802,10 @@ async fn handle_consensus_connection(
             tls_completion,
         );
         let (mut reader, mut writer) = tokio::io::split(tls_stream);
+        #[cfg(feature = "test-control")]
+        capacity_observation::inbound_socket_phase(
+            capacity_observation::InboundSocketPhase::Bootstrap,
+        );
         dispatch_consensus(
             &mut reader,
             &mut writer,
@@ -3665,6 +3835,10 @@ async fn handle_consensus_connection(
         .await
     } else {
         let (mut reader, mut writer) = tokio::io::split(stream);
+        #[cfg(feature = "test-control")]
+        capacity_observation::inbound_socket_phase(
+            capacity_observation::InboundSocketPhase::Bootstrap,
+        );
         dispatch_consensus(
             &mut reader,
             &mut writer,
@@ -3709,6 +3883,8 @@ where
     if error == SessionConsensusPeerError::Rejected {
         return Err(ProtocolError::InvalidWireValue);
     }
+    #[cfg(feature = "test-control")]
+    capacity_observation::inbound_socket_phase(capacity_observation::InboundSocketPhase::Refusing);
     write_frame_bounded_until_cancellable(
         writer,
         &SessionConsensusBootstrapResponse::Rejected(error),
@@ -3727,6 +3903,8 @@ async fn retire_consensus_bootstrap<W>(
 where
     W: AsyncWrite + Unpin,
 {
+    #[cfg(feature = "test-control")]
+    capacity_observation::inbound_socket_phase(capacity_observation::InboundSocketPhase::Refusing);
     tracing::debug!(
         reason = "rotation_bootstrap_retired",
         "retiring authenticated consensus connection before request admission"
@@ -4149,6 +4327,10 @@ where
         }
     }
     drop(bootstrap_membership_lease);
+    #[cfg(feature = "test-control")]
+    capacity_observation::inbound_socket_phase(
+        capacity_observation::InboundSocketPhase::Negotiated,
+    );
     let connection_cancellation = connection_cancellation.as_ref();
 
     loop {
@@ -4282,11 +4464,19 @@ where
 mod tests {
     #[cfg(feature = "test-control")]
     mod inbound_budget;
+    #[cfg(all(feature = "test-control", feature = "insecure-test"))]
+    mod inbound_decode_composition;
+    #[cfg(all(feature = "test-control", feature = "insecure-test"))]
+    mod inbound_sockets;
     mod negotiated_loss;
+    #[cfg(all(feature = "test-control", feature = "insecure-test"))]
+    pub(super) mod outbound_sockets;
     #[cfg(feature = "test-control")]
     mod pending_rpc;
     #[cfg(feature = "test-control")]
     mod rejected_decode;
+    #[cfg(all(feature = "test-control", feature = "insecure-test"))]
+    mod setup_cleanup;
 
     use std::sync::atomic::AtomicUsize;
     use std::sync::Mutex as StdMutex;
@@ -5365,6 +5555,8 @@ mod tests {
         )
         .expect("deadline publication connection lifecycle");
         let connection = Box::new(ConsensusConnection {
+            #[cfg(feature = "test-control")]
+            outbound_socket_context: None,
             reader: Box::new(tokio::io::empty()),
             writer: Box::new(tokio::io::sink()),
             response_frame_size: MAX_NEGOTIATED_FRAME_SIZE,
@@ -5417,6 +5609,8 @@ mod tests {
         .expect("publication-race lifecycle policy");
         let connection = |established_at| {
             Box::new(ConsensusConnection {
+                #[cfg(feature = "test-control")]
+                outbound_socket_context: None,
                 reader: Box::new(tokio::io::empty()),
                 writer: Box::new(tokio::io::sink()),
                 response_frame_size: MAX_NEGOTIATED_FRAME_SIZE,
@@ -6409,6 +6603,8 @@ mod tests {
                 remote_retirement_probe: false,
             };
             let connection = Box::new(ConsensusConnection {
+                #[cfg(feature = "test-control")]
+                outbound_socket_context: None,
                 reader: Box::new(tokio::io::empty()),
                 writer: Box::new(tokio::io::sink()),
                 response_frame_size: MAX_NEGOTIATED_FRAME_SIZE,
@@ -6667,6 +6863,8 @@ mod tests {
             attempt_id,
             epoch: staged_epoch,
             connection: Box::new(ConsensusConnection {
+                #[cfg(feature = "test-control")]
+                outbound_socket_context: None,
                 reader: Box::new(reader),
                 writer: Box::new(writer),
                 response_frame_size: MIN_SESSION_CONSENSUS_FRAME_SIZE,
@@ -6735,6 +6933,8 @@ mod tests {
             attempt_id,
             epoch: staged_epoch,
             connection: Box::new(ConsensusConnection {
+                #[cfg(feature = "test-control")]
+                outbound_socket_context: None,
                 reader: Box::new(reader),
                 writer: Box::new(writer),
                 response_frame_size: MIN_SESSION_CONSENSUS_FRAME_SIZE,
@@ -6794,6 +6994,8 @@ mod tests {
         let (stream, _remote) = tokio::io::duplex(64);
         let (reader, writer) = tokio::io::split(stream);
         let mut connection = ConsensusConnection {
+            #[cfg(feature = "test-control")]
+            outbound_socket_context: None,
             reader: Box::new(reader),
             writer: Box::new(writer),
             response_frame_size: MIN_SESSION_CONSENSUS_FRAME_SIZE,
@@ -6852,6 +7054,8 @@ mod tests {
         let (stream, _remote) = tokio::io::duplex(64);
         let (reader, writer) = tokio::io::split(stream);
         let mut connection = ConsensusConnection {
+            #[cfg(feature = "test-control")]
+            outbound_socket_context: None,
             reader: Box::new(reader),
             writer: Box::new(writer),
             response_frame_size: MIN_SESSION_CONSENSUS_FRAME_SIZE,
@@ -6909,6 +7113,8 @@ mod tests {
         let (stream, _remote) = tokio::io::duplex(64);
         let (reader, writer) = tokio::io::split(stream);
         let mut connection = ConsensusConnection {
+            #[cfg(feature = "test-control")]
+            outbound_socket_context: None,
             reader: Box::new(reader),
             writer: Box::new(writer),
             response_frame_size: MIN_SESSION_CONSENSUS_FRAME_SIZE,
@@ -9170,6 +9376,8 @@ mod tests {
         {
             let mut primary = pool.primary.connection.lock().await;
             *primary = Some(ConsensusConnection {
+                #[cfg(feature = "test-control")]
+                outbound_socket_context: None,
                 reader: Box::new(reader),
                 writer: Box::new(writer),
                 response_frame_size: MIN_SESSION_CONSENSUS_FRAME_SIZE,
@@ -9204,6 +9412,8 @@ mod tests {
         let (stream, _remote) = tokio::io::duplex(64);
         let (reader, writer) = tokio::io::split(stream);
         ConsensusConnection {
+            #[cfg(feature = "test-control")]
+            outbound_socket_context: None,
             reader: Box::new(reader),
             writer: Box::new(writer),
             response_frame_size: MIN_SESSION_CONSENSUS_FRAME_SIZE,

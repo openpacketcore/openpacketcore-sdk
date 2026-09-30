@@ -663,6 +663,8 @@ impl LedgerState {
                 return Err(AuditAuthorityError::BindingMismatch);
             }
         }
+        #[cfg(feature = "dangerous-test-hooks")]
+        crate::consensus::capacity_observation::validated_ledger(self, &derived);
         Ok(())
     }
 }

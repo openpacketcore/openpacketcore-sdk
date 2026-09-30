@@ -472,6 +472,16 @@ pub(crate) fn authentication(encoded: &Vec<u8>) -> OwnerGuard<'_> {
     owner(AUTH, || encoded.capacity())
 }
 
+// A synchronous bridge callback can compare against the independently
+// observed real validation owner. This is current state, never a phase peak.
+#[cfg(feature = "dangerous-test-hooks")]
+pub(crate) fn live_derived_bytes() -> usize {
+    OBSERVATION.with(|slot| {
+        slot.get()
+            .map_or(0, |observation| observation.owners[DERIVED])
+    })
+}
+
 pub(crate) struct DerivedGuard(OwnerGuard<'static>);
 
 pub(crate) fn derived() -> DerivedGuard {

@@ -40,6 +40,7 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 use crate::error::ProtocolError;
 
+mod consensus_decode;
 mod consensus_json;
 
 pub const CONTRACT_VERSION: u32 = 5;
@@ -780,6 +781,10 @@ impl SessionConsensusTransportRequest {
 pub(crate) enum SessionConsensusTransportResponse {
     Call {
         call_id: uuid::Uuid,
+        #[cfg_attr(
+            all(test, feature = "test-control"),
+            serde(deserialize_with = "consensus_decode_tests::deserialize_response")
+        )]
         response: SessionConsensusWireResponse,
     },
 }
@@ -4857,6 +4862,18 @@ where
     serde_json::from_slice(&payload).map_err(ProtocolError::from)
 }
 
+/// Read the closed consensus response through the existing bounded frame reader.
+pub(crate) async fn read_consensus_response_frame<R>(
+    reader: &mut R,
+    max_frame_size: usize,
+) -> Result<SessionConsensusTransportResponse, ProtocolError>
+where
+    R: tokio::io::AsyncRead + Unpin,
+{
+    let payload = read_frame_payload(reader, max_frame_size).await?;
+    consensus_decode::response(&payload).map_err(ProtocolError::from)
+}
+
 /// Decode one post-bootstrap operation request through the private v5 DTO.
 pub(crate) async fn read_request_frame<R>(
     reader: &mut R,
@@ -4908,21 +4925,20 @@ where
     }
 }
 
-/// Read one post-authentication frame with an absolute idle deadline.
+/// Read one post-authentication consensus request with an absolute idle deadline.
 ///
 /// `Ok(None)` means the peer sent no byte before the next-request idle policy
 /// expired. Once any frame byte arrives, every remaining prefix/payload byte
 /// must arrive by the same deadline; a partial-frame stall remains a timed-out
 /// [`ProtocolError`] so authenticated slowloris behavior is never relabeled as
 /// a normal idle retirement.
-pub(crate) async fn read_authenticated_frame_within<R, T>(
+pub(crate) async fn read_authenticated_frame_within<R>(
     reader: &mut R,
     max_frame_size: usize,
     timeout: std::time::Duration,
-) -> Result<Option<T>, ProtocolError>
+) -> Result<Option<SessionConsensusTransportRequest>, ProtocolError>
 where
     R: tokio::io::AsyncRead + Unpin,
-    T: for<'de> Deserialize<'de>,
 {
     let payload =
         match read_authenticated_frame_payload_within(reader, max_frame_size, timeout).await? {
@@ -4932,7 +4948,7 @@ where
     #[cfg(all(test, feature = "test-control"))]
     {
         let _owner = inbound_decode_observation::borrow_raw_decode(&payload);
-        let decoded = serde_json::from_slice(&payload)
+        let decoded = consensus_decode::request(&payload)
             .map(Some)
             .map_err(ProtocolError::from);
         inbound_decode_observation::capture_decode_result(&payload, decoded.is_err());
@@ -4940,7 +4956,7 @@ where
     }
     #[cfg(not(all(test, feature = "test-control")))]
     {
-        serde_json::from_slice(&payload)
+        consensus_decode::request(&payload)
             .map(Some)
             .map_err(ProtocolError::from)
     }
@@ -5113,6 +5129,12 @@ mod capacity_owner_tests;
 
 #[cfg(all(test, feature = "test-control"))]
 mod encoding_batch_tests;
+
+#[cfg(all(test, feature = "test-control"))]
+mod consensus_decode_tests;
+
+#[cfg(all(test, feature = "test-control", feature = "insecure-test"))]
+pub(crate) use consensus_decode_tests::ConsensusDecodeDispatchCount;
 
 #[cfg(test)]
 mod tests {
