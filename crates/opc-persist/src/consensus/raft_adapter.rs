@@ -143,7 +143,17 @@ impl ConfigRaftNetwork {
             ConsensusWireRequest::try_new(self.identity, self.local_node_id, family, payload)
                 .map_err(|error| EngineRpcError::Unreachable(Unreachable::new(&error)))?;
         let ttl = option.hard_ttl();
-        let response = match tokio::time::timeout(ttl, peer.call(wire)).await {
+        #[cfg(feature = "dangerous-test-hooks")]
+        let timeout_before = tokio::time::Instant::now();
+        let response = tokio::time::timeout(ttl, peer.call(wire));
+        #[cfg(feature = "dangerous-test-hooks")]
+        let response = super::capacity_observation::raft_buffers::scope_rpc_deadline(
+            ttl,
+            timeout_before,
+            tokio::time::Instant::now(),
+            response,
+        );
+        let response = match response.await {
             Err(_) => {
                 return Err(EngineRpcError::Timeout(Timeout {
                     action,

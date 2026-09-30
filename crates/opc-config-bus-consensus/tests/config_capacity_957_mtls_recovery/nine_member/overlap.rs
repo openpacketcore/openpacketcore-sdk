@@ -7,6 +7,9 @@ mod tls;
 use super::super::joint_metadata as joint;
 use super::*;
 use opc_persist::audit_authority::{AuditAdmission, AuditLedgerLimits, AuditOperationState};
+use opc_persist::config_capacity_observation::raft_buffers::{
+    AllocationView, RaftAppendCensus, RaftAppendSample, RaftAppendUnion,
+};
 use opc_persist::config_capacity_observation::{
     AppendOwnerSample, AppendStage, NativeOwnerObserver, NativeOwnerSample, NativeRegistration,
     NativeStage, PreparationCensus,
@@ -20,10 +23,7 @@ use opc_session_net::consensus::capacity_observation::{
 struct NativeResults {
     decoded: Option<NativeOwnerSample>,
     validated: Option<NativeOwnerSample>,
-    mutation: Option<(
-        NativeOwnerSample,
-        Option<(NativeTransportOverlap, tls::Checkpoint)>,
-    )>,
+    mutation: Option<NativeCapture>,
     written: Option<NativeOwnerSample>,
     append: Option<(
         AppendOwnerSample,
@@ -32,11 +32,33 @@ struct NativeResults {
     counts: [usize; 4],
 }
 
+#[derive(Debug)]
+struct NativeCapture {
+    native: NativeOwnerSample,
+    overlap: Option<NativeTransportCapture>,
+}
+
+#[derive(Debug)]
+struct NativeTransportCapture {
+    transport: NativeTransportOverlap,
+    tls: tls::Checkpoint,
+    raft: Option<NativeRaftCapture>,
+}
+
+#[derive(Debug)]
+struct NativeRaftCapture {
+    sample: RaftAppendSample,
+    joined: RaftAppendUnion,
+    generation: Option<u64>,
+}
+
 // Owns only counter snapshots and transport controls; never the observed
 // preparations, native command, ledger, request, frame or database.
 struct NativeBridge {
     transport: Arc<ConsensusBufferObservation>,
     tls: Arc<tls::Census>,
+    raft: Arc<RaftAppendCensus>,
+    native_raft: Arc<std::sync::Mutex<BTreeMap<u64, u64>>>,
     results: std::sync::Mutex<NativeResults>,
 }
 
@@ -51,9 +73,33 @@ impl NativeOwnerObserver for NativeBridge {
     }
 
     fn observe(&self, sample: NativeOwnerSample) {
+        self.record_native(sample, None);
+    }
+
+    fn observe_with_allocations(&self, sample: NativeOwnerSample, owners: AllocationView<'_>) {
+        self.record_native(sample, Some(owners));
+    }
+}
+
+impl NativeBridge {
+    fn record_native(&self, sample: NativeOwnerSample, owners: Option<AllocationView<'_>>) {
         let overlap = (sample.stage == NativeStage::AuthenticatedMutation).then(|| {
             self.transport
-                .capture_native_overlap_and_release_with(sample.source, |_| self.tls.snapshot())
+                .capture_native_overlap_and_release_with(sample.source, |transport| {
+                    self.raft.with_current_capture(|capture| {
+                        let joined = owners.as_ref().map(|owners| NativeRaftCapture {
+                            sample: capture.sample(),
+                            joined: capture.join(owners),
+                            generation: self
+                                .native_raft
+                                .lock()
+                                .unwrap()
+                                .get(&transport.append_generation)
+                                .copied(),
+                        });
+                        (self.tls.snapshot(), joined)
+                    })
+                })
         });
         let mut results = self.results.lock().unwrap();
         match sample.stage {
@@ -67,7 +113,16 @@ impl NativeOwnerObserver for NativeBridge {
             }
             NativeStage::AuthenticatedMutation => {
                 results.counts[1] += 1;
-                results.mutation = Some((sample, overlap.flatten()));
+                results.mutation = Some(NativeCapture {
+                    native: sample,
+                    overlap: overlap.flatten().map(|(transport, (tls, raft))| {
+                        NativeTransportCapture {
+                            transport,
+                            tls,
+                            raft,
+                        }
+                    }),
+                });
             }
             NativeStage::LedgerWrite => {
                 results.counts[2] += 1;
@@ -558,7 +613,17 @@ native_case!(
         }
         preparation_owners.extend(census.observe_audited(leader_id, &prepared));
         preparation_owners.extend(census.observe_audited(leader_id, &prepared_alias));
+        let raft = Arc::new(RaftAppendCensus::default());
+        let raft_registrations: Vec<_> = stores
+            .iter()
+            .map(|store| {
+                raft.observe_source(manifest.consensus_identity(), store.status().node_id)
+                    .unwrap()
+            })
+            .collect();
         let native_bridge = Arc::new(NativeBridge {
+            raft: raft.clone(),
+            native_raft: transfers[leader].native_raft.clone(),
             tls: tls.clone(),
             transport: observation.clone(),
             results: std::sync::Mutex::new(NativeResults::default()),
@@ -741,6 +806,9 @@ native_case!(
         )
         .await;
         let native_drain = native_registration.snapshot();
+        let raft_drained = raft.with_current_capture(|capture| capture.sample());
+        drop(raft_registrations);
+        let raft_detached = raft.with_current_capture(|capture| capture.sample());
         let tls_after_mutation = tls.snapshot();
         let native_results = std::mem::take(&mut *native_bridge.results.lock().unwrap());
         drop(native_registration);
@@ -857,16 +925,57 @@ native_case!(
             "CONFIG_CAPACITY_NATIVE_OWNER_BRIDGE_LIFECYCLE members=9 prepared=72 aliases=73 native={native_drain:?} preparations_before={preparations_before_drop:?} preparations_after={preparations_after_drop:?} native_counts={:?} full_memory_bound=false",
             native_results.counts
         );
-        let (native, transport) = native_results.mutation.expect(
+        let NativeCapture { native, overlap: native_overlap } = native_results.mutation.expect(
             "CONFIG_CAPACITY_NATIVE_OWNER_BRIDGE_RED: actual native mutation checkpoint after completed lifecycle",
         );
-        let (transport, tls_checkpoint) = transport.expect(
+        let NativeTransportCapture {
+            transport,
+            tls: tls_checkpoint,
+            raft: raft_checkpoint,
+        } = native_overlap.expect(
             "CONFIG_CAPACITY_NATIVE_TRANSPORT_JOIN_RED: currently live selected append and snapshot at native mutation",
         );
         tls_checkpoint.verify(&transport, &tls_after_mutation, &tls_after_recovery);
+        assert!(
+            raft_drained.calls.is_empty()
+                && raft_drained.origins.is_empty()
+                && raft_drained.issues.complete()
+        );
+        assert!(
+            raft_detached.calls.is_empty()
+                && raft_detached.origins.is_empty()
+                && raft_detached.issues.complete()
+        );
+        assert_eq!(raft_detached.registrations, 0);
+        let NativeRaftCapture {
+            sample: raft_sample,
+            joined: raft_union,
+            generation,
+        } = raft_checkpoint.expect("CONFIG_CAPACITY_NINE_NATIVE_RAFT_JOIN_RED: exact native allocation view reaches the atomic transport/Raft/TLS census");
+        assert!(raft_sample.issues.complete() && raft_union.issues.complete());
+        assert_eq!(raft_union.identity, manifest.consensus_identity());
+        assert_eq!(raft_union.source, leader_id);
+        assert_eq!(raft_union.native_bytes, native.node_mutation_bytes);
+        assert!(raft_union.union_bytes >= raft_union.native_bytes);
+        let generation = generation.expect("CONFIG_CAPACITY_NINE_NATIVE_RAFT_ORIGIN_RED: native and Raft witnesses verified the same original wire");
+        let original = raft_sample.origins.iter().find(|origin| {
+            origin.identity == manifest.consensus_identity()
+                && origin.source == leader_id
+                && origin.target == minority_id
+                && origin.generation == generation
+                && origin.entries == 1
+                && origin.attribution.len() == 1
+                && origin.attribution[0].supported
+        }).expect("CONFIG_CAPACITY_NINE_NATIVE_RAFT_ORIGIN_RED: exact held original minority append retains encoded provenance");
+        println!("CONFIG_CAPACITY_NINE_NATIVE_RAFT_CHECKPOINT sample={raft_sample:?} joined={raft_union:?} current_native_transport_raft_tls=true full_memory_bound=false");
         let (append, append_transport) = native_results
             .append
             .expect("CONFIG_CAPACITY_NINE_APPEND_BUFFERS_RED: original native append callback");
+        assert_eq!(
+            original.attribution[0].request,
+            Some(append.request),
+            "CONFIG_CAPACITY_NINE_NATIVE_RAFT_REQUEST_RED: original wire and native append share the actual durable request"
+        );
         assert_eq!(append.source, leader_id);
         assert_eq!(append.stage, AppendStage::OutputsReady);
         assert_eq!(append.unmeasured_entries, 0);
@@ -995,14 +1104,17 @@ native_case!(
         // All currently registered append RPCs from this source are distinct
         // from native mutation storage. Snapshot RPC and outer-frame storage
         // remain separate; source/family groups can alias and are not summed.
-        let current_node_mutation_bytes =
-            native.node_mutation_bytes + append_group.totals.rpc_bytes;
+        let current_node_mutation_bytes = raft_union
+            .union_bytes
+            .checked_add(append_group.totals.rpc_bytes)
+            .unwrap();
         println!(
-            "CONFIG_CAPACITY_CURRENT_NATIVE_LIFECYCLE observed_calls={} additional_calls={} current_append_targets={} completed_append_targets=7 native_node_mutation_bytes={} current_append_rpc_bytes={} current_snapshot_rpc_bytes={} current_node_mutation_bytes={} current_outer_frame_bytes={} current={current:?} full_memory_bound=false",
+            "CONFIG_CAPACITY_CURRENT_NATIVE_LIFECYCLE observed_calls={} additional_calls={} current_append_targets={} completed_append_targets=7 native_node_mutation_bytes={} native_raft_union_bytes={} current_append_rpc_bytes={} current_snapshot_rpc_bytes={} current_node_mutation_bytes={} current_outer_frame_bytes={} current={current:?} full_memory_bound=false",
             current.total.calls,
             current.additional.calls,
             current_append_targets.len(),
             native.node_mutation_bytes,
+            raft_union.union_bytes,
             append_group.totals.rpc_bytes,
             snapshot_group.totals.rpc_bytes,
             current_node_mutation_bytes,

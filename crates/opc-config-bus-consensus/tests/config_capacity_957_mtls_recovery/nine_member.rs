@@ -21,6 +21,7 @@ const PREPARATIONS: usize = 8;
 #[derive(Default, Debug)]
 struct Transfers {
     fanout: fanout::Gate,
+    native_raft: Arc<std::sync::Mutex<BTreeMap<u64, u64>>>,
     large_append_success: [AtomicUsize; MEMBERS],
     active: AtomicUsize,
     active_capacity: AtomicUsize,
@@ -159,11 +160,29 @@ impl NinePeer {
         request: ConsensusWireRequest,
         timeout: Option<Duration>,
     ) -> Result<ConsensusWireResponse, ConsensusPeerError> {
+        let invocation_entered = tokio::time::Instant::now();
         assert!(request.payload.len() <= opc_consensus::CONSENSUS_MAX_RPC_PAYLOAD_BYTES);
         let typed = opc_persist::config_capacity_observation::transport_witness(
             &request,
             self.inner.node_id(),
         );
+        let raft = opc_persist::config_capacity_observation::raft_buffers::raft_append_witness(
+            &request,
+            self.inner.node_id(),
+        );
+        if let (Some(typed), Some(raft)) = (typed, raft) {
+            // Both witnesses checked this exact original wire allocation. Keep
+            // only their numeric relation; a later native capture must still
+            // prove the transport owner and Raft origin are currently live.
+            assert!(typed.selected_append);
+            assert!(self
+                .transfers
+                .native_raft
+                .lock()
+                .unwrap()
+                .insert(typed.generation, raft.generation)
+                .is_none());
+        }
         // The typed context was captured by the real adapter before this peer
         // was invoked. Pause before reading defer_snapshots so arming exercises
         // the exact pre-registration interleaving, without restarting the RPC.
@@ -191,12 +210,13 @@ impl NinePeer {
         let fanout_call = self
             .transfers
             .fanout
-            .pause(&request, self.inner.node_id())
+            .pause(&request, self.inner.node_id(), invocation_entered)
             .await;
         // Test-only decoding for the existing contiguous acknowledged-chunk
         // witness. Its temporary copy is not a measured production owner.
         let chunk = self.transfers.snapshots[self.target].capture(&request);
         let vote_probe = self.transfers.vote_probes[self.target].capture(&request);
+        let _fanout_call = fanout_call.map(|call| self.transfers.fanout.in_flight(call));
         let result = opc_session_net::consensus::capacity_observation::scope_typed_transport(
             typed.is_some_and(|witness| witness.selected_append),
             typed.map_or(0, |witness| witness.snapshot_data_bytes),
@@ -210,6 +230,7 @@ impl NinePeer {
         )
         .await;
         if let Some(call) = fanout_call {
+            self.transfers.fanout.response_ready(call, &result).await;
             self.transfers.fanout.complete(call, &result);
         }
         if let Some(probe) = vote_probe {

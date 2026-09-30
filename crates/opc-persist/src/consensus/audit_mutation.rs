@@ -291,6 +291,8 @@ impl PreparedAuditedMutation {
 
     /// Encode for protected caller recovery storage, never diagnostics.
     pub fn encode(&self) -> Result<Vec<u8>, AuditAuthorityError> {
+        #[cfg(feature = "dangerous-test-hooks")]
+        let mut encoded = super::capacity_observation::working_buffers::RecoveryOutput::start(self);
         let _encoding = self
             .preparation
             .as_ref()
@@ -300,12 +302,20 @@ impl PreparedAuditedMutation {
         // array's decimal expansion must not allocate first and reject later.
         let mut counter = RecoverySizeCounter(0);
         serde_json::to_writer(&mut counter, self).map_err(|_| AuditAuthorityError::InvalidInput)?;
+        #[cfg(not(feature = "dangerous-test-hooks"))]
         let mut encoded = Vec::new();
         encoded
             .try_reserve_exact(counter.0)
             .map_err(|_| AuditAuthorityError::Unavailable)?;
         serde_json::to_writer(&mut encoded, self).map_err(|_| AuditAuthorityError::InvalidInput)?;
-        Ok(encoded)
+        #[cfg(feature = "dangerous-test-hooks")]
+        {
+            encoded.finish()
+        }
+        #[cfg(not(feature = "dangerous-test-hooks"))]
+        {
+            Ok(encoded)
+        }
     }
 
     /// Decode bounded, untrusted recovery data. Submission authenticates every field.

@@ -18,6 +18,7 @@ use std::collections::BTreeMap;
 use std::marker::PhantomData;
 
 const WORKING_BYTES: usize = 32 * 1024 * 1024;
+const MAX_CALL_DIAGNOSTICS: usize = 128;
 
 #[derive(Clone, Copy, Debug)]
 struct Wire {
@@ -27,12 +28,63 @@ struct Wire {
     bytes: usize,
 }
 
+struct CallTiming {
+    target: ConsensusNodeId,
+    generation: Option<u64>,
+    invocation_entered_us: u128,
+    registered_us: u128,
+    released_us: Option<u128>,
+    transport_entered_us: Option<u128>,
+    peer_response_us: Option<u128>,
+    result_us: Option<u128>,
+    result_at: Option<tokio::time::Instant>,
+    dropped_us: Option<u128>,
+    cancelled: bool,
+    success: Option<bool>,
+    hard_ttl_us: Option<u128>,
+    deadline_earliest_us: Option<u128>,
+    deadline_latest_us: Option<u128>,
+    deadline_earliest: Option<tokio::time::Instant>,
+    deadline_latest: Option<tokio::time::Instant>,
+}
+
 #[derive(Default)]
 struct State {
     source: Option<ConsensusNodeId>,
+    epoch: Option<tokio::time::Instant>,
     next: u64,
     rows: BTreeMap<u64, (Wire, usize)>,
     completed: BTreeMap<u64, bool>,
+    timings: BTreeMap<u64, CallTiming>,
+    timings_saturated: bool,
+    hold_one_response: bool,
+    held_response: Option<u64>,
+    response_released: bool,
+    settle_entered_us: Option<u128>,
+    response_released_us: Option<u128>,
+    mutation_completed_us: Option<u128>,
+}
+
+impl State {
+    fn micros(&self, instant: tokio::time::Instant) -> u128 {
+        instant
+            .saturating_duration_since(self.epoch.expect("armed timing origin"))
+            .as_micros()
+    }
+
+    fn completed_in_time(&self, wires: &[Wire]) -> bool {
+        !self.timings_saturated
+            && wires.iter().all(|wire| {
+                self.completed.get(&wire.call) == Some(&true)
+                    && self.timings.get(&wire.call).is_some_and(|timing| {
+                        !timing.cancelled
+                            && matches!(
+                                (timing.result_at, timing.deadline_earliest),
+                                (Some(result), Some(deadline)) if result <= deadline
+                            )
+                    })
+            })
+    }
 }
 
 pub(super) struct Gate {
@@ -65,7 +117,34 @@ struct Paused<'a> {
 
 impl Drop for Paused<'_> {
     fn drop(&mut self) {
-        self.gate.state.lock().unwrap().rows.remove(&self.token);
+        let mut state = self.gate.state.lock().unwrap();
+        let now = state.micros(tokio::time::Instant::now());
+        state.rows.remove(&self.token);
+        if let Some(timing) = state.timings.get_mut(&self.token) {
+            if timing.released_us.is_none() {
+                timing.dropped_us = Some(now);
+                timing.cancelled = true;
+            }
+        }
+        drop(state);
+        self.gate.changed.send_replace(());
+    }
+}
+
+pub(super) struct InFlight<'a> {
+    gate: &'a Gate,
+    call: u64,
+}
+
+impl Drop for InFlight<'_> {
+    fn drop(&mut self) {
+        let mut state = self.gate.state.lock().unwrap();
+        let now = state.micros(tokio::time::Instant::now());
+        if let Some(timing) = state.timings.get_mut(&self.call) {
+            timing.dropped_us = Some(now);
+            timing.cancelled = timing.result_us.is_none();
+        }
+        drop(state);
         self.gate.changed.send_replace(());
     }
 }
@@ -75,12 +154,14 @@ impl Gate {
         let mut state = self.state.lock().unwrap();
         assert!(state.source.is_none() && state.rows.is_empty());
         state.source = Some(source);
+        state.epoch = Some(tokio::time::Instant::now());
     }
 
     pub(super) async fn pause(
         &self,
         request: &ConsensusWireRequest,
         target: ConsensusNodeId,
+        invocation_entered: tokio::time::Instant,
     ) -> Option<u64> {
         if request.family != ConsensusRpcFamily::AppendEntries
             || request.payload.len() <= BOUNDED_LOGICAL_BYTES
@@ -96,6 +177,35 @@ impl Gate {
             }
             state.next = state.next.checked_add(1).expect("finite original calls");
             let token = state.next;
+            if state.timings.len() < MAX_CALL_DIAGNOSTICS {
+                let deadline = original.and_then(|original| original.deadline);
+                let timing = CallTiming {
+                    target,
+                    generation: original.map(|original| original.generation),
+                    invocation_entered_us: state.micros(invocation_entered),
+                    registered_us: state.micros(tokio::time::Instant::now()),
+                    released_us: None,
+                    transport_entered_us: None,
+                    peer_response_us: None,
+                    result_us: None,
+                    result_at: None,
+                    dropped_us: None,
+                    cancelled: false,
+                    success: None,
+                    hard_ttl_us: deadline.map(|deadline| deadline.hard_ttl.as_micros()),
+                    deadline_earliest_us: deadline
+                        .and_then(|deadline| deadline.earliest)
+                        .map(|instant| state.micros(instant)),
+                    deadline_latest_us: deadline
+                        .and_then(|deadline| deadline.latest)
+                        .map(|instant| state.micros(instant)),
+                    deadline_earliest: deadline.and_then(|deadline| deadline.earliest),
+                    deadline_latest: deadline.and_then(|deadline| deadline.latest),
+                };
+                state.timings.insert(token, timing);
+            } else {
+                state.timings_saturated = true;
+            }
             state.rows.insert(
                 token,
                 (
@@ -125,15 +235,27 @@ impl Gate {
                 .expect("original gate remains owned");
         }
         let call = guard.token;
+        {
+            let mut state = self.state.lock().unwrap();
+            let now = state.micros(tokio::time::Instant::now());
+            if let Some(timing) = state.timings.get_mut(&call) {
+                timing.released_us = Some(now);
+            }
+        }
         drop(guard);
         Some(call)
     }
 
-    pub(super) fn complete(
-        &self,
-        call: u64,
-        response: &Result<ConsensusWireResponse, ConsensusPeerError>,
-    ) {
+    pub(super) fn in_flight(&self, call: u64) -> InFlight<'_> {
+        let mut state = self.state.lock().unwrap();
+        let now = state.micros(tokio::time::Instant::now());
+        if let Some(timing) = state.timings.get_mut(&call) {
+            timing.transport_entered_us = Some(now);
+        }
+        InFlight { gate: self, call }
+    }
+
+    fn native_success(response: &Result<ConsensusWireResponse, ConsensusPeerError>) -> bool {
         use opc_consensus::engine::{error::RaftError, raft::AppendEntriesResponse};
         #[derive(serde::Deserialize)]
         struct Reply<T> {
@@ -142,21 +264,142 @@ impl Gate {
         }
         type AppendReply =
             Result<AppendEntriesResponse<ConsensusNodeId>, RaftError<ConsensusNodeId>>;
-        let success = response
+        response
             .as_ref()
             .ok()
             .and_then(|response| response.result.as_ref().ok())
             .and_then(|bytes| opc_consensus::decode_bounded::<Reply<AppendReply>>(bytes).ok())
             .is_some_and(|reply| {
                 reply.revision == 8 && matches!(reply.value, Ok(AppendEntriesResponse::Success))
-            });
-        assert!(self
-            .state
-            .lock()
-            .unwrap()
-            .completed
-            .insert(call, success)
-            .is_none());
+            })
+    }
+
+    fn hold_one_response(&self) {
+        let mut state = self.state.lock().unwrap();
+        assert!(state.source.is_some() && state.held_response.is_none());
+        state.hold_one_response = true;
+    }
+
+    pub(super) async fn response_ready(
+        &self,
+        call: u64,
+        response: &Result<ConsensusWireResponse, ConsensusPeerError>,
+    ) {
+        let mut changed = self.changed.subscribe();
+        let held = {
+            let mut state = self.state.lock().unwrap();
+            let now = state.micros(tokio::time::Instant::now());
+            if let Some(timing) = state.timings.get_mut(&call) {
+                timing.peer_response_us = Some(now);
+            }
+            if state.hold_one_response
+                && state.held_response.is_none()
+                && Self::native_success(response)
+            {
+                state.held_response = Some(call);
+                true
+            } else {
+                false
+            }
+        };
+        if !held {
+            return;
+        }
+        // The real authenticated peer has returned this original call's own
+        // native success. Hold its response delivery, still inside the same
+        // adapter timeout. No new request, retry, or response is constructed.
+        self.changed.send_replace(());
+        loop {
+            if self.state.lock().unwrap().response_released {
+                return;
+            }
+            changed
+                .changed()
+                .await
+                .expect("response gate remains owned");
+        }
+    }
+
+    pub(super) fn complete(
+        &self,
+        call: u64,
+        response: &Result<ConsensusWireResponse, ConsensusPeerError>,
+    ) {
+        let success = Self::native_success(response);
+        let mut state = self.state.lock().unwrap();
+        assert!(state.completed.insert(call, success).is_none());
+        let instant = tokio::time::Instant::now();
+        let now = state.micros(instant);
+        if let Some(timing) = state.timings.get_mut(&call) {
+            timing.result_us = Some(now);
+            timing.result_at = Some(instant);
+            timing.success = Some(success);
+        }
+        drop(state);
+        self.changed.send_replace(());
+    }
+
+    async fn settle(&self, wires: &[Wire]) -> bool {
+        let mut changed = self.changed.subscribe();
+        let deadline = {
+            let mut state = self.state.lock().unwrap();
+            state.settle_entered_us = Some(state.micros(tokio::time::Instant::now()));
+            wires
+                .iter()
+                .map(|wire| {
+                    // The lower constructor bound is no later than the actual
+                    // deadline. This wait grants no new duration; every
+                    // original adapter also enforces its own timeout.
+                    state.timings.get(&wire.call)?.deadline_earliest
+                })
+                .collect::<Option<Vec<_>>>()
+                .and_then(|deadlines| deadlines.into_iter().max())
+        };
+        let Some(deadline) = deadline else {
+            return false;
+        };
+        tokio::time::timeout_at(deadline, async {
+            loop {
+                let (released, completed) = {
+                    let mut state = self.state.lock().unwrap();
+                    // The join starts immediately after ownership capture.
+                    // When a real response hold is armed, observe its genuine
+                    // native Success before releasing that same invocation.
+                    // No mutation-completion dependency delays this release.
+                    let released = !state.response_released
+                        && (!state.hold_one_response || state.held_response.is_some());
+                    if released {
+                        state.response_released = true;
+                        state.response_released_us =
+                            Some(state.micros(tokio::time::Instant::now()));
+                    }
+                    let completed = wires.iter().all(|wire| {
+                        state.completed.contains_key(&wire.call)
+                            || state
+                                .timings
+                                .get(&wire.call)
+                                .is_some_and(|timing| timing.cancelled)
+                    });
+                    (released, completed.then(|| state.completed_in_time(wires)))
+                };
+                if released {
+                    self.changed.send_replace(());
+                }
+                if let Some(completed) = completed {
+                    return completed;
+                }
+                changed
+                    .changed()
+                    .await
+                    .expect("original calls remain observed");
+            }
+        })
+        .await
+        .unwrap_or(false)
+    }
+
+    fn completed_in_time(&self, wires: &[Wire]) -> bool {
+        self.state.lock().unwrap().completed_in_time(wires)
     }
 
     async fn wait_for_all(&self) {
@@ -188,6 +431,31 @@ impl Gate {
 
     fn drained(&self) -> bool {
         self.state.lock().unwrap().rows.is_empty()
+    }
+
+    fn elapsed_micros(&self) -> u128 {
+        self.state
+            .lock()
+            .unwrap()
+            .micros(tokio::time::Instant::now())
+    }
+
+    fn print_diagnostics(&self, shutdown_entered_us: u128) {
+        let state = self.state.lock().unwrap();
+        println!("CONFIG_CAPACITY_NINE_FANOUT_RPC_LIFECYCLE shutdown_entered_us={shutdown_entered_us} shutdown_completed_us={} diagnostics_saturated={} held_response={:?} response_released={} settle_entered_us={:?} response_released_us={:?} mutation_completed_us={:?}", state.micros(tokio::time::Instant::now()), state.timings_saturated, state.held_response, state.response_released, state.settle_entered_us, state.response_released_us, state.mutation_completed_us);
+        for (call, timing) in &state.timings {
+            let epoch = state.epoch.expect("armed timing origin");
+            let result_ns = timing
+                .result_at
+                .map(|instant| instant.duration_since(epoch).as_nanos());
+            let deadline_earliest_ns = timing
+                .deadline_earliest
+                .map(|instant| instant.duration_since(epoch).as_nanos());
+            let deadline_latest_ns = timing
+                .deadline_latest
+                .map(|instant| instant.duration_since(epoch).as_nanos());
+            println!("CONFIG_CAPACITY_NINE_FANOUT_RPC call={call} target={} generation={:?} invocation_entered_us={} registered_us={} released_us={:?} transport_entered_us={:?} peer_response_us={:?} result_us={:?} dropped_us={:?} cancelled={} success={:?} hard_ttl_us={:?} deadline_earliest_us={:?} deadline_latest_us={:?} result_ns={result_ns:?} deadline_earliest_ns={deadline_earliest_ns:?} deadline_latest_ns={deadline_latest_ns:?}", timing.target, timing.generation, timing.invocation_entered_us, timing.registered_us, timing.released_us, timing.transport_entered_us, timing.peer_response_us, timing.result_us, timing.dropped_us, timing.cancelled, timing.success, timing.hard_ttl_us, timing.deadline_earliest_us, timing.deadline_latest_us);
+        }
     }
 }
 
@@ -331,8 +599,16 @@ native_case!(config_capacity_957_nine_live_fanout_working_bound, {
     });
     let gate = &transfers[leader].fanout;
     gate.arm(leader_id);
-    let (result, checkpoint) = tokio::join!(
-        stores[leader].submit_audited_mutation_local(&alias, &admission, joint::caller(&principal)),
+    gate.hold_one_response();
+    let (result, (checkpoint, settled)) = tokio::join!(
+        async {
+            let result = stores[leader]
+                .submit_audited_mutation_local(&alias, &admission, joint::caller(&principal))
+                .await;
+            let mut state = gate.state.lock().unwrap();
+            state.mutation_completed_us = Some(state.micros(tokio::time::Instant::now()));
+            result
+        },
         async {
             let ready =
                 tokio::time::timeout(DURABLE_CONSENSUS_OPERATION_TIMEOUT, gate.wait_for_all())
@@ -356,7 +632,14 @@ native_case!(config_capacity_957_nine_live_fanout_working_bound, {
                 .expect("original bounded audited preparation")
             });
             gate.release();
-            checkpoint
+            // The actual original responses have their own shorter deadlines.
+            // Join them as soon as capture releases their requests, while the
+            // same audited mutation can continue through native application.
+            let settled = match &checkpoint {
+                Ok(checkpoint) => gate.settle(&checkpoint.wires).await,
+                Err(_) => false,
+            };
+            (checkpoint, settled)
         },
     );
     let AuditAdmission::Applied(receipt) = result else {
@@ -386,13 +669,9 @@ native_case!(config_capacity_957_nine_live_fanout_working_bound, {
             AuditOperationState::Committed { version: 2 }
         );
     }
-    for (target, before) in before.iter().enumerate() {
-        if target != leader {
-            assert!(
-                transfers[leader].large_append_success[target].load(Ordering::SeqCst) > *before
-            );
-        }
-    }
+    let after: [_; MEMBERS] = std::array::from_fn(|target| {
+        transfers[leader].large_append_success[target].load(Ordering::SeqCst)
+    });
     let committed = databases.each_ref().map(|path| effect_counts(path));
     assert!(!recovery.is_empty());
     drop(prepared);
@@ -419,6 +698,7 @@ native_case!(config_capacity_957_nine_live_fanout_working_bound, {
         assert_exhausted(store);
         drop(slots);
     }
+    let shutdown_entered_us = gate.elapsed_micros();
     for (store, server) in stores.iter().zip(servers) {
         server.unwrap().abort_and_wait().await;
         store.shutdown().await.unwrap();
@@ -442,6 +722,7 @@ native_case!(config_capacity_957_nine_live_fanout_working_bound, {
         committed
     );
     println!("CONFIG_CAPACITY_NINE_FANOUT_LIFECYCLE members=9 prepared=72 remote_targets=8 audited_commits=1 exact_readback=true original_handle=true original_paths=true joined_shutdown=true caller_recovery_bytes={caller_recovery_bytes} full_memory_bound=false");
+    gate.print_diagnostics(shutdown_entered_us);
     assert!(gate.drained());
     assert!(drained.calls.is_empty() && drained.origins.is_empty() && drained.issues.complete());
     assert!(detached.calls.is_empty() && detached.origins.is_empty() && detached.issues.complete());
@@ -458,6 +739,32 @@ native_case!(config_capacity_957_nine_live_fanout_working_bound, {
     );
     assert!(checkpoint.wires.iter().all(|wire| completed.get(&wire.call) == Some(&true)),
         "CONFIG_CAPACITY_NINE_FANOUT_GENERATION_COMPLETION_RED: every captured original call receives its own native success");
+    // Tokio polls its inner future before its timer. A successful timeout
+    // wrapper therefore cannot prove that a ready response met its deadline.
+    // Compare the actual unrounded instants for every captured original call.
+    assert!(gate.completed_in_time(&checkpoint.wires), "CONFIG_CAPACITY_NINE_FANOUT_DEADLINE_RED: each original response arrives within its own unchanged deadline");
+    assert!(settled, "CONFIG_CAPACITY_NINE_FANOUT_DEADLINE_RED: original-call join stays inside original deadlines");
+    {
+        let state = gate.state.lock().unwrap();
+        let call = state.held_response.expect("genuine original response tail");
+        let timing = &state.timings[&call];
+        assert!(timing.peer_response_us.is_some_and(|received| {
+            state
+                .response_released_us
+                .is_some_and(|released| received <= released)
+        }));
+        assert!(state.settle_entered_us.is_some_and(|joined| {
+            state
+                .response_released_us
+                .is_some_and(|released| joined <= released)
+        }));
+        println!("CONFIG_CAPACITY_NINE_FANOUT_RESPONSE_JOIN held_original_call={call} native_success_before_release=true captured_calls=8 settled=true original_deadlines=true");
+    }
+    for (target, before) in before.iter().enumerate() {
+        if target != leader {
+            assert!(after[target] > *before);
+        }
+    }
     assert_eq!(checkpoint.wire_allocations, MEMBERS - 1);
     let targets: BTreeSet<_> = checkpoint.wires.iter().map(|wire| wire.target).collect();
     assert_eq!(targets.len(), MEMBERS - 1);
