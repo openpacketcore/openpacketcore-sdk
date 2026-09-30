@@ -218,8 +218,17 @@ async fn wait_for_ready(
 }
 
 async fn ready_cached_lanes(tls: bool) {
+    ready_cached_lanes_observed(tls, Arc::new(ConsensusBufferObservation::default()), |_| {}).await;
+}
+
+// Reuse this exact real-I/O lifecycle for TLS receipt qualification. The
+// supplied receipt probe uses numeric metadata and leaves these gates intact.
+pub(super) async fn ready_cached_lanes_observed(
+    tls: bool,
+    observation: Arc<ConsensusBufferObservation>,
+    mut checkpoint: impl FnMut(&'static str),
+) {
     let (server_binding, binding) = material_fixture_bindings();
-    let observation = Arc::new(ConsensusBufferObservation::default());
     let (entered_tx, mut entered_rx) = tokio::sync::mpsc::channel(3);
     let handler = Arc::new(HeldSocketHandler {
         entered: entered_tx,
@@ -268,6 +277,7 @@ async fn ready_cached_lanes(tls: bool) {
     hook.release.notify_one();
     wait_for_ready(&coordinator, guard).await;
     let ready = observation.outbound_socket_snapshot();
+    checkpoint("ready");
 
     let first = spawn_call(peer.clone(), request(&binding, 17), &tasks_tx);
     tokio::time::timeout_at(guard, entered_rx.recv())
@@ -279,6 +289,7 @@ async fn ready_cached_lanes(tls: bool) {
         .expect("seed setup join guard")
         .expect("claimed Ready ends actual seed setup task");
     let first_active = observation.outbound_socket_snapshot();
+    checkpoint("first_active");
 
     let second = spawn_call(peer.clone(), request(&binding, 29), &tasks_tx);
     tokio::time::timeout_at(guard, hook.entered.notified())
@@ -298,6 +309,7 @@ async fn ready_cached_lanes(tls: bool) {
         .expect("second setup join guard")
         .expect("second setup actually joined");
     let both_active = observation.outbound_socket_snapshot();
+    checkpoint("both_active");
     let inbound_pair = observation.inbound_socket_snapshot();
     handler.release.add_permits(2);
     let mut replies = Vec::new();
@@ -312,6 +324,7 @@ async fn ready_cached_lanes(tls: bool) {
         );
     }
     let cached = observation.outbound_socket_snapshot();
+    checkpoint("cached");
     let reused_call = spawn_call(peer.clone(), request(&binding, 43), &tasks_tx);
     tokio::time::timeout_at(guard, entered_rx.recv())
         .await
@@ -324,12 +337,14 @@ async fn ready_cached_lanes(tls: bool) {
         .expect("reuse caller joined")
         .expect("reused correlated reply");
     let reused = observation.outbound_socket_snapshot();
+    checkpoint("reused");
     let no_extra_attempt = tasks_rx.try_recv().is_err();
     drop(peer);
     tokio::time::timeout_at(guard, observation.wait_for_no_inbound_sockets())
         .await
         .expect("server observes cached client closures before server abort");
     handle.abort_and_drain_handlers_for_test().await;
+    checkpoint("drained");
     let drained = observation.outbound_socket_snapshot();
     assert!(seed_cancelled && no_extra_attempt);
     assert_eq!(replies, vec![Ok(vec![17]), Ok(vec![29])]);

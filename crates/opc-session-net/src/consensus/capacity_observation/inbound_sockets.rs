@@ -185,6 +185,24 @@ impl InboundSocket {
     pub(crate) fn context(&self) -> Option<SocketContext> {
         self.registration.as_ref().map(|owner| owner.0.clone())
     }
+
+    pub(crate) fn tls_material_owner(&self) -> Option<super::tls_allocations::TlsOwner> {
+        let registration = self.registration.as_ref()?;
+        registration
+            .0
+            .observation
+            .open_tls_source(super::TlsAllocationSource::InboundMaterial(
+                registration.0.id,
+            ))
+    }
+
+    pub(crate) fn tls_owner(&self) -> Option<super::tls_allocations::TlsOwner> {
+        let registration = self.registration.as_ref()?;
+        registration
+            .0
+            .observation
+            .open_tls(super::TlsEndpoint::Inbound(registration.0.id))
+    }
 }
 
 impl Deref for InboundSocket {

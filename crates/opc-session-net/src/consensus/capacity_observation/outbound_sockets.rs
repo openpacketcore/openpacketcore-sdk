@@ -220,6 +220,17 @@ pub(crate) fn observe_outbound_attempt<F: Future>(
     }
 }
 
+pub(crate) fn outbound_tls_material() -> Option<super::tls_allocations::TlsOwner> {
+    OUTBOUND_ATTEMPT
+        .try_with(|context| {
+            context
+                .observation
+                .open_tls_source(super::TlsAllocationSource::OutboundMaterial(context.id))
+        })
+        .ok()
+        .flatten()
+}
+
 pub(crate) fn outbound_attempt_phase(phase: OutboundAttemptPhase) {
     let _ = OUTBOUND_ATTEMPT.try_with(|context| {
         let mut state = context.observation.state();
@@ -298,6 +309,14 @@ impl OutboundSocket {
 
     pub(crate) fn context(&self) -> Option<OutboundSocketContext> {
         self.registration.as_ref().map(|owner| owner.0.clone())
+    }
+
+    pub(crate) fn tls_owner(&self) -> Option<super::tls_allocations::TlsOwner> {
+        let registration = self.registration.as_ref()?;
+        registration
+            .0
+            .observation
+            .open_tls(super::TlsEndpoint::Outbound(registration.0.id))
     }
 }
 
