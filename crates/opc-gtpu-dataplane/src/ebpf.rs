@@ -2657,6 +2657,18 @@ fn grouped_device_config(
     )
 }
 
+/// Project a validated commit's optional downlink inner MTU and policy into
+/// the model. `None` means a valid record carried a value the model cannot
+/// represent.
+fn commit_downlink_inner_mtu(
+    commit: PdpContextCommit,
+) -> Option<Option<crate::GtpuDownlinkInnerMtu>> {
+    match commit.downlink_inner_mtu() {
+        None => Some(None),
+        Some(wire) => crate::GtpuDownlinkInnerMtu::from_wire(wire).map(Some),
+    }
+}
+
 fn grouped_entry_to_ebpf(entry: &GtpuSessionEntry) -> Option<EbpfSessionEntry> {
     let context = entry.context();
     validate_gtp_version(context.gtp_version).ok()?;
@@ -2728,6 +2740,7 @@ fn grouped_model_from_record(
                 .map(crate::DscpCodepoint::new)
                 .transpose()
                 .ok()?,
+            downlink_inner_mtu: None,
         };
         let model = GtpuSessionEntry::new(context, ip_address(entry.local_outer_address())).ok()?;
         entries.push(match entry.n3_qfi() {
@@ -10818,6 +10831,7 @@ impl EbpfGtpuDataplaneBackend {
             return Err(indeterminate());
         }
         let uplink_source_port_policy = commit.uplink_source_port_policy();
+        let downlink_inner_mtu = commit_downlink_inner_mtu(commit).ok_or_else(indeterminate)?;
         let local_teid = Teid::new(u32::from_be_bytes(local_teid)).ok_or_else(indeterminate)?;
         let peer_teid = Teid::new(u32::from_be_bytes(far.o_teid)).ok_or_else(indeterminate)?;
         Ok(GtpPdpContext {
@@ -10831,6 +10845,7 @@ impl EbpfGtpuDataplaneBackend {
             bearer_mark: None,
             egress_dscp,
             uplink_source_port_policy,
+            downlink_inner_mtu,
         })
     }
 
@@ -10918,6 +10933,7 @@ impl EbpfGtpuDataplaneBackend {
             return Err(indeterminate());
         }
         let uplink_source_port_policy = commit.uplink_source_port_policy();
+        let downlink_inner_mtu = commit_downlink_inner_mtu(commit).ok_or_else(indeterminate)?;
         Ok(GtpPdpContext {
             local_teid,
             peer_teid,
@@ -10929,6 +10945,7 @@ impl EbpfGtpuDataplaneBackend {
             bearer_mark: Some(bearer_mark),
             egress_dscp,
             uplink_source_port_policy,
+            downlink_inner_mtu,
         })
     }
 
@@ -11458,6 +11475,31 @@ impl EbpfGtpuDataplaneBackend {
                 "uplink source-port policy and PDP graph must be canonical",
             )
         })?;
+        if request.downlink_inner_mtu.is_some_and(|mtu| {
+            mtu.policy() == crate::GtpuDownlinkOversizePolicy::InTunnelPacketTooBig
+        }) && request.uplink_source_port_policy
+            != crate::GtpuUplinkSourcePortPolicy::LegacyServicePort
+        {
+            // The in-tunnel error leaves through the backend-owned UDP/2152
+            // socket, which cannot honor a selected uplink source port. The
+            // default inner fragmentation sends nothing uplink.
+            return Err(GtpuError::UnsupportedFeature {
+                feature: "downlink_inner_mtu_with_selected_uplink_source_port",
+            });
+        }
+        let invalid_mtu = || {
+            GtpuError::invalid_config(
+                "pdp.downlink_inner_mtu",
+                "downlink inner MTU must be from the IPv4 minimum to the 15-bit maximum",
+            )
+        };
+        let downlink_inner_mtu = request
+            .downlink_inner_mtu
+            .map(|mtu| mtu.to_wire().ok_or_else(invalid_mtu))
+            .transpose()?;
+        let commit = commit
+            .with_downlink_inner_mtu(downlink_inner_mtu)
+            .ok_or_else(invalid_mtu)?;
         if request.bearer_mark.is_some()
             && !self
                 .inner
@@ -12010,7 +12052,7 @@ impl EbpfGtpuDataplaneBackend {
         } else {
             Some("eBPF GTP-U datapath mutation ready")
         };
-        GtpuProbe {
+        let mut probe = GtpuProbe {
             kind: GtpuBackendKind::LinuxEbpf,
             platform_supported: env.platform_supported,
             kernel_reachable: env.bpffs_present,
@@ -12107,8 +12149,18 @@ impl EbpfGtpuDataplaneBackend {
             downlink_outer_fragment_handling: downlink_outer_fragment_contract(
                 has_legacy_ipv4_downlink_attachment && endpoint_binding_datapath_usable,
             ),
+            downlink_inner_mtu_enforcement: GtpuCapability::Missing,
             details,
-        }
+        };
+        // The MTU rides in the complete commit record; steered packets land
+        // in the Linux backend-owned packet-too-big queue and the error leaves
+        // through the UDP/2152 socket.
+        probe.downlink_inner_mtu_enforcement = if cfg!(target_os = "linux") {
+            probe.uplink_source_port_selection
+        } else {
+            GtpuCapability::Missing
+        };
+        probe
     }
 }
 
@@ -63306,6 +63358,7 @@ mod tests {
             bearer_mark: None,
             egress_dscp: None,
             uplink_source_port_policy: crate::GtpuUplinkSourcePortPolicy::LegacyServicePort,
+            downlink_inner_mtu: None,
         }
     }
 
@@ -65960,6 +66013,7 @@ mod tests {
                 bearer_mark: None,
                 egress_dscp: Some(crate::DscpCodepoint::new(18).unwrap()),
                 uplink_source_port_policy: crate::GtpuUplinkSourcePortPolicy::LegacyServicePort,
+                downlink_inner_mtu: None,
             },
             IpAddr::V6(ipv6_local()),
         )
@@ -65979,6 +66033,7 @@ mod tests {
                 bearer_mark: None,
                 egress_dscp: None,
                 uplink_source_port_policy: crate::GtpuUplinkSourcePortPolicy::LegacyServicePort,
+                downlink_inner_mtu: None,
             },
             IpAddr::V4(Ipv4Addr::new(192, 0, 2, 1)),
         )
@@ -66005,6 +66060,7 @@ mod tests {
                 bearer_mark: bearer_mark.and_then(GtpBearerMark::new),
                 egress_dscp: None,
                 uplink_source_port_policy: crate::GtpuUplinkSourcePortPolicy::LegacyServicePort,
+                downlink_inner_mtu: None,
             },
             local_outer,
         )

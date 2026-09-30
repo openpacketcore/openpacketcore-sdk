@@ -62,14 +62,28 @@ pub trait GtpuControlPort: fmt::Debug + Send + Sync {
     /// authoritative forwarding state.
     ///
     /// This is the production consumer for G-PDUs that the kernel delivers to
-    /// the shared queue: outer-fragmented downlink G-PDUs after kernel
-    /// reassembly (TS 29.281 clauses 4.2.4 and 4.2.5) and unknown-TEID
-    /// handoffs. An authorized G-PDU is decapsulated exactly once with the
-    /// same selector, endpoint-binding, owner, generation and commit-last
-    /// checks as the tc fast path. Non-G-PDU messages are returned for the
-    /// existing control planners. Receive and processing are serialized per
-    /// attachment and never wait behind PDP mutation; a `Busy` result from an
-    /// implementation consumes nothing from the queue.
+    /// the backend-owned queues. The shared UDP/2152 queue carries
+    /// outer-fragmented downlink G-PDUs after kernel reassembly (TS 29.281
+    /// clauses 4.2.4 and 4.2.5) and unknown-TEID handoffs, and is always
+    /// served first. The UDP/2153 queue carries G-PDUs that tc steered because
+    /// their inner IPv4 packet has Don't Fragment set and exceeds the
+    /// session's downlink inner MTU. An authorized G-PDU is decapsulated
+    /// exactly once with the same selector, endpoint-binding, owner,
+    /// generation and commit-last checks as the tc fast path. An over-MTU one
+    /// becomes `Fragmented` under the default policy (the caller injects the
+    /// fragments) or `PacketTooBig` under the explicit opt-in. Under the
+    /// opt-in this call itself may send one in-tunnel error G-PDU toward the
+    /// peer through the backend-owned UDP/2152 socket. Non-G-PDU messages are
+    /// returned for the existing control planners. Receive and processing are
+    /// serialized per attachment and never wait behind PDP mutation; a `Busy`
+    /// result from an implementation consumes nothing from the queue.
+    ///
+    /// The backend binds both queues when a port is first opened for the
+    /// attachment and keeps them until the attachment is removed or its queue
+    /// is retired. Open the port before installing any context with a
+    /// downlink inner MTU, and keep draining it for the attachment's lifetime:
+    /// while nothing is bound, the kernel may answer handed-off datagrams
+    /// with rate-limited ICMP Port Unreachable toward the peer (#1019).
     ///
     /// The default implementation belongs to ports without backend state and
     /// returns [`GtpuControlPortError::Unsupported`] without receiving.
@@ -93,6 +107,37 @@ pub trait GtpuControlPort: fmt::Debug + Send + Sync {
     /// backend-authoritative consumer, or `Unavailable`/`Busy` for a retired
     /// or currently mutating attachment.
     fn downlink_counters(&self) -> Result<crate::GtpuDownlinkCounters, GtpuControlPortError> {
+        Err(GtpuControlPortError::Unsupported)
+    }
+
+    /// Replace the per-session in-tunnel Packet Too Big rate limit applied by
+    /// this attachment registration (see [`crate::GtpuPacketTooBigRateLimit`]);
+    /// every session's bucket restarts full.
+    ///
+    /// # Errors
+    /// Returns [`GtpuControlPortError::Unsupported`] for ports without a
+    /// backend-authoritative consumer, or `Unavailable`/`Busy`.
+    fn set_packet_too_big_rate_limit(
+        &self,
+        limit: crate::GtpuPacketTooBigRateLimit,
+    ) -> Result<(), GtpuControlPortError> {
+        let _ = limit;
+        Err(GtpuControlPortError::Unsupported)
+    }
+
+    /// Replace the per-destination inner fragmentation rate limit applied by
+    /// this attachment registration (see [`crate::GtpuInnerFragmentRateLimit`]).
+    /// Tracked destinations keep their Identification sequences and at most
+    /// their current tokens.
+    ///
+    /// # Errors
+    /// Returns [`GtpuControlPortError::Unsupported`] for ports without a
+    /// backend-authoritative consumer, or `Unavailable`/`Busy`.
+    fn set_inner_fragment_rate_limit(
+        &self,
+        limit: crate::GtpuInnerFragmentRateLimit,
+    ) -> Result<(), GtpuControlPortError> {
+        let _ = limit;
         Err(GtpuControlPortError::Unsupported)
     }
 }

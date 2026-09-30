@@ -64,14 +64,14 @@ behavior.
 
 The accepted one-engine rule applies to source selection as well as APIs. Until
 an official stable Openraft release contains per-campaign election-timeout
-resampling, the workspace exact-pins
+resampling, the original source-build candidate exact-pinned
 `https://github.com/openpacketcore/openraft` revision
 `f607e636406b16bd0ad7925dbb631da1b7a4cd96` (signed tag
 `opc-v0.9.24-election-resampling-1`). The dependency is a full immutable `rev`,
 not a mutable branch or tag, and locked metadata must resolve only
 `openraft`/`openraft-macros` 0.9.24 from that revision.
 
-SDK-741 advances the current immutable pin to signed commit
+SDK-741 advanced the immutable pin to signed commit
 `702ff263d2122820e09d35abd53518b01c85823a`. This descendant preserves the
 election repair and fixes snapshot-to-log handoff and failed-target purge
 retention. It also joins former-leader replication readers before conflict
@@ -83,7 +83,7 @@ consensus authority remain unchanged. Historical HA profiles still bind the
 original revision above; current manifest/lock/metadata checks independently
 bind the new candidate. This source change does not confer qualification.
 
-SDK-957 advances the candidate to `72e327a4f25cbbe3a3695d8c3c0f0970ccb925d5`,
+The shared dependency update advances the candidate to `72e327a4f25cbbe3a3695d8c3c0f0970ccb925d5`,
 which incorporates release-0.9 through v0.9.25 and the fork's bounded apply,
 joined replication retirement and fatal completion repairs. It also retires
 obsolete leadership and mismatched campaigns on an accepted newer self-vote,

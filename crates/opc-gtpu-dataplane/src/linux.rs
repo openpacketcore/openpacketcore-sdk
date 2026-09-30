@@ -1968,6 +1968,7 @@ impl LinuxGtpuTransport for NetlinkGtpuTransport {
             // re-enter that driver's UDP consumer exactly once, so this
             // backend must not advertise the stronger handoff contract.
             downlink_outer_fragment_handling: GtpuDownlinkFragmentContract::Unsupported,
+            downlink_inner_mtu_enforcement: GtpuCapability::Missing,
             details,
         }
     }
@@ -2106,6 +2107,11 @@ fn validate_pdp_context(context: &GtpPdpContext) -> Result<(), GtpuError> {
     if context.egress_dscp.is_some() {
         return Err(GtpuError::UnsupportedFeature {
             feature: "fixed_outer_dscp",
+        });
+    }
+    if context.downlink_inner_mtu.is_some() {
+        return Err(GtpuError::UnsupportedFeature {
+            feature: "downlink_inner_mtu",
         });
     }
     if context.downlink_source_port_policy != crate::GtpuSourcePortPolicy::Any {
@@ -2568,6 +2574,7 @@ fn parse_pdp_context_response(
         bearer_mark: None,
         egress_dscp: None,
         uplink_source_port_policy: crate::GtpuUplinkSourcePortPolicy::LegacyServicePort,
+        downlink_inner_mtu: None,
     };
     let selector_matches = match selector {
         PdpContextSelector::LocalTeid(selector) => {
@@ -3380,6 +3387,7 @@ mod tests {
                     uplink_pmtu_enforcement: GtpuCapability::Missing,
                     downlink_outer_fragment_handling: GtpuDownlinkFragmentContract::Unsupported,
                     details: Some("test transport"),
+                    downlink_inner_mtu_enforcement: GtpuCapability::Missing,
                 },
                 socket_fd: 9,
                 ifindex: 42,
@@ -3639,6 +3647,7 @@ mod tests {
             bearer_mark: None,
             egress_dscp: None,
             uplink_source_port_policy: crate::GtpuUplinkSourcePortPolicy::LegacyServicePort,
+            downlink_inner_mtu: None,
         }
     }
 

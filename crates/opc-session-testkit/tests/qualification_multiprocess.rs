@@ -131,6 +131,7 @@ struct HarnessStageFailure {
     node_index: Option<usize>,
     kind: HarnessFailureKind,
     readiness: Vec<ReadinessDiagnostic>,
+    readiness_progress: Option<ReadinessProgressDiagnostic>,
     exit: Option<ExitDiagnostic>,
     stderr: Option<StderrDiagnostic>,
     checker: Option<CheckerDiagnostic>,
@@ -150,6 +151,74 @@ struct ReadinessDiagnostic {
     required_quorum: usize,
     committed_index: Option<u64>,
     applied_index: Option<u64>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ReadinessRoundDiagnostic {
+    completed_after_millis: u128,
+    duration_millis: u128,
+    readiness: Vec<ReadinessDiagnostic>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ReadinessProgressDiagnostic {
+    completed_rounds: usize,
+    elapsed_millis: u128,
+    failed_round_elapsed_millis: Option<u128>,
+    last_completed_round: Option<ReadinessRoundDiagnostic>,
+}
+
+// Keep one complete observation separate from the failed round's partial
+// replies. Neither historical readiness nor these timings grant readiness.
+struct ReadinessRoundObserver {
+    started: Instant,
+    completed_rounds: usize,
+    last_completed_round: Option<ReadinessRoundDiagnostic>,
+}
+
+impl ReadinessRoundObserver {
+    fn new(started: Instant) -> Self {
+        Self {
+            started,
+            completed_rounds: 0,
+            last_completed_round: None,
+        }
+    }
+
+    fn completed(
+        &mut self,
+        round_started: Instant,
+        finished: Instant,
+        readiness: &[ReadinessDiagnostic],
+    ) {
+        self.completed_rounds = self.completed_rounds.saturating_add(1);
+        self.last_completed_round = Some(ReadinessRoundDiagnostic {
+            completed_after_millis: finished.duration_since(self.started).as_millis(),
+            duration_millis: finished.duration_since(round_started).as_millis(),
+            readiness: readiness.to_vec(),
+        });
+    }
+
+    fn attach(
+        &self,
+        error: HarnessError,
+        failed_round_started: Option<Instant>,
+        finished: Instant,
+    ) -> HarnessError {
+        match error {
+            HarnessError::Stage(mut failure) => {
+                failure.readiness_progress = Some(ReadinessProgressDiagnostic {
+                    completed_rounds: self.completed_rounds,
+                    elapsed_millis: finished.duration_since(self.started).as_millis(),
+                    failed_round_elapsed_millis: failed_round_started
+                        .map(|started| finished.duration_since(started).as_millis()),
+                    last_completed_round: self.last_completed_round.clone(),
+                });
+                HarnessError::Stage(failure)
+            }
+            other => other,
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -228,6 +297,7 @@ impl HarnessStageFailure {
             node_index,
             kind,
             readiness: Vec::new(),
+            readiness_progress: None,
             exit: None,
             stderr: None,
             checker: None,
@@ -2215,21 +2285,25 @@ impl Fleet {
         old_term: u64,
         timeout: Duration,
     ) -> Result<ReadinessDiagnostic, HarnessError> {
-        let deadline = Instant::now() + timeout;
+        let started = Instant::now();
+        let deadline = started + timeout;
+        let mut observer = ReadinessRoundObserver::new(started);
         let mut last_readiness;
         loop {
-            let observed = self.probe_readiness_round_for(
+            let observed = self.probe_observed_readiness_round_for(
                 survivors,
                 HarnessStage::LeaderFailoverReadiness,
                 deadline,
+                &mut observer,
             )?;
             last_readiness = observed.clone();
             if let Some((leader_id, term)) = coherent_leader_snapshot(&observed, survivors.len()) {
                 if leader_id != old_leader_id && term > old_term {
-                    let confirmed = self.probe_readiness_round_for(
+                    let confirmed = self.probe_observed_readiness_round_for(
                         survivors,
                         HarnessStage::LeaderFailoverReadiness,
                         deadline,
+                        &mut observer,
                     )?;
                     last_readiness = confirmed.clone();
                     if coherent_leader_snapshot(&confirmed, survivors.len())
@@ -2247,14 +2321,35 @@ impl Fleet {
                 }
             }
             if Instant::now() >= deadline {
-                return Err(readiness_deadline(
-                    HarnessStage::LeaderFailoverReadiness,
-                    &readiness_map(&last_readiness),
+                return Err(observer.attach(
+                    readiness_deadline(
+                        HarnessStage::LeaderFailoverReadiness,
+                        &readiness_map(&last_readiness),
+                    ),
+                    None,
+                    Instant::now(),
                 ));
             }
             thread::sleep(
                 Duration::from_millis(100).min(deadline.saturating_duration_since(Instant::now())),
             );
+        }
+    }
+
+    fn probe_observed_readiness_round_for(
+        &mut self,
+        node_indices: &[usize],
+        stage: HarnessStage,
+        deadline: Instant,
+        observer: &mut ReadinessRoundObserver,
+    ) -> Result<Vec<ReadinessDiagnostic>, HarnessError> {
+        let started = Instant::now();
+        match self.probe_readiness_round_for(node_indices, stage, deadline) {
+            Ok(readiness) => {
+                observer.completed(started, Instant::now(), &readiness);
+                Ok(readiness)
+            }
+            Err(error) => Err(observer.attach(error, Some(started), Instant::now())),
         }
     }
 
@@ -3430,4 +3525,143 @@ fn induced_no_quorum_retains_last_reason_and_reaps_every_child() {
     for pid in pids {
         assert_process_gone(pid);
     }
+}
+
+#[test]
+fn replacement_leader_diagnostics_preserve_failure_and_separate_completed_rounds() {
+    let started = Instant::now();
+    let mut observer = ReadinessRoundObserver::new(started);
+    let mut completed = vec![ReadinessDiagnostic {
+        node_index: 2,
+        ready: false,
+        reason_code: QualificationReadinessCode::NoQuorum,
+        node_id: 3,
+        term: 5,
+        leader_id: None,
+        configured_voters: 5,
+        fresh_reachable_voters: 0,
+        agreeing_voters: 0,
+        required_quorum: 3,
+        committed_index: None,
+        applied_index: Some(7),
+    }];
+    // Replacement keeps the diagnostic bounded to the most recent complete
+    // round, even when many rounds finish before the failed receive.
+    for round in 0..32 {
+        completed[0].term = round + 5;
+        observer.completed(
+            started + Duration::from_millis(round * 100),
+            started + Duration::from_millis(round * 100 + 50),
+            &completed,
+        );
+    }
+    let mut original = HarnessStageFailure::new(
+        HarnessStage::LeaderFailoverReadiness,
+        Some(0),
+        HarnessFailureKind::Deadline,
+    );
+    // Partial current-round data must not be merged with a past complete
+    // round, which could otherwise appear to be a fresh coherent snapshot.
+    let mut partial = completed[0].clone();
+    partial.node_index = 1;
+    partial.node_id = 2;
+    partial.term = 50;
+    original.readiness.push(partial);
+    original.stderr = Some(StderrDiagnostic {
+        total_bytes: 0,
+        captured_bytes: 0,
+        truncated: false,
+        line_codes: Vec::new(),
+    });
+    let HarnessError::Stage(mut failure) = observer.attach(
+        HarnessError::Stage(Box::new(original.clone())),
+        Some(started + Duration::from_millis(3_200)),
+        started + Duration::from_millis(3_500),
+    ) else {
+        panic!("original staged error lost");
+    };
+    let progress = failure.readiness_progress.take().expect("bounded history");
+    assert_eq!(*failure, original, "original failure changed");
+    assert_eq!(progress.completed_rounds, 32);
+    assert_eq!(progress.elapsed_millis, 3_500);
+    assert_eq!(progress.failed_round_elapsed_millis, Some(300));
+    let last = progress.last_completed_round.expect("last complete round");
+    assert_eq!(last.completed_after_millis, 3_150);
+    assert_eq!(last.duration_millis, 50);
+    assert_eq!(last.readiness, completed);
+}
+
+#[test]
+fn replacement_leader_diagnostics_record_first_round_deadline_without_history() {
+    let started = Instant::now();
+    let observer = ReadinessRoundObserver::new(started);
+    let HarnessError::Stage(failure) = observer.attach(
+        stage_error(
+            HarnessStage::LeaderFailoverReadiness,
+            Some(0),
+            HarnessFailureKind::Deadline,
+        ),
+        Some(started),
+        started + Duration::from_secs(30),
+    ) else {
+        panic!("first-round error lost");
+    };
+    let progress = failure.readiness_progress.expect("first-round progress");
+    assert_eq!(progress.completed_rounds, 0);
+    assert_eq!(progress.elapsed_millis, 30_000);
+    assert_eq!(progress.failed_round_elapsed_millis, Some(30_000));
+    assert!(progress.last_completed_round.is_none());
+    assert!(failure.readiness.is_empty());
+}
+
+#[test]
+fn replacement_leader_no_quorum_retains_completed_round_and_reaps_every_child() {
+    let _process_test_guard = acquire_process_qualification_test_lock();
+    let schedule_sha256 = format!("sha256:{}", "0".repeat(64));
+    let mut fleet = Fleet::start(3, &schedule_sha256).expect("start failover observer fleet");
+    let pids = fleet
+        .nodes
+        .iter()
+        .map(|node| node.as_ref().expect("live fleet node").pid())
+        .collect::<Vec<_>>();
+    let leader = fleet
+        .observe_stable_leader(FLEET_READY_TIMEOUT)
+        .expect("observe original leader");
+    for node_index in 0..3 {
+        if node_index != leader.node_index {
+            fleet.stop_unclean(node_index).expect("stop quorum peer");
+        }
+    }
+    let result = fleet.observe_stable_replacement_leader(
+        &[leader.node_index],
+        leader.node_id,
+        leader.term,
+        Duration::from_secs(13),
+    );
+    fleet.shutdown_all();
+    drop(fleet);
+    for pid in pids {
+        assert_process_gone(pid);
+    }
+    let HarnessError::Stage(failure) = result.expect_err("one survivor cannot regain quorum")
+    else {
+        panic!("failover observation lost its original staged failure");
+    };
+    assert_eq!(failure.stage, HarnessStage::LeaderFailoverReadiness);
+    assert!(matches!(
+        failure.kind,
+        HarnessFailureKind::Deadline | HarnessFailureKind::ReadinessNotReady
+    ));
+    let progress = failure
+        .readiness_progress
+        .expect("completed probe retained");
+    assert!(progress.completed_rounds >= 1);
+    let last = progress.last_completed_round.expect("last complete probe");
+    assert!(last.completed_after_millis <= progress.elapsed_millis);
+    assert_eq!(last.readiness.len(), 1);
+    let readiness = &last.readiness[0];
+    assert_eq!(readiness.node_index, leader.node_index);
+    assert!(!readiness.ready);
+    assert_eq!(readiness.reason_code, QualificationReadinessCode::NoQuorum);
+    assert!(readiness.committed_index.is_none());
 }
