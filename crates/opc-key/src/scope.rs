@@ -26,6 +26,11 @@ impl KeyId {
     pub fn as_str(&self) -> &str {
         &self.0
     }
+
+    #[cfg(feature = "capacity-observation")]
+    pub(crate) fn allocation_capacity(&self) -> usize {
+        self.0.capacity()
+    }
 }
 
 impl fmt::Display for KeyId {
