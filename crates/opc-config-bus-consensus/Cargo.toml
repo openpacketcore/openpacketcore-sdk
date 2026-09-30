@@ -37,6 +37,8 @@ tracing = { workspace = true }
 uuid = { workspace = true }
 
 [dev-dependencies]
+opc-crypto = { path = "../opc-crypto", version = "0.2.0", features = ["capacity-observation"] }
+tracking-allocator = { version = "=0.4.0", default-features = false }
 opc-persist = { path = "../opc-persist", version = "0.2.0", features = ["dangerous-test-hooks"] }
 opc-session-net = { path = "../opc-session-net", version = "0.2.0", features = ["test-control"] }
 opc-session-store = { path = "../opc-session-store", version = "0.2.0" }

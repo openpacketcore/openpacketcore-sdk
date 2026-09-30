@@ -1,17 +1,4 @@
-//! Real TLS provenance qualification, with an independent source-receipt ledger.
-//!
-//! The allocator exists only in this feature-gated unit-test executable. Its
-//! callback records original Layout extents, never TLS/application stand-in
-//! allocations. Tables are fixed and contain no observed resource owners.
-
-use std::cell::Cell;
-use std::future::Future;
-use std::sync::atomic::{AtomicU64, AtomicUsize};
-use std::sync::{Mutex as ReceiptMutex, Once, TryLockError};
-
-use tracking_allocator::{
-    AllocationGroupId, AllocationGroupToken, AllocationRegistry, AllocationTracker, Allocator,
-};
+//! Real TLS provenance qualification with the shared original-receipt ledger.
 
 use super::inbound_sockets::material_fixture_bindings;
 use super::outbound_sockets::ready_cached_lanes_observed;
@@ -19,638 +6,19 @@ use super::*;
 use capacity_observation::{
     ConsensusBufferObservation, TlsAllocationObserver, TlsAllocationSource,
 };
-
-#[global_allocator]
-static TEST_ALLOCATOR: Allocator<std::alloc::System> = Allocator::system();
+use std::future::Future;
 
 const OWNER_LIMIT: usize = 64;
 const RECEIPT_LIMIT: usize = 16_384;
-const PHASES: usize = 12;
-const SATURATED: u32 = 1;
-const ARITHMETIC: u32 = 2;
-const UNMATCHED_FREE: u32 = 4;
-const AMBIGUOUS_REUSE: u32 = 8;
-const INVALID_SCOPE: u32 = 16;
-const LATE_ALLOCATION: u32 = 32;
-
+// Force chained collisions and free-list reuse in every original real-I/O
+// detector. The fleet uses a larger table with the identical implementation.
+const RECEIPT_BUCKETS: usize = 1;
 static SERIAL_TEST: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
-static INITIALIZE: Once = Once::new();
-static NEXT_RUN: AtomicU64 = AtomicU64::new(1);
-static NEXT_THREAD: AtomicUsize = AtomicUsize::new(1);
 
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-struct Extent {
-    allocations: usize,
-    object: usize,
-    wrapped: usize,
-}
-
-impl Extent {
-    const ZERO: Self = Self {
-        allocations: 0,
-        object: 0,
-        wrapped: 0,
-    };
-
-    fn add(&mut self, object: usize, wrapped: usize) -> bool {
-        match (
-            self.allocations.checked_add(1),
-            self.object.checked_add(object),
-            self.wrapped.checked_add(wrapped),
-        ) {
-            (Some(allocations), Some(object), Some(wrapped)) => {
-                *self = Self {
-                    allocations,
-                    object,
-                    wrapped,
-                };
-                true
-            }
-            _ => false,
-        }
-    }
-
-    fn subtract(&mut self, object: usize, wrapped: usize) -> bool {
-        match (
-            self.allocations.checked_sub(1),
-            self.object.checked_sub(object),
-            self.wrapped.checked_sub(wrapped),
-        ) {
-            (Some(allocations), Some(object), Some(wrapped)) => {
-                *self = Self {
-                    allocations,
-                    object,
-                    wrapped,
-                };
-                true
-            }
-            _ => false,
-        }
-    }
-}
-
-fn sum_extents<'a>(values: impl IntoIterator<Item = &'a Extent>) -> Extent {
-    values.into_iter().fold(Extent::ZERO, |sum, value| Extent {
-        allocations: sum
-            .allocations
-            .checked_add(value.allocations)
-            .expect("receipt count"),
-        object: sum
-            .object
-            .checked_add(value.object)
-            .expect("receipt object bytes"),
-        wrapped: sum
-            .wrapped
-            .checked_add(value.wrapped)
-            .expect("receipt wrapped bytes"),
-    })
-}
-
-#[derive(Clone, Copy)]
-struct Active {
-    owner: u64,
-    phase: TlsAllocationPhase,
-}
-
-impl Active {
-    const NONE: Self = Self {
-        owner: 0,
-        phase: TlsAllocationPhase::Construct,
-    };
-}
-
-thread_local! {
-    static ACTIVE: Cell<Active> = const { Cell::new(Active::NONE) };
-    static THREAD: usize = NEXT_THREAD.fetch_update(
-        Ordering::Relaxed, Ordering::Relaxed, |thread| thread.checked_add(1),
-    ).unwrap_or_else(|_| { ledger().flags |= ARITHMETIC; 0 });
-}
-
-struct ActiveGuard(Active);
-
-impl Drop for ActiveGuard {
-    fn drop(&mut self) {
-        ACTIVE.with(|active| active.set(self.0));
-    }
-}
-
-fn socket_phase(phase: TlsAllocationPhase) -> bool {
-    matches!(
-        phase,
-        TlsAllocationPhase::SocketPoll
-            | TlsAllocationPhase::SocketDrop
-            | TlsAllocationPhase::OwnerStorage
-    )
-}
-
-// Observation controls change this decision only. Original source receipts,
-// allocation groups, real I/O, TLS work, deadlines and cleanup stay intact.
-fn enroll_allocation(_phase: TlsAllocationPhase) -> bool {
-    true
-}
-
-#[derive(Clone, Copy)]
-struct OwnerRow {
-    run: u64,
-    id: u64,
-    source: Option<TlsAllocationSource>,
-    material: Option<u64>,
-    tls_group: usize,
-    socket_group: usize,
-    visible: bool,
-    established: bool,
-    closed: bool,
-    origins: [Extent; PHASES],
-    retired: [Extent; PHASES],
-    enrolled_origins: [Extent; PHASES],
-    reported_tls: Extent,
-    reported_socket: Extent,
-    reported_owner_storage: Extent,
-    scopes: [usize; PHASES],
-    frees: [usize; PHASES],
-    cross_thread_frees: usize,
-    foreign_source_frees: usize,
-    unscoped_frees: usize,
-}
-
-impl OwnerRow {
-    const EMPTY: Self = Self {
-        run: 0,
-        id: 0,
-        source: None,
-        material: None,
-        tls_group: 0,
-        socket_group: 0,
-        visible: false,
-        established: false,
-        closed: false,
-        origins: [Extent::ZERO; PHASES],
-        retired: [Extent::ZERO; PHASES],
-        enrolled_origins: [Extent::ZERO; PHASES],
-        reported_tls: Extent::ZERO,
-        reported_socket: Extent::ZERO,
-        reported_owner_storage: Extent::ZERO,
-        scopes: [0; PHASES],
-        frees: [0; PHASES],
-        cross_thread_frees: 0,
-        foreign_source_frees: 0,
-        unscoped_frees: 0,
-    };
-}
-
-#[derive(Clone, Copy)]
-struct Receipt {
-    serial: u64,
-    address: usize,
-    group: usize,
-    owner_index: usize,
-    object: usize,
-    wrapped: usize,
-    thread: usize,
-    socket: bool,
-    enrolled: bool,
-    phase: TlsAllocationPhase,
-}
-
-impl Receipt {
-    const EMPTY: Self = Self {
-        serial: 0,
-        address: 0,
-        group: 0,
-        owner_index: 0,
-        object: 0,
-        wrapped: 0,
-        thread: 0,
-        socket: false,
-        enrolled: false,
-        phase: TlsAllocationPhase::Construct,
-    };
-}
-
-struct Ledger {
-    owners: [OwnerRow; OWNER_LIMIT],
-    receipts: [Receipt; RECEIPT_LIMIT],
-    high_water: usize,
-    serial: u64,
-    flags: u32,
-    pointer_reuse_tails: usize,
-}
-
-// Allocator callbacks neither allocate nor retain application/TLS objects.
-// Poison recovery performs no formatting, logging, or recursive callback.
-static LEDGER: ReceiptMutex<Ledger> = ReceiptMutex::new(Ledger {
-    owners: [OwnerRow::EMPTY; OWNER_LIMIT],
-    receipts: [Receipt::EMPTY; RECEIPT_LIMIT],
-    high_water: 0,
-    serial: 0,
-    flags: 0,
-    pointer_reuse_tails: 0,
-});
-
-fn ledger() -> std::sync::MutexGuard<'static, Ledger> {
-    LEDGER
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner)
-}
-
-fn checked_increment(value: &mut usize) -> bool {
-    match value.checked_add(1) {
-        Some(next) => {
-            *value = next;
-            true
-        }
-        None => false,
-    }
-}
-
-struct Tracker;
-
-impl AllocationTracker for Tracker {
-    fn allocated(&self, address: usize, object: usize, wrapped: usize, group: AllocationGroupId) {
-        let group = group.as_usize().get();
-        let active = ACTIVE.with(Cell::get);
-        let thread = THREAD.with(|thread| *thread);
-        let mut ledger = ledger();
-        let Some(index) = ledger.owners.iter().position(|owner| {
-            owner.id != 0 && (owner.tls_group == group || owner.socket_group == group)
-        }) else {
-            // Preexisting material, application, observer and unscoped runtime
-            // storage are not connection TLS bytes.
-            return;
-        };
-        let socket = ledger.owners[index].socket_group == group;
-        if active.owner != ledger.owners[index].id || socket != socket_phase(active.phase) {
-            ledger.flags |= INVALID_SCOPE;
-        }
-        if ledger.owners[index].closed && !socket {
-            ledger.flags |= LATE_ALLOCATION;
-        }
-        let Some(serial) = ledger.serial.checked_add(1) else {
-            ledger.flags |= ARITHMETIC;
-            return;
-        };
-        ledger.serial = serial;
-        let mut reuse = false;
-        let mut ambiguous = false;
-        for receipt in &ledger.receipts[..ledger.high_water] {
-            if receipt.serial != 0 && receipt.address == address {
-                reuse = true;
-                ambiguous |= receipt.group == group
-                    && receipt.object == object
-                    && receipt.wrapped == wrapped;
-            }
-        }
-        if reuse && !checked_increment(&mut ledger.pointer_reuse_tails) {
-            ledger.flags |= ARITHMETIC;
-        }
-        if ambiguous {
-            // System free precedes its callback. Keep both generations rather
-            // than overwrite a still-unretired receipt. Identical tuples cannot
-            // be disambiguated by this API; qualification fails explicitly.
-            ledger.flags |= AMBIGUOUS_REUSE;
-        }
-        let slot = ledger.receipts[..ledger.high_water]
-            .iter()
-            .position(|receipt| receipt.serial == 0)
-            .unwrap_or(ledger.high_water);
-        if slot == RECEIPT_LIMIT {
-            ledger.flags |= SATURATED;
-            return;
-        }
-        ledger.high_water = ledger.high_water.max(slot + 1);
-        let enrolled = enroll_allocation(active.phase);
-        ledger.receipts[slot] = Receipt {
-            serial,
-            address,
-            group,
-            owner_index: index,
-            object,
-            wrapped,
-            thread,
-            socket,
-            enrolled,
-            phase: active.phase,
-        };
-        let owner = &mut ledger.owners[index];
-        let mut valid = owner.origins[active.phase as usize].add(object, wrapped);
-        if enrolled {
-            valid &= owner.enrolled_origins[active.phase as usize].add(object, wrapped);
-            valid &= if active.phase == TlsAllocationPhase::OwnerStorage {
-                owner.reported_owner_storage.add(object, wrapped)
-            } else if socket {
-                owner.reported_socket.add(object, wrapped)
-            } else {
-                owner.reported_tls.add(object, wrapped)
-            };
-        }
-        if !valid {
-            ledger.flags |= ARITHMETIC;
-        }
-    }
-
-    fn deallocated(
-        &self,
-        address: usize,
-        object: usize,
-        wrapped: usize,
-        source_group: AllocationGroupId,
-        current_group: AllocationGroupId,
-    ) {
-        let source_group = source_group.as_usize().get();
-        let current_group = current_group.as_usize().get();
-        let thread = THREAD.with(|thread| *thread);
-        let active = ACTIVE.with(Cell::get);
-        let mut ledger = ledger();
-        if let Some(owner) = ledger.owners.iter_mut().find(|owner| {
-            owner.id != 0 && owner.tls_group == current_group && source_group != current_group
-        }) {
-            if !checked_increment(&mut owner.foreign_source_frees) {
-                ledger.flags |= ARITHMETIC;
-            }
-        }
-        if !ledger.owners.iter().any(|owner| {
-            owner.id != 0 && (owner.tls_group == source_group || owner.socket_group == source_group)
-        }) {
-            return;
-        }
-        let receipt = ledger.receipts[..ledger.high_water]
-            .iter()
-            .enumerate()
-            .filter(|(_, receipt)| {
-                receipt.serial != 0
-                    && receipt.address == address
-                    && receipt.group == source_group
-                    && receipt.object == object
-                    && receipt.wrapped == wrapped
-            })
-            .min_by_key(|(_, receipt)| receipt.serial)
-            .map(|(index, receipt)| (index, *receipt));
-        let Some((slot, receipt)) = receipt else {
-            ledger.flags |= UNMATCHED_FREE;
-            return;
-        };
-        ledger.receipts[slot] = Receipt::EMPTY;
-        let owner = &mut ledger.owners[receipt.owner_index];
-        let mut valid = owner.retired[receipt.phase as usize].add(object, wrapped);
-        if receipt.enrolled {
-            valid &= if receipt.phase == TlsAllocationPhase::OwnerStorage {
-                owner.reported_owner_storage.subtract(object, wrapped)
-            } else if receipt.socket {
-                owner.reported_socket.subtract(object, wrapped)
-            } else {
-                owner.reported_tls.subtract(object, wrapped)
-            };
-        }
-        if !receipt.socket {
-            if active.owner == owner.id {
-                valid &= checked_increment(&mut owner.frees[active.phase as usize]);
-            } else {
-                valid &= checked_increment(&mut owner.unscoped_frees);
-            }
-            if receipt.thread != thread {
-                valid &= checked_increment(&mut owner.cross_thread_frees);
-            }
-        }
-        if !valid {
-            ledger.flags |= ARITHMETIC;
-        }
-    }
-}
-
-struct Tokens {
-    tls: ReceiptMutex<Option<AllocationGroupToken>>,
-    socket: ReceiptMutex<Option<AllocationGroupToken>>,
-}
-
-struct Observation {
-    run: u64,
-    tokens: [Tokens; OWNER_LIMIT],
-}
-
-impl Observation {
-    fn new() -> Arc<Self> {
-        INITIALIZE.call_once(|| {
-            AllocationRegistry::set_global_tracker(Tracker).expect("one test allocator registry");
-            AllocationRegistry::enable_tracking();
-        });
-        AllocationRegistry::untracked(|| {
-            Arc::new(Self {
-                run: NEXT_RUN
-                    .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |run| {
-                        run.checked_add(1)
-                    })
-                    .expect("test run identity must not wrap"),
-                tokens: std::array::from_fn(|_| Tokens {
-                    tls: ReceiptMutex::new(None),
-                    socket: ReceiptMutex::new(None),
-                }),
-            })
-        })
-    }
-
-    fn attach(self: &Arc<Self>, observation: &ConsensusBufferObservation) {
-        observation.set_tls_allocation_observer(self.clone());
-    }
-
-    fn snapshot(&self) -> Snapshot {
-        AllocationRegistry::untracked(|| {
-            let ledger = ledger();
-            let mut owners = Vec::new();
-            for (index, owner) in ledger.owners.iter().enumerate() {
-                if owner.run != self.run {
-                    continue;
-                }
-                let mut tls = Extent::ZERO;
-                let mut socket = Extent::ZERO;
-                let mut owner_storage = Extent::ZERO;
-                for receipt in &ledger.receipts[..ledger.high_water] {
-                    if receipt.serial == 0 || receipt.owner_index != index {
-                        continue;
-                    }
-                    let valid = if receipt.phase == TlsAllocationPhase::OwnerStorage {
-                        owner_storage.add(receipt.object, receipt.wrapped)
-                    } else if receipt.socket {
-                        socket.add(receipt.object, receipt.wrapped)
-                    } else {
-                        tls.add(receipt.object, receipt.wrapped)
-                    };
-                    assert!(valid, "snapshot receipt arithmetic");
-                }
-                owners.push(OwnerSnapshot {
-                    row: *owner,
-                    tls,
-                    socket,
-                    owner_storage,
-                });
-            }
-            Snapshot {
-                owners,
-                flags: ledger.flags,
-                pointer_reuse_tails: ledger.pointer_reuse_tails,
-            }
-        })
-    }
-}
-
-impl TlsAllocationObserver for Observation {
-    fn open(&self, source: TlsAllocationSource) -> Option<u64> {
-        AllocationRegistry::untracked(|| {
-            let (Some(tls), Some(socket)) = (
-                AllocationGroupToken::register(),
-                AllocationGroupToken::register(),
-            ) else {
-                ledger().flags |= SATURATED;
-                return None;
-            };
-            let tls_group = tls.id().as_usize().get();
-            let socket_group = socket.id().as_usize().get();
-            let mut ledger = ledger();
-            let Some(index) = ledger.owners.iter().position(|owner| owner.id == 0) else {
-                ledger.flags |= SATURATED;
-                return None;
-            };
-            let id = (index + 1) as u64;
-            ledger.owners[index] = OwnerRow {
-                run: self.run,
-                id,
-                source: Some(source),
-                tls_group,
-                socket_group,
-                visible: true,
-                ..OwnerRow::EMPTY
-            };
-            drop(ledger);
-            *self.tokens[index]
-                .tls
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(tls);
-            *self.tokens[index]
-                .socket
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(socket);
-            Some(id)
-        })
-    }
-
-    fn link_material(&self, connection: u64, material: u64) {
-        let mut ledger = ledger();
-        let material_is_valid = ledger.owners.iter().any(|row| {
-            row.run == self.run
-                && row.id == material
-                && matches!(
-                    row.source,
-                    Some(
-                        TlsAllocationSource::InboundMaterial(_)
-                            | TlsAllocationSource::OutboundMaterial(_)
-                    )
-                )
-        });
-        if material_is_valid {
-            if let Some(row) = ledger.owners.iter_mut().find(|row| row.id == connection) {
-                row.material = Some(material);
-                return;
-            }
-        }
-        ledger.flags |= INVALID_SCOPE;
-    }
-
-    fn scope(&self, owner: u64, phase: TlsAllocationPhase, operation: &mut dyn FnMut()) {
-        let index = usize::try_from(owner)
-            .ok()
-            .and_then(|owner| owner.checked_sub(1));
-        let token = index.and_then(|index| self.tokens.get(index));
-        let Some(token) = token else {
-            ledger().flags |= INVALID_SCOPE;
-            operation();
-            return;
-        };
-        {
-            let mut ledger = ledger();
-            let row = ledger.owners.iter_mut().find(|row| row.id == owner);
-            if !row.is_some_and(|row| checked_increment(&mut row.scopes[phase as usize])) {
-                ledger.flags |= ARITHMETIC;
-            }
-        }
-        let previous = ACTIVE.with(|active| active.replace(Active { owner, phase }));
-        let _active = ActiveGuard(previous);
-        if previous.owner == owner && socket_phase(previous.phase) == socket_phase(phase) {
-            operation();
-            return;
-        }
-        let lock = if socket_phase(phase) {
-            &token.socket
-        } else {
-            &token.tls
-        };
-        let mut token = match lock.try_lock() {
-            Ok(token) => token,
-            Err(TryLockError::Poisoned(error)) => error.into_inner(),
-            Err(TryLockError::WouldBlock) => {
-                // Do not manufacture cross-connection serialization. This
-                // marks the observation incomplete and still executes real I/O.
-                ledger().flags |= INVALID_SCOPE;
-                operation();
-                return;
-            }
-        };
-        let Some(token) = token.as_mut() else {
-            ledger().flags |= INVALID_SCOPE;
-            operation();
-            return;
-        };
-        let guard = token.enter();
-        operation();
-        // Explicit exit() in released 0.4.0 also pops again in Drop. Use Drop.
-        drop(guard);
-    }
-
-    fn established(&self, owner: u64) {
-        let mut ledger = ledger();
-        if let Some(row) = ledger.owners.iter_mut().find(|row| row.id == owner) {
-            row.established = true;
-        }
-    }
-
-    fn close(&self, owner: u64) {
-        let mut ledger = ledger();
-        if let Some(row) = ledger.owners.iter_mut().find(|row| row.id == owner) {
-            row.closed = true;
-            row.visible = false;
-        }
-        // Never erase source groups or outstanding receipts at owner closure.
-    }
-}
-
-struct OwnerSnapshot {
-    row: OwnerRow,
-    tls: Extent,
-    socket: Extent,
-    owner_storage: Extent,
-}
-
-struct Snapshot {
-    owners: Vec<OwnerSnapshot>,
-    flags: u32,
-    pointer_reuse_tails: usize,
-}
-
-fn connection_rows(snapshot: &Snapshot) -> impl Iterator<Item = &OwnerSnapshot> {
-    snapshot
-        .owners
-        .iter()
-        .filter(|owner| matches!(owner.row.source, Some(TlsAllocationSource::Connection(_))))
-}
-
-fn material_rows(snapshot: &Snapshot) -> impl Iterator<Item = &OwnerSnapshot> {
-    snapshot.owners.iter().filter(|owner| {
-        matches!(
-            owner.row.source,
-            Some(
-                TlsAllocationSource::InboundMaterial(_) | TlsAllocationSource::OutboundMaterial(_)
-            )
-        )
-    })
-}
+include!(concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/tests/support/tls_receipts.rs"
+));
 
 fn print_snapshot(checkpoint: &str, snapshot: &Snapshot) {
     for owner in &snapshot.owners {
@@ -664,41 +32,6 @@ fn print_snapshot(checkpoint: &str, snapshot: &Snapshot) {
             owner.row.origins,
             owner.row.retired,
         );
-    }
-}
-
-fn assert_conserved(snapshot: &Snapshot) {
-    assert_eq!(
-        snapshot.flags, 0,
-        "CONFIG_CAPACITY_TLS_RECEIPT_VALIDITY_RED"
-    );
-    for owner in &snapshot.owners {
-        assert_eq!(
-            owner.tls, owner.row.reported_tls,
-            "CONFIG_CAPACITY_TLS_ENROLLMENT_RED: original live receipts differ"
-        );
-        assert_eq!(
-            owner.socket, owner.row.reported_socket,
-            "CONFIG_CAPACITY_TLS_SOCKET_CLASSIFICATION_RED"
-        );
-        assert_eq!(
-            owner.owner_storage, owner.row.reported_owner_storage,
-            "CONFIG_CAPACITY_TLS_SPLIT_ENROLLMENT_RED"
-        );
-        assert_eq!(
-            owner.row.origins, owner.row.enrolled_origins,
-            "CONFIG_CAPACITY_TLS_PHASE_ENROLLMENT_RED: original allocation receipts differ"
-        );
-        assert_eq!(
-            sum_extents(&owner.row.origins),
-            sum_extents(owner.row.retired.iter().chain([
-                &owner.tls,
-                &owner.socket,
-                &owner.owner_storage,
-            ])),
-            "CONFIG_CAPACITY_TLS_RETIREMENT_RED: every original allocation is live or physically freed"
-        );
-        assert!(owner.tls.wrapped >= owner.tls.object);
     }
 }
 
@@ -744,53 +77,24 @@ fn assert_material_retained(snapshot: &Snapshot) {
     );
 }
 
-fn assert_drained(snapshot: &Snapshot) {
-    assert_conserved(snapshot);
-    assert!(snapshot
-        .owners
-        .iter()
-        .all(|owner| owner.row.closed && !owner.row.visible));
-    assert!(
-        snapshot
-            .owners
-            .iter()
-            .all(|owner| owner.tls == Extent::ZERO),
-        "CONFIG_CAPACITY_TLS_FINAL_FREE_RED: owner closure is not allocation release"
-    );
-    assert!(
-        snapshot
-            .owners
-            .iter()
-            .all(|owner| owner.owner_storage == Extent::ZERO),
-        "CONFIG_CAPACITY_TLS_SPLIT_CONTAINER_FREE_RED"
-    );
-    // Socket/runtime receipts are reported separately. Wakers can be retained
-    // by the runtime after this task/stream closes; they cannot cancel TLS bytes.
-    let runtime_object: usize = snapshot
-        .owners
-        .iter()
-        .map(|owner| owner.socket.object)
-        .sum();
-    println!(
-        "CONFIG_CAPACITY_TLS_RECEIPTS_DRAINED connections={} material_sources={} tls_object=0 material_object=0 split_object=0 runtime_object={} pointer_reuse_tails={} fixed_ledger_bytes={} token_storage_bytes={} snapshot_vector_bytes={} observer_arc_header=unmeasured tracker_thread_stack=unmeasured",
-        connection_rows(snapshot).count(), material_rows(snapshot).count(), runtime_object,
-        snapshot.pointer_reuse_tails, std::mem::size_of_val(&LEDGER),
-        std::mem::size_of::<Observation>(),
-        snapshot.owners.capacity() * std::mem::size_of::<OwnerSnapshot>(),
-    );
-}
-
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn mtls_allocations_follow_ready_cache_and_application_io() {
     let _serial = SERIAL_TEST.lock().await;
     let receipts = Observation::new();
     let observation = Arc::new(ConsensusBufferObservation::default());
     receipts.attach(&observation);
+    let guard = tokio::time::Instant::now() + DEFAULT_CONSENSUS_RPC_TIMEOUT;
     let mut checkpoints = Vec::new();
     ready_cached_lanes_observed(true, observation, |name| {
-        checkpoints.push((name, receipts.snapshot()));
+        if name != "drained" {
+            checkpoints.push((name, receipts.snapshot()));
+        }
     })
     .await;
+    tokio::time::timeout_at(guard, receipts.wait_for_drain())
+        .await
+        .expect("original TLS receipt cleanup guard");
+    checkpoints.push(("drained", receipts.snapshot()));
     // The unchanged fixture completed authenticated Hello/Ack, three exact
     // application replies, both setup joins and server cleanup before assertions.
     println!("CONFIG_CAPACITY_TLS_MTLS_LIFECYCLE original_fixture=true replies=3 setup_joins=2 real_cleanup=true");
@@ -1052,6 +356,14 @@ async fn mtls_last_split_half_drops_original_allocations_on_another_thread() {
     .expect("real TLS read guard");
     assert_eq!(byte, [7]);
     let split = receipts.snapshot();
+    let mut cancelled_drain = Box::pin(receipts.wait_for_drain());
+    assert!(
+        std::future::poll_fn(|cx| Poll::Ready(cancelled_drain.as_mut().poll(cx).is_pending()))
+            .await
+    );
+    // A cancelled observer wait joins only its own waiter thread. It cannot
+    // close a live TLS owner or retain the original stream or split halves.
+    drop(cancelled_drain);
     drop(reader);
     let one_half = receipts.snapshot();
     tokio::time::timeout_at(guard, async {
@@ -1081,6 +393,9 @@ async fn mtls_last_split_half_drops_original_allocations_on_another_thread() {
     drop(listener);
     let material_tail = receipts.snapshot();
     drop(retained_material);
+    tokio::time::timeout_at(guard, receipts.wait_for_drain())
+        .await
+        .expect("original split receipt cleanup guard");
     let drained = receipts.snapshot();
     assert_eq!(eof, 0);
     let sockets = observation.outbound_socket_snapshot();

@@ -138,10 +138,23 @@ impl KeyHandle {
         }
         let serialized_aad = serialize_bound_aad(aad, &self.key_id)
             .map_err(|_| CryptoOperationError::EncryptionFailed)?;
+        #[cfg(feature = "capacity-observation")]
+        let _aad_observation = crate::capacity_observation::BufferBorrow::new(
+            crate::capacity_observation::BufferKind::BoundAad,
+            &serialized_aad,
+        );
         let derived_key = self.derive_aead_key(aad, CryptoOperationError::EncryptionFailed)?;
 
         let cipher = Aes256GcmSiv::new((&*derived_key).into());
         let mut ciphertext = plaintext.to_vec();
+        #[cfg(feature = "capacity-observation")]
+        {
+            let _ciphertext = crate::capacity_observation::BufferBorrow::new(
+                crate::capacity_observation::BufferKind::Ciphertext,
+                &ciphertext,
+            );
+            crate::capacity_observation::checkpoint("ciphertext-before-seal");
+        }
         let tag = cipher
             .encrypt_inout_detached(
                 (&nonce).into(),
@@ -150,6 +163,17 @@ impl KeyHandle {
             )
             .map_err(|_| CryptoOperationError::EncryptionFailed)?;
         ciphertext.extend_from_slice(tag.as_slice());
+
+        #[cfg(feature = "capacity-observation")]
+        {
+            let _ciphertext = crate::capacity_observation::BufferBorrow::new(
+                crate::capacity_observation::BufferKind::Ciphertext,
+                &ciphertext,
+            );
+            crate::capacity_observation::checkpoint("ciphertext-with-tag");
+        }
+        #[cfg(feature = "capacity-observation")]
+        drop(_aad_observation);
 
         Ok(EncryptedPayload {
             aad: serialized_aad,
@@ -211,6 +235,17 @@ impl KeyHandle {
         failure: CryptoOperationError,
     ) -> Result<Zeroizing<[u8; AES_256_GCM_SIV_KEY_LEN]>, CryptoOperationError> {
         let (salt, info) = aad.kdf_context(&self.key_id).map_err(|_| failure)?;
+        #[cfg(feature = "capacity-observation")]
+        let _kdf_observation = (
+            crate::capacity_observation::BufferBorrow::new(
+                crate::capacity_observation::BufferKind::KdfSalt,
+                &salt,
+            ),
+            crate::capacity_observation::BufferBorrow::new(
+                crate::capacity_observation::BufferKind::KdfInfo,
+                &info,
+            ),
+        );
         let hkdf = Hkdf::<Sha256>::new(Some(&salt), self.material.bytes.as_slice());
         let mut derived = Zeroizing::new([0_u8; AES_256_GCM_SIV_KEY_LEN]);
         hkdf.expand(&info, &mut *derived).map_err(|_| failure)?;

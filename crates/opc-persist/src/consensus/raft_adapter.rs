@@ -175,11 +175,22 @@ impl ConfigRaftNetwork {
     #[allow(clippy::result_large_err)]
     async fn append(
         &self,
-        request: &AppendEntriesRequest<ConfigRaftTypeConfig>,
+        request: AppendEntriesRequest<ConfigRaftTypeConfig>,
         option: RPCOption,
     ) -> Result<AppendEntriesResponse<ConsensusNodeId>, EngineRpcError> {
-        let entry_count = request.entries.len();
-        let payload = match encode_config_wire_for_profile(self.mode, request) {
+        #[cfg(feature = "dangerous-test-hooks")]
+        let request = super::capacity_observation::raft_buffers::OriginalAppend::start(
+            self.identity,
+            self.local_node_id,
+            self.target,
+            request,
+        );
+        #[cfg(feature = "dangerous-test-hooks")]
+        let typed = request.borrow();
+        #[cfg(not(feature = "dangerous-test-hooks"))]
+        let typed = &request;
+        let entry_count = typed.entries.len();
+        let payload = match encode_config_wire_for_profile(self.mode, typed) {
             Ok(payload) => payload,
             Err(ConsensusCodecError::TooLarge) => {
                 if let Some(entries_hint) = append_entries_split_hint(entry_count) {
@@ -202,9 +213,16 @@ impl ConfigRaftNetwork {
             self.identity,
             self.local_node_id,
             self.target,
-            request,
+            typed,
             &payload,
         );
+        #[cfg(feature = "dangerous-test-hooks")]
+        let original_wire = request.wire(&payload);
+        #[cfg(all(feature = "dangerous-test-hooks", test))]
+        request.before_drop().await;
+        // Each follower has independently decoded the typed log batch. The
+        // encoded payload is now the sole request representation needed by IO.
+        drop(request);
         let call = self.call(
             ConsensusRpcFamily::AppendEntries,
             opc_consensus::engine::RPCTypes::AppendEntries,
@@ -213,6 +231,8 @@ impl ConfigRaftNetwork {
         );
         #[cfg(feature = "dangerous-test-hooks")]
         let call = super::capacity_observation::scope_transport(observation, call);
+        #[cfg(feature = "dangerous-test-hooks")]
+        let call = super::capacity_observation::raft_buffers::scope_wire(original_wire, call);
         call.await
     }
 }
@@ -227,7 +247,7 @@ impl RaftNetwork<ConfigRaftTypeConfig> for ConfigRaftNetwork {
         request: AppendEntriesRequest<ConfigRaftTypeConfig>,
         option: RPCOption,
     ) -> Result<AppendEntriesResponse<ConsensusNodeId>, EngineRpcError> {
-        self.append(&request, option).await
+        self.append(request, option).await
     }
 
     async fn install_snapshot(

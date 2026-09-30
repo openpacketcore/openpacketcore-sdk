@@ -8,6 +8,10 @@
 
 #![forbid(unsafe_code)]
 
+#[cfg(all(test, feature = "capacity-observation"))]
+mod capacity_buffer_tests;
+#[cfg(feature = "capacity-observation")]
+pub mod capacity_observation;
 mod config_preparation;
 
 pub use config_preparation::{ConfigPreparationPool, ConfigPreparationReservation};
@@ -226,10 +230,20 @@ fn seal_bounded_config(
     nonce: [u8; AES_256_GCM_SIV_NONCE_LEN],
     evidence: ConfigCapacityEvidence,
 ) -> Result<AuthenticatedEnvelope, ConfigCapacityError> {
+    #[cfg(feature = "capacity-observation")]
+    let _handle_observation = opc_key::capacity_observation::borrow_key_handle(handle);
     // Preflight bounded the base shape. KeyId is bounded by its constructor;
     // this allocation therefore cannot grow with arbitrary rejected AAD.
     let bound_aad = opc_key::serialize_bound_aad(aad, handle.key_id())
         .map_err(|_| ConfigCapacityError::EncryptionFailed)?;
+    #[cfg(feature = "capacity-observation")]
+    {
+        let _aad = capacity_observation::BufferBorrow::new(
+            capacity_observation::BufferKind::PreflightAad,
+            &bound_aad,
+        );
+        capacity_observation::checkpoint("bounded-aad-preflight");
+    }
     if bound_aad.len() > CONFIG_CAPACITY_V1_AAD_BYTES {
         return Err(ConfigCapacityError::AadBytes);
     }
@@ -256,6 +270,8 @@ pub async fn encrypt_bounded_config_envelope<P: KeyProvider + ?Sized>(
     aad: &EnvelopeAad,
     plaintext: &[u8],
 ) -> Result<AuthenticatedEnvelope, ConfigCapacityError> {
+    #[cfg(feature = "capacity-observation")]
+    let _aad_observation = opc_key::capacity_observation::borrow_config_aad(aad);
     let evidence = ConfigCapacityEvidence::validate(plaintext)?;
     preflight_config_aad(aad)?;
     let handle = provider
@@ -282,6 +298,8 @@ pub async fn encrypt_reserved_bounded_config_envelope<P: KeyProvider + ?Sized>(
     plaintext: &[u8],
 ) -> Result<AuthenticatedEnvelope, ConfigCapacityError> {
     reservation.begin_encryption()?;
+    #[cfg(feature = "capacity-observation")]
+    capacity_observation::observe_reservation(&reservation);
     let mut envelope = encrypt_bounded_config_envelope(provider, aad, plaintext).await?;
     envelope.preparation = Some(reservation.lease);
     Ok(envelope)
@@ -306,7 +324,10 @@ pub fn encrypt_bounded_config_envelope_with_handle_and_nonce(
 /// is never serialized into a consensus command, log, RPC, or snapshot.
 #[derive(Clone)]
 pub struct AuthenticatedEnvelope {
+    #[cfg(not(feature = "capacity-observation"))]
     encoded: Arc<[u8]>,
+    #[cfg(feature = "capacity-observation")]
+    encoded: opc_key::capacity_observation::ObservedArc,
     plaintext_digest: [u8; 32],
     capacity_evidence: Option<ConfigCapacityEvidence>,
     preparation: Option<Arc<config_preparation::ConfigPreparationLease>>,
@@ -315,8 +336,16 @@ pub struct AuthenticatedEnvelope {
 
 impl AuthenticatedEnvelope {
     fn new(encoded: Vec<u8>, plaintext: &[u8]) -> Self {
+        #[cfg(feature = "capacity-observation")]
+        {
+            let _encoded = capacity_observation::BufferBorrow::new(
+                capacity_observation::BufferKind::EncodedEnvelope,
+                &encoded,
+            );
+            capacity_observation::checkpoint("envelope-before-arc");
+        }
         Self {
-            encoded: Arc::from(encoded),
+            encoded: encoded.into(),
             plaintext_digest: Sha256::digest(plaintext).into(),
             capacity_evidence: None,
             preparation: None,
@@ -361,7 +390,10 @@ impl std::fmt::Debug for AuthenticatedEnvelope {
 /// Non-cloneable one-shot claim consumed by an authenticated persistence
 /// proposal constructor.
 pub struct AuthenticatedEnvelopeClaim {
+    #[cfg(not(feature = "capacity-observation"))]
     encoded: Arc<[u8]>,
+    #[cfg(feature = "capacity-observation")]
+    encoded: opc_key::capacity_observation::ObservedArc,
     plaintext_digest: [u8; 32],
     capacity_evidence: Option<ConfigCapacityEvidence>,
     preparation: Option<ConfigPreparationReservation>,
@@ -569,6 +601,26 @@ pub struct CryptoEnvelopeV1 {
 
 impl CryptoEnvelopeV1 {
     pub fn encode(&self) -> Result<Vec<u8>, CryptoError> {
+        #[cfg(feature = "capacity-observation")]
+        let _key_observation = opc_key::capacity_observation::borrow_key_id(
+            capacity_observation::BufferKind::EnvelopeKeyId,
+            &self.key_id,
+        );
+        #[cfg(feature = "capacity-observation")]
+        let _input_observations = (
+            capacity_observation::BufferBorrow::new(
+                capacity_observation::BufferKind::BoundAad,
+                &self.aad,
+            ),
+            capacity_observation::BufferBorrow::new(
+                capacity_observation::BufferKind::Ciphertext,
+                &self.ciphertext_and_tag,
+            ),
+            capacity_observation::BufferBorrow::new(
+                capacity_observation::BufferKind::EnvelopeNonce,
+                &self.nonce,
+            ),
+        );
         let key_id = self.key_id.as_str().as_bytes();
         let key_id_len = u16::try_from(key_id.len()).map_err(|_| CryptoError::InvalidEnvelope)?;
         let nonce_len =
@@ -592,6 +644,16 @@ impl CryptoEnvelopeV1 {
         out.extend_from_slice(&self.nonce);
         out.extend_from_slice(&self.aad);
         out.extend_from_slice(&self.ciphertext_and_tag);
+        #[cfg(feature = "capacity-observation")]
+        {
+            let _encoded = capacity_observation::BufferBorrow::new(
+                capacity_observation::BufferKind::EncodedEnvelope,
+                &out,
+            );
+            capacity_observation::checkpoint("envelope-encoded");
+            #[cfg(test)]
+            capacity_buffer_tests::inspect_encoding(self, &out);
+        }
         Ok(out)
     }
 

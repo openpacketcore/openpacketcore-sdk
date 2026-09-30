@@ -13,6 +13,10 @@ readme = "README.md"
 documentation = "https://docs.rs/opc-key"
 keywords = ["5g", "cnf", "cryptography", "telecom", "packet-core"]
 categories = ["cryptography", "network-programming"]
+[features]
+# Numeric original-buffer observations for capacity qualification only.
+capacity-observation = []
+
 [dependencies]
 aes-gcm-siv = { workspace = true }
 async-trait = { workspace = true }

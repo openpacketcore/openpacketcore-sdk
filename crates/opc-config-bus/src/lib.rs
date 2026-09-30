@@ -19,6 +19,8 @@
 pub mod alarms;
 pub mod authority;
 pub mod authorizer;
+#[cfg(feature = "capacity-observation")]
+pub mod capacity_observation;
 pub mod commit;
 pub mod committed;
 pub mod datastore;

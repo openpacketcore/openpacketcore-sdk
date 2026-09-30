@@ -16,6 +16,7 @@ keywords = ["5g", "cnf", "config", "telecom", "packet-core"]
 categories = ["network-programming", "data-structures"]
 [features]
 required-netconf-audit = ["dep:opc-persist"]
+capacity-observation = ["opc-crypto/capacity-observation", "opc-key/capacity-observation"]
 
 [dependencies]
 async-trait = { workspace = true }

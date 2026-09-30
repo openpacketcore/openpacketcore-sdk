@@ -26,6 +26,10 @@ use crate::types::{
     StoredConfig, StoredRequestFingerprint,
 };
 
+#[cfg(all(test, feature = "capacity-observation"))]
+#[path = "adapter_capacity_tests.rs"]
+mod adapter_capacity_tests;
+
 const CONFIG_STORE_KIND: &str = "running";
 const CONFIG_ENVELOPE_SERIALIZATION_FAILED_MESSAGE: &str = "config envelope serialization failed";
 const CONFIG_ENVELOPE_ENCRYPT_FAILED_MESSAGE: &str = "config envelope encryption failed";
@@ -619,6 +623,14 @@ where
                     .map_err(|_| {
                         StoreError::unavailable("configuration plaintext allocation failed")
                     })?;
+                #[cfg(feature = "capacity-observation")]
+                {
+                    let _plaintext = crate::capacity_observation::BufferBorrow::new(
+                        crate::capacity_observation::BufferKind::AdapterPlaintext,
+                        &plaintext,
+                    );
+                    crate::capacity_observation::checkpoint("adapter-plaintext-reserved");
+                }
                 plaintext.extend_from_slice(CONFIG_PLAINTEXT_V2_MAGIC);
                 serde_json::to_writer(ConfigPlaintextWriter(&mut plaintext), &plaintext_v2)
                     .map_err(|_| {
@@ -633,13 +645,26 @@ where
                 ))
             }
         }
+        #[cfg(feature = "capacity-observation")]
+        let _plaintext_observation = (profile == ConfigCapacityProfile::BoundedV1).then(|| {
+            crate::capacity_observation::BufferBorrow::new(
+                crate::capacity_observation::BufferKind::AdapterPlaintext,
+                &plaintext,
+            )
+        });
+        #[cfg(all(test, feature = "capacity-observation"))]
+        adapter_capacity_tests::inspect_plaintext(&plaintext);
         record.plaintext_digest = Some(compute_plaintext_digest(plaintext.as_slice()));
         record.idempotency_key =
             replay_lookup_digest(record.idempotency_key.as_ref(), record.request_id)?;
         record.apply_plan = None;
         record.request_fingerprint = None;
         record.request_id = None;
-        let aad = build_config_envelope_aad(&record, self.store_kind(), None)?;
+        let aad = if profile == ConfigCapacityProfile::BoundedV1 {
+            build_bounded_config_envelope_aad(&record, self.store_kind())?
+        } else {
+            build_config_envelope_aad(&record, self.store_kind(), None)?
+        };
         let schema_digest = record.schema_digest;
         let envelope = match profile {
             ConfigCapacityProfile::Legacy => {
@@ -672,6 +697,16 @@ where
             }
         };
         record.encrypted_blob = envelope.encoded().to_vec();
+        #[cfg(feature = "capacity-observation")]
+        if profile == ConfigCapacityProfile::BoundedV1 {
+            let _record_blob = crate::capacity_observation::BufferBorrow::new(
+                crate::capacity_observation::BufferKind::RecordBlob,
+                &record.encrypted_blob,
+            );
+            crate::capacity_observation::checkpoint("adapter-sealed-record-transfer");
+            #[cfg(test)]
+            adapter_capacity_tests::inspect_transfer(&record.encrypted_blob, &envelope);
+        }
         Ok(record.with_config(SealedConfig::newly_encrypted(schema_digest, envelope)))
     }
 
@@ -959,6 +994,58 @@ pub(crate) fn build_config_envelope_aad<C: OpcConfig>(
         record.version.get(),
         metadata,
     ))
+}
+
+// Count the actual principal JSON and store-kind serialization before making
+// SDK-owned copies. The later crypto preflight still validates the complete
+// AAD shape (including principal escaping), then the exact key-bound encoding.
+// These individual checks bound even the copies of metadata rejected there.
+fn build_bounded_config_envelope_aad<C: OpcConfig>(
+    record: &StoredConfig<C>,
+    store_kind: &str,
+) -> Result<EnvelopeAad, StoreError> {
+    let failure =
+        || StoreError::internal("configuration AAD serialization exceeds capacity or is invalid");
+    let mut principal_size = ConfigAadTextCounter(0);
+    serde_json::to_writer(&mut principal_size, &record.principal).map_err(|_| failure())?;
+    serde_json::to_writer(ConfigAadTextCounter(0), store_kind).map_err(|_| failure())?;
+    let mut principal = Vec::new();
+    principal
+        .try_reserve_exact(principal_size.0)
+        .map_err(|_| StoreError::unavailable("configuration AAD allocation failed"))?;
+    serde_json::to_writer(&mut principal, &record.principal).map_err(|_| failure())?;
+    let principal = String::from_utf8(principal).map_err(|_| failure())?;
+    let metadata = ConfigAad::new(
+        record.tx_id,
+        record.parent_tx_id,
+        record.committed_at,
+        principal,
+        record.schema_digest,
+        store_kind,
+    )
+    .map_err(|_| StoreError::crypto(CONFIG_ENVELOPE_AAD_FAILED_MESSAGE))?;
+    Ok(EnvelopeAad::config(
+        record.principal.tenant.clone(),
+        record.version.get(),
+        metadata,
+    ))
+}
+
+struct ConfigAadTextCounter(usize);
+
+impl std::io::Write for ConfigAadTextCounter {
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        self.0 = self
+            .0
+            .checked_add(bytes.len())
+            .filter(|length| *length <= opc_crypto::CONFIG_CAPACITY_V1_AAD_BYTES)
+            .ok_or_else(|| std::io::Error::other("configuration AAD capacity exceeded"))?;
+        Ok(bytes.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
 }
 
 fn compute_plaintext_digest(bytes: &[u8]) -> [u8; 32] {

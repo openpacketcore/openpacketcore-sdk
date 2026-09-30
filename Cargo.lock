@@ -2643,6 +2643,7 @@ dependencies = [
  "tokio",
  "tokio-rustls",
  "tracing",
+ "tracking-allocator",
  "uuid",
  "zeroize",
 ]

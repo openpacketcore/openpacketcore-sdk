@@ -1767,9 +1767,22 @@ fn cargo_metadata_matches_the_exact_openraft_and_foundation_feature_profile() {
             "default": [],
             "insecure-test": [],
             "legacy-session-net-compat": [],
-            "test-control": ["opc-session-store/test-control"]
+            "test-control": ["opc-session-store/test-control", "opc-tls/test-control"]
         })
     );
+    // TLS material snapshots are available only through the explicit network
+    // qualification feature; normal dependency edges keep the hooks disabled.
+    assert_eq!(
+        package("opc-tls")["features"],
+        serde_json::json!({ "test-control": [] })
+    );
+    let network_tls = network["dependencies"]
+        .as_array()
+        .expect("network dependencies")
+        .iter()
+        .find(|dependency| dependency["name"] == "opc-tls" && dependency["kind"].is_null())
+        .expect("normal network TLS dependency");
+    assert_eq!(network_tls["features"], serde_json::json!([]));
     let testkit = package("opc-session-testkit");
     assert_eq!(
         testkit["features"],
