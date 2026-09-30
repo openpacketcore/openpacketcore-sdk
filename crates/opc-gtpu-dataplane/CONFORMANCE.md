@@ -15,6 +15,7 @@ held (`publish = false`) and does not complete [#790](https://github.com/openpac
 | Receive framing | Exact datagram length, bounded extension walk, duplicate PSC refusal, endpoint comprehension bits | Optional unknowns can appear before/after the PSC and remain in the borrowed original datagram; no raw re-encoder |
 | eBPF fixed-flow attachment | One QFI per inner family; UL PSC insertion and DL QFI/direction checks; atomic generation/readback and opaque selector authority | Four inner/outer IP combinations; existing checksum/offload limits; no multi-QFI, reflective QoS, in-place QFI change or ordered End Marker retirement |
 | Retirement-bound End Marker submission | Exact protected retirement, classifier grace, original IPv4 addresses/TEIDs and UDP/2152 socket; one marker per distinct outgoing tunnel | Separate operation; no outer IPv6, selected source port, 5GS/EPS forwarding PSC, NIC drain, peer acknowledgement or delivery guarantee; other backends return typed `Unsupported` |
+| RFC 021 N3IWF session intent | Typed N3 tunnel pair, QoS flows with optional uplink N3 DSCP, up to eight Child SAs with full marks, UE inner and UP addresses and associated QFIs, one default Child SA and a declared unknown-QFI disposition; exact validation, canonical order, and a pure uplink admission and downlink selection model | Desired state only: no forwarding, installation authority, allocation or XFRM change. Lifecycle methods return `UnsupportedFeature` on Linux kernel-GTP, eBPF and unsupported adapters; the mock implements the state lifecycle only |
 | Linux, eBPF, mock, unsupported adapter | Coarse N3 capability remains `GtpuCapability::Missing` for every adapter; only qualified eBPF attachments expose the narrower fixed-flow capability | No full N3 role or backend parity claim |
 
 The two TNL types are not convertible. `N3ForwardingIntent` is desired data,
@@ -112,9 +113,17 @@ capability results. `fuzz/n3_packet` exercises bounded complete-packet
 reception and uplink insertion, with a 4,096-byte input cap and 64-extension
 bounds. The fuzz workflow runs it in PR smoke and scheduled lanes.
 
+`tests/n3iwf_session_contract.rs` covers every RFC 021 model refusal,
+canonical ordering, the uplink admission and downlink selection model against
+an independently written oracle for all 64 QFIs, redaction, the exact
+unsupported defaults of every real adapter and of a pre-RFC external
+implementation, and the mock's install, readback, flow swap, stale-writer,
+removal and fault paths. These tests prove no packet forwarding.
+
 ```sh
 python3 crates/opc-gtpu-dataplane/tests/n3_reference.py --check
 cargo test --locked -p opc-gtpu-dataplane --test n3_contract
+cargo test --locked -p opc-gtpu-dataplane --test n3iwf_session_contract
 cargo test --locked -p opc-gtpu-dataplane --doc
 # From crates/opc-gtpu-dataplane:
 cargo +nightly-2026-07-23 fuzz run n3_packet -- -max_total_time=60 -max_len=4096

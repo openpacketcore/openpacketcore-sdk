@@ -25,6 +25,12 @@ use crate::model::{
     PdpContextRemovalOutcome, PdpContextSelector, PdpLiveWriterProof, PdpLiveWriterRemovalRequest,
     PdpRestartRecoveryRequest, RemovePdpContextRequest,
 };
+use crate::n3::{
+    N3iwfInstalledSession, N3iwfSessionFlowUpdate, N3iwfSessionInstallOutcome, N3iwfSessionIntent,
+    N3iwfSessionLifecycleCapabilities, N3iwfSessionLiveWriterRemovalRequest, N3iwfSessionReadback,
+    N3iwfSessionReconcileOutcome, N3iwfSessionRecoveryRequest, N3iwfSessionRemovalOutcome,
+    N3iwfSessionSelector,
+};
 use crate::tft_classifier::{
     TftUplinkClassifier, TftUplinkClassifierReadback, TftUplinkClassifierReconcileOutcome,
     TftUplinkClassifierRemovalOutcome,
@@ -1267,6 +1273,95 @@ pub trait GtpuDataplaneBackend: Send + Sync + std::fmt::Debug {
         Ok(GtpuCapability::Missing)
     }
 
+    /// Report support for each RFC 021 N3IWF session lifecycle operation.
+    ///
+    /// This is state lifecycle only and grants no forwarding claim; the
+    /// forwarding role stays reported by [`Self::n3_forwarding_capability`].
+    /// The default reports every operation as `Missing`.
+    fn n3iwf_session_lifecycle_capabilities(&self) -> N3iwfSessionLifecycleCapabilities {
+        N3iwfSessionLifecycleCapabilities::unsupported()
+    }
+
+    /// Read back the one N3IWF session occupying a selector.
+    ///
+    /// `Present` carries the complete Active intent and its generation.
+    /// Pending, Removing, partial or inconsistent state is an error, never
+    /// `Absent`. The default is explicitly unsupported so existing
+    /// implementations cannot claim that absence or equality was proven.
+    async fn read_n3iwf_session(
+        &self,
+        _selector: N3iwfSessionSelector,
+    ) -> Result<N3iwfSessionReadback, GtpuError> {
+        Err(GtpuError::UnsupportedFeature {
+            feature: "n3iwf_session_readback",
+        })
+    }
+
+    /// Install one N3IWF session only after classifying its local TEID and
+    /// every Child SA mark (RFC 021 section 5.5).
+    ///
+    /// Uninspected occupancy is never success. Active is published last, and
+    /// cancellation does not prove that a backend operation stopped: read back
+    /// before retrying after dropping an in-flight future.
+    async fn install_n3iwf_session_classified(
+        &self,
+        _intent: N3iwfSessionIntent,
+    ) -> Result<N3iwfSessionInstallOutcome, GtpuError> {
+        Err(GtpuError::UnsupportedFeature {
+            feature: "n3iwf_session_classified_install",
+        })
+    }
+
+    /// Swap a session's QoS flow and Child SA tables atomically for both
+    /// directions (RFC 021 section 5.5).
+    ///
+    /// The swap applies only when the installed session and generation equal
+    /// the update's expectation. A backend that removes a Child SA from the
+    /// table returns only after classifier quiescence, so the caller may then
+    /// delete that Child SA.
+    async fn reconcile_n3iwf_session_flows(
+        &self,
+        _update: N3iwfSessionFlowUpdate,
+    ) -> Result<N3iwfSessionReconcileOutcome, GtpuError> {
+        Err(GtpuError::UnsupportedFeature {
+            feature: "n3iwf_session_flow_reconcile",
+        })
+    }
+
+    /// Remove exactly the expected session and generation, then prove its
+    /// absence and complete classifier quiescence before returning `Removed`.
+    async fn remove_n3iwf_session_exact(
+        &self,
+        _expected: N3iwfInstalledSession,
+    ) -> Result<N3iwfSessionRemovalOutcome, GtpuError> {
+        Err(GtpuError::UnsupportedFeature {
+            feature: "n3iwf_session_exact_removal",
+        })
+    }
+
+    /// Remove one exact durable session after its previous writer stopped.
+    ///
+    /// Recovery never publishes a session: a Pending record resolves by
+    /// removal and a Removing record by completion.
+    async fn recover_n3iwf_session_exact(
+        &self,
+        _request: N3iwfSessionRecoveryRequest,
+    ) -> Result<N3iwfSessionRemovalOutcome, GtpuError> {
+        Err(GtpuError::UnsupportedFeature {
+            feature: "n3iwf_session_restart_recovery",
+        })
+    }
+
+    /// Remove one exact session under the current live writer's affine proof.
+    async fn remove_n3iwf_session_exact_live_writer(
+        &self,
+        _request: N3iwfSessionLiveWriterRemovalRequest,
+    ) -> Result<N3iwfSessionRemovalOutcome, GtpuError> {
+        Err(GtpuError::UnsupportedFeature {
+            feature: "n3iwf_session_live_writer_removal",
+        })
+    }
+
     /// Report support for PDP contexts whose inner UE address is IPv6.
     ///
     /// `Available` means [`Self::install_pdp_context`],
@@ -1377,6 +1472,77 @@ mod tests {
         async fn probe(&self) -> Result<GtpuProbe, GtpuError> {
             Ok(GtpuProbe::unsupported())
         }
+    }
+
+    #[tokio::test]
+    async fn legacy_external_implementer_refuses_n3iwf_live_writer_removal() {
+        use crate::n3::{
+            LocalN3DownlinkTnl, N3Qfi, N3iwfChildSa, N3iwfDownlinkUnknownQfi, N3iwfN3Tunnel,
+            N3iwfQfiSet, N3iwfQosFlow, N3iwfSessionGeneration, ReceivedN3UplinkTnl,
+        };
+        use std::net::{IpAddr, Ipv4Addr};
+
+        let backend: Box<dyn GtpuDataplaneBackend> = Box::new(LegacyExternalBackend);
+        let tunnel = N3iwfN3Tunnel::new(
+            7,
+            ReceivedN3UplinkTnl::new(
+                IpAddr::V4(Ipv4Addr::new(192, 0, 2, 1)),
+                crate::Teid::new(1).unwrap(),
+            )
+            .unwrap(),
+            LocalN3DownlinkTnl::new(
+                IpAddr::V4(Ipv4Addr::new(192, 0, 2, 2)),
+                crate::Teid::new(2).unwrap(),
+            )
+            .unwrap(),
+            crate::GtpuSourcePortPolicy::Any,
+            crate::GtpuUplinkSourcePortPolicy::LegacyServicePort,
+        )
+        .unwrap();
+        let mark = crate::GtpBearerMark::new(0x100).unwrap();
+        let intent = N3iwfSessionIntent::new(
+            tunnel,
+            vec![N3iwfQosFlow::new(N3Qfi::new(1).unwrap(), None)],
+            vec![N3iwfChildSa::new(
+                mark,
+                IpAddr::V4(Ipv4Addr::new(10, 45, 0, 2)),
+                IpAddr::V4(Ipv4Addr::new(10, 200, 0, 1)),
+                N3iwfQfiSet::empty(),
+            )
+            .unwrap()],
+            mark,
+            N3iwfDownlinkUnknownQfi::Drop,
+        )
+        .unwrap();
+        let proof = PdpLiveWriterProof::for_test(
+            std::path::PathBuf::from("/nonexistent-recovery-root"),
+            crate::model::PdpLiveWriterNamespaceIdentity::from_dev_ino(1, 1),
+        );
+        let request = N3iwfSessionLiveWriterRemovalRequest::new(
+            GtpDevice {
+                name: String::from("n3"),
+                ifindex: 7,
+            },
+            crate::PdpDeviceIncarnation::from_bytes([3; 16]).unwrap(),
+            N3iwfInstalledSession::new(intent, N3iwfSessionGeneration::FIRST),
+            proof,
+        );
+        assert_eq!(
+            format!("{request:?}"),
+            "N3iwfSessionLiveWriterRemovalRequest(<redacted>)"
+        );
+        assert!(matches!(
+            backend
+                .remove_n3iwf_session_exact_live_writer(request)
+                .await,
+            Err(GtpuError::UnsupportedFeature {
+                feature: "n3iwf_session_live_writer_removal"
+            })
+        ));
+        assert_eq!(
+            backend.n3iwf_session_lifecycle_capabilities(),
+            N3iwfSessionLifecycleCapabilities::unsupported()
+        );
     }
 
     #[tokio::test]

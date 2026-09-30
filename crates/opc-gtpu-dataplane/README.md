@@ -47,6 +47,23 @@ support remain unavailable. Linux kernel-GTP, mock and unsupported
 adapters return `Missing` for the new attachment-scoped capability. The software
 packet helpers alone confer no install authority; see [N3 conformance](CONFORMANCE.md).
 
+[RFC 021](../../docs/rfc/021-n3iwf-forwarding-role.md) proposes the complete
+N3IWF forwarding role, and its first slice adds the typed session state.
+`N3iwfSessionIntent` holds one PDU session: its N3 tunnel pair
+(`N3iwfN3Tunnel`), its QoS flows with an optional uplink N3 DSCP, up to
+`N3IWF_SESSION_MAX_CHILD_SAS` logical user-plane Child SAs (`N3iwfChildSa`:
+full XFRM mark, UE inner and UP addresses, explicitly associated QFIs), exactly
+one default Child SA and the declared disposition for an unknown downlink QFI.
+It has no PAA. Construction validates and canonicalizes the session, and
+`uplink_admission` and `downlink_selection` encode the RFC's receiver
+dispositions. The `GtpuDataplaneBackend` lifecycle methods
+`read_n3iwf_session`, `install_n3iwf_session_classified`,
+`reconcile_n3iwf_session_flows`, `remove_n3iwf_session_exact`,
+`recover_n3iwf_session_exact` and `remove_n3iwf_session_exact_live_writer`
+default to `UnsupportedFeature`, which Linux kernel-GTP, eBPF and unsupported
+adapters keep. The mock implements the state lifecycle for tests only. No
+adapter forwards N3IWF traffic, and the forwarding role stays `Missing`.
+
 ## Grouped device shutdown for retained restart
 
 `EbpfGtpuDataplaneBackend::suspend_grouped_device` detaches both exact owned tc

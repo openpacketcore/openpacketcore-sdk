@@ -14,6 +14,12 @@ use crate::model::{
     PdpContextInstallOutcome, PdpContextReadback, PdpContextReconciliationCapabilities,
     PdpContextRemovalOutcome, PdpContextSelector, RemovePdpContextRequest,
 };
+use crate::n3::{
+    N3iwfInstalledSession, N3iwfSessionConflict, N3iwfSessionFlowUpdate, N3iwfSessionGeneration,
+    N3iwfSessionInstallOutcome, N3iwfSessionIntent, N3iwfSessionLifecycleCapabilities,
+    N3iwfSessionOccupancy, N3iwfSessionReadback, N3iwfSessionReconcileOutcome,
+    N3iwfSessionRemovalOutcome, N3iwfSessionSelector, N3iwfSessionSelectorKey,
+};
 use crate::tft_classifier::{
     TftUplinkClassifier, TftUplinkClassifierReadback, TftUplinkClassifierReconcileOutcome,
     TftUplinkClassifierRemovalOutcome,
@@ -130,6 +136,56 @@ impl fmt::Debug for MockPdpContextReconciliationOperation {
     }
 }
 
+/// One RFC 021 N3IWF session call recorded by the mock backend.
+///
+/// These calls use their own log for the same reason as
+/// [`MockPdpContextReconciliationOperation`]. Every snapshot redacts its
+/// values.
+#[non_exhaustive]
+#[derive(Clone, PartialEq, Eq)]
+pub enum MockN3iwfSessionOperation {
+    /// Session readback.
+    Read {
+        /// Redacted selector snapshot.
+        selector: N3iwfSessionSelector,
+    },
+    /// Classified session install.
+    InstallClassified {
+        /// Redacted intent snapshot.
+        intent: N3iwfSessionIntent,
+    },
+    /// Flow-table swap.
+    ReconcileFlows {
+        /// Redacted update snapshot.
+        update: N3iwfSessionFlowUpdate,
+    },
+    /// Exact session removal.
+    RemoveExact {
+        /// Redacted expected-session snapshot.
+        expected: N3iwfInstalledSession,
+    },
+}
+
+impl fmt::Debug for MockN3iwfSessionOperation {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Read { selector } => f.debug_struct("Read").field("selector", selector).finish(),
+            Self::InstallClassified { intent } => f
+                .debug_struct("InstallClassified")
+                .field("intent", intent)
+                .finish(),
+            Self::ReconcileFlows { update } => f
+                .debug_struct("ReconcileFlows")
+                .field("update", update)
+                .finish(),
+            Self::RemoveExact { expected } => f
+                .debug_struct("RemoveExact")
+                .field("expected", expected)
+                .finish(),
+        }
+    }
+}
+
 /// Deterministic in-memory GTP-U dataplane backend.
 #[derive(Clone)]
 pub struct MockGtpuDataplaneBackend {
@@ -156,6 +212,18 @@ struct MockState {
     pdp_fault: Option<MockPdpContextFault>,
     tft_uplink_classification_capability: GtpuCapability,
     tft_classifiers: BTreeMap<(u32, std::net::IpAddr), TftUplinkClassifier>,
+    n3iwf_sessions: BTreeMap<MockN3iwfKey, N3iwfInstalledSession>,
+    n3iwf_marks: BTreeMap<(u32, u32), MockN3iwfKey>,
+    n3iwf_session_operations: Vec<MockN3iwfSessionOperation>,
+}
+
+/// Composite record key: N3 link, outer family and local TEID (RFC 021
+/// section 5.4).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+struct MockN3iwfKey {
+    link_ifindex: u32,
+    outer_family: u8,
+    local_teid: u32,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
@@ -202,6 +270,9 @@ impl MockGtpuDataplaneBackend {
                 pdp_fault: None,
                 tft_uplink_classification_capability: GtpuCapability::Available,
                 tft_classifiers: BTreeMap::new(),
+                n3iwf_sessions: BTreeMap::new(),
+                n3iwf_marks: BTreeMap::new(),
+                n3iwf_session_operations: Vec::new(),
             })),
         }
     }
@@ -272,6 +343,17 @@ impl MockGtpuDataplaneBackend {
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         state.operations.clear();
         state.pdp_context_reconciliation_operations.clear();
+        state.n3iwf_session_operations.clear();
+    }
+
+    /// Return all recorded RFC 021 N3IWF session calls, in order.
+    #[must_use]
+    pub fn n3iwf_session_operations(&self) -> Vec<MockN3iwfSessionOperation> {
+        let state = self
+            .state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        state.n3iwf_session_operations.clone()
     }
 
     /// Inject or clear a redaction-safe PDP reconciliation fault.
@@ -484,6 +566,91 @@ impl MockGtpuDataplaneBackend {
             })
         }
     }
+
+    fn n3iwf_key(link_ifindex: u32, local_downlink: crate::n3::LocalN3DownlinkTnl) -> MockN3iwfKey {
+        MockN3iwfKey {
+            link_ifindex,
+            outer_family: if local_downlink.local_address().is_ipv4() {
+                4
+            } else {
+                6
+            },
+            local_teid: local_downlink.teid().get(),
+        }
+    }
+
+    fn n3iwf_intent_key(intent: &N3iwfSessionIntent) -> MockN3iwfKey {
+        Self::n3iwf_key(intent.n3().link_ifindex(), intent.n3().local_downlink())
+    }
+
+    const fn n3iwf_fault_reason(fault: MockPdpContextFault) -> PdpContextIndeterminateReason {
+        match fault {
+            MockPdpContextFault::ChangingReadback => PdpContextIndeterminateReason::StateChanged,
+            MockPdpContextFault::CorruptState | MockPdpContextFault::TransitionalState => {
+                PdpContextIndeterminateReason::IncompleteState
+            }
+        }
+    }
+
+    /// The owner of the lowest requested mark that another session holds.
+    fn n3iwf_foreign_owner(
+        state: &MockState,
+        intent: &N3iwfSessionIntent,
+        own: MockN3iwfKey,
+    ) -> Option<MockN3iwfKey> {
+        let link_ifindex = intent.n3().link_ifindex();
+        intent.child_sas().iter().find_map(|child_sa| {
+            state
+                .n3iwf_marks
+                .get(&(link_ifindex, child_sa.mark().get()))
+                .copied()
+                .filter(|owner| *owner != own)
+        })
+    }
+
+    /// Conflict evidence against the session that owns `owner`, or an
+    /// indeterminate result if the index names no record.
+    fn n3iwf_mark_conflict(
+        state: &MockState,
+        owner: MockN3iwfKey,
+        desired: &N3iwfSessionIntent,
+    ) -> Option<N3iwfSessionConflict> {
+        state.n3iwf_sessions.get(&owner).and_then(|occupant| {
+            N3iwfSessionConflict::between(
+                N3iwfSessionOccupancy::ChildSaMark,
+                occupant.intent(),
+                desired,
+            )
+        })
+    }
+
+    /// The record equals `expected` and exactly its marks are indexed to it.
+    fn n3iwf_is_exact(
+        state: &MockState,
+        key: MockN3iwfKey,
+        expected: &N3iwfInstalledSession,
+    ) -> bool {
+        let child_sas = expected.intent().child_sas();
+        state.n3iwf_sessions.get(&key) == Some(expected)
+            && child_sas.iter().all(|child_sa| {
+                state
+                    .n3iwf_marks
+                    .get(&(key.link_ifindex, child_sa.mark().get()))
+                    == Some(&key)
+            })
+            && state
+                .n3iwf_marks
+                .values()
+                .filter(|owner| **owner == key)
+                .count()
+                == child_sas.len()
+    }
+
+    /// Neither a record nor any index entry names `key`.
+    fn n3iwf_is_absent(state: &MockState, key: MockN3iwfKey) -> bool {
+        !state.n3iwf_sessions.contains_key(&key)
+            && !state.n3iwf_marks.values().any(|owner| *owner == key)
+    }
 }
 
 impl Default for MockGtpuDataplaneBackend {
@@ -674,6 +841,12 @@ impl GtpuDataplaneBackend for MockGtpuDataplaneBackend {
         state
             .pdp_by_uplink
             .retain(|selector, _| selector.link_ifindex != device.ifindex);
+        state
+            .n3iwf_sessions
+            .retain(|key, _| key.link_ifindex != device.ifindex);
+        state
+            .n3iwf_marks
+            .retain(|(link_ifindex, _), _| *link_ifindex != device.ifindex);
         state.operations.push(MockOperation::RemoveDevice {
             device: device.clone(),
         });
@@ -887,6 +1060,268 @@ impl GtpuDataplaneBackend for MockGtpuDataplaneBackend {
             DualSelectorState::Indeterminate => Ok(PdpContextRemovalOutcome::Indeterminate(
                 PdpContextIndeterminateReason::IncompleteState,
             )),
+        }
+    }
+
+    fn n3iwf_session_lifecycle_capabilities(&self) -> N3iwfSessionLifecycleCapabilities {
+        // The mock models the RFC 021 state lifecycle only. It forwards no
+        // packets, so the N3IWF forwarding role stays `Missing`, and it has no
+        // durable writer authority for recovery or live-writer removal.
+        N3iwfSessionLifecycleCapabilities {
+            readback: GtpuCapability::Available,
+            classified_install: GtpuCapability::Available,
+            flow_reconcile: GtpuCapability::Available,
+            exact_removal: GtpuCapability::Available,
+            restart_recovery: GtpuCapability::Missing,
+            live_writer_removal: GtpuCapability::Missing,
+        }
+    }
+
+    async fn read_n3iwf_session(
+        &self,
+        selector: N3iwfSessionSelector,
+    ) -> Result<N3iwfSessionReadback, GtpuError> {
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        Self::check_failure(&state)?;
+        state
+            .n3iwf_session_operations
+            .push(MockN3iwfSessionOperation::Read { selector });
+        let indeterminate = GtpuError::StateIndeterminate {
+            operation: "mock_n3iwf_session_readback",
+        };
+        if state.pdp_fault.is_some() {
+            return Err(indeterminate);
+        }
+        let key = match selector.key() {
+            N3iwfSessionSelectorKey::LocalDownlink(local_downlink) => {
+                Self::n3iwf_key(selector.link_ifindex(), local_downlink)
+            }
+            N3iwfSessionSelectorKey::ChildSaMark(mark) => {
+                match state
+                    .n3iwf_marks
+                    .get(&(selector.link_ifindex(), mark.get()))
+                {
+                    Some(key) => *key,
+                    None => return Ok(N3iwfSessionReadback::Absent),
+                }
+            }
+        };
+        match state.n3iwf_sessions.get(&key) {
+            Some(installed) if Self::n3iwf_is_exact(&state, key, installed) => {
+                Ok(N3iwfSessionReadback::Present(installed.clone()))
+            }
+            None if Self::n3iwf_is_absent(&state, key) => Ok(N3iwfSessionReadback::Absent),
+            // Index residue or a partial closure is never collapsed into Absent.
+            Some(_) | None => Err(indeterminate),
+        }
+    }
+
+    async fn install_n3iwf_session_classified(
+        &self,
+        intent: N3iwfSessionIntent,
+    ) -> Result<N3iwfSessionInstallOutcome, GtpuError> {
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        Self::check_failure(&state)?;
+        state
+            .n3iwf_session_operations
+            .push(MockN3iwfSessionOperation::InstallClassified {
+                intent: intent.clone(),
+            });
+        if let Some(fault) = state.pdp_fault {
+            return Ok(N3iwfSessionInstallOutcome::Indeterminate(
+                Self::n3iwf_fault_reason(fault),
+            ));
+        }
+        let key = Self::n3iwf_intent_key(&intent);
+        let foreign_owner = Self::n3iwf_foreign_owner(&state, &intent, key);
+        if let Some(existing) = state.n3iwf_sessions.get(&key) {
+            if existing.intent() == &intent {
+                return Ok(N3iwfSessionInstallOutcome::ExactAlreadyPresent(
+                    existing.generation(),
+                ));
+            }
+            let occupancy = if foreign_owner.is_some() {
+                N3iwfSessionOccupancy::Both
+            } else {
+                N3iwfSessionOccupancy::LocalTeid
+            };
+            return Ok(
+                N3iwfSessionConflict::between(occupancy, existing.intent(), &intent).map_or(
+                    N3iwfSessionInstallOutcome::Indeterminate(
+                        PdpContextIndeterminateReason::IncompleteState,
+                    ),
+                    N3iwfSessionInstallOutcome::Conflict,
+                ),
+            );
+        }
+        if let Some(owner) = foreign_owner {
+            return Ok(Self::n3iwf_mark_conflict(&state, owner, &intent).map_or(
+                N3iwfSessionInstallOutcome::Indeterminate(
+                    PdpContextIndeterminateReason::IncompleteState,
+                ),
+                N3iwfSessionInstallOutcome::Conflict,
+            ));
+        }
+        let installed = N3iwfInstalledSession::new(intent, N3iwfSessionGeneration::FIRST);
+        // Index entries authorize nothing until the record is published.
+        for child_sa in installed.intent().child_sas() {
+            state
+                .n3iwf_marks
+                .insert((key.link_ifindex, child_sa.mark().get()), key);
+        }
+        state.n3iwf_sessions.insert(key, installed.clone());
+        if Self::n3iwf_is_exact(&state, key, &installed) {
+            Ok(N3iwfSessionInstallOutcome::Installed(
+                installed.generation(),
+            ))
+        } else {
+            Ok(N3iwfSessionInstallOutcome::Indeterminate(
+                PdpContextIndeterminateReason::MutationUnconfirmed,
+            ))
+        }
+    }
+
+    async fn reconcile_n3iwf_session_flows(
+        &self,
+        update: N3iwfSessionFlowUpdate,
+    ) -> Result<N3iwfSessionReconcileOutcome, GtpuError> {
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        Self::check_failure(&state)?;
+        state
+            .n3iwf_session_operations
+            .push(MockN3iwfSessionOperation::ReconcileFlows {
+                update: update.clone(),
+            });
+        if let Some(fault) = state.pdp_fault {
+            return Ok(N3iwfSessionReconcileOutcome::Indeterminate(
+                Self::n3iwf_fault_reason(fault),
+            ));
+        }
+        let (expected, desired) = update.into_parts();
+        let key = Self::n3iwf_intent_key(&desired);
+        let Some(current) = state.n3iwf_sessions.get(&key).cloned() else {
+            return Ok(N3iwfSessionReconcileOutcome::Absent);
+        };
+        if current.intent() == &desired {
+            return Ok(N3iwfSessionReconcileOutcome::ExactAlreadyPresent(
+                current.generation(),
+            ));
+        }
+        if current != expected {
+            return Ok(N3iwfSessionConflict::between_installed(
+                N3iwfSessionOccupancy::LocalTeid,
+                &current,
+                &expected,
+            )
+            .map_or(
+                N3iwfSessionReconcileOutcome::Indeterminate(
+                    PdpContextIndeterminateReason::IncompleteState,
+                ),
+                N3iwfSessionReconcileOutcome::Conflict,
+            ));
+        }
+        if let Some(owner) = Self::n3iwf_foreign_owner(&state, &desired, key) {
+            return Ok(Self::n3iwf_mark_conflict(&state, owner, &desired).map_or(
+                N3iwfSessionReconcileOutcome::Indeterminate(
+                    PdpContextIndeterminateReason::IncompleteState,
+                ),
+                N3iwfSessionReconcileOutcome::Conflict,
+            ));
+        }
+        let Some(next) = current.generation().next() else {
+            // Generations never wrap; exhaustion refuses without mutation.
+            return Ok(N3iwfSessionReconcileOutcome::Indeterminate(
+                PdpContextIndeterminateReason::AuthorityUnavailable,
+            ));
+        };
+        let replacement = N3iwfInstalledSession::new(desired, next);
+        // Stage new index entries, replace the record once, then drop the
+        // entries of Child SAs that left the table.
+        for child_sa in replacement.intent().child_sas() {
+            state
+                .n3iwf_marks
+                .insert((key.link_ifindex, child_sa.mark().get()), key);
+        }
+        state.n3iwf_sessions.insert(key, replacement.clone());
+        for child_sa in current.intent().child_sas() {
+            let index = (key.link_ifindex, child_sa.mark().get());
+            if replacement.intent().child_sa(child_sa.mark()).is_none()
+                && state.n3iwf_marks.get(&index) == Some(&key)
+            {
+                state.n3iwf_marks.remove(&index);
+            }
+        }
+        if Self::n3iwf_is_exact(&state, key, &replacement) {
+            Ok(N3iwfSessionReconcileOutcome::Reconciled(next))
+        } else {
+            Ok(N3iwfSessionReconcileOutcome::Indeterminate(
+                PdpContextIndeterminateReason::MutationUnconfirmed,
+            ))
+        }
+    }
+
+    async fn remove_n3iwf_session_exact(
+        &self,
+        expected: N3iwfInstalledSession,
+    ) -> Result<N3iwfSessionRemovalOutcome, GtpuError> {
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        Self::check_failure(&state)?;
+        state
+            .n3iwf_session_operations
+            .push(MockN3iwfSessionOperation::RemoveExact {
+                expected: expected.clone(),
+            });
+        if let Some(fault) = state.pdp_fault {
+            return Ok(N3iwfSessionRemovalOutcome::Indeterminate(
+                Self::n3iwf_fault_reason(fault),
+            ));
+        }
+        let key = Self::n3iwf_intent_key(expected.intent());
+        match state.n3iwf_sessions.get(&key) {
+            None if Self::n3iwf_is_absent(&state, key) => {
+                return Ok(N3iwfSessionRemovalOutcome::AlreadyAbsent);
+            }
+            None => {
+                return Ok(N3iwfSessionRemovalOutcome::Indeterminate(
+                    PdpContextIndeterminateReason::IncompleteState,
+                ));
+            }
+            Some(current) if current != &expected => {
+                return Ok(N3iwfSessionConflict::between_installed(
+                    N3iwfSessionOccupancy::LocalTeid,
+                    current,
+                    &expected,
+                )
+                .map_or(
+                    N3iwfSessionRemovalOutcome::Indeterminate(
+                        PdpContextIndeterminateReason::IncompleteState,
+                    ),
+                    N3iwfSessionRemovalOutcome::Conflict,
+                ));
+            }
+            Some(_) => {}
+        }
+        // Withdraw the record first, then its index entries.
+        state.n3iwf_sessions.remove(&key);
+        state.n3iwf_marks.retain(|_, owner| *owner != key);
+        if Self::n3iwf_is_absent(&state, key) {
+            Ok(N3iwfSessionRemovalOutcome::Removed)
+        } else {
+            Ok(N3iwfSessionRemovalOutcome::Indeterminate(
+                PdpContextIndeterminateReason::MutationUnconfirmed,
+            ))
         }
     }
 

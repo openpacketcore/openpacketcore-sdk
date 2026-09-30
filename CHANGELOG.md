@@ -74,6 +74,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- `opc-gtpu-dataplane`: propose [RFC 021](docs/rfc/021-n3iwf-forwarding-role.md)
+  for the N3IWF forwarding role between NWu GRE and N3 GTP-U and add its first
+  slice. `n3::N3iwfSessionIntent` validates one PDU session's N3 tunnel pair,
+  QoS flows, up to eight Child SAs with full marks and NWu inner addresses,
+  exactly one default Child SA and a declared unknown-QFI disposition, with no
+  PAA. New `GtpuDataplaneBackend` lifecycle methods (classified install, exact
+  readback, atomic flow-table swap, exact removal, restart recovery and
+  live-writer removal) default to `UnsupportedFeature`; only the mock
+  implements the state lifecycle. Every adapter still reports the N3IWF
+  forwarding role as `Missing`. Refs #1028.
+
 - `opc-persist`: add an online audit recipient client and authority-owned
   verification session without exporting signing keys. Verify actual received
   pages, frozen-range completeness and fresh independent checkpoints; bind

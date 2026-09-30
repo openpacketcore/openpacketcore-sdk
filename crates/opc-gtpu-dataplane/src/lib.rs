@@ -10,7 +10,9 @@
 //! the committed eBPF datapath object and `opc-gtpu-ebpf-common`.
 //! The experimental [`n3`] module adds software G-PDU/PSC packet helpers and
 //! directional intent types; all shipped backends report N3 forwarding as
-//! unavailable, independently of those packet helpers.
+//! unavailable, independently of those packet helpers. It also carries the
+//! RFC 021 N3IWF session intent, whose lifecycle methods default to
+//! unsupported on every backend and are implemented only by the mock.
 //!
 //! The additive reconciliation contract provides typed lookup by local TEID or
 //! uplink identity, dual-selector classified install, and capability-gated
@@ -89,7 +91,7 @@ pub use error::{GtpuError, ProgramLoadRefusal};
 pub use icmp::{build_icmpv4_packet_too_big, build_icmpv6_packet_too_big};
 pub use linux::{LinuxGtpuDataplaneBackend, LinuxGtpuDataplaneBackendConfig};
 pub use mock::{
-    MockGtpuDataplaneBackend, MockOperation, MockPdpContextFault,
+    MockGtpuDataplaneBackend, MockN3iwfSessionOperation, MockOperation, MockPdpContextFault,
     MockPdpContextReconciliationOperation,
 };
 pub use model::{

@@ -32,6 +32,13 @@
 //! first, clears sequence/N-PDU/reserved fields, and preflights length before
 //! writing. It does not construct UDP/IP headers, controls, or checksums.
 //! `Debug` and errors contain no endpoint, TEID, mark, QoS, or packet values.
+//!
+//! [`N3iwfSessionIntent`] and its companions are the RFC 021 typed state for
+//! the complete N3IWF forwarding role: one PDU session's QoS flows, Child SAs
+//! with their NWu inner addresses and associated QFIs, one default Child SA
+//! and no PAA. Construction is validated and canonical; the lifecycle
+//! operations on [`crate::GtpuDataplaneBackend`] default to unsupported, and
+//! no adapter reports the role as available.
 
 use std::{fmt, net::IpAddr};
 
@@ -47,6 +54,19 @@ use opc_protocol::{
 use thiserror::Error;
 
 use crate::{GtpBearerMark, Teid};
+
+mod session;
+
+pub use session::{
+    N3iwfChildSa, N3iwfDownlinkSelection, N3iwfDownlinkUnknownQfi, N3iwfInstalledSession,
+    N3iwfN3Tunnel, N3iwfQfiSet, N3iwfQfiSetIter, N3iwfQosFlow, N3iwfSessionConflict,
+    N3iwfSessionFlowUpdate, N3iwfSessionGeneration, N3iwfSessionInstallOutcome, N3iwfSessionIntent,
+    N3iwfSessionLifecycleCapabilities, N3iwfSessionLiveWriterRemovalRequest,
+    N3iwfSessionMismatchField, N3iwfSessionModelError, N3iwfSessionOccupancy, N3iwfSessionReadback,
+    N3iwfSessionReconcileOutcome, N3iwfSessionRecoveryRequest, N3iwfSessionRemovalOutcome,
+    N3iwfSessionSelector, N3iwfSessionSelectorKey, N3iwfUplinkAdmission,
+    N3IWF_SESSION_MAX_CHILD_SAS,
+};
 
 /// N3 function role, distinct from the Linux `GtpRole` netdevice setting.
 #[non_exhaustive]
