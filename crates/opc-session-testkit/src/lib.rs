@@ -5,6 +5,8 @@
 
 #[cfg(feature = "consumer-fixture")]
 pub mod authenticated_consumer_fixture;
+#[cfg(feature = "test-control")]
+mod consensus_observation;
 pub mod qualification;
 pub mod qualification_concurrent_v5;
 pub mod qualification_kubernetes;
@@ -149,6 +151,8 @@ struct InProcessConsensusPeer {
     online: Arc<AtomicBool>,
     ordinary_read_barrier_online: Arc<AtomicBool>,
     rejected_ordinary_read_barriers: Arc<AtomicUsize>,
+    #[cfg(feature = "test-control")]
+    rpc_observations: Arc<consensus_observation::Observations>,
 }
 
 impl InProcessConsensusPeer {
@@ -160,6 +164,8 @@ impl InProcessConsensusPeer {
             online: Arc::new(AtomicBool::new(true)),
             ordinary_read_barrier_online: Arc::new(AtomicBool::new(true)),
             rejected_ordinary_read_barriers: Arc::new(AtomicUsize::new(0)),
+            #[cfg(feature = "test-control")]
+            rpc_observations: Arc::default(),
         }
     }
 
@@ -196,6 +202,20 @@ impl SessionConsensusPeer for InProcessConsensusPeer {
         &self,
         request: SessionConsensusWireRequest,
     ) -> Result<SessionConsensusWireResponse, SessionConsensusPeerError> {
+        #[cfg(feature = "test-control")]
+        let observation = self.rpc_observations.begin(&request);
+        let result = self.call_observed(request).await;
+        #[cfg(feature = "test-control")]
+        observation.finish(&result);
+        result
+    }
+}
+
+impl InProcessConsensusPeer {
+    async fn call_observed(
+        &self,
+        request: SessionConsensusWireRequest,
+    ) -> Result<SessionConsensusWireResponse, SessionConsensusPeerError> {
         if !self.online.load(Ordering::SeqCst) {
             return Err(SessionConsensusPeerError::Unavailable);
         }
@@ -229,6 +249,8 @@ pub struct ConsensusTestCluster {
     stores: Vec<ConsensusSessionStore>,
     paths: BTreeMap<(usize, usize), Arc<InProcessConsensusPeer>>,
     identity: SessionConsensusIdentity,
+    #[cfg(feature = "test-control")]
+    rpc_observations: Arc<consensus_observation::Observations>,
     #[cfg(feature = "consumer-fixture")]
     consumer_roster: SessionConsumerRoster,
 }
@@ -324,6 +346,8 @@ impl ConsensusTestCluster {
             .session_consumer_roster()
             .expect("consensus test consumer roster");
 
+        #[cfg(feature = "test-control")]
+        let rpc_observations = Arc::default();
         let mut paths = BTreeMap::new();
         for source in 0..member_count {
             for (target, node_id) in node_ids.iter().copied().enumerate() {
@@ -332,6 +356,8 @@ impl ConsensusTestCluster {
                         (source, target),
                         Arc::new(InProcessConsensusPeer {
                             scope: fixed.then_some(identity),
+                            #[cfg(feature = "test-control")]
+                            rpc_observations: Arc::clone(&rpc_observations),
                             ..InProcessConsensusPeer::new(node_id)
                         }),
                     );
@@ -388,6 +414,8 @@ impl ConsensusTestCluster {
             stores,
             paths,
             identity,
+            #[cfg(feature = "test-control")]
+            rpc_observations,
             #[cfg(feature = "consumer-fixture")]
             consumer_roster,
         };
@@ -401,6 +429,18 @@ impl ConsensusTestCluster {
             .get(index)
             .unwrap_or_else(|| panic!("consensus test node {index} does not exist"))
             .clone()
+    }
+
+    /// Fixed numeric observations of actual in-process consensus peer calls.
+    ///
+    /// Counts include background heartbeats, retries and readiness work; they
+    /// are neither client-operation nor Raft proposal counts. Durations include
+    /// handler wait and execution, with cancellation recorded on future drop.
+    /// The snapshot issues no request and exposes no identities or payloads.
+    /// Fields are sampled independently; lifetime peaks are not interval peaks.
+    #[cfg(feature = "test-control")]
+    pub fn consensus_rpc_observation(&self) -> serde_json::Value {
+        self.rpc_observations.snapshot()
     }
 
     /// Exact cluster/configuration/epoch scope used by this test fleet.

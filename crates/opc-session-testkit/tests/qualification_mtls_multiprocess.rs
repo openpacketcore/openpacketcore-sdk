@@ -2849,7 +2849,153 @@ enum ChildStderrDiagnostic {
     QualificationNodeSqliteFailed,
     QualificationNodeConsensusFailed,
     QualificationNodeListenerFailed,
+    InitializationRejected {
+        stage: &'static str,
+        error_class: &'static str,
+    },
     Redacted,
+}
+
+fn child_initialization_diagnostic(line: &[u8]) -> Option<ChildStderrDiagnostic> {
+    let (stage, error_class) = std::str::from_utf8(line)
+        .ok()?
+        .strip_prefix("qualification initialization rejected: stage=")?
+        .split_once(" class=")?;
+    let stage = match stage {
+        "cluster" => "cluster",
+        "fenced_transition" => "fenced_transition",
+        "protected_roster_v2" => "protected_roster_v2",
+        _ => return None,
+    };
+    let error_class = match (stage, error_class) {
+        ("cluster", "ClusterFormationRejected") => "ClusterFormationRejected",
+        ("cluster", "EngineUnavailable") => "EngineUnavailable",
+        ("cluster", "StorageUnavailable") => "StorageUnavailable",
+        ("cluster", "RecoveryRequired") => "RecoveryRequired",
+        ("fenced_transition" | "protected_roster_v2", "BackendUnavailable") => "BackendUnavailable",
+        ("fenced_transition" | "protected_roster_v2", "CasIdempotencyOutcomeUnavailable") => {
+            "CasIdempotencyOutcomeUnavailable"
+        }
+        ("fenced_transition" | "protected_roster_v2", "BackendOperationOutcomeUnavailable") => {
+            "BackendOperationOutcomeUnavailable"
+        }
+        ("fenced_transition" | "protected_roster_v2", "LeaseLostOrInvalid") => "LeaseLostOrInvalid",
+        (_, "Other") => "Other",
+        _ => return None,
+    };
+    Some(ChildStderrDiagnostic::InitializationRejected { stage, error_class })
+}
+
+#[test]
+fn initialization_stderr_diagnostic_recognizes_only_closed_stage_classes() {
+    let directory = tempfile::tempdir().expect("diagnostic directory");
+    let path = directory.path().join("stderr.log");
+    let classes = [
+        ("cluster", "ClusterFormationRejected"),
+        ("cluster", "EngineUnavailable"),
+        ("cluster", "StorageUnavailable"),
+        ("cluster", "RecoveryRequired"),
+        ("cluster", "Other"),
+        ("fenced_transition", "BackendUnavailable"),
+        ("fenced_transition", "CasIdempotencyOutcomeUnavailable"),
+        ("fenced_transition", "BackendOperationOutcomeUnavailable"),
+        ("fenced_transition", "LeaseLostOrInvalid"),
+        ("fenced_transition", "Other"),
+        ("protected_roster_v2", "BackendUnavailable"),
+        ("protected_roster_v2", "CasIdempotencyOutcomeUnavailable"),
+        ("protected_roster_v2", "BackendOperationOutcomeUnavailable"),
+        ("protected_roster_v2", "LeaseLostOrInvalid"),
+        ("protected_roster_v2", "Other"),
+    ];
+    for (stage, error_class) in classes {
+        let mut bytes = b"synthetic-sensitive-body\xff\n".to_vec();
+        bytes.extend_from_slice(
+            format!("qualification initialization rejected: stage={stage} class={error_class}\n")
+                .as_bytes(),
+        );
+        std::fs::write(&path, bytes).expect("write diagnostic");
+        let diagnostic = ChildNode::stderr_diagnostic_at(&path);
+        assert_eq!(
+            diagnostic,
+            ChildStderrDiagnostic::InitializationRejected { stage, error_class },
+        );
+        assert!(!format!("{diagnostic:?}").contains("synthetic-sensitive-body"));
+    }
+    for invalid in [
+        b"qualification initialization rejected: stage=cluster class=BackendUnavailable".as_slice(),
+        b"qualification initialization rejected: stage=unknown class=Other",
+        b"qualification initialization rejected: stage=cluster class=Other synthetic-sensitive-body",
+        b"qualification initialization rejected: stage=fenced_transition class=Other\xff",
+        b"synthetic-sensitive-body",
+    ] {
+        std::fs::write(&path, invalid).expect("write invalid diagnostic");
+        assert_eq!(ChildNode::stderr_diagnostic_at(&path), ChildStderrDiagnostic::Redacted);
+    }
+}
+
+#[test]
+fn initialization_stderr_diagnostic_bounds_tail_and_skips_partial_first_line() {
+    let directory = tempfile::tempdir().expect("diagnostic directory");
+    let path = directory.path().join("stderr.log");
+    let marker = b"qualification initialization rejected: stage=cluster class=StorageUnavailable";
+    let mut bytes = vec![b'x'; 16 * 1024];
+    bytes.push(b'\n');
+    bytes.extend_from_slice(marker);
+    bytes.push(b'\n');
+    std::fs::write(&path, &bytes).expect("write oversized diagnostic");
+    assert_eq!(
+        ChildNode::stderr_diagnostic_at(&path),
+        ChildStderrDiagnostic::InitializationRejected {
+            stage: "cluster",
+            error_class: "StorageUnavailable",
+        },
+    );
+
+    // The capped tail starts with marker-shaped text embedded in an unrelated
+    // longer line. It must not be mistaken for a complete child marker.
+    let mut embedded = b"unrelated-prefix:".to_vec();
+    embedded.extend_from_slice(marker);
+    embedded.push(b'\n');
+    embedded.resize(b"unrelated-prefix:".len() + 8 * 1024, b'x');
+    std::fs::write(&path, &embedded).expect("write partial first line");
+    assert_eq!(
+        ChildNode::stderr_diagnostic_at(&path),
+        ChildStderrDiagnostic::Redacted
+    );
+
+    // A marker outside the retained tail supplies no observation.
+    let mut evicted = marker.to_vec();
+    evicted.push(b'\n');
+    evicted.extend_from_slice(&[b'x'; 16 * 1024]);
+    std::fs::write(&path, &evicted).expect("write evicted marker");
+    assert_eq!(
+        ChildNode::stderr_diagnostic_at(&path),
+        ChildStderrDiagnostic::Redacted
+    );
+}
+
+#[test]
+fn initialization_stderr_diagnostic_preserves_missing_empty_and_legacy_results() {
+    let directory = tempfile::tempdir().expect("diagnostic directory");
+    let path = directory.path().join("stderr.log");
+    assert_eq!(
+        ChildNode::stderr_diagnostic_at(&path),
+        ChildStderrDiagnostic::Unavailable
+    );
+    std::fs::write(&path, b" \n\t").expect("write empty diagnostic");
+    assert_eq!(
+        ChildNode::stderr_diagnostic_at(&path),
+        ChildStderrDiagnostic::Empty
+    );
+    std::fs::write(
+        &path,
+        b"qualification node open failed: consensus\nqualification node failed\n",
+    )
+    .expect("write legacy diagnostic");
+    assert_eq!(
+        ChildNode::stderr_diagnostic_at(&path),
+        ChildStderrDiagnostic::QualificationNodeConsensusFailed
+    );
 }
 
 /// Receive one child reply within the supplied absolute deadline. A zero-timeout
@@ -3080,9 +3226,13 @@ impl ChildNode {
     }
 
     fn stderr_diagnostic(&self) -> ChildStderrDiagnostic {
+        Self::stderr_diagnostic_at(&self.stderr_path)
+    }
+
+    fn stderr_diagnostic_at(stderr_path: &Path) -> ChildStderrDiagnostic {
         const MAX_STDERR_BYTES: u64 = 8 * 1024;
 
-        let Ok(mut file) = File::open(&self.stderr_path) else {
+        let Ok(mut file) = File::open(stderr_path) else {
             return ChildStderrDiagnostic::Unavailable;
         };
         let Ok(total_bytes) = file.metadata().map(|metadata| metadata.len()) else {
@@ -3101,13 +3251,24 @@ impl ChildNode {
         if bytes.iter().all(u8::is_ascii_whitespace) {
             return ChildStderrDiagnostic::Empty;
         }
+        let lines = bytes
+            .split(|byte| *byte == b'\n')
+            // A bounded tail can begin midway through an unrelated message.
+            .skip(usize::from(start != 0))
+            .filter(|line| !line.is_empty())
+            .collect::<Vec<_>>();
+        // Return only static vocabulary, even when other stderr is present.
+        // Raw backend messages and material never enter the parent panic.
+        if let Some(diagnostic) = lines
+            .iter()
+            .rev()
+            .find_map(|line| child_initialization_diagnostic(line))
+        {
+            return diagnostic;
+        }
         if start != 0 {
             return ChildStderrDiagnostic::Redacted;
         }
-        let lines = bytes
-            .split(|byte| *byte == b'\n')
-            .filter(|line| !line.is_empty())
-            .collect::<Vec<_>>();
         let allowed = lines.iter().all(|line| {
             *line == b"qualification node failed"
                 || *line == b"qualification node open failed: transport"
@@ -4130,7 +4291,11 @@ impl Fleet {
             match node.receive() {
                 QualificationNodeReply::Initialized => {}
                 QualificationNodeReply::Error { code } => {
-                    panic!("qualification initial fleet initialization rejected: {code:?}");
+                    panic!(
+                        "qualification initial fleet initialization rejected: node={}, code={code:?}, stderr={:?}",
+                        node.node_index,
+                        node.stderr_diagnostic()
+                    );
                 }
                 _ => panic!("qualification initial fleet initialization reply mismatch"),
             }
@@ -8332,7 +8497,24 @@ fn candidate_git_output(
         .env("GIT_TERMINAL_PROMPT", "0")
         .env("LC_ALL", "C")
         .current_dir(repository);
-    let output = bounded_candidate_git_command_output(&mut command, maximum_bytes)?;
+    // Closed labels identify the failing operation without emitting repository
+    // paths, arguments, environment, or source/output bytes.
+    let operation = match arguments {
+        ["rev-parse", "HEAD"] => "revision",
+        ["rev-parse", ..] => "rev-parse",
+        ["status", ..] => "status",
+        ["diff", ..] => "tracked-diff",
+        ["ls-files", "--others", ..] => "untracked-paths",
+        ["ls-files", ..] => "index",
+        _ => "other",
+    };
+    let output =
+        bounded_candidate_git_command_output(&mut command, maximum_bytes).map_err(|error| {
+            io::Error::new(
+                error.kind(),
+                format!("candidate Git operation={operation}: {error}"),
+            )
+        })?;
     if !output.status.success() || !output.stderr.is_empty() {
         return Err(io::Error::other("candidate source state is unavailable"));
     }
@@ -8350,6 +8532,48 @@ struct BoundedCandidateGitOutput {
     stdout: Vec<u8>,
     stderr: Vec<u8>,
 }
+
+/// Last observed completion state before cleanup, not a post-cleanup outcome.
+/// A collected empty pipe is `Some(0)`; an uncollected pipe is `None`.
+#[derive(Debug)]
+struct CandidateGitTimeout {
+    elapsed_ms: u128,
+    spawned_ms: u128,
+    readers_ready_ms: u128,
+    executable_busy_retries: u32,
+    leader_exit_success: Option<bool>,
+    stdout_collected_bytes: Option<usize>,
+    stderr_collected_bytes: Option<usize>,
+    // None means the reader was already joined. Some samples its finished
+    // flag at the timeout cutoff without adding a blocking join or I/O.
+    stdout_reader_finished: Option<bool>,
+    stderr_reader_finished: Option<bool>,
+    cleanup_failed: bool,
+}
+
+impl std::fmt::Display for CandidateGitTimeout {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "candidate Git command exceeded fixed runtime: elapsed_ms={} spawned_ms={} \
+             readers_ready_ms={} executable_busy_retries={} leader_exit_success={:?} \
+             stdout_collected_bytes={:?} stderr_collected_bytes={:?} \
+             stdout_reader_finished={:?} stderr_reader_finished={:?} cleanup_failed={}",
+            self.elapsed_ms,
+            self.spawned_ms,
+            self.readers_ready_ms,
+            self.executable_busy_retries,
+            self.leader_exit_success,
+            self.stdout_collected_bytes,
+            self.stderr_collected_bytes,
+            self.stdout_reader_finished,
+            self.stderr_reader_finished,
+            self.cleanup_failed,
+        )
+    }
+}
+
+impl std::error::Error for CandidateGitTimeout {}
 
 struct CandidateGitPipeReader {
     reader: Option<JoinHandle<io::Result<Vec<u8>>>>,
@@ -8375,7 +8599,8 @@ fn bounded_candidate_git_command_output(
     command: &mut Command,
     maximum_stdout_bytes: u64,
 ) -> io::Result<BoundedCandidateGitOutput> {
-    let deadline = Instant::now() + CANDIDATE_GIT_COMMAND_TIMEOUT;
+    let started = Instant::now();
+    let deadline = started + CANDIDATE_GIT_COMMAND_TIMEOUT;
     // This creates a fresh process group before exec whose PGID is exactly
     // the child PID; only that freshly-created group is ever signalled below.
     command.process_group(0);
@@ -8383,6 +8608,7 @@ fn bounded_candidate_git_command_output(
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
+    let mut executable_busy_retries = 0_u32;
     let mut child = loop {
         match command.spawn() {
             Ok(child) => break child,
@@ -8390,6 +8616,7 @@ fn bounded_candidate_git_command_output(
                 if error.raw_os_error() == Some(LINUX_EXECUTABLE_FILE_BUSY_OS_ERROR)
                     && Instant::now() < deadline =>
             {
+                executable_busy_retries = executable_busy_retries.saturating_add(1);
                 // GitHub-hosted storage can transiently retain an external
                 // writable reference to a newly published executable. Retry
                 // only Linux ETXTBSY and charge every retry to the existing
@@ -8405,6 +8632,7 @@ fn bounded_candidate_git_command_output(
             Err(error) => return Err(error),
         }
     };
+    let spawned_ms = started.elapsed().as_millis();
     let process_group = rustix::process::Pid::from_child(&child);
     let stop_readers = Arc::new(AtomicBool::new(false));
     let stdout = match child.stdout.take() {
@@ -8470,6 +8698,7 @@ fn bounded_candidate_git_command_output(
             return Err(io::Error::other("start bounded candidate Git pipe reader"));
         }
     };
+    let readers_ready_ms = started.elapsed().as_millis();
     let mut status = None;
     let mut stdout = None;
     let mut stderr = None;
@@ -8527,13 +8756,26 @@ fn bounded_candidate_git_command_output(
             });
         }
         if Instant::now() >= deadline {
-            return candidate_git_fail_closed(
+            let mut timeout = CandidateGitTimeout {
+                elapsed_ms: started.elapsed().as_millis(),
+                spawned_ms,
+                readers_ready_ms,
+                executable_busy_retries,
+                leader_exit_success: status.as_ref().map(std::process::ExitStatus::success),
+                stdout_collected_bytes: stdout.as_ref().map(Vec::len),
+                stderr_collected_bytes: stderr.as_ref().map(Vec::len),
+                stdout_reader_finished: readers[0].reader.as_ref().map(JoinHandle::is_finished),
+                stderr_reader_finished: readers[1].reader.as_ref().map(JoinHandle::is_finished),
+                cleanup_failed: false,
+            };
+            timeout.cleanup_failed = terminate_candidate_git_process_group(
                 &mut child,
                 process_group,
                 &stop_readers,
                 &mut readers,
-                "candidate Git command exceeded fixed runtime",
-            );
+            )
+            .is_err();
+            return Err(io::Error::other(timeout));
         }
         thread::sleep(CANDIDATE_GIT_PIPE_POLL);
     }
@@ -11805,19 +12047,27 @@ fn bounded_candidate_git_runner_kills_pipe_holding_term_resistant_descendant() {
     let helper = workspace.path().join("fake-git");
     let descendant_pid = workspace.path().join("descendant.pid");
     let leader_pid = workspace.path().join("leader.pid");
+    let descendant_ready = workspace.path().join("descendant.ready");
     write_candidate_git_helper_script(
         &helper,
-        b"#!/bin/sh\nprintf '%s' \"$$\" > \"$2\"\n(\n  trap '' TERM\n  while :; do sleep 1; done\n) &\ndescendant=$!\nprintf '%s' \"$descendant\" > \"$1\"\nexit 0\n",
+        b"#!/bin/sh\nprintf '%s' \"$$\" > \"$2\"\n(\n  trap '' TERM\n  : > \"$3\"\n  while :; do sleep 1; done\n) &\ndescendant=$!\nprintf '%s' \"$descendant\" > \"$1\"\nwhile [ ! -f \"$3\" ]; do sleep 0.01; done\nexit 0\n",
     );
 
     let started = Instant::now();
     let result = bounded_candidate_git_command_output(
-        Command::new(&helper).arg(&descendant_pid).arg(&leader_pid),
+        Command::new(&helper)
+            .arg(&descendant_pid)
+            .arg(&leader_pid)
+            .arg(&descendant_ready),
         64,
     );
     assert!(
         result.is_err(),
         "a descendant-held pipe must hit the deadline"
+    );
+    assert!(
+        descendant_ready.is_file(),
+        "descendant installed its TERM trap before leader exit"
     );
     assert!(
         started.elapsed()
@@ -11850,6 +12100,73 @@ fn bounded_candidate_git_runner_kills_pipe_holding_term_resistant_descendant() {
         candidate_git_process_is_gone(observed_descendant_pid),
         "owned process-group SIGKILL leaves the exact parent-recorded descendant PID gone after its leader exits"
     );
+
+    // Check observations only after the original deadline and owned-process
+    // assertions, including when a removal control corrupts the observations.
+    let error = result.err().expect("descendant-held pipes fail closed");
+    let timeout = error
+        .get_ref()
+        .and_then(|error| error.downcast_ref::<CandidateGitTimeout>())
+        .expect("retain the timeout completion state");
+    assert_eq!(timeout.leader_exit_success, Some(true));
+    assert_eq!(timeout.stdout_collected_bytes, None);
+    assert_eq!(timeout.stderr_collected_bytes, None);
+    assert_eq!(timeout.stdout_reader_finished, Some(false));
+    assert_eq!(timeout.stderr_reader_finished, Some(false));
+    assert!(timeout.elapsed_ms >= CANDIDATE_GIT_COMMAND_TIMEOUT.as_millis());
+    assert!(timeout.spawned_ms <= timeout.readers_ready_ms);
+    assert!(timeout.readers_ready_ms <= timeout.elapsed_ms);
+    // The existing cleanup may report a cancelled pipe reader while SIGKILL
+    // is still closing the descendant's descriptors. Preserve that result;
+    // the exact descendant PID and original cleanup bound are asserted above.
+}
+
+#[test]
+fn bounded_candidate_git_runner_identifies_live_leader_after_both_pipes_close() {
+    let workspace = tempfile::tempdir().expect("create closed-pipe helper workspace");
+    let helper = workspace.path().join("fake-git");
+    let leader_pid = workspace.path().join("leader.pid");
+    write_candidate_git_helper_script(
+        &helper,
+        b"#!/bin/sh\ntrap '' TERM\nexec 1>&-\nexec 2>&-\nprintf '%s' \"$$\" > \"$1\"\nwhile :; do sleep 1; done\n",
+    );
+
+    let started = Instant::now();
+    let result = bounded_candidate_git_command_output(Command::new(&helper).arg(&leader_pid), 64);
+    assert!(
+        started.elapsed()
+            < CANDIDATE_GIT_COMMAND_TIMEOUT
+                + CANDIDATE_GIT_TERMINATE_GRACE
+                + CANDIDATE_GIT_TERMINATE_GRACE
+                + Duration::from_secs(1),
+        "closed pipes cannot extend the original process deadline and cleanup bound"
+    );
+    let observed_leader_pid = fs::read_to_string(&leader_pid)
+        .expect("leader reported its pid after closing both pipes")
+        .trim()
+        .parse::<u32>()
+        .expect("leader pid is numeric");
+    assert!(
+        candidate_git_process_is_gone(observed_leader_pid),
+        "owned live leader was killed and reaped despite both pipes already closing"
+    );
+
+    let error = result
+        .err()
+        .expect("closed pipes cannot complete a live leader");
+    let timeout = error
+        .get_ref()
+        .and_then(|error| error.downcast_ref::<CandidateGitTimeout>())
+        .expect("retain the timeout completion state");
+    assert_eq!(timeout.leader_exit_success, None);
+    assert_eq!(timeout.stdout_collected_bytes, Some(0));
+    assert_eq!(timeout.stderr_collected_bytes, Some(0));
+    assert_eq!(timeout.stdout_reader_finished, None);
+    assert_eq!(timeout.stderr_reader_finished, None);
+    assert!(!timeout.cleanup_failed);
+    assert!(timeout.elapsed_ms >= CANDIDATE_GIT_COMMAND_TIMEOUT.as_millis());
+    assert!(timeout.spawned_ms <= timeout.readers_ready_ms);
+    assert!(timeout.readers_ready_ms <= timeout.elapsed_ms);
 }
 
 #[test]
@@ -11890,7 +12207,7 @@ fn v9_external_namespace_is_owner_private_nofollow_and_no_clobber() {
 fn v9_snapshot_campaign_and_leaf_are_private_and_descriptor_pinned_across_replacement() {
     let _fleet = FLEET_TEST_LOCK
         .lock()
-        .expect("serialize V9 snapshot namespace creation");
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
     let workspace = tempfile::tempdir().expect("create V9 snapshot workspace");
     let root = workspace.path().join("fs-verity-root");
     fs::create_dir(&root).expect("create V9 snapshot root");

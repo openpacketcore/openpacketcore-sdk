@@ -652,6 +652,18 @@ child may be live or unresolved for that default. This is a separate bounded
 profile, not general mixed-selector or arbitrary subset admission. Legacy
 `Fresh`, whole-set reuse and single-bearer reattach checks remain unchanged.
 
+`reconcile_bearer_under_active_parent` is an alternative when a consumer has
+the complete parent descriptor but needs no separately returned parent claim.
+Under the same fenced operation lease, the coordinator reads the protected
+ledger, resolves the exact authenticated Active issuance descriptor, and
+performs the existing parent backend qualification before child admission.
+It MUST NOT install, repair or reattach a parent, accept a marked parent, or
+reuse a cached admission across operations. The concurrent entry point reserves
+the parent, child and overlapping selectors before resolution. All original
+child transitions, fresh durable readbacks, supervised cancellation semantics
+and failure recovery remain mandatory. A failed final readback or lease release
+MUST NOT publish a successful child claim, even if its effect is recoverable.
+
 The complete canonical P/M/T atoms and group fingerprints remain unchanged.
 For this profile only, the child reserves its T atom and a B atom whose payload
 is the concatenation of the framed canonical P and full-mask M atoms. This

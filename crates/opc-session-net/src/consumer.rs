@@ -5902,6 +5902,10 @@ where
 /// handle's deterministic cursor and attempt cap.
 trait PreparedFencedTransitionWrapperFactory: Send + Sync {
     fn wrap(&self, physical: Arc<dyn SessionBackend>) -> Arc<dyn SessionBackend>;
+
+    /// The durable #701 journal this factory binds, cloned (never reopened)
+    /// so an upgraded protected V2 facade can reject retained V1 IDs.
+    fn journal(&self) -> Arc<PreparedFencedTransitionJournal>;
 }
 
 struct LocalAeadPreparedFencedTransitionWrapper<P: ?Sized> {
@@ -5924,6 +5928,10 @@ where
             .with_fenced_transition_journal(Arc::clone(&self.journal)),
         )
     }
+
+    fn journal(&self) -> Arc<PreparedFencedTransitionJournal> {
+        Arc::clone(&self.journal)
+    }
 }
 
 struct RemoteSealPreparedFencedTransitionWrapper<S: ?Sized> {
@@ -5945,6 +5953,10 @@ where
             )
             .with_fenced_transition_journal(Arc::clone(&self.journal)),
         )
+    }
+
+    fn journal(&self) -> Arc<PreparedFencedTransitionJournal> {
+        Arc::clone(&self.journal)
     }
 }
 
@@ -11458,6 +11470,54 @@ impl PersistentSessionConsumerV2Pool {
         .await
     }
 
+    /// Execute one V2 operation whose complete lifetime is also bounded by a
+    /// caller-owned absolute deadline.
+    ///
+    /// This is the protected V2 facade's physical-attempt boundary. The lane
+    /// actor enforces the deadline itself and classifies the result from its
+    /// own write observation, so the caller never has to cancel an effectful
+    /// Call to bound it. The ordinary operation timeout still applies.
+    async fn execute_before(
+        self: &Arc<Self>,
+        request: &SessionConsumerV2Request,
+        caller_deadline: tokio::time::Instant,
+    ) -> Result<SessionConsumerV2Response, PersistentSessionConsumerV2ExecuteError> {
+        self.ensure_idle_reaper();
+        if request.scope() != self.client.scope() || request.validate().is_err() {
+            return Err(PersistentSessionConsumerV2ExecuteError::NotTransmitted {
+                cause: SessionConsumerClientError::Protocol,
+            });
+        }
+        let started = tokio::time::Instant::now();
+        let deadline = started
+            .checked_add(effective_consumer_operation_timeout(
+                self.client.operation_timeout,
+            ))
+            .ok_or(PersistentSessionConsumerV2ExecuteError::NotTransmitted {
+                cause: SessionConsumerClientError::Deadline,
+            })?
+            .min(caller_deadline);
+        if deadline <= started {
+            return Err(PersistentSessionConsumerV2ExecuteError::NotTransmitted {
+                cause: SessionConsumerClientError::Deadline,
+            });
+        }
+        let (pre_request_deadline, pre_request_budget_active) =
+            self.client.pre_request_deadline(started, deadline);
+        self.execute_with_attempt_budget(
+            request,
+            started,
+            pre_request_deadline,
+            pre_request_budget_active,
+            deadline,
+            matches!(
+                request.operation(),
+                SessionConsumerV2Operation::FencedTransitionV2Status { .. }
+            ),
+        )
+        .await
+    }
+
     /// Execute one fresh V2 attempt within a caller-owned absolute deadline.
     ///
     /// The outer attempt budget owns retries. This one attempt either checks
@@ -14516,6 +14576,21 @@ impl PersistentSessionConsumerClient {
             });
         }
         self.v2_pool.execute(request).await
+    }
+
+    /// Net-private V2 call for the protected V2 facade whose lifetime is also
+    /// bounded by the facade's physical-attempt deadline.
+    pub(crate) async fn execute_v2_before(
+        &self,
+        request: &SessionConsumerV2Request,
+        deadline: tokio::time::Instant,
+    ) -> Result<SessionConsumerV2Response, PersistentSessionConsumerV2ExecuteError> {
+        if self.fenced_mutation_roster_transport_enabled() {
+            return Err(PersistentSessionConsumerV2ExecuteError::NotTransmitted {
+                cause: SessionConsumerClientError::Protocol,
+            });
+        }
+        self.v2_pool.execute_before(request, deadline).await
     }
 
     /// Return the ALPN-specific V2 idle-pool diagnostics within the shared
@@ -20866,6 +20941,19 @@ where
         Err(error) => Err(ProtocolError::Io(error)),
     }
 }
+mod prepared_fenced_v2;
+
+pub use prepared_fenced_v2::{
+    ActivatedSessionConsumerFencedTransitionV2Voters,
+    SessionConsumerFencedTransitionV2ReclaimReport, SessionConsumerFencedTransitionV2ReleaseError,
+    SessionConsumerPreparedFencedTransitionV2, SessionConsumerPreparedFencedTransitionV2Backend,
+    SessionConsumerPreparedFencedTransitionV2BackendError,
+    SessionConsumerRecoveredFencedTransition, SessionConsumerRecoveredFencedTransitionV2Status,
+};
+
+#[cfg(test)]
+mod payload_profile;
+
 #[cfg(test)]
 mod tests {
     use std::io;

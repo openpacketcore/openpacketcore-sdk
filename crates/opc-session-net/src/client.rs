@@ -4598,11 +4598,6 @@ mod tests {
             )
             .await
             .expect("fixture lease");
-        let listener = TcpListener::bind("127.0.0.1:0")
-            .await
-            .expect("reserve unreachable address");
-        let unreachable = listener.local_addr().expect("unreachable address");
-        drop(listener);
         let (server_addr, server) = response_loss_server().await;
         let resolutions = Arc::new(AtomicUsize::new(0));
         let resolver: RemoteAddrResolver = {
@@ -4611,7 +4606,13 @@ mod tests {
                 let attempt = resolutions.fetch_add(1, Ordering::SeqCst);
                 async move {
                     if attempt == 0 {
-                        Ok(unreachable)
+                        // A released port can be reassigned to this server or
+                        // another concurrent test. Inject the pretransmission
+                        // I/O failure before returning a live endpoint.
+                        Err(io::Error::new(
+                            io::ErrorKind::ConnectionRefused,
+                            "synthetic pretransmission failure",
+                        ))
                     } else {
                         Ok(server_addr)
                     }
@@ -4630,7 +4631,7 @@ mod tests {
                 .await,
             Err(StoreError::BackendOperationOutcomeUnavailable)
         ));
-        assert!(resolutions.load(Ordering::SeqCst) >= 2);
+        assert_eq!(resolutions.load(Ordering::SeqCst), 2);
         assert_eq!(server.await.expect("response-loss server"), 1);
     }
 

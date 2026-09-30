@@ -3784,7 +3784,9 @@ impl std::io::Write for BoundedFrameBuffer<'_> {
         }
         let mut remaining = buf;
         while !remaining.is_empty() {
-            self.check_control()?;
+            // The entry check covers the first copy. Recheck between later
+            // copies below, preserving one probe per serializer write and
+            // per retained chunk without probing twice before any copy.
             let needs_chunk = self
                 .frame
                 .chunks
@@ -3804,6 +3806,9 @@ impl std::io::Write for BoundedFrameBuffer<'_> {
                 .copy_from_slice(&remaining[..copied]);
             chunk.initialized += copied;
             remaining = &remaining[copied..];
+            if !remaining.is_empty() {
+                self.check_control()?;
+            }
         }
         self.frame.encoded_len = attempted;
         Ok(buf.len())
@@ -6825,6 +6830,66 @@ mod tests {
             serde::ser::SerializeSeq::serialize_element(&mut sequence, &1_u8)?;
             serde::ser::SerializeSeq::end(sequence)
         }
+    }
+
+    struct CancelAfterSerialization<'a> {
+        cancellation: &'a AtomicBool,
+    }
+
+    impl Serialize for CancelAfterSerialization<'_> {
+        fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+        where
+            S: serde::Serializer,
+        {
+            let result = 0_u8.serialize(serializer)?;
+            self.cancellation.store(true, Ordering::Release);
+            Ok(result)
+        }
+    }
+
+    #[tokio::test]
+    async fn bounded_writer_rejects_deadline_during_serialization_before_prefix() {
+        let mut output = Vec::new();
+        let error = write_frame_bounded_until_classified(
+            &mut output,
+            &PauseMidSerialization,
+            MIN_NEGOTIATED_FRAME_SIZE,
+            tokio::time::Instant::now() + Duration::from_millis(1),
+        )
+        .await
+        .expect_err("serialization cannot exceed the original write deadline");
+        assert!(matches!(
+            error,
+            FrameWriteError::BeforeWrite(ProtocolError::Io(ref error))
+                if error.kind() == std::io::ErrorKind::TimedOut
+        ));
+        assert!(output.is_empty());
+    }
+
+    #[tokio::test]
+    async fn bounded_writer_rejects_cancellation_after_last_serialized_byte_before_prefix() {
+        let cancellation = AtomicBool::new(false);
+        let progress = FrameWriteProgress::new();
+        let mut output = Vec::new();
+        let error = write_frame_bounded_until_cancellable_classified_with_progress(
+            &mut output,
+            &CancelAfterSerialization {
+                cancellation: &cancellation,
+            },
+            MIN_NEGOTIATED_FRAME_SIZE,
+            tokio::time::Instant::now() + Duration::from_secs(1),
+            &cancellation,
+            &progress,
+        )
+        .await
+        .expect_err("post-encoding cancellation cannot emit a prefix");
+        assert!(matches!(
+            error,
+            FrameWriteError::BeforeWrite(ProtocolError::Io(ref error))
+                if error.kind() == std::io::ErrorKind::Interrupted
+        ));
+        assert!(!progress.accepted_any());
+        assert!(output.is_empty());
     }
 
     #[derive(Default)]

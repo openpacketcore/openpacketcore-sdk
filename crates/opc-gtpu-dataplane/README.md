@@ -90,6 +90,35 @@ preserve message-specific response tuples and require the exact receiving
 socket; admission and aggregate rate policy remain with the caller. This
 does not yet expose Linux kernel-GTP sockets or qualify backend parity,
 End Marker ordering or N3 forwarding.
+On an eBPF attachment, `try_receive_downlink` on the same port is the
+backend-authoritative consumer for kernel-reassembled and handed-off G-PDUs:
+it authorizes against the backend's own grouped and v5 maps (commit read
+last) and returns the exact inner packet and bearer mark, or a value-free
+drop. With an optional per-context `GtpPdpContext::downlink_inner_mtu`, tc
+steers an over-MTU DF downlink IPv4 packet to a dedicated backend-owned queue
+instead of letting the host drop it with its own error. The consumer then
+applies the context's RFC 4459 policy:
+
+- **Default** (`GtpuDownlinkInnerMtu::new`): clear DF and fragment the inner
+  packet before encapsulation (RFC 4459 section 3.4). `try_receive_downlink`
+  returns RFC 791 fragments of at most the MTU, with the bearer mark, for the
+  caller to inject toward XFRM; the UE reassembles them. Fragmenting a DF
+  datagram is an owner-approved deviation from RFC 791, RFC 1191 and RFC 6864
+  DF semantics, and the originator's PMTUD never learns the tunnel MTU.
+- **Opt-in** (`GtpuDownlinkInnerMtu::in_tunnel_packet_too_big`): drop the
+  packet and signal it at most once inside the UE's default-bearer uplink
+  G-PDU (RFC 1191). The error's source is the subscriber's own PAA, the only
+  address the PGW's anti-spoofing admits; this departs from RFC 1812 4.3.2.4,
+  and the originator attributes the error to the subscriber.
+
+Inner IPv6 contexts refuse both policies: IPv6 has no in-network
+fragmentation (RFC 8200).
+
+Open the control port before installing an MTU-bearing context, and keep
+draining it. While its queues are not bound, the kernel may answer steered
+packets with rate-limited ICMP Port Unreachable toward the peer (#1019). MTU-bearing
+contexts must be drained before an SDK downgrade. See
+[control port](docs/control-port.md).
 
 - `GtpuDataplaneBackend`: async port for device and PDP lifecycle, typed PDP
   readback, classified installation, authority-safe exact removal, and probes.
@@ -146,7 +175,11 @@ End Marker ordering or N3 forwarding.
   backend-neutral parser can represent (including IPv4 and IPv6 semantics),
   and returns a pre-existing bearer mark or a silent drop. The unfiltered
   bearer is the explicit default fallback; absent one, no-match, malformed,
-  fragmented, unsafe-to-parse, and foreign-PAA packets drop.
+  fragmented, unsafe-to-parse, and foreign-PAA packets drop. Its typed
+  `TftUplinkPaaSet` holds at most one IPv4 `/32` and one canonical IPv6
+  `/64`; any inner source inside the IPv6 prefix matches, and an IPv4v6 PDN
+  uses one classifier for both families. The native eBPF ABI remains
+  IPv4-only and rejects an IPv6 or dual-family set.
   `GtpuDataplaneBackend::tft_uplink_classification_capability` is separate from
   `per_bearer_marking`: a backend must not advertise it until its actual
   dataplane program and exact readback ABI support it. The deterministic mock
@@ -907,10 +940,50 @@ peer contract. Missing state is never interpreted as `Any`.
 install. The eBPF adapter derives the rest of the public
 `GtpuDownlinkEndpoint` from the request's peer, the managed device's concrete
 local address, and the attachment ifindex. The semantic API accepts canonical
-IPv4 or IPv6 endpoint pairs so adapters can share one contract. The legacy
-single-context eBPF API remains IPv4-only. The grouped-session API and current
-tc object support independent inner and outer IPv4/IPv6 families, including
-cross-family transport and simultaneous IPv4v6 entries.
+IPv4 or IPv6 endpoint pairs so adapters can share one contract. The
+grouped-session API and current tc object support independent inner and outer
+IPv4/IPv6 families, including cross-family transport and simultaneous IPv4v6
+entries.
+
+### Inner IPv6 on an ordinary attachment
+
+The single-context PDP API (`install_pdp_context`,
+`install_pdp_context_classified`, `read_pdp_context`, `remove_pdp_context`,
+`remove_pdp_context_exact`) accepts an IPv6 `ms_address` on an ordinary eBPF
+attachment when `pdp_inner_ipv6_capability()` reports `Available`. The address
+must be the PDN connection's canonical `/64` prefix with a zero interface
+identifier (TS 23.401 clause 5.3.1.2.2, TS 29.274 clause 8.14); readback returns
+that canonical form. tc selects uplink traffic by the inner source `/64` plus
+the complete packet mark, so temporary and privacy addresses (RFC 8981) inside
+the prefix match, and decapsulates downlink only toward a destination inside
+it. The peer must use the attachment's IPv4 S2b-U family: inner IPv6 is carried
+over IPv4 GTP-U transport, and an IPv6 peer is `UnsupportedFeature`.
+
+An IPv4v6 PDN connection is two family-scoped contexts that may share the
+bearer's local and peer TEIDs, peer, mark, DSCP, and source-port policies.
+`PdpContextLocalTeidSelector` and `RemovePdpContextRequest` carry the address
+family, so reading or removing one family never touches the other.
+
+Each IPv6 context is stored in the family-tagged tc authority as one
+single-entry record and exactly its uplink and downlink selectors, under the
+ordinary per-device writer gate; IPv4 contexts keep their byte-exact v5 maps.
+The first IPv6 install publishes the attachment's IPv4 endpoint and a random
+device identity in `GTPU_CONFIG6` and then `GTPU_SCHEMA6`. The removal that
+drains the last IPv6 record, selector and journal retires both (schema, then
+config), so a drained attachment is identical to one that never carried inner
+IPv6 and legacy terminal-successor recovery accepts it. Publication writes the
+downlink selector, the uplink selector, then the record, so tc drops rather
+than falls back while it is incomplete; removal deletes the record, the uplink
+selector, then the downlink selector. The downlink selector is thus present in
+every interrupted state, and the family-scoped removal by local TEID always
+reaches the whole residue. An interrupted publication, removal or retirement
+reads back as indeterminate and is completed by the next ordinary install or
+family-scoped removal. Cleanup-only recovery accepts this ordinary family
+authority (its own IPv4 endpoint, no IPv6 endpoint, no grouped journal),
+including a config-only authority left between the two initialization writes,
+and removes stale IPv6 contexts exactly. Outer-IPv4 fragments carrying an inner
+IPv6 G-PDU are passed to the host, as for the grouped path, and are not
+reassembled into the datapath.
 
 After the complete outer IPv4/UDP/GTP-U envelope has passed its existing
 structural and checksum checks, the tc ingress program selects exactly one
@@ -2285,6 +2358,17 @@ selector, so unrelated default PAAs may use the same numeric mark. Legacy
 canonical fingerprints and `Fresh` mark reservations are unchanged. The
 protected `OPCSN18` ledger records the immutable child-parent relationship;
 parent retirement waits for exact child retirement.
+
+When the caller needs no separate parent capability, use
+`reconcile_bearer_under_active_parent` with the complete parent and child
+groups. It resolves the exact existing Active parent inside the child
+operation's fenced lease, eliminating a separate `recover_active` operation.
+The protected parent descriptor and fresh backend qualification remain
+mandatory, as do all three child writes and their durable readbacks. Missing,
+changed, marked or retired parents are refused; this entry point cannot repair
+or reattach a parent. The concurrent operations handle reserves both groups
+and all conflicting selectors before resolution. Cancellation detaches only
+the observer, and independent groups retain the same bounded progress rules.
 
 Use the ordinary exact child recovery and retirement operations after a failed
 or cancelled call. Mark reuse requires source quiescence and a fresh local TEID;

@@ -9005,8 +9005,16 @@ impl SqliteSessionBackend {
         #[cfg(test)]
         self.fixed_quorum_durable_check_count
             .fetch_add(1, Ordering::SeqCst);
+        #[cfg(all(test, target_os = "linux"))]
+        use crate::consensus::store::scoped_read_diagnostics::{self as diagnostic, Phase, Span};
+        #[cfg(all(test, target_os = "linux"))]
+        let connection_wait = Span::start(Phase::SqlScopeConnection);
         let conn = self.conn.lock().await;
-        self.with_application_cache_read(&conn, || {
+        #[cfg(all(test, target_os = "linux"))]
+        connection_wait.finish(diagnostic::Outcome::Ready);
+        #[cfg(all(test, target_os = "linux"))]
+        let guarded_query = Span::start(Phase::SqlScopeGuardAndQuery);
+        let result = self.with_application_cache_read(&conn, || {
             let authority_profile = read_consensus_authority_profile_sync(&conn)
                 .map_err(|_| MembershipScopeMutationError::CorruptState)?;
             let placement_policy = read_fixed_placement_policy_sync(&conn)
@@ -9015,8 +9023,10 @@ impl SqliteSessionBackend {
             let membership = read_membership_sync(&conn, storage_identity)
                 .map_err(|_| MembershipScopeMutationError::CorruptState)?;
             Ok((authority_profile, placement_policy, scope, membership))
-        })
-        .map_err(|_| MembershipScopeMutationError::CorruptState)?
+        });
+        #[cfg(all(test, target_os = "linux"))]
+        guarded_query.finish(diagnostic::guarded_result(&result));
+        result.map_err(|_| MembershipScopeMutationError::CorruptState)?
     }
 
     /// Atomically read the durable transition scope, exact evidence, and

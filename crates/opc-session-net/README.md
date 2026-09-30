@@ -896,6 +896,23 @@ interval. No retained encoded-JSON byte store can exceed the budget. Deadline
 expiry terminates the connection and releases its handler/connection permit,
 so an authenticated slow reader cannot retain a server slot indefinitely.
 
+The bounded encoder checks control at entry to every serializer write and
+between retained chunk copies. The entry check covers the first copy; a second
+probe immediately before that same copy adds no cooperative cancellation
+boundary. Post-serialization and pre-prefix checks still reject expiration or
+cancellation without emitting bytes. Chunk sizes, retained-byte ceilings, wire
+bytes and the original absolute deadline are unchanged.
+
+The synthetic `consumer::payload_profile::encrypted_get_response_local_stage_profile`
+test reports separate local encode, strict decode and payload-crypto samples.
+Set `OPC_CONSUMER_PAYLOAD_PROFILE_CYCLES=100` and run it alone with
+`cargo test --release --locked -p opc-session-net --lib --features test-control consumer::payload_profile::encrypted_get_response_local_stage_profile -- --exact --nocapture --test-threads=1`.
+Record the optimization profile and host conditions when comparing revisions.
+The default is one cycle for correctness gates. These local stages exclude TLS
+and quorum; strict decoding includes parsing and canonical reserialization, so
+nested stage times must not be added. They do not establish request latency or
+deployment capacity.
+
 Response families use these fail-closed rules:
 
 | Family | Oversize backend/output behavior |
