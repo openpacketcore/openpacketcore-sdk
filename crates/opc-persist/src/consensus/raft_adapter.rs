@@ -42,6 +42,7 @@ pub(crate) struct ConfigRaftNetworkFactory {
     local_node_id: ConsensusNodeId,
     peers: Arc<BTreeMap<ConsensusNodeId, Arc<dyn ConsensusPeer>>>,
     capacity_profile: opc_crypto::ConfigCapacityProfile,
+    append_encoding: Option<Arc<tokio::sync::Mutex<()>>>,
 }
 
 impl ConfigRaftNetworkFactory {
@@ -62,6 +63,8 @@ impl ConfigRaftNetworkFactory {
             local_node_id,
             peers: Arc::new(peers),
             capacity_profile,
+            append_encoding: (capacity_profile == opc_crypto::ConfigCapacityProfile::BoundedV1)
+                .then(|| Arc::new(tokio::sync::Mutex::new(()))),
         })
     }
 }
@@ -86,6 +89,7 @@ impl RaftNetworkFactory<ConfigRaftTypeConfig> for ConfigRaftNetworkFactory {
             identity: self.identity,
             local_node_id: self.local_node_id,
             target,
+            append_encoding: self.append_encoding.clone(),
             peer: self
                 .peers
                 .get(&target)
@@ -101,6 +105,17 @@ pub(crate) struct ConfigRaftNetwork {
     local_node_id: ConsensusNodeId,
     target: ConsensusNodeId,
     peer: Option<Arc<dyn ConsensusPeer>>,
+    append_encoding: Option<Arc<tokio::sync::Mutex<()>>>,
+}
+
+// Fields drop in declaration order, including on cancellation and unwinding.
+// Retire the actual typed request before another client may create its output.
+struct AppendEncoding<'a> {
+    #[cfg(feature = "dangerous-test-hooks")]
+    request: super::capacity_observation::raft_buffers::OriginalAppend,
+    #[cfg(not(feature = "dangerous-test-hooks"))]
+    request: AppendEntriesRequest<ConfigRaftTypeConfig>,
+    _guard: Option<tokio::sync::MutexGuard<'a, ()>>,
 }
 
 impl fmt::Debug for ConfigRaftNetwork {
@@ -143,7 +158,17 @@ impl ConfigRaftNetwork {
             ConsensusWireRequest::try_new(self.identity, self.local_node_id, family, payload)
                 .map_err(|error| EngineRpcError::Unreachable(Unreachable::new(&error)))?;
         let ttl = option.hard_ttl();
-        let response = match tokio::time::timeout(ttl, peer.call(wire)).await {
+        #[cfg(feature = "dangerous-test-hooks")]
+        let timeout_before = tokio::time::Instant::now();
+        let response = tokio::time::timeout(ttl, peer.call(wire));
+        #[cfg(feature = "dangerous-test-hooks")]
+        let response = super::capacity_observation::raft_buffers::scope_rpc_deadline(
+            ttl,
+            timeout_before,
+            tokio::time::Instant::now(),
+            response,
+        );
+        let response = match response.await {
             Err(_) => {
                 return Err(EngineRpcError::Timeout(Timeout {
                     action,
@@ -172,18 +197,41 @@ impl ConfigRaftNetwork {
     #[allow(clippy::result_large_err)]
     async fn append(
         &self,
-        request: &AppendEntriesRequest<ConfigRaftTypeConfig>,
+        request: AppendEntriesRequest<ConfigRaftTypeConfig>,
         option: RPCOption,
     ) -> Result<AppendEntriesResponse<ConsensusNodeId>, EngineRpcError> {
         #[cfg(feature = "dangerous-test-hooks")]
-        let original = super::capacity_observation::raft_buffers::OriginalAppend::start(
+        let request = super::capacity_observation::raft_buffers::OriginalAppend::start(
             self.identity,
             self.local_node_id,
             self.target,
             request,
         );
-        let entry_count = request.entries.len();
-        let payload = match encode_config_wire_for_profile(self.capacity_profile, request) {
+        // All clients and later clients from the same factory share this
+        // guard. Waiting still owns (and observes) the original decoded DTO;
+        // only the typed-plus-encoded pair is serialized. Openraft's existing
+        // outer RPC timeout includes this wait. Peer IO never holds the guard.
+        let guard = match &self.append_encoding {
+            Some(encoding) => {
+                let wait = encoding.lock();
+                #[cfg(all(test, target_os = "linux", feature = "dangerous-test-hooks"))]
+                let wait = super::types::config_capacity_parallel_encoding_tests::observe_wait(
+                    encoding, wait,
+                );
+                Some(wait.await)
+            }
+            None => None,
+        };
+        let request = AppendEncoding {
+            request,
+            _guard: guard,
+        };
+        #[cfg(feature = "dangerous-test-hooks")]
+        let typed = request.request.borrow();
+        #[cfg(not(feature = "dangerous-test-hooks"))]
+        let typed = &request.request;
+        let entry_count = typed.entries.len();
+        let payload = match encode_config_wire_for_profile(self.capacity_profile, typed) {
             Ok(payload) => payload,
             Err(ConsensusCodecError::TooLarge) => {
                 if let Some(entries_hint) = append_entries_split_hint(entry_count) {
@@ -201,16 +249,31 @@ impl ConfigRaftNetwork {
                 )))
             }
         };
+        #[cfg(all(test, target_os = "linux", feature = "dangerous-test-hooks"))]
+        super::types::config_capacity_parallel_encoding_tests::encoded(
+            &payload,
+            request._guard.as_ref(),
+        );
         #[cfg(feature = "dangerous-test-hooks")]
         let observation = super::capacity_observation::append_context(
             self.identity,
             self.local_node_id,
             self.target,
-            request,
+            typed,
             &payload,
         );
         #[cfg(feature = "dangerous-test-hooks")]
-        let original_wire = original.as_ref().map(|owner| owner.wire(&payload));
+        let original_wire = request.request.wire(&payload);
+        #[cfg(all(feature = "dangerous-test-hooks", test))]
+        request.request.before_drop().await;
+        #[cfg(all(test, target_os = "linux", feature = "dangerous-test-hooks"))]
+        super::types::config_capacity_parallel_encoding_tests::original_ready(
+            &payload,
+            request._guard.as_ref(),
+        );
+        // Each follower has independently decoded the typed log batch. This
+        // physically drops that DTO before unlocking; IO needs only the wire.
+        drop(request);
         let call = self.call(
             ConsensusRpcFamily::AppendEntries,
             opc_consensus::engine::RPCTypes::AppendEntries,
@@ -235,7 +298,7 @@ impl RaftNetwork<ConfigRaftTypeConfig> for ConfigRaftNetwork {
         request: AppendEntriesRequest<ConfigRaftTypeConfig>,
         option: RPCOption,
     ) -> Result<AppendEntriesResponse<ConsensusNodeId>, EngineRpcError> {
-        self.append(&request, option).await
+        self.append(request, option).await
     }
 
     async fn install_snapshot(

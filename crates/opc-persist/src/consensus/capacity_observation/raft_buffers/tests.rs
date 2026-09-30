@@ -82,6 +82,16 @@ fn entry_heap(entry: &Entry<ConfigRaftTypeConfig>) -> usize {
     size_of::<AuditedMutationFields>() + commit_heap(commit)
 }
 
+fn entry_weak(entry: &Entry<ConfigRaftTypeConfig>) -> Weak<AuditedMutationFields> {
+    let EntryPayload::Normal(command) = &entry.payload else {
+        panic!("normal fixture")
+    };
+    let ConfigMutationIntent::AuditedMutation(command) = &command.intent else {
+        panic!("audited fixture")
+    };
+    command.weak_fields()
+}
+
 fn prepared(
     size: usize,
     pool: &ConfigPreparationPool,
@@ -254,6 +264,33 @@ fn rpc(entries: Vec<Entry<ConfigRaftTypeConfig>>) -> AppendEntriesRequest<Config
     }
 }
 
+// Pauses the original typed request and its already-encoded output in the
+// production append method, before its physical disposal and first network poll.
+// Tests release the same call into HeldPeer to inspect the subsequent wire phase.
+pub(super) struct EncodedGate {
+    pub(super) arrived: Semaphore,
+    pub(super) release: Semaphore,
+}
+
+impl EncodedGate {
+    fn attach(census: &RaftAppendCensus) -> Arc<Self> {
+        let gate = Arc::new(Self {
+            arrived: Semaphore::new(0),
+            release: Semaphore::new(0),
+        });
+        assert!(lock(&census.encoded_gate).replace(gate.clone()).is_none());
+        gate
+    }
+
+    async fn wait(&self, count: u32) {
+        tokio::time::timeout(HANG_GUARD, self.arrived.acquire_many(count))
+            .await
+            .unwrap()
+            .unwrap()
+            .forget();
+    }
+}
+
 #[derive(Debug)]
 struct Gate {
     live: Mutex<BTreeMap<ConsensusNodeId, Option<RaftAppendWitness>>>,
@@ -353,6 +390,9 @@ async fn start(
 
 struct Outcome {
     sample: RaftAppendSample,
+    wire_phase: RaftAppendSample,
+    decoded_fields_live: bool,
+    decoded_fields_retired: bool,
     union: RaftAppendUnion,
     conflicting: RaftAppendUnion,
     witnesses: Vec<Option<RaftAppendWitness>>,
@@ -411,6 +451,9 @@ async fn held_sqlite_calls() -> Outcome {
             .unwrap();
     assert_eq!(first.len(), 2);
     assert_eq!(second.len(), 2);
+    // Weak witnesses retain only the Arc headers, never the nested allocations.
+    // The four separately decoded field payloads have no other strong owner.
+    let decoded_fields: Vec<_> = first.iter().chain(&second).map(entry_weak).collect();
     let mut aliases = entries(identity, &prepared, &[1, 1]);
     let mut other_aliases = entries(identity, &prepared, &[1, 1]);
     first.reserve_exact(5);
@@ -425,6 +468,7 @@ async fn held_sqlite_calls() -> Outcome {
         + expected_shared;
     let census = Arc::new(RaftAppendCensus::default());
     let registration = census.observe_source(identity, node(1)).unwrap();
+    let encoded = EncodedGate::attach(&census);
     let preparations = Arc::new(PreparationCensus::default());
     let preparation = preparations.observe_audited(node(1), &prepared).unwrap();
     let gate = Gate::new();
@@ -432,8 +476,11 @@ async fn held_sqlite_calls() -> Outcome {
     let second = start(identity, 3, &gate, rpc(second)).await;
     let aliases = start(identity, 4, &gate, rpc(aliases)).await;
     let other_aliases = start(identity, 5, &gate, rpc(other_aliases)).await;
-    gate.wait(4).await;
-    let (sample, union, conflicting, witnesses) = {
+    encoded.wait(4).await;
+    let decoded_fields_live = decoded_fields
+        .iter()
+        .all(|fields| fields.strong_count() == 1);
+    let (sample, union, conflicting) = {
         // Exact intended lock order: preparations -> transport -> original DTOs.
         let borrowed_preparations = lock(&preparations.state);
         let native = &borrowed_preparations
@@ -442,21 +489,27 @@ async fn held_sqlite_calls() -> Outcome {
             .next()
             .unwrap()
             .allocations;
-        let transport = lock(&gate.live);
+        let _transport = lock(&gate.live);
         census.with_current_capture(|capture| {
             let sample = capture.sample();
             let union = capture.join(&AllocationView::new(identity, node(1), native));
             let mut inconsistent = native.clone();
             *inconsistent.values_mut().next().unwrap() += 1;
             let conflicting = capture.join(&AllocationView::new(identity, node(1), &inconsistent));
-            (
-                sample,
-                union,
-                conflicting,
-                transport.values().copied().collect(),
-            )
+            (sample, union, conflicting)
         })
     };
+    encoded.release.add_permits(4);
+    gate.wait(4).await;
+    let (wire_phase, witnesses) = {
+        let transport = lock(&gate.live);
+        census.with_current_capture(|capture| {
+            (capture.sample(), transport.values().copied().collect())
+        })
+    };
+    let decoded_fields_retired = decoded_fields
+        .iter()
+        .all(|fields| fields.strong_count() == 0);
     // All semantic observation assertions happen only after real cancellation,
     // success, owner drainage, connection close and preparation release.
     first.abort();
@@ -487,6 +540,9 @@ async fn held_sqlite_calls() -> Outcome {
     );
     Outcome {
         sample,
+        wire_phase,
+        decoded_fields_live,
+        decoded_fields_retired,
         union,
         conflicting,
         witnesses,
@@ -499,6 +555,10 @@ async fn held_sqlite_calls() -> Outcome {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn capacity_raft_buffers_real_sqlite_calls_count_original_batches_and_aliases() {
     let result = held_sqlite_calls().await;
+    assert!(
+        result.decoded_fields_live,
+        "original SQLite owners are live before disposal"
+    );
     assert_eq!(
         result.sample.calls.len(),
         4,
@@ -608,6 +668,69 @@ async fn capacity_raft_buffers_real_sqlite_calls_count_original_batches_and_alia
     );
     assert!(result.conflicting.issues.inconsistent_extents);
     assert!(!result.conflicting.issues.complete());
+    assert!(result.wire_phase.issues.complete());
+    assert!(
+        result.decoded_fields_retired,
+        "CAPACITY_RAFT_PHYSICAL_RETIREMENT_RED"
+    );
+    assert!(
+        result.wire_phase.calls.is_empty(),
+        "CAPACITY_RAFT_TYPED_RETIREMENT_RED"
+    );
+    assert_eq!(result.wire_phase.original_bytes, 0);
+    assert_eq!(result.wire_phase.origins.len(), 4);
+    assert_eq!(
+        result
+            .wire_phase
+            .origins
+            .iter()
+            .map(|origin| origin.generation)
+            .collect::<BTreeSet<_>>(),
+        result
+            .sample
+            .calls
+            .iter()
+            .map(|call| call.generation)
+            .collect()
+    );
+}
+
+#[test]
+fn capacity_raft_buffers_physical_drop_waits_for_capture() {
+    let identity = identity();
+    let pool = ConfigPreparationPool::bounded_v1();
+    let (prepared, lease, _) = prepared(1024, &pool, identity);
+    let entries = entries(identity, &prepared, &[1]);
+    let fields = entry_weak(&entries[0]);
+    drop(prepared);
+    assert!(lease.upgrade().is_none());
+    let census = Arc::new(RaftAppendCensus::default());
+    let registration = census.observe_source(identity, node(1)).unwrap();
+    let original = OriginalAppend::start(identity, node(1), node(2), rpc(entries));
+    let (started, start) = std::sync::mpsc::channel();
+    let (finished, finish) = std::sync::mpsc::channel();
+    let (thread, waited, fields_still_live) = census.with_current_capture(|capture| {
+        assert_eq!(capture.sample().calls.len(), 1);
+        let thread = std::thread::spawn(move || {
+            started.send(()).unwrap();
+            drop(original);
+            finished.send(()).unwrap();
+        });
+        start.recv_timeout(HANG_GUARD).unwrap();
+        let waited = finish.recv_timeout(Duration::from_millis(50)).is_err();
+        (thread, waited, fields.strong_count() == 1)
+    });
+    thread.join().unwrap();
+    finish.recv_timeout(HANG_GUARD).unwrap();
+    assert_eq!(fields.strong_count(), 0);
+    let drained = census.with_current_capture(|capture| capture.sample());
+    drop(registration);
+    assert!(drained.calls.is_empty() && drained.origins.is_empty());
+    println!(
+        "CAPACITY_RAFT_CLEANUP physical_drop calls=0 transport=0 registrations=0 preparations=0"
+    );
+    assert!(waited);
+    assert!(fields_still_live, "CAPACITY_RAFT_PHYSICAL_DROP_BARRIER_RED");
 }
 
 async fn single(
@@ -615,17 +738,29 @@ async fn single(
     identity: ConsensusIdentity,
     request: AppendEntriesRequest<ConfigRaftTypeConfig>,
 ) -> (RaftAppendSample, Option<RaftAppendWitness>) {
+    let encoded = EncodedGate::attach(census);
     let gate = Gate::new();
     let call = start(identity, 2, &gate, request).await;
+    encoded.wait(1).await;
+    let sample = census.with_current_capture(|capture| capture.sample());
+    encoded.release.add_permits(1);
     gate.wait(1).await;
-    let (sample, witness) = {
+    let (wire_phase, witness) = {
         let transport = lock(&gate.live);
         census.with_current_capture(|capture| (capture.sample(), transport[&node(2)]))
     };
     gate.release.add_permits(1);
     assert!(call.await.unwrap());
     assert!(lock(&gate.live).is_empty());
-    assert!(census.with_current_capture(|capture| capture.sample().calls.is_empty()));
+    let drained = census.with_current_capture(|capture| capture.sample());
+    assert!(drained.calls.is_empty() && drained.origins.is_empty());
+    lock(&census.encoded_gate).take();
+    assert!(
+        wire_phase.calls.is_empty(),
+        "CAPACITY_RAFT_TYPED_RETIREMENT_RED"
+    );
+    assert_eq!(wire_phase.original_bytes, 0);
+    assert_eq!(wire_phase.origins.len(), usize::from(witness.is_some()));
     (sample, witness)
 }
 
@@ -751,20 +886,25 @@ async fn capacity_raft_buffers_call_saturation_and_detach_keep_originals_borrowe
         ..RaftAppendLimits::default()
     }));
     let registration = census.observe_source(identity, node(1)).unwrap();
+    let encoded = EncodedGate::attach(&census);
     let gate = Gate::new();
     let first = start(identity, 2, &gate, rpc(Vec::new())).await;
-    gate.wait(1).await;
+    encoded.wait(1).await;
     let second = start(identity, 3, &gate, rpc(Vec::new())).await;
-    gate.wait(1).await;
+    encoded.wait(1).await;
     let before = census.with_current_capture(|capture| capture.sample());
     drop(registration);
     let detached = census.with_current_capture(|capture| capture.sample());
+    encoded.release.add_permits(2);
+    gate.wait(2).await;
+    let wire_phase = census.with_current_capture(|capture| capture.sample());
     first.abort();
     second.abort();
     assert!(first.await.unwrap_err().is_cancelled());
     assert!(second.await.unwrap_err().is_cancelled());
     assert!(lock(&gate.live).is_empty());
-    assert!(census.with_current_capture(|capture| capture.sample().calls.is_empty()));
+    let drained = census.with_current_capture(|capture| capture.sample());
+    assert!(drained.calls.is_empty() && drained.origins.is_empty());
     assert_eq!(before.calls.len(), 1);
     assert!(before.issues.metadata_saturated);
     assert_eq!(
@@ -775,6 +915,12 @@ async fn capacity_raft_buffers_call_saturation_and_detach_keep_originals_borrowe
     assert_eq!(detached.registrations, 0);
     assert!(detached.issues.ambiguous_source);
     assert!(!detached.issues.complete());
+    assert!(
+        wire_phase.calls.is_empty(),
+        "CAPACITY_RAFT_TYPED_RETIREMENT_RED"
+    );
+    assert_eq!(wire_phase.original_bytes, 0);
+    assert_eq!(wire_phase.origins.len(), 1);
 }
 
 #[derive(Clone, Copy)]
@@ -830,6 +976,7 @@ async fn capacity_raft_buffers_native_append_callback_refuses_other_authority() 
     let (remote, remote_weak, _) = prepared(2048, &pool, remote_identity);
     let originals = Arc::new(RaftAppendCensus::default());
     let remote_registration = originals.observe_source(remote_identity, node(1)).unwrap();
+    let encoded = EncodedGate::attach(&originals);
     let preparations = Arc::new(PreparationCensus::default());
     let preparation = preparations.observe_audited(node(1), &native).unwrap();
     let gate = Gate::new();
@@ -855,7 +1002,7 @@ async fn capacity_raft_buffers_native_append_callback_refuses_other_authority() 
         rpc(entries(remote_identity, &remote, &[2])),
     )
     .await;
-    gate.wait(1).await;
+    encoded.wait(1).await;
     let native_entries = entries(native_identity, &native, &[1]);
     let result = sqlite::append_logs_sync(
         &connection,
@@ -877,10 +1024,14 @@ async fn capacity_raft_buffers_native_append_callback_refuses_other_authority() 
         &continuation,
         PROFILE,
     );
+    encoded.release.add_permits(1);
+    gate.wait(1).await;
+    let wire_phase = originals.with_current_capture(|capture| capture.sample());
     gate.release.add_permits(1);
     assert!(call.await.unwrap());
     assert!(lock(&gate.live).is_empty());
-    assert!(originals.with_current_capture(|capture| capture.sample().calls.is_empty()));
+    let drained = originals.with_current_capture(|capture| capture.sample());
+    assert!(drained.calls.is_empty() && drained.origins.is_empty());
     drop(remote_registration);
     drop(local_registration);
     let drained = native_registration.snapshot();
@@ -903,6 +1054,12 @@ async fn capacity_raft_buffers_native_append_callback_refuses_other_authority() 
     println!("CAPACITY_RAFT_CLEANUP authority_join calls=0 transport=0 registrations=0 preparations=0 storage=closed");
     assert!(result.is_ok());
     assert!(matched_result.is_ok(), "{matched_result:?}");
+    assert!(
+        wire_phase.calls.is_empty(),
+        "CAPACITY_RAFT_TYPED_RETIREMENT_RED"
+    );
+    assert_eq!(wire_phase.original_bytes, 0);
+    assert_eq!(wire_phase.origins.len(), 1);
     let receipts = lock(&observer.receipts);
     assert!(mismatched_receipts > 0 && receipts.len() > mismatched_receipts);
     assert!(receipts

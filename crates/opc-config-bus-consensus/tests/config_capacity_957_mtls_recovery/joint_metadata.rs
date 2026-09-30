@@ -166,6 +166,29 @@ pub(super) async fn input(
     .await
 }
 
+pub(super) async fn input_with_envelope(
+    store: &ConsensusConfigStore,
+    version: u64,
+    parent: Option<TxId>,
+    principal: &str,
+    path_extra: usize,
+) -> (
+    AttestedConfigCommit,
+    EnvelopeAad,
+    Vec<u8>,
+    opc_crypto::AuthenticatedEnvelope,
+) {
+    input_mode_with_envelope(
+        store,
+        version,
+        parent,
+        principal,
+        path_extra,
+        CommitMode::Ordinary,
+    )
+    .await
+}
+
 async fn input_mode(
     store: &ConsensusConfigStore,
     version: u64,
@@ -174,6 +197,25 @@ async fn input_mode(
     path_extra: usize,
     mode: CommitMode,
 ) -> (AttestedConfigCommit, EnvelopeAad, Vec<u8>) {
+    let (commit, aad, plaintext, envelope) =
+        input_mode_with_envelope(store, version, parent, principal, path_extra, mode).await;
+    drop(envelope);
+    (commit, aad, plaintext)
+}
+
+async fn input_mode_with_envelope(
+    store: &ConsensusConfigStore,
+    version: u64,
+    parent: Option<TxId>,
+    principal: &str,
+    path_extra: usize,
+    mode: CommitMode,
+) -> (
+    AttestedConfigCommit,
+    EnvelopeAad,
+    Vec<u8>,
+    opc_crypto::AuthenticatedEnvelope,
+) {
     let reservation = store
         .try_reserve_config_preparation()
         .expect("joint destination preparation admission")
@@ -232,7 +274,7 @@ async fn input_mode(
         }
     }
     .expect("exact paired record evidence");
-    (commit, aad, plaintext)
+    (commit, aad, plaintext, envelope)
 }
 
 pub(super) fn assert_readback(

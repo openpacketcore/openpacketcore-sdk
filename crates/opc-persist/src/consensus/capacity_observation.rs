@@ -90,6 +90,24 @@ fn audited_allocations(command: &AuditedConfigCommand) -> Option<Allocations> {
     Some(allocations)
 }
 
+/// Borrow one genuine audited preparation's allocation map for a synchronous
+/// join outside native apply. The authority comes from the immutable original
+/// command, not a caller-supplied identity. The view cannot retain payloads or
+/// escape the callback; unsupported effects return no measurement.
+pub fn with_audited_allocations<R>(
+    source: ConsensusNodeId,
+    prepared: &PreparedAuditedMutation,
+    capture: impl FnOnce(raft_buffers::AllocationView<'_>) -> R,
+) -> Option<R> {
+    let command = prepared.command();
+    let allocations = audited_allocations(command)?;
+    Some(capture(raft_buffers::AllocationView::new(
+        command.handle.body.identity,
+        source,
+        &allocations,
+    )))
+}
+
 fn ledger_allocations(ledger: &LedgerState) -> Allocations {
     let mut allocations = Allocations::new();
     vector(&mut allocations, &ledger.entries);

@@ -275,7 +275,9 @@ their existing behavior; an unsupported nonlegacy datastore refuses.
 
 `encrypt_reserved_bounded_config_envelope` consumes the reservation before
 provider access and transfers it through the one-shot encryption claim and
-attestation. Envelope aliases retain shared ownership until their last drop.
+attestation. Envelope aliases retain shared ownership until their last drop;
+count the original SDK-created envelope allocation once while any lease-bearing
+alias remains live, including after its claim was consumed.
 Ordinary prepared operations remain non-cloneable; audited prepared aliases
 share immutable payload and preparation ownership. Separate nonwaiting guards
 bound concurrent SDK encoding and mutation submission by those aliases.
@@ -286,6 +288,13 @@ has released its payload. The supervisor retains both admission owners until
 the final native storage owner drains, using observation that owns no storage.
 The receiver acquires its own reservation before inner forwarded
 command decoding. Slot counts alone are not allocated-byte accounting.
+
+The bounded recovery encoder's current output counts while the SDK owns it.
+A raw output Vec returned to an application transfers responsibility for that
+retained buffer to the application. If SDK code retains or reborrows
+such output, it must still account its actual capacity for that overlapping
+lifetime. This transfer does not release lease-bearing envelope or prepared
+aliases, and it does not make separate encoder and submission peaks additive.
 
 `ConsensusConfigStore::decode_prepared_audited_mutation` reserves before owned
 decoding and authenticates the original handle, effect and required record

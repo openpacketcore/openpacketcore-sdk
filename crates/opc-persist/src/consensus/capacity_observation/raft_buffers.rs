@@ -1,4 +1,4 @@
-//! Original typed requests borrowed across the real Raft append await.
+//! Original typed requests owned by the real Raft append encoder.
 //!
 //! This opt-in census retains numeric metadata only. It measures the entries
 //! Vec backing and recognized nested allocation extents, including spare
@@ -18,7 +18,6 @@ use opc_consensus::{
 };
 use std::collections::BTreeMap;
 use std::future::Future;
-use std::marker::PhantomData;
 use std::mem::size_of;
 use std::sync::{Arc, LazyLock, Mutex, Weak};
 
@@ -115,6 +114,24 @@ pub struct RaftAppendCall {
     pub attribution: Vec<RaftAppendEntry>,
 }
 
+/// Encoded call provenance; this metadata owns no typed or encoded payload.
+/// Use an actual wire borrow and `raft_append_witness` to establish wire liveness.
+#[derive(Clone, Debug)]
+pub struct RaftAppendOrigin {
+    /// Exact authority of the originating typed call.
+    pub identity: ConsensusIdentity,
+    /// Actual source node.
+    pub source: ConsensusNodeId,
+    /// Actual follower target.
+    pub target: ConsensusNodeId,
+    /// Original-call identity, preserved after its typed allocations retire.
+    pub generation: u64,
+    /// Original batch length.
+    pub entries: usize,
+    /// Historical entry attribution; these extents are not current ownership.
+    pub attribution: Vec<RaftAppendEntry>,
+}
+
 /// Current redaction-safe snapshot; never a sum of separate phase maxima.
 #[derive(Clone, Debug)]
 pub struct RaftAppendSample {
@@ -122,6 +139,8 @@ pub struct RaftAppendSample {
     pub registrations: usize,
     /// Current original calls; empty heartbeat batches remain visible.
     pub calls: Vec<RaftAppendCall>,
+    /// Metadata for encoded call contexts, separate from current typed owners.
+    pub origins: Vec<RaftAppendOrigin>,
     /// Unique original entries Vec backing extents across all live calls.
     pub descriptor_bytes: usize,
     /// Unique nested payload extents across all live calls and true aliases.
@@ -179,10 +198,17 @@ pub struct RaftAppendUnion {
 
 struct Call {
     sample: RaftAppendCall,
-    original: usize,
     registration: u64,
     descriptors: Allocations,
     payloads: Allocations,
+    issues: RaftAppendIssues,
+}
+
+struct Origin {
+    sample: RaftAppendOrigin,
+    registration: u64,
+    payload: usize,
+    capacity: usize,
     issues: RaftAppendIssues,
 }
 
@@ -191,10 +217,20 @@ struct State {
     next: u64,
     registrations: BTreeMap<u64, (ConsensusIdentity, ConsensusNodeId)>,
     calls: BTreeMap<u64, Call>,
+    origins: BTreeMap<u64, Origin>,
     issues: RaftAppendIssues,
 }
 
 impl State {
+    fn active_generations(&self) -> usize {
+        self.calls.len()
+            + self
+                .origins
+                .keys()
+                .filter(|generation| !self.calls.contains_key(generation))
+                .count()
+    }
+
     fn generation(&mut self) -> Option<u64> {
         match self.next.checked_add(1) {
             Some(next) => {
@@ -213,6 +249,8 @@ impl State {
 pub struct RaftAppendCensus {
     limits: RaftAppendLimits,
     state: Mutex<State>,
+    #[cfg(test)]
+    encoded_gate: Mutex<Option<Arc<tests::EncodedGate>>>,
 }
 
 impl Default for RaftAppendCensus {
@@ -227,6 +265,8 @@ impl RaftAppendCensus {
         Self {
             limits,
             state: Mutex::new(State::default()),
+            #[cfg(test)]
+            encoded_gate: Mutex::new(None),
         }
     }
 
@@ -300,6 +340,10 @@ impl Drop for RaftAppendRegistration {
             .calls
             .values()
             .any(|call| call.registration == self.shared.id)
+            || state
+                .origins
+                .values()
+                .any(|origin| origin.registration == self.shared.id)
         {
             state.issues.ambiguous_source = true;
         }
@@ -323,6 +367,11 @@ impl RaftAppendCapture<'_> {
             extend(&mut descriptors, &call.descriptors, &mut issues);
             extend(&mut payloads, &call.payloads, &mut issues);
         }
+        for (&generation, origin) in &self.state.origins {
+            if !self.state.calls.contains_key(&generation) {
+                issues.merge(origin.issues);
+            }
+        }
         let descriptor_bytes = sum(&descriptors, &mut issues);
         let payload_bytes = sum(&payloads, &mut issues);
         extend(&mut descriptors, &payloads, &mut issues);
@@ -334,6 +383,12 @@ impl RaftAppendCapture<'_> {
                 .calls
                 .values()
                 .map(|call| call.sample.clone())
+                .collect(),
+            origins: self
+                .state
+                .origins
+                .values()
+                .map(|origin| origin.sample.clone())
                 .collect(),
             descriptor_bytes,
             payload_bytes,
@@ -366,6 +421,13 @@ impl RaftAppendCapture<'_> {
             issues.merge(call.issues);
             extend(&mut original, &call.descriptors, &mut issues);
             extend(&mut original, &call.payloads, &mut issues);
+        }
+        for origin in self.state.origins.values().filter(|origin| {
+            origin.sample.identity == native.identity
+                && origin.sample.source == native.source
+                && !self.state.calls.contains_key(&origin.sample.generation)
+        }) {
+            issues.merge(origin.issues);
         }
         let original_bytes = sum(&original, &mut issues);
         let native_bytes = sum(native.allocations, &mut issues);
@@ -495,36 +557,87 @@ impl Inventory {
     }
 }
 
-pub(crate) struct OriginalAppend<'a> {
-    shared: Arc<Source>,
-    generation: u64,
-    original: usize,
-    borrowed: PhantomData<&'a AppendEntriesRequest<ConfigRaftTypeConfig>>,
+pub(crate) struct OriginalAppend {
+    request: Option<AppendEntriesRequest<ConfigRaftTypeConfig>>,
+    observation: Option<ObservedAppend>,
+    #[cfg(test)]
+    sources: Vec<Arc<Source>>,
 }
 
-impl<'a> OriginalAppend<'a> {
+struct ObservedAppend {
+    shared: Arc<Source>,
+    generation: u64,
+}
+
+impl OriginalAppend {
     pub(crate) fn start(
         identity: ConsensusIdentity,
         source: ConsensusNodeId,
         target: ConsensusNodeId,
-        request: &'a AppendEntriesRequest<ConfigRaftTypeConfig>,
-    ) -> Option<Self> {
+        request: AppendEntriesRequest<ConfigRaftTypeConfig>,
+    ) -> Self {
         let registry = lock(&SOURCES);
         let matches: Vec<_> = registry
             .iter()
             .filter_map(Weak::upgrade)
             .filter(|value| value.identity == identity && value.source == source)
             .collect();
-        if matches.len() != 1 {
-            for value in matches {
+        let observation = if matches.len() == 1 {
+            ObservedAppend::start(matches[0].clone(), target, &request)
+        } else {
+            for value in &matches {
                 lock(&value.census.state).issues.ambiguous_source = true;
             }
-            return None;
+            None
+        };
+        Self {
+            request: Some(request),
+            observation,
+            #[cfg(test)]
+            sources: matches,
         }
-        let shared = matches.into_iter().next()?;
+    }
+
+    pub(crate) fn borrow(&self) -> &AppendEntriesRequest<ConfigRaftTypeConfig> {
+        self.request
+            .as_ref()
+            .expect("original owner has not dropped")
+    }
+
+    pub(crate) fn wire(&self, payload: &Vec<u8>) -> Option<OriginalWire> {
+        self.observation.as_ref().map(|owner| owner.wire(payload))
+    }
+
+    #[cfg(test)]
+    pub(crate) async fn before_drop(&self) {
+        // Component tests pause the actual encoded call before physical release.
+        // No gate exists in the production or integration-test build.
+        let mut seen = Vec::new();
+        for source in &self.sources {
+            if seen.iter().any(|prior| Arc::ptr_eq(prior, &source.census)) {
+                continue;
+            }
+            seen.push(source.census.clone());
+            let gate = lock(&source.census.encoded_gate).clone();
+            if let Some(gate) = gate {
+                gate.arrived.add_permits(1);
+                gate.release.acquire().await.unwrap().forget();
+            }
+        }
+    }
+}
+
+impl ObservedAppend {
+    fn start(
+        shared: Arc<Source>,
+        target: ConsensusNodeId,
+        request: &AppendEntriesRequest<ConfigRaftTypeConfig>,
+    ) -> Option<Self> {
+        let identity = shared.identity;
+        let source = shared.source;
         let mut state = lock(&shared.census.state);
         let limits = shared.census.limits;
-        if state.calls.len() >= limits.calls {
+        if state.active_generations() >= limits.calls {
             state.issues.metadata_saturated = true;
             return None;
         }
@@ -591,7 +704,6 @@ impl<'a> OriginalAppend<'a> {
                     payload_bytes,
                     attribution,
                 },
-                original: std::ptr::from_ref(request) as usize,
                 registration: shared.id,
                 descriptors: descriptor.allocations,
                 payloads: payload.allocations,
@@ -599,39 +711,59 @@ impl<'a> OriginalAppend<'a> {
             },
         );
         drop(state);
-        Some(Self {
-            shared,
-            generation,
-            original: std::ptr::from_ref(request) as usize,
-            borrowed: PhantomData,
-        })
+        Some(Self { shared, generation })
     }
 
-    pub(crate) fn wire(&self, payload: &Vec<u8>) -> OriginalWire {
+    fn wire(&self, payload: &Vec<u8>) -> OriginalWire {
+        let mut state = lock(&self.shared.census.state);
+        let call = &state.calls[&self.generation];
+        let origin = Origin {
+            sample: RaftAppendOrigin {
+                identity: call.sample.identity,
+                source: call.sample.source,
+                target: call.sample.target,
+                generation: call.sample.generation,
+                entries: call.sample.entries,
+                attribution: call.sample.attribution.clone(),
+            },
+            registration: call.registration,
+            payload: payload.as_ptr() as usize,
+            capacity: payload.capacity(),
+            issues: call.issues,
+        };
+        assert!(state.origins.insert(self.generation, origin).is_none());
         OriginalWire {
             shared: self.shared.clone(),
             generation: self.generation,
-            original: self.original,
-            payload: payload.as_ptr() as usize,
-            capacity: payload.capacity(),
         }
     }
 }
 
-impl Drop for OriginalAppend<'_> {
+impl Drop for OriginalAppend {
     fn drop(&mut self) {
-        lock(&self.shared.census.state)
-            .calls
-            .remove(&self.generation);
+        if let Some(observation) = &self.observation {
+            let mut state = lock(&observation.shared.census.state);
+            // Physically destroy the only typed request owner before retiring
+            // its metadata. A capture cannot race this allocation release.
+            drop(self.request.take());
+            state.calls.remove(&observation.generation);
+        } else {
+            drop(self.request.take());
+        }
     }
 }
 
 pub(crate) struct OriginalWire {
     shared: Arc<Source>,
     generation: u64,
-    original: usize,
-    payload: usize,
-    capacity: usize,
+}
+
+impl Drop for OriginalWire {
+    fn drop(&mut self) {
+        lock(&self.shared.census.state)
+            .origins
+            .remove(&self.generation);
+    }
 }
 
 tokio::task_local! { static WIRE: OriginalWire; }
@@ -643,13 +775,48 @@ pub(crate) async fn scope_wire<F: Future>(context: Option<OriginalWire>, future:
     }
 }
 
+/// Numeric bounds on the original duration-based RPC timeout's deadline.
+/// Tokio computes its deadline between these two constructor timestamps; the
+/// observer leaves that timeout and its duration unchanged.
+#[derive(Clone, Copy, Debug)]
+pub struct RaftAppendDeadline {
+    /// The real adapter's prescribed hard TTL.
+    pub hard_ttl: std::time::Duration,
+    /// Earliest possible original absolute deadline on Tokio's monotonic clock.
+    pub earliest: Option<tokio::time::Instant>,
+    /// Latest possible original absolute deadline on Tokio's monotonic clock.
+    pub latest: Option<tokio::time::Instant>,
+}
+
+tokio::task_local! { static RPC_DEADLINE: RaftAppendDeadline; }
+
+pub(crate) async fn scope_rpc_deadline<F: Future>(
+    hard_ttl: std::time::Duration,
+    before: tokio::time::Instant,
+    after: tokio::time::Instant,
+    future: F,
+) -> F::Output {
+    RPC_DEADLINE
+        .scope(
+            RaftAppendDeadline {
+                hard_ttl,
+                earliest: before.checked_add(hard_ttl),
+                latest: after.checked_add(hard_ttl),
+            },
+            future,
+        )
+        .await
+}
+
 /// Typed original-call attribution verified against the genuine moved payload.
 #[derive(Clone, Copy, Debug)]
 pub struct RaftAppendWitness {
-    /// Original call generation, matching a currently live census record.
+    /// Original generation, matching an encoded provenance context.
     pub generation: u64,
     /// Actual entries length, including multi-entry and empty heartbeat batches.
     pub entries: usize,
+    /// Original RPC timeout bounds, present once its actual timeout is built.
+    pub deadline: Option<RaftAppendDeadline>,
 }
 
 /// Verify encoded allocation provenance without decoding or retaining payloads.
@@ -659,17 +826,17 @@ pub fn raft_append_witness(
 ) -> Option<RaftAppendWitness> {
     WIRE.try_with(|wire| {
         let state = lock(&wire.shared.census.state);
-        let original = state.calls.get(&wire.generation)?;
+        let original = state.origins.get(&wire.generation)?;
         (request.identity == wire.shared.identity
             && request.sender == wire.shared.source
             && request.family == ConsensusRpcFamily::AppendEntries
             && target == original.sample.target
-            && request.payload.as_ptr() as usize == wire.payload
-            && request.payload.capacity() == wire.capacity
-            && original.original == wire.original)
+            && request.payload.as_ptr() as usize == original.payload
+            && request.payload.capacity() == original.capacity)
             .then_some(RaftAppendWitness {
                 generation: wire.generation,
                 entries: original.sample.entries,
+                deadline: RPC_DEADLINE.try_with(|deadline| *deadline).ok(),
             })
     })
     .ok()

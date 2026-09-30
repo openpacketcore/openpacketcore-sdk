@@ -143,3 +143,43 @@ fn capacity_command_counts_unused_audit_and_string_capacities() {
     assert_eq!(after - initial, added + audit_backing);
     assert_eq!(preflight(&probe(&command), PROFILE).unwrap(), sizes);
 }
+
+#[test]
+fn capacity_command_rejects_spare_owner_that_can_overlap_guarded_replication() {
+    let mut command = audited_command();
+    let admitted = preflight(&probe(&command), PROFILE).unwrap();
+    let ConfigMutationIntent::AuditedMutation(prepared) = &mut command.intent else {
+        panic!("audited fixture");
+    };
+    let AuditedConfigEffect::BoundedAppend { commit, .. } = &mut prepared.effect else {
+        panic!("bounded append fixture");
+    };
+    // This exact spare capacity passed the previous native-output-only check.
+    // Its bytes and all authenticated metadata remain unchanged. A serialized
+    // encoder still coexists with the remaining peers' actual representations.
+    commit
+        .record
+        .encrypted_blob
+        .try_reserve_exact(14 * 1024 * 1024 - commit.record.encrypted_blob.len())
+        .unwrap();
+    assert_eq!(commit.record.encrypted_blob.capacity(), 14 * 1024 * 1024);
+    prepared.verify_effect(&key()).unwrap();
+    command
+        .intent
+        .validate_capacity(identity(), &key(), PROFILE)
+        .unwrap();
+    assert_eq!(
+        config_command_encoded_size(&probe(&command)).unwrap(),
+        admitted.command
+    );
+    let rejected = matches!(
+        preflight(&probe(&command), PROFILE),
+        Err(ForwardMutationRejection::CommandTooLarge)
+    );
+    drop(command);
+    eprintln!("CAPACITY_PARALLEL_CLEANUP spare_owner=0 rejected={rejected}");
+    assert!(
+        rejected,
+        "CAPACITY_PARALLEL_SPARE_RED: replication headroom must be admitted before allocating output"
+    );
+}
