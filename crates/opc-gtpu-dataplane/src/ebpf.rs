@@ -1435,6 +1435,14 @@ pub(crate) trait EbpfGtpuRuntime: Send + Sync + fmt::Debug {
             feature: "grouped_selector_quiescence",
         })
     }
+    /// Complete the qualified kernel grace boundary for the non-sleepable TC
+    /// readers of the TFT classifier. No map, hook or packet-source mutation
+    /// is allowed.
+    fn synchronize_tft_readers(&self) -> Result<(), GtpuError> {
+        Err(GtpuError::UnsupportedFeature {
+            feature: "tft_classifier_reader_grace",
+        })
+    }
     /// Reconcile one exclusively owned workload graph to absence.
     fn reset_workload_graph(
         &self,
@@ -55112,6 +55120,7 @@ mod tests {
         grouped_reader_grace_enabled: bool,
         grouped_reader_grace_calls: usize,
         grouped_reader_grace_fault: bool,
+        tft_reader_grace_enabled: bool,
         grouped_reader_grace_corrupt_group: Option<[u8; 16]>,
         grouped_reader_grace_replace_path: bool,
         attached: HashMap<u32, FakeAttachment>,
@@ -57725,6 +57734,17 @@ mod tests {
                     .store(true, Ordering::Release);
             }
             Ok(())
+        }
+
+        fn synchronize_tft_readers(&self) -> Result<(), GtpuError> {
+            let mut state = self.state();
+            state.operations.push("tft_reader_grace");
+            if !state.tft_reader_grace_enabled {
+                return Err(GtpuError::UnsupportedFeature {
+                    feature: "tft_classifier_reader_grace",
+                });
+            }
+            Self::fail_if_requested(&mut state, "tft_reader_grace")
         }
 
         fn ifindex_by_name(&self, name: &str) -> Result<u32, GtpuError> {
@@ -65488,6 +65508,109 @@ mod tests {
                 .unwrap(),
             TftUplinkClassifierReadback::Absent
         );
+    }
+
+    /// A TC invocation that copied the active selector before the fence may
+    /// still read its rows, so every attempt waits out such readers after the
+    /// fence is published and before it deletes a row. A kernel outside the
+    /// qualified grace profile keeps the removal available without the wait.
+    #[tokio::test]
+    async fn tft_classifier_removal_waits_for_pre_fence_readers_before_deleting_rows() {
+        for grace_supported in [true, false] {
+            let (backend, runtime) = backend_with_fake();
+            backend.create_device(create_request()).await.unwrap();
+            let classifier = tft_classifier_with_two_filters();
+            assert_eq!(
+                backend
+                    .reconcile_tft_uplink_classifier(classifier.clone())
+                    .await
+                    .unwrap(),
+                TftUplinkClassifierReconcileOutcome::Installed
+            );
+            {
+                let mut state = runtime.state();
+                state.tft_reader_grace_enabled = grace_supported;
+                state.operations.clear();
+            }
+            assert_eq!(
+                backend
+                    .remove_tft_uplink_classifier_exact(classifier.clone())
+                    .await
+                    .unwrap(),
+                TftUplinkClassifierRemovalOutcome::Removed
+            );
+            let operations = runtime.state().operations.clone();
+            let position = |operation| {
+                operations
+                    .iter()
+                    .position(|recorded| *recorded == operation)
+                    .unwrap_or_else(|| panic!("{operation} is recorded"))
+            };
+            assert_eq!(
+                operations
+                    .iter()
+                    .filter(|recorded| **recorded == "tft_reader_grace")
+                    .count(),
+                1,
+                "one wait per attempt"
+            );
+            assert!(position("tft_meta_put") < position("tft_reader_grace"));
+            assert!(position("tft_reader_grace") < position("tft_filter_remove"));
+            assert_eq!(
+                backend
+                    .read_tft_uplink_classifier(classifier.link_ifindex(), classifier.paa())
+                    .await
+                    .unwrap(),
+                TftUplinkClassifierReadback::Absent
+            );
+        }
+    }
+
+    /// A failed reader wait leaves the published fence and every row, and
+    /// the retry waits again before its first deletion.
+    #[tokio::test]
+    async fn tft_classifier_removal_retries_a_failed_reader_wait_untouched() {
+        let (backend, runtime) = backend_with_fake();
+        backend.create_device(create_request()).await.unwrap();
+        let classifier = tft_classifier_with_two_filters();
+        assert_eq!(
+            backend
+                .reconcile_tft_uplink_classifier(classifier.clone())
+                .await
+                .unwrap(),
+            TftUplinkClassifierReconcileOutcome::Installed
+        );
+        runtime.state().tft_reader_grace_enabled = true;
+        let rows = runtime.state().tft_filters.clone();
+        runtime.fail_in_order(["tft_reader_grace"]);
+        assert_eq!(
+            backend
+                .remove_tft_uplink_classifier_exact(classifier.clone())
+                .await
+                .unwrap(),
+            TftUplinkClassifierRemovalOutcome::Indeterminate
+        );
+        assert_eq!(runtime.state().tft_filters, rows);
+        assert!(!runtime.state().operations.contains(&"tft_filter_remove"));
+
+        runtime.state().operations.clear();
+        assert_eq!(
+            backend
+                .remove_tft_uplink_classifier_exact(classifier.clone())
+                .await
+                .unwrap(),
+            TftUplinkClassifierRemovalOutcome::Removed
+        );
+        let operations = runtime.state().operations.clone();
+        let grace = operations
+            .iter()
+            .position(|recorded| *recorded == "tft_reader_grace")
+            .expect("the retry waits for readers");
+        let first_delete = operations
+            .iter()
+            .position(|recorded| *recorded == "tft_filter_remove")
+            .expect("the retry deletes rows");
+        assert!(grace < first_delete);
     }
 
     #[tokio::test]
