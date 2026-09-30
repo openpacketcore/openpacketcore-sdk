@@ -75,10 +75,10 @@ impl ApplyWatch {
             work.verified_bytes + work.borrowed_bytes,
             6 * retained_bytes
         );
-        assert_eq!(work.owned, 3, "APPLY_ORIGINAL_NATIVE_OWNED_DECODES");
-        assert_eq!(work.borrowed, 3);
-        assert_eq!(work.owned_bytes, 3 * retained_bytes);
-        assert_eq!(work.borrowed_bytes, 3 * retained_bytes);
+        assert_eq!(work.owned, 1, "APPLY_ORIGINAL_NATIVE_OWNED_DECODES");
+        assert_eq!(work.borrowed, 5);
+        assert_eq!(work.owned_bytes, retained_bytes);
+        assert_eq!(work.borrowed_bytes, 5 * retained_bytes);
     }
 }
 
@@ -281,8 +281,10 @@ fn joint_apply_original_rejection_finishes_before_cost_assertion() {
     assert_eq!(work.owned_bytes, work.verified_bytes);
     assert_eq!(work.verified + work.borrowed, 5);
     assert_eq!(work.verified_bytes + work.borrowed_bytes, 5 * bytes);
-    assert_eq!(work.owned, 2, "APPLY_ORIGINAL_COMPONENT_OWNED_DECODES");
-    assert_eq!(work.borrowed, 3);
+    assert_eq!(work.owned, 0, "APPLY_ORIGINAL_COMPONENT_OWNED_DECODES");
+    assert_eq!(work.borrowed, 5);
+    assert_eq!(work.owned_bytes, 0);
+    assert_eq!(work.borrowed_bytes, 5 * bytes);
 }
 
 fn resign(ledger: &mut LedgerState, keys: &AuditKeyRing) {
@@ -549,3 +551,6 @@ fn joint_apply_original_autocommit_and_wrong_mode_do_not_lend() {
     assert_eq!((work.entered, work.borrowed, work.completed), (1, 0, 0));
     assert_eq!(snapshot(&f.conn).rows, before.rows);
 }
+
+#[path = "joint_native_apply_original_direct.rs"]
+mod direct_tests;

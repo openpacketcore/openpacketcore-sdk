@@ -1689,8 +1689,8 @@ pub(crate) fn apply_target_for_mode_sync(
     };
     // Lend only this immutable bounded command inside the pinned Apply
     // transaction. This is not an authentication token: the fresh ledger read
-    // and the post-resolution validation each compare its actual retained bytes
-    // and rerun the full verifier. No validation result crosses either call.
+    // and every recovery or validation below compare its actual retained bytes
+    // and rerun the full verifier. No validation result crosses a call.
     let borrowed_original = (mode == super::RetainedConfigMode::NetconfRunningV1
         && prepared.bounded_running().is_some())
     .then_some(prepared);
@@ -1706,15 +1706,21 @@ pub(crate) fn apply_target_for_mode_sync(
     };
     #[cfg(test)]
     crate::consensus::storage::config_capacity_apply_observations::observe("target_ledger_read");
-    let original = match ledger.recover_target(key, prepared.handle(), prepared.effect.caller) {
-        Ok(original) => original,
-        Err(_) => return Ok(Err(Failure::Conflict)),
+    let matches_original = if let Some(original) = borrowed_original {
+        ledger.matches_target(key, original, prepared.effect.caller)
+    } else {
+        ledger
+            .recover_target(key, prepared.handle(), prepared.effect.caller)
+            .map(|original| original.command() == prepared)
+    };
+    let Ok(matches_original) = matches_original else {
+        return Ok(Err(Failure::Conflict));
     };
     #[cfg(test)]
     crate::consensus::storage::config_capacity_apply_observations::observe(
         "target_original_recovered",
     );
-    if original.command() != prepared {
+    if !matches_original {
         return Ok(Err(Failure::Conflict));
     }
     let Some(operation) = ledger
@@ -1819,7 +1825,7 @@ pub(crate) fn apply_target_for_mode_sync(
     #[cfg(test)]
     crate::consensus::storage::config_capacity_apply_observations::observe("target_before_resolve");
     ledger
-        .resolve(key, prepared.handle(), applied)
+        .resolve_with_original(key, prepared.handle(), applied, borrowed_original)
         .map_err(|_| invalid())?;
     #[cfg(test)]
     crate::consensus::storage::config_capacity_apply_observations::observe("target_resolved");

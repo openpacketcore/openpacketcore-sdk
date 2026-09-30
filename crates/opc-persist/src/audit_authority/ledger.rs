@@ -655,6 +655,38 @@ impl LedgerState {
         }
     }
 
+    // The candidate supplies a representation, never a previous verification.
+    // Check the operation's actual retained bytes and authenticate it anew.
+    pub(crate) fn matches_target(
+        &self,
+        key: &AuditKey,
+        prepared: &crate::consensus::TargetMutationCommand,
+        caller: AuditCaller,
+    ) -> Result<bool, AuditAuthorityError> {
+        let handle = prepared.handle();
+        handle.verify(key, self.identity, caller)?;
+        let index = self.operation_index(key, handle)?;
+        let operation = &self.operations[index];
+        let entry = self
+            .entries
+            .iter()
+            .find(|entry| entry.sequence == operation.first_sequence)
+            .ok_or(AuditAuthorityError::BindingMismatch)?;
+        match &entry.payload {
+            EntryPayload::TargetIntent(retained) if retained.handle == *handle => {
+                let original = recover_target_for_validation(
+                    key,
+                    self.identity,
+                    handle,
+                    &retained.recovery,
+                    Some(prepared),
+                )?;
+                Ok(original.command() == prepared)
+            }
+            _ => Err(AuditAuthorityError::BindingMismatch),
+        }
+    }
+
     #[cfg(test)]
     pub(crate) fn append_event(
         &mut self,
@@ -677,6 +709,16 @@ impl LedgerState {
         handle: &AuditOperationHandle,
         state: AuditOperationState,
     ) -> Result<(), LedgerMutationError> {
+        self.resolve_with_original(key, handle, state, None)
+    }
+
+    pub(crate) fn resolve_with_original(
+        &mut self,
+        key: &AuditKey,
+        handle: &AuditOperationHandle,
+        state: AuditOperationState,
+        original: Option<&crate::consensus::TargetMutationCommand>,
+    ) -> Result<(), LedgerMutationError> {
         let index = self.operation_index(key, handle)?;
         state.validate_target_for(handle)?;
         let retained = self.entries.iter().find_map(|entry| match &entry.payload {
@@ -685,7 +727,7 @@ impl LedgerState {
         });
         let target = retained.is_some();
         if let Some(retained) = retained {
-            validate_target_outcome(key, self.identity, retained, state)?;
+            validate_target_outcome_with_original(key, self.identity, retained, state, original)?;
         }
         let current = &self.operations[index];
         if current.state == state {
@@ -1093,15 +1135,6 @@ mod strict_target_handle {
         utc_seconds: i64,
         nanosecond: u32,
     }
-}
-
-fn validate_target_outcome(
-    key: &AuditKey,
-    identity: ConfigConsensusIdentity,
-    retained: &RetainedTargetIntent,
-    state: AuditOperationState,
-) -> Result<(), AuditAuthorityError> {
-    validate_target_outcome_with_original(key, identity, retained, state, None)
 }
 
 fn validate_target_outcome_with_original(
