@@ -54,6 +54,8 @@ mod n3_end_marker;
 mod n3_fixed_flow;
 #[path = "ebpf_gtpu_privileged/packet_too_big_baseline.rs"]
 mod packet_too_big_baseline;
+#[path = "ebpf_gtpu_privileged/tft_classifier_removal.rs"]
+mod tft_classifier_removal;
 
 use std::cell::RefCell;
 use std::env;
@@ -8763,6 +8765,20 @@ async fn ebpf_gtpu_shared_paa_tft_classifier_ipv4_live_contract(
     drop(net);
     eprintln!("OPC_GTPU_TFT_IPV4_LIVE_PROVEN");
     Ok(())
+}
+
+#[tokio::test]
+#[ignore = "requires root (CAP_BPF/CAP_NET_ADMIN), a fresh netns, and bpffs"]
+async fn ebpf_gtpu_tft_classifier_removal_fence_forwards_default_uplink(
+) -> Result<(), Box<dyn std::error::Error>> {
+    tft_classifier_removal::qualify_fence().await
+}
+
+#[tokio::test]
+#[ignore = "requires root (CAP_BPF/CAP_NET_ADMIN), a fresh netns, and bpffs"]
+async fn ebpf_gtpu_tft_classifier_removal_keeps_default_uplink_continuous(
+) -> Result<(), Box<dyn std::error::Error>> {
+    tft_classifier_removal::qualify_continuity().await
 }
 
 #[tokio::test]
