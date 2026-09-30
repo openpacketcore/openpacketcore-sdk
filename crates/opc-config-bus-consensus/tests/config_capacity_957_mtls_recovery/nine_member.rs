@@ -10,6 +10,8 @@ use futures_util::{future::join_all, stream, StreamExt};
 use opc_persist::PreparedConfigCommitOperation;
 use opc_session_net::consensus::capacity_observation::ConsensusBufferObservation;
 
+#[path = "nine_member/fanout.rs"]
+mod fanout;
 #[path = "nine_member/overlap.rs"]
 mod overlap;
 
@@ -18,6 +20,7 @@ const PREPARATIONS: usize = 8;
 
 #[derive(Default, Debug)]
 struct Transfers {
+    fanout: fanout::Gate,
     large_append_success: [AtomicUsize; MEMBERS],
     active: AtomicUsize,
     active_capacity: AtomicUsize,
@@ -185,6 +188,11 @@ impl NinePeer {
         // TLS, inner encoders, responses and retained engine entries are not
         // measured by this guard and cannot be inferred from its high water.
         let _active = ActiveRequest::new(&self.transfers, request.payload.capacity());
+        let fanout_call = self
+            .transfers
+            .fanout
+            .pause(&request, self.inner.node_id())
+            .await;
         // Test-only decoding for the existing contiguous acknowledged-chunk
         // witness. Its temporary copy is not a measured production owner.
         let chunk = self.transfers.snapshots[self.target].capture(&request);
@@ -201,6 +209,9 @@ impl NinePeer {
             },
         )
         .await;
+        if let Some(call) = fanout_call {
+            self.transfers.fanout.complete(call, &result);
+        }
         if let Some(probe) = vote_probe {
             probe.record(&result);
         }

@@ -176,6 +176,11 @@ impl<'de> Deserialize<'de> for AuditedConfigCommand {
 }
 
 impl AuditedConfigCommand {
+    #[cfg(all(test, feature = "dangerous-test-hooks"))]
+    pub(crate) fn weak_fields(&self) -> std::sync::Weak<AuditedMutationFields> {
+        Arc::downgrade(&self.0)
+    }
+
     pub(crate) fn verify_effect(&self, key: &AuditKey) -> Result<(), AuditAuthorityError> {
         #[cfg(all(test, target_os = "linux"))]
         let _effect_scope =

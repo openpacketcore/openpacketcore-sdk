@@ -81,7 +81,7 @@ use opc_session_net::SessionConsensusServerHandle;
 
 type Released = tokio::sync::oneshot::Receiver<()>;
 
-async fn listen_one(
+pub(super) async fn listen_one(
     stores: &[ConsensusConfigStore],
     member: usize,
     pki: &Pki,
@@ -108,7 +108,11 @@ async fn listen_one(
     (server, released)
 }
 
-async fn ready(stores: &[ConsensusConfigStore], pending_snapshot: Option<usize>, phase: &str) {
+pub(super) async fn ready(
+    stores: &[ConsensusConfigStore],
+    pending_snapshot: Option<usize>,
+    phase: &str,
+) {
     println!("CONFIG_CAPACITY_NINE_OVERLAP_PHASE phase={phase} stage=initialization_begin");
     tokio::time::timeout(DURABLE_CONSENSUS_OPERATION_TIMEOUT, async {
         // Re-admit every original voter through real all-peer compatibility.

@@ -24,7 +24,10 @@ provider access. The envelope, its aliases, and its single encryption claim
 share that one reservation. The attested commit consumes the claim only after
 checking exact ciphertext and plaintext digest equality. Extracting the claim
 does not make its sealed reservation usable for another encryption. Failed or
-cancelled encryption releases capacity when its last owner drops.
+cancelled encryption releases capacity when its last owner drops. The original
+SDK envelope storage still counts once toward that reservation while any of
+these aliases remains live, including an envelope retained after its claim was
+consumed. Shared aliases do not create independent ciphertext allocations.
 
 Ordinary prepared commits remain non-cloneable. Audited prepared values share
 immutable ciphertext and ownership when cloned. Equality, legacy JSON and
@@ -35,9 +38,13 @@ reservation. They have separate resource obligations.
 Aliases of a reserved audited preparation admit at most one active SDK
 `encode()` call and one active mutation submission. These guards are
 nonwaiting. Read-only recovery remains available. The encoder counts exact JSON
-expansion before allocating output; returned bytes and output produced by a
-caller-supplied serde serializer belong to the caller. Callers must separately
-bound retained copies of those bytes.
+expansion before allocating output. The current SDK encoding output remains
+part of mutation working memory until it is returned. Once a raw output Vec is
+returned to an application, that application must bound retained copies. If SDK
+code retains the result or reborrows it for another SDK operation, it must
+count that actual storage for the full overlapping lifetime. A caller-supplied
+serde serializer likewise owns its output; it does not acquire a preparation
+reservation merely by serializing a prepared value.
 
 Once Openraft accepts a proposal, its supervisor keeps preparation and proposal
 ownership until that exact work completes, even if the client cancels or loses
