@@ -1,11 +1,15 @@
 //! Partial owner census on real nine-voter audited replication and snapshot IO.
 //! Includes selected native command/ledger owners; no complete 32/256 MiB bound is claimed.
 
+#[path = "overlap/tls.rs"]
+mod tls;
+
 use super::super::joint_metadata as joint;
 use super::*;
 use opc_persist::audit_authority::{AuditAdmission, AuditLedgerLimits, AuditOperationState};
 use opc_persist::config_capacity_observation::{
-    NativeOwnerObserver, NativeOwnerSample, NativeRegistration, NativeStage, PreparationCensus,
+    AppendOwnerSample, AppendStage, NativeOwnerObserver, NativeOwnerSample, NativeRegistration,
+    NativeStage, PreparationCensus,
 };
 use opc_persist::{ConfigHistoryLimits, ConfigHistoryRetention};
 use opc_session_net::consensus::capacity_observation::{
@@ -16,8 +20,15 @@ use opc_session_net::consensus::capacity_observation::{
 struct NativeResults {
     decoded: Option<NativeOwnerSample>,
     validated: Option<NativeOwnerSample>,
-    mutation: Option<(NativeOwnerSample, Option<NativeTransportOverlap>)>,
+    mutation: Option<(
+        NativeOwnerSample,
+        Option<(NativeTransportOverlap, tls::Checkpoint)>,
+    )>,
     written: Option<NativeOwnerSample>,
+    append: Option<(
+        AppendOwnerSample,
+        opc_session_net::consensus::capacity_observation::BufferTotals,
+    )>,
     counts: [usize; 4],
 }
 
@@ -25,14 +36,24 @@ struct NativeResults {
 // preparations, native command, ledger, request, frame or database.
 struct NativeBridge {
     transport: Arc<ConsensusBufferObservation>,
+    tls: Arc<tls::Census>,
     results: std::sync::Mutex<NativeResults>,
 }
 
 impl NativeOwnerObserver for NativeBridge {
+    fn observe_append(&self, sample: AppendOwnerSample) {
+        if sample.stage == AppendStage::OutputsReady {
+            // Original append outputs stay borrowed through this current read.
+            // This phase precedes native apply and never releases its frame gate.
+            let current = self.transport.snapshot().live;
+            self.results.lock().unwrap().append = Some((sample, current));
+        }
+    }
+
     fn observe(&self, sample: NativeOwnerSample) {
         let overlap = (sample.stage == NativeStage::AuthenticatedMutation).then(|| {
             self.transport
-                .capture_native_overlap_and_release(sample.source)
+                .capture_native_overlap_and_release_with(sample.source, |_| self.tls.snapshot())
         });
         let mut results = self.results.lock().unwrap();
         match sample.stage {
@@ -234,6 +255,7 @@ async fn stop(
     released: Vec<Released>,
     addresses: &[Arc<RwLock<Option<SocketAddr>>>; MEMBERS],
     observation: &Arc<ConsensusBufferObservation>,
+    tls: &tls::Census,
 ) {
     for (store, server) in stores.iter().zip(servers) {
         if let Some(server) = server {
@@ -255,14 +277,15 @@ async fn stop(
         *address.write().unwrap() = None;
     }
     // Producers and listeners have stopped and original peer pools are gone.
-    // Observe the final TCP/attempt destructor tails under the existing guard;
-    // this is not a join of unobserved tasks or a private TLS allocation barrier.
+    // Observe the final TCP/attempt destructor tails and, separately, original
+    // TLS/material/split receipt frees under the same existing cleanup guard.
     tokio::time::timeout(DURABLE_CONSENSUS_OPERATION_TIMEOUT, async {
         observation.wait_for_no_inbound_sockets().await;
         observation.wait_for_no_outbound_owners().await;
+        tls.wait_for_drain().await;
     })
     .await
-    .expect("original endpoint census drains after native shutdown");
+    .expect("original endpoint and TLS receipt censuses drain after native shutdown");
 }
 
 native_case!(
@@ -276,6 +299,7 @@ native_case!(
         let addresses = std::array::from_fn(|_| Arc::new(RwLock::new(None)));
         let transfers: [_; MEMBERS] = std::array::from_fn(|_| Arc::new(Transfers::default()));
         let observation = Arc::new(ConsensusBufferObservation::default());
+        let tls = tls::Census::new(&observation);
         let stores = open_nine(
             &directory,
             &manifest,
@@ -396,7 +420,16 @@ native_case!(
         .expect("production compaction finishes under original guard");
         assert_eq!(effect_counts(&databases[lagging]), offline_counts);
         assert!(snapshot::current_snapshot(&databases[lagging]).is_none());
-        stop(None, stores, servers, released, &addresses, &observation).await;
+        stop(
+            None,
+            stores,
+            servers,
+            released,
+            &addresses,
+            &observation,
+            &tls,
+        )
+        .await;
         assert_eq!(observation.snapshot().live.calls, 0);
 
         // Every donor has purged beyond the lagging prefix. Keep the real
@@ -522,6 +555,7 @@ native_case!(
         preparation_owners.extend(census.observe_audited(leader_id, &prepared));
         preparation_owners.extend(census.observe_audited(leader_id, &prepared_alias));
         let native_bridge = Arc::new(NativeBridge {
+            tls: tls.clone(),
             transport: observation.clone(),
             results: std::sync::Mutex::new(NativeResults::default()),
         });
@@ -699,9 +733,11 @@ native_case!(
             released,
             &addresses,
             &observation,
+            &tls,
         )
         .await;
         let native_drain = native_registration.snapshot();
+        let tls_after_mutation = tls.snapshot();
         let native_results = std::mem::take(&mut *native_bridge.results.lock().unwrap());
         drop(native_registration);
         let drained = observation.snapshot();
@@ -750,7 +786,17 @@ native_case!(
             committed,
             "original handle recovery and reopen do not resubmit or mutate effects"
         );
-        stop(None, stores, servers, released, &addresses, &observation).await;
+        stop(
+            None,
+            stores,
+            servers,
+            released,
+            &addresses,
+            &observation,
+            &tls,
+        )
+        .await;
+        let tls_after_recovery = tls.snapshot();
         assert_eq!(observation.snapshot().live, Default::default());
         for transfer in &transfers {
             assert_eq!(transfer.active.load(Ordering::SeqCst), 0);
@@ -810,9 +856,26 @@ native_case!(
         let (native, transport) = native_results.mutation.expect(
             "CONFIG_CAPACITY_NATIVE_OWNER_BRIDGE_RED: actual native mutation checkpoint after completed lifecycle",
         );
-        let transport = transport.expect(
+        let (transport, tls_checkpoint) = transport.expect(
             "CONFIG_CAPACITY_NATIVE_TRANSPORT_JOIN_RED: currently live selected append and snapshot at native mutation",
         );
+        tls_checkpoint.verify(&transport, &tls_after_mutation, &tls_after_recovery);
+        let (append, append_transport) = native_results
+            .append
+            .expect("CONFIG_CAPACITY_NINE_APPEND_BUFFERS_RED: original native append callback");
+        assert_eq!(append.source, leader_id);
+        assert_eq!(append.stage, AppendStage::OutputsReady);
+        assert_eq!(append.unmeasured_entries, 0);
+        assert_eq!(append.selected_entries, 1);
+        assert_eq!(append.completed_outputs, append.entries);
+        assert!(append.descriptor_bytes > 0 && append.selected_json_bytes > BOUNDED_LOGICAL_BYTES);
+        assert!(append.selected_entry_bytes > BOUNDED_LOGICAL_BYTES);
+        assert!(
+            append.node_mutation_bytes >= append.selected_mutation_bytes + append.descriptor_bytes
+        );
+        assert_eq!(native_drain.append_scopes, 0);
+        assert!(native_drain.append_callbacks >= 5);
+        println!("CONFIG_CAPACITY_NINE_APPEND_BUFFERS_LIFECYCLE append={append:?} transport_at_append={append_transport:?} phase_separate_from_apply=true native_wal=true full_memory_bound=false");
         assert_eq!(
             native_results.counts,
             [1, 1, 1, 1],

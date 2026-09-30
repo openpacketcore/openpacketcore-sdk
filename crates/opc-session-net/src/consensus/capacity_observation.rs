@@ -662,12 +662,29 @@ impl ConsensusBufferObservation {
         &self,
         source: ConsensusNodeId,
     ) -> Option<NativeTransportOverlap> {
+        self.capture_native_overlap_and_release_with(source, |_| ())
+            .map(|(transport, ())| transport)
+    }
+
+    /// Add another numeric census while the current transport owners stay pinned.
+    /// The synchronous callback runs under the transport-registration lock only
+    /// when a current native pair exists. It must not call this observer again,
+    /// wait for another task or retain observed resources. The caller's native
+    /// and preparation borrows must remain live throughout this call.
+    pub fn capture_native_overlap_and_release_with<R>(
+        &self,
+        source: ConsensusNodeId,
+        capture: impl FnOnce(&NativeTransportOverlap) -> R,
+    ) -> Option<(NativeTransportOverlap, R)> {
         let captured = {
             let mut state = self.state();
             if state.native_source != Some(source) {
                 return None;
             }
-            let captured = state.native_overlap();
+            let captured = state.native_overlap().map(|transport| {
+                let additional = capture(&transport);
+                (transport, additional)
+            });
             state.held_snapshot_target = None;
             state.held_append_target = None;
             state.native_source = None;
