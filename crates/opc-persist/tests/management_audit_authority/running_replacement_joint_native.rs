@@ -10,6 +10,9 @@ use opc_consensus::engine::raft::{AppendEntriesRequest, InstallSnapshotRequest, 
 use opc_consensus::engine::storage::RaftStateMachine;
 use opc_consensus::engine::{RaftSnapshotBuilder, StoredMembership, Vote};
 
+#[path = "running_replacement_cleanup_admission.rs"]
+mod cleanup_admission;
+
 fn profile() -> RetainedConfigProfile {
     serde_json::from_str("\"netconf-running-v1\"").expect("JOINT_NATIVE_EXPLICIT_PROFILE")
 }

@@ -538,7 +538,10 @@ impl ConsensusConfigStore {
         {
             return AuditAdmission::Rejected(AuditAuthorityError::InvalidInput);
         }
-        let ledger = match self.read_audit_ledger().await {
+        let ledger = match self
+            .read_audit_ledger_for_submission(ownership.clone())
+            .await
+        {
             Ok(ledger) => ledger,
             Err(error) => return AuditAdmission::Rejected(error),
         };
@@ -650,7 +653,10 @@ impl ConsensusConfigStore {
         // await would overlap an unnecessary decoded audit allocation.
         drop(ledger);
         if checkpoint_before_submission {
-            if let Err(error) = self.checkpoint_audit_tail().await {
+            if let Err(error) = self
+                .checkpoint_audit_tail_for_submission(ownership.clone())
+                .await
+            {
                 return AuditAdmission::Rejected(error);
             }
         }
@@ -659,7 +665,7 @@ impl ConsensusConfigStore {
                 .submit_owned_request_on_local_leader_guarded(
                     request,
                     command,
-                    ownership,
+                    ownership.clone(),
                     Some(admission),
                 )
                 .await
@@ -671,10 +677,11 @@ impl ConsensusConfigStore {
                 Err(super::LocalSubmissionError::Submission(error)) => Err(error),
             }
         } else if local_only {
-            self.submit_owned_request_on_local_leader(request, command, ownership)
+            self.submit_owned_request_on_local_leader(request, command, ownership.clone())
                 .await
         } else {
-            self.submit_owned_request(request, command, ownership).await
+            self.submit_owned_request(request, command, ownership.clone())
+                .await
         };
         match response {
             Err(_error) => {
@@ -736,7 +743,10 @@ impl ConsensusConfigStore {
                     }
                 }
                 let refreshed = match &target_command {
-                    Some(target) => match self.read_audit_ledger().await {
+                    Some(target) => match self
+                        .read_audit_ledger_for_submission(ownership.clone())
+                        .await
+                    {
                         Ok(ledger) => target
                             .lookup_receipt(&ledger, self.inner.backend.audit_key(), caller)
                             .and_then(|receipt| {
@@ -753,7 +763,14 @@ impl ConsensusConfigStore {
                             }),
                         Err(error) => Err(error),
                     },
-                    None => self.lookup_audit_operation(handle, caller).await,
+                    None => {
+                        self.lookup_audit_operation_with_ownership(
+                            handle,
+                            caller,
+                            ownership.clone(),
+                        )
+                        .await
+                    }
                 };
                 match refreshed {
                     Ok(Some(receipt)) => AuditAdmission::Applied(receipt),
@@ -811,8 +828,18 @@ impl ConsensusConfigStore {
         handle: &AuditOperationHandle,
         caller: AuditCaller,
     ) -> Result<Option<AuditOperationReceipt>, AuditAuthorityError> {
+        self.lookup_audit_operation_with_ownership(handle, caller, None)
+            .await
+    }
+
+    async fn lookup_audit_operation_with_ownership(
+        &self,
+        handle: &AuditOperationHandle,
+        caller: AuditCaller,
+        ownership: SubmissionOwnership,
+    ) -> Result<Option<AuditOperationReceipt>, AuditAuthorityError> {
         handle.verify(self.inner.backend.audit_key(), self.inner.identity, caller)?;
-        let ledger = self.read_audit_ledger().await?;
+        let ledger = self.read_audit_ledger_for_submission(ownership).await?;
         let receipt = ledger.lookup(self.inner.backend.audit_key(), handle, caller)?;
         if receipt.is_none() {
             handle.require_live(
@@ -912,7 +939,25 @@ impl ConsensusConfigStore {
     }
 
     pub(super) async fn read_audit_ledger(&self) -> Result<LedgerState, AuditAuthorityError> {
-        let ledger = self.read_audit_ledger_without_checkpoint().await?;
+        self.read_audit_ledger_for_submission(None).await
+    }
+
+    pub(super) async fn read_audit_ledger_for_submission(
+        &self,
+        ownership: SubmissionOwnership,
+    ) -> Result<LedgerState, AuditAuthorityError> {
+        self.linearizable_barrier()
+            .await
+            .map_err(|_| AuditAuthorityError::Unavailable)?;
+        let read = read_audit_ledger_worker_with_submission(
+            &self.inner.backend,
+            self.inner.identity,
+            self.inner.operation_timeout,
+            None,
+            ownership,
+        )
+        .await?;
+        let ledger = read.ledger.ok_or(AuditAuthorityError::Unavailable)?;
         self.verify_audit_checkpoint(&ledger).await?;
         Ok(ledger)
     }
@@ -948,6 +993,7 @@ impl ConsensusConfigStore {
 struct AuditLedgerRead {
     ledger: Option<LedgerState>,
     reservation: Option<opc_crypto::ConfigPreparationReservation>,
+    _submission: SubmissionOwnership,
     #[cfg(all(test, target_os = "linux"))]
     _observation: Option<target_recovery_worker_tests::ReadObservation>,
 }
@@ -958,6 +1004,16 @@ async fn read_audit_ledger_worker(
     timeout: std::time::Duration,
     reservation: Option<opc_crypto::ConfigPreparationReservation>,
 ) -> Result<AuditLedgerRead, AuditAuthorityError> {
+    read_audit_ledger_worker_with_submission(backend, identity, timeout, reservation, None).await
+}
+
+async fn read_audit_ledger_worker_with_submission(
+    backend: &crate::SqliteBackend,
+    identity: crate::ConfigConsensusIdentity,
+    timeout: std::time::Duration,
+    reservation: Option<opc_crypto::ConfigPreparationReservation>,
+    ownership: SubmissionOwnership,
+) -> Result<AuditLedgerRead, AuditAuthorityError> {
     #[cfg(all(test, target_os = "linux"))]
     let observation = target_recovery_worker_tests::observe(backend);
     let worker_backend = backend.clone();
@@ -967,6 +1023,7 @@ async fn read_audit_ledger_worker(
         move |conn, cancellation| {
             #[cfg(all(test, target_os = "linux"))]
             let observation = observation;
+            let _submission = ownership;
             // This local must own the destination lease during decoding,
             // including after the async receiver has been dropped.
             let reservation = reservation;
@@ -988,6 +1045,7 @@ async fn read_audit_ledger_worker(
             Ok(AuditLedgerRead {
                 ledger,
                 reservation,
+                _submission,
                 #[cfg(all(test, target_os = "linux"))]
                 _observation: observation,
             })
@@ -1000,7 +1058,7 @@ async fn read_audit_ledger_worker(
 
 #[cfg(all(test, target_os = "linux"))]
 #[path = "audit/target_recovery_worker_tests.rs"]
-mod target_recovery_worker_tests;
+pub(super) mod target_recovery_worker_tests;
 
 impl ConsensusConfigStore {
     fn require_netconf_target_profile(&self) -> Result<(), AuditAuthorityError> {
@@ -1345,7 +1403,10 @@ impl ConsensusConfigStore {
                 return AuditAdmission::Rejected(AuditAuthorityError::InvalidInput);
             }
         }
-        match self.preflight_netconf_target(prepared).await {
+        match self
+            .preflight_netconf_target_phase(prepared, false, ownership.clone())
+            .await
+        {
             Ok(Some(receipt)) => return AuditAdmission::Applied(receipt),
             Ok(None) => {}
             Err(error) => return AuditAdmission::Rejected(error),
@@ -1399,7 +1460,10 @@ impl ConsensusConfigStore {
             Ok(ownership) => ownership,
             Err(error) => return AuditAdmission::Rejected(error),
         };
-        let ledger = match self.read_audit_ledger().await {
+        let ledger = match self
+            .read_audit_ledger_for_submission(ownership.clone())
+            .await
+        {
             Ok(ledger) => ledger,
             Err(error) => return AuditAdmission::Rejected(error),
         };
@@ -1423,7 +1487,11 @@ impl ConsensusConfigStore {
         }) {
             return AuditAdmission::Rejected(AuditAuthorityError::RecoveryRequired);
         }
-        if let Err(error) = self.checkpoint_audit_tail().await {
+        drop(ledger);
+        if let Err(error) = self
+            .checkpoint_audit_tail_for_submission(ownership.clone())
+            .await
+        {
             return AuditAdmission::Rejected(error);
         }
         self.audit_operation_command_with_route(
@@ -1443,13 +1511,15 @@ impl ConsensusConfigStore {
         &self,
         prepared: &crate::audit_authority::PreparedTargetMutation,
     ) -> Result<Option<AuditOperationReceipt>, AuditAuthorityError> {
-        self.preflight_netconf_target_phase(prepared, false).await
+        self.preflight_netconf_target_phase(prepared, false, None)
+            .await
     }
 
     async fn preflight_netconf_target_phase(
         &self,
         prepared: &crate::audit_authority::PreparedTargetMutation,
         retire_cleanup: bool,
+        ownership: SubmissionOwnership,
     ) -> Result<Option<AuditOperationReceipt>, AuditAuthorityError> {
         self.verify_netconf_target(prepared, prepared.command().effect.caller)?;
         self.linearizable_barrier()
@@ -1457,6 +1527,8 @@ impl ConsensusConfigStore {
             .map_err(|_| AuditAuthorityError::Unavailable)?;
         let prepared = prepared.clone();
         let backend = self.inner.backend.clone();
+        #[cfg(all(test, target_os = "linux"))]
+        let observation = target_recovery_worker_tests::observe(&backend);
         let identity = self.inner.identity;
         let now = self
             .inner
@@ -1464,10 +1536,13 @@ impl ConsensusConfigStore {
             .now_utc()
             .as_offset_datetime()
             .unix_timestamp();
-        let (ledger, decision) = super::super::run_backend_sqlite_with_timeout(
+        let (read, decision) = super::super::run_backend_sqlite_with_timeout(
             &self.inner.backend,
             self.inner.operation_timeout,
             move |conn, cancellation| {
+                #[cfg(all(test, target_os = "linux"))]
+                let observation = observation;
+                let _submission = ownership;
                 let unavailable = || std::io::Error::other("target authority unavailable");
                 let tx = conn.unchecked_transaction().map_err(|_| unavailable())?;
                 super::super::sqlite::validate_live_history_schema_for_profile(
@@ -1481,6 +1556,10 @@ impl ConsensusConfigStore {
                         .map_err(|_| unavailable())?,
                 )?;
                 let keys = backend.management_audit_keys().ok_or_else(unavailable)?;
+                #[cfg(all(test, target_os = "linux"))]
+                if let Some(observation) = &observation {
+                    observation.before_decode();
+                }
                 let ledger = super::super::audit::read_with_keys_sync(
                     &tx,
                     backend.audit_key(),
@@ -1488,6 +1567,10 @@ impl ConsensusConfigStore {
                     identity,
                 )?
                 .ok_or_else(unavailable)?;
+                #[cfg(all(test, target_os = "linux"))]
+                if let Some(observation) = &observation {
+                    observation.after_decode();
+                }
                 let decision = if retire_cleanup {
                     let mut candidate = ledger.clone();
                     super::super::audit_targets::retire_cleanup_sync(
@@ -1532,12 +1615,26 @@ impl ConsensusConfigStore {
                 };
                 cancellation.check_io()?;
                 tx.commit().map_err(|_| unavailable())?;
-                Ok((ledger, decision))
+                Ok((
+                    AuditLedgerRead {
+                        ledger: Some(ledger),
+                        reservation: None,
+                        _submission,
+                        #[cfg(all(test, target_os = "linux"))]
+                        _observation: observation,
+                    },
+                    decision,
+                ))
             },
         )
         .await
         .map_err(|_| AuditAuthorityError::Unavailable)?;
-        self.verify_audit_checkpoint(&ledger).await?;
+        self.verify_audit_checkpoint(
+            read.ledger
+                .as_ref()
+                .ok_or(AuditAuthorityError::Unavailable)?,
+        )
+        .await?;
         decision
     }
 }
@@ -2033,10 +2130,20 @@ impl ConsensusConfigStore {
         if let Err(error) = verified {
             return AuditAdmission::Rejected(error);
         }
+        // Retirement is a new native submission, including its ledger decode.
+        // Keep destination capacity owned through accepted completion even when
+        // the caller drops this future after the native command was accepted.
+        let ownership = match self.begin_netconf_target_submission(prepared) {
+            Ok(ownership) => ownership,
+            Err(error) => return AuditAdmission::Rejected(error),
+        };
         // A fresh authenticated lookup preserves an original settled result even
         // when current lifecycle/expiry would refuse a new retirement. It grants
         // no effect authority to an Intent obtained after a lost acknowledgement.
-        let ledger = match self.read_audit_ledger().await {
+        let ledger = match self
+            .read_audit_ledger_for_submission(ownership.clone())
+            .await
+        {
             Ok(ledger) => ledger,
             Err(error) => return AuditAdmission::Rejected(error),
         };
@@ -2052,7 +2159,11 @@ impl ConsensusConfigStore {
             Err(error) => return AuditAdmission::Rejected(error),
             _ => {}
         }
-        match self.preflight_netconf_target_phase(prepared, true).await {
+        drop(ledger);
+        match self
+            .preflight_netconf_target_phase(prepared, true, ownership.clone())
+            .await
+        {
             Ok(Some(receipt)) => return AuditAdmission::Applied(receipt),
             Ok(None) => {}
             Err(error) => return AuditAdmission::Rejected(error),
@@ -2066,7 +2177,7 @@ impl ConsensusConfigStore {
                     Box::new(command),
                 ))),
                 true,
-                None,
+                ownership,
             )
             .await;
         match decision {

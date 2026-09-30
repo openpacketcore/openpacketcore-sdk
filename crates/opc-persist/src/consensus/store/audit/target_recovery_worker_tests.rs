@@ -17,18 +17,19 @@ use opc_consensus::{
 };
 use opc_crypto::{ConfigCapacityProfile, ConfigPreparationPool};
 use std::collections::BTreeMap;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Condvar, Mutex, OnceLock, Weak};
 use tokio::sync::{Notify, Semaphore};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum Point {
+pub(in crate::consensus::store) enum Point {
     BeforeDecode,
     AfterDecode,
 }
 
 struct Gate {
     point: Point,
+    reads_to_skip: AtomicUsize,
     entered: Notify,
     drained: Notify,
     decoded: AtomicBool,
@@ -62,7 +63,7 @@ fn observers() -> &'static Mutex<BTreeMap<usize, Weak<Gate>>> {
 // The registration pins this backend's actual worker-gate allocation, so its
 // address cannot be reused while the scoped registration exists. The observer
 // stores no payload, reservation or callback that supplies a ledger result.
-struct Registration {
+pub(in crate::consensus::store) struct Registration {
     key: usize,
     gate: Arc<Gate>,
     _worker_gate: Arc<Semaphore>,
@@ -70,10 +71,20 @@ struct Registration {
 
 impl Registration {
     fn new(backend: &SqliteBackend, point: Point) -> Self {
+        Self::nth(backend, point, 1)
+    }
+
+    pub(in crate::consensus::store) fn nth(
+        backend: &SqliteBackend,
+        point: Point,
+        ordinal: usize,
+    ) -> Self {
+        assert!(ordinal > 0);
         let worker_gate = backend.config_consensus_worker_gate();
         let key = Arc::as_ptr(&worker_gate) as usize;
         let gate = Arc::new(Gate {
             point,
+            reads_to_skip: AtomicUsize::new(ordinal - 1),
             entered: Notify::new(),
             drained: Notify::new(),
             decoded: AtomicBool::new(false),
@@ -96,7 +107,7 @@ impl Registration {
         }
     }
 
-    async fn entered(&self) {
+    pub(in crate::consensus::store) async fn entered(&self) {
         tokio::time::timeout(
             DURABLE_CONSENSUS_OPERATION_TIMEOUT,
             self.gate.entered.notified(),
@@ -105,13 +116,21 @@ impl Registration {
         .expect("real SQL worker reached retained decoding gate");
     }
 
-    async fn drained(&self) {
+    pub(in crate::consensus::store) async fn drained(&self) {
         tokio::time::timeout(
             DURABLE_CONSENSUS_OPERATION_TIMEOUT,
             self.gate.drained.notified(),
         )
         .await
         .expect("worker/result allocations and reservation drained");
+    }
+
+    pub(in crate::consensus::store) fn release(&self) {
+        self.gate.release();
+    }
+
+    pub(in crate::consensus::store) fn decoded(&self) -> bool {
+        self.gate.decoded.load(Ordering::Acquire)
     }
 }
 
@@ -135,12 +154,19 @@ pub(super) struct ReadObservation(Arc<Gate>);
 pub(super) fn observe(backend: &SqliteBackend) -> Option<ReadObservation> {
     let worker_gate = backend.config_consensus_worker_gate();
     let key = Arc::as_ptr(&worker_gate) as usize;
-    observers()
-        .lock()
-        .expect("observer registry")
-        .remove(&key)
-        .and_then(|gate| gate.upgrade())
-        .map(ReadObservation)
+    let mut registered = observers().lock().expect("observer registry");
+    let gate = registered.get(&key)?.upgrade()?;
+    if gate
+        .reads_to_skip
+        .fetch_update(Ordering::AcqRel, Ordering::Acquire, |remaining| {
+            remaining.checked_sub(1)
+        })
+        .is_ok()
+    {
+        return None;
+    }
+    registered.remove(&key);
+    Some(ReadObservation(gate))
 }
 
 impl ReadObservation {
@@ -285,7 +311,7 @@ fn all_slots_available(pool: &ConfigPreparationPool) {
     drop(slots);
 }
 
-async fn worker_drained(backend: &SqliteBackend) {
+pub(in crate::consensus::store) async fn worker_drained(backend: &SqliteBackend) {
     let gate = backend.config_consensus_worker_gate();
     let permit = tokio::time::timeout(DURABLE_CONSENSUS_OPERATION_TIMEOUT, gate.acquire_owned())
         .await

@@ -21,6 +21,7 @@ const WAIT: Duration = Duration::from_secs(10);
 #[derive(Default)]
 struct Checkpoint {
     value: Mutex<Option<AuditCheckpoint>>,
+    loads: std::sync::atomic::AtomicUsize,
     unavailable: AtomicBool,
     pause: AtomicBool,
     entered: tokio::sync::Notify,
@@ -32,6 +33,7 @@ impl AuditCheckpointPort for Checkpoint {
         &self,
         _: super::super::ConfigConsensusIdentity,
     ) -> Result<Option<AuditCheckpoint>, AuditAuthorityError> {
+        self.loads.fetch_add(1, Ordering::AcqRel);
         // Delay delivery of a real checkpoint observation, not the effect or
         // a fabricated SDK response. A concurrent advance cannot rewrite it.
         let observed = self.value.lock().unwrap().clone();

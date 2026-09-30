@@ -11,6 +11,7 @@ use crate::audit_authority::continuity::checkpoint::CheckpointBody;
 use crate::audit_authority::continuity::*;
 use crate::audit_authority::ledger::LedgerState;
 use crate::audit_authority::{AuditAuthorityError, AuditCaller};
+use crate::consensus::preparation::SubmissionOwnership;
 use crate::consensus::{audit::AuditCommand, ConfigMutationIntent};
 use crate::{ConfigConsensusIdentity, ConfigConsensusTopology, SqliteBackend};
 use opc_consensus::{ConsensusNodeId, ConsensusPeer};
@@ -125,12 +126,24 @@ impl ConsensusConfigStore {
     // Advancing mutation continuity never acknowledges an export. Retention
     // uses the separately committed export receipt below, even at an equal tail.
     pub(super) async fn checkpoint_audit_tail(&self) -> Result<(), AuditAuthorityError> {
+        let ownership = self
+            .reserve_submission()
+            .map_err(|_| AuditAuthorityError::Unavailable)?;
+        self.checkpoint_audit_tail_for_submission(ownership).await
+    }
+
+    pub(super) async fn checkpoint_audit_tail_for_submission(
+        &self,
+        ownership: SubmissionOwnership,
+    ) -> Result<(), AuditAuthorityError> {
         let policy = self
             .inner
             .audit_continuity
             .as_ref()
             .ok_or(AuditAuthorityError::Unavailable)?;
-        let ledger = self.read_audit_ledger().await?;
+        let ledger = self
+            .read_audit_ledger_for_submission(ownership.clone())
+            .await?;
         #[cfg(all(test, target_os = "linux"))]
         let ledger = super::config_capacity_native_owner_observation::caller_ledger(
             &self.inner.backend,
@@ -172,7 +185,7 @@ impl ConsensusConfigStore {
         // The exact external prefix has been authenticated and read back.
         // Native Checkpoint independently validates its current ledger again.
         drop(ledger);
-        self.audit_maintenance(AuditCommand::Checkpoint(checkpoint))
+        self.audit_maintenance_with_ownership(AuditCommand::Checkpoint(checkpoint), ownership)
             .await
     }
 
@@ -542,6 +555,18 @@ impl ConsensusConfigStore {
     }
 
     async fn audit_maintenance(&self, command: AuditCommand) -> Result<(), AuditAuthorityError> {
+        let ownership = self
+            .reserve_submission()
+            .map_err(|_| AuditAuthorityError::Unavailable)?;
+        self.audit_maintenance_with_ownership(command, ownership)
+            .await
+    }
+
+    async fn audit_maintenance_with_ownership(
+        &self,
+        command: AuditCommand,
+        ownership: SubmissionOwnership,
+    ) -> Result<(), AuditAuthorityError> {
         // The operation's exact transition/checkpoint/prefix is its durable
         // idempotency authority in the ledger. Each invocation is a new attempt:
         // a cached rejection (for example, a not-yet-expired retained handle)
@@ -567,9 +592,10 @@ impl ConsensusConfigStore {
                 request,
                 &command,
             );
-        self.submit_request(
+        self.submit_owned_request(
             request,
             ConfigMutationIntent::ManagementAudit(Box::new(command)),
+            ownership,
         )
         .await
         .map_err(|_| AuditAuthorityError::Unavailable)?
