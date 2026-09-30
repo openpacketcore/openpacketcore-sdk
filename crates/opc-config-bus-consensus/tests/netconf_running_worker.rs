@@ -170,6 +170,7 @@ struct Checkpoint {
     current: Mutex<Option<AuditCheckpoint>>,
     database: std::path::PathBuf,
     fail_after_effect: AtomicBool,
+    fail_after_history_count: AtomicUsize,
     revocation: revocation::CheckpointControls,
 }
 
@@ -198,7 +199,7 @@ impl AuditCheckpointPort for Checkpoint {
             let count: u64 = conn
                 .query_row("SELECT count(*) FROM config_history", [], |row| row.get(0))
                 .unwrap();
-            if count != 0 {
+            if count >= self.fail_after_history_count.load(Ordering::Acquire) as u64 {
                 return Err(AuditAuthorityError::Unavailable);
             }
         }
@@ -313,6 +314,7 @@ impl Fixture {
             current: Mutex::new(None),
             database: directory.path().join("authority.sqlite"),
             fail_after_effect: AtomicBool::new(false),
+            fail_after_history_count: AtomicUsize::new(1),
             revocation: revocation::CheckpointControls::default(),
         });
         let policy = AuditContinuityPolicy::new(

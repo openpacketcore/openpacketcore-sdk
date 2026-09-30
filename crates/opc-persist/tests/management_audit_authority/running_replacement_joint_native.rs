@@ -630,7 +630,7 @@ async fn joint_native_running_rejects_unsupported_and_unadmitted_without_effect(
         f.store
             .submit_request_on_local_leader(
                 opc_consensus::ConsensusRequestId::from_bytes([0xB1; 16]),
-                ConfigMutationIntent::ClearRecoveryRequired { tx_id: TxId::new() },
+                ConfigMutationIntent::MarkConfirmed { tx_id: TxId::new() },
             )
             .await
             .is_err(),

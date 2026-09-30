@@ -150,6 +150,8 @@ async fn joint_native_running_publication_requires_terminal_and_protects_pruning
             .await,
     );
     assert!(!result.terminal_recorded());
+    // An independently checkpointed outcome is still not a terminal record.
+    f.store.checkpoint_audit_tail().await.unwrap();
     let before = effect_rows(&f.store).await;
     let refused = f.store.clear_recovery_required(record.tx_id).await.is_err();
     assert!(

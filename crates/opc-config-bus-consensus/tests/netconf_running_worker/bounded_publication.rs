@@ -52,6 +52,9 @@ async fn bounded_running_worker_clears_durable_marker_and_recovers_publication()
                 && !recovered.completion_pending()
                 && !recovered.publication_pending());
         same_original &= f.rows() == before && history_count(&f) == version + 1;
+        if !published || !marker_cleared {
+            break;
+        }
         // An unrelated or older transaction must not acknowledge this head.
         let before = f.rows();
         assert!(f
@@ -66,9 +69,6 @@ async fn bounded_running_worker_clears_durable_marker_and_recovers_publication()
             .unwrap();
         assert_eq!(f.rows(), before, "BOUNDED_MARKER_EXACT_REPLAY");
         previous = Some(stored.tx_id);
-        if !published || !marker_cleared {
-            break;
-        }
     }
     let two_commits = history_count(&f) == 2;
     drop(session);
@@ -101,10 +101,23 @@ async fn bounded_running_marker_refuses_uncheckpointed_outcome() {
     .unwrap();
     let audit = bus.required_netconf_audit().unwrap();
     let session = audit.open_session(&principal()).await.unwrap();
+    // A fully settled earlier Running operation cannot authorize the new head.
+    let first = request(0);
+    let event = request_event(&first);
+    let earlier = known(
+        audit
+            .replace_running(&session, &principal(), first, event)
+            .await
+            .unwrap(),
+    );
+    assert!(!earlier.completion_pending() && !earlier.publication_pending());
+    f.checkpoint
+        .fail_after_history_count
+        .store(2, Ordering::Release);
     f.checkpoint
         .fail_after_effect
         .store(true, Ordering::Release);
-    let request = request(0);
+    let request = request(1);
     let event = request_event(&request);
     let receipt = known(
         audit
