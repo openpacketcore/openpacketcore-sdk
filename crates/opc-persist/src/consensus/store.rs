@@ -7,6 +7,9 @@ mod config_capacity_local_admission;
 #[cfg(all(test, target_os = "linux"))]
 pub(super) mod config_capacity_native_owner_observation;
 mod recovery;
+#[cfg(all(test, target_os = "linux", feature = "dangerous-test-hooks"))]
+#[path = "capacity_observation/working_buffers/store_tests.rs"]
+mod working_buffer_tests;
 
 pub use recovery::{
     ConfigCommitRecoveryHandle, ConfigCommitRecoveryOutcome, PreparedConfigCommitOperation,
@@ -1494,7 +1497,12 @@ impl ConsensusConfigStore {
                     .await
             } else {
                 match self
-                    .call_mutation_peer(leader, input.forward(budget), deadline, ownership.clone())
+                    .call_mutation_peer(
+                        leader,
+                        input.forward_owned(budget),
+                        deadline,
+                        ownership.clone(),
+                    )
                     .await
                 {
                     Ok(reply) => reply,
@@ -1654,13 +1662,17 @@ impl ConsensusConfigStore {
             command.request_id,
             deadline,
         );
-        let response =
-            match tokio::time::timeout_at(deadline, self.inner.raft.client_write_ff(command)).await
-            {
-                Err(_) => return ForwardMutationReply::OutcomeUnknown,
-                Ok(Err(_)) => return ForwardMutationReply::Unavailable,
-                Ok(Ok(response)) => response,
-            };
+        // The engine call owns its argument from this handoff onward. Subsequent
+        // engine retention is outside the SDK staging observer's declared scope.
+        #[cfg(feature = "dangerous-test-hooks")]
+        let submission = self.inner.raft.client_write_ff(command.into_engine());
+        #[cfg(not(feature = "dangerous-test-hooks"))]
+        let submission = self.inner.raft.client_write_ff(command);
+        let response = match tokio::time::timeout_at(deadline, submission).await {
+            Err(_) => return ForwardMutationReply::OutcomeUnknown,
+            Ok(Err(_)) => return ForwardMutationReply::Unavailable,
+            Ok(Ok(response)) => response,
+        };
         #[cfg(all(test, target_os = "linux"))]
         if let Some(hook) = self
             .inner
@@ -1811,7 +1823,7 @@ impl ConsensusConfigStore {
     async fn call_mutation_peer(
         &self,
         target: ConsensusNodeId,
-        request: ForwardMutationRequest,
+        request: config_capacity_local_admission::RequestValue,
         deadline: tokio::time::Instant,
         ownership: SubmissionOwnership,
     ) -> Result<ForwardMutationReply, PersistError> {
