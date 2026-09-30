@@ -32,6 +32,7 @@ use crate::audit_authority::ledger::{EntryPayload as LedgerPayload, LedgerOperat
 pub(crate) mod append_buffers;
 pub use append_buffers::{AppendOwnerSample, AppendStage};
 pub mod raft_buffers;
+pub mod working_buffers;
 
 type Allocations = BTreeMap<usize, usize>;
 

@@ -154,9 +154,9 @@ pub struct RaftAppendSample {
 /// Borrowed numeric native/preparation allocation set for a synchronous join.
 /// Private identities cannot be inspected, cloned, or saved as owned evidence.
 pub struct AllocationView<'a> {
-    identity: ConsensusIdentity,
-    source: ConsensusNodeId,
-    allocations: &'a Allocations,
+    pub(super) identity: ConsensusIdentity,
+    pub(super) source: ConsensusNodeId,
+    pub(super) allocations: &'a Allocations,
 }
 
 impl<'a> AllocationView<'a> {
