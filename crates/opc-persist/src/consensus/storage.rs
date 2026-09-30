@@ -170,6 +170,9 @@ pub(crate) struct SqliteConfigSnapshotBuilder {
 // receivers, so observing shutdown cannot keep the storage lifetime alive.
 #[derive(Debug)]
 pub(crate) struct ConfigStorageOwner {
+    // Detached SQLite workers retain this owner independently of progress.
+    // Release the claim before announcing that the final native owner drained.
+    _engine_claim: Option<Arc<crate::backend::ConfigEngineClaim>>,
     _released: tokio::sync::watch::Sender<()>,
 }
 
@@ -187,6 +190,7 @@ impl ConfigStorageReleaseObserver {
 
 #[derive(Debug)]
 pub(crate) struct ConfigDurableProgress {
+    engine_claim: Option<Arc<crate::backend::ConfigEngineClaim>>,
     apply_deadline: config_capacity_apply_deadline::ApplyPrefixDeadline,
     committed_present: AtomicBool,
     committed_index: AtomicU64,
@@ -208,6 +212,7 @@ impl Default for ConfigDurableProgress {
     fn default() -> Self {
         let (applied_epoch, _) = tokio::sync::watch::channel(0);
         Self {
+            engine_claim: None,
             apply_deadline: Default::default(),
             committed_present: AtomicBool::new(false),
             committed_index: AtomicU64::new(0),
@@ -234,6 +239,7 @@ impl ConfigDurableProgress {
             .set(receiver)
             .map_err(|_| ConfigConsensusStorageError::BackendUnavailable)?;
         Ok(Arc::new(ConfigStorageOwner {
+            _engine_claim: self.engine_claim.clone(),
             _released: released,
         }))
     }
@@ -361,7 +367,10 @@ pub(crate) async fn open_with_recovery(
         ),
         Some(_) | None => None,
     };
-    let progress = Arc::new(ConfigDurableProgress::default());
+    let progress = Arc::new(ConfigDurableProgress {
+        engine_claim: backend.config_consensus_engine_claim(),
+        ..ConfigDurableProgress::default()
+    });
     let core = sqlite::ConfigConsensusCore::initialize(
         backend,
         snapshot_directory,
@@ -2113,6 +2122,9 @@ mod config_capacity_snapshot_tests;
 
 #[cfg(all(test, target_os = "linux"))]
 mod config_capacity_worker_ownership_tests;
+
+#[cfg(all(test, target_os = "linux"))]
+mod config_capacity_engine_incarnation_tests;
 
 #[cfg(test)]
 mod tests {

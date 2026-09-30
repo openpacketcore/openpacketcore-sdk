@@ -626,6 +626,11 @@ impl ConsensusConfigStore {
         if peers.keys().copied().collect::<BTreeSet<_>>() != expected_peers {
             return Err(ConfigConsensusOpenError::PeerSetMismatch);
         }
+        let backend = backend.claim_config_consensus_engine()?;
+        let preparation_admission = match backend.config_consensus_engine_claim() {
+            Some(claim) => opc_crypto::ConfigPreparationPool::bounded_v1_with_owner(claim),
+            None => opc_crypto::ConfigPreparationPool::bounded_v1(),
+        };
         if let Some(policy) = &audit_continuity {
             backend
                 .attach_management_audit_keys(policy.keys.clone())
@@ -689,7 +694,7 @@ impl ConsensusConfigStore {
                 proposal_admission: Arc::new(tokio::sync::Semaphore::new(
                     DURABLE_OPENRAFT_PROPOSAL_ADMISSION_SLOTS,
                 )),
-                preparation_admission: opc_crypto::ConfigPreparationPool::bounded_v1(),
+                preparation_admission,
                 #[cfg(all(test, target_os = "linux"))]
                 proposal_test_gate: std::sync::Mutex::new(None),
                 metric_leader: std::sync::Mutex::new(None),
