@@ -154,9 +154,9 @@ pub struct RaftAppendSample {
 /// Borrowed numeric native/preparation allocation set for a synchronous join.
 /// Private identities cannot be inspected, cloned, or saved as owned evidence.
 pub struct AllocationView<'a> {
-    identity: ConsensusIdentity,
-    source: ConsensusNodeId,
-    allocations: &'a Allocations,
+    pub(super) identity: ConsensusIdentity,
+    pub(super) source: ConsensusNodeId,
+    pub(super) allocations: &'a Allocations,
 }
 
 impl<'a> AllocationView<'a> {
@@ -775,6 +775,39 @@ pub(crate) async fn scope_wire<F: Future>(context: Option<OriginalWire>, future:
     }
 }
 
+/// Numeric bounds on the original duration-based RPC timeout's deadline.
+/// Tokio computes its deadline between these two constructor timestamps; the
+/// observer leaves that timeout and its duration unchanged.
+#[derive(Clone, Copy, Debug)]
+pub struct RaftAppendDeadline {
+    /// The real adapter's prescribed hard TTL.
+    pub hard_ttl: std::time::Duration,
+    /// Earliest possible original absolute deadline on Tokio's monotonic clock.
+    pub earliest: Option<tokio::time::Instant>,
+    /// Latest possible original absolute deadline on Tokio's monotonic clock.
+    pub latest: Option<tokio::time::Instant>,
+}
+
+tokio::task_local! { static RPC_DEADLINE: RaftAppendDeadline; }
+
+pub(crate) async fn scope_rpc_deadline<F: Future>(
+    hard_ttl: std::time::Duration,
+    before: tokio::time::Instant,
+    after: tokio::time::Instant,
+    future: F,
+) -> F::Output {
+    RPC_DEADLINE
+        .scope(
+            RaftAppendDeadline {
+                hard_ttl,
+                earliest: before.checked_add(hard_ttl),
+                latest: after.checked_add(hard_ttl),
+            },
+            future,
+        )
+        .await
+}
+
 /// Typed original-call attribution verified against the genuine moved payload.
 #[derive(Clone, Copy, Debug)]
 pub struct RaftAppendWitness {
@@ -782,6 +815,8 @@ pub struct RaftAppendWitness {
     pub generation: u64,
     /// Actual entries length, including multi-entry and empty heartbeat batches.
     pub entries: usize,
+    /// Original RPC timeout bounds, present once its actual timeout is built.
+    pub deadline: Option<RaftAppendDeadline>,
 }
 
 /// Verify encoded allocation provenance without decoding or retaining payloads.
@@ -801,6 +836,7 @@ pub fn raft_append_witness(
             .then_some(RaftAppendWitness {
                 generation: wire.generation,
                 entries: original.sample.entries,
+                deadline: RPC_DEADLINE.try_with(|deadline| *deadline).ok(),
             })
     })
     .ok()

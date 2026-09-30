@@ -12,6 +12,49 @@ use opc_consensus::ConsensusRequestId;
 use opc_crypto::ConfigCapacityProfile;
 use std::sync::Arc;
 
+#[cfg(feature = "dangerous-test-hooks")]
+use crate::consensus::capacity_observation::working_buffers::{
+    Observation, Observed, Vacate, WorkingBufferKind,
+};
+
+#[cfg(feature = "dangerous-test-hooks")]
+type IntentValue = Observed<ConfigMutationIntent>;
+#[cfg(not(feature = "dangerous-test-hooks"))]
+type IntentValue = ConfigMutationIntent;
+#[cfg(feature = "dangerous-test-hooks")]
+pub(super) type RequestValue = Observed<ForwardMutationRequest>;
+#[cfg(not(feature = "dangerous-test-hooks"))]
+pub(super) type RequestValue = ForwardMutationRequest;
+#[cfg(feature = "dangerous-test-hooks")]
+pub(super) type FinalizedCommand = Observed<ConfigConsensusCommand>;
+#[cfg(not(feature = "dangerous-test-hooks"))]
+pub(super) type FinalizedCommand = ConfigConsensusCommand;
+
+#[cfg(feature = "dangerous-test-hooks")]
+impl Vacate for ForwardMutationRequest {
+    fn vacate(&mut self) -> Self {
+        Self {
+            request_id: self.request_id,
+            intent: self.intent.vacate(),
+            compatibility: self.compatibility,
+            budget: self.budget,
+        }
+    }
+}
+
+#[cfg(feature = "dangerous-test-hooks")]
+impl Vacate for ConfigConsensusCommand {
+    fn vacate(&mut self) -> Self {
+        Self {
+            schema_version: self.schema_version,
+            identity: self.identity,
+            request_id: self.request_id,
+            logical_time: self.logical_time,
+            intent: self.intent.vacate(),
+        }
+    }
+}
+
 /// Fields are private to this module: no caller can replace the admitted ID or
 /// intent, attach evidence to another value, or mutate a shared audited effect.
 /// The borrowed store pins its immutable identity, profile and audit key without
@@ -19,7 +62,7 @@ use std::sync::Arc;
 pub(super) struct LocalIntent<'a> {
     store: &'a ConsensusConfigStore,
     request_id: ConsensusRequestId,
-    intent: ConfigMutationIntent,
+    intent: IntentValue,
 }
 
 impl<'a> LocalIntent<'a> {
@@ -28,6 +71,17 @@ impl<'a> LocalIntent<'a> {
         request_id: ConsensusRequestId,
         intent: ConfigMutationIntent,
     ) -> Result<Self, PersistError> {
+        #[cfg(feature = "dangerous-test-hooks")]
+        let intent = {
+            let observation = Observation::intent(
+                store.inner.identity,
+                store.inner.local_node_id,
+                request_id,
+                WorkingBufferKind::RoutingOriginal,
+                &intent,
+            );
+            Observed::new(intent, observation)
+        };
         #[cfg(all(test, target_os = "linux"))]
         let _cost_scope = super::config_capacity_cost_observation::Scope::ingress(request_id);
         // Preserve the original input/proof/size refusals before admission or
@@ -52,22 +106,56 @@ impl<'a> LocalIntent<'a> {
     }
 
     pub(super) fn into_local(self, budget: ForwardedBudget) -> LocalMutation<'a> {
+        let make_request = |intent| ForwardMutationRequest {
+            request_id: self.request_id,
+            intent,
+            compatibility: self.store.peer_compatibility(),
+            budget,
+        };
+        #[cfg(feature = "dangerous-test-hooks")]
+        let request = self
+            .intent
+            .map(WorkingBufferKind::LocalAttempt, make_request);
+        #[cfg(not(feature = "dangerous-test-hooks"))]
+        let request = make_request(self.intent);
         LocalMutation {
             origin: Some(self.store),
-            request: ForwardMutationRequest {
-                request_id: self.request_id,
-                intent: self.intent,
-                compatibility: self.store.peer_compatibility(),
-                budget,
-            },
+            request,
         }
     }
 
     pub(super) fn local(&self, budget: ForwardedBudget) -> LocalMutation<'a> {
+        #[cfg(feature = "dangerous-test-hooks")]
+        let request = self.cloned_request(budget, WorkingBufferKind::LocalAttempt);
+        #[cfg(not(feature = "dangerous-test-hooks"))]
+        let request = self.forward(budget);
         LocalMutation {
             origin: Some(self.store),
-            request: self.forward(budget),
+            request,
         }
+    }
+
+    pub(super) fn forward_owned(&self, budget: ForwardedBudget) -> RequestValue {
+        #[cfg(feature = "dangerous-test-hooks")]
+        {
+            self.cloned_request(budget, WorkingBufferKind::ForwardAttempt)
+        }
+        #[cfg(not(feature = "dangerous-test-hooks"))]
+        {
+            self.forward(budget)
+        }
+    }
+
+    #[cfg(feature = "dangerous-test-hooks")]
+    fn cloned_request(&self, budget: ForwardedBudget, kind: WorkingBufferKind) -> RequestValue {
+        Observed::create_intent(
+            self.store.inner.identity,
+            self.store.inner.local_node_id,
+            self.request_id,
+            kind,
+            || self.forward(budget),
+            |request| &request.intent,
+        )
     }
 
     pub(super) fn forward(&self, budget: ForwardedBudget) -> ForwardMutationRequest {
@@ -84,11 +172,13 @@ impl<'a> LocalIntent<'a> {
 
 pub(super) struct LocalMutation<'a> {
     origin: Option<&'a ConsensusConfigStore>,
-    request: ForwardMutationRequest,
+    request: RequestValue,
 }
 
 impl LocalMutation<'_> {
     pub(super) fn received(request: ForwardMutationRequest) -> Self {
+        #[cfg(feature = "dangerous-test-hooks")]
+        let request = Observed::new(request, None);
         Self {
             origin: None,
             request,
@@ -99,9 +189,24 @@ impl LocalMutation<'_> {
         self,
         store: &ConsensusConfigStore,
     ) -> Result<CheckedLocalMutation<'_>, ForwardMutationRejection> {
+        #[cfg(feature = "dangerous-test-hooks")]
+        let request = if self.origin.is_none() {
+            let observation = Observation::intent(
+                store.inner.identity,
+                store.inner.local_node_id,
+                self.request.request_id,
+                WorkingBufferKind::LocalAttempt,
+                &self.request.intent,
+            );
+            self.request.attach(observation)
+        } else {
+            self.request
+        };
+        #[cfg(not(feature = "dangerous-test-hooks"))]
+        let request = self.request;
         #[cfg(all(test, target_os = "linux"))]
         let _cost_scope =
-            super::config_capacity_cost_observation::Scope::local_apply(self.request.request_id);
+            super::config_capacity_cost_observation::Scope::local_apply(request.request_id);
         let reuse = if let Some(origin) = self.origin {
             // Store clones share this exact immutable authority. Even another
             // authority with equal-looking fields cannot consume this input.
@@ -109,7 +214,7 @@ impl LocalMutation<'_> {
                 return Err(ForwardMutationRejection::InvalidCommand);
             }
             origin.capacity_profile() == ConfigCapacityProfile::BoundedV1
-                && match &self.request.intent {
+                && match &request.intent {
                     ConfigMutationIntent::BoundedAppend { .. } => true,
                     ConfigMutationIntent::AuditedMutation(command) => matches!(
                         &command.effect,
@@ -123,7 +228,7 @@ impl LocalMutation<'_> {
         if !reuse {
             // Received requests and Legacy retain the original receiver checks
             // and rejection mapping before permit/read-barrier acquisition.
-            self.request
+            request
                 .intent
                 .validate_capacity(
                     store.inner.identity,
@@ -133,14 +238,14 @@ impl LocalMutation<'_> {
                 .map_err(|_| ForwardMutationRejection::InvalidCommand)?;
             preflight_config_command_replication_budget(
                 store.inner.identity,
-                self.request.request_id,
-                &self.request.intent,
+                request.request_id,
+                &request.intent,
                 store.mode(),
             )?;
         }
         Ok(CheckedLocalMutation {
             store,
-            request: self.request,
+            request,
             reuse,
         })
     }
@@ -148,7 +253,7 @@ impl LocalMutation<'_> {
 
 pub(super) struct CheckedLocalMutation<'a> {
     store: &'a ConsensusConfigStore,
-    request: ForwardMutationRequest,
+    request: RequestValue,
     reuse: bool,
 }
 
@@ -156,15 +261,21 @@ impl CheckedLocalMutation<'_> {
     pub(super) fn finalize(
         self,
         logical_time: opc_types::Timestamp,
-    ) -> Result<ConfigConsensusCommand, ForwardMutationRejection> {
+    ) -> Result<FinalizedCommand, ForwardMutationRejection> {
         let profile = self.store.capacity_profile();
-        let command = ConfigConsensusCommand {
+        let make_command = |request: ForwardMutationRequest| ConfigConsensusCommand {
             schema_version: config_command_revision(self.store.mode()),
             identity: self.store.inner.identity,
-            request_id: self.request.request_id,
+            request_id: request.request_id,
             logical_time,
-            intent: self.request.intent,
+            intent: request.intent,
         };
+        #[cfg(feature = "dangerous-test-hooks")]
+        let command = self
+            .request
+            .map(WorkingBufferKind::FinalizedCommand, make_command);
+        #[cfg(not(feature = "dangerous-test-hooks"))]
+        let command = make_command(self.request);
         // This observation spans only synchronous finalized-command admission.
         #[cfg(all(test, target_os = "linux"))]
         let cost_scope =
@@ -178,7 +289,7 @@ impl CheckedLocalMutation<'_> {
             command
                 .validate(self.store.inner.identity)
                 .map_err(|_| ForwardMutationRejection::InvalidCommand)?;
-            if command.schema_version > config_command_revision(profile) {
+            if command.schema_version > config_command_revision(self.store.mode()) {
                 return Err(ForwardMutationRejection::InvalidCommand);
             }
         } else {
@@ -191,7 +302,7 @@ impl CheckedLocalMutation<'_> {
                 .map_err(|_| ForwardMutationRejection::InvalidCommand)?;
         }
         if profile != ConfigCapacityProfile::BoundedV1
-            && !config_command_fits_replication_budget(&command, profile)
+            && !config_command_fits_replication_budget(&command, self.store.mode())
         {
             return Err(ForwardMutationRejection::CommandTooLarge);
         }
