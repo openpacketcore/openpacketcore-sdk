@@ -31,6 +31,9 @@ use crate::schema;
 use crate::types::{extract_tenant, AuditKey, AuditOpType, AuditRecord, CommitSource};
 use opc_types::TxId;
 
+pub(crate) use engine_admission::ConfigEngineClaim;
+
+mod engine_admission;
 mod ops;
 
 /// Connection storage shared with detached workers. Field order is deliberate:
@@ -40,6 +43,10 @@ mod ops;
 pub(crate) struct BackendConnection {
     connection: rusqlite::Connection,
     _retained_admission: Option<Arc<crate::local_sqlite::FileAdmission>>,
+    // Non-owning test receivers observe actual SQLite and retained-file
+    // destruction independently of any engine claim. Release this last.
+    #[cfg(all(test, target_os = "linux"))]
+    released: tokio::sync::watch::Sender<()>,
 }
 
 impl BackendConnection {
@@ -51,23 +58,37 @@ impl BackendConnection {
         Self {
             connection,
             _retained_admission: Some(admission),
+            #[cfg(all(test, target_os = "linux"))]
+            released: tokio::sync::watch::channel(()).0,
         }
+    }
+
+    #[cfg(all(test, target_os = "linux"))]
+    pub(crate) fn release_observer(&self) -> tokio::sync::watch::Receiver<()> {
+        self.released.subscribe()
     }
 
     pub(crate) fn close(self) -> Result<(), rusqlite::Error> {
         let Self {
             connection,
-            _retained_admission,
+            _retained_admission: retained_admission,
+            #[cfg(all(test, target_os = "linux"))]
+            released,
         } = self;
         // Retain admission through both explicit close and the returned
         // connection's final drop if SQLite rejects the first close attempt.
-        match connection.close() {
+        let result = match connection.close() {
             Ok(()) => Ok(()),
             Err((connection, error)) => {
                 drop(connection);
                 Err(error)
             }
-        }
+        };
+        // Mirror field order on explicit close, including test observers.
+        drop(retained_admission);
+        #[cfg(all(test, target_os = "linux"))]
+        drop(released);
+        result
     }
 }
 
@@ -163,6 +184,12 @@ pub(crate) fn deserialize_audit_op_type(s: &str) -> Result<AuditOpType, PersistE
 /// The connection and audit key are intentionally not exposed; authority is
 /// available only through typed store operations.
 ///
+/// Bounded configuration engines opened from clones share one exclusive
+/// process-local claim. The claim remains held by their native workers and
+/// preparation owners, including ciphertext aliases after shutdown or store
+/// drop. Backend clones remain usable for reads; Legacy engine opens retain
+/// their existing behavior.
+///
 /// ```compile_fail
 /// use opc_persist::SqliteBackend;
 /// fn raw_connection(backend: &SqliteBackend) {
@@ -190,6 +217,11 @@ pub struct SqliteBackend {
     /// Shared admission for config-consensus blocking work, including startup
     /// before the consensus core exists.
     config_consensus_worker_gate: Arc<tokio::sync::Semaphore>,
+    /// Clone-shared weak registry, scoped to this admitted backing.
+    config_consensus_engine_admission: Arc<engine_admission::ConfigEngineAdmission>,
+    /// Present only on the backend consumed by one bounded engine open and on
+    /// its internal worker clones. Ordinary pre-open clones remain unclaimed.
+    config_consensus_engine_claim: Option<Arc<ConfigEngineClaim>>,
     #[cfg(test)]
     pub(crate) consensus_apply_gate: Arc<tokio::sync::Semaphore>,
     /// Audit HMAC key used to seal and verify local audit-trail rows.
@@ -407,8 +439,12 @@ impl SqliteBackend {
             conn: Arc::new(AsyncMutex::new(BackendConnection {
                 connection: conn,
                 _retained_admission: None,
+                #[cfg(all(test, target_os = "linux"))]
+                released: tokio::sync::watch::channel(()).0,
             })),
             config_consensus_worker_gate: Arc::new(tokio::sync::Semaphore::new(1)),
+            config_consensus_engine_admission: Arc::new(Default::default()),
+            config_consensus_engine_claim: None,
             #[cfg(test)]
             consensus_apply_gate: Arc::new(tokio::sync::Semaphore::new(1)),
             audit_key: Arc::new(audit_key),
@@ -448,8 +484,12 @@ impl SqliteBackend {
             conn: Arc::new(AsyncMutex::new(BackendConnection {
                 connection: conn,
                 _retained_admission: Some(admission),
+                #[cfg(all(test, target_os = "linux"))]
+                released: tokio::sync::watch::channel(()).0,
             })),
             config_consensus_worker_gate: Arc::new(tokio::sync::Semaphore::new(1)),
+            config_consensus_engine_admission: Arc::new(Default::default()),
+            config_consensus_engine_claim: None,
             #[cfg(test)]
             consensus_apply_gate: Arc::new(tokio::sync::Semaphore::new(1)),
             audit_key: Arc::new(audit_key),

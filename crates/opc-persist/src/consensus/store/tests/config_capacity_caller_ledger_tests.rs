@@ -1110,12 +1110,59 @@ async fn public_audited_ledger_lifetime_with_native_owners(
         native_owners.detach();
     }
     drop(store);
+    assert_eq!(
+        SqliteBackend::reopen_config_authority(options.clone(), key.clone())
+            .await
+            .err(),
+        Some(crate::RetainedConfigError::InUse),
+        "the original prepared command and envelope alias still own this bounded engine"
+    );
+    // Preserve witnesses from the actual owners after the complete measured
+    // native lifecycle. Protected recovery bytes and the original handle are
+    // sufficient for read-only verification after those owners retire.
+    let (
+        original_alias_matches,
+        original_ciphertext_capacity,
+        original_ciphertext_len,
+        original_transferred_capacities,
+        original_transferred_lengths,
+    ) = {
+        let AuditedConfigEffect::BoundedAppend { commit, .. } = &prepared.command().effect else {
+            panic!("bounded effect");
+        };
+        (
+            envelope.encoded() == commit.record.encrypted_blob,
+            commit.record.encrypted_blob.capacity(),
+            commit.record.encrypted_blob.len(),
+            [
+                commit.record.principal.capacity(),
+                commit.record.plaintext_digest.capacity(),
+                commit.audit.capacity() * size_of::<crate::AuditRecord>(),
+            ],
+            [
+                commit.record.principal.len(),
+                commit.record.plaintext_digest.len(),
+                commit.audit.len() * size_of::<crate::AuditRecord>(),
+            ],
+        )
+    };
+    #[cfg(feature = "dangerous-test-hooks")]
+    drop(bridge_preparation_owner);
+    drop(prepared);
+    drop(envelope);
     let backend = SqliteBackend::reopen_config_authority(options, key)
         .await
-        .expect("full original retained authority validation");
+        .expect("full original retained authority validation after actual owner retirement");
     let reopened = open_fixture(topology, backend, root.join("snapshots"), external.as_ref()).await;
     ready(&reopened).await;
-    verify(&reopened, &provider, &aad, &plaintext, &prepared, caller).await;
+    let recovered = PreparedAuditedMutation::decode(&recovery)
+        .expect("decode the original protected recovery bytes for read-only verification");
+    assert_eq!(
+        recovered.handle(),
+        &handle,
+        "retain the exact original handle"
+    );
+    verify(&reopened, &provider, &aad, &plaintext, &recovered, caller).await;
     if let Some(external) = &external {
         verify_continuity(&reopened, external).await;
     }
@@ -1124,7 +1171,6 @@ async fn public_audited_ledger_lifetime_with_native_owners(
     {
         let result = *bridge_oracles.result.lock().unwrap();
         let drained = bridge_registration.snapshot();
-        drop(bridge_preparation_owner);
         let preparation_drain = bridge_census.snapshot();
         let derived = *bridge_oracles.derived.lock().unwrap();
         println!("CONFIG_CAPACITY_NATIVE_DERIVED_LIFECYCLE observed={derived:?} exact_readback=true original_recovery=true retained_reopen=true joined_shutdown=true full_memory_bound=false");
@@ -1252,19 +1298,14 @@ async fn public_audited_ledger_lifetime_with_native_owners(
         final_collections.capacities[2], final_collections.lengths[2],
         "LEDGER_GROWTH_NATIVE_ROWS: sealing must reserve its actual missing rows"
     );
-    // These legal original owners actually survive the measured native apply.
+    // The original owners survived measured apply, readback, recovery, and
+    // shutdown; their live witnesses were captured before explicit retirement.
     // Test-only plaintext/decryption witnesses are outside the production inventory.
     assert!(!recovery.is_empty());
-    let AuditedConfigEffect::BoundedAppend { commit, .. } = &prepared.command().effect else {
-        panic!("bounded effect");
-    };
-    assert!(
-        envelope.encoded() == commit.record.encrypted_blob,
-        "exact original envelope alias"
-    );
+    assert!(original_alias_matches, "exact original envelope alias");
     // The original transferred spare-capacity owner was asserted above.
     // Count the actual prepared capacity, including any real normalization.
-    assert!(commit.record.encrypted_blob.capacity() >= commit.record.encrypted_blob.len());
+    assert!(original_ciphertext_capacity >= original_ciphertext_len);
     assert!(measured.apply_reads >= 2 && measured.writes == 1);
     assert_eq!(measured.derived_len, 1024);
     assert!(
@@ -1340,10 +1381,7 @@ async fn public_audited_ledger_lifetime_with_native_owners(
         assert!(normalized.alias_bytes > 0 && normalized.other_owned > 0);
         assert_eq!(normalized.old_capacity, transferred_capacity);
         assert!(normalized.new_capacity > 0 && normalized.new_capacity < normalized.old_capacity);
-        assert_eq!(
-            normalized.post_capacity,
-            commit.record.encrypted_blob.capacity()
-        );
+        assert_eq!(normalized.post_capacity, original_ciphertext_capacity);
         println!("CONFIG_CAPACITY_NORMALIZATION owners={normalized:?}");
         assert!(
             normalized.total <= OPERATION_BYTES,
@@ -1354,22 +1392,8 @@ async fn public_audited_ledger_lifetime_with_native_owners(
         let normalized = observation.finish();
         assert!(normalized.has_reservation && normalized.copy_observed);
         assert_eq!(normalized.released, [true; 3]);
-        assert_eq!(
-            normalized.post_capacities,
-            [
-                commit.record.principal.capacity(),
-                commit.record.plaintext_digest.capacity(),
-                commit.audit.capacity() * size_of::<crate::AuditRecord>()
-            ],
-        );
-        assert_eq!(
-            normalized.post_capacities,
-            [
-                commit.record.principal.len(),
-                commit.record.plaintext_digest.len(),
-                commit.audit.len() * size_of::<crate::AuditRecord>()
-            ]
-        );
+        assert_eq!(normalized.post_capacities, original_transferred_capacities,);
+        assert_eq!(normalized.post_capacities, original_transferred_lengths);
         assert!(normalized.alias_bytes > 0 && normalized.nested_bytes > 0);
         println!("CONFIG_CAPACITY_TRANSFERRED_OWNERS_NORMALIZATION owners={normalized:?}");
         assert!(

@@ -442,6 +442,11 @@ impl ConfigConsensusCore {
         let worker_conn = tokio::time::timeout_at(deadline, conn.clone().lock_owned())
             .await
             .map_err(|_| ConfigConsensusStorageError::BackendUnavailable)?;
+        let worker_connection = ConfigSqliteWorkerConnection {
+            connection: worker_conn,
+            _engine_claim: backend.config_consensus_engine_claim(),
+            _storage_owner: None,
+        };
         let worker_members = expected_members.clone();
         let worker_audit_key = backend.audit_key().clone();
         let worker_backend = backend.clone();
@@ -456,6 +461,10 @@ impl ConfigConsensusCore {
         let mut cancel_on_drop = SqliteWorkCancelOnDrop::new(cancellation.clone());
         let worker_cancellation = cancellation.clone();
         let mut worker = tokio::task::spawn_blocking(move || {
+            // Retain the whole wrapper so connection release precedes claim
+            // release independently of the other captured values' drop order.
+            let worker_connection = worker_connection;
+            let worker_conn = &worker_connection.connection;
             let _permit = permit;
             let progress_cancellation = worker_cancellation.clone();
             worker_conn
@@ -471,7 +480,7 @@ impl ConfigConsensusCore {
                     Err(ConfigConsensusStorageError::RecoveryRequired)
                 } else {
                     validate_existing_schema(
-                        &worker_conn,
+                        worker_conn,
                         identity,
                         &worker_members,
                         &worker_audit_key,
@@ -482,7 +491,7 @@ impl ConfigConsensusCore {
                 }
             } else {
                 initialize_schema_for_profile(
-                    &worker_conn,
+                    worker_conn,
                     identity,
                     &worker_members,
                     &worker_audit_key,
@@ -577,6 +586,7 @@ impl ConfigConsensusCore {
         run_sqlite_worker_until(
             self.sqlite_worker_gate.clone(),
             self.conn.clone(),
+            None,
             Some(Arc::clone(&self.storage_owner)),
             deadline,
             operation,
@@ -613,6 +623,7 @@ impl ConfigConsensusCore {
         run_sqlite_worker_until(
             self.sqlite_worker_gate.clone(),
             self.conn.clone(),
+            None,
             Some(Arc::clone(&self.storage_owner)),
             deadline,
             operation,
@@ -641,6 +652,7 @@ where
     run_sqlite_worker_until(
         backend.config_consensus_worker_gate(),
         backend.conn(),
+        backend.config_consensus_engine_claim(),
         None,
         deadline,
         operation,
@@ -648,16 +660,19 @@ where
     .await
 }
 
-// Retain the engine-storage owner through the final worker connection drop,
-// including a blocking worker whose caller was cancelled. Field order matters.
+// Retain engine ownership through the final worker connection drop, including
+// backend-only startup probes and workers whose caller was cancelled. Release
+// the storage observer last. Field order matters.
 struct ConfigSqliteWorkerConnection {
     connection: tokio::sync::OwnedMutexGuard<crate::backend::BackendConnection>,
+    _engine_claim: Option<Arc<crate::backend::ConfigEngineClaim>>,
     _storage_owner: Option<Arc<super::storage::ConfigStorageOwner>>,
 }
 
 async fn run_sqlite_worker_until<T, F>(
     worker_gate: Arc<tokio::sync::Semaphore>,
     conn: Arc<tokio::sync::Mutex<crate::backend::BackendConnection>>,
+    engine_claim: Option<Arc<crate::backend::ConfigEngineClaim>>,
     storage_owner: Option<Arc<super::storage::ConfigStorageOwner>>,
     deadline: tokio::time::Instant,
     operation: F,
@@ -679,6 +694,7 @@ where
         .map_err(|_| timed_out("config consensus SQLite connection timed out"))?;
     let connection = ConfigSqliteWorkerConnection {
         connection: conn,
+        _engine_claim: engine_claim,
         _storage_owner: storage_owner,
     };
     let cancellation = Arc::new(SqliteWorkCancellation::with_deadline(std_deadline));
@@ -2736,6 +2752,7 @@ pub(super) async fn read_commit_outcome_until(
     run_sqlite_worker_until(
         backend.config_consensus_worker_gate(),
         backend.conn(),
+        backend.config_consensus_engine_claim(),
         None,
         deadline,
         move |conn, cancellation| {
