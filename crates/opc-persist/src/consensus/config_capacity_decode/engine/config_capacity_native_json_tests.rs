@@ -1,6 +1,9 @@
 //! Original bounded Serde decoding is the independent compatibility oracle.
 //! Synthetic envelopes exercise only codec ownership/format, not authority.
 
+#[path = "config_capacity_native_preflight_tests.rs"]
+mod preflight;
+
 use super::*;
 use crate::consensus::capacity_record::CapacityRecordBinding;
 use crate::consensus::types::{ConfigConsensusCommand, PreparedConfigCommit};

@@ -1394,6 +1394,7 @@ impl NativeState {
         )))
     }
 
+    #[cfg(any(test, feature = "test-control"))]
     pub(super) fn prepare_transfer(&mut self) -> io::Result<BusinessTransfer<'_>> {
         self.prepare_checkpoint_transfer(None)
     }
@@ -1432,6 +1433,7 @@ impl NativeState {
             .ok_or_else(|| invalid("native change capture disappeared"))
     }
 
+    #[cfg(any(test, feature = "test-control"))]
     pub(super) fn publish_snapshot_metadata(
         &mut self,
         current: crate::sqlite::consensus::CurrentSnapshot,

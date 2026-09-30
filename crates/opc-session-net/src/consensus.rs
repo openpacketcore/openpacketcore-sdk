@@ -2885,7 +2885,7 @@ impl RemoteSessionConsensusPeer {
             response_allows_reuse: false,
         };
         let call = async {
-            write_frame_bounded_until(
+            crate::protocol::write_consensus_frame_bounded_until(
                 &mut connection.writer,
                 &request,
                 connection.request_frame_size,

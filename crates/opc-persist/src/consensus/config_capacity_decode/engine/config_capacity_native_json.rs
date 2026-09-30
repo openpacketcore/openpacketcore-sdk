@@ -23,47 +23,33 @@ fn invalid() -> io::Error {
     crate::consensus::sqlite::invalid_data("invalid bounded config consensus encoding")
 }
 
-// Match the three canonical unsigned-byte token widths directly. The complete
-// first pass bounds and validates every ciphertext value and delimiter before
-// allocation. Only that immutable validated span may use the specialized fill.
-fn decimal_byte(bytes: &[u8], index: &mut usize) -> Option<u8> {
-    let (value, digits) = match bytes.get(*index..)? {
-        [first @ b'1'..=b'2', second @ b'0'..=b'9', third @ b'0'..=b'9', b',' | b']', ..] => {
-            let value = u16::from(*first - b'0') * 100
-                + u16::from(*second - b'0') * 10
-                + u16::from(*third - b'0');
-            (u8::try_from(value).ok()?, 3)
-        }
-        [first @ b'1'..=b'9', second @ b'0'..=b'9', b',' | b']', ..] => {
-            ((*first - b'0') * 10 + (*second - b'0'), 2)
-        }
-        [digit @ b'0'..=b'9', b',' | b']', ..] => (*digit - b'0', 1),
-        _ => return None,
-    };
-    *index += digits;
-    Some(value)
-}
-
+// Validate canonical unsigned-byte tokens without decoding their values. The
+// only three-digit forms are 100..=199, 200..=249 and 250..=255. Slice patterns
+// check every digit and its delimiter before advancing, so the first pass can
+// prove the exact count and extent without allocation or discarded arithmetic.
 fn array_extent(bytes: &[u8]) -> Option<(usize, usize)> {
-    if bytes.first().copied()? != b'[' {
-        return None;
-    }
-    if bytes.get(1) == Some(&b']') {
+    let mut remaining = bytes.strip_prefix(b"[")?;
+    if remaining.first() == Some(&b']') {
         return Some((2, 0));
     }
-    let mut index = 1;
     let mut count = 0;
     loop {
-        decimal_byte(bytes, &mut index)?;
+        let (delimiter, rest) = match remaining {
+            [b'0'..=b'9', delimiter @ (b',' | b']'), rest @ ..]
+            | [b'1'..=b'9', b'0'..=b'9', delimiter @ (b',' | b']'), rest @ ..]
+            | [b'1', b'0'..=b'9', b'0'..=b'9', delimiter @ (b',' | b']'), rest @ ..]
+            | [b'2', b'0'..=b'4', b'0'..=b'9', delimiter @ (b',' | b']'), rest @ ..]
+            | [b'2', b'5', b'0'..=b'5', delimiter @ (b',' | b']'), rest @ ..] => (*delimiter, rest),
+            _ => return None,
+        };
         count += 1;
         if count > CONFIG_CAPACITY_V1_ENVELOPE_BYTES {
             return None;
         }
-        match bytes.get(index).copied()? {
-            b']' => return Some((index + 1, count)),
-            b',' => index += 1,
-            _ => return None,
+        if delimiter == b']' {
+            return Some((bytes.len() - rest.len(), count));
         }
+        remaining = rest;
     }
 }
 

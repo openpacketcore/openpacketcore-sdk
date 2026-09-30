@@ -2849,7 +2849,153 @@ enum ChildStderrDiagnostic {
     QualificationNodeSqliteFailed,
     QualificationNodeConsensusFailed,
     QualificationNodeListenerFailed,
+    InitializationRejected {
+        stage: &'static str,
+        error_class: &'static str,
+    },
     Redacted,
+}
+
+fn child_initialization_diagnostic(line: &[u8]) -> Option<ChildStderrDiagnostic> {
+    let (stage, error_class) = std::str::from_utf8(line)
+        .ok()?
+        .strip_prefix("qualification initialization rejected: stage=")?
+        .split_once(" class=")?;
+    let stage = match stage {
+        "cluster" => "cluster",
+        "fenced_transition" => "fenced_transition",
+        "protected_roster_v2" => "protected_roster_v2",
+        _ => return None,
+    };
+    let error_class = match (stage, error_class) {
+        ("cluster", "ClusterFormationRejected") => "ClusterFormationRejected",
+        ("cluster", "EngineUnavailable") => "EngineUnavailable",
+        ("cluster", "StorageUnavailable") => "StorageUnavailable",
+        ("cluster", "RecoveryRequired") => "RecoveryRequired",
+        ("fenced_transition" | "protected_roster_v2", "BackendUnavailable") => "BackendUnavailable",
+        ("fenced_transition" | "protected_roster_v2", "CasIdempotencyOutcomeUnavailable") => {
+            "CasIdempotencyOutcomeUnavailable"
+        }
+        ("fenced_transition" | "protected_roster_v2", "BackendOperationOutcomeUnavailable") => {
+            "BackendOperationOutcomeUnavailable"
+        }
+        ("fenced_transition" | "protected_roster_v2", "LeaseLostOrInvalid") => "LeaseLostOrInvalid",
+        (_, "Other") => "Other",
+        _ => return None,
+    };
+    Some(ChildStderrDiagnostic::InitializationRejected { stage, error_class })
+}
+
+#[test]
+fn initialization_stderr_diagnostic_recognizes_only_closed_stage_classes() {
+    let directory = tempfile::tempdir().expect("diagnostic directory");
+    let path = directory.path().join("stderr.log");
+    let classes = [
+        ("cluster", "ClusterFormationRejected"),
+        ("cluster", "EngineUnavailable"),
+        ("cluster", "StorageUnavailable"),
+        ("cluster", "RecoveryRequired"),
+        ("cluster", "Other"),
+        ("fenced_transition", "BackendUnavailable"),
+        ("fenced_transition", "CasIdempotencyOutcomeUnavailable"),
+        ("fenced_transition", "BackendOperationOutcomeUnavailable"),
+        ("fenced_transition", "LeaseLostOrInvalid"),
+        ("fenced_transition", "Other"),
+        ("protected_roster_v2", "BackendUnavailable"),
+        ("protected_roster_v2", "CasIdempotencyOutcomeUnavailable"),
+        ("protected_roster_v2", "BackendOperationOutcomeUnavailable"),
+        ("protected_roster_v2", "LeaseLostOrInvalid"),
+        ("protected_roster_v2", "Other"),
+    ];
+    for (stage, error_class) in classes {
+        let mut bytes = b"synthetic-sensitive-body\xff\n".to_vec();
+        bytes.extend_from_slice(
+            format!("qualification initialization rejected: stage={stage} class={error_class}\n")
+                .as_bytes(),
+        );
+        std::fs::write(&path, bytes).expect("write diagnostic");
+        let diagnostic = ChildNode::stderr_diagnostic_at(&path);
+        assert_eq!(
+            diagnostic,
+            ChildStderrDiagnostic::InitializationRejected { stage, error_class },
+        );
+        assert!(!format!("{diagnostic:?}").contains("synthetic-sensitive-body"));
+    }
+    for invalid in [
+        b"qualification initialization rejected: stage=cluster class=BackendUnavailable".as_slice(),
+        b"qualification initialization rejected: stage=unknown class=Other",
+        b"qualification initialization rejected: stage=cluster class=Other synthetic-sensitive-body",
+        b"qualification initialization rejected: stage=fenced_transition class=Other\xff",
+        b"synthetic-sensitive-body",
+    ] {
+        std::fs::write(&path, invalid).expect("write invalid diagnostic");
+        assert_eq!(ChildNode::stderr_diagnostic_at(&path), ChildStderrDiagnostic::Redacted);
+    }
+}
+
+#[test]
+fn initialization_stderr_diagnostic_bounds_tail_and_skips_partial_first_line() {
+    let directory = tempfile::tempdir().expect("diagnostic directory");
+    let path = directory.path().join("stderr.log");
+    let marker = b"qualification initialization rejected: stage=cluster class=StorageUnavailable";
+    let mut bytes = vec![b'x'; 16 * 1024];
+    bytes.push(b'\n');
+    bytes.extend_from_slice(marker);
+    bytes.push(b'\n');
+    std::fs::write(&path, &bytes).expect("write oversized diagnostic");
+    assert_eq!(
+        ChildNode::stderr_diagnostic_at(&path),
+        ChildStderrDiagnostic::InitializationRejected {
+            stage: "cluster",
+            error_class: "StorageUnavailable",
+        },
+    );
+
+    // The capped tail starts with marker-shaped text embedded in an unrelated
+    // longer line. It must not be mistaken for a complete child marker.
+    let mut embedded = b"unrelated-prefix:".to_vec();
+    embedded.extend_from_slice(marker);
+    embedded.push(b'\n');
+    embedded.resize(b"unrelated-prefix:".len() + 8 * 1024, b'x');
+    std::fs::write(&path, &embedded).expect("write partial first line");
+    assert_eq!(
+        ChildNode::stderr_diagnostic_at(&path),
+        ChildStderrDiagnostic::Redacted
+    );
+
+    // A marker outside the retained tail supplies no observation.
+    let mut evicted = marker.to_vec();
+    evicted.push(b'\n');
+    evicted.extend_from_slice(&[b'x'; 16 * 1024]);
+    std::fs::write(&path, &evicted).expect("write evicted marker");
+    assert_eq!(
+        ChildNode::stderr_diagnostic_at(&path),
+        ChildStderrDiagnostic::Redacted
+    );
+}
+
+#[test]
+fn initialization_stderr_diagnostic_preserves_missing_empty_and_legacy_results() {
+    let directory = tempfile::tempdir().expect("diagnostic directory");
+    let path = directory.path().join("stderr.log");
+    assert_eq!(
+        ChildNode::stderr_diagnostic_at(&path),
+        ChildStderrDiagnostic::Unavailable
+    );
+    std::fs::write(&path, b" \n\t").expect("write empty diagnostic");
+    assert_eq!(
+        ChildNode::stderr_diagnostic_at(&path),
+        ChildStderrDiagnostic::Empty
+    );
+    std::fs::write(
+        &path,
+        b"qualification node open failed: consensus\nqualification node failed\n",
+    )
+    .expect("write legacy diagnostic");
+    assert_eq!(
+        ChildNode::stderr_diagnostic_at(&path),
+        ChildStderrDiagnostic::QualificationNodeConsensusFailed
+    );
 }
 
 /// Receive one child reply within the supplied absolute deadline. A zero-timeout
@@ -3080,9 +3226,13 @@ impl ChildNode {
     }
 
     fn stderr_diagnostic(&self) -> ChildStderrDiagnostic {
+        Self::stderr_diagnostic_at(&self.stderr_path)
+    }
+
+    fn stderr_diagnostic_at(stderr_path: &Path) -> ChildStderrDiagnostic {
         const MAX_STDERR_BYTES: u64 = 8 * 1024;
 
-        let Ok(mut file) = File::open(&self.stderr_path) else {
+        let Ok(mut file) = File::open(stderr_path) else {
             return ChildStderrDiagnostic::Unavailable;
         };
         let Ok(total_bytes) = file.metadata().map(|metadata| metadata.len()) else {
@@ -3101,13 +3251,24 @@ impl ChildNode {
         if bytes.iter().all(u8::is_ascii_whitespace) {
             return ChildStderrDiagnostic::Empty;
         }
+        let lines = bytes
+            .split(|byte| *byte == b'\n')
+            // A bounded tail can begin midway through an unrelated message.
+            .skip(usize::from(start != 0))
+            .filter(|line| !line.is_empty())
+            .collect::<Vec<_>>();
+        // Return only static vocabulary, even when other stderr is present.
+        // Raw backend messages and material never enter the parent panic.
+        if let Some(diagnostic) = lines
+            .iter()
+            .rev()
+            .find_map(|line| child_initialization_diagnostic(line))
+        {
+            return diagnostic;
+        }
         if start != 0 {
             return ChildStderrDiagnostic::Redacted;
         }
-        let lines = bytes
-            .split(|byte| *byte == b'\n')
-            .filter(|line| !line.is_empty())
-            .collect::<Vec<_>>();
         let allowed = lines.iter().all(|line| {
             *line == b"qualification node failed"
                 || *line == b"qualification node open failed: transport"
@@ -4130,7 +4291,11 @@ impl Fleet {
             match node.receive() {
                 QualificationNodeReply::Initialized => {}
                 QualificationNodeReply::Error { code } => {
-                    panic!("qualification initial fleet initialization rejected: {code:?}");
+                    panic!(
+                        "qualification initial fleet initialization rejected: node={}, code={code:?}, stderr={:?}",
+                        node.node_index,
+                        node.stderr_diagnostic()
+                    );
                 }
                 _ => panic!("qualification initial fleet initialization reply mismatch"),
             }

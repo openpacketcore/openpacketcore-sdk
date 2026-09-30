@@ -193,6 +193,30 @@ const PROTECTED_ROSTER_PROFILE_V2_ACTIVATION_REQUEST_ID_DOMAIN: &[u8] =
 #[cfg(all(test, target_os = "linux"))]
 mod initialization_evidence;
 
+#[cfg(all(test, target_os = "linux"))]
+pub(crate) mod scoped_read_diagnostics;
+
+// Only explicitly scoped Linux unit tests collect observations. Every other
+// build expands to the original await, with the original future and deadline.
+#[cfg(all(test, target_os = "linux"))]
+macro_rules! scoped_read_observe {
+    ($phase:ident, $future:expr, $classify:ident) => {
+        scoped_read_diagnostics::observe(
+            scoped_read_diagnostics::Phase::$phase,
+            $future,
+            scoped_read_diagnostics::$classify,
+        )
+        .await
+    };
+}
+
+#[cfg(not(all(test, target_os = "linux")))]
+macro_rules! scoped_read_observe {
+    ($phase:ident, $future:expr, $classify:ident) => {
+        ($future).await
+    };
+}
+
 #[cfg(test)]
 static CONSUMER_CONSENSUS_PROPOSAL_COUNT: AtomicU64 = AtomicU64::new(0);
 
@@ -2520,11 +2544,13 @@ impl LogicalReadTimeSupervisor {
         required_consumer_scope: Option<SessionConsensusIdentity>,
         deadline: tokio::time::Instant,
     ) -> Result<SessionConsensusResponse, StoreError> {
-        let admission =
-            tokio::time::timeout_at(deadline, Arc::clone(&self.admission).acquire_owned())
-                .await
-                .map_err(|_| consensus_unavailable())?
-                .map_err(|_| consensus_unavailable())?;
+        let admission = scoped_read_observe!(
+            LogicalPermit,
+            tokio::time::timeout_at(deadline, Arc::clone(&self.admission).acquire_owned()),
+            timed_result
+        )
+        .map_err(|_| consensus_unavailable())?
+        .map_err(|_| consensus_unavailable())?;
         let (reply, response) = tokio::sync::oneshot::channel();
         let request = LogicalReadTimeRequest {
             required_consumer_scope,
@@ -2532,14 +2558,20 @@ impl LogicalReadTimeSupervisor {
             reply,
             _admission: admission,
         };
-        tokio::time::timeout_at(deadline, self.requests.send(request))
-            .await
-            .map_err(|_| consensus_unavailable())?
-            .map_err(|_| consensus_unavailable())?;
-        tokio::time::timeout_at(deadline, response)
-            .await
-            .map_err(|_| consensus_unavailable())?
-            .map_err(|_| consensus_unavailable())?
+        scoped_read_observe!(
+            LogicalSend,
+            tokio::time::timeout_at(deadline, self.requests.send(request)),
+            timed_result
+        )
+        .map_err(|_| consensus_unavailable())?
+        .map_err(|_| consensus_unavailable())?;
+        scoped_read_observe!(
+            LogicalReply,
+            tokio::time::timeout_at(deadline, response),
+            timed_store_reply
+        )
+        .map_err(|_| consensus_unavailable())?
+        .map_err(|_| consensus_unavailable())?
     }
 }
 
@@ -5807,9 +5839,12 @@ impl ConsensusSessionStore {
         deadline: tokio::time::Instant,
     ) -> Result<ConsumerScopeAdmission, SessionConsumerRejection> {
         let operation_gate = self.inner.topology_coordinator.operation_gate();
-        let operation_guard = tokio::time::timeout_at(deadline, operation_gate.read_owned())
-            .await
-            .map_err(|_| SessionConsumerRejection::Unavailable)?;
+        let operation_guard = scoped_read_observe!(
+            TopologyGate,
+            tokio::time::timeout_at(deadline, operation_gate.read_owned()),
+            elapsed_result
+        )
+        .map_err(|_| SessionConsumerRejection::Unavailable)?;
         self.consumer_scope_is_current(scope, deadline).await?;
         Ok(ConsumerScopeAdmission {
             required_scope: scope.consensus_identity(),
@@ -6222,7 +6257,11 @@ impl ConsensusSessionStore {
         if self.inner.topology.mode() != QuorumTopologyMode::FixedDurableQuorum {
             return Ok(());
         }
-        match tokio::time::timeout_at(deadline, self.durable_fixed_quorum_scope_is_exact()).await {
+        match scoped_read_observe!(
+            DurableScope,
+            tokio::time::timeout_at(deadline, self.durable_fixed_quorum_scope_is_exact()),
+            timed_bool
+        ) {
             Ok(Ok(true)) => Ok(()),
             Ok(Ok(false)) | Ok(Err(_)) | Err(_) => Err(consensus_unavailable()),
         }
@@ -6300,19 +6339,21 @@ impl ConsensusSessionStore {
                 .topology
                 .fixed_durable_placement_policy()
                 .ok_or_else(consensus_unavailable)?;
-            return match tokio::time::timeout_at(
-                deadline,
-                self.inner
-                    .backend
-                    .fixed_quorum_application_traffic_authority_is_exact(
-                        self.inner.storage_identity,
-                        self.inner.bootstrap_members.clone(),
-                        self.inner.bootstrap_bindings.clone(),
-                        expected_placement_policy,
-                    ),
-            )
-            .await
-            {
+            return match scoped_read_observe!(
+                ApplicationAuthority,
+                tokio::time::timeout_at(
+                    deadline,
+                    self.inner
+                        .backend
+                        .fixed_quorum_application_traffic_authority_is_exact(
+                            self.inner.storage_identity,
+                            self.inner.bootstrap_members.clone(),
+                            self.inner.bootstrap_bindings.clone(),
+                            expected_placement_policy,
+                        ),
+                ),
+                timed_bool
+            ) {
                 Ok(Ok(true)) => Ok(()),
                 Ok(Ok(false)) | Ok(Err(_)) | Err(_) => Err(consensus_unavailable()),
             };
@@ -9316,15 +9357,23 @@ impl ConsensusSessionStore {
             .logical_read_time
             .logical_read_time_before(required_consumer_scope, deadline)
             .await?;
+        #[cfg(all(test, target_os = "linux"))]
+        scoped_read_diagnostics::completed(
+            scoped_read_diagnostics::Phase::LogicalResponse,
+            scoped_read_diagnostics::store_result(&response.result),
+        );
         response.result?;
         if response.raft_log_index == 0 {
             return Err(consensus_unavailable());
         }
-        self.inner
-            .read_barrier
-            .wait_for_applied_index(response.raft_log_index, deadline)
-            .await
-            .map_err(|_| consensus_unavailable())?;
+        scoped_read_observe!(
+            LogicalApplied,
+            self.inner
+                .read_barrier
+                .wait_for_applied_index(response.raft_log_index, deadline),
+            result
+        )
+        .map_err(|_| consensus_unavailable())?;
         response.logical_time.ok_or_else(consensus_unavailable)
     }
 
@@ -9517,47 +9566,59 @@ impl ConsensusSessionStore {
         deadline: tokio::time::Instant,
     ) -> Result<Option<StoredSessionRecord>, StoreError> {
         if self.inner.topology.mode() == QuorumTopologyMode::FixedDurableQuorum {
-            let admission =
-                self.admit_consumer_scope(scope, deadline)
-                    .await
-                    .map_err(|rejection| match rejection {
-                        SessionConsumerRejection::ScopeMismatch => {
-                            StoreError::TopologyAuthorityRevoked
-                        }
-                        _ => consensus_unavailable(),
-                    })?;
+            let admission = scoped_read_observe!(
+                InitialAdmission,
+                self.admit_consumer_scope(scope, deadline),
+                scope_result
+            )
+            .map_err(|rejection| match rejection {
+                SessionConsumerRejection::ScopeMismatch => StoreError::TopologyAuthorityRevoked,
+                _ => consensus_unavailable(),
+            })?;
             drop(admission);
-            self.require_application_traffic_authority_before(deadline)
-                .await?;
+            scoped_read_observe!(
+                InitialAuthority,
+                self.require_application_traffic_authority_before(deadline),
+                store_result
+            )?;
             // This barrier has read leases disabled: even a warm non-expiring
             // record requires a fresh majority proof and local application of
             // its returned index. It never allocates a sequencing authority.
-            self.linearizable_barrier_before(deadline)
-                .await
-                .map_err(|_| consensus_unavailable())?;
-            let admission =
-                self.admit_consumer_scope(scope, deadline)
-                    .await
-                    .map_err(|rejection| match rejection {
-                        SessionConsumerRejection::ScopeMismatch => {
-                            StoreError::TopologyAuthorityRevoked
-                        }
-                        _ => consensus_unavailable(),
-                    })?;
-            if let Some(logical_time) = tokio::time::timeout_at(
-                deadline,
-                self.inner
-                    .backend
-                    .consensus_logical_time(self.inner.storage_identity),
+            scoped_read_observe!(
+                ReadBarrier,
+                self.linearizable_barrier_before(deadline),
+                barrier_result
             )
-            .await
+            .map_err(|_| consensus_unavailable())?;
+            let admission = scoped_read_observe!(
+                ReadAdmission,
+                self.admit_consumer_scope(scope, deadline),
+                scope_result
+            )
+            .map_err(|rejection| match rejection {
+                SessionConsumerRejection::ScopeMismatch => StoreError::TopologyAuthorityRevoked,
+                _ => consensus_unavailable(),
+            })?;
+            if let Some(logical_time) = scoped_read_observe!(
+                CommittedLogicalTime,
+                tokio::time::timeout_at(
+                    deadline,
+                    self.inner
+                        .backend
+                        .consensus_logical_time(self.inner.storage_identity),
+                ),
+                timed_store_result
+            )
             .map_err(|_| consensus_unavailable())??
             {
-                let record = tokio::time::timeout_at(
-                    deadline,
-                    self.inner.backend.consensus_get_at(key, logical_time),
+                let record = scoped_read_observe!(
+                    CommittedRecord,
+                    tokio::time::timeout_at(
+                        deadline,
+                        self.inner.backend.consensus_get_at(key, logical_time),
+                    ),
+                    timed_store_result
                 )
-                .await
                 .map_err(|_| consensus_unavailable())??;
                 // Absence already proven at committed time and records with
                 // no expiry do not depend on advancing the replicated clock.
@@ -9567,8 +9628,11 @@ impl ConsensusSessionStore {
                     .as_ref()
                     .is_none_or(|record| record.expires_at.is_none())
                 {
-                    self.require_application_traffic_authority_before(deadline)
-                        .await?;
+                    scoped_read_observe!(
+                        FastReturnAuthority,
+                        self.require_application_traffic_authority_before(deadline),
+                        store_result
+                    )?;
                     return Ok(record);
                 }
             }
@@ -9576,27 +9640,34 @@ impl ConsensusSessionStore {
             // path must acquire the same topology gate.
             drop(admission);
         }
-        let logical_time = self
-            .logical_read_time_before(Some(scope.consensus_identity()), deadline)
-            .await?;
+        let logical_time = scoped_read_observe!(
+            LogicalTime,
+            self.logical_read_time_before(Some(scope.consensus_identity()), deadline),
+            store_result
+        )?;
         // `logical_read_time_before` submits a consensus command and owns its
         // own leader-side topology gate. Acquire the local read gate only
         // after that command has settled; retaining it across the submission
         // can self-block behind a queued topology writer on Tokio's fair lock.
-        let _admission = self
-            .admit_consumer_scope(scope, deadline)
-            .await
-            .map_err(|rejection| match rejection {
-                SessionConsumerRejection::ScopeMismatch => StoreError::TopologyAuthorityRevoked,
-                _ => consensus_unavailable(),
-            })?;
-        let record = self
-            .inner
-            .backend
-            .consensus_get_at(key, logical_time)
-            .await?;
-        self.require_application_traffic_authority_before(deadline)
-            .await?;
+        let _admission = scoped_read_observe!(
+            ReadbackAdmission,
+            self.admit_consumer_scope(scope, deadline),
+            scope_result
+        )
+        .map_err(|rejection| match rejection {
+            SessionConsumerRejection::ScopeMismatch => StoreError::TopologyAuthorityRevoked,
+            _ => consensus_unavailable(),
+        })?;
+        let record = scoped_read_observe!(
+            Readback,
+            self.inner.backend.consensus_get_at(key, logical_time),
+            store_result
+        )?;
+        scoped_read_observe!(
+            FinalAuthority,
+            self.require_application_traffic_authority_before(deadline),
+            store_result
+        )?;
         Ok(record)
     }
 

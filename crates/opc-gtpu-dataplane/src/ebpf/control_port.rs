@@ -10,9 +10,17 @@ use crate::control_port::{
 #[derive(Default)]
 pub(super) struct ControlSocketState {
     socket: Option<crate::GtpuReassemblySocket>,
+    /// Dedicated queue for tc-steered over-MTU G-PDUs; see
+    /// [`opc_gtpu_ebpf_common::GTPU_PACKET_TOO_BIG_QUEUE_PORT`].
+    too_big_socket: Option<crate::GtpuReassemblySocket>,
     retired: bool,
     /// Value-free counters of this registration's downlink consumer.
     downlink_counters: crate::GtpuDownlinkCounters,
+    /// Per-registration in-tunnel Packet Too Big rate limit.
+    too_big_limiter: crate::reassembly::PacketTooBigLimiter,
+    /// Per-destination inner fragmentation budgets and Identification
+    /// sequences of this registration.
+    inner_fragment_budget: crate::reassembly::InnerFragmentBudget,
 }
 
 impl ControlSocketState {
@@ -21,9 +29,23 @@ impl ControlSocketState {
         self.socket.is_none()
     }
 
+    #[cfg(test)]
+    pub(super) fn with_inner_fragment_limit(limit: crate::GtpuInnerFragmentRateLimit) -> Self {
+        Self {
+            inner_fragment_budget: crate::reassembly::InnerFragmentBudget::new(limit),
+            ..Self::default()
+        }
+    }
+
+    #[cfg(test)]
+    pub(super) fn downlink_counters(&self) -> crate::GtpuDownlinkCounters {
+        self.downlink_counters
+    }
+
     pub(super) fn retire(&mut self) {
         self.retired = true;
         self.socket = None;
+        self.too_big_socket = None;
     }
 }
 
@@ -157,23 +179,172 @@ impl GtpuControlPort for BackendControlPort {
                 .socket
                 .as_ref()
                 .ok_or(GtpuControlPortError::Unavailable)?;
-            let Some(datagram) = socket.try_receive_datagram(maximum_bytes)? else {
-                return Ok(None);
+            // The shared queue (Echo, reassembled G-PDUs) is always served
+            // first; tc-steered over-MTU G-PDUs wait in their own queue and can
+            // never delay or crowd it out.
+            let (datagram, steered) = match socket.try_receive_datagram(maximum_bytes)? {
+                Some(datagram) => (datagram, false),
+                None => match state.too_big_socket.as_ref() {
+                    Some(queue) => match queue.try_receive_datagram(maximum_bytes)? {
+                        Some(datagram) => (datagram, true),
+                        None => return Ok(None),
+                    },
+                    None => return Ok(None),
+                },
             };
-            Ok(Some(
-                super::reassembled_downlink::process_downlink_datagram(
-                    backend.inner.runtime.as_ref(),
-                    scope,
-                    datagram,
-                    &mut state.downlink_counters,
+            let processed = super::reassembled_downlink::process_downlink_datagram(
+                backend.inner.runtime.as_ref(),
+                scope,
+                datagram,
+                &mut state.downlink_counters,
+            );
+            let plan = match processed {
+                super::reassembled_downlink::ProcessedDownlink::PacketTooBig(plan) => plan,
+                super::reassembled_downlink::ProcessedDownlink::FragmentInner(plan) => {
+                    return Ok(Some(fragment_inner(state, &plan)));
+                }
+                super::reassembled_downlink::ProcessedDownlink::Event(event) => {
+                    // A steered datagram only ever carries an authorized
+                    // over-MTU packet. If authority changed since tc steered
+                    // it, never expose it as a control or unknown-tunnel
+                    // event bound to the wrong socket.
+                    return Ok(Some(match event {
+                        crate::GtpuDownlinkEvent::Control(_)
+                        | crate::GtpuDownlinkEvent::UnknownTunnel(_)
+                            if steered =>
+                        {
+                            state
+                                .downlink_counters
+                                .record_drop(crate::GtpuDownlinkDrop::StateUnavailable);
+                            crate::GtpuDownlinkEvent::Dropped(
+                                crate::GtpuDownlinkDrop::StateUnavailable,
+                            )
+                        }
+                        event => event,
+                    }));
+                }
+            };
+            // At most one error per offending packet. The never-answer rules
+            // run before a token is taken, so suppressed packets cannot drain
+            // a session's budget. The error is always carried in the UE's
+            // default-bearer uplink G-PDU; nothing is ever sent unencapsulated.
+            let signal = match plan.build_uplink_gpdu() {
+                None => crate::GtpuPacketTooBigSignal::Unsendable,
+                Some(_)
+                    if !state
+                        .too_big_limiter
+                        .admit(plan.session(), std::time::Instant::now()) =>
+                {
+                    crate::GtpuPacketTooBigSignal::RateLimited
+                }
+                Some((gpdu, local, peer)) => {
+                    match socket.send_in_tunnel_error(local, peer, &gpdu) {
+                        Ok(_) => crate::GtpuPacketTooBigSignal::Sent,
+                        Err(_) => crate::GtpuPacketTooBigSignal::Unsendable,
+                    }
+                }
+            };
+            let counters = &mut state.downlink_counters;
+            let slot = match signal {
+                crate::GtpuPacketTooBigSignal::Sent => &mut counters.packet_too_big_signalled,
+                crate::GtpuPacketTooBigSignal::RateLimited => {
+                    &mut counters.packet_too_big_rate_limited
+                }
+                crate::GtpuPacketTooBigSignal::Unsendable => {
+                    &mut counters.packet_too_big_unsendable
+                }
+            };
+            *slot = slot.saturating_add(1);
+            Ok(Some(crate::GtpuDownlinkEvent::PacketTooBig(
+                crate::GtpuDownlinkPacketTooBig::new(
+                    crate::GtpAddressFamily::Ipv4,
+                    plan.mtu(),
+                    signal,
                 ),
-            ))
+            )))
+        })
+    }
+
+    fn set_packet_too_big_rate_limit(
+        &self,
+        limit: crate::GtpuPacketTooBigRateLimit,
+    ) -> Result<(), GtpuControlPortError> {
+        self.with_attachment(|_, state, _| {
+            state.too_big_limiter = crate::reassembly::PacketTooBigLimiter::new(limit);
+            Ok(())
+        })
+    }
+
+    fn set_inner_fragment_rate_limit(
+        &self,
+        limit: crate::GtpuInnerFragmentRateLimit,
+    ) -> Result<(), GtpuControlPortError> {
+        self.with_attachment(|_, state, _| {
+            state.inner_fragment_budget.set_limit(limit);
+            Ok(())
         })
     }
 
     fn downlink_counters(&self) -> Result<crate::GtpuDownlinkCounters, GtpuControlPortError> {
-        self.with_attachment(|_, state, _| Ok(state.downlink_counters))
+        self.with_attachment(|_, state, _| {
+            let mut counters = state.downlink_counters;
+            counters.shared_queue_drops = state
+                .socket
+                .as_ref()
+                .map_or(0, |socket| u64::from(socket.queue_drops()));
+            counters.packet_too_big_queue_drops = state
+                .too_big_socket
+                .as_ref()
+                .map_or(0, |socket| u64::from(socket.queue_drops()));
+            Ok(counters)
+        })
     }
+}
+
+/// Fragment one authorized over-MTU packet under the default policy, recording
+/// exactly one outcome counter.
+///
+/// The header is validated first, so a malformed or option-bearing packet
+/// takes no token; the destination's budget is taken next, and only then is
+/// an Identification assigned from its sequence (atomic datagrams only).
+pub(super) fn fragment_inner(
+    state: &mut ControlSocketState,
+    plan: &super::reassembled_downlink::InnerFragmentPlan,
+) -> crate::GtpuDownlinkEvent {
+    let drop = |state: &mut ControlSocketState, reason| {
+        state.downlink_counters.record_drop(reason);
+        crate::GtpuDownlinkEvent::Dropped(reason)
+    };
+    let source = match crate::inner_fragment::Ipv4FragmentSource::parse(plan.inner_packet()) {
+        Ok(source) => source,
+        Err(crate::inner_fragment::InnerFragmentRefusal::Options) => {
+            return drop(state, crate::GtpuDownlinkDrop::InnerUnfragmentable);
+        }
+        Err(crate::inner_fragment::InnerFragmentRefusal::Malformed) => {
+            return drop(state, crate::GtpuDownlinkDrop::Malformed);
+        }
+    };
+    let Some(assigned) = state.inner_fragment_budget.admit(
+        plan.destination(),
+        std::time::Instant::now(),
+        source.is_atomic(),
+    ) else {
+        return drop(state, crate::GtpuDownlinkDrop::InnerFragmentRateLimited);
+    };
+    let identification = assigned.unwrap_or_else(|| source.identification());
+    let Some(fragments) = source.fragment(plan.mtu(), identification) else {
+        return drop(state, crate::GtpuDownlinkDrop::Malformed);
+    };
+    let counters = &mut state.downlink_counters;
+    counters.inner_fragmented = counters.inner_fragmented.saturating_add(1);
+    counters.inner_fragments = counters
+        .inner_fragments
+        .saturating_add(u64::try_from(fragments.len()).unwrap_or(u64::MAX));
+    crate::GtpuDownlinkEvent::Fragmented(crate::GtpuFragmentedDownlink::new(
+        fragments,
+        plan.bearer_mark(),
+        plan.mtu(),
+    ))
 }
 
 impl EbpfGtpuDataplaneBackend {
@@ -285,6 +456,16 @@ impl EbpfGtpuDataplaneBackend {
             socket.socket = Some(
                 crate::GtpuReassemblySocket::bind(local_ip, &device.name)
                     .map_err(|error| GtpuError::io("ebpf_control_port_bind", error))?,
+            );
+        }
+        if socket.too_big_socket.is_none() {
+            // Without this queue, tc-steered over-MTU G-PDUs would be
+            // answered by the kernel with port unreachable; refuse instead.
+            socket.too_big_socket = Some(
+                crate::GtpuReassemblySocket::bind_packet_too_big_queue(local_ip, &device.name)
+                    .map_err(|error| {
+                        GtpuError::io("ebpf_control_port_packet_too_big_bind", error)
+                    })?,
             );
         }
         Ok(Arc::new(BackendControlPort {

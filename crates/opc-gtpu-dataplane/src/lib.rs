@@ -60,6 +60,7 @@ pub mod control_port;
 pub mod ebpf;
 pub mod error;
 pub mod icmp;
+mod inner_fragment;
 pub mod linux;
 pub mod mock;
 pub mod model;
@@ -113,11 +114,12 @@ pub use model::{
     DrainedV2TeardownProgress, DrainedV2TeardownRefusal, DrainedV2TeardownRequest,
     EbpfDatapathGeneration, EbpfHistoricalDatapathGeneration, GtpAddressFamily, GtpBearerMark,
     GtpDevice, GtpPdpContext, GtpRole, GtpVersion, GtpuBackendKind, GtpuCapability,
-    GtpuDownlinkEndpoint, GtpuDownlinkFragmentContract, GtpuIpFamilyCapabilities,
-    GtpuLocalEndpointSet, GtpuOuterFragmentPolicy, GtpuProbe, GtpuReassemblyBounds,
-    GtpuSessionAttachmentSelector, GtpuSessionDeviceId, GtpuSessionEntry, GtpuSessionGroup,
-    GtpuSessionGroupConflict, GtpuSessionGroupId, GtpuSessionGroupIndeterminateReason,
-    GtpuSessionGroupReadback, GtpuSessionGroupReconcileOutcome, GtpuSessionGroupReconcileRequest,
+    GtpuDownlinkEndpoint, GtpuDownlinkFragmentContract, GtpuDownlinkInnerMtu,
+    GtpuDownlinkOversizePolicy, GtpuIpFamilyCapabilities, GtpuLocalEndpointSet,
+    GtpuOuterFragmentPolicy, GtpuProbe, GtpuReassemblyBounds, GtpuSessionAttachmentSelector,
+    GtpuSessionDeviceId, GtpuSessionEntry, GtpuSessionGroup, GtpuSessionGroupConflict,
+    GtpuSessionGroupId, GtpuSessionGroupIndeterminateReason, GtpuSessionGroupReadback,
+    GtpuSessionGroupReconcileOutcome, GtpuSessionGroupReconcileRequest,
     GtpuSessionGroupRemovalOutcome, GtpuSessionGroupSelector, GtpuSessionModelError,
     GtpuSessionPaa, GtpuSessionSelectorProvenance, GtpuSessionSelectorReuseEvidence,
     GtpuSessionSelectorReuseProof, GtpuSourcePortPolicy, GtpuSourcePortRange,
@@ -175,9 +177,10 @@ pub use reassembly::{
 };
 pub use reassembly::{
     reassembly_commit_authorizes_graph, DownlinkOuterProvenance, GtpuDecapsulatedDownlink,
-    GtpuDownlinkCounters, GtpuDownlinkDrop, GtpuDownlinkEvent, GtpuReassemblyConsumer,
-    GtpuReassemblyCounters, GtpuReassemblyDrop, GtpuReassemblyGraphIdentity, GtpuReassemblyOutcome,
-    GtpuReassemblyPdr, GtpuReassemblySelector,
+    GtpuDownlinkCounters, GtpuDownlinkDrop, GtpuDownlinkEvent, GtpuDownlinkPacketTooBig,
+    GtpuFragmentedDownlink, GtpuInnerFragmentRateLimit, GtpuPacketTooBigRateLimit,
+    GtpuPacketTooBigSignal, GtpuReassemblyConsumer, GtpuReassemblyCounters, GtpuReassemblyDrop,
+    GtpuReassemblyGraphIdentity, GtpuReassemblyOutcome, GtpuReassemblyPdr, GtpuReassemblySelector,
 };
 pub use selector_namespace::GtpuSelectorNamespaceBootstrap;
 pub use selector_namespace::{
@@ -246,6 +249,7 @@ mod integration_tests {
             bearer_mark: None,
             egress_dscp: None,
             uplink_source_port_policy: GtpuUplinkSourcePortPolicy::LegacyServicePort,
+            downlink_inner_mtu: None,
         }
     }
 

@@ -94,7 +94,31 @@ On an eBPF attachment, `try_receive_downlink` on the same port is the
 backend-authoritative consumer for kernel-reassembled and handed-off G-PDUs:
 it authorizes against the backend's own grouped and v5 maps (commit read
 last) and returns the exact inner packet and bearer mark, or a value-free
-drop.
+drop. With an optional per-context `GtpPdpContext::downlink_inner_mtu`, tc
+steers an over-MTU DF downlink IPv4 packet to a dedicated backend-owned queue
+instead of letting the host drop it with its own error. The consumer then
+applies the context's RFC 4459 policy:
+
+- **Default** (`GtpuDownlinkInnerMtu::new`): clear DF and fragment the inner
+  packet before encapsulation (RFC 4459 section 3.4). `try_receive_downlink`
+  returns RFC 791 fragments of at most the MTU, with the bearer mark, for the
+  caller to inject toward XFRM; the UE reassembles them. Fragmenting a DF
+  datagram is an owner-approved deviation from RFC 791, RFC 1191 and RFC 6864
+  DF semantics, and the originator's PMTUD never learns the tunnel MTU.
+- **Opt-in** (`GtpuDownlinkInnerMtu::in_tunnel_packet_too_big`): drop the
+  packet and signal it at most once inside the UE's default-bearer uplink
+  G-PDU (RFC 1191). The error's source is the subscriber's own PAA, the only
+  address the PGW's anti-spoofing admits; this departs from RFC 1812 4.3.2.4,
+  and the originator attributes the error to the subscriber.
+
+Inner IPv6 contexts refuse both policies: IPv6 has no in-network
+fragmentation (RFC 8200).
+
+Open the control port before installing an MTU-bearing context, and keep
+draining it. While its queues are not bound, the kernel may answer steered
+packets with rate-limited ICMP Port Unreachable toward the peer (#1019). MTU-bearing
+contexts must be drained before an SDK downgrade. See
+[control port](docs/control-port.md).
 
 - `GtpuDataplaneBackend`: async port for device and PDP lifecycle, typed PDP
   readback, classified installation, authority-safe exact removal, and probes.

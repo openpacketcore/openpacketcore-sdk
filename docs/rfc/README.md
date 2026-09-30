@@ -28,6 +28,12 @@ engineers.
 | [018](018-never-admitted-selector-relocation.md) | Never-Admitted Selector Namespace Relocation | Explicit relocation under positive permanent no-admission proof; excludes all prior session history |
 | [019](019-netconf-required-audit.md) | NETCONF Required Audit for Exact Configuration Effects | Exact-worker writable-running handoff; candidate, startup and confirmed lifecycle obligations remain open |
 
+## Contracts with separate implementation qualification
+
+| RFC | Title | Status and scope |
+| :--- | :--- | :--- |
+| [020](020-online-audit-recipient-verification.md) | Authority-owned online audit recipient verification | Acceptance is recorded by maintainer-approved merge of #979; implementation qualification remains separate. Online recipient custody, authenticated application boundary and checkpoint/report semantics for #959. |
+
 ## Recommended Reading Order
 
 1. RFC 008: runtime chassis.

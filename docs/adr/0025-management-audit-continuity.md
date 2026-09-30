@@ -89,6 +89,10 @@ restored after process loss; the consumer must start a newly verified export.
 
 ## Online recipient verification without signing material
 
+[RFC 020](../rfc/020-online-audit-recipient-verification.md) defines this
+online trust and public API contract. Its acceptance and this implementation
+qualification are separate from authenticated application transport evidence.
+
 `begin_recipient_audit_export` adds an online authority-owned verification
 profile. The authority keeps its admitted `AuditKeyRing`, independent checkpoint
 port and existing export permit. `AuditRecipientClient` contains only public
