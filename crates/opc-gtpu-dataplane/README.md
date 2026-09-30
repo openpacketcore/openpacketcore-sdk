@@ -188,8 +188,11 @@ contexts must be drained before an SDK downgrade. See
   self-owned snapshot is replaced without a transient absent or wrong-bearer
   publication; foreign ownership conflicts and partial, mixed, or stale state
   is indeterminate. Native exact removal first publishes a SHA-256-bound
-  metadata tombstone that the tc program rejects, removes only canonical rows
-  under the current authority, and removes the tombstone last. Its durable
+  metadata tombstone, removes only canonical rows under the current
+  authority, and removes the tombstone last. The tc program classifies a
+  tombstone whose classifier has a default bearer as absent, so default-bearer
+  uplink continues through removal without any row being read; it rejects a
+  tombstone without a default bearer. Its durable
   dense-rank cursor authorizes each active-row deletion before it occurs, so a
   retry accepts only the exact remaining suffix plus any acknowledged-loss
   rows in the authorized prefix; an unexplained missing row fails closed.

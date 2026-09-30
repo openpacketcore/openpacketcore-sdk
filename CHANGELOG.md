@@ -9,6 +9,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- `opc-gtpu-dataplane`: exact TFT classifier removal no longer drops
+  default-bearer uplink. Removal first converts the classifier into its
+  durable removal fence, and the tc program used to drop every unmarked IPv4
+  packet from the PAA while that fence existed, default-bearer traffic
+  included (TS 24.302 section 7.4.6.4.3). A fence whose classifier has a
+  default bearer now classifies as absent, the state removal publishes last:
+  unmarked packets take mark zero without any filter row being read. A fence
+  without a default bearer still drops. The datapath object is rebuilt; the
+  map ABI is unchanged. Fixes #1030.
+
 - Shared Openraft dependency: consume the exact 0.9.25 fork revision
   `72e327a4f25cbbe3a3695d8c3c0f0970ccb925d5`, including bounded apply dispatch,
   joined replication retirement, stale-campaign cleanup and cancellable
