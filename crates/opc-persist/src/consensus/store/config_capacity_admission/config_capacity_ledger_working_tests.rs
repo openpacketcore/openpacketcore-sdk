@@ -407,8 +407,11 @@ fn command_heap(command: &AuditedConfigCommand) -> usize {
     // Count each distinct real Arc payload once. The effect's execution copy
     // does not exist at the measured nested validation checkpoint. Arc headers
     // and allocator rounding are omitted.
-    size_of::<AuditedMutationFields>()
-        + size_of::<PreparedConfigCommit>()
+    size_of::<AuditedMutationFields>() + commit_heap(commit)
+}
+
+fn commit_heap(commit: &PreparedConfigCommit) -> usize {
+    size_of::<PreparedConfigCommit>()
         + commit.record.encrypted_blob.capacity()
         + commit.record.plaintext_digest.capacity()
         + commit.record.principal.capacity()
@@ -424,32 +427,74 @@ fn command_heap(command: &AuditedConfigCommand) -> usize {
             .sum::<usize>()
 }
 
+fn maximize_admitted_spare(
+    mut commit: PreparedConfigCommit,
+    binding: CapacityRecordBinding,
+    pool: &ConfigPreparationPool,
+) -> PreparedConfigCommit {
+    let required = {
+        let compact = mutation(commit.clone(), binding, pool);
+        let value = command(&compact);
+        let sizes = preflight(&probe(&value), PROFILE).expect("ordinary maximal command admission");
+        let compact_total =
+            config_capacity_command_buffers::CommandBuffers::for_command(&value.intent, &sizes)
+                .unwrap()
+                .total()
+                .unwrap();
+        let AuditedConfigEffect::BoundedAppend { commit: cloned, .. } = &compact.command().effect
+        else {
+            panic!("bounded fixture");
+        };
+        // Sizing this temporary command uses compact clones. Restore every
+        // real retained capacity in the input owner before choosing headroom.
+        compact_total + commit_heap(&commit) - commit_heap(cloned)
+    };
+    let additional = OPERATION_BYTES.checked_sub(required).unwrap();
+    assert!(
+        additional > 0,
+        "maximal metadata still admits real spare capacity"
+    );
+    let capacity = commit.record.encrypted_blob.capacity() + additional;
+    commit
+        .record
+        .encrypted_blob
+        .reserve_exact(capacity - commit.record.encrypted_blob.len());
+    assert_eq!(commit.record.encrypted_blob.capacity(), capacity);
+    PreparedConfigCommit::prepare_for_profile(commit.record, commit.audit, &key(), PROFILE)
+        .expect("the inclusive owner passes early preparation admission")
+}
+
 fn simultaneous_apply(expanded: bool) {
     let pool = ConfigPreparationPool::bounded_v1();
     let (commit, binding, envelope) = maximum_parts();
     let mut commit = maximize_metadata(commit, binding, &pool);
     if expanded {
-        // Keep every authenticated byte unchanged; spare Vec capacity is a
-        // real admitted input owner and must not be replaced by its length.
-        commit
-            .record
-            .encrypted_blob
-            .reserve_exact(14 * 1024 * 1024 - commit.record.encrypted_blob.len());
-        commit =
-            PreparedConfigCommit::prepare_for_profile(commit.record, commit.audit, &key(), PROFILE)
-                .expect("expanded owner passes actual early preparation admission");
+        // The former 14 MiB owner is now rejected for replication headroom.
+        // Preserve the real maximum-ledger apply with the largest admitted
+        // spare capacity instead; authentication and every byte stay intact.
+        commit = maximize_admitted_spare(commit, binding, &pool);
     }
     let prepared = mutation(commit, binding, &pool);
     if expanded {
         let AuditedConfigEffect::BoundedAppend { commit, .. } = &prepared.command().effect else {
             panic!("bounded fixture");
         };
-        assert!(commit.record.encrypted_blob.capacity() >= 14 * 1024 * 1024);
+        assert!(commit.record.encrypted_blob.capacity() > ENVELOPE_BYTES);
         assert_eq!(commit.record.encrypted_blob.len(), ENVELOPE_BYTES);
     }
     let value = command(&prepared);
     let sizes =
         preflight(&probe(&value), PROFILE).expect("actual command working and encoding admission");
+    if expanded {
+        assert_eq!(
+            config_capacity_command_buffers::CommandBuffers::for_command(&value.intent, &sizes)
+                .unwrap()
+                .total()
+                .unwrap(),
+            OPERATION_BYTES,
+            "exercise the inclusive current admission boundary during real apply"
+        );
+    }
     assert_eq!(sizes.command - ENVELOPE_BYTES, METADATA_BYTES);
     let applied_metadata =
         config_command_encoded_size(&value).expect("actual applied command size") - ENVELOPE_BYTES;

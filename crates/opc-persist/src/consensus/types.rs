@@ -1122,6 +1122,10 @@ pub(crate) fn encode_config_wire_for_profile<T: Serialize + ?Sized>(
     })
 }
 
+#[cfg(all(test, target_os = "linux", feature = "dangerous-test-hooks"))]
+#[path = "types/config_capacity_parallel_encoding_tests.rs"]
+pub(super) mod config_capacity_parallel_encoding_tests;
+
 // Validate the profile discriminator before asking the payload to deserialize.
 // This keeps a mismatched peer from allocating its command or snapshot chunk
 // before the immutable configuration profile has been checked.
