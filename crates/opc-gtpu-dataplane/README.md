@@ -195,10 +195,12 @@ contexts must be drained before an SDK downgrade. See
   tombstone without a default bearer. Before deleting any row, each removal
   attempt waits for every tc invocation that could have copied the active
   selector before the tombstone, using the qualified GLOBAL membarrier grace
-  of grouped selectors. On a kernel outside that profile (PREEMPT_RT, or an
-  unrecognized version string) the wait is unavailable and removal proceeds
-  without it, so an invocation already running when the tombstone is
-  published may still miss a deleted row. Its durable
+  of grouped selectors. Where that grace is unavailable (PREEMPT_RT,
+  `nohz_full`, an unrecognized version string, or a refused `membarrier`
+  query), TFT classification reports `Missing` and exact removal refuses with
+  `UnsupportedFeature` before any mutation, leaving the complete classifier
+  published. A wait that fails after the tombstone is published deletes
+  nothing and returns `Indeterminate` for a retry. Its durable
   dense-rank cursor authorizes each active-row deletion before it occurs, so a
   retry accepts only the exact remaining suffix plus any acknowledged-loss
   rows in the authorized prefix; an unexplained missing row fails closed.

@@ -19,9 +19,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   without a default bearer still drops. Before deleting any row, each removal
   attempt also waits for tc invocations that copied the active selector before
   the fence, using the qualified GLOBAL membarrier grace of grouped selectors.
-  On PREEMPT_RT or an unrecognized kernel profile the wait is unavailable and
-  removal proceeds without it. The datapath object is rebuilt; the map ABI is
-  unchanged. Fixes #1030.
+  Where that grace is unavailable (PREEMPT_RT, nohz_full, an unrecognized
+  kernel profile or a refused membarrier query), TFT classification reports
+  Missing and removal refuses before any mutation. The datapath object is
+  rebuilt; the map ABI is unchanged. Fixes #1030.
 
 - Shared Openraft dependency: consume the exact 0.9.25 fork revision
   `72e327a4f25cbbe3a3695d8c3c0f0970ccb925d5`, including bounded apply dispatch,
