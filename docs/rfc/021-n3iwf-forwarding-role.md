@@ -1,7 +1,8 @@
 # RFC 021: N3IWF forwarding role between NWu GRE and N3 GTP-U
 
-**Status:** Proposed contract. Maintainer-approved merge of the pull request
-that introduces this document records acceptance; until then it is a proposal.
+**Status:** Proposed contract. Maintainer-approved merge of
+[#1029](https://github.com/openpacketcore/openpacketcore-sdk/pull/1029)
+records acceptance; until then it is a proposal.
 Acceptance approves the boundary and the three decisions below. It does not
 qualify an implementation, and every shipped adapter keeps reporting the
 N3IWF forwarding role as `Missing` until the evidence in §10 exists.
