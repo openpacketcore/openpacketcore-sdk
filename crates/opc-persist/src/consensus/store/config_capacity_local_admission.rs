@@ -302,7 +302,7 @@ impl CheckedLocalMutation<'_> {
                 .map_err(|_| ForwardMutationRejection::InvalidCommand)?;
         }
         if profile != ConfigCapacityProfile::BoundedV1
-            && !config_command_fits_replication_budget(&command, self.store.mode())
+            && !config_command_fits_replication_budget(&command, profile)
         {
             return Err(ForwardMutationRejection::CommandTooLarge);
         }
