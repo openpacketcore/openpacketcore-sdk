@@ -21,7 +21,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   the fence, using the qualified GLOBAL membarrier grace of grouped selectors.
   Where that grace is unavailable (PREEMPT_RT, nohz_full, an unrecognized
   kernel profile or a refused membarrier query), TFT classification reports
-  Missing and removal refuses before any mutation. The datapath object is
+  Missing, and install, replacement and removal refuse before any mutation. The datapath object is
   rebuilt; the map ABI is unchanged. Fixes #1030.
 
 - Shared Openraft dependency: consume the exact 0.9.25 fork revision

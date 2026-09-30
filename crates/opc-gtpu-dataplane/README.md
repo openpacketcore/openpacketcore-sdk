@@ -197,9 +197,10 @@ contexts must be drained before an SDK downgrade. See
   selector before the tombstone, using the qualified GLOBAL membarrier grace
   of grouped selectors. Where that grace is unavailable (PREEMPT_RT,
   `nohz_full`, an unrecognized version string, or a refused `membarrier`
-  query), TFT classification reports `Missing` and exact removal refuses with
-  `UnsupportedFeature` before any mutation, leaving the complete classifier
-  published. A wait that fails after the tombstone is published deletes
+  query), TFT classification reports `Missing`, and both reconciliation that
+  would install or replace a classifier and exact removal refuse with
+  `UnsupportedFeature` before any mutation, leaving any published classifier
+  complete. A wait that fails after the tombstone is published deletes
   nothing and returns `Indeterminate` for a retry. Its durable
   dense-rank cursor authorizes each active-row deletion before it occurs, so a
   retry accepts only the exact remaining suffix plus any acknowledged-loss

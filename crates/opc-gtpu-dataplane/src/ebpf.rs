@@ -5416,6 +5416,19 @@ impl EbpfGtpuDataplaneBackend {
                 Ok(observed) => observed,
                 Err(_) => return Ok(TftUplinkClassifierReconcileOutcome::Indeterminate),
             };
+            // A classifier published without the reader grace could never be
+            // removed exactly, so no mutation is admitted without it.
+            let mutates = match &observed {
+                TftClassifierObservation::Present(value) => {
+                    Self::tft_observation_owned_by(value, authority) && value.classifier != desired
+                }
+                TftClassifierObservation::Absent | TftClassifierObservation::Indeterminate => true,
+            };
+            if mutates && !self.inner.runtime.tft_reader_grace_available() {
+                return Err(GtpuError::UnsupportedFeature {
+                    feature: "tft_classifier_reader_grace",
+                });
+            }
             let (previous, replacement) = match &observed {
                 TftClassifierObservation::Absent => (None, false),
                 TftClassifierObservation::Present(value) => {
@@ -65672,6 +65685,77 @@ mod tests {
                 .await
                 .unwrap(),
             TftUplinkClassifierRemovalOutcome::Removed
+        );
+    }
+
+    /// Without the reader grace a classifier could never be removed exactly,
+    /// so reconciliation admits no install or replacement and changes no map,
+    /// while an exact present classifier still reports `AlreadyPresent`.
+    #[tokio::test]
+    async fn tft_classifier_reconcile_without_reader_grace_is_refused_untouched() {
+        let (backend, runtime) = backend_with_fake();
+        backend.create_device(create_request()).await.unwrap();
+        let classifier = tft_classifier_with_two_filters();
+        runtime.state().tft_reader_grace_unavailable = true;
+        runtime.state().operations.clear();
+        assert!(matches!(
+            backend
+                .reconcile_tft_uplink_classifier(classifier.clone())
+                .await,
+            Err(GtpuError::UnsupportedFeature {
+                feature: "tft_classifier_reader_grace"
+            })
+        ));
+        {
+            let state = runtime.state();
+            assert!(state.tft_meta.is_empty());
+            assert!(state.tft_filters.is_empty());
+            assert!(!state.operations.contains(&"tft_filter_put"));
+            assert!(!state.operations.contains(&"tft_meta_put"));
+        }
+
+        runtime.state().tft_reader_grace_unavailable = false;
+        assert_eq!(
+            backend
+                .reconcile_tft_uplink_classifier(classifier.clone())
+                .await
+                .unwrap(),
+            TftUplinkClassifierReconcileOutcome::Installed
+        );
+        runtime.state().tft_reader_grace_unavailable = true;
+        let (meta, rows) = {
+            let mut state = runtime.state();
+            state.operations.clear();
+            (state.tft_meta.clone(), state.tft_filters.clone())
+        };
+        assert!(matches!(
+            backend
+                .reconcile_tft_uplink_classifier(tft_classifier(0x41, 7, 6))
+                .await,
+            Err(GtpuError::UnsupportedFeature {
+                feature: "tft_classifier_reader_grace"
+            })
+        ));
+        assert_eq!(
+            backend
+                .reconcile_tft_uplink_classifier(classifier.clone())
+                .await
+                .unwrap(),
+            TftUplinkClassifierReconcileOutcome::AlreadyPresent
+        );
+        {
+            let state = runtime.state();
+            assert_eq!(state.tft_meta, meta);
+            assert_eq!(state.tft_filters, rows);
+            assert!(!state.operations.contains(&"tft_filter_put"));
+            assert!(!state.operations.contains(&"tft_meta_put"));
+        }
+        assert_eq!(
+            backend
+                .read_tft_uplink_classifier(classifier.link_ifindex(), classifier.paa())
+                .await
+                .unwrap(),
+            TftUplinkClassifierReadback::Present(classifier)
         );
     }
 
