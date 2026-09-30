@@ -1,6 +1,7 @@
 //! Deterministic bounded state used only by the configuration consensus owner.
 
 use std::fmt;
+use std::sync::Arc;
 
 use hmac::{Hmac, KeyInit, Mac};
 use serde::{Deserialize, Serialize};
@@ -329,7 +330,42 @@ pub(crate) enum EntryPayload {
 pub(crate) struct RetainedTargetIntent {
     #[serde(deserialize_with = "deserialize_target_handle")]
     pub(crate) handle: AuditOperationHandle,
-    pub(crate) recovery: String,
+    // Ledger snapshots keep independent mutable indexes and authenticators,
+    // while this authenticated original stays immutable across those copies.
+    #[serde(with = "retained_recovery")]
+    pub(crate) recovery: Arc<String>,
+}
+
+mod retained_recovery {
+    use super::*;
+
+    pub(super) fn serialize<S: serde::Serializer>(
+        recovery: &Arc<String>,
+        serializer: S,
+    ) -> Result<S::Ok, S::Error> {
+        recovery.as_ref().serialize(serializer)
+    }
+
+    pub(super) fn deserialize<'de, D: serde::Deserializer<'de>>(
+        deserializer: D,
+    ) -> Result<Arc<String>, D::Error> {
+        String::deserialize(deserializer).map(Arc::new)
+    }
+}
+
+impl RetainedTargetIntent {
+    #[cfg(any(test, feature = "dangerous-test-hooks"))]
+    pub(crate) fn recovery_owner_allocation(&self) -> (usize, usize) {
+        // Charge the String object and both Arc reference counts, including
+        // their alignment. The pointer identifies the shared allocation; it
+        // is never dereferenced by an observer or exposed in a sample.
+        let owner = std::alloc::Layout::new::<[std::sync::atomic::AtomicUsize; 2]>()
+            .extend(std::alloc::Layout::new::<String>())
+            .expect("fixed shared recovery owner layout")
+            .0
+            .pad_to_align();
+        (Arc::as_ptr(&self.recovery) as usize, owner.size())
+    }
 }
 
 #[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -468,7 +504,7 @@ impl LedgerState {
             now,
             EntryPayload::TargetIntent(Box::new(RetainedTargetIntent {
                 handle: prepared.handle().clone(),
-                recovery,
+                recovery: Arc::new(recovery),
             })),
         )
     }
@@ -502,6 +538,8 @@ impl LedgerState {
         // the outer transaction. Existing legacy-only admission keeps its path.
         if !matches!(payload, EntryPayload::Intent(_)) || self.has_target_payloads() {
             let mut candidate = self.clone();
+            #[cfg(test)]
+            workspace_probe::admission_clone(self, &candidate, &payload);
             candidate.admit_inner(key, handle, now, payload)?;
             candidate.check_target_capacity()?;
             *self = candidate;
@@ -1305,6 +1343,9 @@ pub(crate) mod allocation_probe {
 
 #[cfg(test)]
 pub(crate) mod target_budget_probe;
+
+#[cfg(test)]
+pub(crate) mod workspace_probe;
 
 #[cfg(test)]
 pub(crate) mod native_cost_tests;

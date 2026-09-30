@@ -84,7 +84,7 @@ async fn target_ledger_budget_stops_oversized_native_admission_without_partial_s
     let retained_entries = serde_json::to_vec(&before_ledger.entries).unwrap().len();
     let next_payload = EntryPayload::TargetIntent(Box::new(RetainedTargetIntent {
         handle: second.handle().clone(),
-        recovery: String::from_utf8(second_bytes.clone()).unwrap(),
+        recovery: String::from_utf8(second_bytes.clone()).unwrap().into(),
     }));
     let additional = serde_json::to_vec(&next_payload).unwrap().len();
     assert!(

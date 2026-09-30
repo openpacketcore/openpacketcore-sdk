@@ -122,6 +122,8 @@ fn ledger_allocations(ledger: &LedgerState) -> Allocations {
             LedgerPayload::KeyTransition(value) => boxed(&mut allocations, &**value),
             LedgerPayload::TargetIntent(value) => {
                 boxed(&mut allocations, &**value);
+                let (address, bytes) = value.recovery_owner_allocation();
+                allocations.insert(address, bytes);
                 string(&mut allocations, &value.recovery);
             }
             LedgerPayload::EmptyCommit(value) => boxed(&mut allocations, &**value),

@@ -1,8 +1,9 @@
 //! Test-only live-owner accounting at the real retained-ledger validation calls.
 //!
 //! These are allocated payload extents, not allocator/RSS estimates. SQL engine
-//! pages, serde scratch and Arc bookkeeping are outside this lower bound. An
-//! inactive observer performs no inventory and imposes no ledger-shape limit.
+//! pages, serde scratch and other Arc bookkeeping are outside this lower bound.
+//! Retained recovery owners include the String object and both reference counts.
+//! An inactive observer performs no inventory and imposes no ledger-shape limit.
 
 use std::cell::Cell;
 use std::marker::PhantomData;
@@ -181,6 +182,7 @@ pub(crate) fn ledger_heap(ledger: &LedgerState) -> usize {
             }
             EntryPayload::TargetIntent(value) => {
                 size_of::<crate::audit_authority::ledger::RetainedTargetIntent>()
+                    + value.recovery_owner_allocation().1
                     + value.recovery.capacity()
             }
             EntryPayload::EmptyCommit(_) => {

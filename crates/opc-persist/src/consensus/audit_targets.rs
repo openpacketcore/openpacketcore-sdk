@@ -2038,6 +2038,11 @@ pub(crate) fn preflight_target_for_mode_sync(
     }) {
         return Ok(Err(AuditAuthorityError::RecoveryRequired));
     }
+    #[cfg(test)]
+    let _workspace = crate::audit_authority::ledger::workspace_probe::Preflight::enter(
+        ledger,
+        prepared.handle(),
+    );
     let mut candidate = ledger.clone();
     if let Err(error) = super::audit::mutation_result(candidate.admit_target(key, prepared, now))? {
         return Ok(Err(error));

@@ -326,7 +326,7 @@ fn joint_apply_original_noncanonical_matching_bytes_use_real_fallback() {
             _ => None,
         })
         .unwrap();
-    retained.recovery.push(' ');
+    std::sync::Arc::make_mut(&mut retained.recovery).push(' ');
     let actual_bytes = retained.recovery.len();
     resign(&mut ledger, &f.keys);
     let tx = f.conn.unchecked_transaction().unwrap();

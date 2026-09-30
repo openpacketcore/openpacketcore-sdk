@@ -34,7 +34,7 @@ fn replace_original(ledger: &mut LedgerState, bytes: String) {
     let EntryPayload::TargetIntent(retained) = &mut ledger.entries[0].payload else {
         panic!("actual retained target Intent")
     };
-    retained.recovery = bytes;
+    retained.recovery = bytes.into();
 }
 
 fn admit(prepared: &PreparedTargetMutation) -> LedgerState {

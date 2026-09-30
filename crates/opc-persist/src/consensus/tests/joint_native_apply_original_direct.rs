@@ -108,7 +108,7 @@ fn joint_apply_original_direct_scope_and_outcome_checks() {
     let mut changed_caller = command.clone();
     changed_caller.effect.caller = other_caller;
     let mut caller_ledger = ledger.clone();
-    retained_mut(&mut caller_ledger, handle).recovery = canonical(&changed_caller);
+    retained_mut(&mut caller_ledger, handle).recovery = canonical(&changed_caller).into();
     rejected_matches(&caller_ledger, &key(), &changed_caller, caller);
     rejected_resolution(
         caller_ledger,
@@ -264,7 +264,10 @@ fn joint_apply_original_direct_retained_bytes_and_fallback() {
     let database = snapshot(&f.conn);
     let bytes = canonical(command);
     assert!(bytes.len() > 4096);
-    assert_eq!(retained_mut(&mut ledger.clone(), handle).recovery, bytes);
+    assert_eq!(
+        retained_mut(&mut ledger.clone(), handle).recovery.as_str(),
+        bytes
+    );
 
     // Valid JSON with an extra byte must take the real owned decoder and fail
     // canonical checking. A truncated document must also fail both boundaries.
@@ -274,7 +277,7 @@ fn joint_apply_original_direct_retained_bytes_and_fallback() {
     truncated.pop().unwrap();
     for recovery in [noncanonical, truncated] {
         let mut changed = ledger.clone();
-        retained_mut(&mut changed, handle).recovery = recovery;
+        retained_mut(&mut changed, handle).recovery = recovery.into();
         let before = changed.clone();
         let (result, work) =
             direct_work(handle, || changed.matches_target(&key(), command, caller));
@@ -370,9 +373,11 @@ fn canonical_substitution() -> (Fixture, LedgerState, TargetMutationCommand) {
     let mut comparison_bytes = Vec::new();
     crate::consensus::config_capacity_json::to_writer(&mut comparison_bytes, &substituted).unwrap();
     assert_eq!(comparison_bytes.as_slice(), bytes.as_bytes());
-    retained_mut(&mut ledger, original.handle()).recovery = bytes.clone();
+    retained_mut(&mut ledger, original.handle()).recovery = bytes.clone().into();
     assert_eq!(
-        retained_mut(&mut ledger, substituted.handle()).recovery,
+        retained_mut(&mut ledger, substituted.handle())
+            .recovery
+            .as_str(),
         canonical(&substituted)
     );
     (f, ledger, substituted)

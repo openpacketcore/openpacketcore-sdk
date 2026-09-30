@@ -415,7 +415,7 @@ fn joint_receipt_cost_rejects_resigned_malformed_matching_and_other_originals() 
                         _ => None,
                     })
                     .unwrap();
-                retained.recovery.insert(0, ' ');
+                std::sync::Arc::make_mut(&mut retained.recovery).insert(0, ' ');
                 let keys =
                     AuditKeyRing::new(vec![AuditSigningKey::new(1, [0x7c; 32]).unwrap()]).unwrap();
                 resign_entries(&mut ledger, &keys);
@@ -641,7 +641,7 @@ fn joint_receipt_cost_exact_candidate_still_requires_full_verification() {
                     _ => None,
                 })
                 .unwrap();
-            retained.recovery = forged;
+            retained.recovery = forged.into();
             let keys =
                 AuditKeyRing::new(vec![AuditSigningKey::new(1, [0x7c; 32]).unwrap()]).unwrap();
             resign_entries(&mut ledger, &keys);
@@ -1141,7 +1141,8 @@ fn malformed_receipt_original_after_cleanup(
                 ReceiptRetainedEncodingFault::AlternateEscape => {
                     saved.replacen("\"effect\":", "\"\\u0065ffect\":", 1)
                 }
-            };
+            }
+            .into();
             assert_ne!(
                 retained.recovery, saved,
                 "fixture changes actual retained bytes"
@@ -1152,7 +1153,7 @@ fn malformed_receipt_original_after_cleanup(
                     | ReceiptRetainedEncodingFault::TrailingData
             ) {
                 assert!(
-                    retained.recovery.starts_with(&saved),
+                    retained.recovery.starts_with(saved.as_str()),
                     "complete canonical prefix remains intact"
                 );
             }

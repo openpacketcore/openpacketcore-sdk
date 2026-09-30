@@ -626,7 +626,7 @@ fn retained_target_admission_rejects_tampered_truncated_and_substituted_descript
     let EntryPayload::TargetIntent(retained) = &mut forged.entries[0].payload else {
         panic!("missing target intent");
     };
-    retained.recovery = changed;
+    retained.recovery = changed.into();
     let entry = &mut forged.entries[0];
     entry.mac = authenticate(
         &key,

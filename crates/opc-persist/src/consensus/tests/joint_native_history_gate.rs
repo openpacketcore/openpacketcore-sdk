@@ -756,7 +756,7 @@ fn joint_history_gate_rejects_resigned_noncanonical_retained_original() {
             _ => None,
         })
         .expect("exact bounded original");
-    retained.recovery.insert(0, ' ');
+    std::sync::Arc::make_mut(&mut retained.recovery).insert(0, ' ');
     let mut previous = ledger.predecessor;
     for entry in &mut ledger.entries {
         entry.previous = previous;
