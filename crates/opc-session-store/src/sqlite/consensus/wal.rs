@@ -397,6 +397,7 @@ impl Default for IoControl {
 
 #[derive(Clone, Debug)]
 pub(super) struct AdmissionObservation {
+    #[cfg(any(test, feature = "test-control"))]
     pub(super) operation: &'static str,
     pub(super) entries: usize,
     #[cfg(test)]
@@ -419,6 +420,7 @@ pub(super) struct FlushObservation {
     pub(super) queue_wait: Vec<Duration>,
     pub(super) admission: Vec<AdmissionObservation>,
     pub(super) submit_to_callback: Vec<Duration>,
+    #[cfg(any(test, feature = "test-control"))]
     pub(super) rollover: Duration,
     pub(super) write: Duration,
     pub(super) intent: Duration,
@@ -1057,7 +1059,7 @@ impl Wal {
         checkpoint_on_retention: bool,
     ) -> io::Result<()> {
         let submitted = Instant::now();
-        let (operation_name, entries) = match &operation {
+        let (_operation_name, entries) = match &operation {
             Operation::Append(entries) => ("append", entries.len()),
             Operation::Vote(_) => ("vote", 0),
             Operation::Committed(_) => ("committed", 0),
@@ -1172,7 +1174,8 @@ impl Wal {
             admitted: Instant::now(),
             submitted,
             admission: AdmissionObservation {
-                operation: operation_name,
+                #[cfg(any(test, feature = "test-control"))]
+                operation: _operation_name,
                 entries,
                 #[cfg(test)]
                 encode,
@@ -1813,6 +1816,7 @@ fn write_loop_body(
             .map(|request| request.admission.clone())
             .collect();
         let mut sync_calls = 4; // durable intent and final cut, each file + directory
+        #[cfg(any(test, feature = "test-control"))]
         let mut rollover = Duration::ZERO;
         let mut data_sync = Duration::ZERO;
         let mut write = Duration::ZERO;
@@ -1912,12 +1916,16 @@ fn write_loop_body(
                         sync_calls += 1;
                         (control.hook)(Point::AfterDataSync)?;
                     }
+                    #[cfg(any(test, feature = "test-control"))]
                     let started = Instant::now();
                     disk.segment += 1;
                     disk.file =
                         create_segment(&disk.directory, disk.segment, disk.binding, disk.chain)?;
                     disk.offset = SEGMENT_HEADER as u64;
-                    rollover += started.elapsed();
+                    #[cfg(any(test, feature = "test-control"))]
+                    {
+                        rollover += started.elapsed();
+                    }
                     sync_calls += 2;
                     (control.hook)(Point::AfterRollover)?;
                 }
@@ -2063,6 +2071,7 @@ fn write_loop_body(
             queue_wait,
             admission,
             submit_to_callback,
+            #[cfg(any(test, feature = "test-control"))]
             rollover,
             write,
             intent,

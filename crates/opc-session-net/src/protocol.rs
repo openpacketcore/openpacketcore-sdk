@@ -40,6 +40,8 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 use crate::error::ProtocolError;
 
+mod consensus_json;
+
 pub const CONTRACT_VERSION: u32 = 5;
 pub const DEFAULT_MAX_FRAME_SIZE: usize = 1024 * 1024;
 pub const MAX_HANDSHAKE_FRAME_SIZE: usize = 8 * 1024;
@@ -3720,6 +3722,8 @@ struct EncodedFrame {
     retained_byte_capacity: usize,
     #[cfg(all(test, feature = "test-control"))]
     encoding_control_checks: usize,
+    #[cfg(all(test, feature = "test-control"))]
+    encoding_fragment_writes: usize,
 }
 
 struct BoundedFrameBuffer<'a> {
@@ -3741,6 +3745,8 @@ impl<'a> BoundedFrameBuffer<'a> {
                 retained_byte_capacity: 0,
                 #[cfg(all(test, feature = "test-control"))]
                 encoding_control_checks: 0,
+                #[cfg(all(test, feature = "test-control"))]
+                encoding_fragment_writes: 0,
             },
             max_frame_size,
             exceeded_at: None,
@@ -3895,6 +3901,10 @@ impl<'buffer, 'control> FrameFragmentBuffer<'buffer, 'control> {
 
 impl std::io::Write for FrameFragmentBuffer<'_, '_> {
     fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        #[cfg(all(test, feature = "test-control"))]
+        {
+            self.sink.frame.encoding_fragment_writes += 1;
+        }
         // Count pending bytes against the original ceiling before copying them.
         // On rejection, preserve the sink's original control/error precedence.
         if buf.len() > self.remaining_budget {
@@ -3989,7 +3999,7 @@ where
     }
     let encoded = {
         let mut fragments = FrameFragmentBuffer::new(&mut buffer);
-        serde_json::to_writer(&mut fragments, frame)
+        consensus_json::to_writer(&mut fragments, frame)
             .map_err(ProtocolError::from)
             .and_then(|()| std::io::Write::flush(&mut fragments).map_err(ProtocolError::Io))
     };
@@ -4499,6 +4509,28 @@ where
             }
         }
     }
+}
+
+/// Write the ordinary owned wire DTO through a borrowed encoding view.
+///
+/// Numeric payload emission uses additional fixed 1 KiB synchronous scratch;
+/// it borrows the original payload and preserves the bounded frame writer.
+pub(crate) async fn write_consensus_frame_bounded_until<W>(
+    writer: &mut W,
+    frame: &SessionConsensusTransportRequest,
+    max_frame_size: usize,
+    deadline: tokio::time::Instant,
+) -> Result<(), ProtocolError>
+where
+    W: tokio::io::AsyncWrite + Unpin,
+{
+    write_frame_bounded_until(
+        writer,
+        &consensus_json::BorrowedRequest(frame),
+        max_frame_size,
+        deadline,
+    )
+    .await
 }
 
 /// Cancellable counterpart to [`write_frame_bounded_until`].

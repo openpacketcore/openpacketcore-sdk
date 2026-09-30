@@ -746,6 +746,7 @@ impl NativeState {
         retained
     }
 
+    #[cfg(any(test, feature = "test-control"))]
     pub(crate) fn set_current_snapshot(
         &mut self,
         current: crate::sqlite::consensus::CurrentSnapshot,

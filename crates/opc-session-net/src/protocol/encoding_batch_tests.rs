@@ -9,6 +9,7 @@ use std::sync::atomic::AtomicUsize;
 struct Work {
     frames: usize,
     control_checks: usize,
+    fragment_writes: usize,
     encoded_bytes: usize,
     retained_bytes: usize,
     chunks: usize,
@@ -26,6 +27,7 @@ pub(super) fn record_frame_work(frame: &EncodedFrame) {
         if let Some(mut work) = slot.get() {
             work.frames += 1;
             work.control_checks += frame.encoding_control_checks;
+            work.fragment_writes += frame.encoding_fragment_writes;
             work.encoded_bytes += frame.encoded_len;
             work.retained_bytes += frame.retained_byte_capacity;
             work.chunks += frame.chunks.len();
@@ -494,3 +496,6 @@ async fn latched_cancellation_survives_signal_clear_and_serializer_error() {
 async fn latched_oversize_precedes_later_cancellation_and_serializer_error() {
     assert_latched_error_precedes_later_signal(false).await;
 }
+
+#[path = "consensus_json_tests.rs"]
+mod consensus_json_tests;
