@@ -23,6 +23,8 @@ const DERIVED: usize = 3;
 const AUTH: usize = 4;
 const APPLY: usize = 5;
 const WRITE: usize = 6;
+const VALIDATION_INDEX: usize = 7;
+const OWNERS: usize = 8;
 
 #[derive(Clone, Copy, Debug, Default)]
 pub(crate) struct Sample {
@@ -36,6 +38,7 @@ pub(crate) struct Sample {
     pub(crate) write_json: usize,
     pub(crate) decoded_ledger: usize,
     pub(crate) derived: usize,
+    pub(crate) validation_index: usize,
     pub(crate) authentication: usize,
     pub(crate) total: usize,
 }
@@ -66,8 +69,8 @@ fn ledger_collections(ledger: &LedgerState) -> LedgerCollections {
 #[derive(Clone, Copy, Debug, Default)]
 pub(crate) struct Observation {
     base: Sample,
-    owners: [usize; 7],
-    ledger_identities: [usize; 7],
+    owners: [usize; OWNERS],
+    ledger_identities: [usize; OWNERS],
     continuity_depth: usize,
     encoding_depth: usize,
     pub(crate) encoding_calls: usize,
@@ -113,6 +116,7 @@ fn sample(observation: &mut Observation) {
         write_json: observation.owners[WRITE],
         decoded_ledger: observation.owners[DECODED],
         derived: observation.owners[DERIVED],
+        validation_index: observation.owners[VALIDATION_INDEX],
         authentication: observation.owners[AUTH],
         ..observation.base
     };
@@ -127,6 +131,7 @@ fn sample(observation: &mut Observation) {
         current.write_json,
         current.decoded_ledger,
         current.derived,
+        current.validation_index,
         current.authentication,
     ]
     .into_iter()
@@ -491,6 +496,18 @@ pub(crate) fn live_derived_bytes() -> usize {
     })
 }
 
+#[cfg(feature = "dangerous-test-hooks")]
+pub(crate) fn live_validation_index_bytes() -> usize {
+    OBSERVATION.with(|slot| {
+        slot.get()
+            .map_or(0, |observation| observation.owners[VALIDATION_INDEX])
+    })
+}
+
+pub(crate) fn validation_index<T>(entries: &Vec<T>) -> OwnerGuard<'_> {
+    owner(VALIDATION_INDEX, || entries.capacity() * size_of::<T>())
+}
+
 pub(crate) struct DerivedGuard(OwnerGuard<'static>);
 
 pub(crate) fn derived() -> DerivedGuard {
@@ -537,8 +554,11 @@ impl ObservationGuard {
     pub(crate) fn finish(self) -> Observation {
         OBSERVATION.with(|slot| {
             let observation = slot.take().expect("active observation");
-            assert_eq!(observation.owners, [0; 7], "all observed scopes have ended");
-            assert_eq!(observation.ledger_identities, [0; 7]);
+            assert_eq!(
+                observation.owners, [0; OWNERS],
+                "all observed scopes have ended"
+            );
+            assert_eq!(observation.ledger_identities, [0; OWNERS]);
             assert_eq!(observation.continuity_depth, 0);
             assert_eq!(observation.encoding_depth, 0);
             observation

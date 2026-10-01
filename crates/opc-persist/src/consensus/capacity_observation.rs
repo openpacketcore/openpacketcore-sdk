@@ -259,7 +259,7 @@ impl Drop for PreparationOwner<'_> {
 pub enum NativeStage {
     /// Actual owned ledger after decoding; SQL's borrowed blob is excluded.
     DecodedLedger,
-    /// Validated ledger while its original derived-operation Vec is still live.
+    /// Validated ledger while its derived-operation and validation-index Vecs are live.
     ValidatedLedger,
     /// Authenticated ledger and decoded effect before the actual mutation.
     AuthenticatedMutation,
@@ -296,6 +296,8 @@ pub struct NativeOwnerSample {
     pub native_ledger_capacities: [usize; 3],
     /// Actual derived-operation Vec capacity, or zero outside validation.
     pub native_derived_bytes: usize,
+    /// Actual borrowed-handle index Vec capacity, or zero outside validation.
+    pub native_validation_index_bytes: usize,
     /// Actual native row-write Vec capacity, or zero outside that checkpoint.
     pub native_write_bytes: usize,
     /// Whether native allocations are distinct from the selected prepared ones.
@@ -509,13 +511,23 @@ impl Drop for NativeScope<'_> {
 }
 
 pub(crate) fn sample(stage: NativeStage, ledger: &LedgerState, write: Option<&Vec<u8>>) {
-    sample_owners(stage, ledger, write, None);
+    sample_owners(stage, ledger, write, None, None);
 }
 
-pub(crate) fn validated_ledger(ledger: &LedgerState, derived: &Vec<LedgerOperation>) {
+pub(crate) fn validated_ledger(
+    ledger: &LedgerState,
+    derived: &Vec<LedgerOperation>,
+    index_allocation: (usize, usize),
+) {
     // This borrows the original validation local, before its scope can end.
     // An inactive native registration returns before constructing any census.
-    sample_owners(NativeStage::ValidatedLedger, ledger, None, Some(derived));
+    sample_owners(
+        NativeStage::ValidatedLedger,
+        ledger,
+        None,
+        Some(derived),
+        Some(index_allocation),
+    );
 }
 
 fn sample_owners(
@@ -523,6 +535,7 @@ fn sample_owners(
     ledger: &LedgerState,
     write: Option<&Vec<u8>>,
     derived: Option<&Vec<LedgerOperation>>,
+    index_allocation: Option<(usize, usize)>,
 ) {
     NATIVE.with(|slot| {
         let active = slot.borrow();
@@ -564,6 +577,9 @@ fn sample_owners(
         if let Some(derived) = derived {
             vector(&mut native, derived);
         }
+        if let Some((address, bytes)) = index_allocation.filter(|(_, bytes)| *bytes != 0) {
+            native.insert(address, bytes);
+        }
         node.extend(native.iter().map(|(&address, &bytes)| (address, bytes)));
         selected.extend(native);
         shared.callbacks.fetch_add(1, Ordering::SeqCst);
@@ -583,6 +599,7 @@ fn sample_owners(
                 native_ledger_capacities,
                 native_derived_bytes: derived
                     .map_or(0, |values| values.capacity() * size_of::<LedgerOperation>()),
+                native_validation_index_bytes: index_allocation.map_or(0, |(_, bytes)| bytes),
                 native_write_bytes: write.map_or(0, Vec::capacity),
                 native_is_distinct,
                 selected_mutation_bytes: selected.values().sum(),

@@ -9,6 +9,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- `opc-persist`: preserve indexed validation across legacy audit intents,
+  retained target intents, and empty commits. Account for the live index
+  allocation alongside the derived ledger operations. Combined runtime and
+  capacity qualification remain open. Refs #957, #958.
+
 - `opc-persist`: connect the explicit bounded Running profile to native audited
   admission and application, preserving its original recovery identity and WAL
   durability. Avoid repeated ledger serialization and bounded recovery routing
@@ -47,6 +52,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   identities. Release completed audit preflight ledgers before checkpoint and
   native submission. The experimental capacity profile remains under qualification.
   Refs #957, #960.
+
+- `opc-gtpu-dataplane`: exact TFT classifier removal no longer drops
+  default-bearer uplink. Removal first converts the classifier into its
+  durable removal fence, and the tc program used to drop every unmarked IPv4
+  packet from the PAA while that fence existed, default-bearer traffic
+  included (TS 24.302 section 7.4.6.4.3). A fence whose classifier has a
+  default bearer now classifies as absent, the state removal publishes last:
+  unmarked packets take mark zero without any filter row being read. A fence
+  without a default bearer still drops. Before deleting any row, each removal
+  attempt also waits for tc invocations that copied the active selector before
+  the fence, using the qualified GLOBAL membarrier grace of grouped selectors.
+  Where that grace is unavailable (PREEMPT_RT, nohz_full, an unrecognized
+  kernel profile or a refused membarrier query), TFT classification reports
+  Missing, and install, replacement and removal refuse before any mutation. The datapath object is
+  rebuilt; the map ABI is unchanged. Fixes #1030.
 
 - Shared Openraft dependency: consume the exact 0.9.25 fork revision
   `72e327a4f25cbbe3a3695d8c3c0f0970ccb925d5`, including bounded apply dispatch,

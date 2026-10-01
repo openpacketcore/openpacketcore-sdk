@@ -60,6 +60,8 @@ impl crate::config_capacity_observation::NativeOwnerObserver for BridgeOracles {
         let counters = self.census.snapshot();
         let derived =
             crate::consensus::config_capacity_simultaneous_working_tests::ledger::live_derived_bytes();
+        let validation_index =
+            crate::consensus::config_capacity_simultaneous_working_tests::ledger::live_validation_index_bytes();
         if derived != 0 {
             // The existing component observer is inside the real validate()
             // scope. No returned ledger or historical peak can satisfy this.
@@ -71,16 +73,20 @@ impl crate::config_capacity_observation::NativeOwnerObserver for BridgeOracles {
                 + sample.native_command_bytes
                 + sample.native_ledger_bytes
                 + sample.native_write_bytes
-                + derived;
+                + derived
+                + validation_index;
             result.node_bytes = sample.node_mutation_bytes;
             result.expected_node_bytes = sample.node_prepared_bytes
                 + sample.native_command_bytes
                 + sample.native_ledger_bytes
                 + sample.native_write_bytes
-                + derived;
+                + derived
+                + validation_index;
             result.matched_oracles += usize::from(
                 counters == sample.preparations
                     && sample.native_is_distinct
+                    && validation_index > 0
+                    && sample.native_validation_index_bytes == validation_index
                     && sample.independent_oracles_match,
             );
             return;
