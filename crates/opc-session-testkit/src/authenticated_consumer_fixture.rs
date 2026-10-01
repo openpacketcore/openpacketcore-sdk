@@ -220,10 +220,32 @@ struct FixtureGeneralConsumerCounters {
     compare_and_set: AtomicUsize,
 }
 
+fn take_one(counter: &AtomicUsize) -> bool {
+    let mut remaining = counter.load(Ordering::Acquire);
+    loop {
+        let Some(next) = remaining.checked_sub(1) else {
+            return false;
+        };
+        match counter.compare_exchange_weak(remaining, next, Ordering::AcqRel, Ordering::Acquire) {
+            Ok(_) => return true,
+            Err(observed) => remaining = observed,
+        }
+    }
+}
+
 fn increment_fixture_counter(counter: &AtomicUsize) {
-    let _ = counter.fetch_update(Ordering::SeqCst, Ordering::SeqCst, |value| {
-        Some(value.saturating_add(1))
-    });
+    let mut value = counter.load(Ordering::SeqCst);
+    loop {
+        match counter.compare_exchange_weak(
+            value,
+            value.saturating_add(1),
+            Ordering::SeqCst,
+            Ordering::SeqCst,
+        ) {
+            Ok(_) => break,
+            Err(observed) => value = observed,
+        }
+    }
 }
 
 impl fmt::Debug for FixtureGeneralConsumerBackend {
@@ -1914,12 +1936,7 @@ impl SessionQuorumConsumer for FixtureConsumer {
                 &response,
                 SessionConsumerResponse::FencedTransitionStatus(Ok(_))
             )
-            && self
-                .fenced_transition_status_misses_remaining
-                .fetch_update(Ordering::AcqRel, Ordering::Acquire, |remaining| {
-                    remaining.checked_sub(1)
-                })
-                .is_ok()
+            && take_one(&self.fenced_transition_status_misses_remaining)
         {
             self.forced_fenced_transition_status_misses
                 .fetch_add(1, Ordering::SeqCst);

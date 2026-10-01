@@ -1052,11 +1052,18 @@ fn add_saturating(counter: &AtomicU64, saturated: &AtomicBool, count: u64) {
     if count == 0 {
         return;
     }
-    let previous = counter
-        .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |value| {
-            Some(value.saturating_add(count))
-        })
-        .unwrap_or_else(|value| value);
+    let mut previous = counter.load(Ordering::Relaxed);
+    loop {
+        match counter.compare_exchange_weak(
+            previous,
+            previous.saturating_add(count),
+            Ordering::Relaxed,
+            Ordering::Relaxed,
+        ) {
+            Ok(_) => break,
+            Err(current) => previous = current,
+        }
+    }
     if previous >= u64::MAX.saturating_sub(count) {
         saturated.store(true, Ordering::Relaxed);
     }
@@ -3938,6 +3945,47 @@ mod tests {
         write_security_metrics(&mut exported, &reader);
         assert!(exported
             .contains("opc_security_rotation_saturated{kind=\"svid\",outcome=\"rejected\"} 1\n"));
+    }
+
+    #[test]
+    fn security_rotation_counter_preserves_zero_count_and_exact_ceiling() {
+        let counter = AtomicU64::new(u64::MAX);
+        let saturated = AtomicBool::new(false);
+        add_saturating(&counter, &saturated, 0);
+        assert_eq!(counter.load(Ordering::Relaxed), u64::MAX);
+        assert!(!saturated.load(Ordering::Relaxed));
+
+        counter.store(u64::MAX - 2, Ordering::Relaxed);
+        add_saturating(&counter, &saturated, 1);
+        assert_eq!(counter.load(Ordering::Relaxed), u64::MAX - 1);
+        assert!(!saturated.load(Ordering::Relaxed));
+        add_saturating(&counter, &saturated, 1);
+        assert_eq!(counter.load(Ordering::Relaxed), u64::MAX);
+        assert!(saturated.load(Ordering::Relaxed));
+    }
+
+    #[test]
+    fn security_rotation_counter_concurrent_additions_do_not_lose_updates_or_wrap() {
+        const WORKERS: usize = 8;
+        const ADDS_PER_WORKER: usize = 64;
+        for initial in [0, u64::MAX - 1] {
+            let counter = AtomicU64::new(initial);
+            let saturated = AtomicBool::new(false);
+            let start = std::sync::Barrier::new(WORKERS);
+            std::thread::scope(|scope| {
+                for _ in 0..WORKERS {
+                    scope.spawn(|| {
+                        start.wait();
+                        for _ in 0..ADDS_PER_WORKER {
+                            add_saturating(&counter, &saturated, 1);
+                        }
+                    });
+                }
+            });
+            let expected = initial.saturating_add((WORKERS * ADDS_PER_WORKER) as u64);
+            assert_eq!(counter.load(Ordering::Relaxed), expected);
+            assert_eq!(saturated.load(Ordering::Relaxed), expected == u64::MAX);
+        }
     }
 
     #[test]

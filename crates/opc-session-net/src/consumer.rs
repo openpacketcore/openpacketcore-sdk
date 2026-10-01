@@ -12405,12 +12405,18 @@ impl Drop for PersistentPoolWait<'_> {
 }
 
 fn counter_increment(counter: &AtomicU64) -> u64 {
-    counter
-        .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |value| {
-            Some(value.saturating_add(1))
-        })
-        .unwrap_or(u64::MAX)
-        .saturating_add(1)
+    let mut value = counter.load(Ordering::Relaxed);
+    loop {
+        match counter.compare_exchange_weak(
+            value,
+            value.saturating_add(1),
+            Ordering::Relaxed,
+            Ordering::Relaxed,
+        ) {
+            Ok(previous) => return previous.saturating_add(1),
+            Err(observed) => value = observed,
+        }
+    }
 }
 
 fn counter_max(counter: &AtomicU64, value: u64) {
@@ -18272,21 +18278,35 @@ impl ConsumerServerAdmission {
     }
 
     fn record_rejection(&self) {
-        let _ = self
-            .rejections
-            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |current| {
-                Some(current.saturating_add(1))
-            });
+        let mut current = self.rejections.load(Ordering::Acquire);
+        loop {
+            match self.rejections.compare_exchange_weak(
+                current,
+                current.saturating_add(1),
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            ) {
+                Ok(_) => break,
+                Err(observed) => current = observed,
+            }
+        }
     }
 
     fn admit(self: &Arc<Self>, permit: OwnedSemaphorePermit) -> ConsumerServerAdmissionLease {
         let active = self.active.fetch_add(1, Ordering::AcqRel).saturating_add(1);
         counter_max(&self.high_water, active);
-        let _ = self
-            .samples
-            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |current| {
-                Some(current.saturating_add(1))
-            });
+        let mut current = self.samples.load(Ordering::Acquire);
+        loop {
+            match self.samples.compare_exchange_weak(
+                current,
+                current.saturating_add(1),
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            ) {
+                Ok(_) => break,
+                Err(observed) => current = observed,
+            }
+        }
         ConsumerServerAdmissionLease {
             admission: Arc::clone(self),
             _permit: permit,
@@ -18689,11 +18709,18 @@ impl ConsumerServerCancellation {
     }
 
     fn record_tls_peer_credential_rejection(&self) {
-        let _ = self.tls_peer_credential_rejections.fetch_update(
-            Ordering::AcqRel,
-            Ordering::Acquire,
-            |current| Some(current.saturating_add(1)),
-        );
+        let mut current = self.tls_peer_credential_rejections.load(Ordering::Acquire);
+        loop {
+            match self.tls_peer_credential_rejections.compare_exchange_weak(
+                current,
+                current.saturating_add(1),
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            ) {
+                Ok(_) => break,
+                Err(observed) => current = observed,
+            }
+        }
     }
 
     fn tls_peer_credential_rejections(&self) -> u64 {
