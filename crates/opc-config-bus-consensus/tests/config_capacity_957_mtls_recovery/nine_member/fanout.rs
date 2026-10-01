@@ -25,9 +25,34 @@ use opc_persist::config_capacity_observation::raft_buffers::{
 use opc_persist::config_capacity_observation::with_audited_allocations;
 use std::collections::BTreeMap;
 use std::marker::PhantomData;
+use std::sync::atomic::AtomicU64;
 
 const WORKING_BYTES: usize = 32 * 1024 * 1024;
 const MAX_CALL_DIAGNOSTICS: usize = 128;
+
+// A fixed diagnostic slot avoids reacquiring a census lock after notification.
+// Saturation is diagnostic only; no gate or deadline reads these observations.
+struct ObservedDuration(AtomicU64);
+
+impl Default for ObservedDuration {
+    fn default() -> Self {
+        Self(AtomicU64::new(u64::MAX))
+    }
+}
+
+impl ObservedDuration {
+    fn record(&self, elapsed: Duration) {
+        self.0.store(
+            elapsed.as_nanos().min(u128::from(u64::MAX - 1)) as u64,
+            Ordering::Relaxed,
+        );
+    }
+
+    fn get(&self) -> Option<Duration> {
+        let nanos = self.0.load(Ordering::Relaxed);
+        (nanos != u64::MAX).then(|| Duration::from_nanos(nanos))
+    }
+}
 
 #[derive(Clone, Copy, Debug)]
 struct Wire {
@@ -42,12 +67,14 @@ struct CallTiming {
     generation: Option<u64>,
     invocation_entered_us: u128,
     registered_us: u128,
+    // This is the invocation resuming from the gate, not the notification time.
     released_us: Option<u128>,
     transport_entered_us: Option<u128>,
     peer_response_us: Option<u128>,
     result_us: Option<u128>,
     result_at: Option<tokio::time::Instant>,
     dropped_us: Option<u128>,
+    // Drop observes cancellation; it does not identify the inner/outer timeout.
     cancelled: bool,
     success: Option<bool>,
     hard_ttl_us: Option<u128>,
@@ -73,6 +100,8 @@ struct State {
     settle_entered_us: Option<u128>,
     response_released_us: Option<u128>,
     mutation_completed_us: Option<u128>,
+    gate_release_entered_us: Option<u128>,
+    gate_opened_us: Option<u128>,
 }
 
 impl State {
@@ -100,6 +129,7 @@ impl State {
 pub(super) struct Gate {
     state: std::sync::Mutex<State>,
     changed: tokio::sync::watch::Sender<()>,
+    gate_notification_completed: ObservedDuration,
 }
 
 impl Default for Gate {
@@ -107,6 +137,7 @@ impl Default for Gate {
         Self {
             state: std::sync::Mutex::new(State::default()),
             changed: tokio::sync::watch::channel(()).0,
+            gate_notification_completed: ObservedDuration::default(),
         }
     }
 }
@@ -458,8 +489,25 @@ impl Gate {
     }
 
     fn release(&self) {
-        self.state.lock().unwrap().source = None;
+        let entered_at = tokio::time::Instant::now();
+        let epoch = {
+            let mut state = self.state.lock().unwrap();
+            let first_release = state.source.is_some();
+            state.source = None;
+            if first_release {
+                // Preserve the first opening; cleanup repeats this method.
+                state.gate_release_entered_us = Some(state.micros(entered_at));
+                state.gate_opened_us = Some(state.micros(tokio::time::Instant::now()));
+                state.epoch
+            } else {
+                None
+            }
+        };
         self.changed.send_replace(());
+        if let Some(epoch) = epoch {
+            self.gate_notification_completed
+                .record(tokio::time::Instant::now().saturating_duration_since(epoch));
+        }
     }
 
     fn drained(&self) -> bool {
@@ -476,6 +524,7 @@ impl Gate {
     fn print_diagnostics(&self, shutdown_entered_us: u128) {
         let state = self.state.lock().unwrap();
         println!("CONFIG_CAPACITY_NINE_FANOUT_RPC_LIFECYCLE shutdown_entered_us={shutdown_entered_us} shutdown_completed_us={} diagnostics_saturated={} held_response={:?} response_released={} settle_entered_us={:?} response_released_us={:?} mutation_completed_us={:?}", state.micros(tokio::time::Instant::now()), state.timings_saturated, state.held_response, state.response_released, state.settle_entered_us, state.response_released_us, state.mutation_completed_us);
+        println!("CONFIG_CAPACITY_NINE_FANOUT_GATE_TIMING gate_release_entered_us={:?} gate_opened_us={:?} gate_notification_completed_us={:?} origin=gate_arm first_release=true released_us_is_rpc_resumption=true dropped_us_is_scope_drop_observation=true timeout_cause_known=false diagnostic_only=true", state.gate_release_entered_us, state.gate_opened_us, self.gate_notification_completed.get().map(|elapsed| elapsed.as_micros()));
         for (call, timing) in &state.timings {
             let epoch = state.epoch.expect("armed timing origin");
             let result_ns = timing
@@ -490,6 +539,39 @@ impl Gate {
             println!("CONFIG_CAPACITY_NINE_FANOUT_RPC call={call} target={} generation={:?} invocation_entered_us={} registered_us={} released_us={:?} transport_entered_us={:?} peer_response_us={:?} result_us={:?} dropped_us={:?} cancelled={} success={:?} hard_ttl_us={:?} deadline_earliest_us={:?} deadline_latest_us={:?} result_ns={result_ns:?} deadline_earliest_ns={deadline_earliest_ns:?} deadline_latest_ns={deadline_latest_ns:?}", timing.target, timing.generation, timing.invocation_entered_us, timing.registered_us, timing.released_us, timing.transport_entered_us, timing.peer_response_us, timing.result_us, timing.dropped_us, timing.cancelled, timing.success, timing.hard_ttl_us, timing.deadline_earliest_us, timing.deadline_latest_us);
         }
     }
+}
+
+#[test]
+fn gate_release_timing_survives_cleanup_without_completing_calls() {
+    let gate = Gate::default();
+    let mut changed = gate.changed.subscribe();
+    assert!(gate.gate_notification_completed.get().is_none());
+    gate.arm(ConsensusNodeId::new(1).unwrap());
+    gate.release();
+    assert!(changed.has_changed().unwrap());
+    drop(changed.borrow_and_update());
+    let first = {
+        let state = gate.state.lock().unwrap();
+        assert!(state.source.is_none());
+        assert!(state.completed.is_empty() && state.timings.is_empty());
+        (
+            state.gate_release_entered_us.unwrap(),
+            state.gate_opened_us.unwrap(),
+            gate.gate_notification_completed.get().unwrap(),
+        )
+    };
+    gate.release();
+    assert!(changed.has_changed().unwrap());
+    let state = gate.state.lock().unwrap();
+    assert_eq!(
+        first,
+        (
+            state.gate_release_entered_us.unwrap(),
+            state.gate_opened_us.unwrap(),
+            gate.gate_notification_completed.get().unwrap(),
+        )
+    );
+    assert!(state.completed.is_empty() && state.timings.is_empty());
 }
 
 struct Checkpoint {

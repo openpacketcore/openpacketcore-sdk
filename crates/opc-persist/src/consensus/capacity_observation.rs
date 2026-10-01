@@ -13,6 +13,7 @@ use std::marker::PhantomData;
 use std::mem::size_of;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, LazyLock, Mutex, MutexGuard, Weak};
+use std::time::Instant;
 
 use opc_consensus::engine::raft::AppendEntriesRequest;
 use opc_consensus::engine::EntryPayload;
@@ -261,12 +262,19 @@ pub enum NativeStage {
 }
 
 /// One instant of real prepared/native capacities, before joining transport.
+/// Timing fields diagnose the capture path; they are not capacity sample instants.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct NativeOwnerSample {
     /// Native source node selected by exact connection and operation request.
     pub source: ConsensusNodeId,
     /// Concrete checkpoint; no sum of independently measured phases.
     pub stage: NativeStage,
+    /// Entry to the selected native scope, before registry lookup and command census.
+    /// Monotonic diagnostic only; neither an API start nor an RPC deadline.
+    pub native_scope_entered_at: Instant,
+    /// Entry to this active census, before the preparation-owner lock and walks.
+    /// The observer's callback entry follows this work; neither is a time limit.
+    pub census_entered_at: Instant,
     /// Currently borrowed preparations across all observed nodes.
     pub preparations: PreparationTotals,
     /// Unique prepared commands on this one source node.
@@ -445,6 +453,7 @@ impl Drop for NativeRegistration {
 
 struct ActiveNative {
     shared: Arc<Shared>,
+    entered_at: Instant,
     command: Allocations,
     #[cfg(all(test, target_os = "linux"))]
     command_oracle_bytes: usize,
@@ -463,6 +472,7 @@ impl<'a> NativeScope<'a> {
         request: ConsensusRequestId,
         command: &'a AuditedConfigCommand,
     ) -> Option<Self> {
+        let entered_at = Instant::now();
         let shared = lock(&REGISTRY)
             .get(&(std::ptr::from_ref(conn) as usize))
             .and_then(Weak::upgrade)?;
@@ -479,6 +489,7 @@ impl<'a> NativeScope<'a> {
             }
             *current = Some(ActiveNative {
                 shared: shared.clone(),
+                entered_at,
                 command,
                 #[cfg(all(test, target_os = "linux"))]
                 command_oracle_bytes,
@@ -523,6 +534,7 @@ fn sample_owners(
             return;
         };
         let shared = &active.shared;
+        let census_entered_at = Instant::now();
         // Keep this lock through the callback: a preparation registration cannot
         // disappear and permit its owner to drop between native and transport reads.
         let preparations = lock(&shared.preparations.state);
@@ -564,6 +576,8 @@ fn sample_owners(
             NativeOwnerSample {
                 source: shared.source,
                 stage,
+                native_scope_entered_at: active.entered_at,
+                census_entered_at,
                 preparations: preparation_totals(&preparations),
                 node_prepared_commands,
                 node_prepared_bytes,

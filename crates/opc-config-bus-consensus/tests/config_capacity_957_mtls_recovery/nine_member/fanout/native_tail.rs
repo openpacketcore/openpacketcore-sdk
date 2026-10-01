@@ -5,6 +5,10 @@
 //! Each native callback joins actual preparations, ledger/output, recovery Vec,
 //! typed Raft allocations, outgoing wires and the lease-bearing envelope at
 //! one instant. Separate stages are never added. This remains a partial bound.
+//!
+//! Diagnostic microseconds share the gate-arm origin, before recovery readiness
+//! and API submission. Stage indices are decoded (0), validated (1), authenticated
+//! (2), and ledger write (3). These observations never decide a deadline or pass.
 
 use super::*;
 use opc_persist::config_capacity_observation::raft_buffers::AllocationView;
@@ -75,9 +79,17 @@ struct TailCheckpoint {
     encryption: BufferSnapshot,
 }
 
+struct NativeTiming {
+    native_scope_entered_at: std::time::Instant,
+    census_entered_at: std::time::Instant,
+    callback_entered_at: std::time::Instant,
+    owned_capture_completed_at: Option<std::time::Instant>,
+}
+
 #[derive(Default)]
 struct NativeResults {
     samples: [Option<TailCheckpoint>; 4],
+    timings: [Option<NativeTiming>; 4],
     counts: [usize; 4],
     missing_views: usize,
     request: Option<opc_consensus::ConsensusRequestId>,
@@ -94,10 +106,13 @@ struct NativeTail {
     raft: Arc<RaftAppendCensus>,
     encryption: Arc<BufferObservation>,
     results: Mutex<NativeResults>,
+    tail_release_entered_after_callback: ObservedDuration,
+    tail_release_returned_after_callback: ObservedDuration,
 }
 
 impl NativeTail {
     fn record(&self, native: NativeOwnerSample, owners: Option<AllocationView<'_>>) {
+        let callback_entered_at = std::time::Instant::now();
         let index = match native.stage {
             NativeStage::DecodedLedger => 0,
             NativeStage::ValidatedLedger => 1,
@@ -138,8 +153,18 @@ impl NativeTail {
                 })
             })
         });
-        {
+        let owned_capture_completed_at = checkpoint.as_ref().map(|_| std::time::Instant::now());
+        let first_callback = {
             let mut results = self.results.lock().unwrap();
+            let first_callback = results.timings[index].is_none();
+            if first_callback {
+                results.timings[index] = Some(NativeTiming {
+                    native_scope_entered_at: native.native_scope_entered_at,
+                    census_entered_at: native.census_entered_at,
+                    callback_entered_at,
+                    owned_capture_completed_at,
+                });
+            }
             results.counts[index] += 1;
             if checkpoint.is_none() {
                 results.missing_views += 1;
@@ -147,13 +172,50 @@ impl NativeTail {
             if results.samples[index].is_none() {
                 results.samples[index] = checkpoint;
             }
-        }
+            first_callback
+        };
         if native.stage == NativeStage::LedgerWrite {
             // Release the very same four calls and public encoder only after
             // the actual native output has been captured. Neither deadline nor
             // operation authority changes at this scheduling checkpoint.
+            let release_entered_at = std::time::Instant::now();
             self.gate.release();
+            let release_returned_at = std::time::Instant::now();
             self.encoder.open();
+            if first_callback {
+                self.tail_release_entered_after_callback
+                    .record(release_entered_at.duration_since(callback_entered_at));
+                self.tail_release_returned_after_callback
+                    .record(release_returned_at.duration_since(callback_entered_at));
+            }
+        }
+    }
+
+    fn print_diagnostics(&self) {
+        let epoch = self.gate.state.lock().unwrap().epoch.unwrap();
+        let micros = |instant| {
+            tokio::time::Instant::from_std(instant)
+                .saturating_duration_since(epoch)
+                .as_micros()
+        };
+        let results = self.results.lock().unwrap();
+        // Four fixed stages, including a callback without a valid owner view.
+        // Print before completion assertions so failed original calls retain it.
+        for (stage_index, timing) in results.timings.iter().enumerate() {
+            if let Some(timing) = timing {
+                println!("CONFIG_CAPACITY_NINE_NATIVE_FOUR_TAIL_TIMING stage_index={stage_index} callbacks={} native_scope_entered_us={} census_entered_us={} callback_entered_us={} owned_capture_completed_us={:?} origin=gate_arm first_callback=true diagnostic_only=true", results.counts[stage_index], micros(timing.native_scope_entered_at), micros(timing.census_entered_at), micros(timing.callback_entered_at), timing.owned_capture_completed_at.map(micros));
+                if stage_index == 3 {
+                    let release_entered_us = self
+                        .tail_release_entered_after_callback
+                        .get()
+                        .map(|elapsed| micros(timing.callback_entered_at + elapsed));
+                    let release_returned_us = self
+                        .tail_release_returned_after_callback
+                        .get()
+                        .map(|elapsed| micros(timing.callback_entered_at + elapsed));
+                    println!("CONFIG_CAPACITY_NINE_NATIVE_FOUR_TAIL_RELEASE release_entered_us={release_entered_us:?} release_returned_us={release_returned_us:?} origin=gate_arm first_ledger_write_callback=true diagnostic_only=true");
+                }
+            }
         }
     }
 }
@@ -345,6 +407,8 @@ pub(super) async fn run(history: AuditHistory) {
         raft: raft.clone(),
         encryption: encryption.clone(),
         results: Mutex::new(NativeResults::default()),
+        tail_release_entered_after_callback: ObservedDuration::default(),
+        tail_release_returned_after_callback: ObservedDuration::default(),
     });
     let native_registration = stores[leader]
         .observe_capacity_native_owners_for_test(&prepared, preparations.clone(), native.clone())
@@ -553,6 +617,7 @@ pub(super) async fn run(history: AuditHistory) {
     );
     println!("CONFIG_CAPACITY_NINE_NATIVE_FOUR_TAIL_LIFECYCLE members=9 prepared=72 original_calls=8 remote_quorum_successes=4 held_rpc_tails=4 audited_commits=1 exact_readback=true original_handle=true original_paths=true joined_shutdown=true actual_encoder_joined=true caller_recovery_bytes={caller_recovery_bytes} full_memory_bound=false");
     gate.print_diagnostics(shutdown_entered_us);
+    native.print_diagnostics();
     assert!(gate.drained());
     assert!(drained.calls.is_empty() && drained.origins.is_empty() && drained.issues.complete());
     assert!(detached.calls.is_empty() && detached.origins.is_empty() && detached.issues.complete());
