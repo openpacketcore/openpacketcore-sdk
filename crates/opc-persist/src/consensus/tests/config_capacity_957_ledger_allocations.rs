@@ -61,8 +61,7 @@ fn decoded_owned_bytes(stored: &StoredLedger) -> usize {
         + boxed_bytes
 }
 
-#[test]
-fn config_capacity_957_retained_ledger_buffer_inventory() {
+pub(super) fn fixture(completed_operations: u64, final_intent: bool) -> (AuditKey, StoredLedger) {
     let key = AuditKey::new([0xD1; 32]).expect("synthetic authentication key");
     let privacy = AuditPrivacyKey::new([0xD2; 32]).expect("synthetic projection key");
     let identity = ConfigConsensusIdentity::new(
@@ -77,11 +76,12 @@ fn config_capacity_957_retained_ledger_buffer_inventory() {
             .expect("key projection"),
         AuditLedgerLimits::new(4096, 1024).expect("existing ledger limits"),
     );
-    // Use real authenticated admission, rejection and terminal transitions.
-    // No test-only append_event shortcut or forged canonical state is used.
-    // This fills the operation bound and reaches 3072 of 4096 event slots;
-    // it makes no claim that the two maxima are jointly reachable.
-    for number in 0_u64..1024 {
+    // Use the original authenticated transitions for both the inventory and
+    // phase diagnostic. The optional final operation remains an actual Intent.
+    assert!(completed_operations <= 1_024);
+    let operations = completed_operations + u64::from(final_intent);
+    assert!(operations <= 1_024);
+    for number in 0..operations {
         let event = ProjectedAuditEvent::project(&privacy, &event(number))
             .expect("actual event projection");
         let binding = AuditOperationBinding::project(&privacy, &event, 0, b"synthetic operation")
@@ -104,13 +104,31 @@ fn config_capacity_957_retained_ledger_buffer_inventory() {
         )
         .expect("authenticated original handle");
         ledger.admit(&key, &handle, 100).expect("intent admission");
-        ledger
-            .resolve(&key, &handle, AuditOperationState::Rejected)
-            .expect("authoritative rejection");
-        ledger
-            .acknowledge_terminal(&key, &handle)
-            .expect("terminal acknowledgement");
+        if number < completed_operations {
+            ledger
+                .resolve(&key, &handle, AuditOperationState::Rejected)
+                .expect("authoritative rejection");
+            ledger
+                .acknowledge_terminal(&key, &handle)
+                .expect("terminal acknowledgement");
+        }
     }
+    (
+        key,
+        StoredLedger {
+            identity,
+            ledger: Some(ledger),
+        },
+    )
+}
+
+#[test]
+fn config_capacity_957_retained_ledger_buffer_inventory() {
+    // This unchanged inventory fills the operation bound: 3072 of 4096 events.
+    // The two independent maxima are not claimed to be jointly reachable.
+    let (key, stored) = fixture(1_024, false);
+    let identity = stored.identity;
+    let ledger = stored.ledger.expect("original completed inventory");
     ledger
         .validate(&key, identity)
         .expect("entire valid history");
