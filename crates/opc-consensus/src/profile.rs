@@ -138,6 +138,72 @@ impl DurableConsensusTimingProfile {
     pub const fn server_handler_timeout(self) -> Duration {
         Duration::from_millis(self.server_handler_timeout_millis)
     }
+
+    /// Return the engine tick derived from the heartbeat interval.
+    ///
+    /// The pinned Openraft engine evaluates both a leader's idle heartbeat and
+    /// every follower's election timer only on this tick, which it fixes at
+    /// three halves of the heartbeat interval.
+    pub const fn engine_tick(self) -> Duration {
+        Duration::from_millis(self.engine_tick_millis())
+    }
+
+    const fn engine_tick_millis(self) -> u64 {
+        self.append_entries_timeout_millis.saturating_mul(3) / 2
+    }
+
+    /// Return the exclusive bound on a surviving voter's first campaign,
+    /// measured from its last contact with the committed leader.
+    ///
+    /// The pinned engine leases a committed leader's vote for
+    /// `election_timeout_max_millis`, then waits one sampled election timeout,
+    /// which is below `election_timeout_max_millis`, and campaigns on its next
+    /// tick. A voter rejects every candidate for the same lease, so failure
+    /// detection is never shorter than the sum of both election bounds.
+    pub const fn leader_loss_first_campaign_bound(self) -> Duration {
+        Duration::from_millis(self.leader_loss_first_campaign_bound_millis())
+    }
+
+    const fn leader_loss_first_campaign_bound_millis(self) -> u64 {
+        self.election_timeout_max_millis
+            .saturating_mul(2)
+            .saturating_add(self.engine_tick_millis())
+    }
+
+    /// Return the exclusive bound on electing a replacement leader after an
+    /// unplanned leader loss, measured from the last leader contact.
+    ///
+    /// It allows one further campaign after the first: a split vote, or a
+    /// first candidate whose log is shorter than another survivor's. A
+    /// campaigning voter's own uncommitted vote is not leased, so the further
+    /// campaign waits only a newly sampled election timeout and one tick.
+    pub const fn leader_loss_reelection_bound(self) -> Duration {
+        Duration::from_millis(self.leader_loss_reelection_bound_millis())
+    }
+
+    const fn leader_loss_reelection_bound_millis(self) -> u64 {
+        self.leader_loss_first_campaign_bound_millis()
+            .saturating_add(self.election_timeout_max_millis)
+            .saturating_add(self.engine_tick_millis())
+    }
+
+    /// Return the documented maximum write stall for an unplanned leader
+    /// loss.
+    ///
+    /// The bound adds, to the replacement election, one cold connection that
+    /// was already pending against the lost leader, one cold connection to its
+    /// successor, and three complete AppendEntries rounds: the successor's
+    /// first commit, its linearizable admission round, and the write's own
+    /// commit. It assumes a reachable majority whose processes are not
+    /// suspended or CPU-throttled and whose RPCs each finish within their
+    /// family ceilings. Further split votes are probabilistic and outside it.
+    pub const fn unplanned_leader_loss_write_stall(self) -> Duration {
+        Duration::from_millis(
+            self.leader_loss_reelection_bound_millis()
+                .saturating_add(self.cold_connect_timeout_millis.saturating_mul(2))
+                .saturating_add(self.append_entries_timeout_millis.saturating_mul(3)),
+        )
+    }
 }
 
 /// The one fixed timing contract for SDK-owned durable consensus.
@@ -386,6 +452,46 @@ mod tests {
                 < Duration::from_millis(profile.election_timeout_min_millis)
         );
         validate_durable_consensus_timing_profile(profile).expect("fixed timing profile");
+    }
+
+    #[test]
+    fn leader_loss_bounds_follow_the_pinned_engine_lease_and_tick() {
+        let profile = DurableConsensusTimingProfile {
+            cold_connect_timeout_millis: 70,
+            append_entries_timeout_millis: 100,
+            election_timeout_min_millis: 400,
+            election_timeout_max_millis: 1_000,
+            ..DURABLE_CONSENSUS_TIMING_PROFILE
+        };
+        assert_eq!(profile.engine_tick(), Duration::from_millis(150));
+        // Lease (max) + sampled timeout (< max) + one tick.
+        assert_eq!(
+            profile.leader_loss_first_campaign_bound(),
+            Duration::from_millis(2_150)
+        );
+        // One further campaign: sampled timeout (< max) + one tick.
+        assert_eq!(
+            profile.leader_loss_reelection_bound(),
+            Duration::from_millis(3_300)
+        );
+        // Two cold connections and three complete AppendEntries rounds.
+        assert_eq!(
+            profile.unplanned_leader_loss_write_stall(),
+            Duration::from_millis(3_740)
+        );
+    }
+
+    #[test]
+    fn unplanned_leader_loss_write_stall_fits_inside_the_operation_timeout() {
+        let profile = DURABLE_CONSENSUS_TIMING_PROFILE;
+        assert!(
+            profile.unplanned_leader_loss_write_stall() < profile.operation_timeout(),
+            "a write in flight at an unplanned leader loss must reach a definite \
+             outcome inside one operation timeout: stall bound {:?}, operation \
+             timeout {:?}",
+            profile.unplanned_leader_loss_write_stall(),
+            profile.operation_timeout()
+        );
     }
 
     #[test]

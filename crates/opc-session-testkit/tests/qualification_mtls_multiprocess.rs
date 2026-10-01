@@ -2,6 +2,8 @@
 
 #[path = "qualification_mtls_multiprocess/isolated_scale.rs"]
 mod isolated_scale;
+#[path = "qualification_mtls_multiprocess/unplanned_leader_loss.rs"]
+mod unplanned_leader_loss;
 
 use std::env;
 use std::ffi::OsString;
