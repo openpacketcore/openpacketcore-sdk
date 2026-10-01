@@ -6,6 +6,8 @@
 //! configuration value.
 
 mod audit;
+#[cfg(test)]
+pub(crate) use audit::{applied_receipt_sync, apply_sync, read_sync, write_sync, AuditCommand};
 mod audit_mutation;
 pub use audit_mutation::PreparedAuditedMutation;
 pub(crate) mod history;

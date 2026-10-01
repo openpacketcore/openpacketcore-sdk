@@ -11,10 +11,17 @@ use super::{
 };
 use crate::{AuditKey, ConfigConsensusIdentity};
 
+mod validation_index;
+#[cfg(test)]
+mod validation_probe;
+#[cfg(test)]
+mod validation_tests;
+
 const HANDLE_DOMAIN: &[u8] = b"openpacketcore/management-audit/operation-handle/v1\0";
 const ENTRY_DOMAIN: &[u8] = b"openpacketcore/management-audit/replicated-entry/v1\0";
 pub(crate) const STATE_DOMAIN: &[u8] = b"openpacketcore/management-audit/replicated-state/v1\0";
 pub(crate) const MAX_STATE_BYTES: usize = 16 * 1024 * 1024;
+pub(crate) const MAX_LEDGER_EVENTS: usize = 4096;
 const MAX_HANDLE_BYTES: usize = 8192;
 const OPERATION_EVENT_RESERVATION: usize = 3;
 
@@ -40,7 +47,7 @@ impl AuditLedgerLimits {
     }
 
     fn validate(self) -> Result<(), AuditAuthorityError> {
-        if !(3..=4096).contains(&self.max_events)
+        if !(3..=MAX_LEDGER_EVENTS).contains(&self.max_events)
             || !(1..=1024).contains(&self.max_operations)
             || self.max_operations > self.max_events / OPERATION_EVENT_RESERVATION
         {
@@ -501,6 +508,7 @@ impl LedgerState {
         let mut sequence = self.floor;
         let mut previous = self.predecessor;
         let mut derived: Vec<LedgerOperation> = Vec::new();
+        let index = validation_index::ValidationIndex::new(&self.entries)?;
         for entry in &self.entries {
             sequence = sequence
                 .checked_add(1)
@@ -527,9 +535,7 @@ impl LedgerState {
                 EntryPayload::Intent(handle) => {
                     handle.verify(key, identity, handle.body.binding.caller)?;
                     if handle.body.event.projection != self.projection
-                        || derived
-                            .iter()
-                            .any(|op| op.handle.body.binding.request == handle.body.binding.request)
+                        || index.duplicate_request(derived.len())?
                     {
                         return Err(AuditAuthorityError::BindingMismatch);
                     }
@@ -551,10 +557,10 @@ impl LedgerState {
                     });
                 }
                 EntryPayload::Outcome { operation, state } => {
-                    let op = derived
-                        .iter_mut()
-                        .find(|op| op.handle.mac == *operation)
+                    let position = index
+                        .prior_operation(operation, derived.len())
                         .ok_or(AuditAuthorityError::BindingMismatch)?;
+                    let op = &mut derived[position];
                     if op.state != AuditOperationState::Intent
                         || !matches!(
                             state,
@@ -568,10 +574,10 @@ impl LedgerState {
                     op.reserved = 1;
                 }
                 EntryPayload::Terminal { operation } => {
-                    let op = derived
-                        .iter_mut()
-                        .find(|op| op.handle.mac == *operation)
+                    let position = index
+                        .prior_operation(operation, derived.len())
                         .ok_or(AuditAuthorityError::BindingMismatch)?;
+                    let op = &mut derived[position];
                     if op.state == AuditOperationState::Intent || op.terminal_recorded {
                         return Err(AuditAuthorityError::BindingMismatch);
                     }
@@ -598,7 +604,7 @@ impl LedgerState {
         if sequence != self.sequence || previous != self.terminal {
             return Err(AuditAuthorityError::BindingMismatch);
         }
-        for (index, op) in self.operations.iter().enumerate() {
+        for (position, op) in self.operations.iter().enumerate() {
             op.handle
                 .verify(key, identity, op.handle.body.binding.caller)?;
             let reserved = match (op.state, op.terminal_recorded) {
@@ -613,9 +619,7 @@ impl LedgerState {
                 || op.first_sequence <= self.floor
                 || op.last_sequence > self.sequence
                 || op.last_sequence < op.first_sequence
-                || self.operations[..index].iter().any(|other| {
-                    other.handle.body.binding.request == op.handle.body.binding.request
-                })
+                || index.duplicate_request(position)?
             {
                 return Err(AuditAuthorityError::BindingMismatch);
             }
