@@ -7,6 +7,9 @@
 #[path = "fanout/native_tail.rs"]
 mod native_tail;
 
+#[path = "fanout/public_history.rs"]
+mod public_history;
+
 #[path = "fanout/working.rs"]
 mod working;
 
