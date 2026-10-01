@@ -538,13 +538,10 @@ fn config_capacity_957_streamed_ledger_buffer_preserves_size_and_output_checks()
     let length = canonical_state_len(&stored).expect("original canonical length");
     assert!(length > 1 && length < STATE_STREAM_BUFFER_BYTES);
     for invalid_length in [0, length - 1, length + 1, MAX_STATE_BYTES + 1] {
-        assert_eq!(
-            stream_state(&stored, &key, invalid_length, None)
-                .err()
-                .expect("incorrect length must not produce a MAC")
-                .kind(),
-            io::ErrorKind::InvalidData
-        );
+        let Err(error) = stream_state(&stored, &key, invalid_length, None) else {
+            panic!("incorrect length must not produce a MAC");
+        };
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
     }
     let mut absent_output = Vec::new();
     assert!(stream_state(&stored, &key, length, Some(&mut absent_output)).is_err());
