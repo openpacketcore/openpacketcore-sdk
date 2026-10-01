@@ -11,21 +11,37 @@ use crate::StoreError;
 /// Closed failure boundaries in the caller's activation path.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum CapabilityActivationFailureStageForTest {
+    /// The initial local application-traffic authority check failed.
     InitialAuthority,
+    /// Reading the initial cluster scope failed.
     InitialScope,
+    /// Discovering the current leader failed.
     LeaderDiscovery,
+    /// The local authority check immediately before remote transmission failed.
     PreTransmitAuthority,
+    /// The remote call failed after the request may have been transmitted.
     AfterTransmission,
+    /// An authenticated peer rejected the activation request.
     AuthenticatedRejection,
+    /// Refreshing the leader route failed.
     RouteRefresh,
+    /// The local leader returned an activation error.
     LocalLeaderRejected,
+    /// The remote leader returned an activation error without its internal stage.
     RemoteLeaderRejected,
+    /// Waiting for the activation reply's applied log index failed.
     AppliedIndex,
+    /// The local authority check after observing the applied log index failed.
     PostApplyAuthority,
+    /// Reading the cluster scope after observing the applied log index failed.
     PostApplyScope,
+    /// The backend could not check the persisted activation certificate.
     CertificateBackend,
+    /// No persisted activation certificate matched the current cluster scope.
     CertificateMismatch,
+    /// The leader reported an unknown activation outcome.
     OutcomeUnknown,
+    /// The activation request received a reply for another mutation operation.
     UnexpectedReply,
 }
 
@@ -58,6 +74,7 @@ impl CapabilityActivationFailureStageForTest {
 /// failed stage inside the remote handler.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct CapabilityActivationFailureForTest {
+    /// The caller boundary where the original activation error was returned.
     pub stage: CapabilityActivationFailureStageForTest,
     /// Whether this invocation's original deadline had elapsed at rejection.
     /// This does not assert that deadline exhaustion caused the rejection.
