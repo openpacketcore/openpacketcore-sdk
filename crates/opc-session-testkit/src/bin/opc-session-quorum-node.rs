@@ -1112,6 +1112,51 @@ fn write_qualification_initialization_failure(
     );
 }
 
+fn write_qualification_activation_failure(
+    stderr: &mut impl io::Write,
+    stage: &'static str,
+    error: &StoreError,
+    observation: Option<(&'static str, bool)>,
+) {
+    let error_class = qualification_store_error_class(error);
+    if let Some((boundary, deadline_elapsed)) = observation {
+        // The tag comes only from the closed store observer. Diagnostic I/O
+        // still cannot replace the original failure reply.
+        let _ = writeln!(
+            stderr,
+            "qualification activation rejected: stage={stage} class={error_class:?} boundary={boundary} deadline_elapsed={deadline_elapsed}"
+        );
+    } else {
+        write_qualification_initialization_failure(stderr, stage, format_args!("{error_class:?}"));
+    }
+}
+
+async fn qualification_activation_attempt(
+    stage: &'static str,
+    activation: impl std::future::Future<Output = Result<(), StoreError>>,
+) -> Result<(), ()> {
+    #[cfg(feature = "test-control")]
+    let (result, observation) = {
+        let (result, observation) =
+            opc_session_store::test_support::observe_capability_activation_for_test(activation)
+                .await;
+        (
+            result,
+            observation.map(|failure| (failure.stage.as_str(), failure.deadline_elapsed)),
+        )
+    };
+    #[cfg(not(feature = "test-control"))]
+    let (result, observation) = (activation.await, None);
+    result.map_err(|error| {
+        write_qualification_activation_failure(
+            &mut io::stderr().lock(),
+            stage,
+            &error,
+            observation,
+        );
+    })
+}
+
 fn qualification_store_error_class(error: &StoreError) -> QualificationTrafficErrorClass {
     match error {
         StoreError::BackendUnavailable(_) => QualificationTrafficErrorClass::BackendUnavailable,
@@ -1979,26 +2024,16 @@ impl QualificationNode {
             // This fixture retains the production trust root from construction
             // and activates the same V2 profile before returning initialized.
             // Reopen must reconcile that exact profile; it cannot remove it.
-            self.store
-                .activate_fenced_transition_capability()
-                .await
-                .map_err(|error| {
-                    write_qualification_initialization_failure(
-                        &mut io::stderr().lock(),
-                        "fenced_transition",
-                        format_args!("{:?}", qualification_store_error_class(&error)),
-                    );
-                })?;
-            self.store
-                .activate_protected_roster_profile_v2()
-                .await
-                .map_err(|error| {
-                    write_qualification_initialization_failure(
-                        &mut io::stderr().lock(),
-                        "protected_roster_v2",
-                        format_args!("{:?}", qualification_store_error_class(&error)),
-                    );
-                })?;
+            qualification_activation_attempt(
+                "fenced_transition",
+                self.store.activate_fenced_transition_capability(),
+            )
+            .await?;
+            qualification_activation_attempt(
+                "protected_roster_v2",
+                self.store.activate_protected_roster_profile_v2(),
+            )
+            .await?;
         }
         Ok(())
     }
@@ -7165,6 +7200,54 @@ mod tests {
                 );
             });
             assert_eq!(rejected, Err(()));
+        }
+    }
+
+    #[test]
+    fn activation_failure_diagnostic_is_closed_and_io_failure_is_nonfatal() {
+        struct FullWriter;
+        impl io::Write for FullWriter {
+            fn write(&mut self, _: &[u8]) -> io::Result<usize> {
+                Err(io::Error::from_raw_os_error(28))
+            }
+
+            fn flush(&mut self) -> io::Result<()> {
+                Err(io::Error::from_raw_os_error(28))
+            }
+        }
+        let error = StoreError::BackendUnavailable("synthetic-sensitive-body".to_owned());
+        for stage in ["fenced_transition", "protected_roster_v2"] {
+            for deadline_elapsed in [false, true] {
+                let mut bytes = Vec::new();
+                write_qualification_activation_failure(
+                    &mut bytes,
+                    stage,
+                    &error,
+                    Some(("after_transmission", deadline_elapsed)),
+                );
+                assert_eq!(
+                    bytes,
+                    format!("qualification activation rejected: stage={stage} class=BackendUnavailable boundary=after_transmission deadline_elapsed={deadline_elapsed}\n").as_bytes()
+                );
+                assert!(!String::from_utf8(bytes)
+                    .unwrap()
+                    .contains("synthetic-sensitive-body"));
+                let rejected = Err::<(), _>(error.clone()).map_err(|error| {
+                    write_qualification_activation_failure(
+                        &mut FullWriter,
+                        stage,
+                        &error,
+                        Some(("after_transmission", deadline_elapsed)),
+                    );
+                });
+                assert_eq!(rejected, Err(()));
+            }
+            let mut bytes = Vec::new();
+            write_qualification_activation_failure(&mut bytes, stage, &error, None);
+            assert_eq!(
+                bytes,
+                format!("qualification initialization rejected: stage={stage} class=BackendUnavailable\n").as_bytes()
+            );
         }
     }
 
