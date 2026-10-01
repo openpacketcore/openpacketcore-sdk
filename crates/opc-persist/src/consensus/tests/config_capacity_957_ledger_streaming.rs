@@ -139,7 +139,7 @@ fn measured_phase<T>(
     result
 }
 
-#[derive(Default)]
+#[derive(Clone, Copy, Default)]
 struct FragmentCounts {
     writes: usize,
     bytes: usize,
@@ -316,6 +316,353 @@ fn config_capacity_957_ledger_read_write_phase_diagnostic() {
                 "causal_removal_evidence": false,
                 "native_rpc_qualification": false,
                 "test_cfg_observation_hooks_present": true
+            })
+        )
+        .unwrap();
+    }
+}
+
+struct ObservedWriter<W> {
+    inner: W,
+    fragments: FragmentCounts,
+    last_write: usize,
+    flushes: usize,
+}
+
+#[derive(Clone, Copy, Default)]
+struct AuthenticatedSinkObservation {
+    fragments: FragmentCounts,
+    last_write: usize,
+    output_writes: usize,
+    verification_writes: usize,
+}
+
+std::thread_local! {
+    static AUTHENTICATED_SINK: std::cell::Cell<Option<AuthenticatedSinkObservation>> =
+        const { std::cell::Cell::new(None) };
+}
+
+// This hook is compiled only with the unit-test module. It observes the actual
+// StateWriter used by both production entry points, including a bypass of the
+// batching helper. No recorder exists in the native integration-library build.
+pub(super) fn observe_authenticated_sink_write(bytes: usize, with_output: bool) {
+    AUTHENTICATED_SINK.with(|state| {
+        if let Some(mut observed) = state.get() {
+            observed.fragments.writes += 1;
+            observed.fragments.bytes += bytes;
+            observed.fragments.maximum_write = observed.fragments.maximum_write.max(bytes);
+            observed.last_write = bytes;
+            if with_output {
+                observed.output_writes += 1;
+            } else {
+                observed.verification_writes += 1;
+            }
+            state.set(Some(observed));
+        }
+    });
+}
+
+fn observe_state_stream<T>(operation: impl FnOnce() -> T) -> (T, AuthenticatedSinkObservation) {
+    struct Reset;
+    impl Drop for Reset {
+        fn drop(&mut self) {
+            AUTHENTICATED_SINK.with(|state| state.set(None));
+        }
+    }
+
+    AUTHENTICATED_SINK.with(|state| {
+        assert!(
+            state.get().is_none(),
+            "one scoped sink observation at a time"
+        );
+        state.set(Some(AuthenticatedSinkObservation::default()));
+    });
+    let reset = Reset;
+    let result = operation();
+    let observed = AUTHENTICATED_SINK.with(|state| state.take().expect("active observation"));
+    drop(reset);
+    (result, observed)
+}
+
+impl<W> ObservedWriter<W> {
+    fn new(inner: W) -> Self {
+        Self {
+            inner,
+            fragments: FragmentCounts::default(),
+            last_write: 0,
+            flushes: 0,
+        }
+    }
+}
+
+impl<W: std::io::Write> std::io::Write for ObservedWriter<W> {
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        let written = self.inner.write(bytes)?;
+        self.fragments.writes += 1;
+        self.fragments.bytes += written;
+        self.fragments.maximum_write = self.fragments.maximum_write.max(written);
+        self.last_write = written;
+        Ok(written)
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        self.flushes += 1;
+        self.inner.flush()
+    }
+}
+
+#[test]
+fn config_capacity_957_streamed_ledger_buffer_preserves_partitions_and_flushes() {
+    use std::io::Write;
+
+    let chunk = STATE_STREAM_BUFFER_BYTES;
+    for length in [0, 1, chunk - 1, chunk, chunk + 1, 2 * chunk, 2 * chunk + 1] {
+        let expected: Vec<u8> = (0..length).map(|index| (index % 251) as u8).collect();
+        for partition in [1, 19, chunk - 1, chunk, chunk + 7] {
+            let mut observed = ObservedWriter::new(Vec::new());
+            {
+                let mut buffer = StateBuffer::new(&mut observed);
+                assert_eq!(
+                    std::mem::size_of_val(&buffer),
+                    chunk + 2 * std::mem::size_of::<usize>(),
+                    "fixed stack payload plus one reference and one length"
+                );
+                for fragment in expected.chunks(partition) {
+                    buffer.write_all(fragment).expect("partitioned input");
+                    assert_eq!(buffer.write(&[]).expect("empty input"), 0);
+                }
+                buffer.flush().expect("final partial chunk is required");
+                assert_eq!(buffer.buffered, 0);
+            }
+            assert!(observed.inner == expected, "every byte stays in order");
+            assert_eq!(observed.fragments.bytes, length);
+            assert_eq!(observed.fragments.writes, length.div_ceil(chunk));
+            assert_eq!(observed.fragments.maximum_write, length.min(chunk));
+            assert_eq!(
+                observed.last_write,
+                if length == 0 {
+                    0
+                } else {
+                    (length - 1) % chunk + 1
+                }
+            );
+            assert_eq!(observed.flushes, 1);
+        }
+    }
+
+    let mut observed = ObservedWriter::new(Vec::new());
+    {
+        let mut buffer = StateBuffer::new(&mut observed);
+        buffer.write_all(b"first").expect("first partial chunk");
+        buffer.flush().expect("explicit partial flush");
+        buffer.write_all(b"second").expect("second partial chunk");
+        buffer.flush().expect("second explicit flush");
+        buffer.flush().expect("empty flush");
+    }
+    assert_eq!(observed.inner, b"firstsecond");
+    assert_eq!(observed.fragments.writes, 2);
+    assert_eq!(observed.flushes, 3);
+}
+
+#[test]
+fn config_capacity_957_streamed_ledger_buffer_propagates_sink_errors() {
+    use std::collections::VecDeque;
+    use std::io::Write;
+
+    enum Step {
+        Interrupted,
+        Partial(usize),
+        Failure,
+        Zero,
+    }
+    struct ControlledWriter {
+        encoded: Vec<u8>,
+        steps: VecDeque<Step>,
+        fail_flush: bool,
+    }
+    impl Write for ControlledWriter {
+        fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+            let accepted = match self.steps.pop_front() {
+                Some(Step::Interrupted) => return Err(io::ErrorKind::Interrupted.into()),
+                Some(Step::Failure) => return Err(io::Error::other("controlled sink failure")),
+                Some(Step::Zero) => return Ok(0),
+                Some(Step::Partial(limit)) => limit.min(bytes.len()),
+                None => bytes.len(),
+            };
+            self.encoded.extend_from_slice(&bytes[..accepted]);
+            Ok(accepted)
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            if self.fail_flush {
+                return Err(io::Error::other("controlled flush failure"));
+            }
+            Ok(())
+        }
+    }
+
+    let mut writer = ControlledWriter {
+        encoded: Vec::new(),
+        steps: VecDeque::from([Step::Interrupted, Step::Partial(2), Step::Failure]),
+        fail_flush: false,
+    };
+    let mut buffer = StateBuffer::new(&mut writer);
+    buffer.write_all(b"abcdef").expect("buffered input");
+    assert_eq!(buffer.flush().unwrap_err().kind(), io::ErrorKind::Other);
+    assert_eq!(buffer.inner.encoded, b"ab");
+    assert_eq!(&buffer.bytes[..buffer.buffered], b"cdef");
+    buffer.flush().expect("only unwritten suffix is retried");
+    assert_eq!(buffer.inner.encoded, b"abcdef");
+    assert_eq!(buffer.buffered, 0);
+
+    buffer.inner.steps.push_back(Step::Zero);
+    buffer.write_all(b"tail").expect("final buffered tail");
+    assert_eq!(buffer.flush().unwrap_err().kind(), io::ErrorKind::WriteZero);
+    assert_eq!(&buffer.bytes[..buffer.buffered], b"tail");
+    buffer.flush().expect("tail remains available after error");
+    assert_eq!(buffer.inner.encoded, b"abcdeftail");
+
+    buffer.inner.fail_flush = true;
+    assert_eq!(buffer.flush().unwrap_err().kind(), io::ErrorKind::Other);
+    buffer.inner.fail_flush = false;
+    buffer.flush().expect("inner flush errors are propagated");
+}
+
+#[test]
+fn config_capacity_957_streamed_ledger_buffer_preserves_size_and_output_checks() {
+    let key = AuditKey::new([0xC3; 32]).expect("synthetic authentication key");
+    let stored = StoredLedger {
+        identity: identity(),
+        ledger: None,
+    };
+    let length = canonical_state_len(&stored).expect("original canonical length");
+    assert!(length > 1 && length < STATE_STREAM_BUFFER_BYTES);
+    for invalid_length in [0, length - 1, length + 1, MAX_STATE_BYTES + 1] {
+        assert_eq!(
+            stream_state(&stored, &key, invalid_length, None)
+                .err()
+                .expect("incorrect length must not produce a MAC")
+                .kind(),
+            io::ErrorKind::InvalidData
+        );
+    }
+    let mut absent_output = Vec::new();
+    assert!(stream_state(&stored, &key, length, Some(&mut absent_output)).is_err());
+    assert!(absent_output.is_empty() && absent_output.capacity() == 0);
+    let mut occupied_output = vec![0xA5; length];
+    let original_capacity = occupied_output.capacity();
+    occupied_output.resize(original_capacity, 0xA5);
+    assert!(stream_state(&stored, &key, length, Some(&mut occupied_output)).is_err());
+    assert_eq!(occupied_output.capacity(), original_capacity);
+    assert!(occupied_output.iter().all(|byte| *byte == 0xA5));
+
+    let original_mac = authenticate(&key, STATE_DOMAIN, &stored).expect("original authenticator");
+    stream_state(&stored, &key, length, None)
+        .expect("exact length flushes the final tail")
+        .verify_slice(&original_mac)
+        .expect("unchanged final-tail authentication");
+    let mut changed = stored;
+    changed.identity = ConfigConsensusIdentity::new(
+        crate::ConfigConsensusClusterId::from_bytes([0xC6; 32]),
+        changed.identity.configuration_id(),
+        changed.identity.configuration_epoch(),
+    );
+    let changed_length = canonical_state_len(&changed).expect("changed canonical value");
+    assert!(stream_state(&changed, &key, changed_length, None)
+        .expect("changed bytes remain serializable")
+        .verify_slice(&original_mac)
+        .is_err());
+}
+
+#[test]
+fn config_capacity_957_streamed_ledger_batches_authenticated_sink_writes() {
+    use std::io::Write;
+
+    let (key, mut stored) = super::config_capacity_957_ledger_allocations::fixture(1_023, true);
+    for rows in [3_070, 3_071] {
+        if rows == 3_071 {
+            let ledger = stored.ledger.as_mut().unwrap();
+            let selected = ledger.operations.last().unwrap().handle.clone();
+            ledger
+                .resolve(
+                    &key,
+                    &selected,
+                    AuditOperationState::Committed { version: 2 },
+                )
+                .expect("same real final outcome transition as the phase diagnostic");
+        }
+        let ledger = stored.ledger.as_ref().unwrap();
+        assert_eq!(ledger.entries.len(), rows);
+        assert_eq!(ledger.operations.len(), 1_024);
+        ledger
+            .validate(&key, stored.identity)
+            .expect("valid history");
+        let original = serde_json::to_vec(&stored).expect("original canonical bytes");
+        let original_mac = authenticate(&key, STATE_DOMAIN, &stored).expect("original MAC");
+        let length = canonical_state_len(&stored).expect("actual canonical length");
+        assert_eq!(length, original.len());
+        let ((output, batched_mac), encoded) = observe_state_stream(|| {
+            encode_state(&stored, &key).expect("complete production encoder")
+        });
+        assert!(
+            output == original,
+            "batching preserves every canonical byte"
+        );
+        assert!(batched_mac == original_mac, "batching preserves the MAC");
+        let ((), verified) = observe_state_stream(|| {
+            stream_state(&stored, &key, length, None)
+                .expect("complete production verification stream")
+                .verify_slice(&original_mac)
+                .expect("original MAC verifies without output allocation");
+        });
+        let mut original_fragments = FragmentCounts::default();
+        serde_json::to_writer(&mut original_fragments, &stored)
+            .expect("unbuffered fragment oracle");
+        assert_eq!(original_fragments.bytes, length);
+        assert_eq!(encoded.fragments.bytes, length);
+        assert_eq!(verified.fragments.bytes, length);
+        assert_eq!(encoded.output_writes, encoded.fragments.writes);
+        assert_eq!(encoded.verification_writes, 0);
+        assert_eq!(verified.verification_writes, verified.fragments.writes);
+        assert_eq!(verified.output_writes, 0);
+        assert_eq!(
+            encoded.fragments.writes,
+            length.div_ceil(STATE_STREAM_BUFFER_BYTES),
+            "CONFIG_CAPACITY_LEDGER_BATCHING_RED: production encoder must batch authenticated sink writes"
+        );
+        assert_eq!(
+            verified.fragments.writes,
+            length.div_ceil(STATE_STREAM_BUFFER_BYTES),
+            "CONFIG_CAPACITY_LEDGER_BATCHING_RED: production verification must batch authenticated sink writes"
+        );
+        for observed in [encoded, verified] {
+            assert_eq!(observed.fragments.maximum_write, STATE_STREAM_BUFFER_BYTES);
+            assert_eq!(
+                observed.last_write,
+                (length - 1) % STATE_STREAM_BUFFER_BYTES + 1
+            );
+            assert!(original_fragments.writes > 1_000 * observed.fragments.writes);
+        }
+        writeln!(
+            std::io::stdout().lock(),
+            "CONFIG_CAPACITY_LEDGER_BATCHING {}",
+            serde_json::json!({
+                "rows": rows,
+                "operations": 1_024,
+                "canonical_bytes": length,
+                "serde_writes": original_fragments.writes,
+                "authenticated_sink_writes": encoded.fragments.writes,
+                "verification_sink_writes": verified.fragments.writes,
+                "maximum_sink_write_bytes": encoded.fragments.maximum_write,
+                "last_sink_write_bytes": encoded.last_write,
+                "stack_buffer_payload_bytes": STATE_STREAM_BUFFER_BYTES,
+                "stack_buffer_type_bytes": std::mem::size_of::<StateBuffer<'_, StateByteCounter>>(),
+                "original_bytes_and_mac_equal": true,
+                "production_bytes_and_mac_equal": true,
+                "test_cfg_sink_observer": true,
+                "whole_operation_memory_bound": false,
+                "timing_qualification": false,
+                "native_rpc_qualification": false
             })
         )
         .unwrap();

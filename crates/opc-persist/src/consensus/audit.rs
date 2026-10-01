@@ -98,6 +98,71 @@ struct StateWriter<'a> {
     encoded: Option<&'a mut Vec<u8>>,
 }
 
+const STATE_STREAM_BUFFER_BYTES: usize = 4 * 1024;
+
+// Canonical serde JSON emits many very small fragments. Batch them before the
+// authenticated sink so hashing and output extension operate on whole chunks.
+// This adds a fixed 4 KiB stack payload plus a reference and length; it does not
+// replace or enlarge the retained output allocation or change its size checks.
+struct StateBuffer<'a, W: io::Write> {
+    inner: &'a mut W,
+    bytes: [u8; STATE_STREAM_BUFFER_BYTES],
+    buffered: usize,
+}
+
+impl<'a, W: io::Write> StateBuffer<'a, W> {
+    fn new(inner: &'a mut W) -> Self {
+        Self {
+            inner,
+            bytes: [0; STATE_STREAM_BUFFER_BYTES],
+            buffered: 0,
+        }
+    }
+
+    fn drain(&mut self) -> io::Result<()> {
+        while self.buffered != 0 {
+            let written = match self.inner.write(&self.bytes[..self.buffered]) {
+                Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
+                result => result?,
+            };
+            if written == 0 {
+                return Err(io::ErrorKind::WriteZero.into());
+            }
+            self.bytes.copy_within(written..self.buffered, 0);
+            self.buffered -= written;
+        }
+        Ok(())
+    }
+}
+
+impl<W: io::Write> io::Write for StateBuffer<'_, W> {
+    fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+        if bytes.is_empty() {
+            return Ok(0);
+        }
+        if self.buffered == self.bytes.len() {
+            self.drain()?;
+        }
+        let accepted = bytes.len().min(self.bytes.len() - self.buffered);
+        self.bytes[self.buffered..self.buffered + accepted].copy_from_slice(&bytes[..accepted]);
+        self.buffered += accepted;
+        Ok(accepted)
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        self.drain()?;
+        self.inner.flush()
+    }
+}
+
+fn write_canonical_state(stored: &StoredLedger, writer: &mut impl io::Write) -> io::Result<()> {
+    let mut buffered = StateBuffer::new(writer);
+    serde_json::to_writer(&mut buffered, stored).map_err(|_| invalid())?;
+    // Explicitly propagate the final partial chunk's errors before returning
+    // the MAC. Dropping a buffer must never silently discard an error or tail.
+    io::Write::flush(&mut buffered)
+}
+
 impl io::Write for StateWriter<'_> {
     fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
         let remaining = self
@@ -112,6 +177,11 @@ impl io::Write for StateWriter<'_> {
         }
         self.mac.update(bytes);
         self.remaining = remaining;
+        #[cfg(test)]
+        config_capacity_957_ledger_streaming::observe_authenticated_sink_write(
+            bytes.len(),
+            self.encoded.is_some(),
+        );
         Ok(bytes.len())
     }
 
@@ -137,7 +207,7 @@ fn stream_state(
         remaining: length,
         encoded,
     };
-    serde_json::to_writer(&mut writer, stored).map_err(|_| invalid())?;
+    write_canonical_state(stored, &mut writer)?;
     if writer.remaining != 0 {
         return Err(invalid());
     }
