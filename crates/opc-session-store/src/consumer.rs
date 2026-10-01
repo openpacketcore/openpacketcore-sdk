@@ -3180,6 +3180,13 @@ pub enum SessionConsumerRejection {
     /// The mTLS identity is not authorized as a consumer.
     Unauthorized,
     /// The server cannot dispatch the request within its bound.
+    ///
+    /// A server returns it only before it submits the operation's own
+    /// consensus intent. It may follow the effect-free durable request
+    /// binding, which the identical request rebinds idempotently. Clients
+    /// therefore treat it as proof that this server did not dispatch the
+    /// request: a prepared request moves the identical request to another
+    /// voter of the same quorum.
     Unavailable,
 }
 

@@ -1958,6 +1958,17 @@ of that ID for a different request is a closed conflict. Applications otherwise
 must perform authoritative readback and apply the existing fencing/idempotency
 contract.
 
+A complete V1 `Rejected(Unavailable)` reply is a closed rejection. A server
+MUST return it only before it submits the operation's own consensus intent. It
+MAY follow the effect-free durable request binding, which the identical
+request rebinds idempotently. The reply therefore proves that the answering
+voter did not dispatch the request. The persistent client MUST count it as a
+not-transmitted completion, never as an unsafe failure. A prepared
+compare-and-set or lease acquire MUST move the identical request to its next
+voter, exactly as after a proven pre-write failure, and MUST end
+`NotTransmitted` when every voter rejects or is unreachable. Scope, topology,
+authorization and validation rejections remain terminal.
+
 For persistent V2 calls, `NotTransmitted` is a pre-write result. A
 `ReadUnavailable` result is a post-write read loss for a non-effectful V2
 capability, history, or status operation and may be retried as that read.
@@ -2174,6 +2185,11 @@ setup is safe and retryable because no application bytes can cross the
 transport boundary. After dispatch begins, a possible send, including
 `OutcomeUnknown`, or cancellation is ambiguous and MUST permanently make the
 handle receipt-only; it MUST NOT regain mutation authority.
+A complete closed `Rejected(Unavailable)` reply proves that the selected voter
+did not dispatch the transition, but the handle has already written its call:
+it MUST return a terminal `NotTransmitted` result and MUST NOT advance to
+another voter. A single-voter consumer fenced-transition backend also reports
+that reply as `NotTransmitted`, not as a rejected store error.
 `BeforeCallWrite(SessionConsumerClientError::Scope)` is a terminal topology
 authority revocation and MUST be returned as rejected
 `StoreError::TopologyAuthorityRevoked`; it MUST NOT be downgraded to a generic
