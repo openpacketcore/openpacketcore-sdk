@@ -13,6 +13,9 @@ readme = "README.md"
 documentation = "https://docs.rs/opc-tls"
 keywords = ["5g", "cnf", "tls", "telecom", "packet-core"]
 categories = ["network-programming", "cryptography"]
+[features]
+test-control = []
+
 [dependencies]
 serde = { workspace = true, features = ["derive"] }
 serde_json = "1.0"

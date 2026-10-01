@@ -13,9 +13,14 @@ readme = "README.md"
 documentation = "https://docs.rs/opc-crypto"
 keywords = ["5g", "cnf", "cryptography", "telecom", "packet-core"]
 categories = ["cryptography", "network-programming"]
+[features]
+capacity-observation = ["opc-key/capacity-observation"]
+
 [dependencies]
 opc-key = { path = "../opc-key", version = "0.2.0" }
 rand = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true, features = ["raw_value"] }
 sha2 = { workspace = true }
 thiserror = { workspace = true }
 

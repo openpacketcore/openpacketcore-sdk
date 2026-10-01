@@ -19,6 +19,8 @@
 
 #![forbid(unsafe_code)]
 
+#[cfg(feature = "capacity-observation")]
+pub mod capacity_observation;
 mod consumer_checkpoint;
 pub mod custody;
 pub mod errors;

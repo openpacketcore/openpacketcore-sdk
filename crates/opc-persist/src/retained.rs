@@ -60,6 +60,7 @@ pub struct RetainedConfigBinding {
     topology: ConfigConsensusTopology,
     backing_identity: [u8; 32],
     key_scope: [u8; 32],
+    capacity_profile: opc_crypto::ConfigCapacityProfile,
 }
 
 impl RetainedConfigBinding {
@@ -76,7 +77,22 @@ impl RetainedConfigBinding {
             topology,
             backing_identity,
             key_scope,
+            capacity_profile: opc_crypto::ConfigCapacityProfile::Legacy,
         })
+    }
+
+    /// Select an immutable plaintext capacity profile before provisioning or
+    /// reopening. This never promotes existing storage: the authenticated
+    /// binding must match before any original database/WAL recovery. Selecting
+    /// a profile does not enable unqualified consensus admission.
+    pub fn with_capacity_profile(mut self, profile: opc_crypto::ConfigCapacityProfile) -> Self {
+        self.capacity_profile = profile;
+        self
+    }
+
+    /// The exact caller-selected profile authenticated by this binding.
+    pub const fn capacity_profile(&self) -> opc_crypto::ConfigCapacityProfile {
+        self.capacity_profile
     }
 
     pub(crate) fn topology(&self) -> &ConfigConsensusTopology {
@@ -99,6 +115,12 @@ impl RetainedConfigBinding {
         digest.update(self.key_scope);
         digest.update(key.epoch().to_be_bytes());
         digest.update(key.fingerprint());
+        // Legacy bytes remain identical. A nonlegacy profile is part of the
+        // authenticated admission scope checked before original WAL recovery.
+        if self.capacity_profile != opc_crypto::ConfigCapacityProfile::Legacy {
+            digest.update(b"openpacketcore/config-retained-capacity/v1\0");
+            digest.update(self.capacity_profile.revision().to_be_bytes());
+        }
         digest.finalize().into()
     }
 }
@@ -488,6 +510,7 @@ fn open_authority_sync(
             &conn,
             options.binding.topology(),
             &audit_key,
+            options.binding.capacity_profile(),
             work.deadline,
         )
         .map_err(|_| RetainedConfigError::Rejected)?;
@@ -780,6 +803,7 @@ fn validate_connection(
         conn,
         options.binding.topology(),
         key,
+        options.binding.capacity_profile(),
         work.deadline,
     )
     .map_err(|_| RetainedConfigError::Rejected)?;

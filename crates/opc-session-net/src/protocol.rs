@@ -40,6 +40,9 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 use crate::error::ProtocolError;
 
+mod consensus_decode;
+mod consensus_json;
+
 pub const CONTRACT_VERSION: u32 = 5;
 pub const DEFAULT_MAX_FRAME_SIZE: usize = 1024 * 1024;
 pub const MAX_HANDSHAKE_FRAME_SIZE: usize = 8 * 1024;
@@ -707,6 +710,10 @@ impl<'de> Deserialize<'de> for CompactRosterWireRequest {
 pub(crate) enum SessionConsensusTransportRequest {
     Call {
         call_id: uuid::Uuid,
+        #[cfg_attr(
+            all(test, feature = "test-control"),
+            serde(deserialize_with = "inbound_decode_observation::deserialize_request")
+        )]
         request: SessionConsensusWireRequest,
     },
     RosterCall {
@@ -774,6 +781,10 @@ impl SessionConsensusTransportRequest {
 pub(crate) enum SessionConsensusTransportResponse {
     Call {
         call_id: uuid::Uuid,
+        #[cfg_attr(
+            all(test, feature = "test-control"),
+            serde(deserialize_with = "consensus_decode_tests::deserialize_response")
+        )]
         response: SessionConsensusWireResponse,
     },
 }
@@ -3707,9 +3718,17 @@ impl EncodedFrameChunk {
 }
 
 struct EncodedFrame {
+    // Rust drops fields in declaration order: deregister before freeing chunks.
+    // A recorded ready frame therefore cannot outlive its actual allocations.
+    #[cfg(feature = "test-control")]
+    observation: Option<crate::consensus::capacity_observation::FrameObservation>,
     chunks: Vec<EncodedFrameChunk>,
     encoded_len: usize,
     retained_byte_capacity: usize,
+    #[cfg(all(test, feature = "test-control"))]
+    encoding_control_checks: usize,
+    #[cfg(all(test, feature = "test-control"))]
+    encoding_fragment_writes: usize,
 }
 
 struct BoundedFrameBuffer<'a> {
@@ -3724,9 +3743,15 @@ impl<'a> BoundedFrameBuffer<'a> {
     fn new(max_frame_size: usize, control: EncodingControl<'a>) -> Self {
         Self {
             frame: EncodedFrame {
+                #[cfg(feature = "test-control")]
+                observation: crate::consensus::capacity_observation::FrameObservation::current(),
                 chunks: Vec::new(),
                 encoded_len: 0,
                 retained_byte_capacity: 0,
+                #[cfg(all(test, feature = "test-control"))]
+                encoding_control_checks: 0,
+                #[cfg(all(test, feature = "test-control"))]
+                encoding_fragment_writes: 0,
             },
             max_frame_size,
             exceeded_at: None,
@@ -3736,6 +3761,10 @@ impl<'a> BoundedFrameBuffer<'a> {
     }
 
     fn check_control(&mut self) -> std::io::Result<()> {
+        #[cfg(all(test, feature = "test-control"))]
+        {
+            self.frame.encoding_control_checks += 1;
+        }
         self.control.check().map_err(|halted| {
             self.halted = Some(halted);
             encoding_halt_sink_error(halted)
@@ -3753,6 +3782,10 @@ impl<'a> BoundedFrameBuffer<'a> {
         };
         let chunk_size = preferred_size.min(remaining_capacity);
         debug_assert!(chunk_size > 0);
+        #[cfg(feature = "test-control")]
+        if let Some(observation) = &self.frame.observation {
+            observation.before_chunk_allocation();
+        }
         self.frame.chunks.push(EncodedFrameChunk {
             // Converting to a boxed slice discards Vec's spare capacity. Each
             // retained byte allocation therefore has exactly this logical
@@ -3762,6 +3795,20 @@ impl<'a> BoundedFrameBuffer<'a> {
             initialized: 0,
         });
         self.frame.retained_byte_capacity += chunk_size;
+        #[cfg(feature = "test-control")]
+        if let (Some(observation), Some(chunk)) =
+            (&self.frame.observation, self.frame.chunks.last())
+        {
+            // Observe the real owners after growth, including descriptor spare
+            // capacity. Pointer identity is private to the qualification census.
+            observation.chunk_allocated(
+                (
+                    self.frame.chunks.as_ptr() as usize,
+                    self.frame.chunks.capacity() * std::mem::size_of::<EncodedFrameChunk>(),
+                ),
+                (chunk.bytes.as_ptr() as usize, chunk.bytes.len()),
+            );
+        }
     }
 }
 
@@ -3819,6 +3866,92 @@ impl std::io::Write for BoundedFrameBuffer<'_> {
     }
 }
 
+// Keep scratch on the synchronous encoder's stack, not in the retained frame.
+// This also bounds work between cooperative checks for tiny/empty fragments.
+const ENCODED_FRAGMENT_BATCH_BYTES: usize = 1024;
+const ENCODED_FRAGMENT_BATCH_WRITES: usize = 1024;
+
+struct FrameFragmentBuffer<'buffer, 'control> {
+    sink: &'buffer mut BoundedFrameBuffer<'control>,
+    scratch: [u8; ENCODED_FRAGMENT_BATCH_BYTES],
+    pending: usize,
+    remaining_budget: usize,
+    writes_since_check: usize,
+}
+
+impl<'buffer, 'control> FrameFragmentBuffer<'buffer, 'control> {
+    fn new(sink: &'buffer mut BoundedFrameBuffer<'control>) -> Self {
+        let remaining_budget = sink.max_frame_size.saturating_sub(sink.frame.encoded_len);
+        Self {
+            sink,
+            scratch: [0; ENCODED_FRAGMENT_BATCH_BYTES],
+            pending: 0,
+            remaining_budget,
+            writes_since_check: 0,
+        }
+    }
+
+    fn flush_pending(&mut self) -> std::io::Result<()> {
+        if self.pending == 0 {
+            // Empty serializer writes must not postpone cooperative checks.
+            self.sink.check_control()?;
+        } else {
+            std::io::Write::write_all(self.sink, &self.scratch[..self.pending])?;
+            self.pending = 0;
+        }
+        self.writes_since_check = 0;
+        Ok(())
+    }
+}
+
+impl std::io::Write for FrameFragmentBuffer<'_, '_> {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        #[cfg(all(test, feature = "test-control"))]
+        {
+            self.sink.frame.encoding_fragment_writes += 1;
+        }
+        // Count pending bytes against the original ceiling before copying them.
+        // On rejection, preserve the sink's original control/error precedence.
+        if buf.len() > self.remaining_budget {
+            self.sink.check_control()?;
+            let accepted = self.sink.max_frame_size - self.remaining_budget;
+            self.sink.exceeded_at = Some(accepted.saturating_add(buf.len()));
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "encoded frame exceeds configured limit",
+            ));
+        }
+        self.remaining_budget -= buf.len();
+        self.writes_since_check += 1;
+        if self.writes_since_check == ENCODED_FRAGMENT_BATCH_WRITES {
+            self.flush_pending()?;
+        }
+        if buf.len() >= self.scratch.len() {
+            if self.pending != 0 {
+                self.flush_pending()?;
+            }
+            // Large fragments retain the original per-chunk control checks.
+            std::io::Write::write_all(self.sink, buf)?;
+            self.writes_since_check = 0;
+            return Ok(buf.len());
+        }
+        if buf.len() > self.scratch.len() - self.pending {
+            self.flush_pending()?;
+        }
+        let end = self.pending + buf.len();
+        self.scratch[self.pending..end].copy_from_slice(buf);
+        self.pending = end;
+        if self.pending == self.scratch.len() {
+            self.flush_pending()?;
+        }
+        Ok(buf.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        self.flush_pending()
+    }
+}
+
 fn encoding_halt_sink_error(halted: EncodingHalt) -> std::io::Error {
     let (kind, message) = match halted {
         EncodingHalt::TimedOut => (
@@ -3850,6 +3983,10 @@ fn encoding_halt_protocol_error(halted: EncodingHalt) -> ProtocolError {
     ProtocolError::Io(std::io::Error::new(kind, message))
 }
 
+// Completion observes cancellation/deadline even when a custom serializer
+// returns an error without another sink write. Already-latched sink failures
+// keep precedence; otherwise a current halt wins over that serialization error.
+// Neither error path flushes pending bytes or reaches the transport.
 fn encode_frame_bounded<T>(
     frame: &T,
     max_frame_size: usize,
@@ -3865,9 +4002,17 @@ where
     if let Err(halted) = control.check() {
         return Err(encoding_halt_protocol_error(halted));
     }
-    match serde_json::to_writer(&mut buffer, frame) {
+    let encoded = {
+        let mut fragments = FrameFragmentBuffer::new(&mut buffer);
+        consensus_json::to_writer(&mut fragments, frame)
+            .map_err(ProtocolError::from)
+            .and_then(|()| std::io::Write::flush(&mut fragments).map_err(ProtocolError::Io))
+    };
+    match encoded {
         Ok(()) => {
             control.check().map_err(encoding_halt_protocol_error)?;
+            #[cfg(all(test, feature = "test-control"))]
+            encoding_batch_tests::record_frame_work(&buffer.frame);
             Ok(buffer.frame)
         }
         Err(error) => {
@@ -3876,7 +4021,8 @@ where
             } else if let Some(exceeded_at) = buffer.exceeded_at {
                 Err(ProtocolError::FrameTooLarge(exceeded_at))
             } else {
-                Err(error.into())
+                control.check().map_err(encoding_halt_protocol_error)?;
+                Err(error)
             }
         }
     }
@@ -4213,8 +4359,10 @@ impl FrameWriteError {
 ///
 /// Encoding is single-pass into lazy exact-length boxed chunks whose total
 /// retained JSON-byte capacity never exceeds `max_frame_size`; the chunks are
-/// not coalesced. Chunk-vector metadata and allocator slab/RSS overhead are
-/// outside the encoded-byte contract. The length prefix is not emitted until
+/// not coalesced. Tiny serializer fragments use an additional fixed 1 KiB
+/// stack buffer only during synchronous encoding; it is gone before writing.
+/// Chunk-vector metadata and allocator slab/RSS overhead are outside the
+/// encoded-byte contract. The length prefix is not emitted until
 /// encoding succeeds, so oversize, timeout, cancellation, and serialization
 /// failures leave the stream untouched. The same absolute deadline covers
 /// encoding, prefix, payload, and flush.
@@ -4368,12 +4516,36 @@ where
     }
 }
 
+/// Write the ordinary owned wire DTO through a borrowed encoding view.
+///
+/// Numeric payload emission uses additional fixed 1 KiB synchronous scratch;
+/// it borrows the original payload and preserves the bounded frame writer.
+pub(crate) async fn write_consensus_frame_bounded_until<W>(
+    writer: &mut W,
+    frame: &SessionConsensusTransportRequest,
+    max_frame_size: usize,
+    deadline: tokio::time::Instant,
+) -> Result<(), ProtocolError>
+where
+    W: tokio::io::AsyncWrite + Unpin,
+{
+    write_frame_bounded_until(
+        writer,
+        &consensus_json::BorrowedRequest(frame),
+        max_frame_size,
+        deadline,
+    )
+    .await
+}
+
 /// Cancellable counterpart to [`write_frame_bounded_until`].
 ///
 /// Cancellation is cooperative while synchronous JSON serialization is in
-/// progress: the sink checks it before every serializer write and between
-/// retained chunks. The bounded wire DTO fields keep the interval between
-/// checks finite; Tokio task abortion alone cannot preempt synchronous Rust.
+/// progress: small fragments are checked at each bounded 1 KiB batch and at
+/// least every 1,024 serializer writes, including empty writes. Larger writes
+/// retain the sink's checks between retained chunks. Entry, completion and
+/// pre-prefix checks remain mandatory. These are work bounds, not a wall-time
+/// guarantee; Tokio task abortion alone cannot preempt synchronous Rust.
 pub(crate) async fn write_frame_bounded_until_cancellable<W, T>(
     writer: &mut W,
     frame: &T,
@@ -4425,6 +4597,11 @@ where
         .map_err(FrameWriteError::BeforeWrite)?;
     let mut writer = WriteProgress { writer, progress };
     let write = async {
+        #[cfg(feature = "test-control")]
+        if let Some(observation) = &json.observation {
+            // This await stays inside the original timeout_at(deadline, write).
+            observation.ready_and_wait().await;
+        }
         writer
             .write_all(&len.to_be_bytes())
             .await
@@ -4685,6 +4862,18 @@ where
     serde_json::from_slice(&payload).map_err(ProtocolError::from)
 }
 
+/// Read the closed consensus response through the existing bounded frame reader.
+pub(crate) async fn read_consensus_response_frame<R>(
+    reader: &mut R,
+    max_frame_size: usize,
+) -> Result<SessionConsensusTransportResponse, ProtocolError>
+where
+    R: tokio::io::AsyncRead + Unpin,
+{
+    let payload = read_frame_payload(reader, max_frame_size).await?;
+    consensus_decode::response(&payload).map_err(ProtocolError::from)
+}
+
 /// Decode one post-bootstrap operation request through the private v5 DTO.
 pub(crate) async fn read_request_frame<R>(
     reader: &mut R,
@@ -4736,30 +4925,41 @@ where
     }
 }
 
-/// Read one post-authentication frame with an absolute idle deadline.
+/// Read one post-authentication consensus request with an absolute idle deadline.
 ///
 /// `Ok(None)` means the peer sent no byte before the next-request idle policy
 /// expired. Once any frame byte arrives, every remaining prefix/payload byte
 /// must arrive by the same deadline; a partial-frame stall remains a timed-out
 /// [`ProtocolError`] so authenticated slowloris behavior is never relabeled as
 /// a normal idle retirement.
-pub(crate) async fn read_authenticated_frame_within<R, T>(
+pub(crate) async fn read_authenticated_frame_within<R>(
     reader: &mut R,
     max_frame_size: usize,
     timeout: std::time::Duration,
-) -> Result<Option<T>, ProtocolError>
+) -> Result<Option<SessionConsensusTransportRequest>, ProtocolError>
 where
     R: tokio::io::AsyncRead + Unpin,
-    T: for<'de> Deserialize<'de>,
 {
     let payload =
         match read_authenticated_frame_payload_within(reader, max_frame_size, timeout).await? {
             Some(payload) => payload,
             None => return Ok(None),
         };
-    serde_json::from_slice(&payload)
-        .map(Some)
-        .map_err(ProtocolError::from)
+    #[cfg(all(test, feature = "test-control"))]
+    {
+        let _owner = inbound_decode_observation::borrow_raw_decode(&payload);
+        let decoded = consensus_decode::request(&payload)
+            .map(Some)
+            .map_err(ProtocolError::from);
+        inbound_decode_observation::capture_decode_result(&payload, decoded.is_err());
+        decoded
+    }
+    #[cfg(not(all(test, feature = "test-control")))]
+    {
+        consensus_decode::request(&payload)
+            .map(Some)
+            .map_err(ProtocolError::from)
+    }
 }
 
 pub(crate) async fn read_authenticated_frame_payload_within<R>(
@@ -4862,7 +5062,11 @@ where
     let mut remaining = len;
     while remaining != 0 {
         let chunk_len = remaining.min(chunk.len());
+        #[cfg(all(test, feature = "test-control"))]
+        let owner = inbound_decode_observation::borrow_raw_read(&payload, len);
         read_exact_frame_bytes_until(reader, &mut chunk[..chunk_len], deadline).await?;
+        #[cfg(all(test, feature = "test-control"))]
+        drop(owner);
         payload.extend_from_slice(&chunk[..chunk_len]);
         remaining -= chunk_len;
     }
@@ -4916,6 +5120,21 @@ where
         .map(Some)
         .map_err(|_| ProtocolError::InvalidWireValue)
 }
+
+#[cfg(all(test, feature = "test-control"))]
+pub(crate) mod inbound_decode_observation;
+
+#[cfg(all(test, feature = "test-control"))]
+mod capacity_owner_tests;
+
+#[cfg(all(test, feature = "test-control"))]
+mod encoding_batch_tests;
+
+#[cfg(all(test, feature = "test-control"))]
+mod consensus_decode_tests;
+
+#[cfg(all(test, feature = "test-control", feature = "insecure-test"))]
+pub(crate) use consensus_decode_tests::ConsensusDecodeDispatchCount;
 
 #[cfg(test)]
 mod tests {

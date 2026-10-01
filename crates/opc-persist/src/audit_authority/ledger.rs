@@ -22,8 +22,35 @@ const ENTRY_DOMAIN: &[u8] = b"openpacketcore/management-audit/replicated-entry/v
 pub(crate) const STATE_DOMAIN: &[u8] = b"openpacketcore/management-audit/replicated-state/v1\0";
 pub(crate) const MAX_STATE_BYTES: usize = 16 * 1024 * 1024;
 pub(crate) const MAX_LEDGER_EVENTS: usize = 4096;
+pub(crate) const MAX_LEDGER_OPERATIONS: usize = 1024;
 const MAX_HANDLE_BYTES: usize = 8192;
 const OPERATION_EVENT_RESERVATION: usize = 3;
+
+// Resource failure is replica-local and must not become a replicated logical
+// rejection. Only the authority variant may be serialized as a command result.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, thiserror::Error)]
+pub(crate) enum LedgerMutationError {
+    #[error(transparent)]
+    Authority(#[from] AuditAuthorityError),
+    #[error("retained ledger allocation failed")]
+    Allocation,
+}
+
+pub(crate) fn reserve_mutation<T>(
+    values: &mut Vec<T>,
+    additional: usize,
+) -> Result<(), LedgerMutationError> {
+    if additional <= values.capacity() - values.len() {
+        return Ok(());
+    }
+    #[cfg(test)]
+    let additional = allocation_probe::requested(additional);
+    // Retained decoding uses exact capacities. Reserve only the new elements,
+    // preserving existing spare capacity and avoiding Vec's geometric growth.
+    values
+        .try_reserve_exact(additional)
+        .map_err(|_| LedgerMutationError::Allocation)
+}
 
 /// Fixed capacity admitted with the ledger, including reserved outcome slots.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -48,7 +75,7 @@ impl AuditLedgerLimits {
 
     fn validate(self) -> Result<(), AuditAuthorityError> {
         if !(3..=MAX_LEDGER_EVENTS).contains(&self.max_events)
-            || !(1..=1024).contains(&self.max_operations)
+            || !(1..=MAX_LEDGER_OPERATIONS).contains(&self.max_operations)
             || self.max_operations > self.max_events / OPERATION_EVENT_RESERVATION
         {
             return Err(AuditAuthorityError::InvalidInput);
@@ -302,15 +329,18 @@ impl LedgerState {
         &mut self,
         key: &AuditKey,
         payload: EntryPayload,
-    ) -> Result<u64, AuditAuthorityError> {
+    ) -> Result<u64, LedgerMutationError> {
         let next = self
             .sequence
             .checked_add(1)
             .filter(|seq| *seq <= i64::MAX as u64)
             .ok_or(AuditAuthorityError::Full)?;
         if self.entries.len() >= self.limits.max_events {
-            return Err(AuditAuthorityError::Full);
+            return Err(AuditAuthorityError::Full.into());
         }
+        reserve_mutation(&mut self.entries, 1)?;
+        #[cfg(test)]
+        crate::consensus::config_capacity_simultaneous_working_tests::ledger::changed(self);
         let mac = authenticate(
             key,
             ENTRY_DOMAIN,
@@ -325,6 +355,8 @@ impl LedgerState {
         });
         self.sequence = next;
         self.terminal = mac;
+        #[cfg(test)]
+        crate::consensus::config_capacity_simultaneous_working_tests::ledger::changed(self);
         Ok(next)
     }
 
@@ -333,7 +365,7 @@ impl LedgerState {
         key: &AuditKey,
         handle: &AuditOperationHandle,
         now: i64,
-    ) -> Result<(), AuditAuthorityError> {
+    ) -> Result<(), LedgerMutationError> {
         handle.verify(key, self.identity, handle.body.binding.caller)?;
         if let Some(existing) = self
             .operations
@@ -343,7 +375,7 @@ impl LedgerState {
             return if existing.handle == *handle {
                 Ok(())
             } else {
-                Err(AuditAuthorityError::BindingMismatch)
+                Err(AuditAuthorityError::BindingMismatch.into())
             };
         }
         handle.require_live(now)?;
@@ -353,10 +385,10 @@ impl LedgerState {
                 .iter()
                 .any(|operation| self.mutation_outcome_needs_checkpoint(operation))
         {
-            return Err(AuditAuthorityError::RecoveryRequired);
+            return Err(AuditAuthorityError::RecoveryRequired.into());
         }
         if handle.body.event.projection != self.projection {
-            return Err(AuditAuthorityError::BindingMismatch);
+            return Err(AuditAuthorityError::BindingMismatch.into());
         }
         let is_intent = handle.body.event.outcome == crate::ManagementAuditOutcomeCode::Intent;
         let reservation = if is_intent {
@@ -370,8 +402,11 @@ impl LedgerState {
                 .checked_add(reservation)
                 .is_none_or(|used| used > self.limits.max_events)
         {
-            return Err(AuditAuthorityError::Full);
+            return Err(AuditAuthorityError::Full.into());
         }
+        reserve_mutation(&mut self.operations, 1)?;
+        #[cfg(test)]
+        crate::consensus::config_capacity_simultaneous_working_tests::ledger::changed(self);
         let sequence = self.append(key, EntryPayload::Intent(Box::new(handle.clone())))?;
         self.operations.push(LedgerOperation {
             handle: handle.clone(),
@@ -387,6 +422,8 @@ impl LedgerState {
             last_sequence: sequence,
             reserved: reservation - 1,
         });
+        #[cfg(test)]
+        crate::consensus::config_capacity_simultaneous_working_tests::ledger::changed(self);
         Ok(())
     }
 
@@ -395,12 +432,12 @@ impl LedgerState {
         &mut self,
         key: &AuditKey,
         event: ProjectedAuditEvent,
-    ) -> Result<(), AuditAuthorityError> {
+    ) -> Result<(), LedgerMutationError> {
         if event.projection != self.projection {
-            return Err(AuditAuthorityError::BindingMismatch);
+            return Err(AuditAuthorityError::BindingMismatch.into());
         }
         if self.used_capacity()? >= self.limits.max_events {
-            return Err(AuditAuthorityError::Full);
+            return Err(AuditAuthorityError::Full.into());
         }
         self.append(key, EntryPayload::Event(Box::new(event)))?;
         Ok(())
@@ -411,14 +448,14 @@ impl LedgerState {
         key: &AuditKey,
         handle: &AuditOperationHandle,
         state: AuditOperationState,
-    ) -> Result<(), AuditAuthorityError> {
+    ) -> Result<(), LedgerMutationError> {
         let index = self.operation_index(key, handle)?;
         let current = &self.operations[index];
         if current.state == state {
             return Ok(());
         }
         if current.state != AuditOperationState::Intent || state == AuditOperationState::Intent {
-            return Err(AuditAuthorityError::BindingMismatch);
+            return Err(AuditAuthorityError::BindingMismatch.into());
         }
         let sequence = self.append(
             key,
@@ -438,14 +475,14 @@ impl LedgerState {
         &mut self,
         key: &AuditKey,
         handle: &AuditOperationHandle,
-    ) -> Result<(), AuditAuthorityError> {
+    ) -> Result<(), LedgerMutationError> {
         let index = self.operation_index(key, handle)?;
         let current = &self.operations[index];
         if current.terminal_recorded {
             return Ok(());
         }
         if current.state == AuditOperationState::Intent {
-            return Err(AuditAuthorityError::BindingMismatch);
+            return Err(AuditAuthorityError::BindingMismatch.into());
         }
         let sequence = self.append(
             key,
@@ -508,6 +545,9 @@ impl LedgerState {
         let mut sequence = self.floor;
         let mut previous = self.predecessor;
         let mut derived: Vec<LedgerOperation> = Vec::new();
+        #[cfg(test)]
+        let observed_derived =
+            crate::consensus::config_capacity_simultaneous_working_tests::ledger::derived();
         let index = validation_index::ValidationIndex::new(&self.entries)?;
         for entry in &self.entries {
             sequence = sequence
@@ -596,6 +636,8 @@ impl LedgerState {
                     }
                 }
             }
+            #[cfg(test)]
+            observed_derived.observe(&derived);
             previous = entry.mac;
         }
         if derived != self.operations {
@@ -624,6 +666,8 @@ impl LedgerState {
                 return Err(AuditAuthorityError::BindingMismatch);
             }
         }
+        #[cfg(feature = "dangerous-test-hooks")]
+        crate::consensus::capacity_observation::validated_ledger(self, &derived);
         Ok(())
     }
 }
@@ -656,6 +700,11 @@ fn authenticator<T: Serialize>(
     value: &T,
 ) -> Result<Hmac<Sha256>, AuditAuthorityError> {
     let encoded = serde_json::to_vec(value).map_err(|_| AuditAuthorityError::InvalidInput)?;
+    #[cfg(test)]
+    let _observed_authentication =
+        crate::consensus::config_capacity_simultaneous_working_tests::ledger::authentication(
+            &encoded,
+        );
     if encoded.len() > MAX_STATE_BYTES {
         return Err(AuditAuthorityError::InvalidInput);
     }
@@ -665,4 +714,52 @@ fn authenticator<T: Serialize>(
     mac.update(&(encoded.len() as u64).to_be_bytes());
     mac.update(&encoded);
     Ok(mac)
+}
+
+// A scoped test fault at the real reservation call. Capacity overflow returns
+// TryReserveError without a global allocator, OOM, or a fabricated receipt.
+#[cfg(test)]
+pub(crate) mod allocation_probe {
+    use std::cell::Cell;
+
+    thread_local! {
+        static AFTER: Cell<Option<usize>> = const { Cell::new(None) };
+        static INJECTED: Cell<bool> = const { Cell::new(false) };
+    }
+
+    pub(crate) struct FailureGuard;
+
+    impl FailureGuard {
+        pub(crate) fn start(after: usize) -> Self {
+            AFTER.with(|slot| assert!(slot.replace(Some(after)).is_none()));
+            INJECTED.with(|slot| assert!(!slot.replace(false)));
+            Self
+        }
+
+        pub(crate) fn injected(&self) -> bool {
+            INJECTED.with(Cell::get)
+        }
+    }
+
+    impl Drop for FailureGuard {
+        fn drop(&mut self) {
+            AFTER.with(|slot| slot.set(None));
+            INJECTED.with(|slot| slot.set(false));
+        }
+    }
+
+    pub(crate) fn requested(additional: usize) -> usize {
+        AFTER.with(|slot| match slot.get() {
+            Some(0) => {
+                slot.set(None);
+                INJECTED.with(|slot| slot.set(true));
+                usize::MAX
+            }
+            Some(remaining) => {
+                slot.set(Some(remaining - 1));
+                additional
+            }
+            None => additional,
+        })
+    }
 }

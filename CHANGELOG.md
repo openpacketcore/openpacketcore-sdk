@@ -9,6 +9,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- `opc-persist`: release the authenticated audit SQL encoding before deriving
+  retained operations. Preserve canonical authentication, identity and signing
+  continuity checks; qualify the lifetime with native durable commit and reopen
+  coverage. Full capacity qualification remains open. Refs #957.
+
+- `opc-persist`: reuse admission checks for the same locally owned bounded
+  append. Received requests, legacy operations, native storage and retained
+  reopen keep independent validation. Preserve admission ordering, cancellation
+  and original deadlines. Full capacity qualification remains open. Refs #957.
+
+- `opc-persist`: decode canonical audited bounded appends without the generic
+  ciphertext-array fallback and batch audit-effect JSON writes. Preserve exact
+  canonical bytes, HMAC compatibility, authenticated recovery, retained reopen
+  and original size ceilings. Full capacity qualification remains open. Refs #957.
+
+- Preserve bounded configuration preparation and proposal ownership until
+  native storage drains after response loss. Authenticate retained results,
+  retain the committed snapshot frontier, and refuse mismatched retained
+  identities. Release completed audit preflight ledgers before checkpoint and
+  native submission. The experimental capacity profile remains under qualification.
+  Refs #957, #960.
+
 - `opc-session-net`: a prepared compare-and-set or lease acquire whose
   current voter answers with a complete `Rejected(Unavailable)` now moves the
   identical request to the next voter, as after a pre-write failure, and ends

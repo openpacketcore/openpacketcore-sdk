@@ -569,10 +569,10 @@ fn validation_index_allocation_failure_precedes_native_write_and_receipt() {
     assert!(read_sync(&conn, &key(), identity()).is_err());
     assert!(probe.injected());
     drop(probe);
-    let intent = ConfigMutationIntent::ManagementAudit(AuditCommand::Terminal(handle(
+    let intent = ConfigMutationIntent::ManagementAudit(Box::new(AuditCommand::Terminal(handle(
         0,
         ManagementAuditOutcomeCode::Intent,
-    )));
+    ))));
     let probe = validation_probe::Probe::start(Some(0));
     assert!(applied_receipt_sync(&conn, &key(), identity(), &intent).is_err());
     assert!(probe.injected());

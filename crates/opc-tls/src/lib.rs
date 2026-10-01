@@ -470,6 +470,14 @@ impl AuthenticatedClientConfig {
         provider: Arc<rustls::crypto::CryptoProvider>,
     ) -> Result<TlsClientHandshake, TlsMaterialError> {
         let snapshot = self.controller.snapshot()?;
+        self.handshake_from_snapshot(snapshot, provider)
+    }
+
+    fn handshake_from_snapshot(
+        &self,
+        snapshot: material::TlsMaterialSnapshot,
+        provider: Arc<rustls::crypto::CryptoProvider>,
+    ) -> Result<TlsClientHandshake, TlsMaterialError> {
         let config = fixed_client_config(
             &snapshot,
             self.policy.clone(),
@@ -482,6 +490,58 @@ impl AuthenticatedClientConfig {
             self.controller.clone(),
             snapshot,
         ))
+    }
+
+    /// Observe only synchronous construction of one frozen material config.
+    ///
+    /// Shared-controller reconciliation happens before this callback. The
+    /// callback must execute synchronously and release all guards on return.
+    /// The original construction runs exactly once even if the callback skips
+    /// or repeats its operation. The hook retains no additional material or
+    /// transport owner.
+    #[cfg(feature = "test-control")]
+    #[doc(hidden)]
+    pub fn begin_handshake_observed<S>(
+        &self,
+        mut scope: S,
+    ) -> Result<TlsClientHandshake, TlsMaterialError>
+    where
+        S: FnMut(&mut dyn FnMut()),
+    {
+        let snapshot = self.controller.snapshot()?;
+        let mut inputs = Some((snapshot, Arc::clone(self.config.crypto_provider())));
+        let mut result = None;
+        let mut construct = || {
+            if let Some((snapshot, provider)) = inputs.take() {
+                result = Some(self.handshake_from_snapshot(snapshot, provider));
+            }
+        };
+        scope(&mut construct);
+        construct();
+        result.unwrap_or(Err(TlsMaterialError::Configuration))
+    }
+
+    /// Observe each frozen-config construction in the original retry loop.
+    ///
+    /// Every retry invokes `material_scope` separately, after admission and
+    /// shared-controller reconciliation. No scope spans an operation await.
+    #[cfg(feature = "test-control")]
+    #[doc(hidden)]
+    pub async fn run_handshake_observed<T, E, F, Fut, S>(
+        &self,
+        mut material_scope: S,
+        operation: F,
+    ) -> Result<TlsHandshakeOutcome<T>, TlsHandshakeRunError<E>>
+    where
+        F: FnMut(TlsClientHandshake) -> Fut,
+        Fut: std::future::Future<Output = Result<T, E>>,
+        S: FnMut(&mut dyn FnMut()),
+    {
+        self.run_handshake_using(
+            |config| config.begin_handshake_observed(&mut material_scope),
+            operation,
+        )
+        .await
     }
 
     /// Run TLS plus application negotiation with bounded epoch-change retries.
@@ -626,6 +686,14 @@ impl AuthenticatedServerConfig {
         provider: Arc<rustls::crypto::CryptoProvider>,
     ) -> Result<TlsServerHandshake, TlsMaterialError> {
         let snapshot = self.controller.snapshot()?;
+        self.handshake_from_snapshot(snapshot, provider)
+    }
+
+    fn handshake_from_snapshot(
+        &self,
+        snapshot: material::TlsMaterialSnapshot,
+        provider: Arc<rustls::crypto::CryptoProvider>,
+    ) -> Result<TlsServerHandshake, TlsMaterialError> {
         let config = fixed_server_config(
             &snapshot,
             self.policy.clone(),
@@ -638,6 +706,58 @@ impl AuthenticatedServerConfig {
             self.controller.clone(),
             snapshot,
         ))
+    }
+
+    /// Observe only synchronous construction of one frozen material config.
+    ///
+    /// Shared-controller reconciliation happens before this callback. The
+    /// callback must execute synchronously and release all guards on return.
+    /// The original construction runs exactly once even if the callback skips
+    /// or repeats its operation. The hook retains no additional material or
+    /// transport owner.
+    #[cfg(feature = "test-control")]
+    #[doc(hidden)]
+    pub fn begin_handshake_observed<S>(
+        &self,
+        mut scope: S,
+    ) -> Result<TlsServerHandshake, TlsMaterialError>
+    where
+        S: FnMut(&mut dyn FnMut()),
+    {
+        let snapshot = self.controller.snapshot()?;
+        let mut inputs = Some((snapshot, Arc::clone(self.config.crypto_provider())));
+        let mut result = None;
+        let mut construct = || {
+            if let Some((snapshot, provider)) = inputs.take() {
+                result = Some(self.handshake_from_snapshot(snapshot, provider));
+            }
+        };
+        scope(&mut construct);
+        construct();
+        result.unwrap_or(Err(TlsMaterialError::Configuration))
+    }
+
+    /// Observe each frozen-config construction in the original retry loop.
+    ///
+    /// Every retry invokes `material_scope` separately, after admission and
+    /// shared-controller reconciliation. No scope spans an operation await.
+    #[cfg(feature = "test-control")]
+    #[doc(hidden)]
+    pub async fn run_handshake_observed<T, E, F, Fut, S>(
+        &self,
+        mut material_scope: S,
+        operation: F,
+    ) -> Result<TlsHandshakeOutcome<T>, TlsHandshakeRunError<E>>
+    where
+        F: FnMut(TlsServerHandshake) -> Fut,
+        Fut: std::future::Future<Output = Result<T, E>>,
+        S: FnMut(&mut dyn FnMut()),
+    {
+        self.run_handshake_using(
+            |config| config.begin_handshake_observed(&mut material_scope),
+            operation,
+        )
+        .await
     }
 
     /// Run TLS plus application negotiation with bounded epoch-change retries.

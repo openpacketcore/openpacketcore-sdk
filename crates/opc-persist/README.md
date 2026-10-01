@@ -269,8 +269,11 @@ See [ADR 0002](../../docs/adr/0002-config-store-consensus-ha.md),
 - Config and session consensus share the fixed eight-slot proposal-admission
   profile. Config admission uses the operation's original deadline; after
   `client_write_ff` accepts a request, a detached supervisor owns its permit
-  until Openraft resolves that exact request. Cancellation or result timeout
-  cannot release the slot early. A caller recovering an unavailable explicit
+  until Openraft resolves that exact request. If the response channel closes,
+  the caller receives `OutcomeUnknown` promptly while the supervisor retains
+  proposal admission and any bounded preparation reservation until the final
+  native storage owner drains. Observing that drain does not keep storage alive.
+  Cancellation or result timeout cannot release the slot early. A caller recovering an unavailable explicit
   idempotent call must retry the same retained request ID; the state machine
   returns the original persisted outcome rather than applying the mutation
   twice.
