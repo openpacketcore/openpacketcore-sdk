@@ -1668,11 +1668,14 @@ impl SessionConsumerMutationError {
 #[derive(Clone, PartialEq, Eq, thiserror::Error)]
 #[non_exhaustive]
 pub enum SessionConsumerFencedTransitionMutationError {
-    /// No application-call byte was written, so the transition did not reach
-    /// the quorum and may be submitted on another admitted endpoint.
+    /// The transition did not reach the quorum and may be submitted on
+    /// another admitted endpoint: no application-call byte was written, or
+    /// the endpoint answered with a complete closed `Unavailable` rejection
+    /// before dispatch.
     #[error("consumer fenced transition was not transmitted: {cause}")]
     NotTransmitted {
-        /// Redaction-safe pre-write transport classification.
+        /// Redaction-safe classification of why the transition was not
+        /// dispatched.
         cause: SessionConsumerClientError,
     },
     /// The transition may have reached the quorum.  Do not automatically
@@ -5404,6 +5407,10 @@ impl PreparedFencedTransitionRoute {
 struct PreparedFencedTransitionWriteBoundary {
     write_progress: Arc<FrameWriteProgress>,
     may_have_sent: AtomicBool,
+    // A complete closed rejection proves that the written call was not
+    // dispatched. It does not clear the possible-send latch: the affine
+    // handle still never writes the mutation to a second voter.
+    rejected_before_dispatch: AtomicBool,
     latched: AtomicBool,
     route: Arc<PreparedFencedTransitionRoute>,
     voter_count: usize,
@@ -5418,6 +5425,7 @@ impl PreparedFencedTransitionWriteBoundary {
         Self {
             write_progress,
             may_have_sent: AtomicBool::new(false),
+            rejected_before_dispatch: AtomicBool::new(false),
             latched: AtomicBool::new(false),
             route,
             voter_count,
@@ -5426,6 +5434,14 @@ impl PreparedFencedTransitionWriteBoundary {
 
     fn mark_may_have_sent(&self) {
         self.may_have_sent.store(true, Ordering::Release);
+    }
+
+    fn mark_rejected_before_dispatch(&self) {
+        self.rejected_before_dispatch.store(true, Ordering::Release);
+    }
+
+    fn rejected_before_dispatch(&self) -> bool {
+        self.rejected_before_dispatch.load(Ordering::Acquire)
     }
 
     /// Record an actual physical attempt exactly once. This is deliberately
@@ -5770,6 +5786,15 @@ impl SessionBackend for ActivatedFencedTransitionBackend {
             // response was lost. A pending/zero-byte cancellation leaves the
             // boundary clear instead.
             write_boundary.mark_may_have_sent();
+        }
+        if matches!(
+            &response,
+            Ok(SessionConsumerResponse::Rejected(rejection))
+                if consumer_rejection_proves_not_dispatched(*rejection)
+        ) {
+            // The voter answered with a complete closed rejection, so the
+            // written call never reached the consensus state machine.
+            write_boundary.mark_rejected_before_dispatch();
         }
         let _ = write_boundary.latch_possible_send();
         prepared_fenced_transition_execute_response(&request, response)
@@ -17102,6 +17127,16 @@ impl PersistentPreparedFencedTransitionToken {
                     return Ok(outcome);
                 }
                 Ok(Err(FencedTransitionExecuteError::NotTransmitted)) => {
+                    if write_boundary.rejected_before_dispatch() {
+                        // The voter answered with a complete closed rejection:
+                        // the transition was written but never dispatched.
+                        // This handle has spent its one write, so it reports
+                        // the not-dispatched result without rotating.
+                        if let Some(preparation) = preparation.as_mut() {
+                            preparation.terminal();
+                        }
+                        return Err(FencedTransitionExecuteError::NotTransmitted);
+                    }
                     if write_boundary.latch_possible_send() {
                         preparation
                             .as_mut()
@@ -18206,6 +18241,18 @@ fn fenced_transition_response(
                 cause: SessionConsumerClientError::Protocol,
             },
         ),
+        // The endpoint refused admission before the transition reached the
+        // consensus state machine. Keep that proof distinguishable from a
+        // confirmed store rejection.
+        Ok(SessionConsumerResponse::Rejected(rejection))
+            if consumer_rejection_proves_not_dispatched(rejection) =>
+        {
+            Err(
+                SessionConsumerFencedTransitionMutationError::NotTransmitted {
+                    cause: consumer_rejection_into_client_error(rejection),
+                },
+            )
+        }
         Ok(SessionConsumerResponse::Rejected(rejection)) => {
             Err(SessionConsumerFencedTransitionMutationError::Store(
                 rejection_into_store_error(rejection),
@@ -21531,6 +21578,50 @@ mod tests {
             )),
             "scope loss is topology revocation rather than a rotatable pre-write failure"
         );
+    }
+
+    #[tokio::test]
+    async fn fenced_complete_unavailable_rejection_is_not_transmitted_and_others_stay_rejected() {
+        let request = authenticated_consumer_record_free_request(0x74, false).await;
+        let unavailable = || {
+            Ok(SessionConsumerResponse::Rejected(
+                SessionConsumerRejection::Unavailable,
+            ))
+        };
+        assert_eq!(
+            fenced_transition_response(&request, unavailable()),
+            Err(
+                SessionConsumerFencedTransitionMutationError::NotTransmitted {
+                    cause: SessionConsumerClientError::Unavailable,
+                }
+            ),
+            "a closed pre-dispatch rejection stays distinguishable from a store rejection"
+        );
+        assert_eq!(
+            consumer_execute_into_fenced_transition(
+                &request,
+                fenced_transition_response(&request, unavailable()),
+            ),
+            Err(FencedTransitionExecuteError::NotTransmitted),
+            "a single-voter fenced backend reports the not-dispatched result"
+        );
+        for rejection in [
+            SessionConsumerRejection::ScopeMismatch,
+            SessionConsumerRejection::TopologyMismatch,
+            SessionConsumerRejection::MalformedRequest,
+            SessionConsumerRejection::Unauthorized,
+        ] {
+            assert!(
+                matches!(
+                    fenced_transition_response(
+                        &request,
+                        Ok(SessionConsumerResponse::Rejected(rejection)),
+                    ),
+                    Err(SessionConsumerFencedTransitionMutationError::Store(_))
+                ),
+                "authority and validation rejections stay confirmed rejections"
+            );
+        }
     }
 
     #[tokio::test(start_paused = true)]
