@@ -144,6 +144,8 @@ jobs:
           grep -Fq 'OPC_GTPU_OFF_SLOT_GENERATION_GUARD_PROVEN' "${datapath_log}"
           grep -Fq 'OPC_GTPU_WRONG_CURRENT_GRAPH_GUARD_PROVEN' "${datapath_log}"
           grep -Fq 'OPC_GTPU_TFT_IPV4_LIVE_PROVEN' "${datapath_log}"
+          grep -Fq 'OPC_GTPU_TFT_REMOVAL_FENCE_DEFAULT_PROVEN:' "${datapath_log}"
+          grep -Fq 'OPC_GTPU_TFT_REMOVAL_CONTINUITY_PROVEN:' "${datapath_log}"
           grep -Fq 'OPC_GTPU_REQUIRED_EXTENSION_CONTROL_PROVEN:' "${datapath_log}"
           grep -Fq 'OPC_GTPU_UNKNOWN_TEID_CONTROL_PROVEN:' "${datapath_log}"
           grep -Fq 'OPC_GTPU_BACKEND_CONTROL_LIFETIME_PROVEN:' "${datapath_log}"
@@ -403,7 +405,7 @@ jobs:
 
           if ! live_output="$(
             ssh "${ssh_options[@]}" opc@127.0.0.1 \
-              'sudo env OPC_GTPU_RUN_PRIVILEGED=1 unshare -n -- bash -euo pipefail -c "ip link set lo up && /tmp/opc-gtpu-linux68-datapath --ignored --nocapture --test-threads=1 ebpf_gtpu_shared_paa_tft_classifier_ipv4_live_contract ebpf_gtpu_n3_fixed_flow_live_contract ebpf_gtpu_n3_end_marker_retirement_ordering ebpf_gtpu_ordinary_inner_ipv6_live_contract"' \
+              'sudo env OPC_GTPU_RUN_PRIVILEGED=1 unshare -n -- bash -euo pipefail -c "ip link set lo up && /tmp/opc-gtpu-linux68-datapath --ignored --nocapture --test-threads=1 ebpf_gtpu_shared_paa_tft_classifier_ipv4_live_contract ebpf_gtpu_tft_classifier_removal_fence_forwards_default_uplink ebpf_gtpu_tft_classifier_removal_keeps_default_uplink_continuous ebpf_gtpu_n3_fixed_flow_live_contract ebpf_gtpu_n3_end_marker_retirement_ordering ebpf_gtpu_ordinary_inner_ipv6_live_contract"' \
               2>&1
           )"; then
             printf '%s\n' "${live_output}"
@@ -414,10 +416,12 @@ jobs:
             echo '::error::Linux 6.8 TFT live proof skipped instead of running'
             exit 1
           fi
-          grep -Fq 'test result: ok. 4 passed; 0 failed;' <<< "${live_output}"
+          grep -Fq 'test result: ok. 6 passed; 0 failed;' <<< "${live_output}"
           grep -Fq 'OPC_GTPU_N3_FIXED_FLOW_PROVEN:' <<< "${live_output}"
           grep -Fq 'OPC_GTPU_N3_END_MARKER_PROVEN:' <<< "${live_output}"
           grep -Fq 'OPC_GTPU_TFT_IPV4_LIVE_PROVEN' <<< "${live_output}"
+          grep -Fq 'OPC_GTPU_TFT_REMOVAL_FENCE_DEFAULT_PROVEN:' <<< "${live_output}"
+          grep -Fq 'OPC_GTPU_TFT_REMOVAL_CONTINUITY_PROVEN:' <<< "${live_output}"
           grep -Fq 'OPC_GTPU_ORDINARY_INNER_IPV6_PROVEN' <<< "${live_output}"
 
   el9-514-classifier-load:
@@ -799,6 +803,8 @@ jobs:
           grep -Fq 'OPC_GTPU_OFF_SLOT_GENERATION_GUARD_PROVEN' "${datapath_log}"
           grep -Fq 'OPC_GTPU_WRONG_CURRENT_GRAPH_GUARD_PROVEN' "${datapath_log}"
           grep -Fq 'OPC_GTPU_TFT_IPV4_LIVE_PROVEN' "${datapath_log}"
+          grep -Fq 'OPC_GTPU_TFT_REMOVAL_FENCE_DEFAULT_PROVEN:' "${datapath_log}"
+          grep -Fq 'OPC_GTPU_TFT_REMOVAL_CONTINUITY_PROVEN:' "${datapath_log}"
           grep -Fq 'OPC_GTPU_REQUIRED_EXTENSION_CONTROL_PROVEN:' "${datapath_log}"
           grep -Fq 'OPC_GTPU_UNKNOWN_TEID_CONTROL_PROVEN:' "${datapath_log}"
           grep -Fq 'OPC_GTPU_BACKEND_CONTROL_LIFETIME_PROVEN:' "${datapath_log}"

@@ -16,6 +16,7 @@ use opc_consensus::{
     ConsensusIdentity, ConsensusNodeId, ConsensusRequestId, ConsensusRpcFamily,
     ConsensusWireRequest,
 };
+use std::borrow::Borrow;
 use std::collections::BTreeMap;
 use std::future::Future;
 use std::mem::size_of;
@@ -557,8 +558,8 @@ impl Inventory {
     }
 }
 
-pub(crate) struct OriginalAppend {
-    request: Option<AppendEntriesRequest<ConfigRaftTypeConfig>>,
+pub(crate) struct OriginalAppend<R> {
+    request: Option<R>,
     observation: Option<ObservedAppend>,
     #[cfg(test)]
     sources: Vec<Arc<Source>>,
@@ -569,12 +570,12 @@ struct ObservedAppend {
     generation: u64,
 }
 
-impl OriginalAppend {
+impl<R: Borrow<AppendEntriesRequest<ConfigRaftTypeConfig>>> OriginalAppend<R> {
     pub(crate) fn start(
         identity: ConsensusIdentity,
         source: ConsensusNodeId,
         target: ConsensusNodeId,
-        request: AppendEntriesRequest<ConfigRaftTypeConfig>,
+        request: R,
     ) -> Self {
         let registry = lock(&SOURCES);
         let matches: Vec<_> = registry
@@ -583,7 +584,7 @@ impl OriginalAppend {
             .filter(|value| value.identity == identity && value.source == source)
             .collect();
         let observation = if matches.len() == 1 {
-            ObservedAppend::start(matches[0].clone(), target, &request)
+            ObservedAppend::start(matches[0].clone(), target, request.borrow())
         } else {
             for value in &matches {
                 lock(&value.census.state).issues.ambiguous_source = true;
@@ -602,6 +603,7 @@ impl OriginalAppend {
         self.request
             .as_ref()
             .expect("original owner has not dropped")
+            .borrow()
     }
 
     pub(crate) fn wire(&self, payload: &Vec<u8>) -> Option<OriginalWire> {
@@ -739,7 +741,7 @@ impl ObservedAppend {
     }
 }
 
-impl Drop for OriginalAppend {
+impl<R> Drop for OriginalAppend<R> {
     fn drop(&mut self) {
         if let Some(observation) = &self.observation {
             let mut state = lock(&observation.shared.census.state);

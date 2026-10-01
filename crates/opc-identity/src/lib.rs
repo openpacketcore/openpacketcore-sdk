@@ -25,7 +25,7 @@ pub const MAX_SPIFFE_ID_URI_LEN: usize = 2_048;
 
 pub mod file_svid;
 pub mod projected_svid;
-pub use file_svid::FileSvidSource;
+pub use file_svid::{FileSvidShutdownError, FileSvidSource};
 pub use projected_svid::{
     ProjectedSvidAuthoritativeError, ProjectedSvidAvailability, ProjectedSvidConfigError,
     ProjectedSvidControllerClaimError, ProjectedSvidControllerInput, ProjectedSvidReloadReason,
@@ -453,11 +453,21 @@ pub(crate) fn spawn_expiry_monitor(
     state_tx: watch::Sender<Option<IdentityState>>,
     event_tx: broadcast::Sender<IdentityReloadEvent>,
 ) -> tokio::task::JoinHandle<()> {
+    spawn_expiry_monitor_until(state_tx, event_tx, std::future::pending())
+}
+
+pub(crate) fn spawn_expiry_monitor_until(
+    state_tx: watch::Sender<Option<IdentityState>>,
+    event_tx: broadcast::Sender<IdentityReloadEvent>,
+    stop: impl std::future::Future<Output = ()> + Send + 'static,
+) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
+        tokio::pin!(stop);
         let mut state_rx = state_tx.subscribe();
         loop {
             let sleep_for = expiry_monitor_sleep_duration(state_rx.borrow().as_ref());
             tokio::select! {
+                () = &mut stop => break,
                 changed = state_rx.changed() => {
                     if changed.is_err() {
                         break;

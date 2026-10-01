@@ -30,6 +30,9 @@ use crate::{AuditKey, ConfigConsensusTopology, SqliteBackend};
 #[cfg(unix)]
 use std::os::unix::fs::OpenOptionsExt;
 
+mod operation;
+pub use operation::{RetainedConfigOpen, RetainedConfigOpenRetirement};
+
 const RECORD_MAGIC: &[u8; 8] = b"OPCRET01";
 const RECORD_DOMAIN: &[u8] = b"openpacketcore/config-retained-admission/v1\0";
 const BINDING_DOMAIN: &[u8] = b"openpacketcore/config-retained-scope/v1\0";
@@ -230,6 +233,8 @@ struct AdmissionWork {
     hook: Option<AdmissionTestHook>,
     #[cfg(test)]
     lock_hook: Option<AdmissionLockTestHook>,
+    #[cfg(test)]
+    completion_hook: Option<AdmissionCompletionTestHook>,
 }
 
 #[cfg(test)]
@@ -237,6 +242,9 @@ type AdmissionTestHook = Arc<dyn Fn(&AdmissionWork, &str) + Send + Sync>;
 
 #[cfg(test)]
 type AdmissionLockTestHook = Arc<dyn Fn(&File) + Send + Sync>;
+
+#[cfg(test)]
+type AdmissionCompletionTestHook = Arc<dyn Fn(&SqliteBackend) + Send + Sync>;
 
 impl AdmissionWork {
     #[cfg(test)]
@@ -322,9 +330,15 @@ async fn open_authority(
     audit_key: AuditKey,
     intent: OpenIntent,
 ) -> Result<SqliteBackend, RetainedConfigError> {
-    let admission_slot = ADMISSION_GATE
-        .try_acquire()
-        .map_err(|_| RetainedConfigError::AdmissionBound)?;
+    let mut operation = begin_open_authority(options, audit_key, intent)?;
+    operation.wait().await
+}
+
+fn begin_open_authority(
+    options: RetainedConfigOptions,
+    audit_key: AuditKey,
+    intent: OpenIntent,
+) -> Result<RetainedConfigOpen, RetainedConfigError> {
     let work = Arc::new(AdmissionWork {
         cancelled: AtomicBool::new(false),
         mutated: AtomicBool::new(false),
@@ -335,28 +349,10 @@ async fn open_authority(
         hook: None,
         #[cfg(test)]
         lock_hook: None,
+        #[cfg(test)]
+        completion_hook: None,
     });
-    let _cancellation = CancelOnDrop(Arc::clone(&work));
-    let worker_work = Arc::clone(&work);
-    let timeout = options.operation_timeout;
-    let mut worker = tokio::task::spawn_blocking(move || {
-        let _admission_slot = admission_slot;
-        let result = open_authority_sync(options, audit_key, intent, &worker_work);
-        result.map_err(|error| {
-            if worker_work.mutated.load(Ordering::Acquire) {
-                RetainedConfigError::Indeterminate
-            } else {
-                error
-            }
-        })
-    });
-    match tokio::time::timeout(timeout, &mut worker).await {
-        Ok(Ok(result)) => result,
-        Ok(Err(_)) | Err(_) => {
-            work.cancelled.store(true, Ordering::Release);
-            Err(RetainedConfigError::Indeterminate)
-        }
-    }
+    RetainedConfigOpen::start(options, audit_key, intent, work)
 }
 
 #[cfg(not(unix))]

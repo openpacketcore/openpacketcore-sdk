@@ -1435,6 +1435,19 @@ pub(crate) trait EbpfGtpuRuntime: Send + Sync + fmt::Debug {
             feature: "grouped_selector_quiescence",
         })
     }
+    /// Complete the qualified kernel grace boundary for the non-sleepable TC
+    /// readers of the TFT classifier. No map, hook or packet-source mutation
+    /// is allowed.
+    fn synchronize_tft_readers(&self) -> Result<(), GtpuError> {
+        Err(GtpuError::UnsupportedFeature {
+            feature: "tft_classifier_reader_grace",
+        })
+    }
+    /// Return whether [`Self::synchronize_tft_readers`] is available on this
+    /// kernel. Exact TFT classifier removal requires it.
+    fn tft_reader_grace_available(&self) -> bool {
+        false
+    }
     /// Reconcile one exclusively owned workload graph to absence.
     fn reset_workload_graph(
         &self,
@@ -5403,6 +5416,19 @@ impl EbpfGtpuDataplaneBackend {
                 Ok(observed) => observed,
                 Err(_) => return Ok(TftUplinkClassifierReconcileOutcome::Indeterminate),
             };
+            // A classifier published without the reader grace could never be
+            // removed exactly, so no mutation is admitted without it.
+            let mutates = match &observed {
+                TftClassifierObservation::Present(value) => {
+                    Self::tft_observation_owned_by(value, authority) && value.classifier != desired
+                }
+                TftClassifierObservation::Absent | TftClassifierObservation::Indeterminate => true,
+            };
+            if mutates && !self.inner.runtime.tft_reader_grace_available() {
+                return Err(GtpuError::UnsupportedFeature {
+                    feature: "tft_classifier_reader_grace",
+                });
+            }
             let (previous, replacement) = match &observed {
                 TftClassifierObservation::Absent => (None, false),
                 TftClassifierObservation::Present(value) => {
@@ -5650,6 +5676,18 @@ impl EbpfGtpuDataplaneBackend {
         authority: EbpfTftAuthority,
         key: TftClassifierKey,
     ) -> TftUplinkClassifierRemovalOutcome {
+        // A TC invocation that copied the active selector before the fence
+        // may still read its rows; one that copies the fence reads none. Wait
+        // out the former once, before this attempt deletes any row, even when
+        // an earlier attempt published the fence. Without a completed wait no
+        // row is deleted: the fence and every row stay for a retry.
+        let mut reader_grace_done = false;
+        let mut await_reader_grace = || {
+            reader_grace_done || {
+                reader_grace_done = self.inner.runtime.synchronize_tft_readers().is_ok();
+                reader_grace_done
+            }
+        };
         loop {
             let Some((raw_fence, records)) =
                 self.stable_tft_removal_fence_locked(expected, authority, key)
@@ -5672,6 +5710,9 @@ impl EbpfGtpuDataplaneBackend {
                 .collect::<Vec<_>>();
 
             if !authorized_active_keys.is_empty() {
+                if !await_reader_grace() {
+                    return TftUplinkClassifierRemovalOutcome::Indeterminate;
+                }
                 for record_key in authorized_active_keys {
                     if !matches!(
                         self.inner
@@ -5722,6 +5763,9 @@ impl EbpfGtpuDataplaneBackend {
             // Every active rank has been durably authorized and proved absent.
             // Any remaining records belong to the inactive bank and may be
             // cleaned idempotently under the same exact owner authority.
+            if !records.is_empty() && !await_reader_grace() {
+                return TftUplinkClassifierRemovalOutcome::Indeterminate;
+            }
             for (record_key, _) in records {
                 if !matches!(
                     self.inner
@@ -5790,6 +5834,15 @@ impl EbpfGtpuDataplaneBackend {
                 }
                 TftClassifierObservation::Indeterminate => {
                     return Ok(self.finish_tft_removal_fence_locked(&expected, authority, key));
+                }
+                // Without the reader grace a fence could never be finished, so
+                // the complete classifier stays published and forwarding.
+                TftClassifierObservation::Present(_)
+                    if !self.inner.runtime.tft_reader_grace_available() =>
+                {
+                    return Err(GtpuError::UnsupportedFeature {
+                        feature: "tft_classifier_reader_grace",
+                    });
                 }
                 TftClassifierObservation::Present(value) => value,
             };
@@ -14840,6 +14893,12 @@ impl GtpuDataplaneBackend for EbpfGtpuDataplaneBackend {
         }
         if !environment.net_admin_capable || !environment.bpf_capable {
             return GtpuCapability::PermissionDenied;
+        }
+        // Exact removal waits for in-flight TC readers before deleting any
+        // row; without that grace an installed classifier could not be
+        // removed, so classification is not offered.
+        if !self.inner.runtime.tft_reader_grace_available() {
+            return GtpuCapability::Missing;
         }
         let devices = match self.devices() {
             Ok(devices) if !devices.is_empty() => devices
@@ -39463,6 +39522,18 @@ mod aya_runtime {
                 .map_err(|_| state_indeterminate("ebpf_selector_global_grace"))
         }
 
+        fn synchronize_tft_readers(&self) -> Result<(), GtpuError> {
+            // TFT classifier readers are non-sleepable TC read-side sections,
+            // so the same qualified GLOBAL grace covers them.
+            self.synchronize_grouped_readers()
+        }
+
+        fn tft_reader_grace_available(&self) -> bool {
+            use rustix::thread::{membarrier_query, MembarrierQuery};
+            grouped_reader_grace_kernel_profile(rustix::system::uname().version().to_bytes())
+                && membarrier_query().contains(MembarrierQuery::GLOBAL)
+        }
+
         fn reset_workload_graph(
             &self,
             ifindex: Option<u32>,
@@ -55112,6 +55183,7 @@ mod tests {
         grouped_reader_grace_enabled: bool,
         grouped_reader_grace_calls: usize,
         grouped_reader_grace_fault: bool,
+        tft_reader_grace_unavailable: bool,
         grouped_reader_grace_corrupt_group: Option<[u8; 16]>,
         grouped_reader_grace_replace_path: bool,
         attached: HashMap<u32, FakeAttachment>,
@@ -57725,6 +57797,21 @@ mod tests {
                     .store(true, Ordering::Release);
             }
             Ok(())
+        }
+
+        fn synchronize_tft_readers(&self) -> Result<(), GtpuError> {
+            let mut state = self.state();
+            state.operations.push("tft_reader_grace");
+            if state.tft_reader_grace_unavailable {
+                return Err(GtpuError::UnsupportedFeature {
+                    feature: "tft_classifier_reader_grace",
+                });
+            }
+            Self::fail_if_requested(&mut state, "tft_reader_grace")
+        }
+
+        fn tft_reader_grace_available(&self) -> bool {
+            !self.state().tft_reader_grace_unavailable
         }
 
         fn ifindex_by_name(&self, name: &str) -> Result<u32, GtpuError> {
@@ -65488,6 +65575,250 @@ mod tests {
                 .unwrap(),
             TftUplinkClassifierReadback::Absent
         );
+    }
+
+    /// A TC invocation that copied the active selector before the fence may
+    /// still read its rows, so every attempt waits out such readers after the
+    /// fence is published and before it deletes a row.
+    #[tokio::test]
+    async fn tft_classifier_removal_waits_for_pre_fence_readers_before_deleting_rows() {
+        let (backend, runtime) = backend_with_fake();
+        backend.create_device(create_request()).await.unwrap();
+        let classifier = tft_classifier_with_two_filters();
+        assert_eq!(
+            backend
+                .reconcile_tft_uplink_classifier(classifier.clone())
+                .await
+                .unwrap(),
+            TftUplinkClassifierReconcileOutcome::Installed
+        );
+        runtime.state().operations.clear();
+        assert_eq!(
+            backend
+                .remove_tft_uplink_classifier_exact(classifier.clone())
+                .await
+                .unwrap(),
+            TftUplinkClassifierRemovalOutcome::Removed
+        );
+        let operations = runtime.state().operations.clone();
+        let position = |operation| {
+            operations
+                .iter()
+                .position(|recorded| *recorded == operation)
+                .unwrap_or_else(|| panic!("{operation} is recorded"))
+        };
+        assert_eq!(
+            operations
+                .iter()
+                .filter(|recorded| **recorded == "tft_reader_grace")
+                .count(),
+            1,
+            "one wait per attempt"
+        );
+        assert!(position("tft_meta_put") < position("tft_reader_grace"));
+        assert!(position("tft_reader_grace") < position("tft_filter_remove"));
+        assert_eq!(
+            backend
+                .read_tft_uplink_classifier(classifier.link_ifindex(), classifier.paa())
+                .await
+                .unwrap(),
+            TftUplinkClassifierReadback::Absent
+        );
+    }
+
+    /// Without the reader grace a removal fence could never be finished, so
+    /// classification is not offered, and removal leaves the complete
+    /// classifier published without any mutation.
+    #[tokio::test]
+    async fn tft_classifier_removal_without_reader_grace_is_refused_untouched() {
+        let (backend, runtime) = backend_with_fake();
+        backend.create_device(create_request()).await.unwrap();
+        let classifier = tft_classifier_with_two_filters();
+        assert_eq!(
+            backend
+                .reconcile_tft_uplink_classifier(classifier.clone())
+                .await
+                .unwrap(),
+            TftUplinkClassifierReconcileOutcome::Installed
+        );
+        runtime.state().tft_reader_grace_unavailable = true;
+        assert_eq!(
+            backend.tft_uplink_classification_capability(),
+            GtpuCapability::Missing
+        );
+        let (meta, rows) = {
+            let mut state = runtime.state();
+            state.operations.clear();
+            (state.tft_meta.clone(), state.tft_filters.clone())
+        };
+        assert!(matches!(
+            backend
+                .remove_tft_uplink_classifier_exact(classifier.clone())
+                .await,
+            Err(GtpuError::UnsupportedFeature {
+                feature: "tft_classifier_reader_grace"
+            })
+        ));
+        {
+            let state = runtime.state();
+            assert_eq!(state.tft_meta, meta);
+            assert_eq!(state.tft_filters, rows);
+            assert!(!state.operations.contains(&"tft_meta_put"));
+            assert!(!state.operations.contains(&"tft_filter_remove"));
+        }
+        assert_eq!(
+            backend
+                .read_tft_uplink_classifier(classifier.link_ifindex(), classifier.paa())
+                .await
+                .unwrap(),
+            TftUplinkClassifierReadback::Present(classifier.clone())
+        );
+
+        runtime.state().tft_reader_grace_unavailable = false;
+        assert_eq!(
+            backend.tft_uplink_classification_capability(),
+            GtpuCapability::Available
+        );
+        assert_eq!(
+            backend
+                .remove_tft_uplink_classifier_exact(classifier)
+                .await
+                .unwrap(),
+            TftUplinkClassifierRemovalOutcome::Removed
+        );
+    }
+
+    /// Without the reader grace a classifier could never be removed exactly,
+    /// so reconciliation admits no install or replacement and changes no map,
+    /// while an exact present classifier still reports `AlreadyPresent`.
+    #[tokio::test]
+    async fn tft_classifier_reconcile_without_reader_grace_is_refused_untouched() {
+        let (backend, runtime) = backend_with_fake();
+        backend.create_device(create_request()).await.unwrap();
+        let classifier = tft_classifier_with_two_filters();
+        runtime.state().tft_reader_grace_unavailable = true;
+        runtime.state().operations.clear();
+        assert!(matches!(
+            backend
+                .reconcile_tft_uplink_classifier(classifier.clone())
+                .await,
+            Err(GtpuError::UnsupportedFeature {
+                feature: "tft_classifier_reader_grace"
+            })
+        ));
+        {
+            let state = runtime.state();
+            assert!(state.tft_meta.is_empty());
+            assert!(state.tft_filters.is_empty());
+            assert!(!state.operations.contains(&"tft_filter_put"));
+            assert!(!state.operations.contains(&"tft_meta_put"));
+        }
+
+        runtime.state().tft_reader_grace_unavailable = false;
+        assert_eq!(
+            backend
+                .reconcile_tft_uplink_classifier(classifier.clone())
+                .await
+                .unwrap(),
+            TftUplinkClassifierReconcileOutcome::Installed
+        );
+        runtime.state().tft_reader_grace_unavailable = true;
+        let (meta, rows) = {
+            let mut state = runtime.state();
+            state.operations.clear();
+            (state.tft_meta.clone(), state.tft_filters.clone())
+        };
+        assert!(matches!(
+            backend
+                .reconcile_tft_uplink_classifier(tft_classifier(0x41, 7, 6))
+                .await,
+            Err(GtpuError::UnsupportedFeature {
+                feature: "tft_classifier_reader_grace"
+            })
+        ));
+        assert_eq!(
+            backend
+                .reconcile_tft_uplink_classifier(classifier.clone())
+                .await
+                .unwrap(),
+            TftUplinkClassifierReconcileOutcome::AlreadyPresent
+        );
+        {
+            let state = runtime.state();
+            assert_eq!(state.tft_meta, meta);
+            assert_eq!(state.tft_filters, rows);
+            assert!(!state.operations.contains(&"tft_filter_put"));
+            assert!(!state.operations.contains(&"tft_meta_put"));
+        }
+        assert_eq!(
+            backend
+                .read_tft_uplink_classifier(classifier.link_ifindex(), classifier.paa())
+                .await
+                .unwrap(),
+            TftUplinkClassifierReadback::Present(classifier)
+        );
+    }
+
+    /// A failed reader wait leaves the published fence and every row. A
+    /// fence retried without the grace still deletes nothing, and a retry
+    /// with it waits again before its first deletion.
+    #[tokio::test]
+    async fn tft_classifier_removal_retries_a_failed_reader_wait_untouched() {
+        let (backend, runtime) = backend_with_fake();
+        backend.create_device(create_request()).await.unwrap();
+        let classifier = tft_classifier_with_two_filters();
+        assert_eq!(
+            backend
+                .reconcile_tft_uplink_classifier(classifier.clone())
+                .await
+                .unwrap(),
+            TftUplinkClassifierReconcileOutcome::Installed
+        );
+        let rows = runtime.state().tft_filters.clone();
+        runtime.fail_in_order(["tft_reader_grace"]);
+        assert_eq!(
+            backend
+                .remove_tft_uplink_classifier_exact(classifier.clone())
+                .await
+                .unwrap(),
+            TftUplinkClassifierRemovalOutcome::Indeterminate
+        );
+        assert_eq!(runtime.state().tft_filters, rows);
+        assert!(!runtime.state().operations.contains(&"tft_filter_remove"));
+
+        runtime.state().tft_reader_grace_unavailable = true;
+        assert_eq!(
+            backend
+                .remove_tft_uplink_classifier_exact(classifier.clone())
+                .await
+                .unwrap(),
+            TftUplinkClassifierRemovalOutcome::Indeterminate
+        );
+        assert_eq!(runtime.state().tft_filters, rows);
+        assert!(!runtime.state().operations.contains(&"tft_filter_remove"));
+
+        {
+            let mut state = runtime.state();
+            state.tft_reader_grace_unavailable = false;
+            state.operations.clear();
+        }
+        assert_eq!(
+            backend
+                .remove_tft_uplink_classifier_exact(classifier.clone())
+                .await
+                .unwrap(),
+            TftUplinkClassifierRemovalOutcome::Removed
+        );
+        let operations = runtime.state().operations.clone();
+        let grace = operations
+            .iter()
+            .position(|recorded| *recorded == "tft_reader_grace")
+            .expect("the retry waits for readers");
+        let first_delete = operations
+            .iter()
+            .position(|recorded| *recorded == "tft_filter_remove")
+            .expect("the retry deletes rows");
+        assert!(grace < first_delete);
     }
 
     #[tokio::test]

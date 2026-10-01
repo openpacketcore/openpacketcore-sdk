@@ -1376,7 +1376,9 @@ unsafe extern "C" fn classify_tft_filter_step(index: u64, context: *mut c_void) 
 /// reader observes either bank and constructs every lookup key from that
 /// metadata's owner, generations, bank, and dense precedence rank. The old
 /// bank remains intact until a later pre-publication staging pass, so readers
-/// never race post-publication record cleanup.
+/// never race post-publication record cleanup. A removal fence whose
+/// classifier has a default bearer classifies as absent, the state its
+/// removal publishes last; any other fence drops.
 #[inline(never)]
 fn classify_owned_tft_uplink(ctx: &TcContext) -> TftClassifierUplinkResult {
     let Ok(local_address) = ctx.load::<[u8; 4]>(ETH_HDR_LEN + 12) else {
@@ -1396,7 +1398,17 @@ fn classify_owned_tft_uplink(ctx: &TcContext) -> TftClassifierUplinkResult {
     // the all-byte ABI has alignment one and userspace publishes whole values.
     let meta = unsafe { *meta_ptr };
     // SAFETY: the single-slot marker is read-only for this invocation.
-    if !tft_classifier_schema_is_current(unsafe { &*schema_ptr }) || !meta.is_valid() {
+    if !tft_classifier_schema_is_current(unsafe { &*schema_ptr }) {
+        count_tft_classifier_drop(COUNTER_TFT_CLASSIFIER_INVALID_STATE);
+        return TftClassifierUplinkResult::Drop;
+    }
+    // Exact removal deletes rows only under a durable fence. A fence with a
+    // default bearer forwards as its absent successor does, on mark zero,
+    // without reading a row the removal may already have deleted.
+    if meta.has_default() && meta.is_valid_removal_fence() {
+        return TftClassifierUplinkResult::Absent;
+    }
+    if !meta.is_valid() {
         count_tft_classifier_drop(COUNTER_TFT_CLASSIFIER_INVALID_STATE);
         return TftClassifierUplinkResult::Drop;
     }
@@ -6035,6 +6047,41 @@ mod tests {
             .expect("post-loop selected mark lookup is present");
         assert!(loop_call < selected_mark);
         assert!(classifier.contains("u32::from(meta.filter_count())"));
+    }
+
+    #[test]
+    fn default_removal_fence_classifies_as_absent_before_any_row_is_read() {
+        // The host test cannot run tc; the privileged
+        // `ebpf_gtpu_tft_classifier_removal_*` proofs do. Retain the order
+        // they depend on: the schema is checked first, and a default fence
+        // returns before the active-selector check, the packet parse, and
+        // the row loop.
+        let source = include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/src/main.rs"));
+        let (_, classifier) = source
+            .split_once("fn classify_owned_tft_uplink(ctx: &TcContext)")
+            .expect("owned TFT classifier is present");
+        let schema = classifier
+            .find("if !tft_classifier_schema_is_current(")
+            .expect("schema check is present");
+        let fence = classifier
+            .find(
+                "if meta.has_default() && meta.is_valid_removal_fence() {\n        \
+                 return TftClassifierUplinkResult::Absent;",
+            )
+            .expect("a default removal fence classifies as absent");
+        let selector = classifier
+            .find("if !meta.is_valid() {")
+            .expect("active-selector check is present");
+        let parse = classifier
+            .find("parse_owned_tft_ipv4(ctx, local_address)")
+            .expect("packet parse is present");
+        let loop_call = classifier
+            .find("bpf_loop(")
+            .expect("bounded TFT loop is present");
+        assert!(schema < fence);
+        assert!(fence < selector);
+        assert!(selector < parse);
+        assert!(parse < loop_call);
     }
 
     #[test]
