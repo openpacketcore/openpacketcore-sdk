@@ -2853,14 +2853,19 @@ enum ChildStderrDiagnostic {
         stage: &'static str,
         error_class: &'static str,
     },
+    ActivationRejected {
+        stage: &'static str,
+        error_class: &'static str,
+        boundary: &'static str,
+        deadline_elapsed: bool,
+    },
     Redacted,
 }
 
-fn child_initialization_diagnostic(line: &[u8]) -> Option<ChildStderrDiagnostic> {
-    let (stage, error_class) = std::str::from_utf8(line)
-        .ok()?
-        .strip_prefix("qualification initialization rejected: stage=")?
-        .split_once(" class=")?;
+fn initialization_stage_class(
+    stage: &str,
+    error_class: &str,
+) -> Option<(&'static str, &'static str)> {
     let stage = match stage {
         "cluster" => "cluster",
         "fenced_transition" => "fenced_transition",
@@ -2883,7 +2888,119 @@ fn child_initialization_diagnostic(line: &[u8]) -> Option<ChildStderrDiagnostic>
         (_, "Other") => "Other",
         _ => return None,
     };
+    Some((stage, error_class))
+}
+
+fn child_initialization_diagnostic(line: &[u8]) -> Option<ChildStderrDiagnostic> {
+    let line = std::str::from_utf8(line).ok()?;
+    if let Some(details) = line.strip_prefix("qualification activation rejected: stage=") {
+        let (stage, details) = details.split_once(" class=")?;
+        let (error_class, details) = details.split_once(" boundary=")?;
+        let (boundary, deadline_elapsed) = details.split_once(" deadline_elapsed=")?;
+        let (stage, error_class) = initialization_stage_class(stage, error_class)?;
+        if stage == "cluster" {
+            return None;
+        }
+        let boundary = match boundary {
+            "initial_authority" => "initial_authority",
+            "initial_scope" => "initial_scope",
+            "leader_discovery" => "leader_discovery",
+            "pre_transmit_authority" => "pre_transmit_authority",
+            "after_transmission" => "after_transmission",
+            "authenticated_rejection" => "authenticated_rejection",
+            "route_refresh" => "route_refresh",
+            "local_leader_rejected" => "local_leader_rejected",
+            "remote_leader_rejected" => "remote_leader_rejected",
+            "applied_index" => "applied_index",
+            "post_apply_authority" => "post_apply_authority",
+            "post_apply_scope" => "post_apply_scope",
+            "certificate_backend" => "certificate_backend",
+            "certificate_mismatch" => "certificate_mismatch",
+            "outcome_unknown" => "outcome_unknown",
+            "unexpected_reply" => "unexpected_reply",
+            _ => return None,
+        };
+        let deadline_elapsed = match deadline_elapsed {
+            "true" => true,
+            "false" => false,
+            _ => return None,
+        };
+        return Some(ChildStderrDiagnostic::ActivationRejected {
+            stage,
+            error_class,
+            boundary,
+            deadline_elapsed,
+        });
+    }
+    let (stage, error_class) = line
+        .strip_prefix("qualification initialization rejected: stage=")?
+        .split_once(" class=")?;
+    let (stage, error_class) = initialization_stage_class(stage, error_class)?;
     Some(ChildStderrDiagnostic::InitializationRejected { stage, error_class })
+}
+
+#[derive(Clone, Copy, Debug)]
+struct InitializationStderrBoundary {
+    device: u64,
+    inode: u64,
+    bytes: u64,
+}
+
+impl InitializationStderrBoundary {
+    fn capture(path: &Path) -> Option<Self> {
+        let metadata = File::open(path).ok()?.metadata().ok()?;
+        Some(Self {
+            device: metadata.dev(),
+            inode: metadata.ino(),
+            bytes: metadata.len(),
+        })
+    }
+
+    fn classify(self, path: &Path) -> ChildStderrDiagnostic {
+        const MAX_BYTES: u64 = 8 * 1024;
+        let Ok(mut file) = File::open(path) else {
+            return ChildStderrDiagnostic::Unavailable;
+        };
+        let Ok(metadata) = file.metadata() else {
+            return ChildStderrDiagnostic::Unavailable;
+        };
+        if metadata.dev() != self.device || metadata.ino() != self.inode {
+            return ChildStderrDiagnostic::Unavailable;
+        }
+        let Some(length) = metadata.len().checked_sub(self.bytes) else {
+            return ChildStderrDiagnostic::Unavailable;
+        };
+        if length > MAX_BYTES {
+            return ChildStderrDiagnostic::Redacted;
+        }
+        let mut starts_at_line = self.bytes == 0;
+        if self.bytes != 0 {
+            let mut previous = [0];
+            if file.seek(SeekFrom::Start(self.bytes - 1)).is_err()
+                || file.read_exact(&mut previous).is_err()
+            {
+                return ChildStderrDiagnostic::Unavailable;
+            }
+            starts_at_line = previous == [b'\n'];
+        }
+        let mut bytes = Vec::with_capacity(length as usize);
+        if file.take(length).read_to_end(&mut bytes).is_err() || bytes.len() as u64 != length {
+            return ChildStderrDiagnostic::Unavailable;
+        }
+        if bytes.iter().all(u8::is_ascii_whitespace) {
+            return ChildStderrDiagnostic::Empty;
+        }
+        // Only complete lines appended after this exact Initialize send are
+        // eligible. A partial historical line or partial final write cannot
+        // supply the current invocation's evidence.
+        bytes
+            .split_inclusive(|byte| *byte == b'\n')
+            .skip(usize::from(!starts_at_line))
+            .filter_map(|line| line.strip_suffix(b"\n"))
+            .filter_map(child_initialization_diagnostic)
+            .last()
+            .unwrap_or(ChildStderrDiagnostic::Redacted)
+    }
 }
 
 #[test]
@@ -2929,6 +3046,116 @@ fn initialization_stderr_diagnostic_recognizes_only_closed_stage_classes() {
         b"synthetic-sensitive-body",
     ] {
         std::fs::write(&path, invalid).expect("write invalid diagnostic");
+        assert_eq!(ChildNode::stderr_diagnostic_at(&path), ChildStderrDiagnostic::Redacted);
+    }
+}
+
+#[test]
+fn initialization_stderr_boundary_isolates_attempts_and_rejects_changed_files() {
+    let directory = tempfile::tempdir().expect("attempt diagnostic directory");
+    let path = directory.path().join("stderr.log");
+    let old = b"qualification initialization rejected: stage=cluster class=RecoveryRequired\n";
+    let current = b"qualification activation rejected: stage=fenced_transition class=BackendUnavailable boundary=after_transmission deadline_elapsed=false\n";
+    assert!(InitializationStderrBoundary::capture(&path).is_none());
+    let mut history = vec![b'x'; 16 * 1024];
+    history.push(b'\n');
+    history.extend_from_slice(old);
+    std::fs::write(&path, history).unwrap();
+    let boundary = InitializationStderrBoundary::capture(&path).unwrap();
+    assert_eq!(boundary.classify(&path), ChildStderrDiagnostic::Empty);
+    let mut writer = OpenOptions::new().append(true).open(&path).unwrap();
+    writer.write_all(current).unwrap();
+    assert_eq!(
+        boundary.classify(&path),
+        ChildStderrDiagnostic::ActivationRejected {
+            stage: "fenced_transition",
+            error_class: "BackendUnavailable",
+            boundary: "after_transmission",
+            deadline_elapsed: false,
+        }
+    );
+    let next = InitializationStderrBoundary::capture(&path).unwrap();
+    assert_eq!(next.classify(&path), ChildStderrDiagnostic::Empty);
+    // Keep the old inode alive so replacement cannot accidentally reuse it.
+    std::fs::rename(&path, directory.path().join("previous.stderr")).unwrap();
+    std::fs::write(&path, current).unwrap();
+    assert_eq!(next.classify(&path), ChildStderrDiagnostic::Unavailable);
+    assert_eq!(boundary.classify(&path), ChildStderrDiagnostic::Unavailable);
+}
+
+#[test]
+fn initialization_stderr_boundary_rejects_partial_truncated_and_excess_output() {
+    let directory = tempfile::tempdir().expect("bounded attempt diagnostic directory");
+    let path = directory.path().join("stderr.log");
+    let marker = b"qualification activation rejected: stage=fenced_transition class=BackendUnavailable boundary=after_transmission deadline_elapsed=false";
+    std::fs::write(&path, b"historical-partial:").unwrap();
+    let boundary = InitializationStderrBoundary::capture(&path).unwrap();
+    let mut writer = OpenOptions::new().append(true).open(&path).unwrap();
+    writer.write_all(marker).unwrap();
+    writer.write_all(b"\n").unwrap();
+    assert_eq!(boundary.classify(&path), ChildStderrDiagnostic::Redacted);
+
+    let partial = InitializationStderrBoundary::capture(&path).unwrap();
+    writer.write_all(marker).unwrap();
+    assert_eq!(partial.classify(&path), ChildStderrDiagnostic::Redacted);
+    std::fs::write(&path, b"").unwrap();
+    assert_eq!(partial.classify(&path), ChildStderrDiagnostic::Unavailable);
+
+    let empty = InitializationStderrBoundary::capture(&path).unwrap();
+    writer.write_all(&[b'x'; 8 * 1024 + 1]).unwrap();
+    assert_eq!(empty.classify(&path), ChildStderrDiagnostic::Redacted);
+}
+
+#[test]
+fn activation_stderr_diagnostic_accepts_only_closed_boundaries_and_deadline_flags() {
+    let directory = tempfile::tempdir().expect("activation diagnostic directory");
+    let path = directory.path().join("stderr.log");
+    for stage in ["fenced_transition", "protected_roster_v2"] {
+        for boundary in [
+            "initial_authority",
+            "initial_scope",
+            "leader_discovery",
+            "pre_transmit_authority",
+            "after_transmission",
+            "authenticated_rejection",
+            "route_refresh",
+            "local_leader_rejected",
+            "remote_leader_rejected",
+            "applied_index",
+            "post_apply_authority",
+            "post_apply_scope",
+            "certificate_backend",
+            "certificate_mismatch",
+            "outcome_unknown",
+            "unexpected_reply",
+        ] {
+            for deadline_elapsed in [false, true] {
+                let marker = format!("qualification activation rejected: stage={stage} class=BackendUnavailable boundary={boundary} deadline_elapsed={deadline_elapsed}\n");
+                let mut bytes = vec![b'x'; 16 * 1024];
+                bytes.push(b'\n');
+                bytes.extend_from_slice(marker.as_bytes());
+                std::fs::write(&path, bytes).expect("write bounded activation marker");
+                assert_eq!(
+                    ChildNode::stderr_diagnostic_at(&path),
+                    ChildStderrDiagnostic::ActivationRejected {
+                        stage,
+                        error_class: "BackendUnavailable",
+                        boundary,
+                        deadline_elapsed,
+                    }
+                );
+            }
+        }
+    }
+    for invalid in [
+        b"qualification activation rejected: stage=cluster class=Other boundary=initial_authority deadline_elapsed=false".as_slice(),
+        b"qualification activation rejected: stage=fenced_transition class=BackendUnavailable boundary=synthetic-sensitive-body deadline_elapsed=false",
+        b"qualification activation rejected: stage=fenced_transition class=BackendUnavailable boundary=after_transmission deadline_elapsed=false synthetic-sensitive-body",
+        b"qualification activation rejected: stage=fenced_transition class=BackendUnavailable boundary=after_transmission deadline_elapsed=1",
+        b"qualification activation rejected: stage=fenced_transition class=BackendUnavailable boundary=after_transmission deadline_elapsed=false\xff",
+        b"qualification activation rejected: stage=fenced_transition class=BackendUnavailable boundary=after_transmission",
+    ] {
+        std::fs::write(&path, invalid).expect("write malformed activation marker");
         assert_eq!(ChildNode::stderr_diagnostic_at(&path), ChildStderrDiagnostic::Redacted);
     }
 }
@@ -3032,6 +3259,7 @@ struct ChildNode {
     stderr_path: PathBuf,
     pending: Option<PendingCommand>,
     next_command_sequence: u64,
+    initialization_stderr: Option<InitializationStderrBoundary>,
 }
 
 impl ChildNode {
@@ -3143,6 +3371,7 @@ impl ChildNode {
                 sent_at: Instant::now(),
             }),
             next_command_sequence: 1,
+            initialization_stderr: None,
         };
         let reply = node.receive_until(deadline);
         let QualificationNodeReply::Bound {
@@ -3162,6 +3391,12 @@ impl ChildNode {
             self.pending.is_none(),
             "qualification child already has one pending command"
         );
+        // Capture before transmission: the child's failure can arrive before
+        // the write returns. Unavailable attribution never falls back to an
+        // earlier attempt or process that appended to this file.
+        self.initialization_stderr = matches!(command, QualificationNodeCommand::Initialize)
+            .then(|| InitializationStderrBoundary::capture(&self.stderr_path))
+            .flatten();
         write_json_line(
             self.stdin.as_mut().expect("qualification child stdin open"),
             command,
@@ -3216,17 +3451,25 @@ impl ChildNode {
     }
 
     fn fail_response(&mut self, failure: ChildResponseFailure, pending: PendingCommand) -> ! {
+        let current_initialize_stderr = matches!(
+            pending.kind,
+            PendingCommandKind::Command(QualificationNodeCommandKind::Initialize)
+        )
+        .then(|| self.initialization_stderr_diagnostic());
         let pending = pending.diagnostic_at(Instant::now());
         let status = self.child.try_wait().ok().flatten();
-        let stderr = self.stderr_diagnostic();
+        let stderr = Self::stderr_diagnostic_at(&self.stderr_path);
         panic!(
-            "qualification child response failed: node={}, failure={failure:?}, pending={pending:?}, status={status:?}, stderr={stderr:?}",
+            "qualification child response failed: node={}, failure={failure:?}, pending={pending:?}, status={status:?}, current_initialize_stderr={current_initialize_stderr:?}, historical_stderr={stderr:?}",
             self.node_index
         )
     }
 
-    fn stderr_diagnostic(&self) -> ChildStderrDiagnostic {
-        Self::stderr_diagnostic_at(&self.stderr_path)
+    fn initialization_stderr_diagnostic(&self) -> ChildStderrDiagnostic {
+        self.initialization_stderr
+            .map_or(ChildStderrDiagnostic::Unavailable, |boundary| {
+                boundary.classify(&self.stderr_path)
+            })
     }
 
     fn stderr_diagnostic_at(stderr_path: &Path) -> ChildStderrDiagnostic {
@@ -4294,7 +4537,7 @@ impl Fleet {
                     panic!(
                         "qualification initial fleet initialization rejected: node={}, code={code:?}, stderr={:?}",
                         node.node_index,
-                        node.stderr_diagnostic()
+                        node.initialization_stderr_diagnostic()
                     );
                 }
                 _ => panic!("qualification initial fleet initialization reply mismatch"),
