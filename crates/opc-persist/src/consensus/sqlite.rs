@@ -2026,6 +2026,8 @@ fn row_entry(
     native_io::row_decoded(&entry);
     #[cfg(test)]
     config_capacity_retained_pointer_tests::row_decoded(entry.log_id.index);
+    #[cfg(all(test, target_os = "linux"))]
+    config_capacity_append_floor_tests::row_decoded(&entry);
     Ok(entry)
 }
 
@@ -2562,6 +2564,72 @@ pub(crate) fn append_logs_cancellable_sync(
     }
     #[cfg(feature = "dangerous-test-hooks")]
     let append_scope = AppendScope::start(conn, identity, entries);
+    // Reject malformed inputs and cancellation before taking the write lock.
+    // These are the same semantic checks formerly performed while encoding.
+    for entry in entries {
+        cancellation.check_io()?;
+        validate_entry(entry, identity, expected_members, mode)?;
+    }
+    // Resolve the floor with the unchanged full row decoder before allocating
+    // append JSON outputs. Keep this Immediate transaction through insertion so
+    // another writer cannot invalidate the floor during encoding. The earlier
+    // write lock is released by rollback on cancellation or an encoding error.
+    cancellation.check_io()?;
+    #[cfg(all(test, target_os = "linux"))]
+    native_io::phase(native_io::Phase::TransactionBegin);
+    let tx = Transaction::new_unchecked(conn, TransactionBehavior::Immediate).map_err(db_error)?;
+    #[cfg(all(test, target_os = "linux"))]
+    native_io::phase(native_io::Phase::TransactionBegun);
+    #[cfg(all(test, target_os = "linux"))]
+    native_io::phase(native_io::Phase::PointersBegin);
+
+    let (committed, applied, purged) = validate_durable_pointer_relationships_sync(&tx, identity)?;
+    #[cfg(all(test, target_os = "linux"))]
+    native_io::phase(native_io::Phase::PointersValidated);
+
+    let floor = {
+        #[cfg(all(test, target_os = "linux"))]
+        let _floor = config_capacity_append_floor_tests::FloorScope::enter(None);
+        [
+            last_log_sync(&tx, identity, mode)?,
+            committed,
+            applied,
+            purged,
+        ]
+        .into_iter()
+        .flatten()
+        .max_by_key(|log_id| log_id.index)
+    };
+    #[cfg(test)]
+    super::storage::config_capacity_append_observations::observe("durable_floor_validated");
+    let expected = floor
+        .map(|log_id| {
+            log_id
+                .index
+                .checked_add(1)
+                .ok_or_else(|| invalid_data("config consensus log index exhausted"))
+        })
+        .transpose()?
+        .unwrap_or(0);
+    if entries[0].log_id.index != expected {
+        return Err(invalid_data(
+            "config consensus log append would overwrite a durable entry or create a hole",
+        ));
+    }
+    for (offset, entry) in entries.iter().enumerate() {
+        cancellation.check_io()?;
+        let offset = u64::try_from(offset)
+            .map_err(|_| invalid_data("config consensus log batch exceeds integer range"))?;
+        if entry.log_id.index
+            != expected
+                .checked_add(offset)
+                .ok_or_else(|| invalid_data("config consensus log index exhausted"))?
+        {
+            return Err(invalid_data("config consensus log batch is not contiguous"));
+        }
+    }
+    #[cfg(test)]
+    super::storage::config_capacity_append_observations::observe("contiguous_checked");
     let mut encoded_entries = Vec::with_capacity(entries.len());
     let mut encoded_bytes = 0_usize;
     for entry in entries {
@@ -2577,7 +2645,6 @@ pub(crate) fn append_logs_cancellable_sync(
             #[cfg(feature = "dangerous-test-hooks")]
             append_buffers::encoding_output(AppendStage::EncodingRejected, None);
         })?;
-        validate_entry(entry, identity, expected_members, mode)?;
         let remaining = CONFIG_CONSENSUS_LOG_APPEND_MAX_BYTES
             .checked_sub(encoded_bytes)
             .ok_or_else(|| {
@@ -2610,58 +2677,9 @@ pub(crate) fn append_logs_cancellable_sync(
     }
     #[cfg(test)]
     super::storage::config_capacity_append_observations::observe("entries_encoded");
+    #[cfg(all(test, target_os = "linux"))]
+    config_capacity_append_floor_tests::outputs_ready(&encoded_entries);
     cancellation.check_io()?;
-    #[cfg(all(test, target_os = "linux"))]
-    native_io::phase(native_io::Phase::TransactionBegin);
-    let tx = Transaction::new_unchecked(conn, TransactionBehavior::Immediate).map_err(db_error)?;
-    #[cfg(all(test, target_os = "linux"))]
-    native_io::phase(native_io::Phase::TransactionBegun);
-    #[cfg(all(test, target_os = "linux"))]
-    native_io::phase(native_io::Phase::PointersBegin);
-
-    let (committed, applied, purged) = validate_durable_pointer_relationships_sync(&tx, identity)?;
-    #[cfg(all(test, target_os = "linux"))]
-    native_io::phase(native_io::Phase::PointersValidated);
-
-    let floor = [
-        last_log_sync(&tx, identity, mode)?,
-        committed,
-        applied,
-        purged,
-    ]
-    .into_iter()
-    .flatten()
-    .max_by_key(|log_id| log_id.index);
-    #[cfg(test)]
-    super::storage::config_capacity_append_observations::observe("durable_floor_validated");
-    let expected = floor
-        .map(|log_id| {
-            log_id
-                .index
-                .checked_add(1)
-                .ok_or_else(|| invalid_data("config consensus log index exhausted"))
-        })
-        .transpose()?
-        .unwrap_or(0);
-    if entries[0].log_id.index != expected {
-        return Err(invalid_data(
-            "config consensus log append would overwrite a durable entry or create a hole",
-        ));
-    }
-    for (offset, entry) in entries.iter().enumerate() {
-        cancellation.check_io()?;
-        let offset = u64::try_from(offset)
-            .map_err(|_| invalid_data("config consensus log batch exceeds integer range"))?;
-        if entry.log_id.index
-            != expected
-                .checked_add(offset)
-                .ok_or_else(|| invalid_data("config consensus log index exhausted"))?
-        {
-            return Err(invalid_data("config consensus log batch is not contiguous"));
-        }
-    }
-    #[cfg(test)]
-    super::storage::config_capacity_append_observations::observe("contiguous_checked");
     for (entry, encoded) in entries.iter().zip(encoded_entries) {
         cancellation.check_io()?;
         tx.execute(
@@ -2674,6 +2692,8 @@ pub(crate) fn append_logs_cancellable_sync(
             ],
         )
         .map_err(db_error)?;
+        #[cfg(all(test, target_os = "linux"))]
+        config_capacity_append_floor_tests::inserted(entry.log_id.index);
     }
     cancellation.check_io()?;
     #[cfg(test)]
@@ -6866,3 +6886,7 @@ mod config_capacity_retained_pointer_tests;
 #[cfg(all(test, feature = "dangerous-test-hooks"))]
 #[path = "sqlite/config_capacity_append_buffers_tests.rs"]
 mod config_capacity_append_buffers_tests;
+
+#[cfg(all(test, target_os = "linux"))]
+#[path = "sqlite/config_capacity_append_floor_tests.rs"]
+mod config_capacity_append_floor_tests;
