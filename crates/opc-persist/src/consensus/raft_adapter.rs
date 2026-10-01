@@ -1,5 +1,6 @@
 //! Private Openraft adapter over the shared authenticated consensus transport.
 
+use std::borrow::Borrow;
 use std::collections::BTreeMap;
 use std::fmt;
 use std::sync::Arc;
@@ -114,11 +115,11 @@ pub(crate) struct ConfigRaftNetwork {
 
 // Fields drop in declaration order, including on cancellation and unwinding.
 // Retire the actual typed request before another client may create its output.
-struct AppendEncoding<'a> {
+struct AppendEncoding<'a, R> {
     #[cfg(feature = "dangerous-test-hooks")]
-    request: super::capacity_observation::raft_buffers::OriginalAppend,
+    request: super::capacity_observation::raft_buffers::OriginalAppend<R>,
     #[cfg(not(feature = "dangerous-test-hooks"))]
-    request: AppendEntriesRequest<ConfigRaftTypeConfig>,
+    request: R,
     _guard: Option<tokio::sync::MutexGuard<'a, ()>>,
 }
 
@@ -198,10 +199,12 @@ impl ConfigRaftNetwork {
     }
 
     // OpenRaft's append RPC must retain its prescribed transport error type.
+    // Production passes the DTO by value; 'static rejects borrowing that local
+    // DTO. Borrow also permits an Arc of the real DTO for the ownership test.
     #[allow(clippy::result_large_err)]
     async fn append(
         &self,
-        request: AppendEntriesRequest<ConfigRaftTypeConfig>,
+        request: impl Borrow<AppendEntriesRequest<ConfigRaftTypeConfig>> + 'static,
         option: RPCOption,
     ) -> Result<AppendEntriesResponse<ConsensusNodeId>, EngineRpcError> {
         #[cfg(feature = "dangerous-test-hooks")]
@@ -230,10 +233,7 @@ impl ConfigRaftNetwork {
             request,
             _guard: guard,
         };
-        #[cfg(feature = "dangerous-test-hooks")]
         let typed = request.request.borrow();
-        #[cfg(not(feature = "dangerous-test-hooks"))]
-        let typed = &request.request;
         let entry_count = typed.entries.len();
         let payload = match encode_config_wire_for_profile(self.mode, typed) {
             Ok(payload) => payload,
@@ -590,14 +590,4 @@ struct PeerIdentityChanged;
 struct CodecTransportError(#[source] ConsensusCodecError);
 
 #[cfg(test)]
-mod tests {
-    use super::append_entries_split_hint;
-
-    #[test]
-    fn append_entries_split_hint_never_retries_a_singleton_as_payload_too_large() {
-        assert_eq!(append_entries_split_hint(0), None);
-        assert_eq!(append_entries_split_hint(1), None);
-        assert_eq!(append_entries_split_hint(2), Some(1));
-        assert_eq!(append_entries_split_hint(64), Some(32));
-    }
-}
+mod tests;
