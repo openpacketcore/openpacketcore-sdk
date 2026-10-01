@@ -1430,9 +1430,9 @@ pub struct PersistentSessionConsumerDiagnostics {
     pub completed_operations: u64,
     /// Completed physical operations with a confirmed response.
     pub completed_operation_successes: u64,
-    /// Completed operations proven not to have been dispatched: no
-    /// application frame was written, or the server answered with a complete
-    /// `Rejected(Unavailable)`, a closed rejection that precedes the
+    /// Completed operations proven to have had no effect: no application
+    /// frame was written, or the server answered with a complete closed
+    /// `Rejected(Unavailable)`, which it returns before a mutation reaches the
     /// consensus state machine.
     pub completed_operation_not_transmitted: u64,
     /// Effectful operations whose application frame may have been written.
@@ -3971,10 +3971,11 @@ fn response_is_known_failure(response: &SessionConsumerResponse) -> bool {
 ///
 /// A [`SessionConsumerRejection`] is a closed rejection before an operation
 /// reaches the consensus state machine, and `Unavailable` means that the
-/// server could not dispatch the request within its bound. Under that
-/// contract, which the SDK's consensus quorum service upholds, the operation's
-/// own consensus intent was never submitted, so another voter of the same
-/// quorum may serve the identical request. Scope, topology, authorization and
+/// server could not dispatch the request within its bound. For a mutation,
+/// the SDK's consensus quorum service returns it only before it submits the
+/// operation's own consensus intent, so another voter of the same quorum may
+/// serve the identical request. A read may receive it after read work, but
+/// never after an application effect. Scope, topology, authorization and
 /// validation rejections are deterministic decisions and remain confirmed
 /// failures.
 const fn consumer_rejection_proves_not_dispatched(rejection: SessionConsumerRejection) -> bool {
@@ -3998,7 +3999,7 @@ fn completed_operation_class(
         SessionConsumerResponse::Rejected(rejection)
             if consumer_rejection_proves_not_dispatched(*rejection)
     ) {
-        // A closed pre-dispatch rejection is as conclusively unsent as an
+        // A closed Unavailable rejection had no effect, as conclusively as an
         // unwritten call frame, so it must not enter the unsafe aggregate.
         PersistentCompletedOperationClass::NotTransmitted
     } else if response_is_known_failure(response) {
@@ -36865,7 +36866,7 @@ mod tests {
                     &SessionConsumerResponse::Rejected(SessionConsumerRejection::Unavailable),
                 ),
                 PersistentCompletedOperationClass::NotTransmitted,
-                "a closed Unavailable rejection precedes dispatch and is not an unsafe completion"
+                "a closed Unavailable rejection had no effect and is not an unsafe completion"
             );
             for rejection in [
                 SessionConsumerRejection::ScopeMismatch,

@@ -1958,11 +1958,12 @@ of that ID for a different request is a closed conflict. Applications otherwise
 must perform authoritative readback and apply the existing fencing/idempotency
 contract.
 
-A complete V1 `Rejected(Unavailable)` reply is a closed rejection. A server
-MUST return it only before it submits the operation's own consensus intent. It
-MAY follow the effect-free durable request binding, which the identical
-request rebinds idempotently. The reply therefore proves that the answering
-voter did not dispatch the request. The persistent client MUST count it as a
+A complete V1 `Rejected(Unavailable)` reply is a closed rejection. For a
+mutation, a server MUST return it only before it submits the operation's own
+consensus intent. It MAY follow the effect-free durable request binding, which
+the identical request rebinds idempotently. A read MAY receive it after read
+work. The reply therefore proves that the request had no application effect
+on the answering voter. The persistent client MUST count it as a
 not-transmitted completion, never as an unsafe failure. A prepared
 compare-and-set or lease acquire MUST move the identical request to its next
 voter, exactly as after a proven pre-write failure, and MUST end

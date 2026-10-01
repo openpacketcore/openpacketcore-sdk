@@ -3181,11 +3181,12 @@ pub enum SessionConsumerRejection {
     Unauthorized,
     /// The server cannot dispatch the request within its bound.
     ///
-    /// A server returns it only before it submits the operation's own
-    /// consensus intent. It may follow the effect-free durable request
-    /// binding, which the identical request rebinds idempotently. Clients
-    /// therefore treat it as proof that this server did not dispatch the
-    /// request: a prepared request moves the identical request to another
+    /// For a mutation, a server returns it only before it submits the
+    /// operation's own consensus intent. It may follow the effect-free durable
+    /// request binding, which the identical request rebinds idempotently. A
+    /// read may receive it after read work. In every case the request had no
+    /// application effect on this server, so clients treat it as not
+    /// dispatched: a prepared mutation moves the identical request to another
     /// voter of the same quorum.
     Unavailable,
 }
