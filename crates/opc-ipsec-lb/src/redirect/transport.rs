@@ -294,18 +294,9 @@ fn retain_proven_send_ceiling(
     refreshed: Result<usize, IngressRedirectDatagramError>,
 ) -> Result<usize, IngressRedirectDatagramError> {
     let refreshed = refreshed?;
-    let mut current = ceiling.load(Ordering::Acquire);
-    loop {
-        match ceiling.compare_exchange_weak(
-            current,
-            current.min(refreshed),
-            Ordering::AcqRel,
-            Ordering::Acquire,
-        ) {
-            Ok(_) => break,
-            Err(observed) => current = observed,
-        }
-    }
+    let _ = ceiling.fetch_update(Ordering::AcqRel, Ordering::Acquire, |current| {
+        Some(current.min(refreshed))
+    });
     Ok(ceiling.load(Ordering::Acquire))
 }
 
@@ -894,18 +885,11 @@ impl EndpointMetrics {
     fn record_latency(&self, elapsed: Duration) {
         let micros = u64::try_from(elapsed.as_micros()).unwrap_or(u64::MAX);
         increment(&self.receipt_latency_samples);
-        let mut value = self.receipt_latency_total_micros.load(Ordering::Relaxed);
-        loop {
-            match self.receipt_latency_total_micros.compare_exchange_weak(
-                value,
-                value.saturating_add(micros),
-                Ordering::Relaxed,
-                Ordering::Relaxed,
-            ) {
-                Ok(_) => break,
-                Err(observed) => value = observed,
-            }
-        }
+        let _ = self.receipt_latency_total_micros.fetch_update(
+            Ordering::Relaxed,
+            Ordering::Relaxed,
+            |value| Some(value.saturating_add(micros)),
+        );
         let _ = self
             .receipt_latency_max_micros
             .fetch_max(micros, Ordering::Relaxed);
@@ -968,21 +952,11 @@ impl EndpointLifecycle {
         if self.phase() != EndpointPhase::Active {
             return Err(self.admission_error());
         }
-        let mut active = self.active_operations.load(Ordering::Acquire);
-        loop {
-            let next = active
-                .checked_add(1)
-                .ok_or(IngressRedirectError::StateUnavailable)?;
-            match self.active_operations.compare_exchange_weak(
-                active,
-                next,
-                Ordering::AcqRel,
-                Ordering::Acquire,
-            ) {
-                Ok(_) => break,
-                Err(observed) => active = observed,
-            }
-        }
+        self.active_operations
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |active| {
+                active.checked_add(1)
+            })
+            .map_err(|_| IngressRedirectError::StateUnavailable)?;
         if self.phase() == EndpointPhase::Active {
             Ok(EndpointOperationGuard {
                 lifecycle: Arc::clone(self),

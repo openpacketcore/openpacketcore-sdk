@@ -224,18 +224,9 @@ impl Recorder {
 static RECORDER: Recorder = Recorder::new();
 
 fn add(counter: &AtomicU64, value: u64) {
-    let mut current = counter.load(Ordering::Relaxed);
-    loop {
-        match counter.compare_exchange_weak(
-            current,
-            current.saturating_add(value),
-            Ordering::Relaxed,
-            Ordering::Relaxed,
-        ) {
-            Ok(_) => break,
-            Err(observed) => current = observed,
-        }
-    }
+    let _ = counter.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
+        Some(current.saturating_add(value))
+    });
 }
 
 /// Snapshot fixed counters without reading a store, backend, or authority.

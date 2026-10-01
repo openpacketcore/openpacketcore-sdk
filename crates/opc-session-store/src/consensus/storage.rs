@@ -3038,25 +3038,18 @@ impl ConsensusStorageShutdownGuard {
             .runtime_write_handoff_pending
             .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
             .ok()?;
-        let mut admitted = RUNTIME_WRITE_HANDOFFS.load(Ordering::Acquire);
-        loop {
-            if admitted >= MAX_RUNTIME_WRITE_HANDOFFS {
-                // No scheduler job has been submitted for this reservation, so
-                // only this failed admission may release its tracker immediately.
-                completion
-                    .runtime_write_handoff_pending
-                    .store(false, Ordering::Release);
-                return None;
-            }
-            match RUNTIME_WRITE_HANDOFFS.compare_exchange_weak(
-                admitted,
-                admitted + 1,
-                Ordering::AcqRel,
-                Ordering::Acquire,
-            ) {
-                Ok(_) => break,
-                Err(observed) => admitted = observed,
-            }
+        if RUNTIME_WRITE_HANDOFFS
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |admitted| {
+                (admitted < MAX_RUNTIME_WRITE_HANDOFFS).then(|| admitted + 1)
+            })
+            .is_err()
+        {
+            // No scheduler job has been submitted for this reservation, so
+            // only this failed admission may release its tracker immediately.
+            completion
+                .runtime_write_handoff_pending
+                .store(false, Ordering::Release);
+            return None;
         }
         Some(RuntimeWriteHandoff {
             completion: Arc::clone(completion),
@@ -3073,21 +3066,12 @@ impl ConsensusStorageShutdownGuard {
         let Some(completion) = self.0.as_ref() else {
             return Self::detached();
         };
-        let mut current = completion.active_owners.load(Ordering::Acquire);
-        let incremented = loop {
-            let Some(next) = current.checked_add(1) else {
-                break Err(current);
-            };
-            match completion.active_owners.compare_exchange_weak(
-                current,
-                next,
-                Ordering::AcqRel,
-                Ordering::Acquire,
-            ) {
-                Ok(previous) => break Ok(previous),
-                Err(observed) => current = observed,
-            }
-        };
+        let incremented =
+            completion
+                .active_owners
+                .fetch_update(Ordering::AcqRel, Ordering::Acquire, |current| {
+                    current.checked_add(1)
+                });
         assert!(
             incremented.is_ok(),
             "bounded consensus storage ownership cannot overflow"

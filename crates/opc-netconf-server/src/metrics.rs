@@ -138,19 +138,11 @@ pub(crate) fn record_rpc_error(
 /// The counter deliberately has no labels: audit content and request identity
 /// must not escape through the metrics surface.
 pub(crate) fn record_terminal_audit_failure() {
-    let counter = &METRICS.netconf_terminal_audit_failures_total;
-    let mut current = counter.load(Ordering::Relaxed);
-    loop {
-        match counter.compare_exchange_weak(
-            current,
-            current.saturating_add(1),
-            Ordering::Relaxed,
-            Ordering::Relaxed,
-        ) {
-            Ok(_) => break,
-            Err(observed) => current = observed,
-        }
-    }
+    let _ = METRICS.netconf_terminal_audit_failures_total.fetch_update(
+        Ordering::Relaxed,
+        Ordering::Relaxed,
+        |current| Some(current.saturating_add(1)),
+    );
 }
 
 /// Records read NACM denials filtered from a NETCONF response.

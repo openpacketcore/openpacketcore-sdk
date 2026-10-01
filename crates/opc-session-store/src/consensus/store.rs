@@ -1417,18 +1417,9 @@ pub(crate) struct ConsensusStoreDiagnosticCounters {
 
 impl ConsensusStoreDiagnosticCounters {
     fn saturating_add(counter: &AtomicU64, value: u64) {
-        let mut current = counter.load(Ordering::Relaxed);
-        loop {
-            match counter.compare_exchange_weak(
-                current,
-                current.saturating_add(value),
-                Ordering::Relaxed,
-                Ordering::Relaxed,
-            ) {
-                Ok(_) => break,
-                Err(observed) => current = observed,
-            }
-        }
+        let _ = counter.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
+            Some(current.saturating_add(value))
+        });
     }
 
     fn duration_bucket(duration: Duration) -> usize {

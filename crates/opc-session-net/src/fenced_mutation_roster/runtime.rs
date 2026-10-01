@@ -1098,7 +1098,14 @@ impl LocalAuthorityRegistry {
     }
 
     fn reserve_entry(&self) -> bool {
-        if self.try_reserve_entry() {
+        if self
+            .inner
+            .entry_count
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |count| {
+                (count < MAX_LOCAL_AUTHORITY_ENTRIES).then_some(count + 1)
+            })
+            .is_ok()
+        {
             return true;
         }
         // A full entry total can include expired bindings in unrelated
@@ -1107,25 +1114,12 @@ impl LocalAuthorityRegistry {
         // aggregate hard cap while ensuring an old tenant shard cannot
         // permanently consume the process-wide allowance.
         self.sweep_expired_all_shards();
-        self.try_reserve_entry()
-    }
-
-    fn try_reserve_entry(&self) -> bool {
-        let mut count = self.inner.entry_count.load(Ordering::Acquire);
-        loop {
-            let Some(next) = (count < MAX_LOCAL_AUTHORITY_ENTRIES).then_some(count + 1) else {
-                return false;
-            };
-            match self.inner.entry_count.compare_exchange_weak(
-                count,
-                next,
-                Ordering::AcqRel,
-                Ordering::Acquire,
-            ) {
-                Ok(_) => return true,
-                Err(observed) => count = observed,
-            }
-        }
+        self.inner
+            .entry_count
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |count| {
+                (count < MAX_LOCAL_AUTHORITY_ENTRIES).then_some(count + 1)
+            })
+            .is_ok()
     }
 
     fn sweep_expired_all_shards(&self) {

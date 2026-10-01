@@ -208,17 +208,11 @@ const fn advance_audit_monotonic_sequence(current: u64) -> u64 {
 }
 
 fn next_audit_monotonic_sequence() -> u64 {
-    let mut current = AUDIT_MONOTONIC_SEQUENCE.load(Ordering::Acquire);
-    loop {
-        match AUDIT_MONOTONIC_SEQUENCE.compare_exchange_weak(
-            current,
-            advance_audit_monotonic_sequence(current),
-            Ordering::AcqRel,
-            Ordering::Acquire,
-        ) {
-            Ok(previous) => return advance_audit_monotonic_sequence(previous),
-            Err(observed) => current = observed,
-        }
+    match AUDIT_MONOTONIC_SEQUENCE.fetch_update(Ordering::AcqRel, Ordering::Acquire, |current| {
+        Some(advance_audit_monotonic_sequence(current))
+    }) {
+        Ok(previous) => advance_audit_monotonic_sequence(previous),
+        Err(current) => current,
     }
 }
 

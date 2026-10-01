@@ -22,22 +22,12 @@ impl MigrationScope {
     }
 
     pub(crate) fn advance(&self) -> Result<u64, Error> {
-        let mut current = self.generation.load(Ordering::Acquire);
-        let previous = loop {
-            if current == 0 {
-                return Err(Error::Closed);
-            }
-            let next = current.checked_add(1).unwrap_or(0);
-            match self.generation.compare_exchange_weak(
-                current,
-                next,
-                Ordering::AcqRel,
-                Ordering::Acquire,
-            ) {
-                Ok(previous) => break previous,
-                Err(observed) => current = observed,
-            }
-        };
+        let previous = self
+            .generation
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |value| {
+                (value != 0).then(|| value.checked_add(1).unwrap_or(0))
+            })
+            .map_err(|_| Error::Closed)?;
         previous.checked_add(1).ok_or(Error::Closed)
     }
 

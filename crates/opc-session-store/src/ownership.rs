@@ -2282,18 +2282,9 @@ fn elapsed(now: Timestamp, observed: Timestamp) -> Option<Duration> {
 }
 
 fn saturating_increment(counter: &AtomicU64) {
-    let mut value = counter.load(Ordering::Relaxed);
-    loop {
-        match counter.compare_exchange_weak(
-            value,
-            value.saturating_add(1),
-            Ordering::Relaxed,
-            Ordering::Relaxed,
-        ) {
-            Ok(_) => break,
-            Err(observed) => value = observed,
-        }
-    }
+    let _ = counter.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |value| {
+        Some(value.saturating_add(1))
+    });
 }
 
 #[cfg(test)]

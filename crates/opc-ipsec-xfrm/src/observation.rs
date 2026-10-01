@@ -141,14 +141,11 @@ impl EspPeerObservationScope {
     /// closed instead of wrapping to an already-issued scope.
     fn try_new() -> Result<Self, XfrmError> {
         static NEXT: AtomicU64 = AtomicU64::new(1);
-        let mut current = NEXT.load(Ordering::Relaxed);
-        let raw = loop {
-            let next = current.checked_add(1).ok_or(XfrmError::Unavailable)?;
-            match NEXT.compare_exchange_weak(current, next, Ordering::Relaxed, Ordering::Relaxed) {
-                Ok(previous) => break previous,
-                Err(observed) => current = observed,
-            }
-        };
+        let raw = NEXT
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |value| {
+                value.checked_add(1)
+            })
+            .map_err(|_| XfrmError::Unavailable)?;
         NonZeroU64::new(raw).map(Self).ok_or(XfrmError::Unavailable)
     }
 

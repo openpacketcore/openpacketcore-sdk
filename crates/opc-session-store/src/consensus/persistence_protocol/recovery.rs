@@ -69,18 +69,11 @@ impl PersistenceProtocol {
             Capability::Legacy => 1,
             Capability::ProtectedAuthority => 2,
         };
-        let mut current = self.recovery_limit.load(Ordering::Acquire);
-        while current < 4 {
-            match self.recovery_limit.compare_exchange_weak(
-                current,
-                value,
-                Ordering::AcqRel,
-                Ordering::Acquire,
-            ) {
-                Ok(_) => break,
-                Err(observed) => current = observed,
-            }
-        }
+        let _ = self
+            .recovery_limit
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |current| {
+                (current < 4).then_some(value)
+            });
     }
 
     #[cfg(target_os = "linux")]

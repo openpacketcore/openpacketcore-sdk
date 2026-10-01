@@ -620,7 +620,13 @@ impl BootClock for TestBootClock {
         {
             return scripted;
         }
-        if take_one(&self.fail_reads) {
+        if self
+            .fail_reads
+            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |remaining| {
+                remaining.checked_sub(1)
+            })
+            .is_ok()
+        {
             Err(KernelFailure::Clock)
         } else {
             Ok(self.now())
@@ -628,7 +634,13 @@ impl BootClock for TestBootClock {
     }
 
     async fn wait_poll(&self, duration: Duration) -> Result<(), KernelFailure> {
-        if take_one(&self.fail_waits) {
+        if self
+            .fail_waits
+            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |remaining| {
+                remaining.checked_sub(1)
+            })
+            .is_ok()
+        {
             return Err(KernelFailure::Clock);
         }
         self.waits.fetch_add(1, Ordering::SeqCst);
@@ -3311,17 +3323,4 @@ fn errors_and_evidence_are_redaction_safe() {
         FenceError::GateExpired.to_string(),
         "egress_fence_gate_expired"
     );
-}
-
-fn take_one(counter: &AtomicUsize) -> bool {
-    let mut remaining = counter.load(Ordering::SeqCst);
-    loop {
-        let Some(next) = remaining.checked_sub(1) else {
-            return false;
-        };
-        match counter.compare_exchange_weak(remaining, next, Ordering::SeqCst, Ordering::SeqCst) {
-            Ok(_) => return true,
-            Err(observed) => remaining = observed,
-        }
-    }
 }

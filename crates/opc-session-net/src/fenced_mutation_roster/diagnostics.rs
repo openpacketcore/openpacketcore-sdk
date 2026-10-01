@@ -290,18 +290,9 @@ fn load(counter: &AtomicU64) -> u64 {
 }
 
 fn saturating_increment(counter: &AtomicU64) {
-    let mut current = counter.load(Ordering::Relaxed);
-    loop {
-        match counter.compare_exchange_weak(
-            current,
-            current.saturating_add(1),
-            Ordering::Relaxed,
-            Ordering::Relaxed,
-        ) {
-            Ok(_) => break,
-            Err(observed) => current = observed,
-        }
-    }
+    let _ = counter.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
+        Some(current.saturating_add(1))
+    });
 }
 
 pub(crate) struct ProviderInFlight {

@@ -791,18 +791,9 @@ impl Drop for LifecycleConnectionMetrics {
 }
 
 fn decrement_gauge(gauge: &AtomicI64) {
-    let mut value = gauge.load(Ordering::Relaxed);
-    loop {
-        match gauge.compare_exchange_weak(
-            value,
-            value.saturating_sub(1).max(0),
-            Ordering::Relaxed,
-            Ordering::Relaxed,
-        ) {
-            Ok(_) => break,
-            Err(observed) => value = observed,
-        }
-    }
+    let _ = gauge.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |value| {
+        Some(value.saturating_sub(1).max(0))
+    });
 }
 
 impl RetirementReason {

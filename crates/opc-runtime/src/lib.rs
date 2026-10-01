@@ -86,7 +86,7 @@ pub use runtime::{run, run_with_hooks, try_run, try_run_with_hooks, RuntimeHandl
 /// The returned closure is intended for [`StartupPhases::init_logging`] and
 /// runs during [`RuntimePhase::ProcessInit`].
 #[cfg(feature = "observability")]
-#[must_use = "the returned callback must be installed or invoked to initialize observability"]
+#[must_use]
 pub fn init_observability_logging(
     directive: Option<&str>,
 ) -> Box<dyn Fn() -> Result<(), BootstrapError> + Send + Sync> {

@@ -988,18 +988,9 @@ impl IngressRedirectMetrics {
 }
 
 fn increment(counter: &AtomicU64) {
-    let mut value = counter.load(Ordering::Relaxed);
-    loop {
-        match counter.compare_exchange_weak(
-            value,
-            value.saturating_add(1),
-            Ordering::Relaxed,
-            Ordering::Relaxed,
-        ) {
-            Ok(_) => break,
-            Err(observed) => value = observed,
-        }
-    }
+    let _ = counter.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |value| {
+        Some(value.saturating_add(1))
+    });
 }
 
 struct ReplayWindow {
@@ -2351,34 +2342,15 @@ impl fmt::Debug for IngressRedirectPeerSession {
 }
 
 fn next_sequence(counter: &AtomicU64) -> Result<u64, IngressRedirectError> {
-    let mut value = counter.load(Ordering::Relaxed);
-    loop {
-        let next = value
-            .checked_add(1)
-            .ok_or(IngressRedirectError::SequenceExhausted)?;
-        match counter.compare_exchange_weak(value, next, Ordering::Relaxed, Ordering::Relaxed) {
-            Ok(previous) => return Ok(previous),
-            Err(observed) => value = observed,
-        }
-    }
-}
-
-fn reserve_aead_usage(counter: &AtomicU64, limit: u64) -> Result<u64, u64> {
-    let mut used = counter.load(Ordering::Acquire);
-    loop {
-        if used >= limit {
-            return Err(used);
-        }
-        match counter.compare_exchange_weak(
-            used,
-            used.saturating_add(1),
-            Ordering::AcqRel,
-            Ordering::Acquire,
-        ) {
-            Ok(previous) => return Ok(previous),
-            Err(observed) => used = observed,
-        }
-    }
+    counter
+        .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |value| {
+            if value == u64::MAX {
+                None
+            } else {
+                value.checked_add(1)
+            }
+        })
+        .map_err(|_| IngressRedirectError::SequenceExhausted)
 }
 
 fn reserve_new_aead_seal(
@@ -2390,7 +2362,13 @@ fn reserve_new_aead_seal(
         return Ok(());
     }
     let limit = epoch.aead_frame_limit.load(Ordering::Acquire);
-    if reserve_aead_usage(&epoch.newly_sealed_frames, limit).is_err() {
+    if epoch
+        .newly_sealed_frames
+        .fetch_update(Ordering::AcqRel, Ordering::Acquire, |used| {
+            (used < limit).then(|| used.saturating_add(1))
+        })
+        .is_err()
+    {
         increment(&metrics.aead_seal_budget_exhausted);
         return Err(IngressRedirectError::AeadUsageExhausted);
     }
@@ -2427,7 +2405,13 @@ fn reserve_successful_aead_open(
         return Ok(());
     }
     let limit = epoch.aead_frame_limit.load(Ordering::Acquire);
-    if reserve_aead_usage(&epoch.successful_opened_frames, limit).is_err() {
+    if epoch
+        .successful_opened_frames
+        .fetch_update(Ordering::AcqRel, Ordering::Acquire, |used| {
+            (used < limit).then(|| used.saturating_add(1))
+        })
+        .is_err()
+    {
         increment(&metrics.aead_open_budget_exhausted);
         return Err(IngressRedirectError::AeadUsageExhausted);
     }
@@ -2443,7 +2427,11 @@ fn record_failed_aead_authentication(
         return;
     }
     let limit = epoch.aead_failed_auth_limit.load(Ordering::Acquire);
-    let prior = reserve_aead_usage(&epoch.failed_aead_authentications, limit);
+    let prior = epoch.failed_aead_authentications.fetch_update(
+        Ordering::AcqRel,
+        Ordering::Acquire,
+        |failed| (failed < limit).then(|| failed.saturating_add(1)),
+    );
     let Ok(prior) = prior else {
         increment(&metrics.aead_failed_auth_budget_exhausted);
         return;
@@ -2772,50 +2760,6 @@ mod tests {
         FencedOwnershipCacheConfig, FencedOwnershipNamespace, TokioVirtualClock,
     };
     use opc_types::{NetworkFunctionKind, TenantId};
-
-    #[test]
-    fn aead_usage_reservation_returns_previous_value_and_preserves_exhaustion() {
-        let counter = AtomicU64::new(3);
-        assert_eq!(reserve_aead_usage(&counter, 5), Ok(3));
-        assert_eq!(reserve_aead_usage(&counter, 5), Ok(4));
-        assert_eq!(reserve_aead_usage(&counter, 5), Err(5));
-        assert_eq!(counter.load(Ordering::Acquire), 5);
-
-        let empty = AtomicU64::new(0);
-        assert_eq!(reserve_aead_usage(&empty, 0), Err(0));
-        assert_eq!(empty.load(Ordering::Acquire), 0);
-        let exhausted = AtomicU64::new(u64::MAX - 1);
-        assert_eq!(reserve_aead_usage(&exhausted, u64::MAX), Ok(u64::MAX - 1));
-        assert_eq!(reserve_aead_usage(&exhausted, u64::MAX), Err(u64::MAX));
-        assert_eq!(exhausted.load(Ordering::Acquire), u64::MAX);
-    }
-
-    #[test]
-    fn aead_usage_reservation_never_exceeds_budget_under_contention() {
-        const WORKERS: usize = 8;
-        const LIMIT: u64 = 64;
-        let counter = AtomicU64::new(0);
-        let previous_values = std::sync::Mutex::new(Vec::new());
-        let start = std::sync::Barrier::new(WORKERS);
-        std::thread::scope(|scope| {
-            for _ in 0..WORKERS {
-                scope.spawn(|| {
-                    start.wait();
-                    for _ in 0..LIMIT {
-                        match reserve_aead_usage(&counter, LIMIT) {
-                            Ok(previous) => previous_values.lock().expect("values").push(previous),
-                            Err(current) => assert_eq!(current, LIMIT),
-                        }
-                    }
-                });
-            }
-        });
-        let mut previous_values = previous_values.into_inner().expect("values");
-        previous_values.sort_unstable();
-        assert_eq!(previous_values, (0..LIMIT).collect::<Vec<_>>());
-        assert_eq!(counter.load(Ordering::Acquire), LIMIT);
-        assert_eq!(reserve_aead_usage(&counter, LIMIT), Err(LIMIT));
-    }
 
     fn owner(value: &str) -> OwnerId {
         OwnerId::new(value).expect("valid owner")

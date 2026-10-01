@@ -642,16 +642,11 @@ fn checked_counter_increment(counter: &AtomicU64, label: &str) {
 }
 
 fn checked_counter_increment_by(counter: &AtomicU64, increment: u64, label: &str) {
-    let mut value = counter.load(Ordering::Relaxed);
-    loop {
-        let next = value
-            .checked_add(increment)
-            .unwrap_or_else(|| panic!("{label} counter overflow"));
-        match counter.compare_exchange_weak(value, next, Ordering::Relaxed, Ordering::Relaxed) {
-            Ok(_) => break,
-            Err(observed) => value = observed,
-        }
-    }
+    counter
+        .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |value| {
+            value.checked_add(increment)
+        })
+        .unwrap_or_else(|_| panic!("{label} counter overflow"));
 }
 
 fn checked_counter_max(counter: &AtomicU64, value: u64, label: &str) {
@@ -1517,7 +1512,15 @@ async fn maintain_exact_history_batch(
         // bounded one-shot counter keeps unrelated qualification calls on
         // their ordinary production path.
         let result = match production_result {
-            Ok(_) if post_commit_reply_loss.is_some_and(take_one) => {
+            Ok(_)
+                if post_commit_reply_loss.is_some_and(|remaining| {
+                    remaining
+                        .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |count| {
+                            count.checked_sub(1)
+                        })
+                        .is_ok()
+                }) =>
+            {
                 checked_counter_increment(
                     &production_counters.post_commit_reply_loss_projections,
                     "post-commit reply-loss projections",
@@ -1624,7 +1627,12 @@ impl SessionConsensusPeer for ScopedLoopbackPeer {
     ) -> Result<SessionConsensusWireResponse, SessionConsensusPeerError> {
         let drop_forward_mutation_reply = request.family
             == SessionConsensusRpcFamily::ForwardMutation
-            && take_one(&self.forward_mutation_reply_losses);
+            && self
+                .forward_mutation_reply_losses
+                .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |remaining| {
+                    remaining.checked_sub(1)
+                })
+                .is_ok();
         let handler = self
             .handler
             .read()
@@ -14845,16 +14853,3 @@ async fn release_1010000_operation_successor_scale_is_bounded_and_recoverable() 
 #[cfg(target_os = "linux")]
 #[path = "fenced_transition_v2_qualification/volatile_scale.rs"]
 mod volatile_scale;
-
-fn take_one(counter: &AtomicUsize) -> bool {
-    let mut remaining = counter.load(Ordering::SeqCst);
-    loop {
-        let Some(next) = remaining.checked_sub(1) else {
-            return false;
-        };
-        match counter.compare_exchange_weak(remaining, next, Ordering::SeqCst, Ordering::SeqCst) {
-            Ok(_) => return true,
-            Err(observed) => remaining = observed,
-        }
-    }
-}

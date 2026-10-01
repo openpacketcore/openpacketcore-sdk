@@ -79,15 +79,9 @@ impl RegisteredSnapshot {
             return Err(FileControlError);
         }
         install_vfs()?;
-        let mut current = NEXT_ID.load(Ordering::Relaxed);
-        let id = loop {
-            let next = current.checked_add(1).ok_or(FileControlError)?;
-            match NEXT_ID.compare_exchange_weak(current, next, Ordering::Relaxed, Ordering::Relaxed)
-            {
-                Ok(previous) => break previous,
-                Err(observed) => current = observed,
-            }
-        };
+        let id = NEXT_ID
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |id| id.checked_add(1))
+            .map_err(|_| FileControlError)?;
         let mut entries = registry().lock().map_err(|_| FileControlError)?;
         if entries.len() >= MAX_REGISTRATIONS {
             return Err(FileControlError);

@@ -158,7 +158,14 @@ impl ConsensusPeer for LoopbackPeer {
             self.forward_response_ready.notify_one();
             self.release_forward_response.notified().await;
         }
-        if family == ConsensusRpcFamily::ForwardMutation && take_one(&self.drop_forward_responses) {
+        if family == ConsensusRpcFamily::ForwardMutation
+            && self
+                .drop_forward_responses
+                .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |remaining| {
+                    remaining.checked_sub(1)
+                })
+                .is_ok()
+        {
             return Err(ConsensusPeerError::Unavailable);
         }
         Ok(response)
@@ -3885,39 +3892,4 @@ async fn retained_history_lifecycle_metadata_is_authenticated_on_reopen() {
             .await
             .expect("exact metadata restoration restores admission");
     }
-}
-
-fn take_one(counter: &AtomicUsize) -> bool {
-    let mut remaining = counter.load(Ordering::SeqCst);
-    loop {
-        let Some(next) = remaining.checked_sub(1) else {
-            return false;
-        };
-        match counter.compare_exchange_weak(remaining, next, Ordering::SeqCst, Ordering::SeqCst) {
-            Ok(_) => return true,
-            Err(observed) => remaining = observed,
-        }
-    }
-}
-
-#[test]
-fn response_drop_budget_is_consumed_exactly_once_under_contention() {
-    const WORKERS: usize = 8;
-    const BUDGET: usize = 64;
-    let remaining = AtomicUsize::new(BUDGET);
-    let consumed = AtomicUsize::new(0);
-    let start = std::sync::Barrier::new(WORKERS);
-    std::thread::scope(|scope| {
-        for _ in 0..WORKERS {
-            scope.spawn(|| {
-                start.wait();
-                while take_one(&remaining) {
-                    consumed.fetch_add(1, Ordering::SeqCst);
-                }
-            });
-        }
-    });
-    assert_eq!(consumed.load(Ordering::SeqCst), BUDGET);
-    assert_eq!(remaining.load(Ordering::SeqCst), 0);
-    assert!(!take_one(&remaining));
 }
