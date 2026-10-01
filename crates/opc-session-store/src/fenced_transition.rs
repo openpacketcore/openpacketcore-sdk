@@ -1142,8 +1142,10 @@ impl fmt::Debug for PreparedFencedTransitionLookup {
 #[derive(Clone, PartialEq, Eq, thiserror::Error)]
 #[non_exhaustive]
 pub enum FencedTransitionExecuteError {
-    /// This invocation did not dispatch any request because its exact durable
-    /// prepared binding was unavailable.
+    /// This invocation did not dispatch the request: its exact durable
+    /// prepared binding was unavailable, no application byte was written, or
+    /// the endpoint answered with a closed `Unavailable` consumer rejection
+    /// before dispatch.
     #[error("fenced transition was not transmitted")]
     NotTransmitted,
     /// The exact request may have reached its effect boundary.

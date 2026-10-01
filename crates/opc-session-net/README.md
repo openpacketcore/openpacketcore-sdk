@@ -336,7 +336,15 @@ separately implement `SessionBackend`. This lets the fenced router compose the r
 `SessionConsumerFencedTransitionBackend` without inventing lease authority.
 `SessionConsumerPreparedCheckpointBackend` remains the separate full
 protected-session composite for prepared CAS and lease operations, which do
-require `ProtectedSessionBackend` and its lease surface.
+require `ProtectedSessionBackend` and its lease surface. Each prepared CAS or
+lease acquire starts at a rotating origin voter. It moves the identical
+request to the next voter after a proven pre-write failure or a complete
+closed `Rejected(Unavailable)` reply, which a server returns only before the
+operation reaches the consensus state machine. It ends `NotTransmitted` when
+every voter rejects or is unreachable. Scope, topology, authorization and
+validation rejections are terminal. The persistent client counts a closed
+`Rejected(Unavailable)` reply as a not-transmitted completion, not as an
+unsafe failure.
 
 `prepare_fenced_transition` keeps the exact outer protected journal token
 private in a move-only `SessionConsumerPreparedFencedTransition` handle. The
@@ -350,6 +358,10 @@ still pre-dispatch, cancellation is safe and retryable because no application
 bytes can cross the transport boundary. Once dispatch starts, any possible send
 (`OutcomeUnknown`) or cancellation makes the affine handle permanently
 receipt-only; it can never dispatch the mutation again.
+A complete closed `Rejected(Unavailable)` reply proves that the voter did not
+dispatch the transition. Because the call was already written, the handle
+returns a terminal `NotTransmitted` result and does not advance to another
+voter.
 An authenticated-scope `BeforeCallWrite` failure is topology revocation, not a
 rotatable `NotTransmitted` result, and terminalizes the handle.
 

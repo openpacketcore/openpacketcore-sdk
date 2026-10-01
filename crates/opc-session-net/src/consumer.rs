@@ -1430,13 +1430,17 @@ pub struct PersistentSessionConsumerDiagnostics {
     pub completed_operations: u64,
     /// Completed physical operations with a confirmed response.
     pub completed_operation_successes: u64,
-    /// Completed operations proven not to have written an application frame.
+    /// Completed operations proven to have had no effect: no application
+    /// frame was written, or the server answered with a complete closed
+    /// `Rejected(Unavailable)`, which it returns before a mutation reaches the
+    /// consensus state machine.
     pub completed_operation_not_transmitted: u64,
     /// Effectful operations whose application frame may have been written.
     pub completed_operation_outcome_unknown: u64,
     /// Completed operations that were neither successful, proven-unsent, nor
-    /// effect-ambiguous (for example a confirmed rejection or a read failure
-    /// after an application frame).
+    /// effect-ambiguous (for example a confirmed scope, topology,
+    /// authorization or validation rejection, or a read failure after an
+    /// application frame).
     pub completed_operation_other_failures: u64,
     /// Completed failure outcomes unsafe for a caller to treat as
     /// conclusively unsent.  This is a direct counter, not a difference of
@@ -1664,11 +1668,14 @@ impl SessionConsumerMutationError {
 #[derive(Clone, PartialEq, Eq, thiserror::Error)]
 #[non_exhaustive]
 pub enum SessionConsumerFencedTransitionMutationError {
-    /// No application-call byte was written, so the transition did not reach
-    /// the quorum and may be submitted on another admitted endpoint.
+    /// The transition did not reach the quorum and may be submitted on
+    /// another admitted endpoint: no application-call byte was written, or
+    /// the endpoint answered with a complete closed `Unavailable` rejection
+    /// before dispatch.
     #[error("consumer fenced transition was not transmitted: {cause}")]
     NotTransmitted {
-        /// Redaction-safe pre-write transport classification.
+        /// Redaction-safe classification of why the transition was not
+        /// dispatched.
         cause: SessionConsumerClientError,
     },
     /// The transition may have reached the quorum.  Do not automatically
@@ -3959,12 +3966,42 @@ fn response_is_known_failure(response: &SessionConsumerResponse) -> bool {
     }
 }
 
+/// Return whether a complete closed rejection proves that the answering voter
+/// did not dispatch the request.
+///
+/// A [`SessionConsumerRejection`] is a closed rejection before an operation
+/// reaches the consensus state machine, and `Unavailable` means that the
+/// server could not dispatch the request within its bound. For a mutation,
+/// the SDK's consensus quorum service returns it only before it submits the
+/// operation's own consensus intent, so another voter of the same quorum may
+/// serve the identical request. A read may receive it after read work, but
+/// never after an application effect. Scope, topology, authorization and
+/// validation rejections are deterministic decisions and remain confirmed
+/// failures.
+const fn consumer_rejection_proves_not_dispatched(rejection: SessionConsumerRejection) -> bool {
+    match rejection {
+        SessionConsumerRejection::Unavailable => true,
+        SessionConsumerRejection::ScopeMismatch
+        | SessionConsumerRejection::TopologyMismatch
+        | SessionConsumerRejection::MalformedRequest
+        | SessionConsumerRejection::Unauthorized => false,
+    }
+}
+
 fn completed_operation_class(
     operation: &SessionConsumerOperation,
     response: &SessionConsumerResponse,
 ) -> PersistentCompletedOperationClass {
     if response_is_outcome_unknown(operation, response) {
         PersistentCompletedOperationClass::OutcomeUnknown
+    } else if matches!(
+        response,
+        SessionConsumerResponse::Rejected(rejection)
+            if consumer_rejection_proves_not_dispatched(*rejection)
+    ) {
+        // A closed Unavailable rejection had no effect, as conclusively as an
+        // unwritten call frame, so it must not enter the unsafe aggregate.
+        PersistentCompletedOperationClass::NotTransmitted
     } else if response_is_known_failure(response) {
         PersistentCompletedOperationClass::OtherFailure
     } else {
@@ -5371,6 +5408,10 @@ impl PreparedFencedTransitionRoute {
 struct PreparedFencedTransitionWriteBoundary {
     write_progress: Arc<FrameWriteProgress>,
     may_have_sent: AtomicBool,
+    // A complete closed rejection proves that the written call was not
+    // dispatched. It does not clear the possible-send latch: the affine
+    // handle still never writes the mutation to a second voter.
+    rejected_before_dispatch: AtomicBool,
     latched: AtomicBool,
     route: Arc<PreparedFencedTransitionRoute>,
     voter_count: usize,
@@ -5385,6 +5426,7 @@ impl PreparedFencedTransitionWriteBoundary {
         Self {
             write_progress,
             may_have_sent: AtomicBool::new(false),
+            rejected_before_dispatch: AtomicBool::new(false),
             latched: AtomicBool::new(false),
             route,
             voter_count,
@@ -5393,6 +5435,14 @@ impl PreparedFencedTransitionWriteBoundary {
 
     fn mark_may_have_sent(&self) {
         self.may_have_sent.store(true, Ordering::Release);
+    }
+
+    fn mark_rejected_before_dispatch(&self) {
+        self.rejected_before_dispatch.store(true, Ordering::Release);
+    }
+
+    fn rejected_before_dispatch(&self) -> bool {
+        self.rejected_before_dispatch.load(Ordering::Acquire)
     }
 
     /// Record an actual physical attempt exactly once. This is deliberately
@@ -5737,6 +5787,15 @@ impl SessionBackend for ActivatedFencedTransitionBackend {
             // response was lost. A pending/zero-byte cancellation leaves the
             // boundary clear instead.
             write_boundary.mark_may_have_sent();
+        }
+        if matches!(
+            &response,
+            Ok(SessionConsumerResponse::Rejected(rejection))
+                if consumer_rejection_proves_not_dispatched(*rejection)
+        ) {
+            // The voter answered with a complete closed rejection, so the
+            // written call never reached the consensus state machine.
+            write_boundary.mark_rejected_before_dispatch();
         }
         let _ = write_boundary.latch_possible_send();
         prepared_fenced_transition_execute_response(&request, response)
@@ -17069,6 +17128,16 @@ impl PersistentPreparedFencedTransitionToken {
                     return Ok(outcome);
                 }
                 Ok(Err(FencedTransitionExecuteError::NotTransmitted)) => {
+                    if write_boundary.rejected_before_dispatch() {
+                        // The voter answered with a complete closed rejection:
+                        // the transition was written but never dispatched.
+                        // This handle has spent its one write, so it reports
+                        // the not-dispatched result without rotating.
+                        if let Some(preparation) = preparation.as_mut() {
+                            preparation.terminal();
+                        }
+                        return Err(FencedTransitionExecuteError::NotTransmitted);
+                    }
                     if write_boundary.latch_possible_send() {
                         preparation
                             .as_mut()
@@ -17518,6 +17587,15 @@ impl PersistentPreparedCompareAndSetToken {
                     dispatch.terminal();
                     return Ok(PreparedCompareAndSetOutcome::Rejected(error));
                 }
+                Ok(SessionConsumerResponse::Rejected(rejection))
+                    if consumer_rejection_proves_not_dispatched(rejection) =>
+                {
+                    // The voter refused admission before the request reached
+                    // the consensus state machine. As for a pre-write
+                    // failure, the identical request moves to the next voter.
+                    self.state.not_transmitted();
+                    continue;
+                }
                 Ok(SessionConsumerResponse::Rejected(SessionConsumerRejection::ScopeMismatch)) => {
                     dispatch.terminal();
                     return Err(PreparedCompareAndSetExecuteError::TopologyAuthorityRevoked);
@@ -17790,16 +17868,23 @@ fn classify_prepared_lease_acquire_error(
 
 /// Complete wire rejections are known pre-dispatch outcomes. Keep their
 /// bounded typed classification separate from transport ambiguity.
+///
+/// `None` means that the voter proved it did not dispatch the acquire (see
+/// [`consumer_rejection_proves_not_dispatched`]), so the router moves the
+/// identical request to its next voter. Every other rejection is a terminal
+/// typed result.
 fn classify_prepared_lease_acquire_rejection(
     rejection: SessionConsumerRejection,
-) -> PreparedLeaseAcquireExecuteError {
+) -> Option<PreparedLeaseAcquireExecuteError> {
     match rejection {
+        SessionConsumerRejection::Unavailable => None,
         SessionConsumerRejection::ScopeMismatch | SessionConsumerRejection::TopologyMismatch => {
-            PreparedLeaseAcquireExecuteError::TopologyAuthorityRevoked
+            Some(PreparedLeaseAcquireExecuteError::TopologyAuthorityRevoked)
         }
-        SessionConsumerRejection::Unavailable => PreparedLeaseAcquireExecuteError::Unavailable,
         SessionConsumerRejection::Unauthorized | SessionConsumerRejection::MalformedRequest => {
-            PreparedLeaseAcquireExecuteError::Rejected(rejection_into_lease_error(rejection))
+            Some(PreparedLeaseAcquireExecuteError::Rejected(
+                rejection_into_lease_error(rejection),
+            ))
         }
     }
 }
@@ -17873,8 +17958,16 @@ impl PersistentPreparedLeaseAcquireToken {
                     }
                 }
                 Ok(SessionConsumerResponse::Rejected(rejection)) => {
+                    let Some(error) = classify_prepared_lease_acquire_rejection(rejection) else {
+                        // The voter refused admission before the acquire
+                        // reached the consensus state machine. As for a
+                        // pre-write failure, the identical request moves to
+                        // the next voter.
+                        self.state.not_transmitted();
+                        continue;
+                    };
                     dispatch.terminal();
-                    return Err(classify_prepared_lease_acquire_rejection(rejection));
+                    return Err(error);
                 }
                 Err(SessionConsumerCallError::BeforeCallWrite(
                     SessionConsumerClientError::Scope,
@@ -18149,6 +18242,18 @@ fn fenced_transition_response(
                 cause: SessionConsumerClientError::Protocol,
             },
         ),
+        // The endpoint refused admission before the transition reached the
+        // consensus state machine. Keep that proof distinguishable from a
+        // confirmed store rejection.
+        Ok(SessionConsumerResponse::Rejected(rejection))
+            if consumer_rejection_proves_not_dispatched(rejection) =>
+        {
+            Err(
+                SessionConsumerFencedTransitionMutationError::NotTransmitted {
+                    cause: consumer_rejection_into_client_error(rejection),
+                },
+            )
+        }
         Ok(SessionConsumerResponse::Rejected(rejection)) => {
             Err(SessionConsumerFencedTransitionMutationError::Store(
                 rejection_into_store_error(rejection),
@@ -20975,15 +21080,16 @@ mod tests {
         consumer_fresh_admission_is_current, consumer_hello_rejection,
         consumer_operation_is_effectful, consumer_payload_fragments_exceed_frame,
         consumer_public_response_from_wire, consumer_rejection_into_client_error,
-        consumer_request_has_exact_fenced_transition_id, consumer_response_fits,
-        consumer_timeout_response, consumer_tls_setup_error, consumer_watch_error_is_legal,
-        consumer_wire_response_from_public, decode_consumer_frame_payload,
-        ensure_pre_request_budget_remaining, exact_correlation, fenced_transition_response,
-        lease_error_matches_operation, lease_mutation_status_matches_request,
-        lease_mutation_status_wire_matches_request, lease_response, mutation_response,
-        persistent_execute_error, persistent_roster_execute_error_for_request,
-        poll_persistent_consumer_setup_io, poll_persistent_reconnect_setup,
-        prepared_fenced_transition_execute_response, prepared_fenced_transition_status_response,
+        consumer_rejection_proves_not_dispatched, consumer_request_has_exact_fenced_transition_id,
+        consumer_response_fits, consumer_timeout_response, consumer_tls_setup_error,
+        consumer_watch_error_is_legal, consumer_wire_response_from_public,
+        decode_consumer_frame_payload, ensure_pre_request_budget_remaining, exact_correlation,
+        fenced_transition_response, lease_error_matches_operation,
+        lease_mutation_status_matches_request, lease_mutation_status_wire_matches_request,
+        lease_response, mutation_response, persistent_execute_error,
+        persistent_roster_execute_error_for_request, poll_persistent_consumer_setup_io,
+        poll_persistent_reconnect_setup, prepared_fenced_transition_execute_response,
+        prepared_fenced_transition_status_response,
         prepared_fenced_transition_status_retryable_before, prepared_router_roster_is_distinct,
         prepared_voter_index, publish_monotonic_shutdown_phase, queued_consumer_watch_stream,
         read_authenticated_consumer_frame_until, read_authenticated_consumer_frame_within,
@@ -21475,6 +21581,50 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn fenced_complete_unavailable_rejection_is_not_transmitted_and_others_stay_rejected() {
+        let request = authenticated_consumer_record_free_request(0x74, false).await;
+        let unavailable = || {
+            Ok(SessionConsumerResponse::Rejected(
+                SessionConsumerRejection::Unavailable,
+            ))
+        };
+        assert_eq!(
+            fenced_transition_response(&request, unavailable()),
+            Err(
+                SessionConsumerFencedTransitionMutationError::NotTransmitted {
+                    cause: SessionConsumerClientError::Unavailable,
+                }
+            ),
+            "a closed pre-dispatch rejection stays distinguishable from a store rejection"
+        );
+        assert_eq!(
+            consumer_execute_into_fenced_transition(
+                &request,
+                fenced_transition_response(&request, unavailable()),
+            ),
+            Err(FencedTransitionExecuteError::NotTransmitted),
+            "a single-voter fenced backend reports the not-dispatched result"
+        );
+        for rejection in [
+            SessionConsumerRejection::ScopeMismatch,
+            SessionConsumerRejection::TopologyMismatch,
+            SessionConsumerRejection::MalformedRequest,
+            SessionConsumerRejection::Unauthorized,
+        ] {
+            assert!(
+                matches!(
+                    fenced_transition_response(
+                        &request,
+                        Ok(SessionConsumerResponse::Rejected(rejection)),
+                    ),
+                    Err(SessionConsumerFencedTransitionMutationError::Store(_))
+                ),
+                "authority and validation rejections stay confirmed rejections"
+            );
+        }
+    }
+
     #[tokio::test(start_paused = true)]
     async fn prepared_fenced_not_found_at_exact_outer_deadline_is_terminal_deadline() {
         let deadline = tokio::time::Instant::now() + Duration::from_secs(1);
@@ -21678,19 +21828,42 @@ mod tests {
     }
 
     #[test]
-    fn prepared_acquire_complete_wire_unavailable_is_typed_terminal() {
-        assert!(matches!(
-            classify_prepared_lease_acquire_rejection(SessionConsumerRejection::Unavailable),
-            PreparedLeaseAcquireExecuteError::Unavailable
-        ));
+    fn prepared_acquire_complete_wire_unavailable_rotates_and_other_rejections_are_terminal() {
+        assert!(
+            classify_prepared_lease_acquire_rejection(SessionConsumerRejection::Unavailable)
+                .is_none(),
+            "a closed pre-dispatch Unavailable rejection moves the acquire to the next voter"
+        );
         assert!(matches!(
             classify_prepared_lease_acquire_rejection(SessionConsumerRejection::Unauthorized),
-            PreparedLeaseAcquireExecuteError::Rejected(_)
+            Some(PreparedLeaseAcquireExecuteError::Rejected(_))
         ));
         assert!(matches!(
             classify_prepared_lease_acquire_rejection(SessionConsumerRejection::MalformedRequest),
-            PreparedLeaseAcquireExecuteError::Rejected(_)
+            Some(PreparedLeaseAcquireExecuteError::Rejected(_))
         ));
+        for rejection in [
+            SessionConsumerRejection::ScopeMismatch,
+            SessionConsumerRejection::TopologyMismatch,
+        ] {
+            assert!(matches!(
+                classify_prepared_lease_acquire_rejection(rejection),
+                Some(PreparedLeaseAcquireExecuteError::TopologyAuthorityRevoked)
+            ));
+        }
+        for rejection in [
+            SessionConsumerRejection::ScopeMismatch,
+            SessionConsumerRejection::TopologyMismatch,
+            SessionConsumerRejection::MalformedRequest,
+            SessionConsumerRejection::Unauthorized,
+            SessionConsumerRejection::Unavailable,
+        ] {
+            assert_eq!(
+                classify_prepared_lease_acquire_rejection(rejection).is_none(),
+                consumer_rejection_proves_not_dispatched(rejection),
+                "the acquire rotates exactly on the shared not-dispatched classification"
+            );
+        }
     }
 
     #[test]
@@ -22605,6 +22778,367 @@ mod tests {
 
         a_server.abort_and_wait().await;
         b_server.abort_and_wait().await;
+    }
+
+    /// Three exact same-scope voters for prepared-router failover tests. The
+    /// router keeps this order, so request origin zero selects voter A.
+    struct PreparedFailoverVoters {
+        router: Arc<PreparedConsumerRouter>,
+        scope: SessionConsumerScope,
+        servers: Vec<super::SessionQuorumConsumerServerHandle>,
+    }
+
+    impl PreparedFailoverVoters {
+        async fn unsafe_failures(&self) -> [u64; 3] {
+            let mut counts = [0; 3];
+            for (count, client) in counts.iter_mut().zip(self.router.clients.iter()) {
+                *count = client
+                    .diagnostics()
+                    .await
+                    .completed_operation_unsafe_failures;
+            }
+            counts
+        }
+
+        async fn not_transmitted(&self) -> [u64; 3] {
+            let mut counts = [0; 3];
+            for (count, client) in counts.iter_mut().zip(self.router.clients.iter()) {
+                *count = client
+                    .diagnostics()
+                    .await
+                    .completed_operation_not_transmitted;
+            }
+            counts
+        }
+
+        async fn shutdown(self) {
+            for server in self.servers {
+                server.abort_and_wait().await;
+            }
+        }
+    }
+
+    /// Start one authenticated listener for each `Some` service. A `None`
+    /// voter keeps its exact roster authority, but its resolver fails, so the
+    /// router can reach it only as a proven pre-write failure.
+    async fn prepared_failover_voters(
+        label: &str,
+        services: [Option<Arc<dyn SessionQuorumConsumer>>; 3],
+    ) -> PreparedFailoverVoters {
+        let client_identity = material_spiffe(&format!("{label}-client"));
+        let voter_identities = [
+            material_spiffe(&format!("{label}-voter-a")),
+            material_spiffe(&format!("{label}-voter-b")),
+            material_spiffe(&format!("{label}-voter-c")),
+        ];
+        let client_material = RotatableClientMaterial::new(client_identity.as_str());
+        let roster = test_consumer_roster_for(&voter_identities);
+        let grant = opc_session_store::SessionConsumerAuthorizationGrant::try_new(
+            client_identity,
+            [SessionConsumerTenantNfScope::new(
+                TenantId::new("prepared-router-cas").expect("test tenant"),
+                NetworkFunctionKind::smf(),
+            )],
+        )
+        .expect("prepared failover grant");
+        let mut servers = Vec::new();
+        let mut clients = Vec::with_capacity(voter_identities.len());
+        for (identity, service) in voter_identities.iter().zip(services) {
+            let authority = voter_authority_for_identity(&roster, identity);
+            let stateless = match service {
+                Some(service) => {
+                    let authorizer = SessionConsumerAuthorizer::try_new(
+                        roster
+                            .clone()
+                            .authorization_manifest(authority.node_id(), [grant.clone()])
+                            .expect("prepared failover manifest"),
+                    )
+                    .expect("prepared failover authorizer");
+                    let (server, address) = SessionQuorumConsumerServer::new(
+                        service,
+                        client_material.trusted_server_config(identity.as_str()),
+                        authorizer,
+                    )
+                    .listen("127.0.0.1:0".parse().expect("prepared failover listener"))
+                    .await
+                    .expect("prepared failover listener starts");
+                    servers.push(server);
+                    StatelessSessionConsumerClient::new(
+                        address,
+                        rustls_pki_types::ServerName::IpAddress(address.ip().into()),
+                        authority,
+                        client_material.config(),
+                    )
+                }
+                None => {
+                    let unreachable: RemoteAddrResolver = Arc::new(|| {
+                        Box::pin(async {
+                            Err(io::Error::new(
+                                io::ErrorKind::ConnectionRefused,
+                                "unreachable prepared failover voter",
+                            ))
+                        })
+                    });
+                    StatelessSessionConsumerClient::new_with_resolver(
+                        unreachable,
+                        rustls_pki_types::ServerName::try_from("consumer.test")
+                            .expect("unreachable voter server name"),
+                        authority,
+                        client_material.config(),
+                    )
+                }
+            };
+            clients.push(
+                PersistentSessionConsumerClient::from_stateless(stateless)
+                    .expect("prepared failover persistent voter"),
+            );
+        }
+        PreparedFailoverVoters {
+            router: Arc::new(
+                PreparedConsumerRouter::persistent(clients).expect("three exact prepared voters"),
+            ),
+            scope: roster.scope(),
+            servers,
+        }
+    }
+
+    /// One comparison of a prepared request's result, its application reach
+    /// on each voter, its rotating cursor and each voter's coherent
+    /// completed-operation safety accounting.
+    #[derive(Debug, PartialEq, Eq)]
+    struct PreparedFailoverObservation<T> {
+        outcome: T,
+        mutation_calls: [usize; 3],
+        mutation_cursor: usize,
+        unsafe_failures: [u64; 3],
+        not_transmitted: [u64; 3],
+    }
+
+    fn prepared_failover_budget() -> PreparedCheckpointBudget {
+        PreparedCheckpointBudget::new(
+            tokio::time::Instant::now() + Duration::from_secs(3),
+            opc_session_store::PREPARED_CHECKPOINT_MAX_PHYSICAL_ATTEMPT,
+        )
+        .expect("prepared failover budget")
+    }
+
+    #[tokio::test]
+    async fn prepared_cas_complete_unavailable_rejection_completes_through_next_voter() {
+        let rejected_calls = Arc::new(AtomicUsize::new(0));
+        let next_mutation_calls = Arc::new(AtomicUsize::new(0));
+        let next_status_calls = Arc::new(AtomicUsize::new(0));
+        let last_mutation_calls = Arc::new(AtomicUsize::new(0));
+        let voters = prepared_failover_voters(
+            "prepared-cas-unavailable",
+            [
+                Some(Arc::new(CountingRejectingTestConsumer {
+                    calls: Arc::clone(&rejected_calls),
+                })),
+                Some(Arc::new(HealthyPreparedCasConsumer {
+                    mutation_calls: Arc::clone(&next_mutation_calls),
+                    status_calls: Arc::clone(&next_status_calls),
+                })),
+                Some(Arc::new(HealthyPreparedCasConsumer {
+                    mutation_calls: Arc::clone(&last_mutation_calls),
+                    status_calls: Arc::new(AtomicUsize::new(0)),
+                })),
+            ],
+        )
+        .await;
+        let token = PersistentPreparedCompareAndSetToken {
+            router: Arc::clone(&voters.router),
+            request: Arc::new(
+                unprotected_router_state_test_compare_and_set_request(voters.scope).await,
+            ),
+            receipt: OnceLock::new(),
+            budget: prepared_failover_budget(),
+            // The rotating origin selects voter A, which withholds admission.
+            state: PreparedRequestState::new(0),
+            terminal_receipt: StdMutex::new(None),
+        };
+
+        let outcome = token.execute_once().await;
+        assert_eq!(
+            PreparedFailoverObservation {
+                outcome,
+                mutation_calls: [
+                    rejected_calls.load(Ordering::SeqCst),
+                    next_mutation_calls.load(Ordering::SeqCst),
+                    last_mutation_calls.load(Ordering::SeqCst),
+                ],
+                mutation_cursor: token.state.mutation_cursor.load(Ordering::Acquire),
+                unsafe_failures: voters.unsafe_failures().await,
+                not_transmitted: voters.not_transmitted().await,
+            },
+            PreparedFailoverObservation {
+                outcome: Ok(PreparedCompareAndSetOutcome::Applied),
+                mutation_calls: [1, 1, 0],
+                mutation_cursor: 1,
+                unsafe_failures: [0, 0, 0],
+                not_transmitted: [1, 0, 0],
+            },
+            "a complete Unavailable rejection proves A did not dispatch the exact request, \
+             so it completes on B and is not an unsafe completion"
+        );
+        assert_eq!(token.state.phase.load(Ordering::Acquire), PREPARED_TERMINAL);
+        assert_eq!(
+            token
+                .status_once(tokio::time::Instant::now() + Duration::from_millis(250))
+                .await,
+            Err(PreparedCompareAndSetStatusError::NotExecuted),
+            "the confirmed outcome from B needs no receipt lookup"
+        );
+        assert_eq!(next_status_calls.load(Ordering::SeqCst), 0);
+        voters.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn prepared_lease_complete_unavailable_rejection_completes_through_next_voter() {
+        let key = SessionKey {
+            tenant: TenantId::new("prepared-router-cas").expect("test tenant"),
+            nf_kind: NetworkFunctionKind::smf(),
+            key_type: SessionKeyType::PduSession,
+            stable_id: Bytes::from_static(b"prepared-router-lease")
+                .try_into()
+                .expect("bounded stable ID"),
+        };
+        let owner = OwnerId::new("prepared-router-lease-owner").expect("test owner");
+        let ttl = Duration::from_secs(30);
+        let expected_lease = FakeSessionBackend::new()
+            .acquire(&key, owner.clone(), ttl)
+            .await
+            .expect("local lease response");
+        let rejected_calls = Arc::new(AtomicUsize::new(0));
+        let next_mutation_calls = Arc::new(AtomicUsize::new(0));
+        let next_status_calls = Arc::new(AtomicUsize::new(0));
+        let last_mutation_calls = Arc::new(AtomicUsize::new(0));
+        let voters = prepared_failover_voters(
+            "prepared-lease-unavailable",
+            [
+                Some(Arc::new(CountingRejectingTestConsumer {
+                    calls: Arc::clone(&rejected_calls),
+                })),
+                Some(Arc::new(HealthyPreparedLeaseConsumer {
+                    lease: expected_lease.clone(),
+                    mutation_calls: Arc::clone(&next_mutation_calls),
+                    status_calls: Arc::clone(&next_status_calls),
+                })),
+                Some(Arc::new(HealthyPreparedLeaseConsumer {
+                    lease: expected_lease.clone(),
+                    mutation_calls: Arc::clone(&last_mutation_calls),
+                    status_calls: Arc::new(AtomicUsize::new(0)),
+                })),
+            ],
+        )
+        .await;
+        let token = PersistentPreparedLeaseAcquireToken {
+            router: Arc::clone(&voters.router),
+            request: Arc::new(SessionConsumerRequest::new(
+                voters.scope,
+                SessionConsumerRequestId::new(),
+                SessionConsumerOperation::AcquireLease { key, owner, ttl },
+            )),
+            receipt: OnceLock::new(),
+            budget: prepared_failover_budget(),
+            // The rotating origin selects voter A, which withholds admission.
+            state: PreparedRequestState::new(0),
+            terminal_receipt: StdMutex::new(None),
+        };
+
+        let outcome = token.execute_once().await;
+        assert_eq!(
+            PreparedFailoverObservation {
+                outcome,
+                mutation_calls: [
+                    rejected_calls.load(Ordering::SeqCst),
+                    next_mutation_calls.load(Ordering::SeqCst),
+                    last_mutation_calls.load(Ordering::SeqCst),
+                ],
+                mutation_cursor: token.state.mutation_cursor.load(Ordering::Acquire),
+                unsafe_failures: voters.unsafe_failures().await,
+                not_transmitted: voters.not_transmitted().await,
+            },
+            PreparedFailoverObservation {
+                outcome: Ok(expected_lease),
+                mutation_calls: [1, 1, 0],
+                mutation_cursor: 1,
+                unsafe_failures: [0, 0, 0],
+                not_transmitted: [1, 0, 0],
+            },
+            "a complete Unavailable rejection proves A did not dispatch the exact acquire, \
+             so it completes on B and is not an unsafe completion"
+        );
+        assert_eq!(token.state.phase.load(Ordering::Acquire), PREPARED_TERMINAL);
+        assert_eq!(
+            token
+                .status_once(tokio::time::Instant::now() + Duration::from_millis(250))
+                .await,
+            Err(PreparedLeaseAcquireStatusError::NotExecuted),
+            "the confirmed lease from B needs no receipt lookup"
+        );
+        assert_eq!(next_status_calls.load(Ordering::SeqCst), 0);
+        voters.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn prepared_cas_every_voter_rejecting_or_unreachable_is_not_transmitted() {
+        let first_calls = Arc::new(AtomicUsize::new(0));
+        let last_calls = Arc::new(AtomicUsize::new(0));
+        let voters = prepared_failover_voters(
+            "prepared-cas-all-unavailable",
+            [
+                Some(Arc::new(CountingRejectingTestConsumer {
+                    calls: Arc::clone(&first_calls),
+                })),
+                None,
+                Some(Arc::new(CountingRejectingTestConsumer {
+                    calls: Arc::clone(&last_calls),
+                })),
+            ],
+        )
+        .await;
+        let token = PersistentPreparedCompareAndSetToken {
+            router: Arc::clone(&voters.router),
+            request: Arc::new(
+                unprotected_router_state_test_compare_and_set_request(voters.scope).await,
+            ),
+            receipt: OnceLock::new(),
+            budget: prepared_failover_budget(),
+            state: PreparedRequestState::new(0),
+            terminal_receipt: StdMutex::new(None),
+        };
+
+        let outcome = token.execute_once().await;
+        assert_eq!(
+            PreparedFailoverObservation {
+                outcome,
+                mutation_calls: [
+                    first_calls.load(Ordering::SeqCst),
+                    0,
+                    last_calls.load(Ordering::SeqCst),
+                ],
+                mutation_cursor: token.state.mutation_cursor.load(Ordering::Acquire),
+                unsafe_failures: voters.unsafe_failures().await,
+                not_transmitted: voters.not_transmitted().await,
+            },
+            PreparedFailoverObservation {
+                outcome: Err(PreparedCompareAndSetExecuteError::NotTransmitted),
+                mutation_calls: [1, 0, 1],
+                mutation_cursor: 3,
+                unsafe_failures: [0, 0, 0],
+                not_transmitted: [1, 0, 1],
+            },
+            "A and C reject before dispatch and B is unreachable, so no voter dispatched it"
+        );
+        assert_eq!(token.state.phase.load(Ordering::Acquire), PREPARED_TERMINAL);
+        assert_eq!(
+            token
+                .status_once(tokio::time::Instant::now() + Duration::from_millis(250))
+                .await,
+            Err(PreparedCompareAndSetStatusError::NotExecuted),
+            "a request that no voter dispatched has no receipt authority"
+        );
+        voters.shutdown().await;
     }
 
     // Reproduces the old race precisely: clone A sampled status state but was
@@ -23885,6 +24419,8 @@ mod tests {
     enum PublicProtectedFencedMutationBehavior {
         CommitThenLoseResponse,
         Unauthorized,
+        /// Withhold admission with the closed pre-dispatch rejection.
+        Unavailable,
     }
 
     #[derive(Clone, Copy)]
@@ -23976,6 +24512,9 @@ mod tests {
                             SessionConsumerResponse::Rejected(
                                 SessionConsumerRejection::Unauthorized,
                             )
+                        }
+                        PublicProtectedFencedMutationBehavior::Unavailable => {
+                            SessionConsumerResponse::Rejected(SessionConsumerRejection::Unavailable)
                         }
                     }
                 }
@@ -24753,10 +25292,14 @@ mod tests {
         }
 
         /// Replace one listener with the same authenticated authority but an
-        /// explicit application authorization denial. This keeps the real
+        /// explicit typed application mutation rejection. This keeps the real
         /// request on its exact activated voter and distinguishes a typed
-        /// server denial from transient TLS/setup material failures.
-        async fn replace_voter_with_unauthorized_mutation(&mut self, index: usize) {
+        /// server rejection from transient TLS/setup material failures.
+        async fn replace_voter_with_mutation_behavior(
+            &mut self,
+            index: usize,
+            mutation_behavior: PublicProtectedFencedMutationBehavior,
+        ) {
             assert!(index < self.servers.len());
             self.servers.remove(index).abort_and_wait().await;
             self.composite.router.clients[index]
@@ -24769,7 +25312,7 @@ mod tests {
                     .authorization_manifest(self.authorities[index].node_id(), [self.grant.clone()])
                     .expect("same exact local voter remains a valid manifest"),
             )
-            .expect("authorization-denying test authorizer");
+            .expect("typed-rejection test authorizer");
             let voter = ["A", "B", "C"][index];
             let (server, address) = SessionQuorumConsumerServer::new(
                 Arc::new(PublicProtectedFencedVoterConsumer {
@@ -24781,7 +25324,7 @@ mod tests {
                     recorded_outcome: Arc::clone(&self.recorded_outcome),
                     preflight_behavior: PublicProtectedFencedPreflightBehavior::Available,
                     status_behavior: PublicProtectedFencedStatusBehavior::Unavailable,
-                    mutation_behavior: PublicProtectedFencedMutationBehavior::Unauthorized,
+                    mutation_behavior,
                 }),
                 self.client_material
                     .trusted_server_config(self.voter_identities[index].as_str()),
@@ -24789,7 +25332,7 @@ mod tests {
             )
             .listen(self.addresses[index])
             .await
-            .expect("replace listener with authorization denial");
+            .expect("replace listener with typed mutation rejection");
             assert_eq!(
                 address, self.addresses[index],
                 "the client reaches the replacement only through its activated endpoint"
@@ -25238,7 +25781,12 @@ mod tests {
             )
             .await
             .expect("local preparation succeeds before application authorization changes");
-        fixture.replace_voter_with_unauthorized_mutation(0).await;
+        fixture
+            .replace_voter_with_mutation_behavior(
+                0,
+                PublicProtectedFencedMutationBehavior::Unauthorized,
+            )
+            .await;
 
         assert_eq!(
             prepared.execute_once().await,
@@ -25259,6 +25807,74 @@ mod tests {
             prepared.execute_once().await,
             Err(FencedTransitionExecuteError::NotTransmitted),
             "the terminal application denial seals the execute handle"
+        );
+        fixture.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn public_protected_fenced_mutation_unavailable_is_not_transmitted_without_rotation() {
+        let mut fixture = public_protected_fenced_acceptance_fixture(
+            [PublicProtectedFencedStatusBehavior::Recorded; 3],
+            [PublicProtectedFencedPreflightBehavior::Available; 3],
+        )
+        .await;
+        let request = public_protected_fenced_request_on_a(&fixture.composite, 0x53);
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(3);
+        let mut prepared = fixture
+            .composite
+            .prepare_fenced_transition(
+                request,
+                PreparedCheckpointBudget::new(deadline, Duration::from_millis(100))
+                    .expect("bounded public protected fenced budget"),
+            )
+            .await
+            .expect("local preparation succeeds before A withholds admission");
+        fixture
+            .replace_voter_with_mutation_behavior(
+                0,
+                PublicProtectedFencedMutationBehavior::Unavailable,
+            )
+            .await;
+        let before = fixture.composite.router.clients[0].diagnostics().await;
+
+        let outcome = prepared.execute_once().await;
+        let after = fixture.composite.router.clients[0].diagnostics().await;
+        assert_eq!(
+            (
+                outcome,
+                after.completed_operations - before.completed_operations,
+                after.completed_operation_not_transmitted
+                    - before.completed_operation_not_transmitted,
+                after.completed_operation_unsafe_failures
+                    - before.completed_operation_unsafe_failures,
+            ),
+            (Err(FencedTransitionExecuteError::NotTransmitted), 1, 1, 0),
+            "A's complete Unavailable rejection proves the transition was not dispatched"
+        );
+        assert_eq!(
+            fixture
+                .mutation_calls
+                .each_ref()
+                .map(|calls| calls.load(Ordering::SeqCst)),
+            [0, 0, 0],
+            "the affine handle spent its one write on A and cannot rotate it to B or C"
+        );
+        assert_eq!(
+            prepared.status_once(deadline).await,
+            Err(SessionConsumerPreparedFencedTransitionStatusError::NotExecuted),
+            "a transition that was not dispatched has no receipt to recover"
+        );
+        assert_eq!(
+            fixture
+                .status_calls
+                .each_ref()
+                .map(|calls| calls.load(Ordering::SeqCst)),
+            [0, 0, 0]
+        );
+        assert_eq!(
+            prepared.execute_once().await,
+            Err(FencedTransitionExecuteError::NotTransmitted),
+            "the terminal not-dispatched result seals the execute handle"
         );
         fixture.shutdown().await;
     }
@@ -36218,7 +36834,9 @@ mod tests {
             SessionConsumerResponse::FencedMutationRosterTerminalize(
                 SessionConsumerRosterTerminalMutationResponse::NotTransmitted,
             ),
-            SessionConsumerResponse::Rejected(SessionConsumerRejection::Unavailable),
+            // A closed Unavailable rejection is a not-transmitted completion;
+            // see `complete_unavailable_rejection_is_a_not_transmitted_completion`.
+            SessionConsumerResponse::Rejected(SessionConsumerRejection::ScopeMismatch),
         ];
 
         for response in failures {
@@ -36235,6 +36853,37 @@ mod tests {
             ),
             PersistentCompletedOperationClass::Success
         );
+    }
+
+    #[test]
+    fn complete_unavailable_rejection_is_a_not_transmitted_completion() {
+        let read = SessionConsumerOperation::Capabilities;
+        let lease_mutation = mutation_request(SessionConsumerRequestId::new());
+        for operation in [&read, lease_mutation.operation()] {
+            assert_eq!(
+                completed_operation_class(
+                    operation,
+                    &SessionConsumerResponse::Rejected(SessionConsumerRejection::Unavailable),
+                ),
+                PersistentCompletedOperationClass::NotTransmitted,
+                "a closed Unavailable rejection had no effect and is not an unsafe completion"
+            );
+            for rejection in [
+                SessionConsumerRejection::ScopeMismatch,
+                SessionConsumerRejection::TopologyMismatch,
+                SessionConsumerRejection::MalformedRequest,
+                SessionConsumerRejection::Unauthorized,
+            ] {
+                assert_eq!(
+                    completed_operation_class(
+                        operation,
+                        &SessionConsumerResponse::Rejected(rejection),
+                    ),
+                    PersistentCompletedOperationClass::OtherFailure,
+                    "authority and validation rejections stay confirmed failures"
+                );
+            }
+        }
     }
 
     #[test]
