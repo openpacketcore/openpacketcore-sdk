@@ -14,6 +14,10 @@ use opc_types::{NetworkFunctionKind, SpiffeId, TenantId};
 use p256::ecdsa::{signature::hazmat::PrehashSigner, SigningKey};
 use serde::{Deserialize, Serialize};
 
+pub use super::activation_evidence::{
+    observe_capability_activation_for_test, CapabilityActivationFailureForTest,
+    CapabilityActivationFailureStageForTest,
+};
 pub use super::membership::{
     is_replayed_joint_voting_for_test, observe_next_unstage_supervisor_for_test,
     pause_next_learner_barrier_snapshot_for_test, pause_next_outbound_learner_barrier_for_test,
