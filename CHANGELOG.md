@@ -9,6 +9,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- `opc-session-net`: a prepared compare-and-set or lease acquire whose
+  current voter answers with a complete `Rejected(Unavailable)` now moves the
+  identical request to the next voter, as after a pre-write failure, and ends
+  `NotTransmitted` when every voter rejects or is unreachable. That rejection
+  is closed and precedes the consensus state machine; before, the request
+  failed although the rest of the quorum could serve it. Completed-operation
+  accounting now records the reply as not transmitted instead of as an other
+  failure, so it no longer raises `completed_operation_unsafe_failures`. A V1
+  fenced transition reports it as `NotTransmitted` instead of a rejected
+  `BackendUnavailable`; the activated affine handle still never sends a
+  written mutation to a second voter. Scope, topology, authorization and
+  validation rejections are unchanged. Fixes #1036.
+
 - `opc-gtpu-dataplane`: exact TFT classifier removal no longer drops
   default-bearer uplink. Removal first converts the classifier into its
   durable removal fence, and the tc program used to drop every unmarked IPv4

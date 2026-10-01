@@ -118,16 +118,17 @@ use opc_session_store::PreparedCompareAndSetPrepareError;
 #[cfg(feature = "test-control")]
 use opc_session_store::ProtectedRosterConsensusDiagnosticSnapshot;
 use opc_session_store::{
-    AtomicFencedTransitionCapability, BackendCapabilities, CompareAndSet, ConsensusSessionStore,
-    EncryptedSessionPayload, EncryptingSessionBackend, FenceToken, FencedTransitionExecuteError,
-    FencedTransitionLease, FencedTransitionMutation, FencedTransitionRequest,
-    FencedTransitionRequestId, FencedTransitionStatus, FencedTransitionV2CallerNonce,
-    FencedTransitionV2Capability, FencedTransitionV2HistoryEpoch, FencedTransitionV2Request,
-    Generation, LeaseGuard, OwnerId, PreparedCheckpointBudget, PreparedCompareAndSetExecuteError,
-    PreparedCompareAndSetOutcome, PreparedCompareAndSetStatus, PreparedFencedTransitionJournal,
-    PreparedFencedTransitionJournalKey, PreparedFencedTransitionLookup, QuorumReplicaDescriptor,
-    QuorumTopologyConfig, QuorumTopologyMode, RecordExpiryPreflight, ReplicaBackingIdentity,
-    ReplicaEndpoint, ReplicaFailureDomain, ReplicaId, ReplicaTlsIdentity, RestoreScanRequest,
+    AtomicFencedTransitionCapability, BackendCapabilities, CompareAndSet, CompareAndSetResult,
+    ConsensusSessionStore, EncryptedSessionPayload, EncryptingSessionBackend, FenceToken,
+    FencedTransitionExecuteError, FencedTransitionLease, FencedTransitionMutation,
+    FencedTransitionRequest, FencedTransitionRequestId, FencedTransitionStatus,
+    FencedTransitionV2CallerNonce, FencedTransitionV2Capability, FencedTransitionV2HistoryEpoch,
+    FencedTransitionV2Request, Generation, LeaseGuard, OwnerId, PreparedCheckpointBudget,
+    PreparedCompareAndSetExecuteError, PreparedCompareAndSetOutcome, PreparedCompareAndSetStatus,
+    PreparedFencedTransitionJournal, PreparedFencedTransitionJournalKey,
+    PreparedFencedTransitionLookup, QuorumReplicaDescriptor, QuorumTopologyConfig,
+    QuorumTopologyMode, RecordExpiryPreflight, ReplicaBackingIdentity, ReplicaEndpoint,
+    ReplicaFailureDomain, ReplicaId, ReplicaTlsIdentity, RestoreScanRequest,
     RosterAttestationTrustRootIdentityV1, RosterAttestationTrustRootV1,
     RosterCompactAdmissionProvenance, RosterCompactAdmissionProvenanceInput,
     RosterIngressAttestation, RosterIngressAttestationV1, RosterIngressAttestationV2,
@@ -146,7 +147,7 @@ use opc_session_store::{
     SessionQuorumConsumer, SessionQuorumRosterIngress, SqliteSessionBackend, StateClass, StateType,
     StoreError, StoredSessionRecord, ValidatedQuorumTopology,
     FENCED_MUTATION_ROSTER_MAX_CHECKPOINT_BYTES, FENCED_MUTATION_ROSTER_MAX_PLAN_BYTES,
-    FENCED_MUTATION_ROSTER_MAX_RESULT_BYTES,
+    FENCED_MUTATION_ROSTER_MAX_RESULT_BYTES, PREPARED_CHECKPOINT_MAX_PHYSICAL_ATTEMPT,
 };
 #[cfg(feature = "test-control")]
 use opc_session_store::{
@@ -465,6 +466,12 @@ struct GatedReadBarrierPeer {
     append_entries_decode_failures: Arc<AtomicUsize>,
     consumer_binding_entries: Arc<AtomicUsize>,
     consumer_acquire_entries: Arc<AtomicUsize>,
+    /// Forwarded-mutation replies this path still withholds. An armed call
+    /// still reaches the real target, which completes it; the sender then
+    /// observes a post-transmission failure instead of the reply.
+    withhold_forward_mutation_replies: Arc<AtomicUsize>,
+    /// Withheld forwarded-mutation replies that the target had answered.
+    withheld_forward_mutation_replies: Arc<AtomicUsize>,
 }
 
 #[async_trait]
@@ -485,7 +492,9 @@ impl SessionConsensusPeer for GatedReadBarrierPeer {
             return Err(SessionConsensusPeerError::Unavailable);
         }
         self.record_request(&request).await;
-        self.inner.call(request).await
+        let withhold = self.take_forward_mutation_reply_loss(&request);
+        let response = self.inner.call(request).await;
+        self.complete_forward_mutation_call(withhold, response)
     }
 
     async fn call_with_timeout(
@@ -497,11 +506,38 @@ impl SessionConsensusPeer for GatedReadBarrierPeer {
             return Err(SessionConsensusPeerError::Unavailable);
         }
         self.record_request(&request).await;
-        self.inner.call_with_timeout(request, timeout).await
+        let withhold = self.take_forward_mutation_reply_loss(&request);
+        let response = self.inner.call_with_timeout(request, timeout).await;
+        self.complete_forward_mutation_call(withhold, response)
     }
 }
 
 impl GatedReadBarrierPeer {
+    fn take_forward_mutation_reply_loss(&self, request: &SessionConsensusWireRequest) -> bool {
+        request.family == opc_session_store::SessionConsensusRpcFamily::ForwardMutation
+            && self
+                .withhold_forward_mutation_replies
+                .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |remaining| {
+                    remaining.checked_sub(1)
+                })
+                .is_ok()
+    }
+
+    fn complete_forward_mutation_call(
+        &self,
+        withhold: bool,
+        response: Result<SessionConsensusWireResponse, SessionConsensusPeerError>,
+    ) -> Result<SessionConsensusWireResponse, SessionConsensusPeerError> {
+        if !withhold {
+            return response;
+        }
+        if matches!(&response, Ok(reply) if reply.result.is_ok()) {
+            self.withheld_forward_mutation_replies
+                .fetch_add(1, Ordering::SeqCst);
+        }
+        Err(SessionConsensusPeerError::Unavailable)
+    }
+
     async fn record_request(&self, request: &SessionConsensusWireRequest) {
         if matches!(
             request.family,
@@ -731,6 +767,8 @@ struct ThreeVoterConsumerFleet {
     append_entries_decode_failures: Arc<AtomicUsize>,
     consumer_binding_entries: Arc<AtomicUsize>,
     consumer_acquire_entries: Arc<AtomicUsize>,
+    forward_mutation_reply_loss: BTreeMap<(usize, usize), Arc<AtomicUsize>>,
+    withheld_forward_mutation_replies: Arc<AtomicUsize>,
     reauthentication: Vec<SessionReauthenticationControl>,
     address_slots: Vec<Arc<RwLock<Option<SocketAddr>>>>,
     servers: Vec<Option<SessionConsensusServerHandle>>,
@@ -924,6 +962,8 @@ impl ThreeVoterConsumerFleet {
         let append_entries_decode_failures = Arc::new(AtomicUsize::new(0));
         let consumer_binding_entries = Arc::new(AtomicUsize::new(0));
         let consumer_acquire_entries = Arc::new(AtomicUsize::new(0));
+        let mut forward_mutation_reply_loss = BTreeMap::new();
+        let withheld_forward_mutation_replies = Arc::new(AtomicUsize::new(0));
         let reauthentication = (0..THREE_VOTER_COUNT)
             .map(|_| SessionReauthenticationControl::new())
             .collect::<Vec<_>>();
@@ -942,6 +982,7 @@ impl ThreeVoterConsumerFleet {
                         .bind_remote(three_voter_replica_id(target))
                         .expect("three-voter remote consensus binding");
                     let enabled = Arc::new(AtomicBool::new(true));
+                    let withhold_forward_replies = Arc::new(AtomicUsize::new(0));
                     let resolver_slot = Arc::clone(&address_slots[target]);
                     let resolver_enabled = Arc::clone(&enabled);
                     let resolver: RemoteAddrResolver = Arc::new(move || {
@@ -990,8 +1031,13 @@ impl ThreeVoterConsumerFleet {
                         append_entries_decode_failures: Arc::clone(&append_entries_decode_failures),
                         consumer_binding_entries: Arc::clone(&consumer_binding_entries),
                         consumer_acquire_entries: Arc::clone(&consumer_acquire_entries),
+                        withhold_forward_mutation_replies: Arc::clone(&withhold_forward_replies),
+                        withheld_forward_mutation_replies: Arc::clone(
+                            &withheld_forward_mutation_replies,
+                        ),
                     });
                     path_enabled.insert((index, target), enabled);
+                    forward_mutation_reply_loss.insert((index, target), withhold_forward_replies);
                     let peer: Arc<dyn SessionConsensusPeer> = peer;
                     (node_id, peer)
                 })
@@ -1056,6 +1102,8 @@ impl ThreeVoterConsumerFleet {
             append_entries_decode_failures,
             consumer_binding_entries,
             consumer_acquire_entries,
+            forward_mutation_reply_loss,
+            withheld_forward_mutation_replies,
             reauthentication,
             address_slots,
             servers,
@@ -1158,6 +1206,21 @@ impl ThreeVoterConsumerFleet {
             self.consumer_binding_entries.load(Ordering::SeqCst),
             self.consumer_acquire_entries.load(Ordering::SeqCst),
         )
+    }
+
+    /// Deliver the next forwarded mutation from voter `from` to voter `to`
+    /// and let the target complete it, but withhold its reply: the sender
+    /// observes a post-transmission failure.
+    fn withhold_next_forward_mutation_reply(&self, from: usize, to: usize) {
+        self.forward_mutation_reply_loss
+            .get(&(from, to))
+            .expect("three-voter consensus path")
+            .store(1, Ordering::SeqCst);
+    }
+
+    fn withheld_forward_mutation_replies(&self) -> usize {
+        self.withheld_forward_mutation_replies
+            .load(Ordering::SeqCst)
     }
 
     fn observed_leader(&self) -> (usize, SessionConsensusNodeId, u64) {
@@ -1798,6 +1861,93 @@ impl SessionQuorumConsumer for CountingPreparedCasStatusConsumer {
             self.status_calls.fetch_add(1, Ordering::SeqCst);
         }
         self.inner.execute(identity, request).await
+    }
+
+    async fn watch(
+        &self,
+        identity: &SessionConsumerAuthorization,
+        scope: SessionConsumerScope,
+        start_sequence: u64,
+    ) -> Result<
+        BoxStream<'static, Result<SessionConsumerChange, SessionConsumerStoreError>>,
+        SessionConsumerRejection,
+    > {
+        self.inner.watch(identity, scope, start_sequence).await
+    }
+}
+
+/// One compare-and-set served by a [`RecordingCompareAndSetConsumer`], with
+/// the consensus state sampled when the voter answered.
+#[derive(Clone)]
+struct RecordedCompareAndSetCall {
+    request: SessionConsumerRequest,
+    response: SessionConsumerResponse,
+    binding_entries_at_answer: usize,
+    effects_at_answer: u64,
+}
+
+/// A real consumer listener wrapper that records every compare-and-set it
+/// serves. It never changes a request or a response.
+struct RecordingCompareAndSetConsumer {
+    inner: Arc<dyn SessionQuorumConsumer>,
+    binding_entries: Arc<AtomicUsize>,
+    effects: ConsensusSessionStore,
+    calls: Mutex<Vec<RecordedCompareAndSetCall>>,
+}
+
+impl RecordingCompareAndSetConsumer {
+    fn new(
+        inner: Arc<dyn SessionQuorumConsumer>,
+        binding_entries: Arc<AtomicUsize>,
+        effects: ConsensusSessionStore,
+    ) -> Self {
+        Self {
+            inner,
+            binding_entries,
+            effects,
+            calls: Mutex::new(Vec::new()),
+        }
+    }
+
+    fn calls(&self) -> Vec<RecordedCompareAndSetCall> {
+        self.calls
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
+    }
+}
+
+#[async_trait]
+impl SessionQuorumConsumer for RecordingCompareAndSetConsumer {
+    async fn execute(
+        &self,
+        identity: &SessionConsumerAuthorization,
+        request: SessionConsumerRequest,
+    ) -> SessionConsumerResponse {
+        let recorded = matches!(
+            request.operation(),
+            SessionConsumerOperation::CompareAndSet { .. }
+        )
+        .then(|| request.clone());
+        let response = self.inner.execute(identity, request).await;
+        if let Some(request) = recorded {
+            let binding_entries_at_answer = self.binding_entries.load(Ordering::SeqCst);
+            let effects_at_answer = self
+                .effects
+                .max_replication_sequence()
+                .await
+                .expect("replication sequence when the voter answers");
+            self.calls
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .push(RecordedCompareAndSetCall {
+                    request,
+                    response: response.clone(),
+                    binding_entries_at_answer,
+                    effects_at_answer,
+                });
+        }
+        response
     }
 
     async fn watch(
@@ -6082,6 +6232,249 @@ async fn prepared_cas_three_voter_receipt_converges_with_payload(
     client_c.shutdown().await;
     a_server.abort_and_wait().await;
     c_server.abort_and_wait().await;
+    fleet.quiesce().await;
+}
+
+/// The origin follower forwards the request binding, and the leader commits
+/// it, but the forwarded reply is lost. The origin therefore answers the
+/// prepared compare-and-set with a closed `Rejected(Unavailable)` after its
+/// binding was submitted. The prepared request moves to the next voter with
+/// the identical ID and body, rebinds idempotently and applies exactly once.
+/// Identical retries replay the recorded outcome on every voter, and a
+/// different body under the same ID remains a request conflict.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn prepared_cas_binding_reply_loss_fails_over_and_applies_exactly_once() {
+    let pki = Arc::new(TestPki::new());
+    let mut fleet = ThreeVoterConsumerFleet::start_fixed_durable(Arc::clone(&pki)).await;
+    let (leader, _, _) = fleet.wait_for_observed_leader().await;
+    // The rotating origin must be a follower, so that it forwards its
+    // binding to the leader. The successor is the other follower.
+    let route = [
+        (leader + 1) % THREE_VOTER_COUNT,
+        (leader + 2) % THREE_VOTER_COUNT,
+        leader,
+    ];
+    let origin = route[0];
+    let client_spiffe = spiffe("prepared-cas-binding-reply-loss-client");
+    let mut recorders = Vec::with_capacity(THREE_VOTER_COUNT);
+    let mut servers = Vec::with_capacity(THREE_VOTER_COUNT);
+    let mut clients = Vec::with_capacity(THREE_VOTER_COUNT);
+    for voter in route {
+        let recorder = Arc::new(RecordingCompareAndSetConsumer::new(
+            Arc::new(fleet.stores[voter].consumer_service()),
+            Arc::clone(&fleet.consumer_binding_entries),
+            fleet.stores[leader].clone(),
+        ));
+        let server_spiffe = three_voter_spiffe(voter);
+        let (server, address) = SessionQuorumConsumerServer::new(
+            Arc::clone(&recorder) as Arc<dyn SessionQuorumConsumer>,
+            pki.server_config(&server_spiffe),
+            three_voter_authorizer(&fleet.stores[voter], &client_spiffe).await,
+        )
+        .listen(
+            "127.0.0.1:0"
+                .parse::<SocketAddr>()
+                .expect("prepared failover listener"),
+        )
+        .await
+        .expect("start prepared failover listener");
+        clients.push(
+            PersistentSessionConsumerClient::from_stateless(consumer_client(
+                &pki,
+                address,
+                &server_spiffe,
+                &client_spiffe,
+                fleet.voter_authority(voter),
+            ))
+            .expect("prepared failover persistent client"),
+        );
+        recorders.push(recorder);
+        servers.push(server);
+    }
+    let key = test_key();
+    let owner = OwnerId::new("prepared-cas-binding-reply-loss-owner").expect("owner");
+    let lease = fleet.stores[leader]
+        .acquire(&key, owner.clone(), Duration::from_secs(30))
+        .await
+        .expect("real quorum lease");
+    let operation = CompareAndSet {
+        key: key.clone(),
+        lease: lease.clone(),
+        expected_generation: None,
+        new_record: StoredSessionRecord {
+            key,
+            generation: Generation::new(1),
+            owner,
+            fence: lease.fence(),
+            state_class: StateClass::AuthoritativeSession,
+            state_type: StateType::from_static("prepared-cas-binding-reply-loss"),
+            expires_at: None,
+            payload: EncryptedSessionPayload::new([0xb1]),
+        },
+    };
+    let provider = CountingKeyProvider::with_active_session_key();
+    // Seal over the leader so the preparation preflight forwards nothing.
+    let protected = SessionConsumerPreparedCheckpointBackend::persistent(
+        Arc::new(EncryptingSessionBackend::new(
+            Arc::new(fleet.stores[leader].clone()),
+            Arc::clone(&provider),
+            "prepared-cas-binding-reply-loss",
+        )),
+        clients.iter().cloned(),
+    )
+    .expect("same-scope protected composite");
+    let request_id = SessionConsumerRequestId::from_bytes([0xb1; 16]);
+    let budget = || {
+        PreparedCheckpointBudget::new(
+            tokio::time::Instant::now() + Duration::from_secs(3),
+            PREPARED_CHECKPOINT_MAX_PHYSICAL_ATTEMPT,
+        )
+        .expect("prepared failover budget")
+    };
+    let mut prepared = protected
+        .prepare_compare_and_set(request_id, operation.clone(), budget())
+        .await
+        .expect("prepare the exact protected compare-and-set");
+    let before = fleet.stores[leader]
+        .max_replication_sequence()
+        .await
+        .expect("sequence before the compare-and-set");
+    let settled = fleet
+        .application_sequences()
+        .await
+        .into_iter()
+        .max()
+        .expect("three-voter applied index");
+    fleet.wait_all_application_sequences(settled).await;
+    fleet.consumer_binding_entries.store(0, Ordering::SeqCst);
+    fleet.withhold_next_forward_mutation_reply(origin, leader);
+
+    let outcome = prepared.execute_once().await;
+    let origin_calls = recorders[0].calls();
+    let successor_calls = recorders[1].calls();
+    assert_eq!(
+        (
+            outcome,
+            fleet.withheld_forward_mutation_replies(),
+            origin_calls
+                .iter()
+                .map(|call| call.response.clone())
+                .collect::<Vec<_>>(),
+            successor_calls
+                .iter()
+                .map(|call| call.response.clone())
+                .collect::<Vec<_>>(),
+            recorders[2].calls().len(),
+            fleet.stores[leader]
+                .max_replication_sequence()
+                .await
+                .expect("sequence after the compare-and-set"),
+        ),
+        (
+            Ok(PreparedCompareAndSetOutcome::Applied),
+            1,
+            vec![SessionConsumerResponse::Rejected(
+                SessionConsumerRejection::Unavailable
+            )],
+            vec![SessionConsumerResponse::CompareAndSet(Ok(
+                CompareAndSetResult::Success
+            ))],
+            0,
+            before + 1,
+        ),
+        "the origin loses its committed binding reply; the identical request applies once on the successor"
+    );
+    assert!(
+        origin_calls[0].binding_entries_at_answer > 0,
+        "the origin answered after the leader replicated its binding"
+    );
+    assert_eq!(
+        origin_calls[0].effects_at_answer, before,
+        "the origin answered before any compare-and-set effect"
+    );
+    assert!(
+        successor_calls[0].request == origin_calls[0].request,
+        "failover carries the identical request ID and body"
+    );
+    let origin_diagnostics = clients[0].diagnostics().await;
+    assert_eq!(
+        (
+            origin_diagnostics.completed_operations,
+            origin_diagnostics.completed_operation_not_transmitted,
+            origin_diagnostics.completed_operation_unsafe_failures,
+        ),
+        (1, 1, 0),
+        "the closed rejection is a safe completion on the origin"
+    );
+    assert_eq!(
+        prepared.execute_once().await,
+        Err(PreparedCompareAndSetExecuteError::AlreadyExecuted)
+    );
+
+    // An identical retry replays the recorded outcome on every voter.
+    let identical = origin_calls[0].request.clone();
+    for client in &clients {
+        assert_eq!(
+            client.execute(&identical).await,
+            Ok(SessionConsumerResponse::CompareAndSet(Ok(
+                CompareAndSetResult::Success
+            ))),
+            "an identical retry replays the recorded result without a request conflict"
+        );
+    }
+    assert_eq!(
+        fleet.stores[leader]
+            .max_replication_sequence()
+            .await
+            .expect("sequence after identical retries"),
+        before + 1,
+        "identical retries add no effect"
+    );
+
+    // A different sealed body under the same ID is a closed conflict.
+    let mut conflicting = protected
+        .prepare_compare_and_set(request_id, operation, budget())
+        .await
+        .expect("prepare a different sealed body under the same request ID");
+    assert_eq!(
+        provider.calls(),
+        2,
+        "the second preparation seals a new body"
+    );
+    assert_eq!(
+        conflicting.execute_once().await,
+        Ok(PreparedCompareAndSetOutcome::Rejected(
+            SessionConsumerStoreError::RequestConflict
+        )),
+        "a different body under the same request ID is a request conflict"
+    );
+    let conflicting_request = recorders[1]
+        .calls()
+        .last()
+        .expect("the successor serves the conflicting request")
+        .request
+        .clone();
+    assert_eq!(conflicting_request.request_id(), identical.request_id());
+    assert!(
+        conflicting_request != identical,
+        "the conflicting request carries a different body"
+    );
+    assert_eq!(
+        fleet.stores[leader]
+            .max_replication_sequence()
+            .await
+            .expect("sequence after the conflicting request"),
+        before + 1,
+        "the conflicting body has no effect"
+    );
+
+    for client in &clients {
+        client.shutdown().await;
+    }
+    for server in servers {
+        server.abort_and_wait().await;
+    }
+    drop((prepared, conflicting, protected, recorders));
     fleet.quiesce().await;
 }
 
