@@ -10,6 +10,11 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 
+use super::RetainedConfigMode;
+use hmac::{Hmac, KeyInit, Mac};
+#[cfg(all(test, target_os = "linux"))]
+use opc_crypto::ConfigCapacityProfile;
+
 use opc_consensus::engine::storage::{LogFlushed, RaftLogStorage, RaftStateMachine};
 use opc_consensus::engine::{
     Entry, ErrorSubject, ErrorVerb, LogId, LogState, RaftLogReader, RaftSnapshotBuilder, Snapshot,
@@ -23,10 +28,45 @@ use tokio::io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt};
 use super::snapshot_file::ConfigSnapshotFile;
 use super::{sqlite, ApprovedLegacyConfigRecovery, ConfigConsensusResponse, ConfigRaftTypeConfig};
 use crate::backend::SqliteBackend;
+use crate::types::AuditKey;
+
+mod config_capacity_apply_deadline;
+
+#[cfg(test)]
+pub(super) mod config_capacity_apply_observations;
+
+#[cfg(test)]
+pub(super) mod config_capacity_append_observations;
+
+#[cfg(all(test, target_os = "linux"))]
+pub(super) mod config_capacity_native_read_observations;
+
+#[cfg(all(test, target_os = "linux"))]
+use config_capacity_native_read_observations as native_io;
+
+macro_rules! native_io_result {
+    ($result:expr, $observer:ident $(, $entries:ident)?) => {{
+        #[cfg(all(test, target_os = "linux"))]
+        {
+            let result = $result;
+            match &result {
+                Ok(_value) => {
+                    $(native_io::$entries(_value);)?
+                    $observer.completed();
+                }
+                Err(error) => $observer.failed(error),
+            }
+            result
+        }
+        #[cfg(not(all(test, target_os = "linux")))]
+        { $result }
+    }};
+}
 
 const SNAPSHOT_FOOTER_MAGIC: &[u8; 8] = b"OPCCFG01";
 const SNAPSHOT_FOOTER_BYTES: u64 = 8 + 2 + 8 + 32;
 const SNAPSHOT_MAX_BYTES: u64 = 64 * 1024 * 1024 * 1024;
+pub(super) const SNAPSHOT_MAX_WIRE_BYTES: u64 = SNAPSHOT_MAX_BYTES + SNAPSHOT_FOOTER_BYTES;
 const SNAPSHOT_DIRECTORY_MAX_ENTRIES: usize = 8_192;
 const SNAPSHOT_OPERATION_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
 
@@ -35,6 +75,8 @@ struct StagingArtifact {
     path: PathBuf,
     sqlite_sidecars: bool,
     armed: bool,
+    // Descriptor-relative cleanup must keep its directory open through Drop.
+    _directory_guard: Option<Arc<std::fs::File>>,
 }
 
 impl StagingArtifact {
@@ -43,6 +85,7 @@ impl StagingArtifact {
             path,
             sqlite_sidecars: false,
             armed: true,
+            _directory_guard: None,
         }
     }
 
@@ -51,7 +94,12 @@ impl StagingArtifact {
             path,
             sqlite_sidecars: true,
             armed: true,
+            _directory_guard: None,
         }
+    }
+
+    fn retain_directory(&mut self, directory: Arc<std::fs::File>) {
+        self._directory_guard = Some(directory);
     }
 
     fn replace_path(&mut self, path: PathBuf) {
@@ -118,34 +166,133 @@ pub(crate) struct SqliteConfigSnapshotBuilder {
     core: sqlite::ConfigConsensusCore,
 }
 
+// The final engine-storage owner closes this channel. Observers retain only
+// receivers, so observing shutdown cannot keep the storage lifetime alive.
+#[derive(Debug)]
+pub(crate) struct ConfigStorageOwner {
+    // Detached SQLite workers retain this owner independently of progress.
+    // Release the claim before announcing that the final native owner drained.
+    _engine_claim: Option<Arc<crate::backend::ConfigEngineClaim>>,
+    _released: tokio::sync::watch::Sender<()>,
+}
+
+// A release observer contains no storage owner. Only closure of the final
+// sender proves that all accepted native storage work has released ownership.
+pub(crate) struct ConfigStorageReleaseObserver {
+    released: tokio::sync::watch::Receiver<()>,
+}
+
+impl ConfigStorageReleaseObserver {
+    pub(crate) async fn wait(mut self) {
+        while self.released.changed().await.is_ok() {}
+    }
+}
+
 #[derive(Debug)]
 pub(crate) struct ConfigDurableProgress {
+    engine_claim: Option<Arc<crate::backend::ConfigEngineClaim>>,
+    apply_deadline: config_capacity_apply_deadline::ApplyPrefixDeadline,
     committed_present: AtomicBool,
     committed_index: AtomicU64,
     applied_epoch: tokio::sync::watch::Sender<u64>,
+    storage_released: std::sync::OnceLock<tokio::sync::watch::Receiver<()>>,
+    #[cfg(test)]
+    pub(crate) apply_entered: tokio::sync::watch::Sender<u64>,
+    // After a real response loss, report whether the accepted-work supervisor's
+    // latest poll completed. Observation happens after that poll's drops.
+    #[cfg(test)]
+    pub(crate) accepted_response_loss: tokio::sync::watch::Sender<Option<bool>>,
+    #[cfg(test)]
+    pub(crate) native_read_max_entries: std::sync::atomic::AtomicUsize,
+    #[cfg(test)]
+    pub(crate) append_observed_from: std::sync::OnceLock<std::time::Instant>,
 }
 
 impl Default for ConfigDurableProgress {
     fn default() -> Self {
         let (applied_epoch, _) = tokio::sync::watch::channel(0);
         Self {
+            engine_claim: None,
+            apply_deadline: Default::default(),
             committed_present: AtomicBool::new(false),
             committed_index: AtomicU64::new(0),
             applied_epoch,
+            storage_released: std::sync::OnceLock::new(),
+            #[cfg(test)]
+            apply_entered: tokio::sync::watch::channel(0).0,
+            #[cfg(test)]
+            accepted_response_loss: tokio::sync::watch::channel(None).0,
+            #[cfg(test)]
+            native_read_max_entries: std::sync::atomic::AtomicUsize::new(0),
+            #[cfg(test)]
+            append_observed_from: std::sync::OnceLock::new(),
         }
     }
 }
 
 impl ConfigDurableProgress {
+    pub(crate) fn track_storage_owners(
+        &self,
+    ) -> Result<Arc<ConfigStorageOwner>, ConfigConsensusStorageError> {
+        let (released, receiver) = tokio::sync::watch::channel(());
+        self.storage_released
+            .set(receiver)
+            .map_err(|_| ConfigConsensusStorageError::BackendUnavailable)?;
+        Ok(Arc::new(ConfigStorageOwner {
+            _engine_claim: self.engine_claim.clone(),
+            _released: released,
+        }))
+    }
+
+    pub(crate) fn storage_release_observer(
+        &self,
+    ) -> Result<ConfigStorageReleaseObserver, ConfigConsensusStorageError> {
+        let released = self
+            .storage_released
+            .get()
+            .ok_or(ConfigConsensusStorageError::BackendUnavailable)?
+            .clone();
+        Ok(ConfigStorageReleaseObserver { released })
+    }
+
+    pub(crate) async fn wait_for_storage_release(&self) -> Result<(), ConfigConsensusStorageError> {
+        let mut released = self.storage_release_observer()?.released;
+        // No value is ever sent: closure proves that the last storage owner
+        // has dropped. A value notification cannot stand in for task exit.
+        if released.changed().await.is_err() {
+            Ok(())
+        } else {
+            Err(ConfigConsensusStorageError::BackendUnavailable)
+        }
+    }
+
     fn set_committed(&self, committed: Option<LogId<ConsensusNodeId>>) {
         if let Some(committed) = committed {
             self.committed_index
                 .store(committed.index, Ordering::Release);
             self.committed_present.store(true, Ordering::Release);
+            #[cfg(feature = "dangerous-test-hooks")]
+            super::completion_observation::frontier(self, committed.index);
         } else {
             self.committed_present.store(false, Ordering::Release);
             self.committed_index.store(0, Ordering::Release);
         }
+    }
+
+    #[cfg(all(test, target_os = "linux"))]
+    pub(crate) fn print_native_io_progress(&self) {
+        let committed = self.committed_index();
+        let applied_epoch = *self.applied_epoch.borrow();
+        let apply_entered = *self.apply_entered.borrow();
+        let storage_released = self
+            .storage_released
+            .get()
+            .map(|receiver| receiver.has_changed().is_err());
+        let response_loss_poll = *self.accepted_response_loss.borrow();
+        println!(
+            "CONFIG_CAPACITY_NATIVE_IO_PROGRESS committed={:?} applied_epoch={} apply_entered={} storage_released={:?} response_loss_poll={:?}",
+            committed, applied_epoch, apply_entered, storage_released, response_loss_poll,
+        );
     }
 
     pub(crate) fn committed_index(&self) -> Option<u64> {
@@ -220,7 +367,10 @@ pub(crate) async fn open_with_recovery(
         ),
         Some(_) | None => None,
     };
-    let progress = Arc::new(ConfigDurableProgress::default());
+    let progress = Arc::new(ConfigDurableProgress {
+        engine_claim: backend.config_consensus_engine_claim(),
+        ..ConfigDurableProgress::default()
+    });
     let core = sqlite::ConfigConsensusCore::initialize(
         backend,
         snapshot_directory,
@@ -482,9 +632,10 @@ async fn validate_and_clean_snapshot_directory(
     core: &sqlite::ConfigConsensusCore,
 ) -> Result<(), ConfigConsensusStorageError> {
     let identity = core.identity;
+    let mode = core.mode;
     let members = core.expected_members.clone();
     let current = core
-        .run_sqlite(move |conn| sqlite::read_current_snapshot_sync(conn, identity, &members))
+        .run_sqlite(move |conn| sqlite::read_current_snapshot_sync(conn, identity, &members, mode))
         .await
         .map_err(|_| ConfigConsensusStorageError::CorruptState)?;
     let current_file_name = current
@@ -499,11 +650,13 @@ async fn validate_and_clean_snapshot_directory(
         if !file_type.is_file() {
             return Err(ConfigConsensusStorageError::CorruptState);
         }
-        let (_, checksum, length) =
-            tokio::time::timeout(SNAPSHOT_OPERATION_TIMEOUT, verify_snapshot_envelope(&path))
-                .await
-                .map_err(|_| ConfigConsensusStorageError::BackendUnavailable)?
-                .map_err(|_| ConfigConsensusStorageError::CorruptState)?;
+        let (_, checksum, length) = tokio::time::timeout(
+            SNAPSHOT_OPERATION_TIMEOUT,
+            verify_snapshot_envelope(&path, core.mode, core.identity, &core.audit_key),
+        )
+        .await
+        .map_err(|_| ConfigConsensusStorageError::BackendUnavailable)?
+        .map_err(|_| ConfigConsensusStorageError::CorruptState)?;
         if checksum != *expected_checksum || length != *expected_length {
             return Err(ConfigConsensusStorageError::CorruptState);
         }
@@ -620,17 +773,53 @@ impl RaftLogReader<ConfigRaftTypeConfig> for SqliteConfigLogStore {
     ) -> Result<Vec<Entry<ConfigRaftTypeConfig>>, StorageError<ConsensusNodeId>> {
         let (start, end) = range_to_half_open(&range)
             .map_err(|error| storage_error(ErrorSubject::Logs, ErrorVerb::Read, error))?;
+        #[cfg(all(test, target_os = "linux"))]
+        let mut native_io_call = native_io::Call::queued(
+            self.core
+                .durable_progress
+                .append_observed_from
+                .get()
+                .copied(),
+            native_io::Reason::NativeRangeRead,
+            Some(start),
+            end,
+            None,
+        );
+        #[cfg(all(test, target_os = "linux"))]
+        let native_io_token = native_io_call.worker();
         if end.is_some_and(|end| start >= end) {
+            #[cfg(all(test, target_os = "linux"))]
+            native_io_call.completed();
             return Ok(Vec::new());
         }
         let identity = self.core.identity;
+        let mode = self.core.mode;
         let members = self.core.expected_members.clone();
-        self.core
-            .run_sqlite(move |conn| {
-                sqlite::read_log_range_sync(conn, identity, &members, start, end, None)
-            })
-            .await
-            .map_err(|error| storage_error(ErrorSubject::Logs, ErrorVerb::Read, error))
+        native_io_result!(
+            self.core
+                .run_sqlite(move |conn| {
+                    #[cfg(all(test, target_os = "linux"))]
+                    let mut native_io_worker = native_io::Scope::enter(native_io_token);
+
+                    native_io_result!(
+                        sqlite::read_log_range_sync(
+                            conn, identity, &members, start, end, None, mode,
+                        ),
+                        native_io_worker,
+                        entries_returned
+                    )
+                })
+                .await,
+            native_io_call
+        )
+        .inspect(|_entries| {
+            #[cfg(test)]
+            self.core
+                .durable_progress
+                .native_read_max_entries
+                .fetch_max(_entries.len(), Ordering::AcqRel);
+        })
+        .map_err(|error| storage_error(ErrorSubject::Logs, ErrorVerb::Read, error))
     }
 
     async fn limited_get_log_entries(
@@ -638,30 +827,67 @@ impl RaftLogReader<ConfigRaftTypeConfig> for SqliteConfigLogStore {
         start: u64,
         end: u64,
     ) -> Result<Vec<Entry<ConfigRaftTypeConfig>>, StorageError<ConsensusNodeId>> {
+        #[cfg(all(test, target_os = "linux"))]
+        let mut native_io_call = native_io::Call::queued(
+            self.core
+                .durable_progress
+                .append_observed_from
+                .get()
+                .copied(),
+            native_io::Reason::NativeLimitedRead,
+            Some(start),
+            Some(end),
+            None,
+        );
+        #[cfg(all(test, target_os = "linux"))]
+        let native_io_token = native_io_call.worker();
         if start >= end {
+            #[cfg(all(test, target_os = "linux"))]
+            native_io_call.completed();
             return Ok(Vec::new());
         }
         let identity = self.core.identity;
+        let mode = self.core.mode;
         let members = self.core.expected_members.clone();
-        self.core
-            .run_sqlite(move |conn| {
-                let entries = sqlite::read_limited_log_range_sync(
-                    conn,
-                    identity,
-                    &members,
-                    start,
-                    end,
-                    DURABLE_OPENRAFT_MAX_PAYLOAD_ENTRIES,
-                )?;
-                if entries.is_empty() {
-                    return Err(sqlite::invalid_data(
-                        "config consensus limited nonempty log range returned no entry",
-                    ));
-                }
-                Ok(entries)
-            })
-            .await
-            .map_err(|error| storage_error(ErrorSubject::Logs, ErrorVerb::Read, error))
+        native_io_result!(
+            self.core
+                .run_sqlite(move |conn| {
+                    #[cfg(all(test, target_os = "linux"))]
+                    let mut native_io_worker = native_io::Scope::enter(native_io_token);
+
+                    let entries = native_io_result!(
+                        sqlite::read_limited_log_range_sync(
+                            conn,
+                            identity,
+                            &members,
+                            start,
+                            end,
+                            DURABLE_OPENRAFT_MAX_PAYLOAD_ENTRIES,
+                            mode,
+                        ),
+                        native_io_worker,
+                        entries_returned
+                    )?;
+                    if entries.is_empty() {
+                        #[cfg(all(test, target_os = "linux"))]
+                        native_io_worker.failed_kind(io::ErrorKind::InvalidData);
+                        return Err(sqlite::invalid_data(
+                            "config consensus limited nonempty log range returned no entry",
+                        ));
+                    }
+                    Ok(entries)
+                })
+                .await,
+            native_io_call
+        )
+        .inspect(|_entries| {
+            #[cfg(test)]
+            self.core
+                .durable_progress
+                .native_read_max_entries
+                .fetch_max(_entries.len(), Ordering::AcqRel);
+        })
+        .map_err(|error| storage_error(ErrorSubject::Logs, ErrorVerb::Read, error))
     }
 }
 
@@ -671,16 +897,43 @@ impl RaftLogStorage<ConfigRaftTypeConfig> for SqliteConfigLogStore {
     async fn get_log_state(
         &mut self,
     ) -> Result<LogState<ConfigRaftTypeConfig>, StorageError<ConsensusNodeId>> {
+        #[cfg(all(test, target_os = "linux"))]
+        let mut native_io_call = native_io::Call::queued(
+            self.core
+                .durable_progress
+                .append_observed_from
+                .get()
+                .copied(),
+            native_io::Reason::LogStateRead,
+            None,
+            None,
+            None,
+        );
+        #[cfg(all(test, target_os = "linux"))]
+        let native_io_token = native_io_call.worker();
         let identity = self.core.identity;
-        self.core
-            .run_sqlite(move |conn| {
-                Ok(LogState {
-                    last_purged_log_id: sqlite::read_purged_sync(conn, identity)?,
-                    last_log_id: sqlite::last_log_sync(conn, identity)?,
+        let mode = self.core.mode;
+        native_io_result!(
+            self.core
+                .run_sqlite(move |conn| {
+                    #[cfg(all(test, target_os = "linux"))]
+                    let mut native_io_worker = native_io::Scope::enter(native_io_token);
+
+                    Ok(LogState {
+                        last_purged_log_id: native_io_result!(
+                            sqlite::read_purged_sync(conn, identity),
+                            native_io_worker
+                        )?,
+                        last_log_id: native_io_result!(
+                            sqlite::last_log_sync(conn, identity, mode),
+                            native_io_worker
+                        )?,
+                    })
                 })
-            })
-            .await
-            .map_err(|error| storage_error(ErrorSubject::Logs, ErrorVerb::Read, error))
+                .await,
+            native_io_call
+        )
+        .map_err(|error| storage_error(ErrorSubject::Logs, ErrorVerb::Read, error))
     }
 
     async fn get_log_reader(&mut self) -> Self::LogReader {
@@ -715,12 +968,44 @@ impl RaftLogStorage<ConfigRaftTypeConfig> for SqliteConfigLogStore {
         &mut self,
         committed: Option<LogId<ConsensusNodeId>>,
     ) -> Result<(), StorageError<ConsensusNodeId>> {
+        #[cfg(all(test, target_os = "linux"))]
+        let mut native_io_call = native_io::Call::queued(
+            self.core
+                .durable_progress
+                .append_observed_from
+                .get()
+                .copied(),
+            native_io::Reason::CommittedLineage,
+            committed.map(|log| log.index),
+            committed.and_then(|log| log.index.checked_add(1)),
+            None,
+        );
+        #[cfg(all(test, target_os = "linux"))]
+        let native_io_token = native_io_call.worker();
         let identity = self.core.identity;
-        self.core
-            .run_sqlite(move |conn| sqlite::save_committed_sync(conn, identity, committed))
-            .await
-            .map_err(|error| storage_error(ErrorSubject::Logs, ErrorVerb::Write, error))?;
-        self.core.durable_progress.set_committed(committed);
+        let mode = self.core.mode;
+        let progress = self.core.durable_progress.clone();
+        native_io_result!(
+            self.core
+                .run_sqlite(move |conn| {
+                    #[cfg(all(test, target_os = "linux"))]
+                    let mut native_io_worker = native_io::Scope::enter(native_io_token);
+
+                    native_io_result!(
+                        sqlite::save_committed_sync(conn, identity, committed, mode),
+                        native_io_worker
+                    )?;
+                    // Publish while the same SQLite worker still owns the write
+                    // order, including when the async caller has disappeared.
+                    progress.set_committed(committed);
+                    #[cfg(all(test, target_os = "linux"))]
+                    native_io::phase(native_io::Phase::ProgressPublished);
+                    Ok(())
+                })
+                .await,
+            native_io_call
+        )
+        .map_err(|error| storage_error(ErrorSubject::Logs, ErrorVerb::Write, error))?;
         Ok(())
     }
 
@@ -752,28 +1037,75 @@ impl RaftLogStorage<ConfigRaftTypeConfig> for SqliteConfigLogStore {
                 return Err(storage_error(ErrorSubject::Logs, ErrorVerb::Write, error));
             }
         };
+        #[cfg(all(test, target_os = "linux"))]
+        let mut native_io_call = native_io::Call::queued(
+            self.core
+                .durable_progress
+                .append_observed_from
+                .get()
+                .copied(),
+            native_io::Reason::AppendFloor,
+            entries.first().map(|entry| entry.log_id.index),
+            entries
+                .last()
+                .and_then(|entry| entry.log_id.index.checked_add(1)),
+            Some(entries.len()),
+        );
+        #[cfg(all(test, target_os = "linux"))]
+        let native_io_token = native_io_call.worker();
         let identity = self.core.identity;
         let members = self.core.expected_members.clone();
+        let audit_key = self.core.audit_key.clone();
+        let mode = self.core.mode;
+        #[cfg(test)]
+        let append_observation = self
+            .core
+            .durable_progress
+            .append_observed_from
+            .get()
+            .copied()
+            .map(|origin| (origin, entries.len()));
+        #[cfg(test)]
+        config_capacity_append_observations::queued(append_observation);
         match self
             .core
             .run_sqlite_cancellable(move |conn, cancellation| {
-                sqlite::append_logs_cancellable_sync(
-                    conn,
-                    identity,
-                    &members,
-                    &entries,
-                    cancellation,
+                #[cfg(all(test, target_os = "linux"))]
+                let mut native_io_worker = native_io::Scope::enter(native_io_token);
+                #[cfg(test)]
+                let _observation =
+                    config_capacity_append_observations::Scope::enter(append_observation);
+                native_io_result!(
+                    sqlite::validate_entry_capacities(&entries, identity, &audit_key, mode,),
+                    native_io_worker
+                )?;
+                #[cfg(test)]
+                config_capacity_append_observations::observe("capacity_validated");
+                native_io_result!(
+                    sqlite::append_logs_cancellable_sync(
+                        conn,
+                        identity,
+                        &members,
+                        &entries,
+                        cancellation,
+                        mode,
+                    ),
+                    native_io_worker
                 )
             })
             .await
         {
             Ok(()) => {
                 callback.log_io_completed(Ok(()));
+                #[cfg(all(test, target_os = "linux"))]
+                native_io_call.completed();
                 Ok(())
             }
             Err(error) => {
                 callback
                     .log_io_completed(Err(io::Error::other("config consensus log append failed")));
+                #[cfg(all(test, target_os = "linux"))]
+                native_io_call.failed(&error);
                 Err(storage_error(ErrorSubject::Logs, ErrorVerb::Write, error))
             }
         }
@@ -797,6 +1129,7 @@ impl RaftLogStorage<ConfigRaftTypeConfig> for SqliteConfigLogStore {
         validate_snapshot_binding(&self.core)
             .map_err(|error| storage_error(ErrorSubject::Log(log_id), ErrorVerb::Delete, error))?;
         let identity = self.core.identity;
+        let mode = self.core.mode;
         // Openraft queues snapshot installation on its independent state-machine
         // worker before issuing purge. Do not mistake that in-flight install
         // for durable application, or remove its logs before it commits. Wait
@@ -814,7 +1147,7 @@ impl RaftLogStorage<ConfigRaftTypeConfig> for SqliteConfigLogStore {
                         {
                             return Ok(false);
                         }
-                        sqlite::purge_logs_sync(conn, identity, &log_id)?;
+                        sqlite::purge_logs_sync(conn, identity, &log_id, mode)?;
                         Ok(true)
                     })
                     .await?;
@@ -850,12 +1183,13 @@ impl RaftStateMachine<ConfigRaftTypeConfig> for SqliteConfigStateMachine {
         StorageError<ConsensusNodeId>,
     > {
         let identity = self.core.identity;
+        let mode = self.core.mode;
         let members = self.core.expected_members.clone();
         self.core
             .run_sqlite(move |conn| {
                 Ok((
                     sqlite::read_applied_sync(conn, identity)?,
-                    sqlite::read_membership_sync(conn, identity, &members)?,
+                    sqlite::read_membership_sync(conn, identity, &members, mode)?,
                 ))
             })
             .await
@@ -871,6 +1205,23 @@ impl RaftStateMachine<ConfigRaftTypeConfig> for SqliteConfigStateMachine {
         I::IntoIter: Send,
     {
         #[cfg(test)]
+        let apply_origin = self
+            .core
+            .durable_progress
+            .append_observed_from
+            .get()
+            .copied();
+        #[cfg(test)]
+        config_capacity_apply_observations::record(
+            apply_origin.map(|origin| (origin, 0)),
+            "apply_entered",
+        );
+        #[cfg(test)]
+        self.core
+            .durable_progress
+            .apply_entered
+            .send_modify(|epoch| *epoch = epoch.saturating_add(1));
+        #[cfg(test)]
         let _apply_permit = self.core.apply_gate.acquire().await.map_err(|_| {
             storage_error(
                 ErrorSubject::StateMachine,
@@ -878,28 +1229,145 @@ impl RaftStateMachine<ConfigRaftTypeConfig> for SqliteConfigStateMachine {
                 io::Error::other("config consensus test apply gate closed"),
             )
         })?;
-        let identity = self.core.identity;
-        let members = self.core.expected_members.clone();
-        let audit_key = self.core.audit_key.clone();
-        let audit_keys = self.core.management_audit_keys.clone();
-        let entries = collect_bounded_entries(entries)
-            .map_err(|error| storage_error(ErrorSubject::StateMachine, ErrorVerb::Write, error))?;
-        let responses = self
-            .core
-            .run_sqlite_cancellable(move |conn, cancellation| {
-                sqlite::apply_entries_cancellable_sync(
-                    conn,
-                    identity,
-                    &members,
-                    entries,
-                    cancellation,
-                    &audit_key,
-                    audit_keys.as_deref(),
+        #[cfg(test)]
+        config_capacity_apply_observations::record(
+            apply_origin.map(|origin| (origin, 0)),
+            "apply_gate_released",
+        );
+        // BoundedV1's native engine passes one page at a time. Retain the
+        // original storage deadline until the complete committed frontier has
+        // applied; another page or a later commit must not refresh it. Legacy
+        // direct callers retain bounded transactions under one per-call clock.
+        let bounded =
+            self.core.mode.capacity_profile() == opc_crypto::ConfigCapacityProfile::BoundedV1;
+        let deadline = if bounded {
+            self.core
+                .durable_progress
+                .apply_deadline
+                .deadline(
+                    self.core.durable_progress.committed_index(),
+                    tokio::time::Instant::now(),
                 )
-            })
-            .await
-            .map_err(|error| storage_error(ErrorSubject::StateMachine, ErrorVerb::Write, error))?;
-        self.core.durable_progress.notify_applied();
+                .map_err(|error| {
+                    storage_error(ErrorSubject::StateMachine, ErrorVerb::Write, error)
+                })?
+        } else {
+            tokio::time::Instant::now() + std::time::Duration::from_secs(30)
+        };
+        #[cfg(feature = "dangerous-test-hooks")]
+        let mut completion_observation =
+            super::completion_observation::ApplyCall::new(&self.core.durable_progress);
+        let mut incoming = entries.into_iter();
+        let mut pending = Vec::new();
+        let mut responses = Vec::new();
+        loop {
+            if pending.is_empty() {
+                pending = collect_bounded_entries(
+                    incoming
+                        .by_ref()
+                        .take(sqlite::CONFIG_CONSENSUS_LOG_APPEND_MAX_ENTRIES),
+                )
+                .map_err(|error| {
+                    storage_error(ErrorSubject::StateMachine, ErrorVerb::Write, error)
+                })?;
+            }
+            if pending.is_empty() {
+                break;
+            }
+            // Reserve response space before this transaction can commit.
+            responses.try_reserve_exact(pending.len()).map_err(|_| {
+                storage_error(
+                    ErrorSubject::StateMachine,
+                    ErrorVerb::Write,
+                    io::Error::other("config consensus apply response allocation failed"),
+                )
+            })?;
+            let identity = self.core.identity;
+            let members = self.core.expected_members.clone();
+            let audit_key = self.core.audit_key.clone();
+            let audit_keys = self.core.management_audit_keys.clone();
+            let mode = self.core.mode;
+            let collected = pending;
+            #[cfg(test)]
+            let apply_observation = apply_origin.map(|origin| (origin, collected.len()));
+            #[cfg(test)]
+            config_capacity_apply_observations::record(apply_observation, "queued");
+            #[cfg(feature = "dangerous-test-hooks")]
+            let completion_batch = completion_observation.queued(&collected, deadline);
+            let (applied, remainder, last_applied) = self
+                .core
+                .run_sqlite_cancellable_until(deadline, move |conn, cancellation| {
+                    #[cfg(test)]
+                    let _observation =
+                        config_capacity_apply_observations::Scope::enter(apply_observation);
+                    #[cfg(feature = "dangerous-test-hooks")]
+                    let _completion_scope = completion_batch.enter_worker(conn);
+                    let (collected, remainder) = {
+                        #[cfg(all(test, target_os = "linux"))]
+                        let _sizing_observation =
+                            super::store::config_capacity_cost_observation::Scope::batch_sizing(
+                                &collected,
+                            );
+                        sqlite::ApplyBatch::select(collected, cancellation)?
+                    };
+                    #[cfg(test)]
+                    config_capacity_apply_observations::observe("batch_sized");
+                    let last_applied = collected.last_log_index();
+                    let applied = sqlite::apply_entries_cancellable_sync(
+                        conn,
+                        identity,
+                        &members,
+                        collected,
+                        cancellation,
+                        &audit_key,
+                        audit_keys.as_deref(),
+                        mode,
+                    );
+                    #[cfg(test)]
+                    if let (Err(error), true) = (&applied, apply_observation.is_some()) {
+                        eprintln!(
+                            "JOINT_NATIVE_STORAGE stage=apply_error kind={:?}",
+                            error.kind()
+                        );
+                    }
+                    let applied = applied?;
+                    Ok((applied, remainder, last_applied))
+                })
+                .await
+                .map_err(|error| {
+                    #[cfg(test)]
+                    if apply_observation.is_some() {
+                        eprintln!(
+                            "JOINT_NATIVE_STORAGE stage=await_error kind={:?}",
+                            error.kind()
+                        );
+                    }
+                    storage_error(ErrorSubject::StateMachine, ErrorVerb::Write, error)
+                })?;
+            #[cfg(test)]
+            config_capacity_apply_observations::record(apply_observation, "await_returned");
+            #[cfg(feature = "dangerous-test-hooks")]
+            completion_observation.native_returned(&completion_batch, last_applied);
+            responses.extend(applied);
+            pending = remainder;
+            if bounded {
+                if let Some(index) = last_applied {
+                    self.core
+                        .durable_progress
+                        .apply_deadline
+                        .applied(index)
+                        .map_err(|error| {
+                            storage_error(ErrorSubject::StateMachine, ErrorVerb::Write, error)
+                        })?;
+                }
+            }
+            // If a later chunk fails, this prefix is still durably applied.
+            // Reopen resumes from its actual frontier; no whole-prefix rollback
+            // or caller success is claimed for a failed apply operation.
+            self.core.durable_progress.notify_applied();
+        }
+        #[cfg(feature = "dangerous-test-hooks")]
+        completion_observation.returned();
         Ok(responses)
     }
 
@@ -976,23 +1444,30 @@ impl RaftStateMachine<ConfigRaftTypeConfig> for SqliteConfigStateMachine {
             snapshot.disarm_cleanup();
             drop(snapshot);
             let _incoming_cleanup = StagingArtifact::file(incoming.clone());
-            let (payload_length, checksum, total_length) =
-                tokio::time::timeout_at(deadline, verify_snapshot_envelope(&incoming))
-                    .await
-                    .map_err(|_| {
-                        storage_error(
-                            ErrorSubject::Snapshot(Some(meta.signature())),
-                            ErrorVerb::Read,
-                            sqlite::invalid_data("config consensus snapshot install timed out"),
-                        )
-                    })?
-                    .map_err(|error| {
-                        storage_error(
-                            ErrorSubject::Snapshot(Some(meta.signature())),
-                            ErrorVerb::Read,
-                            error,
-                        )
-                    })?;
+            let (payload_length, checksum, total_length) = tokio::time::timeout_at(
+                deadline,
+                verify_snapshot_envelope(
+                    &incoming,
+                    self.core.mode,
+                    self.core.identity,
+                    &self.core.audit_key,
+                ),
+            )
+            .await
+            .map_err(|_| {
+                storage_error(
+                    ErrorSubject::Snapshot(Some(meta.signature())),
+                    ErrorVerb::Read,
+                    sqlite::invalid_data("config consensus snapshot install timed out"),
+                )
+            })?
+            .map_err(|error| {
+                storage_error(
+                    ErrorSubject::Snapshot(Some(meta.signature())),
+                    ErrorVerb::Read,
+                    error,
+                )
+            })?;
             let raw = self
                 .core
                 .snapshot_dir
@@ -1041,21 +1516,36 @@ impl RaftStateMachine<ConfigRaftTypeConfig> for SqliteConfigStateMachine {
                     error,
                 )
             })?;
+            final_cleanup.retain_directory(self.core._snapshot_dir_guard.clone());
             let identity = self.core.identity;
             let members = self.core.expected_members.clone();
             let audit_key = self.core.audit_key.clone();
+            let mode = self.core.mode;
             let raw_for_install = raw.clone();
             let meta_for_install = meta.clone();
             let file_name_for_install = file_name.clone();
+            let progress = self.core.durable_progress.clone();
+            #[cfg(all(test, target_os = "linux"))]
+            let custody =
+                config_capacity_snapshot_tests::custody::observer(&self.core.snapshot_binding_path);
             let previous = self
                 .core
                 .run_sqlite_cancellable_until(deadline, move |conn, cancellation| {
-                    let previous = sqlite::read_current_snapshot_sync(conn, identity, &members)?;
-                    sqlite::install_snapshot_database_cancellable_sync(
+                    #[cfg(all(test, target_os = "linux"))]
+                    config_capacity_snapshot_tests::custody::checkpoint(
+                        &custody,
+                        config_capacity_snapshot_tests::custody::Phase::BeforeWrite,
+                        &file_name_for_install,
+                        cancellation,
+                    )?;
+                    let previous =
+                        sqlite::read_current_snapshot_sync(conn, identity, &members, mode)?;
+                    let committed = sqlite::install_snapshot_database_cancellable_sync(
                         conn,
                         identity,
                         &members,
                         &audit_key,
+                        mode,
                         &raw_for_install,
                         &meta_for_install,
                         &file_name_for_install,
@@ -1063,6 +1553,20 @@ impl RaftStateMachine<ConfigRaftTypeConfig> for SqliteConfigStateMachine {
                         total_length,
                         cancellation,
                     )?;
+                    // Cleanup follows this worker's commit decision even if its
+                    // awaiting task is cancelled before the worker returns.
+                    final_cleanup.disarm();
+                    #[cfg(all(test, target_os = "linux"))]
+                    config_capacity_snapshot_tests::custody::checkpoint(
+                        &custody,
+                        config_capacity_snapshot_tests::custody::Phase::AfterCommit,
+                        &file_name_for_install,
+                        cancellation,
+                    )?;
+                    // Installation may advance the durable commit floor, or
+                    // preserve a newer local suffix. Publish that exact result
+                    // before releasing the serialized SQLite worker.
+                    progress.set_committed(committed);
                     Ok(previous)
                 })
                 .await
@@ -1073,7 +1577,6 @@ impl RaftStateMachine<ConfigRaftTypeConfig> for SqliteConfigStateMachine {
                         error,
                     )
                 })?;
-            final_cleanup.disarm();
             let _ = tokio::time::timeout_at(
                 deadline,
                 remove_old_snapshot(&self.core.snapshot_dir, previous, &file_name),
@@ -1098,33 +1601,43 @@ impl RaftStateMachine<ConfigRaftTypeConfig> for SqliteConfigStateMachine {
         validate_snapshot_binding(&self.core)
             .map_err(|error| storage_error(ErrorSubject::Snapshot(None), ErrorVerb::Read, error))?;
         let identity = self.core.identity;
+        let mode = self.core.mode;
         let members = self.core.expected_members.clone();
         let current = self
             .core
-            .run_sqlite(move |conn| sqlite::read_current_snapshot_sync(conn, identity, &members))
+            .run_sqlite(move |conn| {
+                sqlite::read_current_snapshot_sync(conn, identity, &members, mode)
+            })
             .await
             .map_err(|error| storage_error(ErrorSubject::Snapshot(None), ErrorVerb::Read, error))?;
         let Some((meta, file_name, expected_checksum, expected_length)) = current else {
             return Ok(None);
         };
         let path = self.core.snapshot_dir.join(file_name);
-        let (_, checksum, length) =
-            tokio::time::timeout(SNAPSHOT_OPERATION_TIMEOUT, verify_snapshot_envelope(&path))
-                .await
-                .map_err(|_| {
-                    storage_error(
-                        ErrorSubject::Snapshot(Some(meta.signature())),
-                        ErrorVerb::Read,
-                        sqlite::invalid_data("config consensus snapshot verification timed out"),
-                    )
-                })?
-                .map_err(|error| {
-                    storage_error(
-                        ErrorSubject::Snapshot(Some(meta.signature())),
-                        ErrorVerb::Read,
-                        error,
-                    )
-                })?;
+        let (_, checksum, length) = tokio::time::timeout(
+            SNAPSHOT_OPERATION_TIMEOUT,
+            verify_snapshot_envelope(
+                &path,
+                self.core.mode,
+                self.core.identity,
+                &self.core.audit_key,
+            ),
+        )
+        .await
+        .map_err(|_| {
+            storage_error(
+                ErrorSubject::Snapshot(Some(meta.signature())),
+                ErrorVerb::Read,
+                sqlite::invalid_data("config consensus snapshot verification timed out"),
+            )
+        })?
+        .map_err(|error| {
+            storage_error(
+                ErrorSubject::Snapshot(Some(meta.signature())),
+                ErrorVerb::Read,
+                error,
+            )
+        })?;
         if checksum != expected_checksum || length != expected_length {
             return Err(storage_error(
                 ErrorSubject::Snapshot(Some(meta.signature())),
@@ -1179,6 +1692,7 @@ impl RaftSnapshotBuilder<ConfigRaftTypeConfig> for SqliteConfigSnapshotBuilder {
         let identity = self.core.identity;
         let members = self.core.expected_members.clone();
         let audit_key = self.core.audit_key.clone();
+        let mode = self.core.mode;
         let raw_for_build = raw.clone();
         let (last_log_id, last_membership) = self
             .core
@@ -1188,6 +1702,7 @@ impl RaftSnapshotBuilder<ConfigRaftTypeConfig> for SqliteConfigSnapshotBuilder {
                     identity,
                     &members,
                     &audit_key,
+                    mode,
                     &raw_for_build,
                     cancellation,
                 )
@@ -1201,23 +1716,30 @@ impl RaftSnapshotBuilder<ConfigRaftTypeConfig> for SqliteConfigSnapshotBuilder {
             .core
             .snapshot_dir
             .join(format!("snapshot-{snapshot_id}.part"));
-        let (checksum, length, mut final_cleanup) =
-            tokio::time::timeout_at(deadline, envelope_snapshot_database(&raw, &staging))
-                .await
-                .map_err(|_| {
-                    storage_error(
-                        ErrorSubject::Snapshot(None),
-                        ErrorVerb::Write,
-                        sqlite::invalid_data("config consensus snapshot build timed out"),
-                    )
-                })?
-                .map_err(|error| {
-                    storage_error(ErrorSubject::Snapshot(None), ErrorVerb::Write, error)
-                })?;
+        let (checksum, length, mut final_cleanup) = tokio::time::timeout_at(
+            deadline,
+            envelope_snapshot_database(
+                &raw,
+                &staging,
+                self.core.mode,
+                self.core.identity,
+                &self.core.audit_key,
+            ),
+        )
+        .await
+        .map_err(|_| {
+            storage_error(
+                ErrorSubject::Snapshot(None),
+                ErrorVerb::Write,
+                sqlite::invalid_data("config consensus snapshot build timed out"),
+            )
+        })?
+        .map_err(|error| storage_error(ErrorSubject::Snapshot(None), ErrorVerb::Write, error))?;
         std::fs::rename(&staging, &final_path).map_err(|error| {
             storage_error(ErrorSubject::Snapshot(None), ErrorVerb::Write, error)
         })?;
         final_cleanup.replace_path(final_path.clone());
+        final_cleanup.retain_directory(self.core._snapshot_dir_guard.clone());
         tokio::time::timeout_at(deadline, sync_directory(&self.core.snapshot_dir))
             .await
             .map_err(|_| {
@@ -1257,11 +1779,21 @@ impl RaftSnapshotBuilder<ConfigRaftTypeConfig> for SqliteConfigSnapshotBuilder {
         let members = self.core.expected_members.clone();
         let meta_for_save = meta.clone();
         let file_name_for_save = file_name.clone();
+        #[cfg(all(test, target_os = "linux"))]
+        let custody =
+            config_capacity_snapshot_tests::custody::observer(&self.core.snapshot_binding_path);
         let previous = self
             .core
             .run_sqlite_cancellable_until(deadline, move |conn, cancellation| {
+                #[cfg(all(test, target_os = "linux"))]
+                config_capacity_snapshot_tests::custody::checkpoint(
+                    &custody,
+                    config_capacity_snapshot_tests::custody::Phase::BeforeWrite,
+                    &file_name_for_save,
+                    cancellation,
+                )?;
                 cancellation.check_io()?;
-                let previous = sqlite::read_current_snapshot_sync(conn, identity, &members)?;
+                let previous = sqlite::read_current_snapshot_sync(conn, identity, &members, mode)?;
                 sqlite::save_current_snapshot_sync(
                     conn,
                     identity,
@@ -1270,6 +1802,16 @@ impl RaftSnapshotBuilder<ConfigRaftTypeConfig> for SqliteConfigSnapshotBuilder {
                     &file_name_for_save,
                     checksum,
                     length,
+                )?;
+                // Cleanup follows this worker's commit decision even if its
+                // awaiting task is cancelled before the worker returns.
+                final_cleanup.disarm();
+                #[cfg(all(test, target_os = "linux"))]
+                config_capacity_snapshot_tests::custody::checkpoint(
+                    &custody,
+                    config_capacity_snapshot_tests::custody::Phase::AfterCommit,
+                    &file_name_for_save,
+                    cancellation,
                 )?;
                 Ok(previous)
             })
@@ -1281,7 +1823,6 @@ impl RaftSnapshotBuilder<ConfigRaftTypeConfig> for SqliteConfigSnapshotBuilder {
                     error,
                 )
             })?;
-        final_cleanup.disarm();
         let _ = tokio::time::timeout_at(
             deadline,
             remove_old_snapshot(&self.core.snapshot_dir, previous, &file_name),
@@ -1294,9 +1835,94 @@ impl RaftSnapshotBuilder<ConfigRaftTypeConfig> for SqliteConfigSnapshotBuilder {
     }
 }
 
+/// Legacy snapshots retain their exact checksum. The bounded profile uses the
+/// same 32-byte field for a domain-separated MAC, so changing an unkeyed footer
+/// or SQLite profile row cannot relabel an existing snapshot as a new profile.
+enum SnapshotIntegrity {
+    Legacy(Sha256),
+    Bounded(Hmac<Sha256>),
+    Running(Hmac<Sha256>),
+}
+
+impl SnapshotIntegrity {
+    fn new(
+        profile: RetainedConfigMode,
+        identity: ConsensusIdentity,
+        audit_key: &AuditKey,
+    ) -> io::Result<Self> {
+        match profile {
+            RetainedConfigMode::Legacy | RetainedConfigMode::NetconfTargetsV1 => {
+                Ok(Self::Legacy(Sha256::new()))
+            }
+            RetainedConfigMode::BoundedV1 | RetainedConfigMode::NetconfRunningV1 => {
+                let mut mac = <Hmac<Sha256> as KeyInit>::new_from_slice(audit_key.as_bytes())
+                    .map_err(|_| sqlite::invalid_data("config snapshot key is unavailable"))?;
+                if profile == RetainedConfigMode::NetconfRunningV1 {
+                    mac.update(b"openpacketcore/config-snapshot-netconf-running/v1\0");
+                } else {
+                    mac.update(b"openpacketcore/config-snapshot-capacity/v1\0");
+                }
+                mac.update(&profile.capacity_profile().revision().to_be_bytes());
+                mac.update(identity.cluster_id().as_bytes());
+                mac.update(identity.configuration_id().as_bytes());
+                mac.update(&identity.configuration_epoch().get().to_be_bytes());
+                mac.update(&audit_key.epoch().to_be_bytes());
+                Ok(if profile == RetainedConfigMode::NetconfRunningV1 {
+                    Self::Running(mac)
+                } else {
+                    Self::Bounded(mac)
+                })
+            }
+        }
+    }
+
+    fn update(&mut self, bytes: &[u8]) {
+        match self {
+            Self::Legacy(digest) => digest.update(bytes),
+            Self::Bounded(mac) | Self::Running(mac) => mac.update(bytes),
+        }
+    }
+
+    fn bind_footer(&mut self, length: u64) {
+        let (mac, mode) = match self {
+            Self::Legacy(_) => return,
+            Self::Bounded(mac) => (mac, RetainedConfigMode::BoundedV1),
+            Self::Running(mac) => (mac, RetainedConfigMode::NetconfRunningV1),
+        };
+        mac.update(SNAPSHOT_FOOTER_MAGIC);
+        mac.update(&super::types::config_snapshot_revision(mode).to_be_bytes());
+        mac.update(&length.to_be_bytes());
+    }
+
+    fn finish(mut self, length: u64) -> [u8; 32] {
+        self.bind_footer(length);
+        match self {
+            Self::Legacy(digest) => digest.finalize().into(),
+            Self::Bounded(mac) | Self::Running(mac) => mac.finalize().into_bytes().into(),
+        }
+    }
+
+    fn verify(mut self, length: u64, expected: &[u8; 32]) -> io::Result<()> {
+        self.bind_footer(length);
+        let valid = match self {
+            Self::Legacy(digest) => <[u8; 32]>::from(digest.finalize()) == *expected,
+            Self::Bounded(mac) | Self::Running(mac) => mac.verify_slice(expected).is_ok(),
+        };
+        if !valid {
+            return Err(sqlite::invalid_data(
+                "config consensus snapshot integrity mismatch",
+            ));
+        }
+        Ok(())
+    }
+}
+
 async fn envelope_snapshot_database(
     raw: &Path,
     output: &Path,
+    profile: RetainedConfigMode,
+    identity: ConsensusIdentity,
+    audit_key: &AuditKey,
 ) -> io::Result<([u8; 32], u64, StagingArtifact)> {
     let metadata = tokio::fs::metadata(raw).await?;
     if metadata.len() == 0 || metadata.len() > SNAPSHOT_MAX_BYTES {
@@ -1312,7 +1938,7 @@ async fn envelope_snapshot_database(
         .await?;
     set_private_file_permissions(output)?;
     let cleanup = StagingArtifact::file(output.to_path_buf());
-    let mut hasher = Sha256::new();
+    let mut hasher = SnapshotIntegrity::new(profile, identity, audit_key)?;
     let mut copied = 0_u64;
     let mut buffer = vec![0_u8; 1024 * 1024];
     loop {
@@ -1339,10 +1965,10 @@ async fn envelope_snapshot_database(
             "config consensus snapshot copy length mismatch",
         ));
     }
-    let checksum: [u8; 32] = hasher.finalize().into();
+    let checksum = hasher.finish(copied);
     destination.write_all(SNAPSHOT_FOOTER_MAGIC).await?;
     destination
-        .write_all(&super::types::CONFIG_CONSENSUS_SNAPSHOT_VERSION.to_be_bytes())
+        .write_all(&super::types::config_snapshot_revision(profile).to_be_bytes())
         .await?;
     destination.write_all(&copied.to_be_bytes()).await?;
     destination.write_all(&checksum).await?;
@@ -1353,11 +1979,16 @@ async fn envelope_snapshot_database(
     Ok((checksum, total, cleanup))
 }
 
-async fn verify_snapshot_envelope(path: &Path) -> io::Result<(u64, [u8; 32], u64)> {
+async fn verify_snapshot_envelope(
+    path: &Path,
+    profile: RetainedConfigMode,
+    identity: ConsensusIdentity,
+    audit_key: &AuditKey,
+) -> io::Result<(u64, [u8; 32], u64)> {
     let source = open_read_nofollow(path)?;
     let metadata = source.metadata()?;
     let total = metadata.len();
-    if total <= SNAPSHOT_FOOTER_BYTES || total > SNAPSHOT_MAX_BYTES + SNAPSHOT_FOOTER_BYTES {
+    if total <= SNAPSHOT_FOOTER_BYTES || total > SNAPSHOT_MAX_WIRE_BYTES {
         return Err(sqlite::invalid_data(
             "config consensus snapshot size is invalid",
         ));
@@ -1374,7 +2005,7 @@ async fn verify_snapshot_envelope(path: &Path) -> io::Result<(u64, [u8; 32], u64
     }
     let mut revision = [0_u8; 2];
     file.read_exact(&mut revision).await?;
-    if u16::from_be_bytes(revision) != super::types::CONFIG_CONSENSUS_SNAPSHOT_VERSION {
+    if u16::from_be_bytes(revision) != super::types::config_snapshot_revision(profile) {
         return Err(sqlite::invalid_data(
             "config consensus snapshot revision is unsupported",
         ));
@@ -1390,7 +2021,7 @@ async fn verify_snapshot_envelope(path: &Path) -> io::Result<(u64, [u8; 32], u64
     file.read_exact(&mut expected).await?;
     file.seek(io::SeekFrom::Start(0)).await?;
     let mut remaining = payload_length;
-    let mut hasher = Sha256::new();
+    let mut hasher = SnapshotIntegrity::new(profile, identity, audit_key)?;
     let mut buffer = vec![0_u8; 1024 * 1024];
     while remaining > 0 {
         let requested = usize::try_from(remaining.min(buffer.len() as u64))
@@ -1406,13 +2037,8 @@ async fn verify_snapshot_envelope(path: &Path) -> io::Result<(u64, [u8; 32], u64
             .map_err(|_| sqlite::invalid_data("config consensus snapshot read overflow"))?;
         hasher.update(&buffer[..read]);
     }
-    let actual: [u8; 32] = hasher.finalize().into();
-    if actual != expected {
-        return Err(sqlite::invalid_data(
-            "config consensus snapshot checksum mismatch",
-        ));
-    }
-    Ok((payload_length, actual, total))
+    hasher.verify(payload_length, &expected)?;
+    Ok((payload_length, expected, total))
 }
 
 async fn extract_snapshot_database(
@@ -1490,6 +2116,15 @@ async fn remove_old_snapshot(
         }
     }
 }
+
+#[cfg(all(test, target_os = "linux"))]
+mod config_capacity_snapshot_tests;
+
+#[cfg(all(test, target_os = "linux"))]
+mod config_capacity_worker_ownership_tests;
+
+#[cfg(all(test, target_os = "linux"))]
+mod config_capacity_engine_incarnation_tests;
 
 #[cfg(test)]
 mod tests {
@@ -1753,8 +2388,14 @@ mod tests {
         {
             let conn = backend.conn();
             let conn = conn.lock().await;
-            sqlite::append_logs_sync(&conn, identity(), &members(), &entries)
-                .expect("append bounded-read fixtures");
+            sqlite::append_logs_sync(
+                &conn,
+                identity(),
+                &members(),
+                &entries,
+                RetainedConfigMode::Legacy,
+            )
+            .expect("append bounded-read fixtures");
         }
 
         let full = log_store
@@ -1785,10 +2426,15 @@ mod tests {
     async fn snapshot_file_name(backend: &SqliteBackend) -> String {
         let conn = backend.conn();
         let conn = conn.lock().await;
-        sqlite::read_current_snapshot_sync(&conn, identity(), &members())
-            .expect("current snapshot row")
-            .expect("current snapshot")
-            .1
+        sqlite::read_current_snapshot_sync(
+            &conn,
+            identity(),
+            &members(),
+            RetainedConfigMode::Legacy,
+        )
+        .expect("current snapshot row")
+        .expect("current snapshot")
+        .1
     }
 
     async fn create_referenced_snapshot(backend: &SqliteBackend, snapshot_dir: &Path) -> String {
@@ -1830,7 +2476,13 @@ mod tests {
         let expected_members = log.core.expected_members.clone();
         log.core
             .run_sqlite(move |conn| {
-                sqlite::append_logs_sync(conn, identity(), &expected_members, &[entry])
+                sqlite::append_logs_sync(
+                    conn,
+                    identity(),
+                    &expected_members,
+                    &[entry],
+                    RetainedConfigMode::Legacy,
+                )
             })
             .await
             .expect("durable log entry");
@@ -2818,9 +3470,14 @@ mod tests {
             .expect("write future revision");
         file.sync_all().expect("sync future revision");
 
-        let error = verify_snapshot_envelope(&path)
-            .await
-            .expect_err("future snapshot revision must fail closed");
+        let error = verify_snapshot_envelope(
+            &path,
+            RetainedConfigMode::Legacy,
+            identity(),
+            backend.audit_key(),
+        )
+        .await
+        .expect_err("future snapshot revision must fail closed");
         assert_eq!(io::ErrorKind::InvalidData, error.kind());
     }
 
@@ -2922,3 +3579,10 @@ mod tests {
             .is_none());
     }
 }
+
+#[cfg(test)]
+#[path = "../../tests/management_audit_authority/target_snapshot_envelopes.rs"]
+mod target_snapshot_envelope_tests;
+
+#[cfg(test)]
+mod three_mode_tests;

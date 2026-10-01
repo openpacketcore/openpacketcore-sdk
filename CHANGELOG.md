@@ -22,6 +22,50 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   written mutation to a second voter. Scope, topology, authorization and
   validation rejections are unchanged. Fixes #1036.
 
+- `opc-persist`: preserve indexed validation across legacy audit intents,
+  retained target intents, and empty commits. Account for the live index
+  allocation alongside the derived ledger operations. Combined runtime and
+  capacity qualification remain open. Refs #957, #958.
+
+- `opc-persist`: connect the explicit bounded Running profile to native audited
+  admission and application, preserving its original recovery identity and WAL
+  durability. Avoid repeated ledger serialization and bounded recovery routing
+  scans while preserving canonical authentication. Validate adjacent Running
+  history gates once within their existing SQL transaction. Focused native
+  maximum-size application and recovery pass; full combined capacity
+  qualification remains open. Refs #957, #958.
+
+- `opc-persist`: serialize new retained-target audit Intents against unsettled
+  operations in the authenticated ledger transaction. Preserve exact-original
+  replay and reject stale effects without applying them. Concurrent cleanup
+  convergence remains under qualification. Refs #958.
+
+- `opc-persist`: allow an ordinary Running replacement after a confirmed
+  configuration has been rolled back and its original audit obligations settled.
+  Retained tentative history does not fence the current ordinary head; a current
+  pending confirmation still refuses replacement. Refs #958.
+- `opc-persist`: release the authenticated audit SQL encoding before deriving
+  retained operations. Preserve canonical authentication, identity and signing
+  continuity checks; qualify the lifetime with native durable commit and reopen
+  coverage. Full capacity qualification remains open. Refs #957.
+
+- `opc-persist`: reuse admission checks for the same locally owned bounded
+  append. Received requests, legacy operations, native storage and retained
+  reopen keep independent validation. Preserve admission ordering, cancellation
+  and original deadlines. Full capacity qualification remains open. Refs #957.
+
+- `opc-persist`: decode canonical audited bounded appends without the generic
+  ciphertext-array fallback and batch audit-effect JSON writes. Preserve exact
+  canonical bytes, HMAC compatibility, authenticated recovery, retained reopen
+  and original size ceilings. Full capacity qualification remains open. Refs #957.
+
+- Preserve bounded configuration preparation and proposal ownership until
+  native storage drains after response loss. Authenticate retained results,
+  retain the committed snapshot frontier, and refuse mismatched retained
+  identities. Release completed audit preflight ledgers before checkpoint and
+  native submission. The experimental capacity profile remains under qualification.
+  Refs #957, #960.
+
 - `opc-gtpu-dataplane`: exact TFT classifier removal no longer drops
   default-bearer uplink. Removal first converts the classifier into its
   durable removal fence, and the tc program used to drop every unmarked IPv4
@@ -101,6 +145,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   replacement, shutdown and multihoming failover qualification (Refs #788).
 
 ### Added
+
+- `opc-config-bus`: retain session-bound Running replacements in the required
+  NETCONF worker through reply cancellation and exact-original recovery. Keep
+  known applied results separate from audit and publication debt; publish only
+  authenticated original readback after terminal settlement. This bounded worker
+  slice does not enable the complete retained NETCONF profile. Refs #958.
 
 - `opc-persist`: add an online audit recipient client and authority-owned
   verification session without exporting signing keys. Verify actual received

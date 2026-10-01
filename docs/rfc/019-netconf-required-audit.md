@@ -58,6 +58,66 @@ This is partial delivery: copy, candidate, startup and confirmed lifecycle
 obligations remain required for #958. The smaller profile cannot close the issue
 or stand in for their acceptance evidence.
 
+#### Retained ordinary Running protocol attachment
+
+With the `required-netconf-audit` feature, the separate experimental
+`with_retained_running_audit` attachment routes bounded ordinary Running
+`edit-config` and binding-enabled NMDA `edit-data` to the retained worker.
+The parser's effective schema-root operation selects **Replace/Replace** or
+**Patch/Update** request/audit semantics. A partial edit computes the complete
+resulting model against the selected Running base; omitted fields are preserved
+by the binding's edit applicator. Descendant `replace` under a root `merge`
+remains Patch. NACM authorizes that actual operation before the unchanged
+request reaches the worker; the encrypted fingerprint and original Intent keep
+it through native Apply, recovery and publication. Relabeling a Patch as Replace
+is forbidden even though both persist a complete model.
+
+Copy and unsupported edit options receive `operation-not-supported`. This does
+not add delete-config, candidate, startup or confirmed lifecycle support. The
+constructor requires the exact worker's bus and explicitly refuses candidate,
+startup (including an unadvertised facade), confirmed commit and an already
+attached legacy required-config submitter. Those refusals are rechecked on RPCs.
+The existing read-only retained-session attachment and legacy writable-running
+attachment keep their existing contracts.
+
+This experimental subset leaves the binding's actual `:writable-running` hello
+unchanged; it does not mask that capability or invent a new capability URI.
+Tests assert that advertisement, partial edit and root-replace authorization,
+and literal Patch/Update bindings in authenticated native readback and audit.
+The existing parser, supported edit options and schema applicator still define
+the accepted editing subset. The closed worker accepts only ordinary
+Replace/Replace and Patch/Update; the adapter's ability to prepare Delete/Delete
+does not enable a retained Delete route. This subset does not establish full
+protocol qualification or complete #958 acceptance.
+
+Only the actual transport runner lends its `NetconfSession`. Numeric registry
+IDs and direct asynchronous dispatch cannot supply this authority. Parsing,
+NACM, candidate size/model validation, selected base and the original request's
+30-second deadline remain in force. The worker uses real encrypted
+preparation, session/base-bound Intent and native Apply, then original terminal
+and independent checkpoint completion and exact committed readback/publication.
+The worker retains ownership when the transport future is cancelled. Immediately
+before polling new native Intent admission, the final post-wait guard rechecks
+the exact session and original monotonic request deadline. Slow preflight may
+return after that deadline, but cannot obtain a fresh native budget to admit
+expired work. Already acknowledged originals retain their completion and recovery
+obligations; expiry never relabels their result or creates a replacement request.
+
+A protocol `<ok/>` uses only the original receipt's `published_commit()`. An
+already Applied result with terminal/checkpoint or publication debt receives the
+existing recovery-required RPC error, **not a new failed audit event**. The exact
+Applied receipt remains available to the authorized integration through the same
+request/recovery handle; replay must recover that original rather than mint a
+replacement request. This slice does not add a wire recovery-handle extension
+or infer that an error proves the write was absent.
+
+The scoped synthetic fixture uses real encrypted retained storage, native Apply,
+and an independent monotonic checkpoint through the actual NETCONF session
+runner. It uses an already-authenticated in-memory byte stream and local native
+Ephemeral storage; it does not establish TLS deployment, multi-voter Durable/WAL
+recovery, a latency budget, a full memory bound, or recipient-only verification.
+The complete #958 lifecycle remains open.
+
 The authenticated session supplies the principal and tenant. The SDK creates
 one request identity per received RPC; the XML `message-id` is reply correlation,
 not a durable idempotency key. Raw identities and payloads remain outside public

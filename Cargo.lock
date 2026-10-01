@@ -2601,6 +2601,7 @@ dependencies = [
  "opc-crypto",
  "opc-key",
  "opc-mgmt-audit",
+ "opc-persist",
  "opc-redaction",
  "opc-types",
  "serde",
@@ -2621,10 +2622,13 @@ dependencies = [
  "opc-config-bus",
  "opc-config-model",
  "opc-consensus",
+ "opc-crypto",
  "opc-identity",
  "opc-key",
  "opc-mgmt-audit",
  "opc-persist",
+ "opc-session-net",
+ "opc-session-store",
  "opc-tls",
  "opc-types",
  "rcgen",
@@ -2632,12 +2636,14 @@ dependencies = [
  "rustls-pki-types",
  "serde",
  "serde_json",
+ "sha2 0.11.0",
  "tempfile",
  "thiserror 2.0.20",
  "time",
  "tokio",
  "tokio-rustls",
  "tracing",
+ "tracking-allocator",
  "uuid",
  "zeroize",
 ]
@@ -2687,6 +2693,8 @@ dependencies = [
  "opc-key",
  "opc-types",
  "rand 0.10.2",
+ "serde",
+ "serde_json",
  "sha2 0.11.0",
  "thiserror 2.0.20",
  "tokio",
@@ -3225,6 +3233,7 @@ dependencies = [
  "opc-config-bus-consensus",
  "opc-config-model",
  "opc-consensus",
+ "opc-crypto",
  "opc-identity",
  "opc-key",
  "opc-mgmt-audit",
@@ -3298,6 +3307,7 @@ dependencies = [
  "opc-nacm",
  "opc-redaction",
  "opc-types",
+ "postcard",
  "rand 0.10.2",
  "rusqlite",
  "rustix",
@@ -3712,6 +3722,7 @@ dependencies = [
  "tokio",
  "tokio-rustls",
  "tracing",
+ "tracking-allocator",
  "uuid",
 ]
 
@@ -6111,6 +6122,12 @@ dependencies = [
  "tracing",
  "tracing-core",
 ]
+
+[[package]]
+name = "tracking-allocator"
+version = "0.4.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "1b61e0cb3385e17df7db29c565b40fd0350dfe8a076c7eea83d416e30cfd0581"
 
 [[package]]
 name = "try-lock"

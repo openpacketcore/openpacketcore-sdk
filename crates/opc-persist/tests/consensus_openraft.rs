@@ -1,3 +1,6 @@
+#[path = "config_capacity_957_retention_election/election_trace.rs"]
+mod config_capacity_retention_election_trace;
+
 mod management_audit_authority;
 
 use std::collections::{BTreeMap, BTreeSet};
@@ -1283,6 +1286,7 @@ async fn retained_history_floor_limits_and_outcomes_survive_explicit_reopen() {
 
 #[tokio::test]
 async fn history_retention_survives_natural_leader_change_and_member_snapshot_install() {
+    let election_trace = config_capacity_retention_election_trace::ElectionTrace::install();
     let mut cluster =
         ThreeNodeCluster::build_with_storage([[0x55; 32]; 3], FixtureStorage::RetainedNew).await;
     let (a, b, c) = tokio::join!(
@@ -1358,7 +1362,8 @@ async fn history_retention_survives_natural_leader_change_and_member_snapshot_in
         .shutdown()
         .await
         .expect("old leader stopped");
-    let replacement = tokio::time::timeout(CLUSTER_TRANSITION_TIMEOUT, async {
+    let election_result = tokio::time::timeout(CLUSTER_TRANSITION_TIMEOUT, async {
+        let _election_phase = election_trace.begin_phase();
         loop {
             for index in 0..3 {
                 if index == original_leader {
@@ -1375,8 +1380,48 @@ async fn history_retention_survives_natural_leader_change_and_member_snapshot_in
             tokio::time::sleep(Duration::from_millis(25)).await;
         }
     })
-    .await
-    .expect("natural surviving-quorum election");
+    .await;
+    if election_result.is_err() {
+        // Observe the failure only after the unchanged deadline has elapsed.
+        // Slots and booleans exclude raw identities, log indexes and payloads.
+        for (index, store) in cluster.stores.iter().enumerate() {
+            if index == original_leader {
+                continue;
+            }
+            let state = store.status();
+            eprintln!(
+                "CONFIG_CAPACITY_RETENTION_ELECTION_STATUS survivor_slot={index} term_advanced={} leader_present={} self_leader={} old_leader={} admitted={} applied_present={} committed_present={} applied_caught_up={}",
+                state.term > old_term,
+                state.leader_id.is_some(),
+                state.leader_id == Some(state.node_id),
+                state.leader_id == Some(old_id),
+                state.admitted,
+                state.applied_index.is_some(),
+                state.committed_index.is_some(),
+                state.applied_index.zip(state.committed_index).is_some_and(|(applied, committed)| applied >= committed),
+            );
+        }
+        for ((source, target), path) in &cluster.paths {
+            if *source == original_leader || *target == original_leader {
+                continue;
+            }
+            let installed = path
+                .handler
+                .try_read()
+                .ok()
+                .map(|handler| handler.is_some());
+            let captured_count = path
+                .captured_payloads
+                .try_lock()
+                .ok()
+                .map(|payloads| payloads.len());
+            eprintln!(
+                "CONFIG_CAPACITY_RETENTION_ELECTION_PATH source_slot={source} target_slot={target} enabled={} handler_installed={installed:?} captured_count={captured_count:?}",
+                path.enabled.load(Ordering::SeqCst),
+            );
+        }
+    }
+    let replacement = election_result.expect("natural surviving-quorum election");
     cluster.stores[replacement]
         .retain_history_idempotent(request, decision.clone())
         .await

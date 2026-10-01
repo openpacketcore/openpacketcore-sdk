@@ -12,7 +12,12 @@ use std::sync::Arc;
 use tokio::sync::{watch, Mutex as AsyncMutex};
 
 use opc_config_model::{IdempotencyKey, OpcConfig, RequestId, RequestSource, RollbackTarget};
-use opc_crypto::{decrypt_envelope, encrypt_attested_envelope};
+use opc_crypto::{
+    decrypt_envelope, encrypt_attested_envelope, encrypt_reserved_bounded_config_envelope,
+};
+
+/// Configuration byte policy selected by the sealed datastore authority.
+pub use opc_crypto::ConfigCapacityProfile;
 use opc_key::{ConfigAad, EnvelopeAad, KeyProvider, Zeroizing};
 use opc_types::{ConfigVersion, TxId};
 
@@ -20,6 +25,10 @@ use crate::types::{
     CommitWrite, CommitWriteReceipt, ConfirmedCommitResolution, SealedConfig, StoreError,
     StoredConfig, StoredRequestFingerprint,
 };
+
+#[cfg(all(test, feature = "capacity-observation"))]
+#[path = "adapter_capacity_tests.rs"]
+mod adapter_capacity_tests;
 
 const CONFIG_STORE_KIND: &str = "running";
 const CONFIG_ENVELOPE_SERIALIZATION_FAILED_MESSAGE: &str = "config envelope serialization failed";
@@ -51,6 +60,28 @@ struct ConfigPlaintextV2Ref<'a, C> {
     request_id: Option<opc_config_model::RequestId>,
 }
 
+// Only used after the bounded profile reserved its full plaintext capacity.
+// ConfigCapacityEvidence independently validates logical and replay spans in
+// these exact bytes before any key-provider request.
+struct ConfigPlaintextWriter<'a>(&'a mut Vec<u8>);
+
+impl std::io::Write for ConfigPlaintextWriter<'_> {
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        if bytes.len() > opc_crypto::CONFIG_CAPACITY_V1_PLAINTEXT_BYTES.saturating_sub(self.0.len())
+        {
+            return Err(std::io::Error::other(
+                "configuration plaintext capacity exceeded",
+            ));
+        }
+        self.0.extend_from_slice(bytes);
+        Ok(bytes.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
 #[derive(serde::Deserialize)]
 struct ConfigPlaintextV2<C> {
     config: C,
@@ -75,6 +106,27 @@ struct ConfigPlaintextV2<C> {
 /// after a crash, and a definite failed append must leave no partial record.
 #[async_trait]
 pub trait ManagedDatastore<C: OpcConfig>: Send + Sync {
+    /// Immutable byte policy used before configuration encryption. Legacy is
+    /// the compatibility default. This selection alone does not enable a
+    /// larger consensus command or promise a durability/resource profile.
+    fn config_capacity_profile(&self) -> ConfigCapacityProfile {
+        ConfigCapacityProfile::Legacy
+    }
+
+    /// Reserve preparation capacity in this exact sealed datastore before
+    /// allocating SDK plaintext. Nonlegacy implementations must provide their
+    /// authority's reservation; the compatibility default cannot invent one.
+    fn try_reserve_config_preparation(
+        &self,
+    ) -> Result<Option<opc_crypto::ConfigPreparationReservation>, StoreError> {
+        match self.config_capacity_profile() {
+            ConfigCapacityProfile::Legacy => Ok(None),
+            _ => Err(StoreError::unavailable(
+                "configuration preparation admission unavailable",
+            )),
+        }
+    }
+
     /// Observation port belonging to this datastore's required mutation audit
     /// authority. It must reject standalone Intents and preserve admitted work
     /// across cancellation. Legacy stores expose no required audit capability.
@@ -82,6 +134,36 @@ pub trait ManagedDatastore<C: OpcConfig>: Send + Sync {
     /// [`Self::append_required_audit_commit`] without an unaudited fallback.
     fn required_audit_observations(&self) -> Option<Arc<dyn opc_mgmt_audit::AuditSink>> {
         None
+    }
+
+    /// Concrete retained NETCONF authority. An observation port alone cannot
+    /// provide it. The SDK encrypting wrapper explicitly binds its provider
+    /// before a full-profile ConfigBus capability can be attached.
+    #[cfg(feature = "required-netconf-audit")]
+    fn required_netconf_audit_store(&self) -> Option<crate::NetconfAuditStore> {
+        None
+    }
+
+    /// Prepare one ordinary Running envelope for the retained NETCONF worker.
+    /// The authenticated principal is supplied independently of the write and
+    /// audit event. Implementations must bind all three before provider access.
+    /// This consumes fresh encryption evidence but never admits an Intent,
+    /// appends history, or completes audit. The result grants no session, NACM
+    /// or writable-profile authority; the original SDK session/base still must
+    /// authorize preparation and admission. Retain the original after admission
+    /// instead of encrypting again for effect submission or recovery.
+    ///
+    /// The default refuses without calling any append method.
+    #[cfg(feature = "required-netconf-audit")]
+    async fn prepare_netconf_running_commit(
+        &self,
+        _commit: CommitWrite<C>,
+        _authenticated: &opc_config_model::TrustedPrincipal,
+        _intent: &opc_mgmt_audit::AuditEvent,
+    ) -> Result<opc_persist::AttestedConfigCommit, StoreError> {
+        Err(StoreError::unavailable(
+            "NETCONF Running preparation is unsupported",
+        ))
     }
 
     /// Admit one intent bound to this exact write before atomically applying it.
@@ -279,8 +361,35 @@ where
     C: OpcConfig,
     T: ManagedDatastore<C> + ?Sized,
 {
+    fn config_capacity_profile(&self) -> ConfigCapacityProfile {
+        (**self).config_capacity_profile()
+    }
+
+    fn try_reserve_config_preparation(
+        &self,
+    ) -> Result<Option<opc_crypto::ConfigPreparationReservation>, StoreError> {
+        (**self).try_reserve_config_preparation()
+    }
+
     fn required_audit_observations(&self) -> Option<Arc<dyn opc_mgmt_audit::AuditSink>> {
         (**self).required_audit_observations()
+    }
+
+    #[cfg(feature = "required-netconf-audit")]
+    fn required_netconf_audit_store(&self) -> Option<crate::NetconfAuditStore> {
+        (**self).required_netconf_audit_store()
+    }
+
+    #[cfg(feature = "required-netconf-audit")]
+    async fn prepare_netconf_running_commit(
+        &self,
+        commit: CommitWrite<C>,
+        authenticated: &opc_config_model::TrustedPrincipal,
+        intent: &opc_mgmt_audit::AuditEvent,
+    ) -> Result<opc_persist::AttestedConfigCommit, StoreError> {
+        (**self)
+            .prepare_netconf_running_commit(commit, authenticated, intent)
+            .await
     }
 
     async fn append_required_audit_commit(
@@ -383,6 +492,8 @@ where
 pub struct EncryptingManagedDatastore<C, P: ?Sized, S: ?Sized> {
     inner: Arc<S>,
     provider: Arc<P>,
+    #[cfg(feature = "required-netconf-audit")]
+    netconf: Option<crate::NetconfAuditStore>,
     store_kind: Arc<str>,
     marker: PhantomData<fn() -> C>,
 }
@@ -403,6 +514,8 @@ impl<C, P: ?Sized, S: ?Sized> EncryptingManagedDatastore<C, P, S> {
         Self {
             inner,
             provider,
+            #[cfg(feature = "required-netconf-audit")]
+            netconf: None,
             store_kind: Arc::<str>::from(store_kind.into()),
             marker: PhantomData,
         }
@@ -435,6 +548,31 @@ where
     P: KeyProvider + ?Sized,
     S: ManagedDatastore<SealedConfig<C>> + ?Sized,
 {
+    /// Attach this encrypting datastore's existing provider to its concrete
+    /// retained NETCONF authority. The underlying SDK device must already be
+    /// current and checkpointed. No default constructor enables this profile.
+    ///
+    /// This opt-in attachment requires an owned provider. Existing constructors
+    /// and ordinary ManagedDatastore implementations retain their original bounds.
+    #[cfg(feature = "required-netconf-audit")]
+    pub async fn with_required_netconf_audit(mut self) -> Result<Self, StoreError>
+    where
+        P: 'static,
+    {
+        if self.store_kind() != CONFIG_STORE_KIND {
+            return Err(StoreError::unavailable(
+                "NETCONF configuration store mismatch",
+            ));
+        }
+        let port = self
+            .inner
+            .required_netconf_audit_store()
+            .ok_or_else(|| StoreError::unavailable("required NETCONF audit is unsupported"))?;
+        port.verify_current().await?;
+        self.netconf = Some(port.with_provider(Arc::clone(&self.provider)));
+        Ok(self)
+    }
+
     async fn encrypt_write(
         &self,
         commit: CommitWrite<C>,
@@ -461,33 +599,114 @@ where
             request_fingerprint: record.request_fingerprint.as_ref(),
             request_id: record.request_id,
         };
-        // Serialize directly into zeroizing storage. Wrapping a `to_vec`
-        // result only after serialization would leave both its error path and
-        // any copied intermediate allocation able to retain config and raw
-        // replay metadata in allocator memory.
-        let mut encoded = Zeroizing::new(Vec::new());
-        serde_json::to_writer(&mut *encoded, &plaintext_v2)
-            .map_err(|_| StoreError::internal(CONFIG_ENVELOPE_SERIALIZATION_FAILED_MESSAGE))?;
-        let mut plaintext = Zeroizing::new(Vec::with_capacity(
-            CONFIG_PLAINTEXT_V2_MAGIC
-                .len()
-                .saturating_add(encoded.len()),
-        ));
-        plaintext.extend_from_slice(CONFIG_PLAINTEXT_V2_MAGIC);
-        plaintext.extend_from_slice(&encoded);
+        let profile = self.inner.config_capacity_profile();
+        let preparation = self.inner.try_reserve_config_preparation()?;
+        if profile != ConfigCapacityProfile::Legacy && preparation.is_none() {
+            return Err(StoreError::unavailable(
+                "configuration preparation admission unavailable",
+            ));
+        }
+        let mut plaintext = Zeroizing::new(Vec::new());
+        match profile {
+            ConfigCapacityProfile::Legacy => {
+                plaintext.extend_from_slice(CONFIG_PLAINTEXT_V2_MAGIC);
+                serde_json::to_writer(&mut *plaintext, &plaintext_v2).map_err(|_| {
+                    StoreError::internal(CONFIG_ENVELOPE_SERIALIZATION_FAILED_MESSAGE)
+                })?;
+            }
+            ConfigCapacityProfile::BoundedV1 => {
+                // Reserve once so growing the serializer cannot leave copied
+                // plaintext in an abandoned allocation. Charge the magic and
+                // every exact emitted byte to the complete plaintext ceiling.
+                plaintext
+                    .try_reserve_exact(opc_crypto::CONFIG_CAPACITY_V1_PLAINTEXT_BYTES)
+                    .map_err(|_| {
+                        StoreError::unavailable("configuration plaintext allocation failed")
+                    })?;
+                #[cfg(feature = "capacity-observation")]
+                {
+                    let _plaintext = crate::capacity_observation::BufferBorrow::new(
+                        crate::capacity_observation::BufferKind::AdapterPlaintext,
+                        &plaintext,
+                    );
+                    crate::capacity_observation::checkpoint("adapter-plaintext-reserved");
+                }
+                plaintext.extend_from_slice(CONFIG_PLAINTEXT_V2_MAGIC);
+                serde_json::to_writer(ConfigPlaintextWriter(&mut plaintext), &plaintext_v2)
+                    .map_err(|_| {
+                        StoreError::internal(
+                            "configuration plaintext serialization exceeds capacity or is invalid",
+                        )
+                    })?;
+            }
+            _ => {
+                return Err(StoreError::internal(
+                    "configuration capacity profile is unsupported",
+                ))
+            }
+        }
+        #[cfg(feature = "capacity-observation")]
+        let _plaintext_observation = (profile == ConfigCapacityProfile::BoundedV1).then(|| {
+            crate::capacity_observation::BufferBorrow::new(
+                crate::capacity_observation::BufferKind::AdapterPlaintext,
+                &plaintext,
+            )
+        });
+        #[cfg(all(test, feature = "capacity-observation"))]
+        adapter_capacity_tests::inspect_plaintext(&plaintext);
         record.plaintext_digest = Some(compute_plaintext_digest(plaintext.as_slice()));
         record.idempotency_key =
             replay_lookup_digest(record.idempotency_key.as_ref(), record.request_id)?;
         record.apply_plan = None;
         record.request_fingerprint = None;
         record.request_id = None;
-        let aad = build_config_envelope_aad(&record, self.store_kind(), None)?;
+        let aad = if profile == ConfigCapacityProfile::BoundedV1 {
+            build_bounded_config_envelope_aad(&record, self.store_kind())?
+        } else {
+            build_config_envelope_aad(&record, self.store_kind(), None)?
+        };
         let schema_digest = record.schema_digest;
-        let envelope =
-            encrypt_attested_envelope(self.provider.as_ref(), &aad, plaintext.as_slice())
+        let envelope = match profile {
+            ConfigCapacityProfile::Legacy => {
+                encrypt_attested_envelope(self.provider.as_ref(), &aad, plaintext.as_slice())
+                    .await
+                    .map_err(|_| StoreError::crypto(CONFIG_ENVELOPE_ENCRYPT_FAILED_MESSAGE))?
+            }
+            ConfigCapacityProfile::BoundedV1 => {
+                let preparation = preparation.ok_or_else(|| {
+                    StoreError::unavailable("configuration preparation admission unavailable")
+                })?;
+                encrypt_reserved_bounded_config_envelope(
+                    preparation,
+                    self.provider.as_ref(),
+                    &aad,
+                    plaintext.as_slice(),
+                )
                 .await
-                .map_err(|_| StoreError::crypto(CONFIG_ENVELOPE_ENCRYPT_FAILED_MESSAGE))?;
+                .map_err(|error| match error {
+                    opc_crypto::ConfigCapacityError::EncryptionFailed => {
+                        StoreError::crypto(CONFIG_ENVELOPE_ENCRYPT_FAILED_MESSAGE)
+                    }
+                    _ => StoreError::internal("configuration capacity validation failed"),
+                })?
+            }
+            _ => {
+                return Err(StoreError::internal(
+                    "configuration capacity profile is unsupported",
+                ))
+            }
+        };
         record.encrypted_blob = envelope.encoded().to_vec();
+        #[cfg(feature = "capacity-observation")]
+        if profile == ConfigCapacityProfile::BoundedV1 {
+            let _record_blob = crate::capacity_observation::BufferBorrow::new(
+                crate::capacity_observation::BufferKind::RecordBlob,
+                &record.encrypted_blob,
+            );
+            crate::capacity_observation::checkpoint("adapter-sealed-record-transfer");
+            #[cfg(test)]
+            adapter_capacity_tests::inspect_transfer(&record.encrypted_blob, &envelope);
+        }
         Ok(record.with_config(SealedConfig::newly_encrypted(schema_digest, envelope)))
     }
 
@@ -569,8 +788,50 @@ where
     P: KeyProvider + ?Sized,
     S: ManagedDatastore<SealedConfig<C>> + ?Sized,
 {
+    fn config_capacity_profile(&self) -> ConfigCapacityProfile {
+        self.inner.config_capacity_profile()
+    }
+
+    fn try_reserve_config_preparation(
+        &self,
+    ) -> Result<Option<opc_crypto::ConfigPreparationReservation>, StoreError> {
+        self.inner.try_reserve_config_preparation()
+    }
+
     fn required_audit_observations(&self) -> Option<Arc<dyn opc_mgmt_audit::AuditSink>> {
         self.inner.required_audit_observations()
+    }
+
+    #[cfg(feature = "required-netconf-audit")]
+    fn required_netconf_audit_store(&self) -> Option<crate::NetconfAuditStore> {
+        self.netconf.clone()
+    }
+
+    #[cfg(feature = "required-netconf-audit")]
+    async fn prepare_netconf_running_commit(
+        &self,
+        commit: CommitWrite<C>,
+        authenticated: &opc_config_model::TrustedPrincipal,
+        intent: &opc_mgmt_audit::AuditEvent,
+    ) -> Result<opc_persist::AttestedConfigCommit, StoreError> {
+        let port = self
+            .netconf
+            .as_ref()
+            .ok_or_else(|| StoreError::unavailable("NETCONF Running preparation is unsupported"))?;
+        if self.store_kind() != CONFIG_STORE_KIND
+            || !commit.record().encrypted_blob.is_empty()
+            || commit.record().plaintext_digest.is_some()
+        {
+            return Err(StoreError::unavailable(
+                "NETCONF Running preparation requires a fresh Running write",
+            ));
+        }
+        commit.validate_netconf_running_preparation(authenticated, intent)?;
+        port.verify_current().await?;
+        let sealed = self.encrypt_write(commit).await?;
+        self.inner
+            .prepare_netconf_running_commit(sealed, authenticated, intent)
+            .await
     }
 
     async fn append_required_audit_commit(
@@ -709,7 +970,7 @@ where
 {
 }
 
-fn build_config_envelope_aad<C: OpcConfig>(
+pub(crate) fn build_config_envelope_aad<C: OpcConfig>(
     record: &StoredConfig<C>,
     store_kind: &str,
     persisted_principal: Option<&str>,
@@ -733,6 +994,58 @@ fn build_config_envelope_aad<C: OpcConfig>(
         record.version.get(),
         metadata,
     ))
+}
+
+// Count the actual principal JSON and store-kind serialization before making
+// SDK-owned copies. The later crypto preflight still validates the complete
+// AAD shape (including principal escaping), then the exact key-bound encoding.
+// These individual checks bound even the copies of metadata rejected there.
+fn build_bounded_config_envelope_aad<C: OpcConfig>(
+    record: &StoredConfig<C>,
+    store_kind: &str,
+) -> Result<EnvelopeAad, StoreError> {
+    let failure =
+        || StoreError::internal("configuration AAD serialization exceeds capacity or is invalid");
+    let mut principal_size = ConfigAadTextCounter(0);
+    serde_json::to_writer(&mut principal_size, &record.principal).map_err(|_| failure())?;
+    serde_json::to_writer(ConfigAadTextCounter(0), store_kind).map_err(|_| failure())?;
+    let mut principal = Vec::new();
+    principal
+        .try_reserve_exact(principal_size.0)
+        .map_err(|_| StoreError::unavailable("configuration AAD allocation failed"))?;
+    serde_json::to_writer(&mut principal, &record.principal).map_err(|_| failure())?;
+    let principal = String::from_utf8(principal).map_err(|_| failure())?;
+    let metadata = ConfigAad::new(
+        record.tx_id,
+        record.parent_tx_id,
+        record.committed_at,
+        principal,
+        record.schema_digest,
+        store_kind,
+    )
+    .map_err(|_| StoreError::crypto(CONFIG_ENVELOPE_AAD_FAILED_MESSAGE))?;
+    Ok(EnvelopeAad::config(
+        record.principal.tenant.clone(),
+        record.version.get(),
+        metadata,
+    ))
+}
+
+struct ConfigAadTextCounter(usize);
+
+impl std::io::Write for ConfigAadTextCounter {
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        self.0 = self
+            .0
+            .checked_add(bytes.len())
+            .filter(|length| *length <= opc_crypto::CONFIG_CAPACITY_V1_AAD_BYTES)
+            .ok_or_else(|| std::io::Error::other("configuration AAD capacity exceeded"))?;
+        Ok(bytes.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
 }
 
 fn compute_plaintext_digest(bytes: &[u8]) -> [u8; 32] {

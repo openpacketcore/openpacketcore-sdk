@@ -1,6 +1,7 @@
 //! Deterministic bounded state used only by the configuration consensus owner.
 
 use std::fmt;
+use std::sync::Arc;
 
 use hmac::{Hmac, KeyInit, Mac};
 use serde::{Deserialize, Serialize};
@@ -22,8 +23,75 @@ const ENTRY_DOMAIN: &[u8] = b"openpacketcore/management-audit/replicated-entry/v
 pub(crate) const STATE_DOMAIN: &[u8] = b"openpacketcore/management-audit/replicated-state/v1\0";
 pub(crate) const MAX_STATE_BYTES: usize = 16 * 1024 * 1024;
 pub(crate) const MAX_LEDGER_EVENTS: usize = 4096;
+pub(crate) const MAX_LEDGER_OPERATIONS: usize = 1024;
 const MAX_HANDLE_BYTES: usize = 8192;
 const OPERATION_EVENT_RESERVATION: usize = 3;
+
+// The retained row and its target-budget preflight count the same canonical
+// serde_json representation. No complete JSON output is retained by this sink.
+#[derive(Default)]
+struct StateByteCounter {
+    bytes: usize,
+    exceeded: bool,
+}
+
+impl std::io::Write for StateByteCounter {
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        match self.bytes.checked_add(bytes.len()) {
+            Some(length) if length <= MAX_STATE_BYTES => {
+                self.bytes = length;
+                Ok(bytes.len())
+            }
+            _ => {
+                self.exceeded = true;
+                Err(std::io::Error::from(std::io::ErrorKind::InvalidData))
+            }
+        }
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+/// Count canonical retained JSON, stopping at its unchanged byte limit.
+/// Writer overflow is quota exhaustion; other serialization failure is invalid input.
+pub(crate) fn encoded_state_len<T: Serialize + ?Sized>(
+    value: &T,
+) -> Result<usize, AuditAuthorityError> {
+    let mut counter = StateByteCounter::default();
+    match serde_json::to_writer(&mut counter, value) {
+        Ok(()) => Ok(counter.bytes),
+        Err(_) if counter.exceeded => Err(AuditAuthorityError::Full),
+        Err(_) => Err(AuditAuthorityError::InvalidInput),
+    }
+}
+
+// Resource failure is replica-local and must not become a replicated logical
+// rejection. Only the authority variant may be serialized as a command result.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, thiserror::Error)]
+pub(crate) enum LedgerMutationError {
+    #[error(transparent)]
+    Authority(#[from] AuditAuthorityError),
+    #[error("retained ledger allocation failed")]
+    Allocation,
+}
+
+pub(crate) fn reserve_mutation<T>(
+    values: &mut Vec<T>,
+    additional: usize,
+) -> Result<(), LedgerMutationError> {
+    if additional <= values.capacity() - values.len() {
+        return Ok(());
+    }
+    #[cfg(test)]
+    let additional = allocation_probe::requested(additional);
+    // Retained decoding uses exact capacities. Reserve only the new elements,
+    // preserving existing spare capacity and avoiding Vec's geometric growth.
+    values
+        .try_reserve_exact(additional)
+        .map_err(|_| LedgerMutationError::Allocation)
+}
 
 /// Fixed capacity admitted with the ledger, including reserved outcome slots.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -48,7 +116,7 @@ impl AuditLedgerLimits {
 
     fn validate(self) -> Result<(), AuditAuthorityError> {
         if !(3..=MAX_LEDGER_EVENTS).contains(&self.max_events)
-            || !(1..=1024).contains(&self.max_operations)
+            || !(1..=MAX_LEDGER_OPERATIONS).contains(&self.max_operations)
             || self.max_operations > self.max_events / OPERATION_EVENT_RESERVATION
         {
             return Err(AuditAuthorityError::InvalidInput);
@@ -167,6 +235,21 @@ pub enum AuditOperationState {
         /// Source outcome, independent of configuration authority.
         outcome: crate::ManagementAuditOutcomeCode,
     },
+    /// Retained target/lifecycle effect with its complete resulting state anchor.
+    /// This is disjoint from a running-only committed revision.
+    TargetV1(super::NetconfTargetResult),
+}
+
+impl AuditOperationState {
+    pub(crate) fn validate_target_for(
+        self,
+        handle: &AuditOperationHandle,
+    ) -> Result<(), AuditAuthorityError> {
+        if let Self::TargetV1(result) = self {
+            result.validate_for(handle)?;
+        }
+        Ok(())
+    }
 }
 
 /// Authenticated operation result from a quorum-applied response or quorum read.
@@ -239,6 +322,56 @@ pub(crate) enum EntryPayload {
     Terminal {
         operation: [u8; 32],
     },
+    // Append-only allocation. Both the ordinary root chain and the independent
+    // continuity chain authenticate the exact closed recovery description.
+    TargetIntent(Box<RetainedTargetIntent>),
+    // A guarded observation cannot be replayed through ordinary admission.
+    EmptyCommit(Box<super::PreparedNetconfEmptyCommit>),
+}
+
+// Scope strict decoding to the new format. Existing payload decoding and all
+// serialized field order/bytes remain unchanged.
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct RetainedTargetIntent {
+    #[serde(deserialize_with = "deserialize_target_handle")]
+    pub(crate) handle: AuditOperationHandle,
+    // Ledger snapshots keep independent mutable indexes and authenticators,
+    // while this authenticated original stays immutable across those copies.
+    #[serde(with = "retained_recovery")]
+    pub(crate) recovery: Arc<String>,
+}
+
+mod retained_recovery {
+    use super::*;
+
+    pub(super) fn serialize<S: serde::Serializer>(
+        recovery: &Arc<String>,
+        serializer: S,
+    ) -> Result<S::Ok, S::Error> {
+        recovery.as_ref().serialize(serializer)
+    }
+
+    pub(super) fn deserialize<'de, D: serde::Deserializer<'de>>(
+        deserializer: D,
+    ) -> Result<Arc<String>, D::Error> {
+        String::deserialize(deserializer).map(Arc::new)
+    }
+}
+
+impl RetainedTargetIntent {
+    #[cfg(any(test, feature = "dangerous-test-hooks"))]
+    pub(crate) fn recovery_owner_allocation(&self) -> (usize, usize) {
+        // Charge the String object and both Arc reference counts, including
+        // their alignment. The pointer identifies the shared allocation; it
+        // is never dereferenced by an observer or exposed in a sample.
+        let owner = std::alloc::Layout::new::<[std::sync::atomic::AtomicUsize; 2]>()
+            .extend(std::alloc::Layout::new::<String>())
+            .expect("fixed shared recovery owner layout")
+            .0
+            .pad_to_align();
+        (Arc::as_ptr(&self.recovery) as usize, owner.size())
+    }
 }
 
 #[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -249,6 +382,15 @@ pub(crate) struct LedgerEntry {
     pub(crate) payload: EntryPayload,
     pub(crate) key_epoch: u64,
     pub(crate) mac: [u8; 32],
+}
+
+// Root-authenticated retained anchor survives acknowledged prefix pruning. The
+// new field is absent in legacy JSON, preserving the historical MAC transcript.
+#[derive(Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct TargetStateAnchor {
+    pub(crate) sequence: u64,
+    pub(crate) result: super::NetconfTargetResult,
 }
 
 /// Exactly one bounded state, changed inside the existing Raft apply transaction.
@@ -264,8 +406,11 @@ pub(crate) struct LedgerState {
     pub(crate) floor: u64,
     pub(crate) predecessor: [u8; 32],
     pub(crate) entries: Vec<LedgerEntry>,
+    #[cfg_attr(test, serde(serialize_with = "target_budget_probe::operations"))]
     pub(crate) operations: Vec<LedgerOperation>,
     pub(crate) continuity: Option<super::continuity::chain::ContinuityState>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) target_anchor: Option<TargetStateAnchor>,
 }
 
 impl LedgerState {
@@ -286,6 +431,7 @@ impl LedgerState {
             entries: Vec::new(),
             operations: Vec::new(),
             continuity: None,
+            target_anchor: None,
         }
     }
 
@@ -302,15 +448,18 @@ impl LedgerState {
         &mut self,
         key: &AuditKey,
         payload: EntryPayload,
-    ) -> Result<u64, AuditAuthorityError> {
+    ) -> Result<u64, LedgerMutationError> {
         let next = self
             .sequence
             .checked_add(1)
             .filter(|seq| *seq <= i64::MAX as u64)
             .ok_or(AuditAuthorityError::Full)?;
         if self.entries.len() >= self.limits.max_events {
-            return Err(AuditAuthorityError::Full);
+            return Err(AuditAuthorityError::Full.into());
         }
+        reserve_mutation(&mut self.entries, 1)?;
+        #[cfg(test)]
+        crate::consensus::config_capacity_simultaneous_working_tests::ledger::changed(self);
         let mac = authenticate(
             key,
             ENTRY_DOMAIN,
@@ -325,6 +474,8 @@ impl LedgerState {
         });
         self.sequence = next;
         self.terminal = mac;
+        #[cfg(test)]
+        crate::consensus::config_capacity_simultaneous_working_tests::ledger::changed(self);
         Ok(next)
     }
 
@@ -333,17 +484,100 @@ impl LedgerState {
         key: &AuditKey,
         handle: &AuditOperationHandle,
         now: i64,
-    ) -> Result<(), AuditAuthorityError> {
+    ) -> Result<(), LedgerMutationError> {
+        self.admit_with_payload(
+            key,
+            handle,
+            now,
+            EntryPayload::Intent(Box::new(handle.clone())),
+        )
+    }
+
+    pub(crate) fn admit_target(
+        &mut self,
+        key: &AuditKey,
+        prepared: &crate::consensus::TargetMutationCommand,
+        now: i64,
+    ) -> Result<(), LedgerMutationError> {
+        if self.continuity.is_none() {
+            return Err(AuditAuthorityError::RecoveryRequired.into());
+        }
+        let recovery = String::from_utf8(prepared.encode_retained(key, self.identity)?)
+            .map_err(|_| AuditAuthorityError::InvalidInput)?;
+        self.admit_with_payload(
+            key,
+            prepared.handle(),
+            now,
+            EntryPayload::TargetIntent(Box::new(RetainedTargetIntent {
+                handle: prepared.handle().clone(),
+                recovery: Arc::new(recovery),
+            })),
+        )
+    }
+
+    pub(crate) fn admit_empty_commit(
+        &mut self,
+        key: &AuditKey,
+        prepared: &super::PreparedNetconfEmptyCommit,
+        now: i64,
+    ) -> Result<(), LedgerMutationError> {
+        if self.continuity.is_none() {
+            return Err(AuditAuthorityError::RecoveryRequired.into());
+        }
+        prepared.verify(key, self.identity, prepared.guard.caller)?;
+        self.admit_with_payload(
+            key,
+            prepared.handle(),
+            now,
+            EntryPayload::EmptyCommit(Box::new(prepared.clone())),
+        )
+    }
+
+    fn admit_with_payload(
+        &mut self,
+        key: &AuditKey,
+        handle: &AuditOperationHandle,
+        now: i64,
+        payload: EntryPayload,
+    ) -> Result<(), LedgerMutationError> {
+        // Failed admission leaves the in-memory candidate unchanged as well as
+        // the outer transaction. Existing legacy-only admission keeps its path.
+        if !matches!(payload, EntryPayload::Intent(_)) || self.has_target_payloads() {
+            let mut candidate = self.clone();
+            #[cfg(test)]
+            workspace_probe::admission_clone(self, &candidate, &payload);
+            candidate.admit_inner(key, handle, now, payload)?;
+            candidate.check_target_capacity()?;
+            *self = candidate;
+            Ok(())
+        } else {
+            self.admit_inner(key, handle, now, payload)
+        }
+    }
+
+    fn admit_inner(
+        &mut self,
+        key: &AuditKey,
+        handle: &AuditOperationHandle,
+        now: i64,
+        payload: EntryPayload,
+    ) -> Result<(), LedgerMutationError> {
         handle.verify(key, self.identity, handle.body.binding.caller)?;
         if let Some(existing) = self
             .operations
             .iter()
             .find(|op| op.handle.body.binding.request == handle.body.binding.request)
         {
-            return if existing.handle == *handle {
+            let previous = self.entries.iter().find_map(|entry| {
+                if entry.sequence != existing.first_sequence {
+                    return None;
+                }
+                Some(&entry.payload)
+            });
+            return if existing.handle == *handle && previous == Some(&payload) {
                 Ok(())
             } else {
-                Err(AuditAuthorityError::BindingMismatch)
+                Err(AuditAuthorityError::BindingMismatch.into())
             };
         }
         handle.require_live(now)?;
@@ -353,10 +587,10 @@ impl LedgerState {
                 .iter()
                 .any(|operation| self.mutation_outcome_needs_checkpoint(operation))
         {
-            return Err(AuditAuthorityError::RecoveryRequired);
+            return Err(AuditAuthorityError::RecoveryRequired.into());
         }
         if handle.body.event.projection != self.projection {
-            return Err(AuditAuthorityError::BindingMismatch);
+            return Err(AuditAuthorityError::BindingMismatch.into());
         }
         let is_intent = handle.body.event.outcome == crate::ManagementAuditOutcomeCode::Intent;
         let reservation = if is_intent {
@@ -370,9 +604,12 @@ impl LedgerState {
                 .checked_add(reservation)
                 .is_none_or(|used| used > self.limits.max_events)
         {
-            return Err(AuditAuthorityError::Full);
+            return Err(AuditAuthorityError::Full.into());
         }
-        let sequence = self.append(key, EntryPayload::Intent(Box::new(handle.clone())))?;
+        reserve_mutation(&mut self.operations, 1)?;
+        #[cfg(test)]
+        crate::consensus::config_capacity_simultaneous_working_tests::ledger::changed(self);
+        let sequence = self.append(key, payload)?;
         self.operations.push(LedgerOperation {
             handle: handle.clone(),
             state: if is_intent {
@@ -387,7 +624,111 @@ impl LedgerState {
             last_sequence: sequence,
             reserved: reservation - 1,
         });
+        #[cfg(test)]
+        crate::consensus::config_capacity_simultaneous_working_tests::ledger::changed(self);
         Ok(())
+    }
+
+    fn has_target_payloads(&self) -> bool {
+        self.entries.iter().any(|entry| {
+            matches!(
+                entry.payload,
+                EntryPayload::TargetIntent(_) | EntryPayload::EmptyCommit(_)
+            )
+        })
+    }
+
+    // The existing 16 MiB aggregate is unchanged. Reserve a conservative 32 KiB
+    // for each remaining fixed-shape outcome/terminal event, including its
+    // operation-index update and both chain authenticators. No future outcome
+    // contains configuration/envelope bytes or variable-length caller strings.
+    // Additional fixed slack covers the stored wrapper and two checkpoints;
+    // unsealed rows retain space for their independent chain authenticator.
+    pub(crate) fn check_target_capacity(&self) -> Result<(), AuditAuthorityError> {
+        if !self.has_target_payloads() {
+            return Ok(());
+        }
+        let reserved = self.operations.iter().try_fold(0usize, |used, op| {
+            used.checked_add(op.reserved)
+                .ok_or(AuditAuthorityError::Full)
+        })?;
+        let unsealed = self
+            .continuity
+            .as_ref()
+            .map_or(self.entries.len(), |chain| {
+                self.entries.len().saturating_sub(chain.rows.len())
+            });
+        #[cfg(test)]
+        let _observed_budget = target_budget_probe::Serialization::enter();
+        let encoded_len = encoded_state_len(self)?;
+        let required = reserved
+            .checked_mul(32 * 1024)
+            .and_then(|n| {
+                unsealed
+                    .checked_mul(1024)
+                    .and_then(|rows| n.checked_add(rows))
+            })
+            .and_then(|n| n.checked_add(16 * 1024))
+            .and_then(|n| n.checked_add(encoded_len))
+            .ok_or(AuditAuthorityError::Full)?;
+        if required > MAX_STATE_BYTES {
+            return Err(AuditAuthorityError::Full);
+        }
+        Ok(())
+    }
+
+    pub(crate) fn recover_target(
+        &self,
+        key: &AuditKey,
+        handle: &AuditOperationHandle,
+        caller: AuditCaller,
+    ) -> Result<super::PreparedTargetMutation, AuditAuthorityError> {
+        handle.verify(key, self.identity, caller)?;
+        let index = self.operation_index(key, handle)?;
+        let operation = &self.operations[index];
+        let entry = self
+            .entries
+            .iter()
+            .find(|entry| entry.sequence == operation.first_sequence)
+            .ok_or(AuditAuthorityError::BindingMismatch)?;
+        match &entry.payload {
+            EntryPayload::TargetIntent(retained) if retained.handle == *handle => {
+                validate_target_recovery(key, self.identity, handle, &retained.recovery)
+            }
+            _ => Err(AuditAuthorityError::BindingMismatch),
+        }
+    }
+
+    // The candidate supplies a representation, never a previous verification.
+    // Check the operation's actual retained bytes and authenticate it anew.
+    pub(crate) fn matches_target(
+        &self,
+        key: &AuditKey,
+        prepared: &crate::consensus::TargetMutationCommand,
+        caller: AuditCaller,
+    ) -> Result<bool, AuditAuthorityError> {
+        let handle = prepared.handle();
+        handle.verify(key, self.identity, caller)?;
+        let index = self.operation_index(key, handle)?;
+        let operation = &self.operations[index];
+        let entry = self
+            .entries
+            .iter()
+            .find(|entry| entry.sequence == operation.first_sequence)
+            .ok_or(AuditAuthorityError::BindingMismatch)?;
+        match &entry.payload {
+            EntryPayload::TargetIntent(retained) if retained.handle == *handle => {
+                let original = recover_target_for_validation(
+                    key,
+                    self.identity,
+                    handle,
+                    &retained.recovery,
+                    Some(prepared),
+                )?;
+                Ok(original.command() == prepared)
+            }
+            _ => Err(AuditAuthorityError::BindingMismatch),
+        }
     }
 
     #[cfg(test)]
@@ -395,12 +736,12 @@ impl LedgerState {
         &mut self,
         key: &AuditKey,
         event: ProjectedAuditEvent,
-    ) -> Result<(), AuditAuthorityError> {
+    ) -> Result<(), LedgerMutationError> {
         if event.projection != self.projection {
-            return Err(AuditAuthorityError::BindingMismatch);
+            return Err(AuditAuthorityError::BindingMismatch.into());
         }
         if self.used_capacity()? >= self.limits.max_events {
-            return Err(AuditAuthorityError::Full);
+            return Err(AuditAuthorityError::Full.into());
         }
         self.append(key, EntryPayload::Event(Box::new(event)))?;
         Ok(())
@@ -411,14 +752,33 @@ impl LedgerState {
         key: &AuditKey,
         handle: &AuditOperationHandle,
         state: AuditOperationState,
-    ) -> Result<(), AuditAuthorityError> {
+    ) -> Result<(), LedgerMutationError> {
+        self.resolve_with_original(key, handle, state, None)
+    }
+
+    pub(crate) fn resolve_with_original(
+        &mut self,
+        key: &AuditKey,
+        handle: &AuditOperationHandle,
+        state: AuditOperationState,
+        original: Option<&crate::consensus::TargetMutationCommand>,
+    ) -> Result<(), LedgerMutationError> {
         let index = self.operation_index(key, handle)?;
+        state.validate_target_for(handle)?;
+        let retained = self.entries.iter().find_map(|entry| match &entry.payload {
+            EntryPayload::TargetIntent(retained) if retained.handle == *handle => Some(retained),
+            _ => None,
+        });
+        let target = retained.is_some();
+        if let Some(retained) = retained {
+            validate_target_outcome_with_original(key, self.identity, retained, state, original)?;
+        }
         let current = &self.operations[index];
         if current.state == state {
             return Ok(());
         }
         if current.state != AuditOperationState::Intent || state == AuditOperationState::Intent {
-            return Err(AuditAuthorityError::BindingMismatch);
+            return Err(AuditAuthorityError::BindingMismatch.into());
         }
         let sequence = self.append(
             key,
@@ -431,6 +791,11 @@ impl LedgerState {
         current.state = state;
         current.last_sequence = sequence;
         current.reserved = 1;
+        if target {
+            if let AuditOperationState::TargetV1(result) = state {
+                self.target_anchor = Some(TargetStateAnchor { sequence, result });
+            }
+        }
         Ok(())
     }
 
@@ -438,14 +803,14 @@ impl LedgerState {
         &mut self,
         key: &AuditKey,
         handle: &AuditOperationHandle,
-    ) -> Result<(), AuditAuthorityError> {
+    ) -> Result<(), LedgerMutationError> {
         let index = self.operation_index(key, handle)?;
         let current = &self.operations[index];
         if current.terminal_recorded {
             return Ok(());
         }
         if current.state == AuditOperationState::Intent {
-            return Err(AuditAuthorityError::BindingMismatch);
+            return Err(AuditAuthorityError::BindingMismatch.into());
         }
         let sequence = self.append(
             key,
@@ -491,10 +856,58 @@ impl LedgerState {
             }))
     }
 
+    pub(crate) fn lookup_empty_commit(
+        &self,
+        key: &AuditKey,
+        prepared: &super::PreparedNetconfEmptyCommit,
+        caller: AuditCaller,
+    ) -> Result<Option<AuditOperationReceipt>, AuditAuthorityError> {
+        prepared.verify(key, self.identity, caller)?;
+        let Some(receipt) = self.lookup(key, prepared.handle(), caller)? else {
+            return Ok(None);
+        };
+        let operation = &self.operations[self.operation_index(key, prepared.handle())?];
+        let original = self
+            .entries
+            .iter()
+            .find(|entry| entry.sequence == operation.first_sequence);
+        if !matches!(original.map(|entry| &entry.payload), Some(EntryPayload::EmptyCommit(retained)) if **retained == *prepared)
+        {
+            return Err(AuditAuthorityError::BindingMismatch);
+        }
+        Ok(Some(receipt))
+    }
+
     pub(crate) fn validate(
         &self,
         key: &AuditKey,
         identity: ConfigConsensusIdentity,
+    ) -> Result<(), AuditAuthorityError> {
+        self.validate_with_original(key, identity, None)
+    }
+
+    // Receipt readback may lend its current typed command as a representation
+    // candidate. Matching handles still require the complete verifier and exact
+    // comparison to this freshly authenticated row's canonical retained bytes.
+    pub(crate) fn validate_with_original(
+        &self,
+        key: &AuditKey,
+        identity: ConfigConsensusIdentity,
+        original: Option<&crate::consensus::TargetMutationCommand>,
+    ) -> Result<(), AuditAuthorityError> {
+        self.validate_with_target_observer(key, identity, original, |_, _| {})
+    }
+
+    // The observer borrows each TargetIntent only after its complete retained
+    // verifier and canonical comparison. It cannot substitute for validation:
+    // all entry, operation, replay and anchor checks below still run. Callers
+    // must discard observations if this validation or their enclosing read fails.
+    pub(crate) fn validate_with_target_observer(
+        &self,
+        key: &AuditKey,
+        identity: ConfigConsensusIdentity,
+        original: Option<&crate::consensus::TargetMutationCommand>,
+        mut observe_target: impl FnMut(u64, &crate::consensus::TargetMutationCommand),
     ) -> Result<(), AuditAuthorityError> {
         self.limits.validate()?;
         if self.version != 1
@@ -508,7 +921,13 @@ impl LedgerState {
         let mut sequence = self.floor;
         let mut previous = self.predecessor;
         let mut derived: Vec<LedgerOperation> = Vec::new();
+        let mut target_anchor = None;
+        #[cfg(test)]
+        let observed_derived =
+            crate::consensus::config_capacity_simultaneous_working_tests::ledger::derived();
         let index = validation_index::ValidationIndex::new(&self.entries)?;
+        #[cfg(test)]
+        let _observed_validation_index = index.observe_allocation();
         for entry in &self.entries {
             sequence = sequence
                 .checked_add(1)
@@ -531,31 +950,58 @@ impl LedgerState {
                 ),
                 &entry.mac,
             )?;
-            match &entry.payload {
-                EntryPayload::Intent(handle) => {
-                    handle.verify(key, identity, handle.body.binding.caller)?;
-                    if handle.body.event.projection != self.projection
-                        || index.duplicate_request(derived.len())?
-                    {
+            let intent_handle = match &entry.payload {
+                EntryPayload::Intent(handle) => Some(&**handle),
+                EntryPayload::TargetIntent(retained) => {
+                    if self.continuity.is_none() {
                         return Err(AuditAuthorityError::BindingMismatch);
                     }
-                    let intent =
-                        handle.body.event.outcome == crate::ManagementAuditOutcomeCode::Intent;
-                    derived.push(LedgerOperation {
-                        handle: (**handle).clone(),
-                        state: if intent {
-                            AuditOperationState::Intent
-                        } else {
-                            AuditOperationState::Observed {
-                                outcome: handle.body.event.outcome,
-                            }
-                        },
-                        terminal_recorded: !intent,
-                        first_sequence: sequence,
-                        last_sequence: sequence,
-                        reserved: if intent { 2 } else { 0 },
-                    });
+                    let prepared = recover_target_for_validation(
+                        key,
+                        self.identity,
+                        &retained.handle,
+                        &retained.recovery,
+                        original,
+                    )?;
+                    observe_target(entry.sequence, prepared.command());
+                    Some(&retained.handle)
                 }
+                EntryPayload::EmptyCommit(prepared) => {
+                    if self.continuity.is_none() {
+                        return Err(AuditAuthorityError::BindingMismatch);
+                    }
+                    prepared.verify(key, identity, prepared.guard.caller)?;
+                    Some(prepared.handle())
+                }
+                _ => None,
+            };
+            if let Some(handle) = intent_handle {
+                handle.verify(key, identity, handle.body.binding.caller)?;
+                if handle.body.event.projection != self.projection
+                    || index.duplicate_request(derived.len())?
+                {
+                    return Err(AuditAuthorityError::BindingMismatch);
+                }
+                let intent = handle.body.event.outcome == crate::ManagementAuditOutcomeCode::Intent;
+                derived.push(LedgerOperation {
+                    handle: handle.clone(),
+                    state: if intent {
+                        AuditOperationState::Intent
+                    } else {
+                        AuditOperationState::Observed {
+                            outcome: handle.body.event.outcome,
+                        }
+                    },
+                    terminal_recorded: !intent,
+                    first_sequence: sequence,
+                    last_sequence: sequence,
+                    reserved: if intent { 2 } else { 0 },
+                });
+            }
+            match &entry.payload {
+                EntryPayload::Intent(_)
+                | EntryPayload::TargetIntent(_)
+                | EntryPayload::EmptyCommit(_) => {}
                 EntryPayload::Outcome { operation, state } => {
                     let position = index
                         .prior_operation(operation, derived.len())
@@ -564,10 +1010,46 @@ impl LedgerState {
                     if op.state != AuditOperationState::Intent
                         || !matches!(
                             state,
-                            AuditOperationState::Committed { .. } | AuditOperationState::Rejected
+                            AuditOperationState::Committed { .. }
+                                | AuditOperationState::Rejected
+                                | AuditOperationState::TargetV1(_)
                         )
                     {
                         return Err(AuditAuthorityError::BindingMismatch);
+                    }
+                    state.validate_target_for(&op.handle)?;
+                    let original_position = op
+                        .first_sequence
+                        .checked_sub(self.floor)
+                        .and_then(|offset| offset.checked_sub(1))
+                        .and_then(|offset| usize::try_from(offset).ok())
+                        .ok_or(AuditAuthorityError::BindingMismatch)?;
+                    let original_entry = self
+                        .entries
+                        .get(original_position)
+                        .ok_or(AuditAuthorityError::BindingMismatch)?;
+                    #[cfg(test)]
+                    validation_probe::outcome_entry_visit();
+                    // This operation was derived from the authenticated prefix.
+                    // Its original sequence selects one entry without searching
+                    // later, not yet authenticated payloads.
+                    if let EntryPayload::TargetIntent(retained) = &original_entry.payload {
+                        if retained.handle != op.handle {
+                            return Err(AuditAuthorityError::BindingMismatch);
+                        }
+                        validate_target_outcome_with_original(
+                            key,
+                            self.identity,
+                            retained,
+                            *state,
+                            original,
+                        )?;
+                        if let AuditOperationState::TargetV1(result) = state {
+                            target_anchor = Some(TargetStateAnchor {
+                                sequence,
+                                result: *result,
+                            });
+                        }
                     }
                     op.state = *state;
                     op.last_sequence = sequence;
@@ -596,7 +1078,18 @@ impl LedgerState {
                     }
                 }
             }
+            #[cfg(test)]
+            observed_derived.observe(&derived);
             previous = entry.mac;
+        }
+        match (target_anchor, self.target_anchor) {
+            (Some(derived), Some(stored)) if derived == stored => {}
+            (None, None) => {}
+            (None, Some(stored))
+                if stored.sequence > 0
+                    && stored.sequence <= self.floor
+                    && stored.result.authority() == identity => {}
+            _ => return Err(AuditAuthorityError::BindingMismatch),
         }
         if derived != self.operations {
             return Err(AuditAuthorityError::BindingMismatch);
@@ -604,6 +1097,7 @@ impl LedgerState {
         if sequence != self.sequence || previous != self.terminal {
             return Err(AuditAuthorityError::BindingMismatch);
         }
+        self.check_target_capacity()?;
         for (position, op) in self.operations.iter().enumerate() {
             op.handle
                 .verify(key, identity, op.handle.body.binding.caller)?;
@@ -624,8 +1118,146 @@ impl LedgerState {
                 return Err(AuditAuthorityError::BindingMismatch);
             }
         }
+        #[cfg(feature = "dangerous-test-hooks")]
+        crate::consensus::capacity_observation::validated_ledger(
+            self,
+            &derived,
+            index.allocation(),
+        );
         Ok(())
     }
+}
+
+// The target format has strict nested input without changing the legacy handle,
+// event, caller or authority codecs (or their authentication byte domains).
+pub(crate) fn deserialize_target_handle<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> Result<AuditOperationHandle, D::Error> {
+    strict_target_handle::Handle::deserialize(deserializer)
+}
+
+mod strict_target_handle {
+    use super::*;
+    use crate::{
+        ManagementAuditOperationCode, ManagementAuditOutcomeCode, ManagementAuditTransportCode,
+    };
+
+    #[derive(Deserialize)]
+    #[serde(remote = "AuditOperationHandle", deny_unknown_fields)]
+    pub(super) struct Handle {
+        #[serde(with = "Body")]
+        body: HandleBody,
+        mac: [u8; 32],
+    }
+
+    #[derive(Deserialize)]
+    #[serde(remote = "HandleBody", deny_unknown_fields)]
+    struct Body {
+        version: u16,
+        #[serde(with = "crate::audit_authority::target_identity")]
+        identity: ConfigConsensusIdentity,
+        #[serde(with = "Binding")]
+        binding: AuditOperationBinding,
+        #[serde(with = "Event")]
+        event: ProjectedAuditEvent,
+        issued_at: i64,
+        expires_at: i64,
+        nonce: [u8; 16],
+        key_epoch: u64,
+        mutation: Option<[u8; 32]>,
+    }
+
+    #[derive(Deserialize)]
+    #[serde(remote = "AuditOperationBinding", deny_unknown_fields)]
+    struct Binding {
+        #[serde(with = "crate::audit_authority::target_caller")]
+        caller: AuditCaller,
+        request: AuditToken,
+        operation: AuditToken,
+        base_version: u64,
+    }
+
+    #[derive(Deserialize)]
+    #[serde(remote = "ProjectedAuditEvent", deny_unknown_fields)]
+    struct Event {
+        projection: AuditToken,
+        #[serde(with = "crate::audit_authority::target_caller")]
+        caller: AuditCaller,
+        request: AuditToken,
+        transaction: Option<AuditToken>,
+        paths: AuditToken,
+        reason: Option<AuditToken>,
+        transport: ManagementAuditTransportCode,
+        operation: ManagementAuditOperationCode,
+        outcome: ManagementAuditOutcomeCode,
+        utc_seconds: i64,
+        nanosecond: u32,
+    }
+}
+
+fn validate_target_outcome_with_original(
+    key: &AuditKey,
+    identity: ConfigConsensusIdentity,
+    retained: &RetainedTargetIntent,
+    state: AuditOperationState,
+    original: Option<&crate::consensus::TargetMutationCommand>,
+) -> Result<(), AuditAuthorityError> {
+    let prepared = recover_target_for_validation(
+        key,
+        identity,
+        &retained.handle,
+        &retained.recovery,
+        original,
+    )?;
+    match state {
+        AuditOperationState::Rejected => Ok(()),
+        AuditOperationState::TargetV1(result) => prepared.command().validate_result(result),
+        _ => Err(AuditAuthorityError::BindingMismatch),
+    }
+}
+
+enum TargetForValidation<'a> {
+    Decoded(super::PreparedTargetMutation),
+    Borrowed(&'a crate::consensus::TargetMutationCommand),
+}
+
+impl TargetForValidation<'_> {
+    fn command(&self) -> &crate::consensus::TargetMutationCommand {
+        match self {
+            Self::Decoded(prepared) => prepared.command(),
+            Self::Borrowed(original) => original,
+        }
+    }
+}
+
+fn recover_target_for_validation<'a>(
+    key: &AuditKey,
+    identity: ConfigConsensusIdentity,
+    handle: &AuditOperationHandle,
+    recovery: &str,
+    original: Option<&'a crate::consensus::TargetMutationCommand>,
+) -> Result<TargetForValidation<'a>, AuditAuthorityError> {
+    if let Some(original) = original.filter(|original| original.handle() == handle) {
+        if original.verify_canonical_retained(recovery.as_bytes(), key, identity, handle)? {
+            return Ok(TargetForValidation::Borrowed(original));
+        }
+    }
+    validate_target_recovery(key, identity, handle, recovery).map(TargetForValidation::Decoded)
+}
+
+fn validate_target_recovery(
+    key: &AuditKey,
+    identity: ConfigConsensusIdentity,
+    handle: &AuditOperationHandle,
+    recovery: &str,
+) -> Result<super::PreparedTargetMutation, AuditAuthorityError> {
+    super::PreparedTargetMutation::decode_retained(
+        recovery.as_bytes(),
+        key,
+        identity,
+        handle,
+        handle.body.binding.caller,
+    )
 }
 
 pub(crate) fn authenticate<T: Serialize>(
@@ -655,7 +1287,19 @@ fn authenticator<T: Serialize>(
     domain: &[u8],
     value: &T,
 ) -> Result<Hmac<Sha256>, AuditAuthorityError> {
-    let encoded = serde_json::to_vec(value).map_err(|_| AuditAuthorityError::InvalidInput)?;
+    // Match serde_json::to_vec's original allocation and one Serialize pass.
+    let mut encoded = Vec::with_capacity(128);
+    #[cfg(test)]
+    let output = native_cost_tests::AuthenticationWriter::new(&mut encoded);
+    #[cfg(not(test))]
+    let output = &mut encoded;
+    crate::consensus::config_capacity_json::to_audit_writer(output, value)
+        .map_err(|_| AuditAuthorityError::InvalidInput)?;
+    #[cfg(test)]
+    let _observed_authentication =
+        crate::consensus::config_capacity_simultaneous_working_tests::ledger::authentication(
+            &encoded,
+        );
     if encoded.len() > MAX_STATE_BYTES {
         return Err(AuditAuthorityError::InvalidInput);
     }
@@ -666,3 +1310,60 @@ fn authenticator<T: Serialize>(
     mac.update(&encoded);
     Ok(mac)
 }
+
+// A scoped test fault at the real reservation call. Capacity overflow returns
+// TryReserveError without a global allocator, OOM, or a fabricated receipt.
+#[cfg(test)]
+pub(crate) mod allocation_probe {
+    use std::cell::Cell;
+
+    thread_local! {
+        static AFTER: Cell<Option<usize>> = const { Cell::new(None) };
+        static INJECTED: Cell<bool> = const { Cell::new(false) };
+    }
+
+    pub(crate) struct FailureGuard;
+
+    impl FailureGuard {
+        pub(crate) fn start(after: usize) -> Self {
+            AFTER.with(|slot| assert!(slot.replace(Some(after)).is_none()));
+            INJECTED.with(|slot| assert!(!slot.replace(false)));
+            Self
+        }
+
+        pub(crate) fn injected(&self) -> bool {
+            INJECTED.with(Cell::get)
+        }
+    }
+
+    impl Drop for FailureGuard {
+        fn drop(&mut self) {
+            AFTER.with(|slot| slot.set(None));
+            INJECTED.with(|slot| slot.set(false));
+        }
+    }
+
+    pub(crate) fn requested(additional: usize) -> usize {
+        AFTER.with(|slot| match slot.get() {
+            Some(0) => {
+                slot.set(None);
+                INJECTED.with(|slot| slot.set(true));
+                usize::MAX
+            }
+            Some(remaining) => {
+                slot.set(Some(remaining - 1));
+                additional
+            }
+            None => additional,
+        })
+    }
+}
+
+#[cfg(test)]
+pub(crate) mod target_budget_probe;
+
+#[cfg(test)]
+pub(crate) mod workspace_probe;
+
+#[cfg(test)]
+pub(crate) mod native_cost_tests;

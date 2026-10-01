@@ -1,4 +1,6 @@
 //! Frozen pre-index validator from 78aa9794d1b1af41a1bcf2ec991ea58d3d011279; only comparison counters added.
+//! New payload variants are outside this legacy fixture oracle; its original
+//! match arms and comparison counters remain unchanged.
 //! Original ledger SHA-256: d8dd869cdf04d0da944842189b8cc5bf9b14f2c2fd4d4c9f73245e7cf2c7ecbb.
 
 use super::*;
@@ -68,6 +70,9 @@ pub(super) fn validate(
                     last_sequence: sequence,
                     reserved: if intent { 2 } else { 0 },
                 });
+            }
+            EntryPayload::TargetIntent(_) | EntryPayload::EmptyCommit(_) => {
+                unreachable!("the frozen pre-index reference only accepts legacy fixtures")
             }
             EntryPayload::Outcome { operation, state } => {
                 let op = derived

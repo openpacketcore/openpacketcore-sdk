@@ -36,6 +36,21 @@ impl ConfigAuditPolicy {
         Ok(Self { privacy, lifetime })
     }
 
+    #[cfg(feature = "required-netconf-audit")]
+    pub(super) async fn netconf_store(
+        &self,
+        store: Arc<ConsensusConfigStore>,
+        device: opc_persist::audit_authority::NetconfDeviceOwner,
+    ) -> Result<opc_config_bus::NetconfAuditStore, StoreError> {
+        opc_config_bus::NetconfAuditStore::new(
+            store,
+            Arc::clone(&self.privacy),
+            self.lifetime,
+            device,
+        )
+        .await
+    }
+
     pub(super) async fn append<C: OpcConfig>(
         &self,
         store: &ConsensusConfigStore,

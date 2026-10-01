@@ -14,6 +14,7 @@ keywords = ["5g", "cnf", "netconf", "yang", "management"]
 categories = ["network-programming", "parser-implementations"]
 
 [features]
+required-netconf-audit = ["opc-config-bus/required-netconf-audit"]
 testkit = ["dep:rand"]
 
 [dependencies]
@@ -44,7 +45,8 @@ tracing = { workspace = true }
 
 [dev-dependencies]
 opc-consensus = { path = "../opc-consensus", version = "0.2.0" }
-opc-config-bus-consensus = { path = "../opc-config-bus-consensus", version = "0.2.0" }
+opc-config-bus-consensus = { path = "../opc-config-bus-consensus", version = "0.2.0", features = ["required-netconf-audit"] }
+opc-crypto = { path = "../opc-crypto", version = "0.2.0" }
 async-trait = { workspace = true }
 futures-executor = "0.3"
 opc-key = { path = "../opc-key", version = "0.2.0" }

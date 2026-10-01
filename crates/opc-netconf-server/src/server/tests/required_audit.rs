@@ -20,6 +20,8 @@ use std::sync::atomic::{AtomicBool, AtomicU64};
 mod leadership;
 #[cfg(target_os = "linux")]
 mod recovery;
+#[cfg(feature = "required-netconf-audit")]
+mod retained_running;
 mod running;
 mod transport;
 

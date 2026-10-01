@@ -1,4 +1,5 @@
-//! Validation-local indexes over borrowed, not yet trusted Intent handles.
+//! Validation-local indexes over borrowed, not yet trusted operation handles.
+//! Legacy Intent, TargetIntent and EmptyCommit entries share one ordinal space.
 //!
 //! Sorting does not authenticate an entry. The caller still authenticates the
 //! original chain in order, derives every operation, and compares the complete
@@ -33,16 +34,11 @@ impl<'a> ValidationIndex<'a> {
         if entries.len() > MAX_LEDGER_EVENTS {
             return Err(AuditAuthorityError::BindingMismatch);
         }
-        let count = entries
-            .iter()
-            .filter(|entry| matches!(entry.payload, EntryPayload::Intent(_)))
-            .count();
+        let count = entries.iter().filter_map(operation_handle).count();
         let mut by_mac = Self::reserve(count)?;
-        for entry in entries {
-            if let EntryPayload::Intent(handle) = &entry.payload {
-                let ordinal = by_mac.len();
-                by_mac.push(IndexedIntent { handle, ordinal });
-            }
+        for handle in entries.iter().filter_map(operation_handle) {
+            let ordinal = by_mac.len();
+            by_mac.push(IndexedIntent { handle, ordinal });
         }
         // Both sorts are in place and allocate no auxiliary vector. The
         // ordinal tie break retains the first chronological occurrence even
@@ -123,9 +119,37 @@ impl<'a> ValidationIndex<'a> {
             .then_some(entry.ordinal)
     }
 
+    #[cfg(feature = "dangerous-test-hooks")]
+    pub(super) fn allocation(&self) -> (usize, usize) {
+        (
+            self.by_mac.as_ptr() as usize,
+            self.by_mac.capacity() * size_of::<IndexedIntent<'_>>(),
+        )
+    }
+
+    #[cfg(test)]
+    pub(super) fn observe_allocation(
+        &self,
+    ) -> crate::consensus::config_capacity_simultaneous_working_tests::ledger::OwnerGuard<'_> {
+        crate::consensus::config_capacity_simultaneous_working_tests::ledger::validation_index(
+            &self.by_mac,
+        )
+    }
+
     #[cfg(test)]
     pub(super) fn overflowing_reservation() -> Result<(), AuditAuthorityError> {
         Self::reserve(usize::MAX).map(|_| ())
+    }
+}
+
+// Borrow only. Validation still authenticates each payload before deriving its
+// operation; the index cannot grant authority to a retained recovery command.
+fn operation_handle(entry: &LedgerEntry) -> Option<&AuditOperationHandle> {
+    match &entry.payload {
+        EntryPayload::Intent(handle) => Some(handle),
+        EntryPayload::TargetIntent(retained) => Some(&retained.handle),
+        EntryPayload::EmptyCommit(prepared) => Some(prepared.handle()),
+        _ => None,
     }
 }
 

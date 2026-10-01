@@ -2,6 +2,31 @@
 
 mod audit;
 mod audit_continuity;
+mod config_capacity_admission;
+mod config_capacity_local_admission;
+#[cfg(all(test, target_os = "linux"))]
+pub(super) mod config_capacity_native_owner_observation;
+mod recovery;
+#[cfg(all(test, target_os = "linux", feature = "dangerous-test-hooks"))]
+#[path = "capacity_observation/working_buffers/store_tests.rs"]
+mod working_buffer_tests;
+
+pub use recovery::{
+    ConfigCommitRecoveryHandle, ConfigCommitRecoveryOutcome, PreparedConfigCommitOperation,
+};
+
+#[cfg(test)]
+mod config_capacity_attestation_tests;
+#[cfg(test)]
+mod config_capacity_review_tests;
+#[cfg(test)]
+mod config_capacity_rpc_tests;
+#[cfg(all(test, target_os = "linux", feature = "dangerous-test-hooks"))]
+pub(super) use tests::config_capacity_caller_ledger_tests::command_heap as observed_command_heap;
+#[cfg(all(test, target_os = "linux"))]
+pub(super) use tests::config_capacity_caller_ledger_tests::observation as config_capacity_caller_ledger_observation;
+#[cfg(all(test, target_os = "linux"))]
+pub(super) use tests::config_capacity_cost_tests::observation as config_capacity_cost_observation;
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
@@ -12,27 +37,40 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use async_trait::async_trait;
+#[cfg(test)]
+use opc_consensus::encode_bounded;
 use opc_consensus::engine::error::{ClientWriteError, InitializeError, RaftError};
 use opc_consensus::engine::{EmptyNode, LogId, StoredMembership};
 use opc_consensus::{
-    durable_openraft_config, encode_bounded, ConsensusNodeId, ConsensusPeer, ConsensusPeerError,
-    ConsensusRpcFamily, ConsensusRpcHandler, ConsensusWireRequest, ConsensusWireResponse,
-    DurableOpenraftDomain, EnsureLinearizableOutcome, EnsureLinearizableSupervisor,
-    LinearizableReadBarrier, LinearizableReadBarrierError, LinearizableReadLease,
-    DURABLE_CONSENSUS_OPERATION_TIMEOUT, DURABLE_OPENRAFT_APPEND_ENTRIES_TARGET_BYTES,
-    DURABLE_OPENRAFT_PROPOSAL_ADMISSION_SLOTS,
+    durable_openraft_config, AppendEntriesBatchAccumulator, ConsensusNodeId, ConsensusPeer,
+    ConsensusPeerError, ConsensusRpcFamily, ConsensusRpcHandler, ConsensusWireRequest,
+    ConsensusWireResponse, DurableOpenraftDomain, EnsureLinearizableOutcome,
+    EnsureLinearizableSupervisor, LinearizableReadBarrier, LinearizableReadBarrierError,
+    LinearizableReadLease, DURABLE_CONSENSUS_OPERATION_TIMEOUT,
+    DURABLE_OPENRAFT_APPEND_ENTRIES_TARGET_BYTES, DURABLE_OPENRAFT_PROPOSAL_ADMISSION_SLOTS,
 };
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use thiserror::Error;
 
+use config_capacity_local_admission::{LocalIntent, LocalMutation};
+
+use super::capacity_record::PreparedCapacityCommit;
+use super::preparation::{PreparationOwnership, SubmissionOwnership};
 use super::raft_adapter::{ConfigRaftAdapterError, ConfigRaftNetworkFactory, ConfigRaftRpcHandler};
 use super::storage::{self, ConfigConsensusStorageError};
-use super::types::{decode_config_wire, encode_config_wire, ValidatedRollbackLabel};
+use super::types::{
+    config_command_revision, config_wire_revision, decode_config_wire_for_profile,
+    encode_config_wire_for_profile, ValidatedRollbackLabel,
+};
+#[cfg(test)]
+use super::types::{decode_config_wire, encode_config_wire};
+#[cfg(test)]
+use super::PreparedConfigCommit;
 use super::{
     ApprovedLegacyConfigRecovery, ConfigConsensusClock, ConfigConsensusResponse,
     ConfigConsensusTopology, ConfigMutationIntent, ConfigRaft, ConfigRaftTypeConfig,
-    PreparedConfigCommit, SystemConfigConsensusClock,
+    SystemConfigConsensusClock,
 };
 use crate::backend::SqliteBackend;
 use crate::error::PersistError;
@@ -48,6 +86,40 @@ pub const DEFAULT_CONFIG_CONSENSUS_OPERATION_TIMEOUT: Duration =
 const ROUTE_RETRY_BACKOFF: Duration = Duration::from_millis(50);
 const MAX_FORWARDED_BUDGET: Duration = Duration::from_secs(60);
 const REQUEST_ID_DOMAIN: &[u8] = b"openpacketcore/config-consensus/request-id/v1\0";
+
+// A refused session or expired admission never entered Openraft; distinguish it from
+// uncertain storage/transport completion of an accepted original request.
+enum LocalSubmissionError {
+    BeforeEnqueue(crate::audit_authority::AuditAuthorityError),
+    Submission(PersistError),
+}
+
+impl From<PersistError> for LocalSubmissionError {
+    fn from(error: PersistError) -> Self {
+        Self::Submission(error)
+    }
+}
+
+// This local guard grants no target authority and is never serialized. The
+// prepared original still supplies all authenticated effect and caller binding.
+#[derive(Clone, Copy)]
+struct NetconfRunningAdmission<'a> {
+    session: &'a crate::audit_authority::NetconfSessionOwner,
+    deadline: Option<std::time::Instant>,
+}
+
+impl NetconfRunningAdmission<'_> {
+    fn check(self) -> Result<(), crate::audit_authority::AuditAuthorityError> {
+        self.session.require_active()?;
+        if self
+            .deadline
+            .is_some_and(|deadline| std::time::Instant::now() >= deadline)
+        {
+            return Err(crate::audit_authority::AuditAuthorityError::Expired);
+        }
+        Ok(())
+    }
+}
 
 fn map_watch_snapshot<T, R: 'static>(
     receiver: &tokio::sync::watch::Receiver<T>,
@@ -221,6 +293,50 @@ struct ForwardMutationRequest {
     budget: ForwardedBudget,
 }
 
+fn decode_forward_mutation(
+    profile: impl TryInto<super::RetainedConfigMode>,
+    bytes: &[u8],
+) -> Result<ForwardMutationRequest, opc_consensus::ConsensusCodecError> {
+    let profile = profile
+        .try_into()
+        .map_err(|_| opc_consensus::ConsensusCodecError::Decode)?;
+    if profile == super::RetainedConfigMode::NetconfRunningV1 {
+        #[derive(Deserialize)]
+        #[serde(rename = "ForwardMutationRequest", deny_unknown_fields)]
+        struct RunningForward {
+            request_id: opc_consensus::ConsensusRequestId,
+            intent: super::config_capacity_decode::joint::Intent,
+            compatibility: ConfigPeerCompatibility,
+            budget: ForwardedBudget,
+        }
+        let request: RunningForward = decode_config_wire_for_profile(profile, bytes)?;
+        return Ok(ForwardMutationRequest {
+            request_id: request.request_id,
+            intent: request.intent.into(),
+            compatibility: request.compatibility,
+            budget: request.budget,
+        });
+    }
+    if profile != super::RetainedConfigMode::BoundedV1 {
+        return decode_config_wire_for_profile(profile, bytes);
+    }
+    #[derive(Deserialize)]
+    #[serde(rename = "ForwardMutationRequest", deny_unknown_fields)]
+    struct BoundedForward {
+        request_id: opc_consensus::ConsensusRequestId,
+        intent: super::config_capacity_decode::Intent,
+        compatibility: ConfigPeerCompatibility,
+        budget: ForwardedBudget,
+    }
+    let request: BoundedForward = decode_config_wire_for_profile(profile, bytes)?;
+    Ok(ForwardMutationRequest {
+        request_id: request.request_id,
+        intent: request.intent.into(),
+        compatibility: request.compatibility,
+        budget: request.budget,
+    })
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 enum ForwardMutationReply {
     Applied(Box<ConfigConsensusResponse>),
@@ -236,6 +352,7 @@ enum ForwardMutationReply {
 enum ForwardMutationRejection {
     CommandTooLarge,
     InvalidCommand,
+    ResourceAdmission,
 }
 
 impl ForwardMutationRejection {
@@ -245,6 +362,7 @@ impl ForwardMutationRejection {
                 "config consensus command exceeds durable replication limit",
             ),
             Self::InvalidCommand => PersistError::corrupt_blob(),
+            Self::ResourceAdmission => PersistError::unavailable(),
         }
     }
 }
@@ -284,6 +402,7 @@ enum ReadBarrierReply {
 }
 
 struct ConsensusConfigStoreInner {
+    mode: super::RetainedConfigMode,
     raft: ConfigRaft,
     raft_handler: ConfigRaftRpcHandler,
     backend: SqliteBackend,
@@ -295,8 +414,13 @@ struct ConsensusConfigStoreInner {
     operation_timeout: Duration,
     admitted: AtomicBool,
     audit_continuity: Option<Arc<crate::audit_authority::continuity::AuditContinuityPolicy>>,
+    netconf_recovery: crate::audit_authority::NetconfRecoveryRegistry,
     linearizability: EnsureLinearizableSupervisor<ConfigRaftTypeConfig>,
     proposal_admission: Arc<tokio::sync::Semaphore>,
+    preparation_admission: opc_crypto::ConfigPreparationPool,
+    #[cfg(all(test, target_os = "linux"))]
+    proposal_test_gate:
+        std::sync::Mutex<Option<Arc<tests::config_capacity_accepted_tests::ProposalTestGate>>>,
     metric_leader: std::sync::Mutex<Option<ConsensusNodeId>>,
     durable_progress: Arc<storage::ConfigDurableProgress>,
 }
@@ -319,6 +443,49 @@ impl fmt::Debug for ConsensusConfigStore {
 }
 
 impl ConsensusConfigStore {
+    /// Observe only metadata for one exact audited request on this native node.
+    /// Qualification only; registration owns no storage or mutation authority.
+    #[cfg(feature = "dangerous-test-hooks")]
+    #[doc(hidden)]
+    pub fn observe_capacity_completion_for_test(
+        &self,
+        prepared: &super::PreparedAuditedMutation,
+        origin: std::time::Instant,
+    ) -> Option<super::completion_observation::Registration<'_>> {
+        super::completion_observation::Registration::new(
+            &self.inner.durable_progress,
+            self.inner.local_node_id,
+            derive_durable_request_id(self.inner.identity, b"audit-config", &prepared.handle().mac),
+            origin,
+        )
+    }
+
+    /// Attach a metadata-only native owner bridge to one exact audited mutation.
+    /// Qualification only; the callback must not retain commands or storage.
+    #[cfg(feature = "dangerous-test-hooks")]
+    #[doc(hidden)]
+    pub async fn observe_capacity_native_owners_for_test(
+        &self,
+        prepared: &super::PreparedAuditedMutation,
+        preparations: Arc<super::capacity_observation::PreparationCensus>,
+        observer: Arc<dyn super::capacity_observation::NativeOwnerObserver>,
+    ) -> Result<super::capacity_observation::NativeRegistration, PersistError> {
+        let request =
+            derive_durable_request_id(self.inner.identity, b"audit-config", &prepared.handle().mac);
+        let connection = self.inner.backend.conn();
+        let conn = connection.lock().await;
+        super::capacity_observation::NativeRegistration::new(
+            &conn,
+            self.inner.identity,
+            self.inner.local_node_id,
+            request,
+            prepared,
+            preparations,
+            observer,
+        )
+        .ok_or_else(consensus_unavailable)
+    }
+
     /// Ask Openraft to start one normal campaign for deterministic integration
     /// qualification. Openraft owns vote creation, persistence, and transport.
     #[cfg(feature = "dangerous-test-hooks")]
@@ -437,6 +604,17 @@ impl ConsensusConfigStore {
         {
             return Err(ConfigConsensusOpenError::InvalidRuntimeConfiguration);
         }
+        let mode = backend
+            .retained_binding
+            .as_ref()
+            .map_or(
+                Ok(super::RetainedConfigMode::Legacy),
+                crate::RetainedConfigBinding::mode,
+            )
+            .map_err(|_| ConfigConsensusOpenError::InvalidRuntimeConfiguration)?;
+        if mode.has_netconf_targets() && audit_continuity.is_none() {
+            return Err(ConfigConsensusOpenError::AuditContinuityUnavailable);
+        }
         let identity = topology.identity();
         let local_node_id = topology.local_node_id();
         let members = topology.members().clone();
@@ -448,12 +626,18 @@ impl ConsensusConfigStore {
         if peers.keys().copied().collect::<BTreeSet<_>>() != expected_peers {
             return Err(ConfigConsensusOpenError::PeerSetMismatch);
         }
+        let backend = backend.claim_config_consensus_engine()?;
+        let preparation_admission = match backend.config_consensus_engine_claim() {
+            Some(claim) => opc_crypto::ConfigPreparationPool::bounded_v1_with_owner(claim),
+            None => opc_crypto::ConfigPreparationPool::bounded_v1(),
+        };
         if let Some(policy) = &audit_continuity {
             backend
                 .attach_management_audit_keys(policy.keys.clone())
                 .map_err(|_| ConfigConsensusOpenError::AuditContinuityUnavailable)?;
         }
-        let network = ConfigRaftNetworkFactory::try_new(identity, local_node_id, peers.clone())?;
+        let network =
+            ConfigRaftNetworkFactory::try_new(identity, local_node_id, peers.clone(), mode)?;
         let (log_store, state_machine, durable_progress) = if let Some(recovery) = recovery {
             storage::open_with_recovery(
                 &backend,
@@ -476,17 +660,24 @@ impl ConsensusConfigStore {
         .map_err(|_| ConfigConsensusOpenError::AuditContinuityUnavailable)?;
         let raft = ConfigRaft::new(
             local_node_id,
-            Arc::new(config_raft_config()?),
+            Arc::new(config_raft_config(mode.capacity_profile())?),
             network,
             log_store,
             state_machine,
         )
         .await
         .map_err(|_| ConfigConsensusOpenError::EngineUnavailable)?;
-        let raft_handler = ConfigRaftRpcHandler::new(raft.clone(), identity, local_node_id);
+        let raft_handler = ConfigRaftRpcHandler::new(
+            raft.clone(),
+            identity,
+            local_node_id,
+            mode,
+            backend.audit_key().clone(),
+        );
         let linearizability = EnsureLinearizableSupervisor::new(raft.clone());
         Ok(Self {
             inner: Arc::new(ConsensusConfigStoreInner {
+                mode,
                 raft,
                 raft_handler,
                 backend,
@@ -498,10 +689,14 @@ impl ConsensusConfigStore {
                 operation_timeout,
                 admitted: AtomicBool::new(false),
                 audit_continuity,
+                netconf_recovery: Default::default(),
                 linearizability,
                 proposal_admission: Arc::new(tokio::sync::Semaphore::new(
                     DURABLE_OPENRAFT_PROPOSAL_ADMISSION_SLOTS,
                 )),
+                preparation_admission,
+                #[cfg(all(test, target_os = "linux"))]
+                proposal_test_gate: std::sync::Mutex::new(None),
                 metric_leader: std::sync::Mutex::new(None),
                 durable_progress,
             }),
@@ -820,6 +1015,13 @@ impl ConsensusConfigStore {
             .raft
             .shutdown()
             .await
+            .map_err(|_| consensus_unavailable())?;
+        // Openraft joins its core and timer. Its state-machine, log readers
+        // and snapshot workers may still own SQLite after that core returns.
+        self.inner
+            .durable_progress
+            .wait_for_storage_release()
+            .await
             .map_err(|_| consensus_unavailable())
     }
 
@@ -830,17 +1032,18 @@ impl ConsensusConfigStore {
         request_id: opc_consensus::ConsensusRequestId,
         commit: AttestedConfigCommit,
     ) -> Result<(), PersistError> {
-        let (record, audit, resolution) = commit.into_parts();
-        let prepared =
-            PreparedConfigCommit::prepare(record, audit, self.inner.backend.audit_key())?;
-        let intent = match resolution {
-            Some(resolution) => ConfigMutationIntent::ResolveConfirmedAndAppend {
-                commit: Box::new(prepared),
-                resolution,
-            },
-            None => ConfigMutationIntent::AppendCommit(Box::new(prepared)),
-        };
-        self.submit_request(request_id, intent).await?.into_result()
+        let PreparedCapacityCommit {
+            commit: prepared,
+            resolution,
+            binding,
+            evidence,
+            reservation,
+        } = self.prepare_capacity_commit(commit)?;
+        let ownership = self.commit_submission(evidence, reservation)?;
+        let intent = ConfigMutationIntent::prepared_append(prepared, resolution, binding);
+        self.submit_owned_request(request_id, intent, ownership)
+            .await?
+            .into_result()
     }
 
     /// Append an authenticated config commit only when this node remains the
@@ -851,17 +1054,16 @@ impl ConsensusConfigStore {
         request_id: opc_consensus::ConsensusRequestId,
         commit: AttestedConfigCommit,
     ) -> Result<(), PersistError> {
-        let (record, audit, resolution) = commit.into_parts();
-        let prepared =
-            PreparedConfigCommit::prepare(record, audit, self.inner.backend.audit_key())?;
-        let intent = match resolution {
-            Some(resolution) => ConfigMutationIntent::ResolveConfirmedAndAppend {
-                commit: Box::new(prepared),
-                resolution,
-            },
-            None => ConfigMutationIntent::AppendCommit(Box::new(prepared)),
-        };
-        self.submit_request_on_local_leader(request_id, intent)
+        let PreparedCapacityCommit {
+            commit: prepared,
+            resolution,
+            binding,
+            evidence,
+            reservation,
+        } = self.prepare_capacity_commit(commit)?;
+        let ownership = self.commit_submission(evidence, reservation)?;
+        let intent = ConfigMutationIntent::prepared_append(prepared, resolution, binding);
+        self.submit_owned_request_on_local_leader(request_id, intent, ownership)
             .await?
             .into_result()
     }
@@ -946,19 +1148,37 @@ impl ConsensusConfigStore {
         .into_result()
     }
 
-    /// Clear a recovery marker on this local leader using the deterministic
-    /// lifecycle request identity.
+    /// Clear a recovery marker on this local leader. Bounded Running uses a
+    /// fresh attempt so a refusal before checkpoint completion can be retried.
     pub async fn clear_recovery_required_local(
         &self,
         tx_id: opc_types::TxId,
     ) -> Result<(), PersistError> {
-        let request_id = derive_durable_request_id(
-            self.inner.identity,
-            b"clear-recovery",
-            tx_id.as_uuid().as_bytes(),
-        );
+        let request_id = self.recovery_clear_request_id(tx_id);
         self.clear_recovery_required_local_idempotent(request_id, tx_id)
             .await
+    }
+
+    fn recovery_clear_request_id(
+        &self,
+        tx_id: opc_types::TxId,
+    ) -> opc_consensus::ConsensusRequestId {
+        if self.mode() == super::RetainedConfigMode::NetconfRunningV1 {
+            // The exact current marker is the idempotency authority. A cached
+            // rejection while its audit terminal/checkpoint is owed must not
+            // prevent a later eligible attempt from publishing that original.
+            derive_durable_request_id(
+                self.inner.identity,
+                b"running-publication-attempt",
+                uuid::Uuid::new_v4().as_bytes(),
+            )
+        } else {
+            derive_durable_request_id(
+                self.inner.identity,
+                b"clear-recovery",
+                tx_id.as_uuid().as_bytes(),
+            )
+        }
     }
 
     /// Create a rollback point with a caller-retained durable request ID.
@@ -1093,10 +1313,14 @@ impl ConsensusConfigStore {
         }
     }
 
+    fn mode(&self) -> super::RetainedConfigMode {
+        self.inner.mode
+    }
+
     fn peer_compatibility(&self) -> ConfigPeerCompatibility {
         ConfigPeerCompatibility {
-            wire_version: super::CONFIG_CONSENSUS_WIRE_VERSION,
-            command_version: super::CONFIG_CONSENSUS_COMMAND_VERSION,
+            wire_version: config_wire_revision(self.mode()),
+            command_version: config_command_revision(self.mode()),
             audit_key_epoch: self.inner.backend.audit_key().epoch(),
             audit_key_fingerprint: self.inner.backend.audit_key().fingerprint(),
         }
@@ -1139,12 +1363,122 @@ impl ConsensusConfigStore {
             .any(|voter| voter == node_id)
     }
 
+    fn require_commit_capacity(&self, commit: &AttestedConfigCommit) -> Result<(), PersistError> {
+        let profile = self.capacity_profile();
+        if profile != opc_crypto::ConfigCapacityProfile::Legacy
+            && (!commit
+                .capacity_evidence()
+                .is_some_and(|evidence| evidence.profile() == profile)
+                || !commit
+                    .preparation()
+                    .is_some_and(|reservation| self.inner.preparation_admission.owns(reservation)))
+        {
+            return Err(PersistError::constraint_violation(
+                "configuration capacity evidence and store reservation are required",
+            ));
+        }
+        Ok(())
+    }
+
+    fn prepare_capacity_commit(
+        &self,
+        commit: AttestedConfigCommit,
+    ) -> Result<PreparedCapacityCommit, PersistError> {
+        self.require_commit_capacity(&commit)?;
+        PreparedCapacityCommit::prepare(
+            commit,
+            self.inner.identity,
+            self.inner.backend.audit_key(),
+            self.capacity_profile(),
+        )
+    }
+
+    /// Immutable configuration byte profile admitted by this retained authority.
+    /// Encrypting adapters use it before serialization and key-provider access.
+    pub fn capacity_profile(&self) -> opc_crypto::ConfigCapacityProfile {
+        self.inner.mode.capacity_profile()
+    }
+
+    /// Reserve one of this store's eight bounded preparation slots without
+    /// waiting. Legacy stores require no reservation and return `None`.
+    /// Call before allocating SDK-owned plaintext or recovery decode buffers.
+    pub fn try_reserve_config_preparation(
+        &self,
+    ) -> Result<Option<opc_crypto::ConfigPreparationReservation>, PersistError> {
+        match self.capacity_profile() {
+            opc_crypto::ConfigCapacityProfile::Legacy => Ok(None),
+            opc_crypto::ConfigCapacityProfile::BoundedV1 => self
+                .inner
+                .preparation_admission
+                .try_reserve()
+                .map(Some)
+                .map_err(|_| consensus_unavailable()),
+            _ => Err(consensus_unavailable()),
+        }
+    }
+
+    fn reserve_submission(&self) -> Result<SubmissionOwnership, PersistError> {
+        self.try_reserve_config_preparation()?
+            .map(|reservation| {
+                PreparationOwnership::new(reservation, None)
+                    .try_submit()
+                    .map(Arc::new)
+                    .map_err(|_| consensus_unavailable())
+            })
+            .transpose()
+    }
+
+    fn commit_submission(
+        &self,
+        evidence: Option<opc_crypto::ConfigCapacityEvidence>,
+        reservation: Option<opc_crypto::ConfigPreparationReservation>,
+    ) -> Result<SubmissionOwnership, PersistError> {
+        match reservation {
+            Some(reservation) => {
+                let owner = PreparationOwnership::new(reservation, evidence);
+                if self.capacity_profile() != opc_crypto::ConfigCapacityProfile::Legacy
+                    && !owner.belongs_to(
+                        &self.inner.preparation_admission,
+                        self.capacity_profile(),
+                        true,
+                    )
+                {
+                    return Err(PersistError::constraint_violation(
+                        "configuration capacity evidence and store reservation are required",
+                    ));
+                }
+                owner
+                    .try_submit()
+                    .map(|guard| Some(Arc::new(guard)))
+                    .map_err(|_| consensus_unavailable())
+            }
+            None if self.capacity_profile() == opc_crypto::ConfigCapacityProfile::Legacy => {
+                Ok(None)
+            }
+            None => Err(PersistError::constraint_violation(
+                "configuration capacity evidence and store reservation are required",
+            )),
+        }
+    }
+
     async fn submit_request(
         &self,
         request_id: opc_consensus::ConsensusRequestId,
         intent: ConfigMutationIntent,
     ) -> Result<ConfigConsensusResponse, PersistError> {
-        let result = self.submit_request_inner(request_id, intent).await;
+        self.submit_owned_request(request_id, intent, self.reserve_submission()?)
+            .await
+    }
+
+    async fn submit_owned_request(
+        &self,
+        request_id: opc_consensus::ConsensusRequestId,
+        intent: ConfigMutationIntent,
+        ownership: SubmissionOwnership,
+    ) -> Result<ConfigConsensusResponse, PersistError> {
+        let result = self
+            .submit_owned_request_inner(request_id, intent, ownership)
+            .await;
         let metric = if result.is_ok() {
             &opc_redaction::metrics::METRICS.persist_quorum_write_success
         } else {
@@ -1160,25 +1494,51 @@ impl ConsensusConfigStore {
         request_id: opc_consensus::ConsensusRequestId,
         intent: ConfigMutationIntent,
     ) -> Result<ConfigConsensusResponse, PersistError> {
+        self.submit_owned_request_on_local_leader(request_id, intent, self.reserve_submission()?)
+            .await
+    }
+
+    async fn submit_owned_request_on_local_leader(
+        &self,
+        request_id: opc_consensus::ConsensusRequestId,
+        intent: ConfigMutationIntent,
+        ownership: SubmissionOwnership,
+    ) -> Result<ConfigConsensusResponse, PersistError> {
+        match self
+            .submit_owned_request_on_local_leader_guarded(request_id, intent, ownership, None)
+            .await
+        {
+            Ok(response) => Ok(response),
+            Err(LocalSubmissionError::Submission(error)) => Err(error),
+            Err(LocalSubmissionError::BeforeEnqueue(_)) => Err(consensus_unavailable()),
+        }
+    }
+
+    async fn submit_owned_request_on_local_leader_guarded(
+        &self,
+        request_id: opc_consensus::ConsensusRequestId,
+        intent: ConfigMutationIntent,
+        ownership: SubmissionOwnership,
+        admission: Option<NetconfRunningAdmission<'_>>,
+    ) -> Result<ConfigConsensusResponse, LocalSubmissionError> {
         let result = async {
-            preflight_config_command_replication_budget(self.inner.identity, request_id, &intent)
-                .map_err(ForwardMutationRejection::into_persist_error)?;
+            let input = LocalIntent::new(self, request_id, intent)?;
             self.require_admission()?;
             let deadline = tokio::time::Instant::now()
                 .checked_add(self.inner.operation_timeout)
                 .ok_or_else(consensus_unavailable)?;
-            let request = ForwardMutationRequest {
-                request_id,
-                intent,
-                compatibility: self.peer_compatibility(),
-                budget: ForwardedBudget::from_deadline(deadline)?,
-            };
-            match self.apply_on_local_leader(request, deadline).await {
+            let input = input.into_local(ForwardedBudget::from_deadline(deadline)?);
+            match self
+                .apply_local_mutation_guarded(input, deadline, ownership, admission)
+                .await?
+            {
                 ForwardMutationReply::Applied(response) => Ok(*response),
-                ForwardMutationReply::Rejected(rejection) => Err(rejection.into_persist_error()),
-                ForwardMutationReply::OutcomeUnknown => Err(PersistError::outcome_unknown()),
+                ForwardMutationReply::Rejected(rejection) => {
+                    Err(rejection.into_persist_error().into())
+                }
+                ForwardMutationReply::OutcomeUnknown => Err(PersistError::outcome_unknown().into()),
                 ForwardMutationReply::NotLeader { .. } | ForwardMutationReply::Unavailable => {
-                    Err(consensus_unavailable())
+                    Err(consensus_unavailable().into())
                 }
             }
         }
@@ -1193,13 +1553,23 @@ impl ConsensusConfigStore {
         result
     }
 
+    #[cfg(test)]
     async fn submit_request_inner(
         &self,
         request_id: opc_consensus::ConsensusRequestId,
         intent: ConfigMutationIntent,
     ) -> Result<ConfigConsensusResponse, PersistError> {
-        preflight_config_command_replication_budget(self.inner.identity, request_id, &intent)
-            .map_err(ForwardMutationRejection::into_persist_error)?;
+        self.submit_owned_request_inner(request_id, intent, self.reserve_submission()?)
+            .await
+    }
+
+    async fn submit_owned_request_inner(
+        &self,
+        request_id: opc_consensus::ConsensusRequestId,
+        intent: ConfigMutationIntent,
+        ownership: SubmissionOwnership,
+    ) -> Result<ConfigConsensusResponse, PersistError> {
+        let input = LocalIntent::new(self, request_id, intent)?;
         self.require_admission()?;
         let deadline = tokio::time::Instant::now()
             .checked_add(self.inner.operation_timeout)
@@ -1226,21 +1596,16 @@ impl ConsensusConfigStore {
                 }
                 Err(error) => return Err(error),
             };
-            let request = ForwardMutationRequest {
-                request_id,
-                intent: intent.clone(),
-                compatibility: self.peer_compatibility(),
-                budget,
-            };
             let reply = if leader == self.inner.local_node_id {
-                self.apply_on_local_leader(request.clone(), deadline).await
+                self.apply_local_mutation(input.local(budget), deadline, ownership.clone())
+                    .await
             } else {
                 match self
-                    .call_peer::<_, ForwardMutationReply>(
+                    .call_mutation_peer(
                         leader,
-                        ConsensusRpcFamily::ForwardMutation,
-                        &request,
+                        input.forward_owned(budget),
                         deadline,
+                        ownership.clone(),
                     )
                     .await
                 {
@@ -1260,6 +1625,13 @@ impl ConsensusConfigStore {
                     return Ok(*response);
                 }
                 ForwardMutationReply::Rejected(rejection) => {
+                    // This peer rejected only this attempt. A previous peer
+                    // may already have applied the same operation before its
+                    // response was lost, so rejection cannot resolve that
+                    // earlier uncertainty.
+                    if ambiguity_seen {
+                        return Err(PersistError::outcome_unknown());
+                    }
                     return Err(rejection.into_persist_error());
                 }
                 ForwardMutationReply::NotLeader { leader: next } => {
@@ -1299,20 +1671,81 @@ impl ConsensusConfigStore {
         }
     }
 
+    #[cfg(test)]
     async fn apply_on_local_leader(
         &self,
         request: ForwardMutationRequest,
         deadline: tokio::time::Instant,
     ) -> ForwardMutationReply {
-        if let Err(rejection) = preflight_config_command_replication_budget(
-            self.inner.identity,
-            request.request_id,
-            &request.intent,
-        ) {
-            return ForwardMutationReply::Rejected(rejection);
+        let ownership = match self.reserve_submission() {
+            Ok(ownership) => ownership,
+            Err(_) => return ForwardMutationReply::Unavailable,
+        };
+        self.apply_owned_on_local_leader(request, deadline, ownership)
+            .await
+    }
+
+    async fn apply_owned_on_local_leader(
+        &self,
+        request: ForwardMutationRequest,
+        deadline: tokio::time::Instant,
+        ownership: SubmissionOwnership,
+    ) -> ForwardMutationReply {
+        self.apply_local_mutation(LocalMutation::received(request), deadline, ownership)
+            .await
+    }
+
+    async fn apply_local_mutation(
+        &self,
+        input: LocalMutation<'_>,
+        deadline: tokio::time::Instant,
+        ownership: SubmissionOwnership,
+    ) -> ForwardMutationReply {
+        match self
+            .apply_local_mutation_guarded(input, deadline, ownership, None)
+            .await
+        {
+            Ok(reply) => reply,
+            Err(_) => ForwardMutationReply::Unavailable,
         }
+    }
+
+    async fn apply_local_mutation_guarded(
+        &self,
+        input: LocalMutation<'_>,
+        deadline: tokio::time::Instant,
+        ownership: SubmissionOwnership,
+        admission: Option<NetconfRunningAdmission<'_>>,
+    ) -> Result<ForwardMutationReply, LocalSubmissionError> {
+        #[cfg(test)]
+        let diagnostic_origin = self
+            .inner
+            .durable_progress
+            .append_observed_from
+            .get()
+            .copied();
+        #[cfg(test)]
+        let diagnostic = move |phase: &'static str| {
+            if let Some(origin) = diagnostic_origin {
+                eprintln!(
+                    "JOINT_NATIVE_LOCAL phase={phase} elapsed_ms={} remaining_ms={}",
+                    origin.elapsed().as_millis(),
+                    deadline
+                        .saturating_duration_since(tokio::time::Instant::now())
+                        .as_millis(),
+                );
+            }
+        };
+        #[cfg(test)]
+        diagnostic("before_validate");
+        let input = match input.validate(self) {
+            Ok(input) => input,
+            Err(rejection) => return Ok(ForwardMutationReply::Rejected(rejection)),
+        };
+        #[cfg(test)]
+        diagnostic("after_validate");
         if self.require_admission().is_err() {
-            return ForwardMutationReply::Unavailable;
+            return Ok(ForwardMutationReply::Unavailable);
         }
         let proposal_permit = match tokio::time::timeout_at(
             deadline,
@@ -1321,7 +1754,7 @@ impl ConsensusConfigStore {
         .await
         {
             Ok(Ok(permit)) => permit,
-            Ok(Err(_)) | Err(_) => return ForwardMutationReply::Unavailable,
+            Ok(Err(_)) | Err(_) => return Ok(ForwardMutationReply::Unavailable),
         };
         match self
             .inner
@@ -1331,42 +1764,132 @@ impl ConsensusConfigStore {
         {
             EnsureLinearizableOutcome::Ready { .. } if self.require_admission().is_ok() => {}
             EnsureLinearizableOutcome::Ready { .. } | EnsureLinearizableOutcome::Unavailable => {
-                return ForwardMutationReply::Unavailable;
+                return Ok(ForwardMutationReply::Unavailable);
             }
             EnsureLinearizableOutcome::Retry { leader_hint } => {
-                return ForwardMutationReply::NotLeader {
+                return Ok(ForwardMutationReply::NotLeader {
                     leader: leader_hint,
-                }
+                })
             }
-            _ => return ForwardMutationReply::Unavailable,
+            _ => return Ok(ForwardMutationReply::Unavailable),
         }
-        let command = super::ConfigConsensusCommand {
-            schema_version: super::CONFIG_CONSENSUS_COMMAND_VERSION,
-            identity: self.inner.identity,
-            request_id: request.request_id,
-            logical_time: self.inner.clock.now_utc(),
-            intent: request.intent,
+        #[cfg(test)]
+        diagnostic("after_linearizable");
+        let command = match input.finalize(self.inner.clock.now_utc()) {
+            Ok(command) => command,
+            Err(rejection) => return Ok(ForwardMutationReply::Rejected(rejection)),
         };
-        if command.validate(self.inner.identity).is_err() {
-            return ForwardMutationReply::Rejected(ForwardMutationRejection::InvalidCommand);
+        #[cfg(test)]
+        diagnostic("after_finalize");
+        #[cfg(all(test, target_os = "linux"))]
+        let proposal_test_guard = {
+            let hook = self
+                .inner
+                .proposal_test_gate
+                .lock()
+                .expect("test proposal hook lock")
+                .clone();
+            match hook {
+                Some(hook) => match hook.enter(deadline).await {
+                    Ok(guard) => Some(guard),
+                    Err(()) => return Ok(ForwardMutationReply::Unavailable),
+                },
+                None => None,
+            }
+        };
+        // Obtain observation before enqueue. A response channel can close
+        // before Openraft's detached state-machine worker releases its page.
+        let storage_release = match self.inner.durable_progress.storage_release_observer() {
+            Ok(observer) => observer,
+            Err(_) => return Ok(ForwardMutationReply::Unavailable),
+        };
+        #[cfg(feature = "dangerous-test-hooks")]
+        let completion_observation = super::completion_observation::submission(
+            &self.inner.durable_progress,
+            command.request_id,
+            deadline,
+        );
+        if let Some(admission) = admission {
+            // No await intervenes between this last deadline/session check and
+            // polling enqueue. Once polling starts, preserve possible acceptance
+            // and recover the exact original even if the request later expires.
+            admission
+                .check()
+                .map_err(LocalSubmissionError::BeforeEnqueue)?;
         }
-        if !config_command_fits_replication_budget(&command) {
-            return ForwardMutationReply::Rejected(ForwardMutationRejection::CommandTooLarge);
+        // The engine call owns its argument from this handoff onward. Subsequent
+        // engine retention is outside the SDK staging observer's declared scope.
+        #[cfg(feature = "dangerous-test-hooks")]
+        let submission = self.inner.raft.client_write_ff(command.into_engine());
+        #[cfg(not(feature = "dangerous-test-hooks"))]
+        let submission = self.inner.raft.client_write_ff(command);
+        let response = match tokio::time::timeout_at(deadline, submission).await {
+            Err(_) => {
+                #[cfg(test)]
+                diagnostic("enqueue_timeout");
+                return Ok(ForwardMutationReply::OutcomeUnknown);
+            }
+            Ok(Err(_)) => {
+                #[cfg(test)]
+                diagnostic("enqueue_error");
+                return Ok(ForwardMutationReply::Unavailable);
+            }
+            Ok(Ok(response)) => {
+                #[cfg(test)]
+                diagnostic("accepted");
+                response
+            }
+        };
+        #[cfg(all(test, target_os = "linux"))]
+        if let Some(hook) = self
+            .inner
+            .proposal_test_gate
+            .lock()
+            .expect("test observation lock")
+            .as_ref()
+        {
+            hook.accepted
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         }
-        let response =
-            match tokio::time::timeout_at(deadline, self.inner.raft.client_write_ff(command)).await
-            {
-                Err(_) => return ForwardMutationReply::OutcomeUnknown,
-                Ok(Err(_)) => return ForwardMutationReply::Unavailable,
-                Ok(Ok(response)) => response,
-            };
+        #[cfg(all(test, target_os = "linux"))]
+        drop(proposal_test_guard);
+        #[cfg(feature = "dangerous-test-hooks")]
+        if let Some(observation) = completion_observation {
+            observation.record(
+                super::completion_observation::Phase::EnqueueAccepted,
+                None,
+                None,
+            );
+        }
         // The returned receiver proves that Openraft accepted this durable
         // request ID. Supervision, not the originating RPC/client future,
         // owns admission until that exact accepted proposal resolves.
         let (completion_tx, completion_rx) = tokio::sync::oneshot::channel();
-        tokio::spawn(async move {
-            let reply = match response.await {
-                Err(_) => ForwardMutationReply::OutcomeUnknown,
+        #[cfg(test)]
+        let response_lost = Arc::new(AtomicBool::new(false));
+        #[cfg(test)]
+        let observed_response_lost = Arc::clone(&response_lost);
+        let supervision = async move {
+            let response = response.await;
+            #[cfg(feature = "dangerous-test-hooks")]
+            if let Some(observation) = completion_observation {
+                use super::completion_observation::Phase;
+                let (phase, index) = match &response {
+                    Ok(Ok(response)) => (Phase::EngineResponseOk, Some(response.log_id.index)),
+                    Ok(Err(_)) => (Phase::EngineResponseError, None),
+                    Err(_) => (Phase::EngineResponseLost, None),
+                };
+                observation.record(phase, index, None);
+            }
+            let needs_storage_drain = response.is_err();
+            #[cfg(test)]
+            response_lost.store(needs_storage_drain, Ordering::SeqCst);
+            let reply = match response {
+                Err(_) => {
+                    #[cfg(test)]
+                    diagnostic("accepted_response_closed");
+                    ForwardMutationReply::OutcomeUnknown
+                }
                 Ok(Ok(response)) => ForwardMutationReply::Applied(Box::new(response.data)),
                 Ok(Err(ClientWriteError::ForwardToLeader(forward))) => {
                     ForwardMutationReply::NotLeader {
@@ -1377,16 +1900,66 @@ impl ConsensusConfigStore {
                     ForwardMutationReply::Unavailable
                 }
             };
-            let _ = completion_tx.send(reply);
-            drop(proposal_permit);
-        });
-        match tokio::time::timeout_at(deadline, completion_rx).await {
-            Err(_) | Ok(Err(_)) => ForwardMutationReply::OutcomeUnknown,
-            Ok(Ok(ForwardMutationReply::Applied(response))) => {
-                ForwardMutationReply::Applied(response)
+            // Truthful response loss completes the caller independently of
+            // storage cleanup. The observer cannot keep that storage alive.
+            #[cfg(feature = "dangerous-test-hooks")]
+            {
+                if let Some(observation) = completion_observation {
+                    observation.record(
+                        super::completion_observation::Phase::CompletionSending,
+                        None,
+                        None,
+                    );
+                }
+                let _ = super::completion_observation::sent(
+                    completion_observation,
+                    completion_tx.send(reply),
+                );
             }
-            Ok(Ok(reply)) => reply,
-        }
+            #[cfg(not(feature = "dangerous-test-hooks"))]
+            let _ = completion_tx.send(reply);
+            if needs_storage_drain {
+                storage_release.wait().await;
+            }
+            drop(ownership);
+            drop(proposal_permit);
+        };
+        #[cfg(test)]
+        let supervision = {
+            let observed = self.inner.durable_progress.accepted_response_loss.clone();
+            async move {
+                tokio::pin!(supervision);
+                std::future::poll_fn(|context| {
+                    let result = supervision.as_mut().poll(context);
+                    if observed_response_lost.load(Ordering::SeqCst) {
+                        observed.send_replace(Some(result.is_ready()));
+                    }
+                    result
+                })
+                .await
+            }
+        };
+        tokio::spawn(supervision);
+        Ok(
+            match tokio::time::timeout_at(deadline, completion_rx).await {
+                Err(_) => {
+                    #[cfg(test)]
+                    diagnostic("completion_timeout");
+                    ForwardMutationReply::OutcomeUnknown
+                }
+                Ok(Err(_)) => {
+                    #[cfg(test)]
+                    diagnostic("completion_closed");
+                    ForwardMutationReply::OutcomeUnknown
+                }
+                Ok(Ok(ForwardMutationReply::Applied(response))) => {
+                    #[cfg(test)]
+                    diagnostic("completed_response");
+                    ForwardMutationReply::Applied(response)
+                }
+                Ok(Ok(reply)) => reply,
+            },
+        )
     }
 
     async fn wait_for_known_leader(
@@ -1431,6 +2004,45 @@ impl ConsensusConfigStore {
         }
     }
 
+    async fn call_mutation_peer(
+        &self,
+        target: ConsensusNodeId,
+        request: config_capacity_local_admission::RequestValue,
+        deadline: tokio::time::Instant,
+        ownership: SubmissionOwnership,
+    ) -> Result<ForwardMutationReply, PersistError> {
+        let Some(ownership) = ownership else {
+            return self
+                .call_peer(
+                    target,
+                    ConsensusRpcFamily::ForwardMutation,
+                    &request,
+                    deadline,
+                )
+                .await;
+        };
+        // A cancelled caller cannot release the sender's buffers or alias
+        // guard while its in-flight transport still owns the exact request.
+        // The existing operation deadline bounds this one transport attempt.
+        // The receiver independently owns its decode and accepted proposal.
+        let store = self.clone();
+        tokio::spawn(async move {
+            let result = store
+                .call_peer(
+                    target,
+                    ConsensusRpcFamily::ForwardMutation,
+                    &request,
+                    deadline,
+                )
+                .await;
+            drop(request);
+            drop(ownership);
+            result
+        })
+        .await
+        .map_err(|_| PersistError::outcome_unknown())?
+    }
+
     async fn call_peer<Req, Resp>(
         &self,
         target: ConsensusNodeId,
@@ -1448,7 +2060,8 @@ impl ConsensusConfigStore {
             .get(&target)
             .filter(|peer| peer.node_id() == target)
             .ok_or_else(consensus_unavailable)?;
-        let payload = encode_config_wire(request).map_err(|_| consensus_unavailable())?;
+        let payload = encode_config_wire_for_profile(self.mode(), request)
+            .map_err(|_| consensus_unavailable())?;
         let wire = ConsensusWireRequest::try_new(
             self.inner.identity,
             self.inner.local_node_id,
@@ -1461,8 +2074,11 @@ impl ConsensusConfigStore {
             .map_err(|_| consensus_unavailable())?
             .map_err(|_| consensus_unavailable())?;
         response.validate().map_err(|_| consensus_unavailable())?;
-        decode_config_wire(&response.result.map_err(|_| consensus_unavailable())?)
-            .map_err(|_| consensus_unavailable())
+        decode_config_wire_for_profile(
+            self.mode(),
+            &response.result.map_err(|_| consensus_unavailable())?,
+        )
+        .map_err(|_| consensus_unavailable())
     }
 
     async fn local_read_barrier(&self, deadline: tokio::time::Instant) -> ReadBarrierReply {
@@ -1491,7 +2107,17 @@ impl ConsensusConfigStore {
     }
 
     async fn linearizable_barrier(&self) -> Result<Option<LogId<ConsensusNodeId>>, PersistError> {
-        let result = self.linearizable_barrier_inner().await;
+        let deadline = tokio::time::Instant::now()
+            .checked_add(self.inner.operation_timeout)
+            .ok_or_else(consensus_unavailable)?;
+        self.linearizable_barrier_until(deadline).await
+    }
+
+    async fn linearizable_barrier_until(
+        &self,
+        deadline: tokio::time::Instant,
+    ) -> Result<Option<LogId<ConsensusNodeId>>, PersistError> {
+        let result = self.linearizable_barrier_inner(deadline).await;
         let metric = if result.is_ok() {
             &opc_redaction::metrics::METRICS.persist_quorum_read_success
         } else {
@@ -1504,11 +2130,9 @@ impl ConsensusConfigStore {
 
     async fn linearizable_barrier_inner(
         &self,
+        deadline: tokio::time::Instant,
     ) -> Result<Option<LogId<ConsensusNodeId>>, PersistError> {
         self.require_admission()?;
-        let deadline = tokio::time::Instant::now()
-            .checked_add(self.inner.operation_timeout)
-            .ok_or_else(consensus_unavailable)?;
         let mut preferred = None;
         loop {
             let leader = match preferred.take() {
@@ -1634,44 +2258,151 @@ impl ConsensusConfigStore {
     }
 }
 
-fn config_raft_config() -> Result<opc_consensus::engine::Config, ConfigConsensusOpenError> {
-    durable_openraft_config(DurableOpenraftDomain::ConfigurationState)
-        .map_err(|_| ConfigConsensusOpenError::InvalidRuntimeConfiguration)
+fn config_raft_config(
+    profile: opc_crypto::ConfigCapacityProfile,
+) -> Result<opc_consensus::engine::Config, ConfigConsensusOpenError> {
+    let mut config = durable_openraft_config(DurableOpenraftDomain::ConfigurationState)
+        .map_err(|_| ConfigConsensusOpenError::InvalidRuntimeConfiguration)?;
+    if profile == opc_crypto::ConfigCapacityProfile::BoundedV1 {
+        config.max_apply_entries = std::num::NonZeroU64::new(64);
+    }
+    Ok(config)
 }
 
-fn config_command_fits_replication_budget(command: &super::ConfigConsensusCommand) -> bool {
-    // The 1 MiB command ceiling leaves more than 1 MiB for the fixed config
-    // revision and singleton Openraft metadata under the 2 MiB hard RPC
-    // ceiling. It also aligns every admitted command with the shared
-    // AppendEntries soft target, so no accepted singleton can wedge the log.
-    encode_bounded(command)
-        .is_ok_and(|encoded| encoded.len() <= DURABLE_OPENRAFT_APPEND_ENTRIES_TARGET_BYTES)
+fn config_command_fits_replication_budget(
+    command: &super::ConfigConsensusCommand,
+    profile: opc_crypto::ConfigCapacityProfile,
+) -> bool {
+    match profile {
+        // Keep the original complete-command fence for existing callers.
+        opc_crypto::ConfigCapacityProfile::Legacy => config_command_encoded_size(command)
+            .is_ok_and(|bytes| bytes <= DURABLE_OPENRAFT_APPEND_ENTRIES_TARGET_BYTES),
+        // The independently admitted store profile selects every command,
+        // metadata, RPC, native JSON and working-buffer preflight. A command
+        // revision or retained record proof cannot opt the receiver in.
+        opc_crypto::ConfigCapacityProfile::BoundedV1 => {
+            preflight_received_config_command(command, profile).is_ok()
+        }
+        _ => false,
+    }
+}
+
+fn config_command_encoded_size<T: Serialize>(
+    command: &T,
+) -> Result<usize, opc_consensus::ConsensusCodecError> {
+    // The shared accumulator uses the actual postcard size serializer. Sizing
+    // one borrowed value needs no command buffer. Its oversized-singleton
+    // decision is not admission: callers still enforce the command ceiling.
+    let mut counter = AppendEntriesBatchAccumulator::new();
+    counter.consider(command)?;
+    Ok(counter.serialized_entry_bytes())
 }
 
 fn preflight_config_command_replication_budget(
     identity: opc_consensus::ConsensusIdentity,
     request_id: opc_consensus::ConsensusRequestId,
     intent: &ConfigMutationIntent,
+    mode: impl TryInto<super::RetainedConfigMode>,
 ) -> Result<(), ForwardMutationRejection> {
+    let mode = mode
+        .try_into()
+        .map_err(|_| ForwardMutationRejection::InvalidCommand)?;
+    let profile = mode.capacity_profile();
+    let schema_version = config_command_revision(mode);
+    if schema_version == 0 {
+        return Err(ForwardMutationRejection::InvalidCommand);
+    }
     // The maximum UTC RFC 3339 timestamp has the longest representation that
     // the leader-selected logical time can add to the postcard command. This
     // makes admission independent of the current clock value while retaining
     // the exact command shape and field order.
     let probe = ConfigConsensusCommandSizeProbe {
-        schema_version: super::CONFIG_CONSENSUS_COMMAND_VERSION,
+        schema_version,
         identity,
         request_id,
         logical_time: maximum_encoded_config_timestamp()
             .ok_or(ForwardMutationRejection::InvalidCommand)?,
         intent,
     };
-    match encode_bounded(&probe) {
-        Ok(encoded) if encoded.len() <= DURABLE_OPENRAFT_APPEND_ENTRIES_TARGET_BYTES => Ok(()),
+    if profile == opc_crypto::ConfigCapacityProfile::BoundedV1 {
+        #[cfg(all(test, target_os = "linux"))]
+        config_capacity_cost_observation::preflight_started();
+        let sized = if mode == super::RetainedConfigMode::NetconfRunningV1 {
+            config_capacity_admission::preflight_running_mode(&probe)
+        } else {
+            config_capacity_admission::preflight(&probe, profile)
+        };
+        return sized.map(|_| {
+            #[cfg(all(test, target_os = "linux"))]
+            config_capacity_cost_observation::preflight_succeeded();
+        });
+    }
+    match config_command_encoded_size(&probe) {
+        Ok(bytes)
+            if bytes <= DURABLE_OPENRAFT_APPEND_ENTRIES_TARGET_BYTES
+                && intent.metadata_fits_profile(bytes, profile) =>
+        {
+            Ok(())
+        }
         Ok(_) | Err(opc_consensus::ConsensusCodecError::TooLarge) => {
             Err(ForwardMutationRejection::CommandTooLarge)
         }
         Err(_) => Err(ForwardMutationRejection::InvalidCommand),
     }
+}
+
+// Used by replication and retained-log validation as well as the proposal
+// entrypoints. The immutable receiver profile selects the limits; a command
+// revision or an attached record proof cannot select them.
+pub(super) fn preflight_received_config_command(
+    command: &super::ConfigConsensusCommand,
+    mode: impl TryInto<super::RetainedConfigMode>,
+) -> Result<(), PersistError> {
+    preflight_config_command_replication_budget(
+        command.identity,
+        command.request_id,
+        &command.intent,
+        mode,
+    )
+    .map_err(ForwardMutationRejection::into_persist_error)
+}
+
+// Encoding-only boundary for the proposed joint action-16 representation.
+// No RetainedConfigMode selects revision 10 and no submission calls this helper.
+// Both phases include their full framing and the same maximum clock input.
+pub(super) fn preflight_joint_target_payload(
+    prepared: &super::audit_mutation::PreparedTargetMutation,
+) -> Result<(), crate::audit_authority::AuditAuthorityError> {
+    use crate::audit_authority::AuditAuthorityError;
+    for (purpose, phase) in [
+        (
+            b"netconf-target-intent".as_slice(),
+            super::audit_mutation::TargetAuditCommandV1::Admit(prepared.command().clone()),
+        ),
+        (
+            b"netconf-target-effect".as_slice(),
+            super::audit_mutation::TargetAuditCommandV1::Apply(prepared.command().clone()),
+        ),
+    ] {
+        let intent = ConfigMutationIntent::ManagementAudit(Box::new(
+            super::audit::AuditCommand::NetconfTarget(Box::new(phase)),
+        ));
+        let probe = ConfigConsensusCommandSizeProbe {
+            schema_version: 10,
+            identity: prepared.command().handle.body.identity,
+            request_id: derive_durable_request_id(
+                prepared.command().handle.body.identity,
+                purpose,
+                &prepared.command().handle.mac,
+            ),
+            logical_time: maximum_encoded_config_timestamp()
+                .ok_or(AuditAuthorityError::InvalidInput)?,
+            intent: &intent,
+        };
+        config_capacity_admission::preflight_joint_target_payload(&probe)
+            .map_err(|_| AuditAuthorityError::InvalidInput)?;
+    }
+    Ok(())
 }
 
 fn maximum_encoded_config_timestamp() -> Option<opc_types::Timestamp> {
@@ -1766,10 +2497,22 @@ impl ConsensusRpcHandler for ConfigConsensusService {
                         result: Err(ConsensusPeerError::ScopeMismatch),
                     };
                 }
-                let forwarded: ForwardMutationRequest = match decode_config_wire(&request.payload) {
-                    Ok(forwarded) => forwarded,
-                    Err(_) => return protocol_rejection(),
+                let ownership = match self.store.reserve_submission() {
+                    Ok(ownership) => ownership,
+                    Err(_) => {
+                        return encode_service_reply_for_profile(
+                            self.store.mode(),
+                            &ForwardMutationReply::Rejected(
+                                ForwardMutationRejection::ResourceAdmission,
+                            ),
+                        )
+                    }
                 };
+                let forwarded: ForwardMutationRequest =
+                    match decode_forward_mutation(self.store.mode(), &request.payload) {
+                        Ok(forwarded) => forwarded,
+                        Err(_) => return protocol_rejection(),
+                    };
                 if forwarded.compatibility != self.store.peer_compatibility() {
                     return ConsensusWireResponse {
                         result: Err(ConsensusPeerError::ScopeMismatch),
@@ -1781,20 +2524,30 @@ impl ConsensusRpcHandler for ConfigConsensusService {
                 else {
                     return protocol_rejection();
                 };
-                encode_service_reply(&self.store.apply_on_local_leader(forwarded, deadline).await)
+                encode_service_reply_for_profile(
+                    self.store.mode(),
+                    &self
+                        .store
+                        .apply_owned_on_local_leader(forwarded, deadline, ownership)
+                        .await,
+                )
             }
             ConsensusRpcFamily::ReadBarrier => {
-                let read: ReadBarrierRequest = match decode_config_wire(&request.payload) {
-                    Ok(read) => read,
-                    Err(_) => return protocol_rejection(),
-                };
+                let read: ReadBarrierRequest =
+                    match decode_config_wire_for_profile(self.store.mode(), &request.payload) {
+                        Ok(read) => read,
+                        Err(_) => return protocol_rejection(),
+                    };
                 if read.compatibility != self.store.peer_compatibility() {
                     return ConsensusWireResponse {
                         result: Err(ConsensusPeerError::ScopeMismatch),
                     };
                 }
                 if read.compatibility_probe {
-                    return encode_service_reply(&ReadBarrierReply::Compatible);
+                    return encode_service_reply_for_profile(
+                        self.store.mode(),
+                        &ReadBarrierReply::Compatible,
+                    );
                 }
                 if !self.store.is_live_voter(authenticated_sender) {
                     return ConsensusWireResponse {
@@ -1807,15 +2560,26 @@ impl ConsensusRpcHandler for ConfigConsensusService {
                 else {
                     return protocol_rejection();
                 };
-                encode_service_reply(&self.store.local_read_barrier(deadline).await)
+                encode_service_reply_for_profile(
+                    self.store.mode(),
+                    &self.store.local_read_barrier(deadline).await,
+                )
             }
             _ => protocol_rejection(),
         }
     }
 }
 
+#[cfg(test)]
 fn encode_service_reply<T: Serialize>(reply: &T) -> ConsensusWireResponse {
-    match encode_config_wire(reply) {
+    encode_service_reply_for_profile(super::RetainedConfigMode::Legacy, reply)
+}
+
+fn encode_service_reply_for_profile<T: Serialize>(
+    profile: impl TryInto<super::RetainedConfigMode>,
+    reply: &T,
+) -> ConsensusWireResponse {
+    match encode_config_wire_for_profile(profile, reply) {
         Ok(payload) => ConsensusWireResponse {
             result: Ok(payload),
         },
@@ -1916,11 +2680,7 @@ impl ConfigStore for ConsensusConfigStore {
     }
 
     async fn clear_recovery_required(&self, tx_id: opc_types::TxId) -> Result<(), PersistError> {
-        let request_id = derive_durable_request_id(
-            self.inner.identity,
-            b"clear-recovery",
-            tx_id.as_uuid().as_bytes(),
-        );
+        let request_id = self.recovery_clear_request_id(tx_id);
         self.clear_recovery_required_idempotent(request_id, tx_id)
             .await
     }
@@ -1956,6 +2716,22 @@ impl ConfigStore for ConsensusConfigStore {
 
 #[cfg(test)]
 mod tests {
+    #[cfg(target_os = "linux")]
+    pub(super) mod config_capacity_accepted_tests;
+    #[cfg(target_os = "linux")]
+    pub(super) mod config_capacity_caller_ledger_tests;
+    #[cfg(target_os = "linux")]
+    pub(super) mod config_capacity_cost_tests;
+    mod config_capacity_encoding_tests;
+    mod config_capacity_metadata_tests;
+    #[cfg(target_os = "linux")]
+    mod config_capacity_native_preparation_tests;
+    mod config_capacity_preparation_tests;
+    #[cfg(target_os = "linux")]
+    mod config_capacity_shutdown_tests;
+    #[cfg(target_os = "linux")]
+    mod joint_target_submission_native_tests;
+
     use super::super::{
         ConfigConsensusClusterId, ConfigConsensusConfigurationEpoch, ConfigConsensusConfigurationId,
     };
@@ -2054,7 +2830,7 @@ mod tests {
         }
     }
 
-    fn sized_attested_commit(plaintext_bytes: usize) -> AttestedConfigCommit {
+    pub(super) fn sized_attested_commit(plaintext_bytes: usize) -> AttestedConfigCommit {
         let tx_id = opc_types::TxId::new();
         let committed_at = size_test_timestamp();
         let principal =
@@ -2378,7 +3154,10 @@ mod tests {
         while admitted + 1 < rejected {
             let candidate = admitted + ((rejected - admitted) / 2);
             let request = sized_forwarded_mutation(&store, candidate);
-            if config_command_fits_replication_budget(&command_for(&request)) {
+            if config_command_fits_replication_budget(
+                &command_for(&request),
+                store.capacity_profile(),
+            ) {
                 admitted = candidate;
             } else {
                 rejected = candidate;
@@ -2389,7 +3168,10 @@ mod tests {
         let admitted_command = command_for(&admitted_request);
         let admitted_command_bytes = encode_bounded(&admitted_command).expect("admitted command");
         assert!(admitted_command_bytes.len() <= DURABLE_OPENRAFT_APPEND_ENTRIES_TARGET_BYTES);
-        assert!(config_command_fits_replication_budget(&admitted_command));
+        assert!(config_command_fits_replication_budget(
+            &admitted_command,
+            store.capacity_profile()
+        ));
 
         let max_node = ConsensusNodeId::new(opc_consensus::CONSENSUS_NODE_ID_MAX)
             .expect("largest bounded consensus node ID");
@@ -2408,14 +3190,16 @@ mod tests {
         assert!(encode_config_wire(&admitted_request).is_ok());
 
         let oversized_request = sized_forwarded_mutation(&store, rejected);
-        assert!(!config_command_fits_replication_budget(&command_for(
-            &oversized_request
-        )));
+        assert!(!config_command_fits_replication_budget(
+            &command_for(&oversized_request),
+            store.capacity_profile(),
+        ));
         assert_eq!(
             preflight_config_command_replication_budget(
                 store.inner.identity,
                 oversized_request.request_id,
                 &oversized_request.intent,
+                store.capacity_profile(),
             ),
             Err(ForwardMutationRejection::CommandTooLarge)
         );
@@ -2878,3 +3662,18 @@ mod tests {
         writer_thread.join().expect("join watch writer");
     }
 }
+
+#[cfg(test)]
+#[path = "../../tests/management_audit_authority/running_replacement.rs"]
+mod running_replacement_tests;
+
+#[cfg(test)]
+#[path = "../../tests/management_audit_authority/running_quorum_revocation.rs"]
+mod running_quorum_revocation_tests;
+
+#[cfg(test)]
+#[path = "../../tests/management_audit_authority/target_admission_race.rs"]
+mod target_admission_race_tests;
+
+#[cfg(test)]
+mod three_mode_audit_decode_tests;

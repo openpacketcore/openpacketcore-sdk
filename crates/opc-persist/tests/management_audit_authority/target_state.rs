@@ -1,0 +1,11913 @@
+//! Retained target state transitions through the existing audit apply boundary.
+use super::*;
+use crate::audit_authority::continuity::checkpoint::CheckpointBody;
+use crate::audit_authority::continuity::AuditSigningKey;
+use crate::audit_authority::ledger::{authenticate, HandleBody};
+use crate::audit_authority::{
+    AuditOperationBinding, AuditPrivacyKey, NetconfAppliedOutcome, ProjectedAuditEvent,
+};
+use crate::consensus::audit_mutation::{
+    PreparedTargetMutation, TargetAuditCommandV1, TargetEffectV1, TargetExpectationV1,
+    TargetResolutionV1,
+};
+use crate::{
+    ConfigConsensusClusterId, ConfigConsensusConfigurationEpoch, ConfigConsensusConfigurationId,
+    ConfigConsensusNodeId, ConfigConsensusTopology, ManagementAuditEventRecord,
+    ManagementAuditInstant, ManagementAuditOperationCode, ManagementAuditOutcomeCode,
+    ManagementAuditTimeSourceCode, ManagementAuditTransportCode, RetainedConfigBinding,
+    RetainedConfigDurability, RetainedConfigOptions, RetainedConfigProfile, SqliteBackend,
+};
+use serde_json::Value;
+use std::{collections::BTreeSet, time::Duration};
+
+struct Fixture {
+    directory: tempfile::TempDir,
+    backend: SqliteBackend,
+    identity: ConfigConsensusIdentity,
+    key: AuditKey,
+    keys: AuditKeyRing,
+    privacy: AuditPrivacyKey,
+}
+
+impl Fixture {
+    async fn new() -> Self {
+        let directory = tempfile::tempdir().unwrap();
+        let identity = ConfigConsensusIdentity::new(
+            ConfigConsensusClusterId::from_bytes([0x41; 32]),
+            ConfigConsensusConfigurationId::from_bytes([0x42; 32]),
+            ConfigConsensusConfigurationEpoch::new(1).unwrap(),
+        );
+        let node = ConfigConsensusNodeId::new(1).unwrap();
+        let topology =
+            ConfigConsensusTopology::try_new(identity, node, BTreeSet::from([node])).unwrap();
+        let key = AuditKey::new([0x43; 32]).unwrap();
+        let keys = AuditKeyRing::new(vec![AuditSigningKey::new(1, [0x44; 32]).unwrap()]).unwrap();
+        let options = RetainedConfigOptions::new(
+            directory.path().join("authority.sqlite"),
+            RetainedConfigBinding::new(topology, [0x45; 32], [0x46; 32])
+                .unwrap()
+                .with_profile(RetainedConfigProfile::NetconfTargetsV1),
+            RetainedConfigDurability::Ephemeral,
+            16 * 1024 * 1024,
+            Duration::from_secs(30),
+        )
+        .unwrap();
+        let backend = SqliteBackend::provision_config_authority(options, key.clone())
+            .await
+            .unwrap();
+        let fixture = Self {
+            directory,
+            backend,
+            identity,
+            key,
+            keys,
+            privacy: AuditPrivacyKey::new([0x47; 32]).unwrap(),
+        };
+        let shared = fixture.backend.conn();
+        let conn = shared.lock().await;
+        fixture
+            .apply(
+                &conn,
+                AuditCommand::InitializeWithContinuity {
+                    projection: fixture.event(1).projection,
+                    limits: AuditLedgerLimits::new(96, 32).unwrap(),
+                    initial_epoch: 1,
+                },
+                100,
+            )
+            .unwrap();
+        fixture.checkpoint(&conn);
+        drop(conn);
+        fixture
+    }
+
+    fn event(&self, request: u8) -> ProjectedAuditEvent {
+        let event = ManagementAuditEventRecord::try_new(
+            [request; 16],
+            ManagementAuditInstant::try_new(100, 0, 1, ManagementAuditTimeSourceCode::NodeClock)
+                .unwrap(),
+            "fixture-tenant",
+            "fixture-principal",
+            ManagementAuditTransportCode::NetconfSsh,
+            ManagementAuditOperationCode::Exec,
+            ManagementAuditOutcomeCode::Intent,
+            None::<&str>,
+            ["/fixture:configuration"],
+            Some("fixture-target"),
+        )
+        .unwrap();
+        ProjectedAuditEvent::project(&self.privacy, &event).unwrap()
+    }
+
+    fn apply(
+        &self,
+        conn: &Connection,
+        command: AuditCommand,
+        now: i64,
+    ) -> Result<(), ConfigMutationFailure> {
+        let tx = conn.unchecked_transaction().unwrap();
+        let result = apply_sync(
+            &tx,
+            &self.key,
+            self.identity,
+            &command,
+            now,
+            Some(&self.keys),
+        )
+        .expect("audit transaction I/O");
+        // A definite retained rejection is also committed. An I/O failure above
+        // drops the transaction instead of publishing partial target state.
+        tx.commit().unwrap();
+        result
+    }
+
+    fn ledger(&self, conn: &Connection) -> LedgerState {
+        read_with_keys_sync(conn, &self.key, Some(&self.keys), self.identity)
+            .unwrap()
+            .unwrap()
+    }
+
+    fn checkpoint(&self, conn: &Connection) -> AuditCheckpoint {
+        let ledger = self.ledger(conn);
+        let chain = ledger.continuity.as_ref().unwrap();
+        let checkpoint = AuditCheckpoint::issue(
+            &self.keys,
+            CheckpointBody {
+                version: 1,
+                identity: self.identity,
+                sequence: ledger.sequence,
+                root_anchor: ledger.terminal,
+                anchor: chain.terminal,
+                epoch_at_sequence: chain.active_epoch,
+                signing_epoch: chain.active_epoch,
+                acknowledged_export: [0; 32],
+            },
+        )
+        .unwrap();
+        self.apply(conn, AuditCommand::Checkpoint(checkpoint.clone()), 100)
+            .unwrap();
+        checkpoint
+    }
+
+    fn activate(&self, conn: &Connection) -> PreparedTargetMutation {
+        let event = self.event(1);
+        let checkpoint = self.ledger(conn).continuity.unwrap().checkpoint.unwrap();
+        let profile = row(conn, "config_netconf_profile", "singleton", 1);
+        let effect = TargetEffectV1 {
+            format: 1,
+            authority: self.identity,
+            profile_incarnation: [0x51; 16],
+            device_incarnation: [0x52; 16],
+            caller: event.caller,
+            request: event.request,
+            action: 0.try_into().unwrap(),
+            destination: TargetExpectationV1::Lifecycle {
+                state_digest: serde_json::from_value(profile["state_digest"].clone()).unwrap(),
+            },
+            source: None,
+            lock: None,
+            expires_at: 160,
+            encrypted_payload: None,
+            resolution: Some(TargetResolutionV1::Activate { checkpoint }),
+        };
+        self.prepare(effect, event)
+    }
+
+    fn prepare(
+        &self,
+        effect: TargetEffectV1,
+        event: ProjectedAuditEvent,
+    ) -> PreparedTargetMutation {
+        let binding =
+            AuditOperationBinding::project(&self.privacy, &event, 0, b"target-state").unwrap();
+        let mutation = authenticate(
+            &self.key,
+            b"openpacketcore/management-audit/netconf-target/v1\0",
+            &effect,
+        )
+        .unwrap();
+        let handle = AuditOperationHandle::issue(
+            HandleBody {
+                version: 1,
+                identity: self.identity,
+                binding,
+                event,
+                issued_at: 100,
+                expires_at: effect.expires_at,
+                nonce: [0x53; 16],
+                key_epoch: self.key.epoch(),
+                mutation: Some(mutation),
+            },
+            &self.key,
+        )
+        .unwrap();
+        PreparedTargetMutation::new(handle, effect, None)
+    }
+}
+
+fn row(conn: &Connection, table: &str, column: &str, slot: u8) -> Value {
+    let bytes: Vec<u8> = conn
+        .query_row(
+            &format!("SELECT state_json FROM {table} WHERE {column}=?1"),
+            [slot],
+            |row| row.get(0),
+        )
+        .unwrap();
+    serde_json::from_slice(&bytes).unwrap()
+}
+
+#[tokio::test]
+async fn target_state_activation_retains_the_exact_audit_anchor_and_tombstones() {
+    let fixture = Fixture::new().await;
+    let shared = fixture.backend.conn();
+    let conn = shared.lock().await;
+    let prepared = fixture.activate(&conn);
+    fixture
+        .apply(
+            &conn,
+            AuditCommand::NetconfTarget(Box::new(TargetAuditCommandV1::Admit(
+                prepared.command().clone(),
+            ))),
+            100,
+        )
+        .unwrap();
+    fixture.checkpoint(&conn);
+    let applied = fixture.apply(
+        &conn,
+        AuditCommand::NetconfTarget(Box::new(TargetAuditCommandV1::Apply(
+            prepared.command().clone(),
+        ))),
+        100,
+    );
+    assert!(
+        applied.is_ok(),
+        "checkpointed target activation did not apply"
+    );
+    let ledger = fixture.ledger(&conn);
+    let receipt = ledger
+        .lookup(
+            &fixture.key,
+            prepared.handle(),
+            prepared.command().effect.caller,
+        )
+        .unwrap()
+        .unwrap();
+    let AuditOperationState::TargetV1(result) = receipt.state() else {
+        panic!("activation has no typed retained result");
+    };
+    assert!(matches!(
+        result.outcome(),
+        NetconfAppliedOutcome::Lifecycle { .. }
+    ));
+    assert!(!receipt.terminal_recorded());
+    let profile = row(&conn, "config_netconf_profile", "singleton", 1);
+    assert_eq!(
+        profile["state_digest"],
+        serde_json::to_value(result.state_digest()).unwrap()
+    );
+    assert_eq!(profile["last_target_transition_sequence"], receipt.sequence);
+    assert!(!profile["activation_operation"].is_null());
+    assert!(!profile["bootstrap_checkpoint"].is_null());
+    for target in [0, 1] {
+        let state = row(&conn, "config_netconf_targets", "target", target);
+        assert_eq!(state["generation"], 0);
+        assert_eq!(state["present"], false);
+    }
+    drop(conn);
+    let reopened = Connection::open(fixture.directory.path().join("authority.sqlite")).unwrap();
+    assert_eq!(
+        row(&reopened, "config_netconf_profile", "singleton", 1),
+        profile
+    );
+    assert_eq!(
+        fixture
+            .ledger(&reopened)
+            .lookup(
+                &fixture.key,
+                prepared.handle(),
+                prepared.command().effect.caller
+            )
+            .unwrap()
+            .unwrap()
+            .state(),
+        receipt.state()
+    );
+}
+
+impl Fixture {
+    fn submit(&self, conn: &Connection, prepared: &PreparedTargetMutation) -> AuditOperationState {
+        self.apply(
+            conn,
+            AuditCommand::NetconfTarget(Box::new(TargetAuditCommandV1::Admit(
+                prepared.command().clone(),
+            ))),
+            100,
+        )
+        .unwrap();
+        self.checkpoint(conn);
+        let _ = self.apply(
+            conn,
+            AuditCommand::NetconfTarget(Box::new(TargetAuditCommandV1::Apply(
+                prepared.command().clone(),
+            ))),
+            100,
+        );
+        self.ledger(conn)
+            .lookup(
+                &self.key,
+                prepared.handle(),
+                prepared.command().effect.caller,
+            )
+            .unwrap()
+            .unwrap()
+            .state()
+    }
+
+    fn settle(&self, conn: &Connection, prepared: &PreparedTargetMutation) {
+        self.apply(
+            conn,
+            AuditCommand::Terminal(prepared.command().handle.clone()),
+            100,
+        )
+        .unwrap();
+        self.checkpoint(conn);
+    }
+
+    fn active(&self, conn: &Connection) {
+        let prepared = self.activate(conn);
+        assert!(matches!(
+            self.submit(conn, &prepared),
+            AuditOperationState::TargetV1(_)
+        ));
+        self.settle(conn, &prepared);
+    }
+
+    fn request(
+        &self,
+        conn: &Connection,
+        request: u8,
+        action: u8,
+        session: u8,
+        slot: u8,
+    ) -> PreparedTargetMutation {
+        use crate::consensus::audit_mutation::TargetLockExpectationV1;
+        let event = self.event(request);
+        let profile = row(conn, "config_netconf_profile", "singleton", 1);
+        let lifecycle = row(conn, "config_netconf_lifecycle", "singleton", 1);
+        let destination = if matches!(action, 4 | 5) {
+            TargetExpectationV1::Candidate {
+                generation: crate::audit_authority::CandidateGeneration {
+                    authority: self.identity,
+                    value: row(conn, "config_netconf_targets", "target", 0)["generation"]
+                        .as_u64()
+                        .unwrap(),
+                },
+            }
+        } else if matches!(action, 7 | 8) {
+            TargetExpectationV1::Startup {
+                revision: crate::audit_authority::StartupRevision {
+                    authority: self.identity,
+                    value: row(conn, "config_netconf_targets", "target", 1)["generation"]
+                        .as_u64()
+                        .unwrap(),
+                },
+            }
+        } else {
+            TargetExpectationV1::Lifecycle {
+                state_digest: serde_json::from_value(profile["state_digest"].clone()).unwrap(),
+            }
+        };
+        let lock = if matches!(action, 2..=8) {
+            Some(TargetLockExpectationV1 {
+                datastore: slot,
+                incarnation: lifecycle["locks"][usize::from(slot)]["incarnation"]
+                    .as_u64()
+                    .unwrap(),
+                session: serde_json::from_value(
+                    lifecycle["locks"][usize::from(slot)]["session"].clone(),
+                )
+                .unwrap(),
+                requester: [session; 16],
+            })
+        } else {
+            None
+        };
+        let resolution = match action {
+            1 => Some(TargetResolutionV1::BeginDevice {
+                previous: serde_json::from_value(profile["device_incarnation"].clone()).unwrap(),
+            }),
+            2 => Some(TargetResolutionV1::AcquireLock {
+                session: [session; 16],
+            }),
+            3 => Some(TargetResolutionV1::ReleaseLock {
+                session: [session; 16],
+            }),
+            13 => Some(TargetResolutionV1::EndSession {
+                session: [session; 16],
+            }),
+            _ => None,
+        };
+        self.prepare(
+            TargetEffectV1 {
+                format: 1,
+                authority: self.identity,
+                profile_incarnation: [0x51; 16],
+                device_incarnation: if action == 1 {
+                    [request; 16]
+                } else {
+                    serde_json::from_value(profile["device_incarnation"].clone()).unwrap()
+                },
+                caller: event.caller,
+                request: event.request,
+                action: action.try_into().unwrap(),
+                destination,
+                source: None,
+                lock,
+                expires_at: 160,
+                encrypted_payload: None,
+                resolution,
+            },
+            event,
+        )
+    }
+
+    fn encrypted(&self, mut prepared: PreparedTargetMutation, seed: u8) -> PreparedTargetMutation {
+        use crate::consensus::audit_mutation::{TargetEncryptedBlobV1, TargetPayloadV1};
+        use opc_crypto::encrypt_attested_envelope_with_handle_and_nonce;
+        use opc_key::{
+            ConfigAad, EnvelopeAad, KeyHandle, KeyId, KeyPurpose, AES_256_GCM_SIV_KEY_LEN,
+            AES_256_GCM_SIV_NONCE_LEN,
+        };
+        use sha2::{Digest, Sha256};
+        let (target, version) = match prepared.command().effect.destination {
+            TargetExpectationV1::Candidate { generation } => (0, generation.get() + 1),
+            TargetExpectationV1::Startup { revision } => (1, revision.get() + 1),
+            _ => panic!("target fixture required"),
+        };
+        let schema = opc_types::SchemaDigest::from_bytes([0x71; 32]);
+        let aad = EnvelopeAad::config(
+            opc_types::TenantId::from_static("fixture-tenant"),
+            version,
+            ConfigAad::new(
+                opc_types::TxId::new(),
+                None,
+                opc_types::Timestamp::now_utc(),
+                "fixture-principal",
+                schema,
+                prepared
+                    .command()
+                    .effect
+                    .encryption_store_kind(schema, target)
+                    .unwrap(),
+            )
+            .unwrap(),
+        );
+        let key = KeyHandle::new(
+            KeyId::new("fixture-target-key").unwrap(),
+            KeyPurpose::Config,
+            opc_types::TenantId::from_static("fixture-tenant"),
+            zeroize::Zeroizing::new([seed; AES_256_GCM_SIV_KEY_LEN]),
+        );
+        let envelope = encrypt_attested_envelope_with_handle_and_nonce(
+            &key,
+            &aad,
+            &[0x72; 32],
+            [seed; AES_256_GCM_SIV_NONCE_LEN],
+        )
+        .unwrap();
+        prepared.command_mut().effect.encrypted_payload =
+            Some(TargetPayloadV1::Target(TargetEncryptedBlobV1 {
+                schema,
+                plaintext_digest: Sha256::digest([0x72; 32]).into(),
+                encrypted_blob: envelope.encoded().to_vec(),
+            }));
+        self.prepare(
+            prepared.command().effect.clone(),
+            prepared.command().handle.body.event.clone(),
+        )
+    }
+}
+
+fn target_rows(conn: &Connection) -> Vec<(String, u8, Vec<u8>, Vec<u8>)> {
+    let mut result = Vec::new();
+    for (table, column, slots) in [
+        ("config_netconf_profile", "singleton", vec![1]),
+        ("config_netconf_targets", "target", vec![0, 1]),
+        ("config_netconf_lifecycle", "singleton", vec![1]),
+    ] {
+        for slot in slots {
+            let (body, mac): (Vec<u8>, Vec<u8>) = conn
+                .query_row(
+                    &format!("SELECT state_json,state_hmac FROM {table} WHERE {column}=?1"),
+                    [slot],
+                    |row| Ok((row.get(0)?, row.get(1)?)),
+                )
+                .unwrap();
+            result.push((table.to_owned(), slot, body, mac));
+        }
+    }
+    result
+}
+
+fn restore_rows(conn: &Connection, rows: &[(String, u8, Vec<u8>, Vec<u8>)]) {
+    for (table, slot, body, mac) in rows {
+        let column = if table == "config_netconf_targets" {
+            "target"
+        } else {
+            "singleton"
+        };
+        conn.execute(
+            &format!("UPDATE {table} SET state_json=?1,state_hmac=?2 WHERE {column}=?3"),
+            params![body, mac, slot],
+        )
+        .unwrap();
+    }
+}
+
+#[tokio::test]
+async fn target_state_requires_original_checkpoint_and_retains_rejections_and_terminal_debt() {
+    let fixture = Fixture::new().await;
+    let shared = fixture.backend.conn();
+    let conn = shared.lock().await;
+    let activation = fixture.activate(&conn);
+    let before = target_rows(&conn);
+    let apply = || {
+        AuditCommand::NetconfTarget(Box::new(TargetAuditCommandV1::Apply(
+            activation.command().clone(),
+        )))
+    };
+    assert!(fixture.apply(&conn, apply(), 100).is_err());
+    assert_eq!(target_rows(&conn), before);
+    fixture
+        .apply(
+            &conn,
+            AuditCommand::NetconfTarget(Box::new(TargetAuditCommandV1::Admit(
+                activation.command().clone(),
+            ))),
+            100,
+        )
+        .unwrap();
+    assert!(fixture.apply(&conn, apply(), 100).is_err());
+    assert_eq!(target_rows(&conn), before);
+    assert_eq!(
+        fixture
+            .ledger(&conn)
+            .lookup(
+                &fixture.key,
+                activation.handle(),
+                activation.command().effect.caller
+            )
+            .unwrap()
+            .unwrap()
+            .state(),
+        AuditOperationState::Intent
+    );
+    fixture.checkpoint(&conn);
+    fixture.apply(&conn, apply(), 100).unwrap();
+    let discard = fixture.request(&conn, 2, 5, 0x61, 1);
+    let active = target_rows(&conn);
+    let owed = serde_json::to_vec(&fixture.ledger(&conn)).unwrap();
+    assert!(
+        fixture
+            .apply(
+                &conn,
+                AuditCommand::NetconfTarget(Box::new(TargetAuditCommandV1::Admit(
+                    discard.command().clone()
+                ))),
+                100,
+            )
+            .is_err(),
+        "terminal debt admitted a later target intent"
+    );
+    assert_eq!(serde_json::to_vec(&fixture.ledger(&conn)).unwrap(), owed);
+    assert!(fixture
+        .apply(
+            &conn,
+            AuditCommand::NetconfTarget(Box::new(TargetAuditCommandV1::Apply(
+                discard.command().clone()
+            ))),
+            100
+        )
+        .is_err());
+    assert_eq!(
+        target_rows(&conn),
+        active,
+        "terminal debt allowed a target effect"
+    );
+    fixture.settle(&conn, &activation);
+    fixture
+        .apply(
+            &conn,
+            AuditCommand::NetconfTarget(Box::new(TargetAuditCommandV1::Admit(
+                discard.command().clone(),
+            ))),
+            100,
+        )
+        .unwrap();
+    fixture.checkpoint(&conn);
+    fixture
+        .apply(
+            &conn,
+            AuditCommand::NetconfTarget(Box::new(TargetAuditCommandV1::Apply(
+                discard.command().clone(),
+            ))),
+            200,
+        )
+        .unwrap_err();
+    assert_eq!(target_rows(&conn), active);
+    assert_eq!(
+        fixture
+            .ledger(&conn)
+            .lookup(
+                &fixture.key,
+                discard.handle(),
+                discard.command().effect.caller
+            )
+            .unwrap()
+            .unwrap()
+            .state(),
+        AuditOperationState::Rejected
+    );
+    fixture.settle(&conn, &discard);
+    // Known activation remains truthful after expiry and subsequent rejection.
+    fixture.apply(&conn, apply(), 200).unwrap();
+    assert_eq!(target_rows(&conn), active);
+}
+
+#[tokio::test]
+async fn target_state_generations_locks_and_session_loss_fence_stale_effects() {
+    let fixture = Fixture::new().await;
+    let shared = fixture.backend.conn();
+    let conn = shared.lock().await;
+    fixture.active(&conn);
+    let stage = fixture.encrypted(fixture.request(&conn, 2, 4, 0x61, 1), 0x73);
+    let AuditOperationState::TargetV1(result) = fixture.submit(&conn, &stage) else {
+        panic!("stage refused");
+    };
+    assert!(
+        matches!(result.outcome(), NetconfAppliedOutcome::Candidate { generation } if generation.get() == 1)
+    );
+    fixture.settle(&conn, &stage);
+    let original_candidate = row(&conn, "config_netconf_targets", "target", 0);
+    let late_stage = fixture.encrypted(fixture.request(&conn, 3, 4, 0x61, 1), 0x74);
+    let acquire = fixture.request(&conn, 4, 2, 0x61, 1);
+    assert!(matches!(
+        fixture.submit(&conn, &acquire),
+        AuditOperationState::TargetV1(_)
+    ));
+    fixture.settle(&conn, &acquire);
+    let before = target_rows(&conn);
+    assert_eq!(
+        fixture.submit(&conn, &late_stage),
+        AuditOperationState::Rejected,
+        "stale lock observation applied"
+    );
+    assert_eq!(target_rows(&conn), before);
+    fixture.settle(&conn, &late_stage);
+    let foreign = fixture.request(&conn, 5, 5, 0x62, 1);
+    assert_eq!(
+        fixture.submit(&conn, &foreign),
+        AuditOperationState::Rejected
+    );
+    assert_eq!(target_rows(&conn), before);
+    fixture.settle(&conn, &foreign);
+    let startup = fixture.encrypted(fixture.request(&conn, 6, 7, 0x61, 2), 0x75);
+    assert!(
+        matches!(fixture.submit(&conn, &startup), AuditOperationState::TargetV1(result) if matches!(result.outcome(), NetconfAppliedOutcome::Startup { revision } if revision.get() == 1))
+    );
+    fixture.settle(&conn, &startup);
+    assert_eq!(
+        row(&conn, "config_netconf_targets", "target", 0),
+        original_candidate
+    );
+    let retained_startup = row(&conn, "config_netconf_targets", "target", 1);
+    let release = fixture.request(&conn, 7, 3, 0x61, 1);
+    assert!(matches!(
+        fixture.submit(&conn, &release),
+        AuditOperationState::TargetV1(_)
+    ));
+    fixture.settle(&conn, &release);
+    let retired = row(&conn, "config_netconf_targets", "target", 0);
+    assert_eq!(retired["generation"], 2);
+    assert_eq!(retired["present"], false);
+    assert_eq!(
+        row(&conn, "config_netconf_targets", "target", 1),
+        retained_startup
+    );
+    let late_unlocked = fixture.encrypted(fixture.request(&conn, 8, 7, 0x61, 2), 0x76);
+    let end = fixture.request(&conn, 9, 13, 0x61, 0);
+    assert!(matches!(
+        fixture.submit(&conn, &end),
+        AuditOperationState::TargetV1(_)
+    ));
+    fixture.settle(&conn, &end);
+    let before = target_rows(&conn);
+    assert_eq!(
+        fixture.submit(&conn, &late_unlocked),
+        AuditOperationState::Rejected,
+        "closed session retained an unlocked prepared effect"
+    );
+    assert_eq!(target_rows(&conn), before);
+    fixture.settle(&conn, &late_unlocked);
+    fixture
+        .apply(
+            &conn,
+            AuditCommand::NetconfTarget(Box::new(TargetAuditCommandV1::Apply(
+                stage.command().clone(),
+            ))),
+            200,
+        )
+        .unwrap();
+    assert_eq!(
+        target_rows(&conn),
+        before,
+        "known request replay repeated its effect"
+    );
+    assert_eq!(
+        row(&conn, "config_netconf_targets", "target", 1),
+        retained_startup
+    );
+    crate::consensus::audit_targets::validate_inactive_sync(
+        &conn,
+        &fixture.key,
+        fixture.identity,
+        &crate::consensus::sqlite::SqliteWorkCancellation::audit_test(),
+    )
+    .unwrap();
+}
+
+#[tokio::test]
+async fn target_state_pruned_anchor_rejects_authenticated_older_rows_and_snapshot_validation() {
+    let fixture = Fixture::new().await;
+    let shared = fixture.backend.conn();
+    let conn = shared.lock().await;
+    fixture.active(&conn);
+    let old = target_rows(&conn);
+    let discard = fixture.request(&conn, 2, 5, 0x61, 1);
+    assert!(matches!(
+        fixture.submit(&conn, &discard),
+        AuditOperationState::TargetV1(_)
+    ));
+    fixture.settle(&conn, &discard);
+    let current = target_rows(&conn);
+    let ledger = fixture.ledger(&conn);
+    let mut body = ledger
+        .continuity
+        .as_ref()
+        .unwrap()
+        .checkpoint
+        .as_ref()
+        .unwrap()
+        .body
+        .clone();
+    // This fixture is the signing authority, recording an export acknowledgement
+    // for the exact already-checkpointed prefix. It tests retained state/pruning,
+    // not a recipient-only export capability.
+    body.acknowledged_export = [0x77; 32];
+    let export = AuditCheckpoint::issue(&fixture.keys, body).unwrap();
+    fixture
+        .apply(&conn, AuditCommand::AcknowledgeExport(export.clone()), 200)
+        .unwrap();
+    fixture
+        .apply(
+            &conn,
+            AuditCommand::Prune {
+                through: ledger.sequence,
+                checkpoint: export,
+            },
+            200,
+        )
+        .unwrap();
+    assert!(fixture.ledger(&conn).entries.is_empty());
+    let validate = || {
+        crate::consensus::audit_targets::validate_inactive_sync(
+            &conn,
+            &fixture.key,
+            fixture.identity,
+            &crate::consensus::sqlite::SqliteWorkCancellation::audit_test(),
+        )
+    };
+    validate().unwrap();
+    restore_rows(&conn, &old);
+    assert!(
+        validate().is_err(),
+        "authenticated target rollback survived ledger prefix pruning"
+    );
+    restore_rows(&conn, &current);
+    validate().unwrap();
+}
+
+#[tokio::test]
+async fn target_state_result_must_match_the_retained_action_profile_and_successor() {
+    let fixture = Fixture::new().await;
+    let shared = fixture.backend.conn();
+    let conn = shared.lock().await;
+    fixture.active(&conn);
+    let discard = fixture.request(&conn, 2, 5, 0x61, 1);
+    fixture
+        .apply(
+            &conn,
+            AuditCommand::NetconfTarget(Box::new(TargetAuditCommandV1::Admit(
+                discard.command().clone(),
+            ))),
+            100,
+        )
+        .unwrap();
+    fixture.checkpoint(&conn);
+    let admitted = fixture.ledger(&conn);
+    let AuditOperationState::TargetV1(correct) = fixture.submit(&conn, &discard) else {
+        panic!("discard refused");
+    };
+    use crate::audit_authority::{CandidateGeneration, NetconfTargetResult, StartupRevision};
+    let wrong = [
+        NetconfTargetResult::new(
+            fixture.identity,
+            [0x7e; 16],
+            correct.state_digest(),
+            correct.outcome(),
+        )
+        .unwrap(),
+        NetconfTargetResult::new(
+            fixture.identity,
+            correct.profile_incarnation(),
+            correct.state_digest(),
+            NetconfAppliedOutcome::Startup {
+                revision: StartupRevision {
+                    authority: fixture.identity,
+                    value: 1,
+                },
+            },
+        )
+        .unwrap(),
+        NetconfTargetResult::new(
+            fixture.identity,
+            correct.profile_incarnation(),
+            correct.state_digest(),
+            NetconfAppliedOutcome::Candidate {
+                generation: CandidateGeneration {
+                    authority: fixture.identity,
+                    value: 2,
+                },
+            },
+        )
+        .unwrap(),
+    ];
+    for result in wrong {
+        let mut trial = admitted.clone();
+        let unchanged = serde_json::to_vec(&trial).unwrap();
+        assert!(
+            trial
+                .resolve(
+                    &fixture.key,
+                    discard.handle(),
+                    AuditOperationState::TargetV1(result)
+                )
+                .is_err(),
+            "mismatched retained target result accepted"
+        );
+        assert_eq!(
+            serde_json::to_vec(&trial).unwrap(),
+            unchanged,
+            "refused result changed the ledger"
+        );
+    }
+    let mut positive = admitted;
+    positive
+        .resolve(
+            &fixture.key,
+            discard.handle(),
+            AuditOperationState::TargetV1(correct),
+        )
+        .unwrap();
+    positive.seal_continuity(Some(&fixture.keys)).unwrap();
+    positive.validate(&fixture.key, fixture.identity).unwrap();
+    positive.validate_continuity(Some(&fixture.keys)).unwrap();
+}
+
+#[tokio::test]
+async fn target_state_reconstruction_rejects_authentic_but_substituted_result() {
+    use crate::audit_authority::ledger::{verify, EntryPayload, TargetStateAnchor};
+    const ENTRY_DOMAIN: &[u8] = b"openpacketcore/management-audit/replicated-entry/v1\0";
+    use crate::audit_authority::{NetconfTargetResult, StartupRevision};
+    let fixture = Fixture::new().await;
+    let shared = fixture.backend.conn();
+    let conn = shared.lock().await;
+    fixture.active(&conn);
+    let discard = fixture.request(&conn, 2, 5, 0x61, 1);
+    let AuditOperationState::TargetV1(correct) = fixture.submit(&conn, &discard) else {
+        panic!("discard refused");
+    };
+    let valid = fixture.ledger(&conn);
+    valid.validate(&fixture.key, fixture.identity).unwrap();
+    let wrong = NetconfTargetResult::new(
+        fixture.identity,
+        correct.profile_incarnation(),
+        correct.state_digest(),
+        NetconfAppliedOutcome::Startup {
+            revision: StartupRevision {
+                authority: fixture.identity,
+                value: 1,
+            },
+        },
+    )
+    .unwrap();
+    let mut substituted = valid.clone();
+    let op = substituted
+        .operations
+        .iter_mut()
+        .find(|op| op.handle == discard.command().handle)
+        .unwrap();
+    op.state = AuditOperationState::TargetV1(wrong);
+    substituted.target_anchor = Some(TargetStateAnchor {
+        sequence: op.last_sequence,
+        result: wrong,
+    });
+    for entry in &mut substituted.entries {
+        if let EntryPayload::Outcome { operation, state } = &mut entry.payload {
+            if *operation == discard.command().handle.mac {
+                *state = AuditOperationState::TargetV1(wrong);
+            }
+        }
+    }
+    // Model an authority-side outcome substitution, not a bad-MAC shortcut.
+    // Root ledger validation must bind the genuine stored result to its intent.
+    let mut previous = substituted.predecessor;
+    for entry in &mut substituted.entries {
+        entry.previous = previous;
+        entry.mac = authenticate(
+            &fixture.key,
+            ENTRY_DOMAIN,
+            &(
+                fixture.identity,
+                entry.sequence,
+                previous,
+                entry.key_epoch,
+                &entry.payload,
+            ),
+        )
+        .unwrap();
+        verify(
+            &fixture.key,
+            ENTRY_DOMAIN,
+            &(
+                fixture.identity,
+                entry.sequence,
+                previous,
+                entry.key_epoch,
+                &entry.payload,
+            ),
+            &entry.mac,
+        )
+        .unwrap();
+        previous = entry.mac;
+    }
+    substituted.terminal = previous;
+    assert!(
+        substituted
+            .validate(&fixture.key, fixture.identity)
+            .is_err(),
+        "authenticated substituted target result survived reconstruction"
+    );
+    // The actual stored operation and target rows were not touched.
+    assert_eq!(
+        serde_json::to_vec(&fixture.ledger(&conn)).unwrap(),
+        serde_json::to_vec(&valid).unwrap()
+    );
+}
+
+impl Fixture {
+    fn running_target(
+        &self,
+        conn: &Connection,
+        request: u8,
+        action: u8,
+        source_slot: u8,
+        source_seed: u8,
+    ) -> PreparedTargetMutation {
+        use crate::consensus::audit_mutation::{
+            TargetEncryptedBlobV1, TargetLockExpectationV1, TargetPayloadV1, TargetSourceV1,
+        };
+        use opc_crypto::{
+            decrypt_envelope_with_handle, encrypt_attested_envelope_with_handle_and_nonce,
+        };
+        use opc_key::{ConfigAad, EnvelopeAad, KeyHandle, KeyId, KeyPurpose};
+        use sha2::{Digest, Sha256};
+        let source = row(conn, "config_netconf_targets", "target", source_slot);
+        let blob: TargetEncryptedBlobV1 =
+            serde_json::from_value(source["encrypted_envelope"].clone()).unwrap();
+        let source_key = KeyHandle::new(
+            KeyId::new("fixture-target-key").unwrap(),
+            KeyPurpose::Config,
+            opc_types::TenantId::from_static("fixture-tenant"),
+            zeroize::Zeroizing::new([source_seed; 32]),
+        );
+        let envelope = opc_crypto::CryptoEnvelopeRef::decode(&blob.encrypted_blob).unwrap();
+        let (source_aad, _) = opc_key::decode_bound_aad(envelope.aad).unwrap();
+        let plaintext =
+            decrypt_envelope_with_handle(&source_key, &source_aad, &blob.encrypted_blob).unwrap();
+        assert_eq!(
+            <[u8; 32]>::from(Sha256::digest(&plaintext)),
+            blob.plaintext_digest
+        );
+        let base: u64 = conn
+            .query_row(
+                "SELECT COALESCE(MAX(version),0) FROM config_history",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        let parent = if base == 0 {
+            None
+        } else {
+            let bytes: Vec<u8> = conn
+                .query_row(
+                    "SELECT tx_id FROM config_history ORDER BY version DESC LIMIT 1",
+                    [],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            Some(opc_types::TxId::from_uuid(
+                uuid::Uuid::from_slice(&bytes).unwrap(),
+            ))
+        };
+        let tx_id = opc_types::TxId::new();
+        let committed_at = "2026-01-01T00:00:00Z"
+            .parse::<opc_types::Timestamp>()
+            .unwrap();
+        let principal = r#"{"tenant":"fixture-tenant","subject":"fixture-principal"}"#.to_owned();
+        let aad = EnvelopeAad::config(
+            opc_types::TenantId::from_static("fixture-tenant"),
+            base + 1,
+            ConfigAad::new(
+                tx_id,
+                parent,
+                committed_at,
+                &principal,
+                blob.schema,
+                "running",
+            )
+            .unwrap(),
+        );
+        let destination_key = KeyHandle::new(
+            KeyId::new("fixture-running-key").unwrap(),
+            KeyPurpose::Config,
+            opc_types::TenantId::from_static("fixture-tenant"),
+            zeroize::Zeroizing::new([0x7b; 32]),
+        );
+        let destination = encrypt_attested_envelope_with_handle_and_nonce(
+            &destination_key,
+            &aad,
+            &plaintext,
+            [request; 12],
+        )
+        .unwrap();
+        let commit = crate::consensus::PreparedConfigCommit::prepare(
+            crate::CommitRecord {
+                tx_id,
+                parent_tx_id: parent,
+                version: opc_types::ConfigVersion::new(base + 1),
+                committed_at,
+                principal,
+                source: crate::CommitSource::Netconf,
+                schema_digest: blob.schema,
+                plaintext_digest: blob.plaintext_digest.to_vec(),
+                encrypted_blob: destination.encoded().to_vec(),
+                rollback_point: false,
+                confirmed_deadline: None,
+            },
+            Vec::new(),
+            &self.key,
+        )
+        .unwrap();
+        let generation = source["generation"].as_u64().unwrap();
+        let ciphertext_digest = Sha256::digest(&blob.encrypted_blob).into();
+        let source = if source_slot == 0 {
+            TargetSourceV1::Candidate {
+                generation: crate::audit_authority::CandidateGeneration {
+                    authority: self.identity,
+                    value: generation,
+                },
+                schema: blob.schema,
+                ciphertext_digest,
+            }
+        } else {
+            TargetSourceV1::Startup {
+                revision: crate::audit_authority::StartupRevision {
+                    authority: self.identity,
+                    value: generation,
+                },
+                schema: blob.schema,
+                ciphertext_digest,
+            }
+        };
+        let mut prepared = self.request(conn, request, 6, 0x61, 0);
+        prepared.command_mut().effect.action = action.try_into().unwrap();
+        prepared.command_mut().effect.destination = TargetExpectationV1::Running { version: base };
+        prepared.command_mut().effect.source = Some(source);
+        prepared.command_mut().effect.encrypted_payload = Some(TargetPayloadV1::Running {
+            commit: Box::new(commit),
+            confirmation_ownership: None,
+        });
+        let lifecycle = row(conn, "config_netconf_lifecycle", "singleton", 1);
+        prepared.command_mut().effect.lock = Some(TargetLockExpectationV1 {
+            datastore: 0,
+            incarnation: lifecycle["locks"][0]["incarnation"].as_u64().unwrap(),
+            session: serde_json::from_value(lifecycle["locks"][0]["session"].clone()).unwrap(),
+            requester: [0x61; 16],
+        });
+        // Reissue only within this synthetic SDK fixture, binding the exact observed base.
+        let mut prepared = self.prepare(
+            prepared.command().effect.clone(),
+            prepared.command().handle.body.event.clone(),
+        );
+        prepared.command_mut().handle.body.binding.base_version = base;
+        prepared.command_mut().handle =
+            AuditOperationHandle::issue(prepared.command().handle.body.clone(), &self.key).unwrap();
+        prepared.verify_effect(&self.key).unwrap();
+        prepared
+    }
+
+    fn assert_running_plaintext(&self, conn: &Connection, expected: &PreparedTargetMutation) {
+        use crate::consensus::audit_mutation::TargetPayloadV1;
+        let Some(TargetPayloadV1::Running { commit, .. }) =
+            &expected.command().effect.encrypted_payload
+        else {
+            panic!("running fixture");
+        };
+        let (version, bytes): (u64, Vec<u8>) = conn
+            .query_row(
+                "SELECT version,encrypted_blob FROM config_history ORDER BY version DESC LIMIT 1",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(version, commit.record.version.get());
+        assert_eq!(bytes, commit.record.encrypted_blob);
+        let key = opc_key::KeyHandle::new(
+            opc_key::KeyId::new("fixture-running-key").unwrap(),
+            opc_key::KeyPurpose::Config,
+            opc_types::TenantId::from_static("fixture-tenant"),
+            zeroize::Zeroizing::new([0x7b; 32]),
+        );
+        let envelope = opc_crypto::CryptoEnvelopeRef::decode(&bytes).unwrap();
+        let (aad, _) = opc_key::decode_bound_aad(envelope.aad).unwrap();
+        assert_eq!(
+            *opc_crypto::decrypt_envelope_with_handle(&key, &aad, &bytes).unwrap(),
+            vec![0x72; 32]
+        );
+        crate::consensus::history::validate_record_chain_sync(
+            conn,
+            &self.key,
+            &crate::consensus::sqlite::SqliteWorkCancellation::audit_test(),
+        )
+        .unwrap();
+    }
+}
+
+#[tokio::test]
+async fn target_running_promotion_atomically_retires_the_exact_candidate() {
+    let fixture = Fixture::new().await;
+    let shared = fixture.backend.conn();
+    let conn = shared.lock().await;
+    fixture.active(&conn);
+    let stage = fixture.encrypted(fixture.request(&conn, 81, 4, 0x61, 1), 0x31);
+    assert!(matches!(
+        fixture.submit(&conn, &stage),
+        AuditOperationState::TargetV1(_)
+    ));
+    fixture.settle(&conn, &stage);
+    let prepared = fixture.running_target(&conn, 82, 6, 0, 0x31);
+    let result = fixture.submit(&conn, &prepared);
+    assert!(
+        matches!(result, AuditOperationState::TargetV1(result)
+        if matches!(result.outcome(), NetconfAppliedOutcome::Promoted { running_version: 1, retired_generation } if retired_generation.get() == 2)),
+        "checkpointed candidate promotion did not atomically apply"
+    );
+    fixture.assert_running_plaintext(&conn, &prepared);
+    let candidate = row(&conn, "config_netconf_targets", "target", 0);
+    assert_eq!(candidate["generation"], 2);
+    assert_eq!(candidate["present"], false);
+    let before = target_rows(&conn);
+    fixture
+        .apply(
+            &conn,
+            AuditCommand::NetconfTarget(Box::new(TargetAuditCommandV1::Apply(
+                prepared.command().clone(),
+            ))),
+            200,
+        )
+        .unwrap();
+    assert_eq!(
+        target_rows(&conn),
+        before,
+        "known promotion must not retire again after expiry"
+    );
+    assert_eq!(
+        fixture
+            .ledger(&conn)
+            .lookup(
+                &fixture.key,
+                prepared.handle(),
+                prepared.command().effect.caller
+            )
+            .unwrap()
+            .unwrap()
+            .state(),
+        result
+    );
+    fixture.settle(&conn, &prepared);
+}
+
+#[tokio::test]
+async fn target_running_copy_preserves_candidate_and_startup_sources() {
+    for source_slot in [0, 1] {
+        let fixture = Fixture::new().await;
+        let shared = fixture.backend.conn();
+        let conn = shared.lock().await;
+        fixture.active(&conn);
+        let stage = fixture.encrypted(
+            fixture.request(
+                &conn,
+                83,
+                if source_slot == 0 { 4 } else { 7 },
+                0x61,
+                source_slot + 1,
+            ),
+            0x32,
+        );
+        assert!(matches!(
+            fixture.submit(&conn, &stage),
+            AuditOperationState::TargetV1(_)
+        ));
+        fixture.settle(&conn, &stage);
+        let source_before = row(&conn, "config_netconf_targets", "target", source_slot);
+        let prepared = fixture.running_target(&conn, 84, 15, source_slot, 0x32);
+        assert!(
+            matches!(fixture.submit(&conn, &prepared), AuditOperationState::TargetV1(result)
+            if matches!(result.outcome(), NetconfAppliedOutcome::CopiedRunning { running_version: 1 })),
+            "checkpointed target copy did not apply to running"
+        );
+        fixture.assert_running_plaintext(&conn, &prepared);
+        assert_eq!(
+            row(&conn, "config_netconf_targets", "target", source_slot),
+            source_before,
+            "copy must preserve its source generation and ciphertext"
+        );
+        fixture.settle(&conn, &prepared);
+    }
+}
+
+#[tokio::test]
+async fn target_running_copy_rejects_replaced_source_without_any_effect() {
+    let fixture = Fixture::new().await;
+    let shared = fixture.backend.conn();
+    let conn = shared.lock().await;
+    fixture.active(&conn);
+    let stage = fixture.encrypted(fixture.request(&conn, 85, 4, 0x61, 1), 0x33);
+    assert!(matches!(
+        fixture.submit(&conn, &stage),
+        AuditOperationState::TargetV1(_)
+    ));
+    fixture.settle(&conn, &stage);
+    let old_copy = fixture.running_target(&conn, 86, 15, 0, 0x33);
+    let replacement = fixture.encrypted(fixture.request(&conn, 87, 4, 0x61, 1), 0x34);
+    assert!(matches!(
+        fixture.submit(&conn, &replacement),
+        AuditOperationState::TargetV1(_)
+    ));
+    fixture.settle(&conn, &replacement);
+    let before = target_rows(&conn);
+    assert_eq!(
+        fixture.submit(&conn, &old_copy),
+        AuditOperationState::Rejected,
+        "copy accepted a substituted source generation and ciphertext"
+    );
+    assert_eq!(target_rows(&conn), before);
+    assert_eq!(
+        conn.query_row("SELECT COUNT(*) FROM config_history", [], |r| r
+            .get::<_, u64>(0))
+            .unwrap(),
+        0
+    );
+    let receipt = fixture
+        .ledger(&conn)
+        .lookup(
+            &fixture.key,
+            old_copy.handle(),
+            old_copy.command().effect.caller,
+        )
+        .unwrap()
+        .unwrap();
+    assert!(
+        !receipt.terminal_recorded(),
+        "retained rejection keeps its original terminal obligation"
+    );
+    fixture.settle(&conn, &old_copy);
+    let current_copy = fixture.running_target(&conn, 88, 15, 0, 0x34);
+    assert!(matches!(
+        fixture.submit(&conn, &current_copy),
+        AuditOperationState::TargetV1(_)
+    ));
+    fixture.assert_running_plaintext(&conn, &current_copy);
+    assert_eq!(
+        row(&conn, "config_netconf_targets", "target", 0)["generation"],
+        2
+    );
+}
+
+#[tokio::test]
+async fn target_running_promotion_rolls_back_running_and_retirement_on_storage_failure() {
+    let fixture = Fixture::new().await;
+    let shared = fixture.backend.conn();
+    let conn = shared.lock().await;
+    fixture.active(&conn);
+    let stage = fixture.encrypted(fixture.request(&conn, 89, 4, 0x61, 1), 0x35);
+    assert!(matches!(
+        fixture.submit(&conn, &stage),
+        AuditOperationState::TargetV1(_)
+    ));
+    fixture.settle(&conn, &stage);
+    let prepared = fixture.running_target(&conn, 90, 6, 0, 0x35);
+    fixture
+        .apply(
+            &conn,
+            AuditCommand::NetconfTarget(Box::new(TargetAuditCommandV1::Admit(
+                prepared.command().clone(),
+            ))),
+            100,
+        )
+        .unwrap();
+    fixture.checkpoint(&conn);
+    let before = target_rows(&conn);
+    let ledger_before = serde_json::to_vec(&fixture.ledger(&conn)).unwrap();
+    // Synthetic last-row I/O fault after running append and earlier target writes.
+    conn.execute_batch("CREATE TEMP TRIGGER fail_target_lifecycle BEFORE UPDATE ON config_netconf_lifecycle BEGIN SELECT RAISE(ABORT, 'synthetic target write failure'); END;").unwrap();
+    let tx = conn.unchecked_transaction().unwrap();
+    assert!(
+        apply_sync(
+            &tx,
+            &fixture.key,
+            fixture.identity,
+            &AuditCommand::NetconfTarget(Box::new(TargetAuditCommandV1::Apply(
+                prepared.command().clone()
+            ))),
+            100,
+            Some(&fixture.keys)
+        )
+        .is_err(),
+        "injected storage failure must abort the authority transaction"
+    );
+    drop(tx);
+    conn.execute_batch("DROP TRIGGER fail_target_lifecycle")
+        .unwrap();
+    assert_eq!(target_rows(&conn), before);
+    assert_eq!(
+        serde_json::to_vec(&fixture.ledger(&conn)).unwrap(),
+        ledger_before
+    );
+    assert_eq!(
+        conn.query_row("SELECT COUNT(*) FROM config_history", [], |r| r
+            .get::<_, u64>(0))
+            .unwrap(),
+        0
+    );
+    crate::consensus::history::validate_record_chain_sync(
+        &conn,
+        &fixture.key,
+        &crate::consensus::sqlite::SqliteWorkCancellation::audit_test(),
+    )
+    .unwrap();
+    fixture
+        .apply(
+            &conn,
+            AuditCommand::NetconfTarget(Box::new(TargetAuditCommandV1::Apply(
+                prepared.command().clone(),
+            ))),
+            100,
+        )
+        .unwrap();
+    fixture.assert_running_plaintext(&conn, &prepared);
+    assert_eq!(
+        row(&conn, "config_netconf_targets", "target", 0)["generation"],
+        2
+    );
+    fixture.settle(&conn, &prepared);
+}
+
+impl Fixture {
+    fn bind_current_base(
+        &self,
+        conn: &Connection,
+        mut prepared: PreparedTargetMutation,
+    ) -> PreparedTargetMutation {
+        let base: u64 = conn
+            .query_row(
+                "SELECT COALESCE(MAX(version),0) FROM config_history",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        prepared.command_mut().handle.body.binding.base_version = base;
+        prepared.command_mut().handle =
+            AuditOperationHandle::issue(prepared.command().handle.body.clone(), &self.key).unwrap();
+        prepared.verify_effect(&self.key).unwrap();
+        prepared
+    }
+
+    fn tentative_target(
+        &self,
+        conn: &Connection,
+        request: u8,
+        source_seed: u8,
+    ) -> PreparedTargetMutation {
+        use crate::consensus::audit_mutation::{TargetEncryptedBlobV1, TargetPayloadV1};
+        use opc_crypto::encrypt_attested_envelope_with_handle_and_nonce;
+        use opc_key::{ConfigAad, EnvelopeAad, KeyHandle, KeyId, KeyPurpose};
+        use sha2::{Digest, Sha256};
+        let mut prepared = self.running_target(conn, request, 6, 0, source_seed);
+        prepared.command_mut().effect.action = 9.try_into().unwrap();
+        let Some(TargetPayloadV1::Running { commit, .. }) =
+            &mut prepared.command_mut().effect.encrypted_payload
+        else {
+            panic!("running fixture");
+        };
+        let pending = crate::audit_authority::NetconfPendingConfirmation {
+            authority: self.identity,
+            value: [request; 16],
+        };
+        let deadline = commit.record.committed_at.add_seconds(60).unwrap();
+        commit.record.confirmed_deadline = Some(deadline);
+        let schema = commit.record.schema_digest;
+        let version = commit.record.version.get();
+        prepared.command_mut().effect.resolution = Some(TargetResolutionV1::InstallPending {
+            pending,
+            rollback_parent: commit.record.parent_tx_id.unwrap(),
+            rollback_version: prepared.command().handle.body.binding.base_version,
+            original_deadline: deadline.as_offset_datetime().unix_timestamp(),
+            owner_session: [0x61; 16],
+            persistent: true,
+        });
+        // The reviewed ownership domain uses the same bounded pre-encryption
+        // binding as target envelopes, with the fixed confirmation target tag.
+        // Spell it independently so this detector does not require a new API.
+        let effect = &prepared.command().effect;
+        let binding = serde_json::to_vec(&(
+            effect.format,
+            effect.authority,
+            effect.profile_incarnation,
+            effect.device_incarnation,
+            effect.caller,
+            effect.request,
+            effect.action,
+            &effect.destination,
+            &effect.source,
+            &effect.lock,
+            effect.expires_at,
+            &effect.resolution,
+            schema,
+            2_u8,
+        ))
+        .unwrap();
+        let mut hash = Sha256::new();
+        hash.update(b"openpacketcore/config-netconf/target-aad/v1\0");
+        hash.update(binding);
+        use std::fmt::Write;
+        let mut domain = "netconf-confirmation-v1-".to_owned();
+        for byte in hash.finalize() {
+            write!(&mut domain, "{byte:02x}").unwrap();
+        }
+        let aad = EnvelopeAad::config(
+            opc_types::TenantId::from_static("fixture-tenant"),
+            version,
+            ConfigAad::new(
+                opc_types::TxId::new(),
+                None,
+                "2026-01-01T00:00:00Z".parse().unwrap(),
+                "fixture-principal",
+                schema,
+                domain,
+            )
+            .unwrap(),
+        );
+        let key = KeyHandle::new(
+            KeyId::new("fixture-confirmation-key").unwrap(),
+            KeyPurpose::Config,
+            opc_types::TenantId::from_static("fixture-tenant"),
+            zeroize::Zeroizing::new([0x79; 32]),
+        );
+        let ownership = encrypt_attested_envelope_with_handle_and_nonce(
+            &key,
+            &aad,
+            b"synthetic-confirmation-owner",
+            [request; 12],
+        )
+        .unwrap();
+        let Some(TargetPayloadV1::Running {
+            confirmation_ownership,
+            ..
+        }) = &mut prepared.command_mut().effect.encrypted_payload
+        else {
+            panic!("running fixture");
+        };
+        *confirmation_ownership = Some(TargetEncryptedBlobV1 {
+            schema,
+            plaintext_digest: Sha256::digest(b"synthetic-confirmation-owner").into(),
+            encrypted_blob: ownership.encoded().to_vec(),
+        });
+        let prepared = self.prepare(
+            prepared.command().effect.clone(),
+            prepared.command().handle.body.event.clone(),
+        );
+        self.bind_current_base(conn, prepared)
+    }
+}
+
+#[tokio::test]
+async fn target_confirmation_tentative_retains_exact_rollback_deadline_and_encrypted_ownership() {
+    use crate::consensus::audit_mutation::TargetPayloadV1;
+    let fixture = Fixture::new().await;
+    let shared = fixture.backend.conn();
+    let conn = shared.lock().await;
+    fixture.active(&conn);
+    let initial = fixture.encrypted(fixture.request(&conn, 91, 4, 0x61, 1), 0x36);
+    assert!(matches!(
+        fixture.submit(&conn, &initial),
+        AuditOperationState::TargetV1(_)
+    ));
+    fixture.settle(&conn, &initial);
+    let running = fixture.running_target(&conn, 92, 6, 0, 0x36);
+    assert!(matches!(
+        fixture.submit(&conn, &running),
+        AuditOperationState::TargetV1(_)
+    ));
+    fixture.settle(&conn, &running);
+    let staged = fixture.encrypted(fixture.request(&conn, 93, 4, 0x61, 1), 0x37);
+    let staged = fixture.bind_current_base(&conn, staged);
+    assert!(matches!(
+        fixture.submit(&conn, &staged),
+        AuditOperationState::TargetV1(_)
+    ));
+    fixture.settle(&conn, &staged);
+    let prepared = fixture.tentative_target(&conn, 94, 0x37);
+    let Some(TargetResolutionV1::InstallPending {
+        pending,
+        rollback_parent,
+        rollback_version,
+        original_deadline,
+        owner_session,
+        persistent,
+    }) = prepared.command().effect.resolution
+    else {
+        panic!("pending fixture");
+    };
+    let Some(TargetPayloadV1::Running {
+        commit,
+        confirmation_ownership: Some(ownership),
+    }) = &prepared.command().effect.encrypted_payload
+    else {
+        panic!("ownership fixture");
+    };
+    let result = fixture.submit(&conn, &prepared);
+    assert!(
+        matches!(result, AuditOperationState::TargetV1(result)
+        if matches!(result.outcome(), NetconfAppliedOutcome::Tentative { running_version: 2, retired_generation, pending: observed }
+            if retired_generation.get() == 4 && observed == pending)),
+        "checkpointed tentative promotion did not retain its ownership atomically"
+    );
+    fixture.assert_running_plaintext(&conn, &prepared);
+    let candidate = row(&conn, "config_netconf_targets", "target", 0);
+    assert_eq!(candidate["generation"], 4);
+    assert_eq!(candidate["present"], false);
+    let lifecycle = row(&conn, "config_netconf_lifecycle", "singleton", 1);
+    let retained = &lifecycle["pending_confirmation"];
+    assert_eq!(retained["pending"], serde_json::to_value(pending).unwrap());
+    assert_eq!(
+        retained["tx_id"],
+        serde_json::to_value(commit.record.tx_id).unwrap()
+    );
+    assert_eq!(retained["running_version"], 2);
+    assert_eq!(
+        retained["owner_session"],
+        serde_json::to_value(owner_session).unwrap()
+    );
+    assert_eq!(retained["persistent"], persistent);
+    assert_eq!(
+        lifecycle["rollback_parent"]["tx_id"],
+        serde_json::to_value(rollback_parent).unwrap()
+    );
+    assert_eq!(lifecycle["rollback_parent"]["version"], rollback_version);
+    assert_eq!(lifecycle["original_deadline"], original_deadline);
+    assert_eq!(
+        lifecycle["encrypted_confirmation_ownership"],
+        serde_json::to_value(ownership).unwrap()
+    );
+    let before = target_rows(&conn);
+    fixture
+        .apply(
+            &conn,
+            AuditCommand::NetconfTarget(Box::new(TargetAuditCommandV1::Apply(
+                prepared.command().clone(),
+            ))),
+            200,
+        )
+        .unwrap();
+    assert_eq!(
+        target_rows(&conn),
+        before,
+        "known replay cannot extend the pending deadline"
+    );
+    fixture.settle(&conn, &prepared);
+}
+
+impl Fixture {
+    fn rebind_at(
+        &self,
+        conn: &Connection,
+        mut prepared: PreparedTargetMutation,
+        now: i64,
+    ) -> PreparedTargetMutation {
+        prepared.command_mut().effect.expires_at = now + 60;
+        prepared.command_mut().handle.body.expires_at = now + 60;
+        prepared.command_mut().handle.body.issued_at = now;
+        prepared.command_mut().handle.body.mutation = Some(
+            authenticate(
+                &self.key,
+                b"openpacketcore/management-audit/netconf-target/v1\0",
+                &prepared.command().effect,
+            )
+            .unwrap(),
+        );
+        self.bind_current_base(conn, prepared)
+    }
+
+    fn submit_at(
+        &self,
+        conn: &Connection,
+        prepared: &PreparedTargetMutation,
+        now: i64,
+    ) -> AuditOperationState {
+        self.apply(
+            conn,
+            AuditCommand::NetconfTarget(Box::new(TargetAuditCommandV1::Admit(
+                prepared.command().clone(),
+            ))),
+            now,
+        )
+        .unwrap();
+        self.checkpoint(conn);
+        let _ = self.apply(
+            conn,
+            AuditCommand::NetconfTarget(Box::new(TargetAuditCommandV1::Apply(
+                prepared.command().clone(),
+            ))),
+            now,
+        );
+        self.ledger(conn)
+            .lookup(
+                &self.key,
+                prepared.handle(),
+                prepared.command().effect.caller,
+            )
+            .unwrap()
+            .unwrap()
+            .state()
+    }
+
+    fn pending_fixture(&self, conn: &Connection, persistent: bool) -> PreparedTargetMutation {
+        use crate::consensus::audit_mutation::TargetPayloadV1;
+        use opc_crypto::encrypt_attested_envelope_with_handle_and_nonce;
+        use opc_key::{ConfigAad, EnvelopeAad, KeyHandle, KeyId, KeyPurpose};
+        use sha2::{Digest, Sha256};
+        self.active(conn);
+        let initial = self.encrypted(self.request(conn, 101, 4, 0x61, 1), 0x36);
+        assert!(matches!(
+            self.submit(conn, &initial),
+            AuditOperationState::TargetV1(_)
+        ));
+        self.settle(conn, &initial);
+        let first = self.running_target(conn, 102, 6, 0, 0x36);
+        assert!(matches!(
+            self.submit(conn, &first),
+            AuditOperationState::TargetV1(_)
+        ));
+        self.settle(conn, &first);
+        let mut staged = self.encrypted(self.request(conn, 103, 4, 0x61, 1), 0x37);
+        let Some(TargetPayloadV1::Target(blob)) =
+            &mut staged.command_mut().effect.encrypted_payload
+        else {
+            panic!("staged fixture");
+        };
+        let envelope = opc_crypto::CryptoEnvelopeRef::decode(&blob.encrypted_blob).unwrap();
+        let (aad, _) = opc_key::decode_bound_aad(envelope.aad).unwrap();
+        let key = KeyHandle::new(
+            KeyId::new("fixture-target-key").unwrap(),
+            KeyPurpose::Config,
+            opc_types::TenantId::from_static("fixture-tenant"),
+            zeroize::Zeroizing::new([0x37; 32]),
+        );
+        blob.encrypted_blob =
+            encrypt_attested_envelope_with_handle_and_nonce(&key, &aad, &[0x73; 32], [0x38; 12])
+                .unwrap()
+                .encoded()
+                .to_vec();
+        blob.plaintext_digest = Sha256::digest([0x73; 32]).into();
+        let staged = self.rebind_at(conn, staged, 100);
+        assert!(matches!(
+            self.submit(conn, &staged),
+            AuditOperationState::TargetV1(_)
+        ));
+        self.settle(conn, &staged);
+        let mut tentative = self.tentative_target(conn, 104, 0x37);
+        let Some(TargetResolutionV1::InstallPending {
+            persistent: supplied,
+            ..
+        }) = &mut tentative.command_mut().effect.resolution
+        else {
+            panic!("pending fixture");
+        };
+        *supplied = persistent;
+        let Some(TargetPayloadV1::Running { commit, .. }) =
+            &tentative.command().effect.encrypted_payload
+        else {
+            panic!("running fixture");
+        };
+        let schema = commit.record.schema_digest;
+        let aad = EnvelopeAad::config(
+            opc_types::TenantId::from_static("fixture-tenant"),
+            commit.record.version.get(),
+            ConfigAad::new(
+                opc_types::TxId::new(),
+                None,
+                commit.record.committed_at,
+                "fixture-principal",
+                schema,
+                tentative
+                    .command()
+                    .effect
+                    .encryption_store_kind(schema, 2)
+                    .unwrap(),
+            )
+            .unwrap(),
+        );
+        let key = KeyHandle::new(
+            KeyId::new("fixture-confirmation-key").unwrap(),
+            KeyPurpose::Config,
+            opc_types::TenantId::from_static("fixture-tenant"),
+            zeroize::Zeroizing::new([0x79; 32]),
+        );
+        let Some(TargetPayloadV1::Running {
+            confirmation_ownership: Some(blob),
+            ..
+        }) = &mut tentative.command_mut().effect.encrypted_payload
+        else {
+            panic!("ownership fixture");
+        };
+        blob.encrypted_blob = encrypt_attested_envelope_with_handle_and_nonce(
+            &key,
+            &aad,
+            b"synthetic-confirmation-owner",
+            [105; 12],
+        )
+        .unwrap()
+        .encoded()
+        .to_vec();
+        self.rebind_at(conn, tentative, 100)
+    }
+
+    fn resolve_fixture(
+        &self,
+        conn: &Connection,
+        request: u8,
+        action: u8,
+        internal: bool,
+        now: i64,
+    ) -> PreparedTargetMutation {
+        use crate::consensus::audit_mutation::{
+            TargetLockExpectationV1, TargetPayloadV1, TargetSourceV1,
+        };
+        use opc_crypto::{
+            decrypt_envelope_with_handle, encrypt_attested_envelope_with_handle_and_nonce,
+        };
+        use opc_key::{ConfigAad, EnvelopeAad, KeyHandle, KeyId, KeyPurpose};
+        let lifecycle = row(conn, "config_netconf_lifecycle", "singleton", 1);
+        let pending = &lifecycle["pending_confirmation"];
+        let token = serde_json::from_value(pending["pending"].clone()).unwrap();
+        let deadline = lifecycle["original_deadline"].as_i64().unwrap();
+        let mut prepared = self.request(conn, request, 10, 0x61, 0);
+        prepared.command_mut().effect.action = action.try_into().unwrap();
+        prepared.command_mut().effect.lock = Some(TargetLockExpectationV1 {
+            datastore: 0,
+            incarnation: lifecycle["locks"][0]["incarnation"].as_u64().unwrap(),
+            session: serde_json::from_value(lifecycle["locks"][0]["session"].clone()).unwrap(),
+            requester: [0x61; 16],
+        });
+        prepared.command_mut().effect.resolution = if action == 14 {
+            Some(TargetResolutionV1::RebootRecovery {
+                previous_device: serde_json::from_value(pending["device_incarnation"].clone())
+                    .unwrap(),
+                pending: Some(token),
+                original_deadline: Some(deadline),
+            })
+        } else {
+            Some(TargetResolutionV1::ResolvePending {
+                pending: token,
+                original_deadline: deadline,
+            })
+        };
+        if internal {
+            prepared.command_mut().handle.body.event.transport =
+                ManagementAuditTransportCode::Internal;
+        }
+        if action != 10 {
+            let parent = &lifecycle["rollback_parent"];
+            let parent_tx: opc_types::TxId =
+                serde_json::from_value(parent["tx_id"].clone()).unwrap();
+            let encrypted: Vec<u8> = conn
+                .query_row(
+                    "SELECT encrypted_blob FROM config_history WHERE tx_id=?1",
+                    [parent_tx.as_uuid().as_bytes().as_slice()],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            let key = KeyHandle::new(
+                KeyId::new("fixture-running-key").unwrap(),
+                KeyPurpose::Config,
+                opc_types::TenantId::from_static("fixture-tenant"),
+                zeroize::Zeroizing::new([0x7b; 32]),
+            );
+            let envelope = opc_crypto::CryptoEnvelopeRef::decode(&encrypted).unwrap();
+            let (aad, _) = opc_key::decode_bound_aad(envelope.aad).unwrap();
+            let plaintext = decrypt_envelope_with_handle(&key, &aad, &encrypted).unwrap();
+            assert_eq!(
+                plaintext.as_slice(),
+                &[0x72; 32],
+                "rollback source must be original, not tentative plaintext"
+            );
+            let pending_tx: opc_types::TxId =
+                serde_json::from_value(pending["tx_id"].clone()).unwrap();
+            let version = pending["running_version"].as_u64().unwrap();
+            let tx_id = opc_types::TxId::new();
+            let committed_at = opc_types::Timestamp::from_offset_datetime(
+                time::OffsetDateTime::from_unix_timestamp(now).unwrap(),
+            );
+            let schema = serde_json::from_value(parent["schema"].clone()).unwrap();
+            let principal =
+                r#"{"tenant":"fixture-tenant","subject":"fixture-principal"}"#.to_owned();
+            let aad = EnvelopeAad::config(
+                opc_types::TenantId::from_static("fixture-tenant"),
+                version + 1,
+                ConfigAad::new(
+                    tx_id,
+                    Some(pending_tx),
+                    committed_at,
+                    &principal,
+                    schema,
+                    "running",
+                )
+                .unwrap(),
+            );
+            let encrypted = encrypt_attested_envelope_with_handle_and_nonce(
+                &key,
+                &aad,
+                &plaintext,
+                [request; 12],
+            )
+            .unwrap();
+            let commit = crate::consensus::PreparedConfigCommit::prepare(
+                crate::CommitRecord {
+                    tx_id,
+                    parent_tx_id: Some(pending_tx),
+                    version: opc_types::ConfigVersion::new(version + 1),
+                    committed_at,
+                    principal,
+                    source: crate::CommitSource::CommitConfirmedRestore,
+                    schema_digest: schema,
+                    plaintext_digest: serde_json::from_value::<Vec<u8>>(
+                        parent["plaintext_digest"].clone(),
+                    )
+                    .unwrap(),
+                    encrypted_blob: encrypted.encoded().to_vec(),
+                    rollback_point: false,
+                    confirmed_deadline: None,
+                },
+                Vec::new(),
+                &self.key,
+            )
+            .unwrap();
+            prepared.command_mut().effect.destination = TargetExpectationV1::Running { version };
+            prepared.command_mut().effect.source = Some(TargetSourceV1::Running {
+                version: parent["version"].as_u64().unwrap(),
+                schema,
+                ciphertext_digest: serde_json::from_value(parent["ciphertext_digest"].clone())
+                    .unwrap(),
+            });
+            prepared.command_mut().effect.encrypted_payload = Some(TargetPayloadV1::Running {
+                commit: Box::new(commit),
+                confirmation_ownership: None,
+            });
+        }
+        self.rebind_at(conn, prepared, now)
+    }
+
+    fn assert_no_pending(&self, conn: &Connection) {
+        let lifecycle = row(conn, "config_netconf_lifecycle", "singleton", 1);
+        for field in [
+            "pending_confirmation",
+            "rollback_parent",
+            "original_deadline",
+            "encrypted_confirmation_ownership",
+        ] {
+            assert!(
+                lifecycle[field].is_null(),
+                "pending field retained after resolution"
+            );
+        }
+        assert_eq!(lifecycle["cleanup"], serde_json::json!([null, null, null]));
+        crate::consensus::history::validate_record_chain_sync(
+            conn,
+            &self.key,
+            &crate::consensus::sqlite::SqliteWorkCancellation::audit_test(),
+        )
+        .unwrap();
+        crate::consensus::audit_targets::validate_inactive_sync(
+            conn,
+            &self.key,
+            self.identity,
+            &crate::consensus::sqlite::SqliteWorkCancellation::audit_test(),
+        )
+        .unwrap();
+    }
+}
+
+#[tokio::test]
+async fn target_confirmation_rejects_substituted_ownership_aad_before_any_effect() {
+    let fixture = Fixture::new().await;
+    let shared = fixture.backend.conn();
+    let conn = shared.lock().await;
+    let original = fixture.pending_fixture(&conn, false);
+    let mut altered = original.clone();
+    let Some(TargetResolutionV1::InstallPending { persistent, .. }) =
+        &mut altered.command_mut().effect.resolution
+    else {
+        panic!("fixture");
+    };
+    *persistent = true; // Valid AEAD still binds the nonpersistent ownership.
+    let altered = fixture.rebind_at(&conn, altered, 100);
+    let before = target_rows(&conn);
+    assert_eq!(
+        fixture.submit(&conn, &altered),
+        AuditOperationState::Rejected,
+        "ownership from another pending binding was accepted"
+    );
+    assert_eq!(target_rows(&conn), before);
+    assert_eq!(
+        conn.query_row("SELECT MAX(version) FROM config_history", [], |r| r
+            .get::<_, u64>(0))
+            .unwrap(),
+        1
+    );
+    fixture.settle(&conn, &altered);
+}
+
+#[tokio::test]
+async fn target_confirmation_exact_confirm_rejects_wrong_pending_deadline_and_session() {
+    let fixture = Fixture::new().await;
+    let shared = fixture.backend.conn();
+    let conn = shared.lock().await;
+    let tentative = fixture.pending_fixture(&conn, false);
+    assert!(matches!(
+        fixture.submit(&conn, &tentative),
+        AuditOperationState::TargetV1(_)
+    ));
+    fixture.settle(&conn, &tentative);
+    for (id, variant) in [(110, 0), (111, 1), (112, 2)] {
+        let mut wrong = fixture.resolve_fixture(&conn, id, 10, false, 100);
+        match variant {
+            0 => {
+                let Some(TargetResolutionV1::ResolvePending { pending, .. }) =
+                    &mut wrong.command_mut().effect.resolution
+                else {
+                    panic!("fixture");
+                };
+                pending.value = [0xf1; 16];
+            }
+            1 => {
+                let Some(TargetResolutionV1::ResolvePending {
+                    original_deadline, ..
+                }) = &mut wrong.command_mut().effect.resolution
+                else {
+                    panic!("fixture");
+                };
+                *original_deadline += 1;
+            }
+            _ => wrong.command_mut().effect.lock.as_mut().unwrap().requester = [0xf2; 16],
+        }
+        let wrong = fixture.rebind_at(&conn, wrong, 100);
+        let before = target_rows(&conn);
+        assert_eq!(
+            fixture.submit(&conn, &wrong),
+            AuditOperationState::Rejected,
+            "confirmation ignored its exact pending ownership"
+        );
+        assert_eq!(target_rows(&conn), before);
+        fixture.settle(&conn, &wrong);
+    }
+    let exact = fixture.resolve_fixture(&conn, 113, 10, false, 100);
+    assert!(
+        matches!(fixture.submit(&conn,&exact),AuditOperationState::TargetV1(r) if matches!(r.outcome(),NetconfAppliedOutcome::Confirmed{..}))
+    );
+    fixture.assert_no_pending(&conn);
+    let confirmed: Option<String> = conn
+        .query_row(
+            "SELECT confirmed_at FROM config_history ORDER BY version DESC LIMIT 1",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert!(confirmed.is_some());
+    let before = target_rows(&conn);
+    fixture
+        .apply(
+            &conn,
+            AuditCommand::NetconfTarget(Box::new(TargetAuditCommandV1::Apply(
+                exact.command().clone(),
+            ))),
+            200,
+        )
+        .unwrap();
+    assert_eq!(target_rows(&conn), before);
+    fixture.settle(&conn, &exact);
+}
+
+#[tokio::test]
+async fn target_confirmation_cancel_restores_the_original_encrypted_parent() {
+    let fixture = Fixture::new().await;
+    let shared = fixture.backend.conn();
+    let conn = shared.lock().await;
+    let tentative = fixture.pending_fixture(&conn, true);
+    assert!(matches!(
+        fixture.submit(&conn, &tentative),
+        AuditOperationState::TargetV1(_)
+    ));
+    fixture.settle(&conn, &tentative);
+    let exact = fixture.resolve_fixture(&conn, 114, 11, false, 100);
+    assert!(
+        matches!(fixture.submit(&conn,&exact),AuditOperationState::TargetV1(r) if matches!(r.outcome(),NetconfAppliedOutcome::RolledBack{running_version:3,..}))
+    );
+    fixture.assert_running_plaintext(&conn, &exact);
+    fixture.assert_no_pending(&conn);
+    fixture.settle(&conn, &exact);
+}
+
+#[tokio::test]
+async fn target_confirmation_expiry_preserves_original_deadline_and_rejects_early_or_late_confirmation(
+) {
+    let fixture = Fixture::new().await;
+    let shared = fixture.backend.conn();
+    let conn = shared.lock().await;
+    let tentative = fixture.pending_fixture(&conn, true);
+    assert!(matches!(
+        fixture.submit(&conn, &tentative),
+        AuditOperationState::TargetV1(_)
+    ));
+    fixture.settle(&conn, &tentative);
+    let deadline = row(&conn, "config_netconf_lifecycle", "singleton", 1)["original_deadline"]
+        .as_i64()
+        .unwrap();
+    for (id, action, internal, now) in [(115, 12, true, deadline - 1), (116, 10, false, deadline)] {
+        let wrong = fixture.resolve_fixture(&conn, id, action, internal, now);
+        let before = target_rows(&conn);
+        assert_eq!(
+            fixture.submit_at(&conn, &wrong, now),
+            AuditOperationState::Rejected,
+            "original deadline did not fence resolution"
+        );
+        assert_eq!(target_rows(&conn), before);
+        fixture.settle(&conn, &wrong);
+    }
+    let exact = fixture.resolve_fixture(&conn, 117, 12, true, deadline);
+    assert!(
+        matches!(fixture.submit_at(&conn,&exact,deadline),AuditOperationState::TargetV1(r) if matches!(r.outcome(),NetconfAppliedOutcome::RolledBack{running_version:3,..}))
+    );
+    fixture.assert_running_plaintext(&conn, &exact);
+    fixture.assert_no_pending(&conn);
+    fixture.settle(&conn, &exact);
+}
+
+#[tokio::test]
+async fn target_confirmation_session_loss_distinguishes_persistent_ownership() {
+    for persistent in [false, true] {
+        let fixture = Fixture::new().await;
+        let shared = fixture.backend.conn();
+        let conn = shared.lock().await;
+        let tentative = fixture.pending_fixture(&conn, persistent);
+        assert!(matches!(
+            fixture.submit(&conn, &tentative),
+            AuditOperationState::TargetV1(_)
+        ));
+        fixture.settle(&conn, &tentative);
+        let end = fixture.request(&conn, 118, 13, 0x61, 0);
+        let end = fixture.rebind_at(&conn, end, 100);
+        assert!(matches!(
+            fixture.submit(&conn, &end),
+            AuditOperationState::TargetV1(_)
+        ));
+        fixture.settle(&conn, &end);
+        let lifecycle = row(&conn, "config_netconf_lifecycle", "singleton", 1);
+        assert_eq!(lifecycle["cleanup"][0].is_null(), persistent);
+        let exact = fixture.resolve_fixture(
+            &conn,
+            119,
+            if persistent { 10 } else { 11 },
+            !persistent,
+            100,
+        );
+        assert!(matches!(
+            fixture.submit(&conn, &exact),
+            AuditOperationState::TargetV1(_)
+        ));
+        if !persistent {
+            fixture.assert_running_plaintext(&conn, &exact);
+        }
+        fixture.assert_no_pending(&conn);
+        fixture.settle(&conn, &exact);
+    }
+}
+
+#[tokio::test]
+async fn target_confirmation_reopen_preserves_pending_and_device_reboot_requires_exact_rollback() {
+    let fixture = Fixture::new().await;
+    let shared = fixture.backend.conn();
+    let conn = shared.lock().await;
+    let tentative = fixture.pending_fixture(&conn, true);
+    assert!(matches!(
+        fixture.submit(&conn, &tentative),
+        AuditOperationState::TargetV1(_)
+    ));
+    fixture.settle(&conn, &tentative);
+    let before = target_rows(&conn);
+    drop(conn);
+    let conn = Connection::open(fixture.directory.path().join("authority.sqlite")).unwrap();
+    crate::consensus::audit_targets::validate_inactive_sync(
+        &conn,
+        &fixture.key,
+        fixture.identity,
+        &crate::consensus::sqlite::SqliteWorkCancellation::audit_test(),
+    )
+    .unwrap();
+    assert_eq!(target_rows(&conn), before);
+    let begin = fixture.request(&conn, 120, 1, 0x61, 0);
+    let begin = fixture.rebind_at(&conn, begin, 100);
+    assert!(matches!(
+        fixture.submit(&conn, &begin),
+        AuditOperationState::TargetV1(_)
+    ));
+    fixture.settle(&conn, &begin);
+    assert!(!row(&conn, "config_netconf_lifecycle", "singleton", 1)["cleanup"][0].is_null());
+    let wrong = fixture.resolve_fixture(&conn, 121, 10, false, 100);
+    let before = target_rows(&conn);
+    assert_eq!(fixture.submit(&conn, &wrong), AuditOperationState::Rejected);
+    assert_eq!(target_rows(&conn), before);
+    fixture.settle(&conn, &wrong);
+    let exact = fixture.resolve_fixture(&conn, 122, 14, true, 100);
+    assert!(
+        matches!(fixture.submit(&conn,&exact),AuditOperationState::TargetV1(r) if matches!(r.outcome(),NetconfAppliedOutcome::RolledBack{running_version:3,..}))
+    );
+    fixture.assert_running_plaintext(&conn, &exact);
+    fixture.assert_no_pending(&conn);
+    fixture.settle(&conn, &exact);
+}
+impl Fixture {
+    fn fallback_copy(&self, conn: &Connection, request: u8) -> PreparedTargetMutation {
+        use crate::consensus::audit_mutation::{TargetPayloadV1, TargetSourceV1};
+        use opc_crypto::{
+            decrypt_envelope_with_handle, encrypt_attested_envelope_with_handle_and_nonce,
+        };
+        use opc_key::{ConfigAad, EnvelopeAad, KeyHandle, KeyId, KeyPurpose};
+        use sha2::{Digest, Sha256};
+        let candidate = row(conn, "config_netconf_targets", "target", 0);
+        assert_eq!(candidate["present"], false);
+        let (version, tx, encrypted): (u64, Vec<u8>, Vec<u8>) = conn.query_row(
+            "SELECT version,tx_id,encrypted_blob FROM config_history ORDER BY version DESC LIMIT 1",[],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?))).unwrap();
+        let key = KeyHandle::new(
+            KeyId::new("fixture-running-key").unwrap(),
+            KeyPurpose::Config,
+            opc_types::TenantId::from_static("fixture-tenant"),
+            zeroize::Zeroizing::new([0x7b; 32]),
+        );
+        let envelope = opc_crypto::CryptoEnvelopeRef::decode(&encrypted).unwrap();
+        let (source_aad, _) = opc_key::decode_bound_aad(envelope.aad).unwrap();
+        let plaintext = decrypt_envelope_with_handle(&key, &source_aad, &encrypted).unwrap();
+        let opc_key::EnvelopeMetadata::Config(metadata) = source_aad.metadata() else {
+            panic!("running source");
+        };
+        let schema = *metadata.schema_digest();
+        let parent = opc_types::TxId::from_uuid(uuid::Uuid::from_slice(&tx).unwrap());
+        let tx_id = opc_types::TxId::new();
+        let committed_at = "2026-01-01T00:00:00Z"
+            .parse::<opc_types::Timestamp>()
+            .unwrap();
+        let principal = r#"{"tenant":"fixture-tenant","subject":"fixture-principal"}"#.to_owned();
+        let aad = EnvelopeAad::config(
+            opc_types::TenantId::from_static("fixture-tenant"),
+            version + 1,
+            ConfigAad::new(
+                tx_id,
+                Some(parent),
+                committed_at,
+                &principal,
+                schema,
+                "running",
+            )
+            .unwrap(),
+        );
+        let destination =
+            encrypt_attested_envelope_with_handle_and_nonce(&key, &aad, &plaintext, [request; 12])
+                .unwrap();
+        let commit = crate::consensus::PreparedConfigCommit::prepare(
+            crate::CommitRecord {
+                tx_id,
+                parent_tx_id: Some(parent),
+                version: opc_types::ConfigVersion::new(version + 1),
+                committed_at,
+                principal,
+                source: crate::CommitSource::Netconf,
+                schema_digest: schema,
+                plaintext_digest: Sha256::digest(&plaintext).to_vec(),
+                encrypted_blob: destination.encoded().to_vec(),
+                rollback_point: false,
+                confirmed_deadline: None,
+            },
+            Vec::new(),
+            &self.key,
+        )
+        .unwrap();
+        let mut prepared = self.request(conn, request, 6, 0x61, 0);
+        prepared.command_mut().effect.action = 15.try_into().unwrap();
+        prepared.command_mut().effect.destination = TargetExpectationV1::Running { version };
+        prepared.command_mut().effect.source = Some(TargetSourceV1::CandidateFallback {
+            generation: crate::audit_authority::CandidateGeneration {
+                authority: self.identity,
+                value: candidate["generation"].as_u64().unwrap(),
+            },
+            running_version: version,
+            schema,
+            ciphertext_digest: Sha256::digest(encrypted).into(),
+        });
+        prepared.command_mut().effect.encrypted_payload = Some(TargetPayloadV1::Running {
+            commit: Box::new(commit),
+            confirmation_ownership: None,
+        });
+        self.rebind_at(conn, prepared, 100)
+    }
+}
+
+#[tokio::test]
+async fn target_fallback_copy_binds_the_absent_candidate_and_exact_running_source() {
+    let fixture = Fixture::new().await;
+    let shared = fixture.backend.conn();
+    let conn = shared.lock().await;
+    fixture.active(&conn);
+    let staged = fixture.encrypted(fixture.request(&conn, 131, 4, 0x61, 1), 0x39);
+    assert!(matches!(
+        fixture.submit(&conn, &staged),
+        AuditOperationState::TargetV1(_)
+    ));
+    fixture.settle(&conn, &staged);
+    let running = fixture.running_target(&conn, 132, 6, 0, 0x39);
+    assert!(matches!(
+        fixture.submit(&conn, &running),
+        AuditOperationState::TargetV1(_)
+    ));
+    fixture.settle(&conn, &running);
+    let candidate = row(&conn, "config_netconf_targets", "target", 0);
+    let copy = fixture.fallback_copy(&conn, 133);
+    assert!(
+        matches!(fixture.submit(&conn,&copy),AuditOperationState::TargetV1(r) if matches!(r.outcome(),NetconfAppliedOutcome::CopiedRunning{running_version:2})),
+        "checkpointed absent-candidate fallback copy did not apply"
+    );
+    fixture.assert_running_plaintext(&conn, &copy);
+    assert_eq!(
+        row(&conn, "config_netconf_targets", "target", 0),
+        candidate,
+        "fallback copy modified its source tombstone"
+    );
+    fixture.settle(&conn, &copy);
+    let old = fixture.fallback_copy(&conn, 134);
+    let discard = fixture.request(&conn, 135, 5, 0x61, 1);
+    let discard = fixture.rebind_at(&conn, discard, 100);
+    assert!(matches!(
+        fixture.submit(&conn, &discard),
+        AuditOperationState::TargetV1(_)
+    ));
+    fixture.settle(&conn, &discard);
+    let before = target_rows(&conn);
+    assert_eq!(
+        fixture.submit(&conn, &old),
+        AuditOperationState::Rejected,
+        "fallback copy accepted a substituted absent generation"
+    );
+    assert_eq!(target_rows(&conn), before);
+    fixture.settle(&conn, &old);
+    let fresh = fixture.fallback_copy(&conn, 136);
+    assert!(
+        matches!(fixture.submit(&conn,&fresh),AuditOperationState::TargetV1(r) if matches!(r.outcome(),NetconfAppliedOutcome::CopiedRunning{running_version:3}))
+    );
+    fixture.assert_running_plaintext(&conn, &fresh);
+    fixture.settle(&conn, &fresh);
+}
+
+// The target contract must reject unknown nested input even when a reused
+// legacy codec historically ignored it. No authority key or MAC is changed.
+fn assert_closed_target_input(prepared: &PreparedTargetMutation, paths: &[&str]) {
+    let encoded = prepared.encode().unwrap();
+    assert_eq!(PreparedTargetMutation::decode(&encoded).unwrap(), *prepared);
+    for phase in [false, true] {
+        let command = AuditCommand::NetconfTarget(Box::new(if phase {
+            TargetAuditCommandV1::Apply(prepared.command().clone())
+        } else {
+            TargetAuditCommandV1::Admit(prepared.command().clone())
+        }));
+        let bytes = opc_consensus::encode_bounded(&command).unwrap();
+        let restored: AuditCommand = opc_consensus::decode_bounded(&bytes).unwrap();
+        assert_eq!(
+            serde_json::to_value(&restored).unwrap(),
+            serde_json::to_value(&command).unwrap()
+        );
+        assert_eq!(opc_consensus::encode_bounded(&restored).unwrap(), bytes);
+    }
+    for path in paths {
+        let mut value = serde_json::to_value(prepared).unwrap();
+        value
+            .pointer_mut(path)
+            .unwrap()
+            .as_object_mut()
+            .unwrap()
+            .insert("unallocated-target-field".into(), serde_json::json!(0));
+        assert!(
+            PreparedTargetMutation::decode(&serde_json::to_vec(&value).unwrap()).is_err(),
+            "target recovery accepted unknown nested input"
+        );
+        for phase in ["admit", "apply"] {
+            let command = serde_json::json!({"netconf-target": {phase: value.clone()}});
+            assert!(
+                serde_json::from_value::<AuditCommand>(command).is_err(),
+                "target command accepted unknown nested input"
+            );
+        }
+    }
+}
+
+#[tokio::test]
+async fn target_closed_input_rejects_unknown_bootstrap_checkpoint_identity() {
+    let fixture = Fixture::new().await;
+    let shared = fixture.backend.conn();
+    let conn = shared.lock().await;
+    let prepared = fixture.activate(&conn);
+    assert_closed_target_input(
+        &prepared,
+        &[
+            "/effect/resolution/activate/checkpoint/body/identity",
+            "/effect/resolution/activate/checkpoint/body",
+            "/effect/resolution/activate/checkpoint",
+        ],
+    );
+}
+
+#[tokio::test]
+async fn target_closed_input_rejects_unknown_running_commit_and_audit_fields() {
+    use crate::consensus::audit_mutation::TargetPayloadV1;
+    let fixture = Fixture::new().await;
+    let shared = fixture.backend.conn();
+    let conn = shared.lock().await;
+    fixture.active(&conn);
+    let stage = fixture.encrypted(fixture.request(&conn, 141, 4, 0x61, 1), 0x41);
+    assert!(matches!(
+        fixture.submit(&conn, &stage),
+        AuditOperationState::TargetV1(_)
+    ));
+    fixture.settle(&conn, &stage);
+    let mut prepared = fixture.running_target(&conn, 142, 6, 0, 0x41);
+    let Some(TargetPayloadV1::Running { commit, .. }) =
+        &mut prepared.command_mut().effect.encrypted_payload
+    else {
+        panic!("running fixture");
+    };
+    let audit = crate::AuditRecord {
+        tx_id: commit.record.tx_id,
+        sequence: 0,
+        yang_path: "/fixture:configuration".into(),
+        op_type: crate::AuditOpType::Replace,
+        previous_value: None,
+        new_value: None,
+        redaction_applied: false,
+        previous_hash: [0; 32],
+        entry_hmac: [0; 32],
+    };
+    **commit = crate::consensus::PreparedConfigCommit::prepare(
+        commit.record.clone(),
+        vec![audit],
+        &fixture.key,
+    )
+    .unwrap();
+    let prepared = fixture.rebind_at(&conn, prepared, 100);
+    prepared.verify_effect(&fixture.key).unwrap();
+    assert_closed_target_input(
+        &prepared,
+        &[
+            "/effect/encrypted_payload/running/commit",
+            "/effect/encrypted_payload/running/commit/record",
+            "/effect/encrypted_payload/running/commit/audit/0",
+        ],
+    );
+}
+
+use crate::audit_authority::AuditOperationReceipt;
+
+impl Fixture {
+    fn preflight(
+        &self,
+        conn: &Connection,
+        prepared: &PreparedTargetMutation,
+        now: i64,
+    ) -> Result<Option<AuditOperationReceipt>, AuditAuthorityError> {
+        let before = target_rows(conn);
+        let audit_before = serde_json::to_vec(&self.ledger(conn)).unwrap();
+        let changes: i64 = conn
+            .query_row("SELECT total_changes()", [], |row| row.get(0))
+            .unwrap();
+        let tx = conn.unchecked_transaction().unwrap();
+        let ledger = self.ledger(&tx);
+        let result = crate::consensus::audit_targets::preflight_target_sync(
+            &tx,
+            &self.key,
+            prepared.command(),
+            &ledger,
+            &self.keys,
+            now,
+            &crate::consensus::sqlite::SqliteWorkCancellation::audit_test(),
+        )
+        .unwrap();
+        tx.commit().unwrap();
+        let after: i64 = conn
+            .query_row("SELECT total_changes()", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(after, changes, "preflight executed a SQL write");
+        assert_eq!(target_rows(conn), before);
+        assert_eq!(
+            serde_json::to_vec(&self.ledger(conn)).unwrap(),
+            audit_before
+        );
+        result
+    }
+}
+
+#[tokio::test]
+async fn target_sdk_preflight_predicts_current_transition_without_admission_or_effect() {
+    let fixture = Fixture::new().await;
+    let shared = fixture.backend.conn();
+    let conn = shared.lock().await;
+    let activation = fixture.activate(&conn);
+    assert_eq!(fixture.preflight(&conn, &activation, 100).unwrap(), None);
+    assert!(matches!(
+        fixture.submit(&conn, &activation),
+        AuditOperationState::TargetV1(_)
+    ));
+    fixture.settle(&conn, &activation);
+    let staged = fixture.encrypted(fixture.request(&conn, 150, 4, 0x61, 1), 0x39);
+    assert_eq!(fixture.preflight(&conn, &staged, 100).unwrap(), None);
+    assert!(matches!(
+        fixture.submit(&conn, &staged),
+        AuditOperationState::TargetV1(_)
+    ));
+    fixture.settle(&conn, &staged);
+    let running = fixture.running_target(&conn, 151, 6, 0, 0x39);
+    assert_eq!(fixture.preflight(&conn, &running, 100).unwrap(), None);
+    assert!(matches!(
+        fixture.submit(&conn, &running),
+        AuditOperationState::TargetV1(_)
+    ));
+    fixture.settle(&conn, &running);
+    fixture.assert_running_plaintext(&conn, &running);
+}
+
+#[tokio::test]
+async fn target_sdk_preflight_refuses_stale_generation_source_lock_and_expiry() {
+    let fixture = Fixture::new().await;
+    let shared = fixture.backend.conn();
+    let conn = shared.lock().await;
+    fixture.active(&conn);
+    let delayed = fixture.encrypted(fixture.request(&conn, 152, 4, 0x61, 1), 0x39);
+    let first = fixture.encrypted(fixture.request(&conn, 153, 4, 0x61, 1), 0x3a);
+    assert!(matches!(
+        fixture.submit(&conn, &first),
+        AuditOperationState::TargetV1(_)
+    ));
+    fixture.settle(&conn, &first);
+    assert_eq!(
+        fixture.preflight(&conn, &delayed, 100),
+        Err(AuditAuthorityError::BindingMismatch)
+    );
+    let copied = fixture.running_target(&conn, 154, 15, 0, 0x3a);
+    assert_eq!(fixture.preflight(&conn, &copied, 100).unwrap(), None);
+    let replacement = fixture.encrypted(fixture.request(&conn, 155, 4, 0x61, 1), 0x3b);
+    assert!(matches!(
+        fixture.submit(&conn, &replacement),
+        AuditOperationState::TargetV1(_)
+    ));
+    fixture.settle(&conn, &replacement);
+    assert_eq!(
+        fixture.preflight(&conn, &copied, 100),
+        Err(AuditAuthorityError::BindingMismatch)
+    );
+    let delayed = fixture.request(&conn, 156, 5, 0x61, 1);
+    let acquired = fixture.request(&conn, 157, 2, 0x61, 1);
+    assert_eq!(fixture.preflight(&conn, &acquired, 100).unwrap(), None);
+    assert!(matches!(
+        fixture.submit(&conn, &acquired),
+        AuditOperationState::TargetV1(_)
+    ));
+    fixture.settle(&conn, &acquired);
+    assert_eq!(
+        fixture.preflight(&conn, &delayed, 100),
+        Err(AuditAuthorityError::BindingMismatch)
+    );
+    let foreign = fixture.request(&conn, 158, 5, 0x62, 1);
+    assert_eq!(
+        fixture.preflight(&conn, &foreign, 100),
+        Err(AuditAuthorityError::BindingMismatch)
+    );
+    let fresh = fixture.request(&conn, 159, 5, 0x61, 1);
+    assert_eq!(fixture.preflight(&conn, &fresh, 100).unwrap(), None);
+    assert_eq!(
+        fixture.preflight(&conn, &fresh, 160),
+        Err(AuditAuthorityError::Expired)
+    );
+    // A second request with an identical intent body is still not a receipt.
+    assert!(fixture
+        .ledger(&conn)
+        .lookup(&fixture.key, fresh.handle(), fresh.command().effect.caller)
+        .unwrap()
+        .is_none());
+}
+
+#[tokio::test]
+async fn target_sdk_preflight_preserves_original_receipts_and_fences_unresolved_work() {
+    let fixture = Fixture::new().await;
+    let shared = fixture.backend.conn();
+    let conn = shared.lock().await;
+    fixture.active(&conn);
+    let original = fixture.encrypted(fixture.request(&conn, 160, 4, 0x61, 1), 0x3c);
+    fixture
+        .apply(
+            &conn,
+            AuditCommand::NetconfTarget(Box::new(TargetAuditCommandV1::Admit(
+                original.command().clone(),
+            ))),
+            100,
+        )
+        .unwrap();
+    let receipt = fixture.preflight(&conn, &original, 200).unwrap().unwrap();
+    assert_eq!(receipt.state(), AuditOperationState::Intent);
+    assert_eq!(
+        fixture
+            .ledger(&conn)
+            .recover_target(
+                &fixture.key,
+                original.handle(),
+                original.command().effect.caller
+            )
+            .unwrap(),
+        original
+    );
+    let next = fixture.request(&conn, 161, 5, 0x61, 1);
+    assert_eq!(
+        fixture.preflight(&conn, &next, 100),
+        Err(AuditAuthorityError::RecoveryRequired)
+    );
+    fixture.checkpoint(&conn);
+    fixture
+        .apply(
+            &conn,
+            AuditCommand::NetconfTarget(Box::new(TargetAuditCommandV1::Apply(
+                original.command().clone(),
+            ))),
+            100,
+        )
+        .unwrap();
+    let known = fixture.preflight(&conn, &original, 200).unwrap().unwrap();
+    assert!(matches!(known.state(), AuditOperationState::TargetV1(_)));
+    assert!(!known.terminal_recorded());
+    let next = fixture.request(&conn, 161, 5, 0x61, 1);
+    assert_eq!(
+        fixture.preflight(&conn, &next, 100),
+        Err(AuditAuthorityError::RecoveryRequired)
+    );
+    fixture.settle(&conn, &original);
+    assert_eq!(fixture.preflight(&conn, &next, 100).unwrap(), None);
+    assert!(matches!(
+        fixture.submit(&conn, &next),
+        AuditOperationState::TargetV1(_)
+    ));
+    fixture.settle(&conn, &next);
+    let replay = fixture.preflight(&conn, &original, 200).unwrap().unwrap();
+    assert_eq!(replay.state(), known.state());
+    assert!(replay.terminal_recorded());
+    // A newly signed, conflicting use of the original request does not inherit
+    // its retained receipt or replace its exact recovery description.
+    let collision = fixture.encrypted(fixture.request(&conn, 160, 4, 0x61, 1), 0x3d);
+    assert_eq!(
+        fixture.preflight(&conn, &collision, 100),
+        Err(AuditAuthorityError::BindingMismatch)
+    );
+    let wrong = fixture.request(&conn, 162, 5, 0x61, 1);
+    fixture
+        .apply(
+            &conn,
+            AuditCommand::Intent(wrong.command().handle.clone()),
+            100,
+        )
+        .unwrap();
+    assert_eq!(
+        fixture.preflight(&conn, &wrong, 100),
+        Err(AuditAuthorityError::BindingMismatch)
+    );
+}
+
+impl Fixture {
+    fn device_view(&self, conn: &Connection) -> crate::consensus::audit_targets::NetconfDeviceView {
+        let tx = conn.unchecked_transaction().unwrap();
+        let view = crate::consensus::audit_targets::read_device_view_sync(
+            &tx,
+            &self.key,
+            &self.ledger(&tx),
+            &crate::consensus::sqlite::SqliteWorkCancellation::audit_test(),
+        )
+        .unwrap();
+        tx.commit().unwrap();
+        view
+    }
+
+    fn device_event(&self, request: u8) -> ProjectedAuditEvent {
+        let event = ManagementAuditEventRecord::try_new(
+            [request; 16],
+            ManagementAuditInstant::try_new(100, 0, 1, ManagementAuditTimeSourceCode::NodeClock)
+                .unwrap(),
+            "fixture-tenant",
+            "fixture-principal",
+            ManagementAuditTransportCode::Internal,
+            ManagementAuditOperationCode::Exec,
+            ManagementAuditOutcomeCode::Intent,
+            None::<&str>,
+            ["/fixture:lifecycle"],
+            None::<&str>,
+        )
+        .unwrap();
+        ProjectedAuditEvent::project(&self.privacy, &event).unwrap()
+    }
+}
+
+#[tokio::test]
+async fn target_device_preparation_binds_activation_then_exact_previous_device() {
+    use crate::audit_authority::{NetconfDeviceOwner, NetconfWorkerBinding, PreparedNetconfDevice};
+    let fixture = Fixture::new().await;
+    let shared = fixture.backend.conn();
+    let conn = shared.lock().await;
+    let view = fixture.device_view(&conn);
+    let before = target_rows(&conn);
+    let event = fixture.device_event(170);
+    let effect = view.prepare(&event, 160, [0x51; 16], [0x52; 16]).unwrap();
+    assert_eq!(u8::from(effect.action), 0);
+    assert_eq!(effect.expires_at, 160);
+    let activation = fixture.prepare(effect, event.clone());
+    assert_eq!(target_rows(&conn), before);
+    assert_eq!(
+        activation.command().effect.digest(&fixture.key).unwrap(),
+        activation.command().handle.body.mutation.unwrap()
+    );
+    assert_eq!(fixture.preflight(&conn, &activation, 100).unwrap(), None);
+    let worker = std::sync::Arc::new(());
+    let prepared = PreparedNetconfDevice {
+        recovery: Default::default(),
+        worker: NetconfWorkerBinding::new(&worker),
+        prepared: activation.clone(),
+    };
+    assert_eq!(prepared.mutation(), &activation);
+    let owner = NetconfDeviceOwner {
+        recovery: Default::default(),
+        worker: prepared.worker.clone(),
+        authority: fixture.identity,
+        profile_incarnation: [0x51; 16],
+        device_incarnation: [0x52; 16],
+        caller: event.caller,
+    };
+    assert_eq!(
+        view.verify_owner(&owner),
+        Err(AuditAuthorityError::BindingMismatch)
+    );
+    assert!(matches!(
+        fixture.submit(&conn, &activation),
+        AuditOperationState::TargetV1(_)
+    ));
+    assert_eq!(
+        fixture.device_view(&conn).verify_owner(&owner),
+        Err(AuditAuthorityError::RecoveryRequired)
+    );
+    fixture.settle(&conn, &activation);
+    assert_eq!(fixture.device_view(&conn).verify_owner(&owner), Ok(()));
+    let next_event = fixture.device_event(171);
+    let next = fixture
+        .device_view(&conn)
+        .prepare(&next_event, 160, [0x53; 16], [0x54; 16])
+        .unwrap();
+    assert_eq!(u8::from(next.action), 1);
+    assert_eq!(next.profile_incarnation, [0x51; 16]);
+    assert!(
+        matches!(next.resolution, Some(TargetResolutionV1::BeginDevice { previous: Some(value) }) if value == [0x52;16])
+    );
+    let next = fixture.prepare(next, next_event);
+    assert_eq!(fixture.preflight(&conn, &next, 100).unwrap(), None);
+    assert!(matches!(
+        fixture.submit(&conn, &next),
+        AuditOperationState::TargetV1(_)
+    ));
+    fixture.settle(&conn, &next);
+    assert_eq!(
+        fixture.device_view(&conn).verify_owner(&owner),
+        Err(AuditAuthorityError::BindingMismatch)
+    );
+    assert_eq!(
+        format!("{owner:?} {prepared:?}"),
+        "NetconfDeviceOwner(<redacted>) PreparedNetconfDevice(<redacted>)"
+    );
+}
+
+#[tokio::test]
+async fn target_device_preparation_refuses_rpc_events_unsettled_and_reused_incarnations() {
+    let fixture = Fixture::new().await;
+    let shared = fixture.backend.conn();
+    let conn = shared.lock().await;
+    let view = fixture.device_view(&conn);
+    assert!(matches!(
+        view.prepare(&fixture.event(172), 160, [0x51; 16], [0x52; 16]),
+        Err(AuditAuthorityError::BindingMismatch)
+    ));
+    let event = fixture.device_event(173);
+    let prepared = fixture.prepare(
+        view.prepare(&event, 160, [0x51; 16], [0x52; 16]).unwrap(),
+        event,
+    );
+    fixture
+        .apply(
+            &conn,
+            AuditCommand::NetconfTarget(Box::new(TargetAuditCommandV1::Admit(
+                prepared.command().clone(),
+            ))),
+            100,
+        )
+        .unwrap();
+    let view = fixture.device_view(&conn);
+    assert!(matches!(
+        view.prepare(&fixture.device_event(174), 160, [0x55; 16], [0x56; 16]),
+        Err(AuditAuthorityError::RecoveryRequired)
+    ));
+    fixture.checkpoint(&conn);
+    fixture
+        .apply(
+            &conn,
+            AuditCommand::NetconfTarget(Box::new(TargetAuditCommandV1::Apply(
+                prepared.command().clone(),
+            ))),
+            100,
+        )
+        .unwrap();
+    fixture.settle(&conn, &prepared);
+    let view = fixture.device_view(&conn);
+    assert!(matches!(
+        view.prepare(&fixture.device_event(174), 160, [0x55; 16], [0x52; 16]),
+        Err(AuditAuthorityError::BindingMismatch)
+    ));
+    assert!(matches!(
+        view.prepare(&fixture.device_event(174), 160, [0; 16], [0x56; 16]),
+        Err(AuditAuthorityError::BindingMismatch)
+    ));
+}
+
+#[test]
+fn target_device_worker_binding_rejects_equal_value_replacement_and_outlives_no_worker() {
+    use crate::audit_authority::NetconfWorkerBinding;
+    let original = std::sync::Arc::new([0x61; 32]);
+    let clone = original.clone();
+    let replacement = std::sync::Arc::new([0x61; 32]);
+    let binding = NetconfWorkerBinding::new(&original);
+    assert!(binding.belongs_to(&clone));
+    assert!(!binding.belongs_to(&replacement));
+    drop(original);
+    assert!(binding.belongs_to(&clone));
+    drop(clone);
+    let later = std::sync::Arc::new([0x61; 32]);
+    assert!(!binding.belongs_to(&later));
+}
+
+#[tokio::test]
+async fn target_device_preparation_preserves_reboot_cleanup_before_serving() {
+    use crate::audit_authority::{NetconfDeviceOwner, NetconfWorkerBinding};
+    let fixture = Fixture::new().await;
+    let shared = fixture.backend.conn();
+    let conn = shared.lock().await;
+    let tentative = fixture.pending_fixture(&conn, true);
+    assert!(matches!(
+        fixture.submit(&conn, &tentative),
+        AuditOperationState::TargetV1(_)
+    ));
+    fixture.settle(&conn, &tentative);
+    let event = fixture.device_event(175);
+    let effect = fixture
+        .device_view(&conn)
+        .prepare(&event, 160, [0x57; 16], [0x58; 16])
+        .unwrap();
+    let worker = std::sync::Arc::new(());
+    let owner = NetconfDeviceOwner {
+        recovery: Default::default(),
+        worker: NetconfWorkerBinding::new(&worker),
+        authority: fixture.identity,
+        profile_incarnation: effect.profile_incarnation,
+        device_incarnation: effect.device_incarnation,
+        caller: event.caller,
+    };
+    let stale = fixture.prepare(effect, event);
+    assert_eq!(fixture.device_view(&conn).running_version, 2);
+    assert_eq!(stale.command().handle.body.binding.base_version, 0);
+    assert_eq!(
+        fixture.preflight(&conn, &stale, 100),
+        Err(AuditAuthorityError::BindingMismatch)
+    );
+    let prepared = fixture.rebind_at(&conn, stale, 100);
+    assert!(matches!(
+        fixture.submit(&conn, &prepared),
+        AuditOperationState::TargetV1(_)
+    ));
+    fixture.settle(&conn, &prepared);
+    let view = fixture.device_view(&conn);
+    assert!(!view.unsettled);
+    assert!(view.cleanup_pending);
+    assert_eq!(
+        view.verify_owner(&owner),
+        Err(AuditAuthorityError::RecoveryRequired)
+    );
+    assert!(matches!(
+        view.prepare(&fixture.device_event(176), 160, [0x59; 16], [0x5a; 16]),
+        Err(AuditAuthorityError::RecoveryRequired)
+    ));
+    let rollback = fixture.resolve_fixture(&conn, 177, 14, true, 100);
+    assert!(matches!(
+        fixture.submit(&conn, &rollback),
+        AuditOperationState::TargetV1(_)
+    ));
+    fixture.assert_running_plaintext(&conn, &rollback);
+    fixture.settle(&conn, &rollback);
+    fixture.assert_no_pending(&conn);
+    assert_eq!(fixture.device_view(&conn).verify_owner(&owner), Ok(()));
+}
+
+impl Fixture {
+    fn session_owner(
+        &self,
+        conn: &Connection,
+        worker: &std::sync::Arc<()>,
+        session: u8,
+    ) -> crate::audit_authority::NetconfSessionOwner {
+        use crate::audit_authority::{
+            NetconfDeviceOwner, NetconfSessionOwner, NetconfWorkerBinding,
+        };
+        let view = self.device_view(conn);
+        let device = NetconfDeviceOwner {
+            recovery: Default::default(),
+            worker: NetconfWorkerBinding::new(worker),
+            authority: view.authority,
+            profile_incarnation: view.profile_incarnation.unwrap(),
+            device_incarnation: view.device_incarnation.unwrap(),
+            caller: view.caller.unwrap(),
+        };
+        NetconfSessionOwner::new(device, self.event(180).caller, [session; 16]).unwrap()
+    }
+}
+
+#[tokio::test]
+async fn target_session_locks_bind_all_datastores_and_refuse_stale_or_foreign_leases() {
+    use crate::audit_authority::{
+        NetconfLockDatastore as Store, NetconfLockLease, PreparedNetconfLock,
+    };
+    for datastore in [Store::Running, Store::Candidate, Store::Startup] {
+        let fixture = Fixture::new().await;
+        let shared = fixture.backend.conn();
+        let conn = shared.lock().await;
+        fixture.active(&conn);
+        let worker = std::sync::Arc::new(());
+        let session = fixture.session_owner(&conn, &worker, 0x61);
+        let foreign = fixture.session_owner(&conn, &worker, 0x62);
+        assert_eq!(session.caller, foreign.caller);
+        let event = fixture.event(180);
+        let effect = fixture
+            .device_view(&conn)
+            .prepare_lock(&session, &event, datastore, None, 160)
+            .unwrap();
+        let mutation = fixture.prepare(effect, event);
+        let prepared = PreparedNetconfLock {
+            session: session.clone(),
+            datastore,
+            prepared: mutation.clone(),
+        };
+        assert_eq!(prepared.mutation(), &mutation);
+        let lease = NetconfLockLease {
+            session: session.clone(),
+            datastore,
+            incarnation: 1,
+        };
+        assert_eq!(
+            fixture.device_view(&conn).verify_lease(&lease),
+            Err(AuditAuthorityError::BindingMismatch)
+        );
+        assert_eq!(fixture.preflight(&conn, &mutation, 100).unwrap(), None);
+        assert!(matches!(
+            fixture.submit(&conn, &mutation),
+            AuditOperationState::TargetV1(_)
+        ));
+        assert_eq!(
+            fixture.device_view(&conn).verify_lease(&lease),
+            Err(AuditAuthorityError::RecoveryRequired)
+        );
+        fixture.settle(&conn, &mutation);
+        assert_eq!(fixture.device_view(&conn).verify_lease(&lease), Ok(()));
+        assert!(matches!(
+            fixture.device_view(&conn).prepare_lock(
+                &foreign,
+                &fixture.event(181),
+                datastore,
+                Some(&lease),
+                160
+            ),
+            Err(AuditAuthorityError::BindingMismatch)
+        ));
+        let counterfeit = NetconfLockLease {
+            session: foreign.clone(),
+            ..lease.clone()
+        };
+        assert_eq!(
+            fixture.device_view(&conn).verify_lease(&counterfeit),
+            Err(AuditAuthorityError::BindingMismatch)
+        );
+        if datastore == Store::Candidate {
+            let staged = fixture.encrypted(fixture.request(&conn, 181, 4, 0x61, 1), 0x37);
+            assert!(matches!(
+                fixture.submit(&conn, &staged),
+                AuditOperationState::TargetV1(_)
+            ));
+            fixture.settle(&conn, &staged);
+            assert_eq!(
+                row(&conn, "config_netconf_targets", "target", 0)["generation"],
+                1
+            );
+        }
+        let event = fixture.event(182);
+        let effect = fixture
+            .device_view(&conn)
+            .prepare_lock(&session, &event, datastore, Some(&lease), 160)
+            .unwrap();
+        let release = fixture.prepare(effect, event);
+        assert!(matches!(
+            fixture.submit(&conn, &release),
+            AuditOperationState::TargetV1(_)
+        ));
+        fixture.settle(&conn, &release);
+        assert_eq!(
+            fixture.device_view(&conn).verify_lease(&lease),
+            Err(AuditAuthorityError::BindingMismatch)
+        );
+        if datastore == Store::Candidate {
+            let row = row(&conn, "config_netconf_targets", "target", 0);
+            assert_eq!(row["generation"], 2);
+            assert_eq!(row["present"], false);
+            assert!(row["encrypted_envelope"].is_null());
+        }
+        let event = fixture.event(183);
+        let effect = fixture
+            .device_view(&conn)
+            .prepare_lock(&session, &event, datastore, None, 160)
+            .unwrap();
+        let reacquire = fixture.prepare(effect, event);
+        assert!(matches!(
+            fixture.submit(&conn, &reacquire),
+            AuditOperationState::TargetV1(_)
+        ));
+        fixture.settle(&conn, &reacquire);
+        assert_eq!(
+            fixture.device_view(&conn).verify_lease(&lease),
+            Err(AuditAuthorityError::BindingMismatch)
+        );
+        let current = NetconfLockLease {
+            incarnation: 3,
+            ..lease.clone()
+        };
+        assert_eq!(fixture.device_view(&conn).verify_lease(&current), Ok(()));
+        assert!(matches!(
+            fixture.device_view(&conn).prepare_lock(
+                &session,
+                &fixture.event(184),
+                datastore,
+                Some(&lease),
+                160
+            ),
+            Err(AuditAuthorityError::BindingMismatch)
+        ));
+        assert_eq!(format!("{session:?} {prepared:?} {current:?}"),"NetconfSessionOwner(<redacted>) PreparedNetconfLock(<redacted>) NetconfLockLease(<redacted>)");
+    }
+}
+
+#[tokio::test]
+async fn target_session_invalidation_reaches_clones_and_cannot_be_reactivated_by_equal_values() {
+    use crate::audit_authority::{NetconfLockDatastore, NetconfSessionOwner};
+    let fixture = Fixture::new().await;
+    let shared = fixture.backend.conn();
+    let conn = shared.lock().await;
+    fixture.active(&conn);
+    let worker = std::sync::Arc::new(());
+    let session = fixture.session_owner(&conn, &worker, 0x61);
+    let clone = session.clone();
+    let equal = fixture.session_owner(&conn, &worker, 0x61);
+    assert!(session.same_session(&clone));
+    assert!(!session.same_session(&equal));
+    assert_eq!(fixture.device_view(&conn).verify_session(&clone), Ok(()));
+    assert!(matches!(
+        NetconfSessionOwner::new(session.device.clone(), session.caller, [0; 16]),
+        Err(AuditAuthorityError::InvalidInput)
+    ));
+    session.invalidate();
+    clone.invalidate();
+    assert_eq!(
+        session.require_active(),
+        Err(AuditAuthorityError::BindingMismatch)
+    );
+    assert_eq!(
+        clone.require_active(),
+        Err(AuditAuthorityError::BindingMismatch)
+    );
+    assert_eq!(
+        fixture.device_view(&conn).verify_session(&clone),
+        Err(AuditAuthorityError::BindingMismatch)
+    );
+    assert!(matches!(
+        fixture.device_view(&conn).prepare_lock(
+            &clone,
+            &fixture.event(185),
+            NetconfLockDatastore::Running,
+            None,
+            160
+        ),
+        Err(AuditAuthorityError::BindingMismatch)
+    ));
+    assert!(equal.require_active().is_ok());
+    assert!(!equal.same_session(&session));
+}
+
+#[tokio::test]
+async fn target_session_preparation_refuses_wrong_caller_transport_operation_and_old_device() {
+    use crate::audit_authority::{AuditCaller, NetconfLockDatastore};
+    let fixture = Fixture::new().await;
+    let shared = fixture.backend.conn();
+    let conn = shared.lock().await;
+    fixture.active(&conn);
+    let worker = std::sync::Arc::new(());
+    let session = fixture.session_owner(&conn, &worker, 0x61);
+    let view = fixture.device_view(&conn);
+    let before = target_rows(&conn);
+    let changes = conn.total_changes();
+    for variant in 0..3 {
+        let mut event = fixture.event(186);
+        match variant {
+            0 => {
+                event.caller = AuditCaller::project(
+                    &fixture.privacy,
+                    "fixture-tenant",
+                    "fixture-other-principal",
+                )
+                .unwrap()
+            }
+            1 => event.transport = ManagementAuditTransportCode::Internal,
+            _ => event.operation = ManagementAuditOperationCode::Read,
+        }
+        assert!(matches!(
+            view.prepare_lock(&session, &event, NetconfLockDatastore::Running, None, 160),
+            Err(AuditAuthorityError::BindingMismatch)
+        ));
+    }
+    assert_eq!(conn.total_changes(), changes);
+    assert_eq!(target_rows(&conn), before);
+    let event = fixture.device_event(187);
+    let effect = view.prepare(&event, 160, [0x57; 16], [0x58; 16]).unwrap();
+    let replacement = fixture.prepare(effect, event);
+    assert!(matches!(
+        fixture.submit(&conn, &replacement),
+        AuditOperationState::TargetV1(_)
+    ));
+    fixture.settle(&conn, &replacement);
+    assert_eq!(
+        fixture.device_view(&conn).verify_session(&session),
+        Err(AuditAuthorityError::BindingMismatch)
+    );
+    assert!(
+        session.require_active().is_ok(),
+        "local activity must not replace retained device verification"
+    );
+}
+
+#[tokio::test]
+async fn target_session_cleanup_retains_one_original_across_clones_and_concurrent_retry() {
+    let fixture = Fixture::new().await;
+    let shared = fixture.backend.conn();
+    let conn = shared.lock().await;
+    fixture.active(&conn);
+    let worker = std::sync::Arc::new(());
+    let session = fixture.session_owner(&conn, &worker, 0x61);
+    session.invalidate();
+    let event = fixture.device_event(190);
+    let effect = fixture
+        .device_view(&conn)
+        .prepare_session_cleanup(&session, &event, 160)
+        .unwrap();
+    let original = fixture.prepare(effect, event.clone());
+    let later = fixture.rebind_at(&conn, original.clone(), 101);
+    assert_ne!(original, later);
+    let barrier = std::sync::Barrier::new(2);
+    let outcomes = std::thread::scope(|scope| {
+        let one = scope.spawn(|| {
+            barrier.wait();
+            session.retain_cleanup(original.clone()).unwrap()
+        });
+        let two = scope.spawn(|| {
+            barrier.wait();
+            session.clone().retain_cleanup(later.clone()).unwrap()
+        });
+        (one.join().unwrap(), two.join().unwrap())
+    });
+    assert_eq!(outcomes.0, outcomes.1);
+    assert!(outcomes.0 == original || outcomes.0 == later);
+    let selected = outcomes.0;
+    assert_eq!(
+        session
+            .clone()
+            .original_cleanup(&event, Duration::from_secs(60))
+            .unwrap(),
+        Some(selected.clone())
+    );
+    assert_eq!(session.retain_cleanup(later).unwrap(), selected);
+    assert_eq!(session.retain_cleanup(original).unwrap(), selected);
+    assert!(matches!(
+        session.original_cleanup(&fixture.device_event(191), Duration::from_secs(60)),
+        Err(AuditAuthorityError::BindingMismatch)
+    ));
+    assert!(matches!(
+        session.original_cleanup(&event, Duration::from_secs(61)),
+        Err(AuditAuthorityError::BindingMismatch)
+    ));
+    let mut changed = event.clone();
+    changed.operation = ManagementAuditOperationCode::Read;
+    assert!(matches!(
+        session.original_cleanup(&changed, Duration::from_secs(60)),
+        Err(AuditAuthorityError::BindingMismatch)
+    ));
+    assert_eq!(
+        fixture.ledger(&conn).operations.len(),
+        1,
+        "preparation must not admit an intent"
+    );
+    assert_eq!(
+        session.require_active(),
+        Err(AuditAuthorityError::BindingMismatch)
+    );
+}
+
+#[tokio::test]
+async fn target_session_cleanup_requires_original_scope_and_revoked_local_authority() {
+    use crate::audit_authority::AuditCaller;
+    let fixture = Fixture::new().await;
+    let shared = fixture.backend.conn();
+    let conn = shared.lock().await;
+    fixture.active(&conn);
+    let worker = std::sync::Arc::new(());
+    let session = fixture.session_owner(&conn, &worker, 0x61);
+    let event = fixture.device_event(192);
+    let view = fixture.device_view(&conn);
+    assert!(matches!(
+        view.prepare_session_cleanup(&session, &event, 160),
+        Err(AuditAuthorityError::BindingMismatch)
+    ));
+    session.invalidate();
+    for variant in 0..4 {
+        let mut changed = event.clone();
+        match variant {
+            0 => {
+                changed.caller =
+                    AuditCaller::project(&fixture.privacy, "fixture-tenant", "fixture-other")
+                        .unwrap()
+            }
+            1 => changed.transport = ManagementAuditTransportCode::NetconfSsh,
+            2 => changed.operation = ManagementAuditOperationCode::Read,
+            _ => changed.outcome = ManagementAuditOutcomeCode::Success,
+        }
+        assert!(matches!(
+            view.prepare_session_cleanup(&session, &changed, 160),
+            Err(AuditAuthorityError::BindingMismatch)
+        ));
+    }
+    let effect = view.prepare_session_cleanup(&session, &event, 160).unwrap();
+    let mut wrong_session = fixture.prepare(effect, event.clone());
+    wrong_session.command_mut().effect.resolution = Some(TargetResolutionV1::EndSession {
+        session: [0x62; 16],
+    });
+    assert!(matches!(
+        session.retain_cleanup(wrong_session),
+        Err(AuditAuthorityError::BindingMismatch)
+    ));
+    assert!(session
+        .original_cleanup(&event, Duration::from_secs(60))
+        .unwrap()
+        .is_none());
+    let replacement_event = fixture.device_event(193);
+    let replacement = fixture.prepare(
+        view.prepare(&replacement_event, 160, [0x57; 16], [0x58; 16])
+            .unwrap(),
+        replacement_event,
+    );
+    assert!(matches!(
+        fixture.submit(&conn, &replacement),
+        AuditOperationState::TargetV1(_)
+    ));
+    fixture.settle(&conn, &replacement);
+    assert!(matches!(
+        fixture
+            .device_view(&conn)
+            .prepare_session_cleanup(&session, &event, 160),
+        Err(AuditAuthorityError::BindingMismatch)
+    ));
+}
+
+#[tokio::test]
+async fn target_session_cleanup_discards_only_owned_candidate_and_preserves_foreign_lease() {
+    use crate::audit_authority::{NetconfLockDatastore, NetconfLockLease};
+    let fixture = Fixture::new().await;
+    let shared = fixture.backend.conn();
+    let conn = shared.lock().await;
+    fixture.active(&conn);
+    let worker = std::sync::Arc::new(());
+    let session = fixture.session_owner(&conn, &worker, 0x61);
+    let foreign = fixture.session_owner(&conn, &worker, 0x62);
+    for (request, slot, owner) in [(194, 0, 0x61), (195, 1, 0x61), (196, 2, 0x62)] {
+        let lock = fixture.request(&conn, request, 2, owner, slot);
+        assert!(matches!(
+            fixture.submit(&conn, &lock),
+            AuditOperationState::TargetV1(_)
+        ));
+        fixture.settle(&conn, &lock);
+    }
+    let stage = fixture.encrypted(fixture.request(&conn, 197, 4, 0x61, 1), 0x39);
+    assert!(matches!(
+        fixture.submit(&conn, &stage),
+        AuditOperationState::TargetV1(_)
+    ));
+    fixture.settle(&conn, &stage);
+    let foreign_lease = NetconfLockLease {
+        session: foreign,
+        datastore: NetconfLockDatastore::Startup,
+        incarnation: 1,
+    };
+    assert_eq!(
+        fixture.device_view(&conn).verify_lease(&foreign_lease),
+        Ok(())
+    );
+    let before = target_rows(&conn);
+    let startup = row(&conn, "config_netconf_lifecycle", "singleton", 1)["locks"][2].clone();
+    session.invalidate();
+    let event = fixture.device_event(198);
+    let effect = fixture
+        .device_view(&conn)
+        .prepare_session_cleanup(&session, &event, 160)
+        .unwrap();
+    let cleanup = session
+        .retain_cleanup(fixture.prepare(effect, event.clone()))
+        .unwrap();
+    assert_eq!(target_rows(&conn), before);
+    fixture
+        .apply(
+            &conn,
+            AuditCommand::NetconfTarget(Box::new(TargetAuditCommandV1::Admit(
+                cleanup.command().clone(),
+            ))),
+            100,
+        )
+        .unwrap();
+    assert_eq!(
+        target_rows(&conn),
+        before,
+        "intent admission is not cleanup"
+    );
+    assert!(fixture
+        .apply(
+            &conn,
+            AuditCommand::NetconfTarget(Box::new(TargetAuditCommandV1::Apply(
+                cleanup.command().clone()
+            ))),
+            100
+        )
+        .is_err());
+    assert_eq!(
+        target_rows(&conn),
+        before,
+        "uncheckpointed intent grants no cleanup"
+    );
+    fixture.checkpoint(&conn);
+    fixture
+        .apply(
+            &conn,
+            AuditCommand::NetconfTarget(Box::new(TargetAuditCommandV1::Apply(
+                cleanup.command().clone(),
+            ))),
+            100,
+        )
+        .unwrap();
+    let known = fixture
+        .ledger(&conn)
+        .lookup(&fixture.key, cleanup.handle(), session.caller)
+        .unwrap()
+        .unwrap();
+    assert!(matches!(known.state(), AuditOperationState::TargetV1(_)));
+    assert!(!known.terminal_recorded());
+    let candidate = row(&conn, "config_netconf_targets", "target", 0);
+    assert_eq!(candidate["generation"], 2);
+    assert_eq!(candidate["present"], false);
+    assert!(candidate["encrypted_envelope"].is_null());
+    let lifecycle = row(&conn, "config_netconf_lifecycle", "singleton", 1);
+    assert_eq!(lifecycle["locks"][0]["incarnation"], 2);
+    assert_eq!(lifecycle["locks"][1]["incarnation"], 2);
+    assert!(lifecycle["locks"][0]["session"].is_null());
+    assert!(lifecycle["locks"][1]["session"].is_null());
+    assert_eq!(lifecycle["locks"][2], startup);
+    assert_eq!(
+        fixture.device_view(&conn).verify_owner(&session.device),
+        Err(AuditAuthorityError::RecoveryRequired)
+    );
+    fixture.settle(&conn, &cleanup);
+    assert_eq!(
+        fixture.device_view(&conn).verify_lease(&foreign_lease),
+        Ok(())
+    );
+    let after = target_rows(&conn);
+    assert_eq!(fixture.submit(&conn, &cleanup), known.state());
+    assert_eq!(
+        target_rows(&conn),
+        after,
+        "original replay must not advance counters"
+    );
+    assert_eq!(
+        session
+            .clone()
+            .original_cleanup(&event, Duration::from_secs(60))
+            .unwrap(),
+        Some(cleanup.clone())
+    );
+    let reopened = Connection::open(fixture.directory.path().join("authority.sqlite")).unwrap();
+    assert_eq!(
+        fixture
+            .ledger(&reopened)
+            .recover_target(&fixture.key, cleanup.handle(), session.caller)
+            .unwrap(),
+        cleanup
+    );
+    assert_eq!(
+        fixture
+            .ledger(&reopened)
+            .lookup(&fixture.key, cleanup.handle(), session.caller)
+            .unwrap()
+            .unwrap()
+            .state(),
+        known.state()
+    );
+}
+
+impl Fixture {
+    fn cleanup_at(
+        &self,
+        conn: &Connection,
+        session: &crate::audit_authority::NetconfSessionOwner,
+        request: u8,
+        now: i64,
+    ) -> PreparedTargetMutation {
+        let event = self.device_event(request);
+        let effect = self
+            .device_view(conn)
+            .prepare_session_cleanup(session, &event, now + 60)
+            .unwrap();
+        self.rebind_at(conn, self.prepare(effect, event), now)
+    }
+
+    fn expire_cleanup(&self, conn: &Connection, original: &PreparedTargetMutation) {
+        self.apply(
+            conn,
+            AuditCommand::NetconfTarget(Box::new(TargetAuditCommandV1::Admit(
+                original.command().clone(),
+            ))),
+            original.command().handle.body.issued_at,
+        )
+        .unwrap();
+        self.checkpoint(conn);
+        assert!(self
+            .apply(
+                conn,
+                AuditCommand::NetconfTarget(Box::new(TargetAuditCommandV1::Apply(
+                    original.command().clone()
+                ))),
+                original.command().handle.body.expires_at,
+            )
+            .is_err());
+        assert_eq!(
+            self.ledger(conn)
+                .lookup(
+                    &self.key,
+                    original.handle(),
+                    original.command().effect.caller
+                )
+                .unwrap()
+                .unwrap()
+                .state(),
+            AuditOperationState::Rejected
+        );
+    }
+}
+
+#[tokio::test]
+async fn target_cleanup_successor_requires_expiry_rejection_terminal_and_checkpoint() {
+    let fixture = Fixture::new().await;
+    let shared = fixture.backend.conn();
+    let conn = shared.lock().await;
+    fixture.active(&conn);
+    let worker = std::sync::Arc::new(());
+    let session = fixture.session_owner(&conn, &worker, 0x61);
+    session.invalidate();
+    let original = session
+        .retain_cleanup(fixture.cleanup_at(&conn, &session, 201, 100))
+        .unwrap();
+    let original_bytes = original.encode().unwrap();
+    let successor = fixture.cleanup_at(&conn, &session, 202, 160);
+    let before = target_rows(&conn);
+    assert!(
+        session
+            .retain_cleanup_successor(
+                &original,
+                successor.clone(),
+                &fixture.ledger(&conn),
+                &fixture.key,
+                160
+            )
+            .is_err(),
+        "missing original is not rejection"
+    );
+    fixture
+        .apply(
+            &conn,
+            AuditCommand::NetconfTarget(Box::new(TargetAuditCommandV1::Admit(
+                original.command().clone(),
+            ))),
+            100,
+        )
+        .unwrap();
+    fixture.checkpoint(&conn);
+    assert!(
+        matches!(
+            session.retain_cleanup_successor(
+                &original,
+                successor.clone(),
+                &fixture.ledger(&conn),
+                &fixture.key,
+                160
+            ),
+            Err(AuditAuthorityError::RecoveryRequired)
+        ),
+        "expired intent is still unresolved"
+    );
+    assert!(fixture
+        .apply(
+            &conn,
+            AuditCommand::NetconfTarget(Box::new(TargetAuditCommandV1::Apply(
+                original.command().clone()
+            ))),
+            160
+        )
+        .is_err());
+    assert_eq!(
+        fixture
+            .ledger(&conn)
+            .lookup(&fixture.key, original.handle(), session.caller)
+            .unwrap()
+            .unwrap()
+            .state(),
+        AuditOperationState::Rejected
+    );
+    assert!(
+        matches!(
+            session.retain_cleanup_successor(
+                &original,
+                successor.clone(),
+                &fixture.ledger(&conn),
+                &fixture.key,
+                160
+            ),
+            Err(AuditAuthorityError::RecoveryRequired)
+        ),
+        "rejection without terminal is unsettled"
+    );
+    fixture
+        .apply(
+            &conn,
+            AuditCommand::Terminal(original.command().handle.clone()),
+            160,
+        )
+        .unwrap();
+    assert!(
+        matches!(
+            session.retain_cleanup_successor(
+                &original,
+                successor.clone(),
+                &fixture.ledger(&conn),
+                &fixture.key,
+                160
+            ),
+            Err(AuditAuthorityError::RecoveryRequired)
+        ),
+        "terminal without independent checkpoint is unsettled"
+    );
+    fixture.checkpoint(&conn);
+    assert!(
+        matches!(
+            session.retain_cleanup_successor(
+                &original,
+                successor.clone(),
+                &fixture.ledger(&conn),
+                &fixture.key,
+                159
+            ),
+            Err(AuditAuthorityError::RecoveryRequired)
+        ),
+        "original expiry must have elapsed"
+    );
+    let changes = conn.total_changes();
+    assert_eq!(
+        session
+            .retain_cleanup_successor(
+                &original,
+                successor.clone(),
+                &fixture.ledger(&conn),
+                &fixture.key,
+                160
+            )
+            .unwrap(),
+        successor
+    );
+    assert_eq!(
+        conn.total_changes(),
+        changes,
+        "preparation must not admit or apply cleanup"
+    );
+    assert_eq!(target_rows(&conn), before);
+    assert_eq!(original.encode().unwrap(), original_bytes);
+    assert_eq!(
+        session.require_active(),
+        Err(AuditAuthorityError::BindingMismatch)
+    );
+    assert!(fixture
+        .ledger(&conn)
+        .lookup(&fixture.key, successor.handle(), session.caller)
+        .unwrap()
+        .is_none());
+    let reopened = Connection::open(fixture.directory.path().join("authority.sqlite")).unwrap();
+    assert_eq!(
+        fixture
+            .ledger(&reopened)
+            .recover_target(&fixture.key, original.handle(), session.caller)
+            .unwrap(),
+        original
+    );
+    assert_eq!(
+        fixture
+            .ledger(&reopened)
+            .lookup(&fixture.key, original.handle(), session.caller)
+            .unwrap()
+            .unwrap()
+            .state(),
+        AuditOperationState::Rejected
+    );
+}
+
+#[tokio::test]
+async fn target_cleanup_successor_selects_one_concurrent_attempt_and_rejects_stale_predecessors() {
+    let fixture = Fixture::new().await;
+    let shared = fixture.backend.conn();
+    let conn = shared.lock().await;
+    fixture.active(&conn);
+    let worker = std::sync::Arc::new(());
+    let session = fixture.session_owner(&conn, &worker, 0x61);
+    session.invalidate();
+    let original = session
+        .retain_cleanup(fixture.cleanup_at(&conn, &session, 203, 100))
+        .unwrap();
+    fixture.expire_cleanup(&conn, &original);
+    fixture.settle(&conn, &original);
+    let first = fixture.cleanup_at(&conn, &session, 204, 160);
+    let later = fixture.cleanup_at(&conn, &session, 204, 161);
+    assert_ne!(first, later);
+    let ledger = fixture.ledger(&conn);
+    let key = fixture.key.clone();
+    let before = target_rows(&conn);
+    let barrier = std::sync::Barrier::new(2);
+    let outcomes = std::thread::scope(|scope| {
+        let one = scope.spawn(|| {
+            barrier.wait();
+            session
+                .retain_cleanup_successor(&original, first.clone(), &ledger, &key, 161)
+                .unwrap()
+        });
+        let two = scope.spawn(|| {
+            barrier.wait();
+            session
+                .clone()
+                .retain_cleanup_successor(&original, later.clone(), &ledger, &key, 161)
+                .unwrap()
+        });
+        (one.join().unwrap(), two.join().unwrap())
+    });
+    let selected = outcomes.0;
+    assert_eq!(selected, outcomes.1);
+    assert!(selected == first || selected == later);
+    assert_eq!(
+        session
+            .successor_cleanup(
+                &original,
+                &fixture.device_event(204),
+                Duration::from_secs(60)
+            )
+            .unwrap(),
+        Some(selected.clone())
+    );
+    assert!(matches!(
+        session.successor_cleanup(
+            &original,
+            &fixture.device_event(205),
+            Duration::from_secs(60)
+        ),
+        Err(AuditAuthorityError::BindingMismatch)
+    ));
+    assert!(matches!(
+        session.successor_cleanup(
+            &original,
+            &fixture.device_event(204),
+            Duration::from_secs(61)
+        ),
+        Err(AuditAuthorityError::BindingMismatch)
+    ));
+    assert!(matches!(
+        session.successor_cleanup(
+            &original,
+            &fixture.device_event(203),
+            Duration::from_secs(60)
+        ),
+        Err(AuditAuthorityError::BindingMismatch)
+    ));
+    let competing = fixture.cleanup_at(&conn, &session, 205, 162);
+    assert!(matches!(
+        session.retain_cleanup_successor(&original, competing, &ledger, &key, 162),
+        Err(AuditAuthorityError::BindingMismatch)
+    ));
+    assert_eq!(target_rows(&conn), before);
+    fixture.expire_cleanup(&conn, &selected);
+    fixture.settle(&conn, &selected);
+    let next = fixture.cleanup_at(&conn, &session, 206, 222);
+    assert_eq!(
+        session
+            .retain_cleanup_successor(
+                &selected,
+                next.clone(),
+                &fixture.ledger(&conn),
+                &fixture.key,
+                222
+            )
+            .unwrap(),
+        next
+    );
+    assert!(
+        matches!(
+            session.successor_cleanup(
+                &original,
+                &fixture.device_event(206),
+                Duration::from_secs(60)
+            ),
+            Err(AuditAuthorityError::BindingMismatch)
+        ),
+        "an old predecessor cannot select the current attempt"
+    );
+    assert!(matches!(
+        session.retain_cleanup_successor(
+            &original,
+            next.clone(),
+            &fixture.ledger(&conn),
+            &fixture.key,
+            222
+        ),
+        Err(AuditAuthorityError::BindingMismatch)
+    ));
+    assert_eq!(
+        session
+            .clone()
+            .original_cleanup(&fixture.device_event(206), Duration::from_secs(60))
+            .unwrap(),
+        Some(next)
+    );
+    for old in [&original, &selected] {
+        assert_eq!(
+            fixture
+                .ledger(&conn)
+                .recover_target(&fixture.key, old.handle(), session.caller)
+                .unwrap(),
+            *old
+        );
+        assert_eq!(
+            fixture
+                .ledger(&conn)
+                .lookup(&fixture.key, old.handle(), session.caller)
+                .unwrap()
+                .unwrap()
+                .state(),
+            AuditOperationState::Rejected
+        );
+    }
+    assert_eq!(target_rows(&conn), before);
+}
+
+#[tokio::test]
+async fn target_cleanup_successor_refuses_applied_cleanup_and_other_session_scope() {
+    let fixture = Fixture::new().await;
+    let shared = fixture.backend.conn();
+    let conn = shared.lock().await;
+    fixture.active(&conn);
+    let worker = std::sync::Arc::new(());
+    let session = fixture.session_owner(&conn, &worker, 0x61);
+    session.invalidate();
+    let original = session
+        .retain_cleanup(fixture.cleanup_at(&conn, &session, 207, 100))
+        .unwrap();
+    assert!(matches!(
+        fixture.submit(&conn, &original),
+        AuditOperationState::TargetV1(_)
+    ));
+    fixture.settle(&conn, &original);
+    let successor = fixture.cleanup_at(&conn, &session, 208, 160);
+    assert!(matches!(
+        session.retain_cleanup_successor(
+            &original,
+            successor,
+            &fixture.ledger(&conn),
+            &fixture.key,
+            160
+        ),
+        Err(AuditAuthorityError::RecoveryRequired)
+    ));
+    let other = fixture.session_owner(&conn, &worker, 0x62);
+    other.invalidate();
+    assert!(matches!(
+        other.successor_cleanup(
+            &original,
+            &fixture.device_event(208),
+            Duration::from_secs(60)
+        ),
+        Err(AuditAuthorityError::BindingMismatch)
+    ));
+    assert_eq!(
+        session
+            .original_cleanup(&fixture.device_event(207), Duration::from_secs(60))
+            .unwrap(),
+        Some(original)
+    );
+}
+
+#[tokio::test]
+async fn target_cleanup_successor_refuses_pruned_original_without_changing_pending_rollback() {
+    let fixture = Fixture::new().await;
+    let shared = fixture.backend.conn();
+    let conn = shared.lock().await;
+    let tentative = fixture.pending_fixture(&conn, true);
+    assert!(matches!(
+        fixture.submit(&conn, &tentative),
+        AuditOperationState::TargetV1(_)
+    ));
+    fixture.settle(&conn, &tentative);
+    let worker = std::sync::Arc::new(());
+    let session = fixture.session_owner(&conn, &worker, 0x61);
+    session.invalidate();
+    let original = session
+        .retain_cleanup(fixture.cleanup_at(&conn, &session, 209, 100))
+        .unwrap();
+    fixture.expire_cleanup(&conn, &original);
+    fixture.settle(&conn, &original);
+    let before = target_rows(&conn);
+    let successor = fixture.cleanup_at(&conn, &session, 210, 200);
+    let ledger = fixture.ledger(&conn);
+    assert_eq!(
+        original.verify_settled_cleanup_rejection(&session, &ledger, &fixture.key, 200),
+        Ok(())
+    );
+    // The fixture is the authority. This is a real acknowledged-prefix prune,
+    // not a recipient verification guarantee or a fabricated missing receipt.
+    let mut body = ledger
+        .continuity
+        .as_ref()
+        .unwrap()
+        .checkpoint
+        .as_ref()
+        .unwrap()
+        .body
+        .clone();
+    body.acknowledged_export = [0x78; 32];
+    let export = AuditCheckpoint::issue(&fixture.keys, body).unwrap();
+    fixture
+        .apply(&conn, AuditCommand::AcknowledgeExport(export.clone()), 200)
+        .unwrap();
+    fixture
+        .apply(
+            &conn,
+            AuditCommand::Prune {
+                through: ledger.sequence,
+                checkpoint: export,
+            },
+            200,
+        )
+        .unwrap();
+    let pruned = fixture.ledger(&conn);
+    assert!(pruned
+        .lookup(&fixture.key, original.handle(), session.caller)
+        .unwrap()
+        .is_none());
+    assert!(
+        session
+            .retain_cleanup_successor(&original, successor, &pruned, &fixture.key, 200)
+            .is_err(),
+        "pruned rejection cannot authorize a new cleanup"
+    );
+    assert_eq!(
+        session
+            .original_cleanup(&fixture.device_event(209), Duration::from_secs(60))
+            .unwrap(),
+        Some(original)
+    );
+    assert_eq!(
+        target_rows(&conn),
+        before,
+        "pending parent and deadline must remain unchanged"
+    );
+}
+
+fn copy_plaintext(request: u8, config: &[u8]) -> Vec<u8> {
+    let mut bytes = b"\x89OPCCFG\x02\r\n\x1a\n{\"config\":".to_vec();
+    bytes.extend_from_slice(config);
+    bytes.extend_from_slice(
+        format!(",\"request_id\":\"00000000-0000-4000-8000-{request:012x}\"}}").as_bytes(),
+    );
+    bytes
+}
+
+async fn copy_provider_stage(
+    fixture: &Fixture,
+    conn: &Connection,
+    slot: u8,
+    config: &[u8],
+) -> (
+    opc_key::MemoryKeyProvider,
+    crate::consensus::audit_mutation::TargetEncryptedBlobV1,
+) {
+    use crate::consensus::audit_mutation::TargetPayloadV1;
+    use opc_key::{KeyId, KeyPurpose, MemoryKeyProvider};
+    use sha2::{Digest, Sha256};
+    let provider = MemoryKeyProvider::new();
+    provider
+        .insert_active_key(
+            KeyId::new("fixture-target-key").unwrap(),
+            KeyPurpose::Config,
+            opc_types::TenantId::from_static("fixture-tenant"),
+            zeroize::Zeroizing::new([0x6a; 32]),
+        )
+        .unwrap();
+    let mut stage = fixture.encrypted(
+        fixture.request(conn, 180, if slot == 0 { 4 } else { 7 }, 0x61, slot + 1),
+        0x6a,
+    );
+    let Some(TargetPayloadV1::Target(blob)) = &mut stage.command_mut().effect.encrypted_payload
+    else {
+        panic!("target copy fixture");
+    };
+    let envelope = opc_crypto::CryptoEnvelopeRef::decode(&blob.encrypted_blob).unwrap();
+    let (aad, _) = opc_key::decode_bound_aad(envelope.aad).unwrap();
+    let plaintext = copy_plaintext(180, config);
+    let encrypted = opc_crypto::encrypt_attested_envelope(&provider, &aad, &plaintext)
+        .await
+        .unwrap();
+    blob.encrypted_blob = encrypted.encoded().to_vec();
+    blob.plaintext_digest = Sha256::digest(&plaintext).into();
+    let source = blob.clone();
+    let stage = fixture.rebind_at(conn, stage, 100);
+    assert!(matches!(
+        fixture.submit(conn, &stage),
+        AuditOperationState::TargetV1(_)
+    ));
+    fixture.settle(conn, &stage);
+    provider
+        .insert_active_key(
+            KeyId::new("fixture-running-key").unwrap(),
+            KeyPurpose::Config,
+            opc_types::TenantId::from_static("fixture-tenant"),
+            zeroize::Zeroizing::new([0x7b; 32]),
+        )
+        .unwrap();
+    (provider, source)
+}
+
+async fn copy_provider_destination(
+    fixture: &Fixture,
+    conn: &Connection,
+    provider: &opc_key::MemoryKeyProvider,
+    slot: u8,
+    request: u8,
+    config: &[u8],
+) -> PreparedTargetMutation {
+    use crate::consensus::audit_mutation::TargetPayloadV1;
+    use sha2::{Digest, Sha256};
+    let mut prepared = fixture.running_target(conn, request, 15, slot, 0x6a);
+    let Some(TargetPayloadV1::Running { commit, .. }) =
+        &mut prepared.command_mut().effect.encrypted_payload
+    else {
+        panic!("running copy fixture");
+    };
+    let envelope = opc_crypto::CryptoEnvelopeRef::decode(&commit.record.encrypted_blob).unwrap();
+    let (aad, _) = opc_key::decode_bound_aad(envelope.aad).unwrap();
+    let plaintext = copy_plaintext(request, config);
+    let encrypted = opc_crypto::encrypt_attested_envelope(provider, &aad, &plaintext)
+        .await
+        .unwrap();
+    let mut record = commit.record.clone();
+    record.encrypted_blob = encrypted.encoded().to_vec();
+    record.plaintext_digest = Sha256::digest(&plaintext).to_vec();
+    let attested =
+        crate::AttestedConfigCommit::try_new(record, Vec::new(), encrypted.claim().unwrap())
+            .unwrap();
+    let (record, audit, _) = attested.into_parts();
+    **commit =
+        crate::consensus::PreparedConfigCommit::prepare(record, audit, &fixture.key).unwrap();
+    fixture.rebind_at(conn, prepared, 100)
+}
+
+async fn bind_copy_provider(
+    fixture: &Fixture,
+    conn: &Connection,
+    provider: &dyn opc_key::KeyProvider,
+    source: &crate::consensus::audit_mutation::TargetEncryptedBlobV1,
+    mut prepared: PreparedTargetMutation,
+) -> Result<PreparedTargetMutation, AuditAuthorityError> {
+    prepared
+        .command_mut()
+        .effect
+        .bind_provider_copy(provider, source)
+        .await?;
+    Ok(fixture.rebind_at(conn, prepared, 100))
+}
+
+#[tokio::test]
+async fn target_provider_copy_accepts_distinct_authenticated_replay_wrappers() {
+    use crate::consensus::audit_mutation::TargetPayloadV1;
+    for slot in [0, 1] {
+        let fixture = Fixture::new().await;
+        let shared = fixture.backend.conn();
+        let conn = shared.lock().await;
+        fixture.active(&conn);
+        let config = br#"{"limit":9007199254740993,"items":[1,2]}"#;
+        let (provider, source) = copy_provider_stage(&fixture, &conn, slot, config).await;
+        let prepared =
+            copy_provider_destination(&fixture, &conn, &provider, slot, 181, config).await;
+        let prepared = bind_copy_provider(&fixture, &conn, &provider, &source, prepared)
+            .await
+            .unwrap();
+        let (commit, _) = prepared
+            .command()
+            .effect
+            .encrypted_payload
+            .as_ref()
+            .and_then(TargetPayloadV1::running)
+            .unwrap();
+        assert_ne!(commit.record.plaintext_digest, source.plaintext_digest);
+        for (ciphertext, expected) in [
+            (&source.encrypted_blob, copy_plaintext(180, config)),
+            (&commit.record.encrypted_blob, copy_plaintext(181, config)),
+        ] {
+            let envelope = opc_crypto::CryptoEnvelopeRef::decode(ciphertext).unwrap();
+            let (aad, _) = opc_key::decode_bound_aad(envelope.aad).unwrap();
+            let decoded = opc_crypto::decrypt_envelope(&provider, &aad, ciphertext)
+                .await
+                .unwrap();
+            assert_eq!(
+                *decoded, expected,
+                "exact configuration and original replay wrapper"
+            );
+        }
+        let before = row(&conn, "config_netconf_targets", "target", slot);
+        assert!(
+            matches!(fixture.submit(&conn, &prepared), AuditOperationState::TargetV1(r)
+                if matches!(r.outcome(), NetconfAppliedOutcome::CopiedRunning { running_version: 1 })),
+            "provider-authenticated copy of identical configuration rejected distinct replay wrappers"
+        );
+        assert_eq!(row(&conn, "config_netconf_targets", "target", slot), before);
+        let retained: Vec<u8> = conn
+            .query_row(
+                "SELECT encrypted_blob FROM config_history WHERE version=1",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(retained, commit.record.encrypted_blob);
+        fixture.settle(&conn, &prepared);
+    }
+}
+
+#[tokio::test]
+async fn target_provider_copy_refuses_content_substitution_and_authentication_failure_before_intent(
+) {
+    use crate::consensus::audit_mutation::TargetPayloadV1;
+    let fixture = Fixture::new().await;
+    let shared = fixture.backend.conn();
+    let conn = shared.lock().await;
+    fixture.active(&conn);
+    let config = br#"{"limit":9007199254740993}"#;
+    let (provider, source) = copy_provider_stage(&fixture, &conn, 0, config).await;
+    let before = target_rows(&conn);
+    let sequence = fixture.ledger(&conn).sequence;
+    // Adjacent large numbers must never become equal through float conversion.
+    let wrong = copy_provider_destination(
+        &fixture,
+        &conn,
+        &provider,
+        0,
+        181,
+        br#"{"limit":9007199254740992}"#,
+    )
+    .await;
+    assert!(
+        matches!(
+            bind_copy_provider(&fixture, &conn, &provider, &source, wrong).await,
+            Err(AuditAuthorityError::BindingMismatch)
+        ),
+        "provider copy accepted substituted configuration"
+    );
+    let exact = copy_provider_destination(&fixture, &conn, &provider, 0, 182, config).await;
+    let mut false_digest = source.clone();
+    false_digest.plaintext_digest[0] ^= 1;
+    assert!(matches!(
+        bind_copy_provider(&fixture, &conn, &provider, &false_digest, exact.clone()).await,
+        Err(AuditAuthorityError::BindingMismatch)
+    ));
+    let mut tampered = source.clone();
+    *tampered.encrypted_blob.last_mut().unwrap() ^= 1;
+    assert!(
+        bind_copy_provider(&fixture, &conn, &provider, &tampered, exact.clone())
+            .await
+            .is_err()
+    );
+    assert!(matches!(
+        bind_copy_provider(
+            &fixture,
+            &conn,
+            &opc_key::MemoryKeyProvider::new(),
+            &source,
+            exact.clone()
+        )
+        .await,
+        Err(AuditAuthorityError::Unavailable)
+    ));
+    let mut tampered_destination = exact.clone();
+    let Some(TargetPayloadV1::Running { commit, .. }) =
+        &mut tampered_destination.command_mut().effect.encrypted_payload
+    else {
+        panic!("running copy fixture");
+    };
+    *commit.record.encrypted_blob.last_mut().unwrap() ^= 1;
+    assert!(
+        bind_copy_provider(&fixture, &conn, &provider, &source, tampered_destination)
+            .await
+            .is_err()
+    );
+    let mut false_source = exact.clone();
+    let Some(crate::consensus::audit_mutation::TargetSourceV1::Candidate {
+        ciphertext_digest, ..
+    }) = &mut false_source.command_mut().effect.source
+    else {
+        panic!("candidate source fixture");
+    };
+    ciphertext_digest[0] ^= 1;
+    assert!(matches!(
+        bind_copy_provider(&fixture, &conn, &provider, &source, false_source).await,
+        Err(AuditAuthorityError::BindingMismatch)
+    ));
+    assert_eq!(target_rows(&conn), before);
+    assert_eq!(
+        fixture.ledger(&conn).sequence,
+        sequence,
+        "failed provider preparation admitted an intent"
+    );
+    assert_eq!(
+        conn.query_row("SELECT COUNT(*) FROM config_history", [], |r| r
+            .get::<_, u64>(0))
+            .unwrap(),
+        0
+    );
+    assert!(
+        bind_copy_provider(&fixture, &conn, &provider, &source, exact)
+            .await
+            .is_ok()
+    );
+}
+
+#[tokio::test]
+async fn target_provider_copy_retains_source_and_authenticated_binding_fences() {
+    let fixture = Fixture::new().await;
+    let shared = fixture.backend.conn();
+    let conn = shared.lock().await;
+    fixture.active(&conn);
+    let config = br#"{"enabled":true}"#;
+    let (provider, source) = copy_provider_stage(&fixture, &conn, 0, config).await;
+    let exact = copy_provider_destination(&fixture, &conn, &provider, 0, 181, config).await;
+    let exact = bind_copy_provider(&fixture, &conn, &provider, &source, exact)
+        .await
+        .unwrap();
+    let encoded = exact.encode().unwrap();
+    assert!(
+        !encoded.windows(config.len()).any(|w| w == config),
+        "configuration entered closed recovery data"
+    );
+    let mut changed: Value = serde_json::from_slice(&encoded).unwrap();
+    let binding = &mut changed["effect"]["encrypted_payload"]["provider-copy"]["binding"];
+    binding["source_plaintext_digest"][0] =
+        Value::from(binding["source_plaintext_digest"][0].as_u64().unwrap() ^ 1);
+    let untrusted = PreparedTargetMutation::decode(&serde_json::to_vec(&changed).unwrap()).unwrap();
+    assert!(
+        untrusted.verify_effect(&fixture.key).is_err(),
+        "decoded copy binding bypassed original effect authentication"
+    );
+    // Even an authority-side fault cannot substitute its claimed source digest
+    // for the digest in the authenticated retained row.
+    let corrupt = fixture.rebind_at(&conn, untrusted, 100);
+    let before = target_rows(&conn);
+    assert_eq!(
+        fixture.submit(&conn, &corrupt),
+        AuditOperationState::Rejected,
+        "copy accepted an unrelated source plaintext digest"
+    );
+    assert_eq!(target_rows(&conn), before);
+    fixture.settle(&conn, &corrupt);
+    let old = copy_provider_destination(&fixture, &conn, &provider, 0, 182, config).await;
+    let old = bind_copy_provider(&fixture, &conn, &provider, &source, old)
+        .await
+        .unwrap();
+    let replacement = fixture.encrypted(fixture.request(&conn, 183, 4, 0x61, 1), 0x6b);
+    assert!(matches!(
+        fixture.submit(&conn, &replacement),
+        AuditOperationState::TargetV1(_)
+    ));
+    fixture.settle(&conn, &replacement);
+    let before = target_rows(&conn);
+    assert_eq!(
+        fixture.submit(&conn, &old),
+        AuditOperationState::Rejected,
+        "provider binding bypassed exact source generation/ciphertext"
+    );
+    assert_eq!(target_rows(&conn), before);
+    assert_eq!(
+        conn.query_row("SELECT COUNT(*) FROM config_history", [], |r| r
+            .get::<_, u64>(0))
+            .unwrap(),
+        0
+    );
+    fixture.settle(&conn, &old);
+}
+
+#[tokio::test]
+async fn target_provider_copy_pinned_preparation_binds_current_session_and_locks() {
+    use crate::audit_authority::NetconfLockDatastore as Store;
+    use crate::consensus::audit_mutation::TargetPayloadV1;
+    for store in [Store::Candidate, Store::Startup] {
+        let slot = if store == Store::Candidate { 0 } else { 1 };
+        let fixture = Fixture::new().await;
+        let shared = fixture.backend.conn();
+        let conn = shared.lock().await;
+        fixture.active(&conn);
+        let config = br#"{"enabled":true}"#;
+        let (provider, source) = copy_provider_stage(&fixture, &conn, slot, config).await;
+        let original =
+            copy_provider_destination(&fixture, &conn, &provider, slot, 181, config).await;
+        let Some(TargetPayloadV1::Running { commit, .. }) =
+            original.command().effect.encrypted_payload.clone()
+        else {
+            panic!("running copy fixture");
+        };
+        let tx = conn.unchecked_transaction().unwrap();
+        let view = crate::consensus::audit_targets::read_copy_view_sync(
+            &tx,
+            &fixture.key,
+            &fixture.ledger(&tx),
+            store,
+            &crate::consensus::sqlite::SqliteWorkCancellation::audit_test(),
+        )
+        .unwrap()
+        .unwrap();
+        tx.commit().unwrap();
+        assert!(view.blob == source);
+        let worker = std::sync::Arc::new(());
+        let session = fixture.session_owner(&conn, &worker, 0x61);
+        let mut protocol = fixture.event(181);
+        protocol.operation = ManagementAuditOperationCode::Replace;
+        let mut effect = view
+            .prepare(&session, &protocol, (*commit).clone(), 160)
+            .unwrap();
+        effect
+            .bind_provider_copy(&provider, &view.blob)
+            .await
+            .unwrap();
+        let prepared = fixture.rebind_at(&conn, fixture.prepare(effect, protocol), 100);
+        assert!(matches!(
+            fixture.submit(&conn, &prepared),
+            AuditOperationState::TargetV1(_)
+        ));
+        fixture.settle(&conn, &prepared);
+        session.invalidate();
+        let mut later = fixture.event(182);
+        later.operation = ManagementAuditOperationCode::Replace;
+        assert!(matches!(
+            view.prepare(&session, &later, *commit, 160),
+            Err(AuditAuthorityError::BindingMismatch)
+        ));
+    }
+}
+fn provider_lifecycle_keys() -> opc_key::MemoryKeyProvider {
+    let provider = opc_key::MemoryKeyProvider::new();
+    for (name, seed) in [("fixture-target-key", 0x6a), ("fixture-running-key", 0x7b)] {
+        provider
+            .insert_active_key(
+                opc_key::KeyId::new(name).unwrap(),
+                opc_key::KeyPurpose::Config,
+                opc_types::TenantId::from_static("fixture-tenant"),
+                zeroize::Zeroizing::new([seed; 32]),
+            )
+            .unwrap();
+    }
+    provider
+}
+
+fn provider_history_blob(
+    conn: &Connection,
+    version: u64,
+) -> crate::consensus::audit_mutation::TargetEncryptedBlobV1 {
+    let (schema, digest, encrypted): (Vec<u8>, Vec<u8>, Vec<u8>) = conn
+        .query_row(
+            "SELECT schema_digest,plaintext_digest,encrypted_blob FROM config_history WHERE version=?1",
+            [version],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+        )
+        .unwrap();
+    crate::consensus::audit_mutation::TargetEncryptedBlobV1 {
+        schema: opc_types::SchemaDigest::from_bytes(schema.try_into().unwrap()),
+        plaintext_digest: digest.try_into().unwrap(),
+        encrypted_blob: encrypted,
+    }
+}
+
+async fn provider_assert_history(
+    conn: &Connection,
+    provider: &dyn opc_key::KeyProvider,
+    version: u64,
+    request: u8,
+    config: &[u8],
+) {
+    use sha2::{Digest, Sha256};
+    let blob = provider_history_blob(conn, version);
+    let envelope = opc_crypto::CryptoEnvelopeRef::decode(&blob.encrypted_blob).unwrap();
+    let (aad, _) = opc_key::decode_bound_aad(envelope.aad).unwrap();
+    assert_eq!(aad.version(), version);
+    let plaintext = opc_crypto::decrypt_envelope(provider, &aad, &blob.encrypted_blob)
+        .await
+        .unwrap();
+    assert_eq!(*plaintext, copy_plaintext(request, config));
+    assert_eq!(
+        <[u8; 32]>::from(Sha256::digest(&plaintext)),
+        blob.plaintext_digest
+    );
+}
+
+async fn provider_rewrap_running(
+    fixture: &Fixture,
+    conn: &Connection,
+    provider: &dyn opc_key::KeyProvider,
+    mut prepared: PreparedTargetMutation,
+    request: u8,
+    config: &[u8],
+) -> PreparedTargetMutation {
+    use crate::consensus::audit_mutation::TargetPayloadV1;
+    use sha2::{Digest, Sha256};
+    let Some(TargetPayloadV1::Running { commit, .. }) =
+        &mut prepared.command_mut().effect.encrypted_payload
+    else {
+        panic!("running lifecycle fixture");
+    };
+    let envelope = opc_crypto::CryptoEnvelopeRef::decode(&commit.record.encrypted_blob).unwrap();
+    let (aad, _) = opc_key::decode_bound_aad(envelope.aad).unwrap();
+    let plaintext = copy_plaintext(request, config);
+    let encrypted = opc_crypto::encrypt_attested_envelope(provider, &aad, &plaintext)
+        .await
+        .unwrap();
+    let mut record = commit.record.clone();
+    record.encrypted_blob = encrypted.encoded().to_vec();
+    record.plaintext_digest = Sha256::digest(&plaintext).to_vec();
+    let attested =
+        crate::AttestedConfigCommit::try_new(record, Vec::new(), encrypted.claim().unwrap())
+            .unwrap();
+    let (record, audit, _) = attested.into_parts();
+    **commit =
+        crate::consensus::PreparedConfigCommit::prepare(record, audit, &fixture.key).unwrap();
+    fixture.rebind_at(conn, prepared, 100)
+}
+
+async fn provider_stage_second_candidate(
+    fixture: &Fixture,
+    conn: &Connection,
+    config: &[u8],
+) -> crate::consensus::audit_mutation::TargetEncryptedBlobV1 {
+    use crate::consensus::audit_mutation::TargetPayloadV1;
+    use sha2::{Digest, Sha256};
+    let provider = opc_key::MemoryKeyProvider::new();
+    provider
+        .insert_active_key(
+            opc_key::KeyId::new("fixture-target-key").unwrap(),
+            opc_key::KeyPurpose::Config,
+            opc_types::TenantId::from_static("fixture-tenant"),
+            zeroize::Zeroizing::new([0x6a; 32]),
+        )
+        .unwrap();
+    let mut stage = fixture.encrypted(fixture.request(conn, 182, 4, 0x61, 1), 0x6a);
+    let Some(TargetPayloadV1::Target(blob)) = &mut stage.command_mut().effect.encrypted_payload
+    else {
+        panic!("second candidate fixture");
+    };
+    let envelope = opc_crypto::CryptoEnvelopeRef::decode(&blob.encrypted_blob).unwrap();
+    let (aad, _) = opc_key::decode_bound_aad(envelope.aad).unwrap();
+    let plaintext = copy_plaintext(182, config);
+    let encrypted = opc_crypto::encrypt_attested_envelope(&provider, &aad, &plaintext)
+        .await
+        .unwrap();
+    blob.encrypted_blob = encrypted.encoded().to_vec();
+    blob.plaintext_digest = Sha256::digest(&plaintext).into();
+    let source = blob.clone();
+    let stage = fixture.rebind_at(conn, stage, 100);
+    assert!(matches!(
+        fixture.submit(conn, &stage),
+        AuditOperationState::TargetV1(_)
+    ));
+    fixture.settle(conn, &stage);
+    source
+}
+
+async fn provider_rollback(
+    fixture: &Fixture,
+    conn: &Connection,
+    provider: &dyn opc_key::KeyProvider,
+    action: u8,
+    now: i64,
+    config: &[u8],
+) -> PreparedTargetMutation {
+    use crate::consensus::audit_mutation::{TargetPayloadV1, TargetSourceV1};
+    use opc_key::{ConfigAad, EnvelopeAad};
+    use sha2::{Digest, Sha256};
+    // Reuse only the ordinary confirmation identity/lock fixture. The copied
+    // destination and original parent are constructed separately below.
+    let mut prepared = fixture.resolve_fixture(conn, 184, 10, false, now);
+    let lifecycle = row(conn, "config_netconf_lifecycle", "singleton", 1);
+    let pending = &lifecycle["pending_confirmation"];
+    let parent = &lifecycle["rollback_parent"];
+    let version = pending["running_version"].as_u64().unwrap();
+    let source = provider_history_blob(conn, parent["version"].as_u64().unwrap());
+    let parent_tx = serde_json::from_value(pending["tx_id"].clone()).unwrap();
+    let tx_id = opc_types::TxId::new();
+    let committed_at = opc_types::Timestamp::from_offset_datetime(
+        time::OffsetDateTime::from_unix_timestamp(now).unwrap(),
+    );
+    let principal = r#"{"tenant":"fixture-tenant","subject":"fixture-principal"}"#.to_owned();
+    let aad = EnvelopeAad::config(
+        opc_types::TenantId::from_static("fixture-tenant"),
+        version + 1,
+        ConfigAad::new(
+            tx_id,
+            Some(parent_tx),
+            committed_at,
+            &principal,
+            source.schema,
+            "running",
+        )
+        .unwrap(),
+    );
+    let plaintext = copy_plaintext(184, config);
+    let encrypted = opc_crypto::encrypt_attested_envelope(provider, &aad, &plaintext)
+        .await
+        .unwrap();
+    let record = crate::CommitRecord {
+        tx_id,
+        parent_tx_id: Some(parent_tx),
+        version: opc_types::ConfigVersion::new(version + 1),
+        committed_at,
+        principal,
+        source: crate::CommitSource::CommitConfirmedRestore,
+        schema_digest: source.schema,
+        plaintext_digest: Sha256::digest(&plaintext).to_vec(),
+        encrypted_blob: encrypted.encoded().to_vec(),
+        rollback_point: false,
+        confirmed_deadline: None,
+    };
+    let attested =
+        crate::AttestedConfigCommit::try_new(record, Vec::new(), encrypted.claim().unwrap())
+            .unwrap();
+    let (record, audit, _) = attested.into_parts();
+    let commit =
+        crate::consensus::PreparedConfigCommit::prepare(record, audit, &fixture.key).unwrap();
+    prepared.command_mut().effect.action = action.try_into().unwrap();
+    prepared.command_mut().effect.destination = TargetExpectationV1::Running { version };
+    prepared.command_mut().effect.source = Some(TargetSourceV1::Running {
+        version: parent["version"].as_u64().unwrap(),
+        schema: source.schema,
+        ciphertext_digest: Sha256::digest(&source.encrypted_blob).into(),
+    });
+    prepared.command_mut().effect.encrypted_payload = Some(TargetPayloadV1::Running {
+        commit: Box::new(commit),
+        confirmation_ownership: None,
+    });
+    if action == 12 || action == 14 {
+        prepared.command_mut().handle.body.event.transport = ManagementAuditTransportCode::Internal;
+    }
+    if action == 14 {
+        prepared.command_mut().effect.resolution = Some(TargetResolutionV1::RebootRecovery {
+            previous_device: serde_json::from_value(pending["device_incarnation"].clone()).unwrap(),
+            pending: Some(serde_json::from_value(pending["pending"].clone()).unwrap()),
+            original_deadline: lifecycle["original_deadline"].as_i64(),
+        });
+    }
+    prepared
+        .command_mut()
+        .effect
+        .bind_provider_copy(provider, &source)
+        .await
+        .unwrap();
+    fixture.rebind_at(conn, prepared, now)
+}
+
+#[tokio::test]
+async fn target_provider_lifecycle_promotes_and_copies_exact_absent_candidate_fallback() {
+    use crate::audit_authority::NetconfLockDatastore;
+    use crate::consensus::audit_mutation::{TargetPayloadV1, TargetSourceV1};
+    let fixture = Fixture::new().await;
+    let shared = fixture.backend.conn();
+    let conn = shared.lock().await;
+    fixture.active(&conn);
+    let config = br#"{"counter":9007199254740993,"enabled":true}"#;
+    let (provider, source) = copy_provider_stage(&fixture, &conn, 0, config).await;
+    let promote = fixture.running_target(&conn, 181, 6, 0, 0x6a);
+    let promote = provider_rewrap_running(&fixture, &conn, &provider, promote, 181, config).await;
+    let promote = bind_copy_provider(&fixture, &conn, &provider, &source, promote)
+        .await
+        .unwrap();
+    assert!(
+        matches!(fixture.submit(&conn, &promote), AuditOperationState::TargetV1(r)
+        if matches!(r.outcome(), NetconfAppliedOutcome::Promoted { running_version: 1, retired_generation } if retired_generation.get() == 2))
+    );
+    fixture.settle(&conn, &promote);
+    provider_assert_history(&conn, &provider, 1, 181, config).await;
+    let candidate = row(&conn, "config_netconf_targets", "target", 0);
+    assert_eq!(candidate["present"], false);
+    let original = fixture.fallback_copy(&conn, 182);
+    let original = provider_rewrap_running(&fixture, &conn, &provider, original, 182, config).await;
+    let Some(TargetPayloadV1::Running { commit, .. }) =
+        original.command().effect.encrypted_payload.clone()
+    else {
+        panic!("fallback fixture");
+    };
+    let tx = conn.unchecked_transaction().unwrap();
+    let view = crate::consensus::audit_targets::read_copy_view_sync(
+        &tx,
+        &fixture.key,
+        &fixture.ledger(&tx),
+        NetconfLockDatastore::Candidate,
+        &crate::consensus::sqlite::SqliteWorkCancellation::audit_test(),
+    )
+    .unwrap()
+    .unwrap();
+    tx.commit().unwrap();
+    assert!(matches!(
+        view.source,
+        TargetSourceV1::CandidateFallback {
+            running_version: 1,
+            ..
+        }
+    ));
+    let worker = std::sync::Arc::new(());
+    let session = fixture.session_owner(&conn, &worker, 0x61);
+    let mut protocol = fixture.event(182);
+    protocol.operation = ManagementAuditOperationCode::Replace;
+    let mut effect = view.prepare(&session, &protocol, *commit, 160).unwrap();
+    effect
+        .bind_provider_copy(&provider, &view.blob)
+        .await
+        .unwrap();
+    let fallback = fixture.rebind_at(&conn, fixture.prepare(effect, protocol), 100);
+    assert!(
+        matches!(fixture.submit(&conn, &fallback), AuditOperationState::TargetV1(r)
+        if matches!(r.outcome(), NetconfAppliedOutcome::CopiedRunning { running_version: 2 }))
+    );
+    assert_eq!(row(&conn, "config_netconf_targets", "target", 0), candidate);
+    provider_assert_history(&conn, &provider, 2, 182, config).await;
+    fixture.settle(&conn, &fallback);
+}
+
+#[tokio::test]
+async fn target_provider_lifecycle_confirms_or_restores_exact_parent_for_each_resolution() {
+    let original_config = br#"{"counter":9007199254740993,"enabled":false}"#;
+    let tentative_config = br#"{"counter":9007199254740992,"enabled":true}"#;
+    for action in [10, 11, 12, 14] {
+        let fixture = Fixture::new().await;
+        let shared = fixture.backend.conn();
+        let conn = shared.lock().await;
+        fixture.active(&conn);
+        let (provider, source) = copy_provider_stage(&fixture, &conn, 0, original_config).await;
+        let promote = fixture.running_target(&conn, 181, 6, 0, 0x6a);
+        let promote =
+            provider_rewrap_running(&fixture, &conn, &provider, promote, 181, original_config)
+                .await;
+        let promote = bind_copy_provider(&fixture, &conn, &provider, &source, promote)
+            .await
+            .unwrap();
+        assert!(matches!(
+            fixture.submit(&conn, &promote),
+            AuditOperationState::TargetV1(_)
+        ));
+        fixture.settle(&conn, &promote);
+        let source = provider_stage_second_candidate(&fixture, &conn, tentative_config).await;
+        let tentative = fixture.tentative_target(&conn, 183, 0x6a);
+        let tentative =
+            provider_rewrap_running(&fixture, &conn, &provider, tentative, 183, tentative_config)
+                .await;
+        let tentative = bind_copy_provider(&fixture, &conn, &provider, &source, tentative)
+            .await
+            .unwrap();
+        assert!(
+            matches!(fixture.submit(&conn, &tentative), AuditOperationState::TargetV1(r)
+            if matches!(r.outcome(), NetconfAppliedOutcome::Tentative { running_version: 2, retired_generation, .. } if retired_generation.get() == 4)),
+            "provider copy did not atomically retain tentative ownership"
+        );
+        fixture.settle(&conn, &tentative);
+        provider_assert_history(&conn, &provider, 1, 181, original_config).await;
+        provider_assert_history(&conn, &provider, 2, 183, tentative_config).await;
+        let retained = target_rows(&conn);
+        let deadline = row(&conn, "config_netconf_lifecycle", "singleton", 1)["original_deadline"]
+            .as_i64()
+            .unwrap();
+        drop(conn);
+        drop(provider);
+        // Reopen persisted rows and reconstruct a fresh provider using the same
+        // synthetic custody material. This is component recovery, not a process
+        // restart or public NETCONF server qualification.
+        let conn = Connection::open(fixture.directory.path().join("authority.sqlite")).unwrap();
+        assert_eq!(target_rows(&conn), retained);
+        let provider = provider_lifecycle_keys();
+        if action == 14 {
+            let begin = fixture.request(&conn, 185, 1, 0x61, 0);
+            let begin = fixture.rebind_at(&conn, begin, 100);
+            assert!(matches!(
+                fixture.submit(&conn, &begin),
+                AuditOperationState::TargetV1(_)
+            ));
+            fixture.settle(&conn, &begin);
+        }
+        let now = if action == 12 { deadline } else { 100 };
+        let resolution = if action == 10 {
+            fixture.resolve_fixture(&conn, 184, 10, false, now)
+        } else {
+            provider_rollback(&fixture, &conn, &provider, action, now, original_config).await
+        };
+        let result = fixture.submit_at(&conn, &resolution, now);
+        assert!(
+            matches!(result, AuditOperationState::TargetV1(ref r) if
+            (action == 10 && matches!(r.outcome(), NetconfAppliedOutcome::Confirmed { .. })) ||
+            (action != 10 && matches!(r.outcome(), NetconfAppliedOutcome::RolledBack { running_version: 3, .. }))),
+            "provider copy resolution did not preserve its exact applied outcome"
+        );
+        if action == 10 {
+            provider_assert_history(&conn, &provider, 2, 183, tentative_config).await;
+        } else {
+            provider_assert_history(&conn, &provider, 3, 184, original_config).await;
+        }
+        fixture.assert_no_pending(&conn);
+        fixture.settle(&conn, &resolution);
+    }
+}
+
+#[tokio::test]
+async fn target_provider_lifecycle_recovers_admitted_copy_without_repeating_provider_preparation() {
+    let fixture = Fixture::new().await;
+    let shared = fixture.backend.conn();
+    let conn = shared.lock().await;
+    fixture.active(&conn);
+    let config = br#"{"enabled":true}"#;
+    let (provider, source) = copy_provider_stage(&fixture, &conn, 0, config).await;
+    let prepared = copy_provider_destination(&fixture, &conn, &provider, 0, 181, config).await;
+    let prepared = bind_copy_provider(&fixture, &conn, &provider, &source, prepared)
+        .await
+        .unwrap();
+    let encoded = prepared.encode().unwrap();
+    fixture
+        .apply(
+            &conn,
+            AuditCommand::NetconfTarget(Box::new(TargetAuditCommandV1::Admit(
+                prepared.command().clone(),
+            ))),
+            100,
+        )
+        .unwrap();
+    fixture.checkpoint(&conn);
+    let candidate = row(&conn, "config_netconf_targets", "target", 0);
+    drop(prepared);
+    drop(provider);
+    drop(conn);
+    let conn = Connection::open(fixture.directory.path().join("authority.sqlite")).unwrap();
+    let original = PreparedTargetMutation::decode(&encoded).unwrap();
+    original.verify_effect(&fixture.key).unwrap();
+    fixture
+        .apply(
+            &conn,
+            AuditCommand::NetconfTarget(Box::new(TargetAuditCommandV1::Apply(
+                original.command().clone(),
+            ))),
+            100,
+        )
+        .unwrap();
+    let outcome = fixture
+        .ledger(&conn)
+        .lookup(
+            &fixture.key,
+            original.handle(),
+            original.command().effect.caller,
+        )
+        .unwrap()
+        .unwrap();
+    assert!(matches!(outcome.state(), AuditOperationState::TargetV1(r)
+        if matches!(r.outcome(), NetconfAppliedOutcome::CopiedRunning { running_version: 1 })));
+    assert_eq!(row(&conn, "config_netconf_targets", "target", 0), candidate);
+    fixture.settle(&conn, &original);
+    let provider = provider_lifecycle_keys();
+    provider_assert_history(&conn, &provider, 1, 181, config).await;
+    // Replaying that exact original after its deadline does not append again.
+    fixture
+        .apply(
+            &conn,
+            AuditCommand::NetconfTarget(Box::new(TargetAuditCommandV1::Apply(
+                original.command().clone(),
+            ))),
+            200,
+        )
+        .unwrap();
+    assert_eq!(
+        conn.query_row("SELECT COUNT(*) FROM config_history", [], |r| r
+            .get::<_, u64>(0))
+            .unwrap(),
+        1
+    );
+}
+
+#[tokio::test]
+async fn target_provider_copy_preparation_accepts_exact_protocol_replace_operation() {
+    use crate::audit_authority::NetconfLockDatastore;
+    use crate::consensus::audit_mutation::TargetPayloadV1;
+    let fixture = Fixture::new().await;
+    let shared = fixture.backend.conn();
+    let conn = shared.lock().await;
+    fixture.active(&conn);
+    let config = br#"{"enabled":true}"#;
+    let (provider, _) = copy_provider_stage(&fixture, &conn, 0, config).await;
+    let original = copy_provider_destination(&fixture, &conn, &provider, 0, 181, config).await;
+    let Some(TargetPayloadV1::Running { commit, .. }) =
+        original.command().effect.encrypted_payload.clone()
+    else {
+        panic!("protocol copy fixture");
+    };
+    let tx = conn.unchecked_transaction().unwrap();
+    let view = crate::consensus::audit_targets::read_copy_view_sync(
+        &tx,
+        &fixture.key,
+        &fixture.ledger(&tx),
+        NetconfLockDatastore::Candidate,
+        &crate::consensus::sqlite::SqliteWorkCancellation::audit_test(),
+    )
+    .unwrap()
+    .unwrap();
+    tx.commit().unwrap();
+    let worker = std::sync::Arc::new(());
+    let session = fixture.session_owner(&conn, &worker, 0x61);
+    // NETCONF's copy-config handler uses Replace for its required Intent and
+    // both terminal paths. Preserve that operation through SDK preparation.
+    let mut protocol = fixture.event(181);
+    protocol.operation = ManagementAuditOperationCode::Replace;
+    let before = target_rows(&conn);
+    let candidate_before = row(&conn, "config_netconf_targets", "target", 0);
+    let sequence = fixture.ledger(&conn).sequence;
+    let effect = view.prepare(&session, &protocol, (*commit).clone(), 160);
+    assert_eq!(target_rows(&conn), before);
+    assert_eq!(fixture.ledger(&conn).sequence, sequence);
+    let mut effect = effect.expect("NETCONF Replace intent refused by copy preparation");
+    for wrong in [
+        ManagementAuditOperationCode::Exec,
+        ManagementAuditOperationCode::Read,
+        ManagementAuditOperationCode::Update,
+        ManagementAuditOperationCode::Delete,
+    ] {
+        let mut event = protocol.clone();
+        event.operation = wrong;
+        assert!(
+            matches!(
+                view.prepare(&session, &event, (*commit).clone(), 160),
+                Err(AuditAuthorityError::BindingMismatch)
+            ),
+            "copy preparation accepted another protocol operation"
+        );
+    }
+    let mut internal = protocol.clone();
+    internal.transport = ManagementAuditTransportCode::Internal;
+    assert!(view.prepare(&session, &internal, *commit, 160).is_err());
+    effect
+        .bind_provider_copy(&provider, &view.blob)
+        .await
+        .unwrap();
+    let prepared = fixture.rebind_at(&conn, fixture.prepare(effect, protocol), 100);
+    assert_eq!(
+        prepared.command().handle.body.event.operation,
+        ManagementAuditOperationCode::Replace
+    );
+    assert!(
+        matches!(fixture.submit(&conn, &prepared), AuditOperationState::TargetV1(r)
+        if matches!(r.outcome(), NetconfAppliedOutcome::CopiedRunning { running_version: 1 }))
+    );
+    assert_eq!(
+        row(&conn, "config_netconf_targets", "target", 0),
+        candidate_before
+    );
+    fixture.settle(&conn, &prepared);
+    provider_assert_history(&conn, &provider, 1, 181, config).await;
+}
+
+impl Fixture {
+    fn removal_view(
+        &self,
+        conn: &Connection,
+        datastore: crate::audit_authority::NetconfLockDatastore,
+    ) -> Result<crate::consensus::audit_targets::NetconfRemovalView, AuditAuthorityError> {
+        let tx = conn.unchecked_transaction().unwrap();
+        let view = crate::consensus::audit_targets::read_removal_view_sync(
+            &tx,
+            &self.key,
+            &self.ledger(&tx),
+            datastore,
+            &crate::consensus::sqlite::SqliteWorkCancellation::audit_test(),
+        )
+        .unwrap();
+        tx.commit().unwrap();
+        view
+    }
+
+    fn removal_event(
+        &self,
+        request: u8,
+        datastore: crate::audit_authority::NetconfLockDatastore,
+    ) -> ProjectedAuditEvent {
+        let mut event = self.event(request);
+        if datastore == crate::audit_authority::NetconfLockDatastore::Startup {
+            event.operation = ManagementAuditOperationCode::Delete;
+        }
+        event
+    }
+}
+
+#[tokio::test]
+async fn target_removal_advances_exact_tombstone_and_preserves_known_result_through_debt() {
+    use crate::audit_authority::NetconfLockDatastore as Store;
+    for datastore in [Store::Candidate, Store::Startup] {
+        let slot = u8::from(datastore == Store::Startup);
+        let fixture = Fixture::new().await;
+        let shared = fixture.backend.conn();
+        let conn = shared.lock().await;
+        fixture.active(&conn);
+        let worker = std::sync::Arc::new(());
+        let session = fixture.session_owner(&conn, &worker, 0x61);
+        let stage = fixture.encrypted(
+            fixture.request(&conn, 231, if slot == 0 { 4 } else { 7 }, 0x61, slot + 1),
+            0x73,
+        );
+        assert!(matches!(
+            fixture.submit(&conn, &stage),
+            AuditOperationState::TargetV1(_)
+        ));
+        fixture.settle(&conn, &stage);
+        let other = row(&conn, "config_netconf_targets", "target", 1 - slot);
+        for (request, generation) in [(232, 2), (233, 3)] {
+            let before = target_rows(&conn);
+            let sequence = fixture.ledger(&conn).sequence;
+            let event = fixture.removal_event(request, datastore);
+            let view = fixture.removal_view(&conn, datastore).unwrap();
+            let effect = view.prepare(&session, &event, 160).unwrap();
+            assert_eq!(target_rows(&conn), before);
+            assert_eq!(fixture.ledger(&conn).sequence, sequence);
+            let prepared = fixture.prepare(effect, event);
+            assert_eq!(fixture.preflight(&conn, &prepared, 100).unwrap(), None);
+            let outcome = fixture.submit(&conn, &prepared);
+            let AuditOperationState::TargetV1(result) = outcome else {
+                panic!("prepared target removal did not apply");
+            };
+            match (datastore, result.outcome()) {
+                (Store::Candidate, NetconfAppliedOutcome::Candidate { generation: value }) => {
+                    assert_eq!(value.get(), generation);
+                }
+                (Store::Startup, NetconfAppliedOutcome::Startup { revision }) => {
+                    assert_eq!(revision.get(), generation);
+                }
+                _ => panic!("target removal returned another target result"),
+            }
+            let target = row(&conn, "config_netconf_targets", "target", slot);
+            assert_eq!(target["generation"], generation);
+            assert_eq!(target["present"], false);
+            assert!(target["encrypted_envelope"].is_null());
+            assert_eq!(
+                row(&conn, "config_netconf_targets", "target", 1 - slot),
+                other
+            );
+            assert_eq!(fixture.device_view(&conn).running_version, 0);
+            let receipt = fixture
+                .ledger(&conn)
+                .lookup(&fixture.key, prepared.handle(), session.caller)
+                .unwrap()
+                .unwrap();
+            assert_eq!(receipt.state(), outcome);
+            assert!(!receipt.terminal_recorded());
+            assert!(matches!(
+                fixture.removal_view(&conn, datastore).unwrap().prepare(
+                    &session,
+                    &fixture.removal_event(234, datastore),
+                    160
+                ),
+                Err(AuditAuthorityError::RecoveryRequired)
+            ));
+            fixture.settle(&conn, &prepared);
+            let after = target_rows(&conn);
+            let sequence = fixture.ledger(&conn).sequence;
+            fixture
+                .apply(
+                    &conn,
+                    AuditCommand::NetconfTarget(Box::new(TargetAuditCommandV1::Apply(
+                        prepared.command().clone(),
+                    ))),
+                    if generation == 3 { 200 } else { 100 },
+                )
+                .unwrap();
+            assert_eq!(target_rows(&conn), after);
+            assert_eq!(fixture.ledger(&conn).sequence, sequence);
+            assert_eq!(
+                fixture
+                    .ledger(&conn)
+                    .lookup(&fixture.key, prepared.handle(), session.caller)
+                    .unwrap()
+                    .unwrap()
+                    .state(),
+                outcome
+            );
+        }
+    }
+}
+
+#[tokio::test]
+async fn target_removal_refuses_foreign_session_operation_and_observation_without_effect() {
+    use crate::audit_authority::{AuditCaller, NetconfLockDatastore as Store};
+    for datastore in [Store::Candidate, Store::Startup] {
+        let fixture = Fixture::new().await;
+        let shared = fixture.backend.conn();
+        let conn = shared.lock().await;
+        fixture.active(&conn);
+        let worker = std::sync::Arc::new(());
+        let session = fixture.session_owner(&conn, &worker, 0x61);
+        let foreign = fixture.session_owner(&conn, &worker, 0x62);
+        let event = fixture.event(235);
+        let acquire = fixture.prepare(
+            fixture
+                .device_view(&conn)
+                .prepare_lock(&session, &event, datastore, None, 160)
+                .unwrap(),
+            event,
+        );
+        assert!(matches!(
+            fixture.submit(&conn, &acquire),
+            AuditOperationState::TargetV1(_)
+        ));
+        fixture.settle(&conn, &acquire);
+        let view = fixture.removal_view(&conn, datastore).unwrap();
+        let event = fixture.removal_event(236, datastore);
+        assert!(view.prepare(&session, &event, 160).is_ok());
+        let before = target_rows(&conn);
+        let changes = conn.total_changes();
+        assert!(
+            matches!(
+                view.prepare(&foreign, &event, 160),
+                Err(AuditAuthorityError::BindingMismatch)
+            ),
+            "removal accepted another lock owner"
+        );
+        for variant in 0..4 {
+            let mut wrong = event.clone();
+            match variant {
+                0 => {
+                    wrong.caller = AuditCaller::project(
+                        &fixture.privacy,
+                        "fixture-tenant",
+                        "fixture-other-principal",
+                    )
+                    .unwrap()
+                }
+                1 => {
+                    wrong.operation = if datastore == Store::Candidate {
+                        ManagementAuditOperationCode::Delete
+                    } else {
+                        ManagementAuditOperationCode::Exec
+                    }
+                }
+                2 => wrong.transport = ManagementAuditTransportCode::Internal,
+                _ => wrong.outcome = ManagementAuditOutcomeCode::Success,
+            }
+            assert!(
+                matches!(
+                    view.prepare(&session, &wrong, 160),
+                    Err(AuditAuthorityError::BindingMismatch)
+                ),
+                "removal accepted mismatched audit context"
+            );
+        }
+        assert!(matches!(
+            fixture.removal_view(&conn, Store::Running),
+            Err(AuditAuthorityError::InvalidInput)
+        ));
+        session.invalidate();
+        assert!(matches!(
+            view.prepare(&session, &event, 160),
+            Err(AuditAuthorityError::BindingMismatch)
+        ));
+        assert_eq!(target_rows(&conn), before);
+        assert_eq!(conn.total_changes(), changes);
+    }
+}
+
+#[tokio::test]
+async fn target_removal_stale_generation_cannot_delete_recreated_target() {
+    use crate::audit_authority::NetconfLockDatastore as Store;
+    for datastore in [Store::Candidate, Store::Startup] {
+        let slot = u8::from(datastore == Store::Startup);
+        let fixture = Fixture::new().await;
+        let shared = fixture.backend.conn();
+        let conn = shared.lock().await;
+        fixture.active(&conn);
+        let worker = std::sync::Arc::new(());
+        let session = fixture.session_owner(&conn, &worker, 0x61);
+        let event = fixture.removal_event(237, datastore);
+        let stale = fixture.prepare(
+            fixture
+                .removal_view(&conn, datastore)
+                .unwrap()
+                .prepare(&session, &event, 160)
+                .unwrap(),
+            event,
+        );
+        let stage = fixture.encrypted(
+            fixture.request(&conn, 238, if slot == 0 { 4 } else { 7 }, 0x61, slot + 1),
+            0x74,
+        );
+        assert!(matches!(
+            fixture.submit(&conn, &stage),
+            AuditOperationState::TargetV1(_)
+        ));
+        fixture.settle(&conn, &stage);
+        let before = target_rows(&conn);
+        let sequence = fixture.ledger(&conn).sequence;
+        assert_eq!(
+            fixture.preflight(&conn, &stale, 100),
+            Err(AuditAuthorityError::BindingMismatch)
+        );
+        assert_eq!(target_rows(&conn), before);
+        assert_eq!(fixture.ledger(&conn).sequence, sequence);
+        // Retained application also refuses if a stale request bypasses the
+        // local preflight; its definite rejection and terminal are preserved.
+        assert_eq!(fixture.submit(&conn, &stale), AuditOperationState::Rejected);
+        assert_eq!(target_rows(&conn), before);
+        assert_eq!(fixture.device_view(&conn).running_version, 0);
+        fixture.settle(&conn, &stale);
+    }
+}
+
+#[tokio::test]
+async fn target_removal_preserves_pending_confirmation_and_original_owner() {
+    use crate::audit_authority::NetconfLockDatastore as Store;
+    for persistent in [false, true] {
+        let fixture = Fixture::new().await;
+        let shared = fixture.backend.conn();
+        let conn = shared.lock().await;
+        let tentative = fixture.pending_fixture(&conn, persistent);
+        assert!(matches!(
+            fixture.submit(&conn, &tentative),
+            AuditOperationState::TargetV1(_)
+        ));
+        fixture.settle(&conn, &tentative);
+        let worker = std::sync::Arc::new(());
+        let session = fixture.session_owner(&conn, &worker, 0x61);
+        let foreign = fixture.session_owner(&conn, &worker, 0x62);
+        let event = fixture.removal_event(239, Store::Candidate);
+        let candidate = fixture.removal_view(&conn, Store::Candidate).unwrap();
+        let before = target_rows(&conn);
+        let sequence = fixture.ledger(&conn).sequence;
+        assert!(
+            matches!(
+                candidate.prepare(&foreign, &event, 160),
+                Err(AuditAuthorityError::BindingMismatch)
+            ),
+            "pending removal accepted another session"
+        );
+        assert!(
+            matches!(
+                fixture
+                    .removal_view(&conn, Store::Startup)
+                    .unwrap()
+                    .prepare(&session, &fixture.removal_event(240, Store::Startup), 160),
+                Err(AuditAuthorityError::BindingMismatch)
+            ),
+            "pending confirmation allowed startup removal"
+        );
+        assert_eq!(target_rows(&conn), before);
+        assert_eq!(fixture.ledger(&conn).sequence, sequence);
+        let lifecycle = row(&conn, "config_netconf_lifecycle", "singleton", 1);
+        let startup = row(&conn, "config_netconf_targets", "target", 1);
+        let prepared = fixture.rebind_at(
+            &conn,
+            fixture.prepare(candidate.prepare(&session, &event, 160).unwrap(), event),
+            100,
+        );
+        assert!(
+            matches!(fixture.submit(&conn, &prepared), AuditOperationState::TargetV1(result)
+            if matches!(result.outcome(), NetconfAppliedOutcome::Candidate { .. }))
+        );
+        assert_eq!(
+            row(&conn, "config_netconf_lifecycle", "singleton", 1),
+            lifecycle
+        );
+        assert_eq!(row(&conn, "config_netconf_targets", "target", 1), startup);
+        assert_eq!(fixture.device_view(&conn).running_version, 2);
+        fixture.settle(&conn, &prepared);
+    }
+}
+
+impl Fixture {
+    fn frozen_target(
+        &self,
+        conn: &Connection,
+        session: &crate::audit_authority::NetconfSessionOwner,
+        datastore: crate::audit_authority::NetconfLockDatastore,
+    ) -> Result<crate::audit_authority::NetconfTargetRead, AuditAuthorityError> {
+        let tx = conn.unchecked_transaction().unwrap();
+        let ledger = self.ledger(&tx);
+        let value = crate::consensus::audit_targets::read_target_view_sync(
+            &tx,
+            &self.key,
+            &ledger,
+            datastore,
+            session,
+            &crate::consensus::sqlite::SqliteWorkCancellation::audit_test(),
+        )
+        .unwrap();
+        tx.commit().unwrap();
+        value
+    }
+
+    fn bind_frozen_target(
+        &self,
+        frozen: &crate::audit_authority::NetconfTargetRead,
+        effect: TargetEffectV1,
+        event: ProjectedAuditEvent,
+    ) -> PreparedTargetMutation {
+        let digest = effect.digest(&self.key).unwrap();
+        let binding = AuditOperationBinding::project(
+            &self.privacy,
+            &event,
+            frozen.running_base_version(),
+            &digest,
+        )
+        .unwrap();
+        let handle = AuditOperationHandle::issue(
+            HandleBody {
+                version: 1,
+                identity: self.identity,
+                binding,
+                event,
+                issued_at: 100,
+                expires_at: effect.expires_at,
+                nonce: [0x54; 16],
+                key_epoch: self.key.epoch(),
+                mutation: Some(digest),
+            },
+            &self.key,
+        )
+        .unwrap();
+        PreparedTargetMutation::new(handle, effect, None)
+    }
+}
+
+fn replacement_provider() -> opc_key::MemoryKeyProvider {
+    let provider = opc_key::MemoryKeyProvider::new();
+    provider
+        .insert_active_key(
+            opc_key::KeyId::new("fixture-replacement-key").unwrap(),
+            opc_key::KeyPurpose::Config,
+            opc_types::TenantId::from_static("fixture-tenant"),
+            zeroize::Zeroizing::new([0x7d; 32]),
+        )
+        .unwrap();
+    provider
+}
+
+#[tokio::test]
+async fn target_replacement_freezes_exact_read_encrypts_and_retains_known_result() {
+    use crate::audit_authority::{NetconfLockDatastore as Store, NetconfTargetReplacement};
+    for datastore in [Store::Candidate, Store::Startup] {
+        let fixture = Fixture::new().await;
+        let shared = fixture.backend.conn();
+        let conn = shared.lock().await;
+        fixture.active(&conn);
+        let worker = std::sync::Arc::new(());
+        let session = fixture.session_owner(&conn, &worker, 0x61);
+        let provider = replacement_provider();
+        let tenant = opc_types::TenantId::from_static("fixture-tenant");
+        let schema = opc_types::SchemaDigest::from_bytes([0x71; 32]);
+        let frozen = fixture.frozen_target(&conn, &session, datastore).unwrap();
+        assert_eq!(frozen.datastore(), datastore);
+        assert_eq!(frozen.running_base_version(), 0);
+        assert!(!frozen.uses_running_fallback());
+        assert_eq!(frozen.schema(), None);
+        assert!(frozen.encrypted_configuration().is_none());
+        assert!(frozen
+            .decrypt_configuration(&provider, &tenant)
+            .await
+            .unwrap()
+            .is_none());
+        let plaintext = copy_plaintext(240, br#"{"exact":9007199254740993}"#);
+        let mut event = fixture.event(240);
+        event.operation = ManagementAuditOperationCode::Update;
+        let before = target_rows(&conn);
+        let changes = conn.total_changes();
+        let effect = frozen
+            .prepare_replacement(
+                &session,
+                NetconfTargetReplacement::edit(&frozen, &plaintext, schema, &provider),
+                tenant.clone(),
+                &event,
+                160,
+            )
+            .await
+            .unwrap();
+        let prepared = fixture.bind_frozen_target(&frozen, effect, event);
+        assert_eq!(fixture.preflight(&conn, &prepared, 100).unwrap(), None);
+        assert_eq!(target_rows(&conn), before);
+        assert_eq!(conn.total_changes(), changes);
+        let known = fixture.submit(&conn, &prepared);
+        assert!(matches!(known, AuditOperationState::TargetV1(_)));
+        let retained = target_rows(&conn);
+        assert!(matches!(
+            fixture.frozen_target(&conn, &session, datastore),
+            Err(AuditAuthorityError::RecoveryRequired)
+        ));
+        assert_eq!(
+            fixture
+                .preflight(&conn, &prepared, 500)
+                .unwrap()
+                .unwrap()
+                .state(),
+            known
+        );
+        assert_eq!(fixture.submit(&conn, &prepared), known);
+        assert_eq!(target_rows(&conn), retained, "known replay changed target");
+        fixture.settle(&conn, &prepared);
+        let read = fixture.frozen_target(&conn, &session, datastore).unwrap();
+        assert_eq!(read.schema(), Some(schema));
+        let counter = match datastore {
+            Store::Candidate => read.candidate_generation().unwrap().get(),
+            Store::Startup => read.startup_revision().unwrap().get(),
+            _ => unreachable!(),
+        };
+        assert_eq!(counter, 1);
+        assert_eq!(
+            read.decrypt_configuration(&provider, &tenant)
+                .await
+                .unwrap()
+                .unwrap()
+                .as_slice(),
+            plaintext
+        );
+        assert_eq!(format!("{read:?}"), "NetconfTargetRead(<redacted>)");
+        // Inline content carries Replace. This is not a datastore-copy claim.
+        let replacement = copy_plaintext(241, br#"{"exact":2}"#);
+        let mut event = fixture.event(241);
+        event.operation = ManagementAuditOperationCode::Replace;
+        let effect = read
+            .prepare_replacement(
+                &session,
+                NetconfTargetReplacement::inline_copy(&read, &replacement, schema, &provider),
+                tenant.clone(),
+                &event,
+                160,
+            )
+            .await
+            .unwrap();
+        let prepared = fixture.bind_frozen_target(&read, effect, event);
+        assert_eq!(fixture.preflight(&conn, &prepared, 100).unwrap(), None);
+        assert!(matches!(
+            fixture.submit(&conn, &prepared),
+            AuditOperationState::TargetV1(_)
+        ));
+        fixture.settle(&conn, &prepared);
+        let read = fixture.frozen_target(&conn, &session, datastore).unwrap();
+        assert_eq!(
+            read.decrypt_configuration(&provider, &tenant)
+                .await
+                .unwrap()
+                .unwrap()
+                .as_slice(),
+            replacement
+        );
+        assert_eq!(fixture.device_view(&conn).running_version, 0);
+        assert_eq!(
+            row(
+                &conn,
+                "config_netconf_targets",
+                "target",
+                u8::from(datastore == Store::Candidate)
+            )["generation"],
+            0
+        );
+    }
+}
+
+#[tokio::test]
+async fn target_replacement_refuses_edit_computed_before_intervening_replacement() {
+    use crate::audit_authority::{NetconfLockDatastore as Store, NetconfTargetReplacement};
+    for datastore in [Store::Candidate, Store::Startup] {
+        let fixture = Fixture::new().await;
+        let shared = fixture.backend.conn();
+        let conn = shared.lock().await;
+        fixture.active(&conn);
+        let slot = u8::from(datastore == Store::Startup);
+        let (provider, _) = copy_provider_stage(&fixture, &conn, slot, br#"{"base":"a"}"#).await;
+        let worker = std::sync::Arc::new(());
+        let session = fixture.session_owner(&conn, &worker, 0x61);
+        let frozen_a = fixture.frozen_target(&conn, &session, datastore).unwrap();
+        let tenant = opc_types::TenantId::from_static("fixture-tenant");
+        let a = frozen_a
+            .decrypt_configuration(&provider, &tenant)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(a.as_slice(), copy_plaintext(180, br#"{"base":"a"}"#));
+        let edit_from_a = copy_plaintext(242, br#"{"base":"a","edit":true}"#);
+        // Another request commits after A was read but before A is prepared.
+        let frozen_b = fixture.frozen_target(&conn, &session, datastore).unwrap();
+        let replacement_b = copy_plaintext(243, br#"{"base":"b"}"#);
+        let mut event_b = fixture.event(243);
+        event_b.operation = ManagementAuditOperationCode::Update;
+        let effect_b = frozen_b
+            .prepare_replacement(
+                &session,
+                NetconfTargetReplacement::edit(
+                    &frozen_b,
+                    &replacement_b,
+                    frozen_b.schema().unwrap(),
+                    &provider,
+                ),
+                tenant.clone(),
+                &event_b,
+                160,
+            )
+            .await
+            .unwrap();
+        let prepared_b = fixture.bind_frozen_target(&frozen_b, effect_b, event_b);
+        assert!(matches!(
+            fixture.submit(&conn, &prepared_b),
+            AuditOperationState::TargetV1(_)
+        ));
+        fixture.settle(&conn, &prepared_b);
+        let before = target_rows(&conn);
+        let sequence = fixture.ledger(&conn).sequence;
+        let mut event_a = fixture.event(242);
+        event_a.operation = ManagementAuditOperationCode::Update;
+        let effect_a = frozen_a
+            .prepare_replacement(
+                &session,
+                NetconfTargetReplacement::edit(
+                    &frozen_a,
+                    &edit_from_a,
+                    frozen_a.schema().unwrap(),
+                    &provider,
+                ),
+                tenant.clone(),
+                &event_a,
+                160,
+            )
+            .await
+            .unwrap();
+        let prepared_a = fixture.bind_frozen_target(&frozen_a, effect_a, event_a);
+        assert_eq!(
+            fixture.preflight(&conn, &prepared_a, 100),
+            Err(AuditAuthorityError::BindingMismatch),
+            "stale edit acquired a newer destination"
+        );
+        assert_eq!(target_rows(&conn), before);
+        assert_eq!(fixture.ledger(&conn).sequence, sequence);
+        assert_eq!(
+            fixture.submit(&conn, &prepared_a),
+            AuditOperationState::Rejected
+        );
+        assert_eq!(target_rows(&conn), before);
+        fixture.settle(&conn, &prepared_a);
+        let latest = fixture.frozen_target(&conn, &session, datastore).unwrap();
+        assert_eq!(
+            latest
+                .decrypt_configuration(&provider, &tenant)
+                .await
+                .unwrap()
+                .unwrap()
+                .as_slice(),
+            replacement_b
+        );
+    }
+}
+
+#[tokio::test]
+async fn target_replacement_refuses_session_context_provider_and_content_substitution() {
+    use crate::audit_authority::{NetconfLockDatastore as Store, NetconfTargetReplacement};
+    let fixture = Fixture::new().await;
+    let shared = fixture.backend.conn();
+    let conn = shared.lock().await;
+    fixture.active(&conn);
+    let (provider, _) = copy_provider_stage(&fixture, &conn, 0, br#"{"value":1}"#).await;
+    let worker = std::sync::Arc::new(());
+    let session = fixture.session_owner(&conn, &worker, 0x61);
+    let other = fixture.session_owner(&conn, &worker, 0x62);
+    let mut frozen = fixture
+        .frozen_target(&conn, &session, Store::Candidate)
+        .unwrap();
+    let tenant = opc_types::TenantId::from_static("fixture-tenant");
+    let schema = frozen.schema().unwrap();
+    let plaintext = copy_plaintext(244, br#"{"value":2}"#);
+    let mut event = fixture.event(244);
+    event.operation = ManagementAuditOperationCode::Update;
+    let before = target_rows(&conn);
+    let changes = conn.total_changes();
+    assert!(
+        matches!(
+            frozen
+                .prepare_replacement(
+                    &other,
+                    NetconfTargetReplacement::edit(&frozen, &plaintext, schema, &provider),
+                    tenant.clone(),
+                    &event,
+                    160,
+                )
+                .await,
+            Err(AuditAuthorityError::BindingMismatch)
+        ),
+        "frozen edit accepted a different session"
+    );
+    for variant in 0..4 {
+        let mut wrong = event.clone();
+        match variant {
+            0 => wrong.operation = ManagementAuditOperationCode::Replace,
+            1 => wrong.transport = ManagementAuditTransportCode::Internal,
+            2 => wrong.outcome = ManagementAuditOutcomeCode::Success,
+            _ => {
+                wrong.caller = crate::audit_authority::AuditCaller::project(
+                    &fixture.privacy,
+                    "fixture-tenant",
+                    "fixture-other",
+                )
+                .unwrap()
+            }
+        }
+        assert!(
+            matches!(
+                frozen
+                    .prepare_replacement(
+                        &session,
+                        NetconfTargetReplacement::edit(&frozen, &plaintext, schema, &provider),
+                        tenant.clone(),
+                        &wrong,
+                        160,
+                    )
+                    .await,
+                Err(AuditAuthorityError::BindingMismatch)
+            ),
+            "frozen edit accepted mismatched audit context"
+        );
+    }
+    let missing = opc_key::MemoryKeyProvider::new();
+    assert!(matches!(
+        frozen.decrypt_configuration(&missing, &tenant).await,
+        Err(AuditAuthorityError::Unavailable)
+    ));
+    assert!(matches!(
+        frozen
+            .prepare_replacement(
+                &session,
+                NetconfTargetReplacement::edit(&frozen, &plaintext, schema, &missing),
+                tenant.clone(),
+                &event,
+                160,
+            )
+            .await,
+        Err(AuditAuthorityError::Unavailable)
+    ));
+    let foreign_tenant = opc_types::TenantId::from_static("fixture-other-tenant");
+    assert!(matches!(
+        frozen
+            .decrypt_configuration(&provider, &foreign_tenant)
+            .await,
+        Err(AuditAuthorityError::BindingMismatch)
+    ));
+    assert!(matches!(
+        frozen
+            .prepare_replacement(
+                &session,
+                NetconfTargetReplacement::edit(&frozen, &plaintext, schema, &provider),
+                foreign_tenant,
+                &event,
+                160,
+            )
+            .await,
+        Err(AuditAuthorityError::BindingMismatch)
+    ));
+    let content = frozen.content.as_mut().unwrap();
+    content.plaintext_digest[0] ^= 1;
+    assert!(matches!(
+        frozen.decrypt_configuration(&provider, &tenant).await,
+        Err(AuditAuthorityError::BindingMismatch)
+    ));
+    frozen.content.as_mut().unwrap().plaintext_digest[0] ^= 1;
+    let bytes = &mut frozen.content.as_mut().unwrap().encrypted;
+    *bytes.last_mut().unwrap() ^= 1;
+    assert!(frozen
+        .decrypt_configuration(&provider, &tenant)
+        .await
+        .is_err());
+    session.invalidate();
+    assert!(matches!(
+        frozen
+            .prepare_replacement(
+                &session,
+                NetconfTargetReplacement::edit(&frozen, &plaintext, schema, &provider),
+                tenant.clone(),
+                &event,
+                160,
+            )
+            .await,
+        Err(AuditAuthorityError::BindingMismatch)
+    ));
+    assert_eq!(target_rows(&conn), before);
+    assert_eq!(conn.total_changes(), changes);
+}
+
+#[tokio::test]
+async fn target_replacement_preserves_original_lock_even_when_target_is_unchanged() {
+    use crate::audit_authority::{NetconfLockDatastore as Store, NetconfTargetReplacement};
+    let fixture = Fixture::new().await;
+    let shared = fixture.backend.conn();
+    let conn = shared.lock().await;
+    fixture.active(&conn);
+    let worker = std::sync::Arc::new(());
+    let session = fixture.session_owner(&conn, &worker, 0x61);
+    let frozen = fixture
+        .frozen_target(&conn, &session, Store::Startup)
+        .unwrap();
+    let event = fixture.event(245);
+    let acquire = fixture.prepare(
+        fixture
+            .device_view(&conn)
+            .prepare_lock(&session, &event, Store::Startup, None, 160)
+            .unwrap(),
+        event,
+    );
+    assert!(matches!(
+        fixture.submit(&conn, &acquire),
+        AuditOperationState::TargetV1(_)
+    ));
+    fixture.settle(&conn, &acquire);
+    let provider = replacement_provider();
+    let mut event = fixture.event(246);
+    event.operation = ManagementAuditOperationCode::Update;
+    let effect = frozen
+        .prepare_replacement(
+            &session,
+            NetconfTargetReplacement::edit(
+                &frozen,
+                b"{}",
+                opc_types::SchemaDigest::from_bytes([0x71; 32]),
+                &provider,
+            ),
+            opc_types::TenantId::from_static("fixture-tenant"),
+            &event,
+            160,
+        )
+        .await
+        .unwrap();
+    let prepared = fixture.bind_frozen_target(&frozen, effect, event);
+    let before = target_rows(&conn);
+    let sequence = fixture.ledger(&conn).sequence;
+    assert_eq!(
+        fixture.preflight(&conn, &prepared, 100),
+        Err(AuditAuthorityError::BindingMismatch)
+    );
+    assert_eq!(target_rows(&conn), before);
+    assert_eq!(fixture.ledger(&conn).sequence, sequence);
+    assert_eq!(
+        row(&conn, "config_netconf_targets", "target", 1)["generation"],
+        0
+    );
+}
+
+#[tokio::test]
+async fn target_replacement_binds_absent_candidate_fallback_and_pending_owner() {
+    use crate::audit_authority::{NetconfLockDatastore as Store, NetconfTargetReplacement};
+    for persistent in [false, true] {
+        let fixture = Fixture::new().await;
+        let shared = fixture.backend.conn();
+        let conn = shared.lock().await;
+        let tentative = fixture.pending_fixture(&conn, persistent);
+        assert!(matches!(
+            fixture.submit(&conn, &tentative),
+            AuditOperationState::TargetV1(_)
+        ));
+        fixture.settle(&conn, &tentative);
+        let worker = std::sync::Arc::new(());
+        let session = fixture.session_owner(&conn, &worker, 0x61);
+        let other = fixture.session_owner(&conn, &worker, 0x62);
+        let before = target_rows(&conn);
+        let sequence = fixture.ledger(&conn).sequence;
+        assert!(
+            matches!(
+                fixture.frozen_target(&conn, &other, Store::Candidate),
+                Err(AuditAuthorityError::BindingMismatch)
+            ),
+            "pending edit read accepted another session"
+        );
+        assert!(matches!(
+            fixture.frozen_target(&conn, &session, Store::Startup),
+            Err(AuditAuthorityError::BindingMismatch)
+        ));
+        assert!(matches!(
+            fixture.frozen_target(&conn, &session, Store::Running),
+            Err(AuditAuthorityError::InvalidInput)
+        ));
+        let frozen = fixture
+            .frozen_target(&conn, &session, Store::Candidate)
+            .unwrap();
+        assert!(frozen.uses_running_fallback());
+        assert_eq!(frozen.running_base_version(), 2);
+        assert_eq!(target_rows(&conn), before);
+        assert_eq!(fixture.ledger(&conn).sequence, sequence);
+        let lifecycle = row(&conn, "config_netconf_lifecycle", "singleton", 1);
+        let provider = replacement_provider();
+        let mut event = fixture.event(247);
+        event.operation = ManagementAuditOperationCode::Update;
+        let effect = frozen
+            .prepare_replacement(
+                &session,
+                NetconfTargetReplacement::edit(&frozen, b"{}", frozen.schema().unwrap(), &provider),
+                opc_types::TenantId::from_static("fixture-tenant"),
+                &event,
+                160,
+            )
+            .await
+            .unwrap();
+        let prepared = fixture.bind_frozen_target(&frozen, effect, event);
+        assert_eq!(prepared.command().handle.body.binding.base_version, 2);
+        assert_eq!(fixture.preflight(&conn, &prepared, 100).unwrap(), None);
+        assert!(matches!(
+            fixture.submit(&conn, &prepared),
+            AuditOperationState::TargetV1(_)
+        ));
+        assert_eq!(
+            row(&conn, "config_netconf_lifecycle", "singleton", 1),
+            lifecycle
+        );
+        assert_eq!(fixture.device_view(&conn).running_version, 2);
+        fixture.settle(&conn, &prepared);
+    }
+}
+
+#[tokio::test]
+async fn target_replacement_rejects_malformed_and_oversized_content_before_admission() {
+    use crate::audit_authority::{NetconfLockDatastore as Store, NetconfTargetReplacement};
+    let fixture = Fixture::new().await;
+    let shared = fixture.backend.conn();
+    let conn = shared.lock().await;
+    fixture.active(&conn);
+    let worker = std::sync::Arc::new(());
+    let session = fixture.session_owner(&conn, &worker, 0x61);
+    let frozen = fixture
+        .frozen_target(&conn, &session, Store::Candidate)
+        .unwrap();
+    let missing = opc_key::MemoryKeyProvider::new();
+    let schema = opc_types::SchemaDigest::from_bytes([0x71; 32]);
+    let tenant = opc_types::TenantId::from_static("fixture-tenant");
+    let mut event = fixture.event(248);
+    event.operation = ManagementAuditOperationCode::Update;
+    let before = target_rows(&conn);
+    let changes = conn.total_changes();
+    for bytes in [
+        b"".as_slice(),
+        b"{",
+        b"\x89OPCCFG\x02\r\n\x1a\n{\"config\":{},\"extra\":1}",
+    ] {
+        assert!(matches!(
+            frozen
+                .prepare_replacement(
+                    &session,
+                    NetconfTargetReplacement::edit(&frozen, bytes, schema, &missing),
+                    tenant.clone(),
+                    &event,
+                    160,
+                )
+                .await,
+            Err(AuditAuthorityError::BindingMismatch)
+        ));
+    }
+    let oversized = vec![b' '; crate::consensus::sqlite::CONFIG_CONSENSUS_LOG_ENTRY_MAX_BYTES + 1];
+    assert!(
+        matches!(
+            frozen
+                .prepare_replacement(
+                    &session,
+                    NetconfTargetReplacement::edit(&frozen, &oversized, schema, &missing),
+                    tenant.clone(),
+                    &event,
+                    160,
+                )
+                .await,
+            Err(AuditAuthorityError::InvalidInput)
+        ),
+        "input bound reached unavailable provider"
+    );
+    drop(oversized);
+    // Below the plaintext bound, serialization/recovery still must fit the
+    // existing aggregate limits. Encryption success grants no intent admission.
+    let provider = replacement_provider();
+    let mut bounded =
+        vec![b'x'; crate::consensus::sqlite::CONFIG_CONSENSUS_LOG_ENTRY_MAX_BYTES / 2];
+    bounded[0] = b'"';
+    *bounded.last_mut().unwrap() = b'"';
+    let effect = frozen
+        .prepare_replacement(
+            &session,
+            NetconfTargetReplacement::edit(&frozen, &bounded, schema, &provider),
+            tenant,
+            &event,
+            160,
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        effect.digest(&fixture.key),
+        Err(AuditAuthorityError::InvalidInput)
+    );
+    assert_eq!(target_rows(&conn), before);
+    assert_eq!(conn.total_changes(), changes);
+    drop(effect);
+    drop(bounded);
+
+    // Each operation below is representable on its own. Retaining the first
+    // original leaves insufficient aggregate space for the second recovery and
+    // future terminal obligations. No byte or event limit is increased.
+    let mut content =
+        vec![b'x'; crate::consensus::sqlite::CONFIG_CONSENSUS_LOG_ENTRY_MAX_BYTES / 16 * 3];
+    content[0] = b'"';
+    *content.last_mut().unwrap() = b'"';
+    let effect = frozen
+        .prepare_replacement(
+            &session,
+            NetconfTargetReplacement::edit(&frozen, &content, schema, &provider),
+            opc_types::TenantId::from_static("fixture-tenant"),
+            &event,
+            160,
+        )
+        .await
+        .unwrap();
+    let first = fixture.bind_frozen_target(&frozen, effect, event);
+    assert!(first.encode().is_ok());
+    assert_eq!(fixture.preflight(&conn, &first, 100).unwrap(), None);
+    assert!(matches!(
+        fixture.submit(&conn, &first),
+        AuditOperationState::TargetV1(_)
+    ));
+    fixture.settle(&conn, &first);
+    let next = fixture
+        .frozen_target(&conn, &session, Store::Candidate)
+        .unwrap();
+    let mut event = fixture.event(249);
+    event.operation = ManagementAuditOperationCode::Update;
+    let effect = next
+        .prepare_replacement(
+            &session,
+            NetconfTargetReplacement::edit(&next, &content, schema, &provider),
+            opc_types::TenantId::from_static("fixture-tenant"),
+            &event,
+            160,
+        )
+        .await
+        .unwrap();
+    let second = fixture.bind_frozen_target(&next, effect, event);
+    assert!(second.encode().is_ok());
+    let retained = target_rows(&conn);
+    let changes = conn.total_changes();
+    let sequence = fixture.ledger(&conn).sequence;
+    assert_eq!(
+        fixture.preflight(&conn, &second, 100),
+        Err(AuditAuthorityError::Full)
+    );
+    assert_eq!(target_rows(&conn), retained);
+    assert_eq!(fixture.ledger(&conn).sequence, sequence);
+    assert_eq!(conn.total_changes(), changes);
+}
+
+async fn datastore_copy_lock_fixture(
+    fixture: &Fixture,
+    conn: &Connection,
+    source_slot: u8,
+    requester: u8,
+    request: u8,
+    provider: &dyn opc_key::KeyProvider,
+    config: &[u8],
+) -> PreparedTargetMutation {
+    use crate::audit_authority::{NetconfLockDatastore as Store, NetconfTargetReplacement};
+    let worker = std::sync::Arc::new(());
+    let session = fixture.session_owner(conn, &worker, requester);
+    let (source, destination) = if source_slot == 0 {
+        (Store::Candidate, Store::Startup)
+    } else {
+        (Store::Startup, Store::Candidate)
+    };
+    let tx = conn.unchecked_transaction().unwrap();
+    let ledger = fixture.ledger(&tx);
+    let original = crate::consensus::audit_targets::read_copy_view_sync(
+        &tx,
+        &fixture.key,
+        &ledger,
+        source,
+        &crate::consensus::sqlite::SqliteWorkCancellation::audit_test(),
+    )
+    .unwrap()
+    .unwrap();
+    let frozen = crate::consensus::audit_targets::read_target_view_sync(
+        &tx,
+        &fixture.key,
+        &ledger,
+        destination,
+        &session,
+        &crate::consensus::sqlite::SqliteWorkCancellation::audit_test(),
+    )
+    .unwrap()
+    .unwrap();
+    tx.commit().unwrap();
+    let source_envelope =
+        opc_crypto::CryptoEnvelopeRef::decode(&original.blob.encrypted_blob).unwrap();
+    let (source_aad, _) = opc_key::decode_bound_aad(source_envelope.aad).unwrap();
+    let source_plaintext =
+        opc_crypto::decrypt_envelope(provider, &source_aad, &original.blob.encrypted_blob)
+            .await
+            .unwrap();
+    assert_eq!(*source_plaintext, copy_plaintext(180, config));
+    let plaintext = copy_plaintext(request, config);
+    let tenant = opc_types::TenantId::from_static("fixture-tenant");
+    let mut event = fixture.event(request);
+    event.operation = ManagementAuditOperationCode::Replace;
+    // This fixture exercises the existing closed authority reducer. Public
+    // datastore-copy preparation remains a separate, unavailable SDK port.
+    let mut effect = frozen
+        .prepare_replacement(
+            &session,
+            NetconfTargetReplacement::inline_copy(
+                &frozen,
+                &plaintext,
+                original.blob.schema,
+                provider,
+            ),
+            tenant.clone(),
+            &event,
+            160,
+        )
+        .await
+        .unwrap();
+    effect.source = Some(original.source);
+    effect.encrypted_payload = None;
+    effect
+        .bind_target_plaintext(
+            tenant,
+            NetconfTargetReplacement::inline_copy(
+                &frozen,
+                &plaintext,
+                original.blob.schema,
+                provider,
+            ),
+        )
+        .await
+        .unwrap();
+    fixture.bind_frozen_target(&frozen, effect, event)
+}
+
+#[tokio::test]
+async fn target_datastore_copy_preserves_source_with_unowned_or_own_source_lock() {
+    use crate::consensus::audit_mutation::TargetPayloadV1;
+    for source_slot in [0, 1] {
+        for locked in [false, true] {
+            let fixture = Fixture::new().await;
+            let shared = fixture.backend.conn();
+            let conn = shared.lock().await;
+            fixture.active(&conn);
+            let config = br#"{"source":9007199254740993}"#;
+            let (provider, _) = copy_provider_stage(&fixture, &conn, source_slot, config).await;
+            if locked {
+                let lock = fixture.request(&conn, 201, 2, 0x61, source_slot + 1);
+                assert!(matches!(
+                    fixture.submit(&conn, &lock),
+                    AuditOperationState::TargetV1(_)
+                ));
+                fixture.settle(&conn, &lock);
+            }
+            let prepared = datastore_copy_lock_fixture(
+                &fixture,
+                &conn,
+                source_slot,
+                0x61,
+                202,
+                &provider,
+                config,
+            )
+            .await;
+            assert_eq!(fixture.preflight(&conn, &prepared, 100).unwrap(), None);
+            let source = row(&conn, "config_netconf_targets", "target", source_slot);
+            let known = fixture.submit(&conn, &prepared);
+            assert!(matches!(known, AuditOperationState::TargetV1(_)));
+            let target = row(&conn, "config_netconf_targets", "target", 1 - source_slot);
+            assert_eq!(target["generation"], 1);
+            assert_eq!(
+                row(&conn, "config_netconf_targets", "target", source_slot),
+                source
+            );
+            let Some(TargetPayloadV1::Target(blob)) = &prepared.command().effect.encrypted_payload
+            else {
+                panic!("datastore copy target payload");
+            };
+            let envelope = opc_crypto::CryptoEnvelopeRef::decode(&blob.encrypted_blob).unwrap();
+            let (aad, _) = opc_key::decode_bound_aad(envelope.aad).unwrap();
+            let actual = opc_crypto::decrypt_envelope(&provider, &aad, &blob.encrypted_blob)
+                .await
+                .unwrap();
+            assert_eq!(*actual, copy_plaintext(202, config));
+            let before_replay = target_rows(&conn);
+            assert_eq!(fixture.submit(&conn, &prepared), known);
+            assert_eq!(target_rows(&conn), before_replay);
+            fixture.settle(&conn, &prepared);
+        }
+    }
+}
+
+#[tokio::test]
+async fn target_datastore_copy_refuses_original_source_locked_by_another_session() {
+    for source_slot in [0, 1] {
+        let fixture = Fixture::new().await;
+        let shared = fixture.backend.conn();
+        let conn = shared.lock().await;
+        fixture.active(&conn);
+        let config = br#"{"source":"original"}"#;
+        let (provider, _) = copy_provider_stage(&fixture, &conn, source_slot, config).await;
+        let prepared =
+            datastore_copy_lock_fixture(&fixture, &conn, source_slot, 0x62, 203, &provider, config)
+                .await;
+        assert_eq!(fixture.preflight(&conn, &prepared, 100).unwrap(), None);
+        let lock = fixture.request(&conn, 204, 2, 0x61, source_slot + 1);
+        assert!(matches!(
+            fixture.submit(&conn, &lock),
+            AuditOperationState::TargetV1(_)
+        ));
+        fixture.settle(&conn, &lock);
+        let before = target_rows(&conn);
+        let changes = conn.total_changes();
+        assert!(
+            matches!(
+                fixture.preflight(&conn, &prepared, 100),
+                Err(AuditAuthorityError::BindingMismatch)
+            ),
+            "target copy ignored a source lock acquired by another session"
+        );
+        assert_eq!(conn.total_changes(), changes);
+        assert_eq!(target_rows(&conn), before);
+        assert_eq!(
+            fixture.submit(&conn, &prepared),
+            AuditOperationState::Rejected
+        );
+        assert_eq!(target_rows(&conn), before);
+        let receipt = fixture
+            .ledger(&conn)
+            .lookup(
+                &fixture.key,
+                prepared.handle(),
+                prepared.command().effect.caller,
+            )
+            .unwrap()
+            .unwrap();
+        assert!(!receipt.terminal_recorded());
+        fixture.settle(&conn, &prepared);
+    }
+}
+
+#[tokio::test]
+async fn target_datastore_copy_refuses_source_replaced_after_preparation() {
+    use crate::audit_authority::{NetconfLockDatastore as Store, NetconfTargetReplacement};
+    for source_slot in [0, 1] {
+        let fixture = Fixture::new().await;
+        let shared = fixture.backend.conn();
+        let conn = shared.lock().await;
+        fixture.active(&conn);
+        let config = br#"{"source":"original"}"#;
+        let (provider, _) = copy_provider_stage(&fixture, &conn, source_slot, config).await;
+        let prepared =
+            datastore_copy_lock_fixture(&fixture, &conn, source_slot, 0x61, 205, &provider, config)
+                .await;
+        assert_eq!(fixture.preflight(&conn, &prepared, 100).unwrap(), None);
+        let worker = std::sync::Arc::new(());
+        let session = fixture.session_owner(&conn, &worker, 0x61);
+        let datastore = if source_slot == 0 {
+            Store::Candidate
+        } else {
+            Store::Startup
+        };
+        let frozen = fixture.frozen_target(&conn, &session, datastore).unwrap();
+        let replacement = copy_plaintext(206, br#"{"source":"replacement"}"#);
+        let mut event = fixture.event(206);
+        event.operation = ManagementAuditOperationCode::Update;
+        let effect = frozen
+            .prepare_replacement(
+                &session,
+                NetconfTargetReplacement::edit(
+                    &frozen,
+                    &replacement,
+                    frozen.schema().unwrap(),
+                    &provider,
+                ),
+                opc_types::TenantId::from_static("fixture-tenant"),
+                &event,
+                160,
+            )
+            .await
+            .unwrap();
+        let changed = fixture.bind_frozen_target(&frozen, effect, event);
+        assert!(matches!(
+            fixture.submit(&conn, &changed),
+            AuditOperationState::TargetV1(_)
+        ));
+        fixture.settle(&conn, &changed);
+        let before = target_rows(&conn);
+        let changes = conn.total_changes();
+        assert!(
+            matches!(
+                fixture.preflight(&conn, &prepared, 100),
+                Err(AuditAuthorityError::BindingMismatch)
+            ),
+            "target copy accepted a source substituted after preparation"
+        );
+        assert_eq!(conn.total_changes(), changes);
+        assert_eq!(target_rows(&conn), before);
+        assert_eq!(
+            fixture.submit(&conn, &prepared),
+            AuditOperationState::Rejected
+        );
+        assert_eq!(target_rows(&conn), before);
+        fixture.settle(&conn, &prepared);
+    }
+}
+
+impl Fixture {
+    fn frozen_target_copy(
+        &self,
+        conn: &Connection,
+        session: &crate::audit_authority::NetconfSessionOwner,
+        source: crate::audit_authority::NetconfLockDatastore,
+        destination: crate::audit_authority::NetconfLockDatastore,
+    ) -> Result<crate::audit_authority::NetconfTargetCopyRead, AuditAuthorityError> {
+        let tx = conn.unchecked_transaction().unwrap();
+        let ledger = self.ledger(&tx);
+        let view = crate::consensus::audit_targets::read_target_copy_view_sync(
+            &tx,
+            &self.key,
+            &ledger,
+            source,
+            destination,
+            session,
+            &crate::consensus::sqlite::SqliteWorkCancellation::audit_test(),
+        )
+        .unwrap();
+        tx.commit().unwrap();
+        view
+    }
+}
+
+async fn target_copy_sdk_source(
+    fixture: &Fixture,
+    conn: &Connection,
+    source: crate::audit_authority::NetconfLockDatastore,
+    fallback: bool,
+    config: &[u8],
+) -> opc_key::MemoryKeyProvider {
+    use crate::audit_authority::NetconfLockDatastore as Store;
+    let slot = u8::from(source == Store::Startup);
+    let (provider, blob) = copy_provider_stage(fixture, conn, slot, config).await;
+    if source == Store::Running || fallback {
+        let running = copy_provider_destination(fixture, conn, &provider, slot, 181, config).await;
+        let running = bind_copy_provider(fixture, conn, &provider, &blob, running)
+            .await
+            .unwrap();
+        assert!(matches!(
+            fixture.submit(conn, &running),
+            AuditOperationState::TargetV1(_)
+        ));
+        fixture.settle(conn, &running);
+        if fallback {
+            let discard = fixture.rebind_at(conn, fixture.request(conn, 182, 5, 0x61, 1), 100);
+            assert!(matches!(
+                fixture.submit(conn, &discard),
+                AuditOperationState::TargetV1(_)
+            ));
+            fixture.settle(conn, &discard);
+        }
+    }
+    provider
+}
+
+#[tokio::test]
+async fn target_copy_sdk_freezes_each_source_and_preserves_exact_encrypted_configuration() {
+    use crate::audit_authority::{NetconfLockDatastore as Store, NetconfTargetCopy};
+    for (source, destination, fallback) in [
+        (Store::Running, Store::Candidate, false),
+        (Store::Running, Store::Startup, false),
+        (Store::Candidate, Store::Startup, false),
+        (Store::Candidate, Store::Startup, true),
+        (Store::Startup, Store::Candidate, false),
+    ] {
+        let fixture = Fixture::new().await;
+        let shared = fixture.backend.conn();
+        let conn = shared.lock().await;
+        fixture.active(&conn);
+        let config = br#"{"exact":18446744073709551617,"escaped":"\u0061","v":-0.0}"#;
+        let provider = target_copy_sdk_source(&fixture, &conn, source, fallback, config).await;
+        let worker = std::sync::Arc::new(());
+        let session = fixture.session_owner(&conn, &worker, 0x61);
+        let frozen = fixture
+            .frozen_target_copy(&conn, &session, source, destination)
+            .unwrap();
+        assert_eq!(frozen.source_datastore(), source);
+        assert_eq!(frozen.destination().datastore(), destination);
+        assert_eq!(frozen.uses_running_fallback(), fallback);
+        let source_plaintext = copy_plaintext(
+            if source == Store::Running || fallback {
+                181
+            } else {
+                180
+            },
+            config,
+        );
+        let tenant = opc_types::TenantId::from_static("fixture-tenant");
+        assert_eq!(
+            *frozen.decrypt_source(&provider, &tenant).await.unwrap(),
+            source_plaintext
+        );
+        let source_row = match source {
+            Store::Candidate => Some(row(&conn, "config_netconf_targets", "target", 0)),
+            Store::Startup => Some(row(&conn, "config_netconf_targets", "target", 1)),
+            Store::Running => None,
+        };
+        let running = fixture.device_view(&conn).running_version;
+        let plaintext = copy_plaintext(207, config);
+        let mut event = fixture.event(207);
+        event.operation = ManagementAuditOperationCode::Replace;
+        let before = target_rows(&conn);
+        let changes = conn.total_changes();
+        let effect = frozen
+            .prepare_copy(
+                &session,
+                NetconfTargetCopy::new(&frozen, &plaintext, &provider),
+                tenant.clone(),
+                &event,
+                160,
+            )
+            .await
+            .unwrap();
+        let prepared = fixture.bind_frozen_target(frozen.destination(), effect, event);
+        assert_eq!(fixture.preflight(&conn, &prepared, 100).unwrap(), None);
+        assert_eq!(conn.total_changes(), changes);
+        assert_eq!(target_rows(&conn), before);
+        let known = fixture.submit(&conn, &prepared);
+        assert!(matches!(&known, AuditOperationState::TargetV1(result)
+        if match (destination, result.outcome()) {
+            (Store::Candidate, NetconfAppliedOutcome::Candidate { generation }) =>
+                generation.get() == frozen.destination().candidate_generation().unwrap().get() + 1,
+            (Store::Startup, NetconfAppliedOutcome::Startup { revision }) =>
+                revision.get() == frozen.destination().startup_revision().unwrap().get() + 1,
+            _ => false,
+        }));
+        let retained = target_rows(&conn);
+        assert_eq!(fixture.submit(&conn, &prepared), known);
+        assert_eq!(target_rows(&conn), retained);
+        assert!(matches!(
+            fixture.frozen_target_copy(&conn, &session, source, destination),
+            Err(AuditAuthorityError::RecoveryRequired)
+        ));
+        assert!(!fixture
+            .ledger(&conn)
+            .lookup(
+                &fixture.key,
+                prepared.handle(),
+                prepared.command().effect.caller
+            )
+            .unwrap()
+            .unwrap()
+            .terminal_recorded());
+        fixture.settle(&conn, &prepared);
+        if let Some(original) = source_row {
+            let slot = u8::from(source == Store::Startup);
+            assert_eq!(
+                row(&conn, "config_netconf_targets", "target", slot),
+                original
+            );
+        }
+        assert_eq!(fixture.device_view(&conn).running_version, running);
+        let readback = fixture.frozen_target(&conn, &session, destination).unwrap();
+        assert_eq!(
+            *readback
+                .decrypt_configuration(&provider, &tenant)
+                .await
+                .unwrap()
+                .unwrap(),
+            plaintext
+        );
+        assert_ne!(source_plaintext, plaintext);
+    }
+}
+
+#[tokio::test]
+async fn target_copy_sdk_refuses_content_session_context_and_provider_substitution() {
+    use crate::audit_authority::{NetconfLockDatastore as Store, NetconfTargetCopy};
+    let fixture = Fixture::new().await;
+    let shared = fixture.backend.conn();
+    let conn = shared.lock().await;
+    fixture.active(&conn);
+    let config = br#"{"authorized":1}"#;
+    let provider = target_copy_sdk_source(&fixture, &conn, Store::Candidate, false, config).await;
+    let worker = std::sync::Arc::new(());
+    let session = fixture.session_owner(&conn, &worker, 0x61);
+    let other = fixture.session_owner(&conn, &worker, 0x62);
+    let mut frozen = fixture
+        .frozen_target_copy(&conn, &session, Store::Candidate, Store::Startup)
+        .unwrap();
+    let another = fixture
+        .frozen_target_copy(&conn, &session, Store::Candidate, Store::Startup)
+        .unwrap();
+    let plaintext = copy_plaintext(208, config);
+    let substituted = copy_plaintext(208, br#"{"authorized":2}"#);
+    let tenant = opc_types::TenantId::from_static("fixture-tenant");
+    let mut event = fixture.event(208);
+    event.operation = ManagementAuditOperationCode::Replace;
+    let before = target_rows(&conn);
+    let changes = conn.total_changes();
+    for bytes in [substituted.as_slice(), b"not-json".as_slice()] {
+        assert!(
+            matches!(
+                frozen
+                    .prepare_copy(
+                        &session,
+                        NetconfTargetCopy::new(&frozen, bytes, &provider),
+                        tenant.clone(),
+                        &event,
+                        160
+                    )
+                    .await,
+                Err(AuditAuthorityError::BindingMismatch)
+            ),
+            "SDK datastore copy accepted substituted configuration"
+        );
+    }
+    for (owner, original) in [(&other, &frozen), (&session, &another)] {
+        assert!(matches!(
+            frozen
+                .prepare_copy(
+                    owner,
+                    NetconfTargetCopy::new(original, &plaintext, &provider),
+                    tenant.clone(),
+                    &event,
+                    160
+                )
+                .await,
+            Err(AuditAuthorityError::BindingMismatch)
+        ));
+    }
+    for variant in 0..4 {
+        let mut wrong = event.clone();
+        match variant {
+            0 => wrong.operation = ManagementAuditOperationCode::Update,
+            1 => wrong.transport = ManagementAuditTransportCode::Internal,
+            2 => wrong.outcome = ManagementAuditOutcomeCode::Success,
+            _ => {
+                wrong.caller = crate::audit_authority::AuditCaller::project(
+                    &fixture.privacy,
+                    "fixture-tenant",
+                    "fixture-other",
+                )
+                .unwrap()
+            }
+        }
+        assert!(matches!(
+            frozen
+                .prepare_copy(
+                    &session,
+                    NetconfTargetCopy::new(&frozen, &plaintext, &provider),
+                    tenant.clone(),
+                    &wrong,
+                    160
+                )
+                .await,
+            Err(AuditAuthorityError::BindingMismatch)
+        ));
+    }
+    let missing = opc_key::MemoryKeyProvider::new();
+    assert!(matches!(
+        frozen
+            .prepare_copy(
+                &session,
+                NetconfTargetCopy::new(&frozen, &plaintext, &missing),
+                tenant.clone(),
+                &event,
+                160
+            )
+            .await,
+        Err(AuditAuthorityError::Unavailable)
+    ));
+    assert!(matches!(
+        frozen
+            .prepare_copy(
+                &session,
+                NetconfTargetCopy::new(&frozen, &plaintext, &provider),
+                opc_types::TenantId::from_static("fixture-other-tenant"),
+                &event,
+                160
+            )
+            .await,
+        Err(AuditAuthorityError::BindingMismatch)
+    ));
+    frozen.source.content.as_mut().unwrap().plaintext_digest[0] ^= 1;
+    assert!(matches!(
+        frozen
+            .prepare_copy(
+                &session,
+                NetconfTargetCopy::new(&frozen, &plaintext, &provider),
+                tenant.clone(),
+                &event,
+                160
+            )
+            .await,
+        Err(AuditAuthorityError::BindingMismatch)
+    ));
+    frozen.source.content.as_mut().unwrap().plaintext_digest[0] ^= 1;
+    *frozen
+        .source
+        .content
+        .as_mut()
+        .unwrap()
+        .encrypted
+        .last_mut()
+        .unwrap() ^= 1;
+    assert!(frozen
+        .prepare_copy(
+            &session,
+            NetconfTargetCopy::new(&frozen, &plaintext, &provider),
+            tenant,
+            &event,
+            160
+        )
+        .await
+        .is_err());
+    assert_eq!(conn.total_changes(), changes);
+    assert_eq!(target_rows(&conn), before);
+}
+
+#[tokio::test]
+async fn target_copy_sdk_refuses_absent_same_and_running_destinations_before_effect() {
+    use crate::audit_authority::NetconfLockDatastore as Store;
+    let fixture = Fixture::new().await;
+    let shared = fixture.backend.conn();
+    let conn = shared.lock().await;
+    fixture.active(&conn);
+    let worker = std::sync::Arc::new(());
+    let session = fixture.session_owner(&conn, &worker, 0x61);
+    let before = target_rows(&conn);
+    let changes = conn.total_changes();
+    for (source, destination) in [
+        (Store::Running, Store::Candidate),
+        (Store::Running, Store::Startup),
+        (Store::Candidate, Store::Startup),
+        (Store::Startup, Store::Candidate),
+        (Store::Candidate, Store::Candidate),
+        (Store::Startup, Store::Startup),
+        (Store::Candidate, Store::Running),
+    ] {
+        assert!(matches!(
+            fixture.frozen_target_copy(&conn, &session, source, destination),
+            Err(AuditAuthorityError::InvalidInput)
+        ));
+    }
+    assert_eq!(conn.total_changes(), changes);
+    assert_eq!(target_rows(&conn), before);
+}
+
+#[tokio::test]
+async fn target_copy_sdk_never_refreshes_original_source_destination_or_locks() {
+    use crate::audit_authority::{
+        NetconfLockDatastore as Store, NetconfTargetCopy, NetconfTargetReplacement,
+    };
+    for change in [
+        "source",
+        "destination",
+        "source-lock",
+        "destination-lock",
+        "fallback",
+    ] {
+        let fixture = Fixture::new().await;
+        let shared = fixture.backend.conn();
+        let conn = shared.lock().await;
+        fixture.active(&conn);
+        let config = br#"{"original":1}"#;
+        let provider = target_copy_sdk_source(
+            &fixture,
+            &conn,
+            Store::Candidate,
+            change == "fallback",
+            config,
+        )
+        .await;
+        let worker = std::sync::Arc::new(());
+        let session = fixture.session_owner(&conn, &worker, 0x62);
+        let frozen = fixture
+            .frozen_target_copy(&conn, &session, Store::Candidate, Store::Startup)
+            .unwrap();
+        let copied = copy_plaintext(209, config);
+        // Change authoritative state before encryption/preparation. The SDK
+        // must still prepare the exact saved read, then reject it at preflight.
+        if change.ends_with("-lock") {
+            let slot = if change == "source-lock" { 1 } else { 2 };
+            let locked = fixture.rebind_at(&conn, fixture.request(&conn, 210, 2, 0x61, slot), 100);
+            assert!(matches!(
+                fixture.submit(&conn, &locked),
+                AuditOperationState::TargetV1(_)
+            ));
+            fixture.settle(&conn, &locked);
+        } else {
+            let owner = fixture.session_owner(&conn, &worker, 0x61);
+            let changed_store = if change == "destination" {
+                Store::Startup
+            } else {
+                Store::Candidate
+            };
+            let base = fixture.frozen_target(&conn, &owner, changed_store).unwrap();
+            let replacement = copy_plaintext(210, br#"{"replacement":2}"#);
+            let mut event = fixture.event(210);
+            event.operation = ManagementAuditOperationCode::Update;
+            let effect = base
+                .prepare_replacement(
+                    &owner,
+                    NetconfTargetReplacement::edit(
+                        &base,
+                        &replacement,
+                        frozen.schema().unwrap(),
+                        &provider,
+                    ),
+                    opc_types::TenantId::from_static("fixture-tenant"),
+                    &event,
+                    160,
+                )
+                .await
+                .unwrap();
+            let changed = fixture.bind_frozen_target(&base, effect, event);
+            assert!(matches!(
+                fixture.submit(&conn, &changed),
+                AuditOperationState::TargetV1(_)
+            ));
+            fixture.settle(&conn, &changed);
+        }
+        let before = target_rows(&conn);
+        let changes = conn.total_changes();
+        let mut event = fixture.event(209);
+        event.operation = ManagementAuditOperationCode::Replace;
+        let effect = frozen
+            .prepare_copy(
+                &session,
+                NetconfTargetCopy::new(&frozen, &copied, &provider),
+                opc_types::TenantId::from_static("fixture-tenant"),
+                &event,
+                160,
+            )
+            .await
+            .unwrap();
+        let stale = fixture.bind_frozen_target(frozen.destination(), effect, event);
+        assert!(
+            matches!(
+                fixture.preflight(&conn, &stale, 100),
+                Err(AuditAuthorityError::BindingMismatch)
+            ),
+            "SDK target copy refreshed an original source, destination or lock expectation"
+        );
+        assert_eq!(conn.total_changes(), changes);
+        assert_eq!(target_rows(&conn), before);
+        assert_eq!(fixture.submit(&conn, &stale), AuditOperationState::Rejected);
+        assert_eq!(target_rows(&conn), before);
+        fixture.settle(&conn, &stale);
+    }
+}
+
+impl Fixture {
+    fn frozen_running_copy(
+        &self,
+        conn: &Connection,
+        session: &crate::audit_authority::NetconfSessionOwner,
+        source: crate::audit_authority::NetconfLockDatastore,
+    ) -> Result<crate::audit_authority::NetconfRunningCopyRead, AuditAuthorityError> {
+        let tx = conn.unchecked_transaction().unwrap();
+        let view = crate::consensus::audit_targets::read_copy_view_sync(
+            &tx,
+            &self.key,
+            &self.ledger(&tx),
+            source,
+            &crate::consensus::sqlite::SqliteWorkCancellation::audit_test(),
+        )
+        .unwrap();
+        tx.commit().unwrap();
+        view?.freeze(session)
+    }
+}
+
+async fn frozen_running_envelope(
+    conn: &Connection,
+    frozen: &crate::audit_authority::NetconfRunningCopyRead,
+    provider: &dyn opc_key::KeyProvider,
+    request: u8,
+    config: &[u8],
+) -> crate::AttestedConfigCommit {
+    use opc_key::{ConfigAad, EnvelopeAad};
+    use sha2::{Digest, Sha256};
+    let base = frozen.source().running_base_version();
+    let parent = if base == 0 {
+        None
+    } else {
+        let bytes: Vec<u8> = conn
+            .query_row(
+                "SELECT tx_id FROM config_history WHERE version=?1",
+                [base],
+                |r| r.get(0),
+            )
+            .unwrap();
+        Some(opc_types::TxId::from_uuid(
+            uuid::Uuid::from_slice(&bytes).unwrap(),
+        ))
+    };
+    let tx_id = opc_types::TxId::new();
+    let committed_at = "2026-01-01T00:00:00Z"
+        .parse::<opc_types::Timestamp>()
+        .unwrap();
+    let principal = r#"{"tenant":"fixture-tenant","subject":"fixture-principal"}"#.to_owned();
+    let schema = frozen.source().schema().unwrap();
+    let aad = EnvelopeAad::config(
+        opc_types::TenantId::from_static("fixture-tenant"),
+        base + 1,
+        ConfigAad::new(tx_id, parent, committed_at, &principal, schema, "running").unwrap(),
+    );
+    let plaintext = copy_plaintext(request, config);
+    let encrypted = opc_crypto::encrypt_attested_envelope(provider, &aad, &plaintext)
+        .await
+        .unwrap();
+    crate::AttestedConfigCommit::try_new(
+        crate::CommitRecord {
+            tx_id,
+            parent_tx_id: parent,
+            version: opc_types::ConfigVersion::new(base + 1),
+            committed_at,
+            principal,
+            source: crate::CommitSource::Netconf,
+            schema_digest: schema,
+            plaintext_digest: Sha256::digest(&plaintext).to_vec(),
+            encrypted_blob: encrypted.encoded().to_vec(),
+            rollback_point: false,
+            confirmed_deadline: None,
+        },
+        Vec::new(),
+        encrypted.claim().unwrap(),
+    )
+    .unwrap()
+}
+
+#[tokio::test]
+async fn target_running_copy_sdk_preserves_frozen_sources_and_exact_configuration() {
+    use crate::audit_authority::{NetconfLockDatastore as Store, NetconfRunningCopy};
+    for (source, fallback) in [
+        (Store::Candidate, false),
+        (Store::Startup, false),
+        (Store::Candidate, true),
+    ] {
+        let fixture = Fixture::new().await;
+        let shared = fixture.backend.conn();
+        let conn = shared.lock().await;
+        fixture.active(&conn);
+        let config = br#"{"exact":18446744073709551617,"escaped":"\u0061","v":-0.0}"#;
+        let provider = target_copy_sdk_source(&fixture, &conn, source, fallback, config).await;
+        let worker = std::sync::Arc::new(());
+        let session = fixture.session_owner(&conn, &worker, 0x61);
+        let frozen = fixture
+            .frozen_running_copy(&conn, &session, source)
+            .unwrap();
+        assert_eq!(frozen.source().datastore(), source);
+        assert_eq!(frozen.source().uses_running_fallback(), fallback);
+        let tenant = opc_types::TenantId::from_static("fixture-tenant");
+        assert_eq!(
+            *frozen
+                .source()
+                .decrypt_configuration(&provider, &tenant)
+                .await
+                .unwrap()
+                .unwrap(),
+            copy_plaintext(if fallback { 181 } else { 180 }, config)
+        );
+        let commit = frozen_running_envelope(&conn, &frozen, &provider, 215, config).await;
+        let mut event = fixture.event(215);
+        event.operation = ManagementAuditOperationCode::Replace;
+        let before = target_rows(&conn);
+        let source_row = row(
+            &conn,
+            "config_netconf_targets",
+            "target",
+            u8::from(source == Store::Startup),
+        );
+        let changes = conn.total_changes();
+        let effect = frozen
+            .prepare_copy(
+                &session,
+                NetconfRunningCopy::new(&frozen, commit, &provider),
+                &tenant,
+                &event,
+                160,
+                &fixture.key,
+            )
+            .await
+            .unwrap();
+        let prepared = fixture.bind_frozen_target(frozen.source(), effect, event);
+        assert_eq!(fixture.preflight(&conn, &prepared, 100).unwrap(), None);
+        assert_eq!(conn.total_changes(), changes);
+        assert_eq!(target_rows(&conn), before);
+        let known = fixture.submit(&conn, &prepared);
+        let version = frozen.source().running_base_version() + 1;
+        assert!(matches!(&known, AuditOperationState::TargetV1(result)
+            if matches!(result.outcome(), NetconfAppliedOutcome::CopiedRunning {running_version} if running_version == version)));
+        assert_eq!(
+            row(
+                &conn,
+                "config_netconf_targets",
+                "target",
+                u8::from(source == Store::Startup)
+            ),
+            source_row
+        );
+        let retained = target_rows(&conn);
+        assert_eq!(fixture.submit(&conn, &prepared), known);
+        assert_eq!(target_rows(&conn), retained);
+        assert!(matches!(
+            fixture.frozen_running_copy(&conn, &session, source),
+            Err(AuditAuthorityError::RecoveryRequired)
+        ));
+        assert!(!fixture
+            .ledger(&conn)
+            .lookup(
+                &fixture.key,
+                prepared.handle(),
+                prepared.command().effect.caller
+            )
+            .unwrap()
+            .unwrap()
+            .terminal_recorded());
+        fixture.settle(&conn, &prepared);
+        provider_assert_history(&conn, &provider, version, 215, config).await;
+        assert_eq!(
+            *frozen
+                .source()
+                .decrypt_configuration(&provider, &tenant)
+                .await
+                .unwrap()
+                .unwrap(),
+            copy_plaintext(if fallback { 181 } else { 180 }, config)
+        );
+    }
+}
+
+#[tokio::test]
+async fn target_running_copy_sdk_refuses_identical_configuration_from_a_new_source_generation() {
+    use crate::audit_authority::{
+        NetconfLockDatastore as Store, NetconfRunningCopy, NetconfTargetReplacement,
+    };
+    for (source, fallback) in [
+        (Store::Candidate, false),
+        (Store::Startup, false),
+        (Store::Candidate, true),
+    ] {
+        let fixture = Fixture::new().await;
+        let shared = fixture.backend.conn();
+        let conn = shared.lock().await;
+        fixture.active(&conn);
+        let config = br#"{"same":true}"#;
+        let provider = target_copy_sdk_source(&fixture, &conn, source, fallback, config).await;
+        let worker = std::sync::Arc::new(());
+        let session = fixture.session_owner(&conn, &worker, 0x61);
+        let frozen = fixture
+            .frozen_running_copy(&conn, &session, source)
+            .unwrap();
+        let tenant = opc_types::TenantId::from_static("fixture-tenant");
+        let original = frozen
+            .source()
+            .decrypt_configuration(&provider, &tenant)
+            .await
+            .unwrap()
+            .unwrap();
+        let commit = frozen_running_envelope(&conn, &frozen, &provider, 216, config).await;
+        let base = fixture.frozen_target(&conn, &session, source).unwrap();
+        let replacement = copy_plaintext(217, config);
+        let mut event = fixture.event(217);
+        event.operation = ManagementAuditOperationCode::Update;
+        let effect = base
+            .prepare_replacement(
+                &session,
+                NetconfTargetReplacement::edit(
+                    &base,
+                    &replacement,
+                    frozen.source().schema().unwrap(),
+                    &provider,
+                ),
+                tenant.clone(),
+                &event,
+                160,
+            )
+            .await
+            .unwrap();
+        let changed = fixture.bind_frozen_target(&base, effect, event);
+        assert!(matches!(
+            fixture.submit(&conn, &changed),
+            AuditOperationState::TargetV1(_)
+        ));
+        fixture.settle(&conn, &changed);
+        let new = fixture
+            .frozen_running_copy(&conn, &session, source)
+            .unwrap();
+        assert_ne!(
+            new.source().encrypted_configuration(),
+            frozen.source().encrypted_configuration()
+        );
+        assert_ne!(new.source.counter, frozen.source.counter);
+        assert_eq!(
+            *new.source()
+                .decrypt_configuration(&provider, &tenant)
+                .await
+                .unwrap()
+                .unwrap(),
+            replacement
+        );
+        assert_eq!(
+            *frozen
+                .source()
+                .decrypt_configuration(&provider, &tenant)
+                .await
+                .unwrap()
+                .unwrap(),
+            *original
+        );
+        let before = target_rows(&conn);
+        let changes = conn.total_changes();
+        let running = fixture.device_view(&conn).running_version;
+        let mut event = fixture.event(216);
+        event.operation = ManagementAuditOperationCode::Replace;
+        let effect = frozen
+            .prepare_copy(
+                &session,
+                NetconfRunningCopy::new(&frozen, commit, &provider),
+                &tenant,
+                &event,
+                160,
+                &fixture.key,
+            )
+            .await
+            .unwrap();
+        let stale = fixture.bind_frozen_target(frozen.source(), effect, event);
+        assert!(
+            matches!(
+                fixture.preflight(&conn, &stale, 100),
+                Err(AuditAuthorityError::BindingMismatch)
+            ),
+            "running copy refreshed the original source generation"
+        );
+        assert_eq!(conn.total_changes(), changes);
+        assert_eq!(target_rows(&conn), before);
+        assert_eq!(fixture.submit(&conn, &stale), AuditOperationState::Rejected);
+        assert_eq!(target_rows(&conn), before);
+        assert_eq!(fixture.device_view(&conn).running_version, running);
+        fixture.settle(&conn, &stale);
+    }
+}
+
+#[tokio::test]
+async fn target_running_copy_sdk_preserves_original_running_version_and_locks() {
+    use crate::audit_authority::{NetconfLockDatastore as Store, NetconfRunningCopy};
+    for change in ["running", "source-lock", "running-lock"] {
+        let fixture = Fixture::new().await;
+        let shared = fixture.backend.conn();
+        let conn = shared.lock().await;
+        fixture.active(&conn);
+        let config = br#"{"value":1}"#;
+        let (provider, blob) = copy_provider_stage(&fixture, &conn, 0, config).await;
+        let worker = std::sync::Arc::new(());
+        let session = fixture.session_owner(&conn, &worker, 0x62);
+        let frozen = fixture
+            .frozen_running_copy(&conn, &session, Store::Candidate)
+            .unwrap();
+        let commit = frozen_running_envelope(&conn, &frozen, &provider, 218, config).await;
+        let changed = if change == "running" {
+            let other = copy_provider_destination(&fixture, &conn, &provider, 0, 219, config).await;
+            bind_copy_provider(&fixture, &conn, &provider, &blob, other)
+                .await
+                .unwrap()
+        } else {
+            fixture.rebind_at(
+                &conn,
+                fixture.request(&conn, 219, 2, 0x61, u8::from(change == "source-lock")),
+                100,
+            )
+        };
+        assert!(matches!(
+            fixture.submit(&conn, &changed),
+            AuditOperationState::TargetV1(_)
+        ));
+        fixture.settle(&conn, &changed);
+        let before = target_rows(&conn);
+        let running = fixture.device_view(&conn).running_version;
+        let changes = conn.total_changes();
+        let mut event = fixture.event(218);
+        event.operation = ManagementAuditOperationCode::Replace;
+        let effect = frozen
+            .prepare_copy(
+                &session,
+                NetconfRunningCopy::new(&frozen, commit, &provider),
+                &opc_types::TenantId::from_static("fixture-tenant"),
+                &event,
+                160,
+                &fixture.key,
+            )
+            .await
+            .unwrap();
+        let stale = fixture.bind_frozen_target(frozen.source(), effect, event);
+        assert!(
+            matches!(
+                fixture.preflight(&conn, &stale, 100),
+                Err(AuditAuthorityError::BindingMismatch)
+            ),
+            "running copy refreshed its original destination or ignored current lock ownership"
+        );
+        assert_eq!(conn.total_changes(), changes);
+        assert_eq!(target_rows(&conn), before);
+        assert_eq!(fixture.submit(&conn, &stale), AuditOperationState::Rejected);
+        assert_eq!(target_rows(&conn), before);
+        assert_eq!(fixture.device_view(&conn).running_version, running);
+        fixture.settle(&conn, &stale);
+    }
+}
+
+#[tokio::test]
+async fn target_running_copy_sdk_refuses_substituted_session_read_tenant_and_content() {
+    use crate::audit_authority::{NetconfLockDatastore as Store, NetconfRunningCopy};
+    let fixture = Fixture::new().await;
+    let shared = fixture.backend.conn();
+    let conn = shared.lock().await;
+    fixture.active(&conn);
+    let config = br#"{"authorized":1}"#;
+    let (provider, _) = copy_provider_stage(&fixture, &conn, 0, config).await;
+    let worker = std::sync::Arc::new(());
+    let another_worker = std::sync::Arc::new(());
+    let session = fixture.session_owner(&conn, &worker, 0x61);
+    let foreign_session = fixture.session_owner(&conn, &worker, 0x62);
+    let foreign_worker = fixture.session_owner(&conn, &another_worker, 0x61);
+    let frozen = fixture
+        .frozen_running_copy(&conn, &session, Store::Candidate)
+        .unwrap();
+    let another_read = fixture
+        .frozen_running_copy(&conn, &session, Store::Candidate)
+        .unwrap();
+    let unavailable = opc_key::MemoryKeyProvider::new();
+    let before = target_rows(&conn);
+    let changes = conn.total_changes();
+    for change in [
+        "session",
+        "worker",
+        "read",
+        "tenant",
+        "operation",
+        "outcome",
+        "transport",
+        "caller",
+        "provider",
+        "content",
+    ] {
+        let copied = if change == "content" {
+            br#"{"authorized":2}"#.as_slice()
+        } else {
+            config
+        };
+        let commit = frozen_running_envelope(&conn, &frozen, &provider, 220, copied).await;
+        let chosen = match change {
+            "session" => &foreign_session,
+            "worker" => &foreign_worker,
+            _ => &session,
+        };
+        let read = if change == "read" {
+            &another_read
+        } else {
+            &frozen
+        };
+        let tenant = opc_types::TenantId::from_static(if change == "tenant" {
+            "another-tenant"
+        } else {
+            "fixture-tenant"
+        });
+        let mut event = fixture.event(220);
+        event.operation = ManagementAuditOperationCode::Replace;
+        match change {
+            "operation" => event.operation = ManagementAuditOperationCode::Exec,
+            "outcome" => event.outcome = ManagementAuditOutcomeCode::Success,
+            "transport" => event.transport = ManagementAuditTransportCode::Internal,
+            "caller" => {
+                event.caller = crate::audit_authority::AuditCaller::project(
+                    &fixture.privacy,
+                    "fixture-tenant",
+                    "other-principal",
+                )
+                .unwrap()
+            }
+            _ => {}
+        }
+        let keys: &dyn opc_key::KeyProvider = if change == "provider" {
+            &unavailable
+        } else {
+            &provider
+        };
+        let result = frozen
+            .prepare_copy(
+                chosen,
+                NetconfRunningCopy::new(read, commit, keys),
+                &tenant,
+                &event,
+                160,
+                &fixture.key,
+            )
+            .await;
+        assert!(result.is_err(), "frozen running copy accepted substituted session, read, tenant, context, provider or configuration: {change}");
+        assert_eq!(conn.total_changes(), changes);
+        assert_eq!(target_rows(&conn), before);
+    }
+}
+
+#[tokio::test]
+async fn target_running_copy_sdk_read_refuses_absence_foreign_locks_and_pending_state() {
+    use crate::audit_authority::NetconfLockDatastore as Store;
+    for change in [
+        "absent",
+        "source-lock",
+        "running-lock",
+        "terminal-debt",
+        "pending",
+    ] {
+        let fixture = Fixture::new().await;
+        let shared = fixture.backend.conn();
+        let conn = shared.lock().await;
+        if change == "pending" {
+            let tentative = fixture.pending_fixture(&conn, true);
+            assert!(matches!(
+                fixture.submit(&conn, &tentative),
+                AuditOperationState::TargetV1(_)
+            ));
+            fixture.settle(&conn, &tentative);
+        } else {
+            fixture.active(&conn);
+            if change != "absent" {
+                copy_provider_stage(&fixture, &conn, 0, br#"{"value":1}"#).await;
+                let lock = fixture.rebind_at(
+                    &conn,
+                    fixture.request(&conn, 221, 2, 0x61, u8::from(change == "source-lock")),
+                    100,
+                );
+                assert!(matches!(
+                    fixture.submit(&conn, &lock),
+                    AuditOperationState::TargetV1(_)
+                ));
+                if change != "terminal-debt" {
+                    fixture.settle(&conn, &lock);
+                }
+            }
+        }
+        let worker = std::sync::Arc::new(());
+        let session = fixture.session_owner(&conn, &worker, 0x62);
+        let before = target_rows(&conn);
+        let changes = conn.total_changes();
+        assert!(fixture
+            .frozen_running_copy(&conn, &session, Store::Candidate)
+            .is_err());
+        assert!(fixture
+            .frozen_running_copy(&conn, &session, Store::Running)
+            .is_err());
+        assert!(fixture
+            .frozen_running_copy(&conn, &session, Store::Startup)
+            .is_err());
+        assert_eq!(conn.total_changes(), changes);
+        assert_eq!(target_rows(&conn), before);
+    }
+}
+
+impl Fixture {
+    fn frozen_promotion(
+        &self,
+        conn: &Connection,
+        session: &crate::audit_authority::NetconfSessionOwner,
+    ) -> Result<crate::audit_authority::NetconfCandidatePromotionRead, AuditAuthorityError> {
+        let tx = conn.unchecked_transaction().unwrap();
+        let view = crate::consensus::audit_targets::read_copy_view_sync(
+            &tx,
+            &self.key,
+            &self.ledger(&tx),
+            crate::audit_authority::NetconfLockDatastore::Candidate,
+            &crate::consensus::sqlite::SqliteWorkCancellation::audit_test(),
+        )
+        .unwrap();
+        tx.commit().unwrap();
+        view?.freeze_promotion(session)
+    }
+}
+
+#[tokio::test]
+async fn target_promotion_sdk_retires_original_candidate_with_exact_running_result() {
+    use crate::audit_authority::NetconfCandidatePromotion;
+    for locked in [false, true] {
+        let fixture = Fixture::new().await;
+        let shared = fixture.backend.conn();
+        let conn = shared.lock().await;
+        fixture.active(&conn);
+        let config = br#"{"exact":18446744073709551617,"escaped":"\u0061","n":-0.0}"#;
+        let (provider, _) = copy_provider_stage(&fixture, &conn, 0, config).await;
+        if locked {
+            for (request, slot) in [(224, 0), (225, 1)] {
+                let lock = fixture.request(&conn, request, 2, 0x61, slot);
+                assert!(matches!(
+                    fixture.submit(&conn, &lock),
+                    AuditOperationState::TargetV1(_)
+                ));
+                fixture.settle(&conn, &lock);
+            }
+        }
+        let worker = std::sync::Arc::new(());
+        let session = fixture.session_owner(&conn, &worker, 0x61);
+        let frozen = fixture.frozen_promotion(&conn, &session).unwrap();
+        let generation = frozen.candidate().candidate_generation().unwrap();
+        assert!(!frozen.candidate().uses_running_fallback());
+        let tenant = opc_types::TenantId::from_static("fixture-tenant");
+        assert_eq!(
+            *frozen
+                .candidate()
+                .decrypt_configuration(&provider, &tenant)
+                .await
+                .unwrap()
+                .unwrap(),
+            copy_plaintext(180, config)
+        );
+        let commit = frozen_running_envelope(&conn, &frozen.copy, &provider, 226, config).await;
+        let mut event = fixture.event(226);
+        event.operation = ManagementAuditOperationCode::Exec;
+        let before = target_rows(&conn);
+        let changes = conn.total_changes();
+        let effect = frozen
+            .prepare_promotion(
+                &session,
+                NetconfCandidatePromotion::new(&frozen, commit, &provider),
+                &tenant,
+                &event,
+                160,
+                &fixture.key,
+            )
+            .await
+            .unwrap();
+        let prepared = fixture.bind_frozen_target(frozen.candidate(), effect, event);
+        assert_eq!(fixture.preflight(&conn, &prepared, 100).unwrap(), None);
+        assert_eq!(conn.total_changes(), changes);
+        assert_eq!(target_rows(&conn), before);
+        let startup = row(&conn, "config_netconf_targets", "target", 1);
+        let known = fixture.submit(&conn, &prepared);
+        let version = frozen.candidate().running_base_version() + 1;
+        assert!(matches!(&known, AuditOperationState::TargetV1(result)
+            if matches!(result.outcome(), NetconfAppliedOutcome::Promoted {running_version, retired_generation}
+                if running_version == version && retired_generation == generation.checked_next().unwrap())));
+        let candidate = row(&conn, "config_netconf_targets", "target", 0);
+        assert_eq!(candidate["generation"], generation.get() + 1);
+        assert_eq!(candidate["present"], false);
+        assert!(candidate["encrypted_envelope"].is_null());
+        assert!(candidate["source_binding"].is_null());
+        assert_eq!(row(&conn, "config_netconf_targets", "target", 1), startup);
+        let retained = target_rows(&conn);
+        assert_eq!(fixture.submit(&conn, &prepared), known);
+        assert_eq!(target_rows(&conn), retained);
+        // The known promotion remains truthful while terminal durability is owed.
+        let receipt = fixture
+            .ledger(&conn)
+            .lookup(
+                &fixture.key,
+                prepared.handle(),
+                prepared.command().effect.caller,
+            )
+            .unwrap()
+            .unwrap();
+        assert!(!receipt.terminal_recorded());
+        assert!(fixture.frozen_promotion(&conn, &session).is_err());
+        assert_eq!(fixture.submit(&conn, &prepared), known);
+        fixture.settle(&conn, &prepared);
+        provider_assert_history(&conn, &provider, version, 226, config).await;
+        assert!(
+            fixture.frozen_promotion(&conn, &session).is_err(),
+            "retired candidate became a promotable fallback"
+        );
+        assert_eq!(
+            *frozen
+                .candidate()
+                .decrypt_configuration(&provider, &tenant)
+                .await
+                .unwrap()
+                .unwrap(),
+            copy_plaintext(180, config)
+        );
+    }
+}
+
+#[tokio::test]
+async fn target_promotion_sdk_read_requires_original_stage_owner_and_current_base() {
+    use crate::audit_authority::NetconfLockDatastore as Store;
+    for change in [
+        "absent",
+        "fallback",
+        "startup",
+        "session",
+        "caller",
+        "running-base",
+        "source-lock",
+        "running-lock",
+        "pending",
+    ] {
+        let fixture = Fixture::new().await;
+        let shared = fixture.backend.conn();
+        let conn = shared.lock().await;
+        let config = br#"{"value":1}"#;
+        if change == "pending" {
+            let tentative = fixture.pending_fixture(&conn, true);
+            assert!(matches!(
+                fixture.submit(&conn, &tentative),
+                AuditOperationState::TargetV1(_)
+            ));
+            fixture.settle(&conn, &tentative);
+        } else {
+            fixture.active(&conn);
+            if change == "fallback" {
+                target_copy_sdk_source(&fixture, &conn, Store::Candidate, true, config).await;
+            } else if change != "absent" {
+                let (provider, blob) =
+                    copy_provider_stage(&fixture, &conn, u8::from(change == "startup"), config)
+                        .await;
+                if change == "running-base" {
+                    let running =
+                        copy_provider_destination(&fixture, &conn, &provider, 0, 227, config).await;
+                    let running = bind_copy_provider(&fixture, &conn, &provider, &blob, running)
+                        .await
+                        .unwrap();
+                    assert!(matches!(
+                        fixture.submit(&conn, &running),
+                        AuditOperationState::TargetV1(_)
+                    ));
+                    fixture.settle(&conn, &running);
+                } else if matches!(change, "source-lock" | "running-lock") {
+                    let lock = if change == "source-lock" {
+                        fixture.foreign_candidate_lock_after_owner_discard(&conn)
+                    } else {
+                        fixture.request(&conn, 227, 2, 0x62, 0)
+                    };
+                    assert!(matches!(
+                        fixture.submit(&conn, &lock),
+                        AuditOperationState::TargetV1(_)
+                    ));
+                    fixture.settle(&conn, &lock);
+                }
+            }
+        }
+        let worker = std::sync::Arc::new(());
+        let mut session = fixture.session_owner(
+            &conn,
+            &worker,
+            if change == "session" { 0x62 } else { 0x61 },
+        );
+        if change == "caller" {
+            session.caller = crate::audit_authority::AuditCaller::project(
+                &fixture.privacy,
+                "fixture-tenant",
+                "other-principal",
+            )
+            .unwrap();
+        }
+        let before = target_rows(&conn);
+        let changes = conn.total_changes();
+        assert!(
+            fixture.frozen_promotion(&conn, &session).is_err(),
+            "promotion read accepted original stage ownership/base/source substitution: {change}"
+        );
+        assert_eq!(conn.total_changes(), changes);
+        assert_eq!(target_rows(&conn), before);
+    }
+}
+
+#[tokio::test]
+async fn target_promotion_sdk_preserves_original_generation_and_running_expectations() {
+    use crate::audit_authority::{
+        NetconfCandidatePromotion, NetconfLockDatastore as Store, NetconfTargetReplacement,
+    };
+    for change in [
+        "generation",
+        "discard",
+        "running",
+        "source-lock",
+        "running-lock",
+    ] {
+        let fixture = Fixture::new().await;
+        let shared = fixture.backend.conn();
+        let conn = shared.lock().await;
+        fixture.active(&conn);
+        let config = br#"{"same":true}"#;
+        let (provider, blob) = copy_provider_stage(&fixture, &conn, 0, config).await;
+        let worker = std::sync::Arc::new(());
+        let session = fixture.session_owner(&conn, &worker, 0x61);
+        let frozen = fixture.frozen_promotion(&conn, &session).unwrap();
+        let commit = frozen_running_envelope(&conn, &frozen.copy, &provider, 228, config).await;
+        let changed = if change == "generation" {
+            let original = fixture
+                .frozen_target(&conn, &session, Store::Candidate)
+                .unwrap();
+            let plaintext = copy_plaintext(229, config);
+            let mut event = fixture.event(229);
+            event.operation = ManagementAuditOperationCode::Update;
+            let effect = original
+                .prepare_replacement(
+                    &session,
+                    NetconfTargetReplacement::edit(
+                        &original,
+                        &plaintext,
+                        frozen.candidate().schema().unwrap(),
+                        &provider,
+                    ),
+                    opc_types::TenantId::from_static("fixture-tenant"),
+                    &event,
+                    160,
+                )
+                .await
+                .unwrap();
+            fixture.bind_frozen_target(&original, effect, event)
+        } else if change == "running" {
+            let running =
+                copy_provider_destination(&fixture, &conn, &provider, 0, 229, config).await;
+            bind_copy_provider(&fixture, &conn, &provider, &blob, running)
+                .await
+                .unwrap()
+        } else if change == "discard" {
+            fixture.request(&conn, 229, 5, 0x61, 1)
+        } else if change == "source-lock" {
+            fixture.foreign_candidate_lock_after_owner_discard(&conn)
+        } else {
+            fixture.request(&conn, 229, 2, 0x62, 0)
+        };
+        assert!(matches!(
+            fixture.submit(&conn, &changed),
+            AuditOperationState::TargetV1(_)
+        ));
+        fixture.settle(&conn, &changed);
+        let mut event = fixture.event(228);
+        event.operation = ManagementAuditOperationCode::Exec;
+        let effect = frozen
+            .prepare_promotion(
+                &session,
+                NetconfCandidatePromotion::new(&frozen, commit, &provider),
+                &opc_types::TenantId::from_static("fixture-tenant"),
+                &event,
+                160,
+                &fixture.key,
+            )
+            .await
+            .unwrap();
+        let stale = fixture.bind_frozen_target(frozen.candidate(), effect, event);
+        let before = target_rows(&conn);
+        let changes = conn.total_changes();
+        let running = fixture.device_view(&conn).running_version;
+        assert!(
+            matches!(
+                fixture.preflight(&conn, &stale, 100),
+                Err(AuditAuthorityError::BindingMismatch)
+            ),
+            "promotion refreshed original generation/base or ignored current lock: {change}"
+        );
+        assert_eq!(conn.total_changes(), changes);
+        assert_eq!(target_rows(&conn), before);
+        assert_eq!(fixture.submit(&conn, &stale), AuditOperationState::Rejected);
+        assert_eq!(target_rows(&conn), before);
+        assert_eq!(fixture.device_view(&conn).running_version, running);
+        fixture.settle(&conn, &stale);
+    }
+}
+
+#[tokio::test]
+async fn target_promotion_sdk_refuses_substituted_session_read_tenant_and_configuration() {
+    use crate::audit_authority::NetconfCandidatePromotion;
+    let fixture = Fixture::new().await;
+    let shared = fixture.backend.conn();
+    let conn = shared.lock().await;
+    fixture.active(&conn);
+    let config = br#"{"authorized":1}"#;
+    let (provider, _) = copy_provider_stage(&fixture, &conn, 0, config).await;
+    let worker = std::sync::Arc::new(());
+    let other_worker = std::sync::Arc::new(());
+    let session = fixture.session_owner(&conn, &worker, 0x61);
+    let foreign_session = fixture.session_owner(&conn, &worker, 0x62);
+    let foreign_worker = fixture.session_owner(&conn, &other_worker, 0x61);
+    let frozen = fixture.frozen_promotion(&conn, &session).unwrap();
+    let other_read = fixture.frozen_promotion(&conn, &session).unwrap();
+    let unavailable = opc_key::MemoryKeyProvider::new();
+    let before = target_rows(&conn);
+    let changes = conn.total_changes();
+    for change in [
+        "session",
+        "worker",
+        "read",
+        "tenant",
+        "operation",
+        "outcome",
+        "transport",
+        "caller",
+        "provider",
+        "content",
+    ] {
+        let content = if change == "content" {
+            br#"{"authorized":2}"#.as_slice()
+        } else {
+            config
+        };
+        let commit = frozen_running_envelope(&conn, &frozen.copy, &provider, 230, content).await;
+        let chosen = match change {
+            "session" => &foreign_session,
+            "worker" => &foreign_worker,
+            _ => &session,
+        };
+        let read = if change == "read" {
+            &other_read
+        } else {
+            &frozen
+        };
+        let tenant = opc_types::TenantId::from_static(if change == "tenant" {
+            "another-tenant"
+        } else {
+            "fixture-tenant"
+        });
+        let mut event = fixture.event(230);
+        event.operation = ManagementAuditOperationCode::Exec;
+        match change {
+            "operation" => event.operation = ManagementAuditOperationCode::Replace,
+            "outcome" => event.outcome = ManagementAuditOutcomeCode::Success,
+            "transport" => event.transport = ManagementAuditTransportCode::Internal,
+            "caller" => {
+                event.caller = crate::audit_authority::AuditCaller::project(
+                    &fixture.privacy,
+                    "fixture-tenant",
+                    "other-principal",
+                )
+                .unwrap()
+            }
+            _ => {}
+        }
+        let keys: &dyn opc_key::KeyProvider = if change == "provider" {
+            &unavailable
+        } else {
+            &provider
+        };
+        let result = frozen
+            .prepare_promotion(
+                chosen,
+                NetconfCandidatePromotion::new(read, commit, keys),
+                &tenant,
+                &event,
+                160,
+                &fixture.key,
+            )
+            .await;
+        assert!(result.is_err(), "promotion accepted substituted session, read, tenant, context, provider or configuration: {change}");
+        assert_eq!(conn.total_changes(), changes);
+        assert_eq!(target_rows(&conn), before);
+    }
+}
+
+impl Fixture {
+    // A different session cannot acquire an existing owner's staged candidate.
+    // Exercise that refusal first, then create a reachable foreign-lock state
+    // after the original owner discards its candidate. Original frozen reads
+    // must still reject the changed generation and ownership.
+    fn foreign_candidate_lock_after_owner_discard(
+        &self,
+        conn: &Connection,
+    ) -> PreparedTargetMutation {
+        let attempted = self.request(conn, 231, 2, 0x62, 1);
+        let before = target_rows(conn);
+        assert_eq!(self.submit(conn, &attempted), AuditOperationState::Rejected);
+        assert_eq!(target_rows(conn), before);
+        self.settle(conn, &attempted);
+        assert_eq!(target_rows(conn), before);
+        let discard = self.request(conn, 232, 5, 0x61, 1);
+        assert!(matches!(
+            self.submit(conn, &discard),
+            AuditOperationState::TargetV1(_)
+        ));
+        self.settle(conn, &discard);
+        let candidate = row(conn, "config_netconf_targets", "target", 0);
+        assert_eq!(candidate["present"], false);
+        assert!(candidate["source_binding"].is_null());
+        self.request(conn, 233, 2, 0x62, 1)
+    }
+}
+
+async fn confirmed_sdk_source(
+    fixture: &Fixture,
+    conn: &Connection,
+) -> (
+    opc_key::MemoryKeyProvider,
+    std::sync::Arc<()>,
+    crate::audit_authority::NetconfSessionOwner,
+    crate::audit_authority::NetconfCandidatePromotionRead,
+) {
+    fixture.active(conn);
+    let config = br#"{"retained":0}"#;
+    let (provider, source) = copy_provider_stage(fixture, conn, 0, config).await;
+    let running = fixture.running_target(conn, 181, 6, 0, 0x6a);
+    let running = provider_rewrap_running(fixture, conn, &provider, running, 181, config).await;
+    let running = bind_copy_provider(fixture, conn, &provider, &source, running)
+        .await
+        .unwrap();
+    assert!(matches!(
+        fixture.submit(conn, &running),
+        AuditOperationState::TargetV1(_)
+    ));
+    fixture.settle(conn, &running);
+    provider_stage_second_candidate(fixture, conn, br#"{"retained":1}"#).await;
+    let worker = std::sync::Arc::new(());
+    let session = fixture.session_owner(conn, &worker, 0x61);
+    let frozen = fixture.frozen_promotion(conn, &session).unwrap();
+    (provider, worker, session, frozen)
+}
+
+async fn confirmed_sdk_envelope(
+    conn: &Connection,
+    frozen: &crate::audit_authority::NetconfCandidatePromotionRead,
+    provider: &dyn opc_key::KeyProvider,
+    request: u8,
+    deadline: Option<opc_types::Timestamp>,
+) -> crate::AttestedConfigCommit {
+    use sha2::{Digest, Sha256};
+    let original =
+        frozen_running_envelope(conn, &frozen.copy, provider, request, br#"{"retained":1}"#).await;
+    let mut record = original.record().clone();
+    record.confirmed_deadline = deadline;
+    let envelope = opc_crypto::CryptoEnvelopeRef::decode(&record.encrypted_blob).unwrap();
+    let (aad, _) = opc_key::decode_bound_aad(envelope.aad).unwrap();
+    let plaintext = copy_plaintext(request, br#"{"retained":1}"#);
+    let encrypted = opc_crypto::encrypt_attested_envelope(provider, &aad, &plaintext)
+        .await
+        .unwrap();
+    record.encrypted_blob = encrypted.encoded().to_vec();
+    record.plaintext_digest = Sha256::digest(&plaintext).to_vec();
+    crate::AttestedConfigCommit::try_new(record, Vec::new(), encrypted.claim().unwrap()).unwrap()
+}
+
+impl Fixture {
+    fn frozen_pending(
+        &self,
+        conn: &Connection,
+        session: &crate::audit_authority::NetconfSessionOwner,
+    ) -> Result<crate::audit_authority::NetconfPendingRead, AuditAuthorityError> {
+        let tx = conn.unchecked_transaction().unwrap();
+        let frozen = crate::consensus::audit_targets::read_pending_view_sync(
+            &tx,
+            &self.key,
+            &self.ledger(&tx),
+            session,
+            &crate::consensus::sqlite::SqliteWorkCancellation::audit_test(),
+        )
+        .unwrap();
+        tx.commit().unwrap();
+        frozen
+    }
+
+    fn bind_pending_target(
+        &self,
+        frozen: &crate::audit_authority::NetconfPendingRead,
+        effect: TargetEffectV1,
+        event: ProjectedAuditEvent,
+    ) -> PreparedTargetMutation {
+        let digest = effect.digest(&self.key).unwrap();
+        let binding =
+            AuditOperationBinding::project(&self.privacy, &event, frozen.running_base(), &digest)
+                .unwrap();
+        let handle = AuditOperationHandle::issue(
+            HandleBody {
+                version: 1,
+                identity: self.identity,
+                binding,
+                event,
+                issued_at: 100,
+                expires_at: effect.expires_at,
+                nonce: [0x55; 16],
+                key_epoch: self.key.epoch(),
+                mutation: Some(digest),
+            },
+            &self.key,
+        )
+        .unwrap();
+        PreparedTargetMutation::new(handle, effect, None)
+    }
+}
+
+async fn confirmed_sdk_install(
+    fixture: &Fixture,
+    conn: &Connection,
+    session: &crate::audit_authority::NetconfSessionOwner,
+    frozen: &crate::audit_authority::NetconfCandidatePromotionRead,
+    provider: &dyn opc_key::KeyProvider,
+    token: Option<&str>,
+) -> PreparedTargetMutation {
+    let deadline = "2026-01-01T00:01:00Z".parse().unwrap();
+    let commit = confirmed_sdk_envelope(conn, frozen, provider, 234, Some(deadline)).await;
+    let event = fixture.event(234);
+    let changes = conn.total_changes();
+    let before = target_rows(conn);
+    let effect = frozen
+        .prepare_tentative(
+            session,
+            crate::audit_authority::NetconfTentativePromotion::new(frozen, commit, provider, token),
+            &opc_types::TenantId::from_static("fixture-tenant"),
+            &event,
+            100..160,
+            &fixture.key,
+        )
+        .await
+        .unwrap();
+    assert_eq!(conn.total_changes(), changes);
+    assert_eq!(target_rows(conn), before);
+    let prepared = fixture.bind_frozen_target(frozen.candidate(), effect, event);
+    assert_eq!(fixture.preflight(conn, &prepared, 100), Ok(None));
+    assert!(
+        matches!(fixture.submit(conn, &prepared), AuditOperationState::TargetV1(result)
+        if matches!(result.outcome(), NetconfAppliedOutcome::Tentative { running_version: 2, .. }))
+    );
+    prepared
+}
+
+#[tokio::test]
+async fn target_confirmed_sdk_tentative_and_empty_confirmation_retain_original_ownership() {
+    use crate::audit_authority::NetconfEmptyConfirmation;
+    for token in [None, Some("synthetic-persistent-credential")] {
+        let fixture = Fixture::new().await;
+        let shared = fixture.backend.conn();
+        let conn = shared.lock().await;
+        let (provider, worker, session, frozen) = confirmed_sdk_source(&fixture, &conn).await;
+        let prepared =
+            confirmed_sdk_install(&fixture, &conn, &session, &frozen, &provider, token).await;
+        let original = fixture
+            .ledger(&conn)
+            .lookup(
+                &fixture.key,
+                prepared.handle(),
+                prepared.command().effect.caller,
+            )
+            .unwrap()
+            .unwrap();
+        assert!(!original.terminal_recorded());
+        assert!(fixture.frozen_pending(&conn, &session).is_err());
+        assert_eq!(fixture.submit(&conn, &prepared), original.state());
+        fixture.settle(&conn, &prepared);
+        let lifecycle = row(&conn, "config_netconf_lifecycle", "singleton", 1);
+        assert_eq!(
+            lifecycle["pending_confirmation"]["persistent"],
+            token.is_some()
+        );
+        let deadline = "2026-01-01T00:01:00Z"
+            .parse::<opc_types::Timestamp>()
+            .unwrap()
+            .as_offset_datetime()
+            .unix_timestamp();
+        assert_eq!(lifecycle["original_deadline"], deadline);
+        let pending = if token.is_some() {
+            fixture.session_owner(&conn, &worker, 0x62)
+        } else {
+            session.clone()
+        };
+        let read = fixture.frozen_pending(&conn, &pending).unwrap();
+        assert!(!read.has_staged_candidate());
+        let ownership = prepared
+            .command()
+            .effect
+            .encrypted_payload
+            .as_ref()
+            .unwrap()
+            .running()
+            .unwrap()
+            .1
+            .unwrap();
+        let credential = b"synthetic-persistent-credential";
+        assert!(!ownership
+            .encrypted_blob
+            .windows(credential.len())
+            .any(|v| v == credential));
+        // Reconstruct provider custody independently of the preparation object.
+        // This is component provider reconstruction, not a process restart.
+        drop(provider);
+        let provider = provider_lifecycle_keys();
+        let event = fixture.event(235);
+        let changes = conn.total_changes();
+        let before = target_rows(&conn);
+        let effect = read
+            .prepare_empty_confirmation(
+                &pending,
+                NetconfEmptyConfirmation::new(&read, &provider, token),
+                &opc_types::TenantId::from_static("fixture-tenant"),
+                &event,
+                100..160,
+            )
+            .await
+            .unwrap();
+        let confirmation = fixture.bind_pending_target(&read, effect, event);
+        assert_eq!(fixture.preflight(&conn, &confirmation, 100), Ok(None));
+        assert_eq!(conn.total_changes(), changes);
+        assert_eq!(target_rows(&conn), before);
+        let known = fixture.submit(&conn, &confirmation);
+        assert!(matches!(&known, AuditOperationState::TargetV1(result)
+            if matches!(result.outcome(), NetconfAppliedOutcome::Confirmed { pending: observed } if observed == read.pending())));
+        let after = target_rows(&conn);
+        assert_eq!(fixture.submit(&conn, &confirmation), known);
+        assert_eq!(target_rows(&conn), after);
+        assert!(!fixture
+            .ledger(&conn)
+            .lookup(
+                &fixture.key,
+                confirmation.handle(),
+                confirmation.command().effect.caller
+            )
+            .unwrap()
+            .unwrap()
+            .terminal_recorded());
+        assert_eq!(fixture.device_view(&conn).running_version, 2);
+        let lifecycle = row(&conn, "config_netconf_lifecycle", "singleton", 1);
+        for field in [
+            "pending_confirmation",
+            "rollback_parent",
+            "original_deadline",
+            "encrypted_confirmation_ownership",
+        ] {
+            assert!(lifecycle[field].is_null());
+        }
+        fixture.settle(&conn, &confirmation);
+        provider_assert_history(&conn, &provider, 1, 181, br#"{"retained":0}"#).await;
+        provider_assert_history(&conn, &provider, 2, 234, br#"{"retained":1}"#).await;
+        assert!(fixture.frozen_pending(&conn, &pending).is_err());
+    }
+}
+
+#[tokio::test]
+async fn target_confirmed_sdk_refuses_wrong_credentials_context_provider_and_original_read() {
+    use crate::audit_authority::NetconfEmptyConfirmation;
+    for token in [None, Some("synthetic-persistent-credential")] {
+        let fixture = Fixture::new().await;
+        let shared = fixture.backend.conn();
+        let conn = shared.lock().await;
+        let (provider, worker, session, frozen) = confirmed_sdk_source(&fixture, &conn).await;
+        let prepared =
+            confirmed_sdk_install(&fixture, &conn, &session, &frozen, &provider, token).await;
+        fixture.settle(&conn, &prepared);
+        let read = fixture.frozen_pending(&conn, &session).unwrap();
+        let other_read = fixture.frozen_pending(&conn, &session).unwrap();
+        let other = fixture.session_owner(&conn, &worker, 0x62);
+        if token.is_none() {
+            assert!(fixture.frozen_pending(&conn, &other).is_err());
+        }
+        let unavailable = opc_key::MemoryKeyProvider::new();
+        let before = target_rows(&conn);
+        let changes = conn.total_changes();
+        for change in [
+            "session",
+            "read",
+            "tenant",
+            "caller",
+            "operation",
+            "outcome",
+            "transport",
+            "credential",
+            "missing",
+            "provider",
+            "deadline",
+        ] {
+            if token.is_none() && change == "missing" {
+                continue;
+            }
+            let chosen = if change == "session" {
+                &other
+            } else {
+                &session
+            };
+            let frozen = if change == "read" { &other_read } else { &read };
+            let keys: &dyn opc_key::KeyProvider = if change == "provider" {
+                &unavailable
+            } else {
+                &provider
+            };
+            let mut event = fixture.event(236);
+            match change {
+                "caller" => {
+                    event.caller = crate::audit_authority::AuditCaller::project(
+                        &fixture.privacy,
+                        "fixture-tenant",
+                        "other-principal",
+                    )
+                    .unwrap()
+                }
+                "operation" => event.operation = ManagementAuditOperationCode::Read,
+                "outcome" => event.outcome = ManagementAuditOutcomeCode::Success,
+                "transport" => event.transport = ManagementAuditTransportCode::Internal,
+                _ => {}
+            }
+            let credential = match change {
+                "credential" => Some("different-credential"),
+                "missing" => None,
+                _ => token,
+            };
+            let tenant = opc_types::TenantId::from_static(if change == "tenant" {
+                "other-tenant"
+            } else {
+                "fixture-tenant"
+            });
+            let start = if change == "deadline" {
+                "2026-01-01T00:01:00Z"
+                    .parse::<opc_types::Timestamp>()
+                    .unwrap()
+                    .as_offset_datetime()
+                    .unix_timestamp()
+            } else {
+                100
+            };
+            assert!(
+                read.prepare_empty_confirmation(
+                    chosen,
+                    NetconfEmptyConfirmation::new(frozen, keys, credential),
+                    &tenant,
+                    &event,
+                    start..start + 60
+                )
+                .await
+                .is_err(),
+                "confirmation accepted substituted original authority or credential: {change}"
+            );
+            assert_eq!(conn.total_changes(), changes);
+            assert_eq!(target_rows(&conn), before);
+        }
+    }
+}
+
+#[tokio::test]
+async fn target_confirmed_sdk_empty_confirmation_refuses_concurrent_candidate_changes() {
+    use crate::audit_authority::NetconfEmptyConfirmation;
+    for token in [None, Some("synthetic-persistent-credential")] {
+        let fixture = Fixture::new().await;
+        let shared = fixture.backend.conn();
+        let conn = shared.lock().await;
+        let (provider, _worker, session, frozen) = confirmed_sdk_source(&fixture, &conn).await;
+        let prepared =
+            confirmed_sdk_install(&fixture, &conn, &session, &frozen, &provider, token).await;
+        fixture.settle(&conn, &prepared);
+        let read = fixture.frozen_pending(&conn, &session).unwrap();
+        let changed = fixture.encrypted(fixture.request(&conn, 237, 4, 0x61, 1), 0x6a);
+        let changed = fixture.rebind_at(&conn, changed, 100);
+        assert!(matches!(
+            fixture.submit(&conn, &changed),
+            AuditOperationState::TargetV1(_)
+        ));
+        fixture.settle(&conn, &changed);
+        let event = fixture.event(238);
+        let effect = read
+            .prepare_empty_confirmation(
+                &session,
+                NetconfEmptyConfirmation::new(&read, &provider, token),
+                &opc_types::TenantId::from_static("fixture-tenant"),
+                &event,
+                100..160,
+            )
+            .await
+            .unwrap();
+        let stale = fixture.bind_pending_target(&read, effect, event);
+        let before = target_rows(&conn);
+        let changes = conn.total_changes();
+        assert_eq!(
+            fixture.preflight(&conn, &stale, 100),
+            Err(AuditAuthorityError::BindingMismatch)
+        );
+        assert_eq!(conn.total_changes(), changes);
+        assert_eq!(target_rows(&conn), before);
+        assert_eq!(fixture.submit(&conn, &stale), AuditOperationState::Rejected);
+        assert_eq!(target_rows(&conn), before);
+        fixture.settle(&conn, &stale);
+        let now = fixture.frozen_pending(&conn, &session).unwrap();
+        assert!(now.has_staged_candidate());
+        assert!(now
+            .prepare_empty_confirmation(
+                &session,
+                NetconfEmptyConfirmation::new(&now, &provider, token),
+                &opc_types::TenantId::from_static("fixture-tenant"),
+                &fixture.event(239),
+                100..160
+            )
+            .await
+            .is_err());
+        assert_eq!(target_rows(&conn), before);
+    }
+}
+
+#[tokio::test]
+async fn target_confirmed_sdk_tentative_requires_deadline_context_and_bounded_credential() {
+    use crate::audit_authority::NetconfTentativePromotion;
+    let fixture = Fixture::new().await;
+    let shared = fixture.backend.conn();
+    let conn = shared.lock().await;
+    let (provider, worker, session, frozen) = confirmed_sdk_source(&fixture, &conn).await;
+    let other = fixture.session_owner(&conn, &worker, 0x62);
+    let other_read = fixture.frozen_promotion(&conn, &session).unwrap();
+    let unavailable = opc_key::MemoryKeyProvider::new();
+    let oversized = "x".repeat(crate::audit_authority::AUDIT_OPERATION_MAX_BYTES + 1);
+    let before = target_rows(&conn);
+    let changes = conn.total_changes();
+    for change in [
+        "deadline-missing",
+        "deadline-before-commit",
+        "session",
+        "read",
+        "tenant",
+        "operation",
+        "provider",
+        "credential-empty",
+        "credential-large",
+    ] {
+        let deadline = match change {
+            "deadline-missing" => None,
+            "deadline-before-commit" => Some("2025-12-31T23:59:59Z".parse().unwrap()),
+            _ => Some("2026-01-01T00:01:00Z".parse().unwrap()),
+        };
+        let commit = confirmed_sdk_envelope(&conn, &frozen, &provider, 240, deadline).await;
+        let keys: &dyn opc_key::KeyProvider = if change == "provider" {
+            &unavailable
+        } else {
+            &provider
+        };
+        let read = if change == "read" {
+            &other_read
+        } else {
+            &frozen
+        };
+        let chosen = if change == "session" {
+            &other
+        } else {
+            &session
+        };
+        let token = match change {
+            "credential-empty" => Some(""),
+            "credential-large" => Some(oversized.as_str()),
+            _ => None,
+        };
+        let mut event = fixture.event(240);
+        if change == "operation" {
+            event.operation = ManagementAuditOperationCode::Replace;
+        }
+        let tenant = opc_types::TenantId::from_static(if change == "tenant" {
+            "other-tenant"
+        } else {
+            "fixture-tenant"
+        });
+        assert!(
+            frozen
+                .prepare_tentative(
+                    chosen,
+                    NetconfTentativePromotion::new(read, commit, keys, token),
+                    &tenant,
+                    &event,
+                    100..160,
+                    &fixture.key
+                )
+                .await
+                .is_err(),
+            "tentative promotion accepted substituted input: {change}"
+        );
+        assert_eq!(conn.total_changes(), changes);
+        assert_eq!(target_rows(&conn), before);
+    }
+}
+
+impl Fixture {
+    fn frozen_staged_confirmation(
+        &self,
+        conn: &Connection,
+        session: &crate::audit_authority::NetconfSessionOwner,
+    ) -> Result<crate::audit_authority::NetconfStagedConfirmationRead, AuditAuthorityError> {
+        let tx = conn.unchecked_transaction().unwrap();
+        let read = crate::consensus::audit_targets::read_staged_confirmation_view_sync(
+            &tx,
+            &self.key,
+            &self.ledger(&tx),
+            session,
+            &crate::consensus::sqlite::SqliteWorkCancellation::audit_test(),
+        )
+        .unwrap();
+        tx.commit().unwrap();
+        read
+    }
+}
+
+async fn resolution_sdk_stage(
+    fixture: &Fixture,
+    conn: &Connection,
+    provider: &dyn opc_key::KeyProvider,
+    request: u8,
+    config: &[u8],
+) {
+    use crate::consensus::audit_mutation::TargetPayloadV1;
+    use sha2::{Digest, Sha256};
+    let mut stage = fixture.encrypted(fixture.request(conn, request, 4, 0x61, 1), 0x6a);
+    let Some(TargetPayloadV1::Target(blob)) = &mut stage.command_mut().effect.encrypted_payload
+    else {
+        panic!("staged confirmation fixture");
+    };
+    let envelope = opc_crypto::CryptoEnvelopeRef::decode(&blob.encrypted_blob).unwrap();
+    let (aad, _) = opc_key::decode_bound_aad(envelope.aad).unwrap();
+    let plaintext = copy_plaintext(request, config);
+    let encrypted = opc_crypto::encrypt_attested_envelope(provider, &aad, &plaintext)
+        .await
+        .unwrap();
+    blob.encrypted_blob = encrypted.encoded().to_vec();
+    blob.plaintext_digest = Sha256::digest(&plaintext).into();
+    let stage = fixture.rebind_at(conn, stage, 100);
+    assert!(matches!(
+        fixture.submit(conn, &stage),
+        AuditOperationState::TargetV1(_)
+    ));
+    fixture.settle(conn, &stage);
+}
+
+async fn resolution_sdk_rollback_envelope(
+    read: &crate::audit_authority::NetconfPendingRead,
+    provider: &dyn opc_key::KeyProvider,
+    request: u8,
+    change: &str,
+) -> crate::AttestedConfigCommit {
+    use opc_key::{ConfigAad, EnvelopeAad};
+    use sha2::{Digest, Sha256};
+    let source = read.rollback_configuration();
+    let version = source.running_base_version() + if change == "version" { 2 } else { 1 };
+    let parent = if change == "parent" {
+        opc_types::TxId::new()
+    } else {
+        read.tentative_transaction()
+    };
+    let schema = if change == "schema" {
+        opc_types::SchemaDigest::from_bytes([0x99; 32])
+    } else {
+        source.schema().unwrap()
+    };
+    let tx_id = opc_types::TxId::new();
+    let committed_at = "2026-01-01T00:00:01Z".parse().unwrap();
+    let principal = r#"{"tenant":"fixture-tenant","subject":"fixture-principal"}"#.to_owned();
+    let aad = EnvelopeAad::config(
+        opc_types::TenantId::from_static("fixture-tenant"),
+        version,
+        ConfigAad::new(
+            tx_id,
+            Some(parent),
+            committed_at,
+            &principal,
+            schema,
+            "running",
+        )
+        .unwrap(),
+    );
+    let config = if change == "content" {
+        br#"{"retained":1}"#
+    } else {
+        br#"{"retained":0}"#
+    };
+    let plaintext = copy_plaintext(request, config);
+    let encrypted = opc_crypto::encrypt_attested_envelope(provider, &aad, &plaintext)
+        .await
+        .unwrap();
+    crate::AttestedConfigCommit::try_new(
+        crate::CommitRecord {
+            tx_id,
+            parent_tx_id: Some(parent),
+            version: opc_types::ConfigVersion::new(version),
+            committed_at,
+            principal,
+            source: if change == "source" {
+                crate::CommitSource::Netconf
+            } else {
+                crate::CommitSource::CommitConfirmedRestore
+            },
+            schema_digest: schema,
+            plaintext_digest: Sha256::digest(&plaintext).to_vec(),
+            encrypted_blob: encrypted.encoded().to_vec(),
+            rollback_point: false,
+            confirmed_deadline: (change == "confirmed")
+                .then(|| "2026-01-01T00:01:00Z".parse().unwrap()),
+        },
+        Vec::new(),
+        encrypted.claim().unwrap(),
+    )
+    .unwrap()
+}
+
+#[tokio::test]
+async fn target_resolution_sdk_staged_confirmation_atomically_promotes_and_resolves() {
+    use crate::audit_authority::NetconfStagedConfirmation;
+    let tenant = opc_types::TenantId::from_static("fixture-tenant");
+    for token in [None, Some("synthetic-persistent-credential")] {
+        let fixture = Fixture::new().await;
+        let shared = fixture.backend.conn();
+        let conn = shared.lock().await;
+        let (provider, _worker, session, frozen) = confirmed_sdk_source(&fixture, &conn).await;
+        let tentative =
+            confirmed_sdk_install(&fixture, &conn, &session, &frozen, &provider, token).await;
+        fixture.settle(&conn, &tentative);
+        assert!(fixture.frozen_staged_confirmation(&conn, &session).is_err());
+        resolution_sdk_stage(&fixture, &conn, &provider, 241, br#"{"retained":2}"#).await;
+        assert!(fixture.frozen_promotion(&conn, &session).is_err());
+        let read = fixture.frozen_staged_confirmation(&conn, &session).unwrap();
+        assert_eq!(
+            read.pending(),
+            fixture.frozen_pending(&conn, &session).unwrap().pending()
+        );
+        let generation = read.candidate().candidate_generation().unwrap();
+        drop(provider);
+        let provider = provider_lifecycle_keys();
+        let commit = frozen_running_envelope(
+            &conn,
+            &read.promotion.copy,
+            &provider,
+            242,
+            br#"{"retained":2}"#,
+        )
+        .await;
+        let event = fixture.event(242);
+        let before = target_rows(&conn);
+        let changes = conn.total_changes();
+        let effect = read
+            .prepare_confirmation(
+                &session,
+                NetconfStagedConfirmation::new(&read, commit, &provider, token),
+                &tenant,
+                &event,
+                100..160,
+                &fixture.key,
+            )
+            .await
+            .unwrap();
+        let prepared = fixture.bind_pending_target(&read.pending, effect, event);
+        assert_eq!(fixture.preflight(&conn, &prepared, 100), Ok(None));
+        assert_eq!(target_rows(&conn), before);
+        assert_eq!(conn.total_changes(), changes);
+        let known = fixture.submit(&conn, &prepared);
+        assert!(matches!(&known, AuditOperationState::TargetV1(result)
+            if matches!(result.outcome(), NetconfAppliedOutcome::Promoted { running_version: 3, retired_generation }
+                if retired_generation == generation.checked_next().unwrap())));
+        let after = target_rows(&conn);
+        assert_eq!(fixture.submit(&conn, &prepared), known);
+        assert_eq!(target_rows(&conn), after);
+        let lifecycle = row(&conn, "config_netconf_lifecycle", "singleton", 1);
+        assert!(lifecycle["pending_confirmation"].is_null());
+        assert!(lifecycle["rollback_parent"].is_null());
+        assert!(lifecycle["original_deadline"].is_null());
+        assert!(
+            !row(&conn, "config_netconf_targets", "target", 0)["present"]
+                .as_bool()
+                .unwrap()
+        );
+        assert!(!fixture
+            .ledger(&conn)
+            .lookup(
+                &fixture.key,
+                prepared.handle(),
+                prepared.command().effect.caller
+            )
+            .unwrap()
+            .unwrap()
+            .terminal_recorded());
+        fixture.settle(&conn, &prepared);
+        provider_assert_history(&conn, &provider, 1, 181, br#"{"retained":0}"#).await;
+        provider_assert_history(&conn, &provider, 2, 234, br#"{"retained":1}"#).await;
+        provider_assert_history(&conn, &provider, 3, 242, br#"{"retained":2}"#).await;
+    }
+}
+
+#[tokio::test]
+async fn target_resolution_sdk_staged_confirmation_refuses_original_authority_substitution() {
+    use crate::audit_authority::NetconfStagedConfirmation;
+    for token in [None, Some("synthetic-persistent-credential")] {
+        let fixture = Fixture::new().await;
+        let shared = fixture.backend.conn();
+        let conn = shared.lock().await;
+        let (provider, worker, session, frozen) = confirmed_sdk_source(&fixture, &conn).await;
+        let tentative =
+            confirmed_sdk_install(&fixture, &conn, &session, &frozen, &provider, token).await;
+        fixture.settle(&conn, &tentative);
+        resolution_sdk_stage(&fixture, &conn, &provider, 241, br#"{"retained":2}"#).await;
+        let read = fixture.frozen_staged_confirmation(&conn, &session).unwrap();
+        let another = fixture.frozen_staged_confirmation(&conn, &session).unwrap();
+        let other = fixture.session_owner(&conn, &worker, 0x62);
+        let missing = opc_key::MemoryKeyProvider::new();
+        let before = target_rows(&conn);
+        let changes = conn.total_changes();
+        for change in [
+            "session",
+            "read",
+            "tenant",
+            "credential",
+            "missing",
+            "provider",
+            "content",
+            "operation",
+            "internal",
+            "deadline",
+        ] {
+            if token.is_none() && change == "missing" {
+                continue;
+            }
+            let config = if change == "content" {
+                br#"{"retained":9}"#
+            } else {
+                br#"{"retained":2}"#
+            };
+            let commit =
+                frozen_running_envelope(&conn, &read.promotion.copy, &provider, 242, config).await;
+            let chosen = if change == "session" {
+                &other
+            } else {
+                &session
+            };
+            let original = if change == "read" { &another } else { &read };
+            let keys: &dyn opc_key::KeyProvider = if change == "provider" {
+                &missing
+            } else {
+                &provider
+            };
+            let credential = match change {
+                "credential" => Some("different-credential"),
+                "missing" => None,
+                _ => token,
+            };
+            let tenant = opc_types::TenantId::from_static(if change == "tenant" {
+                "other-tenant"
+            } else {
+                "fixture-tenant"
+            });
+            let mut event = fixture.event(242);
+            if change == "operation" {
+                event.operation = ManagementAuditOperationCode::Replace;
+            }
+            if change == "internal" {
+                event.transport = ManagementAuditTransportCode::Internal;
+            }
+            let start = if change == "deadline" {
+                read.pending.view.original_deadline
+            } else {
+                100
+            };
+            assert!(
+                read.prepare_confirmation(
+                    chosen,
+                    NetconfStagedConfirmation::new(original, commit, keys, credential),
+                    &tenant,
+                    &event,
+                    start..start + 60,
+                    &fixture.key,
+                )
+                .await
+                .is_err(),
+                "staged confirmation accepted substituted original authority: {change}"
+            );
+            assert_eq!(target_rows(&conn), before);
+            assert_eq!(conn.total_changes(), changes);
+        }
+    }
+}
+
+#[tokio::test]
+async fn target_resolution_sdk_staged_confirmation_fences_stale_source_and_pending() {
+    use crate::audit_authority::NetconfStagedConfirmation;
+    let tenant = opc_types::TenantId::from_static("fixture-tenant");
+    for change in ["candidate", "resolved"] {
+        let fixture = Fixture::new().await;
+        let shared = fixture.backend.conn();
+        let conn = shared.lock().await;
+        let (provider, _worker, session, frozen) = confirmed_sdk_source(&fixture, &conn).await;
+        let tentative = confirmed_sdk_install(
+            &fixture,
+            &conn,
+            &session,
+            &frozen,
+            &provider,
+            Some("synthetic-token"),
+        )
+        .await;
+        fixture.settle(&conn, &tentative);
+        resolution_sdk_stage(&fixture, &conn, &provider, 241, br#"{"retained":2}"#).await;
+        let read = fixture.frozen_staged_confirmation(&conn, &session).unwrap();
+        let commit = frozen_running_envelope(
+            &conn,
+            &read.promotion.copy,
+            &provider,
+            242,
+            br#"{"retained":2}"#,
+        )
+        .await;
+        let event = fixture.event(242);
+        let effect = read
+            .prepare_confirmation(
+                &session,
+                NetconfStagedConfirmation::new(&read, commit, &provider, Some("synthetic-token")),
+                &tenant,
+                &event,
+                100..160,
+                &fixture.key,
+            )
+            .await
+            .unwrap();
+        let original = fixture.bind_pending_target(&read.pending, effect, event);
+        if change == "candidate" {
+            // Equal content under a distinct generation must still invalidate it.
+            resolution_sdk_stage(&fixture, &conn, &provider, 243, br#"{"retained":2}"#).await;
+        } else {
+            let commit = frozen_running_envelope(
+                &conn,
+                &read.promotion.copy,
+                &provider,
+                244,
+                br#"{"retained":2}"#,
+            )
+            .await;
+            let event = fixture.event(244);
+            let effect = read
+                .prepare_confirmation(
+                    &session,
+                    NetconfStagedConfirmation::new(
+                        &read,
+                        commit,
+                        &provider,
+                        Some("synthetic-token"),
+                    ),
+                    &tenant,
+                    &event,
+                    100..160,
+                    &fixture.key,
+                )
+                .await
+                .unwrap();
+            let other = fixture.bind_pending_target(&read.pending, effect, event);
+            assert!(matches!(
+                fixture.submit(&conn, &other),
+                AuditOperationState::TargetV1(_)
+            ));
+            fixture.settle(&conn, &other);
+        }
+        let before = target_rows(&conn);
+        let changes = conn.total_changes();
+        assert_eq!(
+            fixture.preflight(&conn, &original, 100),
+            Err(AuditAuthorityError::BindingMismatch)
+        );
+        assert_eq!(target_rows(&conn), before);
+        assert_eq!(conn.total_changes(), changes);
+        assert_eq!(
+            fixture.submit(&conn, &original),
+            AuditOperationState::Rejected
+        );
+        assert_eq!(target_rows(&conn), before);
+        fixture.settle(&conn, &original);
+    }
+}
+
+#[tokio::test]
+async fn target_resolution_sdk_cancellation_restores_original_parent_and_preserves_candidate() {
+    use crate::audit_authority::NetconfCancellation;
+    let tenant = opc_types::TenantId::from_static("fixture-tenant");
+    for token in [None, Some("synthetic-persistent-credential")] {
+        for staged in [false, true] {
+            let fixture = Fixture::new().await;
+            let shared = fixture.backend.conn();
+            let conn = shared.lock().await;
+            let (provider, worker, session, frozen) = confirmed_sdk_source(&fixture, &conn).await;
+            let tentative =
+                confirmed_sdk_install(&fixture, &conn, &session, &frozen, &provider, token).await;
+            fixture.settle(&conn, &tentative);
+            if staged {
+                resolution_sdk_stage(&fixture, &conn, &provider, 241, br#"{"retained":2}"#).await;
+            }
+            let candidate = row(&conn, "config_netconf_targets", "target", 0);
+            let caller = if token.is_some() {
+                fixture.session_owner(&conn, &worker, 0x62)
+            } else {
+                session.clone()
+            };
+            let read = fixture.frozen_pending(&conn, &caller).unwrap();
+            assert_eq!(read.rollback_configuration().running_base_version(), 2);
+            drop(provider);
+            let provider = provider_lifecycle_keys();
+            let plaintext = read
+                .rollback_configuration()
+                .decrypt_configuration(&provider, &tenant)
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(*plaintext, copy_plaintext(181, br#"{"retained":0}"#));
+            let commit = resolution_sdk_rollback_envelope(&read, &provider, 245, "valid").await;
+            let event = fixture.event(245);
+            let before = target_rows(&conn);
+            let changes = conn.total_changes();
+            let effect = read
+                .prepare_cancellation(
+                    &caller,
+                    NetconfCancellation::new(&read, commit, &provider, token),
+                    &tenant,
+                    &event,
+                    100..160,
+                    &fixture.key,
+                )
+                .await
+                .unwrap();
+            let prepared = fixture.bind_pending_target(&read, effect, event);
+            assert_eq!(fixture.preflight(&conn, &prepared, 100), Ok(None));
+            assert_eq!(target_rows(&conn), before);
+            assert_eq!(conn.total_changes(), changes);
+            let known = fixture.submit(&conn, &prepared);
+            assert!(matches!(&known, AuditOperationState::TargetV1(result)
+                if matches!(result.outcome(), NetconfAppliedOutcome::RolledBack { running_version: 3, pending } if pending == read.pending())));
+            assert_eq!(row(&conn, "config_netconf_targets", "target", 0), candidate);
+            let after = target_rows(&conn);
+            assert_eq!(fixture.submit(&conn, &prepared), known);
+            assert_eq!(target_rows(&conn), after);
+            assert!(!fixture
+                .ledger(&conn)
+                .lookup(
+                    &fixture.key,
+                    prepared.handle(),
+                    prepared.command().effect.caller
+                )
+                .unwrap()
+                .unwrap()
+                .terminal_recorded());
+            assert!(
+                row(&conn, "config_netconf_lifecycle", "singleton", 1)["pending_confirmation"]
+                    .is_null()
+            );
+            fixture.settle(&conn, &prepared);
+            provider_assert_history(&conn, &provider, 1, 181, br#"{"retained":0}"#).await;
+            provider_assert_history(&conn, &provider, 2, 234, br#"{"retained":1}"#).await;
+            provider_assert_history(&conn, &provider, 3, 245, br#"{"retained":0}"#).await;
+        }
+    }
+}
+
+#[tokio::test]
+async fn target_resolution_sdk_cancellation_refuses_substituted_ownership_and_successor() {
+    use crate::audit_authority::NetconfCancellation;
+    for token in [None, Some("synthetic-persistent-credential")] {
+        let fixture = Fixture::new().await;
+        let shared = fixture.backend.conn();
+        let conn = shared.lock().await;
+        let (provider, worker, session, frozen) = confirmed_sdk_source(&fixture, &conn).await;
+        let tentative =
+            confirmed_sdk_install(&fixture, &conn, &session, &frozen, &provider, token).await;
+        fixture.settle(&conn, &tentative);
+        let read = fixture.frozen_pending(&conn, &session).unwrap();
+        let another = fixture.frozen_pending(&conn, &session).unwrap();
+        let other = fixture.session_owner(&conn, &worker, 0x62);
+        let missing = opc_key::MemoryKeyProvider::new();
+        let before = target_rows(&conn);
+        let changes = conn.total_changes();
+        for change in [
+            "parent",
+            "version",
+            "schema",
+            "source",
+            "confirmed",
+            "content",
+            "session",
+            "read",
+            "tenant",
+            "credential",
+            "missing",
+            "provider",
+            "operation",
+            "internal",
+            "deadline",
+        ] {
+            if token.is_none() && change == "missing" {
+                continue;
+            }
+            let commit = resolution_sdk_rollback_envelope(&read, &provider, 245, change).await;
+            let chosen = if change == "session" {
+                &other
+            } else {
+                &session
+            };
+            let original = if change == "read" { &another } else { &read };
+            let keys: &dyn opc_key::KeyProvider = if change == "provider" {
+                &missing
+            } else {
+                &provider
+            };
+            let credential = match change {
+                "credential" => Some("different-credential"),
+                "missing" => None,
+                _ => token,
+            };
+            let tenant = opc_types::TenantId::from_static(if change == "tenant" {
+                "other-tenant"
+            } else {
+                "fixture-tenant"
+            });
+            let mut event = fixture.event(245);
+            if change == "operation" {
+                event.operation = ManagementAuditOperationCode::Replace;
+            }
+            if change == "internal" {
+                event.transport = ManagementAuditTransportCode::Internal;
+            }
+            let start = if change == "deadline" {
+                read.view.original_deadline
+            } else {
+                100
+            };
+            assert!(
+                read.prepare_cancellation(
+                    chosen,
+                    NetconfCancellation::new(original, commit, keys, credential),
+                    &tenant,
+                    &event,
+                    start..start + 60,
+                    &fixture.key,
+                )
+                .await
+                .is_err(),
+                "cancellation accepted substituted ownership or successor: {change}"
+            );
+            assert_eq!(target_rows(&conn), before);
+            assert_eq!(conn.total_changes(), changes);
+        }
+    }
+}
+
+#[tokio::test]
+async fn target_resolution_sdk_cancellation_fences_current_lock_and_original_pending() {
+    use crate::audit_authority::NetconfCancellation;
+    let tenant = opc_types::TenantId::from_static("fixture-tenant");
+    for change in ["lock", "resolved"] {
+        let fixture = Fixture::new().await;
+        let shared = fixture.backend.conn();
+        let conn = shared.lock().await;
+        let (provider, _worker, session, frozen) = confirmed_sdk_source(&fixture, &conn).await;
+        let frozen = if change == "lock" {
+            let lock = fixture.rebind_at(&conn, fixture.request(&conn, 247, 2, 0x61, 0), 100);
+            assert!(matches!(
+                fixture.submit(&conn, &lock),
+                AuditOperationState::TargetV1(_)
+            ));
+            fixture.settle(&conn, &lock);
+            fixture.frozen_promotion(&conn, &session).unwrap()
+        } else {
+            frozen
+        };
+        let tentative =
+            confirmed_sdk_install(&fixture, &conn, &session, &frozen, &provider, None).await;
+        fixture.settle(&conn, &tentative);
+        let read = fixture.frozen_pending(&conn, &session).unwrap();
+        let commit = resolution_sdk_rollback_envelope(&read, &provider, 245, "valid").await;
+        let event = fixture.event(245);
+        let effect = read
+            .prepare_cancellation(
+                &session,
+                NetconfCancellation::new(&read, commit, &provider, None),
+                &tenant,
+                &event,
+                100..160,
+                &fixture.key,
+            )
+            .await
+            .unwrap();
+        let original = fixture.bind_pending_target(&read, effect, event);
+        if change == "lock" {
+            let before = target_rows(&conn);
+            let foreign = fixture.rebind_at(&conn, fixture.request(&conn, 246, 2, 0x62, 0), 100);
+            assert_eq!(
+                fixture.submit(&conn, &foreign),
+                AuditOperationState::Rejected
+            );
+            assert_eq!(target_rows(&conn), before);
+            fixture.settle(&conn, &foreign);
+            // Acquisition during a pending operation is forbidden. A release
+            // of its owner's original lease is the reachable stale-lock case.
+            let release = fixture.rebind_at(&conn, fixture.request(&conn, 248, 3, 0x61, 0), 100);
+            assert!(matches!(
+                fixture.submit(&conn, &release),
+                AuditOperationState::TargetV1(_)
+            ));
+            fixture.settle(&conn, &release);
+            assert!(fixture.frozen_pending(&conn, &session).is_ok());
+        } else {
+            let commit = resolution_sdk_rollback_envelope(&read, &provider, 246, "valid").await;
+            let event = fixture.event(246);
+            let effect = read
+                .prepare_cancellation(
+                    &session,
+                    NetconfCancellation::new(&read, commit, &provider, None),
+                    &tenant,
+                    &event,
+                    100..160,
+                    &fixture.key,
+                )
+                .await
+                .unwrap();
+            let other = fixture.bind_pending_target(&read, effect, event);
+            assert!(matches!(
+                fixture.submit(&conn, &other),
+                AuditOperationState::TargetV1(_)
+            ));
+            fixture.settle(&conn, &other);
+        }
+        let before = target_rows(&conn);
+        let changes = conn.total_changes();
+        assert_eq!(
+            fixture.preflight(&conn, &original, 100),
+            Err(AuditAuthorityError::BindingMismatch)
+        );
+        assert_eq!(target_rows(&conn), before);
+        assert_eq!(conn.total_changes(), changes);
+        assert_eq!(
+            fixture.submit(&conn, &original),
+            AuditOperationState::Rejected
+        );
+        assert_eq!(target_rows(&conn), before);
+        fixture.settle(&conn, &original);
+    }
+}
+
+struct ResolutionPausedProvider {
+    inner: opc_key::MemoryKeyProvider,
+    entered: tokio::sync::Notify,
+    resume: tokio::sync::Notify,
+    calls: std::sync::atomic::AtomicUsize,
+}
+
+#[async_trait::async_trait]
+impl opc_key::KeyProvider for ResolutionPausedProvider {
+    async fn get_active_key(
+        &self,
+        purpose: opc_key::KeyPurpose,
+        tenant: &opc_types::TenantId,
+    ) -> Result<opc_key::KeyHandle, opc_key::KeyError> {
+        opc_key::KeyProvider::get_active_key(&self.inner, purpose, tenant).await
+    }
+    async fn get_key_by_id(
+        &self,
+        key_id: &opc_key::KeyId,
+    ) -> Result<opc_key::KeyHandle, opc_key::KeyError> {
+        self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        self.entered.notify_one();
+        self.resume.notified().await;
+        opc_key::KeyProvider::get_key_by_id(&self.inner, key_id).await
+    }
+    async fn rotate_key(
+        &self,
+        purpose: opc_key::KeyPurpose,
+        tenant: &opc_types::TenantId,
+    ) -> Result<opc_key::KeyId, opc_key::KeyError> {
+        opc_key::KeyProvider::rotate_key(&self.inner, purpose, tenant).await
+    }
+}
+
+#[tokio::test]
+async fn target_resolution_sdk_cancellation_during_provider_work_admits_nothing() {
+    use crate::audit_authority::{NetconfCancellation, NetconfStagedConfirmation};
+    let tenant = opc_types::TenantId::from_static("fixture-tenant");
+    for staged in [false, true] {
+        for invalidate in [false, true] {
+            let fixture = Fixture::new().await;
+            let shared = fixture.backend.conn();
+            let conn = shared.lock().await;
+            let (provider, _worker, session, frozen) = confirmed_sdk_source(&fixture, &conn).await;
+            let tentative =
+                confirmed_sdk_install(&fixture, &conn, &session, &frozen, &provider, None).await;
+            fixture.settle(&conn, &tentative);
+            if staged {
+                resolution_sdk_stage(&fixture, &conn, &provider, 241, br#"{"retained":2}"#).await;
+            }
+            let pending = fixture.frozen_pending(&conn, &session).unwrap();
+            let staged_read = if staged {
+                Some(fixture.frozen_staged_confirmation(&conn, &session).unwrap())
+            } else {
+                None
+            };
+            let commit = if let Some(read) = &staged_read {
+                frozen_running_envelope(
+                    &conn,
+                    &read.promotion.copy,
+                    &provider,
+                    245,
+                    br#"{"retained":2}"#,
+                )
+                .await
+            } else {
+                resolution_sdk_rollback_envelope(&pending, &provider, 245, "valid").await
+            };
+            let paused = ResolutionPausedProvider {
+                inner: provider,
+                entered: tokio::sync::Notify::new(),
+                resume: tokio::sync::Notify::new(),
+                calls: std::sync::atomic::AtomicUsize::new(0),
+            };
+            let event = fixture.event(245);
+            let before = target_rows(&conn);
+            let changes = conn.total_changes();
+            let original_operations = fixture.ledger(&conn).operations.len();
+            let mut preparation: std::pin::Pin<
+                Box<
+                    dyn std::future::Future<Output = Result<TargetEffectV1, AuditAuthorityError>>
+                        + '_,
+                >,
+            > = if let Some(read) = &staged_read {
+                Box::pin(read.prepare_confirmation(
+                    &session,
+                    NetconfStagedConfirmation::new(read, commit, &paused, None),
+                    &tenant,
+                    &event,
+                    100..160,
+                    &fixture.key,
+                ))
+            } else {
+                Box::pin(pending.prepare_cancellation(
+                    &session,
+                    NetconfCancellation::new(&pending, commit, &paused, None),
+                    &tenant,
+                    &event,
+                    100..160,
+                    &fixture.key,
+                ))
+            };
+            tokio::select! {
+                _ = paused.entered.notified() => {},
+                _ = &mut preparation => panic!("preparation did not wait for provider ownership"),
+            }
+            assert_eq!(paused.calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+            if invalidate {
+                session.invalidate();
+                paused.resume.notify_one();
+                assert!(
+                    preparation.await.is_err(),
+                    "revoked session survived provider ownership await"
+                );
+            } else {
+                drop(preparation);
+            }
+            assert_eq!(target_rows(&conn), before);
+            assert_eq!(conn.total_changes(), changes);
+            assert_eq!(fixture.ledger(&conn).operations.len(), original_operations);
+        }
+    }
+}
+
+async fn internal_rollback_envelope(
+    read: &crate::audit_authority::NetconfRollbackRead,
+    provider: &dyn opc_key::KeyProvider,
+    request: u8,
+    change: &str,
+) -> crate::AttestedConfigCommit {
+    use opc_key::{ConfigAad, EnvelopeAad};
+    use sha2::{Digest, Sha256};
+    let version = read.running_version() + if change == "version" { 2 } else { 1 };
+    let parent = if change == "parent" {
+        opc_types::TxId::new()
+    } else {
+        read.tentative_transaction()
+    };
+    let schema = if change == "schema" {
+        opc_types::SchemaDigest::from_bytes([0x99; 32])
+    } else {
+        read.schema()
+    };
+    let tx_id = opc_types::TxId::new();
+    let committed_at = "2026-01-01T00:00:01Z".parse().unwrap();
+    let principal = r#"{"tenant":"fixture-tenant","subject":"fixture-principal"}"#.to_owned();
+    let aad = EnvelopeAad::config(
+        opc_types::TenantId::from_static("fixture-tenant"),
+        version,
+        ConfigAad::new(
+            tx_id,
+            Some(parent),
+            committed_at,
+            &principal,
+            schema,
+            "running",
+        )
+        .unwrap(),
+    );
+    let config = if change == "content" {
+        br#"{"retained":1}"#
+    } else {
+        br#"{"retained":0}"#
+    };
+    let plaintext = copy_plaintext(request, config);
+    let encrypted = opc_crypto::encrypt_attested_envelope(provider, &aad, &plaintext)
+        .await
+        .unwrap();
+    crate::AttestedConfigCommit::try_new(
+        crate::CommitRecord {
+            tx_id,
+            parent_tx_id: Some(parent),
+            version: opc_types::ConfigVersion::new(version),
+            committed_at,
+            principal,
+            source: if change == "source" {
+                crate::CommitSource::Netconf
+            } else {
+                crate::CommitSource::CommitConfirmedRestore
+            },
+            schema_digest: schema,
+            plaintext_digest: Sha256::digest(&plaintext).to_vec(),
+            encrypted_blob: encrypted.encoded().to_vec(),
+            rollback_point: false,
+            confirmed_deadline: (change == "confirmed")
+                .then(|| "2026-01-01T00:01:00Z".parse().unwrap()),
+        },
+        Vec::new(),
+        encrypted.claim().unwrap(),
+    )
+    .unwrap()
+}
+
+impl Fixture {
+    fn frozen_rollback(
+        &self,
+        conn: &Connection,
+        owner: &crate::audit_authority::NetconfRecoveryOwner,
+        now: i64,
+    ) -> Result<Option<crate::audit_authority::NetconfRollbackRead>, AuditAuthorityError> {
+        let tx = conn.unchecked_transaction().unwrap();
+        let view = crate::consensus::audit_targets::read_rollback_view_sync(
+            &tx,
+            &self.key,
+            &self.ledger(&tx),
+            owner,
+            now,
+            &crate::consensus::sqlite::SqliteWorkCancellation::audit_test(),
+        )
+        .unwrap();
+        tx.commit().unwrap();
+        view?.map(|view| owner.remember(view)).transpose()
+    }
+
+    fn bind_rollback(
+        &self,
+        read: &crate::audit_authority::NetconfRollbackRead,
+        effect: TargetEffectV1,
+        event: ProjectedAuditEvent,
+        now: i64,
+    ) -> PreparedTargetMutation {
+        let digest = effect.digest(&self.key).unwrap();
+        let binding =
+            AuditOperationBinding::project(&self.privacy, &event, read.running_version(), &digest)
+                .unwrap();
+        let handle = AuditOperationHandle::issue(
+            HandleBody {
+                version: 1,
+                identity: self.identity,
+                binding,
+                event,
+                issued_at: now,
+                expires_at: effect.expires_at,
+                nonce: *uuid::Uuid::new_v4().as_bytes(),
+                key_epoch: self.key.epoch(),
+                mutation: Some(digest),
+            },
+            &self.key,
+        )
+        .unwrap();
+        let prepared = PreparedTargetMutation::new(handle, effect, None);
+        prepared.verify_effect(&self.key).unwrap();
+        prepared
+    }
+}
+
+#[tokio::test]
+async fn target_rollback_sdk_timeout_uses_original_parent_and_retains_exact_attempt() {
+    use crate::audit_authority::{NetconfRollback, NetconfRollbackCause};
+    for token in [None, Some("synthetic-persistent-credential")] {
+        let fixture = Fixture::new().await;
+        let shared = fixture.backend.conn();
+        let conn = shared.lock().await;
+        let (provider, worker, session, frozen) = confirmed_sdk_source(&fixture, &conn).await;
+        let tentative =
+            confirmed_sdk_install(&fixture, &conn, &session, &frozen, &provider, token).await;
+        let owner = session.device.recovery_owner();
+        assert!(owner.worker.belongs_to(&worker));
+        assert!(!owner.worker.belongs_to(&std::sync::Arc::new(())));
+        assert!(matches!(
+            fixture.frozen_rollback(&conn, &owner, i64::MAX),
+            Err(AuditAuthorityError::RecoveryRequired)
+        ));
+        fixture.settle(&conn, &tentative);
+        let pending = fixture.frozen_pending(&conn, &session).unwrap();
+        let deadline = pending.view.original_deadline;
+        assert!(
+            fixture
+                .frozen_rollback(&conn, &owner, deadline - 1)
+                .unwrap()
+                .is_none(),
+            "internal rollback became available before original deadline"
+        );
+        let read = fixture
+            .frozen_rollback(&conn, &owner, deadline)
+            .unwrap()
+            .unwrap();
+        let again = fixture
+            .frozen_rollback(&conn, &session.device.clone().recovery_owner(), deadline)
+            .unwrap()
+            .unwrap();
+        assert_eq!(read.cause(), NetconfRollbackCause::Timeout);
+        assert_eq!(read.pending(), pending.pending());
+        assert_eq!(read.original_deadline(), deadline);
+        assert_eq!(read.parent_version(), 1);
+        assert_eq!(read.running_version(), 2);
+        assert_eq!(
+            read.tentative_transaction(),
+            pending.tentative_transaction()
+        );
+        assert_eq!(
+            read.encrypted_configuration(),
+            pending
+                .rollback_configuration()
+                .encrypted_configuration()
+                .unwrap()
+        );
+        let tenant = opc_types::TenantId::from_static("fixture-tenant");
+        read.verify_tenant(&fixture.privacy, &tenant).unwrap();
+        let event = read
+            .project_event(&fixture.privacy, fixture.device_event(245))
+            .unwrap();
+        assert_eq!(event.caller, read.original_caller());
+        let commit = internal_rollback_envelope(&read, &provider, 245, "valid").await;
+        let before = target_rows(&conn);
+        let changes = conn.total_changes();
+        let effect = read
+            .prepare_rollback(
+                &owner,
+                NetconfRollback::new(&read, commit, &provider),
+                &tenant,
+                &event,
+                deadline..deadline + 60,
+                &fixture.key,
+            )
+            .await
+            .unwrap();
+        assert_eq!(conn.total_changes(), changes);
+        assert_eq!(target_rows(&conn), before);
+        let first = fixture.bind_rollback(&read, effect.clone(), event.clone(), deadline);
+        let concurrent = fixture.bind_rollback(&read, effect, event.clone(), deadline);
+        let (a, b) = tokio::join!(async { read.retain(&owner, first) }, async {
+            again.retain(&owner, concurrent)
+        });
+        let prepared = a.unwrap();
+        assert_eq!(prepared, b.unwrap());
+        assert_eq!(read.original().unwrap(), Some(prepared.clone()));
+        assert_eq!(again.original().unwrap(), Some(prepared.clone()));
+        let commit = internal_rollback_envelope(&again, &provider, 245, "valid").await;
+        assert!(matches!(
+            again
+                .prepare_rollback(
+                    &owner,
+                    NetconfRollback::new(&again, commit, &provider),
+                    &tenant,
+                    &event,
+                    deadline + 1..deadline + 61,
+                    &fixture.key,
+                )
+                .await,
+            Err(AuditAuthorityError::RecoveryRequired)
+        ));
+        assert_eq!(fixture.preflight(&conn, &prepared, deadline), Ok(None));
+        let result = fixture.submit_at(&conn, &prepared, deadline);
+        assert!(matches!(result, AuditOperationState::TargetV1(result)
+            if matches!(result.outcome(), NetconfAppliedOutcome::RolledBack {
+                running_version: 3, pending: token,
+            } if token == read.pending())));
+        assert_eq!(fixture.submit_at(&conn, &prepared, deadline + 1), result);
+        assert!(matches!(
+            fixture.frozen_rollback(&conn, &owner, deadline + 1),
+            Err(AuditAuthorityError::RecoveryRequired)
+        ));
+        assert_eq!(read.original().unwrap(), Some(prepared.clone()));
+        let ledger = fixture.ledger(&conn);
+        assert_eq!(
+            ledger
+                .recover_target(&fixture.key, prepared.handle(), read.original_caller())
+                .unwrap(),
+            prepared
+        );
+        // A persisted-row reopen reconstructs the exact admitted description;
+        // this is not a public store/process restart qualification.
+        let reopened = Connection::open(fixture.directory.path().join("authority.sqlite")).unwrap();
+        assert_eq!(
+            fixture
+                .ledger(&reopened)
+                .recover_target(&fixture.key, prepared.handle(), read.original_caller(),)
+                .unwrap(),
+            prepared
+        );
+        fixture.settle(&conn, &prepared);
+        assert!(fixture
+            .frozen_rollback(&conn, &owner, deadline + 1)
+            .unwrap()
+            .is_none());
+        fixture.assert_no_pending(&conn);
+        provider_assert_history(&conn, &provider, 1, 181, br#"{"retained":0}"#).await;
+        provider_assert_history(&conn, &provider, 2, 234, br#"{"retained":1}"#).await;
+        provider_assert_history(&conn, &provider, 3, 245, br#"{"retained":0}"#).await;
+    }
+}
+
+#[tokio::test]
+async fn target_rollback_sdk_session_loss_requires_retained_original_cleanup() {
+    use crate::audit_authority::{NetconfRollback, NetconfRollbackCause};
+    for token in [None, Some("synthetic-persistent-credential")] {
+        let fixture = Fixture::new().await;
+        let shared = fixture.backend.conn();
+        let conn = shared.lock().await;
+        let (provider, _worker, session, frozen) = confirmed_sdk_source(&fixture, &conn).await;
+        let tentative =
+            confirmed_sdk_install(&fixture, &conn, &session, &frozen, &provider, token).await;
+        fixture.settle(&conn, &tentative);
+        let owner = session.device.recovery_owner();
+        session.invalidate();
+        assert!(fixture
+            .frozen_rollback(&conn, &owner, 100)
+            .unwrap()
+            .is_none());
+        let event = fixture.device_event(244);
+        let cleanup = fixture
+            .device_view(&conn)
+            .prepare_session_cleanup(&session, &event, 160)
+            .unwrap();
+        let cleanup = fixture.bind_current_base(&conn, fixture.prepare(cleanup, event));
+        assert!(matches!(
+            fixture.submit(&conn, &cleanup),
+            AuditOperationState::TargetV1(_)
+        ));
+        assert!(matches!(
+            fixture.frozen_rollback(&conn, &owner, 100),
+            Err(AuditAuthorityError::RecoveryRequired)
+        ));
+        fixture.settle(&conn, &cleanup);
+        if token.is_some() {
+            assert!(
+                fixture
+                    .frozen_rollback(&conn, &owner, 100)
+                    .unwrap()
+                    .is_none(),
+                "persistent session loss fabricated internal rollback authority"
+            );
+            let deadline = row(&conn, "config_netconf_lifecycle", "singleton", 1)
+                ["original_deadline"]
+                .as_i64()
+                .unwrap();
+            assert_eq!(
+                fixture
+                    .frozen_rollback(&conn, &owner, deadline)
+                    .unwrap()
+                    .unwrap()
+                    .cause(),
+                NetconfRollbackCause::Timeout
+            );
+            continue;
+        }
+        assert_eq!(
+            fixture.device_view(&conn).verify_owner(&session.device),
+            Err(AuditAuthorityError::RecoveryRequired)
+        );
+        let read = fixture
+            .frozen_rollback(&conn, &owner, 100)
+            .unwrap()
+            .unwrap();
+        assert_eq!(read.cause(), NetconfRollbackCause::SessionLoss);
+        let event = read
+            .project_event(&fixture.privacy, fixture.device_event(245))
+            .unwrap();
+        let commit = internal_rollback_envelope(&read, &provider, 245, "valid").await;
+        let effect = read
+            .prepare_rollback(
+                &owner,
+                NetconfRollback::new(&read, commit, &provider),
+                &opc_types::TenantId::from_static("fixture-tenant"),
+                &event,
+                100..160,
+                &fixture.key,
+            )
+            .await
+            .unwrap();
+        let prepared = read
+            .retain(&owner, fixture.bind_rollback(&read, effect, event, 100))
+            .unwrap();
+        assert!(
+            matches!(fixture.submit(&conn, &prepared), AuditOperationState::TargetV1(result)
+            if matches!(result.outcome(), NetconfAppliedOutcome::RolledBack { running_version:3, .. }))
+        );
+        fixture.settle(&conn, &prepared);
+        assert_eq!(
+            fixture.device_view(&conn).verify_owner(&session.device),
+            Ok(())
+        );
+        assert!(session.require_active().is_err());
+        fixture.assert_no_pending(&conn);
+        provider_assert_history(&conn, &provider, 3, 245, br#"{"retained":0}"#).await;
+    }
+}
+
+#[tokio::test]
+async fn target_rollback_sdk_reboot_uses_recovery_scope_without_serving_authority() {
+    use crate::audit_authority::{NetconfRollback, NetconfRollbackCause};
+    for token in [None, Some("synthetic-persistent-credential")] {
+        let fixture = Fixture::new().await;
+        let shared = fixture.backend.conn();
+        let conn = shared.lock().await;
+        let (provider, worker, session, frozen) = confirmed_sdk_source(&fixture, &conn).await;
+        let tentative =
+            confirmed_sdk_install(&fixture, &conn, &session, &frozen, &provider, token).await;
+        fixture.settle(&conn, &tentative);
+        let old = session.device.recovery_owner();
+        // Reopening the rows does not begin a device or authorize early rollback.
+        let reopened = Connection::open(fixture.directory.path().join("authority.sqlite")).unwrap();
+        assert!(fixture
+            .frozen_rollback(&reopened, &old, 100)
+            .unwrap()
+            .is_none());
+        let mut event = fixture.device_event(243);
+        event.caller = crate::audit_authority::AuditCaller::project(
+            &fixture.privacy,
+            "fixture-tenant",
+            "synthetic-recovery-administrator",
+        )
+        .unwrap();
+        let effect = fixture
+            .device_view(&conn)
+            .prepare(&event, 160, [0x58; 16], [0x59; 16])
+            .unwrap();
+        let start = fixture.bind_current_base(&conn, fixture.prepare(effect, event.clone()));
+        assert!(matches!(
+            fixture.submit(&conn, &start),
+            AuditOperationState::TargetV1(_)
+        ));
+        let new_session = fixture.session_owner(&conn, &worker, 0x64);
+        let owner = new_session.device.recovery_owner();
+        assert!(matches!(
+            fixture.frozen_rollback(&conn, &owner, 100),
+            Err(AuditAuthorityError::RecoveryRequired)
+        ));
+        fixture.settle(&conn, &start);
+        assert_eq!(
+            fixture.device_view(&conn).verify_owner(&new_session.device),
+            Err(AuditAuthorityError::RecoveryRequired)
+        );
+        assert!(matches!(
+            fixture.frozen_rollback(&conn, &old, 100),
+            Err(AuditAuthorityError::BindingMismatch)
+        ));
+        let read = fixture
+            .frozen_rollback(&conn, &owner, 100)
+            .unwrap()
+            .unwrap();
+        assert_eq!(read.cause(), NetconfRollbackCause::DeviceReboot);
+        assert_eq!(read.original_caller(), session.caller);
+        assert_ne!(read.original_caller(), owner.caller);
+        let mut event = fixture.device_event(245);
+        event.caller = owner.caller;
+        let event = read.project_event(&fixture.privacy, event).unwrap();
+        assert_eq!(event.caller, session.caller);
+        let commit = internal_rollback_envelope(&read, &provider, 245, "valid").await;
+        let effect = read
+            .prepare_rollback(
+                &owner,
+                NetconfRollback::new(&read, commit, &provider),
+                &opc_types::TenantId::from_static("fixture-tenant"),
+                &event,
+                100..160,
+                &fixture.key,
+            )
+            .await
+            .unwrap();
+        let prepared = read
+            .retain(&owner, fixture.bind_rollback(&read, effect, event, 100))
+            .unwrap();
+        assert!(
+            matches!(fixture.submit(&conn, &prepared), AuditOperationState::TargetV1(result)
+            if matches!(result.outcome(), NetconfAppliedOutcome::RolledBack { running_version:3, .. }))
+        );
+        assert_eq!(
+            fixture.device_view(&conn).verify_owner(&new_session.device),
+            Err(AuditAuthorityError::RecoveryRequired)
+        );
+        fixture.settle(&conn, &prepared);
+        assert_eq!(
+            fixture.device_view(&conn).verify_owner(&new_session.device),
+            Ok(())
+        );
+        fixture.assert_no_pending(&conn);
+        provider_assert_history(&conn, &provider, 3, 245, br#"{"retained":0}"#).await;
+    }
+}
+
+#[tokio::test]
+async fn target_rollback_sdk_refuses_substituted_scope_event_and_successor() {
+    use crate::audit_authority::NetconfRollback;
+    let fixture = Fixture::new().await;
+    let shared = fixture.backend.conn();
+    let conn = shared.lock().await;
+    let (provider, _worker, session, frozen) = confirmed_sdk_source(&fixture, &conn).await;
+    let tentative =
+        confirmed_sdk_install(&fixture, &conn, &session, &frozen, &provider, None).await;
+    fixture.settle(&conn, &tentative);
+    let owner = session.device.recovery_owner();
+    let deadline = fixture
+        .frozen_pending(&conn, &session)
+        .unwrap()
+        .view
+        .original_deadline;
+    let read = fixture
+        .frozen_rollback(&conn, &owner, deadline)
+        .unwrap()
+        .unwrap();
+    let event = read
+        .project_event(&fixture.privacy, fixture.device_event(245))
+        .unwrap();
+    let tenant = opc_types::TenantId::from_static("fixture-tenant");
+    let missing = opc_key::MemoryKeyProvider::new();
+    let before = target_rows(&conn);
+    let changes = conn.total_changes();
+    for change in ["authority", "profile", "device", "administrator", "cache"] {
+        let mut changed = owner.clone();
+        match change {
+            "authority" => {
+                changed.authority = ConfigConsensusIdentity::new(
+                    ConfigConsensusClusterId::from_bytes([0x79; 32]),
+                    ConfigConsensusConfigurationId::from_bytes([0x42; 32]),
+                    ConfigConsensusConfigurationEpoch::new(1).unwrap(),
+                )
+            }
+            "profile" => changed.profile_incarnation = [0x77; 16],
+            "device" => changed.device_incarnation = [0x78; 16],
+            "administrator" => {
+                changed.caller = crate::audit_authority::AuditCaller::project(
+                    &fixture.privacy,
+                    "fixture-tenant",
+                    "different-principal",
+                )
+                .unwrap()
+            }
+            "cache" => changed.cache = Default::default(),
+            _ => unreachable!(),
+        }
+        assert!(
+            read.verify_owner(&changed).is_err(),
+            "rollback accepted substituted recovery scope: {change}"
+        );
+        if change != "cache" {
+            assert!(fixture.frozen_rollback(&conn, &changed, deadline).is_err());
+        }
+    }
+    for change in [
+        "parent",
+        "version",
+        "schema",
+        "source",
+        "confirmed",
+        "content",
+        "provider",
+        "tenant",
+        "read",
+        "caller",
+        "projection",
+        "operation",
+        "transport",
+        "deadline",
+    ] {
+        let commit = internal_rollback_envelope(&read, &provider, 245, change).await;
+        let clone = read.clone();
+        let input_read = if change == "read" { &clone } else { &read };
+        let keys: &dyn opc_key::KeyProvider = if change == "provider" {
+            &missing
+        } else {
+            &provider
+        };
+        let selected_tenant = opc_types::TenantId::from_static(if change == "tenant" {
+            "other-tenant"
+        } else {
+            "fixture-tenant"
+        });
+        let mut changed_event = event.clone();
+        match change {
+            "caller" => {
+                changed_event.caller = crate::audit_authority::AuditCaller::project(
+                    &fixture.privacy,
+                    "fixture-tenant",
+                    "different-principal",
+                )
+                .unwrap()
+            }
+            "projection" => {
+                changed_event.projection =
+                    crate::audit_authority::AuditToken::from_keyed_projection([0x77; 32]).unwrap()
+            }
+            "operation" => changed_event.operation = ManagementAuditOperationCode::Replace,
+            "transport" => changed_event.transport = ManagementAuditTransportCode::NetconfSsh,
+            _ => {}
+        }
+        let now = if change == "deadline" {
+            deadline - 1
+        } else {
+            deadline
+        };
+        assert!(
+            read.prepare_rollback(
+                &owner,
+                NetconfRollback::new(input_read, commit, keys),
+                &selected_tenant,
+                &changed_event,
+                now..now + 60,
+                &fixture.key,
+            )
+            .await
+            .is_err(),
+            "internal rollback accepted substituted original authority: {change}"
+        );
+        assert_eq!(target_rows(&conn), before);
+        assert_eq!(conn.total_changes(), changes);
+        assert!(read.original().unwrap().is_none());
+    }
+    assert!(read
+        .verify_tenant(
+            &fixture.privacy,
+            &opc_types::TenantId::from_static("other-tenant")
+        )
+        .is_err());
+    assert!(read
+        .verify_tenant(
+            &crate::audit_authority::AuditPrivacyKey::new([0x76; 32]).unwrap(),
+            &tenant
+        )
+        .is_err());
+    for change in ["caller", "projection", "operation", "transport", "outcome"] {
+        let mut event = fixture.device_event(245);
+        match change {
+            "caller" => {
+                event.caller = crate::audit_authority::AuditCaller::project(
+                    &fixture.privacy,
+                    "fixture-tenant",
+                    "different-principal",
+                )
+                .unwrap()
+            }
+            "projection" => {
+                event.projection =
+                    crate::audit_authority::AuditToken::from_keyed_projection([0x77; 32]).unwrap()
+            }
+            "operation" => event.operation = ManagementAuditOperationCode::Replace,
+            "transport" => event.transport = ManagementAuditTransportCode::NetconfSsh,
+            "outcome" => event.outcome = ManagementAuditOutcomeCode::Denied,
+            _ => unreachable!(),
+        }
+        assert!(
+            read.project_event(&fixture.privacy, event).is_err(),
+            "internal rollback accepted untrusted administrator event: {change}"
+        );
+    }
+    assert_eq!(conn.total_changes(), changes);
+    assert_eq!(target_rows(&conn), before);
+}
+
+#[tokio::test]
+async fn target_rollback_sdk_retains_ambiguous_original_and_refuses_replacement() {
+    use crate::audit_authority::NetconfRollback;
+    let fixture = Fixture::new().await;
+    let shared = fixture.backend.conn();
+    let conn = shared.lock().await;
+    let (provider, _worker, session, frozen) = confirmed_sdk_source(&fixture, &conn).await;
+    let tentative =
+        confirmed_sdk_install(&fixture, &conn, &session, &frozen, &provider, None).await;
+    fixture.settle(&conn, &tentative);
+    let owner = session.device.recovery_owner();
+    let deadline = fixture
+        .frozen_pending(&conn, &session)
+        .unwrap()
+        .view
+        .original_deadline;
+    let read = fixture
+        .frozen_rollback(&conn, &owner, deadline)
+        .unwrap()
+        .unwrap();
+    let event = read
+        .project_event(&fixture.privacy, fixture.device_event(245))
+        .unwrap();
+    let commit = internal_rollback_envelope(&read, &provider, 245, "valid").await;
+    let effect = read
+        .prepare_rollback(
+            &owner,
+            NetconfRollback::new(&read, commit, &provider),
+            &opc_types::TenantId::from_static("fixture-tenant"),
+            &event,
+            deadline..deadline + 60,
+            &fixture.key,
+        )
+        .await
+        .unwrap();
+    let prepared = read
+        .retain(
+            &owner,
+            fixture.bind_rollback(&read, effect, event, deadline),
+        )
+        .unwrap();
+    let before = target_rows(&conn);
+    // Simulate loss of the admission response: retain the exact intent only.
+    fixture
+        .apply(
+            &conn,
+            AuditCommand::NetconfTarget(Box::new(TargetAuditCommandV1::Admit(
+                prepared.command().clone(),
+            ))),
+            deadline,
+        )
+        .unwrap();
+    fixture.checkpoint(&conn);
+    assert_eq!(
+        fixture
+            .ledger(&conn)
+            .lookup(&fixture.key, prepared.handle(), read.original_caller())
+            .unwrap()
+            .unwrap()
+            .state(),
+        AuditOperationState::Intent
+    );
+    assert!(matches!(
+        fixture.frozen_rollback(&conn, &owner, deadline + 1),
+        Err(AuditAuthorityError::RecoveryRequired)
+    ));
+    assert_eq!(read.original().unwrap(), Some(prepared.clone()));
+    for change in ["request", "parent", "lifetime"] {
+        let mut other = prepared.clone();
+        match change {
+            "request" => other.command_mut().handle.body.event.request = fixture.event(246).request,
+            "parent" => other.command_mut().effect.source = None,
+            "lifetime" => other.command_mut().handle.body.expires_at += 1,
+            _ => unreachable!(),
+        }
+        assert!(
+            read.retain(&owner, other).is_err(),
+            "ambiguous original was replaced: {change}"
+        );
+        assert_eq!(read.original().unwrap(), Some(prepared.clone()));
+        assert_eq!(target_rows(&conn), before);
+    }
+    // Expiry is not proof of a decision. Even after definite rejection this
+    // initial-preparation API cannot silently replace the original operation.
+    assert_eq!(
+        fixture.submit_at(&conn, &prepared, deadline + 60),
+        AuditOperationState::Rejected
+    );
+    fixture.settle(&conn, &prepared);
+    let original_deadline =
+        row(&conn, "config_netconf_lifecycle", "singleton", 1)["original_deadline"].clone();
+    let same = fixture
+        .frozen_rollback(&conn, &owner, deadline + 61)
+        .unwrap()
+        .unwrap();
+    assert_eq!(same.original().unwrap(), Some(prepared.clone()));
+    assert_eq!(original_deadline.as_i64(), Some(deadline));
+    assert_eq!(target_rows(&conn), before);
+}
+
+#[tokio::test]
+async fn target_rollback_sdk_provider_cancellation_and_later_device_change_admit_nothing() {
+    use crate::audit_authority::NetconfRollback;
+    for replace_device in [false, true] {
+        let fixture = Fixture::new().await;
+        let shared = fixture.backend.conn();
+        let conn = shared.lock().await;
+        let (provider, _worker, session, frozen) = confirmed_sdk_source(&fixture, &conn).await;
+        let tentative =
+            confirmed_sdk_install(&fixture, &conn, &session, &frozen, &provider, None).await;
+        fixture.settle(&conn, &tentative);
+        let owner = session.device.recovery_owner();
+        let deadline = fixture
+            .frozen_pending(&conn, &session)
+            .unwrap()
+            .view
+            .original_deadline;
+        let read = fixture
+            .frozen_rollback(&conn, &owner, deadline)
+            .unwrap()
+            .unwrap();
+        let event = read
+            .project_event(&fixture.privacy, fixture.device_event(245))
+            .unwrap();
+        let commit = internal_rollback_envelope(&read, &provider, 245, "valid").await;
+        let paused = ResolutionPausedProvider {
+            inner: provider,
+            entered: tokio::sync::Notify::new(),
+            resume: tokio::sync::Notify::new(),
+            calls: std::sync::atomic::AtomicUsize::new(0),
+        };
+        let tenant = opc_types::TenantId::from_static("fixture-tenant");
+        let mut preparation = Box::pin(read.prepare_rollback(
+            &owner,
+            NetconfRollback::new(&read, commit, &paused),
+            &tenant,
+            &event,
+            deadline..deadline + 60,
+            &fixture.key,
+        ));
+        let before = target_rows(&conn);
+        let changes = conn.total_changes();
+        let operations = fixture.ledger(&conn).operations.len();
+        tokio::select! {
+            _ = paused.entered.notified() => {},
+            _ = &mut preparation => panic!("rollback did not wait for provider"),
+        }
+        assert_eq!(paused.calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+        if !replace_device {
+            drop(preparation);
+            assert!(read.original().unwrap().is_none());
+            assert_eq!(target_rows(&conn), before);
+            assert_eq!(conn.total_changes(), changes);
+            assert_eq!(fixture.ledger(&conn).operations.len(), operations);
+            continue;
+        }
+        let admin = fixture.device_event(243);
+        let effect = fixture
+            .device_view(&conn)
+            .prepare(&admin, 160, [0x58; 16], [0x59; 16])
+            .unwrap();
+        let device = fixture.rebind_at(&conn, fixture.prepare(effect, admin), deadline);
+        assert!(matches!(
+            fixture.submit_at(&conn, &device, deadline),
+            AuditOperationState::TargetV1(_)
+        ));
+        fixture.settle(&conn, &device);
+        let after_device = target_rows(&conn);
+        let changes = conn.total_changes();
+        paused.resume.notify_one();
+        tokio::select! {
+            _ = paused.entered.notified() => {},
+            _ = &mut preparation => panic!("rollback skipped successor provider authentication"),
+        }
+        assert_eq!(paused.calls.load(std::sync::atomic::Ordering::SeqCst), 2);
+        paused.resume.notify_one();
+        // Binding checks after provider await precede admission. The public
+        // store port performs this same authoritative preflight before return.
+        let effect = preparation.await.unwrap();
+        let prepared = read
+            .retain(
+                &owner,
+                fixture.bind_rollback(&read, effect, event, deadline),
+            )
+            .unwrap();
+        assert_eq!(
+            fixture.preflight(&conn, &prepared, deadline),
+            Err(AuditAuthorityError::BindingMismatch)
+        );
+        assert_eq!(target_rows(&conn), after_device);
+        assert_eq!(conn.total_changes(), changes);
+        assert_eq!(fixture.ledger(&conn).operations.len(), operations + 1);
+        assert_eq!(read.original().unwrap(), Some(prepared));
+    }
+}
+
+#[tokio::test]
+async fn target_rollback_sdk_preserves_candidate_and_retained_result_after_new_device() {
+    use crate::audit_authority::NetconfRollback;
+    let fixture = Fixture::new().await;
+    let shared = fixture.backend.conn();
+    let conn = shared.lock().await;
+    let (provider, _worker, session, frozen) = confirmed_sdk_source(&fixture, &conn).await;
+    let tentative = confirmed_sdk_install(
+        &fixture,
+        &conn,
+        &session,
+        &frozen,
+        &provider,
+        Some("synthetic-persistent-credential"),
+    )
+    .await;
+    fixture.settle(&conn, &tentative);
+    let owner = session.device.recovery_owner();
+    let deadline = fixture
+        .frozen_pending(&conn, &session)
+        .unwrap()
+        .view
+        .original_deadline;
+    let read = fixture
+        .frozen_rollback(&conn, &owner, deadline)
+        .unwrap()
+        .unwrap();
+    resolution_sdk_stage(&fixture, &conn, &provider, 241, br#"{"retained":2}"#).await;
+    let candidate = row(&conn, "config_netconf_targets", "target", 0);
+    let event = read
+        .project_event(&fixture.privacy, fixture.device_event(245))
+        .unwrap();
+    let commit = internal_rollback_envelope(&read, &provider, 245, "valid").await;
+    let effect = read
+        .prepare_rollback(
+            &owner,
+            NetconfRollback::new(&read, commit, &provider),
+            &opc_types::TenantId::from_static("fixture-tenant"),
+            &event,
+            deadline..deadline + 60,
+            &fixture.key,
+        )
+        .await
+        .unwrap();
+    let prepared = read
+        .retain(
+            &owner,
+            fixture.bind_rollback(&read, effect, event, deadline),
+        )
+        .unwrap();
+    let known = fixture.submit_at(&conn, &prepared, deadline);
+    assert!(matches!(known, AuditOperationState::TargetV1(_)));
+    assert_eq!(row(&conn, "config_netconf_targets", "target", 0), candidate);
+    fixture.settle(&conn, &prepared);
+    let event = fixture.device_event(243);
+    let effect = fixture
+        .device_view(&conn)
+        .prepare(&event, 160, [0x58; 16], [0x59; 16])
+        .unwrap();
+    let device = fixture.rebind_at(&conn, fixture.prepare(effect, event), deadline);
+    assert!(matches!(
+        fixture.submit_at(&conn, &device, deadline),
+        AuditOperationState::TargetV1(_)
+    ));
+    fixture.settle(&conn, &device);
+    assert!(matches!(
+        fixture.frozen_rollback(&conn, &owner, deadline),
+        Err(AuditAuthorityError::BindingMismatch)
+    ));
+    assert_eq!(read.original().unwrap(), Some(prepared.clone()));
+    assert_eq!(fixture.submit_at(&conn, &prepared, deadline + 600), known);
+    provider_assert_history(&conn, &provider, 3, 245, br#"{"retained":0}"#).await;
+}
+
+async fn prepared_rollback_source(
+    fixture: &Fixture,
+    conn: &Connection,
+    persistent: bool,
+    cause: crate::audit_authority::NetconfRollbackCause,
+) -> (
+    opc_key::MemoryKeyProvider,
+    std::sync::Arc<()>,
+    crate::audit_authority::NetconfRecoveryOwner,
+    crate::audit_authority::NetconfRollbackRead,
+    PreparedTargetMutation,
+) {
+    use crate::audit_authority::NetconfRollback;
+    let (provider, worker, session, frozen) = confirmed_sdk_source(fixture, conn).await;
+    let tentative = confirmed_sdk_install(
+        fixture,
+        conn,
+        &session,
+        &frozen,
+        &provider,
+        persistent.then_some("synthetic-persistent-credential"),
+    )
+    .await;
+    fixture.settle(conn, &tentative);
+    use crate::audit_authority::NetconfRollbackCause;
+    let owner = session.device.recovery_owner();
+    let deadline = fixture
+        .frozen_pending(conn, &session)
+        .unwrap()
+        .view
+        .original_deadline;
+    let (owner, now) = match cause {
+        NetconfRollbackCause::Timeout => (owner, deadline),
+        NetconfRollbackCause::SessionLoss => {
+            assert!(!persistent);
+            session.invalidate();
+            let event = fixture.device_event(244);
+            let effect = fixture
+                .device_view(conn)
+                .prepare_session_cleanup(&session, &event, 160)
+                .unwrap();
+            let cleanup = fixture.bind_current_base(conn, fixture.prepare(effect, event));
+            assert!(matches!(
+                fixture.submit(conn, &cleanup),
+                AuditOperationState::TargetV1(_)
+            ));
+            fixture.settle(conn, &cleanup);
+            (owner, 100)
+        }
+        NetconfRollbackCause::DeviceReboot => {
+            let mut event = fixture.device_event(243);
+            event.caller = crate::audit_authority::AuditCaller::project(
+                &fixture.privacy,
+                "fixture-tenant",
+                "synthetic-recovery-administrator",
+            )
+            .unwrap();
+            let effect = fixture
+                .device_view(conn)
+                .prepare(&event, 160, [0x58; 16], [0x59; 16])
+                .unwrap();
+            let start = fixture.bind_current_base(conn, fixture.prepare(effect, event));
+            assert!(matches!(
+                fixture.submit(conn, &start),
+                AuditOperationState::TargetV1(_)
+            ));
+            fixture.settle(conn, &start);
+            let next = fixture
+                .session_owner(conn, &worker, 0x64)
+                .device
+                .recovery_owner();
+            assert!(matches!(
+                fixture.frozen_rollback(conn, &owner, 100),
+                Err(AuditAuthorityError::BindingMismatch)
+            ));
+            (next, 100)
+        }
+    };
+    let read = fixture.frozen_rollback(conn, &owner, now).unwrap().unwrap();
+    assert_eq!(read.cause(), cause);
+    assert_eq!(read.original_deadline(), deadline);
+    let mut event = fixture.device_event(245);
+    event.caller = owner.caller;
+    let event = read.project_event(&fixture.privacy, event).unwrap();
+    let commit = internal_rollback_envelope(&read, &provider, 245, "valid").await;
+    let effect = read
+        .prepare_rollback(
+            &owner,
+            NetconfRollback::new(&read, commit, &provider),
+            &opc_types::TenantId::from_static("fixture-tenant"),
+            &event,
+            now..now + 60,
+            &fixture.key,
+        )
+        .await
+        .unwrap();
+    let original = read
+        .retain(&owner, fixture.bind_rollback(&read, effect, event, now))
+        .unwrap();
+    (provider, worker, owner, read, original)
+}
+
+fn reject_rollback(fixture: &Fixture, conn: &Connection, original: &PreparedTargetMutation) {
+    fixture
+        .apply(
+            conn,
+            AuditCommand::NetconfTarget(Box::new(TargetAuditCommandV1::Admit(
+                original.command().clone(),
+            ))),
+            original.command().handle.body.issued_at,
+        )
+        .unwrap();
+    fixture.checkpoint(conn);
+    assert!(fixture
+        .apply(
+            conn,
+            AuditCommand::NetconfTarget(Box::new(TargetAuditCommandV1::Apply(
+                original.command().clone()
+            ))),
+            original.command().handle.body.expires_at
+        )
+        .is_err());
+    assert_eq!(
+        fixture
+            .ledger(conn)
+            .lookup(
+                &fixture.key,
+                original.handle(),
+                original.command().handle.body.binding.caller
+            )
+            .unwrap()
+            .unwrap()
+            .state(),
+        AuditOperationState::Rejected
+    );
+}
+
+#[tokio::test]
+async fn target_rollback_successor_requires_exact_settled_rejection_without_changing_parent() {
+    use crate::audit_authority::{NetconfRollback, NetconfRollbackSuccessor};
+    for persistent in [false, true] {
+        let fixture = Fixture::new().await;
+        let shared = fixture.backend.conn();
+        let conn = shared.lock().await;
+        let (provider, _worker, owner, read, original) = prepared_rollback_source(
+            &fixture,
+            &conn,
+            persistent,
+            crate::audit_authority::NetconfRollbackCause::Timeout,
+        )
+        .await;
+        let now = original.command().handle.body.expires_at;
+        let before = target_rows(&conn);
+        let original_bytes = original.encode().unwrap();
+        assert!(
+            read.verify_rejected_predecessor(&original, &fixture.ledger(&conn), &fixture.key, now)
+                .is_err(),
+            "absent operation authorized a successor"
+        );
+        fixture
+            .apply(
+                &conn,
+                AuditCommand::NetconfTarget(Box::new(TargetAuditCommandV1::Admit(
+                    original.command().clone(),
+                ))),
+                original.command().handle.body.issued_at,
+            )
+            .unwrap();
+        fixture.checkpoint(&conn);
+        for clock in [now - 1, now] {
+            assert_eq!(
+                read.verify_rejected_predecessor(
+                    &original,
+                    &fixture.ledger(&conn),
+                    &fixture.key,
+                    clock
+                ),
+                Err(AuditAuthorityError::RecoveryRequired),
+                "unresolved intent authorized a successor"
+            );
+        }
+        assert!(fixture
+            .apply(
+                &conn,
+                AuditCommand::NetconfTarget(Box::new(TargetAuditCommandV1::Apply(
+                    original.command().clone()
+                ))),
+                now
+            )
+            .is_err());
+        assert_eq!(
+            read.verify_rejected_predecessor(&original, &fixture.ledger(&conn), &fixture.key, now),
+            Err(AuditAuthorityError::RecoveryRequired),
+            "rejection without terminal authorized a successor"
+        );
+        fixture
+            .apply(
+                &conn,
+                AuditCommand::Terminal(original.command().handle.clone()),
+                now,
+            )
+            .unwrap();
+        assert_eq!(
+            read.verify_rejected_predecessor(&original, &fixture.ledger(&conn), &fixture.key, now),
+            Err(AuditAuthorityError::RecoveryRequired),
+            "terminal without checkpoint authorized a successor"
+        );
+        fixture.checkpoint(&conn);
+        let ledger = fixture.ledger(&conn);
+        assert_eq!(
+            read.verify_rejected_predecessor(&original, &ledger, &fixture.key, now - 1),
+            Err(AuditAuthorityError::RecoveryRequired),
+            "unexpired operation authorized a successor"
+        );
+        let mut absent_checkpoint = ledger.clone();
+        absent_checkpoint.continuity.as_mut().unwrap().checkpoint = None;
+        assert_eq!(
+            read.verify_rejected_predecessor(&original, &absent_checkpoint, &fixture.key, now),
+            Err(AuditAuthorityError::RecoveryRequired)
+        );
+        assert_eq!(
+            read.verify_rejected_predecessor(&original, &ledger, &fixture.key, now),
+            Ok(())
+        );
+        let event = read
+            .project_event(&fixture.privacy, fixture.device_event(246))
+            .unwrap();
+        read.successor_context(&owner, &original, &event).unwrap();
+        let commit = internal_rollback_envelope(&read, &provider, 246, "valid").await;
+        let changes = conn.total_changes();
+        let effect = read
+            .prepare_rollback_successor(
+                &owner,
+                NetconfRollbackSuccessor::new(
+                    &original,
+                    NetconfRollback::new(&read, commit, &provider),
+                ),
+                &opc_types::TenantId::from_static("fixture-tenant"),
+                &event,
+                now..now + 60,
+                &fixture.key,
+            )
+            .await
+            .unwrap();
+        let successor = read
+            .retain_successor(
+                &owner,
+                &original,
+                fixture.bind_rollback(&read, effect, event, now),
+                &ledger,
+                &fixture.key,
+                now,
+            )
+            .unwrap();
+        assert_eq!(
+            conn.total_changes(),
+            changes,
+            "successor preparation admitted work"
+        );
+        assert_eq!(target_rows(&conn), before);
+        assert_eq!(read.original().unwrap(), Some(successor.clone()));
+        assert_eq!(original.encode().unwrap(), original_bytes);
+        assert_eq!(
+            read.original_deadline(),
+            original.command().handle.body.issued_at
+        );
+        assert_eq!(
+            fixture
+                .ledger(&conn)
+                .lookup(&fixture.key, original.handle(), read.original_caller())
+                .unwrap()
+                .unwrap()
+                .state(),
+            AuditOperationState::Rejected
+        );
+        let outcome = fixture.submit_at(&conn, &successor, now);
+        assert!(matches!(outcome, AuditOperationState::TargetV1(r)
+            if matches!(r.outcome(), NetconfAppliedOutcome::RolledBack { running_version:3, pending } if pending==read.pending())));
+        assert!(matches!(
+            fixture.frozen_rollback(&conn, &owner, now),
+            Err(AuditAuthorityError::RecoveryRequired)
+        ));
+        assert_eq!(fixture.submit_at(&conn, &successor, now + 3600), outcome);
+        assert_eq!(read.original().unwrap(), Some(successor.clone()));
+        fixture.settle(&conn, &successor);
+        fixture.assert_no_pending(&conn);
+        provider_assert_history(&conn, &provider, 3, 246, br#"{"retained":0}"#).await;
+    }
+}
+
+#[tokio::test]
+async fn target_rollback_successor_selects_one_attempt_and_refuses_ambiguous_or_stale_predecessors()
+{
+    use crate::audit_authority::{NetconfRollback, NetconfRollbackSuccessor};
+    let fixture = Fixture::new().await;
+    let shared = fixture.backend.conn();
+    let conn = shared.lock().await;
+    let (provider, _worker, owner, read, original) = prepared_rollback_source(
+        &fixture,
+        &conn,
+        true,
+        crate::audit_authority::NetconfRollbackCause::Timeout,
+    )
+    .await;
+    reject_rollback(&fixture, &conn, &original);
+    fixture.settle(&conn, &original);
+    let now = original.command().handle.body.expires_at;
+    let ledger = fixture.ledger(&conn);
+    let event = read
+        .project_event(&fixture.privacy, fixture.device_event(246))
+        .unwrap();
+    assert_eq!(
+        read.successor_context(&owner, &original, &original.command().handle.body.event),
+        Err(AuditAuthorityError::BindingMismatch),
+        "successor reused original request"
+    );
+    let mut unrelated = original.clone();
+    unrelated.command_mut().effect.source = None;
+    assert!(read.successor_context(&owner, &unrelated, &event).is_err());
+    assert!(read
+        .verify_rejected_predecessor(&unrelated, &ledger, &fixture.key, now)
+        .is_err());
+    let commit = internal_rollback_envelope(&read, &provider, 246, "valid").await;
+    let effect = read
+        .prepare_rollback_successor(
+            &owner,
+            NetconfRollbackSuccessor::new(
+                &original,
+                NetconfRollback::new(&read, commit, &provider),
+            ),
+            &opc_types::TenantId::from_static("fixture-tenant"),
+            &event,
+            now..now + 60,
+            &fixture.key,
+        )
+        .await
+        .unwrap();
+    let competing_commit = internal_rollback_envelope(&read, &provider, 246, "valid").await;
+    let competing_content = read
+        .prepare_rollback_successor(
+            &owner,
+            NetconfRollbackSuccessor::new(
+                &original,
+                NetconfRollback::new(&read, competing_commit, &provider),
+            ),
+            &opc_types::TenantId::from_static("fixture-tenant"),
+            &event,
+            now..now + 60,
+            &fixture.key,
+        )
+        .await
+        .unwrap();
+    let first = fixture.bind_rollback(&read, effect.clone(), event.clone(), now);
+    let competing = fixture.bind_rollback(&read, effect.clone(), event.clone(), now);
+    let clone = read.clone();
+    let (a, b) = tokio::join!(
+        async {
+            read.retain_successor(&owner, &original, first.clone(), &ledger, &fixture.key, now)
+        },
+        async { clone.retain_successor(&owner, &original, competing, &ledger, &fixture.key, now) }
+    );
+    let selected = a.unwrap();
+    assert_eq!(selected, b.unwrap());
+    assert_eq!(clone.original().unwrap(), Some(selected.clone()));
+    assert_eq!(
+        read.successor_context(&owner, &original, &event),
+        Err(AuditAuthorityError::RecoveryRequired)
+    );
+    // A repeat refuses before provider calls: the caller must recover original().
+    let paused = ResolutionPausedProvider {
+        inner: provider,
+        entered: tokio::sync::Notify::new(),
+        resume: tokio::sync::Notify::new(),
+        calls: std::sync::atomic::AtomicUsize::new(0),
+    };
+    let commit = internal_rollback_envelope(&read, &paused.inner, 246, "valid").await;
+    assert!(matches!(
+        read.prepare_rollback_successor(
+            &owner,
+            NetconfRollbackSuccessor::new(&original, NetconfRollback::new(&read, commit, &paused)),
+            &opc_types::TenantId::from_static("fixture-tenant"),
+            &event,
+            now + 1..now + 61,
+            &fixture.key
+        )
+        .await,
+        Err(AuditAuthorityError::RecoveryRequired)
+    ));
+    assert_eq!(paused.calls.load(std::sync::atomic::Ordering::SeqCst), 0);
+    let before = target_rows(&conn);
+    for change in ["request", "content", "lifetime"] {
+        let mut changed_effect = effect.clone();
+        let mut changed_event = event.clone();
+        match change {
+            "request" => {
+                changed_event = read
+                    .project_event(&fixture.privacy, fixture.device_event(247))
+                    .unwrap()
+            }
+            "content" => changed_effect = competing_content.clone(),
+            "lifetime" => changed_effect.expires_at += 1,
+            _ => unreachable!(),
+        }
+        changed_effect.request = changed_event.request;
+        let proposed = fixture.bind_rollback(&read, changed_effect, changed_event, now);
+        assert!(
+            read.retain_successor(&owner, &original, proposed, &ledger, &fixture.key, now)
+                .is_err(),
+            "ambiguous successor replaced the selected original: {change}"
+        );
+        assert_eq!(read.original().unwrap(), Some(selected.clone()));
+    }
+    assert_eq!(target_rows(&conn), before);
+    reject_rollback(&fixture, &conn, &selected);
+    fixture.settle(&conn, &selected);
+    let later = selected.command().handle.body.expires_at;
+    let event = read
+        .project_event(&fixture.privacy, fixture.device_event(248))
+        .unwrap();
+    let commit = internal_rollback_envelope(&read, &paused.inner, 248, "valid").await;
+    let effect = read
+        .prepare_rollback_successor(
+            &owner,
+            NetconfRollbackSuccessor::new(
+                &selected,
+                NetconfRollback::new(&read, commit, &paused.inner),
+            ),
+            &opc_types::TenantId::from_static("fixture-tenant"),
+            &event,
+            later..later + 60,
+            &fixture.key,
+        )
+        .await
+        .unwrap();
+    let next = read
+        .retain_successor(
+            &owner,
+            &selected,
+            fixture.bind_rollback(&read, effect, event.clone(), later),
+            &fixture.ledger(&conn),
+            &fixture.key,
+            later,
+        )
+        .unwrap();
+    assert_eq!(
+        read.successor_context(&owner, &original, &event),
+        Err(AuditAuthorityError::BindingMismatch)
+    );
+    assert!(read
+        .retain_successor(
+            &owner,
+            &original,
+            first,
+            &fixture.ledger(&conn),
+            &fixture.key,
+            later
+        )
+        .is_err());
+    assert_eq!(read.original().unwrap(), Some(next.clone()));
+    assert!(matches!(
+        fixture.submit_at(&conn, &next, later),
+        AuditOperationState::TargetV1(_)
+    ));
+    fixture.settle(&conn, &next);
+}
+
+#[tokio::test]
+async fn target_rollback_successor_refuses_applied_outcomes_and_other_original_scope() {
+    let fixture = Fixture::new().await;
+    let shared = fixture.backend.conn();
+    let conn = shared.lock().await;
+    let (_provider, _worker, owner, read, original) = prepared_rollback_source(
+        &fixture,
+        &conn,
+        false,
+        crate::audit_authority::NetconfRollbackCause::Timeout,
+    )
+    .await;
+    let result = fixture.submit_at(&conn, &original, original.command().handle.body.issued_at);
+    assert!(matches!(result, AuditOperationState::TargetV1(_)));
+    fixture.settle(&conn, &original);
+    let before = target_rows(&conn);
+    let changes = conn.total_changes();
+    assert_eq!(
+        read.verify_rejected_predecessor(
+            &original,
+            &fixture.ledger(&conn),
+            &fixture.key,
+            original.command().handle.body.expires_at
+        ),
+        Err(AuditAuthorityError::RecoveryRequired),
+        "known rollback authorized replacement"
+    );
+    let event = read
+        .project_event(&fixture.privacy, fixture.device_event(246))
+        .unwrap();
+    let mut foreign = owner.clone();
+    foreign.device_incarnation = [0x81; 16];
+    assert_eq!(
+        read.successor_context(&foreign, &original, &event),
+        Err(AuditAuthorityError::BindingMismatch)
+    );
+    let mut foreign = owner.clone();
+    foreign.cache = Default::default();
+    assert_eq!(
+        read.successor_context(&foreign, &original, &event),
+        Err(AuditAuthorityError::BindingMismatch)
+    );
+    assert_eq!(conn.total_changes(), changes);
+    assert_eq!(target_rows(&conn), before);
+    assert_eq!(
+        fixture.submit_at(
+            &conn,
+            &original,
+            original.command().handle.body.expires_at + 3600
+        ),
+        result
+    );
+}
+
+#[tokio::test]
+async fn target_rollback_successor_refuses_acknowledged_pruned_predecessor() {
+    let fixture = Fixture::new().await;
+    let shared = fixture.backend.conn();
+    let conn = shared.lock().await;
+    let (_provider, _worker, _owner, read, original) = prepared_rollback_source(
+        &fixture,
+        &conn,
+        true,
+        crate::audit_authority::NetconfRollbackCause::Timeout,
+    )
+    .await;
+    reject_rollback(&fixture, &conn, &original);
+    fixture.settle(&conn, &original);
+    let now = original.command().handle.body.expires_at;
+    let ledger = fixture.ledger(&conn);
+    assert_eq!(
+        read.verify_rejected_predecessor(&original, &ledger, &fixture.key, now),
+        Ok(())
+    );
+    let before = target_rows(&conn);
+    let mut body = ledger
+        .continuity
+        .as_ref()
+        .unwrap()
+        .checkpoint
+        .as_ref()
+        .unwrap()
+        .body
+        .clone();
+    body.acknowledged_export = [0x7a; 32];
+    let export = AuditCheckpoint::issue(&fixture.keys, body).unwrap();
+    fixture
+        .apply(&conn, AuditCommand::AcknowledgeExport(export.clone()), now)
+        .unwrap();
+    fixture
+        .apply(
+            &conn,
+            AuditCommand::Prune {
+                through: ledger.sequence,
+                checkpoint: export,
+            },
+            now,
+        )
+        .unwrap();
+    let pruned = fixture.ledger(&conn);
+    assert!(pruned
+        .lookup(&fixture.key, original.handle(), read.original_caller())
+        .unwrap()
+        .is_none());
+    assert!(
+        read.verify_rejected_predecessor(&original, &pruned, &fixture.key, now)
+            .is_err(),
+        "pruned rejection authorized successor"
+    );
+    assert_eq!(read.original().unwrap(), Some(original));
+    assert_eq!(target_rows(&conn), before);
+}
+
+#[tokio::test]
+async fn target_rollback_successor_provider_cancellation_preserves_rejected_original() {
+    use crate::audit_authority::{NetconfRollback, NetconfRollbackSuccessor};
+    let fixture = Fixture::new().await;
+    let shared = fixture.backend.conn();
+    let conn = shared.lock().await;
+    let (provider, _worker, owner, read, original) = prepared_rollback_source(
+        &fixture,
+        &conn,
+        false,
+        crate::audit_authority::NetconfRollbackCause::Timeout,
+    )
+    .await;
+    reject_rollback(&fixture, &conn, &original);
+    fixture.settle(&conn, &original);
+    let now = original.command().handle.body.expires_at;
+    let ledger = fixture.ledger(&conn);
+    read.verify_rejected_predecessor(&original, &ledger, &fixture.key, now)
+        .unwrap();
+    let event = read
+        .project_event(&fixture.privacy, fixture.device_event(246))
+        .unwrap();
+    let commit = internal_rollback_envelope(&read, &provider, 246, "valid").await;
+    let paused = ResolutionPausedProvider {
+        inner: provider,
+        entered: tokio::sync::Notify::new(),
+        resume: tokio::sync::Notify::new(),
+        calls: std::sync::atomic::AtomicUsize::new(0),
+    };
+    let tenant = opc_types::TenantId::from_static("fixture-tenant");
+    let mut preparation = Box::pin(read.prepare_rollback_successor(
+        &owner,
+        NetconfRollbackSuccessor::new(&original, NetconfRollback::new(&read, commit, &paused)),
+        &tenant,
+        &event,
+        now..now + 60,
+        &fixture.key,
+    ));
+    let before = target_rows(&conn);
+    let changes = conn.total_changes();
+    tokio::select! {_ = paused.entered.notified()=>{}, _ = &mut preparation=>panic!("successor did not wait for provider")}
+    drop(preparation);
+    assert_eq!(paused.calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+    assert_eq!(read.original().unwrap(), Some(original));
+    assert_eq!(target_rows(&conn), before);
+    assert_eq!(conn.total_changes(), changes);
+    assert!(fixture.ledger(&conn) == ledger);
+}
+
+#[tokio::test]
+async fn target_rollback_successor_preserves_retained_session_loss_and_reboot_causes() {
+    use crate::audit_authority::{NetconfRollback, NetconfRollbackCause, NetconfRollbackSuccessor};
+    for (persistent, cause) in [
+        (false, NetconfRollbackCause::SessionLoss),
+        (false, NetconfRollbackCause::DeviceReboot),
+        (true, NetconfRollbackCause::DeviceReboot),
+    ] {
+        let fixture = Fixture::new().await;
+        let shared = fixture.backend.conn();
+        let conn = shared.lock().await;
+        let (provider, _worker, owner, read, original) =
+            prepared_rollback_source(&fixture, &conn, persistent, cause).await;
+        let deadline = read.original_deadline();
+        let parent = read.encrypted_configuration().to_vec();
+        let caller = read.original_caller();
+        let pending = read.pending();
+        reject_rollback(&fixture, &conn, &original);
+        fixture.settle(&conn, &original);
+        let now = original.command().handle.body.expires_at;
+        let ledger = fixture.ledger(&conn);
+        read.verify_rejected_predecessor(&original, &ledger, &fixture.key, now)
+            .unwrap();
+        let mut event = fixture.device_event(246);
+        event.caller = owner.caller;
+        let event = read.project_event(&fixture.privacy, event).unwrap();
+        let commit = internal_rollback_envelope(&read, &provider, 246, "valid").await;
+        let before = target_rows(&conn);
+        let changes = conn.total_changes();
+        let effect = read
+            .prepare_rollback_successor(
+                &owner,
+                NetconfRollbackSuccessor::new(
+                    &original,
+                    NetconfRollback::new(&read, commit, &provider),
+                ),
+                &opc_types::TenantId::from_static("fixture-tenant"),
+                &event,
+                now..now + 60,
+                &fixture.key,
+            )
+            .await
+            .unwrap();
+        let successor = read
+            .retain_successor(
+                &owner,
+                &original,
+                fixture.bind_rollback(&read, effect, event, now),
+                &ledger,
+                &fixture.key,
+                now,
+            )
+            .unwrap();
+        assert_eq!(conn.total_changes(), changes);
+        assert_eq!(target_rows(&conn), before);
+        assert_eq!(read.cause(), cause);
+        assert_eq!(read.original_deadline(), deadline);
+        assert_eq!(read.encrypted_configuration(), parent);
+        assert_eq!(read.original_caller(), caller);
+        assert_eq!(read.pending(), pending);
+        let result = fixture.submit_at(&conn, &successor, now);
+        assert!(matches!(result,AuditOperationState::TargetV1(r)
+            if matches!(r.outcome(),NetconfAppliedOutcome::RolledBack{running_version:3,pending:p} if p==pending)));
+        assert_eq!(fixture.submit_at(&conn, &successor, now + 3600), result);
+        assert_eq!(
+            fixture
+                .ledger(&conn)
+                .lookup(&fixture.key, original.handle(), caller)
+                .unwrap()
+                .unwrap()
+                .state(),
+            AuditOperationState::Rejected
+        );
+        fixture.settle(&conn, &successor);
+        fixture.assert_no_pending(&conn);
+        provider_assert_history(&conn, &provider, 3, 246, br#"{"retained":0}"#).await;
+    }
+}
+
+#[tokio::test]
+async fn target_recovery_opening_new_worker_preserves_retained_cleanup_and_original() {
+    use crate::audit_authority::{NetconfRecoveryRegistry, NetconfRollback, NetconfRollbackCause};
+    for (persistent, cause) in [
+        (false, NetconfRollbackCause::SessionLoss),
+        (false, NetconfRollbackCause::DeviceReboot),
+        (true, NetconfRollbackCause::DeviceReboot),
+    ] {
+        let fixture = Fixture::new().await;
+        let shared = fixture.backend.conn();
+        let conn = shared.lock().await;
+        let (provider, old_worker, old_owner, prior_read, never_sent) =
+            prepared_rollback_source(&fixture, &conn, persistent, cause).await;
+        assert!(fixture
+            .ledger(&conn)
+            .lookup(
+                &fixture.key,
+                never_sent.handle(),
+                prior_read.original_caller()
+            )
+            .unwrap()
+            .is_none());
+        let caller = old_owner.caller;
+        let pending = prior_read.pending();
+        let deadline = prior_read.original_deadline();
+        assert_eq!(std::sync::Arc::strong_count(&old_worker), 1);
+        drop(old_worker);
+        let worker = std::sync::Arc::new(());
+        let registry = NetconfRecoveryRegistry::default();
+        assert!(!old_owner.worker.belongs_to(&worker));
+        // A real independent SQL reader and a new worker/cache. This is not a
+        // process-crash or public-runtime claim.
+        let reopened = Connection::open(fixture.directory.path().join("authority.sqlite")).unwrap();
+        let before = target_rows(&conn);
+        let changes = conn.total_changes();
+        let owner = fixture
+            .device_view(&reopened)
+            .open_recovery_owner(&registry, &worker, caller)
+            .unwrap();
+        assert_eq!(
+            std::sync::Arc::strong_count(&worker),
+            1,
+            "registry retained its worker strongly"
+        );
+        let view = fixture.device_view(&reopened);
+        let device_event = fixture.device_event(249);
+        assert!(
+            matches!(
+                view.prepare(&device_event, 160, [0x91; 16], [0x92; 16]),
+                Err(AuditAuthorityError::RecoveryRequired)
+            ),
+            "cleanup allowed serving-device preparation"
+        );
+        let read = fixture
+            .frozen_rollback(&reopened, &owner, 100)
+            .unwrap()
+            .unwrap();
+        assert_eq!(read.pending(), pending);
+        assert_eq!(read.original_deadline(), deadline);
+        assert_eq!(read.cause(), cause);
+        assert_eq!(read.original_caller(), prior_read.original_caller());
+        let mut event = fixture.device_event(249);
+        event.caller = caller;
+        let event = read.project_event(&fixture.privacy, event).unwrap();
+        let commit = internal_rollback_envelope(&read, &provider, 249, "valid").await;
+        let effect = read
+            .prepare_rollback(
+                &owner,
+                NetconfRollback::new(&read, commit, &provider),
+                &opc_types::TenantId::from_static("fixture-tenant"),
+                &event,
+                100..160,
+                &fixture.key,
+            )
+            .await
+            .unwrap();
+        let original = read
+            .retain(&owner, fixture.bind_rollback(&read, effect, event, 100))
+            .unwrap();
+        let repeated = fixture
+            .device_view(&reopened)
+            .open_recovery_owner(&registry, &worker, caller)
+            .unwrap();
+        let repeat_read = fixture
+            .frozen_rollback(&reopened, &repeated, 100)
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            repeat_read.original().unwrap(),
+            Some(original.clone()),
+            "recovery reopening lost the possibly transmitted original"
+        );
+        assert_eq!(conn.total_changes(), changes);
+        assert_eq!(target_rows(&conn), before);
+        let result = fixture.submit(&conn, &original);
+        assert!(matches!(result, AuditOperationState::TargetV1(_)));
+        assert!(
+            matches!(
+                fixture
+                    .device_view(&reopened)
+                    .open_recovery_owner(&registry, &worker, caller),
+                Err(AuditAuthorityError::RecoveryRequired)
+            ),
+            "known outcome erased terminal debt"
+        );
+        assert_eq!(read.original().unwrap(), Some(original.clone()));
+        assert_eq!(fixture.submit_at(&conn, &original, 3600), result);
+        fixture.settle(&conn, &original);
+        let settled = fixture
+            .device_view(&reopened)
+            .open_recovery_owner(&registry, &worker, caller)
+            .unwrap();
+        assert!(fixture
+            .frozen_rollback(&reopened, &settled, 3600)
+            .unwrap()
+            .is_none());
+        assert_eq!(repeat_read.original().unwrap(), Some(original));
+        provider_assert_history(&conn, &provider, 3, 249, br#"{"retained":0}"#).await;
+    }
+}
+
+#[tokio::test]
+async fn target_recovery_opening_refuses_wrong_administrator_and_all_retained_debt() {
+    use crate::audit_authority::{NetconfRecoveryRegistry, NetconfRollbackCause};
+    let fixture = Fixture::new().await;
+    let shared = fixture.backend.conn();
+    let conn = shared.lock().await;
+    let (_provider, worker, owner, read, original) =
+        prepared_rollback_source(&fixture, &conn, false, NetconfRollbackCause::SessionLoss).await;
+    let registry = NetconfRecoveryRegistry::default();
+    let view = fixture.device_view(&conn);
+    let other = crate::audit_authority::AuditCaller::project(
+        &fixture.privacy,
+        "fixture-tenant",
+        "synthetic-other-admin",
+    )
+    .unwrap();
+    assert!(matches!(
+        view.open_recovery_owner(&registry, &worker, other),
+        Err(AuditAuthorityError::BindingMismatch)
+    ));
+    assert!(view
+        .open_recovery_owner(&registry, &worker, owner.caller)
+        .is_ok());
+    fixture
+        .apply(
+            &conn,
+            AuditCommand::NetconfTarget(Box::new(TargetAuditCommandV1::Admit(
+                original.command().clone(),
+            ))),
+            100,
+        )
+        .unwrap();
+    assert!(
+        matches!(
+            fixture
+                .device_view(&conn)
+                .open_recovery_owner(&registry, &worker, owner.caller),
+            Err(AuditAuthorityError::RecoveryRequired)
+        ),
+        "intent without checkpoint authorized recovery opening"
+    );
+    fixture.checkpoint(&conn);
+    assert!(
+        matches!(
+            fixture
+                .device_view(&conn)
+                .open_recovery_owner(&registry, &worker, owner.caller),
+            Err(AuditAuthorityError::RecoveryRequired)
+        ),
+        "unknown intent authorized recovery opening"
+    );
+    fixture
+        .apply(
+            &conn,
+            AuditCommand::NetconfTarget(Box::new(TargetAuditCommandV1::Apply(
+                original.command().clone(),
+            ))),
+            100,
+        )
+        .unwrap();
+    assert!(
+        matches!(
+            fixture
+                .device_view(&conn)
+                .open_recovery_owner(&registry, &worker, owner.caller),
+            Err(AuditAuthorityError::RecoveryRequired)
+        ),
+        "outcome without terminal authorized recovery opening"
+    );
+    fixture
+        .apply(
+            &conn,
+            AuditCommand::Terminal(original.command().handle.clone()),
+            100,
+        )
+        .unwrap();
+    assert!(
+        matches!(
+            fixture
+                .device_view(&conn)
+                .open_recovery_owner(&registry, &worker, owner.caller),
+            Err(AuditAuthorityError::RecoveryRequired)
+        ),
+        "terminal without covering checkpoint authorized recovery opening"
+    );
+    fixture.checkpoint(&conn);
+    assert!(fixture
+        .device_view(&conn)
+        .open_recovery_owner(&registry, &worker, owner.caller)
+        .is_ok());
+    assert_eq!(
+        fixture
+            .ledger(&conn)
+            .lookup(&fixture.key, original.handle(), read.original_caller())
+            .unwrap()
+            .unwrap()
+            .state(),
+        fixture.submit_at(&conn, &original, 3600)
+    );
+}
+
+#[tokio::test]
+async fn target_recovery_opening_preserves_concurrent_claims_and_refuses_delayed_old_read() {
+    use crate::audit_authority::{NetconfRecoveryRegistry, NetconfRollbackCause};
+    let fixture = Fixture::new().await;
+    let shared = fixture.backend.conn();
+    let conn = shared.lock().await;
+    let (_provider, worker, owner, read, original) =
+        prepared_rollback_source(&fixture, &conn, true, NetconfRollbackCause::Timeout).await;
+    let old = fixture.device_view(&conn);
+    let registry = NetconfRecoveryRegistry::default();
+    let claimed = old
+        .bind_recovery_owner(&registry, &worker, owner.clone())
+        .unwrap();
+    let (a, b) = std::thread::scope(|scope| {
+        let a = scope.spawn(|| old.open_recovery_owner(&registry, &worker, owner.caller));
+        let b = scope.spawn(|| old.bind_recovery_owner(&registry, &worker, owner.clone()));
+        (a.join().unwrap().unwrap(), b.join().unwrap().unwrap())
+    });
+    for repeated in [claimed, a, b] {
+        let reread = fixture
+            .frozen_rollback(&conn, &repeated, original.command().handle.body.issued_at)
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            reread.original().unwrap(),
+            Some(original.clone()),
+            "another recovery claim discarded the retained original"
+        );
+    }
+    let foreign_worker = std::sync::Arc::new(());
+    assert!(
+        matches!(
+            old.bind_recovery_owner(&registry, &foreign_worker, owner.clone()),
+            Err(AuditAuthorityError::BindingMismatch)
+        ),
+        "foreign worker reused registry authority"
+    );
+    let mut foreign = owner.clone();
+    foreign.profile_incarnation = [0xee; 16];
+    assert!(matches!(
+        old.bind_recovery_owner(&registry, &worker, foreign),
+        Err(AuditAuthorityError::BindingMismatch)
+    ));
+    let mut same_sequence_device = owner.clone();
+    same_sequence_device.device_incarnation = [0xed; 16];
+    assert!(
+        matches!(
+            registry.bind(
+                &worker,
+                same_sequence_device,
+                fixture.ledger(&conn).sequence
+            ),
+            Err(AuditAuthorityError::BindingMismatch)
+        ),
+        "same-sequence device substitution replaced the recovery owner"
+    );
+    let result = fixture.submit_at(&conn, &original, original.command().handle.body.issued_at);
+    assert!(matches!(result, AuditOperationState::TargetV1(_)));
+    fixture.settle(&conn, &original);
+    let event = fixture.device_event(250);
+    let effect = fixture
+        .device_view(&conn)
+        .prepare(&event, 160, [0x91; 16], [0x92; 16])
+        .unwrap();
+    let start = fixture.rebind_at(
+        &conn,
+        fixture.prepare(effect, event),
+        original.command().handle.body.issued_at,
+    );
+    assert!(matches!(
+        fixture.submit_at(&conn, &start, original.command().handle.body.issued_at),
+        AuditOperationState::TargetV1(_)
+    ));
+    fixture.settle(&conn, &start);
+    let current = fixture.device_view(&conn);
+    let caller = current.caller.unwrap();
+    let replacement = current
+        .open_recovery_owner(&registry, &worker, caller)
+        .unwrap();
+    assert_ne!(replacement.device_incarnation, owner.device_incarnation);
+    let before = target_rows(&conn);
+    let changes = conn.total_changes();
+    assert!(
+        matches!(
+            old.open_recovery_owner(&registry, &worker, owner.caller),
+            Err(AuditAuthorityError::RollbackDetected)
+        ),
+        "delayed old recovery read replaced the newer registry owner"
+    );
+    let still_current = current
+        .open_recovery_owner(&registry, &worker, caller)
+        .unwrap();
+    assert_eq!(
+        still_current.device_incarnation,
+        replacement.device_incarnation
+    );
+    assert_eq!(read.original().unwrap(), Some(original.clone()));
+    assert_eq!(conn.total_changes(), changes);
+    assert_eq!(target_rows(&conn), before);
+    assert_eq!(fixture.submit_at(&conn, &original, 3600), result);
+}
+
+#[tokio::test]
+async fn target_recovery_pending_read_cannot_replace_a_later_original() {
+    use crate::audit_authority::{
+        NetconfLockDatastore, NetconfRollback, NetconfRollbackCause, NetconfTargetReplacement,
+        NetconfTentativePromotion,
+    };
+    let fixture = Fixture::new().await;
+    let shared = fixture.backend.conn();
+    let conn = shared.lock().await;
+    let (provider, worker, owner, first, original) =
+        prepared_rollback_source(&fixture, &conn, true, NetconfRollbackCause::Timeout).await;
+    // Keep an authentic old view, as if its read/checkpoint verification had
+    // completed before another thread advanced the retained lifecycle.
+    let delayed = first.view().clone();
+    let first_result =
+        fixture.submit_at(&conn, &original, original.command().handle.body.issued_at);
+    assert!(matches!(first_result, AuditOperationState::TargetV1(_)));
+    fixture.settle(&conn, &original);
+    fixture.assert_no_pending(&conn);
+
+    let now = original.command().handle.body.issued_at + 1;
+    let tenant = opc_types::TenantId::from_static("fixture-tenant");
+    let session = fixture.session_owner(&conn, &worker, 0x61);
+    let staged_read = fixture
+        .frozen_target(&conn, &session, NetconfLockDatastore::Candidate)
+        .unwrap();
+    let mut stage_event = fixture.event(246);
+    stage_event.operation = ManagementAuditOperationCode::Update;
+    let plaintext = copy_plaintext(246, br#"{"retained":1}"#);
+    let effect = staged_read
+        .prepare_replacement(
+            &session,
+            NetconfTargetReplacement::edit(
+                &staged_read,
+                &plaintext,
+                staged_read.schema().unwrap(),
+                &provider,
+            ),
+            tenant.clone(),
+            &stage_event,
+            now + 60,
+        )
+        .await
+        .unwrap();
+    // Issue at the actual unchanged 60-second window; changing an encrypted
+    // target's expiry afterwards would invalidate its authenticated AAD.
+    let bind = |effect: TargetEffectV1, event: ProjectedAuditEvent, base: u64, issued_at: i64| {
+        let digest = effect.digest(&fixture.key).unwrap();
+        let binding =
+            AuditOperationBinding::project(&fixture.privacy, &event, base, &digest).unwrap();
+        let handle = AuditOperationHandle::issue(
+            HandleBody {
+                version: 1,
+                identity: fixture.identity,
+                binding,
+                event,
+                issued_at,
+                expires_at: effect.expires_at,
+                nonce: [0x5a; 16],
+                key_epoch: fixture.key.epoch(),
+                mutation: Some(digest),
+            },
+            &fixture.key,
+        )
+        .unwrap();
+        PreparedTargetMutation::new(handle, effect, None)
+    };
+    let stage = bind(effect, stage_event, staged_read.running_base_version(), now);
+    assert!(matches!(
+        fixture.submit_at(&conn, &stage, now),
+        AuditOperationState::TargetV1(_)
+    ));
+    fixture.settle(&conn, &stage);
+    let promotion = fixture.frozen_promotion(&conn, &session).unwrap();
+    let deadline = now + 120;
+    let deadline_timestamp = opc_types::Timestamp::from_offset_datetime(
+        time::OffsetDateTime::from_unix_timestamp(deadline).unwrap(),
+    );
+    let commit =
+        confirmed_sdk_envelope(&conn, &promotion, &provider, 247, Some(deadline_timestamp)).await;
+    let event = fixture.event(247);
+    let effect = promotion
+        .prepare_tentative(
+            &session,
+            NetconfTentativePromotion::new(
+                &promotion,
+                commit,
+                &provider,
+                Some("synthetic-next-credential"),
+            ),
+            &tenant,
+            &event,
+            now..now + 60,
+            &fixture.key,
+        )
+        .await
+        .unwrap();
+    let tentative = bind(
+        effect,
+        event,
+        promotion.candidate().running_base_version(),
+        now,
+    );
+    assert!(
+        matches!(fixture.submit_at(&conn, &tentative, now), AuditOperationState::TargetV1(result)
+        if matches!(result.outcome(), NetconfAppliedOutcome::Tentative { running_version: 4, .. }))
+    );
+    fixture.settle(&conn, &tentative);
+    let current = fixture
+        .frozen_rollback(&conn, &owner, deadline)
+        .unwrap()
+        .unwrap();
+    assert_ne!(current.pending(), first.pending());
+    assert!(current.running_version() > first.running_version());
+    let event = current
+        .project_event(&fixture.privacy, fixture.device_event(248))
+        .unwrap();
+    let commit = internal_rollback_envelope(&current, &provider, 248, "valid").await;
+    let effect = current
+        .prepare_rollback(
+            &owner,
+            NetconfRollback::new(&current, commit, &provider),
+            &tenant,
+            &event,
+            deadline..deadline + 60,
+            &fixture.key,
+        )
+        .await
+        .unwrap();
+    let next = current
+        .retain(
+            &owner,
+            fixture.bind_rollback(&current, effect, event, deadline),
+        )
+        .unwrap();
+    fixture
+        .apply(
+            &conn,
+            AuditCommand::NetconfTarget(Box::new(TargetAuditCommandV1::Admit(
+                next.command().clone(),
+            ))),
+            deadline,
+        )
+        .unwrap();
+    fixture.checkpoint(&conn);
+    assert_eq!(
+        fixture
+            .ledger(&conn)
+            .lookup(&fixture.key, next.handle(), current.original_caller())
+            .unwrap()
+            .unwrap()
+            .state(),
+        AuditOperationState::Intent
+    );
+    let before = (
+        target_rows(&conn),
+        fixture.ledger(&conn).sequence,
+        conn.total_changes(),
+    );
+    assert!(
+        matches!(
+            owner.remember(delayed),
+            Err(AuditAuthorityError::RollbackDetected)
+        ),
+        "delayed pending read replaced a later possibly transmitted original"
+    );
+    assert_eq!(
+        owner
+            .remember(current.view().clone())
+            .unwrap()
+            .original()
+            .unwrap(),
+        Some(next.clone())
+    );
+    // A different pending identity at the same running revision cannot be a
+    // valid forward lifecycle transition, even with otherwise equal fields.
+    let mut same_revision = current.view().clone();
+    same_revision.pending = first.pending();
+    assert!(
+        matches!(
+            owner.remember(same_revision),
+            Err(AuditAuthorityError::RollbackDetected)
+        ),
+        "same-revision pending substitution replaced the selected original"
+    );
+    assert_eq!(
+        owner
+            .remember(current.view().clone())
+            .unwrap()
+            .original()
+            .unwrap(),
+        Some(next)
+    );
+    assert_eq!(
+        (
+            target_rows(&conn),
+            fixture.ledger(&conn).sequence,
+            conn.total_changes()
+        ),
+        before
+    );
+    assert_eq!(first.original().unwrap(), Some(original.clone()));
+    assert_eq!(
+        fixture
+            .ledger(&conn)
+            .lookup(&fixture.key, original.handle(), first.original_caller())
+            .unwrap()
+            .unwrap()
+            .state(),
+        first_result
+    );
+}
+
+// Append to target_state.rs. Existing APIs only; this is a prepared detector,
+// not a runtime result. It exercises the receipt producer used after apply.
+#[tokio::test]
+async fn target_receipt_requires_the_retained_description_after_admission_race() {
+    use crate::consensus::ConfigMutationIntent;
+    let fixture = Fixture::new().await;
+    let shared = fixture.backend.conn();
+    let conn = shared.lock().await;
+    fixture.active(&conn);
+
+    // An actual retained target result still produces truthful receipts for
+    // both phase replays, including when its terminal obligation is outstanding.
+    let original = fixture.request(&conn, 249, 5, 0x61, 1);
+    let applied = fixture.submit(&conn, &original);
+    assert!(matches!(applied, AuditOperationState::TargetV1(_)));
+    for phase in [
+        TargetAuditCommandV1::Admit(original.command().clone()),
+        TargetAuditCommandV1::Apply(original.command().clone()),
+    ] {
+        let tx = conn.unchecked_transaction().unwrap();
+        let proof = crate::consensus::audit::applied_receipt_sync(
+            &tx,
+            &fixture.key,
+            fixture.identity,
+            &ConfigMutationIntent::ManagementAudit(Box::new(AuditCommand::NetconfTarget(
+                Box::new(phase),
+            ))),
+        )
+        .unwrap()
+        .unwrap();
+        let receipt = proof
+            .read_back(
+                &fixture.key,
+                fixture.identity,
+                original.handle(),
+                original.command().effect.caller,
+            )
+            .unwrap();
+        assert_eq!(receipt.state(), applied);
+        assert!(!receipt.terminal_recorded());
+        tx.commit().unwrap();
+    }
+    fixture.settle(&conn, &original);
+
+    let prepared = fixture.request(&conn, 250, 5, 0x61, 1);
+    assert!(fixture.preflight(&conn, &prepared, 100).unwrap().is_none());
+    // A caller can present the same authentic handle at the ordinary admission
+    // port while the target proposal is in flight. Its ordinary receipt does
+    // not retain the target description required for target recovery.
+    fixture
+        .apply(&conn, AuditCommand::Intent(prepared.handle().clone()), 100)
+        .unwrap();
+    assert!(matches!(
+        fixture.preflight(&conn, &prepared, 100),
+        Err(AuditAuthorityError::BindingMismatch)
+    ));
+    let ledger = fixture.ledger(&conn);
+    assert_eq!(
+        ledger
+            .lookup(
+                &fixture.key,
+                prepared.handle(),
+                prepared.command().effect.caller
+            )
+            .unwrap()
+            .unwrap()
+            .state(),
+        AuditOperationState::Intent
+    );
+    assert!(matches!(
+        ledger.recover_target(
+            &fixture.key,
+            prepared.handle(),
+            prepared.command().effect.caller
+        ),
+        Err(AuditAuthorityError::BindingMismatch)
+    ));
+    let before = (target_rows(&conn), ledger.sequence);
+    assert!(fixture
+        .apply(
+            &conn,
+            AuditCommand::NetconfTarget(Box::new(TargetAuditCommandV1::Admit(
+                prepared.command().clone()
+            ))),
+            100,
+        )
+        .is_err());
+    assert_eq!((target_rows(&conn), fixture.ledger(&conn).sequence), before);
+    for phase in [
+        TargetAuditCommandV1::Admit(prepared.command().clone()),
+        TargetAuditCommandV1::Apply(prepared.command().clone()),
+    ] {
+        let tx = conn.unchecked_transaction().unwrap();
+        let proof = crate::consensus::audit::applied_receipt_sync(
+            &tx,
+            &fixture.key,
+            fixture.identity,
+            &ConfigMutationIntent::ManagementAudit(Box::new(AuditCommand::NetconfTarget(
+                Box::new(phase),
+            ))),
+        )
+        .unwrap();
+        assert!(
+            proof.is_none(),
+            "rejected target admission sealed an ordinary intent receipt"
+        );
+        tx.commit().unwrap();
+    }
+    assert_eq!((target_rows(&conn), fixture.ledger(&conn).sequence), before);
+}
+
+impl Fixture {
+    fn empty_commit_event(&self, request: u8) -> ProjectedAuditEvent {
+        let mut event = self.event(request);
+        event.operation = ManagementAuditOperationCode::Commit;
+        event.outcome = ManagementAuditOutcomeCode::Success;
+        event.transaction = None;
+        event
+    }
+
+    fn frozen_empty_commit(
+        &self,
+        conn: &Connection,
+        session: &crate::audit_authority::NetconfSessionOwner,
+    ) -> Result<crate::audit_authority::NetconfEmptyCommitRead, AuditAuthorityError> {
+        let tx = conn.unchecked_transaction().unwrap();
+        let read = crate::consensus::audit_targets::read_empty_commit_sync(
+            &tx,
+            &self.key,
+            &self.ledger(&tx),
+            session,
+            &crate::consensus::sqlite::SqliteWorkCancellation::audit_test(),
+        )
+        .unwrap();
+        tx.commit().unwrap();
+        read
+    }
+
+    fn prepare_empty_commit(
+        &self,
+        frozen: &crate::audit_authority::NetconfEmptyCommitRead,
+        session: &crate::audit_authority::NetconfSessionOwner,
+        request: u8,
+    ) -> crate::audit_authority::PreparedNetconfEmptyCommit {
+        frozen
+            .prepare(
+                &self.key,
+                &self.privacy,
+                session,
+                self.empty_commit_event(request),
+                100..160,
+                [0x55; 16],
+            )
+            .unwrap()
+    }
+
+    fn observe_empty_commit(
+        &self,
+        conn: &Connection,
+        prepared: &crate::audit_authority::PreparedNetconfEmptyCommit,
+        now: i64,
+    ) -> Result<(), ConfigMutationFailure> {
+        self.apply(
+            conn,
+            AuditCommand::NetconfTarget(Box::new(TargetAuditCommandV1::EmptyCommit(Box::new(
+                prepared.clone(),
+            )))),
+            now,
+        )
+    }
+}
+
+#[tokio::test]
+async fn target_empty_commit_observes_only_the_original_empty_state_and_replays_it() {
+    let fixture = Fixture::new().await;
+    let shared = fixture.backend.conn();
+    let conn = shared.lock().await;
+    fixture.active(&conn);
+    let worker = std::sync::Arc::new(());
+    let session = fixture.session_owner(&conn, &worker, 0x61);
+    let before = target_rows(&conn);
+    let changes = conn.total_changes();
+    let frozen = fixture.frozen_empty_commit(&conn, &session).unwrap();
+    let prepared = fixture.prepare_empty_commit(&frozen, &session, 239);
+    let command = TargetAuditCommandV1::EmptyCommit(Box::new(prepared.clone()));
+    // Heap ownership must preserve the existing JSON tag and binary phase 2.
+    let mut original_json = br#"{"empty-commit":"#.to_vec();
+    original_json.extend(serde_json::to_vec(&prepared).unwrap());
+    original_json.push(b'}');
+    assert_eq!(serde_json::to_vec(&command).unwrap(), original_json);
+    assert!(serde_json::from_slice::<TargetAuditCommandV1>(&original_json).unwrap() == command);
+    let mut original_binary = vec![2];
+    original_binary.extend(postcard::to_stdvec(&prepared).unwrap());
+    assert_eq!(postcard::to_stdvec(&command).unwrap(), original_binary);
+    assert!(postcard::from_bytes::<TargetAuditCommandV1>(&original_binary).unwrap() == command);
+    assert_eq!(conn.total_changes(), changes);
+    assert_eq!(target_rows(&conn), before);
+    assert!(prepared.handle().body.mutation.is_none());
+    assert!(prepared.handle().body.event.transaction.is_none());
+    assert_eq!(prepared.handle().body.binding.base_version, 0);
+    let sequence = fixture.ledger(&conn).sequence;
+    assert!(
+        fixture.observe_empty_commit(&conn, &prepared, 100).is_ok(),
+        "authoritatively empty plain commit did not retain its guarded observation"
+    );
+    let ledger = fixture.ledger(&conn);
+    let receipt = ledger
+        .lookup_empty_commit(&fixture.key, &prepared, session.caller)
+        .unwrap()
+        .unwrap();
+    assert_eq!(ledger.sequence, sequence + 1);
+    assert_eq!(
+        receipt.state(),
+        AuditOperationState::Observed {
+            outcome: ManagementAuditOutcomeCode::Success,
+        }
+    );
+    assert!(receipt.terminal_recorded());
+    assert_eq!(target_rows(&conn), before);
+    let history_count: u64 = conn
+        .query_row("SELECT COUNT(*) FROM config_history", [], |row| row.get(0))
+        .unwrap();
+    assert_eq!(history_count, 0);
+
+    // A later state change and expired original deadline cannot rewrite a
+    // previously known empty-commit observation or append another observation.
+    let stage = fixture.encrypted(fixture.request(&conn, 240, 4, 0x61, 1), 0x7a);
+    assert!(matches!(
+        fixture.submit(&conn, &stage),
+        AuditOperationState::TargetV1(_)
+    ));
+    fixture.settle(&conn, &stage);
+    let before_replay = fixture.ledger(&conn).sequence;
+    assert!(fixture.observe_empty_commit(&conn, &prepared, 160).is_ok());
+    assert_eq!(fixture.ledger(&conn).sequence, before_replay);
+    assert_eq!(
+        fixture
+            .ledger(&conn)
+            .lookup_empty_commit(&fixture.key, &prepared, session.caller)
+            .unwrap()
+            .unwrap()
+            .state(),
+        receipt.state()
+    );
+    drop(conn);
+    let reopened = Connection::open(fixture.directory.path().join("authority.sqlite")).unwrap();
+    let decoded =
+        crate::audit_authority::PreparedNetconfEmptyCommit::decode(&prepared.encode().unwrap())
+            .unwrap();
+    assert_eq!(
+        fixture
+            .ledger(&reopened)
+            .lookup_empty_commit(&fixture.key, &decoded, session.caller)
+            .unwrap()
+            .unwrap()
+            .state(),
+        receipt.state()
+    );
+}
+
+#[tokio::test]
+async fn target_empty_commit_refuses_staging_and_stage_discard_aba() {
+    let fixture = Fixture::new().await;
+    let shared = fixture.backend.conn();
+    let conn = shared.lock().await;
+    fixture.active(&conn);
+    let worker = std::sync::Arc::new(());
+    let session = fixture.session_owner(&conn, &worker, 0x61);
+    let frozen = fixture.frozen_empty_commit(&conn, &session).unwrap();
+    let before_stage = fixture.prepare_empty_commit(&frozen, &session, 239);
+    let before_aba = fixture.prepare_empty_commit(&frozen, &session, 240);
+    let stage = fixture.encrypted(fixture.request(&conn, 241, 4, 0x61, 1), 0x7a);
+    assert!(matches!(
+        fixture.submit(&conn, &stage),
+        AuditOperationState::TargetV1(_)
+    ));
+    fixture.settle(&conn, &stage);
+    assert!(fixture.frozen_empty_commit(&conn, &session).is_err());
+    let before = (target_rows(&conn), fixture.ledger(&conn).sequence);
+    assert!(
+        fixture
+            .observe_empty_commit(&conn, &before_stage, 100)
+            .is_err(),
+        "staged candidate passed the frozen empty-commit guard"
+    );
+    assert_eq!((target_rows(&conn), fixture.ledger(&conn).sequence), before);
+    let discard = fixture.request(&conn, 242, 5, 0x61, 1);
+    assert!(matches!(
+        fixture.submit(&conn, &discard),
+        AuditOperationState::TargetV1(_)
+    ));
+    fixture.settle(&conn, &discard);
+    assert_eq!(
+        row(&conn, "config_netconf_targets", "target", 0)["present"],
+        false
+    );
+    let before = (target_rows(&conn), fixture.ledger(&conn).sequence);
+    assert!(
+        fixture
+            .observe_empty_commit(&conn, &before_aba, 100)
+            .is_err(),
+        "stage-discard ABA reused the original empty candidate generation"
+    );
+    assert_eq!((target_rows(&conn), fixture.ledger(&conn).sequence), before);
+    let fresh = fixture.frozen_empty_commit(&conn, &session).unwrap();
+    let new = fixture.prepare_empty_commit(&fresh, &session, 243);
+    assert!(fixture.observe_empty_commit(&conn, &new, 100).is_ok());
+}
+
+#[tokio::test]
+async fn target_empty_commit_refuses_an_ordinary_observation_receipt() {
+    use crate::consensus::ConfigMutationIntent;
+    let fixture = Fixture::new().await;
+    let shared = fixture.backend.conn();
+    let conn = shared.lock().await;
+    fixture.active(&conn);
+    let worker = std::sync::Arc::new(());
+    let session = fixture.session_owner(&conn, &worker, 0x61);
+    let frozen = fixture.frozen_empty_commit(&conn, &session).unwrap();
+    let prepared = fixture.prepare_empty_commit(&frozen, &session, 239);
+    // General observations remain valid. They cannot prove that the specific
+    // candidate/pending state was checked in their admission transaction.
+    fixture
+        .apply(&conn, AuditCommand::Intent(prepared.handle().clone()), 100)
+        .unwrap();
+    let ledger = fixture.ledger(&conn);
+    assert!(matches!(
+        ledger
+            .lookup(&fixture.key, prepared.handle(), session.caller)
+            .unwrap()
+            .unwrap()
+            .state(),
+        AuditOperationState::Observed { .. }
+    ));
+    assert!(
+        matches!(
+            ledger.lookup_empty_commit(&fixture.key, &prepared, session.caller),
+            Err(AuditAuthorityError::BindingMismatch)
+        ),
+        "ordinary observation supplied a guarded empty-commit receipt"
+    );
+    let before = (target_rows(&conn), ledger.sequence);
+    assert!(fixture.observe_empty_commit(&conn, &prepared, 100).is_err());
+    assert_eq!((target_rows(&conn), fixture.ledger(&conn).sequence), before);
+    let command =
+        ConfigMutationIntent::ManagementAudit(Box::new(AuditCommand::NetconfTarget(Box::new(
+            TargetAuditCommandV1::EmptyCommit(Box::new(prepared.clone())),
+        ))));
+    let tx = conn.unchecked_transaction().unwrap();
+    let proof = crate::consensus::audit::applied_receipt_sync(
+        &tx,
+        &fixture.key,
+        fixture.identity,
+        &command,
+    )
+    .unwrap();
+    assert!(
+        proof.is_none(),
+        "rejected empty commit sealed an ordinary observation proof"
+    );
+    tx.commit().unwrap();
+}
+
+#[tokio::test]
+async fn target_empty_commit_refuses_new_running_state_and_pending_confirmation() {
+    let fixture = Fixture::new().await;
+    let shared = fixture.backend.conn();
+    let conn = shared.lock().await;
+    fixture.active(&conn);
+    let worker = std::sync::Arc::new(());
+    let session = fixture.session_owner(&conn, &worker, 0x61);
+    let frozen = fixture.frozen_empty_commit(&conn, &session).unwrap();
+    let initial = fixture.prepare_empty_commit(&frozen, &session, 239);
+    let config = br#"{"retained":0}"#;
+    let (provider, source) = copy_provider_stage(&fixture, &conn, 0, config).await;
+    let running = fixture.running_target(&conn, 181, 6, 0, 0x6a);
+    let running = provider_rewrap_running(&fixture, &conn, &provider, running, 181, config).await;
+    let running = bind_copy_provider(&fixture, &conn, &provider, &source, running)
+        .await
+        .unwrap();
+    assert!(matches!(
+        fixture.submit(&conn, &running),
+        AuditOperationState::TargetV1(_)
+    ));
+    fixture.settle(&conn, &running);
+    assert!(
+        fixture.observe_empty_commit(&conn, &initial, 100).is_err(),
+        "initial running base zero acted as a wildcard for an empty commit"
+    );
+    let empty_running = fixture.frozen_empty_commit(&conn, &session).unwrap();
+    let before_pending = fixture.prepare_empty_commit(&empty_running, &session, 240);
+    provider_stage_second_candidate(&fixture, &conn, br#"{"retained":1}"#).await;
+    let promotion = fixture.frozen_promotion(&conn, &session).unwrap();
+    let pending =
+        confirmed_sdk_install(&fixture, &conn, &session, &promotion, &provider, None).await;
+    fixture.settle(&conn, &pending);
+    assert_eq!(
+        row(&conn, "config_netconf_targets", "target", 0)["present"],
+        false
+    );
+    assert!(
+        fixture.frozen_empty_commit(&conn, &session).is_err(),
+        "an empty pending confirmation was treated as an ordinary empty commit"
+    );
+    let before = (target_rows(&conn), fixture.ledger(&conn).sequence);
+    assert!(
+        fixture
+            .observe_empty_commit(&conn, &before_pending, 100)
+            .is_err(),
+        "pending confirmation passed a previously empty lifecycle guard"
+    );
+    assert_eq!((target_rows(&conn), fixture.ledger(&conn).sequence), before);
+}
+
+#[tokio::test]
+async fn target_empty_commit_binds_session_event_and_strict_recovery_bytes() {
+    use crate::audit_authority::{AuditCaller, PreparedNetconfEmptyCommit};
+    let fixture = Fixture::new().await;
+    let shared = fixture.backend.conn();
+    let conn = shared.lock().await;
+    fixture.active(&conn);
+    let worker = std::sync::Arc::new(());
+    let session = fixture.session_owner(&conn, &worker, 0x61);
+    let frozen = fixture.frozen_empty_commit(&conn, &session).unwrap();
+    let prepare = |owner: &crate::audit_authority::NetconfSessionOwner, event| {
+        frozen.prepare(
+            &fixture.key,
+            &fixture.privacy,
+            owner,
+            event,
+            100..160,
+            [0x55; 16],
+        )
+    };
+    let equal_worker = std::sync::Arc::new(());
+    let replacement = fixture.session_owner(&conn, &equal_worker, 0x61);
+    let other_session = fixture.session_owner(&conn, &worker, 0x62);
+    for foreign in [&replacement, &other_session] {
+        assert!(matches!(
+            prepare(foreign, fixture.empty_commit_event(239)),
+            Err(AuditAuthorityError::BindingMismatch)
+        ));
+    }
+    let mut other_caller = fixture.empty_commit_event(239);
+    other_caller.caller =
+        AuditCaller::project(&fixture.privacy, "fixture-tenant", "other-principal").unwrap();
+    let mut other_operation = fixture.empty_commit_event(239);
+    other_operation.operation = ManagementAuditOperationCode::Exec;
+    let mut other_transport = fixture.empty_commit_event(239);
+    other_transport.transport = ManagementAuditTransportCode::Internal;
+    let mut other_outcome = fixture.empty_commit_event(239);
+    other_outcome.outcome = ManagementAuditOutcomeCode::Intent;
+    let mut claimed_transaction = fixture.empty_commit_event(239);
+    claimed_transaction.transaction = Some(claimed_transaction.request);
+    for invalid in [
+        other_caller,
+        other_operation,
+        other_transport,
+        other_outcome,
+        claimed_transaction,
+    ] {
+        assert!(
+            prepare(&session, invalid).is_err(),
+            "empty commit accepted a different audit assertion"
+        );
+    }
+    let prepared = fixture.prepare_empty_commit(&frozen, &session, 239);
+    let bytes = prepared.encode().unwrap();
+    let decoded = PreparedNetconfEmptyCommit::decode(&bytes).unwrap();
+    decoded
+        .verify(&fixture.key, fixture.identity, session.caller)
+        .unwrap();
+    assert_eq!(decoded.encode().unwrap(), bytes);
+    let original = serde_json::to_value(&prepared).unwrap();
+    for pointer in [
+        "",
+        "/handle",
+        "/handle/body",
+        "/handle/body/identity",
+        "/handle/body/binding",
+        "/handle/body/event",
+        "/guard",
+        "/guard/authority",
+        "/guard/caller",
+    ] {
+        let mut unknown = original.clone();
+        unknown
+            .pointer_mut(pointer)
+            .unwrap()
+            .as_object_mut()
+            .unwrap()
+            .insert("unallocated".into(), true.into());
+        assert!(
+            PreparedNetconfEmptyCommit::decode(&serde_json::to_vec(&unknown).unwrap()).is_err(),
+            "unknown empty-commit recovery field bypassed strict decoding"
+        );
+    }
+    let mut substituted = original;
+    substituted["guard"]["candidate_generation"] = 1.into();
+    let substituted =
+        PreparedNetconfEmptyCommit::decode(&serde_json::to_vec(&substituted).unwrap()).unwrap();
+    assert_eq!(
+        substituted.verify(&fixture.key, fixture.identity, session.caller),
+        Err(AuditAuthorityError::BindingMismatch)
+    );
+    assert!(PreparedNetconfEmptyCommit::decode(&vec![b' '; 32 * 1024 + 1]).is_err());
+    let before = (target_rows(&conn), fixture.ledger(&conn).sequence);
+    assert!(fixture.observe_empty_commit(&conn, &prepared, 160).is_err());
+    assert_eq!((target_rows(&conn), fixture.ledger(&conn).sequence), before);
+    session.invalidate();
+    assert!(prepare(&session, fixture.empty_commit_event(240)).is_err());
+}
+
+#[tokio::test]
+async fn target_empty_commit_preserves_debt_locks_and_request_uniqueness() {
+    let fixture = Fixture::new().await;
+    let shared = fixture.backend.conn();
+    let conn = shared.lock().await;
+    fixture.active(&conn);
+    let worker = std::sync::Arc::new(());
+    let session = fixture.session_owner(&conn, &worker, 0x61);
+    let frozen = fixture.frozen_empty_commit(&conn, &session).unwrap();
+    let original = fixture.prepare_empty_commit(&frozen, &session, 239);
+    assert!(fixture.observe_empty_commit(&conn, &original, 100).is_ok());
+    let locked = fixture.request(&conn, 240, 2, 0x62, 1);
+    fixture
+        .apply(
+            &conn,
+            AuditCommand::NetconfTarget(Box::new(TargetAuditCommandV1::Admit(
+                locked.command().clone(),
+            ))),
+            100,
+        )
+        .unwrap();
+    assert!(matches!(
+        fixture.frozen_empty_commit(&conn, &session),
+        Err(AuditAuthorityError::RecoveryRequired)
+    ));
+    fixture.checkpoint(&conn);
+    fixture
+        .apply(
+            &conn,
+            AuditCommand::NetconfTarget(Box::new(TargetAuditCommandV1::Apply(
+                locked.command().clone(),
+            ))),
+            100,
+        )
+        .unwrap();
+    assert!(matches!(
+        fixture.frozen_empty_commit(&conn, &session),
+        Err(AuditAuthorityError::RecoveryRequired)
+    ));
+    fixture
+        .apply(&conn, AuditCommand::Terminal(locked.handle().clone()), 100)
+        .unwrap();
+    assert!(matches!(
+        fixture.frozen_empty_commit(&conn, &session),
+        Err(AuditAuthorityError::RecoveryRequired)
+    ));
+    fixture.checkpoint(&conn);
+    assert!(
+        fixture.frozen_empty_commit(&conn, &session).is_err(),
+        "foreign candidate lock permitted empty commit"
+    );
+    let release = fixture.request(&conn, 241, 3, 0x62, 1);
+    assert!(matches!(
+        fixture.submit(&conn, &release),
+        AuditOperationState::TargetV1(_)
+    ));
+    fixture.settle(&conn, &release);
+    let later = fixture.frozen_empty_commit(&conn, &session).unwrap();
+    let ambiguous = fixture.prepare_empty_commit(&later, &session, 239);
+    assert_ne!(ambiguous.encode().unwrap(), original.encode().unwrap());
+    let before = (target_rows(&conn), fixture.ledger(&conn).sequence);
+    assert!(
+        fixture
+            .observe_empty_commit(&conn, &ambiguous, 100)
+            .is_err(),
+        "duplicate request replaced the original guarded observation"
+    );
+    assert_eq!((target_rows(&conn), fixture.ledger(&conn).sequence), before);
+    assert!(fixture.observe_empty_commit(&conn, &original, 160).is_ok());
+}
+
+#[tokio::test]
+async fn target_empty_commit_proof_binds_guard_and_survives_later_unavailability() {
+    use crate::audit_authority::receipt::AuthenticatedAuditReceipt;
+    use crate::consensus::ConfigMutationIntent;
+    let fixture = Fixture::new().await;
+    let shared = fixture.backend.conn();
+    let conn = shared.lock().await;
+    fixture.active(&conn);
+    let worker = std::sync::Arc::new(());
+    let session = fixture.session_owner(&conn, &worker, 0x61);
+    let frozen = fixture.frozen_empty_commit(&conn, &session).unwrap();
+    let prepared = fixture.prepare_empty_commit(&frozen, &session, 239);
+    assert!(fixture.observe_empty_commit(&conn, &prepared, 100).is_ok());
+    let receipt = fixture
+        .ledger(&conn)
+        .lookup_empty_commit(&fixture.key, &prepared, session.caller)
+        .unwrap()
+        .unwrap();
+    let tx = conn.unchecked_transaction().unwrap();
+    let proof = crate::consensus::audit::applied_receipt_sync(
+        &tx,
+        &fixture.key,
+        fixture.identity,
+        &ConfigMutationIntent::ManagementAudit(Box::new(AuditCommand::NetconfTarget(Box::new(
+            TargetAuditCommandV1::EmptyCommit(Box::new(prepared.clone())),
+        )))),
+    )
+    .unwrap()
+    .unwrap();
+    tx.commit().unwrap();
+    assert_eq!(
+        proof
+            .read_back_empty_commit(&fixture.key, fixture.identity, &prepared, session.caller)
+            .unwrap()
+            .state(),
+        receipt.state()
+    );
+    let ordinary = AuthenticatedAuditReceipt::seal(&fixture.key, &receipt).unwrap();
+    assert_eq!(
+        ordinary
+            .read_back(
+                &fixture.key,
+                fixture.identity,
+                prepared.handle(),
+                session.caller
+            )
+            .unwrap()
+            .state(),
+        receipt.state()
+    );
+    assert!(
+        ordinary
+            .read_back_empty_commit(&fixture.key, fixture.identity, &prepared, session.caller)
+            .is_err(),
+        "ordinary point-in-time receipt supplied guarded empty-commit proof"
+    );
+    assert!(proof
+        .read_back(
+            &fixture.key,
+            fixture.identity,
+            prepared.handle(),
+            session.caller
+        )
+        .is_err());
+    let stage = fixture.encrypted(fixture.request(&conn, 240, 4, 0x61, 1), 0x7a);
+    assert!(matches!(
+        fixture.submit(&conn, &stage),
+        AuditOperationState::TargetV1(_)
+    ));
+    fixture.settle(&conn, &stage);
+    let discard = fixture.request(&conn, 241, 5, 0x61, 1);
+    assert!(matches!(
+        fixture.submit(&conn, &discard),
+        AuditOperationState::TargetV1(_)
+    ));
+    fixture.settle(&conn, &discard);
+    let later = fixture.frozen_empty_commit(&conn, &session).unwrap();
+    let different_guard = fixture.prepare_empty_commit(&later, &session, 239);
+    assert_ne!(
+        prepared.encode().unwrap(),
+        different_guard.encode().unwrap()
+    );
+    assert!(
+        proof
+            .read_back_empty_commit(
+                &fixture.key,
+                fixture.identity,
+                &different_guard,
+                session.caller
+            )
+            .is_err(),
+        "guarded proof authenticated a different original empty-state read"
+    );
+    let caller = session.caller;
+    session.invalidate();
+    drop(conn);
+    drop(shared);
+    drop(fixture.backend);
+    // Readback has only the authenticated preparation, key, caller and proof.
+    // It cannot depend on an additional successful backend/quorum lookup.
+    assert_eq!(
+        proof
+            .read_back_empty_commit(&fixture.key, fixture.identity, &prepared, caller)
+            .unwrap()
+            .state(),
+        receipt.state()
+    );
+}
+
+#[tokio::test]
+async fn target_empty_commit_retains_authenticated_export_and_expired_prune_boundaries() {
+    use crate::audit_authority::continuity::{
+        AuditExportPage, AuditExportSession, AuditExportVerifier,
+    };
+    use std::sync::Arc;
+
+    let fixture = Fixture::new().await;
+    let shared = fixture.backend.conn();
+    let conn = shared.lock().await;
+    fixture.active(&conn);
+    let worker = Arc::new(());
+    let session = fixture.session_owner(&conn, &worker, 0x61);
+    let frozen = fixture.frozen_empty_commit(&conn, &session).unwrap();
+    // This observation outlives every earlier activation operation. The
+    // pre-expiry prune refusal must therefore depend on this new payload.
+    let prepared = frozen
+        .prepare(
+            &fixture.key,
+            &fixture.privacy,
+            &session,
+            fixture.empty_commit_event(239),
+            100..200,
+            [0x55; 16],
+        )
+        .unwrap();
+    fixture.observe_empty_commit(&conn, &prepared, 100).unwrap();
+    let ledger = fixture.ledger(&conn);
+    let before = target_rows(&conn);
+    // This fixture exercises the current authority-side HMAC contract. These
+    // signing keys are not a recipient-only capability; that is separate work.
+    let keys =
+        Arc::new(AuditKeyRing::new(vec![AuditSigningKey::new(1, [0x44; 32]).unwrap()]).unwrap());
+    let export = AuditExportSession::freeze(
+        &ledger,
+        keys.clone(),
+        session.caller,
+        100,
+        120,
+        Arc::new(tokio::sync::Semaphore::new(1))
+            .try_acquire_owned()
+            .unwrap(),
+    )
+    .unwrap();
+    let page = export.page_at(None, 256, session.caller, 100).unwrap();
+    assert!(page.next_cursor().is_none());
+    let verify = || {
+        AuditExportVerifier::new(
+            keys.clone(),
+            export.manifest().clone(),
+            fixture.identity,
+            session.caller,
+            100,
+        )
+        .unwrap()
+    };
+    let mut complete = verify();
+    complete.accept(&page).unwrap();
+    let verified = complete.finish().unwrap();
+    let page_json: Value = serde_json::from_slice(&page.encode().unwrap()).unwrap();
+    let empty_rows = page_json["rows"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .enumerate()
+        .filter(|(_, row)| row["entry"]["payload"].get("empty-commit").is_some())
+        .map(|(index, _)| index)
+        .collect::<Vec<_>>();
+    assert_eq!(empty_rows.len(), 1);
+    for corruption in ["guard", "omit", "substitute"] {
+        let mut altered = page_json.clone();
+        let rows = altered["rows"].as_array_mut().unwrap();
+        let index = empty_rows[0];
+        match corruption {
+            "guard" => {
+                rows[index]["entry"]["payload"]["empty-commit"]["guard"]["candidate_generation"] =
+                    serde_json::json!(77);
+            }
+            "omit" => {
+                rows.remove(index);
+            }
+            "substitute" => {
+                rows[index]["entry"]["payload"] = serde_json::json!({"intent": prepared.handle()});
+            }
+            _ => unreachable!(),
+        }
+        let altered = AuditExportPage::decode(&serde_json::to_vec(&altered).unwrap()).unwrap();
+        let mut rejected = verify();
+        assert!(
+            rejected.accept(&altered).is_err(),
+            "guarded observation export admitted {corruption}"
+        );
+        assert!(rejected.finish().is_err());
+    }
+    assert!(verify().finish().is_err());
+
+    let checkpoint = fixture.checkpoint(&conn);
+    let mut body = checkpoint.body.clone();
+    body.acknowledged_export = verified.manifest.mac;
+    let acknowledgement = AuditCheckpoint::issue(&fixture.keys, body).unwrap();
+    assert!(fixture
+        .apply(
+            &conn,
+            AuditCommand::Prune {
+                through: ledger.sequence,
+                checkpoint: acknowledgement.clone(),
+            },
+            200,
+        )
+        .is_err());
+    fixture
+        .apply(
+            &conn,
+            AuditCommand::AcknowledgeExport(acknowledgement.clone()),
+            100,
+        )
+        .unwrap();
+    let retained = fixture.ledger(&conn);
+    assert!(fixture
+        .apply(
+            &conn,
+            AuditCommand::Prune {
+                through: ledger.sequence,
+                checkpoint: acknowledgement.clone(),
+            },
+            199,
+        )
+        .is_err());
+    assert_eq!(fixture.ledger(&conn).floor, retained.floor);
+    fixture
+        .apply(
+            &conn,
+            AuditCommand::Prune {
+                through: ledger.sequence,
+                checkpoint: acknowledgement,
+            },
+            200,
+        )
+        .unwrap();
+    let pruned = fixture.ledger(&conn);
+    assert_eq!(pruned.floor, ledger.sequence);
+    assert!(pruned
+        .lookup_empty_commit(&fixture.key, &prepared, session.caller)
+        .unwrap()
+        .is_none());
+    assert!(fixture.observe_empty_commit(&conn, &prepared, 200).is_err());
+    assert_eq!(fixture.ledger(&conn).sequence, ledger.sequence);
+    assert_eq!(target_rows(&conn), before);
+    // The immutable export retains its authenticated old rows after pruning.
+    assert_eq!(
+        export.page_at(None, 256, session.caller, 200).unwrap(),
+        page
+    );
+    let mut after_prune = verify();
+    after_prune.accept(&page).unwrap();
+    after_prune.finish().unwrap();
+}
+
+impl Fixture {
+    fn ordinary_running(
+        &self,
+        conn: &Connection,
+        request: u8,
+    ) -> crate::consensus::PreparedAuditedMutation {
+        use rusqlite::OptionalExtension;
+
+        let previous: Option<(Vec<u8>, u64)> = conn
+            .query_row(
+                "SELECT tx_id,version FROM config_history ORDER BY version DESC LIMIT 1",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .optional()
+            .unwrap();
+        let base = previous.as_ref().map_or(0, |(_, version)| *version);
+        let parent = previous
+            .map(|(bytes, _)| opc_types::TxId::from_uuid(uuid::Uuid::from_slice(&bytes).unwrap()));
+        self.ordinary_running_at(base, parent, None, request)
+    }
+
+    fn ordinary_running_at(
+        &self,
+        base: u64,
+        parent: Option<opc_types::TxId>,
+        deadline: Option<opc_types::Timestamp>,
+        request: u8,
+    ) -> crate::consensus::PreparedAuditedMutation {
+        use crate::consensus::audit_mutation::AuditedConfigEffect;
+        use opc_crypto::encrypt_attested_envelope_with_handle_and_nonce;
+        use opc_key::{ConfigAad, EnvelopeAad, KeyHandle, KeyId, KeyPurpose};
+        use sha2::{Digest, Sha256};
+
+        let tx_id = opc_types::TxId::new();
+        let committed_at = opc_types::Timestamp::from_offset_datetime(
+            time::OffsetDateTime::from_unix_timestamp(100).unwrap(),
+        );
+        let schema = opc_types::SchemaDigest::from_bytes([0x74; 32]);
+        let principal = r#"{"tenant":"fixture-tenant","subject":"fixture-principal"}"#.to_owned();
+        let aad = EnvelopeAad::config(
+            opc_types::TenantId::from_static("fixture-tenant"),
+            base + 1,
+            ConfigAad::new(tx_id, parent, committed_at, &principal, schema, "running").unwrap(),
+        );
+        let encryption_key = KeyHandle::new(
+            KeyId::new("fixture-running-key").unwrap(),
+            KeyPurpose::Config,
+            opc_types::TenantId::from_static("fixture-tenant"),
+            zeroize::Zeroizing::new([0x75; 32]),
+        );
+        let plaintext = [0x76; 32];
+        let encrypted = encrypt_attested_envelope_with_handle_and_nonce(
+            &encryption_key,
+            &aad,
+            &plaintext,
+            [request; 12],
+        )
+        .unwrap();
+        let commit = crate::consensus::PreparedConfigCommit::prepare(
+            crate::CommitRecord {
+                tx_id,
+                parent_tx_id: parent,
+                version: opc_types::ConfigVersion::new(base + 1),
+                committed_at,
+                principal,
+                source: crate::CommitSource::Netconf,
+                schema_digest: schema,
+                plaintext_digest: Sha256::digest(plaintext).to_vec(),
+                encrypted_blob: encrypted.encoded().to_vec(),
+                rollback_point: false,
+                confirmed_deadline: deadline,
+            },
+            Vec::new(),
+            &self.key,
+        )
+        .unwrap();
+        let effect = AuditedConfigEffect::Append {
+            commit: Box::new(commit),
+            resolution: None,
+        };
+        self.ordinary_with_effect(effect, base, request)
+    }
+
+    fn ordinary_with_effect(
+        &self,
+        effect: crate::consensus::audit_mutation::AuditedConfigEffect,
+        base: u64,
+        request: u8,
+    ) -> crate::consensus::PreparedAuditedMutation {
+        let mutation = effect.digest(&self.key).unwrap();
+        let event = self.event(request);
+        let binding =
+            AuditOperationBinding::project(&self.privacy, &event, base, &mutation).unwrap();
+        let handle = AuditOperationHandle::issue(
+            HandleBody {
+                version: 1,
+                identity: self.identity,
+                binding,
+                event,
+                issued_at: 100,
+                expires_at: 160,
+                nonce: [request; 16],
+                key_epoch: self.key.epoch(),
+                mutation: Some(mutation),
+            },
+            &self.key,
+        )
+        .unwrap();
+        crate::consensus::PreparedAuditedMutation::new(handle, effect, None)
+    }
+
+    fn admit_ordinary(
+        &self,
+        conn: &Connection,
+        prepared: &crate::consensus::PreparedAuditedMutation,
+    ) {
+        self.apply(conn, AuditCommand::Intent(prepared.handle().clone()), 100)
+            .unwrap();
+        self.checkpoint(conn);
+    }
+
+    fn apply_ordinary(
+        &self,
+        conn: &Connection,
+        prepared: &crate::consensus::PreparedAuditedMutation,
+    ) -> std::io::Result<Result<(), ConfigMutationFailure>> {
+        crate::consensus::sqlite::target_snapshot_tests::apply_ordinary_running(
+            conn,
+            &self.key,
+            self.identity,
+            prepared,
+            &self.keys,
+        )
+    }
+}
+
+#[tokio::test]
+async fn ordinary_running_apply_preserves_target_state_and_known_commit() {
+    let fixture = Fixture::new().await;
+    let shared = fixture.backend.conn();
+    let conn = shared.lock().await;
+    fixture.active(&conn);
+    let before = target_rows(&conn);
+    let prepared = fixture.ordinary_running(&conn, 210);
+    fixture.admit_ordinary(&conn, &prepared);
+    let result = fixture.apply_ordinary(&conn, &prepared);
+    assert!(
+        matches!(result, Ok(Ok(()))),
+        "activated unlocked target authority refused ordinary running apply"
+    );
+    let receipt = fixture
+        .ledger(&conn)
+        .lookup(
+            &fixture.key,
+            prepared.handle(),
+            prepared.handle().body.binding.caller,
+        )
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        receipt.state(),
+        AuditOperationState::Committed { version: 1 }
+    );
+    assert!(!receipt.terminal_recorded());
+    assert!(
+        target_rows(&conn) == before,
+        "ordinary running apply changed target authority"
+    );
+    let original = fixture.ledger(&conn);
+    assert!(matches!(
+        fixture.apply_ordinary(&conn, &prepared),
+        Ok(Ok(()))
+    ));
+    assert!(
+        serde_json::to_vec(&fixture.ledger(&conn)).unwrap()
+            == serde_json::to_vec(&original).unwrap(),
+        "known committed replay changed its retained audit obligation"
+    );
+    let crate::consensus::audit_mutation::AuditedConfigEffect::Append { commit, .. } =
+        &prepared.command().effect
+    else {
+        panic!("ordinary append fixture");
+    };
+    let (tx, encrypted, count): (Vec<u8>, Vec<u8>, u64) = conn
+        .query_row(
+            "SELECT tx_id,encrypted_blob,(SELECT COUNT(*) FROM config_history) FROM config_history WHERE version=1",
+            [],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+        )
+        .unwrap();
+    assert!(tx == commit.record.tx_id.as_uuid().as_bytes());
+    assert!(encrypted == commit.record.encrypted_blob);
+    assert_eq!(count, 1);
+}
+
+#[tokio::test]
+async fn ordinary_running_apply_refuses_equal_caller_without_running_lock_lease() {
+    let fixture = Fixture::new().await;
+    let shared = fixture.backend.conn();
+    let conn = shared.lock().await;
+    fixture.active(&conn);
+    let lock = fixture.request(&conn, 220, 2, 0x61, 0);
+    assert!(matches!(
+        fixture.submit(&conn, &lock),
+        AuditOperationState::TargetV1(_)
+    ));
+    fixture.settle(&conn, &lock);
+    let before = target_rows(&conn);
+    let prepared = fixture.ordinary_running(&conn, 221);
+    assert!(prepared.handle().body.binding.caller == lock.command().effect.caller);
+    fixture.admit_ordinary(&conn, &prepared);
+    assert!(
+        matches!(
+            fixture.apply_ordinary(&conn, &prepared),
+            Ok(Err(ConfigMutationFailure::Conflict))
+        ),
+        "caller equality supplied no exact running lock lease"
+    );
+    assert!(
+        target_rows(&conn) == before,
+        "refused running apply changed target authority"
+    );
+    assert_eq!(
+        conn.query_row("SELECT COUNT(*) FROM config_history", [], |r| r
+            .get::<_, u64>(0))
+            .unwrap(),
+        0
+    );
+    assert_eq!(
+        fixture
+            .ledger(&conn)
+            .lookup(
+                &fixture.key,
+                prepared.handle(),
+                prepared.handle().body.binding.caller
+            )
+            .unwrap()
+            .unwrap()
+            .state(),
+        AuditOperationState::Rejected
+    );
+    fixture
+        .apply(
+            &conn,
+            AuditCommand::Terminal(prepared.handle().clone()),
+            100,
+        )
+        .unwrap();
+    fixture.checkpoint(&conn);
+    let unlock = fixture.request(&conn, 222, 3, 0x61, 0);
+    assert!(matches!(
+        fixture.submit(&conn, &unlock),
+        AuditOperationState::TargetV1(_)
+    ));
+    fixture.settle(&conn, &unlock);
+    let allowed = fixture.ordinary_running(&conn, 223);
+    fixture.admit_ordinary(&conn, &allowed);
+    assert!(
+        matches!(fixture.apply_ordinary(&conn, &allowed), Ok(Ok(()))),
+        "unlocked ordinary running authority remained fenced"
+    );
+}
+
+#[path = "ordinary_running.rs"]
+mod ordinary_running;
+
+#[path = "cleanup_retirement.rs"]
+mod cleanup_retirement_tests;
+
+#[path = "cleanup_running_base.rs"]
+mod cleanup_running_base;
+
+#[path = "target_allocation_boundary.rs"]
+mod target_allocation_boundary;
+
+#[path = "target_ledger_budget_native.rs"]
+mod target_ledger_budget_tests;

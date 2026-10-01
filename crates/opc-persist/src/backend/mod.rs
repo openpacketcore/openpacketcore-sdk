@@ -31,6 +31,9 @@ use crate::schema;
 use crate::types::{extract_tenant, AuditKey, AuditOpType, AuditRecord, CommitSource};
 use opc_types::TxId;
 
+pub(crate) use engine_admission::ConfigEngineClaim;
+
+mod engine_admission;
 mod ops;
 
 /// Connection storage shared with detached workers. Field order is deliberate:
@@ -40,6 +43,10 @@ mod ops;
 pub(crate) struct BackendConnection {
     connection: rusqlite::Connection,
     _retained_admission: Option<Arc<crate::local_sqlite::FileAdmission>>,
+    // Non-owning test receivers observe actual SQLite and retained-file
+    // destruction independently of any engine claim. Release this last.
+    #[cfg(all(test, target_os = "linux"))]
+    released: tokio::sync::watch::Sender<()>,
 }
 
 impl BackendConnection {
@@ -51,23 +58,37 @@ impl BackendConnection {
         Self {
             connection,
             _retained_admission: Some(admission),
+            #[cfg(all(test, target_os = "linux"))]
+            released: tokio::sync::watch::channel(()).0,
         }
+    }
+
+    #[cfg(all(test, target_os = "linux"))]
+    pub(crate) fn release_observer(&self) -> tokio::sync::watch::Receiver<()> {
+        self.released.subscribe()
     }
 
     pub(crate) fn close(self) -> Result<(), rusqlite::Error> {
         let Self {
             connection,
-            _retained_admission,
+            _retained_admission: retained_admission,
+            #[cfg(all(test, target_os = "linux"))]
+            released,
         } = self;
         // Retain admission through both explicit close and the returned
         // connection's final drop if SQLite rejects the first close attempt.
-        match connection.close() {
+        let result = match connection.close() {
             Ok(()) => Ok(()),
             Err((connection, error)) => {
                 drop(connection);
                 Err(error)
             }
-        }
+        };
+        // Mirror field order on explicit close, including test observers.
+        drop(retained_admission);
+        #[cfg(all(test, target_os = "linux"))]
+        drop(released);
+        result
     }
 }
 
@@ -163,6 +184,12 @@ pub(crate) fn deserialize_audit_op_type(s: &str) -> Result<AuditOpType, PersistE
 /// The connection and audit key are intentionally not exposed; authority is
 /// available only through typed store operations.
 ///
+/// Bounded configuration engines opened from clones share one exclusive
+/// process-local claim. The claim remains held by their native workers and
+/// preparation owners, including ciphertext aliases after shutdown or store
+/// drop. Backend clones remain usable for reads; Legacy engine opens retain
+/// their existing behavior.
+///
 /// ```compile_fail
 /// use opc_persist::SqliteBackend;
 /// fn raw_connection(backend: &SqliteBackend) {
@@ -190,6 +217,11 @@ pub struct SqliteBackend {
     /// Shared admission for config-consensus blocking work, including startup
     /// before the consensus core exists.
     config_consensus_worker_gate: Arc<tokio::sync::Semaphore>,
+    /// Clone-shared weak registry, scoped to this admitted backing.
+    config_consensus_engine_admission: Arc<engine_admission::ConfigEngineAdmission>,
+    /// Present only on the backend consumed by one bounded engine open and on
+    /// its internal worker clones. Ordinary pre-open clones remain unclaimed.
+    config_consensus_engine_claim: Option<Arc<ConfigEngineClaim>>,
     #[cfg(test)]
     pub(crate) consensus_apply_gate: Arc<tokio::sync::Semaphore>,
     /// Audit HMAC key used to seal and verify local audit-trail rows.
@@ -202,6 +234,9 @@ pub struct SqliteBackend {
     /// Monotonic refusal fence shared by every clone. Once consensus is claimed,
     /// losing its tables cannot re-enable standalone reads or local mutation.
     config_consensus_history_required: Arc<AtomicBool>,
+    /// Independently admitted authority, shared by clones and never selected
+    /// from mutable history or identity rows during a read.
+    config_consensus_identity: Arc<std::sync::OnceLock<opc_consensus::ConsensusIdentity>>,
     /// Cached preflight result (populated after first successful preflight).
     cached_caps: std::sync::OnceLock<PersistCapabilities>,
     /// Exact retained scope, absent only on the existing create-or-open API.
@@ -273,6 +308,9 @@ impl SqliteBackend {
     ///
     /// Production callers must use this constructor so audit-trail rows are
     /// sealed with deployment-owned key material rather than a development key.
+    /// A reopened legacy consensus database refuses history reads until
+    /// [`crate::ConsensusConfigStore::open`] independently admits its topology.
+    /// Explicitly retained authorities require the retained lifecycle APIs.
     pub async fn open_with_audit_key(
         path: impl Into<PathBuf>,
         ephemeral: bool,
@@ -319,9 +357,20 @@ impl SqliteBackend {
         self.config_consensus_worker_gate.clone()
     }
 
-    pub(crate) fn require_config_consensus_history(&self) {
+    pub(crate) fn config_consensus_identity(&self) -> Option<opc_consensus::ConsensusIdentity> {
+        self.config_consensus_identity.get().copied()
+    }
+
+    pub(crate) fn require_config_consensus_history(
+        &self,
+        identity: opc_consensus::ConsensusIdentity,
+    ) -> Result<(), crate::consensus::ConfigConsensusStorageError> {
+        if *self.config_consensus_identity.get_or_init(|| identity) != identity {
+            return Err(crate::consensus::ConfigConsensusStorageError::InvalidIdentity);
+        }
         self.config_consensus_history_required
             .store(true, Ordering::Release);
+        Ok(())
     }
 
     pub(crate) const fn is_ephemeral(&self) -> bool {
@@ -390,14 +439,19 @@ impl SqliteBackend {
             conn: Arc::new(AsyncMutex::new(BackendConnection {
                 connection: conn,
                 _retained_admission: None,
+                #[cfg(all(test, target_os = "linux"))]
+                released: tokio::sync::watch::channel(()).0,
             })),
             config_consensus_worker_gate: Arc::new(tokio::sync::Semaphore::new(1)),
+            config_consensus_engine_admission: Arc::new(Default::default()),
+            config_consensus_engine_claim: None,
             #[cfg(test)]
             consensus_apply_gate: Arc::new(tokio::sync::Semaphore::new(1)),
             audit_key: Arc::new(audit_key),
             management_audit_keys: Arc::new(std::sync::OnceLock::new()),
             management_audit_data_version: Arc::new(AtomicU64::new(0)),
             config_consensus_history_required: Arc::new(AtomicBool::new(consensus_required)),
+            config_consensus_identity: Arc::new(std::sync::OnceLock::new()),
             cached_caps: std::sync::OnceLock::new(),
             retained_binding: None,
             retained_repair_only: false,
@@ -430,14 +484,21 @@ impl SqliteBackend {
             conn: Arc::new(AsyncMutex::new(BackendConnection {
                 connection: conn,
                 _retained_admission: Some(admission),
+                #[cfg(all(test, target_os = "linux"))]
+                released: tokio::sync::watch::channel(()).0,
             })),
             config_consensus_worker_gate: Arc::new(tokio::sync::Semaphore::new(1)),
+            config_consensus_engine_admission: Arc::new(Default::default()),
+            config_consensus_engine_claim: None,
             #[cfg(test)]
             consensus_apply_gate: Arc::new(tokio::sync::Semaphore::new(1)),
             audit_key: Arc::new(audit_key),
             management_audit_keys: Arc::new(std::sync::OnceLock::new()),
             management_audit_data_version: Arc::new(AtomicU64::new(0)),
             config_consensus_history_required: Arc::new(AtomicBool::new(true)),
+            config_consensus_identity: Arc::new(std::sync::OnceLock::from(
+                binding.topology().identity(),
+            )),
             cached_caps: std::sync::OnceLock::new(),
             retained_binding: Some(binding),
             retained_repair_only: repair_only,

@@ -275,13 +275,26 @@ their existing behavior; an unsupported nonlegacy datastore refuses.
 
 `encrypt_reserved_bounded_config_envelope` consumes the reservation before
 provider access and transfers it through the one-shot encryption claim and
-attestation. Envelope aliases retain shared ownership until their last drop.
+attestation. Envelope aliases retain shared ownership until their last drop;
+count the original SDK-created envelope allocation once while any lease-bearing
+alias remains live, including after its claim was consumed.
 Ordinary prepared operations remain non-cloneable; audited prepared aliases
 share immutable payload and preparation ownership. Separate nonwaiting guards
 bound concurrent SDK encoding and mutation submission by those aliases.
 Timeout or cancellation must retain ownership of accepted work until it
-finishes. The receiver acquires its own reservation before inner forwarded
+finishes. A closed Openraft response channel reports `OutcomeUnknown` to the
+caller independently of cleanup; it does not prove the accepted native apply
+has released its payload. The supervisor retains both admission owners until
+the final native storage owner drains, using observation that owns no storage.
+The receiver acquires its own reservation before inner forwarded
 command decoding. Slot counts alone are not allocated-byte accounting.
+
+The bounded recovery encoder's current output counts while the SDK owns it.
+A raw output Vec returned to an application transfers responsibility for that
+retained buffer to the application. If SDK code retains or reborrows
+such output, it must still account its actual capacity for that overlapping
+lifetime. This transfer does not release lease-bearing envelope or prepared
+aliases, and it does not make separate encoder and submission peaks additive.
 
 `ConsensusConfigStore::decode_prepared_audited_mutation` reserves before owned
 decoding and authenticates the original handle, effect and required record
@@ -419,7 +432,8 @@ no package version upgrade or transport-budget expansion.
 Prepare the original-behavior detector and bounded implementation design while
 these decisions are reviewed. Before delivering a wider admission fence,
 complete the approved plaintext/sealed admission and resource contract, qualify
-every row, and integrate against current main. The existing 1 MiB command fence
-remains in place in this contract slice. Follow-up
-assessments of #724 and #683 begin only after #957 has complete evidence;
+every row, and integrate against current main. The implementation branch now
+provides explicit `BoundedV1` selection; legacy stores retain the existing
+1 MiB command fence. Implementation availability does not establish that this
+acceptance matrix is complete or supply RFC approval. Follow-up assessments of #724 and #683 begin only after #957 has complete evidence;
 those assessments do not authorize their implementations.

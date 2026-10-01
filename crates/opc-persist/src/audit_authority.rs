@@ -16,14 +16,43 @@ use crate::management_audit::{
     ManagementAuditTransportCode,
 };
 
-pub use crate::consensus::PreparedAuditedMutation;
+pub use crate::consensus::{PreparedAuditedMutation, PreparedTargetMutation};
+pub(crate) mod confirmation;
+pub(crate) use targets::NetconfPendingView;
 /// Authenticated retained epochs, portable exports and external checkpoints.
 pub mod continuity;
+mod empty_commit;
+pub(crate) use empty_commit::EmptyCommitGuard;
+pub use empty_commit::{NetconfEmptyCommitRead, PreparedNetconfEmptyCommit};
 pub(crate) mod ledger;
+mod netconf_recovery;
 pub(crate) mod receipt;
+mod targets;
+pub(crate) use netconf_recovery::{
+    NetconfRecoveryCache, NetconfRecoveryRegistry, NetconfRollbackView,
+};
+pub use netconf_recovery::{
+    NetconfRecoveryOwner, NetconfRollback, NetconfRollbackCause, NetconfRollbackRead,
+    NetconfRollbackSuccessor,
+};
+
 pub use ledger::{
     AuditAdmission, AuditLedgerLimits, AuditOperationHandle, AuditOperationReceipt,
     AuditOperationState,
+};
+pub(crate) use targets::{
+    caller as target_caller, identity as target_identity, NetconfTargetReadContent,
+    NetconfWorkerBinding,
+};
+pub use targets::{
+    CandidateGeneration, NetconfAppliedOutcome, NetconfCancellation, NetconfCandidatePromotion,
+    NetconfCandidatePromotionRead, NetconfDeviceOwner, NetconfEmptyConfirmation,
+    NetconfIncarnation, NetconfLockDatastore, NetconfLockLease, NetconfPendingConfirmation,
+    NetconfPendingRead, NetconfRunningCopy, NetconfRunningCopyRead, NetconfRunningEditRead,
+    NetconfSessionOwner, NetconfStagedConfirmation, NetconfStagedConfirmationRead,
+    NetconfTargetCopy, NetconfTargetCopyRead, NetconfTargetRead, NetconfTargetReplacement,
+    NetconfTargetResult, NetconfTentativePromotion, PreparedNetconfDevice, PreparedNetconfLock,
+    StartupRevision,
 };
 
 /// Largest aggregate private tuple accepted before projection.

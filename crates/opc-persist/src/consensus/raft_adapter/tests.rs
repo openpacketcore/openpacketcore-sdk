@@ -16,10 +16,17 @@ use tokio::sync::Notify;
 
 use super::*;
 use crate::consensus::{
-    ConfigConsensusCommand, ConfigMutationIntent, PreparedConfigCommit,
+    ConfigConsensusCommand, ConfigMutationIntent, PreparedConfigCommit, RetainedConfigMode,
     CONFIG_CONSENSUS_COMMAND_VERSION,
 };
 use crate::{CommitRecord, CommitSource};
+
+const MODES: [RetainedConfigMode; 4] = [
+    RetainedConfigMode::Legacy,
+    RetainedConfigMode::BoundedV1,
+    RetainedConfigMode::NetconfTargetsV1,
+    RetainedConfigMode::NetconfRunningV1,
+];
 
 fn identity() -> ConsensusIdentity {
     ConsensusIdentity::new(
@@ -84,13 +91,22 @@ fn rpc_option() -> RPCOption {
     ))
 }
 
-#[derive(Debug, Default)]
+#[derive(Debug)]
 struct HeldAppendPeer {
+    mode: RetainedConfigMode,
     received: Mutex<Option<ConsensusWireRequest>>,
     release: Notify,
 }
 
 impl HeldAppendPeer {
+    fn new(mode: RetainedConfigMode) -> Self {
+        Self {
+            mode,
+            received: Mutex::new(None),
+            release: Notify::new(),
+        }
+    }
+
     fn assert_received(&self, expected_payload: &[u8]) {
         let received = self.received.lock().expect("received request");
         let wire = received.as_ref().expect("peer call reached the IO hold");
@@ -121,16 +137,20 @@ impl ConsensusPeer for HeldAppendPeer {
         self.release.notified().await;
         let result: Result<_, RaftError<ConsensusNodeId>> = Ok(response());
         Ok(ConsensusWireResponse {
-            result: Ok(encode_engine_result(&result).expect("encode response")),
+            result: Ok(encode_engine_result(self.mode, &result).expect("encode response")),
         })
     }
 }
 
-async fn network(peer: Arc<HeldAppendPeer>) -> ConfigRaftNetwork {
+async fn network(mode: RetainedConfigMode, peer: Arc<HeldAppendPeer>) -> ConfigRaftNetwork {
     let peer: Arc<dyn ConsensusPeer> = peer;
-    let mut factory =
-        ConfigRaftNetworkFactory::try_new(identity(), node(1), BTreeMap::from([(node(2), peer)]))
-            .expect("network factory");
+    let mut factory = ConfigRaftNetworkFactory::try_new(
+        identity(),
+        node(1),
+        BTreeMap::from([(node(2), peer)]),
+        mode,
+    )
+    .expect("network factory");
     factory.new_client(node(2), &EmptyNode::new()).await
 }
 
@@ -142,42 +162,51 @@ fn assert_pending(future: Pin<&mut impl Future>) {
 
 #[tokio::test]
 async fn append_retires_typed_payload_before_peer_io_completes() {
-    let expected_payload = encode_config_wire(&append_request()).expect("encode fixture");
-    let request = Arc::new(
-        decode_config_wire::<AppendEntriesRequest<ConfigRaftTypeConfig>>(&expected_payload)
+    for mode in MODES {
+        let expected_payload =
+            encode_config_wire_for_profile(mode, &append_request()).expect("encode fixture");
+        let request = Arc::new(
+            decode_config_wire_for_profile::<AppendEntriesRequest<ConfigRaftTypeConfig>>(
+                mode,
+                &expected_payload,
+            )
             .expect("decode independently owned typed payload"),
-    );
-    // Weak retains only the Arc backing allocation, not the live DTO or its
-    // nested allocations. There is no separate drop token or retirement hook.
-    let original_payload = Arc::downgrade(&request);
-    assert_eq!(original_payload.strong_count(), 1);
-    let peer = Arc::new(HeldAppendPeer::default());
-    let network = network(peer.clone()).await;
-    let mut append = pin!(network.append(request, rpc_option()));
+        );
+        // Weak retains only the Arc backing allocation, not the live DTO or its
+        // nested allocations. There is no separate drop token or retirement hook.
+        let original_payload = Arc::downgrade(&request);
+        assert_eq!(original_payload.strong_count(), 1);
+        let peer = Arc::new(HeldAppendPeer::new(mode));
+        let network = network(mode, peer.clone()).await;
+        let mut append = pin!(network.append(request, rpc_option()));
 
-    assert_pending(append.as_mut());
-    peer.assert_received(&expected_payload);
-    assert!(
-        original_payload.upgrade().is_none(),
-        "typed append payload must be physically retired while peer IO is held"
-    );
+        assert_pending(append.as_mut());
+        peer.assert_received(&expected_payload);
+        assert!(
+            original_payload.upgrade().is_none(),
+            "typed append payload must be physically retired while peer IO is held"
+        );
 
-    peer.release.notify_one();
-    assert_eq!(append.await.expect("append response"), response());
+        peer.release.notify_one();
+        assert_eq!(append.await.expect("append response"), response());
+    }
 }
 
 #[tokio::test]
 async fn append_entries_preserves_wire_request_and_response() {
-    let request = append_request();
-    let expected_payload = encode_config_wire(&request).expect("encode fixture");
-    let peer = Arc::new(HeldAppendPeer::default());
-    let mut network = network(peer.clone()).await;
-    let mut append = pin!(network.append_entries(request, rpc_option()));
+    for mode in MODES {
+        let request = append_request();
+        let expected_payload =
+            encode_config_wire_for_profile(mode, &request).expect("encode fixture");
+        let peer = Arc::new(HeldAppendPeer::new(mode));
+        let mut network = network(mode, peer.clone()).await;
+        let mut append = pin!(network.append_entries(request, rpc_option()));
 
-    assert_pending(append.as_mut());
-    peer.assert_received(&expected_payload);
-    peer.release.notify_one();
-    assert_eq!(append.await.expect("append response"), response());
+        assert_pending(append.as_mut());
+        peer.assert_received(&expected_payload);
+        peer.release.notify_one();
+        assert_eq!(append.await.expect("append response"), response());
+    }
 }
 
 #[test]

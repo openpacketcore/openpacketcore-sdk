@@ -9,23 +9,40 @@ mod audit;
 #[cfg(test)]
 pub(crate) use audit::{applied_receipt_sync, apply_sync, read_sync, write_sync, AuditCommand};
 mod audit_mutation;
-pub use audit_mutation::PreparedAuditedMutation;
+mod audit_targets;
+pub(crate) use crate::retained::RetainedConfigMode;
+pub(crate) use audit_mutation::TargetMutationCommand;
+pub use audit_mutation::{PreparedAuditedMutation, PreparedTargetMutation};
+pub use audit_targets::RetainedConfigProfile;
+#[cfg(feature = "dangerous-test-hooks")]
+pub mod capacity_observation;
+mod capacity_record;
+#[cfg(feature = "dangerous-test-hooks")]
+pub mod completion_observation;
+mod config_capacity_decode;
+pub(crate) mod config_capacity_json;
 pub(crate) mod history;
+mod preparation;
 mod raft_adapter;
 mod snapshot_file;
 mod sqlite;
 pub(crate) use sqlite::run_backend_sqlite_with_timeout;
 mod storage;
+pub(crate) use storage::ConfigConsensusStorageError;
 mod store;
 mod types;
+
+#[cfg(test)]
+pub(crate) mod config_capacity_simultaneous_working_tests;
 
 pub(crate) use sqlite::{provision_retained_schema, validate_retained_schema};
 
 pub use history::{ConfigHistoryLimits, ConfigHistoryRetention};
 
 pub use store::{
-    ConfigConsensusOpenError, ConfigConsensusStatus, ConfigLocalAuthorityOutcome,
-    ConsensusConfigStore, DEFAULT_CONFIG_CONSENSUS_OPERATION_TIMEOUT,
+    ConfigCommitRecoveryHandle, ConfigCommitRecoveryOutcome, ConfigConsensusOpenError,
+    ConfigConsensusStatus, ConfigLocalAuthorityOutcome, ConsensusConfigStore,
+    PreparedConfigCommitOperation, DEFAULT_CONFIG_CONSENSUS_OPERATION_TIMEOUT,
 };
 pub use types::{
     ApprovedLegacyConfigRecovery, ConfigConsensusClock, ConfigConsensusClusterId,

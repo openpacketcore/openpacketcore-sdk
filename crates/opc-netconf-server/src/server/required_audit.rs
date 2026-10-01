@@ -72,9 +72,54 @@ where
         if !self.required_audit_profile_supported() {
             return Err(ServerInitError::RequiredAuditProfileUnsupported);
         }
+        #[cfg(feature = "required-netconf-audit")]
+        if self.retained_running {
+            return Err(ServerInitError::RequiredAuditProfileUnsupported);
+        }
         self.audit = Arc::new(ServerAudit::Required(audit.observation_sink()));
         self.required_config_audit = Some(audit);
         Ok(self)
+    }
+
+    /// Attach retained session ownership to this exact read-only bus worker.
+    ///
+    /// The actual transport runner owns the returned SDK session until final
+    /// drop, including task cancellation. Running lock/unlock use that exact
+    /// session and worker-owned SDK leases, with NACM before effect admission.
+    /// This narrow attachment does not enable retained configuration writes,
+    /// candidate/startup, or confirmed commit. Writable bindings fail closed
+    /// until those protocol lifecycles are wired.
+    #[cfg(feature = "required-netconf-audit")]
+    pub fn with_retained_session_lifecycle(
+        mut self,
+        audit: opc_config_bus::RequiredNetconfAudit<C>,
+    ) -> Result<Self, ServerInitError> {
+        if !audit.belongs_to(self.binding.config_bus().as_ref()) {
+            return Err(ServerInitError::RequiredAuditWorkerMismatch);
+        }
+        if self.binding.writable_running_capability() || !self.required_audit_profile_supported() {
+            return Err(ServerInitError::RequiredAuditProfileUnsupported);
+        }
+        self.audit = Arc::new(ServerAudit::Required(audit.observation_sink()));
+        self.retained_sessions = Some(audit);
+        Ok(self)
+    }
+
+    pub(super) fn has_unsupported_audit_profile(&self) -> bool {
+        if self.required_config_audit.is_some() && !self.required_audit_profile_supported() {
+            return true;
+        }
+        #[cfg(feature = "required-netconf-audit")]
+        if self.retained_sessions.is_some() && !self.retained_audit_profile_supported() {
+            return true;
+        }
+        false
+    }
+
+    #[cfg(feature = "required-netconf-audit")]
+    pub(super) fn retained_audit_profile_supported(&self) -> bool {
+        self.required_audit_profile_supported()
+            && (!self.binding.writable_running_capability() || self.retained_running)
     }
 
     pub(super) fn required_audit_profile_supported(&self) -> bool {

@@ -39,6 +39,10 @@ use crate::types::{
 };
 use crate::{ConfigProjectionHead, ConfigProjectionPublication, ConfigProjectionRebuilder};
 
+#[cfg(feature = "required-netconf-audit")]
+#[path = "netconf_audit/running_commit.rs"]
+pub(crate) mod netconf_running;
+
 pub(crate) const DEFAULT_COMMIT_QUEUE_CAPACITY: usize = 32;
 const UNSUPPORTED_VALIDATE_ONLY_OPERATION_MESSAGE: &str =
     "validate-only only supports replace operations in this skeleton config bus";
@@ -79,6 +83,12 @@ pub(crate) struct Submission<C: OpcConfig> {
 
 pub(crate) enum WorkerRequest<C: OpcConfig> {
     Submit(Box<Submission<C>>),
+    #[cfg(feature = "required-netconf-audit")]
+    NetconfRecovery(Box<crate::netconf_audit::RecoveryMessage>),
+    #[cfg(feature = "required-netconf-audit")]
+    NetconfSession(Box<crate::netconf_audit::SessionMessage>),
+    #[cfg(feature = "required-netconf-audit")]
+    NetconfRunning(Box<netconf_running::RunningMessage<C>>),
     Reconcile {
         source: Arc<dyn CommittedRevisionSource<C>>,
         reply: oneshot::Sender<Result<ConfigProjectionHead, StoreError>>,
@@ -203,6 +213,10 @@ pub struct ConfigBus<C: OpcConfig> {
     pub(crate) authorizer: Arc<dyn ConfigAuthorizer>,
     pub(crate) admission_limits: Arc<CommitAdmissionLimits>,
     pub(crate) store: Arc<dyn ManagedDatastore<C>>,
+    #[cfg(feature = "required-netconf-audit")]
+    pub(crate) netconf_audit: Option<crate::netconf_audit::WorkerAttachment>,
+    #[cfg(feature = "required-netconf-audit")]
+    pub(crate) netconf_join: Option<crate::netconf_audit::WorkerJoin>,
     pub(crate) authority: Arc<Mutex<Option<Arc<dyn crate::ConfigAuthorityPort>>>>,
 }
 
@@ -226,8 +240,10 @@ impl<C: OpcConfig> ConfigBus<C> {
         let admission_limits = Arc::new(CommitAdmissionLimits::default());
         let authority = Arc::new(Mutex::new(None));
         let (tx, rx) = mpsc::channel(queue_capacity);
+        #[cfg(feature = "required-netconf-audit")]
+        let netconf_audit = crate::netconf_audit::WorkerAttachment::from_store(store.as_ref());
 
-        tokio::spawn(worker_loop(
+        let worker_task = tokio::spawn(worker_loop(
             rx,
             Arc::clone(&snapshot),
             Arc::clone(&subscribers),
@@ -239,7 +255,23 @@ impl<C: OpcConfig> ConfigBus<C> {
             impact_classifier.clone(),
             Arc::clone(&authority),
             pending_deadline,
+            #[cfg(feature = "required-netconf-audit")]
+            netconf_audit.as_ref().map(|attachment| {
+                attachment.worker(
+                    std::num::NonZeroUsize::new(queue_capacity)
+                        .unwrap_or(std::num::NonZeroUsize::MIN),
+                )
+            }),
+            #[cfg(feature = "required-netconf-audit")]
+            netconf_audit
+                .as_ref()
+                .map(|attachment| attachment.signal.clone()),
         ));
+
+        #[cfg(feature = "required-netconf-audit")]
+        let netconf_join = Some(crate::netconf_audit::WorkerJoin::new(worker_task));
+        #[cfg(not(feature = "required-netconf-audit"))]
+        drop(worker_task);
 
         Self {
             tx,
@@ -251,6 +283,10 @@ impl<C: OpcConfig> ConfigBus<C> {
             authorizer,
             admission_limits,
             store,
+            #[cfg(feature = "required-netconf-audit")]
+            netconf_audit,
+            #[cfg(feature = "required-netconf-audit")]
+            netconf_join,
             authority,
         }
     }
@@ -279,6 +315,10 @@ impl<C: OpcConfig> ConfigBus<C> {
             authorizer: Arc::new(DenyAllAuthorizer),
             admission_limits,
             store,
+            #[cfg(feature = "required-netconf-audit")]
+            netconf_audit: None,
+            #[cfg(feature = "required-netconf-audit")]
+            netconf_join: None,
             authority: Arc::new(Mutex::new(None)),
         }
     }
@@ -592,6 +632,11 @@ fn pending_deadline_fire_at(deadline: &Timestamp) -> tokio::time::Instant {
     tokio::time::Instant::now() + remaining
 }
 
+#[cfg(feature = "required-netconf-audit")]
+type WorkerOutcome = crate::netconf_audit::WorkerExit;
+#[cfg(not(feature = "required-netconf-audit"))]
+type WorkerOutcome = ();
+
 async fn worker_loop<C: OpcConfig>(
     mut rx: mpsc::Receiver<WorkerRequest<C>>,
     snapshot: Arc<AtomicConfigSnapshot<C>>,
@@ -604,15 +649,42 @@ async fn worker_loop<C: OpcConfig>(
     impact_classifier: Arc<dyn ConfigImpactClassifier<C>>,
     authority: Arc<Mutex<Option<Arc<dyn crate::ConfigAuthorityPort>>>>,
     initial_pending_deadline: Option<Timestamp>,
-) {
+    #[cfg(feature = "required-netconf-audit")] mut netconf_worker: Option<
+        crate::netconf_audit::TargetWorker,
+    >,
+    #[cfg(feature = "required-netconf-audit")] signal: Option<crate::netconf_audit::WorkerSignal>,
+) -> WorkerOutcome {
     let mut pending_fire_at = initial_pending_deadline
         .as_ref()
         .map(pending_deadline_fire_at);
 
+    #[cfg(feature = "required-netconf-audit")]
+    if let Some(worker) = netconf_worker.as_mut() {
+        worker.attach_running_publication(Arc::new(netconf_running::RunningPublisher::new(
+            Arc::clone(&store),
+            Arc::clone(&snapshot),
+            Arc::clone(&subscribers),
+            worker.port_for_publication(),
+        )));
+    }
+
     loop {
+        #[cfg(feature = "required-netconf-audit")]
+        if let Some(worker) = netconf_worker.as_mut() {
+            if signal.as_ref().is_some_and(|signal| signal.is_draining()) {
+                rx.close();
+                worker.begin_drain();
+            }
+            worker.cleanup().await;
+        }
         let current_fire_at = pending_fire_at;
 
         tokio::select! {
+            _ = async {
+                #[cfg(feature = "required-netconf-audit")]
+                if let Some(signal) = &signal { signal.notified().await; return; }
+                std::future::pending::<()>().await;
+            } => { continue; }
             submission_opt = rx.recv() => {
                 let Some(request) = submission_opt else {
                     break;
@@ -620,10 +692,40 @@ async fn worker_loop<C: OpcConfig>(
 
                 let mut submission = match request {
                     WorkerRequest::Submit(submission) => *submission,
+                    #[cfg(feature = "required-netconf-audit")]
+                    WorkerRequest::NetconfSession(message) => {
+                        crate::netconf_audit::session_in_worker(netconf_worker.as_mut(), *message).await;
+                        continue;
+                    }
+                    #[cfg(feature = "required-netconf-audit")]
+                    WorkerRequest::NetconfRecovery(message) => {
+                        crate::netconf_audit::recover_in_worker(
+                            netconf_worker.as_mut(), *message,
+                        ).await;
+                        continue;
+                    }
+                    #[cfg(feature = "required-netconf-audit")]
+                    WorkerRequest::NetconfRunning(message) => {
+                        netconf_running::running_in_worker(
+                            netconf_worker.as_mut(), *message, snapshot.as_ref(),
+                            recovery.as_ref(), admission_limits.as_ref(), store.as_ref(),
+                            authorizer.as_ref(), Arc::clone(&impact_classifier), authority.as_ref(),
+                            pending_fire_at.is_some(),
+                            signal.as_ref().is_some_and(|signal| signal.is_draining()),
+                        ).await;
+                        continue;
+                    }
                     WorkerRequest::Reconcile {
                         source,
                         reply,
                     } => {
+                        #[cfg(feature = "required-netconf-audit")]
+                        if netconf_worker.as_ref().is_some_and(|worker| worker.has_unsettled()) {
+                            let _ = reply.send(Err(StoreError::unavailable(
+                                "original NETCONF publication requires recovery",
+                            )));
+                            continue;
+                        }
                         let Some(authority) = authority_port(authority.as_ref()) else {
                             let _ = reply.send(Err(StoreError::unavailable(
                                 "authoritative projection reconciliation requires a local authority port",
@@ -670,7 +772,17 @@ async fn worker_loop<C: OpcConfig>(
                     }
                 };
 
+                #[cfg(feature = "required-netconf-audit")]
+                if signal.as_ref().is_some_and(|signal| signal.is_draining()) {
+                    let _ = submission.reply.send(Err(CommitError::recovery_required("config worker is draining")));
+                    continue;
+                }
                 let has_pending = pending_fire_at.is_some();
+                #[cfg(feature = "required-netconf-audit")]
+                let has_unsettled_target = netconf_worker.as_ref()
+                    .is_some_and(|worker| worker.has_unsettled());
+                #[cfg(not(feature = "required-netconf-audit"))]
+                let has_unsettled_target = false;
 
                 let processed = AssertUnwindSafe(process_commit(
                     submission.request,
@@ -683,6 +795,7 @@ async fn worker_loop<C: OpcConfig>(
                     impact_classifier.clone(),
                     authority.as_ref(),
                     has_pending,
+                    has_unsettled_target,
                     &mut submission.required_audit,
                 ))
                 .catch_unwind()
@@ -885,6 +998,21 @@ async fn worker_loop<C: OpcConfig>(
             }
         }
     }
+    #[cfg(feature = "required-netconf-audit")]
+    {
+        let exit = match netconf_worker.as_mut() {
+            Some(worker) => AssertUnwindSafe(worker.finish_drain())
+                .catch_unwind()
+                .await
+                .unwrap_or(crate::netconf_audit::WorkerExit::RecoveryRequired),
+            None => crate::netconf_audit::WorkerExit::Drained,
+        };
+        if pending_fire_at.is_some() || recovery.reason().is_some() {
+            crate::netconf_audit::WorkerExit::RecoveryRequired
+        } else {
+            exit
+        }
+    }
 }
 
 async fn process_commit<C: OpcConfig>(
@@ -898,6 +1026,7 @@ async fn process_commit<C: OpcConfig>(
     impact_classifier: Arc<dyn ConfigImpactClassifier<C>>,
     authority: &Mutex<Option<Arc<dyn crate::ConfigAuthorityPort>>>,
     has_pending: bool,
+    has_unsettled_target: bool,
     required_audit: &mut Option<crate::required_audit::RequiredAuditSubmission>,
 ) -> Result<ProcessedCommit, CommitError> {
     if let Some(reason) = recovery.reason() {
@@ -1039,6 +1168,16 @@ async fn process_commit<C: OpcConfig>(
             // observed before the new-write path.
             if let Some(reason) = recovery.reason() {
                 return Err(CommitError::recovery_required(reason));
+            }
+
+            // An original target operation retained by this same worker must
+            // settle before new work. Exact persisted running replay above and
+            // read-only validation remain available; this local fence never
+            // replaces the authority's retained completion/debt checks.
+            if has_unsettled_target {
+                return Err(CommitError::recovery_required(
+                    "original NETCONF operation requires recovery",
+                ));
             }
 
             // After an exact replay miss, every new operation under retention
