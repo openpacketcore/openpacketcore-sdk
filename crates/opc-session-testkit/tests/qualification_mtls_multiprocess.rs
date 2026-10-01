@@ -2981,7 +2981,7 @@ impl InitializationStderrBoundary {
             {
                 return ChildStderrDiagnostic::Unavailable;
             }
-            starts_at_line = previous == [b'\n'];
+            starts_at_line = previous == *b"\n";
         }
         let mut bytes = Vec::with_capacity(length as usize);
         if file.take(length).read_to_end(&mut bytes).is_err() || bytes.len() as u64 != length {
