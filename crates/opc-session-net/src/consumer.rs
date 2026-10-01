@@ -1430,13 +1430,17 @@ pub struct PersistentSessionConsumerDiagnostics {
     pub completed_operations: u64,
     /// Completed physical operations with a confirmed response.
     pub completed_operation_successes: u64,
-    /// Completed operations proven not to have written an application frame.
+    /// Completed operations proven not to have been dispatched: no
+    /// application frame was written, or the server answered with a complete
+    /// `Rejected(Unavailable)`, a closed rejection that precedes the
+    /// consensus state machine.
     pub completed_operation_not_transmitted: u64,
     /// Effectful operations whose application frame may have been written.
     pub completed_operation_outcome_unknown: u64,
     /// Completed operations that were neither successful, proven-unsent, nor
-    /// effect-ambiguous (for example a confirmed rejection or a read failure
-    /// after an application frame).
+    /// effect-ambiguous (for example a confirmed scope, topology,
+    /// authorization or validation rejection, or a read failure after an
+    /// application frame).
     pub completed_operation_other_failures: u64,
     /// Completed failure outcomes unsafe for a caller to treat as
     /// conclusively unsent.  This is a direct counter, not a difference of
@@ -3959,12 +3963,41 @@ fn response_is_known_failure(response: &SessionConsumerResponse) -> bool {
     }
 }
 
+/// Return whether a complete closed rejection proves that the answering voter
+/// did not dispatch the request.
+///
+/// A [`SessionConsumerRejection`] is a closed rejection before an operation
+/// reaches the consensus state machine, and `Unavailable` means that the
+/// server could not dispatch the request within its bound. Under that
+/// contract, which the SDK's consensus quorum service upholds, the operation's
+/// own consensus intent was never submitted, so another voter of the same
+/// quorum may serve the identical request. Scope, topology, authorization and
+/// validation rejections are deterministic decisions and remain confirmed
+/// failures.
+const fn consumer_rejection_proves_not_dispatched(rejection: SessionConsumerRejection) -> bool {
+    match rejection {
+        SessionConsumerRejection::Unavailable => true,
+        SessionConsumerRejection::ScopeMismatch
+        | SessionConsumerRejection::TopologyMismatch
+        | SessionConsumerRejection::MalformedRequest
+        | SessionConsumerRejection::Unauthorized => false,
+    }
+}
+
 fn completed_operation_class(
     operation: &SessionConsumerOperation,
     response: &SessionConsumerResponse,
 ) -> PersistentCompletedOperationClass {
     if response_is_outcome_unknown(operation, response) {
         PersistentCompletedOperationClass::OutcomeUnknown
+    } else if matches!(
+        response,
+        SessionConsumerResponse::Rejected(rejection)
+            if consumer_rejection_proves_not_dispatched(*rejection)
+    ) {
+        // A closed pre-dispatch rejection is as conclusively unsent as an
+        // unwritten call frame, so it must not enter the unsafe aggregate.
+        PersistentCompletedOperationClass::NotTransmitted
     } else if response_is_known_failure(response) {
         PersistentCompletedOperationClass::OtherFailure
     } else {
@@ -17518,6 +17551,15 @@ impl PersistentPreparedCompareAndSetToken {
                     dispatch.terminal();
                     return Ok(PreparedCompareAndSetOutcome::Rejected(error));
                 }
+                Ok(SessionConsumerResponse::Rejected(rejection))
+                    if consumer_rejection_proves_not_dispatched(rejection) =>
+                {
+                    // The voter refused admission before the request reached
+                    // the consensus state machine. As for a pre-write
+                    // failure, the identical request moves to the next voter.
+                    self.state.not_transmitted();
+                    continue;
+                }
                 Ok(SessionConsumerResponse::Rejected(SessionConsumerRejection::ScopeMismatch)) => {
                     dispatch.terminal();
                     return Err(PreparedCompareAndSetExecuteError::TopologyAuthorityRevoked);
@@ -17790,16 +17832,23 @@ fn classify_prepared_lease_acquire_error(
 
 /// Complete wire rejections are known pre-dispatch outcomes. Keep their
 /// bounded typed classification separate from transport ambiguity.
+///
+/// `None` means that the voter proved it did not dispatch the acquire (see
+/// [`consumer_rejection_proves_not_dispatched`]), so the router moves the
+/// identical request to its next voter. Every other rejection is a terminal
+/// typed result.
 fn classify_prepared_lease_acquire_rejection(
     rejection: SessionConsumerRejection,
-) -> PreparedLeaseAcquireExecuteError {
+) -> Option<PreparedLeaseAcquireExecuteError> {
     match rejection {
+        SessionConsumerRejection::Unavailable => None,
         SessionConsumerRejection::ScopeMismatch | SessionConsumerRejection::TopologyMismatch => {
-            PreparedLeaseAcquireExecuteError::TopologyAuthorityRevoked
+            Some(PreparedLeaseAcquireExecuteError::TopologyAuthorityRevoked)
         }
-        SessionConsumerRejection::Unavailable => PreparedLeaseAcquireExecuteError::Unavailable,
         SessionConsumerRejection::Unauthorized | SessionConsumerRejection::MalformedRequest => {
-            PreparedLeaseAcquireExecuteError::Rejected(rejection_into_lease_error(rejection))
+            Some(PreparedLeaseAcquireExecuteError::Rejected(
+                rejection_into_lease_error(rejection),
+            ))
         }
     }
 }
@@ -17873,8 +17922,16 @@ impl PersistentPreparedLeaseAcquireToken {
                     }
                 }
                 Ok(SessionConsumerResponse::Rejected(rejection)) => {
+                    let Some(error) = classify_prepared_lease_acquire_rejection(rejection) else {
+                        // The voter refused admission before the acquire
+                        // reached the consensus state machine. As for a
+                        // pre-write failure, the identical request moves to
+                        // the next voter.
+                        self.state.not_transmitted();
+                        continue;
+                    };
                     dispatch.terminal();
-                    return Err(classify_prepared_lease_acquire_rejection(rejection));
+                    return Err(error);
                 }
                 Err(SessionConsumerCallError::BeforeCallWrite(
                     SessionConsumerClientError::Scope,
@@ -20975,15 +21032,16 @@ mod tests {
         consumer_fresh_admission_is_current, consumer_hello_rejection,
         consumer_operation_is_effectful, consumer_payload_fragments_exceed_frame,
         consumer_public_response_from_wire, consumer_rejection_into_client_error,
-        consumer_request_has_exact_fenced_transition_id, consumer_response_fits,
-        consumer_timeout_response, consumer_tls_setup_error, consumer_watch_error_is_legal,
-        consumer_wire_response_from_public, decode_consumer_frame_payload,
-        ensure_pre_request_budget_remaining, exact_correlation, fenced_transition_response,
-        lease_error_matches_operation, lease_mutation_status_matches_request,
-        lease_mutation_status_wire_matches_request, lease_response, mutation_response,
-        persistent_execute_error, persistent_roster_execute_error_for_request,
-        poll_persistent_consumer_setup_io, poll_persistent_reconnect_setup,
-        prepared_fenced_transition_execute_response, prepared_fenced_transition_status_response,
+        consumer_rejection_proves_not_dispatched, consumer_request_has_exact_fenced_transition_id,
+        consumer_response_fits, consumer_timeout_response, consumer_tls_setup_error,
+        consumer_watch_error_is_legal, consumer_wire_response_from_public,
+        decode_consumer_frame_payload, ensure_pre_request_budget_remaining, exact_correlation,
+        fenced_transition_response, lease_error_matches_operation,
+        lease_mutation_status_matches_request, lease_mutation_status_wire_matches_request,
+        lease_response, mutation_response, persistent_execute_error,
+        persistent_roster_execute_error_for_request, poll_persistent_consumer_setup_io,
+        poll_persistent_reconnect_setup, prepared_fenced_transition_execute_response,
+        prepared_fenced_transition_status_response,
         prepared_fenced_transition_status_retryable_before, prepared_router_roster_is_distinct,
         prepared_voter_index, publish_monotonic_shutdown_phase, queued_consumer_watch_stream,
         read_authenticated_consumer_frame_until, read_authenticated_consumer_frame_within,
@@ -21678,19 +21736,42 @@ mod tests {
     }
 
     #[test]
-    fn prepared_acquire_complete_wire_unavailable_is_typed_terminal() {
-        assert!(matches!(
-            classify_prepared_lease_acquire_rejection(SessionConsumerRejection::Unavailable),
-            PreparedLeaseAcquireExecuteError::Unavailable
-        ));
+    fn prepared_acquire_complete_wire_unavailable_rotates_and_other_rejections_are_terminal() {
+        assert!(
+            classify_prepared_lease_acquire_rejection(SessionConsumerRejection::Unavailable)
+                .is_none(),
+            "a closed pre-dispatch Unavailable rejection moves the acquire to the next voter"
+        );
         assert!(matches!(
             classify_prepared_lease_acquire_rejection(SessionConsumerRejection::Unauthorized),
-            PreparedLeaseAcquireExecuteError::Rejected(_)
+            Some(PreparedLeaseAcquireExecuteError::Rejected(_))
         ));
         assert!(matches!(
             classify_prepared_lease_acquire_rejection(SessionConsumerRejection::MalformedRequest),
-            PreparedLeaseAcquireExecuteError::Rejected(_)
+            Some(PreparedLeaseAcquireExecuteError::Rejected(_))
         ));
+        for rejection in [
+            SessionConsumerRejection::ScopeMismatch,
+            SessionConsumerRejection::TopologyMismatch,
+        ] {
+            assert!(matches!(
+                classify_prepared_lease_acquire_rejection(rejection),
+                Some(PreparedLeaseAcquireExecuteError::TopologyAuthorityRevoked)
+            ));
+        }
+        for rejection in [
+            SessionConsumerRejection::ScopeMismatch,
+            SessionConsumerRejection::TopologyMismatch,
+            SessionConsumerRejection::MalformedRequest,
+            SessionConsumerRejection::Unauthorized,
+            SessionConsumerRejection::Unavailable,
+        ] {
+            assert_eq!(
+                classify_prepared_lease_acquire_rejection(rejection).is_none(),
+                consumer_rejection_proves_not_dispatched(rejection),
+                "the acquire rotates exactly on the shared not-dispatched classification"
+            );
+        }
     }
 
     #[test]
@@ -36661,7 +36742,9 @@ mod tests {
             SessionConsumerResponse::FencedMutationRosterTerminalize(
                 SessionConsumerRosterTerminalMutationResponse::NotTransmitted,
             ),
-            SessionConsumerResponse::Rejected(SessionConsumerRejection::Unavailable),
+            // A closed Unavailable rejection is a not-transmitted completion;
+            // see `complete_unavailable_rejection_is_a_not_transmitted_completion`.
+            SessionConsumerResponse::Rejected(SessionConsumerRejection::ScopeMismatch),
         ];
 
         for response in failures {
