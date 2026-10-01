@@ -214,6 +214,22 @@ macro_rules! activation_failure {
     };
 }
 
+// Compile error observation out of ordinary builds instead of leaving an
+// identity error map after the diagnostic body has been removed.
+#[cfg(any(test, feature = "test-control"))]
+macro_rules! observe_activation_result {
+    ($stage:ident, $deadline:expr, $result:expr) => {
+        ($result).map_err(|error| activation_failure!($stage, $deadline, error))
+    };
+}
+
+#[cfg(not(any(test, feature = "test-control")))]
+macro_rules! observe_activation_result {
+    ($stage:ident, $deadline:expr, $result:expr) => {
+        $result
+    };
+}
+
 #[cfg(all(test, target_os = "linux"))]
 pub(crate) mod scoped_read_diagnostics;
 
@@ -7449,12 +7465,14 @@ impl ConsensusSessionStore {
         deadline: tokio::time::Instant,
         activation: CapabilityActivationKind,
     ) -> Result<(), StoreError> {
-        self.require_application_traffic_authority_before(deadline)
-            .await
-            .map_err(|error| activation_failure!(InitialAuthority, deadline, error))?;
-        let (scope_identity, _) = self
-            .current_scope()
-            .map_err(|error| activation_failure!(InitialScope, deadline, error))?;
+        observe_activation_result!(
+            InitialAuthority,
+            deadline,
+            self.require_application_traffic_authority_before(deadline)
+                .await
+        )?;
+        let (scope_identity, _) =
+            observe_activation_result!(InitialScope, deadline, self.current_scope())?;
         let request = ForwardMutationRequest {
             request_id: match activation {
                 CapabilityActivationKind::FencedTransitionV1 => {
@@ -7484,10 +7502,11 @@ impl ConsensusSessionStore {
         loop {
             let leader = match preferred.take() {
                 Some(leader) => leader,
-                None => self
-                    .wait_for_known_leader(deadline)
-                    .await
-                    .map_err(|error| activation_failure!(LeaderDiscovery, deadline, error))?,
+                None => observe_activation_result!(
+                    LeaderDiscovery,
+                    deadline,
+                    self.wait_for_known_leader(deadline).await
+                )?,
             };
             // Recovery authority is replica-local. Route discovery and every
             // route-refresh retry can await long enough for this follower to
@@ -7500,9 +7519,12 @@ impl ConsensusSessionStore {
                     .remote_forward_authority_gate
                     .wait_before_authority()
                     .await;
-                self.require_application_traffic_authority_before(deadline)
-                    .await
-                    .map_err(|error| activation_failure!(PreTransmitAuthority, deadline, error))?;
+                observe_activation_result!(
+                    PreTransmitAuthority,
+                    deadline,
+                    self.require_application_traffic_authority_before(deadline)
+                        .await
+                )?;
             }
             let reply = if leader == self.inner.local_node_id {
                 self.apply_on_local_leader(request.clone(), self.inner.local_node_id, deadline)
@@ -7536,9 +7558,11 @@ impl ConsensusSessionStore {
                         ));
                     }
                     Err(ConsensusPeerCallFailure::BeforeTransmission) => {
-                        self.wait_for_route_refresh(leader, deadline)
-                            .await
-                            .map_err(|error| activation_failure!(RouteRefresh, deadline, error))?;
+                        observe_activation_result!(
+                            RouteRefresh,
+                            deadline,
+                            self.wait_for_route_refresh(leader, deadline).await
+                        )?;
                         continue;
                     }
                 }
@@ -7552,14 +7576,14 @@ impl ConsensusSessionStore {
                         .map_err(|_| {
                             activation_failure!(AppliedIndex, deadline, consensus_unavailable())
                         })?;
-                    self.require_application_traffic_authority_before(deadline)
-                        .await
-                        .map_err(|error| {
-                            activation_failure!(PostApplyAuthority, deadline, error)
-                        })?;
-                    let (scope_identity, voters) = self
-                        .current_scope()
-                        .map_err(|error| activation_failure!(PostApplyScope, deadline, error))?;
+                    observe_activation_result!(
+                        PostApplyAuthority,
+                        deadline,
+                        self.require_application_traffic_authority_before(deadline)
+                            .await
+                    )?;
+                    let (scope_identity, voters) =
+                        observe_activation_result!(PostApplyScope, deadline, self.current_scope())?;
                     let activated = match activation {
                         CapabilityActivationKind::FencedTransitionV1 => {
                             self.inner
@@ -7591,8 +7615,9 @@ impl ConsensusSessionStore {
                                 )
                                 .await
                         }
-                    }
-                    .map_err(|error| activation_failure!(CertificateBackend, deadline, error))?;
+                    };
+                    let activated =
+                        observe_activation_result!(CertificateBackend, deadline, activated)?;
                     if activated {
                         return Ok(());
                     }
@@ -7616,15 +7641,19 @@ impl ConsensusSessionStore {
                         *candidate != leader && self.is_current_member(*candidate)
                     });
                     if preferred.is_none() {
-                        self.wait_for_route_refresh(leader, deadline)
-                            .await
-                            .map_err(|error| activation_failure!(RouteRefresh, deadline, error))?;
+                        observe_activation_result!(
+                            RouteRefresh,
+                            deadline,
+                            self.wait_for_route_refresh(leader, deadline).await
+                        )?;
                     }
                 }
                 ForwardMutationReply::Unavailable => {
-                    self.wait_for_route_refresh(leader, deadline)
-                        .await
-                        .map_err(|error| activation_failure!(RouteRefresh, deadline, error))?;
+                    observe_activation_result!(
+                        RouteRefresh,
+                        deadline,
+                        self.wait_for_route_refresh(leader, deadline).await
+                    )?;
                 }
                 ForwardMutationReply::OutcomeUnknown => {
                     return Err(activation_failure!(
