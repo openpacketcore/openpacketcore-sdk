@@ -35,6 +35,9 @@ pub use append_buffers::{AppendOwnerSample, AppendStage};
 pub mod raft_buffers;
 pub mod working_buffers;
 
+#[cfg(test)]
+mod phase_tests;
+
 type Allocations = BTreeMap<usize, usize>;
 
 fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
@@ -261,6 +264,72 @@ pub enum NativeStage {
     LedgerWrite,
 }
 
+/// Selected-request diagnostics only. Nested phases overlap and must not be summed.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[repr(usize)]
+pub enum NativePhase {
+    /// Authenticate the original audited effect.
+    EffectAuthentication,
+    /// Prepare and borrow the retained SQL row.
+    LedgerRowRead,
+    /// Validate scalar fields and all retained collection counts.
+    DecodePreflight,
+    /// Construct all retained owned collections.
+    DecodeCollections,
+    /// Count the canonical retained row before read authentication.
+    ReadCanonicalCount,
+    /// Stream and verify the retained row's canonical MAC.
+    ReadCanonicalMac,
+    /// Validate entries, original handles and derived operations.
+    LedgerValidation,
+    /// Independently validate signed continuity rows.
+    ContinuityValidation,
+    /// Validate the remaining sealed configuration, including retained outcomes.
+    ConfigurationValidation,
+    /// Validate each retained request outcome and its authentication.
+    RetainedOutcomeValidation,
+    /// Execute the original configuration effect.
+    EffectApplication,
+    /// Refresh authenticated configuration history after the effect.
+    HistoryRefresh,
+    /// Resolve the original operation and seal/validate its continuity.
+    LedgerResolution,
+    /// Count canonical output before allocating the one write buffer.
+    WriteCanonicalCount,
+    /// Reserve that exact output buffer.
+    WriteReserve,
+    /// Encode canonical output and its MAC into that buffer.
+    WriteCanonicalMac,
+}
+
+impl NativePhase {
+    /// Fixed number of diagnostic slots; no phase buffer grows during apply.
+    pub const COUNT: usize = Self::WriteCanonicalMac as usize + 1;
+}
+
+/// Scalar phase receipt. Contains no owner, payload, result or authenticator.
+#[derive(Clone, Copy, Debug)]
+pub struct NativePhaseSample {
+    /// Concrete selected-request work boundary.
+    pub phase: NativePhase,
+    /// Scope generation for interpreting repeated selected-request observations.
+    pub native_scope_entered_at: Instant,
+    /// Start of this phase, after observing an active selected native scope.
+    pub started_at: Instant,
+    /// End of this phase, before invoking the metadata callback.
+    pub finished_at: Instant,
+    /// Actual rows visited, where the phase provides a row count.
+    pub rows: usize,
+    /// Actual encoded bytes visited, where the phase provides a byte count.
+    pub bytes: usize,
+    /// Whether either scalar counter saturated; never silently wraps.
+    pub saturated: bool,
+    /// Whether the explicit end of the instrumented boundary was reached.
+    /// False includes early errors, early returns and unwinding.
+    /// This is diagnostic only and does not assert mutation or RPC success.
+    pub completed: bool,
+}
+
 /// One instant of real prepared/native capacities, before joining transport.
 /// Timing fields diagnose the capture path; they are not capacity sample instants.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -317,6 +386,9 @@ pub struct NativeOwnerSample {
 pub trait NativeOwnerObserver: Send + Sync {
     /// Join a current transport census here, before the borrowed owners can drop.
     fn observe(&self, sample: NativeOwnerSample);
+
+    /// Retain only bounded scalar diagnostics. No preparation barrier is held.
+    fn observe_phase(&self, _sample: NativePhaseSample) {}
 
     /// Join transport here while the original native append buffers are borrowed.
     /// This is a separate instant from an apply callback, never an added peak.
@@ -460,6 +532,77 @@ struct ActiveNative {
 }
 
 thread_local! { static NATIVE: RefCell<Option<ActiveNative>> = const { RefCell::new(None) }; }
+
+/// No owner retention: the guard records only the active request and timestamps.
+/// Inactive registrations return before reading the clock or walking any rows.
+pub(crate) struct NativePhaseGuard {
+    phase: NativePhase,
+    active: Option<(ConsensusRequestId, Instant, Instant)>,
+    rows: usize,
+    bytes: usize,
+    saturated: bool,
+}
+
+impl NativePhaseGuard {
+    pub(crate) fn start(phase: NativePhase) -> Self {
+        let active = NATIVE.with(|slot| {
+            slot.borrow()
+                .as_ref()
+                .map(|active| (active.shared.request, active.entered_at, Instant::now()))
+        });
+        Self {
+            phase,
+            active,
+            rows: 0,
+            bytes: 0,
+            saturated: false,
+        }
+    }
+
+    pub(crate) fn rows(&mut self, rows: usize, bytes: usize) {
+        if self.active.is_none() {
+            return;
+        }
+        self.saturated |=
+            self.rows.checked_add(rows).is_none() || self.bytes.checked_add(bytes).is_none();
+        self.rows = self.rows.saturating_add(rows);
+        self.bytes = self.bytes.saturating_add(bytes);
+    }
+
+    pub(crate) fn finish(mut self) {
+        self.publish(true);
+    }
+
+    fn publish(&mut self, completed: bool) {
+        let Some((request, native_scope_entered_at, started_at)) = self.active.take() else {
+            return;
+        };
+        let finished_at = Instant::now();
+        NATIVE.with(|slot| {
+            let active = slot.borrow();
+            if let Some(active) = active.as_ref().filter(|active| {
+                active.shared.request == request && active.entered_at == native_scope_entered_at
+            }) {
+                active.shared.observer.observe_phase(NativePhaseSample {
+                    phase: self.phase,
+                    native_scope_entered_at,
+                    started_at,
+                    finished_at,
+                    rows: self.rows,
+                    bytes: self.bytes,
+                    saturated: self.saturated,
+                    completed,
+                });
+            }
+        });
+    }
+}
+
+impl Drop for NativePhaseGuard {
+    fn drop(&mut self) {
+        self.publish(false);
+    }
+}
 
 pub(crate) struct NativeScope<'a> {
     shared: Arc<Shared>,

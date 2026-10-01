@@ -2,6 +2,10 @@
 //! and authentication behavior; this is not native WAL or a 32 MiB envelope.
 
 use super::*;
+
+#[path = "config_capacity_957_ledger_decode/reference.rs"]
+mod reference;
+
 use crate::audit_authority::continuity::AuditSigningKey;
 use crate::audit_authority::ledger::HandleBody;
 use crate::audit_authority::{
@@ -282,6 +286,15 @@ fn assert_overcount_refuses_before_owned_ledger(target: &str) {
     // unchanged logical/continuity validators reject them.
     let mut connection = database(&key, &stored);
     assert!(row(&connection).0.len() < MAX_STATE_BYTES);
+    for decode in [ledger_decode::decode, reference::decode] {
+        let probe = ledger_decode::decode_probe::Guard::start(None);
+        assert!(decode(&row(&connection).0).is_err());
+        let measured = probe.finish();
+        assert_eq!(measured.preflight_passes, 1);
+        assert_eq!(measured.owned_passes, 0);
+        assert_eq!(measured.reserve_calls, 0);
+        assert_eq!(measured.constructed_elements, 0);
+    }
     let measured = reject_without_effects(&mut connection, &key, &keys, stored.identity);
     assert_eq!(measured.reads, 1);
     assert_eq!(
@@ -476,6 +489,7 @@ fn config_capacity_957_retained_decode_preserves_accepted_json_forms() {
         serde_json::to_vec(&sequence).expect("sequence representation"),
         serde_json::to_vec(&extended).expect("ignored extension"),
     ] {
+        assert_decoder_parity(&encoded);
         let previous: StoredLedger =
             serde_json::from_slice(&encoded).expect("previous derived decoder accepts this form");
         assert!(previous.ledger == stored.ledger && previous.identity == stored.identity);
@@ -496,6 +510,182 @@ fn config_capacity_957_retained_decode_preserves_accepted_json_forms() {
         assert!(
             row(&connection) == before,
             "compatible read does not canonicalize storage"
+        );
+    }
+}
+
+fn assert_decoder_parity(encoded: &[u8]) -> StoredLedger {
+    let old = reference::decode(encoded).expect("previous bounded decoder accepts form");
+    let current = ledger_decode::decode(encoded).expect("single owned pass accepts form");
+    assert!(old.identity == current.identity && old.ledger == current.ledger);
+    assert_eq!(
+        serde_json::to_vec(&old).expect("old canonical form"),
+        serde_json::to_vec(&current).expect("current canonical form"),
+        "exact canonical bytes, including every original signed entry and handle"
+    );
+    current
+}
+
+#[test]
+fn config_capacity_957_retained_decode_single_pass_parity() {
+    for operations in [0, 1, 3, 1024] {
+        let (_, _, mut stored) = fixture(operations, if operations == 1024 { 8 } else { 1 });
+        for continuity in [true, false] {
+            if !continuity {
+                stored.ledger.as_mut().expect("active ledger").continuity = None;
+            }
+            let encoded = serde_json::to_vec(&stored).expect("real bounded history");
+            let current = assert_decoder_parity(&encoded);
+            assert!(current.identity == stored.identity && current.ledger == stored.ledger);
+            let pretty = serde_json::to_vec_pretty(&stored).expect("accepted whitespace");
+            assert_decoder_parity(&pretty);
+            // serde_json::Value sorts map keys, putting continuity before the
+            // other arrays. The owned seed must not depend on canonical order.
+            let reordered: serde_json::Value = serde_json::from_slice(&encoded).unwrap();
+            assert_decoder_parity(&serde_json::to_vec(&reordered).unwrap());
+        }
+        stored.ledger = None;
+        assert_decoder_parity(&serde_json::to_vec(&stored).unwrap());
+    }
+}
+
+#[test]
+fn config_capacity_957_retained_decode_single_pass_collection_boundaries() {
+    let (_, _, source) = fixture(3, 1);
+    for (events, operations) in [(0, 0), (1, 1), (4096, 1024)] {
+        let mut stored = StoredLedger {
+            identity: source.identity,
+            ledger: source.ledger.clone(),
+        };
+        let ledger = stored.ledger.as_mut().unwrap();
+        // These are structural decoder boundaries, not invented valid ledger
+        // histories. Independent logical/authentication validation is unchanged.
+        ledger.entries.resize(events, ledger.entries[0].clone());
+        ledger
+            .operations
+            .resize(operations, ledger.operations[0].clone());
+        let rows = &mut ledger.continuity.as_mut().unwrap().rows;
+        rows.resize(events, rows[0].clone());
+        let current = assert_decoder_parity(&serde_json::to_vec(&stored).unwrap());
+        let ledger = current.ledger.unwrap();
+        assert_eq!(ledger.entries.capacity(), events);
+        assert_eq!(ledger.operations.capacity(), operations);
+        assert_eq!(ledger.continuity.unwrap().rows.capacity(), events);
+    }
+}
+
+#[test]
+fn config_capacity_957_retained_decode_single_pass_traversal() {
+    let (_, _, mut stored) = fixture(3, 2);
+    for continuity in [true, false] {
+        if !continuity {
+            stored.ledger.as_mut().expect("active ledger").continuity = None;
+        }
+        let encoded = serde_json::to_vec(&stored).unwrap();
+        let ledger = stored.ledger.as_ref().unwrap();
+        let elements = ledger.entries.len()
+            + ledger.operations.len()
+            + ledger
+                .continuity
+                .as_ref()
+                .map_or(0, |chain| chain.rows.len());
+        let probe = ledger_decode::decode_probe::Guard::start(None);
+        let current = ledger_decode::decode(&encoded).expect("real production decoder");
+        let measured = probe.finish();
+        assert!(current.ledger == stored.ledger);
+        assert_eq!(measured.preflight_passes, 1);
+        assert_eq!(
+            measured.owned_passes, 1,
+            "LEDGER_SINGLE_OWNED_PASS: construct every owned collection in one traversal"
+        );
+        assert_eq!(measured.traversed_input_bytes, encoded.len() * 2);
+        assert_eq!(measured.reserve_calls, if continuity { 3 } else { 2 });
+        assert_eq!(measured.requested_elements, elements);
+        assert_eq!(measured.constructed_elements, elements);
+        assert!(!measured.allocation_fault_injected);
+        let probe = ledger_decode::decode_probe::Guard::start(None);
+        let old = reference::decode(&encoded).expect("real previous decoder control");
+        let control = probe.finish();
+        assert!(old.ledger == current.ledger);
+        assert_eq!(control.preflight_passes, 1);
+        assert_eq!(control.owned_passes, if continuity { 3 } else { 2 });
+        assert_eq!(control.reserve_calls, measured.reserve_calls);
+        assert_eq!(control.requested_elements, measured.requested_elements);
+        assert_eq!(control.constructed_elements, measured.constructed_elements);
+        assert_eq!(
+            control.traversed_input_bytes,
+            encoded.len() * (control.owned_passes + 1)
+        );
+        println!("CONFIG_CAPACITY_LEDGER_SINGLE_PASS continuity={continuity} bytes={} current_passes={} reference_passes={} requested_elements={elements} constructed_elements={} parity=true", encoded.len(), measured.preflight_passes + measured.owned_passes, control.preflight_passes + control.owned_passes, measured.constructed_elements);
+    }
+}
+
+#[test]
+fn config_capacity_957_retained_decode_single_pass_adversarial_parity() {
+    let (_, _, stored) = fixture(3, 1);
+    let encoded = serde_json::to_vec(&stored).unwrap();
+    let text = String::from_utf8(encoded.clone()).unwrap();
+    let mut malformed = vec![
+        format!("{text} null").into_bytes(),
+        text.replacen("\"ledger\":", "\"ledger\":null,\"ledger\":", 1)
+            .into_bytes(),
+        text.replacen("\"entries\":", "\"entries\":[],\"entries\":", 1)
+            .into_bytes(),
+        text.replacen("\"rows\":", "\"rows\":[],\"rows\":", 1)
+            .into_bytes(),
+        text.replacen("\"version\":1", "\"version\":65536", 1)
+            .into_bytes(),
+        text.replacen("\"intent\":", "\"unknown-payload\":", 1)
+            .into_bytes(),
+        text.replacen("\"operations\":", "\"unexpected\":", 1)
+            .into_bytes(),
+    ];
+    for end in [0, 1, encoded.len() / 2, encoded.len() - 1] {
+        malformed.push(encoded[..end].to_vec());
+    }
+    for field in ["entries", "operations"] {
+        for value in [
+            serde_json::Value::Null,
+            serde_json::json!({}),
+            serde_json::json!([null]),
+        ] {
+            let mut changed: serde_json::Value = serde_json::from_slice(&encoded).unwrap();
+            changed["ledger"][field] = value;
+            malformed.push(serde_json::to_vec(&changed).unwrap());
+        }
+    }
+    for bytes in malformed {
+        assert_ne!(bytes, encoded, "malformed control must alter the real row");
+        let old = reference::decode(&bytes)
+            .err()
+            .expect("previous decoder must reject");
+        let current = ledger_decode::decode(&bytes)
+            .err()
+            .expect("current decoder must reject");
+        assert_eq!(old.kind(), current.kind());
+    }
+}
+
+#[test]
+fn config_capacity_957_retained_decode_single_pass_allocation_failure() {
+    let (key, keys, stored) = fixture(3, 1);
+    let mut connection = database(&key, &stored);
+    for fail_after in 0..3 {
+        let before = row(&connection);
+        let probe = ledger_decode::decode_probe::Guard::start(Some(fail_after));
+        reject_without_effects(&mut connection, &key, &keys, stored.identity);
+        let measured = probe.finish();
+        assert!(
+            measured.allocation_fault_injected,
+            "actual try_reserve_exact refusal"
+        );
+        assert_eq!(measured.reserve_calls, fail_after + 1);
+        assert_eq!(measured.constructed_elements, [0, 9, 12][fail_after]);
+        assert!(row(&connection) == before);
+        assert!(
+            read_with_keys_sync(&connection, &key, Some(&keys), stored.identity)
+                .expect("original signed row still authenticates")
+                == stored.ledger
         );
     }
 }

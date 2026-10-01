@@ -156,6 +156,10 @@ pub(super) fn validate(
     profile: ConfigCapacityProfile,
     cancellation: &SqliteWorkCancellation,
 ) -> io::Result<()> {
+    #[cfg(feature = "dangerous-test-hooks")]
+    let mut phase = crate::consensus::capacity_observation::NativePhaseGuard::start(
+        crate::consensus::capacity_observation::NativePhase::RetainedOutcomeValidation,
+    );
     let current_sequence = current_sequence(conn, identity)?;
     let mut statement = conn
         .prepare("SELECT request_id, configuration_epoch, applied_sequence, payload_digest, response_json FROM config_raft_request_outcomes")
@@ -164,6 +168,8 @@ pub(super) fn validate(
     let mut count = 0_u64;
     while let Some(row) = rows.next().map_err(db_error)? {
         cancellation.check_io()?;
+        #[cfg(feature = "dangerous-test-hooks")]
+        phase.rows(1, 0);
         count += 1;
         if count > CONFIG_CONSENSUS_RETAINED_REQUEST_OUTCOMES {
             return Err(invalid());
@@ -177,16 +183,15 @@ pub(super) fn validate(
             return Err(invalid());
         }
         let digest: [u8; 32] = row_blob(row, 3)?.try_into().map_err(|_| invalid())?;
+        let encoded = row_blob(row, 4)?;
+        #[cfg(feature = "dangerous-test-hooks")]
+        phase.rows(0, encoded.len());
         decode(
-            row_blob(row, 4)?,
-            key,
-            identity,
-            profile,
-            request_id,
-            &digest,
-            sequence,
+            encoded, key, identity, profile, request_id, &digest, sequence,
         )?;
     }
+    #[cfg(feature = "dangerous-test-hooks")]
+    phase.finish();
     Ok(())
 }
 

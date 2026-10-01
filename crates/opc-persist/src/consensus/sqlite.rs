@@ -3313,14 +3313,20 @@ fn apply_audited_mutation_sync(
     request_id: opc_consensus::ConsensusRequestId,
     cancellation: &SqliteWorkCancellation,
 ) -> io::Result<Result<(), ConfigMutationFailure>> {
+    #[cfg(feature = "dangerous-test-hooks")]
+    use super::capacity_observation::{NativePhase, NativePhaseGuard};
     use crate::audit_authority::AuditOperationState;
     #[cfg(feature = "dangerous-test-hooks")]
     let _capacity_native_scope =
         super::capacity_observation::NativeScope::start(conn, request_id, prepared);
     let invalid = || invalid_data("invalid audited configuration mutation");
+    #[cfg(feature = "dangerous-test-hooks")]
+    let effect_phase = NativePhaseGuard::start(NativePhase::EffectAuthentication);
     if prepared.verify_effect(key).is_err() {
         return Ok(Err(ConfigMutationFailure::InvalidInput));
     }
+    #[cfg(feature = "dangerous-test-hooks")]
+    effect_phase.finish();
     let Some(mut ledger) = super::audit::read_with_keys_sync(conn, key, audit_keys, identity)?
     else {
         return Ok(Err(ConfigMutationFailure::InvalidInput));
@@ -3368,6 +3374,8 @@ fn apply_audited_mutation_sync(
     // validation, exact identity and continuity checks in this SQL transaction.
     // Validate the remaining sealed state without decoding a second ledger
     // while the original must remain live for the atomic outcome below.
+    #[cfg(feature = "dangerous-test-hooks")]
+    let configuration_phase = NativePhaseGuard::start(NativePhase::ConfigurationValidation);
     validate_sealed_configuration_for_profile_sync(
         conn,
         identity,
@@ -3375,6 +3383,8 @@ fn apply_audited_mutation_sync(
         capacity_profile,
         cancellation,
     )?;
+    #[cfg(feature = "dangerous-test-hooks")]
+    configuration_phase.finish();
     let current_version: u64 = conn
         .query_row(
             "SELECT COALESCE(MAX(version),0) FROM config_history",
@@ -3388,6 +3398,8 @@ fn apply_audited_mutation_sync(
     conn.execute_batch("SAVEPOINT audited_config_effect")
         .map_err(db_error)?;
     let updates = prepared.effect.updates_existing_records();
+    #[cfg(feature = "dangerous-test-hooks")]
+    let effect_phase = NativePhaseGuard::start(NativePhase::EffectApplication);
     let mut result = if live {
         execute_audited_effect_sync(
             conn,
@@ -3403,8 +3415,14 @@ fn apply_audited_mutation_sync(
     } else {
         Err(ConfigMutationFailure::Conflict)
     };
+    #[cfg(feature = "dangerous-test-hooks")]
+    effect_phase.finish();
     if result.is_ok() {
+        #[cfg(feature = "dangerous-test-hooks")]
+        let history_phase = NativePhaseGuard::start(NativePhase::HistoryRefresh);
         result = super::history::refresh_sync(conn, key, updates, cancellation)?;
+        #[cfg(feature = "dangerous-test-hooks")]
+        history_phase.finish();
     }
     if result.is_err() {
         conn.execute_batch("ROLLBACK TO audited_config_effect")
@@ -3426,6 +3444,8 @@ fn apply_audited_mutation_sync(
     } else {
         AuditOperationState::Rejected
     };
+    #[cfg(feature = "dangerous-test-hooks")]
+    let resolution_phase = NativePhaseGuard::start(NativePhase::LedgerResolution);
     ledger
         .resolve(key, &prepared.handle, state)
         .map_err(|_| invalid())?;
@@ -3433,6 +3453,8 @@ fn apply_audited_mutation_sync(
     ledger
         .validate_continuity(audit_keys)
         .map_err(|_| invalid())?;
+    #[cfg(feature = "dangerous-test-hooks")]
+    resolution_phase.finish();
     #[cfg(test)]
     drop(observed_ledger);
     super::audit::write_sync(conn, key, identity, Some(ledger), false)?;

@@ -57,6 +57,9 @@ struct StoredLedger {
 
 mod ledger_decode;
 
+#[cfg(feature = "dangerous-test-hooks")]
+use super::capacity_observation::{NativePhase, NativePhaseGuard};
+
 fn invalid() -> io::Error {
     io::Error::new(
         io::ErrorKind::InvalidData,
@@ -215,13 +218,34 @@ fn stream_state(
 }
 
 fn encode_state(stored: &StoredLedger, key: &AuditKey) -> io::Result<(Vec<u8>, [u8; 32])> {
+    #[cfg(feature = "dangerous-test-hooks")]
+    let mut count_phase = NativePhaseGuard::start(NativePhase::WriteCanonicalCount);
     let length = canonical_state_len(stored)?;
+    #[cfg(feature = "dangerous-test-hooks")]
+    {
+        count_phase.rows(1, length);
+        count_phase.finish();
+    }
+    #[cfg(feature = "dangerous-test-hooks")]
+    let mut reserve_phase = NativePhaseGuard::start(NativePhase::WriteReserve);
     let mut encoded = Vec::new();
     encoded.try_reserve_exact(length).map_err(|_| invalid())?;
+    #[cfg(feature = "dangerous-test-hooks")]
+    {
+        reserve_phase.rows(1, length);
+        reserve_phase.finish();
+    }
     #[cfg(test)]
     let _observed_encoding =
         super::config_capacity_simultaneous_working_tests::ledger::encoding(&encoded);
+    #[cfg(feature = "dangerous-test-hooks")]
+    let mut mac_phase = NativePhaseGuard::start(NativePhase::WriteCanonicalMac);
     let mac = stream_state(stored, key, length, Some(&mut encoded))?;
+    #[cfg(feature = "dangerous-test-hooks")]
+    {
+        mac_phase.rows(1, length);
+        mac_phase.finish();
+    }
     Ok((encoded, mac.finalize().into_bytes().into()))
 }
 
@@ -254,12 +278,26 @@ pub(crate) fn read_with_keys_sync(
 ) -> io::Result<Option<LedgerState>> {
     let ledger = read_sync(conn, key, identity)?;
     if let Some(ledger) = &ledger {
+        #[cfg(feature = "dangerous-test-hooks")]
+        let mut phase = NativePhaseGuard::start(NativePhase::ContinuityValidation);
+        #[cfg(feature = "dangerous-test-hooks")]
+        phase.rows(
+            ledger
+                .continuity
+                .as_ref()
+                .map_or(0, |chain| chain.rows.len()),
+            0,
+        );
         ledger.validate_continuity(keys).map_err(|_| invalid())?;
+        #[cfg(feature = "dangerous-test-hooks")]
+        phase.finish();
     }
     Ok(ledger)
 }
 
 fn read_verified_sync(conn: &Connection, key: &AuditKey) -> io::Result<StoredLedger> {
+    #[cfg(feature = "dangerous-test-hooks")]
+    let mut row_phase = NativePhaseGuard::start(NativePhase::LedgerRowRead);
     let mut statement = conn.prepare(
         "SELECT state_json, state_hmac FROM config_raft_management_audit WHERE singleton = 1 AND length(state_json) BETWEEN 1 AND 16777216 AND length(state_hmac) = 32",
     ).map_err(|_| invalid())?;
@@ -269,6 +307,11 @@ fn read_verified_sync(conn: &Connection, key: &AuditKey) -> io::Result<StoredLed
     let encoded = encoded.as_blob().map_err(|_| invalid())?;
     let mac = row.get_ref(1).map_err(|_| invalid())?;
     let mac = mac.as_blob().map_err(|_| invalid())?;
+    #[cfg(feature = "dangerous-test-hooks")]
+    {
+        row_phase.rows(1, encoded.len());
+        row_phase.finish();
+    }
     #[cfg(test)]
     let observed_row =
         super::config_capacity_simultaneous_working_tests::ledger::borrowed_read(encoded);
@@ -284,10 +327,24 @@ fn read_verified_sync(conn: &Connection, key: &AuditKey) -> io::Result<StoredLed
     #[cfg(test)]
     let observed_read =
         super::config_capacity_simultaneous_working_tests::ledger::decoded(stored.ledger.as_ref());
+    #[cfg(feature = "dangerous-test-hooks")]
+    let mut count_phase = NativePhaseGuard::start(NativePhase::ReadCanonicalCount);
     let length = canonical_state_len(&stored)?;
+    #[cfg(feature = "dangerous-test-hooks")]
+    {
+        count_phase.rows(1, length);
+        count_phase.finish();
+    }
+    #[cfg(feature = "dangerous-test-hooks")]
+    let mut mac_phase = NativePhaseGuard::start(NativePhase::ReadCanonicalMac);
     stream_state(&stored, key, length, None)?
         .verify_slice(mac)
         .map_err(|_| invalid())?;
+    #[cfg(feature = "dangerous-test-hooks")]
+    {
+        mac_phase.rows(1, length);
+        mac_phase.finish();
+    }
     // Canonical authentication is complete. End the immutable row borrow and
     // finalize its statement before validation derives operations. The caller's
     // connection/transaction still owns the complete read and identity check.
@@ -296,9 +353,15 @@ fn read_verified_sync(conn: &Connection, key: &AuditKey) -> io::Result<StoredLed
     drop(rows);
     drop(statement);
     if let Some(ledger) = &stored.ledger {
+        #[cfg(feature = "dangerous-test-hooks")]
+        let mut phase = NativePhaseGuard::start(NativePhase::LedgerValidation);
+        #[cfg(feature = "dangerous-test-hooks")]
+        phase.rows(ledger.entries.len(), 0);
         ledger
             .validate(key, stored.identity)
             .map_err(|_| invalid())?;
+        #[cfg(feature = "dangerous-test-hooks")]
+        phase.finish();
     }
     let identity = stored.identity;
     let matches: bool = conn.query_row(

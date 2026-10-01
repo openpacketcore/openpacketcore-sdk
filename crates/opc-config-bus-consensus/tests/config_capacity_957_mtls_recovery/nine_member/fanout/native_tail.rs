@@ -13,7 +13,8 @@
 use super::*;
 use opc_persist::config_capacity_observation::raft_buffers::AllocationView;
 use opc_persist::config_capacity_observation::{
-    AppendOwnerSample, NativeOwnerObserver, NativeOwnerSample, NativeStage, PreparationCensus,
+    AppendOwnerSample, NativeOwnerObserver, NativeOwnerSample, NativePhase, NativePhaseSample,
+    NativeStage, PreparationCensus,
 };
 
 const HELD_TAILS: usize = 4;
@@ -94,6 +95,10 @@ struct NativeResults {
     missing_views: usize,
     request: Option<opc_consensus::ConsensusRequestId>,
     request_changed: bool,
+    phases: [Option<NativePhaseSample>; NativePhase::COUNT],
+    phase_counts: [usize; NativePhase::COUNT],
+    phase_incomplete: [usize; NativePhase::COUNT],
+    phase_counts_saturated: bool,
 }
 
 // The bridge owns only numeric ledgers and scheduling controls. Native and
@@ -199,6 +204,21 @@ impl NativeTail {
                 .as_micros()
         };
         let results = self.results.lock().unwrap();
+        // Preserve small receipts even if the original completion assertion
+        // fails. The original rich shape assertions remain below, unchanged.
+        for (stage_index, checkpoint) in results.samples.iter().enumerate() {
+            if let Some(checkpoint) = checkpoint {
+                let sample = checkpoint.native;
+                println!("CONFIG_CAPACITY_NINE_NATIVE_FOUR_TAIL_SCALAR stage_index={stage_index} present=true callbacks={} entries={} operations={} continuity_rows={} entries_capacity={} operations_capacity={} rows_capacity={} command_bytes={} ledger_bytes={} derived_bytes={} write_bytes={} wires_observed={} wire_allocations={} successful_quorum_calls={} native_is_distinct={} diagnostic_only=true", results.counts[stage_index], sample.native_ledger_entries, sample.native_ledger_operations, sample.native_continuity_rows, sample.native_ledger_capacities[0], sample.native_ledger_capacities[1], sample.native_ledger_capacities[2], sample.native_command_bytes, sample.native_ledger_bytes, sample.native_derived_bytes, sample.native_write_bytes, checkpoint.wires.len(), checkpoint.wire_allocations, checkpoint.successful_quorum_calls.len(), sample.native_is_distinct);
+            } else {
+                println!("CONFIG_CAPACITY_NINE_NATIVE_FOUR_TAIL_SCALAR stage_index={stage_index} present=false callbacks={} diagnostic_only=true", results.counts[stage_index]);
+            }
+        }
+        for (phase_index, phase) in results.phases.iter().enumerate() {
+            if let Some(phase) = phase {
+                println!("CONFIG_CAPACITY_NINE_NATIVE_PHASE phase_index={phase_index} phase={:?} occurrences={} incomplete={} native_scope_entered_us={} started_us={} finished_us={} rows={} bytes={} saturated={} completed={} first_occurrence=true nested_durations=true origin=gate_arm diagnostic_only=true", phase.phase, results.phase_counts[phase_index], results.phase_incomplete[phase_index], micros(phase.native_scope_entered_at), micros(phase.started_at), micros(phase.finished_at), phase.rows, phase.bytes, phase.saturated || results.phase_counts_saturated, phase.completed);
+            }
+        }
         // Four fixed stages, including a callback without a valid owner view.
         // Print before completion assertions so failed original calls retain it.
         for (stage_index, timing) in results.timings.iter().enumerate() {
@@ -221,6 +241,21 @@ impl NativeTail {
 }
 
 impl NativeOwnerObserver for NativeTail {
+    fn observe_phase(&self, sample: NativePhaseSample) {
+        // Fixed slots and one existing metadata mutex. No gate/owner lock,
+        // payload capture, allocation, printing, or per-outcome callback.
+        let mut results = self.results.lock().unwrap();
+        let index = sample.phase as usize;
+        results.phase_counts_saturated |= results.phase_counts[index] == usize::MAX;
+        results.phase_counts[index] = results.phase_counts[index].saturating_add(1);
+        if !sample.completed {
+            results.phase_incomplete[index] = results.phase_incomplete[index].saturating_add(1);
+        }
+        if results.phases[index].is_none() {
+            results.phases[index] = Some(sample);
+        }
+    }
+
     fn observe_append(&self, sample: AppendOwnerSample) {
         let mut results = self.results.lock().unwrap();
         if results
@@ -415,6 +450,10 @@ pub(super) async fn run(history: AuditHistory) {
         .await
         .unwrap();
     gate.arm(leader_id);
+    let completion_origin = gate.state.lock().unwrap().epoch.unwrap().into_std();
+    let completion_registration = stores[leader]
+        .observe_capacity_completion_for_test(&prepared, completion_origin)
+        .expect("bounded selected-request completion observer");
     let (result, checkpoint, ready, recovery, after_return, released_in_time, settled) =
         tokio::task::block_in_place(|| {
             std::thread::scope(|scope| {
@@ -591,6 +630,7 @@ pub(super) async fn run(history: AuditHistory) {
         store.shutdown().await.unwrap();
     }
     all_handlers_released(released).await;
+    let completion_diagnostics = completion_registration.finish();
     drop(stores);
     for address in &addresses {
         *address.write().unwrap() = None;
@@ -618,6 +658,16 @@ pub(super) async fn run(history: AuditHistory) {
     println!("CONFIG_CAPACITY_NINE_NATIVE_FOUR_TAIL_LIFECYCLE members=9 prepared=72 original_calls=8 remote_quorum_successes=4 held_rpc_tails=4 audited_commits=1 exact_readback=true original_handle=true original_paths=true joined_shutdown=true actual_encoder_joined=true caller_recovery_bytes={caller_recovery_bytes} full_memory_bound=false");
     gate.print_diagnostics(shutdown_entered_us);
     native.print_diagnostics();
+    if let Some(snapshot) = &completion_diagnostics {
+        println!("CONFIG_CAPACITY_NINE_NATIVE_COMPLETION_METADATA present=true events={} omitted={} cutoff_us={} origin=gate_arm diagnostic_only=true", snapshot.events.len(), snapshot.omitted, snapshot.cutoff_us);
+        for event in &snapshot.events {
+            println!("CONFIG_CAPACITY_NINE_NATIVE_COMPLETION_PHASE phase={:?} at_us={} index={:?} deadline_us={:?} origin=gate_arm diagnostic_only=true", event.phase, event.at_us, event.index, event.deadline_us);
+        }
+    } else {
+        println!(
+            "CONFIG_CAPACITY_NINE_NATIVE_COMPLETION_METADATA present=false diagnostic_only=true"
+        );
+    }
     assert!(gate.drained());
     assert!(drained.calls.is_empty() && drained.origins.is_empty() && drained.issues.complete());
     assert!(detached.calls.is_empty() && detached.origins.is_empty() && detached.issues.complete());
