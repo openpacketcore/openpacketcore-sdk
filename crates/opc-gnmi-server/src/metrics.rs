@@ -7,11 +7,19 @@ use opc_redaction::metrics::{metrics_label_safe, LatencyHistogram, METRICS};
 
 /// Records a failed terminal audit write without request or principal labels.
 pub(crate) fn record_terminal_audit_failure() {
-    let _ = METRICS.gnmi_terminal_audit_failures_total.fetch_update(
-        std::sync::atomic::Ordering::Relaxed,
-        std::sync::atomic::Ordering::Relaxed,
-        |current| Some(current.saturating_add(1)),
-    );
+    let counter = &METRICS.gnmi_terminal_audit_failures_total;
+    let mut current = counter.load(std::sync::atomic::Ordering::Relaxed);
+    loop {
+        match counter.compare_exchange_weak(
+            current,
+            current.saturating_add(1),
+            std::sync::atomic::Ordering::Relaxed,
+            std::sync::atomic::Ordering::Relaxed,
+        ) {
+            Ok(_) => break,
+            Err(observed) => current = observed,
+        }
+    }
 }
 
 /// Low-cardinality gNMI RPC labels.
