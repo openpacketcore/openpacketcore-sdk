@@ -437,6 +437,10 @@ fn retained_validation_comparison_work_is_bounded() {
         "production comparisons must be observed"
     );
     assert!(indexed.comparisons <= 128 * 1024, "LEDGER_VALIDATION_INDEX_WORK: sorting and lookup must not scan every prior operation: {indexed:?}");
+    assert_eq!(
+        indexed.outcome_entry_visits, 1024,
+        "LEDGER_VALIDATION_OUTCOME_LOOKUP_WORK: each Outcome must visit only its original entry"
+    );
     assert_eq!(indexed.reserves, 1);
     assert_eq!(indexed.intents, 1024);
     assert_eq!(indexed.capacity, 1024);
@@ -445,7 +449,9 @@ fn retained_validation_comparison_work_is_bounded() {
     assert_eq!(indexed.live_indexes, 0);
     writeln!(std::io::stdout().lock(), "LEDGER_VALIDATION_INDEX_COST {}", serde_json::json!({
         "operations": 1024, "rows": 3072, "indexed_comparisons": indexed.comparisons,
-        "original_comparisons": original.comparisons, "indexed_ns": indexed_elapsed.as_nanos(),
+        "original_comparisons": original.comparisons,
+        "outcome_entry_visits": indexed.outcome_entry_visits,
+        "indexed_ns": indexed_elapsed.as_nanos(),
         "original_ns": original_elapsed.as_nanos(), "index_capacity": indexed.capacity,
         "index_heap_bytes": indexed.heap_bytes, "bitmap_bytes": indexed.bitmap_bytes,
         "entry_capacity": ledger.entries.capacity(), "operation_capacity": ledger.operations.capacity(),

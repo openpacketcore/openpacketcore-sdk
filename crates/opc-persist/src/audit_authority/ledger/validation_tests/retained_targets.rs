@@ -115,6 +115,7 @@ fn indexed_validation_retained_payloads_share_authenticated_prefix_ordinals() {
         .expect("LEDGER_VALIDATION_RETAINED_ORDINALS");
     let counts = probe.counts();
     assert_eq!(counts.intents, 4);
+    assert_eq!(counts.outcome_entry_visits, 3);
     assert_eq!(counts.capacity, 4);
     assert_eq!(counts.reserves, 1);
     assert_eq!(counts.live_indexes, 0);
@@ -158,36 +159,45 @@ fn indexed_validation_retained_payloads_share_authenticated_prefix_ordinals() {
 
 #[test]
 fn indexed_validation_retained_payloads_detect_cross_variant_duplicate_requests() {
-    let target = target(1);
-    let payloads = [
-        EntryPayload::Intent(Box::new(handle(1, ManagementAuditOutcomeCode::Intent))),
-        EntryPayload::TargetIntent(Box::new(RetainedTargetIntent {
-            handle: target.handle().clone(),
-            recovery: Arc::new(
-                String::from_utf8(
-                    target
-                        .command()
-                        .encode_retained(&key(), identity())
-                        .unwrap(),
-                )
-                .unwrap(),
-            ),
-        })),
-        EntryPayload::EmptyCommit(Box::new(empty_commit(1))),
-    ];
-    for first in &payloads {
-        for second in &payloads {
-            let mut ledger = empty();
-            ledger.continuity = Some(ContinuityState::new(1));
-            ledger.append(&key(), first.clone()).unwrap();
-            ledger.append(&key(), second.clone()).unwrap();
+    let mut fixtures = [empty(), empty(), empty()];
+    for ledger in &mut fixtures {
+        ledger.continuity = Some(ContinuityState::new(1));
+    }
+    fixtures[0]
+        .admit(&key(), &handle(1, ManagementAuditOutcomeCode::Intent), 110)
+        .unwrap();
+    fixtures[1]
+        .admit_target(&key(), target(1).command(), 110)
+        .unwrap();
+    fixtures[2]
+        .admit_empty_commit(&key(), &empty_commit(1), 110)
+        .unwrap();
+    for ledger in &fixtures {
+        ledger.validate(&key(), identity()).unwrap();
+        assert_eq!(ledger.entries.len(), 1);
+        assert_eq!(ledger.operations.len(), 1);
+    }
+    for first in &fixtures {
+        for second in &fixtures {
+            let mut ledger = first.clone();
+            // Admission already produced each authentic payload and matching
+            // operation independently. Combine them with consistent stored
+            // operations so rejection cannot come from derived != operations.
+            let sequence = ledger
+                .append(&key(), second.entries[0].payload.clone())
+                .unwrap();
+            let mut operation = second.operations[0].clone();
+            operation.first_sequence = sequence;
+            operation.last_sequence = sequence;
+            ledger.operations.push(operation);
+            assert_eq!(
+                ledger.validate(&key(), identity()),
+                Err(AuditAuthorityError::BindingMismatch),
+                "LEDGER_VALIDATION_DUPLICATE_REQUEST"
+            );
             let index = validation_index::ValidationIndex::new(&ledger.entries).unwrap();
             assert!(!index.duplicate_request(0).unwrap());
             assert!(index.duplicate_request(1).unwrap());
-            assert_eq!(
-                ledger.validate(&key(), identity()),
-                Err(AuditAuthorityError::BindingMismatch)
-            );
         }
     }
 }

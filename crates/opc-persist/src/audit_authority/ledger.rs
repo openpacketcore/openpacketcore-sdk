@@ -1018,16 +1018,25 @@ impl LedgerState {
                         return Err(AuditAuthorityError::BindingMismatch);
                     }
                     state.validate_target_for(&op.handle)?;
-                    if let Some(retained) =
-                        self.entries.iter().find_map(|entry| match &entry.payload {
-                            EntryPayload::TargetIntent(retained)
-                                if retained.handle == op.handle =>
-                            {
-                                Some(retained)
-                            }
-                            _ => None,
-                        })
-                    {
+                    let original_position = op
+                        .first_sequence
+                        .checked_sub(self.floor)
+                        .and_then(|offset| offset.checked_sub(1))
+                        .and_then(|offset| usize::try_from(offset).ok())
+                        .ok_or(AuditAuthorityError::BindingMismatch)?;
+                    let original_entry = self
+                        .entries
+                        .get(original_position)
+                        .ok_or(AuditAuthorityError::BindingMismatch)?;
+                    #[cfg(test)]
+                    validation_probe::outcome_entry_visit();
+                    // This operation was derived from the authenticated prefix.
+                    // Its original sequence selects one entry without searching
+                    // later, not yet authenticated payloads.
+                    if let EntryPayload::TargetIntent(retained) = &original_entry.payload {
+                        if retained.handle != op.handle {
+                            return Err(AuditAuthorityError::BindingMismatch);
+                        }
                         validate_target_outcome_with_original(
                             key,
                             self.identity,

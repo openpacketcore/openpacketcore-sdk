@@ -5,6 +5,7 @@ use std::cell::Cell;
 #[derive(Clone, Copy, Debug, Default)]
 pub(super) struct Counts {
     pub(super) comparisons: usize,
+    pub(super) outcome_entry_visits: usize,
     pub(super) reserves: usize,
     pub(super) intents: usize,
     pub(super) capacity: usize,
@@ -56,6 +57,18 @@ pub(super) fn comparison() {
     COUNTS.with(|slot| {
         if let Some(mut counts) = slot.get() {
             counts.comparisons = counts.comparisons.checked_add(1).expect("bounded count");
+            slot.set(Some(counts));
+        }
+    });
+}
+
+pub(super) fn outcome_entry_visit() {
+    COUNTS.with(|slot| {
+        if let Some(mut counts) = slot.get() {
+            counts.outcome_entry_visits = counts
+                .outcome_entry_visits
+                .checked_add(1)
+                .expect("bounded entry visits");
             slot.set(Some(counts));
         }
     });
