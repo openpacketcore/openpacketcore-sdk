@@ -344,6 +344,12 @@ jobs:
           ref: ${{ github.event.pull_request.base.sha || github.event.before || 'main' }}
           path: previous-release
 
+      # The qualification fleet records the tree under test, untracked files
+      # included, as candidate evidence. Keep the previous release's checkout
+      # out of that tree.
+      - name: Move the previous release out of the tree under test
+        run: mv previous-release "${RUNNER_TEMP}/previous-release"
+
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@1.98.1 # pinned until #1041 migrates Atomic::fetch_update
         with:
@@ -357,19 +363,19 @@ jobs:
         with:
           shared-key: opc-rust-mixed-release
           save-if: ${{ github.ref == 'refs/heads/main' }}
-          workspaces: |
-            . -> target
-            previous-release -> target
 
       # The same package selection and features as the test shards, so the
-      # previous node is built exactly as its own CI built it.
+      # previous node is built exactly as its own CI built it. Its artifacts
+      # live under this tree's ignored, cached target directory.
       - name: Build the previous release's quorum node
-        working-directory: previous-release
+        working-directory: ${{ runner.temp }}/previous-release
+        env:
+          CARGO_TARGET_DIR: ${{ github.workspace }}/target/previous-release
         run: cargo build --locked --workspace --exclude opc-persist --all-features --bin opc-session-quorum-node
 
       - name: Run the mixed-release qualification
         env:
-          OPC_SESSION_QUORUM_NODE_PREVIOUS_RELEASE: ${{ github.workspace }}/previous-release/target/debug/opc-session-quorum-node
+          OPC_SESSION_QUORUM_NODE_PREVIOUS_RELEASE: ${{ github.workspace }}/target/previous-release/debug/opc-session-quorum-node
         run: |
           cargo test --locked --workspace --exclude opc-persist --all-features \
             --test qualification_mtls_multiprocess -- \
