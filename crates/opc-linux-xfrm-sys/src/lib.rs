@@ -176,6 +176,30 @@ pub const NLM_F_EXCL: u16 = 0x0200;
 pub const NLM_F_CREATE: u16 = 0x0400;
 /// Netlink append flag.
 pub const NLM_F_APPEND: u16 = 0x0800;
+/// Netlink dump-reply flag: the dump was inconsistent due to a sequence
+/// change.
+///
+/// `include/uapi/linux/netlink.h`: `#define NLM_F_DUMP_INTR 0x10`. The kernel
+/// sets it on a dump reply when the dumped table changed between two
+/// multipart batches. A reader must discard the whole dump.
+pub const NLM_F_DUMP_INTR: u16 = 0x0010;
+/// Netlink GET modifier: return the complete table.
+///
+/// `include/uapi/linux/netlink.h`: `#define NLM_F_ROOT 0x100`. GET requests
+/// share this bit with [`NLM_F_REPLACE`], which has meaning only on NEW
+/// requests.
+pub const NLM_F_ROOT: u16 = 0x0100;
+/// Netlink GET modifier: return all matching entries.
+///
+/// `include/uapi/linux/netlink.h`: `#define NLM_F_MATCH 0x200`. GET requests
+/// share this bit with [`NLM_F_EXCL`], which has meaning only on NEW requests.
+pub const NLM_F_MATCH: u16 = 0x0200;
+/// Netlink GET modifier requesting a multipart dump.
+///
+/// `include/uapi/linux/netlink.h`: `#define NLM_F_DUMP (NLM_F_ROOT|NLM_F_MATCH)`.
+/// The kernel answers with [`NLM_F_MULTI`] messages terminated by
+/// [`NLMSG_DONE`].
+pub const NLM_F_DUMP: u16 = NLM_F_ROOT | NLM_F_MATCH;
 
 /// Netlink no-op control message.
 pub const NLMSG_NOOP: u16 = 0x1;
@@ -270,6 +294,17 @@ pub const XFRMA_ALG_AUTH_TRUNC: u16 = 20;
 pub const XFRMA_MARK: u16 = 21;
 /// XFRM ESN replay sequence/bitmap attribute.
 pub const XFRMA_REPLAY_ESN_VAL: u16 = 23;
+/// XFRM state-dump transform-protocol filter (`__u8`).
+///
+/// `include/uapi/linux/xfrm.h`, `enum xfrm_attr_type_t`: `XFRMA_PROTO` is
+/// 25. An `XFRM_MSG_GETSA` dump reports only states whose protocol matches.
+pub const XFRMA_PROTO: u16 = 25;
+/// XFRM state-dump address filter ([`XfrmAddressFilter`]).
+///
+/// `include/uapi/linux/xfrm.h`, `enum xfrm_attr_type_t`:
+/// `XFRMA_ADDRESS_FILTER` is 26. An `XFRM_MSG_GETSA` dump reports only states
+/// whose family and address prefixes match.
+pub const XFRMA_ADDRESS_FILTER: u16 = 26;
 /// Empty netlink alignment attribute.
 pub const XFRMA_PAD: u16 = 27;
 /// XFRM hardware or packet-offload device attribute.
@@ -662,6 +697,29 @@ pub struct XfrmMark {
     pub mask: u32,
 }
 
+/// Linux `struct xfrm_address_filter`, the payload of
+/// [`XFRMA_ADDRESS_FILTER`].
+///
+/// `include/uapi/linux/xfrm.h`. The kernel compares the first
+/// `source_prefix_len` bits of `source` with a state's outer source and the
+/// first `destination_prefix_len` bits of `destination` with its destination.
+/// When `family` is `AF_INET` or `AF_INET6`, the state family must match too.
+/// A prefix length above 128 makes the dump fail with `EINVAL`.
+#[repr(C)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash)]
+pub struct XfrmAddressFilter {
+    /// Outer source address prefix (`saddr`).
+    pub source: XfrmAddress,
+    /// Destination address prefix (`daddr`).
+    pub destination: XfrmAddress,
+    /// Address family (`family`).
+    pub family: u16,
+    /// Source prefix length in bits (`splen`).
+    pub source_prefix_len: u8,
+    /// Destination prefix length in bits (`dplen`).
+    pub destination_prefix_len: u8,
+}
+
 /// Linux `struct xfrm_encap_tmpl`.
 #[repr(C)]
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash)]
@@ -764,6 +822,25 @@ mod tests {
     }
 
     #[test]
+    fn dump_constants_match_linux_uapi_headers() {
+        // include/uapi/linux/netlink.h
+        assert_eq!(NLM_F_DUMP_INTR, 0x10);
+        assert_eq!(NLM_F_ROOT, 0x100);
+        assert_eq!(NLM_F_MATCH, 0x200);
+        assert_eq!(NLM_F_DUMP, 0x300);
+        // NLM_F_DUMP and NLM_F_DUMP_INTR are distinct from every other flag a
+        // dump request or reply carries.
+        assert_eq!(
+            NLM_F_DUMP & (NLM_F_REQUEST | NLM_F_MULTI | NLM_F_ACK | NLM_F_DUMP_INTR),
+            0
+        );
+        // include/uapi/linux/xfrm.h, enum xfrm_attr_type_t
+        assert_eq!(XFRMA_PROTO, 25);
+        assert_eq!(XFRMA_ADDRESS_FILTER, 26);
+        assert_eq!(XFRMA_ADDRESS_FILTER + 1, XFRMA_PAD);
+    }
+
+    #[test]
     fn address_constructors_preserve_wire_octets_in_memory() {
         let ipv4 = XfrmAddress::from_ipv4_octets([192, 0, 2, 1]);
         assert_eq!(ipv4.words[0].to_ne_bytes(), [192, 0, 2, 1]);
@@ -840,6 +917,13 @@ mod tests {
         assert_eq!(size_of::<XfrmAlgoHeader>(), 68);
         assert_eq!(size_of::<XfrmAlgoAuthHeader>(), 72);
         assert_eq!(size_of::<XfrmMark>(), 8);
+        assert_eq!(size_of::<XfrmAddressFilter>(), 36);
+        assert_eq!(align_of::<XfrmAddressFilter>(), 4);
+        assert_eq!(offset_of!(XfrmAddressFilter, source), 0);
+        assert_eq!(offset_of!(XfrmAddressFilter, destination), 16);
+        assert_eq!(offset_of!(XfrmAddressFilter, family), 32);
+        assert_eq!(offset_of!(XfrmAddressFilter, source_prefix_len), 34);
+        assert_eq!(offset_of!(XfrmAddressFilter, destination_prefix_len), 35);
         assert_eq!(size_of::<XfrmEncapTemplate>(), 24);
         assert_eq!(offset_of!(XfrmEncapTemplate, original_address), 8);
     }
