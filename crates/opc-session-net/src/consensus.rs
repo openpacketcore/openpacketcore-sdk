@@ -7625,6 +7625,11 @@ mod tests {
 
     #[tokio::test]
     async fn consensus_server_refuses_pre_vote_on_a_connection_negotiated_without_it() {
+        // Each served connection ends in an idle retirement, which the
+        // connection-outcome metric tests count exactly.
+        let _guard = crate::test_support::SESSION_CONNECTION_METRICS_TEST_LOCK
+            .lock()
+            .await;
         let families = [ConsensusRpcFamily::PreVote, ConsensusRpcFamily::Vote];
         let (handled, responses) = dispatch_families(false, &families).await;
         assert_eq!(
