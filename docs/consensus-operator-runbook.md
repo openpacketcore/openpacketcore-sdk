@@ -40,8 +40,10 @@ The session and configuration adapters use one fixed runtime profile from
 `opc-consensus`; operators cannot tune either domain onto a different election
 or heartbeat regime. This workspace revision exact-pins
 `https://github.com/openpacketcore/openraft` at
-`72e327a4f25cbbe3a3695d8c3c0f0970ccb925d5` with the complete release-0.9 history
-through v0.9.25, bounded apply pages and joined replication retirement. Confirm the lock resolves only
+`20f4f3123168907d5a00ec3772c78872e9a47820` with the complete release-0.9 history
+through v0.9.25, bounded apply pages, joined replication retirement, the
+overlapping follower lease and election timeout, the separate AppendEntries
+deadline, Pre-Vote and the leader's quorum-acknowledged lease. Confirm the lock resolves only
 `openraft` and `openraft-macros` 0.9.25 from that full revision. Do not substitute
 a registry package, a branch, a tag, or a downstream partial patch.
 
@@ -122,9 +124,10 @@ call also has its transport-owned complete deadline within that operation.
 The production transport profile is fixed, not operator-tunable:
 
 - AppendEntries and Openraft read-index confirmation: 2 seconds;
-- Vote: 5 seconds;
+- leader heartbeat interval: 200 ms, sent on a 300 ms engine tick;
+- Vote and Pre-Vote: 5 seconds;
 - InstallSnapshot, forwarded mutation, and consumer ReadBarrier: 10 seconds;
-- election timeout: freshly sampled from `[5 seconds, 8 seconds)`; and
+- election timeout: freshly sampled from `[5 seconds, 6.5 seconds)`; and
 - server frame-idle and handler ceilings: 30 seconds.
 
 For an initial or replacement connection, DNS, TCP, mTLS, identity admission,
@@ -154,6 +157,94 @@ readiness evidence:
 independently persisted committed index, applied index, non-secret audit-key
 epoch/fingerprint, and admission state. Use it for routing and
 diagnostics, but keep readiness gated by the fresh probe.
+
+### 2.4 Unplanned leader loss and voter CPU
+
+A planned shutdown transfers leadership before the leader stops. After an
+unplanned loss (a crash, a node failure, or a partition), the surviving
+voters elect a replacement on their own timers. A surviving voter campaigns
+once the longer of its leader lease (the 5-second minimum election timeout) and
+its sampled election timeout has passed since it last heard from the leader.
+If another survivor's lease still runs, its Pre-Vote round is rejected and
+retried 1.5 seconds later; every lease runs out within 5 seconds of the loss. A
+round stays open for late replies until its 5-second Vote deadline, so slow
+voters delay an election but never prevent it:
+
+- the first successful campaign starts within 6,800 ms of the loss;
+- a write in flight at the loss reaches its outcome within the documented
+  9,700 ms stall, inside one 10-second operation, when the caller retries only
+  its own exact request identity after an ambiguous or unavailable attempt;
+- a session-store write or read that a black-holed lost leader holds is moved
+  to the successor within 200 ms after the forwarding replica observes it,
+  instead of at the caller's deadline; one that has not been sent when the
+  replica already knows the successor goes to the successor directly.
+
+These bounds assume a reachable majority whose processes are not suspended or
+throttled and whose RPCs complete within one heartbeat interval; the first
+successful campaign needs only every surviving voter to answer a Pre-Vote
+within 1.5 seconds. A split vote is improbable and outside them; it adds at
+most one further election timeout and tick.
+
+Each voter first asks the others in a Pre-Vote round whether they would grant
+it a vote, and raises its term only when a majority would. A voter that is cut
+off from the others, or restarted while cut off, therefore keeps its term and
+rejoins as a follower without deposing a healthy leader. A leader also rejects
+every candidate while a majority keeps acknowledging it.
+
+A voter campaigns after 5,000 ms without AppendEntries from its leader, more
+than sixteen missed 300 ms engine ticks. Give every voter CPU that is never
+throttled or suspended for that long:
+
+- set the CPU limit equal to the request, with an integer number of cores, or
+  set no CPU limit;
+- do not pause, checkpoint, or live-migrate a voter that is serving traffic;
+- keep durable-log storage latency far below the 2-second AppendEntries
+  ceiling.
+
+CFS quota exhaustion, a stopped container, or storage that blocks a leader for
+seconds can still depose it. The election stays safe, but writes in flight on
+the deposed leader end ambiguous and must be resolved through their exact
+request identity.
+
+### 2.5 Rolling upgrade from a release without Pre-Vote
+
+Voters can be replaced one at a time, in either direction: an upgrade from the
+previous release, or the rollback of one. Each consensus connection negotiates
+its protocol revision through TLS ALPN. A voter of this release offers
+`opc-session-consensus/3`, which carries Pre-Vote, ahead of
+`opc-session-consensus/2`, which the previous release speaks. A connection to
+or from a previous-release voter therefore negotiates the previous revision. A
+voter of this release never sends that voter a Pre-Vote it could not decode.
+Such a voter can still grant a vote, so whenever a voter of this release can
+reach one, it runs the classic election for that campaign instead of Pre-Vote.
+
+While a previous-release voter is a member, a leader loss is therefore
+resolved with the classic vote, as with the previous release:
+
+- a previous-release voter grants a vote only after its 8-second leader lease,
+  and first campaigns within 19 seconds of its last leader contact: its lease,
+  its sampled election timeout below 8 seconds, and a 3-second tick;
+- a voter of this release first campaigns within 6.8 seconds of its last
+  leader contact, plus at most one 1.5-second connection that tells it a voter
+  cannot answer Pre-Vote. If a previous-release lease rejects it, it campaigns
+  again within 6.8 seconds, after every such lease has run out;
+- a voter whose log is behind still campaigns with the classic vote and votes
+  for itself in its next term. A more up-to-date candidate is refused in such
+  a term at most once per such voter: a voter of this release then defers its
+  own next campaign by 13 seconds, and a previous-release voter that has seen
+  a more up-to-date log campaigns at most once per 21 seconds;
+- a successor is elected within 30 seconds of the loss when the leader is the
+  only voter lost, no two voters campaign within one round trip of each other
+  and no process is suspended: a previous-release voter that must win does so
+  by its second campaign, and a voter of this release that can win within
+  15.1 seconds.
+
+During the roll, a voter of this release that is cut off can raise its term
+and depose a healthy leader when it returns, as a previous-release voter can.
+A write in flight at such a loss can outlast one 10-second operation and end
+ambiguous. The caller retries only its own exact request identity, and the
+write still applies exactly once. Once every voter runs this release, Pre-Vote
+and the bounds of section 2.4 apply again.
 
 ## 3. Normal write and response-loss handling
 
@@ -447,16 +538,16 @@ an `expiry - 30 seconds` soft boundary, followed by complete hard-deadline drain
 and source/controller `LastGoodExpired`; survivors continue canary progress and
 a valid long-lived leaf restores the affected member in the same process. The
 replacement proof uses the schedule-bound
-`member-scoped-reauth-settled-baseline/v4` checkpoint: its 86-second clock and
+`member-scoped-reauth-settled-baseline/v4` checkpoint: its 83-second clock and
 60-second two-stage server tail begin at the atomic projected-data rename, and
 a final 2.5-second outbound-ledger quiet tail completes the horizon. A
-prepublication common-key pulse plus 13-second observation checkpoints requires
+prepublication common-key pulse plus 11.5-second observation checkpoints requires
 one active key to advance on every survivor observer and conservatively bounds
-that pulse's worst-case actual event gap to 26 seconds. An independent 26-second
+that pulse's worst-case actual event gap to 23 seconds. An independent 23-second
 checkpoint requires every active key on every observer and cannot be reset by a
 faster key. Each survivor may record at most one rejoin availability episode;
 its consecutive typed retry outcomes remain separately bounded by the
-unchanged eight-outcome ceiling. It must recover within that 26-second SLO and
+unchanged eight-outcome ceiling. It must recover within that 23-second SLO and
 settle before the clean baseline, and a second or late episode fails closed.
 Fault-era new-attempt and reconnect
 deltas remain inside the fixed 85/161 per-node bound (ordinary 24/40, fifteen
@@ -523,7 +614,7 @@ See the [qualification contract](../crates/opc-session-testkit/README.md).
 The private schedule drops one successful release response per mutator to prove
 this path.
 More than eight such outcomes per node, any recovery episode beyond the fixed
-26-second two-election-plus-operation transition envelope, any retry before the
+23-second two-election-plus-operation transition envelope, any retry before the
 fixed 50 ms delay, or phase completion with an unresolved interruption fails
 the campaign. A terminal operation observed after that deadline reports the
 closed operation stage and elapsed milliseconds and stays failed; raw backend
@@ -544,15 +635,15 @@ the following stage deadlines:
 | Restart stage | Bound |
 | --- | ---: |
 | SIGKILL termination and process reaping | 5 seconds |
-| Outage work and survivor progress | 26 seconds |
+| Outage work and survivor progress | 23 seconds |
 | Replacement-child startup | 45 seconds |
-| Openraft recovery and all-voter readiness observation | 37 seconds |
+| Openraft recovery and all-voter readiness observation | 34 seconds |
 | Bounded journal reconciliation | 25 seconds |
-| Higher-fence mutation resume | 26 seconds |
+| Higher-fence mutation resume | 23 seconds |
 
-The sequential stages compose to a 164-second crash-to-resume ceiling. Each
+The sequential stages compose to a 155-second crash-to-resume ceiling. Each
 stage fails independently and cannot borrow unused time from another stage or
-use the total as its timer. The 37-second readiness stage is the 26-second
+use the total as its timer. The 34-second readiness stage is the 23-second
 recovery envelope followed by one 11-second final round: a 10-second backend
 operation plus 1 second of bounded local result delivery. This retains the v1
 deadline-composition fix and corrects v2's free-running probe admission, which

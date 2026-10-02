@@ -134,10 +134,13 @@ removed. Each domain retains its own state machine and production evidence
 gates.
 
 The current exact pin is the immutable `openpacketcore/openraft` revision
-`72e327a4f25cbbe3a3695d8c3c0f0970ccb925d5` (0.9.25 plus fork fixes). Both domains
+`20f4f3123168907d5a00ec3772c78872e9a47820` (0.9.25 plus fork fixes). Both domains
 consume one fixed runtime profile from `opc-consensus`, including fresh
-per-campaign `[5,000 ms, 8,000 ms)` election-timeout sampling, a 2,000 ms
-heartbeat/AppendEntries ceiling, and the shared 10,000 ms operation default.
+per-campaign `[5,000 ms, 6,500 ms)` election-timeout sampling, a 200 ms
+heartbeat interval, a separate 2,000 ms AppendEntries ceiling, Pre-Vote, and the
+shared 10,000 ms operation default. After an unplanned leader loss the first
+successful campaign starts within 6,800 ms and a write stalls at most 9,700 ms;
+voters need CPU that is never throttled or suspended for 5,000 ms.
 This temporary git source makes the mechanically derived 26-crate normal
 reverse-dependency
 closure source-build-only and `publish = false`. Keep that boundary until an
@@ -967,16 +970,16 @@ must advance committed canary and mixed traffic during the outage; the returned
 member must reconcile the exact bounded journal/current record and resume at a
 strictly higher same-owner fence. Schedule v6 binds
 `same-disk-exact-address-active-mutator/v3`. The independently checked stages
-are termination/reaping (5 seconds), outage/survivor progress (26 seconds),
+are termination/reaping (5 seconds), outage/survivor progress (23 seconds),
 replacement-child startup (45 seconds), Openraft recovery and readiness
-observation (37 seconds: the 26-second recovery envelope plus one reserved
+observation (34 seconds: the 23-second recovery envelope plus one reserved
 11-second final all-voter readiness round comprising a 10-second backend
 operation and 1 second of bounded local result delivery), journal
-reconciliation (25 seconds), and higher-fence resume (26 seconds). The composed
-crash-to-resume ceiling is 164 seconds; it is not a shared timer, and each stage
+reconciliation (25 seconds), and higher-fence resume (23 seconds). The composed
+crash-to-resume ceiling is 155 seconds; it is not a shared timer, and each stage
 fails at its own deadline. This retains the v1 deadline-composition correction and fixes
 v2's readiness admission loop, which could leave its last six seconds unusable
-without weakening the separate 26-second survivor-availability or recovery
+without weakening the separate 23-second survivor-availability or recovery
 envelopes. It then
 publishes a same-issuer leaf with a 75-second remaining-validity/expiry budget.
 With the default 30-second drain window, its fixed soft-retirement boundary is
@@ -999,20 +1002,20 @@ witnesses, cover the first observed committed frontier, and retain monotonic
 applied progress. Elapsed time or progress by the surviving majority cannot
 complete this proof. These processes share storage; their catch-up duration
 does not establish a deployment recovery SLO. After readiness and canary
-verification, a separate connection-settlement phase retains its 86-second
+verification, a separate connection-settlement phase retains its 83-second
 fail-safe, full 60-second two-stage server tail, and final 2.5-second quiet
 interval for cold connect plus maximum reconnect backoff. The frozen schedule
 profile `member-scoped-reauth-settled-baseline/v4` and its historical results
 retain their original publication-based timing semantics; passing the corrected
 functional checks does not qualify that historical timing profile. A prepublication
-common-key pulse and 13-second observation checkpoints require one active key
+common-key pulse and 11.5-second observation checkpoints require one active key
 to advance on every survivor observer and conservatively bound that pulse's
-worst-case actual event gap to 26 seconds. An independent 26-second checkpoint
+worst-case actual event gap to 23 seconds. An independent 23-second checkpoint
 requires every active key on every observer and cannot be reset by a faster key.
 Availability evidence may advance by at most one episode per survivor while
 the expired member rejoins. Consecutive typed retry outcomes inside that
 episode remain separately bounded by the unchanged eight-outcome ceiling; all
-must settle inside the 26-second SLO, and a second or late episode fails
+must settle inside the 23-second SLO, and a second or late episode fails
 closed. Fault-era new-attempt and reconnect deltas
 remain within the fixed 85/161 per-node bound: ordinary 24/40, fifteen
 five-second refresh rounds over four/eight incident paths, and one scheduled

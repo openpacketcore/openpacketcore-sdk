@@ -39,8 +39,9 @@ pub use crate::sqlite::test_support::{
     ProtectedRosterV2TerminalStatusValidationStagesForTest,
 };
 pub use network::{
-    SessionConsensusPeer, SessionConsensusPeerError, SessionConsensusRpcFamily,
-    SessionConsensusRpcHandler, SessionConsensusWireRequest, SessionConsensusWireResponse,
+    forward_session_consensus_pre_vote, SessionConsensusPeer, SessionConsensusPeerError,
+    SessionConsensusPreVoteCall, SessionConsensusRpcFamily, SessionConsensusRpcHandler,
+    SessionConsensusWireRequest, SessionConsensusWireResponse,
     SESSION_CONSENSUS_MAX_RPC_PAYLOAD_BYTES,
 };
 #[cfg(feature = "test-control")]

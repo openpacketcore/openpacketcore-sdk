@@ -91,6 +91,14 @@ pub const SESSION_NET_CAS_REQUEST_ID_BYTES: usize = 36;
 pub const SESSION_NET_ALPN: &[u8] = b"opc-session-net/5";
 /// Dedicated ALPN for the least-authority consensus-only transport.
 pub const SESSION_CONSENSUS_ALPN: &[u8] = b"opc-session-consensus/2";
+/// ALPN of the same consensus-only transport whose connections also carry the
+/// Pre-Vote family.
+///
+/// Every client and server of this release offers it ahead of
+/// [`SESSION_CONSENSUS_ALPN`]. A peer of a release without Pre-Vote knows only
+/// [`SESSION_CONSENSUS_ALPN`], so a connection to or from it negotiates that
+/// protocol and never carries a Pre-Vote request it could not decode.
+pub const SESSION_CONSENSUS_PRE_VOTE_ALPN: &[u8] = b"opc-session-consensus/3";
 /// Fixed revision of the consensus-only bootstrap and operation DTOs.
 ///
 /// Revision 5 adds an exact application-semantics gate for outcome-digest v2.

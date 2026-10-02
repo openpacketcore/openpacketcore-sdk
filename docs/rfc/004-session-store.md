@@ -73,7 +73,7 @@ combined algorithm.
 
 See the [qualification contract](../../crates/opc-session-testkit/README.md).
 The fixed schedule drops one successful release response per mutator, allows eight
-outcomes per node, uses the fixed 26-second two-election-plus-operation
+outcomes per node, uses the fixed 23-second two-election-plus-operation
 transition envelope per recovery episode, and applies a 50 ms retry delay;
 phase completion requires every interruption to be reconciled. Lease loss,
 unexpected state, and invariant failures fail closed. The admission-loss
@@ -86,13 +86,13 @@ the same-disk, exact-address restart must reconcile a bounded gap-free journal,
 prove the exact generation/owner/fence/payload, and resume at a strictly higher
 same-owner fence under the versioned
 `same-disk-exact-address-active-mutator/v3` profile. That profile independently
-bounds termination/reaping at 5 seconds, outage/survivor progress at 26
+bounds termination/reaping at 5 seconds, outage/survivor progress at 23
 seconds, replacement-child startup at 45 seconds, Openraft
-recovery/readiness observation at 37 seconds (a 26-second recovery envelope
+recovery/readiness observation at 34 seconds (a 23-second recovery envelope
 plus one reserved 11-second final all-voter readiness round comprising a
 10-second backend operation and 1 second of bounded local result delivery),
-journal reconciliation at 25 seconds, and higher-fence mutation resume at 26 seconds.
-The sequential stages compose to a 164-second crash-to-resume ceiling, but each
+journal reconciliation at 25 seconds, and higher-fence mutation resume at 23 seconds.
+The sequential stages compose to a 155-second crash-to-resume ceiling, but each
 stage fails at its own deadline. This retains the v1 deadline-composition fix
 and corrects v2's stranded readiness-observation tail; it does not qualify a
 broader restart matrix or deployed production readiness.
@@ -1512,7 +1512,7 @@ stable follower is also killed uncleanly with active mutation/watch tasks;
 survivors commit during the outage and its same-disk, exact-address restart
 must reconcile the exact record/watch state and resume at a higher fence under
 the v3 stage bounds described above. The six sequential stage bounds compose
-to a 164-second crash-to-resume ceiling; the total does not replace any
+to a 155-second crash-to-resume ceiling; the total does not replace any
 individual stage deadline. Other active-mutator restart patterns, a
 real/deployed partition, a broader restart/fault matrix, resource/soak,
 remote-HKMS, deployed-CNF, signed release, and
@@ -2620,20 +2620,20 @@ fencing.
   deadline. Every voter must become ready with the exact quorum witnesses and
   cover the first observed committed frontier; majority progress alone never
   completes recovery. After readiness and canary verification, connection
-  settlement retains its own 86-second bound, full 60-second two-stage server
+  settlement retains its own 83-second bound, full 60-second two-stage server
   tail and final 2.5-second outbound-ledger quiet tail. The frozen schedule-bound
   `member-scoped-reauth-settled-baseline/v4` descriptor and historical results
   retain their publication-based clock; these corrected functional checks do
   not qualify that historical timing profile or a deployment recovery SLO on
-  shared storage. A prepublication common-key pulse and conservative 13-second
+  shared storage. A prepublication common-key pulse and conservative 11.5-second
   observations require one active key to advance on every survivor observer
-  and bound that pulse's worst-case actual event gap to 26 seconds. An
-  independent 26-second checkpoint requires every active key on every observer
+  and bound that pulse's worst-case actual event gap to 23 seconds. An
+  independent 23-second checkpoint requires every active key on every observer
   and cannot be reset by a faster key.
   Each survivor may record at most one availability episode while the expired
   member rejoins. Consecutive typed retry outcomes inside that episode remain
   separately bounded by the unchanged eight-outcome ceiling; all must settle
-  inside the 26-second SLO, and a second or late episode fails closed.
+  inside the 23-second SLO, and a second or late episode fails closed.
   Fault-era new-attempt and reconnect deltas
   retain a fixed 85/161 per-node bound: ordinary 24/40, fifteen five-second
   refresh rounds over four/eight incident paths, and one scheduled

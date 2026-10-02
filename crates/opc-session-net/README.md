@@ -168,14 +168,16 @@ cap of 128 rather than that planning estimate.
 | RPC family | Outer hard/direct complete ceiling |
 |:---|---:|
 | AppendEntries and Openraft read-index confirmation | 2,000 ms |
-| Vote | 5,000 ms |
+| Vote and PreVote | 5,000 ms |
 | InstallSnapshot | 10,000 ms |
 | ForwardMutation | 10,000 ms |
 | Consumer ReadBarrier | 10,000 ms |
 | TopologyAdmissionBarrier | 10,000 ms |
 
-The election range is `[5,000 ms, 8,000 ms)`, the session/config operation
-default is 10,000 ms, and listener idle/handler ceilings are 30,000 ms.
+The election range is `[5,000 ms, 6,500 ms)`, the leader heartbeat interval is
+200 ms and is not a call deadline, the session/config operation default is
+10,000 ms, and listener idle/handler ceilings are 30,000 ms. A PreVote request
+is admitted exactly like a Vote and changes no engine state.
 The exact consensus contract is transport/wire-schema revision 5, application
 revision 4, and error-set revision 6. The revision-5 transport profile retains
 the explicit forwarded consumer scope, so a peer cannot silently downgrade a

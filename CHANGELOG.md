@@ -9,6 +9,99 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- `opc-session-store`: a write or read forwarded to a lost leader that
+  black-holes its connection no longer waits for the caller's whole deadline.
+  A failed node or partition, unlike a crashed process, gives the forwarding
+  replica no connection error, so its forward, read barrier, exact V2 status
+  ticket, capability activation or expiry preflight waited 10 seconds even
+  after the surviving voters had elected a successor. Every leader-routed call
+  is now bounded by the replica's own leader view: once its engine names a
+  different leader, a call still unanswered after one 200 ms heartbeat interval
+  is abandoned and reported as possibly transmitted, so callers retry only the
+  same request identity or report an unknown outcome. The view is judged
+  against the leader it named when the route was chosen, so a successor learned
+  while the caller still revalidated its authority counts, and a call whose
+  route was already replaced before it was sent goes to the successor without
+  being sent to the lost leader. A regression that black-holes one follower's
+  route to the leader now commits its write in about 6.5 seconds instead of
+  ending ambiguous after 10 seconds; one that elects the successor between
+  route selection and transmission sends nothing to the lost leader, where the
+  call used to wait 24 seconds for its deadline. A route that a redirect chose
+  while the view named another leader keeps that leader's exemption only until
+  the view names the redirect target: a regression in which leadership moves
+  from A to B and back to A abandons a call held by the lost B within the
+  grace, where it used to wait for its deadline. Refs #1037.
+
+- `opc-consensus`: an unplanned leader loss no longer stalls an in-flight
+  write past the 10-second operation timeout. The pinned engine used to start a
+  follower's own election timeout only after a leader lease of
+  `election_timeout_max` and checked timers on a tick of 1.5 heartbeats, so
+  the former 2,000 ms heartbeat and `[5,000 ms, 8,000 ms)` elections detected a
+  lost leader 13 to 19 seconds after its last contact. With the consumed fork
+  rules (overlapping lease and timeout, a separate AppendEntries deadline,
+  Pre-Vote and the leader's quorum-acknowledged lease),
+  `DURABLE_CONSENSUS_TIMING_PROFILE` keeps the 2,000 ms AppendEntries/read-index,
+  5,000 ms Vote and 1,500 ms contained cold-connect budgets, adds a separate
+  200 ms heartbeat interval and samples elections from `[5,000 ms, 6,500 ms)`.
+  New profile helpers expose the first-campaign (6,800 ms) and documented
+  write-stall (9,700 ms) bounds. Profile validation requires that stall to stay
+  below the operation timeout and a follower lease to span two engine ticks and
+  two AppendEntries ceilings. A real three- and five-process projected-mTLS
+  fleet regression kills the leader with SIGKILL during a stream of fenced
+  writes: the outage falls from 15.6 seconds to 5.6 seconds with three voters
+  and 5.4 seconds with five, and every write commits exactly once with its
+  exact receipt. A healthy fleet squeezed onto two CPUs with spinning threads
+  keeps its leader. Voters campaign only after
+  5,000 ms without AppendEntries, so they need CPU that is never throttled or
+  suspended for that long; `opc-consensus` documents the guarantee and its
+  assumptions. Profile-derived qualification envelopes follow the shorter
+  maximum election timeout (26 to 23 seconds), which changes the traffic and
+  candidate schedule digests; the frozen v6/v7 HA profiles keep their original
+  timing. Refs #1037.
+
+- `opc-consensus`, `opc-session-store`, `opc-persist`: a voter that is cut off
+  from the others, or restarted while cut off, no longer deposes a healthy
+  leader when it returns. The new `PreVote` RPC family (Vote's payload bound
+  and deadline) carries the engine's Pre-Vote round through the session and
+  configuration Raft adapters, and the shared durable Openraft configuration
+  enables it. A PreVote request is admitted exactly like a Vote and changes no
+  engine state; a refused, failed or timed-out PreVote call is never a grant.
+  A regression that cuts one voter off for two election timeouts keeps its term
+  and the leader; without the family, the voter reaches term 3 and the cluster
+  is left leaderless. Members negotiate Pre-Vote per connection, so voters can
+  be upgraded or rolled back one at a time; see the next entry. Refs #1037.
+
+- `opc-session-net`, `opc-consensus`, `opc-session-store`, `opc-persist`: a
+  rolling upgrade from a release without Pre-Vote, or its rollback, and a
+  transport that does not implement Pre-Vote no longer risk a cluster that
+  elects no leader. A previous-release voter cannot decode a Pre-Vote request,
+  and a voter of this release that sent one dropped the connection; when the
+  lost leader's survivors needed such a voter and its log was behind, a
+  three-process fleet mixing both releases stayed leaderless for 60 seconds.
+  Pre-Vote is now used only while every voter that can be reached is
+  positively known to answer it. Each consensus connection negotiates Pre-Vote
+  through TLS ALPN, `opc-session-consensus/3` ahead of
+  `opc-session-consensus/2`, and `ConsensusPeer::call_pre_vote` forwards the
+  request only to a voter that negotiated it; in-process peers forward with
+  `forward_pre_vote`. For any other voter it sends nothing and reports the
+  voter unable to answer, and the engine runs the classic election for that
+  campaign. Its default does so for every voter, so a transport that does not
+  implement it keeps automatic failover with the classic election: a
+  three-voter regression over such a transport elects a successor in about
+  6 seconds, where counting those voters as rejecting left the survivors
+  leaderless. While a previous-release voter is a member, a leader loss is
+  resolved within 30 seconds, as with the previous release, when the leader is
+  the only voter lost and no two voters campaign at once. A classic campaign
+  of a voter whose log is behind used to occupy a more up-to-date candidate's
+  next term again and again: with this release's survivor lagging, a
+  three-process fleet elected no successor within 30 seconds, and a
+  five-process fleet took 26 seconds. A voter of this release that refuses
+  such a candidate only because of its own vote now defers its next campaign
+  by its greater-log timeout. Three- and five-process regressions, using the
+  previous release's node binary, lose the leader while either release's
+  voters lag, and roll a fleet forward and back under fenced writes, killing
+  the leader on both releases: every write applies exactly once. Refs #1037.
+
 - `opc-session-net`: a prepared compare-and-set or lease acquire whose
   current voter answers with a complete `Rejected(Unavailable)` now moves the
   identical request to the next voter, as after a pre-write failure, and ends
@@ -36,6 +129,29 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   kernel profile or a refused membarrier query), TFT classification reports
   Missing, and install, replacement and removal refuse before any mutation. The datapath object is
   rebuilt; the map ABI is unchanged. Fixes #1030.
+
+- Shared Openraft dependency: consume the 0.9.25 fork revision
+  `20f4f3123168907d5a00ec3772c78872e9a47820`. A follower now campaigns after
+  the longer of its leader lease and its sampled election timeout instead of
+  their sum, and the lease is the minimum election timeout. AppendEntries can
+  have its own deadline, an optional Pre-Vote round keeps a voter that cannot
+  win from raising its term, and a leader rejects other candidates while a
+  quorum acknowledges it. Configuration validation requires the minimum
+  election timeout to outlast the heartbeat tick. A voter that is not known to
+  answer Pre-Vote makes the campaign run the classic election, so such voters
+  never block an election. Pre-Vote rounds carry an identifier, so a delayed
+  grant can no longer reach a later round, where a grant from a voter removed
+  in between stopped the Raft core. A round that a running lease rejects is
+  retried after the width of the election-timeout window instead of a whole
+  sampled election timeout, which could delay the first successful election
+  past the maximum election timeout; a round still awaiting replies stays open
+  until its Vote deadline, so voters that answer more slowly than that width
+  still elect a leader and a late report that a voter cannot answer Pre-Vote
+  still starts the classic election. A campaigning voter that refuses a more
+  up-to-date candidate only because of its own vote defers its next campaign
+  by the greater-log timeout. A closed replication stream gives up an
+  in-flight AppendEntries at once, so a learner that never answers no longer
+  delays the answer to the vote that deposes its leader. Refs #1037.
 
 - Shared Openraft dependency: consume the exact 0.9.25 fork revision
   `72e327a4f25cbbe3a3695d8c3c0f0970ccb925d5`, including bounded apply dispatch,

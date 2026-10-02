@@ -51,14 +51,27 @@ persistence authority.
   compatibility engine.
 
 The shared engine also has one runtime and complete-call profile.
-`opc-consensus` owns the 2,000 ms heartbeat/AppendEntries/read-index ceiling,
-5,000 ms Vote ceiling, `[5,000 ms, 8,000 ms)` election range, 10,000 ms
+`opc-consensus` owns the 2,000 ms AppendEntries/read-index ceiling, the 200 ms
+heartbeat interval, the 5,000 ms Vote and PreVote ceiling, the
+`[5,000 ms, 6,500 ms)` election range, Pre-Vote, the 10,000 ms
 snapshot/forward/read-barrier and operation ceilings, 30,000 ms listener
 ceilings, and the contained 1,500 ms cold-connect sub-bound. It also owns the
 replication payload, snapshot trigger/chunk, retained-log, and Tokio runtime
 choices. Session and configuration adapters select only their non-secret
 cluster label; they cannot silently drift to separate timing or runtime
 behavior.
+
+The profile previously used a 2,000 ms heartbeat equal to the AppendEntries
+ceiling and `[5,000 ms, 8,000 ms)` elections, and the engine then started a
+follower's own election timeout only after a leader lease of the maximum
+election timeout, checking timers on a tick of 1.5 heartbeats. An unplanned
+leader loss took 13 to 19 seconds to detect. With the current engine rules and
+values, the first successful campaign starts within 6,800 ms of the loss and
+the documented write stall is 9,700 ms, below the operation timeout; profile
+validation enforces that ordering. The AppendEntries, Vote and cold-connect
+budgets are unchanged. The `opc-consensus` crate documentation records the
+derivation, its assumptions, the CPU requirement and the engine's lack of
+check-quorum.
 
 ### Interim engine-source and release gate
 
@@ -94,6 +107,27 @@ unchanged. The exact
 profiles retain their original versions and revisions; the current manifest,
 lock and metadata checks bind this candidate separately. Dependency tests do
 not establish SDK qualification.
+
+The failover update advances the candidate to `20f4f3123168907d5a00ec3772c78872e9a47820`. A
+follower now campaigns after the longer of its leader lease and its sampled
+election timeout instead of their sum, and the lease is the minimum election
+timeout. AppendEntries has its own configurable deadline, separate from the
+heartbeat interval, and a closed replication stream gives up an in-flight
+AppendEntries at once. An optional Pre-Vote round keeps a voter that cannot win
+from raising its term, and a leader rejects other candidates while a quorum
+acknowledges it. Pre-Vote rounds carry an identifier and stay open for
+replies until their Vote deadline, and a round that a running lease rejects is
+retried after the width of the election-timeout window. A campaigning voter
+that refuses a more up-to-date candidate only because of its own vote defers
+its next campaign by the greater-log timeout. Pre-Vote is used only while every voter that can be reached is
+positively known to answer it; a voter that is not, such as a voter of a
+release without Pre-Vote, makes the campaign run the classic election, so such
+voters never block an election. Configuration validation requires the minimum
+election timeout to outlast the engine tick on which a leader sends
+heartbeats. These engine rules replace
+no SDK election, vote or quorum logic. Frozen
+qualification profiles retain their original revisions, and dependency tests
+do not establish SDK qualification.
 
 Registry 0.9.24 SDK one-shot leader-loss runs happened to pass. They do not
 invalidate the deterministic scripted engine regression or the historical

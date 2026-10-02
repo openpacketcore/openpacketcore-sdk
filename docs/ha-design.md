@@ -28,8 +28,9 @@ yet approved as a production deployment profile.
 
 Both domains use `opc_consensus::durable_openraft_config`, the same Tokio
 runtime, and the same end-to-end timing profile. AppendEntries/Openraft
-read-index and the heartbeat are 2,000 ms; Vote is 5,000 ms; elections sample
-freshly from `[5,000 ms, 8,000 ms)`; InstallSnapshot, forwarded mutation,
+read-index is 2,000 ms and the heartbeat interval is 200 ms; Vote and Pre-Vote
+are 5,000 ms; elections sample freshly from `[5,000 ms, 6,500 ms)`;
+InstallSnapshot, forwarded mutation,
 consumer ReadBarrier, and the operation default are 10,000 ms. Listener
 idle/handler ceilings are 30,000 ms. A fresh connection has a contained
 1,500 ms DNS/TCP/mTLS/bootstrap cap inside its already-running family deadline,
@@ -50,9 +51,24 @@ cancellation or timeout. Domain adapters select only their cluster label.
 These are code-path constants, not operator tuning knobs and not proof that
 the experimental profile meets #143 under deployed load.
 
+After an unplanned leader loss, the first successful campaign starts within
+6,800 ms: a surviving voter campaigns once the longer of its leader lease (the
+minimum election timeout) and its sampled election timeout has passed, on its
+next 300 ms engine tick. The documented write stall is 9,700 ms, so a write in
+flight at the loss reaches its outcome inside one 10,000 ms operation when it is
+retried only through its own exact request identity. A voter campaigns only
+after 5,000 ms without AppendEntries, so voters need CPU that is never throttled
+or suspended for that long. Pre-Vote keeps a voter that is cut off from the
+others, or restarted, from raising its term and deposing a healthy leader when
+it returns. The
+[`opc-consensus` README](../crates/opc-consensus/README.md#unplanned-leader-loss)
+derives these bounds from the pinned engine.
+
 The workspace temporarily exact-pins `openpacketcore/openraft` revision
-`72e327a4f25cbbe3a3695d8c3c0f0970ccb925d5`, containing release-0.9 through v0.9.25
-and the fork repairs for bounded apply and joined replication retirement.
+`20f4f3123168907d5a00ec3772c78872e9a47820`, containing release-0.9 through v0.9.25
+and the fork repairs for bounded apply and joined replication retirement, the
+overlapping follower lease and election timeout, the separate AppendEntries
+deadline, Pre-Vote, and the leader's quorum-acknowledged lease.
 It preserves per-campaign election-timeout sampling without adding an SDK
 leader lease or second election/vote path. Until an official
 stable release contains that fix, an exact registry checksum replaces the git

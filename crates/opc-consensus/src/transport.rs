@@ -134,6 +134,9 @@ pub enum ConsensusRpcFamily {
     /// voter use the engine's ordinary election. This does not carry commands
     /// or change membership.
     LeadershipTransfer,
+    /// Openraft Pre-Vote request: ask whether a voter would grant a vote for
+    /// the sender's next term. Answering persists nothing and changes no term.
+    PreVote,
 }
 
 impl ConsensusRpcFamily {
@@ -149,6 +152,7 @@ impl ConsensusRpcFamily {
             Self::ReadBarrier => "read_barrier",
             Self::TopologyAdmissionBarrier => "topology_admission_barrier",
             Self::LeadershipTransfer => "leadership_transfer",
+            Self::PreVote => "pre_vote",
         }
     }
 
@@ -167,6 +171,7 @@ impl ConsensusRpcFamily {
                 CONSENSUS_MAX_ROSTER_RPC_PAYLOAD_BYTES
             }
             Self::Vote
+            | Self::PreVote
             | Self::AppendEntries
             | Self::InstallSnapshot
             | Self::ForwardMutation
@@ -363,6 +368,61 @@ pub trait ConsensusPeer: Send + Sync + std::fmt::Debug {
     ) -> Result<ConsensusWireResponse, ConsensusPeerError> {
         self.call(request).await
     }
+
+    /// Send one [`ConsensusRpcFamily::PreVote`] call under the caller's
+    /// complete logical timeout, or report that the remote voter is not known
+    /// to answer it.
+    ///
+    /// Forward the request only to a voter positively known to answer
+    /// Pre-Vote: the capability was negotiated on the connection, as the SDK's
+    /// session transport does through the protocol it negotiates, or the peer
+    /// is an in-process peer whose remote voter runs this release, which
+    /// forwards with [`forward_pre_vote`]. For any other voter that can be
+    /// reached, such as a voter of a release without Pre-Vote, send nothing
+    /// and return [`PreVoteCall::Unsupported`]. Such a voter can still grant a
+    /// vote but never a Pre-Vote, so the Raft adapters report it to the engine,
+    /// which then runs the classic election for that campaign instead of a
+    /// Pre-Vote round that could never reach a quorum without it.
+    ///
+    /// The default sends nothing and reports `Unsupported`, so a transport
+    /// that does not implement this method keeps automatic failover with the
+    /// classic election. Return an error only for a voter that cannot be
+    /// reached; never for one that answers ordinary calls, or no Pre-Vote
+    /// quorum that needs that voter can form.
+    async fn call_pre_vote(
+        &self,
+        request: ConsensusWireRequest,
+        timeout: Duration,
+    ) -> Result<PreVoteCall, ConsensusPeerError> {
+        let _ = (request, timeout);
+        Ok(PreVoteCall::Unsupported)
+    }
+}
+
+/// The result of one [`ConsensusPeer::call_pre_vote`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PreVoteCall {
+    /// The remote voter answered the Pre-Vote request.
+    Answered(ConsensusWireResponse),
+    /// The remote voter is not known to answer Pre-Vote, for example because
+    /// it runs a release without it. Nothing was sent, and the campaign runs
+    /// the classic election instead.
+    Unsupported,
+}
+
+/// Forward a Pre-Vote call through [`ConsensusPeer::call_with_timeout`], for a
+/// peer whose remote voter runs this release.
+pub async fn forward_pre_vote<P>(
+    peer: &P,
+    request: ConsensusWireRequest,
+    timeout: Duration,
+) -> Result<PreVoteCall, ConsensusPeerError>
+where
+    P: ConsensusPeer + ?Sized,
+{
+    peer.call_with_timeout(request, timeout)
+        .await
+        .map(PreVoteCall::Answered)
 }
 
 /// Inbound consensus-only handler exposed by an authenticated server.
@@ -494,6 +554,23 @@ mod tests {
     }
 
     #[test]
+    fn pre_vote_family_extends_the_wire_encoding_and_keeps_the_vote_bound() {
+        let family = ConsensusRpcFamily::PreVote;
+        assert_eq!(family.as_str(), "pre_vote");
+        assert_eq!(
+            family.max_request_payload_bytes(),
+            ConsensusRpcFamily::Vote.max_request_payload_bytes()
+        );
+        // Adding the family must preserve existing encoded discriminants.
+        assert_eq!(encode_bounded(&ConsensusRpcFamily::Vote).unwrap(), vec![0]);
+        assert_eq!(
+            encode_bounded(&ConsensusRpcFamily::LeadershipTransfer).unwrap(),
+            vec![8]
+        );
+        assert_eq!(encode_bounded(&family).unwrap(), vec![9]);
+    }
+
+    #[test]
     fn roster_request_ceiling_is_inclusive_without_relaxing_ordinary_families() {
         let template = request();
         assert_eq!(CONSENSUS_MAX_ROSTER_RPC_PAYLOAD_BYTES, 2_253_338);
@@ -585,6 +662,52 @@ mod tests {
                 CONSENSUS_MAX_ROSTER_RPC_PAYLOAD_BYTES + 1
             ]),
             Err(ConsensusCodecError::TooLarge)
+        );
+    }
+
+    fn pre_vote_request() -> ConsensusWireRequest {
+        ConsensusWireRequest {
+            family: ConsensusRpcFamily::PreVote,
+            ..request()
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn pre_vote_default_sends_nothing_to_a_voter_of_unknown_release() {
+        // This peer's `call` blocks until released, so any answer proves the
+        // default never reached it.
+        let peer = CompatibilityPeer {
+            entered: Notify::new(),
+            release: Notify::new(),
+        };
+        let outcome = tokio::time::timeout(
+            Duration::from_secs(1),
+            peer.call_pre_vote(pre_vote_request(), Duration::from_millis(10)),
+        )
+        .await
+        .expect("the default answers without sending the request");
+        assert_eq!(outcome, Ok(PreVoteCall::Unsupported));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn forwarded_pre_vote_returns_the_voters_answer() {
+        let peer = Arc::new(CompatibilityPeer {
+            entered: Notify::new(),
+            release: Notify::new(),
+        });
+        let call = tokio::spawn({
+            let peer = Arc::clone(&peer);
+            async move {
+                forward_pre_vote(peer.as_ref(), pre_vote_request(), Duration::from_millis(10)).await
+            }
+        });
+        peer.entered.notified().await;
+        peer.release.notify_one();
+        assert_eq!(
+            call.await.expect("forwarding task"),
+            Ok(PreVoteCall::Answered(ConsensusWireResponse {
+                result: Ok(Vec::new()),
+            }))
         );
     }
 

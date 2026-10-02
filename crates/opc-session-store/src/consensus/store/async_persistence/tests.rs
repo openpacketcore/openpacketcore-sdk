@@ -74,8 +74,10 @@ impl SessionConsensusPeer for Peer {
         &self,
         request: SessionConsensusWireRequest,
     ) -> Result<SessionConsensusWireResponse, SessionConsensusPeerError> {
-        if request.family == SessionConsensusRpcFamily::Vote
-            && self.blocked_votes.load(Ordering::Acquire)
+        if matches!(
+            request.family,
+            SessionConsensusRpcFamily::Vote | SessionConsensusRpcFamily::PreVote
+        ) && self.blocked_votes.load(Ordering::Acquire)
         {
             return Err(SessionConsensusPeerError::Unavailable);
         }
@@ -101,6 +103,7 @@ impl SessionConsensusPeer for Peer {
         if matches!(
             family,
             SessionConsensusRpcFamily::Vote
+                | SessionConsensusRpcFamily::PreVote
                 | SessionConsensusRpcFamily::AppendEntries
                 | SessionConsensusRpcFamily::AppendEntriesRoster
                 | SessionConsensusRpcFamily::InstallSnapshot
@@ -161,6 +164,15 @@ impl SessionConsensusPeer for Peer {
             }
         }
         Ok(response)
+    }
+
+    async fn call_pre_vote(
+        &self,
+        request: opc_consensus::ConsensusWireRequest,
+        timeout: std::time::Duration,
+    ) -> Result<opc_consensus::PreVoteCall, opc_consensus::ConsensusPeerError> {
+        // Every voter of this in-process cluster runs this build.
+        opc_consensus::forward_pre_vote(self, request, timeout).await
     }
 }
 

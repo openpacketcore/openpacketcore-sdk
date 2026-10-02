@@ -15,8 +15,8 @@ use std::time::Duration;
 use async_trait::async_trait;
 use futures_util::future::BoxFuture;
 use opc_consensus::{
-    ConsensusIdentity, ConsensusRpcFamily, DURABLE_CONSENSUS_REMOTE_RETIREMENT_PROBE_INTERVAL,
-    DURABLE_CONSENSUS_TIMING_PROFILE,
+    ConsensusIdentity, ConsensusRpcFamily, PreVoteCall,
+    DURABLE_CONSENSUS_REMOTE_RETIREMENT_PROBE_INTERVAL, DURABLE_CONSENSUS_TIMING_PROFILE,
 };
 use opc_redaction::metrics::METRICS;
 use opc_session_store::{
@@ -45,7 +45,7 @@ use crate::protocol::{
     SessionConsensusBootstrapResponse, SessionConsensusTransportRequest,
     SessionConsensusTransportResponse, CURRENT_SESSION_CONSENSUS_CONTRACT_PROFILE,
     MAX_HANDSHAKE_FRAME_SIZE, MAX_NEGOTIATED_FRAME_SIZE, MIN_SESSION_CONSENSUS_FRAME_SIZE,
-    SESSION_CONSENSUS_ALPN, SESSION_CONSENSUS_TRANSPORT_REVISION,
+    SESSION_CONSENSUS_ALPN, SESSION_CONSENSUS_PRE_VOTE_ALPN, SESSION_CONSENSUS_TRANSPORT_REVISION,
 };
 
 const DEFAULT_CONSENSUS_IDLE_TIMEOUT: Duration =
@@ -188,9 +188,31 @@ impl fmt::Debug for ConsensusTarget {
     }
 }
 
+/// The consensus protocols this release offers, the Pre-Vote revision first.
+///
+/// A server selects the first of its own protocols that the client offers, so
+/// two peers of this release negotiate Pre-Vote and a peer of a release
+/// without it negotiates [`SESSION_CONSENSUS_ALPN`].
+fn consensus_alpn_protocols() -> Vec<Vec<u8>> {
+    vec![
+        SESSION_CONSENSUS_PRE_VOTE_ALPN.to_vec(),
+        SESSION_CONSENSUS_ALPN.to_vec(),
+    ]
+}
+
+/// Whether a negotiated consensus protocol carries Pre-Vote, or `None` for any
+/// protocol this transport does not speak.
+fn negotiated_pre_vote(protocol: Option<&[u8]>) -> Option<bool> {
+    match protocol {
+        Some(protocol) if protocol == SESSION_CONSENSUS_PRE_VOTE_ALPN => Some(true),
+        Some(protocol) if protocol == SESSION_CONSENSUS_ALPN => Some(false),
+        _ => None,
+    }
+}
+
 fn consensus_client_tls_config(config: Arc<opc_tls::ClientConfig>) -> Arc<opc_tls::ClientConfig> {
     let mut config = config.as_ref().clone();
-    config.alpn_protocols = vec![SESSION_CONSENSUS_ALPN.to_vec()];
+    config.alpn_protocols = consensus_alpn_protocols();
     config.resumption = tokio_rustls::rustls::client::Resumption::disabled();
     config.enable_early_data = false;
     Arc::new(config)
@@ -198,7 +220,7 @@ fn consensus_client_tls_config(config: Arc<opc_tls::ClientConfig>) -> Arc<opc_tl
 
 fn consensus_server_tls_config(config: Arc<opc_tls::ServerConfig>) -> Arc<opc_tls::ServerConfig> {
     let mut config = config.as_ref().clone();
-    config.alpn_protocols = vec![SESSION_CONSENSUS_ALPN.to_vec()];
+    config.alpn_protocols = consensus_alpn_protocols();
     config.session_storage = Arc::new(tokio_rustls::rustls::server::NoServerSessionStorage {});
     config.ticketer = Arc::new(DisabledSessionTickets);
     config.send_tls13_tickets = 0;
@@ -350,6 +372,10 @@ struct ConsensusConnection {
     writer: Box<dyn AsyncWrite + Unpin + Send>,
     response_frame_size: usize,
     request_frame_size: usize,
+    // Whether the server negotiated the protocol revision that carries
+    // Pre-Vote. A server of a release without Pre-Vote cannot decode such a
+    // request, so this connection never sends it one.
+    pre_vote: bool,
     // Installed only when the cold coordinator publishes this exact
     // authenticated bootstrap. Cached-lane retirement carries the token back
     // to the coordinator so a delayed predecessor cannot reopen a probe gate
@@ -364,6 +390,15 @@ struct ConsensusConnection {
     // establishment/bootstrapping age is therefore the conservative fallback
     // used to prevent `None` from granting unbounded reuse.
     idle_deadline_origin: tokio::time::Instant,
+}
+
+/// What one outbound consensus call produced.
+enum ConsensusCallOutcome {
+    /// The peer answered the request.
+    Answered(SessionConsensusWireResponse),
+    /// The connection negotiated the protocol revision without Pre-Vote, so
+    /// the Pre-Vote request was not sent.
+    PreVoteUnsupported,
 }
 
 // A negotiated call owns its socket until a complete correlated response is
@@ -1309,9 +1344,8 @@ impl ConsensusColdConnector {
                             .connect(server_name, tcp)
                             .await
                             .map_err(map_tls_connect_error)?;
-                        if tls_stream.get_ref().1.alpn_protocol() != Some(SESSION_CONSENSUS_ALPN) {
-                            return Err(SessionConsensusPeerError::Protocol);
-                        }
+                        let pre_vote = negotiated_pre_vote(tls_stream.get_ref().1.alpn_protocol())
+                            .ok_or(SessionConsensusPeerError::Protocol)?;
                         let peer = opc_tls::peer_tls_identity_from_client_connection(
                             tls_stream.get_ref().1,
                         )
@@ -1353,6 +1387,7 @@ impl ConsensusColdConnector {
                             request_frame_size,
                             tls_completed_at,
                             lifecycle,
+                            pre_vote,
                         ))
                     }
                 })
@@ -1375,12 +1410,14 @@ impl ConsensusColdConnector {
                 request_frame_size,
                 tls_completed_at,
                 lifecycle,
+                pre_vote,
             ) = parts;
             return Ok(ConsensusConnection {
                 reader,
                 writer,
                 response_frame_size,
                 request_frame_size,
+                pre_vote,
                 admission_attempt_id: None,
                 lifecycle,
                 last_successful_correlated_use: None,
@@ -1406,6 +1443,9 @@ impl ConsensusColdConnector {
             writer: Box::new(writer),
             response_frame_size,
             request_frame_size,
+            // Plaintext exists only for insecure tests, whose peers all run
+            // this build.
+            pre_vote: true,
             admission_attempt_id: None,
             lifecycle: ConnectionLifecycle::new(
                 self.lifecycle_policy,
@@ -2510,7 +2550,8 @@ impl RemoteSessionConsensusPeer {
         connection_slot: &mut Option<ConsensusConnection>,
         request: SessionConsensusWireRequest,
         deadline: tokio::time::Instant,
-    ) -> Result<SessionConsensusWireResponse, SessionConsensusPeerError> {
+    ) -> Result<ConsensusCallOutcome, SessionConsensusPeerError> {
+        let pre_vote = request.family == ConsensusRpcFamily::PreVote;
         checked_wire_frame_size(self.max_frame_size)
             .map_err(|_| SessionConsensusPeerError::Protocol)?;
         if self.max_frame_size < MIN_SESSION_CONSENSUS_FRAME_SIZE {
@@ -2533,6 +2574,12 @@ impl RemoteSessionConsensusPeer {
             if self.connection_is_current(&mut connection, now)
                 && !self.connection_idle_reuse_expired(&connection, now)
             {
+                if pre_vote && !connection.pre_vote {
+                    // The server runs a release without Pre-Vote. Keep the
+                    // healthy lane and send nothing it could not decode.
+                    *connection_slot = Some(connection);
+                    return Ok(ConsensusCallOutcome::PreVoteUnsupported);
+                }
                 // Sample no later than request dispatch, then commit only
                 // after a complete correlated and payload-validated response.
                 // A failed/cancelled write never refreshes this idle epoch.
@@ -2562,7 +2609,7 @@ impl RemoteSessionConsensusPeer {
                         .await;
                     }
                 }
-                return result;
+                return result.map(ConsensusCallOutcome::Answered);
             }
             if let Some(reason) = connection.lifecycle.retirement(now) {
                 let epoch = self.connection_epoch(&connection);
@@ -2636,6 +2683,14 @@ impl RemoteSessionConsensusPeer {
                 .fetch_add(1, Ordering::Relaxed);
             return Err(SessionConsensusPeerError::Unavailable);
         }
+        if pre_vote && !connection.pre_vote {
+            // The server runs a release without Pre-Vote. Keep the fresh lane
+            // for its other calls and send nothing it could not decode.
+            if self.connection_is_current(&mut connection, tokio::time::Instant::now()) {
+                *connection_slot = Some(connection);
+            }
+            return Ok(ConsensusCallOutcome::PreVoteUnsupported);
+        }
         let dispatched_at = tokio::time::Instant::now();
         let result = self
             .call_negotiated(&mut connection, request, deadline)
@@ -2662,14 +2717,14 @@ impl RemoteSessionConsensusPeer {
                 .await;
             }
         }
-        result
+        result.map(ConsensusCallOutcome::Answered)
     }
 
     async fn call_with_timeout_inner(
         &self,
         request: SessionConsensusWireRequest,
         call_timeout: Duration,
-    ) -> Result<SessionConsensusWireResponse, SessionConsensusPeerError> {
+    ) -> Result<ConsensusCallOutcome, SessionConsensusPeerError> {
         let deadline = tokio::time::Instant::now()
             .checked_add(call_timeout)
             .ok_or(SessionConsensusPeerError::Protocol)?;
@@ -2891,7 +2946,7 @@ impl SessionConsensusPeer for RemoteSessionConsensusPeer {
         request: SessionConsensusWireRequest,
     ) -> Result<SessionConsensusWireResponse, SessionConsensusPeerError> {
         let call_timeout = self.deadline_policy.for_family(request.family);
-        self.call_with_timeout_inner(request, call_timeout).await
+        answered(self.call_with_timeout_inner(request, call_timeout).await)
     }
 
     async fn call_with_timeout(
@@ -2900,7 +2955,34 @@ impl SessionConsensusPeer for RemoteSessionConsensusPeer {
         timeout: Duration,
     ) -> Result<SessionConsensusWireResponse, SessionConsensusPeerError> {
         let call_timeout = timeout.min(self.deadline_policy.for_family(request.family));
-        self.call_with_timeout_inner(request, call_timeout).await
+        answered(self.call_with_timeout_inner(request, call_timeout).await)
+    }
+
+    /// Send a Pre-Vote only over a connection that negotiated the protocol
+    /// revision carrying it, and report a server of a release without
+    /// Pre-Vote as unable to answer.
+    async fn call_pre_vote(
+        &self,
+        request: SessionConsensusWireRequest,
+        timeout: Duration,
+    ) -> Result<PreVoteCall, SessionConsensusPeerError> {
+        let call_timeout = timeout.min(self.deadline_policy.for_family(request.family));
+        match self.call_with_timeout_inner(request, call_timeout).await? {
+            ConsensusCallOutcome::Answered(response) => Ok(PreVoteCall::Answered(response)),
+            ConsensusCallOutcome::PreVoteUnsupported => Ok(PreVoteCall::Unsupported),
+        }
+    }
+}
+
+/// The response of an ordinary call. A Pre-Vote sent through an ordinary call
+/// to a server of a release without Pre-Vote is refused unsent, never
+/// reported as an answer.
+fn answered(
+    outcome: Result<ConsensusCallOutcome, SessionConsensusPeerError>,
+) -> Result<SessionConsensusWireResponse, SessionConsensusPeerError> {
+    match outcome? {
+        ConsensusCallOutcome::Answered(response) => Ok(response),
+        ConsensusCallOutcome::PreVoteUnsupported => Err(SessionConsensusPeerError::Protocol),
     }
 }
 
@@ -3349,6 +3431,9 @@ struct PendingConsensusLifecycle {
     peer_certificate_expiry: Option<CertificateExpiryEvidence>,
     established_at: tokio::time::Instant,
     generation: u64,
+    // Whether this connection negotiated the protocol revision that carries
+    // Pre-Vote.
+    pre_vote: bool,
     #[cfg(test)]
     expire_at_final_ack_boundary: bool,
 }
@@ -3367,6 +3452,9 @@ impl PendingConsensusLifecycle {
             peer_certificate_expiry: None,
             established_at: tokio::time::Instant::now(),
             generation,
+            // Plaintext exists only for insecure tests, whose peers all run
+            // this build.
+            pre_vote: true,
             #[cfg(test)]
             expire_at_final_ack_boundary: false,
         }
@@ -3532,9 +3620,8 @@ async fn handle_consensus_connection(
             .map_err(classify_tls_io_error)?;
         let tls_completion = TlsCompletionTime::now();
         let established_at = tls_completion.instant();
-        if tls_stream.get_ref().1.alpn_protocol() != Some(SESSION_CONSENSUS_ALPN) {
-            return Err(ProtocolError::UnexpectedResponse);
-        }
+        let pre_vote = negotiated_pre_vote(tls_stream.get_ref().1.alpn_protocol())
+            .ok_or(ProtocolError::UnexpectedResponse)?;
         let peer = opc_tls::peer_tls_identity_from_server_connection(tls_stream.get_ref().1)
             .map_err(|_| ProtocolError::Authentication)?;
         let local_certificate_expiry = CertificateExpiryEvidence::capture(
@@ -3559,6 +3646,7 @@ async fn handle_consensus_connection(
                 peer_certificate_expiry: Some(peer_certificate_expiry),
                 established_at,
                 generation,
+                pre_vote,
                 #[cfg(test)]
                 expire_at_final_ack_boundary: false,
             },
@@ -3707,6 +3795,7 @@ where
 {
     #[cfg(test)]
     let expire_at_final_ack_boundary = pending_lifecycle.expire_at_final_ack_boundary;
+    let pre_vote = pending_lifecycle.pre_vote;
     let bootstrap_lifecycle = pending_lifecycle.provisional_lifecycle(lifecycle_policy)?;
     let bootstrap_cancellation =
         Arc::new(AtomicBool::new(global_cancellation.load(Ordering::Acquire)));
@@ -4089,6 +4178,13 @@ where
             Err(_) => SessionConsensusWireResponse {
                 result: Err(SessionConsensusPeerError::Protocol),
             },
+            // A client that negotiated the revision without Pre-Vote never
+            // sends one; refuse it rather than dispatch it.
+            Ok((_, request)) if request.family == ConsensusRpcFamily::PreVote && !pre_vote => {
+                SessionConsensusWireResponse {
+                    result: Err(SessionConsensusPeerError::Protocol),
+                }
+            }
             Ok((_, request)) => {
                 let handler_deadline = tokio::time::Instant::now()
                     .checked_add(rpc_timeout)
@@ -5275,6 +5371,7 @@ mod tests {
             writer: Box::new(tokio::io::sink()),
             response_frame_size: MAX_NEGOTIATED_FRAME_SIZE,
             request_frame_size: MAX_NEGOTIATED_FRAME_SIZE,
+            pre_vote: true,
             admission_attempt_id: None,
             lifecycle,
             last_successful_correlated_use: None,
@@ -5327,6 +5424,7 @@ mod tests {
                 writer: Box::new(tokio::io::sink()),
                 response_frame_size: MAX_NEGOTIATED_FRAME_SIZE,
                 request_frame_size: MAX_NEGOTIATED_FRAME_SIZE,
+                pre_vote: true,
                 admission_attempt_id: None,
                 lifecycle: ConnectionLifecycle::new(
                     lifecycle_policy,
@@ -6319,6 +6417,7 @@ mod tests {
                 writer: Box::new(tokio::io::sink()),
                 response_frame_size: MAX_NEGOTIATED_FRAME_SIZE,
                 request_frame_size: MAX_NEGOTIATED_FRAME_SIZE,
+                pre_vote: true,
                 admission_attempt_id: None,
                 lifecycle: ConnectionLifecycle::new(
                     lifecycle_policy,
@@ -6577,6 +6676,7 @@ mod tests {
                 writer: Box::new(writer),
                 response_frame_size: MIN_SESSION_CONSENSUS_FRAME_SIZE,
                 request_frame_size: MIN_SESSION_CONSENSUS_FRAME_SIZE,
+                pre_vote: true,
                 admission_attempt_id: None,
                 lifecycle,
                 last_successful_correlated_use: None,
@@ -6645,6 +6745,7 @@ mod tests {
                 writer: Box::new(writer),
                 response_frame_size: MIN_SESSION_CONSENSUS_FRAME_SIZE,
                 request_frame_size: MIN_SESSION_CONSENSUS_FRAME_SIZE,
+                pre_vote: true,
                 admission_attempt_id: None,
                 lifecycle,
                 last_successful_correlated_use: None,
@@ -6704,6 +6805,7 @@ mod tests {
             writer: Box::new(writer),
             response_frame_size: MIN_SESSION_CONSENSUS_FRAME_SIZE,
             request_frame_size: MIN_SESSION_CONSENSUS_FRAME_SIZE,
+            pre_vote: true,
             admission_attempt_id: None,
             lifecycle: ConnectionLifecycle::new(policy, now, None, None, 0, None)
                 .expect("connection lifecycle"),
@@ -6762,6 +6864,7 @@ mod tests {
             writer: Box::new(writer),
             response_frame_size: MIN_SESSION_CONSENSUS_FRAME_SIZE,
             request_frame_size: MIN_SESSION_CONSENSUS_FRAME_SIZE,
+            pre_vote: true,
             admission_attempt_id: None,
             lifecycle: ConnectionLifecycle::new(
                 policy,
@@ -6819,6 +6922,7 @@ mod tests {
             writer: Box::new(writer),
             response_frame_size: MIN_SESSION_CONSENSUS_FRAME_SIZE,
             request_frame_size: MIN_SESSION_CONSENSUS_FRAME_SIZE,
+            pre_vote: true,
             admission_attempt_id: None,
             lifecycle: ConnectionLifecycle::new(policy, now, None, None, 0, None)
                 .expect("connection lifecycle"),
@@ -7445,6 +7549,125 @@ mod tests {
         (result, writer)
     }
 
+    /// Serve one authenticated connection that sends `families` after its
+    /// Hello. Returns how many calls reached the handler and every response.
+    async fn dispatch_families(
+        pre_vote: bool,
+        families: &[ConsensusRpcFamily],
+    ) -> (usize, Vec<SessionConsensusWireResponse>) {
+        let (server_binding, client_binding) = bindings();
+        let reauthentication = SessionReauthenticationControl::new();
+        let mut pending = PendingConsensusLifecycle::insecure(reauthentication.generation());
+        pending.pre_vote = pre_vote;
+        let mut input = valid_consensus_hello_bytes(&client_binding).await;
+        for family in families {
+            let request = SessionConsensusWireRequest::try_new(
+                client_binding.consensus_identity(),
+                client_binding.local_consensus_node_id(),
+                *family,
+                vec![0x5a],
+            )
+            .expect("bounded engine request");
+            write_frame(
+                &mut input,
+                &SessionConsensusTransportRequest::from_wire_call(uuid::Uuid::new_v4(), request)
+                    .expect("ordinary engine call"),
+            )
+            .await
+            .expect("encode engine call");
+        }
+        let (mut peer, mut reader) = tokio::io::duplex(input.len() + 16);
+        peer.write_all(&input)
+            .await
+            .expect("write authenticated consensus test input");
+        let handler = Arc::new(CountingHandler(AtomicUsize::new(0)));
+        let mut writer = Vec::new();
+        let cancellation = AtomicBool::new(false);
+        let (_shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+        let _ = dispatch_consensus(
+            &mut reader,
+            &mut writer,
+            ConnectionPeerIdentity::InsecureTest,
+            pending,
+            SessionMembershipAdmission::from_current_binding(server_binding),
+            handler.clone(),
+            Arc::new(Semaphore::new(1)),
+            MAX_NEGOTIATED_FRAME_SIZE,
+            Duration::from_millis(20),
+            tokio::time::Instant::now() + Duration::from_secs(1),
+            Duration::from_secs(1),
+            &cancellation,
+            shutdown_rx,
+            test_consensus_lifecycle_policy(),
+            reauthentication,
+        )
+        .await;
+        drop(peer);
+        let mut output = writer.as_slice();
+        let acknowledgement: SessionConsensusBootstrapResponse =
+            read_frame(&mut output, MAX_HANDSHAKE_FRAME_SIZE)
+                .await
+                .expect("bootstrap acknowledgement");
+        assert!(matches!(
+            acknowledgement,
+            SessionConsensusBootstrapResponse::Accepted(_)
+        ));
+        let mut responses = Vec::new();
+        for _ in families {
+            let SessionConsensusTransportResponse::Call { response, .. } =
+                read_frame(&mut output, MAX_NEGOTIATED_FRAME_SIZE)
+                    .await
+                    .expect("one response per call");
+            responses.push(response);
+        }
+        (handler.0.load(Ordering::Relaxed), responses)
+    }
+
+    #[tokio::test]
+    async fn consensus_server_refuses_pre_vote_on_a_connection_negotiated_without_it() {
+        // Each served connection ends in an idle retirement, which the
+        // connection-outcome metric tests count exactly.
+        let _guard = crate::test_support::SESSION_CONNECTION_METRICS_TEST_LOCK
+            .lock()
+            .await;
+        let families = [ConsensusRpcFamily::PreVote, ConsensusRpcFamily::Vote];
+        let (handled, responses) = dispatch_families(false, &families).await;
+        assert_eq!(
+            responses[0].result,
+            Err(SessionConsensusPeerError::Protocol),
+            "a client of a release without Pre-Vote never sends one; refuse it unhandled"
+        );
+        assert_eq!(responses[1].result, Ok(vec![0x5a]));
+        assert_eq!(handled, 1, "only the Vote reaches the engine handler");
+
+        let (handled, responses) = dispatch_families(true, &families).await;
+        assert!(responses
+            .iter()
+            .all(|response| response.result == Ok(vec![0x5a])));
+        assert_eq!(handled, 2, "a Pre-Vote connection serves both families");
+    }
+
+    #[test]
+    fn consensus_alpn_offers_pre_vote_first_and_names_only_known_protocols() {
+        assert_eq!(
+            consensus_alpn_protocols(),
+            vec![
+                SESSION_CONSENSUS_PRE_VOTE_ALPN.to_vec(),
+                SESSION_CONSENSUS_ALPN.to_vec()
+            ]
+        );
+        assert_eq!(
+            negotiated_pre_vote(Some(SESSION_CONSENSUS_PRE_VOTE_ALPN)),
+            Some(true)
+        );
+        assert_eq!(
+            negotiated_pre_vote(Some(SESSION_CONSENSUS_ALPN)),
+            Some(false)
+        );
+        assert_eq!(negotiated_pre_vote(Some(b"opc-session-consensus/1")), None);
+        assert_eq!(negotiated_pre_vote(None), None);
+    }
+
     #[tokio::test]
     async fn consensus_server_distinguishes_authenticated_idle_from_active_frame_timeout() {
         let _guard = crate::test_support::SESSION_CONNECTION_METRICS_TEST_LOCK
@@ -7671,6 +7894,7 @@ mod tests {
             peer_certificate_expiry: None,
             established_at,
             generation: 0,
+            pre_vote: true,
             expire_at_final_ack_boundary: false,
         };
         let policy = test_consensus_lifecycle_policy();
@@ -9080,6 +9304,7 @@ mod tests {
                 writer: Box::new(writer),
                 response_frame_size: MIN_SESSION_CONSENSUS_FRAME_SIZE,
                 request_frame_size: MIN_SESSION_CONSENSUS_FRAME_SIZE,
+                pre_vote: true,
                 admission_attempt_id: None,
                 lifecycle,
                 last_successful_correlated_use: None,
@@ -9114,6 +9339,7 @@ mod tests {
             writer: Box::new(writer),
             response_frame_size: MIN_SESSION_CONSENSUS_FRAME_SIZE,
             request_frame_size: MIN_SESSION_CONSENSUS_FRAME_SIZE,
+            pre_vote: true,
             admission_attempt_id: None,
             lifecycle,
             last_successful_correlated_use: None,

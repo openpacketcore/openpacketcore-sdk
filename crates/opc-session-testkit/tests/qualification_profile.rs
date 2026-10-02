@@ -3,7 +3,9 @@ use std::fs;
 use std::path::Path;
 use std::process::{Command, Output};
 
-use opc_consensus::{DURABLE_CONSENSUS_TIMING_PROFILE, DURABLE_OPENRAFT_PROFILE};
+use opc_consensus::{
+    DurableConsensusTimingProfile, DURABLE_CONSENSUS_TIMING_PROFILE, DURABLE_OPENRAFT_PROFILE,
+};
 use opc_session_net::{
     CURRENT_SESSION_CONSENSUS_CONTRACT_PROFILE, DEFAULT_MAX_AUTHENTICATION_AGE,
     DEFAULT_PERSISTENT_SESSION_CONSUMER_CONNECT_ATTEMPTS,
@@ -647,58 +649,66 @@ fn frozen_v6_profile_matches_its_declared_consensus_and_store_contract() {
         DEFAULT_ROTATION_JITTER.as_millis() as u64
     );
 
-    let timing = DURABLE_CONSENSUS_TIMING_PROFILE;
     assert_eq!(
         profile.consensus_timing.cold_connect_budget_composition,
         "contained-within-family-deadline"
     );
     assert_eq!(
-        profile.consensus_timing.cold_connect_timeout_millis,
-        timing.cold_connect_timeout_millis
-    );
-    assert_eq!(
-        profile.consensus_timing.append_entries_timeout_millis,
-        timing.append_entries_timeout_millis
-    );
-    assert_eq!(
-        profile.consensus_timing.heartbeat_interval_millis,
-        DURABLE_OPENRAFT_PROFILE.heartbeat_interval_millis
-    );
-    assert_eq!(
-        profile.consensus_timing.vote_timeout_millis,
-        timing.vote_timeout_millis
-    );
-    assert_eq!(
-        profile.consensus_timing.election_timeout_min_millis,
-        DURABLE_OPENRAFT_PROFILE.election_timeout_min_millis
-    );
-    assert_eq!(
-        profile.consensus_timing.election_timeout_max_millis,
-        DURABLE_OPENRAFT_PROFILE.election_timeout_max_millis
-    );
-    assert_eq!(
-        profile.consensus_timing.install_snapshot_timeout_millis,
-        DURABLE_OPENRAFT_PROFILE.install_snapshot_timeout_millis
-    );
-    assert_eq!(
-        profile.consensus_timing.forward_mutation_timeout_millis,
-        timing.forward_mutation_timeout_millis
-    );
-    assert_eq!(
-        profile.consensus_timing.read_barrier_timeout_millis,
-        timing.read_barrier_timeout_millis
-    );
-    assert_eq!(
-        profile.consensus_timing.server_idle_timeout_millis,
-        timing.server_idle_timeout_millis
-    );
-    assert_eq!(
-        profile.consensus_timing.server_handler_timeout_millis,
-        timing.server_handler_timeout_millis
-    );
-    assert_eq!(
         profile.consensus_timing.heartbeat_interval_millis,
         profile.consensus_timing.append_entries_timeout_millis
+    );
+    // The frozen v6 artifact keeps the timing profile it was published with.
+    // The live profile later decoupled the heartbeat from the AppendEntries
+    // ceiling and shortened the maximum election timeout; every other family
+    // still equals the live value.
+    let frozen_timing = DurableConsensusTimingProfile {
+        cold_connect_timeout_millis: profile.consensus_timing.cold_connect_timeout_millis,
+        heartbeat_interval_millis: profile.consensus_timing.heartbeat_interval_millis,
+        append_entries_timeout_millis: profile.consensus_timing.append_entries_timeout_millis,
+        vote_timeout_millis: profile.consensus_timing.vote_timeout_millis,
+        install_snapshot_timeout_millis: profile.consensus_timing.install_snapshot_timeout_millis,
+        forward_mutation_timeout_millis: profile.consensus_timing.forward_mutation_timeout_millis,
+        read_barrier_timeout_millis: profile.consensus_timing.read_barrier_timeout_millis,
+        election_timeout_min_millis: profile.consensus_timing.election_timeout_min_millis,
+        election_timeout_max_millis: profile.consensus_timing.election_timeout_max_millis,
+        operation_timeout_millis: profile.bounds.operation_timeout_millis,
+        server_idle_timeout_millis: profile.consensus_timing.server_idle_timeout_millis,
+        server_handler_timeout_millis: profile.consensus_timing.server_handler_timeout_millis,
+    };
+    assert_eq!(
+        frozen_timing,
+        DurableConsensusTimingProfile {
+            cold_connect_timeout_millis: 1_500,
+            heartbeat_interval_millis: 2_000,
+            append_entries_timeout_millis: 2_000,
+            vote_timeout_millis: 5_000,
+            install_snapshot_timeout_millis: 10_000,
+            forward_mutation_timeout_millis: 10_000,
+            read_barrier_timeout_millis: 10_000,
+            election_timeout_min_millis: 5_000,
+            election_timeout_max_millis: 8_000,
+            operation_timeout_millis: 10_000,
+            server_idle_timeout_millis: 30_000,
+            server_handler_timeout_millis: 30_000,
+        }
+    );
+    let timing = DURABLE_CONSENSUS_TIMING_PROFILE;
+    assert_ne!(
+        frozen_timing, timing,
+        "the frozen v6 timing must not describe the live profile"
+    );
+    assert_eq!(
+        DurableConsensusTimingProfile {
+            heartbeat_interval_millis: timing.heartbeat_interval_millis,
+            election_timeout_max_millis: timing.election_timeout_max_millis,
+            ..frozen_timing
+        },
+        timing,
+        "only the heartbeat interval and the maximum election timeout moved"
+    );
+    assert_eq!(
+        frozen_timing.install_snapshot_timeout_millis,
+        DURABLE_OPENRAFT_PROFILE.install_snapshot_timeout_millis
     );
     assert!(
         profile.consensus_timing.cold_connect_timeout_millis
@@ -1622,7 +1632,7 @@ fn inventory_pins_workspace_msrv_source_build_gate_and_openraft_revision() {
     let workspace = include_str!("../../../Cargo.toml");
     assert!(workspace.contains("rust-version = \"1.89\""));
     assert!(workspace.contains(
-        "openraft = { version = \"=0.9.25\", git = \"https://github.com/openpacketcore/openraft\", rev = \"72e327a4f25cbbe3a3695d8c3c0f0970ccb925d5\""
+        "openraft = { version = \"=0.9.25\", git = \"https://github.com/openpacketcore/openraft\", rev = \"20f4f3123168907d5a00ec3772c78872e9a47820\""
     ));
     for manifest in [
         include_str!("../../opc-alarm/Cargo.toml"),
@@ -1639,7 +1649,7 @@ fn inventory_pins_workspace_msrv_source_build_gate_and_openraft_revision() {
     let lockfile = include_str!("../../../Cargo.lock");
     assert!(lockfile.contains("name = \"openraft\"\nversion = \"0.9.25\""));
     assert!(lockfile.contains(
-        "source = \"git+https://github.com/openpacketcore/openraft?rev=72e327a4f25cbbe3a3695d8c3c0f0970ccb925d5#72e327a4f25cbbe3a3695d8c3c0f0970ccb925d5\""
+        "source = \"git+https://github.com/openpacketcore/openraft?rev=20f4f3123168907d5a00ec3772c78872e9a47820#20f4f3123168907d5a00ec3772c78872e9a47820\""
     ));
 }
 
@@ -1676,7 +1686,7 @@ fn cargo_metadata_matches_the_exact_openraft_and_foundation_feature_profile() {
     assert_eq!(openraft["req"], "=0.9.25");
     assert_eq!(
         openraft["source"],
-        "git+https://github.com/openpacketcore/openraft?rev=72e327a4f25cbbe3a3695d8c3c0f0970ccb925d5"
+        "git+https://github.com/openpacketcore/openraft?rev=20f4f3123168907d5a00ec3772c78872e9a47820"
     );
     assert_eq!(
         openraft["features"],
@@ -1687,7 +1697,7 @@ fn cargo_metadata_matches_the_exact_openraft_and_foundation_feature_profile() {
     assert_eq!(resolved_openraft["version"], "0.9.25");
     assert_eq!(
         resolved_openraft["source"],
-        "git+https://github.com/openpacketcore/openraft?rev=72e327a4f25cbbe3a3695d8c3c0f0970ccb925d5#72e327a4f25cbbe3a3695d8c3c0f0970ccb925d5"
+        "git+https://github.com/openpacketcore/openraft?rev=20f4f3123168907d5a00ec3772c78872e9a47820#20f4f3123168907d5a00ec3772c78872e9a47820"
     );
     let fork_source = resolved_openraft["source"]
         .as_str()

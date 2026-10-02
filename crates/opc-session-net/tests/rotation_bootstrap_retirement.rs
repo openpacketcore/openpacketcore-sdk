@@ -23,8 +23,8 @@ use opc_session_store::fake::FakeSessionBackend;
 use opc_session_store::{
     QuorumReplicaDescriptor, ReplicaBackingIdentity, ReplicaEndpoint, ReplicaFailureDomain,
     ReplicaId, ReplicaTlsIdentity, SessionBackend, SessionConsensusPeer, SessionConsensusPeerError,
-    SessionConsensusRpcFamily, SessionConsensusRpcHandler, SessionConsensusWireRequest,
-    SessionConsensusWireResponse,
+    SessionConsensusPreVoteCall, SessionConsensusRpcFamily, SessionConsensusRpcHandler,
+    SessionConsensusWireRequest, SessionConsensusWireResponse,
 };
 use opc_tls::{
     AuthenticatedClientConfig, AuthenticatedServerConfig, TlsConfigBuilder,
@@ -33,6 +33,10 @@ use opc_tls::{
 
 const CLIENT_REPLICA: u16 = 1;
 const SERVER_REPLICA: u16 = 2;
+
+/// Serializes the tests in this binary: they assert exact deltas of the
+/// process-wide connection metrics.
+static CONNECTION_METRICS_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 struct TestPki {
     ca: rcgen::CertifiedIssuer<'static, rcgen::KeyPair>,
@@ -973,6 +977,9 @@ async fn assert_consensus_server_pre_hello_rotation(
 
 #[test]
 fn authenticated_pre_hello_rotation_is_explicit_bounded_and_metric_clean() {
+    let _metrics = CONNECTION_METRICS_TEST_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .worker_threads(2)
         .enable_all()
@@ -995,5 +1002,122 @@ fn authenticated_pre_hello_rotation_is_explicit_bounded_and_metric_clean() {
         assert_generic_server_pre_hello_rotation(&pki, &manifest, RotationRace::Explicit).await;
         assert_consensus_server_pre_hello_rotation(&pki, &manifest, RotationRace::Material).await;
         assert_consensus_server_pre_hello_rotation(&pki, &manifest, RotationRace::Explicit).await;
+    });
+}
+
+/// A consensus server of a release without Pre-Vote offers only the previous
+/// consensus protocol. The client negotiates it, reports Pre-Vote calls to that
+/// voter as unsupported without sending them, and keeps serving every other
+/// family on the same connection.
+#[test]
+fn consensus_client_sends_no_pre_vote_to_a_previous_release_server() {
+    let _metrics = CONNECTION_METRICS_TEST_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(2)
+        .enable_all()
+        .build()
+        .expect("previous-release consensus test runtime");
+    runtime.block_on(async {
+        let pki = TestPki::new();
+        let manifest = manifest();
+        let (_server_source, server_config) = pki.server_source(SERVER_REPLICA);
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind previous-release consensus listener");
+        let address = listener
+            .local_addr()
+            .expect("previous-release consensus address");
+        let server = tokio::spawn(async move {
+            let mut tls = accept_tls(&listener, &server_config, SESSION_CONSENSUS_ALPN).await;
+            let hello: serde_json::Value = read_frame(&mut tls, DEFAULT_MAX_FRAME_SIZE)
+                .await
+                .expect("read consensus Hello");
+            let hello = &hello["Hello"];
+            write_frame(
+                &mut tls,
+                &serde_json::json!({
+                    "Accepted": {
+                        "transport_revision": hello["transport_revision"].clone(),
+                        "contract_profile": hello["contract_profile"].clone(),
+                        "identity": hello["identity"].clone(),
+                        "server_node_id": hello["expected_server_node_id"].clone(),
+                        "accepted_sender_node_id": hello["sender_node_id"].clone(),
+                        "handshake_nonce": hello["handshake_nonce"].clone(),
+                        "accepted_response_frame_size": hello["requested_response_frame_size"].clone(),
+                        "server_request_frame_size": opc_session_net::MAX_NEGOTIATED_FRAME_SIZE as u32,
+                    }
+                }),
+            )
+            .await
+            .expect("write previous-release consensus acknowledgement");
+            // A Pre-Vote sent first would arrive here, where a previous-release
+            // server could not decode it.
+            let call: serde_json::Value = read_frame(&mut tls, DEFAULT_MAX_FRAME_SIZE)
+                .await
+                .expect("read the first consensus call");
+            let call = &call["Call"];
+            write_frame(
+                &mut tls,
+                &serde_json::json!({
+                    "Call": {
+                        "call_id": call["call_id"].clone(),
+                        "response": {"result": {"Ok": call["request"]["payload"].clone()}},
+                    }
+                }),
+            )
+            .await
+            .expect("write consensus response");
+            call["request"]["family"].clone()
+        });
+
+        let (_client_source, client_config) = pki.client_source(CLIENT_REPLICA);
+        let binding = manifest
+            .bind_local(replica_id(CLIENT_REPLICA))
+            .expect("client binding")
+            .bind_remote(replica_id(SERVER_REPLICA))
+            .expect("remote binding");
+        let request = |family, payload: &[u8]| {
+            SessionConsensusWireRequest::try_new(
+                binding.consensus_identity(),
+                binding.local_consensus_node_id(),
+                family,
+                payload.to_vec(),
+            )
+            .expect("bounded consensus request")
+        };
+        let pre_vote = request(SessionConsensusRpcFamily::PreVote, b"pre-vote");
+        let vote = request(SessionConsensusRpcFamily::Vote, b"vote");
+        let peer = RemoteSessionConsensusPeer::new_with_resolver(
+            binding.clone(),
+            resolver(address),
+            client_config,
+            Some(Duration::from_secs(2)),
+        )
+        .with_connection_lifecycle(lifecycle_policy());
+
+        assert_eq!(
+            peer.call_pre_vote(pre_vote.clone(), Duration::from_secs(2))
+                .await,
+            Ok(SessionConsensusPreVoteCall::Unsupported),
+            "a voter that negotiated the previous protocol cannot answer Pre-Vote"
+        );
+        assert_eq!(
+            peer.call(pre_vote).await,
+            Err(SessionConsensusPeerError::Protocol),
+            "no call path sends that voter a Pre-Vote"
+        );
+        assert_eq!(
+            peer.call(vote).await,
+            Ok(SessionConsensusWireResponse {
+                result: Ok(b"vote".to_vec()),
+            }),
+            "the same connection keeps serving every other family"
+        );
+        assert_eq!(
+            server.await.expect("previous-release consensus server"),
+            serde_json::json!("Vote")
+        );
     });
 }

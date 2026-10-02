@@ -25,7 +25,8 @@ use opc_consensus::{
     encode_roster_bounded, DurableOpenraftDomain, EnsureLinearizableOutcome,
     EnsureLinearizableSupervisor, LinearizableReadAdmit, LinearizableReadBarrier,
     LinearizableReadBarrierError, LinearizableReadLease, DURABLE_CONSENSUS_OPERATION_TIMEOUT,
-    DURABLE_OPENRAFT_LINEARIZABILITY_ADMISSION_CAPACITY, DURABLE_OPENRAFT_PROPOSAL_ADMISSION_SLOTS,
+    DURABLE_CONSENSUS_TIMING_PROFILE, DURABLE_OPENRAFT_LINEARIZABILITY_ADMISSION_CAPACITY,
+    DURABLE_OPENRAFT_PROPOSAL_ADMISSION_SLOTS,
 };
 use opc_types::Timestamp;
 use serde::de::{SeqAccess, Visitor};
@@ -291,6 +292,113 @@ fn reset_roster_ingress_test_counters() {
 }
 
 const SESSION_CONSENSUS_ROUTE_RETRY_BACKOFF: Duration = Duration::from_millis(50);
+/// Grace a leader-routed call keeps after this replica observes a different
+/// leader. A deposed leader's in-flight answer, such as a planned handoff's
+/// not-leader reply, normally arrives within it; a lost leader that
+/// black-holes the connection is abandoned at its end rather than at the
+/// caller's deadline. It is the one heartbeat interval that the documented
+/// unplanned leader-loss write stall reserves for that stale attempt.
+const STALE_LEADER_ROUTE_GRACE: Duration =
+    DURABLE_CONSENSUS_TIMING_PROFILE.stale_leader_route_grace();
+
+/// A leader-routed call's target and the leader this replica's engine named
+/// when the route was chosen.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct LeaderRoute {
+    target: SessionConsensusNodeId,
+    /// The target itself for a route taken from the local view; for a route
+    /// a peer's redirect named, whatever the local view named then.
+    chosen_under: Option<SessionConsensusNodeId>,
+}
+
+impl LeaderRoute {
+    /// A route to the leader the local view names.
+    const fn from_local_view(leader: SessionConsensusNodeId) -> Self {
+        Self {
+            target: leader,
+            chosen_under: Some(leader),
+        }
+    }
+
+    /// Whether a local view that names `observed` supersedes this route: it
+    /// names a leader other than both the target and the leader the route was
+    /// chosen under. A redirect may lead away from a leader the local view
+    /// still names, so that view alone never supersedes it.
+    fn superseded_by(self, observed: Option<SessionConsensusNodeId>) -> bool {
+        observed.is_some_and(|leader| leader != self.target) && observed != self.chosen_under
+    }
+
+    /// Record that the local view names `observed`, and return whether that supersedes this
+    /// route.
+    ///
+    /// A view that names the target confirms the route: from then on, the leader a redirect was
+    /// chosen under no longer exempts it, so that leader leading again supersedes it like any
+    /// other.
+    fn observe(&mut self, observed: Option<SessionConsensusNodeId>) -> bool {
+        if observed == Some(self.target) {
+            self.chosen_under = Some(self.target);
+        }
+        self.superseded_by(observed)
+    }
+}
+
+#[cfg(test)]
+mod leader_route_tests {
+    use super::*;
+
+    fn node(value: u64) -> SessionConsensusNodeId {
+        SessionConsensusNodeId::new(value).expect("valid test consensus node ID")
+    }
+
+    #[test]
+    fn a_route_from_the_local_view_is_superseded_by_any_other_known_leader() {
+        let route = LeaderRoute::from_local_view(node(1));
+        assert!(!route.superseded_by(Some(node(1))));
+        assert!(
+            !route.superseded_by(None),
+            "an unknown leader supersedes nothing"
+        );
+        assert!(route.superseded_by(Some(node(2))));
+    }
+
+    #[test]
+    fn a_redirected_route_is_not_superseded_by_the_leader_it_led_away_from() {
+        let route = LeaderRoute {
+            target: node(2),
+            chosen_under: Some(node(1)),
+        };
+        assert!(!route.superseded_by(Some(node(1))), "the stale local view");
+        assert!(!route.superseded_by(Some(node(2))), "the redirect target");
+        assert!(!route.superseded_by(None));
+        assert!(route.superseded_by(Some(node(3))), "a third leader");
+
+        let unknown = LeaderRoute {
+            target: node(2),
+            chosen_under: None,
+        };
+        assert!(!unknown.superseded_by(None));
+        assert!(!unknown.superseded_by(Some(node(2))));
+        assert!(unknown.superseded_by(Some(node(1))));
+    }
+
+    #[test]
+    fn a_redirected_route_confirmed_by_the_view_is_superseded_by_its_source() {
+        let mut route = LeaderRoute {
+            target: node(2),
+            chosen_under: Some(node(1)),
+        };
+        assert!(!route.observe(Some(node(1))), "the stale local view");
+        assert!(
+            !route.observe(Some(node(2))),
+            "the view confirms the target"
+        );
+        assert!(!route.observe(None));
+        assert!(
+            route.observe(Some(node(1))),
+            "the source leading again supersedes the confirmed route"
+        );
+    }
+}
 const FENCED_TRANSITION_V2_STATUS_LEADER_COLLECTION_WINDOW: Duration = Duration::from_micros(500);
 const GENERIC_WATCH_AUTHORITY_RECHECK_INTERVAL: Duration = Duration::from_millis(50);
 const TOPOLOGY_ENDPOINT_BINDING_DOMAIN: &[u8] =
@@ -3153,6 +3261,15 @@ impl ConsensusSessionStore {
     #[doc(hidden)]
     pub fn set_automatic_election_for_test(&self, enabled: bool) {
         self.inner.raft.runtime_config().elect(enabled);
+    }
+
+    /// Enable or disable a leader's periodic idle heartbeats for deterministic
+    /// integration qualification. Log replication, commit propagation and
+    /// leadership-confirmation rounds keep running.
+    #[cfg(feature = "test-control")]
+    #[doc(hidden)]
+    pub fn set_periodic_heartbeat_for_test(&self, enabled: bool) {
+        self.inner.raft.runtime_config().heartbeat(enabled);
     }
 
     /// Ask Openraft to start one normal campaign for deterministic integration
@@ -7252,16 +7369,17 @@ impl ConsensusSessionStore {
         let mut outcome_may_be_unavailable = false;
 
         loop {
-            let leader = match preferred.take() {
-                Some(leader) => leader,
+            let route = match preferred.take() {
+                Some(route) => route,
                 None => match self.wait_for_known_leader(deadline).await {
-                    Ok(leader) => leader,
+                    Ok(leader) => LeaderRoute::from_local_view(leader),
                     Err(_) if outcome_may_be_unavailable => {
                         return ConsensusSubmissionEffect::OutcomeUnknown;
                     }
                     Err(error) => return ConsensusSubmissionEffect::NotTransmitted(error),
                 },
             };
+            let leader = route.target;
             // Fixed recovery is replica-local durable authority. Re-read it
             // after route discovery or refresh and immediately before every
             // remote forwarding attempt. The local-leader path already
@@ -7289,14 +7407,20 @@ impl ConsensusSessionStore {
                     .await
             } else {
                 match if roster_mutation {
-                    self.call_roster_mutation_peer(leader, &request, deadline)
-                        .await
+                    self.bound_by_local_leader_view(
+                        route,
+                        self.call_roster_mutation_peer(leader, &request, deadline),
+                    )
+                    .await
                 } else {
-                    self.call_peer::<_, ForwardMutationReply>(
-                        leader,
-                        SessionConsensusRpcFamily::ForwardMutation,
-                        &BorrowedForwardRequest::Mutation(&request),
-                        deadline,
+                    self.bound_by_local_leader_view(
+                        route,
+                        self.call_peer::<_, ForwardMutationReply>(
+                            leader,
+                            SessionConsensusRpcFamily::ForwardMutation,
+                            &BorrowedForwardRequest::Mutation(&request),
+                            deadline,
+                        ),
                     )
                     .await
                 } {
@@ -7358,9 +7482,11 @@ impl ConsensusSessionStore {
                 ForwardMutationReply::NotLeader {
                     leader: next_leader,
                 } => {
-                    preferred = next_leader.filter(|candidate| {
-                        *candidate != leader && self.is_current_member(*candidate)
-                    });
+                    preferred = next_leader
+                        .filter(|candidate| {
+                            *candidate != leader && self.is_current_member(*candidate)
+                        })
+                        .map(|candidate| self.redirected_route(candidate));
                     if preferred.is_none() {
                         if let Err(error) = self.wait_for_route_refresh(leader, deadline).await {
                             return if outcome_may_be_unavailable {
@@ -7458,10 +7584,11 @@ impl ConsensusSessionStore {
         };
         let mut preferred = None;
         loop {
-            let leader = match preferred.take() {
-                Some(leader) => leader,
-                None => self.wait_for_known_leader(deadline).await?,
+            let route = match preferred.take() {
+                Some(route) => route,
+                None => LeaderRoute::from_local_view(self.wait_for_known_leader(deadline).await?),
             };
+            let leader = route.target;
             // Recovery authority is replica-local. Route discovery and every
             // route-refresh retry can await long enough for this follower to
             // enter recovery, so prove authority again at the remote
@@ -7481,11 +7608,14 @@ impl ConsensusSessionStore {
                     .await
             } else {
                 match self
-                    .call_peer::<_, ForwardMutationReply>(
-                        leader,
-                        SessionConsensusRpcFamily::ForwardMutation,
-                        &BorrowedForwardRequest::Mutation(&request),
-                        deadline,
+                    .bound_by_local_leader_view(
+                        route,
+                        self.call_peer::<_, ForwardMutationReply>(
+                            leader,
+                            SessionConsensusRpcFamily::ForwardMutation,
+                            &BorrowedForwardRequest::Mutation(&request),
+                            deadline,
+                        ),
                     )
                     .await
                 {
@@ -7556,9 +7686,11 @@ impl ConsensusSessionStore {
                 ForwardMutationReply::NotLeader {
                     leader: next_leader,
                 } => {
-                    preferred = next_leader.filter(|candidate| {
-                        *candidate != leader && self.is_current_member(*candidate)
-                    });
+                    preferred = next_leader
+                        .filter(|candidate| {
+                            *candidate != leader && self.is_current_member(*candidate)
+                        })
+                        .map(|candidate| self.redirected_route(candidate));
                     if preferred.is_none() {
                         self.wait_for_route_refresh(leader, deadline).await?;
                     }
@@ -7590,10 +7722,11 @@ impl ConsensusSessionStore {
         };
         let mut preferred = None;
         loop {
-            let leader = match preferred.take() {
-                Some(leader) => leader,
-                None => self.wait_for_known_leader(deadline).await?,
+            let route = match preferred.take() {
+                Some(route) => route,
+                None => LeaderRoute::from_local_view(self.wait_for_known_leader(deadline).await?),
             };
+            let leader = route.target;
             // As with ordinary mutation forwarding, recovery authority must
             // be revalidated after each selected or refreshed remote route
             // and immediately before the preflight can transmit an
@@ -7624,11 +7757,14 @@ impl ConsensusSessionStore {
                 .await
             } else {
                 match self
-                    .call_peer::<_, ForwardMutationReply>(
-                        leader,
-                        SessionConsensusRpcFamily::ForwardMutation,
-                        &request,
-                        deadline,
+                    .bound_by_local_leader_view(
+                        route,
+                        self.call_peer::<_, ForwardMutationReply>(
+                            leader,
+                            SessionConsensusRpcFamily::ForwardMutation,
+                            &request,
+                            deadline,
+                        ),
                     )
                     .await
                 {
@@ -7656,9 +7792,11 @@ impl ConsensusSessionStore {
                 ForwardMutationReply::NotLeader {
                     leader: next_leader,
                 } => {
-                    preferred = next_leader.filter(|candidate| {
-                        *candidate != leader && self.is_current_member(*candidate)
-                    });
+                    preferred = next_leader
+                        .filter(|candidate| {
+                            *candidate != leader && self.is_current_member(*candidate)
+                        })
+                        .map(|candidate| self.redirected_route(candidate));
                     if preferred.is_none() {
                         self.wait_for_route_refresh(leader, deadline).await?;
                     }
@@ -9068,6 +9206,64 @@ impl ConsensusSessionStore {
         }
     }
 
+    /// Bound one leader-routed peer call by this replica's own leader view.
+    ///
+    /// A lost leader can black-hole an established connection, which would
+    /// otherwise hold the route until the caller's whole deadline even after
+    /// the surviving voters elect and announce a successor. The local view is
+    /// compared with the one the route was chosen under, not with the one
+    /// seen when the call starts: the caller may revalidate authority between
+    /// the two, and a successor learned meanwhile must count.
+    ///
+    /// If the local engine already names a leader other than both the
+    /// route's target and the leader it named when the route was chosen, the
+    /// call is not sent and reports `BeforeTransmission`, so the caller
+    /// refreshes its route. Once the view names the target, the leader a
+    /// redirect was chosen under no longer exempts the route. Once the engine names such a leader while the call
+    /// is in flight, the call keeps [`STALE_LEADER_ROUTE_GRACE`] for an answer
+    /// already in flight and is then abandoned. Abandonment never proves that
+    /// the request stayed undelivered, so it reports `AfterTransmission`
+    /// exactly like a call deadline: callers retry only the same request
+    /// identity or report an unknown outcome.
+    async fn bound_by_local_leader_view<T>(
+        &self,
+        mut route: LeaderRoute,
+        call: impl Future<Output = Result<T, ConsensusPeerCallFailure>>,
+    ) -> Result<T, ConsensusPeerCallFailure> {
+        let mut metrics = self.inner.raft.metrics();
+        if route.observe(metrics.borrow_and_update().current_leader) {
+            // The call future has not been polled, so nothing was sent.
+            return Err(ConsensusPeerCallFailure::BeforeTransmission);
+        }
+        tokio::pin!(call);
+        loop {
+            tokio::select! {
+                biased;
+                result = &mut call => return result,
+                changed = metrics.changed() => {
+                    if changed.is_err() {
+                        return call.await;
+                    }
+                    if route.observe(metrics.borrow_and_update().current_leader) {
+                        break;
+                    }
+                }
+            }
+        }
+        tokio::time::timeout(STALE_LEADER_ROUTE_GRACE, call)
+            .await
+            .unwrap_or(Err(ConsensusPeerCallFailure::AfterTransmission))
+    }
+
+    /// A route to `target` that a peer's redirect named, under this
+    /// replica's current leader view.
+    fn redirected_route(&self, target: SessionConsensusNodeId) -> LeaderRoute {
+        LeaderRoute {
+            target,
+            chosen_under: self.inner.raft.metrics().borrow().current_leader,
+        }
+    }
+
     async fn call_peer<Req, Resp>(
         &self,
         target: SessionConsensusNodeId,
@@ -9250,22 +9446,27 @@ impl ConsensusSessionStore {
         }
         let mut preferred = None;
         loop {
-            let leader = match preferred.take() {
-                Some(leader) => leader,
-                None => self
-                    .wait_for_known_leader(deadline)
-                    .await
-                    .map_err(|_| LinearizableBarrierFailure::Unavailable)?,
+            let route = match preferred.take() {
+                Some(route) => route,
+                None => LeaderRoute::from_local_view(
+                    self.wait_for_known_leader(deadline)
+                        .await
+                        .map_err(|_| LinearizableBarrierFailure::Unavailable)?,
+                ),
             };
+            let leader = route.target;
             let reply = if leader == self.inner.local_node_id {
                 self.local_read_barrier(deadline).await
             } else {
                 match self
-                    .call_peer::<_, ReadBarrierReply>(
-                        leader,
-                        SessionConsensusRpcFamily::ReadBarrier,
-                        &ReadBarrierRequest,
-                        deadline,
+                    .bound_by_local_leader_view(
+                        route,
+                        self.call_peer::<_, ReadBarrierReply>(
+                            leader,
+                            SessionConsensusRpcFamily::ReadBarrier,
+                            &ReadBarrierRequest,
+                            deadline,
+                        ),
                     )
                     .await
                 {
@@ -9307,9 +9508,11 @@ impl ConsensusSessionStore {
                 ReadBarrierReply::NotLeader {
                     leader: next_leader,
                 } => {
-                    preferred = next_leader.filter(|candidate| {
-                        *candidate != leader && self.is_current_member(*candidate)
-                    });
+                    preferred = next_leader
+                        .filter(|candidate| {
+                            *candidate != leader && self.is_current_member(*candidate)
+                        })
+                        .map(|candidate| self.redirected_route(candidate));
                     if preferred.is_none() {
                         self.wait_for_route_refresh(leader, deadline)
                             .await
@@ -9481,13 +9684,16 @@ impl ConsensusSessionStore {
         }
 
         match self
-            .call_peer::<_, FencedTransitionV2StatusLogicalTimeTicketReply>(
-                leader,
-                SessionConsensusRpcFamily::ForwardMutation,
-                &ForwardRequest::FencedTransitionV2StatusLogicalTimeTicket {
-                    required_consumer_scope: Box::new(required_consumer_scope),
-                },
-                deadline,
+            .bound_by_local_leader_view(
+                LeaderRoute::from_local_view(leader),
+                self.call_peer::<_, FencedTransitionV2StatusLogicalTimeTicketReply>(
+                    leader,
+                    SessionConsensusRpcFamily::ForwardMutation,
+                    &ForwardRequest::FencedTransitionV2StatusLogicalTimeTicket {
+                        required_consumer_scope: Box::new(required_consumer_scope),
+                    },
+                    deadline,
+                ),
             )
             .await
         {
@@ -11582,6 +11788,7 @@ impl SessionConsensusRpcHandler for SessionConsensusService {
         if matches!(
             request.family,
             SessionConsensusRpcFamily::Vote
+                | SessionConsensusRpcFamily::PreVote
                 | SessionConsensusRpcFamily::AppendEntries
                 | SessionConsensusRpcFamily::AppendEntriesRoster
                 | SessionConsensusRpcFamily::InstallSnapshot
@@ -16788,6 +16995,15 @@ mod membership_tests {
             _request: SessionConsensusWireRequest,
         ) -> Result<SessionConsensusWireResponse, SessionConsensusPeerError> {
             Err(SessionConsensusPeerError::Unavailable)
+        }
+
+        async fn call_pre_vote(
+            &self,
+            request: opc_consensus::ConsensusWireRequest,
+            timeout: std::time::Duration,
+        ) -> Result<opc_consensus::PreVoteCall, opc_consensus::ConsensusPeerError> {
+            // Every voter of this in-process cluster runs this build.
+            opc_consensus::forward_pre_vote(self, request, timeout).await
         }
     }
 

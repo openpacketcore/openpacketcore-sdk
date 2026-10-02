@@ -523,6 +523,24 @@ impl SessionConsensusPeer for InstrumentedConsensusPeer {
         self.record_result(family, &result);
         result
     }
+
+    async fn call_pre_vote(
+        &self,
+        request: SessionConsensusWireRequest,
+        timeout: Duration,
+    ) -> Result<opc_consensus::PreVoteCall, SessionConsensusPeerError> {
+        let family = request.family.as_str();
+        let result = self.inner.call_pre_vote(request, timeout).await;
+        // A Pre-Vote to a voter without Pre-Vote sends nothing to record.
+        match &result {
+            Ok(opc_consensus::PreVoteCall::Answered(response)) => {
+                self.record_result(family, &Ok(response.clone()));
+            }
+            Ok(opc_consensus::PreVoteCall::Unsupported) => {}
+            Err(error) => self.record_result(family, &Err(*error)),
+        }
+        result
+    }
 }
 
 #[derive(Debug)]

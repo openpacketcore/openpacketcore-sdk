@@ -54,9 +54,10 @@ them is a requalification event.
 | Drain window (old-epoch connection retirement) | 100 ms |
 | Reconnect cooldown per directed peer | 1–20 ms |
 | Cold connect timeout | 1500 ms |
-| AppendEntries (heartbeat) timeout | 2000 ms |
+| Heartbeat interval | 200 ms |
+| AppendEntries timeout | 2000 ms |
 | Vote timeout | 5000 ms |
-| Election window | 5000–8000 ms |
+| Election window | 5000–6500 ms |
 | Operation timeout (any complete operation) | 10 000 ms |
 
 Derived campaign SLOs (the same derivation as the runbook restart-stage
@@ -64,8 +65,8 @@ table):
 
 | SLO | Value | Derivation |
 | --- | --- | --- |
-| Member transition envelope | 26 s | 2 × election-max + operation timeout |
-| Member recovery envelope | 37 s | transition envelope + one backend operation (10 s) + one delivery second (1 s) |
+| Member transition envelope | 23 s | 2 × election-max + operation timeout |
+| Member recovery envelope | 34 s | transition envelope + one backend operation (10 s) + one delivery second (1 s) |
 | Traffic round envelope | (N + 1) × 10 s | one committed write plus one linearizable read per reachable voter, each within the operation timeout |
 | Local fault/measurement action | 10 s | one operation timeout |
 
@@ -172,8 +173,8 @@ any count bound is exceeded, or the checker rejects the document.
 | `three_member_fleet_member_restarts_mid_rotation_and_rejoins_under_overlap_trust` | Member restart while the fleet adds the new anchor and rotates leaves to the new root | Member rejoins under the overlap bundle with material advanced while down; catch-up within 37 s; fleet reaches new-only trust; old-chain client rejected at the restarted member |
 | `rotation_fault_evidence_checker_binds_digests_bounds_and_provenance` | Contract test for the independent checker | A valid document passes; every structural, digest, freshness, SLO, accounting, or provenance violation fails closed |
 
-Phase-kind SLOs enforced by the checker: `fault` ≤ 10 s, `rotation` ≤ 26 s,
-`traffic` ≤ (members + 1) × 10 s, `recovery` ≤ 37 s, `bounds` ≤ 10 s.
+Phase-kind SLOs enforced by the checker: `fault` ≤ 10 s, `rotation` ≤ 23 s,
+`traffic` ≤ (members + 1) × 10 s, `recovery` ≤ 34 s, `bounds` ≤ 10 s.
 
 **Resolver accounting scope.** The transition and per-path handshake
 allowances cover rotation-driven dials only. Retry traffic on fenced paths

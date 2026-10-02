@@ -25,7 +25,8 @@ use crate::backend::{
 };
 use crate::consensus::{
     SessionConsensusNodeId, SessionConsensusPeer, SessionConsensusPeerError,
-    SessionConsensusRpcHandler, SessionConsensusWireRequest, SessionConsensusWireResponse,
+    SessionConsensusRpcFamily, SessionConsensusRpcHandler, SessionConsensusWireRequest,
+    SessionConsensusWireResponse,
 };
 use crate::fenced_transition::{
     AtomicFencedTransitionCapability, FencedTransitionLease, FencedTransitionMutation,
@@ -822,6 +823,8 @@ struct RemoteRotationPeer {
     target: SessionConsensusNodeId,
     handler: Arc<tokio::sync::RwLock<Option<Arc<dyn SessionConsensusRpcHandler>>>>,
     enabled: Arc<AtomicBool>,
+    blackholed: Arc<AtomicBool>,
+    blackholed_forwards: Arc<AtomicUsize>,
 }
 
 impl RemoteRotationPeer {
@@ -830,7 +833,20 @@ impl RemoteRotationPeer {
             target,
             handler: Arc::new(tokio::sync::RwLock::new(None)),
             enabled: Arc::new(AtomicBool::new(true)),
+            blackholed: Arc::new(AtomicBool::new(false)),
+            blackholed_forwards: Arc::new(AtomicUsize::new(0)),
         }
+    }
+
+    /// Accept every call on this path but never answer it, as a connection
+    /// to a lost node can.
+    fn set_blackholed(&self, blackholed: bool) {
+        self.blackholed.store(blackholed, Ordering::SeqCst);
+    }
+
+    /// Forwarded mutations this path accepted while black-holed.
+    fn blackholed_forwards(&self) -> usize {
+        self.blackholed_forwards.load(Ordering::SeqCst)
     }
 
     async fn install(&self, handler: Arc<dyn SessionConsensusRpcHandler>) {
@@ -869,6 +885,12 @@ impl SessionConsensusPeer for RemoteRotationPeer {
         if !self.enabled.load(Ordering::SeqCst) {
             return Err(SessionConsensusPeerError::Unavailable);
         }
+        if self.blackholed.load(Ordering::SeqCst) {
+            if request.family == SessionConsensusRpcFamily::ForwardMutation {
+                self.blackholed_forwards.fetch_add(1, Ordering::SeqCst);
+            }
+            return std::future::pending().await;
+        }
         let handler = self
             .handler
             .read()
@@ -876,6 +898,15 @@ impl SessionConsensusPeer for RemoteRotationPeer {
             .clone()
             .ok_or(SessionConsensusPeerError::Unavailable)?;
         Ok(handler.handle(request.sender, request).await)
+    }
+
+    async fn call_pre_vote(
+        &self,
+        request: opc_consensus::ConsensusWireRequest,
+        timeout: std::time::Duration,
+    ) -> Result<opc_consensus::PreVoteCall, opc_consensus::ConsensusPeerError> {
+        // Every voter of this in-process cluster runs this build.
+        opc_consensus::forward_pre_vote(self, request, timeout).await
     }
 }
 
@@ -1492,6 +1523,199 @@ async fn finite_expiry_preflight_follower_recovery_after_route_discovery_is_not_
         2,
         "finite preflight performs its initial and just-in-time source recovery checks"
     );
+    cluster.shutdown().await;
+}
+
+/// A follower that chose the leader route before the survivors of that
+/// leader's loss elected a successor sends nothing to the lost leader once it
+/// knows the successor, and completes through the successor.
+///
+/// Forwarding selects the leader from the local view, then revalidates source
+/// authority before it transmits. The successor can become known during that
+/// wait, so the call would start while the local view already names it.
+/// Comparing later views with the one seen when the call began would never
+/// notice the change: a call to a black-holed lost leader would consume the
+/// caller's whole deadline and end with an unknown outcome.
+#[tokio::test]
+async fn forward_skips_a_lost_leader_whose_successor_is_known_before_it_transmits() {
+    let _timing_permit = crate::acquire_consensus_timing_test_permit().await;
+    let cluster = RemoteRotationCluster::start().await;
+    let leader = cluster.current_leader();
+    let leader_id = cluster.stores[leader].status().node_id;
+    let follower = (0..REMOTE_ROTATION_MEMBER_COUNT)
+        .find(|member| *member != leader)
+        .expect("three-member cluster has a follower");
+    let other = (0..REMOTE_ROTATION_MEMBER_COUNT)
+        .find(|member| *member != leader && *member != follower)
+        .expect("three-member cluster has a second follower");
+    let follower_store = cluster.stores[follower].clone();
+
+    let hold = follower_store.hold_remote_forward_before_authority_for_test();
+    let preflight = finite_remote_forward_preflight();
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+    let submission = tokio::spawn({
+        let follower_store = follower_store.clone();
+        async move {
+            follower_store
+                .preflight_record_expiry_before(&[preflight], None, deadline)
+                .await
+        }
+    });
+    hold.gate.wait_until_entered().await;
+
+    // The leader is lost: the follower's established route to it accepts
+    // calls but never answers, and every other path to or from it fails.
+    let blackholed = cluster
+        .paths
+        .get(&(follower, leader))
+        .expect("follower to leader path");
+    blackholed.set_blackholed(true);
+    for (source, target) in [(leader, follower), (leader, other), (other, leader)] {
+        cluster
+            .paths
+            .get(&(source, target))
+            .expect("leader path")
+            .set_enabled(false);
+    }
+    let elected = tokio::time::Instant::now() + REMOTE_ROTATION_TRANSITION_TIMEOUT;
+    while follower_store
+        .inner
+        .raft
+        .metrics()
+        .borrow()
+        .current_leader
+        .is_none_or(|successor| successor == leader_id)
+    {
+        assert!(
+            tokio::time::Instant::now() < elected,
+            "the survivors elect a successor"
+        );
+        tokio::time::sleep(REMOTE_ROTATION_POLL_INTERVAL).await;
+    }
+
+    // Only now does the paused forward revalidate authority and transmit.
+    let released = tokio::time::Instant::now();
+    drop(hold);
+    let result = submission.await.expect("preflight task");
+    let completed_after = released.elapsed();
+
+    assert_eq!(
+        0,
+        blackholed.blackholed_forwards(),
+        "nothing is sent to a leader that the local view has already replaced"
+    );
+    assert!(
+        result.is_ok(),
+        "the forward completes through the successor: {result:?}"
+    );
+    assert!(
+        completed_after <= super::STALE_LEADER_ROUTE_GRACE + Duration::from_secs(1),
+        "the forward completed {completed_after:?} after it was released, not promptly \
+         through the successor"
+    );
+
+    blackholed.set_blackholed(false);
+    cluster.heal(leader);
+    cluster.shutdown().await;
+}
+
+/// A call that a redirect sent to B while this replica's view still named A keeps that exemption
+/// for A only until the view names B: once it has, A leading again supersedes the route.
+///
+/// Otherwise, after the view advanced from A to B while the caller revalidated its authority, a
+/// lost B that black-holes the call while A is elected again would hold the call until its
+/// deadline, although the replica knows the successor.
+#[tokio::test]
+async fn redirected_route_is_abandoned_when_its_source_leads_again_after_the_target() {
+    let _timing_permit = crate::acquire_consensus_timing_test_permit().await;
+    let cluster = RemoteRotationCluster::start().await;
+    let a = cluster.current_leader();
+    let f = (0..REMOTE_ROTATION_MEMBER_COUNT)
+        .find(|member| *member != a)
+        .expect("three-member cluster has a follower");
+    let b = (0..REMOTE_ROTATION_MEMBER_COUNT)
+        .find(|member| *member != a && *member != f)
+        .expect("three-member cluster has a second follower");
+    let a_id = cluster.stores[a].status().node_id;
+    let b_id = cluster.stores[b].status().node_id;
+    let follower_store = cluster.stores[f].clone();
+    let path = |source: usize, target: usize| {
+        cluster
+            .paths
+            .get(&(source, target))
+            .expect("loopback path")
+            .clone()
+    };
+    let wait_for_view = |leader: SessionConsensusNodeId, stage: &'static str| {
+        let follower_store = follower_store.clone();
+        async move {
+            let deadline = tokio::time::Instant::now() + REMOTE_ROTATION_TRANSITION_TIMEOUT;
+            while follower_store.inner.raft.metrics().borrow().current_leader != Some(leader) {
+                assert!(tokio::time::Instant::now() < deadline, "{stage}");
+                tokio::time::sleep(REMOTE_ROTATION_POLL_INTERVAL).await;
+            }
+        }
+    };
+
+    // B leads next: A is lost, and the follower's own campaigns cannot reach B.
+    cluster.isolate(a);
+    path(f, b).set_enabled(false);
+    wait_for_view(b_id, "B is elected").await;
+
+    // A redirect from A sent this call to B; the view names B when the call starts.
+    let route = super::LeaderRoute {
+        target: b_id,
+        chosen_under: Some(a_id),
+    };
+    let call = tokio::spawn({
+        let follower_store = follower_store.clone();
+        async move {
+            follower_store
+                .bound_by_local_leader_view(
+                    route,
+                    std::future::pending::<Result<(), super::ConsensusPeerCallFailure>>(),
+                )
+                .await
+        }
+    });
+
+    // A catches up from B, then B is lost and A leads again.
+    cluster.heal(a);
+    path(f, b).set_enabled(true);
+    let caught_up = tokio::time::Instant::now() + REMOTE_ROTATION_TRANSITION_TIMEOUT;
+    while cluster.stores[a].status().last_log_index != cluster.stores[f].status().last_log_index
+        || cluster.stores[a].status().leader_id != Some(b_id)
+    {
+        assert!(
+            tokio::time::Instant::now() < caught_up,
+            "A follows B and has its log"
+        );
+        tokio::time::sleep(REMOTE_ROTATION_POLL_INTERVAL).await;
+    }
+    cluster.isolate(b);
+    path(f, a).set_enabled(false);
+    wait_for_view(a_id, "A is elected again").await;
+    let returned = tokio::time::Instant::now();
+
+    let result = tokio::time::timeout(
+        super::STALE_LEADER_ROUTE_GRACE + Duration::from_secs(5),
+        call,
+    )
+    .await
+    .expect("the call to the lost B is abandoned")
+    .expect("call task");
+    assert_eq!(
+        Err(super::ConsensusPeerCallFailure::AfterTransmission),
+        result
+    );
+    assert!(
+        returned.elapsed() <= super::STALE_LEADER_ROUTE_GRACE + Duration::from_secs(1),
+        "the call was abandoned {:?} after A led again",
+        returned.elapsed()
+    );
+
+    path(f, a).set_enabled(true);
+    cluster.heal(b);
     cluster.shutdown().await;
 }
 

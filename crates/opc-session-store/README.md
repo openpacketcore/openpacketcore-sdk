@@ -913,12 +913,23 @@ rolling operation is unsupported.
 
 Both durable domains use the shared 10-second operation default. Transport
 families use 2 seconds for AppendEntries/Openraft read-index, 5 seconds for
-Vote, and 10 seconds for InstallSnapshot/forwarded mutation/consumer
+Vote and PreVote, and 10 seconds for InstallSnapshot/forwarded mutation/consumer
 ReadBarrier. One absolute family deadline starts before per-peer lane
 acquisition; a fresh DNS/TCP/mTLS/bootstrap path has a contained 1.5-second
 sub-bound and does not receive additive time. A directed peer caches a fixed
 primary/overflow pool of at most two authenticated connections after correlated
 validated successes, with one in-flight RPC per lane.
+
+A leader-routed call (a forwarded mutation, a read barrier, an exact V2 status
+ticket, capability activation or an expiry preflight) is also bounded by this
+replica's own leader view, judged against the leader that view named when the
+route was chosen. A lost leader that black-holes its connection never answers;
+once this replica's engine names a different leader, the call is abandoned
+after one 200 ms heartbeat interval and reported as possibly transmitted, so
+callers retry only the same request identity or report an unknown outcome. A
+call whose route that view had already replaced before it was sent is not sent
+at all, and the caller moves to the successor. The PreVote family carries the engine's Pre-Vote round; a
+replica admits it exactly like a Vote, and only while it would accept that vote.
 
 Descriptor admission validates the complete descriptor set, its exact local
 logical member, configuration digest, and stable derived node IDs without

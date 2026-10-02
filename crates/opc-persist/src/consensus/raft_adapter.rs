@@ -11,12 +11,13 @@ use opc_consensus::engine::error::{
 use opc_consensus::engine::network::{RPCOption, RaftNetwork, RaftNetworkFactory};
 use opc_consensus::engine::raft::{
     AppendEntriesRequest, AppendEntriesResponse, InstallSnapshotRequest, InstallSnapshotResponse,
-    VoteRequest, VoteResponse,
+    PreVoteReply, VoteRequest, VoteResponse,
 };
 use opc_consensus::engine::{EmptyNode, Vote};
 use opc_consensus::{
     ConsensusCodecError, ConsensusIdentity, ConsensusNodeId, ConsensusPeer, ConsensusPeerError,
     ConsensusRpcFamily, ConsensusRpcHandler, ConsensusWireRequest, ConsensusWireResponse,
+    PreVoteCall,
 };
 use serde::de::DeserializeOwned;
 use serde::Serialize;
@@ -111,6 +112,16 @@ impl fmt::Debug for ConfigRaftNetwork {
     }
 }
 
+/// How [`ConfigRaftNetwork::dispatch`] sends one request.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum PeerDispatch {
+    /// An ordinary call, answered by every voter.
+    Call,
+    /// A Pre-Vote call, which only a voter the transport knows to answer
+    /// Pre-Vote receives.
+    PreVote,
+}
+
 impl ConfigRaftNetwork {
     // OpenRaft requires this transport error type; boxing it would change the
     // adapter's prescribed RPC error contract.
@@ -122,6 +133,30 @@ impl ConfigRaftNetwork {
         payload: Vec<u8>,
         option: RPCOption,
     ) -> Result<Resp, EngineRpcError<E>>
+    where
+        Resp: DeserializeOwned,
+        E: std::error::Error + DeserializeOwned,
+    {
+        self.dispatch(family, action, payload, option, PeerDispatch::Call)
+            .await?
+            .ok_or_else(|| {
+                EngineRpcError::Unreachable(Unreachable::new(&ConsensusPeerError::Protocol))
+            })
+    }
+
+    /// Send one request. `Ok(None)` reports a Pre-Vote call to a voter that
+    /// is not known to answer Pre-Vote; nothing was sent.
+    // OpenRaft requires this transport error type; boxing it would change the
+    // adapter's prescribed RPC error contract.
+    #[allow(clippy::result_large_err)]
+    async fn dispatch<Resp, E>(
+        &self,
+        family: ConsensusRpcFamily,
+        action: opc_consensus::engine::RPCTypes,
+        payload: Vec<u8>,
+        option: RPCOption,
+        dispatch: PeerDispatch,
+    ) -> Result<Option<Resp>, EngineRpcError<E>>
     where
         Resp: DeserializeOwned,
         E: std::error::Error + DeserializeOwned,
@@ -139,7 +174,14 @@ impl ConfigRaftNetwork {
             ConsensusWireRequest::try_new(self.identity, self.local_node_id, family, payload)
                 .map_err(|error| EngineRpcError::Unreachable(Unreachable::new(&error)))?;
         let ttl = option.hard_ttl();
-        let response = match tokio::time::timeout(ttl, peer.call(wire)).await {
+        let sent = async {
+            match dispatch {
+                PeerDispatch::Call => peer.call(wire).await.map(PreVoteCall::Answered),
+                PeerDispatch::PreVote => peer.call_pre_vote(wire, ttl).await,
+            }
+        };
+        let response = match tokio::time::timeout(ttl, sent).await {
+            Ok(Ok(PreVoteCall::Unsupported)) => return Ok(None),
             Err(_) => {
                 return Err(EngineRpcError::Timeout(Timeout {
                     action,
@@ -149,7 +191,7 @@ impl ConfigRaftNetwork {
                 }))
             }
             Ok(Err(error)) => return Err(map_peer_error(error, action, self, ttl)),
-            Ok(Ok(response)) => response,
+            Ok(Ok(PreVoteCall::Answered(response))) => response,
         };
         response
             .validate()
@@ -161,7 +203,9 @@ impl ConfigRaftNetwork {
             .map_err(|error| {
                 EngineRpcError::Unreachable(Unreachable::new(&CodecTransportError(error)))
             })?;
-        result.map_err(|error| EngineRpcError::RemoteError(RemoteError::new(self.target, error)))
+        result
+            .map(Some)
+            .map_err(|error| EngineRpcError::RemoteError(RemoteError::new(self.target, error)))
     }
 
     // OpenRaft's append RPC must retain its prescribed transport error type.
@@ -251,6 +295,31 @@ impl RaftNetwork<ConfigRaftTypeConfig> for ConfigRaftNetwork {
             option,
         )
         .await
+    }
+
+    async fn pre_vote(
+        &mut self,
+        request: VoteRequest<ConsensusNodeId>,
+        option: RPCOption,
+    ) -> Result<PreVoteReply<ConsensusNodeId>, EngineRpcError> {
+        let payload = encode_config_wire(&request).map_err(|error| {
+            EngineRpcError::Unreachable(Unreachable::new(&CodecTransportError(error)))
+        })?;
+        // A failed or refused call is never counted as a grant by the engine.
+        let answered = self
+            .dispatch(
+                ConsensusRpcFamily::PreVote,
+                opc_consensus::engine::RPCTypes::Vote,
+                payload,
+                option,
+                PeerDispatch::PreVote,
+            )
+            .await?;
+        // A voter that the transport does not positively know to answer
+        // Pre-Vote, such as a voter of a release without it or any voter behind
+        // a transport that does not implement it, can still grant a vote but
+        // never a Pre-Vote: the engine runs the classic election instead.
+        Ok(answered.map_or(PreVoteReply::Unsupported, PreVoteReply::Answered))
     }
 }
 
@@ -342,6 +411,16 @@ impl ConsensusRpcHandler for ConfigRaftRpcHandler {
                     Err(error) => return rejected_response(error),
                 };
                 encode_engine_result(&self.raft.vote(rpc).await)
+            }
+            ConsensusRpcFamily::PreVote => {
+                let rpc = match decode_and_bind_sender::<VoteRequest<ConsensusNodeId>>(
+                    &request.payload,
+                    request.sender,
+                ) {
+                    Ok(rpc) => rpc,
+                    Err(error) => return rejected_response(error),
+                };
+                encode_engine_result(&self.raft.pre_vote(rpc).await)
             }
             ConsensusRpcFamily::InstallSnapshot => {
                 let rpc = match decode_and_bind_sender::<InstallSnapshotRequest<ConfigRaftTypeConfig>>(
