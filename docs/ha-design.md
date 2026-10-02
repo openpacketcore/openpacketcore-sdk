@@ -65,7 +65,7 @@ it returns. The
 derives these bounds from the pinned engine.
 
 The workspace temporarily exact-pins `openpacketcore/openraft` revision
-`71f7ff7ed2a0a1783362264d597926a243d62b37`, containing release-0.9 through v0.9.25
+`47ba29a605c34562df3c785034a8374af074ec72`, containing release-0.9 through v0.9.25
 and the fork repairs for bounded apply and joined replication retirement, the
 overlapping follower lease and election timeout, the separate AppendEntries
 deadline, Pre-Vote, and the leader's quorum-acknowledged lease.

@@ -222,7 +222,7 @@ unplanned leader loss elects a successor within 30,000 ms:
 
 Issue #143 remains open and the HA profile remains experimental. The workspace
 pins `https://github.com/openpacketcore/openraft` at the full verified revision
-`71f7ff7ed2a0a1783362264d597926a243d62b37` (0.9.25 plus fork fixes). It retains the
+`47ba29a605c34562df3c785034a8374af074ec72` (0.9.25 plus fork fixes). It retains the
 per-campaign election-timeout fix and preserves a recovering snapshot target's
 required log suffix through successful handoff, while failed targets release
 their ownership before retrying. When a higher vote ends leadership, the core
