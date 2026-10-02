@@ -175,12 +175,17 @@ impl DurableConsensusTimingProfile {
     /// Return the bound on the first successful campaign after an unplanned
     /// leader loss, measured from the loss.
     ///
-    /// A surviving voter campaigns once the longer of its leader lease
-    /// (`election_timeout_min_millis`) and its sampled election timeout
+    /// Every survivor's leader lease (`election_timeout_min_millis`) runs out
+    /// within the lease of the loss. A survivor starts its first Pre-Vote
+    /// round once the longer of its lease and its sampled election timeout
     /// (below `election_timeout_max_millis`) has passed since its last leader
-    /// contact, on its next engine tick. The survivor that heard from the
-    /// leader last is the last to campaign, and by then every other
-    /// survivor's lease has expired, so its Pre-Vote and vote are granted.
+    /// contact, on its next engine tick. A round that a still-running lease
+    /// rejects is retried after the width of the election-timeout window
+    /// (`election_timeout_max_millis - election_timeout_min_millis`), on a
+    /// later tick. So the survivor with the most up-to-date log starts a round
+    /// that no lease rejects within the lease, the window and one tick of the
+    /// loss, that is within the maximum election timeout and one tick, and that
+    /// round and its vote are granted.
     pub const fn leader_loss_first_campaign_bound(self) -> Duration {
         Duration::from_millis(self.leader_loss_first_campaign_bound_millis())
     }
@@ -219,10 +224,12 @@ impl DurableConsensusTimingProfile {
 /// After an unplanned leader loss, a surviving voter campaigns once the longer
 /// of its leader lease (the minimum election timeout) and its sampled election
 /// timeout has passed since its last leader contact, checked on a 300 ms
-/// engine tick. Pre-Vote keeps a voter that cannot win from raising its term.
-/// With these values the first successful campaign starts within 6,800 ms of
-/// the loss and the documented write stall is 9,700 ms, inside the unchanged
-/// 10,000 ms operation timeout. A voter campaigns only after 5,000 ms without
+/// engine tick. Pre-Vote keeps a voter that cannot win from raising its term,
+/// and a Pre-Vote round that a still-running lease rejects is retried after
+/// the 1,500 ms width of the election-timeout window. With these values the
+/// first successful campaign starts within 6,800 ms of the loss and the
+/// documented write stall is 9,700 ms, inside the unchanged 10,000 ms
+/// operation timeout. A voter campaigns only after 5,000 ms without
 /// any AppendEntries, more than sixteen missed 300 ms ticks of a leader that is
 /// neither suspended nor CPU-throttled.
 pub const DURABLE_CONSENSUS_TIMING_PROFILE: DurableConsensusTimingProfile =
@@ -547,6 +554,18 @@ mod tests {
         assert_eq!(
             profile.leader_loss_first_campaign_bound(),
             Duration::from_millis(1_150)
+        );
+        // A rejected Pre-Vote round is retried after the window's width on a
+        // later tick, so the first round after every lease (min) has run out
+        // starts within the same bound.
+        let window = Duration::from_millis(
+            profile.election_timeout_max_millis - profile.election_timeout_min_millis,
+        );
+        assert_eq!(
+            profile.leader_loss_first_campaign_bound(),
+            Duration::from_millis(profile.election_timeout_min_millis)
+                + window
+                + profile.engine_tick()
         );
         // Six heartbeat round trips, the stale-route grace and one cold
         // connection.
