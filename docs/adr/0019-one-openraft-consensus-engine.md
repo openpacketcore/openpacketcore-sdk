@@ -51,24 +51,27 @@ persistence authority.
   compatibility engine.
 
 The shared engine also has one runtime and complete-call profile.
-`opc-consensus` owns the 500 ms heartbeat/AppendEntries/read-index ceiling,
-1,000 ms Vote ceiling, `[1,000 ms, 1,800 ms)` election range, 10,000 ms
+`opc-consensus` owns the 2,000 ms AppendEntries/read-index ceiling, the 200 ms
+heartbeat interval, the 5,000 ms Vote and PreVote ceiling, the
+`[5,000 ms, 6,500 ms)` election range, Pre-Vote, the 10,000 ms
 snapshot/forward/read-barrier and operation ceilings, 30,000 ms listener
-ceilings, and the contained 500 ms cold-connect sub-bound. It also owns the
+ceilings, and the contained 1,500 ms cold-connect sub-bound. It also owns the
 replication payload, snapshot trigger/chunk, retained-log, and Tokio runtime
 choices. Session and configuration adapters select only their non-secret
 cluster label; they cannot silently drift to separate timing or runtime
 behavior.
 
-The profile previously used a 2,000 ms heartbeat, a 5,000 ms Vote ceiling and
-`[5,000 ms, 8,000 ms)` elections. Because the engine leases a committed
-leader's vote for the maximum election timeout before a follower's own timeout
-starts, and checks timers only on a tick of 1.5 heartbeats, an unplanned leader
-loss then took 13 to 19 seconds to detect. The current values bound the first
-campaign at 4,350 ms after the last leader contact and the documented write
-stall at 9,400 ms, below the operation timeout; profile validation enforces
-that ordering. The `opc-consensus` crate documentation records the derivation,
-the CPU assumptions and the engine's lack of pre-vote and check-quorum.
+The profile previously used a 2,000 ms heartbeat equal to the AppendEntries
+ceiling and `[5,000 ms, 8,000 ms)` elections, and the engine then started a
+follower's own election timeout only after a leader lease of the maximum
+election timeout, checking timers on a tick of 1.5 heartbeats. An unplanned
+leader loss took 13 to 19 seconds to detect. With the current engine rules and
+values, the first successful campaign starts within 6,800 ms of the loss and
+the documented write stall is 9,700 ms, below the operation timeout; profile
+validation enforces that ordering. The AppendEntries, Vote and cold-connect
+budgets are unchanged. The `opc-consensus` crate documentation records the
+derivation, its assumptions, the CPU requirement and the engine's lack of
+check-quorum.
 
 ### Interim engine-source and release gate
 
@@ -113,8 +116,9 @@ heartbeat interval. An optional Pre-Vote round keeps a voter that cannot win
 from raising its term, and a leader rejects other candidates while a quorum
 acknowledges it. Configuration validation requires the minimum election
 timeout to outlast the engine tick on which a leader sends heartbeats. These
-engine rules replace no SDK election, vote or quorum logic. Frozen qualification profiles retain their original revisions, and
-dependency tests do not establish SDK qualification.
+engine rules replace no SDK election, vote or quorum logic. Frozen
+qualification profiles retain their original revisions, and dependency tests
+do not establish SDK qualification.
 
 Registry 0.9.24 SDK one-shot leader-loss runs happened to pass. They do not
 invalidate the deterministic scripted engine regression or the historical

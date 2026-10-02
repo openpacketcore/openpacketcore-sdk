@@ -23,82 +23,92 @@ to share one exact engine version while keeping Openraft details out of
 domain-facing wire and storage APIs.
 
 `DURABLE_CONSENSUS_TIMING_PROFILE` is the sole timing authority for both
-durable domains: AppendEntries/Openraft read-index and heartbeat 500 ms,
-Vote 1,000 ms, elections `[1,000 ms, 1,800 ms)`, InstallSnapshot/forwarded
-mutation/consumer ReadBarrier and operation default 10,000 ms, and listener
-idle/handler ceilings 30,000 ms. The 500 ms DNS/TCP/mTLS/bootstrap cold cap is
-contained inside the selected family deadline, never added to it.
+durable domains: AppendEntries/Openraft read-index 2,000 ms, heartbeat interval
+200 ms, Vote and PreVote 5,000 ms, elections `[5,000 ms, 6,500 ms)`,
+InstallSnapshot/forwarded mutation/consumer ReadBarrier and operation default
+10,000 ms, and listener idle/handler ceilings 30,000 ms. The 1,500 ms
+DNS/TCP/mTLS/bootstrap cold cap is contained inside the selected family
+deadline, never added to it. The heartbeat interval is not a call deadline:
+every AppendEntries, heartbeats included, uses the 2,000 ms ceiling, and the
+shared Openraft configuration enables Pre-Vote.
 
 ### Unplanned leader loss
 
 Planned shutdown hands leadership off before the leader stops. An unplanned
 loss (a crash, a node failure, or a partition) is detected only by the
-election timers of the surviving voters. The pinned engine adds three terms
-to that detection:
+election timers of the surviving voters. The pinned engine applies these
+rules:
 
-- it leases a committed leader's vote for `election_timeout_max`, and a voter
-  rejects every candidate during that lease;
-- a follower campaigns only after the lease plus one sampled election
-  timeout, which is below `election_timeout_max`;
-- it checks election timers, and sends idle heartbeats, only on an engine
-  tick of `heartbeat * 3 / 2` (750 ms).
+- a voter leases a committed leader's vote for `election_timeout_min`, and
+  rejects every candidate during that lease; a leader rejects every candidate
+  while a quorum acknowledged it within the same lease;
+- a follower campaigns once the longer of the lease and its sampled election
+  timeout has passed since its last leader contact, never their sum; every
+  sampled timeout covers the lease, so campaigns stay randomized;
+- before it raises its term, a voter asks the others in a Pre-Vote round
+  whether they would grant it a vote, and campaigns only if a quorum would;
+- the engine checks election timers, and sends idle heartbeats, only on a tick
+  of `heartbeat * 3 / 2` (300 ms).
 
-The profile helpers expose the resulting bounds. Each is measured from a
-surviving voter's last contact with the lost leader:
+The profile helpers expose the resulting bounds, measured from the leader
+loss:
 
 | Bound | Formula | Value |
 |:---|:---|---:|
-| `leader_loss_first_campaign_bound` | `2 * election_timeout_max + tick` | 4,350 ms |
-| `leader_loss_reelection_bound` | first campaign `+ election_timeout_max + tick` | 6,900 ms |
-| `unplanned_leader_loss_write_stall` | re-election `+ 2 * cold connect + 3 * AppendEntries` | 9,400 ms |
+| `leader_loss_first_campaign_bound` | `election_timeout_max + tick` | 6,800 ms |
+| `unplanned_leader_loss_write_stall` | first campaign `+ 6 * heartbeat + grace + cold connect` | 9,700 ms |
 
-The re-election bound allows one further campaign: a split vote, or a first
-candidate whose log is shorter than another survivor's. The write stall adds
-one stale attempt against the lost leader, one cold connection to its
-successor, and three complete AppendEntries rounds: the successor's first
-commit, its linearizable admission round, and the write's own commit. Profile
-validation requires that stall to stay below the operation timeout. A write in
-flight when the leader is lost, submitted through a surviving voter and retried
-only through its own exact request identity after an ambiguous or unavailable
-attempt, therefore reaches its committed outcome within one 10,000 ms
-operation. The bounds assume:
+The survivor that heard from the leader last is the last to campaign; by then
+every other survivor's lease has expired, so its Pre-Vote and vote are
+granted. The write stall adds six round trips, each answered within one
+heartbeat interval (Pre-Vote, vote, the successor's first commit, the forwarded
+write, the successor's linearizable admission round and the write's own
+commit), the one-heartbeat stale-route grace below, and one new connection to
+the successor. Profile validation requires that stall to stay below the
+operation timeout. A write in flight when the leader is lost, submitted through
+a surviving voter and retried only through its own exact request identity after
+an ambiguous or unavailable attempt, therefore reaches its committed outcome
+within one 10,000 ms operation. The bounds assume:
 
-- a reachable majority of voters;
-- every RPC completing within its family ceiling; disk syncs and round trips
-  are expected to stay well below the 500 ms AppendEntries ceiling;
-- no further split vote. Repeated split votes are possible but improbable,
-  because every campaign samples a fresh timeout.
+- a reachable majority of voters whose processes are not suspended or
+  CPU-throttled;
+- every round trip, disk sync included, completing within one heartbeat
+  interval, and every new connection within the cold-connect allowance;
+- no split vote. Two survivors that both pass Pre-Vote at the same moment can
+  still split one term; that is improbable because every campaign samples a
+  fresh timeout, and it adds at most one further election timeout and tick.
 
 A crashed leader refuses the stale attempt at once. A failed node or a
 partition can instead black-hole an established connection, so the session
 store bounds every leader-routed call (forwarded writes, read barriers, exact
 V2 status tickets, capability activation and expiry preflight) by its own
 leader view: once its engine names a different leader, a call still unanswered
-after the cold-connect allowance is abandoned and reported as possibly
-transmitted, and the route moves to the successor. The configuration store's
-routes are not yet bounded this way: behind a black-holed lost leader, a
-configuration write or read waits for its own operation deadline.
+after one heartbeat interval is abandoned and reported as possibly transmitted,
+and the route moves to the successor. The configuration store's routes are not
+yet bounded this way: behind a black-holed lost leader, a configuration write
+or read waits for its own operation deadline.
 
 The same timers decide when a healthy cluster elects spuriously. A voter
-campaigns only after 2,800 ms (`election_timeout_min + election_timeout_max`)
-without any AppendEntries from its leader, that is, after at least three
-missed 750 ms ticks. Voters therefore need CPU that is never throttled or
-suspended for longer than that window. Run voters with guaranteed CPU: either
-no CPU limit, or a limit equal to the request with an integer number of
-cores. CFS quota exhaustion, a stopped container, or storage that blocks the
-engine for seconds can depose a healthy leader. The election itself remains
-safe; in-flight writes on the old leader then end ambiguous and must be
-resolved through their exact request identity.
+campaigns only after 5,000 ms (`election_timeout_min`) without any
+AppendEntries from its leader, that is, after more than sixteen missed 300 ms
+ticks; one slow AppendEntries, bounded by the 2,000 ms ceiling, never expires
+the lease. Voters therefore need CPU that is never throttled or suspended for
+longer than that window. Run voters with guaranteed CPU: either no CPU limit,
+or a limit equal to the request with an integer number of cores. CFS quota
+exhaustion, a stopped container, or storage that blocks the engine for seconds
+can still depose a healthy leader. The election itself remains safe; in-flight
+writes on the old leader then end ambiguous and must be resolved through their
+exact request identity.
 
-The engine provides no pre-vote and no check-quorum leader step-down. Its
-equivalent protection is the follower lease above: while a voter hears from a
-live leader, it rejects candidates, so an isolated or flapping voter cannot win
-an election on its own. A voter that is cut off for longer than 2,800 ms keeps
-raising its term, however, and when it reconnects that higher term can make the
-current leader step down for one further election. A minority leader keeps its
-role but cannot commit: linearizable reads and admission rounds fail closed as
-unavailable, and a write already proposed there ends at its operation deadline
-as ambiguous, to be resolved through its exact request identity.
+Pre-Vote keeps a voter that cannot win from raising its term. A voter cut off
+from the others, or restarted while cut off, keeps its term and rejoins as a
+follower without deposing the leader; a voter that can still send but no
+longer receives is refused by the other voters' leases and the leader's
+quorum-acknowledged lease. The engine has no check-quorum step-down: a minority
+leader keeps its role but cannot commit, linearizable reads and admission
+rounds fail closed as unavailable, and a write already proposed there ends at
+its operation deadline as ambiguous, to be resolved through its exact request
+identity.
 
 `DURABLE_OPENRAFT_PROPOSAL_ADMISSION_SLOTS` fixes both durable adapters at
 eight concurrent proposal paths. Admission is obtained inside the original
@@ -142,9 +152,14 @@ equivalent retirement fence.
 
 The appended `LeadershipTransfer` RPC family carries only an engine-issued
 handoff request. Its payload limit is 1,024 bytes and its deadline uses the
-existing 1,000 ms Vote budget. Consumers must authenticate the exact sender,
+existing five-second Vote budget. Consumers must authenticate the exact sender,
 vote issuer and membership scope before passing the request to the engine.
 This family does not replace ordinary election, quorum or applied-prefix checks.
+
+The appended `PreVote` RPC family carries the engine's Pre-Vote round. Its
+payload and deadline are the Vote family's. It is admitted exactly like a Vote
+and never changes engine state; a refused, failed or timed-out PreVote call is
+never counted as a grant.
 
 New leaders can use `open_leader(projection, deadline)` with a
 `LeaderReadProjection` implementation. The helper executes the barrier,

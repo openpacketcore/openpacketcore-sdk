@@ -247,15 +247,15 @@ directions on every edge incident to that member, and restores all-voter
 readiness and canary progress without changing that process's PID. Unrelated
 survivors must not record an explicit or local-material-epoch retirement from
 this member-only recovery. A prepublication common-key survivor pulse primes
-conservative 10.025-second progress checkpoints. Every publication,
+conservative 11.5-second progress checkpoints. Every publication,
 existing-generation incident path, readiness, and canary checkpoint must
 observe one common active key on every survivor observer. Requiring that pulse in every half-SLO observation
-interval bounds its worst-case actual event gap to the 20.05-second availability
-SLO. A separate 20.05-second checkpoint requires every active key on every
+interval bounds its worst-case actual event gap to the 23-second availability
+SLO. A separate 23-second checkpoint requires every active key on every
 observer and is never reset by a faster key.
 
 Snapshot catch-up records its elapsed time and each voter's applied frontier;
-it does not inherit the 80.05-second connection-settlement deadline. Each voter
+it does not inherit the 83-second connection-settlement deadline. Each voter
 must become ready with the original quorum witnesses and cover the committed
 frontier observed when catch-up began. An applied frontier must not regress,
 and survivor progress alone cannot complete recovery. RPC deadlines and the
@@ -266,11 +266,11 @@ their recovery duration is not an isolated-disk or deployment recovery SLO.
 
 After actual readiness and canary verification, the connection-settlement
 phase observes the full original 60-second two-stage server idle/handler tail
-and retains its 80.05-second deadline. The attempt/terminal ledger must remain
-unchanged for the final 1.5-second
+and retains its 83-second deadline. The attempt/terminal ledger must remain
+unchanged for the final 2.5-second
 cold-connect/maximum-reconnect-backoff tail. Each survivor may record at most
 one availability episode while the expired member rejoins; that episode must
-recover inside the existing 20.05-second SLO and be fully settled before the
+recover inside the existing 23-second SLO and be fully settled before the
 clean baseline. Consecutive typed retry outcomes remain individually counted
 against the unchanged eight-outcome ceiling but do not manufacture additional
 episodes. A second or late episode fails closed. The half-SLO pulse
@@ -362,9 +362,7 @@ combined algorithm.
 The private schedule drops one successful
 release response
 per mutator to exercise that path, and is bound to eight outcomes per node, a
-fixed 20.05-second availability-recovery envelope per episode (the larger of
-the 13.6-second two-election-plus-operation transition and two sequential
-operations plus one retry delay),
+fixed 23-second two-election-plus-operation transition envelope per episode,
 and a fixed 50 ms retry delay; all three bounds and the
 total/recovered/consecutive counters are schedule evidence. Phase completion
 requires every interruption to be reconciled. A committed generation recovered
@@ -378,14 +376,14 @@ process must then reconcile at most 262,144 committed journal entries, prove
 the exact latest generation/owner/fence/payload with a linearizable read, catch
 its watch up without a gap, and resume mutation at a strictly higher same-owner
 fence under the `same-disk-exact-address-active-mutator/v3` stage-bounded
-profile. Its independent bounds are 5 seconds for termination/reaping, 13.6
+profile. Its independent bounds are 5 seconds for termination/reaping, 23
 seconds for outage/survivor progress, 45 seconds for replacement-child startup,
-24.6 seconds for Openraft recovery and readiness observation (the existing
-13.6-second recovery envelope followed by one reserved 11-second final all-voter
+34 seconds for Openraft recovery and readiness observation (the existing
+23-second recovery envelope followed by one reserved 11-second final all-voter
 readiness round: 10 seconds for the backend operation and 1 second for bounded
-local result delivery), 25 seconds for journal reconciliation, and 13.6 seconds
+local result delivery), 25 seconds for journal reconciliation, and 23 seconds
 for higher-fence mutation resume. Those sequential stages compose to a
-126.8-second crash-to-resume ceiling; each stage still fails at its own bound and
+155-second crash-to-resume ceiling; each stage still fails at its own bound and
 cannot borrow from the total. The current schedule binds exact-request acquisition
 recovery and its journal version/size, alongside the count, profile, recovery
 envelope, delivery allowance, final observation reserve, six bounds, and total

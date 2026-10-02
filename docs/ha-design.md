@@ -28,11 +28,12 @@ yet approved as a production deployment profile.
 
 Both domains use `opc_consensus::durable_openraft_config`, the same Tokio
 runtime, and the same end-to-end timing profile. AppendEntries/Openraft
-read-index and the heartbeat are 500 ms; Vote is 1,000 ms; elections sample
-freshly from `[1,000 ms, 1,800 ms)`; InstallSnapshot, forwarded mutation,
+read-index is 2,000 ms and the heartbeat interval is 200 ms; Vote and Pre-Vote
+are 5,000 ms; elections sample freshly from `[5,000 ms, 6,500 ms)`;
+InstallSnapshot, forwarded mutation,
 consumer ReadBarrier, and the operation default are 10,000 ms. Listener
 idle/handler ceilings are 30,000 ms. A fresh connection has a contained
-500 ms DNS/TCP/mTLS/bootstrap cap inside its already-running family deadline,
+1,500 ms DNS/TCP/mTLS/bootstrap cap inside its already-running family deadline,
 may consume at most two thirds of the remaining call budget, and therefore
 leaves a bounded final third for the first negotiated RPC. It is never added to
 the family deadline. The engine profile admits at most 64 log entries per
@@ -50,13 +51,16 @@ cancellation or timeout. Domain adapters select only their cluster label.
 These are code-path constants, not operator tuning knobs and not proof that
 the experimental profile meets #143 under deployed load.
 
-After an unplanned leader loss, a surviving voter campaigns within 4,350 ms of
-its last leader contact, and a replacement leader is elected within 6,900 ms
-when at most one further campaign is needed. The documented write stall is
-9,400 ms, so a write in flight at the loss reaches its outcome inside one
-10,000 ms operation when it is retried only through its own exact request
-identity. A voter campaigns only after 2,800 ms without AppendEntries, so
-voters need CPU that is never throttled or suspended for that long. The
+After an unplanned leader loss, the first successful campaign starts within
+6,800 ms: a surviving voter campaigns once the longer of its leader lease (the
+minimum election timeout) and its sampled election timeout has passed, on its
+next 300 ms engine tick. The documented write stall is 9,700 ms, so a write in
+flight at the loss reaches its outcome inside one 10,000 ms operation when it is
+retried only through its own exact request identity. A voter campaigns only
+after 5,000 ms without AppendEntries, so voters need CPU that is never throttled
+or suspended for that long. Pre-Vote keeps a voter that is cut off from the
+others, or restarted, from raising its term and deposing a healthy leader when
+it returns. The
 [`opc-consensus` README](../crates/opc-consensus/README.md#unplanned-leader-loss)
 derives these bounds from the pinned engine.
 

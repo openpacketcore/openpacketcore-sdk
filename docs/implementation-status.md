@@ -1223,11 +1223,11 @@ reauthentication generation, proves fresh bidirectional incident paths, leaves
 unrelated survivor explicit/material-epoch retirement counters unchanged, and
 settles lifecycle plus survivor availability before the next phase baseline.
 That schedule-bound `member-scoped-reauth-settled-baseline/v4` checkpoint
-starts its 80.05-second fail-safe and 60-second two-stage server tail at the atomic
-projected-data rename, then requires a final 1.5-second outbound quiet tail.
-A prepublication common-key pulse plus 10.025-second observation checkpoints
+starts its 83-second fail-safe and 60-second two-stage server tail at the atomic
+projected-data rename, then requires a final 2.5-second outbound quiet tail.
+A prepublication common-key pulse plus 11.5-second observation checkpoints
 requires one active key to advance on every survivor observer and conservatively
-bounds that pulse's actual event gap to 20.05 seconds. An independent 20.05-second
+bounds that pulse's actual event gap to 23 seconds. An independent 23-second
 checkpoint requires every active key on every observer and cannot be reset by a
 faster key. At most one rejoin availability episode per survivor may settle
 within that SLO. Its consecutive typed retry outcomes remain separately
@@ -1248,17 +1248,16 @@ non-intrusive; final watch-head settlement retains its fail-closed
 authoritative replication-head read. Schedule v6 now binds the active-mutator
 scenario as
 `same-disk-exact-address-active-mutator/v3`: independent 5-second termination,
-13.6-second outage/survivor-progress, 45-second startup, 24.6-second Openraft
-recovery/readiness-observation (a 13.6-second recovery envelope plus one reserved
+23-second outage/survivor-progress, 45-second startup, 34-second Openraft
+recovery/readiness-observation (a 23-second recovery envelope plus one reserved
 11-second final all-voter readiness round: 10 seconds for the backend operation
 and 1 second for bounded local result delivery), 25-second
-journal-reconciliation, and 13.6-second higher-fence-resume deadlines compose to a 126.8-second
+journal-reconciliation, and 23-second higher-fence-resume deadlines compose to a 155-second
 crash-to-resume ceiling.
 Each stage fails independently; the total is not a shared timer. This fixes an
 under-composed v1 qualification deadline that charged all six stages to one
-26-second clock without changing the separate survivor-availability and
-operation-recovery SLOs, now 20.05 and 13.6 seconds under the current timing
-profile. It does not change Openraft's sole commit
+26-second clock without changing the separate 23-second survivor-availability
+and operation-recovery SLOs. It does not change Openraft's sole commit
 authority, HKMS/provider placement, encryption, AAD, or durable formats, and it
 does not prove deployed production readiness. Real
 network/storage partitions, broader active-mutator restart, fault, and

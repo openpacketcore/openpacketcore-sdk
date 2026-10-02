@@ -16,36 +16,50 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   ticket, capability activation or expiry preflight waited 10 seconds even
   after the surviving voters had elected a successor. Every leader-routed call
   is now bounded by the replica's own leader view: once its engine names a
-  different leader, a call still unanswered after the 500 ms cold-connect
-  allowance is abandoned and reported as possibly transmitted, so callers
-  retry only the same request identity or report an unknown outcome. A
-  planned handoff's not-leader answer still arrives inside that allowance. A
-  regression that black-holes one follower's route to the leader now commits
-  its write in 3.5 to 4.3 seconds instead of ending ambiguous after 10
-  seconds. Refs #1037.
+  different leader, a call still unanswered after one 200 ms heartbeat interval
+  is abandoned and reported as possibly transmitted, so callers retry only the
+  same request identity or report an unknown outcome. A regression that
+  black-holes one follower's route to the leader now commits its write in
+  about 6.5 seconds instead of ending ambiguous after 10 seconds. Refs #1037.
 
 - `opc-consensus`: an unplanned leader loss no longer stalls an in-flight
-  write past the 10-second operation timeout. The pinned engine leases a
-  committed leader's vote for `election_timeout_max`, then waits one sampled
-  election timeout, and checks timers only on a tick of 1.5 heartbeats, so the
-  former 2,000 ms heartbeat and `[5,000 ms, 8,000 ms)` elections detected a lost
-  leader 13 to 19 seconds after its last contact. `DURABLE_CONSENSUS_TIMING_PROFILE`
-  now uses a 500 ms heartbeat/AppendEntries/read-index ceiling, a 1,000 ms Vote
-  ceiling, `[1,000 ms, 1,800 ms)` elections and a 500 ms contained cold-connect
-  cap. InstallSnapshot, forwarded-mutation, read-barrier, operation and listener
-  ceilings are unchanged. New profile helpers expose the first-campaign
-  (4,350 ms), replacement-election (6,900 ms) and documented write-stall
-  (9,400 ms) bounds, and profile validation requires that stall to stay below
-  the operation timeout. A real three- and five-process projected-mTLS fleet
-  regression kills the leader with SIGKILL during a stream of fenced writes:
-  the outage falls from 15.6 seconds to 3.6 seconds, and every write commits
-  exactly once with its exact receipt. Voters now campaign after 2,800 ms
-  without AppendEntries, so they need CPU that is never throttled or suspended
-  for that long; `opc-consensus` documents the guarantee, its assumptions, and
-  the engine's lack of pre-vote and check-quorum. Profile-derived qualification
-  envelopes follow the new timing: the traffic schedule advances to v11, and its
-  availability-recovery envelope still covers two sequential operations plus
-  one retry. The frozen v6/v7 HA profiles keep their original timing. Refs #1037.
+  write past the 10-second operation timeout. The pinned engine used to start a
+  follower's own election timeout only after a leader lease of
+  `election_timeout_max` and checked timers on a tick of 1.5 heartbeats, so
+  the former 2,000 ms heartbeat and `[5,000 ms, 8,000 ms)` elections detected a
+  lost leader 13 to 19 seconds after its last contact. With the consumed fork
+  rules (overlapping lease and timeout, a separate AppendEntries deadline,
+  Pre-Vote and the leader's quorum-acknowledged lease),
+  `DURABLE_CONSENSUS_TIMING_PROFILE` keeps the 2,000 ms AppendEntries/read-index,
+  5,000 ms Vote and 1,500 ms contained cold-connect budgets, adds a separate
+  200 ms heartbeat interval and samples elections from `[5,000 ms, 6,500 ms)`.
+  New profile helpers expose the first-campaign (6,800 ms) and documented
+  write-stall (9,700 ms) bounds. Profile validation requires that stall to stay
+  below the operation timeout and a follower lease to span two engine ticks and
+  two AppendEntries ceilings. A real three- and five-process projected-mTLS
+  fleet regression kills the leader with SIGKILL during a stream of fenced
+  writes: the outage falls from 15.6 seconds to 5.6 seconds with three voters
+  and 5.4 seconds with five, and every write commits exactly once with its
+  exact receipt. A healthy fleet squeezed onto two CPUs with spinning threads
+  keeps its leader. Voters campaign only after
+  5,000 ms without AppendEntries, so they need CPU that is never throttled or
+  suspended for that long; `opc-consensus` documents the guarantee and its
+  assumptions. Profile-derived qualification envelopes follow the shorter
+  maximum election timeout (26 to 23 seconds), which changes the traffic and
+  candidate schedule digests; the frozen v6/v7 HA profiles keep their original
+  timing. Refs #1037.
+
+- `opc-consensus`, `opc-session-store`, `opc-persist`: a voter that is cut off
+  from the others, or restarted while cut off, no longer deposes a healthy
+  leader when it returns. The new `PreVote` RPC family (Vote's payload bound
+  and deadline) carries the engine's Pre-Vote round through the session and
+  configuration Raft adapters, and the shared durable Openraft configuration
+  enables it. A PreVote request is admitted exactly like a Vote and changes no
+  engine state; a refused, failed or timed-out PreVote call is never a grant.
+  A regression that cuts one voter off for two election timeouts keeps its term
+  and the leader; without the family, the voter reaches term 3 and the cluster
+  is left leaderless. Older members do not understand the family: stop and
+  upgrade every consensus member together. Refs #1037.
 
 - `opc-session-net`: a prepared compare-and-set or lease acquire whose
   current voter answers with a complete `Rejected(Unavailable)` now moves the

@@ -123,14 +123,15 @@ call also has its transport-owned complete deadline within that operation.
 
 The production transport profile is fixed, not operator-tunable:
 
-- AppendEntries, the heartbeat, and Openraft read-index confirmation: 500 ms;
-- Vote: 1 second;
+- AppendEntries and Openraft read-index confirmation: 2 seconds;
+- leader heartbeat interval: 200 ms, sent on a 300 ms engine tick;
+- Vote and Pre-Vote: 5 seconds;
 - InstallSnapshot, forwarded mutation, and consumer ReadBarrier: 10 seconds;
-- election timeout: freshly sampled from `[1 second, 1.8 seconds)`; and
+- election timeout: freshly sampled from `[5 seconds, 6.5 seconds)`; and
 - server frame-idle and handler ceilings: 30 seconds.
 
 For an initial or replacement connection, DNS, TCP, mTLS, identity admission,
-and bootstrap have a 500 ms sub-bound inside the already-running family
+and bootstrap have a 1.5-second sub-bound inside the already-running family
 deadline. It is never an additional allowance. A healthy directed peer reuses
 a fixed primary/overflow pool of at most two authenticated connections, with
 one in-flight RPC per lane. Sequential calls prefer primary, a concurrent call
@@ -161,37 +162,43 @@ diagnostics, but keep readiness gated by the fresh probe.
 
 A planned shutdown transfers leadership before the leader stops. After an
 unplanned loss (a crash, a node failure, or a partition), the surviving
-voters elect a replacement on their own timers:
+voters elect a replacement on their own timers. A surviving voter campaigns
+once the longer of its leader lease (the 5-second minimum election timeout) and
+its sampled election timeout has passed since it last heard from the leader:
 
-- a surviving voter first campaigns within 4,350 ms of its last contact with
-  the lost leader;
-- a replacement leader is elected within 6,900 ms when at most one further
-  campaign is needed, for a split vote or a first candidate with a shorter log;
+- the first successful campaign starts within 6,800 ms of the loss;
 - a write in flight at the loss reaches its outcome within the documented
-  9,400 ms stall, inside one 10-second operation, when the caller retries only
+  9,700 ms stall, inside one 10-second operation, when the caller retries only
   its own exact request identity after an ambiguous or unavailable attempt;
 - a session-store write or read that a black-holed lost leader holds is moved
-  to the successor within 500 ms after the forwarding replica observes it,
+  to the successor within 200 ms after the forwarding replica observes it,
   instead of at the caller's deadline.
 
-These bounds assume a reachable majority whose RPCs complete within their
-family ceilings. Repeated split votes are improbable but not excluded.
+These bounds assume a reachable majority whose processes are not suspended or
+throttled and whose RPCs complete within one heartbeat interval. A split vote
+is improbable and outside them; it adds at most one further election timeout
+and tick.
 
-A voter campaigns after 2,800 ms without AppendEntries from its leader, three
-missed 750 ms engine ticks. Give every voter CPU that is never throttled or
-suspended for that long:
+Each voter first asks the others in a Pre-Vote round whether they would grant
+it a vote, and raises its term only when a majority would. A voter that is cut
+off from the others, or restarted while cut off, therefore keeps its term and
+rejoins as a follower without deposing a healthy leader. A leader also rejects
+every candidate while a majority keeps acknowledging it.
+
+A voter campaigns after 5,000 ms without AppendEntries from its leader, more
+than sixteen missed 300 ms engine ticks. Give every voter CPU that is never
+throttled or suspended for that long:
 
 - set the CPU limit equal to the request, with an integer number of cores, or
   set no CPU limit;
 - do not pause, checkpoint, or live-migrate a voter that is serving traffic;
-- keep durable-log storage latency far below the 500 ms AppendEntries ceiling.
+- keep durable-log storage latency far below the 2-second AppendEntries
+  ceiling.
 
-CFS quota exhaustion, a stopped container, or storage that blocks the engine
-for seconds can depose a healthy leader. The election stays safe, but writes in
-flight on the deposed leader end ambiguous and must be resolved through their
-exact request identity. The pinned engine has no pre-vote: a voter cut off for
-more than 2,800 ms raises its term, and when it reconnects it can make the
-current leader step down for one further election.
+CFS quota exhaustion, a stopped container, or storage that blocks a leader for
+seconds can still depose it. The election stays safe, but writes in flight on
+the deposed leader end ambiguous and must be resolved through their exact
+request identity.
 
 ## 3. Normal write and response-loss handling
 
@@ -485,16 +492,16 @@ an `expiry - 30 seconds` soft boundary, followed by complete hard-deadline drain
 and source/controller `LastGoodExpired`; survivors continue canary progress and
 a valid long-lived leaf restores the affected member in the same process. The
 replacement proof uses the schedule-bound
-`member-scoped-reauth-settled-baseline/v4` checkpoint: its 80.05-second clock and
+`member-scoped-reauth-settled-baseline/v4` checkpoint: its 83-second clock and
 60-second two-stage server tail begin at the atomic projected-data rename, and
-a final 1.5-second outbound-ledger quiet tail completes the horizon. A
-prepublication common-key pulse plus 10.025-second observation checkpoints requires
+a final 2.5-second outbound-ledger quiet tail completes the horizon. A
+prepublication common-key pulse plus 11.5-second observation checkpoints requires
 one active key to advance on every survivor observer and conservatively bounds
-that pulse's worst-case actual event gap to 20.05 seconds. An independent 20.05-second
+that pulse's worst-case actual event gap to 23 seconds. An independent 23-second
 checkpoint requires every active key on every observer and cannot be reset by a
 faster key. Each survivor may record at most one rejoin availability episode;
 its consecutive typed retry outcomes remain separately bounded by the
-unchanged eight-outcome ceiling. It must recover within that 20.05-second SLO and
+unchanged eight-outcome ceiling. It must recover within that 23-second SLO and
 settle before the clean baseline, and a second or late episode fails closed.
 Fault-era new-attempt and reconnect
 deltas remain inside the fixed 85/161 per-node bound (ordinary 24/40, fifteen
@@ -561,9 +568,7 @@ See the [qualification contract](../crates/opc-session-testkit/README.md).
 The private schedule drops one successful release response per mutator to prove
 this path.
 More than eight such outcomes per node, any recovery episode beyond the fixed
-20.05-second availability-recovery envelope (the larger of the 13.6-second
-two-election-plus-operation transition and two sequential operations plus one
-retry delay), any retry before the
+23-second two-election-plus-operation transition envelope, any retry before the
 fixed 50 ms delay, or phase completion with an unresolved interruption fails
 the campaign. A terminal operation observed after that deadline reports the
 closed operation stage and elapsed milliseconds and stays failed; raw backend
@@ -584,15 +589,15 @@ the following stage deadlines:
 | Restart stage | Bound |
 | --- | ---: |
 | SIGKILL termination and process reaping | 5 seconds |
-| Outage work and survivor progress | 13.6 seconds |
+| Outage work and survivor progress | 23 seconds |
 | Replacement-child startup | 45 seconds |
-| Openraft recovery and all-voter readiness observation | 24.6 seconds |
+| Openraft recovery and all-voter readiness observation | 34 seconds |
 | Bounded journal reconciliation | 25 seconds |
-| Higher-fence mutation resume | 13.6 seconds |
+| Higher-fence mutation resume | 23 seconds |
 
-The sequential stages compose to a 126.8-second crash-to-resume ceiling. Each
+The sequential stages compose to a 155-second crash-to-resume ceiling. Each
 stage fails independently and cannot borrow unused time from another stage or
-use the total as its timer. The 24.6-second readiness stage is the 13.6-second
+use the total as its timer. The 34-second readiness stage is the 23-second
 recovery envelope followed by one 11-second final round: a 10-second backend
 operation plus 1 second of bounded local result delivery. This retains the v1
 deadline-composition fix and corrects v2's free-running probe admission, which
