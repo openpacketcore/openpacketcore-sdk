@@ -10,7 +10,7 @@ on:
 permissions:
   contents: read
 
-# This workflow now requests 27 concurrent jobs per run (20 job definitions;
+# This workflow now requests 29 concurrent jobs per run (22 job definitions;
 # one expands to a 7-way shard matrix and one to a 2-way matrix). Without a
 # concurrency group a superseded push keeps its whole fleet running and the
 # replacement run queues behind it, which costs far more wall clock than the
@@ -319,6 +319,68 @@ jobs:
       - name: Run consensus e2e tests (serial)
         run: cargo test --locked -p opc-persist --all-features --quiet -- --test-threads=1
 
+  # Rolling upgrade, and its rollback, between the previous release and this
+  # one. A voter set mixes the two while voters are replaced one at a time, so
+  # this lane builds the previous release's quorum node from its own checkout:
+  # the pull request's base, or the previous main commit on a push. It then
+  # runs the ignored mixed-release qualification against it. That
+  # qualification drives the previous node through this tree's harness, so a
+  # change that breaks compatibility with the previous release fails here.
+  rust-mixed-release:
+    name: Rust mixed-release rolling upgrade
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    env:
+      CARGO_INCREMENTAL: "0"
+      CARGO_PROFILE_DEV_DEBUG: "0"
+      CARGO_PROFILE_TEST_DEBUG: "0"
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      - name: Checkout the previous release
+        uses: actions/checkout@v7
+        with:
+          ref: ${{ github.event.pull_request.base.sha || github.event.before || 'main' }}
+          path: previous-release
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@1.98.1 # pinned until #1041 migrates Atomic::fetch_update
+        with:
+          components: clippy,rustfmt
+
+      - name: Prepare fs-verity snapshot storage
+        run: ci/setup-fsverity-tmp.sh
+
+      - name: Cache Rust dependencies
+        uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: opc-rust-mixed-release
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+          workspaces: |
+            . -> target
+            previous-release -> target
+
+      # The same package selection and features as the test shards, so the
+      # previous node is built exactly as its own CI built it.
+      - name: Build the previous release's quorum node
+        working-directory: previous-release
+        run: cargo build --locked --workspace --exclude opc-persist --all-features --bin opc-session-quorum-node
+
+      - name: Run the mixed-release qualification
+        env:
+          OPC_SESSION_QUORUM_NODE_PREVIOUS_RELEASE: ${{ github.workspace }}/previous-release/target/debug/opc-session-quorum-node
+        run: |
+          cargo test --locked --workspace --exclude opc-persist --all-features \
+            --test qualification_mtls_multiprocess -- \
+            --ignored --exact --test-threads=1 \
+            mixed_release::three_process_mixed_release_leader_loss_with_a_lagging_previous_release_voter \
+            mixed_release::five_process_mixed_release_leader_loss_with_lagging_previous_release_voters \
+            mixed_release::three_process_rolling_upgrade_from_the_previous_release_under_fenced_writes \
+            mixed_release::five_process_rolling_upgrade_from_the_previous_release_under_fenced_writes \
+            mixed_release::three_process_rolling_downgrade_to_the_previous_release_under_fenced_writes \
+            mixed_release::five_process_rolling_downgrade_to_the_previous_release_under_fenced_writes
+
   rust-gtpu-cfg:
     name: Rust GTP-U unsupported-platform cfg
     runs-on: ubuntu-latest
@@ -619,6 +681,7 @@ jobs:
       - rust-clippy
       - rust-tests
       - rust-persist
+      - rust-mixed-release
       - rust-gtpu-cfg
       - rust-gtpu-freebsd
       - rust-gtpu-macos
