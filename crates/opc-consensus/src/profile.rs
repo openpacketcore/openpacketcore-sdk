@@ -91,6 +91,7 @@ impl DurableConsensusTimingProfile {
     pub const fn rpc_timeout(self, family: ConsensusRpcFamily) -> Duration {
         Duration::from_millis(match family {
             ConsensusRpcFamily::Vote => self.vote_timeout_millis,
+            ConsensusRpcFamily::PreVote => self.vote_timeout_millis,
             ConsensusRpcFamily::LeadershipTransfer => self.vote_timeout_millis,
             ConsensusRpcFamily::AppendEntries => self.append_entries_timeout_millis,
             ConsensusRpcFamily::AppendEntriesRoster => self.append_entries_timeout_millis,
@@ -366,6 +367,9 @@ pub fn durable_openraft_config(
         snapshot_policy: SnapshotPolicy::LogsSinceLast(profile.logs_per_snapshot),
         snapshot_max_chunk_size: profile.snapshot_chunk_bytes,
         max_in_snapshot_log_to_keep: profile.retained_logs,
+        // A voter that cannot win, such as one cut off from the others, keeps its
+        // term instead of deposing a healthy leader when it is reachable again.
+        enable_pre_vote: Some(true),
         ..Config::default()
     }
     .validate()
@@ -415,6 +419,7 @@ mod tests {
                 config.snapshot_policy,
                 SnapshotPolicy::LogsSinceLast(DURABLE_OPENRAFT_PROFILE.logs_per_snapshot)
             );
+            assert_eq!(config.enable_pre_vote, Some(true));
         }
     }
 
@@ -433,6 +438,10 @@ mod tests {
         assert_eq!(
             profile.rpc_timeout(ConsensusRpcFamily::Vote),
             Duration::from_millis(1_000)
+        );
+        assert_eq!(
+            profile.rpc_timeout(ConsensusRpcFamily::PreVote),
+            profile.rpc_timeout(ConsensusRpcFamily::Vote)
         );
         assert_eq!(
             profile.rpc_timeout(ConsensusRpcFamily::LeadershipTransfer),

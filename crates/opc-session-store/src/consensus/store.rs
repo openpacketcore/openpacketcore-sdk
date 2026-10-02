@@ -11647,6 +11647,7 @@ impl SessionConsensusRpcHandler for SessionConsensusService {
         if matches!(
             request.family,
             SessionConsensusRpcFamily::Vote
+                | SessionConsensusRpcFamily::PreVote
                 | SessionConsensusRpcFamily::AppendEntries
                 | SessionConsensusRpcFamily::AppendEntriesRoster
                 | SessionConsensusRpcFamily::InstallSnapshot

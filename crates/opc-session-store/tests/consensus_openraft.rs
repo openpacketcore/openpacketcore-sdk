@@ -10,6 +10,9 @@ mod planned_shutdown;
 #[path = "consensus_openraft/stale_leader_route.rs"]
 mod stale_leader_route;
 
+#[path = "consensus_openraft/pre_vote.rs"]
+mod pre_vote;
+
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 use std::path::{Path, PathBuf};
@@ -24,6 +27,7 @@ use opc_consensus::engine::raft::InstallSnapshotResponse;
 use opc_consensus::{
     decode_bounded, derive_configuration_id, encode_bounded, ConsensusClusterId,
     ConsensusConfigurationEpoch, ConsensusIdentity, DURABLE_CONSENSUS_TIMING_PROFILE,
+    DURABLE_OPENRAFT_PROFILE,
 };
 use opc_crypto::CryptoEnvelopeV1;
 use opc_key::{

@@ -502,7 +502,7 @@ impl SessionRaftPeerDirectory {
         let staged = state
             .staged
             .as_ref()
-            .filter(|staged| family != SessionConsensusRpcFamily::Vote || staged.voting_admitted)
+            .filter(|staged| !is_vote_rpc_family(family) || staged.voting_admitted)
             .and_then(|staged| staged.routes.get(&target));
         let route = if state.current_members.contains(&self.local_node_id) {
             active.or(staged)
@@ -530,7 +530,7 @@ impl SessionRaftPeerDirectory {
                         route.identity == identity && route.peer.node_id() == sender
                     }))
                     || state.staged.as_ref().is_some_and(|staged| {
-                        (family != SessionConsensusRpcFamily::Vote || staged.voting_admitted)
+                        (!is_vote_rpc_family(family) || staged.voting_admitted)
                             && staged.routes.get(&sender).is_some_and(|route| {
                                 route.identity == identity && route.peer.node_id() == sender
                             })
@@ -1185,6 +1185,24 @@ impl RaftNetwork<SessionRaftTypeConfig> for SessionRaftNetwork {
         )
         .await
     }
+
+    async fn pre_vote(
+        &mut self,
+        rpc: VoteRequest<SessionConsensusNodeId>,
+        option: RPCOption,
+    ) -> Result<VoteResponse<SessionConsensusNodeId>, EngineRpcError> {
+        let payload = encode_bounded(&rpc).map_err(|error| {
+            EngineRpcError::Unreachable(Unreachable::new(&CodecTransportError(error)))
+        })?;
+        // A failed or refused call is never counted as a grant by the engine.
+        self.call(
+            SessionConsensusRpcFamily::PreVote,
+            opc_consensus::engine::RPCTypes::Vote,
+            payload,
+            option,
+        )
+        .await
+    }
 }
 
 fn map_peer_error<E>(
@@ -1449,6 +1467,21 @@ impl SessionRaftRpcHandler {
                 }
                 encode_engine_result(&self.raft.vote(rpc).await)
             }
+            SessionConsensusRpcFamily::PreVote => {
+                let rpc = match decode_and_bind_sender::<VoteRequest<SessionConsensusNodeId>>(
+                    &request.payload,
+                    request.sender,
+                ) {
+                    Ok(rpc) => rpc,
+                    Err(error) => return rejected_response(error),
+                };
+                // A replica that could not accept this vote does not pretend
+                // that it would.
+                if !persistence.permits_vote(&rpc) {
+                    return rejected_response(SessionConsensusPeerError::Rejected);
+                }
+                encode_engine_result(&self.raft.pre_vote(rpc).await)
+            }
             SessionConsensusRpcFamily::InstallSnapshot => {
                 let rpc = match decode_and_bind_sender::<
                     InstallSnapshotRequest<SessionRaftTypeConfig>,
@@ -1536,10 +1569,18 @@ fn validate_envelope(
     Ok(())
 }
 
+fn is_vote_rpc_family(family: SessionConsensusRpcFamily) -> bool {
+    matches!(
+        family,
+        SessionConsensusRpcFamily::Vote | SessionConsensusRpcFamily::PreVote
+    )
+}
+
 fn is_engine_rpc_family(family: SessionConsensusRpcFamily) -> bool {
     matches!(
         family,
         SessionConsensusRpcFamily::Vote
+            | SessionConsensusRpcFamily::PreVote
             | SessionConsensusRpcFamily::AppendEntries
             | SessionConsensusRpcFamily::AppendEntriesRoster
             | SessionConsensusRpcFamily::InstallSnapshot

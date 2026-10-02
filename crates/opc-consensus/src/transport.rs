@@ -134,6 +134,9 @@ pub enum ConsensusRpcFamily {
     /// voter use the engine's ordinary election. This does not carry commands
     /// or change membership.
     LeadershipTransfer,
+    /// Openraft Pre-Vote request: ask whether a voter would grant a vote for
+    /// the sender's next term. Answering persists nothing and changes no term.
+    PreVote,
 }
 
 impl ConsensusRpcFamily {
@@ -149,6 +152,7 @@ impl ConsensusRpcFamily {
             Self::ReadBarrier => "read_barrier",
             Self::TopologyAdmissionBarrier => "topology_admission_barrier",
             Self::LeadershipTransfer => "leadership_transfer",
+            Self::PreVote => "pre_vote",
         }
     }
 
@@ -167,6 +171,7 @@ impl ConsensusRpcFamily {
                 CONSENSUS_MAX_ROSTER_RPC_PAYLOAD_BYTES
             }
             Self::Vote
+            | Self::PreVote
             | Self::AppendEntries
             | Self::InstallSnapshot
             | Self::ForwardMutation
@@ -491,6 +496,23 @@ mod tests {
             vec![7]
         );
         assert_eq!(encode_bounded(&family).unwrap(), vec![8]);
+    }
+
+    #[test]
+    fn pre_vote_family_extends_the_wire_encoding_and_keeps_the_vote_bound() {
+        let family = ConsensusRpcFamily::PreVote;
+        assert_eq!(family.as_str(), "pre_vote");
+        assert_eq!(
+            family.max_request_payload_bytes(),
+            ConsensusRpcFamily::Vote.max_request_payload_bytes()
+        );
+        // Adding the family must preserve existing encoded discriminants.
+        assert_eq!(encode_bounded(&ConsensusRpcFamily::Vote).unwrap(), vec![0]);
+        assert_eq!(
+            encode_bounded(&ConsensusRpcFamily::LeadershipTransfer).unwrap(),
+            vec![8]
+        );
+        assert_eq!(encode_bounded(&family).unwrap(), vec![9]);
     }
 
     #[test]

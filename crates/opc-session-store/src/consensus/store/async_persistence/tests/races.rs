@@ -221,8 +221,9 @@ pub(super) async fn wait_for_lease_expiry(store: &ConsensusSessionStore) {
         .await
         .unwrap()
         .unwrap();
-    // Fixture setup waits for the real pinned engine lease. No operation is
-    // in progress, and neither election settings nor the 800 ms API change.
+    // Fixture setup waits for the real pinned engine lease, which never
+    // exceeds the maximum election timeout. No operation is in progress, and
+    // neither election settings nor the 800 ms API change.
     let lease = Duration::from_millis(session_raft_config().unwrap().election_timeout_max);
     tokio::time::sleep_until(modified + lease + Duration::from_millis(1)).await;
 }
@@ -310,7 +311,21 @@ async fn async_persistence_old_completion_cannot_certify_a_new_leader() {
             old_applied.leader_id,
             CommittedLeaderId::new(vote.leader_id.term, fleet.peers[old].node)
         );
-        next_store.inner.raft.trigger().elect().await.unwrap();
+        // A leader rejects every candidate while a quorum acknowledges it, so
+        // the old leader hands over: it releases its lease, and the next
+        // voter wins an ordinary election in a higher term.
+        let handoff = old_store
+            .inner
+            .raft
+            .begin_leadership_transfer(fleet.peers[next].node)
+            .await
+            .unwrap();
+        next_store
+            .inner
+            .raft
+            .handle_leadership_transfer(handoff)
+            .await
+            .unwrap();
         until(
             || {
                 let new_vote = next_store.inner.raft.metrics().borrow().vote;
@@ -323,12 +338,17 @@ async fn async_persistence_old_completion_cannot_certify_a_new_leader() {
         )
         .await;
         hold.release();
-        assert!(matches!(
-            pending.await.unwrap(),
-            Err(ConsensusPeerCallFailure::AuthenticatedRejection(
-                SessionConsensusPeerError::Rejected
-            ))
-        ));
+        let held = pending.await.unwrap();
+        assert!(
+            matches!(
+                held,
+                Err(ConsensusPeerCallFailure::AuthenticatedRejection(
+                    SessionConsensusPeerError::Rejected
+                ))
+            ),
+            "the old completion is rejected: {:?}",
+            held.as_ref().err()
+        );
         assert!(started.elapsed() < OPERATION_BOUND);
         assert!(!cold.inner.persistence_protocol.is_active());
         until(

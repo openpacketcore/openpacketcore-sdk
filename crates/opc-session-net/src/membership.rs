@@ -791,7 +791,7 @@ impl SessionMembershipAdmission {
                 )
             });
         let pending_engine_catchup = match family {
-            ConsensusRpcFamily::Vote => pending_voting_admitted,
+            ConsensusRpcFamily::Vote | ConsensusRpcFamily::PreVote => pending_voting_admitted,
             ConsensusRpcFamily::AppendEntries
             | ConsensusRpcFamily::AppendEntriesRoster
             | ConsensusRpcFamily::InstallSnapshot
@@ -1197,19 +1197,21 @@ mod tests {
             )
             .await
             .is_ok());
-        assert_eq!(
-            admission
-                .revalidate_engine_scope(
-                    &pending_scope,
-                    five.consensus_identity(),
-                    pending_scope.sender_node_id,
-                    ConsensusRpcFamily::Vote,
-                )
-                .await
-                .map(|_| ()),
-            Err(SessionConsensusPeerError::ScopeMismatch),
-            "a staged learner must not vote before catch-up promotion"
-        );
+        for family in [ConsensusRpcFamily::Vote, ConsensusRpcFamily::PreVote] {
+            assert_eq!(
+                admission
+                    .revalidate_engine_scope(
+                        &pending_scope,
+                        five.consensus_identity(),
+                        pending_scope.sender_node_id,
+                        family,
+                    )
+                    .await
+                    .map(|_| ()),
+                Err(SessionConsensusPeerError::ScopeMismatch),
+                "a staged learner must not vote or pre-vote before catch-up promotion"
+            );
+        }
         assert_eq!(
             admission
                 .admit_successor_voting_after_catch_up_for_test(&expand_request)
@@ -1223,15 +1225,17 @@ mod tests {
             Ok(SessionMembershipTransitionResult::AlreadyVotingAdmitted)
         );
         assert!(admission.snapshot().await.pending_voting_admitted());
-        assert!(admission
-            .revalidate_engine_scope(
-                &pending_scope,
-                five.consensus_identity(),
-                pending_scope.sender_node_id,
-                ConsensusRpcFamily::Vote,
-            )
-            .await
-            .is_ok());
+        for family in [ConsensusRpcFamily::Vote, ConsensusRpcFamily::PreVote] {
+            assert!(admission
+                .revalidate_engine_scope(
+                    &pending_scope,
+                    five.consensus_identity(),
+                    pending_scope.sender_node_id,
+                    family,
+                )
+                .await
+                .is_ok());
+        }
         assert_eq!(
             admission
                 .revalidate_engine_scope(
@@ -1267,6 +1271,7 @@ mod tests {
         }
         for family in [
             ConsensusRpcFamily::Vote,
+            ConsensusRpcFamily::PreVote,
             ConsensusRpcFamily::AppendEntries,
             ConsensusRpcFamily::AppendEntriesRoster,
             ConsensusRpcFamily::InstallSnapshot,

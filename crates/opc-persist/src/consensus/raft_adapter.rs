@@ -252,6 +252,24 @@ impl RaftNetwork<ConfigRaftTypeConfig> for ConfigRaftNetwork {
         )
         .await
     }
+
+    async fn pre_vote(
+        &mut self,
+        request: VoteRequest<ConsensusNodeId>,
+        option: RPCOption,
+    ) -> Result<VoteResponse<ConsensusNodeId>, EngineRpcError> {
+        let payload = encode_config_wire(&request).map_err(|error| {
+            EngineRpcError::Unreachable(Unreachable::new(&CodecTransportError(error)))
+        })?;
+        // A failed or refused call is never counted as a grant by the engine.
+        self.call(
+            ConsensusRpcFamily::PreVote,
+            opc_consensus::engine::RPCTypes::Vote,
+            payload,
+            option,
+        )
+        .await
+    }
 }
 
 fn map_peer_error<E>(
@@ -342,6 +360,16 @@ impl ConsensusRpcHandler for ConfigRaftRpcHandler {
                     Err(error) => return rejected_response(error),
                 };
                 encode_engine_result(&self.raft.vote(rpc).await)
+            }
+            ConsensusRpcFamily::PreVote => {
+                let rpc = match decode_and_bind_sender::<VoteRequest<ConsensusNodeId>>(
+                    &request.payload,
+                    request.sender,
+                ) {
+                    Ok(rpc) => rpc,
+                    Err(error) => return rejected_response(error),
+                };
+                encode_engine_result(&self.raft.pre_vote(rpc).await)
             }
             ConsensusRpcFamily::InstallSnapshot => {
                 let rpc = match decode_and_bind_sender::<InstallSnapshotRequest<ConfigRaftTypeConfig>>(

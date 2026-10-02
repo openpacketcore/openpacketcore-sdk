@@ -243,7 +243,7 @@ impl EngineAdmission {
             return false;
         }
         match family {
-            SessionConsensusRpcFamily::Vote => {
+            SessionConsensusRpcFamily::Vote | SessionConsensusRpcFamily::PreVote => {
                 opc_consensus::decode_bounded(payload).is_ok_and(|rpc| self.permits_vote(&rpc))
             }
             SessionConsensusRpcFamily::AppendEntries => {

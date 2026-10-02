@@ -74,8 +74,10 @@ impl SessionConsensusPeer for Peer {
         &self,
         request: SessionConsensusWireRequest,
     ) -> Result<SessionConsensusWireResponse, SessionConsensusPeerError> {
-        if request.family == SessionConsensusRpcFamily::Vote
-            && self.blocked_votes.load(Ordering::Acquire)
+        if matches!(
+            request.family,
+            SessionConsensusRpcFamily::Vote | SessionConsensusRpcFamily::PreVote
+        ) && self.blocked_votes.load(Ordering::Acquire)
         {
             return Err(SessionConsensusPeerError::Unavailable);
         }
@@ -101,6 +103,7 @@ impl SessionConsensusPeer for Peer {
         if matches!(
             family,
             SessionConsensusRpcFamily::Vote
+                | SessionConsensusRpcFamily::PreVote
                 | SessionConsensusRpcFamily::AppendEntries
                 | SessionConsensusRpcFamily::AppendEntriesRoster
                 | SessionConsensusRpcFamily::InstallSnapshot
