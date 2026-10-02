@@ -1,16 +1,19 @@
-//! Unplanned leader loss under a live stream of fenced writes.
+//! Leader-loss timing under a live stream of fenced writes.
 //!
 //! One OS process per voter. A persistent V2 consumer attached to a surviving
-//! voter streams sequential epoch-fenced transitions on one record while the
-//! elected leader is killed with SIGKILL. A write retries only its own
-//! self-authenticating request after a not-transmitted, unavailable, or
-//! ambiguous attempt, so the SDK's exact replay contract, never a fresh
-//! request, resolves every ambiguity.
+//! voter streams sequential epoch-fenced transitions on one record. In the
+//! unplanned-loss tests the elected leader is killed with SIGKILL while that
+//! stream is in flight; a write retries only its own self-authenticating
+//! request after a not-transmitted, unavailable, or ambiguous attempt, so the
+//! SDK's exact replay contract, never a fresh request, resolves every
+//! ambiguity. The contention test instead keeps every voter alive on two
+//! shared CPUs and requires that no voter campaigns.
 
 use std::collections::BTreeMap;
 use std::fmt;
 
 use opc_session_store::FencedTransitionOutcome;
+use rustix::thread::{sched_getaffinity, sched_setaffinity, CpuSet, Pid};
 
 use super::*;
 
@@ -180,6 +183,7 @@ async fn fenced_stream_request(
 struct StreamProgress {
     committed: AtomicUsize,
     fault_at: Mutex<Option<Instant>>,
+    stop: AtomicBool,
 }
 
 impl StreamProgress {
@@ -202,6 +206,9 @@ async fn stream_fenced_writes(
 ) -> Result<Vec<FencedStreamWrite>, (Vec<FencedStreamWrite>, String)> {
     let mut writes: Vec<FencedStreamWrite> = Vec::new();
     loop {
+        if progress.stop.load(Ordering::SeqCst) {
+            return Ok(writes);
+        }
         if let Some(fault_at) = progress.fault_at() {
             let committed_after_fault = writes
                 .iter()
@@ -528,4 +535,189 @@ fn five_process_projected_mtls_unplanned_leader_loss_fenced_write_stream() {
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
     run_unplanned_leader_loss_fenced_write_stream(5);
+}
+
+/// The two lowest-numbered CPUs this test process may run on.
+fn contended_cpu_set() -> (CpuSet, usize) {
+    let allowed = sched_getaffinity(None).expect("read this process's CPU affinity");
+    let mut cpus = CpuSet::new();
+    let mut count = 0;
+    for cpu in 0..CpuSet::MAX_CPU {
+        if allowed.is_set(cpu) {
+            cpus.set(cpu);
+            count += 1;
+            if count == 2 {
+                break;
+            }
+        }
+    }
+    assert!(count > 0, "this process may run on at least one CPU");
+    (cpus, count)
+}
+
+/// Confine every thread of one voter process to `cpus`. A thread the voter
+/// creates later inherits the mask of its pinned creator; a second pass
+/// covers a thread created while the first pass ran.
+fn pin_voter_threads(process_id: u32, cpus: &CpuSet) {
+    for _ in 0..2 {
+        let tasks =
+            fs::read_dir(format!("/proc/{process_id}/task")).expect("list the voter's threads");
+        for task in tasks {
+            let Some(thread_id) = task
+                .expect("voter thread entry")
+                .file_name()
+                .to_str()
+                .and_then(|name| name.parse::<i32>().ok())
+                .and_then(Pid::from_raw)
+            else {
+                continue;
+            };
+            // A thread that exits between listing and pinning needs no mask.
+            let _ = sched_setaffinity(Some(thread_id), cpus);
+        }
+    }
+}
+
+/// Spinning threads that share the voters' CPUs for the observation window.
+struct CpuHogs {
+    stop: Arc<AtomicBool>,
+    threads: Vec<JoinHandle<()>>,
+}
+
+impl CpuHogs {
+    fn start(cpus: &CpuSet, count: usize) -> Self {
+        let stop = Arc::new(AtomicBool::new(false));
+        let threads = (0..count)
+            .map(|_| {
+                let stop = Arc::clone(&stop);
+                let cpus = *cpus;
+                thread::spawn(move || {
+                    sched_setaffinity(None, &cpus).expect("pin a CPU hog");
+                    while !stop.load(Ordering::Relaxed) {
+                        std::hint::spin_loop();
+                    }
+                })
+            })
+            .collect();
+        Self { stop, threads }
+    }
+
+    fn stop(self) {
+        self.stop.store(true, Ordering::Relaxed);
+        for hog in self.threads {
+            hog.join().expect("CPU hog exits");
+        }
+    }
+}
+
+/// A healthy fleet whose voters share two CPUs with spinning threads must
+/// keep its leader and term for several election windows while it serves a
+/// stream of fenced writes. Contention delays every task but suspends none,
+/// so the voters keep hearing heartbeats well inside their campaign window.
+fn run_healthy_fleet_keeps_its_leader_under_cpu_contention(member_count: usize) {
+    let mut fleet = Fleet::start(member_count);
+    let consumer_identities = (0..12).map(stateless_consumer_identity).collect::<Vec<_>>();
+    let consumer_identity = consumer_identities[0].clone();
+    let mut endpoints = Vec::with_capacity(member_count);
+    let mut scope = None;
+    for node_index in 0..member_count {
+        let (endpoint, node_scope) =
+            fleet.start_stateless_consumer(node_index, consumer_identities.clone());
+        assert!(
+            scope.is_none_or(|expected| expected == node_scope),
+            "every voter must serve the same consumer scope"
+        );
+        scope = Some(node_scope);
+        endpoints.push(endpoint);
+    }
+    let scope = scope.expect("one consumer scope per fleet");
+    let voter_authorities = fleet.stateless_consumer_voter_authorities();
+    let before = settled_leader_reports(&mut fleet);
+    let term = before[0].term;
+    let leader_id = before[0].leader_id.expect("settled leader identity");
+    let leader = leader_node_index(&before);
+    let writer_voter = (0..member_count)
+        .find(|node_index| *node_index != leader)
+        .expect("a follower");
+
+    let (_identity_source, identity_receiver) =
+        watch::channel(Some(fleet.pki.consumer_identity_state(&consumer_identity)));
+    let tls = TlsConfigBuilder::new(identity_receiver)
+        .allow_any_trusted_peer()
+        .build_authenticated_client_config()
+        .expect("stream consumer mTLS configuration");
+    let client = PersistentSessionConsumerClient::try_from_stateless(
+        StatelessSessionConsumerClient::new(
+            endpoints[writer_voter],
+            rustls_pki_types::ServerName::IpAddress(endpoints[writer_voter].ip().into()),
+            voter_authorities[writer_voter].clone(),
+            tls,
+        ),
+        PersistentSessionConsumerConfig::default(),
+    )
+    .expect("fixed persistent stream consumer configuration");
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(2)
+        .enable_all()
+        .build()
+        .expect("CPU contention consumer runtime");
+    runtime
+        .block_on(client.prewarm_v2())
+        .expect("prewarm the stream consumer");
+
+    let (cpus, cpu_count) = contended_cpu_set();
+    for node in &fleet.nodes {
+        pin_voter_threads(node.process_id(), &cpus);
+    }
+    let hogs = CpuHogs::start(&cpus, cpu_count * 2);
+    let progress = Arc::new(StreamProgress::default());
+    let writer = runtime.spawn(stream_fenced_writes(
+        client.clone(),
+        scope,
+        member_count,
+        Arc::clone(&progress),
+    ));
+    // Several complete campaign windows of continuous contention.
+    let window = DURABLE_CONSENSUS_TIMING_PROFILE.leader_loss_first_campaign_bound() * 4;
+    thread::sleep(window);
+    progress.stop.store(true, Ordering::SeqCst);
+    let writes = runtime.block_on(writer).expect("stream task joins");
+    hogs.stop();
+    let writes = writes.unwrap_or_else(|(writes, failure)| {
+        panic!("the contended stream failed: {failure}; committed writes: {writes:#?}")
+    });
+    let slowest = writes
+        .iter()
+        .map(FencedStreamWrite::stall)
+        .max()
+        .unwrap_or_default();
+
+    let after = fleet.readiness_reports(&(0..member_count).collect::<Vec<_>>());
+    eprintln!(
+        "CPU contention: voters={member_count} cpus={cpu_count} hogs={} window_ms={} \
+         writes={} slowest_write_ms={} terms={:?}",
+        cpu_count * 2,
+        window.as_millis(),
+        writes.len(),
+        slowest.as_millis(),
+        after.iter().map(|report| report.term).collect::<Vec<_>>(),
+    );
+    assert!(
+        !writes.is_empty(),
+        "the contended fleet must keep committing fenced writes"
+    );
+    assert!(
+        after.iter().all(|report| report.ready
+            && report.term == term
+            && report.leader_id == Some(leader_id)),
+        "no voter may campaign while its leader is healthy: before term {term}, after {after:?}"
+    );
+}
+
+#[test]
+fn three_process_projected_mtls_healthy_fleet_keeps_its_leader_under_cpu_contention() {
+    let _guard = FLEET_TEST_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    run_healthy_fleet_keeps_its_leader_under_cpu_contention(3);
 }

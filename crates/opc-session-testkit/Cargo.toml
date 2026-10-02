@@ -47,7 +47,7 @@ rcgen = { workspace = true }
 rustls-pki-types = { workspace = true }
 
 [target.'cfg(unix)'.dependencies]
-rustix = { version = "1", features = ["event", "fs", "net", "process"] }
+rustix = { version = "1", features = ["event", "fs", "net", "process", "thread"] }
 
 [target.'cfg(target_os = "linux")'.dependencies]
 rusqlite = { workspace = true, features = ["bundled"] }
