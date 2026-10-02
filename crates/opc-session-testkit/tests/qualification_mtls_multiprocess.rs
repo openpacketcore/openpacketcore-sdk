@@ -2,6 +2,8 @@
 
 #[path = "qualification_mtls_multiprocess/isolated_scale.rs"]
 mod isolated_scale;
+#[path = "qualification_mtls_multiprocess/mixed_release.rs"]
+mod mixed_release;
 #[path = "qualification_mtls_multiprocess/unplanned_leader_loss.rs"]
 mod unplanned_leader_loss;
 
@@ -217,6 +219,11 @@ const MAX_CANDIDATE_EVIDENCE_BYTES: u64 = 256 * 1024;
 const MAX_CANDIDATE_SOURCE_BYTES: u64 = 64 * 1024 * 1024;
 
 static FLEET_TEST_LOCK: Mutex<()> = Mutex::new(());
+
+/// This build's voter binary.
+fn current_release_node_binary() -> PathBuf {
+    PathBuf::from(env!("CARGO_BIN_EXE_opc-session-quorum-node"))
+}
 static CANDIDATE_STAGING_COUNTER: AtomicU64 = AtomicU64::new(0);
 
 fn single_attempt_removed_root_probe_lifecycle() -> ConnectionLifecyclePolicy {
@@ -3037,39 +3044,29 @@ struct ChildNode {
 }
 
 impl ChildNode {
-    fn spawn(
-        config: &Path,
-        node_index: usize,
-        stderr: &Path,
-        snapshot_leaf: Option<&PinnedV9SnapshotLeaf>,
-    ) -> (Self, SocketAddr) {
-        Self::spawn_bound(
-            config,
-            node_index,
-            stderr,
-            "127.0.0.1:0".parse().expect("loopback qualification bind"),
-            snapshot_leaf,
-        )
-    }
-
-    fn spawn_bound(
+    fn spawn_bound_until(
         config: &Path,
         node_index: usize,
         stderr_path: &Path,
         bind_addr: SocketAddr,
+        deadline: Instant,
         snapshot_leaf: Option<&PinnedV9SnapshotLeaf>,
     ) -> (Self, SocketAddr) {
-        Self::spawn_bound_until(
+        Self::spawn_bound_until_from(
+            &current_release_node_binary(),
             config,
             node_index,
             stderr_path,
             bind_addr,
-            Instant::now() + CHILD_TIMEOUT,
+            deadline,
             snapshot_leaf,
         )
     }
 
-    fn spawn_bound_until(
+    /// Spawn one voter from an explicit node binary, so a fleet can mix the
+    /// previous release's voters with this build's during a rolling upgrade.
+    fn spawn_bound_until_from(
+        binary: &Path,
         config: &Path,
         node_index: usize,
         stderr_path: &Path,
@@ -3083,7 +3080,7 @@ impl ChildNode {
             .mode(0o600)
             .open(stderr_path)
             .expect("open qualification stderr");
-        let mut command = Command::new(env!("CARGO_BIN_EXE_opc-session-quorum-node"));
+        let mut command = Command::new(binary);
         command
             .arg("--config")
             .arg(config)
@@ -3635,6 +3632,9 @@ impl CandidateEvidenceInputs {
 
 struct Fleet {
     nodes: Vec<ChildNode>,
+    // The node binary each voter runs on its next (re)spawn: this build's, or
+    // the previous release's during a rolling-upgrade qualification.
+    node_binaries: Vec<PathBuf>,
     // Keep the workspace alive until every child has been killed on panic.
     workspace: TempDir,
     // The immutable snapshot namespace has a distinct lifecycle from mutable
@@ -4072,7 +4072,43 @@ impl Fleet {
             opc_session_testkit::qualification::QualificationIsolatedScaleConfig,
         >,
     ) -> Self {
+        Self::start_with_settings_and_node_binaries(
+            member_count,
+            workload_schedule_sha256,
+            release_provenance,
+            isolated_scale,
+            vec![current_release_node_binary(); member_count],
+        )
+    }
+
+    /// Start a rotation-core fleet whose voter `i` runs `node_binaries[i]`.
+    fn start_with_node_binaries(node_binaries: Vec<PathBuf>) -> Self {
+        let member_count = node_binaries.len();
+        let schedule = session_mtls_candidate_schedule_sha256(
+            SessionMtlsCandidateCampaign::RotationCore,
+            member_count,
+        )
+        .expect("supported rotation-core candidate topology");
+        Self::start_with_settings_and_node_binaries(
+            member_count,
+            schedule,
+            None,
+            None,
+            node_binaries,
+        )
+    }
+
+    fn start_with_settings_and_node_binaries(
+        member_count: usize,
+        workload_schedule_sha256: String,
+        release_provenance: Option<&ReleaseGateProvenance>,
+        isolated_scale: Option<
+            opc_session_testkit::qualification::QualificationIsolatedScaleConfig,
+        >,
+        node_binaries: Vec<PathBuf>,
+    ) -> Self {
         assert!(matches!(member_count, 3 | 5));
+        assert_eq!(node_binaries.len(), member_count);
         assert!(isolated_scale.is_none() || release_provenance.is_none());
         let (source_revision, source_tree_status, source_worktree_sha256) =
             candidate_source_provenance().expect("capture candidate source provenance");
@@ -4117,15 +4153,18 @@ impl Fleet {
         let mut nodes = Vec::with_capacity(member_count);
         let mut addresses = Vec::with_capacity(member_count);
         let mut stderr_paths = Vec::with_capacity(member_count);
-        for node_index in 0..member_count {
+        for (node_index, node_binary) in node_binaries.iter().enumerate() {
             let node_root = root.join(format!("node-{node_index}"));
             fs::create_dir(&node_root).expect("create qualification node directory");
             let config = node_root.join("config.json");
             let stderr = node_root.join("stderr.log");
-            let (node, address) = ChildNode::spawn(
+            let (node, address) = ChildNode::spawn_bound_until_from(
+                node_binary,
                 &config,
                 node_index,
                 &stderr,
+                "127.0.0.1:0".parse().expect("loopback qualification bind"),
+                Instant::now() + CHILD_TIMEOUT,
                 snapshot_leaves.get(node_index),
             );
             configs.push(config);
@@ -4305,6 +4344,7 @@ impl Fleet {
 
         let mut fleet = Self {
             nodes,
+            node_binaries,
             workspace,
             _snapshot_namespace: snapshot_namespace,
             _snapshot_leaves: snapshot_leaves,
@@ -4722,7 +4762,8 @@ impl Fleet {
         deadline: Instant,
     ) {
         self.verify_snapshot_namespace();
-        let (node, actual_address) = ChildNode::spawn_bound_until(
+        let (node, actual_address) = ChildNode::spawn_bound_until_from(
+            &self.node_binaries[node_index],
             &self.config_paths[node_index],
             node_index,
             &self.stderr_paths[node_index],
@@ -4752,6 +4793,26 @@ impl Fleet {
                 availability: QualificationConsensusRpcAvailability::Available,
             }
         ));
+    }
+
+    /// Select the node binary voter `node_index` runs on its next respawn.
+    fn set_node_binary(&mut self, node_index: usize, binary: PathBuf) {
+        self.node_binaries[node_index] = binary;
+    }
+
+    /// Stop voter `node_index` with its own shutdown command and respawn it,
+    /// from its currently selected binary, at the same address on the same
+    /// database: one step of a rolling restart.
+    fn roll_node_at_manifest_address(&mut self, node_index: usize) {
+        let expected_address = self.members[node_index]
+            .dial_addr
+            .expect("projected-mTLS test route");
+        let deadline = Instant::now()
+            + Duration::from_millis(QUALIFICATION_TRAFFIC_UNCLEAN_RESTART_TERMINATION_MILLIS);
+        let previous_process_id = self.nodes[node_index].process_id();
+        self.nodes[node_index].shutdown();
+        wait_for_bind_address_release_by(expected_address, deadline);
+        self.spawn_node_at_manifest_address(node_index, expected_address, previous_process_id);
     }
 
     fn restart_node_at_manifest_address(&mut self, node_index: usize) {

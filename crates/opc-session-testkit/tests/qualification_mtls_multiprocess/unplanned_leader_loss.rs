@@ -18,11 +18,11 @@ use rustix::thread::{sched_getaffinity, sched_setaffinity, CpuSet, Pid};
 use super::*;
 
 /// Sequential writes committed through the stable leader before the fault.
-const WARM_WRITES_BEFORE_FAULT: usize = 3;
+pub(super) const WARM_WRITES_BEFORE_FAULT: usize = 3;
 /// Writes that must commit after the fault, through the replacement leader.
-const WRITES_AFTER_FAULT: usize = 4;
+pub(super) const WRITES_AFTER_FAULT: usize = 4;
 /// Pause before a write retries its own retained request.
-const WRITE_RETRY_PAUSE: Duration = Duration::from_millis(25);
+pub(super) const WRITE_RETRY_PAUSE: Duration = Duration::from_millis(25);
 /// Observation cap for one write. It only keeps a failing run finite and
 /// reports the real stall; the documented bound below is the assertion.
 const WRITE_OBSERVATION_CAP: Duration = Duration::from_secs(90);
@@ -30,7 +30,7 @@ const WRITE_OBSERVATION_CAP: Duration = Duration::from_secs(90);
 /// slow failover is reported as a stall, not as an expired lease.
 const STREAM_LEASE_TTL: Duration = Duration::from_secs(600);
 /// Bounded attempts for each post-run exact status readback.
-const STATUS_READBACK_ATTEMPTS: usize = 40;
+pub(super) const STATUS_READBACK_ATTEMPTS: usize = 40;
 
 /// The guarantee under test: a write in flight at an unplanned leader loss
 /// reaches its committed outcome inside the documented stall bound, which
@@ -41,18 +41,18 @@ fn unplanned_leader_loss_stall_bound() -> Duration {
         .min(DURABLE_CONSENSUS_TIMING_PROFILE.operation_timeout())
 }
 
-struct FencedStreamWrite {
-    index: usize,
-    request: FencedTransitionV2Request,
-    outcome: FencedTransitionOutcome,
-    issued_at: Instant,
-    completed_at: Instant,
-    attempts: usize,
-    retries: BTreeMap<&'static str, usize>,
+pub(super) struct FencedStreamWrite {
+    pub(super) index: usize,
+    pub(super) request: FencedTransitionV2Request,
+    pub(super) outcome: FencedTransitionOutcome,
+    pub(super) issued_at: Instant,
+    pub(super) completed_at: Instant,
+    pub(super) attempts: usize,
+    pub(super) retries: BTreeMap<&'static str, usize>,
 }
 
 impl FencedStreamWrite {
-    fn stall(&self) -> Duration {
+    pub(super) fn stall(&self) -> Duration {
         self.completed_at.saturating_duration_since(self.issued_at)
     }
 }
@@ -180,18 +180,42 @@ async fn fenced_stream_request(
 
 /// Shared progress between the writer task and the fault-injecting thread.
 #[derive(Default)]
-struct StreamProgress {
-    committed: AtomicUsize,
-    fault_at: Mutex<Option<Instant>>,
-    stop: AtomicBool,
+pub(super) struct StreamProgress {
+    pub(super) committed: AtomicUsize,
+    pub(super) fault_at: Mutex<Option<Instant>>,
+    pub(super) stop: AtomicBool,
 }
 
 impl StreamProgress {
-    fn fault_at(&self) -> Option<Instant> {
+    pub(super) fn fault_at(&self) -> Option<Instant> {
         *self
             .fault_at
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+}
+
+/// The consumer client the stream sends its next attempt through. A rolling
+/// upgrade moves it to another voter before restarting the one it uses.
+pub(super) struct WriterRoute(Mutex<PersistentSessionConsumerClient>);
+
+impl WriterRoute {
+    pub(super) fn new(client: PersistentSessionConsumerClient) -> Arc<Self> {
+        Arc::new(Self(Mutex::new(client)))
+    }
+
+    pub(super) fn client(&self) -> PersistentSessionConsumerClient {
+        self.0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
+    }
+
+    pub(super) fn replace(&self, client: PersistentSessionConsumerClient) {
+        *self
+            .0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = client;
     }
 }
 
@@ -200,6 +224,18 @@ impl StreamProgress {
 /// first failure.
 async fn stream_fenced_writes(
     client: PersistentSessionConsumerClient,
+    scope: SessionConsumerScope,
+    member_count: usize,
+    progress: Arc<StreamProgress>,
+) -> Result<Vec<FencedStreamWrite>, (Vec<FencedStreamWrite>, String)> {
+    stream_fenced_writes_on(WriterRoute::new(client), scope, member_count, progress).await
+}
+
+/// [`stream_fenced_writes`] through a route the caller may move between
+/// voters. Each attempt, including a retry of the same request, uses the
+/// route's current client.
+pub(super) async fn stream_fenced_writes_on(
+    route: Arc<WriterRoute>,
     scope: SessionConsumerScope,
     member_count: usize,
     progress: Arc<StreamProgress>,
@@ -236,6 +272,7 @@ async fn stream_fenced_writes(
         let mut retries = BTreeMap::new();
         let outcome = loop {
             attempts += 1;
+            let client = route.client();
             match classify_write_attempt(&request, client.execute_v2(&execute).await) {
                 WriteAttempt::Committed(outcome) => break *outcome,
                 WriteAttempt::Retry(class) => *retries.entry(class).or_insert(0) += 1,
@@ -276,7 +313,7 @@ async fn stream_fenced_writes(
 
 /// Wait for two identical all-voter observations of one ready leader, term,
 /// and fully applied log head, so the fault lands on a settled cluster.
-fn settled_leader_reports(fleet: &mut Fleet) -> Vec<FleetReadiness> {
+pub(super) fn settled_leader_reports(fleet: &mut Fleet) -> Vec<FleetReadiness> {
     let all_nodes = (0..fleet.member_count()).collect::<Vec<_>>();
     let deadline = Instant::now() + CLUSTER_TRANSITION_TIMEOUT;
     let mut previous = None;
@@ -308,12 +345,59 @@ fn settled_leader_reports(fleet: &mut Fleet) -> Vec<FleetReadiness> {
     }
 }
 
-fn leader_node_index(reports: &[FleetReadiness]) -> usize {
+pub(super) fn leader_node_index(reports: &[FleetReadiness]) -> usize {
     reports
         .iter()
         .find(|report| report.leader_id == Some(report.node_id))
         .map(|report| report.node_index)
         .expect("settled fleet has one leader")
+}
+
+/// Prove that every streamed write applied exactly once: the sequential chain
+/// advances one generation per committed request under one unchanged lease
+/// fence, and every write's exact retained receipt matches the outcome it
+/// returned.
+pub(super) fn assert_stream_committed_exactly_once(
+    writes: &[FencedStreamWrite],
+    scope: SessionConsumerScope,
+    client: &PersistentSessionConsumerClient,
+    runtime: &tokio::runtime::Runtime,
+) {
+    let fence = writes[0].outcome.lease().fence();
+    for (position, write) in writes.iter().enumerate() {
+        assert_eq!(write.index, position);
+        assert_eq!(
+            write.outcome.committed_generation(),
+            Generation::new(position as u64 + 1),
+            "write {position} must commit exactly the next generation"
+        );
+        assert_eq!(write.outcome.lease().fence(), fence);
+    }
+    for write in writes {
+        let status = SessionConsumerV2Request::new(
+            scope,
+            SessionConsumerV2Operation::FencedTransitionV2Status {
+                request: Box::new(write.request.clone()),
+            },
+        );
+        let expected = SessionConsumerV2Response::FencedTransitionV2Status(Ok(
+            SessionConsumerV2FencedTransitionStatus::Recorded(Box::new(Ok(write.outcome.clone()))),
+        ));
+        let observed = (0..STATUS_READBACK_ATTEMPTS)
+            .find_map(|_| match runtime.block_on(client.execute_v2(&status)) {
+                Ok(response) => Some(response),
+                Err(_) => {
+                    thread::sleep(WRITE_RETRY_PAUSE);
+                    None
+                }
+            })
+            .expect("exact status readback");
+        assert_eq!(
+            observed, expected,
+            "write {} has exactly its own committed receipt",
+            write.index
+        );
+    }
 }
 
 fn run_unplanned_leader_loss_fenced_write_stream(member_count: usize) {
@@ -448,44 +532,7 @@ fn run_unplanned_leader_loss_fenced_write_stream(member_count: usize) {
             .as_millis(),
     );
 
-    // Exactly one application per write: the sequential chain advances one
-    // generation per committed request, under one unchanged lease fence.
-    let fence = writes[0].outcome.lease().fence();
-    for (position, write) in writes.iter().enumerate() {
-        assert_eq!(write.index, position);
-        assert_eq!(
-            write.outcome.committed_generation(),
-            Generation::new(position as u64 + 1),
-            "write {position} must commit exactly the next generation"
-        );
-        assert_eq!(write.outcome.lease().fence(), fence);
-    }
-    // Every write's exact retained receipt matches the outcome it returned.
-    for write in &writes {
-        let status = SessionConsumerV2Request::new(
-            scope,
-            SessionConsumerV2Operation::FencedTransitionV2Status {
-                request: Box::new(write.request.clone()),
-            },
-        );
-        let expected = SessionConsumerV2Response::FencedTransitionV2Status(Ok(
-            SessionConsumerV2FencedTransitionStatus::Recorded(Box::new(Ok(write.outcome.clone()))),
-        ));
-        let observed = (0..STATUS_READBACK_ATTEMPTS)
-            .find_map(|_| match runtime.block_on(client.execute_v2(&status)) {
-                Ok(response) => Some(response),
-                Err(_) => {
-                    thread::sleep(WRITE_RETRY_PAUSE);
-                    None
-                }
-            })
-            .expect("exact status readback");
-        assert_eq!(
-            observed, expected,
-            "write {} has exactly its own committed receipt",
-            write.index
-        );
-    }
+    assert_stream_committed_exactly_once(&writes, scope, &client, &runtime);
     assert!(
         after_fault.iter().all(|report| {
             report.ready
