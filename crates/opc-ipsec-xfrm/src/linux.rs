@@ -14,15 +14,16 @@ use async_trait::async_trait;
 use opc_ipsec_xfrm_ebpf_common::{MarkProfile, IPPROTO_ESP};
 use opc_linux_xfrm_sys::{
     align_to_netlink, open_netlink_socket, receive_message_outcome, send_message,
-    ReceiveMessageOutcome, LINUX_EINVAL, LINUX_ENOPROTOOPT, NLMSG_DONE, NLMSG_ERROR, NLM_F_ACK,
-    NLM_F_CREATE, NLM_F_EXCL, NLM_F_REPLACE, NLM_F_REQUEST, XFRMA_ALG_AEAD, XFRMA_ALG_AUTH,
+    ReceiveMessageOutcome, LINUX_EINVAL, LINUX_ENOPROTOOPT, NLMSG_DONE, NLMSG_ERROR, NLMSG_NOOP,
+    NLMSG_OVERRUN, NLM_F_ACK, NLM_F_CREATE, NLM_F_DUMP, NLM_F_DUMP_INTR, NLM_F_EXCL, NLM_F_MULTI,
+    NLM_F_REPLACE, NLM_F_REQUEST, XFRMA_ADDRESS_FILTER, XFRMA_ALG_AEAD, XFRMA_ALG_AUTH,
     XFRMA_ALG_AUTH_TRUNC, XFRMA_ALG_CRYPT, XFRMA_ENCAP, XFRMA_IF_ID, XFRMA_LASTUSED, XFRMA_MARK,
-    XFRMA_OFFLOAD_DEV, XFRMA_PAD, XFRMA_POLICY_TYPE, XFRMA_REPLAY_ESN_VAL, XFRMA_REPLAY_VAL,
-    XFRMA_SA_DIR, XFRMA_SET_MARK, XFRMA_SET_MARK_MASK, XFRMA_TMPL, XFRM_AE_RVAL, XFRM_MSG_ALLOCSPI,
-    XFRM_MSG_DELPOLICY, XFRM_MSG_DELSA, XFRM_MSG_GETPOLICY, XFRM_MSG_GETSA, XFRM_MSG_MIGRATE_STATE,
-    XFRM_MSG_NEWAE, XFRM_MSG_NEWPOLICY, XFRM_MSG_NEWSA, XFRM_MSG_UPDPOLICY, XFRM_MSG_UPDSA,
-    XFRM_POLICY_ALLOW, XFRM_POLICY_BLOCK, XFRM_POLICY_FWD, XFRM_POLICY_IN, XFRM_POLICY_OUT,
-    XFRM_POLICY_TYPE_MAIN, XFRM_SA_DIR_IN, XFRM_SA_DIR_OUT, XFRM_STATE_ESN,
+    XFRMA_OFFLOAD_DEV, XFRMA_PAD, XFRMA_POLICY_TYPE, XFRMA_PROTO, XFRMA_REPLAY_ESN_VAL,
+    XFRMA_REPLAY_VAL, XFRMA_SA_DIR, XFRMA_SET_MARK, XFRMA_SET_MARK_MASK, XFRMA_TMPL, XFRM_AE_RVAL,
+    XFRM_MSG_ALLOCSPI, XFRM_MSG_DELPOLICY, XFRM_MSG_DELSA, XFRM_MSG_GETPOLICY, XFRM_MSG_GETSA,
+    XFRM_MSG_MIGRATE_STATE, XFRM_MSG_NEWAE, XFRM_MSG_NEWPOLICY, XFRM_MSG_NEWSA, XFRM_MSG_UPDPOLICY,
+    XFRM_MSG_UPDSA, XFRM_POLICY_ALLOW, XFRM_POLICY_BLOCK, XFRM_POLICY_FWD, XFRM_POLICY_IN,
+    XFRM_POLICY_OUT, XFRM_POLICY_TYPE_MAIN, XFRM_SA_DIR_IN, XFRM_SA_DIR_OUT, XFRM_STATE_ESN,
 };
 use subtle::ConstantTimeEq;
 use zeroize::Zeroizing;
@@ -35,9 +36,11 @@ use crate::durable_relocation::{XfrmSaRelocationRecoveryProofKey, XfrmSaRelocati
 #[cfg(unix)]
 use crate::durable_roster::{XfrmObjectRosterRecoveryProofKey, XfrmObjectRosterRecoveryStore};
 use crate::model::{
-    sa_uses_esn, validate_exact_remove_policy_request, validate_policy_query,
-    validate_relocate_sa_request, validate_sa_output_mark, validate_sa_query,
-    ExactRemovePolicyRequest, QueryPolicyRequest,
+    authorize_exact_sa_removal, sa_uses_esn, validate_exact_remove_policy_request,
+    validate_exact_remove_sa_request, validate_policy_query, validate_relocate_sa_request,
+    validate_sa_lookup_key, validate_sa_output_mark, validate_sa_query, ExactRemovePolicyRequest,
+    ExactRemoveSaRequest, QueryPolicyRequest, SaKeySnapshot, SaLookupKey,
+    EXACT_SA_REMOVAL_PREFLIGHT,
 };
 #[cfg(unix)]
 use crate::namespace::XfrmObjectRecoveryBindError;
@@ -78,6 +81,7 @@ const XFRM_ALGO_HEADER_LEN: usize = 68;
 const XFRM_ALGO_AUTH_HEADER_LEN: usize = 72;
 const XFRM_ALGO_AEAD_HEADER_LEN: usize = 72;
 const XFRM_MARK_LEN: usize = 8;
+const XFRM_ADDRESS_FILTER_LEN: usize = 36;
 const XFRM_ENCAP_TEMPLATE_LEN: usize = 24;
 const XFRM_REPLAY_STATE_LEN: usize = 12;
 const XFRM_REPLAY_STATE_ESN_BASE_LEN: usize = 24;
@@ -95,6 +99,12 @@ const RELOCATION_CAPABILITY_MISSING: u8 = 2;
 const SA_RELOCATION_PROBE_SPI: u32 = 0xffff_fffe;
 const XFRM_KEY_READBACK_REDACTED: &str = "xfrm_key_readback_redacted";
 const EXACT_POLICY_REMOVAL_PREFLIGHT: &str = "remove_policy_exact_preflight";
+const SA_KEY_SNAPSHOT: &str = "query_sa_key_snapshot";
+const EXACT_SA_REMOVAL: &str = "remove_sa_exact";
+/// Complete `XFRM_MSG_GETSA` dumps attempted before an interrupted key read
+/// fails closed. Current Linux never flags an XFRM state dump interrupted;
+/// the bound keeps a future kernel that does from stalling the actor.
+const SA_KEY_SNAPSHOT_DUMP_ATTEMPTS: usize = 4;
 
 pub(crate) type SensitiveBuffer = Zeroizing<Vec<u8>>;
 
@@ -871,6 +881,73 @@ impl LinuxXfrmBackend {
         parse_sa_relocation_snapshot(&response)
     }
 
+    /// Read every state at `key` with one complete `XFRM_MSG_GETSA` dump.
+    ///
+    /// The kernel walks `state_all` under `xfrm_state_lock`, so the read does
+    /// not depend on SPI hash-chain order. It releases that lock between
+    /// multipart batches. A dump the kernel flags as interrupted is
+    /// discarded whole and repeated with a fresh socket and sequence, at most
+    /// [`SA_KEY_SNAPSHOT_DUMP_ATTEMPTS`] times.
+    fn snapshot_sa_key(
+        &self,
+        key: SaLookupKey,
+        operation: &'static str,
+    ) -> Result<SaKeySnapshot, XfrmError> {
+        let body = encode_sa_key_dump_request(key)?;
+        for attempt in 0..SA_KEY_SNAPSHOT_DUMP_ATTEMPTS {
+            if attempt > 0 && !self.inner.config.retry_delay.is_zero() {
+                std::thread::sleep(self.inner.config.retry_delay);
+            }
+            // Keep the identity check adjacent to transport socket creation,
+            // as `transact` does.
+            self.ensure_namespace_binding()?;
+            let sequence = self.next_sequence();
+            let request = encode_netlink_message(
+                XFRM_MSG_GETSA,
+                NLM_F_REQUEST | NLM_F_DUMP,
+                sequence,
+                &body,
+            )?;
+            let mut states = Vec::new();
+            let completion = self.inner.transport.dump(
+                operation,
+                &request,
+                sequence,
+                XFRM_MSG_NEWSA,
+                self.inner.config,
+                &mut |message| {
+                    if let Some(identity) = sa_key_member_identity(message, key, operation)? {
+                        states.push(identity);
+                    }
+                    Ok(())
+                },
+            )?;
+            if completion == NetlinkDumpCompletion::Complete {
+                return SaKeySnapshot::new(key, states);
+            }
+        }
+        Err(XfrmError::StateIndeterminate { operation })
+    }
+
+    async fn snapshot_sa_key_blocking(
+        &self,
+        key: SaLookupKey,
+        operation: &'static str,
+    ) -> Result<SaKeySnapshot, XfrmError> {
+        if self.inner.namespace_binding.is_some() {
+            return self.snapshot_sa_key(key, operation);
+        }
+        let backend = self.clone();
+        tokio::task::spawn_blocking(move || backend.snapshot_sa_key(key, operation))
+            .await
+            .map_err(|_| {
+                XfrmError::io(
+                    operation,
+                    io::Error::new(io::ErrorKind::Interrupted, "xfrm blocking task failed"),
+                )
+            })?
+    }
+
     pub(crate) async fn query_esp_peer_observation_registration(
         &self,
         requested: EspPeerObservationKey,
@@ -1293,6 +1370,11 @@ impl XfrmBackend for LinuxXfrmBackend {
         Ok(snapshot.identity)
     }
 
+    async fn query_sa_key_snapshot(&self, key: SaLookupKey) -> Result<SaKeySnapshot, XfrmError> {
+        validate_sa_lookup_key(key)?;
+        self.snapshot_sa_key_blocking(key, SA_KEY_SNAPSHOT).await
+    }
+
     async fn rekey_sa(&self, request: RekeySaRequest) -> Result<(), XfrmError> {
         let profile = self.prepare_dscp(&request.parameters)?;
         let body = encode_sa_info_with_dscp(&request.parameters, profile)?;
@@ -1374,6 +1456,28 @@ impl XfrmBackend for LinuxXfrmBackend {
         )?;
         self.run_ack("remove_sa", XFRM_MSG_DELSA, NLM_F_REQUEST | NLM_F_ACK, body)
             .await
+    }
+
+    async fn remove_sa_exact(&self, request: ExactRemoveSaRequest) -> Result<(), XfrmError> {
+        validate_exact_remove_sa_request(&request)?;
+        let snapshot = self
+            .snapshot_sa_key_blocking(request.key(), EXACT_SA_REMOVAL_PREFLIGHT)
+            .await?;
+        authorize_exact_sa_removal(&snapshot, request.expected())?;
+        let removal = request.removal();
+        let body = encode_sa_id(
+            removal.destination,
+            removal.protocol,
+            removal.spi,
+            removal.mark,
+        )?;
+        self.run_ack(
+            EXACT_SA_REMOVAL,
+            XFRM_MSG_DELSA,
+            NLM_F_REQUEST | NLM_F_ACK,
+            body,
+        )
+        .await
     }
 
     async fn install_policy(&self, request: InstallPolicyRequest) -> Result<(), XfrmError> {
@@ -1523,6 +1627,17 @@ impl XfrmBackend for LinuxXfrmBackend {
     }
 }
 
+/// How one multipart netlink dump ended.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum NetlinkDumpCompletion {
+    /// `NLMSG_DONE` arrived with a zero status, and no message of the dump
+    /// carried `NLM_F_DUMP_INTR` or was `NLMSG_OVERRUN`.
+    Complete,
+    /// The kernel marked the dump inconsistent. Everything the visitor saw
+    /// belongs to a discarded dump.
+    Interrupted,
+}
+
 pub(crate) trait LinuxXfrmTransport: Send + Sync + fmt::Debug {
     fn transact(
         &self,
@@ -1534,6 +1649,33 @@ pub(crate) trait LinuxXfrmTransport: Send + Sync + fmt::Debug {
     ) -> Result<Option<SensitiveBuffer>, XfrmError>;
 
     fn probe(&self, config: LinuxXfrmBackendConfig) -> XfrmProbe;
+
+    /// Send one `NLM_F_DUMP` request and pass the body of every
+    /// `reply_message_type` message to `visit` until `NLMSG_DONE`.
+    ///
+    /// Transports without dump support fail closed, which keeps every
+    /// existing transport source compatible.
+    fn dump(
+        &self,
+        operation: &'static str,
+        request: &[u8],
+        expected_sequence: u32,
+        reply_message_type: u16,
+        config: LinuxXfrmBackendConfig,
+        visit: &mut dyn FnMut(&[u8]) -> Result<(), XfrmError>,
+    ) -> Result<NetlinkDumpCompletion, XfrmError> {
+        let _ = (
+            operation,
+            request,
+            expected_sequence,
+            reply_message_type,
+            config,
+            visit,
+        );
+        Err(XfrmError::UnsupportedFeature {
+            feature: "sa_key_snapshot",
+        })
+    }
 }
 
 #[derive(Debug)]
@@ -1564,6 +1706,36 @@ impl LinuxXfrmTransport for NetlinkXfrmTransport {
             expected_sequence,
             config,
             |buffer| receive_message_outcome(&socket, buffer),
+        )
+    }
+
+    fn dump(
+        &self,
+        operation: &'static str,
+        request: &[u8],
+        expected_sequence: u32,
+        reply_message_type: u16,
+        config: LinuxXfrmBackendConfig,
+        visit: &mut dyn FnMut(&[u8]) -> Result<(), XfrmError>,
+    ) -> Result<NetlinkDumpCompletion, XfrmError> {
+        // A fresh socket per dump: an abandoned dump's later batches can
+        // never be read as part of a retry.
+        let socket = open_netlink_socket().map_err(|error| map_open_error(operation, error))?;
+        let sent =
+            send_message(&socket, request).map_err(|error| XfrmError::io("netlink_send", error))?;
+        if sent != request.len() {
+            return Err(XfrmError::io(
+                "netlink_send",
+                io::Error::new(io::ErrorKind::WriteZero, "short netlink send"),
+            ));
+        }
+        receive_netlink_dump(
+            operation,
+            expected_sequence,
+            reply_message_type,
+            config,
+            |buffer| receive_message_outcome(&socket, buffer),
+            visit,
         )
     }
 
@@ -1680,6 +1852,196 @@ fn receive_netlink_response(
     }
 
     Err(XfrmError::StateIndeterminate { operation })
+}
+
+/// Progress after one dump datagram.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum NetlinkDumpProgress {
+    More,
+    Done,
+    Interrupted,
+}
+
+/// Read one multipart netlink dump to its end.
+///
+/// Every message must carry `expected_sequence`, and every data message must
+/// be a `reply_message_type` with `NLM_F_MULTI`. `NLM_F_DUMP_INTR` on any
+/// message, or an `NLMSG_OVERRUN`, ends the dump as
+/// [`NetlinkDumpCompletion::Interrupted`]; the visitor sees nothing after
+/// the flag. The dump is [`NetlinkDumpCompletion::Complete`] only at an
+/// `NLMSG_DONE` with a zero status. No partial dump is reported as complete:
+/// a receive failure, an oversized datagram, a malformed or unexpected
+/// message, a nonzero status, or a missing next datagram within the receive
+/// budget is an error. Each datagram's attempt budget is
+/// `config.receive_attempts`.
+fn receive_netlink_dump(
+    operation: &'static str,
+    expected_sequence: u32,
+    reply_message_type: u16,
+    config: LinuxXfrmBackendConfig,
+    mut receive: impl FnMut(&mut [u8]) -> io::Result<ReceiveMessageOutcome>,
+    visit: &mut dyn FnMut(&[u8]) -> Result<(), XfrmError>,
+) -> Result<NetlinkDumpCompletion, XfrmError> {
+    let mut buffer = Zeroizing::new(vec![0_u8; config.receive_buffer_len]);
+    'datagrams: loop {
+        for _ in 0..config.receive_attempts {
+            match receive(&mut buffer) {
+                Ok(ReceiveMessageOutcome::Complete { bytes_received: 0 }) => {}
+                Ok(ReceiveMessageOutcome::Complete { bytes_received }) => {
+                    let datagram = buffer.get(..bytes_received).ok_or_else(|| {
+                        XfrmError::io(
+                            "netlink_receive",
+                            invalid_data("receive length exceeded bounded buffer"),
+                        )
+                    })?;
+                    match parse_netlink_dump_datagram(
+                        operation,
+                        datagram,
+                        expected_sequence,
+                        reply_message_type,
+                        visit,
+                    )? {
+                        NetlinkDumpProgress::More => continue 'datagrams,
+                        NetlinkDumpProgress::Done => return Ok(NetlinkDumpCompletion::Complete),
+                        NetlinkDumpProgress::Interrupted => {
+                            return Ok(NetlinkDumpCompletion::Interrupted)
+                        }
+                    }
+                }
+                Ok(ReceiveMessageOutcome::ConsumedOversize {
+                    buffer_bytes,
+                    datagram_bytes,
+                }) => {
+                    return Err(XfrmError::ResponseTooLarge {
+                        operation,
+                        buffer_bytes,
+                        datagram_bytes,
+                    });
+                }
+                Ok(ReceiveMessageOutcome::RejectedNonKernel) => {}
+                Err(error)
+                    if matches!(
+                        error.kind(),
+                        io::ErrorKind::WouldBlock | io::ErrorKind::Interrupted
+                    ) => {}
+                Err(error) => return Err(XfrmError::io("netlink_receive", error)),
+                Ok(_) => {
+                    return Err(XfrmError::io(
+                        "netlink_receive",
+                        invalid_data("unsupported receive outcome"),
+                    ));
+                }
+            }
+            if !config.retry_delay.is_zero() {
+                std::thread::sleep(config.retry_delay);
+            }
+        }
+        return Err(XfrmError::StateIndeterminate { operation });
+    }
+}
+
+fn parse_netlink_dump_datagram(
+    operation: &'static str,
+    datagram: &[u8],
+    expected_sequence: u32,
+    reply_message_type: u16,
+    visit: &mut dyn FnMut(&[u8]) -> Result<(), XfrmError>,
+) -> Result<NetlinkDumpProgress, XfrmError> {
+    let malformed = |reason: &'static str| XfrmError::io(operation, invalid_data(reason));
+    let mut cursor = 0_usize;
+    let mut done = false;
+    let mut interrupted = false;
+    while cursor < datagram.len() {
+        if done {
+            return Err(malformed("netlink message after dump completion"));
+        }
+        if datagram.len() - cursor < NETLINK_HEADER_LEN {
+            return Err(malformed("short netlink header"));
+        }
+        let length = read_u32_ne(datagram, cursor)? as usize;
+        let end = cursor
+            .checked_add(length)
+            .ok_or_else(|| malformed("netlink length overflow"))?;
+        if length < NETLINK_HEADER_LEN || end > datagram.len() {
+            return Err(malformed("invalid netlink length"));
+        }
+        let message_type = read_u16_ne(datagram, cursor + 4)?;
+        let flags = read_u16_ne(datagram, cursor + 6)?;
+        if read_u32_ne(datagram, cursor + 8)? != expected_sequence {
+            return Err(malformed("unexpected netlink sequence"));
+        }
+        if flags & NLM_F_DUMP_INTR != 0 {
+            interrupted = true;
+        }
+        let body = &datagram[cursor + NETLINK_HEADER_LEN..end];
+        match message_type {
+            // A dump that could not start, for example without
+            // CAP_NET_ADMIN, answers with an error instead of members.
+            NLMSG_ERROR => {
+                return Err(match netlink_status(operation, body)? {
+                    0 => malformed("acknowledgement in a dump reply"),
+                    status => netlink_status_error(operation, status),
+                });
+            }
+            NLMSG_DONE => {
+                if flags & NLM_F_MULTI == 0 {
+                    return Err(malformed("dump completion without NLM_F_MULTI"));
+                }
+                match netlink_status(operation, body)? {
+                    0 => done = true,
+                    status => return Err(netlink_status_error(operation, status)),
+                }
+            }
+            NLMSG_OVERRUN => interrupted = true,
+            NLMSG_NOOP => {}
+            _ if message_type == reply_message_type => {
+                if flags & NLM_F_MULTI == 0 {
+                    return Err(malformed("dump member without NLM_F_MULTI"));
+                }
+                if !interrupted {
+                    visit(body)?;
+                }
+            }
+            _ => return Err(malformed("unexpected netlink message type in dump")),
+        }
+        let aligned_end = align_to_netlink(length)
+            .and_then(|aligned| cursor.checked_add(aligned))
+            .ok_or_else(|| malformed("netlink alignment overflow"))?
+            .min(datagram.len());
+        if datagram[end..aligned_end].iter().any(|octet| *octet != 0) {
+            return Err(malformed("noncanonical netlink message padding"));
+        }
+        cursor = aligned_end;
+    }
+    Ok(if interrupted {
+        NetlinkDumpProgress::Interrupted
+    } else if done {
+        NetlinkDumpProgress::Done
+    } else {
+        NetlinkDumpProgress::More
+    })
+}
+
+/// Read the leading `int` status of an `NLMSG_ERROR` or `NLMSG_DONE` body.
+fn netlink_status(operation: &'static str, body: &[u8]) -> Result<i32, XfrmError> {
+    if body.len() < size_of::<i32>() {
+        return Err(XfrmError::io(
+            operation,
+            invalid_data("short netlink status"),
+        ));
+    }
+    read_i32_ne(body, 0)
+}
+
+/// Map a nonzero dump status to a redaction-safe error with its errno.
+fn netlink_status_error(operation: &'static str, status: i32) -> XfrmError {
+    if status > 0 {
+        return XfrmError::io(operation, invalid_data("positive netlink status"));
+    }
+    XfrmError::io(
+        operation,
+        io::Error::from_raw_os_error(status.saturating_abs()),
+    )
 }
 
 fn process_has_cap_net_admin() -> Option<bool> {
@@ -2118,6 +2480,35 @@ fn encode_sa_id(
     if let Some(mark) = mark {
         append_attr(&mut out, XFRMA_MARK, &encode_mark(mark))?;
     }
+    Ok(out)
+}
+
+/// Encode the attribute-only `XFRM_MSG_GETSA` dump body for one lookup key.
+///
+/// `xfrm_dump_sa` parses a dump request's attributes from offset zero, so
+/// the body carries no `xfrm_usersa_id`. `XFRMA_ADDRESS_FILTER` restricts
+/// the kernel walk to the key's family and exact destination with any outer
+/// source, and `XFRMA_PROTO` to its protocol. A kernel that ignores either
+/// attribute returns a larger dump; the key check on every reply message
+/// still narrows it to the key.
+fn encode_sa_key_dump_request(key: SaLookupKey) -> Result<SensitiveBuffer, XfrmError> {
+    let destination = key.destination();
+    let destination_prefix_len = match destination {
+        IpAddress::Ipv4(_) => 32,
+        IpAddress::Ipv6(_) => 128,
+    };
+    let mut filter = sensitive_buffer_with_capacity(XFRM_ADDRESS_FILTER_LEN);
+    // `saddr` is ignored with a zero source prefix length.
+    filter.resize(XFRM_ADDRESS_LEN, 0);
+    encode_address(&mut filter, destination);
+    push_u16_ne(&mut filter, address_family(destination));
+    push_u8(&mut filter, 0);
+    push_u8(&mut filter, destination_prefix_len);
+    let mut out = sensitive_buffer_with_capacity(
+        2 * ROUTE_ATTRIBUTE_HEADER_LEN + XFRM_ADDRESS_FILTER_LEN + size_of::<u32>(),
+    );
+    append_attr(&mut out, XFRMA_ADDRESS_FILTER, &filter)?;
+    append_attr(&mut out, XFRMA_PROTO, &[key.protocol()])?;
     Ok(out)
 }
 
@@ -2721,6 +3112,70 @@ fn parse_sa_relocation_snapshot(payload: &[u8]) -> Result<SaRelocationSnapshot, 
         output_mark: state.output_mark,
     };
     Ok(SaRelocationSnapshot { state, identity })
+}
+
+/// Decode one state-dump message into an identity when the state is at
+/// `key`.
+///
+/// The key is compared the way `__xfrm_state_lookup` compares it: state
+/// family, SPI, protocol, and the family's destination bytes, so an IPv4
+/// state's unused address words are ignored. A message for another key is
+/// skipped undecoded, so an unrepresentable state elsewhere cannot fail the
+/// read. A state at the key must decode completely.
+fn sa_key_member_identity(
+    payload: &[u8],
+    key: SaLookupKey,
+    operation: &'static str,
+) -> Result<Option<SaRelocationIdentity>, XfrmError> {
+    const DESTINATION_OFFSET: usize = XFRM_SELECTOR_LEN;
+    const PROTOCOL_OFFSET: usize = XFRM_SPI_OFFSET_IN_SA_INFO + 4;
+    const FAMILY_OFFSET: usize = 212;
+
+    if payload.len() < XFRM_USER_SA_INFO_LEN {
+        return Err(XfrmError::io(
+            operation,
+            invalid_data("short state dump message"),
+        ));
+    }
+    let destination = key.destination();
+    let destination_octets: &[u8] = match &destination {
+        IpAddress::Ipv4(octets) => octets,
+        IpAddress::Ipv6(octets) => octets,
+    };
+    let observed_destination = payload
+        .get(DESTINATION_OFFSET..DESTINATION_OFFSET + destination_octets.len())
+        .ok_or_else(|| XfrmError::io(operation, invalid_data("short state dump message")))?;
+    if read_u16_ne(payload, FAMILY_OFFSET)? != address_family(destination)
+        || read_u32_be(payload, XFRM_SPI_OFFSET_IN_SA_INFO)? != key.spi()
+        || read_u8(payload, PROTOCOL_OFFSET)? != key.protocol()
+        || observed_destination != destination_octets
+    {
+        return Ok(None);
+    }
+    let identity = parse_sa_relocation_snapshot(payload)
+        .map_err(|error| relabel_io_error(error, operation))?
+        .identity;
+    if SaLookupKey::from(identity.id) != key {
+        return Err(XfrmError::io(
+            operation,
+            invalid_data("state dump key mismatch"),
+        ));
+    }
+    Ok(Some(identity))
+}
+
+/// Report a decode failure under the operation that read it.
+fn relabel_io_error(error: XfrmError, operation: &'static str) -> XfrmError {
+    match error {
+        XfrmError::Io {
+            kind, raw_os_error, ..
+        } => XfrmError::Io {
+            operation,
+            kind,
+            raw_os_error,
+        },
+        other => other,
+    }
 }
 
 fn parse_esp_peer_observation_registration(
@@ -5956,6 +6411,7 @@ mod tests {
     #[cfg(all(unix, feature = "ikev2"))]
     mod child_sa_relocation_tests;
     mod installed_child_sa_tests;
+    mod sa_key_snapshot_tests;
 
     #[tokio::test]
     async fn outbound_binding_backend_reads_policy_then_sa_and_rejects_key_substitution() {

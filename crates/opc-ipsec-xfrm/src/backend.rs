@@ -3,10 +3,12 @@
 use async_trait::async_trait;
 
 use crate::model::{
-    validate_exact_remove_policy_request, AllocateSpiRequest, ExactRemovePolicyRequest,
-    InstallPolicyRequest, InstallSaRequest, PolicyParameters, QueryPolicyRequest, QuerySaRequest,
-    RekeyPolicyRequest, RekeySaRequest, RelocateSaRequest, RemovePolicyRequest, RemoveSaRequest,
-    SaRelocationIdentity, SaState, SpiAllocation, XfrmCapability, XfrmProbe,
+    authorize_exact_sa_removal, validate_exact_remove_policy_request,
+    validate_exact_remove_sa_request, AllocateSpiRequest, ExactRemovePolicyRequest,
+    ExactRemoveSaRequest, InstallPolicyRequest, InstallSaRequest, PolicyParameters,
+    QueryPolicyRequest, QuerySaRequest, RekeyPolicyRequest, RekeySaRequest, RelocateSaRequest,
+    RemovePolicyRequest, RemoveSaRequest, SaKeySnapshot, SaLookupKey, SaRelocationIdentity,
+    SaState, SpiAllocation, XfrmCapability, XfrmProbe,
 };
 use crate::XfrmError;
 
@@ -111,6 +113,44 @@ pub trait XfrmBackend: Send + Sync + std::fmt::Debug {
         })
     }
 
+    /// Read every SA state at one lookup key, whatever its lookup mark.
+    ///
+    /// Linux GETSA, DELSA, UPDSA, and MIGRATE_STATE all select their state
+    /// with `__xfrm_state_lookup`: the first state in an SPI hash chain whose
+    /// stored mark satisfies `(lookup & mask) == value`. An unmarked state
+    /// satisfies every lookup, new states go to the chain head, and a hash
+    /// resize can reverse the chain. When two states at one key match a
+    /// lookup, no point query can prove which one the next lookup selects.
+    /// This read does not depend on chain order. Apply the predicate with
+    /// [`SaKeySnapshot::lookup_candidates`].
+    ///
+    /// The snapshot never reports a partial read as complete. Every state
+    /// present at the key for the whole read is reported. A state added at
+    /// the key or removed from it while the read runs may or may not be. So
+    /// the snapshot equals the key's states only while no other writer
+    /// changes them; excluding other writers at the key is a caller
+    /// precondition, as for [`Self::remove_policy_exact`]. Expiry can still
+    /// remove a state, which only shrinks the set.
+    ///
+    /// This is a read and changes no kernel state. Through the namespace
+    /// actor a lost reply is `Unavailable`, as for other reads. Backends
+    /// without a complete key read fail closed with
+    /// [`XfrmError::UnsupportedFeature`].
+    ///
+    /// # Errors
+    ///
+    /// [`XfrmError::InvalidConfig`] for a zero SPI or a protocol other than
+    /// AH, ESP, or IPComp. A Linux dump the kernel flags as interrupted is
+    /// discarded and repeated a bounded number of times, then reported as
+    /// [`XfrmError::StateIndeterminate`]. A state at the key that the SDK
+    /// cannot represent, such as one with an unaddressable lookup mark, fails
+    /// the read instead of being left out.
+    async fn query_sa_key_snapshot(&self, _key: SaLookupKey) -> Result<SaKeySnapshot, XfrmError> {
+        Err(XfrmError::UnsupportedFeature {
+            feature: "sa_key_snapshot",
+        })
+    }
+
     /// Rekey (update) an existing Security Association.
     async fn rekey_sa(&self, request: RekeySaRequest) -> Result<(), XfrmError>;
 
@@ -155,6 +195,53 @@ pub trait XfrmBackend: Send + Sync + std::fmt::Debug {
 
     /// Remove a Security Association.
     async fn remove_sa(&self, request: RemoveSaRequest) -> Result<(), XfrmError>;
+
+    /// Remove one SA only when a fresh key snapshot proves that the
+    /// deletion's own lookup can select nothing else.
+    ///
+    /// [`Self::remove_sa`] deletes whatever state the kernel lookup selects
+    /// first, which need not be the caller's state when another state at the
+    /// key also matches the lookup mark (for example an unmarked state, which
+    /// matches every mark). This method first reads the key with
+    /// [`Self::query_sa_key_snapshot`]. It sends the deletion only when
+    /// exactly one state is a lookup candidate for the expected lookup mark
+    /// and that state equals the expected identity on every field of
+    /// [`SaRelocationIdentity`]. With a single candidate, chain order cannot
+    /// change which state the deletion selects.
+    ///
+    /// Linux has no conditional SA deletion. Excluding other writers at the
+    /// key across the read and the deletion is a caller precondition, as for
+    /// [`Self::remove_policy_exact`]. The namespace actor runs both steps as
+    /// one command, which excludes the SDK's own operations on that actor but
+    /// not other processes.
+    ///
+    /// The default implementation composes [`Self::query_sa_key_snapshot`]
+    /// and [`Self::remove_sa`], so a backend without key snapshots fails
+    /// closed with [`XfrmError::UnsupportedFeature`] and sends no deletion.
+    ///
+    /// # Errors
+    ///
+    /// No deletion is sent for any of these refusals:
+    ///
+    /// - [`XfrmError::StateIndeterminate`] when two or more states are lookup
+    ///   candidates;
+    /// - [`XfrmError::StateMismatch`] when the only candidate differs from
+    ///   the expected identity;
+    /// - [`XfrmError::NotFound`] when no state is a candidate;
+    /// - [`XfrmError::InvalidConfig`] for an invalid key or a zero interface
+    ///   identifier;
+    /// - any error of [`Self::query_sa_key_snapshot`], including
+    ///   [`XfrmError::StateIndeterminate`] when the read cannot be proven
+    ///   complete.
+    ///
+    /// After an authorized deletion is sent, errors are those of
+    /// [`Self::remove_sa`].
+    async fn remove_sa_exact(&self, request: ExactRemoveSaRequest) -> Result<(), XfrmError> {
+        validate_exact_remove_sa_request(&request)?;
+        let snapshot = self.query_sa_key_snapshot(request.key()).await?;
+        authorize_exact_sa_removal(&snapshot, request.expected())?;
+        self.remove_sa(request.removal()).await
+    }
 
     /// Install a new Security Policy.
     async fn install_policy(&self, request: InstallPolicyRequest) -> Result<(), XfrmError>;

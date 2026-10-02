@@ -20,7 +20,11 @@
 //! retrying or releasing writer exclusion after cancellation or process loss.
 //! The crate never infers relocation from packet source addresses and deliberately
 //! does not implement IKE, ESP processing, namespace creation/switching, or
-//! deployment policy. [`LinuxXfrmBackend::bind_current_network_namespace`]
+//! deployment policy. [`XfrmBackend::query_sa_key_snapshot`] reads every SA at
+//! one destination/protocol/SPI key, whatever its lookup mark, from one complete
+//! Linux `XFRM_MSG_GETSA` dump, and [`XfrmBackend::remove_sa_exact`] deletes an
+//! SA only when that read proves it is the only state the deletion's own lookup
+//! can select. Both rely on the caller excluding other writers at the key. [`LinuxXfrmBackend::bind_current_network_namespace`]
 //! can pin backend execution to the calling thread's already-selected network
 //! namespace without exposing its filesystem identity.
 //! Fixed-DSCP users that must recover durable state before opening external
@@ -307,15 +311,16 @@ pub use linux::{LinuxXfrmBackend, LinuxXfrmBackendConfig};
 pub use mock::{MockOperation, MockSaRelocation, MockXfrmBackend};
 pub use model::{
     AeadAlgorithm, Algorithm, AllocateSpiRequest, AuthAlgorithm, ExactRemovePolicyRequest,
-    InstallPolicyRequest, InstallSaRequest, IpAddress, KeyMaterial, LifetimeConfig,
-    LifetimeCurrent, PolicyParameters, QueryPolicyRequest, QuerySaRequest, RekeyPolicyRequest,
-    RekeySaRequest, RelocateSaRequest, RemovePolicyRequest, RemoveSaRequest, SaParameters,
-    SaRelocationDirection, SaRelocationEncap, SaRelocationIdentity, SaRelocationSelector,
-    SaReplayState, SaState, SaStatistics, SpiAllocation, UdpEncap, UdpEncapError, XfrmAction,
-    XfrmBackendKind, XfrmCapability, XfrmDirection, XfrmId, XfrmLookupMark, XfrmLookupMarkError,
-    XfrmMark, XfrmMode, XfrmProbe, XfrmRequestId, XfrmSelector, XfrmTemplate, UDP_ENCAP_ESPINUDP,
-    XFRM_AEAD_RFC4106_GCM_AES, XFRM_AUTH_HMAC_SHA1, XFRM_AUTH_HMAC_SHA256, XFRM_AUTH_HMAC_SHA384,
-    XFRM_AUTH_HMAC_SHA512, XFRM_ENCR_CBC_AES, XFRM_ENCR_NULL,
+    ExactRemoveSaRequest, InstallPolicyRequest, InstallSaRequest, IpAddress, KeyMaterial,
+    LifetimeConfig, LifetimeCurrent, PolicyParameters, QueryPolicyRequest, QuerySaRequest,
+    RekeyPolicyRequest, RekeySaRequest, RelocateSaRequest, RemovePolicyRequest, RemoveSaRequest,
+    SaKeySnapshot, SaLookupKey, SaParameters, SaRelocationDirection, SaRelocationEncap,
+    SaRelocationIdentity, SaRelocationSelector, SaReplayState, SaState, SaStatistics,
+    SpiAllocation, UdpEncap, UdpEncapError, XfrmAction, XfrmBackendKind, XfrmCapability,
+    XfrmDirection, XfrmId, XfrmLookupMark, XfrmLookupMarkError, XfrmMark, XfrmMode, XfrmProbe,
+    XfrmRequestId, XfrmSelector, XfrmTemplate, UDP_ENCAP_ESPINUDP, XFRM_AEAD_RFC4106_GCM_AES,
+    XFRM_AUTH_HMAC_SHA1, XFRM_AUTH_HMAC_SHA256, XFRM_AUTH_HMAC_SHA384, XFRM_AUTH_HMAC_SHA512,
+    XFRM_ENCR_CBC_AES, XFRM_ENCR_NULL,
 };
 #[cfg(all(unix, feature = "ikev2"))]
 pub use namespace::{

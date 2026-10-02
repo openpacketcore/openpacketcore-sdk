@@ -36,7 +36,9 @@ use crate::counter_resume::{
     EspCounterReceiptRegistry,
 };
 use crate::installed_child_sa::ChildSaRosterRegistry;
-use crate::model::validate_exact_remove_policy_request;
+use crate::model::{
+    validate_exact_remove_policy_request, validate_exact_remove_sa_request, validate_sa_lookup_key,
+};
 #[cfg(target_os = "linux")]
 use crate::observation::linux::LinuxEspPeerObservationKernelSource;
 #[cfg(target_os = "linux")]
@@ -107,11 +109,11 @@ use crate::{
     InstalledOutboundSaBinding, OutboundSaBindingError, OutboundSaBindingId,
 };
 use crate::{
-    AllocateSpiRequest, ExactRemovePolicyRequest, InstallPolicyRequest, InstallSaRequest,
-    LinuxXfrmBackend, PolicyParameters, QueryPolicyRequest, QuerySaRequest, RekeyPolicyRequest,
-    RekeySaRequest, RelocateSaRequest, RemovePolicyRequest, RemoveSaRequest, SaParameters,
-    SaRelocationIdentity, SaState, SpiAllocation, XfrmBackend, XfrmCapability,
-    XfrmCompositeInstallRequest, XfrmError, XfrmProbe,
+    AllocateSpiRequest, ExactRemovePolicyRequest, ExactRemoveSaRequest, InstallPolicyRequest,
+    InstallSaRequest, LinuxXfrmBackend, PolicyParameters, QueryPolicyRequest, QuerySaRequest,
+    RekeyPolicyRequest, RekeySaRequest, RelocateSaRequest, RemovePolicyRequest, RemoveSaRequest,
+    SaKeySnapshot, SaLookupKey, SaParameters, SaRelocationIdentity, SaState, SpiAllocation,
+    XfrmBackend, XfrmCapability, XfrmCompositeInstallRequest, XfrmError, XfrmProbe,
 };
 use crate::{
     ChildSaInstalledRosterRequest, ChildSaRosterUpdate, InstalledChildSaRoster,
@@ -3611,6 +3613,10 @@ enum NamespaceCommand {
         QuerySaRequest,
         oneshot::Sender<Result<SaRelocationIdentity, XfrmError>>,
     ),
+    QuerySaKeySnapshot(
+        SaLookupKey,
+        oneshot::Sender<Result<SaKeySnapshot, XfrmError>>,
+    ),
     QueryPolicy(
         QueryPolicyRequest,
         oneshot::Sender<Result<PolicyParameters, XfrmError>>,
@@ -3628,6 +3634,7 @@ enum NamespaceCommand {
     RekeySa(RekeySaRequest, oneshot::Sender<Result<(), XfrmError>>),
     RelocateSa(RelocateSaRequest, oneshot::Sender<Result<(), XfrmError>>),
     RemoveSa(RemoveSaRequest, oneshot::Sender<Result<(), XfrmError>>),
+    RemoveSaExact(ExactRemoveSaRequest, oneshot::Sender<Result<(), XfrmError>>),
     InstallPolicy(InstallPolicyRequest, oneshot::Sender<Result<(), XfrmError>>),
     RekeyPolicy(RekeyPolicyRequest, oneshot::Sender<Result<(), XfrmError>>),
     RemovePolicy(RemovePolicyRequest, oneshot::Sender<Result<(), XfrmError>>),
@@ -4713,6 +4720,9 @@ impl NamespaceCommand {
             Self::QuerySaRelocationIdentity(request, reply) => {
                 let _ = reply.send(backend.query_sa_relocation_identity(request).await);
             }
+            Self::QuerySaKeySnapshot(key, reply) => {
+                let _ = reply.send(backend.query_sa_key_snapshot(key).await);
+            }
             Self::QueryPolicy(request, reply) => {
                 let _ = reply.send(backend.query_policy(request).await);
             }
@@ -4747,6 +4757,15 @@ impl NamespaceCommand {
             Self::RemoveSa(request, reply) => {
                 let result = match state.admit_xfrm_mutation() {
                     Ok(()) => backend.remove_sa(request).await,
+                    Err(error) => Err(error),
+                };
+                let _ = reply.send(result);
+            }
+            // One command runs the key read and the deletion, so no other
+            // operation on this actor can change the key between them.
+            Self::RemoveSaExact(request, reply) => {
+                let result = match state.admit_xfrm_mutation() {
+                    Ok(()) => backend.remove_sa_exact(request).await,
                     Err(error) => Err(error),
                 };
                 let _ = reply.send(result);
@@ -4945,6 +4964,7 @@ impl NamespaceCommand {
             | Self::RekeySa(_, reply)
             | Self::RelocateSa(_, reply)
             | Self::RemoveSa(_, reply)
+            | Self::RemoveSaExact(_, reply)
             | Self::InstallPolicy(_, reply)
             | Self::RekeyPolicy(_, reply)
             | Self::RemovePolicy(_, reply)
@@ -4955,6 +4975,9 @@ impl NamespaceCommand {
                 let _ = reply.send(Err(error));
             }
             Self::QuerySaRelocationIdentity(_, reply) => {
+                let _ = reply.send(Err(error));
+            }
+            Self::QuerySaKeySnapshot(_, reply) => {
                 let _ = reply.send(Err(error));
             }
             Self::QueryPolicy(_, reply) => {
@@ -5063,6 +5086,14 @@ impl XfrmBackend for NamespaceBoundLinuxXfrmBackend {
         .await
     }
 
+    async fn query_sa_key_snapshot(&self, key: SaLookupKey) -> Result<SaKeySnapshot, XfrmError> {
+        validate_sa_lookup_key(key)?;
+        self.dispatch(LostReply::ReadOnly, |reply| {
+            NamespaceCommand::QuerySaKeySnapshot(key, reply)
+        })
+        .await
+    }
+
     async fn query_policy(
         &self,
         request: QueryPolicyRequest,
@@ -5090,6 +5121,14 @@ impl XfrmBackend for NamespaceBoundLinuxXfrmBackend {
     async fn remove_sa(&self, request: RemoveSaRequest) -> Result<(), XfrmError> {
         self.dispatch(LostReply::Mutation("remove_sa"), |reply| {
             NamespaceCommand::RemoveSa(request, reply)
+        })
+        .await
+    }
+
+    async fn remove_sa_exact(&self, request: ExactRemoveSaRequest) -> Result<(), XfrmError> {
+        validate_exact_remove_sa_request(&request)?;
+        self.dispatch(LostReply::Mutation("remove_sa_exact"), |reply| {
+            NamespaceCommand::RemoveSaExact(request, reply)
         })
         .await
     }
@@ -5226,6 +5265,19 @@ mod tests {
             _expected_sequence: u32,
             _config: LinuxXfrmBackendConfig,
         ) -> Result<Option<SensitiveBuffer>, XfrmError> {
+            self.record(operation);
+            Err(XfrmError::Unavailable)
+        }
+
+        fn dump(
+            &self,
+            operation: &'static str,
+            _request: &[u8],
+            _expected_sequence: u32,
+            _reply_message_type: u16,
+            _config: LinuxXfrmBackendConfig,
+            _visit: &mut dyn FnMut(&[u8]) -> Result<(), XfrmError>,
+        ) -> Result<crate::linux::NetlinkDumpCompletion, XfrmError> {
             self.record(operation);
             Err(XfrmError::Unavailable)
         }
@@ -5513,6 +5565,14 @@ mod tests {
         RemoveSaRequest::new(sa.id.destination, sa.id.protocol, sa.id.spi)
     }
 
+    fn key_request() -> SaLookupKey {
+        SaLookupKey::from(sa_parameters().id)
+    }
+
+    fn exact_removal_request() -> ExactRemoveSaRequest {
+        ExactRemoveSaRequest::new(relocation_request().current)
+    }
+
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn every_backend_command_runs_on_the_captured_namespace_actor() {
         let expected_binding = NetworkNamespaceBinding::capture().unwrap();
@@ -5531,6 +5591,7 @@ mod tests {
             .await;
         let _ = backend.query_sa(query_request()).await;
         let _ = backend.query_sa_relocation_identity(query_request()).await;
+        let _ = backend.query_sa_key_snapshot(key_request()).await;
         let _ = backend
             .rekey_sa(RekeySaRequest {
                 parameters: sa.clone(),
@@ -5538,6 +5599,7 @@ mod tests {
             .await;
         let _ = backend.relocate_sa(relocation_request()).await;
         let _ = backend.remove_sa(remove_request()).await;
+        let _ = backend.remove_sa_exact(exact_removal_request()).await;
         let _ = backend
             .install_policy(InstallPolicyRequest {
                 parameters: policy.clone(),
@@ -5567,7 +5629,7 @@ mod tests {
         let _ = backend.sa_relocation_capability().await;
 
         let records = transport.records();
-        assert_eq!(records.len(), 13);
+        assert_eq!(records.len(), 15);
         assert!(records
             .iter()
             .all(|record| record.binding == expected_binding));
@@ -5584,9 +5646,11 @@ mod tests {
                 "install_sa",
                 "query_sa",
                 "query_sa_relocation_identity",
+                "query_sa_key_snapshot",
                 "rekey_sa",
                 "relocate_sa_preflight",
                 "remove_sa",
+                "remove_sa_exact_preflight",
                 "install_policy",
                 "rekey_policy",
                 "remove_policy",
@@ -5595,6 +5659,41 @@ mod tests {
                 "probe",
             ]
         );
+    }
+
+    #[tokio::test]
+    async fn key_reads_and_exact_sa_removal_validate_before_namespace_dispatch() {
+        let transport = RecordingUnavailableTransport::default();
+        let backend = LinuxXfrmBackend::with_transport(transport.clone())
+            .bind_current_network_namespace()
+            .unwrap();
+        let sa = sa_parameters();
+
+        let error = backend
+            .query_sa_key_snapshot(SaLookupKey::new(sa.id.destination, 17, sa.id.spi))
+            .await
+            .expect_err("a protocol Linux does not look up by SPI must fail first");
+        assert!(matches!(
+            error,
+            XfrmError::InvalidConfig {
+                field: "sa_key.protocol",
+                ..
+            }
+        ));
+        let mut zero_if_id = exact_removal_request().into_expected();
+        zero_if_id.if_id = Some(0);
+        let error = backend
+            .remove_sa_exact(ExactRemoveSaRequest::new(zero_if_id))
+            .await
+            .expect_err("zero interface identifier must fail before actor admission");
+        assert!(matches!(
+            error,
+            XfrmError::InvalidConfig {
+                field: "sa.if_id",
+                ..
+            }
+        ));
+        assert!(transport.records().is_empty());
     }
 
     #[tokio::test]
@@ -6753,6 +6852,35 @@ mod tests {
             Err(XfrmError::Unavailable)
         ));
         read_worker.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn lost_key_snapshot_reply_is_a_read_and_lost_exact_removal_reply_is_not() {
+        let (read_sender, mut read_receiver) = mpsc::channel(1);
+        let read_backend = backend_from_sender(read_sender);
+        let read_worker = tokio::spawn(async move {
+            drop(read_receiver.recv().await);
+        });
+        assert!(matches!(
+            read_backend.query_sa_key_snapshot(key_request()).await,
+            Err(XfrmError::Unavailable)
+        ));
+        read_worker.await.unwrap();
+
+        let (mutation_sender, mut mutation_receiver) = mpsc::channel(1);
+        let mutation_backend = backend_from_sender(mutation_sender);
+        let mutation_worker = tokio::spawn(async move {
+            drop(mutation_receiver.recv().await);
+        });
+        assert!(matches!(
+            mutation_backend
+                .remove_sa_exact(exact_removal_request())
+                .await,
+            Err(XfrmError::StateIndeterminate {
+                operation: "remove_sa_exact"
+            })
+        ));
+        mutation_worker.await.unwrap();
     }
 
     type RecoveryResponse = Result<Option<SensitiveBuffer>, XfrmError>;
@@ -9485,6 +9613,19 @@ mod tests {
         assert!(matches!(
             backend.remove_sa(remove_request()).await,
             Err(XfrmError::Unavailable)
+        ));
+        // An exact removal is an ordinary mutation and is fenced before its
+        // key read. The read alone is not fenced: it reaches the transport,
+        // which has no dump support here.
+        assert!(matches!(
+            backend.remove_sa_exact(exact_removal_request()).await,
+            Err(XfrmError::Unavailable)
+        ));
+        assert!(matches!(
+            backend.query_sa_key_snapshot(key_request()).await,
+            Err(XfrmError::UnsupportedFeature {
+                feature: "sa_key_snapshot"
+            })
         ));
         assert!(matches!(
             backend
