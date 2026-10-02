@@ -291,11 +291,10 @@ fn lagging_voter_releases(member_count: usize) -> Vec<Release> {
 /// The previous-release voters miss the entries this build's majority
 /// committed while they were cut off, so a survivor of this build holds the
 /// most up-to-date log and must win. It can only win with a previous-release
-/// voter's vote, and that voter cannot answer Pre-Vote, the round this build
-/// runs before it campaigns. The previous-release voters campaign with the
-/// classic vote but cannot win: their logs are behind. A survivor of this
-/// build that rejects such a candidate for its log campaigns one election
-/// timeout later, without Pre-Vote and in a higher term.
+/// voter's vote, which that voter can grant but never as a Pre-Vote: the
+/// survivor learns this from the protocol the connection negotiates and runs
+/// the classic election instead. The previous-release voters campaign with the
+/// classic vote too, but cannot win: their logs are behind.
 fn run_leader_loss_with_lagging_previous_release_voters(member_count: usize) {
     let mut mixed = MixedFleet::start(lagging_voter_releases(member_count));
     let leader = mixed.steer_leader_to_current_release();
@@ -427,26 +426,40 @@ fn five_process_mixed_release_leader_loss_with_lagging_previous_release_voters()
     run_leader_loss_with_lagging_previous_release_voters(5);
 }
 
-/// Bound on electing a successor while a voter of the previous release is
-/// still needed for a quorum.
+/// Bound on electing a successor while a voter of the previous release is a
+/// member.
 ///
-/// Such a voter grants a vote only after its 8 s lease, and first campaigns
-/// within its lease, its maximum election timeout and one tick of its last
-/// leader contact. A voter of this build counts it as rejecting Pre-Vote, so
-/// it never campaigns first in that window. If the previous-release
-/// candidate's log is behind, a voter of this build that rejects it campaigns
-/// within one of its own election timeouts and a tick. If two previous-release
-/// candidates split the vote instead, one more previous-release election
-/// timeout and tick follow. The longer of the two completes the bound.
+/// A voter of this build that reaches such a voter runs the classic election
+/// for that campaign, as the previous release does, so the voter set elects as
+/// the previous release would. When only previous-release voters can win, one
+/// first campaigns within its 8 s lease, its maximum election timeout and one
+/// tick of its last leader contact, and a split vote adds one more
+/// previous-release election timeout and tick. When a voter of this build can
+/// win, it first campaigns within its own maximum election timeout and tick of
+/// its last leader contact, after at most one cold connection that tells it a
+/// voter cannot answer Pre-Vote. A previous-release lease, 8 s at most, may
+/// reject that campaign; it campaigns again within one more of its election
+/// timeouts and a tick, after every such lease has run out. The longer of the
+/// two paths is the bound.
 fn mixed_release_election_bound() -> Duration {
-    let first_previous_release_campaign =
-        PREVIOUS_RELEASE_ELECTION_TIMEOUT_MAX * 2 + PREVIOUS_RELEASE_ENGINE_TICK;
-    let current_release_campaign =
-        Duration::from_millis(DURABLE_CONSENSUS_TIMING_PROFILE.election_timeout_max_millis)
-            + DURABLE_CONSENSUS_TIMING_PROFILE.engine_tick();
+    let previous_release_lease = PREVIOUS_RELEASE_ELECTION_TIMEOUT_MAX;
     let previous_release_round =
         PREVIOUS_RELEASE_ELECTION_TIMEOUT_MAX + PREVIOUS_RELEASE_ENGINE_TICK;
-    first_previous_release_campaign + current_release_campaign.max(previous_release_round)
+    let previous_release_path = previous_release_lease + previous_release_round * 2;
+    let current_release_round =
+        Duration::from_millis(DURABLE_CONSENSUS_TIMING_PROFILE.election_timeout_max_millis)
+            + DURABLE_CONSENSUS_TIMING_PROFILE.engine_tick();
+    let current_release_path =
+        DURABLE_CONSENSUS_TIMING_PROFILE.cold_connect_timeout() + current_release_round * 2;
+    // A retried campaign of this build starts at least two of its minimum
+    // election timeouts after its last leader contact: after every
+    // previous-release lease.
+    assert!(
+        Duration::from_millis(DURABLE_CONSENSUS_TIMING_PROFILE.election_timeout_min_millis) * 2
+            >= previous_release_lease,
+        "a retried campaign of this build starts after every previous-release lease"
+    );
+    previous_release_path.max(current_release_path)
 }
 
 /// Bound on a write in flight at a leader loss while a voter of the previous
