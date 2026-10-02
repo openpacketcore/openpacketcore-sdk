@@ -1619,6 +1619,106 @@ async fn forward_skips_a_lost_leader_whose_successor_is_known_before_it_transmit
     cluster.shutdown().await;
 }
 
+/// A call that a redirect sent to B while this replica's view still named A keeps that exemption
+/// for A only until the view names B: once it has, A leading again supersedes the route.
+///
+/// Otherwise, after the view advanced from A to B while the caller revalidated its authority, a
+/// lost B that black-holes the call while A is elected again would hold the call until its
+/// deadline, although the replica knows the successor.
+#[tokio::test]
+async fn redirected_route_is_abandoned_when_its_source_leads_again_after_the_target() {
+    let _timing_permit = crate::acquire_consensus_timing_test_permit().await;
+    let cluster = RemoteRotationCluster::start().await;
+    let a = cluster.current_leader();
+    let f = (0..REMOTE_ROTATION_MEMBER_COUNT)
+        .find(|member| *member != a)
+        .expect("three-member cluster has a follower");
+    let b = (0..REMOTE_ROTATION_MEMBER_COUNT)
+        .find(|member| *member != a && *member != f)
+        .expect("three-member cluster has a second follower");
+    let a_id = cluster.stores[a].status().node_id;
+    let b_id = cluster.stores[b].status().node_id;
+    let follower_store = cluster.stores[f].clone();
+    let path = |source: usize, target: usize| {
+        cluster
+            .paths
+            .get(&(source, target))
+            .expect("loopback path")
+            .clone()
+    };
+    let wait_for_view = |leader: SessionConsensusNodeId, stage: &'static str| {
+        let follower_store = follower_store.clone();
+        async move {
+            let deadline = tokio::time::Instant::now() + REMOTE_ROTATION_TRANSITION_TIMEOUT;
+            while follower_store.inner.raft.metrics().borrow().current_leader != Some(leader) {
+                assert!(tokio::time::Instant::now() < deadline, "{stage}");
+                tokio::time::sleep(REMOTE_ROTATION_POLL_INTERVAL).await;
+            }
+        }
+    };
+
+    // B leads next: A is lost, and the follower's own campaigns cannot reach B.
+    cluster.isolate(a);
+    path(f, b).set_enabled(false);
+    wait_for_view(b_id, "B is elected").await;
+
+    // A redirect from A sent this call to B; the view names B when the call starts.
+    let route = super::LeaderRoute {
+        target: b_id,
+        chosen_under: Some(a_id),
+    };
+    let call = tokio::spawn({
+        let follower_store = follower_store.clone();
+        async move {
+            follower_store
+                .bound_by_local_leader_view(
+                    route,
+                    std::future::pending::<Result<(), super::ConsensusPeerCallFailure>>(),
+                )
+                .await
+        }
+    });
+
+    // A catches up from B, then B is lost and A leads again.
+    cluster.heal(a);
+    path(f, b).set_enabled(true);
+    let caught_up = tokio::time::Instant::now() + REMOTE_ROTATION_TRANSITION_TIMEOUT;
+    while cluster.stores[a].status().last_log_index != cluster.stores[f].status().last_log_index
+        || cluster.stores[a].status().leader_id != Some(b_id)
+    {
+        assert!(
+            tokio::time::Instant::now() < caught_up,
+            "A follows B and has its log"
+        );
+        tokio::time::sleep(REMOTE_ROTATION_POLL_INTERVAL).await;
+    }
+    cluster.isolate(b);
+    path(f, a).set_enabled(false);
+    wait_for_view(a_id, "A is elected again").await;
+    let returned = tokio::time::Instant::now();
+
+    let result = tokio::time::timeout(
+        super::STALE_LEADER_ROUTE_GRACE + Duration::from_secs(5),
+        call,
+    )
+    .await
+    .expect("the call to the lost B is abandoned")
+    .expect("call task");
+    assert_eq!(
+        Err(super::ConsensusPeerCallFailure::AfterTransmission),
+        result
+    );
+    assert!(
+        returned.elapsed() <= super::STALE_LEADER_ROUTE_GRACE + Duration::from_secs(1),
+        "the call was abandoned {:?} after A led again",
+        returned.elapsed()
+    );
+
+    path(f, a).set_enabled(true);
+    cluster.heal(b);
+    cluster.shutdown().await;
+}
+
 struct CountingRemoteSealProvider {
     inner: Arc<MemoryRemoteSealProvider>,
     seal_calls: AtomicUsize,
