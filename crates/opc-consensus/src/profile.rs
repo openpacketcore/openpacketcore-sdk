@@ -64,7 +64,11 @@ pub struct DurableOpenraftProfile {
 pub struct DurableConsensusTimingProfile {
     /// Resolver, TCP, mutual-TLS, identity, and application-bootstrap ceiling.
     pub cold_connect_timeout_millis: u64,
-    /// Openraft heartbeat interval and AppendEntries/read-index call ceiling.
+    /// Openraft heartbeat interval. A leader sends heartbeats on its engine
+    /// tick, every three halves of this interval.
+    pub heartbeat_interval_millis: u64,
+    /// AppendEntries and read-index call ceiling, separate from the heartbeat
+    /// interval.
     pub append_entries_timeout_millis: u64,
     /// Vote RPC ceiling.
     pub vote_timeout_millis: u64,
@@ -140,6 +144,11 @@ impl DurableConsensusTimingProfile {
         Duration::from_millis(self.server_handler_timeout_millis)
     }
 
+    /// Return the Openraft heartbeat interval.
+    pub const fn heartbeat_interval(self) -> Duration {
+        Duration::from_millis(self.heartbeat_interval_millis)
+    }
+
     /// Return the engine tick derived from the heartbeat interval.
     ///
     /// The pinned Openraft engine evaluates both a leader's idle heartbeat and
@@ -150,94 +159,93 @@ impl DurableConsensusTimingProfile {
     }
 
     const fn engine_tick_millis(self) -> u64 {
-        self.append_entries_timeout_millis.saturating_mul(3) / 2
+        self.heartbeat_interval_millis.saturating_mul(3) / 2
     }
 
-    /// Return the exclusive bound on a surviving voter's first campaign,
-    /// measured from its last contact with the committed leader.
+    /// Return how long a replica keeps waiting for a leader-routed call after
+    /// its own engine names a different leader.
     ///
-    /// The pinned engine leases a committed leader's vote for
-    /// `election_timeout_max_millis`, then waits one sampled election timeout,
-    /// which is below `election_timeout_max_millis`, and campaigns on its next
-    /// tick. A voter rejects every candidate for the same lease, so failure
-    /// detection is never shorter than the sum of both election bounds.
+    /// A lost leader that black-holes a connection never answers. Once the
+    /// replica observes the successor, the call is abandoned after this grace
+    /// and reported as possibly transmitted.
+    pub const fn stale_leader_route_grace(self) -> Duration {
+        Duration::from_millis(self.heartbeat_interval_millis)
+    }
+
+    /// Return the bound on the first successful campaign after an unplanned
+    /// leader loss, measured from the loss.
+    ///
+    /// A surviving voter campaigns once the longer of its leader lease
+    /// (`election_timeout_min_millis`) and its sampled election timeout
+    /// (below `election_timeout_max_millis`) has passed since its last leader
+    /// contact, on its next engine tick. The survivor that heard from the
+    /// leader last is the last to campaign, and by then every other
+    /// survivor's lease has expired, so its Pre-Vote and vote are granted.
     pub const fn leader_loss_first_campaign_bound(self) -> Duration {
         Duration::from_millis(self.leader_loss_first_campaign_bound_millis())
     }
 
     const fn leader_loss_first_campaign_bound_millis(self) -> u64 {
         self.election_timeout_max_millis
-            .saturating_mul(2)
-            .saturating_add(self.engine_tick_millis())
-    }
-
-    /// Return the exclusive bound on electing a replacement leader after an
-    /// unplanned leader loss, measured from the last leader contact.
-    ///
-    /// It allows one further campaign after the first: a split vote, or a
-    /// first candidate whose log is shorter than another survivor's. A
-    /// campaigning voter's own uncommitted vote is not leased, so the further
-    /// campaign waits only a newly sampled election timeout and one tick.
-    pub const fn leader_loss_reelection_bound(self) -> Duration {
-        Duration::from_millis(self.leader_loss_reelection_bound_millis())
-    }
-
-    const fn leader_loss_reelection_bound_millis(self) -> u64 {
-        self.leader_loss_first_campaign_bound_millis()
-            .saturating_add(self.election_timeout_max_millis)
             .saturating_add(self.engine_tick_millis())
     }
 
     /// Return the documented maximum write stall for an unplanned leader
     /// loss.
     ///
-    /// The bound adds, to the replacement election, one stale attempt against
-    /// the lost leader (a refused cold connection, or a call to a black-holed
-    /// leader that a replica abandons within the cold-connect allowance once
-    /// it observes the successor), one cold connection to the successor, and
-    /// three complete AppendEntries rounds: the successor's first commit, its
-    /// linearizable admission round, and the write's own commit. It assumes a reachable majority whose processes are not
-    /// suspended or CPU-throttled and whose RPCs each finish within their
-    /// family ceilings. Further split votes are probabilistic and outside it.
+    /// The bound adds, to the first successful campaign, six round trips each
+    /// answered within one heartbeat interval (Pre-Vote, vote, the
+    /// successor's first commit, the forwarded write, the successor's
+    /// linearizable admission round and the write's own commit), the stale
+    /// leader-route grace for a black-holed lost leader, and one new
+    /// connection to the successor within the cold-connect allowance. It
+    /// assumes a reachable majority whose processes are not suspended or
+    /// CPU-throttled. A split vote is probabilistic and outside the bound; it
+    /// adds at most one further election timeout and tick.
     pub const fn unplanned_leader_loss_write_stall(self) -> Duration {
         Duration::from_millis(self.unplanned_leader_loss_write_stall_millis())
     }
 
     const fn unplanned_leader_loss_write_stall_millis(self) -> u64 {
-        self.leader_loss_reelection_bound_millis()
-            .saturating_add(self.cold_connect_timeout_millis.saturating_mul(2))
-            .saturating_add(self.append_entries_timeout_millis.saturating_mul(3))
+        self.leader_loss_first_campaign_bound_millis()
+            .saturating_add(self.heartbeat_interval_millis.saturating_mul(6))
+            .saturating_add(self.heartbeat_interval_millis)
+            .saturating_add(self.cold_connect_timeout_millis)
     }
 }
 
 /// The one fixed timing contract for SDK-owned durable consensus.
 ///
-/// Unplanned leader loss is detected by the pinned engine only after its
-/// leader lease (`election_timeout_max_millis`) plus one sampled election
-/// timeout, checked on a tick of 750 ms. With these values a surviving voter
-/// first campaigns within 4,350 ms of its last leader contact, a replacement
-/// is elected within 6,900 ms allowing one further campaign, and the
-/// documented write stall is 9,400 ms, inside the unchanged 10,000 ms
-/// operation timeout. A voter campaigns only after 2,800 ms without any
-/// AppendEntries, at least three missed 750 ms ticks of a leader that is
+/// After an unplanned leader loss, a surviving voter campaigns once the longer
+/// of its leader lease (the minimum election timeout) and its sampled election
+/// timeout has passed since its last leader contact, checked on a 300 ms
+/// engine tick. Pre-Vote keeps a voter that cannot win from raising its term.
+/// With these values the first successful campaign starts within 6,800 ms of
+/// the loss and the documented write stall is 9,700 ms, inside the unchanged
+/// 10,000 ms operation timeout. A voter campaigns only after 5,000 ms without
+/// any AppendEntries, more than sixteen missed 300 ms ticks of a leader that is
 /// neither suspended nor CPU-throttled.
 pub const DURABLE_CONSENSUS_TIMING_PROFILE: DurableConsensusTimingProfile =
     DurableConsensusTimingProfile {
-        // Contained in every family ceiling, including the heartbeat family.
-        cold_connect_timeout_millis: 500,
-        // Heartbeat and AppendEntries/read-index ceiling: the engine uses the
-        // heartbeat interval as this RPC's hard deadline.
-        append_entries_timeout_millis: 500,
-        // The engine uses the minimum election timeout as the Vote deadline.
-        vote_timeout_millis: 1_000,
+        // Contained in every family ceiling.
+        cold_connect_timeout_millis: 1_500,
+        // Heartbeats go out on a 300 ms engine tick, sixteen of them within
+        // one follower lease.
+        heartbeat_interval_millis: 200,
+        // AppendEntries/read-index ceiling, independent of the heartbeat.
+        append_entries_timeout_millis: 2_000,
+        // The engine uses the minimum election timeout as the Vote and
+        // Pre-Vote deadline.
+        vote_timeout_millis: 5_000,
         install_snapshot_timeout_millis: 10_000,
         forward_mutation_timeout_millis: 10_000,
         read_barrier_timeout_millis: 10_000,
-        // Twice the heartbeat, the profile's minimum ratio.
-        election_timeout_min_millis: 1_000,
-        // Also the engine's leader lease. Leaves 600 ms of the operation
-        // timeout above the documented write stall; 2,000 ms would leave none.
-        election_timeout_max_millis: 1_800,
+        // Also the follower lease. At least twice the AppendEntries ceiling,
+        // so one slow AppendEntries never lets it expire.
+        election_timeout_min_millis: 5_000,
+        // Bounds the first campaign. Leaves 300 ms of the operation timeout
+        // above the documented write stall.
+        election_timeout_max_millis: 6_500,
         operation_timeout_millis: 10_000,
         server_idle_timeout_millis: 30_000,
         server_handler_timeout_millis: 30_000,
@@ -268,7 +276,7 @@ pub const DURABLE_OPENRAFT_PROPOSAL_ADMISSION_SLOTS: usize = 8;
 
 /// The one SDK-owned runtime configuration used by durable Openraft consumers.
 pub const DURABLE_OPENRAFT_PROFILE: DurableOpenraftProfile = DurableOpenraftProfile {
-    heartbeat_interval_millis: DURABLE_CONSENSUS_TIMING_PROFILE.append_entries_timeout_millis,
+    heartbeat_interval_millis: DURABLE_CONSENSUS_TIMING_PROFILE.heartbeat_interval_millis,
     election_timeout_min_millis: DURABLE_CONSENSUS_TIMING_PROFILE.election_timeout_min_millis,
     election_timeout_max_millis: DURABLE_CONSENSUS_TIMING_PROFILE.election_timeout_max_millis,
     install_snapshot_timeout_millis: DURABLE_CONSENSUS_TIMING_PROFILE
@@ -294,15 +302,22 @@ pub struct DurableConsensusTimingProfileError;
 /// Validate the cross-family timing relationships required by the fixed
 /// production profile.
 ///
-/// Besides the family ordering, the documented unplanned leader-loss write
-/// stall must stay below the operation timeout, so a write in flight at an
-/// unplanned leader loss can reach its outcome within one operation.
+/// Besides the family ordering, a follower's lease (the minimum election
+/// timeout) must span two engine ticks and two AppendEntries ceilings, and the
+/// documented unplanned leader-loss write stall must stay below the operation
+/// timeout, so a write in flight at an unplanned leader loss can reach its
+/// outcome within one operation.
 pub fn validate_durable_consensus_timing_profile(
     profile: DurableConsensusTimingProfile,
 ) -> Result<(), DurableConsensusTimingProfileError> {
-    let doubled_heartbeat = profile
+    let doubled_append_entries = profile
         .append_entries_timeout_millis
         .checked_mul(2)
+        .ok_or(DurableConsensusTimingProfileError)?;
+    // Two engine ticks, each three halves of the heartbeat interval.
+    let two_engine_ticks = profile
+        .heartbeat_interval_millis
+        .checked_mul(3)
         .ok_or(DurableConsensusTimingProfileError)?;
     let largest_rpc_timeout = profile
         .append_entries_timeout_millis
@@ -318,6 +333,9 @@ pub fn validate_durable_consensus_timing_profile(
         .min(profile.read_barrier_timeout_millis);
     if profile.cold_connect_timeout_millis == 0
         || profile.cold_connect_timeout_millis > smallest_rpc_timeout
+        || profile.heartbeat_interval_millis == 0
+        || profile.heartbeat_interval_millis > profile.append_entries_timeout_millis
+        || profile.election_timeout_min_millis < two_engine_ticks
         || profile.append_entries_timeout_millis == 0
         || profile.vote_timeout_millis == 0
         || profile.install_snapshot_timeout_millis == 0
@@ -325,7 +343,7 @@ pub fn validate_durable_consensus_timing_profile(
         || profile.read_barrier_timeout_millis == 0
         || profile.operation_timeout_millis == 0
         || profile.append_entries_timeout_millis >= profile.election_timeout_min_millis
-        || profile.election_timeout_min_millis < doubled_heartbeat
+        || profile.election_timeout_min_millis < doubled_append_entries
         || profile.election_timeout_min_millis >= profile.election_timeout_max_millis
         || profile.election_timeout_max_millis >= profile.operation_timeout_millis
         || profile.vote_timeout_millis != profile.election_timeout_min_millis
@@ -349,7 +367,7 @@ pub fn durable_openraft_config(
     let profile = DURABLE_OPENRAFT_PROFILE;
     let timing = DURABLE_CONSENSUS_TIMING_PROFILE;
     validate_durable_consensus_timing_profile(timing).map_err(|_| DurableOpenraftProfileError)?;
-    if profile.heartbeat_interval_millis != timing.append_entries_timeout_millis
+    if profile.heartbeat_interval_millis != timing.heartbeat_interval_millis
         || profile.election_timeout_min_millis != timing.election_timeout_min_millis
         || profile.election_timeout_max_millis != timing.election_timeout_max_millis
         || profile.install_snapshot_timeout_millis != timing.install_snapshot_timeout_millis
@@ -359,6 +377,9 @@ pub fn durable_openraft_config(
     Config {
         cluster_name: domain.cluster_name().into(),
         heartbeat_interval: profile.heartbeat_interval_millis,
+        // AppendEntries, heartbeats and read-index rounds use their own
+        // ceiling instead of the heartbeat interval.
+        append_entries_timeout: Some(timing.append_entries_timeout_millis),
         election_timeout_min: profile.election_timeout_min_millis,
         election_timeout_max: profile.election_timeout_max_millis,
         install_snapshot_timeout: profile.install_snapshot_timeout_millis,
@@ -408,6 +429,14 @@ mod tests {
                 DURABLE_OPENRAFT_PROFILE.heartbeat_interval_millis
             );
             assert_eq!(
+                config.heartbeat_interval,
+                DURABLE_CONSENSUS_TIMING_PROFILE.heartbeat_interval_millis
+            );
+            assert_eq!(
+                config.append_entries_timeout(),
+                DURABLE_CONSENSUS_TIMING_PROFILE.rpc_timeout(ConsensusRpcFamily::AppendEntries)
+            );
+            assert_eq!(
                 config.election_timeout_min,
                 DURABLE_OPENRAFT_PROFILE.election_timeout_min_millis
             );
@@ -426,18 +455,19 @@ mod tests {
     #[test]
     fn fixed_timing_profile_has_exact_family_deadlines_and_valid_ordering() {
         let profile = DURABLE_CONSENSUS_TIMING_PROFILE;
-        assert_eq!(profile.cold_connect_timeout(), Duration::from_millis(500));
+        assert_eq!(profile.cold_connect_timeout(), Duration::from_millis(1_500));
+        assert_eq!(profile.heartbeat_interval(), Duration::from_millis(200));
         assert_eq!(
             profile.rpc_timeout(ConsensusRpcFamily::AppendEntries),
-            Duration::from_millis(500)
+            Duration::from_millis(2_000)
         );
         assert_eq!(
             profile.rpc_timeout(ConsensusRpcFamily::AppendEntriesRoster),
-            Duration::from_millis(500)
+            Duration::from_millis(2_000)
         );
         assert_eq!(
             profile.rpc_timeout(ConsensusRpcFamily::Vote),
-            Duration::from_millis(1_000)
+            Duration::from_millis(5_000)
         );
         assert_eq!(
             profile.rpc_timeout(ConsensusRpcFamily::PreVote),
@@ -445,7 +475,7 @@ mod tests {
         );
         assert_eq!(
             profile.rpc_timeout(ConsensusRpcFamily::LeadershipTransfer),
-            Duration::from_millis(1_000)
+            Duration::from_millis(5_000)
         );
         for family in [
             ConsensusRpcFamily::InstallSnapshot,
@@ -456,21 +486,21 @@ mod tests {
         ] {
             assert_eq!(profile.rpc_timeout(family), Duration::from_millis(10_000));
         }
-        assert_eq!(profile.election_timeout_min_millis, 1_000);
-        assert_eq!(profile.election_timeout_max_millis, 1_800);
+        assert_eq!(profile.election_timeout_min_millis, 5_000);
+        assert_eq!(profile.election_timeout_max_millis, 6_500);
         assert_eq!(profile.operation_timeout(), Duration::from_millis(10_000));
-        assert_eq!(profile.engine_tick(), Duration::from_millis(750));
+        assert_eq!(profile.engine_tick(), Duration::from_millis(300));
         assert_eq!(
-            profile.leader_loss_first_campaign_bound(),
-            Duration::from_millis(4_350)
+            profile.stale_leader_route_grace(),
+            Duration::from_millis(200)
         );
         assert_eq!(
-            profile.leader_loss_reelection_bound(),
-            Duration::from_millis(6_900)
+            profile.leader_loss_first_campaign_bound(),
+            Duration::from_millis(6_800)
         );
         assert_eq!(
             profile.unplanned_leader_loss_write_stall(),
-            Duration::from_millis(9_400)
+            Duration::from_millis(9_700)
         );
         assert_eq!(
             DURABLE_CONSENSUS_REMOTE_RETIREMENT_PROBE_INTERVAL,
@@ -479,7 +509,7 @@ mod tests {
         assert_eq!(profile.server_idle_timeout(), Duration::from_millis(30_000));
         assert_eq!(
             profile.client_connection_reuse_limit(),
-            Duration::from_millis(29_500)
+            Duration::from_millis(28_500)
         );
         assert!(profile.client_connection_reuse_limit() < profile.server_idle_timeout());
         assert_eq!(
@@ -502,29 +532,36 @@ mod tests {
     }
 
     #[test]
-    fn leader_loss_bounds_follow_the_pinned_engine_lease_and_tick() {
+    fn leader_loss_bounds_follow_the_overlapping_lease_and_tick() {
         let profile = DurableConsensusTimingProfile {
             cold_connect_timeout_millis: 70,
-            append_entries_timeout_millis: 100,
+            heartbeat_interval_millis: 100,
+            append_entries_timeout_millis: 150,
             election_timeout_min_millis: 400,
             election_timeout_max_millis: 1_000,
             ..DURABLE_CONSENSUS_TIMING_PROFILE
         };
         assert_eq!(profile.engine_tick(), Duration::from_millis(150));
-        // Lease (max) + sampled timeout (< max) + one tick.
+        // The longer of the lease (min) and the sampled timeout (< max), then
+        // one tick: never their sum.
         assert_eq!(
             profile.leader_loss_first_campaign_bound(),
-            Duration::from_millis(2_150)
+            Duration::from_millis(1_150)
         );
-        // One further campaign: sampled timeout (< max) + one tick.
-        assert_eq!(
-            profile.leader_loss_reelection_bound(),
-            Duration::from_millis(3_300)
-        );
-        // Two cold connections and three complete AppendEntries rounds.
+        // Six heartbeat round trips, the stale-route grace and one cold
+        // connection.
         assert_eq!(
             profile.unplanned_leader_loss_write_stall(),
-            Duration::from_millis(3_740)
+            Duration::from_millis(1_920)
+        );
+        // The AppendEntries ceiling does not enter the bound.
+        assert_eq!(
+            DurableConsensusTimingProfile {
+                append_entries_timeout_millis: 200,
+                ..profile
+            }
+            .unplanned_leader_loss_write_stall(),
+            profile.unplanned_leader_loss_write_stall()
         );
     }
 
@@ -572,13 +609,11 @@ mod tests {
             // Each of these keeps every family ordering valid, but its
             // unplanned leader-loss write stall reaches the operation timeout.
             DurableConsensusTimingProfile {
-                election_timeout_max_millis: 2_000,
+                election_timeout_max_millis: 6_800,
                 ..fixed
             },
             DurableConsensusTimingProfile {
-                vote_timeout_millis: 1_500,
-                election_timeout_min_millis: 1_500,
-                election_timeout_max_millis: 3_000,
+                heartbeat_interval_millis: 250,
                 ..fixed
             },
             DurableConsensusTimingProfile {
@@ -589,6 +624,19 @@ mod tests {
             },
             DurableConsensusTimingProfile {
                 vote_timeout_millis: fixed.vote_timeout_millis + 1,
+                ..fixed
+            },
+            DurableConsensusTimingProfile {
+                heartbeat_interval_millis: 0,
+                ..fixed
+            },
+            DurableConsensusTimingProfile {
+                heartbeat_interval_millis: fixed.append_entries_timeout_millis + 1,
+                ..fixed
+            },
+            // A follower lease that spans fewer than two engine ticks.
+            DurableConsensusTimingProfile {
+                heartbeat_interval_millis: fixed.election_timeout_min_millis / 3 + 1,
                 ..fixed
             },
             DurableConsensusTimingProfile {

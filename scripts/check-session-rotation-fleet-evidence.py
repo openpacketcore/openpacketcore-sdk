@@ -48,11 +48,11 @@ EXPECTED_LIFECYCLE = {
     "reconnect_max_millis": 20,
 }
 EXPECTED_TIMING_PROFILE = {
-    "cold_connect_timeout_millis": 500,
-    "heartbeat_millis": 500,
-    "vote_timeout_millis": 1000,
-    "election_timeout_min_millis": 1000,
-    "election_timeout_max_millis": 1800,
+    "cold_connect_timeout_millis": 1500,
+    "heartbeat_millis": 200,
+    "vote_timeout_millis": 5000,
+    "election_timeout_min_millis": 5000,
+    "election_timeout_max_millis": 6500,
     "operation_timeout_millis": 10000,
 }
 
@@ -63,8 +63,8 @@ EXPECTED_TIMING_PROFILE = {
 # plus one linearizable read per reachable member, each within the operation
 # timeout.
 FAULT_SLO_MILLIS = 10_000
-ROTATION_SLO_MILLIS = 13_600
-RECOVERY_SLO_MILLIS = 24_600
+ROTATION_SLO_MILLIS = 23_000
+RECOVERY_SLO_MILLIS = 34_000
 BOUNDS_SLO_MILLIS = 10_000
 PHASE_KINDS = ("fault", "rotation", "traffic", "recovery", "bounds")
 

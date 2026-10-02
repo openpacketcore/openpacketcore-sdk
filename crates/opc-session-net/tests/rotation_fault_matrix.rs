@@ -29,8 +29,8 @@
 //! it with the independent stdlib checker
 //! `scripts/check-session-rotation-fleet-evidence.py`. The per-kind duration
 //! SLOs are the profile-derived envelopes documented in
-//! `docs/rotation-qualification-plan.md`: the 26-second two-election-plus-operation
-//! transition envelope, the 37-second member-recovery stage, and the
+//! `docs/rotation-qualification-plan.md`: the 23-second two-election-plus-operation
+//! transition envelope, the 34-second member-recovery stage, and the
 //! (members + 1) x operation-timeout traffic-round envelope.
 
 use std::collections::{BTreeMap, BTreeSet};
@@ -785,7 +785,7 @@ impl CampaignEvidence {
                 },
                 "timing_profile": {
                     "cold_connect_timeout_millis": DURABLE_CONSENSUS_TIMING_PROFILE.cold_connect_timeout_millis,
-                    "heartbeat_millis": DURABLE_CONSENSUS_TIMING_PROFILE.append_entries_timeout_millis,
+                    "heartbeat_millis": DURABLE_CONSENSUS_TIMING_PROFILE.heartbeat_interval_millis,
                     "vote_timeout_millis": DURABLE_CONSENSUS_TIMING_PROFILE.vote_timeout_millis,
                     "election_timeout_min_millis": DURABLE_CONSENSUS_TIMING_PROFILE.election_timeout_min_millis,
                     "election_timeout_max_millis": DURABLE_CONSENSUS_TIMING_PROFILE.election_timeout_max_millis,

@@ -658,10 +658,12 @@ fn frozen_v6_profile_matches_its_declared_consensus_and_store_contract() {
         profile.consensus_timing.append_entries_timeout_millis
     );
     // The frozen v6 artifact keeps the timing profile it was published with.
-    // The live profile later shortened unplanned leader-loss detection, so
-    // only the families that did not move still equal the live values.
+    // The live profile later decoupled the heartbeat from the AppendEntries
+    // ceiling and shortened the maximum election timeout; every other family
+    // still equals the live value.
     let frozen_timing = DurableConsensusTimingProfile {
         cold_connect_timeout_millis: profile.consensus_timing.cold_connect_timeout_millis,
+        heartbeat_interval_millis: profile.consensus_timing.heartbeat_interval_millis,
         append_entries_timeout_millis: profile.consensus_timing.append_entries_timeout_millis,
         vote_timeout_millis: profile.consensus_timing.vote_timeout_millis,
         install_snapshot_timeout_millis: profile.consensus_timing.install_snapshot_timeout_millis,
@@ -677,6 +679,7 @@ fn frozen_v6_profile_matches_its_declared_consensus_and_store_contract() {
         frozen_timing,
         DurableConsensusTimingProfile {
             cold_connect_timeout_millis: 1_500,
+            heartbeat_interval_millis: 2_000,
             append_entries_timeout_millis: 2_000,
             vote_timeout_millis: 5_000,
             install_snapshot_timeout_millis: 10_000,
@@ -695,22 +698,17 @@ fn frozen_v6_profile_matches_its_declared_consensus_and_store_contract() {
         "the frozen v6 timing must not describe the live profile"
     );
     assert_eq!(
-        (
-            frozen_timing.install_snapshot_timeout_millis,
-            frozen_timing.forward_mutation_timeout_millis,
-            frozen_timing.read_barrier_timeout_millis,
-            frozen_timing.operation_timeout_millis,
-            frozen_timing.server_idle_timeout_millis,
-            frozen_timing.server_handler_timeout_millis,
-        ),
-        (
-            DURABLE_OPENRAFT_PROFILE.install_snapshot_timeout_millis,
-            timing.forward_mutation_timeout_millis,
-            timing.read_barrier_timeout_millis,
-            timing.operation_timeout_millis,
-            timing.server_idle_timeout_millis,
-            timing.server_handler_timeout_millis,
-        )
+        DurableConsensusTimingProfile {
+            heartbeat_interval_millis: timing.heartbeat_interval_millis,
+            election_timeout_max_millis: timing.election_timeout_max_millis,
+            ..frozen_timing
+        },
+        timing,
+        "only the heartbeat interval and the maximum election timeout moved"
+    );
+    assert_eq!(
+        frozen_timing.install_snapshot_timeout_millis,
+        DURABLE_OPENRAFT_PROFILE.install_snapshot_timeout_millis
     );
     assert!(
         profile.consensus_timing.cold_connect_timeout_millis

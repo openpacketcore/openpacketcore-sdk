@@ -942,22 +942,14 @@ pub const QUALIFICATION_TRAFFIC_AVAILABILITY_INTERRUPTION_BUDGET_PER_NODE: u64 =
 /// Ambiguous mutation outcomes resolve every retained acquisition before
 /// advancing same-owner fencing authority; read-only checkpoints retain the
 /// already-proven guard and validate its exact record.
-/// The bound is the larger of the fixed two-election cluster transition plus
-/// one complete consensus operation, and the reconciliation's sequential
-/// acquire and linearizable get plus one retry delay. An accepted backend
-/// operation is still allowed to reach its terminal outcome; a success
+/// The bound covers the fixed two-election cluster transition plus one complete
+/// consensus operation and remains large enough for the reconciliation's
+/// sequential acquire and linearizable get plus one retry delay. An accepted
+/// backend operation is still allowed to reach its terminal outcome; a success
 /// observed after this deadline fails the qualification.
-pub const QUALIFICATION_TRAFFIC_AVAILABILITY_RECOVERY_MILLIS: u64 = {
-    let transition = DURABLE_CONSENSUS_TIMING_PROFILE.election_timeout_max_millis * 2
+pub const QUALIFICATION_TRAFFIC_AVAILABILITY_RECOVERY_MILLIS: u64 =
+    DURABLE_CONSENSUS_TIMING_PROFILE.election_timeout_max_millis * 2
         + DURABLE_CONSENSUS_TIMING_PROFILE.operation_timeout_millis;
-    let reconciliation = DURABLE_CONSENSUS_TIMING_PROFILE.operation_timeout_millis * 2
-        + QUALIFICATION_TRAFFIC_AVAILABILITY_RETRY_MILLIS;
-    if transition > reconciliation {
-        transition
-    } else {
-        reconciliation
-    }
-};
 /// Fixed retry delay between terminal recoverable backend outcomes.
 pub const QUALIFICATION_TRAFFIC_AVAILABILITY_RETRY_MILLIS: u64 = 50;
 /// Versioned, qualification-only response-loss injection that deterministically
@@ -4878,7 +4870,7 @@ pub fn qualification_traffic_schedule_sha256(member_count: usize) -> Option<Stri
     let seed = qualification_traffic_seed(member_count)?;
     let schedule = format!(
         concat!(
-            "opc-session-ha/traffic-resource/v11\n",
+            "opc-session-ha/traffic-resource/v10\n",
             "member_count={member_count}\n",
             "seed={seed}\n",
             "rotations_per_member={}\n",
@@ -8867,15 +8859,11 @@ mod tests {
             8
         );
         assert_eq!(QUALIFICATION_TRAFFIC_TTL_MILLIS, 3_600_000);
-        assert_eq!(QUALIFICATION_TRAFFIC_AVAILABILITY_RECOVERY_MILLIS, 20_050);
+        assert_eq!(QUALIFICATION_TRAFFIC_AVAILABILITY_RECOVERY_MILLIS, 23_000);
         assert_eq!(
             QUALIFICATION_TRAFFIC_AVAILABILITY_RECOVERY_MILLIS,
-            (DURABLE_CONSENSUS_TIMING_PROFILE.election_timeout_max_millis * 2
-                + DURABLE_CONSENSUS_TIMING_PROFILE.operation_timeout_millis)
-                .max(
-                    DURABLE_CONSENSUS_TIMING_PROFILE.operation_timeout_millis * 2
-                        + QUALIFICATION_TRAFFIC_AVAILABILITY_RETRY_MILLIS
-                )
+            DURABLE_CONSENSUS_TIMING_PROFILE.election_timeout_max_millis * 2
+                + DURABLE_CONSENSUS_TIMING_PROFILE.operation_timeout_millis
         );
         const {
             assert!(
@@ -8937,11 +8925,11 @@ mod tests {
             QUALIFICATION_TRAFFIC_UNCLEAN_RESTART_TERMINATION_MILLIS,
             5_000
         );
-        assert_eq!(QUALIFICATION_TRAFFIC_UNCLEAN_RESTART_OUTAGE_MILLIS, 13_600);
+        assert_eq!(QUALIFICATION_TRAFFIC_UNCLEAN_RESTART_OUTAGE_MILLIS, 23_000);
         assert_eq!(QUALIFICATION_TRAFFIC_UNCLEAN_RESTART_STARTUP_MILLIS, 45_000);
         assert_eq!(
             QUALIFICATION_TRAFFIC_UNCLEAN_RESTART_RECOVERY_MILLIS,
-            13_600
+            23_000
         );
         assert_eq!(
             QUALIFICATION_TRAFFIC_UNCLEAN_RESTART_READINESS_DELIVERY_MILLIS,
@@ -8951,14 +8939,14 @@ mod tests {
             QUALIFICATION_TRAFFIC_UNCLEAN_RESTART_FINAL_READINESS_PROBE_MILLIS,
             11_000
         );
-        assert_eq!(QUALIFICATION_TRAFFIC_UNCLEAN_RESTART_CATCHUP_MILLIS, 24_600);
+        assert_eq!(QUALIFICATION_TRAFFIC_UNCLEAN_RESTART_CATCHUP_MILLIS, 34_000);
         assert_eq!(
             QUALIFICATION_TRAFFIC_UNCLEAN_RESTART_CATCHUP_MILLIS,
             QUALIFICATION_TRAFFIC_UNCLEAN_RESTART_RECOVERY_MILLIS
                 + QUALIFICATION_TRAFFIC_UNCLEAN_RESTART_FINAL_READINESS_PROBE_MILLIS
         );
-        assert_eq!(QUALIFICATION_TRAFFIC_UNCLEAN_RESTART_RESUME_MILLIS, 13_600);
-        assert_eq!(QUALIFICATION_TRAFFIC_UNCLEAN_RESTART_TOTAL_MILLIS, 126_800);
+        assert_eq!(QUALIFICATION_TRAFFIC_UNCLEAN_RESTART_RESUME_MILLIS, 23_000);
+        assert_eq!(QUALIFICATION_TRAFFIC_UNCLEAN_RESTART_TOTAL_MILLIS, 155_000);
         const {
             assert!(
                 QUALIFICATION_TRAFFIC_UNCLEAN_RESTART_TOTAL_MILLIS
@@ -8988,19 +8976,19 @@ mod tests {
         );
         assert_eq!(
             QUALIFICATION_TRAFFIC_MEMBER_RECOVERY_SETTLEMENT_MILLIS,
-            61_500
+            62_500
         );
         assert_eq!(
             QUALIFICATION_TRAFFIC_MEMBER_RECOVERY_SETTLEMENT_DEADLINE_MILLIS,
-            80_050
+            83_000
         );
         assert_eq!(
             QUALIFICATION_TRAFFIC_MEMBER_RECOVERY_PROGRESS_CHECKPOINT_MILLIS,
-            10_025
+            11_500
         );
         assert_eq!(
             QUALIFICATION_TRAFFIC_MEMBER_RECOVERY_COVERAGE_MILLIS,
-            20_050
+            23_000
         );
         assert_eq!(
             QUALIFICATION_TRAFFIC_MEMBER_RECOVERY_AVAILABILITY_INTERRUPTION_BUDGET_PER_NODE,
@@ -9020,8 +9008,8 @@ mod tests {
         assert_eq!(
             (three.as_str(), five.as_str()),
             (
-                "sha256:15f9f04964f617e95741ed8d7d3ef02eba09f3f2801ed95b4ee38c212c7d1e16",
-                "sha256:982368ecda42e8de036a4d7c30376f60d16883fdeed987f28de519f9d73648c8",
+                "sha256:e526ce3cc32a16623a7110488e1b0efdb7739176bc6136ae7a7f8e5f0e055841",
+                "sha256:dde02ab159d4af30b93c36025e26cb841a9b7ba7e606f62ca1f93b5f05b93f22",
             )
         );
         assert!(is_exact_sha256(&three));
@@ -9584,32 +9572,32 @@ mod tests {
             (
                 SessionMtlsCandidateCampaign::RotationCore,
                 3,
-                "sha256:705db632bef82be4471a8db7379749e7a5743d5f51fa9460c6b4dd222b9abf9a",
+                "sha256:b5611999bdfe1cb3885ebaaad2d671e8564cf9305c5aa39c990c49cf466dd8e2",
             ),
             (
                 SessionMtlsCandidateCampaign::RotationCore,
                 5,
-                "sha256:9c2e61a8a0d7d29e6b1e647ea430b426c5739005cd6ee3e4676914e01699b958",
+                "sha256:9012f0a1fd4aa53b11cc84526ac6d3b87843831360d229fb31e60c146662bf79",
             ),
             (
                 SessionMtlsCandidateCampaign::FaultExpiryRecovery,
                 3,
-                "sha256:7ba9a809a900446ee81d2cdb1672f36bf7880ff8c0868480f19a5a0eaece429f",
+                "sha256:253d6fe516d3c578dbced1cfe8a4d73aac77283c3ec0fd8be6c5612680bfddbb",
             ),
             (
                 SessionMtlsCandidateCampaign::FaultExpiryRecovery,
                 5,
-                "sha256:29b7a759fb6071f16ca004cf963534fd131ef1355a8f4666807c963a019423ed",
+                "sha256:66f90b7090dcb57b333831ee8117f4dbfc55ba9f5fed17e5abb5253f1379a5c1",
             ),
             (
                 SessionMtlsCandidateCampaign::TrafficResourceBounds,
                 3,
-                "sha256:d63686c66258eb8d43c99549e26545aff14140845d363ae951e30105c3ca34fd",
+                "sha256:f2575bc674a49c93e6708209dbdad8d8722f86e954a2735fd4944e0d0ce6168e",
             ),
             (
                 SessionMtlsCandidateCampaign::TrafficResourceBounds,
                 5,
-                "sha256:c5fc0b4fc51efab839838bc33c831eb54cc4f56a8615c2e31c0355b6ea3f00c2",
+                "sha256:821bb850fbe5353d5a13d3b8019154f382764773e69427b08c720c8890273a9b",
             ),
         ];
         for (campaign, member_count, expected) in vectors {

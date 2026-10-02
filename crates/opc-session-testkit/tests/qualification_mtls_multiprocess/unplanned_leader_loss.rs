@@ -432,7 +432,7 @@ fn run_unplanned_leader_loss_fenced_write_stream(member_count: usize) {
         "unplanned leader loss: voters={member_count} old_term={old_term} \
          new_terms={:?} outage_ms={} slowest_write={} slowest_stall_ms={} \
          slowest_attempts={} slowest_retries={:?} bound_ms={} \
-         first_campaign_bound_ms={} reelection_bound_ms={}",
+         first_campaign_bound_ms={}",
         after_fault
             .iter()
             .map(|report| report.term)
@@ -445,9 +445,6 @@ fn run_unplanned_leader_loss_fenced_write_stream(member_count: usize) {
         bound.as_millis(),
         DURABLE_CONSENSUS_TIMING_PROFILE
             .leader_loss_first_campaign_bound()
-            .as_millis(),
-        DURABLE_CONSENSUS_TIMING_PROFILE
-            .leader_loss_reelection_bound()
             .as_millis(),
     );
 
@@ -677,8 +674,8 @@ fn run_healthy_fleet_keeps_its_leader_under_cpu_contention(member_count: usize) 
         member_count,
         Arc::clone(&progress),
     ));
-    // Several complete campaign windows of continuous contention.
-    let window = DURABLE_CONSENSUS_TIMING_PROFILE.leader_loss_first_campaign_bound() * 4;
+    // Three complete campaign windows of continuous contention.
+    let window = DURABLE_CONSENSUS_TIMING_PROFILE.leader_loss_first_campaign_bound() * 3;
     thread::sleep(window);
     progress.stop.store(true, Ordering::SeqCst);
     let writes = runtime.block_on(writer).expect("stream task joins");

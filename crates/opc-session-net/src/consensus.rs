@@ -57,8 +57,8 @@ const DEFAULT_CONSENSUS_RPC_TIMEOUT: Duration =
 // deadline. Limiting it to two thirds of the remaining budget guarantees that
 // a successful DNS/TCP/TLS/bootstrap phase leaves a non-zero bounded interval
 // for the first negotiated RPC. This is especially important for Openraft
-// AppendEntries: its 375 ms soft TTL is below the profile's absolute cold cap,
-// so applying only that cap could leave no time to send the heartbeat that
+// AppendEntries: its 1,500 ms soft TTL is equal to the profile's absolute cold
+// cap, so applying only that cap could leave no time to send the heartbeat that
 // makes the new connection useful.
 const CONSENSUS_COLD_CONNECT_BUDGET_NUMERATOR: u32 = 2;
 const CONSENSUS_COLD_CONNECT_BUDGET_DENOMINATOR: u32 = 3;
@@ -4630,22 +4630,14 @@ mod tests {
     #[test]
     fn cold_connect_budget_reserves_one_third_of_the_append_soft_ttl() {
         let now = tokio::time::Instant::now();
-        // Openraft's soft TTL is three quarters of its AppendEntries hard
-        // TTL, which the profile fixes at the heartbeat family ceiling.
-        let append_soft_ttl =
-            DURABLE_CONSENSUS_TIMING_PROFILE.rpc_timeout(ConsensusRpcFamily::AppendEntries) * 3 / 4;
-        assert_eq!(append_soft_ttl, Duration::from_millis(375));
+        let append_soft_ttl = Duration::from_millis(1_500);
         let call_deadline = now + append_soft_ttl;
         let connect_deadline = contained_cold_connect_deadline(now, call_deadline);
 
-        assert!(append_soft_ttl * 2 / 3 < DURABLE_CONSENSUS_TIMING_PROFILE.cold_connect_timeout());
-        assert_eq!(
-            connect_deadline.duration_since(now),
-            Duration::from_millis(250)
-        );
+        assert_eq!(connect_deadline.duration_since(now), Duration::from_secs(1));
         assert_eq!(
             call_deadline.duration_since(connect_deadline),
-            Duration::from_millis(125)
+            Duration::from_millis(500)
         );
     }
 
@@ -4661,7 +4653,7 @@ mod tests {
         );
         assert_eq!(
             call_deadline.duration_since(connect_deadline),
-            Duration::from_millis(9_500)
+            Duration::from_millis(8_500)
         );
     }
 
@@ -7285,14 +7277,11 @@ mod tests {
                 std::future::pending::<io::Result<SocketAddr>>().await
             })
         });
-        // A cold caller waits on a cooldown only when that cooldown ends
-        // inside its contained cold-connect budget.
-        let cooldown = DURABLE_CONSENSUS_TIMING_PROFILE.cold_connect_timeout() / 2;
         let policy = ConnectionLifecyclePolicy::try_new(
             Duration::from_secs(60),
             Duration::from_secs(5),
-            cooldown,
-            cooldown,
+            Duration::from_secs(1),
+            Duration::from_secs(1),
             Duration::ZERO,
         )
         .expect("lifecycle policy");

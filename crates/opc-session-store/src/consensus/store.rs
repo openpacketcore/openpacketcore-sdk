@@ -294,11 +294,12 @@ fn reset_roster_ingress_test_counters() {
 const SESSION_CONSENSUS_ROUTE_RETRY_BACKOFF: Duration = Duration::from_millis(50);
 /// Grace a leader-routed call keeps after this replica observes a different
 /// leader. A deposed leader's in-flight answer, such as a planned handoff's
-/// not-leader reply, arrives within it; a lost leader that black-holes the
-/// connection is abandoned at its end rather than at the caller's deadline.
-/// It is the cold-connect allowance that the documented unplanned leader-loss
-/// write stall reserves for one stale attempt against the lost leader.
-const STALE_LEADER_ROUTE_GRACE: Duration = DURABLE_CONSENSUS_TIMING_PROFILE.cold_connect_timeout();
+/// not-leader reply, normally arrives within it; a lost leader that
+/// black-holes the connection is abandoned at its end rather than at the
+/// caller's deadline. It is the one heartbeat interval that the documented
+/// unplanned leader-loss write stall reserves for that stale attempt.
+const STALE_LEADER_ROUTE_GRACE: Duration =
+    DURABLE_CONSENSUS_TIMING_PROFILE.stale_leader_route_grace();
 const FENCED_TRANSITION_V2_STATUS_LEADER_COLLECTION_WINDOW: Duration = Duration::from_micros(500);
 const GENERIC_WATCH_AUTHORITY_RECHECK_INTERVAL: Duration = Duration::from_millis(50);
 const TOPOLOGY_ENDPOINT_BINDING_DOMAIN: &[u8] =
