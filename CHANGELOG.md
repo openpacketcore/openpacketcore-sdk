@@ -9,6 +9,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- `opc-session-store`: a write or read forwarded to a lost leader that
+  black-holes its connection no longer waits for the caller's whole deadline.
+  A failed node or partition, unlike a crashed process, gives the forwarding
+  replica no connection error, so its forward, read barrier, exact V2 status
+  ticket, capability activation or expiry preflight waited 10 seconds even
+  after the surviving voters had elected a successor. Every leader-routed call
+  is now bounded by the replica's own leader view: once its engine names a
+  different leader, a call still unanswered after the 500 ms cold-connect
+  allowance is abandoned and reported as possibly transmitted, so callers
+  retry only the same request identity or report an unknown outcome. A
+  planned handoff's not-leader answer still arrives inside that allowance. A
+  regression that black-holes one follower's route to the leader now commits
+  its write in 3.5 to 4.3 seconds instead of ending ambiguous after 10
+  seconds. Refs #1037.
+
 - `opc-consensus`: an unplanned leader loss no longer stalls an in-flight
   write past the 10-second operation timeout. The pinned engine leases a
   committed leader's vote for `election_timeout_max`, then waits one sampled

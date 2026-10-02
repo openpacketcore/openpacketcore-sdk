@@ -167,7 +167,10 @@ voters elect a replacement on their own timers:
   campaign is needed, for a split vote or a first candidate with a shorter log;
 - a write in flight at the loss reaches its outcome within the documented
   9,400 ms stall, inside one 10-second operation, when the caller retries only
-  its own exact request identity after an ambiguous or unavailable attempt.
+  its own exact request identity after an ambiguous or unavailable attempt;
+- a session-store write or read that a black-holed lost leader holds is moved
+  to the successor within 500 ms after the forwarding replica observes it,
+  instead of at the caller's deadline.
 
 These bounds assume a reachable majority whose RPCs complete within their
 family ceilings. Repeated split votes are improbable but not excluded.

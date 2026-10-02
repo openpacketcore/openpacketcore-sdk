@@ -58,6 +58,12 @@ async fn blackholed_leader_forward_reroutes_within_the_unplanned_loss_write_stal
     .expect("the store bounds the write by its own operation deadline");
     let elapsed = started.elapsed();
     let bound = DURABLE_CONSENSUS_TIMING_PROFILE.unplanned_leader_loss_write_stall();
+    eprintln!(
+        "black-holed leader reroute: elapsed_ms={} bound_ms={} ok={}",
+        elapsed.as_millis(),
+        bound.as_millis(),
+        acquired.is_ok()
+    );
     assert!(
         cluster
             .paths

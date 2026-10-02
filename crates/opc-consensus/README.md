@@ -54,13 +54,14 @@ surviving voter's last contact with the lost leader:
 
 The re-election bound allows one further campaign: a split vote, or a first
 candidate whose log is shorter than another survivor's. The write stall adds
-one cold connection still pending against the lost leader, one to its
+one stale attempt against the lost leader, one cold connection to its
 successor, and three complete AppendEntries rounds: the successor's first
 commit, its linearizable admission round, and the write's own commit. Profile
 validation requires that stall to stay below the operation timeout. A write in
-flight when the leader is lost, retried only through its own exact request
-identity after an ambiguous or unavailable attempt, therefore reaches its
-committed outcome within one 10,000 ms operation. The bounds assume:
+flight when the leader is lost, submitted through a surviving voter and retried
+only through its own exact request identity after an ambiguous or unavailable
+attempt, therefore reaches its committed outcome within one 10,000 ms
+operation. The bounds assume:
 
 - a reachable majority of voters;
 - every RPC completing within its family ceiling; disk syncs and round trips
@@ -68,12 +69,22 @@ committed outcome within one 10,000 ms operation. The bounds assume:
 - no further split vote. Repeated split votes are possible but improbable,
   because every campaign samples a fresh timeout.
 
+A crashed leader refuses the stale attempt at once. A failed node or a
+partition can instead black-hole an established connection, so the session
+store bounds every leader-routed call (forwarded writes, read barriers, exact
+V2 status tickets, capability activation and expiry preflight) by its own
+leader view: once its engine names a different leader, a call still unanswered
+after the cold-connect allowance is abandoned and reported as possibly
+transmitted, and the route moves to the successor. The configuration store's
+routes are not yet bounded this way: behind a black-holed lost leader, a
+configuration write or read waits for its own operation deadline.
+
 The same timers decide when a healthy cluster elects spuriously. A voter
 campaigns only after 2,800 ms (`election_timeout_min + election_timeout_max`)
 without any AppendEntries from its leader, that is, after at least three
 missed 750 ms ticks. Voters therefore need CPU that is never throttled or
-suspended for longer than that window. Run voters with guaranteed CPU: no CPU
-limit below the request, or `requests == limits` with an integer number of
+suspended for longer than that window. Run voters with guaranteed CPU: either
+no CPU limit, or a limit equal to the request with an integer number of
 cores. CFS quota exhaustion, a stopped container, or storage that blocks the
 engine for seconds can depose a healthy leader. The election itself remains
 safe; in-flight writes on the old leader then end ambiguous and must be

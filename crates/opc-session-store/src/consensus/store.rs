@@ -25,7 +25,8 @@ use opc_consensus::{
     encode_roster_bounded, DurableOpenraftDomain, EnsureLinearizableOutcome,
     EnsureLinearizableSupervisor, LinearizableReadAdmit, LinearizableReadBarrier,
     LinearizableReadBarrierError, LinearizableReadLease, DURABLE_CONSENSUS_OPERATION_TIMEOUT,
-    DURABLE_OPENRAFT_LINEARIZABILITY_ADMISSION_CAPACITY, DURABLE_OPENRAFT_PROPOSAL_ADMISSION_SLOTS,
+    DURABLE_CONSENSUS_TIMING_PROFILE, DURABLE_OPENRAFT_LINEARIZABILITY_ADMISSION_CAPACITY,
+    DURABLE_OPENRAFT_PROPOSAL_ADMISSION_SLOTS,
 };
 use opc_types::Timestamp;
 use serde::de::{SeqAccess, Visitor};
@@ -291,6 +292,13 @@ fn reset_roster_ingress_test_counters() {
 }
 
 const SESSION_CONSENSUS_ROUTE_RETRY_BACKOFF: Duration = Duration::from_millis(50);
+/// Grace a leader-routed call keeps after this replica observes a different
+/// leader. A deposed leader's in-flight answer, such as a planned handoff's
+/// not-leader reply, arrives within it; a lost leader that black-holes the
+/// connection is abandoned at its end rather than at the caller's deadline.
+/// It is the cold-connect allowance that the documented unplanned leader-loss
+/// write stall reserves for one stale attempt against the lost leader.
+const STALE_LEADER_ROUTE_GRACE: Duration = DURABLE_CONSENSUS_TIMING_PROFILE.cold_connect_timeout();
 const FENCED_TRANSITION_V2_STATUS_LEADER_COLLECTION_WINDOW: Duration = Duration::from_micros(500);
 const GENERIC_WATCH_AUTHORITY_RECHECK_INTERVAL: Duration = Duration::from_millis(50);
 const TOPOLOGY_ENDPOINT_BINDING_DOMAIN: &[u8] =
@@ -7289,14 +7297,20 @@ impl ConsensusSessionStore {
                     .await
             } else {
                 match if roster_mutation {
-                    self.call_roster_mutation_peer(leader, &request, deadline)
-                        .await
-                } else {
-                    self.call_peer::<_, ForwardMutationReply>(
+                    self.bound_by_local_leader_view(
                         leader,
-                        SessionConsensusRpcFamily::ForwardMutation,
-                        &BorrowedForwardRequest::Mutation(&request),
-                        deadline,
+                        self.call_roster_mutation_peer(leader, &request, deadline),
+                    )
+                    .await
+                } else {
+                    self.bound_by_local_leader_view(
+                        leader,
+                        self.call_peer::<_, ForwardMutationReply>(
+                            leader,
+                            SessionConsensusRpcFamily::ForwardMutation,
+                            &BorrowedForwardRequest::Mutation(&request),
+                            deadline,
+                        ),
                     )
                     .await
                 } {
@@ -7481,11 +7495,14 @@ impl ConsensusSessionStore {
                     .await
             } else {
                 match self
-                    .call_peer::<_, ForwardMutationReply>(
+                    .bound_by_local_leader_view(
                         leader,
-                        SessionConsensusRpcFamily::ForwardMutation,
-                        &BorrowedForwardRequest::Mutation(&request),
-                        deadline,
+                        self.call_peer::<_, ForwardMutationReply>(
+                            leader,
+                            SessionConsensusRpcFamily::ForwardMutation,
+                            &BorrowedForwardRequest::Mutation(&request),
+                            deadline,
+                        ),
                     )
                     .await
                 {
@@ -7624,11 +7641,14 @@ impl ConsensusSessionStore {
                 .await
             } else {
                 match self
-                    .call_peer::<_, ForwardMutationReply>(
+                    .bound_by_local_leader_view(
                         leader,
-                        SessionConsensusRpcFamily::ForwardMutation,
-                        &request,
-                        deadline,
+                        self.call_peer::<_, ForwardMutationReply>(
+                            leader,
+                            SessionConsensusRpcFamily::ForwardMutation,
+                            &request,
+                            deadline,
+                        ),
                     )
                     .await
                 {
@@ -9068,6 +9088,45 @@ impl ConsensusSessionStore {
         }
     }
 
+    /// Bound one leader-routed peer call by this replica's own leader view.
+    ///
+    /// A lost leader can black-hole an established connection, which would
+    /// otherwise hold the route until the caller's whole deadline even after
+    /// the surviving voters elect and announce a successor. Once the local
+    /// engine names a leader other than both `target` and the leader it named
+    /// when the call began, the call keeps [`STALE_LEADER_ROUTE_GRACE`] for an
+    /// answer already in flight and is then abandoned. Abandonment never
+    /// proves that the request stayed undelivered, so it reports
+    /// `AfterTransmission` exactly like a call deadline: callers retry only
+    /// the same request identity or report an unknown outcome.
+    async fn bound_by_local_leader_view<T>(
+        &self,
+        target: SessionConsensusNodeId,
+        call: impl Future<Output = Result<T, ConsensusPeerCallFailure>>,
+    ) -> Result<T, ConsensusPeerCallFailure> {
+        tokio::pin!(call);
+        let mut metrics = self.inner.raft.metrics();
+        let initial = metrics.borrow_and_update().current_leader;
+        loop {
+            tokio::select! {
+                biased;
+                result = &mut call => return result,
+                changed = metrics.changed() => {
+                    if changed.is_err() {
+                        return call.await;
+                    }
+                    let observed = metrics.borrow_and_update().current_leader;
+                    if observed != initial && observed.is_some_and(|leader| leader != target) {
+                        break;
+                    }
+                }
+            }
+        }
+        tokio::time::timeout(STALE_LEADER_ROUTE_GRACE, call)
+            .await
+            .unwrap_or(Err(ConsensusPeerCallFailure::AfterTransmission))
+    }
+
     async fn call_peer<Req, Resp>(
         &self,
         target: SessionConsensusNodeId,
@@ -9261,11 +9320,14 @@ impl ConsensusSessionStore {
                 self.local_read_barrier(deadline).await
             } else {
                 match self
-                    .call_peer::<_, ReadBarrierReply>(
+                    .bound_by_local_leader_view(
                         leader,
-                        SessionConsensusRpcFamily::ReadBarrier,
-                        &ReadBarrierRequest,
-                        deadline,
+                        self.call_peer::<_, ReadBarrierReply>(
+                            leader,
+                            SessionConsensusRpcFamily::ReadBarrier,
+                            &ReadBarrierRequest,
+                            deadline,
+                        ),
                     )
                     .await
                 {
@@ -9481,13 +9543,16 @@ impl ConsensusSessionStore {
         }
 
         match self
-            .call_peer::<_, FencedTransitionV2StatusLogicalTimeTicketReply>(
+            .bound_by_local_leader_view(
                 leader,
-                SessionConsensusRpcFamily::ForwardMutation,
-                &ForwardRequest::FencedTransitionV2StatusLogicalTimeTicket {
-                    required_consumer_scope: Box::new(required_consumer_scope),
-                },
-                deadline,
+                self.call_peer::<_, FencedTransitionV2StatusLogicalTimeTicketReply>(
+                    leader,
+                    SessionConsensusRpcFamily::ForwardMutation,
+                    &ForwardRequest::FencedTransitionV2StatusLogicalTimeTicket {
+                        required_consumer_scope: Box::new(required_consumer_scope),
+                    },
+                    deadline,
+                ),
             )
             .await
         {

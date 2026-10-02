@@ -190,11 +190,12 @@ impl DurableConsensusTimingProfile {
     /// Return the documented maximum write stall for an unplanned leader
     /// loss.
     ///
-    /// The bound adds, to the replacement election, one cold connection that
-    /// was already pending against the lost leader, one cold connection to its
-    /// successor, and three complete AppendEntries rounds: the successor's
-    /// first commit, its linearizable admission round, and the write's own
-    /// commit. It assumes a reachable majority whose processes are not
+    /// The bound adds, to the replacement election, one stale attempt against
+    /// the lost leader (a refused cold connection, or a call to a black-holed
+    /// leader that a replica abandons within the cold-connect allowance once
+    /// it observes the successor), one cold connection to the successor, and
+    /// three complete AppendEntries rounds: the successor's first commit, its
+    /// linearizable admission round, and the write's own commit. It assumes a reachable majority whose processes are not
     /// suspended or CPU-throttled and whose RPCs each finish within their
     /// family ceilings. Further split votes are probabilistic and outside it.
     pub const fn unplanned_leader_loss_write_stall(self) -> Duration {
