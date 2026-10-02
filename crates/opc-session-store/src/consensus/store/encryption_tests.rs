@@ -1527,16 +1527,17 @@ async fn finite_expiry_preflight_follower_recovery_after_route_discovery_is_not_
 }
 
 /// A follower that chose the leader route before the survivors of that
-/// leader's loss elected a successor still abandons a black-holed call to the
-/// lost leader within the stale-route grace.
+/// leader's loss elected a successor sends nothing to the lost leader once it
+/// knows the successor, and completes through the successor.
 ///
 /// Forwarding selects the leader from the local view, then revalidates source
 /// authority before it transmits. The successor can become known during that
-/// wait, so the call starts while the local view already names it. Comparing
-/// later views with the one seen when the call began would then never notice
-/// the change, and the call would consume the caller's whole deadline.
+/// wait, so the call would start while the local view already names it.
+/// Comparing later views with the one seen when the call began would never
+/// notice the change: a call to a black-holed lost leader would consume the
+/// caller's whole deadline and end with an unknown outcome.
 #[tokio::test]
-async fn forward_abandons_a_lost_leader_whose_successor_was_known_before_it_began() {
+async fn forward_skips_a_lost_leader_whose_successor_is_known_before_it_transmits() {
     let _timing_permit = crate::acquire_consensus_timing_test_permit().await;
     let cluster = RemoteRotationCluster::start().await;
     let leader = cluster.current_leader();
@@ -1550,12 +1551,13 @@ async fn forward_abandons_a_lost_leader_whose_successor_was_known_before_it_bega
     let follower_store = cluster.stores[follower].clone();
 
     let hold = follower_store.hold_remote_forward_before_authority_for_test();
+    let preflight = finite_remote_forward_preflight();
     let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
     let submission = tokio::spawn({
         let follower_store = follower_store.clone();
         async move {
             follower_store
-                .activate_fenced_transition_capability_before(deadline)
+                .preflight_record_expiry_before(&[preflight], None, deadline)
                 .await
         }
     });
@@ -1594,23 +1596,22 @@ async fn forward_abandons_a_lost_leader_whose_successor_was_known_before_it_bega
     // Only now does the paused forward revalidate authority and transmit.
     let released = tokio::time::Instant::now();
     drop(hold);
-    let result = submission.await.expect("activation task");
-    let abandoned_after = released.elapsed();
+    let result = submission.await.expect("preflight task");
+    let completed_after = released.elapsed();
 
     assert_eq!(
-        1,
+        0,
         blackholed.blackholed_forwards(),
-        "the forward was transmitted to the lost leader once"
+        "nothing is sent to a leader that the local view has already replaced"
     );
     assert!(
-        matches!(result, Err(crate::StoreError::BackendUnavailable(_))),
-        "an abandoned forward reports a possibly transmitted request: {result:?}"
+        result.is_ok(),
+        "the forward completes through the successor: {result:?}"
     );
     assert!(
-        abandoned_after <= super::STALE_LEADER_ROUTE_GRACE + Duration::from_secs(1),
-        "the forward to the lost leader was abandoned {abandoned_after:?} after it began, \
-         not within the {:?} stale-route grace",
-        super::STALE_LEADER_ROUTE_GRACE
+        completed_after <= super::STALE_LEADER_ROUTE_GRACE + Duration::from_secs(1),
+        "the forward completed {completed_after:?} after it was released, not promptly \
+         through the successor"
     );
 
     blackholed.set_blackholed(false);
