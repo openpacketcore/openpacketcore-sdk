@@ -61,7 +61,7 @@ voters need CPU that is never throttled or suspended for that long. The
 derives these bounds from the pinned engine.
 
 The workspace temporarily exact-pins `openpacketcore/openraft` revision
-`5ab83b63bb199651f0b0a58a21acf89e24d77c27`, containing release-0.9 through v0.9.25
+`252ee9589db998b5d80e2a339398892d84c5d5f7`, containing release-0.9 through v0.9.25
 and the fork repairs for bounded apply and joined replication retirement, the
 overlapping follower lease and election timeout, the separate AppendEntries
 deadline, Pre-Vote, and the leader's quorum-acknowledged lease.
