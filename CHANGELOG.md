@@ -108,26 +108,33 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     destination/protocol/SPI key, whatever its lookup mark, as an
     `SaKeySnapshot` of complete `SaRelocationIdentity` values.
     `SaKeySnapshot::lookup_candidates` applies the Linux lookup predicate
-    `(lookup & mask) == value`. Linux reads the key with one `XFRM_MSG_GETSA`
-    dump (`NLM_F_DUMP`) that the kernel filters with `XFRMA_ADDRESS_FILTER`
-    and `XFRMA_PROTO` and the backend narrows to the key on every reply, so
-    the result does not depend on SPI hash-chain order. A dump flagged
-    `NLM_F_DUMP_INTR`, or an `NLMSG_OVERRUN`, is repeated whole on a fresh
-    socket at most four times and then fails with `StateIndeterminate`; no
-    partial dump is returned.
+    `(lookup & mask) == value`. Linux reads the key from an `XFRM_MSG_GETSA`
+    dump (`NLM_F_DUMP`) of every state in the namespace, narrowed to the key on
+    every reply, so the result does not depend on SPI hash-chain order.
+  - Linux ends a state dump with a successful `NLMSG_DONE` after silently
+    dropping a state too large for a dump batch, together with every older
+    state, so the read proves completeness by count: on one socket it reads
+    the SAD state count (`XFRM_MSG_GETSADINFO`), dumps, and reads it again,
+    and it accepts the dump only when it returned as many states as both
+    counts. Receiving the first count with `receive_buffer_len` sets the dump
+    batch size (Linux caps it at about 32 KiB); a larger state makes the read
+    fail closed instead of hiding others. A read whose counts disagree, or
+    whose dump is flagged `NLM_F_DUMP_INTR` or `NLMSG_OVERRUN`, is repeated
+    whole on a fresh socket at most four times and then fails with
+    `StateIndeterminate`; no partial dump is returned.
   - `XfrmBackend::remove_sa_exact(ExactRemoveSaRequest)` sends
     `XFRM_MSG_DELSA` only when that read shows exactly one lookup candidate
     for the expected mark and it equals the expected identity. Otherwise it
     sends nothing and returns `StateIndeterminate` (several candidates, for
     example a marked SA and an unmarked SA at one key), `StateMismatch` (one
     different candidate) or `NotFound`. The namespace actor runs the read and
-    the deletion as one admitted mutation. Excluding other writers at the key
-    remains a caller precondition: XFRM state dumps carry no change sequence.
+    the deletion as one admitted mutation. Excluding other writers remains a
+    caller precondition: XFRM state dumps carry no change sequence.
   - Both methods have defaults, so existing backends stay source compatible;
     `UnsupportedXfrmBackend` returns `UnsupportedPlatform`.
   - `opc-linux-xfrm-sys` adds `NLM_F_DUMP_INTR`, `NLM_F_ROOT`, `NLM_F_MATCH`,
-    `NLM_F_DUMP`, `XFRMA_PROTO`, `XFRMA_ADDRESS_FILTER`, and the
-    `XfrmAddressFilter` layout, each citing its UAPI header.
+    `NLM_F_DUMP`, `XFRM_MSG_NEWSADINFO`, `XFRM_MSG_GETSADINFO`, and
+    `XFRMA_SAD_CNT`, each citing its UAPI header.
 
 - `opc-persist`: add an online audit recipient client and authority-owned
   verification session without exporting signing keys. Verify actual received

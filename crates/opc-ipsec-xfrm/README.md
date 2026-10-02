@@ -1181,14 +1181,12 @@ unmarked SA added later at the same key, and a DELSA can delete it.
 whatever its mark, as a complete `SaRelocationIdentity` each. The key is a
 destination, a protocol (AH, ESP, or IPComp, the protocols Linux looks up by
 SPI), and a nonzero SPI. `SaKeySnapshot::lookup_candidates` applies the lookup
-predicate to the result. The Linux backend sends one `XFRM_MSG_GETSA` dump
-(`NLM_F_DUMP`). The kernel filters it by family and exact destination
-(`XFRMA_ADDRESS_FILTER`) and by protocol (`XFRMA_PROTO`), and the backend
-keeps only the replies whose family, destination bytes, protocol, and SPI
-equal the key, so a kernel that ignored a filter would cost time, not
-correctness. The dump walks the namespace's list of states, not the hash
-chains, so it does not depend on chain order. States are reported newest
-first. That order is not the lookup order.
+predicate to the result. The Linux backend reads the key from an
+`XFRM_MSG_GETSA` dump (`NLM_F_DUMP`) of every state in the namespace and keeps
+only the replies whose family, destination bytes, protocol, and SPI equal the
+key. The dump walks the namespace's list of states, not the hash chains, so it
+does not depend on chain order. States are reported newest first. That order
+is not the lookup order.
 
 `XfrmBackend::remove_sa_exact` takes the expected identity, normally from an
 earlier snapshot or `query_sa_relocation_identity`, reads its key, and sends
@@ -1226,30 +1224,59 @@ async fn remove_owned_marked_sa(
 }
 ```
 
+A successful end of a dump does not prove that it is complete. When one
+state's message does not fit an empty dump batch, `xfrm_dump_sa` returns the
+batch length and drops the `-EMSGSIZE` from `xfrm_state_walk`, and the netlink
+core then ends the dump with a successful `NLMSG_DONE` (`net/xfrm/xfrm_user.c`
+and `netlink_dump` in `net/netlink/af_netlink.c`). That state and every older
+one are silently missing. A state can be that large: `xfrm_user` bounds key
+lengths only by the attribute length, HMAC accepts any key length, and the
+dump reports an authentication key twice, in `XFRMA_ALG_AUTH` and
+`XFRMA_ALG_AUTH_TRUNC`. So the Linux backend proves completeness by count. On
+one socket it reads the SAD state count (`XFRM_MSG_GETSADINFO`, whose
+`XFRMA_SAD_CNT` is `net->xfrm.state_num`), dumps every state, and reads the
+count again. The read is complete only when the dump returned exactly as many
+states as both counts. Every state the dump can return is counted, and every
+counted state is returned unless it is being deleted.
+
+The batch size comes from the receive buffer. A fresh socket's first dump
+batch is `NLMSG_GOODSIZE`, about 3.7 KiB with 4 KiB pages, because the kernel
+sizes batches from the largest buffer previously used to receive on that
+socket. Receiving the first count reply with `receive_buffer_len` therefore
+raises every batch of the dump to that size, up to the kernel's cap of about
+32 KiB. With the default 8 KiB, ordinary states fit with room to spare. A
+state whose dump message is larger than the batch makes every attempt fail
+the count, and the read fails closed with `StateIndeterminate`. A larger
+`receive_buffer_len` admits larger states. A state larger than 32 KiB makes
+every read of the namespace fail closed until it is removed.
+
 Linux releases `xfrm_state_lock` between the batches of a multipart dump. A
 state present at the key for the whole read is always reported; a state added
 to or removed from the key while the read runs may or may not be. Current
 Linux keeps no change sequence for XFRM state dumps and never sets
-`NLM_F_DUMP_INTR` on them, so a concurrent writer cannot be detected. A snapshot therefore equals the key's
-states only while no other writer changes them, and `remove_sa_exact` needs
-the same exclusion across its read and its deletion. Excluding other writers
-at the key is a caller precondition, as for `remove_policy_exact`; kernel
-expiry can still remove a state, which only shrinks the set. On the namespace
-actor the read and the deletion run as one command, so no other operation on
-that actor can run between them, but the actor cannot exclude other
-processes.
+`NLM_F_DUMP_INTR` on them. A snapshot therefore equals the key's states only
+while no other writer changes them, and `remove_sa_exact` needs the same
+exclusion across its read and its deletion. Excluding other writers is a
+caller precondition, as for `remove_policy_exact`. A state added or removed
+anywhere in the namespace during a read usually makes the counts disagree,
+and the read is then repeated. The counts could hide a dropped state only if,
+within one read, the namespace both gained a state before the dump started
+and lost one the dump had already returned. With other writers excluded,
+only a kernel ACQUIRE state together with a lifetime expiry could do that.
+On the namespace actor the read and the deletion run as one command, so no
+other operation on that actor can run between them, but the actor cannot
+exclude other processes.
 
-The read never reports a partial dump as complete. A dump flagged with
-`NLM_F_DUMP_INTR`, or an `NLMSG_OVERRUN`, is discarded and repeated whole on a
-fresh socket and sequence, at most four times, and then fails with
-`StateIndeterminate`. A receive failure, an oversized datagram
+The read never reports a partial dump as complete. A read whose dump is
+flagged with `NLM_F_DUMP_INTR` or `NLMSG_OVERRUN`, or whose counts disagree,
+is repeated whole on a fresh socket and sequence, at most four times, and
+then fails with `StateIndeterminate`. A receive failure, an oversized datagram
 (`ResponseTooLarge`), a malformed or foreign message, an error status, or a
 missing `NLMSG_DONE` fails the read. A state at the key that the SDK cannot
 represent, such as one with a nonzero NAT-T original address, also fails the
-read rather than being left out; states at other keys are skipped without
-being decoded. Each read makes the kernel walk every state in the namespace,
-and the destination filter passes every state at the key's destination; for
-an inbound SA that is usually every inbound SA on the local address. Like
+read rather than being left out; states at other keys are counted but not
+decoded. Each read makes the kernel serialize every state in the namespace,
+so its cost grows with the namespace's SA count, not with the key. Like
 GETSA, the dump carries the key material of every state it reports. The
 backend reads it only into its zeroizing receive buffer and keeps none of it.
 
