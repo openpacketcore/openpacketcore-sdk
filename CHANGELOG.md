@@ -18,9 +18,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   is now bounded by the replica's own leader view: once its engine names a
   different leader, a call still unanswered after one 200 ms heartbeat interval
   is abandoned and reported as possibly transmitted, so callers retry only the
-  same request identity or report an unknown outcome. A regression that
-  black-holes one follower's route to the leader now commits its write in
-  about 6.5 seconds instead of ending ambiguous after 10 seconds. Refs #1037.
+  same request identity or report an unknown outcome. The view is judged
+  against the leader it named when the route was chosen, so a successor learned
+  while the caller still revalidated its authority counts, and a call whose
+  route was already replaced before it was sent goes to the successor without
+  being sent to the lost leader. A regression that black-holes one follower's
+  route to the leader now commits its write in about 6.5 seconds instead of
+  ending ambiguous after 10 seconds; one that elects the successor between
+  route selection and transmission sends nothing to the lost leader, where the
+  call used to wait 24 seconds for its deadline. Refs #1037.
 
 - `opc-consensus`: an unplanned leader loss no longer stalls an in-flight
   write past the 10-second operation timeout. The pinned engine used to start a
@@ -62,26 +68,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   be upgraded or rolled back one at a time; see the next entry. Refs #1037.
 
 - `opc-session-net`, `opc-consensus`, `opc-session-store`, `opc-persist`: a
-  rolling upgrade from a release without Pre-Vote, or its rollback, no longer
-  risks a cluster that elects no leader. Previously a voter of this release
-  sent Pre-Vote to previous-release voters, which cannot decode it and drop the
-  connection. When the lost leader's survivors needed such a voter and its log
-  was behind, no voter could win: a three-process fleet mixing both releases
-  stayed leaderless for 60 seconds. Each consensus connection now negotiates
-  Pre-Vote through TLS ALPN, `opc-session-consensus/3` ahead of
-  `opc-session-consensus/2`, and a voter of this release counts a
-  previous-release voter as rejecting the Pre-Vote without sending it.
-  `ConsensusPeer::call_pre_vote` carries this. Its default reports the voter
-  unable to answer, so a transport that cannot tell which release its peer
-  runs never sends Pre-Vote to it. In-process peers forward with
-  `forward_pre_vote`. The consumed Openraft fork adds the matching engine rule:
-  a voter that rejects a candidate for its stale log campaigns without Pre-Vote,
-  in a higher term, one election timeout later unless a leader appears. While
-  a previous-release voter is needed for a majority, a leader loss is resolved
-  within 30 seconds, as with the previous release. Three- and five-process
-  regressions, using the previous release's node binary, roll a fleet forward
-  and back under fenced writes and kill the leader on both releases: every
-  write applies exactly once. Refs #1037.
+  rolling upgrade from a release without Pre-Vote, or its rollback, and a
+  transport that does not implement Pre-Vote no longer risk a cluster that
+  elects no leader. A previous-release voter cannot decode a Pre-Vote request,
+  and a voter of this release that sent one dropped the connection; when the
+  lost leader's survivors needed such a voter and its log was behind, a
+  three-process fleet mixing both releases stayed leaderless for 60 seconds.
+  Pre-Vote is now used only while every voter that can be reached is
+  positively known to answer it. Each consensus connection negotiates Pre-Vote
+  through TLS ALPN, `opc-session-consensus/3` ahead of
+  `opc-session-consensus/2`, and `ConsensusPeer::call_pre_vote` forwards the
+  request only to a voter that negotiated it; in-process peers forward with
+  `forward_pre_vote`. For any other voter it sends nothing and reports the
+  voter unable to answer, and the engine runs the classic election for that
+  campaign. Its default does so for every voter, so a transport that does not
+  implement it keeps automatic failover with the classic election: a
+  three-voter regression over such a transport elects a successor in about
+  6 seconds, where counting those voters as rejecting left the survivors
+  leaderless. While a previous-release voter is a member, a leader loss is
+  resolved within 30 seconds, as with the previous release. Three- and
+  five-process regressions, using the previous release's node binary, roll a
+  fleet forward and back under fenced writes and kill the leader on both
+  releases: every write applies exactly once. Refs #1037.
 
 - `opc-session-net`: a prepared compare-and-set or lease acquire whose
   current voter answers with a complete `Rejected(Unavailable)` now moves the
@@ -118,9 +126,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   have its own deadline, an optional Pre-Vote round keeps a voter that cannot
   win from raising its term, and a leader rejects other candidates while a
   quorum acknowledges it. Configuration validation requires the minimum
-  election timeout to outlast the heartbeat tick. A voter that rejects a
-  candidate for its stale log campaigns above it one election timeout later,
-  so voters that cannot answer Pre-Vote never block an election. Refs #1037.
+  election timeout to outlast the heartbeat tick. A voter that is not known to
+  answer Pre-Vote makes the campaign run the classic election, so such voters
+  never block an election. Pre-Vote rounds carry an identifier, so a delayed
+  grant can no longer reach a later round, where a grant from a voter removed
+  in between stopped the Raft core. A round that a running lease rejects is
+  retried after the width of the election-timeout window instead of a whole
+  sampled election timeout, which could delay the first successful election
+  past the maximum election timeout. A closed replication stream gives up an
+  in-flight AppendEntries at once, so a learner that never answers no longer
+  delays the answer to the vote that deposes its leader. Refs #1037.
 
 - Shared Openraft dependency: consume the exact 0.9.25 fork revision
   `72e327a4f25cbbe3a3695d8c3c0f0970ccb925d5`, including bounded apply dispatch,

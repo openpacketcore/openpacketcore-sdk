@@ -164,7 +164,9 @@ A planned shutdown transfers leadership before the leader stops. After an
 unplanned loss (a crash, a node failure, or a partition), the surviving
 voters elect a replacement on their own timers. A surviving voter campaigns
 once the longer of its leader lease (the 5-second minimum election timeout) and
-its sampled election timeout has passed since it last heard from the leader:
+its sampled election timeout has passed since it last heard from the leader.
+If another survivor's lease still runs, its Pre-Vote round is rejected and
+retried 1.5 seconds later; every lease runs out within 5 seconds of the loss:
 
 - the first successful campaign starts within 6,800 ms of the loss;
 - a write in flight at the loss reaches its outcome within the documented
@@ -172,7 +174,8 @@ its sampled election timeout has passed since it last heard from the leader:
   its own exact request identity after an ambiguous or unavailable attempt;
 - a session-store write or read that a black-holed lost leader holds is moved
   to the successor within 200 ms after the forwarding replica observes it,
-  instead of at the caller's deadline.
+  instead of at the caller's deadline; one that has not been sent when the
+  replica already knows the successor goes to the successor directly.
 
 These bounds assume a reachable majority whose processes are not suspended or
 throttled and whose RPCs complete within one heartbeat interval. A split vote
@@ -208,27 +211,30 @@ its protocol revision through TLS ALPN. A voter of this release offers
 `opc-session-consensus/3`, which carries Pre-Vote, ahead of
 `opc-session-consensus/2`, which the previous release speaks. A connection to
 or from a previous-release voter therefore negotiates the previous revision. A
-voter of this release never sends that voter a Pre-Vote it could not decode,
-and counts it as rejecting the Pre-Vote.
+voter of this release never sends that voter a Pre-Vote it could not decode.
+Such a voter can still grant a vote, so whenever a voter of this release can
+reach one, it runs the classic election for that campaign instead of Pre-Vote.
 
-While a previous-release voter is needed for a majority, a leader loss is
-resolved by that release's rules:
+While a previous-release voter is a member, a leader loss is therefore
+resolved with the classic vote, as with the previous release:
 
 - a previous-release voter grants a vote only after its 8-second leader lease,
   and first campaigns within 19 seconds of its last leader contact: its lease,
   its sampled election timeout below 8 seconds, and a 3-second tick;
-- a voter of this release does not campaign before it in that window. If the
-  previous-release candidate's log is behind, a voter of this release that
-  rejects it campaigns one of its own election timeouts later, without Pre-Vote
-  and in a higher term;
+- a voter of this release first campaigns within 6.8 seconds of its last
+  leader contact, plus at most one 1.5-second connection that tells it a voter
+  cannot answer Pre-Vote. If a previous-release lease rejects it, it campaigns
+  again within 6.8 seconds, after every such lease has run out;
 - a successor is elected within 30 seconds of the loss, as with the previous
   release, including one round in which two previous-release voters split the
   vote.
 
-A write in flight at such a loss outlasts one 10-second operation and ends
-ambiguous at least once. The caller retries only its own exact request
-identity, and the write still applies exactly once. Once this release's voters
-alone form a majority, the bounds of section 2.4 apply again.
+During the roll, a voter of this release that is cut off can raise its term
+and depose a healthy leader when it returns, as a previous-release voter can.
+A write in flight at such a loss can outlast one 10-second operation and end
+ambiguous. The caller retries only its own exact request identity, and the
+write still applies exactly once. Once every voter runs this release, Pre-Vote
+and the bounds of section 2.4 apply again.
 
 ## 3. Normal write and response-loss handling
 

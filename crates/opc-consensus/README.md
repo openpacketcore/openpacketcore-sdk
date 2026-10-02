@@ -106,7 +106,12 @@ rules:
   timeout has passed since its last leader contact, never their sum; every
   sampled timeout covers the lease, so campaigns stay randomized;
 - before it raises its term, a voter asks the others in a Pre-Vote round
-  whether they would grant it a vote, and campaigns only if a quorum would;
+  whether they would grant it a vote, and campaigns only if a quorum would; a
+  round that a running lease rejects is retried after the width of the
+  election-timeout window, 1,500 ms, on a later tick;
+- Pre-Vote is used only while every voter that can be reached is positively
+  known to answer it; otherwise that campaign runs the classic election (see
+  [Voters of a release without Pre-Vote](#voters-of-a-release-without-pre-vote));
 - the engine checks election timers, and sends idle heartbeats, only on a tick
   of `heartbeat * 3 / 2` (300 ms).
 
@@ -118,9 +123,14 @@ loss:
 | `leader_loss_first_campaign_bound` | `election_timeout_max + tick` | 6,800 ms |
 | `unplanned_leader_loss_write_stall` | first campaign `+ 6 * heartbeat + grace + cold connect` | 9,700 ms |
 
-The survivor that heard from the leader last is the last to campaign; by then
-every other survivor's lease has expired, so its Pre-Vote and vote are
-granted. The write stall adds six round trips, each answered within one
+Every survivor's lease runs out within `election_timeout_min` of the loss. The
+survivor with the most up-to-date log starts its first Pre-Vote round within
+`election_timeout_max` and a tick of its last leader contact. If a survivor
+that heard from the leader later still holds a running lease, that round is
+rejected, and it is retried within the 1,500 ms window and a tick. So the first
+round that no lease rejects starts within `election_timeout_min`, the window
+and a tick of the loss, which is `election_timeout_max + tick`, and that round
+and its vote are granted. The write stall adds six round trips, each answered within one
 heartbeat interval (Pre-Vote, vote, the successor's first commit, the forwarded
 write, the successor's linearizable admission round and the write's own
 commit), the one-heartbeat stale-route grace below, and one new connection to
@@ -173,24 +183,40 @@ identity.
 #### Voters of a release without Pre-Vote
 
 A rolling upgrade, or its rollback, mixes voters of this release with voters
-of the previous release, which cannot decode a Pre-Vote request. The port's
-`ConsensusPeer::call_pre_vote` keeps them interoperable: a transport that
-knows its peer's release forwards the request to a voter of this release and
-reports any other voter as unable to answer, sending nothing. The session
-transport learns this per connection through TLS ALPN: it offers
-`opc-session-consensus/3`, which carries Pre-Vote, ahead of
-`opc-session-consensus/2`. The default implementation reports every voter as
-unable to answer, so a transport that cannot tell never sends Pre-Vote.
+of the previous release, which cannot decode a Pre-Vote request. Such a voter
+can grant a vote but never a Pre-Vote, so Pre-Vote is used only while every
+voter that can be reached is positively known to answer it.
 
-The Raft adapters count a voter that cannot answer as rejecting the Pre-Vote.
-While such voters are needed for a majority, they lead the election with the
-classic vote, by the previous release's timing: a lease of 8,000 ms, and a first
-campaign within 19,000 ms of their last leader contact. When their logs are
-behind, a voter of this release that rejects such a candidate campaigns
-without Pre-Vote, in a higher term, one of its own election timeouts later.
-A successor is elected within 30,000 ms of the loss. That includes one round
-in which two previous-release voters split the vote. Once voters of this
-release alone form a majority, the bounds above apply.
+The port's `ConsensusPeer::call_pre_vote` forwards the request only to a voter
+that is: the session transport learns this per connection through TLS ALPN,
+offering `opc-session-consensus/3`, which carries Pre-Vote, ahead of
+`opc-session-consensus/2`, and an in-process peer forwards with
+`forward_pre_vote`. For any other voter it sends nothing and reports the voter
+as unable to answer. The default implementation does so for every voter, so a
+transport that does not implement the method keeps automatic failover with the
+classic election.
+
+The Raft adapters pass that report to the engine, which then runs the classic
+election for that campaign instead of a Pre-Vote round that could never reach
+a quorum without the voter. A voter that cannot be reached at all neither
+grants nor forces the classic election: it can answer neither request. Each
+campaign decides again, so once every voter runs this release, Pre-Vote and
+the bounds above apply again.
+
+While a previous-release voter is a member, a voter set therefore elects with
+the classic vote, as the previous release does, and a voter of this release
+that is cut off can raise its term, as every previous-release voter can. An
+unplanned leader loss elects a successor within 30,000 ms:
+
+- when only previous-release voters can win, they campaign by the previous
+  release's timing: a lease of 8,000 ms, a first campaign within 19,000 ms of
+  their last leader contact, and one more election timeout and tick, at most
+  11,000 ms, after a split vote;
+- when a voter of this release can win, it first campaigns within 6,800 ms of
+  its last leader contact, after at most one 1,500 ms connection that tells it
+  a voter cannot answer Pre-Vote. If a previous-release lease rejects that
+  campaign, it campaigns again within 6,800 ms, after every such lease has run
+  out, so it is elected within 15,100 ms.
 
 ## Interim source-build gate
 
@@ -206,8 +232,13 @@ The candidate also includes bounded apply dispatch, joined replication task
 retirement, obsolete campaign cleanup and cancellable pacing of append retries
 that acknowledge no progress. A follower campaigns after the longer of its
 leader lease and its sampled election timeout, AppendEntries has its own
-deadline, an optional Pre-Vote round keeps a voter that cannot win from raising
-its term, and a leader rejects other candidates while a quorum acknowledges it.
+deadline, a closed replication stream gives up an in-flight AppendEntries at
+once, an optional Pre-Vote round keeps a voter that cannot win from raising its
+term, and a leader rejects other candidates while a quorum acknowledges it.
+Pre-Vote rounds
+carry an identifier, a round that a running lease rejects is retried after the
+width of the election-timeout window, and a voter that is not known to answer
+Pre-Vote makes the campaign run the classic election.
 Bounded apply is opt-in; this dependency update does not select a new SDK
 runtime limit. The pin is by `rev`, never a branch or tag.
 The frozen HA profiles retain their original revision and evidence; they do

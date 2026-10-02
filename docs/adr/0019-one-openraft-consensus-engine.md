@@ -112,13 +112,17 @@ The failover update advances the candidate to `71f7ff7ed2a0a1783362264d597926a24
 follower now campaigns after the longer of its leader lease and its sampled
 election timeout instead of their sum, and the lease is the minimum election
 timeout. AppendEntries has its own configurable deadline, separate from the
-heartbeat interval. An optional Pre-Vote round keeps a voter that cannot win
+heartbeat interval, and a closed replication stream gives up an in-flight
+AppendEntries at once. An optional Pre-Vote round keeps a voter that cannot win
 from raising its term, and a leader rejects other candidates while a quorum
-acknowledges it. Configuration validation requires the minimum election
-timeout to outlast the engine tick on which a leader sends heartbeats. A voter
-that rejects a candidate for its stale log campaigns without Pre-Vote, in a
-higher term, one election timeout later unless a leader appears, so voters
-that cannot answer Pre-Vote never block an election. These engine rules replace
+acknowledges it. Pre-Vote rounds carry an identifier, and a round that a
+running lease rejects is retried after the width of the election-timeout
+window. Pre-Vote is used only while every voter that can be reached is
+positively known to answer it; a voter that is not, such as a voter of a
+release without Pre-Vote, makes the campaign run the classic election, so such
+voters never block an election. Configuration validation requires the minimum
+election timeout to outlast the engine tick on which a leader sends
+heartbeats. These engine rules replace
 no SDK election, vote or quorum logic. Frozen
 qualification profiles retain their original revisions, and dependency tests
 do not establish SDK qualification.
