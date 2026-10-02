@@ -25,7 +25,8 @@ use crate::backend::{
 };
 use crate::consensus::{
     SessionConsensusNodeId, SessionConsensusPeer, SessionConsensusPeerError,
-    SessionConsensusRpcHandler, SessionConsensusWireRequest, SessionConsensusWireResponse,
+    SessionConsensusRpcFamily, SessionConsensusRpcHandler, SessionConsensusWireRequest,
+    SessionConsensusWireResponse,
 };
 use crate::fenced_transition::{
     AtomicFencedTransitionCapability, FencedTransitionLease, FencedTransitionMutation,
@@ -823,7 +824,7 @@ struct RemoteRotationPeer {
     handler: Arc<tokio::sync::RwLock<Option<Arc<dyn SessionConsensusRpcHandler>>>>,
     enabled: Arc<AtomicBool>,
     blackholed: Arc<AtomicBool>,
-    blackholed_calls: Arc<AtomicUsize>,
+    blackholed_forwards: Arc<AtomicUsize>,
 }
 
 impl RemoteRotationPeer {
@@ -833,7 +834,7 @@ impl RemoteRotationPeer {
             handler: Arc::new(tokio::sync::RwLock::new(None)),
             enabled: Arc::new(AtomicBool::new(true)),
             blackholed: Arc::new(AtomicBool::new(false)),
-            blackholed_calls: Arc::new(AtomicUsize::new(0)),
+            blackholed_forwards: Arc::new(AtomicUsize::new(0)),
         }
     }
 
@@ -843,8 +844,9 @@ impl RemoteRotationPeer {
         self.blackholed.store(blackholed, Ordering::SeqCst);
     }
 
-    fn blackholed_calls(&self) -> usize {
-        self.blackholed_calls.load(Ordering::SeqCst)
+    /// Forwarded mutations this path accepted while black-holed.
+    fn blackholed_forwards(&self) -> usize {
+        self.blackholed_forwards.load(Ordering::SeqCst)
     }
 
     async fn install(&self, handler: Arc<dyn SessionConsensusRpcHandler>) {
@@ -884,7 +886,9 @@ impl SessionConsensusPeer for RemoteRotationPeer {
             return Err(SessionConsensusPeerError::Unavailable);
         }
         if self.blackholed.load(Ordering::SeqCst) {
-            self.blackholed_calls.fetch_add(1, Ordering::SeqCst);
+            if request.family == SessionConsensusRpcFamily::ForwardMutation {
+                self.blackholed_forwards.fetch_add(1, Ordering::SeqCst);
+            }
             return std::future::pending().await;
         }
         let handler = self
@@ -1595,8 +1599,8 @@ async fn forward_abandons_a_lost_leader_whose_successor_was_known_before_it_bega
 
     assert_eq!(
         1,
-        blackholed.blackholed_calls(),
-        "the forward was transmitted to the lost leader"
+        blackholed.blackholed_forwards(),
+        "the forward was transmitted to the lost leader once"
     );
     assert!(
         matches!(result, Err(crate::StoreError::BackendUnavailable(_))),
