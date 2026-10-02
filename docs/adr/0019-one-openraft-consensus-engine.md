@@ -108,15 +108,18 @@ profiles retain their original versions and revisions; the current manifest,
 lock and metadata checks bind this candidate separately. Dependency tests do
 not establish SDK qualification.
 
-The failover update advances the candidate to `252ee9589db998b5d80e2a339398892d84c5d5f7`. A
+The failover update advances the candidate to `38c6524a405a55e2d6808b136329ff62ba4e492d`. A
 follower now campaigns after the longer of its leader lease and its sampled
 election timeout instead of their sum, and the lease is the minimum election
 timeout. AppendEntries has its own configurable deadline, separate from the
 heartbeat interval. An optional Pre-Vote round keeps a voter that cannot win
 from raising its term, and a leader rejects other candidates while a quorum
 acknowledges it. Configuration validation requires the minimum election
-timeout to outlast the engine tick on which a leader sends heartbeats. These
-engine rules replace no SDK election, vote or quorum logic. Frozen
+timeout to outlast the engine tick on which a leader sends heartbeats. A voter
+that rejects a candidate for its stale log campaigns without Pre-Vote, in a
+higher term, one election timeout later unless a leader appears, so voters
+that cannot answer Pre-Vote never block an election. These engine rules replace
+no SDK election, vote or quorum logic. Frozen
 qualification profiles retain their original revisions, and dependency tests
 do not establish SDK qualification.
 

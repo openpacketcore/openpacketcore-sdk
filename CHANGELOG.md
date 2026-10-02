@@ -90,13 +90,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   rebuilt; the map ABI is unchanged. Fixes #1030.
 
 - Shared Openraft dependency: consume the 0.9.25 fork revision
-  `252ee9589db998b5d80e2a339398892d84c5d5f7`. A follower now campaigns after
+  `38c6524a405a55e2d6808b136329ff62ba4e492d`. A follower now campaigns after
   the longer of its leader lease and its sampled election timeout instead of
   their sum, and the lease is the minimum election timeout. AppendEntries can
   have its own deadline, an optional Pre-Vote round keeps a voter that cannot
   win from raising its term, and a leader rejects other candidates while a
   quorum acknowledges it. Configuration validation requires the minimum
-  election timeout to outlast the heartbeat tick. Refs #1037.
+  election timeout to outlast the heartbeat tick. A voter that rejects a
+  candidate for its stale log campaigns above it one election timeout later,
+  so voters that cannot answer Pre-Vote never block an election. Refs #1037.
 
 - Shared Openraft dependency: consume the exact 0.9.25 fork revision
   `72e327a4f25cbbe3a3695d8c3c0f0970ccb925d5`, including bounded apply dispatch,

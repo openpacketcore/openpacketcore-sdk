@@ -174,7 +174,7 @@ signal; these helpers are scheduling and gating, not a parallel authority.
 
 Issue #143 remains open and the HA profile remains experimental. The workspace
 pins `https://github.com/openpacketcore/openraft` at the full verified revision
-`252ee9589db998b5d80e2a339398892d84c5d5f7` (0.9.25 plus fork fixes). It retains the
+`38c6524a405a55e2d6808b136329ff62ba4e492d` (0.9.25 plus fork fixes). It retains the
 per-campaign election-timeout fix and preserves a recovering snapshot target's
 required log suffix through successful handoff, while failed targets release
 their ownership before retrying. When a higher vote ends leadership, the core
