@@ -7,6 +7,9 @@ mod stepdown;
 #[path = "consensus_openraft/planned_shutdown.rs"]
 mod planned_shutdown;
 
+#[path = "consensus_openraft/stale_leader_route.rs"]
+mod stale_leader_route;
+
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 use std::path::{Path, PathBuf};
