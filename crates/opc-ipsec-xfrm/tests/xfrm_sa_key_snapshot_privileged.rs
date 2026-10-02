@@ -13,9 +13,14 @@
 //!   the only candidate for its own lookup mark;
 //! - an unmarked SA refuses a later marked install at its key;
 //! - the key read stays exact when several hundred other states at the same
-//!   destination make the kernel split the dump into many multipart batches.
+//!   destination make the kernel split the dump into many multipart batches;
+//! - a state whose dump message does not fit an empty dump batch never makes
+//!   the read a false complete. Linux ends such a dump with a successful
+//!   `NLMSG_DONE`, silently dropping that state and every older one, so the
+//!   read must either still be complete or fail with `StateIndeterminate`.
 //!
-//! The test prints `SA_KEY_SNAPSHOT_PROOF_OK` only after every assertion.
+//! The test prints `SA_KEY_SNAPSHOT_TRUNCATION_PROOF_OK` and
+//! `SA_KEY_SNAPSHOT_PROOF_OK` only after every assertion.
 
 #![cfg(target_os = "linux")]
 
@@ -23,9 +28,9 @@ use std::env;
 
 use opc_ipsec_xfrm::{
     Algorithm, AuthAlgorithm, ExactRemoveSaRequest, InstallSaRequest, IpAddress, KeyMaterial,
-    LifetimeConfig, LinuxXfrmBackend, QuerySaRequest, RemoveSaRequest, SaKeySnapshot, SaLookupKey,
-    SaParameters, SaRelocationIdentity, XfrmBackend, XfrmError, XfrmId, XfrmLookupMark, XfrmMode,
-    XfrmRequestId, XfrmSelector,
+    LifetimeConfig, LinuxXfrmBackend, LinuxXfrmBackendConfig, QuerySaRequest, RemoveSaRequest,
+    SaKeySnapshot, SaLookupKey, SaParameters, SaRelocationIdentity, XfrmBackend, XfrmError, XfrmId,
+    XfrmLookupMark, XfrmMode, XfrmRequestId, XfrmSelector,
 };
 
 const IPPROTO_ESP: u8 = 50;
@@ -38,6 +43,22 @@ const FILLER_SPI_BASE: u32 = 0x5151_0000;
 const FILLER_STATES: u32 = 384;
 const MARK: u32 = 0x42;
 const DISJOINT_MARK: u32 = 0x43;
+const TRUNCATION_TARGET_SPI: u32 = 0x5152_0001;
+const TRUNCATION_OVERLAP_SPI: u32 = 0x5152_0002;
+const TRUNCATION_KEY_SPI: u32 = 0x5152_0003;
+const LARGE_STATE_SPI_BASE: u32 = 0x5153_0000;
+/// An HMAC key this long makes a dumped state about 4.6 KiB, because Linux
+/// reports the key in both `XFRMA_ALG_AUTH` and `XFRMA_ALG_AUTH_TRUNC`. That
+/// exceeds the first dump batch of a fresh socket (`NLMSG_GOODSIZE`, about
+/// 3.7 KiB with 4 KiB pages) but fits the 8 KiB batch that the default
+/// receive buffer requests.
+const LARGE_KEY_BYTES: usize = 2048;
+/// About 12.6 KiB per dumped state: above the default 8 KiB batch, below the
+/// kernel's 32 KiB dump-batch cap.
+const BATCH_EXCEEDING_KEY_BYTES: usize = 6144;
+/// About 33 KiB per dumped state: above the 32 KiB cap, so no dump batch
+/// can hold it.
+const UNDUMPABLE_KEY_BYTES: usize = 16384;
 
 fn ipv4(octets: [u8; 4]) -> IpAddress {
     IpAddress::Ipv4(octets)
@@ -79,6 +100,17 @@ fn unmarked(spi: u32) -> SaParameters {
     sa(spi, None, 2)
 }
 
+/// A valid unmarked ESP SA with an HMAC key of `key_bytes` bytes; HMAC
+/// accepts any key length.
+fn large_key_sa(spi: u32, key_bytes: usize) -> SaParameters {
+    let mut parameters = sa(spi, None, 4);
+    parameters.auth = Some((
+        AuthAlgorithm::hmac_sha256(128),
+        KeyMaterial::new(vec![0x5a; key_bytes]),
+    ));
+    parameters
+}
+
 fn key(spi: u32) -> SaLookupKey {
     SaLookupKey::new(ipv4([192, 0, 2, 51]), IPPROTO_ESP, spi)
 }
@@ -112,6 +144,50 @@ async fn snapshot(backend: &impl XfrmBackend, spi: u32) -> Result<SaKeySnapshot,
 
 fn marks(snapshot: &SaKeySnapshot) -> Vec<Option<XfrmLookupMark>> {
     snapshot.states().iter().map(|state| state.mark).collect()
+}
+
+fn read_failed_closed(read: &Result<SaKeySnapshot, XfrmError>) -> bool {
+    matches!(
+        read,
+        Err(XfrmError::StateIndeterminate {
+            operation: "query_sa_key_snapshot"
+        })
+    )
+}
+
+fn read_is_exactly(
+    read: &Result<SaKeySnapshot, XfrmError>,
+    expected: &[SaRelocationIdentity],
+) -> bool {
+    read.as_ref()
+        .is_ok_and(|snapshot| snapshot.states() == expected)
+}
+
+/// Render a read for the proof log without addresses or keys.
+fn describe(read: &Result<SaKeySnapshot, XfrmError>) -> String {
+    match read {
+        Ok(snapshot) => format!("complete with {} state(s)", snapshot.len()),
+        Err(error) => format!("error: {error}"),
+    }
+}
+
+async fn remove_unmarked(backend: &impl XfrmBackend, spi: u32) -> Result<(), XfrmError> {
+    backend
+        .remove_sa(RemoveSaRequest::new(
+            ipv4([192, 0, 2, 51]),
+            IPPROTO_ESP,
+            spi,
+        ))
+        .await
+}
+
+async fn remove_marked(backend: &impl XfrmBackend, spi: u32) -> Result<(), XfrmError> {
+    backend
+        .remove_sa(
+            RemoveSaRequest::new(ipv4([192, 0, 2, 51]), IPPROTO_ESP, spi)
+                .with_mark(XfrmLookupMark::full(MARK)),
+        )
+        .await
 }
 
 fn refused_as_ambiguous(result: Result<(), XfrmError>) -> bool {
@@ -282,6 +358,160 @@ async fn key_snapshot_proves_overlapping_lookup_candidates_on_the_kernel(
         backend.remove_sa(removal).await?;
     }
     assert!(snapshot(&backend, FILLER_SPI_BASE).await?.is_empty());
+
+    // Oversized states. Each case records its outcome so that one run shows
+    // every case; the assertion follows after the namespace is clean again.
+    let mut failures = Vec::new();
+
+    // 1. A newer large-key state at the target's destination and protocol,
+    // but another SPI, is the first state the dump reaches.
+    let target_sa = marked(TRUNCATION_TARGET_SPI);
+    install(&backend, &target_sa).await?;
+    let target = lookup(&backend, TRUNCATION_TARGET_SPI, target_sa.mark).await?;
+    install(
+        &backend,
+        &large_key_sa(LARGE_STATE_SPI_BASE, LARGE_KEY_BYTES),
+    )
+    .await?;
+    let read = snapshot(&backend, TRUNCATION_TARGET_SPI).await;
+    println!("large state before an ordinary target: {}", describe(&read));
+    if !read_is_exactly(&read, std::slice::from_ref(&target)) {
+        failures.push(format!(
+            "ordinary target behind a large state: {}",
+            describe(&read)
+        ));
+    }
+    let removal = backend
+        .remove_sa_exact(ExactRemoveSaRequest::new(target.clone()))
+        .await;
+    println!("exact removal of that target: {removal:?}");
+    if removal.is_err() {
+        failures.push(format!("exact removal behind a large state: {removal:?}"));
+        let _ = remove_marked(&backend, TRUNCATION_TARGET_SPI).await;
+    }
+    remove_unmarked(&backend, LARGE_STATE_SPI_BASE).await?;
+
+    // 2. The same large state in front of an overlapping pair.
+    let overlap_marked = marked(TRUNCATION_OVERLAP_SPI);
+    let overlap_unmarked = unmarked(TRUNCATION_OVERLAP_SPI);
+    install(&backend, &overlap_marked).await?;
+    let overlap_marked_identity =
+        lookup(&backend, TRUNCATION_OVERLAP_SPI, overlap_marked.mark).await?;
+    install(&backend, &overlap_unmarked).await?;
+    let overlap_unmarked_identity = lookup(&backend, TRUNCATION_OVERLAP_SPI, None).await?;
+    install(
+        &backend,
+        &large_key_sa(LARGE_STATE_SPI_BASE + 1, LARGE_KEY_BYTES),
+    )
+    .await?;
+    let read = snapshot(&backend, TRUNCATION_OVERLAP_SPI).await;
+    println!(
+        "large state before an overlapping pair: {}",
+        describe(&read)
+    );
+    if !read_is_exactly(
+        &read,
+        &[
+            overlap_unmarked_identity.clone(),
+            overlap_marked_identity.clone(),
+        ],
+    ) {
+        failures.push(format!(
+            "overlapping pair behind a large state: {}",
+            describe(&read)
+        ));
+    }
+    let removal = backend
+        .remove_sa_exact(ExactRemoveSaRequest::new(overlap_marked_identity))
+        .await;
+    println!("exact removal of the marked state of that pair: {removal:?}");
+    if !refused_as_ambiguous(removal.clone()) {
+        failures.push(format!(
+            "exact removal of an ambiguous candidate behind a large state: {removal:?}"
+        ));
+    }
+    let _ = remove_unmarked(&backend, TRUNCATION_OVERLAP_SPI).await;
+    let _ = remove_marked(&backend, TRUNCATION_OVERLAP_SPI).await;
+    remove_unmarked(&backend, LARGE_STATE_SPI_BASE + 1).await?;
+
+    // 3. A state larger than the default 8 KiB batch, but within the 32 KiB
+    // cap: the default backend must fail closed, while a backend whose
+    // receive buffer requests 32 KiB batches reads the key completely.
+    let key_sa = marked(TRUNCATION_KEY_SPI);
+    install(&backend, &key_sa).await?;
+    let key_identity = lookup(&backend, TRUNCATION_KEY_SPI, key_sa.mark).await?;
+    install(
+        &backend,
+        &large_key_sa(LARGE_STATE_SPI_BASE + 2, BATCH_EXCEEDING_KEY_BYTES),
+    )
+    .await?;
+    let read = snapshot(&backend, TRUNCATION_KEY_SPI).await;
+    println!("12.6 KiB state, 8 KiB batches: {}", describe(&read));
+    if !read_failed_closed(&read) {
+        failures.push(format!(
+            "state above the default batch: {}",
+            describe(&read)
+        ));
+    }
+    let wide = LinuxXfrmBackend::with_config(LinuxXfrmBackendConfig {
+        receive_buffer_len: 32 * 1024,
+        ..LinuxXfrmBackendConfig::default()
+    })
+    .bind_current_network_namespace()?;
+    let read = snapshot(&wide, TRUNCATION_KEY_SPI).await;
+    println!("12.6 KiB state, 32 KiB batches: {}", describe(&read));
+    if !read_is_exactly(&read, std::slice::from_ref(&key_identity)) {
+        failures.push(format!("state within 32 KiB batches: {}", describe(&read)));
+    }
+    remove_unmarked(&backend, LARGE_STATE_SPI_BASE + 2).await?;
+
+    // 4. A state no dump batch can hold: every read fails closed.
+    install(
+        &backend,
+        &large_key_sa(LARGE_STATE_SPI_BASE + 3, UNDUMPABLE_KEY_BYTES),
+    )
+    .await?;
+    for (label, read) in [
+        ("8 KiB", snapshot(&backend, TRUNCATION_KEY_SPI).await),
+        ("32 KiB", snapshot(&wide, TRUNCATION_KEY_SPI).await),
+    ] {
+        println!("33 KiB state, {label} batches: {}", describe(&read));
+        if !read_failed_closed(&read) {
+            failures.push(format!(
+                "undumpable state, {label} batches: {}",
+                describe(&read)
+            ));
+        }
+    }
+    let removal = backend
+        .remove_sa_exact(ExactRemoveSaRequest::new(key_identity))
+        .await;
+    println!("exact removal behind an undumpable state: {removal:?}");
+    if !matches!(
+        removal,
+        Err(XfrmError::StateIndeterminate {
+            operation: "remove_sa_exact_preflight"
+        })
+    ) {
+        failures.push(format!(
+            "exact removal behind an undumpable state: {removal:?}"
+        ));
+    }
+    remove_unmarked(&backend, LARGE_STATE_SPI_BASE + 3).await?;
+    let _ = remove_marked(&backend, TRUNCATION_KEY_SPI).await;
+
+    for spi in [
+        TRUNCATION_TARGET_SPI,
+        TRUNCATION_OVERLAP_SPI,
+        TRUNCATION_KEY_SPI,
+    ] {
+        assert!(snapshot(&backend, spi).await?.is_empty());
+    }
+    assert!(
+        failures.is_empty(),
+        "oversized states produced a false or missing proof: {failures:#?}"
+    );
+    println!("SA_KEY_SNAPSHOT_TRUNCATION_PROOF_OK");
 
     println!("SA_KEY_SNAPSHOT_PROOF_OK");
     Ok(())
