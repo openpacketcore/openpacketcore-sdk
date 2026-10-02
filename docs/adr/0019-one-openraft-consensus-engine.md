@@ -51,14 +51,24 @@ persistence authority.
   compatibility engine.
 
 The shared engine also has one runtime and complete-call profile.
-`opc-consensus` owns the 2,000 ms heartbeat/AppendEntries/read-index ceiling,
-5,000 ms Vote ceiling, `[5,000 ms, 8,000 ms)` election range, 10,000 ms
+`opc-consensus` owns the 500 ms heartbeat/AppendEntries/read-index ceiling,
+1,000 ms Vote ceiling, `[1,000 ms, 1,800 ms)` election range, 10,000 ms
 snapshot/forward/read-barrier and operation ceilings, 30,000 ms listener
-ceilings, and the contained 1,500 ms cold-connect sub-bound. It also owns the
+ceilings, and the contained 500 ms cold-connect sub-bound. It also owns the
 replication payload, snapshot trigger/chunk, retained-log, and Tokio runtime
 choices. Session and configuration adapters select only their non-secret
 cluster label; they cannot silently drift to separate timing or runtime
 behavior.
+
+The profile previously used a 2,000 ms heartbeat, a 5,000 ms Vote ceiling and
+`[5,000 ms, 8,000 ms)` elections. Because the engine leases a committed
+leader's vote for the maximum election timeout before a follower's own timeout
+starts, and checks timers only on a tick of 1.5 heartbeats, an unplanned leader
+loss then took 13 to 19 seconds to detect. The current values bound the first
+campaign at 4,350 ms after the last leader contact and the documented write
+stall at 9,400 ms, below the operation timeout; profile validation enforces
+that ordering. The `opc-consensus` crate documentation records the derivation,
+the CPU assumptions and the engine's lack of pre-vote and check-quorum.
 
 ### Interim engine-source and release gate
 

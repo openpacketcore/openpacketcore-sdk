@@ -9,6 +9,29 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- `opc-consensus`: an unplanned leader loss no longer stalls an in-flight
+  write past the 10-second operation timeout. The pinned engine leases a
+  committed leader's vote for `election_timeout_max`, then waits one sampled
+  election timeout, and checks timers only on a tick of 1.5 heartbeats, so the
+  former 2,000 ms heartbeat and `[5,000 ms, 8,000 ms)` elections detected a lost
+  leader 13 to 19 seconds after its last contact. `DURABLE_CONSENSUS_TIMING_PROFILE`
+  now uses a 500 ms heartbeat/AppendEntries/read-index ceiling, a 1,000 ms Vote
+  ceiling, `[1,000 ms, 1,800 ms)` elections and a 500 ms contained cold-connect
+  cap. InstallSnapshot, forwarded-mutation, read-barrier, operation and listener
+  ceilings are unchanged. New profile helpers expose the first-campaign
+  (4,350 ms), replacement-election (6,900 ms) and documented write-stall
+  (9,400 ms) bounds, and profile validation requires that stall to stay below
+  the operation timeout. A real three- and five-process projected-mTLS fleet
+  regression kills the leader with SIGKILL during a stream of fenced writes:
+  the outage falls from 15.6 seconds to 3.6 seconds, and every write commits
+  exactly once with its exact receipt. Voters now campaign after 2,800 ms
+  without AppendEntries, so they need CPU that is never throttled or suspended
+  for that long; `opc-consensus` documents the guarantee, its assumptions, and
+  the engine's lack of pre-vote and check-quorum. Profile-derived qualification
+  envelopes follow the new timing: the traffic schedule advances to v11, and its
+  availability-recovery envelope still covers two sequential operations plus
+  one retry. The frozen v6/v7 HA profiles keep their original timing. Refs #1037.
+
 - `opc-session-net`: a prepared compare-and-set or lease acquire whose
   current voter answers with a complete `Rejected(Unavailable)` now moves the
   identical request to the next voter, as after a pre-write failure, and ends

@@ -145,8 +145,8 @@ mutual TLS, identity admission, and bootstrap. One absolute family deadline
 starts before lane acquisition. Direct calls use the fixed family ceiling;
 Openraft calls use its smaller supplied soft TTL, never more than that family
 ceiling. One caller waits for cold work for at most two thirds of its remaining
-budget and never beyond the 1,500 ms cold cap. The singleflight itself has one
-fixed 1,500 ms lifetime from its original admission, so a later retry may join
+budget and never beyond the 500 ms cold cap. The singleflight itself has one
+fixed 500 ms lifetime from its original admission, so a later retry may join
 or claim completed authenticated work instead of restarting it. This does not
 extend either caller's logical deadline. The reserved final third carries the
 first negotiated RPC, so an AppendEntries soft TTL cannot be exhausted by a
@@ -167,14 +167,14 @@ cap of 128 rather than that planning estimate.
 
 | RPC family | Outer hard/direct complete ceiling |
 |:---|---:|
-| AppendEntries and Openraft read-index confirmation | 2,000 ms |
-| Vote | 5,000 ms |
+| AppendEntries and Openraft read-index confirmation | 500 ms |
+| Vote | 1,000 ms |
 | InstallSnapshot | 10,000 ms |
 | ForwardMutation | 10,000 ms |
 | Consumer ReadBarrier | 10,000 ms |
 | TopologyAdmissionBarrier | 10,000 ms |
 
-The election range is `[5,000 ms, 8,000 ms)`, the session/config operation
+The election range is `[1,000 ms, 1,800 ms)`, the session/config operation
 default is 10,000 ms, and listener idle/handler ceilings are 30,000 ms.
 The exact consensus contract is transport/wire-schema revision 5, application
 revision 4, and error-set revision 6. The revision-5 transport profile retains
@@ -564,7 +564,7 @@ observation, rolling fresh prewarm, and pool-wide cold-setup serialization.
   frame, lifecycle, or reauthentication builders detach incompatible cached
   state. `None` selects the shared family profile. `Some(duration)` remains a
   source-compatible fixed complete-call test/compatibility override, but cannot
-  enlarge the shared 1,500 ms cold cap. `new_profiled` and
+  enlarge the shared 500 ms cold cap. `new_profiled` and
   `new_profiled_with_resolver` select the production profile explicitly.
 - `SessionConsensusServer::new` accepts only an
   `Arc<dyn SessionConsensusRpcHandler>` and serves only the dedicated consensus
@@ -1452,13 +1452,13 @@ endpoint, SPIFFE ID, certificate, key, transaction, or payload text.
   reuse, cancellation/timeout/dead-socket eviction, exact replacement after an
   explicit generation or material epoch, finite cached-connection retirement,
   renewed SVID handshakes, wrong rotated identities, rejection of legacy
-  backend authority, the 1,500 ms contained cold cap, and every 2/5/10-second
+  backend authority, the 500 ms contained cold cap, and every 0.5/1/10-second
   family. A server-only material epoch retires the listener's accepted lanes
   and replaces both cached lanes exactly once; a call assigned to a stale lane
   fails once with the typed no-replay outcome before its retried replacement
   completes the full negotiation. It forms a real three-node `ConsensusConfigStore` over the existing
-  mTLS peer/server, restarts a follower listener, injects a persistent 500 ms
-  cold delay, and proves same-leader, same-term
+  mTLS peer/server, restarts a follower listener, injects a persistent cold
+  delay of half the AppendEntries cold allocation, and proves same-leader, same-term
   catch-up/readiness/linearizable read within 10 seconds without a preflight.
   Its bounded session-store rotation case also forms real three- and five-voter
   Openraft/SQLite fleets over the production mTLS peer/server, executes forward

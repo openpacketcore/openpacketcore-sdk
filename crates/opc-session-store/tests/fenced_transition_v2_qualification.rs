@@ -4608,6 +4608,12 @@ async fn fixed_quorum_public_v2_batch_effect_stale_warm_hint_fails_closed_before
     .await;
 }
 
+// Each rejected warm call holds its whole operation deadline while every
+// voter carries the injected fault, and the scope-drift fault rejects even
+// heartbeats. Ticker-driven elections therefore stay disabled for exactly that
+// window, so the witnessed vote, log and applied state can prove that only the
+// rejected call ran; explicit engine campaigns stay available.
+#[cfg(feature = "test-control")]
 #[tokio::test(flavor = "multi_thread")]
 async fn fixed_quorum_public_v2_stale_warm_hint_fails_closed_before_proposal() {
     for fault in 0..3 {
@@ -4708,6 +4714,9 @@ async fn fixed_quorum_public_v2_stale_warm_hint_fails_closed_before_proposal() {
 
             // Every exact voter loses the prerequisite in its actual backend.
             // Native activation/scope faults are live-owner witnesses only.
+            for voter in &stores {
+                voter.set_automatic_election_for_test(false);
+            }
             let faults = stores
                 .iter()
                 .zip(&database_paths)
@@ -4756,6 +4765,9 @@ async fn fixed_quorum_public_v2_stale_warm_hint_fails_closed_before_proposal() {
                 "rejected warm call changes no durable cut, record, fence, history or receipt"
             );
             restore_activation_fixture_faults(faults);
+            for voter in &stores {
+                voter.set_automatic_election_for_test(true);
+            }
         })
         .await;
     }

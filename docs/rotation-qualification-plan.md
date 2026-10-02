@@ -53,10 +53,10 @@ them is a requalification event.
 | Connection max age | 60 s |
 | Drain window (old-epoch connection retirement) | 100 ms |
 | Reconnect cooldown per directed peer | 1–20 ms |
-| Cold connect timeout | 1500 ms |
-| AppendEntries (heartbeat) timeout | 2000 ms |
-| Vote timeout | 5000 ms |
-| Election window | 5000–8000 ms |
+| Cold connect timeout | 500 ms |
+| AppendEntries (heartbeat) timeout | 500 ms |
+| Vote timeout | 1000 ms |
+| Election window | 1000–1800 ms |
 | Operation timeout (any complete operation) | 10 000 ms |
 
 Derived campaign SLOs (the same derivation as the runbook restart-stage
@@ -64,8 +64,8 @@ table):
 
 | SLO | Value | Derivation |
 | --- | --- | --- |
-| Member transition envelope | 26 s | 2 × election-max + operation timeout |
-| Member recovery envelope | 37 s | transition envelope + one backend operation (10 s) + one delivery second (1 s) |
+| Member transition envelope | 13.6 s | 2 × election-max + operation timeout |
+| Member recovery envelope | 24.6 s | transition envelope + one backend operation (10 s) + one delivery second (1 s) |
 | Traffic round envelope | (N + 1) × 10 s | one committed write plus one linearizable read per reachable voter, each within the operation timeout |
 | Local fault/measurement action | 10 s | one operation timeout |
 

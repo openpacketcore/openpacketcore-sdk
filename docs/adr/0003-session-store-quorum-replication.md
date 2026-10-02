@@ -121,10 +121,10 @@ authenticated connections after correlated validated successes or typed
 semantic `Unavailable` responses, with one in-flight RPC per lane. Sequential
 calls prefer primary, a concurrent call may use overflow, and further calls
 wait for lane acquisition under the shared absolute family deadline. Those
-deadlines are 2 seconds for
-AppendEntries/Openraft read-index, 5 seconds for Vote, and 10 seconds for
+deadlines are 500 ms for
+AppendEntries/Openraft read-index, 1 second for Vote, and 10 seconds for
 InstallSnapshot, forwarded mutation, and consumer ReadBarrier. A fresh
-connection has a 1.5-second DNS/TCP/mTLS/bootstrap sub-bound contained inside
+connection has a 500 ms DNS/TCP/mTLS/bootstrap sub-bound contained inside
 that deadline. A complete, correlated, authenticated, validated success or
 typed semantic `Unavailable` response may return the selected lane to its
 pool; `Unavailable` preserves a known stream position but grants no success or

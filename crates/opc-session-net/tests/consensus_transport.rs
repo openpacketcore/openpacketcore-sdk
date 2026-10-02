@@ -342,6 +342,13 @@ fn deferred_resolver_with_counter(
     })
 }
 
+/// Half of the cold allocation Openraft's AppendEntries soft TTL (three
+/// quarters of the heartbeat family ceiling) admits: a slow but successful
+/// reconnect.
+const PERSISTENT_COLD_DELAY: Duration = Duration::from_millis(
+    DURABLE_CONSENSUS_TIMING_PROFILE.append_entries_timeout_millis * 3 / 4 * 2 / 3 / 2,
+);
+
 fn delayed_profiled_resolver(
     address: Arc<StdRwLock<Option<SocketAddr>>>,
     delay_enabled: Arc<AtomicBool>,
@@ -353,7 +360,7 @@ fn delayed_profiled_resolver(
         let delayed_completions = Arc::clone(&delayed_completions);
         Box::pin(async move {
             if delay_enabled.load(Ordering::Acquire) {
-                tokio::time::sleep(Duration::from_millis(500)).await;
+                tokio::time::sleep(PERSISTENT_COLD_DELAY).await;
                 delayed_completions.fetch_add(1, Ordering::AcqRel);
             }
             address
@@ -1908,7 +1915,7 @@ async fn cancelling_a_queued_lane_waiter_does_not_lose_released_capacity() {
 }
 
 #[tokio::test]
-async fn profiled_cold_connection_is_a_contained_fifteen_hundred_millisecond_bound() {
+async fn profiled_cold_connection_is_a_contained_cold_cap_bound() {
     let pki = TestPki::new();
     let manifest = manifest("consensus-profiled-cold-bound", 8, 1);
     let handler = Arc::new(CountingEchoHandler::default());
@@ -1936,9 +1943,14 @@ async fn profiled_cold_connection_is_a_contained_fifteen_hundred_millisecond_bou
             .bind_remote(replica_id(SERVER_REPLICA))
             .expect("remote binding")
     };
+    // An AppendEntries call may spend two thirds of its family ceiling on
+    // cold work; a resolver taking a quarter of the ceiling stays inside it.
     let within_bound = RemoteSessionConsensusPeer::new_profiled_with_resolver(
         remote_binding(),
-        delayed_resolver(Duration::from_millis(500)),
+        delayed_resolver(
+            DURABLE_CONSENSUS_TIMING_PROFILE.rpc_timeout(SessionConsensusRpcFamily::AppendEntries)
+                / 4,
+        ),
         pki.client_config(1),
     );
     let payload = b"within-cold-bound".to_vec();
@@ -1956,9 +1968,17 @@ async fn profiled_cold_connection_is_a_contained_fifteen_hundred_millisecond_bou
         })
     );
 
+    // Two thirds of the Vote ceiling exceed the absolute cold cap, so only
+    // that cap stops this resolver before the call could dispatch.
+    let beyond_cap =
+        DURABLE_CONSENSUS_TIMING_PROFILE.cold_connect_timeout() + Duration::from_millis(100);
+    assert!(
+        DURABLE_CONSENSUS_TIMING_PROFILE.rpc_timeout(SessionConsensusRpcFamily::Vote) * 2 / 3
+            > beyond_cap
+    );
     let beyond_bound = RemoteSessionConsensusPeer::new_profiled_with_resolver(
         remote_binding(),
-        delayed_resolver(Duration::from_millis(1_600)),
+        delayed_resolver(beyond_cap),
         pki.client_config(1),
     );
     assert_eq!(
@@ -1966,7 +1986,7 @@ async fn profiled_cold_connection_is_a_contained_fifteen_hundred_millisecond_bou
             .call(request_for_family(
                 &manifest,
                 1,
-                SessionConsensusRpcFamily::AppendEntries,
+                SessionConsensusRpcFamily::Vote,
                 b"must-not-dispatch".to_vec(),
             ))
             .await,
@@ -2169,6 +2189,12 @@ async fn append_soft_ttl_reserves_post_handshake_rpc_time_and_reuses_the_socket(
             .await
             .expect("profiled soft-reserve listener");
 
+    // Openraft hands AppendEntries three quarters of the heartbeat family
+    // ceiling as its soft TTL; two thirds of that is the cold allocation.
+    let soft_ttl =
+        DURABLE_CONSENSUS_TIMING_PROFILE.rpc_timeout(SessionConsensusRpcFamily::AppendEntries) * 3
+            / 4;
+    let cold_allocation = soft_ttl * 2 / 3;
     let resolutions = Arc::new(AtomicUsize::new(0));
     let delayed_resolver: RemoteAddrResolver = {
         let resolutions = Arc::clone(&resolutions);
@@ -2176,10 +2202,11 @@ async fn append_soft_ttl_reserves_post_handshake_rpc_time_and_reuses_the_socket(
             let resolutions = Arc::clone(&resolutions);
             Box::pin(async move {
                 resolutions.fetch_add(1, Ordering::SeqCst);
-                // Eighty percent of the derived one-second cold allocation is
-                // consumed before TCP, mTLS, and bootstrap. The remaining
-                // overall soft TTL must still carry the negotiated RPC.
-                tokio::time::sleep(Duration::from_millis(800)).await;
+                // Half of the derived cold allocation is consumed before TCP,
+                // mTLS, and bootstrap, which keep the other half. The
+                // remaining overall soft TTL must still carry the negotiated
+                // RPC.
+                tokio::time::sleep(cold_allocation / 2).await;
                 Ok(addr)
             })
         })
@@ -2194,7 +2221,6 @@ async fn append_soft_ttl_reserves_post_handshake_rpc_time_and_reuses_the_socket(
         delayed_resolver,
         pki.client_config(1),
     );
-    let soft_ttl = Duration::from_millis(1_500);
 
     for payload in [b"near-cold-cap".to_vec(), b"cached-follow-up".to_vec()] {
         assert_eq!(
@@ -2222,7 +2248,7 @@ async fn append_soft_ttl_reserves_post_handshake_rpc_time_and_reuses_the_socket(
 
     let too_late_resolver: RemoteAddrResolver = Arc::new(move || {
         Box::pin(async move {
-            tokio::time::sleep(Duration::from_millis(1_100)).await;
+            tokio::time::sleep(cold_allocation * 11 / 10).await;
             Ok(addr)
         })
     });
@@ -2262,7 +2288,13 @@ async fn append_soft_ttl_reserves_post_handshake_rpc_time_and_reuses_the_socket(
 async fn profiled_long_rpc_families_are_not_truncated_by_the_append_deadline() {
     let pki = TestPki::new();
     let manifest = manifest("consensus-profiled-family-deadlines", 9, 1);
-    let (server, addr) = start_server(&pki, &manifest, Duration::from_millis(2_100)).await;
+    // Every handler answer outlives the AppendEntries ceiling but leaves the
+    // shortest longer family, Vote, most of its ceiling for a reconnect.
+    let append =
+        DURABLE_CONSENSUS_TIMING_PROFILE.rpc_timeout(SessionConsensusRpcFamily::AppendEntries);
+    let vote = DURABLE_CONSENSUS_TIMING_PROFILE.rpc_timeout(SessionConsensusRpcFamily::Vote);
+    let handler_delay = append + (vote - append) / 5;
+    let (server, addr) = start_server(&pki, &manifest, handler_delay).await;
     let resolutions = Arc::new(AtomicUsize::new(0));
     let counted_resolver: RemoteAddrResolver = {
         let resolutions = Arc::clone(&resolutions);
@@ -2305,7 +2337,7 @@ async fn profiled_long_rpc_families_are_not_truncated_by_the_append_deadline() {
             Ok(SessionConsensusWireResponse {
                 result: Ok(payload),
             }),
-            "{family:?} must retain its family deadline above two seconds"
+            "{family:?} must retain its family deadline above the AppendEntries ceiling"
         );
         assert_eq!(
             resolutions.load(Ordering::SeqCst),
@@ -3868,7 +3900,7 @@ async fn config_openraft_forms_and_commits_over_the_shared_mtls_adapter_case() {
         .expect("consensus address lock") = Some(actual_replacement_addr);
 
     // No raw peer preflight is allowed here. Openraft must evict the dead
-    // cached socket, resolve after the injected 500 ms cold delay, and repair
+    // cached socket, resolve after the injected persistent cold delay, and repair
     // the follower through its normal replication stream under the same
     // leader and term.
     tokio::time::timeout(DURABLE_CONSENSUS_OPERATION_TIMEOUT, async {

@@ -912,10 +912,10 @@ writers, then stop and upgrade every consensus member together; mixed-profile
 rolling operation is unsupported.
 
 Both durable domains use the shared 10-second operation default. Transport
-families use 2 seconds for AppendEntries/Openraft read-index, 5 seconds for
+families use 500 ms for AppendEntries/Openraft read-index, 1 second for
 Vote, and 10 seconds for InstallSnapshot/forwarded mutation/consumer
 ReadBarrier. One absolute family deadline starts before per-peer lane
-acquisition; a fresh DNS/TCP/mTLS/bootstrap path has a contained 1.5-second
+acquisition; a fresh DNS/TCP/mTLS/bootstrap path has a contained 500 ms
 sub-bound and does not receive additive time. A directed peer caches a fixed
 primary/overflow pool of at most two authenticated connections after correlated
 validated successes, with one in-flight RPC per lane.

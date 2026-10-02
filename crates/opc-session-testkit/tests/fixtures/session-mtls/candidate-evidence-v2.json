@@ -28,7 +28,7 @@
     "evidence_schema_sha256": "sha256:911873fe33a2d376c25fa6cacb0b3644f59d0c5a372bf966204c33bd2f581fef",
     "configuration_sha256": "sha256:ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad",
     "public_material_manifest_sha256": "sha256:88d4266fd4e6338d13b845fcf289579d209c897823b9217da3e161936f031589",
-    "workload_schedule_sha256": "sha256:f64560ee88d5e58be6d192129d6075eefa7dab6e62015d77c0ce297857d6616e"
+    "workload_schedule_sha256": "sha256:705db632bef82be4471a8db7379749e7a5743d5f51fa9460c6b4dd222b9abf9a"
   },
   "observations": {
     "material_status_collected": true,

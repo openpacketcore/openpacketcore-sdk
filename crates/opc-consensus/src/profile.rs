@@ -198,25 +198,44 @@ impl DurableConsensusTimingProfile {
     /// suspended or CPU-throttled and whose RPCs each finish within their
     /// family ceilings. Further split votes are probabilistic and outside it.
     pub const fn unplanned_leader_loss_write_stall(self) -> Duration {
-        Duration::from_millis(
-            self.leader_loss_reelection_bound_millis()
-                .saturating_add(self.cold_connect_timeout_millis.saturating_mul(2))
-                .saturating_add(self.append_entries_timeout_millis.saturating_mul(3)),
-        )
+        Duration::from_millis(self.unplanned_leader_loss_write_stall_millis())
+    }
+
+    const fn unplanned_leader_loss_write_stall_millis(self) -> u64 {
+        self.leader_loss_reelection_bound_millis()
+            .saturating_add(self.cold_connect_timeout_millis.saturating_mul(2))
+            .saturating_add(self.append_entries_timeout_millis.saturating_mul(3))
     }
 }
 
 /// The one fixed timing contract for SDK-owned durable consensus.
+///
+/// Unplanned leader loss is detected by the pinned engine only after its
+/// leader lease (`election_timeout_max_millis`) plus one sampled election
+/// timeout, checked on a tick of 750 ms. With these values a surviving voter
+/// first campaigns within 4,350 ms of its last leader contact, a replacement
+/// is elected within 6,900 ms allowing one further campaign, and the
+/// documented write stall is 9,400 ms, inside the unchanged 10,000 ms
+/// operation timeout. A voter campaigns only after 2,800 ms without any
+/// AppendEntries, at least three missed 750 ms ticks of a leader that is
+/// neither suspended nor CPU-throttled.
 pub const DURABLE_CONSENSUS_TIMING_PROFILE: DurableConsensusTimingProfile =
     DurableConsensusTimingProfile {
-        cold_connect_timeout_millis: 1_500,
-        append_entries_timeout_millis: 2_000,
-        vote_timeout_millis: 5_000,
+        // Contained in every family ceiling, including the heartbeat family.
+        cold_connect_timeout_millis: 500,
+        // Heartbeat and AppendEntries/read-index ceiling: the engine uses the
+        // heartbeat interval as this RPC's hard deadline.
+        append_entries_timeout_millis: 500,
+        // The engine uses the minimum election timeout as the Vote deadline.
+        vote_timeout_millis: 1_000,
         install_snapshot_timeout_millis: 10_000,
         forward_mutation_timeout_millis: 10_000,
         read_barrier_timeout_millis: 10_000,
-        election_timeout_min_millis: 5_000,
-        election_timeout_max_millis: 8_000,
+        // Twice the heartbeat, the profile's minimum ratio.
+        election_timeout_min_millis: 1_000,
+        // Also the engine's leader lease. Leaves 600 ms of the operation
+        // timeout above the documented write stall; 2,000 ms would leave none.
+        election_timeout_max_millis: 1_800,
         operation_timeout_millis: 10_000,
         server_idle_timeout_millis: 30_000,
         server_handler_timeout_millis: 30_000,
@@ -272,6 +291,10 @@ pub struct DurableConsensusTimingProfileError;
 
 /// Validate the cross-family timing relationships required by the fixed
 /// production profile.
+///
+/// Besides the family ordering, the documented unplanned leader-loss write
+/// stall must stay below the operation timeout, so a write in flight at an
+/// unplanned leader loss can reach its outcome within one operation.
 pub fn validate_durable_consensus_timing_profile(
     profile: DurableConsensusTimingProfile,
 ) -> Result<(), DurableConsensusTimingProfileError> {
@@ -309,6 +332,7 @@ pub fn validate_durable_consensus_timing_profile(
         || profile.server_idle_timeout_millis <= profile.cold_connect_timeout_millis
         || profile.server_idle_timeout_millis < largest_rpc_timeout
         || profile.server_handler_timeout_millis < largest_rpc_timeout
+        || profile.unplanned_leader_loss_write_stall_millis() >= profile.operation_timeout_millis
     {
         return Err(DurableConsensusTimingProfileError);
     }
@@ -396,22 +420,22 @@ mod tests {
     #[test]
     fn fixed_timing_profile_has_exact_family_deadlines_and_valid_ordering() {
         let profile = DURABLE_CONSENSUS_TIMING_PROFILE;
-        assert_eq!(profile.cold_connect_timeout(), Duration::from_millis(1_500));
+        assert_eq!(profile.cold_connect_timeout(), Duration::from_millis(500));
         assert_eq!(
             profile.rpc_timeout(ConsensusRpcFamily::AppendEntries),
-            Duration::from_millis(2_000)
+            Duration::from_millis(500)
         );
         assert_eq!(
             profile.rpc_timeout(ConsensusRpcFamily::AppendEntriesRoster),
-            Duration::from_millis(2_000)
+            Duration::from_millis(500)
         );
         assert_eq!(
             profile.rpc_timeout(ConsensusRpcFamily::Vote),
-            Duration::from_millis(5_000)
+            Duration::from_millis(1_000)
         );
         assert_eq!(
             profile.rpc_timeout(ConsensusRpcFamily::LeadershipTransfer),
-            Duration::from_millis(5_000)
+            Duration::from_millis(1_000)
         );
         for family in [
             ConsensusRpcFamily::InstallSnapshot,
@@ -422,9 +446,22 @@ mod tests {
         ] {
             assert_eq!(profile.rpc_timeout(family), Duration::from_millis(10_000));
         }
-        assert_eq!(profile.election_timeout_min_millis, 5_000);
-        assert_eq!(profile.election_timeout_max_millis, 8_000);
+        assert_eq!(profile.election_timeout_min_millis, 1_000);
+        assert_eq!(profile.election_timeout_max_millis, 1_800);
         assert_eq!(profile.operation_timeout(), Duration::from_millis(10_000));
+        assert_eq!(profile.engine_tick(), Duration::from_millis(750));
+        assert_eq!(
+            profile.leader_loss_first_campaign_bound(),
+            Duration::from_millis(4_350)
+        );
+        assert_eq!(
+            profile.leader_loss_reelection_bound(),
+            Duration::from_millis(6_900)
+        );
+        assert_eq!(
+            profile.unplanned_leader_loss_write_stall(),
+            Duration::from_millis(9_400)
+        );
         assert_eq!(
             DURABLE_CONSENSUS_REMOTE_RETIREMENT_PROBE_INTERVAL,
             Duration::from_secs(5)
@@ -432,7 +469,7 @@ mod tests {
         assert_eq!(profile.server_idle_timeout(), Duration::from_millis(30_000));
         assert_eq!(
             profile.client_connection_reuse_limit(),
-            Duration::from_millis(28_500)
+            Duration::from_millis(29_500)
         );
         assert!(profile.client_connection_reuse_limit() < profile.server_idle_timeout());
         assert_eq!(
@@ -520,6 +557,24 @@ mod tests {
             },
             DurableConsensusTimingProfile {
                 election_timeout_max_millis: fixed.operation_timeout_millis,
+                ..fixed
+            },
+            // Each of these keeps every family ordering valid, but its
+            // unplanned leader-loss write stall reaches the operation timeout.
+            DurableConsensusTimingProfile {
+                election_timeout_max_millis: 2_000,
+                ..fixed
+            },
+            DurableConsensusTimingProfile {
+                vote_timeout_millis: 1_500,
+                election_timeout_min_millis: 1_500,
+                election_timeout_max_millis: 3_000,
+                ..fixed
+            },
+            DurableConsensusTimingProfile {
+                forward_mutation_timeout_millis: fixed.unplanned_leader_loss_write_stall_millis(),
+                read_barrier_timeout_millis: fixed.unplanned_leader_loss_write_stall_millis(),
+                operation_timeout_millis: fixed.unplanned_leader_loss_write_stall_millis(),
                 ..fixed
             },
             DurableConsensusTimingProfile {

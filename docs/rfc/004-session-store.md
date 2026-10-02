@@ -73,8 +73,10 @@ combined algorithm.
 
 See the [qualification contract](../../crates/opc-session-testkit/README.md).
 The fixed schedule drops one successful release response per mutator, allows eight
-outcomes per node, uses the fixed 26-second two-election-plus-operation
-transition envelope per recovery episode, and applies a 50 ms retry delay;
+outcomes per node, uses the fixed 20.05-second availability-recovery envelope
+per recovery episode (the larger of the 13.6-second two-election-plus-operation
+transition and two sequential operations plus one retry delay), and applies a
+50 ms retry delay;
 phase completion requires every interruption to be reconciled. Lease loss,
 unexpected state, and invariant failures fail closed. The admission-loss
 exact-address restart is watcher-only before exit and joins the mutator set
@@ -86,13 +88,13 @@ the same-disk, exact-address restart must reconcile a bounded gap-free journal,
 prove the exact generation/owner/fence/payload, and resume at a strictly higher
 same-owner fence under the versioned
 `same-disk-exact-address-active-mutator/v3` profile. That profile independently
-bounds termination/reaping at 5 seconds, outage/survivor progress at 26
+bounds termination/reaping at 5 seconds, outage/survivor progress at 13.6
 seconds, replacement-child startup at 45 seconds, Openraft
-recovery/readiness observation at 37 seconds (a 26-second recovery envelope
+recovery/readiness observation at 24.6 seconds (a 13.6-second recovery envelope
 plus one reserved 11-second final all-voter readiness round comprising a
 10-second backend operation and 1 second of bounded local result delivery),
-journal reconciliation at 25 seconds, and higher-fence mutation resume at 26 seconds.
-The sequential stages compose to a 164-second crash-to-resume ceiling, but each
+journal reconciliation at 25 seconds, and higher-fence mutation resume at 13.6 seconds.
+The sequential stages compose to a 126.8-second crash-to-resume ceiling, but each
 stage fails at its own deadline. This retains the v1 deadline-composition fix
 and corrects v2's stranded readiness-observation tail; it does not qualify a
 broader restart matrix or deployed production readiness.
@@ -1570,12 +1572,12 @@ identity.
 
 One absolute family deadline MUST begin before lane acquisition and cover
 bounded encode, write, and response read. The outer hard/direct complete
-ceiling for AppendEntries/Openraft read-index MUST be 2,000 ms, Vote 5,000 ms,
+ceiling for AppendEntries/Openraft read-index MUST be 500 ms, Vote 1,000 ms,
 and InstallSnapshot, forwarded mutation, and consumer ReadBarrier 10,000 ms.
 An Openraft network call uses the smaller soft TTL described below. If no valid
 cached connection exists,
 resolution, TCP connect, mutual TLS, identity admission, and bootstrap MUST use
-the lesser of two thirds of the remaining family budget and a 1,500 ms cold
+the lesser of two thirds of the remaining family budget and a 500 ms cold
 sub-bound. The reserved final third MUST remain available for the first
 negotiated RPC; cold time MUST NOT be added to the family deadline. Each
 directed peer MAY cache a
@@ -2620,20 +2622,20 @@ fencing.
   deadline. Every voter must become ready with the exact quorum witnesses and
   cover the first observed committed frontier; majority progress alone never
   completes recovery. After readiness and canary verification, connection
-  settlement retains its own 86-second bound, full 60-second two-stage server
-  tail and final 2.5-second outbound-ledger quiet tail. The frozen schedule-bound
+  settlement retains its own 80.05-second bound, full 60-second two-stage server
+  tail and final 1.5-second outbound-ledger quiet tail. The frozen schedule-bound
   `member-scoped-reauth-settled-baseline/v4` descriptor and historical results
   retain their publication-based clock; these corrected functional checks do
   not qualify that historical timing profile or a deployment recovery SLO on
-  shared storage. A prepublication common-key pulse and conservative 13-second
+  shared storage. A prepublication common-key pulse and conservative 10.025-second
   observations require one active key to advance on every survivor observer
-  and bound that pulse's worst-case actual event gap to 26 seconds. An
-  independent 26-second checkpoint requires every active key on every observer
+  and bound that pulse's worst-case actual event gap to 20.05 seconds. An
+  independent 20.05-second checkpoint requires every active key on every observer
   and cannot be reset by a faster key.
   Each survivor may record at most one availability episode while the expired
   member rejoins. Consecutive typed retry outcomes inside that episode remain
   separately bounded by the unchanged eight-outcome ceiling; all must settle
-  inside the 26-second SLO, and a second or late episode fails closed.
+  inside the 20.05-second SLO, and a second or late episode fails closed.
   Fault-era new-attempt and reconnect deltas
   retain a fixed 85/161 per-node bound: ordinary 24/40, fifteen five-second
   refresh rounds over four/eight incident paths, and one scheduled
