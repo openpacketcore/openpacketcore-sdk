@@ -20430,7 +20430,10 @@ fn member_recovery_rolling_observation_keeps_the_existing_availability_allowance
     let (participants, before, mut interrupted) = subset_traffic_fixture();
     let mut progress = RecoveryTrafficProgressTracker::new(before.clone(), observed_at);
     let initial_deadline = progress.observation_deadline(None);
-    assert_eq!(initial_deadline, observed_at + Duration::from_secs(13));
+    assert_eq!(
+        initial_deadline,
+        observed_at + Duration::from_millis(11_500)
+    );
 
     interrupted[0].status.availability_interruption_episodes += 1;
     interrupted[0].status.availability_interruptions += 1;
@@ -20440,10 +20443,10 @@ fn member_recovery_rolling_observation_keeps_the_existing_availability_allowance
         &participants,
     ));
     progress.extend_pulse_for_availability_recovery();
-    let recovery_deadline = observed_at + Duration::from_secs(26);
+    let recovery_deadline = observed_at + Duration::from_secs(23);
     assert_eq!(progress.observation_deadline(None), recovery_deadline);
     assert!(deadline_allows_completion(
-        observed_at + Duration::from_millis(13_013),
+        observed_at + Duration::from_millis(11_513),
         progress.observation_deadline(None),
     ));
     assert!(!deadline_allows_completion(
@@ -20472,7 +20475,7 @@ fn member_recovery_absolute_phase_still_bounds_an_availability_allowance() {
     ));
     assert_eq!(
         progress.observation_deadline(Some(observed_at + Duration::from_secs(86))),
-        observed_at + Duration::from_secs(26),
+        observed_at + Duration::from_secs(23),
         "a phase deadline never replaces the stricter rolling continuity bounds"
     );
 }
@@ -21240,17 +21243,17 @@ fn recovery_fault_settlement_tracks_attempts_without_freezing_connection_gauges(
     );
     assert_eq!(
         QUALIFICATION_TRAFFIC_MEMBER_RECOVERY_PROGRESS_CHECKPOINT_MILLIS,
-        13_000
+        11_500
     );
     assert_eq!(
         QUALIFICATION_TRAFFIC_MEMBER_RECOVERY_COVERAGE_MILLIS,
-        26_000
+        23_000
     );
     let observed_at = Instant::now();
     let absolute_deadline = observed_at + Duration::from_millis(86_000);
     assert_eq!(
         recovery_traffic_progress_deadline(observed_at, absolute_deadline),
-        observed_at + Duration::from_millis(13_000)
+        observed_at + Duration::from_millis(11_500)
     );
     let late_observation = observed_at + Duration::from_millis(80_000);
     assert_eq!(
@@ -21260,18 +21263,18 @@ fn recovery_fault_settlement_tracks_attempts_without_freezing_connection_gauges(
     let mut progress = RecoveryTrafficProgressTracker::new(Vec::new(), observed_at);
     assert_eq!(
         progress.next_deadline(absolute_deadline),
-        observed_at + Duration::from_millis(13_000)
+        observed_at + Duration::from_millis(11_500)
     );
     progress.extend_pulse_for_availability_recovery();
     assert_eq!(
         progress.next_deadline(absolute_deadline),
-        observed_at + Duration::from_millis(26_000)
+        observed_at + Duration::from_millis(23_000)
     );
     progress.record_pulse(Vec::new(), observed_at + Duration::from_millis(20_000));
     assert!(!progress.pulse_recovery_extended);
     assert_eq!(
         progress.next_deadline(absolute_deadline),
-        observed_at + Duration::from_millis(26_000)
+        observed_at + Duration::from_millis(23_000)
     );
     let operation_timeout = Duration::from_millis(QUALIFICATION_OPERATION_TIMEOUT_MILLIS);
     assert!(
@@ -21291,7 +21294,7 @@ fn recovery_fault_settlement_tracks_attempts_without_freezing_connection_gauges(
         observed_at
             + Duration::from_millis(20_000)
             + operation_timeout
-            + Duration::from_millis(3_000)
+            + Duration::from_millis(1_500)
     );
 
     let baseline = lifecycle_metrics_fixture();
