@@ -26,7 +26,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   route to the leader now commits its write in about 6.5 seconds instead of
   ending ambiguous after 10 seconds; one that elects the successor between
   route selection and transmission sends nothing to the lost leader, where the
-  call used to wait 24 seconds for its deadline. Refs #1037.
+  call used to wait 24 seconds for its deadline. A route that a redirect chose
+  while the view named another leader keeps that leader's exemption only until
+  the view names the redirect target: a regression in which leadership moves
+  from A to B and back to A abandons a call held by the lost B within the
+  grace, where it used to wait for its deadline. Refs #1037.
 
 - `opc-consensus`: an unplanned leader loss no longer stalls an in-flight
   write past the 10-second operation timeout. The pinned engine used to start a
@@ -86,10 +90,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   three-voter regression over such a transport elects a successor in about
   6 seconds, where counting those voters as rejecting left the survivors
   leaderless. While a previous-release voter is a member, a leader loss is
-  resolved within 30 seconds, as with the previous release. Three- and
-  five-process regressions, using the previous release's node binary, roll a
-  fleet forward and back under fenced writes and kill the leader on both
-  releases: every write applies exactly once. Refs #1037.
+  resolved within 30 seconds, as with the previous release, when the leader is
+  the only voter lost and no two voters campaign at once. A classic campaign
+  of a voter whose log is behind used to occupy a more up-to-date candidate's
+  next term again and again: with this release's survivor lagging, a
+  three-process fleet elected no successor within 30 seconds, and a
+  five-process fleet took 26 seconds. A voter of this release that refuses
+  such a candidate only because of its own vote now defers its next campaign
+  by its greater-log timeout. Three- and five-process regressions, using the
+  previous release's node binary, lose the leader while either release's
+  voters lag, and roll a fleet forward and back under fenced writes, killing
+  the leader on both releases: every write applies exactly once. Refs #1037.
 
 - `opc-session-net`: a prepared compare-and-set or lease acquire whose
   current voter answers with a complete `Rejected(Unavailable)` now moves the
@@ -133,7 +144,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   in between stopped the Raft core. A round that a running lease rejects is
   retried after the width of the election-timeout window instead of a whole
   sampled election timeout, which could delay the first successful election
-  past the maximum election timeout. A closed replication stream gives up an
+  past the maximum election timeout; a round still awaiting replies stays open
+  until its Vote deadline, so voters that answer more slowly than that width
+  still elect a leader and a late report that a voter cannot answer Pre-Vote
+  still starts the classic election. A campaigning voter that refuses a more
+  up-to-date candidate only because of its own vote defers its next campaign
+  by the greater-log timeout. A closed replication stream gives up an
   in-flight AppendEntries at once, so a learner that never answers no longer
   delays the answer to the vote that deposes its leader. Refs #1037.
 

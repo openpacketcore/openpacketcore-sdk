@@ -173,19 +173,29 @@ impl DurableConsensusTimingProfile {
     }
 
     /// Return the bound on the first successful campaign after an unplanned
-    /// leader loss, measured from the loss.
+    /// leader loss, measured from the loss: the start of the Pre-Vote round
+    /// that a quorum grants.
     ///
     /// Every survivor's leader lease (`election_timeout_min_millis`) runs out
     /// within the lease of the loss. A survivor starts its first Pre-Vote
     /// round once the longer of its lease and its sampled election timeout
     /// (below `election_timeout_max_millis`) has passed since its last leader
-    /// contact, on its next engine tick. A round that a still-running lease
-    /// rejects is retried after the width of the election-timeout window
+    /// contact, on its next engine tick. A round stays open for replies until
+    /// its Vote deadline (`vote_timeout_millis`); a round that a still-running
+    /// lease rejects is retried after the width of the election-timeout window
     /// (`election_timeout_max_millis - election_timeout_min_millis`), on a
-    /// later tick. So the survivor with the most up-to-date log starts a round
-    /// that no lease rejects within the lease, the window and one tick of the
-    /// loss, that is within the maximum election timeout and one tick, and that
-    /// round and its vote are granted.
+    /// later tick, while it stays open.
+    ///
+    /// The bound holds when every surviving voter answers a Pre-Vote within
+    /// that width and every voter's engine tick runs on time, its process
+    /// neither suspended nor CPU-throttled. Each round is then rejected or
+    /// granted within the width, so the survivor with the most up-to-date log
+    /// starts a round that no lease rejects within the lease, the width and one
+    /// tick of the loss: within the maximum election timeout and one tick. A
+    /// lost leader that never answers does not delay a round the survivors
+    /// answer. A survivor that answers more slowly, but within the Vote
+    /// deadline, delays the retries by the excess and never prevents an
+    /// election.
     pub const fn leader_loss_first_campaign_bound(self) -> Duration {
         Duration::from_millis(self.leader_loss_first_campaign_bound_millis())
     }
@@ -226,10 +236,11 @@ impl DurableConsensusTimingProfile {
 /// timeout has passed since its last leader contact, checked on a 300 ms
 /// engine tick. Pre-Vote keeps a voter that cannot win from raising its term,
 /// and a Pre-Vote round that a still-running lease rejects is retried after
-/// the 1,500 ms width of the election-timeout window. With these values the
-/// first successful campaign starts within 6,800 ms of the loss and the
-/// documented write stall is 9,700 ms, inside the unchanged 10,000 ms
-/// operation timeout. A voter campaigns only after 5,000 ms without
+/// the 1,500 ms width of the election-timeout window. With these values, and
+/// surviving voters that answer within that width, the first successful
+/// campaign starts within 6,800 ms of the loss; with every round trip answered
+/// within one heartbeat interval, the documented write stall is 9,700 ms,
+/// inside the unchanged 10,000 ms operation timeout. A voter campaigns only after 5,000 ms without
 /// any AppendEntries, more than sixteen missed 300 ms ticks of a leader that is
 /// neither suspended nor CPU-throttled.
 pub const DURABLE_CONSENSUS_TIMING_PROFILE: DurableConsensusTimingProfile =

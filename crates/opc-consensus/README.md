@@ -106,12 +106,16 @@ rules:
   timeout has passed since its last leader contact, never their sum; every
   sampled timeout covers the lease, so campaigns stay randomized;
 - before it raises its term, a voter asks the others in a Pre-Vote round
-  whether they would grant it a vote, and campaigns only if a quorum would; a
-  round that a running lease rejects is retried after the width of the
-  election-timeout window, 1,500 ms, on a later tick;
+  whether they would grant it a vote, and campaigns only if a quorum would. A
+  round stays open for replies until its 5,000 ms Vote deadline; a round that a
+  running lease rejects is retried after the width of the election-timeout
+  window, 1,500 ms, on a later tick, while it stays open for late grants;
 - Pre-Vote is used only while every voter that can be reached is positively
   known to answer it; otherwise that campaign runs the classic election (see
   [Voters of a release without Pre-Vote](#voters-of-a-release-without-pre-vote));
+- a candidate refused only because a voter with a less up-to-date log voted
+  for itself in its term finds no new self-vote in its next campaign: that
+  voter defers its own next campaign by the greater-log timeout;
 - the engine checks election timers, and sends idle heartbeats, only on a tick
   of `heartbeat * 3 / 2` (300 ms).
 
@@ -127,10 +131,15 @@ Every survivor's lease runs out within `election_timeout_min` of the loss. The
 survivor with the most up-to-date log starts its first Pre-Vote round within
 `election_timeout_max` and a tick of its last leader contact. If a survivor
 that heard from the leader later still holds a running lease, that round is
-rejected, and it is retried within the 1,500 ms window and a tick. So the first
-round that no lease rejects starts within `election_timeout_min`, the window
-and a tick of the loss, which is `election_timeout_max + tick`, and that round
-and its vote are granted. The write stall adds six round trips, each answered within one
+rejected. When every surviving voter answers within the 1,500 ms window, each
+round is rejected or granted within it and retried within the window and a
+tick. So the first round that no lease rejects starts within
+`election_timeout_min`, the window and a tick of the loss, which is
+`election_timeout_max + tick`, and that round and its vote are granted. A lost
+leader that never answers does not delay a round that the survivors answer; a
+survivor that answers more slowly, but within the 5,000 ms Vote deadline,
+delays the election by the excess and never prevents it. The write stall adds
+six round trips, each answered within one
 heartbeat interval (Pre-Vote, vote, the successor's first commit, the forwarded
 write, the successor's linearizable admission round and the write's own
 commit), the one-heartbeat stale-route grace below, and one new connection to
@@ -143,7 +152,10 @@ within one 10,000 ms operation. The bounds assume:
 - a reachable majority of voters whose processes are not suspended or
   CPU-throttled;
 - every round trip, disk sync included, completing within one heartbeat
-  interval, and every new connection within the cold-connect allowance;
+  interval, and every new connection within the cold-connect allowance; for
+  the first successful campaign alone, every surviving voter answering a
+  Pre-Vote within the 1,500 ms window is enough;
+- every voter's engine tick running on time;
 - no split vote. Two survivors that both pass Pre-Vote at the same moment can
   still split one term; that is improbable because every campaign samples a
   fresh timeout, and it adds at most one further election timeout and tick.
@@ -205,18 +217,35 @@ the bounds above apply again.
 
 While a previous-release voter is a member, a voter set therefore elects with
 the classic vote, as the previous release does, and a voter of this release
-that is cut off can raise its term, as every previous-release voter can. An
-unplanned leader loss elects a successor within 30,000 ms:
+that is cut off can raise its term, as every previous-release voter can. Each
+classic campaign of a voter whose log is behind still votes for itself in its
+next term, and a candidate with a more up-to-date log that campaigns in such a
+term is refused. A voter of this release that refuses such a candidate defers
+its own next campaign by its 13,000 ms greater-log timeout, and a
+previous-release voter that has seen a greater log campaigns at most once per
+21,000 ms (its 5,000 ms minimum timeout and 16,000 ms greater-log timeout), so
+each voter whose log is behind refuses at most one campaign of the candidate
+that wins.
 
-- when only previous-release voters can win, they campaign by the previous
-  release's timing: a lease of 8,000 ms, a first campaign within 19,000 ms of
-  their last leader contact, and one more election timeout and tick, at most
-  11,000 ms, after a split vote;
+An unplanned leader loss elects a successor within 30,000 ms when the leader is
+the only voter lost, every round trip completes within one heartbeat interval,
+no two voters campaign within one round trip of each other, and no process is
+suspended:
+
+- when a previous-release voter must win, its first campaign comes within
+  19,000 ms of its last leader contact (its 8,000 ms lease, a timeout below
+  8,000 ms and a 3,000 ms tick), after every lease has run out. Every voter it
+  needs refuses at most one of its campaigns, so it is elected by its second
+  campaign, at most 11,000 ms later;
 - when a voter of this release can win, it first campaigns within 6,800 ms of
   its last leader contact, after at most one 1,500 ms connection that tells it
   a voter cannot answer Pre-Vote. If a previous-release lease rejects that
   campaign, it campaigns again within 6,800 ms, after every such lease has run
-  out, so it is elected within 15,100 ms.
+  out, in a term that no voter behind it holds, so it is elected within
+  15,100 ms.
+
+A write in flight at such a loss reaches its outcome within 32,900 ms: the
+election bound and the same rounds after it as the documented write stall.
 
 ## Interim source-build gate
 

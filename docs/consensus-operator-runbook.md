@@ -166,7 +166,9 @@ voters elect a replacement on their own timers. A surviving voter campaigns
 once the longer of its leader lease (the 5-second minimum election timeout) and
 its sampled election timeout has passed since it last heard from the leader.
 If another survivor's lease still runs, its Pre-Vote round is rejected and
-retried 1.5 seconds later; every lease runs out within 5 seconds of the loss:
+retried 1.5 seconds later; every lease runs out within 5 seconds of the loss. A
+round stays open for late replies until its 5-second Vote deadline, so slow
+voters delay an election but never prevent it:
 
 - the first successful campaign starts within 6,800 ms of the loss;
 - a write in flight at the loss reaches its outcome within the documented
@@ -178,9 +180,10 @@ retried 1.5 seconds later; every lease runs out within 5 seconds of the loss:
   replica already knows the successor goes to the successor directly.
 
 These bounds assume a reachable majority whose processes are not suspended or
-throttled and whose RPCs complete within one heartbeat interval. A split vote
-is improbable and outside them; it adds at most one further election timeout
-and tick.
+throttled and whose RPCs complete within one heartbeat interval; the first
+successful campaign needs only every surviving voter to answer a Pre-Vote
+within 1.5 seconds. A split vote is improbable and outside them; it adds at
+most one further election timeout and tick.
 
 Each voter first asks the others in a Pre-Vote round whether they would grant
 it a vote, and raises its term only when a majority would. A voter that is cut
@@ -225,9 +228,16 @@ resolved with the classic vote, as with the previous release:
   leader contact, plus at most one 1.5-second connection that tells it a voter
   cannot answer Pre-Vote. If a previous-release lease rejects it, it campaigns
   again within 6.8 seconds, after every such lease has run out;
-- a successor is elected within 30 seconds of the loss, as with the previous
-  release, including one round in which two previous-release voters split the
-  vote.
+- a voter whose log is behind still campaigns with the classic vote and votes
+  for itself in its next term. A more up-to-date candidate is refused in such
+  a term at most once per such voter: a voter of this release then defers its
+  own next campaign by 13 seconds, and a previous-release voter that has seen
+  a more up-to-date log campaigns at most once per 21 seconds;
+- a successor is elected within 30 seconds of the loss when the leader is the
+  only voter lost, no two voters campaign within one round trip of each other
+  and no process is suspended: a previous-release voter that must win does so
+  by its second campaign, and a voter of this release that can win within
+  15.1 seconds.
 
 During the roll, a voter of this release that is cut off can raise its term
 and depose a healthy leader when it returns, as a previous-release voter can.

@@ -455,20 +455,32 @@ fn five_process_mixed_release_leader_loss_with_lagging_current_release_voters() 
 }
 
 /// Bound on electing a successor while a voter of the previous release is a
-/// member.
+/// member, when the leader is the only voter lost, every round trip completes
+/// within one heartbeat interval and no two voters campaign within one round
+/// trip of each other.
 ///
 /// A voter of this build that reaches such a voter runs the classic election
-/// for that campaign, as the previous release does, so the voter set elects as
-/// the previous release would. When only previous-release voters can win, one
-/// first campaigns within its 8 s lease, its maximum election timeout and one
-/// tick of its last leader contact, and a split vote adds one more
-/// previous-release election timeout and tick. When a voter of this build can
-/// win, it first campaigns within its own maximum election timeout and tick of
-/// its last leader contact, after at most one cold connection that tells it a
-/// voter cannot answer Pre-Vote. A previous-release lease, 8 s at most, may
-/// reject that campaign; it campaigns again within one more of its election
-/// timeouts and a tick, after every such lease has run out. The longer of the
-/// two paths is the bound.
+/// for that campaign, as the previous release does. A classic campaign of a
+/// voter whose log is behind still votes for itself in its next term, and a
+/// more up-to-date candidate is refused in that term. Each such voter refuses
+/// the eventual winner at most once: a voter of this build then defers its own
+/// next campaign by its 13 s greater-log timeout, and a previous-release voter
+/// that has seen a greater log campaigns at most once per 21 s (a 5 s minimum
+/// timeout and a 16 s greater-log timeout), longer than the winner's spacing.
+/// The winner therefore needs at most one more campaign:
+///
+/// - a previous-release voter that must win first campaigns within its 8 s
+///   lease, its maximum election timeout and one tick of its last leader
+///   contact, after every lease has run out, and again within one more
+///   election timeout and tick;
+/// - a voter of this build that can win first campaigns within its own maximum
+///   election timeout and tick of its last leader contact, after at most one
+///   cold connection that tells it a voter cannot answer Pre-Vote. A
+///   previous-release lease, 8 s at most, may reject that campaign; it
+///   campaigns again within one more of its election timeouts and a tick,
+///   after every such lease has run out.
+///
+/// The longer of the two paths is the bound.
 fn mixed_release_election_bound() -> Duration {
     let previous_release_lease = PREVIOUS_RELEASE_ELECTION_TIMEOUT_MAX;
     let previous_release_round =

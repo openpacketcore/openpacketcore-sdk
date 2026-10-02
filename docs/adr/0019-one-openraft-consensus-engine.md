@@ -115,9 +115,11 @@ timeout. AppendEntries has its own configurable deadline, separate from the
 heartbeat interval, and a closed replication stream gives up an in-flight
 AppendEntries at once. An optional Pre-Vote round keeps a voter that cannot win
 from raising its term, and a leader rejects other candidates while a quorum
-acknowledges it. Pre-Vote rounds carry an identifier, and a round that a
-running lease rejects is retried after the width of the election-timeout
-window. Pre-Vote is used only while every voter that can be reached is
+acknowledges it. Pre-Vote rounds carry an identifier and stay open for
+replies until their Vote deadline, and a round that a running lease rejects is
+retried after the width of the election-timeout window. A campaigning voter
+that refuses a more up-to-date candidate only because of its own vote defers
+its next campaign by the greater-log timeout. Pre-Vote is used only while every voter that can be reached is
 positively known to answer it; a voter that is not, such as a voter of a
 release without Pre-Vote, makes the campaign run the classic election, so such
 voters never block an election. Configuration validation requires the minimum
