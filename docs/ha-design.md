@@ -61,8 +61,10 @@ voters need CPU that is never throttled or suspended for that long. The
 derives these bounds from the pinned engine.
 
 The workspace temporarily exact-pins `openpacketcore/openraft` revision
-`72e327a4f25cbbe3a3695d8c3c0f0970ccb925d5`, containing release-0.9 through v0.9.25
-and the fork repairs for bounded apply and joined replication retirement.
+`5ab83b63bb199651f0b0a58a21acf89e24d77c27`, containing release-0.9 through v0.9.25
+and the fork repairs for bounded apply and joined replication retirement, the
+overlapping follower lease and election timeout, the separate AppendEntries
+deadline, Pre-Vote, and the leader's quorum-acknowledged lease.
 It preserves per-campaign election-timeout sampling without adding an SDK
 leader lease or second election/vote path. Until an official
 stable release contains that fix, an exact registry checksum replaces the git

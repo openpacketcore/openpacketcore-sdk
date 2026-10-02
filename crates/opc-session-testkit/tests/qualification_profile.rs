@@ -1634,7 +1634,7 @@ fn inventory_pins_workspace_msrv_source_build_gate_and_openraft_revision() {
     let workspace = include_str!("../../../Cargo.toml");
     assert!(workspace.contains("rust-version = \"1.89\""));
     assert!(workspace.contains(
-        "openraft = { version = \"=0.9.25\", git = \"https://github.com/openpacketcore/openraft\", rev = \"72e327a4f25cbbe3a3695d8c3c0f0970ccb925d5\""
+        "openraft = { version = \"=0.9.25\", git = \"https://github.com/openpacketcore/openraft\", rev = \"5ab83b63bb199651f0b0a58a21acf89e24d77c27\""
     ));
     for manifest in [
         include_str!("../../opc-alarm/Cargo.toml"),
@@ -1651,7 +1651,7 @@ fn inventory_pins_workspace_msrv_source_build_gate_and_openraft_revision() {
     let lockfile = include_str!("../../../Cargo.lock");
     assert!(lockfile.contains("name = \"openraft\"\nversion = \"0.9.25\""));
     assert!(lockfile.contains(
-        "source = \"git+https://github.com/openpacketcore/openraft?rev=72e327a4f25cbbe3a3695d8c3c0f0970ccb925d5#72e327a4f25cbbe3a3695d8c3c0f0970ccb925d5\""
+        "source = \"git+https://github.com/openpacketcore/openraft?rev=5ab83b63bb199651f0b0a58a21acf89e24d77c27#5ab83b63bb199651f0b0a58a21acf89e24d77c27\""
     ));
 }
 
@@ -1688,7 +1688,7 @@ fn cargo_metadata_matches_the_exact_openraft_and_foundation_feature_profile() {
     assert_eq!(openraft["req"], "=0.9.25");
     assert_eq!(
         openraft["source"],
-        "git+https://github.com/openpacketcore/openraft?rev=72e327a4f25cbbe3a3695d8c3c0f0970ccb925d5"
+        "git+https://github.com/openpacketcore/openraft?rev=5ab83b63bb199651f0b0a58a21acf89e24d77c27"
     );
     assert_eq!(
         openraft["features"],
@@ -1699,7 +1699,7 @@ fn cargo_metadata_matches_the_exact_openraft_and_foundation_feature_profile() {
     assert_eq!(resolved_openraft["version"], "0.9.25");
     assert_eq!(
         resolved_openraft["source"],
-        "git+https://github.com/openpacketcore/openraft?rev=72e327a4f25cbbe3a3695d8c3c0f0970ccb925d5#72e327a4f25cbbe3a3695d8c3c0f0970ccb925d5"
+        "git+https://github.com/openpacketcore/openraft?rev=5ab83b63bb199651f0b0a58a21acf89e24d77c27#5ab83b63bb199651f0b0a58a21acf89e24d77c27"
     );
     let fork_source = resolved_openraft["source"]
         .as_str()

@@ -105,6 +105,16 @@ profiles retain their original versions and revisions; the current manifest,
 lock and metadata checks bind this candidate separately. Dependency tests do
 not establish SDK qualification.
 
+The failover update advances the candidate to `5ab83b63bb199651f0b0a58a21acf89e24d77c27`. A
+follower now campaigns after the longer of its leader lease and its sampled
+election timeout instead of their sum, and the lease is the minimum election
+timeout. AppendEntries has its own configurable deadline, separate from the
+heartbeat interval. An optional Pre-Vote round keeps a voter that cannot win
+from raising its term, and a leader rejects other candidates while a quorum
+acknowledges it. These engine rules replace no SDK election, vote or quorum
+logic. Frozen qualification profiles retain their original revisions, and
+dependency tests do not establish SDK qualification.
+
 Registry 0.9.24 SDK one-shot leader-loss runs happened to pass. They do not
 invalidate the deterministic scripted engine regression or the historical
 observed-leader split-vote in the multi-process qualification harness: the

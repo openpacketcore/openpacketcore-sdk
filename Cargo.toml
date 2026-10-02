@@ -64,7 +64,7 @@ x509-parser = { version = "0.18.1" }
 rusqlite = { version = "0.40.2", features = ["fallible_uint"] }
 rcgen = { version = "0.14" }
 nix = { version = "0.31.3", default-features = false }
-openraft = { version = "=0.9.25", git = "https://github.com/openpacketcore/openraft", rev = "72e327a4f25cbbe3a3695d8c3c0f0970ccb925d5", features = ["serde", "storage-v2", "single-term-leader"] }
+openraft = { version = "=0.9.25", git = "https://github.com/openpacketcore/openraft", rev = "5ab83b63bb199651f0b0a58a21acf89e24d77c27", features = ["serde", "storage-v2", "single-term-leader"] }
 postcard = { version = "=1.1.3", default-features = false, features = ["alloc", "use-std"] }
 
 [workspace.lints.rust]
