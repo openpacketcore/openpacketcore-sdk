@@ -52,19 +52,24 @@ closes the queue and lets the detached actor drain without blocking `Drop`.
 
 - `XfrmBackend`: async port for SPI allocation, SA
   install/query/rekey/relocation/removal, policy install/rekey/remove, and
-  capability probing.
+  capability probing. The optional key-scoped read `query_sa_key_snapshot`
+  and `remove_sa_exact` are described in
+  [Key-scoped SA snapshots and exact SA removal](#key-scoped-sa-snapshots-and-exact-sa-removal).
 - `LinuxXfrmBackend`: safe adapter over `NETLINK_XFRM` through
   `opc-linux-xfrm-sys`.
 - `NamespaceBoundLinuxXfrmBackend`: cloneable bounded actor that keeps every
   Linux XFRM operation in one captured network namespace.
 - `MockXfrmBackend`: deterministic in-memory backend with operation capture,
   a source-compatible separate `MockSaRelocation` log, and failure injection.
+  Its SA lookups follow the Linux mark predicate and lookup order, and
+  `reverse_sa_lookup_order` simulates a hash resize.
 - `UnsupportedXfrmBackend`: trait-compatible unsupported backend.
 - Model exports include `IpAddress`, `XfrmSelector`, `XfrmId`, `SaParameters`,
   `PolicyParameters`, `XfrmTemplate`, `InstallSaRequest`,
   `InstallPolicyRequest`, `QuerySaRequest`, `SaState`, `SaReplayState`,
   `SaRelocationSelector`, `SaRelocationIdentity`, `SaRelocationEncap`,
-  `SaRelocationDirection`, `RelocateSaRequest`,
+  `SaRelocationDirection`, `RelocateSaRequest`, `SaLookupKey`,
+  `SaKeySnapshot`, `ExactRemoveSaRequest`,
   `XfrmRequestId`, `UdpEncap`, `UdpEncapError`, `XfrmMark`, `DscpCodepoint`,
   `LifetimeConfig`, and `XfrmProbe`.
 - Algorithm/key exports include `Algorithm`, `AuthAlgorithm`, `AeadAlgorithm`,
@@ -1155,9 +1160,105 @@ guarantees this crate can make:
   the tuple, but it will admit an unmarked state alongside marked ones. Do not
   mix unmarked and marked SAs on one destination/protocol/SPI.
 - A foreign state installed by another writer with a narrower mask still
-  widens the lookup domain. Proving otherwise would require dumping the tuple
-  on every removal, which this crate does not do; it fails closed on the
-  request instead.
+  widens the lookup domain. The exact-profile paths above do not read the
+  whole tuple and fail closed on the request instead. `remove_sa_exact` does
+  read it: see
+  [Key-scoped SA snapshots and exact SA removal](#key-scoped-sa-snapshots-and-exact-sa-removal).
+
+## Key-scoped SA snapshots and exact SA removal
+
+`XfrmBackend::remove_sa` sends `XFRM_MSG_DELSA`, and Linux deletes the state
+that its own lookup selects. `__xfrm_state_lookup` walks the SPI hash chain of
+the destination/protocol/SPI key and returns the first state whose stored mark
+satisfies `(lookup & mask) == value`. Several states can match one lookup: an
+unmarked state matches every lookup value, and a narrower mask can overlap a
+full one. New states go to the head of the chain, and a hash resize can
+reverse it, so no sequence of point queries proves which matching state the
+next lookup selects. A GETSA that carries a marked SA's own mark can return an
+unmarked SA added later at the same key, and a DELSA can delete it.
+
+`XfrmBackend::query_sa_key_snapshot` reads every state at one `SaLookupKey`,
+whatever its mark, as a complete `SaRelocationIdentity` each. The key is a
+destination, a protocol (AH, ESP, or IPComp, the protocols Linux looks up by
+SPI), and a nonzero SPI. `SaKeySnapshot::lookup_candidates` applies the lookup
+predicate to the result. The Linux backend sends one `XFRM_MSG_GETSA` dump
+(`NLM_F_DUMP`). The kernel filters it by family and exact destination
+(`XFRMA_ADDRESS_FILTER`) and by protocol (`XFRMA_PROTO`), and the backend
+keeps only the replies whose family, destination bytes, protocol, and SPI
+equal the key, so a kernel that ignored a filter would cost time, not
+correctness. The dump walks the namespace's list of states, not the hash
+chains, so it does not depend on chain order. States are reported newest
+first. That order is not the lookup order.
+
+`XfrmBackend::remove_sa_exact` takes the expected identity, normally from an
+earlier snapshot or `query_sa_relocation_identity`, reads its key, and sends
+DELSA with the expected lookup mark only when that mark has exactly one
+candidate at the key and the candidate equals the expected identity on every
+`SaRelocationIdentity` field. With one candidate, chain order cannot change
+which state the deletion selects. Otherwise no DELSA is sent:
+
+| Snapshot for the expected lookup mark | Result |
+|:--|:--|
+| One candidate, equal to the expected identity | DELSA sent; its result is returned |
+| Two or more candidates | `StateIndeterminate` (`remove_sa_exact_preflight`) |
+| One candidate that differs | `StateMismatch` (`remove_sa_exact_preflight`) |
+| No candidate | `NotFound` |
+| Read failed or could not be proven complete | the read's error |
+
+```rust,no_run
+use opc_ipsec_xfrm::{ExactRemoveSaRequest, SaLookupKey, XfrmBackend, XfrmLookupMark};
+
+async fn remove_owned_marked_sa(
+    backend: &impl XfrmBackend,
+    key: SaLookupKey,
+    mark: XfrmLookupMark,
+) -> Result<(), opc_ipsec_xfrm::XfrmError> {
+    let snapshot = backend.query_sa_key_snapshot(key).await?;
+    // The state this process installed, identified by its mark.
+    let Some(owned) = snapshot.states().iter().find(|state| state.mark == Some(mark)) else {
+        return Ok(());
+    };
+    // Refused with StateIndeterminate while another state, such as an
+    // unmarked one, also answers this mark at the key.
+    backend
+        .remove_sa_exact(ExactRemoveSaRequest::new(owned.clone()))
+        .await
+}
+```
+
+Linux releases `xfrm_state_lock` between the batches of a multipart dump. A
+state present at the key for the whole read is always reported; a state added
+to or removed from the key while the read runs may or may not be. Current
+Linux keeps no change sequence for XFRM state dumps and never sets
+`NLM_F_DUMP_INTR` on them, so a concurrent writer cannot be detected. A snapshot therefore equals the key's
+states only while no other writer changes them, and `remove_sa_exact` needs
+the same exclusion across its read and its deletion. Excluding other writers
+at the key is a caller precondition, as for `remove_policy_exact`; kernel
+expiry can still remove a state, which only shrinks the set. On the namespace
+actor the read and the deletion run as one command, so no other operation on
+that actor can run between them, but the actor cannot exclude other
+processes.
+
+The read never reports a partial dump as complete. A dump flagged with
+`NLM_F_DUMP_INTR`, or an `NLMSG_OVERRUN`, is discarded and repeated whole on a
+fresh socket and sequence, at most four times, and then fails with
+`StateIndeterminate`. A receive failure, an oversized datagram
+(`ResponseTooLarge`), a malformed or foreign message, an error status, or a
+missing `NLMSG_DONE` fails the read. A state at the key that the SDK cannot
+represent, such as one with a nonzero NAT-T original address, also fails the
+read rather than being left out; states at other keys are skipped without
+being decoded. Each read makes the kernel walk every state in the namespace,
+and the destination filter passes every state at the key's destination; for
+an inbound SA that is usually every inbound SA on the local address. Like
+GETSA, the dump carries the key material of every state it reports. The
+backend reads it only into its zeroizing receive buffer and keeps none of it.
+
+`MockXfrmBackend` models the same lookup: queries, rekeys, relocations, and
+removals select the first state at the key whose mark matches, an install
+collides when its own mark's lookup selects an existing state, and new states
+go to the head. `reverse_sa_lookup_order` reverses the order at every key, as a
+hash resize can, while its snapshots keep creation order. The mock runs
+`remove_sa_exact` under one lock.
 
 ## Per-SA output marks
 
@@ -1421,6 +1522,7 @@ cargo test -p opc-ipsec-xfrm --features ikev2
 sudo OPC_XFRM_RUN_NAMESPACE_PRIVILEGED=1 cargo test -p opc-ipsec-xfrm --test xfrm_namespace_bound_privileged -- --ignored --nocapture
 sudo unshare -n -- bash -lc 'ip link set lo up && OPC_XFRM_RUN_PRIVILEGED=1 cargo test -p opc-ipsec-xfrm --test xfrm_dscp_privileged -- --ignored --nocapture'
 sudo unshare -n -- bash -lc 'ip link set lo up && OPC_XFRM_RUN_RELOCATION_PRIVILEGED=1 cargo test -p opc-ipsec-xfrm --test xfrm_relocation_privileged -- --ignored --nocapture'
+sudo unshare -n -- bash -lc 'ip link set lo up && OPC_XFRM_RUN_SA_KEY_SNAPSHOT_PRIVILEGED=1 cargo test -p opc-ipsec-xfrm --test xfrm_sa_key_snapshot_privileged -- --ignored --nocapture'
 sudo unshare -n -- bash -lc 'ip link set lo up && OPC_XFRM_RUN_AUTH_ONLY_PRIVILEGED=1 cargo test -p opc-ipsec-xfrm --features ikev2 --test xfrm_auth_only_privileged -- --ignored --nocapture'
 ```
 

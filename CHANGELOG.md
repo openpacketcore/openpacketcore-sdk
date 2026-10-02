@@ -102,6 +102,33 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- `opc-ipsec-xfrm` / `opc-linux-xfrm-sys`: key-scoped SA snapshots and exact
+  SA removal. Closes #1050.
+  - `XfrmBackend::query_sa_key_snapshot(SaLookupKey)` reads every SA at one
+    destination/protocol/SPI key, whatever its lookup mark, as an
+    `SaKeySnapshot` of complete `SaRelocationIdentity` values.
+    `SaKeySnapshot::lookup_candidates` applies the Linux lookup predicate
+    `(lookup & mask) == value`. Linux reads the key with one `XFRM_MSG_GETSA`
+    dump (`NLM_F_DUMP`) that the kernel filters with `XFRMA_ADDRESS_FILTER`
+    and `XFRMA_PROTO` and the backend narrows to the key on every reply, so
+    the result does not depend on SPI hash-chain order. A dump flagged
+    `NLM_F_DUMP_INTR`, or an `NLMSG_OVERRUN`, is repeated whole on a fresh
+    socket at most four times and then fails with `StateIndeterminate`; no
+    partial dump is returned.
+  - `XfrmBackend::remove_sa_exact(ExactRemoveSaRequest)` sends
+    `XFRM_MSG_DELSA` only when that read shows exactly one lookup candidate
+    for the expected mark and it equals the expected identity. Otherwise it
+    sends nothing and returns `StateIndeterminate` (several candidates, for
+    example a marked SA and an unmarked SA at one key), `StateMismatch` (one
+    different candidate) or `NotFound`. The namespace actor runs the read and
+    the deletion as one admitted mutation. Excluding other writers at the key
+    remains a caller precondition: XFRM state dumps carry no change sequence.
+  - Both methods have defaults, so existing backends stay source compatible;
+    `UnsupportedXfrmBackend` returns `UnsupportedPlatform`.
+  - `opc-linux-xfrm-sys` adds `NLM_F_DUMP_INTR`, `NLM_F_ROOT`, `NLM_F_MATCH`,
+    `NLM_F_DUMP`, `XFRMA_PROTO`, `XFRMA_ADDRESS_FILTER`, and the
+    `XfrmAddressFilter` layout, each citing its UAPI header.
+
 - `opc-persist`: add an online audit recipient client and authority-owned
   verification session without exporting signing keys. Verify actual received
   pages, frozen-range completeness and fresh independent checkpoints; bind
@@ -498,6 +525,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 
 ### Changed
+- `opc-ipsec-xfrm`: `MockXfrmBackend` selects SA states with the Linux lookup
+  predicate and lookup order instead of exact mark-pair equality, closing the
+  gap noted under #419. A marked query, rekey, relocation, or removal can now
+  select an unmarked state at the same key. An install collides when a lookup
+  with its own mark selects an existing state, so a marked install after an
+  unmarked one at the key returns `AlreadyExists`, as on Linux. New states go
+  to the head of the key's lookup order, and `reverse_sa_lookup_order`
+  simulates a hash resize. Tests that install overlapping marked and unmarked
+  SAs at one key can observe different results (Refs #1050).
 - `opc-diameter-transport`: expose an opaque generic RFC 6083 connector,
   acceptor and protected connection using the existing mutual DTLS/SCTP
   machinery without Diameter procedure state. Admit protected PPIDs 47 and 66
