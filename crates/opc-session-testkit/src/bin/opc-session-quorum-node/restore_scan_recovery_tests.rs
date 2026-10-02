@@ -309,7 +309,11 @@ async fn restore_scan_reproof_keeps_work_budget_errors_terminal() {
 async fn restore_scan_reproof_uses_remaining_original_deadline() {
     let started = tokio::time::Instant::now();
     let deadline = traffic_recovery_deadline(started, None);
-    tokio::time::advance(Duration::from_secs(25)).await;
+    // Stop one second before the original episode deadline.
+    tokio::time::advance(Duration::from_millis(
+        QUALIFICATION_TRAFFIC_AVAILABILITY_RECOVERY_MILLIS - 1_000,
+    ))
+    .await;
     let entered = Arc::new(Notify::new());
     let entered_scan = Arc::clone(&entered);
     let task = tokio::spawn(async move {

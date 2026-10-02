@@ -233,7 +233,11 @@ async fn readiness_checkpoint_recovers_after_counting_a_real_failed_reproof() {
 async fn readiness_reproof_uses_the_remaining_original_episode_deadline() {
     let started = tokio::time::Instant::now();
     let deadline = traffic_recovery_deadline(started, None);
-    tokio::time::advance(Duration::from_secs(25)).await;
+    // Stop one second before the original episode deadline.
+    tokio::time::advance(Duration::from_millis(
+        QUALIFICATION_TRAFFIC_AVAILABILITY_RECOVERY_MILLIS - 1_000,
+    ))
+    .await;
     let entered = Arc::new(Notify::new());
     let entered_probe = Arc::clone(&entered);
     let task = tokio::spawn(async move {
