@@ -327,6 +327,19 @@ impl LeaderRoute {
     fn superseded_by(self, observed: Option<SessionConsensusNodeId>) -> bool {
         observed.is_some_and(|leader| leader != self.target) && observed != self.chosen_under
     }
+
+    /// Record that the local view names `observed`, and return whether that supersedes this
+    /// route.
+    ///
+    /// A view that names the target confirms the route: from then on, the leader a redirect was
+    /// chosen under no longer exempts it, so that leader leading again supersedes it like any
+    /// other.
+    fn observe(&mut self, observed: Option<SessionConsensusNodeId>) -> bool {
+        if observed == Some(self.target) {
+            self.chosen_under = Some(self.target);
+        }
+        self.superseded_by(observed)
+    }
 }
 
 #[cfg(test)]
@@ -366,6 +379,24 @@ mod leader_route_tests {
         assert!(!unknown.superseded_by(None));
         assert!(!unknown.superseded_by(Some(node(2))));
         assert!(unknown.superseded_by(Some(node(1))));
+    }
+
+    #[test]
+    fn a_redirected_route_confirmed_by_the_view_is_superseded_by_its_source() {
+        let mut route = LeaderRoute {
+            target: node(2),
+            chosen_under: Some(node(1)),
+        };
+        assert!(!route.observe(Some(node(1))), "the stale local view");
+        assert!(
+            !route.observe(Some(node(2))),
+            "the view confirms the target"
+        );
+        assert!(!route.observe(None));
+        assert!(
+            route.observe(Some(node(1))),
+            "the source leading again supersedes the confirmed route"
+        );
     }
 }
 const FENCED_TRANSITION_V2_STATUS_LEADER_COLLECTION_WINDOW: Duration = Duration::from_micros(500);
@@ -9187,7 +9218,8 @@ impl ConsensusSessionStore {
     /// If the local engine already names a leader other than both the
     /// route's target and the leader it named when the route was chosen, the
     /// call is not sent and reports `BeforeTransmission`, so the caller
-    /// refreshes its route. Once the engine names such a leader while the call
+    /// refreshes its route. Once the view names the target, the leader a
+    /// redirect was chosen under no longer exempts the route. Once the engine names such a leader while the call
     /// is in flight, the call keeps [`STALE_LEADER_ROUTE_GRACE`] for an answer
     /// already in flight and is then abandoned. Abandonment never proves that
     /// the request stayed undelivered, so it reports `AfterTransmission`
@@ -9195,11 +9227,11 @@ impl ConsensusSessionStore {
     /// identity or report an unknown outcome.
     async fn bound_by_local_leader_view<T>(
         &self,
-        route: LeaderRoute,
+        mut route: LeaderRoute,
         call: impl Future<Output = Result<T, ConsensusPeerCallFailure>>,
     ) -> Result<T, ConsensusPeerCallFailure> {
         let mut metrics = self.inner.raft.metrics();
-        if route.superseded_by(metrics.borrow_and_update().current_leader) {
+        if route.observe(metrics.borrow_and_update().current_leader) {
             // The call future has not been polled, so nothing was sent.
             return Err(ConsensusPeerCallFailure::BeforeTransmission);
         }
@@ -9212,7 +9244,7 @@ impl ConsensusSessionStore {
                     if changed.is_err() {
                         return call.await;
                     }
-                    if route.superseded_by(metrics.borrow_and_update().current_leader) {
+                    if route.observe(metrics.borrow_and_update().current_leader) {
                         break;
                     }
                 }
