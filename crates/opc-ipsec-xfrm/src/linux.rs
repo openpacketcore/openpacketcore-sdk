@@ -16,14 +16,15 @@ use opc_linux_xfrm_sys::{
     align_to_netlink, open_netlink_socket, receive_message_outcome, send_message,
     ReceiveMessageOutcome, LINUX_EINVAL, LINUX_ENOPROTOOPT, NLMSG_DONE, NLMSG_ERROR, NLMSG_NOOP,
     NLMSG_OVERRUN, NLM_F_ACK, NLM_F_CREATE, NLM_F_DUMP, NLM_F_DUMP_INTR, NLM_F_EXCL, NLM_F_MULTI,
-    NLM_F_REPLACE, NLM_F_REQUEST, XFRMA_ADDRESS_FILTER, XFRMA_ALG_AEAD, XFRMA_ALG_AUTH,
-    XFRMA_ALG_AUTH_TRUNC, XFRMA_ALG_CRYPT, XFRMA_ENCAP, XFRMA_IF_ID, XFRMA_LASTUSED, XFRMA_MARK,
-    XFRMA_OFFLOAD_DEV, XFRMA_PAD, XFRMA_POLICY_TYPE, XFRMA_PROTO, XFRMA_REPLAY_ESN_VAL,
-    XFRMA_REPLAY_VAL, XFRMA_SA_DIR, XFRMA_SET_MARK, XFRMA_SET_MARK_MASK, XFRMA_TMPL, XFRM_AE_RVAL,
-    XFRM_MSG_ALLOCSPI, XFRM_MSG_DELPOLICY, XFRM_MSG_DELSA, XFRM_MSG_GETPOLICY, XFRM_MSG_GETSA,
-    XFRM_MSG_MIGRATE_STATE, XFRM_MSG_NEWAE, XFRM_MSG_NEWPOLICY, XFRM_MSG_NEWSA, XFRM_MSG_UPDPOLICY,
-    XFRM_MSG_UPDSA, XFRM_POLICY_ALLOW, XFRM_POLICY_BLOCK, XFRM_POLICY_FWD, XFRM_POLICY_IN,
-    XFRM_POLICY_OUT, XFRM_POLICY_TYPE_MAIN, XFRM_SA_DIR_IN, XFRM_SA_DIR_OUT, XFRM_STATE_ESN,
+    NLM_F_REPLACE, NLM_F_REQUEST, XFRMA_ALG_AEAD, XFRMA_ALG_AUTH, XFRMA_ALG_AUTH_TRUNC,
+    XFRMA_ALG_CRYPT, XFRMA_ENCAP, XFRMA_IF_ID, XFRMA_LASTUSED, XFRMA_MARK, XFRMA_OFFLOAD_DEV,
+    XFRMA_PAD, XFRMA_POLICY_TYPE, XFRMA_REPLAY_ESN_VAL, XFRMA_REPLAY_VAL, XFRMA_SAD_CNT,
+    XFRMA_SA_DIR, XFRMA_SET_MARK, XFRMA_SET_MARK_MASK, XFRMA_TMPL, XFRM_AE_RVAL, XFRM_MSG_ALLOCSPI,
+    XFRM_MSG_DELPOLICY, XFRM_MSG_DELSA, XFRM_MSG_GETPOLICY, XFRM_MSG_GETSA, XFRM_MSG_GETSADINFO,
+    XFRM_MSG_MIGRATE_STATE, XFRM_MSG_NEWAE, XFRM_MSG_NEWPOLICY, XFRM_MSG_NEWSA,
+    XFRM_MSG_NEWSADINFO, XFRM_MSG_UPDPOLICY, XFRM_MSG_UPDSA, XFRM_POLICY_ALLOW, XFRM_POLICY_BLOCK,
+    XFRM_POLICY_FWD, XFRM_POLICY_IN, XFRM_POLICY_OUT, XFRM_POLICY_TYPE_MAIN, XFRM_SA_DIR_IN,
+    XFRM_SA_DIR_OUT, XFRM_STATE_ESN,
 };
 use subtle::ConstantTimeEq;
 use zeroize::Zeroizing;
@@ -81,7 +82,6 @@ const XFRM_ALGO_HEADER_LEN: usize = 68;
 const XFRM_ALGO_AUTH_HEADER_LEN: usize = 72;
 const XFRM_ALGO_AEAD_HEADER_LEN: usize = 72;
 const XFRM_MARK_LEN: usize = 8;
-const XFRM_ADDRESS_FILTER_LEN: usize = 36;
 const XFRM_ENCAP_TEMPLATE_LEN: usize = 24;
 const XFRM_REPLAY_STATE_LEN: usize = 12;
 const XFRM_REPLAY_STATE_ESN_BASE_LEN: usize = 24;
@@ -101,10 +101,13 @@ const XFRM_KEY_READBACK_REDACTED: &str = "xfrm_key_readback_redacted";
 const EXACT_POLICY_REMOVAL_PREFLIGHT: &str = "remove_policy_exact_preflight";
 const SA_KEY_SNAPSHOT: &str = "query_sa_key_snapshot";
 const EXACT_SA_REMOVAL: &str = "remove_sa_exact";
-/// Complete `XFRM_MSG_GETSA` dumps attempted before an interrupted key read
-/// fails closed. Current Linux never flags an XFRM state dump interrupted;
-/// the bound keeps a future kernel that does from stalling the actor.
-const SA_KEY_SNAPSHOT_DUMP_ATTEMPTS: usize = 4;
+/// Counted key reads attempted before a key read fails closed.
+///
+/// A read is repeated when the kernel flags its dump interrupted or when the
+/// dumped state count disagrees with the SAD count around it. A state too
+/// large for a dump batch disagrees on every attempt, so the bound also
+/// limits how many whole-namespace dumps one refused read costs.
+const SA_KEY_SNAPSHOT_READ_ATTEMPTS: usize = 4;
 
 pub(crate) type SensitiveBuffer = Zeroizing<Vec<u8>>;
 
@@ -116,7 +119,9 @@ pub(crate) enum NetlinkOperationClass {
 
 fn netlink_operation_class(message_type: u16) -> NetlinkOperationClass {
     match message_type {
-        XFRM_MSG_GETSA | XFRM_MSG_GETPOLICY => NetlinkOperationClass::ReadOnly,
+        XFRM_MSG_GETSA | XFRM_MSG_GETPOLICY | XFRM_MSG_GETSADINFO => {
+            NetlinkOperationClass::ReadOnly
+        }
         _ => NetlinkOperationClass::Mutation,
     }
 }
@@ -131,6 +136,12 @@ pub struct LinuxXfrmBackendConfig {
     /// A consumed response above this bound makes a mutation
     /// [`XfrmError::StateIndeterminate`] and makes a read
     /// [`XfrmError::ResponseTooLarge`].
+    ///
+    /// A key snapshot also sets the kernel's state-dump batch size with it
+    /// (Linux caps a batch at about 32 KiB). A state whose dump message does
+    /// not fit one batch makes the snapshot fail closed with
+    /// [`XfrmError::StateIndeterminate`]; a larger bound admits larger
+    /// states, such as those with long HMAC keys.
     pub receive_buffer_len: usize,
     /// Delay between nonblocking receive attempts.
     pub retry_delay: Duration,
@@ -881,52 +892,110 @@ impl LinuxXfrmBackend {
         parse_sa_relocation_snapshot(&response)
     }
 
-    /// Read every state at `key` with one complete `XFRM_MSG_GETSA` dump.
+    /// Read every state at `key` with a counted, unfiltered state dump.
     ///
-    /// The kernel walks `state_all` under `xfrm_state_lock`, so the read does
-    /// not depend on SPI hash-chain order. It releases that lock between
-    /// multipart batches. A dump the kernel flags as interrupted is
-    /// discarded whole and repeated with a fresh socket and sequence, at most
-    /// [`SA_KEY_SNAPSHOT_DUMP_ATTEMPTS`] times.
+    /// Linux can end an `XFRM_MSG_GETSA` dump with a successful `NLMSG_DONE`
+    /// although states are missing: when one state's message does not fit an
+    /// empty dump batch, `xfrm_dump_sa` returns the batch length and drops
+    /// the `-EMSGSIZE` from `xfrm_state_walk`, so that state and every older
+    /// one are never sent. A completion message therefore proves nothing.
+    /// Each attempt instead reads the SAD state count
+    /// (`XFRM_MSG_GETSADINFO`), dumps every state in the namespace, and reads
+    /// the count again, all on one socket. The read is complete only when the
+    /// kernel reported no interruption and the dump returned exactly as many
+    /// states as both counts. Otherwise it is repeated whole on a fresh
+    /// socket, at most [`SA_KEY_SNAPSHOT_READ_ATTEMPTS`] times, and then
+    /// fails with [`XfrmError::StateIndeterminate`].
     fn snapshot_sa_key(
         &self,
         key: SaLookupKey,
         operation: &'static str,
     ) -> Result<SaKeySnapshot, XfrmError> {
-        let body = encode_sa_key_dump_request(key)?;
-        for attempt in 0..SA_KEY_SNAPSHOT_DUMP_ATTEMPTS {
+        for attempt in 0..SA_KEY_SNAPSHOT_READ_ATTEMPTS {
             if attempt > 0 && !self.inner.config.retry_delay.is_zero() {
                 std::thread::sleep(self.inner.config.retry_delay);
             }
             // Keep the identity check adjacent to transport socket creation,
             // as `transact` does.
             self.ensure_namespace_binding()?;
-            let sequence = self.next_sequence();
-            let request = encode_netlink_message(
-                XFRM_MSG_GETSA,
-                NLM_F_REQUEST | NLM_F_DUMP,
-                sequence,
-                &body,
-            )?;
-            let mut states = Vec::new();
-            let completion = self.inner.transport.dump(
-                operation,
-                &request,
-                sequence,
-                XFRM_MSG_NEWSA,
-                self.inner.config,
-                &mut |message| {
-                    if let Some(identity) = sa_key_member_identity(message, key, operation)? {
-                        states.push(identity);
-                    }
-                    Ok(())
-                },
-            )?;
-            if completion == NetlinkDumpCompletion::Complete {
-                return SaKeySnapshot::new(key, states);
+            let mut session = self.inner.transport.open_session(operation)?;
+            if let Some(snapshot) = self.counted_sa_key_read(session.as_mut(), key, operation)? {
+                return Ok(snapshot);
             }
         }
         Err(XfrmError::StateIndeterminate { operation })
+    }
+
+    /// One counted key read on one socket: SAD count, unfiltered dump, SAD
+    /// count. `Ok(None)` means the read cannot be proven complete.
+    fn counted_sa_key_read(
+        &self,
+        session: &mut dyn LinuxXfrmSession,
+        key: SaLookupKey,
+        operation: &'static str,
+    ) -> Result<Option<SaKeySnapshot>, XfrmError> {
+        // Receiving this reply with the configured buffer also sets the
+        // socket's dump batch size (`max_recvmsg_len`). On a fresh socket
+        // the first batch would otherwise be `NLMSG_GOODSIZE`, about 3.7 KiB
+        // with 4 KiB pages.
+        let count_before = self.sad_state_count(session, operation)?;
+        let sequence = self.next_sequence();
+        // No `XFRMA_ADDRESS_FILTER` or `XFRMA_PROTO`: the count covers every
+        // state in the namespace, so the dump must as well.
+        session.send(&encode_netlink_message(
+            XFRM_MSG_GETSA,
+            NLM_F_REQUEST | NLM_F_DUMP,
+            sequence,
+            &[],
+        )?)?;
+        let mut dumped = 0_u64;
+        let mut states = Vec::new();
+        let config = self.inner.config;
+        let completion = receive_netlink_dump(
+            operation,
+            sequence,
+            XFRM_MSG_NEWSA,
+            config,
+            |buffer| session.receive(buffer),
+            &mut |message| {
+                dumped = dumped.saturating_add(1);
+                if let Some(identity) = sa_key_member_identity(message, key, operation)? {
+                    states.push(identity);
+                }
+                Ok(())
+            },
+        )?;
+        // An interrupted dump's later batches may still be queued on this
+        // socket, so it carries no further request; the read restarts on a
+        // fresh one.
+        if completion == NetlinkDumpCompletion::Interrupted {
+            return Ok(None);
+        }
+        let count_after = self.sad_state_count(session, operation)?;
+        if dumped == u64::from(count_before) && count_before == count_after {
+            return SaKeySnapshot::new(key, states).map(Some);
+        }
+        Ok(None)
+    }
+
+    /// Read the namespace's SAD state count (`XFRMA_SAD_CNT`).
+    fn sad_state_count(
+        &self,
+        session: &mut dyn LinuxXfrmSession,
+        operation: &'static str,
+    ) -> Result<u32, XfrmError> {
+        let sequence = self.next_sequence();
+        // No `NLM_F_ACK`: an acknowledgement would follow the reply as a
+        // second datagram on a socket that is about to carry a dump.
+        session.send(&encode_netlink_message(
+            XFRM_MSG_GETSADINFO,
+            NLM_F_REQUEST,
+            sequence,
+            &0_u32.to_ne_bytes(),
+        )?)?;
+        receive_sad_state_count(operation, sequence, self.inner.config, |buffer| {
+            session.receive(buffer)
+        })
     }
 
     async fn snapshot_sa_key_blocking(
@@ -1650,31 +1719,53 @@ pub(crate) trait LinuxXfrmTransport: Send + Sync + fmt::Debug {
 
     fn probe(&self, config: LinuxXfrmBackendConfig) -> XfrmProbe;
 
-    /// Send one `NLM_F_DUMP` request and pass the body of every
-    /// `reply_message_type` message to `visit` until `NLMSG_DONE`.
+    /// Open one socket for an exchange of several requests, such as a
+    /// counted key read.
     ///
-    /// Transports without dump support fail closed, which keeps every
-    /// existing transport source compatible.
-    fn dump(
+    /// Transports without sessions fail closed, which keeps every existing
+    /// transport source compatible.
+    fn open_session(
         &self,
         operation: &'static str,
-        request: &[u8],
-        expected_sequence: u32,
-        reply_message_type: u16,
-        config: LinuxXfrmBackendConfig,
-        visit: &mut dyn FnMut(&[u8]) -> Result<(), XfrmError>,
-    ) -> Result<NetlinkDumpCompletion, XfrmError> {
-        let _ = (
-            operation,
-            request,
-            expected_sequence,
-            reply_message_type,
-            config,
-            visit,
-        );
+    ) -> Result<Box<dyn LinuxXfrmSession>, XfrmError> {
+        let _ = operation;
         Err(XfrmError::UnsupportedFeature {
             feature: "sa_key_snapshot",
         })
+    }
+}
+
+/// One netlink socket that carries several requests in order.
+///
+/// Every reply must be received before the next request is sent.
+pub(crate) trait LinuxXfrmSession {
+    /// Send one complete request datagram.
+    fn send(&mut self, request: &[u8]) -> Result<(), XfrmError>;
+
+    /// Receive and classify one datagram, as `receive_message_outcome` does.
+    fn receive(&mut self, buffer: &mut [u8]) -> io::Result<ReceiveMessageOutcome>;
+}
+
+#[derive(Debug)]
+struct NetlinkXfrmSession {
+    socket: opc_linux_xfrm_sys::NetlinkSocket,
+}
+
+impl LinuxXfrmSession for NetlinkXfrmSession {
+    fn send(&mut self, request: &[u8]) -> Result<(), XfrmError> {
+        let sent = send_message(&self.socket, request)
+            .map_err(|error| XfrmError::io("netlink_send", error))?;
+        if sent != request.len() {
+            return Err(XfrmError::io(
+                "netlink_send",
+                io::Error::new(io::ErrorKind::WriteZero, "short netlink send"),
+            ));
+        }
+        Ok(())
+    }
+
+    fn receive(&mut self, buffer: &mut [u8]) -> io::Result<ReceiveMessageOutcome> {
+        receive_message_outcome(&self.socket, buffer)
     }
 }
 
@@ -1709,34 +1800,14 @@ impl LinuxXfrmTransport for NetlinkXfrmTransport {
         )
     }
 
-    fn dump(
+    fn open_session(
         &self,
         operation: &'static str,
-        request: &[u8],
-        expected_sequence: u32,
-        reply_message_type: u16,
-        config: LinuxXfrmBackendConfig,
-        visit: &mut dyn FnMut(&[u8]) -> Result<(), XfrmError>,
-    ) -> Result<NetlinkDumpCompletion, XfrmError> {
-        // A fresh socket per dump: an abandoned dump's later batches can
+    ) -> Result<Box<dyn LinuxXfrmSession>, XfrmError> {
+        // A fresh socket per read: an abandoned dump's later batches can
         // never be read as part of a retry.
         let socket = open_netlink_socket().map_err(|error| map_open_error(operation, error))?;
-        let sent =
-            send_message(&socket, request).map_err(|error| XfrmError::io("netlink_send", error))?;
-        if sent != request.len() {
-            return Err(XfrmError::io(
-                "netlink_send",
-                io::Error::new(io::ErrorKind::WriteZero, "short netlink send"),
-            ));
-        }
-        receive_netlink_dump(
-            operation,
-            expected_sequence,
-            reply_message_type,
-            config,
-            |buffer| receive_message_outcome(&socket, buffer),
-            visit,
-        )
+        Ok(Box::new(NetlinkXfrmSession { socket }))
     }
 
     fn probe(&self, _config: LinuxXfrmBackendConfig) -> XfrmProbe {
@@ -2042,6 +2113,106 @@ fn netlink_status_error(operation: &'static str, status: i32) -> XfrmError {
         operation,
         io::Error::from_raw_os_error(status.saturating_abs()),
     )
+}
+
+/// Receive the one-datagram `XFRM_MSG_NEWSADINFO` reply and return its
+/// `XFRMA_SAD_CNT`.
+fn receive_sad_state_count(
+    operation: &'static str,
+    expected_sequence: u32,
+    config: LinuxXfrmBackendConfig,
+    mut receive: impl FnMut(&mut [u8]) -> io::Result<ReceiveMessageOutcome>,
+) -> Result<u32, XfrmError> {
+    let mut buffer = Zeroizing::new(vec![0_u8; config.receive_buffer_len]);
+    for _ in 0..config.receive_attempts {
+        match receive(&mut buffer) {
+            Ok(ReceiveMessageOutcome::Complete { bytes_received: 0 }) => {}
+            Ok(ReceiveMessageOutcome::Complete { bytes_received }) => {
+                let datagram = buffer.get(..bytes_received).ok_or_else(|| {
+                    XfrmError::io(
+                        "netlink_receive",
+                        invalid_data("receive length exceeded bounded buffer"),
+                    )
+                })?;
+                return parse_sad_state_count_reply(operation, datagram, expected_sequence);
+            }
+            Ok(ReceiveMessageOutcome::ConsumedOversize {
+                buffer_bytes,
+                datagram_bytes,
+            }) => {
+                return Err(XfrmError::ResponseTooLarge {
+                    operation,
+                    buffer_bytes,
+                    datagram_bytes,
+                });
+            }
+            Ok(ReceiveMessageOutcome::RejectedNonKernel) => {}
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    io::ErrorKind::WouldBlock | io::ErrorKind::Interrupted
+                ) => {}
+            Err(error) => return Err(XfrmError::io("netlink_receive", error)),
+            Ok(_) => {
+                return Err(XfrmError::io(
+                    "netlink_receive",
+                    invalid_data("unsupported receive outcome"),
+                ));
+            }
+        }
+        if !config.retry_delay.is_zero() {
+            std::thread::sleep(config.retry_delay);
+        }
+    }
+    Err(XfrmError::StateIndeterminate { operation })
+}
+
+/// Parse a datagram that must hold exactly one `XFRM_MSG_NEWSADINFO`
+/// message: a `__u32` flags word, then attributes with exactly one
+/// four-byte `XFRMA_SAD_CNT`. An error reply maps to its errno.
+fn parse_sad_state_count_reply(
+    operation: &'static str,
+    datagram: &[u8],
+    expected_sequence: u32,
+) -> Result<u32, XfrmError> {
+    let malformed = |reason: &'static str| XfrmError::io(operation, invalid_data(reason));
+    if datagram.len() < NETLINK_HEADER_LEN {
+        return Err(malformed("short netlink header"));
+    }
+    let length = read_u32_ne(datagram, 0)? as usize;
+    if length < NETLINK_HEADER_LEN || length > datagram.len() {
+        return Err(malformed("invalid netlink length"));
+    }
+    let aligned_end = align_to_netlink(length)
+        .ok_or_else(|| malformed("netlink alignment overflow"))?
+        .min(datagram.len());
+    if aligned_end != datagram.len() || datagram[length..].iter().any(|octet| *octet != 0) {
+        return Err(malformed("unexpected data after SAD information"));
+    }
+    if read_u32_ne(datagram, 8)? != expected_sequence {
+        return Err(malformed("unexpected netlink sequence"));
+    }
+    let body = &datagram[NETLINK_HEADER_LEN..length];
+    match read_u16_ne(datagram, 4)? {
+        NLMSG_ERROR => {
+            return Err(match netlink_status(operation, body)? {
+                0 => malformed("acknowledgement instead of SAD information"),
+                status => netlink_status_error(operation, status),
+            });
+        }
+        XFRM_MSG_NEWSADINFO => {}
+        _ => return Err(malformed("unexpected SAD information reply")),
+    }
+    const FLAGS_LEN: usize = size_of::<u32>();
+    if body.len() < FLAGS_LEN {
+        return Err(malformed("short SAD information"));
+    }
+    let count = unique_route_attribute(body, FLAGS_LEN, XFRMA_SAD_CNT, operation)?
+        .ok_or_else(|| malformed("missing SAD state count"))?;
+    if count.len() != size_of::<u32>() {
+        return Err(malformed("invalid SAD state count length"));
+    }
+    read_u32_ne(count, 0)
 }
 
 fn process_has_cap_net_admin() -> Option<bool> {
@@ -2480,35 +2651,6 @@ fn encode_sa_id(
     if let Some(mark) = mark {
         append_attr(&mut out, XFRMA_MARK, &encode_mark(mark))?;
     }
-    Ok(out)
-}
-
-/// Encode the attribute-only `XFRM_MSG_GETSA` dump body for one lookup key.
-///
-/// `xfrm_dump_sa` parses a dump request's attributes from offset zero, so
-/// the body carries no `xfrm_usersa_id`. `XFRMA_ADDRESS_FILTER` restricts
-/// the kernel walk to the key's family and exact destination with any outer
-/// source, and `XFRMA_PROTO` to its protocol. A kernel that ignores either
-/// attribute returns a larger dump; the key check on every reply message
-/// still narrows it to the key.
-fn encode_sa_key_dump_request(key: SaLookupKey) -> Result<SensitiveBuffer, XfrmError> {
-    let destination = key.destination();
-    let destination_prefix_len = match destination {
-        IpAddress::Ipv4(_) => 32,
-        IpAddress::Ipv6(_) => 128,
-    };
-    let mut filter = sensitive_buffer_with_capacity(XFRM_ADDRESS_FILTER_LEN);
-    // `saddr` is ignored with a zero source prefix length.
-    filter.resize(XFRM_ADDRESS_LEN, 0);
-    encode_address(&mut filter, destination);
-    push_u16_ne(&mut filter, address_family(destination));
-    push_u8(&mut filter, 0);
-    push_u8(&mut filter, destination_prefix_len);
-    let mut out = sensitive_buffer_with_capacity(
-        2 * ROUTE_ATTRIBUTE_HEADER_LEN + XFRM_ADDRESS_FILTER_LEN + size_of::<u32>(),
-    );
-    append_attr(&mut out, XFRMA_ADDRESS_FILTER, &filter)?;
-    append_attr(&mut out, XFRMA_PROTO, &[key.protocol()])?;
     Ok(out)
 }
 

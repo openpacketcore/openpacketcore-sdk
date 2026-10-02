@@ -1,13 +1,16 @@
-//! Key-scoped SA snapshots: `XFRM_MSG_GETSA` dump encoding, multipart
-//! parsing, interrupted-dump retry, key filtering, and exact removal.
+//! Key-scoped SA snapshots: the counted read (SAD count, unfiltered
+//! `XFRM_MSG_GETSA` dump, SAD count) on one socket, multipart parsing,
+//! interrupted and short dumps, key filtering, and exact removal.
+
+use std::sync::atomic::AtomicUsize;
 
 use super::*;
 
 const SEQUENCE: u32 = 7;
 const KEY_SPI: u32 = 0x1234_5678;
-const AF_INET_WIRE: u16 = 2;
-const AF_INET6_WIRE: u16 = 10;
 const LINUX_EPERM: i32 = 1;
+/// `enum xfrm_sadattr_type_t` in `include/uapi/linux/xfrm.h`.
+const XFRMA_SAD_HINFO: u16 = 2;
 
 fn dump_config() -> LinuxXfrmBackendConfig {
     LinuxXfrmBackendConfig {
@@ -117,34 +120,92 @@ impl Scripted {
     }
 }
 
-type ScriptedDump = Vec<Vec<Scripted>>;
-/// A dump request and the sequence it was sent with.
-type DumpRequest = (Vec<u8>, u32);
 /// A non-dump request and its operation label.
 type Transaction = (&'static str, Vec<u8>);
 
-/// Transport that answers each dump request with the next scripted dump and
-/// records every request.
+/// One counted read as the scripted kernel answers it.
 #[derive(Debug, Clone, Default)]
-struct DumpTransport {
-    dumps: Arc<Mutex<VecDeque<ScriptedDump>>>,
-    dump_requests: Arc<Mutex<Vec<DumpRequest>>>,
-    transactions: Arc<Mutex<Vec<Transaction>>>,
+struct ScriptedRead {
+    /// SAD count before the dump; `None` reports the scripted members.
+    count_before: Option<u32>,
+    /// Dump datagrams, each a list of messages.
+    dump: Vec<Vec<Scripted>>,
+    /// SAD count after the dump; `None` reports the scripted members.
+    count_after: Option<u32>,
 }
 
-impl DumpTransport {
-    fn new(dumps: Vec<ScriptedDump>) -> Self {
+impl ScriptedRead {
+    /// A dump whose counts agree with it, as on a quiet kernel.
+    fn dump(dump: Vec<Vec<Scripted>>) -> Self {
         Self {
-            dumps: Arc::new(Mutex::new(dumps.into())),
+            dump,
             ..Self::default()
         }
     }
 
-    fn dump_requests(&self) -> Vec<DumpRequest> {
-        self.dump_requests
+    /// The same dump between explicit SAD counts.
+    fn counted(mut self, before: u32, after: u32) -> Self {
+        self.count_before = Some(before);
+        self.count_after = Some(after);
+        self
+    }
+
+    fn members(&self) -> u32 {
+        let members = self
+            .dump
+            .iter()
+            .flatten()
+            .filter(|message| message.message_type == XFRM_MSG_NEWSA)
+            .count();
+        u32::try_from(members).unwrap()
+    }
+}
+
+/// A request one session received.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct SessionRequest {
+    session: usize,
+    message_type: u16,
+    flags: u16,
+    sequence: u32,
+    body: Vec<u8>,
+}
+
+/// Transport whose sessions answer like the kernel: each session plays the
+/// next scripted read. It records every session request and every
+/// single-request transaction.
+#[derive(Debug, Clone, Default)]
+struct KernelTransport {
+    reads: Arc<Mutex<VecDeque<ScriptedRead>>>,
+    sessions: Arc<AtomicUsize>,
+    session_requests: Arc<Mutex<Vec<SessionRequest>>>,
+    transactions: Arc<Mutex<Vec<Transaction>>>,
+}
+
+impl KernelTransport {
+    fn new(reads: Vec<ScriptedRead>) -> Self {
+        Self {
+            reads: Arc::new(Mutex::new(reads.into())),
+            ..Self::default()
+        }
+    }
+
+    fn sessions(&self) -> usize {
+        self.sessions.load(Ordering::Acquire)
+    }
+
+    fn session_requests(&self) -> Vec<SessionRequest> {
+        self.session_requests
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .clone()
+    }
+
+    fn dump_requests(&self) -> Vec<SessionRequest> {
+        self.session_requests()
+            .into_iter()
+            .filter(|request| request.message_type == XFRM_MSG_GETSA)
+            .collect()
     }
 
     fn transactions(&self) -> Vec<Transaction> {
@@ -155,7 +216,7 @@ impl DumpTransport {
     }
 }
 
-impl LinuxXfrmTransport for DumpTransport {
+impl LinuxXfrmTransport for KernelTransport {
     fn transact(
         &self,
         operation: &'static str,
@@ -175,43 +236,85 @@ impl LinuxXfrmTransport for DumpTransport {
         XfrmProbe::unsupported()
     }
 
-    fn dump(
+    fn open_session(
         &self,
-        operation: &'static str,
-        request: &[u8],
-        expected_sequence: u32,
-        reply_message_type: u16,
-        _config: LinuxXfrmBackendConfig,
-        visit: &mut dyn FnMut(&[u8]) -> Result<(), XfrmError>,
-    ) -> Result<NetlinkDumpCompletion, XfrmError> {
-        self.dump_requests
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .push((request.to_vec(), expected_sequence));
-        let script = self
-            .dumps
+        _operation: &'static str,
+    ) -> Result<Box<dyn LinuxXfrmSession>, XfrmError> {
+        let read = self
+            .reads
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .pop_front()
-            .unwrap_or_default();
-        let mut datagrams: VecDeque<Vec<u8>> = script
-            .iter()
-            .map(|messages| {
-                messages
-                    .iter()
-                    .flat_map(|message| message.render(expected_sequence))
-                    .collect()
-            })
-            .collect();
-        receive_netlink_dump(
-            operation,
-            expected_sequence,
-            reply_message_type,
-            dump_config(),
-            |buffer| deliver(&mut datagrams, buffer),
-            visit,
-        )
+            .unwrap_or_else(|| ScriptedRead::dump(vec![vec![Scripted::done()]]));
+        Ok(Box::new(ScriptedSession {
+            index: self.sessions.fetch_add(1, Ordering::AcqRel),
+            read,
+            counts_sent: 0,
+            pending: VecDeque::new(),
+            requests: Arc::clone(&self.session_requests),
+        }))
     }
+}
+
+struct ScriptedSession {
+    index: usize,
+    read: ScriptedRead,
+    counts_sent: usize,
+    pending: VecDeque<Vec<u8>>,
+    requests: Arc<Mutex<Vec<SessionRequest>>>,
+}
+
+impl LinuxXfrmSession for ScriptedSession {
+    fn send(&mut self, request: &[u8]) -> Result<(), XfrmError> {
+        let message_type = netlink_message_type(request);
+        let sequence = u32::from_ne_bytes(request[8..12].try_into().unwrap());
+        self.requests
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .push(SessionRequest {
+                session: self.index,
+                message_type,
+                flags: u16::from_ne_bytes([request[6], request[7]]),
+                sequence,
+                body: netlink_body(request).to_vec(),
+            });
+        match message_type {
+            XFRM_MSG_GETSADINFO => {
+                let count = if self.counts_sent == 0 {
+                    self.read.count_before
+                } else {
+                    self.read.count_after
+                }
+                .unwrap_or_else(|| self.read.members());
+                self.counts_sent += 1;
+                self.pending.push_back(sad_info_reply(sequence, count));
+            }
+            XFRM_MSG_GETSA => {
+                for datagram in &self.read.dump {
+                    self.pending.push_back(
+                        datagram
+                            .iter()
+                            .flat_map(|message| message.render(sequence))
+                            .collect(),
+                    );
+                }
+            }
+            other => panic!("unexpected session request type {other}"),
+        }
+        Ok(())
+    }
+
+    fn receive(&mut self, buffer: &mut [u8]) -> io::Result<ReceiveMessageOutcome> {
+        deliver(&mut self.pending, buffer)
+    }
+}
+
+/// The kernel's `XFRM_MSG_NEWSADINFO` reply (`build_sadinfo`).
+fn sad_info_reply(sequence: u32, count: u32) -> Vec<u8> {
+    let mut body = 0_u32.to_ne_bytes().to_vec();
+    append_attr(&mut body, XFRMA_SAD_CNT, &count.to_ne_bytes()).unwrap();
+    append_attr(&mut body, XFRMA_SAD_HINFO, &[0; 8]).unwrap();
+    message(XFRM_MSG_NEWSADINFO, 0, sequence, &body)
 }
 
 fn deliver(
@@ -266,70 +369,246 @@ fn assert_malformed(result: Result<NetlinkDumpCompletion, XfrmError>) {
 }
 
 #[tokio::test]
-async fn key_dump_request_is_an_attribute_only_getsa_dump_with_kernel_filters() {
-    for (destination, family, prefix_len, address) in [
-        (
-            IpAddress::Ipv4([192, 0, 2, 20]),
-            AF_INET_WIRE,
-            32_u8,
-            [&[192, 0, 2, 20][..], &[0; 12][..]].concat(),
-        ),
-        (
-            IpAddress::Ipv6([
-                0x20, 0x01, 0x0d, 0xb8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0x20,
-            ]),
-            AF_INET6_WIRE,
-            128_u8,
-            vec![
-                0x20, 0x01, 0x0d, 0xb8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0x20,
-            ],
-        ),
-    ] {
-        let transport = DumpTransport::new(vec![vec![vec![Scripted::done()]]]);
-        let backend = LinuxXfrmBackend::with_transport(transport.clone());
-        let snapshot = backend
-            .query_sa_key_snapshot(SaLookupKey::new(destination, 50, KEY_SPI))
-            .await
-            .unwrap();
-        assert!(snapshot.is_empty());
+async fn key_read_dumps_every_state_between_two_sad_counts_on_one_socket() {
+    let transport = KernelTransport::new(vec![ScriptedRead::dump(vec![vec![Scripted::done()]])]);
+    let backend = LinuxXfrmBackend::with_transport(transport.clone());
+    let snapshot = backend.query_sa_key_snapshot(key()).await.unwrap();
+    assert!(snapshot.is_empty());
+    assert_eq!(transport.sessions(), 1);
 
-        let requests = transport.dump_requests();
-        assert_eq!(requests.len(), 1);
-        let (request, sequence) = &requests[0];
-        assert_eq!(netlink_message_type(request), XFRM_MSG_GETSA);
-        // A dump never asks for an ACK: Linux sends none for a started dump.
+    let requests = transport.session_requests();
+    let kinds: Vec<_> = requests
+        .iter()
+        .map(|request| (request.session, request.message_type, request.flags))
+        .collect();
+    // One socket carries the three requests, so the count reply received with
+    // the configured buffer also sizes the dump's batches. Neither request
+    // asks for an acknowledgement, which would arrive as a stray datagram.
+    assert_eq!(
+        kinds,
+        vec![
+            (0, XFRM_MSG_GETSADINFO, NLM_F_REQUEST),
+            (0, XFRM_MSG_GETSA, NLM_F_REQUEST | NLM_F_DUMP),
+            (0, XFRM_MSG_GETSADINFO, NLM_F_REQUEST),
+        ]
+    );
+    assert!(requests[0].sequence < requests[1].sequence);
+    assert!(requests[1].sequence < requests[2].sequence);
+    // GETSADINFO carries its `__u32` flags word. The dump carries no
+    // `XFRMA_ADDRESS_FILTER` or `XFRMA_PROTO`: the SAD count covers the
+    // whole namespace, so the dump must too.
+    assert_eq!(requests[0].body, 0_u32.to_ne_bytes());
+    assert!(requests[1].body.is_empty());
+    assert_eq!(requests[2].body, 0_u32.to_ne_bytes());
+    for message_type in [XFRM_MSG_GETSA, XFRM_MSG_GETSADINFO] {
         assert_eq!(
-            u16::from_ne_bytes([request[6], request[7]]),
-            NLM_F_REQUEST | NLM_F_DUMP
-        );
-        assert_eq!(
-            u32::from_ne_bytes(request[8..12].try_into().unwrap()),
-            *sequence
-        );
-        assert_eq!(
-            netlink_operation_class(netlink_message_type(request)),
+            netlink_operation_class(message_type),
             NetlinkOperationClass::ReadOnly
         );
-
-        // The body is attributes only: `xfrm_dump_sa` parses from offset 0.
-        let body = netlink_body(request);
-        let filter = route_attr_payload_from(body, 0, XFRMA_ADDRESS_FILTER).unwrap();
-        assert_eq!(filter.len(), XFRM_ADDRESS_FILTER_LEN);
-        assert_eq!(
-            filter.len(),
-            size_of::<opc_linux_xfrm_sys::XfrmAddressFilter>()
-        );
-        assert_eq!(&filter[..16], &[0; 16], "any outer source");
-        assert_eq!(&filter[16..32], address.as_slice());
-        assert_eq!(u16::from_ne_bytes([filter[32], filter[33]]), family);
-        assert_eq!(filter[34], 0, "zero source prefix length");
-        assert_eq!(filter[35], prefix_len, "exact destination");
-        assert_eq!(
-            route_attr_payload_from(body, 0, XFRMA_PROTO),
-            Some(&[50][..])
-        );
-        assert_eq!(body.len(), 40 + 8);
     }
+    assert!(transport.transactions().is_empty());
+}
+
+#[tokio::test]
+async fn a_dump_shorter_than_the_sad_count_is_never_complete() {
+    // Linux ends a dump with DONE(0) when a state does not fit an empty
+    // batch, dropping it and every older state. Here the kernel counts four
+    // states but the dump delivers two, on every attempt.
+    let short = || {
+        ScriptedRead::dump(vec![vec![
+            Scripted::member(sa_body(&disjoint_sa())),
+            Scripted::member(sa_body(&marked_sa())),
+            Scripted::done(),
+        ]])
+        .counted(4, 4)
+    };
+    let transport = KernelTransport::new(
+        (0..SA_KEY_SNAPSHOT_READ_ATTEMPTS + 1)
+            .map(|_| short())
+            .collect(),
+    );
+    let error = LinuxXfrmBackend::with_transport(transport.clone())
+        .query_sa_key_snapshot(key())
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(
+            error,
+            XfrmError::StateIndeterminate {
+                operation: SA_KEY_SNAPSHOT
+            }
+        ),
+        "{error:?}"
+    );
+    assert_eq!(transport.sessions(), SA_KEY_SNAPSHOT_READ_ATTEMPTS);
+
+    // The same short dump never authorizes a deletion: the marked state looks
+    // like the sole candidate, but the dump is not complete.
+    let transport = KernelTransport::new(
+        (0..SA_KEY_SNAPSHOT_READ_ATTEMPTS)
+            .map(|_| short())
+            .collect(),
+    );
+    let error = LinuxXfrmBackend::with_transport(transport.clone())
+        .remove_sa_exact(ExactRemoveSaRequest::new(identity(&marked_sa())))
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(
+            error,
+            XfrmError::StateIndeterminate {
+                operation: "remove_sa_exact_preflight"
+            }
+        ),
+        "{error:?}"
+    );
+    assert!(transport.transactions().is_empty(), "no DELSA was sent");
+}
+
+#[tokio::test]
+async fn a_read_whose_counts_disagree_is_repeated_whole() {
+    let states = || {
+        vec![vec![
+            Scripted::member(sa_body(&unmarked_sa())),
+            Scripted::member(sa_body(&marked_sa())),
+            Scripted::done(),
+        ]]
+    };
+    for first in [
+        // A state added while the dump ran.
+        ScriptedRead::dump(states()).counted(2, 3),
+        // A state removed while the dump ran.
+        ScriptedRead::dump(states()).counted(2, 1),
+        // A state added before the dump started, then removed after it.
+        ScriptedRead::dump(states()).counted(1, 1),
+    ] {
+        let transport = KernelTransport::new(vec![first, ScriptedRead::dump(states())]);
+        let snapshot = LinuxXfrmBackend::with_transport(transport.clone())
+            .query_sa_key_snapshot(key())
+            .await
+            .unwrap();
+        assert_eq!(
+            snapshot.states(),
+            &[identity(&unmarked_sa()), identity(&marked_sa())]
+        );
+        assert_eq!(transport.sessions(), 2);
+    }
+}
+
+#[test]
+fn sad_state_count_reply_parsing_is_strict() {
+    let parse = |datagram: &[u8]| parse_sad_state_count_reply(SA_KEY_SNAPSHOT, datagram, SEQUENCE);
+    assert_eq!(parse(&sad_info_reply(SEQUENCE, 77)).unwrap(), 77);
+    assert_eq!(parse(&sad_info_reply(SEQUENCE, 0)).unwrap(), 0);
+
+    let malformed = |result: Result<u32, XfrmError>| {
+        matches!(
+            result,
+            Err(XfrmError::Io {
+                operation: SA_KEY_SNAPSHOT,
+                kind: io::ErrorKind::InvalidData,
+                ..
+            })
+        )
+    };
+    let reply = |message_type: u16, body: &[u8]| message(message_type, 0, SEQUENCE, body);
+    let flags = 0_u32.to_ne_bytes();
+    let with_attrs = |attrs: &[(u16, &[u8])]| {
+        let mut body = flags.to_vec();
+        for (attr_type, payload) in attrs {
+            append_attr(&mut body, *attr_type, payload).unwrap();
+        }
+        body
+    };
+    // Another request's reply, another message type, or a second message.
+    assert!(malformed(parse(&sad_info_reply(SEQUENCE + 1, 1))));
+    assert!(malformed(parse(&reply(
+        XFRM_MSG_NEWSA,
+        &with_attrs(&[(XFRMA_SAD_CNT, &1_u32.to_ne_bytes())])
+    ))));
+    assert!(malformed(parse(
+        &[sad_info_reply(SEQUENCE, 1), sad_info_reply(SEQUENCE, 1)].concat()
+    )));
+    // No flags word, no count, a short count, or two counts.
+    assert!(malformed(parse(&reply(XFRM_MSG_NEWSADINFO, &[0; 2]))));
+    assert!(malformed(parse(&reply(
+        XFRM_MSG_NEWSADINFO,
+        &with_attrs(&[(XFRMA_SAD_HINFO, &[0; 8])])
+    ))));
+    assert!(malformed(parse(&reply(
+        XFRM_MSG_NEWSADINFO,
+        &with_attrs(&[(XFRMA_SAD_CNT, &[1, 0])])
+    ))));
+    assert!(malformed(parse(&reply(
+        XFRM_MSG_NEWSADINFO,
+        &with_attrs(&[
+            (XFRMA_SAD_CNT, &1_u32.to_ne_bytes()),
+            (XFRMA_SAD_CNT, &1_u32.to_ne_bytes())
+        ])
+    ))));
+    // Truncated or overlong framing.
+    assert!(malformed(parse(&[0; 8])));
+    let mut overlong = sad_info_reply(SEQUENCE, 1);
+    let length = u32::try_from(overlong.len() + 4).unwrap();
+    overlong[..4].copy_from_slice(&length.to_ne_bytes());
+    assert!(malformed(parse(&overlong)));
+    // An acknowledgement is not an answer; an error carries its errno.
+    assert!(malformed(parse(&reply(NLMSG_ERROR, &[0; 20]))));
+    assert!(matches!(
+        parse(&reply(
+            NLMSG_ERROR,
+            &[(-LINUX_EPERM).to_ne_bytes().as_slice(), &[0; 16]].concat()
+        )),
+        Err(XfrmError::Io {
+            operation: SA_KEY_SNAPSHOT,
+            kind: io::ErrorKind::PermissionDenied,
+            raw_os_error: Some(LINUX_EPERM),
+        })
+    ));
+}
+
+#[test]
+fn sad_state_count_receive_is_bounded() {
+    let config = LinuxXfrmBackendConfig {
+        receive_attempts: 2,
+        receive_buffer_len: 16,
+        retry_delay: Duration::ZERO,
+    };
+    let mut datagrams = VecDeque::from([sad_info_reply(SEQUENCE, 1)]);
+    assert!(matches!(
+        receive_sad_state_count(SA_KEY_SNAPSHOT, SEQUENCE, config, |buffer| {
+            deliver(&mut datagrams, buffer)
+        }),
+        Err(XfrmError::ResponseTooLarge {
+            operation: SA_KEY_SNAPSHOT,
+            buffer_bytes: 16,
+            ..
+        })
+    ));
+    let mut empty = VecDeque::new();
+    assert!(matches!(
+        receive_sad_state_count(SA_KEY_SNAPSHOT, SEQUENCE, dump_config(), |buffer| {
+            deliver(&mut empty, buffer)
+        }),
+        Err(XfrmError::StateIndeterminate {
+            operation: SA_KEY_SNAPSHOT
+        })
+    ));
+    let mut outcomes = VecDeque::from([
+        Ok(ReceiveMessageOutcome::RejectedNonKernel),
+        Err(sad_info_reply(SEQUENCE, 9)),
+    ]);
+    assert_eq!(
+        receive_sad_state_count(SA_KEY_SNAPSHOT, SEQUENCE, dump_config(), |buffer| {
+            match outcomes.pop_front() {
+                Some(Ok(outcome)) => Ok(outcome),
+                Some(Err(bytes)) => deliver(&mut VecDeque::from([bytes]), buffer),
+                None => Err(io::Error::from(io::ErrorKind::WouldBlock)),
+            }
+        })
+        .unwrap(),
+        9
+    );
 }
 
 #[test]
@@ -568,7 +847,7 @@ fn oversized_dump_datagram_is_a_typed_read_error() {
 async fn key_snapshot_keeps_exactly_the_states_lookup_compares_with_the_key() {
     let mut other_spi = marked_sa();
     other_spi.id.spi += 1;
-    // A kernel that ignored XFRMA_ADDRESS_FILTER or XFRMA_PROTO.
+    // The dump is unfiltered, so every other state arrives too.
     let mut other_destination = marked_sa();
     other_destination.id.destination = IpAddress::Ipv4([192, 0, 2, 21]);
     let mut other_protocol = sa_body(&marked_sa());
@@ -586,7 +865,7 @@ async fn key_snapshot_keeps_exactly_the_states_lookup_compares_with_the_key() {
     let mut upper_words = sa_body(&unmarked_sa());
     upper_words[60..72].copy_from_slice(&[0xaa; 12]);
 
-    let transport = DumpTransport::new(vec![vec![
+    let transport = KernelTransport::new(vec![ScriptedRead::dump(vec![
         vec![
             Scripted::member(sa_body(&other_spi)),
             Scripted::member(sa_body(&marked_sa())),
@@ -599,7 +878,7 @@ async fn key_snapshot_keeps_exactly_the_states_lookup_compares_with_the_key() {
             Scripted::member(sa_body(&disjoint_sa())),
         ],
         vec![Scripted::done()],
-    ]]);
+    ])]);
     let backend = LinuxXfrmBackend::with_transport(transport.clone());
     let snapshot = backend.query_sa_key_snapshot(key()).await.unwrap();
 
@@ -613,6 +892,7 @@ async fn key_snapshot_keeps_exactly_the_states_lookup_compares_with_the_key() {
         ]
     );
     assert_eq!(transport.dump_requests().len(), 1);
+    assert_eq!(transport.sessions(), 1);
     assert!(transport.transactions().is_empty());
 }
 
@@ -622,11 +902,11 @@ async fn key_snapshot_skips_unrepresentable_states_elsewhere_but_not_at_the_key(
     other_spi.id.spi += 1;
     let mut broken_elsewhere = sa_body(&other_spi);
     broken_elsewhere.extend_from_slice(&[0xff; 3]);
-    let transport = DumpTransport::new(vec![vec![vec![
+    let transport = KernelTransport::new(vec![ScriptedRead::dump(vec![vec![
         Scripted::member(broken_elsewhere),
         Scripted::member(sa_body(&marked_sa())),
         Scripted::done(),
-    ]]]);
+    ]])]);
     let snapshot = LinuxXfrmBackend::with_transport(transport)
         .query_sa_key_snapshot(key())
         .await
@@ -645,11 +925,11 @@ async fn key_snapshot_skips_unrepresentable_states_elsewhere_but_not_at_the_key(
     // So does a truncated member at any key.
     let short = sa_body(&marked_sa())[..XFRM_USER_SA_INFO_LEN - 1].to_vec();
     for body in [noncanonical, short] {
-        let transport = DumpTransport::new(vec![vec![vec![
+        let transport = KernelTransport::new(vec![ScriptedRead::dump(vec![vec![
             Scripted::member(sa_body(&marked_sa())),
             Scripted::member(body),
             Scripted::done(),
-        ]]]);
+        ]])]);
         let error = LinuxXfrmBackend::with_transport(transport)
             .query_sa_key_snapshot(key())
             .await
@@ -670,16 +950,16 @@ async fn key_snapshot_skips_unrepresentable_states_elsewhere_but_not_at_the_key(
 
 #[tokio::test]
 async fn interrupted_dump_is_discarded_and_repeated_with_a_fresh_sequence() {
-    let transport = DumpTransport::new(vec![
-        vec![
+    let transport = KernelTransport::new(vec![
+        ScriptedRead::dump(vec![
             vec![Scripted::member(sa_body(&marked_sa()))],
             vec![Scripted::member(sa_body(&disjoint_sa())).interrupted()],
             vec![Scripted::done()],
-        ],
-        vec![vec![
+        ]),
+        ScriptedRead::dump(vec![vec![
             Scripted::member(sa_body(&unmarked_sa())),
             Scripted::done(),
-        ]],
+        ]]),
     ]);
     let backend = LinuxXfrmBackend::with_transport(transport.clone());
     let snapshot = backend.query_sa_key_snapshot(key()).await.unwrap();
@@ -688,8 +968,9 @@ async fn interrupted_dump_is_discarded_and_repeated_with_a_fresh_sequence() {
     assert_eq!(snapshot.states(), &[identity(&unmarked_sa())]);
     let requests = transport.dump_requests();
     assert_eq!(requests.len(), 2);
-    assert_ne!(requests[0].1, requests[1].1);
-    assert_eq!(netlink_body(&requests[0].0), netlink_body(&requests[1].0));
+    assert_ne!(requests[0].session, requests[1].session);
+    assert_ne!(requests[0].sequence, requests[1].sequence);
+    assert_eq!(requests[0].body, requests[1].body);
 }
 
 #[tokio::test]
@@ -700,9 +981,9 @@ async fn persistently_interrupted_dump_fails_closed_after_bounded_attempts() {
             Scripted::done(),
         ]]
     };
-    let transport = DumpTransport::new(
-        (0..SA_KEY_SNAPSHOT_DUMP_ATTEMPTS + 1)
-            .map(|_| interrupted())
+    let transport = KernelTransport::new(
+        (0..SA_KEY_SNAPSHOT_READ_ATTEMPTS + 1)
+            .map(|_| ScriptedRead::dump(interrupted()))
             .collect(),
     );
     let error = LinuxXfrmBackend::with_transport(transport.clone())
@@ -720,13 +1001,13 @@ async fn persistently_interrupted_dump_fails_closed_after_bounded_attempts() {
     );
     assert_eq!(
         transport.dump_requests().len(),
-        SA_KEY_SNAPSHOT_DUMP_ATTEMPTS
+        SA_KEY_SNAPSHOT_READ_ATTEMPTS
     );
 }
 
 #[tokio::test]
 async fn key_snapshot_rejects_invalid_keys_before_any_request() {
-    let transport = DumpTransport::new(Vec::new());
+    let transport = KernelTransport::new(Vec::new());
     let backend = LinuxXfrmBackend::with_transport(transport.clone());
     let destination = marked_sa().id.destination;
     for (key, field) in [
@@ -742,16 +1023,16 @@ async fn key_snapshot_rejects_invalid_keys_before_any_request() {
             "{error:?}"
         );
     }
-    assert!(transport.dump_requests().is_empty());
+    assert_eq!(transport.sessions(), 0);
 }
 
 #[tokio::test]
 async fn exact_removal_refuses_marked_and_unmarked_overlap_without_delsa() {
-    let transport = DumpTransport::new(vec![vec![vec![
+    let transport = KernelTransport::new(vec![ScriptedRead::dump(vec![vec![
         Scripted::member(sa_body(&unmarked_sa())),
         Scripted::member(sa_body(&marked_sa())),
         Scripted::done(),
-    ]]]);
+    ]])]);
     let error = LinuxXfrmBackend::with_transport(transport.clone())
         .remove_sa_exact(ExactRemoveSaRequest::new(identity(&marked_sa())))
         .await
@@ -773,11 +1054,11 @@ async fn exact_removal_refuses_marked_and_unmarked_overlap_without_delsa() {
 async fn exact_removal_deletes_the_sole_candidate_with_its_lookup_mark() {
     // The disjoint full-mask state is at the key but cannot answer the
     // marked lookup.
-    let transport = DumpTransport::new(vec![vec![vec![
+    let transport = KernelTransport::new(vec![ScriptedRead::dump(vec![vec![
         Scripted::member(sa_body(&disjoint_sa())),
         Scripted::member(sa_body(&marked_sa())),
         Scripted::done(),
-    ]]]);
+    ]])]);
     LinuxXfrmBackend::with_transport(transport.clone())
         .remove_sa_exact(ExactRemoveSaRequest::new(identity(&marked_sa())))
         .await
@@ -812,7 +1093,7 @@ async fn exact_removal_reports_absent_or_changed_states_without_delsa() {
     ] {
         let mut dump = states;
         dump.push(Scripted::done());
-        let transport = DumpTransport::new(vec![vec![dump]]);
+        let transport = KernelTransport::new(vec![ScriptedRead::dump(vec![dump])]);
         let error = LinuxXfrmBackend::with_transport(transport.clone())
             .remove_sa_exact(ExactRemoveSaRequest::new(identity(&marked_sa())))
             .await
@@ -835,9 +1116,13 @@ async fn exact_removal_reports_absent_or_changed_states_without_delsa() {
 
 #[tokio::test]
 async fn exact_removal_without_a_complete_snapshot_sends_no_delsa() {
-    let transport = DumpTransport::new(
-        (0..SA_KEY_SNAPSHOT_DUMP_ATTEMPTS)
-            .map(|_| vec![vec![Scripted::member(sa_body(&marked_sa())).interrupted()]])
+    let transport = KernelTransport::new(
+        (0..SA_KEY_SNAPSHOT_READ_ATTEMPTS)
+            .map(|_| {
+                ScriptedRead::dump(vec![vec![
+                    Scripted::member(sa_body(&marked_sa())).interrupted()
+                ]])
+            })
             .collect(),
     );
     let error = LinuxXfrmBackend::with_transport(transport.clone())
@@ -855,7 +1140,7 @@ async fn exact_removal_without_a_complete_snapshot_sends_no_delsa() {
     );
     assert!(transport.transactions().is_empty());
 
-    // A transport without dump support fails closed the same way.
+    // A transport without sessions fails closed the same way.
     let transport = CapturingTransport::default();
     let error = LinuxXfrmBackend::with_transport(transport.clone())
         .remove_sa_exact(ExactRemoveSaRequest::new(identity(&marked_sa())))

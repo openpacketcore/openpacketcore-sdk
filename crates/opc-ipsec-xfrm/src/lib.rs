@@ -21,10 +21,11 @@
 //! The crate never infers relocation from packet source addresses and deliberately
 //! does not implement IKE, ESP processing, namespace creation/switching, or
 //! deployment policy. [`XfrmBackend::query_sa_key_snapshot`] reads every SA at
-//! one destination/protocol/SPI key, whatever its lookup mark, from one complete
-//! Linux `XFRM_MSG_GETSA` dump, and [`XfrmBackend::remove_sa_exact`] deletes an
-//! SA only when that read proves it is the only state the deletion's own lookup
-//! can select. Both rely on the caller excluding other writers at the key. [`LinuxXfrmBackend::bind_current_network_namespace`]
+//! one destination/protocol/SPI key, whatever its lookup mark, from a Linux
+//! `XFRM_MSG_GETSA` dump whose completeness is checked against the kernel's SAD
+//! count, and [`XfrmBackend::remove_sa_exact`] deletes an SA only when that
+//! read proves it is the only state the deletion's own lookup can select. Both
+//! rely on the caller excluding other writers. [`LinuxXfrmBackend::bind_current_network_namespace`]
 //! can pin backend execution to the calling thread's already-selected network
 //! namespace without exposing its filesystem identity.
 //! Fixed-DSCP users that must recover durable state before opening external

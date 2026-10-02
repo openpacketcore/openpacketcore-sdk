@@ -5269,15 +5269,10 @@ mod tests {
             Err(XfrmError::Unavailable)
         }
 
-        fn dump(
+        fn open_session(
             &self,
             operation: &'static str,
-            _request: &[u8],
-            _expected_sequence: u32,
-            _reply_message_type: u16,
-            _config: LinuxXfrmBackendConfig,
-            _visit: &mut dyn FnMut(&[u8]) -> Result<(), XfrmError>,
-        ) -> Result<crate::linux::NetlinkDumpCompletion, XfrmError> {
+        ) -> Result<Box<dyn crate::linux::LinuxXfrmSession>, XfrmError> {
             self.record(operation);
             Err(XfrmError::Unavailable)
         }

@@ -236,6 +236,18 @@ pub const XFRM_MSG_FLUSHSA: u16 = XFRM_MSG_BASE + 12;
 pub const XFRM_MSG_FLUSHPOLICY: u16 = XFRM_MSG_BASE + 13;
 /// Update/query replay and lifetime state for an existing Security Association.
 pub const XFRM_MSG_NEWAE: u16 = XFRM_MSG_BASE + 14;
+/// Reply carrying Security Association Database information.
+///
+/// `include/uapi/linux/xfrm.h`, message-type enum: `XFRM_MSG_NEWSADINFO` is
+/// `0x22`. Its body is a `__u32` flags word followed by `XFRMA_SAD_*`
+/// attributes, including [`XFRMA_SAD_CNT`].
+pub const XFRM_MSG_NEWSADINFO: u16 = XFRM_MSG_BASE + 18;
+/// Request Security Association Database information.
+///
+/// `include/uapi/linux/xfrm.h`: `XFRM_MSG_GETSADINFO` is `0x23`. The request
+/// body is one `__u32` flags word; Linux answers with
+/// [`XFRM_MSG_NEWSADINFO`].
+pub const XFRM_MSG_GETSADINFO: u16 = XFRM_MSG_BASE + 19;
 /// Relocate one exactly identified Security Association.
 ///
 /// This is the single-state migration UAPI added after the older
@@ -294,17 +306,6 @@ pub const XFRMA_ALG_AUTH_TRUNC: u16 = 20;
 pub const XFRMA_MARK: u16 = 21;
 /// XFRM ESN replay sequence/bitmap attribute.
 pub const XFRMA_REPLAY_ESN_VAL: u16 = 23;
-/// XFRM state-dump transform-protocol filter (`__u8`).
-///
-/// `include/uapi/linux/xfrm.h`, `enum xfrm_attr_type_t`: `XFRMA_PROTO` is
-/// 25. An `XFRM_MSG_GETSA` dump reports only states whose protocol matches.
-pub const XFRMA_PROTO: u16 = 25;
-/// XFRM state-dump address filter ([`XfrmAddressFilter`]).
-///
-/// `include/uapi/linux/xfrm.h`, `enum xfrm_attr_type_t`:
-/// `XFRMA_ADDRESS_FILTER` is 26. An `XFRM_MSG_GETSA` dump reports only states
-/// whose family and address prefixes match.
-pub const XFRMA_ADDRESS_FILTER: u16 = 26;
 /// Empty netlink alignment attribute.
 pub const XFRMA_PAD: u16 = 27;
 /// XFRM hardware or packet-offload device attribute.
@@ -317,6 +318,14 @@ pub const XFRMA_SET_MARK_MASK: u16 = 30;
 pub const XFRMA_IF_ID: u16 = 31;
 /// Optional Security Association direction attribute.
 pub const XFRMA_SA_DIR: u16 = 34;
+/// Number of states in the Security Association Database (`__u32`), an
+/// attribute of [`XFRM_MSG_NEWSADINFO`].
+///
+/// `include/uapi/linux/xfrm.h`, `enum xfrm_sadattr_type_t`: `XFRMA_SAD_CNT`
+/// is 1. Linux fills it from `net->xfrm.state_num` under `xfrm_state_lock`
+/// (`xfrm_sad_getinfo` in `net/xfrm/xfrm_state.c`). This attribute namespace
+/// is separate from `enum xfrm_attr_type_t`.
+pub const XFRMA_SAD_CNT: u16 = 1;
 
 /// Main Security Policy Database policy type.
 pub const XFRM_POLICY_TYPE_MAIN: u8 = 0;
@@ -697,29 +706,6 @@ pub struct XfrmMark {
     pub mask: u32,
 }
 
-/// Linux `struct xfrm_address_filter`, the payload of
-/// [`XFRMA_ADDRESS_FILTER`].
-///
-/// `include/uapi/linux/xfrm.h`. The kernel compares the first
-/// `source_prefix_len` bits of `source` with a state's outer source and the
-/// first `destination_prefix_len` bits of `destination` with its destination.
-/// When `family` is `AF_INET` or `AF_INET6`, the state family must match too.
-/// A prefix length above 128 makes the dump fail with `EINVAL`.
-#[repr(C)]
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash)]
-pub struct XfrmAddressFilter {
-    /// Outer source address prefix (`saddr`).
-    pub source: XfrmAddress,
-    /// Destination address prefix (`daddr`).
-    pub destination: XfrmAddress,
-    /// Address family (`family`).
-    pub family: u16,
-    /// Source prefix length in bits (`splen`).
-    pub source_prefix_len: u8,
-    /// Destination prefix length in bits (`dplen`).
-    pub destination_prefix_len: u8,
-}
-
 /// Linux `struct xfrm_encap_tmpl`.
 #[repr(C)]
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash)]
@@ -834,10 +820,11 @@ mod tests {
             NLM_F_DUMP & (NLM_F_REQUEST | NLM_F_MULTI | NLM_F_ACK | NLM_F_DUMP_INTR),
             0
         );
-        // include/uapi/linux/xfrm.h, enum xfrm_attr_type_t
-        assert_eq!(XFRMA_PROTO, 25);
-        assert_eq!(XFRMA_ADDRESS_FILTER, 26);
-        assert_eq!(XFRMA_ADDRESS_FILTER + 1, XFRMA_PAD);
+        // include/uapi/linux/xfrm.h: message types and enum xfrm_sadattr_type_t
+        assert_eq!(XFRM_MSG_NEWSADINFO, 0x22);
+        assert_eq!(XFRM_MSG_GETSADINFO, 0x23);
+        assert_eq!(XFRM_MSG_GETSADINFO, XFRM_MSG_NEWSADINFO + 1);
+        assert_eq!(XFRMA_SAD_CNT, 1);
     }
 
     #[test]
@@ -917,13 +904,6 @@ mod tests {
         assert_eq!(size_of::<XfrmAlgoHeader>(), 68);
         assert_eq!(size_of::<XfrmAlgoAuthHeader>(), 72);
         assert_eq!(size_of::<XfrmMark>(), 8);
-        assert_eq!(size_of::<XfrmAddressFilter>(), 36);
-        assert_eq!(align_of::<XfrmAddressFilter>(), 4);
-        assert_eq!(offset_of!(XfrmAddressFilter, source), 0);
-        assert_eq!(offset_of!(XfrmAddressFilter, destination), 16);
-        assert_eq!(offset_of!(XfrmAddressFilter, family), 32);
-        assert_eq!(offset_of!(XfrmAddressFilter, source_prefix_len), 34);
-        assert_eq!(offset_of!(XfrmAddressFilter, destination_prefix_len), 35);
         assert_eq!(size_of::<XfrmEncapTemplate>(), 24);
         assert_eq!(offset_of!(XfrmEncapTemplate, original_address), 8);
     }

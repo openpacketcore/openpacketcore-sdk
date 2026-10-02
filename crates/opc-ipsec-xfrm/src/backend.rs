@@ -132,6 +132,18 @@ pub trait XfrmBackend: Send + Sync + std::fmt::Debug {
     /// precondition, as for [`Self::remove_policy_exact`]. Expiry can still
     /// remove a state, which only shrinks the set.
     ///
+    /// A finished Linux dump is not proof of a complete one: Linux ends a
+    /// state dump with a successful `NLMSG_DONE` after silently dropping a
+    /// state too large for a dump batch, together with every older state.
+    /// The Linux backend therefore dumps every state in the namespace and
+    /// accepts the dump only when it returned as many states as the kernel's
+    /// SAD count read just before and just after it. An oversized state fails
+    /// the read instead of hiding others. The count could be offset only if,
+    /// within one read, the namespace both gained a state before the dump
+    /// started and lost one the dump had already returned; with other writers
+    /// excluded, only a kernel ACQUIRE state and a lifetime expiry together
+    /// could do that.
+    ///
     /// This is a read and changes no kernel state. Through the namespace
     /// actor a lost reply is `Unavailable`, as for other reads. Backends
     /// without a complete key read fail closed with
@@ -140,8 +152,9 @@ pub trait XfrmBackend: Send + Sync + std::fmt::Debug {
     /// # Errors
     ///
     /// [`XfrmError::InvalidConfig`] for a zero SPI or a protocol other than
-    /// AH, ESP, or IPComp. A Linux dump the kernel flags as interrupted is
-    /// discarded and repeated a bounded number of times, then reported as
+    /// AH, ESP, or IPComp. A Linux read whose dump the kernel flags as
+    /// interrupted, or whose state count disagrees with the SAD count, is
+    /// repeated a bounded number of times, then reported as
     /// [`XfrmError::StateIndeterminate`]. A state at the key that the SDK
     /// cannot represent, such as one with an unaddressable lookup mark, fails
     /// the read instead of being left out.
