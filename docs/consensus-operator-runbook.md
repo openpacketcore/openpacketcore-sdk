@@ -200,6 +200,36 @@ seconds can still depose it. The election stays safe, but writes in flight on
 the deposed leader end ambiguous and must be resolved through their exact
 request identity.
 
+### 2.5 Rolling upgrade from a release without Pre-Vote
+
+Voters can be replaced one at a time, in either direction: an upgrade from the
+previous release, or the rollback of one. Each consensus connection negotiates
+its protocol revision through TLS ALPN. A voter of this release offers
+`opc-session-consensus/3`, which carries Pre-Vote, ahead of
+`opc-session-consensus/2`, which the previous release speaks. A connection to
+or from a previous-release voter therefore negotiates the previous revision. A
+voter of this release never sends that voter a Pre-Vote it could not decode,
+and counts it as rejecting the Pre-Vote.
+
+While a previous-release voter is needed for a majority, a leader loss is
+resolved by that release's rules:
+
+- a previous-release voter grants a vote only after its 8-second leader lease,
+  and first campaigns within 19 seconds of its last leader contact: its lease,
+  its sampled election timeout below 8 seconds, and a 3-second tick;
+- a voter of this release does not campaign before it in that window. If the
+  previous-release candidate's log is behind, a voter of this release that
+  rejects it campaigns one of its own election timeouts later, without Pre-Vote
+  and in a higher term;
+- a successor is elected within 30 seconds of the loss, as with the previous
+  release, including one round in which two previous-release voters split the
+  vote.
+
+A write in flight at such a loss outlasts one 10-second operation and ends
+ambiguous at least once. The caller retries only its own exact request
+identity, and the write still applies exactly once. Once this release's voters
+alone form a majority, the bounds of section 2.4 apply again.
+
 ## 3. Normal write and response-loss handling
 
 The application encrypts through `EncryptingManagedDatastore`. A successful

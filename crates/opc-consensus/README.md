@@ -32,6 +32,66 @@ deadline, never added to it. The heartbeat interval is not a call deadline:
 every AppendEntries, heartbeats included, uses the 2,000 ms ceiling, and the
 shared Openraft configuration enables Pre-Vote.
 
+`DURABLE_OPENRAFT_PROPOSAL_ADMISSION_SLOTS` fixes both durable adapters at
+eight concurrent proposal paths. Admission is obtained inside the original
+operation deadline. Once `client_write_ff` returns an accepted-result
+receiver, a detached supervisor retains that permit until Openraft resolves
+the exact proposal, even if the caller disconnects, times out, or is cancelled.
+This bounds accepted and pre-accept work without adding a second sequencing or
+commit authority.
+
+`EnsureLinearizableSupervisor` admits every fresh read-index or mutation
+preflight through exactly one supervisor-owned Openraft check per node and at
+most 64 total callers across the active and waiting cohorts. Callers collected
+before dispatch may share that exact result; later callers await a subsequent
+check under their original deadlines. Once dispatched, caller cancellation or
+timeout cannot cancel the check or start an overlapping one.
+
+`LinearizableReadBarrier` is the reusable local-snapshot gate over that
+supervisor. A successful `admit(deadline)` waits for the caller-supplied
+Openraft metrics watch to report `last_applied >= read_log_id.index` before it
+returns `LinearizableReadAdmit`. A deposed node receives the typed
+`LinearizableReadBarrierError::NotLeader`; lost quorum, a closed apply watch,
+or an expired deadline returns the typed fail-closed `Unavailable`. A consumer
+that obtains a barrier from a remote leader uses `wait_for_applied_index` on
+its own barrier before reading local state.
+
+The optional `LinearizableReadLease::Enabled` mode reuses a prior successful
+Openraft quorum proof only while Openraft still reports the same local leader
+and term. Its fixed maximum lifetime is derived from the smaller of the shared
+heartbeat interval and read-barrier deadline, remains below the minimum
+election timeout, and starts no later than dispatch of the proving round so
+delayed task scheduling cannot extend it. The default is `Disabled`, which
+retains a fresh coalesced quorum round for every barrier cohort; consumers
+cannot supply a lease duration.
+
+Before releasing an engine vote lease for planned retirement, call
+`disable_lease_reuse()` on every applicable barrier. The veto is permanent for
+that barrier and all its clones: an in-flight proof cannot repopulate the cache
+or return a cached admission after the veto. Fresh engine checks retain their
+normal authority and deadline requirements. Clearing a cache once is not an
+equivalent retirement fence.
+
+The appended `LeadershipTransfer` RPC family carries only an engine-issued
+handoff request. Its payload limit is 1,024 bytes and its deadline uses the
+existing five-second Vote budget. Consumers must authenticate the exact sender,
+vote issuer and membership scope before passing the request to the engine.
+This family does not replace ordinary election, quorum or applied-prefix checks.
+
+The appended `PreVote` RPC family carries the engine's Pre-Vote round. Its
+payload and deadline are the Vote family's. It is admitted exactly like a Vote
+and never changes engine state; a refused, failed or timed-out PreVote call is
+never counted as a grant.
+
+New leaders can use `open_leader(projection, deadline)` with a
+`LeaderReadProjection` implementation. The helper executes the barrier,
+drives the consumer-owned projection to Openraft's applied log ID, independently
+waits for the projection watch to match that exact ID, and rechecks the same
+leader term before returning `LeaderOpenAdmit`. Advertising the node as a read
+target is a consumer responsibility and must occur only after that success.
+Openraft still supplies every quorum, leadership, term, commit, and apply
+signal; these helpers are scheduling and gating, not a parallel authority.
+
 ### Unplanned leader loss
 
 Planned shutdown hands leadership off before the leader stops. An unplanned
@@ -110,65 +170,27 @@ rounds fail closed as unavailable, and a write already proposed there ends at
 its operation deadline as ambiguous, to be resolved through its exact request
 identity.
 
-`DURABLE_OPENRAFT_PROPOSAL_ADMISSION_SLOTS` fixes both durable adapters at
-eight concurrent proposal paths. Admission is obtained inside the original
-operation deadline. Once `client_write_ff` returns an accepted-result
-receiver, a detached supervisor retains that permit until Openraft resolves
-the exact proposal, even if the caller disconnects, times out, or is cancelled.
-This bounds accepted and pre-accept work without adding a second sequencing or
-commit authority.
+#### Voters of a release without Pre-Vote
 
-`EnsureLinearizableSupervisor` admits every fresh read-index or mutation
-preflight through exactly one supervisor-owned Openraft check per node and at
-most 64 total callers across the active and waiting cohorts. Callers collected
-before dispatch may share that exact result; later callers await a subsequent
-check under their original deadlines. Once dispatched, caller cancellation or
-timeout cannot cancel the check or start an overlapping one.
+A rolling upgrade, or its rollback, mixes voters of this release with voters
+of the previous release, which cannot decode a Pre-Vote request. The port's
+`ConsensusPeer::call_pre_vote` keeps them interoperable: a transport that
+knows its peer's release forwards the request to a voter of this release and
+reports any other voter as unable to answer, sending nothing. The session
+transport learns this per connection through TLS ALPN: it offers
+`opc-session-consensus/3`, which carries Pre-Vote, ahead of
+`opc-session-consensus/2`. The default implementation reports every voter as
+unable to answer, so a transport that cannot tell never sends Pre-Vote.
 
-`LinearizableReadBarrier` is the reusable local-snapshot gate over that
-supervisor. A successful `admit(deadline)` waits for the caller-supplied
-Openraft metrics watch to report `last_applied >= read_log_id.index` before it
-returns `LinearizableReadAdmit`. A deposed node receives the typed
-`LinearizableReadBarrierError::NotLeader`; lost quorum, a closed apply watch,
-or an expired deadline returns the typed fail-closed `Unavailable`. A consumer
-that obtains a barrier from a remote leader uses `wait_for_applied_index` on
-its own barrier before reading local state.
-
-The optional `LinearizableReadLease::Enabled` mode reuses a prior successful
-Openraft quorum proof only while Openraft still reports the same local leader
-and term. Its fixed maximum lifetime is derived from the smaller of the shared
-heartbeat interval and read-barrier deadline, remains below the minimum
-election timeout, and starts no later than dispatch of the proving round so
-delayed task scheduling cannot extend it. The default is `Disabled`, which
-retains a fresh coalesced quorum round for every barrier cohort; consumers
-cannot supply a lease duration.
-
-Before releasing an engine vote lease for planned retirement, call
-`disable_lease_reuse()` on every applicable barrier. The veto is permanent for
-that barrier and all its clones: an in-flight proof cannot repopulate the cache
-or return a cached admission after the veto. Fresh engine checks retain their
-normal authority and deadline requirements. Clearing a cache once is not an
-equivalent retirement fence.
-
-The appended `LeadershipTransfer` RPC family carries only an engine-issued
-handoff request. Its payload limit is 1,024 bytes and its deadline uses the
-existing five-second Vote budget. Consumers must authenticate the exact sender,
-vote issuer and membership scope before passing the request to the engine.
-This family does not replace ordinary election, quorum or applied-prefix checks.
-
-The appended `PreVote` RPC family carries the engine's Pre-Vote round. Its
-payload and deadline are the Vote family's. It is admitted exactly like a Vote
-and never changes engine state; a refused, failed or timed-out PreVote call is
-never counted as a grant.
-
-New leaders can use `open_leader(projection, deadline)` with a
-`LeaderReadProjection` implementation. The helper executes the barrier,
-drives the consumer-owned projection to Openraft's applied log ID, independently
-waits for the projection watch to match that exact ID, and rechecks the same
-leader term before returning `LeaderOpenAdmit`. Advertising the node as a read
-target is a consumer responsibility and must occur only after that success.
-Openraft still supplies every quorum, leadership, term, commit, and apply
-signal; these helpers are scheduling and gating, not a parallel authority.
+The Raft adapters count a voter that cannot answer as rejecting the Pre-Vote.
+While such voters are needed for a majority, they lead the election with the
+classic vote, by the previous release's timing: a lease of 8,000 ms, and a first
+campaign within 19,000 ms of their last leader contact. When their logs are
+behind, a voter of this release that rejects such a candidate campaigns
+without Pre-Vote, in a higher term, one of its own election timeouts later.
+A successor is elected within 30,000 ms of the loss. That includes one round
+in which two previous-release voters split the vote. Once voters of this
+release alone form a majority, the bounds above apply.
 
 ## Interim source-build gate
 

@@ -58,8 +58,30 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   engine state; a refused, failed or timed-out PreVote call is never a grant.
   A regression that cuts one voter off for two election timeouts keeps its term
   and the leader; without the family, the voter reaches term 3 and the cluster
-  is left leaderless. Older members do not understand the family: stop and
-  upgrade every consensus member together. Refs #1037.
+  is left leaderless. Members negotiate Pre-Vote per connection, so voters can
+  be upgraded or rolled back one at a time; see the next entry. Refs #1037.
+
+- `opc-session-net`, `opc-consensus`, `opc-session-store`, `opc-persist`: a
+  rolling upgrade from a release without Pre-Vote, or its rollback, no longer
+  risks a cluster that elects no leader. Previously a voter of this release
+  sent Pre-Vote to previous-release voters, which cannot decode it and drop the
+  connection. When the lost leader's survivors needed such a voter and its log
+  was behind, no voter could win: a three-process fleet mixing both releases
+  stayed leaderless for 60 seconds. Each consensus connection now negotiates
+  Pre-Vote through TLS ALPN, `opc-session-consensus/3` ahead of
+  `opc-session-consensus/2`, and a voter of this release counts a
+  previous-release voter as rejecting the Pre-Vote without sending it.
+  `ConsensusPeer::call_pre_vote` carries this. Its default reports the voter
+  unable to answer, so a transport that cannot tell which release its peer
+  runs never sends Pre-Vote to it. In-process peers forward with
+  `forward_pre_vote`. The consumed Openraft fork adds the matching engine rule:
+  a voter that rejects a candidate for its stale log campaigns without Pre-Vote,
+  in a higher term, one election timeout later unless a leader appears. While
+  a previous-release voter is needed for a majority, a leader loss is resolved
+  within 30 seconds, as with the previous release. Three- and five-process
+  regressions, using the previous release's node binary, roll a fleet forward
+  and back under fenced writes and kill the leader on both releases: every
+  write applies exactly once. Refs #1037.
 
 - `opc-session-net`: a prepared compare-and-set or lease acquire whose
   current voter answers with a complete `Rejected(Unavailable)` now moves the
