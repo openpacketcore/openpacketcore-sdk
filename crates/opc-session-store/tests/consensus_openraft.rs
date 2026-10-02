@@ -13,6 +13,9 @@ mod stale_leader_route;
 #[path = "consensus_openraft/pre_vote.rs"]
 mod pre_vote;
 
+#[path = "consensus_openraft/pre_vote_unaware_transport.rs"]
+mod pre_vote_unaware_transport;
+
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 use std::path::{Path, PathBuf};
@@ -936,6 +939,47 @@ impl TestCluster {
         clock: Arc<dyn Clock>,
         test_permit: tokio::sync::SemaphorePermit<'static>,
     ) -> Self {
+        Self::start_with_peers(operation_timeout, topologies, clock, test_permit, |path| {
+            path
+        })
+        .await
+    }
+
+    /// Start a cluster whose stores reach each other through `wrap`ped
+    /// loopback paths.
+    async fn start_with_peer_wrapper(
+        wrap: fn(Arc<LoopbackPeer>) -> Arc<dyn SessionConsensusPeer>,
+    ) -> Self {
+        let members = (0..MEMBER_COUNT).map(member).collect::<Vec<_>>();
+        let identity = consensus_identity(&members);
+        let topologies = (0..MEMBER_COUNT)
+            .map(|index| {
+                ValidatedQuorumTopology::try_from(QuorumTopologyConfig::new_consensus(
+                    replica_id(index),
+                    members.clone(),
+                    identity,
+                ))
+                .expect("validate consensus topology")
+            })
+            .collect::<Vec<_>>();
+        let test_permit = Self::acquire_test_permit().await;
+        Self::start_with_peers(
+            DEFAULT_SESSION_CONSENSUS_OPERATION_TIMEOUT,
+            topologies,
+            Arc::new(SystemClock),
+            test_permit,
+            wrap,
+        )
+        .await
+    }
+
+    async fn start_with_peers(
+        operation_timeout: Duration,
+        topologies: Vec<ValidatedQuorumTopology>,
+        clock: Arc<dyn Clock>,
+        test_permit: tokio::sync::SemaphorePermit<'static>,
+        wrap: fn(Arc<LoopbackPeer>) -> Arc<dyn SessionConsensusPeer>,
+    ) -> Self {
         assert_eq!(topologies.len(), MEMBER_COUNT);
         let directory = tempfile::tempdir().expect("create fleet database directory");
         let snapshot_directory = fs_verity_snapshot_tempdir("consensus-openraft-snapshots-");
@@ -968,8 +1012,7 @@ impl TestCluster {
             let peers = (0..MEMBER_COUNT)
                 .filter(|target| *target != index)
                 .map(|target| {
-                    let peer: Arc<dyn SessionConsensusPeer> =
-                        paths.get(&(index, target)).expect("loopback path").clone();
+                    let peer = wrap(paths.get(&(index, target)).expect("loopback path").clone());
                     (node_ids[target], peer)
                 })
                 .collect::<BTreeMap<_, _>>();
