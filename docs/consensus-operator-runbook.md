@@ -40,7 +40,7 @@ The session and configuration adapters use one fixed runtime profile from
 `opc-consensus`; operators cannot tune either domain onto a different election
 or heartbeat regime. This workspace revision exact-pins
 `https://github.com/openpacketcore/openraft` at
-`38c6524a405a55e2d6808b136329ff62ba4e492d` with the complete release-0.9 history
+`71f7ff7ed2a0a1783362264d597926a243d62b37` with the complete release-0.9 history
 through v0.9.25, bounded apply pages, joined replication retirement, the
 overlapping follower lease and election timeout, the separate AppendEntries
 deadline, Pre-Vote and the leader's quorum-acknowledged lease. Confirm the lock resolves only

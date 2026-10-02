@@ -108,7 +108,7 @@ profiles retain their original versions and revisions; the current manifest,
 lock and metadata checks bind this candidate separately. Dependency tests do
 not establish SDK qualification.
 
-The failover update advances the candidate to `38c6524a405a55e2d6808b136329ff62ba4e492d`. A
+The failover update advances the candidate to `71f7ff7ed2a0a1783362264d597926a243d62b37`. A
 follower now campaigns after the longer of its leader lease and its sampled
 election timeout instead of their sum, and the lease is the minimum election
 timeout. AppendEntries has its own configurable deadline, separate from the

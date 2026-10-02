@@ -112,7 +112,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   rebuilt; the map ABI is unchanged. Fixes #1030.
 
 - Shared Openraft dependency: consume the 0.9.25 fork revision
-  `38c6524a405a55e2d6808b136329ff62ba4e492d`. A follower now campaigns after
+  `71f7ff7ed2a0a1783362264d597926a243d62b37`. A follower now campaigns after
   the longer of its leader lease and its sampled election timeout instead of
   their sum, and the lease is the minimum election timeout. AppendEntries can
   have its own deadline, an optional Pre-Vote round keeps a voter that cannot

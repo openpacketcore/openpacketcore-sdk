@@ -196,7 +196,7 @@ release alone form a majority, the bounds above apply.
 
 Issue #143 remains open and the HA profile remains experimental. The workspace
 pins `https://github.com/openpacketcore/openraft` at the full verified revision
-`38c6524a405a55e2d6808b136329ff62ba4e492d` (0.9.25 plus fork fixes). It retains the
+`71f7ff7ed2a0a1783362264d597926a243d62b37` (0.9.25 plus fork fixes). It retains the
 per-campaign election-timeout fix and preserves a recovering snapshot target's
 required log suffix through successful handoff, while failed targets release
 their ownership before retrying. When a higher vote ends leadership, the core

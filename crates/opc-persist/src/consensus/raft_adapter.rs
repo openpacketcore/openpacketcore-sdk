@@ -11,7 +11,7 @@ use opc_consensus::engine::error::{
 use opc_consensus::engine::network::{RPCOption, RaftNetwork, RaftNetworkFactory};
 use opc_consensus::engine::raft::{
     AppendEntriesRequest, AppendEntriesResponse, InstallSnapshotRequest, InstallSnapshotResponse,
-    VoteRequest, VoteResponse,
+    PreVoteReply, VoteRequest, VoteResponse,
 };
 use opc_consensus::engine::{EmptyNode, Vote};
 use opc_consensus::{
@@ -117,8 +117,8 @@ impl fmt::Debug for ConfigRaftNetwork {
 enum PeerDispatch {
     /// An ordinary call, answered by every voter.
     Call,
-    /// A Pre-Vote call, which a voter of a release without Pre-Vote cannot
-    /// answer.
+    /// A Pre-Vote call, which only a voter the transport knows to answer
+    /// Pre-Vote receives.
     PreVote,
 }
 
@@ -145,7 +145,7 @@ impl ConfigRaftNetwork {
     }
 
     /// Send one request. `Ok(None)` reports a Pre-Vote call to a voter that
-    /// runs a release without Pre-Vote; nothing was sent.
+    /// is not known to answer Pre-Vote; nothing was sent.
     // OpenRaft requires this transport error type; boxing it would change the
     // adapter's prescribed RPC error contract.
     #[allow(clippy::result_large_err)]
@@ -301,7 +301,7 @@ impl RaftNetwork<ConfigRaftTypeConfig> for ConfigRaftNetwork {
         &mut self,
         request: VoteRequest<ConsensusNodeId>,
         option: RPCOption,
-    ) -> Result<VoteResponse<ConsensusNodeId>, EngineRpcError> {
+    ) -> Result<PreVoteReply<ConsensusNodeId>, EngineRpcError> {
         let payload = encode_config_wire(&request).map_err(|error| {
             EngineRpcError::Unreachable(Unreachable::new(&CodecTransportError(error)))
         })?;
@@ -315,12 +315,11 @@ impl RaftNetwork<ConfigRaftTypeConfig> for ConfigRaftNetwork {
                 PeerDispatch::PreVote,
             )
             .await?;
-        // A voter of a release without Pre-Vote cannot answer. Count it as
-        // rejecting, with no vote to catch up to: such voters lead an election
-        // they are needed for with the real vote, and when their logs are
-        // behind, the engine's stale-candidate rule makes a voter of this
-        // release campaign without Pre-Vote instead.
-        Ok(answered.unwrap_or_else(|| VoteResponse::new(Vote::default(), None, false)))
+        // A voter that the transport does not positively know to answer
+        // Pre-Vote, such as a voter of a release without it or any voter behind
+        // a transport that does not implement it, can still grant a vote but
+        // never a Pre-Vote: the engine runs the classic election instead.
+        Ok(answered.map_or(PreVoteReply::Unsupported, PreVoteReply::Answered))
     }
 }
 

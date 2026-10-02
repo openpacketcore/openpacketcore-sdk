@@ -15,7 +15,7 @@ use opc_consensus::engine::error::{
 use opc_consensus::engine::network::{RPCOption, RaftNetwork, RaftNetworkFactory};
 use opc_consensus::engine::raft::{
     AppendEntriesRequest, AppendEntriesResponse, InstallSnapshotRequest, InstallSnapshotResponse,
-    TransferLeaderRequest, VoteRequest, VoteResponse,
+    PreVoteReply, TransferLeaderRequest, VoteRequest, VoteResponse,
 };
 use opc_consensus::engine::{EmptyNode, EntryPayload, Membership, StoredMembership, Vote};
 use opc_consensus::{
@@ -957,8 +957,8 @@ impl fmt::Debug for SessionRaftNetwork {
 enum PeerDispatch {
     /// An ordinary call, answered by every voter.
     Call,
-    /// A Pre-Vote call, which a voter of a release without Pre-Vote cannot
-    /// answer.
+    /// A Pre-Vote call, which only a voter the transport knows to answer
+    /// Pre-Vote receives.
     PreVote,
 }
 
@@ -985,7 +985,7 @@ impl SessionRaftNetwork {
     }
 
     /// Route and send one request. `Ok(None)` reports a Pre-Vote call to a
-    /// voter that runs a release without Pre-Vote; nothing was sent.
+    /// voter that is not known to answer Pre-Vote; nothing was sent.
     // OpenRaft requires this transport error type; boxing it would change the
     // adapter's prescribed RPC error contract.
     #[allow(clippy::result_large_err)]
@@ -1234,7 +1234,7 @@ impl RaftNetwork<SessionRaftTypeConfig> for SessionRaftNetwork {
         &mut self,
         rpc: VoteRequest<SessionConsensusNodeId>,
         option: RPCOption,
-    ) -> Result<VoteResponse<SessionConsensusNodeId>, EngineRpcError> {
+    ) -> Result<PreVoteReply<SessionConsensusNodeId>, EngineRpcError> {
         let payload = encode_bounded(&rpc).map_err(|error| {
             EngineRpcError::Unreachable(Unreachable::new(&CodecTransportError(error)))
         })?;
@@ -1248,12 +1248,11 @@ impl RaftNetwork<SessionRaftTypeConfig> for SessionRaftNetwork {
                 PeerDispatch::PreVote,
             )
             .await?;
-        // A voter of a release without Pre-Vote cannot answer. Count it as
-        // rejecting, with no vote to catch up to: such voters lead an election
-        // they are needed for with the real vote, and when their logs are
-        // behind, the engine's stale-candidate rule makes a voter of this
-        // release campaign without Pre-Vote instead.
-        Ok(answered.unwrap_or_else(|| VoteResponse::new(Vote::default(), None, false)))
+        // A voter that the transport does not positively know to answer
+        // Pre-Vote, such as a voter of a release without it or any voter behind
+        // a transport that does not implement it, can still grant a vote but
+        // never a Pre-Vote: the engine runs the classic election instead.
+        Ok(answered.map_or(PreVoteReply::Unsupported, PreVoteReply::Answered))
     }
 }
 
@@ -3205,9 +3204,10 @@ mod tests {
             .await
     }
 
-    /// A voter of a release without Pre-Vote, reached through a transport that
-    /// knows it: the port's default reports it unable to answer. Any request
-    /// that reaches `call` is counted.
+    /// A voter behind a transport that does not implement Pre-Vote, such as
+    /// one written before it or one that reaches a voter of a release without
+    /// it: the port's default reports it unable to answer. Any request that
+    /// reaches `call` is counted.
     #[derive(Debug)]
     struct PreviousReleasePeer {
         node_id: SessionConsensusNodeId,
@@ -3262,7 +3262,7 @@ mod tests {
         peer: Arc<dyn SessionConsensusPeer>,
     ) -> (
         VoteRequest<SessionConsensusNodeId>,
-        Result<VoteResponse<SessionConsensusNodeId>, EngineRpcError>,
+        Result<PreVoteReply<SessionConsensusNodeId>, EngineRpcError>,
     ) {
         let local = node_id(1);
         let target = peer.node_id();
@@ -3282,17 +3282,17 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn pre_vote_counts_a_previous_release_voter_as_rejecting() {
+    async fn pre_vote_reports_a_voter_that_cannot_answer_as_unsupported() {
         let peer = Arc::new(PreviousReleasePeer {
             node_id: node_id(2),
             calls: std::sync::atomic::AtomicUsize::new(0),
         });
         let (_, response) = pre_vote_through(peer.clone()).await;
         assert_eq!(
-            response.expect("a voter without Pre-Vote is counted, not failed"),
-            VoteResponse::new(Vote::default(), None, false),
-            "a voter without Pre-Vote leads an election it is needed for, so it rejects, with \
-             no vote to catch up to"
+            response.expect("a voter without Pre-Vote is reported, not failed"),
+            PreVoteReply::Unsupported,
+            "a voter without Pre-Vote can still grant a vote, so the engine runs the classic \
+             election instead of counting it as rejecting"
         );
         assert_eq!(
             peer.calls.load(Ordering::SeqCst),
@@ -3328,7 +3328,10 @@ mod tests {
             }),
         });
         let (_, response) = pre_vote_through(peer).await;
-        assert_eq!(response.expect("answered Pre-Vote"), rejection);
+        assert_eq!(
+            response.expect("answered Pre-Vote"),
+            PreVoteReply::Answered(rejection)
+        );
     }
 
     #[tokio::test(start_paused = true)]

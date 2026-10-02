@@ -370,24 +370,25 @@ pub trait ConsensusPeer: Send + Sync + std::fmt::Debug {
     }
 
     /// Send one [`ConsensusRpcFamily::PreVote`] call under the caller's
-    /// complete logical timeout, or report that the remote voter cannot answer
-    /// it.
+    /// complete logical timeout, or report that the remote voter is not known
+    /// to answer it.
     ///
-    /// A voter of a release without Pre-Vote cannot decode the request and
-    /// campaigns with the classic vote alone. A transport that learns which
-    /// release its peer runs, such as the SDK's session transport through the
-    /// protocol negotiated for the connection, returns
-    /// [`PreVoteCall::Unsupported`] for such a voter without sending anything
-    /// and forwards the request otherwise. The Raft adapters count that voter
-    /// as rejecting the Pre-Vote: such voters lead an election they are needed
-    /// for with the classic vote, and when their logs are behind, the engine
-    /// makes a voter with a more up-to-date log campaign without Pre-Vote.
+    /// Forward the request only to a voter positively known to answer
+    /// Pre-Vote: the capability was negotiated on the connection, as the SDK's
+    /// session transport does through the protocol it negotiates, or the peer
+    /// is an in-process peer whose remote voter runs this release, which
+    /// forwards with [`forward_pre_vote`]. For any other voter that can be
+    /// reached, such as a voter of a release without Pre-Vote, send nothing
+    /// and return [`PreVoteCall::Unsupported`]. Such a voter can still grant a
+    /// vote but never a Pre-Vote, so the Raft adapters report it to the engine,
+    /// which then runs the classic election for that campaign instead of a
+    /// Pre-Vote round that could never reach a quorum without it.
     ///
-    /// The default sends nothing and reports `Unsupported`: a transport that
-    /// cannot tell which release its peer runs must not send it a request it
-    /// may be unable to decode. A peer whose remote voter is known to run this
-    /// release, such as an in-process peer, forwards the call with
-    /// [`forward_pre_vote`].
+    /// The default sends nothing and reports `Unsupported`, so a transport
+    /// that does not implement this method keeps automatic failover with the
+    /// classic election. Return an error only for a voter that cannot be
+    /// reached; never for one that answers ordinary calls, or no Pre-Vote
+    /// quorum that needs that voter can form.
     async fn call_pre_vote(
         &self,
         request: ConsensusWireRequest,
@@ -403,8 +404,9 @@ pub trait ConsensusPeer: Send + Sync + std::fmt::Debug {
 pub enum PreVoteCall {
     /// The remote voter answered the Pre-Vote request.
     Answered(ConsensusWireResponse),
-    /// The remote voter runs a release that cannot answer Pre-Vote. Nothing
-    /// was sent.
+    /// The remote voter is not known to answer Pre-Vote, for example because
+    /// it runs a release without it. Nothing was sent, and the campaign runs
+    /// the classic election instead.
     Unsupported,
 }
 
