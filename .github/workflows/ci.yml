@@ -382,6 +382,8 @@ jobs:
             --ignored --exact --test-threads=1 \
             mixed_release::three_process_mixed_release_leader_loss_with_a_lagging_previous_release_voter \
             mixed_release::five_process_mixed_release_leader_loss_with_lagging_previous_release_voters \
+            mixed_release::three_process_mixed_release_leader_loss_with_a_lagging_current_release_voter \
+            mixed_release::five_process_mixed_release_leader_loss_with_lagging_current_release_voters \
             mixed_release::three_process_rolling_upgrade_from_the_previous_release_under_fenced_writes \
             mixed_release::five_process_rolling_upgrade_from_the_previous_release_under_fenced_writes \
             mixed_release::three_process_rolling_downgrade_to_the_previous_release_under_fenced_writes \

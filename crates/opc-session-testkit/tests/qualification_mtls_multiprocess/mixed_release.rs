@@ -19,10 +19,10 @@ use super::*;
 /// Names the previous release's `opc-session-quorum-node` binary.
 const PREVIOUS_RELEASE_NODE_ENV: &str = "OPC_SESSION_QUORUM_NODE_PREVIOUS_RELEASE";
 
-/// How long the previous-release voters stay cut off before the leader is
-/// lost. The current-release majority keeps committing entries they never
-/// receive. The window is shorter than the previous release's 8 s leader
-/// lease, so a cut-off voter never campaigns.
+/// How long the lagging voters stay cut off before the leader is lost. The
+/// others keep committing entries they never receive. The window is shorter
+/// than either release's leader lease, 5 s for this build and 8 s for the
+/// previous release, so a cut-off voter never campaigns.
 const PREVIOUS_RELEASE_LAG_WINDOW: Duration = Duration::from_secs(4);
 
 /// Writes the stream must commit after the roll finished.
@@ -270,8 +270,8 @@ fn wait_for_successor(
     }
 }
 
-/// The previous-release voters of the lagging-voter topology are the last
-/// ones, so this build keeps a majority without them.
+/// The previous-release voters of the lagging-voter topologies are the last
+/// ones: this build keeps a majority without them, and its leader is lost.
 fn lagging_voter_releases(member_count: usize) -> Vec<Release> {
     match member_count {
         3 => vec![Release::Current, Release::Current, Release::Previous],
@@ -286,24 +286,35 @@ fn lagging_voter_releases(member_count: usize) -> Vec<Release> {
     }
 }
 
-/// Lose the leader of this build while every previous-release voter lags.
+/// Lose the leader of this build while every other voter of release
+/// `lagging` lags.
 ///
-/// The previous-release voters miss the entries this build's majority
-/// committed while they were cut off, so a survivor of this build holds the
-/// most up-to-date log and must win. It can only win with a previous-release
-/// voter's vote, which that voter can grant but never as a Pre-Vote: the
-/// survivor learns this from the protocol the connection negotiates and runs
-/// the classic election instead. The previous-release voters campaign with the
-/// classic vote too, but cannot win: their logs are behind.
-fn run_leader_loss_with_lagging_previous_release_voters(member_count: usize) {
+/// The lagging voters miss the entries the others committed while they were
+/// cut off, so only a survivor of the other release holds the most up-to-date
+/// log and can win.
+///
+/// - With previous-release voters lagging, a survivor of this build must win.
+///   It can only win with a previous-release voter's vote, which that voter can
+///   grant but never as a Pre-Vote: the survivor learns this from the protocol
+///   the connection negotiates and runs the classic election instead. The
+///   previous-release voters campaign with the classic vote too, but cannot
+///   win: their logs are behind.
+/// - With this build's survivors lagging, a previous-release voter must win, by
+///   its own slower timers. This build's survivors run the classic election,
+///   because a previous-release voter cannot answer Pre-Vote, and each such
+///   campaign votes for itself in its next term. A previous-release candidate
+///   that meets such a self-vote in its term is refused, and the survivor of
+///   this build then defers its own next campaign, so that the next
+///   previous-release campaign finds no new self-vote.
+fn run_leader_loss_with_lagging_voters(member_count: usize, lagging: Release) {
     let mut mixed = MixedFleet::start(lagging_voter_releases(member_count));
     let leader = mixed.steer_leader_to_current_release();
     let before = settled_leader_reports(&mut mixed.fleet);
     let old_term = before[0].term;
     assert_eq!(leader_node_index(&before), leader);
     let writer_voter = (0..member_count)
-        .find(|node_index| *node_index != leader && mixed.releases[*node_index] == Release::Current)
-        .expect("a surviving voter of this build");
+        .find(|node_index| *node_index != leader && mixed.releases[*node_index] != lagging)
+        .expect("a surviving voter that does not lag");
     let client = mixed.client(writer_voter);
     let progress = Arc::new(StreamProgress::default());
     let writer = mixed.runtime.spawn(stream_fenced_writes_on(
@@ -321,10 +332,10 @@ fn run_leader_loss_with_lagging_previous_release_voters(member_count: usize) {
         thread::sleep(Duration::from_millis(5));
     }
 
-    let lagging = (0..member_count)
-        .filter(|node_index| mixed.releases[*node_index] == Release::Previous)
+    let lagging_voters = (0..member_count)
+        .filter(|node_index| *node_index != leader && mixed.releases[*node_index] == lagging)
         .collect::<Vec<_>>();
-    for node_index in &lagging {
+    for node_index in &lagging_voters {
         mixed.fleet.set_consensus_rpc_availability(
             *node_index,
             QualificationConsensusRpcAvailability::Unavailable,
@@ -334,7 +345,7 @@ fn run_leader_loss_with_lagging_previous_release_voters(member_count: usize) {
     thread::sleep(PREVIOUS_RELEASE_LAG_WINDOW);
     assert!(
         progress.committed.load(Ordering::SeqCst) >= committed_before_lag + 3,
-        "this build's majority must keep committing while the previous-release voters lag"
+        "the voters that do not lag must keep committing while the others lag"
     );
 
     // Lose the leader first, so the lagging voters cannot catch up from it.
@@ -344,7 +355,7 @@ fn run_leader_loss_with_lagging_previous_release_voters(member_count: usize) {
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(fault_at);
     let _ = mixed.fleet.kill_node_unclean(leader);
-    for node_index in &lagging {
+    for node_index in &lagging_voters {
         mixed.fleet.set_consensus_rpc_availability(
             *node_index,
             QualificationConsensusRpcAvailability::Available,
@@ -362,7 +373,7 @@ fn run_leader_loss_with_lagging_previous_release_voters(member_count: usize) {
                 panic!(
                     "{member_count}-voter mixed-release fleet elected no successor within the \
                      documented {}ms mixed-release bound after losing its leader while the \
-                     previous-release voters lagged: survivors={reports:?}",
+                     {lagging:?}-release voters lagged: survivors={reports:?}",
                     bound.as_millis()
                 )
             }
@@ -378,7 +389,7 @@ fn run_leader_loss_with_lagging_previous_release_voters(member_count: usize) {
     let outage = outage_after(&writes, fault_at).expect("a write issued after the fault commits");
     let outage_bound = mixed_release_write_stall_bound();
     eprintln!(
-        "mixed-release leader loss with lagging previous-release voters: voters={member_count} \
+        "mixed-release leader loss with lagging {lagging:?}-release voters: voters={member_count} \
          releases={:?} old_term={old_term} new_term={new_term} elected_ms={} outage_ms={} \
          election_bound_ms={} outage_bound_ms={}",
         mixed.releases,
@@ -395,9 +406,8 @@ fn run_leader_loss_with_lagging_previous_release_voters(member_count: usize) {
         outage.as_millis(),
         outage_bound.as_millis()
     );
-    // No voter is left rejecting votes: every survivor, the lagging
-    // previous-release voters included, follows the successor and has
-    // applied the committed log.
+    // No voter is left rejecting votes: every survivor, the lagging voters
+    // included, follows the successor and has applied the committed log.
     let survivors_after = mixed.fleet.readiness_reports(&survivors);
     assert!(
         survivors_after.iter().all(|report| report.ready
@@ -414,7 +424,7 @@ fn three_process_mixed_release_leader_loss_with_a_lagging_previous_release_voter
     let _guard = FLEET_TEST_LOCK
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
-    run_leader_loss_with_lagging_previous_release_voters(3);
+    run_leader_loss_with_lagging_voters(3, Release::Previous);
 }
 
 #[test]
@@ -423,7 +433,25 @@ fn five_process_mixed_release_leader_loss_with_lagging_previous_release_voters()
     let _guard = FLEET_TEST_LOCK
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
-    run_leader_loss_with_lagging_previous_release_voters(5);
+    run_leader_loss_with_lagging_voters(5, Release::Previous);
+}
+
+#[test]
+#[ignore = "requires OPC_SESSION_QUORUM_NODE_PREVIOUS_RELEASE; run by the rolling-upgrade lane"]
+fn three_process_mixed_release_leader_loss_with_a_lagging_current_release_voter() {
+    let _guard = FLEET_TEST_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    run_leader_loss_with_lagging_voters(3, Release::Current);
+}
+
+#[test]
+#[ignore = "requires OPC_SESSION_QUORUM_NODE_PREVIOUS_RELEASE; run by the rolling-upgrade lane"]
+fn five_process_mixed_release_leader_loss_with_lagging_current_release_voters() {
+    let _guard = FLEET_TEST_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    run_leader_loss_with_lagging_voters(5, Release::Current);
 }
 
 /// Bound on electing a successor while a voter of the previous release is a
