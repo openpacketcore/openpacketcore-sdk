@@ -5516,6 +5516,16 @@ async fn persistent_three_voter_consumer_write_does_not_spend_budget_on_a_read_q
         persistent.capabilities().await.is_ok(),
         "warm and authenticate the persistent connection before measuring the mutation"
     );
+    // A periodic idle heartbeat is an empty AppendEntries too, and one that
+    // reached a follower inside the measured window would be counted as a
+    // pre-write quorum round. Pause them before the binding write. Every voter
+    // applying that write proves that any heartbeat sent before the pause has
+    // crossed its follower's ordered replication stream. A leadership
+    // confirmation round does not use these heartbeats, so the measured
+    // mutation still cannot hide one.
+    for store in &fleet.stores {
+        store.set_periodic_heartbeat_for_test(false);
+    }
     fleet.stores[follower]
         .consumer_service()
         .prepare_consumer_request_binding_for_test(&authorization, &request)
@@ -5543,6 +5553,9 @@ async fn persistent_three_voter_consumer_write_does_not_spend_budget_on_a_read_q
     };
     let mutation_elapsed = started.elapsed();
     fleet.set_prewrite_empty_append_entries_delay(false);
+    for store in &fleet.stores {
+        store.set_periodic_heartbeat_for_test(true);
+    }
     let observation_deadline = Instant::now() + Duration::from_secs(1);
     while !fleet.append_entries_observation().2 && Instant::now() < observation_deadline {
         tokio::task::yield_now().await;

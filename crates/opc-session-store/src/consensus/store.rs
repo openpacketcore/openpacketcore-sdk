@@ -3164,6 +3164,15 @@ impl ConsensusSessionStore {
         self.inner.raft.runtime_config().elect(enabled);
     }
 
+    /// Enable or disable a leader's periodic idle heartbeats for deterministic
+    /// integration qualification. Log replication, commit propagation and
+    /// leadership-confirmation rounds keep running.
+    #[cfg(feature = "test-control")]
+    #[doc(hidden)]
+    pub fn set_periodic_heartbeat_for_test(&self, enabled: bool) {
+        self.inner.raft.runtime_config().heartbeat(enabled);
+    }
+
     /// Ask Openraft to start one normal campaign for deterministic integration
     /// qualification. Openraft owns vote creation, persistence, and transport.
     #[cfg(feature = "test-control")]
