@@ -30,10 +30,10 @@ use super::persistence_protocol::{self, PersistenceProtocol};
 
 use super::{
     SessionConsensusCommand, SessionConsensusIdentity, SessionConsensusNodeId,
-    SessionConsensusPeer, SessionConsensusPeerError, SessionConsensusRpcFamily,
-    SessionConsensusRpcHandler, SessionConsensusWireRequest, SessionConsensusWireResponse,
-    SessionMutationIntent, SessionPersistenceMode, SessionRaft, SessionRaftTypeConfig,
-    SESSION_CONSENSUS_SCHEMA_VERSION,
+    SessionConsensusPeer, SessionConsensusPeerError, SessionConsensusPreVoteCall,
+    SessionConsensusRpcFamily, SessionConsensusRpcHandler, SessionConsensusWireRequest,
+    SessionConsensusWireResponse, SessionMutationIntent, SessionPersistenceMode, SessionRaft,
+    SessionRaftTypeConfig, SESSION_CONSENSUS_SCHEMA_VERSION,
 };
 use crate::membership::{SessionTopologyTransitionDigest, SessionTopologyTransitionId};
 use crate::readiness::PlacementResiliencePolicy;
@@ -952,6 +952,16 @@ impl fmt::Debug for SessionRaftNetwork {
     }
 }
 
+/// How [`SessionRaftNetwork::dispatch`] sends one routed request.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum PeerDispatch {
+    /// An ordinary call, answered by every voter.
+    Call,
+    /// A Pre-Vote call, which a voter of a release without Pre-Vote cannot
+    /// answer.
+    PreVote,
+}
+
 impl SessionRaftNetwork {
     // OpenRaft requires this transport error type; boxing it would change the
     // adapter's prescribed RPC error contract.
@@ -963,6 +973,30 @@ impl SessionRaftNetwork {
         payload: Vec<u8>,
         option: RPCOption,
     ) -> Result<Resp, EngineRpcError<E>>
+    where
+        Resp: DeserializeOwned,
+        E: std::error::Error + DeserializeOwned,
+    {
+        self.dispatch(family, action, payload, option, PeerDispatch::Call)
+            .await?
+            .ok_or_else(|| {
+                EngineRpcError::Unreachable(Unreachable::new(&SessionConsensusPeerError::Protocol))
+            })
+    }
+
+    /// Route and send one request. `Ok(None)` reports a Pre-Vote call to a
+    /// voter that runs a release without Pre-Vote; nothing was sent.
+    // OpenRaft requires this transport error type; boxing it would change the
+    // adapter's prescribed RPC error contract.
+    #[allow(clippy::result_large_err)]
+    async fn dispatch<Resp, E>(
+        &self,
+        family: SessionConsensusRpcFamily,
+        action: opc_consensus::engine::RPCTypes,
+        payload: Vec<u8>,
+        option: RPCOption,
+        dispatch: PeerDispatch,
+    ) -> Result<Option<Resp>, EngineRpcError<E>>
     where
         Resp: DeserializeOwned,
         E: std::error::Error + DeserializeOwned,
@@ -1023,7 +1057,15 @@ impl SessionRaftNetwork {
                 })?,
             None => option.soft_ttl(),
         };
-        let response = match peer.call_with_timeout(wire, remaining).await {
+        let sent = match dispatch {
+            PeerDispatch::Call => peer.call_with_timeout(wire, remaining).await,
+            PeerDispatch::PreVote => match peer.call_pre_vote(wire, remaining).await {
+                Ok(SessionConsensusPreVoteCall::Answered(response)) => Ok(response),
+                Ok(SessionConsensusPreVoteCall::Unsupported) => return Ok(None),
+                Err(error) => Err(error),
+            },
+        };
+        let response = match sent {
             Err(error) => return Err(map_peer_error(error, action, self, hard_ttl)),
             Ok(response) => response,
         };
@@ -1040,7 +1082,9 @@ impl SessionRaftNetwork {
             .map_err(|error| {
                 EngineRpcError::Unreachable(Unreachable::new(&CodecTransportError(error)))
             })?;
-        result.map_err(|error| EngineRpcError::RemoteError(RemoteError::new(self.target, error)))
+        result
+            .map(Some)
+            .map_err(|error| EngineRpcError::RemoteError(RemoteError::new(self.target, error)))
     }
 
     // OpenRaft's append RPC must retain its prescribed transport error type.
@@ -1195,13 +1239,21 @@ impl RaftNetwork<SessionRaftTypeConfig> for SessionRaftNetwork {
             EngineRpcError::Unreachable(Unreachable::new(&CodecTransportError(error)))
         })?;
         // A failed or refused call is never counted as a grant by the engine.
-        self.call(
-            SessionConsensusRpcFamily::PreVote,
-            opc_consensus::engine::RPCTypes::Vote,
-            payload,
-            option,
-        )
-        .await
+        let answered = self
+            .dispatch(
+                SessionConsensusRpcFamily::PreVote,
+                opc_consensus::engine::RPCTypes::Vote,
+                payload,
+                option,
+                PeerDispatch::PreVote,
+            )
+            .await?;
+        // A voter of a release without Pre-Vote cannot answer. Count it as
+        // rejecting, with no vote to catch up to: such voters lead an election
+        // they are needed for with the real vote, and when their logs are
+        // behind, the engine's stale-candidate rule makes a voter of this
+        // release campaign without Pre-Vote instead.
+        Ok(answered.unwrap_or_else(|| VoteResponse::new(Vote::default(), None, false)))
     }
 }
 
@@ -1715,6 +1767,15 @@ mod tests {
         ) -> Result<SessionConsensusWireResponse, SessionConsensusPeerError> {
             Ok(self.response.clone())
         }
+
+        async fn call_pre_vote(
+            &self,
+            request: opc_consensus::ConsensusWireRequest,
+            timeout: std::time::Duration,
+        ) -> Result<opc_consensus::PreVoteCall, opc_consensus::ConsensusPeerError> {
+            // Every voter of this in-process cluster runs this build.
+            opc_consensus::forward_pre_vote(self, request, timeout).await
+        }
     }
 
     struct DeadlineRecordingPeer {
@@ -1765,6 +1826,15 @@ mod tests {
             self.release.notified().await;
             Ok(self.response.clone())
         }
+
+        async fn call_pre_vote(
+            &self,
+            request: opc_consensus::ConsensusWireRequest,
+            timeout: std::time::Duration,
+        ) -> Result<opc_consensus::PreVoteCall, opc_consensus::ConsensusPeerError> {
+            // Every voter of this in-process cluster runs this build.
+            opc_consensus::forward_pre_vote(self, request, timeout).await
+        }
     }
 
     #[derive(Debug)]
@@ -1792,6 +1862,15 @@ mod tests {
                 return Err(SessionConsensusPeerError::ScopeMismatch);
             }
             Ok(self.response.clone())
+        }
+
+        async fn call_pre_vote(
+            &self,
+            request: opc_consensus::ConsensusWireRequest,
+            timeout: std::time::Duration,
+        ) -> Result<opc_consensus::PreVoteCall, opc_consensus::ConsensusPeerError> {
+            // Every voter of this in-process cluster runs this build.
+            opc_consensus::forward_pre_vote(self, request, timeout).await
         }
     }
 
@@ -3124,6 +3203,132 @@ mod tests {
                 RPCOption::new(Duration::from_secs(1)),
             )
             .await
+    }
+
+    /// A voter of a release without Pre-Vote, reached through a transport that
+    /// knows it: the port's default reports it unable to answer. Any request
+    /// that reaches `call` is counted.
+    #[derive(Debug)]
+    struct PreviousReleasePeer {
+        node_id: SessionConsensusNodeId,
+        calls: std::sync::atomic::AtomicUsize,
+    }
+
+    #[async_trait::async_trait]
+    impl SessionConsensusPeer for PreviousReleasePeer {
+        fn node_id(&self) -> SessionConsensusNodeId {
+            self.node_id
+        }
+
+        async fn call(
+            &self,
+            _request: SessionConsensusWireRequest,
+        ) -> Result<SessionConsensusWireResponse, SessionConsensusPeerError> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            Err(SessionConsensusPeerError::Protocol)
+        }
+    }
+
+    /// A voter of this release that answers every call with `result`.
+    #[derive(Debug)]
+    struct AnsweringPeer {
+        node_id: SessionConsensusNodeId,
+        result: Result<SessionConsensusWireResponse, SessionConsensusPeerError>,
+    }
+
+    #[async_trait::async_trait]
+    impl SessionConsensusPeer for AnsweringPeer {
+        fn node_id(&self) -> SessionConsensusNodeId {
+            self.node_id
+        }
+
+        async fn call(
+            &self,
+            _request: SessionConsensusWireRequest,
+        ) -> Result<SessionConsensusWireResponse, SessionConsensusPeerError> {
+            self.result.clone()
+        }
+
+        async fn call_pre_vote(
+            &self,
+            request: SessionConsensusWireRequest,
+            timeout: Duration,
+        ) -> Result<SessionConsensusPreVoteCall, SessionConsensusPeerError> {
+            crate::consensus::forward_session_consensus_pre_vote(self, request, timeout).await
+        }
+    }
+
+    async fn pre_vote_through(
+        peer: Arc<dyn SessionConsensusPeer>,
+    ) -> (
+        VoteRequest<SessionConsensusNodeId>,
+        Result<VoteResponse<SessionConsensusNodeId>, EngineRpcError>,
+    ) {
+        let local = node_id(1);
+        let target = peer.node_id();
+        let mut factory = SessionRaftNetworkFactory::try_new(
+            identity(1),
+            local,
+            BTreeSet::from([local, target]),
+            BTreeMap::from([(target, peer)]),
+        )
+        .expect("valid routing table");
+        let mut network = factory.new_client(target, &EmptyNode::default()).await;
+        let request = VoteRequest::new(Vote::new(7, local), None);
+        let response = network
+            .pre_vote(request.clone(), RPCOption::new(Duration::from_secs(1)))
+            .await;
+        (request, response)
+    }
+
+    #[tokio::test]
+    async fn pre_vote_counts_a_previous_release_voter_as_rejecting() {
+        let peer = Arc::new(PreviousReleasePeer {
+            node_id: node_id(2),
+            calls: std::sync::atomic::AtomicUsize::new(0),
+        });
+        let (_, response) = pre_vote_through(peer.clone()).await;
+        assert_eq!(
+            response.expect("a voter without Pre-Vote is counted, not failed"),
+            VoteResponse::new(Vote::default(), None, false),
+            "a voter without Pre-Vote leads an election it is needed for, so it rejects, with \
+             no vote to catch up to"
+        );
+        assert_eq!(
+            peer.calls.load(Ordering::SeqCst),
+            0,
+            "nothing is sent to a voter that cannot decode a Pre-Vote"
+        );
+    }
+
+    #[tokio::test]
+    async fn pre_vote_failure_of_a_current_release_voter_is_never_a_grant() {
+        let peer = Arc::new(AnsweringPeer {
+            node_id: node_id(2),
+            result: Err(SessionConsensusPeerError::Unavailable),
+        });
+        let (_, response) = pre_vote_through(peer).await;
+        assert!(
+            matches!(response, Err(EngineRpcError::Unreachable(_))),
+            "an unreachable voter of this release grants nothing: {response:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn pre_vote_returns_a_current_release_voters_rejection() {
+        let rejection = VoteResponse::new(Vote::new(9, node_id(3)), None, false);
+        let encoded: Result<
+            VoteResponse<SessionConsensusNodeId>,
+            RaftError<SessionConsensusNodeId, opc_consensus::engine::error::Infallible>,
+        > = Ok(rejection.clone());
+        let peer = Arc::new(AnsweringPeer {
+            node_id: node_id(2),
+            result: Ok(SessionConsensusWireResponse {
+                result: Ok(encode_bounded(&encoded).expect("bounded Pre-Vote response")),
+            }),
+        });
+        let (_, response) = pre_vote_through(peer).await;
+        assert_eq!(response.expect("answered Pre-Vote"), rejection);
     }
 
     #[tokio::test(start_paused = true)]

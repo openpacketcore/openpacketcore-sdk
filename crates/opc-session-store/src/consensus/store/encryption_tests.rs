@@ -877,6 +877,15 @@ impl SessionConsensusPeer for RemoteRotationPeer {
             .ok_or(SessionConsensusPeerError::Unavailable)?;
         Ok(handler.handle(request.sender, request).await)
     }
+
+    async fn call_pre_vote(
+        &self,
+        request: opc_consensus::ConsensusWireRequest,
+        timeout: std::time::Duration,
+    ) -> Result<opc_consensus::PreVoteCall, opc_consensus::ConsensusPeerError> {
+        // Every voter of this in-process cluster runs this build.
+        opc_consensus::forward_pre_vote(self, request, timeout).await
+    }
 }
 
 fn remote_rotation_replica_id(index: usize) -> ReplicaId {

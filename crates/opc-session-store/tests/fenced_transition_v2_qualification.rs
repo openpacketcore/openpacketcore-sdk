@@ -1645,6 +1645,15 @@ impl SessionConsensusPeer for ScopedLoopbackPeer {
         }
         Ok(response)
     }
+
+    async fn call_pre_vote(
+        &self,
+        request: opc_consensus::ConsensusWireRequest,
+        timeout: std::time::Duration,
+    ) -> Result<opc_consensus::PreVoteCall, opc_consensus::ConsensusPeerError> {
+        // Every voter of this in-process cluster runs this build.
+        opc_consensus::forward_pre_vote(self, request, timeout).await
+    }
 }
 
 fn replica_id(index: usize) -> ReplicaId {

@@ -209,6 +209,15 @@ impl SessionConsensusPeer for InProcessConsensusPeer {
         observation.finish(&result);
         result
     }
+
+    async fn call_pre_vote(
+        &self,
+        request: opc_consensus::ConsensusWireRequest,
+        timeout: std::time::Duration,
+    ) -> Result<opc_consensus::PreVoteCall, opc_consensus::ConsensusPeerError> {
+        // Every voter of this in-process cluster runs this build.
+        opc_consensus::forward_pre_vote(self, request, timeout).await
+    }
 }
 
 impl InProcessConsensusPeer {

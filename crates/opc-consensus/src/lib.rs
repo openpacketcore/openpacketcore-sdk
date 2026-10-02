@@ -50,9 +50,9 @@ pub use profile::{
     DURABLE_OPENRAFT_PROFILE, DURABLE_OPENRAFT_PROPOSAL_ADMISSION_SLOTS,
 };
 pub use transport::{
-    decode_roster_bounded, encode_roster_bounded, ConsensusPeer, ConsensusPeerError,
-    ConsensusRpcFamily, ConsensusRpcHandler, ConsensusWireRequest, ConsensusWireResponse,
-    CONSENSUS_MAX_ROSTER_RPC_PAYLOAD_BYTES, CONSENSUS_MAX_RPC_PAYLOAD_BYTES,
-    CONSENSUS_PROTECTED_ROSTER_TERMINAL_COMPACT_EVIDENCE_BYTES,
+    decode_roster_bounded, encode_roster_bounded, forward_pre_vote, ConsensusPeer,
+    ConsensusPeerError, ConsensusRpcFamily, ConsensusRpcHandler, ConsensusWireRequest,
+    ConsensusWireResponse, PreVoteCall, CONSENSUS_MAX_ROSTER_RPC_PAYLOAD_BYTES,
+    CONSENSUS_MAX_RPC_PAYLOAD_BYTES, CONSENSUS_PROTECTED_ROSTER_TERMINAL_COMPACT_EVIDENCE_BYTES,
     CONSENSUS_PROTECTED_ROSTER_TERMINAL_PROOF_BUNDLE_BYTES, CONSENSUS_SCHEMA_VERSION,
 };

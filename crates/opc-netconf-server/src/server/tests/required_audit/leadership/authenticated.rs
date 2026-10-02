@@ -172,6 +172,20 @@ impl ConsensusPeer for NetworkPath {
         self.activity.notify_one();
         result
     }
+
+    async fn call_pre_vote(
+        &self,
+        request: ConsensusWireRequest,
+        timeout: Duration,
+    ) -> Result<opc_consensus::PreVoteCall, ConsensusPeerError> {
+        if !self.enabled.load(Ordering::Acquire) {
+            return Err(ConsensusPeerError::Unavailable);
+        }
+        // The remote peer negotiates whether its voter answers Pre-Vote.
+        let result = self.remote.call_pre_vote(request, timeout).await;
+        self.activity.notify_one();
+        result
+    }
 }
 
 #[derive(Debug)]

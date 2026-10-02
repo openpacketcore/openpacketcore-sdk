@@ -48,6 +48,7 @@ impl Fixture {
             writer: Box::new(writer),
             response_frame_size: MIN_SESSION_CONSENSUS_FRAME_SIZE,
             request_frame_size: MIN_SESSION_CONSENSUS_FRAME_SIZE,
+            pre_vote: true,
             admission_attempt_id: Some(attempt_id),
             lifecycle: ConnectionLifecycle::new(peer.lifecycle_policy, now, None, None, 0, None)
                 .expect("fixture lifecycle"),

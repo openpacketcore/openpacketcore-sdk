@@ -510,6 +510,18 @@ impl SessionConsensusPeer for GatedReadBarrierPeer {
         let response = self.inner.call_with_timeout(request, timeout).await;
         self.complete_forward_mutation_call(withhold, response)
     }
+
+    async fn call_pre_vote(
+        &self,
+        request: SessionConsensusWireRequest,
+        timeout: Duration,
+    ) -> Result<opc_consensus::PreVoteCall, SessionConsensusPeerError> {
+        if !self.enabled.load(Ordering::Acquire) {
+            return Err(SessionConsensusPeerError::Unavailable);
+        }
+        self.record_request(&request).await;
+        self.inner.call_pre_vote(request, timeout).await
+    }
 }
 
 impl GatedReadBarrierPeer {

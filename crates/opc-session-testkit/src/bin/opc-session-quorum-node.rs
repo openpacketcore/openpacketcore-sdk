@@ -342,6 +342,18 @@ impl SessionConsensusPeer for QualificationGatedConsensusPeer {
         }
         self.inner.call_with_timeout(request, timeout).await
     }
+
+    async fn call_pre_vote(
+        &self,
+        request: SessionConsensusWireRequest,
+        timeout: Duration,
+    ) -> Result<opc_consensus::PreVoteCall, SessionConsensusPeerError> {
+        if !self.gate.permits_rpc() {
+            return Err(SessionConsensusPeerError::Unavailable);
+        }
+        // The wrapped peer negotiates whether its voter answers Pre-Vote.
+        self.inner.call_pre_vote(request, timeout).await
+    }
 }
 
 struct QualificationGatedConsensusRpcHandler {
@@ -7385,6 +7397,15 @@ mod tests {
                 Ordering::SeqCst,
             );
             self.call(request).await
+        }
+
+        async fn call_pre_vote(
+            &self,
+            request: opc_consensus::ConsensusWireRequest,
+            timeout: std::time::Duration,
+        ) -> Result<opc_consensus::PreVoteCall, opc_consensus::ConsensusPeerError> {
+            // Every voter of this in-process cluster runs this build.
+            opc_consensus::forward_pre_vote(self, request, timeout).await
         }
     }
 

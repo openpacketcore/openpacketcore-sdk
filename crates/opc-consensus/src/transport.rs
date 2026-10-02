@@ -368,6 +368,59 @@ pub trait ConsensusPeer: Send + Sync + std::fmt::Debug {
     ) -> Result<ConsensusWireResponse, ConsensusPeerError> {
         self.call(request).await
     }
+
+    /// Send one [`ConsensusRpcFamily::PreVote`] call under the caller's
+    /// complete logical timeout, or report that the remote voter cannot answer
+    /// it.
+    ///
+    /// A voter of a release without Pre-Vote cannot decode the request and
+    /// campaigns with the classic vote alone. A transport that learns which
+    /// release its peer runs, such as the SDK's session transport through the
+    /// protocol negotiated for the connection, returns
+    /// [`PreVoteCall::Unsupported`] for such a voter without sending anything
+    /// and forwards the request otherwise. The Raft adapters count that voter
+    /// as rejecting the Pre-Vote: such voters lead an election they are needed
+    /// for with the classic vote, and when their logs are behind, the engine
+    /// makes a voter with a more up-to-date log campaign without Pre-Vote.
+    ///
+    /// The default sends nothing and reports `Unsupported`: a transport that
+    /// cannot tell which release its peer runs must not send it a request it
+    /// may be unable to decode. A peer whose remote voter is known to run this
+    /// release, such as an in-process peer, forwards the call with
+    /// [`forward_pre_vote`].
+    async fn call_pre_vote(
+        &self,
+        request: ConsensusWireRequest,
+        timeout: Duration,
+    ) -> Result<PreVoteCall, ConsensusPeerError> {
+        let _ = (request, timeout);
+        Ok(PreVoteCall::Unsupported)
+    }
+}
+
+/// The result of one [`ConsensusPeer::call_pre_vote`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PreVoteCall {
+    /// The remote voter answered the Pre-Vote request.
+    Answered(ConsensusWireResponse),
+    /// The remote voter runs a release that cannot answer Pre-Vote. Nothing
+    /// was sent.
+    Unsupported,
+}
+
+/// Forward a Pre-Vote call through [`ConsensusPeer::call_with_timeout`], for a
+/// peer whose remote voter runs this release.
+pub async fn forward_pre_vote<P>(
+    peer: &P,
+    request: ConsensusWireRequest,
+    timeout: Duration,
+) -> Result<PreVoteCall, ConsensusPeerError>
+where
+    P: ConsensusPeer + ?Sized,
+{
+    peer.call_with_timeout(request, timeout)
+        .await
+        .map(PreVoteCall::Answered)
 }
 
 /// Inbound consensus-only handler exposed by an authenticated server.
@@ -607,6 +660,52 @@ mod tests {
                 CONSENSUS_MAX_ROSTER_RPC_PAYLOAD_BYTES + 1
             ]),
             Err(ConsensusCodecError::TooLarge)
+        );
+    }
+
+    fn pre_vote_request() -> ConsensusWireRequest {
+        ConsensusWireRequest {
+            family: ConsensusRpcFamily::PreVote,
+            ..request()
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn pre_vote_default_sends_nothing_to_a_voter_of_unknown_release() {
+        // This peer's `call` blocks until released, so any answer proves the
+        // default never reached it.
+        let peer = CompatibilityPeer {
+            entered: Notify::new(),
+            release: Notify::new(),
+        };
+        let outcome = tokio::time::timeout(
+            Duration::from_secs(1),
+            peer.call_pre_vote(pre_vote_request(), Duration::from_millis(10)),
+        )
+        .await
+        .expect("the default answers without sending the request");
+        assert_eq!(outcome, Ok(PreVoteCall::Unsupported));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn forwarded_pre_vote_returns_the_voters_answer() {
+        let peer = Arc::new(CompatibilityPeer {
+            entered: Notify::new(),
+            release: Notify::new(),
+        });
+        let call = tokio::spawn({
+            let peer = Arc::clone(&peer);
+            async move {
+                forward_pre_vote(peer.as_ref(), pre_vote_request(), Duration::from_millis(10)).await
+            }
+        });
+        peer.entered.notified().await;
+        peer.release.notify_one();
+        assert_eq!(
+            call.await.expect("forwarding task"),
+            Ok(PreVoteCall::Answered(ConsensusWireResponse {
+                result: Ok(Vec::new()),
+            }))
         );
     }
 
