@@ -176,6 +176,30 @@ pub const NLM_F_EXCL: u16 = 0x0200;
 pub const NLM_F_CREATE: u16 = 0x0400;
 /// Netlink append flag.
 pub const NLM_F_APPEND: u16 = 0x0800;
+/// Netlink dump-reply flag: the dump was inconsistent due to a sequence
+/// change.
+///
+/// `include/uapi/linux/netlink.h`: `#define NLM_F_DUMP_INTR 0x10`. The kernel
+/// sets it on a dump reply when the dumped table changed between two
+/// multipart batches. A reader must discard the whole dump.
+pub const NLM_F_DUMP_INTR: u16 = 0x0010;
+/// Netlink GET modifier: return the complete table.
+///
+/// `include/uapi/linux/netlink.h`: `#define NLM_F_ROOT 0x100`. GET requests
+/// share this bit with [`NLM_F_REPLACE`], which has meaning only on NEW
+/// requests.
+pub const NLM_F_ROOT: u16 = 0x0100;
+/// Netlink GET modifier: return all matching entries.
+///
+/// `include/uapi/linux/netlink.h`: `#define NLM_F_MATCH 0x200`. GET requests
+/// share this bit with [`NLM_F_EXCL`], which has meaning only on NEW requests.
+pub const NLM_F_MATCH: u16 = 0x0200;
+/// Netlink GET modifier requesting a multipart dump.
+///
+/// `include/uapi/linux/netlink.h`: `#define NLM_F_DUMP (NLM_F_ROOT|NLM_F_MATCH)`.
+/// The kernel answers with [`NLM_F_MULTI`] messages terminated by
+/// [`NLMSG_DONE`].
+pub const NLM_F_DUMP: u16 = NLM_F_ROOT | NLM_F_MATCH;
 
 /// Netlink no-op control message.
 pub const NLMSG_NOOP: u16 = 0x1;
@@ -212,6 +236,18 @@ pub const XFRM_MSG_FLUSHSA: u16 = XFRM_MSG_BASE + 12;
 pub const XFRM_MSG_FLUSHPOLICY: u16 = XFRM_MSG_BASE + 13;
 /// Update/query replay and lifetime state for an existing Security Association.
 pub const XFRM_MSG_NEWAE: u16 = XFRM_MSG_BASE + 14;
+/// Reply carrying Security Association Database information.
+///
+/// `include/uapi/linux/xfrm.h`, message-type enum: `XFRM_MSG_NEWSADINFO` is
+/// `0x22`. Its body is a `__u32` flags word followed by `XFRMA_SAD_*`
+/// attributes, including [`XFRMA_SAD_CNT`].
+pub const XFRM_MSG_NEWSADINFO: u16 = XFRM_MSG_BASE + 18;
+/// Request Security Association Database information.
+///
+/// `include/uapi/linux/xfrm.h`: `XFRM_MSG_GETSADINFO` is `0x23`. The request
+/// body is one `__u32` flags word; Linux answers with
+/// [`XFRM_MSG_NEWSADINFO`].
+pub const XFRM_MSG_GETSADINFO: u16 = XFRM_MSG_BASE + 19;
 /// Relocate one exactly identified Security Association.
 ///
 /// This is the single-state migration UAPI added after the older
@@ -282,6 +318,14 @@ pub const XFRMA_SET_MARK_MASK: u16 = 30;
 pub const XFRMA_IF_ID: u16 = 31;
 /// Optional Security Association direction attribute.
 pub const XFRMA_SA_DIR: u16 = 34;
+/// Number of states in the Security Association Database (`__u32`), an
+/// attribute of [`XFRM_MSG_NEWSADINFO`].
+///
+/// `include/uapi/linux/xfrm.h`, `enum xfrm_sadattr_type_t`: `XFRMA_SAD_CNT`
+/// is 1. Linux fills it from `net->xfrm.state_num` under `xfrm_state_lock`
+/// (`xfrm_sad_getinfo` in `net/xfrm/xfrm_state.c`). This attribute namespace
+/// is separate from `enum xfrm_attr_type_t`.
+pub const XFRMA_SAD_CNT: u16 = 1;
 
 /// Main Security Policy Database policy type.
 pub const XFRM_POLICY_TYPE_MAIN: u8 = 0;
@@ -761,6 +805,26 @@ mod tests {
         assert_eq!(XFRM_MIGRATE_STATE_KNOWN_FLAGS, 3);
         assert_eq!(LINUX_EINVAL, libc::EINVAL);
         assert_eq!(LINUX_ENOPROTOOPT, libc::ENOPROTOOPT);
+    }
+
+    #[test]
+    fn dump_constants_match_linux_uapi_headers() {
+        // include/uapi/linux/netlink.h
+        assert_eq!(NLM_F_DUMP_INTR, 0x10);
+        assert_eq!(NLM_F_ROOT, 0x100);
+        assert_eq!(NLM_F_MATCH, 0x200);
+        assert_eq!(NLM_F_DUMP, 0x300);
+        // NLM_F_DUMP and NLM_F_DUMP_INTR are distinct from every other flag a
+        // dump request or reply carries.
+        assert_eq!(
+            NLM_F_DUMP & (NLM_F_REQUEST | NLM_F_MULTI | NLM_F_ACK | NLM_F_DUMP_INTR),
+            0
+        );
+        // include/uapi/linux/xfrm.h: message types and enum xfrm_sadattr_type_t
+        assert_eq!(XFRM_MSG_NEWSADINFO, 0x22);
+        assert_eq!(XFRM_MSG_GETSADINFO, 0x23);
+        assert_eq!(XFRM_MSG_GETSADINFO, XFRM_MSG_NEWSADINFO + 1);
+        assert_eq!(XFRMA_SAD_CNT, 1);
     }
 
     #[test]

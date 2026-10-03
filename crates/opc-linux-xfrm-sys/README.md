@@ -18,9 +18,11 @@ privilege selection, or deployment defaults.
   from an oversized one or a consumed userspace-forged datagram. Receive
   provenance requires an exact unicast kernel `sockaddr_nl` (`pid=0`,
   `groups=0`) before any payload is exposed to callers.
-- UAPI constants for netlink flags/control messages, XFRM SA/policy message
-  types, policy directions/actions, modes, optional attributes, ESN flags, and
-  algorithm name length.
+- UAPI constants for netlink flags/control messages, including the dump
+  request and interrupted-dump flags, XFRM SA/policy message types including
+  the SAD information request and reply, policy directions/actions, modes,
+  optional attributes including the SAD state count, ESN flags, and algorithm
+  name length. Newer constants cite their `include/uapi/linux` header.
 - `repr(C)` layouts for XFRM addresses, IDs, selectors, lifetimes, stats, SA
   info, SA IDs, policy info, policy IDs, templates, SPI allocation, algorithm
   headers, marks, UDP encapsulation templates, netlink headers, and errors.

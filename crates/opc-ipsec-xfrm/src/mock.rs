@@ -8,14 +8,16 @@ use async_trait::async_trait;
 use crate::backend::XfrmBackend;
 use crate::error::XfrmError;
 use crate::model::{
-    validate_exact_remove_policy_request, validate_policy_query, validate_relocate_sa_request,
-    validate_sa_output_mark, validate_sa_query, AllocateSpiRequest, ExactRemovePolicyRequest,
-    InstallPolicyRequest, InstallSaRequest, IpAddress, LifetimeConfig, LifetimeCurrent,
-    PolicyParameters, QueryPolicyRequest, QuerySaRequest, RekeyPolicyRequest, RekeySaRequest,
-    RelocateSaRequest, RemovePolicyRequest, RemoveSaRequest, SaRelocationDirection,
-    SaRelocationEncap, SaRelocationIdentity, SaRelocationSelector, SaReplayState, SaState,
-    SaStatistics, SpiAllocation, XfrmAction, XfrmCapability, XfrmDirection, XfrmId, XfrmLookupMark,
-    XfrmMode, XfrmProbe, XfrmSelector, XfrmTemplate,
+    authorize_exact_sa_removal, linux_lookup_selects, validate_exact_remove_policy_request,
+    validate_exact_remove_sa_request, validate_policy_query, validate_relocate_sa_request,
+    validate_sa_lookup_key, validate_sa_output_mark, validate_sa_query, AllocateSpiRequest,
+    ExactRemovePolicyRequest, ExactRemoveSaRequest, InstallPolicyRequest, InstallSaRequest,
+    IpAddress, LifetimeConfig, LifetimeCurrent, PolicyParameters, QueryPolicyRequest,
+    QuerySaRequest, RekeyPolicyRequest, RekeySaRequest, RelocateSaRequest, RemovePolicyRequest,
+    RemoveSaRequest, SaKeySnapshot, SaLookupKey, SaRelocationDirection, SaRelocationEncap,
+    SaRelocationIdentity, SaRelocationSelector, SaReplayState, SaState, SaStatistics,
+    SpiAllocation, XfrmAction, XfrmCapability, XfrmDirection, XfrmId, XfrmLookupMark, XfrmMode,
+    XfrmProbe, XfrmSelector, XfrmTemplate,
 };
 
 /// One recorded call against the mock backend.
@@ -192,6 +194,15 @@ pub struct MockSaRelocation {
 /// backend. SPI allocations choose the first free SPI in the requested
 /// inclusive range, skipping reserved SPI 0. Errors can be injected to exercise
 /// caller recovery paths.
+///
+/// SA lookups follow Linux `__xfrm_state_lookup`. Query, rekey, relocation,
+/// and removal select the first state at the destination/protocol/SPI key
+/// whose stored lookup mark satisfies `(lookup & mask) == value`, so an
+/// unmarked state answers every lookup mark. An install collides when that
+/// lookup, made with the new state's own mark, selects an existing state, and
+/// a new state goes to the head of the key's lookup order.
+/// [`Self::reverse_sa_lookup_order`] reverses that order, as an XFRM hash
+/// resize can.
 #[derive(Debug, Clone)]
 pub struct MockXfrmBackend {
     state: Arc<Mutex<MockState>>,
@@ -200,20 +211,27 @@ pub struct MockXfrmBackend {
 /// Allocated SPI identity used to allow the same SPI value to be reused for a
 /// different destination or protocol.
 type AllocatedSpiKey = (IpAddress, u8, u32);
-type SaKey = (IpAddress, u8, u32, Option<XfrmLookupMark>);
+
+/// Linux SA lookup key: destination (and so family), protocol, and SPI.
+///
+/// `__xfrm_state_lookup` compares these before the mark. The mock keeps the
+/// states of one key in their lookup order, head first: Linux walks an SPI
+/// hash chain from its head, and only the relative order of states at one
+/// key can change which state a lookup selects.
+type SaChainKey = (IpAddress, u8, u32);
 
 /// Linux policy lookup identity.
 ///
-/// `if_id` belongs here even though it is absent from [`SaKey`]:
+/// `if_id` belongs here even though it is absent from [`SaChainKey`]:
 /// `xfrm_policy_insert` compares it, while `__xfrm_state_lookup` matches only
 /// family, SPI, protocol, destination and the mark, so two SAs differing only
 /// by interface collide.
 ///
-/// The mark halves differ too, and only the policy half is modelled exactly
-/// here: policy lookup is pair equality (`xfrm_policy_mark_match`), whereas SA
-/// lookup applies the *stored* SA's mask to the incoming value. Overlapping SA
-/// masks are therefore still compared by pair equality below; that gap is
-/// issue #419, not something this key models.
+/// The mark halves differ too. Policy lookup is pair equality
+/// (`xfrm_policy_mark_match`), so the mark is part of this key. SA lookup
+/// applies the *stored* SA's mask to the incoming value instead, which is why
+/// SA states are kept per [`SaChainKey`] and selected with
+/// `linux_lookup_selects` rather than keyed by their mark.
 type PolicyKey = (
     XfrmSelector,
     XfrmDirection,
@@ -225,6 +243,10 @@ type PolicyKey = (
 struct MockSaRecord {
     state: SaState,
     identity: SaRelocationIdentity,
+    /// Creation order in the namespace-wide state list (`state_all`); larger
+    /// is newer. Key snapshots report newest first, as an XFRM dump does,
+    /// whatever the lookup order.
+    generation: u64,
 }
 
 #[derive(Debug)]
@@ -232,10 +254,68 @@ struct MockState {
     operations: Vec<MockOperation>,
     relocations: Vec<MockSaRelocation>,
     allocated_spis: BTreeSet<AllocatedSpiKey>,
-    sas: BTreeMap<SaKey, MockSaRecord>,
+    /// The states of each key in lookup order, head first.
+    sas: BTreeMap<SaChainKey, Vec<MockSaRecord>>,
+    next_sa_generation: u64,
     policies: HashMap<PolicyKey, PolicyParameters>,
     probe_result: XfrmProbe,
     failure: Option<XfrmError>,
+}
+
+impl MockState {
+    /// Position of the state a Linux lookup carrying `mark` selects at `id`.
+    fn sa_lookup_index(&self, id: XfrmId, mark: Option<XfrmLookupMark>) -> Option<usize> {
+        self.sas
+            .get(&sa_chain_key(id))?
+            .iter()
+            .position(|record| linux_lookup_selects(mark, record.identity.mark))
+    }
+
+    /// The state a Linux lookup carrying `mark` selects at `id`.
+    fn sa_lookup(&self, id: XfrmId, mark: Option<XfrmLookupMark>) -> Option<&MockSaRecord> {
+        let index = self.sa_lookup_index(id, mark)?;
+        self.sas.get(&sa_chain_key(id))?.get(index)
+    }
+
+    /// Insert a new state at the head of its key's lookup order, as
+    /// `__xfrm_state_insert` does.
+    fn insert_sa_at_head(&mut self, mut record: MockSaRecord) {
+        record.generation = self.next_sa_generation;
+        self.next_sa_generation = self.next_sa_generation.wrapping_add(1);
+        self.sas
+            .entry(sa_chain_key(record.identity.id))
+            .or_default()
+            .insert(0, record);
+    }
+
+    fn remove_sa_at(&mut self, key: SaChainKey, index: usize) -> Option<MockSaRecord> {
+        let chain = self.sas.get_mut(&key)?;
+        if index >= chain.len() {
+            return None;
+        }
+        let record = chain.remove(index);
+        if chain.is_empty() {
+            self.sas.remove(&key);
+        }
+        Some(record)
+    }
+
+    /// Every state at `key`, newest first.
+    fn sa_key_snapshot(&self, key: SaLookupKey) -> Result<SaKeySnapshot, XfrmError> {
+        let mut records = self
+            .sas
+            .get(&(key.destination(), key.protocol(), key.spi()))
+            .map(|chain| chain.iter().collect::<Vec<_>>())
+            .unwrap_or_default();
+        records.sort_by_key(|record| std::cmp::Reverse(record.generation));
+        SaKeySnapshot::new(
+            key,
+            records
+                .into_iter()
+                .map(|record| record.identity.clone())
+                .collect(),
+        )
+    }
 }
 
 impl MockXfrmBackend {
@@ -252,6 +332,7 @@ impl MockXfrmBackend {
                 relocations: Vec::new(),
                 allocated_spis: BTreeSet::new(),
                 sas: BTreeMap::new(),
+                next_sa_generation: 0,
                 policies: HashMap::new(),
                 probe_result,
                 failure: None,
@@ -314,6 +395,24 @@ impl MockXfrmBackend {
         state.relocations.clear();
     }
 
+    /// Reverse the lookup order of the states at every SA key, as an XFRM
+    /// hash resize can.
+    ///
+    /// `xfrm_hash_resize` re-links every SPI hash chain into a new table, head
+    /// first, which can reverse the order of two states at one key. After
+    /// this call, a lookup that more than one state answers selects the other
+    /// end of the order. Key snapshots report creation order and are
+    /// unaffected, as an XFRM dump is. No operation is recorded.
+    pub fn reverse_sa_lookup_order(&self) {
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        for chain in state.sas.values_mut() {
+            chain.reverse();
+        }
+    }
+
     fn check_failure(state: &MockState) -> Result<(), XfrmError> {
         if let Some(ref error) = state.failure {
             return Err(error.clone());
@@ -345,8 +444,8 @@ fn policy_key(parameters: &PolicyParameters) -> PolicyKey {
     )
 }
 
-fn sa_key(id: XfrmId, mark: Option<XfrmLookupMark>) -> SaKey {
-    (id.destination, id.protocol, id.spi, mark)
+fn sa_chain_key(id: XfrmId) -> SaChainKey {
+    (id.destination, id.protocol, id.spi)
 }
 
 fn sa_record_from_parameters(parameters: &crate::model::SaParameters) -> MockSaRecord {
@@ -382,7 +481,19 @@ fn sa_record_from_parameters(parameters: &crate::model::SaParameters) -> MockSaR
         if_id: parameters.if_id,
         output_mark: state.output_mark,
     };
-    MockSaRecord { state, identity }
+    MockSaRecord {
+        state,
+        identity,
+        generation: 0,
+    }
+}
+
+fn query_sa_id(request: QuerySaRequest) -> XfrmId {
+    XfrmId {
+        destination: request.destination,
+        spi: request.spi,
+        protocol: request.protocol,
+    }
 }
 
 impl Default for MockXfrmBackend {
@@ -501,14 +612,17 @@ impl XfrmBackend for MockXfrmBackend {
         });
         // NLM_F_CREATE | NLM_F_EXCL: a collision leaves the pre-existing SA
         // untouched and reports EEXIST, so the attempt is recorded above but
-        // no state changes here.
-        let key = sa_key(request.parameters.id, request.parameters.mark);
-        if state.sas.contains_key(&key) {
+        // no state changes here. `xfrm_state_add` collides when a lookup made
+        // with the new state's own mark selects an existing state, so an
+        // existing unmarked state refuses every marked install at its key,
+        // while a marked one does not refuse a later unmarked install.
+        if state
+            .sa_lookup(request.parameters.id, request.parameters.mark)
+            .is_some()
+        {
             return Err(XfrmError::AlreadyExists);
         }
-        state
-            .sas
-            .insert(key, sa_record_from_parameters(&request.parameters));
+        state.insert_sa_at_head(sa_record_from_parameters(&request.parameters));
         Ok(())
     }
 
@@ -525,13 +639,7 @@ impl XfrmBackend for MockXfrmBackend {
             protocol: request.protocol,
         });
         state
-            .sas
-            .get(&(
-                request.destination,
-                request.protocol,
-                request.spi,
-                request.mark,
-            ))
+            .sa_lookup(query_sa_id(request), request.mark)
             .map(|record| record.state.clone())
             .ok_or(XfrmError::NotFound)
     }
@@ -552,15 +660,21 @@ impl XfrmBackend for MockXfrmBackend {
             protocol: request.protocol,
         });
         state
-            .sas
-            .get(&(
-                request.destination,
-                request.protocol,
-                request.spi,
-                request.mark,
-            ))
+            .sa_lookup(query_sa_id(request), request.mark)
             .map(|record| record.identity.clone())
             .ok_or(XfrmError::NotFound)
+    }
+
+    async fn query_sa_key_snapshot(&self, key: SaLookupKey) -> Result<SaKeySnapshot, XfrmError> {
+        validate_sa_lookup_key(key)?;
+        let state = self
+            .state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        Self::check_failure(&state)?;
+        // Not recorded in `operations`, like `query_policy`: the established
+        // `MockOperation` enum is exhaustive.
+        state.sa_key_snapshot(key)
     }
 
     async fn query_policy(
@@ -655,13 +769,23 @@ impl XfrmBackend for MockXfrmBackend {
         // XFRM_MSG_UPDSA carries NLM_F_REPLACE without NLM_F_CREATE, so
         // xfrm_state_update returns -ESRCH when the lookup misses rather than
         // creating the SA.
-        let key = sa_key(request.parameters.id, request.parameters.mark);
-        if !state.sas.contains_key(&key) {
-            return Err(XfrmError::NotFound);
-        }
-        state
+        let key = sa_chain_key(request.parameters.id);
+        let index = state
+            .sa_lookup_index(request.parameters.id, request.parameters.mark)
+            .ok_or(XfrmError::NotFound)?;
+        let current = state
             .sas
-            .insert(key, sa_record_from_parameters(&request.parameters));
+            .get_mut(&key)
+            .and_then(|chain| chain.get_mut(index))
+            .ok_or(XfrmError::NotFound)?;
+        // xfrm_state_update changes the state its lookup selected in place, so
+        // that state keeps its lookup order, its age, and its stored lookup
+        // mark. The mock replaces every other field with the request's, a
+        // coarser update than Linux's.
+        let mut replacement = sa_record_from_parameters(&request.parameters);
+        replacement.identity.mark = current.identity.mark;
+        replacement.generation = current.generation;
+        *current = replacement;
         Ok(())
     }
 
@@ -680,34 +804,48 @@ impl XfrmBackend for MockXfrmBackend {
             direction: request.direction,
         });
 
-        let old_key = sa_key(request.current.id, request.current.mark);
+        // XFRM_MSG_MIGRATE_STATE finds the state with the same lookup as
+        // GETSA, so the identity check below applies to whichever state that
+        // lookup selects.
+        let old_key = sa_chain_key(request.current.id);
         let new_id = XfrmId {
             destination: request.new_destination,
             ..request.current.id
         };
-        let new_key = sa_key(new_id, request.current.mark);
-        let observed = state.sas.get(&old_key).ok_or(XfrmError::NotFound)?;
+        let index = state
+            .sa_lookup_index(request.current.id, request.current.mark)
+            .ok_or(XfrmError::NotFound)?;
+        let observed = state
+            .sas
+            .get(&old_key)
+            .and_then(|chain| chain.get(index))
+            .ok_or(XfrmError::NotFound)?;
         if request.current != observed.identity {
             return Err(XfrmError::StateMismatch {
                 operation: "relocate_sa_preflight",
             });
         }
-        if new_key != old_key && state.sas.contains_key(&new_key) {
+        // A new destination is added with `xfrm_state_add`, which collides
+        // like an install made with the relocated state's mark.
+        if new_id.destination != request.current.id.destination
+            && state.sa_lookup(new_id, request.current.mark).is_some()
+        {
             return Err(XfrmError::AlreadyExists);
         }
 
-        let mut current = state
-            .sas
-            .remove(&old_key)
-            .ok_or(XfrmError::StateIndeterminate {
-                operation: "relocate_sa_mock_mutation",
-            })?;
+        let mut current =
+            state
+                .remove_sa_at(old_key, index)
+                .ok_or(XfrmError::StateIndeterminate {
+                    operation: "relocate_sa_mock_mutation",
+                })?;
         current.state.id = new_id;
         current.state.source_address = request.new_source_address;
         current.identity.id = new_id;
         current.identity.source_address = request.new_source_address;
         current.identity.encap = request.encap.resulting(current.identity.encap);
-        state.sas.insert(new_key, current);
+        // Linux installs a migrated copy, which is a new state at the head.
+        state.insert_sa_at_head(current);
         Ok(())
     }
 
@@ -722,15 +860,51 @@ impl XfrmBackend for MockXfrmBackend {
             spi: request.spi,
             protocol: request.protocol,
         });
-        state
-            .sas
-            .remove(&(
-                request.destination,
-                request.protocol,
-                request.spi,
-                request.mark,
-            ))
+        // DELSA deletes whichever state its lookup selects first, which an
+        // unmarked state at the key can answer for any mark.
+        let id = XfrmId {
+            destination: request.destination,
+            spi: request.spi,
+            protocol: request.protocol,
+        };
+        let index = state
+            .sa_lookup_index(id, request.mark)
             .ok_or(XfrmError::NotFound)?;
+        state
+            .remove_sa_at(sa_chain_key(id), index)
+            .ok_or(XfrmError::NotFound)?;
+        Ok(())
+    }
+
+    async fn remove_sa_exact(&self, request: ExactRemoveSaRequest) -> Result<(), XfrmError> {
+        validate_exact_remove_sa_request(&request)?;
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        Self::check_failure(&state)?;
+        // Every mock state writer uses this same lock, excluding all changes
+        // between the snapshot and deletion. Linux has no such exclusion.
+        let snapshot = state.sa_key_snapshot(request.key())?;
+        authorize_exact_sa_removal(&snapshot, request.expected())?;
+        let removal = request.removal();
+        state.operations.push(MockOperation::RemoveSa {
+            destination: removal.destination,
+            spi: removal.spi,
+            protocol: removal.protocol,
+        });
+        let id = request.expected().id;
+        let index =
+            state
+                .sa_lookup_index(id, removal.mark)
+                .ok_or(XfrmError::StateIndeterminate {
+                    operation: "remove_sa_exact_mock_mutation",
+                })?;
+        state
+            .remove_sa_at(sa_chain_key(id), index)
+            .ok_or(XfrmError::StateIndeterminate {
+                operation: "remove_sa_exact_mock_mutation",
+            })?;
         Ok(())
     }
 
@@ -2227,5 +2401,385 @@ mod tests {
         };
         let err = backend.allocate_spi(same_identity).await.unwrap_err();
         assert!(matches!(err, XfrmError::Unavailable));
+    }
+
+    /// A marked SA and an unmarked SA at one destination/protocol/SPI key.
+    fn overlapping_parameters() -> (SaParameters, SaParameters) {
+        let mut marked = sample_sa_parameters();
+        marked.mark = Some(XfrmLookupMark::full(0x42));
+        let mut unmarked = sample_sa_parameters();
+        unmarked.request_id = crate::XfrmRequestId::new(9);
+        (marked, unmarked)
+    }
+
+    fn identity(parameters: &SaParameters) -> SaRelocationIdentity {
+        sa_record_from_parameters(parameters).identity
+    }
+
+    fn key_query(parameters: &SaParameters) -> QuerySaRequest {
+        QuerySaRequest::new(
+            parameters.id.destination,
+            parameters.id.protocol,
+            parameters.id.spi,
+        )
+    }
+
+    fn key(parameters: &SaParameters) -> SaLookupKey {
+        SaLookupKey::from(parameters.id)
+    }
+
+    async fn install(backend: &MockXfrmBackend, parameters: &SaParameters) {
+        backend
+            .install_sa(InstallSaRequest {
+                parameters: parameters.clone(),
+            })
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn mock_marked_lookup_selects_an_overlapping_unmarked_state_like_linux() {
+        // Regression: the mock used to key SAs by their exact mark pair, so a
+        // marked query could only ever return the marked state and a marked
+        // removal could only ever delete it. Linux applies the stored mask to
+        // the lookup value, and an unmarked state stores `{ 0, 0 }`.
+        let backend = MockXfrmBackend::new();
+        let (marked, unmarked) = overlapping_parameters();
+        install(&backend, &marked).await;
+        // Linux admits an unmarked state next to a marked one.
+        install(&backend, &unmarked).await;
+        let marked_query = key_query(&marked).with_mark(XfrmLookupMark::full(0x42));
+
+        // The newer unmarked state heads the lookup order and answers the
+        // marked lookup.
+        assert_eq!(
+            backend
+                .query_sa_relocation_identity(marked_query)
+                .await
+                .unwrap(),
+            identity(&unmarked)
+        );
+        assert_eq!(
+            backend.query_sa(marked_query).await.unwrap().request_id,
+            unmarked.request_id
+        );
+        // A hash resize that reverses the order changes the answer.
+        backend.reverse_sa_lookup_order();
+        assert_eq!(
+            backend
+                .query_sa_relocation_identity(marked_query)
+                .await
+                .unwrap(),
+            identity(&marked)
+        );
+        // The marked state never answers the unmarked lookup.
+        assert_eq!(
+            backend
+                .query_sa_relocation_identity(key_query(&marked))
+                .await
+                .unwrap(),
+            identity(&unmarked)
+        );
+
+        // A marked DELSA deletes whichever state heads the order: here, the
+        // unmarked one.
+        backend.reverse_sa_lookup_order();
+        backend
+            .remove_sa(
+                RemoveSaRequest::new(marked.id.destination, marked.id.protocol, marked.id.spi)
+                    .with_mark(XfrmLookupMark::full(0x42)),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            backend
+                .query_sa_key_snapshot(key(&marked))
+                .await
+                .unwrap()
+                .states(),
+            &[identity(&marked)]
+        );
+    }
+
+    #[tokio::test]
+    async fn mock_unmarked_state_refuses_a_later_marked_install() {
+        // `xfrm_state_add` looks the new state up with its own mark, which an
+        // existing unmarked state answers.
+        let backend = MockXfrmBackend::new();
+        let (marked, unmarked) = overlapping_parameters();
+        install(&backend, &unmarked).await;
+        let error = backend
+            .install_sa(InstallSaRequest {
+                parameters: marked.clone(),
+            })
+            .await
+            .unwrap_err();
+        assert!(matches!(error, XfrmError::AlreadyExists));
+        assert_eq!(
+            backend
+                .query_sa_key_snapshot(key(&marked))
+                .await
+                .unwrap()
+                .states(),
+            &[identity(&unmarked)]
+        );
+    }
+
+    #[tokio::test]
+    async fn mock_narrow_masks_collide_in_one_order_and_overlap_in_the_other() {
+        // The asymmetric canonical pair from #419.
+        let narrow = XfrmLookupMark::new(0x10, 0xf0).expect("canonical");
+        let exact = XfrmLookupMark::new(0x11, 0xff).expect("canonical");
+        let with_mark = |mark| {
+            let mut parameters = sample_sa_parameters();
+            parameters.mark = Some(mark);
+            parameters
+        };
+
+        let backend = MockXfrmBackend::new();
+        install(&backend, &with_mark(narrow)).await;
+        assert!(matches!(
+            backend
+                .install_sa(InstallSaRequest {
+                    parameters: with_mark(exact),
+                })
+                .await,
+            Err(XfrmError::AlreadyExists)
+        ));
+
+        let backend = MockXfrmBackend::new();
+        install(&backend, &with_mark(exact)).await;
+        install(&backend, &with_mark(narrow)).await;
+        let snapshot = backend
+            .query_sa_key_snapshot(key(&with_mark(exact)))
+            .await
+            .unwrap();
+        assert_eq!(snapshot.len(), 2);
+        assert_eq!(snapshot.lookup_candidates(Some(exact)).count(), 2);
+        assert_eq!(
+            backend
+                .query_sa_relocation_identity(key_query(&with_mark(exact)).with_mark(exact))
+                .await
+                .unwrap()
+                .mark,
+            Some(narrow)
+        );
+    }
+
+    #[tokio::test]
+    async fn mock_relocation_preflights_the_state_its_lookup_selects() {
+        let backend = MockXfrmBackend::new();
+        let (marked, unmarked) = overlapping_parameters();
+        install(&backend, &marked).await;
+        install(&backend, &unmarked).await;
+        let request = RelocateSaRequest {
+            current: identity(&marked),
+            new_source_address: ipv4(198, 51, 100, 10),
+            new_destination: ipv4(198, 51, 100, 20),
+            encap: SaRelocationEncap::Preserve,
+            direction: SaRelocationDirection::Inbound,
+        };
+        // MIGRATE_STATE's lookup selects the unmarked state, which is not the
+        // requested identity.
+        assert!(matches!(
+            backend.relocate_sa(request.clone()).await,
+            Err(XfrmError::StateMismatch {
+                operation: "relocate_sa_preflight"
+            })
+        ));
+        backend.reverse_sa_lookup_order();
+        backend.relocate_sa(request).await.unwrap();
+        assert_eq!(
+            backend
+                .query_sa_key_snapshot(key(&marked))
+                .await
+                .unwrap()
+                .states(),
+            &[identity(&unmarked)]
+        );
+    }
+
+    #[tokio::test]
+    async fn mock_key_snapshot_reports_every_state_newest_first_whatever_the_lookup_order() {
+        let backend = MockXfrmBackend::new();
+        let (marked, unmarked) = overlapping_parameters();
+        let mut elsewhere = marked.clone();
+        elsewhere.id.spi += 1;
+        install(&backend, &marked).await;
+        install(&backend, &elsewhere).await;
+        install(&backend, &unmarked).await;
+        backend.clear_operations();
+
+        let expected = [identity(&unmarked), identity(&marked)];
+        let snapshot = backend.query_sa_key_snapshot(key(&marked)).await.unwrap();
+        assert_eq!(snapshot.key(), key(&marked));
+        assert_eq!(snapshot.states(), &expected);
+        backend.reverse_sa_lookup_order();
+        assert_eq!(
+            backend
+                .query_sa_key_snapshot(key(&marked))
+                .await
+                .unwrap()
+                .states(),
+            &expected
+        );
+        let mut empty = marked.clone();
+        empty.id.spi += 2;
+        assert!(backend
+            .query_sa_key_snapshot(key(&empty))
+            .await
+            .unwrap()
+            .is_empty());
+        // Key reads are not recorded, like policy queries.
+        assert!(backend.operations().is_empty());
+    }
+
+    #[tokio::test]
+    async fn mock_exact_removal_refuses_overlapping_candidates_and_deletes_neither() {
+        let backend = MockXfrmBackend::new();
+        let (marked, unmarked) = overlapping_parameters();
+        install(&backend, &marked).await;
+        install(&backend, &unmarked).await;
+        backend.clear_operations();
+
+        for _ in 0..2 {
+            let error = backend
+                .remove_sa_exact(ExactRemoveSaRequest::new(identity(&marked)))
+                .await
+                .unwrap_err();
+            assert!(matches!(
+                error,
+                XfrmError::StateIndeterminate {
+                    operation: "remove_sa_exact_preflight"
+                }
+            ));
+            assert_eq!(
+                backend
+                    .query_sa_key_snapshot(key(&marked))
+                    .await
+                    .unwrap()
+                    .len(),
+                2
+            );
+            backend.reverse_sa_lookup_order();
+        }
+        assert!(backend.operations().is_empty(), "no deletion was issued");
+
+        // The unmarked lookup selects only the unmarked state, so it can go,
+        // and then the marked state is the sole candidate for its own mark.
+        backend
+            .remove_sa_exact(ExactRemoveSaRequest::new(identity(&unmarked)))
+            .await
+            .unwrap();
+        backend
+            .remove_sa_exact(ExactRemoveSaRequest::new(identity(&marked)))
+            .await
+            .unwrap();
+        assert!(backend
+            .query_sa_key_snapshot(key(&marked))
+            .await
+            .unwrap()
+            .is_empty());
+        assert_eq!(backend.operations().len(), 2);
+    }
+
+    #[tokio::test]
+    async fn mock_exact_removal_deletes_the_sole_candidate_whatever_the_lookup_order() {
+        for reverse in [false, true] {
+            let backend = MockXfrmBackend::new();
+            let (marked, _) = overlapping_parameters();
+            let mut disjoint = marked.clone();
+            disjoint.mark = Some(XfrmLookupMark::full(0x43));
+            install(&backend, &marked).await;
+            install(&backend, &disjoint).await;
+            backend.clear_operations();
+            // A reordering between any earlier read and the removal cannot
+            // change the result: the disjoint state is never a candidate.
+            let _ = backend.query_sa_key_snapshot(key(&marked)).await.unwrap();
+            if reverse {
+                backend.reverse_sa_lookup_order();
+            }
+
+            backend
+                .remove_sa_exact(ExactRemoveSaRequest::new(identity(&marked)))
+                .await
+                .unwrap();
+
+            assert_eq!(
+                backend
+                    .query_sa_key_snapshot(key(&marked))
+                    .await
+                    .unwrap()
+                    .states(),
+                &[identity(&disjoint)]
+            );
+            assert_eq!(
+                backend.operations(),
+                vec![MockOperation::RemoveSa {
+                    destination: marked.id.destination,
+                    spi: marked.id.spi,
+                    protocol: marked.id.protocol,
+                }]
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn mock_exact_removal_reports_absent_and_changed_states_without_deleting() {
+        let backend = MockXfrmBackend::new();
+        let (marked, _) = overlapping_parameters();
+        assert!(matches!(
+            backend
+                .remove_sa_exact(ExactRemoveSaRequest::new(identity(&marked)))
+                .await,
+            Err(XfrmError::NotFound)
+        ));
+
+        install(&backend, &marked).await;
+        backend.clear_operations();
+        let mut changed = identity(&marked);
+        changed.request_id = crate::XfrmRequestId::new(77);
+        assert!(matches!(
+            backend
+                .remove_sa_exact(ExactRemoveSaRequest::new(changed))
+                .await,
+            Err(XfrmError::StateMismatch {
+                operation: "remove_sa_exact_preflight"
+            })
+        ));
+
+        // Validation precedes the injected failure, which precedes the read.
+        backend.set_failure(XfrmError::Unavailable);
+        let mut zero_if_id = identity(&marked);
+        zero_if_id.if_id = Some(0);
+        assert!(matches!(
+            backend
+                .remove_sa_exact(ExactRemoveSaRequest::new(zero_if_id))
+                .await,
+            Err(XfrmError::InvalidConfig {
+                field: "sa.if_id",
+                ..
+            })
+        ));
+        assert!(matches!(
+            backend
+                .remove_sa_exact(ExactRemoveSaRequest::new(identity(&marked)))
+                .await,
+            Err(XfrmError::Unavailable)
+        ));
+        assert!(matches!(
+            backend.query_sa_key_snapshot(key(&marked)).await,
+            Err(XfrmError::Unavailable)
+        ));
+        backend.clear_failure();
+        assert!(backend.operations().is_empty());
+        assert_eq!(
+            backend
+                .query_sa_key_snapshot(key(&marked))
+                .await
+                .unwrap()
+                .states(),
+            &[identity(&marked)]
+        );
     }
 }
