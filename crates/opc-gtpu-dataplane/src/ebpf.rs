@@ -5198,6 +5198,11 @@ impl EbpfGtpuDataplaneBackend {
                 operation: "ebpf_tft_stage",
             });
         }
+        if !old_inactive.is_empty() {
+            // A reader may still hold this bank's selector from before the
+            // previous publication. Keep both banks intact until it exits.
+            self.inner.runtime.synchronize_tft_readers()?;
+        }
         for (key, _) in &old_inactive {
             self.inner.runtime.tft_filter_remove(ifindex, *key)?;
         }
@@ -65624,6 +65629,90 @@ mod tests {
                 .unwrap(),
             TftUplinkClassifierReadback::Absent
         );
+    }
+
+    /// A reader can retain bank zero across the first replacement. Before
+    /// reusing that bank, the next replacement must wait before deleting or
+    /// overwriting any of its rows.
+    #[tokio::test]
+    async fn tft_classifier_bank_reuse_waits_before_any_row_mutation() {
+        let (backend, runtime) = backend_with_fake();
+        backend.create_device(create_request()).await.unwrap();
+        assert_eq!(
+            backend
+                .reconcile_tft_uplink_classifier(tft_classifier(0x41, 7, 6))
+                .await
+                .unwrap(),
+            TftUplinkClassifierReconcileOutcome::Installed
+        );
+        assert_eq!(
+            backend
+                .reconcile_tft_uplink_classifier(tft_classifier(0x42, 8, 17))
+                .await
+                .unwrap(),
+            TftUplinkClassifierReconcileOutcome::Replaced
+        );
+        runtime.state().operations.clear();
+        let replacement = tft_classifier(0x43, 9, 6);
+        assert_eq!(
+            backend
+                .reconcile_tft_uplink_classifier(replacement.clone())
+                .await
+                .unwrap(),
+            TftUplinkClassifierReconcileOutcome::Replaced
+        );
+        let operations = runtime.state().operations.clone();
+        let grace = operations
+            .iter()
+            .position(|operation| *operation == "tft_reader_grace")
+            .expect("bank reuse must complete a reader grace");
+        for mutation in ["tft_filter_remove", "tft_filter_put", "tft_meta_put"] {
+            let position = operations
+                .iter()
+                .position(|operation| *operation == mutation)
+                .expect("replacement must exercise this mutation");
+            assert!(grace < position, "reader grace must precede {mutation}");
+        }
+        assert_eq!(
+            backend
+                .read_tft_uplink_classifier(replacement.link_ifindex(), replacement.paa())
+                .await
+                .unwrap(),
+            TftUplinkClassifierReadback::Present(replacement)
+        );
+    }
+
+    /// A failed bank-reuse grace must preserve both banks and the active
+    /// selector, allowing an exact retry without a partial replacement.
+    #[tokio::test]
+    async fn tft_classifier_bank_reuse_grace_failure_preserves_both_banks() {
+        let (backend, runtime) = backend_with_fake();
+        backend.create_device(create_request()).await.unwrap();
+        for classifier in [tft_classifier(0x41, 7, 6), tft_classifier(0x42, 8, 17)] {
+            backend
+                .reconcile_tft_uplink_classifier(classifier)
+                .await
+                .unwrap();
+        }
+        let (meta, rows) = {
+            let mut state = runtime.state();
+            state.operations.clear();
+            (state.tft_meta.clone(), state.tft_filters.clone())
+        };
+        runtime.fail_in_order(["tft_reader_grace"]);
+        assert_eq!(
+            backend
+                .reconcile_tft_uplink_classifier(tft_classifier(0x43, 9, 6))
+                .await
+                .unwrap(),
+            TftUplinkClassifierReconcileOutcome::Indeterminate
+        );
+        let state = runtime.state();
+        assert_eq!(state.tft_meta, meta);
+        assert_eq!(state.tft_filters, rows);
+        for mutation in ["tft_filter_remove", "tft_filter_put", "tft_meta_put"] {
+            assert!(!state.operations.contains(&mutation));
+        }
     }
 
     /// Without the reader grace a removal fence could never be finished, so
