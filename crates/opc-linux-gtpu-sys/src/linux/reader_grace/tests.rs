@@ -13,8 +13,10 @@ const BPF_PROG_TEST_RUN: libc::c_uint = 10;
 const BPF_BTF_LOAD: libc::c_uint = 18;
 const BPF_PROG_TYPE_KPROBE: u32 = 2;
 const BPF_PROG_TYPE_SCHED_CLS: u32 = 3;
-const PERF_EVENT_IOC_ENABLE: libc::c_ulong = 0x2400;
-const PERF_EVENT_IOC_SET_BPF: libc::c_ulong = 0x4004_2408;
+// Linux request codes are 32-bit; libc accepts c_ulong on GNU and c_int on
+// musl. Both values fit either ABI, so infer the request argument at each call.
+const PERF_EVENT_IOC_ENABLE: u32 = 0x2400;
+const PERF_EVENT_IOC_SET_BPF: u32 = 0x4004_2408;
 
 // armed, entry_ns, return_ns, entry_count, return_count, respectively.
 type TraceRecord = [u64; 5];
@@ -426,7 +428,7 @@ impl Probe {
         let attached = unsafe {
             libc::ioctl(
                 event.as_raw_fd(),
-                PERF_EVENT_IOC_SET_BPF,
+                PERF_EVENT_IOC_SET_BPF as _,
                 program.as_raw_fd(),
             )
         };
@@ -437,7 +439,7 @@ impl Probe {
             io::Error::last_os_error()
         );
         // SAFETY: Enabling this owned perf event takes no pointer argument.
-        let enabled = unsafe { libc::ioctl(event.as_raw_fd(), PERF_EVENT_IOC_ENABLE, 0_u64) };
+        let enabled = unsafe { libc::ioctl(event.as_raw_fd(), PERF_EVENT_IOC_ENABLE as _, 0_u64) };
         assert_eq!(
             enabled,
             0,
