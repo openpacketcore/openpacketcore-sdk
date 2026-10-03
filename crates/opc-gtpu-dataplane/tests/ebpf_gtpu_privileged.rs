@@ -56,6 +56,8 @@ mod n3_fixed_flow;
 mod packet_too_big_baseline;
 #[path = "ebpf_gtpu_privileged/tft_classifier_removal.rs"]
 mod tft_classifier_removal;
+#[path = "ebpf_gtpu_privileged/tft_nohz_full.rs"]
+mod tft_nohz_full;
 
 use std::cell::RefCell;
 use std::env;
@@ -8280,6 +8282,7 @@ fn capture_gtpu_outer_flags(capture: &OwnedFd) -> u8 {
 #[ignore = "requires root (CAP_BPF/CAP_NET_ADMIN), a fresh netns, and bpffs"]
 async fn ebpf_gtpu_shared_paa_tft_classifier_ipv4_live_contract(
 ) -> Result<(), Box<dyn std::error::Error>> {
+    let nohz_full = tft_nohz_full::require_requested_profile();
     if env::var("OPC_GTPU_RUN_PRIVILEGED").as_deref() != Ok("1") {
         eprintln!("skipping: set OPC_GTPU_RUN_PRIVILEGED=1 inside a fresh privileged netns");
         return Ok(());
@@ -8423,6 +8426,9 @@ async fn ebpf_gtpu_shared_paa_tft_classifier_ipv4_live_contract(
         ],
     )
     .expect("canonical shared-PAA TFT classifier");
+    if nohz_full {
+        tft_nohz_full::require_aya_available(&backend);
+    }
     assert_eq!(
         backend
             .reconcile_tft_uplink_classifier(main_classifier.clone())
@@ -8568,12 +8574,22 @@ async fn ebpf_gtpu_shared_paa_tft_classifier_ipv4_live_contract(
         ],
     )
     .expect("no-default TFT classifier");
+    let retained_bank = nohz_full.then(|| tft_nohz_full::retained_inactive_bank(&pin_dir));
     assert_eq!(
         backend
-            .reconcile_tft_uplink_classifier(no_default_classifier)
+            .reconcile_tft_uplink_classifier(no_default_classifier.clone())
             .await?,
         TftUplinkClassifierReconcileOutcome::Replaced
     );
+    if let Some(bank) = retained_bank {
+        assert_eq!(
+            backend
+                .read_tft_uplink_classifier(device.ifindex, IpAddr::V4(UE_PAA))
+                .await?,
+            TftUplinkClassifierReadback::Present(no_default_classifier)
+        );
+        tft_nohz_full::require_reused_bank(&pin_dir, bank);
+    }
     let no_match_before = pinned_per_cpu_u64_values(
         &pin_dir,
         MAP_TFT_CLASSIFIER_COUNTERS,
@@ -8764,6 +8780,9 @@ async fn ebpf_gtpu_shared_paa_tft_classifier_ipv4_live_contract(
     drop(backend);
     drop(net);
     eprintln!("OPC_GTPU_TFT_IPV4_LIVE_PROVEN");
+    if nohz_full {
+        eprintln!("OPC_GTPU_TFT_NOHZ_LIFECYCLE_PROVEN");
+    }
     Ok(())
 }
 

@@ -188,6 +188,7 @@ fn delete_first_fenced_rank(pin_dir: &Path, fence: TftClassifierMeta) {
 // PRIVILEGED_TEST_LOCK.
 #[allow(clippy::await_holding_lock)]
 pub(super) async fn qualify_fence() -> Result<(), Box<dyn std::error::Error>> {
+    let nohz_full = tft_nohz_full::require_requested_profile();
     if env::var("OPC_GTPU_RUN_PRIVILEGED").as_deref() != Ok("1") {
         eprintln!("skipping: set OPC_GTPU_RUN_PRIVILEGED=1 inside a fresh privileged netns");
         return Ok(());
@@ -196,6 +197,9 @@ pub(super) async fn qualify_fence() -> Result<(), Box<dyn std::error::Error>> {
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
     let (net, backend, device) = provision_shared_paa().await?;
+    if nohz_full {
+        tft_nohz_full::require_aya_available(&backend);
+    }
     let pin_dir = net.pin_root.join("s2bu");
     let pgw_socket = in_netns(&net.pgw_ns, || {
         UdpSocket::bind((PGW_IP, GTPU_PORT)).expect("bind PGW TFT GTP-U socket")
@@ -370,6 +374,7 @@ fn receive_probes(socket: &UdpSocket, stop: &AtomicBool) -> (Vec<(u64, u32)>, us
 // PRIVILEGED_TEST_LOCK.
 #[allow(clippy::await_holding_lock)]
 pub(super) async fn qualify_continuity() -> Result<(), Box<dyn std::error::Error>> {
+    let nohz_full = tft_nohz_full::require_requested_profile();
     if env::var("OPC_GTPU_RUN_PRIVILEGED").as_deref() != Ok("1") {
         eprintln!("skipping: set OPC_GTPU_RUN_PRIVILEGED=1 inside a fresh privileged netns");
         return Ok(());
@@ -378,6 +383,9 @@ pub(super) async fn qualify_continuity() -> Result<(), Box<dyn std::error::Error
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
     let (net, backend, device) = provision_shared_paa().await?;
+    if nohz_full {
+        tft_nohz_full::require_aya_available(&backend);
+    }
     let pin_dir = net.pin_root.join("s2bu");
     let pgw_socket = in_netns(&net.pgw_ns, || {
         let socket = UdpSocket::bind((PGW_IP, GTPU_PORT)).expect("bind PGW TFT GTP-U socket");

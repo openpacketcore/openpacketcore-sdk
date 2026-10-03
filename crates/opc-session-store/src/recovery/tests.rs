@@ -6175,6 +6175,1778 @@ fn pinned_inspection_keeps_terminal_predicate_on_the_x_wal_snapshot() {
     );
 }
 
+#[cfg(target_os = "linux")]
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum RecoveryProgressBaseline {
+    Membership,
+    RetainedBlank,
+    Snapshot,
+    Purged,
+}
+
+#[cfg(target_os = "linux")]
+struct RecoveryProgressFixture {
+    root: tempfile::TempDir,
+    backup: tempfile::TempDir,
+    manager: LegacyForkRecovery<AllowRecovery, CapturingAudit, CapturingObserver>,
+    plan: RecoveryPlan,
+    replicas: Vec<RecoveryReplica>,
+    baseline: Entry<SessionRaftTypeConfig>,
+}
+
+#[cfg(target_os = "linux")]
+impl RecoveryProgressFixture {
+    fn new() -> Self {
+        Self::with_basis(RecoveryDecisionBasis::ExplicitLegacyCheckpoint)
+    }
+
+    fn with_basis(basis: RecoveryDecisionBasis) -> Self {
+        Self::with_baseline(basis, RecoveryProgressBaseline::Membership)
+    }
+
+    fn with_baseline(basis: RecoveryDecisionBasis, coverage: RecoveryProgressBaseline) -> Self {
+        let root = tempfile::tempdir().expect("recovery progress databases");
+        let backup = private_tempdir();
+        let ids = [
+            replica_id("legacy-progress-a"),
+            replica_id("legacy-progress-b"),
+            replica_id("legacy-progress-c"),
+        ];
+        let replicas = vec![
+            create_legacy_replica(root.path(), ids[0].clone(), 17),
+            create_legacy_replica(
+                root.path(),
+                ids[1].clone(),
+                if basis == RecoveryDecisionBasis::ExplicitLegacyCheckpoint {
+                    31
+                } else {
+                    17
+                },
+            ),
+            create_legacy_replica(root.path(), ids[2].clone(), 47),
+        ];
+        let members = node_set(&ids);
+        let leader = *members.first().expect("bootstrap leader");
+        let mut baseline = Entry::<SessionRaftTypeConfig> {
+            log_id: LogId::new(CommittedLeaderId::new(1, leader), 0),
+            payload: EntryPayload::Membership(Membership::new(
+                vec![members.clone()],
+                members.clone(),
+            )),
+        };
+        let targets = if basis == RecoveryDecisionBasis::ExplicitLegacyCheckpoint {
+            ids.as_slice()
+        } else {
+            // The exact majority retains the source branch; execution repairs
+            // only the third voter from that independently proved checkpoint.
+            claim_current_replica(&replicas[0], &members, baseline.log_id);
+            claim_current_replica(&replicas[1], &members, baseline.log_id);
+            claim_current_replica(
+                &replicas[2],
+                &members,
+                LogId::new(CommittedLeaderId::new(2, leader), 0),
+            );
+            &ids[2..]
+        };
+        if coverage != RecoveryProgressBaseline::Membership {
+            assert_eq!(basis, RecoveryDecisionBasis::VerifiedCommittedMajority);
+            baseline = Entry {
+                log_id: LogId::new(CommittedLeaderId::new(3, leader), 1),
+                payload: EntryPayload::Blank,
+            };
+            for replica in &replicas {
+                append_current_blank_checkpoint(replica, baseline.log_id);
+            }
+            for replica in &replicas[..2] {
+                match coverage {
+                    RecoveryProgressBaseline::Snapshot => {
+                        install_dynamic_current_snapshot_fixture(
+                            replica,
+                            baseline.log_id,
+                            "snapshot-00000000-0000-4000-8000-0000000000d1.opc",
+                            "recovery-progress-predecessor",
+                            b"exact immutable recovery predecessor coverage",
+                        );
+                    }
+                    RecoveryProgressBaseline::Purged => {
+                        let conn = Connection::open(&replica.database_path)
+                            .expect("purged predecessor voter");
+                        install_current_purge_floor(&conn, &baseline.log_id);
+                    }
+                    RecoveryProgressBaseline::RetainedBlank
+                    | RecoveryProgressBaseline::Membership => {}
+                }
+                if matches!(
+                    coverage,
+                    RecoveryProgressBaseline::Snapshot | RecoveryProgressBaseline::Purged
+                ) {
+                    let conn = Connection::open(&replica.database_path)
+                        .expect("covered predecessor voter");
+                    assert_eq!(
+                        conn.execute("DELETE FROM consensus_log WHERE log_index <= 1", [])
+                            .expect("remove exactly covered baseline and prefix"),
+                        2
+                    );
+                }
+            }
+        }
+        let manager = recovery(AllowRecovery);
+        let plan = manager
+            .plan(
+                &context(),
+                identity(),
+                members.clone(),
+                &replicas,
+                &ids[0],
+                targets,
+                basis,
+                RecoveryLimits::default(),
+            )
+            .expect("plan recovery progress campaign");
+        let confirmation = if basis == RecoveryDecisionBasis::ExplicitLegacyCheckpoint {
+            RecoveryConfirmation::legacy(
+                &plan,
+                RecoveryConfirmation::required_legacy_acknowledgement(),
+            )
+        } else {
+            RecoveryConfirmation::verified(&plan)
+        };
+        assert_eq!(
+            manager
+                .execute(
+                    &context(),
+                    &plan,
+                    &confirmation,
+                    &replicas,
+                    backup.path(),
+                    RecoveryLimits::default(),
+                )
+                .expect("install legacy progress campaign")
+                .state(),
+            RecoveryExecutionState::AwaitingEpochCommit
+        );
+        for replica in replicas
+            .iter()
+            .filter(|_| basis == RecoveryDecisionBasis::ExplicitLegacyCheckpoint)
+        {
+            let conn = Connection::open(&replica.database_path).expect("open installed voter");
+            consensus::append_logs_sync(&conn, identity(), std::slice::from_ref(&baseline))
+                .expect("append bootstrap Membership");
+            consensus::save_committed_sync(&conn, identity(), Some(baseline.log_id))
+                .expect("commit bootstrap Membership");
+            consensus::apply_entries_sync(
+                &conn,
+                identity(),
+                &BackendCapabilities::all_enabled(),
+                vec![baseline.clone()],
+            )
+            .expect("apply bootstrap Membership");
+        }
+        Self {
+            root,
+            backup,
+            manager,
+            plan,
+            replicas,
+            baseline,
+        }
+    }
+
+    fn assert_campaign_still_fenced(&self) {
+        assert_eq!(
+            resume_execution_state(&self.manager.integrity_key, &self.plan, self.backup.path())
+                .expect("authenticate unchanged workflow"),
+            RecoveryExecutionState::AwaitingEpochCommit
+        );
+        let expected = consensus::OperatorRecoveryLatch {
+            identity: identity(),
+            recovery_epoch: self.plan.next_recovery_epoch(),
+            plan_digest: self.plan.plan_digest().as_bytes(),
+            audit_pending: false,
+        };
+        for replica in &self.replicas {
+            let file = File::open(&replica.database_path).expect("open held campaign database");
+            assert_eq!(
+                consensus::operator_recovery_latch_phase_sync(
+                    &replica.database_path,
+                    expected,
+                    &file,
+                    None,
+                )
+                .expect("authenticate campaign latch"),
+                consensus::OperatorRecoveryLatchPhase::Active
+            );
+        }
+    }
+
+    fn workflow_bytes(&self) -> Vec<u8> {
+        std::fs::read(
+            self.backup
+                .path()
+                .join(format!("recovery-{}", self.plan.plan_digest()))
+                .join("workflow.json"),
+        )
+        .expect("read sealed workflow and MAC")
+    }
+
+    fn latch(&self, audit_pending: bool) -> consensus::OperatorRecoveryLatch {
+        consensus::OperatorRecoveryLatch {
+            identity: identity(),
+            recovery_epoch: self.plan.next_recovery_epoch(),
+            plan_digest: self.plan.plan_digest().as_bytes(),
+            audit_pending,
+        }
+    }
+
+    fn blank(&self, index: u64) -> Entry<SessionRaftTypeConfig> {
+        Entry {
+            log_id: LogId::new(self.baseline.log_id.leader_id, index),
+            payload: EntryPayload::Blank,
+        }
+    }
+
+    fn inject_log(conn: &Connection, entry: &Entry<SessionRaftTypeConfig>) {
+        let encoded = serde_json::to_vec(entry).expect("encode adversarial stored entry");
+        assert_eq!(conn.execute(
+            "INSERT INTO consensus_log (log_index, configuration_epoch, term, entry_json) VALUES (?1, ?2, ?3, ?4)",
+            params![entry.log_id.index, identity().configuration_epoch().get(), entry.log_id.leader_id.term, encoded],
+        ).expect("inject bytes below the normal append validator"), 1);
+        let observed: Vec<u8> = conn
+            .query_row(
+                "SELECT entry_json FROM consensus_log WHERE log_index = ?1",
+                [entry.log_id.index],
+                |row| row.get(0),
+            )
+            .expect("read adversarial stored bytes");
+        assert_eq!(observed, encoded);
+    }
+
+    fn capture(
+        &self,
+        pins: &mut super::sqlite::FinalizationPins<'_>,
+    ) -> Result<Option<FinalizationPredecessorCapsule>, RecoveryError> {
+        legacy_finalization_predecessor(
+            &self.manager.integrity_key,
+            &self.plan,
+            pins,
+            self.backup.path(),
+            RecoveryLimits::default(),
+        )
+    }
+
+    fn assert_unsealed_workflow_unchanged(&self, before: &[u8]) {
+        let observed = self.workflow_bytes();
+        assert_eq!(
+            observed, before,
+            "progress must not rewrite the workflow or MAC"
+        );
+        let sealed: serde_json::Value =
+            serde_json::from_slice(&observed).expect("decode observed workflow fields");
+        assert!(sealed["record"]["legacy_finalization_predecessor"].is_null());
+        assert!(sealed["record"]["terminal_proof"].is_null());
+        self.assert_campaign_still_fenced();
+    }
+
+    fn pins(&self) -> super::sqlite::FinalizationPins<'_> {
+        acquire_finalization_pins(
+            &self.manager.integrity_key,
+            &self.plan,
+            &self.replicas,
+            self.backup.path(),
+            RecoveryLimits::default(),
+        )
+        .expect("reacquire campaign descriptors from the authenticated workflow")
+    }
+
+    fn classify(
+        &self,
+        pins: &mut super::sqlite::FinalizationPins<'_>,
+    ) -> Result<FinalizationTransitionState, RecoveryError> {
+        classify_finalization_pins(
+            &self.manager.integrity_key,
+            &self.plan,
+            pins,
+            RecoveryLimits::default(),
+        )
+    }
+
+    fn predecessor(
+        &self,
+        pins: &mut super::sqlite::FinalizationPins<'_>,
+    ) -> Option<FinalizationPredecessorCapsule> {
+        legacy_finalization_predecessor(
+            &self.manager.integrity_key,
+            &self.plan,
+            pins,
+            self.backup.path(),
+            RecoveryLimits::default(),
+        )
+        .expect("read or seal the exact campaign predecessor")
+    }
+
+    fn finalize_entry(
+        &self,
+        predecessor: Option<&FinalizationPredecessorCapsule>,
+        index: u64,
+    ) -> Entry<SessionRaftTypeConfig> {
+        let mut request_id = [0; 16];
+        request_id.copy_from_slice(&self.plan.plan_digest().as_bytes()[..16]);
+        Entry::<SessionRaftTypeConfig> {
+            log_id: LogId::new(self.baseline.log_id.leader_id, index),
+            payload: EntryPayload::Normal(SessionConsensusCommand {
+                schema_version: SESSION_CONSENSUS_SCHEMA_VERSION,
+                identity: identity(),
+                request_id: SessionConsensusRequestId::from_bytes(request_id),
+                logical_time: Timestamp::from_str("2026-10-03T00:00:00Z")
+                    .expect("fixed command time"),
+                intent: SessionMutationIntent::FinalizeOperatorRecoveryV2(Box::new(
+                    recovery_v2_intent_from_plan(&self.plan, predecessor)
+                        .expect("compose exact plan-bound V2 intent"),
+                )),
+            }),
+        }
+    }
+
+    fn apply_and_assert_finalize(
+        &self,
+        conn: &Connection,
+        finalize: &Entry<SessionRaftTypeConfig>,
+    ) {
+        let EntryPayload::Normal(command) = &finalize.payload else {
+            panic!("finalization control requires a Normal entry");
+        };
+        let applied = consensus::apply_entries_sync(
+            conn,
+            identity(),
+            &BackendCapabilities::all_enabled(),
+            vec![finalize.clone()],
+        )
+        .expect("apply exact authorized V2 on real state machine");
+        assert_eq!(applied.responses.len(), 1);
+        assert!(
+            applied.responses[0].result.is_ok(),
+            "the V2 must be accepted"
+        );
+        let state = consensus::read_operator_recovery_sync(conn, identity())
+            .expect("read independently committed recovery effect");
+        assert_eq!(state.recovery_epoch, self.plan.next_recovery_epoch());
+        assert_eq!(state.last_plan_digest, self.plan.plan_digest().as_bytes());
+        assert_eq!(state.finalize_log_id, Some(finalize.log_id));
+        assert_eq!(state.pending_epoch, None);
+        let outcome_count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM consensus_request_outcomes WHERE request_id = ?1",
+                [command.request_id.as_bytes().as_slice()],
+                |row| row.get(0),
+            )
+            .expect("count exact V2 outcomes");
+        assert_eq!(
+            outcome_count, 1,
+            "one proposal must produce one exact outcome"
+        );
+    }
+}
+
+/// Append, commit and apply are separate storage operations. A legitimate
+/// election Blank can lead the other voters after exact membership admission,
+/// without corrupting the sealed checkpoint or authorizing epoch finalization.
+#[cfg(target_os = "linux")]
+#[test]
+fn legacy_recovery_progress_before_capsule_seal_waits_for_blank_convergence() {
+    let fixture = RecoveryProgressFixture::new();
+    let workflow_before = fixture.workflow_bytes();
+    fixture.assert_unsealed_workflow_unchanged(&workflow_before);
+    let mut pins = acquire_finalization_pins(
+        &fixture.manager.integrity_key,
+        &fixture.plan,
+        &fixture.replicas,
+        fixture.backup.path(),
+        RecoveryLimits::default(),
+    )
+    .expect("pin bootstrap campaign");
+    let blank = Entry::<SessionRaftTypeConfig> {
+        log_id: LogId::new(
+            CommittedLeaderId::new(
+                2,
+                *fixture.plan.body.expected_members.first().expect("leader"),
+            ),
+            1,
+        ),
+        payload: EntryPayload::Blank,
+    };
+    let conn = Connection::open(&fixture.replicas[0].database_path).expect("open leading voter");
+    consensus::append_logs_sync(&conn, identity(), std::slice::from_ref(&blank))
+        .expect("append election Blank without committing or applying it");
+    assert_eq!(
+        consensus::read_log_range_for_recovery_sync(&conn, identity(), 0, Some(2), Some(2))
+            .expect("read exact bootstrap and election entries"),
+        vec![fixture.baseline.clone(), blank.clone()]
+    );
+    let appended = legacy_finalization_predecessor(
+        &fixture.manager.integrity_key,
+        &fixture.plan,
+        &mut pins,
+        fixture.backup.path(),
+        RecoveryLimits::default(),
+    );
+    fixture.assert_campaign_still_fenced();
+    fixture.assert_unsealed_workflow_unchanged(&workflow_before);
+    drop(pins);
+    let mut pins = fixture.pins();
+    consensus::save_committed_sync(&conn, identity(), Some(blank.log_id))
+        .expect("commit election Blank without applying it");
+    let committed = legacy_finalization_predecessor(
+        &fixture.manager.integrity_key,
+        &fixture.plan,
+        &mut pins,
+        fixture.backup.path(),
+        RecoveryLimits::default(),
+    );
+    fixture.assert_unsealed_workflow_unchanged(&workflow_before);
+    drop(pins);
+    let mut pins = fixture.pins();
+    consensus::apply_entries_sync(
+        &conn,
+        identity(),
+        &BackendCapabilities::all_enabled(),
+        vec![blank.clone()],
+    )
+    .expect("apply election Blank on leading voter");
+    let one_applied = legacy_finalization_predecessor(
+        &fixture.manager.integrity_key,
+        &fixture.plan,
+        &mut pins,
+        fixture.backup.path(),
+        RecoveryLimits::default(),
+    );
+    fixture.assert_campaign_still_fenced();
+    fixture.assert_unsealed_workflow_unchanged(&workflow_before);
+    drop(pins);
+    let mut pins = fixture.pins();
+    for replica in &fixture.replicas[1..] {
+        let follower = Connection::open(&replica.database_path).expect("open follower");
+        consensus::append_logs_sync(&follower, identity(), std::slice::from_ref(&blank))
+            .expect("replicate exact election Blank");
+        consensus::save_committed_sync(&follower, identity(), Some(blank.log_id))
+            .expect("commit exact election Blank");
+        consensus::apply_entries_sync(
+            &follower,
+            identity(),
+            &BackendCapabilities::all_enabled(),
+            vec![blank.clone()],
+        )
+        .expect("apply exact election Blank");
+    }
+    let converged = legacy_finalization_predecessor(
+        &fixture.manager.integrity_key,
+        &fixture.plan,
+        &mut pins,
+        fixture.backup.path(),
+        RecoveryLimits::default(),
+    )
+    .expect("capture converged bootstrap capsule")
+    .expect("legacy capsule");
+    assert_eq!(converged.baseline_log_id, blank.log_id);
+    assert_eq!(
+        classify_finalization_pins(
+            &fixture.manager.integrity_key,
+            &fixture.plan,
+            &mut pins,
+            RecoveryLimits::default(),
+        ),
+        Ok(FinalizationTransitionState::AllInstalled)
+    );
+    fixture.assert_campaign_still_fenced();
+    // Check the progress observations after the positive convergence control,
+    // so the RED distinguishes valid intermediate storage states from a bad fixture.
+    assert_eq!(
+        [appended, committed, one_applied].map(|result| result.map(|_| ())),
+        [Err(RecoveryError::ConsensusUnavailable); 3],
+        "valid bootstrap progress must defer sealing and leave the workflow fenced"
+    );
+}
+
+/// The exact plan-bound command remains in flight even before save_committed
+/// catches up with append. Application on the real state machine independently
+/// proves that these bytes are an authorized V2, rather than an arbitrary Normal.
+#[cfg(target_os = "linux")]
+#[test]
+fn legacy_recovery_progress_exact_v2_append_waits_without_reproposal() {
+    let fixture = RecoveryProgressFixture::new();
+    let mut pins = acquire_finalization_pins(
+        &fixture.manager.integrity_key,
+        &fixture.plan,
+        &fixture.replicas,
+        fixture.backup.path(),
+        RecoveryLimits::default(),
+    )
+    .expect("pin installed campaign");
+    let predecessor = legacy_finalization_predecessor(
+        &fixture.manager.integrity_key,
+        &fixture.plan,
+        &mut pins,
+        fixture.backup.path(),
+        RecoveryLimits::default(),
+    )
+    .expect("seal exact predecessor")
+    .expect("legacy predecessor");
+    let mut request_id = [0; 16];
+    request_id.copy_from_slice(&fixture.plan.plan_digest().as_bytes()[..16]);
+    let finalize = Entry::<SessionRaftTypeConfig> {
+        log_id: LogId::new(fixture.baseline.log_id.leader_id, 1),
+        payload: EntryPayload::Normal(SessionConsensusCommand {
+            schema_version: SESSION_CONSENSUS_SCHEMA_VERSION,
+            identity: identity(),
+            request_id: SessionConsensusRequestId::from_bytes(request_id),
+            logical_time: Timestamp::from_str("2026-10-03T00:00:00Z").expect("fixed command time"),
+            intent: SessionMutationIntent::FinalizeOperatorRecoveryV2(Box::new(
+                recovery_v2_intent_from_plan(&fixture.plan, Some(&predecessor))
+                    .expect("compose exact plan-bound V2 intent"),
+            )),
+        }),
+    };
+    let conn = Connection::open(&fixture.replicas[0].database_path).expect("open proposing voter");
+    consensus::append_logs_sync(&conn, identity(), std::slice::from_ref(&finalize))
+        .expect("append authorized V2 without committing it");
+    assert_eq!(
+        consensus::read_log_range_for_recovery_sync(&conn, identity(), 1, Some(2), Some(1))
+            .expect("read exact V2 suffix bytes"),
+        vec![finalize.clone()]
+    );
+    assert_eq!(
+        consensus::read_committed_sync(&conn, identity()).expect("read old committed frontier"),
+        Some(fixture.baseline.log_id)
+    );
+    let appended = classify_finalization_pins(
+        &fixture.manager.integrity_key,
+        &fixture.plan,
+        &mut pins,
+        RecoveryLimits::default(),
+    );
+    fixture.assert_campaign_still_fenced();
+    consensus::save_committed_sync(&conn, identity(), Some(finalize.log_id))
+        .expect("commit the same V2 bytes without applying them");
+    assert_eq!(
+        classify_finalization_pins(
+            &fixture.manager.integrity_key,
+            &fixture.plan,
+            &mut pins,
+            RecoveryLimits::default(),
+        ),
+        Ok(FinalizationTransitionState::ExactFinalizeInFlight)
+    );
+    for (index, replica) in fixture.replicas.iter().enumerate() {
+        let voter = Connection::open(&replica.database_path).expect("open converging voter");
+        if index != 0 {
+            consensus::append_logs_sync(&voter, identity(), std::slice::from_ref(&finalize))
+                .expect("replicate the same V2 bytes");
+            consensus::save_committed_sync(&voter, identity(), Some(finalize.log_id))
+                .expect("commit the same V2 bytes");
+        }
+        let applied = consensus::apply_entries_sync(
+            &voter,
+            identity(),
+            &BackendCapabilities::all_enabled(),
+            vec![finalize.clone()],
+        )
+        .expect("apply exact authorized V2 on real state machine");
+        assert_eq!(applied.responses.len(), 1);
+        assert!(
+            applied.responses[0].result.is_ok(),
+            "the V2 must be accepted"
+        );
+        let state = consensus::read_operator_recovery_sync(&voter, identity())
+            .expect("read independently committed recovery effect");
+        assert_eq!(state.recovery_epoch, fixture.plan.next_recovery_epoch());
+        assert_eq!(
+            state.last_plan_digest,
+            fixture.plan.plan_digest().as_bytes()
+        );
+        assert_eq!(state.finalize_log_id, Some(finalize.log_id));
+        assert_eq!(state.pending_epoch, None);
+        let outcome_count: i64 = voter
+            .query_row(
+                "SELECT COUNT(*) FROM consensus_request_outcomes WHERE request_id = ?1",
+                [request_id.as_slice()],
+                |row| row.get(0),
+            )
+            .expect("count exact V2 outcomes");
+        assert_eq!(
+            outcome_count, 1,
+            "one proposal must produce one exact outcome"
+        );
+    }
+    assert_eq!(
+        classify_finalization_pins(
+            &fixture.manager.integrity_key,
+            &fixture.plan,
+            &mut pins,
+            RecoveryLimits::default(),
+        ),
+        Ok(FinalizationTransitionState::AllFinalized)
+    );
+    fixture.assert_campaign_still_fenced();
+    assert_eq!(
+        appended,
+        Ok(FinalizationTransitionState::ExactFinalizeInFlight),
+        "an authenticated append awaiting commit must neither corrupt nor permit reproposal"
+    );
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn legacy_recovery_progress_rejects_unrelated_normal_even_before_commit() {
+    for seal_predecessor in [false, true] {
+        let fixture = RecoveryProgressFixture::new();
+        let mut pins = acquire_finalization_pins(
+            &fixture.manager.integrity_key,
+            &fixture.plan,
+            &fixture.replicas,
+            fixture.backup.path(),
+            RecoveryLimits::default(),
+        )
+        .expect("pin negative progress control");
+        if seal_predecessor {
+            legacy_finalization_predecessor(
+                &fixture.manager.integrity_key,
+                &fixture.plan,
+                &mut pins,
+                fixture.backup.path(),
+                RecoveryLimits::default(),
+            )
+            .expect("seal negative control predecessor");
+        }
+        let normal = Entry::<SessionRaftTypeConfig> {
+            log_id: LogId::new(fixture.baseline.log_id.leader_id, 1),
+            payload: EntryPayload::Normal(SessionConsensusCommand {
+                schema_version: SESSION_CONSENSUS_SCHEMA_VERSION,
+                identity: identity(),
+                request_id: SessionConsensusRequestId::from_bytes([0xD1; 16]),
+                logical_time: Timestamp::from_str("2026-10-03T00:00:00Z")
+                    .expect("fixed negative control time"),
+                intent: SessionMutationIntent::AdvanceLogicalTime,
+            }),
+        };
+        let conn = Connection::open(&fixture.replicas[0].database_path)
+            .expect("open negative control voter");
+        consensus::append_logs_sync(&conn, identity(), std::slice::from_ref(&normal))
+            .expect("append structurally valid unrelated Normal");
+        let result = if seal_predecessor {
+            classify_finalization_pins(
+                &fixture.manager.integrity_key,
+                &fixture.plan,
+                &mut pins,
+                RecoveryLimits::default(),
+            )
+            .map(|_| ())
+        } else {
+            legacy_finalization_predecessor(
+                &fixture.manager.integrity_key,
+                &fixture.plan,
+                &mut pins,
+                fixture.backup.path(),
+                RecoveryLimits::default(),
+            )
+            .map(|_| ())
+        };
+        assert_eq!(
+            result,
+            Err(RecoveryError::BackupCorrupt),
+            "uncommitted progress does not excuse an unrelated Normal"
+        );
+        fixture.assert_campaign_still_fenced();
+    }
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn current_recovery_progress_exact_v2_append_waits_without_reproposal() {
+    let mut appended = Vec::new();
+    // Exercise both consumers of the current-format suffix proof: an
+    // untouched majority voter and the checkpoint-installed minority target.
+    for leading in [0, 2] {
+        let fixture =
+            RecoveryProgressFixture::with_basis(RecoveryDecisionBasis::VerifiedCommittedMajority);
+        let mut pins = fixture.pins();
+        assert!(fixture.predecessor(&mut pins).is_none());
+        assert_eq!(
+            fixture.classify(&mut pins),
+            Ok(FinalizationTransitionState::AllInstalled)
+        );
+        let workflow_before = fixture.workflow_bytes();
+        let finalize = fixture.finalize_entry(None, 1);
+        let conn = Connection::open(&fixture.replicas[leading].database_path)
+            .expect("open current-format leading voter");
+        consensus::append_logs_sync(&conn, identity(), std::slice::from_ref(&finalize))
+            .expect("append exact current-format V2 without commit");
+        assert_eq!(
+            consensus::read_log_range_for_recovery_sync(&conn, identity(), 1, Some(2), Some(1))
+                .expect("read exact current-format V2 bytes"),
+            vec![finalize.clone()]
+        );
+        assert_eq!(
+            consensus::read_committed_sync(&conn, identity()).expect("read committed baseline"),
+            Some(fixture.baseline.log_id)
+        );
+        appended.push(fixture.classify(&mut pins));
+        fixture.assert_unsealed_workflow_unchanged(&workflow_before);
+        consensus::save_committed_sync(&conn, identity(), Some(finalize.log_id))
+            .expect("commit the exact current-format V2 without apply");
+        assert_eq!(
+            fixture.classify(&mut pins),
+            Ok(FinalizationTransitionState::ExactFinalizeInFlight)
+        );
+        fixture.apply_and_assert_finalize(&conn, &finalize);
+        assert_eq!(
+            fixture.classify(&mut pins),
+            Ok(FinalizationTransitionState::MixedConverging)
+        );
+        for (index, replica) in fixture.replicas.iter().enumerate() {
+            if index == leading {
+                continue;
+            }
+            let follower = Connection::open(&replica.database_path).expect("open current follower");
+            consensus::append_logs_sync(&follower, identity(), std::slice::from_ref(&finalize))
+                .expect("replicate exact current-format V2");
+            consensus::save_committed_sync(&follower, identity(), Some(finalize.log_id))
+                .expect("commit exact current-format V2");
+            fixture.apply_and_assert_finalize(&follower, &finalize);
+        }
+        assert_eq!(
+            fixture.classify(&mut pins),
+            Ok(FinalizationTransitionState::AllFinalized)
+        );
+        fixture.assert_unsealed_workflow_unchanged(&workflow_before);
+    }
+    assert_eq!(
+        appended,
+        vec![Ok(FinalizationTransitionState::ExactFinalizeInFlight); 2],
+        "both current-format voter paths must defer an exact append awaiting commit"
+    );
+}
+
+#[cfg(target_os = "linux")]
+fn assert_applied_blank_preserves_recovery_predecessor(basis: RecoveryDecisionBasis) {
+    let mut observed = Vec::new();
+    for leading in [0, 2] {
+        let fixture = RecoveryProgressFixture::with_basis(basis);
+        let mut pins = fixture.pins();
+        let predecessor = fixture.predecessor(&mut pins);
+        let workflow_before = fixture.workflow_bytes();
+        let blank = Entry::<SessionRaftTypeConfig> {
+            log_id: LogId::new(
+                CommittedLeaderId::new(
+                    2,
+                    *fixture.plan.body.expected_members.first().expect("leader"),
+                ),
+                1,
+            ),
+            payload: EntryPayload::Blank,
+        };
+        let conn = Connection::open(&fixture.replicas[leading].database_path)
+            .expect("open voter advancing after predecessor seal");
+        consensus::append_logs_sync(&conn, identity(), std::slice::from_ref(&blank))
+            .expect("append post-predecessor election Blank");
+        consensus::save_committed_sync(&conn, identity(), Some(blank.log_id))
+            .expect("commit post-predecessor election Blank");
+        assert_eq!(
+            fixture.classify(&mut pins),
+            Ok(FinalizationTransitionState::AllInstalled)
+        );
+        consensus::apply_entries_sync(
+            &conn,
+            identity(),
+            &BackendCapabilities::all_enabled(),
+            vec![blank.clone()],
+        )
+        .expect("apply only the inert post-predecessor Blank");
+        assert_eq!(
+            consensus::read_applied_sync(&conn, identity()).expect("read applied Blank"),
+            Some(blank.log_id)
+        );
+        observed.push(fixture.classify(&mut pins));
+        fixture.assert_campaign_still_fenced();
+        for (index, replica) in fixture.replicas.iter().enumerate() {
+            if index != leading {
+                append_current_blank_checkpoint(replica, blank.log_id);
+            }
+        }
+        observed.push(fixture.classify(&mut pins));
+        assert_eq!(fixture.workflow_bytes(), workflow_before);
+        drop(pins);
+        let mut pins = fixture.pins();
+        assert_eq!(
+            fixture.predecessor(&mut pins),
+            predecessor,
+            "reopening must keep the original authenticated predecessor"
+        );
+        observed.push(fixture.classify(&mut pins));
+
+        // The unchanged predecessor is actually usable after the Blank:
+        // every real state machine must accept and persist its exact V2.
+        let mut finalize = fixture.finalize_entry(predecessor.as_ref(), 2);
+        finalize.log_id = LogId::new(blank.log_id.leader_id, 2);
+        for replica in &fixture.replicas {
+            let voter = Connection::open(&replica.database_path).expect("open converged voter");
+            consensus::append_logs_sync(&voter, identity(), std::slice::from_ref(&finalize))
+                .expect("append V2 after applied Blank");
+            consensus::save_committed_sync(&voter, identity(), Some(finalize.log_id))
+                .expect("commit V2 after applied Blank");
+            fixture.apply_and_assert_finalize(&voter, &finalize);
+        }
+        assert_eq!(
+            fixture.classify(&mut pins),
+            Ok(FinalizationTransitionState::AllFinalized)
+        );
+        assert_eq!(fixture.workflow_bytes(), workflow_before);
+        fixture.assert_campaign_still_fenced();
+    }
+    assert_eq!(
+        observed,
+        vec![Ok(FinalizationTransitionState::AllInstalled); 6],
+        "applying authenticated Blanks cannot invalidate an unchanged V2 predecessor"
+    );
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn legacy_recovery_progress_applied_blank_keeps_sealed_predecessor_usable() {
+    assert_applied_blank_preserves_recovery_predecessor(
+        RecoveryDecisionBasis::ExplicitLegacyCheckpoint,
+    );
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn current_recovery_progress_applied_blank_keeps_planned_predecessor_usable() {
+    assert_applied_blank_preserves_recovery_predecessor(
+        RecoveryDecisionBasis::VerifiedCommittedMajority,
+    );
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn recovery_progress_rejects_incompatible_uncommitted_fleet_suffixes() {
+    for basis in [
+        RecoveryDecisionBasis::ExplicitLegacyCheckpoint,
+        RecoveryDecisionBasis::VerifiedCommittedMajority,
+    ] {
+        for conflicting_blank in [false, true] {
+            for finalized_first in [false, true] {
+                let fixture = RecoveryProgressFixture::with_basis(basis);
+                let mut pins = fixture.pins();
+                let predecessor = fixture.predecessor(&mut pins);
+                let workflow_before = fixture.workflow_bytes();
+                let finalize = fixture.finalize_entry(predecessor.as_ref(), 1);
+                let mut conflict = finalize.clone();
+                if conflicting_blank {
+                    conflict.payload = EntryPayload::Blank;
+                } else {
+                    let EntryPayload::Normal(command) = &mut conflict.payload else {
+                        panic!("V2 timing control requires a Normal entry");
+                    };
+                    command.logical_time = Timestamp::from_str("2026-10-03T00:00:01Z")
+                        .expect("different fixed command time");
+                }
+                assert_eq!(finalize.log_id, conflict.log_id);
+                assert_ne!(
+                    serde_json::to_vec(&finalize).expect("encode first full entry"),
+                    serde_json::to_vec(&conflict).expect("encode conflicting full entry"),
+                    "same LogId does not authenticate the complete entry bytes"
+                );
+                for (index, entry) in [finalize, conflict].iter().enumerate() {
+                    let conn = Connection::open(&fixture.replicas[index].database_path)
+                        .expect("open conflicting append voter");
+                    consensus::append_logs_sync(&conn, identity(), std::slice::from_ref(entry))
+                        .expect("append independently valid but incompatible suffix");
+                    if finalized_first && index == 0 {
+                        consensus::save_committed_sync(&conn, identity(), Some(entry.log_id))
+                            .expect("commit first voter before conflicting follower catches up");
+                        fixture.apply_and_assert_finalize(&conn, entry);
+                    }
+                    assert_eq!(
+                        consensus::read_committed_sync(&conn, identity()).expect("read old commit"),
+                        Some(if finalized_first && index == 0 {
+                            entry.log_id
+                        } else {
+                            fixture.baseline.log_id
+                        })
+                    );
+                    assert_eq!(
+                        consensus::read_log_range_for_recovery_sync(
+                            &conn,
+                            identity(),
+                            1,
+                            Some(2),
+                            Some(1)
+                        )
+                        .expect("read exact conflicting suffix"),
+                        vec![entry.clone()]
+                    );
+                }
+                assert_eq!(
+                    fixture.classify(&mut pins),
+                    Err(RecoveryError::BackupCorrupt),
+                    "per-voter plan/request matches must not excuse incompatible fleet entries"
+                );
+                assert_eq!(fixture.workflow_bytes(), workflow_before);
+                fixture.assert_campaign_still_fenced();
+            }
+        }
+    }
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn legacy_recovery_progress_deferral_does_not_mask_later_corruption() {
+    for missing_latch in [false, true] {
+        let fixture = RecoveryProgressFixture::new();
+        let mut pins = fixture.pins();
+        let workflow_before = fixture.workflow_bytes();
+        let leading =
+            Connection::open(&fixture.replicas[0].database_path).expect("open lagging voter");
+        let blank = Entry::<SessionRaftTypeConfig> {
+            log_id: LogId::new(fixture.baseline.log_id.leader_id, 1),
+            payload: EntryPayload::Blank,
+        };
+        consensus::append_logs_sync(&leading, identity(), std::slice::from_ref(&blank))
+            .expect("append legitimate leading Blank");
+        let latch_path =
+            consensus::operator_recovery_latch_path(&fixture.replicas[2].database_path)
+                .expect("locate exact later campaign latch");
+        let held_latch = fixture.root.path().join("held-campaign-latch");
+        if missing_latch {
+            std::fs::rename(&latch_path, &held_latch)
+                .expect("remove later sidecar from its bound path");
+        } else {
+            let later = Connection::open(&fixture.replicas[2].database_path)
+                .expect("open later corrupt voter");
+            let unrelated = Entry::<SessionRaftTypeConfig> {
+                log_id: blank.log_id,
+                payload: EntryPayload::Normal(SessionConsensusCommand {
+                    schema_version: SESSION_CONSENSUS_SCHEMA_VERSION,
+                    identity: identity(),
+                    request_id: SessionConsensusRequestId::from_bytes([0xE1; 16]),
+                    logical_time: Timestamp::from_str("2026-10-03T00:00:00Z")
+                        .expect("fixed unrelated Normal time"),
+                    intent: SessionMutationIntent::AdvanceLogicalTime,
+                }),
+            };
+            consensus::append_logs_sync(&later, identity(), std::slice::from_ref(&unrelated))
+                .expect("append unrelated Normal on later voter");
+        }
+        let result = legacy_finalization_predecessor(
+            &fixture.manager.integrity_key,
+            &fixture.plan,
+            &mut pins,
+            fixture.backup.path(),
+            RecoveryLimits::default(),
+        );
+        assert_eq!(
+            result,
+            Err(RecoveryError::BackupCorrupt),
+            "one lagging voter must not hide a later corrupt history or sidecar"
+        );
+        if missing_latch {
+            std::fs::rename(&held_latch, &latch_path).expect("restore unchanged test sidecar");
+        }
+        fixture.assert_unsealed_workflow_unchanged(&workflow_before);
+    }
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn recovery_progress_rejects_foreign_duplicate_and_mutated_v2() {
+    for basis in [
+        RecoveryDecisionBasis::ExplicitLegacyCheckpoint,
+        RecoveryDecisionBasis::VerifiedCommittedMajority,
+    ] {
+        for fault in ["request", "campaign", "payload", "schema", "duplicate"] {
+            let fixture = RecoveryProgressFixture::with_basis(basis);
+            let mut pins = fixture.pins();
+            let predecessor = fixture.predecessor(&mut pins);
+            let workflow = fixture.workflow_bytes();
+            let mut entry = fixture.finalize_entry(predecessor.as_ref(), 1);
+            let EntryPayload::Normal(command) = &mut entry.payload else {
+                panic!("V2 fixture must carry a command");
+            };
+            match fault {
+                "request" => command.request_id = SessionConsensusRequestId::from_bytes([0xB7; 16]),
+                "schema" => command.schema_version += 1,
+                "campaign" | "payload" => {
+                    let SessionMutationIntent::FinalizeOperatorRecoveryV2(payload) =
+                        &mut command.intent
+                    else {
+                        panic!("V2 fixture must carry the finalization payload");
+                    };
+                    if fault == "campaign" {
+                        payload.plan_digest = [0xB8; 32];
+                    } else {
+                        payload.recovery_epoch += 1;
+                    }
+                }
+                "duplicate" => {}
+                _ => unreachable!(),
+            }
+            let conn = Connection::open(&fixture.replicas[2].database_path).expect("open target");
+            let mut entries = vec![entry.clone()];
+            if fault == "duplicate" {
+                entry.log_id.index = 2;
+                entries.push(entry);
+            }
+            for entry in &entries {
+                RecoveryProgressFixture::inject_log(&conn, entry);
+            }
+            assert_eq!(
+                fixture.classify(&mut pins),
+                Err(RecoveryError::BackupCorrupt),
+                "{basis:?}: {fault}"
+            );
+            assert_eq!(fixture.workflow_bytes(), workflow);
+            fixture.assert_campaign_still_fenced();
+        }
+    }
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn recovery_progress_rejects_invalid_lineage_and_installed_state() {
+    for basis in [
+        RecoveryDecisionBasis::ExplicitLegacyCheckpoint,
+        RecoveryDecisionBasis::VerifiedCommittedMajority,
+    ] {
+        for unsealed in [false, true] {
+            if unsealed && basis != RecoveryDecisionBasis::ExplicitLegacyCheckpoint {
+                continue;
+            }
+            for fault in [
+                "hole",
+                "pointer-term",
+                "term-regression",
+                "pointer-beyond",
+                "applied-normal",
+                "logical-state",
+            ] {
+                let fixture = RecoveryProgressFixture::with_basis(basis);
+                let mut pins = fixture.pins();
+                if !unsealed {
+                    fixture.predecessor(&mut pins);
+                }
+                let workflow = fixture.workflow_bytes();
+                let leading =
+                    Connection::open(&fixture.replicas[0].database_path).expect("leading voter");
+                consensus::append_logs_sync(&leading, identity(), &[fixture.blank(1)])
+                    .expect("append permissible leading Blank");
+                let later =
+                    Connection::open(&fixture.replicas[2].database_path).expect("later voter");
+                match fault {
+                    "hole" => RecoveryProgressFixture::inject_log(&later, &fixture.blank(2)),
+                    "pointer-term" | "pointer-beyond" => {
+                        let pointer = LogId::new(
+                            CommittedLeaderId::new(
+                                9,
+                                *fixture.plan.body.expected_members.first().expect("leader"),
+                            ),
+                            if fault == "pointer-term" { 0 } else { 9 },
+                        );
+                        assert_eq!(later.execute(
+                            "UPDATE consensus_committed SET term = ?1, log_index = ?2, log_id_json = ?3 WHERE singleton = 1",
+                            params![pointer.leader_id.term, pointer.index, serde_json::to_vec(&pointer).expect("encode invalid pointer")],
+                        ).expect("inject pointer with no matching retained LogId"), 1);
+                        assert_eq!(
+                            consensus::read_committed_sync(&later, identity())
+                                .expect("read invalid pointer"),
+                            Some(pointer)
+                        );
+                    }
+                    "term-regression" => {
+                        let mut blank = fixture.blank(1);
+                        blank.log_id.leader_id = CommittedLeaderId::new(
+                            0,
+                            *fixture.plan.body.expected_members.first().expect("leader"),
+                        );
+                        RecoveryProgressFixture::inject_log(&later, &blank);
+                    }
+                    "applied-normal" => {
+                        let mut entry = fixture.blank(1);
+                        entry.payload = EntryPayload::Normal(SessionConsensusCommand {
+                            schema_version: SESSION_CONSENSUS_SCHEMA_VERSION,
+                            identity: identity(),
+                            request_id: SessionConsensusRequestId::from_bytes([0xB9; 16]),
+                            logical_time: Timestamp::from_str("2026-10-03T00:00:02Z")
+                                .expect("fixed time"),
+                            intent: SessionMutationIntent::AdvanceLogicalTime,
+                        });
+                        consensus::append_logs_sync(
+                            &later,
+                            identity(),
+                            std::slice::from_ref(&entry),
+                        )
+                        .expect("append foreign Normal");
+                        consensus::save_committed_sync(&later, identity(), Some(entry.log_id))
+                            .expect("commit foreign Normal");
+                        consensus::apply_entries_sync(
+                            &later,
+                            identity(),
+                            &BackendCapabilities::all_enabled(),
+                            vec![entry],
+                        )
+                        .expect("apply foreign Normal");
+                    }
+                    "logical-state" => {
+                        assert_eq!(
+                            later
+                                .execute("UPDATE key_fences SET fence = fence + 1", [])
+                                .expect("alter installed logical state"),
+                            1
+                        );
+                    }
+                    _ => unreachable!(),
+                }
+                let result = if unsealed {
+                    fixture.capture(&mut pins).map(|_| ())
+                } else {
+                    fixture.classify(&mut pins).map(|_| ())
+                };
+                assert_eq!(
+                    result,
+                    Err(RecoveryError::BackupCorrupt),
+                    "{basis:?}, unsealed={unsealed}: {fault}"
+                );
+                assert_eq!(fixture.workflow_bytes(), workflow);
+                fixture.assert_campaign_still_fenced();
+            }
+        }
+    }
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn legacy_recovery_progress_requires_exact_stable_active_bootstrap_latches() {
+    let mut results = Vec::new();
+    for fault in ["foreign", "terminal", "audit", "changed-audit"] {
+        let fixture = RecoveryProgressFixture::new();
+        if fault == "changed-audit" {
+            super::sqlite::record_audit_pending(
+                &fixture.manager.integrity_key,
+                &fixture.plan,
+                fixture.backup.path(),
+            )
+            .expect("authenticate audit resume workflow");
+        }
+        let mut pins = fixture.pins();
+        let workflow = fixture.workflow_bytes();
+        let path = consensus::operator_recovery_latch_path(&fixture.replicas[2].database_path)
+            .expect("latch path");
+        let before = std::fs::read(&path).expect("save exact latch");
+        let changed = Arc::new(AtomicBool::new(false));
+        match fault {
+            "foreign" => {
+                let mut bytes = before.clone();
+                bytes[88] ^= 1;
+                std::fs::write(&path, bytes).expect("write foreign campaign sidecar");
+            }
+            "terminal" => consensus::terminalize_operator_recovery_latch_sync(
+                &fixture.replicas[2].database_path,
+                fixture.latch(false),
+                &File::open(&fixture.replicas[2].database_path).expect("pin terminal database"),
+                None,
+            )
+            .expect("create a bound premature terminal sidecar"),
+            "audit" => consensus::set_operator_recovery_latch_audit_pending_sync(
+                &fixture.replicas[2].database_path,
+                fixture.latch(false),
+                true,
+            )
+            .expect("set audit bit outside AuditPending"),
+            "changed-audit" => {
+                let database = fixture.replicas[2].database_path.clone();
+                let latch = fixture.latch(false);
+                let changed_hook = Arc::clone(&changed);
+                install_pinned_inspection_path_swap_hooks(
+                    |_| {},
+                    move |_| {
+                        if !changed_hook.swap(true, Ordering::SeqCst) {
+                            consensus::set_operator_recovery_latch_audit_pending_sync(
+                                &database, latch, true,
+                            )
+                            .expect("change allowed audit bit during full fleet proof");
+                        }
+                    },
+                );
+            }
+            _ => unreachable!(),
+        }
+        let result = fixture.capture(&mut pins);
+        clear_pinned_inspection_path_swap_hooks();
+        if fault == "changed-audit" {
+            assert!(
+                changed.load(Ordering::SeqCst),
+                "sidecar writer must execute inside inspection"
+            );
+        }
+        results.push((
+            fault,
+            result.map(|_| ()),
+            fixture.workflow_bytes() == workflow,
+        ));
+    }
+    for (fault, result, unchanged) in results {
+        assert_eq!(result, Err(RecoveryError::BackupCorrupt), "{fault}");
+        assert!(
+            unchanged,
+            "{fault} must not publish a predecessor or change the workflow MAC"
+        );
+    }
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn legacy_recovery_progress_authenticated_audit_bit_transitions_remain_resumable() {
+    let mut observations = Vec::new();
+    for bits in [
+        [false, false, false],
+        [true, false, false],
+        [true, true, true],
+        [false, true, true],
+    ] {
+        let fixture = RecoveryProgressFixture::new();
+        super::sqlite::record_audit_pending(
+            &fixture.manager.integrity_key,
+            &fixture.plan,
+            fixture.backup.path(),
+        )
+        .expect("authenticate ordered audit-resume boundary");
+        for (replica, bit) in fixture.replicas.iter().zip(bits) {
+            consensus::set_operator_recovery_latch_audit_pending_sync(
+                &replica.database_path,
+                fixture.latch(false),
+                bit,
+            )
+            .expect("represent a completed prefix of the ordered set or clear operation");
+        }
+        let mut pins = fixture.pins();
+        let workflow = fixture.workflow_bytes();
+        let leading = Connection::open(&fixture.replicas[0].database_path).expect("leading voter");
+        let blank = fixture.blank(1);
+        consensus::append_logs_sync(&leading, identity(), std::slice::from_ref(&blank))
+            .expect("append inert progress");
+        let result = fixture.capture(&mut pins).map(|_| ());
+        assert_eq!(
+            fixture.workflow_bytes(),
+            workflow,
+            "a retry cannot publish or satisfy audit"
+        );
+        for (replica, bit) in fixture.replicas.iter().zip(bits) {
+            assert_eq!(
+                consensus::active_operator_recovery_latch_sync(&replica.database_path)
+                    .expect("active latch"),
+                Some(fixture.latch(bit))
+            );
+        }
+        observations.push(result);
+        for (index, replica) in fixture.replicas.iter().enumerate() {
+            let conn = Connection::open(&replica.database_path).expect("converging voter");
+            if index != 0 {
+                consensus::append_logs_sync(&conn, identity(), std::slice::from_ref(&blank))
+                    .expect("append exact Blank");
+            }
+            consensus::save_committed_sync(&conn, identity(), Some(blank.log_id))
+                .expect("commit exact Blank");
+            consensus::apply_entries_sync(
+                &conn,
+                identity(),
+                &BackendCapabilities::all_enabled(),
+                vec![blank.clone()],
+            )
+            .expect("apply exact Blank");
+        }
+        let predecessor = fixture
+            .capture(&mut pins)
+            .expect("stable audit bits permit exact bootstrap proof")
+            .expect("legacy predecessor");
+        assert_eq!(predecessor.baseline_log_id, blank.log_id);
+        assert_eq!(
+            resume_execution_state(
+                &fixture.manager.integrity_key,
+                &fixture.plan,
+                fixture.backup.path()
+            )
+            .expect("audit state remains authenticated"),
+            RecoveryExecutionState::AuditPending
+        );
+        drop(pins);
+        assert_eq!(
+            fixture
+                .manager
+                .execute(
+                    &context(),
+                    &fixture.plan,
+                    &RecoveryConfirmation::legacy(
+                        &fixture.plan,
+                        RecoveryConfirmation::required_legacy_acknowledgement()
+                    ),
+                    &fixture.replicas,
+                    fixture.backup.path(),
+                    RecoveryLimits::default(),
+                )
+                .expect("ordinary audited resume clears the exact sidecars")
+                .state(),
+            RecoveryExecutionState::AwaitingEpochCommit
+        );
+        fixture.assert_campaign_still_fenced();
+    }
+    assert_eq!(
+        observations,
+        vec![Err(RecoveryError::ConsensusUnavailable); 4]
+    );
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn current_recovery_progress_rejects_rewritten_older_blank_predecessor() {
+    let mut observations = Vec::new();
+    for changed_voter in [0, 2] {
+        let fixture = RecoveryProgressFixture::with_baseline(
+            RecoveryDecisionBasis::VerifiedCommittedMajority,
+            RecoveryProgressBaseline::RetainedBlank,
+        );
+        let mut pins = fixture.pins();
+        assert!(fixture.predecessor(&mut pins).is_none());
+        let workflow = fixture.workflow_bytes();
+        let successor = LogId::new(
+            CommittedLeaderId::new(
+                4,
+                *fixture.plan.body.expected_members.first().expect("leader"),
+            ),
+            2,
+        );
+        for replica in &fixture.replicas {
+            append_current_blank_checkpoint(replica, successor);
+        }
+        assert_eq!(
+            fixture.classify(&mut pins),
+            Ok(FinalizationTransitionState::AllInstalled)
+        );
+        let mut changed = fixture.baseline.clone();
+        changed.log_id.leader_id = CommittedLeaderId::new(
+            2,
+            *fixture.plan.body.expected_members.first().expect("leader"),
+        );
+        let conn = Connection::open(&fixture.replicas[changed_voter].database_path)
+            .expect("rewrite older predecessor");
+        assert_eq!(
+            conn.execute(
+                "UPDATE consensus_log SET term = ?1, entry_json = ?2 WHERE log_index = ?3",
+                params![
+                    changed.log_id.leader_id.term,
+                    serde_json::to_vec(&changed).expect("encode rewritten predecessor"),
+                    changed.log_id.index
+                ],
+            )
+            .expect("replace predecessor with another monotonic full LogId"),
+            1
+        );
+        assert_eq!(
+            consensus::read_log_range_for_recovery_sync(&conn, identity(), 1, Some(2), Some(1))
+                .expect("read substituted predecessor"),
+            vec![changed]
+        );
+        let evidence = inspect_current_fixture(
+            &fixture.replicas[changed_voter],
+            &fixture.plan.body.expected_members,
+        )
+        .expect("later durable pointers and membership still have valid exact lineage");
+        assert_eq!(evidence.applied_log_id, Some(successor));
+        assert_eq!(evidence.committed_log_id, Some(successor));
+        assert_eq!(evidence.local_head_log_id, Some(successor));
+        observations.push(fixture.classify(&mut pins));
+        assert_eq!(fixture.workflow_bytes(), workflow);
+        fixture.assert_campaign_still_fenced();
+    }
+    assert_eq!(
+        observations,
+        vec![Err(RecoveryError::BackupCorrupt); 2],
+        "an applied Blank must not erase the planned predecessor's exact physical identity"
+    );
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn current_recovery_progress_preserves_exact_snapshot_and_purge_predecessors() {
+    for coverage in [
+        RecoveryProgressBaseline::Snapshot,
+        RecoveryProgressBaseline::Purged,
+    ] {
+        let fixture = RecoveryProgressFixture::with_baseline(
+            RecoveryDecisionBasis::VerifiedCommittedMajority,
+            coverage,
+        );
+        let mut pins = fixture.pins();
+        assert!(fixture.predecessor(&mut pins).is_none());
+        let workflow = fixture.workflow_bytes();
+        for replica in &fixture.replicas {
+            let conn = Connection::open(&replica.database_path).expect("covered predecessor voter");
+            assert_eq!(
+                consensus::operator_recovery_v2_predecessor_kind_sync(
+                    &conn,
+                    identity(),
+                    &fixture.baseline.log_id
+                )
+                .expect("observe absent physical baseline"),
+                consensus::OperatorRecoveryV2PredecessorKind::NotRetained
+            );
+            if coverage == RecoveryProgressBaseline::Snapshot {
+                assert_eq!(
+                    consensus::read_purged_sync(&conn, identity()).expect("no purge coverage"),
+                    None
+                );
+                assert_eq!(
+                    consensus::read_current_snapshot_sync(&conn, identity())
+                        .expect("snapshot coverage")
+                        .expect("selected snapshot")
+                        .0
+                        .last_log_id,
+                    Some(fixture.baseline.log_id)
+                );
+            } else {
+                assert!(consensus::read_current_snapshot_sync(&conn, identity())
+                    .expect("no snapshot coverage")
+                    .is_none());
+                assert_eq!(
+                    consensus::read_purged_sync(&conn, identity()).expect("purge coverage"),
+                    Some(fixture.baseline.log_id)
+                );
+            }
+            let blank = fixture.blank(2);
+            if coverage == RecoveryProgressBaseline::Snapshot {
+                // A no-purge snapshot checkpoint has no physical append
+                // cursor. Materialize its first durable suffix row, then
+                // exercise the real commit/apply path on that valid image.
+                RecoveryProgressFixture::inject_log(&conn, &blank);
+                consensus::save_committed_sync(&conn, identity(), Some(blank.log_id))
+                    .expect("commit snapshot-covered Blank");
+                consensus::apply_entries_sync(
+                    &conn,
+                    identity(),
+                    &BackendCapabilities::all_enabled(),
+                    vec![blank],
+                )
+                .expect("apply snapshot-covered Blank");
+            } else {
+                append_current_blank_checkpoint(replica, blank.log_id);
+            }
+        }
+        assert_eq!(
+            fixture.classify(&mut pins),
+            Ok(FinalizationTransitionState::AllInstalled)
+        );
+        let finalize = fixture.finalize_entry(None, 3);
+        for replica in &fixture.replicas {
+            let conn = Connection::open(&replica.database_path).expect("covered V2 voter");
+            consensus::append_logs_sync(&conn, identity(), std::slice::from_ref(&finalize))
+                .expect("append covered V2");
+        }
+        assert_eq!(
+            fixture.classify(&mut pins),
+            Ok(FinalizationTransitionState::ExactFinalizeInFlight)
+        );
+        for replica in &fixture.replicas {
+            let conn = Connection::open(&replica.database_path).expect("apply covered V2 voter");
+            consensus::save_committed_sync(&conn, identity(), Some(finalize.log_id))
+                .expect("commit covered V2");
+            fixture.apply_and_assert_finalize(&conn, &finalize);
+        }
+        assert_eq!(
+            fixture.classify(&mut pins),
+            Ok(FinalizationTransitionState::AllFinalized)
+        );
+        assert_eq!(fixture.workflow_bytes(), workflow);
+        fixture.assert_campaign_still_fenced();
+    }
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn current_recovery_progress_bounds_physical_predecessor_read() {
+    let mut observations = Vec::new();
+    for bound in ["value", "total", "remaining"] {
+        for changed_voter in [0, 2] {
+            let fixture = RecoveryProgressFixture::with_baseline(
+                RecoveryDecisionBasis::VerifiedCommittedMajority,
+                RecoveryProgressBaseline::Purged,
+            );
+            let mut pins = fixture.pins();
+            let workflow = fixture.workflow_bytes();
+            let defaults = RecoveryLimits::default();
+            let limits = RecoveryLimits::try_new_with_work_budget(
+                defaults.max_database_bytes(),
+                defaults.max_snapshot_bytes(),
+                defaults.max_rows(),
+                if bound == "value" {
+                    64 * 1024
+                } else {
+                    1024 * 1024
+                },
+                if bound == "value" {
+                    1024 * 1024
+                } else {
+                    64 * 1024
+                },
+                defaults.max_duration(),
+            )
+            .expect("stricter caller byte bounds");
+            for replica in &fixture.replicas {
+                append_current_blank_checkpoint(replica, fixture.blank(2).log_id);
+            }
+            let replica = &fixture.replicas[changed_voter];
+            let conn =
+                Connection::open(&replica.database_path).expect("retained purge-floor voter");
+            RecoveryProgressFixture::inject_log(&conn, &fixture.baseline);
+            pad_current_log_entry(&conn, fixture.baseline.log_id.index, 1024);
+            let classify = |pins: &mut super::sqlite::FinalizationPins<'_>| {
+                classify_finalization_pins(
+                    &fixture.manager.integrity_key,
+                    &fixture.plan,
+                    pins,
+                    limits,
+                )
+            };
+            assert_eq!(
+                classify(&mut pins),
+                Ok(FinalizationTransitionState::AllInstalled),
+                "a within-bound physical row at the exact purge floor remains valid"
+            );
+            let oversized = if bound == "remaining" {
+                64 * 1024 - 1
+            } else {
+                128 * 1024
+            };
+            pad_current_log_entry(&conn, fixture.baseline.log_id.index, oversized);
+            let bytes: i64 = conn
+                .query_row(
+                    "SELECT length(entry_json) FROM consensus_log WHERE log_index = ?1",
+                    [fixture.baseline.log_id.index],
+                    |row| row.get(0),
+                )
+                .expect("read oversized physical row length");
+            assert_eq!(
+                usize::try_from(bytes).expect("positive physical length"),
+                oversized
+            );
+            if bound == "remaining" {
+                assert!(u64::try_from(bytes).expect("row length") < limits.max_value_bytes());
+                assert!(u64::try_from(bytes).expect("row length") < limits.max_total_value_bytes());
+            }
+            let evidence = inspect_replica(InspectionInput {
+                snapshot_integrity: fixture.plan.snapshot_integrity_policy(),
+                key: &fixture.manager.integrity_key,
+                replica,
+                identity: identity(),
+                expected_members: &fixture.plan.body.expected_members,
+                limits,
+            })
+            .expect("ordinary logical inspection masks retained cleanup below the purge floor");
+            assert_eq!(evidence.applied_log_id, Some(fixture.blank(2).log_id));
+            observations.push(classify(&mut pins));
+            pad_current_log_entry(&conn, fixture.baseline.log_id.index, 1024);
+            assert_eq!(
+                classify(&mut pins),
+                Ok(FinalizationTransitionState::AllInstalled),
+                "restoring the row within the caller bound restores the exact proof"
+            );
+            assert_eq!(fixture.workflow_bytes(), workflow);
+            fixture.assert_campaign_still_fenced();
+        }
+    }
+    assert_eq!(
+        observations,
+        vec![Err(RecoveryError::WorkLimitExceeded); 6],
+        "a new physical predecessor read must honor per-value, total and remaining caller bounds"
+    );
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn recovery_progress_bounds_cumulative_suffix_reads() {
+    let mut observations = Vec::new();
+    for basis in [
+        RecoveryDecisionBasis::ExplicitLegacyCheckpoint,
+        RecoveryDecisionBasis::VerifiedCommittedMajority,
+    ] {
+        for changed_voter in [0, 2] {
+            let fixture = RecoveryProgressFixture::with_basis(basis);
+            let mut pins = fixture.pins();
+            fixture.predecessor(&mut pins);
+            let workflow = fixture.workflow_bytes();
+            let defaults = RecoveryLimits::default();
+            let limits = RecoveryLimits::try_new_with_work_budget(
+                defaults.max_database_bytes(),
+                defaults.max_snapshot_bytes(),
+                defaults.max_rows(),
+                1024 * 1024,
+                64 * 1024,
+                defaults.max_duration(),
+            )
+            .expect("strict cumulative read budget");
+            for replica in &fixture.replicas {
+                append_current_blank_checkpoint(replica, fixture.blank(1).log_id);
+            }
+            let replica = &fixture.replicas[changed_voter];
+            let conn = Connection::open(&replica.database_path).expect("suffix budget voter");
+            let classify = |pins: &mut super::sqlite::FinalizationPins<'_>| {
+                classify_finalization_pins(
+                    &fixture.manager.integrity_key,
+                    &fixture.plan,
+                    pins,
+                    limits,
+                )
+            };
+            pad_current_log_entry(&conn, 1, 1024);
+            assert_eq!(
+                classify(&mut pins),
+                Ok(FinalizationTransitionState::AllInstalled),
+                "the same applied Blank and original predecessor fit the caller budget"
+            );
+            pad_current_log_entry(&conn, 1, 48 * 1024);
+            let bytes: i64 = conn
+                .query_row(
+                    "SELECT length(entry_json) FROM consensus_log WHERE log_index = 1",
+                    [],
+                    |row| row.get(0),
+                )
+                .expect("read encoded suffix length");
+            let bytes = u64::try_from(bytes).expect("positive suffix length");
+            assert_eq!(bytes, 48 * 1024);
+            assert!(bytes < limits.max_value_bytes());
+            assert!(bytes < limits.max_total_value_bytes());
+            assert!(bytes * 2 > limits.max_total_value_bytes());
+            let evidence = inspect_replica(InspectionInput {
+                snapshot_integrity: fixture.plan.snapshot_integrity_policy(),
+                key: &fixture.manager.integrity_key,
+                replica,
+                identity: identity(),
+                expected_members: &fixture.plan.body.expected_members,
+                limits,
+            })
+            .expect("ordinary semantic inspection fits the same caller limits");
+            assert_eq!(evidence.applied_log_id, Some(fixture.blank(1).log_id));
+            // The complete fleet witness and installed-state proof each read
+            // this same encoded suffix. Neither may reset or omit the caller's
+            // cumulative accounting merely because the first read was valid.
+            observations.push(classify(&mut pins));
+            pad_current_log_entry(&conn, 1, 1024);
+            assert_eq!(
+                classify(&mut pins),
+                Ok(FinalizationTransitionState::AllInstalled),
+                "reducing only the encoded read volume restores the unchanged proof"
+            );
+            assert_eq!(fixture.workflow_bytes(), workflow);
+            fixture.assert_campaign_still_fenced();
+        }
+    }
+    assert_eq!(
+        observations,
+        vec![Err(RecoveryError::WorkLimitExceeded); 4],
+        "each actual suffix read must fit the remaining original inspection budget"
+    );
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn recovery_progress_bounds_additional_head_read() {
+    let mut observations = Vec::new();
+    for basis in [
+        RecoveryDecisionBasis::ExplicitLegacyCheckpoint,
+        RecoveryDecisionBasis::VerifiedCommittedMajority,
+    ] {
+        for changed_voter in [0, 2] {
+            let fixture = RecoveryProgressFixture::with_basis(basis);
+            let mut pins = fixture.pins();
+            let predecessor = fixture.predecessor(&mut pins);
+            let finalize = fixture.finalize_entry(predecessor.as_ref(), 1);
+            for replica in &fixture.replicas {
+                let conn = Connection::open(&replica.database_path).expect("finalized head voter");
+                consensus::append_logs_sync(&conn, identity(), std::slice::from_ref(&finalize))
+                    .expect("append exact V2");
+                consensus::save_committed_sync(&conn, identity(), Some(finalize.log_id))
+                    .expect("commit exact V2");
+                fixture.apply_and_assert_finalize(&conn, &finalize);
+                append_current_blank_checkpoint(replica, fixture.blank(2).log_id);
+            }
+            let workflow = fixture.workflow_bytes();
+            let defaults = RecoveryLimits::default();
+            let limits = RecoveryLimits::try_new_with_work_budget(
+                defaults.max_database_bytes(),
+                defaults.max_snapshot_bytes(),
+                defaults.max_rows(),
+                1024 * 1024,
+                128 * 1024,
+                defaults.max_duration(),
+            )
+            .expect("strict cumulative finalized-head budget");
+            let replica = &fixture.replicas[changed_voter];
+            let conn = Connection::open(&replica.database_path).expect("head allocation voter");
+            let classify = |pins: &mut super::sqlite::FinalizationPins<'_>| {
+                classify_finalization_pins(
+                    &fixture.manager.integrity_key,
+                    &fixture.plan,
+                    pins,
+                    limits,
+                )
+            };
+            pad_current_log_entry(&conn, 2, 8 * 1024);
+            assert_eq!(
+                classify(&mut pins),
+                Ok(FinalizationTransitionState::AllFinalized),
+                "the real V2 effect and encoded head fit the caller budget"
+            );
+            pad_current_log_entry(&conn, 2, 96 * 1024);
+            let bytes: i64 = conn
+                .query_row(
+                    "SELECT length(entry_json) FROM consensus_log WHERE log_index = 2",
+                    [],
+                    |row| row.get(0),
+                )
+                .expect("read encoded finalized head length");
+            let bytes = u64::try_from(bytes).expect("positive head length");
+            assert_eq!(bytes, 96 * 1024);
+            assert!(bytes < limits.max_value_bytes());
+            assert!(bytes < limits.max_total_value_bytes());
+            assert!(bytes * 2 > limits.max_total_value_bytes());
+            let evidence = inspect_replica(InspectionInput {
+                snapshot_integrity: fixture.plan.snapshot_integrity_policy(),
+                key: &fixture.manager.integrity_key,
+                replica,
+                identity: identity(),
+                expected_members: &fixture.plan.body.expected_members,
+                limits,
+            })
+            .expect("same-budget semantic inspection accepts the exact finalized state");
+            assert_eq!(evidence.applied_log_id, Some(fixture.blank(2).log_id));
+            assert_eq!(evidence.finalize_log_id, Some(finalize.log_id));
+            // A finalized voter needs only the new history observer. Its lower
+            // reader audits the highest row before returning the range, so
+            // the post-V2 Blank is read once for that audit and again in the
+            // returned suffix. The V2 bytes themselves stay canonical.
+            observations.push(classify(&mut pins));
+            pad_current_log_entry(&conn, 2, 8 * 1024);
+            assert_eq!(
+                classify(&mut pins),
+                Ok(FinalizationTransitionState::AllFinalized),
+                "reducing only encoded head bytes restores the exact finalized proof"
+            );
+            assert_eq!(fixture.workflow_bytes(), workflow);
+            fixture.assert_campaign_still_fenced();
+        }
+    }
+    assert_eq!(
+        observations,
+        vec![Err(RecoveryError::WorkLimitExceeded); 4],
+        "the observer must include its lower reader's additional highest-row allocation"
+    );
+}
+
 /// The legacy capsule is captured from X.  Before classification can start, a
 /// same-inode WAL writer installs Y with a canonical-but-different baseline
 /// Membership while retaining the same resulting membership scope and all

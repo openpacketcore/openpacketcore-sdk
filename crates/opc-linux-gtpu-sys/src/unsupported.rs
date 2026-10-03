@@ -142,6 +142,18 @@ pub fn clock_gettime_boottime_ns() -> io::Result<u64> {
     Err(unsupported())
 }
 
+pub struct BpfMapReaderGrace;
+
+impl BpfMapReaderGrace {
+    pub fn new() -> io::Result<Self> {
+        Err(unsupported())
+    }
+
+    pub fn synchronize(&self) -> io::Result<()> {
+        Err(unsupported())
+    }
+}
+
 #[cfg(target_os = "linux")]
 pub fn freeze_bpf_map(_map: std::os::fd::BorrowedFd<'_>) -> io::Result<()> {
     Err(unsupported())
