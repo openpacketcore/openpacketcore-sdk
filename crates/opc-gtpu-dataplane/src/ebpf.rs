@@ -1427,6 +1427,25 @@ fn state_indeterminate(operation: &'static str) -> GtpuError {
     GtpuError::StateIndeterminate { operation }
 }
 
+#[cfg(any(target_os = "linux", test))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TftReaderGraceMethod {
+    Global,
+    MapInMap,
+}
+
+#[cfg(any(target_os = "linux", test))]
+fn select_tft_reader_grace(
+    global_available: bool,
+    map_available: impl FnOnce() -> bool,
+) -> Option<TftReaderGraceMethod> {
+    if global_available {
+        Some(TftReaderGraceMethod::Global)
+    } else {
+        map_available().then_some(TftReaderGraceMethod::MapInMap)
+    }
+}
+
 pub(crate) trait EbpfGtpuRuntime: Send + Sync + fmt::Debug {
     /// Complete the qualified kernel grace boundary for the non-sleepable
     /// grouped XDP/TC readers. No map, hook or packet-source mutation is allowed.
@@ -1436,8 +1455,8 @@ pub(crate) trait EbpfGtpuRuntime: Send + Sync + fmt::Debug {
         })
     }
     /// Complete the qualified kernel grace boundary for the non-sleepable TC
-    /// readers of the TFT classifier. No map, hook or packet-source mutation
-    /// is allowed.
+    /// readers of the TFT classifier. No datapath map, hook or packet-source
+    /// mutation is allowed; an implementation may update private grace maps.
     fn synchronize_tft_readers(&self) -> Result<(), GtpuError> {
         Err(GtpuError::UnsupportedFeature {
             feature: "tft_classifier_reader_grace",
@@ -2517,6 +2536,15 @@ pub(crate) trait EbpfGtpuRuntime: Send + Sync + fmt::Debug {
     /// Return whether current program, held/pinned maps, TFT marker, and
     /// managed attachment identity are all simultaneously authoritative.
     fn tft_datapath_usable(&self, ifindex: u32) -> bool;
+
+    /// Explain a failed per-device TFT authority check without exposing values.
+    fn tft_datapath_unavailable_reason(
+        &self,
+        ifindex: u32,
+    ) -> Option<crate::TftUplinkClassificationUnavailableReason> {
+        (!self.tft_datapath_usable(ifindex))
+            .then_some(crate::TftUplinkClassificationUnavailableReason::DatapathNotCurrent)
+    }
 
     /// Probe the environment for eBPF datapath readiness.
     fn probe_environment(&self) -> EbpfEnvironment;
@@ -5197,6 +5225,11 @@ impl EbpfGtpuDataplaneBackend {
             return Err(GtpuError::StateIndeterminate {
                 operation: "ebpf_tft_stage",
             });
+        }
+        if !old_inactive.is_empty() {
+            // A reader may still hold this bank's selector from before the
+            // previous publication. Keep both banks intact until it exits.
+            self.inner.runtime.synchronize_tft_readers()?;
         }
         for (key, _) in &old_inactive {
             self.inner.runtime.tft_filter_remove(ifindex, *key)?;
@@ -14886,39 +14919,48 @@ impl GtpuDataplaneBackend for EbpfGtpuDataplaneBackend {
     }
 
     fn tft_uplink_classification_capability(&self) -> GtpuCapability {
+        self.tft_uplink_classification_unavailable_reason()
+            .map_or(GtpuCapability::Available, |reason| reason.capability())
+    }
+
+    fn tft_uplink_classification_unavailable_reason(
+        &self,
+    ) -> Option<crate::TftUplinkClassificationUnavailableReason> {
+        use crate::TftUplinkClassificationUnavailableReason as Reason;
         let environment = self.inner.runtime.probe_environment();
         if !environment.platform_supported || !environment.bpffs_present || !environment.btf_present
         {
-            return GtpuCapability::Missing;
+            return Some(Reason::EnvironmentUnavailable);
         }
         if !environment.net_admin_capable || !environment.bpf_capable {
-            return GtpuCapability::PermissionDenied;
+            return Some(Reason::PermissionDenied);
         }
         // Exact removal waits for in-flight TC readers before deleting any
         // row; without that grace an installed classifier could not be
         // removed, so classification is not offered.
         if !self.inner.runtime.tft_reader_grace_available() {
-            return GtpuCapability::Missing;
+            return Some(Reason::ReaderGraceUnavailable);
         }
         let devices = match self.devices() {
             Ok(devices) if !devices.is_empty() => devices
                 .iter()
                 .map(|(ifindex, device)| (*ifindex, device.cleanup_only, device.successor_pending))
                 .collect::<Vec<_>>(),
-            Ok(_) | Err(_) => return GtpuCapability::Unknown,
+            Ok(_) => return Some(Reason::NoManagedDevice),
+            Err(_) => return Some(Reason::DeviceInventoryUnavailable),
         };
-        if devices
-            .iter()
-            .all(|(ifindex, cleanup_only, successor_pending)| {
-                !cleanup_only
-                    && !successor_pending
-                    && self.inner.runtime.tft_datapath_usable(*ifindex)
-            })
-        {
-            GtpuCapability::Available
-        } else {
-            GtpuCapability::Missing
+        for (ifindex, cleanup_only, successor_pending) in devices {
+            if cleanup_only {
+                return Some(Reason::CleanupOnly);
+            }
+            if successor_pending {
+                return Some(Reason::SuccessorPending);
+            }
+            if let Some(reason) = self.inner.runtime.tft_datapath_unavailable_reason(ifindex) {
+                return Some(reason);
+            }
         }
+        None
     }
 
     fn validate_tft_uplink_classifier(
@@ -17638,6 +17680,9 @@ mod aya_runtime {
         // final readback compare the exact loaded graph, rather than only its
         // selector marker path.
         devices: Arc<Mutex<HashMap<u32, LoadedDevice>>>,
+        // Private, unpinned maps; never part of a packet program's map graph.
+        // Failed initialization is not cached, so a later probe can recover.
+        tft_map_reader_grace: Mutex<Option<sys::BpfMapReaderGrace>>,
     }
 
     struct ReconcilerOwnership {
@@ -39334,6 +39379,97 @@ mod aya_runtime {
             })
     }
 
+    fn tft_map_reader_grace_kernel_profile(release: &[u8], version: &[u8]) -> bool {
+        if !grouped_reader_grace_kernel_profile(version) {
+            return false;
+        }
+        let Ok(release) = std::str::from_utf8(release) else {
+            return false;
+        };
+        if release.bytes().any(|byte| byte.is_ascii_whitespace()) {
+            return false;
+        }
+        let (numbers, suffix) = release.split_once('-').unwrap_or((release, ""));
+        let mut fields = numbers.split('.');
+        let (Some(major), Some(minor), Some(patch)) = (fields.next(), fields.next(), fields.next())
+        else {
+            return false;
+        };
+        let decimal =
+            |value: &str| !value.is_empty() && value.bytes().all(|byte| byte.is_ascii_digit());
+        if fields.next().is_some() || ![major, minor, patch].into_iter().all(decimal) {
+            return false;
+        }
+        let (Ok(major), Ok(minor), Ok(_patch)) = (
+            major.parse::<u32>(),
+            minor.parse::<u32>(),
+            patch.parse::<u32>(),
+        ) else {
+            return false;
+        };
+        // Bound this fallback to reviewed release families. A successful map
+        // syscall alone cannot attest an unknown kernel's RCU implementation.
+        // Object loadability remains an independent per-device prerequisite.
+        match (major, minor) {
+            (6, 8..=19) | (7, 0..=2) => !suffix.starts_with("rc"),
+            (5, 14) if patch == "0" => suffix
+                .strip_prefix("427.")
+                .and_then(|suffix| suffix.split_once(".el9_4"))
+                .is_some_and(|(build, architecture)| {
+                    build.split('.').all(decimal)
+                        && architecture.starts_with('.')
+                        && architecture.len() > 1
+                }),
+            _ => false,
+        }
+    }
+
+    #[test]
+    fn tft_map_reader_grace_accepts_only_reviewed_non_realtime_profiles() {
+        let version = b"#1 SMP PREEMPT_DYNAMIC Wed Sep 9 00:00:00 UTC 2026";
+        for release in [
+            "5.14.0-427.13.1.el9_4.x86_64",
+            "6.8.0-134-generic",
+            "6.12.0",
+            "6.18.1",
+            "6.19.0",
+            "7.1.8-200.fc44.x86_64",
+            "7.2.0",
+        ] {
+            assert!(
+                tft_map_reader_grace_kernel_profile(release.as_bytes(), version),
+                "{release}"
+            );
+        }
+        for release in [
+            "5.14.0",
+            "5.14.0-427.el9.x86_64",
+            "5.14.0-570.1.el9_6.x86_64",
+            "6.7.12",
+            "6.8.0-rc1",
+            "7.3.0",
+            "8.0.0",
+            "6.8",
+            "unknown",
+            "",
+        ] {
+            assert!(
+                !tft_map_reader_grace_kernel_profile(release.as_bytes(), version),
+                "{release}"
+            );
+        }
+        for version in [
+            "#1 SMP PREEMPT_RT Wed Sep 9 00:00:00 UTC 2026",
+            "#1 SMP PREEMPT_UNKNOWN Wed Sep 9 00:00:00 UTC 2026",
+            "unknown",
+        ] {
+            assert!(!tft_map_reader_grace_kernel_profile(
+                b"7.2.0",
+                version.as_bytes()
+            ));
+        }
+    }
+
     #[test]
     fn grouped_reader_grace_refuses_realtime_and_unknown_kernel_profiles() {
         for version in [
@@ -39372,6 +39508,41 @@ mod aya_runtime {
     }
 
     impl AyaGtpuRuntime {
+        fn tft_reader_grace_method(&self) -> Option<super::TftReaderGraceMethod> {
+            use rustix::thread::{membarrier_query, MembarrierQuery};
+            let kernel = rustix::system::uname();
+            if !grouped_reader_grace_kernel_profile(kernel.version().to_bytes()) {
+                return None;
+            }
+            super::select_tft_reader_grace(
+                membarrier_query().contains(MembarrierQuery::GLOBAL),
+                || {
+                    tft_map_reader_grace_kernel_profile(
+                        kernel.release().to_bytes(),
+                        kernel.version().to_bytes(),
+                    ) && self.prepare_tft_map_reader_grace().is_ok()
+                },
+            )
+        }
+
+        fn prepare_tft_map_reader_grace(&self) -> Result<(), GtpuError> {
+            let mut grace = self
+                .tft_map_reader_grace
+                .lock()
+                .map_err(|_| state_indeterminate("ebpf_tft_map_grace"))?;
+            if grace.is_none() {
+                let candidate = sys::BpfMapReaderGrace::new()
+                    .map_err(|_| state_indeterminate("ebpf_tft_map_grace"))?;
+                // Creation is not capability evidence. Require a successful
+                // userspace UPDATE before admitting the first TFT mutation.
+                candidate
+                    .synchronize()
+                    .map_err(|_| state_indeterminate("ebpf_tft_map_grace"))?;
+                *grace = Some(candidate);
+            }
+            Ok(())
+        }
+
         fn detach_managed_device(
             &self,
             interface: &str,
@@ -39523,15 +39694,24 @@ mod aya_runtime {
         }
 
         fn synchronize_tft_readers(&self) -> Result<(), GtpuError> {
-            // TFT classifier readers are non-sleepable TC read-side sections,
-            // so the same qualified GLOBAL grace covers them.
-            self.synchronize_grouped_readers()
+            match self.tft_reader_grace_method() {
+                Some(super::TftReaderGraceMethod::Global) => self.synchronize_grouped_readers(),
+                Some(super::TftReaderGraceMethod::MapInMap) => self
+                    .tft_map_reader_grace
+                    .lock()
+                    .map_err(|_| state_indeterminate("ebpf_tft_map_grace"))?
+                    .as_ref()
+                    .ok_or_else(|| state_indeterminate("ebpf_tft_map_grace"))?
+                    .synchronize()
+                    .map_err(|_| state_indeterminate("ebpf_tft_map_grace")),
+                None => Err(GtpuError::UnsupportedFeature {
+                    feature: "tft_classifier_reader_grace",
+                }),
+            }
         }
 
         fn tft_reader_grace_available(&self) -> bool {
-            use rustix::thread::{membarrier_query, MembarrierQuery};
-            grouped_reader_grace_kernel_profile(rustix::system::uname().version().to_bytes())
-                && membarrier_query().contains(MembarrierQuery::GLOBAL)
+            self.tft_reader_grace_method().is_some()
         }
 
         fn reset_workload_graph(
@@ -46667,16 +46847,35 @@ mod aya_runtime {
         }
 
         fn tft_datapath_usable(&self, ifindex: u32) -> bool {
-            let devices = self
-                .devices
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
-            devices.get(&ifindex).is_some_and(|device| {
-                !device.successor_pending
-                    && Self::loaded_datapath_is_current(ifindex, device)
-                    && Self::tft_schema_slot(&device.ebpf)
-                        .is_ok_and(|marker| tft_classifier_schema_is_current(&marker))
-            })
+            self.tft_datapath_unavailable_reason(ifindex).is_none()
+        }
+
+        fn tft_datapath_unavailable_reason(
+            &self,
+            ifindex: u32,
+        ) -> Option<crate::TftUplinkClassificationUnavailableReason> {
+            use crate::TftUplinkClassificationUnavailableReason as Reason;
+            let Ok(devices) = self.devices.lock() else {
+                return Some(Reason::DatapathNotCurrent);
+            };
+            let Some(device) = devices.get(&ifindex) else {
+                return Some(Reason::DatapathNotCurrent);
+            };
+            if device.cleanup_only {
+                return Some(Reason::CleanupOnly);
+            }
+            if device.successor_pending {
+                return Some(Reason::SuccessorPending);
+            }
+            if !Self::loaded_datapath_is_current(ifindex, device) {
+                return Some(Reason::DatapathNotCurrent);
+            }
+            if !Self::tft_schema_slot(&device.ebpf)
+                .is_ok_and(|marker| tft_classifier_schema_is_current(&marker))
+            {
+                return Some(Reason::SchemaNotCurrent);
+            }
+            None
         }
 
         fn pdr_get(
@@ -55184,6 +55383,7 @@ mod tests {
         grouped_reader_grace_calls: usize,
         grouped_reader_grace_fault: bool,
         tft_reader_grace_unavailable: bool,
+        tft_map_reader_grace_available: bool,
         grouped_reader_grace_corrupt_group: Option<[u8; 16]>,
         grouped_reader_grace_replace_path: bool,
         attached: HashMap<u32, FakeAttachment>,
@@ -57802,16 +58002,28 @@ mod tests {
         fn synchronize_tft_readers(&self) -> Result<(), GtpuError> {
             let mut state = self.state();
             state.operations.push("tft_reader_grace");
-            if state.tft_reader_grace_unavailable {
-                return Err(GtpuError::UnsupportedFeature {
-                    feature: "tft_classifier_reader_grace",
-                });
+            match select_tft_reader_grace(!state.tft_reader_grace_unavailable, || {
+                state.tft_map_reader_grace_available
+            }) {
+                Some(TftReaderGraceMethod::Global) => {}
+                Some(TftReaderGraceMethod::MapInMap) => {
+                    state.operations.push("tft_map_reader_grace");
+                }
+                None => {
+                    return Err(GtpuError::UnsupportedFeature {
+                        feature: "tft_classifier_reader_grace",
+                    });
+                }
             }
             Self::fail_if_requested(&mut state, "tft_reader_grace")
         }
 
         fn tft_reader_grace_available(&self) -> bool {
-            !self.state().tft_reader_grace_unavailable
+            let state = self.state();
+            select_tft_reader_grace(!state.tft_reader_grace_unavailable, || {
+                state.tft_map_reader_grace_available
+            })
+            .is_some()
         }
 
         fn ifindex_by_name(&self, name: &str) -> Result<u32, GtpuError> {
@@ -63310,6 +63522,33 @@ mod tests {
             Self::tft_datapath_is_exact(&self.state(), ifindex)
         }
 
+        fn tft_datapath_unavailable_reason(
+            &self,
+            ifindex: u32,
+        ) -> Option<crate::TftUplinkClassificationUnavailableReason> {
+            use crate::TftUplinkClassificationUnavailableReason as Reason;
+            let state = self.state();
+            if state.cleanup_only.contains(&ifindex) {
+                Some(Reason::CleanupOnly)
+            } else if state.successor_pending.contains(&ifindex) {
+                Some(Reason::SuccessorPending)
+            } else if state.attached.contains_key(&ifindex)
+                && state.uplink_filter_ready.contains(&ifindex)
+                && state.downlink_filter_ready.contains(&ifindex)
+                && Self::tft_identity_is_exact(&state, ifindex)
+                && !state
+                    .tft_schema
+                    .get(&ifindex)
+                    .is_some_and(tft_classifier_schema_is_current)
+            {
+                Some(Reason::SchemaNotCurrent)
+            } else if !Self::tft_datapath_is_exact(&state, ifindex) {
+                Some(Reason::DatapathNotCurrent)
+            } else {
+                None
+            }
+        }
+
         fn probe_environment(&self) -> EbpfEnvironment {
             self.environment
         }
@@ -65624,6 +65863,300 @@ mod tests {
                 .unwrap(),
             TftUplinkClassifierReadback::Absent
         );
+    }
+
+    #[test]
+    fn tft_classification_reasons_distinguish_environment_and_permissions() {
+        use crate::TftUplinkClassificationUnavailableReason as Reason;
+        for (fault, expected) in [
+            ("platform", Reason::EnvironmentUnavailable),
+            ("bpffs", Reason::EnvironmentUnavailable),
+            ("btf", Reason::EnvironmentUnavailable),
+            ("net_admin", Reason::PermissionDenied),
+            ("bpf", Reason::PermissionDenied),
+        ] {
+            let mut runtime = FakeRuntime::new();
+            match fault {
+                "platform" => runtime.environment.platform_supported = false,
+                "bpffs" => runtime.environment.bpffs_present = false,
+                "btf" => runtime.environment.btf_present = false,
+                "net_admin" => runtime.environment.net_admin_capable = false,
+                "bpf" => runtime.environment.bpf_capable = false,
+                _ => unreachable!(),
+            }
+            let backend = EbpfGtpuDataplaneBackend::with_runtime(Arc::new(runtime));
+            assert_eq!(
+                backend.tft_uplink_classification_unavailable_reason(),
+                Some(expected),
+                "{fault}"
+            );
+            assert_eq!(
+                backend.tft_uplink_classification_capability(),
+                expected.capability(),
+                "{fault}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn tft_classification_reasons_distinguish_managed_device_state() {
+        use crate::TftUplinkClassificationUnavailableReason as Reason;
+        for (fault, expected) in [
+            ("no_device", Reason::NoManagedDevice),
+            ("grace", Reason::ReaderGraceUnavailable),
+            ("cleanup", Reason::CleanupOnly),
+            ("successor", Reason::SuccessorPending),
+            ("hook", Reason::DatapathNotCurrent),
+            ("schema", Reason::SchemaNotCurrent),
+        ] {
+            let (backend, runtime) = backend_with_fake();
+            if fault != "no_device" {
+                backend.create_device(create_request()).await.unwrap();
+                assert_eq!(backend.tft_uplink_classification_unavailable_reason(), None);
+            }
+            match fault {
+                "grace" => runtime.state().tft_reader_grace_unavailable = true,
+                "cleanup" => {
+                    backend
+                        .devices()
+                        .unwrap()
+                        .get_mut(&S2BU_IFINDEX)
+                        .unwrap()
+                        .cleanup_only = true
+                }
+                "successor" => {
+                    backend
+                        .devices()
+                        .unwrap()
+                        .get_mut(&S2BU_IFINDEX)
+                        .unwrap()
+                        .successor_pending = true
+                }
+                "hook" => {
+                    runtime.state().uplink_filter_ready.remove(&S2BU_IFINDEX);
+                }
+                "schema" => {
+                    runtime
+                        .state()
+                        .tft_schema
+                        .insert(S2BU_IFINDEX, [0; TFT_CLASSIFIER_SCHEMA_VALUE_LEN]);
+                }
+                "no_device" => {}
+                _ => unreachable!(),
+            }
+            assert_eq!(
+                backend.tft_uplink_classification_unavailable_reason(),
+                Some(expected),
+                "{fault}"
+            );
+            assert_eq!(
+                backend.tft_uplink_classification_capability(),
+                expected.capability(),
+                "{fault}"
+            );
+        }
+    }
+
+    #[test]
+    fn tft_reader_grace_prefers_global_without_probing_map() {
+        assert_eq!(
+            select_tft_reader_grace(true, || panic!("GLOBAL does not require a BPF map")),
+            Some(TftReaderGraceMethod::Global)
+        );
+        assert_eq!(select_tft_reader_grace(false, || false), None);
+    }
+
+    #[test]
+    fn tft_reader_grace_selects_map_when_global_is_unavailable() {
+        assert_eq!(
+            select_tft_reader_grace(false, || true),
+            Some(TftReaderGraceMethod::MapInMap)
+        );
+    }
+
+    /// nohz_full removes GLOBAL from QUERY. An available independent map
+    /// grace must still permit exact install and removal, with the actual
+    /// selected grace completed between the tombstone and row deletion.
+    #[tokio::test]
+    async fn tft_classifier_nohz_uses_map_grace_before_removal() {
+        let (backend, runtime) = backend_with_fake();
+        backend.create_device(create_request()).await.unwrap();
+        {
+            let mut state = runtime.state();
+            state.tft_reader_grace_unavailable = true;
+            state.tft_map_reader_grace_available = true;
+        }
+        assert_eq!(
+            backend.tft_uplink_classification_capability(),
+            GtpuCapability::Available
+        );
+        let classifier = tft_classifier_with_two_filters();
+        assert_eq!(
+            backend
+                .reconcile_tft_uplink_classifier(classifier.clone())
+                .await
+                .unwrap(),
+            TftUplinkClassifierReconcileOutcome::Installed
+        );
+        runtime.state().operations.clear();
+        assert_eq!(
+            backend
+                .remove_tft_uplink_classifier_exact(classifier.clone())
+                .await
+                .unwrap(),
+            TftUplinkClassifierRemovalOutcome::Removed
+        );
+        let operations = runtime.state().operations.clone();
+        let position = |operation| {
+            operations
+                .iter()
+                .position(|recorded| *recorded == operation)
+                .expect("removal must exercise this operation")
+        };
+        assert!(position("tft_meta_put") < position("tft_map_reader_grace"));
+        assert!(position("tft_map_reader_grace") < position("tft_filter_remove"));
+        assert_eq!(
+            backend
+                .read_tft_uplink_classifier(classifier.link_ifindex(), classifier.paa())
+                .await
+                .unwrap(),
+            TftUplinkClassifierReadback::Absent
+        );
+    }
+
+    #[tokio::test]
+    async fn tft_classifier_map_grace_failure_preserves_fence_and_rows_for_retry() {
+        let (backend, runtime) = backend_with_fake();
+        backend.create_device(create_request()).await.unwrap();
+        {
+            let mut state = runtime.state();
+            state.tft_reader_grace_unavailable = true;
+            state.tft_map_reader_grace_available = true;
+        }
+        let classifier = tft_classifier_with_two_filters();
+        backend
+            .reconcile_tft_uplink_classifier(classifier.clone())
+            .await
+            .unwrap();
+        let rows = runtime.state().tft_filters.clone();
+        runtime.state().operations.clear();
+        runtime.fail_in_order(["tft_reader_grace"]);
+        assert_eq!(
+            backend
+                .remove_tft_uplink_classifier_exact(classifier.clone())
+                .await
+                .unwrap(),
+            TftUplinkClassifierRemovalOutcome::Indeterminate
+        );
+        {
+            let state = runtime.state();
+            assert_eq!(state.tft_filters, rows);
+            assert!(state.operations.contains(&"tft_meta_put"));
+            assert!(!state.operations.contains(&"tft_filter_remove"));
+            assert!(!state.operations.contains(&"tft_meta_remove"));
+        }
+        runtime.state().operations.clear();
+        assert_eq!(
+            backend
+                .remove_tft_uplink_classifier_exact(classifier)
+                .await
+                .unwrap(),
+            TftUplinkClassifierRemovalOutcome::Removed
+        );
+        let operations = runtime.state().operations.clone();
+        let grace = operations
+            .iter()
+            .position(|op| *op == "tft_map_reader_grace")
+            .unwrap();
+        let delete = operations
+            .iter()
+            .position(|op| *op == "tft_filter_remove")
+            .unwrap();
+        assert!(grace < delete);
+    }
+
+    /// A reader can retain bank zero across the first replacement. Before
+    /// reusing that bank, the next replacement must wait before deleting or
+    /// overwriting any of its rows.
+    #[tokio::test]
+    async fn tft_classifier_bank_reuse_waits_before_any_row_mutation() {
+        let (backend, runtime) = backend_with_fake();
+        backend.create_device(create_request()).await.unwrap();
+        assert_eq!(
+            backend
+                .reconcile_tft_uplink_classifier(tft_classifier(0x41, 7, 6))
+                .await
+                .unwrap(),
+            TftUplinkClassifierReconcileOutcome::Installed
+        );
+        assert_eq!(
+            backend
+                .reconcile_tft_uplink_classifier(tft_classifier(0x42, 8, 17))
+                .await
+                .unwrap(),
+            TftUplinkClassifierReconcileOutcome::Replaced
+        );
+        runtime.state().operations.clear();
+        let replacement = tft_classifier(0x43, 9, 6);
+        assert_eq!(
+            backend
+                .reconcile_tft_uplink_classifier(replacement.clone())
+                .await
+                .unwrap(),
+            TftUplinkClassifierReconcileOutcome::Replaced
+        );
+        let operations = runtime.state().operations.clone();
+        let grace = operations
+            .iter()
+            .position(|operation| *operation == "tft_reader_grace")
+            .expect("bank reuse must complete a reader grace");
+        for mutation in ["tft_filter_remove", "tft_filter_put", "tft_meta_put"] {
+            let position = operations
+                .iter()
+                .position(|operation| *operation == mutation)
+                .expect("replacement must exercise this mutation");
+            assert!(grace < position, "reader grace must precede {mutation}");
+        }
+        assert_eq!(
+            backend
+                .read_tft_uplink_classifier(replacement.link_ifindex(), replacement.paa())
+                .await
+                .unwrap(),
+            TftUplinkClassifierReadback::Present(replacement)
+        );
+    }
+
+    /// A failed bank-reuse grace must preserve both banks and the active
+    /// selector, allowing an exact retry without a partial replacement.
+    #[tokio::test]
+    async fn tft_classifier_bank_reuse_grace_failure_preserves_both_banks() {
+        let (backend, runtime) = backend_with_fake();
+        backend.create_device(create_request()).await.unwrap();
+        for classifier in [tft_classifier(0x41, 7, 6), tft_classifier(0x42, 8, 17)] {
+            backend
+                .reconcile_tft_uplink_classifier(classifier)
+                .await
+                .unwrap();
+        }
+        let (meta, rows) = {
+            let mut state = runtime.state();
+            state.operations.clear();
+            (state.tft_meta.clone(), state.tft_filters.clone())
+        };
+        runtime.fail_in_order(["tft_reader_grace"]);
+        assert_eq!(
+            backend
+                .reconcile_tft_uplink_classifier(tft_classifier(0x43, 9, 6))
+                .await
+                .unwrap(),
+            TftUplinkClassifierReconcileOutcome::Indeterminate
+        );
+        let state = runtime.state();
+        assert_eq!(state.tft_meta, meta);
+        assert_eq!(state.tft_filters, rows);
+        for mutation in ["tft_filter_remove", "tft_filter_put", "tft_meta_put"] {
+            assert!(!state.operations.contains(&mutation));
+        }
     }
 
     /// Without the reader grace a removal fence could never be finished, so
