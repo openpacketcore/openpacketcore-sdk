@@ -611,6 +611,13 @@ impl LinuxXfrmBackend {
         }
     }
 
+    #[cfg(any(test, feature = "test-support"))]
+    pub(crate) fn test_namespace_actor_lifetime(
+        &self,
+    ) -> Option<test_support::MockNamespaceActorLifetime> {
+        self.inner.transport.test_namespace_actor_lifetime()
+    }
+
     pub(crate) fn prepare_namespace_actor(&self) -> Result<(), XfrmError> {
         self.ensure_namespace_binding()?;
         if !self.inner.dscp_activation_deferred {
@@ -1527,6 +1534,11 @@ impl XfrmBackend for LinuxXfrmBackend {
 }
 
 pub(crate) trait LinuxXfrmTransport: Send + Sync + fmt::Debug {
+    #[cfg(any(test, feature = "test-support"))]
+    fn test_namespace_actor_lifetime(&self) -> Option<test_support::MockNamespaceActorLifetime> {
+        None
+    }
+
     fn transact(
         &self,
         operation: &'static str,

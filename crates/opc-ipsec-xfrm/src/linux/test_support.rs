@@ -70,7 +70,7 @@ impl MockLinuxXfrmKernel {
     /// or durable-store behavior.
     #[must_use]
     pub fn backend(&self) -> LinuxXfrmBackend {
-        self.shared.active_backends.fetch_add(1, Ordering::AcqRel);
+        self.shared.active_lifetimes.fetch_add(1, Ordering::AcqRel);
         LinuxXfrmBackend::with_transport(MockKernelTransport {
             shared: Arc::clone(&self.shared),
         })
@@ -95,19 +95,21 @@ impl MockLinuxXfrmKernel {
         Ok(())
     }
 
-    /// Wait until every backend created by this fixture has released transport.
+    /// Wait until every backend and namespace actor created by this fixture exits.
     ///
-    /// This also observes namespace actors releasing their final backend after
-    /// their command channel drains. Callers must drop their own backend handles
-    /// first and keep a test-level timeout around this wait.
+    /// The actor barrier covers its drained commands, retained runtime tasks and
+    /// durable-store lease handles, even when transport drops earlier. Callers
+    /// must first drop all their backend and recovery-store handles, avoid
+    /// concurrently creating backends, and keep a test-level timeout around this
+    /// wait. Store handles retained by the caller still own their leases.
     pub async fn wait_for_idle(&self) {
         loop {
             let notified = self.shared.idle.notified();
             tokio::pin!(notified);
-            // Register before testing the predicate so final transport release
+            // Register before testing the predicate so final lifetime release
             // cannot be lost between the count observation and the await.
             notified.as_mut().enable();
-            if self.shared.active_backends.load(Ordering::Acquire) == 0 {
+            if self.shared.active_lifetimes.load(Ordering::Acquire) == 0 {
                 return;
             }
             notified.await;
@@ -118,8 +120,36 @@ impl MockLinuxXfrmKernel {
 #[derive(Default)]
 struct MockKernelShared {
     kernel: Mutex<MockKernelState>,
-    active_backends: AtomicUsize,
+    active_lifetimes: AtomicUsize,
     idle: Notify,
+    #[cfg(test)]
+    transport_release_pause: Mutex<Option<TransportReleasePause>>,
+}
+
+impl MockKernelShared {
+    fn release_lifetime(&self) {
+        if self.active_lifetimes.fetch_sub(1, Ordering::AcqRel) == 1 {
+            self.idle.notify_waiters();
+        }
+    }
+}
+
+// Held by the namespace thread outside run_actor so its release follows the
+// actor's state, runtime and admitted-task teardown, including unwinding.
+pub(crate) struct MockNamespaceActorLifetime {
+    shared: Arc<MockKernelShared>,
+}
+
+impl Drop for MockNamespaceActorLifetime {
+    fn drop(&mut self) {
+        self.shared.release_lifetime();
+    }
+}
+
+#[cfg(test)]
+struct TransportReleasePause {
+    entered: tokio::sync::oneshot::Sender<()>,
+    release: std::sync::mpsc::Receiver<()>,
 }
 
 #[derive(Default)]
@@ -145,8 +175,19 @@ struct MockKernelTransport {
 
 impl Drop for MockKernelTransport {
     fn drop(&mut self) {
-        if self.shared.active_backends.fetch_sub(1, Ordering::AcqRel) == 1 {
-            self.shared.idle.notify_waiters();
+        self.shared.release_lifetime();
+        #[cfg(test)]
+        {
+            let pause = self
+                .shared
+                .transport_release_pause
+                .lock()
+                .ok()
+                .and_then(|mut pause| pause.take());
+            if let Some(pause) = pause {
+                let _ = pause.entered.send(());
+                let _ = pause.release.recv();
+            }
         }
     }
 }
@@ -296,6 +337,13 @@ impl MockKernelState {
 }
 
 impl LinuxXfrmTransport for MockKernelTransport {
+    fn test_namespace_actor_lifetime(&self) -> Option<MockNamespaceActorLifetime> {
+        self.shared.active_lifetimes.fetch_add(1, Ordering::AcqRel);
+        Some(MockNamespaceActorLifetime {
+            shared: Arc::clone(&self.shared),
+        })
+    }
+
     fn transact(
         &self,
         operation: &'static str,
@@ -352,5 +400,136 @@ impl LinuxXfrmTransport for MockKernelTransport {
             egress_dscp_marking: XfrmCapability::Missing,
             details: Some("deterministic Linux XFRM kernel fixture"),
         }
+    }
+}
+
+#[cfg(all(test, target_os = "linux"))]
+mod tests {
+    use std::future::Future;
+    use std::path::PathBuf;
+    use std::task::{Context, Waker};
+    use std::time::Duration;
+
+    use super::{MockLinuxXfrmKernel, TransportReleasePause};
+    use crate::{
+        XfrmObjectInstallDurableError, XfrmObjectRecoveryBindError, XfrmObjectRecoveryProofKey,
+        XfrmObjectRosterDurableError, XfrmObjectRosterGroupId, XfrmObjectRosterRecoveryProofKey,
+        XfrmSaRelocationDurableError, XfrmSaRelocationRecoveryProofKey,
+    };
+
+    struct TestRoot(PathBuf);
+
+    impl TestRoot {
+        fn new() -> Self {
+            let suffix = XfrmObjectRosterGroupId::generate()
+                .unwrap()
+                .to_bytes()
+                .iter()
+                .map(|byte| format!("{byte:02x}"))
+                .collect::<String>();
+            let root = std::env::temp_dir().join(format!("opc-xfrm-actor-idle-{suffix}"));
+            std::fs::create_dir(&root).unwrap();
+            Self(root)
+        }
+    }
+
+    impl Drop for TestRoot {
+        fn drop(&mut self) {
+            std::fs::remove_dir_all(&self.0).unwrap();
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn idle_wait_remains_pending_until_actor_releases_every_store_lease() {
+        let root = TestRoot::new();
+        let object_path = root.0.join("object");
+        let relocation_path = root.0.join("relocation");
+        let roster_path = root.0.join("roster");
+        let kernel = MockLinuxXfrmKernel::new();
+        let (backend, object_store, relocation_store, roster_store) = kernel
+            .backend()
+            .bind_current_network_namespace_with_object_sa_relocation_and_roster_recovery(
+                object_path.clone(),
+                XfrmObjectRecoveryProofKey::new([0x31; 32]).unwrap(),
+                relocation_path.clone(),
+                XfrmSaRelocationRecoveryProofKey::new([0x32; 32]).unwrap(),
+                roster_path.clone(),
+                XfrmObjectRosterRecoveryProofKey::new([0x33; 32]).unwrap(),
+            )
+            .unwrap();
+        // Hold the exact gap: transport release has been published, while the
+        // actor's state still owns all three durable-store leases. Dropping the
+        // sender also releases this pause if any assertion unwinds the test.
+        let (entered_sender, entered_receiver) = tokio::sync::oneshot::channel();
+        let (release_sender, release_receiver) = std::sync::mpsc::channel();
+        *kernel.shared.transport_release_pause.lock().unwrap() = Some(TransportReleasePause {
+            entered: entered_sender,
+            release: release_receiver,
+        });
+        drop((object_store, relocation_store, roster_store));
+        drop(backend);
+        tokio::time::timeout(Duration::from_secs(5), entered_receiver)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(matches!(
+            MockLinuxXfrmKernel::new()
+                .backend()
+                .bind_current_network_namespace_with_object_recovery(
+                    object_path.clone(),
+                    XfrmObjectRecoveryProofKey::new([0x31; 32]).unwrap(),
+                ),
+            Err(XfrmObjectRecoveryBindError::Store {
+                source: XfrmObjectInstallDurableError::StoreBusy
+            })
+        ));
+        assert!(matches!(
+            MockLinuxXfrmKernel::new()
+                .backend()
+                .bind_current_network_namespace_with_sa_relocation_recovery(
+                    relocation_path.clone(),
+                    XfrmSaRelocationRecoveryProofKey::new([0x32; 32]).unwrap(),
+                ),
+            Err(XfrmObjectRecoveryBindError::SaRelocationStore {
+                source: XfrmSaRelocationDurableError::StoreBusy
+            })
+        ));
+        assert!(matches!(
+            MockLinuxXfrmKernel::new()
+                .backend()
+                .bind_current_network_namespace_with_object_roster_recovery(
+                    roster_path.clone(),
+                    XfrmObjectRosterRecoveryProofKey::new([0x33; 32]).unwrap(),
+                ),
+            Err(XfrmObjectRecoveryBindError::RosterStore {
+                source: XfrmObjectRosterDurableError::StoreBusy
+            })
+        ));
+        let mut wait = Box::pin(kernel.wait_for_idle());
+        let mut context = Context::from_waker(Waker::noop());
+        assert!(
+            wait.as_mut().poll(&mut context).is_pending(),
+            "transport release must not publish idle while actor leases remain held"
+        );
+        drop(release_sender);
+        tokio::time::timeout(Duration::from_secs(5), wait)
+            .await
+            .unwrap();
+
+        let successor = kernel
+            .backend()
+            .bind_current_network_namespace_with_object_sa_relocation_and_roster_recovery(
+                object_path,
+                XfrmObjectRecoveryProofKey::new([0x31; 32]).unwrap(),
+                relocation_path,
+                XfrmSaRelocationRecoveryProofKey::new([0x32; 32]).unwrap(),
+                roster_path,
+                XfrmObjectRosterRecoveryProofKey::new([0x33; 32]).unwrap(),
+            )
+            .unwrap();
+        drop(successor);
+        tokio::time::timeout(Duration::from_secs(5), kernel.wait_for_idle())
+            .await
+            .unwrap();
     }
 }
