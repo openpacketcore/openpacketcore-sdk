@@ -1,6 +1,6 @@
 //! Authenticated ESP peer outer-source observations for NAT rebinding.
 //!
-//! A [`LinuxEspPeerObservationMonitor`] turns kernel-attributed ESP decap
+//! A `LinuxEspPeerObservationMonitor` turns kernel-attributed ESP decap
 //! events into bounded, typed observations: an established inbound ESP-in-UDP
 //! SA that starts arriving from a new outer source produces one
 //! [`EspPeerObservation`] retaining only the routing facts needed for policy
@@ -98,13 +98,16 @@
 //! printed. The routing facts themselves remain available through typed
 //! fields for policy decisions; they are simply never formatted.
 
+#[cfg(any(target_os = "linux", test))]
 use std::collections::HashMap;
 #[cfg(test)]
 use std::collections::VecDeque;
 use std::fmt;
 use std::num::NonZeroU64;
+#[cfg(any(target_os = "linux", test))]
 use std::sync::atomic::{AtomicU64, Ordering};
 
+#[cfg(any(target_os = "linux", test))]
 use crate::error::XfrmError;
 use crate::model::{IpAddress, XfrmDirection, XfrmId, XfrmLookupMark};
 
@@ -130,9 +133,11 @@ pub const DEFAULT_ESP_PEER_OBSERVATION_CAPACITY: usize = 1024;
 /// exposing any filesystem or namespace identity. Events minted under a
 /// different scope are rejected, so observations cannot be cross-combined
 /// across namespaces or sources.
+#[cfg(any(target_os = "linux", test))]
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub struct EspPeerObservationScope(NonZeroU64);
 
+#[cfg(any(target_os = "linux", test))]
 impl EspPeerObservationScope {
     /// Mint a fresh process-unique scope for a crate-owned source factory.
     ///
@@ -158,6 +163,7 @@ impl EspPeerObservationScope {
     }
 }
 
+#[cfg(any(target_os = "linux", test))]
 impl fmt::Debug for EspPeerObservationScope {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("EspPeerObservationScope")
@@ -186,6 +192,7 @@ impl fmt::Debug for EspPeerObservationEpoch {
 ///
 /// This type is private so downstream callers cannot assert the trusted grade.
 /// A crate-owned source must construct every event.
+#[cfg(any(target_os = "linux", test))]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 enum EspPeerEventProvenance {
     /// An unauthenticated packet-path signal (raw socket, tc/XDP ingress copy,
@@ -236,6 +243,7 @@ impl EspPeerObservationKey {
 
     /// True when another key names the same kernel identity fields but a
     /// different direction.
+    #[cfg(any(target_os = "linux", test))]
     fn same_identity_other_direction(&self, other: &Self) -> bool {
         self.id == other.id
             && self.mark == other.mark
@@ -281,6 +289,7 @@ pub enum EspPeerAddressFamily {
 /// configured `if_id` must be nonzero (0 is equivalent to unbound). The
 /// boundary rejects the zero-forms instead of normalizing them so its identity
 /// can never become broader than the kernel SA.
+#[cfg(any(target_os = "linux", test))]
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub struct EspPeerObservationRegistration {
     /// Exact SA identity and direction, in canonical kernel form.
@@ -296,6 +305,7 @@ pub struct EspPeerObservationRegistration {
     pub integrity_protected: bool,
 }
 
+#[cfg(any(target_os = "linux", test))]
 impl fmt::Debug for EspPeerObservationRegistration {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("EspPeerObservationRegistration")
@@ -314,6 +324,7 @@ impl fmt::Debug for EspPeerObservationRegistration {
 /// monotonic event sequence for this SA stream; `dropped_since_previous`
 /// reports producer-side loss the source itself detected since the previous
 /// event for this SA (zero when none).
+#[cfg(any(target_os = "linux", test))]
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub struct EspPeerObservationEvent {
     /// Scope the event was observed in; must match the boundary scope.
@@ -347,6 +358,7 @@ pub struct EspPeerObservationEvent {
     dropped_since_previous: u64,
 }
 
+#[cfg(any(target_os = "linux", test))]
 impl fmt::Debug for EspPeerObservationEvent {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("EspPeerObservationEvent")
@@ -407,6 +419,7 @@ impl EspPeerObservationLoss {
 
     /// Combine the boundary overflow fact into this status without erasing a
     /// source-attributed loss.
+    #[cfg(any(target_os = "linux", test))]
     const fn with_overflow(self) -> Self {
         match self {
             Self::None => Self::OverflowClosed,
@@ -416,6 +429,7 @@ impl EspPeerObservationLoss {
     }
 
     /// Combine source-attributed loss without erasing an overflow fact.
+    #[cfg(any(target_os = "linux", test))]
     const fn with_source_attributed(self) -> Self {
         match self {
             Self::None => Self::SourceAttributed,
@@ -628,6 +642,7 @@ impl fmt::Display for EspPeerObservationRejection {
 }
 
 /// Outcome of presenting one event to the boundary.
+#[cfg(any(target_os = "linux", test))]
 #[non_exhaustive]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum EspPeerIngestOutcome {
@@ -676,6 +691,7 @@ impl EspPeerIngestTally {
         self.rejections_by_label[rejection_index(label)]
     }
 
+    #[cfg(any(target_os = "linux", test))]
     fn record(&mut self, outcome: EspPeerIngestOutcome) {
         self.events += 1;
         match outcome {
@@ -688,6 +704,7 @@ impl EspPeerIngestTally {
         }
     }
 
+    #[cfg(any(target_os = "linux", test))]
     fn record_source_rejection(&mut self, label: EspPeerObservationRejection) {
         self.rejected += 1;
         self.rejections_by_label[rejection_index(label)] += 1;
@@ -731,6 +748,7 @@ impl fmt::Display for EspPeerObservationSourceTerminal {
 ///
 /// Fields are private because only a crate-owned, admitted source may bind
 /// loss to an exact scope, SA, and registration epoch.
+#[cfg(any(target_os = "linux", test))]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct EspPeerObservationSourceLoss {
     scope: EspPeerObservationScope,
@@ -740,6 +758,7 @@ pub struct EspPeerObservationSourceLoss {
 }
 
 /// One pull result from a crate-owned observation source.
+#[cfg(any(target_os = "linux", test))]
 #[non_exhaustive]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum EspPeerObservationSourceRecord {
@@ -753,6 +772,7 @@ pub enum EspPeerObservationSourceRecord {
     Terminal(EspPeerObservationSourceTerminal),
 }
 
+#[cfg(any(target_os = "linux", test))]
 mod source_sealed {
     pub trait Sealed {}
 }
@@ -776,6 +796,7 @@ mod source_sealed {
 /// overflow-rejected candidates). See the module-level trust-anchor
 /// documentation for why stock `XFRM_MSG_MAPPING` does not meet this
 /// contract.
+#[cfg(any(target_os = "linux", test))]
 pub trait EspPeerObservationSource: source_sealed::Sealed {
     /// Pull the next source record.
     ///
@@ -834,6 +855,7 @@ impl EspPeerObservationSource for ScriptedEspPeerObservationSource {
 }
 
 /// Per-SA bounded observation slot.
+#[cfg(any(target_os = "linux", test))]
 struct ObservationSlot {
     epoch: EspPeerObservationEpoch,
     current_source: (IpAddress, u16),
@@ -847,6 +869,7 @@ struct ObservationSlot {
     overflow_closed: bool,
 }
 
+#[cfg(any(target_os = "linux", test))]
 impl ObservationSlot {
     fn new(epoch: EspPeerObservationEpoch, current_source: (IpAddress, u16)) -> Self {
         Self {
@@ -862,6 +885,7 @@ impl ObservationSlot {
     }
 }
 
+#[cfg(any(target_os = "linux", test))]
 impl fmt::Debug for ObservationSlot {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("ObservationSlot")
@@ -881,6 +905,7 @@ impl fmt::Debug for ObservationSlot {
 ///
 /// One boundary is pinned to one [`EspPeerObservationScope`]. See the module
 /// documentation for the trust anchor, acceptance rules, and bounds.
+#[cfg(any(target_os = "linux", test))]
 #[derive(Debug)]
 pub struct EspPeerObservationBoundary {
     scope: EspPeerObservationScope,
@@ -890,6 +915,7 @@ pub struct EspPeerObservationBoundary {
     closed: bool,
 }
 
+#[cfg(any(target_os = "linux", test))]
 impl EspPeerObservationBoundary {
     /// Create a boundary with the default registry capacity.
     #[cfg(test)]
@@ -1326,6 +1352,7 @@ impl EspPeerObservationBoundary {
     }
 }
 
+#[cfg(any(target_os = "linux", test))]
 fn note_source_loss(slot: &mut ObservationSlot) {
     if let Some(observation) = &mut slot.pending {
         observation.loss = observation.loss.with_source_attributed();
@@ -1334,6 +1361,7 @@ fn note_source_loss(slot: &mut ObservationSlot) {
     }
 }
 
+#[cfg(any(target_os = "linux", test))]
 const fn family_of(address: IpAddress) -> EspPeerAddressFamily {
     match address {
         IpAddress::Ipv4(_) => EspPeerAddressFamily::Ipv4,
@@ -1341,6 +1369,7 @@ const fn family_of(address: IpAddress) -> EspPeerAddressFamily {
     }
 }
 
+#[cfg(any(target_os = "linux", test))]
 const fn direction_order(direction: XfrmDirection) -> u8 {
     match direction {
         XfrmDirection::In => 0,
@@ -1353,8 +1382,10 @@ const fn direction_order(direction: XfrmDirection) -> u8 {
 /// identity fields sort by family, destination octets, SPI, protocol, mark,
 /// `if_id`, then direction; this ordering is an implementation detail and is
 /// not a stable API.
+#[cfg(any(target_os = "linux", test))]
 type ObservationKeyOrder = (u8, [u8; 16], u32, u8, (u32, u32), u32, u8);
 
+#[cfg(any(target_os = "linux", test))]
 fn observation_key_order(key: &EspPeerObservationKey) -> ObservationKeyOrder {
     let (family, octets) = match key.id.destination {
         IpAddress::Ipv4(v4) => {

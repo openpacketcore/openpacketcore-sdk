@@ -45,6 +45,7 @@ use crate::model::{
 #[cfg(unix)]
 use crate::namespace::XfrmObjectRecoveryBindError;
 use crate::namespace::{self, NamespaceBoundLinuxXfrmBackend, NetworkNamespaceBinding};
+#[cfg(any(target_os = "linux", test))]
 use crate::observation::{EspPeerObservationKey, EspPeerObservationRegistration};
 use crate::outbound_binding::{
     expected_policy, expected_sa, readback_mismatch, OutboundSaCryptoExpectation,
@@ -909,6 +910,7 @@ impl LinuxXfrmBackend {
         parse_sa_relocation_snapshot(&response)
     }
 
+    #[cfg(target_os = "linux")]
     pub(crate) async fn query_esp_peer_observation_registration(
         &self,
         requested: EspPeerObservationKey,
@@ -2766,6 +2768,7 @@ fn parse_sa_relocation_snapshot(payload: &[u8]) -> Result<SaRelocationSnapshot, 
     Ok(SaRelocationSnapshot { state, identity })
 }
 
+#[cfg(any(target_os = "linux", test))]
 fn parse_esp_peer_observation_registration(
     payload: &[u8],
     requested: EspPeerObservationKey,
@@ -2882,6 +2885,7 @@ fn parse_esp_peer_observation_registration(
 /// This is an identity comparison, not a claim about kernel selection. Two
 /// distinct canonical marks can still both be selected by one lookup value;
 /// see `XfrmLookupMark::is_exact_profile`.
+#[cfg(any(target_os = "linux", test))]
 fn observation_mark_selects(
     requested: Option<XfrmLookupMark>,
     observed: Option<XfrmLookupMark>,
@@ -2889,6 +2893,7 @@ fn observation_mark_selects(
     requested == observed
 }
 
+#[cfg(any(target_os = "linux", test))]
 fn validate_esp_peer_observation_crypto(payload: &[u8]) -> Result<(), XfrmError> {
     const OPERATION: &str = "query_esp_peer_observation_registration";
 
@@ -2952,6 +2957,7 @@ fn validate_esp_peer_observation_crypto(payload: &[u8]) -> Result<(), XfrmError>
     Ok(())
 }
 
+#[cfg(any(target_os = "linux", test))]
 fn validate_esp_peer_observation_replay(payload: &[u8]) -> Result<(), XfrmError> {
     const OPERATION: &str = "query_esp_peer_observation_registration";
 
@@ -2987,6 +2993,7 @@ fn validate_esp_peer_observation_replay(payload: &[u8]) -> Result<(), XfrmError>
     Ok(())
 }
 
+#[cfg(any(target_os = "linux", test))]
 const fn family_of_ip(address: IpAddress) -> u8 {
     match address {
         IpAddress::Ipv4(_) => 4,

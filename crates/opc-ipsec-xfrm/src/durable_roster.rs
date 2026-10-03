@@ -22,7 +22,7 @@
 //! [`crate::durable_object`] so both families pin the same bytes-on-the-wire
 //! definition of "the same request".
 
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", test))]
 use std::io::Write;
 #[cfg(target_os = "linux")]
 use std::io::{Seek, SeekFrom};

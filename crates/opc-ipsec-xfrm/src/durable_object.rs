@@ -3370,7 +3370,7 @@ mod tests {
         let pending = root
             .path()
             .join(".opc-xfrm-object-pending-0123456789abcdef0123456789abcdef");
-        mkfifoat(CWD, &pending, Mode::from_raw_mode(FILE_MODE)).unwrap();
+        mkfifoat(CWD, &pending, Mode::RUSR | Mode::WUSR).unwrap();
 
         assert!(matches!(
             XfrmObjectInstallRecoveryStore::open_bound(root.path(), key(9), [0x42; 40]),
