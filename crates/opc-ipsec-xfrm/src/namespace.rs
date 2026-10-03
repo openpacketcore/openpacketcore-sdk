@@ -1115,10 +1115,10 @@ fn bind_with_capacity(
         .name(String::from("opc-xfrm-netns"))
         .spawn({
             let actor_binding = actor_binding.clone();
-            #[cfg(any(test, feature = "test-support"))]
+            #[cfg(feature = "test-support")]
             let actor_lifetime = backend.test_namespace_actor_lifetime();
             move || {
-                #[cfg(any(test, feature = "test-support"))]
+                #[cfg(feature = "test-support")]
                 let _actor_lifetime = actor_lifetime;
                 run_actor(backend, actor_binding, receiver, startup_sender);
             }
@@ -1316,10 +1316,10 @@ fn bind_with_capacity_and_recovery(
         .name(String::from("opc-xfrm-netns"))
         .spawn({
             let actor_binding = actor_binding.clone();
-            #[cfg(any(test, feature = "test-support"))]
+            #[cfg(feature = "test-support")]
             let actor_lifetime = backend.test_namespace_actor_lifetime();
             move || {
-                #[cfg(any(test, feature = "test-support"))]
+                #[cfg(feature = "test-support")]
                 let _actor_lifetime = actor_lifetime;
                 run_actor(
                     backend,

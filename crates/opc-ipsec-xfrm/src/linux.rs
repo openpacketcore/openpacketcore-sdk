@@ -611,7 +611,7 @@ impl LinuxXfrmBackend {
         }
     }
 
-    #[cfg(any(test, feature = "test-support"))]
+    #[cfg(feature = "test-support")]
     pub(crate) fn test_namespace_actor_lifetime(
         &self,
     ) -> Option<test_support::MockNamespaceActorLifetime> {
@@ -1534,7 +1534,7 @@ impl XfrmBackend for LinuxXfrmBackend {
 }
 
 pub(crate) trait LinuxXfrmTransport: Send + Sync + fmt::Debug {
-    #[cfg(any(test, feature = "test-support"))]
+    #[cfg(feature = "test-support")]
     fn test_namespace_actor_lifetime(&self) -> Option<test_support::MockNamespaceActorLifetime> {
         None
     }
