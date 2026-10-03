@@ -112,7 +112,7 @@ wait_for_boot() {
 old_boot="$(wait_for_boot '')"
 printf '%s\n' "$old_boot" > "${logs}/boot-before.txt"
 
-# This SSH session changes only the disposable guest's boot configuration.
+# Complete setup before starting a reboot that can close its SSH transport.
 ssh "${ssh_options[@]}" opc@127.0.0.1 bash -s -- "$profile" <<'GUEST'
 set -euo pipefail
 systemd-detect-virt | grep -Eq '^(kvm|qemu)$'
@@ -131,8 +131,20 @@ else
   sudo grubby --update-kernel=ALL --args=nohz_full=1
 fi
 grep -Fx 'CONFIG_NO_HZ_FULL=y' "/boot/config-$(uname -r)"
-sudo systemctl reboot --no-block
 GUEST
+
+# A shutdown may close SSH before it receives the reboot command's exit status.
+# Only this request admits a transport disconnect; the unchanged bounded wait
+# must still observe a different boot ID before any qualification can proceed.
+reboot_status=0
+ssh "${ssh_options[@]}" opc@127.0.0.1 \
+  'sudo systemctl reboot --no-block' || reboot_status=$?
+printf 'ssh_exit_status=%s\n' "$reboot_status" > "${logs}/reboot-request.txt"
+case "$reboot_status" in
+  0|255) ;;
+  *) echo "guest reboot request failed with SSH status ${reboot_status}" >&2
+     exit "$reboot_status" ;;
+esac
 new_boot="$(wait_for_boot "$old_boot")"
 printf '%s\n' "$new_boot" > "${logs}/boot-after.txt"
 test "$new_boot" != "$old_boot"
