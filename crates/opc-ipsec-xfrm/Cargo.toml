@@ -16,6 +16,7 @@ publish = false
 [features]
 default = []
 ikev2 = ["dep:opc-proto-ikev2"]
+test-support = []
 
 [dependencies]
 opc-linux-xfrm-sys = { path = "../opc-linux-xfrm-sys", version = "0.2.0" }

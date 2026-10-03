@@ -303,6 +303,8 @@ pub use installed_child_sa::{
     ChildSaInstalledPairRequest, ChildSaInstalledRosterRequest, ChildSaRosterUpdate,
     InstalledChildSaRoster, InstalledChildSaSelection,
 };
+#[cfg(feature = "test-support")]
+pub use linux::test_support;
 pub use linux::{LinuxXfrmBackend, LinuxXfrmBackendConfig};
 pub use mock::{MockOperation, MockSaRelocation, MockXfrmBackend};
 pub use model::{

@@ -1,5 +1,8 @@
 //! Safe Linux XFRM backend over the raw netlink sys boundary.
 
+#[cfg(feature = "test-support")]
+pub mod test_support;
+
 use std::fmt;
 use std::io;
 use std::mem::size_of;
@@ -302,7 +305,7 @@ impl LinuxXfrmBackend {
         })
     }
 
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-support"))]
     pub(crate) fn with_transport<T>(transport: T) -> Self
     where
         T: LinuxXfrmTransport + 'static,
