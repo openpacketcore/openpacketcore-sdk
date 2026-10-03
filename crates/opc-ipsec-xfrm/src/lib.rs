@@ -164,6 +164,19 @@
 //! cooperating actor writes only, not that external fence: otherwise identical
 //! ownership is observationally ambiguous and Linux deletion is unconditional.
 //!
+//! The opt-in `LinuxXfrmBackend::bind_current_network_namespace_with_cleanup_inventory`
+//! provides an experimental encrypted snapshot store and a closed actor. Its
+//! sole available operational surface is authenticated inventory status,
+//! `ExactRemovalUnavailable`; it provides no object cleanup, journal settlement,
+//! completion seal or traffic activation. All backend clones share that gate,
+//! and returned transaction-store handles permit authenticated inspection only.
+//! Reopen requires the exact configured store incarnations and preserves
+//! malformed or incomplete histories without repair. Inventory-bound rosters
+//! must use the journal layout, including on create-new over an existing store;
+//! ordinary recovery constructors retain their existing legacy support.
+//! Eagerly initialized DSCP backends are refused before inventory binding.
+//! The inventory format and resource profile remain experimental and unqualified.
+//!
 //! Same-SPI successor activation uses
 //! [`NamespaceBoundLinuxXfrmBackend::apply_and_read_back_outbound_esp_counter`].
 //! The sealed actor validates the opaque outbound binding, reads the kernel's
@@ -207,6 +220,8 @@ pub mod child_sa;
 mod child_sa_relocation;
 #[cfg(all(unix, feature = "ikev2"))]
 mod child_sa_relocation_flow;
+#[cfg(unix)]
+mod cleanup_inventory;
 pub mod composite;
 mod counter_resume;
 mod dscp;
@@ -239,6 +254,12 @@ pub mod unsupported;
 pub use backend::XfrmBackend;
 #[cfg(all(unix, feature = "ikev2"))]
 pub use child_sa_relocation::{ChildSaRelocationError, ChildSaRelocationIntent};
+#[cfg(unix)]
+pub use cleanup_inventory::{
+    XfrmCleanupInventoryBinding, XfrmCleanupInventoryBindingConfig, XfrmCleanupInventoryConfig,
+    XfrmCleanupInventoryError, XfrmCleanupInventoryKey, XfrmCleanupInventoryLimits,
+    XfrmCleanupInventoryOpenMode, XfrmCleanupInventoryStatus,
+};
 pub use composite::{
     install_bidirectional_sa_policy_with_rollback, install_sa_policy_with_rollback,
     rekey_sa_policy, remove_policy_sa, XfrmBidirectionalInstallError,

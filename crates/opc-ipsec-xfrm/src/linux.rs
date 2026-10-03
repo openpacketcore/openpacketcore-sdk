@@ -588,6 +588,34 @@ impl LinuxXfrmBackend {
         )
     }
 
+    /// Bind an encrypted cleanup inventory and its transaction stores atomically.
+    ///
+    /// All operational commands remain closed because exact removal is not
+    /// available. Only authenticated inventory status can be queried. A backend
+    /// with eagerly configured DSCP marking is refused; construct deferred DSCP
+    /// marking before opting into this binding.
+    ///
+    /// # Errors
+    /// Returns a value-free binding error for an invalid configuration, missing
+    /// or unauthenticated state, an occupied lease, or storage failure.
+    #[cfg(unix)]
+    pub fn bind_current_network_namespace_with_cleanup_inventory(
+        self,
+        config: crate::XfrmCleanupInventoryBindingConfig,
+    ) -> Result<crate::XfrmCleanupInventoryBinding, crate::XfrmObjectRecoveryBindError> {
+        crate::namespace::bind_current_network_namespace_with_cleanup_inventory(self, config)
+    }
+
+    #[cfg(unix)]
+    pub(crate) fn validate_cleanup_inventory_binding(&self) -> Result<(), XfrmError> {
+        if self.inner.dscp_config.is_some() && !self.inner.dscp_activation_deferred {
+            return Err(XfrmError::UnsupportedFeature {
+                feature: "cleanup_inventory_eager_dscp",
+            });
+        }
+        Ok(())
+    }
+
     pub(crate) fn for_namespace_actor(self, binding: NetworkNamespaceBinding) -> Self {
         let inner = self.inner;
         Self {
@@ -1024,7 +1052,7 @@ impl LinuxXfrmBackend {
             {
                 Ok(policy) => policy,
                 Err(XfrmError::NotFound) => {
-                    return readback_mismatch("xfrm_outbound_sa_binding_current_policy_missing")
+                    return readback_mismatch("xfrm_outbound_sa_binding_current_policy_missing");
                 }
                 Err(source) => return Err(OutboundSaBindingError::Readback { source }),
             };
@@ -1037,7 +1065,7 @@ impl LinuxXfrmBackend {
         let observed_sa_body = match self.query_sa_for_outbound_binding(expected_sa).await {
             Ok(body) => body,
             Err(XfrmError::NotFound) => {
-                return readback_mismatch("xfrm_outbound_sa_binding_current_sa_missing")
+                return readback_mismatch("xfrm_outbound_sa_binding_current_sa_missing");
             }
             Err(source) => return Err(OutboundSaBindingError::Readback { source }),
         };
@@ -3001,7 +3029,7 @@ fn parse_outbound_sa_binding_snapshot(
         _ => {
             return Err(XfrmError::UnsupportedFeature {
                 feature: "installed_child_sa_direction",
-            })
+            });
         }
     };
     validate_sa_binding_dynamic_attributes(payload, direction)?;
@@ -4323,7 +4351,7 @@ fn is_known_aead_algorithm(name: &str) -> bool {
     )
 }
 
-fn validate_policy_parameters(parameters: &PolicyParameters) -> Result<(), XfrmError> {
+pub(crate) fn validate_policy_parameters(parameters: &PolicyParameters) -> Result<(), XfrmError> {
     validate_selector_family(&parameters.selector)?;
     if parameters.templates.len() > XFRM_POLICY_TEMPLATE_LIMIT {
         return Err(XfrmError::invalid_config(

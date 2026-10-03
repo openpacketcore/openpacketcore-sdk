@@ -780,6 +780,7 @@ struct StoreInner {
     owner_process_id: u32,
     proof_key: XfrmObjectRecoveryProofKey,
     control: ControlRecord,
+    authentication_only: bool,
     process_lock: Mutex<()>,
 }
 
@@ -970,6 +971,14 @@ impl Inventory {
 }
 
 impl XfrmObjectInstallRecoveryStore {
+    pub(crate) fn authenticate_existing_bound(
+        path: &Path,
+        proof_key: XfrmObjectRecoveryProofKey,
+        namespace_binding: [u8; 40],
+    ) -> Result<Self, XfrmObjectInstallDurableError> {
+        Self::open_bound_mode(path, proof_key, namespace_binding, true)
+    }
+
     /// Open or initialize a store through a namespace-bound backend.
     ///
     /// The root path must be absolute. If absent, it is created with mode
@@ -984,10 +993,21 @@ impl XfrmObjectInstallRecoveryStore {
         proof_key: XfrmObjectRecoveryProofKey,
         namespace_binding: [u8; 40],
     ) -> Result<Self, XfrmObjectInstallDurableError> {
+        Self::open_bound_mode(path, proof_key, namespace_binding, false)
+    }
+
+    fn open_bound_mode(
+        path: &Path,
+        proof_key: XfrmObjectRecoveryProofKey,
+        namespace_binding: [u8; 40],
+        authentication_only: bool,
+    ) -> Result<Self, XfrmObjectInstallDurableError> {
         if !valid_store_path(path) {
             return Err(XfrmObjectInstallDurableError::InvalidStoreRoot);
         }
-        create_root_if_absent(path)?;
+        if !authentication_only {
+            create_root_if_absent(path)?;
+        }
         let descriptor = open(
             path,
             OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
@@ -1005,10 +1025,10 @@ impl XfrmObjectInstallRecoveryStore {
                 XfrmObjectInstallDurableError::Storage
             }
         })?;
-        // Synchronize the containing directory even on reopen. This both
-        // publishes a newly created root and repairs the safe case where a
-        // prior process died after mkdir but before its parent fsync.
-        sync_store_root_parent(path, &descriptor)?;
+        // Writer opens synchronize even on reopen, repairing a prior mkdir
+        // whose parent was not yet synced. Authentication-only opens validate
+        // the same parent/name binding without performing that repair.
+        sync_store_root_parent(path, &descriptor, !authentication_only)?;
 
         let namespace_seal = namespace_seal(&proof_key, namespace_binding);
         let owner_process_id = std::process::id();
@@ -1027,6 +1047,7 @@ impl XfrmObjectInstallRecoveryStore {
                 root_device,
                 root_inode,
             },
+            authentication_only,
             process_lock: Mutex::new(()),
         };
         inner.control = initialize_or_load_control(&inner, namespace_seal)?;
@@ -1035,6 +1056,23 @@ impl XfrmObjectInstallRecoveryStore {
         };
         store.lease()?.inventory()?;
         Ok(store)
+    }
+
+    /// Permanently restrict a uniquely held store before exposing any alias.
+    pub(crate) fn into_authentication_only(
+        mut self,
+    ) -> Result<Self, XfrmObjectInstallDurableError> {
+        let inner =
+            Arc::get_mut(&mut self.inner).ok_or(XfrmObjectInstallDurableError::WrongBinding)?;
+        inner.authentication_only = true;
+        Ok(self)
+    }
+
+    pub(crate) fn authenticated_incarnation(
+        &self,
+    ) -> Result<[u8; 16], XfrmObjectInstallDurableError> {
+        self.lease()?.inventory()?;
+        Ok(self.inner.control.store_incarnation)
     }
 
     /// Persist a prepared operation before any backend mutation is admitted.
@@ -1458,6 +1496,11 @@ impl StoreLease<'_> {
         let (records, obsolete_records) = classify_operation_records(records, epoch)?;
         validate_unique_active_deletion_identities(&records)?;
         validate_single_cleanup_authority(&records)?;
+        if self.store.authentication_only
+            && (obsolete_epoch.is_some() || !obsolete_records.is_empty())
+        {
+            return Err(XfrmObjectInstallDurableError::Malformed);
+        }
         if let Some(name) = obsolete_epoch {
             self.remove_epoch(&name)?;
         }
@@ -1580,6 +1623,9 @@ impl StoreLease<'_> {
     }
 
     fn remove_epoch(&self, name: &str) -> Result<(), XfrmObjectInstallDurableError> {
+        if self.store.authentication_only {
+            return Err(XfrmObjectInstallDurableError::InvalidTransition);
+        }
         parse_epoch_name(name).ok_or(XfrmObjectInstallDurableError::Malformed)?;
         unlinkat(self.store.descriptor.as_fd(), name, AtFlags::empty())
             .map_err(|_| XfrmObjectInstallDurableError::Storage)?;
@@ -1588,6 +1634,9 @@ impl StoreLease<'_> {
     }
 
     fn remove_record(&self, name: &str) -> Result<(), XfrmObjectInstallDurableError> {
+        if self.store.authentication_only {
+            return Err(XfrmObjectInstallDurableError::InvalidTransition);
+        }
         validate_record_name(OsStr::new(name))?;
         unlinkat(self.store.descriptor.as_fd(), name, AtFlags::empty())
             .map_err(|_| XfrmObjectInstallDurableError::Storage)?;
@@ -1781,6 +1830,7 @@ fn valid_store_path(path: &Path) -> bool {
 fn sync_store_root_parent(
     path: &Path,
     root: &OwnedFd,
+    synchronize: bool,
 ) -> Result<(), XfrmObjectInstallDurableError> {
     let parent = path
         .parent()
@@ -1818,7 +1868,10 @@ fn sync_store_root_parent(
     if expected.st_dev != observed.st_dev || expected.st_ino != observed.st_ino {
         return Err(XfrmObjectInstallDurableError::InvalidStoreRoot);
     }
-    fsync(&parent_descriptor).map_err(|_| XfrmObjectInstallDurableError::Storage)
+    if synchronize {
+        fsync(&parent_descriptor).map_err(|_| XfrmObjectInstallDurableError::Storage)?;
+    }
+    Ok(())
 }
 
 fn validate_root_metadata(
@@ -1926,9 +1979,14 @@ fn initialize_or_load_control(
     namespace_seal: [u8; 32],
 ) -> Result<ControlRecord, XfrmObjectInstallDurableError> {
     verify_visible_identity(store)?;
-    cleanup_interrupted_publications(store)?;
+    if !store.authentication_only {
+        cleanup_interrupted_publications(store)?;
+    }
     let names = scan_raw_names(store)?;
     if names.is_empty() {
+        if store.authentication_only {
+            return Err(XfrmObjectInstallDurableError::Malformed);
+        }
         let control = ControlRecord {
             store_incarnation: random_nonzero_16()?,
             namespace_seal,
@@ -1965,6 +2023,9 @@ fn initialize_or_load_control(
     // is deterministic. Any additional or different entry remains fail-closed
     // in the bounded inventory scan.
     if names.len() == 1 {
+        if store.authentication_only {
+            return Err(XfrmObjectInstallDurableError::Malformed);
+        }
         let epoch = EpochRecord {
             store_incarnation: control.store_incarnation,
             epoch: NonZeroU64::new(1).ok_or(XfrmObjectInstallDurableError::Malformed)?,
@@ -2044,10 +2105,11 @@ fn read_fixed_file<const N: usize>(
     store: &StoreInner,
     name: &str,
 ) -> Result<[u8; N], XfrmObjectInstallDurableError> {
+    // Reject special files after open without waiting for a FIFO peer.
     let descriptor = openat(
         store.descriptor.as_fd(),
         name,
-        OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+        OFlags::RDONLY | OFlags::NONBLOCK | OFlags::NOFOLLOW | OFlags::CLOEXEC,
         Mode::empty(),
     )
     .map_err(|_| XfrmObjectInstallDurableError::Malformed)?;
@@ -2090,6 +2152,9 @@ fn publish_new_file(
     target: &str,
     bytes: &[u8],
 ) -> Result<(), XfrmObjectInstallDurableError> {
+    if store.authentication_only {
+        return Err(XfrmObjectInstallDurableError::InvalidTransition);
+    }
     #[cfg(not(target_os = "linux"))]
     {
         // The public atomic constructor is unavailable before this point on a

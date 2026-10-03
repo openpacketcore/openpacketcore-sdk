@@ -1,8 +1,9 @@
 # RFC 021: Namespace-bound XFRM cleanup inventory
 
-**Status:** Proposal for SDK #1058. This document does not declare an
-implementation available or qualified. Exact SA removal remains a blocking
-prerequisite; the proposed inventory must refuse cleanup while it is unavailable.
+**Status:** Experimental persistence and closed actor composition for SDK #1058;
+the cleanup lifecycle and activation remain proposed. The format and resource
+profile are not qualified or frozen. Exact SA removal remains a blocking
+prerequisite; the inventory refuses cleanup while it is unavailable.
 
 **Date:** 2026-10-03
 
@@ -28,6 +29,25 @@ Create-new and reopen are distinct operations. Create-new requires a fresh
 network namespace under the deployment's exclusive-writer contract; it cannot
 adopt objects installed before the inventory existed. Reopen never substitutes
 an empty inventory for a missing, unreadable or malformed store.
+
+The initial experimental implementation exposes create-new/reopen binding,
+explicit capacity budgets and authenticated status only. Status reauthenticates
+the inventory root and every retained transaction-store incarnation and history.
+It reports `ExactRemovalUnavailable`, which is not traffic readiness. Every other
+actor command remains closed across all clones, including queries, capability
+probes, DSCP activation and durable preparation. Returned transaction handles
+permit inspection only. Eagerly initialized DSCP backends are refused before
+binding; deferred DSCP initialization remains untouched.
+
+The initial inventory format requires journal-backed roster stores. Create-new
+initializes a roster directory only when it was absent; an existing directory
+must already authenticate as a complete journal, without staging cleanup,
+initialization, reconciliation or tail repair. Reopen has the same journal-only
+invariant. A legacy named record could be an older public recovery handle
+substituted for a removed journal, retaining the same store incarnation while
+discarding later history. Such records are therefore refused by inventory
+binding. Ordinary recovery APIs retain their existing legacy support. Any future
+inventory migration needs a separately versioned and authenticated contract.
 
 ## Initial capability profile
 
@@ -72,8 +92,8 @@ to actor, namespace, inventory incarnation, generation and publication revision.
 Activation validates the supplied seal before any journal-settlement write. Its
 admitted command consumes the seal, durably settles the covered transaction
 journals and publishes activation; only successful completion opens Live. A lost
-seal can be reissued by a
-fresh complete observation; a stale or wrong-actor seal cannot activate anything.
+seal can be reissued by a fresh complete observation; a stale or wrong-actor seal
+cannot activate anything.
 An interrupted activation reopens in Cleanup and validates its durable state;
 no caller-side Boolean can open the actor. Cleanup cannot run on a Live actor.
 
@@ -168,15 +188,27 @@ allocation or I/O. Consumers supply smaller explicit object, candidate-image,
 coverage and total-storage limits. Live, unresolved and orphaned entries all
 consume those limits until their appropriate terminal proof is durable.
 
-The proposed encoded record ceiling is 2 KiB, subject to a measured worst-case
-codec fixture before format freeze. At that ceiling, a leaf payload is 128 KiB.
-Both manifests have a 16 KiB envelope; one-record publication therefore writes
-at most one leaf and two manifests, approximately 160 KiB plus fixed envelopes,
-independent of inventory size. A read/update touches at most three tree nodes.
-Initial complete validation streams leaves and uses bounded node buffers, not
-one allocation proportional to the whole store. The implementation must measure
-actual maximum encoded bytes, node I/O counts and peak parser buffers, then fix
-the numerical format limits through review before exposing consumer composition.
+The experimental codec reserves 1,024 bytes per record, with at most two
+candidate images, six policy templates and eight coverage members. Exhaustive
+variable-field fixtures derive record maxima of 418 bytes for an SA lifecycle,
+752 for a policy lifecycle and 485 for coverage. Each node has a 134-byte
+authenticated envelope. A fully occupied leaf needs at most 48,398 framed bytes
+for the current record grammar; the reserved record ceiling allows 65,806.
+Branch frames have a 16,384-byte cap. The root has a 20,480-byte cap including a
+4,096-byte completion reservation whose current version and contents must all
+be zero. Those reserved bytes do not grant completion or activation authority.
+
+One changed leaf, branch and root currently need at most 84,605 framed bytes
+with grammar-maximum records, or 102,670 under the reserved record ceiling.
+Those figures describe one publication path; an atomic batch can change multiple
+paths. Initial complete validation streams bounded leaves and rebuilds the
+fixed locator index; its separately budgeted lifecycle-serial scratch space is
+eight bytes per configured record. No allocation covers the whole address space.
+The parser/publication budget also includes decoded values, root copies, changed
+paths, index changes and change vectors. Logical byte budgets exclude allocator
+metadata, thread stacks, filesystem metadata and block rounding. The measured
+layout and prototype fault model do not freeze a production compatibility or
+memory-usage contract.
 
 Two physical slots per node bound stored snapshots. Temporary publication has
 one bounded file at a time; publication sequencing and directory accounting must

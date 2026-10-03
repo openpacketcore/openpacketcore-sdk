@@ -1482,11 +1482,19 @@ struct StoreInner {
     proof_key: XfrmObjectRosterRecoveryProofKey,
     control: ControlRecord,
     journal_enabled: bool,
+    authentication_only: bool,
     process_lock: Mutex<()>,
     #[cfg(test)]
     ledger: Mutex<Vec<XfrmObjectRosterPublication>>,
     #[cfg(test)]
     physical_barriers: Mutex<usize>,
+}
+
+#[derive(Clone, Copy)]
+enum StoreOpenMode {
+    Writer,
+    AuthenticateExisting,
+    InitializeAbsentJournal,
 }
 
 impl Drop for StoreInner {
@@ -1696,6 +1704,34 @@ impl Inventory {
 }
 
 impl XfrmObjectRosterRecoveryStore {
+    pub(crate) fn authenticate_existing_bound(
+        path: &Path,
+        proof_key: XfrmObjectRosterRecoveryProofKey,
+        namespace_binding: [u8; 40],
+    ) -> Result<Self, XfrmObjectRosterDurableError> {
+        Self::open_bound_mode(
+            path,
+            proof_key,
+            namespace_binding,
+            StoreOpenMode::AuthenticateExisting,
+        )
+    }
+
+    /// Initialize only an absent root; existing inventory-bound rosters must
+    /// already authenticate as complete journals without any repair.
+    pub(crate) fn open_inventory_bound(
+        path: &Path,
+        proof_key: XfrmObjectRosterRecoveryProofKey,
+        namespace_binding: [u8; 40],
+    ) -> Result<Self, XfrmObjectRosterDurableError> {
+        Self::open_bound_mode(
+            path,
+            proof_key,
+            namespace_binding,
+            StoreOpenMode::InitializeAbsentJournal,
+        )
+    }
+
     /// Open or initialize a roster store through a namespace-bound backend.
     ///
     /// The root path must be absolute and must never be shared with another
@@ -1719,10 +1755,26 @@ impl XfrmObjectRosterRecoveryStore {
         proof_key: XfrmObjectRosterRecoveryProofKey,
         namespace_binding: [u8; 40],
     ) -> Result<Self, XfrmObjectRosterDurableError> {
+        Self::open_bound_mode(path, proof_key, namespace_binding, StoreOpenMode::Writer)
+    }
+
+    fn open_bound_mode(
+        path: &Path,
+        proof_key: XfrmObjectRosterRecoveryProofKey,
+        namespace_binding: [u8; 40],
+        mode: StoreOpenMode,
+    ) -> Result<Self, XfrmObjectRosterDurableError> {
         if !valid_store_path(path) {
             return Err(XfrmObjectRosterDurableError::InvalidStoreRoot);
         }
-        create_root_if_absent(path)?;
+        let authentication_only = match mode {
+            StoreOpenMode::Writer => {
+                create_root_if_absent(path)?;
+                false
+            }
+            StoreOpenMode::AuthenticateExisting => true,
+            StoreOpenMode::InitializeAbsentJournal => !create_root_if_absent(path)?,
+        };
         let descriptor = open(
             path,
             OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
@@ -1740,10 +1792,10 @@ impl XfrmObjectRosterRecoveryStore {
                 XfrmObjectRosterDurableError::Storage
             }
         })?;
-        // Synchronize the containing directory even on reopen. This both
-        // publishes a newly created root and repairs the safe case where a
-        // prior process died after mkdir but before its parent fsync.
-        sync_store_root_parent(path, &descriptor)?;
+        // Writer opens synchronize even on reopen, repairing a prior mkdir
+        // whose parent was not yet synced. Authentication-only opens validate
+        // the same parent/name binding without performing that repair.
+        sync_store_root_parent(path, &descriptor, !authentication_only)?;
 
         let namespace_seal = namespace_seal(&proof_key, namespace_binding);
         let owner_process_id = std::process::id();
@@ -1763,6 +1815,7 @@ impl XfrmObjectRosterRecoveryStore {
                 root_inode,
             },
             journal_enabled: false,
+            authentication_only,
             process_lock: Mutex::new(()),
             #[cfg(test)]
             ledger: Mutex::new(Vec::new()),
@@ -1771,11 +1824,38 @@ impl XfrmObjectRosterRecoveryStore {
         };
         inner.control = initialize_or_load_control(&inner, namespace_seal)?;
         inner.journal_enabled = initialize_journal_mode(&inner)?;
+        if authentication_only && !inner.journal_enabled {
+            return Err(XfrmObjectRosterDurableError::Malformed);
+        }
         let store = Self {
             inner: Arc::new(inner),
         };
         store.lease()?.inventory()?;
         Ok(store)
+    }
+
+    /// Permanently restrict a uniquely held store before exposing any alias.
+    pub(crate) fn into_authentication_only(mut self) -> Result<Self, XfrmObjectRosterDurableError> {
+        let inner =
+            Arc::get_mut(&mut self.inner).ok_or(XfrmObjectRosterDurableError::WrongBinding)?;
+        // The cleanup inventory's initial format admits journal-backed rosters
+        // only. A named record can be an older public handle substituted for
+        // a deleted journal without changing the store's incarnation.
+        if !inner.journal_enabled {
+            return Err(XfrmObjectRosterDurableError::Malformed);
+        }
+        inner.authentication_only = true;
+        Ok(self)
+    }
+
+    pub(crate) fn authenticated_incarnation(
+        &self,
+    ) -> Result<[u8; 16], XfrmObjectRosterDurableError> {
+        if !self.inner.journal_enabled {
+            return Err(XfrmObjectRosterDurableError::Malformed);
+        }
+        self.lease()?.inventory()?;
+        Ok(self.inner.control.store_incarnation)
     }
 
     /// Persist a prepared roster before any backend mutation is admitted.
@@ -2460,6 +2540,11 @@ impl StoreLease<'_> {
             });
         validate_unique_active_deletion_identities(&records)?;
         validate_single_cleanup_authority(&records)?;
+        if self.store.authentication_only
+            && (obsolete_epoch.is_some() || !obsolete_records.is_empty())
+        {
+            return Err(XfrmObjectRosterDurableError::Malformed);
+        }
         if let Some(name) = obsolete_epoch {
             self.remove_epoch(&name)?;
         }
@@ -2639,6 +2724,9 @@ impl StoreLease<'_> {
     }
 
     fn remove_epoch(&self, name: &str) -> Result<(), XfrmObjectRosterDurableError> {
+        if self.store.authentication_only {
+            return Err(XfrmObjectRosterDurableError::InvalidTransition);
+        }
         parse_epoch_name(name).ok_or(XfrmObjectRosterDurableError::Malformed)?;
         unlinkat(self.store.descriptor.as_fd(), name, AtFlags::empty())
             .map_err(|_| XfrmObjectRosterDurableError::Storage)?;
@@ -2649,6 +2737,9 @@ impl StoreLease<'_> {
     }
 
     fn remove_record(&self, name: &str) -> Result<(), XfrmObjectRosterDurableError> {
+        if self.store.authentication_only {
+            return Err(XfrmObjectRosterDurableError::InvalidTransition);
+        }
         validate_record_name(OsStr::new(name))?;
         unlinkat(self.store.descriptor.as_fd(), name, AtFlags::empty())
             .map_err(|_| XfrmObjectRosterDurableError::Storage)?;
@@ -3045,12 +3136,12 @@ fn adjacent_proof_permits(
     }
 }
 
-fn create_root_if_absent(path: &Path) -> Result<(), XfrmObjectRosterDurableError> {
+fn create_root_if_absent(path: &Path) -> Result<bool, XfrmObjectRosterDurableError> {
     let mut builder = std::fs::DirBuilder::new();
     builder.mode(DIRECTORY_MODE);
     match builder.create(path) {
-        Ok(()) => Ok(()),
-        Err(error) if error.kind() == io::ErrorKind::AlreadyExists => Ok(()),
+        Ok(()) => Ok(true),
+        Err(error) if error.kind() == io::ErrorKind::AlreadyExists => Ok(false),
         Err(_) => Err(XfrmObjectRosterDurableError::Storage),
     }
 }
@@ -3066,7 +3157,11 @@ fn valid_store_path(path: &Path) -> bool {
             .all(|component| matches!(component, Component::RootDir | Component::Normal(_)))
 }
 
-fn sync_store_root_parent(path: &Path, root: &OwnedFd) -> Result<(), XfrmObjectRosterDurableError> {
+fn sync_store_root_parent(
+    path: &Path,
+    root: &OwnedFd,
+    synchronize: bool,
+) -> Result<(), XfrmObjectRosterDurableError> {
     let parent = path
         .parent()
         .ok_or(XfrmObjectRosterDurableError::InvalidStoreRoot)?;
@@ -3103,7 +3198,10 @@ fn sync_store_root_parent(path: &Path, root: &OwnedFd) -> Result<(), XfrmObjectR
     if expected.st_dev != observed.st_dev || expected.st_ino != observed.st_ino {
         return Err(XfrmObjectRosterDurableError::InvalidStoreRoot);
     }
-    fsync(&parent_descriptor).map_err(|_| XfrmObjectRosterDurableError::Storage)
+    if synchronize {
+        fsync(&parent_descriptor).map_err(|_| XfrmObjectRosterDurableError::Storage)?;
+    }
+    Ok(())
 }
 
 fn validate_root_metadata(metadata: &rustix::fs::Stat) -> Result<(), XfrmObjectRosterDurableError> {
@@ -3209,9 +3307,14 @@ fn initialize_or_load_control(
     namespace_seal: [u8; 32],
 ) -> Result<ControlRecord, XfrmObjectRosterDurableError> {
     verify_visible_identity(store)?;
-    cleanup_interrupted_publications(store)?;
+    if !store.authentication_only {
+        cleanup_interrupted_publications(store)?;
+    }
     let names = scan_raw_names(store)?;
     if names.is_empty() {
+        if store.authentication_only {
+            return Err(XfrmObjectRosterDurableError::Malformed);
+        }
         let control = ControlRecord {
             store_incarnation: random_nonzero_16()?,
             namespace_seal,
@@ -3252,6 +3355,9 @@ fn initialize_or_load_control(
             && names.iter().any(|name| name == JOURNAL_NAME)
             && names.iter().any(|name| name == CONTROL_NAME))
     {
+        if store.authentication_only {
+            return Err(XfrmObjectRosterDurableError::Malformed);
+        }
         let epoch = EpochRecord {
             store_incarnation: control.store_incarnation,
             epoch: NonZeroU64::new(1).ok_or(XfrmObjectRosterDurableError::Malformed)?,
@@ -3276,6 +3382,11 @@ fn initialize_journal_mode(store: &StoreInner) -> Result<bool, XfrmObjectRosterD
     let names = scan_raw_names(store)?;
     if names.iter().any(|name| name == JOURNAL_NAME) {
         return Ok(true);
+    }
+    // The initial experimental inventory requires this journal layout. Legacy
+    // named records cannot prove that a later journal history was not removed.
+    if store.authentication_only {
+        return Err(XfrmObjectRosterDurableError::Malformed);
     }
     if names
         .iter()
@@ -3443,13 +3554,22 @@ fn read_journal_records(
     let descriptor = openat(
         store.descriptor.as_fd(),
         JOURNAL_NAME,
-        OFlags::RDWR | OFlags::NONBLOCK | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+        (if store.authentication_only {
+            OFlags::RDONLY
+        } else {
+            OFlags::RDWR
+        }) | OFlags::NONBLOCK
+            | OFlags::NOFOLLOW
+            | OFlags::CLOEXEC,
         Mode::empty(),
     )
     .map_err(|_| XfrmObjectRosterDurableError::Malformed)?;
     let (frames, trailing_bytes) = journal_frame_layout(store, &descriptor)?;
     let mut file = std::fs::File::from(descriptor);
     if trailing_bytes != 0 {
+        if store.authentication_only {
+            return Err(XfrmObjectRosterDurableError::Malformed);
+        }
         let length = JOURNAL_HEADER_BYTES
             .checked_add(
                 frames
@@ -3496,6 +3616,9 @@ fn append_journal_record(
     bytes: &[u8; XFRM_OBJECT_ROSTER_RECOVERY_HANDLE_BYTES],
     writer_epoch: NonZeroU64,
 ) -> Result<(), XfrmObjectRosterDurableError> {
+    if store.authentication_only {
+        return Err(XfrmObjectRosterDurableError::InvalidTransition);
+    }
     verify_visible_identity(store)?;
     let descriptor = openat(
         store.descriptor.as_fd(),
@@ -3554,6 +3677,9 @@ fn compact_journal(
     records: &[DurableRosterRecord],
     epoch: NonZeroU64,
 ) -> Result<(), XfrmObjectRosterDurableError> {
+    if store.authentication_only {
+        return Err(XfrmObjectRosterDurableError::InvalidTransition);
+    }
     if records.len() > MAX_JOURNAL_FRAMES {
         return Err(XfrmObjectRosterDurableError::CapacityExceeded);
     }
@@ -3674,6 +3800,9 @@ fn publish_new_file(
     target: &str,
     bytes: &[u8],
 ) -> Result<(), XfrmObjectRosterDurableError> {
+    if store.authentication_only {
+        return Err(XfrmObjectRosterDurableError::InvalidTransition);
+    }
     #[cfg(not(target_os = "linux"))]
     {
         // The public atomic constructor is unavailable before this point on a
