@@ -351,11 +351,17 @@ fn reader_btf() -> OwnedFd {
     unsafe { OwnedFd::from_raw_fd(fd as libc::c_int) }
 }
 
-fn observer_program(map: BorrowedFd<'_>, returning: bool) -> OwnedFd {
+fn observer_program(map: BorrowedFd<'_>, returning: bool, updater_pid_tgid: u64) -> OwnedFd {
     let (stamp, count) = if returning { (16, 32) } else { (8, 24) };
     load_program(
         BPF_PROG_TYPE_KPROBE,
         &[
+            // Kprobe BPF programs run before perf's task/sample filtering.
+            // Reject every other process/thread before accessing trace state.
+            insn(0x85, 0, 0, 0, 14), // get_current_pid_tgid
+            insn(0x18, 1, 0, 0, updater_pid_tgid as u32 as i32),
+            insn(0, 0, 0, 0, (updater_pid_tgid >> 32) as u32 as i32),
+            insn(0x5d, 0, 1, 15, 0),  // foreign PID/TID -> return zero
             insn(0x62, 10, 0, -4, 0), // stack key = 0
             insn(0x18, 1, 1, 0, map.as_raw_fd()),
             Insn::default(),
@@ -412,9 +418,9 @@ impl Probe {
         // SAFETY: gettid has no pointer arguments and identifies this updater
         // thread, not the reader or other processes on the host.
         let tid = unsafe { libc::syscall(libc::SYS_gettid) } as libc::pid_t;
-        // SAFETY: The initialized attr and NUL-terminated symbol outlive this
-        // call. pid=tid/cpu=-1 restricts this event to the updater task.
         let fd =
+            // SAFETY: The initialized attr and NUL-terminated symbol outlive
+            // this call. pid=tid/cpu=-1 binds the perf event to the updater.
             unsafe { libc::syscall(libc::SYS_perf_event_open, &attr, tid, -1_i32, -1_i32, 8_u64) };
         assert!(
             fd >= 0,
@@ -423,7 +429,8 @@ impl Probe {
         );
         // SAFETY: perf_event_open returned this fresh uniquely-owned FD.
         let event = unsafe { OwnedFd::from_raw_fd(fd as libc::c_int) };
-        let program = observer_program(map, returning);
+        let updater_pid_tgid = u64::from(std::process::id()) << 32 | u64::from(tid as u32);
+        let program = observer_program(map, returning, updater_pid_tgid);
         // SAFETY: These ioctls take integer arguments and borrowed live FDs.
         let attached = unsafe {
             libc::ioctl(
@@ -537,6 +544,7 @@ impl AffinityGuard {
         // SAFETY: An all-zero cpu_set_t is a valid empty mask for the syscall
         // to fill, and its storage remains writable for the call.
         let mut mask: libc::cpu_set_t = unsafe { mem::zeroed() };
+        // SAFETY: The initialized cpu_set_t is writable for its exact size.
         let result = unsafe { libc::sched_getaffinity(0, mem::size_of_val(&mask), &mut mask) };
         assert_eq!(result, 0, "read CPU affinity");
         mask
@@ -547,7 +555,9 @@ impl AffinityGuard {
         // SAFETY: The caller selects a CPU from the initial allowed mask and
         // stays within CPU_SETSIZE; the initialized mask outlives the syscall.
         let mut mask: libc::cpu_set_t = unsafe { mem::zeroed() };
+        // SAFETY: The selected CPU is below CPU_SETSIZE and mask is writable.
         unsafe { libc::CPU_SET(cpu, &mut mask) };
+        // SAFETY: The initialized mask contains a permitted CPU and is live.
         let result = unsafe { libc::sched_setaffinity(0, mem::size_of_val(&mask), &mask) };
         assert_eq!(result, 0, "pin distinct reader/updater CPU");
         Self(original)
@@ -612,6 +622,23 @@ fn map_in_map_grace_waits_for_live_non_sleepable_reader() {
     println!("\nOPC_GTPU_MAP_READER_GRACE_NEGATIVE_CONTROL_PROVEN");
     array_update(normal.as_fd(), &armed);
     array_update(expedited.as_fd(), &armed);
+    thread::scope(|scope| {
+        scope
+            .spawn(|| grace.synchronize().expect("foreign-thread map grace"))
+            .join()
+            .expect("foreign-thread control completed");
+    });
+    assert_eq!(
+        array_read::<5>(normal.as_fd()),
+        armed,
+        "another thread's normal grace must not enter the updater's trace"
+    );
+    assert_eq!(
+        array_read::<5>(expedited.as_fd()),
+        armed,
+        "another thread's expedited grace must not enter the updater's trace"
+    );
+    println!("OPC_GTPU_MAP_READER_GRACE_THREAD_CONTROL_PROVEN");
     array_update(reader.as_fd(), &[17, 0, 0, 0, 0, 0]);
     thread::scope(|scope| {
         let task = scope.spawn(|| {
@@ -646,9 +673,13 @@ fn map_in_map_grace_waits_for_live_non_sleepable_reader() {
         array_update(reader.as_fd(), &replacement);
         task.join().expect("bounded TC reader completed");
         let after: ReaderRecord = array_read(reader.as_fd());
-        let interval =
-            paired_grace_interval(array_read(normal.as_fd()), array_read(expedited.as_fd()))
-                .expect("exact paired in-kernel grace observations");
+        let normal_trace = array_read(normal.as_fd());
+        let expedited_trace = array_read(expedited.as_fd());
+        let interval = paired_grace_interval(normal_trace, expedited_trace).unwrap_or_else(|error| {
+            panic!(
+                "exact paired in-kernel grace observations: {error:?}; normal={normal_trace:?}; expedited={expedited_trace:?}"
+            )
+        });
         println!(
             "reader_start_ns={} grace_entry_ns={} reader_end_ns={} grace_return_ns={}",
             after[1], interval.0, after[2], interval.1

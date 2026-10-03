@@ -668,11 +668,15 @@ waits before the first row mutation. A failed wait retains the rows and
 returns indeterminate; initial unavailability refuses before mutation. This
 does not alter grouped-selector retirement or imply packet/NIC drain.
 
-Privileged qualification instruments actual RCU entry/return in the updater
-thread and requires the interval to contain the end of an already-running,
+Privileged qualification instruments actual RCU entry/return, filtering the
+updater's exact process/thread identity inside BPF before map access, and
+requires the interval to contain the end of an already-running,
 non-sleepable TC test reader on another CPU. The reader must retain both old
 row samples before post-grace replacement. Exact event pairs, overlap, and an
-ordinary ARRAY negative control are mandatory. Simulated selection and this
+ordinary ARRAY negative control are mandatory. A grace in a separate thread
+must leave both trace records untouched. Perf task binding alone is not a BPF
+filter: the [enterprise kprobe path](https://gitlab.com/redhat/centos-stream/src/kernel/centos-stream-9/-/blob/kernel-5.14.0-427.el9/kernel/trace/trace_kprobe.c)
+invokes attached BPF before perf event filtering. Simulated selection and this
 primitive proof alone do not establish native nohz_full execution, RT support,
 forwarding, or latency.
 

@@ -196,6 +196,7 @@ ssh "${ssh_options[@]}" opc@127.0.0.1 \
 grep -Eq '^test result: ok\. 1 passed; 0 failed; 0 ignored;' "${logs}/grace.log"
 grep -Fxq 'OPC_GTPU_MAP_READER_GRACE_PROVEN' "${logs}/grace.log"
 grep -Fxq 'OPC_GTPU_MAP_READER_GRACE_NEGATIVE_CONTROL_PROVEN' "${logs}/grace.log"
+grep -Fxq 'OPC_GTPU_MAP_READER_GRACE_THREAD_CONTROL_PROVEN' "${logs}/grace.log"
 
 # These exact existing packet proofs validate the opt-in profile before any
 # setup/skip path. They require effective nohz CPUs, GLOBAL absent, and actual

@@ -84,6 +84,9 @@ RCU entry/return observations must enclose a live non-sleepable TC reader; an
 ordinary ARRAY update is a negative control. Missing prerequisites or missed
 overlap fail this qualification. The test does not prove native `nohz_full`,
 PREEMPT_RT, packet forwarding, or performance.
+The BPF observers reject other process/thread identities before reading their
+maps: perf task binding alone does not filter kprobe BPF execution. A grace
+from a separate thread must leave both trace records untouched.
 The separate `TFT nohz_full` VM matrix combines this proof with effective
 nohz CPU/GLOBAL checks and production Aya TFT packet lifecycle tests on the
 pinned Linux 6.8 and enterprise 5.14 guests.

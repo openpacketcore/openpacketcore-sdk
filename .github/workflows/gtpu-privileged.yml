@@ -72,6 +72,7 @@ jobs:
           grep -Eq '^test result: ok\. 1 passed; 0 failed; 0 ignored;' "${RUNNER_TEMP}/gtpu-reader-grace.log"
           grep -Fxq 'OPC_GTPU_MAP_READER_GRACE_PROVEN' "${RUNNER_TEMP}/gtpu-reader-grace.log"
           grep -Fxq 'OPC_GTPU_MAP_READER_GRACE_NEGATIVE_CONTROL_PROVEN' "${RUNNER_TEMP}/gtpu-reader-grace.log"
+          grep -Fxq 'OPC_GTPU_MAP_READER_GRACE_THREAD_CONTROL_PROVEN' "${RUNNER_TEMP}/gtpu-reader-grace.log"
 
       - name: Build privileged GTP-U test
         run: |
@@ -462,6 +463,7 @@ jobs:
           grep -Eq '^test result: ok\. 1 passed; 0 failed; 0 ignored;' <<< "${grace_output}"
           grep -Fq 'OPC_GTPU_MAP_READER_GRACE_PROVEN' <<< "${grace_output}"
           grep -Fxq 'OPC_GTPU_MAP_READER_GRACE_NEGATIVE_CONTROL_PROVEN' <<< "${grace_output}"
+          grep -Fxq 'OPC_GTPU_MAP_READER_GRACE_THREAD_CONTROL_PROVEN' <<< "${grace_output}"
           if ! load_output="$(
             ssh "${ssh_options[@]}" opc@127.0.0.1 \
               'sudo env OPC_GTPU_RUN_PRIVILEGED=1 /tmp/opc-gtpu-linux68-test --ignored --nocapture --test-threads=1 program_tag_candidates_match_the_running_kernel pre_redirect_tag_candidates_match_the_running_kernel committed_classifier_load_capability_is_loadable_and_leaves_no_state' \
@@ -779,6 +781,7 @@ jobs:
           grep -Eq '^test result: ok\. 1 passed; 0 failed; 0 ignored;' <<< "${grace_output}"
           grep -Fq 'OPC_GTPU_MAP_READER_GRACE_PROVEN' <<< "${grace_output}"
           grep -Fxq 'OPC_GTPU_MAP_READER_GRACE_NEGATIVE_CONTROL_PROVEN' <<< "${grace_output}"
+          grep -Fxq 'OPC_GTPU_MAP_READER_GRACE_THREAD_CONTROL_PROVEN' <<< "${grace_output}"
           if ! load_output="$(
             ssh "${ssh_options[@]}" opc@127.0.0.1 \
               'sudo env OPC_GTPU_RUN_PRIVILEGED=1 /tmp/opc-gtpu-el9-test --ignored --nocapture --test-threads=1 program_tag_candidates_match_the_running_kernel pre_redirect_tag_candidates_match_the_running_kernel committed_classifier_load_capability_is_loadable_and_leaves_no_state' \
