@@ -53,6 +53,26 @@ jobs:
           sudo mountpoint -q /sys/fs/bpf || sudo mount -t bpf bpf /sys/fs/bpf
           sudo unshare -n -- ip link set lo up
 
+      - name: Prove map-in-map reader grace
+        run: |
+          set -euo pipefail
+          export CARGO_TARGET_DIR="${RUNNER_TEMP}/gtpu-target"
+          cargo test --locked -p opc-linux-gtpu-sys --lib --no-run --message-format=json \
+            > "${RUNNER_TEMP}/gtpu-reader-grace-build.jsonl"
+          grace_binary="$(
+            jq -r 'select(.profile.test == true and .target.name == "opc_linux_gtpu_sys") | .executable // empty' \
+              "${RUNNER_TEMP}/gtpu-reader-grace-build.jsonl" | tail -n 1
+          )"
+          test -n "${grace_binary}"
+          test -x "${grace_binary}"
+          sha256sum "${grace_binary}"
+          sudo env OPC_GTPU_RUN_PRIVILEGED=1 "${grace_binary}" \
+            --ignored --exact linux::reader_grace::tests::map_in_map_grace_waits_for_live_non_sleepable_reader \
+            --nocapture --test-threads=1 | tee "${RUNNER_TEMP}/gtpu-reader-grace.log"
+          grep -Eq '^test result: ok\. 1 passed; 0 failed; 0 ignored;' "${RUNNER_TEMP}/gtpu-reader-grace.log"
+          grep -Fxq 'OPC_GTPU_MAP_READER_GRACE_PROVEN' "${RUNNER_TEMP}/gtpu-reader-grace.log"
+          grep -Fxq 'OPC_GTPU_MAP_READER_GRACE_NEGATIVE_CONTROL_PROVEN' "${RUNNER_TEMP}/gtpu-reader-grace.log"
+
       - name: Build privileged GTP-U test
         run: |
           set -euo pipefail
@@ -247,6 +267,17 @@ jobs:
           test -n "${datapath_binary}"
           test -x "${datapath_binary}"
           cp "${datapath_binary}" "${RUNNER_TEMP}/opc-gtpu-linux68-datapath"
+
+          cargo test --locked -p opc-linux-gtpu-sys --lib --no-run --message-format=json \
+            > "${RUNNER_TEMP}/gtpu-linux68-grace-build.jsonl"
+          grace_binary="$(
+            jq -r 'select(.profile.test == true and .target.name == "opc_linux_gtpu_sys") | .executable // empty' \
+              "${RUNNER_TEMP}/gtpu-linux68-grace-build.jsonl" | tail -n 1
+          )"
+          test -n "${grace_binary}"
+          test -x "${grace_binary}"
+          cp "${grace_binary}" "${RUNNER_TEMP}/opc-gtpu-linux68-grace"
+          sha256sum "${RUNNER_TEMP}/opc-gtpu-linux68-grace"
           wc -c "${RUNNER_TEMP}/opc-gtpu-linux68-test" "${RUNNER_TEMP}/opc-gtpu-linux68-datapath"
           sha256sum "${RUNNER_TEMP}/opc-gtpu-linux68-test" "${RUNNER_TEMP}/opc-gtpu-linux68-datapath"
 
@@ -358,6 +389,14 @@ jobs:
             -o UserKnownHostsFile=/dev/null \
             "${RUNNER_TEMP}/opc-gtpu-linux68-datapath" \
             opc@127.0.0.1:/tmp/opc-gtpu-linux68-datapath
+          scp \
+            -i "${key}" \
+            -P 2227 \
+            -o BatchMode=yes \
+            -o IdentitiesOnly=yes \
+            -o StrictHostKeyChecking=no \
+            -o UserKnownHostsFile=/dev/null \
+            "${RUNNER_TEMP}/opc-gtpu-linux68-grace" opc@127.0.0.1:/tmp/opc-gtpu-linux68-grace
           ssh "${ssh_options[@]}" opc@127.0.0.1 '
             set -euo pipefail
             test "$(uname -r)" = "6.8.0-134-generic"
@@ -370,8 +409,21 @@ jobs:
             esac
             sudo mountpoint -q /sys/fs/bpf || sudo mount -t bpf bpf /sys/fs/bpf
             chmod 0755 /tmp/opc-gtpu-linux68-test
+            chmod 0755 /tmp/opc-gtpu-linux68-grace
             chmod 0755 /tmp/opc-gtpu-linux68-datapath
           '
+          if ! grace_output="$(
+            ssh "${ssh_options[@]}" opc@127.0.0.1 \
+              'sudo env OPC_GTPU_RUN_PRIVILEGED=1 /tmp/opc-gtpu-linux68-grace --ignored --exact linux::reader_grace::tests::map_in_map_grace_waits_for_live_non_sleepable_reader --nocapture --test-threads=1' \
+              2>&1
+          )"; then
+            printf '%s\n' "${grace_output}"
+            exit 1
+          fi
+          printf '%s\n' "${grace_output}"
+          grep -Eq '^test result: ok\. 1 passed; 0 failed; 0 ignored;' <<< "${grace_output}"
+          grep -Fq 'OPC_GTPU_MAP_READER_GRACE_PROVEN' <<< "${grace_output}"
+          grep -Fxq 'OPC_GTPU_MAP_READER_GRACE_NEGATIVE_CONTROL_PROVEN' <<< "${grace_output}"
           if ! load_output="$(
             ssh "${ssh_options[@]}" opc@127.0.0.1 \
               'sudo env OPC_GTPU_RUN_PRIVILEGED=1 /tmp/opc-gtpu-linux68-test --ignored --nocapture --test-threads=1 program_tag_candidates_match_the_running_kernel pre_redirect_tag_candidates_match_the_running_kernel committed_classifier_load_capability_is_loadable_and_leaves_no_state' \
@@ -500,6 +552,22 @@ jobs:
           fi
           cp "${datapath_binary}" "${RUNNER_TEMP}/opc-gtpu-el9-datapath"
 
+          cargo test --locked -p opc-linux-gtpu-sys --lib --no-run --target x86_64-unknown-linux-musl --message-format=json \
+            > "${RUNNER_TEMP}/gtpu-el9-grace-build.jsonl"
+          grace_binary="$(
+            jq -r 'select(.profile.test == true and .target.name == "opc_linux_gtpu_sys") | .executable // empty' \
+              "${RUNNER_TEMP}/gtpu-el9-grace-build.jsonl" | tail -n 1
+          )"
+          test -n "${grace_binary}"
+          test -x "${grace_binary}"
+          grace_headers="$(readelf -l "${grace_binary}")"
+          if grep -q 'Requesting program interpreter' <<< "${grace_headers}"; then
+            echo "::error::el9 grace binary is dynamically linked"
+            exit 1
+          fi
+          cp "${grace_binary}" "${RUNNER_TEMP}/opc-gtpu-el9-grace"
+          sha256sum "${RUNNER_TEMP}/opc-gtpu-el9-grace"
+
       - name: Load both classifiers on a RHEL 9 kernel
         run: |
           set -euo pipefail
@@ -612,6 +680,14 @@ jobs:
             -o StrictHostKeyChecking=no \
             -o UserKnownHostsFile=/dev/null \
             "${RUNNER_TEMP}/opc-gtpu-el9-datapath" opc@127.0.0.1:/tmp/opc-gtpu-el9-datapath
+          scp \
+            -i "${key}" \
+            -P 2228 \
+            -o BatchMode=yes \
+            -o IdentitiesOnly=yes \
+            -o StrictHostKeyChecking=no \
+            -o UserKnownHostsFile=/dev/null \
+            "${RUNNER_TEMP}/opc-gtpu-el9-grace" opc@127.0.0.1:/tmp/opc-gtpu-el9-grace
 
           # Record the kernel this evidence is about, and assert it is the
           # RHEL 9 line rather than whatever the image happens to ship.
@@ -630,7 +706,20 @@ jobs:
             systemd-detect-virt | grep -qE "kvm|qemu"
             sudo mountpoint -q /sys/fs/bpf || sudo mount -t bpf bpf /sys/fs/bpf
             chmod 0755 /tmp/opc-gtpu-el9-test
+            chmod 0755 /tmp/opc-gtpu-el9-grace
           '
+          if ! grace_output="$(
+            ssh "${ssh_options[@]}" opc@127.0.0.1 \
+              'sudo env OPC_GTPU_RUN_PRIVILEGED=1 /tmp/opc-gtpu-el9-grace --ignored --exact linux::reader_grace::tests::map_in_map_grace_waits_for_live_non_sleepable_reader --nocapture --test-threads=1' \
+              2>&1
+          )"; then
+            printf '%s\n' "${grace_output}"
+            exit 1
+          fi
+          printf '%s\n' "${grace_output}"
+          grep -Eq '^test result: ok\. 1 passed; 0 failed; 0 ignored;' <<< "${grace_output}"
+          grep -Fq 'OPC_GTPU_MAP_READER_GRACE_PROVEN' <<< "${grace_output}"
+          grep -Fxq 'OPC_GTPU_MAP_READER_GRACE_NEGATIVE_CONTROL_PROVEN' <<< "${grace_output}"
           if ! load_output="$(
             ssh "${ssh_options[@]}" opc@127.0.0.1 \
               'sudo env OPC_GTPU_RUN_PRIVILEGED=1 /tmp/opc-gtpu-el9-test --ignored --nocapture --test-threads=1 program_tag_candidates_match_the_running_kernel pre_redirect_tag_candidates_match_the_running_kernel committed_classifier_load_capability_is_loadable_and_leaves_no_state' \
