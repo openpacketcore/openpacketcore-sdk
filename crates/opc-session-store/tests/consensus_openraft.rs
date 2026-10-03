@@ -743,13 +743,7 @@ impl SessionConsensusPeer for LoopbackPeer {
                 drop(observations);
                 self.install_snapshot_observation_notify.notify_one();
 
-                if self
-                    .install_snapshot_responses_to_drop
-                    .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |remaining| {
-                        remaining.checked_sub(1)
-                    })
-                    .is_ok()
-                {
+                if take_one(&self.install_snapshot_responses_to_drop) {
                     *self
                         .dropped_install_snapshot_observation
                         .lock()
@@ -772,12 +766,7 @@ impl SessionConsensusPeer for LoopbackPeer {
         }
 
         if family == SessionConsensusRpcFamily::ForwardMutation
-            && self
-                .forward_responses_to_drop
-                .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |remaining| {
-                    remaining.checked_sub(1)
-                })
-                .is_ok()
+            && take_one(&self.forward_responses_to_drop)
         {
             self.dropped_forward_responses
                 .fetch_add(1, Ordering::SeqCst);
@@ -7062,4 +7051,17 @@ async fn committed_write_with_a_late_forward_result_is_typed_ambiguous_and_appli
     }
 
     panic!("no follower path was exercised while forward results were delayed");
+}
+
+fn take_one(counter: &AtomicUsize) -> bool {
+    let mut remaining = counter.load(Ordering::SeqCst);
+    loop {
+        let Some(next) = remaining.checked_sub(1) else {
+            return false;
+        };
+        match counter.compare_exchange_weak(remaining, next, Ordering::SeqCst, Ordering::SeqCst) {
+            Ok(_) => return true,
+            Err(observed) => remaining = observed,
+        }
+    }
 }

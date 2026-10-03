@@ -1791,22 +1791,11 @@ pub(crate) mod tests {
             let all_available = rpc_available.iter().all(|available| *available);
             let all_unavailable = rpc_available.iter().all(|available| !*available);
             drop(rpc_available);
-            let delayed_loss = all_unavailable
-                && self
-                    .delayed_loss_replies
-                    .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |remaining| {
-                        remaining.checked_sub(1)
-                    })
-                    .is_ok();
+            let delayed_loss = all_unavailable && take_one(&self.delayed_loss_replies);
             let delayed_recovery = all_available
                 && self.saw_isolation.load(Ordering::SeqCst)
                 && (self.never_recovers.load(Ordering::SeqCst)
-                    || self
-                        .delayed_recovery_replies
-                        .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |remaining| {
-                            remaining.checked_sub(1)
-                        })
-                        .is_ok());
+                    || take_one(&self.delayed_recovery_replies));
             let available = delayed_loss || all_available && !delayed_recovery;
             let required_quorum = self.member_count / 2 + 1;
             let journal_head = if self.batch_applied.load(Ordering::SeqCst) {
@@ -2533,5 +2522,19 @@ pub(crate) mod tests {
             invalid.validate(),
             Err(QualificationKubernetesConcurrentV5ConfigError::InvalidNamespace)
         );
+    }
+
+    fn take_one(counter: &AtomicUsize) -> bool {
+        let mut remaining = counter.load(Ordering::SeqCst);
+        loop {
+            let Some(next) = remaining.checked_sub(1) else {
+                return false;
+            };
+            match counter.compare_exchange_weak(remaining, next, Ordering::SeqCst, Ordering::SeqCst)
+            {
+                Ok(_) => return true,
+                Err(observed) => remaining = observed,
+            }
+        }
     }
 }

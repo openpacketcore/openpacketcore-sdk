@@ -96,18 +96,23 @@ impl VerificationMemory {
     }
 
     fn reserve_from(counter: &'static AtomicUsize, bytes: usize, limit: usize) -> io::Result<Self> {
-        counter
-            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |used| {
-                used.checked_add(bytes).filter(|total| *total <= limit)
-            })
-            .map_err(|_used| {
+        let mut used = counter.load(Ordering::Acquire);
+        loop {
+            let Some(next) = used.checked_add(bytes).filter(|total| *total <= limit) else {
                 #[cfg(feature = "test-control")]
                 eprintln!(
                     "verification_memory_admission_failure used={} requested={} limit={}",
-                    _used, bytes, limit,
+                    used, bytes, limit,
                 );
-                io::Error::other("portable snapshot verification memory limit reached")
-            })?;
+                return Err(io::Error::other(
+                    "portable snapshot verification memory limit reached",
+                ));
+            };
+            match counter.compare_exchange_weak(used, next, Ordering::AcqRel, Ordering::Acquire) {
+                Ok(_) => break,
+                Err(observed) => used = observed,
+            }
+        }
         Ok(Self { bytes, counter })
     }
 }

@@ -229,13 +229,7 @@ impl SessionQuorumConsumer for ControlledConsumer {
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .push(request.request_id());
         self.entered.notify_waiters();
-        if self
-            .blocked_remaining
-            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |remaining| {
-                remaining.checked_sub(1)
-            })
-            .is_ok()
-        {
+        if take_one(&self.blocked_remaining) {
             while self.block.load(Ordering::SeqCst) {
                 self.released.notified().await;
             }
@@ -903,6 +897,19 @@ async fn persistent_v2_prewarm_proves_server_peer_credential_rejection() {
 
     client.shutdown().await;
     handle.abort_and_wait().await;
+}
+
+fn take_one(counter: &AtomicUsize) -> bool {
+    let mut remaining = counter.load(Ordering::SeqCst);
+    loop {
+        let Some(next) = remaining.checked_sub(1) else {
+            return false;
+        };
+        match counter.compare_exchange_weak(remaining, next, Ordering::SeqCst, Ordering::SeqCst) {
+            Ok(_) => return true,
+            Err(observed) => remaining = observed,
+        }
+    }
 }
 
 #[tokio::test]
