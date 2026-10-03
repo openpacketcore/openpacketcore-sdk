@@ -17,6 +17,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   writer epochs and prepared authorities. The locked mock retains functional
   exact removal; Linux cleanup through this API remains unavailable.
 
+- `opc-gtpu-dataplane`: TFT classification can use a qualified private
+  map-in-map RCU grace when GLOBAL membarrier is unavailable, including
+  `nohz_full`. GLOBAL remains preferred, and unknown or realtime profiles
+  remain refused. Exact removal still waits after publishing its tombstone;
+  inactive-bank reuse now waits before any retained row is mutated. Failed
+  waits preserve rows for retry. An additive value-free unavailable-reason
+  API explains the capability gate. `opc-linux-gtpu-sys` owns the private
+  maps; no datapath map ABI or program changes are required. Fixes #1057.
+
 - `opc-session-net`: a prepared compare-and-set or lease acquire whose
   current voter answers with a complete `Rejected(Unavailable)` now moves the
   identical request to the next voter, as after a pre-write failure, and ends
@@ -39,10 +48,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   unmarked packets take mark zero without any filter row being read. A fence
   without a default bearer still drops. Before deleting any row, each removal
   attempt also waits for tc invocations that copied the active selector before
-  the fence, using the qualified GLOBAL membarrier grace of grouped selectors.
-  Where that grace is unavailable (PREEMPT_RT, nohz_full, an unrecognized
-  kernel profile or a refused membarrier query), TFT classification reports
-  Missing, and install, replacement and removal refuse before any mutation. The datapath object is
+  the fence, using a qualified kernel reader grace. Where no such grace is
+  available, TFT classification reports Missing, and install, replacement
+  and removal refuse before any mutation. The datapath object is
   rebuilt; the map ABI is unchanged. Fixes #1030.
 
 - Shared Openraft dependency: consume the exact 0.9.25 fork revision

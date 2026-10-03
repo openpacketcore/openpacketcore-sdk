@@ -26,6 +26,10 @@ defaults.
 - `repr(C)` layouts: `NetlinkMessageHeader`, `RouteAttributeHeader`,
   `IfInfoMessage`, `GenericNetlinkHeader`, and `NetlinkErrorMessage`.
 - `align_to_netlink` for Linux 4-byte netlink attribute/message alignment.
+- `BpfMapReaderGrace`, which owns two private, unpinned maps and performs a
+  fresh userspace ARRAY_OF_MAPS update. The caller must qualify the kernel's
+  RCU implementation and non-sleepable reader context; construction alone is
+  not a grace, and failed updates never count. No map descriptor is exposed.
 
 ## Usage
 
@@ -71,3 +75,18 @@ let _len = receive_message(&socket, &mut response)?;
 ```sh
 cargo test -p opc-linux-gtpu-sys
 ```
+
+The privileged GTP-U workflow separately runs
+`linux::reader_grace::tests::map_in_map_grace_waits_for_live_non_sleepable_reader`.
+It requires BPF/perf privileges, kprobe/kretprobe support, `bpf_loop`, and two
+allowed CPUs. It attaches no packet hooks. Kernel timestamps and exact paired
+RCU entry/return observations must enclose a live non-sleepable TC reader; an
+ordinary ARRAY update is a negative control. Missing prerequisites or missed
+overlap fail this qualification. The test does not prove native `nohz_full`,
+PREEMPT_RT, packet forwarding, or performance.
+The BPF observers reject other process/thread identities before reading their
+maps: perf task binding alone does not filter kprobe BPF execution. A grace
+from a separate thread must leave both trace records untouched.
+The separate `TFT nohz_full` VM matrix combines this proof with effective
+nohz CPU/GLOBAL checks and production Aya TFT packet lifecycle tests on the
+pinned Linux 6.8 and enterprise 5.14 guests.

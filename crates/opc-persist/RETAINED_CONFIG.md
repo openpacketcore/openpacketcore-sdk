@@ -107,6 +107,53 @@ and caller-bounded aggregate database/journal bytes (at most 64 GiB). Operations
 have caller-selected deadlines of at most one hour. Errors and `Debug` surfaces
 are value-free; no paths, keys or binding values enter lifecycle diagnostics.
 
+## Owning opener completion
+
+The three existing async constructors keep their signatures and admission
+outcomes. Callers that must account for shutdown completion can instead call
+`SqliteBackend::begin_provision_config_authority`,
+`SqliteBackend::begin_provision_config_member_repair`, or
+`SqliteBackend::begin_reopen_config_authority`. Each starts the same admission
+work immediately and returns a `RetainedConfigOpen`. These entry points retain
+the same independent provisioning authorization, member-repair restriction,
+and existing-only reopen contract.
+
+Keep this operation in the lifecycle owner, outside a startup or shutdown
+future that may be cancelled. `wait(&mut self)` waits only until the original
+absolute admission deadline. Cancelling a polled wait or reaching that deadline
+requests cancellation and denies any later capability transfer. A ready
+successful result is checked again before transfer, because a ready task may
+win over an expired timer. An unpolled wait has made no cancellation request.
+
+`cancel()` requests cooperative cancellation. `cancel_and_join(&mut self)`
+requests cancellation, discards any unclaimed successful backend on the
+runtime's blocking pool, and joins both opening and disposal. Cancelling that
+join future leaves its handles inside the operation; call it again to finish.
+The join has no deadline. Blocking system calls and SQLite close cannot be
+forcefully aborted, so no finite wall-clock retirement bound is promised.
+
+The returned `RetainedConfigOpenRetirement` distinguishes:
+
+- `Released { admission_error }`: opening and disposal have finished and the
+  operation's connection, retained lock and admission slot have been released.
+  `Indeterminate` still requires authoritative readback; joining is not rollback.
+- `BackendReturned`: `wait` already transferred a backend. Its clones and
+  outstanding work belong to the caller and are outside this retirement proof.
+
+A completed, unclaimed result retains its admission slot. A successful one also
+holds its SQLite connection and retained lock. Discarding it releases SQLite
+and the lock before the slot; at most four openers or unclaimed results can be
+owned at once. Taking an admitted backend releases the opener's slot while the
+backend continues to own its retained lock through the existing connection
+lifetime contract.
+
+Dropping the operation requests cancellation and relinquishes its handles; it
+provides no completion evidence. Drop attempts to move handle/result destruction
+to the captured runtime's blocking pool. Runtime shutdown can reject that work
+and run destruction synchronously. For explicit retirement, keep that runtime
+available until `cancel_and_join` finishes. A cancelled shutdown *future* does
+not itself shut down the runtime or relinquish the operation's ownership.
+
 ## Remaining external authority
 
 An intact authenticated database plus admission record can be coherently rolled
