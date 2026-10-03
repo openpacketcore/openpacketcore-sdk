@@ -17,14 +17,14 @@ use opc_linux_xfrm_sys::{
     ReceiveMessageOutcome, LINUX_EINVAL, LINUX_ENOPROTOOPT, NLMSG_DONE, NLMSG_ERROR, NLMSG_NOOP,
     NLMSG_OVERRUN, NLM_F_ACK, NLM_F_CREATE, NLM_F_DUMP, NLM_F_DUMP_INTR, NLM_F_EXCL, NLM_F_MULTI,
     NLM_F_REPLACE, NLM_F_REQUEST, XFRMA_ALG_AEAD, XFRMA_ALG_AUTH, XFRMA_ALG_AUTH_TRUNC,
-    XFRMA_ALG_CRYPT, XFRMA_ENCAP, XFRMA_IF_ID, XFRMA_LASTUSED, XFRMA_MARK, XFRMA_OFFLOAD_DEV,
-    XFRMA_PAD, XFRMA_POLICY_TYPE, XFRMA_REPLAY_ESN_VAL, XFRMA_REPLAY_VAL, XFRMA_SAD_CNT,
-    XFRMA_SA_DIR, XFRMA_SET_MARK, XFRMA_SET_MARK_MASK, XFRMA_TMPL, XFRM_AE_RVAL, XFRM_MSG_ALLOCSPI,
-    XFRM_MSG_DELPOLICY, XFRM_MSG_DELSA, XFRM_MSG_GETPOLICY, XFRM_MSG_GETSA, XFRM_MSG_GETSADINFO,
-    XFRM_MSG_MIGRATE_STATE, XFRM_MSG_NEWAE, XFRM_MSG_NEWPOLICY, XFRM_MSG_NEWSA,
-    XFRM_MSG_NEWSADINFO, XFRM_MSG_UPDPOLICY, XFRM_MSG_UPDSA, XFRM_POLICY_ALLOW, XFRM_POLICY_BLOCK,
-    XFRM_POLICY_FWD, XFRM_POLICY_IN, XFRM_POLICY_OUT, XFRM_POLICY_TYPE_MAIN, XFRM_SA_DIR_IN,
-    XFRM_SA_DIR_OUT, XFRM_STATE_ESN,
+    XFRMA_ALG_COMP, XFRMA_ALG_CRYPT, XFRMA_ENCAP, XFRMA_IF_ID, XFRMA_LASTUSED, XFRMA_MARK,
+    XFRMA_OFFLOAD_DEV, XFRMA_PAD, XFRMA_POLICY_TYPE, XFRMA_REPLAY_ESN_VAL, XFRMA_REPLAY_VAL,
+    XFRMA_SAD_CNT, XFRMA_SA_DIR, XFRMA_SET_MARK, XFRMA_SET_MARK_MASK, XFRMA_TMPL, XFRM_AE_RVAL,
+    XFRM_MSG_ALLOCSPI, XFRM_MSG_DELPOLICY, XFRM_MSG_DELSA, XFRM_MSG_GETPOLICY, XFRM_MSG_GETSA,
+    XFRM_MSG_GETSADINFO, XFRM_MSG_MIGRATE_STATE, XFRM_MSG_NEWAE, XFRM_MSG_NEWPOLICY,
+    XFRM_MSG_NEWSA, XFRM_MSG_NEWSADINFO, XFRM_MSG_UPDPOLICY, XFRM_MSG_UPDSA, XFRM_POLICY_ALLOW,
+    XFRM_POLICY_BLOCK, XFRM_POLICY_FWD, XFRM_POLICY_IN, XFRM_POLICY_OUT, XFRM_POLICY_TYPE_MAIN,
+    XFRM_SA_DIR_IN, XFRM_SA_DIR_OUT, XFRM_STATE_ESN,
 };
 use subtle::ConstantTimeEq;
 use zeroize::Zeroizing;
@@ -37,11 +37,10 @@ use crate::durable_relocation::{XfrmSaRelocationRecoveryProofKey, XfrmSaRelocati
 #[cfg(unix)]
 use crate::durable_roster::{XfrmObjectRosterRecoveryProofKey, XfrmObjectRosterRecoveryStore};
 use crate::model::{
-    authorize_exact_sa_removal, sa_uses_esn, validate_exact_remove_policy_request,
-    validate_exact_remove_sa_request, validate_policy_query, validate_relocate_sa_request,
-    validate_sa_lookup_key, validate_sa_output_mark, validate_sa_query, ExactRemovePolicyRequest,
-    ExactRemoveSaRequest, QueryPolicyRequest, SaKeySnapshot, SaLookupKey,
-    EXACT_SA_REMOVAL_PREFLIGHT,
+    sa_uses_esn, validate_exact_remove_policy_request, validate_exact_remove_sa_request,
+    validate_policy_query, validate_relocate_sa_request, validate_sa_lookup_key,
+    validate_sa_output_mark, validate_sa_query, ExactRemovePolicyRequest, ExactRemoveSaRequest,
+    QueryPolicyRequest, SaKeySnapshot, SaLookupKey,
 };
 #[cfg(unix)]
 use crate::namespace::XfrmObjectRecoveryBindError;
@@ -89,6 +88,10 @@ const XFRM_SPI_OFFSET_IN_SA_INFO: usize = XFRM_SELECTOR_LEN + XFRM_ADDRESS_LEN;
 
 const AF_INET: u16 = 2;
 const AF_INET6: u16 = 10;
+/// Linux `IPPROTO_AH`.
+const IPPROTO_AH: u8 = 51;
+/// Linux `IPPROTO_COMP` (IPComp).
+const IPPROTO_COMP: u8 = 108;
 const XFRM_INF: u64 = u64::MAX;
 const ENOENT: i32 = 2;
 const ESRCH: i32 = 3;
@@ -100,7 +103,6 @@ const SA_RELOCATION_PROBE_SPI: u32 = 0xffff_fffe;
 const XFRM_KEY_READBACK_REDACTED: &str = "xfrm_key_readback_redacted";
 const EXACT_POLICY_REMOVAL_PREFLIGHT: &str = "remove_policy_exact_preflight";
 const SA_KEY_SNAPSHOT: &str = "query_sa_key_snapshot";
-const EXACT_SA_REMOVAL: &str = "remove_sa_exact";
 /// Counted key reads attempted before a key read fails closed.
 ///
 /// A read is repeated when the kernel flags its dump interrupted or when the
@@ -928,6 +930,13 @@ impl LinuxXfrmBackend {
 
     /// One counted key read on one socket: SAD count, unfiltered dump, SAD
     /// count. `Ok(None)` means the read cannot be proven complete.
+    ///
+    /// Equal counts prove the dump complete only if no state the dump
+    /// returned was inserted after the first count: such a state can stand
+    /// in for one the dump dropped. The caller excludes other userspace SA
+    /// writers, and the one state Linux inserts on its own is a larval
+    /// ACQUIRE state (`xfrm_state_find`), so the read also fails when the
+    /// dump returned any larval state, or any state it cannot classify.
     fn counted_sa_key_read(
         &self,
         session: &mut dyn LinuxXfrmSession,
@@ -949,6 +958,7 @@ impl LinuxXfrmBackend {
             &[],
         )?)?;
         let mut dumped = 0_u64;
+        let mut unestablished = false;
         let mut states = Vec::new();
         let config = self.inner.config;
         let completion = receive_netlink_dump(
@@ -959,6 +969,10 @@ impl LinuxXfrmBackend {
             |buffer| session.receive(buffer),
             &mut |message| {
                 dumped = dumped.saturating_add(1);
+                if dumped_state_kind(message, operation)? != DumpedStateKind::Established {
+                    unestablished = true;
+                    return Ok(());
+                }
                 if let Some(identity) = sa_key_member_identity(message, key, operation)? {
                     states.push(identity);
                 }
@@ -968,7 +982,7 @@ impl LinuxXfrmBackend {
         // An interrupted dump's later batches may still be queued on this
         // socket, so it carries no further request; the read restarts on a
         // fresh one.
-        if completion == NetlinkDumpCompletion::Interrupted {
+        if completion == NetlinkDumpCompletion::Interrupted || unestablished {
             return Ok(None);
         }
         let count_after = self.sad_state_count(session, operation)?;
@@ -1529,24 +1543,9 @@ impl XfrmBackend for LinuxXfrmBackend {
 
     async fn remove_sa_exact(&self, request: ExactRemoveSaRequest) -> Result<(), XfrmError> {
         validate_exact_remove_sa_request(&request)?;
-        let snapshot = self
-            .snapshot_sa_key_blocking(request.key(), EXACT_SA_REMOVAL_PREFLIGHT)
-            .await?;
-        authorize_exact_sa_removal(&snapshot, request.expected())?;
-        let removal = request.removal();
-        let body = encode_sa_id(
-            removal.destination,
-            removal.protocol,
-            removal.spi,
-            removal.mark,
-        )?;
-        self.run_ack(
-            EXACT_SA_REMOVAL,
-            XFRM_MSG_DELSA,
-            NLM_F_REQUEST | NLM_F_ACK,
-            body,
-        )
-        .await
+        Err(XfrmError::UnsupportedFeature {
+            feature: "exact_sa_removal",
+        })
     }
 
     async fn install_policy(&self, request: InstallPolicyRequest) -> Result<(), XfrmError> {
@@ -3254,6 +3253,68 @@ fn parse_sa_relocation_snapshot(payload: &[u8]) -> Result<SaRelocationSnapshot, 
         output_mark: state.output_mark,
     };
     Ok(SaRelocationSnapshot { state, identity })
+}
+
+/// What a dumped state reveals about whether it is larval.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DumpedStateKind {
+    /// An AH, ESP, or IPComp state carrying the transform its protocol
+    /// requires.
+    Established,
+    /// An AH, ESP, or IPComp state without that transform: a larval
+    /// (`XFRM_STATE_ACQ`) state, from a kernel ACQUIRE or an SPI allocation.
+    Larval,
+    /// A state of another protocol, whose larval and established forms look
+    /// alike in a dump.
+    Unclassified,
+}
+
+/// Classify one dumped state.
+///
+/// A dump does not report a state's `km.state`: `copy_to_user_state` fills
+/// `xfrm_usersa_info` from the id, selector, lifetimes, statistics, outer
+/// source, mode, replay window, request ID, family, flags, and `km.seq`.
+/// The transform attributes tell larval states apart instead. Linux creates
+/// a larval state without any transform (the ACQUIRE path of
+/// `xfrm_state_find`, and `__find_acq_core` for SPI allocation), while
+/// `esp_init_state`, `ah_init_state`, and `ipcomp_init_state` refuse an
+/// established ESP state without AEAD or CRYPT, an AH state without AUTH,
+/// and an IPComp state without COMP. `copy_to_user_state_extra` reports
+/// every transform a state has. Other protocols, such as the IPIP helper
+/// states IPComp creates, have no transform when established either.
+fn dumped_state_kind(
+    payload: &[u8],
+    operation: &'static str,
+) -> Result<DumpedStateKind, XfrmError> {
+    const PROTOCOL_OFFSET: usize = XFRM_SPI_OFFSET_IN_SA_INFO + 4;
+
+    if payload.len() < XFRM_USER_SA_INFO_LEN {
+        return Err(XfrmError::io(
+            operation,
+            invalid_data("short state dump message"),
+        ));
+    }
+    let required: &[u16] = match read_u8(payload, PROTOCOL_OFFSET)? {
+        IPPROTO_ESP => &[XFRMA_ALG_AEAD, XFRMA_ALG_CRYPT],
+        IPPROTO_AH => &[XFRMA_ALG_AUTH, XFRMA_ALG_AUTH_TRUNC],
+        IPPROTO_COMP => &[XFRMA_ALG_COMP],
+        _ => return Ok(DumpedStateKind::Unclassified),
+    };
+    validate_route_attribute_stream(payload, XFRM_USER_SA_INFO_LEN, operation)?;
+    let mut offset = XFRM_USER_SA_INFO_LEN;
+    while offset < payload.len() {
+        let len = usize::from(read_u16_ne(payload, offset)?);
+        if required.contains(&read_u16_ne(payload, offset + 2)?) {
+            return Ok(DumpedStateKind::Established);
+        }
+        offset += align_to_netlink(len).ok_or_else(|| {
+            XfrmError::io(
+                operation,
+                invalid_data("route attribute alignment overflow"),
+            )
+        })?;
+    }
+    Ok(DumpedStateKind::Larval)
 }
 
 /// Decode one state-dump message into an identity when the state is at

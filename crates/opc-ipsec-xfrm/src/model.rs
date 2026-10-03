@@ -1168,6 +1168,10 @@ impl SaRelocationSelector {
 /// destination, SPI, protocol, family, and lookup mark. The remaining fields
 /// are an optimistic-concurrency snapshot: the backend checks them before the
 /// mutation and preserves them in the relocated state.
+///
+/// This view omits algorithm, key, lifetime and replay fingerprints. Matching
+/// its fields, including the lookup mark, does not establish installation
+/// ownership or authorize cleanup of a kernel SA.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SaRelocationIdentity {
     /// Current exact packet selector.
@@ -1536,15 +1540,15 @@ pub(crate) fn validate_sa_lookup_key(key: SaLookupKey) -> Result<(), XfrmError> 
 /// Every SA state at one lookup key, read in one complete pass.
 ///
 /// Returned by [`crate::XfrmBackend::query_sa_key_snapshot`]. Each state is a
-/// complete [`SaRelocationIdentity`], whatever its lookup mark. The order is
+/// [`SaRelocationIdentity`] view, whatever its lookup mark. The order is
 /// the backend's report order (newest first on Linux), **not** lookup order:
 /// Linux selects the first matching state in an SPI hash chain, and a hash
 /// resize can reverse that chain.
 ///
 /// [`Self::lookup_candidates`] applies the Linux lookup predicate. When it
-/// yields exactly one state for a lookup mark, a GETSA or DELSA carrying that
-/// mark can select only that state, whatever the chain order, until a writer
-/// changes the states at the key.
+/// yields exactly one state for a lookup mark, that state is the sole candidate
+/// at the observed point in time. A later insertion or replacement can change
+/// the selection. This observation does not authorize a later deletion.
 ///
 /// Debug output is redacted: it reports only the number of states.
 #[derive(Clone, PartialEq, Eq)]
@@ -1610,7 +1614,8 @@ impl SaKeySnapshot {
     /// value, or zero when `mark` is `None`, and an unmarked state stores
     /// `{ 0, 0 }`, so an unmarked state is a candidate for every lookup. Linux
     /// returns the first candidate in hash-chain order, which no snapshot can
-    /// report; only a single candidate makes the selection certain.
+    /// report. A sole candidate describes the snapshot's selection only;
+    /// this iterator does not fence later changes to kernel state.
     pub fn lookup_candidates(
         &self,
         mark: Option<XfrmLookupMark>,
@@ -1629,35 +1634,32 @@ impl fmt::Debug for SaKeySnapshot {
     }
 }
 
-/// Request to remove one SA only when a fresh key snapshot proves that the
-/// deletion's own lookup can select nothing else.
+/// Request to remove one SA through a backend that can keep its state
+/// observation and deletion mutually exclusive with every competing change.
 ///
-/// `expected` is the complete identity of the SA to remove, normally taken
+/// `expected` contains the observed identity fields to match, normally taken
 /// from [`crate::XfrmBackend::query_sa_key_snapshot`] or
 /// [`crate::XfrmBackend::query_sa_relocation_identity`]. Its destination,
-/// protocol, and SPI name the key, and its lookup mark is the mark the
-/// deletion carries. See [`crate::XfrmBackend::remove_sa_exact`].
+/// protocol, and SPI name the key, and its lookup mark describes the deletion
+/// lookup. These fields are not complete SA fingerprints or installation
+/// ownership. The default and Linux backends validate and refuse this request
+/// with `UnsupportedFeature { feature: "exact_sa_removal" }` before any read
+/// or effect. The mock implements it under one state lock. See
+/// [`crate::XfrmBackend::remove_sa_exact`].
 ///
 /// Debug output is redacted because the identity carries addresses, an SPI,
 /// and marks.
 ///
 /// ```rust,no_run
-/// use opc_ipsec_xfrm::{ExactRemoveSaRequest, SaLookupKey, XfrmBackend, XfrmLookupMark};
+/// use opc_ipsec_xfrm::{ExactRemoveSaRequest, MockXfrmBackend, SaRelocationIdentity, XfrmBackend};
 ///
-/// async fn remove_owned_marked_sa(
-///     backend: &impl XfrmBackend,
-///     key: SaLookupKey,
-///     mark: XfrmLookupMark,
+/// async fn remove_expected_mock_sa(
+///     backend: &MockXfrmBackend,
+///     expected: SaRelocationIdentity,
 /// ) -> Result<(), opc_ipsec_xfrm::XfrmError> {
-///     let snapshot = backend.query_sa_key_snapshot(key).await?;
-///     // The state this process installed, identified by its mark.
-///     let Some(owned) = snapshot.states().iter().find(|state| state.mark == Some(mark)) else {
-///         return Ok(());
-///     };
-///     // Refused with StateIndeterminate while another state, such as an
-///     // unmarked one, also answers this mark at the key.
+///     // The mock checks and removes the sole matching candidate under one lock.
 ///     backend
-///         .remove_sa_exact(ExactRemoveSaRequest::new(owned.clone()))
+///         .remove_sa_exact(ExactRemoveSaRequest::new(expected))
 ///         .await
 /// }
 /// ```
@@ -1667,7 +1669,7 @@ pub struct ExactRemoveSaRequest {
 }
 
 impl ExactRemoveSaRequest {
-    /// Build a removal request for the SA with this complete identity.
+    /// Build a removal request with these expected identity fields.
     #[must_use]
     pub const fn new(expected: SaRelocationIdentity) -> Self {
         Self { expected }
@@ -1685,7 +1687,7 @@ impl ExactRemoveSaRequest {
         self.expected
     }
 
-    /// The lookup key the removal reads and deletes from.
+    /// The lookup key named by this request.
     #[must_use]
     pub const fn key(&self) -> SaLookupKey {
         SaLookupKey::new(
@@ -1695,7 +1697,9 @@ impl ExactRemoveSaRequest {
         )
     }
 
-    /// The deletion this request issues once the snapshot authorizes it.
+    /// The unconditional deletion tuple corresponding to this request.
+    ///
+    /// Deriving this tuple grants no deletion or cleanup authority.
     #[must_use]
     pub const fn removal(&self) -> RemoveSaRequest {
         RemoveSaRequest {
@@ -1733,6 +1737,9 @@ pub(crate) fn validate_exact_remove_sa_request(
 ///
 /// The deletion's lookup can select only a candidate under the Linux
 /// predicate, so exactly one candidate that equals `expected` authorizes it.
+/// The caller must exclude every state change through deletion. Only the
+/// locked mock currently uses this helper; a snapshot alone cannot authorize
+/// a kernel deletion.
 /// No candidate is [`XfrmError::NotFound`], and one different candidate is
 /// [`XfrmError::StateMismatch`]. Two or more candidates are
 /// [`XfrmError::StateIndeterminate`]: the chain order decides which one a

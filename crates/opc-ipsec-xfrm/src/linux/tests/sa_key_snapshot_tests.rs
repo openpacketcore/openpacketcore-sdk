@@ -442,8 +442,8 @@ async fn a_dump_shorter_than_the_sad_count_is_never_complete() {
     );
     assert_eq!(transport.sessions(), SA_KEY_SNAPSHOT_READ_ATTEMPTS);
 
-    // The same short dump never authorizes a deletion: the marked state looks
-    // like the sole candidate, but the dump is not complete.
+    // Exact removal refuses before trying this same incomplete dump, even
+    // though its reported marked state would look like the sole candidate.
     let transport = KernelTransport::new(
         (0..SA_KEY_SNAPSHOT_READ_ATTEMPTS)
             .map(|_| short())
@@ -456,13 +456,140 @@ async fn a_dump_shorter_than_the_sad_count_is_never_complete() {
     assert!(
         matches!(
             error,
-            XfrmError::StateIndeterminate {
-                operation: "remove_sa_exact_preflight"
+            XfrmError::UnsupportedFeature {
+                feature: "exact_sa_removal"
             }
         ),
         "{error:?}"
     );
+    assert_eq!(transport.sessions(), 0);
+    assert!(transport.session_requests().is_empty());
     assert!(transport.transactions().is_empty(), "no DELSA was sent");
+}
+
+/// A larval state as the dump reports it: the protocol's transform
+/// attributes are absent. Kernel ACQUIRE states (`xfrm_state_find`) and SPI
+/// allocations (`__find_acq_core`) never carry one.
+fn larval_body(parameters: &SaParameters, spi: u32) -> Vec<u8> {
+    let mut body = sa_body(parameters)[..XFRM_USER_SA_INFO_LEN].to_vec();
+    body[XFRM_SPI_OFFSET_IN_SA_INFO..XFRM_SPI_OFFSET_IN_SA_INFO + 4]
+        .copy_from_slice(&spi.to_be_bytes());
+    body
+}
+
+#[tokio::test]
+async fn an_acquire_state_standing_in_for_an_omitted_state_is_never_complete() {
+    // The review counterexample: the namespace holds a small state E and an
+    // oversized state U at the key, so the first count is 2. A kernel
+    // ACQUIRE state A is inserted before the dump starts; the dump returns A
+    // and E and ends silently at U; E expires before the second count. All
+    // three numbers are 2, yet U is missing.
+    let mut elsewhere = disjoint_sa();
+    elsewhere.id.spi += 7;
+    let acquire = larval_body(&unmarked_sa(), 0);
+    let counterexample = || {
+        ScriptedRead::dump(vec![vec![
+            Scripted::member(acquire.clone()),
+            Scripted::member(sa_body(&elsewhere)),
+            Scripted::done(),
+        ]])
+        .counted(2, 2)
+    };
+    let transport = KernelTransport::new(
+        (0..SA_KEY_SNAPSHOT_READ_ATTEMPTS)
+            .map(|_| counterexample())
+            .collect(),
+    );
+    let read = LinuxXfrmBackend::with_transport(transport.clone())
+        .query_sa_key_snapshot(key())
+        .await;
+    assert!(
+        matches!(
+            read,
+            Err(XfrmError::StateIndeterminate {
+                operation: SA_KEY_SNAPSHOT
+            })
+        ),
+        "{read:?}"
+    );
+    assert_eq!(transport.sessions(), SA_KEY_SNAPSHOT_READ_ATTEMPTS);
+
+    // Exact removal refuses before reading and cannot report U absent.
+    let transport = KernelTransport::new(
+        (0..SA_KEY_SNAPSHOT_READ_ATTEMPTS)
+            .map(|_| counterexample())
+            .collect(),
+    );
+    let removal = LinuxXfrmBackend::with_transport(transport.clone())
+        .remove_sa_exact(ExactRemoveSaRequest::new(identity(&marked_sa())))
+        .await;
+    assert!(
+        matches!(
+            removal,
+            Err(XfrmError::UnsupportedFeature {
+                feature: "exact_sa_removal"
+            })
+        ),
+        "{removal:?}"
+    );
+    assert_eq!(transport.sessions(), 0);
+    assert!(transport.session_requests().is_empty());
+    assert!(transport.transactions().is_empty(), "no DELSA was sent");
+}
+
+#[tokio::test]
+async fn any_larval_or_unclassifiable_state_makes_the_read_indeterminate() {
+    // A larval state anywhere, including at the key itself with the key's
+    // SPI (an SPI allocation, or an ACQUIRE for a template naming that SPI),
+    // or a state of a protocol whose larval and established forms look alike.
+    let mut ipip = sa_body(&disjoint_sa());
+    ipip[XFRM_SPI_OFFSET_IN_SA_INFO + 4] = 4;
+    let at_key = larval_body(&unmarked_sa(), unmarked_sa().id.spi);
+    for extra in [larval_body(&disjoint_sa(), 0x0bad_0001), at_key, ipip] {
+        let transport = KernelTransport::new(
+            (0..SA_KEY_SNAPSHOT_READ_ATTEMPTS)
+                .map(|_| {
+                    ScriptedRead::dump(vec![vec![
+                        Scripted::member(sa_body(&marked_sa())),
+                        Scripted::member(extra.clone()),
+                        Scripted::done(),
+                    ]])
+                })
+                .collect(),
+        );
+        let read = LinuxXfrmBackend::with_transport(transport.clone())
+            .query_sa_key_snapshot(key())
+            .await;
+        assert!(
+            matches!(
+                read,
+                Err(XfrmError::StateIndeterminate {
+                    operation: SA_KEY_SNAPSHOT
+                })
+            ),
+            "{read:?}"
+        );
+        assert_eq!(transport.sessions(), SA_KEY_SNAPSHOT_READ_ATTEMPTS);
+    }
+
+    // Once the larval state is gone, the next attempt completes.
+    let transport = KernelTransport::new(vec![
+        ScriptedRead::dump(vec![vec![
+            Scripted::member(larval_body(&unmarked_sa(), 0)),
+            Scripted::member(sa_body(&marked_sa())),
+            Scripted::done(),
+        ]]),
+        ScriptedRead::dump(vec![vec![
+            Scripted::member(sa_body(&marked_sa())),
+            Scripted::done(),
+        ]]),
+    ]);
+    let snapshot = LinuxXfrmBackend::with_transport(transport.clone())
+        .query_sa_key_snapshot(key())
+        .await
+        .unwrap();
+    assert_eq!(snapshot.states(), &[identity(&marked_sa())]);
+    assert_eq!(transport.sessions(), 2);
 }
 
 #[tokio::test]
@@ -898,12 +1025,20 @@ async fn key_snapshot_keeps_exactly_the_states_lookup_compares_with_the_key() {
 
 #[tokio::test]
 async fn key_snapshot_skips_unrepresentable_states_elsewhere_but_not_at_the_key() {
+    // A well-formed established state at another key is classified and
+    // counted but not decoded, so a mark the SDK cannot represent there does
+    // not fail the read.
     let mut other_spi = marked_sa();
     other_spi.id.spi += 1;
-    let mut broken_elsewhere = sa_body(&other_spi);
-    broken_elsewhere.extend_from_slice(&[0xff; 3]);
+    let mut noncanonical_elsewhere = sa_body(&other_spi);
+    append_attr(
+        &mut noncanonical_elsewhere,
+        XFRMA_MARK,
+        &[0x11_u32.to_ne_bytes(), 0xf0_u32.to_ne_bytes()].concat(),
+    )
+    .unwrap();
     let transport = KernelTransport::new(vec![ScriptedRead::dump(vec![vec![
-        Scripted::member(broken_elsewhere),
+        Scripted::member(noncanonical_elsewhere),
         Scripted::member(sa_body(&marked_sa())),
         Scripted::done(),
     ]])]);
@@ -922,9 +1057,12 @@ async fn key_snapshot_skips_unrepresentable_states_elsewhere_but_not_at_the_key(
         &[0x11_u32.to_ne_bytes(), 0xf0_u32.to_ne_bytes()].concat(),
     )
     .unwrap();
-    // So does a truncated member at any key.
+    // So do a truncated member and a malformed attribute stream at any key,
+    // because every state must be classified as established or larval.
     let short = sa_body(&marked_sa())[..XFRM_USER_SA_INFO_LEN - 1].to_vec();
-    for body in [noncanonical, short] {
+    let mut malformed_elsewhere = sa_body(&other_spi);
+    malformed_elsewhere.extend_from_slice(&[0xff; 3]);
+    for body in [noncanonical, short, malformed_elsewhere] {
         let transport = KernelTransport::new(vec![ScriptedRead::dump(vec![vec![
             Scripted::member(sa_body(&marked_sa())),
             Scripted::member(body),
@@ -946,6 +1084,73 @@ async fn key_snapshot_skips_unrepresentable_states_elsewhere_but_not_at_the_key(
             "{error:?}"
         );
     }
+}
+
+#[test]
+fn dumped_states_are_classified_by_their_required_transform() {
+    let classify = |body: &[u8]| dumped_state_kind(body, SA_KEY_SNAPSHOT).unwrap();
+    let with_protocol = |body: &[u8], protocol: u8| {
+        let mut body = body.to_vec();
+        body[XFRM_SPI_OFFSET_IN_SA_INFO + 4] = protocol;
+        body
+    };
+    let bare = larval_body(&marked_sa(), 0);
+    let with_attr = |attr_type: u16, payload: &[u8]| {
+        let mut body = bare.clone();
+        append_attr(&mut body, attr_type, payload).unwrap();
+        body
+    };
+    // ESP needs AEAD or CRYPT; AUTH alone is not enough.
+    assert_eq!(
+        classify(&sa_body(&marked_sa())),
+        DumpedStateKind::Established
+    );
+    assert_eq!(
+        classify(&with_attr(XFRMA_ALG_AEAD, &[0; 72])),
+        DumpedStateKind::Established
+    );
+    assert_eq!(
+        classify(&with_attr(XFRMA_ALG_AUTH_TRUNC, &[0; 72])),
+        DumpedStateKind::Larval
+    );
+    assert_eq!(classify(&bare), DumpedStateKind::Larval);
+    // AH needs AUTH or AUTH_TRUNC, and IPComp needs COMP.
+    for (attr_type, protocol, kind) in [
+        (XFRMA_ALG_AUTH, IPPROTO_AH, DumpedStateKind::Established),
+        (
+            XFRMA_ALG_AUTH_TRUNC,
+            IPPROTO_AH,
+            DumpedStateKind::Established,
+        ),
+        (XFRMA_ALG_CRYPT, IPPROTO_AH, DumpedStateKind::Larval),
+        (XFRMA_ALG_COMP, IPPROTO_COMP, DumpedStateKind::Established),
+        (XFRMA_ALG_AUTH, IPPROTO_COMP, DumpedStateKind::Larval),
+    ] {
+        assert_eq!(
+            classify(&with_protocol(&with_attr(attr_type, &[0; 68]), protocol)),
+            kind
+        );
+    }
+    assert_eq!(
+        classify(&with_protocol(&bare, IPPROTO_AH)),
+        DumpedStateKind::Larval
+    );
+    assert_eq!(
+        classify(&with_protocol(&bare, IPPROTO_COMP)),
+        DumpedStateKind::Larval
+    );
+    // IPIP and every other protocol cannot be told apart.
+    for protocol in [0, 4, 41, 43, 60] {
+        assert_eq!(
+            classify(&with_protocol(&sa_body(&marked_sa()), protocol)),
+            DumpedStateKind::Unclassified
+        );
+    }
+    // A malformed attribute stream or a short member is an error.
+    let mut malformed = sa_body(&marked_sa());
+    malformed.extend_from_slice(&[0xff; 3]);
+    assert!(dumped_state_kind(&malformed, SA_KEY_SNAPSHOT).is_err());
+    assert!(dumped_state_kind(&bare[..XFRM_USER_SA_INFO_LEN - 1], SA_KEY_SNAPSHOT).is_err());
 }
 
 #[tokio::test]
@@ -1027,7 +1232,78 @@ async fn key_snapshot_rejects_invalid_keys_before_any_request() {
 }
 
 #[tokio::test]
-async fn exact_removal_refuses_marked_and_unmarked_overlap_without_delsa() {
+async fn unfenced_exact_removal_linux_refuses_before_opening_any_netlink_session() {
+    let mut changed = marked_sa();
+    changed.request_id = XfrmRequestId::new(0x0a0a);
+    for states in [
+        vec![disjoint_sa(), marked_sa()],
+        vec![marked_sa()],
+        vec![unmarked_sa(), marked_sa()],
+        vec![changed],
+        Vec::new(),
+    ] {
+        let mut dump: Vec<_> = states
+            .iter()
+            .map(|state| Scripted::member(sa_body(state)))
+            .collect();
+        dump.push(Scripted::done());
+        let transport = KernelTransport::new(vec![ScriptedRead::dump(vec![dump])]);
+        let result = LinuxXfrmBackend::with_transport(transport.clone())
+            .remove_sa_exact(ExactRemoveSaRequest::new(identity(&marked_sa())))
+            .await;
+
+        assert_eq!(transport.sessions(), 0, "no snapshot session may be opened");
+        assert!(
+            transport.session_requests().is_empty(),
+            "no read may be sent"
+        );
+        assert!(
+            transport.transactions().is_empty(),
+            "no deletion may be sent"
+        );
+        assert_eq!(transport.reads.lock().unwrap().len(), 1);
+        assert!(
+            matches!(
+                result,
+                Err(XfrmError::UnsupportedFeature {
+                    feature: "exact_sa_removal"
+                })
+            ),
+            "{result:?}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn unfenced_exact_removal_linux_validates_before_refusing() {
+    let transport = KernelTransport::new(Vec::new());
+    let backend = LinuxXfrmBackend::with_transport(transport.clone());
+    let mut zero_spi = identity(&marked_sa());
+    zero_spi.id.spi = 0;
+    let mut wrong_protocol = identity(&marked_sa());
+    wrong_protocol.id.protocol = 17;
+    let mut zero_if_id = identity(&marked_sa());
+    zero_if_id.if_id = Some(0);
+    for (expected, field) in [
+        (zero_spi, "sa_key.spi"),
+        (wrong_protocol, "sa_key.protocol"),
+        (zero_if_id, "sa.if_id"),
+    ] {
+        let result = backend
+            .remove_sa_exact(ExactRemoveSaRequest::new(expected))
+            .await;
+        assert!(
+            matches!(result, Err(XfrmError::InvalidConfig { field: actual, .. }) if actual == field),
+            "{result:?}"
+        );
+        assert_eq!(transport.sessions(), 0);
+        assert!(transport.session_requests().is_empty());
+        assert!(transport.transactions().is_empty());
+    }
+}
+
+#[tokio::test]
+async fn exact_removal_refuses_marked_and_unmarked_overlap_without_any_request() {
     let transport = KernelTransport::new(vec![ScriptedRead::dump(vec![vec![
         Scripted::member(sa_body(&unmarked_sa())),
         Scripted::member(sa_body(&marked_sa())),
@@ -1040,18 +1316,19 @@ async fn exact_removal_refuses_marked_and_unmarked_overlap_without_delsa() {
     assert!(
         matches!(
             error,
-            XfrmError::StateIndeterminate {
-                operation: "remove_sa_exact_preflight"
+            XfrmError::UnsupportedFeature {
+                feature: "exact_sa_removal"
             }
         ),
         "{error:?}"
     );
-    assert_eq!(transport.dump_requests().len(), 1);
+    assert_eq!(transport.sessions(), 0);
+    assert!(transport.session_requests().is_empty());
     assert!(transport.transactions().is_empty(), "no DELSA was sent");
 }
 
 #[tokio::test]
-async fn exact_removal_deletes_the_sole_candidate_with_its_lookup_mark() {
+async fn exact_removal_refuses_a_sole_candidate_before_any_request() {
     // The disjoint full-mask state is at the key but cannot answer the
     // marked lookup.
     let transport = KernelTransport::new(vec![ScriptedRead::dump(vec![vec![
@@ -1059,37 +1336,33 @@ async fn exact_removal_deletes_the_sole_candidate_with_its_lookup_mark() {
         Scripted::member(sa_body(&marked_sa())),
         Scripted::done(),
     ]])]);
-    LinuxXfrmBackend::with_transport(transport.clone())
+    let error = LinuxXfrmBackend::with_transport(transport.clone())
         .remove_sa_exact(ExactRemoveSaRequest::new(identity(&marked_sa())))
         .await
-        .unwrap();
+        .unwrap_err();
 
-    let transactions = transport.transactions();
-    assert_eq!(transactions.len(), 1);
-    let (operation, request) = &transactions[0];
-    assert_eq!(*operation, "remove_sa_exact");
-    assert_eq!(netlink_message_type(request), XFRM_MSG_DELSA);
-    let sa = marked_sa();
-    assert_eq!(
-        netlink_body(request),
-        encode_sa_id(sa.id.destination, sa.id.protocol, sa.id.spi, sa.mark)
-            .unwrap()
-            .as_slice()
+    assert!(
+        matches!(
+            error,
+            XfrmError::UnsupportedFeature {
+                feature: "exact_sa_removal"
+            }
+        ),
+        "{error:?}"
     );
-    assert_eq!(
-        route_attr_payload_from(netlink_body(request), XFRM_USER_SA_ID_LEN, XFRMA_MARK),
-        Some(&[0x42_u32.to_ne_bytes(), u32::MAX.to_ne_bytes()].concat()[..])
-    );
+    assert_eq!(transport.sessions(), 0);
+    assert!(transport.session_requests().is_empty());
+    assert!(transport.transactions().is_empty(), "no DELSA was sent");
 }
 
 #[tokio::test]
-async fn exact_removal_reports_absent_or_changed_states_without_delsa() {
+async fn exact_removal_refuses_absent_or_changed_states_without_reading() {
     let mut changed = marked_sa();
     changed.request_id = XfrmRequestId::new(0x0a0a);
-    for (states, expected) in [
-        (Vec::new(), "not_found"),
-        (vec![Scripted::member(sa_body(&changed))], "mismatch"),
-        (vec![Scripted::member(sa_body(&unmarked_sa()))], "mismatch"),
+    for states in [
+        Vec::new(),
+        vec![Scripted::member(sa_body(&changed))],
+        vec![Scripted::member(sa_body(&unmarked_sa()))],
     ] {
         let mut dump = states;
         dump.push(Scripted::done());
@@ -1098,24 +1371,23 @@ async fn exact_removal_reports_absent_or_changed_states_without_delsa() {
             .remove_sa_exact(ExactRemoveSaRequest::new(identity(&marked_sa())))
             .await
             .unwrap_err();
-        match expected {
-            "not_found" => assert!(matches!(error, XfrmError::NotFound), "{error:?}"),
-            _ => assert!(
-                matches!(
-                    error,
-                    XfrmError::StateMismatch {
-                        operation: "remove_sa_exact_preflight"
-                    }
-                ),
-                "{error:?}"
+        assert!(
+            matches!(
+                error,
+                XfrmError::UnsupportedFeature {
+                    feature: "exact_sa_removal"
+                }
             ),
-        }
+            "{error:?}"
+        );
+        assert_eq!(transport.sessions(), 0);
+        assert!(transport.session_requests().is_empty());
         assert!(transport.transactions().is_empty(), "no DELSA was sent");
     }
 }
 
 #[tokio::test]
-async fn exact_removal_without_a_complete_snapshot_sends_no_delsa() {
+async fn exact_removal_does_not_attempt_a_snapshot_even_when_it_would_fail() {
     let transport = KernelTransport::new(
         (0..SA_KEY_SNAPSHOT_READ_ATTEMPTS)
             .map(|_| {
@@ -1132,12 +1404,14 @@ async fn exact_removal_without_a_complete_snapshot_sends_no_delsa() {
     assert!(
         matches!(
             error,
-            XfrmError::StateIndeterminate {
-                operation: "remove_sa_exact_preflight"
+            XfrmError::UnsupportedFeature {
+                feature: "exact_sa_removal"
             }
         ),
         "{error:?}"
     );
+    assert_eq!(transport.sessions(), 0);
+    assert!(transport.session_requests().is_empty());
     assert!(transport.transactions().is_empty());
 
     // A transport without sessions fails closed the same way.
@@ -1150,7 +1424,7 @@ async fn exact_removal_without_a_complete_snapshot_sends_no_delsa() {
         matches!(
             error,
             XfrmError::UnsupportedFeature {
-                feature: "sa_key_snapshot"
+                feature: "exact_sa_removal"
             }
         ),
         "{error:?}"

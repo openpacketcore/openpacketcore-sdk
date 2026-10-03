@@ -883,8 +883,8 @@ impl XfrmBackend for MockXfrmBackend {
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         Self::check_failure(&state)?;
-        // The snapshot and the deletion run under one lock, the mock's form
-        // of the caller-held writer exclusion the Linux contract requires.
+        // Every mock state writer uses this same lock, excluding all changes
+        // between the snapshot and deletion. Linux has no such exclusion.
         let snapshot = state.sa_key_snapshot(request.key())?;
         authorize_exact_sa_removal(&snapshot, request.expected())?;
         let removal = request.removal();

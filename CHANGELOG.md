@@ -9,6 +9,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- `opc-ipsec-xfrm`: default, Linux and namespace-bound Linux exact SA
+  removal now validates and refuses with `UnsupportedFeature` for
+  `exact_sa_removal` before any snapshot, netlink request or actor admission.
+  A snapshot followed by an unconditional deletion could select a kernel
+  ACQUIRE state inserted after the read. Refusal also preserves durable
+  writer epochs and prepared authorities. The locked mock retains functional
+  exact removal; Linux cleanup through this API remains unavailable.
+
 - `opc-session-net`: a prepared compare-and-set or lease acquire whose
   current voter answers with a complete `Rejected(Unavailable)` now moves the
   identical request to the next voter, as after a pre-write failure, and ends
@@ -102,11 +110,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
-- `opc-ipsec-xfrm` / `opc-linux-xfrm-sys`: key-scoped SA snapshots and exact
-  SA removal. Closes #1050.
+- `opc-ipsec-xfrm` / `opc-linux-xfrm-sys`: key-scoped SA snapshots and an
+  optional exact SA removal request, implemented only by the locked mock.
+  Refs #1050.
   - `XfrmBackend::query_sa_key_snapshot(SaLookupKey)` reads every SA at one
     destination/protocol/SPI key, whatever its lookup mark, as an
-    `SaKeySnapshot` of complete `SaRelocationIdentity` values.
+    `SaKeySnapshot` of `SaRelocationIdentity` views.
     `SaKeySnapshot::lookup_candidates` applies the Linux lookup predicate
     `(lookup & mask) == value`. Linux reads the key from an `XFRM_MSG_GETSA`
     dump (`NLM_F_DUMP`) of every state in the namespace, narrowed to the key on
@@ -118,18 +127,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     and it accepts the dump only when it returned as many states as both
     counts. Receiving the first count with `receive_buffer_len` sets the dump
     batch size (Linux caps it at about 32 KiB); a larger state makes the read
-    fail closed instead of hiding others. A read whose counts disagree, or
-    whose dump is flagged `NLM_F_DUMP_INTR` or `NLMSG_OVERRUN`, is repeated
-    whole on a fresh socket at most four times and then fails with
-    `StateIndeterminate`; no partial dump is returned.
-  - `XfrmBackend::remove_sa_exact(ExactRemoveSaRequest)` sends
-    `XFRM_MSG_DELSA` only when that read shows exactly one lookup candidate
-    for the expected mark and it equals the expected identity. Otherwise it
-    sends nothing and returns `StateIndeterminate` (several candidates, for
-    example a marked SA and an unmarked SA at one key), `StateMismatch` (one
-    different candidate) or `NotFound`. The namespace actor runs the read and
-    the deletion as one admitted mutation. Excluding other writers remains a
-    caller precondition: XFRM state dumps carry no change sequence.
+    fail closed instead of hiding others. Equal counts prove completeness only
+    when no state inserted after the first count was dumped: the caller
+    excludes other userspace SA writers in the namespace for the read, and
+    the read detects the one state Linux inserts on its own, the larval state
+    of a kernel ACQUIRE. Every dumped state is classified, and a larval state
+    (an AH, ESP, or IPComp state without the transform its protocol
+    requires), or a state of another protocol, makes the read indeterminate.
+    Larval states from pending SPI allocations do too. A read whose counts
+    disagree, whose dump holds such a state, or whose dump is flagged
+    `NLM_F_DUMP_INTR` or `NLMSG_OVERRUN`, is repeated whole on a fresh socket
+    at most four times and then fails with `StateIndeterminate`; no partial
+    dump is returned.
+  - `XfrmBackend::remove_sa_exact(ExactRemoveSaRequest)` validates and
+    returns `UnsupportedFeature { feature: "exact_sa_removal" }` on the
+    default, Linux and namespace-bound Linux backends, without a read or
+    effect. The mock holds one state lock through its candidate check and
+    deletion: several candidates yield `StateIndeterminate`, a different
+    candidate yields `StateMismatch`, and no candidate yields `NotFound`.
+    `SaRelocationIdentity` excludes algorithm/key/lifetime/replay fingerprints
+    and matching it does not establish installation ownership.
   - Both methods have defaults, so existing backends stay source compatible;
     `UnsupportedXfrmBackend` returns `UnsupportedPlatform`.
   - `opc-linux-xfrm-sys` adds `NLM_F_DUMP_INTR`, `NLM_F_ROOT`, `NLM_F_MATCH`,
