@@ -83,6 +83,13 @@ impl Default for LinuxGtpuDataplaneBackendConfig {
 /// `opc-linux-gtpu-sys`, encodes SDK request models into Linux GTP UAPI
 /// messages, and maps ACK/error responses back into redaction-safe
 /// [`GtpuError`] values.
+///
+/// Readiness accepts an owned IPv4 UDP/2152 socket after rechecking
+/// its network namespace and live device identity. Backend clones share this
+/// ownership; resolving a device by name alone does not acquire it. Userspace
+/// sockets may bind any IPv4 address; recoverable kernel sockets require the
+/// wildcard address and exact v2 incarnation. Probes and synchronous capability
+/// getters wait behind in-flight device and PDP operations.
 #[derive(Clone)]
 pub struct LinuxGtpuDataplaneBackend {
     inner: Arc<LinuxGtpuDataplaneBackendInner>,
@@ -93,7 +100,7 @@ struct LinuxGtpuDataplaneBackendInner {
     next_sequence: AtomicU32,
     /// Serializes PDP read/compare/mutate transactions across backend clones.
     pdp_operation_lock: Mutex<()>,
-    device_sockets: Mutex<HashMap<u32, GtpuSocketHandle>>,
+    device_sockets: Mutex<OwnedDeviceSockets>,
     config: LinuxGtpuDataplaneBackendConfig,
     /// Durable directory anchoring cross-process PDP restart-recovery leases.
     ///
@@ -131,7 +138,7 @@ impl LinuxGtpuDataplaneBackend {
                 transport: Arc::new(NetlinkGtpuTransport),
                 next_sequence: AtomicU32::new(1),
                 pdp_operation_lock: Mutex::new(()),
-                device_sockets: Mutex::new(HashMap::new()),
+                device_sockets: Mutex::new(OwnedDeviceSockets::default()),
                 config,
                 pdp_recovery_root: OnceLock::new(),
             }),
@@ -229,7 +236,7 @@ impl LinuxGtpuDataplaneBackend {
                 transport: Arc::new(transport),
                 next_sequence: AtomicU32::new(1),
                 pdp_operation_lock: Mutex::new(()),
-                device_sockets: Mutex::new(HashMap::new()),
+                device_sockets: Mutex::new(OwnedDeviceSockets::default()),
                 config: LinuxGtpuDataplaneBackendConfig {
                     receive_attempts: 1,
                     receive_buffer_len: 4096,
@@ -412,18 +419,23 @@ impl LinuxGtpuDataplaneBackend {
                 Some(_) => return Err(GtpuError::AlreadyExists),
             }
         }
-        let socket = if recoverable {
-            None
+        // Missing namespace evidence must never grant probe ownership, but
+        // does not change the existing device-creation contract.
+        let namespace = self.inner.transport.current_namespace_identity().ok();
+        let socket = if let Some(incarnation) = incarnation {
+            OwnedGtpuSocket::KernelOwned(incarnation)
         } else {
-            Some(self.inner.transport.open_gtpu_socket(
+            OwnedGtpuSocket::Userspace(self.inner.transport.open_gtpu_socket(
                 request.bind_address,
                 request.bind_port,
                 "gtpu_udp_bind",
             )?)
         };
-        let socket_provisioning = match socket.as_ref() {
-            Some(socket) => GtpSocketProvisioning::UserspaceFd(socket.raw_fd()),
-            None => GtpSocketProvisioning::KernelOwned,
+        let socket_provisioning = match &socket {
+            OwnedGtpuSocket::Userspace(socket) => {
+                GtpSocketProvisioning::UserspaceFd(socket.raw_fd())
+            }
+            OwnedGtpuSocket::KernelOwned(_) => GtpSocketProvisioning::KernelOwned,
         };
         let body = encode_create_device_request(&request, socket_provisioning)?;
         let create_result = self.route_transact(
@@ -477,15 +489,22 @@ impl LinuxGtpuDataplaneBackend {
                 };
             }
         }
-        if let Some(socket) = socket {
-            if let Err(retain_error) = self.retain_device_socket(ifindex, socket) {
-                if recoverable && self.remove_unpublished_device_sync(&device).is_err() {
-                    return Err(GtpuError::StateIndeterminate {
-                        operation: "recoverable_device_provision",
-                    });
-                }
-                return Err(retain_error);
+        if let Err(retain_error) = self.retain_device_socket(
+            &device,
+            OwnedDeviceSocket {
+                name: device.name.clone(),
+                namespace,
+                bind_address: request.bind_address,
+                bind_port: request.bind_port,
+                socket,
+            },
+        ) {
+            if recoverable && self.remove_unpublished_device_sync(&device).is_err() {
+                return Err(GtpuError::StateIndeterminate {
+                    operation: "recoverable_device_provision",
+                });
             }
+            return Err(retain_error);
         }
         Ok(device)
     }
@@ -551,13 +570,17 @@ impl LinuxGtpuDataplaneBackend {
             Err(error) => return Err(error),
         }
         let body = encode_remove_device_request(&device)?;
+        // Capture the namespace before mutation. A successful delete without
+        // namespace evidence cannot authorize closing a potentially foreign
+        // retained descriptor at the same ifindex.
+        let namespace = self.inner.transport.current_namespace_identity().ok();
         let _ = self.route_transact(
             "remove_device",
             RTM_DELLINK,
             NLM_F_REQUEST | NLM_F_ACK,
             body,
         )?;
-        self.release_device_socket(device.ifindex)?;
+        self.release_device_socket(device.ifindex, namespace)?;
         Ok(())
     }
 
@@ -612,24 +635,117 @@ impl LinuxGtpuDataplaneBackend {
 
     fn retain_device_socket(
         &self,
-        ifindex: u32,
-        socket: GtpuSocketHandle,
+        device: &GtpDevice,
+        socket: OwnedDeviceSocket,
     ) -> Result<(), GtpuError> {
-        self.inner
+        let mut sockets = self
+            .inner
             .device_sockets
             .lock()
-            .map_err(|_| GtpuError::io("device_socket_retain", poisoned_lock()))?
-            .insert(ifindex, socket);
+            .map_err(|_| GtpuError::io("device_socket_retain", poisoned_lock()))?;
+        match &socket.socket {
+            OwnedGtpuSocket::Userspace(_) => {
+                sockets.userspace.insert(device.ifindex, socket);
+            }
+            OwnedGtpuSocket::KernelOwned(_) => {
+                // Kernel ownership is metadata, independent of held userspace
+                // descriptors. Missing namespace evidence cannot establish
+                // readiness, but does not change creation/acquisition success
+                // or replace a previously proven namespace's record.
+                let Some(namespace) = socket.namespace else {
+                    return Ok(());
+                };
+                if let Some((_, owned)) = sockets.kernel.iter_mut().find(|(ifindex, owned)| {
+                    *ifindex == device.ifindex && owned.namespace == Some(namespace)
+                }) {
+                    *owned = socket;
+                } else {
+                    sockets.kernel.push((device.ifindex, socket));
+                }
+            }
+        }
         Ok(())
     }
 
-    fn release_device_socket(&self, ifindex: u32) -> Result<(), GtpuError> {
-        self.inner
+    fn release_device_socket(
+        &self,
+        ifindex: u32,
+        namespace: Option<PdpLiveWriterNamespaceIdentity>,
+    ) -> Result<(), GtpuError> {
+        let Some(namespace) = namespace else {
+            return Ok(());
+        };
+        let mut sockets = self
+            .inner
             .device_sockets
             .lock()
-            .map_err(|_| GtpuError::io("device_socket_release", poisoned_lock()))?
-            .remove(&ifindex);
+            .map_err(|_| GtpuError::io("device_socket_release", poisoned_lock()))?;
+        if sockets
+            .userspace
+            .get(&ifindex)
+            .is_some_and(|owned| owned.namespace == Some(namespace))
+        {
+            sockets.userspace.remove(&ifindex);
+        }
+        sockets.kernel.retain(|(owned_ifindex, owned)| {
+            *owned_ifindex != ifindex || owned.namespace != Some(namespace)
+        });
         Ok(())
+    }
+
+    fn probe_sync(&self) -> GtpuProbe {
+        // Keep the exclusive userspace socket alive throughout the probe and
+        // serialize with creation, removal and retained-device acquisition.
+        let Ok(_operation) = self.pdp_operation_guard() else {
+            return self.inner.transport.probe(self.inner.config, false);
+        };
+        let Ok(sockets) = self.inner.device_sockets.lock() else {
+            return self.inner.transport.probe(self.inner.config, false);
+        };
+        let owned_socket = self
+            .inner
+            .transport
+            .current_namespace_identity()
+            .ok()
+            .is_some_and(|namespace| {
+                sockets
+                    .userspace
+                    .iter()
+                    .map(|(&ifindex, owned)| (ifindex, owned))
+                    .chain(
+                        sockets
+                            .kernel
+                            .iter()
+                            .map(|(ifindex, owned)| (*ifindex, owned)),
+                    )
+                    .any(|(ifindex, owned)| {
+                        if owned.namespace != Some(namespace)
+                            || !owned.bind_address.is_ipv4()
+                            || owned.bind_port != GTPU_PORT
+                        {
+                            return false;
+                        }
+                        let Ok(Some(live)) = self
+                            .inner
+                            .transport
+                            .link_identity(ifindex, self.inner.config)
+                        else {
+                            return false;
+                        };
+                        if live.ifindex != ifindex || live.name != owned.name.as_bytes() {
+                            return false;
+                        }
+                        match &owned.socket {
+                            OwnedGtpuSocket::Userspace(_) => true,
+                            OwnedGtpuSocket::KernelOwned(incarnation) => {
+                                owned.bind_address == IpAddr::V4(Ipv4Addr::UNSPECIFIED)
+                                    && live.alias.as_deref()
+                                        == Some(encode_pdp_device_alias(*incarnation).as_bytes())
+                            }
+                        }
+                    })
+            });
+        self.inner.transport.probe(self.inner.config, owned_socket)
     }
 
     fn install_pdp_context_sync(&self, request: GtpPdpContext) -> Result<(), GtpuError> {
@@ -1141,6 +1257,9 @@ impl LinuxGtpuDataplaneBackend {
     /// overlap an admitted acquisition. This call does not extend the writer
     /// authorities past its return; subsequent device and PDP mutations are
     /// fenced independently by the existing lease hierarchy.
+    /// An exact retained result also records kernel-socket ownership for this
+    /// backend's readiness probes. Each probe rechecks the current namespace,
+    /// name, ifindex and versioned incarnation before accepting that socket.
     pub async fn acquire_retained_device_identity(
         &self,
         request: RetainedDeviceIdentityRequest,
@@ -1267,10 +1386,23 @@ impl LinuxGtpuDataplaneBackend {
         let expected_alias = encode_pdp_device_alias(expected_incarnation);
         match probe.alias {
             Some(alias) if alias == expected_alias.as_bytes() => {
-                Ok(RetainedDeviceIdentityAcquisition::retained(GtpDevice {
+                let device = GtpDevice {
                     name: expected_name.to_string(),
                     ifindex: expected_ifindex,
-                }))
+                };
+                self.retain_device_socket(
+                    &device,
+                    OwnedDeviceSocket {
+                        name: device.name.clone(),
+                        namespace: self.inner.transport.current_namespace_identity().ok(),
+                        // Only the v2 incarnation attests this exact kernel-
+                        // owned socket profile; legacy stamps never reach here.
+                        bind_address: IpAddr::V4(Ipv4Addr::UNSPECIFIED),
+                        bind_port: GTPU_PORT,
+                        socket: OwnedGtpuSocket::KernelOwned(expected_incarnation),
+                    },
+                )?;
+                Ok(RetainedDeviceIdentityAcquisition::retained(device))
             }
             Some(_) => Ok(RetainedDeviceIdentityAcquisition::conflict(
                 RetainedDeviceConflictReason::ReplacementIdentity,
@@ -1580,7 +1712,7 @@ impl GtpuDataplaneBackend for LinuxGtpuDataplaneBackend {
     }
 
     fn pdp_context_reconciliation_capabilities(&self) -> PdpContextReconciliationCapabilities {
-        let probe = self.inner.transport.probe(self.inner.config);
+        let probe = self.probe_sync();
         let readback = if !probe.platform_supported || !probe.gtp_module_present {
             GtpuCapability::Missing
         } else if !probe.net_admin_capable {
@@ -1615,7 +1747,7 @@ impl GtpuDataplaneBackend for LinuxGtpuDataplaneBackend {
     }
 
     async fn probe(&self) -> Result<GtpuProbe, GtpuError> {
-        Ok(self.inner.transport.probe(self.inner.config))
+        Ok(self.probe_sync())
     }
 }
 
@@ -1625,10 +1757,33 @@ enum NetlinkProtocol {
     Generic,
 }
 
+#[derive(Default)]
+struct OwnedDeviceSockets {
+    userspace: HashMap<u32, OwnedDeviceSocket>,
+    /// Descriptor-free kernel records keyed by proven namespace and ifindex.
+    kernel: Vec<(u32, OwnedDeviceSocket)>,
+}
+
+struct OwnedDeviceSocket {
+    name: String,
+    namespace: Option<PdpLiveWriterNamespaceIdentity>,
+    bind_address: IpAddr,
+    bind_port: u16,
+    socket: OwnedGtpuSocket,
+}
+
+enum OwnedGtpuSocket {
+    Userspace(GtpuSocketHandle),
+    /// Recorded only after verifying the recoverable v2 incarnation.
+    KernelOwned(PdpDeviceIncarnation),
+}
+
 #[derive(Debug)]
 struct GtpuSocketHandle {
     raw_fd: i32,
     _socket: Option<GtpuUdpSocket>,
+    #[cfg(test)]
+    _test_socket: Option<std::net::UdpSocket>,
 }
 
 impl GtpuSocketHandle {
@@ -1636,6 +1791,8 @@ impl GtpuSocketHandle {
         Self {
             raw_fd: socket.raw_fd(),
             _socket: Some(socket),
+            #[cfg(test)]
+            _test_socket: None,
         }
     }
 
@@ -1644,6 +1801,7 @@ impl GtpuSocketHandle {
         Self {
             raw_fd,
             _socket: None,
+            _test_socket: None,
         }
     }
 
@@ -1708,7 +1866,13 @@ trait LinuxGtpuTransport: Send + Sync + fmt::Debug {
         config: LinuxGtpuDataplaneBackendConfig,
     ) -> Result<Option<LinkIdentityProbe>, GtpuError>;
 
-    fn probe(&self, config: LinuxGtpuDataplaneBackendConfig) -> GtpuProbe;
+    fn current_namespace_identity(&self) -> Result<PdpLiveWriterNamespaceIdentity, GtpuError> {
+        current_pdp_live_writer_namespace_identity()
+    }
+
+    /// `owned_socket` proves this backend already owns IPv4 UDP/2152
+    /// in the current namespace; it replaces only the fresh UDP bind check.
+    fn probe(&self, config: LinuxGtpuDataplaneBackendConfig, owned_socket: bool) -> GtpuProbe;
 }
 
 #[derive(Debug)]
@@ -1903,7 +2067,7 @@ impl LinuxGtpuTransport for NetlinkGtpuTransport {
         Ok(Some(probe))
     }
 
-    fn probe(&self, config: LinuxGtpuDataplaneBackendConfig) -> GtpuProbe {
+    fn probe(&self, config: LinuxGtpuDataplaneBackendConfig, owned_socket: bool) -> GtpuProbe {
         let route_open = open_route_netlink_socket();
         let generic_open = open_generic_netlink_socket();
         let platform_supported = !matches!(
@@ -1923,54 +2087,71 @@ impl LinuxGtpuTransport for NetlinkGtpuTransport {
             false
         };
         let net_admin_capable = effective_cap_net_admin().unwrap_or(false);
-        let socket_bindable = self
-            .open_gtpu_socket(
-                IpAddr::V4(Ipv4Addr::UNSPECIFIED),
-                GTPU_PORT,
-                "gtpu_udp_probe_bind",
-            )
-            .is_ok();
-        let mutation_ready = platform_supported
-            && kernel_reachable
-            && gtp_module_present
-            && net_admin_capable
-            && socket_bindable;
-        let details = if !platform_supported {
-            Some("linux GTP-U netlink unsupported on this platform")
-        } else if !kernel_reachable {
-            Some("linux route or generic netlink socket unavailable")
-        } else if !gtp_module_present {
-            Some("linux gtp generic-netlink family not present")
-        } else if !net_admin_capable {
-            Some("CAP_NET_ADMIN is not effective")
-        } else if !socket_bindable {
-            Some("GTP-U UDP socket bind failed")
-        } else {
-            Some("linux GTP-U dataplane mutation ready")
-        };
-
-        GtpuProbe {
-            kind: GtpuBackendKind::LinuxKernel,
+        let socket_bindable = owned_socket
+            || self
+                .open_gtpu_socket(
+                    IpAddr::V4(Ipv4Addr::UNSPECIFIED),
+                    GTPU_PORT,
+                    "gtpu_udp_probe_bind",
+                )
+                .is_ok();
+        compose_linux_gtpu_probe(
             platform_supported,
             kernel_reachable,
             gtp_module_present,
             net_admin_capable,
-            bpf_capable: false,
-            btf_present: false,
-            mutation_ready,
-            egress_dscp_marking: GtpuCapability::Missing,
-            per_bearer_marking: GtpuCapability::Missing,
-            downlink_endpoint_binding: GtpuCapability::Missing,
-            uplink_source_port_selection: GtpuCapability::Missing,
-            uplink_pmtu_enforcement: GtpuCapability::Missing,
-            // The generic-netlink family probe proves only that the Linux GTP
-            // driver is present. It does not prove fragmented outer packets
-            // re-enter that driver's UDP consumer exactly once, so this
-            // backend must not advertise the stronger handoff contract.
-            downlink_outer_fragment_handling: GtpuDownlinkFragmentContract::Unsupported,
-            downlink_inner_mtu_enforcement: GtpuCapability::Missing,
-            details,
-        }
+            socket_bindable,
+        )
+    }
+}
+
+fn compose_linux_gtpu_probe(
+    platform_supported: bool,
+    kernel_reachable: bool,
+    gtp_module_present: bool,
+    net_admin_capable: bool,
+    socket_bindable: bool,
+) -> GtpuProbe {
+    let mutation_ready = platform_supported
+        && kernel_reachable
+        && gtp_module_present
+        && net_admin_capable
+        && socket_bindable;
+    let details = if !platform_supported {
+        Some("linux GTP-U netlink unsupported on this platform")
+    } else if !kernel_reachable {
+        Some("linux route or generic netlink socket unavailable")
+    } else if !gtp_module_present {
+        Some("linux gtp generic-netlink family not present")
+    } else if !net_admin_capable {
+        Some("CAP_NET_ADMIN is not effective")
+    } else if !socket_bindable {
+        Some("GTP-U UDP socket bind failed")
+    } else {
+        Some("linux GTP-U dataplane mutation ready")
+    };
+
+    GtpuProbe {
+        kind: GtpuBackendKind::LinuxKernel,
+        platform_supported,
+        kernel_reachable,
+        gtp_module_present,
+        net_admin_capable,
+        bpf_capable: false,
+        btf_present: false,
+        mutation_ready,
+        egress_dscp_marking: GtpuCapability::Missing,
+        per_bearer_marking: GtpuCapability::Missing,
+        downlink_endpoint_binding: GtpuCapability::Missing,
+        uplink_source_port_selection: GtpuCapability::Missing,
+        uplink_pmtu_enforcement: GtpuCapability::Missing,
+        // The generic-netlink family probe proves only that the Linux GTP
+        // driver is present. It does not prove fragmented outer packets
+        // re-enter that driver's UDP consumer exactly once, so this
+        // backend must not advertise the stronger handoff contract.
+        downlink_outer_fragment_handling: GtpuDownlinkFragmentContract::Unsupported,
+        downlink_inner_mtu_enforcement: GtpuCapability::Missing,
+        details,
     }
 }
 
@@ -3332,6 +3513,7 @@ mod tests {
         /// caller after this increments, so a test can observe the exact
         /// admitted-identity-read boundary.
         link_identity_admissions: Arc<AtomicU32>,
+        namespace_identity: Arc<Mutex<Option<(u64, u64)>>>,
         probe: GtpuProbe,
         socket_fd: i32,
         ifindex: u32,
@@ -3371,6 +3553,7 @@ mod tests {
                 link_identity_responses: Arc::new(Mutex::new(VecDeque::new())),
                 ifindex_admissions: Arc::new(AtomicU32::new(0)),
                 link_identity_admissions: Arc::new(AtomicU32::new(0)),
+                namespace_identity: Arc::new(Mutex::new(Some((1, 2)))),
                 probe: GtpuProbe {
                     kind: GtpuBackendKind::LinuxKernel,
                     platform_supported: true,
@@ -3479,6 +3662,7 @@ mod tests {
                 receive_buffer_len: 4096,
                 retry_delay: Duration::ZERO,
             },
+            false,
         );
 
         assert_eq!(
@@ -3612,8 +3796,24 @@ mod tests {
             }
         }
 
-        fn probe(&self, _config: LinuxGtpuDataplaneBackendConfig) -> GtpuProbe {
-            self.probe
+        fn current_namespace_identity(&self) -> Result<PdpLiveWriterNamespaceIdentity, GtpuError> {
+            self.namespace_identity
+                .lock()
+                .unwrap()
+                .map(|(device, inode)| PdpLiveWriterNamespaceIdentity::from_dev_ino(device, inode))
+                .ok_or(GtpuError::UnsupportedFeature {
+                    feature: "pdp_live_writer_namespace_identity",
+                })
+        }
+
+        fn probe(&self, _config: LinuxGtpuDataplaneBackendConfig, owned_socket: bool) -> GtpuProbe {
+            compose_linux_gtpu_probe(
+                self.probe.platform_supported,
+                self.probe.kernel_reachable,
+                self.probe.gtp_module_present,
+                self.probe.net_admin_capable,
+                owned_socket || self.probe.mutation_ready,
+            )
         }
     }
 
@@ -3788,7 +3988,17 @@ mod tests {
             .device_sockets
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .userspace
             .len()
+    }
+
+    fn retained_ownership_count(backend: &LinuxGtpuDataplaneBackend) -> usize {
+        let sockets = backend
+            .inner
+            .device_sockets
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        sockets.userspace.len() + sockets.kernel.len()
     }
 
     #[test]
@@ -4329,6 +4539,7 @@ mod tests {
             .unwrap();
         assert_eq!(device.ifindex, 42);
         assert_eq!(retained_socket_count(&backend), 1);
+        assert_eq!(retained_ownership_count(&backend), 1);
 
         let requests = transport.requests();
         assert_eq!(requests.len(), 1);
@@ -4339,6 +4550,635 @@ mod tests {
         let linkinfo = attr_payload_from(body, IF_INFO_MESSAGE_LEN, IFLA_LINKINFO).unwrap();
         let info_data = attr_payload(linkinfo, IFLA_INFO_DATA).unwrap();
         assert_eq!(attr_u32(info_data, IFLA_GTP_FD1), 9);
+    }
+
+    fn busy_probe_transport() -> CapturingTransport {
+        let mut transport = CapturingTransport::new();
+        transport.probe.mutation_ready = false;
+        transport.probe.details = Some("GTP-U UDP socket bind failed");
+        transport
+    }
+
+    async fn assert_probe_install_ready(backend: &LinuxGtpuDataplaneBackend, ready: bool) {
+        assert_eq!(backend.probe().await.unwrap().mutation_ready, ready);
+        assert_eq!(
+            backend
+                .pdp_context_reconciliation_capabilities()
+                .classified_install,
+            if ready {
+                GtpuCapability::Available
+            } else {
+                GtpuCapability::Missing
+            },
+        );
+    }
+
+    #[tokio::test]
+    async fn linux_probe_uses_owned_socket_across_clones_until_removal() {
+        let transport = busy_probe_transport();
+        let backend = LinuxGtpuDataplaneBackend::with_transport(transport.clone());
+        assert_probe_install_ready(&backend, false).await;
+        let clone = backend.clone();
+        let device = backend
+            .create_device(CreateGtpDeviceRequest::new("gtp0"))
+            .await
+            .unwrap();
+        assert_probe_install_ready(&clone, true).await;
+
+        let independent = LinuxGtpuDataplaneBackend::with_transport(transport);
+        assert_eq!(independent.resolve_device("gtp0").await.unwrap(), device);
+        assert_probe_install_ready(&independent, false).await;
+        clone.remove_device(&device).await.unwrap();
+        assert_probe_install_ready(&backend, false).await;
+    }
+
+    #[tokio::test]
+    async fn linux_probe_accepts_owned_userspace_sockets_on_any_ipv4_address() {
+        for address in [
+            Ipv4Addr::UNSPECIFIED,
+            Ipv4Addr::LOCALHOST,
+            Ipv4Addr::new(192, 0, 2, 10),
+        ] {
+            let transport = busy_probe_transport();
+            let backend = LinuxGtpuDataplaneBackend::with_transport(transport.clone());
+            let mut request = CreateGtpDeviceRequest::new("gtp0");
+            request.bind_address = IpAddr::V4(address);
+            backend.create_device(request).await.unwrap();
+            assert_probe_install_ready(&backend, true).await;
+            assert_eq!(transport.link_identity_admissions(), 2);
+            assert_eq!(retained_socket_count(&backend), 1);
+            assert_eq!(retained_ownership_count(&backend), 1);
+        }
+    }
+
+    #[tokio::test]
+    async fn linux_probe_requires_an_ipv4_service_port_endpoint() {
+        for (address, port) in [
+            (IpAddr::V4(Ipv4Addr::UNSPECIFIED), GTPU_PORT + 1),
+            (IpAddr::V4(Ipv4Addr::LOCALHOST), GTPU_PORT + 1),
+            (IpAddr::V6(Ipv6Addr::UNSPECIFIED), GTPU_PORT),
+        ] {
+            let transport = busy_probe_transport();
+            let backend = LinuxGtpuDataplaneBackend::with_transport(transport.clone());
+            let mut request = CreateGtpDeviceRequest::new("gtp0");
+            request.bind_address = address;
+            request.bind_port = port;
+            backend.create_device(request).await.unwrap();
+            assert_probe_install_ready(&backend, false).await;
+            assert_eq!(transport.link_identity_admissions(), 0);
+        }
+    }
+
+    #[tokio::test]
+    async fn linux_probe_requires_namespace_evidence_at_creation_and_probe() {
+        let transport = busy_probe_transport();
+        let backend = LinuxGtpuDataplaneBackend::with_transport(transport.clone());
+        backend
+            .create_device(CreateGtpDeviceRequest::new("gtp0"))
+            .await
+            .unwrap();
+        for namespace in [Some((1, 3)), Some((2, 2)), None] {
+            *transport.namespace_identity.lock().unwrap() = namespace;
+            assert_probe_install_ready(&backend, false).await;
+        }
+        assert_eq!(transport.link_identity_admissions(), 0);
+        *transport.namespace_identity.lock().unwrap() = Some((1, 2));
+        assert_probe_install_ready(&backend, true).await;
+
+        let transport = busy_probe_transport();
+        *transport.namespace_identity.lock().unwrap() = None;
+        let backend = LinuxGtpuDataplaneBackend::with_transport(transport.clone());
+        backend
+            .create_device(CreateGtpDeviceRequest::new("gtp0"))
+            .await
+            .unwrap();
+        *transport.namespace_identity.lock().unwrap() = Some((1, 2));
+        assert_probe_install_ready(&backend, false).await;
+    }
+
+    #[tokio::test]
+    async fn linux_probe_rechecks_owned_link_identity_and_recoverable_incarnation() {
+        for (recoverable, bind_address) in [
+            (false, Ipv4Addr::UNSPECIFIED),
+            (false, Ipv4Addr::LOCALHOST),
+            (true, Ipv4Addr::UNSPECIFIED),
+        ] {
+            let root = unique_recovery_root("probe-owned-identity");
+            let transport = busy_probe_transport();
+            let backend = LinuxGtpuDataplaneBackend::with_transport(transport.clone())
+                .with_pdp_recovery_root(root.clone())
+                .unwrap();
+            let mut request = CreateGtpDeviceRequest::new("gtp0");
+            request.bind_address = IpAddr::V4(bind_address);
+            if recoverable {
+                transport.push_ifindex_response(IfindexResponse::NotFound);
+                backend
+                    .create_recoverable_device(request, test_device_incarnation())
+                    .await
+                    .unwrap();
+            } else {
+                backend.create_device(request).await.unwrap();
+            }
+            assert_probe_install_ready(&backend, true).await;
+            let mut replaced = test_link_identity();
+            replaced.ifindex += 1;
+            let mut renamed = test_link_identity();
+            renamed.name = b"gtp-other".to_vec();
+            let mut invalid = vec![
+                Ok(None),
+                Ok(Some(replaced)),
+                Ok(Some(renamed)),
+                Err(GtpuError::io(
+                    "link_identity",
+                    io::Error::from(io::ErrorKind::TimedOut),
+                )),
+            ];
+            if recoverable {
+                for alias in [
+                    None,
+                    Some(b"foreign".to_vec()),
+                    Some(b"opc-pdp-recovery-v1:a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5".to_vec()),
+                    Some(
+                        encode_pdp_device_alias(
+                            PdpDeviceIncarnation::from_bytes([0x5a; 16]).unwrap(),
+                        )
+                        .into_bytes(),
+                    ),
+                ] {
+                    invalid.push(Ok(Some(LinkIdentityProbe {
+                        alias,
+                        ..test_link_identity()
+                    })));
+                }
+            }
+            for response in invalid {
+                // Both public capability paths must reject the same stale or
+                // unreadable evidence, even after a previous successful probe.
+                transport.push_link_identity_response(response.clone());
+                transport.push_link_identity_response(response);
+                assert_probe_install_ready(&backend, false).await;
+            }
+            assert_probe_install_ready(&backend, true).await;
+            drop(backend);
+            let _ = std::fs::remove_dir_all(root);
+        }
+    }
+
+    #[tokio::test]
+    async fn linux_probe_owned_socket_does_not_override_other_prerequisites() {
+        for prerequisite in 0..4 {
+            let mut transport = busy_probe_transport();
+            match prerequisite {
+                0 => transport.probe.platform_supported = false,
+                1 => transport.probe.kernel_reachable = false,
+                2 => transport.probe.gtp_module_present = false,
+                _ => transport.probe.net_admin_capable = false,
+            }
+            let backend = LinuxGtpuDataplaneBackend::with_transport(transport);
+            backend
+                .create_device(CreateGtpDeviceRequest::new("gtp0"))
+                .await
+                .unwrap();
+            assert!(!backend.probe().await.unwrap().mutation_ready);
+            assert_eq!(
+                backend
+                    .pdp_context_reconciliation_capabilities()
+                    .classified_install,
+                if prerequisite == 3 {
+                    GtpuCapability::PermissionDenied
+                } else {
+                    GtpuCapability::Missing
+                },
+            );
+        }
+    }
+
+    #[test]
+    fn linux_probe_composition_requires_every_prerequisite() {
+        for (flags, ready, details) in [
+            (
+                [false, true, true, true, true],
+                false,
+                "linux GTP-U netlink unsupported on this platform",
+            ),
+            (
+                [true, false, true, true, true],
+                false,
+                "linux route or generic netlink socket unavailable",
+            ),
+            (
+                [true, true, false, true, true],
+                false,
+                "linux gtp generic-netlink family not present",
+            ),
+            (
+                [true, true, true, false, true],
+                false,
+                "CAP_NET_ADMIN is not effective",
+            ),
+            (
+                [true, true, true, true, false],
+                false,
+                "GTP-U UDP socket bind failed",
+            ),
+            (
+                [true, true, true, true, true],
+                true,
+                "linux GTP-U dataplane mutation ready",
+            ),
+        ] {
+            let [platform, kernel, module, permission, socket] = flags;
+            let probe = compose_linux_gtpu_probe(platform, kernel, module, permission, socket);
+            assert_eq!(probe.mutation_ready, ready);
+            assert_eq!(probe.details, Some(details));
+            assert_eq!(probe.platform_supported, platform);
+            assert_eq!(probe.kernel_reachable, kernel);
+            assert_eq!(probe.gtp_module_present, module);
+            assert_eq!(probe.net_admin_capable, permission);
+        }
+    }
+
+    #[tokio::test]
+    async fn linux_probe_acquires_kernel_socket_only_from_exact_retained_identity() {
+        for expected_ifindex in [None, Some(42)] {
+            for matches in [false, true] {
+                let root = unique_recovery_root("probe-retained");
+                let transport = busy_probe_transport();
+                let backend = LinuxGtpuDataplaneBackend::with_transport(transport)
+                    .with_pdp_recovery_root(root.clone())
+                    .unwrap();
+                assert_probe_install_ready(&backend, false).await;
+                let request = RetainedDeviceIdentityRequest::new(
+                    "gtp0",
+                    expected_ifindex,
+                    if matches {
+                        test_device_incarnation()
+                    } else {
+                        PdpDeviceIncarnation::from_bytes([0x5a; 16]).unwrap()
+                    },
+                    PdpRestartRecoveryProof::previous_writer_stopped(),
+                );
+                let acquisition = backend
+                    .acquire_retained_device_identity(request)
+                    .await
+                    .unwrap();
+                assert_eq!(acquisition.retained_device().is_some(), matches);
+                assert_eq!(retained_socket_count(&backend), 0);
+                assert_eq!(retained_ownership_count(&backend), usize::from(matches));
+                assert_probe_install_ready(&backend.clone(), matches).await;
+                drop(backend);
+                let _ = std::fs::remove_dir_all(root);
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn linux_repeated_retained_acquisition_refreshes_one_kernel_ownership_record() {
+        let root = unique_recovery_root("probe-retained-repeat");
+        let transport = busy_probe_transport();
+        let backend = LinuxGtpuDataplaneBackend::with_transport(transport)
+            .with_pdp_recovery_root(root.clone())
+            .unwrap();
+        for _ in 0..2 {
+            let acquired = backend
+                .acquire_retained_device_identity(retained_device_request())
+                .await
+                .unwrap();
+            assert!(acquired.retained_device().is_some());
+            assert_eq!(retained_socket_count(&backend), 0);
+            assert_eq!(retained_ownership_count(&backend), 1);
+            let sockets = backend.inner.device_sockets.lock().unwrap();
+            let (ifindex, owned) = &sockets.kernel[0];
+            assert_eq!(*ifindex, 42);
+            assert_eq!(owned.name, "gtp0");
+            assert!(owned.namespace == Some(PdpLiveWriterNamespaceIdentity::from_dev_ino(1, 2)));
+            assert!(
+                matches!(&owned.socket, OwnedGtpuSocket::KernelOwned(incarnation) if *incarnation == test_device_incarnation())
+            );
+        }
+        assert_probe_install_ready(&backend, true).await;
+        drop(backend);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn linux_kernel_ownership_at_same_ifindex_is_independent_between_namespaces() {
+        let root = unique_recovery_root("kernel-ownership-namespaces");
+        let transport = busy_probe_transport();
+        let backend = LinuxGtpuDataplaneBackend::with_transport(transport.clone())
+            .with_pdp_recovery_root(root.clone())
+            .unwrap();
+        let device = GtpDevice {
+            name: "gtp0".to_string(),
+            ifindex: 42,
+        };
+        let namespaces = [
+            ((1, 2), test_device_incarnation()),
+            (
+                (2, 2),
+                PdpDeviceIncarnation::from_bytes([0x5a; 16]).unwrap(),
+            ),
+        ];
+        for (index, (namespace, incarnation)) in namespaces.into_iter().enumerate() {
+            *transport.namespace_identity.lock().unwrap() = Some(namespace);
+            let live = LinkIdentityProbe {
+                alias: Some(encode_pdp_device_alias(incarnation).into_bytes()),
+                ..test_link_identity()
+            };
+            for _ in 0..2 {
+                transport.push_link_identity_response(Ok(Some(live.clone())));
+                let acquired = backend
+                    .acquire_retained_device_identity(RetainedDeviceIdentityRequest::new(
+                        "gtp0",
+                        Some(42),
+                        incarnation,
+                        PdpRestartRecoveryProof::previous_writer_stopped(),
+                    ))
+                    .await
+                    .unwrap();
+                assert_eq!(acquired.retained_device(), Some(&device));
+                assert_eq!(retained_socket_count(&backend), 0);
+                assert_eq!(retained_ownership_count(&backend), index + 1);
+                transport.push_link_identity_response(Ok(Some(live.clone())));
+                transport.push_link_identity_response(Ok(Some(live.clone())));
+                assert_probe_install_ready(&backend, true).await;
+            }
+        }
+        assert!(transport.requests().is_empty());
+
+        // Removing namespace B's record must not withdraw namespace A's
+        // independently verified incarnation at the same interface index.
+        backend.remove_device(&device).await.unwrap();
+        assert_eq!(retained_socket_count(&backend), 0);
+        assert_eq!(retained_ownership_count(&backend), 1);
+        assert_probe_install_ready(&backend, false).await;
+        *transport.namespace_identity.lock().unwrap() = Some((1, 2));
+        assert_probe_install_ready(&backend, true).await;
+        backend.remove_device(&device).await.unwrap();
+        assert_eq!(retained_socket_count(&backend), 0);
+        assert_eq!(retained_ownership_count(&backend), 0);
+        assert_probe_install_ready(&backend, false).await;
+        *transport.namespace_identity.lock().unwrap() = Some((2, 2));
+        assert_probe_install_ready(&backend, false).await;
+        drop(backend);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn linux_missing_namespace_preserves_kernel_operation_outcomes_without_ownership() {
+        for create in [false, true] {
+            for known_namespace in [false, true] {
+                let root = unique_recovery_root("kernel-ownership-missing-namespace");
+                let transport = busy_probe_transport();
+                let backend = LinuxGtpuDataplaneBackend::with_transport(transport.clone())
+                    .with_pdp_recovery_root(root.clone())
+                    .unwrap();
+                if known_namespace {
+                    let acquired = backend
+                        .acquire_retained_device_identity(retained_device_request())
+                        .await
+                        .unwrap();
+                    assert!(acquired.retained_device().is_some());
+                }
+                *transport.namespace_identity.lock().unwrap() = None;
+                let device = if create {
+                    transport.push_ifindex_response(IfindexResponse::NotFound);
+                    backend
+                        .create_recoverable_device(
+                            CreateGtpDeviceRequest::new("gtp-other"),
+                            test_device_incarnation(),
+                        )
+                        .await
+                        .unwrap()
+                } else {
+                    transport.push_link_identity_response(Ok(Some(LinkIdentityProbe {
+                        name: b"gtp-other".to_vec(),
+                        ..test_link_identity()
+                    })));
+                    backend
+                        .acquire_retained_device_identity(RetainedDeviceIdentityRequest::new(
+                            "gtp-other",
+                            Some(42),
+                            test_device_incarnation(),
+                            PdpRestartRecoveryProof::previous_writer_stopped(),
+                        ))
+                        .await
+                        .unwrap()
+                        .into_retained_device()
+                        .unwrap()
+                };
+                assert_eq!(device.name, "gtp-other");
+                assert_eq!(device.ifindex, 42);
+                assert_eq!(retained_socket_count(&backend), 0);
+                assert_eq!(
+                    retained_ownership_count(&backend),
+                    usize::from(known_namespace)
+                );
+                assert_probe_install_ready(&backend, false).await;
+
+                // Neither publication nor removal without namespace evidence
+                // may overwrite or discard a previously proven namespace.
+                backend.remove_device(&device).await.unwrap();
+                assert_eq!(retained_socket_count(&backend), 0);
+                assert_eq!(
+                    retained_ownership_count(&backend),
+                    usize::from(known_namespace)
+                );
+                *transport.namespace_identity.lock().unwrap() = Some((1, 2));
+                assert_probe_install_ready(&backend, known_namespace).await;
+                let operations = transport
+                    .requests()
+                    .iter()
+                    .map(|request| request.operation)
+                    .collect::<Vec<_>>();
+                assert_eq!(
+                    operations,
+                    if create {
+                        vec![
+                            "create_device",
+                            "pdp_device_identity_stamp",
+                            "remove_device",
+                        ]
+                    } else {
+                        vec!["remove_device"]
+                    }
+                );
+                drop(backend);
+                let _ = std::fs::remove_dir_all(root);
+            }
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn linux_remove_device_never_closes_userspace_fd_without_matching_namespace() {
+        use std::net::UdpSocket;
+        use std::os::fd::AsRawFd;
+
+        for (recorded_namespace, current_namespace) in [
+            (None, Some((1, 2))),
+            (Some((1, 2)), None),
+            (Some((1, 2)), Some((2, 2))),
+        ] {
+            let transport = busy_probe_transport();
+            *transport.namespace_identity.lock().unwrap() = current_namespace;
+            let backend = LinuxGtpuDataplaneBackend::with_transport(transport.clone());
+            let socket = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+            let endpoint = socket.local_addr().unwrap();
+            let raw_fd = socket.as_raw_fd();
+            let fd_path = PathBuf::from(format!("/proc/self/fd/{raw_fd}"));
+            let fd_identity = std::fs::read_link(&fd_path).unwrap();
+            let device = GtpDevice {
+                name: "gtp0".to_string(),
+                ifindex: 42,
+            };
+            backend
+                .retain_device_socket(
+                    &device,
+                    OwnedDeviceSocket {
+                        name: device.name.clone(),
+                        namespace: recorded_namespace.map(|(device, inode)| {
+                            PdpLiveWriterNamespaceIdentity::from_dev_ino(device, inode)
+                        }),
+                        bind_address: endpoint.ip(),
+                        bind_port: endpoint.port(),
+                        socket: OwnedGtpuSocket::Userspace(GtpuSocketHandle {
+                            raw_fd,
+                            _socket: None,
+                            _test_socket: Some(socket),
+                        }),
+                    },
+                )
+                .unwrap();
+
+            backend.remove_device(&device).await.unwrap();
+            assert_eq!(transport.requests()[0].operation, "remove_device");
+            assert_eq!(retained_socket_count(&backend), 1);
+            assert_eq!(retained_ownership_count(&backend), 1);
+            assert_eq!(std::fs::read_link(&fd_path).unwrap(), fd_identity);
+            assert_eq!(
+                UdpSocket::bind(endpoint).unwrap_err().kind(),
+                io::ErrorKind::AddrInUse
+            );
+            drop(backend);
+            let _rebound = UdpSocket::bind(endpoint).unwrap();
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn linux_kernel_socket_registration_coexists_with_other_namespace_userspace_fd() {
+        use std::net::UdpSocket;
+        use std::os::fd::AsRawFd;
+
+        for create in [false, true] {
+            let root = unique_recovery_root("kernel-and-userspace-socket");
+            let transport = busy_probe_transport();
+            let backend = LinuxGtpuDataplaneBackend::with_transport(transport.clone())
+                .with_pdp_recovery_root(root.clone())
+                .unwrap();
+            // A standard socket keeps this lifetime regression meaningful
+            // even when the sys boundary uses its unsupported-platform cfg.
+            let socket = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+            let endpoint = socket.local_addr().unwrap();
+            let raw_fd = socket.as_raw_fd();
+            let fd_path = PathBuf::from(format!("/proc/self/fd/{raw_fd}"));
+            let fd_identity = std::fs::read_link(&fd_path).unwrap();
+            let previous_namespace = PdpLiveWriterNamespaceIdentity::from_dev_ino(1, 1);
+            let previous_device = GtpDevice {
+                name: "gtp-other".to_string(),
+                ifindex: 42,
+            };
+            backend
+                .retain_device_socket(
+                    &previous_device,
+                    OwnedDeviceSocket {
+                        name: previous_device.name.clone(),
+                        namespace: Some(previous_namespace),
+                        bind_address: endpoint.ip(),
+                        bind_port: endpoint.port(),
+                        socket: OwnedGtpuSocket::Userspace(GtpuSocketHandle {
+                            raw_fd,
+                            _socket: None,
+                            _test_socket: Some(socket),
+                        }),
+                    },
+                )
+                .unwrap();
+
+            let kernel_device = if create {
+                transport.push_ifindex_response(IfindexResponse::NotFound);
+                backend
+                    .create_recoverable_device(
+                        CreateGtpDeviceRequest::new("gtp0"),
+                        test_device_incarnation(),
+                    )
+                    .await
+                    .unwrap()
+            } else {
+                backend
+                    .acquire_retained_device_identity(retained_device_request())
+                    .await
+                    .unwrap()
+                    .into_retained_device()
+                    .unwrap()
+            };
+            for _ in 0..2 {
+                let retained = backend
+                    .acquire_retained_device_identity(retained_device_request())
+                    .await
+                    .unwrap();
+                assert_eq!(retained.retained_device(), Some(&kernel_device));
+                assert_eq!(retained_socket_count(&backend), 1);
+                assert_eq!(retained_ownership_count(&backend), 2);
+                assert_eq!(std::fs::read_link(&fd_path).unwrap(), fd_identity);
+                assert_eq!(
+                    UdpSocket::bind(endpoint).unwrap_err().kind(),
+                    io::ErrorKind::AddrInUse
+                );
+                let sockets = backend.inner.device_sockets.lock().unwrap();
+                let owned = sockets.userspace.get(&42).unwrap();
+                assert_eq!(owned.name, previous_device.name);
+                assert!(owned.namespace == Some(previous_namespace));
+                assert!(
+                    matches!(&owned.socket, OwnedGtpuSocket::Userspace(socket) if socket.raw_fd() == raw_fd)
+                );
+            }
+            let operations = transport
+                .requests()
+                .iter()
+                .map(|request| request.operation)
+                .collect::<Vec<_>>();
+            assert_eq!(
+                operations,
+                if create {
+                    vec!["create_device", "pdp_device_identity_stamp"]
+                } else {
+                    vec![]
+                }
+            );
+            assert_probe_install_ready(&backend, true).await;
+
+            // Removing the kernel device in namespace B must leave the held
+            // userspace socket at the same ifindex in namespace A untouched.
+            backend.remove_device(&kernel_device).await.unwrap();
+            assert_eq!(retained_socket_count(&backend), 1);
+            assert_eq!(retained_ownership_count(&backend), 1);
+            assert_eq!(std::fs::read_link(&fd_path).unwrap(), fd_identity);
+            assert_eq!(
+                UdpSocket::bind(endpoint).unwrap_err().kind(),
+                io::ErrorKind::AddrInUse
+            );
+            assert_probe_install_ready(&backend, false).await;
+
+            *transport.namespace_identity.lock().unwrap() = Some((1, 1));
+            backend.remove_device(&previous_device).await.unwrap();
+            assert_eq!(retained_socket_count(&backend), 0);
+            assert_eq!(retained_ownership_count(&backend), 0);
+            let _rebound = UdpSocket::bind(endpoint).unwrap();
+            drop(backend);
+            let _ = std::fs::remove_dir_all(root);
+        }
     }
 
     #[tokio::test]
@@ -4365,6 +5205,7 @@ mod tests {
 
         assert_eq!(device.ifindex, 42);
         assert_eq!(retained_socket_count(&backend), 0);
+        assert_eq!(retained_ownership_count(&backend), 1);
         let requests = transport.requests();
         let create_body = netlink_body(&requests[0].request);
         let linkinfo = attr_payload_from(create_body, IF_INFO_MESSAGE_LEN, IFLA_LINKINFO).unwrap();
@@ -4407,6 +5248,7 @@ mod tests {
 
         assert_eq!(device.ifindex, 42);
         assert_eq!(retained_socket_count(&backend), 0);
+        assert_eq!(retained_ownership_count(&backend), 1);
         assert_eq!(
             transport
                 .requests()
@@ -4438,6 +5280,7 @@ mod tests {
             GtpuError::AlreadyExists
         ));
         assert_eq!(retained_socket_count(&backend), 0);
+        assert_eq!(retained_ownership_count(&backend), 0);
         assert!(transport.requests().is_empty());
         drop(backend);
         let _ = std::fs::remove_dir_all(root);
@@ -4504,6 +5347,7 @@ mod tests {
             vec!["create_device"]
         );
         assert_eq!(retained_socket_count(&backend), 0);
+        assert_eq!(retained_ownership_count(&backend), 0);
         drop(backend);
         let _ = std::fs::remove_dir_all(root);
     }
@@ -4531,6 +5375,7 @@ mod tests {
             }
         ));
         assert_eq!(retained_socket_count(&backend), 0);
+        assert_eq!(retained_ownership_count(&backend), 0);
         assert_eq!(
             transport
                 .requests()
@@ -4589,6 +5434,7 @@ mod tests {
         ));
         assert!(transport.requests().is_empty());
         assert_eq!(retained_socket_count(&backend), 0);
+        assert_eq!(retained_ownership_count(&backend), 0);
         drop(backend);
         let _ = std::fs::remove_dir_all(root);
     }
@@ -4615,6 +5461,7 @@ mod tests {
         ));
         assert!(transport.requests().is_empty());
         assert_eq!(retained_socket_count(&backend), 0);
+        assert_eq!(retained_ownership_count(&backend), 0);
         drop(backend);
         let _ = std::fs::remove_dir_all(root);
     }
@@ -4635,6 +5482,7 @@ mod tests {
         );
         assert!(transport.requests().is_empty());
         assert_eq!(retained_socket_count(&backend), 0);
+        assert_eq!(retained_ownership_count(&backend), 0);
     }
 
     #[tokio::test]
@@ -4646,10 +5494,12 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(retained_socket_count(&backend), 1);
+        assert_eq!(retained_ownership_count(&backend), 1);
 
         backend.remove_device(&device).await.unwrap();
 
         assert_eq!(retained_socket_count(&backend), 0);
+        assert_eq!(retained_ownership_count(&backend), 0);
     }
 
     #[tokio::test]
@@ -4667,6 +5517,7 @@ mod tests {
 
         assert!(matches!(error, GtpuError::NotFound));
         assert_eq!(retained_socket_count(&backend), 1);
+        assert_eq!(retained_ownership_count(&backend), 1);
     }
 
     #[tokio::test]

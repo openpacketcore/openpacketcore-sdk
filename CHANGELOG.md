@@ -35,6 +35,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   its voting barrier, so a coordinator whose followers finalized first can
   still complete. No wire format, durable state or production API changes.
 
+- `opc-gtpu-dataplane`: Linux kernel-GTP readiness and classified PDP install
+  recognize the backend's own IPv4 UDP/2152 socket after device creation or
+  exact retained-device acquisition. Userspace sockets may bind any IPv4 address;
+  recoverable kernel sockets retain the wildcard IPv4 and exact v2 incarnation
+  requirements. Probes recheck namespace and live device identity. Foreign
+  sockets alone, name-only resolution, IPv6 and other ports do not establish
+  ownership; existing module, netlink and permission checks remain. Kernel
+  ownership records at the same interface index in different namespaces
+  coexist with held userspace sockets; removal releases only matching namespace
+  records. Probes and synchronous capability getters now wait behind in-flight
+  device and PDP operations. Fixes #1032.
+
 - `opc-gtpu-dataplane`: TFT classification can use a qualified private
   map-in-map RCU grace when GLOBAL membarrier is unavailable, including
   `nohz_full`. GLOBAL remains preferred, and unknown or realtime profiles
