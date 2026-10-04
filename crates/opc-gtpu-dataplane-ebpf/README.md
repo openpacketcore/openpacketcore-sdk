@@ -60,12 +60,54 @@ The crate exposes tc entry points, not a Rust library API:
   complete authorization and before decapsulation. A session without a
   downlink inner MTU hands nothing off. A hand-off flood therefore never
   fills the shared UDP/2152 queue, and a flood of one hand-off class never
-  fills the other's queue. tc steers whether or not the queues are bound.
-  While they are not, the kernel may answer with rate-limited ICMP Port
-  Unreachable toward the peer (#1019). tc keeps no hand-off counter: adding a
-  counter or policing map would change the retained pin inventory and durable
-  recovery records. A true grouped-index miss alone may enter the legacy IPv4
-  PDR/commit path.
+  fills the other's queue. tc does not police hand-offs: a policing map would
+  change the retained pin inventory and durable recovery records. A true
+  grouped-index miss alone may enter the legacy IPv4 PDR/commit path.
+- A hand-off needs a bound consumer. tc passes a datagram on to a UDP socket
+  of this host only while one is bound for it: a steered packet on its
+  hand-off port; a G-PDU for no tunnel, or with a required unknown extension,
+  on UDP/2152 of one of the attachment's endpoints; and an outer-fragmented
+  UDP/2152 datagram for an IPv4 endpoint, judged by its first fragment.
+  Otherwise the datagram is counted in `COUNTER_DL_MISSING_CONSUMER` and
+  never delivered, because the kernel would answer with ICMP Port Unreachable
+  toward the peer, quoting the start of the subscriber's inner packet. The
+  backend binds its queues when the control port is first opened, and they
+  close with the process, while tc keeps running from the pinned graph. tc
+  finds the socket with `bpf_sk_lookup_udp` and, except for a fragment,
+  assigns it to the datagram with `bpf_sk_assign`, so that a socket closing
+  after the check is not answered either. Neither helper is GPL-only; the
+  assignment needs Linux 5.7. A socket counts only when UDP input will
+  accept it for a datagram that arrives on the attachment's device, which
+  can be enslaved to a VRF: a socket bound to that device, or a socket bound
+  to no device that the lookup finds under the device's VRF scope. Before
+  Linux 6.5 the lookup does not know that scope, so tc decides in two steps:
+  a lookup without a VRF scope, which establishes a socket bound to the
+  device, and otherwise a lookup with the scope engaged, which establishes
+  a socket bound to no device. What neither establishes is not assigned: tc
+  passes the datagram on as a link-layer multicast frame
+  (`bpf_skb_change_type`), so that the stack's own lookup chooses the socket
+  and the host sends no ICMP error if there is none.
+  All of this assumes that IP input receives on the device of the hook. A
+  receive handler runs after tc, can take the frame to another device and
+  can reset its type, and the program cannot see one. The loader refuses an
+  interface that has a master other than a VRF (a bridge, a bond, a team, a
+  virtual switch), one below a device of its namespace that can take its
+  frames (a macvlan, an ipvlan, a MACsec device), and every interface of a
+  namespace that holds an HSR or PRP device; it cannot see such a device in
+  another namespace. A frame that carries a VLAN tag with a VLAN ID is
+  received by the VLAN device above the hook's device, or by nothing. Where
+  the downlink program decides a hand-off, it reads the tag from the context
+  (`vlan_present`, `vlan_tci`): a hand-off in such a frame has no consumer,
+  whatever is bound, and is dropped and counted without a lookup. A priority
+  tag (VLAN ID 0) leaves the frame on the device.
+  tc drops an unfragmented datagram without a consumer itself. It
+  lets the first fragment of a fragmented one pass with a UDP Length that no
+  datagram can have (`UDP_LENGTH_OF_NO_DATAGRAM`): the host then reassembles
+  the datagram and UDP input discards it unanswered, where a dropped first
+  fragment would strand the other fragments in the reassembly queue.
+  The control-port guide in `opc-gtpu-dataplane` states the limits: the
+  reassembly window, unfragmented non-G-PDU messages, outer IPv6 fragments,
+  a socket bound to a VRF device, and what differs on older kernels.
   Outer-IPv4 fragments, legacy or grouped, retain the bounded
   kernel-reassembly handoff; the backend-owned consumer
   (`GtpuControlPort::try_receive_downlink`) authorizes the reassembled G-PDU
@@ -79,9 +121,13 @@ The crate exposes tc entry points, not a Rust library API:
   authorized. IPv6 UDP checksums are mandatory.
 
 Map names, counter indexes, program names, and byte layouts are imported from
-`opc-gtpu-ebpf-common`. `GTPU_COUNTERS` is a seven-slot per-CPU map; the
-seventh slot is `COUNTER_UL_REDIRECT_RESOLVED`, described under Status And
-Limits.
+`opc-gtpu-ebpf-common`. `GTPU_COUNTERS` is a sixteen-slot per-CPU map
+(`COUNTER_SLOTS`), of which eight carry a counter (`COUNTER_SLOTS_IN_USE`).
+The seventh is `COUNTER_UL_REDIRECT_RESOLVED`, described under Status And
+Limits, and the eighth is `COUNTER_DL_MISSING_CONSUMER`. The other eight are
+reserved and read zero, so that the next counter does not change the width
+of the pinned map: a pin graph retained from a build with another width is
+refused and needs a drained reprovision.
 `GTPU_DL_DROP` is a fixed six-slot per-CPU counter map for invalid, family,
 peer, local, ingress, and source-port binding failures. Its values are
 aggregate and contain no rejected endpoint or session fields.

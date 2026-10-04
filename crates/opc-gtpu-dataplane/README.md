@@ -182,11 +182,11 @@ buffer, and the two are served in turn, so a flood of fragments cannot
 displace over-MTU packets. A packet above the MTU without Don't Fragment is
 still returned unfragmented (#1023).
 
-Open the control port before installing an MTU-bearing context, and keep
-draining it. While its queues are not bound, the kernel may answer steered
-packets with rate-limited ICMP Port Unreachable toward the peer (#1019), and
-the steered packets are not forwarded. MTU-bearing
-contexts must be drained before an SDK downgrade. See
+Open the control port right after creating or adopting the attachment, and
+keep draining it. While its queues are not bound, tc drops the steered
+packets and counts them (`downlink_missing_consumer`), so the host answers
+none of them with an ICMP error toward the peer, and they are not forwarded.
+MTU-bearing contexts must be drained before an SDK downgrade. See
 [control port](docs/control-port.md).
 
 - `GtpuDataplaneBackend`: async port for device and PDP lifecycle, typed PDP
@@ -406,6 +406,34 @@ interface and `bind_address` is the local outer IPv4 address. It pins maps under
 `/sys/fs/bpf/opc-gtpu/<interface>/` by default, installs both uplink FAR and
 downlink PDR state from one `GtpPdpContext`, and supports restore through
 `resolve_device`. It only supports IPv4 session state today.
+
+The attach interface must be the one on which IP input receives the
+endpoint's packets. The backend refuses an interface from which another
+device takes the frames after tc ran, because tc's decision about a hand-off
+would then not describe the delivery:
+
+- an interface whose master is anything but a VRF, such as a port of a
+  bridge, a bond, a team or a virtual switch, with
+  `GtpuError::UnsupportedFeature { feature: ATTACHMENT_ON_ENSLAVED_INTERFACE }`;
+- an interface below a macvlan, an ipvlan, a MACsec device or any other
+  device of the namespace that names it as its lower link and is not known to
+  leave its frames alone, with `ATTACHMENT_BELOW_STACKED_DEVICE`;
+- every interface of a namespace that holds an HSR or PRP device, with
+  `ATTACHMENT_IN_NAMESPACE_WITH_HSR_DEVICE`. The kernel does not always
+  report the interlink port of an HSR device, so the backend cannot tell
+  which interfaces such a device takes frames from; a PRP device is a link of
+  the same kind.
+
+Attach to the device that receives instead, for a bridge, bond or team the
+master itself. VLAN devices above the interface are accepted. The VLAN device
+receives what arrives in its VLAN, and tc's lookup on the interface does not
+describe the delivery there, so tc gives a hand-off from there to no socket:
+it drops and counts it. For an endpoint that lives on a VLAN device, attach to
+that device. `create_device` pins its maps under the interface's name, and
+bpffs accepts no dot in a name, so that device needs a name without one. See
+[control port](docs/control-port.md#hand-offs-need-a-bound-consumer) for what
+is and is not enforced; a device that is stacked on the interface from
+another network namespace is not detected.
 
 ### Generation-fenced traffic-continuity proof
 
@@ -1361,6 +1389,28 @@ leaving the attachment whose source is not a provisioned UE PAA -- locally
 originated traffic from the host included -- so read a nonzero value as a
 prompt to investigate rather than as proof of session-state corruption.
 
+`downlink_missing_consumer` counts the hand-offs that tc gave to no UDP
+socket, because none was bound to receive them or they arrived in a VLAN above
+the attachment's interface. tc leaves some datagrams to a socket on the
+gateway instead of decapsulating them: a steered over-MTU Don't Fragment
+packet or inner fragment (UDP/2153, UDP/2154), a G-PDU for no tunnel or with
+a required unknown extension (UDP/2152), and an outer-fragmented UDP/2152
+datagram, judged by its first fragment. Each is passed on only while a socket
+is bound for it, because the kernel would otherwise answer with ICMP Port
+Unreachable toward the peer and quote the start of the subscriber's inner
+packet. A rising value means that hand-offs arrive while nothing drains them:
+the control port was not opened yet, the process was down, or it restarted
+and has not reopened the port. Those packets are lost, as they were before
+this counter existed; the host no longer answers them. A hand-off that
+arrives in a VLAN above the attachment's interface is counted here whatever
+is bound, so a value that rises while the port is open and drained can mean
+that the peer sends in such a VLAN. A G-PDU for no tunnel is counted in
+`downlink_unknown_teid` first, so it can raise both. A socket counts when UDP
+input will accept it for a datagram that arrives on the attachment's
+interface, and an interface that is enslaved to a VRF changes which sockets
+those are. See
+[control port](docs/control-port.md#hand-offs-need-a-bound-consumer).
+
 Existing `GtpPdpContext` literals must add `bearer_mark: None` to retain the
 default path, or construct a non-zero `GtpBearerMark` for a dedicated bearer;
 they must also choose an explicit `downlink_source_port_policy` and an explicit
@@ -1374,11 +1424,12 @@ pin have been verified. The mainline Linux `gtp`, mock, and unsupported backends
 report `Missing` and reject marked requests. This API requires no Cargo feature
 and introduces no dependency.
 
-`EbpfGtpuDatapathCounters` gained `uplink_redirects_resolved`. The type is
-deliberately exhaustive, like every other public struct in this module, so any
-struct literal or exhaustive destructuring of it outside this crate must add
-the field. Nothing in-tree constructs it by literal outside the crate, and the
-crate is `publish = false`.
+`EbpfGtpuDatapathCounters` gained `uplink_redirects_resolved` and, later,
+`downlink_missing_consumer`. The type is deliberately exhaustive, like every
+other public struct in this module, so any struct literal or exhaustive
+destructuring of it outside this crate must add each new field. Nothing
+in-tree constructs it by literal outside the crate, and the crate is
+`publish = false`.
 
 ### DSCP and reconciliation
 
@@ -1571,8 +1622,11 @@ reassembles under its bounded `net.ipv4.ipfrag_*` accounting (reported from
 the live sysctls, absent when unreadable — never fabricated defaults), and
 exactly one complete UDP/2152 datagram is delivered to a socket bound on the
 concrete local S2b-U address. The contract is complete only while the operator
-runs an SDK consumer on that socket: without one, the kernel answers each
-fragment set with ICMP port unreachable toward the PGW and the packet is lost.
+runs an SDK consumer on that socket. Without one, tc counts each set at its
+first fragment (`downlink_missing_consumer`) and marks that fragment, so that
+UDP input discards the reassembled datagram: the packet is lost, no fragment
+stays in the kernel's reassembly queue, and the host sends no ICMP error
+toward the PGW.
 
 Grouped fragmentation is reported separately per attachment through
 `GtpuIpFamilyCapabilities::downlink_outer_ipv4_fragment_handling` and
@@ -1640,9 +1694,11 @@ embedding ePDG: use `GtpuReassemblySocket::set_receive_buffer_size` and retain
 its effective `SO_RCVBUF` readback for the expected reassembled burst (kernel
 UDP buffer overruns drop silently and are not visible in the consumer
 counters), and shut down in reverse order — detach the tc datapath before
-closing the consumer socket — because fragments arriving after the socket
-closes are answered with ICMP port unreachable toward the PGW. Linux `gtp`,
-mock, and unsupported backends report `Unsupported`.
+closing the consumer socket — because a fragment set whose first fragment
+passed while the socket was bound, and which completes after it closed, is
+answered with ICMP port unreachable toward the PGW. A set that begins after
+the close is counted by tc and discarded. Linux `gtp`, mock, and unsupported
+backends report `Unsupported`.
 
 The privileged suite proves the contract end-to-end: a valid two-fragment
 G-PDU, a reordered set, and a set with a duplicated first fragment each
@@ -1798,7 +1854,16 @@ An uncommitted, legacy-v0, or DSCP-v1 schema can advance only when it is empty,
 its retained maps already satisfy the current ABI, and no historical hook is
 live. An authentic frozen-v1 graph has a six-slot counter map and historical
 program tags, so it now requires a drained pin removal and reprovision instead
-of automatic hook replacement. Any retained PDR/FAR without an exact binding
+of automatic hook replacement. The same holds for the counter map's second
+growth: `GTPU_COUNTERS` has sixteen slots since the missing-consumer counter,
+and every earlier build published seven or fewer. A graph retained from such
+a build is refused before anything is read through a typed binding or
+changed: with `DatapathGenerationMismatch` while its hooks are still
+attached, and with `ebpf_pin_map_abi` when only its pins remain. Drain it,
+remove the retained graph with the build that created it (or remove its pins
+once nothing references them), and provision again. Eight of the sixteen
+slots are reserved, so that the next counter does not change the width
+again. Any retained PDR/FAR without an exact binding
 is indeterminate and fails before either hook changes. The SDK never invents
 `Any`, derives a peer from an untrusted packet, or labels endpoint-unbound
 forwarding state production-ready.
@@ -2515,7 +2580,10 @@ empty-graph migration could advance the marker while retaining a narrower
 counter pin and leave a current-marker graph that can never satisfy this build.
 The frozen v1 and pre-redirect artifacts both carry six-slot counter maps, so
 their authentic retained graphs require drained reprovisioning rather than
-automatic migration.
+automatic migration. The map has grown once more since, from seven to sixteen
+slots for the missing-consumer counter, and a graph retained with the
+seven-slot map is refused in the same way. Eight of the sixteen slots are
+reserved, so that the next counter leaves the width as it is.
 
 **Program generation and graph identity.** Replacing a hook in place requires
 exact program-tag equality, because the replacement is a single

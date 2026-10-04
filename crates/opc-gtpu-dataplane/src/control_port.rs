@@ -96,12 +96,13 @@ pub trait GtpuControlPort: fmt::Debug + Send + Sync {
     /// queue is retired. Each hand-off queue is bounded by its own socket
     /// receive buffer, so a flood of one class overflows only its own queue;
     /// the kernel counts those drops (see
-    /// [`crate::GtpuDownlinkCounters`]). Open the port before installing any
-    /// context with a downlink inner MTU, and keep draining it for the
-    /// attachment's lifetime: while nothing is bound, the kernel may answer
-    /// handed-off datagrams with rate-limited ICMP Port Unreachable toward
-    /// the peer (#1019), and neither over-MTU Don't Fragment packets nor
-    /// inner fragments of those contexts are forwarded.
+    /// [`crate::GtpuDownlinkCounters`]). Open the port right after creating
+    /// or adopting the attachment, and keep draining it for the attachment's
+    /// lifetime. While nothing is bound, tc drops every hand-off and counts
+    /// it (`EbpfGtpuDatapathCounters::downlink_missing_consumer`), so that
+    /// the host never answers one with an ICMP error toward the peer; neither
+    /// over-MTU Don't Fragment packets nor inner fragments of contexts with a
+    /// downlink inner MTU are forwarded then.
     ///
     /// The default implementation belongs to ports without backend state and
     /// returns [`GtpuControlPortError::Unsupported`] without receiving.

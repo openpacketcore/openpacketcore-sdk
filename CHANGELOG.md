@@ -42,6 +42,250 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   per-receiver limits. A third receiver returns a fatal storage error.
   Refs #1009.
 
+- **A hand-off from tc needs a bound consumer -- `opc-gtpu-dataplane`,
+  `opc-gtpu-dataplane-ebpf`, `opc-gtpu-ebpf-common` (breaking to
+  `EbpfGtpuDatapathCounters`; a retained pin graph needs a drained
+  reprovision; an interface enslaved to a bridge, bond, team or virtual
+  switch, below a macvlan, an ipvlan or another stacked device, or in a
+  namespace with an HSR or PRP device, is refused; a hand-off that arrives
+  in a VLAN above the interface is dropped and counted; #1019):**
+  - **Problem.** tc leaves some downlink datagrams to a UDP socket on the
+    gateway instead of decapsulating them: an over-MTU Don't Fragment packet
+    and an inner fragment of a context with a downlink inner MTU (UDP/2153
+    and UDP/2154), a G-PDU for no tunnel or with a required unknown extension
+    (UDP/2152), and an outer-fragmented G-PDU, which the kernel reassembles
+    for UDP/2152. The backend binds those sockets when the control port is
+    first opened, and they close with the process, while tc keeps running
+    from the pinned graph. While nothing was bound, the kernel answered each
+    such datagram with ICMP Port Unreachable toward the core, quoting the
+    outer headers and the start of the subscriber's inner packet in
+    plaintext: up to 548 octets over IPv4 and up to 1,232 over IPv6. The
+    documented order (open the port before installing an MTU context) could
+    not close the window after a restart, because adopting a retained graph
+    reopens tc's traffic gate before the port can be opened.
+  - **Fix.** tc passes such a datagram on only while a UDP socket is bound
+    for it, and otherwise drops it and counts the drop. It looks the socket
+    up as UDP input does (`bpf_sk_lookup_udp`): by the datagram's addresses
+    and ports, in the namespace and on the device of the attachment, per
+    datagram. A socket counts when UDP input will accept it for a datagram
+    that arrives on that device: the backend's sockets, which are bound to
+    the attachment's interface, and an application's own socket on UDP/2152.
+    The check covers the steered hand-offs, the two
+    G-PDU hand-offs on UDP/2152 over IPv4 and IPv6 for the attachment's own
+    endpoints, and an outer-fragmented UDP/2152 datagram for an IPv4
+    endpoint. The dropped packets are lost, as they were before; the host no
+    longer answers them.
+  - **A socket that closes after the check.** A lookup is a snapshot, and
+    the stack looks again when it delivers. For a datagram that is not
+    fragmented on the outer path, tc therefore also assigns the socket it
+    found to the datagram (`bpf_sk_assign`), and UDP input delivers to that
+    socket without a second lookup. A socket that closes in between receives
+    the datagram in a queue that is freed with it, and nothing is sent. The
+    one case in which tc assigns nothing to an unfragmented datagram is
+    described under "An interface in a VRF".
+  - **Outer fragments.** Only the first fragment carries the UDP header, so
+    tc judges the datagram by it. It does not drop that fragment: the other
+    fragments would then wait in the host's reassembly queue until they
+    expire, and a steady stream of them fills the namespace's reassembly
+    budget, after which every other IPv4 reassembly there fails (measured
+    with the Linux defaults: about 3,600 stranded fragments, for 30
+    seconds). Instead tc sets the UDP Length of the first fragment to a
+    value no datagram can have. The host reassembles the datagram and frees
+    the queue at once, and UDP input discards it before it looks for a
+    socket, without an answer. Reassembly discards an assigned socket, so a
+    socket that closes while a datagram is being reassembled is still
+    answered with Port Unreachable. tc cannot close that window.
+  - **Counter.** `EbpfGtpuDatapathCounters` gains
+    `downlink_missing_consumer` (`COUNTER_DL_MISSING_CONSUMER`). A rising
+    value means that hand-offs arrive while nothing drains them, or that
+    they arrive in a VLAN above the attachment's interface (see "Hand-offs
+    in a VLAN"). The struct is exhaustive, so a literal or an exhaustive
+    destructuring of it outside the crate must add the field.
+  - **Upgrade.** `GTPU_COUNTERS` grows from 7 to 16 slots. Eight carry a
+    counter (`COUNTER_SLOTS_IN_USE`) and eight are reserved, so that the
+    next counter does not change the width again. A pin graph retained from
+    an earlier build has the narrower map, where the kernel would silently
+    discard every write to the new slot. Such a graph is refused before
+    anything is read through a typed binding or changed, by `create_device`,
+    `resolve_device` and `create_device_with_endpoints`: with
+    `GtpuError::DatapathGenerationMismatch` while its tc hooks are still
+    attached, as after every change of the tc programs, and with
+    `GtpuError::Io { operation: "ebpf_pin_map_abi" }` when only its pins
+    remain. There is no in-place upgrade: drain the attachment, remove the
+    retained graph, and provision again. The description of the frozen
+    shipped-25 graph keeps its own seven-slot width.
+  - **Kernels.** The lookup is available to tc since Linux 4.20 and the
+    assignment since Linux 5.7; neither is GPL-only. Before Linux 6.6 the
+    assignment refuses a socket with `SO_REUSEPORT`: tc then passes the
+    datagram on, and only the lookup's guarantee holds for that socket. The
+    backend's sockets never set the option.
+  - **An interface in a VRF.** UDP input then accepts a socket bound to no
+    device only with `udp_l3mdev_accept`, and tc must not take a socket for
+    the consumer that the stack will refuse: a first fragment would pass and
+    the reassembled datagram would be answered, and an assigned datagram
+    would be delivered across the VRF boundary. From Linux 6.5 the lookup
+    applies the device's VRF scope itself. Before, it takes the scope from
+    the IP control block, which is not initialized at tc, and cannot tell tc
+    whether the device is enslaved. tc therefore decides in two steps, on
+    every kernel. Without a VRF scope it accepts only a socket bound to the
+    attachment's interface. Otherwise it looks again with the scope engaged
+    and accepts only a socket bound to no device, which that lookup finds
+    only with `udp_l3mdev_accept`. Before Linux 6.5 two results remain that
+    depend on whether the interface is in a VRF: the second lookup finds
+    nothing, or it finds a socket bound to a device where UDP input would
+    choose the first socket outside a VRF. tc does not decide these: it
+    assigns nothing and passes the datagram on as a link-layer multicast
+    frame. The stack's own lookup then chooses the socket, and the host
+    sends no ICMP error about such a frame. Inside a VRF without an eligible
+    socket UDP input discards the datagram and counts it in the host's
+    `NoPorts`, not in `downlink_missing_consumer`. The frame type has side
+    effects: IP input drops the datagram while
+    `drop_unicast_in_l2_multicast` is set for the interface (IPv4 input also
+    while it is set for `all`), IPv6 input drops one that carries a Routing
+    header, and a packet filter's packet-type match sees a multicast frame.
+    A socket bound to the VRF device itself is not seen by tc on any kernel;
+    the guide states what then happens. The backend's sockets are bound to
+    the attachment's own interface.
+  - **The attachment's interface.** tc decides a hand-off on the device it
+    is attached to, so IP input must receive the endpoint's packets on that
+    device. Three kinds of device take a frame from an interface after tc
+    ran: the master of a port (a bridge, a bond, a team, a virtual switch),
+    a device stacked on the interface with a receive handler of its own (a
+    macvlan, an ipvlan, a MACsec device, an HSR or PRP device), and a VLAN
+    device, for the frames of its VLAN. The VRF and the socket bindings of
+    the device that finally receives then decide the delivery, and a bridge
+    and a macvlan reset the frame's type. With the endpoint on a bridge or
+    on a passthru macvlan in a VRF, hand-offs were answered with Port
+    Unreachable or assigned across the VRF boundary. With the endpoint on a
+    macvlan or an ipvlan and a consumer on the interface below, a fragmented
+    hand-off was answered. With a VLAN device above the interface, tc
+    assigned a hand-off that arrived in the VLAN to a consumer on the
+    interface below, and let a fragmented one pass, which the host delivered
+    to a socket on the VLAN device or answered with Port Unreachable.
+  - **Refused interfaces (breaking).** The backend asks the kernel for the
+    interface's master and for every link of the namespace. It refuses an
+    interface whose master is anything but a VRF with
+    `GtpuError::UnsupportedFeature { feature:
+    ATTACHMENT_ON_ENSLAVED_INTERFACE }`, and one that another device of the
+    namespace names as its lower link with
+    `ATTACHMENT_BELOW_STACKED_DEVICE`. A device that names the interface as
+    its link is accepted only when its kind leaves the frames of that link
+    alone: a VLAN device with a VLAN ID other than 0, the other end of a
+    `veth`, `vxcan` or `netkit` pair, and a tunnel or XFRM interface bound
+    to it (`ipip`, `gre`, `gretap`, `erspan`, `ip6gre`, `ip6gretap`,
+    `ip6erspan`, `sit`, `ip6tnl`, `vti`, `vti6`, `xfrm`). Every other kind
+    is refused. The backend also refuses every interface of a namespace that
+    holds an HSR or PRP device, with
+    `ATTACHMENT_IN_NAMESPACE_WITH_HSR_DEVICE`: such a device names no lower
+    link, and from Linux 6.10 to 6.17 nothing in the kernel's answer ties
+    the interlink port of an HSR device to it, so the backend cannot tell
+    which interfaces the device takes frames from. A PRP device is a link of
+    the same kind and is refused with it. The three refusals apply in
+    `create_device`, `create_device_with_endpoints` and `resolve_device`, in
+    the inspection and admission of a sealed successor, in the activation of
+    a cleanup-only attachment, and before the backend binds the control port
+    or the socket that sends N3 End Markers. A refusal changes nothing. This
+    breaks an attachment on a port, one on an interface that carries a
+    macvlan, an ipvlan or a MACsec device in the same namespace, and every
+    attachment in a namespace that holds an HSR or PRP device: attach to the
+    device on which IP input receives the endpoint's packets, for a bridge,
+    bond or team the master itself, and keep an HSR or PRP device out of the
+    attachment's namespace.
+  - **Hand-offs in a VLAN (behaviour change).** The kernel takes the
+    outermost VLAN tag out of a frame before tc runs and keeps it beside the
+    frame, with and without tag offload. After tc it gives a frame whose tag
+    has a VLAN ID other than 0 to the VLAN device above the interface, where
+    no socket bound to the interface takes it. A hand-off in such a frame is
+    now given to no socket, whatever is bound, also on the VLAN device: tc
+    drops it and counts it in `downlink_missing_consumer` without a socket
+    lookup, and it counts and marks a first fragment, which the host
+    reassembles and UDP input discards. Before, tc passed such a hand-off
+    on. Everything else in such a frame is handled as before: a G-PDU of one
+    of the attachment's tunnels is decapsulated. An interface with VLAN
+    devices above it is accepted. An attachment on the interface below a
+    VLAN device that holds the endpoint still decapsulates the G-PDUs of its
+    tunnels that arrive in the VLAN, but its hand-offs are dropped and
+    counted: for them to be consumed, attach to the VLAN device.
+    `create_device` pins its maps under the interface's name, and bpffs
+    accepts no dot in a name, so that device needs a name without one.
+    A priority tag has the VLAN ID 0 and stays the interface's own; a VLAN
+    device with the ID 0 above the interface is refused.
+  - **Not enforced, and stated in the guide.** The backend refuses what the
+    kernel's answer for the links of the attachment's namespace reports: a
+    master other than a VRF, a device that names the interface as its lower
+    link and is not of an accepted kind, and an HSR or PRP device in the
+    namespace. What that answer does not report is a precondition for the
+    deployer. A device of a kind that takes frames from the interface and
+    reports neither a master nor a lower link is not seen. A device that is
+    stacked on the interface from another namespace is not among the links
+    that the backend reads, and the kernel shows this namespace nothing
+    reliable about it. Such a device must leave the endpoint's frames on the
+    interface, which a passthru macvlan does not; an endpoint that lives on
+    such a device is not local to the attachment's namespace, so the control
+    port cannot bind it. The checks run in the calls above and not at packet
+    time, so an interface that is enslaved, below which a device is stacked,
+    or whose namespace gains an HSR or PRP device under a running attachment
+    is reported by the next of them. The process that manages such an
+    attachment can still remove it, but a restarted process does not adopt
+    it and so cannot remove it until the interface is accepted again.
+  - **Not covered.** Echo and other non-G-PDU messages on UDP/2152 that are
+    not fragmented on the outer path are passed as before, and while nothing
+    is bound the host answers them with Port Unreachable, quoting only the
+    GTP-U message. An outer-fragmented datagram for UDP/2152 is judged by
+    its first fragment whatever GTP-U message it carries. A G-PDU with a
+    required unknown extension for an address that is not one of the
+    attachment's endpoints, and outer IPv6 fragments, are passed to the host
+    as before. A datagram that a sender addresses to UDP/2153 or UDP/2154
+    itself is not steered by tc. While the loader holds the traffic gate
+    closed, tc passes every packet untouched. An outer-fragmented datagram
+    that never completes although its first fragment arrived is still
+    reported to the sender with ICMP Time Exceeded, with and without a bound
+    consumer, unless tc passed its first fragment on as a multicast frame.
+  - **Evidence.** On a real kernel, with no consumer bound, every hand-off
+    is dropped and counted, a capture on the core side holds no ICMP error
+    and the host's ICMP counters do not move: on a fresh attachment whose
+    port was never opened, while only UDP/2152 is bound, while the process
+    is down, and after a retained graph is adopted and before the port is
+    reopened; over IPv4, and over IPv6 on a grouped attachment. An
+    outer-fragmented datagram is reassembled and discarded by UDP input, and
+    no fragment stays in a reassembly queue. With a consumer bound every
+    hand-off is delivered, and of two application sockets the one that UDP
+    input chooses receives it. On an interface enslaved to a VRF, an
+    unrelated socket in the default VRF receives no hand-off and the core no
+    ICMP error: for a G-PDU for no tunnel over IPv4 and IPv6, with and
+    without `SO_REUSEPORT` on that socket, and for an outer-fragmented G-PDU
+    over IPv4 in either fragment order. A socket admitted by
+    `udp_l3mdev_accept`, a socket on the attachment's interface and the
+    control port receive every hand-off. An interface that is a bridge port
+    is refused by every entry point before a hook or a pin exists; once the
+    interface of an attachment is enslaved, the control port and the
+    adoption are refused and neither hook nor pin changes, and the process
+    that made the attachment still removes it. An interface below a
+    passthru macvlan, an ipvlan and a VLAN device with the ID 0 is refused
+    by the same three calls before a hook or a pin exists. Once a macvlan is
+    stacked on the interface of an attachment, the control port and the
+    hand-out are refused, neither hook nor pin changes, and the process that
+    made the attachment still removes it. A cleanup-only attachment is
+    fenced but not activated on an interface that is refused. No real-kernel
+    run creates an HSR or PRP device: unit tests cover that refusal on the
+    kernel's answer for the links, among them one that omits an actual
+    interlink as a kernel from Linux 6.10 to 6.17 writes it. An interface
+    that a VLAN device, a tunnel and the other end of a veth pair name as
+    their link is accepted. With a VLAN device above the attachment's
+    interface, every kind of hand-off that arrives in that VLAN is dropped
+    and counted while a consumer is bound on the interface and a socket
+    listens on the VLAN device, with the tag in the frame and beside it: a
+    G-PDU for no tunnel over IPv4 and IPv6, a steered over-MTU packet and
+    inner fragment, and a G-PDU with a required unknown extension. A G-PDU
+    for no tunnel is dropped and counted while only a socket bound to no
+    device listens as well. An outer-fragmented one is reassembled and
+    discarded by UDP input. No socket receives any of them, and the host
+    generates no ICMP error. A G-PDU of a provisioned tunnel is decapsulated
+    in the VLAN as outside it, a frame with a priority tag is handled as the
+    interface's own, and an attachment on the VLAN device judges the frames
+    of its VLAN. A retained graph with the seven-slot counter map is refused
+    by every entry point and left exactly as it was found.
+
 - `opc-session-store`: ordinary SQLite committed-frontier writes no longer
   strand unrelated tasks on current-thread Tokio runtimes after startup.
   Process-wide admission bounds queued and active owned writes; jobs retain

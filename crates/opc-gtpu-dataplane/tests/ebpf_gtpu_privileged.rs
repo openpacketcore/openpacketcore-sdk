@@ -42,6 +42,16 @@
 
 #![cfg(target_os = "linux")]
 
+#[path = "ebpf_gtpu_privileged/attachment_receive_interface.rs"]
+mod attachment_receive_interface;
+#[path = "ebpf_gtpu_privileged/attachment_stacked_device.rs"]
+mod attachment_stacked_device;
+#[path = "ebpf_gtpu_privileged/attachment_vlan_frames.rs"]
+mod attachment_vlan_frames;
+#[path = "ebpf_gtpu_privileged/backend_hand_off_consumer.rs"]
+mod backend_hand_off_consumer;
+#[path = "ebpf_gtpu_privileged/backend_hand_off_vrf.rs"]
+mod backend_hand_off_vrf;
 #[path = "ebpf_gtpu_privileged/backend_inner_fragment_hand_off.rs"]
 mod backend_inner_fragment_hand_off;
 #[path = "ebpf_gtpu_privileged/backend_inner_fragmentation.rs"]
@@ -226,9 +236,10 @@ use opc_gtpu_ebpf_common::{
     COUNTER_DL_BINDING_FAMILY_MISMATCH, COUNTER_DL_BINDING_INGRESS_MISMATCH,
     COUNTER_DL_BINDING_INVALID, COUNTER_DL_BINDING_LOCAL_MISMATCH,
     COUNTER_DL_BINDING_PEER_MISMATCH, COUNTER_DL_BINDING_SOURCE_PORT_MISMATCH, COUNTER_DL_DECAP,
-    COUNTER_DL_DST_MISMATCH, COUNTER_DL_MALFORMED, COUNTER_DL_UNKNOWN_TEID, COUNTER_SLOTS,
-    COUNTER_TFT_CLASSIFIER_NO_MATCH, COUNTER_UL_ENCAP, COUNTER_UL_FAR_MISS, COUNTER_UL_MTU_REJECT,
-    COUNTER_UL_PMTU_CORRUPT, COUNTER_UL_REDIRECT_RESOLVED, DOWNLINK_BINDING_COUNTER_SLOTS,
+    COUNTER_DL_DST_MISMATCH, COUNTER_DL_MALFORMED, COUNTER_DL_MISSING_CONSUMER,
+    COUNTER_DL_UNKNOWN_TEID, COUNTER_SLOTS, COUNTER_TFT_CLASSIFIER_NO_MATCH, COUNTER_UL_ENCAP,
+    COUNTER_UL_FAR_MISS, COUNTER_UL_MTU_REJECT, COUNTER_UL_PMTU_CORRUPT,
+    COUNTER_UL_REDIRECT_RESOLVED, DOWNLINK_BINDING_COUNTER_SLOTS,
     DOWNLINK_ENDPOINT_BINDING_VALUE_LEN, DOWNLINK_PDR_VALUE_LEN, ETH_HDR_LEN,
     GTPU_MANDATORY_HDR_LEN, GTPU_SESSION_CONFIG_KEY, GTPU_SESSION_CONFIG_VALUE_LEN,
     GTPU_SESSION_DOWNLINK_KEY_LEN, GTPU_SESSION_GROUP_ID_LEN, GTPU_SESSION_GROUP_REF_LEN,
@@ -394,6 +405,11 @@ const FROZEN_PRE_REDIRECT_OBJECT: &[u8] =
     include_bytes!("../bpf/opc-gtpu-datapath-pre-redirect.bpf.o");
 /// `COUNTER_SLOTS` as the frozen v1 generation declared it.
 const LEGACY_V1_COUNTER_SLOTS: u32 = 6;
+/// `COUNTER_SLOTS` as every build declared it from the uplink
+/// redirect-outcome counter up to, and not including, the missing-consumer
+/// counter. A map of this width has no slot for that counter.
+const PRE_MISSING_CONSUMER_COUNTER_SLOTS: u32 = 7;
+const _: () = assert!(PRE_MISSING_CONSUMER_COUNTER_SLOTS <= COUNTER_DL_MISSING_CONSUMER);
 /// `COUNTER_SLOTS` as that generation declared it.
 const PRE_REDIRECT_COUNTER_SLOTS: u32 = 6;
 const SDK_TC_HANDLE: TcHandle = TcHandle::new(0, 1);
@@ -5104,6 +5120,70 @@ fn install_pre_redirect_generation(
     (uplink_id, downlink_id, identity)
 }
 
+/// Leave behind a pin graph with both hook slots empty: every map as this
+/// build declares it, except that the counter map has `counter_slots` slots.
+///
+/// With [`PRE_MISSING_CONSUMER_COUNTER_SLOTS`] this is the graph of the build
+/// that preceded the missing-consumer counter. Unlike the pre-redirect
+/// fixture it reshapes the current object: between the two builds no other
+/// map changed, and the capacity guard this fixture is for reads nothing but
+/// the pinned maps, so this is exactly what it would find. With
+/// [`COUNTER_SLOTS`] it is the control: the same graph at the current width.
+///
+/// With `populated`, the graph is seeded as a committed ordinary one with a
+/// session, so that a refusal by a typed schema read would be named
+/// differently.
+fn install_pin_only_graph_with_counter_slots(
+    pin_dir: &std::path::Path,
+    counter_slots: u32,
+    populated: bool,
+) -> TestOwnedDirectoryIdentity {
+    let identity = create_test_owned_private_directory_tree(
+        pin_dir,
+        "create pin-only graph with a chosen counter width",
+    );
+    let mut ebpf = EbpfLoader::new()
+        .map_max_entries(MAP_COUNTERS, counter_slots)
+        .default_map_pin_directory(pin_dir)
+        .load(CURRENT_DATAPATH_OBJECT)
+        .expect("load the current object with the chosen counter width");
+    if !populated {
+        drop(ebpf);
+        return identity;
+    }
+    {
+        let map = ebpf.map_mut(MAP_CONFIG).expect("retained config map");
+        let mut config = Array::<_, [u8; 4]>::try_from(map).expect("typed retained config");
+        config
+            .set(0, EPDG_S2BU_IP.octets(), 0)
+            .expect("seed retained config");
+    }
+    {
+        let map = ebpf.map_mut(MAP_UPLINK_FAR).expect("retained FAR map");
+        let mut far = BpfHashMap::<_, [u8; 4], [u8; UPLINK_FAR_VALUE_LEN]>::try_from(map)
+            .expect("typed retained FAR");
+        far.insert(
+            UPLINK_DSCP_SCHEMA_MARKER_KEY,
+            UPLINK_PMTU_SCHEMA_MARKER_VALUE,
+            0,
+        )
+        .expect("seed committed marker");
+        far.insert(
+            UE_PAA.octets(),
+            UplinkFar {
+                peer_ip: PGW_IP.octets(),
+                local_ip: EPDG_S2BU_IP.octets(),
+                o_teid: PEER_TEID.to_be_bytes(),
+            }
+            .encode(),
+            0,
+        )
+        .expect("seed retained FAR");
+    }
+    drop(ebpf);
+    identity
+}
+
 /// Leave one authentic historical SDK hook outside the slot managed by the
 /// current loader while publishing maps whose capacity matches this build.
 ///
@@ -7239,7 +7319,7 @@ async fn ebpf_gtpu_uplink_and_downlink_round_trip() -> Result<(), Box<dyn std::e
     // The live v1 hooks must be refused before any config, marker, map-ID, or
     // hook mutation. Their exact tags name the generation, while their
     // authentic 6-slot counter map proves why it cannot be replaced by the
-    // current 7-slot program.
+    // current program, which indexes more slots.
     let v1_pins_before = pin_directory_listing(&v1_pin_dir);
     let historical_v1 = opc_gtpu_dataplane::EbpfDatapathGeneration::Historical(
         opc_gtpu_dataplane::EbpfHistoricalDatapathGeneration::PreBearerMark,
@@ -8965,9 +9045,10 @@ async fn ebpf_gtpu_downlink_outer_fragments_reenter_sdk_consumer_exactly_once(
         .await?;
 
     // The SDK post-reassembly consumer: a sealed, device-bound UDP/2152 socket
-    // on the concrete local S2b-U endpoint in the ePDG (root) netns. tc passes
-    // every outer fragment to the stack; the kernel reassembles under its
-    // bounded ipfrag accounting and delivers one complete datagram here.
+    // on the concrete local S2b-U endpoint in the ePDG (root) netns. While it
+    // is bound, tc passes every outer fragment to the stack unchanged; the
+    // kernel reassembles under its bounded ipfrag accounting and delivers one
+    // complete datagram here.
     let consumer_socket = GtpuReassemblySocket::bind(EPDG_S2BU_IP, "s2bu")?;
     assert_eq!(consumer_socket.ingress_ifindex(), device.ifindex);
     assert_eq!(
@@ -9276,6 +9357,48 @@ async fn ebpf_gtpu_downlink_oversized_dont_fragment_is_fragmented_inside_the_tun
 async fn ebpf_gtpu_downlink_inner_fragments_take_the_backend_queue(
 ) -> Result<(), Box<dyn std::error::Error>> {
     backend_inner_fragment_hand_off::qualify().await
+}
+
+#[tokio::test]
+#[ignore = "requires root (CAP_BPF/CAP_NET_ADMIN), a fresh netns, bpffs, and the bridge module"]
+async fn ebpf_gtpu_attachment_refuses_an_enslaved_interface(
+) -> Result<(), Box<dyn std::error::Error>> {
+    attachment_receive_interface::qualify().await
+}
+
+#[tokio::test]
+#[ignore = "requires root (CAP_BPF/CAP_NET_ADMIN), a fresh netns, bpffs, and the macvlan, ipvlan and 8021q modules"]
+async fn ebpf_gtpu_attachment_refuses_an_interface_below_a_stacked_device(
+) -> Result<(), Box<dyn std::error::Error>> {
+    attachment_stacked_device::qualify().await
+}
+
+#[tokio::test]
+#[ignore = "requires root (CAP_BPF/CAP_NET_ADMIN), a fresh netns, bpffs, and the macvlan and vrf modules"]
+async fn ebpf_gtpu_attachment_refuses_an_interface_below_a_macvlan_in_a_vrf(
+) -> Result<(), Box<dyn std::error::Error>> {
+    attachment_stacked_device::qualify_macvlan_in_a_vrf().await
+}
+
+#[tokio::test]
+#[ignore = "requires root (CAP_BPF/CAP_NET_ADMIN), a fresh netns, bpffs, and the 8021q module"]
+async fn ebpf_gtpu_downlink_hand_offs_in_a_vlan_have_no_consumer(
+) -> Result<(), Box<dyn std::error::Error>> {
+    attachment_vlan_frames::qualify().await
+}
+
+#[tokio::test]
+#[ignore = "requires root (CAP_BPF/CAP_NET_ADMIN), a fresh netns, and bpffs"]
+async fn ebpf_gtpu_downlink_hand_offs_need_a_bound_consumer(
+) -> Result<(), Box<dyn std::error::Error>> {
+    backend_hand_off_consumer::qualify().await
+}
+
+#[tokio::test]
+#[ignore = "requires root (CAP_BPF/CAP_NET_ADMIN), a fresh netns, bpffs, and the vrf module"]
+async fn ebpf_gtpu_downlink_hand_offs_respect_the_vrf_of_the_attachment(
+) -> Result<(), Box<dyn std::error::Error>> {
+    backend_hand_off_vrf::qualify().await
 }
 
 #[tokio::test]
@@ -12743,6 +12866,258 @@ async fn ebpf_gtpu_foreign_pin_abi_is_refused_before_any_typed_read(
         "a foreign-shape refusal must publish nothing"
     );
 
+    drop(net);
+    Ok(())
+}
+
+/// The counter map grew from seven to sixteen slots for the missing-consumer
+/// counter. A pin graph retained from the build before that has the narrower
+/// map, where the kernel would silently discard every write to the new slot.
+/// It must be refused before anything is read through a typed binding or
+/// changed, by every entry point, so that the documented remedy still works:
+/// drain, remove the retained graph, and provision again.
+#[tokio::test]
+// The serial guard is deliberately held for the entire test body; see
+// PRIVILEGED_TEST_LOCK.
+#[allow(clippy::await_holding_lock)]
+#[ignore = "requires root (CAP_BPF/CAP_NET_ADMIN), a fresh netns, and bpffs"]
+async fn ebpf_gtpu_retained_seven_slot_counter_map_is_refused_before_mutation(
+) -> Result<(), Box<dyn std::error::Error>> {
+    if env::var("OPC_GTPU_RUN_PRIVILEGED").as_deref() != Ok("1") {
+        eprintln!("skipping: set OPC_GTPU_RUN_PRIVILEGED=1 inside a fresh privileged netns");
+        return Ok(());
+    }
+
+    let _serial = PRIVILEGED_TEST_LOCK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let net = TestNet::provision();
+    let config = EbpfGtpuDataplaneBackendConfig {
+        bpffs_pin_root: net.pin_root.clone(),
+        ..EbpfGtpuDataplaneBackendConfig::default()
+    };
+    let pin_dir = net.pin_root.join("s2bu");
+
+    let retained_identity = install_pin_only_graph_with_counter_slots(
+        &pin_dir,
+        PRE_MISSING_CONSUMER_COUNTER_SLOTS,
+        true,
+    );
+    for direction in ["egress", "ingress"] {
+        assert!(
+            !tc_filters(direction).contains("opc_gtpu"),
+            "the {direction} hook must be empty for the pin-only case"
+        );
+    }
+    let pins_before = pin_directory_listing(&pin_dir);
+    let counters_before =
+        pinned_map_abi(&pin_dir, MAP_COUNTERS).expect("retained counter map must be pinned");
+    assert_eq!(counters_before.3, PRE_MISSING_CONSUMER_COUNTER_SLOTS);
+    let marker_before = pinned_schema_marker(&pin_dir);
+    let config_before = pinned_config(&pin_dir);
+    let assert_untouched = |context: &str| {
+        assert_eq!(
+            pin_directory_listing(&pin_dir),
+            pins_before,
+            "{context}: a refusal must not add, remove or rebuild a pin"
+        );
+        assert_eq!(
+            pinned_map_abi(&pin_dir, MAP_COUNTERS),
+            Some(counters_before),
+            "{context}: the retained counter map must be left exactly as it was found"
+        );
+        assert_eq!(
+            pinned_schema_marker(&pin_dir),
+            marker_before,
+            "{context}: the durable schema marker must not change"
+        );
+        assert_eq!(
+            pinned_config(&pin_dir),
+            config_before,
+            "{context}: the retained config must not be rewritten"
+        );
+        for direction in ["egress", "ingress"] {
+            assert!(
+                !tc_filters(direction).contains("opc_gtpu"),
+                "{context}: no hook may be attached to the refused graph"
+            );
+        }
+    };
+
+    let creating = EbpfGtpuDataplaneBackend::with_config(config.clone());
+    let mut create = CreateGtpDeviceRequest::new("s2bu");
+    create.bind_address = IpAddr::V4(EPDG_S2BU_IP);
+    let error = creating
+        .create_device(create)
+        .await
+        .expect_err("a retained seven-slot counter map must refuse create_device");
+    assert!(
+        matches!(
+            error,
+            GtpuError::Io {
+                operation: "ebpf_pin_map_abi",
+                ..
+            }
+        ),
+        "create_device must name the narrower counter map as a pin ABI mismatch, got {error:?}"
+    );
+    drop(creating);
+    assert_untouched("after create_device");
+
+    let adopting = EbpfGtpuDataplaneBackend::with_config(config.clone());
+    let error = adopting
+        .resolve_device("s2bu")
+        .await
+        .expect_err("a retained seven-slot counter map must refuse resolve_device");
+    assert!(
+        matches!(
+            error,
+            GtpuError::Io {
+                operation: "ebpf_pin_map_abi",
+                ..
+            }
+        ),
+        "resolve_device must refuse with the same pin ABI mismatch, got {error:?}"
+    );
+    drop(adopting);
+    assert_untouched("after resolve_device");
+
+    assert!(
+        remove_owned_test_directory(&pin_dir, retained_identity),
+        "remove the exact retained pin graph"
+    );
+
+    // The width alone is what this guard refuses. An empty graph with the
+    // seven-slot map is refused in the same way, and the same empty graph
+    // with the current map gets past the pin ABI guard. (The loader does not
+    // adopt a graph that it did not publish itself; that later refusal has
+    // its own name and is not this test's subject.)
+    let narrow_identity = install_pin_only_graph_with_counter_slots(
+        &pin_dir,
+        PRE_MISSING_CONSUMER_COUNTER_SLOTS,
+        false,
+    );
+    let narrow_pins = pin_directory_listing(&pin_dir);
+    let refusing = EbpfGtpuDataplaneBackend::with_config(config.clone());
+    let mut create = CreateGtpDeviceRequest::new("s2bu");
+    create.bind_address = IpAddr::V4(EPDG_S2BU_IP);
+    let error = refusing
+        .create_device(create)
+        .await
+        .expect_err("an empty graph with the seven-slot counter map must be refused");
+    assert!(
+        matches!(
+            error,
+            GtpuError::Io {
+                operation: "ebpf_pin_map_abi",
+                ..
+            }
+        ),
+        "an empty graph with the narrower counter map must be named a pin ABI mismatch, got {error:?}"
+    );
+    drop(refusing);
+    assert_eq!(pin_directory_listing(&pin_dir), narrow_pins);
+    assert!(
+        remove_owned_test_directory(&pin_dir, narrow_identity),
+        "remove the exact empty seven-slot pin graph"
+    );
+
+    let control_identity =
+        install_pin_only_graph_with_counter_slots(&pin_dir, COUNTER_SLOTS, false);
+    assert_eq!(
+        pinned_map_abi(&pin_dir, MAP_COUNTERS).map(|abi| abi.3),
+        Some(COUNTER_SLOTS)
+    );
+    let control = EbpfGtpuDataplaneBackend::with_config(config.clone());
+    let mut create = CreateGtpDeviceRequest::new("s2bu");
+    create.bind_address = IpAddr::V4(EPDG_S2BU_IP);
+    match control.create_device(create).await {
+        Ok(device) => control.remove_device(&device).await?,
+        Err(error) => assert!(
+            !matches!(
+                error,
+                GtpuError::Io {
+                    operation: "ebpf_pin_map_abi",
+                    ..
+                }
+            ),
+            "the same empty graph with the current counter map must pass the pin ABI guard, got {error:?}"
+        ),
+    }
+    drop(control);
+    if pin_dir.exists() {
+        assert!(
+            remove_owned_test_directory(&pin_dir, control_identity),
+            "remove the exact control pin graph"
+        );
+    }
+
+    // The remedy: with the retained graph removed, the same request
+    // provisions a graph of the current width.
+    let reprovisioned = EbpfGtpuDataplaneBackend::with_config(config.clone());
+    let mut create = CreateGtpDeviceRequest::new("s2bu");
+    create.bind_address = IpAddr::V4(EPDG_S2BU_IP);
+    let device = reprovisioned.create_device(create).await?;
+    assert_eq!(
+        pinned_map_abi(&pin_dir, MAP_COUNTERS).map(|abi| abi.3),
+        Some(COUNTER_SLOTS),
+        "a reprovisioned graph has the current counter map"
+    );
+    assert_eq!(pinned_counter(&pin_dir, COUNTER_DL_MISSING_CONSUMER), 0);
+    reprovisioned.remove_device(&device).await?;
+    drop(reprovisioned);
+
+    // A grouped attachment keeps its graph in a directory of its own, and
+    // the same guard protects it.
+    let grouped_pin_dir = grouped_pin_directory(&net.pin_root, grouped_device_id());
+    let grouped_identity = install_pin_only_graph_with_counter_slots(
+        &grouped_pin_dir,
+        PRE_MISSING_CONSUMER_COUNTER_SLOTS,
+        false,
+    );
+    let grouped_pins_before = pin_directory_listing(&grouped_pin_dir);
+    let grouped_counters_before = pinned_map_abi(&grouped_pin_dir, MAP_COUNTERS)
+        .expect("retained grouped counter map must be pinned");
+    assert_eq!(
+        grouped_counters_before.3,
+        PRE_MISSING_CONSUMER_COUNTER_SLOTS
+    );
+    let grouping = EbpfGtpuDataplaneBackend::with_config(config.clone());
+    let error = grouping
+        .create_device_with_endpoints(grouped_device_request(grouped_mtu_policy()))
+        .await
+        .expect_err("a retained seven-slot counter map must refuse create_device_with_endpoints");
+    assert!(
+        matches!(
+            error,
+            GtpuError::Io {
+                operation: "ebpf_pin_map_abi",
+                ..
+            }
+        ),
+        "create_device_with_endpoints must refuse with the same pin ABI mismatch, got {error:?}"
+    );
+    drop(grouping);
+    assert_eq!(
+        pin_directory_listing(&grouped_pin_dir),
+        grouped_pins_before,
+        "a refusal must not add, remove or rebuild a grouped pin"
+    );
+    assert_eq!(
+        pinned_map_abi(&grouped_pin_dir, MAP_COUNTERS),
+        Some(grouped_counters_before),
+        "the retained grouped counter map must be left exactly as it was found"
+    );
+    for direction in ["egress", "ingress"] {
+        assert!(
+            !tc_filters(direction).contains("opc_gtpu"),
+            "no hook may be attached to the refused grouped graph"
+        );
+    }
+    assert!(
+        remove_owned_test_directory(&grouped_pin_dir, grouped_identity),
+        "remove the exact retained grouped pin graph"
+    );
     drop(net);
     Ok(())
 }
