@@ -1,15 +1,15 @@
 # EAP packet conformance
 
 This document defines the exact conformance boundaries for `opc-proto-eap`:
-the EAP-AKA structural projection described first, and the separate
-[EAP-5G bootstrap codec](#eap-5g-bootstrap-envelopes). Neither is an
-authentication implementation or an authentication claim.
+common EAP admission and terminal packets, the EAP-AKA structural projection,
+and the separate [EAP-5G bootstrap codec](#eap-5g-bootstrap-envelopes).
+These are structural APIs, without an authentication implementation or claim.
 
 ## Specification baseline
 
 | Specification | Claimed scope |
 |:--|:--|
-| IETF RFC 3748 | Section 4.1 complete Request/Response header framing |
+| IETF RFC 3748 | Sections 4–4.2 common admission, receive padding, Request/Response framing and four-octet Success/Failure |
 | IETF RFC 4187 | Sections 6 through 10 EAP-AKA messages, attributes, Notification S/P semantics, and extensibility |
 | IETF RFC 9048 | Current backwards-compatible EAP-AKA-prime specification, Sections 3 through 6; Type 50, KDF/KDF-Input, and AT_BIDDING updates |
 | IETF RFC 5998 | Structural evidence consumed by an IKEv2 EAP-only product; no EAP-only safety decision |
@@ -17,6 +17,46 @@ authentication implementation or an authentication claim.
 RFC 9048 is the current EAP-AKA-prime baseline and updates the older RFC 5448
 definition. RFC 3748 has no section 4.4; no conformance claim is made against
 that erroneous reference.
+
+## EAP admission and terminal packets
+
+`EapPacket::parse` admits Code 1 Request, Code 2 Response, Code 3 Success and
+Code 4 Failure from common header framing. It rejects a header shorter than
+four octets, Length below four, Length larger than the supplied slice, and
+unsupported codes. A Request/Response must include at least its Type octet
+within Length; Type and Type-Data validation is deferred to a method parser.
+
+`EapSuccess` and `EapFailure` encode exactly `[3, identifier, 0, 4]` and
+`[4, identifier, 0, 4]`. Receive admission requires Length 4. Any declared
+Data, even zero-filled or a method header, is rejected. RFC 3748 section 4
+requires bytes beyond Length to be ignored as lower-layer padding: this policy
+applies to all admitted codes. Padding is neither retained nor re-encoded.
+This distinction means a terminal with Length 5 is invalid even if all five
+octets arrived, while extra received octets beyond Length 4 are ignored.
+
+Request/Response variants contain an `EapMethodPacket` borrowing exactly the
+declared packet. Its `parse_aka` and `parse_eap5g` methods invoke the existing
+parsers without changing their validation, errors or caller limits. EAP-5G's
+packet length limit applies to the declared packet, excluding receive padding.
+Calling either method parser directly still requires exact framing. The
+two-variant `EapCode` direction enum is unchanged. EAP-5G Stop remains an EAP
+Response and is distinct from EAP Failure.
+
+RFC 3748 section 4.2 requires both terminal identifiers to equal that of the
+last Response being answered. Each terminal's `matches_response_identifier`
+helper compares against the caller's last Response identifier. The caller
+still owns exchange state and authentication decisions; identifier equality
+alone is not authentication evidence. Admission and terminal diagnostics
+omit all identifiers, packet values and padding; errors are stable unit
+variants. The method borrow has no raw accessor.
+
+`tests/packet.rs` covers exact encoding and round-trips for both terminal codes
+at identifiers 0 and 255; matching and mismatched identifiers; truncated headers,
+unknown codes, invalid Length, Length 3/5, missing Type, incomplete declared
+packets and declared terminal Data; ignored receive padding; unchanged AKA,
+AKA-prime and EAP-5G method dispatch, errors, limits and input lifetimes; the
+existing exhaustive direction enum; and value-free diagnostics. Fixtures are
+synthetic and expected terminal octets are authored directly from the RFC layout.
 
 ## Validation contract
 

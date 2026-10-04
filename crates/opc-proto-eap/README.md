@@ -1,14 +1,60 @@
 # opc-proto-eap
 
-`opc-proto-eap` provides a strict, allocation-bounded, product-neutral
-projection for complete EAP-AKA (Type 23) and EAP-AKA-prime (Type 50) Request
-and Response packets, alongside a bounded EAP-5G envelope codec. The AKA
+`opc-proto-eap` provides method-independent EAP admission, typed Success and
+Failure packets, a strict, allocation-bounded projection for complete EAP-AKA
+(Type 23) and EAP-AKA-prime (Type 50) Request and Response packets, and a
+bounded EAP-5G envelope codec. The AKA
 projection is shared by the IKEv2 and SWm Diameter-EAP
 boundaries so products do not need a second method parser. The crate remains
 an experimental workspace component and is not published independently until
 its protocol surface graduates.
 
 ## Scope
+
+### Common admission and terminal packets
+
+`EapPacket::parse` classifies the common header as `Request`, `Response`,
+`Success` or `Failure`, without interpreting a method. `EapSuccess` and
+`EapFailure` each hold an identifier and encode without allocation to exactly
+`[3, identifier, 0, 4]` or `[4, identifier, 0, 4]`.
+
+```rust
+use opc_proto_eap::{EapFailure, EapPacket, EapPacketError, EapSuccess};
+
+let last_response_identifier = 7;
+let wire = EapSuccess::new(last_response_identifier).encode();
+assert!(matches!(
+    EapPacket::parse(&wire)?,
+    EapPacket::Success(success)
+        if success.matches_response_identifier(last_response_identifier)
+));
+assert_eq!(EapFailure::new(7).encode(), [4, 7, 0, 4]);
+# Ok::<(), EapPacketError>(())
+```
+
+Admission rejects incomplete headers, unsupported codes, Length below four,
+Length beyond the received slice, and Request/Response without a Type octet
+inside Length. Terminals require Length exactly four: declared Data is invalid,
+including zero-filled Data. Per [RFC 3748 section 4](https://www.rfc-editor.org/rfc/rfc3748.html#section-4),
+octets **outside** Length are lower-layer padding and are ignored for all four
+codes. Thus `[3, 7, 0, 5, 0]` is rejected, while `[3, 7, 0, 4, 0]` is admitted
+and re-encodes to four octets.
+
+`Request` and `Response` contain an `EapMethodPacket` borrowing only the
+declared packet. Call `parse_aka()` or `parse_eap5g(limits)` on it to invoke the
+existing method parsers. Method validation and EAP-5G caller limits still apply;
+the packet length limit excludes ignored lower-layer padding. Direct calls to
+the method parsers continue to require an exact complete packet. `EapCode`
+remains the two-variant Request/Response direction type.
+
+Per [RFC 3748 section 4.2](https://www.rfc-editor.org/rfc/rfc3748.html#section-4.2),
+both terminal identifiers must equal the last Response being answered.
+`matches_response_identifier` checks that equality against caller-owned state;
+neither equality nor parsing proves authentication or completes IKE_AUTH.
+Admission and terminal `Debug` output and errors contain no identifiers,
+method values or padding bytes.
+
+### EAP-5G envelopes
 
 The separate [`eap5g`](src/eap5g.rs) module constructs and parses EAP-5G
 Start, NAS Request/Response, Stop, and empty Notification envelopes. NAS is
