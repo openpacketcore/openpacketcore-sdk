@@ -4715,6 +4715,12 @@ pub enum GtpuDownlinkOversizePolicy {
 /// [`GtpPdpContext::downlink_inner_mtu`] `None` to keep the existing
 /// behaviour.
 ///
+/// Under either policy the eBPF backend also hands every inner IPv4 fragment
+/// of the session (More Fragments set, or a non-zero fragment offset) to the
+/// backend-owned consumer instead of decapsulating it in tc, so that all
+/// fragments of one datagram take one path; see
+/// [`GtpPdpContext::downlink_inner_mtu`].
+///
 /// The MTU is from [`opc_gtpu_ebpf_common::DOWNLINK_INNER_MTU_MIN`] (576, the
 /// RFC 791 IPv4 floor) to [`opc_gtpu_ebpf_common::DOWNLINK_INNER_MTU_MAX`]
 /// (32,767, the commit record's 15-bit field). `Debug` exposes the value and
@@ -4856,6 +4862,31 @@ pub struct GtpPdpContext {
     /// sends at most one RFC 1191 Fragmentation Needed error carried in the
     /// UE's default-bearer uplink G-PDU toward the peer; see
     /// [`GtpuControlPort::try_receive_downlink`](crate::control_port::GtpuControlPort::try_receive_downlink).
+    ///
+    /// With `Some`, tc also forwards no inner IPv4 fragment (More Fragments
+    /// set, or a non-zero fragment offset) itself. Every authorized fragment
+    /// is handed to the same control port:
+    ///
+    /// - A fragment that exceeds this value with Don't Fragment set is an
+    ///   over-MTU packet like any other. It follows the oversize policy
+    ///   above and its rate limit.
+    /// - Every other fragment is returned as
+    ///   [`GtpuDownlinkEvent::Decapsulated`](crate::GtpuDownlinkEvent::Decapsulated),
+    ///   unmodified, with its tunnel's bearer mark, for the caller to
+    ///   inject, once its header has been validated. It takes no token from
+    ///   the inner fragmentation or Packet Too Big rate limits. This includes
+    ///   a fragment larger than this value without Don't Fragment, which is
+    ///   returned unfragmented.
+    ///
+    /// One fragment of a datagram can reach that port anyway, through kernel
+    /// reassembly of an outer-fragmented G-PDU. If tc forwarded the others,
+    /// netfilter connection tracking could hold the two halves in separate
+    /// reassembly queues until both expire. A fragment is authorized like
+    /// any G-PDU, first or not: by its tunnel, outer endpoints, complete
+    /// Active graph and inner destination. Inner fragments wait in their own
+    /// queue, bounded by its socket receive buffer, so a flood of them cannot
+    /// displace over-MTU packets.
+    ///
     /// Backends whose [`GtpuProbe::downlink_inner_mtu_enforcement`] is not
     /// [`GtpuCapability::Available`] reject `Some`. `None` preserves the
     /// existing packet behavior and the original commit-record bytes. Open
@@ -6853,15 +6884,16 @@ pub struct GtpuProbe {
     /// opted in (see [`GtpPdpContext::downlink_inner_mtu`]).
     ///
     /// `Available` states that the datapath can enforce the MTU and steer
-    /// over-MTU packets to the backend-owned queue. Fragments are produced,
-    /// and errors sent, only while the embedding application drains that
-    /// queue through
+    /// over-MTU packets, and every inner IPv4 fragment of a context with an
+    /// MTU, to the backend-owned queues. Fragments are produced or returned,
+    /// and errors sent, only while the embedding application drains those
+    /// queues through
     /// [`GtpuControlPort::try_receive_downlink`](crate::control_port::GtpuControlPort::try_receive_downlink)
-    /// and injects the returned fragments; otherwise over-MTU packets wait in
-    /// that queue and are dropped when it overflows, never forwarded.
+    /// and injects the returned packets; otherwise steered packets wait in
+    /// their queue and are dropped when it overflows, never forwarded.
     ///
-    /// The backend binds that queue when the control port is first opened for
-    /// the attachment and keeps it until the attachment is removed or the
+    /// The backend binds those queues when the control port is first opened for
+    /// the attachment and keeps them until the attachment is removed or the
     /// queue is retired. Nothing is bound before that first open, while the
     /// process is down across a restart (tc keeps steering from the pinned
     /// graph), or after a retirement. In those windows the kernel may answer

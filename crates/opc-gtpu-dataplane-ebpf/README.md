@@ -41,12 +41,25 @@ The crate exposes tc entry points, not a Rust library API:
   (`GTPU_PACKET_TOO_BIG_QUEUE_PORT`, 2153). Its consumer fragments the inner
   packet by default, or sends at most one in-tunnel RFC 1191 error when the
   session opted in; tc reads only the MTU bits and steers identically under
-  both policies. A hand-off flood therefore never fills the shared UDP/2152
-  queue. tc steers whether or not the queue is bound. While it is not, the
-  kernel may answer with rate-limited ICMP Port Unreachable toward the peer
-  (#1019). tc keeps no hand-off counter: adding a counter or policing map
-  would change the retained pin inventory and durable recovery records. A true
-  grouped-index miss alone may enter the legacy IPv4 PDR/commit path.
+  both policies. Every other authorized inner IPv4 fragment of a session with
+  a downlink inner MTU (More Fragments set, or a non-zero fragment offset) is
+  handed off the same way, to the backend-owned inner-fragment queue
+  (`GTPU_INNER_FRAGMENT_QUEUE_PORT`, 2154). Its consumer validates the inner
+  header, as the kernel's IPv4 input would after a decapsulation, and returns
+  the fragment unmodified with its bearer mark, so that every fragment of one
+  datagram
+  leaves through the application and none through the host's forwarding
+  path, where netfilter connection tracking could strand it. The decision is
+  `opc-gtpu-ebpf-common`'s `downlink_ipv4_hand_off_port`, taken only after the
+  complete authorization and before decapsulation. A session without a
+  downlink inner MTU hands nothing off. A hand-off flood therefore never
+  fills the shared UDP/2152 queue, and a flood of one hand-off class never
+  fills the other's queue. tc steers whether or not the queues are bound.
+  While they are not, the kernel may answer with rate-limited ICMP Port
+  Unreachable toward the peer (#1019). tc keeps no hand-off counter: adding a
+  counter or policing map would change the retained pin inventory and durable
+  recovery records. A true grouped-index miss alone may enter the legacy IPv4
+  PDR/commit path.
   Outer-IPv4 fragments, legacy or grouped, retain the bounded
   kernel-reassembly handoff; the backend-owned consumer
   (`GtpuControlPort::try_receive_downlink`) authorizes the reassembled G-PDU
