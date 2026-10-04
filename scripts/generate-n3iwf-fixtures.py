@@ -1905,6 +1905,8 @@ def n2_sctp(subset_dir: Path) -> list[dict]:
             wire_hex=data,
             assertions=[
                 "chunk=DATA",
+                "order=ordered",
+                "stream_id=0",
                 "ppid=60",
                 "user_data_len=1",
                 "user_data=opaque-synthetic-octet",
