@@ -993,15 +993,24 @@ struct ConsensusConnectionLaneState {
     changed: Arc<Notify>,
     reaper_started: AtomicBool,
     in_flight: Semaphore,
+    /// Test-only notification when the reaper clears this lane. Waiters
+    /// recheck the current connection so an earlier retirement cannot satisfy
+    /// a wait after the lane has been reused.
+    #[cfg(test)]
+    retired_for_test: tokio::sync::watch::Sender<()>,
 }
 
 impl ConsensusConnectionLaneState {
     fn new() -> Self {
+        #[cfg(test)]
+        let (retired_for_test, _) = tokio::sync::watch::channel(());
         Self {
             connection: Mutex::new(None),
             changed: Arc::new(Notify::new()),
             reaper_started: AtomicBool::new(false),
             in_flight: Semaphore::new(1),
+            #[cfg(test)]
+            retired_for_test,
         }
     }
 }
@@ -1204,6 +1213,8 @@ async fn reap_cached_consensus_connection(
                             )
                             .await;
                     }
+                    #[cfg(test)]
+                    lane_state.retired_for_test.send_replace(());
                     continue;
                 }
                 if consensus_connection_idle_expired(connection, now) {
@@ -1213,6 +1224,8 @@ async fn reap_cached_consensus_connection(
                     let retired = cached.take();
                     drop(cached);
                     drop(retired);
+                    #[cfg(test)]
+                    lane_state.retired_for_test.send_replace(());
                     continue;
                 }
                 Some(
@@ -6886,13 +6899,15 @@ mod tests {
             "cancelling the caller must leave its detached replacement setup alive"
         );
         drop(pool_owner);
-        tokio::time::timeout(Duration::from_secs(1), async {
-            while accounting.snapshot().1 < 2 {
-                tokio::task::yield_now().await;
-            }
-        })
+        let mut accounting_changed = accounting.subscribe_changed();
+        let settled = Arc::clone(&accounting);
+        tokio::time::timeout(
+            Duration::from_secs(1),
+            accounting_changed.wait_for(move |_| settled.snapshot().1 >= 2),
+        )
         .await
-        .expect("pool shutdown must settle the detached replacement setup");
+        .expect("pool shutdown must settle the detached replacement setup")
+        .expect("accounting watch channel must outlive the waiter");
         assert_eq!(accounting.snapshot(), (2, 2, 1, 1));
     }
 
@@ -6997,13 +7012,15 @@ mod tests {
             "caller cancellation must not supersede the detached new-epoch setup"
         );
         drop(pool_owner);
-        tokio::time::timeout(Duration::from_secs(1), async {
-            while accounting.snapshot().1 < 2 {
-                tokio::task::yield_now().await;
-            }
-        })
+        let mut accounting_changed = accounting.subscribe_changed();
+        let settled = Arc::clone(&accounting);
+        tokio::time::timeout(
+            Duration::from_secs(1),
+            accounting_changed.wait_for(move |_| settled.snapshot().1 >= 2),
+        )
         .await
-        .expect("pool shutdown must settle the detached new-epoch setup");
+        .expect("pool shutdown must settle the detached new-epoch setup")
+        .expect("accounting watch channel must outlive the waiter");
         assert_eq!(accounting.snapshot(), (2, 2, 1, 1));
     }
 
@@ -7153,13 +7170,15 @@ mod tests {
             "cancelling the original caller must not terminalize the material-successor attempt"
         );
         drop(pool_owner);
-        tokio::time::timeout(Duration::from_secs(1), async {
-            while accounting.snapshot().1 < 2 {
-                tokio::task::yield_now().await;
-            }
-        })
+        let mut accounting_changed = accounting.subscribe_changed();
+        let settled = Arc::clone(&accounting);
+        tokio::time::timeout(
+            Duration::from_secs(1),
+            accounting_changed.wait_for(move |_| settled.snapshot().1 >= 2),
+        )
         .await
-        .expect("pool shutdown must settle the detached material-successor attempt");
+        .expect("pool shutdown must settle the detached material-successor attempt")
+        .expect("accounting watch channel must outlive the waiter");
         assert_eq!(accounting.snapshot(), (2, 2, 1, 1));
     }
 
@@ -7255,13 +7274,15 @@ mod tests {
         assert_eq!(superseded, 0);
         assert_eq!(abandoned, 0);
         drop(peer);
-        tokio::time::timeout(Duration::from_secs(1), async {
-            while accounting.snapshot().1 < attempts {
-                tokio::task::yield_now().await;
-            }
-        })
+        let mut accounting_changed = accounting.subscribe_changed();
+        let settled = Arc::clone(&accounting);
+        tokio::time::timeout(
+            Duration::from_secs(1),
+            accounting_changed.wait_for(move |_| settled.snapshot().1 >= attempts),
+        )
         .await
-        .expect("pool shutdown must settle detached attempt accounting");
+        .expect("pool shutdown must settle detached attempt accounting")
+        .expect("accounting watch channel must outlive the waiter");
         assert_eq!(accounting.snapshot(), (attempts, attempts, 0, attempts));
     }
 
@@ -9209,8 +9230,10 @@ mod tests {
         assert!(pool.overflow.connection.lock().await.is_some());
 
         tokio::time::advance(Duration::from_millis(1)).await;
+        let at_reuse_boundary = tokio::time::Instant::now();
         wait_for_cached_lane_to_empty(&pool, ConsensusConnectionLane::Primary).await;
         wait_for_cached_lane_to_empty(&pool, ConsensusConnectionLane::Overflow).await;
+        assert_eq!(tokio::time::Instant::now(), at_reuse_boundary);
         for probe in [primary_probe, overflow_probe] {
             assert_eq!(probe.recorded_retirement_count(), 1);
             assert_eq!(
@@ -9546,20 +9569,90 @@ mod tests {
         );
     }
 
+    /// Waits until the cached-connection reaper empties `lane`.
+    ///
+    /// Subscribe before inspecting the connection to avoid a lost wakeup.
+    /// Recheck after every retirement notification, including when this lane
+    /// was used by an earlier connection. Parking lets a paused clock advance.
     async fn wait_for_cached_lane_to_empty(
         pool: &ConsensusConnectionPool,
         lane: ConsensusConnectionLane,
     ) {
-        tokio::time::timeout(Duration::from_secs(1), async {
+        let lane = pool.lane(lane);
+        let mut retired = lane.retired_for_test.subscribe();
+        tokio::time::timeout(Duration::from_secs(1), async move {
             loop {
-                if pool.lane(lane).connection.lock().await.is_none() {
+                if lane.connection.lock().await.is_none() {
                     return;
                 }
-                tokio::task::yield_now().await;
+                retired
+                    .changed()
+                    .await
+                    .expect("lane retirement watch channel must outlive the waiter");
             }
         })
         .await
         .expect("cached consensus lane retirement");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn cached_lane_wait_parks_until_current_connection_retires_after_lane_reuse() {
+        let _guard = crate::test_support::SESSION_CONNECTION_METRICS_TEST_LOCK
+            .lock()
+            .await;
+        let policy = ConnectionLifecyclePolicy::try_new(
+            Duration::from_millis(50),
+            Duration::from_millis(10),
+            Duration::from_millis(5),
+            Duration::from_millis(20),
+            Duration::ZERO,
+        )
+        .expect("short cached lifecycle policy");
+        let pool = Arc::new(ConsensusConnectionPool::new(policy));
+        for lane in [
+            ConsensusConnectionLane::Primary,
+            ConsensusConnectionLane::Overflow,
+        ] {
+            // Reuse the lane after a lifecycle retirement, then exercise the
+            // idle-retirement notification with that older signal retained.
+            for reason in [RetirementReason::MaximumAge, RetirementReason::IdleTimeout] {
+                let now = tokio::time::Instant::now();
+                let lifecycle = ConnectionLifecycle::new(policy, now, None, None, 0, None)
+                    .expect("cached lifecycle");
+                let probe = lifecycle.clone();
+                let mut connection = cached_consensus_connection(lifecycle);
+                let retire_at = if reason == RetirementReason::IdleTimeout {
+                    connection.last_successful_correlated_use = Some(
+                        now - DURABLE_CONSENSUS_TIMING_PROFILE.client_connection_reuse_limit()
+                            + Duration::from_millis(20),
+                    );
+                    now + Duration::from_millis(20)
+                } else {
+                    probe.retire_at()
+                };
+                *pool.lane(lane).connection.lock().await = Some(connection);
+                pool.ensure_cached_connection_reaper(
+                    lane,
+                    None,
+                    SessionReauthenticationControl::new(),
+                    [0; 32],
+                    test_cold_epoch(),
+                );
+                pool.lane(lane).changed.notify_one();
+
+                // No manual clock advance: the waiter must park for the
+                // reaper's timer, including on the second use of this lane.
+                wait_for_cached_lane_to_empty(&pool, lane).await;
+                assert!(tokio::time::Instant::now() >= retire_at);
+                assert!(pool.lane(lane).connection.lock().await.is_none());
+                assert_eq!(probe.recorded_retirement_count(), 1);
+                assert_eq!(probe.recorded_retirement_reason(), Some(reason));
+
+                let retired_at = tokio::time::Instant::now();
+                wait_for_cached_lane_to_empty(&pool, lane).await;
+                assert_eq!(tokio::time::Instant::now(), retired_at);
+            }
+        }
     }
 
     #[tokio::test]
@@ -9675,7 +9768,9 @@ mod tests {
             "the reaper must wait for the in-flight lane owner"
         );
         drop(in_flight);
+        let released_at = tokio::time::Instant::now();
         wait_for_cached_lane_to_empty(&pool, ConsensusConnectionLane::Primary).await;
+        assert_eq!(tokio::time::Instant::now(), released_at);
         assert_eq!(retirement_probe.recorded_retirement_count(), 1);
         assert_eq!(
             retirement_probe.recorded_retirement_reason(),
