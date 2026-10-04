@@ -144,6 +144,11 @@ pub enum XfrmObjectRecoveryBindError {
         /// Redaction-safe backend failure.
         source: XfrmError,
     },
+    /// The cleanup inventory could not be authenticated and leased.
+    CleanupInventory {
+        /// Value-free inventory failure.
+        source: crate::XfrmCleanupInventoryError,
+    },
     /// The durable recovery store could not be authenticated and leased.
     Store {
         /// Value-free durable-store failure.
@@ -170,6 +175,7 @@ impl XfrmObjectRecoveryBindError {
     pub const fn as_str(&self) -> &'static str {
         match self {
             Self::Backend { .. } => "xfrm_object_recovery_bind_backend",
+            Self::CleanupInventory { .. } => "xfrm_cleanup_inventory_bind",
             Self::Store { .. } => "xfrm_object_recovery_bind_store",
             Self::SaRelocationStore { .. } => "xfrm_sa_relocation_recovery_bind_store",
             Self::RosterStore { .. } => "xfrm_object_roster_recovery_bind_store",
@@ -199,6 +205,7 @@ impl Error for XfrmObjectRecoveryBindError {
     fn source(&self) -> Option<&(dyn Error + 'static)> {
         match self {
             Self::Backend { source } => Some(source),
+            Self::CleanupInventory { source } => Some(source),
             Self::Store { source } => Some(source),
             Self::SaRelocationStore { source } => Some(source),
             Self::RosterStore { source } => Some(source),
@@ -1096,7 +1103,8 @@ fn bind_with_capacity(
             // value-free.
             XfrmObjectRecoveryBindError::Store { .. }
             | XfrmObjectRecoveryBindError::SaRelocationStore { .. }
-            | XfrmObjectRecoveryBindError::RosterStore { .. } => XfrmError::Unavailable,
+            | XfrmObjectRecoveryBindError::RosterStore { .. }
+            | XfrmObjectRecoveryBindError::CleanupInventory { .. } => XfrmError::Unavailable,
         })
 }
 
@@ -1115,7 +1123,13 @@ fn bind_with_capacity(
         .name(String::from("opc-xfrm-netns"))
         .spawn({
             let actor_binding = actor_binding.clone();
-            move || run_actor(backend, actor_binding, receiver, startup_sender)
+            #[cfg(feature = "test-support")]
+            let actor_lifetime = backend.test_namespace_actor_lifetime();
+            move || {
+                #[cfg(feature = "test-support")]
+                let _actor_lifetime = actor_lifetime;
+                run_actor(backend, actor_binding, receiver, startup_sender);
+            }
         })
         .map_err(|error| XfrmError::io("network_namespace_actor_spawn", error))?;
 
@@ -1284,6 +1298,38 @@ pub(crate) fn bind_current_network_namespace_with_object_and_sa_relocation_recov
 }
 
 #[cfg(unix)]
+pub(crate) fn bind_current_network_namespace_with_cleanup_inventory(
+    backend: LinuxXfrmBackend,
+    config: crate::XfrmCleanupInventoryBindingConfig,
+) -> Result<crate::XfrmCleanupInventoryBinding, XfrmObjectRecoveryBindError> {
+    let (backend, object_recovery, sa_relocation_recovery, roster_recovery) =
+        bind_with_recovery_config(
+            backend,
+            LINUX_XFRM_NAMESPACE_ACTOR_CAPACITY,
+            ActorRecoveryConfig {
+                recovery: config.object_recovery,
+                relocation_recovery: config.sa_relocation_recovery,
+                roster_recovery: config.roster_recovery,
+                inventory: Some(config.inventory),
+            },
+        )?;
+    Ok(crate::XfrmCleanupInventoryBinding {
+        backend,
+        object_recovery,
+        sa_relocation_recovery,
+        roster_recovery,
+    })
+}
+
+#[cfg(unix)]
+struct ActorRecoveryConfig {
+    recovery: Option<(PathBuf, XfrmObjectRecoveryProofKey)>,
+    relocation_recovery: Option<(PathBuf, XfrmSaRelocationRecoveryProofKey)>,
+    roster_recovery: Option<(PathBuf, XfrmObjectRosterRecoveryProofKey)>,
+    inventory: Option<crate::XfrmCleanupInventoryConfig>,
+}
+
+#[cfg(unix)]
 type DurableRecoveryBindResult = (
     NamespaceBoundLinuxXfrmBackend,
     Option<XfrmObjectInstallRecoveryStore>,
@@ -1299,6 +1345,32 @@ fn bind_with_capacity_and_recovery(
     relocation_recovery: Option<(PathBuf, XfrmSaRelocationRecoveryProofKey)>,
     roster_recovery: Option<(PathBuf, XfrmObjectRosterRecoveryProofKey)>,
 ) -> Result<DurableRecoveryBindResult, XfrmObjectRecoveryBindError> {
+    bind_with_recovery_config(
+        backend,
+        capacity,
+        ActorRecoveryConfig {
+            recovery,
+            relocation_recovery,
+            roster_recovery,
+            inventory: None,
+        },
+    )
+}
+
+#[cfg(unix)]
+fn bind_with_recovery_config(
+    backend: LinuxXfrmBackend,
+    capacity: usize,
+    recovery_config: ActorRecoveryConfig,
+) -> Result<DurableRecoveryBindResult, XfrmObjectRecoveryBindError> {
+    if let Some(config) = &recovery_config.inventory {
+        backend
+            .validate_cleanup_inventory_binding()
+            .map_err(|source| XfrmObjectRecoveryBindError::Backend { source })?;
+        config
+            .validate()
+            .map_err(|source| XfrmObjectRecoveryBindError::CleanupInventory { source })?;
+    }
     let binding = NetworkNamespaceBinding::capture()
         .map_err(|source| XfrmObjectRecoveryBindError::Backend { source })?;
     let actor_binding = NamespaceActorBinding::new(binding);
@@ -1310,15 +1382,17 @@ fn bind_with_capacity_and_recovery(
         .name(String::from("opc-xfrm-netns"))
         .spawn({
             let actor_binding = actor_binding.clone();
+            #[cfg(feature = "test-support")]
+            let actor_lifetime = backend.test_namespace_actor_lifetime();
             move || {
+                #[cfg(feature = "test-support")]
+                let _actor_lifetime = actor_lifetime;
                 run_actor(
                     backend,
                     actor_binding,
                     receiver,
                     startup_sender,
-                    recovery,
-                    relocation_recovery,
-                    roster_recovery,
+                    recovery_config,
                 )
             }
         })
@@ -1362,7 +1436,6 @@ type DurableRecoveryStartupStores = (
 );
 
 #[cfg(unix)]
-#[allow(clippy::too_many_arguments)]
 fn run_actor(
     backend: LinuxXfrmBackend,
     actor_binding: NamespaceActorBinding,
@@ -1370,10 +1443,16 @@ fn run_actor(
     startup: std::sync::mpsc::SyncSender<
         Result<DurableRecoveryStartupStores, XfrmObjectRecoveryBindError>,
     >,
-    recovery: Option<(PathBuf, XfrmObjectRecoveryProofKey)>,
-    relocation_recovery: Option<(PathBuf, XfrmSaRelocationRecoveryProofKey)>,
-    roster_recovery: Option<(PathBuf, XfrmObjectRosterRecoveryProofKey)>,
+    recovery_config: ActorRecoveryConfig,
 ) {
+    let ActorRecoveryConfig {
+        recovery,
+        relocation_recovery,
+        roster_recovery,
+        inventory,
+    } = recovery_config;
+    let inventory_mode = inventory.as_ref().map(|config| config.mode);
+    let authenticate_existing = inventory_mode == Some(crate::XfrmCleanupInventoryOpenMode::Reopen);
     let runtime = match tokio::runtime::Builder::new_current_thread()
         .enable_time()
         .build()
@@ -1394,32 +1473,60 @@ fn run_actor(
     }
 
     let mut state = NamespaceActorState::new(actor_binding);
-    let namespace_binding =
-        if recovery.is_some() || relocation_recovery.is_some() || roster_recovery.is_some() {
-            match state.actor_binding.namespace().durable_bytes() {
-                Ok(binding) => Some(binding),
-                Err(source) if recovery.is_some() => {
-                    let _ = startup.send(Err(XfrmObjectRecoveryBindError::Store { source }));
-                    return;
-                }
-                // `durable_bytes` fails closed only with a missing namespace
-                // identity; report that through whichever store was requested.
-                Err(_) if relocation_recovery.is_some() => {
-                    let _ = startup.send(Err(XfrmObjectRecoveryBindError::SaRelocationStore {
-                        source: XfrmSaRelocationDurableError::WrongBinding,
-                    }));
-                    return;
-                }
-                Err(_) => {
-                    let _ = startup.send(Err(XfrmObjectRecoveryBindError::RosterStore {
-                        source: XfrmObjectRosterDurableError::WrongBinding,
+    let namespace_binding = if recovery.is_some()
+        || relocation_recovery.is_some()
+        || roster_recovery.is_some()
+        || inventory.is_some()
+    {
+        match state.actor_binding.namespace().durable_bytes() {
+            Ok(binding) => Some(binding),
+            Err(source) if recovery.is_some() => {
+                let _ = startup.send(Err(XfrmObjectRecoveryBindError::Store { source }));
+                return;
+            }
+            // `durable_bytes` fails closed only with a missing namespace
+            // identity; report that through whichever store was requested.
+            Err(_) if relocation_recovery.is_some() => {
+                let _ = startup.send(Err(XfrmObjectRecoveryBindError::SaRelocationStore {
+                    source: XfrmSaRelocationDurableError::WrongBinding,
+                }));
+                return;
+            }
+            Err(_) if inventory.is_some() => {
+                let _ = startup.send(Err(XfrmObjectRecoveryBindError::CleanupInventory {
+                    source: crate::XfrmCleanupInventoryError::WrongBinding,
+                }));
+                return;
+            }
+            Err(_) => {
+                let _ = startup.send(Err(XfrmObjectRecoveryBindError::RosterStore {
+                    source: XfrmObjectRosterDurableError::WrongBinding,
+                }));
+                return;
+            }
+        }
+    } else {
+        None
+    };
+    let pending_inventory = match inventory {
+        Some(config) => {
+            let result = namespace_binding
+                .ok_or(crate::XfrmCleanupInventoryError::WrongBinding)
+                .and_then(|binding| {
+                    crate::cleanup_inventory::PendingInventory::open(config, binding)
+                });
+            match result {
+                Ok(pending) => Some(pending),
+                Err(source) => {
+                    let _ = startup.send(Err(XfrmObjectRecoveryBindError::CleanupInventory {
+                        source,
                     }));
                     return;
                 }
             }
-        } else {
-            None
-        };
+        }
+        None => None,
+    };
     let store = match recovery {
         Some((path, proof_key)) => {
             let Some(binding) = namespace_binding else {
@@ -1430,7 +1537,21 @@ fn run_actor(
                 }));
                 return;
             };
-            match XfrmObjectInstallRecoveryStore::open_bound(&path, proof_key, binding) {
+            let opened = if authenticate_existing {
+                XfrmObjectInstallRecoveryStore::authenticate_existing_bound(
+                    &path, proof_key, binding,
+                )
+            } else {
+                XfrmObjectInstallRecoveryStore::open_bound(&path, proof_key, binding)
+            }
+            .and_then(|store| {
+                if inventory_mode.is_some() {
+                    store.into_authentication_only()
+                } else {
+                    Ok(store)
+                }
+            });
+            match opened {
                 Ok(store) => {
                     state.object_recovery_store = Some(store.clone());
                     Some(store)
@@ -1453,7 +1574,21 @@ fn run_actor(
                 }));
                 return;
             };
-            match XfrmSaRelocationRecoveryStore::open_bound(&path, proof_key, binding) {
+            let opened = if authenticate_existing {
+                XfrmSaRelocationRecoveryStore::authenticate_existing_bound(
+                    &path, proof_key, binding,
+                )
+            } else {
+                XfrmSaRelocationRecoveryStore::open_bound(&path, proof_key, binding)
+            }
+            .and_then(|store| {
+                if inventory_mode.is_some() {
+                    store.into_authentication_only()
+                } else {
+                    Ok(store)
+                }
+            });
+            match opened {
                 Ok(store) => {
                     state.relocation_recovery_store = Some(store.clone());
                     Some(store)
@@ -1478,7 +1613,23 @@ fn run_actor(
                 }));
                 return;
             };
-            match XfrmObjectRosterRecoveryStore::open_bound(&path, proof_key, binding) {
+            let opened = if authenticate_existing {
+                XfrmObjectRosterRecoveryStore::authenticate_existing_bound(
+                    &path, proof_key, binding,
+                )
+            } else if inventory_mode.is_some() {
+                XfrmObjectRosterRecoveryStore::open_inventory_bound(&path, proof_key, binding)
+            } else {
+                XfrmObjectRosterRecoveryStore::open_bound(&path, proof_key, binding)
+            }
+            .and_then(|store| {
+                if inventory_mode.is_some() {
+                    store.into_authentication_only()
+                } else {
+                    Ok(store)
+                }
+            });
+            match opened {
                 Ok(store) => {
                     state.roster_recovery_store = Some(store.clone());
                     Some(store)
@@ -1491,6 +1642,35 @@ fn run_actor(
         }
         None => None,
     };
+    if let Some(pending) = pending_inventory {
+        let bound = (|| {
+            let object = store
+                .as_ref()
+                .map(XfrmObjectInstallRecoveryStore::authenticated_incarnation)
+                .transpose()
+                .map_err(|source| XfrmObjectRecoveryBindError::Store { source })?;
+            let relocation = relocation_store
+                .as_ref()
+                .map(XfrmSaRelocationRecoveryStore::authenticated_incarnation)
+                .transpose()
+                .map_err(|source| XfrmObjectRecoveryBindError::SaRelocationStore { source })?;
+            let roster = roster_store
+                .as_ref()
+                .map(XfrmObjectRosterRecoveryStore::authenticated_incarnation)
+                .transpose()
+                .map_err(|source| XfrmObjectRecoveryBindError::RosterStore { source })?;
+            pending
+                .finish([object, relocation, roster])
+                .map_err(|source| XfrmObjectRecoveryBindError::CleanupInventory { source })
+        })();
+        match bound {
+            Ok(inventory) => state.cleanup_inventory = Some(inventory),
+            Err(error) => {
+                let _ = startup.send(Err(error));
+                return;
+            }
+        }
+    }
     if startup
         .send(Ok((
             store,
@@ -1544,6 +1724,8 @@ fn run_actor(
 }
 
 struct NamespaceActorState {
+    #[cfg(unix)]
+    cleanup_inventory: Option<crate::cleanup_inventory::BoundInventory>,
     actor_binding: NamespaceActorBinding,
     counter_receipts: EspCounterReceiptRegistry,
     child_sa_roster: ChildSaRosterRegistry,
@@ -1577,6 +1759,8 @@ struct NamespaceActorState {
 impl NamespaceActorState {
     fn new(actor_binding: NamespaceActorBinding) -> Self {
         Self {
+            #[cfg(unix)]
+            cleanup_inventory: None,
             actor_binding,
             counter_receipts: EspCounterReceiptRegistry::default(),
             child_sa_roster: ChildSaRosterRegistry::default(),
@@ -1593,6 +1777,37 @@ impl NamespaceActorState {
             #[cfg(unix)]
             roster_admissions: HashMap::new(),
         }
+    }
+
+    #[cfg(unix)]
+    fn cleanup_inventory_status(
+        &self,
+    ) -> Result<Option<crate::XfrmCleanupInventoryStatus>, XfrmError> {
+        let Some(inventory) = &self.cleanup_inventory else {
+            return Ok(None);
+        };
+        let object = self
+            .object_recovery_store
+            .as_ref()
+            .map(XfrmObjectInstallRecoveryStore::authenticated_incarnation)
+            .transpose()
+            .map_err(|_| XfrmError::Unavailable)?;
+        let relocation = self
+            .relocation_recovery_store
+            .as_ref()
+            .map(XfrmSaRelocationRecoveryStore::authenticated_incarnation)
+            .transpose()
+            .map_err(|_| XfrmError::Unavailable)?;
+        let roster = self
+            .roster_recovery_store
+            .as_ref()
+            .map(XfrmObjectRosterRecoveryStore::authenticated_incarnation)
+            .transpose()
+            .map_err(|_| XfrmError::Unavailable)?;
+        inventory
+            .status([object, relocation, roster])
+            .map(Some)
+            .map_err(|_| XfrmError::Unavailable)
     }
 
     fn invalidate_live_authorities(&mut self) {
@@ -2167,6 +2382,21 @@ impl LostReply {
 }
 
 impl NamespaceBoundLinuxXfrmBackend {
+    /// Authenticate this actor's retained cleanup inventory and return its status.
+    ///
+    /// Legacy actors return `None`. This status never grants cleanup or traffic
+    /// readiness. A missing or changed current root returns an error.
+    #[cfg(unix)]
+    pub async fn cleanup_inventory_status(
+        &self,
+    ) -> Result<Option<crate::XfrmCleanupInventoryStatus>, XfrmError> {
+        self.dispatch(
+            LostReply::ReadOnly,
+            NamespaceCommand::CleanupInventoryStatus,
+        )
+        .await
+    }
+
     /// Return the actor's captured namespace binding to crate-internal sealed
     /// authorities without exposing device or inode values publicly.
     pub(crate) fn network_namespace_binding(&self) -> NetworkNamespaceBinding {
@@ -3483,6 +3713,10 @@ enum DetectorRosterCut {
 }
 
 enum NamespaceCommand {
+    #[cfg(unix)]
+    CleanupInventoryStatus(
+        oneshot::Sender<Result<Option<crate::XfrmCleanupInventoryStatus>, XfrmError>>,
+    ),
     #[cfg(all(unix, feature = "ikev2"))]
     ChildSaMobike(child_sa_mobike::Command),
     BeginChildSaRosterUpdate(oneshot::Sender<Result<ChildSaRosterUpdate, XfrmError>>),
@@ -3897,7 +4131,21 @@ impl NamespaceCommand {
             return;
         }
 
+        #[cfg(unix)]
+        if state.cleanup_inventory.is_some() && !matches!(self, Self::CleanupInventoryStatus(_)) {
+            self.send_error(XfrmError::UnsupportedFeature {
+                feature: "cleanup_inventory_exact_removal_unavailable",
+            });
+            return;
+        }
+
         match self {
+            #[cfg(unix)]
+            Self::CleanupInventoryStatus(reply) => {
+                let result = state.cleanup_inventory_status();
+                let _ = reply.send(result);
+            }
+
             Self::BeginChildSaRosterUpdate(reply) => {
                 let result = state
                     .require_child_sa_publication_ready()
@@ -4851,6 +5099,11 @@ impl NamespaceCommand {
 
     fn send_error(self, error: XfrmError) {
         match self {
+            #[cfg(unix)]
+            Self::CleanupInventoryStatus(reply) => {
+                let _ = reply.send(Err(error));
+            }
+
             #[cfg(all(unix, feature = "ikev2"))]
             Self::ChildSaMobike(command) => command.send_error(error),
             Self::BeginChildSaRosterUpdate(reply) => {
@@ -12462,5 +12715,985 @@ mod tests {
             error,
             XfrmObjectRecoveryBindError::RosterStore { .. }
         ));
+    }
+    #[cfg(unix)]
+    fn cleanup_config(
+        root: &DurableTestRoot,
+        mode: crate::XfrmCleanupInventoryOpenMode,
+    ) -> crate::XfrmCleanupInventoryBindingConfig {
+        crate::XfrmCleanupInventoryBindingConfig {
+            inventory: crate::XfrmCleanupInventoryConfig {
+                path: root.path().to_owned(),
+                key: crate::XfrmCleanupInventoryKey::new([0x91; 32]).unwrap(),
+                mode,
+                limits: crate::XfrmCleanupInventoryLimits {
+                    objects: 4,
+                    images: 8,
+                    coverage: 2,
+                    batch_records: 3,
+                    storage_bytes: 1024 * 1024,
+                    index_bytes: 4096,
+                    working_bytes: 2 * 1024 * 1024,
+                },
+            },
+            object_recovery: None,
+            sa_relocation_recovery: None,
+            roster_recovery: None,
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn cleanup_inventory_binding_reports_closed_status_and_gates_every_backend_clone() {
+        let root = DurableTestRoot::new();
+        let transport = RecordingUnavailableTransport::default();
+        let runtime = DeferredDscpRuntime::with_outcomes([]);
+        let backend = LinuxXfrmBackend::with_transport_and_deferred_dscp_runtime(
+            transport.clone(),
+            LinuxXfrmDscpMarkingConfig::new([String::from("lo")], 25).unwrap(),
+            runtime.clone(),
+        )
+        .unwrap()
+        .bind_current_network_namespace_with_cleanup_inventory(cleanup_config(
+            &root,
+            crate::XfrmCleanupInventoryOpenMode::CreateNew,
+        ))
+        .unwrap()
+        .backend;
+        let status = backend.cleanup_inventory_status().await.unwrap();
+        let clone = backend.clone();
+        let mut accepted = Vec::new();
+        macro_rules! refused {
+            ($name:literal, $call:expr) => {
+                if $call.is_ok() {
+                    accepted.push($name);
+                }
+            };
+        }
+        refused!("activate_dscp", clone.activate_dscp_marking().await);
+        refused!("allocate_spi", clone.allocate_spi(allocate_request()).await);
+        let mut exact_spi = allocate_request();
+        exact_spi.max_spi = exact_spi.min_spi;
+        refused!("allocate_exact_spi", clone.allocate_spi(exact_spi).await);
+        refused!(
+            "install_sa",
+            clone
+                .install_sa(InstallSaRequest {
+                    parameters: sa_parameters()
+                })
+                .await
+        );
+        refused!(
+            "rekey_sa",
+            clone
+                .rekey_sa(RekeySaRequest {
+                    parameters: sa_parameters()
+                })
+                .await
+        );
+        refused!("relocate_sa", clone.relocate_sa(relocation_request()).await);
+        refused!("remove_sa", clone.remove_sa(remove_request()).await);
+        refused!("query_sa", clone.query_sa(query_request()).await);
+        refused!(
+            "query_sa_identity",
+            clone.query_sa_relocation_identity(query_request()).await
+        );
+        let policy = policy_parameters();
+        refused!(
+            "install_policy",
+            clone
+                .install_policy(InstallPolicyRequest {
+                    parameters: policy.clone()
+                })
+                .await
+        );
+        refused!(
+            "rekey_policy",
+            clone
+                .rekey_policy(RekeyPolicyRequest {
+                    parameters: policy.clone()
+                })
+                .await
+        );
+        refused!(
+            "remove_policy",
+            clone
+                .remove_policy(RemovePolicyRequest::new(
+                    policy.selector.clone(),
+                    policy.direction
+                ))
+                .await
+        );
+        refused!(
+            "remove_exact_policy",
+            clone
+                .remove_policy_exact(
+                    ExactRemovePolicyRequest::new(RemovePolicyRequest::new(
+                        policy.selector.clone(),
+                        policy.direction
+                    ))
+                    .with_if_id(7)
+                )
+                .await
+        );
+        refused!(
+            "query_policy",
+            clone
+                .query_policy(QueryPolicyRequest::new(policy.selector, policy.direction))
+                .await
+        );
+        refused!("probe", clone.probe().await);
+        refused!("capability", clone.sa_relocation_capability().await);
+        assert!(accepted.is_empty(), "closed actor admitted: {accepted:?}");
+        assert!(transport.records().is_empty());
+        assert!(runtime.records().is_empty());
+        assert_eq!(runtime.capability_calls(), 0);
+        assert_eq!(
+            status,
+            Some(crate::XfrmCleanupInventoryStatus::ExactRemovalUnavailable)
+        );
+        assert!(root.path().join("root").is_file());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn cleanup_inventory_binding_refuses_eager_dscp_before_new_bind_effects() {
+        let root = DurableTestRoot::new();
+        let records = Arc::new(Mutex::new(Vec::new()));
+        let runtime = DscpRecordingRuntime {
+            records: Arc::clone(&records),
+        };
+        let transport = RecordingUnavailableTransport::default();
+        let backend = LinuxXfrmBackend::with_transport_and_dscp_runtime(
+            transport.clone(),
+            LinuxXfrmDscpMarkingConfig::new([String::from("lo")], 25).unwrap(),
+            runtime,
+        )
+        .unwrap();
+        assert_eq!(
+            records.lock().unwrap().len(),
+            1,
+            "constructor already performed its eager effect"
+        );
+        let result = backend.bind_current_network_namespace_with_cleanup_inventory(cleanup_config(
+            &root,
+            crate::XfrmCleanupInventoryOpenMode::CreateNew,
+        ));
+        let refused = result.is_err();
+        drop(result);
+        assert!(refused);
+        assert_eq!(
+            records.lock().unwrap().len(),
+            1,
+            "binding added an eager effect"
+        );
+        assert!(transport.records().is_empty());
+        assert!(!root.path().exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn cleanup_inventory_binding_reopen_never_initializes_missing_inventory_or_stores() {
+        let root = DurableTestRoot::new();
+        let object = DurableTestRoot::new();
+        let relocation = DurableTestRoot::new();
+        let roster = DurableTestRoot::new();
+        let mut config = cleanup_config(&root, crate::XfrmCleanupInventoryOpenMode::Reopen);
+        config.object_recovery = Some((
+            object.path().to_owned(),
+            XfrmObjectRecoveryProofKey::new([1; 32]).unwrap(),
+        ));
+        config.sa_relocation_recovery = Some((
+            relocation.path().to_owned(),
+            XfrmSaRelocationRecoveryProofKey::new([2; 32]).unwrap(),
+        ));
+        config.roster_recovery = Some((
+            roster.path().to_owned(),
+            XfrmObjectRosterRecoveryProofKey::new([3; 32]).unwrap(),
+        ));
+        let result = LinuxXfrmBackend::with_transport(RecordingUnavailableTransport::default())
+            .bind_current_network_namespace_with_cleanup_inventory(config);
+        let refused = result.is_err();
+        drop(result);
+        let exists =
+            [root.path(), object.path(), relocation.path(), roster.path()].map(Path::exists);
+        assert!(
+            refused && exists == [false; 4],
+            "reopen accepted or initialized missing state: {exists:?}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn cleanup_inventory_binding_legacy_actor_has_no_inventory_status() {
+        let backend = LinuxXfrmBackend::with_transport(RecordingUnavailableTransport::default())
+            .bind_current_network_namespace()
+            .unwrap();
+        assert_eq!(backend.cleanup_inventory_status().await.unwrap(), None);
+    }
+    #[cfg(unix)]
+    fn cleanup_all_stores_config(
+        root: &DurableTestRoot,
+        stores: &[DurableTestRoot; 3],
+        mode: crate::XfrmCleanupInventoryOpenMode,
+    ) -> crate::XfrmCleanupInventoryBindingConfig {
+        let mut config = cleanup_config(root, mode);
+        config.object_recovery = Some((
+            stores[0].path().to_owned(),
+            XfrmObjectRecoveryProofKey::new([1; 32]).unwrap(),
+        ));
+        config.sa_relocation_recovery = Some((
+            stores[1].path().to_owned(),
+            XfrmSaRelocationRecoveryProofKey::new([2; 32]).unwrap(),
+        ));
+        config.roster_recovery = Some((
+            stores[2].path().to_owned(),
+            XfrmObjectRosterRecoveryProofKey::new([3; 32]).unwrap(),
+        ));
+        config
+    }
+
+    #[cfg(unix)]
+    fn cleanup_directory_snapshot(path: &Path) -> Vec<(std::ffi::OsString, Vec<u8>)> {
+        let mut entries = fs::read_dir(path)
+            .unwrap()
+            .map(|entry| {
+                let entry = entry.unwrap();
+                (entry.file_name(), fs::read(entry.path()).unwrap())
+            })
+            .collect::<Vec<_>>();
+        entries.sort_by(|left, right| left.0.cmp(&right.0));
+        entries
+    }
+
+    #[cfg(unix)]
+    async fn cleanup_wait_for_leases(paths: &[&Path]) {
+        use rustix::fs::{flock, open, FlockOperation, Mode, OFlags};
+        let deadline = Instant::now() + Duration::from_secs(2);
+        for path in paths {
+            let directory = open(
+                *path,
+                OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+                Mode::empty(),
+            )
+            .unwrap();
+            loop {
+                match flock(&directory, FlockOperation::NonBlockingLockExclusive) {
+                    Ok(()) => {
+                        // Other tests spawn real processes concurrently. An
+                        // inherited copy of this lease probe must not retain
+                        // our lock after its descriptor leaves this scope.
+                        flock(&directory, FlockOperation::Unlock).unwrap();
+                        break;
+                    }
+                    Err(rustix::io::Errno::WOULDBLOCK) if Instant::now() < deadline => {
+                        tokio::time::sleep(Duration::from_millis(1)).await
+                    }
+                    Err(error) => {
+                        panic!("owned actor did not release its directory lease: {error}")
+                    }
+                }
+            }
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn cleanup_inventory_binding_new_and_reopened_store_clones_cannot_prepare_or_repair() {
+        use crate::XfrmCleanupInventoryOpenMode::{CreateNew, Reopen};
+        let root = DurableTestRoot::new();
+        let stores = std::array::from_fn(|_| DurableTestRoot::new());
+        let transport = RecordingUnavailableTransport::default();
+        let mut prior_root = None;
+        for mode in [CreateNew, Reopen] {
+            let binding = LinuxXfrmBackend::with_transport(transport.clone())
+                .bind_current_network_namespace_with_cleanup_inventory(cleanup_all_stores_config(
+                    &root, &stores, mode,
+                ))
+                .unwrap();
+            let root_bytes = fs::read(root.path().join("root")).unwrap();
+            if let Some(prior) = prior_root {
+                assert_ne!(prior, root_bytes, "new actor generation was not published");
+            }
+            prior_root = Some(root_bytes);
+            let before = stores
+                .each_ref()
+                .map(|store| cleanup_directory_snapshot(store.path()));
+            let object = binding.object_recovery.as_ref().unwrap().clone();
+            let relocation = binding.sa_relocation_recovery.as_ref().unwrap().clone();
+            let roster = binding.roster_recovery.as_ref().unwrap().clone();
+            let backend = binding.backend.clone();
+            assert!(object.advance_writer_epoch().is_err());
+            assert!(relocation.advance_writer_epoch().is_err());
+            assert!(roster.advance_writer_epoch().is_err());
+            assert!(backend
+                .prepare_durable_object_install(
+                    &object,
+                    XfrmObjectInstallOperationId::from_bytes([4; 16]).unwrap(),
+                    XfrmObjectInstallOperationGeneration::new(1).unwrap(),
+                    XfrmObjectInstallRequest::Sa(InstallSaRequest {
+                        parameters: sa_parameters()
+                    }),
+                )
+                .await
+                .is_err());
+            assert!(backend
+                .prepare_sa_relocation(
+                    &relocation,
+                    XfrmSaRelocationOperationId::from_bytes([5; 16]).unwrap(),
+                    XfrmSaRelocationOperationGeneration::new(1).unwrap(),
+                    relocation_request(),
+                )
+                .await
+                .is_err());
+            assert!(backend
+                .prepare_durable_object_roster(
+                    &roster,
+                    XfrmObjectRosterGroupId::from_bytes([6; 16]).unwrap(),
+                    XfrmObjectRosterOperationGeneration::new(1).unwrap(),
+                    sa_roster(1),
+                )
+                .await
+                .is_err());
+            assert_eq!(
+                stores
+                    .each_ref()
+                    .map(|store| cleanup_directory_snapshot(store.path())),
+                before
+            );
+            assert_eq!(
+                backend.cleanup_inventory_status().await.unwrap(),
+                Some(crate::XfrmCleanupInventoryStatus::ExactRemovalUnavailable)
+            );
+            assert!(transport.records().is_empty());
+            drop((object, relocation, roster, backend, binding));
+            cleanup_wait_for_leases(&[
+                root.path(),
+                stores[0].path(),
+                stores[1].path(),
+                stores[2].path(),
+            ])
+            .await;
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn cleanup_inventory_binding_authentication_failure_preserves_every_store_and_staging() {
+        use crate::XfrmCleanupInventoryOpenMode::{CreateNew, Reopen};
+        use std::os::unix::fs::OpenOptionsExt;
+        let root = DurableTestRoot::new();
+        let stores = std::array::from_fn(|_| DurableTestRoot::new());
+        let binding = LinuxXfrmBackend::with_transport(RecordingUnavailableTransport::default())
+            .bind_current_network_namespace_with_cleanup_inventory(cleanup_all_stores_config(
+                &root, &stores, CreateNew,
+            ))
+            .unwrap();
+        drop(binding);
+        cleanup_wait_for_leases(&[
+            root.path(),
+            stores[0].path(),
+            stores[1].path(),
+            stores[2].path(),
+        ])
+        .await;
+        fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(root.path().join("pending"))
+            .unwrap();
+        let mut corrupt = fs::read(root.path().join("root")).unwrap();
+        corrupt[0] ^= 1;
+        fs::write(root.path().join("root"), corrupt).unwrap();
+        let before_inventory = cleanup_directory_snapshot(root.path());
+        let before_stores = stores
+            .each_ref()
+            .map(|store| cleanup_directory_snapshot(store.path()));
+        let transport = RecordingUnavailableTransport::default();
+        let runtime = DeferredDscpRuntime::with_outcomes([]);
+        let result = LinuxXfrmBackend::with_transport_and_deferred_dscp_runtime(
+            transport.clone(),
+            LinuxXfrmDscpMarkingConfig::new([String::from("lo")], 25).unwrap(),
+            runtime.clone(),
+        )
+        .unwrap()
+        .bind_current_network_namespace_with_cleanup_inventory(cleanup_all_stores_config(
+            &root, &stores, Reopen,
+        ));
+        assert!(matches!(
+            result,
+            Err(XfrmObjectRecoveryBindError::CleanupInventory { .. })
+        ));
+        assert_eq!(cleanup_directory_snapshot(root.path()), before_inventory);
+        assert_eq!(
+            stores
+                .each_ref()
+                .map(|store| cleanup_directory_snapshot(store.path())),
+            before_stores
+        );
+        assert!(transport.records().is_empty());
+        assert!(runtime.records().is_empty());
+        assert_eq!(runtime.capability_calls(), 0);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn cleanup_inventory_binding_requires_the_exact_store_set_and_current_root() {
+        use crate::XfrmCleanupInventoryOpenMode::{CreateNew, Reopen};
+        let root = DurableTestRoot::new();
+        let stores = std::array::from_fn(|_| DurableTestRoot::new());
+        let binding = LinuxXfrmBackend::with_transport(RecordingUnavailableTransport::default())
+            .bind_current_network_namespace_with_cleanup_inventory(cleanup_all_stores_config(
+                &root, &stores, CreateNew,
+            ))
+            .unwrap();
+        drop(binding);
+        cleanup_wait_for_leases(&[
+            root.path(),
+            stores[0].path(),
+            stores[1].path(),
+            stores[2].path(),
+        ])
+        .await;
+        let before = cleanup_directory_snapshot(root.path());
+        for omitted in 0..3 {
+            let mut config = cleanup_all_stores_config(&root, &stores, Reopen);
+            match omitted {
+                0 => config.object_recovery = None,
+                1 => config.sa_relocation_recovery = None,
+                _ => config.roster_recovery = None,
+            }
+            assert!(
+                LinuxXfrmBackend::with_transport(RecordingUnavailableTransport::default())
+                    .bind_current_network_namespace_with_cleanup_inventory(config)
+                    .is_err()
+            );
+            cleanup_wait_for_leases(&[
+                root.path(),
+                stores[0].path(),
+                stores[1].path(),
+                stores[2].path(),
+            ])
+            .await;
+            assert_eq!(cleanup_directory_snapshot(root.path()), before);
+        }
+        let binding = LinuxXfrmBackend::with_transport(RecordingUnavailableTransport::default())
+            .bind_current_network_namespace_with_cleanup_inventory(cleanup_all_stores_config(
+                &root, &stores, Reopen,
+            ))
+            .unwrap();
+        let mut frame = fs::read(root.path().join("root")).unwrap();
+        frame[0] ^= 1;
+        fs::write(root.path().join("root"), frame).unwrap();
+        assert!(binding.backend.cleanup_inventory_status().await.is_err());
+        assert!(binding.backend.probe().await.is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn cleanup_inventory_binding_capacity_refusal_precedes_any_directory_initialization() {
+        let root = DurableTestRoot::new();
+        let stores = std::array::from_fn(|_| DurableTestRoot::new());
+        let mut config = cleanup_all_stores_config(
+            &root,
+            &stores,
+            crate::XfrmCleanupInventoryOpenMode::CreateNew,
+        );
+        config.inventory.limits.working_bytes = 1;
+        assert!(
+            LinuxXfrmBackend::with_transport(RecordingUnavailableTransport::default())
+                .bind_current_network_namespace_with_cleanup_inventory(config)
+                .is_err()
+        );
+        assert!(!root.path().exists());
+        assert!(stores.iter().all(|store| !store.path().exists()));
+    }
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn cleanup_inventory_binding_rejects_replaced_incarnations_without_writing_any_family() {
+        use crate::XfrmCleanupInventoryOpenMode::{CreateNew, Reopen};
+        let root = DurableTestRoot::new();
+        let stores = std::array::from_fn(|_| DurableTestRoot::new());
+        let binding = LinuxXfrmBackend::with_transport(RecordingUnavailableTransport::default())
+            .bind_current_network_namespace_with_cleanup_inventory(cleanup_all_stores_config(
+                &root, &stores, CreateNew,
+            ))
+            .unwrap();
+        drop(binding);
+        cleanup_wait_for_leases(&[
+            root.path(),
+            stores[0].path(),
+            stores[1].path(),
+            stores[2].path(),
+        ])
+        .await;
+        let namespace = NetworkNamespaceBinding::capture()
+            .unwrap()
+            .durable_bytes()
+            .unwrap();
+        let before_inventory = cleanup_directory_snapshot(root.path());
+        let before_stores = stores
+            .each_ref()
+            .map(|store| cleanup_directory_snapshot(store.path()));
+        for family in 0..3 {
+            let replacement = DurableTestRoot::new();
+            let mut config = cleanup_all_stores_config(&root, &stores, Reopen);
+            match family {
+                0 => {
+                    drop(
+                        XfrmObjectInstallRecoveryStore::open_bound(
+                            replacement.path(),
+                            XfrmObjectRecoveryProofKey::new([1; 32]).unwrap(),
+                            namespace,
+                        )
+                        .unwrap(),
+                    );
+                    config.object_recovery = Some((
+                        replacement.path().to_owned(),
+                        XfrmObjectRecoveryProofKey::new([1; 32]).unwrap(),
+                    ));
+                }
+                1 => {
+                    drop(
+                        XfrmSaRelocationRecoveryStore::open_bound(
+                            replacement.path(),
+                            XfrmSaRelocationRecoveryProofKey::new([2; 32]).unwrap(),
+                            namespace,
+                        )
+                        .unwrap(),
+                    );
+                    config.sa_relocation_recovery = Some((
+                        replacement.path().to_owned(),
+                        XfrmSaRelocationRecoveryProofKey::new([2; 32]).unwrap(),
+                    ));
+                }
+                _ => {
+                    drop(
+                        XfrmObjectRosterRecoveryStore::open_bound(
+                            replacement.path(),
+                            XfrmObjectRosterRecoveryProofKey::new([3; 32]).unwrap(),
+                            namespace,
+                        )
+                        .unwrap(),
+                    );
+                    config.roster_recovery = Some((
+                        replacement.path().to_owned(),
+                        XfrmObjectRosterRecoveryProofKey::new([3; 32]).unwrap(),
+                    ));
+                }
+            }
+            let before_replacement = cleanup_directory_snapshot(replacement.path());
+            let result = LinuxXfrmBackend::with_transport(RecordingUnavailableTransport::default())
+                .bind_current_network_namespace_with_cleanup_inventory(config);
+            assert!(
+                matches!(
+                    result,
+                    Err(XfrmObjectRecoveryBindError::CleanupInventory {
+                        source: crate::XfrmCleanupInventoryError::WrongBinding
+                    })
+                ),
+                "replacement family {family} returned {result:?}"
+            );
+            cleanup_wait_for_leases(&[
+                root.path(),
+                stores[0].path(),
+                stores[1].path(),
+                stores[2].path(),
+                replacement.path(),
+            ])
+            .await;
+            assert_eq!(cleanup_directory_snapshot(root.path()), before_inventory);
+            assert_eq!(
+                stores
+                    .each_ref()
+                    .map(|store| cleanup_directory_snapshot(store.path())),
+                before_stores
+            );
+            assert_eq!(
+                cleanup_directory_snapshot(replacement.path()),
+                before_replacement
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn cleanup_inventory_binding_preserves_partial_create_and_never_reopens_it_as_empty_success() {
+        use crate::XfrmCleanupInventoryOpenMode::{CreateNew, Reopen};
+        let root = DurableTestRoot::new();
+        let stores = std::array::from_fn(|_| DurableTestRoot::new());
+        fs::create_dir(stores[2].path()).unwrap();
+        // This unsafe store blocks after the first two families initialized.
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(stores[2].path(), fs::Permissions::from_mode(0o755)).unwrap();
+        let result = LinuxXfrmBackend::with_transport(RecordingUnavailableTransport::default())
+            .bind_current_network_namespace_with_cleanup_inventory(cleanup_all_stores_config(
+                &root, &stores, CreateNew,
+            ));
+        assert!(matches!(
+            result,
+            Err(XfrmObjectRecoveryBindError::RosterStore { .. })
+        ));
+        assert!(root.path().is_dir());
+        assert!(!root.path().join("root").exists());
+        let before_inventory = cleanup_directory_snapshot(root.path());
+        let before_stores = stores
+            .each_ref()
+            .map(|store| cleanup_directory_snapshot(store.path()));
+        assert!(!before_stores[0].is_empty() && !before_stores[1].is_empty());
+        let result = LinuxXfrmBackend::with_transport(RecordingUnavailableTransport::default())
+            .bind_current_network_namespace_with_cleanup_inventory(cleanup_config(&root, Reopen));
+        assert!(matches!(
+            result,
+            Err(XfrmObjectRecoveryBindError::CleanupInventory { .. })
+        ));
+        assert_eq!(cleanup_directory_snapshot(root.path()), before_inventory);
+        assert_eq!(
+            stores
+                .each_ref()
+                .map(|store| cleanup_directory_snapshot(store.path())),
+            before_stores
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn cleanup_inventory_binding_wrong_inventory_key_or_limits_leave_every_byte_unchanged() {
+        use crate::XfrmCleanupInventoryOpenMode::{CreateNew, Reopen};
+        let root = DurableTestRoot::new();
+        let binding = LinuxXfrmBackend::with_transport(RecordingUnavailableTransport::default())
+            .bind_current_network_namespace_with_cleanup_inventory(cleanup_config(&root, CreateNew))
+            .unwrap();
+        drop(binding);
+        cleanup_wait_for_leases(&[root.path()]).await;
+        let before = cleanup_directory_snapshot(root.path());
+        for wrong_key in [false, true] {
+            let mut config = cleanup_config(&root, Reopen);
+            if wrong_key {
+                config.inventory.key = crate::XfrmCleanupInventoryKey::new([0x92; 32]).unwrap();
+            } else {
+                config.inventory.limits.objects += 1;
+            }
+            assert!(
+                LinuxXfrmBackend::with_transport(RecordingUnavailableTransport::default())
+                    .bind_current_network_namespace_with_cleanup_inventory(config)
+                    .is_err()
+            );
+            cleanup_wait_for_leases(&[root.path()]).await;
+            assert_eq!(cleanup_directory_snapshot(root.path()), before);
+        }
+        assert!(crate::XfrmCleanupInventoryKey::new([0; 32]).is_err());
+        let redacted = format!("{:?}", cleanup_config(&root, Reopen));
+        assert!(!redacted.contains(&root.path().to_string_lossy().to_string()));
+    }
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn cleanup_inventory_binding_status_reauthenticates_every_retained_family() {
+        use std::os::unix::fs::DirBuilderExt;
+        let root = DurableTestRoot::new();
+        let stores = std::array::from_fn(|_| DurableTestRoot::new());
+        let binding = LinuxXfrmBackend::with_transport(RecordingUnavailableTransport::default())
+            .bind_current_network_namespace_with_cleanup_inventory(cleanup_all_stores_config(
+                &root,
+                &stores,
+                crate::XfrmCleanupInventoryOpenMode::CreateNew,
+            ))
+            .unwrap();
+        let before_inventory = cleanup_directory_snapshot(root.path());
+        let before_stores = stores
+            .each_ref()
+            .map(|store| cleanup_directory_snapshot(store.path()));
+        let mut accepted = Vec::new();
+        for (family, store) in stores.iter().enumerate() {
+            let original = store.path().with_extension("original");
+            fs::rename(store.path(), &original).unwrap();
+            fs::DirBuilder::new()
+                .mode(0o700)
+                .create(store.path())
+                .unwrap();
+            let status = binding.backend.cleanup_inventory_status().await;
+            fs::remove_dir(store.path()).unwrap();
+            fs::rename(&original, store.path()).unwrap();
+            if status.is_ok() {
+                accepted.push(family);
+            }
+        }
+        assert_eq!(cleanup_directory_snapshot(root.path()), before_inventory);
+        assert_eq!(
+            stores
+                .each_ref()
+                .map(|store| cleanup_directory_snapshot(store.path())),
+            before_stores
+        );
+        assert!(
+            accepted.is_empty(),
+            "status accepted replaced transaction families: {accepted:?}"
+        );
+    }
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn cleanup_inventory_binding_missing_nonempty_journal_refuses_status_and_reopen_before_generation(
+    ) {
+        use crate::XfrmCleanupInventoryOpenMode::{CreateNew, Reopen};
+        let root = DurableTestRoot::new();
+        let stores = std::array::from_fn(|_| DurableTestRoot::new());
+        let transport = RecordingUnavailableTransport::default();
+        let (legacy, roster) = LinuxXfrmBackend::with_transport(transport.clone())
+            .bind_current_network_namespace_with_object_roster_recovery(
+                stores[2].path().to_owned(),
+                XfrmObjectRosterRecoveryProofKey::new([3; 32]).unwrap(),
+            )
+            .unwrap();
+        let empty_journal_size = fs::metadata(stores[2].path().join("journal"))
+            .unwrap()
+            .len();
+        let authority = legacy
+            .prepare_durable_object_roster(
+                &roster,
+                XfrmObjectRosterGroupId::from_bytes([7; 16]).unwrap(),
+                XfrmObjectRosterOperationGeneration::new(1).unwrap(),
+                sa_roster(1),
+            )
+            .await
+            .unwrap();
+        assert!(
+            fs::metadata(stores[2].path().join("journal"))
+                .unwrap()
+                .len()
+                > empty_journal_size
+        );
+        drop((authority, roster, legacy));
+        cleanup_wait_for_leases(&[stores[2].path()]).await;
+        let binding = LinuxXfrmBackend::with_transport(transport.clone())
+            .bind_current_network_namespace_with_cleanup_inventory(cleanup_all_stores_config(
+                &root, &stores, CreateNew,
+            ))
+            .unwrap();
+        assert!(binding.backend.cleanup_inventory_status().await.is_ok());
+        let inventory_before = cleanup_directory_snapshot(root.path());
+        fs::remove_file(stores[2].path().join("journal")).unwrap();
+        let status_refused = binding.backend.cleanup_inventory_status().await.is_err();
+        drop(binding);
+        cleanup_wait_for_leases(&[
+            root.path(),
+            stores[0].path(),
+            stores[1].path(),
+            stores[2].path(),
+        ])
+        .await;
+        let stores_before = stores
+            .each_ref()
+            .map(|store| cleanup_directory_snapshot(store.path()));
+        let reopened = LinuxXfrmBackend::with_transport(transport.clone())
+            .bind_current_network_namespace_with_cleanup_inventory(cleanup_all_stores_config(
+                &root, &stores, Reopen,
+            ));
+        let reopen_refused = matches!(
+            reopened,
+            Err(XfrmObjectRecoveryBindError::RosterStore {
+                source: XfrmObjectRosterDurableError::Malformed
+            })
+        );
+        drop(reopened);
+        cleanup_wait_for_leases(&[
+            root.path(),
+            stores[0].path(),
+            stores[1].path(),
+            stores[2].path(),
+        ])
+        .await;
+        let inventory_unchanged = cleanup_directory_snapshot(root.path()) == inventory_before;
+        assert_eq!(
+            stores
+                .each_ref()
+                .map(|store| cleanup_directory_snapshot(store.path())),
+            stores_before
+        );
+        assert!(transport.records().is_empty());
+        assert!(status_refused && reopen_refused && inventory_unchanged,
+            "lost journal accepted: status_refused={status_refused}, reopen_refused={reopen_refused}, inventory_unchanged={inventory_unchanged}");
+    }
+
+    #[cfg(unix)]
+    fn cleanup_materialize_legacy_prepared_roster(
+        path: &Path,
+        prepared: &XfrmObjectRosterRecoveryHandle,
+    ) {
+        use std::{io::Write, os::unix::fs::OpenOptionsExt};
+        fs::remove_file(path.join("journal")).unwrap();
+        let mut record = fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(path.join(format!(
+                "prepared-{}-0000000000000001-0001",
+                "07".repeat(16)
+            )))
+            .unwrap();
+        record.write_all(&prepared.to_bytes()).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn cleanup_inventory_binding_refuses_a_journal_downgrade_to_an_older_prepared_handle() {
+        use crate::{
+            durable_roster::XfrmObjectRosterTransition,
+            XfrmCleanupInventoryOpenMode::{CreateNew, Reopen},
+            XfrmObjectRosterDurablePhase::{Prepared, Retired},
+        };
+        let root = DurableTestRoot::new();
+        let stores = std::array::from_fn(|_| DurableTestRoot::new());
+        let transport = RecordingUnavailableTransport::default();
+        let (legacy, roster) = LinuxXfrmBackend::with_transport(transport.clone())
+            .bind_current_network_namespace_with_object_roster_recovery(
+                stores[2].path().to_owned(),
+                XfrmObjectRosterRecoveryProofKey::new([3; 32]).unwrap(),
+            )
+            .unwrap();
+        let authority = legacy
+            .prepare_durable_object_roster(
+                &roster,
+                XfrmObjectRosterGroupId::from_bytes([7; 16]).unwrap(),
+                XfrmObjectRosterOperationGeneration::new(1).unwrap(),
+                sa_roster(1),
+            )
+            .await
+            .unwrap();
+        let prepared = authority.prepared.clone();
+        let retired = roster
+            .transition(
+                &prepared,
+                Prepared,
+                XfrmObjectRosterTransition::new(Retired, 0),
+            )
+            .unwrap()
+            .handle(&XfrmObjectRosterRecoveryProofKey::new([3; 32]).unwrap())
+            .unwrap();
+        assert_eq!(roster.inspect(&retired), Ok(Retired));
+        drop((authority, roster, legacy));
+        cleanup_wait_for_leases(&[stores[2].path()]).await;
+        let binding = LinuxXfrmBackend::with_transport(transport.clone())
+            .bind_current_network_namespace_with_cleanup_inventory(cleanup_all_stores_config(
+                &root, &stores, CreateNew,
+            ))
+            .unwrap();
+        assert!(binding.backend.cleanup_inventory_status().await.is_ok());
+        let inventory_before = cleanup_directory_snapshot(root.path());
+        cleanup_materialize_legacy_prepared_roster(stores[2].path(), &prepared);
+        let status_refused = binding.backend.cleanup_inventory_status().await.is_err();
+        drop(binding);
+        let paths = [
+            root.path(),
+            stores[0].path(),
+            stores[1].path(),
+            stores[2].path(),
+        ];
+        cleanup_wait_for_leases(&paths).await;
+        let stores_before = stores
+            .each_ref()
+            .map(|store| cleanup_directory_snapshot(store.path()));
+        let reopened = LinuxXfrmBackend::with_transport(transport.clone())
+            .bind_current_network_namespace_with_cleanup_inventory(cleanup_all_stores_config(
+                &root, &stores, Reopen,
+            ));
+        let reopen_refused = matches!(
+            reopened,
+            Err(XfrmObjectRecoveryBindError::RosterStore {
+                source: XfrmObjectRosterDurableError::Malformed
+            })
+        );
+        drop(reopened);
+        cleanup_wait_for_leases(&paths).await;
+        let inventory_unchanged = cleanup_directory_snapshot(root.path()) == inventory_before;
+        assert_eq!(
+            stores
+                .each_ref()
+                .map(|store| cleanup_directory_snapshot(store.path())),
+            stores_before
+        );
+        assert!(transport.records().is_empty());
+        assert!(status_refused && reopen_refused && inventory_unchanged,
+            "journal downgrade accepted: status_refused={status_refused}, reopen_refused={reopen_refused}, inventory_unchanged={inventory_unchanged}");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn cleanup_inventory_binding_create_refuses_existing_legacy_or_incomplete_rosters_without_repair(
+    ) {
+        use std::{io::Write, os::unix::fs::OpenOptionsExt};
+        let mut failures = Vec::new();
+        for case in 0..3 {
+            let root = DurableTestRoot::new();
+            let roster_root = DurableTestRoot::new();
+            let transport = RecordingUnavailableTransport::default();
+            let (legacy, roster) = LinuxXfrmBackend::with_transport(transport.clone())
+                .bind_current_network_namespace_with_object_roster_recovery(
+                    roster_root.path().to_owned(),
+                    XfrmObjectRosterRecoveryProofKey::new([3; 32]).unwrap(),
+                )
+                .unwrap();
+            let authority = legacy
+                .prepare_durable_object_roster(
+                    &roster,
+                    XfrmObjectRosterGroupId::from_bytes([7; 16]).unwrap(),
+                    XfrmObjectRosterOperationGeneration::new(1).unwrap(),
+                    sa_roster(1),
+                )
+                .await
+                .unwrap();
+            let prepared = authority.prepared.clone();
+            drop((authority, roster, legacy));
+            cleanup_wait_for_leases(&[roster_root.path()]).await;
+            if case < 2 {
+                cleanup_materialize_legacy_prepared_roster(roster_root.path(), &prepared);
+            } else {
+                for entry in fs::read_dir(roster_root.path()).unwrap() {
+                    let entry = entry.unwrap();
+                    if entry.file_name() != "control" {
+                        fs::remove_file(entry.path()).unwrap();
+                    }
+                }
+            }
+            if case == 1 {
+                let mut staged = fs::OpenOptions::new()
+                    .write(true)
+                    .create_new(true)
+                    .mode(0o600)
+                    .open(
+                        roster_root
+                            .path()
+                            .join(format!(".opc-xfrm-roster-pending-{}", "11".repeat(16))),
+                    )
+                    .unwrap();
+                staged.write_all(b"interrupted publication").unwrap();
+            }
+            let before = cleanup_directory_snapshot(roster_root.path());
+            let mut config = cleanup_config(&root, crate::XfrmCleanupInventoryOpenMode::CreateNew);
+            config.roster_recovery = Some((
+                roster_root.path().to_owned(),
+                XfrmObjectRosterRecoveryProofKey::new([3; 32]).unwrap(),
+            ));
+            let created = LinuxXfrmBackend::with_transport(transport.clone())
+                .bind_current_network_namespace_with_cleanup_inventory(config);
+            let refused = matches!(
+                created,
+                Err(XfrmObjectRecoveryBindError::RosterStore {
+                    source: XfrmObjectRosterDurableError::Malformed
+                })
+            );
+            drop(created);
+            cleanup_wait_for_leases(&[root.path(), roster_root.path()]).await;
+            let unchanged = cleanup_directory_snapshot(roster_root.path()) == before;
+            let unpublished = cleanup_directory_snapshot(root.path()).is_empty();
+            assert!(transport.records().is_empty());
+            if !refused || !unchanged || !unpublished {
+                failures.push((case, refused, unchanged, unpublished));
+            }
+        }
+        assert!(
+            failures.is_empty(),
+            "inventory create repaired or accepted roster: {failures:?}"
+        );
     }
 }

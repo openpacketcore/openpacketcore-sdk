@@ -33,6 +33,7 @@ engineers.
 | RFC | Title | Status and scope |
 | :--- | :--- | :--- |
 | [020](020-online-audit-recipient-verification.md) | Authority-owned online audit recipient verification | Acceptance is recorded by maintainer-approved merge of #979; implementation qualification remains separate. Online recipient custody, authenticated application boundary and checkpoint/report semantics for #959. |
+| [021](021-xfrm-cleanup-inventory.md) | Namespace-bound XFRM cleanup inventory | Proposal for #1058. Encrypted lifetime ownership, bounded authenticated snapshot publication and transaction-settlement coverage; exact-removal qualification remains a prerequisite. |
 
 ## Recommended Reading Order
 

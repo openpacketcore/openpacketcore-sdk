@@ -2968,8 +2968,10 @@ name = "opc-ipsec-xfrm"
 version = "0.2.0"
 dependencies = [
  "aes-gcm 0.11.1",
+ "aes-gcm-siv",
  "async-trait",
  "aya",
+ "hkdf 0.13.0",
  "hmac 0.13.0",
  "nix",
  "opc-crypto-provider",

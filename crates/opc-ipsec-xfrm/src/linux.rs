@@ -1,5 +1,8 @@
 //! Safe Linux XFRM backend over the raw netlink sys boundary.
 
+#[cfg(feature = "test-support")]
+pub mod test_support;
+
 use std::fmt;
 use std::io;
 use std::mem::size_of;
@@ -42,6 +45,7 @@ use crate::model::{
 #[cfg(unix)]
 use crate::namespace::XfrmObjectRecoveryBindError;
 use crate::namespace::{self, NamespaceBoundLinuxXfrmBackend, NetworkNamespaceBinding};
+#[cfg(any(target_os = "linux", test))]
 use crate::observation::{EspPeerObservationKey, EspPeerObservationRegistration};
 use crate::outbound_binding::{
     expected_policy, expected_sa, readback_mismatch, OutboundSaCryptoExpectation,
@@ -302,7 +306,7 @@ impl LinuxXfrmBackend {
         })
     }
 
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-support"))]
     pub(crate) fn with_transport<T>(transport: T) -> Self
     where
         T: LinuxXfrmTransport + 'static,
@@ -585,6 +589,34 @@ impl LinuxXfrmBackend {
         )
     }
 
+    /// Bind an encrypted cleanup inventory and its transaction stores atomically.
+    ///
+    /// All operational commands remain closed because exact removal is not
+    /// available. Only authenticated inventory status can be queried. A backend
+    /// with eagerly configured DSCP marking is refused; construct deferred DSCP
+    /// marking before opting into this binding.
+    ///
+    /// # Errors
+    /// Returns a value-free binding error for an invalid configuration, missing
+    /// or unauthenticated state, an occupied lease, or storage failure.
+    #[cfg(unix)]
+    pub fn bind_current_network_namespace_with_cleanup_inventory(
+        self,
+        config: crate::XfrmCleanupInventoryBindingConfig,
+    ) -> Result<crate::XfrmCleanupInventoryBinding, crate::XfrmObjectRecoveryBindError> {
+        crate::namespace::bind_current_network_namespace_with_cleanup_inventory(self, config)
+    }
+
+    #[cfg(unix)]
+    pub(crate) fn validate_cleanup_inventory_binding(&self) -> Result<(), XfrmError> {
+        if self.inner.dscp_config.is_some() && !self.inner.dscp_activation_deferred {
+            return Err(XfrmError::UnsupportedFeature {
+                feature: "cleanup_inventory_eager_dscp",
+            });
+        }
+        Ok(())
+    }
+
     pub(crate) fn for_namespace_actor(self, binding: NetworkNamespaceBinding) -> Self {
         let inner = self.inner;
         Self {
@@ -606,6 +638,13 @@ impl LinuxXfrmBackend {
                 namespace_binding: Some(binding),
             }),
         }
+    }
+
+    #[cfg(feature = "test-support")]
+    pub(crate) fn test_namespace_actor_lifetime(
+        &self,
+    ) -> Option<test_support::MockNamespaceActorLifetime> {
+        self.inner.transport.test_namespace_actor_lifetime()
     }
 
     pub(crate) fn prepare_namespace_actor(&self) -> Result<(), XfrmError> {
@@ -871,6 +910,7 @@ impl LinuxXfrmBackend {
         parse_sa_relocation_snapshot(&response)
     }
 
+    #[cfg(target_os = "linux")]
     pub(crate) async fn query_esp_peer_observation_registration(
         &self,
         requested: EspPeerObservationKey,
@@ -1014,7 +1054,7 @@ impl LinuxXfrmBackend {
             {
                 Ok(policy) => policy,
                 Err(XfrmError::NotFound) => {
-                    return readback_mismatch("xfrm_outbound_sa_binding_current_policy_missing")
+                    return readback_mismatch("xfrm_outbound_sa_binding_current_policy_missing");
                 }
                 Err(source) => return Err(OutboundSaBindingError::Readback { source }),
             };
@@ -1027,7 +1067,7 @@ impl LinuxXfrmBackend {
         let observed_sa_body = match self.query_sa_for_outbound_binding(expected_sa).await {
             Ok(body) => body,
             Err(XfrmError::NotFound) => {
-                return readback_mismatch("xfrm_outbound_sa_binding_current_sa_missing")
+                return readback_mismatch("xfrm_outbound_sa_binding_current_sa_missing");
             }
             Err(source) => return Err(OutboundSaBindingError::Readback { source }),
         };
@@ -1524,6 +1564,11 @@ impl XfrmBackend for LinuxXfrmBackend {
 }
 
 pub(crate) trait LinuxXfrmTransport: Send + Sync + fmt::Debug {
+    #[cfg(feature = "test-support")]
+    fn test_namespace_actor_lifetime(&self) -> Option<test_support::MockNamespaceActorLifetime> {
+        None
+    }
+
     fn transact(
         &self,
         operation: &'static str,
@@ -2723,6 +2768,7 @@ fn parse_sa_relocation_snapshot(payload: &[u8]) -> Result<SaRelocationSnapshot, 
     Ok(SaRelocationSnapshot { state, identity })
 }
 
+#[cfg(any(target_os = "linux", test))]
 fn parse_esp_peer_observation_registration(
     payload: &[u8],
     requested: EspPeerObservationKey,
@@ -2839,6 +2885,7 @@ fn parse_esp_peer_observation_registration(
 /// This is an identity comparison, not a claim about kernel selection. Two
 /// distinct canonical marks can still both be selected by one lookup value;
 /// see `XfrmLookupMark::is_exact_profile`.
+#[cfg(any(target_os = "linux", test))]
 fn observation_mark_selects(
     requested: Option<XfrmLookupMark>,
     observed: Option<XfrmLookupMark>,
@@ -2846,6 +2893,7 @@ fn observation_mark_selects(
     requested == observed
 }
 
+#[cfg(any(target_os = "linux", test))]
 fn validate_esp_peer_observation_crypto(payload: &[u8]) -> Result<(), XfrmError> {
     const OPERATION: &str = "query_esp_peer_observation_registration";
 
@@ -2909,6 +2957,7 @@ fn validate_esp_peer_observation_crypto(payload: &[u8]) -> Result<(), XfrmError>
     Ok(())
 }
 
+#[cfg(any(target_os = "linux", test))]
 fn validate_esp_peer_observation_replay(payload: &[u8]) -> Result<(), XfrmError> {
     const OPERATION: &str = "query_esp_peer_observation_registration";
 
@@ -2944,6 +2993,7 @@ fn validate_esp_peer_observation_replay(payload: &[u8]) -> Result<(), XfrmError>
     Ok(())
 }
 
+#[cfg(any(target_os = "linux", test))]
 const fn family_of_ip(address: IpAddress) -> u8 {
     match address {
         IpAddress::Ipv4(_) => 4,
@@ -2986,7 +3036,7 @@ fn parse_outbound_sa_binding_snapshot(
         _ => {
             return Err(XfrmError::UnsupportedFeature {
                 feature: "installed_child_sa_direction",
-            })
+            });
         }
     };
     validate_sa_binding_dynamic_attributes(payload, direction)?;
@@ -4308,7 +4358,7 @@ fn is_known_aead_algorithm(name: &str) -> bool {
     )
 }
 
-fn validate_policy_parameters(parameters: &PolicyParameters) -> Result<(), XfrmError> {
+pub(crate) fn validate_policy_parameters(parameters: &PolicyParameters) -> Result<(), XfrmError> {
     validate_selector_family(&parameters.selector)?;
     if parameters.templates.len() > XFRM_POLICY_TEMPLATE_LIMIT {
         return Err(XfrmError::invalid_config(
