@@ -9,6 +9,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- `opc-linux-xfrm-sys`: correct `XFRMA_SA_DIR` to Linux UAPI attribute 33
+  and expose the adjacent timer, NAT keepalive, and per-CPU SA constants.
+  `opc-ipsec-xfrm` now recognizes direction-tagged GETSA replies and rejects
+  attribute 34 as unmodeled NAT keepalive. Literal-number decoding tests and
+  a privileged Linux 6.10+ install/GETSA regression cover the distinction.
+  Fixes #1053.
+
 - `opc-gtpu-dataplane`: TFT classification can use a qualified private
   map-in-map RCU grace when GLOBAL membarrier is unavailable, including
   `nohz_full`. GLOBAL remains preferred, and unknown or realtime profiles
