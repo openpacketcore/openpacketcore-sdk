@@ -167,6 +167,18 @@ jobs:
           grep -Fq 'OPC_GTPU_TFT_IPV4_LIVE_PROVEN' "${datapath_log}"
           grep -Fq 'OPC_GTPU_TFT_REMOVAL_FENCE_DEFAULT_PROVEN:' "${datapath_log}"
           grep -Fq 'OPC_GTPU_TFT_REMOVAL_CONTINUITY_PROVEN:' "${datapath_log}"
+          grep -Fq 'OPC_GTPU_TFT_FRAGMENT_ESP_PAIR_PROVEN' "${datapath_log}"
+          grep -Fq 'OPC_GTPU_TFT_FRAGMENT_EXACT_KEY_PROVEN' "${datapath_log}"
+          grep -Fq 'OPC_GTPU_TFT_FRAGMENT_CONFLICTING_FIRST_PROVEN' "${datapath_log}"
+          grep -Fq 'OPC_GTPU_TFT_FRAGMENT_OVERLAP_AND_RANGE_BOUND_PROVEN' "${datapath_log}"
+          grep -Fq 'OPC_GTPU_TFT_FRAGMENT_CLASSIFIER_IDENTITY_PROVEN' "${datapath_log}"
+          grep -Fq 'OPC_GTPU_TFT_FRAGMENT_LIFECYCLE_PROVEN' "${datapath_log}"
+          grep -Fq 'OPC_GTPU_TFT_FRAGMENT_MALFORMED_RETAINED_PROVEN' "${datapath_log}"
+          grep -Fq 'OPC_GTPU_TFT_FRAGMENT_EXPIRY_PROVEN' "${datapath_log}"
+          grep -Fq 'OPC_GTPU_TFT_FRAGMENT_AUTHORITY_REVOCATION_PROVEN' "${datapath_log}"
+          grep -Fq 'OPC_GTPU_TFT_FRAGMENT_CAPACITY_PROVEN' "${datapath_log}"
+          grep -Fq 'OPC_GTPU_TFT_FRAGMENT_CROSS_ATTACHMENT_PROVEN' "${datapath_log}"
+          grep -Fq 'OPC_GTPU_TFT_FRAGMENT_PORT_ONLY_CONTROL_PROVEN' "${datapath_log}"
           grep -Fq 'OPC_GTPU_REQUIRED_EXTENSION_CONTROL_PROVEN:' "${datapath_log}"
           grep -Fq 'OPC_GTPU_UNKNOWN_TEID_CONTROL_PROVEN:' "${datapath_log}"
           grep -Fq 'OPC_GTPU_BACKEND_CONTROL_LIFETIME_PROVEN:' "${datapath_log}"
@@ -498,7 +510,7 @@ jobs:
 
           if ! live_output="$(
             ssh "${ssh_options[@]}" opc@127.0.0.1 \
-              'sudo env OPC_GTPU_RUN_PRIVILEGED=1 unshare -n -- bash -euo pipefail -c "ip link set lo up && /tmp/opc-gtpu-linux68-datapath --ignored --nocapture --test-threads=1 ebpf_gtpu_shared_paa_tft_classifier_ipv4_live_contract ebpf_gtpu_tft_classifier_removal_fence_forwards_default_uplink ebpf_gtpu_tft_classifier_removal_keeps_default_uplink_continuous ebpf_gtpu_n3_fixed_flow_live_contract ebpf_gtpu_n3_end_marker_retirement_ordering ebpf_gtpu_ordinary_inner_ipv6_live_contract"' \
+              'sudo env OPC_GTPU_RUN_PRIVILEGED=1 unshare -n -- bash -euo pipefail -c "ip link set lo up && /tmp/opc-gtpu-linux68-datapath --ignored --nocapture --test-threads=1 ebpf_gtpu_shared_paa_tft_classifier_ipv4_live_contract ebpf_gtpu_tft_classifier_removal_fence_forwards_default_uplink ebpf_gtpu_tft_classifier_removal_keeps_default_uplink_continuous ebpf_gtpu_tft_fragmented_esp_pair ebpf_gtpu_tft_fragment_affinity_exact_key ebpf_gtpu_tft_fragment_affinity_conflicting_first ebpf_gtpu_tft_fragment_affinity_overlap_and_range_bound ebpf_gtpu_tft_fragment_affinity_classifier_identity ebpf_gtpu_tft_fragment_affinity_lifecycle ebpf_gtpu_tft_fragment_affinity_malformed_retained ebpf_gtpu_tft_fragment_affinity_expiry ebpf_gtpu_tft_fragment_affinity_authority_revocation ebpf_gtpu_tft_fragment_affinity_capacity ebpf_gtpu_tft_fragment_affinity_cross_attachment ebpf_gtpu_tft_fragment_affinity_port_only_control ebpf_gtpu_n3_fixed_flow_live_contract ebpf_gtpu_n3_end_marker_retirement_ordering ebpf_gtpu_ordinary_inner_ipv6_live_contract"' \
               2>&1
           )"; then
             printf '%s\n' "${live_output}"
@@ -509,12 +521,24 @@ jobs:
             echo '::error::Linux 6.8 TFT live proof skipped instead of running'
             exit 1
           fi
-          grep -Fq 'test result: ok. 6 passed; 0 failed;' <<< "${live_output}"
+          grep -Fq 'test result: ok. 18 passed; 0 failed;' <<< "${live_output}"
           grep -Fq 'OPC_GTPU_N3_FIXED_FLOW_PROVEN:' <<< "${live_output}"
           grep -Fq 'OPC_GTPU_N3_END_MARKER_PROVEN:' <<< "${live_output}"
           grep -Fq 'OPC_GTPU_TFT_IPV4_LIVE_PROVEN' <<< "${live_output}"
           grep -Fq 'OPC_GTPU_TFT_REMOVAL_FENCE_DEFAULT_PROVEN:' <<< "${live_output}"
           grep -Fq 'OPC_GTPU_TFT_REMOVAL_CONTINUITY_PROVEN:' <<< "${live_output}"
+          grep -Fq 'OPC_GTPU_TFT_FRAGMENT_ESP_PAIR_PROVEN' <<< "${live_output}"
+          grep -Fq 'OPC_GTPU_TFT_FRAGMENT_EXACT_KEY_PROVEN' <<< "${live_output}"
+          grep -Fq 'OPC_GTPU_TFT_FRAGMENT_CONFLICTING_FIRST_PROVEN' <<< "${live_output}"
+          grep -Fq 'OPC_GTPU_TFT_FRAGMENT_OVERLAP_AND_RANGE_BOUND_PROVEN' <<< "${live_output}"
+          grep -Fq 'OPC_GTPU_TFT_FRAGMENT_CLASSIFIER_IDENTITY_PROVEN' <<< "${live_output}"
+          grep -Fq 'OPC_GTPU_TFT_FRAGMENT_LIFECYCLE_PROVEN' <<< "${live_output}"
+          grep -Fq 'OPC_GTPU_TFT_FRAGMENT_MALFORMED_RETAINED_PROVEN' <<< "${live_output}"
+          grep -Fq 'OPC_GTPU_TFT_FRAGMENT_EXPIRY_PROVEN' <<< "${live_output}"
+          grep -Fq 'OPC_GTPU_TFT_FRAGMENT_AUTHORITY_REVOCATION_PROVEN' <<< "${live_output}"
+          grep -Fq 'OPC_GTPU_TFT_FRAGMENT_CAPACITY_PROVEN' <<< "${live_output}"
+          grep -Fq 'OPC_GTPU_TFT_FRAGMENT_CROSS_ATTACHMENT_PROVEN' <<< "${live_output}"
+          grep -Fq 'OPC_GTPU_TFT_FRAGMENT_PORT_ONLY_CONTROL_PROVEN' <<< "${live_output}"
           grep -Fq 'OPC_GTPU_ORDINARY_INNER_IPV6_PROVEN' <<< "${live_output}"
 
       - name: Preserve Linux 6.8 packet tooling for nohz qualification
@@ -964,6 +988,18 @@ jobs:
           grep -Fq 'OPC_GTPU_TFT_IPV4_LIVE_PROVEN' "${datapath_log}"
           grep -Fq 'OPC_GTPU_TFT_REMOVAL_FENCE_DEFAULT_PROVEN:' "${datapath_log}"
           grep -Fq 'OPC_GTPU_TFT_REMOVAL_CONTINUITY_PROVEN:' "${datapath_log}"
+          grep -Fq 'OPC_GTPU_TFT_FRAGMENT_ESP_PAIR_PROVEN' "${datapath_log}"
+          grep -Fq 'OPC_GTPU_TFT_FRAGMENT_EXACT_KEY_PROVEN' "${datapath_log}"
+          grep -Fq 'OPC_GTPU_TFT_FRAGMENT_CONFLICTING_FIRST_PROVEN' "${datapath_log}"
+          grep -Fq 'OPC_GTPU_TFT_FRAGMENT_OVERLAP_AND_RANGE_BOUND_PROVEN' "${datapath_log}"
+          grep -Fq 'OPC_GTPU_TFT_FRAGMENT_CLASSIFIER_IDENTITY_PROVEN' "${datapath_log}"
+          grep -Fq 'OPC_GTPU_TFT_FRAGMENT_LIFECYCLE_PROVEN' "${datapath_log}"
+          grep -Fq 'OPC_GTPU_TFT_FRAGMENT_MALFORMED_RETAINED_PROVEN' "${datapath_log}"
+          grep -Fq 'OPC_GTPU_TFT_FRAGMENT_EXPIRY_PROVEN' "${datapath_log}"
+          grep -Fq 'OPC_GTPU_TFT_FRAGMENT_AUTHORITY_REVOCATION_PROVEN' "${datapath_log}"
+          grep -Fq 'OPC_GTPU_TFT_FRAGMENT_CAPACITY_PROVEN' "${datapath_log}"
+          grep -Fq 'OPC_GTPU_TFT_FRAGMENT_CROSS_ATTACHMENT_PROVEN' "${datapath_log}"
+          grep -Fq 'OPC_GTPU_TFT_FRAGMENT_PORT_ONLY_CONTROL_PROVEN' "${datapath_log}"
           grep -Fq 'OPC_GTPU_REQUIRED_EXTENSION_CONTROL_PROVEN:' "${datapath_log}"
           grep -Fq 'OPC_GTPU_UNKNOWN_TEID_CONTROL_PROVEN:' "${datapath_log}"
           grep -Fq 'OPC_GTPU_BACKEND_CONTROL_LIFETIME_PROVEN:' "${datapath_log}"
@@ -1144,7 +1180,7 @@ jobs:
             <(printf '%s\n' \
               GTPU_OBS_EVT GTPU_OBS_FLOW GTPU_OBS_GATE GTPU_OBS_LCK \
               GTPU_OBS_LOSS GTPU_OBS_REDIR GTPU_OBS_REG GTPU_OBS_SEQ GTPU_SEL_STAMP \
-              GTPU_TFT_DROP GTPU_TFT_FILT GTPU_TFT_META GTPU_TFT_SCHEMA) \
+              GTPU_TFT_DROP GTPU_TFT_FILT GTPU_TFT_FRAG GTPU_TFT_META GTPU_TFT_SCHEMA) \
             added-after-pre-redirect.maps
           # The whole guard rests on these being different programs. Byte
           # equality with the current object would make the historical-upgrade
@@ -1222,7 +1258,7 @@ jobs:
             GTPU_OBS_REG GTPU_OBS_REDIR GTPU_OBS_EVT GTPU_OBS_LOSS GTPU_OBS_SEQ \
             GTPU_OBS_GATE GTPU_OBS_LCK GTPU_OBS_FLOW \
             GTPU_SEL_STAMP \
-            GTPU_TFT_SCHEMA GTPU_TFT_META GTPU_TFT_FILT GTPU_TFT_DROP; do
+            GTPU_TFT_SCHEMA GTPU_TFT_META GTPU_TFT_FILT GTPU_TFT_FRAG GTPU_TFT_DROP; do
             grep -Eq \
               "( |[[:digit:]])${symbol}((Kb[01]|Kj(4|8|10|20|40))_EB[[:digit:]]+_)?$" \
               committed.inventory

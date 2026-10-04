@@ -26,6 +26,12 @@ The crate exposes tc entry points, not a Rust library API:
   retains the strict DF behavior. The UDP destination port is always 2152.
   The host-only `RequireOuterFragmentation` policy remains non-executable
   because `bpf_redirect_neigh` bypasses the kernel fragmentation path.
+  Before resolving an unmarked inner IPv4 packet, an owned TFT classifier may
+  select its bearer. Fragment zero with `MF=1` must expose all required header
+  fields to establish bounded affinity; later fragments reuse that decision
+  only under the same classifier identity. ESP classification uses protocol
+  50 and visible SPI, never protected TCP/UDP ports. Every fragment still
+  passes the existing downstream exact peer/F-TEID authority lookup.
 - `opc_gtpu_downlink`: tc ingress program. It matches UDP/2152 GTPv1-U G-PDUs,
   proves the complete outer IPv4 or IPv6 envelope and checksum boundary,
   derives the independent inner family, and resolves `(outer family, inner
@@ -80,6 +86,16 @@ Limits.
 peer, local, ingress, and source-port binding failures. Its values are
 aggregate and contain no rejected endpoint or session fields.
 
+`GTPU_TFT_FRAG` is the pinned BTF ARRAY for inner IPv4 fragment affinity. A
+bounded hash selects its four-slot bucket by a `u32` array index. Each slot
+retains the exact interface, PAA, source, destination, protocol, and IPv4 ID,
+plus the selected mark, classifier owner, owner generation, snapshot generation,
+fingerprint, and bounded fragment ranges. The program forwards original
+fragments without buffering payloads or reassembling them. A stale retained key
+drops after classifier removal or replacement even when the classifier had a
+default bearer. Without either a classifier or a live key, ordinary forwarding
+behavior remains.
+
 ## Relationships
 
 - `opc-gtpu-ebpf-common`: shared no-std layout and classification crate.
@@ -92,6 +108,39 @@ aggregate and contain no rejected endpoint or session fields.
 
 - Unpublished standalone crate (`publish = false`) with its own `Cargo.lock`.
 - Build profile uses `panic = "abort"` and optimized BPF codegen.
+- Fragment affinity has 16,384 four-way buckets (65,536 slots), at most 64
+  ranges per datagram, and a fixed two-second boot-time expiry. A full bucket
+  refuses admission even if others have room. No live slot is evicted or
+  refreshed, including completed or poisoned slots. A matching duplicate
+  first fragment is accepted without a state refresh; a conflicting first
+  fragment, overlap, inconsistent final range, or range-limit exhaustion
+  poisons the entry until its original deadline. Under an owned classifier,
+  orphan, expired, stale, ambiguous, and capacity-refused fragments drop
+  through existing aggregate TFT counters. Expired IPv4 IDs may be admitted by
+  a new classifiable first fragment.
+- One spin lock per bucket protects all CPUs' in-place mutations. Packet
+  reads, other map lookups, classification, clock reads, counter updates, and
+  forwarding authority lookups occur outside the lock. The protected
+  transition examines at most four slots and 64 ranges, with no helper calls,
+  allocations, or whole-entry copies. First fragments also use the existing
+  classifier bound of 256 filters; later fragments never parse transport fields.
+- Each affinity slot is 392 bytes. Four slots plus the lock make a 1,572-byte
+  BTF value; the kernel's 1,576-byte stride allocates 24.625 MiB of value storage
+  per attachment before map metadata. Capacity is per concurrent datagram and
+  shared by the attachment; bucket collisions can refuse admission before
+  the global slot limit is reached. There is no userspace packet-expiry scan
+  or live map-value replacement.
+- The complete graph now has 35 maps and TFT schema v5. Former 34-map graphs
+  missing `GTPU_TFT_FRAG`, old TFT markers, and partial TFT graphs are refused
+  before attachment mutation. Current recovery uses `OPCCURR8` proofs and
+  terminal WAL r3. Creation, adoption, cleanup, and rollback belong to the
+  loader; upgrade or downgrade requires a drain, exact cleanup with the
+  generation's compatible version, and fresh attachment. Incompatible retained
+  proofs, WALs, or finalized receipts continue to fence the namespace after
+  graph cleanup. No record conversion is implemented: preserve them and use a
+  separate, freshly authorized namespace. See the
+  [upgrade and rollback contract](../opc-gtpu-dataplane/README.md#tft-fragment-affinity-upgrade-and-rollback).
+  Frozen shipped-25 recovery recognition remains separate and unchanged.
 - The grouped datapath supports all four independent outer/inner IPv4/IPv6
   combinations and simultaneous IPv4v6 session groups. The frozen v5 maps
   remain an IPv4-only compatibility fallback and are never consulted after a

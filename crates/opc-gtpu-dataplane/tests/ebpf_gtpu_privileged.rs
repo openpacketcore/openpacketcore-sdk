@@ -58,6 +58,112 @@ mod n3_fixed_flow;
 mod packet_too_big_baseline;
 #[path = "ebpf_gtpu_privileged/tft_classifier_removal.rs"]
 mod tft_classifier_removal;
+#[path = "ebpf_gtpu_privileged/tft_fragment_affinity.rs"]
+mod tft_fragment_affinity;
+
+#[tokio::test]
+#[ignore = "requires root (CAP_BPF/CAP_NET_ADMIN), a fresh netns, and bpffs"]
+async fn ebpf_gtpu_tft_fragmented_esp_pair() -> Result<(), Box<dyn std::error::Error>> {
+    tft_fragment_affinity::qualify_pair().await?;
+    println!("OPC_GTPU_TFT_FRAGMENT_ESP_PAIR_PROVEN");
+    Ok(())
+}
+
+#[tokio::test]
+#[ignore = "requires root (CAP_BPF/CAP_NET_ADMIN), a fresh netns, and bpffs"]
+async fn ebpf_gtpu_tft_fragment_affinity_exact_key() -> Result<(), Box<dyn std::error::Error>> {
+    tft_fragment_affinity::qualify_exact_key().await?;
+    println!("OPC_GTPU_TFT_FRAGMENT_EXACT_KEY_PROVEN");
+    Ok(())
+}
+
+#[tokio::test]
+#[ignore = "requires root (CAP_BPF/CAP_NET_ADMIN), a fresh netns, and bpffs"]
+async fn ebpf_gtpu_tft_fragment_affinity_conflicting_first(
+) -> Result<(), Box<dyn std::error::Error>> {
+    tft_fragment_affinity::qualify_conflicting_first().await?;
+    println!("OPC_GTPU_TFT_FRAGMENT_CONFLICTING_FIRST_PROVEN");
+    Ok(())
+}
+
+#[tokio::test]
+#[ignore = "requires root (CAP_BPF/CAP_NET_ADMIN), a fresh netns, and bpffs"]
+async fn ebpf_gtpu_tft_fragment_affinity_overlap_and_range_bound(
+) -> Result<(), Box<dyn std::error::Error>> {
+    tft_fragment_affinity::qualify_overlap_and_range_bound().await?;
+    println!("OPC_GTPU_TFT_FRAGMENT_OVERLAP_AND_RANGE_BOUND_PROVEN");
+    Ok(())
+}
+
+#[tokio::test]
+#[ignore = "requires root (CAP_BPF/CAP_NET_ADMIN), a fresh netns, and bpffs"]
+async fn ebpf_gtpu_tft_fragment_affinity_classifier_identity(
+) -> Result<(), Box<dyn std::error::Error>> {
+    tft_fragment_affinity::qualify_classifier_identity().await?;
+    println!("OPC_GTPU_TFT_FRAGMENT_CLASSIFIER_IDENTITY_PROVEN");
+    Ok(())
+}
+
+#[tokio::test]
+#[ignore = "requires root (CAP_BPF/CAP_NET_ADMIN), a fresh netns, and bpffs"]
+async fn ebpf_gtpu_tft_fragment_affinity_lifecycle() -> Result<(), Box<dyn std::error::Error>> {
+    tft_fragment_affinity::qualify_lifecycle().await?;
+    println!("OPC_GTPU_TFT_FRAGMENT_LIFECYCLE_PROVEN");
+    Ok(())
+}
+
+#[tokio::test]
+#[ignore = "requires root (CAP_BPF/CAP_NET_ADMIN), a fresh netns, and bpffs"]
+async fn ebpf_gtpu_tft_fragment_affinity_malformed_retained(
+) -> Result<(), Box<dyn std::error::Error>> {
+    tft_fragment_affinity::qualify_malformed_retained().await?;
+    println!("OPC_GTPU_TFT_FRAGMENT_MALFORMED_RETAINED_PROVEN");
+    Ok(())
+}
+
+#[tokio::test]
+#[ignore = "requires root (CAP_BPF/CAP_NET_ADMIN), a fresh netns, and bpffs"]
+async fn ebpf_gtpu_tft_fragment_affinity_expiry() -> Result<(), Box<dyn std::error::Error>> {
+    tft_fragment_affinity::qualify_expiry().await?;
+    println!("OPC_GTPU_TFT_FRAGMENT_EXPIRY_PROVEN");
+    Ok(())
+}
+
+#[tokio::test]
+#[ignore = "requires root (CAP_BPF/CAP_NET_ADMIN), a fresh netns, and bpffs"]
+async fn ebpf_gtpu_tft_fragment_affinity_authority_revocation(
+) -> Result<(), Box<dyn std::error::Error>> {
+    tft_fragment_affinity::qualify_authority_revocation().await?;
+    println!("OPC_GTPU_TFT_FRAGMENT_AUTHORITY_REVOCATION_PROVEN");
+    Ok(())
+}
+
+#[tokio::test]
+#[ignore = "requires root (CAP_BPF/CAP_NET_ADMIN), a fresh netns, and bpffs"]
+async fn ebpf_gtpu_tft_fragment_affinity_capacity() -> Result<(), Box<dyn std::error::Error>> {
+    tft_fragment_affinity::qualify_capacity().await?;
+    println!("OPC_GTPU_TFT_FRAGMENT_CAPACITY_PROVEN");
+    Ok(())
+}
+
+#[tokio::test]
+#[ignore = "requires root (CAP_BPF/CAP_NET_ADMIN), a fresh netns, and bpffs"]
+async fn ebpf_gtpu_tft_fragment_affinity_cross_attachment() -> Result<(), Box<dyn std::error::Error>>
+{
+    tft_fragment_affinity::qualify_cross_attachment().await?;
+    println!("OPC_GTPU_TFT_FRAGMENT_CROSS_ATTACHMENT_PROVEN");
+    Ok(())
+}
+
+#[tokio::test]
+#[ignore = "requires root (CAP_BPF/CAP_NET_ADMIN), a fresh netns, and bpffs"]
+async fn ebpf_gtpu_tft_fragment_affinity_port_only_control(
+) -> Result<(), Box<dyn std::error::Error>> {
+    tft_fragment_affinity::qualify_port_only_control().await?;
+    println!("OPC_GTPU_TFT_FRAGMENT_PORT_ONLY_CONTROL_PROVEN");
+    Ok(())
+}
+
 #[path = "ebpf_gtpu_privileged/tft_nohz_full.rs"]
 mod tft_nohz_full;
 
@@ -141,12 +247,13 @@ use opc_gtpu_ebpf_common::{
     MAP_MARKED_BEARER_OWNER, MAP_SESSION_DOWNLINK_INDEX, MAP_SESSION_GROUPS, MAP_SESSION_SCHEMA,
     MAP_SESSION_SELECTOR_STAMPS, MAP_SESSION_TRANSACTIONS, MAP_SESSION_UPLINK_INDEX,
     MAP_TFT_CLASSIFIER_COUNTERS, MAP_TFT_CLASSIFIER_FILTERS, MAP_TFT_CLASSIFIER_META,
-    MAP_TFT_CLASSIFIER_SCHEMA, MAP_UPLINK_DSCP, MAP_UPLINK_FAR, MAP_UPLINK_MARK_DSCP,
-    MAP_UPLINK_MARK_FAR, MAP_UPLINK_MARK_SOURCE_PORT, MAP_UPLINK_PMTU, MAP_UPLINK_PMTU_COUNTERS,
-    MAP_UPLINK_SOURCE_PORT, MARKED_BEARER_OWNER_VALUE_LEN, MARKED_DOWNLINK_PDR_VALUE_LEN,
-    PROG_DOWNLINK, PROG_UPLINK, TFT_CLASSIFIER_COUNTER_SLOTS, TFT_CLASSIFIER_FILTER_KEY_LEN,
-    TFT_CLASSIFIER_FILTER_VALUE_LEN, TFT_CLASSIFIER_KEY_LEN, TFT_CLASSIFIER_META_VALUE_LEN,
-    TFT_CLASSIFIER_SCHEMA_VALUE_LEN, UDP_HDR_LEN, UPLINK_BEARER_SCHEMA_MARKER_VALUE,
+    MAP_TFT_CLASSIFIER_SCHEMA, MAP_TFT_FRAGMENT_AFFINITY, MAP_UPLINK_DSCP, MAP_UPLINK_FAR,
+    MAP_UPLINK_MARK_DSCP, MAP_UPLINK_MARK_FAR, MAP_UPLINK_MARK_SOURCE_PORT, MAP_UPLINK_PMTU,
+    MAP_UPLINK_PMTU_COUNTERS, MAP_UPLINK_SOURCE_PORT, MARKED_BEARER_OWNER_VALUE_LEN,
+    MARKED_DOWNLINK_PDR_VALUE_LEN, PROG_DOWNLINK, PROG_UPLINK, TFT_CLASSIFIER_COUNTER_SLOTS,
+    TFT_CLASSIFIER_FILTER_KEY_LEN, TFT_CLASSIFIER_FILTER_VALUE_LEN, TFT_CLASSIFIER_KEY_LEN,
+    TFT_CLASSIFIER_META_VALUE_LEN, TFT_CLASSIFIER_SCHEMA_VALUE_LEN, TFT_FRAGMENT_BUCKETS,
+    TFT_FRAGMENT_BUCKET_VALUE_LEN, UDP_HDR_LEN, UPLINK_BEARER_SCHEMA_MARKER_VALUE,
     UPLINK_DSCP_SCHEMA_MARKER_KEY, UPLINK_DSCP_SCHEMA_MARKER_VALUE, UPLINK_DSCP_VALUE_LEN,
     UPLINK_ENDPOINT_SCHEMA_MARKER_VALUE, UPLINK_FAR_VALUE_LEN, UPLINK_MARK_KEY_LEN,
     UPLINK_PMTU_COUNTER_SLOTS, UPLINK_PMTU_SCHEMA_MARKER_VALUE, UPLINK_PMTU_VALUE_LEN,
@@ -241,7 +348,7 @@ const OBSERVATION_FLOW_SCRATCH_VALUE_LEN: usize = 40;
 const CURRENT_DATAPATH_OBJECT: &[u8] = include_bytes!("../bpf/opc-gtpu-datapath.bpf.o");
 const FROZEN_V1_OBJECT: &[u8] = include_bytes!("../bpf/opc-gtpu-datapath-v1.bpf.o");
 const FROZEN_V2_OBJECT: &[u8] = include_bytes!("../bpf/opc-gtpu-datapath-v2.bpf.o");
-const CURRENT_PIN_NAMES: [&str; 34] = [
+const CURRENT_PIN_NAMES: [&str; 35] = [
     MAP_UPLINK_FAR,
     MAP_UPLINK_MARK_FAR,
     MAP_UPLINK_DSCP,
@@ -268,6 +375,7 @@ const CURRENT_PIN_NAMES: [&str; 34] = [
     MAP_TFT_CLASSIFIER_META,
     MAP_TFT_CLASSIFIER_FILTERS,
     MAP_TFT_CLASSIFIER_COUNTERS,
+    MAP_TFT_FRAGMENT_AFFINITY,
     GTPU_TRAFFIC_OBSERVATION_REGISTRATION_MAP_NAME,
     GTPU_TRAFFIC_OBSERVATION_REDIRECT_MAP_NAME,
     GTPU_TRAFFIC_OBSERVATION_EVENT_MAP_NAME,
@@ -5147,10 +5255,16 @@ fn pinned_array_values<const VALUE_LEN: usize>(
     .unwrap_or_else(|error| panic!("identify pinned {name}: {error}"));
     let array = Array::<_, [u8; VALUE_LEN]>::try_from(map)
         .unwrap_or_else(|error| panic!("type pinned {name}: {error}"));
+    // Fragment buckets contain a BPF spin lock; take it for a coherent snapshot.
+    let flags = if name == MAP_TFT_FRAGMENT_AFFINITY {
+        4 // BPF_F_LOCK
+    } else {
+        0
+    };
     (0..slots)
         .map(|index| {
             array
-                .get(&index, 0)
+                .get(&index, flags)
                 .unwrap_or_else(|error| panic!("read pinned {name}[{index}]: {error}"))
         })
         .collect()
@@ -5218,7 +5332,7 @@ fn pinned_per_cpu_byte_values<const VALUE_LEN: usize>(
 }
 
 /// Exact byte-for-byte state of every durable forwarding and recovery map in
-/// the current 34-pin graph. The restart-fenced observation source is captured
+/// the current 35-pin graph. The restart-fenced observation source is captured
 /// separately because adopting a retained graph must invalidate that source.
 ///
 /// This intentionally has no `Debug` implementation: assertion failures must
@@ -5278,6 +5392,7 @@ struct CurrentMapContents {
         [u8; TFT_CLASSIFIER_FILTER_VALUE_LEN],
     )>,
     tft_drop_counters: Vec<Vec<u64>>,
+    tft_fragment_affinity: Vec<[u8; TFT_FRAGMENT_BUCKET_VALUE_LEN]>,
 }
 
 fn current_map_contents(pin_dir: &std::path::Path) -> CurrentMapContents {
@@ -5319,6 +5434,11 @@ fn current_map_contents(pin_dir: &std::path::Path) -> CurrentMapContents {
             pin_dir,
             MAP_TFT_CLASSIFIER_COUNTERS,
             TFT_CLASSIFIER_COUNTER_SLOTS,
+        ),
+        tft_fragment_affinity: pinned_array_values(
+            pin_dir,
+            MAP_TFT_FRAGMENT_AFFINITY,
+            TFT_FRAGMENT_BUCKETS,
         ),
     }
 }
@@ -5405,7 +5525,7 @@ fn current_pin_graph_snapshot(pin_dir: &std::path::Path) -> CurrentPinGraphSnaps
     expected.sort_unstable();
     assert_eq!(
         pins, expected,
-        "fixture must retain the exact current 34-pin graph"
+        "fixture must retain the exact current 35-pin graph"
     );
     let map_ids = pins
         .iter()
@@ -6187,6 +6307,7 @@ async fn ebpf_gtpu_uplink_and_downlink_round_trip() -> Result<(), Box<dyn std::e
                 MAP_TFT_CLASSIFIER_META,
                 MAP_TFT_CLASSIFIER_FILTERS,
                 MAP_TFT_CLASSIFIER_COUNTERS,
+                MAP_TFT_FRAGMENT_AFFINITY,
                 GTPU_TRAFFIC_OBSERVATION_REGISTRATION_MAP_NAME,
                 GTPU_TRAFFIC_OBSERVATION_REDIRECT_MAP_NAME,
                 GTPU_TRAFFIC_OBSERVATION_EVENT_MAP_NAME,
@@ -8760,6 +8881,7 @@ async fn ebpf_gtpu_shared_paa_tft_classifier_ipv4_live_contract(
         MAP_TFT_CLASSIFIER_META,
         MAP_TFT_CLASSIFIER_FILTERS,
         MAP_TFT_CLASSIFIER_COUNTERS,
+        MAP_TFT_FRAGMENT_AFFINITY,
     ] {
         assert!(
             pin_dir.join(name).exists(),
@@ -12261,6 +12383,10 @@ async fn ebpf_gtpu_exact_current_hooks_refuse_a_different_complete_current_pin_g
     let mut alternate = EbpfLoader::new()
         .default_map_pin_directory(&pin_dir_b)
         .map_pin_path(
+            MAP_TFT_FRAGMENT_AFFINITY,
+            pin_dir_b.join(MAP_TFT_FRAGMENT_AFFINITY),
+        )
+        .map_pin_path(
             GTPU_TRAFFIC_OBSERVATION_SEQUENCE_LOCK_MAP_NAME,
             pin_dir_b.join(GTPU_TRAFFIC_OBSERVATION_SEQUENCE_LOCK_MAP_NAME),
         )
@@ -12315,6 +12441,7 @@ async fn ebpf_gtpu_exact_current_hooks_refuse_a_different_complete_current_pin_g
         MAP_TFT_CLASSIFIER_META,
         MAP_TFT_CLASSIFIER_FILTERS,
         MAP_TFT_CLASSIFIER_COUNTERS,
+        MAP_TFT_FRAGMENT_AFFINITY,
         GTPU_TRAFFIC_OBSERVATION_REGISTRATION_MAP_NAME,
         GTPU_TRAFFIC_OBSERVATION_REDIRECT_MAP_NAME,
         GTPU_TRAFFIC_OBSERVATION_EVENT_MAP_NAME,
@@ -12376,6 +12503,7 @@ async fn ebpf_gtpu_exact_current_hooks_refuse_a_different_complete_current_pin_g
             MAP_TFT_CLASSIFIER_META,
             MAP_TFT_CLASSIFIER_FILTERS,
             MAP_TFT_CLASSIFIER_COUNTERS,
+            MAP_TFT_FRAGMENT_AFFINITY,
             GTPU_TRAFFIC_OBSERVATION_REGISTRATION_MAP_NAME,
             GTPU_TRAFFIC_OBSERVATION_REDIRECT_MAP_NAME,
             GTPU_TRAFFIC_OBSERVATION_EVENT_MAP_NAME,

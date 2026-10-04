@@ -18,6 +18,11 @@ DRIVER = ROOT / "ci/qualify-tft-nohz-vm.sh"
 OLD_BOOT = "11111111-1111-4111-8111-111111111111"
 NEW_BOOT = "22222222-2222-4222-8222-222222222222"
 QUALIFIED = "OPC_GTPU_TFT_NOHZ_VM_QUALIFIED"
+FRAGMENT_MARKERS = (
+    "ESP_PAIR", "EXACT_KEY", "CONFLICTING_FIRST", "OVERLAP_AND_RANGE_BOUND",
+    "CLASSIFIER_IDENTITY", "LIFECYCLE", "MALFORMED_RETAINED", "EXPIRY",
+    "AUTHORITY_REVOCATION", "CAPACITY", "CROSS_ATTACHMENT", "PORT_ONLY_CONTROL",
+)
 
 
 def fake_command(command, args):
@@ -113,8 +118,8 @@ def fake_command(command, args):
                 print("OPC_GTPU_MAP_READER_GRACE_THREAD_CONTROL_PROVEN")
             return finish(state["grace_status"], "grace-proof")
         if len(remote) == 1 and "/tmp/opc-tft-nohz/datapath --ignored" in remote[0]:
-            print("test result: ok. 3 passed; 0 failed; 0 ignored;")
-            for _ in range(3):
+            print("test result: ok. 15 passed; 0 failed; 0 ignored;")
+            for _ in range(15):
                 print("OPC_GTPU_TFT_NOHZ_PROFILE_PROVEN")
                 print("OPC_GTPU_TFT_NOHZ_CAPABILITY_PROVEN")
             print("OPC_GTPU_TFT_NOHZ_BANK_REUSE_PROVEN")
@@ -122,6 +127,9 @@ def fake_command(command, args):
             print("OPC_GTPU_TFT_IPV4_LIVE_PROVEN")
             print("OPC_GTPU_TFT_REMOVAL_FENCE_DEFAULT_PROVEN: offline fixture")
             print("OPC_GTPU_TFT_REMOVAL_CONTINUITY_PROVEN: offline fixture")
+            for marker in FRAGMENT_MARKERS:
+                if marker != state["omit_fragment_marker"]:
+                    print(f"OPC_GTPU_TFT_FRAGMENT_{marker}_PROVEN")
             if state["packet_skip"]:
                 print("skipping: offline negative fixture")
             return finish(state["packet_status"], "packet-proof")
@@ -161,6 +169,7 @@ class GuestRebootTests(unittest.TestCase):
             "setup_status": 0, "reboot_status": 0, "kernel_status": 0,
             "grace_status": 0, "omit_thread_control": False,
             "packet_status": 0, "packet_skip": False, "binary_after_status": 0,
+            "omit_fragment_marker": None,
         }
         state.update(scenario)
         (root / "state.json").write_text(json.dumps(state))
@@ -266,6 +275,14 @@ class GuestRebootTests(unittest.TestCase):
         result, _, logs, _ = self.run_driver(reboot_status=255, packet_skip=True)
         self.assert_refused(result, logs)
         self.assertIn("nohz_full packet proofs skipped", result.stderr)
+
+    def test_changed_boot_requires_every_fragment_marker(self):
+        for marker in FRAGMENT_MARKERS:
+            with self.subTest(marker=marker):
+                result, state, logs, _ = self.run_driver(omit_fragment_marker=marker)
+                self.assert_refused(result, logs)
+                self.assertIn("packet-proof", state["events"])
+                self.assertNotIn("binary-after", state["events"])
 
     def test_changed_boot_requires_final_binary_check(self):
         result, state, logs, _ = self.run_driver(reboot_status=255, binary_after_status=42)

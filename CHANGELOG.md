@@ -34,6 +34,45 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   ordinary APN authorization and peer, session, transaction, and EAP checks
   remain required.
 
+- **Breaking**: `opc-gtpu-dataplane`, `opc-gtpu-ebpf-common`, and
+  `opc-gtpu-dataplane-ebpf`: unmarked inner IPv4 fragments can retain the TFT
+  bearer selected from a fully classifiable first fragment, including ESP
+  selected by its visible protocol and SPI. Bounded affinity preserves the
+  original fragments and binds the decision to the exact interface, PAA,
+  source, destination, protocol, IPv4 ID, classifier owner, owner generation,
+  snapshot generation, and fingerprint. Each fragment still passes the
+  existing downstream peer/F-TEID authority lookup. Under an owned classifier,
+  later fragments with orphan, stale, expired, or ambiguous identities drop
+  and count; overlaps and capacity exhaustion also fail closed. Retained stale
+  entries cannot fall through to a default bearer after removal or replacement.
+  With neither a classifier nor a live affinity entry, prior forwarding
+  behavior remains. The stateless classifier still rejects fragments, and ESP
+  never exposes TCP/UDP ports to TFT matching. The additive public types
+  `TftUplinkFragmentSnapshot` and `TftUplinkFragmentTable` expose the stateful
+  host model. The invalid-state counter now also counts ordinary fragment
+  events such as orphan, expiry, capacity refusal and overlap.
+  The table has 16,384 four-way buckets (65,536 slots), at most 64 fragment
+  ranges per datagram, and a fixed two-second boot-time lifetime. Each range
+  read retains an explicit index bound for enterprise-kernel verification. A full
+  bucket refuses admission without evicting live entries; duplicate first
+  fragments never refresh the deadline. The preallocated kernel value storage
+  costs 24.625 MiB per attachment, excluding map metadata. The new pinned,
+  spin-locked `GTPU_TFT_FRAG` ARRAY advances the current graph from 34 to 35
+  maps and TFT schema from v4 to v5. Current recovery proofs advance from
+  `OPCCURR7` to `OPCCURR8` and the terminal WAL codec from r2 to r3. The r2
+  terminal receipt, transfer checksum and predecessor-basis values also change
+  while their codec IDs remain r2. Retained
+  TFT v4 and partial TFT graphs are refused before attachment mutation, without
+  automatic migration. Upgrade or rollback requires a traffic drain, exact
+  graph cleanup with the version that owns that generation, and fresh
+  attachment under the destination version. Complete pending recovery with
+  its owning version; this does not by itself permit namespace reuse. No
+  conversion is implemented for an incompatible proof, terminal WAL, or
+  finalized receipt that remains after cleanup. Preserve these authority
+  records and use a separate, freshly authorized namespace. See the
+  [upgrade and rollback contract](crates/opc-gtpu-dataplane/README.md#tft-fragment-affinity-upgrade-and-rollback).
+  Frozen shipped-25 recovery recognition is unchanged. Refs #730.
+
 - `opc-linux-xfrm-sys`: correct `XFRMA_SA_DIR` to Linux UAPI attribute 33
   and expose the adjacent timer, NAT keepalive, and per-CPU SA constants.
   `opc-ipsec-xfrm` now recognizes direction-tagged GETSA replies and rejects

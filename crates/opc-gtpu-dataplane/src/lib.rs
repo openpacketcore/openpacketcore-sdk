@@ -59,6 +59,14 @@
 //! Durable proof-last cleanup is idempotently retryable; product code never
 //! receives raw pin-deletion authority.
 //!
+//! Unmarked inner IPv4 TFT fragments use bounded affinity established by a
+//! complete first fragment. [`TftUplinkFragmentSnapshot`] binds a canonical
+//! classifier to its owner and publication generations; retain one
+//! [`TftUplinkFragmentTable`] per attachment across publication changes and
+//! removal. Its selected mark still requires the ordinary exact bearer/F-TEID
+//! authority lookup. The packet-only [`TftUplinkClassifier::classify`] method
+//! continues to reject fragments.
+//!
 //! Raw Linux netlink and socket syscalls stay in [`opc_linux_gtpu_sys`]; this
 //! crate is safe Rust and never performs `unsafe` operations.
 
@@ -223,8 +231,8 @@ pub use selector_namespace_v2::{
 pub use tft_classifier::{
     TftUplinkBearer, TftUplinkClassification, TftUplinkClassificationUnavailableReason,
     TftUplinkClassifier, TftUplinkClassifierReadback, TftUplinkClassifierReconcileOutcome,
-    TftUplinkClassifierRemovalOutcome, TftUplinkDropReason, TftUplinkPaaSet,
-    TFT_UPLINK_IPV6_PAA_PREFIX_LEN,
+    TftUplinkClassifierRemovalOutcome, TftUplinkDropReason, TftUplinkFragmentSnapshot,
+    TftUplinkFragmentTable, TftUplinkPaaSet, TFT_UPLINK_IPV6_PAA_PREFIX_LEN,
 };
 pub use traffic_observation::{
     GtpuTrafficProof, GtpuTrafficProofAuthority, GtpuTrafficProofAuthorityError,

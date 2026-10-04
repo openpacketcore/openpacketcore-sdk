@@ -25,6 +25,10 @@
 //!
 //! Byte layouts live in `opc-gtpu-ebpf-common` and are shared with the
 //! userspace loader in `opc-gtpu-dataplane`.
+//! Unmarked inner IPv4 TFT fragments use a bounded, spin-locked affinity map.
+//! Only a fully classifiable first fragment establishes a mark; later fragments
+//! require the exact datagram and current classifier identity, then pass the
+//! existing bearer/F-TEID authority lookup. No payload reassembly is performed.
 
 #![cfg_attr(not(test), no_std)]
 #![cfg_attr(not(test), no_main)]
@@ -65,7 +69,8 @@ use opc_gtpu_ebpf_common::{
     GtpuSessionAuthorityWireView, GtpuSessionEntryWireView, GtpuSessionGroupPhase,
     GtpuSessionIpFamily, GtpuTrafficObservationDirection, GtpuUplinkMtuPolicy, Ipv4EnvelopeBounds,
     Ipv6ExtensionStep, MarkedDownlinkPdr, TftClassifierFilter, TftClassifierFilterKey,
-    TftClassifierIpv4Packet, TftClassifierKey, TftClassifierMeta, UdpChecksumDisposition,
+    TftClassifierIpv4Packet, TftClassifierKey, TftClassifierMeta, TftFragmentBucket,
+    TftFragmentDisposition, TftFragmentKey, TftIpv4Fragment, UdpChecksumDisposition,
     UdpChecksumEvidence, UdpEnvelopeBounds, UplinkFar, UplinkFarKey, UplinkMtuMapState,
     UplinkPmtuDecision, COUNTER_DL_BINDING_FAMILY_MISMATCH, COUNTER_DL_BINDING_INGRESS_MISMATCH,
     COUNTER_DL_BINDING_INVALID, COUNTER_DL_BINDING_LOCAL_MISMATCH,
@@ -93,9 +98,10 @@ use opc_gtpu_ebpf_common::{
     MARKED_BEARER_OWNER_VALUE_LEN, MARKED_DOWNLINK_PDR_VALUE_LEN, N3_UPLINK_EXTENSION_LEN,
     TFT_CLASSIFIER_COUNTER_SLOTS, TFT_CLASSIFIER_FILTER_MAP_MAX_ENTRIES,
     TFT_CLASSIFIER_MAX_FILTERS, TFT_CLASSIFIER_META_MAP_MAX_ENTRIES,
-    TFT_CLASSIFIER_SCHEMA_VALUE_LEN, UDP_HDR_LEN, UPLINK_DSCP_SCHEMA_MARKER_KEY,
-    UPLINK_DSCP_VALUE_LEN, UPLINK_FAR_VALUE_LEN, UPLINK_MARK_KEY_LEN, UPLINK_PMTU_COUNTER_SLOTS,
-    UPLINK_PMTU_VALUE_LEN, UPLINK_SOURCE_PORT_VALUE_LEN,
+    TFT_CLASSIFIER_SCHEMA_VALUE_LEN, TFT_FRAGMENT_BUCKETS, TFT_FRAGMENT_BUCKET_VALUE_LEN,
+    UDP_HDR_LEN, UPLINK_DSCP_SCHEMA_MARKER_KEY, UPLINK_DSCP_VALUE_LEN, UPLINK_FAR_VALUE_LEN,
+    UPLINK_MARK_KEY_LEN, UPLINK_PMTU_COUNTER_SLOTS, UPLINK_PMTU_VALUE_LEN,
+    UPLINK_SOURCE_PORT_VALUE_LEN,
 };
 use opc_gtpu_ebpf_common::{
     classify_ipv6_extension_step, gtpu_endpoint_requires_extension_control,
@@ -300,6 +306,20 @@ static GTPU_TFT_FILT: HashMap<TftClassifierFilterKey, TftClassifierFilter> =
 /// Bounded fail-closed drop reasons for owned shared-SA classifier packets.
 #[map]
 static GTPU_TFT_DROP: PerCpuArray<u64> = PerCpuArray::pinned(TFT_CLASSIFIER_COUNTER_SLOTS, 0);
+
+/// One top-level BTF lock protects each fixed bucket across all CPUs.
+#[repr(C)]
+struct TftFragmentLockedBucket {
+    lock: BpfSpinLock,
+    bucket: TftFragmentBucket,
+}
+
+const _: [(); TFT_FRAGMENT_BUCKET_VALUE_LEN] =
+    [(); core::mem::size_of::<TftFragmentLockedBucket>()];
+
+#[btf_map]
+static GTPU_TFT_FRAG: BtfArray<TftFragmentLockedBucket, { TFT_FRAGMENT_BUCKETS as usize }> =
+    BtfArray::new();
 
 const IPV4_PROTO_UDP: u8 = 17;
 const IPV4_FRAG_MASK: u16 = 0x3FFF; // MF bit + fragment offset
@@ -1165,7 +1185,7 @@ fn binding_drop(reason: DownlinkBindingMismatch) -> i32 {
         DownlinkBindingMismatch::SourcePort => COUNTER_DL_BINDING_SOURCE_PORT_MISMATCH,
     };
     count_binding_drop(index);
-    TC_ACT_SHOT as i32
+    TC_ACT_SHOT
 }
 
 /// Read the complete Linux packet mark presented to the tc hook.
@@ -1200,13 +1220,15 @@ enum TftClassifierUplinkResult {
 /// Strictly parse the inner IPv4 fields needed by the v1 TFT classifier.
 ///
 /// This runs only after a metadata record owns the exact source PAA. It
-/// rejects every fragment and malformed TCP, UDP, or ESP packet before a
-/// default-bearer decision is possible. Packets for an unowned PAA never take
-/// this parser, retaining the frozen v5 behavior exactly.
+/// rejects malformed TCP, UDP, or ESP before a default-bearer decision is
+/// possible. The ordinary path rejects all fragments; the stateful path can
+/// explicitly admit a fully classifiable first fragment. Packets for an
+/// unowned PAA never take this parser, retaining the frozen v5 behavior exactly.
 #[inline(never)]
 fn parse_owned_tft_ipv4(
     ctx: &TcContext,
     local_address: [u8; 4],
+    first_fragment: bool,
 ) -> Option<TftClassifierIpv4Packet> {
     let available = (ctx.len() as usize).checked_sub(ETH_HDR_LEN)?;
     let version_ihl = ctx.load::<u8>(ETH_HDR_LEN).ok()?;
@@ -1217,7 +1239,12 @@ fn parse_owned_tft_ipv4(
         || header_len < IPV4_MIN_HDR_LEN
         || total_len < header_len
         || total_len != available
-        || !ipv4_owned_tft_fragment_is_unfragmented(fragment)
+        || if first_fragment {
+            !TftIpv4Fragment::from_header(version_ihl, total_len as u16, available, fragment)
+                .is_some_and(TftIpv4Fragment::is_first)
+        } else {
+            !ipv4_owned_tft_fragment_is_unfragmented(fragment)
+        }
     {
         return None;
     }
@@ -1226,6 +1253,7 @@ fn parse_owned_tft_ipv4(
     let remote_address = ctx.load::<[u8; 4]>(ETH_HDR_LEN + 16).ok()?;
     let transport_offset = ETH_HDR_LEN.checked_add(header_len)?;
     let payload_len = total_len.checked_sub(header_len)?;
+    let mut udp_length = 0;
     let (local_port, remote_port) = match protocol {
         6 => {
             if payload_len < 20 {
@@ -1241,10 +1269,16 @@ fn parse_owned_tft_ipv4(
             (Some(local_port), Some(remote_port))
         }
         17 => {
-            if payload_len < UDP_HDR_LEN
-                || usize::from(u16::from_be(ctx.load::<u16>(transport_offset + 4).ok()?))
-                    != payload_len
-            {
+            if payload_len < UDP_HDR_LEN {
+                return None;
+            }
+            let udp_len = usize::from(u16::from_be(ctx.load::<u16>(transport_offset + 4).ok()?));
+            udp_length = udp_len as u16;
+            if if first_fragment {
+                udp_len <= payload_len || udp_len > usize::from(u16::MAX) - header_len
+            } else {
+                udp_len != payload_len
+            } {
                 return None;
             }
             let local_port = u16::from_be(ctx.load::<u16>(transport_offset).ok()?);
@@ -1261,15 +1295,18 @@ fn parse_owned_tft_ipv4(
     } else {
         None
     };
-    Some(TftClassifierIpv4Packet::new(
-        local_address,
-        remote_address,
-        protocol,
-        tos,
-        local_port,
-        remote_port,
-        esp_spi,
-    ))
+    Some(
+        TftClassifierIpv4Packet::new(
+            local_address,
+            remote_address,
+            protocol,
+            tos,
+            local_port,
+            remote_port,
+            esp_spi,
+        )
+        .with_udp_length(udp_length),
+    )
 }
 
 #[repr(C)]
@@ -1347,7 +1384,7 @@ unsafe extern "C" fn classify_tft_filter_step(index: u64, context: *mut c_void) 
         context.invalid = 1;
         return 1;
     };
-    let Some(filter_ptr) = GTPU_TFT_FILT.get_ptr(&filter_key) else {
+    let Some(filter_ptr) = GTPU_TFT_FILT.get_ptr(filter_key) else {
         context.invalid = 1;
         return 1;
     };
@@ -1379,7 +1416,7 @@ unsafe extern "C" fn classify_tft_filter_step(index: u64, context: *mut c_void) 
 /// never race post-publication record cleanup. A removal fence whose
 /// classifier has a default bearer classifies as absent, the state its
 /// removal publishes last; any other fence drops.
-#[inline(never)]
+#[inline(always)]
 fn classify_owned_tft_uplink(ctx: &TcContext) -> TftClassifierUplinkResult {
     let Ok(local_address) = ctx.load::<[u8; 4]>(ETH_HDR_LEN + 12) else {
         return TftClassifierUplinkResult::Absent;
@@ -1387,16 +1424,46 @@ fn classify_owned_tft_uplink(ctx: &TcContext) -> TftClassifierUplinkResult {
     let Some(key) = TftClassifierKey::new(packet_ifindex(ctx), local_address) else {
         return TftClassifierUplinkResult::Absent;
     };
-    let Some(meta_ptr) = GTPU_TFT_META.get_ptr(&key) else {
+    let meta_ptr = GTPU_TFT_META.get_ptr(key);
+    let fragment = u16::from_be(ctx.load::<u16>(ETH_HDR_LEN + 6).unwrap_or(0));
+    // Even absent or removing metadata must consult a retained fragment key
+    // before default fallback. Raw fixed fields locate malformed stale tails.
+    if fragment & IPV4_FRAG_MASK != 0 {
+        return classify_tft_fragment(ctx, key, meta_ptr);
+    }
+    classify_tft_unfragmented(ctx, key, meta_ptr)
+}
+
+// A preallocated hash-map element may be recycled by a subsequent publication.
+// Copy it once before validation and never borrow its live bytes across helpers.
+#[inline(always)]
+unsafe fn snapshot_tft_metadata(ptr: *const TftClassifierMeta) -> TftClassifierMeta {
+    // SAFETY: hash-map value storage is eight-byte aligned. Both layouts are
+    // exactly 72 bytes and metadata contains only byte fields, so every bit
+    // pattern is representable (canonicality is checked after the snapshot).
+    // Nine volatile word reads avoid 72 live byte temporaries in BPF while
+    // materializing the snapshot before later helper invocations.
+    let words = unsafe { ptr.cast::<[u64; 9]>().read_volatile() };
+    unsafe { core::mem::transmute::<[u64; 9], TftClassifierMeta>(words) }
+}
+
+// Keep ordinary packet storage out of the fragment call chain under the
+// kernel's combined stack bound. The tiny dispatcher can inline into uplink.
+#[inline(never)]
+fn classify_tft_unfragmented(
+    ctx: &TcContext,
+    key: TftClassifierKey,
+    meta_ptr: Option<*const TftClassifierMeta>,
+) -> TftClassifierUplinkResult {
+    let Some(meta_ptr) = meta_ptr else {
         return TftClassifierUplinkResult::Absent;
     };
     let Some(schema_ptr) = GTPU_TFT_SCHEMA.get_ptr(0) else {
         count_tft_classifier_drop(COUNTER_TFT_CLASSIFIER_INVALID_STATE);
         return TftClassifierUplinkResult::Drop;
     };
-    // SAFETY: hash-map values are retained by the kernel for this invocation;
-    // the all-byte ABI has alignment one and userspace publishes whole values.
-    let meta = unsafe { *meta_ptr };
+    // SAFETY: this invocation holds the map value; retain one local snapshot.
+    let meta = unsafe { snapshot_tft_metadata(meta_ptr) };
     // SAFETY: the single-slot marker is read-only for this invocation.
     if !tft_classifier_schema_is_current(unsafe { &*schema_ptr }) {
         count_tft_classifier_drop(COUNTER_TFT_CLASSIFIER_INVALID_STATE);
@@ -1412,14 +1479,35 @@ fn classify_owned_tft_uplink(ctx: &TcContext) -> TftClassifierUplinkResult {
         count_tft_classifier_drop(COUNTER_TFT_CLASSIFIER_INVALID_STATE);
         return TftClassifierUplinkResult::Drop;
     }
-    let Some(packet) = parse_owned_tft_ipv4(ctx, local_address) else {
+    let Some(packet) = parse_owned_tft_ipv4(ctx, key.paa(), false) else {
         count_tft_classifier_drop(COUNTER_TFT_CLASSIFIER_MALFORMED);
         return TftClassifierUplinkResult::Drop;
     };
+    let decision = classify_tft_packet(key, &meta, &packet);
+    if decision == TFT_CLASSIFIER_DROP_DECISION {
+        TftClassifierUplinkResult::Drop
+    } else {
+        TftClassifierUplinkResult::Selected(decision as u32)
+    }
+}
+
+// All u32 marks, including default zero, are valid decisions. A scalar sentinel
+// keeps failure fully initialized across BPF subprogram calls; a Rust enum's
+// unused mark payload need not be initialized on its Drop variant.
+const TFT_CLASSIFIER_DROP_DECISION: u64 = 1_u64 << 32;
+
+/// Match an already parsed packet without retaining fragment data in the
+/// callback frame. The ordinary stateless path and fragment-zero path share it.
+#[inline(never)]
+fn classify_tft_packet(
+    key: TftClassifierKey,
+    meta: &TftClassifierMeta,
+    packet: &TftClassifierIpv4Packet,
+) -> u64 {
     let mut loop_context = TftClassifierLoopContext {
         key,
-        meta,
-        packet,
+        meta: *meta,
+        packet: *packet,
         matched: 0,
         invalid: 0,
         selected_rank: 0,
@@ -1430,7 +1518,7 @@ fn classify_owned_tft_uplink(ctx: &TcContext) -> TftClassifierUplinkResult {
     // call. Its fixed whole-classifier iteration bound matches the map ABI.
     let performed = unsafe {
         bpf_loop(
-            u32::from(meta.filter_count()),
+            u32::from(loop_context.meta.filter_count()),
             classify_tft_filter_step as *mut c_void,
             (&mut loop_context as *mut TftClassifierLoopContext).cast(),
             0,
@@ -1438,25 +1526,164 @@ fn classify_owned_tft_uplink(ctx: &TcContext) -> TftClassifierUplinkResult {
     };
     if performed < 0 || loop_context.invalid != 0 {
         count_tft_classifier_drop(COUNTER_TFT_CLASSIFIER_INVALID_STATE);
-        return TftClassifierUplinkResult::Drop;
+        return TFT_CLASSIFIER_DROP_DECISION;
     }
     match loop_context.matched {
-        1 => match selected_tft_classifier_mark(key, &meta, loop_context.selected_rank) {
-            Some(mark) => TftClassifierUplinkResult::Selected(mark),
-            None => {
-                count_tft_classifier_drop(COUNTER_TFT_CLASSIFIER_INVALID_STATE);
-                TftClassifierUplinkResult::Drop
+        1 => {
+            match selected_tft_classifier_mark(key, &loop_context.meta, loop_context.selected_rank)
+            {
+                Some(mark) => u64::from(mark),
+                None => {
+                    count_tft_classifier_drop(COUNTER_TFT_CLASSIFIER_INVALID_STATE);
+                    TFT_CLASSIFIER_DROP_DECISION
+                }
             }
-        },
-        0 if meta.has_default() => TftClassifierUplinkResult::Selected(0),
+        }
+        0 if loop_context.meta.has_default() => 0,
         0 => {
             count_tft_classifier_drop(COUNTER_TFT_CLASSIFIER_NO_MATCH);
-            TftClassifierUplinkResult::Drop
+            TFT_CLASSIFIER_DROP_DECISION
         }
         _ => {
             count_tft_classifier_drop(COUNTER_TFT_CLASSIFIER_INVALID_STATE);
+            TFT_CLASSIFIER_DROP_DECISION
+        }
+    }
+}
+
+/// Classify or recover a bounded fragment decision before any default lookup.
+#[inline(never)]
+fn classify_tft_fragment(
+    ctx: &TcContext,
+    key: TftClassifierKey,
+    meta_ptr: Option<*const TftClassifierMeta>,
+) -> TftClassifierUplinkResult {
+    // Load the fixed envelope once, independently of IHL/length/flag validity.
+    // A single initialized block avoids both dead Option payloads across
+    // helper calls and multiplying verifier paths for each scalar read.
+    let Ok(header) = ctx.load::<[u8; IPV4_MIN_HDR_LEN]>(ETH_HDR_LEN) else {
+        if meta_ptr.is_some() {
+            count_tft_classifier_drop(COUNTER_TFT_CLASSIFIER_MALFORMED);
+            return TftClassifierUplinkResult::Drop;
+        }
+        return TftClassifierUplinkResult::Absent;
+    };
+    // SAFETY: this invocation holds the map value. This one captured snapshot
+    // supplies validation, matching and the identity recorded under the lock.
+    let meta = meta_ptr.map(|ptr| unsafe { snapshot_tft_metadata(ptr) });
+    let active = if let Some(meta) = meta.as_ref() {
+        let Some(schema) = GTPU_TFT_SCHEMA.get_ptr(0) else {
+            count_tft_classifier_drop(COUNTER_TFT_CLASSIFIER_INVALID_STATE);
+            return TftClassifierUplinkResult::Drop;
+        };
+        // SAFETY: the schema array slot remains live and immutable here.
+        if !tft_classifier_schema_is_current(unsafe { &*schema }) {
+            count_tft_classifier_drop(COUNTER_TFT_CLASSIFIER_INVALID_STATE);
+            return TftClassifierUplinkResult::Drop;
+        }
+        if meta.is_valid() {
+            Some(meta)
+        } else if meta.has_default() && meta.is_valid_removal_fence() {
+            None
+        } else {
+            count_tft_classifier_drop(COUNTER_TFT_CLASSIFIER_INVALID_STATE);
+            return TftClassifierUplinkResult::Drop;
+        }
+    } else {
+        None
+    };
+    let packet = if active.is_some() && u16::from_be_bytes([header[6], header[7]]) & 0x1fff == 0 {
+        parse_owned_tft_ipv4(ctx, key.paa(), true)
+    } else {
+        None
+    };
+    let first_decision = match (active, packet.as_ref()) {
+        (Some(meta), Some(packet)) => classify_tft_packet(key, meta, packet),
+        _ => TFT_CLASSIFIER_DROP_DECISION,
+    };
+    let classification_failed =
+        active.is_some() && packet.is_some() && first_decision == TFT_CLASSIFIER_DROP_DECISION;
+    // All helpers, packet reads, metadata reads and map lookups precede locking.
+    let now = unsafe { bpf_ktime_get_boot_ns() };
+    let disposition = apply_tft_fragment_affinity(&TftFragmentApplyContext {
+        key,
+        header: &header,
+        available: (ctx.len() as usize).saturating_sub(ETH_HDR_LEN),
+        meta: active,
+        first_packet: packet.as_ref(),
+        first_decision,
+        now,
+    });
+    if classification_failed {
+        // The matcher already counted NoMatch or InvalidState. The bucket
+        // still saw the failed first decision so an old key was poisoned.
+        return TftClassifierUplinkResult::Drop;
+    }
+    match disposition {
+        TftFragmentDisposition::Absent => TftClassifierUplinkResult::Absent,
+        TftFragmentDisposition::Selected(mark) => TftClassifierUplinkResult::Selected(mark),
+        TftFragmentDisposition::Malformed => {
+            count_tft_classifier_drop(COUNTER_TFT_CLASSIFIER_MALFORMED);
             TftClassifierUplinkResult::Drop
         }
+        TftFragmentDisposition::Drop => {
+            count_tft_classifier_drop(COUNTER_TFT_CLASSIFIER_INVALID_STATE);
+            TftClassifierUplinkResult::Drop
+        }
+    }
+}
+
+/// Borrow packet and captured metadata storage while applying the bounded
+/// transition. All packet helpers precede locking.
+struct TftFragmentApplyContext<'a> {
+    key: TftClassifierKey,
+    header: &'a [u8; IPV4_MIN_HDR_LEN],
+    available: usize,
+    meta: Option<&'a TftClassifierMeta>,
+    first_packet: Option<&'a TftClassifierIpv4Packet>,
+    first_decision: u64,
+    now: u64,
+}
+
+#[inline(never)]
+fn apply_tft_fragment_affinity(context: &TftFragmentApplyContext<'_>) -> TftFragmentDisposition {
+    // Borrow the fixed envelope instead of retaining its individual byte
+    // scalars across classifier helpers in the caller's verifier frame.
+    let header = context.header;
+    let key = TftFragmentKey::new(
+        context.key,
+        context.key.paa(),
+        [header[16], header[17], header[18], header[19]],
+        header[9],
+        u16::from_be_bytes([header[4], header[5]]),
+    );
+    let fragment = TftIpv4Fragment::from_header(
+        header[0],
+        u16::from_be_bytes([header[2], header[3]]),
+        context.available,
+        u16::from_be_bytes([header[6], header[7]]),
+    );
+    let Some(bucket) = GTPU_TFT_FRAG.get_ptr_mut(key.bucket()) else {
+        return TftFragmentDisposition::Drop;
+    };
+    // SAFETY: this stable array value is never replaced or deleted. The lock
+    // covers all key, expiry, identity and range checks and in-place mutations.
+    // apply is forced inline and performs no helper/BPF calls. Every path
+    // unlocks before counters or forwarding authority are consulted.
+    unsafe {
+        bpf_spin_lock(&mut (*bucket).lock);
+        let result = (*bucket).bucket.apply(
+            key,
+            fragment,
+            context.meta,
+            context
+                .first_packet
+                .filter(|_| context.first_decision != TFT_CLASSIFIER_DROP_DECISION)
+                .map(|packet| (packet, context.first_decision as u32)),
+            context.now,
+        );
+        bpf_spin_unlock(&mut (*bucket).lock);
+        result
     }
 }
 
@@ -3112,7 +3339,8 @@ pub fn opc_gtpu_uplink(mut ctx: TcContext) -> i32 {
     if !traffic_gate_allows_packet_effects() {
         return TC_ACT_OK;
     }
-    let mark = packet_mark(&ctx);
+    let mut mark = packet_mark(&ctx);
+    let incoming_mark = mark;
     let Ok(eth_proto) = ctx.load::<u16>(12) else {
         return non_encapsulation_action(mark);
     };
@@ -3129,9 +3357,43 @@ pub fn opc_gtpu_uplink(mut ctx: TcContext) -> i32 {
     }
     clear_unmatched_grouped_uplink_observation_stamp(&ctx);
 
+    // Classify in this small frame: retaining a metadata snapshot in the
+    // ordinary encapsulation call chain would exceed the combined stack bound.
+    match eth_proto {
+        ETH_P_IPV4 => {
+            let version_ihl: u8 = match ctx.load(ETH_HDR_LEN) {
+                Ok(value) => value,
+                Err(_) => return non_encapsulation_action(mark),
+            };
+            if version_ihl >> 4 != 4 {
+                return non_encapsulation_action(mark);
+            }
+
+            // A shared-SA classifier owns an unmarked, valid IPv4 PAA before
+            // any grouped/default selector can choose an entry for mark zero.
+            // A selected nonzero mark is made visible to both later lookup
+            // paths; absent metadata leaves the frozen behavior unchanged.
+            if mark == 0 {
+                match classify_owned_tft_uplink(&ctx) {
+                    TftClassifierUplinkResult::Absent => {}
+                    TftClassifierUplinkResult::Selected(selected_mark) => {
+                        mark = selected_mark;
+                        if mark != 0 {
+                            ctx.set_mark(mark);
+                        }
+                    }
+                    TftClassifierUplinkResult::Drop => return TC_ACT_SHOT,
+                }
+            }
+        }
+        // IPv6 has no TFT classifier and retains its grouped-only path.
+        ETH_P_IPV6 => {}
+        _ => return non_encapsulation_action(mark),
+    }
+
     match try_uplink(&mut ctx, mark, eth_proto) {
         Ok(action) => action,
-        Err(()) => non_encapsulation_action(mark),
+        Err(()) => non_encapsulation_action(incoming_mark),
     }
 }
 
@@ -3184,36 +3446,7 @@ pub fn opc_gtpu_downlink(mut ctx: TcContext) -> i32 {
 /// `src = UE PAA`. Prepend `[outer IPv4][UDP][GTPv1-U]` and re-resolve the
 /// L2 next hop for the new outer destination.
 #[inline(never)]
-fn try_uplink(ctx: &mut TcContext, mut mark: u32, eth_proto: u16) -> Result<i32, ()> {
-    match eth_proto {
-        ETH_P_IPV4 => {
-            let version_ihl: u8 = ctx.load(ETH_HDR_LEN).map_err(|_| ())?;
-            if version_ihl >> 4 != 4 {
-                return Ok(non_encapsulation_action(mark));
-            }
-
-            // A shared-SA classifier owns an unmarked, valid IPv4 PAA before
-            // any grouped/default selector can choose an entry for mark zero.
-            // A selected nonzero mark is made visible to both later lookup
-            // paths; absent metadata leaves the frozen behavior unchanged.
-            if mark == 0 {
-                match classify_owned_tft_uplink(ctx) {
-                    TftClassifierUplinkResult::Absent => {}
-                    TftClassifierUplinkResult::Selected(selected_mark) => {
-                        mark = selected_mark;
-                        if mark != 0 {
-                            ctx.set_mark(mark);
-                        }
-                    }
-                    TftClassifierUplinkResult::Drop => return Ok(TC_ACT_SHOT as i32),
-                }
-            }
-        }
-        // IPv6 has no TFT classifier and retains its grouped-only path.
-        ETH_P_IPV6 => {}
-        _ => return Ok(non_encapsulation_action(mark)),
-    }
-
+fn try_uplink(ctx: &mut TcContext, mark: u32, eth_proto: u16) -> Result<i32, ()> {
     // This is intentionally after the classifier. A grouped default entry
     // must not observe an originally unmarked shared-SA packet before TFT can
     // select its dedicated bearer mark.
@@ -3263,9 +3496,9 @@ fn try_legacy_uplink(ctx: &mut TcContext, mark: u32, eth_proto: u16) -> Result<i
     }
     .encode();
     let far_ptr = if mark == 0 {
-        GTPU_UPLINK_FAR.get_ptr(&inner_src)
+        GTPU_UPLINK_FAR.get_ptr(inner_src)
     } else {
-        GTPU_ULM_FAR.get_ptr(&marked_key)
+        GTPU_ULM_FAR.get_ptr(marked_key)
     };
     let Some(far_ptr) = far_ptr else {
         count(COUNTER_UL_FAR_MISS);
@@ -3279,7 +3512,7 @@ fn try_legacy_uplink(ctx: &mut TcContext, mark: u32, eth_proto: u16) -> Result<i
             // Marked journals bind a concrete complete FAR. The zero-source
             // compatibility fallback is retained only for legacy/default
             // records migrated from the v1 object.
-            return Ok(TC_ACT_SHOT as i32);
+            return Ok(TC_ACT_SHOT);
         }
         if let Some(local_ip) = GTPU_CONFIG.get_ptr(0) {
             // SAFETY: single-slot array value written only by the loader.
@@ -3290,15 +3523,15 @@ fn try_legacy_uplink(ctx: &mut TcContext, mark: u32, eth_proto: u16) -> Result<i
     let inner_len = (ctx.len() as usize).saturating_sub(ETH_HDR_LEN);
     let inner_len = u16::try_from(inner_len).map_err(|_| ())?;
     let dscp_ptr = if mark == 0 {
-        GTPU_UPLINK_DSCP.get_ptr(&inner_src)
+        GTPU_UPLINK_DSCP.get_ptr(inner_src)
     } else {
-        GTPU_ULM_DSCP.get_ptr(&marked_key)
+        GTPU_ULM_DSCP.get_ptr(marked_key)
     };
     let dscp_wire = if let Some(dscp_ptr) = dscp_ptr {
         // SAFETY: the map value outlives this invocation and is read only.
         let value = unsafe { (*dscp_ptr)[0] };
         if value > 63 {
-            return Ok(TC_ACT_SHOT as i32);
+            return Ok(TC_ACT_SHOT);
         }
         value
     } else {
@@ -3310,63 +3543,63 @@ fn try_legacy_uplink(ctx: &mut TcContext, mark: u32, eth_proto: u16) -> Result<i
         Some(dscp_wire)
     };
     let sport_ptr = if mark == 0 {
-        GTPU_UL_SPORT.get_ptr(&inner_src)
+        GTPU_UL_SPORT.get_ptr(inner_src)
     } else {
-        GTPU_ULM_SPORT.get_ptr(&marked_key)
+        GTPU_ULM_SPORT.get_ptr(marked_key)
     };
     let Some(sport_ptr) = sport_ptr else {
         // Every committed v4 bearer owns one explicit policy entry, including
         // legacy 2152. Absence is durable-state corruption, never an implicit
         // policy transition.
-        return Ok(TC_ACT_SHOT as i32);
+        return Ok(TC_ACT_SHOT);
     };
     // SAFETY: the map value outlives this invocation and is read only.
     let commit = unsafe { &*sport_ptr };
     let local_teid = [commit[0], commit[1], commit[2], commit[3]];
     if mark == 0 {
-        if GTPU_DLM_PDR.get_ptr(&local_teid).is_some() {
-            return Ok(TC_ACT_SHOT as i32);
+        if GTPU_DLM_PDR.get_ptr(local_teid).is_some() {
+            return Ok(TC_ACT_SHOT);
         }
-        let Some(pdr_ptr) = GTPU_DOWNLINK_PDR.get_ptr(&local_teid) else {
-            return Ok(TC_ACT_SHOT as i32);
+        let Some(pdr_ptr) = GTPU_DOWNLINK_PDR.get_ptr(local_teid) else {
+            return Ok(TC_ACT_SHOT);
         };
         // SAFETY: the map value remains map-owned and read-only for this
         // complete-graph comparison.
         if DownlinkPdr::decode(unsafe { &*pdr_ptr }).ue_ip != inner_src {
-            return Ok(TC_ACT_SHOT as i32);
+            return Ok(TC_ACT_SHOT);
         }
     } else {
-        if GTPU_DOWNLINK_PDR.get_ptr(&local_teid).is_some() {
-            return Ok(TC_ACT_SHOT as i32);
+        if GTPU_DOWNLINK_PDR.get_ptr(local_teid).is_some() {
+            return Ok(TC_ACT_SHOT);
         }
-        let Some(pdr_ptr) = GTPU_DLM_PDR.get_ptr(&local_teid) else {
-            return Ok(TC_ACT_SHOT as i32);
+        let Some(pdr_ptr) = GTPU_DLM_PDR.get_ptr(local_teid) else {
+            return Ok(TC_ACT_SHOT);
         };
         // SAFETY: the map value remains map-owned and read-only for this
         // complete-graph comparison.
         let pdr = MarkedDownlinkPdr::decode(unsafe { &*pdr_ptr });
         if pdr.ue_ip != inner_src || pdr.bearer_mark != mark.to_be_bytes() {
-            return Ok(TC_ACT_SHOT as i32);
+            return Ok(TC_ACT_SHOT);
         }
     }
-    let Some(binding_ptr) = GTPU_DL_BIND.get_ptr(&local_teid) else {
-        return Ok(TC_ACT_SHOT as i32);
+    let Some(binding_ptr) = GTPU_DL_BIND.get_ptr(local_teid) else {
+        return Ok(TC_ACT_SHOT);
     };
     // SAFETY: the map value remains map-owned and read-only. An Active commit
     // authorizes uplink encapsulation only while every live component in both
     // directions still matches the same record.
     let binding = unsafe { &*binding_ptr };
     if !pdp_commit_wire_authorizes_graph(commit, local_teid, &far, dscp_wire, binding) {
-        return Ok(TC_ACT_SHOT as i32);
+        return Ok(TC_ACT_SHOT);
     }
     if mark != 0 {
         // Re-fetch immediately before authorization instead of carrying a map
         // pointer across the intervening graph checks. The verifier must see
         // this exact lookup provenance at the subprogram boundary, and a
         // concurrent owner removal must fail closed in either case.
-        let Some(owner_ptr) = GTPU_M_OWNER.get_ptr(&marked_key) else {
+        let Some(owner_ptr) = GTPU_M_OWNER.get_ptr(marked_key) else {
             count(COUNTER_UL_FAR_MISS);
-            return Ok(TC_ACT_SHOT as i32);
+            return Ok(TC_ACT_SHOT);
         };
         // SAFETY: the owner remains map-owned and read-only. Both halves are
         // checked so an inconsistent owner/commit pair cannot authorize one
@@ -3375,7 +3608,7 @@ fn try_legacy_uplink(ctx: &mut TcContext, mark: u32, eth_proto: u16) -> Result<i
         if !marked_owner_wire_authorizes_uplink(owner, &far, dscp_wire)
             || !marked_owner_wire_authorizes_downlink(owner, local_teid, binding)
         {
-            return Ok(TC_ACT_SHOT as i32);
+            return Ok(TC_ACT_SHOT);
         }
     }
     let source_port = u16::from_be_bytes([commit[64], commit[65]]);
@@ -3396,7 +3629,7 @@ fn try_legacy_uplink(ctx: &mut TcContext, mark: u32, eth_proto: u16) -> Result<i
                 // unchecked encapsulation. This counter is a canary for
                 // external writers and never moves in normal operation.
                 count_pmtu_drop(COUNTER_UL_PMTU_CORRUPT);
-                return Ok(TC_ACT_SHOT as i32);
+                return Ok(TC_ACT_SHOT);
             }
             UplinkMtuMapState::Configured(policy)
                 if policy.fragmentation() == GtpuOuterFragmentPolicy::SignalPacketTooBig =>
@@ -3406,7 +3639,7 @@ fn try_legacy_uplink(ctx: &mut TcContext, mark: u32, eth_proto: u16) -> Result<i
                     // unencapsulated and the encapsulation never silently
                     // exceeds the effective link MTU.
                     count_pmtu_drop(COUNTER_UL_MTU_REJECT);
-                    return Ok(TC_ACT_SHOT as i32);
+                    return Ok(TC_ACT_SHOT);
                 }
             }
             UplinkMtuMapState::Configured(_) => {
@@ -3414,7 +3647,7 @@ fn try_legacy_uplink(ctx: &mut TcContext, mark: u32, eth_proto: u16) -> Result<i
                 // Treat an out-of-band writer like corrupt state and drop all
                 // packets until userspace restores an executable policy.
                 count_pmtu_drop(COUNTER_UL_PMTU_CORRUPT);
-                return Ok(TC_ACT_SHOT as i32);
+                return Ok(TC_ACT_SHOT);
             }
         }
     }
@@ -3454,23 +3687,23 @@ fn try_legacy_uplink(ctx: &mut TcContext, mark: u32, eth_proto: u16) -> Result<i
     if ret == i64::from(TC_ACT_REDIRECT) {
         Ok(ret as i32)
     } else {
-        Ok(TC_ACT_SHOT as i32)
+        Ok(TC_ACT_SHOT)
     }
 }
 
 #[inline(always)]
 fn non_encapsulation_action(mark: u32) -> i32 {
     if uplink_non_encapsulation_drops(mark) {
-        TC_ACT_SHOT as i32
+        TC_ACT_SHOT
     } else {
-        TC_ACT_OK as i32
+        TC_ACT_OK
     }
 }
 
 #[inline(always)]
 fn malformed_downlink() -> i32 {
     count(COUNTER_DL_MALFORMED);
-    TC_ACT_SHOT as i32
+    TC_ACT_SHOT
 }
 
 // Keep checksum callback overhead bounded without turning a maximum-length
@@ -4227,14 +4460,12 @@ fn downlink_inner_hand_off_port(
     let Ok(flags_fragment) = ctx.load::<u16>(payload_offset + 6) else {
         return 0;
     };
-    match downlink_ipv4_hand_off_port(
+    downlink_ipv4_hand_off_port(
         mtu,
         u16::from_be(total_length),
         u16::from_be(flags_fragment),
-    ) {
-        Some(port) => port,
-        None => 0,
-    }
+    )
+    .unwrap_or_default()
 }
 
 /// Steer one authorized G-PDU, undecapsulated, to the backend-owned queue on
@@ -4259,9 +4490,9 @@ fn hand_off_to_backend_queue(ctx: &mut TcContext, l4_offset: usize, port: u16) -
         || ctx.store(l4_offset + 2, &to, 0).is_err()
     {
         count(COUNTER_DL_MALFORMED);
-        return TC_ACT_SHOT as i32;
+        return TC_ACT_SHOT;
     }
-    TC_ACT_OK as i32
+    TC_ACT_OK
 }
 
 /// Authorize the complete downlink forwarding identity and perform decap.
@@ -4277,11 +4508,11 @@ fn authorize_and_decap_legacy_downlink(
     l4_offset: usize,
     payload_offset: usize,
 ) -> i32 {
-    let legacy_pdr = GTPU_DOWNLINK_PDR.get_ptr(&teid);
-    let marked_pdr = GTPU_DLM_PDR.get_ptr(&teid);
+    let legacy_pdr = GTPU_DOWNLINK_PDR.get_ptr(teid);
+    let marked_pdr = GTPU_DLM_PDR.get_ptr(teid);
     let (pdr, output_mark, owner_selector) = match (legacy_pdr, marked_pdr) {
         (None, None) => {
-            if GTPU_DL_BIND.get_ptr(&teid).is_some() {
+            if GTPU_DL_BIND.get_ptr(teid).is_some() {
                 // A partially removed graph is not an unowned tunnel. Keep
                 // its retained binding fail-closed until reconciliation.
                 return binding_drop(DownlinkBindingMismatch::Invalid);
@@ -4293,7 +4524,7 @@ fn authorize_and_decap_legacy_downlink(
             // corrupted duplicate ownership as malformed rather than picking
             // a bearer nondeterministically.
             count(COUNTER_DL_MALFORMED);
-            return TC_ACT_SHOT as i32;
+            return TC_ACT_SHOT;
         }
         (Some(pdr_ptr), None) => {
             // SAFETY: the map value outlives this program invocation and is
@@ -4315,7 +4546,7 @@ fn authorize_and_decap_legacy_downlink(
             if pdr.bearer_mark == [0; 4] {
                 // Mark zero belongs exclusively to the legacy/default map.
                 count(COUNTER_DL_MALFORMED);
-                return TC_ACT_SHOT as i32;
+                return TC_ACT_SHOT;
             }
             let selector = UplinkFarKey {
                 ue_ip: pdr.ue_ip,
@@ -4326,9 +4557,9 @@ fn authorize_and_decap_legacy_downlink(
         }
     };
 
-    let Some(binding_ptr) = GTPU_DL_BIND.get_ptr(&teid) else {
+    let Some(binding_ptr) = GTPU_DL_BIND.get_ptr(teid) else {
         count_binding_drop(COUNTER_DL_BINDING_INVALID);
-        return TC_ACT_SHOT as i32;
+        return TC_ACT_SHOT;
     };
     // SAFETY: the hash value remains map-owned for this invocation and is
     // read only by the allocation-free wire validators below.
@@ -4352,7 +4583,7 @@ fn authorize_and_decap_legacy_downlink(
         return binding_drop(reason);
     }
     if let Some(selector) = owner_selector {
-        let Some(owner_ptr) = GTPU_M_OWNER.get_ptr(&selector) else {
+        let Some(owner_ptr) = GTPU_M_OWNER.get_ptr(selector) else {
             return binding_drop(DownlinkBindingMismatch::Invalid);
         };
         // SAFETY: both map values remain map-owned and read-only for this
@@ -4363,17 +4594,17 @@ fn authorize_and_decap_legacy_downlink(
         }
     }
     let commit_ptr = if let Some(selector) = owner_selector {
-        GTPU_ULM_SPORT.get_ptr(&selector)
+        GTPU_ULM_SPORT.get_ptr(selector)
     } else {
-        GTPU_UL_SPORT.get_ptr(&pdr.ue_ip)
+        GTPU_UL_SPORT.get_ptr(pdr.ue_ip)
     };
     let Some(commit_ptr) = commit_ptr else {
         return binding_drop(DownlinkBindingMismatch::Invalid);
     };
     let far_ptr = if let Some(selector) = owner_selector {
-        GTPU_ULM_FAR.get_ptr(&selector)
+        GTPU_ULM_FAR.get_ptr(selector)
     } else {
-        GTPU_UPLINK_FAR.get_ptr(&pdr.ue_ip)
+        GTPU_UPLINK_FAR.get_ptr(pdr.ue_ip)
     };
     let Some(far_ptr) = far_ptr else {
         return binding_drop(DownlinkBindingMismatch::Invalid);
@@ -4382,9 +4613,9 @@ fn authorize_and_decap_legacy_downlink(
     // complete-graph comparison.
     let far = UplinkFar::decode(unsafe { &*far_ptr });
     let dscp_ptr = if let Some(selector) = owner_selector {
-        GTPU_ULM_DSCP.get_ptr(&selector)
+        GTPU_ULM_DSCP.get_ptr(selector)
     } else {
-        GTPU_UPLINK_DSCP.get_ptr(&pdr.ue_ip)
+        GTPU_UPLINK_DSCP.get_ptr(pdr.ue_ip)
     };
     let dscp_wire = if let Some(dscp_ptr) = dscp_ptr {
         // SAFETY: the map value remains map-owned and is read only.
@@ -4407,19 +4638,19 @@ fn authorize_and_decap_legacy_downlink(
 
     let Ok(inner_version_ihl) = ctx.load::<u8>(payload_offset) else {
         count(COUNTER_DL_MALFORMED);
-        return TC_ACT_SHOT as i32;
+        return TC_ACT_SHOT;
     };
     if inner_version_ihl >> 4 != 4 {
         count(COUNTER_DL_MALFORMED);
-        return TC_ACT_SHOT as i32;
+        return TC_ACT_SHOT;
     }
     let Ok(inner_dst) = ctx.load::<[u8; 4]>(payload_offset + 16) else {
         count(COUNTER_DL_MALFORMED);
-        return TC_ACT_SHOT as i32;
+        return TC_ACT_SHOT;
     };
     if inner_dst != pdr.ue_ip {
         count(COUNTER_DL_DST_MISMATCH);
-        return TC_ACT_SHOT as i32;
+        return TC_ACT_SHOT;
     }
     let hand_off_port = downlink_inner_hand_off_port(ctx, commit, payload_offset);
     if hand_off_port != 0 {
@@ -4452,13 +4683,13 @@ fn authorize_and_decap_legacy_downlink(
         .is_err()
     {
         count(COUNTER_DL_MALFORMED);
-        return TC_ACT_SHOT as i32;
+        return TC_ACT_SHOT;
     }
     // This boundary owns the complete mark. Zero is the authoritative
     // default bearer; a nonzero value selects one exact dedicated Child SA.
     ctx.set_mark(output_mark);
     count(COUNTER_DL_DECAP);
-    TC_ACT_OK as i32
+    TC_ACT_OK
 }
 
 #[cfg(test)]
@@ -5814,7 +6045,7 @@ mod tests {
             .expect("non-re-entry paths clear only matching internal stamps");
         assert!(reentry < emit);
         assert!(emit < clear);
-        assert!(ordinary.starts_with("ctx: &mut TcContext, mut mark: u32, eth_proto: u16)"));
+        assert!(ordinary.starts_with("ctx: &mut TcContext, mark: u32, eth_proto: u16)"));
         assert!(!ordinary.contains("emit_grouped_uplink_observation_on_reentry"));
     }
 
@@ -5997,7 +6228,7 @@ mod tests {
             (
                 "pub fn opc_gtpu_uplink(mut ctx: TcContext) -> i32",
                 "#[classifier]\npub fn opc_gtpu_downlink",
-                "let mark = packet_mark(&ctx);",
+                "let mut mark = packet_mark(&ctx);",
             ),
             (
                 "pub fn opc_gtpu_downlink(mut ctx: TcContext) -> i32",
@@ -6056,13 +6287,13 @@ mod tests {
         let ordinary = classifier_root
             .find("match try_uplink(&mut ctx, mark, eth_proto)")
             .expect("ordinary uplink path is called after re-entry handling");
-        let classifier = uplink
-            .find("match classify_owned_tft_uplink(ctx)")
+        let classifier = classifier_root
+            .find("match classify_owned_tft_uplink(&ctx)")
             .expect("TFT classifier is present");
-        let selected_mark = uplink
+        let selected_mark = classifier_root
             .find("mark = selected_mark;")
             .expect("selected TFT mark feeds later lookups");
-        let persisted_mark = uplink
+        let persisted_mark = classifier_root
             .find("ctx.set_mark(mark);")
             .expect("selected TFT mark is written");
         let grouped = uplink
@@ -6072,21 +6303,39 @@ mod tests {
             .find("let far_ptr = if mark == 0")
             .expect("legacy FAR lookup is present");
 
-        assert!(redirect < ordinary);
+        assert!(redirect < classifier);
         assert!(classifier < selected_mark);
         assert!(selected_mark < persisted_mark);
-        assert!(persisted_mark < grouped);
+        assert!(persisted_mark < ordinary);
         assert!(grouped < legacy);
-        assert!(uplink.contains("TftClassifierUplinkResult::Absent => {}"));
-        assert!(uplink.contains("TftClassifierUplinkResult::Drop => return Ok(TC_ACT_SHOT as i32)"));
+        assert!(classifier_root.contains("TftClassifierUplinkResult::Absent => {}"));
+        assert!(classifier_root.contains("TftClassifierUplinkResult::Drop => return TC_ACT_SHOT"));
+    }
+
+    #[test]
+    fn tft_metadata_snapshot_keeps_every_byte_after_source_replacement() {
+        // Model kernel map-value alignment, then replace the same allocation
+        // after capture, as a preallocated hash element can be recycled.
+        #[repr(align(8))]
+        struct Aligned([u8; 72]);
+        let original = core::array::from_fn(|index| index as u8);
+        let mut live = Aligned(original);
+        // SAFETY: the fixture is aligned and contains 72 initialized bytes;
+        // the metadata representation accepts every byte pattern.
+        let captured = unsafe { snapshot_tft_metadata(live.0.as_ptr().cast()) };
+        live.0.fill(0xff);
+        assert_eq!(captured.encode(), original);
+        let replacement = unsafe { snapshot_tft_metadata(live.0.as_ptr().cast()) };
+        assert_eq!(replacement.encode(), [0xff; 72]);
     }
 
     #[test]
     fn tft_callback_defers_bearer_mark_resolution_until_after_bpf_loop() {
         // The host test cannot invoke a tc `bpf_loop` callback, so retain the
         // generated control-flow contract in source: the callback may retain
-        // only a dense rank, and the mark is resolved from a fresh
-        // metadata-bound lookup after the loop returns.
+        // only a dense rank, and the mark is resolved after the loop with the
+        // same captured metadata. Re-reading a preallocated map element after
+        // the loop could combine one publication's rank with another's mark.
         let source = include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/src/main.rs"));
         let (_, callback) = source
             .split_once("unsafe extern \"C\" fn classify_tft_filter_step")
@@ -6119,14 +6368,29 @@ mod tests {
         let (_, classifier) = source
             .split_once("fn classify_owned_tft_uplink(ctx: &TcContext)")
             .expect("owned TFT classifier is present");
+        let (classifier, _) = classifier
+            .split_once("\nfn outer_envelope_is_uplink_gpdu(")
+            .expect("classifier region ends before unrelated packet handling");
         let loop_call = classifier
             .find("bpf_loop(")
             .expect("bounded TFT loop is present");
         let selected_mark = classifier
-            .find("selected_tft_classifier_mark(key, &meta, loop_context.selected_rank)")
+            .find("selected_tft_classifier_mark(")
             .expect("post-loop selected mark lookup is present");
         assert!(loop_call < selected_mark);
-        assert!(classifier.contains("u32::from(meta.filter_count())"));
+        assert!(classifier.contains("u32::from(loop_context.meta.filter_count())"));
+        assert!(classifier[selected_mark..selected_mark + 160].contains("&loop_context.meta"));
+        assert!(classifier.contains("0 if loop_context.meta.has_default() => 0"));
+        let (unfragmented, fragment) = classifier
+            .split_once("fn classify_tft_fragment(")
+            .expect("fragment classifier is present");
+        let (fragment, _) = fragment
+            .split_once("struct TftFragmentApplyContext")
+            .expect("fragment classifier body is bounded");
+        assert!(unfragmented.contains("snapshot_tft_metadata(meta_ptr)"));
+        assert!(fragment.contains("snapshot_tft_metadata(ptr)"));
+        assert!(fragment.contains("meta.as_ref()"));
+        assert!(fragment.contains("meta: active"));
     }
 
     #[test]
@@ -6153,7 +6417,7 @@ mod tests {
             .find("if !meta.is_valid() {")
             .expect("active-selector check is present");
         let parse = classifier
-            .find("parse_owned_tft_ipv4(ctx, local_address)")
+            .find("parse_owned_tft_ipv4(ctx, key.paa(), false)")
             .expect("packet parse is present");
         let loop_call = classifier
             .find("bpf_loop(")
