@@ -26,6 +26,9 @@ use std::{
 };
 use tokio::sync::Barrier;
 
+#[path = "encryption/strict_reads.rs"]
+mod strict_reads;
+
 fn hex_encode(bytes: &[u8]) -> String {
     bytes.iter().map(|byte| format!("{byte:02x}")).collect()
 }

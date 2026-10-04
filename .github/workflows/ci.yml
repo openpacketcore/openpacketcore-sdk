@@ -663,6 +663,11 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v7
 
+      - name: Install source-invariant scanner
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes --no-install-recommends ripgrep
+
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@1.98.1 # pinned until #1041 migrates Atomic::fetch_update
         with:
@@ -714,27 +719,12 @@ jobs:
       - name: Test RustCrypto-only DTLS documentation
         run: cargo test --manifest-path vendor/dimpl/Cargo.toml --no-default-features --features rust-crypto --doc
 
-      # These were written as `! rg ...`, which bash exempts from errexit, so
-      # a match printed the offending lines and the step still passed. All
-      # three invariants hold today; they are now actually enforced, and each
-      # reports rather than stopping at the first violation.
+      - name: Test vendored source-invariant guard
+        run: python3 ci/test-vendored-dtls-source.py
+
+      # Report every violation and fail closed if the scanner cannot run.
       - name: Enforce vendored RFC 6083 source invariants
-        run: |
-          violated=0
-          if rg -n '\b(unreachable!|unimplemented!|todo!)' vendor/dimpl/src; then
-            echo "::error::vendored DTLS source must not panic on unreachable paths"
-            violated=1
-          fi
-          if rg -n 'Rfc6083|rfc6083' vendor/dimpl/src/dtls13; then
-            echo "::error::the DTLS 1.3 path must not reference RFC 6083"
-            violated=1
-          fi
-          if rg -n 'impl Default for Config|Config::default\(\)' \
-            vendor/dimpl/src vendor/dimpl/tests vendor/dimpl/README.md; then
-            echo "::error::Config must be constructed explicitly, never defaulted"
-            violated=1
-          fi
-          exit "${violated}"
+        run: bash ci/check-vendored-dtls-source.sh
 
   session-net-i686-tests:
     name: opc-session-net i686 (${{ matrix.slice }})
