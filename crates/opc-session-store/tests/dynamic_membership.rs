@@ -474,12 +474,7 @@ impl SessionConsensusPeer for LoopbackPeer {
             }
         }
         if family == SessionConsensusRpcFamily::TopologyAdmissionBarrier
-            && self
-                .topology_response_drops_remaining
-                .fetch_update(Ordering::AcqRel, Ordering::Acquire, |remaining| {
-                    remaining.checked_sub(1)
-                })
-                .is_ok()
+            && take_one(&self.topology_response_drops_remaining)
         {
             self.topology_responses_dropped
                 .fetch_add(1, Ordering::AcqRel);
@@ -2522,4 +2517,17 @@ fn sealed_record(
     .expect("test envelope");
     record.payload = EncryptedSessionPayload::try_envelope(envelope).expect("valid envelope");
     record
+}
+
+fn take_one(counter: &AtomicUsize) -> bool {
+    let mut remaining = counter.load(Ordering::Acquire);
+    loop {
+        let Some(next) = remaining.checked_sub(1) else {
+            return false;
+        };
+        match counter.compare_exchange_weak(remaining, next, Ordering::AcqRel, Ordering::Acquire) {
+            Ok(_) => return true,
+            Err(observed) => remaining = observed,
+        }
+    }
 }

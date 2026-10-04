@@ -593,35 +593,6 @@ async fn recipient_online_authentic_conflicting_checkpoint_refuses() {
 }
 
 #[tokio::test]
-async fn recipient_online_expiry_after_real_checkpoint_wait_refuses() {
-    let f = Fixture::new(1).await;
-    let (client, mut session) = f.begin(1).await;
-    let binding = client.binding().unwrap().clone();
-    let pages = received_pages(&session, &binding);
-    upload(&mut session, &binding, &pages);
-    let gate = Arc::new(LoadGate::default());
-    *f.external.next_load.lock().unwrap() = Some(gate.clone());
-    let mut pending = Box::pin(session.finish(&binding, caller()));
-    tokio::select! {
-        entered = tokio::time::timeout(Duration::from_secs(10), gate.entered.notified()) => {
-            entered.unwrap();
-            assert_eq!(gate.active.load(Ordering::Acquire), 1);
-        }
-        _ = &mut pending => panic!("finish escaped the real independent provider gate"),
-    }
-    tokio::time::sleep(Duration::from_millis(1100)).await;
-    gate.release.notify_one();
-    assert!(
-        matches!(pending.await, Err(AuditAuthorityError::Expired)),
-        "POST_WAIT_FIXED_EXPIRY"
-    );
-    assert_eq!(gate.active.load(Ordering::Acquire), 0);
-    let (_, session) = f.begin(60).await;
-    drop(session);
-    f.store.shutdown().await.unwrap();
-}
-
-#[tokio::test]
 async fn recipient_online_cancelled_provider_wait_releases_exact_owner() {
     let f = Fixture::new(1).await;
     for at_finish in [false, true] {
@@ -729,23 +700,6 @@ async fn recipient_online_fixed_expiry_bounds_and_empty_received_page() {
             Err(AuditAuthorityError::BindingMismatch)
         ),
         "EMPTY_RANGE_REQUIRES_RECEIVED_PAGE"
-    );
-    let (client, mut session) = f.begin(1).await;
-    let binding = client.binding().unwrap().clone();
-    let pages = received_pages(&session, &binding);
-    assert_eq!(pages.len(), 1);
-    upload(&mut session, &binding, &pages);
-    tokio::time::sleep(Duration::from_millis(1100)).await;
-    assert!(matches!(
-        session.page(&binding, caller(), None, 1),
-        Err(AuditAuthorityError::Expired)
-    ));
-    assert!(
-        matches!(
-            session.finish(&binding, caller()).await,
-            Err(AuditAuthorityError::Expired)
-        ),
-        "FIXED_SESSION_EXPIRY"
     );
     let (client, mut session) = f.begin(60).await;
     let binding = client.binding().unwrap().clone();

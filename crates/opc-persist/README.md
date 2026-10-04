@@ -139,6 +139,9 @@ export, checkpoint and pruning contracts, and
 [ADR 0023](../../docs/adr/0023-bounded-configuration-history.md) for the existing
 configuration-history bounds and protected references.
 
+Online recipient exports keep their original expiry across quorum and independent
+checkpoint waits. Expiry at completion releases the export permit.
+
 Creating the `config_raft_identity` table claims the database for Openraft in
 the same immediate SQLite transaction that checks or imports legacy state.
 Every public standalone mutation checks consensus metadata under the same

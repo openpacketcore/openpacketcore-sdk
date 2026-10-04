@@ -605,11 +605,7 @@ impl QualificationConsumerResponseHoldGate {
     }
 
     fn take_armed_response(&self) -> bool {
-        self.armed
-            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |armed| {
-                armed.checked_sub(1)
-            })
-            .is_ok()
+        take_one(&self.armed)
     }
 
     async fn hold_response(&self) {
@@ -624,19 +620,9 @@ impl QualificationConsumerResponseHoldGate {
                 std::task::Poll::Ready(())
             })
             .await;
-            if self
-                .releases
-                .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |releases| {
-                    releases.checked_sub(1)
-                })
-                .is_ok()
-            {
+            if take_one(&self.releases) {
                 assert!(
-                    self.entered
-                        .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |entered| {
-                            entered.checked_sub(1)
-                        })
-                        .is_ok(),
+                    take_one(&self.entered),
                     "released qualification response must still be held"
                 );
                 return;
@@ -994,25 +980,45 @@ impl QualificationTrafficObservation {
             0,
             "availability writer must be exclusive"
         );
-        let recorded = self
-            .availability_interruptions
-            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |value| {
-                value.checked_add(1).filter(|next| {
-                    *next <= QUALIFICATION_TRAFFIC_AVAILABILITY_INTERRUPTION_BUDGET_PER_NODE
-                })
-            })
-            .is_ok();
+        let mut value = self.availability_interruptions.load(Ordering::Acquire);
+        let recorded = loop {
+            let Some(next) = value.checked_add(1).filter(|next| {
+                *next <= QUALIFICATION_TRAFFIC_AVAILABILITY_INTERRUPTION_BUDGET_PER_NODE
+            }) else {
+                break false;
+            };
+            match self.availability_interruptions.compare_exchange_weak(
+                value,
+                next,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            ) {
+                Ok(_) => break true,
+                Err(observed) => value = observed,
+            }
+        };
         if recorded && *consecutive == 0 {
             self.availability_interruption_episodes
                 .fetch_add(1, Ordering::AcqRel);
         }
         if recorded {
             *consecutive = consecutive.saturating_add(1);
-            let _ = self
+            let mut current = self
                 .max_consecutive_availability_interruptions
-                .fetch_update(Ordering::AcqRel, Ordering::Acquire, |current| {
-                    Some(current.max(*consecutive))
-                });
+                .load(Ordering::Acquire);
+            loop {
+                match self
+                    .max_consecutive_availability_interruptions
+                    .compare_exchange_weak(
+                        current,
+                        current.max(*consecutive),
+                        Ordering::AcqRel,
+                        Ordering::Acquire,
+                    ) {
+                    Ok(_) => break,
+                    Err(observed) => current = observed,
+                }
+            }
         }
         let prior_version = self
             .availability_snapshot_version
@@ -1035,11 +1041,7 @@ impl QualificationTrafficObservation {
             "availability writer must be exclusive"
         );
         let recovered = *consecutive;
-        let _ = self.availability_recoveries.fetch_update(
-            Ordering::AcqRel,
-            Ordering::Acquire,
-            |value| Some(value.saturating_add(recovered)),
-        );
+        add_counter(&self.availability_recoveries, recovered);
         *consecutive = 0;
         let prior_version = self
             .availability_snapshot_version
@@ -1202,10 +1204,36 @@ fn qualification_lease_authority_failure_reason(error: &LeaseError) -> Option<&'
     }
 }
 
+fn take_one(counter: &AtomicUsize) -> bool {
+    let mut remaining = counter.load(Ordering::SeqCst);
+    loop {
+        let Some(next) = remaining.checked_sub(1) else {
+            return false;
+        };
+        match counter.compare_exchange_weak(remaining, next, Ordering::SeqCst, Ordering::SeqCst) {
+            Ok(_) => return true,
+            Err(observed) => remaining = observed,
+        }
+    }
+}
+
 fn increment(counter: &AtomicU64) {
-    let _ = counter.fetch_update(Ordering::AcqRel, Ordering::Acquire, |value| {
-        Some(value.saturating_add(1))
-    });
+    add_counter(counter, 1);
+}
+
+fn add_counter(counter: &AtomicU64, count: u64) {
+    let mut value = counter.load(Ordering::Acquire);
+    loop {
+        match counter.compare_exchange_weak(
+            value,
+            value.saturating_add(count),
+            Ordering::AcqRel,
+            Ordering::Acquire,
+        ) {
+            Ok(_) => break,
+            Err(observed) => value = observed,
+        }
+    }
 }
 
 enum QualificationTransportRuntime {
@@ -1252,11 +1280,18 @@ impl QualificationResolverEvidence {
     fn record_resolution(&self, reauthentication_generation: u64) {
         self.last_reauthentication_generation
             .store(reauthentication_generation, Ordering::SeqCst);
-        let _ = self
-            .calls
-            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |calls| {
-                Some(calls.saturating_add(1))
-            });
+        let mut calls = self.calls.load(Ordering::SeqCst);
+        loop {
+            match self.calls.compare_exchange_weak(
+                calls,
+                calls.saturating_add(1),
+                Ordering::SeqCst,
+                Ordering::SeqCst,
+            ) {
+                Ok(_) => break,
+                Err(observed) => calls = observed,
+            }
+        }
     }
 
     fn calls(&self) -> u64 {
@@ -5174,11 +5209,7 @@ async fn run_traffic_watch_task<B: TrafficWatchBackend + 'static>(
                 observation.watch_sequence.store(entry.sequence, Ordering::Release);
                 increment(&observation.watch_entries);
                 if applied_records != 0 {
-                    let _ = observation.watch_applied_records.fetch_update(
-                        Ordering::AcqRel,
-                        Ordering::Acquire,
-                        |value| Some(value.saturating_add(applied_records)),
-                    );
+                    add_counter(&observation.watch_applied_records, applied_records);
                 }
                 let Some(next_sequence) = expected_sequence.checked_add(1) else {
                     let failure = QualificationTrafficFailure::fixed(

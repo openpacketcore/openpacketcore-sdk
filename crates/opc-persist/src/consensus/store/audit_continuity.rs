@@ -15,6 +15,9 @@ use crate::consensus::{audit::AuditCommand, ConfigMutationIntent};
 use crate::{ConfigConsensusIdentity, ConfigConsensusTopology, SqliteBackend};
 use opc_consensus::{ConsensusNodeId, ConsensusPeer};
 
+#[cfg(test)]
+mod tests;
+
 async fn load_external(
     policy: &AuditContinuityPolicy,
     identity: ConfigConsensusIdentity,
