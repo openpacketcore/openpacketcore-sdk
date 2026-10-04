@@ -514,13 +514,24 @@ impl SessionConsensusPeer for GatedReadBarrierPeer {
 
 impl GatedReadBarrierPeer {
     fn take_forward_mutation_reply_loss(&self, request: &SessionConsensusWireRequest) -> bool {
-        request.family == opc_session_store::SessionConsensusRpcFamily::ForwardMutation
-            && self
+        if request.family != opc_session_store::SessionConsensusRpcFamily::ForwardMutation {
+            return false;
+        }
+        let mut remaining = self
+            .withhold_forward_mutation_replies
+            .load(Ordering::SeqCst);
+        loop {
+            let Some(next) = remaining.checked_sub(1) else {
+                return false;
+            };
+            match self
                 .withhold_forward_mutation_replies
-                .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |remaining| {
-                    remaining.checked_sub(1)
-                })
-                .is_ok()
+                .compare_exchange_weak(remaining, next, Ordering::SeqCst, Ordering::SeqCst)
+            {
+                Ok(_) => return true,
+                Err(observed) => remaining = observed,
+            }
+        }
     }
 
     fn complete_forward_mutation_call(

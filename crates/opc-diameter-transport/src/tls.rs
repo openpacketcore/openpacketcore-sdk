@@ -1345,11 +1345,21 @@ enum HandshakeOperationError {
 }
 
 pub(crate) fn next_generation() -> Result<PeerSessionGeneration, DiameterTlsError> {
-    let value = NEXT_SESSION_GENERATION
-        .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
-            current.checked_add(1)
-        })
-        .map_err(|_| DiameterTlsError::GenerationExhausted)?;
+    let mut current = NEXT_SESSION_GENERATION.load(Ordering::Relaxed);
+    let value = loop {
+        let next = current
+            .checked_add(1)
+            .ok_or(DiameterTlsError::GenerationExhausted)?;
+        match NEXT_SESSION_GENERATION.compare_exchange_weak(
+            current,
+            next,
+            Ordering::Relaxed,
+            Ordering::Relaxed,
+        ) {
+            Ok(previous) => break previous,
+            Err(observed) => current = observed,
+        }
+    };
     let value = NonZeroU64::new(value).ok_or(DiameterTlsError::GenerationExhausted)?;
     Ok(PeerSessionGeneration::new(value))
 }

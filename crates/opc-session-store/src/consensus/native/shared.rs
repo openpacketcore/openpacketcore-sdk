@@ -24,14 +24,22 @@ pub(super) fn issue_revision() -> io::Result<NonZeroU64> {
 
 impl RevisionIssuer {
     fn issue(&self) -> io::Result<NonZeroU64> {
-        let value = self
-            .0
-            // Only uniqueness is synchronized here. The existing Arc and
-            // owner publication locks still synchronize the actual payload.
-            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |value| {
-                value.checked_add(1).filter(|_| value != 0)
-            })
-            .map_err(|_| super::invalid("native row revision exhausted"))?;
+        // Only uniqueness is synchronized here. The existing Arc and
+        // owner publication locks still synchronize the actual payload.
+        let mut current = self.0.load(Ordering::Relaxed);
+        let value = loop {
+            let next = current
+                .checked_add(1)
+                .filter(|_| current != 0)
+                .ok_or_else(|| super::invalid("native row revision exhausted"))?;
+            match self
+                .0
+                .compare_exchange_weak(current, next, Ordering::Relaxed, Ordering::Relaxed)
+            {
+                Ok(previous) => break previous,
+                Err(observed) => current = observed,
+            }
+        };
         NonZeroU64::new(value).ok_or_else(|| super::invalid("native row revision invalid"))
     }
 }
