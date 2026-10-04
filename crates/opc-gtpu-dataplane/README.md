@@ -94,7 +94,40 @@ On an eBPF attachment, `try_receive_downlink` on the same port is the
 backend-authoritative consumer for kernel-reassembled and handed-off G-PDUs:
 it authorizes against the backend's own grouped and v5 maps (commit read
 last) and returns the exact inner packet and bearer mark, or a value-free
-drop. With an optional per-context `GtpPdpContext::downlink_inner_mtu`, tc
+drop.
+
+**Raw injection requires consumer-owned containment:** retain a lower-priority
+outbound block policy over the subscriber pool for the entire lifetime of the
+plaintext source, with `disable_xfrm=0` on both `all` and the egress device,
+and no higher-priority intersecting plaintext bypass. A namespace default
+outbound block is another option for non-loopback output, at the cost of
+explicit policies for every other permitted non-loopback flow.
+`GtpuDownlinkInjector::raw_ipv4()` injects
+`Decapsulated` or `Fragmented` outcomes using `IP_HDRINCL`, `IP_NODEFRAG`, the
+exact bearer mark and the inner source through `IP_PKTINFO`. It sends fragments
+in order. A policy query cannot be an atomic containment receipt; losing the
+block between a query and a send can leak plaintext. The injector installs and
+queries no policies.
+
+Zero-ID non-DF fragments and batches are refused with a typed error and
+counter. A batch with zero ID is one re-fragmented piece of an origin-fragmented
+datagram, so inventing an ID cannot agree with its separate siblings. The raw
+path loses that datagram; the interface-bound contract in issue #1085 has no
+such limit. Keeping DF on pieces from a DF-fragment source would preserve zero
+through raw output. Choosing those flags belongs to the fragmenter and its MTU
+policy, not the injector. Non-initial fragments match `ct state invalid` with
+`IP_NODEFRAG`, so an output filter can refuse them.
+
+The constructor probes mark privileges; send errors distinguish would-block,
+MTU, buffer, policy/filter and access-denied failures. Raw block and MTU refusals
+return local errors; the native all-device trace observes no generated ICMP
+with a usable route toward the inner source. Partial acceptance means the datagram
+is lost; no remainder can be resumed through this API. Success is local
+acceptance, not protection or delivery proof. `GtpuDownlinkInjectionPort` and
+the outcome factories in `testkit` support consumer fakes. See
+[raw IPv4 injection](docs/control-port.md#raw-ipv4-injection).
+
+With an optional per-context `GtpPdpContext::downlink_inner_mtu`, tc
 steers an over-MTU DF downlink IPv4 packet to a dedicated backend-owned queue
 instead of letting the host drop it with its own error. The consumer then
 applies the context's RFC 4459 policy:

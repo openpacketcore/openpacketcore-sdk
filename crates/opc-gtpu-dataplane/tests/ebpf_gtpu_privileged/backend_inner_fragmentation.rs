@@ -4,10 +4,10 @@
 //! The access link `ue0` (MTU 1,400) is narrower than the 1,450-octet DF
 //! datagram, as the CRC SWu path is. The test plays the ePDG: it drains
 //! `try_receive_downlink` and injects every returned inner packet toward
-//! XFRM with its bearer mark, through an `IP_HDRINCL` raw socket whose
-//! `IP_PKTINFO` source is the inner source (so a source-specific XFRM OUT
-//! selector matches). The contract: the datagram reaches the UE's socket as
-//! inner fragments that the UE reassembles exactly, on the default bearer,
+//! XFRM with the production `GtpuDownlinkInjector::raw_ipv4`, preserving
+//! its bearer mark and inner source for source-specific XFRM OUT selectors.
+//! The contract: the datagram reaches the UE's socket as inner fragments
+//! that the UE reassembles exactly, on the default bearer,
 //! after outer reassembly, with a zero outer UDP checksum, and on a dedicated
 //! bearer through its real ESP Child SA, and the host generates no ICMP
 //! anywhere. Datagrams sent straight to the hand-off queue are dropped.
@@ -15,7 +15,8 @@
 use super::*;
 use opc_gtpu_dataplane::control_port::{GtpuControlPort, GtpuControlPortError};
 use opc_gtpu_dataplane::{
-    GtpuDownlinkDrop, GtpuDownlinkEvent, GtpuDownlinkInnerMtu, GtpuInnerFragmentRateLimit,
+    GtpuDownlinkDrop, GtpuDownlinkEvent, GtpuDownlinkInjector, GtpuDownlinkInnerMtu,
+    GtpuInnerFragmentRateLimit,
 };
 
 /// The access-side (SWu) link MTU.
@@ -178,51 +179,14 @@ fn esp_spis(packets: &[Vec<u8>]) -> Vec<u32> {
         .collect()
 }
 
-/// Inject one inner IPv4 packet toward XFRM as the ePDG does: an
-/// `IPPROTO_RAW` (`IP_HDRINCL`) socket, the bearer mark as `SO_MARK` (zero
-/// for the default bearer), and the inner source as the `IP_PKTINFO`
-/// source. Linux builds the XFRM flow from the socket, not from the packet:
-/// without that source a source-specific OUT selector would not match.
-fn inject_toward_xfrm(packet: &[u8], mark: Option<GtpBearerMark>) {
-    use nix::sys::socket::{
-        sendmsg, setsockopt, socket, sockopt, AddressFamily, ControlMessage, MsgFlags, SockFlag,
-        SockProtocol, SockType, SockaddrIn,
-    };
-    let raw = socket(
-        AddressFamily::Inet,
-        SockType::Raw,
-        SockFlag::SOCK_CLOEXEC,
-        SockProtocol::Raw,
-    )
-    .expect("open IP_HDRINCL raw socket");
-    setsockopt(&raw, sockopt::Mark, &mark.map_or(0, GtpBearerMark::get)).expect("set SO_MARK");
-    let source = [packet[12], packet[13], packet[14], packet[15]];
-    let destination = Ipv4Addr::new(packet[16], packet[17], packet[18], packet[19]);
-    let info = libc::in_pktinfo {
-        ipi_ifindex: 0,
-        ipi_spec_dst: libc::in_addr {
-            s_addr: u32::from_ne_bytes(source),
-        },
-        ipi_addr: libc::in_addr { s_addr: 0 },
-    };
-    let sent = sendmsg(
-        raw.as_raw_fd(),
-        &[std::io::IoSlice::new(packet)],
-        &[ControlMessage::Ipv4PacketInfo(&info)],
-        MsgFlags::empty(),
-        Some(&SockaddrIn::from(std::net::SocketAddrV4::new(
-            destination,
-            0,
-        ))),
-    )
-    .expect("inject one inner packet toward XFRM");
-    assert_eq!(sent, packet.len());
-}
-
 /// Serve the backend-owned consumer for `window` as the ePDG's loop does,
 /// injecting every returned inner packet toward XFRM with its bearer mark.
 /// Returns every event, in order.
-fn serve_consumer(port: &dyn GtpuControlPort, window: Duration) -> Vec<GtpuDownlinkEvent> {
+fn serve_consumer(
+    port: &dyn GtpuControlPort,
+    injector: &mut GtpuDownlinkInjector,
+    window: Duration,
+) -> Vec<GtpuDownlinkEvent> {
     let deadline = Instant::now() + window;
     let mut events = Vec::new();
     while Instant::now() < deadline {
@@ -230,12 +194,13 @@ fn serve_consumer(port: &dyn GtpuControlPort, window: Duration) -> Vec<GtpuDownl
             Ok(Some(event)) => {
                 match &event {
                     GtpuDownlinkEvent::Decapsulated(packet) => {
-                        inject_toward_xfrm(packet.inner_packet(), packet.bearer_mark());
+                        assert_eq!(injector.inject(packet.into()), Ok(1));
                     }
                     GtpuDownlinkEvent::Fragmented(fragmented) => {
-                        for fragment in fragmented.fragments() {
-                            inject_toward_xfrm(fragment, fragmented.bearer_mark());
-                        }
+                        assert_eq!(
+                            injector.inject(fragmented.into()),
+                            Ok(fragmented.fragments().len())
+                        );
                     }
                     _ => {}
                 }
@@ -356,6 +321,7 @@ pub(super) async fn qualify() -> Result<(), Box<dyn std::error::Error>> {
     ));
 
     let port = backend.open_gtpu_control_port(&device).await?;
+    let mut injector = GtpuDownlinkInjector::raw_ipv4()?;
     let pgw_capture = packet_capture_socket(&net.pgw_ns);
     let ue_capture = packet_capture_socket(&net.ue_ns);
     let ue = in_netns(&net.ue_ns, || {
@@ -394,7 +360,7 @@ pub(super) async fn qualify() -> Result<(), Box<dyn std::error::Error>> {
     //    a 1,400-octet access link.
     let crc_case = datagram(0x51, OVERSIZED_PAYLOAD, true);
     send(&[&frame(LOCAL_TEID, &crc_case)]);
-    let events = serve_consumer(port.as_ref(), window);
+    let events = serve_consumer(port.as_ref(), &mut injector, window);
     let mut buffer = [0_u8; 2_048];
     let delivered = ue.recv_from(&mut buffer);
     core_packets.extend(captured_ipv4(&pgw_capture));
@@ -426,7 +392,11 @@ pub(super) async fn qualify() -> Result<(), Box<dyn std::error::Error>> {
     let reassembled = datagram(0x52, OVERSIZED_PAYLOAD, true);
     let (head, tail) = build_outer_fragments(&frame(LOCAL_TEID, &reassembled), 1_000, 0x5200);
     send(&[&head, &tail]);
-    expect_fragmented(&serve_consumer(port.as_ref(), window), None, &reassembled);
+    expect_fragmented(
+        &serve_consumer(port.as_ref(), &mut injector, window),
+        None,
+        &reassembled,
+    );
     expect_ue_delivery(
         &ue,
         &application_payload(0x52, OVERSIZED_PAYLOAD),
@@ -450,7 +420,11 @@ pub(super) async fn qualify() -> Result<(), Box<dyn std::error::Error>> {
         false,
         0,
     )]);
-    expect_fragmented(&serve_consumer(port.as_ref(), window), None, &zero_checksum);
+    expect_fragmented(
+        &serve_consumer(port.as_ref(), &mut injector, window),
+        None,
+        &zero_checksum,
+    );
     expect_ue_delivery(
         &ue,
         &application_payload(0x58, OVERSIZED_PAYLOAD),
@@ -464,7 +438,7 @@ pub(super) async fn qualify() -> Result<(), Box<dyn std::error::Error>> {
         LOCAL_TEID,
         &datagram(0x54, OVERSIZED_PAYLOAD, false),
     )]);
-    let events = serve_consumer(port.as_ref(), window);
+    let events = serve_consumer(port.as_ref(), &mut injector, window);
     assert!(events.is_empty(), "fast-path packets: {events:?}");
     expect_ue_delivery(&ue, &application_payload(0x53, FITTING_PAYLOAD), "fitting");
     expect_ue_delivery(
@@ -488,7 +462,7 @@ pub(super) async fn qualify() -> Result<(), Box<dyn std::error::Error>> {
         &build_gpdu(0x7777_0001, None, &datagram(0x59, 64, false)),
         queue,
     )?;
-    let events = serve_consumer(port.as_ref(), window);
+    let events = serve_consumer(port.as_ref(), &mut injector, window);
     assert!(
         matches!(
             &events[..],
@@ -508,7 +482,7 @@ pub(super) async fn qualify() -> Result<(), Box<dyn std::error::Error>> {
     )?;
     send(&[&frame(LOCAL_TEID, &datagram(0x56, OVERSIZED_PAYLOAD, true))]);
     send(&[&frame(LOCAL_TEID, &datagram(0x57, OVERSIZED_PAYLOAD, true))]);
-    let events = serve_consumer(port.as_ref(), window);
+    let events = serve_consumer(port.as_ref(), &mut injector, window);
     match &events[..] {
         [GtpuDownlinkEvent::Fragmented(first), GtpuDownlinkEvent::Dropped(GtpuDownlinkDrop::InnerFragmentRateLimited)] =>
         {
@@ -537,7 +511,7 @@ pub(super) async fn qualify() -> Result<(), Box<dyn std::error::Error>> {
     let dedicated_case = datagram(0x55, OVERSIZED_PAYLOAD, true);
     send(&[&frame(LOCAL_TEID_A, &dedicated_case)]);
     expect_fragmented(
-        &serve_consumer(port.as_ref(), window),
+        &serve_consumer(port.as_ref(), &mut injector, window),
         GtpBearerMark::new(MARK_A),
         &dedicated_case,
     );

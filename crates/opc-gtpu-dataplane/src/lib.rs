@@ -77,6 +77,7 @@ pub mod control_port;
 pub mod ebpf;
 pub mod error;
 pub mod icmp;
+pub mod injection;
 mod inner_fragment;
 pub mod linux;
 pub mod mock;
@@ -104,6 +105,10 @@ pub use ebpf::{
 };
 pub use error::{GtpuError, ProgramLoadRefusal};
 pub use icmp::{build_icmpv4_packet_too_big, build_icmpv6_packet_too_big};
+pub use injection::{
+    GtpuDownlinkInjection, GtpuDownlinkInjectionCounters, GtpuDownlinkInjectionError,
+    GtpuDownlinkInjectionPort, GtpuDownlinkInjector, GtpuDownlinkSendFailure,
+};
 pub use linux::{LinuxGtpuDataplaneBackend, LinuxGtpuDataplaneBackendConfig};
 pub use mock::{
     MockGtpuDataplaneBackend, MockOperation, MockPdpContextFault,

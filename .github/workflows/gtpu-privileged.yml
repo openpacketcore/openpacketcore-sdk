@@ -210,7 +210,7 @@ jobs:
           grep -Fq 'OPC_GTPU_HISTORICAL_25_DETACHED_RECOVERY_PROVEN' "${datapath_log}"
           grep -Fq 'OPC_GTPU_HISTORICAL_25_ATTACHED_REFUSAL_PROVEN' "${datapath_log}"
 
-      - name: Require native shared GTP-U control queue proof
+      - name: Require native shared GTP-U control queue and raw injection proofs
         run: |
           set -euo pipefail
           export CARGO_TARGET_DIR="${RUNNER_TEMP}/gtpu-target"
@@ -464,6 +464,12 @@ jobs:
             command -v ip tc ethtool nft wg python3
             sudo modprobe wireguard
           '
+          # Raw injection needs baseline ESP, never XFRM interfaces/migration.
+          # Execute the same embedded peer and strict inventory as the host.
+          ssh "${ssh_options[@]}" opc@127.0.0.1 \
+            'sudo unshare -n -- bash -s -- /tmp/opc-gtpu-linux68-test /tmp/opc-gtpu-linux68-control' \
+            < ci/qualify-gtpu-control-native.sh \
+            2>&1 | tee "${RUNNER_TEMP}/gtpu-linux68-control.log"
           if ! grace_output="$(
             ssh "${ssh_options[@]}" opc@127.0.0.1 \
               'sudo env OPC_GTPU_RUN_PRIVILEGED=1 /tmp/opc-gtpu-linux68-grace --ignored --exact linux::reader_grace::tests::map_in_map_grace_waits_for_live_non_sleepable_reader --nocapture --test-threads=1' \
@@ -540,6 +546,13 @@ jobs:
           grep -Fq 'OPC_GTPU_TFT_FRAGMENT_CROSS_ATTACHMENT_PROVEN' <<< "${live_output}"
           grep -Fq 'OPC_GTPU_TFT_FRAGMENT_PORT_ONLY_CONTROL_PROVEN' <<< "${live_output}"
           grep -Fq 'OPC_GTPU_ORDINARY_INNER_IPV6_PROVEN' <<< "${live_output}"
+
+      - name: Retain Linux 6.8 control and injection evidence
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: gtpu-linux68-control
+          path: ${{ runner.temp }}/gtpu-linux68-control.log
 
       - name: Preserve Linux 6.8 packet tooling for nohz qualification
         uses: actions/upload-artifact@v7
@@ -935,6 +948,13 @@ jobs:
             chmod 0755 /tmp/opc-gtpu-el9-datapath
           '
 
+          # The peer uses Python 3.9 and baseline ESP, both provided by this
+          # guest; it requires no optional XFRM interface or migration feature.
+          ssh "${ssh_options[@]}" opc@127.0.0.1 \
+            'sudo unshare -n -- bash -s -- /tmp/opc-gtpu-el9-test /tmp/opc-gtpu-el9-control' \
+            < ci/qualify-gtpu-control-native.sh \
+            2>&1 | tee "${RUNNER_TEMP}/gtpu-el9-control.log"
+
           # The committed source is the authority on how many datapath tests
           # must run. Deriving the number from the shipped binary instead
           # would be circular: anything that drops a test from the binary --
@@ -1020,6 +1040,13 @@ jobs:
           grep -Fq 'OPC_GTPU_ORDINARY_INNER_IPV6_CLEANUP_PROVEN' "${datapath_log}"
           grep -Fq 'OPC_GTPU_CLEANUP_ACTIVATION_FORWARDS_PROVEN' "${datapath_log}"
           grep -Fq 'OPC_GTPU_CLEANUP_ACTIVATION_ROLLBACK_PROVEN' "${datapath_log}"
+
+      - name: Retain EL9 control and injection evidence
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: gtpu-el9-control
+          path: ${{ runner.temp }}/gtpu-el9-control.log
 
       - name: Preserve EL9 packet tooling for nohz qualification
         uses: actions/upload-artifact@v7

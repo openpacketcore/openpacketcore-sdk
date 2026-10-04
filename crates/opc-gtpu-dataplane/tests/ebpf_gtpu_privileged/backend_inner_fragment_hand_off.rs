@@ -16,15 +16,14 @@
 //! as `Decapsulated` with its bearer mark, so every fragment of a datagram
 //! takes one path. The test plays the gateway application: it drains
 //! `try_receive_downlink` and injects each returned packet toward XFRM
-//! through an `IP_HDRINCL` raw socket with `SO_MARK`, an `IP_PKTINFO` source
-//! and `IP_NODEFRAG`. One connection-tracking rule is active in the gateway
-//! namespace throughout.
+//! through the production `GtpuDownlinkInjector::raw_ipv4`, including its
+//! exact mark/source selection and `IP_NODEFRAG`. One connection-tracking
+//! rule is active in the gateway namespace throughout.
 //!
 //! The consumer also stands in for the kernel's IPv4 input, which validated
-//! the header of every packet that tc decapsulated. The injection rewrites
-//! the header checksum and the total length, so a fragment that the kernel
-//! refused must be refused by the consumer, and octets after the total length
-//! must be trimmed.
+//! the header of every packet that tc decapsulated. The consumer must refuse
+//! malformed headers and trim octets after the total length; the production
+//! injector separately validates the returned bytes before raw output.
 //!
 //! The fragments wait in their own backend-owned queue. A flood of them must
 //! overflow only that queue: the kernel drops and counts the excess, and
@@ -34,15 +33,10 @@
 
 use super::*;
 use opc_gtpu_dataplane::control_port::{GtpuControlPort, GtpuControlPortError};
-use opc_gtpu_dataplane::{GtpuDownlinkDrop, GtpuDownlinkEvent, GtpuDownlinkInnerMtu};
-
-sockopt_impl!(
-    IpNoDefragment,
-    SetOnly,
-    nix::libc::IPPROTO_IP,
-    nix::libc::IP_NODEFRAG,
-    i32
-);
+use opc_gtpu_dataplane::{
+    GtpuDownlinkDrop, GtpuDownlinkEvent, GtpuDownlinkInjectionError, GtpuDownlinkInjector,
+    GtpuDownlinkInnerMtu,
+};
 
 /// The access-side link MTU (`ue0`), left at the Ethernet default.
 const ACCESS_MTU: u16 = 1_500;
@@ -227,52 +221,14 @@ fn esp_spis(packets: &[Vec<u8>]) -> Vec<u32> {
         .collect()
 }
 
-/// Inject one inner IPv4 packet toward XFRM as the gateway application does:
-/// an `IPPROTO_RAW` (`IP_HDRINCL`) socket, the bearer mark as `SO_MARK` (zero
-/// for the default bearer), the inner source as the `IP_PKTINFO` source, and
-/// `IP_NODEFRAG` so that netfilter does not hold an injected fragment at
-/// LOCAL_OUT for reassembly.
-fn inject_toward_xfrm(packet: &[u8], mark: Option<GtpBearerMark>) {
-    use nix::sys::socket::{
-        sendmsg, setsockopt, socket, sockopt, AddressFamily, ControlMessage, MsgFlags, SockFlag,
-        SockProtocol, SockType, SockaddrIn,
-    };
-    let raw = socket(
-        AddressFamily::Inet,
-        SockType::Raw,
-        SockFlag::SOCK_CLOEXEC,
-        SockProtocol::Raw,
-    )
-    .expect("open IP_HDRINCL raw socket");
-    setsockopt(&raw, sockopt::Mark, &mark.map_or(0, GtpBearerMark::get)).expect("set SO_MARK");
-    setsockopt(&raw, IpNoDefragment, &1).expect("set IP_NODEFRAG");
-    let source = [packet[12], packet[13], packet[14], packet[15]];
-    let destination = Ipv4Addr::new(packet[16], packet[17], packet[18], packet[19]);
-    let info = libc::in_pktinfo {
-        ipi_ifindex: 0,
-        ipi_spec_dst: libc::in_addr {
-            s_addr: u32::from_ne_bytes(source),
-        },
-        ipi_addr: libc::in_addr { s_addr: 0 },
-    };
-    let sent = sendmsg(
-        raw.as_raw_fd(),
-        &[std::io::IoSlice::new(packet)],
-        &[ControlMessage::Ipv4PacketInfo(&info)],
-        MsgFlags::empty(),
-        Some(&SockaddrIn::from(std::net::SocketAddrV4::new(
-            destination,
-            0,
-        ))),
-    )
-    .expect("inject one inner packet toward XFRM");
-    assert_eq!(sent, packet.len());
-}
-
 /// Serve the backend-owned consumer for `window` as the gateway
 /// application's loop does, injecting every returned inner packet toward XFRM
 /// with its bearer mark. Returns every event, in order.
-fn serve_consumer(port: &dyn GtpuControlPort, window: Duration) -> Vec<GtpuDownlinkEvent> {
+fn serve_consumer(
+    port: &dyn GtpuControlPort,
+    injector: &mut GtpuDownlinkInjector,
+    window: Duration,
+) -> Vec<GtpuDownlinkEvent> {
     let deadline = Instant::now() + window;
     let mut events = Vec::new();
     while Instant::now() < deadline {
@@ -280,12 +236,13 @@ fn serve_consumer(port: &dyn GtpuControlPort, window: Duration) -> Vec<GtpuDownl
             Ok(Some(event)) => {
                 match &event {
                     GtpuDownlinkEvent::Decapsulated(packet) => {
-                        inject_toward_xfrm(packet.inner_packet(), packet.bearer_mark());
+                        assert_eq!(injector.inject(packet.into()), Ok(1));
                     }
                     GtpuDownlinkEvent::Fragmented(fragmented) => {
-                        for fragment in fragmented.fragments() {
-                            inject_toward_xfrm(fragment, fragmented.bearer_mark());
-                        }
+                        assert_eq!(
+                            injector.inject(fragmented.into()),
+                            Ok(fragmented.fragments().len())
+                        );
                     }
                     _ => {}
                 }
@@ -432,6 +389,7 @@ pub(super) async fn qualify() -> Result<(), Box<dyn std::error::Error>> {
     let device = backend.create_device(request).await?;
     let pin_dir = net.pin_root.join("s2bu");
     let port = backend.open_gtpu_control_port(&device).await?;
+    let mut injector = GtpuDownlinkInjector::raw_ipv4()?;
     // A context without a downlink inner MTU first: today's behaviour.
     backend
         .install_pdp_context(session_context(device.ifindex))
@@ -485,7 +443,7 @@ pub(super) async fn qualify() -> Result<(), Box<dyn std::error::Error>> {
         &frame(LOCAL_TEID, &fragments[0]),
         &frame(LOCAL_TEID, &fragments[1]),
     ]);
-    let events = serve_consumer(port.as_ref(), window);
+    let events = serve_consumer(port.as_ref(), &mut injector, window);
     assert!(
         events.is_empty(),
         "no downlink inner MTU: fast path, got {events:?}"
@@ -521,7 +479,7 @@ pub(super) async fn qualify() -> Result<(), Box<dyn std::error::Error>> {
     let _ = captured_ipv4(&ue_capture);
     let header_errors_before = ipv4_reassembly_stat("InHdrErrors");
     send(&[&frame(LOCAL_TEID, &corrupt)]);
-    let events = serve_consumer(port.as_ref(), window);
+    let events = serve_consumer(port.as_ref(), &mut injector, window);
     assert!(events.is_empty(), "fast path, got {events:?}");
     assert_eq!(
         pinned_counter(&pin_dir, COUNTER_DL_DECAP) - decapsulated_before,
@@ -565,7 +523,7 @@ pub(super) async fn qualify() -> Result<(), Box<dyn std::error::Error>> {
     let decapsulated_before = pinned_counter(&pin_dir, COUNTER_DL_DECAP);
     let (head, tail) = build_outer_fragments(&frame(LOCAL_TEID, &fragments[0]), 1_000, 0x6201);
     send(&[&head, &tail, &frame(LOCAL_TEID, &fragments[1])]);
-    let events = serve_consumer(port.as_ref(), window);
+    let events = serve_consumer(port.as_ref(), &mut injector, window);
     let mut buffer = vec![0_u8; 4_096];
     let delivered = ue.recv_from(&mut buffer);
     eprintln!(
@@ -628,7 +586,7 @@ pub(super) async fn qualify() -> Result<(), Box<dyn std::error::Error>> {
         &frame(LOCAL_TEID, &fragments[0]),
     ]);
     expect_decapsulated(
-        &serve_consumer(port.as_ref(), window),
+        &serve_consumer(port.as_ref(), &mut injector, window),
         &[&fragments[2], &fragments[1], &fragments[0]],
         None,
         "reordered fragments",
@@ -651,10 +609,9 @@ pub(super) async fn qualify() -> Result<(), Box<dyn std::error::Error>> {
 
     // 3b. The same corrupt first fragment, now handed to the consumer. It
     //     must be dropped as the kernel dropped it above. Returned as
-    //     `Decapsulated`, the injection would repair its checksum and send
-    //     it on. So must a fragment whose total length, under a correct
-    //     checksum, claims one octet more than arrived: the injection would
-    //     rewrite the length and send the truncated datagram as complete.
+    //     `Decapsulated`, a bare IP_HDRINCL send would repair and forward it.
+    //     The production injector validates too, but the receive contract
+    //     must independently refuse invalid checksums and truncated lengths.
     let mut truncated = core_fragments(&datagram(0x6b, 9), 28, 0x6b00).swap_remove(0);
     truncated[2..4].copy_from_slice(&29_u16.to_be_bytes());
     truncated[10..12].fill(0);
@@ -664,7 +621,7 @@ pub(super) async fn qualify() -> Result<(), Box<dyn std::error::Error>> {
     assert_eq!(truncated.len(), 28);
     let _ = captured_ipv4(&ue_capture);
     send(&[&frame(LOCAL_TEID, &corrupt), &frame(LOCAL_TEID, &truncated)]);
-    let events = serve_consumer(port.as_ref(), window);
+    let events = serve_consumer(port.as_ref(), &mut injector, window);
     assert!(
         matches!(
             &events[..],
@@ -681,9 +638,9 @@ pub(super) async fn qualify() -> Result<(), Box<dyn std::error::Error>> {
     );
 
     // 3c. Octets after the inner total length are not part of the datagram.
-    //     The kernel's IPv4 input trims them; the injection would extend the
-    //     total length over them. Both fragments come back trimmed, and the
-    //     UE reassembles the exact datagram.
+    //     The kernel's IPv4 input trims them; a bare IP_HDRINCL send would
+    //     extend the total length over them. Both fragments come back trimmed,
+    //     and the UE reassembles the exact datagram.
     let padded = datagram(0x6a, 2_000);
     let fragments = core_fragments(&padded, 1_300, 0x6a00);
     assert_eq!(fragments.len(), 2);
@@ -700,7 +657,7 @@ pub(super) async fn qualify() -> Result<(), Box<dyn std::error::Error>> {
         &frame(LOCAL_TEID, &carried[1]),
     ]);
     expect_decapsulated(
-        &serve_consumer(port.as_ref(), window),
+        &serve_consumer(port.as_ref(), &mut injector, window),
         &[&fragments[0], &fragments[1]],
         None,
         "octets after the total length",
@@ -722,7 +679,7 @@ pub(super) async fn qualify() -> Result<(), Box<dyn std::error::Error>> {
 
     // 4. A datagram that is not a fragment stays on the tc fast path.
     send(&[&frame(LOCAL_TEID, &datagram(0x64, 1_200))]);
-    let events = serve_consumer(port.as_ref(), window);
+    let events = serve_consumer(port.as_ref(), &mut injector, window);
     assert!(events.is_empty(), "fast-path packet: {events:?}");
     expect_ue_delivery(&ue, &application_payload(0x64, 1_200), "not a fragment");
     assert_eq!(
@@ -757,7 +714,7 @@ pub(super) async fn qualify() -> Result<(), Box<dyn std::error::Error>> {
         &frame(LOCAL_TEID_A, &fragments[1]),
     ]);
     expect_decapsulated(
-        &serve_consumer(port.as_ref(), window),
+        &serve_consumer(port.as_ref(), &mut injector, window),
         &[&fragments[0], &fragments[1]],
         GtpBearerMark::new(MARK_A),
         "dedicated bearer",
@@ -942,11 +899,71 @@ pub(super) async fn qualify() -> Result<(), Box<dyn std::error::Error>> {
     );
     assert_eq!(counters.binding_drops, 0);
 
+    // 8. An origin-fragmented zero-ID datagram with DF on its pieces. The
+    // over-MTU first piece becomes a real Fragmented outcome with DF clear;
+    // its fitting sibling remains a separate Decapsulated outcome with DF.
+    // Rewriting only the batch could never repair this datagram. Refuse it
+    // before sending and preserve zero on the separately accepted DF sibling.
+    let origin = datagram(0x6c, LARGE_PAYLOAD);
+    let zero_fragments: Vec<_> = core_fragments(&origin, CORE_MTU, 0)
+        .into_iter()
+        .map(with_dont_fragment)
+        .collect();
+    assert_eq!(zero_fragments.len(), 2);
+    let (head, tail) =
+        build_outer_fragments(&frame(LOCAL_TEID_A, &zero_fragments[0]), 1_000, 0x6c01);
+    let _ = captured_ipv4(&ue_capture);
+    send(&[&head, &tail, &frame(LOCAL_TEID_A, &zero_fragments[1])]);
+    let outcomes = drain_consumer(port.as_ref(), window);
+    assert_eq!(outcomes.len(), 2);
+    let batch = outcomes
+        .iter()
+        .find_map(|event| match event {
+            GtpuDownlinkEvent::Fragmented(batch) => Some(batch),
+            _ => None,
+        })
+        .expect("over-MTU DF origin fragment must be re-fragmented");
+    let sibling = outcomes
+        .iter()
+        .find_map(|event| match event {
+            GtpuDownlinkEvent::Decapsulated(packet) => Some(packet),
+            _ => None,
+        })
+        .expect("fitting DF sibling must remain independent");
+    assert_eq!(batch.fragments().len(), 2);
+    for fragment in batch.fragments() {
+        assert_eq!(&fragment[4..6], &[0, 0]);
+        assert_eq!(fragment[6] & 0x60, 0x20, "DF cleared, MF retained");
+    }
+    let refusals = injector.counters().zero_identification_refusals;
+    assert_eq!(
+        injector.inject(batch.into()),
+        Err(GtpuDownlinkInjectionError::ZeroIdentificationFragment)
+    );
+    assert_eq!(
+        injector.counters().zero_identification_refusals,
+        refusals + 1
+    );
+    assert!(
+        captured_ipv4(&ue_capture).is_empty(),
+        "refused batch emitted no packet"
+    );
+    assert_eq!(sibling.inner_packet(), zero_fragments[1]);
+    assert_eq!(injector.inject(sibling.into()), Ok(1));
+    let mut missing = [0_u8; 4_096];
+    assert!(
+        ue.recv_from(&mut missing).is_err(),
+        "the refused datagram is lost"
+    );
+    let wire = captured_ipv4(&ue_capture);
+    assert_eq!(esp_spis(&wire), [OUTBOUND_SPI_A]);
+    assert_eq!(wire_inner_packets(&wire), [zero_fragments[1].clone()]);
+
     drop(port);
     backend.remove_device(&device).await?;
     drop(net);
     eprintln!(
-        "OPC_GTPU_DOWNLINK_INNER_FRAGMENT_HAND_OFF_PROVEN: every inner IPv4 fragment of a context with a downlink inner MTU returned by the consumer with its bearer mark (outer-fragmented first fragment, reordered, dedicated via ESP) under connection tracking, none stranded in a host reassembly queue; a wrong inner header checksum dropped as by the kernel's IPv4 input, trailing octets trimmed; a fragment flood overflows only its own queue"
+        "OPC_GTPU_DOWNLINK_INNER_FRAGMENT_HAND_OFF_PROVEN: real receive outcomes use the production injector with exact marks and bytes; outer-fragmented, reordered and dedicated fragments reassemble with conntrack; malformed headers are refused and trailing bytes trimmed; queue flood is isolated; zero-ID origin-fragment batch is refused before sending"
     );
     Ok(())
 }
