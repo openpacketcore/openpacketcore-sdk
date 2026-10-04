@@ -9,6 +9,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- `opc-session-store`: during a dynamic-membership transition, a topology
+  barrier, reconciler pass or commit that started before a terminal step no
+  longer closes a node's application admission after that step settled it.
+  Local admission work now shares one process-local gate, and a barrier that
+  waited for it rechecks exact staging first; the reconciler and
+  `commit_topology_transition` close admission only for a request the node
+  still stages. Before, an abort followed at once by staging a replacement, a
+  late commit of an aborted request, or a repeated commit of a completed
+  request while the next one was staged left the node closed with nothing to
+  reopen it, which on the Raft leader stopped session reads and writes
+  cluster-wide. A member that already finalized a request now acknowledges
+  its voting barrier, so a coordinator whose followers finalized first can
+  still complete. No wire format, durable state or production API changes.
+
 - `opc-gtpu-dataplane`: TFT classification can use a qualified private
   map-in-map RCU grace when GLOBAL membarrier is unavailable, including
   `nohz_full`. GLOBAL remains preferred, and unknown or realtime profiles
