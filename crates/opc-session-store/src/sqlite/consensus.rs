@@ -5836,7 +5836,7 @@ pub(crate) struct SqliteConsensusCore {
     pub(crate) snapshot_publication_indeterminate: Arc<AtomicBool>,
     pub(crate) caps: BackendCapabilities,
     pub(crate) snapshot_gate: Arc<tokio::sync::Mutex<()>>,
-    /// Only one unvalidated receiver may own disk space for this core.
+    /// Bound the current receiver plus OpenRaft's transient replacement handle.
     pub(crate) snapshot_receive_admission: Arc<tokio::sync::Semaphore>,
     pub(crate) applied_progress: tokio::sync::watch::Sender<Option<LogId<SessionConsensusNodeId>>>,
     /// The latest process-owned install and its completion. This is not
@@ -6610,7 +6610,9 @@ impl SqliteConsensusCore {
             // advertised profile rather than SQLite's standalone ceiling.
             caps: backend.consensus_capabilities(),
             snapshot_gate: Arc::new(tokio::sync::Mutex::new(())),
-            snapshot_receive_admission: Arc::new(tokio::sync::Semaphore::new(1)),
+            snapshot_receive_admission: Arc::new(tokio::sync::Semaphore::new(
+                crate::consensus::snapshot::SNAPSHOT_RECEIVER_SLOTS,
+            )),
             applied_progress,
             snapshot_install_progress,
             snapshot_install_failure,
