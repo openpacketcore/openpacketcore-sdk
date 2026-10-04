@@ -2,6 +2,10 @@
 //!
 //! Provides clock skew, network partition, and fault injection fixtures.
 //! This is an internal testkit crate and is not published.
+//!
+//! The Linux mTLS qualification harness reads Git provenance through bounded
+//! pipes. Interrupted reads retain accumulated output and byte limits while
+//! observing termination requests; the command deadline remains fixed.
 
 #[cfg(feature = "consumer-fixture")]
 pub mod authenticated_consumer_fixture;

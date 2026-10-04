@@ -9,6 +9,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- `opc-session-testkit`: preserve bounded candidate Git output across
+  interrupted pipe reads, including accumulated byte limits and termination
+  requests. Retries resume the same pipe under the existing command deadline;
+  overflow and terminal I/O errors still fail qualification. Fixes #831.
+
 - `opc-gtpu-dataplane`: TFT classification can use a qualified private
   map-in-map RCU grace when GLOBAL membarrier is unavailable, including
   `nohz_full`. GLOBAL remains preferred, and unknown or realtime profiles
