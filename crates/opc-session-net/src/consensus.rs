@@ -6899,13 +6899,15 @@ mod tests {
             "cancelling the caller must leave its detached replacement setup alive"
         );
         drop(pool_owner);
-        tokio::time::timeout(Duration::from_secs(1), async {
-            while accounting.snapshot().1 < 2 {
-                tokio::task::yield_now().await;
-            }
-        })
+        let mut accounting_changed = accounting.subscribe_changed();
+        let settled = Arc::clone(&accounting);
+        tokio::time::timeout(
+            Duration::from_secs(1),
+            accounting_changed.wait_for(move |_| settled.snapshot().1 >= 2),
+        )
         .await
-        .expect("pool shutdown must settle the detached replacement setup");
+        .expect("pool shutdown must settle the detached replacement setup")
+        .expect("accounting watch channel must outlive the waiter");
         assert_eq!(accounting.snapshot(), (2, 2, 1, 1));
     }
 
@@ -7010,13 +7012,15 @@ mod tests {
             "caller cancellation must not supersede the detached new-epoch setup"
         );
         drop(pool_owner);
-        tokio::time::timeout(Duration::from_secs(1), async {
-            while accounting.snapshot().1 < 2 {
-                tokio::task::yield_now().await;
-            }
-        })
+        let mut accounting_changed = accounting.subscribe_changed();
+        let settled = Arc::clone(&accounting);
+        tokio::time::timeout(
+            Duration::from_secs(1),
+            accounting_changed.wait_for(move |_| settled.snapshot().1 >= 2),
+        )
         .await
-        .expect("pool shutdown must settle the detached new-epoch setup");
+        .expect("pool shutdown must settle the detached new-epoch setup")
+        .expect("accounting watch channel must outlive the waiter");
         assert_eq!(accounting.snapshot(), (2, 2, 1, 1));
     }
 
@@ -7166,13 +7170,15 @@ mod tests {
             "cancelling the original caller must not terminalize the material-successor attempt"
         );
         drop(pool_owner);
-        tokio::time::timeout(Duration::from_secs(1), async {
-            while accounting.snapshot().1 < 2 {
-                tokio::task::yield_now().await;
-            }
-        })
+        let mut accounting_changed = accounting.subscribe_changed();
+        let settled = Arc::clone(&accounting);
+        tokio::time::timeout(
+            Duration::from_secs(1),
+            accounting_changed.wait_for(move |_| settled.snapshot().1 >= 2),
+        )
         .await
-        .expect("pool shutdown must settle the detached material-successor attempt");
+        .expect("pool shutdown must settle the detached material-successor attempt")
+        .expect("accounting watch channel must outlive the waiter");
         assert_eq!(accounting.snapshot(), (2, 2, 1, 1));
     }
 
@@ -9224,8 +9230,10 @@ mod tests {
         assert!(pool.overflow.connection.lock().await.is_some());
 
         tokio::time::advance(Duration::from_millis(1)).await;
+        let at_reuse_boundary = tokio::time::Instant::now();
         wait_for_cached_lane_to_empty(&pool, ConsensusConnectionLane::Primary).await;
         wait_for_cached_lane_to_empty(&pool, ConsensusConnectionLane::Overflow).await;
+        assert_eq!(tokio::time::Instant::now(), at_reuse_boundary);
         for probe in [primary_probe, overflow_probe] {
             assert_eq!(probe.recorded_retirement_count(), 1);
             assert_eq!(
@@ -9760,7 +9768,9 @@ mod tests {
             "the reaper must wait for the in-flight lane owner"
         );
         drop(in_flight);
+        let released_at = tokio::time::Instant::now();
         wait_for_cached_lane_to_empty(&pool, ConsensusConnectionLane::Primary).await;
+        assert_eq!(tokio::time::Instant::now(), released_at);
         assert_eq!(retirement_probe.recorded_retirement_count(), 1);
         assert_eq!(
             retirement_probe.recorded_retirement_reason(),
