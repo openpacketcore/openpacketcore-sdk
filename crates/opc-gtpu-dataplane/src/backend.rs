@@ -377,6 +377,20 @@ pub trait GtpuDataplaneBackend: Send + Sync + std::fmt::Debug {
         GtpuCapability::Missing
     }
 
+    /// Explain a current non-Available TFT capability without exposing values.
+    ///
+    /// Existing implementations inherit a coarse reason from their capability
+    /// method. Native adapters may provide a more specific prerequisite or
+    /// state reason. `None` means Available at the time of this observation;
+    /// neither this method nor the older capability method authorizes a write.
+    fn tft_uplink_classification_unavailable_reason(
+        &self,
+    ) -> Option<crate::TftUplinkClassificationUnavailableReason> {
+        crate::TftUplinkClassificationUnavailableReason::for_capability(
+            self.tft_uplink_classification_capability(),
+        )
+    }
+
     /// Validate whether one complete TFT classifier can be represented by this
     /// backend without changing runtime state.
     ///
@@ -1352,6 +1366,27 @@ mod tests {
     #[derive(Debug)]
     struct LegacyExternalBackend;
 
+    #[test]
+    fn tft_unavailable_reason_default_tracks_existing_capability() {
+        use crate::TftUplinkClassificationUnavailableReason as Reason;
+        let backend = crate::MockGtpuDataplaneBackend::new();
+        for (capability, reason) in [
+            (GtpuCapability::Available, None),
+            (GtpuCapability::Missing, Some(Reason::BackendUnavailable)),
+            (GtpuCapability::Unknown, Some(Reason::BackendUnknown)),
+            (
+                GtpuCapability::PermissionDenied,
+                Some(Reason::PermissionDenied),
+            ),
+        ] {
+            backend.set_tft_uplink_classification_capability(capability);
+            assert_eq!(
+                backend.tft_uplink_classification_unavailable_reason(),
+                reason
+            );
+        }
+    }
+
     #[async_trait]
     impl GtpuDataplaneBackend for LegacyExternalBackend {
         async fn create_device(
@@ -1388,6 +1423,10 @@ mod tests {
     #[tokio::test]
     async fn legacy_external_implementer_gets_fail_closed_defaults() {
         let backend: Box<dyn GtpuDataplaneBackend> = Box::new(LegacyExternalBackend);
+        assert_eq!(
+            backend.tft_uplink_classification_unavailable_reason(),
+            Some(crate::TftUplinkClassificationUnavailableReason::BackendUnavailable)
+        );
         assert_eq!(
             backend.pdp_context_reconciliation_capabilities(),
             PdpContextReconciliationCapabilities::unsupported()

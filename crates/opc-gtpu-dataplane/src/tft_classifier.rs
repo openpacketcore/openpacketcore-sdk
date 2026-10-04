@@ -14,6 +14,58 @@ use opc_proto_tft::{
 
 use crate::{GtpBearerMark, GtpuError};
 
+/// Value-free reason why a backend cannot currently offer TFT classification.
+///
+/// This is a diagnostic snapshot, not mutation authority. It contains no
+/// subscriber, device, kernel-version, path, or raw operating-system values.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum TftUplinkClassificationUnavailableReason {
+    /// The backend does not provide a more specific reason for missing support.
+    BackendUnavailable,
+    /// The backend cannot currently determine its capability.
+    BackendUnknown,
+    /// The platform, BPF filesystem, or kernel BTF prerequisite is unavailable.
+    EnvironmentUnavailable,
+    /// Required network-administration or BPF permissions are unavailable.
+    PermissionDenied,
+    /// No qualified, usable reader-grace mechanism is available.
+    ReaderGraceUnavailable,
+    /// There is no managed device on which to prove TFT readiness.
+    NoManagedDevice,
+    /// The managed-device inventory could not be inspected.
+    DeviceInventoryUnavailable,
+    /// A managed device is reserved for cleanup rather than traffic.
+    CleanupOnly,
+    /// A managed device has an unresolved successor transition.
+    SuccessorPending,
+    /// The current attachment, program, or map identity could not be proven.
+    DatapathNotCurrent,
+    /// The TFT schema marker is unreadable or does not identify the current ABI.
+    SchemaNotCurrent,
+}
+
+impl TftUplinkClassificationUnavailableReason {
+    pub(crate) const fn for_capability(capability: crate::GtpuCapability) -> Option<Self> {
+        match capability {
+            crate::GtpuCapability::Available => None,
+            crate::GtpuCapability::Missing => Some(Self::BackendUnavailable),
+            crate::GtpuCapability::Unknown => Some(Self::BackendUnknown),
+            crate::GtpuCapability::PermissionDenied => Some(Self::PermissionDenied),
+        }
+    }
+
+    pub(crate) const fn capability(self) -> crate::GtpuCapability {
+        match self {
+            Self::BackendUnknown | Self::NoManagedDevice | Self::DeviceInventoryUnavailable => {
+                crate::GtpuCapability::Unknown
+            }
+            Self::PermissionDenied => crate::GtpuCapability::PermissionDenied,
+            _ => crate::GtpuCapability::Missing,
+        }
+    }
+}
+
 /// One bearer participating in a shared-PAA TFT classifier.
 #[derive(Clone, PartialEq, Eq)]
 pub struct TftUplinkBearer {

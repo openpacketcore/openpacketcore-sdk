@@ -194,14 +194,29 @@ contexts must be drained before an SDK downgrade. See
   uplink continues through removal without any row being read; it rejects a
   tombstone without a default bearer. Before deleting any row, each removal
   attempt waits for every tc invocation that could have copied the active
-  selector before the tombstone, using the qualified GLOBAL membarrier grace
-  of grouped selectors. Where that grace is unavailable (PREEMPT_RT,
-  `nohz_full`, an unrecognized version string, or a refused `membarrier`
-  query), TFT classification reports `Missing`, and both reconciliation that
+  selector before the tombstone. The adapter prefers the qualified GLOBAL
+  membarrier grace. If GLOBAL is unavailable, including on `nohz_full`, TFT
+  uses a successful userspace update of a private, unpinned ARRAY_OF_MAPS.
+  The reviewed kernel path waits for a full RCU grace for non-sleepable TC
+  readers. This fallback requires the recognized non-realtime SMP build
+  profile and Linux 6.8–6.19, 7.0–7.2, or `5.14.0-427.*el9_4*`; object
+  loadability and exact graph/schema readback remain separate prerequisites.
+  Both private map creation and a real update must succeed before the fallback
+  is offered, and every reclamation performs a fresh wait. Reusing a retained
+  inactive bank also waits before deleting or overwriting its rows. Where
+  neither grace is qualified and usable, TFT classification reports `Missing`,
+  and both reconciliation that
   would install or replace a classifier and exact removal refuse with
   `UnsupportedFeature` before any mutation, leaving any published classifier
   complete. A wait that fails after the tombstone is published deletes
-  nothing and returns `Indeterminate` for a retry. Its durable
+  nothing and returns `Indeterminate` for a retry; a failed bank-reuse wait
+  preserves both banks and the active selector.
+  `tft_uplink_classification_unavailable_reason` adds a value-free diagnostic
+  reason without granting mutation authority. PREEMPT_RT, unreviewed fallback
+  releases, and unknown build profiles remain refused. This does not change
+  grouped-selector grace or qualify sleepable BPF, packet drain, or latency.
+  See the [kernel grace contract](../../docs/rfc/016-opaque-gtpu-selector-namespace.md#tft-reader-grace).
+  Its durable
   dense-rank cursor authorizes each active-row deletion before it occurs, so a
   retry accepts only the exact remaining suffix plus any acknowledged-loss
   rows in the authorized prefix; an unexplained missing row fails closed.

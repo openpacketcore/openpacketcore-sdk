@@ -641,6 +641,56 @@ Linux [membarrier.c](https://github.com/torvalds/linux/blob/v6.12/kernel/sched/m
 [network reader context](https://github.com/torvalds/linux/blob/v6.12/net/core/dev.c),
 and [kernel build profile](https://github.com/torvalds/linux/blob/v6.12/init/Makefile).
 
+#### TFT reader grace
+
+TFT row reclamation is separate from grouped-selector retirement above. It
+prefers the existing GLOBAL boundary, but when GLOBAL is unavailable it may
+use a successful userspace ARRAY_OF_MAPS update on SDK-owned private maps.
+The maps are unpinned, unattached, and absent from the datapath graph. The
+kernel's `maybe_wait_bpf_programs` completes `synchronize_rcu` before returning
+success on [Linux 6.8](https://github.com/torvalds/linux/blob/v6.8/kernel/bpf/syscall.c)
+and the [5.14.0-427 enterprise source](https://gitlab.com/redhat/centos-stream/src/kernel/centos-stream-9/-/blob/kernel-5.14.0-427.el9/kernel/bpf/syscall.c).
+[Linux 6.19](https://github.com/torvalds/linux/blob/v6.19/kernel/bpf/syscall.c)
+and [7.2](https://github.com/torvalds/linux/blob/v7.2/kernel/bpf/syscall.c)
+use `synchronize_rcu_expedited`, which still waits for full kernel RCU grace
+and is distinct from expedited membarrier. Failed updates and sleepable BPF
+readers are excluded. TC egress executes within `rcu_read_lock_bh`; Linux 5.0
+and later include BH readers in ordinary RCU grace, as documented in
+[rcupdate.h](https://github.com/torvalds/linux/blob/v5.14/include/linux/rcupdate.h).
+
+The fallback retains the recognized non-realtime SMP build-profile check and
+admits only reviewed release families 6.8–6.19, 7.0–7.2, and
+`5.14.0-427.*el9_4*`. Unknown/future releases and PREEMPT_RT remain refused.
+Private-map creation and an initial update must succeed before capability is
+offered. Every removal attempt publishes its exact tombstone, completes a
+fresh grace, then deletes canonical rows. Reusing an old inactive bank also
+waits before the first row mutation. A failed wait retains the rows and
+returns indeterminate; initial unavailability refuses before mutation. This
+does not alter grouped-selector retirement or imply packet/NIC drain.
+
+Privileged qualification instruments actual RCU entry/return, filtering the
+updater's exact process/thread identity inside BPF before map access, and
+requires the interval to contain the end of an already-running,
+non-sleepable TC test reader on another CPU. The reader must retain both old
+row samples before post-grace replacement. Exact event pairs, overlap, and an
+ordinary ARRAY negative control are mandatory. A grace in a separate thread
+must leave both trace records untouched. Perf task binding alone is not a BPF
+filter: the [enterprise kprobe path](https://gitlab.com/redhat/centos-stream/src/kernel/centos-stream-9/-/blob/kernel-5.14.0-427.el9/kernel/trace/trace_kprobe.c)
+invokes attached BPF before perf event filtering. Simulated selection and this
+primitive proof alone do not establish native nohz_full execution, RT support,
+forwarding, or latency.
+
+The separate `TFT nohz_full` workflow matrix boots the pinned Linux 6.8 and
+enterprise 5.14 guests with `nohz_full=1`. Each requires a changed guest boot
+ID, `CONFIG_NO_HZ_FULL=y`, an effective CPU mask, and GLOBAL absent from the
+actual membarrier query. With that profile required before any test skip path,
+the three existing TFT packet proofs must report production Aya capability,
+exact install/replacement and retained inactive-bank reuse, and removal with
+default-bearer forwarding. The kernel reader/control proof also remains
+mandatory. Binaries, source revision, offline package versions and checksums,
+kernel identity, and proof logs are retained. These guest gates do not qualify
+PREEMPT_RT, bare-metal scheduling, or production latency.
+
 ### 5.5 Marked Child Under a Resident Default
 
 `reconcile_bearer` consumes a current exact default claim and admits one marked

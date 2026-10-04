@@ -2487,8 +2487,7 @@ mod tests {
         fixture.shutdown().await.expect("shut down fixture");
     }
 
-    #[tokio::test]
-    async fn fixture_prepares_and_executes_a_real_authenticated_three_voter_transition() {
+    async fn assert_fresh_fixture_commits_without_replay(lose_response: bool) {
         let tenant = fixture_tenant();
         let fixture =
             AuthenticatedPreparedFencedTransitionFixture::start([fixture_scope(tenant.clone())])
@@ -2500,27 +2499,102 @@ mod tests {
             .expect("open opaque local-AEAD facade");
         let request_id = FencedTransitionRequestId::from_bytes([0x31; 16]);
         let deadline = tokio::time::Instant::now() + Duration::from_secs(3);
+        let request = fixture_request(request_id, tenant);
+        let expected_record = request.mutation().record().expect("create request").clone();
         let mut prepared = facade
-            .prepare_fenced_transition(
-                fixture_request(request_id, tenant),
-                fixture_budget(deadline),
-            )
+            .prepare_fenced_transition(request.clone(), fixture_budget(deadline))
             .await
             .expect("prepare through the production facade");
 
-        prepared
-            .execute_once()
-            .await
-            .expect("one real authenticated transition commits");
+        if lose_response {
+            fixture.lose_next_fenced_transition_response();
+        }
+        let execution = prepared.execute_once().await;
+        let ambiguous = matches!(
+            &execution,
+            Err(FencedTransitionExecuteError::OutcomeUnknown { .. })
+        );
+        if lose_response {
+            assert!(
+                matches!(&execution, Err(FencedTransitionExecuteError::OutcomeUnknown { request_id: observed }) if *observed == request_id),
+                "withholding the real response must expose this exact request's unknown outcome"
+            );
+            assert!(
+                !fixture
+                    .lose_next_fenced_transition_response
+                    .load(Ordering::Acquire),
+                "the response-loss hook must run after the real service returns"
+            );
+        }
+        let outcome = match execution {
+            Ok(outcome) => outcome,
+            Err(FencedTransitionExecuteError::OutcomeUnknown {
+                request_id: observed,
+            }) => {
+                assert!(
+                    observed == request_id,
+                    "only the exact retained request may recover"
+                );
+                // A capped physical attempt may commit without delivering its
+                // response. This same handle can only read its exact receipt
+                // under the original deadline; it cannot dispatch again.
+                let receipt = prepared.status_until_terminal(deadline).await.expect(
+                    "the exact transition receipt must resolve before its original deadline",
+                );
+                let FencedTransitionStatus::Recorded(result) = receipt else {
+                    panic!("only a successful authoritative receipt proves the transition: {receipt:?}");
+                };
+                (*result).expect("one real authenticated transition commits")
+            }
+            Err(error) => panic!("fresh fixture dispatch failed before exact recovery: {error:?}"),
+        };
+        assert!(
+            outcome.matches_request(&request),
+            "the committed outcome must match the complete request"
+        );
+        if ambiguous {
+            assert!(
+                fixture.diagnostics().fenced_transition_status_calls() > 0,
+                "unknown completion must be proved with authoritative receipt reads"
+            );
+        }
         assert_eq!(
             fixture.diagnostics().fenced_transition_calls(),
             1,
             "the fresh affine handle dispatches exactly one physical mutation"
         );
 
+        let observed = tokio::time::timeout_at(
+            deadline,
+            facade.observe_fenced_transition(&expected_record.key),
+        )
+        .await
+        .expect("authoritative readback must finish before the original deadline")
+        .expect("read the record through the same authenticated protected facade");
+        assert_eq!(observed.record(), Some(&expected_record));
+        assert_eq!(observed.current_fence(), outcome.lease().fence());
+        assert_eq!(
+            fixture.diagnostics().fenced_transition_calls(),
+            1,
+            "receipt recovery and readback never replay the mutation"
+        );
+        assert_eq!(fixture.diagnostics().general_mutation_calls(), 0);
+        assert_eq!(fixture.diagnostics().general_compare_and_set_calls(), 0);
+
         drop(prepared);
         drop(facade);
         fixture.shutdown().await.expect("shut down fixture");
+    }
+
+    #[tokio::test]
+    async fn fixture_prepares_and_executes_a_real_authenticated_three_voter_transition() {
+        assert_fresh_fixture_commits_without_replay(false).await;
+    }
+
+    #[tokio::test]
+    async fn fixture_recovers_a_fresh_transition_response_loss_within_original_budget_without_replay(
+    ) {
+        assert_fresh_fixture_commits_without_replay(true).await;
     }
 
     #[tokio::test]
