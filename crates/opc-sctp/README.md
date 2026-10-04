@@ -27,6 +27,9 @@ Diameter transports are outside the current crate boundary.
 - Messaging: `OutboundMessage`, `InboundMessage`, `SctpEvent`,
   `SctpPeerAddrState`, `SctpAuthenticationIndication`, `SctpEndpoint`,
   `SctpAssociation`, and its exclusive send/receive halves.
+- Wire DATA inspection: `DataChunk`, `DataChunkFlags`, and `DataChunkError`
+  decode one exactly padded DATA chunk without allocating and can copy a
+  complete record into `InboundMessage` for existing admission checks.
 - N2 framing: `n2::UnprotectedN2Profile`, `n2::UnprotectedN2Association`,
   `n2::N2Inbound`, `n2::N2Error`, and `n2::NGAP_DEFAULT_PORT` provide strict
   PPID-60 framing with bounded, redacted diagnostics.
@@ -62,6 +65,32 @@ async fn send_ngap(
     Ok(())
 }
 ```
+
+### Inspecting wire DATA chunks
+
+`DataChunk::decode(&wire)` borrows one RFC 9260 section 3.3.1 DATA chunk from
+a fixture or capture. It exposes I/U/B/E, TSN, stream identifier, stream
+sequence number, host-order `PayloadProtocolIdentifier`, and the exact user
+data slice. Reserved flag bits are ignored; unordered SSNs remain raw
+observations with no delivery meaning. Debug and errors omit user data.
+
+The slice must contain exactly the declared Length rounded up to four octets,
+with zero to three zero alignment octets outside Length. Short headers,
+impossible lengths, Length 16 (No User Data), truncated data, missing/nonzero
+padding and trailing bytes are rejected. Checking padding contents is this
+standalone fixture/capture API's strict envelope policy; general SCTP receivers
+ignore padding. The 16-bit Length bounds user data to 65,519 octets. An SCTP
+common header, bundled chunks, checksums and authentication are outside this
+decoder's scope.
+
+`chunk.into_inbound_message(assoc_id)` allocates and copies user data into
+owned `Bytes`. The caller supplies association metadata because no association
+ID is carried in DATA. Only B = E = 1 converts; first, middle and last fragments
+return `DataChunkError::Fragmented` before copying. U maps to
+`DeliveryOrder::Unordered`. Passing the result to
+`UnprotectedN2Profile::admit` applies the kernel path's PPID 60, ordered delivery
+and size checks. This conversion grants no association or protection authority;
+live SCTP reassembly and delivery remain kernel-owned.
 
 ### Strict unprotected N2 framing
 
