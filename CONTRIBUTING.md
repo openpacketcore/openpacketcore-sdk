@@ -30,6 +30,29 @@ cargo test --workspace --all-features -- --test-threads=4
 kubectl kustomize operators/sdk-reference-operator/config/default > /dev/null
 ```
 
+### Reusing development build caches
+
+Keep one stable build directory per worktree and compatible build profile during
+development. The default worktree-local `target/` is suitable for ordinary Cargo
+commands. If a lane requires `CARGO_TARGET_DIR`, choose a stable path within that
+worktree, such as `target/core-tests` or `target/unsupported-selector`, and reuse
+it across source edits. Do not suffix development cache paths with a commit,
+source digest, timestamp, or attempt number, and do not share a writable target
+directory between independently active worktrees.
+
+Cargo tracks changed inputs and rebuilds affected crates. Run focused tests
+during iteration, then the required validation gates on the final candidate.
+Record source revision (and any uncommitted changes), toolchain, profile, command
+and result separately from the cache path. Reused compilation does not allow a
+passing test result from an earlier revision to count for the current one.
+
+Preserve the CI and performance profiles below. In particular,
+`CARGO_INCREMENTAL=0` disables per-crate incremental compilation; it does not
+require clearing compiled dependencies. Do not run `cargo clean` or allocate a
+fresh cache as a routine retry. Use an isolated clean build when qualification
+explicitly requires one or when investigating a demonstrated cache problem.
+Keep evidence outside disposable caches and check active users before cleanup.
+
 ## Validation gates
 
 All pull requests must be green on the following commands before review:
