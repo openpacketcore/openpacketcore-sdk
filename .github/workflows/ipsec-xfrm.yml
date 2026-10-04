@@ -163,6 +163,7 @@ jobs:
           export CARGO_TARGET_DIR="${RUNNER_TEMP}/xfrm-target"
           cargo test --locked -p opc-ipsec-xfrm \
             --features ikev2 \
+            --lib \
             --test xfrm_auth_only_privileged \
             --test xfrm_dscp_privileged \
             --test xfrm_namespace_bound_privileged \
@@ -173,6 +174,46 @@ jobs:
             --test xfrm_relocation_privileged \
             --test xfrm_sa_relocation_recovery_privileged \
             --no-run
+
+      - name: Verify Linux SA direction attribute number
+        run: |
+          set -euo pipefail
+          uname -r
+          export CARGO_TARGET_DIR="${RUNNER_TEMP}/xfrm-target"
+          test_binary="$(
+            cargo test --locked -p opc-ipsec-xfrm \
+              --features ikev2 --lib --no-run --message-format=json \
+            | python3 -c '
+          import json
+          import sys
+
+          executables = [
+              event.get("executable")
+              for line in sys.stdin
+              if (event := json.loads(line)).get("reason") == "compiler-artifact"
+              and event.get("target", {}).get("name") == "opc_ipsec_xfrm"
+              and event.get("executable")
+          ]
+          if len(executables) != 1:
+              raise SystemExit("expected exactly one XFRM unit test executable")
+          print(executables[0])
+          '
+          )"
+          selector=linux::tests::sa_direction_attribute_round_trips_on_kernel
+          "${test_binary}" --ignored --exact "${selector}" --list | python3 -c '
+          import sys
+
+          selected = [
+              line.removesuffix(": test")
+              for line in sys.stdin.read().splitlines()
+              if line.endswith(": test")
+          ]
+          if selected != [sys.argv[1]]:
+              raise SystemExit(f"SA direction test must resolve exactly once: {selected!r}")
+          ' "${selector}"
+          sudo unshare -n -- env OPC_XFRM_RUN_SA_DIRECTION_PRIVILEGED=1 \
+            "${test_binary}" --ignored --exact "${selector}" \
+            --nocapture --test-threads=4
 
       - name: Run namespace-bound counter and first-packet proof
         run: |

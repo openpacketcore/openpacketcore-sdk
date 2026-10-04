@@ -4754,7 +4754,8 @@ pub(crate) fn test_outbound_binding_readback_bodies(
         legacy.extend_from_slice(key.as_bytes());
         append_attr(&mut sa, XFRMA_ALG_AUTH, &legacy)?;
     }
-    append_attr(&mut sa, XFRMA_SA_DIR, &[XFRM_SA_DIR_OUT])?;
+    // Independent Linux UAPI fixture: XFRMA_SA_DIR = 33, XFRM_SA_DIR_OUT = 2.
+    append_attr(&mut sa, 33, &[2])?;
     Ok((policy, sa))
 }
 
@@ -5578,6 +5579,123 @@ mod tests {
                 operation: "query_esp_peer_observation_registration"
             })
         ));
+    }
+
+    #[test]
+    fn esp_peer_observation_registration_checks_uapi_sa_direction() {
+        let parameters = relocation_parameters();
+        let requested = observation_key(&parameters);
+        let clean = encode_sa_info(&parameters).unwrap();
+        assert!(parse_esp_peer_observation_registration(&clean, requested).is_ok());
+
+        // Literal UAPI numbers keep the reply independent of the sys constants.
+        let mut inbound = clean.clone();
+        append_attr(&mut inbound, 33, &[1]).unwrap();
+        assert!(parse_esp_peer_observation_registration(&inbound, requested).is_ok());
+
+        let mut outbound = clean.clone();
+        append_attr(&mut outbound, 33, &[2]).unwrap();
+        assert!(matches!(
+            parse_esp_peer_observation_registration(&outbound, requested),
+            Err(XfrmError::StateMismatch {
+                operation: "query_esp_peer_observation_registration"
+            })
+        ));
+
+        // Keepalive is unmodeled: both its real u32 payload and a malformed
+        // one-byte value resembling an inbound direction must be rejected.
+        for value in [30_u32.to_ne_bytes().as_slice(), &[1]] {
+            let mut keepalive = clean.clone();
+            append_attr(&mut keepalive, 34, value).unwrap();
+            assert!(parse_esp_peer_observation_registration(&keepalive, requested).is_err());
+        }
+    }
+
+    #[test]
+    fn outbound_binding_sa_parser_checks_uapi_sa_direction() {
+        let request = outbound_binding_request();
+        let parameters = &request.sa.parameters;
+        let expectation = validate_outbound_request(&request).unwrap();
+        let mut clean = encode_sa_binding_readback(parameters);
+        remove_route_attr(&mut clean, XFRM_USER_SA_INFO_LEN, 33);
+        assert!(parse_outbound_sa_binding_snapshot(&clean, &expectation, Some(parameters)).is_ok());
+
+        let mut outbound = clean.clone();
+        append_attr(&mut outbound, 33, &[2]).unwrap();
+        assert!(
+            parse_outbound_sa_binding_snapshot(&outbound, &expectation, Some(parameters)).is_ok()
+        );
+
+        let mut inbound = clean.clone();
+        append_attr(&mut inbound, 33, &[1]).unwrap();
+        assert!(
+            parse_outbound_sa_binding_snapshot(&inbound, &expectation, Some(parameters)).is_err()
+        );
+
+        for value in [30_u32.to_ne_bytes().as_slice(), &[2]] {
+            let mut keepalive = clean.clone();
+            append_attr(&mut keepalive, 34, value).unwrap();
+            assert!(
+                parse_outbound_sa_binding_snapshot(&keepalive, &expectation, Some(parameters),)
+                    .is_err()
+            );
+        }
+    }
+
+    #[tokio::test]
+    #[ignore = "requires Linux 6.10+, CAP_NET_ADMIN, XFRM, and a fresh network namespace"]
+    async fn sa_direction_attribute_round_trips_on_kernel() -> Result<(), XfrmError> {
+        assert_eq!(
+            std::env::var("OPC_XFRM_RUN_SA_DIRECTION_PRIVILEGED").as_deref(),
+            Ok("1"),
+            "set OPC_XFRM_RUN_SA_DIRECTION_PRIVILEGED=1 inside a fresh privileged netns"
+        );
+
+        let backend = LinuxXfrmBackend::new();
+        let parameters = sa_parameters();
+        let mut body = encode_sa_info(&parameters)?;
+        append_attr(&mut body, XFRMA_SA_DIR, &[XFRM_SA_DIR_IN])?;
+        backend
+            .run_ack(
+                "install_direction_tagged_sa",
+                XFRM_MSG_NEWSA,
+                NLM_F_REQUEST | NLM_F_ACK | NLM_F_CREATE | NLM_F_EXCL,
+                body,
+            )
+            .await?;
+
+        let body = encode_sa_id(
+            parameters.id.destination,
+            parameters.id.protocol,
+            parameters.id.spi,
+            None,
+        )?;
+        let response = backend
+            .transact_blocking(
+                "query_direction_tagged_sa",
+                XFRM_MSG_GETSA,
+                NLM_F_REQUEST | NLM_F_ACK,
+                body,
+            )
+            .await?
+            .expect("GETSA must return the installed state");
+        // Assert the kernel's raw attribute number and value independently of
+        // the constants used on install; an ACK alone can hide ignored attrs.
+        let direction = unique_route_attribute(
+            &response,
+            XFRM_USER_SA_INFO_LEN,
+            33,
+            "query_direction_tagged_sa",
+        )?;
+        assert_eq!(direction, Some([1].as_slice()));
+        backend
+            .remove_sa(RemoveSaRequest::new(
+                parameters.id.destination,
+                parameters.id.protocol,
+                parameters.id.spi,
+            ))
+            .await?;
+        Ok(())
     }
 
     #[test]
