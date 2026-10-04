@@ -28,7 +28,9 @@
 //!
 //! The fragments wait in their own backend-owned queue. A flood of them must
 //! overflow only that queue: the kernel drops and counts the excess, and
-//! over-MTU Don't Fragment packets and Echo are still served.
+//! over-MTU Don't Fragment packets and Echo are still served. The shared
+//! queue keeps its priority only for a bounded run, so that sustained Echo
+//! cannot keep the consumer from the fragments either.
 
 use super::*;
 use opc_gtpu_dataplane::control_port::{GtpuControlPort, GtpuControlPortError};
@@ -54,6 +56,12 @@ const CORE_MTU: usize = 1_500;
 /// 20 + 8 + 2,572 = the 2,600-octet inner datagram of the reproduction.
 const LARGE_PAYLOAD: usize = 2_572;
 const SIP_PORT: u16 = 5060;
+/// Datagrams the consumer takes from the shared queue in a row before the
+/// hand-off queues get one turn.
+const SHARED_QUEUE_RUN: usize = 8;
+/// Echo Requests waiting in the shared queue in the flood leg: more than two
+/// full runs.
+const ECHO_REQUESTS: usize = 20;
 /// `ipfrag_time` in the gateway namespace while this test runs: should a
 /// fragment be stranded in a host reassembly queue, it expires this soon and
 /// is not left behind for the tests that follow.
@@ -780,13 +788,15 @@ pub(super) async fn qualify() -> Result<(), Box<dyn std::error::Error>> {
     core_packets.extend(captured_ipv4(&pgw_capture));
     assert_eq!(plaintext_icmp(&core_packets), 0, "no ICMP toward the core");
 
-    // 7. The queue budget. With nobody draining, a flood of inner fragments
-    //    larger than the queue's receive buffer arrives, then three over-MTU
-    //    Don't Fragment datagrams and an Echo Request. The flood overflows
-    //    only its own queue: the kernel keeps at most one receive buffer of
-    //    fragments and counts the rest as dropped. Echo is served first, and
-    //    the over-MTU packets are served in turn with the fragments, none of
-    //    them lost.
+    // 7. The queue budget and the service order. With nobody draining, a
+    //    flood of inner fragments larger than the queue's receive buffer
+    //    arrives, then three over-MTU Don't Fragment datagrams and twenty
+    //    Echo Requests. The flood overflows only its own queue: the kernel
+    //    keeps at most one receive buffer of fragments and counts the rest
+    //    as dropped. Echo is served first, but only for a run of eight: then
+    //    one hand-off datagram is served, although Echo is still waiting.
+    //    The hand-off turns alternate between over-MTU packets and
+    //    fragments. No Echo and no over-MTU packet is lost.
     let receive_buffer = default_udp_receive_buffer();
     let flood_fragment = core_fragments(&datagram(0x67, 2_600), 1_400, 0x6700).swap_remove(0);
     assert_eq!(flood_fragment.len(), 1_396);
@@ -805,13 +815,33 @@ pub(super) async fn qualify() -> Result<(), Box<dyn std::error::Error>> {
         assert!(packet.len() > usize::from(SESSION_MTU));
         send(&[&frame(LOCAL_TEID, packet)]);
     }
-    peer.send_to(&echo, (EPDG_S2BU_IP, GTPU_PORT))?;
+    for _ in 0..ECHO_REQUESTS {
+        peer.send_to(&echo, (EPDG_S2BU_IP, GTPU_PORT))?;
+    }
     std::thread::sleep(Duration::from_millis(200));
     let events = drain_consumer(port.as_ref(), window);
-    match &events[0] {
-        GtpuDownlinkEvent::Control(event) => assert_eq!(event.bytes(), echo),
-        other => panic!("Echo must be served ahead of both hand-off backlogs, got {other:?}"),
-    }
+    // The shared queue is served first, for one run. Then the hand-off
+    // queues get one turn while Echo Requests are still waiting, and so on:
+    // sustained input on the shared queue cannot starve the hand-offs.
+    let control: Vec<usize> = events
+        .iter()
+        .enumerate()
+        .filter(|(_, event)| match event {
+            GtpuDownlinkEvent::Control(event) => {
+                assert_eq!(event.bytes(), echo);
+                true
+            }
+            _ => false,
+        })
+        .map(|(index, _)| index)
+        .collect();
+    let expected_control: Vec<usize> = (0..ECHO_REQUESTS)
+        .map(|echo| echo + echo / SHARED_QUEUE_RUN)
+        .collect();
+    assert_eq!(
+        control, expected_control,
+        "a run of {SHARED_QUEUE_RUN} from the shared queue, then one hand-off turn; no Echo lost"
+    );
     let fragmented: Vec<usize> = events
         .iter()
         .enumerate()
@@ -823,12 +853,12 @@ pub(super) async fn qualify() -> Result<(), Box<dyn std::error::Error>> {
         oversized.len(),
         "the fragment flood must not cost the over-MTU path a packet"
     );
-    // Both hand-off queues hold a backlog, so they are served strictly in
-    // turn: three over-MTU packets and three fragments alternate, whichever
-    // queue has the first turn. Neither class waits for the other's backlog.
+    // Both hand-off queues hold a backlog, so their turns alternate: three
+    // over-MTU packets and three fragments, whichever queue has the first
+    // turn. Neither class waits for the other's backlog.
     let turns: Vec<bool> = events
         .iter()
-        .skip(1)
+        .filter(|event| !matches!(event, GtpuDownlinkEvent::Control(_)))
         .take(6)
         .map(|event| matches!(event, GtpuDownlinkEvent::Fragmented(_)))
         .collect();
@@ -847,7 +877,7 @@ pub(super) async fn qualify() -> Result<(), Box<dyn std::error::Error>> {
             _ => false,
         })
         .count();
-    assert_eq!(events.len(), 1 + oversized.len() + accepted);
+    assert_eq!(events.len(), ECHO_REQUESTS + oversized.len() + accepted);
     assert!(
         (1..flood).contains(&accepted),
         "the flood must overflow the inner-fragment queue: {accepted} of {flood} accepted"
