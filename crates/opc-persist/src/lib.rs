@@ -56,6 +56,11 @@
 //! sequence pages. A coherent rollback of the entire database remains an
 //! external-checkpoint concern rather than evidence a local file can provide.
 //!
+//! Online recipient exports opened by
+//! [`ConsensusConfigStore::begin_recipient_audit_export`] keep a fixed expiry.
+//! Completion rechecks it after reading the independent checkpoint; expiry
+//! refuses completion and releases the export permit.
+//!
 //! ## Usage
 //!
 //! ```ignore
