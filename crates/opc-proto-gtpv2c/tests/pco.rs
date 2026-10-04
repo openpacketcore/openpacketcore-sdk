@@ -1870,3 +1870,115 @@ fn an_mtu_only_value_still_reports_empty_for_the_dns_fallback() {
     assert!(decoded.is_empty());
     assert!(decoded.dns_server_ipv4_all().is_empty());
 }
+
+#[test]
+fn configuration_atomicity_discards_valid_siblings_of_a_malformed_address_container() {
+    // All four address containers reject the complete configuration under
+    // this codec's atomicity policy. Keep the outer boundaries valid while
+    // varying the bad address length and its position among valid siblings.
+    let siblings: &[&[u8]] = &[
+        &[0x00, 0x0c, 0x04, 198, 51, 100, 1], // P-CSCF IPv4
+        &[0x00, 0x0d, 0x04, 8, 8, 8, 8],      // DNS IPv4
+    ];
+    for (identifier, valid_length, expected) in [
+        (0x0001u16, 16u8, PcoDecodeError::InvalidIpv6AddressLength),
+        (0x0003, 16, PcoDecodeError::InvalidIpv6AddressLength),
+        (0x000c, 4, PcoDecodeError::InvalidIpv4AddressLength),
+        (0x000d, 4, PcoDecodeError::InvalidIpv4AddressLength),
+    ] {
+        for length in [0, valid_length - 1, valid_length + 1] {
+            let mut malformed = identifier.to_be_bytes().to_vec();
+            malformed.push(length);
+            malformed.resize(3 + usize::from(length), 0);
+
+            for position in 0..=siblings.len() {
+                let mut contents = vec![0x80];
+                for sibling in &siblings[..position] {
+                    contents.extend_from_slice(sibling);
+                }
+                contents.extend_from_slice(&malformed);
+                for sibling in &siblings[position..] {
+                    contents.extend_from_slice(sibling);
+                }
+
+                assert_eq!(
+                    PcoAddressConfiguration::decode_network_contents(&contents),
+                    Err(expected),
+                    "container {identifier:#06x}, length {length}, position {position}"
+                );
+                assert_eq!(
+                    PcoAddressConfiguration::decode_network_contents_correlated(
+                        &contents,
+                        IpcpNakCorrelation::expecting(FIXTURE_IDENTIFIER),
+                    ),
+                    Err(expected),
+                    "correlated container {identifier:#06x}, length {length}, position {position}"
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn failure_policy_asymmetry_is_deliberate_ipcp_unit_local_vs_address_whole_value() {
+    // This test pins the documented asymmetry between IPCP (unit-local
+    // discard) and address containers (whole-value rejection) on values with
+    // the same shape: one valid DNS container, one malformed unit of each
+    // class. The IPCP fault leaves the sibling intact; the address fault
+    // rejects the configuration under this codec's atomicity policy.
+
+    // Case 1: malformed IPCP unit — sibling DNS container survives.
+    // The IPCP unit precedes the container, matching TS 24.008's ordering of
+    // configuration protocol options before additional parameters.
+    let ipcp_malformed = vec![
+        0x80, //
+        0x80, 0x21, 0x02, 0xaa, 0xbb, // IPCP shorter than RFC 1661 header
+        0x00, 0x0d, 0x04, 8, 8, 8, 8, // valid DNS IPv4
+    ];
+    let outcome = decode_correlated(&ipcp_malformed);
+    assert_eq!(outcome.ipcp_discards().len(), 1);
+    assert_eq!(
+        outcome.ipcp_discards()[0].reason(),
+        PcoIpcpDiscardReason::Malformed(PcoDecodeError::IpcpHeaderTruncated)
+    );
+    assert_eq!(outcome.ipcp_discards()[0].unit_index(), 0);
+    let expected = PcoAddressConfiguration {
+        dns_server_ipv4: vec![[8, 8, 8, 8]],
+        ..PcoAddressConfiguration::default()
+    };
+    assert_eq!(
+        outcome.configuration(),
+        &expected,
+        "IPCP unit-local discard must preserve the sibling address"
+    );
+    assert_eq!(
+        PcoAddressConfiguration::decode_network_contents(&ipcp_malformed),
+        Ok(expected.clone())
+    );
+
+    // Case 2: malformed address container — the earlier valid DNS is lost.
+    let address_malformed = vec![
+        0x80, //
+        0x00, 0x0d, 0x04, 8, 8, 8, 8, // valid DNS IPv4
+        0x00, 0x0c, 0x03, 198, 51, 100, // P-CSCF IPv4 with wrong length
+    ];
+    assert_eq!(
+        PcoAddressConfiguration::decode_network_contents(&address_malformed),
+        Err(PcoDecodeError::InvalidIpv4AddressLength),
+        "configuration-atomicity must reject the whole value, losing the valid DNS"
+    );
+
+    // Case 3: malformed IPv4 Link MTU — sibling DNS container survives,
+    // because TS 24.008 §10.5.6.3 mandates the receiver ignore it.
+    let mtu_malformed = vec![
+        0x80, //
+        0x00, 0x0d, 0x04, 8, 8, 8, 8, // valid DNS IPv4
+        0x00, 0x10, 0x01, 0x05, // Link MTU with wrong length (1, not 2)
+    ];
+    let decoded = PcoAddressConfiguration::decode_network_contents(&mtu_malformed)
+        .expect("a wrong-length Link MTU is ignored, not an error");
+    assert_eq!(decoded, expected);
+    let outcome = decode_correlated(&mtu_malformed);
+    assert_eq!(outcome.configuration(), &expected);
+    assert!(outcome.ipcp_discards().is_empty());
+}
