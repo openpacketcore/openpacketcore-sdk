@@ -1880,8 +1880,11 @@ mod tests {
             .succeeded();
     }
 
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn connection_attempt_guard_distinguishes_superseded_and_abandoned_terminals() {
+        let _guard = crate::test_support::SESSION_CONNECTION_METRICS_TEST_LOCK
+            .lock()
+            .await;
         let accounting = Arc::new(ConnectionAttemptTestAccounting::default());
         CONNECTION_ATTEMPT_TEST_ACCOUNTING
             .scope(Arc::clone(&accounting), async {
@@ -1896,7 +1899,65 @@ mod tests {
             })
             .await;
 
+        // A subscriber arriving after the task-local scope ended must observe
+        // the settled state without waiting for another transition.
+        let settled_at = tokio::time::Instant::now();
+        let mut changed = accounting.subscribe_changed();
+        tokio::time::timeout(
+            Duration::from_secs(1),
+            changed.wait_for(|_| accounting.snapshot() == (3, 3, 1, 1)),
+        )
+        .await
+        .expect("completed accounting is retained")
+        .expect("accounting remains open");
+        assert_eq!(tokio::time::Instant::now(), settled_at);
         assert_eq!(accounting.snapshot(), (3, 3, 1, 1));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn connection_attempt_watch_wakes_when_its_scoped_task_is_cancelled() {
+        let _guard = crate::test_support::SESSION_CONNECTION_METRICS_TEST_LOCK
+            .lock()
+            .await;
+        let accounting = Arc::new(ConnectionAttemptTestAccounting::default());
+        let mut changed = accounting.subscribe_changed();
+        let task = tokio::spawn(CONNECTION_ATTEMPT_TEST_ACCOUNTING.scope(
+            Arc::clone(&accounting),
+            async {
+                let _attempt = ConnectionAttemptMetricGuard::started();
+                std::future::pending::<()>().await;
+            },
+        ));
+        tokio::time::timeout(
+            Duration::from_secs(1),
+            changed.wait_for(|_| accounting.snapshot().0 == 1),
+        )
+        .await
+        .expect("scoped attempt starts")
+        .expect("accounting remains open");
+
+        // An unrelated task on the same runtime must not settle this scope.
+        drop(ConnectionAttemptMetricGuard::started());
+        assert_eq!(accounting.snapshot(), (1, 0, 0, 0));
+        let cancel_at = tokio::time::Instant::now() + Duration::from_millis(20);
+        let cancellation = tokio::spawn(async move {
+            tokio::time::sleep_until(cancel_at).await;
+            task.abort();
+            assert!(task
+                .await
+                .expect_err("attempt task is cancelled")
+                .is_cancelled());
+        });
+        tokio::time::timeout(
+            Duration::from_secs(1),
+            changed.wait_for(|_| accounting.snapshot() == (1, 1, 0, 1)),
+        )
+        .await
+        .expect("parked watch lets the paused cancellation timer advance")
+        .expect("accounting remains open");
+        cancellation.await.expect("cancellation task");
+        assert!(tokio::time::Instant::now() >= cancel_at);
+        assert_eq!(accounting.snapshot(), (1, 1, 0, 1));
     }
 
     #[test]

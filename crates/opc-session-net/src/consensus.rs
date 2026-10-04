@@ -9587,6 +9587,66 @@ mod tests {
         .expect("cached consensus lane retirement");
     }
 
+    #[tokio::test(start_paused = true)]
+    async fn cached_lane_wait_parks_until_current_connection_retires_after_lane_reuse() {
+        let _guard = crate::test_support::SESSION_CONNECTION_METRICS_TEST_LOCK
+            .lock()
+            .await;
+        let policy = ConnectionLifecyclePolicy::try_new(
+            Duration::from_millis(50),
+            Duration::from_millis(10),
+            Duration::from_millis(5),
+            Duration::from_millis(20),
+            Duration::ZERO,
+        )
+        .expect("short cached lifecycle policy");
+        let pool = Arc::new(ConsensusConnectionPool::new(policy));
+        for lane in [
+            ConsensusConnectionLane::Primary,
+            ConsensusConnectionLane::Overflow,
+        ] {
+            // Reuse the lane after a lifecycle retirement, then exercise the
+            // idle-retirement notification with that older signal retained.
+            for reason in [RetirementReason::MaximumAge, RetirementReason::IdleTimeout] {
+                let now = tokio::time::Instant::now();
+                let lifecycle = ConnectionLifecycle::new(policy, now, None, None, 0, None)
+                    .expect("cached lifecycle");
+                let probe = lifecycle.clone();
+                let mut connection = cached_consensus_connection(lifecycle);
+                let retire_at = if reason == RetirementReason::IdleTimeout {
+                    connection.last_successful_correlated_use = Some(
+                        now - DURABLE_CONSENSUS_TIMING_PROFILE.client_connection_reuse_limit()
+                            + Duration::from_millis(20),
+                    );
+                    now + Duration::from_millis(20)
+                } else {
+                    probe.retire_at()
+                };
+                *pool.lane(lane).connection.lock().await = Some(connection);
+                pool.ensure_cached_connection_reaper(
+                    lane,
+                    None,
+                    SessionReauthenticationControl::new(),
+                    [0; 32],
+                    test_cold_epoch(),
+                );
+                pool.lane(lane).changed.notify_one();
+
+                // No manual clock advance: the waiter must park for the
+                // reaper's timer, including on the second use of this lane.
+                wait_for_cached_lane_to_empty(&pool, lane).await;
+                assert!(tokio::time::Instant::now() >= retire_at);
+                assert!(pool.lane(lane).connection.lock().await.is_none());
+                assert_eq!(probe.recorded_retirement_count(), 1);
+                assert_eq!(probe.recorded_retirement_reason(), Some(reason));
+
+                let retired_at = tokio::time::Instant::now();
+                wait_for_cached_lane_to_empty(&pool, lane).await;
+                assert_eq!(tokio::time::Instant::now(), retired_at);
+            }
+        }
+    }
+
     #[tokio::test]
     async fn idle_cached_consensus_connection_reacts_to_explicit_reauthentication() {
         let policy = ConnectionLifecyclePolicy::try_new(

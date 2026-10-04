@@ -4318,6 +4318,69 @@ async fn direct_cas_dropped_response_stops_unsafe_retry() {
     server.abort();
 }
 
+#[tokio::test(start_paused = true)]
+async fn cas_effect_wait_requires_a_commit_and_retains_it_for_late_subscribers() {
+    let backend = ReplicationDispatchSpy::new();
+    let key = test_key_with_stable_id(b"watched-cas");
+    let owner = OwnerId::new("watched-cas-owner").expect("owner");
+    let lease = backend
+        .acquire(&key, owner.clone(), Duration::from_secs(60))
+        .await
+        .expect("lease");
+    let record = test_record(&key, &owner, lease.fence(), Generation::new(1));
+    let mut operation = CompareAndSet {
+        key: key.clone(),
+        lease,
+        expected_generation: Some(Generation::new(1)),
+        new_record: record.clone(),
+    };
+    assert_eq!(
+        backend.compare_and_set(operation.clone()).await,
+        Ok(CompareAndSetResult::Conflict { current: None })
+    );
+    assert!(
+        tokio::time::timeout(
+            Duration::from_millis(10),
+            backend.wait_for_cas_effects(|effects| *effects >= 1),
+        )
+        .await
+        .is_err(),
+        "a dispatched but rejected CAS is not a committed effect"
+    );
+
+    operation.expected_generation = None;
+    let writer = backend.clone();
+    let commit_at = tokio::time::Instant::now() + Duration::from_millis(20);
+    let commit = tokio::spawn(async move {
+        tokio::time::sleep_until(commit_at).await;
+        writer.compare_and_set(operation).await
+    });
+    tokio::time::timeout(
+        Duration::from_secs(1),
+        backend.wait_for_cas_effects(|effects| *effects == 1),
+    )
+    .await
+    .expect("parked watch lets the paused commit timer advance");
+    assert_eq!(
+        commit.await.expect("commit task"),
+        Ok(CompareAndSetResult::Success)
+    );
+    assert!(tokio::time::Instant::now() >= commit_at);
+    assert_eq!(
+        backend.get(&key).await.expect("committed record"),
+        Some(record)
+    );
+
+    let committed_at = tokio::time::Instant::now();
+    tokio::time::timeout(
+        Duration::from_secs(1),
+        backend.wait_for_cas_effects(|effects| *effects == 1),
+    )
+    .await
+    .expect("a late subscriber observes the retained committed effect");
+    assert_eq!(tokio::time::Instant::now(), committed_at);
+}
+
 #[tokio::test]
 async fn historical_cas_is_rejected_after_server_restart_without_redispatch() {
     use opc_session_net::protocol::{read_frame, write_frame, DEFAULT_MAX_FRAME_SIZE};
