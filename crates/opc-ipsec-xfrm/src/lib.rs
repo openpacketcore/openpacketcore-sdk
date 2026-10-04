@@ -35,6 +35,21 @@
 //! [`LinuxXfrmBackend::bind_current_network_namespace`]
 //! can pin backend execution to the calling thread's already-selected network
 //! namespace without exposing its filesystem identity.
+//!
+//! **Only an exclusive XFRM writer that retains no predecessor state** may use
+//! [`NamespaceBoundLinuxXfrmBackend::reset_exclusively_owned_namespace`]. Never
+//! combine it with predecessor adoption or recovery in the same process. Bind
+//! every store family ever used in the namespace, then pass an explicit
+//! [`ExclusiveNamespaceResetAcknowledgement`] before any mutation, preparation,
+//! recovery or relocation command. The actor flushes all namespace policies,
+//! then all SAs, proves both tables empty by fresh dumps, and durably clears
+//! bound stores while advancing their writer epochs. Failure or an unobserved
+//! reply keeps mutations closed until a successful repeat. Larval SAs and block
+//! policies disappear too: stop plaintext sources first and reinstall protection
+//! before reopening them. Routes, devices, per-socket policies, default-policy
+//! settings, DSCP companion state and other namespaces are untouched. Callers
+//! that never invoke reset retain their existing startup/recovery behavior.
+//!
 //! Fixed-DSCP users that must recover durable state before opening external
 //! egress authority can use [`LinuxXfrmBackend::with_deferred_dscp_marking`].
 //! That constructor validates and retains configuration without loading,
@@ -238,6 +253,7 @@ mod durable_roster;
 #[cfg(unix)]
 mod durable_roster_flow;
 pub mod error;
+mod exclusive_reset;
 #[cfg(feature = "ikev2")]
 pub mod ikev2;
 pub mod installed_child_sa;
@@ -304,6 +320,7 @@ pub use durable_roster_flow::{
     XfrmObjectRosterRequestError, XfrmObjectRosterRestartOutcome,
 };
 pub use error::XfrmError;
+pub use exclusive_reset::{ExclusiveNamespaceResetAcknowledgement, ExclusiveNamespaceResetReport};
 #[cfg(feature = "ikev2")]
 pub use ikev2::{
     build_xfrm_requests_from_ikev2_child_sa, build_xfrm_requests_from_ikev2_child_sa_with_options,
@@ -319,7 +336,7 @@ pub use installed_child_sa::{
     InstalledChildSaRoster, InstalledChildSaSelection,
 };
 pub use linux::{LinuxXfrmBackend, LinuxXfrmBackendConfig};
-pub use mock::{MockOperation, MockSaRelocation, MockXfrmBackend};
+pub use mock::{MockExclusiveNamespaceReset, MockOperation, MockSaRelocation, MockXfrmBackend};
 pub use model::{
     AeadAlgorithm, Algorithm, AllocateSpiRequest, AuthAlgorithm, ExactRemovePolicyRequest,
     ExactRemoveSaRequest, InstallPolicyRequest, InstallSaRequest, IpAddress, KeyMaterial,

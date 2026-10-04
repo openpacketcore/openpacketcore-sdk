@@ -7,6 +7,7 @@ use async_trait::async_trait;
 
 use crate::backend::XfrmBackend;
 use crate::error::XfrmError;
+use crate::exclusive_reset::NamespaceResetGate;
 use crate::model::{
     authorize_exact_sa_removal, linux_lookup_selects, validate_exact_remove_policy_request,
     validate_exact_remove_sa_request, validate_policy_query, validate_relocate_sa_request,
@@ -19,6 +20,7 @@ use crate::model::{
     SpiAllocation, XfrmAction, XfrmCapability, XfrmDirection, XfrmId, XfrmLookupMark, XfrmMode,
     XfrmProbe, XfrmSelector, XfrmTemplate,
 };
+use crate::{ExclusiveNamespaceResetAcknowledgement, ExclusiveNamespaceResetReport};
 
 /// One recorded call against the mock backend.
 ///
@@ -188,6 +190,14 @@ pub struct MockSaRelocation {
     pub direction: SaRelocationDirection,
 }
 
+/// One value-free admitted namespace-reset attempt on [`MockXfrmBackend`].
+///
+/// As with [`MockSaRelocation`], a separate log preserves the established
+/// exhaustive [`MockOperation`] enum. An entry records admission, including
+/// attempts that subsequently return an injected failure.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MockExclusiveNamespaceReset;
+
 /// Deterministic in-memory XFRM backend.
 ///
 /// Records every operation so tests can assert on the requests that reached the
@@ -208,8 +218,12 @@ pub struct MockSaRelocation {
 /// [`XfrmBackend::remove_sa_exact`] can succeed under one state lock where
 /// [`crate::LinuxXfrmBackend`] refuses, so a consumer test that expects
 /// successful exact removal cannot pass against the Linux backend.
+/// After request validation, exact removal counts as an ordinary mutation for
+/// the startup gate: it closes the reset window and is refused while a reset
+/// is required.
 #[derive(Debug, Clone)]
 pub struct MockXfrmBackend {
+    reset_gate: Arc<Mutex<NamespaceResetGate>>,
     state: Arc<Mutex<MockState>>,
 }
 
@@ -258,6 +272,7 @@ struct MockSaRecord {
 struct MockState {
     operations: Vec<MockOperation>,
     relocations: Vec<MockSaRelocation>,
+    namespace_resets: Vec<MockExclusiveNamespaceReset>,
     allocated_spis: BTreeSet<AllocatedSpiKey>,
     /// The states of each key in lookup order, head first.
     sas: BTreeMap<SaChainKey, Vec<MockSaRecord>>,
@@ -332,9 +347,11 @@ impl MockXfrmBackend {
     /// Create a mock backend with a specific probe result.
     pub fn with_probe(probe_result: XfrmProbe) -> Self {
         Self {
+            reset_gate: Arc::new(Mutex::new(NamespaceResetGate::default())),
             state: Arc::new(Mutex::new(MockState {
                 operations: Vec::new(),
                 relocations: Vec::new(),
+                namespace_resets: Vec::new(),
                 allocated_spis: BTreeSet::new(),
                 sas: BTreeMap::new(),
                 next_sa_generation: 0,
@@ -343,6 +360,27 @@ impl MockXfrmBackend {
                 failure: None,
             })),
         }
+    }
+
+    /// Model a new process binding to the same surviving namespace.
+    ///
+    /// The returned actor has fresh startup admission, while its SA/policy
+    /// model, injected failure, and operation log survive. Ordinary `Clone`
+    /// instead shares the existing actor's admission. Drop the predecessor
+    /// before using the returned actor, just as for the real namespace actor.
+    #[must_use]
+    pub fn rebind_namespace(&self) -> Self {
+        Self {
+            state: Arc::clone(&self.state),
+            reset_gate: Arc::new(Mutex::new(NamespaceResetGate::default())),
+        }
+    }
+
+    fn admit_mutation(&self) -> Result<(), XfrmError> {
+        self.reset_gate
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .admit()
     }
 
     /// Inject an error that every subsequent operation will return.
@@ -390,6 +428,15 @@ impl MockXfrmBackend {
         state.relocations.clone()
     }
 
+    /// Return one value-free entry per admitted namespace-reset attempt.
+    pub fn namespace_resets(&self) -> Vec<MockExclusiveNamespaceReset> {
+        self.state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .namespace_resets
+            .clone()
+    }
+
     /// Clear the recorded operation log.
     pub fn clear_operations(&self) {
         let mut state = self
@@ -398,6 +445,7 @@ impl MockXfrmBackend {
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         state.operations.clear();
         state.relocations.clear();
+        state.namespace_resets.clear();
     }
 
     /// Reverse the lookup order of the states at every SA key, as an XFRM
@@ -509,7 +557,30 @@ impl Default for MockXfrmBackend {
 
 #[async_trait]
 impl XfrmBackend for MockXfrmBackend {
+    async fn reset_exclusively_owned_namespace(
+        &self,
+        _acknowledgement: ExclusiveNamespaceResetAcknowledgement,
+    ) -> Result<ExclusiveNamespaceResetReport, XfrmError> {
+        let mut gate = self
+            .reset_gate
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        gate.start()?;
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        state.namespace_resets.push(MockExclusiveNamespaceReset);
+        Self::check_failure(&state)?;
+        state.policies.clear();
+        state.sas.clear();
+        state.allocated_spis.clear();
+        gate.required = false;
+        Ok(ExclusiveNamespaceResetReport { stores_reset: 0 })
+    }
+
     async fn allocate_spi(&self, request: AllocateSpiRequest) -> Result<SpiAllocation, XfrmError> {
+        self.admit_mutation()?;
         let mut state = self
             .state
             .lock()
@@ -550,6 +621,7 @@ impl XfrmBackend for MockXfrmBackend {
     }
 
     async fn install_sa(&self, request: InstallSaRequest) -> Result<(), XfrmError> {
+        self.admit_mutation()?;
         validate_sa_output_mark(request.parameters.output_mark)?;
         if request.parameters.egress_dscp.is_some() {
             return Err(XfrmError::UnsupportedFeature {
@@ -706,6 +778,7 @@ impl XfrmBackend for MockXfrmBackend {
     }
 
     async fn rekey_sa(&self, request: RekeySaRequest) -> Result<(), XfrmError> {
+        self.admit_mutation()?;
         validate_sa_output_mark(request.parameters.output_mark)?;
         if request.parameters.egress_dscp.is_some() {
             return Err(XfrmError::UnsupportedFeature {
@@ -795,6 +868,7 @@ impl XfrmBackend for MockXfrmBackend {
     }
 
     async fn relocate_sa(&self, request: RelocateSaRequest) -> Result<(), XfrmError> {
+        self.admit_mutation()?;
         validate_relocate_sa_request(&request)?;
         let mut state = self
             .state
@@ -855,6 +929,7 @@ impl XfrmBackend for MockXfrmBackend {
     }
 
     async fn remove_sa(&self, request: RemoveSaRequest) -> Result<(), XfrmError> {
+        self.admit_mutation()?;
         let mut state = self
             .state
             .lock()
@@ -883,6 +958,7 @@ impl XfrmBackend for MockXfrmBackend {
 
     async fn remove_sa_exact(&self, request: ExactRemoveSaRequest) -> Result<(), XfrmError> {
         validate_exact_remove_sa_request(&request)?;
+        self.admit_mutation()?;
         let mut state = self
             .state
             .lock()
@@ -914,6 +990,7 @@ impl XfrmBackend for MockXfrmBackend {
     }
 
     async fn install_policy(&self, request: InstallPolicyRequest) -> Result<(), XfrmError> {
+        self.admit_mutation()?;
         let mut state = self
             .state
             .lock()
@@ -937,6 +1014,7 @@ impl XfrmBackend for MockXfrmBackend {
     }
 
     async fn rekey_policy(&self, request: RekeyPolicyRequest) -> Result<(), XfrmError> {
+        self.admit_mutation()?;
         let mut state = self
             .state
             .lock()
@@ -959,6 +1037,7 @@ impl XfrmBackend for MockXfrmBackend {
     }
 
     async fn remove_policy(&self, request: RemovePolicyRequest) -> Result<(), XfrmError> {
+        self.admit_mutation()?;
         let mut state = self
             .state
             .lock()
@@ -984,6 +1063,7 @@ impl XfrmBackend for MockXfrmBackend {
         &self,
         request: ExactRemovePolicyRequest,
     ) -> Result<(), XfrmError> {
+        self.admit_mutation()?;
         validate_exact_remove_policy_request(&request)?;
         let if_id = request.if_id();
         let removal = request.into_request();
@@ -1088,6 +1168,64 @@ mod tests {
             mark: None,
             if_id: None,
         }
+    }
+
+    #[tokio::test]
+    async fn exclusive_reset_clears_sas_and_larval_allocations_with_one_log_entry() {
+        let predecessor = MockXfrmBackend::new();
+        let sa = sample_sa_parameters();
+        predecessor
+            .install_sa(InstallSaRequest {
+                parameters: sa.clone(),
+            })
+            .await
+            .unwrap();
+        let allocation = AllocateSpiRequest {
+            destination: sa.id.destination,
+            protocol: 51,
+            min_spi: 0x100,
+            max_spi: 0x100,
+        };
+        predecessor.allocate_spi(allocation).await.unwrap();
+        let successor = predecessor.rebind_namespace();
+        drop(predecessor);
+        assert!(successor
+            .query_sa(QuerySaRequest::new(
+                sa.id.destination,
+                sa.id.protocol,
+                sa.id.spi
+            ))
+            .await
+            .is_ok());
+        let normal_operations = successor.operations().len();
+        let report = successor.reset_exclusively_owned_namespace(ExclusiveNamespaceResetAcknowledgement::sole_xfrm_writer_and_retains_no_predecessor_state()).await.unwrap();
+        assert_eq!(successor.operations().len(), normal_operations);
+        assert_eq!(
+            successor.namespace_resets(),
+            vec![MockExclusiveNamespaceReset]
+        );
+        assert_eq!(
+            format!("{report:?}"),
+            "ExclusiveNamespaceResetReport { stores_reset: 0 }"
+        );
+        assert!(matches!(
+            successor
+                .query_sa(QuerySaRequest::new(
+                    sa.id.destination,
+                    sa.id.protocol,
+                    sa.id.spi
+                ))
+                .await,
+            Err(XfrmError::NotFound)
+        ));
+        successor
+            .install_sa(InstallSaRequest { parameters: sa })
+            .await
+            .unwrap();
+        successor.allocate_spi(allocation).await.unwrap();
+        // Clones share ordinary-command admission, unlike a process rebind.
+        assert!(successor.clone().reset_exclusively_owned_namespace(ExclusiveNamespaceResetAcknowledgement::sole_xfrm_writer_and_retains_no_predecessor_state()).await.is_err());
+        assert_eq!(successor.namespace_resets().len(), 1);
     }
 
     #[tokio::test]
@@ -2730,6 +2868,41 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn mock_exact_removal_waits_for_required_reset_after_validation() {
+        let backend = MockXfrmBackend::new();
+        let acknowledgement = ExclusiveNamespaceResetAcknowledgement::sole_xfrm_writer_and_retains_no_predecessor_state();
+        backend.set_failure(XfrmError::Unavailable);
+        assert!(backend
+            .reset_exclusively_owned_namespace(acknowledgement)
+            .await
+            .is_err());
+        backend.clear_failure();
+
+        let expected = identity(&sample_sa_parameters());
+        let mut invalid = expected.clone();
+        invalid.if_id = Some(0);
+        assert!(matches!(
+            backend
+                .remove_sa_exact(ExactRemoveSaRequest::new(invalid))
+                .await,
+            Err(XfrmError::InvalidConfig {
+                field: "sa.if_id",
+                ..
+            })
+        ));
+        assert!(matches!(
+            backend
+                .remove_sa_exact(ExactRemoveSaRequest::new(expected))
+                .await,
+            Err(XfrmError::Unavailable)
+        ));
+        backend
+            .reset_exclusively_owned_namespace(acknowledgement)
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
     async fn mock_exact_removal_reports_absent_and_changed_states_without_deleting() {
         let backend = MockXfrmBackend::new();
         let (marked, _) = overlapping_parameters();
@@ -2739,6 +2912,7 @@ mod tests {
                 .await,
             Err(XfrmError::NotFound)
         ));
+        assert!(backend.reset_exclusively_owned_namespace(ExclusiveNamespaceResetAcknowledgement::sole_xfrm_writer_and_retains_no_predecessor_state()).await.is_err());
 
         install(&backend, &marked).await;
         backend.clear_operations();

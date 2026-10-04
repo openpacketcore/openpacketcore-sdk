@@ -48,6 +48,65 @@ admitted mutation is reported as `StateIndeterminate` (`ALLOCSPI` included),
 while a lost read/probe reply is `Unavailable`. Dropping the final backend clone
 closes the queue and lets the detached actor drain without blocking `Drop`.
 
+## Reset an exclusively owned namespace at startup
+
+**The caller must be the only XFRM writer, and nothing else may rely on any
+SA or policy in the namespace.** This operation is only for callers retaining
+no predecessor state. Never combine it with predecessor adoption, recovery,
+or finalization in the same process. These obligations cannot be verified by
+the SDK. Bind every recovery-store family ever used in this namespace; an
+unbound family is not reset.
+
+```rust,no_run
+use opc_ipsec_xfrm::{ExclusiveNamespaceResetAcknowledgement, NamespaceBoundLinuxXfrmBackend};
+
+# async fn startup(backend: &NamespaceBoundLinuxXfrmBackend) -> Result<(), opc_ipsec_xfrm::XfrmError> {
+// Bind all required stores before this call. Stop plaintext sources first.
+let report = backend.reset_exclusively_owned_namespace(
+    ExclusiveNamespaceResetAcknowledgement::sole_xfrm_writer_and_retains_no_predecessor_state(),
+).await?;
+assert!(report.stores_reset <= 3);
+// Reinstall protective policies before reopening plaintext sources.
+# Ok(())
+# }
+```
+
+One actor command flushes every namespace policy type, then every SA protocol,
+and verifies fresh empty SPD/SAD dumps before durably clearing bound object,
+roster and relocation stores under their existing leases. Writer epochs advance;
+predecessor handles and live authorities become unusable. The report contains
+only the number of stores reset, and reset diagnostics contain no object values.
+Larval SAs and block policies are removed too. No route, device, per-socket
+policy, default-policy setting, DSCP companion or other namespace is changed.
+
+Call before admitting any mutation, durable preparation, recovery or relocation
+command. Calls after that point are refused without effects. Passive queries
+are allowed before reset. Empty and repeated resets succeed before ordinary
+commands begin. Failure keeps mutations closed until a successful retry.
+Cancellation after admission does not stop the command; losing its reply is
+indeterminate and requires another reset before proceeding. After process loss,
+a new actor can repeat reset, including after a partially completed store reset.
+Existing callers that never invoke the operation keep their established gates.
+
+The mock supports the same capability and failure injection, records one
+`MockExclusiveNamespaceReset` entry in `namespace_resets()` per admitted attempt, and clears its
+SA, larval SPI and policy model. `MockXfrmBackend::rebind_namespace()` models a
+successor process over surviving state; ordinary clones retain the same actor's
+startup admission. Unsupported and raw Linux backends reject the capability.
+See [ADR 0026](../../docs/adr/0026-exclusive-xfrm-namespace-reset.md).
+
+The privileged process-loss proof requires AH and IPComp with deflate. It tries
+to add a SUB policy inside its private namespace and accepts only the kernel's
+specific unsupported-policy-type refusal. With sub-policy support, it exercises
+the SUB flush; without it, it covers the refused SUB flush followed by the
+all-type empty readback. The 2026-10-04 hosted preflight kernel
+`6.17.0-1022-azure` (iproute2 `6.1.0`) has sub-policies disabled; the local
+`7.1.8` qualification host supports them. A value-free case marker records which
+path ran, and CI still requires all three proofs. For local fixture coverage,
+`OPC_XFRM_RESET_TEST_FORCE_NO_SUB_POLICY=1` simulates the add refusal without
+changing the kernel. Its distinct `simulated-refusal` marker is not accepted as
+hosted qualification and does not prove that the kernel refused the SUB flush.
+
 ## API Shape
 
 - `XfrmBackend`: async port for SPI allocation, SA

@@ -35,6 +35,7 @@ use crate::counter_resume::{
     map_backend_error, CounterRecoveryActorRequest, CounterResumeActorRequest,
     EspCounterReceiptRegistry,
 };
+use crate::exclusive_reset::NamespaceResetGate;
 use crate::installed_child_sa::ChildSaRosterRegistry;
 use crate::model::{
     validate_exact_remove_policy_request, validate_exact_remove_sa_request, validate_sa_lookup_key,
@@ -119,6 +120,7 @@ use crate::{
     ChildSaInstalledRosterRequest, ChildSaRosterUpdate, InstalledChildSaRoster,
     InstalledChildSaSelection,
 };
+use crate::{ExclusiveNamespaceResetAcknowledgement, ExclusiveNamespaceResetReport};
 
 /// Maximum number of admitted Linux XFRM operations waiting for the dedicated
 /// network-namespace actor.
@@ -1546,6 +1548,9 @@ fn run_actor(
 }
 
 struct NamespaceActorState {
+    reset_gate: NamespaceResetGate,
+    #[cfg(test)]
+    reset_fail_after_step: Option<usize>,
     actor_binding: NamespaceActorBinding,
     counter_receipts: EspCounterReceiptRegistry,
     child_sa_roster: ChildSaRosterRegistry,
@@ -1579,6 +1584,9 @@ struct NamespaceActorState {
 impl NamespaceActorState {
     fn new(actor_binding: NamespaceActorBinding) -> Self {
         Self {
+            reset_gate: NamespaceResetGate::default(),
+            #[cfg(test)]
+            reset_fail_after_step: None,
             actor_binding,
             counter_receipts: EspCounterReceiptRegistry::default(),
             child_sa_roster: ChildSaRosterRegistry::default(),
@@ -1600,6 +1608,60 @@ impl NamespaceActorState {
     fn invalidate_live_authorities(&mut self) {
         self.counter_receipts.invalidate_all();
         self.child_sa_roster.invalidate();
+    }
+
+    fn reset_checkpoint(&self, _step: usize) -> Result<(), XfrmError> {
+        #[cfg(test)]
+        if self.reset_fail_after_step == Some(_step) {
+            return Err(XfrmError::Unavailable);
+        }
+        Ok(())
+    }
+
+    fn reset_namespace(
+        &mut self,
+        backend: &LinuxXfrmBackend,
+    ) -> Result<ExclusiveNamespaceResetReport, XfrmError> {
+        self.invalidate_live_authorities();
+        #[cfg(unix)]
+        {
+            self.object_install_admissions.clear();
+            self.relocation_admissions.clear();
+            self.roster_admissions.clear();
+        }
+        backend.flush_namespace_policies()?;
+        self.reset_checkpoint(1)?;
+        backend.flush_namespace_sas()?;
+        self.reset_checkpoint(2)?;
+        backend.verify_namespace_empty()?;
+        self.reset_checkpoint(3)?;
+        #[allow(unused_mut)]
+        let mut stores_reset = 0;
+        #[cfg(unix)]
+        {
+            if let Some(store) = &self.object_recovery_store {
+                store
+                    .reset_after_namespace_empty()
+                    .map_err(|_| XfrmError::Unavailable)?;
+                stores_reset += 1;
+            }
+            self.reset_checkpoint(4)?;
+            if let Some(store) = &self.relocation_recovery_store {
+                store
+                    .reset_after_namespace_empty()
+                    .map_err(|_| XfrmError::Unavailable)?;
+                stores_reset += 1;
+            }
+            self.reset_checkpoint(5)?;
+            if let Some(store) = &self.roster_recovery_store {
+                store
+                    .reset_after_namespace_empty()
+                    .map_err(|_| XfrmError::Unavailable)?;
+                stores_reset += 1;
+            }
+            self.reset_checkpoint(6)?;
+        }
+        Ok(ExclusiveNamespaceResetReport { stores_reset })
     }
 
     fn require_child_sa_publication_ready(&mut self) -> Result<(), XfrmError> {
@@ -2169,6 +2231,59 @@ impl LostReply {
 }
 
 impl NamespaceBoundLinuxXfrmBackend {
+    /// Empty an exclusively owned namespace, abandoning all predecessor state.
+    ///
+    /// **The caller must be the sole XFRM writer and nothing else may rely on
+    /// any SA or policy in this namespace.** It must never combine this reset
+    /// with predecessor adoption, recovery, or finalization in this process.
+    /// Bind every recovery-store family ever used here; unbound stores are
+    /// untouched. These caller obligations cannot be checked by the SDK.
+    ///
+    /// Before any mutation, preparation, recovery, or relocation command has
+    /// been admitted, this drains as one actor command: flush policies of all
+    /// types, flush SAs of all protocols (including larval SAs), freshly prove
+    /// both tables empty, then durably reset all bound stores under their held
+    /// leases and advance their writer epochs. Reset invalidates preexisting
+    /// authorities. It may be repeated before the first ordinary command.
+    ///
+    /// A failed reset keeps mutations closed until a successful repeat. Once
+    /// admitted, cancellation does not stop the reset. A lost reply is
+    /// [`XfrmError::StateIndeterminate`]; repeat reset before anything else.
+    /// Process loss at any step permits a new actor to repeat the operation.
+    ///
+    /// Block policies are removed too. Stop plaintext sources first and
+    /// reinstall protection before reopening them. Routes, devices, per-socket
+    /// policies, default-policy settings, DSCP companions and other namespaces
+    /// are untouched. Callers never invoking reset keep their existing gates.
+    pub async fn reset_exclusively_owned_namespace(
+        &self,
+        _acknowledgement: ExclusiveNamespaceResetAcknowledgement,
+    ) -> Result<ExclusiveNamespaceResetReport, XfrmError> {
+        let permit = self
+            .inner
+            .sender
+            .reserve()
+            .await
+            .map_err(|_| XfrmError::Unavailable)?;
+        let (reply, received) = oneshot::channel();
+        let (observed, observation) = oneshot::channel();
+        permit.send(NamespaceCommand::ResetExclusivelyOwnedNamespace {
+            reply,
+            observed: observation,
+        });
+        let report = received.await.map_err(|_| XfrmError::StateIndeterminate {
+            operation: "exclusive_namespace_reset",
+        })??;
+        // No await between observing success and acknowledgement. The actor
+        // holds its FIFO slot until this is observed or the receiver vanishes.
+        observed
+            .send(())
+            .map_err(|_| XfrmError::StateIndeterminate {
+                operation: "exclusive_namespace_reset",
+            })?;
+        Ok(report)
+    }
+
     /// Return the actor's captured namespace binding to crate-internal sealed
     /// authorities without exposing device or inode values publicly.
     pub(crate) fn network_namespace_binding(&self) -> NetworkNamespaceBinding {
@@ -3485,6 +3600,10 @@ enum DetectorRosterCut {
 }
 
 enum NamespaceCommand {
+    ResetExclusivelyOwnedNamespace {
+        reply: oneshot::Sender<Result<ExclusiveNamespaceResetReport, XfrmError>>,
+        observed: oneshot::Receiver<()>,
+    },
     #[cfg(all(unix, feature = "ikev2"))]
     ChildSaMobike(child_sa_mobike::Command),
     BeginChildSaRosterUpdate(oneshot::Sender<Result<ChildSaRosterUpdate, XfrmError>>),
@@ -3897,13 +4016,63 @@ async fn finish_object_roster_effect_quiesced_retained(
 }
 
 impl NamespaceCommand {
+    fn is_passive_read(&self) -> bool {
+        matches!(
+            self,
+            Self::QuerySa(..)
+                | Self::QueryPolicy(..)
+                | Self::QuerySaRelocationIdentity(..)
+                | Self::QuerySaKeySnapshot(..)
+                | Self::Probe(..)
+                | Self::SaRelocationCapability(..)
+        )
+    }
+
+    fn closes_reset_window(&self) -> bool {
+        // Preparation writes durable records, recovery may delete, and DSCP
+        // activation mutates a companion. Everything except the explicitly
+        // read-only commands is startup-ending by default, including future
+        // command variants.
+        !self.is_passive_read()
+            && !matches!(
+                self,
+                Self::ResetExclusivelyOwnedNamespace { .. } | Self::BeginChildSaRosterUpdate(..)
+            )
+    }
+
     async fn execute(self, backend: &LinuxXfrmBackend, state: &mut NamespaceActorState) {
+        if matches!(self, Self::ResetExclusivelyOwnedNamespace { .. }) {
+            if let Err(error) = state.reset_gate.start() {
+                self.send_error(error);
+                return;
+            }
+        } else if state.reset_gate.required && !self.is_passive_read() {
+            self.send_error(XfrmError::Unavailable);
+            return;
+        } else if self.closes_reset_window() {
+            if let Err(error) = state.reset_gate.admit() {
+                self.send_error(error);
+                return;
+            }
+        }
         if let Err(error) = backend.verify_namespace_actor() {
             self.send_error(error);
             return;
         }
 
         match self {
+            Self::ResetExclusivelyOwnedNamespace { reply, observed } => {
+                match state.reset_namespace(backend) {
+                    Ok(report) => {
+                        if reply.send(Ok(report)).is_ok() && observed.await.is_ok() {
+                            state.reset_gate.required = false;
+                        }
+                    }
+                    Err(error) => {
+                        let _ = reply.send(Err(error));
+                    }
+                }
+            }
             Self::BeginChildSaRosterUpdate(reply) => {
                 let result = state
                     .require_child_sa_publication_ready()
@@ -4860,6 +5029,9 @@ impl NamespaceCommand {
 
     fn send_error(self, error: XfrmError) {
         match self {
+            Self::ResetExclusivelyOwnedNamespace { reply, .. } => {
+                let _ = reply.send(Err(error));
+            }
             #[cfg(all(unix, feature = "ikev2"))]
             Self::ChildSaMobike(command) => command.send_error(error),
             Self::BeginChildSaRosterUpdate(reply) => {
@@ -5008,6 +5180,13 @@ struct OutboundBindingValidation {
 
 #[async_trait]
 impl XfrmBackend for NamespaceBoundLinuxXfrmBackend {
+    async fn reset_exclusively_owned_namespace(
+        &self,
+        acknowledgement: ExclusiveNamespaceResetAcknowledgement,
+    ) -> Result<ExclusiveNamespaceResetReport, XfrmError> {
+        Self::reset_exclusively_owned_namespace(self, acknowledgement).await
+    }
+
     #[cfg(all(unix, feature = "ikev2"))]
     async fn child_sa_relocation_capability(&self) -> Result<XfrmCapability, XfrmError> {
         self.sa_relocation_capability().await
@@ -5169,6 +5348,8 @@ impl XfrmBackend for NamespaceBoundLinuxXfrmBackend {
 
 #[cfg(test)]
 mod tests {
+    #[cfg(unix)]
+    include!("namespace/reset_tests.rs");
     use std::collections::VecDeque;
     #[cfg(unix)]
     use std::future::Future;

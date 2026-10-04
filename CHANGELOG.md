@@ -7,6 +7,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- `opc-ipsec-xfrm`: add explicit startup reset for an exclusively owned
+  namespace whose caller retains no predecessor state. The namespace actor
+  flushes every policy type and SA protocol, proves empty tables, then durably
+  resets bound recovery stores under their leases while advancing writer
+  epochs. Failure or an unobserved reply keeps mutations closed for retry;
+  reset is refused after ordinary command admission. Includes mock parity and
+  a privileged process-loss proof. Never combine reset with predecessor
+  adoption or recovery; stop plaintext sources until protection is reinstalled.
+
 ### Fixed
 
 - `opc-proto-diameter`: tolerate received successful SWm emergency

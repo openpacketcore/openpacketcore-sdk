@@ -348,6 +348,8 @@ pub const XFRMA_SAD_CNT: u16 = 1;
 
 /// Main Security Policy Database policy type.
 pub const XFRM_POLICY_TYPE_MAIN: u8 = 0;
+/// XFRM sub-policy type (when enabled by the kernel configuration).
+pub const XFRM_POLICY_TYPE_SUB: u8 = 1;
 /// Inbound Security Association direction.
 pub const XFRM_SA_DIR_IN: u8 = 1;
 /// Outbound Security Association direction.
@@ -820,6 +822,7 @@ mod tests {
         assert_eq!(XFRMA_SET_MARK_MASK, 30);
         assert_eq!(XFRM_STATE_ESN, 0x80);
         assert_eq!(XFRM_POLICY_TYPE_MAIN, 0);
+        assert_eq!(XFRM_POLICY_TYPE_SUB, 1);
         assert_eq!(XFRM_SA_DIR_IN, 1);
         assert_eq!(XFRM_SA_DIR_OUT, 2);
         assert_eq!(XFRM_MIGRATE_STATE_CLEAR_OFFLOAD, 1);

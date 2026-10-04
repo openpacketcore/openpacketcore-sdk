@@ -252,6 +252,46 @@ jobs:
             "OPC_XFRM_RUN_NAMESPACE_PRIVILEGED=1" \
             "${test_binary}" --ignored --nocapture
 
+      - name: Run exclusive namespace reset process-loss proof
+        run: |
+          set -euo pipefail
+          export CARGO_TARGET_DIR="${RUNNER_TEMP}/xfrm-target"
+          test_binary="$(
+            cargo test --locked -p opc-ipsec-xfrm --features ikev2 \
+              --test xfrm_exclusive_namespace_reset_privileged \
+              --no-run --message-format=json \
+            | python3 -c '
+          import json
+          import sys
+
+          executables = [
+              event.get("executable")
+              for line in sys.stdin
+              if (event := json.loads(line)).get("reason") == "compiler-artifact"
+              and event.get("target", {}).get("name") == "xfrm_exclusive_namespace_reset_privileged"
+              and event.get("executable")
+          ]
+          if len(executables) != 1:
+              raise SystemExit("expected exactly one namespace-reset privileged test executable")
+          print(executables[0])
+          '
+          )"
+          reset_log="${RUNNER_TEMP}/xfrm-exclusive-reset.log"
+          sudo env "PATH=${PATH}" "OPC_XFRM_RUN_EXCLUSIVE_RESET_PRIVILEGED=1" \
+            "${test_binary}" --ignored --skip exclusive_namespace_reset_seed \
+            --nocapture --test-threads=1 2>&1 | tee "${reset_log}"
+          if grep -q 'skipping:' "${reset_log}"; then
+            echo "::error::privileged namespace reset detector skipped"
+            exit 1
+          fi
+          grep -Fq 'XFRM_EXCLUSIVE_NAMESPACE_RESET_PROOF_OK' "${reset_log}"
+          grep -Fq 'XFRM_EXCLUSIVE_NAMESPACE_RESET_EMPTY_OK' "${reset_log}"
+          grep -Fq 'XFRM_EXCLUSIVE_NAMESPACE_RESET_SOCKET_OK' "${reset_log}"
+          grep -Fq 'test result: ok. 3 passed; 0 failed;' "${reset_log}"
+          sub_policy_pattern='XFRM_EXCLUSIVE_NAMESPACE_RESET_SUB_POLICY=(exercised|kernel-refused)$'
+          test "$(grep -Ec "${sub_policy_pattern}" "${reset_log}")" -eq 1
+          grep -E "${sub_policy_pattern}" "${reset_log}" >> "${GITHUB_STEP_SUMMARY}"
+
       - name: Run durable staged-object process-loss recovery proof
         run: |
           set -euo pipefail

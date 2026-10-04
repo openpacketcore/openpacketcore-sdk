@@ -18,6 +18,23 @@ use crate::XfrmError;
 /// unsupported adapters keep operations cheap and deterministic.
 #[async_trait]
 pub trait XfrmBackend: Send + Sync + std::fmt::Debug {
+    /// Reset every SA and namespace policy only when the caller exclusively
+    /// owns the namespace and abandons all predecessor state.
+    ///
+    /// This startup-only capability must never be combined with adoption or
+    /// recovery in the same process. Bind every store family ever used there.
+    /// See [`crate::ExclusiveNamespaceResetAcknowledgement`] for the caller's
+    /// obligations and plaintext-source precautions. Unsupported adapters
+    /// fail closed; raw Linux callers must use a namespace-bound actor.
+    async fn reset_exclusively_owned_namespace(
+        &self,
+        _acknowledgement: crate::ExclusiveNamespaceResetAcknowledgement,
+    ) -> Result<crate::ExclusiveNamespaceResetReport, XfrmError> {
+        Err(XfrmError::UnsupportedFeature {
+            feature: "exclusive_namespace_reset",
+        })
+    }
+
     /// Report support for the optional authenticated complete-roster profile.
     /// Raw, mock and custom adapters default to Missing. Available still
     /// requires a valid bounded intent and a bound durable namespace actor.
