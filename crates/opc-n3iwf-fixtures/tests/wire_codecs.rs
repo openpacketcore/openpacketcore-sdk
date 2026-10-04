@@ -146,3 +146,47 @@ fn n2_sctp_metadata_uses_iana_service_port_in_each_order() {
         "four metadata cases include one duplicated tuple"
     );
 }
+
+#[test]
+fn n2_sctp_data_chunk_matches_manifest_and_uses_existing_admission() {
+    use opc_sctp::n2::{N2Inbound, UnprotectedN2Profile};
+    use opc_sctp::{DataChunk, DeliveryOrder, NGAP_PPID};
+
+    let catalog = FixtureCatalog::load().expect("catalog");
+    let (manifest, wire) = catalog
+        .manifests()
+        .find(|(m, _)| m.sdk_fixture_id == "opc.n3iwf.n2-sctp.v1.positive-data-chunk")
+        .expect("published DATA fixture");
+    assert_eq!(manifest.validation_scope, "sctp-data-chunk");
+    assert_eq!(manifest.expected_outcome, "constructed");
+    assert!(!manifest.runtime_claim);
+    assert_eq!(
+        manifest.semantic_assertions,
+        [
+            "chunk=DATA",
+            "order=ordered",
+            "stream_id=0",
+            "ppid=60",
+            "user_data_len=1",
+            "user_data=opaque-synthetic-octet",
+            "ngap_message_validation=unsupported",
+        ]
+    );
+    let chunk = DataChunk::decode(wire).expect("DATA chunk");
+    assert!(!chunk.flags().unordered);
+    assert!(chunk.flags().beginning && chunk.flags().ending);
+    assert_eq!(chunk.stream_id(), 0);
+    assert_eq!(chunk.ppid(), NGAP_PPID);
+    assert_eq!(chunk.user_data().len(), 1);
+    assert!(chunk.user_data() == [0], "opaque synthetic octet changed");
+
+    let message = chunk.into_inbound_message(7).expect("complete DATA record");
+    assert_eq!(message.order, DeliveryOrder::Ordered);
+    let profile = UnprotectedN2Profile::new(1).expect("exact payload bound");
+    let N2Inbound::Payload(admitted) = profile.admit(message).expect("N2 admission") else {
+        panic!("DATA became a notification");
+    };
+    assert_eq!(admitted.stream_id(), 0);
+    assert_eq!(admitted.association_id(), 7);
+    assert!(admitted.payload().as_ref() == [0], "opaque payload changed");
+}

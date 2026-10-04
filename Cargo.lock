@@ -3186,6 +3186,7 @@ dependencies = [
  "opc-proto-nas",
  "opc-proto-ngap",
  "opc-protocol",
+ "opc-sctp",
  "serde",
  "serde_json",
  "sha2 0.11.0",
