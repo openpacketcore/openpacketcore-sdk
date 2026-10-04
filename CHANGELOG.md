@@ -123,6 +123,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   struct-literal constructors must add
   `locked_mtu: None`, and `RouteMismatch` literals `mtu`. Refs #991.
 
+- `opc-session-store`: add opt-in `EnvelopeReadPolicy::RequireEnvelopeV1`
+  reads to local encryption and remote sealing wrappers. Every returned
+  physical record requires a canonical envelope and the existing authenticated
+  decode, including nested protected replication records whose exact ciphertext
+  remains unchanged. Point reads, CAS conflicts, batch slots, restore scans,
+  replication logs, watches, and protected observations retain their existing
+  result shapes and stronger guards. Migration-compatible defaults and writes
+  are unchanged; this does not establish storage freshness or batch rollback.
+  Fixes #1061.
+
 - `opc-persist`: add an online audit recipient client and authority-owned
   verification session without exporting signing keys. Verify actual received
   pages, frozen-range completeness and fresh independent checkpoints; bind
