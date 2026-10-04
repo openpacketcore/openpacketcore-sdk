@@ -280,8 +280,27 @@ pub const XFRMA_SET_MARK: u16 = 29;
 pub const XFRMA_SET_MARK_MASK: u16 = 30;
 /// XFRM optional interface identifier attribute.
 pub const XFRMA_IF_ID: u16 = 31;
-/// Optional Security Association direction attribute.
-pub const XFRMA_SA_DIR: u16 = 34;
+/// XFRM input-SA timer threshold attribute (`u32` seconds).
+///
+/// Defined by `enum xfrm_attr_type_t` in the
+/// [Linux UAPI header](https://github.com/torvalds/linux/blob/v6.13/include/uapi/linux/xfrm.h#L322).
+pub const XFRMA_MTIMER_THRESH: u16 = 32;
+/// Optional Security Association direction attribute (`u8`, Linux 6.10+).
+///
+/// Defined by `enum xfrm_attr_type_t` in the
+/// [Linux UAPI header](https://github.com/torvalds/linux/blob/v6.13/include/uapi/linux/xfrm.h#L323).
+/// Values are [`XFRM_SA_DIR_IN`] or [`XFRM_SA_DIR_OUT`].
+pub const XFRMA_SA_DIR: u16 = 33;
+/// XFRM NAT keepalive interval attribute (`u32` seconds, Linux 6.11+).
+///
+/// Defined by `enum xfrm_attr_type_t` in the
+/// [Linux UAPI header](https://github.com/torvalds/linux/blob/v6.13/include/uapi/linux/xfrm.h#L324).
+pub const XFRMA_NAT_KEEPALIVE_INTERVAL: u16 = 34;
+/// XFRM per-CPU Security Association attribute (`u32`, Linux 6.13+).
+///
+/// Defined by `enum xfrm_attr_type_t` in the
+/// [Linux UAPI header](https://github.com/torvalds/linux/blob/v6.13/include/uapi/linux/xfrm.h#L325).
+pub const XFRMA_SA_PCPU: u16 = 35;
 
 /// Main Security Policy Database policy type.
 pub const XFRM_POLICY_TYPE_MAIN: u8 = 0;
@@ -749,7 +768,10 @@ mod tests {
         assert_eq!(XFRMA_PAD, 27);
         assert_eq!(XFRMA_OFFLOAD_DEV, 28);
         assert_eq!(XFRMA_IF_ID, 31);
-        assert_eq!(XFRMA_SA_DIR, 34);
+        assert_eq!(XFRMA_MTIMER_THRESH, 32);
+        assert_eq!(XFRMA_SA_DIR, 33);
+        assert_eq!(XFRMA_NAT_KEEPALIVE_INTERVAL, 34);
+        assert_eq!(XFRMA_SA_PCPU, 35);
         assert_eq!(XFRMA_SET_MARK, 29);
         assert_eq!(XFRMA_SET_MARK_MASK, 30);
         assert_eq!(XFRM_STATE_ESN, 0x80);

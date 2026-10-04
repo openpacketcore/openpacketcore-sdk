@@ -48,6 +48,9 @@
 //! are indistinguishable, so both fail closed before fresh mint or recovery
 //! with `xfrm_outbound_sa_binding_key_readback_unavailable`; algorithm shape is
 //! never accepted as a substitute for exact key proof.
+//! Binding and inbound peer-observation readback validate kernel-reported SA
+//! direction using Linux UAPI attribute 33 (`XFRMA_SA_DIR`). Attribute 34 is
+//! the unmodeled NAT keepalive interval and is rejected by those validators.
 //! Before Linux SA encoding copies any key byte, the backend validates every
 //! variable attribute and computes the complete checked UAPI body length. The
 //! algorithm temporaries, fixed-capacity SA body, and complete netlink request

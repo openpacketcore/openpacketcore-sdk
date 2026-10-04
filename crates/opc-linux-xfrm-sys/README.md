@@ -27,6 +27,14 @@ privilege selection, or deployment defaults.
 - `XfrmAddress::{from_words, from_ipv4_octets, from_ipv6_octets}` helpers.
 - `align_to_netlink` for Linux 4-byte netlink attribute/message alignment.
 
+The optional SA attributes follow `enum xfrm_attr_type_t` in the
+[Linux UAPI header](https://github.com/torvalds/linux/blob/v6.13/include/uapi/linux/xfrm.h#L322):
+`XFRMA_MTIMER_THRESH = 32`, `XFRMA_SA_DIR = 33`,
+`XFRMA_NAT_KEEPALIVE_INTERVAL = 34`, and `XFRMA_SA_PCPU = 35`.
+SA direction uses a one-byte payload and requires Linux 6.10 or later;
+NAT keepalive (Linux 6.11+) and the per-CPU SA attribute (Linux 6.13+)
+use `u32` payloads. Exposing these constants does not probe kernel support.
+
 ## Usage
 
 Most callers should use `opc-ipsec-xfrm` instead:
