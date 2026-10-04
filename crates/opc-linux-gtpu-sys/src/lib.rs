@@ -512,6 +512,51 @@ pub fn clock_gettime_boottime_ns() -> io::Result<u64> {
     platform::clock_gettime_boottime_ns()
 }
 
+/// Private, unpinned maps for the kernel's non-sleepable BPF reader grace.
+///
+/// A successful userspace ARRAY_OF_MAPS update waits for kernel RCU readers
+/// on the qualified Linux implementations. This handle owns the outer map and
+/// its single inner ARRAY; neither is attached to a program or exposed by FD.
+/// The caller must qualify the kernel and non-sleepable reader context. This
+/// does not cover sleepable BPF programs or certify packet/NIC drain.
+pub struct BpfMapReaderGrace {
+    inner: platform::BpfMapReaderGrace,
+}
+
+impl std::fmt::Debug for BpfMapReaderGrace {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("BpfMapReaderGrace")
+            .finish_non_exhaustive()
+    }
+}
+
+impl BpfMapReaderGrace {
+    /// Create two private maps. Creation alone is not a completed reader grace.
+    ///
+    /// # Errors
+    ///
+    /// Returns an operating-system error if the platform, permissions, or map
+    /// resources do not allow either map to be created. Partial creation is
+    /// released automatically and nothing is pinned.
+    pub fn new() -> io::Result<Self> {
+        platform::BpfMapReaderGrace::new().map(|inner| Self { inner })
+    }
+
+    /// Complete a fresh successful single-element map-in-map UPDATE syscall.
+    ///
+    /// The selected kernel implementation waits for a full ordinary or
+    /// expedited RCU grace before returning success. Failed operations never
+    /// count as grace evidence. Only this handle's private outer map changes.
+    ///
+    /// # Errors
+    ///
+    /// Returns an operating-system error when the update is refused or fails.
+    pub fn synchronize(&self) -> io::Result<()> {
+        self.inner.synchronize()
+    }
+}
+
 /// Freeze a BPF map against every subsequent syscall-side mutation.
 ///
 /// BPF programs that already reference the map retain their verifier-approved
@@ -868,6 +913,19 @@ pub const fn align_to_netlink(value: usize) -> Option<usize> {
 mod tests {
     use super::*;
     use std::mem::{align_of, offset_of, size_of};
+
+    #[test]
+    fn map_reader_grace_unsupported_stub_refuses_construction_and_wait() {
+        assert!(matches!(
+            unsupported::BpfMapReaderGrace::new(),
+            Err(error) if error.kind() == io::ErrorKind::Unsupported
+        ));
+        let grace = unsupported::BpfMapReaderGrace;
+        assert_eq!(
+            grace.synchronize().unwrap_err().kind(),
+            io::ErrorKind::Unsupported
+        );
+    }
 
     #[cfg(target_os = "linux")]
     use std::ffi::OsString;

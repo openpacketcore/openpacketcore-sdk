@@ -8,6 +8,9 @@ use std::time::Duration;
 
 use crate::{BpfCgroupProgramAttachment, BpfXdpLinkInfo, GtpuIpAddress, GtpuUdpBind};
 
+mod reader_grace;
+pub use reader_grace::BpfMapReaderGrace;
+
 const BPF_OBJ_PIN: libc::c_uint = 6;
 const BPF_OBJ_GET: libc::c_uint = 7;
 const BPF_PROG_ATTACH: libc::c_uint = 8;

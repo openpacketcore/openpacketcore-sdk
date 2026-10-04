@@ -53,6 +53,27 @@ jobs:
           sudo mountpoint -q /sys/fs/bpf || sudo mount -t bpf bpf /sys/fs/bpf
           sudo unshare -n -- ip link set lo up
 
+      - name: Prove map-in-map reader grace
+        run: |
+          set -euo pipefail
+          export CARGO_TARGET_DIR="${RUNNER_TEMP}/gtpu-target"
+          cargo test --locked -p opc-linux-gtpu-sys --lib --no-run --message-format=json \
+            > "${RUNNER_TEMP}/gtpu-reader-grace-build.jsonl"
+          grace_binary="$(
+            jq -r 'select(.profile.test == true and .target.name == "opc_linux_gtpu_sys") | .executable // empty' \
+              "${RUNNER_TEMP}/gtpu-reader-grace-build.jsonl" | tail -n 1
+          )"
+          test -n "${grace_binary}"
+          test -x "${grace_binary}"
+          sha256sum "${grace_binary}"
+          sudo env OPC_GTPU_RUN_PRIVILEGED=1 "${grace_binary}" \
+            --ignored --exact linux::reader_grace::tests::map_in_map_grace_waits_for_live_non_sleepable_reader \
+            --nocapture --test-threads=1 | tee "${RUNNER_TEMP}/gtpu-reader-grace.log"
+          grep -Eq '^test result: ok\. 1 passed; 0 failed; 0 ignored;' "${RUNNER_TEMP}/gtpu-reader-grace.log"
+          grep -Fxq 'OPC_GTPU_MAP_READER_GRACE_PROVEN' "${RUNNER_TEMP}/gtpu-reader-grace.log"
+          grep -Fxq 'OPC_GTPU_MAP_READER_GRACE_NEGATIVE_CONTROL_PROVEN' "${RUNNER_TEMP}/gtpu-reader-grace.log"
+          grep -Fxq 'OPC_GTPU_MAP_READER_GRACE_THREAD_CONTROL_PROVEN' "${RUNNER_TEMP}/gtpu-reader-grace.log"
+
       - name: Build privileged GTP-U test
         run: |
           set -euo pipefail
@@ -247,14 +268,55 @@ jobs:
           test -n "${datapath_binary}"
           test -x "${datapath_binary}"
           cp "${datapath_binary}" "${RUNNER_TEMP}/opc-gtpu-linux68-datapath"
+
+          cargo test --locked -p opc-linux-gtpu-sys --lib --no-run --message-format=json \
+            > "${RUNNER_TEMP}/gtpu-linux68-grace-build.jsonl"
+          grace_binary="$(
+            jq -r 'select(.profile.test == true and .target.name == "opc_linux_gtpu_sys") | .executable // empty' \
+              "${RUNNER_TEMP}/gtpu-linux68-grace-build.jsonl" | tail -n 1
+          )"
+          test -n "${grace_binary}"
+          test -x "${grace_binary}"
+          cp "${grace_binary}" "${RUNNER_TEMP}/opc-gtpu-linux68-grace"
+          sha256sum "${RUNNER_TEMP}/opc-gtpu-linux68-grace"
           wc -c "${RUNNER_TEMP}/opc-gtpu-linux68-test" "${RUNNER_TEMP}/opc-gtpu-linux68-datapath"
           sha256sum "${RUNNER_TEMP}/opc-gtpu-linux68-test" "${RUNNER_TEMP}/opc-gtpu-linux68-datapath"
+
+          bundle="${RUNNER_TEMP}/gtpu-nohz-linux68-binaries"
+          mkdir -p "${bundle}"
+          cp "${RUNNER_TEMP}/opc-gtpu-linux68-datapath" "${bundle}/datapath"
+          cp "${RUNNER_TEMP}/opc-gtpu-linux68-grace" "${bundle}/grace"
+          git rev-parse HEAD > "${bundle}/source-revision"
+          (cd "${bundle}" && sha256sum datapath grace source-revision > SHA256SUMS)
+
+      - name: Preserve source-bound Linux 6.8 binaries for nohz qualification
+        uses: actions/upload-artifact@v7
+        with:
+          name: gtpu-nohz-linux68-binaries
+          path: ${{ runner.temp }}/gtpu-nohz-linux68-binaries
+          if-no-files-found: error
 
       - name: Load both classifiers on pinned Linux 6.8
         run: |
           set -euo pipefail
           sudo apt-get update
           sudo apt-get install -y cloud-image-utils qemu-system-x86 openssh-client
+
+          # The pinned image already has iproute2/nftables/ethtool/python3,
+          # but the authenticated packet path also needs wireguard-tools.
+          # Download from the matching Ubuntu 24.04 runner; keep the guest
+          # offline and retain the same package for nohz qualification.
+          package_dir="${RUNNER_TEMP}/gtpu-nohz-linux68-packages"
+          mkdir -p "${package_dir}"
+          apt-get --print-uris download wireguard-tools > "${package_dir}/repositories.txt"
+          apt-cache policy wireguard-tools >> "${package_dir}/repositories.txt"
+          (cd "${package_dir}" && apt-get download wireguard-tools)
+          packages=("${package_dir}"/wireguard-tools_*.deb)
+          test "${#packages[@]}" = 1
+          mv "${packages[0]}" "${package_dir}/wireguard-tools.deb"
+          dpkg-deb --field "${package_dir}/wireguard-tools.deb" Package Version Architecture Depends \
+            > "${package_dir}/package-versions.txt"
+          (cd "${package_dir}" && sha256sum wireguard-tools.deb repositories.txt package-versions.txt > SHA256SUMS)
 
           image="${RUNNER_TEMP}/ubuntu-24.04-linux68.img"
           curl --fail --location --retry 3 \
@@ -358,6 +420,17 @@ jobs:
             -o UserKnownHostsFile=/dev/null \
             "${RUNNER_TEMP}/opc-gtpu-linux68-datapath" \
             opc@127.0.0.1:/tmp/opc-gtpu-linux68-datapath
+          scp \
+            -i "${key}" \
+            -P 2227 \
+            -o BatchMode=yes \
+            -o IdentitiesOnly=yes \
+            -o StrictHostKeyChecking=no \
+            -o UserKnownHostsFile=/dev/null \
+            "${RUNNER_TEMP}/opc-gtpu-linux68-grace" opc@127.0.0.1:/tmp/opc-gtpu-linux68-grace
+          scp -r -i "${key}" -P 2227 -o BatchMode=yes -o ConnectTimeout=2 \
+            -o IdentitiesOnly=yes -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null \
+            "${package_dir}" opc@127.0.0.1:/tmp/opc-gtpu-linux68-packages
           ssh "${ssh_options[@]}" opc@127.0.0.1 '
             set -euo pipefail
             test "$(uname -r)" = "6.8.0-134-generic"
@@ -370,8 +443,27 @@ jobs:
             esac
             sudo mountpoint -q /sys/fs/bpf || sudo mount -t bpf bpf /sys/fs/bpf
             chmod 0755 /tmp/opc-gtpu-linux68-test
+            chmod 0755 /tmp/opc-gtpu-linux68-grace
             chmod 0755 /tmp/opc-gtpu-linux68-datapath
+            cd /tmp/opc-gtpu-linux68-packages
+            sha256sum -c SHA256SUMS
+            sudo dpkg -i wireguard-tools.deb
+            command -v ip tc ethtool nft wg python3
+            sudo modprobe wireguard
           '
+          if ! grace_output="$(
+            ssh "${ssh_options[@]}" opc@127.0.0.1 \
+              'sudo env OPC_GTPU_RUN_PRIVILEGED=1 /tmp/opc-gtpu-linux68-grace --ignored --exact linux::reader_grace::tests::map_in_map_grace_waits_for_live_non_sleepable_reader --nocapture --test-threads=1' \
+              2>&1
+          )"; then
+            printf '%s\n' "${grace_output}"
+            exit 1
+          fi
+          printf '%s\n' "${grace_output}"
+          grep -Eq '^test result: ok\. 1 passed; 0 failed; 0 ignored;' <<< "${grace_output}"
+          grep -Fq 'OPC_GTPU_MAP_READER_GRACE_PROVEN' <<< "${grace_output}"
+          grep -Fxq 'OPC_GTPU_MAP_READER_GRACE_NEGATIVE_CONTROL_PROVEN' <<< "${grace_output}"
+          grep -Fxq 'OPC_GTPU_MAP_READER_GRACE_THREAD_CONTROL_PROVEN' <<< "${grace_output}"
           if ! load_output="$(
             ssh "${ssh_options[@]}" opc@127.0.0.1 \
               'sudo env OPC_GTPU_RUN_PRIVILEGED=1 /tmp/opc-gtpu-linux68-test --ignored --nocapture --test-threads=1 program_tag_candidates_match_the_running_kernel pre_redirect_tag_candidates_match_the_running_kernel committed_classifier_load_capability_is_loadable_and_leaves_no_state' \
@@ -423,6 +515,13 @@ jobs:
           grep -Fq 'OPC_GTPU_TFT_REMOVAL_FENCE_DEFAULT_PROVEN:' <<< "${live_output}"
           grep -Fq 'OPC_GTPU_TFT_REMOVAL_CONTINUITY_PROVEN:' <<< "${live_output}"
           grep -Fq 'OPC_GTPU_ORDINARY_INNER_IPV6_PROVEN' <<< "${live_output}"
+
+      - name: Preserve Linux 6.8 packet tooling for nohz qualification
+        uses: actions/upload-artifact@v7
+        with:
+          name: gtpu-nohz-linux68-packages
+          path: ${{ runner.temp }}/gtpu-nohz-linux68-packages
+          if-no-files-found: error
 
   el9-514-classifier-load:
     name: RHEL 9 / OpenShift 4.18 datapath
@@ -499,6 +598,36 @@ jobs:
             exit 1
           fi
           cp "${datapath_binary}" "${RUNNER_TEMP}/opc-gtpu-el9-datapath"
+
+          cargo test --locked -p opc-linux-gtpu-sys --lib --no-run --target x86_64-unknown-linux-musl --message-format=json \
+            > "${RUNNER_TEMP}/gtpu-el9-grace-build.jsonl"
+          grace_binary="$(
+            jq -r 'select(.profile.test == true and .target.name == "opc_linux_gtpu_sys") | .executable // empty' \
+              "${RUNNER_TEMP}/gtpu-el9-grace-build.jsonl" | tail -n 1
+          )"
+          test -n "${grace_binary}"
+          test -x "${grace_binary}"
+          grace_headers="$(readelf -l "${grace_binary}")"
+          if grep -q 'Requesting program interpreter' <<< "${grace_headers}"; then
+            echo "::error::el9 grace binary is dynamically linked"
+            exit 1
+          fi
+          cp "${grace_binary}" "${RUNNER_TEMP}/opc-gtpu-el9-grace"
+          sha256sum "${RUNNER_TEMP}/opc-gtpu-el9-grace"
+
+          bundle="${RUNNER_TEMP}/gtpu-nohz-el9-binaries"
+          mkdir -p "${bundle}"
+          cp "${RUNNER_TEMP}/opc-gtpu-el9-datapath" "${bundle}/datapath"
+          cp "${RUNNER_TEMP}/opc-gtpu-el9-grace" "${bundle}/grace"
+          git rev-parse HEAD > "${bundle}/source-revision"
+          (cd "${bundle}" && sha256sum datapath grace source-revision > SHA256SUMS)
+
+      - name: Preserve source-bound EL9 binaries for nohz qualification
+        uses: actions/upload-artifact@v7
+        with:
+          name: gtpu-nohz-el9-binaries
+          path: ${{ runner.temp }}/gtpu-nohz-el9-binaries
+          if-no-files-found: error
 
       - name: Load both classifiers on a RHEL 9 kernel
         run: |
@@ -612,6 +741,14 @@ jobs:
             -o StrictHostKeyChecking=no \
             -o UserKnownHostsFile=/dev/null \
             "${RUNNER_TEMP}/opc-gtpu-el9-datapath" opc@127.0.0.1:/tmp/opc-gtpu-el9-datapath
+          scp \
+            -i "${key}" \
+            -P 2228 \
+            -o BatchMode=yes \
+            -o IdentitiesOnly=yes \
+            -o StrictHostKeyChecking=no \
+            -o UserKnownHostsFile=/dev/null \
+            "${RUNNER_TEMP}/opc-gtpu-el9-grace" opc@127.0.0.1:/tmp/opc-gtpu-el9-grace
 
           # Record the kernel this evidence is about, and assert it is the
           # RHEL 9 line rather than whatever the image happens to ship.
@@ -630,7 +767,21 @@ jobs:
             systemd-detect-virt | grep -qE "kvm|qemu"
             sudo mountpoint -q /sys/fs/bpf || sudo mount -t bpf bpf /sys/fs/bpf
             chmod 0755 /tmp/opc-gtpu-el9-test
+            chmod 0755 /tmp/opc-gtpu-el9-grace
           '
+          if ! grace_output="$(
+            ssh "${ssh_options[@]}" opc@127.0.0.1 \
+              'sudo env OPC_GTPU_RUN_PRIVILEGED=1 /tmp/opc-gtpu-el9-grace --ignored --exact linux::reader_grace::tests::map_in_map_grace_waits_for_live_non_sleepable_reader --nocapture --test-threads=1' \
+              2>&1
+          )"; then
+            printf '%s\n' "${grace_output}"
+            exit 1
+          fi
+          printf '%s\n' "${grace_output}"
+          grep -Eq '^test result: ok\. 1 passed; 0 failed; 0 ignored;' <<< "${grace_output}"
+          grep -Fq 'OPC_GTPU_MAP_READER_GRACE_PROVEN' <<< "${grace_output}"
+          grep -Fxq 'OPC_GTPU_MAP_READER_GRACE_NEGATIVE_CONTROL_PROVEN' <<< "${grace_output}"
+          grep -Fxq 'OPC_GTPU_MAP_READER_GRACE_THREAD_CONTROL_PROVEN' <<< "${grace_output}"
           if ! load_output="$(
             ssh "${ssh_options[@]}" opc@127.0.0.1 \
               'sudo env OPC_GTPU_RUN_PRIVILEGED=1 /tmp/opc-gtpu-el9-test --ignored --nocapture --test-threads=1 program_tag_candidates_match_the_running_kernel pre_redirect_tag_candidates_match_the_running_kernel committed_classifier_load_capability_is_loadable_and_leaves_no_state' \
@@ -716,10 +867,16 @@ jobs:
             dnf install -y --releasever=9.4 dnf-plugins-core createrepo_c
             dnf download --releasever=9.4 --resolve --alldeps --destdir=/out \
               nftables wireguard-tools $SYSTEMD_PKGS
+            rpm -qp --qf "%{NAME} %{VERSION}-%{RELEASE} %{ARCH}\n" /out/*.rpm \
+              | sort > /out/package-versions.txt
+            dnf repolist --verbose --releasever=9.4 > /out/repositories.txt
             createrepo_c /out
             chmod -R a+rX /out
           '
           test -d "${rpm_dir}/repodata"
+          (cd "${rpm_dir}" && find . -type f -print0 | sort -z | xargs -0 sha256sum) \
+            > "${RUNNER_TEMP}/el9-rpms-SHA256SUMS"
+          mv "${RUNNER_TEMP}/el9-rpms-SHA256SUMS" "${rpm_dir}/SHA256SUMS"
           scp -r \
             -i "${key}" \
             -P 2228 \
@@ -739,6 +896,7 @@ jobs:
           # test failure much later.
           ssh "${ssh_options[@]}" opc@127.0.0.1 '
             set -euo pipefail
+            (cd /tmp/opc-el9-repo && sha256sum -c SHA256SUMS)
             sudo dnf install -y --disablerepo="*" \
               --repofrompath=opclocal,file:///tmp/opc-el9-repo \
               --nogpgcheck nftables wireguard-tools
@@ -824,6 +982,64 @@ jobs:
           grep -Fq 'OPC_GTPU_ORDINARY_INNER_IPV6_CLEANUP_PROVEN' "${datapath_log}"
           grep -Fq 'OPC_GTPU_CLEANUP_ACTIVATION_FORWARDS_PROVEN' "${datapath_log}"
           grep -Fq 'OPC_GTPU_CLEANUP_ACTIVATION_ROLLBACK_PROVEN' "${datapath_log}"
+
+      - name: Preserve EL9 packet tooling for nohz qualification
+        uses: actions/upload-artifact@v7
+        with:
+          name: gtpu-nohz-el9-packages
+          path: ${{ runner.temp }}/el9-rpms
+          if-no-files-found: error
+
+  tft-nohz-full:
+    name: TFT nohz_full / ${{ matrix.profile }}
+    needs: [linux-6-8-classifier-load, el9-514-classifier-load]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        profile: [linux68, el9]
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      - name: Download source-bound test binaries
+        uses: actions/download-artifact@v8
+        with:
+          name: gtpu-nohz-${{ matrix.profile }}-binaries
+          path: ${{ runner.temp }}/gtpu-nohz/binaries
+
+      - name: Download the ordinary guest's offline packet tooling
+        uses: actions/download-artifact@v8
+        with:
+          name: gtpu-nohz-${{ matrix.profile }}-packages
+          path: ${{ runner.temp }}/gtpu-nohz/packages
+
+      - name: Install guest tooling
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install -y cloud-image-utils qemu-system-x86 openssh-client
+
+      - name: Require production TFT fallback with GLOBAL absent
+        env:
+          TFT_NOHZ_PROFILE: ${{ matrix.profile }}
+        run: |
+          set -euo pipefail
+          mkdir -p "${RUNNER_TEMP}/gtpu-nohz/evidence"
+          bash ci/qualify-tft-nohz-vm.sh \
+            "${TFT_NOHZ_PROFILE}" "${RUNNER_TEMP}/gtpu-nohz/binaries" \
+            "${RUNNER_TEMP}/gtpu-nohz/packages" "${RUNNER_TEMP}/gtpu-nohz" \
+            2>&1 | tee "${RUNNER_TEMP}/gtpu-nohz/evidence/run.log"
+          grep -Fxq 'OPC_GTPU_TFT_NOHZ_VM_QUALIFIED' "${RUNNER_TEMP}/gtpu-nohz/evidence/run.log"
+
+      - name: Upload nohz_full qualification evidence
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: gtpu-tft-nohz-${{ matrix.profile }}
+          path: ${{ runner.temp }}/gtpu-nohz/evidence
+          if-no-files-found: error
 
   ebpf-object:
     name: eBPF datapath object rebuild
