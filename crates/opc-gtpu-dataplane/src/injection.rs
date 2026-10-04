@@ -20,6 +20,17 @@
 //! that the local kernel accepted packets, not that they were protected or
 //! delivered. See the crate's `docs/control-port.md` for deployment obligations
 //! and the zero-Identification limit.
+//!
+//! [`GtpuDownlinkInjector::xfrm_interface_ipv4`] is an optional stronger send
+//! contract for consumers whose policies and SAs use an XFRM interface ID.
+//! Its retained packet-socket binding requires an interface-scoped transform
+//! and preserves zero Identification, including separate fragment outcomes.
+//! **The consumer must also contain generated ICMP errors:** missing policy/SA
+//! and DF path-MTU failures can emit ordinarily routed destination-unreachable
+//! messages quoting plaintext from the injected packet. The control-port guide
+//! supplies a verified output-drop rule scoped to the quoted subscriber pool.
+//! The injector installs neither that rule nor interfaces/policies. Privileged
+//! redirects, mirroring and interface configuration remain consumer-owned.
 
 use std::{fmt, io};
 
@@ -30,6 +41,16 @@ use crate::{GtpAddressFamily, GtpBearerMark, GtpuDecapsulatedDownlink, GtpuFragm
 const DONT_FRAGMENT: u16 = 0x4000;
 const MORE_FRAGMENTS: u16 = 0x2000;
 const OFFSET: u16 = 0x1fff;
+
+#[cfg(target_os = "linux")]
+mod xfrm_interface;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum InjectionContract {
+    RawIpv4,
+    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+    XfrmInterfaceIpv4,
+}
 
 /// Borrow one control-port outcome that contains injectable inner packets.
 ///
@@ -77,6 +98,12 @@ pub enum GtpuDownlinkSendFailure {
     /// Access was denied (Linux `EACCES`), for example by a prohibit route
     /// or a broadcast destination without broadcast permission.
     AccessDenied,
+    /// The send device is missing or its retained binding has been retired.
+    /// Reusing its name or index does not repair the old binding.
+    InterfaceUnavailable,
+    /// The retained send device is down, or the socket has a pending error
+    /// from an earlier down notification even though it is now up.
+    InterfaceDown,
     /// A datagram send reported fewer bytes than supplied.
     ShortWrite,
     /// Another local failure, without its possibly sensitive diagnostic.
@@ -94,13 +121,25 @@ pub enum GtpuDownlinkInjectionError {
     /// This constructor supports only inner IPv4 packets.
     #[error("unsupported downlink injection address family")]
     UnsupportedFamily,
+    /// The interface index or XFRM interface identifier is invalid.
+    #[error("invalid downlink injection interface parameters")]
+    InvalidInterface,
+    /// The device is not a local, fixed-identifier XFRM interface.
+    #[error("unsupported downlink injection interface")]
+    UnsupportedInterface,
+    /// The requested device does not exist or disappeared during construction.
+    #[error("downlink injection interface unavailable")]
+    InterfaceUnavailable,
+    /// Device identity did not match, or changed while the socket was bound.
+    #[error("downlink injection interface identity mismatch")]
+    InterfaceIdentityMismatch,
     /// The IPv4 header or fragment batch is inconsistent; nothing was sent.
     #[error("malformed downlink injection packet or fragment batch")]
     MalformedIpv4,
     /// Linux would replace an unspecified source instead of preserving it.
     #[error("unspecified downlink injection source")]
     UnspecifiedSource,
-    /// A non-DF fragment or fragment batch has Identification zero.
+    /// A raw-mode non-DF fragment or fragment batch has Identification zero.
     /// Linux would renumber it independently of its siblings; nothing is sent.
     #[error("zero Identification on a fragment or fragment batch")]
     ZeroIdentificationFragment,
@@ -128,7 +167,7 @@ pub struct GtpuDownlinkInjectionCounters {
     /// Individual packets accepted by the local kernel, including packets
     /// accepted before a later send of the same outcome failed.
     pub packets_accepted: u64,
-    /// Zero-ID non-DF fragment outcomes refused without sending; one per
+    /// Raw-mode zero-ID non-DF outcomes refused without sending; one per
     /// independent fragment or batch, not one per inferred datagram.
     pub zero_identification_refusals: u64,
     /// Outcomes stopped by a local send failure.
@@ -159,16 +198,20 @@ pub trait GtpuDownlinkInjectionPort: fmt::Debug + Send {
 
 /// An opaque IPv4 downlink injector with an explicitly selected send contract.
 ///
-/// The raw constructor requires consumer-owned containment; see
-/// [`Self::raw_ipv4`]. The private representation permits additional send
-/// contracts to be introduced as additive constructors.
+/// Select [`Self::raw_ipv4`] with consumer-owned pool containment, or
+/// [`Self::xfrm_interface_ipv4`] with consumer-managed interface-scoped
+/// policies and SAs. The socket and send contract remain private and fixed
+/// for this instance's lifetime.
 pub struct GtpuDownlinkInjector {
-    inner: Injector<RawIpv4Socket>,
+    inner: Injector<InjectionSocket>,
 }
 
 impl fmt::Debug for GtpuDownlinkInjector {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter.write_str("GtpuDownlinkInjector { contract: RawIpv4 }")
+        formatter
+            .debug_struct("GtpuDownlinkInjector")
+            .field("contract", &self.inner.contract)
+            .finish()
     }
 }
 
@@ -201,19 +244,95 @@ impl GtpuDownlinkInjector {
         let sender = RawIpv4Socket::open()?;
         Ok(Self {
             inner: Injector {
-                sender,
+                sender: InjectionSocket::Raw(sender),
+                contract: InjectionContract::RawIpv4,
                 counters: GtpuDownlinkInjectionCounters::default(),
             },
         })
     }
 
+    /// Bind IPv4 injection to a caller-managed XFRM interface in the current
+    /// network namespace, with a nonzero interface index and expected XFRM
+    /// interface identifier (`if_id`).
+    ///
+    /// The consumer must scope its outbound policies and SAs to that identifier.
+    /// The constructor validates a local, non-metadata XFRM device and binds an
+    /// `AF_PACKET/SOCK_DGRAM` socket once. A bounded link-event subscription
+    /// detects device changes between identity reads around the bind, including
+    /// deletion and reuse of the same index with identical attributes. No
+    /// packets are sent during construction. Subsequent sends provide no
+    /// destination sockaddr and never resolve the interface again: unregister
+    /// invalidates this socket even if the name and index are reused.
+    ///
+    /// This path requires an actual interface-scoped transform. Missing
+    /// matching policy/SA, interface loss and ordinary FIB route changes cannot
+    /// forward the original packet through a plaintext fallback. However,
+    /// missing policy/SA and DF path-MTU failures can generate IPv4 ICMP errors
+    /// quoting the original packet and routed toward its source. Before sending,
+    /// the consumer must continuously retain output containment for those
+    /// errors, for example the quoted-pool drop rule in `docs/control-port.md`.
+    /// This constructor does not install or audit that rule. The consumer
+    /// also owns privileged configuration: redirects/mirrors before XFRM,
+    /// changes to the interface's identifier or namespace contract, and
+    /// selection of an unrelated SA are outside this guarantee.
+    ///
+    /// All validated IPv4 bytes, including Identification zero, remain intact;
+    /// separate fragment outcomes need no correlation cache. The inner packet
+    /// enters device egress directly instead of inner IPv4 LOCAL_OUT, so raw
+    /// `IP_NODEFRAG` is unnecessary. Device egress hooks, inner POST_ROUTING
+    /// before the transform, and transformed-packet IP output hooks still
+    /// apply. Inner packets have no conntrack entry there and match nftables
+    /// `ct state invalid`; an invalid-drop postrouting rule drops them all.
+    /// Sends may succeed when XFRM drops the packet, with or without ICMP;
+    /// success is not delivery or encryption proof.
+    ///
+    /// A reject-all receive filter is installed before binding the packet
+    /// socket. Its IPv4 receive hook still runs, but no inbound packet is queued.
+    ///
+    /// Requires `CAP_NET_RAW` and packet-mark privileges (also `CAP_NET_ADMIN`
+    /// on kernels before Linux 5.17). The constructor probes `SO_MARK` before
+    /// returning. Identity acquisition has a one-second deadline and bounded
+    /// receive work; contention or notification loss refuses construction
+    /// rather than assuming identity continuity.
+    ///
+    /// # Errors
+    /// Returns a value-free platform, parameter, unsupported-device, identity,
+    /// socket or netlink error. A missing device is
+    /// [`GtpuDownlinkInjectionError::InterfaceUnavailable`]. Nothing is sent on
+    /// constructor failure. A deferred link event just after device setup can
+    /// refuse identity acquisition; callers may start a fresh attempt once
+    /// configuration settles, before handing over any packets.
+    pub fn xfrm_interface_ipv4(
+        ifindex: u32,
+        if_id: u32,
+    ) -> Result<Self, GtpuDownlinkInjectionError> {
+        #[cfg(target_os = "linux")]
+        {
+            let sender = xfrm_interface::XfrmInterfaceSocket::open(ifindex, if_id)?;
+            Ok(Self {
+                inner: Injector {
+                    sender: InjectionSocket::XfrmInterface(sender),
+                    contract: InjectionContract::XfrmInterfaceIpv4,
+                    counters: GtpuDownlinkInjectionCounters::default(),
+                },
+            })
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            let _ = (ifindex, if_id);
+            Err(GtpuDownlinkInjectionError::UnsupportedPlatform)
+        }
+    }
+
     /// Inject one outcome in fragment order, returning the number of packets
-    /// accepted by the local kernel. Requires the containment obligation of
-    /// [`Self::raw_ipv4`] to remain satisfied throughout every send.
+    /// accepted by the local kernel. Requires the selected constructor's
+    /// configuration obligations to remain satisfied throughout every send.
     ///
     /// Validates the whole batch before sending. Keeps the header (including
-    /// TTL/options), subject to the following raw-path zero-ID limit;
-    /// Linux recomputes the validated total length and header checksum.
+    /// TTL/options). Interface-bound mode preserves every validated byte,
+    /// including zero Identification in separate outcomes and batches.
+    /// The following zero-ID handling applies only to raw mode, where Linux
+    /// recomputes the validated total length and header checksum.
     ///
     /// A [`GtpuDownlinkInjection::Fragmented`] batch or independently received
     /// [`GtpuDownlinkInjection::Decapsulated`] fragment with Identification
@@ -223,8 +342,8 @@ impl GtpuDownlinkInjector {
     /// datagram. Rewriting that piece cannot agree with its separate siblings.
     /// The raw path therefore loses an origin-fragmented zero-ID datagram
     /// whenever a non-DF fragment must be injected; no ID allocation or
-    /// cross-outcome cache is attempted. The interface-bound sender in issue
-    /// #1085 does not have this raw-path limit.
+    /// cross-outcome cache is attempted. [`Self::xfrm_interface_ipv4`] does
+    /// not have this raw-path limit.
     /// Keeping DF on pieces of a DF-fragment source would preserve zero on
     /// raw output, but changing fragment flags and MTU semantics belongs to
     /// the fragmenter, not this injector.
@@ -232,16 +351,19 @@ impl GtpuDownlinkInjector {
     /// one fragmented datagram in 65,536; sources repeatedly using zero can
     /// lose every fragmented datagram. Zero is legal under RFC 6864; this is
     /// a send-path limitation. Zero on an unfragmented packet (which Linux
-    /// may number) or with DF set is accepted. IPv6 and an unspecified source
-    /// are refused.
+    /// may number) or with DF set is accepted. Raw mode refuses an unspecified
+    /// source. Both constructors refuse IPv6.
     ///
     /// # Errors
     /// Validation refusals send nothing. A local send failure stops at the
     /// first failed fragment and reports earlier accepted packets. Never
     /// retry the entire batch: after partial acceptance the datagram is lost
-    /// and this API cannot resume or resend its remainder. A retained block
-    /// or output filter normally returns [`GtpuDownlinkSendFailure::PolicyOrFilterRefused`];
-    /// that class does not identify which rule refused it. No automatic retry,
+    /// and this API cannot resume or resend its remainder. In raw mode a
+    /// retained block or output filter normally returns
+    /// [`GtpuDownlinkSendFailure::PolicyOrFilterRefused`]; that class does not
+    /// identify which rule refused it. Interface-bound sends can succeed when
+    /// XFRM drops the packet, including when it generates an ICMP error.
+    /// No automatic retry,
     /// packet queue, XFRM lookup diagnostic or policy installation is provided.
     pub fn inject(
         &mut self,
@@ -276,6 +398,7 @@ trait Ipv4Sender {
 
 struct Injector<S> {
     sender: S,
+    contract: InjectionContract,
     counters: GtpuDownlinkInjectionCounters,
 }
 
@@ -285,14 +408,16 @@ impl<S: Ipv4Sender> Injector<S> {
         outcome: GtpuDownlinkInjection<'_>,
     ) -> Result<usize, GtpuDownlinkInjectionError> {
         use GtpuDownlinkInjectionError as Error;
+        let raw = self.contract == InjectionContract::RawIpv4;
         let (first, rest, mark): (&[u8], &[Bytes], _) = match outcome {
             GtpuDownlinkInjection::Decapsulated(packet) => {
                 if packet.family() != GtpAddressFamily::Ipv4 {
                     return Err(Error::UnsupportedFamily);
                 }
                 let bytes = packet.inner_packet();
-                let header = Header::parse(bytes)?;
-                if header.id == 0
+                let header = Header::parse(bytes, self.contract)?;
+                if raw
+                    && header.id == 0
                     && header.flags & DONT_FRAGMENT == 0
                     && header.flags & (MORE_FRAGMENTS | OFFSET) != 0
                 {
@@ -307,10 +432,10 @@ impl<S: Ipv4Sender> Injector<S> {
                     .fragments()
                     .split_first()
                     .ok_or(Error::MalformedIpv4)?;
-                let header = Header::parse(first)?;
+                let header = Header::parse(first, self.contract)?;
                 let mut previous = header;
                 for packet in rest {
-                    let current = Header::parse(packet)?;
+                    let current = Header::parse(packet, self.contract)?;
                     if packet[12..20] != first[12..20]
                         || packet[9] != first[9]
                         || current.id != header.id
@@ -323,7 +448,7 @@ impl<S: Ipv4Sender> Injector<S> {
                     }
                     previous = current;
                 }
-                if header.id == 0 && header.flags & DONT_FRAGMENT == 0 {
+                if raw && header.id == 0 && header.flags & DONT_FRAGMENT == 0 {
                     self.counters.zero_identification_refusals =
                         self.counters.zero_identification_refusals.saturating_add(1);
                     return Err(Error::ZeroIdentificationFragment);
@@ -362,14 +487,17 @@ struct Header {
 }
 
 impl Header {
-    fn parse(packet: &[u8]) -> Result<Self, GtpuDownlinkInjectionError> {
+    fn parse(
+        packet: &[u8],
+        contract: InjectionContract,
+    ) -> Result<Self, GtpuDownlinkInjectionError> {
         use GtpuDownlinkInjectionError as Error;
         let (header_len, total_len) =
             crate::inner_fragment::valid_ipv4_header(packet).ok_or(Error::MalformedIpv4)?;
         if total_len != packet.len() {
             return Err(Error::MalformedIpv4);
         }
-        if packet[12..16] == [0; 4] {
+        if contract == InjectionContract::RawIpv4 && packet[12..16] == [0; 4] {
             return Err(Error::UnspecifiedSource);
         }
         let header = Self {
@@ -395,12 +523,30 @@ fn classify_send_error(error: &io::Error) -> GtpuDownlinkSendFailure {
         Some(nix::libc::EMSGSIZE) => return Class::MessageTooLarge,
         Some(nix::libc::ENOBUFS) => return Class::NoBufferSpace,
         Some(nix::libc::EACCES) => return Class::AccessDenied,
+        Some(nix::libc::ENXIO | nix::libc::ENODEV) => return Class::InterfaceUnavailable,
+        Some(nix::libc::ENETDOWN) => return Class::InterfaceDown,
         _ => {}
     }
     match error.kind() {
         io::ErrorKind::WouldBlock => Class::WouldBlock,
         io::ErrorKind::PermissionDenied => Class::PolicyOrFilterRefused,
         _ => Class::Other,
+    }
+}
+
+enum InjectionSocket {
+    Raw(RawIpv4Socket),
+    #[cfg(target_os = "linux")]
+    XfrmInterface(xfrm_interface::XfrmInterfaceSocket),
+}
+
+impl Ipv4Sender for InjectionSocket {
+    fn send(&mut self, packet: &[u8], mark: Option<GtpBearerMark>) -> io::Result<usize> {
+        match self {
+            Self::Raw(sender) => sender.send(packet, mark),
+            #[cfg(target_os = "linux")]
+            Self::XfrmInterface(sender) => sender.send(packet, mark),
+        }
     }
 }
 

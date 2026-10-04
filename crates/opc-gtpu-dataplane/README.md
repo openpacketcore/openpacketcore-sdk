@@ -127,6 +127,24 @@ acceptance, not protection or delivery proof. `GtpuDownlinkInjectionPort` and
 the outcome factories in `testkit` support consumer fakes. See
 [raw IPv4 injection](docs/control-port.md#raw-ipv4-injection).
 
+`GtpuDownlinkInjector::xfrm_interface_ipv4(ifindex, if_id)` adds an optional
+interface-bound contract for consumers that scope their policies and SAs to a
+nonzero XFRM interface ID. It binds once to a validated XFRM device, preserves
+every validated IPv4 byte including zero-ID fragments, and prevents plaintext
+fallback of the original packet when policies/SAs disappear, routes change,
+or the bound device is replaced. Missing policy/SA and DF path-MTU failures can
+still emit ordinarily routed ICMP errors containing plaintext quotes. The
+consumer must continuously retain output containment for those errors; the
+guide provides a verified rule scoped to the quoted subscriber pool.
+Construction detects device replacement across its identity reads and bind.
+The consumer owns the interface and privileged configuration; send success
+still means local acceptance and can accompany a kernel drop. See
+[interface-bound IPv4 injection](docs/control-port.md#xfrm-interface-bound-ipv4-injection)
+for the interface-ID migration, ICMP rule and output-hook differences. All inner
+packets match `ct state invalid` at POST_ROUTING, so invalid-drop rules there
+drop them. A receive filter installed before bind keeps the send socket's
+queue empty. Missing/retired and down devices have named refusal classes.
+
 With an optional per-context `GtpPdpContext::downlink_inner_mtu`, tc
 steers an over-MTU DF downlink IPv4 packet to a dedicated backend-owned queue
 instead of letting the host drop it with its own error. The consumer then

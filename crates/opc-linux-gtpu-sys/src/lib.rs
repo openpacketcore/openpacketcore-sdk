@@ -424,6 +424,46 @@ pub fn configure_raw_ipv4_injection_socket(socket: std::os::fd::BorrowedFd<'_>) 
         .map_err(|error| io::Error::new(error.kind(), "raw_ipv4_injection_options"))
 }
 
+/// Open a nonblocking, close-on-exec `AF_PACKET/SOCK_DGRAM` socket and bind
+/// its IPv4 protocol to a nonzero interface index in the current namespace.
+///
+/// This only establishes the packet binding; the caller must validate the
+/// device kind and identity before sending. Send without a destination
+/// sockaddr to use the retained binding, rather than resolving an index again.
+/// A reject-all socket filter is attached before binding. The IPv4 receive
+/// hook remains registered for the protocol needed by transmission, but its
+/// packets are discarded before queueing. Filter failure refuses construction.
+///
+/// # Errors
+/// Returns a value-free error for invalid indexes, unsupported platforms,
+/// missing privileges, or socket/bind failures. No packets are sent here.
+#[cfg(target_os = "linux")]
+pub fn open_bound_ipv4_packet_socket(ifindex: u32) -> io::Result<std::os::fd::OwnedFd> {
+    if ifindex == 0 || ifindex > i32::MAX as u32 {
+        return Err(io::Error::from(io::ErrorKind::InvalidInput));
+    }
+    platform::open_bound_ipv4_packet_socket(ifindex).map_err(|error| {
+        let kind = match error.raw_os_error() {
+            Some(libc::ENODEV | libc::ENXIO) => io::ErrorKind::NotFound,
+            _ => error.kind(),
+        };
+        io::Error::new(kind, "bound_ipv4_packet_socket")
+    })
+}
+
+/// Read the live IPv4 packet binding's nonzero interface index.
+///
+/// An unregistered packet binding is refused even after its index is reused.
+/// This reads socket state; it does not validate the device's XFRM identity.
+///
+/// # Errors
+/// Returns a value-free error for a missing, invalid or unsupported binding.
+#[cfg(target_os = "linux")]
+pub fn bound_ipv4_packet_ifindex(socket: std::os::fd::BorrowedFd<'_>) -> io::Result<u32> {
+    platform::bound_ipv4_packet_ifindex(socket)
+        .map_err(|error| io::Error::new(error.kind(), "bound_ipv4_packet_identity"))
+}
+
 /// Query the locally attached cgroup-v2 INET-egress programs.
 ///
 /// The inventory is hard-bounded to the kernel cgroup-BPF limit of 64
@@ -939,6 +979,31 @@ mod tests {
         let grace = unsupported::BpfMapReaderGrace;
         assert_eq!(
             grace.synchronize().unwrap_err().kind(),
+            io::ErrorKind::Unsupported
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn packet_binding_validates_indexes_and_unsupported_stubs_refuse() {
+        use std::os::fd::AsFd;
+        for index in [0, u32::MAX] {
+            assert_eq!(
+                open_bound_ipv4_packet_socket(index).unwrap_err().kind(),
+                io::ErrorKind::InvalidInput
+            );
+        }
+        assert_eq!(
+            unsupported::open_bound_ipv4_packet_socket(7)
+                .unwrap_err()
+                .kind(),
+            io::ErrorKind::Unsupported
+        );
+        let file = std::fs::File::open("/dev/null").unwrap();
+        assert_eq!(
+            unsupported::bound_ipv4_packet_ifindex(file.as_fd())
+                .unwrap_err()
+                .kind(),
             io::ErrorKind::Unsupported
         );
     }

@@ -210,7 +210,7 @@ jobs:
           grep -Fq 'OPC_GTPU_HISTORICAL_25_DETACHED_RECOVERY_PROVEN' "${datapath_log}"
           grep -Fq 'OPC_GTPU_HISTORICAL_25_ATTACHED_REFUSAL_PROVEN' "${datapath_log}"
 
-      - name: Require native shared GTP-U control queue and raw injection proofs
+      - name: Require native shared GTP-U control queue and both injection contracts
         run: |
           set -euo pipefail
           export CARGO_TARGET_DIR="${RUNNER_TEMP}/gtpu-target"
@@ -228,7 +228,7 @@ jobs:
           PY
           )"
           sudo unshare -n -- bash ci/qualify-gtpu-control-native.sh \
-            "$gtpu_control_binary" "${RUNNER_TEMP}/gtpu-control-native"
+            "$gtpu_control_binary" "${RUNNER_TEMP}/gtpu-control-native" kernel-config
 
       - name: Upload shared GTP-U control queue qualification logs
         if: always()
@@ -464,10 +464,10 @@ jobs:
             command -v ip tc ethtool nft wg python3
             sudo modprobe wireguard
           '
-          # Raw injection needs baseline ESP, never XFRM interfaces/migration.
-          # Execute the same embedded peer and strict inventory as the host.
+          # Require both raw and interface-bound proofs when the kernel has
+          # XFRM interfaces; a configured absence requires an actual refusal.
           ssh "${ssh_options[@]}" opc@127.0.0.1 \
-            'sudo unshare -n -- bash -s -- /tmp/opc-gtpu-linux68-test /tmp/opc-gtpu-linux68-control' \
+            'sudo unshare -n -- bash -s -- /tmp/opc-gtpu-linux68-test /tmp/opc-gtpu-linux68-control kernel-config' \
             < ci/qualify-gtpu-control-native.sh \
             2>&1 | tee "${RUNNER_TEMP}/gtpu-linux68-control.log"
           if ! grace_output="$(
@@ -948,10 +948,10 @@ jobs:
             chmod 0755 /tmp/opc-gtpu-el9-datapath
           '
 
-          # The peer uses Python 3.9 and baseline ESP, both provided by this
-          # guest; it requires no optional XFRM interface or migration feature.
+          # Python 3.9 is sufficient. The guest kernel configuration decides
+          # whether the real interface datapath or its refusal must be proved.
           ssh "${ssh_options[@]}" opc@127.0.0.1 \
-            'sudo unshare -n -- bash -s -- /tmp/opc-gtpu-el9-test /tmp/opc-gtpu-el9-control' \
+            'sudo unshare -n -- bash -s -- /tmp/opc-gtpu-el9-test /tmp/opc-gtpu-el9-control kernel-config' \
             < ci/qualify-gtpu-control-native.sh \
             2>&1 | tee "${RUNNER_TEMP}/gtpu-el9-control.log"
 

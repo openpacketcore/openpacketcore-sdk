@@ -106,6 +106,16 @@ pub fn configure_raw_ipv4_injection_socket(_socket: std::os::fd::BorrowedFd<'_>)
 }
 
 #[cfg(target_os = "linux")]
+pub fn open_bound_ipv4_packet_socket(_ifindex: u32) -> io::Result<std::os::fd::OwnedFd> {
+    Err(unsupported())
+}
+
+#[cfg(target_os = "linux")]
+pub fn bound_ipv4_packet_ifindex(_socket: std::os::fd::BorrowedFd<'_>) -> io::Result<u32> {
+    Err(unsupported())
+}
+
+#[cfg(target_os = "linux")]
 pub fn verify_udp_fence_socket_options(
     _socket: std::os::fd::BorrowedFd<'_>,
     _ipv6: bool,
