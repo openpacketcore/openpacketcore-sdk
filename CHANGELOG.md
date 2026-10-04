@@ -130,9 +130,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     entries and inner-IPv6 contexts are unchanged. The datapath object is
     rebuilt; the map ABI is unchanged.
   - **Consumer.** `try_receive_downlink` returns the fragment as
-    `GtpuDownlinkEvent::Decapsulated`, exactly as it arrived, with its
-    tunnel's bearer mark. It does not reassemble and keeps no state per
-    datagram.
+    `GtpuDownlinkEvent::Decapsulated`, unmodified, with its tunnel's bearer
+    mark. It does not reassemble and keeps no state per datagram.
+  - **Header validation.** Before it returns any inner IPv4 packet as
+    `Decapsulated`, the consumer now validates the header as the kernel's
+    IPv4 input validates a packet that tc decapsulated: version 4, a header
+    length of at least five words within the packet, the header checksum,
+    and a total length that covers the header and does not exceed the
+    received length. A failure is a `Malformed` drop, and octets after the
+    total length are trimmed. An `IP_HDRINCL` injection rewrites the
+    checksum and the total length, so a header that the kernel discarded
+    would otherwise have been repaired and sent on. This also applies to
+    reassembled G-PDUs and to grouped attachments, which were returned
+    unvalidated before.
   - **Rate limits.** A returned fragment takes no token from
     `GtpuInnerFragmentRateLimit` or `GtpuPacketTooBigRateLimit`: nothing is
     fragmented, no Identification is assigned and no error is sent. A

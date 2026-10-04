@@ -1174,6 +1174,10 @@ impl fmt::Debug for GtpuReassemblyOutcome {
 pub enum GtpuDownlinkDrop {
     /// GTP-U framing or the inner packet violates the fast-path invariants,
     /// or the persisted PDR state is corrupt (dual-map TEID, reserved mark).
+    /// This includes an authorized inner IPv4 packet whose header the
+    /// kernel's IPv4 input would discard: a header length below five words
+    /// or beyond the packet, a wrong header checksum, or a total length that
+    /// does not cover the header or exceeds the received length.
     Malformed,
     /// The outer endpoint binding, owner journal, grouped generation, or
     /// complete Active commit graph did not authorize the packet.
@@ -1206,7 +1210,7 @@ pub struct GtpuDownlinkCounters {
     pub decapsulated: u64,
     /// Of [`Self::decapsulated`], the G-PDUs whose inner IPv4 packet was a
     /// fragment (More Fragments set, or a non-zero fragment offset), returned
-    /// as it arrived. It is counted by content, whatever queue delivered the
+    /// unmodified. It is counted by content, whatever queue delivered the
     /// G-PDU. tc hands every such fragment of a context with a downlink inner
     /// MTU to the consumer and keeps no hand-off counter of its own.
     pub decapsulated_inner_fragments: u64,
@@ -1214,7 +1218,8 @@ pub struct GtpuDownlinkCounters {
     pub control_plane: u64,
     /// G-PDUs whose TEID selects no installed tunnel (no inner forwarding).
     pub unknown_tunnel: u64,
-    /// Malformed framing, malformed inner packets and corrupt PDR state.
+    /// Malformed framing, malformed inner packets (including an inner IPv4
+    /// header that fails validation) and corrupt PDR state.
     pub malformed: u64,
     /// Endpoint, owner, generation or commit-graph authorization failures.
     pub binding_drops: u64,
@@ -1315,7 +1320,10 @@ impl GtpuDecapsulatedDownlink {
         }
     }
 
-    /// Complete inner IP packet, exactly as carried by the T-PDU.
+    /// Complete inner IP packet, unmodified. An IPv4 packet has a header
+    /// that passed validation and ends at its total length: octets that the
+    /// T-PDU carried after it are not part of the datagram and are not
+    /// returned.
     #[must_use]
     pub fn inner_packet(&self) -> &[u8] {
         &self.inner_packet
@@ -1834,11 +1842,18 @@ pub enum GtpuDownlinkEvent {
     /// and decapsulated exactly once. The caller delivers the inner packet
     /// (route/XFRM injection with the returned mark).
     ///
-    /// The inner packet is returned exactly as the T-PDU carried it. It can
-    /// be an IPv4 fragment: tc hands every inner fragment of a context with a
-    /// downlink inner MTU to this consumer, so that all fragments of one
-    /// datagram leave through the caller. A packet without Don't Fragment is
-    /// not fragmented here and can exceed that MTU.
+    /// The inner packet is returned unmodified. For IPv4 the consumer first
+    /// validates the header as the kernel's IPv4 input does for a packet that
+    /// tc decapsulated (version, header length, header checksum and total
+    /// length), because an `IP_HDRINCL` injection would repair a wrong
+    /// checksum or length; a packet that fails is
+    /// [`GtpuDownlinkDrop::Malformed`]. Octets after the total length are
+    /// trimmed.
+    ///
+    /// The packet can be an IPv4 fragment: tc hands every inner fragment of a
+    /// context with a downlink inner MTU to this consumer, so that all
+    /// fragments of one datagram leave through the caller. A packet without
+    /// Don't Fragment is not fragmented here and can exceed that MTU.
     Decapsulated(GtpuDecapsulatedDownlink),
     /// A non-G-PDU message (typed control, unmodelled message or unsupported
     /// required extension). Use the existing response planners.

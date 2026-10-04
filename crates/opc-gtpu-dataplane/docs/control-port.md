@@ -181,12 +181,34 @@ validators and the backend's own map reads:
    DSCP are read and the Active `PdpContextCommit` is read last as the
    publication fence. Pending, Removing, absent or mixed graphs fail closed.
 
+**Inner IPv4 header.** The consumer stands in for tc and also for the
+kernel's IPv4 input, which validated every inner packet that tc decapsulated.
+Before an authorized inner IPv4 packet is returned as `Decapsulated`, its
+header must pass the same checks (`ip_rcv_core`; RFC 1122 section 3.2.1.2,
+RFC 1812 section 5.2.2):
+
+- version 4, and a header length of at least five words that lies within the
+  packet;
+- a correct header checksum, over the options too;
+- a total length that covers the header and does not exceed the received
+  length.
+
+A failure is a `Malformed` drop. Octets after the total length are not part
+of the datagram and are trimmed, as the kernel trims them. The check applies
+to every route into the consumer: a reassembled G-PDU, a hand-off from tc,
+and grouped as well as ordinary attachments.
+
+It matters because of the injection. An `IP_HDRINCL` send rewrites the header
+checksum and the total length. A header that the kernel discarded would
+otherwise be repaired and sent on, and trailing octets would become part of
+the datagram.
+
 | Event | Meaning |
 | --- | --- |
-| `Decapsulated` | Exact inner packet, inner family and bearer mark (default bearer is `None`). The caller injects it toward XFRM with that mark. The packet can be an inner IPv4 fragment; see [Inner fragments](#inner-fragments). |
+| `Decapsulated` | The inner packet, its family and bearer mark (default bearer is `None`). An IPv4 packet has a validated header and ends at its total length. The caller injects it toward XFRM with that mark. The packet can be an inner IPv4 fragment; see [Inner fragments](#inner-fragments). |
 | `Control` | Non-G-PDU message; use the response planners above. |
 | `UnknownTunnel` | Untouched G-PDU whose TEID selects no tunnel. An observation, not an absence receipt. |
-| `Dropped` | Value-free `GtpuDownlinkDrop`: malformed, binding mismatch, destination mismatch, state unavailable, or an over-MTU packet refused by the inner fragmenter (rate limited, or carrying IPv4 options). |
+| `Dropped` | Value-free `GtpuDownlinkDrop`: malformed (including an inner IPv4 header that fails the checks above), binding mismatch, destination mismatch, state unavailable, or an over-MTU packet refused by the inner fragmenter (rate limited, or carrying IPv4 options). |
 | `Fragmented` | An over-MTU DF IPv4 packet split into RFC 791 inner fragments under the default policy below, with the bearer mark. The caller injects every fragment, in order, toward XFRM with that mark. |
 | `PacketTooBig` | An over-MTU DF IPv4 packet under the explicit in-tunnel Packet Too Big opt-in below; never forwarded. |
 
@@ -324,10 +346,11 @@ injected half at LOCAL_OUT. Neither queue completes, and both halves expire
 after `ipfrag_time` without any error. With every fragment handed over, the
 whole datagram takes one path, which the application controls.
 
-**Consumer.** The G-PDU is re-authorized like any other. A fragment that is
-not an over-MTU Don't Fragment packet is returned as `Decapsulated`, exactly
-as it arrived, with its tunnel's bearer mark. The consumer does not
-reassemble, and keeps no state per datagram.
+**Consumer.** The G-PDU is re-authorized like any other, and its inner header
+is validated as above. A fragment that is not an over-MTU Don't Fragment
+packet is then returned as `Decapsulated`, unmodified, with its tunnel's
+bearer mark. The consumer does not reassemble, and keeps no state per
+datagram.
 
 The three decisions that this hand-off needed:
 
@@ -497,7 +520,10 @@ cannot be reassembled, where tc forwarded the fragments unchanged. That
 affects a datagram whose sender chose Identification zero (#1022). Unlike a
 forwarding router (RFC 1812
 section 5.3.1), the consumer does not decrement TTL, for fragments or for
-`Decapsulated` packets. This is a documented limitation of this path.
+`Decapsulated` packets. Nor does it process IPv4 options (source routing,
+Record Route, Timestamp): a `Decapsulated` packet with options is returned
+with a validated header and unprocessed options. These are documented
+limitations of this path.
 
 **Owner-approved policy.** Fragmenting a datagram with Don't Fragment set is
 not standard router behaviour. RFC 791 section 2.3 and RFC 6864 section 4.3
@@ -641,6 +667,12 @@ rule active in the gateway namespace:
   fragments and nothing else, and no reassembly fails;
 - three fragments in reverse order, none of which enters a host reassembly
   queue;
+- a 28-octet first fragment with one flipped header checksum octet. Without
+  a downlink inner MTU, tc decapsulates it and the kernel's IPv4 input
+  discards it (`InHdrErrors`). With one, the consumer drops it as
+  `Malformed`, and nothing is sent toward the UE;
+- two fragments followed by six octets beyond their total length. They come
+  back trimmed, and the UE reassembles the exact datagram;
 - a dedicated bearer through its real ESP Child SA: one dedicated-SPI ESP
   packet per inner fragment, none fragmented on the outer header;
 - a context without a downlink inner MTU, and a packet that is not a

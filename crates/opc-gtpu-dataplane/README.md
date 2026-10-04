@@ -114,11 +114,15 @@ applies the context's RFC 4459 policy:
 Inner IPv6 contexts refuse both policies: IPv6 has no in-network
 fragmentation (RFC 8200).
 
-Under either policy, tc also steers every inner IPv4 fragment of such a
-context (More Fragments set, or a non-zero fragment offset) to a second
+Under either policy, tc also steers every other inner IPv4 fragment of such
+a context (More Fragments set, or a non-zero fragment offset) to a second
 backend-owned queue, and `try_receive_downlink` returns it as `Decapsulated`
-with its bearer mark. All fragments of one datagram then leave through the
-caller. Otherwise a datagram could be split between the consumer, which
+with its bearer mark. A fragment that exceeds the MTU with Don't Fragment set
+follows the policy above. All fragments of one datagram then leave through
+the caller. Before it returns any inner IPv4 packet, the consumer validates the
+header as the kernel's IPv4 input does for a packet that tc decapsulated, and
+trims octets after the total length; a packet that fails is dropped.
+Otherwise a datagram could be split between the consumer, which
 receives a fragment whose G-PDU was fragmented on the outer path, and the
 host's forwarding path, where netfilter connection tracking holds the rest
 until it expires. A returned fragment is authorized like any G-PDU and takes

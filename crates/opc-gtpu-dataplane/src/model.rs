@@ -4865,19 +4865,27 @@ pub struct GtpPdpContext {
     ///
     /// With `Some`, tc also forwards no inner IPv4 fragment (More Fragments
     /// set, or a non-zero fragment offset) itself. Every authorized fragment
-    /// is handed to the same control port, which returns it as
-    /// [`GtpuDownlinkEvent::Decapsulated`](crate::GtpuDownlinkEvent::Decapsulated)
-    /// exactly as it arrived, with its tunnel's bearer mark, for the caller
-    /// to inject. One fragment of a datagram can reach that port anyway,
-    /// through kernel reassembly of an outer-fragmented G-PDU. If tc forwarded
-    /// the others, netfilter connection tracking could hold the two halves in
-    /// separate reassembly queues until both expire. A fragment is authorized
-    /// like any G-PDU, first or not: by its tunnel, outer endpoints, complete
-    /// Active graph and inner destination. It takes no token from the inner
-    /// fragmentation or Packet Too Big rate limits. Inner fragments wait in
-    /// their own queue, bounded by its socket receive buffer, so a flood of
-    /// them cannot displace over-MTU packets. A fragment larger than this
-    /// value without Don't Fragment is returned unfragmented.
+    /// is handed to the same control port:
+    ///
+    /// - A fragment that exceeds this value with Don't Fragment set is an
+    ///   over-MTU packet like any other. It follows the oversize policy
+    ///   above and its rate limit.
+    /// - Every other fragment is returned as
+    ///   [`GtpuDownlinkEvent::Decapsulated`](crate::GtpuDownlinkEvent::Decapsulated),
+    ///   unmodified, with its tunnel's bearer mark, for the caller to
+    ///   inject, once its header has been validated. It takes no token from
+    ///   the inner fragmentation or Packet Too Big rate limits. This includes
+    ///   a fragment larger than this value without Don't Fragment, which is
+    ///   returned unfragmented.
+    ///
+    /// One fragment of a datagram can reach that port anyway, through kernel
+    /// reassembly of an outer-fragmented G-PDU. If tc forwarded the others,
+    /// netfilter connection tracking could hold the two halves in separate
+    /// reassembly queues until both expire. A fragment is authorized like
+    /// any G-PDU, first or not: by its tunnel, outer endpoints, complete
+    /// Active graph and inner destination. Inner fragments wait in their own
+    /// queue, bounded by its socket receive buffer, so a flood of them cannot
+    /// displace over-MTU packets.
     ///
     /// Backends whose [`GtpuProbe::downlink_inner_mtu_enforcement`] is not
     /// [`GtpuCapability::Available`] reject `Some`. `None` preserves the

@@ -77,9 +77,13 @@ pub trait GtpuControlPort: fmt::Debug + Send + Sync {
     /// fragments) or `PacketTooBig` under the explicit opt-in. Under the
     /// opt-in this call itself may send one in-tunnel error G-PDU toward the
     /// peer through the backend-owned UDP/2152 socket. Every other inner
-    /// fragment is returned as `Decapsulated`, exactly as it arrived, so all
-    /// fragments of one datagram leave through the caller; it takes no token
-    /// from either rate limit. Non-G-PDU messages are returned for the
+    /// fragment is returned as `Decapsulated`, unmodified, so all fragments
+    /// of one datagram leave through the caller; it takes no token from
+    /// either rate limit. Before any inner IPv4 packet is returned as
+    /// `Decapsulated`, its header is validated as the kernel's IPv4 input
+    /// validates a packet that tc decapsulated, and octets after its total
+    /// length are trimmed; a packet that fails is a `Malformed` drop.
+    /// Non-G-PDU messages are returned for the
     /// existing control planners. Receive and processing are serialized per
     /// attachment and never wait behind PDP mutation; a `Busy` result from an
     /// implementation consumes nothing from the queue.

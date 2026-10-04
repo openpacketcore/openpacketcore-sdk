@@ -44,8 +44,9 @@ The crate exposes tc entry points, not a Rust library API:
   both policies. Every other authorized inner IPv4 fragment of a session with
   a downlink inner MTU (More Fragments set, or a non-zero fragment offset) is
   handed off the same way, to the backend-owned inner-fragment queue
-  (`GTPU_INNER_FRAGMENT_QUEUE_PORT`, 2154). Its consumer returns the fragment
-  exactly as it arrived, with its bearer mark, so that every fragment of one
+  (`GTPU_INNER_FRAGMENT_QUEUE_PORT`, 2154). Its consumer validates the inner
+  header, as the kernel's IPv4 input would after a decapsulation, and returns
+  the fragment unmodified with its bearer mark, so that every fragment of one
   datagram
   leaves through the application and none through the host's forwarding
   path, where netfilter connection tracking could strand it. The decision is
