@@ -400,6 +400,20 @@ The three decisions that this hand-off needed:
 - **While nothing drains the queues** (see the binding windows above), tc
   still steers. The inner fragments of contexts with a downlink inner MTU are
   then not forwarded; without this hand-off the host would forward them.
+- **Other senders can crowd fragments out.** The queue budget separates the
+  two hand-off classes from each other. It does not protect a class from
+  datagrams that tc did not steer:
+  - the hand-off queues are unconnected UDP sockets on the S2b-U address. A
+    sender that reaches UDP/2154 directly uses the queue's buffer, and one of
+    the consumer's turns per datagram, before the consumer can refuse it;
+  - the shared queue is always served first, and tc passes Echo and
+    unknown-TEID G-PDUs to it from any source. A sender that keeps UDP/2152
+    busy keeps the consumer from both hand-off queues.
+
+  Inner fragments then overflow their queue, where tc used to forward them
+  whatever the consumer was doing. UDP/2153 has always been exposed in the
+  same way. Admit UDP/2152 to UDP/2154 on the S2b-U address only from the
+  GTP-U peers.
 - **Contexts without a downlink inner MTU** are unchanged: tc decapsulates
   their fragments. One of their datagrams can still be split when a G-PDU is
   fragmented on the outer path and the application drains this port. Give
@@ -470,13 +484,18 @@ such a socket from the socket, not the packet: pass the inner source as the
 rely on port or protocol selectors. Set `IP_NODEFRAG` on that socket too.
 Where connection tracking is active, netfilter otherwise reassembles the
 injected fragments at LOCAL_OUT: it holds them until the datagram is
-complete, and the reassembled packet leaves as one ESP packet that is
-fragmented on the outer header. This applies equally to `Fragmented`
-fragments and to `Decapsulated` inner fragments. Linux also replaces an
-Identification
+complete, and the reassembled packet leaves as one ESP packet, which is
+fragmented on the outer header when it exceeds the link MTU. This applies
+equally to `Fragmented` fragments and to `Decapsulated` inner fragments.
+Linux also replaces an Identification
 of zero on an `IP_HDRINCL` send, which would break reassembly; fragments of
 an atomic datagram never carry zero, but a received DF fragment's own
-Identification is preserved as it is. Unlike a forwarding router (RFC 1812
+Identification is preserved as it is. So is that of a `Decapsulated` inner
+fragment. If it is zero and the fragment has no Don't Fragment, Linux gives
+each fragment a different Identification on such a send, and the datagram
+cannot be reassembled, where tc forwarded the fragments unchanged. That
+affects a datagram whose sender chose Identification zero (#1022). Unlike a
+forwarding router (RFC 1812
 section 5.3.1), the consumer does not decrement TTL, for fragments or for
 `Decapsulated` packets. This is a documented limitation of this path.
 
@@ -557,7 +576,11 @@ rate-limited and unfragmentable packets under the default policy, and
 too-big, signalled, rate-limited and unsendable packets under the opt-in.
 `decapsulated_inner_fragments` reports the decapsulated packets that were
 inner fragments. `SO_RXQ_OVFL` reports kernel drops from the shared queue,
-from the packet-too-big queue and from the inner-fragment queue.
+from the packet-too-big queue and from the inner-fragment queue. The kernel
+reports a queue's drop count with each datagram received from it, so each of
+these three counters shows the drops up to the last datagram read from its
+queue. Drops since then, or from a queue that is not being served, are not
+visible yet.
 
 **Limits.**
 
@@ -626,8 +649,9 @@ rule active in the gateway namespace:
   buffer leaves at most one buffer of fragments queued, and every other one
   dropped and counted (on Linux 7.1 with a 212,992-octet buffer, 92 of 272
   queued and 180 dropped). Echo is served first, and three over-MTU packets
-  are served in turn with the backlog, none lost;
-- datagrams sent straight to UDP/2154, which are dropped;
+  alternate with the fragment backlog, none lost;
+- an Echo Request and a G-PDU for no tunnel sent straight to UDP/2154, which
+  are dropped;
 - zero plaintext ICMP toward the core, and an unchanged host
   `OutDestUnreachs`.
 

@@ -149,13 +149,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     any G-PDU it is authorized by its tunnel, outer endpoints, complete
     Active graph and inner destination, on its own.
   - **Integration.** A consumer that already injects `Decapsulated` packets
-    needs no change, and should set `IP_NODEFRAG` on its injection socket so
-    that netfilter does not reassemble the fragments at LOCAL_OUT. The
-    backend binds UDP/2154 next to UDP/2152 and UDP/2153 when the control
-    port is first opened; a host filter on INPUT must admit it. While
-    nothing drains the queues (before the first open, while the process is
-    down, after a retirement), these fragments are no longer forwarded
-    (#1019).
+    needs no new code path, and should set `IP_NODEFRAG` on its injection
+    socket so that netfilter does not reassemble the fragments at LOCAL_OUT.
+    The backend binds UDP/2154 next to UDP/2152 and UDP/2153 when the control
+    port is first opened; a host filter on INPUT must admit it, and should
+    admit all three only from the GTP-U peers.
+  - **Limits.** These inner fragments now depend on the consumer, where tc
+    forwarded them on its own:
+    - while nothing drains the queues (before the first open, while the
+      process is down, after a retirement) they are not forwarded (#1019);
+    - a sender that reaches UDP/2154 directly, or keeps the shared UDP/2152
+      queue busy, can crowd them out before the consumer refuses its
+      datagrams;
+    - a fragment above the MTU without Don't Fragment is returned
+      unfragmented. An `IP_HDRINCL` injection then fragments the ESP packet
+      on the outer header, or fails with `EMSGSIZE` above the egress device
+      MTU (part (ii) of #1023);
+    - on an `IP_HDRINCL` send Linux replaces a zero Identification per
+      fragment, so a fragmented datagram whose sender chose Identification
+      zero cannot be reassembled (#1022).
   - **Evidence.** On a real kernel with one connection-tracking rule, a
     2,600-octet datagram whose first G-PDU is outer-fragmented reaches the UE,
     each inner fragment leaving as its own packet (on a dedicated bearer, as

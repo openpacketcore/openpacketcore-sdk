@@ -45,7 +45,8 @@ The crate exposes tc entry points, not a Rust library API:
   a downlink inner MTU (More Fragments set, or a non-zero fragment offset) is
   handed off the same way, to the backend-owned inner-fragment queue
   (`GTPU_INNER_FRAGMENT_QUEUE_PORT`, 2154). Its consumer returns the fragment
-  undivided with its bearer mark, so that every fragment of one datagram
+  exactly as it arrived, with its bearer mark, so that every fragment of one
+  datagram
   leaves through the application and none through the host's forwarding
   path, where netfilter connection tracking could strand it. The decision is
   `opc-gtpu-ebpf-common`'s `downlink_ipv4_hand_off_port`, taken only after the

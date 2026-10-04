@@ -1246,6 +1246,10 @@ pub struct GtpuDownlinkCounters {
     /// overload signal. Its receive buffer is the whole budget of the
     /// inner-fragment hand-off, so these drops never come at the expense of
     /// the packet-too-big queue or the shared queue.
+    ///
+    /// Like the other two queue-drop counters, this is the count the kernel
+    /// reported with the last datagram received from that queue. Drops since
+    /// then, or from a queue that is not being served, are not included yet.
     pub inner_fragment_queue_drops: u64,
     /// Authorized over-MTU packets fragmented under the default policy and
     /// returned as [`GtpuDownlinkEvent::Fragmented`].
