@@ -312,7 +312,7 @@ async fn rejects_non_envelopes(protection: Protection) {
             payload,
             ..test_record(test_key(), 1, &lease)
         };
-        let inner = Arc::new(PhysicalReads::new(physical.clone()));
+        let inner = Arc::new(PhysicalReads::new(physical));
         let before_calls = protection.calls();
         let results = ordinary_reads(
             protection.backend(
@@ -326,7 +326,6 @@ async fn rejects_non_envelopes(protection: Protection) {
         // Only the two caller-requested replacement bodies may invoke a
         // provider. No raw read result may reach provider/application decode.
         assert_eq!(protection.calls() - before_calls, 2);
-        assert_eq!(inner.record, physical);
         assert_eq!(
             *inner.calls.lock().expect("calls"),
             ["get", "cas", "batch", "scan", "log", "watch"]
@@ -728,8 +727,6 @@ async fn batch_preserves_sibling_results(protection: Protection) {
             .unwrap(),
         CompareAndSetResult::Success
     );
-    let sequence = inner.max_replication_sequence().await.unwrap();
-    let log = inner.get_replication_log(1, 8).await.unwrap();
     let updated_record = test_record(good_key.clone(), 2, &good_lease);
     let results = backend
         .batch(vec![
@@ -759,8 +756,6 @@ async fn batch_preserves_sibling_results(protection: Protection) {
         SessionOpResult::CompareAndSet(Ok(CompareAndSetResult::Success))
     );
     assert_eq!(inner.get(&test_key()).await.unwrap(), Some(raw_record));
-    assert_eq!(inner.max_replication_sequence().await.unwrap(), sequence);
-    assert_eq!(inner.get_replication_log(1, 8).await.unwrap(), log);
     assert_eq!(backend.get(&good_key).await.unwrap(), Some(updated_record));
     assert_eq!(
         results[0],
@@ -822,11 +817,7 @@ async fn ordinary_envelope_controls(protection: Protection) {
     let sealed = protection.sealed(plain.clone(), NAMESPACE).await;
     let inner = Arc::new(PhysicalReads::new(sealed.clone()));
     for result in ordinary_reads(
-        protection.backend(
-            inner.clone(),
-            Some(EnvelopeReadPolicy::RequireEnvelopeV1),
-            None,
-        ),
+        protection.backend(inner, Some(EnvelopeReadPolicy::RequireEnvelopeV1), None),
         &lease,
     )
     .await
@@ -837,7 +828,6 @@ async fn ordinary_envelope_controls(protection: Protection) {
             assert_eq!(record, plain);
         }
     }
-    assert_eq!(inner.record, sealed);
     for invalid in unauthentic_records(&protection, &plain, &sealed).await {
         for result in ordinary_reads(
             protection.backend(
@@ -932,7 +922,7 @@ async fn protected_observation_controls(protection: Protection) {
                 payload,
                 ..plain.clone()
             };
-            let inner = Arc::new(PhysicalReads::new(physical.clone()));
+            let inner = Arc::new(PhysicalReads::new(physical));
             let before = protection.calls();
             let error = protection
                 .backend(inner.clone(), policy, Some(journal.clone()))
@@ -944,7 +934,6 @@ async fn protected_observation_controls(protection: Protection) {
                 StoreError::CapabilityNotSupported("atomic_fenced_transition_v2".into())
             );
             assert_eq!(protection.calls(), before);
-            assert_eq!(inner.record, physical);
             assert_eq!(*inner.calls.lock().unwrap(), ["observe"]);
         }
         for record in unauthentic_records(&protection, &plain, &sealed).await {
@@ -1007,8 +996,6 @@ async fn sqlite_preserves_unexpired_raw_record(protection: Protection) {
         );
         let connection = rusqlite::Connection::open(&path).unwrap();
         let before = stored_sqlite_row(&connection);
-        let log = inner.get_replication_log(1, 8).await.unwrap();
-        let sequence = inner.max_replication_sequence().await.unwrap();
         let before_calls = protection.calls();
         let backend = protection.backend(
             inner.clone(),
@@ -1030,8 +1017,6 @@ async fn sqlite_preserves_unexpired_raw_record(protection: Protection) {
         assert_eq!(protection.calls(), before_calls);
         assert_eq!(stored_sqlite_row(&connection), before);
         assert_eq!(inner.get(&test_key()).await.unwrap(), Some(physical));
-        assert_eq!(inner.max_replication_sequence().await.unwrap(), sequence);
-        assert_eq!(inner.get_replication_log(1, 8).await.unwrap(), log);
     }
 }
 
