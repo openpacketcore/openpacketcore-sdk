@@ -5,9 +5,10 @@ use async_trait::async_trait;
 use crate::backend::XfrmBackend;
 use crate::error::XfrmError;
 use crate::model::{
-    AllocateSpiRequest, ExactRemovePolicyRequest, InstallPolicyRequest, InstallSaRequest,
-    QuerySaRequest, RekeyPolicyRequest, RekeySaRequest, RelocateSaRequest, RemovePolicyRequest,
-    RemoveSaRequest, SaRelocationIdentity, SaState, SpiAllocation, XfrmProbe,
+    AllocateSpiRequest, ExactRemovePolicyRequest, ExactRemoveSaRequest, InstallPolicyRequest,
+    InstallSaRequest, QuerySaRequest, RekeyPolicyRequest, RekeySaRequest, RelocateSaRequest,
+    RemovePolicyRequest, RemoveSaRequest, SaKeySnapshot, SaLookupKey, SaRelocationIdentity,
+    SaState, SpiAllocation, XfrmProbe,
 };
 
 /// XFRM backend that reports [`XfrmError::UnsupportedPlatform`] for every
@@ -46,6 +47,10 @@ impl XfrmBackend for UnsupportedXfrmBackend {
         Err(XfrmError::UnsupportedPlatform)
     }
 
+    async fn query_sa_key_snapshot(&self, _key: SaLookupKey) -> Result<SaKeySnapshot, XfrmError> {
+        Err(XfrmError::UnsupportedPlatform)
+    }
+
     async fn rekey_sa(&self, _request: RekeySaRequest) -> Result<(), XfrmError> {
         Err(XfrmError::UnsupportedPlatform)
     }
@@ -55,6 +60,10 @@ impl XfrmBackend for UnsupportedXfrmBackend {
     }
 
     async fn remove_sa(&self, _request: RemoveSaRequest) -> Result<(), XfrmError> {
+        Err(XfrmError::UnsupportedPlatform)
+    }
+
+    async fn remove_sa_exact(&self, _request: ExactRemoveSaRequest) -> Result<(), XfrmError> {
         Err(XfrmError::UnsupportedPlatform)
     }
 

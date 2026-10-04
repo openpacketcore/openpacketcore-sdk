@@ -52,19 +52,24 @@ closes the queue and lets the detached actor drain without blocking `Drop`.
 
 - `XfrmBackend`: async port for SPI allocation, SA
   install/query/rekey/relocation/removal, policy install/rekey/remove, and
-  capability probing.
+  capability probing. The optional key-scoped read `query_sa_key_snapshot`
+  and `remove_sa_exact` are described in
+  [Key-scoped SA snapshots and exact SA removal](#key-scoped-sa-snapshots-and-exact-sa-removal).
 - `LinuxXfrmBackend`: safe adapter over `NETLINK_XFRM` through
   `opc-linux-xfrm-sys`.
 - `NamespaceBoundLinuxXfrmBackend`: cloneable bounded actor that keeps every
   Linux XFRM operation in one captured network namespace.
 - `MockXfrmBackend`: deterministic in-memory backend with operation capture,
   a source-compatible separate `MockSaRelocation` log, and failure injection.
+  Its SA lookups follow the Linux mark predicate and lookup order, and
+  `reverse_sa_lookup_order` simulates a hash resize.
 - `UnsupportedXfrmBackend`: trait-compatible unsupported backend.
 - Model exports include `IpAddress`, `XfrmSelector`, `XfrmId`, `SaParameters`,
   `PolicyParameters`, `XfrmTemplate`, `InstallSaRequest`,
   `InstallPolicyRequest`, `QuerySaRequest`, `SaState`, `SaReplayState`,
   `SaRelocationSelector`, `SaRelocationIdentity`, `SaRelocationEncap`,
-  `SaRelocationDirection`, `RelocateSaRequest`,
+  `SaRelocationDirection`, `RelocateSaRequest`, `SaLookupKey`,
+  `SaKeySnapshot`, `ExactRemoveSaRequest`,
   `XfrmRequestId`, `UdpEncap`, `UdpEncapError`, `XfrmMark`, `DscpCodepoint`,
   `LifetimeConfig`, and `XfrmProbe`.
 - Algorithm/key exports include `Algorithm`, `AuthAlgorithm`, `AeadAlgorithm`,
@@ -1165,9 +1170,171 @@ guarantees this crate can make:
   the tuple, but it will admit an unmarked state alongside marked ones. Do not
   mix unmarked and marked SAs on one destination/protocol/SPI.
 - A foreign state installed by another writer with a narrower mask still
-  widens the lookup domain. Proving otherwise would require dumping the tuple
-  on every removal, which this crate does not do; it fails closed on the
-  request instead.
+  widens the lookup domain. The exact-profile paths above do not read the
+  whole tuple and fail closed on the request instead. `query_sa_key_snapshot`
+  observes the whole key; Linux `remove_sa_exact` is unavailable: see
+  [Key-scoped SA snapshots and exact SA removal](#key-scoped-sa-snapshots-and-exact-sa-removal).
+
+## Key-scoped SA snapshots and exact SA removal
+
+`XfrmBackend::remove_sa` sends `XFRM_MSG_DELSA`, and Linux deletes the state
+that its own lookup selects. `__xfrm_state_lookup` walks the SPI hash chain of
+the destination/protocol/SPI key and returns the first state whose stored mark
+satisfies `(lookup & mask) == value`. Several states can match one lookup: an
+unmarked state matches every lookup value, and a narrower mask can overlap a
+full one. New states go to the head of the chain, and a hash resize can
+reverse it, so no sequence of point queries proves which matching state the
+next lookup selects. A GETSA that carries a marked SA's own mark can return an
+unmarked SA added later at the same key, and a DELSA can delete it.
+
+`XfrmBackend::query_sa_key_snapshot` reads every state at one `SaLookupKey`,
+whatever its mark, as a `SaRelocationIdentity` view. The key is a
+destination, a protocol (AH, ESP, or IPComp, the protocols Linux looks up by
+SPI), and a nonzero SPI. `SaKeySnapshot::lookup_candidates` applies the lookup
+predicate to the result. The Linux backend reads the key from an
+`XFRM_MSG_GETSA` dump (`NLM_F_DUMP`) of every state in the namespace and keeps
+only the replies whose family, destination bytes, protocol, and SPI equal the
+key. The dump walks the namespace's list of states, not the hash chains, so it
+does not depend on chain order. States are reported newest first. That order
+is not the lookup order.
+
+`XfrmBackend::remove_sa_exact` is unavailable on the default,
+`LinuxXfrmBackend` and `NamespaceBoundLinuxXfrmBackend` implementations.
+They validate the request and return
+`UnsupportedFeature { feature: "exact_sa_removal" }` before any snapshot,
+netlink request or actor admission. Invalid keys and zero interface IDs still
+return `InvalidConfig` first. Refusal does not advance durable writer epochs
+or invalidate prepared authorities.
+
+Linux has no conditional SA deletion. Even a complete snapshot showing one
+matching candidate cannot exclude a kernel ACQUIRE insertion between that
+read and an unconditional DELSA. A policy template may name the nonzero SPI;
+neither a nonzero SPI nor userspace writer serialization excludes that race.
+`SaRelocationIdentity` also omits algorithm, key, lifetime and replay
+fingerprints. Matching its fields or a lookup mark does not establish
+installation ownership or cleanup authority.
+
+`MockXfrmBackend` implements exact removal under one state lock. It compares
+every `SaRelocationIdentity` field of the sole candidate before removing it.
+The following results apply only to that locked mock:
+
+| Snapshot for the expected lookup mark | Result |
+|:--|:--|
+| One candidate, equal to the expected identity | Mock state removed |
+| Two or more candidates | `StateIndeterminate` (`remove_sa_exact_preflight`) |
+| One candidate that differs | `StateMismatch` (`remove_sa_exact_preflight`) |
+| No candidate | `NotFound` |
+
+```rust,no_run
+use opc_ipsec_xfrm::{ExactRemoveSaRequest, MockXfrmBackend, SaRelocationIdentity, XfrmBackend};
+
+async fn remove_expected_mock_sa(
+    backend: &MockXfrmBackend,
+    expected: SaRelocationIdentity,
+) -> Result<(), opc_ipsec_xfrm::XfrmError> {
+    // The mock checks and removes the sole matching candidate under one lock.
+    backend
+        .remove_sa_exact(ExactRemoveSaRequest::new(expected))
+        .await
+}
+```
+
+A successful end of a dump does not prove that it is complete. When one
+state's message does not fit an empty dump batch, `xfrm_dump_sa` returns the
+batch length and drops the `-EMSGSIZE` from `xfrm_state_walk`, and the netlink
+core then ends the dump with a successful `NLMSG_DONE` (`net/xfrm/xfrm_user.c`
+and `netlink_dump` in `net/netlink/af_netlink.c`). That state and every older
+one are silently missing. A state can be that large: `xfrm_user` bounds key
+lengths only by the attribute length, HMAC accepts any key length, and the
+dump reports an authentication key twice, in `XFRMA_ALG_AUTH` and
+`XFRMA_ALG_AUTH_TRUNC`. So the Linux backend proves completeness by count. On
+one socket it reads the SAD state count (`XFRM_MSG_GETSADINFO`, whose
+`XFRMA_SAD_CNT` is `net->xfrm.state_num`), dumps every state, and reads the
+count again. The read is complete only when the dump returned exactly as many
+states as both counts, under the contract below. Every state the dump can
+return is counted, and a counted state is missing from a finished dump only
+when it was dropped or was being deleted.
+
+The batch size comes from the receive buffer. A fresh socket's first dump
+batch is `NLMSG_GOODSIZE`, about 3.7 KiB with 4 KiB pages, because the kernel
+sizes batches from the largest buffer previously used to receive on that
+socket. Receiving the first count reply with `receive_buffer_len` therefore
+raises every batch of the dump to that size, up to the kernel's cap of about
+32 KiB. With the default 8 KiB, ordinary states fit with room to spare. A
+state whose dump message is larger than the batch makes every attempt fail
+the count, and the read fails closed with `StateIndeterminate`. A larger
+`receive_buffer_len` admits larger states. A state larger than 32 KiB makes
+every read of the namespace fail closed until it is removed.
+
+The completeness contract has two clauses:
+
+- The caller excludes every other userspace SA writer in the network
+  namespace, at any key, for the duration of the read.
+- Kernel ACQUIRE activity is detected and makes the read indeterminate.
+
+Under this contract, a snapshot holds exactly the states that were at the key
+when the read began. Any of them may have expired since. Equal counts alone do
+not prove that. Linux releases `xfrm_state_lock` between the batches of a
+multipart dump, and current Linux keeps no change sequence for XFRM state dumps
+and never sets `NLM_F_DUMP_INTR` on them. A state that the dump returned but
+that was inserted after the first count can stand in for a dropped one, while a
+deletion such as a lifetime expiry evens the second count. Another userspace
+writer could insert such a state; the first clause excludes that. Linux inserts
+a state on its own in one place: `xfrm_state_find` adds a larval
+(`XFRM_STATE_ACQ`) state when outbound traffic matches a policy template that
+no SA satisfies while a key manager listens for ACQUIRE messages, through an
+`XFRMNLGRP_ACQUIRE` netlink listener or a registered PF_KEY socket. Every other
+insertion serves a userspace request: NEWSA, UPDSA, and their PF_KEY
+equivalents; SPI allocation; MIGRATE and MIGRATE_STATE, which also carry
+address updates such as MOBIKE; and the IP-in-IP helper state that an IPComp
+tunnel-mode SA adds when it is installed. Per-CPU SAs and hardware offload add
+no other path: a per-CPU ACQUIRE (`XFRM_POLICY_CPU_ACQUIRE`) and a
+packet-offload ACQUIRE use the same larval insertion.
+
+A dump does not report a state's `km.state`. `copy_to_user_state` fills
+`xfrm_usersa_info` from the identifier, selector, lifetimes, statistics,
+source address, mode, replay window, request ID, family, flags, and sequence.
+A larval state's SPI is not always zero either: a template can name one, and
+SPI allocation assigns one. The backend recognizes a larval state by its
+missing transform instead. `copy_to_user_state_extra` reports every transform a
+state has, a larval state has none, and Linux refuses an established ESP state
+without an AEAD or encryption algorithm, an AH state without an authentication
+algorithm, and an IPComp state without a compression algorithm
+(`esp_init_state`, `ah_init_state`, `ipcomp_init_state`). A state of any other
+protocol, such as an IP-in-IP helper state, cannot be classified and also makes the
+read indeterminate. A larval state that Linux inserts after the dump starts is
+never returned, because new states go to the head of the list that the dump
+walks, behind its position, so it cannot stand in for a dropped state. SPI
+allocation also leaves a larval state until its SA is installed or the
+allocation expires (`net.core.xfrm_acq_expires`, 30 seconds by default), so a
+pending allocation anywhere in the namespace makes reads indeterminate until
+then.
+
+The snapshot is an observation, with no exclusion of later kernel ACQUIRE
+activity or other state changes. It grants no authority for a subsequent
+deletion. Linux and namespace-bound Linux exact removal therefore refuse
+before taking a snapshot.
+
+The read never reports a partial dump as complete. A read whose dump is flagged
+with `NLM_F_DUMP_INTR` or `NLMSG_OVERRUN`, whose counts disagree, or whose dump
+holds a larval or unclassifiable state is repeated whole on a fresh socket and
+sequence, at most four times, and then fails with `StateIndeterminate`. A
+receive failure, an oversized datagram (`ResponseTooLarge`), a malformed or
+foreign message, an error status, or a missing `NLMSG_DONE` fails the read. A
+state at the key that the SDK cannot represent, such as one with a nonzero
+NAT-T original address, also fails the read rather than being left out; states
+at other keys are classified and counted but not decoded. Each read makes the
+kernel serialize every state in the namespace, so its cost grows with the
+namespace's SA count, not with the key. Like GETSA, the dump carries the key
+material of every state it reports. The backend reads it only into its
+zeroizing receive buffer and keeps none of it.
+
+`MockXfrmBackend` models the same lookup: queries, rekeys, relocations, and
+removals select the first state at the key whose mark matches, an install
+collides when its own mark's lookup selects an existing state, and new states
+go to the head. `reverse_sa_lookup_order` reverses the order at every key, as a
+hash resize can, while its snapshots keep creation order. The mock runs
+`remove_sa_exact` under one lock.
 
 ## Per-SA output marks
 
@@ -1432,6 +1599,7 @@ sudo unshare -n -- env OPC_XFRM_RUN_SA_DIRECTION_PRIVILEGED=1 cargo test -p opc-
 sudo OPC_XFRM_RUN_NAMESPACE_PRIVILEGED=1 cargo test -p opc-ipsec-xfrm --test xfrm_namespace_bound_privileged -- --ignored --nocapture
 sudo unshare -n -- bash -lc 'ip link set lo up && OPC_XFRM_RUN_PRIVILEGED=1 cargo test -p opc-ipsec-xfrm --test xfrm_dscp_privileged -- --ignored --nocapture'
 sudo unshare -n -- bash -lc 'ip link set lo up && OPC_XFRM_RUN_RELOCATION_PRIVILEGED=1 cargo test -p opc-ipsec-xfrm --test xfrm_relocation_privileged -- --ignored --nocapture'
+sudo unshare -n -- bash -lc 'ip link set lo up && OPC_XFRM_RUN_SA_KEY_SNAPSHOT_PRIVILEGED=1 cargo test -p opc-ipsec-xfrm --test xfrm_sa_key_snapshot_privileged -- --ignored --nocapture'
 sudo unshare -n -- bash -lc 'ip link set lo up && OPC_XFRM_RUN_AUTH_ONLY_PRIVILEGED=1 cargo test -p opc-ipsec-xfrm --features ikev2 --test xfrm_auth_only_privileged -- --ignored --nocapture'
 ```
 

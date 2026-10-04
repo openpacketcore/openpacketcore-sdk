@@ -7,7 +7,7 @@ require (
 	k8s.io/apimachinery v0.37.1
 	k8s.io/client-go v0.37.1
 	openpacketcore.io/operator-sdk-go v0.0.0-00010101000000-000000000000
-	sigs.k8s.io/controller-runtime v0.25.1
+	sigs.k8s.io/controller-runtime v0.25.2
 )
 
 replace openpacketcore.io/operator-sdk-go => ../operator-sdk-go

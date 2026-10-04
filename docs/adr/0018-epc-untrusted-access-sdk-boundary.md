@@ -152,6 +152,45 @@ prove mechanism behavior only. They do not establish continuous product
 readiness, forwarding, latency or carrier acceptance. This boundary preserves
 the separation between SDK mechanism and product policy above.
 
+### XFRM key observations and exact SA removal
+
+A key-scoped SA snapshot is a mechanism observation, not installation ownership
+or authority to delete kernel state. `SaRelocationIdentity` omits complete
+algorithm, key, lifetime and replay fingerprints; matching a lookup mark or
+those identity fields cannot supply that missing authority.
+
+The Linux snapshot contract requires the caller to exclude every other
+userspace SA writer in the network namespace throughout the read. The SDK
+reads the SAD count, every dumped state and the count again on one socket.
+It accepts the result only when both counts equal the number of dumped states
+and every state can be classified as established. Larval kernel ACQUIRE or
+pending SPI-allocation states, unclassifiable protocols, interrupted dumps
+and changing counts make the read indeterminate after the bounded retries;
+malformed members fail the read. These checks do not fence an insertion or
+replacement after the observation and cannot authorize a subsequent deletion.
+
+An exact-removal backend must exclude every competing state change through
+its observation and deletion. The default, Linux and namespace-bound Linux
+implementations cannot exclude kernel ACQUIRE insertion for that interval.
+They therefore validate `ExactRemoveSaRequest` and return
+`UnsupportedFeature { feature: "exact_sa_removal" }` before a snapshot,
+netlink request, namespace-actor admission or durable writer-epoch change.
+A nonzero SPI, userspace serialization or a caller's assertion of ownership
+cannot replace that missing exclusion. The explicit unsupported-platform
+backend continues to report `UnsupportedPlatform`.
+
+The mock follows Linux's stored-mark lookup predicate and per-key lookup
+order, including asymmetric insertion collisions. Every mock state writer
+uses the same lock, so its exact-removal operation can check the sole matching
+candidate and delete it without an intervening state change. That locked
+model behavior does not establish a Linux exact-cleanup capability.
+
+Callers continue to own SA lifecycle policy and any required userspace writer
+exclusion. Unsupported exact removal grants no authority to retry with an
+unconditional deletion. Native and model tests establish only their recorded
+mechanism behavior; ignored privileged fixtures require separate kernel
+qualification before any live cleanup, continuity or performance claim.
+
 ## Consequences
 
 - The SDK can grow reusable EPC and untrusted-access mechanisms without importing

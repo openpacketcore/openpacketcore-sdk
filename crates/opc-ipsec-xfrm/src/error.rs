@@ -52,6 +52,11 @@ pub enum XfrmError {
     },
     /// A mutation may have been accepted, but its final kernel state could
     /// not be proven or safely reconciled.
+    ///
+    /// Key snapshots and exact SA removals also report it, without sending
+    /// any mutation, when the kernel state they depend on cannot be proven: a
+    /// key read that could not be completed consistently, or a removal whose
+    /// deletion could select more than one state.
     #[error("XFRM {operation} final state is indeterminate")]
     StateIndeterminate {
         /// Stable operation label.

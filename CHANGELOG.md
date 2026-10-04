@@ -148,6 +148,53 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- `opc-ipsec-xfrm` / `opc-linux-xfrm-sys`: key-scoped SA snapshots and an
+  optional exact SA removal request, implemented only by the locked mock.
+  Refs #1050.
+  - `XfrmBackend::query_sa_key_snapshot(SaLookupKey)` reads every SA at one
+    destination/protocol/SPI key, whatever its lookup mark, as an
+    `SaKeySnapshot` of `SaRelocationIdentity` views.
+    `SaKeySnapshot::lookup_candidates` applies the Linux lookup predicate
+    `(lookup & mask) == value`. Linux reads the key from an `XFRM_MSG_GETSA`
+    dump (`NLM_F_DUMP`) of every state in the namespace, narrowed to the key on
+    every reply, so the result does not depend on SPI hash-chain order.
+  - Linux ends a state dump with a successful `NLMSG_DONE` after silently
+    dropping a state too large for a dump batch, together with every older
+    state, so the read proves completeness by count: on one socket it reads
+    the SAD state count (`XFRM_MSG_GETSADINFO`), dumps, and reads it again,
+    and it accepts the dump only when it returned as many states as both
+    counts. Receiving the first count with `receive_buffer_len` sets the dump
+    batch size (Linux caps it at about 32 KiB); a larger state makes the read
+    fail closed instead of hiding others. Equal counts prove completeness only
+    when no state inserted after the first count was dumped: the caller
+    excludes other userspace SA writers in the namespace for the read, and
+    the read detects the one state Linux inserts on its own, the larval state
+    of a kernel ACQUIRE. Every dumped state is classified, and a larval state
+    (an AH, ESP, or IPComp state without the transform its protocol
+    requires), or a state of another protocol, makes the read indeterminate.
+    Larval states from pending SPI allocations do too. A read whose counts
+    disagree, whose dump holds such a state, or whose dump is flagged
+    `NLM_F_DUMP_INTR` or `NLMSG_OVERRUN`, is repeated whole on a fresh socket
+    at most four times and then fails with `StateIndeterminate`; no partial
+    dump is returned.
+  - `XfrmBackend::remove_sa_exact(ExactRemoveSaRequest)` validates and
+    returns `UnsupportedFeature { feature: "exact_sa_removal" }` on the
+    default, Linux and namespace-bound Linux backends before any snapshot,
+    netlink request or actor admission. A snapshot followed by an unconditional
+    deletion could select a kernel ACQUIRE state inserted after the read.
+    Refusal preserves durable writer epochs and prepared authorities. Linux
+    cleanup through this API remains unavailable.
+    The mock holds one state lock through its candidate check and
+    deletion: several candidates yield `StateIndeterminate`, a different
+    candidate yields `StateMismatch`, and no candidate yields `NotFound`.
+    `SaRelocationIdentity` excludes algorithm/key/lifetime/replay fingerprints
+    and matching it does not establish installation ownership.
+  - Both methods have defaults, so existing backends stay source compatible;
+    `UnsupportedXfrmBackend` returns `UnsupportedPlatform`.
+  - `opc-linux-xfrm-sys` adds `NLM_F_DUMP_INTR`, `NLM_F_ROOT`, `NLM_F_MATCH`,
+    `NLM_F_DUMP`, `XFRM_MSG_NEWSADINFO`, `XFRM_MSG_GETSADINFO`, and
+    `XFRMA_SAD_CNT`, each citing its UAPI header.
+
 - `opc-route-steering`: `RouteRequest` gains `locked_mtu`, a validated
   `RouteMtu` installed as one `RTA_METRICS` nest with `RTAX_MTU` and exactly
   its lock bit, the equivalent of `ip route add ... mtu lock`. The forwarding
@@ -670,6 +717,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 
 ### Changed
+- `opc-ipsec-xfrm`: `MockXfrmBackend` selects SA states with the Linux lookup
+  predicate and lookup order instead of exact mark-pair equality, closing the
+  gap noted under #419. A marked query, rekey, relocation, or removal can now
+  select an unmarked state at the same key. An install collides when a lookup
+  with its own mark selects an existing state, so a marked install after an
+  unmarked one at the key returns `AlreadyExists`, as on Linux. New states go
+  to the head of the key's lookup order, and `reverse_sa_lookup_order`
+  simulates a hash resize. Tests that install overlapping marked and unmarked
+  SAs at one key can observe different results (Refs #1050).
 - `opc-diameter-transport`: expose an opaque generic RFC 6083 connector,
   acceptor and protected connection using the existing mutual DTLS/SCTP
   machinery without Diameter procedure state. Admit protected PPIDs 47 and 66

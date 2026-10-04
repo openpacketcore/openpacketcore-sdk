@@ -371,7 +371,6 @@ impl XfrmLookupMark {
 /// Models `(incoming_lookup_value & stored.mask) == stored.value`, with an
 /// unmarked object taking the kernel's `{ value: 0, mask: 0 }` stored shape
 /// and an unmarked lookup taking the lookup value `0`.
-#[cfg(test)]
 pub(crate) const fn linux_lookup_selects(
     incoming: Option<XfrmLookupMark>,
     stored: Option<XfrmLookupMark>,
@@ -1169,6 +1168,10 @@ impl SaRelocationSelector {
 /// destination, SPI, protocol, family, and lookup mark. The remaining fields
 /// are an optimistic-concurrency snapshot: the backend checks them before the
 /// mutation and preserves them in the relocated state.
+///
+/// This view omits algorithm, key, lifetime and replay fingerprints. Matching
+/// its fields, including the lookup mark, does not establish installation
+/// ownership or authorize cleanup of a kernel SA.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SaRelocationIdentity {
     /// Current exact packet selector.
@@ -1447,6 +1450,325 @@ impl RemoveSaRequest {
         self.mark = Some(mark);
         self
     }
+}
+
+/// Linux `IPPROTO_ESP`.
+const IPPROTO_ESP: u8 = 50;
+/// Linux `IPPROTO_AH`.
+const IPPROTO_AH: u8 = 51;
+/// Linux `IPPROTO_COMP` (IPComp).
+const IPPROTO_COMP: u8 = 108;
+
+/// Linux XFRM SA lookup key: destination, transform protocol, and SPI.
+///
+/// This is the tuple `__xfrm_state_lookup` compares before it applies the
+/// lookup-mark predicate. The address family is the destination's. Several
+/// states can share one key when their lookup marks differ, and an unmarked
+/// state answers every lookup mark at its key. See
+/// [`crate::XfrmBackend::query_sa_key_snapshot`].
+///
+/// Linux finds only AH, ESP, and IPComp states by SPI, so a key with another
+/// protocol, or with SPI zero, is rejected before any backend operation.
+///
+/// Debug output is redacted because the key carries an address and an SPI.
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
+pub struct SaLookupKey {
+    destination: IpAddress,
+    protocol: u8,
+    spi: u32,
+}
+
+impl SaLookupKey {
+    /// Build a lookup key from a destination, a transform protocol, and an
+    /// SPI in host byte order.
+    #[must_use]
+    pub const fn new(destination: IpAddress, protocol: u8, spi: u32) -> Self {
+        Self {
+            destination,
+            protocol,
+            spi,
+        }
+    }
+
+    /// Destination address.
+    #[must_use]
+    pub const fn destination(&self) -> IpAddress {
+        self.destination
+    }
+
+    /// Transform protocol.
+    #[must_use]
+    pub const fn protocol(&self) -> u8 {
+        self.protocol
+    }
+
+    /// SPI in host byte order.
+    #[must_use]
+    pub const fn spi(&self) -> u32 {
+        self.spi
+    }
+}
+
+impl From<XfrmId> for SaLookupKey {
+    fn from(id: XfrmId) -> Self {
+        Self::new(id.destination, id.protocol, id.spi)
+    }
+}
+
+impl fmt::Debug for SaLookupKey {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("SaLookupKey(<redacted>)")
+    }
+}
+
+pub(crate) fn validate_sa_lookup_key(key: SaLookupKey) -> Result<(), XfrmError> {
+    if key.spi == 0 {
+        return Err(XfrmError::invalid_config(
+            "sa_key.spi",
+            "spi must be nonzero",
+        ));
+    }
+    if !matches!(key.protocol, IPPROTO_ESP | IPPROTO_AH | IPPROTO_COMP) {
+        return Err(XfrmError::invalid_config(
+            "sa_key.protocol",
+            "SPI lookup keys use AH, ESP, or IPComp",
+        ));
+    }
+    Ok(())
+}
+
+/// Every SA state at one lookup key, read in one complete pass.
+///
+/// Returned by [`crate::XfrmBackend::query_sa_key_snapshot`]. Each state is a
+/// [`SaRelocationIdentity`] view, whatever its lookup mark. The order is
+/// the backend's report order (newest first on Linux), **not** lookup order:
+/// Linux selects the first matching state in an SPI hash chain, and a hash
+/// resize can reverse that chain.
+///
+/// [`Self::lookup_candidates`] applies the Linux lookup predicate. When it
+/// yields exactly one state for a lookup mark, that state is the sole candidate
+/// at the observed point in time. A later insertion or replacement can change
+/// the selection. This observation does not authorize a later deletion.
+///
+/// Debug output is redacted: it reports only the number of states.
+#[derive(Clone, PartialEq, Eq)]
+pub struct SaKeySnapshot {
+    key: SaLookupKey,
+    states: Vec<SaRelocationIdentity>,
+}
+
+impl SaKeySnapshot {
+    /// Build a snapshot of `states` at `key`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`XfrmError::InvalidConfig`] when the destination, protocol,
+    /// or SPI of a state differs from `key`.
+    pub fn new(key: SaLookupKey, states: Vec<SaRelocationIdentity>) -> Result<Self, XfrmError> {
+        if states
+            .iter()
+            .any(|state| SaLookupKey::from(state.id) != key)
+        {
+            return Err(XfrmError::invalid_config(
+                "sa_key_snapshot.states",
+                "every state must be at the snapshot key",
+            ));
+        }
+        Ok(Self { key, states })
+    }
+
+    /// The key that was read.
+    #[must_use]
+    pub const fn key(&self) -> SaLookupKey {
+        self.key
+    }
+
+    /// Every state at the key, in report order.
+    #[must_use]
+    pub fn states(&self) -> &[SaRelocationIdentity] {
+        &self.states
+    }
+
+    /// Consume the snapshot and return its states in report order.
+    #[must_use]
+    pub fn into_states(self) -> Vec<SaRelocationIdentity> {
+        self.states
+    }
+
+    /// Number of states at the key.
+    #[must_use]
+    pub fn len(&self) -> usize {
+        self.states.len()
+    }
+
+    /// Whether no state was at the key.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.states.is_empty()
+    }
+
+    /// The states that a Linux lookup carrying `mark` can select at this key.
+    ///
+    /// Applies the `__xfrm_state_lookup` predicate
+    /// `(lookup & stored.mask) == stored.value`. The lookup value is the mark
+    /// value, or zero when `mark` is `None`, and an unmarked state stores
+    /// `{ 0, 0 }`, so an unmarked state is a candidate for every lookup. Linux
+    /// returns the first candidate in hash-chain order, which no snapshot can
+    /// report. A sole candidate describes the snapshot's selection only;
+    /// this iterator does not fence later changes to kernel state.
+    pub fn lookup_candidates(
+        &self,
+        mark: Option<XfrmLookupMark>,
+    ) -> impl Iterator<Item = &SaRelocationIdentity> + '_ {
+        self.states
+            .iter()
+            .filter(move |state| linux_lookup_selects(mark, state.mark))
+    }
+}
+
+impl fmt::Debug for SaKeySnapshot {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("SaKeySnapshot")
+            .field("states", &self.states.len())
+            .finish_non_exhaustive()
+    }
+}
+
+/// Request to remove one SA through a backend that can keep its state
+/// observation and deletion mutually exclusive with every competing change.
+///
+/// `expected` contains the observed identity fields to match, normally taken
+/// from [`crate::XfrmBackend::query_sa_key_snapshot`] or
+/// [`crate::XfrmBackend::query_sa_relocation_identity`]. Its destination,
+/// protocol, and SPI name the key, and its lookup mark describes the deletion
+/// lookup. These fields are not complete SA fingerprints or installation
+/// ownership. The default and Linux backends validate and refuse this request
+/// with `UnsupportedFeature { feature: "exact_sa_removal" }` before any read
+/// or effect. The mock implements it under one state lock. See
+/// [`crate::XfrmBackend::remove_sa_exact`].
+///
+/// Debug output is redacted because the identity carries addresses, an SPI,
+/// and marks.
+///
+/// ```rust,no_run
+/// use opc_ipsec_xfrm::{ExactRemoveSaRequest, MockXfrmBackend, SaRelocationIdentity, XfrmBackend};
+///
+/// async fn remove_expected_mock_sa(
+///     backend: &MockXfrmBackend,
+///     expected: SaRelocationIdentity,
+/// ) -> Result<(), opc_ipsec_xfrm::XfrmError> {
+///     // The mock checks and removes the sole matching candidate under one lock.
+///     backend
+///         .remove_sa_exact(ExactRemoveSaRequest::new(expected))
+///         .await
+/// }
+/// ```
+#[derive(Clone, PartialEq, Eq)]
+pub struct ExactRemoveSaRequest {
+    expected: SaRelocationIdentity,
+}
+
+impl ExactRemoveSaRequest {
+    /// Build a removal request with these expected identity fields.
+    #[must_use]
+    pub const fn new(expected: SaRelocationIdentity) -> Self {
+        Self { expected }
+    }
+
+    /// The identity the removed state must have.
+    #[must_use]
+    pub const fn expected(&self) -> &SaRelocationIdentity {
+        &self.expected
+    }
+
+    /// Consume the request and return the expected identity.
+    #[must_use]
+    pub fn into_expected(self) -> SaRelocationIdentity {
+        self.expected
+    }
+
+    /// The lookup key named by this request.
+    #[must_use]
+    pub const fn key(&self) -> SaLookupKey {
+        SaLookupKey::new(
+            self.expected.id.destination,
+            self.expected.id.protocol,
+            self.expected.id.spi,
+        )
+    }
+
+    /// The unconditional deletion tuple corresponding to this request.
+    ///
+    /// Deriving this tuple grants no deletion or cleanup authority.
+    #[must_use]
+    pub const fn removal(&self) -> RemoveSaRequest {
+        RemoveSaRequest {
+            destination: self.expected.id.destination,
+            protocol: self.expected.id.protocol,
+            spi: self.expected.id.spi,
+            mark: self.expected.mark,
+        }
+    }
+}
+
+impl fmt::Debug for ExactRemoveSaRequest {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("ExactRemoveSaRequest(<redacted>)")
+    }
+}
+
+/// Stable operation label for an exact SA removal refused by its snapshot.
+pub(crate) const EXACT_SA_REMOVAL_PREFLIGHT: &str = "remove_sa_exact_preflight";
+
+pub(crate) fn validate_exact_remove_sa_request(
+    request: &ExactRemoveSaRequest,
+) -> Result<(), XfrmError> {
+    validate_sa_lookup_key(request.key())?;
+    if request.expected.if_id == Some(0) {
+        return Err(XfrmError::invalid_config(
+            "sa.if_id",
+            "interface identifier must be nonzero; use None when absent",
+        ));
+    }
+    Ok(())
+}
+
+/// Decide whether a complete key snapshot authorizes deleting `expected`.
+///
+/// The deletion's lookup can select only a candidate under the Linux
+/// predicate, so exactly one candidate that equals `expected` authorizes it.
+/// The caller must exclude every state change through deletion. Only the
+/// locked mock currently uses this helper; a snapshot alone cannot authorize
+/// a kernel deletion.
+/// No candidate is [`XfrmError::NotFound`], and one different candidate is
+/// [`XfrmError::StateMismatch`]. Two or more candidates are
+/// [`XfrmError::StateIndeterminate`]: the chain order decides which one a
+/// deletion would remove, and no read can observe that order.
+pub(crate) fn authorize_exact_sa_removal(
+    snapshot: &SaKeySnapshot,
+    expected: &SaRelocationIdentity,
+) -> Result<(), XfrmError> {
+    if snapshot.key() != SaLookupKey::from(expected.id) {
+        return Err(XfrmError::invalid_config(
+            "sa_key_snapshot.key",
+            "snapshot key differs from the removal key",
+        ));
+    }
+    let mut candidates = snapshot.lookup_candidates(expected.mark);
+    let Some(candidate) = candidates.next() else {
+        return Err(XfrmError::NotFound);
+    };
+    if candidates.next().is_some() {
+        return Err(XfrmError::StateIndeterminate {
+            operation: EXACT_SA_REMOVAL_PREFLIGHT,
+        });
+    }
+    if candidate != expected {
+        return Err(XfrmError::StateMismatch {
+            operation: EXACT_SA_REMOVAL_PREFLIGHT,
+        });
+    }
+    Ok(())
 }
 
 /// Request to install a new Security Policy.
@@ -2048,6 +2370,259 @@ mod tests {
             assert!(
                 !rendered.contains(leaked),
                 "error text must carry no values"
+            );
+        }
+    }
+
+    fn key_identity(mark: Option<XfrmLookupMark>, request_id: u32) -> SaRelocationIdentity {
+        let destination = IpAddress::Ipv4([192, 0, 2, 20]);
+        let source = IpAddress::Ipv4([192, 0, 2, 10]);
+        SaRelocationIdentity {
+            selector: SaRelocationSelector::from_selector(&XfrmSelector::new(
+                source,
+                destination,
+                0,
+            )),
+            id: XfrmId {
+                destination,
+                spi: 0x1234_5678,
+                protocol: IPPROTO_ESP,
+            },
+            source_address: source,
+            request_id: XfrmRequestId::new(request_id),
+            mode: XfrmMode::Tunnel,
+            encap: Some(UdpEncap::esp_in_udp(4500, 4500)),
+            mark,
+            if_id: Some(7),
+            output_mark: Some(XfrmMark {
+                value: 0x0000_1200,
+                mask: 0x0000_ff00,
+            }),
+        }
+    }
+
+    fn key_of(identity: &SaRelocationIdentity) -> SaLookupKey {
+        SaLookupKey::from(identity.id)
+    }
+
+    #[test]
+    fn lookup_keys_accept_only_spi_keyed_ipsec_protocols() {
+        let destination = IpAddress::Ipv6([0x20; 16]);
+        for protocol in [IPPROTO_ESP, IPPROTO_AH, IPPROTO_COMP] {
+            assert!(validate_sa_lookup_key(SaLookupKey::new(destination, protocol, 1)).is_ok());
+        }
+        assert!(matches!(
+            validate_sa_lookup_key(SaLookupKey::new(destination, IPPROTO_ESP, 0)),
+            Err(XfrmError::InvalidConfig {
+                field: "sa_key.spi",
+                ..
+            })
+        ));
+        // IPPROTO_ROUTING is looked up by address, not by SPI.
+        for protocol in [0, 17, 43, 255] {
+            assert!(matches!(
+                validate_sa_lookup_key(SaLookupKey::new(destination, protocol, 1)),
+                Err(XfrmError::InvalidConfig {
+                    field: "sa_key.protocol",
+                    ..
+                })
+            ));
+        }
+    }
+
+    #[test]
+    fn key_snapshot_holds_only_states_at_its_key() {
+        let marked = key_identity(Some(XfrmLookupMark::full(0x42)), 1);
+        let key = key_of(&marked);
+        let mut elsewhere = marked.clone();
+        elsewhere.id.spi += 1;
+
+        let snapshot = SaKeySnapshot::new(key, vec![marked.clone()]).expect("state at the key");
+        assert_eq!(snapshot.key(), key);
+        assert_eq!(snapshot.states(), std::slice::from_ref(&marked));
+        assert_eq!(snapshot.len(), 1);
+        assert!(!snapshot.is_empty());
+        assert_eq!(snapshot.clone().into_states(), vec![marked.clone()]);
+        assert!(SaKeySnapshot::new(key, Vec::new())
+            .expect("empty key")
+            .is_empty());
+        assert!(matches!(
+            SaKeySnapshot::new(key, vec![marked, elsewhere]),
+            Err(XfrmError::InvalidConfig {
+                field: "sa_key_snapshot.states",
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn lookup_candidates_apply_the_linux_mark_predicate() {
+        let marked = key_identity(Some(XfrmLookupMark::full(0x42)), 1);
+        let unmarked = key_identity(None, 2);
+        let other_marked = key_identity(Some(XfrmLookupMark::full(0x43)), 3);
+        let narrow = key_identity(Some(XfrmLookupMark::new(0x40, 0xf0).expect("canonical")), 4);
+        let key = key_of(&marked);
+        let snapshot = SaKeySnapshot::new(
+            key,
+            vec![
+                marked.clone(),
+                unmarked.clone(),
+                other_marked.clone(),
+                narrow.clone(),
+            ],
+        )
+        .expect("states at the key");
+        let candidates = |mark| {
+            snapshot
+                .lookup_candidates(mark)
+                .cloned()
+                .collect::<Vec<_>>()
+        };
+
+        // The unmarked state answers every lookup; the narrow mask answers
+        // both full-mask values because 0x42 & 0xf0 == 0x43 & 0xf0 == 0x40.
+        assert_eq!(
+            candidates(Some(XfrmLookupMark::full(0x42))),
+            vec![marked, unmarked.clone(), narrow.clone()]
+        );
+        assert_eq!(
+            candidates(Some(XfrmLookupMark::full(0x43))),
+            vec![unmarked.clone(), other_marked, narrow]
+        );
+        // An unmarked lookup carries the value zero.
+        assert_eq!(candidates(None), vec![unmarked.clone()]);
+        assert_eq!(candidates(Some(XfrmLookupMark::full(0x99))), vec![unmarked]);
+    }
+
+    #[test]
+    fn exact_sa_removal_needs_one_candidate_equal_to_the_expected_state() {
+        let marked = key_identity(Some(XfrmLookupMark::full(0x42)), 1);
+        let unmarked = key_identity(None, 2);
+        let disjoint = key_identity(Some(XfrmLookupMark::full(0x43)), 3);
+        let key = key_of(&marked);
+        let snapshot = |states: Vec<SaRelocationIdentity>| {
+            SaKeySnapshot::new(key, states).expect("states at the key")
+        };
+
+        // A disjoint full-mask state is not a candidate, so the marked state is
+        // the only state the deletion can select.
+        assert!(authorize_exact_sa_removal(
+            &snapshot(vec![disjoint.clone(), marked.clone()]),
+            &marked
+        )
+        .is_ok());
+        // An unmarked state is also a candidate for the marked lookup.
+        assert!(matches!(
+            authorize_exact_sa_removal(&snapshot(vec![marked.clone(), unmarked.clone()]), &marked),
+            Err(XfrmError::StateIndeterminate {
+                operation: EXACT_SA_REMOVAL_PREFLIGHT
+            })
+        ));
+        // ...but not the other way round: the unmarked lookup selects only the
+        // unmarked state.
+        assert!(authorize_exact_sa_removal(
+            &snapshot(vec![marked.clone(), unmarked.clone()]),
+            &unmarked
+        )
+        .is_ok());
+        assert!(matches!(
+            authorize_exact_sa_removal(&snapshot(Vec::new()), &marked),
+            Err(XfrmError::NotFound)
+        ));
+        let mut changed = marked.clone();
+        changed.request_id = XfrmRequestId::new(9);
+        assert!(matches!(
+            authorize_exact_sa_removal(&snapshot(vec![changed]), &marked),
+            Err(XfrmError::StateMismatch {
+                operation: EXACT_SA_REMOVAL_PREFLIGHT
+            })
+        ));
+        let mut other_key = marked.clone();
+        other_key.id.spi += 1;
+        assert!(matches!(
+            authorize_exact_sa_removal(&snapshot(vec![marked]), &other_key),
+            Err(XfrmError::InvalidConfig {
+                field: "sa_key_snapshot.key",
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn exact_sa_removal_request_names_its_key_and_lookup_mark() {
+        let marked = key_identity(Some(XfrmLookupMark::full(0x42)), 1);
+        let request = ExactRemoveSaRequest::new(marked.clone());
+        assert_eq!(request.key(), key_of(&marked));
+        assert_eq!(request.expected(), &marked);
+        assert_eq!(
+            request.removal(),
+            RemoveSaRequest::new(marked.id.destination, marked.id.protocol, marked.id.spi)
+                .with_mark(XfrmLookupMark::full(0x42))
+        );
+        assert!(validate_exact_remove_sa_request(&request).is_ok());
+        assert_eq!(request.into_expected(), marked);
+
+        let mut zero_if_id = marked.clone();
+        zero_if_id.if_id = Some(0);
+        assert!(matches!(
+            validate_exact_remove_sa_request(&ExactRemoveSaRequest::new(zero_if_id)),
+            Err(XfrmError::InvalidConfig {
+                field: "sa.if_id",
+                ..
+            })
+        ));
+        let mut zero_spi = marked;
+        zero_spi.id.spi = 0;
+        assert!(matches!(
+            validate_exact_remove_sa_request(&ExactRemoveSaRequest::new(zero_spi)),
+            Err(XfrmError::InvalidConfig {
+                field: "sa_key.spi",
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn key_snapshot_types_and_refusals_render_no_values() {
+        let marked = key_identity(Some(XfrmLookupMark::full(0x0bad_cafe)), 0x0c0f_fee5);
+        let key = key_of(&marked);
+        let snapshot = SaKeySnapshot::new(key, vec![marked.clone()]).expect("state at the key");
+        let request = ExactRemoveSaRequest::new(marked);
+        let refusals = [
+            XfrmError::StateIndeterminate {
+                operation: EXACT_SA_REMOVAL_PREFLIGHT,
+            },
+            XfrmError::StateMismatch {
+                operation: EXACT_SA_REMOVAL_PREFLIGHT,
+            },
+            XfrmError::invalid_config(
+                "sa_key_snapshot.states",
+                "every state must be at the snapshot key",
+            ),
+        ];
+        let mut rendered = format!("{key:?} {snapshot:?} {request:?}");
+        for refusal in &refusals {
+            rendered.push_str(&format!(" {refusal:?} {refusal}"));
+        }
+        assert!(rendered.contains("SaLookupKey(<redacted>)"));
+        assert!(rendered.contains("SaKeySnapshot { states: 1, .. }"));
+        assert!(rendered.contains("ExactRemoveSaRequest(<redacted>)"));
+        for leaked in [
+            "192",
+            "Ipv4",
+            "305419896",
+            "12345678",
+            "0x",
+            "195939070",
+            "badcafe",
+            "c0ffee5",
+            "4500",
+            "4608",
+            "1200",
+        ] {
+            assert!(
+                !rendered.contains(leaked),
+                "rendering leaked {leaked}: {rendered}"
             );
         }
     }
