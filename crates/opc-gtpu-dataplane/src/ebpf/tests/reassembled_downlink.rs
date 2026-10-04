@@ -24,12 +24,16 @@ const PEER: Ipv4Addr = Ipv4Addr::new(192, 0, 2, 10);
 const LOCAL: Ipv4Addr = Ipv4Addr::new(192, 0, 2, 1);
 const LOCAL_TEID: u32 = 0x1000_0001;
 
+/// An inner IPv4/UDP datagram with Don't Fragment set and a valid header
+/// checksum: the consumer validates the header like the kernel's IPv4 input.
 fn inner_ipv4(destination: [u8; 4], payload: &[u8]) -> Vec<u8> {
     let total = u16::try_from(28 + payload.len()).unwrap();
     let mut packet = vec![0x45, 0, 0, 0, 0, 0, 0x40, 0, 64, 17, 0, 0];
     packet[2..4].copy_from_slice(&total.to_be_bytes());
     packet.extend_from_slice(&[8, 8, 8, 8]);
     packet.extend_from_slice(&destination);
+    let checksum = opc_gtpu_ebpf_common::internet_checksum(&packet);
+    packet[10..12].copy_from_slice(&checksum.to_be_bytes());
     packet.extend_from_slice(&53_u16.to_be_bytes());
     packet.extend_from_slice(&5060_u16.to_be_bytes());
     packet.extend_from_slice(&u16::try_from(8 + payload.len()).unwrap().to_be_bytes());
@@ -685,7 +689,7 @@ fn mtu_context(mtu: u16) -> GtpPdpContext {
 
 fn dont_fragment(mut packet: Vec<u8>) -> Vec<u8> {
     packet[6] |= 0x40;
-    packet
+    checksummed(packet)
 }
 
 /// A context with the default inner fragmentation policy at `mtu`.
@@ -695,8 +699,9 @@ fn fragment_context(mtu: u16) -> GtpPdpContext {
     context
 }
 
-/// Recompute the IPv4 header checksum, which the fast-path fixtures leave
-/// zero but the inner fragmenter validates (RFC 1812 section 5.2.2).
+/// Recompute the IPv4 header checksum after a header field was changed. The
+/// consumer and the inner fragmenter both validate it (RFC 1812 section
+/// 5.2.2).
 fn checksummed(mut packet: Vec<u8>) -> Vec<u8> {
     let header_len = usize::from(packet[0] & 0x0f) * 4;
     packet[10..12].fill(0);
@@ -719,7 +724,7 @@ fn fragment_plan(
 fn sized_inner(total: usize) -> Vec<u8> {
     let mut packet = inner_ipv4(UE, &vec![0x5a; total - 28]);
     packet[6] &= !0x40;
-    packet
+    checksummed(packet)
 }
 
 fn plan(processed: ProcessedDownlink) -> crate::ebpf::reassembled_downlink::PacketTooBigPlan {
@@ -1761,4 +1766,195 @@ async fn a_non_first_fragment_needs_the_complete_authorization_of_its_own_g_pdu(
             ..GtpuDownlinkCounters::default()
         }
     );
+}
+
+/// Every way the kernel's IPv4 input (`ip_rcv_core`) refuses an inner header,
+/// applied to a valid 28-octet packet with the given flags: a name and the
+/// refused packet.
+fn refused_inner_headers(flags_fragment: u16) -> Vec<(&'static str, Vec<u8>)> {
+    let valid = inner_fragment(28, flags_fragment);
+    let with = |change: &dyn Fn(&mut Vec<u8>)| {
+        let mut packet = valid.clone();
+        change(&mut packet);
+        packet
+    };
+    // A total length that the header checksum covers, so only the length is
+    // wrong.
+    let with_total_length = |total: u16| {
+        checksummed(with(&|packet| {
+            packet[2..4].copy_from_slice(&total.to_be_bytes());
+        }))
+    };
+    vec![
+        ("header checksum", with(&|packet| packet[10] ^= 0x01)),
+        (
+            "header checksum low octet",
+            with(&|packet| packet[11] ^= 0x80),
+        ),
+        ("IHL below 5", with(&|packet| packet[0] = 0x44)),
+        ("IHL beyond the datagram", with(&|packet| packet[0] = 0x4f)),
+        ("total length below the header", with_total_length(19)),
+        (
+            "total length above the received length",
+            with_total_length(29),
+        ),
+    ]
+}
+
+/// On main, tc decapsulated an inner fragment whose G-PDU was not fragmented
+/// on the outer path, and the kernel's IPv4 input then validated its header:
+/// version 4, a header length of at least five words within the packet, the
+/// header checksum, and a total length that covers the header and is not
+/// truncated (`ip_rcv_core`). The consumer returns such a fragment for an
+/// `IP_HDRINCL` injection, which rewrites the checksum and the total length,
+/// so it must refuse what the kernel refused. The first case is the smallest
+/// one: an MTU of 576 and a 28-octet first fragment with one flipped
+/// checksum octet.
+#[tokio::test]
+async fn a_handed_off_packet_with_an_invalid_inner_header_is_never_decapsulated() {
+    // (context, flags and fragment offset): a first fragment and a last
+    // fragment that tc hands off, and a packet that is not a fragment, which
+    // reaches the consumer after outer reassembly with or without an MTU.
+    for (context, flags_fragment) in [
+        (fragment_context(576), 0x2000_u16),
+        (fragment_context(576), 0x0003),
+        (mtu_context(576), 0x2000),
+        (fragment_context(576), 0x0000),
+        (context(), 0x0000),
+        (context(), 0x2000),
+    ] {
+        let (_backend, runtime) = ordinary_fixture(context).await;
+        let mut counters = GtpuDownlinkCounters::default();
+        let valid = inner_fragment(28, flags_fragment);
+        assert!(matches!(
+            process(
+                &runtime,
+                ordinary_scope(),
+                gpdu(LOCAL_TEID, &valid),
+                &mut counters
+            ),
+            GtpuDownlinkEvent::Decapsulated(_)
+        ));
+        let refused = refused_inner_headers(flags_fragment);
+        for (case, packet) in &refused {
+            assert_eq!(
+                expect_drop(process(
+                    &runtime,
+                    ordinary_scope(),
+                    gpdu(LOCAL_TEID, packet),
+                    &mut counters,
+                )),
+                GtpuDownlinkDrop::Malformed,
+                "{case}, flags {flags_fragment:#06x}"
+            );
+        }
+        assert_eq!(
+            counters,
+            GtpuDownlinkCounters {
+                decapsulated: 1,
+                decapsulated_inner_fragments: u64::from(flags_fragment != 0),
+                malformed: u64::try_from(refused.len()).unwrap(),
+                ..GtpuDownlinkCounters::default()
+            },
+            "flags {flags_fragment:#06x}"
+        );
+    }
+}
+
+/// Octets after the IPv4 total length are not part of the datagram. The
+/// kernel's IPv4 input trims them; an `IP_HDRINCL` injection would instead
+/// extend the total length over them. The consumer returns the datagram
+/// alone.
+#[tokio::test]
+async fn octets_after_the_inner_total_length_are_trimmed() {
+    let (_backend, runtime) = ordinary_fixture(fragment_context(576)).await;
+    let mut counters = GtpuDownlinkCounters::default();
+    for flags_fragment in [0x2000_u16, 0x0003, 0x0000] {
+        for trailing in [1_usize, 7, 18] {
+            let datagram = inner_fragment(60, flags_fragment);
+            let mut carried = datagram.clone();
+            carried.extend(std::iter::repeat_n(0xee, trailing));
+            let GtpuDownlinkEvent::Decapsulated(decapsulated) = process(
+                &runtime,
+                ordinary_scope(),
+                gpdu(LOCAL_TEID, &carried),
+                &mut counters,
+            ) else {
+                panic!("a valid datagram followed by {trailing} octets must decapsulate");
+            };
+            assert_eq!(
+                decapsulated.inner_packet(),
+                datagram.as_slice(),
+                "flags {flags_fragment:#06x}, {trailing} trailing octets"
+            );
+        }
+    }
+    assert_eq!(counters.decapsulated, 9);
+    assert_eq!(counters.malformed, 0);
+}
+
+/// A header with IPv4 options is valid when its checksum covers the options.
+/// The consumer returns it unchanged: it validates the header as the kernel's
+/// input does, and does not process options.
+#[tokio::test]
+async fn an_inner_header_with_options_is_validated_over_its_whole_length() {
+    let (_backend, runtime) = ordinary_fixture(fragment_context(576)).await;
+    let mut counters = GtpuDownlinkCounters::default();
+    let plain = inner_fragment(60, 0x2000);
+    // IHL 6: one NOP, one NOP, one NOP and End of Options List.
+    let mut options = plain[..20].to_vec();
+    options[0] = 0x46;
+    options.extend_from_slice(&[1, 1, 1, 0]);
+    options.extend_from_slice(&plain[20..]);
+    let total = u16::try_from(options.len()).unwrap();
+    options[2..4].copy_from_slice(&total.to_be_bytes());
+    let options = checksummed(options);
+    let GtpuDownlinkEvent::Decapsulated(decapsulated) = process(
+        &runtime,
+        ordinary_scope(),
+        gpdu(LOCAL_TEID, &options),
+        &mut counters,
+    ) else {
+        panic!("a valid header with options must decapsulate");
+    };
+    assert_eq!(decapsulated.inner_packet(), options.as_slice());
+    // The checksum covers the options: one flipped option octet is refused.
+    let mut corrupt = options.clone();
+    corrupt[21] ^= 0x01;
+    assert_eq!(
+        expect_drop(process(
+            &runtime,
+            ordinary_scope(),
+            gpdu(LOCAL_TEID, &corrupt),
+            &mut counters,
+        )),
+        GtpuDownlinkDrop::Malformed
+    );
+}
+
+/// The grouped path returns an inner IPv4 packet for the same injection, so
+/// its header checksum is validated too. Its exact-length rule is unchanged.
+#[tokio::test]
+async fn grouped_inner_ipv4_header_checksum_is_validated() {
+    let (runtime, _backend, _authority, _desired, scope) =
+        grouped_fixture(vec![grouped_v4_entry(0x1100_0001, 0x2100_0001)]).await;
+    let mut counters = GtpuDownlinkCounters::default();
+    let valid = inner_ipv4(UE, b"grouped");
+    assert!(matches!(
+        process(&runtime, scope, gpdu(0x1100_0001, &valid), &mut counters),
+        GtpuDownlinkEvent::Decapsulated(_)
+    ));
+    let mut corrupt = valid.clone();
+    corrupt[10] ^= 0x01;
+    assert_eq!(
+        expect_drop(process(
+            &runtime,
+            scope,
+            gpdu(0x1100_0001, &corrupt),
+            &mut counters
+        )),
+        GtpuDownlinkDrop::Malformed
+    );
+    assert_eq!(counters.decapsulated, 1);
+    assert_eq!(counters.malformed, 1);
 }

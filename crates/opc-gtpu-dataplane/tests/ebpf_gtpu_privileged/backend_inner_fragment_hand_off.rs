@@ -20,6 +20,12 @@
 //! and `IP_NODEFRAG`. One connection-tracking rule is active in the gateway
 //! namespace throughout.
 //!
+//! The consumer also stands in for the kernel's IPv4 input, which validated
+//! the header of every packet that tc decapsulated. The injection rewrites
+//! the header checksum and the total length, so a fragment that the kernel
+//! refused must be refused by the consumer, and octets after the total length
+//! must be trimmed.
+//!
 //! The fragments wait in their own backend-owned queue. A flood of them must
 //! overflow only that queue: the kernel drops and counts the excess, and
 //! over-MTU Don't Fragment packets and Echo are still served.
@@ -493,6 +499,37 @@ pub(super) async fn qualify() -> Result<(), Box<dyn std::error::Error>> {
     );
     assert_eq!(ipv4_reassembly_queues(), 0);
 
+    // Still without a downlink inner MTU: the smallest first fragment (28
+    // octets, More Fragments set) with one flipped header checksum octet. tc
+    // decapsulates it, and the kernel's IPv4 input discards it. This is the
+    // behaviour the consumer must keep for the fragments it is handed.
+    let mut corrupt = core_fragments(&datagram(0x69, 9), 28, 0x6900).swap_remove(0);
+    assert_eq!(
+        (corrupt.len(), &corrupt[6..8]),
+        (28, &[0x20_u8, 0x00][..]),
+        "a 28-octet first fragment"
+    );
+    corrupt[10] ^= 0x01;
+    let _ = captured_ipv4(&ue_capture);
+    let header_errors_before = ipv4_reassembly_stat("InHdrErrors");
+    send(&[&frame(LOCAL_TEID, &corrupt)]);
+    let events = serve_consumer(port.as_ref(), window);
+    assert!(events.is_empty(), "fast path, got {events:?}");
+    assert_eq!(
+        pinned_counter(&pin_dir, COUNTER_DL_DECAP) - decapsulated_before,
+        3,
+        "tc decapsulates the corrupt fragment of a context without a downlink inner MTU"
+    );
+    assert_eq!(
+        ipv4_reassembly_stat("InHdrErrors") - header_errors_before,
+        1,
+        "the kernel's IPv4 input discards a fragment with a wrong header checksum"
+    );
+    assert!(
+        wire_inner_packets(&captured_ipv4(&ue_capture)).is_empty(),
+        "the kernel does not forward a fragment with a wrong header checksum"
+    );
+
     // The same session now carries a downlink inner MTU, as does a dedicated
     // bearer of the same UE.
     let mtu = GtpuDownlinkInnerMtu::new(SESSION_MTU).expect("canonical session MTU");
@@ -599,6 +636,65 @@ pub(super) async fn qualify() -> Result<(), Box<dyn std::error::Error>> {
         "no inner fragment enters a host reassembly queue"
     );
     assert_eq!(ipv4_reassembly_queues(), 0);
+    assert_eq!(
+        pinned_counter(&pin_dir, COUNTER_DL_DECAP),
+        decapsulated_before
+    );
+
+    // 3b. The same corrupt first fragment, now handed to the consumer. It
+    //     must be dropped as the kernel dropped it above. Returned as
+    //     `Decapsulated`, the injection would repair its checksum and send
+    //     it on.
+    let _ = captured_ipv4(&ue_capture);
+    send(&[&frame(LOCAL_TEID, &corrupt)]);
+    let events = serve_consumer(port.as_ref(), window);
+    assert!(
+        matches!(
+            &events[..],
+            [GtpuDownlinkEvent::Dropped(GtpuDownlinkDrop::Malformed)]
+        ),
+        "a fragment with a wrong inner header checksum: {events:?}"
+    );
+    assert!(
+        wire_inner_packets(&captured_ipv4(&ue_capture)).is_empty(),
+        "a fragment with a wrong header checksum must not be repaired and sent"
+    );
+
+    // 3c. Octets after the inner total length are not part of the datagram.
+    //     The kernel's IPv4 input trims them; the injection would extend the
+    //     total length over them. Both fragments come back trimmed, and the
+    //     UE reassembles the exact datagram.
+    let padded = datagram(0x6a, 2_000);
+    let fragments = core_fragments(&padded, 1_300, 0x6a00);
+    assert_eq!(fragments.len(), 2);
+    let carried: Vec<Vec<u8>> = fragments
+        .iter()
+        .map(|fragment| {
+            let mut carried = fragment.clone();
+            carried.extend_from_slice(&[0xee; 6]);
+            carried
+        })
+        .collect();
+    send(&[
+        &frame(LOCAL_TEID, &carried[0]),
+        &frame(LOCAL_TEID, &carried[1]),
+    ]);
+    expect_decapsulated(
+        &serve_consumer(port.as_ref(), window),
+        &[&fragments[0], &fragments[1]],
+        None,
+        "octets after the total length",
+    );
+    expect_ue_delivery(
+        &ue,
+        &application_payload(0x6a, 2_000),
+        "octets after the total length",
+    );
+    assert_eq!(
+        wire_inner_packets(&captured_ipv4(&ue_capture)),
+        fragments,
+        "the fragments leave without the trailing octets"
+    );
     assert_eq!(
         pinned_counter(&pin_dir, COUNTER_DL_DECAP),
         decapsulated_before
@@ -787,7 +883,7 @@ pub(super) async fn qualify() -> Result<(), Box<dyn std::error::Error>> {
         host_icmp_before,
         "the host must not answer a hand-off with Port Unreachable"
     );
-    let returned = u64::try_from(7 + accepted + 1)?;
+    let returned = u64::try_from(9 + accepted + 1)?;
     assert_eq!(counters.decapsulated, returned);
     assert_eq!(
         counters.decapsulated_inner_fragments, returned,
@@ -798,14 +894,17 @@ pub(super) async fn qualify() -> Result<(), Box<dyn std::error::Error>> {
     assert_eq!(counters.inner_fragment_rate_limited, 0);
     assert_eq!(counters.state_unavailable, 2);
     assert_eq!(counters.packet_too_big, 0);
-    assert_eq!(counters.malformed, 0);
+    assert_eq!(
+        counters.malformed, 1,
+        "the fragment with the wrong header checksum"
+    );
     assert_eq!(counters.binding_drops, 0);
 
     drop(port);
     backend.remove_device(&device).await?;
     drop(net);
     eprintln!(
-        "OPC_GTPU_DOWNLINK_INNER_FRAGMENT_HAND_OFF_PROVEN: every inner IPv4 fragment of a context with a downlink inner MTU returned by the consumer with its bearer mark (outer-fragmented first fragment, reordered, dedicated via ESP) under connection tracking, none stranded in a host reassembly queue; a fragment flood overflows only its own queue"
+        "OPC_GTPU_DOWNLINK_INNER_FRAGMENT_HAND_OFF_PROVEN: every inner IPv4 fragment of a context with a downlink inner MTU returned by the consumer with its bearer mark (outer-fragmented first fragment, reordered, dedicated via ESP) under connection tracking, none stranded in a host reassembly queue; a wrong inner header checksum dropped as by the kernel's IPv4 input, trailing octets trimmed; a fragment flood overflows only its own queue"
     );
     Ok(())
 }
