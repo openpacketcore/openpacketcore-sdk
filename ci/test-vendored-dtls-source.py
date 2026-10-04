@@ -16,6 +16,11 @@ MESSAGES = (
     "the DTLS 1.3 path must not reference RFC 6083",
     "Config must be constructed explicitly, never defaulted",
 )
+VIOLATIONS = (
+    ("src", "unreachable!()", MESSAGES[0]),
+    ("src/dtls13", "Rfc6083", MESSAGES[1]),
+    ("tests", "Config::default()", MESSAGES[2]),
+)
 
 
 def workflow_command():
@@ -89,6 +94,85 @@ class VendoredSourceInvariantTests(unittest.TestCase):
     def test_clean_fixture_passes_with_real_rg(self):
         result = self.run_step(self.fixture())
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+
+    def test_scanned_file_counts_are_reported(self):
+        result = self.run_step(self.fixture())
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertEqual(result.stdout.splitlines(), [
+            f"Scanned 3 files in vendor/dimpl/src: {MESSAGES[0]}",
+            f"Scanned 1 files in vendor/dimpl/src/dtls13: {MESSAGES[1]}",
+            f"Scanned 3 files in vendor/dimpl/src: {MESSAGES[2]}",
+            f"Scanned 1 files in vendor/dimpl/tests: {MESSAGES[2]}",
+            f"Scanned 1 files in vendor/dimpl/README.md: {MESSAGES[2]}",
+        ])
+
+    def test_empty_directories_fail_closed(self):
+        for name in ("src", "src/dtls13", "tests"):
+            with self.subTest(path=name):
+                root = self.fixture()
+                empty = root / "vendor/dimpl" / name
+                for path in empty.rglob("*"):
+                    if path.is_file():
+                        path.unlink()
+                result = self.run_step(root)
+                self.assert_rejected(result)
+                self.assertIn(f"no files in vendor/dimpl/{name}", result.stderr)
+
+    def test_ignored_files_are_rejected(self):
+        for ignore in (".ignore", ".gitignore"):
+            for directory, source, message in VIOLATIONS:
+                with self.subTest(ignore=ignore, path=directory):
+                    root = self.fixture()
+                    if ignore == ".gitignore":
+                        subprocess.run(
+                            ["git", "init", "--quiet"], cwd=root, check=True,
+                            capture_output=True, text=True,
+                        )
+                    (root / ignore).write_text("ignored.rs\n")
+                    name = f"vendor/dimpl/{directory}/ignored.rs"
+                    (root / name).write_text(source + "\n")
+                    result = self.run_step(root)
+                    self.assert_rejected(result)
+                    self.assertIn(message, result.stdout + result.stderr)
+                    self.assertIn(name + ":1:", result.stdout)
+
+    def test_dotfiles_are_rejected(self):
+        for directory, source, message in VIOLATIONS:
+            with self.subTest(path=directory):
+                root = self.fixture()
+                name = f"vendor/dimpl/{directory}/.hidden.rs"
+                (root / name).write_text(source + "\n")
+                result = self.run_step(root)
+                self.assert_rejected(result)
+                self.assertIn(message, result.stdout + result.stderr)
+                self.assertIn(name + ":1:", result.stdout)
+
+    def test_matches_after_nul_bytes_are_rejected(self):
+        for directory, source, message in VIOLATIONS:
+            with self.subTest(path=directory):
+                root = self.fixture()
+                name = f"vendor/dimpl/{directory}/binary.rs"
+                # Keep the match beyond the initial binary-detection buffer.
+                (root / name).write_bytes(
+                    b"\x00" + b"\n" * 65536 + source.encode() + b"\n"
+                )
+                result = self.run_step(root)
+                self.assert_rejected(result)
+                self.assertIn(message, result.stdout + result.stderr)
+                self.assertIn(name + ":65537:", result.stdout)
+
+    def test_symlinked_files_are_rejected(self):
+        for directory, source, message in VIOLATIONS:
+            with self.subTest(path=directory):
+                root = self.fixture()
+                target = root / "linked-source.rs"
+                target.write_text(source + "\n")
+                name = f"vendor/dimpl/{directory}/linked.rs"
+                (root / name).symlink_to(target)
+                result = self.run_step(root)
+                self.assert_rejected(result)
+                self.assertIn(message, result.stdout + result.stderr)
+                self.assertIn(name + ":1:", result.stdout)
 
     def test_each_panic_macro_is_rejected(self):
         for macro in ("unreachable!()", "unimplemented!()", "todo!()"):
