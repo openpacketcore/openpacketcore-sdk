@@ -37,6 +37,10 @@ use opc_session_store::{
 use opc_types::{NetworkFunctionKind, SpiffeId, TenantId};
 
 #[cfg(all(target_os = "linux", feature = "test-control"))]
+#[path = "fixed_quorum_authority/snapshot_retirement.rs"]
+mod snapshot_retirement;
+
+#[cfg(all(target_os = "linux", feature = "test-control"))]
 fn fixed_verity_available_for_test() -> bool {
     use std::os::fd::AsFd as _;
 

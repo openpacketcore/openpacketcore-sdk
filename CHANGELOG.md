@@ -31,6 +31,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- `opc-session-store`: portable snapshot streams retain their verified image
+  when publishing a newer snapshot unlinks the predecessor. Previously, the
+  next read rejected the retired inode and could stop the leader with a
+  snapshot storage read error. Admission still requires a linked file, and
+  retained transport reads keep descriptor identity, length and block-digest
+  checks. Increase the concurrent receiver limit from one to two handles so
+  a newer snapshot can replace an interrupted transfer without stopping the
+  voter. Each retains its size limit, so staged bytes can briefly reach two
+  per-receiver limits. A third receiver returns a fatal storage error.
+  Refs #1009.
+
 - `opc-session-store`: ordinary SQLite committed-frontier writes no longer
   strand unrelated tasks on current-thread Tokio runtimes after startup.
   Process-wide admission bounds queued and active owned writes; jobs retain

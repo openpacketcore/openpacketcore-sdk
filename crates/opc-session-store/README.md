@@ -1340,6 +1340,14 @@ one explicitly:
   consumed by transport, extraction, and a non-default read-only SQLite VFS.
   It works on ordinary supported Linux filesystems without fs-verity. Same-inode
   writes or truncation cannot substitute changed bytes after validation.
+  Once admitted, a stream owns its descriptor and digest index through completion,
+  including after publication of a newer snapshot unlinks its predecessor.
+  Reads continue to verify the retained image; a replacement at the old name
+  cannot redirect the stream. Initial admission still requires a linked file.
+  Ordinary SQLite, recovery and native basis readers continue to reject an
+  unlinked image. This retirement rule applies to admitted snapshot streams
+  used for transport and for local extraction during install; commits still
+  require a linked image.
 - `SnapshotIntegrityPolicy::FsVerity` retains the strict v1/SHA-256/4 KiB kernel
   seal with no salt or signature. Admission probes the selected filesystem
   before starting Raft. Unavailable capability returns
@@ -1353,10 +1361,22 @@ checks. Portable indexing runs on a blocking worker outside the primary SQLite
 lock. Blocks range from 64 KiB to 2 MiB, with at most 16 MiB of digests per image;
 clones share the index and verified cache. A process-wide 128 MiB reservation
 bounds indices, capture/cache replacement buffers, and pending transport reads.
+Unlinking a retired image does not free its disk blocks or index reservation:
+they remain owned until the last handle and pending read worker release them.
+Those unlinked disk blocks are outside the 32-entry snapshot directory budget;
+that pathname bound is not a bound on the total bytes held by retired streams.
 Exhaustion fails closed before allocating more verification work. It is not a
 whole-snapshot memory copy, chmod guarantee, or hash-then-reopen sequence.
 Dynamic authority retains its existing bounded corruption detection and does
 not claim either fixed snapshot protection.
+
+Snapshot receive admission allows two overlapping handles because OpenRaft
+allocates a new snapshot-ID receiver before dropping an interrupted predecessor.
+A third concurrent receiver returns a storage error that stops the engine,
+not a retryable admission response. The current consensus library's serialized
+receiver replacement cannot create that third handle. Each admitted receiver
+retains its own size limit and directory-entry reservation, and cleanup
+preserves both live artifacts; total staged bytes can reach two receiver limits.
 
 Native protected-roster reads reserve their complete validation allowance
 before decoding and authenticating a canonical carrier. Once a live V1 or V2
