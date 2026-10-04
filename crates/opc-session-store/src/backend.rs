@@ -2521,12 +2521,79 @@ pub enum PreparedLeaseAcquireStatusError {
     Unavailable,
 }
 
+/// Physical payload admission for reads through a protection wrapper.
+///
+/// Existing authentication, record/namespace AAD, protected-transition, and
+/// quorum checks remain mandatory. This does not establish storage freshness
+/// or prevent rollback.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum EnvelopeReadPolicy {
+    /// Preserve migration decoding, including plaintext and unclassified rows.
+    #[default]
+    MigrationCompatible,
+    /// Require a canonical `EnvelopeV1` before decrypting or unsealing.
+    RequireEnvelopeV1,
+}
+
+impl EnvelopeReadPolicy {
+    fn validate_payload(self, payload: &EncryptedSessionPayload) -> Result<(), StoreError> {
+        match self {
+            Self::MigrationCompatible => Ok(()),
+            Self::RequireEnvelopeV1 => payload.validate_envelope(),
+        }
+    }
+
+    // The entry has already passed replication structure/expiry validation.
+    // These exact physical records deliberately bypass the generic transform;
+    // strict reads must authenticate them without changing their replay bytes.
+    async fn validate_opaque_records<F, Fut>(
+        self,
+        entry: &ReplicationEntry,
+        mut decode_record: F,
+    ) -> Result<(), StoreError>
+    where
+        F: FnMut(StoredSessionRecord) -> Fut + Send,
+        Fut: Future<Output = Result<StoredSessionRecord, StoreError>> + Send,
+    {
+        if self == Self::MigrationCompatible {
+            return Ok(());
+        }
+        let mut pending = vec![&entry.op];
+        while let Some(op) = pending.pop() {
+            match op {
+                ReplicationOp::ProtectedRosterEstablished {
+                    expected_record,
+                    successor,
+                    ..
+                } => {
+                    drop(decode_record(expected_record.clone()).await?);
+                    if let ProtectedRosterEstablishedSuccessor::Put { record } = &**successor {
+                        drop(decode_record((**record).clone()).await?);
+                    }
+                }
+                ReplicationOp::ProtectedRosterEstablishedCreate { record, .. } => {
+                    drop(decode_record(record.clone()).await?);
+                }
+                ReplicationOp::Batch { ops } => pending.extend(ops.iter().rev()),
+                ReplicationOp::CompareAndSet { .. }
+                | ReplicationOp::DeleteFenced { .. }
+                | ReplicationOp::RefreshTtl { .. }
+                | ReplicationOp::AcquireLease { .. }
+                | ReplicationOp::RenewLease { .. }
+                | ReplicationOp::ReleaseLease { .. } => {}
+            }
+        }
+        Ok(())
+    }
+}
+
 /// Session-backend wrapper that encrypts payloads before persistence and
 /// decrypts them on reads using `opc-crypto` / `opc-key`.
 pub struct EncryptingSessionBackend<B: ?Sized, P: ?Sized> {
     inner: Arc<B>,
     provider: Arc<P>,
     backend_namespace: Arc<str>,
+    read_policy: EnvelopeReadPolicy,
     fenced_transition_journal: Option<Arc<PreparedFencedTransitionJournal>>,
     fenced_transition_v2_journal: Option<Arc<FencedTransitionV2PreparedJournal>>,
     fenced_transition_v2_journal_scope: Option<FencedTransitionV2JournalScope>,
@@ -2539,6 +2606,7 @@ impl<B: ?Sized, P: ?Sized> Clone for EncryptingSessionBackend<B, P> {
             inner: Arc::clone(&self.inner),
             provider: Arc::clone(&self.provider),
             backend_namespace: Arc::clone(&self.backend_namespace),
+            read_policy: self.read_policy,
             fenced_transition_journal: self.fenced_transition_journal.clone(),
             fenced_transition_v2_journal: self.fenced_transition_v2_journal.clone(),
             fenced_transition_v2_journal_scope: self.fenced_transition_v2_journal_scope,
@@ -2565,11 +2633,27 @@ impl<B: ?Sized, P: ?Sized> EncryptingSessionBackend<B, P> {
             inner,
             provider,
             backend_namespace: Arc::<str>::from(backend_namespace.into()),
+            read_policy: EnvelopeReadPolicy::default(),
             fenced_transition_journal: None,
             fenced_transition_v2_journal: None,
             fenced_transition_v2_journal_scope: None,
             fenced_transition_v2_recovery_journal: None,
         }
+    }
+
+    /// Select admission of physical payloads before read decoding.
+    ///
+    /// The default is [`EnvelopeReadPolicy::MigrationCompatible`]. Strict
+    /// admission covers every returned record, including CAS conflicts,
+    /// batch results, restore scans, replication logs, watches, and fenced
+    /// observations. Ordinary records retain their caller-facing plaintext
+    /// representation; exact protected-roster replication records are
+    /// authenticated without changing their ciphertext. Clones and watch
+    /// streams preserve this selection.
+    #[must_use]
+    pub fn with_read_policy(mut self, policy: EnvelopeReadPolicy) -> Self {
+        self.read_policy = policy;
+        self
     }
 
     /// Enable V2 atomic transitions with an SDK-owned durable prepared-request
@@ -2695,6 +2779,7 @@ where
         &self,
         mut record: StoredSessionRecord,
     ) -> Result<StoredSessionRecord, StoreError> {
+        self.read_policy.validate_payload(&record.payload)?;
         let plaintext = record
             .payload
             .decrypt(
@@ -2799,7 +2884,9 @@ async fn decrypt_record_helper<P: KeyProvider + ?Sized>(
     provider: &P,
     mut record: StoredSessionRecord,
     backend_namespace: &str,
+    read_policy: EnvelopeReadPolicy,
 ) -> Result<StoredSessionRecord, StoreError> {
+    read_policy.validate_payload(&record.payload)?;
     let plaintext = record
         .payload
         .decrypt(
@@ -3786,6 +3873,9 @@ where
         )?;
         let mut decrypted = Vec::with_capacity(entries.len());
         for entry in entries {
+            self.read_policy
+                .validate_opaque_records(&entry, |record| self.decrypt_record(record))
+                .await?;
             decrypted.push(
                 transform_replication_entry(entry, |record| self.decrypt_record(record)).await?,
             );
@@ -3838,6 +3928,7 @@ where
         let inner = self.inner.clone();
         let provider = self.provider.clone();
         let backend_namespace = self.backend_namespace.clone();
+        let read_policy = self.read_policy;
         Box::pin(async move {
             let stream = enforce_replication_watch_cursor(
                 inner.watch(start_sequence).await?,
@@ -3850,8 +3941,23 @@ where
                 async move {
                     match res {
                         Ok(entry) => {
+                            read_policy
+                                .validate_opaque_records(&entry, |record| {
+                                    decrypt_record_helper(
+                                        provider.as_ref(),
+                                        record,
+                                        &backend_namespace,
+                                        read_policy,
+                                    )
+                                })
+                                .await?;
                             transform_replication_entry(entry, |record| {
-                                decrypt_record_helper(provider.as_ref(), record, &backend_namespace)
+                                decrypt_record_helper(
+                                    provider.as_ref(),
+                                    record,
+                                    &backend_namespace,
+                                    read_policy,
+                                )
                             })
                             .await
                         }
@@ -3962,6 +4068,7 @@ pub struct RemoteSealingSessionBackend<B: ?Sized, S: ?Sized> {
     inner: Arc<B>,
     provider: Arc<S>,
     backend_namespace: Arc<str>,
+    read_policy: EnvelopeReadPolicy,
     fenced_transition_journal: Option<Arc<PreparedFencedTransitionJournal>>,
     fenced_transition_v2_journal: Option<Arc<FencedTransitionV2PreparedJournal>>,
     fenced_transition_v2_journal_scope: Option<FencedTransitionV2JournalScope>,
@@ -3974,6 +4081,7 @@ impl<B: ?Sized, S: ?Sized> Clone for RemoteSealingSessionBackend<B, S> {
             inner: Arc::clone(&self.inner),
             provider: Arc::clone(&self.provider),
             backend_namespace: Arc::clone(&self.backend_namespace),
+            read_policy: self.read_policy,
             fenced_transition_journal: self.fenced_transition_journal.clone(),
             fenced_transition_v2_journal: self.fenced_transition_v2_journal.clone(),
             fenced_transition_v2_journal_scope: self.fenced_transition_v2_journal_scope,
@@ -3995,11 +4103,27 @@ impl<B: ?Sized, S: ?Sized> RemoteSealingSessionBackend<B, S> {
             inner,
             provider,
             backend_namespace: Arc::<str>::from(backend_namespace.into()),
+            read_policy: EnvelopeReadPolicy::default(),
             fenced_transition_journal: None,
             fenced_transition_v2_journal: None,
             fenced_transition_v2_journal_scope: None,
             fenced_transition_v2_recovery_journal: None,
         }
+    }
+
+    /// Select admission of physical payloads before read decoding.
+    ///
+    /// The default is [`EnvelopeReadPolicy::MigrationCompatible`]. Strict
+    /// admission covers every returned record, including CAS conflicts,
+    /// batch results, restore scans, replication logs, watches, and fenced
+    /// observations. Ordinary records retain their caller-facing plaintext
+    /// representation; exact protected-roster replication records are
+    /// authenticated without changing their ciphertext. Clones and watch
+    /// streams preserve this selection.
+    #[must_use]
+    pub fn with_read_policy(mut self, policy: EnvelopeReadPolicy) -> Self {
+        self.read_policy = policy;
+        self
     }
 
     /// Enable V2 atomic transitions with an SDK-owned durable prepared-request
@@ -4123,6 +4247,7 @@ where
         &self,
         mut record: StoredSessionRecord,
     ) -> Result<StoredSessionRecord, StoreError> {
+        self.read_policy.validate_payload(&record.payload)?;
         let plaintext = record
             .payload
             .remote_unseal(
@@ -4226,7 +4351,9 @@ async fn remote_unseal_record_helper<S: RemoteSealProvider + ?Sized>(
     provider: &S,
     mut record: StoredSessionRecord,
     backend_namespace: &str,
+    read_policy: EnvelopeReadPolicy,
 ) -> Result<StoredSessionRecord, StoreError> {
+    read_policy.validate_payload(&record.payload)?;
     let plaintext = record
         .payload
         .remote_unseal(
@@ -4932,6 +5059,9 @@ where
         )?;
         let mut unsealed = Vec::with_capacity(entries.len());
         for entry in entries {
+            self.read_policy
+                .validate_opaque_records(&entry, |record| self.unseal_record(record))
+                .await?;
             unsealed.push(
                 transform_replication_entry(entry, |record| self.unseal_record(record)).await?,
             );
@@ -4982,6 +5112,7 @@ where
         let inner = self.inner.clone();
         let provider = self.provider.clone();
         let backend_namespace = self.backend_namespace.clone();
+        let read_policy = self.read_policy;
         Box::pin(async move {
             let stream = enforce_replication_watch_cursor(
                 inner.watch(start_sequence).await?,
@@ -4994,11 +5125,22 @@ where
                 async move {
                     match res {
                         Ok(entry) => {
+                            read_policy
+                                .validate_opaque_records(&entry, |record| {
+                                    remote_unseal_record_helper(
+                                        provider.as_ref(),
+                                        record,
+                                        &backend_namespace,
+                                        read_policy,
+                                    )
+                                })
+                                .await?;
                             transform_replication_entry(entry, |record| {
                                 remote_unseal_record_helper(
                                     provider.as_ref(),
                                     record,
                                     &backend_namespace,
+                                    read_policy,
                                 )
                             })
                             .await
