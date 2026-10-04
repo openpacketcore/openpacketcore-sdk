@@ -18,9 +18,9 @@ use super::{
     missing_child_error, mobility, parse_ambr, parse_eps_subscribed_qos_profile,
     retain_diameter_eap_extension, ApnConfiguration, DiameterEapRetention, PdnType, Redacted,
     SwmAdditionalAvp, SwmApnOiReplacement, SwmChargingCharacteristics, SwmDiameterEapAnswer,
-    SwmDiameterEapExtensionMetadata, SwmDiameterEapRequestEnvelope,
-    SwmLocallyConfiguredMobilityMode, SwmMip6AgentInfo, SwmMip6FeatureVector,
-    SwmVisitedNetworkIdentifier, AVP_3GPP_CHARGING_CHARACTERISTICS, AVP_AMBR,
+    SwmDiameterEapAnswerEnvelopeProvenance, SwmDiameterEapExtensionMetadata,
+    SwmDiameterEapRequestEnvelope, SwmLocallyConfiguredMobilityMode, SwmMip6AgentInfo,
+    SwmMip6FeatureVector, SwmVisitedNetworkIdentifier, AVP_3GPP_CHARGING_CHARACTERISTICS, AVP_AMBR,
     AVP_APN_CONFIGURATION, AVP_APN_OI_REPLACEMENT, AVP_CONTEXT_IDENTIFIER,
     AVP_EPS_SUBSCRIBED_QOS_PROFILE, AVP_MIP6_AGENT_INFO, AVP_PDN_TYPE, AVP_SERVICE_SELECTION,
     AVP_VISITED_NETWORK_IDENTIFIER, MAX_SWM_DIAMETER_EAP_ROUTING_AVPS, VENDOR_ID_3GPP,
@@ -187,7 +187,7 @@ pub enum SwmApnConfigurationErrorCode {
     DefaultContextIdentifierMissing,
     /// APN material was attached to a non-success answer.
     ResultNotExactSuccess,
-    /// APN material was attached to an emergency request.
+    /// Subscription APN authorization was attempted for an emergency request.
     EmergencyRequest,
     /// The answer did not correlate to the request used by the checked mutator.
     RequestMismatch,
@@ -962,12 +962,34 @@ impl super::SwmDiameterEapRequest {
 }
 
 impl super::SwmCorrelatedDiameterEapResponse {
+    /// Whether a successful received emergency answer carried an ignored APN profile.
+    ///
+    /// This covers either `APN-Configuration` or top-level `APN-OI-Replacement`,
+    /// including the latter alone. For GTPv2-based S2b, TS 29.273 section
+    /// 7.1.2.1.4 and TS 23.402 sections 7.2.5 and 13.5 require using local
+    /// Emergency Configuration Data instead of subscription information.
+    /// The AVPs retain full wire validation and raw visibility, but both
+    /// [`Self::default_apn_configuration_view`] and
+    /// [`Self::authorized_apn_configurations`] refuse the ignored profile.
+    ///
+    /// Emergency status comes only from this retained DER. The consumer must
+    /// mark every DER in a multi-round emergency exchange and enforce the
+    /// supported access protocol; this codec keeps no session-wide policy.
+    /// This returns false for absent profiles and non-success responses; it
+    /// does not establish emergency authentication or authorize local policy.
+    #[must_use]
+    pub fn subscription_apn_configurations_ignored(&self) -> bool {
+        matches!(self.response(), super::SwmDiameterEapResponse::Application(answer)
+            if emergency_subscription_profile_ignored(self.request(), answer))
+    }
+
     /// Borrow structurally valid ordered APN wire views after authenticated-peer,
     /// connection-generation, and complete DER/DEA correlation.
     ///
     /// Wildcard and future PDN values remain observable here as correlated wire
     /// facts. Use [`Self::authorized_apn_configurations`] for policy-safe broad
-    /// authorization values.
+    /// authorization values. Subscription APNs ignored for an emergency request
+    /// are also wire facts here, never authorization for the emergency service.
     pub fn apn_configuration_views(
         &self,
     ) -> Result<SwmApnConfigurationViews<'_>, SwmApnConfigurationError> {
@@ -977,10 +999,20 @@ impl super::SwmCorrelatedDiameterEapResponse {
     }
 
     /// Resolve the default APN as a correlated, structurally valid wire view.
+    ///
+    /// Returns [`SwmApnConfigurationErrorCode::EmergencyRequest`] when the
+    /// subscription profile is ignored for an emergency request. Use local
+    /// Emergency Configuration Data to select the emergency APN; the raw
+    /// [`Self::apn_configuration_views`] remain available for observation.
     pub fn default_apn_configuration_view(
         &self,
     ) -> Result<Option<SwmApnConfigurationView<'_>>, SwmApnConfigurationError> {
         let answer = correlated_application_answer(self)?;
+        if self.subscription_apn_configurations_ignored() {
+            return Err(SwmApnConfigurationError::new(
+                SwmApnConfigurationErrorCode::EmergencyRequest,
+            ));
+        }
         let mut views = self.apn_configuration_views()?;
         let Some(default_context_identifier) = answer.default_context_identifier else {
             return Ok(None);
@@ -991,14 +1023,57 @@ impl super::SwmCorrelatedDiameterEapResponse {
     /// Borrow policy-consumable APN authorizations after strict correlation.
     ///
     /// This accessor additionally rejects wildcard parents and unknown PDN
-    /// values so they cannot become broad authorization grants.
+    /// values so they cannot become broad authorization grants. A successful
+    /// emergency answer carrying an APN profile (including top-level
+    /// `APN-OI-Replacement` alone) returns
+    /// [`SwmApnConfigurationErrorCode::EmergencyRequest`]; those values were
+    /// ignored during request correlation and cannot authorize emergency service.
     pub fn authorized_apn_configurations(
         &self,
     ) -> Result<SwmApnConfigurationViews<'_>, SwmApnConfigurationError> {
         let answer = correlated_application_answer(self)?;
+        if self.subscription_apn_configurations_ignored() {
+            return Err(SwmApnConfigurationError::new(
+                SwmApnConfigurationErrorCode::EmergencyRequest,
+            ));
+        }
         validate_authorized_view_access(answer)?;
         Ok(configuration_views(answer))
     }
+}
+
+impl super::SwmCorrelatedDiameterEapExchange {
+    /// Whether a successful received emergency answer carried an ignored APN profile.
+    ///
+    /// Like [`super::SwmCorrelatedDiameterEapResponse::subscription_apn_configurations_ignored`],
+    /// this covers `APN-Configuration` and top-level `APN-OI-Replacement`, alone
+    /// or together. It applies only to parsed answers; locally built answers
+    /// retain the sender prohibition on emergency subscription profiles.
+    /// [`Self::answer`] exposes raw wire facts, not emergency authorization.
+    ///
+    /// The GTPv2-based S2b receiver tolerance in TS 29.273 section 7.1.2.1.4
+    /// and TS 23.402 section 7.2.5 requires local Emergency Configuration Data
+    /// (TS 23.402 section 13.5). The consumer must mark every DER in a
+    /// multi-round emergency exchange and enforce the supported access protocol.
+    /// This query proves neither emergency authentication nor local policy.
+    #[must_use]
+    pub fn subscription_apn_configurations_ignored(&self) -> bool {
+        self.answer.provenance == SwmDiameterEapAnswerEnvelopeProvenance::Parsed
+            && emergency_subscription_profile_ignored(self.request(), self.answer())
+    }
+}
+
+fn emergency_subscription_profile_ignored(
+    request: &super::SwmDiameterEapRequest,
+    answer: &SwmDiameterEapAnswer,
+) -> bool {
+    request.requests_emergency_services()
+        && answer.result.is_diameter_success()
+        && (!answer.apn_configurations.is_empty()
+            || answer
+                .subscriber_authorization
+                .apn_oi_replacement()
+                .is_some())
 }
 
 pub(super) fn append_apn_configuration_avp(
@@ -1498,9 +1573,18 @@ pub(super) fn validate_profile(answer: &SwmDiameterEapAnswer) -> Result<(), &'st
 pub(super) fn validate_for_request(
     request: &SwmDiameterEapRequestEnvelope,
     answer: &SwmDiameterEapAnswer,
+    provenance: SwmDiameterEapAnswerEnvelopeProvenance,
 ) -> Result<(), &'static str> {
     if !answer.apn_configurations.is_empty() && request.request().requests_emergency_services() {
-        return Err("SWm DEA APN-Configuration is prohibited for an emergency DER");
+        if provenance == SwmDiameterEapAnswerEnvelopeProvenance::Parsed
+            && answer.result.is_diameter_success()
+        {
+            // TS 29.273 section 7.1.2.1.4: local Emergency Configuration Data
+            // replaces subscription APN authorization. Parsing and final answer
+            // validation still check the complete ignored wire profile.
+            return Ok(());
+        }
+        return Err("SWm emergency APN-Configuration requires a parsed DIAMETER_SUCCESS answer");
     }
     if let Some(requested) = request
         .request()

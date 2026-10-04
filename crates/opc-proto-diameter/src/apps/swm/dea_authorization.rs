@@ -12,7 +12,8 @@ use opc_protocol::{
 use std::{collections::HashSet, error::Error, fmt};
 
 use super::{
-    builder_helpers, DiameterEapRetention, SwmAdditionalAvp, AVP_3GPP_CHARGING_CHARACTERISTICS,
+    builder_helpers, DiameterEapRetention, SwmAdditionalAvp,
+    SwmDiameterEapAnswerEnvelopeProvenance, AVP_3GPP_CHARGING_CHARACTERISTICS,
     AVP_APN_OI_REPLACEMENT, AVP_CORE_NETWORK_RESTRICTIONS, AVP_MPS_PRIORITY, AVP_UE_USAGE_TYPE,
     VENDOR_ID_3GPP,
 };
@@ -344,6 +345,9 @@ impl SwmMpsPriority {
 /// The bundle is intentionally non-exhaustive and uses checked typed values,
 /// allowing future standard fields without creating another collection of
 /// loosely related raw scalars on `SwmDiameterEapAnswer`.
+/// Parsed values are wire facts. In particular, `APN-OI-Replacement` received
+/// for an emergency DER is retained but cannot authorize emergency service;
+/// consult the correlated response or exchange's ignored-profile query.
 #[non_exhaustive]
 #[derive(Clone, PartialEq, Eq, Default)]
 pub struct SwmDeaSubscriberAuthorization {
@@ -420,7 +424,11 @@ impl SwmDeaSubscriberAuthorization {
         self
     }
 
-    /// Return the APN-OI-Replacement value.
+    /// Return the raw APN-OI-Replacement wire value, not an authorization grant.
+    ///
+    /// A successful received emergency profile retains this value but ignores
+    /// it. Use the correlated response or exchange's
+    /// `subscription_apn_configurations_ignored()` query before applying policy.
     #[must_use]
     pub const fn apn_oi_replacement(&self) -> Option<&SwmApnOiReplacement> {
         self.apn_oi_replacement.as_ref()
@@ -840,9 +848,11 @@ pub(super) fn validate_for_request(
     exact_success: bool,
     emergency_requested: bool,
     network_based_mobility_authorized: bool,
+    provenance: SwmDiameterEapAnswerEnvelopeProvenance,
 ) -> Result<(), &'static str> {
     validate_result_conditions(authorization, exact_success)?;
     if authorization.apn_oi_replacement.is_some()
+        && !(provenance == SwmDiameterEapAnswerEnvelopeProvenance::Parsed && emergency_requested)
         && (emergency_requested || !network_based_mobility_authorized)
     {
         return Err(
