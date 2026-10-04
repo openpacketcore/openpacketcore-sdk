@@ -19,10 +19,14 @@
 //! through an `IP_HDRINCL` raw socket with `SO_MARK`, an `IP_PKTINFO` source
 //! and `IP_NODEFRAG`. One connection-tracking rule is active in the gateway
 //! namespace throughout.
+//!
+//! The fragments wait in their own backend-owned queue. A flood of them must
+//! overflow only that queue: the kernel drops and counts the excess, and
+//! over-MTU Don't Fragment packets and Echo are still served.
 
 use super::*;
 use opc_gtpu_dataplane::control_port::{GtpuControlPort, GtpuControlPortError};
-use opc_gtpu_dataplane::{GtpuDownlinkEvent, GtpuDownlinkInnerMtu};
+use opc_gtpu_dataplane::{GtpuDownlinkDrop, GtpuDownlinkEvent, GtpuDownlinkInnerMtu};
 
 sockopt_impl!(
     IpNoDefragment,
@@ -263,6 +267,43 @@ fn serve_consumer(port: &dyn GtpuControlPort, window: Duration) -> Vec<GtpuDownl
         }
     }
     events
+}
+
+/// Drain the backend-owned consumer without injecting anything, until it has
+/// stayed empty for `idle`. Returns every event, in order.
+fn drain_consumer(port: &dyn GtpuControlPort, idle: Duration) -> Vec<GtpuDownlinkEvent> {
+    let mut events = Vec::new();
+    let mut empty_since = Instant::now();
+    while empty_since.elapsed() < idle {
+        match port.try_receive_downlink(4096) {
+            Ok(Some(event)) => {
+                events.push(event);
+                empty_since = Instant::now();
+            }
+            Ok(None) | Err(GtpuControlPortError::Busy) => {
+                std::thread::sleep(Duration::from_millis(1));
+            }
+            Err(error) => panic!("downlink consumer receive failed: {error}"),
+        }
+    }
+    events
+}
+
+fn with_dont_fragment(mut packet: Vec<u8>) -> Vec<u8> {
+    packet[6] |= 0x40;
+    packet[10..12].fill(0);
+    let mut header = [0_u8; 20];
+    header.copy_from_slice(&packet[..20]);
+    packet[10..12].copy_from_slice(&ipv4_header_checksum(&header).to_be_bytes());
+    packet
+}
+
+/// The receive buffer the kernel gives a new UDP socket in this namespace:
+/// the budget of each backend-owned queue.
+fn default_udp_receive_buffer() -> usize {
+    use nix::sys::socket::{getsockopt, sockopt};
+    let socket = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).expect("bind a probe socket");
+    getsockopt(&socket, sockopt::RcvBuf).expect("read the default SO_RCVBUF")
 }
 
 /// Require exactly the `expected` inner packets, in order, each returned as
@@ -576,8 +617,120 @@ pub(super) async fn qualify() -> Result<(), Box<dyn std::error::Error>> {
         "one dedicated-SA ESP packet per inner fragment"
     );
 
-    // No hand-off met an unbound queue: no plaintext ICMP crossed the core,
-    // and the host generated no Destination Unreachable.
+    // 6. A datagram sent straight to the inner-fragment queue is never
+    //    exposed as a control or unknown-tunnel event bound to that queue: an
+    //    Echo Request and a G-PDU for no tunnel are both dropped.
+    let peer = in_netns(&net.pgw_ns, || {
+        UdpSocket::bind((PGW_IP, 0)).expect("bind PGW sender")
+    });
+    let queue = (
+        EPDG_S2BU_IP,
+        opc_gtpu_ebpf_common::GTPU_INNER_FRAGMENT_QUEUE_PORT,
+    );
+    let echo = [0x32, 1, 0, 4, 0, 0, 0, 0, 0x5e, 0x11, 0, 0];
+    peer.send_to(&echo, queue)?;
+    peer.send_to(&build_gpdu(0x7777_0001, None, &datagram(0x66, 64)), queue)?;
+    let events = drain_consumer(port.as_ref(), window);
+    assert!(
+        matches!(
+            &events[..],
+            [
+                GtpuDownlinkEvent::Dropped(GtpuDownlinkDrop::StateUnavailable),
+                GtpuDownlinkEvent::Dropped(GtpuDownlinkDrop::StateUnavailable)
+            ]
+        ),
+        "datagrams sent to the inner-fragment queue: {events:?}"
+    );
+
+    // 7. The queue budget. With nobody draining, a flood of inner fragments
+    //    larger than the queue's receive buffer arrives, then three over-MTU
+    //    Don't Fragment datagrams and an Echo Request. The flood overflows
+    //    only its own queue: the kernel keeps at most one receive buffer of
+    //    fragments and counts the rest as dropped. Echo is served first, and
+    //    the over-MTU packets are served in turn with the fragments, none of
+    //    them lost.
+    let receive_buffer = default_udp_receive_buffer();
+    let flood_fragment = core_fragments(&datagram(0x67, 2_600), 1_400, 0x6700).swap_remove(0);
+    assert_eq!(flood_fragment.len(), 1_396);
+    // Every datagram is charged at least its own length, so this many cannot
+    // fit one receive buffer.
+    let flood = receive_buffer / 1_024 + 64;
+    send_raw_gtpu_frames(
+        &net.pgw_ns,
+        "s2bup",
+        &vec![frame(LOCAL_TEID, &flood_fragment); flood],
+    );
+    let oversized: Vec<Vec<u8>> = (0..3_u8)
+        .map(|index| with_dont_fragment(datagram(0x68 + index, 1_422)))
+        .collect();
+    for packet in &oversized {
+        assert!(packet.len() > usize::from(SESSION_MTU));
+        send(&[&frame(LOCAL_TEID, packet)]);
+    }
+    peer.send_to(&echo, (EPDG_S2BU_IP, GTPU_PORT))?;
+    std::thread::sleep(Duration::from_millis(200));
+    let events = drain_consumer(port.as_ref(), window);
+    match &events[0] {
+        GtpuDownlinkEvent::Control(event) => assert_eq!(event.bytes(), echo),
+        other => panic!("Echo must be served ahead of both hand-off backlogs, got {other:?}"),
+    }
+    let fragmented: Vec<usize> = events
+        .iter()
+        .enumerate()
+        .filter(|(_, event)| matches!(event, GtpuDownlinkEvent::Fragmented(_)))
+        .map(|(index, _)| index)
+        .collect();
+    assert_eq!(
+        fragmented.len(),
+        oversized.len(),
+        "the fragment flood must not cost the over-MTU path a packet"
+    );
+    assert!(
+        fragmented.iter().all(|index| (1..=6).contains(index)),
+        "the over-MTU packets are served in turn with the fragment backlog, at {fragmented:?}"
+    );
+    let accepted = events
+        .iter()
+        .filter(|event| match event {
+            GtpuDownlinkEvent::Decapsulated(packet) => {
+                assert_eq!(packet.inner_packet(), flood_fragment.as_slice());
+                true
+            }
+            _ => false,
+        })
+        .count();
+    assert_eq!(events.len(), 1 + oversized.len() + accepted);
+    assert!(
+        (1..flood).contains(&accepted),
+        "the flood must overflow the inner-fragment queue: {accepted} of {flood} accepted"
+    );
+    assert!(
+        accepted <= receive_buffer / flood_fragment.len() + 1,
+        "the queue holds at most its receive buffer: {accepted} datagrams in {receive_buffer} octets"
+    );
+    // The kernel reports its cumulative drop count with a received datagram:
+    // receive one more fragment to read the flood's.
+    send(&[&frame(LOCAL_TEID, &flood_fragment)]);
+    assert!(matches!(
+        &drain_consumer(port.as_ref(), window)[..],
+        [GtpuDownlinkEvent::Decapsulated(_)]
+    ));
+    let counters = port.downlink_counters()?;
+    eprintln!(
+        "inner fragment queue budget: receive buffer={receive_buffer} octets, flood={flood} fragments, accepted={accepted}, kernel drops={}",
+        counters.inner_fragment_queue_drops
+    );
+    assert_eq!(
+        counters.inner_fragment_queue_drops,
+        u64::try_from(flood - accepted)?,
+        "every fragment beyond the queue's budget is dropped by the kernel and counted"
+    );
+    assert_eq!(counters.packet_too_big_queue_drops, 0);
+    assert_eq!(counters.shared_queue_drops, 0);
+
+    // No hand-off met an unbound queue, and an overflowing queue is silent:
+    // no plaintext ICMP crossed the core, and the host generated no
+    // Destination Unreachable.
     core_packets.extend(captured_ipv4(&pgw_capture));
     assert_eq!(plaintext_icmp(&core_packets), 0, "no ICMP toward the core");
     assert_eq!(
@@ -585,21 +738,25 @@ pub(super) async fn qualify() -> Result<(), Box<dyn std::error::Error>> {
         host_icmp_before,
         "the host must not answer a hand-off with Port Unreachable"
     );
-    let counters = port.downlink_counters()?;
-    assert_eq!(counters.decapsulated, 7);
-    assert_eq!(counters.inner_fragmented, 0);
+    let returned = u64::try_from(7 + accepted + 1)?;
+    assert_eq!(counters.decapsulated, returned);
+    assert_eq!(
+        counters.decapsulated_inner_fragments, returned,
+        "every decapsulated packet of this test was an inner fragment"
+    );
+    assert_eq!(counters.inner_fragmented, 3);
+    assert_eq!(counters.inner_fragments, 6);
+    assert_eq!(counters.inner_fragment_rate_limited, 0);
+    assert_eq!(counters.state_unavailable, 2);
     assert_eq!(counters.packet_too_big, 0);
     assert_eq!(counters.malformed, 0);
     assert_eq!(counters.binding_drops, 0);
-    assert_eq!(counters.state_unavailable, 0);
-    assert_eq!(counters.shared_queue_drops, 0);
-    assert_eq!(counters.packet_too_big_queue_drops, 0);
 
     drop(port);
     backend.remove_device(&device).await?;
     drop(net);
     eprintln!(
-        "OPC_GTPU_DOWNLINK_INNER_FRAGMENT_HAND_OFF_PROVEN: every inner IPv4 fragment of a context with a downlink inner MTU returned by the consumer with its bearer mark (outer-fragmented first fragment, reordered, dedicated via ESP) under connection tracking, none stranded in a host reassembly queue"
+        "OPC_GTPU_DOWNLINK_INNER_FRAGMENT_HAND_OFF_PROVEN: every inner IPv4 fragment of a context with a downlink inner MTU returned by the consumer with its bearer mark (outer-fragmented first fragment, reordered, dedicated via ESP) under connection tracking, none stranded in a host reassembly queue; a fragment flood overflows only its own queue"
     );
     Ok(())
 }
