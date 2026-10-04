@@ -7,7 +7,8 @@ independently compiled complete NGAP messages, and local reference scenarios.
 Independent synthetic IKE AUTH known answers exercise the existing SDK crypto.
 `runtime_claim=false` throughout. The crate
 has no runtime protocol dependencies; test-only dependencies exercise the
-existing NGAP and GTP-U codecs and IKE crypto against the published bytes.
+existing NGAP, GTP-U and SCTP DATA codecs and IKE crypto against the published
+bytes.
 
 `complete` in a subset record means its declared fixture inventory is complete
 at its `validation_scope`. It does not mean a N3IWF primitive is implemented
@@ -44,6 +45,7 @@ qualification. See the [Child-SA inventory](../../docs/n3iwf-child-sa-fixture-pr
 | IETF RFC 7296 / RFC 4555 | Published RFCs | IKE payloads, MOBIKE notification, independent IKE key schedule and AUTH answers |
 | IETF RFC 4231 | Published RFC | SHA-256 HMAC primitive known answer, section 4.2 |
 | IETF RFC 4960 | Published RFC | SCTP DATA framing |
+| IETF RFC 9260 | Published RFC | Standalone DATA decoder, including I/U/B/E observations and complete-record mapping |
 | IETF RFC 6083 | Published RFC | Reliable delivery and AUTH/exporter lifecycle obligations, §4.8/§5 |
 | IETF RFC 6347 / RFC 5246 | Published RFCs | DTLS 1.2 record and isolated ServerHelloDone |
 
@@ -227,6 +229,27 @@ against these vectors.
 Authority: [IANA NG Control Plane service registration](https://www.iana.org/assignments/service-names-port-numbers/service-names-port-numbers.xhtml?search=ng-control),
 [TS 38.412 V18.1.0 clause 7](https://www.etsi.org/deliver/etsi_ts/138400_138499/138412/18.01.00_60/ts_138412v180100p.pdf),
 and [RFC 6335 section 6](https://www.rfc-editor.org/rfc/rfc6335.html#section-6).
+
+## Executable SCTP DATA inspection
+
+The `positive-data-chunk` fixture retains its RFC 4960 provenance, original
+20 wire octets and digest: Length 17, one opaque zero user octet and three
+zero alignment octets. Its manifest now explicitly asserts `order=ordered`
+and `stream_id=0` alongside DATA, PPID 60 and the user-data length.
+
+[`wire_codecs.rs`](tests/wire_codecs.rs) consumes these bytes through the
+portable `opc_sctp::DataChunk` decoder and checks each claim before copying a
+complete record into `UnprotectedN2Profile::admit`. The association ID is
+synthetic caller metadata. The existing independent Python oracle also checks
+order and stream claims against the wire. Fragment handling, malformed framing,
+strict padding, allocation counts and negative N2 admission are covered in
+[`opc-sctp`'s decoder tests](../opc-sctp/tests/data_chunk.rs).
+
+The standalone decoder uses RFC 9260's DATA layout. It validates exact zero
+alignment for fixture/capture envelopes; this stricter policy does not replace
+the live SCTP receiver's padding rules. Payloads remain opaque, and this test
+does not validate NGAP, a complete SCTP packet, an association or protection.
+Fixture outcomes and `runtime_claim=false` remain unchanged.
 
 ## Executable protocol-key custody schedules
 

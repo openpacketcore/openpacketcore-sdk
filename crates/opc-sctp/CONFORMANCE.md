@@ -1,16 +1,18 @@
-# SCTP receive ownership and unprotected N2 lifecycle
+# SCTP DATA inspection, receive ownership and unprotected N2 lifecycle
 
 This document covers partial receive ownership, strict unprotected framing and
 exact N2 association generations in
 [#788](https://github.com/openpacketcore/openpacketcore-sdk/issues/788).
+It also covers the standalone DATA chunk decoder in
+[#1027](https://github.com/openpacketcore/openpacketcore-sdk/issues/1027).
 The scope is the reusable unprotected SDK transport, not NGAP procedure state,
 protected transport or external N3IWF/AMF interoperability.
 
 ## Standards and local policy
 
 [TS 38.412 V18.1.0](https://www.etsi.org/deliver/etsi_ts/138400_138499/138412/18.01.00_60/ts_138412v180100p.pdf)
-clause 7 names RFC 4960 as the SCTP baseline. This change retains that baseline;
-it does not silently substitute RFC 9260. RFC 4960
+clause 7 names RFC 4960 as the SCTP baseline. The live N2 transport retains
+that baseline. RFC 4960
 [3.3.1](https://www.rfc-editor.org/rfc/rfc4960.html#section-3.3.1),
 [6.6](https://www.rfc-editor.org/rfc/rfc4960.html#section-6.6), and
 [10.1 G](https://www.rfc-editor.org/rfc/rfc4960.html#section-10.1) distinguish
@@ -24,6 +26,40 @@ resource and lifecycle policy. They are not new wire requirements. A partial
 record retains its original cap; a different cap cannot resume it. No automatic
 receive timeout is added, and an idle partial record remains owned and bounded
 until receive, close or drop.
+
+## Standalone DATA chunk inspection
+
+`DataChunk::decode` is an allocation-free, portable parser for exactly one
+DATA chunk. It follows the layout in RFC 9260
+[3.3.1](https://www.rfc-editor.org/rfc/rfc9260.html#section-3.3.1), which retains
+the RFC 4960 DATA fields and adds the I-bit definition. It exposes typed
+I/U/B/E flags, host-order TSN/stream/SSN/PPID and borrowed user data. Reserved
+flag bits are ignored. Unordered SSNs are observations only, never used for
+ordering or record admission.
+
+The input must end at Length rounded up to four octets. Zero to three zero
+alignment octets are required outside Length. Nonzero padding is rejected by
+this fixture/capture contract; RFC 9260
+[3.2](https://www.rfc-editor.org/rfc/rfc9260.html#section-3.2) requires senders
+to emit zeros but receivers to ignore padding contents. This parser's stricter
+envelope validation does not change kernel receive policy. It rejects wrong
+type, short headers, impossible lengths, truncated data, missing alignment,
+excess padding and trailing chunks. Length 16 has the separate `NoUserData`
+classification from RFC 9260 sections 6.2 and 3.3.10.9. The maximum accepted
+input is 65,536 octets including padding, with 65,519 user octets.
+
+All fragment forms decode, but `into_inbound_message(assoc_id)` copies into
+owned `Bytes` only when B and E are both set. Otherwise it returns `Fragmented`
+without allocation. U maps to unordered delivery; stream and PPID are retained.
+The caller provides the association ID, which the chunk does not contain.
+Notification/event and truncation flags are clear on these complete DATA
+records. The existing `UnprotectedN2Profile::admit` then checks PPID, delivery
+order and the caller's payload bound exactly as for kernel records.
+
+This decoder validates no SCTP common header, checksum, peer identity, stream
+negotiation, TSN history or NGAP procedure. It performs no fragment reassembly
+or live delivery, and grants no association-generation authority. Debug and
+unit error variants expose no user data.
 
 ## Constructed and received behavior
 
@@ -114,9 +150,9 @@ concurrent association/endpoint receivers, oversized-message closure,
 multihoming/readback and SCTP-AUTH consumers. They require explicit native
 execution; ordinary Cargo runs leave those tests ignored.
 
-The reviewed, merged `n2-sctp` fixture subset from
-[PR #830](https://github.com/openpacketcore/openpacketcore-sdk/pull/830) remains
-unchanged. Its wire/metadata inventory does not by itself prove cancellation
+The `n2-sctp` fixture subset was first reviewed and merged in
+[PR #830](https://github.com/openpacketcore/openpacketcore-sdk/pull/830).
+Its wire/metadata inventory does not by itself prove cancellation
 correctness. A later independent byte check found that four metadata vectors
 encode port 38428 while claiming 38412. [PR #896](https://github.com/openpacketcore/openpacketcore-sdk/pull/896)
 corrected those vectors and their semantic checks and is merged. The N2 tests
@@ -141,6 +177,19 @@ handle survives. The pre-existing deterministic receive schedules remain the
 evidence for cancellation after a partial prefix has actually been consumed.
 These are synthetic metadata vectors and Linux loopback checks, not live
 N3IWF/AMF peer captures.
+
+[`tests/data_chunk.rs`](tests/data_chunk.rs) exercises independently laid out
+synthetic DATA bytes, all flag combinations and wrong types, length/padding
+failures, the maximum wire length, borrowed storage, zero decode allocations,
+copying/fragment refusal and redaction. Its profile checks compare wire-derived
+records with the same synthetic kernel metadata for ordered/unordered DATA,
+wrong PPID and exact-cap/cap+1 payloads.
+The fixture crate's [`wire_codecs.rs`](../opc-n3iwf-fixtures/tests/wire_codecs.rs)
+decodes the published DATA vector through this API and checks its manifest's
+DATA, ordered, stream-zero, PPID-60 and one-user-octet claims before N2 admission.
+The original 20 wire octets and their digest are unchanged; the manifest now
+explicitly includes ordering and stream assertions. This evidence establishes
+standalone parsing and admission, not live peer interoperability.
 
 Candidate evidence must retain exact base/head/tree, failing
 baseline and removed-guard results, native checks, required repository gates

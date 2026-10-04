@@ -136,6 +136,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   Request/Response packets delegate to the existing AKA and EAP-5G parsers;
   new diagnostics omit packet values and identifiers. Fixes #1026.
 
+- `opc-sctp`: add allocation-free `DataChunk::decode` for one bounded,
+  exactly padded RFC 9260 DATA chunk, exposing typed flags, host-order metadata
+  and borrowed user data with redacted diagnostics. Complete chunks can be
+  copied into `InboundMessage` for existing N2 PPID, ordering and size checks;
+  fragments return an explicit conversion error without reassembly.
+  `opc-n3iwf-fixtures` now decodes its published DATA vector through this API
+  and checks ordered stream-zero delivery as well as PPID and payload length.
+  Fixes #1027.
+
 - `opc-session-store`: add opt-in `EnvelopeReadPolicy::RequireEnvelopeV1`
   reads to local encryption and remote sealing wrappers. Every returned
   physical record requires a canonical envelope and the existing authenticated

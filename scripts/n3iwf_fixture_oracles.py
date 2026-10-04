@@ -461,7 +461,12 @@ def verify_field_claims(manifest, data):
             "field-claim",
         )
         if manifest["encoding"] == "protocol-wire":
-            require({"ppid", "user_data_len", "chunk"} <= claims.keys(), "field-claim")
+            require(
+                {"ppid", "user_data_len", "chunk", "order", "stream_id"} <= claims.keys(),
+                "field-claim",
+            )
+            label("order", "unordered" if data[1] & 4 else "ordered")
+            number("stream_id", uint(data[8:10]))
             number("ppid", uint(data[12:16]))
             number("user_data_len", uint(data[2:4]) - 16)
             label("chunk", "DATA")
