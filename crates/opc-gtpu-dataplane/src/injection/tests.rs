@@ -28,6 +28,7 @@ impl Ipv4Sender for RecordingSender {
 fn injector() -> Injector<RecordingSender> {
     Injector {
         sender: RecordingSender::default(),
+        contract: InjectionContract::RawIpv4,
         counters: GtpuDownlinkInjectionCounters::default(),
     }
 }
@@ -172,16 +173,19 @@ fn invalid_and_ipv6_inputs_never_reach_the_sender() {
 #[test]
 fn unspecified_source_is_refused_instead_of_replaced_by_the_kernel() {
     let mut injector = injector();
-    let mut bytes = packet(1, 0x4000, b"data").to_vec();
-    bytes[12..16].fill(0);
-    bytes[10..12].fill(0);
-    let checksum = internet_checksum(&bytes[..20]);
-    bytes[10..12].copy_from_slice(&checksum.to_be_bytes());
-    let event = decapsulated(bytes.into(), None);
-    assert_eq!(
-        injector.inject((&event).into()),
-        Err(GtpuDownlinkInjectionError::UnspecifiedSource)
-    );
+    for (id, flags) in [(1, 0x4000), (0, 0x2000)] {
+        let mut bytes = packet(id, flags, &[0; 8]).to_vec();
+        bytes[12..16].fill(0);
+        bytes[10..12].fill(0);
+        let checksum = internet_checksum(&bytes[..20]);
+        bytes[10..12].copy_from_slice(&checksum.to_be_bytes());
+        let event = decapsulated(bytes.into(), None);
+        assert_eq!(
+            injector.inject((&event).into()),
+            Err(GtpuDownlinkInjectionError::UnspecifiedSource)
+        );
+    }
+    assert_eq!(injector.counters.zero_identification_refusals, 0);
     assert!(injector.sender.packets.is_empty());
 }
 
@@ -317,6 +321,9 @@ fn send_failure_classes_distinguish_kernel_limits_and_containment() {
         (libc::ENOBUFS, GtpuDownlinkSendFailure::NoBufferSpace),
         (libc::EPERM, GtpuDownlinkSendFailure::PolicyOrFilterRefused),
         (libc::EACCES, GtpuDownlinkSendFailure::AccessDenied),
+        (libc::ENXIO, GtpuDownlinkSendFailure::InterfaceUnavailable),
+        (libc::ENODEV, GtpuDownlinkSendFailure::InterfaceUnavailable),
+        (libc::ENETDOWN, GtpuDownlinkSendFailure::InterfaceDown),
         (libc::EBADF, GtpuDownlinkSendFailure::Other),
     ] {
         assert_eq!(
@@ -334,4 +341,68 @@ fn event_debug_has_no_packet_or_bearer_values() {
     for private in ["198.51.100.7", "203.0.113.7", "synthetic", "37", "23"] {
         assert!(!debug.contains(private));
     }
+}
+
+#[test]
+fn interface_contract_preserves_zero_ids_across_separate_outcomes_and_batches() {
+    let mut injector = injector();
+    injector.contract = InjectionContract::XfrmInterfaceIpv4;
+    for mark in [GtpBearerMark::new(37), None, GtpBearerMark::new(41)] {
+        let siblings = vec![packet(0, 0x2000, &[0x11; 8]), packet(0, 1, &[0x22; 7])];
+        let start = injector.sender.packets.len();
+        for bytes in &siblings {
+            let event = decapsulated(bytes.clone(), mark);
+            assert_eq!(injector.inject((&event).into()), Ok(1));
+        }
+        let batch = GtpuFragmentedDownlink::new(siblings.clone(), mark, 576);
+        assert_eq!(injector.inject((&batch).into()), Ok(2));
+        for ((sent, actual_mark), expected) in injector.sender.packets[start..]
+            .iter()
+            .zip(siblings.iter().cycle())
+        {
+            assert_eq!(sent.as_slice(), expected.as_ref());
+            assert_eq!(actual_mark, &mark);
+        }
+    }
+    assert_eq!(injector.counters.packets_accepted, 12);
+    assert_eq!(injector.counters.zero_identification_refusals, 0);
+}
+
+#[test]
+fn interface_contract_stops_a_zero_id_batch_on_partial_acceptance() {
+    let mut injector = injector();
+    injector.contract = InjectionContract::XfrmInterfaceIpv4;
+    injector.sender.fail_after = Some(1);
+    let first = packet(0, 0x2000, &[0x11; 8]);
+    let event =
+        GtpuFragmentedDownlink::new(vec![first.clone(), packet(0, 1, &[0x22; 7])], None, 576);
+    assert_eq!(
+        injector.inject((&event).into()),
+        Err(GtpuDownlinkInjectionError::Send {
+            class: GtpuDownlinkSendFailure::WouldBlock,
+            packets_sent: 1,
+        })
+    );
+    assert_eq!(injector.sender.packets, vec![(first.to_vec(), None)]);
+    assert_eq!(injector.counters.zero_identification_refusals, 0);
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn interface_constructor_rejects_invalid_identity_without_opening_a_socket() {
+    for (index, id) in [(0, 19), (1, 0), (u32::MAX, 19)] {
+        assert!(matches!(
+            GtpuDownlinkInjector::xfrm_interface_ipv4(index, id),
+            Err(GtpuDownlinkInjectionError::InvalidInterface)
+        ));
+    }
+}
+
+#[cfg(not(target_os = "linux"))]
+#[test]
+fn interface_constructor_refuses_unsupported_platforms() {
+    assert!(matches!(
+        GtpuDownlinkInjector::xfrm_interface_ipv4(7, 19),
+        Err(GtpuDownlinkInjectionError::UnsupportedPlatform)
+    ));
 }

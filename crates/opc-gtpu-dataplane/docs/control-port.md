@@ -518,6 +518,8 @@ pool-wide outbound block policy below the bearer policies. The injector
 installs no containment configuration and a policy query cannot provide an
 atomic receipt. See [Raw IPv4 injection](#raw-ipv4-injection) for the exact
 obligation, zero-Identification handling and limits.
+Consumers whose policies and SAs already carry an XFRM interface ID can use
+the optional [interface-bound contract](#xfrm-interface-bound-ipv4-injection).
 
 **Owner-approved policy.** Fragmenting a datagram with Don't Fragment set is
 not standard router behaviour. RFC 791 section 2.3 and RFC 6864 section 4.3
@@ -905,3 +907,236 @@ and [`ipv4_get_l4proto`/`nf_conntrack_in`](https://github.com/gregkh/linux/blob/
 The [enterprise default-policy backport](https://gitlab.com/redhat/centos-stream/src/kernel/centos-stream-9/-/blob/kernel-5.14.0-427.el9/net/xfrm/xfrm_user.c)
 provides SETDEFAULT/GETDEFAULT. Identification semantics follow
 [RFC 6864](https://www.rfc-editor.org/rfc/rfc6864.html).
+
+### XFRM-interface-bound IPv4 injection
+
+**The consumer owns the XFRM interface and its configuration.**
+`GtpuDownlinkInjector::xfrm_interface_ipv4(ifindex, if_id)` selects an
+additional contract for a local, fixed-ID XFRM interface with a nonzero
+`if_id`. Outbound policies and SAs must carry that same interface ID and
+require their intended transforms. Policies and SAs without an interface ID
+need an explicit consumer-owned migration before using this constructor.
+The existing raw constructor remains available for that configuration.
+
+The consumer creates and brings up the device in the selected namespace,
+installs its route, policies and SAs, and supplies its interface index and
+expected XFRM ID. For example, with an existing synthetic `underlay0`:
+
+```sh
+ip link add xfrm0 type xfrm dev underlay0 if_id 19
+ip link set xfrm0 up
+ip route add 203.0.113.0/24 dev xfrm0
+# The matching outbound policy and SA also need: if_id 19
+# Install the ICMP containment rule below before enabling injection.
+```
+
+```rust
+use opc_gtpu_dataplane::GtpuDownlinkInjector;
+
+// interface_index identifies the consumer-managed device in this namespace.
+let mut injector = GtpuDownlinkInjector::xfrm_interface_ipv4(interface_index, 19)?;
+// Use the same borrowed Decapsulated/Fragmented inputs as the raw constructor.
+injector.inject((&packet).into())?;
+```
+
+This path enters the bound XFRM device with `AF_PACKET/SOCK_DGRAM`. The device
+requires an actual transform with its interface ID. A missing matching policy
+or SA drops the original packet instead of returning an ordinary plaintext
+route. That does **not** imply silence: the failure can generate an ICMP error
+containing original packet bytes, as described below.
+Changing the ordinary route does not change the packet-socket binding.
+Deleting or moving the bound device invalidates that binding permanently,
+including after another device reuses its name and ifindex. The consumer
+must explicitly construct a new injector to use a replacement.
+
+**Generated ICMP and consumer containment.** On missing policy or SA,
+`xfrmi_xmit2` invokes `dst_link_failure`; IPv4 responds with ICMP destination
+unreachable, host-unreachable code (type 3, code 1). A DF packet larger than
+the tunnel path MTU, but small enough for the packet socket's device-MTU
+check, invokes `icmp_ndo_send` with fragmentation-needed (type 3, code 4).
+These messages contain the original IPv4 header and initial payload bytes.
+Linux limits the IPv4 error message to 576 bytes (or a smaller route MTU),
+and normally rate-limits errors. It generates them only for whole packets
+and first fragments, subject to the usual ICMP exclusions, such as no error
+in response to an ICMP error. Rate limits and the absence of a current return
+route are not containment guarantees.
+
+The error takes a separate route lookup toward the original source (or an
+echoed source-route option), with ordinary output policy/hook processing. The
+packet-socket binding does not constrain this lookup. **Before injection, the
+consumer must install and continuously retain containment for these ICMP
+quotes in the injection namespace.** The primitive neither installs nor
+audits that configuration. For the synthetic subscriber pool above, this
+nftables example drops locally generated destination-unreachable messages
+whose quoted IPv4 destination belongs to that pool:
+
+```sh
+nft add table inet injection_containment
+nft 'add chain inet injection_containment output { type filter hook output priority -300; }'
+nft 'add rule inet injection_containment output icmp type destination-unreachable @th,192,32 & 0xffffff00 == 0xcb007100 counter drop'
+nft -a list chain inet injection_containment output
+```
+
+`@th,192,32` reads the quoted destination: the eight-byte ICMP header plus
+16 bytes into the quoted IPv4 header. This offset also works with IPv4
+options. Change the mask and network for each actual subscriber pool and
+cover every injectable destination. The rule covers both error codes and
+all bearer marks and inner sources; matching only the outer ICMP destination,
+output interface or a mark would miss legitimate configurations. It runs
+before connection tracking and stops the generated error before device
+output, including loopback. It does not prevent error generation or suppress
+the original injected packet's internal XFRM-device trace. It also suppresses
+legitimate local destination-unreachable errors quoting that pool, including
+PMTU feedback; consumers must accept that cost and handle MTU appropriately.
+Privileged rules that redirect or mirror packets before this guard remain
+outside the contract. Keep the guard across policy/SA replacement and process
+restarts, for the entire lifetime of the plaintext source.
+
+Verify this configuration with the native proof and in the deployment's own
+namespace: supply a usable route toward a synthetic inner source, observe
+every device without an address filter, and trigger both missing-policy/SA
+and DF tunnel-MTU failures for each bearer. First observe the ICMP quotes
+without the guard in an isolated test namespace; with the guard installed,
+its counter must increase while the same trace shows no ICMP on any device.
+Also verify normal encrypted delivery still works. An empty trace without
+those positive controls could merely reflect missing routes or rate limiting.
+
+**Construction and lifetime.** Before sending any bytes, the constructor:
+
+1. Subscribes to kernel link notifications, then reads the requested link.
+   It requires XFRM kind, the expected nonzero `if_id`, fixed metadata, and
+   a policy namespace local to the current network namespace.
+2. Creates the packet socket with protocol zero, attaches a reject-all receive
+   filter, then binds once with `ETH_P_IP` and probes `SO_MARK`. The receive
+   hook required by that protocol still runs, but the filter discards incoming
+   packets before receive queueing. Filter failure refuses construction.
+   It then requests a second
+   link identity over the same subscribed netlink socket. Link changes to
+   that index cause a refusal, even if a replacement has identical attributes.
+   The RTNL-serialized response follows earlier link notifications;
+   notification loss, truncation,
+   malformed data and exhausted receive/deadline bounds also refuse.
+3. Checks the retained socket's own binding. It never exposes or rebinds that
+   descriptor. Every send omits the destination sockaddr, so the kernel uses
+   its retained device rather than resolving the index again.
+
+The initial identity read selects the device for this construction attempt;
+an integer index cannot identify an earlier incarnation that disappeared
+before that read. Notifications bridge the read-to-bind interval, while the
+kernel's retained binding covers the send lifetime. This is device identity
+acquisition, not a read-only containment audit of the entire namespace. There
+is a one-second identity deadline and a 256-datagram receive-work limit. A
+kernel syscall or scheduler stall can delay returning the deadline error.
+Renaming or otherwise changing the device during construction may cause a
+conservative refusal. The caller may retry construction after configuration
+has settled, before releasing any outcome for injection.
+In particular, a deferred `NEWLINK` following device-up can refuse an attempt;
+retry with a fresh monitor and socket rather than ignoring the notification.
+The native construction-race test verifies the replacement hook actually ran,
+so an unrelated early notification cannot pass that assertion.
+
+A missing device at construction is
+`GtpuDownlinkInjectionError::InterfaceUnavailable`.
+A retired send binding is `GtpuDownlinkSendFailure::InterfaceUnavailable`
+(`ENXIO`/`ENODEV`); it needs an explicit new constructor. A down device reports
+`InterfaceDown` (`ENETDOWN`). Linux can also retain a down notification on the
+socket and report it once after the device comes up. Neither is `Other`.
+Only a failure with zero accepted packets can be considered for a new explicit
+send after resolving the device condition; never retry partially accepted batches.
+
+The socket needs `CAP_NET_RAW`; setting each bearer mark also needs
+`CAP_NET_ADMIN` on kernels before Linux 5.17. A missing initial mark privilege
+is a construction error; those privileges must remain available for sends.
+The socket remains in its creation namespace. The consumer must keep
+privileged redirection/mirroring before XFRM out of this path and retain the
+intended interface configuration.
+Changing the live device's `if_id`, selecting an unrelated SA or deliberately
+redirecting plaintext is outside this contract. A retained descriptor cannot
+freeze configuration owned by another privileged actor.
+
+**Bytes, hooks and results.** Every validated IPv4 byte is preserved, including
+source, TTL, options, checksum and Identification zero. Both independently
+received `Decapsulated` fragments and SDK `Fragmented` batches can therefore
+retain zero without a correlation cache or ID allocation. The raw-mode zero-ID
+refusal counter remains zero for this constructor. Whole-batch validation,
+exclusive mutable access, exact mark resets, ordering and partial-acceptance
+reporting are shared with raw mode. IPv6 is unsupported.
+
+The inner packet starts at device egress, bypassing the inner IPv4 LOCAL_OUT
+path and its conntrack defragmentation, so it does not use `IP_NODEFRAG`.
+Device egress hooks and inner IPv4 POST_ROUTING still apply before encryption.
+The freshly allocated packet has no conntrack entry on that first POST_ROUTING
+pass. With conntrack active, **every inner packet**, including a whole packet
+or first fragment, matches nftables `ct state invalid` (not `untracked`). A
+postrouting invalid-drop rule drops all of them. This differs from raw mode,
+whose later fragments have that limitation. The native proof counts every
+inner packet's invalid state and demonstrates drops of a whole packet and
+both fragment positions. Consumers must scope their postrouting rules to
+permit the intended interface injection path; inner LOCAL_OUT exceptions
+cannot achieve this.
+XFRM obtains the source and actual IP protocol from the packet; address, mark
+and protocol selectors work, while transport
+ports are unavailable on later fragments. After the transform, ordinary
+outer-packet IP output hooks apply. Consumers must account for this difference
+when placing firewall or observation rules; an inner LOCAL_OUT rule is not
+an enforcement point for this constructor.
+
+A successful send still means local kernel acceptance. XFRM-interface drops
+can return success, including with a missing policy/SA and generated ICMP.
+No delivery or encryption
+receipt is returned, and no automatic retry, policy/SA installation or fallback
+to another send contract occurs. Device MTU and IPsec path-MTU constraints
+still apply. The injector does not decrement TTL or process options as a router.
+Errors, counters and `Debug` remain value-free, and the same consumer-fake port
+can stand in for either constructor.
+
+**Evidence and kernel coverage.** The native independent peer observes exact
+decrypted packets and reassembled payloads for both bearers, source/protocol
+selectors, zero/nonzero IDs in batches and separate outcomes, options, and
+active sender conntrack. Independent firewall counters verify that inner
+LOCAL_OUT is bypassed while plaintext POST_ROUTING is retained and matches the
+invalid tracking state. A return route to the inner source and an unfiltered
+all-device trace expose ICMP host-unreachable and fragmentation-needed quotes;
+the proof checks their original bytes, type/code and bounded length, including
+first-fragment generation and later-fragment silence. With the documented
+consumer output guard, counters prove those errors are dropped and no ICMP
+leaves on any device for either bearer. Policy/SA loss and ordinary-route
+replacement are exercised with that guard. The trace also observes decrypted
+inbound traffic while a peek proves the production send socket's receive queue
+is empty. Device-down, deletion/recreation and missing-constructor cases assert
+their named error classes. A
+deterministic replacement between the first identity read and bind uses the
+same ifindex, kind and `if_id`; construction must refuse it, then an explicit
+fresh constructor must work.
+
+The shared qualification runner requires all three native cases exactly once
+and zero ignored executions. Host, pinned Linux 6.8 and enterprise 5.14 lanes
+read the running kernel's configuration. `CONFIG_XFRM_INTERFACE=y` or `m`
+requires `OPC_GTPU_XFRM_INTERFACE_INJECTION_PROVEN`. A configured absence must
+produce the kernel's explicit unsupported result on interface creation
+(`EOPNOTSUPP`, with `Unknown device type` extack on current iproute2) and
+the production constructor's `UnsupportedInterface` refusal on a substitute
+device, with no wire output, yielding
+`OPC_GTPU_XFRM_INTERFACE_UNSUPPORTED_PROVEN`. Missing configuration, failed
+module loading, privilege errors and other setup failures do not count as an
+unsupported pass. The unsupported result is distinct from datapath proof.
+The native test also requests a deliberately unavailable link kind to exercise
+the real unknown-kind diagnostic matcher on kernels that support XFRM interfaces.
+
+Source checks cover
+[`packet_do_bind`, `packet_snd`, `packet_getname`, `packet_notifier`](https://github.com/gregkh/linux/blob/v7.1.8/net/packet/af_packet.c),
+[`rtnl_getlink` and the RTNL dispatcher](https://github.com/gregkh/linux/blob/v7.1.8/net/core/rtnetlink.c),
+[`xfrmi_xmit` and `xfrmi_xmit2`](https://github.com/gregkh/linux/blob/v7.1.8/net/xfrm/xfrm_interface_core.c),
+and [`xfrm_output_resume`](https://github.com/gregkh/linux/blob/v7.1.8/net/xfrm/xfrm_output.c).
+[`xfrm4_output`](https://github.com/gregkh/linux/blob/v7.1.8/net/ipv4/xfrm4_output.c)
+enters inner POST_ROUTING before the transform.
+[`ipv4_link_failure`](https://github.com/gregkh/linux/blob/v7.1.8/net/ipv4/route.c)
+and [`__icmp_send`/`icmp_route_lookup`](https://github.com/gregkh/linux/blob/v7.1.8/net/ipv4/icmp.c)
+explain the error quotes, limits and separate route lookup;
+[`nft_ct_get_eval`](https://github.com/gregkh/linux/blob/v7.1.8/net/netfilter/nft_ct.c)
+classifies the absent conntrack entry as invalid.
+[`sock_alloc_send_pskb`](https://github.com/gregkh/linux/blob/v7.1.8/net/core/sock.c)
+consumes a pending socket error after a device-up transition.
+The retained packet binding and required-transform checks also exist in the
+[Linux 5.14 packet path](https://github.com/torvalds/linux/blob/v5.14/net/packet/af_packet.c)
+and [XFRM interface](https://github.com/torvalds/linux/blob/v5.14/net/xfrm/xfrm_interface.c).

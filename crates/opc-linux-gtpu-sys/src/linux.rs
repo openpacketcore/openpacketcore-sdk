@@ -280,6 +280,118 @@ fn validate_raw_ipv4_injection_option_values(hdrincl: i32, nodefrag: i32) -> io:
     Ok(())
 }
 
+pub fn open_bound_ipv4_packet_socket(ifindex: u32) -> io::Result<OwnedFd> {
+    let index = i32::try_from(ifindex)
+        .ok()
+        .filter(|index| *index > 0)
+        .ok_or_else(|| io::Error::from(io::ErrorKind::InvalidInput))?;
+    // SAFETY: these are valid Linux packet-socket constants. Protocol zero
+    // leaves reception disabled until the explicit bind below.
+    let raw_fd = unsafe {
+        libc::socket(
+            libc::AF_PACKET,
+            libc::SOCK_DGRAM | libc::SOCK_CLOEXEC | libc::SOCK_NONBLOCK,
+            0,
+        )
+    };
+    if raw_fd < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    // SAFETY: socket returned this fresh descriptor, checked above; no other
+    // owner exists, and every later error drops it through this OwnedFd.
+    let fd = unsafe { OwnedFd::from_raw_fd(raw_fd) };
+    // ETH_P_IP is needed by packet_snd for transmission but also registers
+    // packet_rcv at bind. Install a reject-all receive filter while protocol
+    // is still zero, so no inbound packet can ever enter this socket's queue.
+    let mut instruction = libc::sock_filter {
+        code: (libc::BPF_RET | libc::BPF_K) as u16,
+        jt: 0,
+        jf: 0,
+        k: 0,
+    };
+    let program = libc::sock_fprog {
+        len: 1,
+        filter: &mut instruction,
+    };
+    // SAFETY: program and its single instruction are initialized and live
+    // throughout setsockopt, which copies the filter before returning. fd
+    // owns a live socket; SO_ATTACH_FILTER expects exactly sock_fprog.
+    let result = unsafe {
+        libc::setsockopt(
+            fd.as_raw_fd(),
+            libc::SOL_SOCKET,
+            libc::SO_ATTACH_FILTER,
+            (&program as *const libc::sock_fprog).cast(),
+            mem::size_of_val(&program) as libc::socklen_t,
+        )
+    };
+    if result < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    let address = libc::sockaddr_ll {
+        sll_family: libc::AF_PACKET as libc::sa_family_t,
+        sll_protocol: (libc::ETH_P_IP as u16).to_be(),
+        sll_ifindex: index,
+        sll_hatype: 0,
+        sll_pkttype: 0,
+        sll_halen: 0,
+        sll_addr: [0; 8],
+    };
+    // SAFETY: address is fully initialized, correctly sized sockaddr_ll and
+    // fd owns a live AF_PACKET socket for the whole bind call.
+    let result = unsafe {
+        libc::bind(
+            fd.as_raw_fd(),
+            (&address as *const libc::sockaddr_ll).cast(),
+            mem::size_of_val(&address) as libc::socklen_t,
+        )
+    };
+    if result < 0 {
+        Err(io::Error::last_os_error())
+    } else {
+        Ok(fd)
+    }
+}
+
+pub fn bound_ipv4_packet_ifindex(socket: BorrowedFd<'_>) -> io::Result<u32> {
+    let mut address = libc::sockaddr_ll {
+        sll_family: 0,
+        sll_protocol: 0,
+        sll_ifindex: 0,
+        sll_hatype: 0,
+        sll_pkttype: 0,
+        sll_halen: 0,
+        sll_addr: [0; 8],
+    };
+    let mut length = mem::size_of_val(&address) as libc::socklen_t;
+    // SAFETY: address and length are initialized, writable outputs. The
+    // sockaddr_ll buffer has the capacity reported to getsockname, and the
+    // descriptor remains borrowed for the whole call.
+    let result = unsafe {
+        libc::getsockname(
+            socket.as_raw_fd(),
+            (&mut address as *mut libc::sockaddr_ll).cast(),
+            &mut length,
+        )
+    };
+    if result < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    // Linux returns offsetof(sll_addr) + the device address length, which
+    // need not equal sizeof(sockaddr_ll), including for a retired binding.
+    if length < mem::offset_of!(libc::sockaddr_ll, sll_addr) as libc::socklen_t
+        || length > mem::size_of_val(&address) as libc::socklen_t
+        || i32::from(address.sll_family) != libc::AF_PACKET
+        || address.sll_protocol != (libc::ETH_P_IP as u16).to_be()
+    {
+        return Err(io::Error::from(io::ErrorKind::InvalidData));
+    }
+    u32::try_from(address.sll_ifindex)
+        .ok()
+        .filter(|index| *index != 0)
+        .ok_or_else(|| io::Error::from(io::ErrorKind::NotFound))
+}
+
 pub fn verify_udp_fence_socket_options(socket: BorrowedFd<'_>, ipv6: bool) -> io::Result<()> {
     let (level, freebind, transparent) = if ipv6 {
         (

@@ -241,6 +241,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- `opc-gtpu-dataplane`: optional
+  `GtpuDownlinkInjector::xfrm_interface_ipv4(ifindex, if_id)` binds once to a
+  consumer-managed XFRM interface with interface-scoped policies/SAs. It
+  preserves validated IPv4 bytes, including zero Identification across
+  independent fragment outcomes, and prevents plaintext fallback of original
+  packets across missing-policy/SA, route-change and device-retirement cases.
+  Consumers must also contain ICMP errors quoting plaintext on policy/SA and
+  DF path-MTU failure; the guide provides an output rule scoped to the quoted
+  subscriber pool. A receive filter installed before bind prevents inbound
+  queueing. Missing/retired and down interfaces have named error classes.
+  Bounded link-event monitoring detects
+  replacement during construction, including identical ifindex reuse.
+  Native tests exercise both bearers, exact reassembly, options, active
+  conntrack, postrouting invalid-state drops, ICMP generation and suppression,
+  inbound receive filtering, policy/SA loss, route replacement, retired
+  bindings and the construction race. CI distinguishes a required supported
+  datapath proof
+  from an executed constructor refusal on kernels configured without XFRM
+  interfaces. The existing raw contract remains available. Refs #1085.
+
 - `opc-gtpu-dataplane`: `GtpuDownlinkInjector::raw_ipv4` injects control-port
   `Decapsulated` and `Fragmented` outcomes with `IP_HDRINCL`, `IP_NODEFRAG`,
   exact bearer marks, inner-source `IP_PKTINFO` and ordered fragment sends.
