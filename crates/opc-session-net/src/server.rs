@@ -247,15 +247,10 @@ fn connection_failure_reason(error: &ProtocolError) -> &'static str {
 }
 
 fn record_server_connection_failure(error: &ProtocolError) {
-    #[cfg(test)]
-    if matches!(
-        error,
-        ProtocolError::Io(error) if error.kind() == std::io::ErrorKind::TimedOut
-    ) {
-        crate::test_support::record_connection_timeout_failure();
-    }
     match error {
         ProtocolError::Io(error) if error.kind() == std::io::ErrorKind::TimedOut => {
+            #[cfg(test)]
+            crate::test_support::record_connection_timeout_failure();
             &METRICS.session_net_connection_failure_timeout
         }
         ProtocolError::Io(_) => &METRICS.session_net_connection_failure_transport,
@@ -4010,9 +4005,9 @@ mod tests {
             before_idle.idle_retirements + 1
         );
         assert_eq!(after_idle.timeout_failures, before_idle.timeout_failures);
-        assert!(after_idle.successes > before_idle.successes);
-        assert!(after_idle.drain_started > before_idle.drain_started);
-        assert!(after_idle.drain_completed > before_idle.drain_completed);
+        assert_eq!(after_idle.successes, before_idle.successes + 1);
+        assert_eq!(after_idle.drain_started, before_idle.drain_started + 1);
+        assert_eq!(after_idle.drain_completed, before_idle.drain_completed + 1);
         let mut acknowledgement = std::io::Cursor::new(acknowledgement);
         assert!(matches!(
             read_frame::<_, BootstrapResponse>(&mut acknowledgement, MAX_HANDSHAKE_FRAME_SIZE)
@@ -4034,7 +4029,11 @@ mod tests {
             after_partial.idle_retirements, before_partial.idle_retirements,
             "one active frame byte must preserve the slowloris timeout failure"
         );
-        assert!(after_partial.timeout_failures > before_partial.timeout_failures);
+        assert_eq!(
+            after_partial.timeout_failures,
+            before_partial.timeout_failures + 1
+        );
+        assert_eq!(after_partial.successes, before_partial.successes);
 
         let before_handshake = connection_outcome_metrics();
         let reauthentication = SessionReauthenticationControl::new();
@@ -4064,7 +4063,11 @@ mod tests {
             after_handshake.idle_retirements,
             before_handshake.idle_retirements
         );
-        assert!(after_handshake.timeout_failures > before_handshake.timeout_failures);
+        assert_eq!(
+            after_handshake.timeout_failures,
+            before_handshake.timeout_failures + 1
+        );
+        assert_eq!(after_handshake.successes, before_handshake.successes);
     }
 
     #[tokio::test]

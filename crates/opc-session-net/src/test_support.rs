@@ -9,7 +9,7 @@ pub(crate) static SESSION_CONNECTION_METRICS_TEST_LOCK: std::sync::LazyLock<
     tokio::sync::Mutex<()>,
 > = std::sync::LazyLock::new(|| tokio::sync::Mutex::new(()));
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub(crate) struct ConnectionOutcomeMetricSnapshot {
     pub(crate) idle_retirements: u64,
     pub(crate) timeout_failures: u64,

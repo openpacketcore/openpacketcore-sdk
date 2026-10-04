@@ -1292,6 +1292,10 @@ pub(crate) fn material_status_matches_admission(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_support::{
+        ConnectionOutcomeMetricSnapshot, ConnectionOutcomeTestAccounting,
+        CONNECTION_OUTCOME_TEST_ACCOUNTING,
+    };
 
     fn policy() -> ConnectionLifecyclePolicy {
         ConnectionLifecyclePolicy::try_new(
@@ -1644,6 +1648,134 @@ mod tests {
             .hard_overrun_recorded
             .load(Ordering::Acquire));
         assert!(Arc::ptr_eq(&lifecycle.metrics, &sibling.metrics));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn connection_outcome_accounting_preserves_origin_across_concurrent_handoffs() {
+        let accounting = Arc::new(ConnectionOutcomeTestAccounting::default());
+        let other_accounting = Arc::new(ConnectionOutcomeTestAccounting::default());
+        let lifecycle = CONNECTION_OUTCOME_TEST_ACCOUNTING
+            .scope(Arc::clone(&accounting), async {
+                ConnectionLifecycle::new(policy(), tokio::time::Instant::now(), None, None, 0, None)
+                    .expect("scoped lifecycle")
+            })
+            .await;
+
+        // Both observers retire the same connection after its creating scope
+        // has exited. Their own scope must not receive the connection's events.
+        let start = Arc::new(tokio::sync::Barrier::new(2));
+        let mut observers = Vec::new();
+        for _ in 0..2 {
+            let lifecycle = lifecycle.clone();
+            let start = Arc::clone(&start);
+            observers.push(tokio::spawn(CONNECTION_OUTCOME_TEST_ACCOUNTING.scope(
+                Arc::clone(&other_accounting),
+                async move {
+                    start.wait().await;
+                    lifecycle.record_forced_retirement(RetirementReason::IdleTimeout);
+                    lifecycle.record_forced_retirement(RetirementReason::IdleTimeout);
+                },
+            )));
+        }
+        for observer in observers {
+            observer.await.expect("retirement observer");
+        }
+
+        let draining = ConnectionOutcomeMetricSnapshot {
+            idle_retirements: 1,
+            drain_started: 1,
+            ..ConnectionOutcomeMetricSnapshot::default()
+        };
+        assert_eq!(accounting.snapshot(), draining);
+        assert_eq!(
+            other_accounting.snapshot(),
+            ConnectionOutcomeMetricSnapshot::default()
+        );
+
+        // Completion belongs to the original scope and waits for the final
+        // owner, even when that owner is dropped in a task with no scope.
+        tokio::spawn(async move { drop(lifecycle) })
+            .await
+            .expect("final lifecycle owner");
+        assert_eq!(
+            accounting.snapshot(),
+            ConnectionOutcomeMetricSnapshot {
+                drain_completed: 1,
+                ..draining
+            }
+        );
+
+        // Entering a scope later must not adopt an unrelated connection.
+        let unscoped =
+            ConnectionLifecycle::new(policy(), tokio::time::Instant::now(), None, None, 0, None)
+                .expect("unscoped lifecycle");
+        CONNECTION_OUTCOME_TEST_ACCOUNTING
+            .scope(Arc::clone(&other_accounting), async move {
+                unscoped.record_forced_retirement(RetirementReason::IdleTimeout);
+                drop(unscoped);
+            })
+            .await;
+        assert_eq!(
+            other_accounting.snapshot(),
+            ConnectionOutcomeMetricSnapshot::default()
+        );
+    }
+
+    #[tokio::test]
+    async fn connection_outcome_accounting_survives_task_cancellation() {
+        for retire in [false, true] {
+            let accounting = Arc::new(ConnectionOutcomeTestAccounting::default());
+            let other_accounting = Arc::new(ConnectionOutcomeTestAccounting::default());
+            let lifecycle = CONNECTION_OUTCOME_TEST_ACCOUNTING
+                .scope(Arc::clone(&accounting), async {
+                    ConnectionLifecycle::new(
+                        policy(),
+                        tokio::time::Instant::now(),
+                        None,
+                        None,
+                        0,
+                        None,
+                    )
+                    .expect("scoped lifecycle")
+                })
+                .await;
+            let (ready_tx, ready_rx) = tokio::sync::oneshot::channel();
+            let owner = tokio::spawn(CONNECTION_OUTCOME_TEST_ACCOUNTING.scope(
+                Arc::clone(&other_accounting),
+                async move {
+                    if retire {
+                        lifecycle.record_forced_retirement(RetirementReason::IdleTimeout);
+                    }
+                    ready_tx.send(()).expect("report lifecycle ownership");
+                    std::future::pending::<()>().await;
+                    drop(lifecycle);
+                },
+            ));
+            ready_rx.await.expect("lifecycle owner is ready");
+            let before_drop = ConnectionOutcomeMetricSnapshot {
+                idle_retirements: u64::from(retire),
+                drain_started: u64::from(retire),
+                ..ConnectionOutcomeMetricSnapshot::default()
+            };
+            assert_eq!(accounting.snapshot(), before_drop);
+
+            owner.abort();
+            assert!(owner
+                .await
+                .expect_err("owner must be cancelled")
+                .is_cancelled());
+            assert_eq!(
+                accounting.snapshot(),
+                ConnectionOutcomeMetricSnapshot {
+                    drain_completed: u64::from(retire),
+                    ..before_drop
+                }
+            );
+            assert_eq!(
+                other_accounting.snapshot(),
+                ConnectionOutcomeMetricSnapshot::default()
+            );
+        }
     }
 
     #[test]
