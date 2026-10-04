@@ -138,3 +138,22 @@ an SCTP-terminating CNF is in scope:
   path, and exposes typed capability and kernel-active-address evidence.
 - NGAP-over-SCTP wiring (PPID 60) is separate integration work and is not
   authorized to use FFI for the NGAP codec itself.
+
+## Receive ownership amendment — 2026-09-17
+
+The safe wrapper owns partial DATA at the socket boundary so cancellation or an
+interleaved notification cannot return a tail as a fresh record. The async
+scratch gate still serializes kernel reads. A separate synchronous mutex owns
+the accumulator and terminal flag; it is held only around bounded assembly,
+never across I/O or an await. Close clears partial data under that same mutex,
+including while a receive is suspended. No cancellation cleanup guard or
+background receive task is required.
+
+Known non-lifecycle notifications preserve the partial record. Matching
+association change/shutdown invalidates it; an ambiguous event while partial
+DATA exists fails closed. Complete ancillary record identity must remain
+consistent, with ordered SSN checked and unordered SSN/TSN progress treated per
+RFC 4960. This changes the documented cancellation contract without adding FFI,
+dependencies or NGAP policy. The [conformance scope](../../crates/opc-sctp/CONFORMANCE.md)
+separates this reliability slice from the remaining typed N2 generation,
+stream-reset, bounded restart and protection boundaries tracked by #788.

@@ -45,6 +45,8 @@
 //! TLS/TCP. External IPsec configuration and attestation remain product-owned;
 //! an explicitly unprotected peer policy never satisfies protected readiness.
 
+pub mod rfc6083;
+
 use std::collections::VecDeque;
 use std::fmt;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -250,25 +252,29 @@ impl fmt::Debug for SctpUserMessage {
 pub(crate) trait SctpTransportClose: Send + Sync {
     /// Close the transport and interrupt in-flight operations.
     fn close(&self);
+
+    /// Whether the sealed carrier has observed a terminal transition.
+    fn is_closed(&self) -> bool;
 }
 
 /// Message-oriented SCTP seam between the DTLS association and a transport.
 ///
 /// The send side deliberately accepts only complete DTLS records: the
-/// implementation emits each record as its own ordered SCTP user message on
-/// stream 0 with PPID 47 (RFC 6083 sections 4.1 and 4.4). This keeps
-/// "PPID 47 only through an actual DTLS/SCTP association" and the
-/// one-record-per-message rule structural properties rather than caller
-/// discipline. The RFC 6083 engine profile disables its datagram replay
-/// window and relies on SCTP's reliable, ordered transport; this seam requires
-/// ordered stream-0 delivery for every record. The receive side surfaces every
-/// user message with its PPID so the association can fail closed on any
-/// cleartext input.
+/// implementation emits each record as its own ordered SCTP user message with
+/// the immutable protected PPID (RFC 6083 sections 4.1 and 4.4). Control records
+/// use stream zero; the generic policy can admit a bounded application stream
+/// range. The RFC 6083 engine disables its datagram replay window and relies
+/// on SCTP's reliable per-stream ordering and DATA authentication. Receive
+/// metadata retains the exact stream and PPID; decrypted record identities,
+/// rather than receive order, determine each application's stream.
 mod sctp_io_sealed {
     pub trait Sealed {}
 }
 
 pub(crate) trait SctpMessageIo: sctp_io_sealed::Sealed + Send {
+    /// Immutable protected PPID selected by the sealed transport constructor.
+    fn protected_ppid(&self) -> u32;
+
     /// Irreversibly bind a pristine association to the direct-DTLS sequence.
     ///
     /// Implementations must reject this transition after any cleartext DATA or
@@ -299,8 +305,24 @@ pub(crate) trait SctpMessageIo: sctp_io_sealed::Sealed + Send {
     /// same association.
     fn seal_inband_cleartext(&mut self) -> Result<(), DiameterTlsError>;
 
-    /// Emit one complete DTLS record as one ordered PPID-47 stream-0 message.
+    /// Emit one complete DTLS record on ordered stream zero with the sealed PPID.
     fn send_dtls_record<'a>(&'a mut self, record: &'a [u8]) -> FrameTransportFuture<'a, ()>;
+
+    /// Emit one record on a selected reliable ordered application stream.
+    /// Control records always require stream zero. The default seam retains
+    /// the original stream-zero-only behavior.
+    fn send_dtls_record_on_stream<'a>(
+        &'a mut self,
+        record: &'a [u8],
+        stream_id: u16,
+    ) -> FrameTransportFuture<'a, ()> {
+        Box::pin(async move {
+            if stream_id != 0 {
+                return Err(DiameterTlsError::Transport);
+            }
+            self.send_dtls_record(record).await
+        })
+    }
 
     /// Receive the next SCTP user message, or `None` once the transport is
     /// cleanly closed and drained.
@@ -410,6 +432,8 @@ pub struct SctpWireRecord {
     pub a_to_b: bool,
     /// Payload protocol identifier of the emitted SCTP user message.
     pub ppid: u32,
+    /// Stream selected on the synthetic authenticated carrier.
+    pub stream_id: u16,
     /// Emitted payload length in bytes.
     pub payload_bytes: usize,
     /// SCTP-AUTH key identifier active when the message was submitted.
@@ -454,6 +478,20 @@ impl SctpWireLog {
             self.shared.notify.notify_waiters();
         }
     }
+
+    /// Replace only the metadata of the next genuine DTLS emission. The
+    /// encrypted record remains untouched, so rejection cannot be attributed
+    /// to a malformed synthetic handshake or application payload.
+    pub(crate) fn set_next_dtls_metadata(&self, a_to_b: bool, metadata: SctpUserMessage) {
+        let direction = if a_to_b {
+            &self.shared.next_a_to_b_metadata
+        } else {
+            &self.shared.next_b_to_a_metadata
+        };
+        let mut slot = direction.lock().expect("private metadata fault lock");
+        assert!(slot.is_none(), "one pending metadata fault per direction");
+        *slot = Some(metadata);
+    }
 }
 
 #[cfg(test)]
@@ -478,6 +516,8 @@ struct InMemoryShared {
     closed: AtomicBool,
     block_a_to_b_dtls: AtomicBool,
     block_b_to_a_dtls: AtomicBool,
+    next_a_to_b_metadata: Mutex<Option<SctpUserMessage>>,
+    next_b_to_a_metadata: Mutex<Option<SctpUserMessage>>,
     notify: Notify,
     log: Arc<Mutex<Vec<SctpWireRecord>>>,
 }
@@ -499,6 +539,10 @@ impl SctpTransportClose for InMemoryClose {
         self.shared.closed.store(true, Ordering::Release);
         self.shared.notify.notify_waiters();
     }
+
+    fn is_closed(&self) -> bool {
+        self.shared.closed.load(Ordering::Acquire)
+    }
 }
 
 /// Deterministic in-memory SCTP message endpoint for tests and simulations.
@@ -509,6 +553,8 @@ impl SctpTransportClose for InMemoryClose {
 /// multihoming or path semantics.
 #[cfg(test)]
 pub struct InMemorySctpEndpoint {
+    buffered_receive: VecDeque<SctpUserMessage>,
+    protected_ppid: u32,
     tx: mpsc::Sender<SctpUserMessage>,
     rx: mpsc::Receiver<SctpUserMessage>,
     a_side: bool,
@@ -591,14 +637,16 @@ impl InMemorySctpInjector {
         ppid: u32,
         payload: Bytes,
     ) -> Result<(), DiameterTlsError> {
-        emit_logged(
-            &self.tx,
-            &self.shared,
-            self.a_side,
-            0,
-            SctpUserMessage::ordered_record(payload, ppid),
-        )
-        .await
+        self.send_message(SctpUserMessage::ordered_record(payload, ppid))
+            .await
+    }
+
+    /// Inject arbitrary synthetic receive metadata for boundary rejection tests.
+    pub(crate) async fn send_message(
+        &self,
+        message: SctpUserMessage,
+    ) -> Result<(), DiameterTlsError> {
+        emit_logged(&self.tx, &self.shared, self.a_side, 0, message).await
     }
 }
 
@@ -617,9 +665,10 @@ async fn emit_logged(
         log.push(SctpWireRecord {
             a_to_b: a_side,
             ppid: message.ppid(),
+            stream_id: message.stream_id(),
             payload_bytes: message.payload().len(),
             auth_key_id,
-            record_header: (message.ppid() == DIAMETER_DTLS_SCTP_PPID
+            record_header: (matches!(message.ppid(), DIAMETER_DTLS_SCTP_PPID | 66)
                 && message.payload().len() >= DTLS_RECORD_HEADER_BYTES)
                 .then(|| {
                     let mut header = [0_u8; DTLS_RECORD_HEADER_BYTES];
@@ -638,6 +687,10 @@ impl sctp_io_sealed::Sealed for InMemorySctpEndpoint {}
 
 #[cfg(test)]
 impl SctpMessageIo for InMemorySctpEndpoint {
+    fn protected_ppid(&self) -> u32 {
+        self.protected_ppid
+    }
+
     fn begin_direct_dtls(&mut self) -> Result<(), DiameterTlsError> {
         if self.active_auth_key.is_some()
             || self.pending_auth_key.is_some()
@@ -715,15 +768,35 @@ impl SctpMessageIo for InMemorySctpEndpoint {
     }
 
     fn send_dtls_record<'a>(&'a mut self, record: &'a [u8]) -> FrameTransportFuture<'a, ()> {
+        self.send_dtls_record_on_stream(record, 0)
+    }
+
+    fn send_dtls_record_on_stream<'a>(
+        &'a mut self,
+        record: &'a [u8],
+        stream_id: u16,
+    ) -> FrameTransportFuture<'a, ()> {
         Box::pin(async move {
             self.phase.ensure_dtls()?;
-            validate_outbound_dtls_record(record)?;
+            validate_outbound_dtls_stream(record, stream_id)?;
             self.wait_for_dtls_send().await?;
-            self.emit(SctpUserMessage::ordered_record(
-                Bytes::copy_from_slice(record),
-                DIAMETER_DTLS_SCTP_PPID,
-            ))
-            .await
+            let direction = if self.a_side {
+                &self.shared.next_a_to_b_metadata
+            } else {
+                &self.shared.next_b_to_a_metadata
+            };
+            let mut message = direction
+                .lock()
+                .expect("private metadata fault lock")
+                .take()
+                .unwrap_or_else(|| {
+                    let mut message =
+                        SctpUserMessage::ordered_record(Bytes::new(), self.protected_ppid);
+                    message.stream_id = stream_id;
+                    message
+                });
+            message.payload = Bytes::copy_from_slice(record);
+            self.emit(message).await
         })
     }
 
@@ -731,6 +804,9 @@ impl SctpMessageIo for InMemorySctpEndpoint {
         Box::pin(async move {
             self.phase.ensure_dtls()?;
             loop {
+                if let Some(message) = self.buffered_receive.pop_front() {
+                    return Ok(Some(message));
+                }
                 if self.shared.closed.load(Ordering::Acquire) && self.rx.is_empty() {
                     return Ok(None);
                 }
@@ -740,7 +816,20 @@ impl SctpMessageIo for InMemorySctpEndpoint {
                             return Ok(None);
                         }
                     }
-                    message = self.rx.recv() => return Ok(message),
+                    message = self.rx.recv() => {
+                        let Some(message) = message else { return Ok(None) };
+                        if requires_receive_drain(message.payload()) {
+                            while let Ok(buffered) = self.rx.try_recv() {
+                                if self.buffered_receive.len() >= self.rx.max_capacity() {
+                                    return Err(DiameterTlsError::Transport);
+                                }
+                                self.buffered_receive.push_back(buffered);
+                            }
+                            self.buffered_receive.push_back(message);
+                        } else {
+                            return Ok(Some(message));
+                        }
+                    },
                 }
             }
         })
@@ -834,6 +923,8 @@ pub fn in_memory_sctp_link(
         closed: AtomicBool::new(false),
         block_a_to_b_dtls: AtomicBool::new(false),
         block_b_to_a_dtls: AtomicBool::new(false),
+        next_a_to_b_metadata: Mutex::new(None),
+        next_b_to_a_metadata: Mutex::new(None),
         notify: Notify::new(),
         log: Arc::new(Mutex::new(Vec::new())),
     });
@@ -843,6 +934,7 @@ pub fn in_memory_sctp_link(
     };
     (
         InMemorySctpEndpoint {
+            buffered_receive: VecDeque::new(),
             tx: a_tx,
             rx: a_rx,
             a_side: true,
@@ -851,8 +943,10 @@ pub fn in_memory_sctp_link(
             pending_auth_key: None,
             previous_auth_key: None,
             phase: SctpIoPhase::Fresh,
+            protected_ppid: DIAMETER_DTLS_SCTP_PPID,
         },
         InMemorySctpEndpoint {
+            buffered_receive: VecDeque::new(),
             tx: b_tx,
             rx: b_rx,
             a_side: false,
@@ -861,6 +955,7 @@ pub fn in_memory_sctp_link(
             pending_auth_key: None,
             previous_auth_key: None,
             phase: SctpIoPhase::Fresh,
+            protected_ppid: DIAMETER_DTLS_SCTP_PPID,
         },
         log,
     )
@@ -868,11 +963,17 @@ pub fn in_memory_sctp_link(
 
 struct KernelSctpClose {
     abort: SctpAssociationAbortHandle,
+    terminal: Arc<AtomicBool>,
 }
 
 impl SctpTransportClose for KernelSctpClose {
     fn close(&self) {
+        self.terminal.store(true, Ordering::Release);
         self.abort.abort();
+    }
+
+    fn is_closed(&self) -> bool {
+        self.terminal.load(Ordering::Acquire)
     }
 }
 
@@ -884,6 +985,8 @@ impl SctpTransportClose for KernelSctpClose {
 /// drains SCTP notifications so sender-dry and SCTP-AUTH lifecycle operations
 /// cannot deadlock behind user DATA.
 pub struct KernelSctpMessageIo {
+    protected_ppid: u32,
+    terminal: Arc<AtomicBool>,
     send: SctpAssociationSendHalf,
     inbound: mpsc::Receiver<Result<SctpUserMessage, DiameterTlsError>>,
     abort: SctpAssociationAbortHandle,
@@ -903,6 +1006,14 @@ impl KernelSctpMessageIo {
     pub fn new(
         association: SctpAssociation,
         receive_queue_capacity: usize,
+    ) -> Result<Self, DiameterTlsError> {
+        Self::with_protected_ppid(association, receive_queue_capacity, DIAMETER_DTLS_SCTP_PPID)
+    }
+
+    fn with_protected_ppid(
+        association: SctpAssociation,
+        receive_queue_capacity: usize,
+        protected_ppid: u32,
     ) -> Result<Self, DiameterTlsError> {
         if let Err(error) = validate_kernel_receive_queue_capacity(receive_queue_capacity) {
             association.abort_handle().abort();
@@ -926,57 +1037,49 @@ impl KernelSctpMessageIo {
         let (send, mut receive) = association.into_split();
         let (inbound_tx, inbound) = mpsc::channel(receive_queue_capacity);
         let task_abort = abort.clone();
+        let terminal = Arc::new(AtomicBool::new(false));
+        let task_terminal = Arc::clone(&terminal);
         let receive_task = runtime.spawn(async move {
-            loop {
-                let received = match receive.recv().await {
-                    Ok(received) => received,
-                    Err(_) => {
-                        let _ = inbound_tx.try_send(Err(DiameterTlsError::Transport));
-                        break;
-                    }
-                };
-                if received.notification {
-                    match received.event {
-                        Some(opc_sctp::SctpEvent::Shutdown { .. })
-                        | Some(opc_sctp::SctpEvent::Unknown { .. })
-                        | None => {
-                            let _ = inbound_tx.try_send(Err(DiameterTlsError::Transport));
-                            break;
-                        }
-                        Some(opc_sctp::SctpEvent::AssociationChange {
-                            state: 0, error: 0, ..
-                        })
-                        | Some(
-                            opc_sctp::SctpEvent::PeerAddrChange { .. }
-                            | opc_sctp::SctpEvent::SenderDry { .. }
-                            | opc_sctp::SctpEvent::Authentication { .. },
-                        ) => continue,
-                        Some(opc_sctp::SctpEvent::AssociationChange { .. }) => {
-                            let _ = inbound_tx.try_send(Err(DiameterTlsError::Transport));
-                            break;
+            let result: Result<(), DiameterTlsError> = async {
+                loop {
+                    let received = receive
+                        .recv()
+                        .await
+                        .map_err(|_| DiameterTlsError::Transport)?;
+                    let mut messages = VecDeque::new();
+                    if !received.notification && requires_receive_drain(&received.payload) {
+                        // RFC 6083 section 4.7: observing a CCS on stream zero
+                        // does not prove the other streams have been read. Drain
+                        // the real socket to EAGAIN before publishing this CCS.
+                        // New-epoch ciphertext can overtake Finished and remains
+                        // buffered in DTLS until that epoch is authenticated.
+                        while let Some(buffered) = receive
+                            .recv_buffered()
+                            .await
+                            .map_err(|_| DiameterTlsError::Transport)?
+                        {
+                            if messages.len() >= receive_queue_capacity {
+                                return Err(DiameterTlsError::Transport);
+                            }
+                            messages.push_back(buffered);
                         }
                     }
-                }
-                let order = match received.order {
-                    DeliveryOrder::Ordered => SctpDeliveryOrder::Ordered,
-                    DeliveryOrder::Unordered => SctpDeliveryOrder::Unordered,
-                };
-                let message = SctpUserMessage::new(
-                    received.payload,
-                    received.ppid.get(),
-                    received.stream_id,
-                    order,
-                    received.truncated,
-                    received.control_truncated,
-                    false,
-                );
-                // Never await a full DATA queue: doing so would stop the only
-                // kernel receiver from dispatching sender-dry and SCTP-AUTH
-                // notifications. Capacity exhaustion is terminal and bounded.
-                if inbound_tx.try_send(Ok(message)).is_err() {
-                    break;
+                    messages.push_back(received);
+                    for received in messages {
+                        if let Some(message) = kernel_dtls_message(received)? {
+                            // Never block notification processing behind DATA.
+                            inbound_tx
+                                .try_send(Ok(message))
+                                .map_err(|_| DiameterTlsError::Transport)?;
+                        }
+                    }
                 }
             }
+            .await;
+            if let Err(error) = result {
+                let _ = inbound_tx.try_send(Err(error));
+            }
+            task_terminal.store(true, Ordering::Release);
             task_abort.abort();
         });
         Ok(Self {
@@ -988,6 +1091,8 @@ impl KernelSctpMessageIo {
             pending_auth_key: None,
             previous_auth_key: None,
             phase: SctpIoPhase::Fresh,
+            protected_ppid,
+            terminal,
         })
     }
 
@@ -998,6 +1103,41 @@ impl KernelSctpMessageIo {
         }
         Ok(deadline.saturating_duration_since(now))
     }
+}
+
+fn requires_receive_drain(payload: &[u8]) -> bool {
+    matches!(payload.first().copied(), Some(20 | 21))
+}
+
+fn kernel_dtls_message(
+    received: opc_sctp::InboundMessage,
+) -> Result<Option<SctpUserMessage>, DiameterTlsError> {
+    if received.notification {
+        return match received.event {
+            Some(opc_sctp::SctpEvent::AssociationChange {
+                state: 0, error: 0, ..
+            })
+            | Some(
+                opc_sctp::SctpEvent::PeerAddrChange { .. }
+                | opc_sctp::SctpEvent::SenderDry { .. }
+                | opc_sctp::SctpEvent::Authentication { .. },
+            ) => Ok(None),
+            _ => Err(DiameterTlsError::Transport),
+        };
+    }
+    let order = match received.order {
+        DeliveryOrder::Ordered => SctpDeliveryOrder::Ordered,
+        DeliveryOrder::Unordered => SctpDeliveryOrder::Unordered,
+    };
+    Ok(Some(SctpUserMessage::new(
+        received.payload,
+        received.ppid.get(),
+        received.stream_id,
+        order,
+        received.truncated,
+        received.control_truncated,
+        false,
+    )))
 }
 
 fn validate_kernel_receive_queue_capacity(capacity: usize) -> Result<(), DiameterTlsError> {
@@ -1013,6 +1153,10 @@ fn validate_kernel_receive_queue_capacity(capacity: usize) -> Result<(), Diamete
 impl sctp_io_sealed::Sealed for KernelSctpMessageIo {}
 
 impl SctpMessageIo for KernelSctpMessageIo {
+    fn protected_ppid(&self) -> u32 {
+        self.protected_ppid
+    }
+
     fn begin_direct_dtls(&mut self) -> Result<(), DiameterTlsError> {
         if self.active_auth_key.is_some()
             || self.pending_auth_key.is_some()
@@ -1091,15 +1235,23 @@ impl SctpMessageIo for KernelSctpMessageIo {
     }
 
     fn send_dtls_record<'a>(&'a mut self, record: &'a [u8]) -> FrameTransportFuture<'a, ()> {
+        self.send_dtls_record_on_stream(record, 0)
+    }
+
+    fn send_dtls_record_on_stream<'a>(
+        &'a mut self,
+        record: &'a [u8],
+        stream_id: u16,
+    ) -> FrameTransportFuture<'a, ()> {
         Box::pin(async move {
             self.phase.ensure_dtls()?;
-            validate_outbound_dtls_record(record)?;
+            validate_outbound_dtls_stream(record, stream_id)?;
             let sent = self
                 .send
                 .send(OutboundMessage::ordered(
                     Bytes::copy_from_slice(record),
-                    DIAMETER_DTLS_SCTP_STREAM,
-                    PayloadProtocolIdentifier::new(DIAMETER_DTLS_SCTP_PPID),
+                    stream_id,
+                    PayloadProtocolIdentifier::new(self.protected_ppid),
                 ))
                 .await
                 .map_err(|_| DiameterTlsError::Transport)?;
@@ -1226,12 +1378,14 @@ impl SctpMessageIo for KernelSctpMessageIo {
     fn close_handle(&self) -> Arc<dyn SctpTransportClose> {
         Arc::new(KernelSctpClose {
             abort: self.abort.clone(),
+            terminal: Arc::clone(&self.terminal),
         })
     }
 }
 
 impl Drop for KernelSctpMessageIo {
     fn drop(&mut self) {
+        self.terminal.store(true, Ordering::Release);
         self.abort.abort();
         self.receive_task.abort();
     }
@@ -1643,9 +1797,12 @@ enum PeerUsage {
 }
 
 struct HandshakeValidation {
-    expected_peer: ExpectedPeerIdentity,
+    expected_peer: opc_types::SpiffeId,
     trust_bundles: TrustBundleSet,
     usage: PeerUsage,
+    revocation: Option<Arc<rfc6083::revocation::Snapshot>>,
+    server_name: Option<rfc6083::ServerName>,
+    certificate_profile: Option<rfc6083::CertificateProfile>,
 }
 
 fn certificate_expiry(der: &[u8]) -> Result<Timestamp, DiameterTlsError> {
@@ -1701,7 +1858,7 @@ fn validate_peer_certificate_chain(
     }
     let peer_spiffe = opc_identity::extract_spiffe_id_from_cert_der(leaf)
         .map_err(|_| DiameterTlsError::Authentication)?;
-    if peer_spiffe != *validation.expected_peer.spiffe_id() {
+    if peer_spiffe != validation.expected_peer {
         return Err(DiameterTlsError::PeerIdentityMismatch);
     }
     // Anchors are scoped to the peer leaf's SPIFFE trust domain, mirroring
@@ -1739,17 +1896,46 @@ fn validate_peer_certificate_chain(
         PeerUsage::Client => webpki::KeyUsage::client_auth(),
     };
     let provider = tokio_rustls::rustls::crypto::ring::default_provider();
-    end_entity
+    if validation.revocation.as_ref().is_some_and(|v| !v.current()) {
+        return Err(DiameterTlsError::Authentication);
+    }
+    let crls = validation.revocation.as_ref().map(|v| v.lists());
+    let revocation = crls
+        .as_ref()
+        .map(|lists| {
+            webpki::RevocationOptionsBuilder::new(lists)
+                .map(|v| {
+                    v.with_depth(webpki::RevocationCheckDepth::Chain)
+                        .with_status_policy(webpki::UnknownStatusPolicy::Deny)
+                        .with_expiration_policy(webpki::ExpirationPolicy::Enforce)
+                        .build()
+                })
+                .map_err(|_| DiameterTlsError::Authentication)
+        })
+        .transpose()?;
+    let path = end_entity
         .verify_for_usage(
             provider.signature_verification_algorithms.all,
             &anchors,
             &intermediates,
             rustls_pki_types::UnixTime::since_unix_epoch(since_epoch),
             usage,
-            None,
+            revocation,
             None,
         )
         .map_err(|_| DiameterTlsError::Authentication)?;
+    if let Some(revocation) = &validation.revocation {
+        revocation.verify_identifiers(&path, &bundle.certificates)?;
+    }
+    if let Some(profile) = validation.certificate_profile {
+        if validation.revocation.is_none() {
+            return Err(DiameterTlsError::Authentication);
+        }
+        expiry = expiry.min(profile.verify(&path, &bundle.certificates, validation.usage)?);
+    }
+    if let Some(name) = &validation.server_name {
+        name.verify_certificate(leaf)?;
+    }
     Ok(expiry)
 }
 
@@ -1757,9 +1943,15 @@ fn validate_peer_certificate_chain(
 struct PumpState {
     connected: bool,
     peer_certificate_expires_at: Option<Timestamp>,
-    inbound: VecDeque<Bytes>,
+    inbound: VecDeque<ReceivedApplication>,
+    streams: rfc6083::streams::RecordStreams,
     peer_closed: bool,
     outbound: Vec<Bytes>,
+}
+
+struct ReceivedApplication {
+    payload: Bytes,
+    stream_id: u16,
 }
 
 enum EnginePoll {
@@ -1792,7 +1984,8 @@ fn poll_engine(
     buffer: &mut Vec<u8>,
 ) -> Result<EnginePoll, DiameterTlsError> {
     loop {
-        match engine.poll_output(buffer) {
+        let (output, record) = engine.poll_output_with_record(buffer);
+        match output {
             dimpl::Output::Packet(packet) => state.outbound.push(Bytes::copy_from_slice(packet)),
             dimpl::Output::BufferTooSmall { needed } => {
                 grow_engine_poll_buffer(buffer, needed)?;
@@ -1819,7 +2012,11 @@ fn poll_engine(
                 if !state.connected {
                     return Err(DiameterTlsError::CleartextInput);
                 }
-                state.inbound.push_back(Bytes::copy_from_slice(plaintext));
+                let stream_id = state.streams.take(record, state.inbound.len())?;
+                state.inbound.push_back(ReceivedApplication {
+                    payload: Bytes::copy_from_slice(plaintext),
+                    stream_id,
+                });
             }
             dimpl::Output::Rfc6083KeyingMaterial(material) => {
                 return Ok(EnginePoll::InstallEpochKey(material));
@@ -1912,11 +2109,27 @@ pub fn parse_dtls_record_bounds(frame: &[u8]) -> Option<DtlsRecordBounds> {
     }
 }
 
+#[cfg(test)]
 fn validate_received_dtls_record(message: &SctpUserMessage) -> Result<&[u8], DiameterTlsError> {
-    if message.ppid() != DIAMETER_DTLS_SCTP_PPID {
+    validate_received_record_for(message, DIAMETER_DTLS_SCTP_PPID)
+}
+
+fn validate_received_record_for(
+    message: &SctpUserMessage,
+    protected_ppid: u32,
+) -> Result<&[u8], DiameterTlsError> {
+    validate_received_record_on_streams(message, protected_ppid, 1)
+}
+
+fn validate_received_record_on_streams(
+    message: &SctpUserMessage,
+    protected_ppid: u32,
+    stream_count: u16,
+) -> Result<&[u8], DiameterTlsError> {
+    if message.ppid() != protected_ppid {
         return Err(DiameterTlsError::CleartextInput);
     }
-    if message.stream_id() != DIAMETER_DTLS_SCTP_STREAM
+    if message.stream_id() >= stream_count
         || message.order() != SctpDeliveryOrder::Ordered
         || message.truncated()
         || message.control_truncated()
@@ -1926,10 +2139,43 @@ fn validate_received_dtls_record(message: &SctpUserMessage) -> Result<&[u8], Dia
         return Err(DiameterTlsError::Transport);
     }
     let bounds = parse_dtls_record_bounds(message.payload()).ok_or(DiameterTlsError::Transport)?;
-    if bounds.record_bytes != message.payload().len() {
+    if bounds.record_bytes != message.payload().len()
+        || (message.stream_id() != 0 && (bounds.content_type != Some(23) || bounds.epoch == 0))
+        // This opt-in profile uses DTLS 1.2 record identities. Initial
+        // handshakes may use the DTLS 1.0 compatibility version, but protected
+        // records must carry the negotiated DTLS 1.2 version on the wire.
+        || (stream_count > 1
+            && (bounds.unified
+                || (bounds.epoch != 0
+                    && message.payload().get(1..3) != Some(&[0xfe, 0xfd][..]))))
+    {
         return Err(DiameterTlsError::Transport);
     }
     Ok(message.payload())
+}
+
+fn handle_received_record(
+    engine: &mut dimpl::Dtls,
+    state: &mut PumpState,
+    message: &SctpUserMessage,
+    protected_ppid: u32,
+    packet_error: DiameterTlsError,
+) -> Result<(), DiameterTlsError> {
+    let record =
+        validate_received_record_on_streams(message, protected_ppid, state.streams.count())?;
+    state.streams.remember(message)?;
+    engine.handle_packet(record).map_err(|_| packet_error)
+}
+
+fn validate_outbound_dtls_stream(record: &[u8], stream_id: u16) -> Result<(), DiameterTlsError> {
+    validate_outbound_dtls_record(record)?;
+    if stream_id != 0 {
+        let bounds = parse_dtls_record_bounds(record).ok_or(DiameterTlsError::Transport)?;
+        if bounds.content_type != Some(23) || bounds.epoch == 0 {
+            return Err(DiameterTlsError::Transport);
+        }
+    }
+    Ok(())
 }
 
 fn validate_outbound_dtls_record(record: &[u8]) -> Result<(), DiameterTlsError> {
@@ -1970,7 +2216,13 @@ async fn flush_outbound(
     let datagrams = std::mem::take(&mut state.outbound);
     for datagram in datagrams {
         for record in split_dtls_records(&datagram)? {
-            io.send_dtls_record(record).await?;
+            let bounds = parse_dtls_record_bounds(record).ok_or(DiameterTlsError::Transport)?;
+            let stream_id = if bounds.content_type == Some(23) {
+                state.streams.outbound
+            } else {
+                0
+            };
+            io.send_dtls_record_on_stream(record, stream_id).await?;
         }
     }
     Ok(())
@@ -2015,14 +2267,66 @@ async fn run_handshake(
     validation: &HandshakeValidation,
     deadline: Instant,
 ) -> Result<(DtlsSctpVersion, DtlsSctpCipher, Timestamp), DiameterTlsError> {
+    let completed = run_transport_handshake(engine, io, validation, deadline).await?;
+    Ok((
+        completed.version,
+        completed.cipher,
+        completed.peer_expires_at,
+    ))
+}
+
+struct CompletedHandshake {
+    version: DtlsSctpVersion,
+    cipher: DtlsSctpCipher,
+    peer_expires_at: Timestamp,
+    state: PumpState,
+    buffer: Vec<u8>,
+}
+
+async fn run_transport_handshake(
+    engine: &mut dimpl::Dtls,
+    io: &mut Box<dyn SctpMessageIo>,
+    validation: &HandshakeValidation,
+    deadline: Instant,
+) -> Result<CompletedHandshake, DiameterTlsError> {
+    run_transport_handshake_with_streams(engine, io, validation, deadline, Default::default()).await
+}
+
+async fn run_transport_handshake_with_streams(
+    engine: &mut dimpl::Dtls,
+    io: &mut Box<dyn SctpMessageIo>,
+    validation: &HandshakeValidation,
+    deadline: Instant,
+    streams: rfc6083::streams::RecordStreams,
+) -> Result<CompletedHandshake, DiameterTlsError> {
+    run_transport_handshake_with_state(
+        engine,
+        io,
+        validation,
+        deadline,
+        PumpState {
+            streams,
+            ..Default::default()
+        },
+        vec![0_u8; ENGINE_POLL_BUFFER],
+    )
+    .await
+}
+
+async fn run_transport_handshake_with_state(
+    engine: &mut dimpl::Dtls,
+    io: &mut Box<dyn SctpMessageIo>,
+    validation: &HandshakeValidation,
+    deadline: Instant,
+    mut state: PumpState,
+    mut buffer: Vec<u8>,
+) -> Result<CompletedHandshake, DiameterTlsError> {
     // dimpl starts the client flight and seeds server state from
     // handle_timeout; the explicit initial kick keeps the handshake
     // deterministic instead of depending on the engine's first timer.
     engine
         .handle_timeout(std::time::Instant::now())
         .map_err(|_| DiameterTlsError::TlsHandshake)?;
-    let mut state = PumpState::default();
-    let mut buffer = vec![0_u8; ENGINE_POLL_BUFFER];
     let mut auth_key_installed = false;
     let mut change_cipher_spec_prepared = false;
     let mut auth_key_prepared = false;
@@ -2079,7 +2383,13 @@ async fn run_handshake(
             let expires_at = state
                 .peer_certificate_expires_at
                 .ok_or(DiameterTlsError::Authentication)?;
-            return Ok((version, cipher, expires_at));
+            return Ok(CompletedHandshake {
+                version,
+                cipher,
+                peer_expires_at: expires_at,
+                state,
+                buffer,
+            });
         }
         if state.peer_closed {
             return Err(DiameterTlsError::TlsHandshake);
@@ -2091,10 +2401,13 @@ async fn run_handshake(
                 .map_err(|_| DiameterTlsError::TlsHandshake)?,
             PumpEvent::Message(None) => return Err(DiameterTlsError::Transport),
             PumpEvent::Message(Some(message)) => {
-                let record = validate_received_dtls_record(&message)?;
-                engine
-                    .handle_packet(record)
-                    .map_err(|_| DiameterTlsError::TlsHandshake)?;
+                handle_received_record(
+                    engine,
+                    &mut state,
+                    &message,
+                    io.protected_ppid(),
+                    DiameterTlsError::TlsHandshake,
+                )?;
             }
         }
     }
@@ -2135,10 +2448,13 @@ async fn pump_until_inbound(
                 .map_err(|_| DiameterTlsError::Transport)?,
             PumpEvent::Message(None) => return Err(DiameterTlsError::Transport),
             PumpEvent::Message(Some(message)) => {
-                let record = validate_received_dtls_record(&message)?;
-                engine
-                    .handle_packet(record)
-                    .map_err(|_| DiameterTlsError::Transport)?;
+                handle_received_record(
+                    engine,
+                    state,
+                    &message,
+                    io.protected_ppid(),
+                    DiameterTlsError::Transport,
+                )?;
             }
         }
     }
@@ -2280,6 +2596,15 @@ struct RetirementTask {
     close: Arc<dyn SctpTransportClose>,
 }
 
+impl RetirementTask {
+    fn replace_watcher(&mut self, task: tokio::task::JoinHandle<()>) {
+        // Keep the same synchronous drop/close authority while replacing only
+        // the timer. Dropping a whole RetirementTask would close the carrier.
+        self.task.abort();
+        self.task = task;
+    }
+}
+
 struct SctpTransportLifetimeGuard {
     close: Arc<dyn SctpTransportClose>,
     armed: bool,
@@ -2314,14 +2639,33 @@ impl Drop for RetirementTask {
 }
 
 fn spawn_retirement_task(
-    mut material_status: TlsMaterialStatusReceiver,
+    material_status: TlsMaterialStatusReceiver,
     admitted_epoch: TlsMaterialEpoch,
     hard_deadline: Instant,
     retired: Arc<AtomicBool>,
     close: Arc<dyn SctpTransportClose>,
 ) -> RetirementTask {
+    RetirementTask {
+        task: spawn_retirement_watcher(
+            material_status,
+            admitted_epoch,
+            hard_deadline,
+            retired,
+            Arc::clone(&close),
+        ),
+        close,
+    }
+}
+
+fn spawn_retirement_watcher(
+    mut material_status: TlsMaterialStatusReceiver,
+    admitted_epoch: TlsMaterialEpoch,
+    hard_deadline: Instant,
+    retired: Arc<AtomicBool>,
+    close: Arc<dyn SctpTransportClose>,
+) -> tokio::task::JoinHandle<()> {
     let task_close = Arc::clone(&close);
-    let task = tokio::spawn(async move {
+    tokio::spawn(async move {
         let hard_deadline_sleep = tokio::time::sleep_until(hard_deadline);
         tokio::pin!(hard_deadline_sleep);
         loop {
@@ -2337,11 +2681,7 @@ fn spawn_retirement_task(
         }
         retired.store(true, Ordering::Release);
         task_close.close();
-    });
-    RetirementTask {
-        task,
-        close: Arc::clone(&close),
-    }
+    })
 }
 
 fn material_epoch_retained(epoch: TlsMaterialEpoch, status: opc_tls::TlsMaterialStatus) -> bool {
@@ -2530,9 +2870,12 @@ impl DiameterDtlsSctpConnector {
         let mut engine = self.new_engine(certificate)?;
         engine.set_active(true);
         let validation = HandshakeValidation {
-            expected_peer: self.expected_peer.clone(),
+            expected_peer: self.expected_peer.spiffe_id().clone(),
             trust_bundles,
             usage: PeerUsage::Server,
+            revocation: None,
+            server_name: None,
+            certificate_profile: None,
         };
         let established = match tokio::time::timeout_at(
             deadline,
@@ -2723,9 +3066,12 @@ impl DiameterDtlsSctpAcceptor {
         } = prepared;
         let mut engine = self.new_engine(certificate)?;
         let validation = HandshakeValidation {
-            expected_peer: self.expected_peer.clone(),
+            expected_peer: self.expected_peer.spiffe_id().clone(),
             trust_bundles,
             usage: PeerUsage::Client,
+            revocation: None,
+            server_name: None,
+            certificate_profile: None,
         };
         let established = match tokio::time::timeout_at(
             deadline,
@@ -3261,7 +3607,8 @@ async fn run_dtls_runtime_actor(
                     let wire = state
                         .inbound
                         .pop_front()
-                        .ok_or(DiameterTlsError::Transport)?;
+                        .ok_or(DiameterTlsError::Transport)?
+                        .payload;
                     let result = validate_wire_frame(&wire, request.limits).map(|()| wire);
                     let failed = result.is_err();
                     let _ = request.result.send(result);
@@ -3323,7 +3670,7 @@ async fn run_dtls_runtime_actor(
             tokio::select! {
                 message = io.receive_message() => {
                     let message = message?.ok_or(DiameterTlsError::Transport)?;
-                    let record = validate_received_dtls_record(&message)?;
+                    let record = validate_received_record_for(&message, io.protected_ppid())?;
                     engine
                         .handle_packet(record)
                         .map_err(|_| DiameterTlsError::Transport)?;
@@ -3780,74 +4127,7 @@ impl DiameterDtlsSctpConnection {
                 poll_buffer,
                 ..
             } = &mut self;
-            let close_protocol = async {
-                // This consuming API has no application-delivery channel.
-                // Never claim an orderly close while silently discarding an
-                // authenticated application record that preceded the alert.
-                if !pump_state.inbound.is_empty() || !pump_state.outbound.is_empty() {
-                    return Err(DiameterTlsError::Transport);
-                }
-                io.prepare_close_notify(deadline).await?;
-                engine.close().map_err(|_| DiameterTlsError::Transport)?;
-                loop {
-                    match poll_engine(engine, None, pump_state, poll_buffer)? {
-                        EnginePoll::Wait(_) => break,
-                        EnginePoll::PrepareCloseNotify => {
-                            // The transport sender-dry barrier completed before
-                            // the engine was asked to emit this alert.
-                        }
-                        EnginePoll::InstallEpochKey(_)
-                        | EnginePoll::PrepareChangeCipherSpec
-                        | EnginePoll::PrepareEpoch => {
-                            return Err(DiameterTlsError::Transport);
-                        }
-                    }
-                }
-                flush_outbound(io, pump_state).await?;
-
-                // Keep SCTP alive until the peer's reciprocal close_notify is
-                // authenticated. Every operation, including alert emission,
-                // remains under the caller's one absolute deadline.
-                loop {
-                    let next_timer = match poll_engine(engine, None, pump_state, poll_buffer)? {
-                        EnginePoll::Wait(next_timer) => next_timer,
-                        EnginePoll::PrepareCloseNotify => {
-                            flush_outbound(io, pump_state).await?;
-                            io.prepare_close_notify(deadline).await?;
-                            continue;
-                        }
-                        EnginePoll::InstallEpochKey(_)
-                        | EnginePoll::PrepareChangeCipherSpec
-                        | EnginePoll::PrepareEpoch => {
-                            return Err(DiameterTlsError::Transport);
-                        }
-                    };
-                    flush_outbound(io, pump_state).await?;
-                    if !pump_state.inbound.is_empty() {
-                        return Err(DiameterTlsError::Transport);
-                    }
-                    if pump_state.peer_closed {
-                        return Ok(());
-                    }
-                    match pump_wait(io, next_timer, deadline).await? {
-                        PumpEvent::Deadline => {
-                            return Err(DiameterTlsError::DeadlineExceeded);
-                        }
-                        PumpEvent::Timer => engine
-                            .handle_timeout(std::time::Instant::now())
-                            .map_err(|_| DiameterTlsError::Transport)?,
-                        PumpEvent::Message(None) => {
-                            return Err(DiameterTlsError::Transport);
-                        }
-                        PumpEvent::Message(Some(message)) => {
-                            let record = validate_received_dtls_record(&message)?;
-                            engine
-                                .handle_packet(record)
-                                .map_err(|_| DiameterTlsError::Transport)?;
-                        }
-                    }
-                }
-            };
+            let close_protocol = close_transport_via(engine, io, pump_state, poll_buffer, deadline);
             close_error = match tokio::time::timeout_at(deadline, close_protocol).await {
                 Ok(Ok(())) => None,
                 Ok(Err(error)) => Some(error),
@@ -4004,6 +4284,84 @@ impl DiameterDtlsSctpConnection {
     }
 }
 
+async fn close_transport_via(
+    engine: &mut dimpl::Dtls,
+    io: &mut Box<dyn SctpMessageIo>,
+    pump_state: &mut PumpState,
+    poll_buffer: &mut Vec<u8>,
+    deadline: Instant,
+) -> Result<(), DiameterTlsError> {
+    // This consuming API has no application-delivery channel.
+    // Never claim an orderly close while silently discarding an
+    // authenticated application record that preceded the alert.
+    if !pump_state.inbound.is_empty() || !pump_state.outbound.is_empty() {
+        return Err(DiameterTlsError::Transport);
+    }
+    io.prepare_close_notify(deadline).await?;
+    engine.close().map_err(|_| DiameterTlsError::Transport)?;
+    loop {
+        match poll_engine(engine, None, pump_state, poll_buffer)? {
+            EnginePoll::Wait(_) => break,
+            EnginePoll::PrepareCloseNotify => {
+                // The transport sender-dry barrier completed before
+                // the engine was asked to emit this alert.
+            }
+            EnginePoll::InstallEpochKey(_)
+            | EnginePoll::PrepareChangeCipherSpec
+            | EnginePoll::PrepareEpoch => {
+                return Err(DiameterTlsError::Transport);
+            }
+        }
+    }
+    flush_outbound(io, pump_state).await?;
+
+    // Keep SCTP alive until the peer's reciprocal close_notify is
+    // authenticated. Every operation, including alert emission,
+    // remains under the caller's one absolute deadline.
+    loop {
+        let next_timer = match poll_engine(engine, None, pump_state, poll_buffer)? {
+            EnginePoll::Wait(next_timer) => next_timer,
+            EnginePoll::PrepareCloseNotify => {
+                flush_outbound(io, pump_state).await?;
+                io.prepare_close_notify(deadline).await?;
+                continue;
+            }
+            EnginePoll::InstallEpochKey(_)
+            | EnginePoll::PrepareChangeCipherSpec
+            | EnginePoll::PrepareEpoch => {
+                return Err(DiameterTlsError::Transport);
+            }
+        };
+        flush_outbound(io, pump_state).await?;
+        if !pump_state.inbound.is_empty() {
+            return Err(DiameterTlsError::Transport);
+        }
+        if pump_state.peer_closed {
+            return Ok(());
+        }
+        match pump_wait(io, next_timer, deadline).await? {
+            PumpEvent::Deadline => {
+                return Err(DiameterTlsError::DeadlineExceeded);
+            }
+            PumpEvent::Timer => engine
+                .handle_timeout(std::time::Instant::now())
+                .map_err(|_| DiameterTlsError::Transport)?,
+            PumpEvent::Message(None) => {
+                return Err(DiameterTlsError::Transport);
+            }
+            PumpEvent::Message(Some(message)) => {
+                handle_received_record(
+                    engine,
+                    pump_state,
+                    &message,
+                    io.protected_ppid(),
+                    DiameterTlsError::Transport,
+                )?;
+            }
+        }
+    }
+}
+
 async fn write_wire_frame_via(
     engine: &mut dimpl::Dtls,
     io: &mut Box<dyn SctpMessageIo>,
@@ -4014,9 +4372,36 @@ async fn write_wire_frame_via(
     deadline: Instant,
 ) -> Result<(), DiameterTlsError> {
     validate_wire_frame(wire, frame_limits)?;
+    write_application_via(engine, io, pump_state, poll_buffer, wire, deadline).await
+}
+
+async fn write_application_via(
+    engine: &mut dimpl::Dtls,
+    io: &mut Box<dyn SctpMessageIo>,
+    pump_state: &mut PumpState,
+    poll_buffer: &mut Vec<u8>,
+    wire: &[u8],
+    deadline: Instant,
+) -> Result<(), DiameterTlsError> {
+    write_application_on_stream_via(engine, io, pump_state, poll_buffer, wire, 0, deadline).await
+}
+
+async fn write_application_on_stream_via(
+    engine: &mut dimpl::Dtls,
+    io: &mut Box<dyn SctpMessageIo>,
+    pump_state: &mut PumpState,
+    poll_buffer: &mut Vec<u8>,
+    wire: &[u8],
+    stream_id: u16,
+    deadline: Instant,
+) -> Result<(), DiameterTlsError> {
     if Instant::now() >= deadline {
         return Err(DiameterTlsError::DeadlineExceeded);
     }
+    if stream_id >= pump_state.streams.count() || !pump_state.outbound.is_empty() {
+        return Err(DiameterTlsError::Transport);
+    }
+    pump_state.streams.outbound = stream_id;
     engine
         .send_application_data(wire)
         .map_err(|_| DiameterTlsError::Transport)?;
@@ -4061,7 +4446,7 @@ async fn read_wire_frame_via(
         .inbound
         .pop_front()
         .ok_or(DiameterTlsError::Transport)?;
-    decode_wire_frame(wire, frame_limits)
+    decode_wire_frame(wire.payload, frame_limits)
 }
 
 impl fmt::Debug for DiameterDtlsSctpConnection {
@@ -4400,6 +4785,7 @@ mod tests {
             vec![SctpWireRecord {
                 a_to_b: true,
                 ppid: DIAMETER_DTLS_SCTP_PPID,
+                stream_id: 0,
                 payload_bytes: DTLS_RECORD_HEADER_BYTES + 10,
                 auth_key_id: 0,
                 record_header: Some(

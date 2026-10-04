@@ -25,7 +25,7 @@ use rusqlite::{
     limits::Limit, params, types::ValueRef, Connection, OpenFlags, OptionalExtension,
     TransactionBehavior,
 };
-use sha2_zeroize::{Digest, Sha256};
+use sha2::{Digest, Sha256};
 use subtle::ConstantTimeEq;
 use zeroize::Zeroizing;
 
@@ -37,6 +37,16 @@ use crate::{
     FENCED_TRANSITION_V2_MAX_ACTIVE_EPOCHS, FENCED_TRANSITION_V2_MAX_HISTORY_ENTRIES,
     FENCED_TRANSITION_V2_MAX_REPLAY_EPOCHS, FENCED_TRANSITION_V2_MAX_RETAINED_HISTORY_ENTRIES,
     FENCED_TRANSITION_V2_REQUEST_ID_BYTES,
+};
+
+mod recovery;
+
+pub(crate) use recovery::{canonical_recovery_request, RecoveryJournalAdmission};
+pub use recovery::{
+    FencedTransitionV2RecoveryJournal, FencedTransitionV2RecoveryJournalKey,
+    FENCED_TRANSITION_V2_RECOVERY_JOURNAL_KEY_BYTES,
+    FENCED_TRANSITION_V2_RECOVERY_JOURNAL_MAX_ENTRIES,
+    FENCED_TRANSITION_V2_RECOVERY_RECLAIM_BATCH_MAX,
 };
 
 /// Width of the independent integrity key protecting one prepared journal.
@@ -487,8 +497,12 @@ struct SecureJournalOpenLease {
 /// that is intentionally independent of payload key/provider rotation.
 #[derive(Clone)]
 pub struct PreparedFencedTransitionJournal {
-    inner: Arc<PreparedFencedTransitionJournalInner>,
+    inner: Option<Arc<PreparedFencedTransitionJournalInner>>,
     operation_permit: Arc<tokio::sync::Semaphore>,
+    #[cfg(feature = "lab-memory")]
+    memory: Option<
+        Arc<Mutex<std::collections::HashMap<FencedTransitionRequestId, PreparedFencedTransition>>>,
+    >,
 }
 
 impl fmt::Debug for PreparedFencedTransitionJournal {
@@ -501,6 +515,19 @@ impl fmt::Debug for PreparedFencedTransitionJournal {
 }
 
 impl PreparedFencedTransitionJournal {
+    /// Construct a volatile preparation journal for a single-process lab.
+    ///
+    /// No database or file is opened. Dropping the last clone loses all tokens;
+    /// this must never be used as a durable production recovery authority.
+    #[cfg(feature = "lab-memory")]
+    pub fn in_memory_lab() -> Self {
+        Self {
+            inner: None,
+            operation_permit: Arc::new(tokio::sync::Semaphore::new(1)),
+            memory: Some(Arc::new(Mutex::new(std::collections::HashMap::new()))),
+        }
+    }
+
     /// Provision one missing dedicated durable journal database.
     ///
     /// On Unix every existing ancestor is opened without following symlinks.
@@ -576,18 +603,24 @@ impl PreparedFencedTransitionJournal {
             path.path_guard.sync_parent_directory()?;
         }
         Ok(Self {
-            inner: Arc::new(PreparedFencedTransitionJournalInner {
+            inner: Some(Arc::new(PreparedFencedTransitionJournalInner {
                 conn: Mutex::new(conn),
                 key,
                 progress_budget,
                 #[cfg(unix)]
                 path_guard: path.path_guard,
-            }),
+            })),
             operation_permit: Arc::new(tokio::sync::Semaphore::new(1)),
+            #[cfg(feature = "lab-memory")]
+            memory: None,
         })
     }
 
     pub(crate) async fn health_check(&self) -> Result<(), StoreError> {
+        #[cfg(feature = "lab-memory")]
+        if let Some(memory) = &self.memory {
+            return memory.lock().map(|_| ()).map_err(|_| journal_unavailable());
+        }
         self.with_connection(false, |conn, key| {
             let transaction = journal_read_transaction(conn)?;
             verify_metadata(&transaction, key)?;
@@ -601,6 +634,18 @@ impl PreparedFencedTransitionJournal {
         &self,
         request_id: FencedTransitionRequestId,
     ) -> Result<(), StoreError> {
+        #[cfg(feature = "lab-memory")]
+        if let Some(memory) = &self.memory {
+            let memory = memory.lock().map_err(|_| journal_unavailable())?;
+            if memory.contains_key(&request_id) {
+                return Err(StoreError::FencedTransitionRequestConflict);
+            }
+            return if memory.len() < 65_536 {
+                Ok(())
+            } else {
+                Err(StoreError::FencedTransitionHistoryFull)
+            };
+        }
         self.with_connection(false, move |conn, key| {
             let transaction = journal_read_transaction(conn)?;
             let membership = verify_metadata(&transaction, key)?;
@@ -623,6 +668,18 @@ impl PreparedFencedTransitionJournal {
         &self,
         prepared: &PreparedFencedTransition,
     ) -> Result<(), StoreError> {
+        #[cfg(feature = "lab-memory")]
+        if let Some(memory) = &self.memory {
+            let mut memory = memory.lock().map_err(|_| journal_unavailable())?;
+            if memory.contains_key(&prepared.request_id()) {
+                return Err(StoreError::FencedTransitionRequestConflict);
+            }
+            if memory.len() >= 65_536 {
+                return Err(StoreError::FencedTransitionHistoryFull);
+            }
+            memory.insert(prepared.request_id(), prepared.clone());
+            return Ok(());
+        }
         let request_id = prepared.request_id();
         let canonical = Zeroizing::new(prepared.as_bytes().to_vec());
         self.with_connection(true, move |conn, key| {
@@ -716,6 +773,14 @@ impl PreparedFencedTransitionJournal {
         &self,
         request_id: FencedTransitionRequestId,
     ) -> Result<PreparedFencedTransitionLookup, StoreError> {
+        #[cfg(feature = "lab-memory")]
+        if let Some(memory) = &self.memory {
+            let memory = memory.lock().map_err(|_| journal_unavailable())?;
+            return Ok(match memory.get(&request_id) {
+                Some(prepared) => PreparedFencedTransitionLookup::Found(prepared.clone()),
+                None => PreparedFencedTransitionLookup::Absent,
+            });
+        }
         self.with_connection(false, move |conn, key| {
             let transaction = journal_read_transaction(conn)?;
             verify_metadata(&transaction, key)?;
@@ -762,7 +827,7 @@ impl PreparedFencedTransitionJournal {
             .acquire_owned()
             .await
             .map_err(|_| journal_unavailable())?;
-        let inner = Arc::clone(&self.inner);
+        let inner = Arc::clone(self.inner.as_ref().ok_or_else(journal_unavailable)?);
         tokio::task::spawn_blocking(move || {
             let _permit = permit;
             let mut conn = inner.conn.lock().map_err(|_| journal_unavailable())?;
@@ -2511,7 +2576,7 @@ fn v2_journal_limits() -> Result<[(Limit, i32); 9], StoreError> {
 
 fn verify_v2_journal_limits(conn: &Connection) -> Result<(), StoreError> {
     for (limit, expected) in v2_journal_limits()? {
-        if conn.limit(limit) != expected {
+        if conn.limit(limit).map_err(|_| v2_journal_unavailable())? != expected {
             return Err(v2_journal_unavailable());
         }
     }
@@ -2520,7 +2585,8 @@ fn verify_v2_journal_limits(conn: &Connection) -> Result<(), StoreError> {
 
 fn configure_v2_journal_sqlite_limits(conn: &Connection) -> Result<(), StoreError> {
     for (limit, requested) in v2_journal_limits()? {
-        conn.set_limit(limit, requested);
+        conn.set_limit(limit, requested)
+            .map_err(|_| v2_journal_unavailable())?;
     }
     verify_v2_journal_limits(conn)
 }
@@ -3996,10 +4062,13 @@ fn update_v2_journal_membership_after_insert(
 fn install_journal_progress_handler(conn: &Connection) -> Arc<JournalSqliteProgressBudget> {
     let progress_budget = Arc::new(JournalSqliteProgressBudget::new());
     let handler_budget = Arc::clone(&progress_budget);
+    // rusqlite rejects hooks on borrowed raw handles. Journal constructors
+    // open owning connections, so rejection here is an ownership invariant.
     conn.progress_handler(
         JOURNAL_SQLITE_PROGRESS_INSTRUCTION_INTERVAL,
         Some(move || handler_budget.should_interrupt()),
-    );
+    )
+    .expect("journal owns its SQLite connection");
     progress_budget
 }
 
@@ -4352,7 +4421,8 @@ fn journal_sqlite_length_limit() -> Result<i32, StoreError> {
 
 fn configure_journal_sqlite_limits(conn: &Connection) -> Result<(), StoreError> {
     for (limit, requested) in journal_sqlite_limits()? {
-        conn.set_limit(limit, requested);
+        conn.set_limit(limit, requested)
+            .map_err(|_| journal_unavailable())?;
     }
     verify_journal_sqlite_limits(conn)
 }
@@ -4373,7 +4443,7 @@ fn journal_sqlite_limits() -> Result<[(Limit, i32); 9], StoreError> {
 
 fn verify_journal_sqlite_limits(conn: &Connection) -> Result<(), StoreError> {
     for (limit, requested) in journal_sqlite_limits()? {
-        if conn.limit(limit) != requested {
+        if conn.limit(limit).map_err(|_| journal_unavailable())? != requested {
             return Err(journal_unavailable());
         }
     }
@@ -5675,6 +5745,8 @@ mod tests {
         let retained = prepared(0x1c);
         journal
             .inner
+            .as_ref()
+            .expect("durable journal fixture")
             .path_guard
             .fail_next_parent_sync
             .store(true, Ordering::Relaxed);
@@ -6050,6 +6122,8 @@ mod tests {
         assert!(
             journal
                 .inner
+                .as_ref()
+                .expect("durable journal fixture")
                 .progress_budget
                 .observed_callbacks()
                 .saturating_mul(4)
@@ -6445,15 +6519,19 @@ mod tests {
 
             let callbacks = Arc::new(AtomicUsize::new(0));
             let handler_callbacks = Arc::clone(&callbacks);
-            connection.progress_handler(
-                1,
-                Some(move || {
-                    handler_callbacks.fetch_add(1, Ordering::Relaxed);
-                    false
-                }),
-            );
+            connection
+                .progress_handler(
+                    1,
+                    Some(move || {
+                        handler_callbacks.fetch_add(1, Ordering::Relaxed);
+                        false
+                    }),
+                )
+                .expect("SQLite test hook registration");
             scan_journal_membership(&connection, &incarnation, 1).expect("measure membership scan");
-            connection.progress_handler(0, None::<fn() -> bool>);
+            connection
+                .progress_handler(0, None::<fn() -> bool>)
+                .expect("SQLite test hook registration");
             callbacks.load(Ordering::Relaxed)
         }
 
@@ -6593,7 +6671,9 @@ mod tests {
             .expect("journal length limit is representable")
             .checked_sub(1)
             .expect("journal length limit is positive");
-        connection.set_limit(Limit::SQLITE_LIMIT_LENGTH, lowered_limit);
+        connection
+            .set_limit(Limit::SQLITE_LIMIT_LENGTH, lowered_limit)
+            .unwrap();
         assert_coarse_unavailable(verify_connection_profile(&connection));
     }
 

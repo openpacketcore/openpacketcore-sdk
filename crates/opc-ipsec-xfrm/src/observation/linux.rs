@@ -37,7 +37,11 @@ use super::{
     EspPeerObservationSource, EspPeerObservationSourceLoss, EspPeerObservationSourceRecord,
     EspPeerObservationSourceTerminal, EspPeerObservationTeardown,
 };
-use crate::{IpAddress, NamespaceBoundLinuxXfrmBackend, XfrmError, XfrmLookupMark};
+use crate::child_sa::{ChildSaId, ChildSaIncarnation, ChildSaOutboundSelection, ChildSaPair};
+use crate::{
+    InstalledChildSaRoster, IpAddress, NamespaceBoundLinuxXfrmBackend, XfrmBackend, XfrmDirection,
+    XfrmError, XfrmLookupMark,
+};
 
 const BPF_NOEXIST: u64 = 1;
 const BPF_EXIST: u64 = 2;
@@ -227,6 +231,89 @@ impl fmt::Debug for LinuxEspPeerObservationHandle {
     }
 }
 
+/// Live inbound observation registration bound to one installed roster.
+///
+/// Only [`LinuxEspPeerObservationMonitor::register_installed_child_sa`] can
+/// issue this handle. It binds the monitor's private source scope, the kernel
+/// registration epoch and the exact published pair. It cannot be rebound to a
+/// later publication: tear down the registration and register anew instead.
+pub struct InstalledChildSaObservationHandle {
+    scope: EspPeerObservationScope,
+    registration: LinuxEspPeerObservationHandle,
+    roster: InstalledChildSaRoster,
+    pair: ChildSaPair,
+}
+
+impl InstalledChildSaObservationHandle {
+    /// Exact installed pair whose inbound SA is being observed.
+    #[must_use]
+    pub const fn pair(&self) -> &ChildSaPair {
+        &self.pair
+    }
+
+    /// Handle for explicit teardown through the same monitor.
+    #[must_use]
+    pub const fn registration(&self) -> LinuxEspPeerObservationHandle {
+        self.registration
+    }
+
+    /// Installed publication generation, for correlation only.
+    #[must_use]
+    pub fn roster_generation(&self) -> u64 {
+        self.roster.generation()
+    }
+}
+
+/// Sealed post-integrity, final-replay-accepted new-source observation.
+///
+/// Only the production Linux monitor can construct this result. It retains the
+/// exact pair, roster publication and registration epoch; caller-created or
+/// edited [`EspPeerObservation`] values cannot be promoted to this type.
+/// This is bounded new-source evidence, not a receipt for every packet or proof
+/// of inner application delivery. Explicit source/overflow loss is preserved.
+/// It grants no IKE authentication, MOBIKE relocation or counter-reuse authority.
+///
+/// ```compile_fail
+/// let forged = opc_ipsec_xfrm::AuthenticatedChildSaPeerObservation {};
+/// ```
+pub struct AuthenticatedChildSaPeerObservation {
+    roster: InstalledChildSaRoster,
+    pair: ChildSaPair,
+    observation: EspPeerObservation,
+}
+
+impl AuthenticatedChildSaPeerObservation {
+    /// Exact installed pair that authenticated the observed inbound traffic.
+    #[must_use]
+    pub const fn pair(&self) -> &ChildSaPair {
+        &self.pair
+    }
+
+    /// Immutable facts from the trusted monitor; copying them grants no seal.
+    #[must_use]
+    pub const fn observation(&self) -> &EspPeerObservation {
+        &self.observation
+    }
+
+    /// Publication validated when the result was issued, for correlation only.
+    #[must_use]
+    pub fn roster_generation(&self) -> u64 {
+        self.roster.generation()
+    }
+}
+
+impl fmt::Debug for InstalledChildSaObservationHandle {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("InstalledChildSaObservationHandle(<redacted>)")
+    }
+}
+
+impl fmt::Debug for AuthenticatedChildSaPeerObservation {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("AuthenticatedChildSaPeerObservation(<redacted>)")
+    }
+}
+
 struct WatchedRegistration {
     handle: LinuxEspPeerObservationHandle,
     current_source: (IpAddress, u16),
@@ -322,6 +409,50 @@ impl LinuxEspPeerObservationMonitor {
         &mut self,
         requested: EspPeerObservationKey,
     ) -> Result<LinuxEspPeerObservationHandle, XfrmError> {
+        self.register_sa_inner(requested, None).await
+    }
+
+    /// Register the inbound SA of one exact installed Child-SA incarnation.
+    ///
+    /// Fresh whole-roster readback precedes registration and repeats before the
+    /// source is armed. Cancellation during those reads aborts the unarmed
+    /// registration. Both selected and receive-only rekey incarnations qualify.
+    /// The existing source profile requires authenticated ESP-in-UDP with replay
+    /// protection and supported kernel tracing; unsupported profiles fail closed.
+    pub async fn register_installed_child_sa(
+        &mut self,
+        roster: &InstalledChildSaRoster,
+        child: ChildSaId,
+        incarnation: ChildSaIncarnation,
+    ) -> Result<InstalledChildSaObservationHandle, XfrmError> {
+        self.ensure_live()?;
+        let pair = roster
+            .declared_pair(child, incarnation)
+            .ok_or(XfrmError::NotFound)?;
+        self.backend
+            .select_installed_child_sa(roster, ChildSaOutboundSelection::Default)
+            .await?;
+        let inbound = pair.inbound();
+        let key = EspPeerObservationKey {
+            id: inbound.id(),
+            mark: inbound.query().mark,
+            if_id: inbound.if_id(),
+            direction: XfrmDirection::In,
+        };
+        let registration = self.register_sa_inner(key, Some(roster)).await?;
+        Ok(InstalledChildSaObservationHandle {
+            scope: self.source.scope,
+            registration,
+            roster: roster.clone(),
+            pair,
+        })
+    }
+
+    async fn register_sa_inner(
+        &mut self,
+        requested: EspPeerObservationKey,
+        roster: Option<&InstalledChildSaRoster>,
+    ) -> Result<LinuxEspPeerObservationHandle, XfrmError> {
         self.ensure_live()?;
         if let Err(error) = self.source.validate_poll_authority() {
             return self.fail_closed(error);
@@ -350,7 +481,16 @@ impl LinuxEspPeerObservationMonitor {
             .query_esp_peer_observation_registration(handle.key)
             .await;
         let arm_result = match second {
-            Ok(second) if second == registration => prepared.arm_and_commit(),
+            Ok(second) if second == registration => {
+                if let Some(roster) = roster {
+                    // The prepared guard remains uncommitted across this
+                    // await, so a cancelled or stale publication cannot arm it.
+                    backend
+                        .select_installed_child_sa(roster, ChildSaOutboundSelection::Default)
+                        .await?;
+                }
+                prepared.arm_and_commit()
+            }
             Ok(_) => prepared.reject(XfrmError::StateMismatch {
                 operation: "esp_peer_observation_second_getsa",
             }),
@@ -420,6 +560,49 @@ impl LinuxEspPeerObservationMonitor {
             tally,
             exit_authority,
         )
+    }
+
+    /// Poll and take sealed inbound provenance for one installed registration.
+    ///
+    /// A successful source poll, fresh whole-roster readback and final source
+    /// authority check all precede issuance. A stale publication, wrong monitor,
+    /// teardown or lost tracing authority produces no result. Caller writers
+    /// must remain serialized with this operation and subsequent use, as for
+    /// installed selection. No source-change event returns `Ok(None)`.
+    pub async fn poll_installed_child_sa(
+        &mut self,
+        handle: &InstalledChildSaObservationHandle,
+    ) -> Result<Option<AuthenticatedChildSaPeerObservation>, XfrmError> {
+        if handle.scope != self.source.scope {
+            return Err(XfrmError::StateMismatch {
+                operation: "installed_child_sa_observation_scope",
+            });
+        }
+        self.ensure_current(handle.registration)?;
+        self.poll_available().await?;
+        self.backend
+            .select_installed_child_sa(&handle.roster, ChildSaOutboundSelection::Default)
+            .await?;
+        self.source.ensure_pollable()?;
+        if let Err(error) = self.source.validate_poll_authority() {
+            return self.fail_closed(error);
+        }
+        self.ensure_current(handle.registration)?;
+        let Some(observation) = self.drain(handle.registration) else {
+            return Ok(None);
+        };
+        if observation.key != handle.registration.key
+            || observation.epoch != handle.registration.epoch
+        {
+            return self.fail_closed(XfrmError::StateMismatch {
+                operation: "installed_child_sa_observation_identity",
+            });
+        }
+        Ok(Some(AuthenticatedChildSaPeerObservation {
+            roster: handle.roster.clone(),
+            pair: handle.pair.clone(),
+            observation,
+        }))
     }
 
     /// Take the pending observation for one exact live registration.

@@ -4,7 +4,7 @@
 //! narrow composition additionally owns and wipes the HMAC normalized key,
 //! ipad/opad blocks, inner digest, and final digest on every path.
 
-use sha2_zeroize::{Digest, Sha256, Sha384, Sha512};
+use sha2::{Digest, Sha256, Sha384, Sha512};
 use zeroize::Zeroizing;
 
 macro_rules! hmac_sha2 {

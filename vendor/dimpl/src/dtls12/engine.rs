@@ -15,10 +15,15 @@ use crate::dtls12::message::{ContentType, DTLSRecord, Dtls12CipherSuite, Handsha
 use crate::error::bounded_error_len;
 use crate::timer::ExponentialBackoff;
 use crate::window::ReplayWindow;
-use crate::{Config, Error, InternalError, KeyingMaterial, Output, SeededRng};
+use crate::{
+    Config, Error, InternalError, KeyingMaterial, Output, Rfc6083ApplicationRecord, SeededRng,
+};
 
 const MAX_DEFRAGMENT_PACKETS: usize = 50;
 const MAX_SEQUENCE_NUMBER: u64 = (1_u64 << 48) - 1;
+
+mod rekey;
+pub(super) mod server_name;
 
 struct Rfc6083OutputBarrier {
     preceding_datagrams: usize,
@@ -77,6 +82,10 @@ pub struct Engine {
 
     /// Cryptographic context for handling encryption/decryption
     pub(crate) crypto_context: CryptoContext,
+    previous_crypto_context: Option<CryptoContext>,
+    previous_protected_send_count: u64,
+    peer_epoch: u16,
+    rekey: rekey::RekeyState,
 
     /// Whether the remote peer has enabled encryption
     peer_encryption_enabled: bool,
@@ -237,6 +246,10 @@ impl Engine {
             min_protected_fragment_len: 0,
             protected_send_count: 0,
             crypto_context,
+            previous_crypto_context: None,
+            previous_protected_send_count: 0,
+            peer_epoch: 0,
+            rekey: rekey::RekeyState::default(),
             peer_encryption_enabled: false,
             is_client: false,
             peer_handshake_seq_no: 0,
@@ -380,7 +393,7 @@ impl Engine {
             return Ok(());
         }
 
-        // Reject new handshakes after initial handshake is complete (renegotiation not supported).
+        // A new handshake requires an explicit local rekey transition first.
         if self.release_app_data && handshake.header.message_seq >= self.peer_handshake_seq_no {
             return Err(Error::RenegotiationAttempt);
         }
@@ -500,11 +513,31 @@ impl Engine {
         Ok(())
     }
 
+    #[cfg(test)]
     pub fn poll_output<'a>(&mut self, buf: &'a mut [u8], now: Instant) -> Output<'a> {
+        self.poll_output_with_record(buf, now).0
+    }
+
+    pub fn poll_output_with_record<'a>(
+        &mut self,
+        buf: &'a mut [u8],
+        now: Instant,
+    ) -> (Output<'a>, Option<Rfc6083ApplicationRecord>) {
+        let mut record = None;
+        let output = self.poll_output_inner(buf, now, &mut record);
+        (output, record)
+    }
+
+    fn poll_output_inner<'a>(
+        &mut self,
+        buf: &'a mut [u8],
+        now: Instant,
+        record: &mut Option<Rfc6083ApplicationRecord>,
+    ) -> Output<'a> {
         // Drain incoming queue of processed records.
         self.purge_handled_queue_rx();
 
-        let buf = match self.poll_app_data(buf) {
+        let buf = match self.poll_app_data(buf, record) {
             PollOutput::Data(p) => return Output::ApplicationData(p),
             PollOutput::BufferTooSmall { needed } => return Output::BufferTooSmall { needed },
             PollOutput::None(b) => b,
@@ -550,7 +583,11 @@ impl Engine {
         Output::Timeout(next_timeout)
     }
 
-    fn poll_app_data<'a>(&mut self, buf: &'a mut [u8]) -> PollOutput<'a> {
+    fn poll_app_data<'a>(
+        &mut self,
+        buf: &'a mut [u8],
+        record: &mut Option<Rfc6083ApplicationRecord>,
+    ) -> PollOutput<'a> {
         if !self.release_app_data {
             return PollOutput::None(buf);
         }
@@ -575,6 +612,13 @@ impl Engine {
         }
 
         buf[..len].copy_from_slice(fragment);
+        let sequence = next.record().sequence;
+        if self.config.rfc6083_sctp() && self.peer_encryption_enabled && sequence.epoch != 0 {
+            *record = Some(Rfc6083ApplicationRecord {
+                epoch: sequence.epoch,
+                sequence_number: sequence.sequence_number,
+            });
+        }
         next.set_handled();
 
         PollOutput::Data(&buf[..len])
@@ -819,7 +863,10 @@ impl Engine {
             .queue_rx
             .iter()
             .flat_map(|i| i.records().iter())
-            .find(|r| !r.is_handled())?;
+            .find(|r| {
+                !r.is_handled()
+                    && (self.previous_crypto_context.is_none() || r.record().content_type == ctype)
+            })?;
 
         if record.record().content_type != ctype {
             return None;
@@ -855,7 +902,13 @@ impl Engine {
     where
         F: FnOnce(&mut Buf),
     {
-        self.create_record_inner(content_type, epoch, save_fragment, false, f)
+        self.create_record_inner(
+            content_type,
+            self.record_epoch(epoch),
+            save_fragment,
+            false,
+            f,
+        )
     }
 
     /// Create a DTLS record in a new datagram even when the current datagram
@@ -875,7 +928,13 @@ impl Engine {
     where
         F: FnOnce(&mut Buf),
     {
-        self.create_record_inner(content_type, epoch, save_fragment, true, f)
+        self.create_record_inner(
+            content_type,
+            self.record_epoch(epoch),
+            save_fragment,
+            true,
+            f,
+        )
     }
 
     fn create_record_inner<F>(
@@ -890,10 +949,10 @@ impl Engine {
         F: FnOnce(&mut Buf),
     {
         if epoch >= 1 {
-            self.ensure_protected_send_budget(1)?;
+            self.ensure_epoch_send_budget(epoch, 1)?;
         }
 
-        let sequence = if epoch == 0 {
+        let sequence = if epoch == self.sequence_epoch_0.epoch {
             self.sequence_epoch_0
         } else {
             self.sequence_epoch_n
@@ -984,9 +1043,9 @@ impl Engine {
 
             // Get the fixed part of the IV
             let iv = if self.is_client {
-                self.crypto_context.get_client_write_iv()
+                self.write_context(epoch).get_client_write_iv()
             } else {
-                self.crypto_context.get_server_write_iv()
+                self.write_context(epoch).get_server_write_iv()
             };
 
             let Some(iv) = iv else {
@@ -1020,7 +1079,7 @@ impl Engine {
             let aad = Aad::new_dtls12(content_type, sequence, length);
 
             // Encrypt the fragment in-place
-            self.encrypt_data(&mut fragment, aad, nonce)?;
+            self.encrypt_data(epoch, &mut fragment, aad, nonce)?;
             let ctext_len = fragment.len();
 
             // For suites with a per-record nonce (e.g. AES-GCM), prefix it on the wire.
@@ -1046,7 +1105,7 @@ impl Engine {
         };
 
         // Increment the sequence number for the next transmission
-        if epoch == 0 {
+        if epoch == self.sequence_epoch_0.epoch {
             self.sequence_epoch_0.sequence_number += 1;
         } else {
             self.sequence_epoch_n.sequence_number += 1;
@@ -1068,7 +1127,11 @@ impl Engine {
         }
 
         if epoch >= 1 {
-            self.protected_send_count += 1;
+            if epoch == self.sequence_epoch_0.epoch {
+                self.previous_protected_send_count += 1;
+            } else {
+                self.protected_send_count += 1;
+            }
         }
 
         // Return the fragment buffer to the pool
@@ -1082,8 +1145,8 @@ impl Engine {
     where
         F: FnOnce(&mut Buf, &mut Self) -> Result<(), Error>,
     {
-        let epoch = msg_type.epoch();
-        let sequence = if epoch == 0 {
+        let epoch = self.record_epoch(msg_type.epoch());
+        let sequence = if epoch == self.sequence_epoch_0.epoch {
             self.sequence_epoch_0
         } else {
             self.sequence_epoch_n
@@ -1106,7 +1169,7 @@ impl Engine {
         let (required_records, new_datagrams) =
             self.required_handshake_records(body_buffer.len(), epoch)?;
         if epoch >= 1 {
-            self.ensure_protected_send_budget(required_records)?;
+            self.ensure_epoch_send_budget(epoch, required_records)?;
         }
         let final_sequence = sequence
             .sequence_number
@@ -1256,13 +1319,21 @@ impl Engine {
     }
 
     fn ensure_protected_send_budget(&self, additional: usize) -> Result<(), Error> {
+        self.ensure_epoch_send_budget(self.sequence_epoch_n.epoch, additional)
+    }
+
+    fn ensure_epoch_send_budget(&self, epoch: u16, additional: usize) -> Result<(), Error> {
         let additional = u64::try_from(additional).map_err(|_| {
             Error::CryptoError(crate::CryptoError::AeadEncryptionLimitReached {
                 limit: self.config.aead_encryption_limit(),
             })
         })?;
-        let within_budget = self
-            .protected_send_count
+        let used = if epoch == self.sequence_epoch_0.epoch {
+            self.previous_protected_send_count
+        } else {
+            self.protected_send_count
+        };
+        let within_budget = used
             .checked_add(additional)
             .is_some_and(|count| count <= self.config.aead_encryption_limit());
         if !within_budget {
@@ -1325,6 +1396,7 @@ impl Engine {
     /// Release application data from the incoming queue
     pub fn release_application_data(&mut self) {
         self.release_app_data = true;
+        self.previous_crypto_context = None;
     }
 
     /// Whether a close_notify alert has been received from the peer.
@@ -1380,13 +1452,19 @@ impl Engine {
     }
 
     /// Encrypt data appropriate for the role (client or server)
-    fn encrypt_data(&mut self, plaintext: &mut Buf, aad: Aad, nonce: Nonce) -> Result<(), Error> {
+    fn encrypt_data(
+        &mut self,
+        epoch: u16,
+        plaintext: &mut Buf,
+        aad: Aad,
+        nonce: Nonce,
+    ) -> Result<(), Error> {
         if self.is_client {
-            self.crypto_context
+            self.write_context_mut(epoch)
                 .encrypt_client_to_server(plaintext, aad, nonce)
                 .map_err(Error::CryptoError)
         } else {
-            self.crypto_context
+            self.write_context_mut(epoch)
                 .encrypt_server_to_client(plaintext, aad, nonce)
                 .map_err(Error::CryptoError)
         }
@@ -1400,11 +1478,11 @@ impl Engine {
         nonce: Nonce,
     ) -> Result<(), Error> {
         if self.is_client {
-            self.crypto_context
+            self.read_context_mut()
                 .decrypt_server_to_client(ciphertext, aad, nonce)
                 .map_err(Error::CryptoError)
         } else {
-            self.crypto_context
+            self.read_context_mut()
                 .decrypt_client_to_server(ciphertext, aad, nonce)
                 .map_err(Error::CryptoError)
         }
@@ -1460,6 +1538,9 @@ impl Engine {
     }
 
     pub fn set_cipher_suite(&mut self, cipher_suite: Dtls12CipherSuite) -> Result<(), Error> {
+        if self.previous_crypto_context.is_some() && self.cipher_suite != Some(cipher_suite) {
+            return Err(Error::RenegotiationAttempt);
+        }
         // Cache AEAD record parameters from the provider suite. The formula
         // (explicit_nonce + tag) lives on the suite trait; Engine just stores
         // the resolved values for hot-path access.
@@ -1482,25 +1563,22 @@ impl Engine {
         debug!("Peer encryption enabled");
         self.peer_encryption_enabled = true;
 
-        let maybe_index_epoch1 = self
-            .queue_rx
-            .iter()
-            .position(|i| i.records().iter().any(|r| r.record().sequence.epoch == 1));
-
-        let Some(index_epoch1) = maybe_index_epoch1 else {
-            return Ok(());
-        };
-
-        // Now decrypt all entries remaining.
-        let all = self.queue_rx.split_off(index_epoch1);
-
+        self.peer_epoch = self.sequence_epoch_n.epoch;
+        self.replay = ReplayWindow::new();
+        // Earlier application records have already been authenticated. Keep
+        // their plaintext; only the new epoch's buffered ciphertext is reparsed.
+        let all = self.queue_rx.split_off(0);
         for incoming in all {
-            let unhandled = incoming.into_records().filter(|r| !r.is_handled());
-
-            for record in unhandled {
-                let buf = record.into_buffer();
-                self.parse_packet(&buf)?;
-                self.buffers_free.push(buf);
+            for record in incoming.into_records().filter(|r| !r.is_handled()) {
+                if record.record().sequence.epoch == self.peer_epoch {
+                    let buf = record.into_buffer();
+                    self.parse_packet(&buf)?;
+                    self.buffers_free.push(buf);
+                } else if record.record().content_type == ContentType::ApplicationData {
+                    self.queue_rx.push_back(Incoming::from_record(record));
+                } else {
+                    self.buffers_free.push(record.into_buffer());
+                }
             }
         }
 
@@ -1509,13 +1587,13 @@ impl Engine {
 
     fn peer_iv(&self) -> Result<Iv, Error> {
         if self.is_client {
-            self.crypto_context
+            self.read_context()
                 .get_server_write_iv()
                 .ok_or(Error::CryptoError(
                     crate::CryptoError::WriteIvNotAvailable { is_client: false },
                 ))
         } else {
-            self.crypto_context
+            self.read_context()
                 .get_client_write_iv()
                 .ok_or(Error::CryptoError(
                     crate::CryptoError::WriteIvNotAvailable { is_client: true },
@@ -1588,6 +1666,19 @@ impl Engine {
 impl RecordHandler for Engine {
     fn classify_record(&mut self, record: Record) -> Result<Option<Record>, Error> {
         let epoch = record.record().sequence.epoch;
+        if epoch > self.peer_epoch {
+            return Ok(Some(record));
+        }
+        if epoch > 0 && epoch < self.peer_epoch {
+            self.push_buffer(record.into_buffer());
+            return Ok(None);
+        }
+        if self.config.rfc6083_rekey()
+            && record.record().content_type == ContentType::ChangeCipherSpec
+            && record.record().fragment(record.buffer()) != [1]
+        {
+            return Err(Error::RenegotiationAttempt);
+        }
 
         if record.record().content_type == ContentType::ChangeCipherSpec
             && epoch == 0
@@ -1683,6 +1774,14 @@ impl RecordHandler for Engine {
         self.peer_encryption_enabled
     }
 
+    fn can_decrypt_epoch(&self, epoch: u16) -> bool {
+        self.peer_encryption_enabled && epoch == self.peer_epoch
+    }
+
+    fn accepts_epoch(&self, epoch: u16) -> bool {
+        epoch <= self.sequence_epoch_n.epoch && (epoch == 0 || epoch >= self.peer_epoch)
+    }
+
     fn replay_check(&self, seq: Sequence) -> bool {
         if !self.config.replay_detection() {
             return true;
@@ -1740,8 +1839,60 @@ impl RecordHandler for Engine {
 }
 
 #[cfg(test)]
-mod tests {
+pub(super) mod tests {
     use super::*;
+
+    pub(in crate::dtls12) fn rekey_fixture_receiver(client: bool) -> Engine {
+        let config = Arc::new(
+            Config::builder()
+                .rfc6083_sctp()
+                .require_server_certificate_request(true)
+                .dtls13_cipher_suites(&[])
+                .build()
+                .expect("mutual profile")
+                .with_rfc6083_rekey()
+                .expect("opt in"),
+        );
+        let mut engine = encrypted_engine(config, client);
+        engine.enable_peer_encryption().expect("old epoch");
+        engine
+            .verify_renegotiation_info(
+                &[crate::dtls12::message::Extension {
+                    extension_type: crate::dtls12::message::ExtensionType::RenegotiationInfo,
+                    extension_data_range: 0..1,
+                }],
+                &[0],
+                false,
+            )
+            .expect("initial extension");
+        engine.save_finished(true, std::array::from_fn(|i| i as u8));
+        engine.save_finished(false, std::array::from_fn(|i| 240 + i as u8));
+        engine.release_application_data();
+        engine.begin_rfc6083_rekey().expect("locally arm");
+        engine
+    }
+
+    pub(in crate::dtls12) fn rekey_hello_fixtures(
+        role: &str,
+    ) -> Vec<(&'static str, bool, Vec<u8>)> {
+        include_str!("../../tests/dtls12/rfc5746_hello_reference.tsv")
+            .lines()
+            .filter(|v| !v.starts_with('#'))
+            .filter_map(|row| {
+                let f: Vec<_> = row.split('\t').collect();
+                (f[0] == role).then(|| {
+                    (
+                        f[1],
+                        f[2] == "1",
+                        (0..f[3].len())
+                            .step_by(2)
+                            .map(|i| u8::from_str_radix(&f[3][i..i + 2], 16).expect("fixture hex"))
+                            .collect(),
+                    )
+                })
+            })
+            .collect()
+    }
 
     fn config(rfc6083: bool) -> Arc<Config> {
         let builder = Config::builder().dtls13_cipher_suites(&[]);
@@ -1766,7 +1917,7 @@ mod tests {
         )
     }
 
-    fn encrypted_engine(config: Arc<Config>, is_client: bool) -> Engine {
+    pub(super) fn encrypted_engine(config: Arc<Config>, is_client: bool) -> Engine {
         let mut engine = Engine::new(config, AuthMode::Psk);
         engine.set_client(is_client);
         engine
@@ -1801,13 +1952,181 @@ mod tests {
         engine
     }
 
-    fn drain_packets(engine: &mut Engine) -> Vec<Vec<u8>> {
+    pub(super) fn drain_packets(engine: &mut Engine) -> Vec<Vec<u8>> {
         let mut packets = Vec::new();
         let mut buffer = vec![0_u8; crate::config::RFC6083_DTLS_MTU];
         while let Output::Packet(packet) = engine.poll_output(&mut buffer, Instant::now()) {
             packets.push(packet.to_vec());
         }
         packets
+    }
+
+    fn record_reference() -> Vec<(u16, u64, Vec<u8>, Vec<u8>)> {
+        fn hex(value: &str) -> Vec<u8> {
+            assert_eq!(value.len() % 2, 0);
+            (0..value.len())
+                .step_by(2)
+                .map(|start| u8::from_str_radix(&value[start..start + 2], 16).expect("fixture hex"))
+                .collect()
+        }
+        include_str!("../../tests/dtls12/rfc6083_record_reference.tsv")
+            .lines()
+            .filter(|line| !line.starts_with('#'))
+            .map(|line| {
+                let fields: Vec<_> = line.split('\t').collect();
+                assert_eq!(fields.len(), 4);
+                (
+                    fields[0].parse().expect("fixture epoch"),
+                    fields[1].parse().expect("fixture sequence"),
+                    hex(fields[2]),
+                    hex(fields[3]),
+                )
+            })
+            .collect()
+    }
+
+    fn record_receiver(rfc6083: bool) -> Engine {
+        let mut receiver = encrypted_engine(config(rfc6083), false);
+        receiver.enable_peer_encryption().expect("receive epoch");
+        receiver
+    }
+
+    #[test]
+    fn rfc6083_record_identity_matches_independent_reordered_ciphertext() {
+        let records = record_reference();
+        assert_eq!(records.len(), 6);
+        let mut receiver = record_receiver(true);
+        // Deliberately retain multiple records before releasing plaintext.
+        // A receive-order FIFO assigns the first plaintext the wrong number.
+        for (_, _, _, wire) in records.iter().rev() {
+            receiver.parse_packet(wire).expect("independent ciphertext");
+        }
+        let mut buffer = [0_u8; 2048];
+        let (before_release, identity) =
+            receiver.poll_output_with_record(&mut buffer, Instant::now());
+        assert!(matches!(before_release, Output::Timeout(_)));
+        assert_eq!(identity, None, "nothing before handshake release");
+        receiver.release_application_data();
+        for (index, (epoch, sequence, plaintext, _)) in records.iter().enumerate() {
+            let (output, identity) = receiver.poll_output_with_record(&mut buffer, Instant::now());
+            assert!(matches!(output, Output::ApplicationData(data) if data == plaintext));
+            let identity = identity.expect("exact decrypted record");
+            assert_eq!(identity.epoch(), *epoch);
+            assert_eq!(identity.sequence_number(), *sequence);
+            assert_ne!(
+                identity.sequence_number(),
+                records[records.len() - 1 - index].1,
+                "a FIFO stream sidecar would misbind this plaintext"
+            );
+            assert_eq!(
+                format!("{identity:?}"),
+                "Rfc6083ApplicationRecord([redacted])"
+            );
+            assert_eq!(
+                format!("{identity:#?}"),
+                "Rfc6083ApplicationRecord([redacted])"
+            );
+        }
+        let (finished, identity) = receiver.poll_output_with_record(&mut buffer, Instant::now());
+        assert!(matches!(finished, Output::Timeout(_)));
+        assert_eq!(identity, None, "no stale number after draining");
+    }
+
+    #[test]
+    fn rfc6083_record_identity_short_buffer_retry_and_legacy_poll_do_not_shift_records() {
+        let records = record_reference();
+        let mut receiver = record_receiver(true);
+        receiver.release_application_data();
+        for (_, _, _, wire) in &records[2..] {
+            receiver.parse_packet(wire).expect("independent record");
+        }
+        let mut short = [0_u8; 1];
+        for _ in 0..3 {
+            let (output, identity) = receiver.poll_output_with_record(&mut short, Instant::now());
+            assert!(matches!(output, Output::BufferTooSmall { needed: 17 }));
+            assert_eq!(identity, None, "retry must not consume or publish identity");
+        }
+        let mut buffer = [0_u8; 2048];
+        assert!(matches!(receiver.poll_output(&mut buffer, Instant::now()),
+            Output::ApplicationData(data) if data == records[2].2));
+        for (_, sequence, plaintext, _) in &records[3..] {
+            let (output, identity) = receiver.poll_output_with_record(&mut buffer, Instant::now());
+            assert!(matches!(output, Output::ApplicationData(data) if data == plaintext));
+            assert_eq!(
+                identity.expect("paired record").sequence_number(),
+                *sequence
+            );
+        }
+    }
+
+    #[test]
+    fn rfc6083_record_identity_is_absent_for_ordinary_dtls12() {
+        let mut receiver = record_receiver(false);
+        receiver.release_application_data();
+        let records = record_reference();
+        receiver
+            .parse_packet(&records[4].3)
+            .expect("ordinary DTLS record");
+        let mut buffer = [0_u8; 2048];
+        let (output, identity) = receiver.poll_output_with_record(&mut buffer, Instant::now());
+        assert!(matches!(output, Output::ApplicationData(data) if data == records[4].2));
+        assert_eq!(
+            identity, None,
+            "ordinary DTLS does not claim RFC 6083 metadata"
+        );
+    }
+
+    #[test]
+    fn rfc6083_record_identity_never_tracks_a_discarded_or_unauthenticated_record() {
+        let records = record_reference();
+        // Mutate every byte of an independent record, including epoch, sequence,
+        // version, explicit nonce, ciphertext, and authentication tag. Malformed
+        // shapes may return a parse error; neither outcome may expose plaintext.
+        for offset in 0..records[2].3.len() {
+            let mut receiver = record_receiver(true);
+            receiver.release_application_data();
+            let mut damaged = records[2].3.clone();
+            damaged[offset] ^= 0x80;
+            let _ = receiver.parse_packet(&damaged);
+            let mut buffer = [0_u8; 2048];
+            let (output, identity) = receiver.poll_output_with_record(&mut buffer, Instant::now());
+            assert!(
+                !matches!(output, Output::ApplicationData(_)),
+                "damaged byte {offset}"
+            );
+            assert_eq!(identity, None, "unauthenticated byte {offset}");
+            receiver
+                .parse_packet(&records[4].3)
+                .expect("later independent record");
+            let (output, identity) = receiver.poll_output_with_record(&mut buffer, Instant::now());
+            assert!(matches!(output, Output::ApplicationData(data) if data == records[4].2));
+            assert_eq!(
+                identity.expect("later record identity").sequence_number(),
+                records[4].1
+            );
+        }
+    }
+
+    #[test]
+    fn rfc6083_record_identity_empty_plaintext_and_pending_duplicate_are_exact() {
+        let records = record_reference();
+        let mut receiver = record_receiver(true);
+        receiver.release_application_data();
+        receiver
+            .parse_packet(&records[0].3)
+            .expect("empty authenticated record");
+        receiver
+            .parse_packet(&records[0].3)
+            .expect("pending duplicate");
+        let (output, identity) = receiver.poll_output_with_record(&mut [], Instant::now());
+        assert!(matches!(output, Output::ApplicationData([])));
+        assert_eq!(
+            identity.expect("empty record identity").sequence_number(),
+            0
+        );
+        let (output, identity) = receiver.poll_output_with_record(&mut [], Instant::now());
+        assert!(matches!(output, Output::Timeout(_)));
+        assert_eq!(identity, None);
     }
 
     #[test]

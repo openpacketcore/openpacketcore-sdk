@@ -1,0 +1,22 @@
+[package]
+name = "opc-proto-gre"
+version.workspace = true
+authors.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+publish = false
+description = "Bounded TS 24.502 NWu keyed GRE codec and abstract QFI associations"
+readme = "README.md"
+
+[dependencies]
+opc-protocol = { path = "../opc-protocol", version = "0.2.0" }
+bytes = { workspace = true }
+thiserror = { workspace = true }
+
+[dev-dependencies]
+allocation-counter = { workspace = true }
+
+[lints]
+workspace = true

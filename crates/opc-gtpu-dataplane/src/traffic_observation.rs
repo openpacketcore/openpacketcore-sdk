@@ -1687,6 +1687,7 @@ mod tests {
             bearer_mark: None,
             egress_dscp: None,
             uplink_source_port_policy: GtpuUplinkSourcePortPolicy::LegacyServicePort,
+            downlink_inner_mtu: None,
         };
         let entry =
             GtpuSessionEntry::new(context, IpAddr::V4(Ipv4Addr::new(192, 0, 2, 2))).unwrap();
@@ -1707,6 +1708,7 @@ mod tests {
             bearer_mark: None,
             egress_dscp: None,
             uplink_source_port_policy: GtpuUplinkSourcePortPolicy::LegacyServicePort,
+            downlink_inner_mtu: None,
         };
         let entry =
             GtpuSessionEntry::new(context, IpAddr::V4(Ipv4Addr::new(192, 0, 2, 4))).unwrap();
@@ -1743,6 +1745,7 @@ mod tests {
             bearer_mark: None,
             egress_dscp: None,
             uplink_source_port_policy: GtpuUplinkSourcePortPolicy::LegacyServicePort,
+            downlink_inner_mtu: None,
         };
         let group = GtpuSessionGroup::new(
             GtpuSessionGroupId::new([1; 16]).unwrap(),
@@ -1775,6 +1778,7 @@ mod tests {
             bearer_mark: None,
             egress_dscp: None,
             uplink_source_port_policy: GtpuUplinkSourcePortPolicy::LegacyServicePort,
+            downlink_inner_mtu: None,
         };
         let group = GtpuSessionGroup::new(
             GtpuSessionGroupId::new([1; 16]).unwrap(),
@@ -1797,6 +1801,7 @@ mod tests {
             bearer_mark: None,
             egress_dscp: None,
             uplink_source_port_policy: GtpuUplinkSourcePortPolicy::LegacyServicePort,
+            downlink_inner_mtu: None,
         };
         let group = GtpuSessionGroup::new(
             GtpuSessionGroupId::new([3; 16]).unwrap(),
@@ -2394,6 +2399,7 @@ mod tests {
                     bearer_mark: None,
                     egress_dscp: None,
                     uplink_source_port_policy: GtpuUplinkSourcePortPolicy::LegacyServicePort,
+                    downlink_inner_mtu: None,
                 },
                 IpAddr::V4(Ipv4Addr::new(192, 0, 2, 2)),
             )

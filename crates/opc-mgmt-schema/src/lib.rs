@@ -883,9 +883,10 @@ pub enum NetconfEditError {
     },
     /// The supplied config element does not resolve to a known schema node.
     UnknownPath(String),
-    /// The supplied value cannot be parsed as the leaf's declared type.
+    /// The supplied value cannot be parsed as the declared type, or multiple
+    /// edits address the same typed leaf-list entry, list key, or singleton.
     InvalidValue {
-        /// Schema-node path of the leaf.
+        /// Schema-node path of the addressed node.
         path: &'static str,
     },
     /// A keyed list entry was missing one of its key leaves.
@@ -912,6 +913,10 @@ pub enum NetconfEditError {
     MalformedXml,
     /// The requested operation is not semantically valid for this node kind or
     /// state.
+    ///
+    /// For supported leaf-lists, `Create` means the typed entry already
+    /// exists and `Delete` means it is absent. NETCONF bindings preserve these
+    /// as RFC 7950 section 7.7.9 `data-exists` and `data-missing` replies.
     OperationNotSupported {
         /// Schema-node path.
         path: &'static str,

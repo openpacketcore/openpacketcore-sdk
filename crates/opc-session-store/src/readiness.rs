@@ -111,12 +111,12 @@ impl PlacementResiliencePolicy {
     }
 }
 
-/// Redaction-safe result of the fixed durable quorum traffic-authority check.
+/// Redaction-safe result of the fixed quorum traffic-authority check.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 #[non_exhaustive]
 pub enum FixedQuorumTrafficAuthority {
-    /// The exact fixed 3- or 5-voter durable quorum completed the required
-    /// recovery, membership, and linearizable-majority checks.
+    /// The exact fixed 3- or 5-voter quorum completed the required recovery,
+    /// membership, and linearizable-majority checks under its persistence mode.
     Granted,
     /// A structural fixed-quorum precondition was not established.
     StructuralRecoveryRequired,
@@ -124,6 +124,8 @@ pub enum FixedQuorumTrafficAuthority {
     RecoveryRequired,
     /// The exact membership or a fresh linearizable majority barrier is absent.
     NoQuorum,
+    /// A durable-only probe was requested for asynchronous persistence.
+    PersistenceNotDurable,
 }
 
 impl FixedQuorumTrafficAuthority {
@@ -139,6 +141,7 @@ impl FixedQuorumTrafficAuthority {
             Self::StructuralRecoveryRequired => "structural_recovery_required",
             Self::RecoveryRequired => "recovery_required",
             Self::NoQuorum => "no_quorum",
+            Self::PersistenceNotDurable => "persistence_not_durable",
         }
     }
 }
@@ -183,6 +186,61 @@ impl FixedQuorumReadinessReport {
     /// Underlying Openraft recovery, membership, and barrier observation.
     pub const fn durable_readiness(&self) -> &DurableReadinessReport {
         &self.durable_readiness
+    }
+}
+
+/// Fixed-quorum traffic evidence with an explicit acknowledgement policy.
+///
+/// A granted Async result proves quorum and local application, not completed
+/// disk persistence. Placement and local persistence progress are separate
+/// observations. Every subsequent operation repeats its own authority checks.
+#[must_use = "quorum readiness evidence must be inspected"]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SessionQuorumReadinessReport {
+    traffic_authority: FixedQuorumTrafficAuthority,
+    placement_resilience: PlacementResilienceReport,
+    committed_barrier_index: Option<u64>,
+    persistence: crate::consensus::SessionPersistenceHealth,
+}
+
+impl SessionQuorumReadinessReport {
+    pub(crate) const fn new(
+        traffic_authority: FixedQuorumTrafficAuthority,
+        placement_resilience: PlacementResilienceReport,
+        committed_barrier_index: Option<u64>,
+        persistence: crate::consensus::SessionPersistenceHealth,
+    ) -> Self {
+        Self {
+            traffic_authority,
+            placement_resilience,
+            committed_barrier_index,
+            persistence,
+        }
+    }
+
+    /// Configured acknowledgement and persistence policy.
+    pub const fn persistence_mode(&self) -> crate::consensus::SessionPersistenceMode {
+        self.persistence.mode
+    }
+
+    /// Point-in-time quorum and local-application authority.
+    pub const fn traffic_authority(&self) -> FixedQuorumTrafficAuthority {
+        self.traffic_authority
+    }
+
+    /// Physical-placement resilience, independent of traffic authority.
+    pub const fn placement_resilience(&self) -> PlacementResilienceReport {
+        self.placement_resilience
+    }
+
+    /// Committed barrier applied locally for a granted result.
+    pub const fn committed_barrier_index(&self) -> Option<u64> {
+        self.committed_barrier_index
+    }
+
+    /// Passive local progress observed at completion of this probe.
+    pub const fn persistence_health(&self) -> crate::consensus::SessionPersistenceHealth {
+        self.persistence
     }
 }
 
@@ -296,6 +354,8 @@ pub enum DurableReadinessState {
     TopologyInvalid,
     /// Conflicting or unrepairable durable state requires recovery action.
     RecoveryRequired,
+    /// The store uses Async acknowledgement and cannot grant durable readiness.
+    PersistenceNotDurable,
 }
 
 impl DurableReadinessState {
@@ -306,6 +366,7 @@ impl DurableReadinessState {
             Self::NoQuorum => "no_quorum",
             Self::TopologyInvalid => "topology_invalid",
             Self::RecoveryRequired => "recovery_required",
+            Self::PersistenceNotDurable => "persistence_not_durable",
         }
     }
 }
@@ -465,9 +526,9 @@ impl DurableReadinessReport {
         let recovery_state = match state {
             DurableReadinessState::Ready => DurableRecoveryState::Synchronized,
             DurableReadinessState::RecoveryRequired => DurableRecoveryState::RecoveryRequired,
-            DurableReadinessState::NoQuorum | DurableReadinessState::TopologyInvalid => {
-                DurableRecoveryState::AwaitingQuorum
-            }
+            DurableReadinessState::NoQuorum
+            | DurableReadinessState::TopologyInvalid
+            | DurableReadinessState::PersistenceNotDurable => DurableRecoveryState::AwaitingQuorum,
         };
         Self {
             scope: DurableReadinessScope::EngineOnly,

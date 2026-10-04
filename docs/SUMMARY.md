@@ -46,6 +46,7 @@
   - [0018 — EPC Untrusted-Access SDK Boundary](adr/0018-epc-untrusted-access-sdk-boundary.md)
   - [0019 — One Openraft Consensus Engine](adr/0019-one-openraft-consensus-engine.md)
 - [OPC gNMI Server Spec](design/opc-gnmi-server-spec.md)
+- [N3IWF fixture contracts](n3iwf-fixture-contracts.md)
 
 # Operator Guide
 

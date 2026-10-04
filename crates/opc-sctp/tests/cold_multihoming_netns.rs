@@ -215,6 +215,10 @@ impl Topology {
     }
 
     fn start_server(&mut self) -> io::Result<()> {
+        self.start_server_test("cold_primary_down_secondary_up_establishes_within_five_seconds")
+    }
+
+    fn start_server_test(&mut self, test: &str) -> io::Result<()> {
         let executable = env::current_exe()?;
         let child = Command::new("ip")
             .args([
@@ -226,7 +230,7 @@ impl Topology {
                     .ok_or_else(|| io::Error::other("test executable path is not UTF-8"))?,
                 "--ignored",
                 "--exact",
-                "cold_primary_down_secondary_up_establishes_within_five_seconds",
+                test,
                 "--nocapture",
             ])
             .env(ROLE_ENV, "server")
@@ -257,6 +261,61 @@ impl Topology {
             std::thread::sleep(Duration::from_millis(10));
         }
         Ok(())
+    }
+
+    fn connect_primary_path(&self) -> io::Result<()> {
+        run("ip", &["link", "del", "cprim"])?;
+        run(
+            "ip",
+            &[
+                "netns",
+                "exec",
+                &self.server_namespace,
+                "ip",
+                "link",
+                "del",
+                "sprim",
+            ],
+        )?;
+        run(
+            "ip",
+            &[
+                "link", "add", "cprim", "type", "veth", "peer", "name", "sprim",
+            ],
+        )?;
+        run(
+            "ip",
+            &["link", "set", "sprim", "netns", &self.server_namespace],
+        )?;
+        run("ip", &["addr", "add", "198.18.0.1/24", "dev", "cprim"])?;
+        run("ip", &["link", "set", "cprim", "up"])?;
+        run(
+            "ip",
+            &[
+                "netns",
+                "exec",
+                &self.server_namespace,
+                "ip",
+                "addr",
+                "add",
+                "198.18.0.2/24",
+                "dev",
+                "sprim",
+            ],
+        )?;
+        run(
+            "ip",
+            &[
+                "netns",
+                "exec",
+                &self.server_namespace,
+                "ip",
+                "link",
+                "set",
+                "sprim",
+                "up",
+            ],
+        )
     }
 
     fn chronology(&self) -> String {
@@ -456,4 +515,193 @@ async fn cold_primary_down_secondary_up_establishes_within_five_seconds() -> io:
             ),
         )),
     }
+}
+
+// Compose the N2 owner with the same isolated, two-path kernel topology. The
+// cold test above retains its own deadline/default configuration unchanged.
+use bytes::Bytes;
+use opc_sctp::n2::{
+    N2AssociationOwner, N2Generation, N2Inbound, N2ReconnectPolicy, UnprotectedN2Association,
+};
+use opc_sctp::{HeartbeatConfig, RtoConfig, SctpPathStatus};
+
+const N2_FAILOVER_TEST: &str = "n2_generation_survives_primary_path_loss_with_exact_readback";
+
+async fn n2_data(owner: &N2AssociationOwner, generation: &N2Generation) -> opc_sctp::n2::N2Payload {
+    tokio::time::timeout(Duration::from_secs(8), async {
+        for _ in 0..64 {
+            let received = owner
+                .recv(generation)
+                .await
+                .expect("N2 namespace receive failed");
+            assert!(
+                received.generation() == generation.number() && !received.retired(),
+                "path change retired or relabelled N2 generation"
+            );
+            if let N2Inbound::Payload(payload) = received.into_inbound() {
+                return payload;
+            }
+        }
+        panic!("N2 namespace notification bound exceeded");
+    })
+    .await
+    .expect("N2 namespace DATA timed out")
+}
+
+fn n2_endpoint_config() -> SctpEndpointConfig {
+    let mut config = SctpEndpointConfig::one_to_one(PRIMARY_REMOTE.parse().unwrap());
+    config.local_addrs.push(SECONDARY_REMOTE.parse().unwrap());
+    config.rto = RtoConfig {
+        initial_ms: Some(200),
+        min_ms: Some(100),
+        max_ms: Some(400),
+    };
+    config.heartbeat = HeartbeatConfig {
+        interval_ms: Some(100),
+        path_max_retrans: Some(1),
+    };
+    config
+}
+
+async fn n2_server() -> io::Result<()> {
+    let endpoint = SctpEndpoint::bind(n2_endpoint_config()).map_err(io::Error::other)?;
+    let ready =
+        env::var_os(READY_PATH_ENV).ok_or_else(|| io::Error::other("missing N2 readiness path"))?;
+    fs::write(ready, b"ready")?;
+    let accepted = tokio::time::timeout(Duration::from_secs(8), endpoint.accept())
+        .await
+        .expect("N2 namespace accept timed out")
+        .map_err(io::Error::other)?;
+    let owner = N2AssociationOwner::new();
+    let generation = owner
+        .promote(
+            owner
+                .candidate(UnprotectedN2Association::from_association(accepted).unwrap())
+                .unwrap(),
+        )
+        .unwrap();
+    for expected in [b"one", b"two", b"end", b"fin"] {
+        let payload = n2_data(&owner, &generation).await;
+        assert!(
+            payload.stream_id() == 3 && payload.payload().as_ref() == expected,
+            "native failover changed stream order or DATA"
+        );
+        owner
+            .send(&generation, payload.into_payload(), 3)
+            .await
+            .unwrap();
+    }
+    let accepted = env::var_os(ACCEPTED_PATH_ENV)
+        .ok_or_else(|| io::Error::other("missing N2 completion path"))?;
+    fs::write(accepted, b"exchanged")?;
+    let release =
+        env::var_os(RELEASE_PATH_ENV).ok_or_else(|| io::Error::other("missing N2 release path"))?;
+    let deadline = Instant::now() + Duration::from_secs(8);
+    while !PathBuf::from(&release).exists() {
+        if Instant::now() >= deadline {
+            return Err(io::Error::other("N2 namespace release timed out"));
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    Ok(())
+}
+
+#[tokio::test]
+#[ignore = "requires Linux SCTP and CAP_NET_ADMIN in a fresh network namespace"]
+async fn n2_generation_survives_primary_path_loss_with_exact_readback() -> io::Result<()> {
+    if env::var(ROLE_ENV).as_deref() == Ok("server") {
+        return n2_server().await;
+    }
+    require_private_netns()?;
+    let mut topology = Topology::create()?;
+    topology.connect_primary_path()?;
+    topology.start_server_test(N2_FAILOVER_TEST)?;
+    let primary: SocketAddr = PRIMARY_REMOTE.parse().unwrap();
+    let secondary: SocketAddr = SECONDARY_REMOTE.parse().unwrap();
+    let mut config = SctpConnectConfig::new(primary);
+    config.remote_addrs.push(secondary);
+    config.local_addrs = ["198.18.0.1:0", "198.19.0.1:0"]
+        .map(|a| a.parse().unwrap())
+        .to_vec();
+    config.rto = n2_endpoint_config().rto;
+    config.heartbeat = n2_endpoint_config().heartbeat;
+    let owner = N2AssociationOwner::new();
+    let bounds = N2ReconnectPolicy::new(2, OUTER_DEADLINE, OUTER_DEADLINE, Duration::ZERO).unwrap();
+    let candidate = owner.connect_candidate(config, bounds).await.unwrap();
+    let generation = owner.promote(candidate).unwrap();
+    let before = owner.readback(&generation).unwrap();
+    assert!(before.local_addresses().len() == 2 && before.peer_addresses().len() == 2);
+    assert!(
+        before.peer_addresses().contains(&primary) && before.peer_addresses().contains(&secondary)
+    );
+    assert!(
+        before
+            .peer_path_health()
+            .iter()
+            .map(|p| p.peer_addr)
+            .collect::<Vec<_>>()
+            == [primary, secondary],
+        "configured path order changed"
+    );
+    owner.set_primary_peer_path(&generation, primary).unwrap();
+    for (index, bytes) in [b"one", b"two", b"end", b"fin"].into_iter().enumerate() {
+        if index == 2 {
+            // Remove the actually used primary link. The kernel must deliver
+            // the remaining records through the independent secondary veth.
+            run("ip", &["link", "set", "cprim", "down"])?;
+        }
+        owner
+            .send(&generation, Bytes::from_static(bytes), 3)
+            .await
+            .unwrap();
+        let echoed = n2_data(&owner, &generation).await;
+        assert!(
+            echoed.stream_id() == 3 && echoed.payload().as_ref() == bytes,
+            "N2 failover echo changed"
+        );
+    }
+    let after = owner.readback(&generation).unwrap();
+    assert!(before.generation() == after.generation());
+    assert!(
+        before.local_addresses() == after.local_addresses(),
+        "local readback changed during static failover"
+    );
+    assert!(
+        before.peer_addresses() == after.peer_addresses(),
+        "peer readback changed during static failover"
+    );
+    tokio::time::timeout(Duration::from_secs(8), async {
+        loop {
+            let readback = owner.readback(&generation).unwrap();
+            if readback
+                .peer_path_health()
+                .iter()
+                .any(|p| p.peer_addr == primary && p.status == SctpPathStatus::Unreachable)
+            {
+                break;
+            }
+            let received = owner.recv(&generation).await.unwrap();
+            assert!(
+                !received.retired() && matches!(received.inbound(), N2Inbound::Notification(_))
+            );
+        }
+    })
+    .await
+    .expect("primary-path loss did not produce exact typed path metadata");
+    owner.set_primary_peer_path(&generation, secondary).unwrap();
+    let selected = owner.readback(&generation).unwrap();
+    assert!(
+        selected
+            .peer_path_health()
+            .iter()
+            .filter(|p| p.primary)
+            .map(|p| p.peer_addr)
+            .collect::<Vec<_>>()
+            == [secondary]
+    );
+    assert!(format!("{selected:?}") == "N2Readback { .. }");
+    topology.wait_for_server_accept()?;
+    topology.release_server()?;
+    println!("native N2 multihoming generation and path assertions completed");
+    Ok(())
 }

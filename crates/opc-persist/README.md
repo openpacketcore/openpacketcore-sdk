@@ -21,8 +21,13 @@ accepted single-replica profile.
   follower-local `load_committed_latest`, bounded ordered `load_since`,
   `wait_for_committed_change`, `load_rollback`, `append_commit`,
   `mark_confirmed`, `create_rollback_point`, and `preflight`.
-- `SqliteBackend::open_with_audit_key` opens durable SQLite state. Durable
-  opens require an explicit non-zero `AuditKey`.
+- `SqliteBackend::open_with_audit_key` opens or creates SQLite state. Durable
+  opens require an explicit non-zero `AuditKey`; this API is not reopen-only.
+- Retained configuration voters use explicit `provision_config_authority`,
+  `reopen_config_authority`, and `provision_config_member_repair` operations.
+  Missing retained storage never falls back to creation during reopen. See the
+  [retained lifecycle contract](RETAINED_CONFIG.md) for scope binding,
+  interruption, repair, durability choices and rollback-freshness limits.
 - `AuditKey::new([u8; 32])` rejects all-zero keys, and
   `AuditKey::new_with_epoch` adds an explicit rotation epoch. Consensus binds
   the non-secret epoch/fingerprint into peer and durable identity and verifies
@@ -38,6 +43,12 @@ accepted single-replica profile.
   Openraft state skip bootstrap and re-admit normally. Clean first formation
   fails closed when the canonical node is absent; it never lets another
   pristine node mint competing initial authority.
+- `ConsensusConfigStore::retain_history_idempotent` commits an exact-head,
+  explicitly acknowledged retention decision with `ConfigHistoryRetention` and
+  `ConfigHistoryLimits`. `ConfigHistoryFull` rejects capacity overflow atomically;
+  `ConfigHistoryProtected` rejects unresolved history references. The authenticated
+  `retained_history_floor` distinguishes an intentionally pruned cursor from
+  corruption. Raft snapshots alone do not prune this application history.
 - `ConsensusConfigStore::rpc_handler` exposes the shared bounded inbound
   consensus port. `opc-persist` does not contain a second TCP or TLS transport.
 - `ConsensusConfigStore::ensure_local_authority` performs a local-only
@@ -75,6 +86,12 @@ async fn open_store() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
 }
 ```
 
+`ConsumerCheckpointStore` provides separate, sealed single-owner consumer
+storage with explicit provision/reopen, bounded CAS/readback and owned shutdown.
+It implements no configuration-authoring or voter trait. Its
+[consumer contract](../opc-config-bus-consensus/CONSUMER_CHECKPOINT.md) documents
+the exact custody, apply ordering and rollback-freshness limits.
+
 ## One consensus authority
 
 The HA composition is:
@@ -105,17 +122,36 @@ and snapshot lineage. The removed custom Raft implementation, majority config
 wrapper, TCP peer/server, and standalone consensus-node binary are not
 alternative authority paths.
 
-Config command and config-specific RPC revision 3 add an inline named rollback
-point to the same deterministic state-machine mutation as its encrypted
-commit. Revisions 1 and 2 remain replayable only with their original semantics.
-Mixed config-consensus revisions do not negotiate: drain config writers, stop
-the complete voter set, upgrade every member, and restart the set together.
+Config command and config-specific RPC revision 7 separate mutation checkpoints
+from verified-export retention authority. Revision 6 added authenticated management
+key transitions, frozen exports and required external checkpoints. Revision 5
+introduced the replicated management ledger and authenticated operation recovery.
+Revisions 1 through 6 retain their
+original command semantics, including revision 4's acknowledged application
+history retention. Configuration storage and snapshot representation 5 carry
+the authenticated authorities and management continuity state. Earlier representations are
+refused; a coordinated binary restart alone is not a state conversion. See
+[the management-audit contract](../../docs/replicated-management-audit.md) for
+admission, atomic results, privacy, bounded recovery and the remaining
+protocol integration boundary,
+[ADR 0025](../../docs/adr/0025-management-audit-continuity.md) for signing,
+export, checkpoint and pruning contracts, and
+[ADR 0023](../../docs/adr/0023-bounded-configuration-history.md) for the existing
+configuration-history bounds and protected references.
 
 Creating the `config_raft_identity` table claims the database for Openraft in
 the same immediate SQLite transaction that checks or imports legacy state.
-Every public standalone mutation checks that marker under the same connection
-lock and fails closed after the claim, including mutations through a retained
-or freshly reopened `SqliteBackend` clone. The backend exposes neither its raw
+Every public standalone mutation checks consensus metadata under the same
+connection lock. Each backend clone also retains the claimed requirement, so
+even removing all consensus tables cannot re-enable local writes. Live history
+reads authenticate the complete retained metadata chain and query it in one
+SQLite read transaction; missing or modified authority is a refusal, including
+negative lookups. The same transaction checks the SDK-defined base and consensus
+schema before reads or mutation, rejecting unexpected executable or temporary
+objects so a lifecycle update cannot re-authenticate unrelated damage. Snapshot
+installation checks the destination schema before replacing any authority rows;
+an admitted schema still permits repair of damaged rows from an authenticated
+snapshot. The backend exposes neither its raw
 SQLite connection nor its audit key, and `AuditKey` does not expose key bytes;
 typed operations are the only safe public authority surface. Protect the
 database directory with the CNF's normal filesystem identity and permissions,

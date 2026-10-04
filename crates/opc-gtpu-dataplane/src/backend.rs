@@ -100,6 +100,24 @@ pub enum GtpuSessionSelectorRetiringRecovery {
 /// and deterministic.
 #[async_trait]
 pub trait GtpuDataplaneBackend: Send + Sync + std::fmt::Debug {
+    /// Open the shared control receive queue for one managed attachment.
+    ///
+    /// Repeated calls share the same socket and require one caller-selected
+    /// receive consumer. No raw descriptor or forwarding authority is issued.
+    /// A supported backend invalidates outstanding ports on attachment removal,
+    /// replacement or backend loss, including already prepared response plans.
+    /// The current eBPF implementation supports concrete IPv4 endpoints only.
+    /// Linux kernel, mock and unsupported adapters return the exact unsupported
+    /// feature below; they do not bind a competing socket or simulate parity.
+    async fn open_gtpu_control_port(
+        &self,
+        _device: &GtpDevice,
+    ) -> Result<std::sync::Arc<dyn crate::control_port::GtpuControlPort>, GtpuError> {
+        Err(GtpuError::UnsupportedFeature {
+            feature: "gtpu_control_port",
+        })
+    }
+
     /// Report whether this backend can issue a trusted production GTP-U
     /// traffic-continuity proof.
     ///
@@ -227,6 +245,32 @@ pub trait GtpuDataplaneBackend: Send + Sync + std::fmt::Debug {
         })
     }
 
+    /// Collect a replacement assessment without extending or immediately
+    /// revoking the current predecessor proof.
+    ///
+    /// The predecessor must still validate under this exact canonical lease.
+    /// A trusted adapter retains at most one predecessor and one successor
+    /// for the group; callers keep the predecessor session alive until they
+    /// publish the new opaque proof, then close it before renewing again.
+    /// Fresh registration and sample authority belong to the SDK. The old
+    /// assessment keeps its original expiry, and source loss, drift and
+    /// authority replacement continue to invalidate protected use.
+    ///
+    /// Cancellation before delivery retains a bounded pending successor for
+    /// retry with the same predecessor. Closing that predecessor cleans up an
+    /// undelivered successor. A delivered successor owns its own lifecycle:
+    /// later predecessor cleanup cannot revoke it. Existing backends fail
+    /// closed; the ordinary begin operation retains its supersession contract.
+    async fn renew_gtpu_traffic_proof(
+        &self,
+        _predecessor: &GtpuTrafficProof,
+        _authority: GtpuTrafficProofAuthorityLease,
+    ) -> Result<GtpuTrafficProofSession, GtpuError> {
+        Err(GtpuError::UnsupportedFeature {
+            feature: "gtpu_traffic_proof_renewal",
+        })
+    }
+
     /// Construct and hand off one exact challenge for this backend's live attempt.
     ///
     /// After SDK route resolution and packet construction, the backend
@@ -333,6 +377,20 @@ pub trait GtpuDataplaneBackend: Send + Sync + std::fmt::Debug {
         GtpuCapability::Missing
     }
 
+    /// Explain a current non-Available TFT capability without exposing values.
+    ///
+    /// Existing implementations inherit a coarse reason from their capability
+    /// method. Native adapters may provide a more specific prerequisite or
+    /// state reason. `None` means Available at the time of this observation;
+    /// neither this method nor the older capability method authorizes a write.
+    fn tft_uplink_classification_unavailable_reason(
+        &self,
+    ) -> Option<crate::TftUplinkClassificationUnavailableReason> {
+        crate::TftUplinkClassificationUnavailableReason::for_capability(
+            self.tft_uplink_classification_capability(),
+        )
+    }
+
     /// Validate whether one complete TFT classifier can be represented by this
     /// backend without changing runtime state.
     ///
@@ -348,6 +406,9 @@ pub trait GtpuDataplaneBackend: Send + Sync + std::fmt::Debug {
     }
 
     /// Read the exact desired/observed TFT classifier for one attachment/PAA.
+    ///
+    /// `paa` selects the classifier whose [`crate::TftUplinkPaaSet`] contains
+    /// it: the IPv4 PAA, or any address inside the owned IPv6 `/64`.
     ///
     /// `Present` proves one complete classifier under this backend's authority.
     /// Partial, mixed, stale, or otherwise unprovable state is `Indeterminate`,
@@ -386,6 +447,12 @@ pub trait GtpuDataplaneBackend: Send + Sync + std::fmt::Debug {
     ///
     /// Absence is idempotent, foreign complete ownership is `Conflict`, and
     /// partial, mixed, stale, or otherwise unprovable state is `Indeterminate`.
+    ///
+    /// Removal never interrupts default-bearer uplink: while a classifier
+    /// with a default bearer is being removed, including after an
+    /// interrupted removal, every unmarked packet it owns is forwarded as
+    /// either the complete classifier or its absent successor forwards it. A
+    /// classifier without a default bearer keeps dropping until it is absent.
     async fn remove_tft_uplink_classifier_exact(
         &self,
         _expected: TftUplinkClassifier,
@@ -888,6 +955,25 @@ pub trait GtpuDataplaneBackend: Send + Sync + std::fmt::Debug {
         })
     }
 
+    /// Submit one End Marker for each distinct outgoing N3 tunnel in the
+    /// SDK-issued request, after exact retirement and classifier quiescence.
+    ///
+    /// Implementations must hold the exclusive namespace effect lease, verify
+    /// the terminal stamp and complete absence before and after a trusted grace
+    /// period, and use each original tunnel's IPs, UDP ports and peer TEID. A
+    /// receipt means local submission only; failures after a send are
+    /// indeterminate. No caller-supplied retired flag or raw tuple is authority.
+    /// `UnsupportedFeature` is permitted only before any submission and must
+    /// reject the entire requested profile, including mixed tunnel graphs.
+    async fn submit_n3_end_markers(
+        &self,
+        _request: crate::GtpuN3EndMarkerRequest,
+    ) -> Result<crate::GtpuN3EndMarkerReceipt, GtpuError> {
+        Err(GtpuError::UnsupportedFeature {
+            feature: "n3_end_marker_submission",
+        })
+    }
+
     /// Qualify one complete retired selector source for RFC 017 reuse.
     ///
     /// This is deliberately distinct from [`Self::authorize_selector_reuse`]:
@@ -987,6 +1073,21 @@ pub trait GtpuDataplaneBackend: Send + Sync + std::fmt::Debug {
     ) -> Result<crate::GtpuSessionSelectorBackendReceipt, GtpuError> {
         Err(GtpuError::UnsupportedFeature {
             feature: "gtpu_selector_namespace_authorized_provision",
+        })
+    }
+
+    /// Prove the exact precommitted binding and complete empty authority
+    /// inventory for a never-admitted relocation. This read-only operation
+    /// takes the backend's current host lock and validates the full graph,
+    /// absence of terminal fences, marker identity, every authority map and
+    /// request currentness before and after readback. A binding-only lookup
+    /// or an empty operation-stamp map alone is insufficient.
+    async fn read_pristine_selector_namespace(
+        &self,
+        _request: crate::GtpuSessionSelectorPristineReadbackRequest,
+    ) -> Result<crate::GtpuSessionSelectorBackendReceipt, GtpuError> {
+        Err(GtpuError::UnsupportedFeature {
+            feature: "gtpu_selector_pristine_readback",
         })
     }
 
@@ -1156,6 +1257,51 @@ pub trait GtpuDataplaneBackend: Send + Sync + std::fmt::Debug {
         PdpContextReconciliationCapabilities::unsupported()
     }
 
+    /// Report support for the complete N3 forwarding role, separately from
+    /// software PSC parsing/construction and existing PDP reconciliation.
+    ///
+    /// All shipped adapters inherit `Missing`. Codec or mock packet success
+    /// cannot qualify production forwarding, exact generation readback,
+    /// stale-writer fencing, or removal/End Marker ordering. A future positive
+    /// report requires those contracts and qualified packet behaviour; this
+    /// coarse support query grants no attachment or mutation authority.
+    fn n3_forwarding_capability(&self, _role: crate::n3::N3ForwardingRole) -> GtpuCapability {
+        GtpuCapability::Missing
+    }
+
+    /// Inspect support for one installed N3IWF QFI per inner-family entry.
+    ///
+    /// This bounded profile inserts uplink PSC and requires one matching
+    /// downlink PSC before applying the entry's complete mark. It uses the
+    /// existing grouped selector admission and exact readback. It does not
+    /// qualify multiple QFIs sharing a PAA, reflective QoS policy, fragmented
+    /// outer reassembly, or removal/End Marker ordering. The complete-role
+    /// query above therefore remains `Missing`.
+    ///
+    /// A positive report requires an exact currently qualified attachment;
+    /// it grants no mutation or peer-authentication authority.
+    async fn n3_fixed_flow_capability(
+        &self,
+        _attachment: GtpuSessionAttachmentSelector,
+    ) -> Result<GtpuCapability, GtpuError> {
+        Ok(GtpuCapability::Missing)
+    }
+
+    /// Report support for PDP contexts whose inner UE address is IPv6.
+    ///
+    /// `Available` means [`Self::install_pdp_context`],
+    /// [`Self::install_pdp_context_classified`], [`Self::read_pdp_context`],
+    /// [`Self::remove_pdp_context`] and [`Self::remove_pdp_context_exact`]
+    /// accept an IPv6 `ms_address` naming the PDN connection's /64 prefix
+    /// (TS 23.401 clause 5.3.1.2.2, TS 29.274 clause 8.14) and match every
+    /// packet address inside that prefix. An IPv4v6 PDN connection is two
+    /// family-scoped contexts, one per inner family, which may share the
+    /// bearer's TEIDs, peer and mark. This coarse report grants no attachment
+    /// or mutation authority; every mutation still revalidates it.
+    fn pdp_inner_ipv6_capability(&self) -> GtpuCapability {
+        GtpuCapability::Missing
+    }
+
     /// Report support for the authority-bearing durable restart-recovery
     /// request independently of generationless exact removal.
     fn pdp_restart_recovery_capability(&self) -> GtpuCapability {
@@ -1220,6 +1366,27 @@ mod tests {
     #[derive(Debug)]
     struct LegacyExternalBackend;
 
+    #[test]
+    fn tft_unavailable_reason_default_tracks_existing_capability() {
+        use crate::TftUplinkClassificationUnavailableReason as Reason;
+        let backend = crate::MockGtpuDataplaneBackend::new();
+        for (capability, reason) in [
+            (GtpuCapability::Available, None),
+            (GtpuCapability::Missing, Some(Reason::BackendUnavailable)),
+            (GtpuCapability::Unknown, Some(Reason::BackendUnknown)),
+            (
+                GtpuCapability::PermissionDenied,
+                Some(Reason::PermissionDenied),
+            ),
+        ] {
+            backend.set_tft_uplink_classification_capability(capability);
+            assert_eq!(
+                backend.tft_uplink_classification_unavailable_reason(),
+                reason
+            );
+        }
+    }
+
     #[async_trait]
     impl GtpuDataplaneBackend for LegacyExternalBackend {
         async fn create_device(
@@ -1256,6 +1423,10 @@ mod tests {
     #[tokio::test]
     async fn legacy_external_implementer_gets_fail_closed_defaults() {
         let backend: Box<dyn GtpuDataplaneBackend> = Box::new(LegacyExternalBackend);
+        assert_eq!(
+            backend.tft_uplink_classification_unavailable_reason(),
+            Some(crate::TftUplinkClassificationUnavailableReason::BackendUnavailable)
+        );
         assert_eq!(
             backend.pdp_context_reconciliation_capabilities(),
             PdpContextReconciliationCapabilities::unsupported()
@@ -1318,6 +1489,7 @@ mod tests {
             bearer_mark: None,
             egress_dscp: None,
             uplink_source_port_policy: crate::GtpuUplinkSourcePortPolicy::LegacyServicePort,
+            downlink_inner_mtu: None,
         };
         assert!(matches!(
             backend.acquire_pdp_live_writer_proof().await,

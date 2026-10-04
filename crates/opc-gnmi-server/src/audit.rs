@@ -1,5 +1,9 @@
 //! gNMI audit helpers over the shared management-plane audit contract.
 
+use std::future::poll_fn;
+use std::panic::{catch_unwind, AssertUnwindSafe};
+use std::task::Poll;
+
 use opc_config_model::{RequestId, TransportType, TrustedPrincipal, YangPath};
 use opc_mgmt_audit::{AuditOperation, AuditOutcome, AuditReasonCode, AuditSink, SchemaNodePath};
 use opc_mgmt_schema::SchemaRegistry;
@@ -7,8 +11,8 @@ use opc_mgmt_schema::SchemaRegistry;
 use crate::GnmiError;
 
 /// Records one gNMI audit event, mapping sink failures to a generic server
-/// error. Callers must preserve the original client-facing error when audit
-/// succeeds.
+/// error. Contains sink construction and polling unwinds without exposing their
+/// payload. Mutation callers distinguish required intent from terminal records.
 pub(crate) async fn record_audit(
     audit: &dyn AuditSink,
     request_id: RequestId,
@@ -17,19 +21,26 @@ pub(crate) async fn record_audit(
     outcome: AuditOutcome,
     paths: Vec<SchemaNodePath>,
 ) -> Result<(), GnmiError> {
-    audit
-        .record_async(
-            &opc_mgmt_audit::AuditEvent::new(
-                request_id,
-                principal,
-                TransportType::Gnmi,
-                operation,
-                outcome,
-            )
-            .with_paths(paths),
-        )
-        .await
-        .map_err(|_| GnmiError::schema("gNMI audit sink failed"))
+    let event = opc_mgmt_audit::AuditEvent::new(
+        request_id,
+        principal,
+        TransportType::Gnmi,
+        operation,
+        outcome,
+    )
+    .with_paths(paths);
+    let mut future = catch_unwind(AssertUnwindSafe(|| audit.record_async(&event)))
+        .map_err(|_| GnmiError::schema("gNMI audit sink failed"))?;
+    poll_fn(
+        |cx| match catch_unwind(AssertUnwindSafe(|| future.as_mut().poll(cx))) {
+            Ok(Poll::Pending) => Poll::Pending,
+            Ok(Poll::Ready(Ok(()))) => Poll::Ready(Ok(())),
+            Ok(Poll::Ready(Err(_))) | Err(_) => {
+                Poll::Ready(Err(GnmiError::schema("gNMI audit sink failed")))
+            }
+        },
+    )
+    .await
 }
 
 /// Maps a gNMI error class to a stable audit outcome.

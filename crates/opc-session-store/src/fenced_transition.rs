@@ -1055,14 +1055,27 @@ impl fmt::Debug for FencedTransitionRequest {
 #[derive(Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub(crate) enum PreparedFencedTransitionProtection {
-    LocalAeadV1 { scope_commitment: [u8; 32] },
-    RemoteSealV1 { scope_commitment: [u8; 32] },
-    ConsensusPhysicalV1 { storage_commitment: [u8; 32] },
+    LocalAeadV1 {
+        scope_commitment: [u8; 32],
+    },
+    RemoteSealV1 {
+        scope_commitment: [u8; 32],
+    },
+    ConsensusPhysicalV1 {
+        storage_commitment: [u8; 32],
+    },
     // Append-only: the discriminants above are part of the prepared-token V1
     // compatibility corpus. This binds an opaque token to one authenticated
     // application-consumer physical boundary without retaining any identity
     // text or endpoint/topology details.
-    AuthenticatedConsumerPhysicalV1 { binding_commitment: [u8; 32] },
+    AuthenticatedConsumerPhysicalV1 {
+        binding_commitment: [u8; 32],
+    },
+    // Lab tokens bind only one process-local allocation, never a voter.
+    #[cfg(feature = "lab-memory")]
+    LabMemoryPhysicalV1 {
+        instance_commitment: [u8; 32],
+    },
 }
 
 /// Frozen payload of the prepared-transition V1 wire frame.
@@ -1129,8 +1142,10 @@ impl fmt::Debug for PreparedFencedTransitionLookup {
 #[derive(Clone, PartialEq, Eq, thiserror::Error)]
 #[non_exhaustive]
 pub enum FencedTransitionExecuteError {
-    /// This invocation did not dispatch any request because its exact durable
-    /// prepared binding was unavailable.
+    /// This invocation did not dispatch the request: its exact durable
+    /// prepared binding was unavailable, no application byte was written, or
+    /// the endpoint answered with a closed `Unavailable` consumer rejection
+    /// before dispatch.
     #[error("fenced transition was not transmitted")]
     NotTransmitted,
     /// The exact request may have reached its effect boundary.
@@ -1425,6 +1440,84 @@ impl Serialize for PreparedFencedTransition {
     }
 }
 
+/// Protected V2 transition retained under one caller-stable identity.
+///
+/// A protected wrapper creates this value only after it has durably bound the
+/// caller's [`FencedTransitionRequestId`] to the exact sealed physical V2
+/// request in its [`crate::FencedTransitionV2RecoveryJournal`]. The value is
+/// opaque: it exposes neither the sealed request nor any way to construct
+/// one, so a caller cannot lower it into a replayable physical transition.
+/// Only the wrapper that journaled it can dispatch or query it, and only
+/// after reloading and comparing its authenticated journal row.
+#[derive(Clone, PartialEq, Eq)]
+pub struct PreparedFencedTransitionV2 {
+    request_id: FencedTransitionRequestId,
+    request: Box<FencedTransitionV2Request>,
+}
+
+impl PreparedFencedTransitionV2 {
+    pub(crate) fn new(
+        request_id: FencedTransitionRequestId,
+        request: FencedTransitionV2Request,
+    ) -> Self {
+        Self {
+            request_id,
+            request: Box::new(request),
+        }
+    }
+
+    /// Caller-stable identity under which the sealed request is retained.
+    pub const fn request_id(&self) -> FencedTransitionRequestId {
+        self.request_id
+    }
+
+    /// History epoch that the protected wrapper selected at preparation.
+    ///
+    /// The epoch is chosen internally from the linearized active epoch; it is
+    /// exposed only so a caller can relate the retained transition to a later
+    /// linearized history state.
+    pub fn history_epoch(&self) -> FencedTransitionV2HistoryEpoch {
+        self.request.request_id().epoch()
+    }
+
+    pub(crate) fn physical_request(&self) -> &FencedTransitionV2Request {
+        &self.request
+    }
+}
+
+impl fmt::Debug for PreparedFencedTransitionV2 {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("PreparedFencedTransitionV2(<redacted>)")
+    }
+}
+
+/// Durable lookup result for one caller-stable protected V2 identity.
+///
+/// `Absent` describes only the SDK recovery journal. It is distinct from
+/// [`FencedTransitionV2Status::NotFound`], which is a non-exclusionary
+/// observation of the consensus receipt history.
+#[derive(Clone, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum PreparedFencedTransitionV2Lookup {
+    /// The exact sealed request is durably retained for status recovery.
+    Found(PreparedFencedTransitionV2),
+    /// No sealed request is retained for this identity in the journal.
+    Absent,
+}
+
+impl fmt::Debug for PreparedFencedTransitionV2Lookup {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let kind = match self {
+            Self::Found(_) => "found",
+            Self::Absent => "absent",
+        };
+        formatter
+            .debug_struct("PreparedFencedTransitionV2Lookup")
+            .field("kind", &kind)
+            .finish_non_exhaustive()
+    }
+}
+
 /// A V2 request whose identity commits to its exact canonical body.
 ///
 /// Construct it once with [`FencedTransitionV2Request::new`] and retain the
@@ -1443,6 +1536,59 @@ pub struct FencedTransitionV2Request {
 }
 
 impl FencedTransitionV2Request {
+    #[cfg(target_os = "linux")]
+    pub(crate) fn copy_for_native_read(&self) -> std::io::Result<Self> {
+        // The original durable-log decoder has already admitted the complete
+        // row. Preserve even a conflicting body/ID exactly: from_parts would
+        // run business validation and change that existing log vocabulary.
+        Ok(Self {
+            request_id: self.request_id,
+            lease: crate::consensus::native::owned::transition_lease(&self.lease)?,
+            mutation: crate::consensus::native::owned::transition_mutation(&self.mutation)?,
+        })
+    }
+
+    pub(crate) fn log_row_reuse_allocation_bytes(&self) -> Option<usize> {
+        let lease = match &self.lease {
+            FencedTransitionLease::Acquire { key, owner, .. } => key
+                .log_row_reuse_allocation_bytes()?
+                .checked_add(owner.allocation_capacity())?,
+            FencedTransitionLease::Renew { lease, .. } => lease.log_row_reuse_allocation_bytes()?,
+        };
+        match &self.mutation {
+            FencedTransitionMutation::Create { record }
+            | FencedTransitionMutation::Update { record, .. } => lease
+                .checked_add(std::mem::size_of::<StoredSessionRecord>())?
+                .checked_add(record.key.log_row_reuse_allocation_bytes()?)?
+                .checked_add(record.owner.allocation_capacity())?
+                .checked_add(record.state_type.allocation_capacity())?
+                // Sharing is deliberately charged per occurrence; no uniqueness
+                // assumption or payload clone is needed for this upper bound.
+                .checked_add(record.payload.log_row_reuse_allocation_bytes()?),
+            FencedTransitionMutation::Delete { .. }
+            | FencedTransitionMutation::RefreshTtl { .. } => Some(lease),
+        }
+    }
+
+    pub(crate) fn normalize_log_row_reuse_backing(&mut self) {
+        match &mut self.lease {
+            FencedTransitionLease::Acquire { key, .. } => {
+                key.normalize_log_row_reuse_backing();
+            }
+            FencedTransitionLease::Renew { lease, .. } => {
+                lease.normalize_log_row_reuse_backing();
+            }
+        }
+        match &mut self.mutation {
+            FencedTransitionMutation::Create { record }
+            | FencedTransitionMutation::Update { record, .. } => {
+                record.key.normalize_log_row_reuse_backing();
+            }
+            FencedTransitionMutation::Delete { .. }
+            | FencedTransitionMutation::RefreshTtl { .. } => {}
+        }
+    }
+
     /// Construct a new self-authenticating V2 request.
     ///
     /// Reusing the same `epoch` and `nonce` with the same lease and mutation
@@ -1651,6 +1797,17 @@ fn valid_v1_protection_stack(layers: &[Option<PreparedFencedTransitionProtection
         AuthenticatedConsumerPhysicalV1, ConsensusPhysicalV1, LocalAeadV1, RemoteSealV1,
     };
 
+    #[cfg(feature = "lab-memory")]
+    if matches!(
+        layers,
+        [
+            Some(PreparedFencedTransitionProtection::LabMemoryPhysicalV1 { .. }),
+            Some(LocalAeadV1 { .. } | RemoteSealV1 { .. })
+        ]
+    ) {
+        return true;
+    }
+
     matches!(
         layers,
         [] | [Some(_)]
@@ -1857,9 +2014,16 @@ impl fmt::Debug for FencedTransitionV2Request {
 /// has no negotiable history-limit fields: two implementations advertising
 /// [`FencedTransitionV2Capability::V2`] must report the same digest.
 pub fn fenced_transition_v2_profile_digest() -> [u8; FENCED_TRANSITION_V2_BODY_COMMITMENT_BYTES] {
-    fenced_transition_v2_profile_digest_with_retention_inputs(
-        FENCED_TRANSITION_V2_RETENTION_PROFILE_INPUTS,
-    )
+    // Every input is an immutable protocol constant. Receipt validation still
+    // authenticates each row; rehashing these same descriptors for every row
+    // only repeats the construction of the protocol's fixed domain separator.
+    static DIGEST: std::sync::OnceLock<[u8; FENCED_TRANSITION_V2_BODY_COMMITMENT_BYTES]> =
+        std::sync::OnceLock::new();
+    *DIGEST.get_or_init(|| {
+        fenced_transition_v2_profile_digest_with_retention_inputs(
+            FENCED_TRANSITION_V2_RETENTION_PROFILE_INPUTS,
+        )
+    })
 }
 
 #[cfg(test)]
@@ -4597,6 +4761,12 @@ mod tests {
                         + FENCED_TRANSITION_V2_RECLAIM_BATCH
             );
         }
+        assert_eq!(
+            fenced_transition_v2_profile_digest(),
+            fenced_transition_v2_profile_digest_with_retention_inputs(
+                FENCED_TRANSITION_V2_RETENTION_PROFILE_INPUTS,
+            ),
+        );
         assert_eq!(
             fenced_transition_v2_profile_digest(),
             [

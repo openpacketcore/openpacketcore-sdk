@@ -4668,6 +4668,132 @@ impl fmt::Debug for GtpuDownlinkEndpoint {
     }
 }
 
+/// What the eBPF backend does with a downlink inner IPv4 packet that has
+/// Don't Fragment set and exceeds its session's [`GtpuDownlinkInnerMtu`].
+///
+/// Under both policies tc hands the packet, undecapsulated, to the
+/// backend-owned consumer
+/// ([`GtpuControlPort::try_receive_downlink`](crate::control_port::GtpuControlPort::try_receive_downlink)),
+/// so the host never forwards it. The host also never emits its own error
+/// while the backend-owned queue is bound; see
+/// [`GtpuProbe::downlink_inner_mtu_enforcement`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+#[non_exhaustive]
+pub enum GtpuDownlinkOversizePolicy {
+    /// The default: fragment the inner packet before encapsulation (RFC 4459
+    /// section 3.4). The consumer clears DF and returns RFC 791 fragments of
+    /// at most the MTU as
+    /// [`GtpuDownlinkEvent::Fragmented`](crate::GtpuDownlinkEvent::Fragmented),
+    /// which the caller injects toward XFRM; the UE reassembles them.
+    ///
+    /// Clearing DF is an owner-approved policy, not standard router
+    /// behaviour. RFC 791 section 2.3 and RFC 6864 section 4.3 forbid
+    /// fragmenting a datagram with DF set or clearing DF in transit, and RFC
+    /// 1191 section 4 has a router discard it and signal the originator
+    /// instead. RFC 4459 section 3.4 describes clearing DF before
+    /// encapsulation as a non-compliant but deployed tunnel practice. The
+    /// originator's Path MTU Discovery never learns the tunnel MTU.
+    FragmentInner,
+    /// The explicit opt-in alternative: do not forward the packet, and send at
+    /// most one RFC 1191 Fragmentation Needed error toward its originator,
+    /// sourced from the UE PAA and carried in the UE's default-bearer uplink
+    /// G-PDU. The PAA is the only inner source the PGW's per-PDN
+    /// anti-spoofing admits. The ePDG is acting as a router on that path, so
+    /// RFC 1812 section 4.3.2.4 would have it use its own address, and the
+    /// originator attributes the error to the subscriber.
+    InTunnelPacketTooBig,
+}
+
+/// Per-session downlink inner (tunnel) MTU with its oversized-packet policy.
+///
+/// The value is the session's downlink inner MTU supplied by the consumer:
+/// for an ePDG, the SWu access MTU minus the negotiated ESP/UDP/IP
+/// encapsulation overhead. An inner IPv4 packet with Don't Fragment set that
+/// exceeds it is handled by its [`GtpuDownlinkOversizePolicy`]: fragmented by
+/// default ([`Self::new`]), or signalled in-tunnel when explicitly opted in
+/// ([`Self::in_tunnel_packet_too_big`]). Leave
+/// [`GtpPdpContext::downlink_inner_mtu`] `None` to keep the existing
+/// behaviour.
+///
+/// The MTU is from [`opc_gtpu_ebpf_common::DOWNLINK_INNER_MTU_MIN`] (576, the
+/// RFC 791 IPv4 floor) to [`opc_gtpu_ebpf_common::DOWNLINK_INNER_MTU_MAX`]
+/// (32,767, the commit record's 15-bit field). `Debug` exposes the value and
+/// policy; they are path properties, not subscriber identifiers.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct GtpuDownlinkInnerMtu {
+    mtu: std::num::NonZeroU16,
+    policy: GtpuDownlinkOversizePolicy,
+}
+
+impl GtpuDownlinkInnerMtu {
+    /// The default policy at `mtu`: fragment an oversized DF inner packet
+    /// ([`GtpuDownlinkOversizePolicy::FragmentInner`]). Values outside
+    /// 576..=32,767 return `None`.
+    #[must_use]
+    pub const fn new(mtu: u16) -> Option<Self> {
+        Self::with_policy(mtu, GtpuDownlinkOversizePolicy::FragmentInner)
+    }
+
+    /// Explicitly opt one context into in-tunnel Packet Too Big at `mtu`
+    /// ([`GtpuDownlinkOversizePolicy::InTunnelPacketTooBig`]). Values outside
+    /// 576..=32,767 return `None`.
+    #[must_use]
+    pub const fn in_tunnel_packet_too_big(mtu: u16) -> Option<Self> {
+        Self::with_policy(mtu, GtpuDownlinkOversizePolicy::InTunnelPacketTooBig)
+    }
+
+    const fn with_policy(mtu: u16, policy: GtpuDownlinkOversizePolicy) -> Option<Self> {
+        if mtu < opc_gtpu_ebpf_common::DOWNLINK_INNER_MTU_MIN
+            || mtu > opc_gtpu_ebpf_common::DOWNLINK_INNER_MTU_MAX
+        {
+            return None;
+        }
+        match std::num::NonZeroU16::new(mtu) {
+            Some(mtu) => Some(Self { mtu, policy }),
+            None => None,
+        }
+    }
+
+    /// Return the MTU in octets.
+    #[must_use]
+    pub const fn get(self) -> u16 {
+        self.mtu.get()
+    }
+
+    /// Return the non-zero MTU.
+    #[must_use]
+    pub const fn as_non_zero(self) -> std::num::NonZeroU16 {
+        self.mtu
+    }
+
+    /// Return the oversized-packet policy.
+    #[must_use]
+    pub const fn policy(self) -> GtpuDownlinkOversizePolicy {
+        self.policy
+    }
+
+    /// Encode as the commit record's downlink inner MTU field.
+    pub(crate) const fn to_wire(self) -> Option<opc_gtpu_ebpf_common::DownlinkInnerMtu> {
+        match self.policy {
+            GtpuDownlinkOversizePolicy::FragmentInner => {
+                opc_gtpu_ebpf_common::DownlinkInnerMtu::fragment_inner(self.mtu.get())
+            }
+            GtpuDownlinkOversizePolicy::InTunnelPacketTooBig => {
+                opc_gtpu_ebpf_common::DownlinkInnerMtu::in_tunnel_packet_too_big(self.mtu.get())
+            }
+        }
+    }
+
+    /// Decode the commit record's downlink inner MTU field.
+    pub(crate) const fn from_wire(wire: opc_gtpu_ebpf_common::DownlinkInnerMtu) -> Option<Self> {
+        if wire.is_packet_too_big() {
+            Self::in_tunnel_packet_too_big(wire.mtu())
+        } else {
+            Self::new(wire.mtu())
+        }
+    }
+}
+
 /// GTP-U PDP context programmed into the Linux `gtp` kernel module.
 #[derive(Clone, PartialEq, Eq, Hash)]
 pub struct GtpPdpContext {
@@ -4720,6 +4846,28 @@ pub struct GtpPdpContext {
     /// reject `Some` rather than silently ignoring it. `None` preserves the
     /// backend's pre-DSCP packet and kernel-message behavior.
     pub egress_dscp: Option<DscpCodepoint>,
+    /// Optional per-context downlink inner MTU and its oversized-packet
+    /// policy; see [`GtpuDownlinkInnerMtu`] and [`GtpuDownlinkOversizePolicy`].
+    ///
+    /// With `Some`, a downlink inner IPv4 packet larger than this value with
+    /// Don't Fragment set is not forwarded by tc. The backend-owned control
+    /// port fragments it by default and returns the fragments for the caller
+    /// to inject, or, when the context opted into in-tunnel Packet Too Big,
+    /// sends at most one RFC 1191 Fragmentation Needed error carried in the
+    /// UE's default-bearer uplink G-PDU toward the peer; see
+    /// [`GtpuControlPort::try_receive_downlink`](crate::control_port::GtpuControlPort::try_receive_downlink).
+    /// Backends whose [`GtpuProbe::downlink_inner_mtu_enforcement`] is not
+    /// [`GtpuCapability::Available`] reject `Some`. `None` preserves the
+    /// existing packet behavior and the original commit-record bytes. Open
+    /// the attachment's control port before installing a context with
+    /// `Some`, and keep draining it for the attachment's lifetime; see
+    /// [`GtpuProbe::downlink_inner_mtu_enforcement`].
+    ///
+    /// An older SDK does not tolerate a record carrying an MTU: its retained-graph
+    /// recovery rejects the non-canonical commit and refuses the whole attachment
+    /// as indeterminate, not just that context. Before downgrading, drain every
+    /// MTU-bearing context (reinstall it with `None`, or remove it).
+    pub downlink_inner_mtu: Option<GtpuDownlinkInnerMtu>,
 }
 
 impl fmt::Debug for GtpPdpContext {
@@ -4735,6 +4883,7 @@ impl fmt::Debug for GtpPdpContext {
             .field("bearer_mark", &self.bearer_mark)
             .field("egress_dscp", &self.egress_dscp)
             .field("uplink_source_port_policy", &"<redacted>")
+            .field("downlink_inner_mtu", &self.downlink_inner_mtu)
             .finish()
     }
 }
@@ -4757,6 +4906,7 @@ pub struct GtpuSessionEntry {
     context: GtpPdpContext,
     inner_paa: GtpuSessionPaa,
     local_outer_address: IpAddr,
+    n3_qfi: Option<crate::n3::N3Qfi>,
 }
 
 impl GtpuSessionEntry {
@@ -4774,6 +4924,9 @@ impl GtpuSessionEntry {
             || context.peer_address.is_unspecified()
             || local_outer_address.is_unspecified()
             || context.link_ifindex == 0
+            // The grouped entry ABI carries no downlink inner MTU; refuse it
+            // rather than silently dropping enforcement.
+            || context.downlink_inner_mtu.is_some()
         {
             return Err(GtpuSessionModelError::InvalidContext);
         }
@@ -4795,7 +4948,91 @@ impl GtpuSessionEntry {
             context,
             inner_paa,
             local_outer_address,
+            n3_qfi: None,
         })
+    }
+
+    /// Construct a fixed-flow N3IWF entry from the distinct directional TNLs.
+    ///
+    /// The selected QFI is inserted on uplink and required on downlink. The
+    /// complete mark selects uplink traffic and is applied after downlink
+    /// classification. Installation still requires the existing opaque
+    /// selector admission and qualified grouped backend. This is one flow per
+    /// inner family; it does not provide a multi-QFI fallback policy.
+    ///
+    /// # Errors
+    /// Returns the same address, PAA, and attachment errors as [`Self::new`].
+    pub fn from_n3(
+        intent: crate::n3::N3ForwardingIntent,
+        inner_address: IpAddr,
+        link_ifindex: u32,
+        downlink_source_port_policy: GtpuSourcePortPolicy,
+        uplink_source_port_policy: GtpuUplinkSourcePortPolicy,
+        egress_dscp: Option<DscpCodepoint>,
+    ) -> Result<Self, GtpuSessionModelError> {
+        match intent.role() {
+            crate::n3::N3ForwardingRole::N3iwf => {}
+        }
+        let mut entry = Self::new(
+            GtpPdpContext {
+                local_teid: intent.local_downlink().teid(),
+                peer_teid: intent.received_uplink().teid(),
+                ms_address: inner_address,
+                peer_address: intent.received_uplink().destination(),
+                link_ifindex,
+                downlink_source_port_policy,
+                gtp_version: GtpVersion::V1,
+                bearer_mark: intent.flow().mark(),
+                egress_dscp,
+                uplink_source_port_policy,
+                downlink_inner_mtu: None,
+            },
+            intent.local_downlink().local_address(),
+        )?;
+        entry.n3_qfi = Some(intent.flow().qfi());
+        Ok(entry)
+    }
+
+    /// Exact fixed-flow N3 QFI; `None` means ordinary GTP-U without PSC enforcement.
+    #[must_use]
+    pub const fn n3_qfi(&self) -> Option<crate::n3::N3Qfi> {
+        self.n3_qfi
+    }
+
+    /// Reconstruct the distinct uplink/downlink TNL and flow intent on readback.
+    #[must_use]
+    pub fn n3_intent(&self) -> Option<crate::n3::N3ForwardingIntent> {
+        use crate::n3::{
+            LocalN3DownlinkTnl, N3FlowMarking, N3ForwardingIntent, N3ForwardingRole,
+            ReceivedN3UplinkTnl,
+        };
+        Some(N3ForwardingIntent::new(
+            N3ForwardingRole::N3iwf,
+            ReceivedN3UplinkTnl::new(self.context.peer_address, self.context.peer_teid).ok()?,
+            LocalN3DownlinkTnl::new(self.local_outer_address, self.context.local_teid).ok()?,
+            N3FlowMarking::new(self.n3_qfi?, self.context.bearer_mark),
+        ))
+    }
+
+    pub(crate) fn restore_n3_qfi(self, qfi: u8) -> Option<Self> {
+        use crate::n3::{
+            LocalN3DownlinkTnl, N3FlowMarking, N3ForwardingIntent, N3ForwardingRole, N3Qfi,
+            ReceivedN3UplinkTnl,
+        };
+        Self::from_n3(
+            N3ForwardingIntent::new(
+                N3ForwardingRole::N3iwf,
+                ReceivedN3UplinkTnl::new(self.context.peer_address, self.context.peer_teid).ok()?,
+                LocalN3DownlinkTnl::new(self.local_outer_address, self.context.local_teid).ok()?,
+                N3FlowMarking::new(N3Qfi::new(qfi).ok()?, self.context.bearer_mark),
+            ),
+            self.context.ms_address,
+            self.context.link_ifindex,
+            self.context.downlink_source_port_policy,
+            self.context.uplink_source_port_policy,
+            self.context.egress_dscp,
+        )
+        .ok()
     }
 
     /// Complete existing PDP-context policy.
@@ -4993,7 +5230,7 @@ impl fmt::Debug for GtpuSessionGroupSelector {
     }
 }
 
-/// Caller evidence that makes one retired selector graph safe to reuse.
+/// Backend completion class for one exact retired selector graph.
 #[non_exhaustive]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum GtpuSessionSelectorReuseEvidence {
@@ -5010,14 +5247,17 @@ pub enum GtpuSessionSelectorReuseEvidence {
 /// This value carries the complete old semantic graph so a backend can compare
 /// only overlapping selectors and reject invented or cross-device evidence.
 /// It does not authorize direct transfer from a still-live source authority:
-/// exact source removal must already be proven. The one retired graph must
-/// cover every selector newly introduced by the desired reconciliation.
-/// Combining selectors from multiple retired groups is deliberately
-/// fail-closed by the current single-proof API.
+/// exact source removal must already be proven. Whole-set reuse requires the
+/// one retired graph to cover every introduced selector. The separately
+/// issued single-bearer reattach profile permits one never-published local
+/// TEID reserved by the SDK alongside the predecessor's exact PAA/mark.
+/// Combining selectors from multiple retired groups remains fail-closed.
 #[derive(Clone, PartialEq, Eq)]
 pub struct GtpuSessionSelectorReuseProof {
     retired_group: GtpuSessionGroup,
     evidence: GtpuSessionSelectorReuseEvidence,
+    // A distinct SDK admission profile, never asserted by a public caller.
+    single_bearer_reattach: bool,
 }
 
 impl GtpuSessionSelectorReuseProof {
@@ -5032,6 +5272,7 @@ impl GtpuSessionSelectorReuseProof {
         Self {
             retired_group,
             evidence: GtpuSessionSelectorReuseEvidence::TrafficDrained,
+            single_bearer_reattach: false,
         }
     }
 
@@ -5042,7 +5283,17 @@ impl GtpuSessionSelectorReuseProof {
         Self {
             retired_group,
             evidence: GtpuSessionSelectorReuseEvidence::RcuGracePeriodElapsed,
+            single_bearer_reattach: false,
         }
+    }
+
+    pub(crate) fn for_single_bearer_reattach(mut self) -> Self {
+        self.single_bearer_reattach = true;
+        self
+    }
+
+    pub(crate) const fn is_single_bearer_reattach(&self) -> bool {
+        self.single_bearer_reattach
     }
 
     /// Exact graph whose selectors have been retired.
@@ -5051,7 +5302,7 @@ impl GtpuSessionSelectorReuseProof {
         &self.retired_group
     }
 
-    /// Kind of external completion evidence supplied by the caller.
+    /// Kind of external completion observed by the selected backend.
     #[must_use]
     pub const fn evidence(&self) -> GtpuSessionSelectorReuseEvidence {
         self.evidence
@@ -5082,6 +5333,10 @@ impl fmt::Debug for GtpuSessionSelectorReuseProof {
 pub enum GtpuSessionSelectorProvenance {
     /// Reuse after exact removal and explicit drain/grace evidence.
     Reused(GtpuSessionSelectorReuseProof),
+    /// One completely retired single-bearer predecessor supplies the exact
+    /// PAA/mark selectors; the SDK reserves a never-published local TEID in
+    /// the same protected transaction. This is a distinct admission profile.
+    Reattached(GtpuSessionSelectorReuseProof),
 }
 
 /// Complete request for grouped-session convergence.
@@ -5134,6 +5389,7 @@ impl GtpuSessionGroupReconcileRequest {
         if !selector_admission.validates(&desired)
             || !selector_admission.authorizes_install_effect()
             || !selector_admission.is_retired_reissue()
+            || reuse.is_single_bearer_reattach()
             || reuse.retired_group.device_id != desired.device_id
             || reuse.retired_group.id == desired.id
         {
@@ -5143,6 +5399,29 @@ impl GtpuSessionGroupReconcileRequest {
             desired,
             selector_admission,
             selector_provenance: Some(GtpuSessionSelectorProvenance::Reused(reuse)),
+        })
+    }
+
+    pub(crate) fn new_reattached(
+        desired: GtpuSessionGroup,
+        selector_admission: crate::GtpuSessionSelectorAdmission,
+        reuse: GtpuSessionSelectorReuseProof,
+    ) -> Result<Self, GtpuSessionModelError> {
+        if !selector_admission.validates(&desired)
+            || !selector_admission.authorizes_install_effect()
+            || !selector_admission.is_retired_reissue()
+            || !reuse.is_single_bearer_reattach()
+            || !crate::selector_namespace::single_bearer_reattach_is_exact(
+                reuse.retired_group(),
+                &desired,
+            )
+        {
+            return Err(GtpuSessionModelError::SelectorAdmissionMismatch);
+        }
+        Ok(Self {
+            desired,
+            selector_admission,
+            selector_provenance: Some(GtpuSessionSelectorProvenance::Reattached(reuse)),
         })
     }
 
@@ -5530,6 +5809,8 @@ pub enum PdpContextMismatchField {
     DownlinkSourcePortPolicy,
     /// Uplink GTP-U source-port selection policy.
     UplinkSourcePortPolicy,
+    /// Optional downlink inner (tunnel) MTU.
+    DownlinkInnerMtu,
 }
 
 /// Selector axes occupied by valid state that conflicts with a request.
@@ -6306,6 +6587,9 @@ pub(crate) fn pdp_context_mismatches(
     if existing.uplink_source_port_policy != desired.uplink_source_port_policy {
         fields.push(PdpContextMismatchField::UplinkSourcePortPolicy);
     }
+    if existing.downlink_inner_mtu != desired.downlink_inner_mtu {
+        fields.push(PdpContextMismatchField::DownlinkInnerMtu);
+    }
     fields
 }
 
@@ -6564,6 +6848,28 @@ pub struct GtpuProbe {
     /// port unreachable and dropped. A backend must never leave this
     /// implicit.
     pub downlink_outer_fragment_handling: GtpuDownlinkFragmentContract,
+    /// Per-session downlink inner MTU enforcement: inner fragmentation by
+    /// default, or an in-tunnel RFC 1191 Fragmentation Needed error when
+    /// opted in (see [`GtpPdpContext::downlink_inner_mtu`]).
+    ///
+    /// `Available` states that the datapath can enforce the MTU and steer
+    /// over-MTU packets to the backend-owned queue. Fragments are produced,
+    /// and errors sent, only while the embedding application drains that
+    /// queue through
+    /// [`GtpuControlPort::try_receive_downlink`](crate::control_port::GtpuControlPort::try_receive_downlink)
+    /// and injects the returned fragments; otherwise over-MTU packets wait in
+    /// that queue and are dropped when it overflows, never forwarded.
+    ///
+    /// The backend binds that queue when the control port is first opened for
+    /// the attachment and keeps it until the attachment is removed or the
+    /// queue is retired. Nothing is bound before that first open, while the
+    /// process is down across a restart (tc keeps steering from the pinned
+    /// graph), or after a retirement. In those windows the kernel may answer
+    /// steered packets with rate-limited ICMP Port Unreachable toward the
+    /// peer, quoting up to about 512 octets of the inner packet, as it
+    /// answers the UDP/2152 hand-offs. Open the control port before installing any context with a
+    /// downlink inner MTU. Enforcement is tracked in #1019.
+    pub downlink_inner_mtu_enforcement: GtpuCapability,
     /// Optional human-readable detail; static so the probe stays `Copy`.
     pub details: Option<&'static str>,
 }
@@ -6586,6 +6892,7 @@ impl GtpuProbe {
             uplink_source_port_selection: GtpuCapability::Missing,
             uplink_pmtu_enforcement: GtpuCapability::Missing,
             downlink_outer_fragment_handling: GtpuDownlinkFragmentContract::Unsupported,
+            downlink_inner_mtu_enforcement: GtpuCapability::Missing,
             details: Some("dry-run/mock backend"),
         }
     }
@@ -6607,6 +6914,7 @@ impl GtpuProbe {
             uplink_source_port_selection: GtpuCapability::Missing,
             uplink_pmtu_enforcement: GtpuCapability::Missing,
             downlink_outer_fragment_handling: GtpuDownlinkFragmentContract::Unsupported,
+            downlink_inner_mtu_enforcement: GtpuCapability::Missing,
             details: Some("GTP-U dataplane operations are not supported on this platform"),
         }
     }
@@ -6629,6 +6937,7 @@ mod tests {
             bearer_mark: Some(GtpBearerMark::new(0x3456_789a).unwrap()),
             egress_dscp: Some(DscpCodepoint::new(46).unwrap()),
             uplink_source_port_policy: GtpuUplinkSourcePortPolicy::selected(40_000).unwrap(),
+            downlink_inner_mtu: None,
         }
     }
 
@@ -6677,6 +6986,7 @@ mod tests {
             bearer_mark: Some(GtpBearerMark::new(0x3456_789a).unwrap()),
             egress_dscp: None,
             uplink_source_port_policy: GtpuUplinkSourcePortPolicy::selected(40_000).unwrap(),
+            downlink_inner_mtu: None,
         };
         let debug = format!("{ctx:?}");
         assert!(!debug.contains("12345678"));
@@ -6870,6 +7180,7 @@ mod tests {
             bearer_mark: None,
             egress_dscp: None,
             uplink_source_port_policy: GtpuUplinkSourcePortPolicy::LegacyServicePort,
+            downlink_inner_mtu: None,
         };
         let remove = RemovePdpContextRequest::from_context(&ctx);
         assert_eq!(remove.local_teid, ctx.local_teid);

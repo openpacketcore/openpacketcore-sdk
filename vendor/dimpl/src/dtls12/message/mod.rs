@@ -35,6 +35,7 @@ pub use certificate_verify::CertificateVerify;
 pub use client_hello::ClientHello;
 pub use client_key_exchange::{ClientKeyExchange, ClientPskKeys, ExchangeKeys};
 pub use digitally_signed::DigitallySigned;
+pub(crate) use extension::ExtensionVec;
 pub use extension::{Extension, ExtensionType};
 pub use extensions::ec_point_formats::ECPointFormatsExtension;
 pub use extensions::signature_algorithms::SignatureAlgorithmsExtension;

@@ -51,9 +51,10 @@ These are code-path constants, not operator tuning knobs and not proof that
 the experimental profile meets #143 under deployed load.
 
 The workspace temporarily exact-pins `openpacketcore/openraft` revision
-`f607e636406b16bd0ad7925dbb631da1b7a4cd96`. Registry 0.9.24 reuses a sampled
-election timeout across campaigns; the fork resamples each campaign. It does
-not add an SDK leader lease or any second election/vote path. Until an official
+`72e327a4f25cbbe3a3695d8c3c0f0970ccb925d5`, containing release-0.9 through v0.9.25
+and the fork repairs for bounded apply and joined replication retirement.
+It preserves per-campaign election-timeout sampling without adding an SDK
+leader lease or second election/vote path. Until an official
 stable release contains that fix, an exact registry checksum replaces the git
 pin, and #143 is requalified, the mechanically checked 26-crate normal reverse
 dependency closure is source-build-only with `publish = false`. The other 51

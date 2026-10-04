@@ -2,6 +2,8 @@
 //! SCTP message seam. These tests prove the RFC 6733 direct-protection
 //! sequencing and RFC 6083 PPID-47 carriage without requiring kernel SCTP.
 
+pub(crate) mod generic;
+
 use std::num::NonZeroUsize;
 use std::time::Duration;
 
@@ -45,7 +47,7 @@ const APP_ID: ApplicationId = ApplicationId::new(16_777_264);
 
 type TestCa = rcgen::CertifiedIssuer<'static, rcgen::KeyPair>;
 
-struct TestMaterial {
+pub(crate) struct TestMaterial {
     _ca: TestCa,
     client_source: watch::Sender<Option<IdentityState>>,
     _server_source: watch::Sender<Option<IdentityState>>,
@@ -182,7 +184,7 @@ fn material_controller(
     )
 }
 
-fn dtls_material() -> TestMaterial {
+pub(crate) fn dtls_material() -> TestMaterial {
     let ca = test_ca();
     let (client_source, client_rx) = watch::channel(Some(identity_state(CLIENT_ID, &ca)));
     let (server_source, server_rx) = watch::channel(Some(identity_state(SERVER_ID, &ca)));
@@ -1480,6 +1482,14 @@ async fn inject_cleartext(endpoint: &mut InMemorySctpEndpoint, ppid: u32, payloa
 }
 
 async fn send_raw_dtls_datagram(io: &mut InMemorySctpEndpoint, datagram: Bytes) -> Result<(), ()> {
+    send_raw_dtls_datagram_with_ppid(io, datagram, DIAMETER_DTLS_SCTP_PPID).await
+}
+
+async fn send_raw_dtls_datagram_with_ppid(
+    io: &mut InMemorySctpEndpoint,
+    datagram: Bytes,
+    ppid: u32,
+) -> Result<(), ()> {
     let mut remaining = datagram.as_ref();
     while !remaining.is_empty() {
         let bounds = crate::parse_dtls_record_bounds(remaining).ok_or(())?;
@@ -1487,7 +1497,7 @@ async fn send_raw_dtls_datagram(io: &mut InMemorySctpEndpoint, datagram: Bytes) 
             return Err(());
         }
         io.send_raw_message(
-            DIAMETER_DTLS_SCTP_PPID,
+            ppid,
             Bytes::copy_from_slice(&remaining[..bounds.record_bytes]),
         )
         .await
@@ -1500,9 +1510,18 @@ async fn send_raw_dtls_datagram(io: &mut InMemorySctpEndpoint, datagram: Bytes) 
 /// Drive a raw dimpl engine as a concurrent task until it errors, closes, or
 /// the deadline passes. Returns the engine's terminal disposition.
 async fn drive_raw_engine(
+    engine: dimpl::Dtls,
+    io: InMemorySctpEndpoint,
+    deadline: Instant,
+) -> Result<(), ()> {
+    drive_raw_engine_with_ppid(engine, io, deadline, DIAMETER_DTLS_SCTP_PPID).await
+}
+
+async fn drive_raw_engine_with_ppid(
     mut engine: dimpl::Dtls,
     mut io: InMemorySctpEndpoint,
     deadline: Instant,
+    ppid: u32,
 ) -> Result<(), ()> {
     io.begin_direct_dtls().map_err(|_| ())?;
     let mut buffer = vec![0_u8; 16 * 1024];
@@ -1519,7 +1538,7 @@ async fn drive_raw_engine(
                 dimpl::Output::BufferTooSmall { needed } => buffer.resize(needed, 0),
                 dimpl::Output::Timeout(next) => {
                     for datagram in std::mem::take(&mut outbound) {
-                        send_raw_dtls_datagram(&mut io, datagram).await?;
+                        send_raw_dtls_datagram_with_ppid(&mut io, datagram, ppid).await?;
                     }
                     let timer = tokio::time::sleep_until(Instant::from_std(next));
                     tokio::select! {
@@ -1529,7 +1548,7 @@ async fn drive_raw_engine(
                         }
                         message = io.receive_message() => {
                             match message.map_err(|_| ())? {
-                                Some(message) if message.ppid() == DIAMETER_DTLS_SCTP_PPID => {
+                                Some(message) if message.ppid() == ppid => {
                                     engine.handle_packet(message.payload()).map_err(|_| ())?;
                                 }
                                 Some(_) | None => return Err(()),

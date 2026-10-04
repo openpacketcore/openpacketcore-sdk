@@ -107,6 +107,31 @@ string_identifier!(
     "tenant id",
     128
 );
+
+impl TenantId {
+    /// Return the allocated capacity of the underlying string, in bytes.
+    ///
+    /// This includes unused capacity and does not allocate or change the identifier.
+    pub fn allocation_capacity(&self) -> usize {
+        self.0.capacity()
+    }
+}
+
+#[cfg(test)]
+mod tenant_capacity_tests {
+    #[test]
+    fn log_row_reuse_preparation_tenant_capacity_includes_slack() {
+        let mut backing = String::with_capacity(4096);
+        backing.push_str("test-tenant");
+        let expected = backing.capacity();
+        let tenant = super::TenantId(backing);
+        let before = serde_json::to_vec(&tenant).unwrap();
+        assert!(expected > tenant.as_str().len());
+        assert_eq!(tenant.allocation_capacity(), expected);
+        assert!(serde_json::to_vec(&tenant).unwrap() == before);
+    }
+}
+
 string_identifier!(
     /// Validated NF instance identifier.
     InstanceId,

@@ -17,7 +17,7 @@ fn main() {
     println!("cargo:rustc-env=OPC_GNMI_PROTO_VERSION={version}");
 
     let out_dir = PathBuf::from(env::var("OUT_DIR").expect("OUT_DIR set by cargo"));
-    tonic_build::configure()
+    tonic_prost_build::configure()
         .build_server(true)
         .build_client(false)
         .file_descriptor_set_path(out_dir.join("gnmi_descriptor.bin"))

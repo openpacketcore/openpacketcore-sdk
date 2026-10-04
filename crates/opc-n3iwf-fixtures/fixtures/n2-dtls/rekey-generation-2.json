@@ -1,0 +1,54 @@
+{
+  "encoding": "scenario-label",
+  "validation_scope": "dtls-lifecycle-contract",
+  "context": {
+    "ppid": 66,
+    "max_record_payload": 16384,
+    "max_label_bytes": 64,
+    "delivery_policy": "reliable-ordered",
+    "identity_verified": true,
+    "exporter_length": 64,
+    "old_auth_key_id": 1,
+    "new_auth_key_id": 2,
+    "switch_auth_key_before_finished": true,
+    "retire_old_key_after_ack": true
+  },
+  "sdk_fixture_id": "opc.n3iwf.n2-dtls.v1.rekey-generation-2",
+  "subset": "n2-dtls",
+  "case_class": "ordering",
+  "source": {
+    "document": "IETF RFC 6083",
+    "release": "RFC 6083",
+    "clauses": [
+      "4.8",
+      "5"
+    ]
+  },
+  "direction": "local",
+  "role": "n3iwf",
+  "prerequisite": "Key id rotation wraps 65535 to 1",
+  "provenance": {
+    "class": "synthetic-kat",
+    "synthetic": true,
+    "independent_capture": false,
+    "referenced_public_vector": "crates/opc-sctp/src/lib.rs",
+    "notes": "Rekey/rotation generation label"
+  },
+  "sanitized_fields": [
+    {
+      "name": "key-material",
+      "treatment": "never-published",
+      "value_class": "absent"
+    }
+  ],
+  "wire": {
+    "path": "wire/rekey-generation-2.hex",
+    "digest_sha256": "38ba5fdae4824ae904473ed5844af594947bd5af7ba01781a789a87e2cc727a5"
+  },
+  "semantic_assertions": [
+    "rekey=true",
+    "generation=2"
+  ],
+  "expected_outcome": "receive",
+  "runtime_claim": false
+}

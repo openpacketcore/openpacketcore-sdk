@@ -1,0 +1,68 @@
+{
+  "subset": "n3-gtpu",
+  "status": "complete",
+  "completion_scope": "fixture-inventory-at-declared-validation-scopes",
+  "issue": 784,
+  "runtime_claim": false,
+  "consumers_may_depend": true,
+  "case_classes": [
+    "bounded-overflow",
+    "duplicate",
+    "malformed",
+    "ordering",
+    "positive",
+    "truncation",
+    "unknown-critical"
+  ],
+  "fixture_ids": [
+    "opc.n3iwf.n3-gtpu.v1.positive-echo-request",
+    "opc.n3iwf.n3-gtpu.v1.positive-echo-response-recovery-zero",
+    "opc.n3iwf.n3-gtpu.v1.receive-recovery-ignored",
+    "opc.n3iwf.n3-gtpu.v1.positive-dl-psc",
+    "opc.n3iwf.n3-gtpu.v1.positive-ul-psc",
+    "opc.n3iwf.n3-gtpu.v1.unknown-required-extension",
+    "opc.n3iwf.n3-gtpu.v1.duplicate-recovery",
+    "opc.n3iwf.n3-gtpu.v1.ordering-end-marker-psc-first",
+    "opc.n3iwf.n3-gtpu.v1.malformed-echo-request",
+    "opc.n3iwf.n3-gtpu.v1.truncated-header",
+    "opc.n3iwf.n3-gtpu.v1.bounded-length-overflow",
+    "opc.n3iwf.n3-gtpu.v1.reference-dl-9-0-none",
+    "opc.n3iwf.n3-gtpu.v1.reference-dl-9-0-0",
+    "opc.n3iwf.n3-gtpu.v1.reference-dl-9-0-1",
+    "opc.n3iwf.n3-gtpu.v1.reference-dl-9-0-2",
+    "opc.n3iwf.n3-gtpu.v1.reference-dl-9-0-3",
+    "opc.n3iwf.n3-gtpu.v1.reference-dl-9-0-4",
+    "opc.n3iwf.n3-gtpu.v1.reference-dl-9-0-5",
+    "opc.n3iwf.n3-gtpu.v1.reference-dl-9-0-6",
+    "opc.n3iwf.n3-gtpu.v1.reference-dl-9-0-7",
+    "opc.n3iwf.n3-gtpu.v1.reference-dl-9-1-none",
+    "opc.n3iwf.n3-gtpu.v1.reference-dl-9-1-0",
+    "opc.n3iwf.n3-gtpu.v1.reference-dl-9-1-1",
+    "opc.n3iwf.n3-gtpu.v1.reference-dl-9-1-2",
+    "opc.n3iwf.n3-gtpu.v1.reference-dl-9-1-3",
+    "opc.n3iwf.n3-gtpu.v1.reference-dl-9-1-4",
+    "opc.n3iwf.n3-gtpu.v1.reference-dl-9-1-5",
+    "opc.n3iwf.n3-gtpu.v1.reference-dl-9-1-6",
+    "opc.n3iwf.n3-gtpu.v1.reference-dl-9-1-7",
+    "opc.n3iwf.n3-gtpu.v1.reference-dl-0-1-7",
+    "opc.n3iwf.n3-gtpu.v1.reference-ul-0",
+    "opc.n3iwf.n3-gtpu.v1.reference-dl-63-1-7",
+    "opc.n3iwf.n3-gtpu.v1.reference-ul-63"
+  ],
+  "constructed": [
+    "Echo Request",
+    "Echo Response Recovery 0",
+    "uplink PSC"
+  ],
+  "receive": [
+    "downlink PSC with both RQI values and all absent/present PPIs",
+    "uplink/downlink QFI 0 and 63 reference packets",
+    "ignored nonzero Recovery",
+    "End Marker PSC order"
+  ],
+  "unsupported": [
+    "backend control port",
+    "eBPF offload",
+    "Tunnel Status"
+  ]
+}

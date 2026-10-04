@@ -38,6 +38,7 @@ use crate::identity::RemoteReplicaBinding;
 use crate::lifecycle::{
     directed_connection_key, CertificateExpiryEvidence, ConnectionAttemptMetricGuard,
     ConnectionLifecycle, ConnectionLifecyclePolicy, ReconnectGate, SessionReauthenticationControl,
+    TlsCompletionTime,
 };
 use crate::protocol::{
     bounded_session_op_expectations, checked_frame_size, checked_wire_frame_size,
@@ -707,16 +708,17 @@ async fn open_connection_attempt(
                     if peer.spiffe_id().as_str() != binding.remote_spiffe_id().as_str() {
                         return Err(ProtocolError::Authentication.into());
                     }
-                    let tls_completed_at = tokio::time::Instant::now();
+                    let tls_completion = TlsCompletionTime::now();
+                    let tls_completed_at = tls_completion.instant();
                     let local_expiry = CertificateExpiryEvidence::capture(
                         attempt.leaf_expires_at(),
                         attempt.certificate_chain_expires_at(),
-                        tls_completed_at,
+                        tls_completion,
                     );
                     let peer_expiry = CertificateExpiryEvidence::capture(
                         peer.leaf_expires_at(),
                         peer.certificate_chain_expires_at(),
-                        tls_completed_at,
+                        tls_completion,
                     );
 
                     let (mut reader, mut writer) = tokio::io::split(tls_stream);
@@ -4596,11 +4598,6 @@ mod tests {
             )
             .await
             .expect("fixture lease");
-        let listener = TcpListener::bind("127.0.0.1:0")
-            .await
-            .expect("reserve unreachable address");
-        let unreachable = listener.local_addr().expect("unreachable address");
-        drop(listener);
         let (server_addr, server) = response_loss_server().await;
         let resolutions = Arc::new(AtomicUsize::new(0));
         let resolver: RemoteAddrResolver = {
@@ -4609,7 +4606,13 @@ mod tests {
                 let attempt = resolutions.fetch_add(1, Ordering::SeqCst);
                 async move {
                     if attempt == 0 {
-                        Ok(unreachable)
+                        // A released port can be reassigned to this server or
+                        // another concurrent test. Inject the pretransmission
+                        // I/O failure before returning a live endpoint.
+                        Err(io::Error::new(
+                            io::ErrorKind::ConnectionRefused,
+                            "synthetic pretransmission failure",
+                        ))
                     } else {
                         Ok(server_addr)
                     }
@@ -4628,7 +4631,7 @@ mod tests {
                 .await,
             Err(StoreError::BackendOperationOutcomeUnavailable)
         ));
-        assert!(resolutions.load(Ordering::SeqCst) >= 2);
+        assert_eq!(resolutions.load(Ordering::SeqCst), 2);
         assert_eq!(server.await.expect("response-loss server"), 1);
     }
 

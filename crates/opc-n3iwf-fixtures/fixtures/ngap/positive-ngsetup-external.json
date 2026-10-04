@@ -1,0 +1,53 @@
+{
+  "encoding": "protocol-wire",
+  "validation_scope": "aper-structural-dispatch",
+  "context": {
+    "max_ies": 256,
+    "duplicate_ie_policy": "reject",
+    "unknown_ie_policy": "reject",
+    "mandatory_presence_validation": false,
+    "inner_ie_validation": false
+  },
+  "sdk_fixture_id": "opc.n3iwf.ngap.v1.positive-ngsetup-external",
+  "subset": "ngap",
+  "case_class": "positive",
+  "source": {
+    "document": "3GPP TS 38.413",
+    "release": "V18.10.0",
+    "clauses": [
+      "9.2.6.1"
+    ]
+  },
+  "direction": "n3iwf-to-amf",
+  "role": "n3iwf",
+  "prerequisite": "Existing opc-proto-ngap DecodeContext policy from issue 493",
+  "provenance": {
+    "class": "referenced-public-vector",
+    "synthetic": true,
+    "independent_capture": false,
+    "referenced_public_vector": "crates/opc-proto-ngap/src/lib.rs::ngsetup_request_fixture",
+    "notes": "Sanitized derivative of the legacy libngap SDK APER fixture: Outer criticality at offset 2 set to reject; PLMNs at offsets 12,48,61 replaced with test PLMN 001/01; RANNodeName replaced with Synthetic RAN. Source SHA-256 183cf47d3546a4a0a9ac72ae66ca166da4ae90c6bed0ed98e82f38832be57f2d. Structural dispatch only; no independent Release-18 N3IWF message evidence."
+  },
+  "sanitized_fields": [
+    {
+      "name": "identifiers",
+      "treatment": "documentation-range-or-reserved-test",
+      "value_class": "synthetic"
+    }
+  ],
+  "wire": {
+    "path": "wire/positive-ngsetup-external.hex",
+    "digest_sha256": "c24da642065feae810a456919e6915fd3428181b488ca3e6b1f137f3e99ec69c"
+  },
+  "semantic_assertions": [
+    "procedure=21",
+    "outcome=initiating",
+    "ie_ids=27,82,102,21",
+    "ts29413=5.2",
+    "matrix=ng-setup-request",
+    "canonical_typed_encode=unsupported",
+    "standards_valid_n3iwf_message=unproven"
+  ],
+  "expected_outcome": "receive",
+  "runtime_claim": false
+}

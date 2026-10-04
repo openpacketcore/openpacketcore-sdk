@@ -3,10 +3,12 @@ use serde::{Deserialize, Deserializer, Serialize};
 use std::fmt;
 
 use crate::errors::KeyError;
+use crate::ConsumerCheckpointAad;
 
 const CONFIG_KDF_LABEL: &[u8] = b"openpacketcore/config/v2";
 const SESSION_KDF_LABEL: &[u8] = b"openpacketcore/session/v1";
 const SHADOW_SECURITY_KDF_LABEL: &[u8] = b"openpacketcore/shadow-security/v2";
+const CONSUMER_CHECKPOINT_KDF_LABEL: &[u8] = b"openpacketcore/config-consumer-checkpoint/v1";
 const MAX_KEY_ID_LEN: usize = 512;
 
 /// Stable key identifier carried in each encrypted envelope.
@@ -48,6 +50,8 @@ impl<'de> Deserialize<'de> for KeyId {
 #[serde(rename_all = "kebab-case")]
 pub enum KeyPurpose {
     Config,
+    /// Non-authoritative configuration-consumer checkpoint custody.
+    ConfigConsumerCheckpoint,
     ShadowSecurity,
     Session,
     IpsecSa,
@@ -59,6 +63,7 @@ impl KeyPurpose {
     pub const fn as_str(self) -> &'static str {
         match self {
             Self::Config => "config",
+            Self::ConfigConsumerCheckpoint => "config-consumer-checkpoint",
             Self::ShadowSecurity => "shadow-security",
             Self::Session => "session",
             Self::IpsecSa => "ipsec-sa",
@@ -336,6 +341,8 @@ impl<'de> Deserialize<'de> for ShadowSecurityAad {
 #[serde(tag = "kind", rename_all = "kebab-case")]
 pub enum EnvelopeMetadata {
     Config(ConfigAad),
+    /// Consumer-local state, with no authoring provenance or voter authority.
+    ConsumerCheckpoint(ConsumerCheckpointAad),
     Session(SessionAad),
     ShadowSecurity(ShadowSecurityAad),
 }
@@ -344,6 +351,7 @@ impl EnvelopeMetadata {
     pub(crate) fn kind(&self) -> &'static str {
         match self {
             Self::Config(_) => "config",
+            Self::ConsumerCheckpoint(_) => "consumer-checkpoint",
             Self::Session(_) => "session",
             Self::ShadowSecurity(_) => "shadow-security",
         }
@@ -352,6 +360,7 @@ impl EnvelopeMetadata {
     pub(crate) fn required_purpose(&self) -> KeyPurpose {
         match self {
             Self::Config(_) => KeyPurpose::Config,
+            Self::ConsumerCheckpoint(_) => KeyPurpose::ConfigConsumerCheckpoint,
             Self::Session(_) => KeyPurpose::Session,
             Self::ShadowSecurity(_) => KeyPurpose::ShadowSecurity,
         }
@@ -368,6 +377,20 @@ pub struct EnvelopeAad {
 }
 
 impl EnvelopeAad {
+    /// Construct consumer-checkpoint AAD using a local persistence generation.
+    pub fn consumer_checkpoint(
+        tenant: TenantId,
+        generation: u64,
+        metadata: ConsumerCheckpointAad,
+    ) -> Self {
+        Self {
+            tenant,
+            purpose: KeyPurpose::ConfigConsumerCheckpoint,
+            version: generation,
+            metadata: EnvelopeMetadata::ConsumerCheckpoint(metadata),
+        }
+    }
+
     pub fn config(tenant: TenantId, version: u64, metadata: ConfigAad) -> Self {
         Self {
             tenant,
@@ -426,6 +449,7 @@ impl EnvelopeAad {
 
         match &self.metadata {
             EnvelopeMetadata::Config(config) => config.validate()?,
+            EnvelopeMetadata::ConsumerCheckpoint(checkpoint) => checkpoint.validate()?,
             EnvelopeMetadata::Session(session) => session.validate()?,
             EnvelopeMetadata::ShadowSecurity(shadow_security) => shadow_security.validate()?,
         }
@@ -436,6 +460,15 @@ impl EnvelopeAad {
     pub(crate) fn kdf_context(&self, key_id: &KeyId) -> Result<(Vec<u8>, Vec<u8>), KeyError> {
         self.validate()?;
         match &self.metadata {
+            EnvelopeMetadata::ConsumerCheckpoint(checkpoint) => {
+                let mut salt = Vec::with_capacity(64);
+                salt.extend_from_slice(&checkpoint.binding_digest);
+                salt.extend_from_slice(&checkpoint.storage_digest);
+                let mut info = Vec::with_capacity(96 + key_id.as_str().len());
+                info.extend_from_slice(CONSUMER_CHECKPOINT_KDF_LABEL);
+                append_kdf_field(&mut info, key_id.as_str().as_bytes());
+                Ok((salt, info))
+            }
             EnvelopeMetadata::Config(config) => {
                 let mut salt = Vec::with_capacity(16 + config.schema_digest.as_bytes().len());
                 salt.extend_from_slice(config.tx_id.as_uuid().as_bytes());

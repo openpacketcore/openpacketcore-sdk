@@ -1,5 +1,8 @@
 #![cfg(target_os = "linux")]
 
+#[path = "qualification_mtls_multiprocess/isolated_scale.rs"]
+mod isolated_scale;
+
 use std::env;
 use std::ffi::OsString;
 use std::fs::{self, DirBuilder, File, OpenOptions, Permissions};
@@ -987,14 +990,24 @@ impl RecoveryTrafficProgressTracker {
     }
 
     fn next_deadline(&self, absolute_deadline: Instant) -> Instant {
-        self.pulse_deadline()
-            .min(self.coverage_deadline())
-            .min(absolute_deadline)
+        self.progress_deadline().min(absolute_deadline)
+    }
+
+    fn progress_deadline(&self) -> Instant {
+        self.pulse_deadline().min(self.coverage_deadline())
+    }
+
+    fn observation_deadline(&self, absolute_deadline: Option<Instant>) -> Instant {
+        // A rolling observation may discover an availability interruption and
+        // use the existing recovery allowance. Capturing its initial pulse
+        // deadline as an absolute deadline would silently remove that allowance.
+        absolute_deadline.map_or_else(|| self.progress_deadline(), |at| self.next_deadline(at))
     }
 }
 
 struct RecoveryFaultSettlementContext<'a> {
     before: &'a [QualificationConnectionLifecycleMetrics],
+    catchup_before: &'a [QualificationConnectionLifecycleMetrics],
     participants: &'a TrafficParticipants,
     phase: &'a str,
     started: Instant,
@@ -1988,6 +2001,138 @@ fn recovery_fault_flush_has_no_unsafe_outcomes(
         && after.drain_overruns == before.drain_overruns
 }
 
+#[derive(Clone, Copy, Debug)]
+struct RecoveryConnectionDelta {
+    attempts: u64,
+    terminal: u64,
+    baseline_outstanding: u64,
+    reconnect_attempts: u64,
+    reconnect_failures: u64,
+}
+
+impl RecoveryConnectionDelta {
+    fn combine(self, other: Self) -> Self {
+        let sum = |left: u64, right: u64| {
+            left.checked_add(right)
+                .expect("bounded recovery connection ledger")
+        };
+        Self {
+            attempts: sum(self.attempts, other.attempts),
+            terminal: sum(self.terminal, other.terminal),
+            baseline_outstanding: sum(self.baseline_outstanding, other.baseline_outstanding),
+            reconnect_attempts: sum(self.reconnect_attempts, other.reconnect_attempts),
+            reconnect_failures: sum(self.reconnect_failures, other.reconnect_failures),
+        }
+    }
+}
+
+fn recovery_connection_delta(
+    node_index: usize,
+    before: &QualificationConnectionLifecycleMetrics,
+    after: &QualificationConnectionLifecycleMetrics,
+) -> RecoveryConnectionDelta {
+    assert_connection_attempts_accounted(before, node_index);
+    assert_connection_attempts_accounted(after, node_index);
+    assert!(
+        recovery_fault_flush_has_no_unsafe_outcomes(before, after),
+        "fault-outcome flush recorded abandoned, protocol, backend, or drain-overrun evidence: node={node_index}, before={before:?}, after={after:?}"
+    );
+    let attempts = lifecycle_counter_delta(
+        before.connection_attempts,
+        after.connection_attempts,
+        node_index,
+        "connection_attempts",
+    );
+    let terminal = [
+        (
+            "connection_successes",
+            before.connection_successes,
+            after.connection_successes,
+        ),
+        (
+            "connection_failure_transport",
+            before.connection_failure_transport,
+            after.connection_failure_transport,
+        ),
+        (
+            "connection_failure_authentication",
+            before.connection_failure_authentication,
+            after.connection_failure_authentication,
+        ),
+        (
+            "connection_failure_timeout",
+            before.connection_failure_timeout,
+            after.connection_failure_timeout,
+        ),
+        (
+            "connection_superseded",
+            before.connection_superseded,
+            after.connection_superseded,
+        ),
+        (
+            "connection_abandoned",
+            before.connection_abandoned,
+            after.connection_abandoned,
+        ),
+    ]
+    .into_iter()
+    .try_fold(0_u64, |total, (name, before, after)| {
+        total.checked_add(lifecycle_counter_delta(before, after, node_index, name))
+    })
+    .expect("bounded fault terminal ledger");
+    let reconnect_attempts = lifecycle_counter_delta(
+        before.reconnect_attempts,
+        after.reconnect_attempts,
+        node_index,
+        "reconnect_attempts",
+    );
+    let reconnect_failures = lifecycle_counter_delta(
+        before.reconnect_failures,
+        after.reconnect_failures,
+        node_index,
+        "reconnect_failures",
+    );
+    let (_, baseline_outstanding, _) =
+        connection_attempt_accounting(before).expect("accounted fault-outcome baseline");
+    assert!(
+        terminal <= attempts.saturating_add(baseline_outstanding),
+        "fault-outcome flush violated interval connection conservation: node={node_index}, attempts={attempts}, terminal_outcomes={terminal}, baseline_outstanding={baseline_outstanding}"
+    );
+    RecoveryConnectionDelta {
+        attempts,
+        terminal,
+        baseline_outstanding,
+        reconnect_attempts,
+        reconnect_failures,
+    }
+}
+
+fn assert_fixed_recovery_connection_bound(
+    member_count: usize,
+    node_index: usize,
+    delta: RecoveryConnectionDelta,
+) {
+    let bound = recovery_fault_connection_bound(member_count);
+    let terminal_bound = bound
+        .checked_add(delta.baseline_outstanding)
+        .expect("bounded terminal carry-in");
+    assert!(
+        delta.terminal <= terminal_bound,
+        "fault-outcome flush exceeded the fixed per-node connection bound plus exact baseline carry-in: node={node_index}, observed={}, bound={terminal_bound}, new_attempt_bound={bound}, delta={delta:?}",
+        delta.terminal,
+    );
+    for (counter, observed) in [
+        ("connection_attempts", delta.attempts),
+        ("reconnect_attempts", delta.reconnect_attempts),
+        ("reconnect_failures", delta.reconnect_failures),
+    ] {
+        assert!(
+            observed <= bound,
+            "fault-outcome flush exceeded the fixed per-node connection bound: node={node_index}, counter={counter}, observed={observed}, bound={bound}"
+        );
+    }
+}
+
 fn assert_recovery_fault_flush_bounds(
     member_count: usize,
     before: &[QualificationConnectionLifecycleMetrics],
@@ -1995,90 +2140,51 @@ fn assert_recovery_fault_flush_bounds(
 ) {
     assert_eq!(before.len(), member_count);
     assert_eq!(after.len(), member_count);
-    let bound = recovery_fault_connection_bound(member_count);
     for (node_index, (before, after)) in before.iter().zip(after).enumerate() {
-        assert_connection_attempts_accounted(before, node_index);
-        assert_connection_attempts_accounted(after, node_index);
-        assert!(
-            recovery_fault_flush_has_no_unsafe_outcomes(before, after),
-            "fault-outcome flush recorded abandoned, protocol, backend, or drain-overrun evidence: node={node_index}, before={before:?}, after={after:?}"
-        );
-        let attempts = lifecycle_counter_delta(
-            before.connection_attempts,
-            after.connection_attempts,
+        assert_fixed_recovery_connection_bound(
+            member_count,
             node_index,
-            "connection_attempts",
+            recovery_connection_delta(node_index, before, after),
         );
-        let terminal = [
-            (
-                "connection_successes",
-                before.connection_successes,
-                after.connection_successes,
-            ),
-            (
-                "connection_failure_transport",
-                before.connection_failure_transport,
-                after.connection_failure_transport,
-            ),
-            (
-                "connection_failure_authentication",
-                before.connection_failure_authentication,
-                after.connection_failure_authentication,
-            ),
-            (
-                "connection_failure_timeout",
-                before.connection_failure_timeout,
-                after.connection_failure_timeout,
-            ),
-            (
-                "connection_superseded",
-                before.connection_superseded,
-                after.connection_superseded,
-            ),
-            (
-                "connection_abandoned",
-                before.connection_abandoned,
-                after.connection_abandoned,
-            ),
-        ]
-        .into_iter()
-        .try_fold(0_u64, |total, (name, before, after)| {
-            total.checked_add(lifecycle_counter_delta(before, after, node_index, name))
-        })
-        .expect("bounded fault terminal ledger");
-        let reconnect_attempts = lifecycle_counter_delta(
-            before.reconnect_attempts,
-            after.reconnect_attempts,
+    }
+}
+
+fn assert_recovery_phase_connection_bounds(
+    member_count: usize,
+    fault_before: &[QualificationConnectionLifecycleMetrics],
+    catchup_before: &[QualificationConnectionLifecycleMetrics],
+    settlement_before: &[QualificationConnectionLifecycleMetrics],
+    settled: &[QualificationConnectionLifecycleMetrics],
+) {
+    for snapshot in [fault_before, catchup_before, settlement_before, settled] {
+        assert_eq!(snapshot.len(), member_count);
+    }
+    for node_index in 0..member_count {
+        // Every phase and the complete interval retain exact conservation and
+        // zero abandoned/protocol/backend/drain-overrun outcomes. Snapshot
+        // catch-up has no fixed duration, so its actual RPC timeouts cannot
+        // spend a connection allowance derived from the finite expiry schedule.
+        let fault = recovery_connection_delta(
             node_index,
-            "reconnect_attempts",
+            &fault_before[node_index],
+            &catchup_before[node_index],
         );
-        let reconnect_failures = lifecycle_counter_delta(
-            before.reconnect_failures,
-            after.reconnect_failures,
+        let catchup = recovery_connection_delta(
             node_index,
-            "reconnect_failures",
+            &catchup_before[node_index],
+            &settlement_before[node_index],
         );
-        let (_, baseline_outstanding, _) =
-            connection_attempt_accounting(before).expect("accounted fault-outcome baseline");
-        let terminal_bound = bound.saturating_add(baseline_outstanding);
-        assert!(
-            terminal <= attempts.saturating_add(baseline_outstanding),
-            "fault-outcome flush violated interval connection conservation: node={node_index}, attempts={attempts}, terminal_outcomes={terminal}, baseline_outstanding={baseline_outstanding}"
+        let settlement = recovery_connection_delta(
+            node_index,
+            &settlement_before[node_index],
+            &settled[node_index],
         );
-        assert!(
-            terminal <= terminal_bound,
-            "fault-outcome flush exceeded the fixed per-node connection bound plus exact baseline carry-in: node={node_index}, counter=connection_terminal_outcomes, observed={terminal}, bound={terminal_bound}, new_attempt_bound={bound}, baseline_outstanding={baseline_outstanding}, attempts={attempts}, reconnect_attempts={reconnect_attempts}, reconnect_failures={reconnect_failures}, before={before:?}, after={after:?}"
-        );
-        for (counter, observed) in [
-            ("connection_attempts", attempts),
-            ("reconnect_attempts", reconnect_attempts),
-            ("reconnect_failures", reconnect_failures),
-        ] {
-            assert!(
-                observed <= bound,
-                "fault-outcome flush exceeded the fixed per-node connection bound: node={node_index}, counter={counter}, observed={observed}, bound={bound}"
-            );
-        }
+        let complete =
+            recovery_connection_delta(node_index, &fault_before[node_index], &settled[node_index]);
+        // Share the original 85/161 allowance across both fixed phases; do not
+        // grant a second allowance when the settlement baseline is captured.
+        assert_fixed_recovery_connection_bound(member_count, node_index, fault.combine(settlement));
+        eprintln!("MTLS_RECOVERY_CONNECTION_PHASES profile=fixed-fault-and-settlement-with-catchup-conservation/v2 node_index={node_index} complete={complete:?} fault={fault:?} catchup={catchup:?} settlement={settlement:?}");
     }
 }
 
@@ -2743,18 +2849,405 @@ enum ChildStderrDiagnostic {
     QualificationNodeSqliteFailed,
     QualificationNodeConsensusFailed,
     QualificationNodeListenerFailed,
+    InitializationRejected {
+        stage: &'static str,
+        error_class: &'static str,
+    },
+    ActivationRejected {
+        stage: &'static str,
+        error_class: &'static str,
+        boundary: &'static str,
+        deadline_elapsed: bool,
+    },
     Redacted,
 }
 
-/// Receive one child reply using the supplied absolute deadline.  Keeping the
-/// deadline conversion at this one boundary makes the directed-handshake and
-/// status/lifecycle callers testable without a wall-clock race: a withheld
-/// reply with an expired deadline has a zero receive budget.
+fn initialization_stage_class(
+    stage: &str,
+    error_class: &str,
+) -> Option<(&'static str, &'static str)> {
+    let stage = match stage {
+        "cluster" => "cluster",
+        "fenced_transition" => "fenced_transition",
+        "protected_roster_v2" => "protected_roster_v2",
+        _ => return None,
+    };
+    let error_class = match (stage, error_class) {
+        ("cluster", "ClusterFormationRejected") => "ClusterFormationRejected",
+        ("cluster", "EngineUnavailable") => "EngineUnavailable",
+        ("cluster", "StorageUnavailable") => "StorageUnavailable",
+        ("cluster", "RecoveryRequired") => "RecoveryRequired",
+        ("fenced_transition" | "protected_roster_v2", "BackendUnavailable") => "BackendUnavailable",
+        ("fenced_transition" | "protected_roster_v2", "CasIdempotencyOutcomeUnavailable") => {
+            "CasIdempotencyOutcomeUnavailable"
+        }
+        ("fenced_transition" | "protected_roster_v2", "BackendOperationOutcomeUnavailable") => {
+            "BackendOperationOutcomeUnavailable"
+        }
+        ("fenced_transition" | "protected_roster_v2", "LeaseLostOrInvalid") => "LeaseLostOrInvalid",
+        (_, "Other") => "Other",
+        _ => return None,
+    };
+    Some((stage, error_class))
+}
+
+fn child_initialization_diagnostic(line: &[u8]) -> Option<ChildStderrDiagnostic> {
+    let line = std::str::from_utf8(line).ok()?;
+    if let Some(details) = line.strip_prefix("qualification activation rejected: stage=") {
+        let (stage, details) = details.split_once(" class=")?;
+        let (error_class, details) = details.split_once(" boundary=")?;
+        let (boundary, deadline_elapsed) = details.split_once(" deadline_elapsed=")?;
+        let (stage, error_class) = initialization_stage_class(stage, error_class)?;
+        if stage == "cluster" {
+            return None;
+        }
+        let boundary = match boundary {
+            "initial_authority" => "initial_authority",
+            "initial_scope" => "initial_scope",
+            "leader_discovery" => "leader_discovery",
+            "pre_transmit_authority" => "pre_transmit_authority",
+            "after_transmission" => "after_transmission",
+            "authenticated_rejection" => "authenticated_rejection",
+            "route_refresh" => "route_refresh",
+            "local_leader_rejected" => "local_leader_rejected",
+            "remote_leader_rejected" => "remote_leader_rejected",
+            "applied_index" => "applied_index",
+            "post_apply_authority" => "post_apply_authority",
+            "post_apply_scope" => "post_apply_scope",
+            "certificate_backend" => "certificate_backend",
+            "certificate_mismatch" => "certificate_mismatch",
+            "outcome_unknown" => "outcome_unknown",
+            "unexpected_reply" => "unexpected_reply",
+            _ => return None,
+        };
+        let deadline_elapsed = match deadline_elapsed {
+            "true" => true,
+            "false" => false,
+            _ => return None,
+        };
+        return Some(ChildStderrDiagnostic::ActivationRejected {
+            stage,
+            error_class,
+            boundary,
+            deadline_elapsed,
+        });
+    }
+    let (stage, error_class) = line
+        .strip_prefix("qualification initialization rejected: stage=")?
+        .split_once(" class=")?;
+    let (stage, error_class) = initialization_stage_class(stage, error_class)?;
+    Some(ChildStderrDiagnostic::InitializationRejected { stage, error_class })
+}
+
+#[derive(Clone, Copy, Debug)]
+struct InitializationStderrBoundary {
+    device: u64,
+    inode: u64,
+    bytes: u64,
+}
+
+impl InitializationStderrBoundary {
+    fn capture(path: &Path) -> Option<Self> {
+        let metadata = File::open(path).ok()?.metadata().ok()?;
+        Some(Self {
+            device: metadata.dev(),
+            inode: metadata.ino(),
+            bytes: metadata.len(),
+        })
+    }
+
+    fn classify(self, path: &Path) -> ChildStderrDiagnostic {
+        const MAX_BYTES: u64 = 8 * 1024;
+        let Ok(mut file) = File::open(path) else {
+            return ChildStderrDiagnostic::Unavailable;
+        };
+        let Ok(metadata) = file.metadata() else {
+            return ChildStderrDiagnostic::Unavailable;
+        };
+        if metadata.dev() != self.device || metadata.ino() != self.inode {
+            return ChildStderrDiagnostic::Unavailable;
+        }
+        let Some(length) = metadata.len().checked_sub(self.bytes) else {
+            return ChildStderrDiagnostic::Unavailable;
+        };
+        if length > MAX_BYTES {
+            return ChildStderrDiagnostic::Redacted;
+        }
+        let mut starts_at_line = self.bytes == 0;
+        if self.bytes != 0 {
+            let mut previous = [0];
+            if file.seek(SeekFrom::Start(self.bytes - 1)).is_err()
+                || file.read_exact(&mut previous).is_err()
+            {
+                return ChildStderrDiagnostic::Unavailable;
+            }
+            starts_at_line = previous == *b"\n";
+        }
+        let mut bytes = Vec::with_capacity(length as usize);
+        if file.take(length).read_to_end(&mut bytes).is_err() || bytes.len() as u64 != length {
+            return ChildStderrDiagnostic::Unavailable;
+        }
+        if bytes.iter().all(u8::is_ascii_whitespace) {
+            return ChildStderrDiagnostic::Empty;
+        }
+        // Only complete lines appended after this exact Initialize send are
+        // eligible. A partial historical line or partial final write cannot
+        // supply the current invocation's evidence.
+        bytes
+            .split_inclusive(|byte| *byte == b'\n')
+            .skip(usize::from(!starts_at_line))
+            .filter_map(|line| line.strip_suffix(b"\n"))
+            .filter_map(child_initialization_diagnostic)
+            .last()
+            .unwrap_or(ChildStderrDiagnostic::Redacted)
+    }
+}
+
+#[test]
+fn initialization_stderr_diagnostic_recognizes_only_closed_stage_classes() {
+    let directory = tempfile::tempdir().expect("diagnostic directory");
+    let path = directory.path().join("stderr.log");
+    let classes = [
+        ("cluster", "ClusterFormationRejected"),
+        ("cluster", "EngineUnavailable"),
+        ("cluster", "StorageUnavailable"),
+        ("cluster", "RecoveryRequired"),
+        ("cluster", "Other"),
+        ("fenced_transition", "BackendUnavailable"),
+        ("fenced_transition", "CasIdempotencyOutcomeUnavailable"),
+        ("fenced_transition", "BackendOperationOutcomeUnavailable"),
+        ("fenced_transition", "LeaseLostOrInvalid"),
+        ("fenced_transition", "Other"),
+        ("protected_roster_v2", "BackendUnavailable"),
+        ("protected_roster_v2", "CasIdempotencyOutcomeUnavailable"),
+        ("protected_roster_v2", "BackendOperationOutcomeUnavailable"),
+        ("protected_roster_v2", "LeaseLostOrInvalid"),
+        ("protected_roster_v2", "Other"),
+    ];
+    for (stage, error_class) in classes {
+        let mut bytes = b"synthetic-sensitive-body\xff\n".to_vec();
+        bytes.extend_from_slice(
+            format!("qualification initialization rejected: stage={stage} class={error_class}\n")
+                .as_bytes(),
+        );
+        std::fs::write(&path, bytes).expect("write diagnostic");
+        let diagnostic = ChildNode::stderr_diagnostic_at(&path);
+        assert_eq!(
+            diagnostic,
+            ChildStderrDiagnostic::InitializationRejected { stage, error_class },
+        );
+        assert!(!format!("{diagnostic:?}").contains("synthetic-sensitive-body"));
+    }
+    for invalid in [
+        b"qualification initialization rejected: stage=cluster class=BackendUnavailable".as_slice(),
+        b"qualification initialization rejected: stage=unknown class=Other",
+        b"qualification initialization rejected: stage=cluster class=Other synthetic-sensitive-body",
+        b"qualification initialization rejected: stage=fenced_transition class=Other\xff",
+        b"synthetic-sensitive-body",
+    ] {
+        std::fs::write(&path, invalid).expect("write invalid diagnostic");
+        assert_eq!(ChildNode::stderr_diagnostic_at(&path), ChildStderrDiagnostic::Redacted);
+    }
+}
+
+#[test]
+fn initialization_stderr_boundary_isolates_attempts_and_rejects_changed_files() {
+    let directory = tempfile::tempdir().expect("attempt diagnostic directory");
+    let path = directory.path().join("stderr.log");
+    let old = b"qualification initialization rejected: stage=cluster class=RecoveryRequired\n";
+    let current = b"qualification activation rejected: stage=fenced_transition class=BackendUnavailable boundary=after_transmission deadline_elapsed=false\n";
+    assert!(InitializationStderrBoundary::capture(&path).is_none());
+    let mut history = vec![b'x'; 16 * 1024];
+    history.push(b'\n');
+    history.extend_from_slice(old);
+    std::fs::write(&path, history).unwrap();
+    let boundary = InitializationStderrBoundary::capture(&path).unwrap();
+    assert_eq!(boundary.classify(&path), ChildStderrDiagnostic::Empty);
+    let mut writer = OpenOptions::new().append(true).open(&path).unwrap();
+    writer.write_all(current).unwrap();
+    assert_eq!(
+        boundary.classify(&path),
+        ChildStderrDiagnostic::ActivationRejected {
+            stage: "fenced_transition",
+            error_class: "BackendUnavailable",
+            boundary: "after_transmission",
+            deadline_elapsed: false,
+        }
+    );
+    let next = InitializationStderrBoundary::capture(&path).unwrap();
+    assert_eq!(next.classify(&path), ChildStderrDiagnostic::Empty);
+    // Keep the old inode alive so replacement cannot accidentally reuse it.
+    std::fs::rename(&path, directory.path().join("previous.stderr")).unwrap();
+    std::fs::write(&path, current).unwrap();
+    assert_eq!(next.classify(&path), ChildStderrDiagnostic::Unavailable);
+    assert_eq!(boundary.classify(&path), ChildStderrDiagnostic::Unavailable);
+}
+
+#[test]
+fn initialization_stderr_boundary_rejects_partial_truncated_and_excess_output() {
+    let directory = tempfile::tempdir().expect("bounded attempt diagnostic directory");
+    let path = directory.path().join("stderr.log");
+    let marker = b"qualification activation rejected: stage=fenced_transition class=BackendUnavailable boundary=after_transmission deadline_elapsed=false";
+    std::fs::write(&path, b"historical-partial:").unwrap();
+    let boundary = InitializationStderrBoundary::capture(&path).unwrap();
+    let mut writer = OpenOptions::new().append(true).open(&path).unwrap();
+    writer.write_all(marker).unwrap();
+    writer.write_all(b"\n").unwrap();
+    assert_eq!(boundary.classify(&path), ChildStderrDiagnostic::Redacted);
+
+    let partial = InitializationStderrBoundary::capture(&path).unwrap();
+    writer.write_all(marker).unwrap();
+    assert_eq!(partial.classify(&path), ChildStderrDiagnostic::Redacted);
+    std::fs::write(&path, b"").unwrap();
+    assert_eq!(partial.classify(&path), ChildStderrDiagnostic::Unavailable);
+
+    let empty = InitializationStderrBoundary::capture(&path).unwrap();
+    writer.write_all(&[b'x'; 8 * 1024 + 1]).unwrap();
+    assert_eq!(empty.classify(&path), ChildStderrDiagnostic::Redacted);
+}
+
+#[test]
+fn activation_stderr_diagnostic_accepts_only_closed_boundaries_and_deadline_flags() {
+    let directory = tempfile::tempdir().expect("activation diagnostic directory");
+    let path = directory.path().join("stderr.log");
+    for stage in ["fenced_transition", "protected_roster_v2"] {
+        for boundary in [
+            "initial_authority",
+            "initial_scope",
+            "leader_discovery",
+            "pre_transmit_authority",
+            "after_transmission",
+            "authenticated_rejection",
+            "route_refresh",
+            "local_leader_rejected",
+            "remote_leader_rejected",
+            "applied_index",
+            "post_apply_authority",
+            "post_apply_scope",
+            "certificate_backend",
+            "certificate_mismatch",
+            "outcome_unknown",
+            "unexpected_reply",
+        ] {
+            for deadline_elapsed in [false, true] {
+                let marker = format!("qualification activation rejected: stage={stage} class=BackendUnavailable boundary={boundary} deadline_elapsed={deadline_elapsed}\n");
+                let mut bytes = vec![b'x'; 16 * 1024];
+                bytes.push(b'\n');
+                bytes.extend_from_slice(marker.as_bytes());
+                std::fs::write(&path, bytes).expect("write bounded activation marker");
+                assert_eq!(
+                    ChildNode::stderr_diagnostic_at(&path),
+                    ChildStderrDiagnostic::ActivationRejected {
+                        stage,
+                        error_class: "BackendUnavailable",
+                        boundary,
+                        deadline_elapsed,
+                    }
+                );
+            }
+        }
+    }
+    for invalid in [
+        b"qualification activation rejected: stage=cluster class=Other boundary=initial_authority deadline_elapsed=false".as_slice(),
+        b"qualification activation rejected: stage=fenced_transition class=BackendUnavailable boundary=synthetic-sensitive-body deadline_elapsed=false",
+        b"qualification activation rejected: stage=fenced_transition class=BackendUnavailable boundary=after_transmission deadline_elapsed=false synthetic-sensitive-body",
+        b"qualification activation rejected: stage=fenced_transition class=BackendUnavailable boundary=after_transmission deadline_elapsed=1",
+        b"qualification activation rejected: stage=fenced_transition class=BackendUnavailable boundary=after_transmission deadline_elapsed=false\xff",
+        b"qualification activation rejected: stage=fenced_transition class=BackendUnavailable boundary=after_transmission",
+    ] {
+        std::fs::write(&path, invalid).expect("write malformed activation marker");
+        assert_eq!(ChildNode::stderr_diagnostic_at(&path), ChildStderrDiagnostic::Redacted);
+    }
+}
+
+#[test]
+fn initialization_stderr_diagnostic_bounds_tail_and_skips_partial_first_line() {
+    let directory = tempfile::tempdir().expect("diagnostic directory");
+    let path = directory.path().join("stderr.log");
+    let marker = b"qualification initialization rejected: stage=cluster class=StorageUnavailable";
+    let mut bytes = vec![b'x'; 16 * 1024];
+    bytes.push(b'\n');
+    bytes.extend_from_slice(marker);
+    bytes.push(b'\n');
+    std::fs::write(&path, &bytes).expect("write oversized diagnostic");
+    assert_eq!(
+        ChildNode::stderr_diagnostic_at(&path),
+        ChildStderrDiagnostic::InitializationRejected {
+            stage: "cluster",
+            error_class: "StorageUnavailable",
+        },
+    );
+
+    // The capped tail starts with marker-shaped text embedded in an unrelated
+    // longer line. It must not be mistaken for a complete child marker.
+    let mut embedded = b"unrelated-prefix:".to_vec();
+    embedded.extend_from_slice(marker);
+    embedded.push(b'\n');
+    embedded.resize(b"unrelated-prefix:".len() + 8 * 1024, b'x');
+    std::fs::write(&path, &embedded).expect("write partial first line");
+    assert_eq!(
+        ChildNode::stderr_diagnostic_at(&path),
+        ChildStderrDiagnostic::Redacted
+    );
+
+    // A marker outside the retained tail supplies no observation.
+    let mut evicted = marker.to_vec();
+    evicted.push(b'\n');
+    evicted.extend_from_slice(&[b'x'; 16 * 1024]);
+    std::fs::write(&path, &evicted).expect("write evicted marker");
+    assert_eq!(
+        ChildNode::stderr_diagnostic_at(&path),
+        ChildStderrDiagnostic::Redacted
+    );
+}
+
+#[test]
+fn initialization_stderr_diagnostic_preserves_missing_empty_and_legacy_results() {
+    let directory = tempfile::tempdir().expect("diagnostic directory");
+    let path = directory.path().join("stderr.log");
+    assert_eq!(
+        ChildNode::stderr_diagnostic_at(&path),
+        ChildStderrDiagnostic::Unavailable
+    );
+    std::fs::write(&path, b" \n\t").expect("write empty diagnostic");
+    assert_eq!(
+        ChildNode::stderr_diagnostic_at(&path),
+        ChildStderrDiagnostic::Empty
+    );
+    std::fs::write(
+        &path,
+        b"qualification node open failed: consensus\nqualification node failed\n",
+    )
+    .expect("write legacy diagnostic");
+    assert_eq!(
+        ChildNode::stderr_diagnostic_at(&path),
+        ChildStderrDiagnostic::QualificationNodeConsensusFailed
+    );
+}
+
+/// Receive one child reply within the supplied absolute deadline. A zero-timeout
+/// channel receive can return an already queued reply, so both admission and
+/// successful completion must be observed before the deadline expires.
 fn receive_qualification_reply_until<T>(
     replies: &Receiver<T>,
     deadline: Instant,
 ) -> Result<T, RecvTimeoutError> {
-    replies.recv_timeout(deadline.saturating_duration_since(Instant::now()))
+    receive_qualification_reply_until_with_clock(replies, deadline, Instant::now)
+}
+
+fn receive_qualification_reply_until_with_clock<T>(
+    replies: &Receiver<T>,
+    deadline: Instant,
+    mut now: impl FnMut() -> Instant,
+) -> Result<T, RecvTimeoutError> {
+    let remaining = deadline
+        .checked_duration_since(now())
+        .ok_or(RecvTimeoutError::Timeout)?;
+    let reply = replies.recv_timeout(remaining)?;
+    if !deadline_allows_completion(now(), deadline) {
+        return Err(RecvTimeoutError::Timeout);
+    }
+    Ok(reply)
 }
 
 struct ChildNode {
@@ -2766,6 +3259,7 @@ struct ChildNode {
     stderr_path: PathBuf,
     pending: Option<PendingCommand>,
     next_command_sequence: u64,
+    initialization_stderr: Option<InitializationStderrBoundary>,
 }
 
 impl ChildNode {
@@ -2877,6 +3371,7 @@ impl ChildNode {
                 sent_at: Instant::now(),
             }),
             next_command_sequence: 1,
+            initialization_stderr: None,
         };
         let reply = node.receive_until(deadline);
         let QualificationNodeReply::Bound {
@@ -2896,6 +3391,12 @@ impl ChildNode {
             self.pending.is_none(),
             "qualification child already has one pending command"
         );
+        // Capture before transmission: the child's failure can arrive before
+        // the write returns. Unavailable attribution never falls back to an
+        // earlier attempt or process that appended to this file.
+        self.initialization_stderr = matches!(command, QualificationNodeCommand::Initialize)
+            .then(|| InitializationStderrBoundary::capture(&self.stderr_path))
+            .flatten();
         write_json_line(
             self.stdin.as_mut().expect("qualification child stdin open"),
             command,
@@ -2950,19 +3451,31 @@ impl ChildNode {
     }
 
     fn fail_response(&mut self, failure: ChildResponseFailure, pending: PendingCommand) -> ! {
+        let current_initialize_stderr = matches!(
+            pending.kind,
+            PendingCommandKind::Command(QualificationNodeCommandKind::Initialize)
+        )
+        .then(|| self.initialization_stderr_diagnostic());
         let pending = pending.diagnostic_at(Instant::now());
         let status = self.child.try_wait().ok().flatten();
-        let stderr = self.stderr_diagnostic();
+        let stderr = Self::stderr_diagnostic_at(&self.stderr_path);
         panic!(
-            "qualification child response failed: node={}, failure={failure:?}, pending={pending:?}, status={status:?}, stderr={stderr:?}",
+            "qualification child response failed: node={}, failure={failure:?}, pending={pending:?}, status={status:?}, current_initialize_stderr={current_initialize_stderr:?}, historical_stderr={stderr:?}",
             self.node_index
         )
     }
 
-    fn stderr_diagnostic(&self) -> ChildStderrDiagnostic {
+    fn initialization_stderr_diagnostic(&self) -> ChildStderrDiagnostic {
+        self.initialization_stderr
+            .map_or(ChildStderrDiagnostic::Unavailable, |boundary| {
+                boundary.classify(&self.stderr_path)
+            })
+    }
+
+    fn stderr_diagnostic_at(stderr_path: &Path) -> ChildStderrDiagnostic {
         const MAX_STDERR_BYTES: u64 = 8 * 1024;
 
-        let Ok(mut file) = File::open(&self.stderr_path) else {
+        let Ok(mut file) = File::open(stderr_path) else {
             return ChildStderrDiagnostic::Unavailable;
         };
         let Ok(total_bytes) = file.metadata().map(|metadata| metadata.len()) else {
@@ -2981,13 +3494,24 @@ impl ChildNode {
         if bytes.iter().all(u8::is_ascii_whitespace) {
             return ChildStderrDiagnostic::Empty;
         }
+        let lines = bytes
+            .split(|byte| *byte == b'\n')
+            // A bounded tail can begin midway through an unrelated message.
+            .skip(usize::from(start != 0))
+            .filter(|line| !line.is_empty())
+            .collect::<Vec<_>>();
+        // Return only static vocabulary, even when other stderr is present.
+        // Raw backend messages and material never enter the parent panic.
+        if let Some(diagnostic) = lines
+            .iter()
+            .rev()
+            .find_map(|line| child_initialization_diagnostic(line))
+        {
+            return diagnostic;
+        }
         if start != 0 {
             return ChildStderrDiagnostic::Redacted;
         }
-        let lines = bytes
-            .split(|byte| *byte == b'\n')
-            .filter(|line| !line.is_empty())
-            .collect::<Vec<_>>();
         let allowed = lines.iter().all(|line| {
             *line == b"qualification node failed"
                 || *line == b"qualification node open failed: transport"
@@ -3081,7 +3605,10 @@ impl ChildNode {
     fn shutdown(&mut self) {
         if self.child.try_wait().ok().flatten().is_none() {
             let reply = self.invoke(&QualificationNodeCommand::Shutdown);
-            assert!(matches!(reply, QualificationNodeReply::ShuttingDown));
+            assert!(
+                matches!(reply, QualificationNodeReply::ShuttingDown),
+                "qualification shutdown was not joined: {reply:?}"
+            );
             let deadline = Instant::now() + Duration::from_secs(5);
             while self.child.try_wait().ok().flatten().is_none() && Instant::now() < deadline {
                 thread::sleep(Duration::from_millis(20));
@@ -3125,6 +3652,59 @@ struct FleetReadiness {
     required_quorum: usize,
     committed_index: Option<u64>,
     applied_index: Option<u64>,
+}
+
+/// A functional catch-up witness, independent of the transport cleanup clock.
+/// Elapsed time or progress by the surviving majority cannot complete it.
+struct MemberCatchupProgress {
+    initial_committed_index: Option<u64>,
+    last_applied: Vec<Option<u64>>,
+}
+
+impl MemberCatchupProgress {
+    fn new(member_count: usize) -> Self {
+        assert!(matches!(member_count, 3 | 5));
+        Self {
+            initial_committed_index: None,
+            last_applied: vec![None; member_count],
+        }
+    }
+
+    fn observe(&mut self, reports: &[FleetReadiness]) -> bool {
+        let member_count = self.last_applied.len();
+        let required_quorum = member_count / 2 + 1;
+        assert_eq!(reports.len(), member_count);
+        if self.initial_committed_index.is_none() {
+            self.initial_committed_index = reports
+                .iter()
+                .filter_map(|report| report.committed_index)
+                .max();
+        }
+        for (node_index, (previous, report)) in
+            self.last_applied.iter_mut().zip(reports).enumerate()
+        {
+            assert_eq!(report.node_index, node_index);
+            if let Some(applied) = report.applied_index {
+                assert!(
+                    previous.is_none_or(|previous| applied >= previous),
+                    "recovering voter lost an already observed applied frontier: node={node_index}, previous={previous:?}, report={report:?}"
+                );
+                *previous = Some(applied);
+            }
+        }
+        reports.iter().all(|report| {
+            report.ready
+                && report.reason_code == QualificationReadinessCode::Ready
+                && report.configured_voters == member_count
+                && report.fresh_reachable_voters == required_quorum
+                && report.agreeing_voters == required_quorum
+                && report.required_quorum == required_quorum
+                && report
+                    .applied_index
+                    .zip(self.initial_committed_index)
+                    .is_some_and(|(applied, target)| applied >= target)
+        })
+    }
 }
 
 struct CandidateEvidenceInputs {
@@ -3264,7 +3844,7 @@ impl CandidatePublicMaterialManifest {
         let mut hasher = self.hasher.clone();
         hasher.update(b"publication-count\0");
         hasher.update(self.publication_count.to_be_bytes());
-        Ok(format!("sha256:{:x}", hasher.finalize()))
+        Ok(format!("sha256:{}", hex::encode(hasher.finalize())))
     }
 }
 
@@ -3504,6 +4084,20 @@ fn stateless_consumer_voter_topology_for_configuration(
     configuration_generation: &str,
     configuration_epoch: u64,
 ) -> ValidatedQuorumTopology {
+    fixed_voter_topology_for_configuration_with_root(
+        members,
+        configuration_generation,
+        configuration_epoch,
+        Some(qualification_roster_attestation_trust_root()),
+    )
+}
+
+fn fixed_voter_topology_for_configuration_with_root(
+    members: &[QualificationMember],
+    configuration_generation: &str,
+    configuration_epoch: u64,
+    roster_attestation_root: Option<opc_session_store::RosterAttestationTrustRootV1>,
+) -> ValidatedQuorumTopology {
     let descriptors = members
         .iter()
         .map(|member| {
@@ -3521,7 +4115,6 @@ fn stateless_consumer_voter_topology_for_configuration(
             )
         })
         .collect::<Vec<_>>();
-    let roster_attestation_root = qualification_roster_attestation_trust_root();
     let manifest = SessionReplicationManifest::try_new_with_epoch_and_roster_attestation_root(
         SessionClusterId::new(format!("qualification-mtls-{}-cluster", members.len()))
             .expect("qualification consumer cluster ID"),
@@ -3530,7 +4123,7 @@ fn stateless_consumer_voter_topology_for_configuration(
         SessionConfigurationEpoch::new(configuration_epoch)
             .expect("qualification consumer configuration epoch"),
         descriptors.clone(),
-        Some(roster_attestation_root.clone()),
+        roster_attestation_root.clone(),
     )
     .expect("qualification consumer replication manifest");
     let local_replica = descriptors
@@ -3538,15 +4131,16 @@ fn stateless_consumer_voter_topology_for_configuration(
         .expect("qualification consumer local replica")
         .replica_id()
         .clone();
-    ValidatedQuorumTopology::try_from_fixed_durable_quorum(
-        QuorumTopologyConfig::new_consensus_with_roster_attestation_trust_root(
-            local_replica,
-            descriptors,
-            manifest.fixed_durable_quorum_consensus_identity(),
-            roster_attestation_root,
-        ),
-    )
-    .expect("qualification consumer validated fixed topology")
+    let mut config = QuorumTopologyConfig::new_consensus(
+        local_replica,
+        descriptors,
+        manifest.fixed_durable_quorum_consensus_identity(),
+    );
+    if let Some(root) = roster_attestation_root {
+        config = config.with_roster_attestation_trust_root(root);
+    }
+    ValidatedQuorumTopology::try_from_fixed_durable_quorum(config)
+        .expect("qualification consumer validated fixed topology")
 }
 
 #[test]
@@ -3703,7 +4297,24 @@ impl Fleet {
         workload_schedule_sha256: String,
         release_provenance: Option<&ReleaseGateProvenance>,
     ) -> Self {
+        Self::start_with_settings(
+            member_count,
+            workload_schedule_sha256,
+            release_provenance,
+            None,
+        )
+    }
+
+    fn start_with_settings(
+        member_count: usize,
+        workload_schedule_sha256: String,
+        release_provenance: Option<&ReleaseGateProvenance>,
+        isolated_scale: Option<
+            opc_session_testkit::qualification::QualificationIsolatedScaleConfig,
+        >,
+    ) -> Self {
         assert!(matches!(member_count, 3 | 5));
+        assert!(isolated_scale.is_none() || release_provenance.is_none());
         let (source_revision, source_tree_status, source_worktree_sha256) =
             candidate_source_provenance().expect("capture candidate source provenance");
         let child_sha256 = candidate_sha256_file(
@@ -3714,7 +4325,10 @@ impl Fleet {
         let harness_path = env::current_exe().expect("locate candidate harness artifact");
         let harness_sha256 = candidate_sha256_file(&harness_path, MAX_CANDIDATE_ARTIFACT_BYTES)
             .expect("hash candidate harness before execution");
-        let workspace = tempfile::tempdir().expect("create mTLS qualification workspace");
+        let mut workspace = tempfile::tempdir().expect("create mTLS qualification workspace");
+        // Preserve scale-mode mutable files on failure as well as success.
+        // Their lifecycle is part of the process-memory/reconstruction evidence.
+        workspace.disable_cleanup(isolated_scale.is_some());
         let snapshot_namespace = Self::fs_verity_snapshot_campaign_namespace(release_provenance);
         if let Some(namespace) = &snapshot_namespace {
             assert_ne!(
@@ -3844,6 +4458,7 @@ impl Fleet {
                     .as_ref()
                     .map(PinnedV9SnapshotNamespace::inode),
                 operation_timeout_millis: QUALIFICATION_OPERATION_TIMEOUT_MILLIS,
+                isolated_scale,
                 transport: QualificationTransportConfig::ProjectedMtls(
                     QualificationProjectedMtlsConfig {
                         projected_volume_root: projected_root.clone(),
@@ -3864,6 +4479,16 @@ impl Fleet {
             .expect("write node configuration");
             projected_roots.push(projected_root);
             database_paths.push(database_path);
+        }
+        #[cfg(target_os = "linux")]
+        if isolated_scale.is_some_and(|scale| {
+            scale.workload == opc_session_testkit::qualification::QualificationIsolatedScaleWorkload::ProtectedRecoveryControl
+                && scale.persistence == opc_session_testkit::qualification::QualificationIsolatedPersistence::Async
+        }) {
+            let identity = stateless_consumer_voter_topology_for_configuration(&members, "v1", 1)
+                .consensus_identity().expect("fixed protected identity");
+            opc_session_testkit::qualification::protected_recovery::Journal::provision(root, identity)
+                .expect("provision external owner before any voter starts");
         }
         let candidate_evidence_inputs = CandidateEvidenceInputs {
             source_revision,
@@ -3906,10 +4531,17 @@ impl Fleet {
             node.send(&QualificationNodeCommand::Initialize);
         }
         for node in &mut nodes {
-            assert!(matches!(
-                node.receive(),
-                QualificationNodeReply::Initialized
-            ));
+            match node.receive() {
+                QualificationNodeReply::Initialized => {}
+                QualificationNodeReply::Error { code } => {
+                    panic!(
+                        "qualification initial fleet initialization rejected: node={}, code={code:?}, stderr={:?}",
+                        node.node_index,
+                        node.initialization_stderr_diagnostic()
+                    );
+                }
+                _ => panic!("qualification initial fleet initialization reply mismatch"),
+            }
         }
 
         let mut fleet = Self {
@@ -3930,6 +4562,13 @@ impl Fleet {
             candidate_public_material_manifest,
             readiness_probe_commands: 0,
         };
+        if isolated_scale.is_some() {
+            // The scale collector invokes its explicit mode-aware probe.
+            // Legacy qualification still takes the strict Durable path below.
+            fleet.assert_all_material_ready();
+            fleet.verify_snapshot_namespace();
+            return fleet;
+        }
         fleet.wait_ready();
         fleet.assert_all_material_ready();
         fleet.verify_snapshot_namespace();
@@ -4413,8 +5052,12 @@ impl Fleet {
                     self.nodes[node_index].invoke(&QualificationNodeCommand::TrafficStatus);
                 let source_at_failure = self.projected_status(node_index);
                 let material_at_failure = self.material_status(node_index);
+                // Observe only after the unchanged readiness deadline failed.
+                // The node emits fixed storage-health categories on this
+                // existing diagnostic command, without raw storage errors.
+                let consensus_at_failure = self.all_consensus_diagnostics();
                 panic!(
-                    "exact-address restart did not regain readiness: restarted_node={node_index}, readiness_before={readiness_before:?}, progress_before={progress_before:?}, readiness_after={reports:?}, progress_after={progress_after:?}, traffic_before={traffic_before:?}, traffic_after={traffic_after:?}, restarted_traffic={restarted_traffic:?}, source_before={source_before:?}, source_after={source_after:?}, source_at_failure={source_at_failure:?}, material_before={material_before:?}, material_after={material_after:?}, material_at_failure={material_at_failure:?}, stderr={:?}",
+                    "exact-address restart did not regain readiness: restarted_node={node_index}, readiness_before={readiness_before:?}, progress_before={progress_before:?}, readiness_after={reports:?}, progress_after={progress_after:?}, traffic_before={traffic_before:?}, traffic_after={traffic_after:?}, restarted_traffic={restarted_traffic:?}, source_before={source_before:?}, source_after={source_after:?}, source_at_failure={source_at_failure:?}, material_before={material_before:?}, material_after={material_after:?}, material_at_failure={material_at_failure:?}, consensus_at_failure={consensus_at_failure:?}, stderr={:?}",
                     self.stderr_diagnostics()
                 );
             }
@@ -5085,6 +5728,7 @@ impl Fleet {
     ) {
         let RecoveryFaultSettlementContext {
             before,
+            catchup_before,
             participants,
             phase,
             started,
@@ -5120,6 +5764,7 @@ impl Fleet {
         let mut stable_traffic_checkpoint = traffic_progress.pulse_checkpoint.clone();
         let mut traffic_progressed_since_stable = false;
         let mut lifecycle = self.all_lifecycle_metrics_by(traffic_progress.next_deadline(deadline));
+        let settlement_before = lifecycle.clone();
         let mut stable_ledger = connection_attempt_settlement_ledgers(&lifecycle);
         let observed_at = Instant::now();
         let mut stable_since = observed_at;
@@ -5276,7 +5921,13 @@ impl Fleet {
                     ),
                     self.stderr_diagnostics()
                 );
-                assert_recovery_fault_flush_bounds(self.member_count(), before, &lifecycle);
+                assert_recovery_phase_connection_bounds(
+                    self.member_count(),
+                    before,
+                    catchup_before,
+                    &settlement_before,
+                    &lifecycle,
+                );
                 return (lifecycle, traffic);
             }
             assert!(
@@ -5603,7 +6254,7 @@ impl Fleet {
         progress: &mut RecoveryTrafficProgressTracker,
         participants: &TrafficParticipants,
         phase: &str,
-        absolute_deadline: Instant,
+        absolute_deadline: Option<Instant>,
     ) {
         assert_eq!(participants.member_count, self.member_count());
         assert!(traffic_status_snapshot_matches(
@@ -5624,15 +6275,16 @@ impl Fleet {
             participants,
         ));
         loop {
-            let observation_deadline = progress.next_deadline(absolute_deadline);
+            let observation_deadline = progress.observation_deadline(absolute_deadline);
             let observation_started = Instant::now();
             assert!(
                 observation_started < observation_deadline,
-                "survivor traffic exhausted its next recovered-member observation boundary before dispatch: phase={phase}, pulse_elapsed={:?}, coverage_elapsed={:?}, observation_overrun={:?}, absolute_remaining={:?}, baseline={availability_baseline:?}, pulse_checkpoint={:?}, coverage_checkpoint={:?}, stderr={:?}",
+                "survivor traffic exhausted its next recovered-member observation boundary before dispatch: phase={phase}, pulse_elapsed={:?}, coverage_elapsed={:?}, observation_overrun={:?}, absolute_remaining={:?}, availability_recovery={}, baseline={availability_baseline:?}, pulse_checkpoint={:?}, coverage_checkpoint={:?}, stderr={:?}",
                 observation_started.saturating_duration_since(progress.pulse_observed_at),
                 observation_started.saturating_duration_since(progress.coverage_observed_at),
                 observation_started.saturating_duration_since(observation_deadline),
-                absolute_deadline.saturating_duration_since(observation_started),
+                absolute_deadline.map(|at| at.saturating_duration_since(observation_started)),
+                progress.pulse_recovery_extended,
                 progress.pulse_checkpoint,
                 progress.coverage_checkpoint,
                 self.stderr_diagnostics()
@@ -5674,7 +6326,10 @@ impl Fleet {
             ) {
                 progress.extend_pulse_for_availability_recovery();
             }
-            let pulse_deadline = progress.pulse_deadline().min(absolute_deadline);
+            let pulse_deadline = absolute_deadline.map_or_else(
+                || progress.pulse_deadline(),
+                |at| progress.pulse_deadline().min(at),
+            );
             let coverage_deadline = progress.coverage_deadline();
             let coverage_progressed = recovery_traffic_has_all_key_coverage(
                 &progress.coverage_checkpoint,
@@ -5688,7 +6343,8 @@ impl Fleet {
             );
 
             assert!(
-                deadline_allows_completion(traffic_observed_at, absolute_deadline),
+                absolute_deadline
+                    .is_none_or(|at| deadline_allows_completion(traffic_observed_at, at)),
                 "survivor traffic observation crossed the absolute recovered-member deadline: phase={phase}, current={traffic:?}, stderr={:?}",
                 self.stderr_diagnostics()
             );
@@ -5741,17 +6397,12 @@ impl Fleet {
         progress: &mut RecoveryTrafficProgressTracker,
         participants: &TrafficParticipants,
         phase: &str,
-        absolute_deadline: Instant,
     ) -> Instant {
         loop {
             let now = Instant::now();
-            assert!(
-                deadline_admits_complete_operation(now, absolute_deadline),
-                "recovered-member readiness exhausted its absolute operation budget: phase={phase}, stderr={:?}",
-                self.stderr_diagnostics()
-            );
-            let probe_deadline = progress.next_deadline(absolute_deadline);
-            if deadline_admits_complete_operation(now, probe_deadline) {
+            if let RecoveryTrafficCommandPlan::DispatchBy(probe_deadline) =
+                recovery_traffic_command_plan(now, progress.progress_deadline())
+            {
                 return probe_deadline;
             }
             self.wait_for_recovery_traffic_progress(
@@ -5759,7 +6410,7 @@ impl Fleet {
                 progress,
                 participants,
                 phase,
-                absolute_deadline,
+                None,
             );
         }
     }
@@ -5793,7 +6444,7 @@ impl Fleet {
                         progress,
                         participants,
                         phase,
-                        absolute_deadline,
+                        Some(absolute_deadline),
                     );
                 }
             }
@@ -5806,46 +6457,67 @@ impl Fleet {
         progress: &mut RecoveryTrafficProgressTracker,
         participants: &TrafficParticipants,
         phase: &str,
-        absolute_deadline: Instant,
     ) {
         let node_indices = (0..self.member_count()).collect::<Vec<_>>();
+        let started = Instant::now();
+        let mut catchup = MemberCatchupProgress::new(self.member_count());
+        // Snapshot catch-up depends on backlog and shared storage throughput.
+        // It does not inherit the bounded connection fault-tail deadline.
+        // Each probe and survivor continuity observation retains its original
+        // deadline. A run that never reaches real readiness never passes;
+        // the existing integration-job watchdog still bounds a hung run.
         loop {
-            let member_count = self.member_count();
-            let required_quorum = self.required_quorum();
             let probe_deadline = self.recovery_readiness_probe_deadline(
                 availability_baseline,
                 progress,
                 participants,
                 phase,
-                absolute_deadline,
             );
             let reports = self.readiness_reports_by(&node_indices, probe_deadline);
-            if reports.iter().all(|report| {
-                report.ready
-                    && report.reason_code == QualificationReadinessCode::Ready
-                    && report.configured_voters == member_count
-                    && report.fresh_reachable_voters == required_quorum
-                    && report.agreeing_voters == required_quorum
-                    && report.required_quorum == required_quorum
-            }) {
+            if catchup.observe(&reports) {
                 assert!(
                     deadline_allows_completion(Instant::now(), probe_deadline),
                     "recovered-member readiness completed after its admitted operation deadline: phase={phase}, reports={reports:?}, stderr={:?}",
                     self.stderr_diagnostics()
                 );
+                eprintln!(
+                    "MTLS_RECOVERY_CATCHUP_COMPLETE phase={phase} elapsed_millis={} initial_committed={:?} applied={:?}",
+                    started.elapsed().as_millis(),
+                    catchup.initial_committed_index,
+                    catchup.last_applied,
+                );
                 return;
             }
-            assert!(
-                deadline_allows_completion(Instant::now(), absolute_deadline),
-                "recovered-member readiness crossed its absolute deadline: phase={phase}, reports={reports:?}, stderr={:?}",
-                self.stderr_diagnostics()
+            if std::env::var_os("OPC_SESSION_QUALIFICATION_DIAGNOSTICS").is_some() {
+                // Observe the reports already returned by the original
+                // probes. No extra RPC or deadline adjustment is involved.
+                for report in &reports {
+                    eprintln!(
+                        "MTLS_RECOVERY_READINESS phase={phase} node_index={} ready={} reason={:?} configured={} reachable={} agreeing={} quorum={} committed={:?} applied={:?}",
+                        report.node_index,
+                        report.ready,
+                        report.reason_code,
+                        report.configured_voters,
+                        report.fresh_reachable_voters,
+                        report.agreeing_voters,
+                        report.required_quorum,
+                        report.committed_index,
+                        report.applied_index,
+                    );
+                }
+            }
+            eprintln!(
+                "MTLS_RECOVERY_CATCHUP_PENDING phase={phase} elapsed_millis={} initial_committed={:?} applied={:?}",
+                started.elapsed().as_millis(),
+                catchup.initial_committed_index,
+                catchup.last_applied,
             );
             self.wait_for_recovery_traffic_progress(
                 availability_baseline,
                 progress,
                 participants,
                 phase,
-                absolute_deadline,
+                None,
             );
         }
     }
@@ -6807,7 +7479,7 @@ impl Fleet {
             traffic_progress,
             participants,
             "existing-generation-survivor-origin-wave",
-            absolute_deadline,
+            Some(absolute_deadline),
         );
         // Recovered-origin paths use the recovered process's one command lane
         // and remain sequential, with their existing bounded passive pulses.
@@ -6830,7 +7502,7 @@ impl Fleet {
                 traffic_progress,
                 participants,
                 "existing-generation-incident-path",
-                absolute_deadline,
+                Some(absolute_deadline),
             );
         }
         let generation_deadline = self.recovery_traffic_command_deadline(
@@ -6850,7 +7522,7 @@ impl Fleet {
             traffic_progress,
             participants,
             "existing-generation-path-generation-check",
-            absolute_deadline,
+            Some(absolute_deadline),
         );
     }
 
@@ -6919,36 +7591,60 @@ impl Fleet {
             &mut traffic_progress,
             recovery_deadline,
         );
+        // Capture the end of the fixed fault/path-proof interval before
+        // backlog-dependent reconstruction. Both surrounding fixed phases
+        // share one original connection allowance when settlement completes.
+        let catchup_before =
+            self.all_lifecycle_metrics_by(traffic_progress.next_deadline(recovery_deadline));
+        assert_recovery_fault_flush_bounds(
+            self.member_count(),
+            fault_lifecycle_before,
+            &catchup_before,
+        );
         self.wait_for_recovery_readiness(
             traffic_availability_baseline,
             &mut traffic_progress,
             participants,
             "replacement-all-voter-readiness",
-            recovery_deadline,
         );
         self.wait_for_recovery_traffic_progress(
             traffic_availability_baseline,
             &mut traffic_progress,
             participants,
             "replacement-all-voter-readiness",
-            recovery_deadline,
+            None,
         );
-        self.verify_canary_by(traffic_progress.next_deadline(recovery_deadline));
+        self.verify_canary_by(traffic_progress.progress_deadline());
         self.wait_for_recovery_traffic_progress(
             traffic_availability_baseline,
             &mut traffic_progress,
             participants,
             "replacement-canary-verification",
-            recovery_deadline,
+            None,
+        );
+        // Begin the bounded fault-outcome observation after catch-up. The
+        // full original server/connect/backoff tail is still observed, and
+        // its deadline cannot be spent by snapshot reconstruction first.
+        let settlement_started = Instant::now();
+        let settlement_deadline = settlement_started
+            + Duration::from_millis(
+                QUALIFICATION_TRAFFIC_MEMBER_RECOVERY_SETTLEMENT_DEADLINE_MILLIS,
+            );
+        eprintln!(
+            "MTLS_RECOVERY_SETTLEMENT_START phase={phase} since_publication_millis={}",
+            settlement_started
+                .duration_since(recovery_started)
+                .as_millis(),
         );
         let readiness_probe_commands_before_settlement = self.readiness_probe_commands;
         let (lifecycle_before, clean_traffic_baseline) = self
             .wait_for_recovery_fault_outcomes_to_settle(RecoveryFaultSettlementContext {
                 before: fault_lifecycle_before,
+                catchup_before: &catchup_before,
                 participants,
                 phase,
-                started: recovery_started,
-                deadline: recovery_deadline,
+                started: settlement_started,
+                deadline: settlement_deadline,
                 traffic_before: traffic_availability_baseline,
                 traffic_progress,
             });
@@ -7904,7 +8600,7 @@ fn candidate_sha256_file(path: &Path, maximum_bytes: u64) -> io::Result<String> 
         }
         hasher.update(&encoded[..read]);
     }
-    Ok(format!("sha256:{:x}", hasher.finalize()))
+    Ok(format!("sha256:{}", hex::encode(hasher.finalize())))
 }
 
 fn candidate_configuration_sha256(config_paths: &[PathBuf]) -> io::Result<String> {
@@ -7920,7 +8616,7 @@ fn candidate_configuration_sha256(config_paths: &[PathBuf]) -> io::Result<String
         hasher.update(length.to_be_bytes());
         hasher.update(encoded);
     }
-    Ok(format!("sha256:{:x}", hasher.finalize()))
+    Ok(format!("sha256:{}", hex::encode(hasher.finalize())))
 }
 
 fn candidate_source_provenance_at(
@@ -8022,7 +8718,7 @@ fn candidate_source_provenance_at(
     Ok((
         revision,
         tree_status,
-        format!("sha256:{:x}", hasher.finalize()),
+        format!("sha256:{}", hex::encode(hasher.finalize())),
     ))
 }
 
@@ -8044,7 +8740,24 @@ fn candidate_git_output(
         .env("GIT_TERMINAL_PROMPT", "0")
         .env("LC_ALL", "C")
         .current_dir(repository);
-    let output = bounded_candidate_git_command_output(&mut command, maximum_bytes)?;
+    // Closed labels identify the failing operation without emitting repository
+    // paths, arguments, environment, or source/output bytes.
+    let operation = match arguments {
+        ["rev-parse", "HEAD"] => "revision",
+        ["rev-parse", ..] => "rev-parse",
+        ["status", ..] => "status",
+        ["diff", ..] => "tracked-diff",
+        ["ls-files", "--others", ..] => "untracked-paths",
+        ["ls-files", ..] => "index",
+        _ => "other",
+    };
+    let output =
+        bounded_candidate_git_command_output(&mut command, maximum_bytes).map_err(|error| {
+            io::Error::new(
+                error.kind(),
+                format!("candidate Git operation={operation}: {error}"),
+            )
+        })?;
     if !output.status.success() || !output.stderr.is_empty() {
         return Err(io::Error::other("candidate source state is unavailable"));
     }
@@ -8062,6 +8775,48 @@ struct BoundedCandidateGitOutput {
     stdout: Vec<u8>,
     stderr: Vec<u8>,
 }
+
+/// Last observed completion state before cleanup, not a post-cleanup outcome.
+/// A collected empty pipe is `Some(0)`; an uncollected pipe is `None`.
+#[derive(Debug)]
+struct CandidateGitTimeout {
+    elapsed_ms: u128,
+    spawned_ms: u128,
+    readers_ready_ms: u128,
+    executable_busy_retries: u32,
+    leader_exit_success: Option<bool>,
+    stdout_collected_bytes: Option<usize>,
+    stderr_collected_bytes: Option<usize>,
+    // None means the reader was already joined. Some samples its finished
+    // flag at the timeout cutoff without adding a blocking join or I/O.
+    stdout_reader_finished: Option<bool>,
+    stderr_reader_finished: Option<bool>,
+    cleanup_failed: bool,
+}
+
+impl std::fmt::Display for CandidateGitTimeout {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "candidate Git command exceeded fixed runtime: elapsed_ms={} spawned_ms={} \
+             readers_ready_ms={} executable_busy_retries={} leader_exit_success={:?} \
+             stdout_collected_bytes={:?} stderr_collected_bytes={:?} \
+             stdout_reader_finished={:?} stderr_reader_finished={:?} cleanup_failed={}",
+            self.elapsed_ms,
+            self.spawned_ms,
+            self.readers_ready_ms,
+            self.executable_busy_retries,
+            self.leader_exit_success,
+            self.stdout_collected_bytes,
+            self.stderr_collected_bytes,
+            self.stdout_reader_finished,
+            self.stderr_reader_finished,
+            self.cleanup_failed,
+        )
+    }
+}
+
+impl std::error::Error for CandidateGitTimeout {}
 
 struct CandidateGitPipeReader {
     reader: Option<JoinHandle<io::Result<Vec<u8>>>>,
@@ -8087,7 +8842,8 @@ fn bounded_candidate_git_command_output(
     command: &mut Command,
     maximum_stdout_bytes: u64,
 ) -> io::Result<BoundedCandidateGitOutput> {
-    let deadline = Instant::now() + CANDIDATE_GIT_COMMAND_TIMEOUT;
+    let started = Instant::now();
+    let deadline = started + CANDIDATE_GIT_COMMAND_TIMEOUT;
     // This creates a fresh process group before exec whose PGID is exactly
     // the child PID; only that freshly-created group is ever signalled below.
     command.process_group(0);
@@ -8095,6 +8851,7 @@ fn bounded_candidate_git_command_output(
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
+    let mut executable_busy_retries = 0_u32;
     let mut child = loop {
         match command.spawn() {
             Ok(child) => break child,
@@ -8102,6 +8859,7 @@ fn bounded_candidate_git_command_output(
                 if error.raw_os_error() == Some(LINUX_EXECUTABLE_FILE_BUSY_OS_ERROR)
                     && Instant::now() < deadline =>
             {
+                executable_busy_retries = executable_busy_retries.saturating_add(1);
                 // GitHub-hosted storage can transiently retain an external
                 // writable reference to a newly published executable. Retry
                 // only Linux ETXTBSY and charge every retry to the existing
@@ -8117,6 +8875,7 @@ fn bounded_candidate_git_command_output(
             Err(error) => return Err(error),
         }
     };
+    let spawned_ms = started.elapsed().as_millis();
     let process_group = rustix::process::Pid::from_child(&child);
     let stop_readers = Arc::new(AtomicBool::new(false));
     let stdout = match child.stdout.take() {
@@ -8182,6 +8941,7 @@ fn bounded_candidate_git_command_output(
             return Err(io::Error::other("start bounded candidate Git pipe reader"));
         }
     };
+    let readers_ready_ms = started.elapsed().as_millis();
     let mut status = None;
     let mut stdout = None;
     let mut stderr = None;
@@ -8239,13 +8999,26 @@ fn bounded_candidate_git_command_output(
             });
         }
         if Instant::now() >= deadline {
-            return candidate_git_fail_closed(
+            let mut timeout = CandidateGitTimeout {
+                elapsed_ms: started.elapsed().as_millis(),
+                spawned_ms,
+                readers_ready_ms,
+                executable_busy_retries,
+                leader_exit_success: status.as_ref().map(std::process::ExitStatus::success),
+                stdout_collected_bytes: stdout.as_ref().map(Vec::len),
+                stderr_collected_bytes: stderr.as_ref().map(Vec::len),
+                stdout_reader_finished: readers[0].reader.as_ref().map(JoinHandle::is_finished),
+                stderr_reader_finished: readers[1].reader.as_ref().map(JoinHandle::is_finished),
+                cleanup_failed: false,
+            };
+            timeout.cleanup_failed = terminate_candidate_git_process_group(
                 &mut child,
                 process_group,
                 &stop_readers,
                 &mut readers,
-                "candidate Git command exceeded fixed runtime",
-            );
+            )
+            .is_err();
+            return Err(io::Error::other(timeout));
         }
         thread::sleep(CANDIDATE_GIT_PIPE_POLL);
     }
@@ -8468,8 +9241,8 @@ fn release_gate_provenance_at(repository: &Path) -> io::Result<ReleaseGateProven
     Ok(ReleaseGateProvenance {
         source_revision,
         source_tree,
-        source_worktree_sha256: format!("sha256:{:x}", source_hasher.finalize()),
-        cargo_lock_sha256: format!("sha256:{:x}", cargo_lock_hasher.finalize()),
+        source_worktree_sha256: format!("sha256:{}", hex::encode(source_hasher.finalize())),
+        cargo_lock_sha256: format!("sha256:{}", hex::encode(cargo_lock_hasher.finalize())),
         cargo_target_directory: external_namespaces.cargo_target_directory,
         cargo_target_directory_sha256: external_namespaces.cargo_target_directory_sha256,
         evidence_root_directory: external_namespaces.evidence_root_directory,
@@ -8481,7 +9254,7 @@ fn release_gate_provenance_at(repository: &Path) -> io::Result<ReleaseGateProven
         fs_verity_snapshot_root_inode: external_namespaces.fs_verity_snapshot_root_inode,
         pair_directory: external_namespaces.pair_directory,
         pair_directory_sha256: external_namespaces.pair_directory_sha256,
-        command_argv_sha256: format!("sha256:{:x}", command_hasher.finalize()),
+        command_argv_sha256: format!("sha256:{}", hex::encode(command_hasher.finalize())),
         cargo_executable_alias: v9_canonical_path_string(
             &observed_cargo.alias,
             "release-gate Cargo executable alias",
@@ -8617,7 +9390,7 @@ fn release_gate_cargo_backing_sha256_from_descriptor(
             "release-gate Cargo backing changed while its descriptor was hashed",
         ));
     }
-    Ok(format!("sha256:{:x}", hasher.finalize()))
+    Ok(format!("sha256:{}", hex::encode(hasher.finalize())))
 }
 
 fn release_gate_cargo_executable_binding_at(
@@ -9265,7 +10038,7 @@ fn write_private_candidate_file_at<Fd: AsFd>(
 const V9_EXTERNAL_TEST_ID: &str = "three_process_projected_mtls_persistent_v2_batch_release_gate";
 
 fn v9_sha256(bytes: &[u8]) -> String {
-    format!("sha256:{:x}", Sha256::digest(bytes))
+    format!("sha256:{}", hex::encode(Sha256::digest(bytes)))
 }
 
 /// Recompute the opaque run identity from both canonical artifacts' shared
@@ -9387,7 +10160,7 @@ fn v9_pair_run_id_material(
     )?;
     hash_candidate_source_part(&mut hasher, b"v1-canonical", v1_canonical)?;
     hash_candidate_source_part(&mut hasher, b"v9-claims-preimage", v9_claims_preimage)?;
-    Ok(format!("sha256:{:x}", hasher.finalize()))
+    Ok(format!("sha256:{}", hex::encode(hasher.finalize())))
 }
 
 fn v1_v9_release_gate_process_generations_agree(
@@ -11517,19 +12290,27 @@ fn bounded_candidate_git_runner_kills_pipe_holding_term_resistant_descendant() {
     let helper = workspace.path().join("fake-git");
     let descendant_pid = workspace.path().join("descendant.pid");
     let leader_pid = workspace.path().join("leader.pid");
+    let descendant_ready = workspace.path().join("descendant.ready");
     write_candidate_git_helper_script(
         &helper,
-        b"#!/bin/sh\nprintf '%s' \"$$\" > \"$2\"\n(\n  trap '' TERM\n  while :; do sleep 1; done\n) &\ndescendant=$!\nprintf '%s' \"$descendant\" > \"$1\"\nexit 0\n",
+        b"#!/bin/sh\nprintf '%s' \"$$\" > \"$2\"\n(\n  trap '' TERM\n  : > \"$3\"\n  while :; do sleep 1; done\n) &\ndescendant=$!\nprintf '%s' \"$descendant\" > \"$1\"\nwhile [ ! -f \"$3\" ]; do sleep 0.01; done\nexit 0\n",
     );
 
     let started = Instant::now();
     let result = bounded_candidate_git_command_output(
-        Command::new(&helper).arg(&descendant_pid).arg(&leader_pid),
+        Command::new(&helper)
+            .arg(&descendant_pid)
+            .arg(&leader_pid)
+            .arg(&descendant_ready),
         64,
     );
     assert!(
         result.is_err(),
         "a descendant-held pipe must hit the deadline"
+    );
+    assert!(
+        descendant_ready.is_file(),
+        "descendant installed its TERM trap before leader exit"
     );
     assert!(
         started.elapsed()
@@ -11562,6 +12343,73 @@ fn bounded_candidate_git_runner_kills_pipe_holding_term_resistant_descendant() {
         candidate_git_process_is_gone(observed_descendant_pid),
         "owned process-group SIGKILL leaves the exact parent-recorded descendant PID gone after its leader exits"
     );
+
+    // Check observations only after the original deadline and owned-process
+    // assertions, including when a removal control corrupts the observations.
+    let error = result.err().expect("descendant-held pipes fail closed");
+    let timeout = error
+        .get_ref()
+        .and_then(|error| error.downcast_ref::<CandidateGitTimeout>())
+        .expect("retain the timeout completion state");
+    assert_eq!(timeout.leader_exit_success, Some(true));
+    assert_eq!(timeout.stdout_collected_bytes, None);
+    assert_eq!(timeout.stderr_collected_bytes, None);
+    assert_eq!(timeout.stdout_reader_finished, Some(false));
+    assert_eq!(timeout.stderr_reader_finished, Some(false));
+    assert!(timeout.elapsed_ms >= CANDIDATE_GIT_COMMAND_TIMEOUT.as_millis());
+    assert!(timeout.spawned_ms <= timeout.readers_ready_ms);
+    assert!(timeout.readers_ready_ms <= timeout.elapsed_ms);
+    // The existing cleanup may report a cancelled pipe reader while SIGKILL
+    // is still closing the descendant's descriptors. Preserve that result;
+    // the exact descendant PID and original cleanup bound are asserted above.
+}
+
+#[test]
+fn bounded_candidate_git_runner_identifies_live_leader_after_both_pipes_close() {
+    let workspace = tempfile::tempdir().expect("create closed-pipe helper workspace");
+    let helper = workspace.path().join("fake-git");
+    let leader_pid = workspace.path().join("leader.pid");
+    write_candidate_git_helper_script(
+        &helper,
+        b"#!/bin/sh\ntrap '' TERM\nexec 1>&-\nexec 2>&-\nprintf '%s' \"$$\" > \"$1\"\nwhile :; do sleep 1; done\n",
+    );
+
+    let started = Instant::now();
+    let result = bounded_candidate_git_command_output(Command::new(&helper).arg(&leader_pid), 64);
+    assert!(
+        started.elapsed()
+            < CANDIDATE_GIT_COMMAND_TIMEOUT
+                + CANDIDATE_GIT_TERMINATE_GRACE
+                + CANDIDATE_GIT_TERMINATE_GRACE
+                + Duration::from_secs(1),
+        "closed pipes cannot extend the original process deadline and cleanup bound"
+    );
+    let observed_leader_pid = fs::read_to_string(&leader_pid)
+        .expect("leader reported its pid after closing both pipes")
+        .trim()
+        .parse::<u32>()
+        .expect("leader pid is numeric");
+    assert!(
+        candidate_git_process_is_gone(observed_leader_pid),
+        "owned live leader was killed and reaped despite both pipes already closing"
+    );
+
+    let error = result
+        .err()
+        .expect("closed pipes cannot complete a live leader");
+    let timeout = error
+        .get_ref()
+        .and_then(|error| error.downcast_ref::<CandidateGitTimeout>())
+        .expect("retain the timeout completion state");
+    assert_eq!(timeout.leader_exit_success, None);
+    assert_eq!(timeout.stdout_collected_bytes, Some(0));
+    assert_eq!(timeout.stderr_collected_bytes, Some(0));
+    assert_eq!(timeout.stdout_reader_finished, None);
+    assert_eq!(timeout.stderr_reader_finished, None);
+    assert!(!timeout.cleanup_failed);
+    assert!(timeout.elapsed_ms >= CANDIDATE_GIT_COMMAND_TIMEOUT.as_millis());
+    assert!(timeout.spawned_ms <= timeout.readers_ready_ms);
+    assert!(timeout.readers_ready_ms <= timeout.elapsed_ms);
 }
 
 #[test]
@@ -11602,7 +12450,7 @@ fn v9_external_namespace_is_owner_private_nofollow_and_no_clobber() {
 fn v9_snapshot_campaign_and_leaf_are_private_and_descriptor_pinned_across_replacement() {
     let _fleet = FLEET_TEST_LOCK
         .lock()
-        .expect("serialize V9 snapshot namespace creation");
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
     let workspace = tempfile::tempdir().expect("create V9 snapshot workspace");
     let root = workspace.path().join("fs-verity-root");
     fs::create_dir(&root).expect("create V9 snapshot root");
@@ -14644,6 +15492,19 @@ impl QualificationProtectedRosterRun {
         voter_index: usize,
         scope: SessionConsumerScope,
     ) -> Self {
+        let client = qualification_fenced_mutation_roster_client(protected.clone(), scope);
+        Self::prepare_with_client(member_count, general, protected, voter_index, scope, client)
+            .await
+    }
+
+    async fn prepare_with_client(
+        member_count: usize,
+        general: &QualificationConsumerClient,
+        protected: PersistentSessionConsumerClient,
+        voter_index: usize,
+        scope: SessionConsumerScope,
+        client: FencedMutationRosterClient,
+    ) -> Self {
         let key = SessionKey {
             tenant: TenantId::new("session-ha-qualification").expect("bounded roster tenant"),
             nf_kind: NetworkFunctionKind::smf(),
@@ -14695,7 +15556,6 @@ impl QualificationProtectedRosterRun {
             ))
         ));
 
-        let client = qualification_fenced_mutation_roster_client(protected.clone(), scope);
         let members = (0_u8..6)
             .map(|ordinal| {
                 FencedMutationRosterMember::new(
@@ -19806,6 +20666,59 @@ fn member_recovery_survivor_origin_wave_has_no_cross_survivor_head_of_line_block
 }
 
 #[test]
+fn member_recovery_rolling_observation_keeps_the_existing_availability_allowance() {
+    let observed_at = Instant::now();
+    let (participants, before, mut interrupted) = subset_traffic_fixture();
+    let mut progress = RecoveryTrafficProgressTracker::new(before.clone(), observed_at);
+    let initial_deadline = progress.observation_deadline(None);
+    assert_eq!(initial_deadline, observed_at + Duration::from_secs(13));
+
+    interrupted[0].status.availability_interruption_episodes += 1;
+    interrupted[0].status.availability_interruptions += 1;
+    assert!(subset_traffic_availability_changed_since(
+        &before,
+        &interrupted,
+        &participants,
+    ));
+    progress.extend_pulse_for_availability_recovery();
+    let recovery_deadline = observed_at + Duration::from_secs(26);
+    assert_eq!(progress.observation_deadline(None), recovery_deadline);
+    assert!(deadline_allows_completion(
+        observed_at + Duration::from_millis(13_013),
+        progress.observation_deadline(None),
+    ));
+    assert!(!deadline_allows_completion(
+        recovery_deadline + Duration::from_nanos(1),
+        progress.observation_deadline(None),
+    ));
+
+    // Refreshing one key must still leave the independent all-key boundary.
+    progress.record_pulse(interrupted, observed_at + Duration::from_secs(20));
+    assert_eq!(progress.observation_deadline(None), recovery_deadline);
+}
+
+#[test]
+fn member_recovery_absolute_phase_still_bounds_an_availability_allowance() {
+    let observed_at = Instant::now();
+    let mut progress = RecoveryTrafficProgressTracker::new(Vec::new(), observed_at);
+    let phase_deadline = observed_at + Duration::from_secs(20);
+    progress.extend_pulse_for_availability_recovery();
+    assert_eq!(
+        progress.observation_deadline(Some(phase_deadline)),
+        phase_deadline
+    );
+    assert!(!deadline_allows_completion(
+        phase_deadline + Duration::from_nanos(1),
+        progress.observation_deadline(Some(phase_deadline)),
+    ));
+    assert_eq!(
+        progress.observation_deadline(Some(observed_at + Duration::from_secs(86))),
+        observed_at + Duration::from_secs(26),
+        "a phase deadline never replaces the stricter rolling continuity bounds"
+    );
+}
+
+#[test]
 fn member_recovery_near_expiry_checkpoint_refreshes_before_a_wave_and_reserves_observation() {
     let observed_at = Instant::now();
     let absolute_deadline =
@@ -20421,6 +21334,127 @@ fn epoch_changing_bounds_cap_supersession_and_reject_abandonment_or_timeout() {
 }
 
 #[test]
+fn member_catchup_requires_the_recovering_voter_despite_majority_progress() {
+    for member_count in [3, 5] {
+        let mut reports = member_catchup_reports(member_count, 100);
+        reports[1].ready = false;
+        reports[1].reason_code = QualificationReadinessCode::NoQuorum;
+        reports[1].committed_index = None;
+        reports[1].applied_index = Some(10);
+        let mut progress = MemberCatchupProgress::new(member_count);
+        assert!(!progress.observe(&reports));
+        for frontier in [200, 1_000, 10_000] {
+            for report in reports.iter_mut().filter(|report| report.node_index != 1) {
+                report.committed_index = Some(frontier);
+                report.applied_index = Some(frontier);
+            }
+            assert!(
+                !progress.observe(&reports),
+                "majority progress must not complete a stalled voter's catch-up"
+            );
+        }
+        reports[1].applied_index = Some(100);
+        assert!(
+            !progress.observe(&reports),
+            "crossing the original frontier does not replace actual readiness"
+        );
+        reports[1] = member_catchup_reports(member_count, 10_000)[1];
+        assert!(progress.observe(&reports));
+    }
+}
+
+#[test]
+fn member_catchup_rejects_readiness_below_its_observed_committed_frontier() {
+    let mut reports = member_catchup_reports(3, 100);
+    reports[1].applied_index = Some(99);
+    let mut progress = MemberCatchupProgress::new(3);
+    assert!(!progress.observe(&reports));
+    reports[1].applied_index = Some(100);
+    assert!(progress.observe(&reports));
+}
+
+#[test]
+fn member_catchup_missing_observation_cannot_hide_applied_regression() {
+    let mut reports = member_catchup_reports(3, 100);
+    let mut progress = MemberCatchupProgress::new(3);
+    assert!(progress.observe(&reports));
+    reports[1].applied_index = None;
+    assert!(!progress.observe(&reports));
+    reports[1].applied_index = Some(99);
+    assert!(std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        progress.observe(&reports)
+    }))
+    .is_err());
+}
+
+#[test]
+fn member_catchup_keeps_every_quorum_readiness_witness() {
+    for member_count in [3, 5] {
+        let reports = member_catchup_reports(member_count, 100);
+        let required_quorum = member_count / 2 + 1;
+        for field in 0..5 {
+            let mut bad = reports.clone();
+            match field {
+                0 => bad[1].configured_voters -= 1,
+                1 => bad[1].fresh_reachable_voters = required_quorum - 1,
+                2 => bad[1].agreeing_voters = required_quorum - 1,
+                3 => bad[1].required_quorum = required_quorum - 1,
+                4 => bad[1].reason_code = QualificationReadinessCode::NoQuorum,
+                _ => unreachable!(),
+            }
+            assert!(!MemberCatchupProgress::new(member_count).observe(&bad));
+        }
+        assert!(MemberCatchupProgress::new(member_count).observe(&reports));
+    }
+}
+
+#[test]
+fn member_catchup_does_not_borrow_the_connection_settlement_deadline() {
+    let publication = Instant::now();
+    let old_settlement_deadline = publication
+        + Duration::from_millis(QUALIFICATION_TRAFFIC_MEMBER_RECOVERY_SETTLEMENT_DEADLINE_MILLIS);
+    let observed_at = old_settlement_deadline + Duration::from_secs(1);
+    let progress = RecoveryTrafficProgressTracker::new(Vec::new(), observed_at);
+    assert!(deadline_admits_complete_operation(
+        observed_at,
+        progress.progress_deadline(),
+    ));
+    assert!(
+        !deadline_admits_complete_operation(
+            observed_at,
+            progress.next_deadline(old_settlement_deadline),
+        ),
+        "the historical clock remains expired; catch-up must use its own observations"
+    );
+    let mut reports = member_catchup_reports(3, 100);
+    reports[1].ready = false;
+    let mut catchup = MemberCatchupProgress::new(3);
+    assert!(!catchup.observe(&reports));
+    reports[1].ready = true;
+    assert!(catchup.observe(&reports));
+}
+
+fn member_catchup_reports(member_count: usize, frontier: u64) -> Vec<FleetReadiness> {
+    let required_quorum = member_count / 2 + 1;
+    (0..member_count)
+        .map(|node_index| FleetReadiness {
+            node_index,
+            ready: true,
+            reason_code: QualificationReadinessCode::Ready,
+            node_id: u64::try_from(node_index + 1).expect("bounded node identifier"),
+            term: 7,
+            leader_id: Some(1),
+            configured_voters: member_count,
+            fresh_reachable_voters: required_quorum,
+            agreeing_voters: required_quorum,
+            required_quorum,
+            committed_index: Some(frontier),
+            applied_index: Some(frontier),
+        })
+        .collect()
+}
+
+#[test]
 fn recovery_fault_settlement_tracks_attempts_without_freezing_connection_gauges() {
     assert_eq!(
         recovery_fault_outcome_settlement_window(),
@@ -20653,6 +21687,85 @@ fn recovery_fault_flush_bounds_incident_failures_and_rejects_abandonment() {
 }
 
 #[test]
+fn recovery_phase_accounting_shares_one_fixed_bound_across_catchup() {
+    for member_count in [3, 5] {
+        let bound = recovery_fault_connection_bound(member_count);
+        let mut before = vec![lifecycle_metrics_fixture(); member_count];
+        before[0].connection_attempts = 1;
+        before[0].active_connections = 1;
+        let mut catchup_before = before.clone();
+        catchup_before[0].connection_attempts += 20;
+        catchup_before[0].connection_successes += 20;
+        let mut settlement_before = catchup_before.clone();
+        // Longer reconstruction legitimately accumulates more calls than the
+        // entire fixed allowance. The original pending attempt stays owned.
+        settlement_before[0].connection_attempts += 2 * bound;
+        settlement_before[0].connection_successes += 2 * bound;
+        let mut settled = settlement_before.clone();
+        settled[0].connection_attempts += bound - 20;
+        settled[0].connection_successes += bound - 20 + 1;
+        settled[0].active_connections = 0;
+        assert_recovery_phase_connection_bounds(
+            member_count,
+            &before,
+            &catchup_before,
+            &settlement_before,
+            &settled,
+        );
+
+        // Exactly one additional attempt in either fixed phase fails. Each
+        // individual phase remains below its bound, so this detects granting
+        // a fresh full allowance after catch-up instead of sharing the budget.
+        for fault_phase in [false, true] {
+            let mut fault = catchup_before.clone();
+            let mut settlement = settled.clone();
+            if fault_phase {
+                fault[0].connection_attempts += 1;
+                fault[0].connection_successes += 1;
+            } else {
+                settlement[0].connection_attempts += 1;
+                settlement[0].connection_successes += 1;
+            }
+            assert!(std::panic::catch_unwind(|| {
+                assert_recovery_phase_connection_bounds(
+                    member_count,
+                    &before,
+                    &fault,
+                    &settlement_before,
+                    &settlement,
+                );
+            })
+            .is_err());
+        }
+    }
+}
+
+#[test]
+fn recovery_phase_accounting_cannot_hide_unsafe_or_unaccounted_catchup() {
+    for failure in 0..6 {
+        let before = vec![lifecycle_metrics_fixture(); 3];
+        let mut catchup = before.clone();
+        catchup[0].connection_attempts = 1;
+        match failure {
+            0 => catchup[0].connection_abandoned = 1,
+            1 => catchup[0].connection_failure_protocol = 1,
+            2 => catchup[0].connection_failure_backend = 1,
+            3 => {
+                catchup[0].connection_successes = 1;
+                catchup[0].drain_overruns = 1;
+            }
+            4 => catchup[0].connection_successes = 2,
+            5 => {} // An outstanding attempt without a live owner.
+            _ => unreachable!(),
+        }
+        assert!(std::panic::catch_unwind(|| {
+            assert_recovery_phase_connection_bounds(3, &before, &before, &catchup, &catchup);
+        })
+        .is_err());
+    }
+}
+
+#[test]
 fn chained_interval_bounds_reject_an_attempt_storm_between_named_phases() {
     let member_count = 3;
     let before = vec![lifecycle_metrics_fixture(); member_count];
@@ -20744,6 +21857,71 @@ fn transition_deadline_never_accepts_a_late_success() {
         started,
         started + operation_timeout - Duration::from_nanos(1)
     ));
+}
+
+#[test]
+fn child_reply_receive_rejects_an_already_queued_reply_after_deadline() {
+    let (sender, replies) = mpsc::sync_channel(1);
+    sender.send(17).expect("queue scripted child reply");
+    let deadline = Instant::now()
+        .checked_sub(Duration::from_nanos(1))
+        .expect("monotonic instant supports an expired deadline");
+
+    assert!(
+        matches!(
+            receive_qualification_reply_until(&replies, deadline),
+            Err(RecvTimeoutError::Timeout)
+        ),
+        "an already queued reply cannot satisfy an expired receive deadline"
+    );
+    assert_eq!(
+        replies.try_recv(),
+        Ok(17),
+        "an expired admission must leave the queued reply available for evidence"
+    );
+}
+
+#[test]
+fn child_reply_receive_checks_completion_against_original_deadline() {
+    let started = Instant::now();
+    let deadline = started + Duration::from_millis(10);
+    for (admitted, completed, expected) in [
+        (started, started, Ok(17)),
+        (started, deadline, Ok(17)),
+        (deadline, deadline, Ok(17)),
+        (
+            started,
+            deadline + Duration::from_nanos(1),
+            Err(RecvTimeoutError::Timeout),
+        ),
+    ] {
+        let (sender, replies) = mpsc::sync_channel(1);
+        sender.send(17).expect("queue scripted child reply");
+        // Keep the real channel receive while controlling only its clock
+        // observations. This also models a descheduled receiver that resumes
+        // after the deadline with a reply already available.
+        let mut observations = [admitted, completed].into_iter();
+        let result = receive_qualification_reply_until_with_clock(&replies, deadline, || {
+            observations.next().expect("bounded clock observations")
+        });
+        assert_eq!(result, expected);
+        assert!(observations.next().is_none());
+    }
+}
+
+#[test]
+fn child_reply_receive_preserves_disconnection_before_deadline() {
+    let (sender, replies) = mpsc::sync_channel::<()>(1);
+    drop(sender);
+    let started = Instant::now();
+    assert_eq!(
+        receive_qualification_reply_until_with_clock(
+            &replies,
+            started + Duration::from_millis(10),
+            || started,
+        ),
+        Err(RecvTimeoutError::Disconnected)
+    );
 }
 
 #[test]

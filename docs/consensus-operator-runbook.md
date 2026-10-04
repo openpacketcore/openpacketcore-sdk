@@ -40,10 +40,10 @@ The session and configuration adapters use one fixed runtime profile from
 `opc-consensus`; operators cannot tune either domain onto a different election
 or heartbeat regime. This workspace revision exact-pins
 `https://github.com/openpacketcore/openraft` at
-`f607e636406b16bd0ad7925dbb631da1b7a4cd96` so every election campaign samples
-a fresh timeout. Confirm the lock resolves only `openraft` and
-`openraft-macros` 0.9.24 from that full revision. Do not substitute registry
-0.9.24, a branch, a tag, or a downstream partial patch.
+`72e327a4f25cbbe3a3695d8c3c0f0970ccb925d5` with the complete release-0.9 history
+through v0.9.25, bounded apply pages and joined replication retirement. Confirm the lock resolves only
+`openraft` and `openraft-macros` 0.9.25 from that full revision. Do not substitute
+a registry package, a branch, a tag, or a downstream partial patch.
 
 This is an interim source-build profile. The 26 workspace crates in the
 machine-readable `source_build_gate.affected_workspace_crates` closure must
@@ -486,9 +486,42 @@ authority ambiguous discard the prior guard, reacquire same-owner authority
 with a strictly higher fence, and validate the exact scheduled record.
 Read-only get, restore-scan, and readiness outcomes retain the already-proven
 guard and validate that same exact record without minting unnecessary fencing
-authority. Evidence binds this routing as `stage-aware-known-authority/v1`.
-The private
-schedule drops one successful release response per mutator to prove this path.
+authority. The current schedule binds this routing as
+`stage-aware-known-authority-readiness-and-scan-reproof/v2`.
+After a readiness failure, the retained-authority checkpoint also requires a
+fresh durable-readiness proof. An exact get uses a logical-time proposal and
+cannot certify the separate read-index path. Every completed not-ready proof
+and proof timeout consumes the existing interruption budget, bounded by the
+remaining original episode deadline. Recovery closes only after both the
+exact record and readiness are proven. After a restore-scan failure, recovery
+repeats the complete scan and requires the same exact record, durable cursor
+profile, count and page bounds. An exact get cannot certify scan availability.
+The scan uses that same original deadline and interruption allowance;
+malformed pages and terminal scan errors remain terminal.
+
+Before every acquisition, the synthetic caller syncs its exact consumer request
+ID, body, scope, identity and original absolute deadline into a private,
+single-writer journal beside its database. The complete image is bounded to
+4096 bytes. Uncertainty is reconciled through the existing consumer receipt
+API; `NotFound` permits only an explicit retry of that identical live request,
+never a distinct successor. At restart, a recorded terminal acquisition is
+retired before fresh authority. Expired unknown requests stay fenced, and
+retries never extend their deadlines. Missing or mismatched journal custody
+beside an existing database fails closed. This trusted local qualification
+caller adds no consumer-mTLS or production persistence claim and changes no
+ordinary lease API. Its acquisition profile is
+`retained-consumer-id-receipt-before-successor/v1`.
+
+The current `opc-session-ha/traffic-resource/v10` schedule binds both behaviors.
+Historical v6, v7, v8 and v9 retain their original meanings: v7 added retained
+acquisitions, v8 added readiness reproof, and v9 added complete scan reproof.
+The combined schedule changes no numeric workload, timeout, interruption or
+resource bound. Current 3/5-voter traffic and mTLS candidate digests bind the
+combined algorithm.
+
+See the [qualification contract](../crates/opc-session-testkit/README.md).
+The private schedule drops one successful release response per mutator to prove
+this path.
 More than eight such outcomes per node, any recovery episode beyond the fixed
 26-second two-election-plus-operation transition envelope, any retry before the
 fixed 50 ms delay, or phase completion with an unresolved interruption fails
@@ -504,7 +537,7 @@ exactly one stable follower is killed uncleanly with active mutation and watch
 tasks. Survivor commits must advance during the outage, and the same-disk,
 exact-address restart must reconcile the bounded committed journal, prove the
 exact current record, catch its watch up, and resume under a strictly higher
-same-owner fence. Schedule v6 binds this one
+same-owner fence. The current schedule retains this one
 `same-disk-exact-address-active-mutator/v3` profile and independently enforces
 the following stage deadlines:
 

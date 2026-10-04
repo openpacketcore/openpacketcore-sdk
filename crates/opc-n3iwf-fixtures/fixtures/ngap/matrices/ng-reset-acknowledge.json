@@ -1,0 +1,42 @@
+{
+  "message": "NGResetAcknowledge",
+  "procedure_code": 20,
+  "outcome": "successful",
+  "direction": "bidirectional",
+  "ts29413_clause": "5.2",
+  "admitted_disposition": "receive",
+  "constructed_send": false,
+  "source": {
+    "document": "3GPP TS 38.413",
+    "release": "V18.10.0",
+    "clauses": [
+      "8.7.4"
+    ]
+  },
+  "application": {
+    "document": "3GPP TS 29.413",
+    "release": "V18.5.0",
+    "clauses": [
+      "5.2"
+    ]
+  },
+  "n3iwf_content_exceptions": "TS 29.413 5.3 RAN-specific ignore is not encoded; rows are TS 38.413 identifier/criticality/cardinality",
+  "admission_scope": "issue-787-qualified-first-cnf-typed-subset",
+  "wire_fixture_id": "opc.n3iwf.ngap.v1.complete-ng-reset-acknowledge",
+  "ies": [
+    {
+      "id": 111,
+      "name": "id-UE-associatedLogicalNG-connectionList",
+      "criticality": "ignore",
+      "cardinality": "singleton",
+      "presence": "optional"
+    },
+    {
+      "id": 19,
+      "name": "id-CriticalityDiagnostics",
+      "criticality": "ignore",
+      "cardinality": "singleton",
+      "presence": "optional"
+    }
+  ]
+}

@@ -2795,7 +2795,12 @@ fn sync_directory(directory: &Path) -> Result<(), QualificationKubernetesCampaig
         .map_err(|_| QualificationKubernetesCampaignArtifactError::Publication)
 }
 
-#[cfg(unix)]
+#[cfg(any(
+    target_os = "linux",
+    target_os = "android",
+    target_vendor = "apple",
+    target_os = "redox"
+))]
 fn publish_staging_directory(
     parent: &Path,
     staging: &Path,
@@ -2824,18 +2829,25 @@ fn publish_staging_directory(
     })
 }
 
-#[cfg(not(unix))]
+#[cfg(not(any(
+    target_os = "linux",
+    target_os = "android",
+    target_vendor = "apple",
+    target_os = "redox"
+)))]
 fn publish_staging_directory(
     parent: &Path,
-    staging: &Path,
+    _staging: &Path,
     destination_name: &std::ffi::OsStr,
 ) -> Result<(), QualificationKubernetesCampaignArtifactError> {
     let destination = parent.join(destination_name);
     if destination.exists() {
         return Err(QualificationKubernetesCampaignArtifactError::DestinationExists);
     }
-    fs::rename(staging, destination)
-        .map_err(|_| QualificationKubernetesCampaignArtifactError::Publication)
+    // This platform cannot publish a directory with the required atomic
+    // no-replace primitive. An existence check followed by rename would let
+    // a concurrent publisher's destination be overwritten.
+    Err(QualificationKubernetesCampaignArtifactError::Publication)
 }
 
 #[cfg(test)]

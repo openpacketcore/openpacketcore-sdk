@@ -98,13 +98,22 @@
 // The crate is fully safe Rust. Filesystem checks use safe shell-out commands
 // (stat, df, python3) rather than libc FFI.
 
+/// Replicated management-audit privacy and operation contracts.
+pub mod audit_authority;
 mod backend;
 pub mod break_glass;
 mod consensus;
+mod consumer_checkpoint;
 mod error;
+mod local_sqlite;
+pub use consumer_checkpoint::{
+    ConsumerCheckpointBinding, ConsumerCheckpointError, ConsumerCheckpointOptions,
+    ConsumerCheckpointReadback, ConsumerCheckpointStore,
+};
 mod management_audit;
 mod mock;
 mod preflight;
+mod retained;
 mod schema;
 mod security_policy;
 mod types;
@@ -121,11 +130,12 @@ pub use consensus::{
     ConfigConsensusIdentity, ConfigConsensusIdentityError, ConfigConsensusNodeId,
     ConfigConsensusOpenError, ConfigConsensusPeer, ConfigConsensusRequestId,
     ConfigConsensusRpcHandler, ConfigConsensusStatus, ConfigConsensusTopology,
-    ConfigConsensusTopologyError, ConfigLocalAuthorityOutcome, ConsensusConfigStore,
-    LegacyConfigTailDisposition, SharedConfigConsensusClock, SystemConfigConsensusClock,
-    CONFIG_CONSENSUS_COMMAND_VERSION, CONFIG_CONSENSUS_MAX_MEMBERS,
-    CONFIG_CONSENSUS_SNAPSHOT_VERSION, CONFIG_CONSENSUS_STORAGE_VERSION,
-    CONFIG_CONSENSUS_WIRE_VERSION, DEFAULT_CONFIG_CONSENSUS_OPERATION_TIMEOUT,
+    ConfigConsensusTopologyError, ConfigHistoryLimits, ConfigHistoryRetention,
+    ConfigLocalAuthorityOutcome, ConsensusConfigStore, LegacyConfigTailDisposition,
+    SharedConfigConsensusClock, SystemConfigConsensusClock, CONFIG_CONSENSUS_COMMAND_VERSION,
+    CONFIG_CONSENSUS_MAX_MEMBERS, CONFIG_CONSENSUS_SNAPSHOT_VERSION,
+    CONFIG_CONSENSUS_STORAGE_VERSION, CONFIG_CONSENSUS_WIRE_VERSION,
+    DEFAULT_CONFIG_CONSENSUS_OPERATION_TIMEOUT,
 };
 pub use error::{PersistError, PersistErrorKind};
 pub use management_audit::{
@@ -146,6 +156,10 @@ pub use management_audit::{
 pub use mock::{FaultInjectingStore, FaultType};
 pub use mock::{MockConfigStore, UnsafePathMock};
 pub use preflight::PersistCapabilities;
+pub use retained::{
+    RetainedConfigBinding, RetainedConfigDurability, RetainedConfigError, RetainedConfigOpen,
+    RetainedConfigOpenRetirement, RetainedConfigOptions,
+};
 pub use security_policy::{
     ActivePolicyMetadata, PolicyHistoryEntry, SecurityPolicyError, SecurityPolicyService,
     SerializablePolicy, SerializableRule, SerializableRuleList, SqliteSecurityPolicyService,

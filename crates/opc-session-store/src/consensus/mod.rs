@@ -4,9 +4,17 @@
 //! and state-machine boundaries. No Openraft type is part of the documented
 //! stable public session-store API or the authenticated session-net contract.
 
+#[cfg(target_os = "linux")]
+pub(crate) mod native;
 pub mod network;
+mod persistence;
+mod persistence_protocol;
+pub mod protected_recovery;
 pub(crate) mod raft_adapter;
+#[cfg(target_os = "linux")]
+pub(crate) mod recovery_types;
 pub(crate) mod snapshot;
+mod snapshot_directory;
 mod snapshot_integrity;
 pub(crate) mod storage;
 pub(crate) mod store;
@@ -14,6 +22,12 @@ pub mod types;
 #[cfg(target_os = "linux")]
 pub(crate) mod verified_snapshot;
 
+pub use persistence::{
+    SessionAsyncPersistenceProgress, SessionAsyncRecoveryState, SessionPersistenceDrainError,
+    SessionPersistenceHealth, SessionPersistenceMode, SessionStorageFailure,
+    SessionStorageFailureKind, SessionStorageFailureStage, SessionStorageState,
+};
+pub use snapshot_directory::SnapshotDirectory;
 pub use snapshot_integrity::SnapshotIntegrityPolicy;
 
 #[cfg(feature = "test-control")]

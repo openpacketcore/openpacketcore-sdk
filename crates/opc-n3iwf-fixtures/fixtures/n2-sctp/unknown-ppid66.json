@@ -1,0 +1,47 @@
+{
+  "encoding": "metadata-record",
+  "validation_scope": "association-metadata",
+  "context": {
+    "layout": "ppid-port",
+    "ppid": 60,
+    "max_port": 65534
+  },
+  "sdk_fixture_id": "opc.n3iwf.n2-sctp.v1.unknown-ppid66",
+  "subset": "n2-sctp",
+  "case_class": "unknown-critical",
+  "source": {
+    "document": "3GPP TS 38.412",
+    "release": "V18.1.0",
+    "clauses": [
+      "7"
+    ]
+  },
+  "direction": "n3iwf-to-amf",
+  "role": "n3iwf",
+  "prerequisite": "Non-DTLS N2 profile",
+  "provenance": {
+    "class": "synthetic-negative",
+    "synthetic": true,
+    "independent_capture": false,
+    "referenced_public_vector": null,
+    "notes": "PPID 66 is reserved for the DTLS subset and is unsupported here"
+  },
+  "sanitized_fields": [
+    {
+      "name": "identifiers",
+      "treatment": "documentation-range-or-reserved-test",
+      "value_class": "synthetic"
+    }
+  ],
+  "wire": {
+    "path": "wire/unknown-ppid66.hex",
+    "digest_sha256": "d930104925fd1c2c1f7418e81c27cb87f77a040e5894f836cb0c18bb342e558d"
+  },
+  "semantic_assertions": [
+    "ppid=66",
+    "port=38412",
+    "non_dtls_profile=unsupported"
+  ],
+  "expected_outcome": "unsupported",
+  "runtime_claim": false
+}

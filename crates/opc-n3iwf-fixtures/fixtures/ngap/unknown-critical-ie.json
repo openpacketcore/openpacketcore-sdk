@@ -1,0 +1,49 @@
+{
+  "encoding": "protocol-wire",
+  "validation_scope": "aper-structural-dispatch",
+  "context": {
+    "max_ies": 256,
+    "duplicate_ie_policy": "reject",
+    "unknown_ie_policy": "reject",
+    "mandatory_presence_validation": false,
+    "inner_ie_validation": false
+  },
+  "sdk_fixture_id": "opc.n3iwf.ngap.v1.unknown-critical-ie",
+  "subset": "ngap",
+  "case_class": "unknown-critical",
+  "source": {
+    "document": "3GPP TS 38.413",
+    "release": "V18.10.0",
+    "clauses": [
+      "9.2.6.1"
+    ]
+  },
+  "direction": "n3iwf-to-amf",
+  "role": "n3iwf",
+  "prerequisite": "DecodeContext unknown_ie_policy=Reject and conservative profile",
+  "provenance": {
+    "class": "synthetic-negative",
+    "synthetic": true,
+    "independent_capture": false,
+    "referenced_public_vector": "crates/opc-proto-ngap/src/policy.rs::NG_SETUP_REQUEST",
+    "notes": "First IE identifier mutated from 27 to 0x00ff retaining reject criticality"
+  },
+  "sanitized_fields": [
+    {
+      "name": "identifiers",
+      "treatment": "documentation-range-or-reserved-test",
+      "value_class": "synthetic"
+    }
+  ],
+  "wire": {
+    "path": "wire/unknown-critical-ie.hex",
+    "digest_sha256": "94d8bf0280c04093fd1a44ba045a7f8812b7dcea1d0fc6badbabfdd470cbc405"
+  },
+  "semantic_assertions": [
+    "unknown_ie=255",
+    "criticality=reject",
+    "code=UnknownCriticalIe"
+  ],
+  "expected_outcome": "reject",
+  "runtime_claim": false
+}

@@ -133,7 +133,7 @@ pub(crate) fn record_rpc_error(
     observe_rpc_latency(operation, elapsed);
 }
 
-/// Records loss of a terminal audit event after a commit was applied.
+/// Records a failed terminal audit write while preserving the operation result.
 ///
 /// The counter deliberately has no labels: audit content and request identity
 /// must not escape through the metrics surface.

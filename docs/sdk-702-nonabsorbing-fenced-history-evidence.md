@@ -102,6 +102,16 @@ binding for every submitted item. The 1,010,000-operation count excludes the
 separately reported intervening active-epoch reclaim write. Resource and
 latency samples are evidence outputs, not inferred from the offered rate.
 
+The frozen v1 evidence format includes a 2 GiB budget for the entire benchmark
+process, including its three voters and workload fixtures. That is a legacy
+aggregate regression profile, not an established per-voter deployment memory
+requirement. SDK-741's separate diagnostics report aggregate memory without
+using that budget as a deployment gate; historical v1 failures and its strict
+validator remain unchanged. Per-voter deployment sizing requires isolated live
+process measurements. The 500/s sustained and 1,000/s burst offered schedule
+also does not, by itself, establish sustained capacity above 1,000 successful
+public DURABLE operations/s. These are distinct evidence claims.
+
 The emitted headroom dimensions are intentionally distinct. The
 `operational_headroom_transitions` value is 31,072 per active epoch
 (131,072 - 100,000): it belongs to the separate active-epoch operational

@@ -286,6 +286,7 @@ pub struct QualificationKubernetesConcurrentV5OperationCounts {
     pub watch: usize,
 }
 
+#[cfg(target_os = "linux")]
 impl QualificationKubernetesConcurrentV5OperationCounts {
     fn total(self) -> Option<usize> {
         self.batch
@@ -1594,6 +1595,7 @@ fn is_lower_hex_width(value: &str, width: usize) -> bool {
             .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
 }
 
+#[cfg(target_os = "linux")]
 fn ensure_not_cancelled(
     cancellation: &QualificationKubernetesCampaignCancellation,
 ) -> Result<(), QualificationKubernetesConcurrentV5ArtifactError> {
@@ -1796,7 +1798,7 @@ fn interpreter_identity<Fd: AsFd>(
     {
         return Err(QualificationKubernetesConcurrentV5ArtifactError::InterpreterUnavailable);
     }
-    let sha256 = QualificationSha256::new(format!("sha256:{:x}", hasher.finalize()))
+    let sha256 = QualificationSha256::new(format!("sha256:{}", hex::encode(hasher.finalize())))
         .map_err(|_| QualificationKubernetesConcurrentV5ArtifactError::InterpreterUnavailable)?;
     Ok(InterpreterIdentity {
         device: before.st_dev,
